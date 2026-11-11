@@ -62,8 +62,8 @@ class MegaMoEHopperInt4Frontend(MegaMoEHopperMxfp4Frontend):
     def _mega_compile_key(self) -> tuple:
         c = self.config
         return (
-            "sm90_int4_fp8_megamoe_v1",
-            "signed_int4_bf16_k128_reglut_linear_m64",
+            "sm90_int4_fp8_megamoe_v2",
+            "signed_int4_bf16_k128_xor_reglut_linear_m64",
             ("optimization_policy", c.optimizations.identity()),
             ("compact_pull_buffer", c.compact_pull_buffer),
             ("dispatch_pull", c.dispatch_pull_batch, c.dispatch_pull_rotate),

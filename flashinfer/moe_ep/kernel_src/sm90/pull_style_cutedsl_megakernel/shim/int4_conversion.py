@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Register lookup for signed INT4 weights with prepared FP8 byte tables.
 
-Prepared nibbles encode +1..+7 as 0..6, zero as 7, and -1..-8 as 8..15.
-Each K128 row stores eight negative FP8 magnitudes in a uint64. Positive
-entries are derived in registers, with a distinct zero entry replacing +8.
+Prepared nibbles put the sign in bit 2 and the magnitude index in bits 0, 1
+and 3, with code 11 reserved for zero. Each K128 row stores eight positive
+FP8 magnitudes in a uint64. Two PRMT lookups and XOR recover signed values.
 """
 
 import functools
@@ -19,41 +19,41 @@ INT4_FOLD_BLOCK_BYTES = 64 * 8
 
 
 def _table_registers(row):
-    return f".reg .b32 p{row}0, p{row}1, n{row}0, n{row}1;"
+    return f".reg .b32 a{row}0, a{row}1, b{row}0, b{row}1;"
 
 
-def _positive_table_lines(row):
+def _table_lines(row):
     return [
-        f"xor.b32 p{row}0, n{row}0, 0x80808080;",
-        f"lop3.b32 p{row}1, n{row}1, 0x00ffffff, 0x00808080, 0x6a;",
+        f"xor.b32 a{row}1, a{row}0, 0x7f7f7f7f;",
+        f"and.b32 b{row}0, b{row}1, 0x00ffffff;",
+        f"or.b32 b{row}1, b{row}1, 0x80808080;",
     ]
 
 
 def _decode_lines(src, lo, hi, out0, out1):
-    # Two magnitude lookups followed by a signed selection implement a
-    # 16-entry byte lookup using PRMT's eight-byte register table.
+    # PRMT's selector bit 3 replicates the selected byte's sign bit.
+    # A's bytes have sign 0; B's negative entries supply 0xff to complement
+    # A, while its positive entries supply 0. Zero-filled tables remain zero.
     return [
-        f"lop3.b32 sel, {src}, 0x88888888, 0x64206420, 0xea;",
-        "shr.u32 sel, sel, 1;",
-        f"and.b32 idx, {src}, 0x77777777;",
-        f"prmt.b32 pos, p{lo}0, p{lo}1, idx;",
-        f"prmt.b32 neg, n{lo}0, n{lo}1, idx;",
-        f"prmt.b32 {out0}, pos, neg, sel;",
-        "shr.u32 idx, idx, 16;",
-        "shr.u32 sel, sel, 16;",
-        f"prmt.b32 pos, p{hi}0, p{hi}1, idx;",
-        f"prmt.b32 neg, n{hi}0, n{hi}1, idx;",
-        f"prmt.b32 {out1}, pos, neg, sel;",
+        f"xor.b32 flip, {src}, 0x88888888;",
+        f"prmt.b32 a, a{lo}0, a{lo}1, {src};",
+        f"prmt.b32 b, b{lo}0, b{lo}1, flip;",
+        f"xor.b32 {out0}, a, b;",
+        f"shr.u32 idx, {src}, 16;",
+        "shr.u32 flip, flip, 16;",
+        f"prmt.b32 a, a{hi}0, a{hi}1, idx;",
+        f"prmt.b32 b, b{hi}0, b{hi}1, flip;",
+        f"xor.b32 {out1}, a, b;",
     ]
 
 
 def _word_asm():
-    lines = ["{", ".reg .b32 idx, sel, pos, neg, r0, r1;"]
+    lines = ["{", ".reg .b32 idx, flip, a, b, r0, r1;"]
     for row in range(2):
         lines += [
             _table_registers(row),
-            f"mov.b64 {{n{row}0,n{row}1}}, ${3 + row};",
-            *_positive_table_lines(row),
+            f"mov.b64 {{a{row}0,b{row}1}}, ${3 + row};",
+            *_table_lines(row),
         ]
     lines += _decode_lines("$2", 0, 1, "r0", "r1")
     return "\n".join(lines + ["mov.b32 $0, r0;", "mov.b32 $1, r1;", "}"])
@@ -81,12 +81,12 @@ def convert_int4x8_to_fp8x8(
 def _group_asm(count):
     outputs, words = 8 * count, 4 * count
     address_base = outputs + words
-    lines = ["{", ".reg .b32 idx, sel, pos, neg;"]
+    lines = ["{", ".reg .b32 idx, flip, a, b;"]
     for row in range(4):
         lines += [
             _table_registers(row),
-            f"ld.shared.v2.b32 {{n{row}0,n{row}1}}, [${address_base + row}];",
-            *_positive_table_lines(row),
+            f"ld.shared.v2.b32 {{a{row}0,b{row}1}}, [${address_base + row}];",
+            *_table_lines(row),
         ]
     for j in range(count):
         for word in range(4):

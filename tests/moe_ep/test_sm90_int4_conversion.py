@@ -64,19 +64,24 @@ def test_int4_conversion_all_positive_bf16_scales():
     sf = scales.to(torch.int16).view(torch.bfloat16)
     # Construct tables independently of the production weight-preparation code.
     metadata = (
-        (-torch.arange(1, 9, device="cuda").bfloat16() * sf[:, :, None])
+        (torch.arange(1, 9, device="cuda").bfloat16() * sf[:, :, None])
         .clamp(-448, 448)
         .to(torch.float8_e4m3fn)
         .view(torch.uint64)
         .reshape(-1, 2)
     )
     code_map = torch.tensor(
-        [7, 0, 1, 2, 3, 4, 5, 6, 15, 14, 13, 12, 11, 10, 9, 8],
+        [11, 0, 1, 2, 3, 8, 9, 10, 15, 14, 13, 12, 7, 6, 5, 4],
         dtype=torch.int64,
         device="cuda",
     )
     shifts = torch.arange(8, dtype=torch.int64, device="cuda") * 4
     packed = (code_map[codes.long()] << shifts).sum(dim=1).to(torch.int32)
+    # Raw zero-filled payload and metadata must decode to +0 for padded rows.
+    packed = torch.cat((packed, torch.zeros(1, dtype=torch.int32, device="cuda")))
+    metadata = torch.cat(
+        (metadata, torch.zeros((1, 2), dtype=torch.uint64, device="cuda"))
+    )
     output = torch.empty((packed.numel(), 2), dtype=torch.int32, device="cuda")
     arguments = tuple(from_dlpack(t) for t in (packed, metadata, output))
     cute.compile(launch, *arguments)(*arguments)
@@ -87,13 +92,16 @@ def test_int4_conversion_all_positive_bf16_scales():
         .to(torch.float8_e4m3fn)
         .view(torch.uint8)
     )
+    expected = torch.cat(
+        (expected, torch.zeros((1, 8), dtype=torch.uint8, device="cuda"))
+    )
     actual = output.view(torch.uint8)
     mismatch = actual != expected
     if bool(mismatch.any()):
         samples = [
             (
-                int(q[row, col]),
-                hex(int(scales[row, col // 4])),
+                int(q[row, col]) if row < q.shape[0] else "padding",
+                hex(int(scales[row, col // 4])) if row < q.shape[0] else "0x0",
                 hex(int(expected[row, col])),
                 hex(int(actual[row, col])),
             )

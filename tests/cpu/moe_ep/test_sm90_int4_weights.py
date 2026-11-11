@@ -90,7 +90,7 @@ def test_scale_tables_rounding_and_linear_row_layout():
     actual_bytes = actual.view(torch.uint8).reshape(*actual.shape, 8)
     expected_rows = {
         scale: torch.tensor(
-            [_fp8_after_bf16(-q * scale) for q in range(1, 9)], dtype=torch.uint8
+            [_fp8_after_bf16(q * scale) for q in range(1, 9)], dtype=torch.uint8
         )
         for scale in values.tolist()
     }
@@ -116,7 +116,7 @@ def test_preprocessing_payload_gate_up_metadata_and_chunking():
             for j in range(8)
         ]
     )
-    code_map = torch.tensor([7, 0, 1, 2, 3, 4, 5, 6, 15, 14, 13, 12, 11, 10, 9, 8])
+    code_map = torch.tensor([11, 0, 1, 2, 3, 8, 9, 10, 15, 14, 13, 12, 7, 6, 5, 4])
     for index, (payload, scales) in enumerate(
         ((raw.w13[:, gate_rows], raw.w13_scale[:, gate_rows]), (raw.w2, raw.w2_scale))
     ):
@@ -129,7 +129,7 @@ def test_preprocessing_payload_gate_up_metadata_and_chunking():
         table_bytes = tables.view(torch.uint8).reshape(*tables.shape, 8)
         for m in range(scales.shape[1]):
             expected = (
-                (-torch.arange(1, 9).float() * scales[:, m, :, None].float())
+                (torch.arange(1, 9).float() * scales[:, m, :, None].float())
                 .bfloat16()
                 .clamp(-448, 448)
                 .to(torch.float8_e4m3fn)

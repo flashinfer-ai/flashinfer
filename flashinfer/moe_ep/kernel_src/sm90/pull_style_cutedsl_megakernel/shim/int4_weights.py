@@ -18,8 +18,8 @@ if TYPE_CHECKING:
 
 INT4_GROUP_SIZE = 128
 INT4_FOLD_M = 64
-# Positive q maps to q-1, zero to 7, and negative q to abs(q)+7.
-INT4_RECODE = (7, 0, 1, 2, 3, 4, 5, 6, 15, 14, 13, 12, 11, 10, 9, 8)
+# Bit 2 is the sign; bits 0, 1 and 3 encode abs(q)-1. Zero uses code 11.
+INT4_RECODE = (11, 0, 1, 2, 3, 8, 9, 10, 15, 14, 13, 12, 7, 6, 5, 4)
 TransformedWeightLeg = tuple[
     "torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor"
 ]
@@ -68,7 +68,7 @@ def interleave_int4_weights(payload: "torch.Tensor") -> "torch.Tensor":
 def fold_int4_scales(scales: "torch.Tensor") -> "torch.Tensor":
     """Build UINT64 tables in ``[E,M/64,K/128,8,8]`` storage.
 
-    Each table stores the E4M3 bytes for ``-1*scale`` through ``-8*scale``.
+    Each table stores the E4M3 bytes for ``1*scale`` through ``8*scale``.
     Multiplication rounds to BF16 before the saturating FP8 conversion.
     Logical M rows are contiguous inside each M64/K128 block, allowing
     lane-quad broadcasts without shared-memory bank conflicts.
@@ -80,10 +80,10 @@ def fold_int4_scales(scales: "torch.Tensor") -> "torch.Tensor":
     e, rows, groups = scales.shape
     if e < 1 or rows < 64 or rows % 64 or groups < 1:
         raise ValueError("INT4 scale folding requires positive E/K and M64 alignment")
-    negatives = -torch.arange(1, 9, dtype=torch.bfloat16, device=scales.device)
+    magnitudes = torch.arange(1, 9, dtype=torch.bfloat16, device=scales.device)
     # Clamp after BF16 multiplication: this also saturates BF16 overflow and
     # avoids the NaN result of an out-of-range float8_e4m3fn cast.
-    values = (scales.unsqueeze(-1) * negatives).clamp(-448, 448)
+    values = (scales.unsqueeze(-1) * magnitudes).clamp(max=448)
     tables = values.to(torch.float8_e4m3fn).view(torch.uint64).squeeze(-1)
     return (
         tables.reshape(e, rows // 64, 8, 8, groups).permute(0, 1, 4, 2, 3).contiguous()

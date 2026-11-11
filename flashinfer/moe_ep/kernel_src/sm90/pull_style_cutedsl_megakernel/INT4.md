@@ -21,10 +21,11 @@ values in `[-8, 7]`, with the lower K element in the low nibble. `H` and `I`
 must be multiples of 128; a K256 tactic requires multiples of 256.
 
 Preprocessing applies gate8/up8 ordering to FC1 and the SM90 INT4 M16/K64
-payload interleave. It recodes positive `q` to `q-1`, zero to `7`, and negative
-`q` to `abs(q)+7`. Each scale becomes an eight-byte table for `-1` through `-8`;
-positive values and zero are derived in registers. PRMT/LOP3 select FP8 bytes,
-reusing each table across the K32 fragments in a K128 group.
+payload interleave. Prepared nibbles store the sign in bit 2 and the
+`abs(q)-1` index in bits 0, 1 and 3; zero uses code 11. Each scale becomes an
+eight-byte table for `1` through `8`. Two PRMT lookups use sign replication
+and XOR to recover four signed FP8 bytes, reusing each table across the K32
+fragments in a K128 group. Zero-filled metadata decodes to signed zeros.
 
 Each prepared leg contains `(payload, tables, unit_activation, unit_expert)`:
 `payload` is uint8 `[E,K/2,M]` with storage-K stride 1; `tables` is contiguous
