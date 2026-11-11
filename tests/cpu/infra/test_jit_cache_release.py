@@ -10,6 +10,12 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
+# These cases source the Linux CI helpers in scripts/jit_cache_build_common.sh,
+# which rely on POSIX tools that the bash shipped on native Windows lacks.
+requires_posix_bash = pytest.mark.skipif(
+    sys.platform == "win32", reason="sources Linux CI bash scripts"
+)
+
 
 def _load_module(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -60,7 +66,9 @@ def release_verifier_module():
 
 @pytest.mark.cpu_only
 def test_provider_release_matrices_are_explicit(cuda_config_module):
-    config = json.loads((REPO_ROOT / "ci" / "cuda-versions.json").read_text())
+    config = json.loads(
+        (REPO_ROOT / "ci" / "cuda-versions.json").read_text(encoding="utf-8")
+    )
 
     cuda_config_module.validate_cuda_config(config, REPO_ROOT)
     provider_matrix = cuda_config_module.build_jit_cache_provider_matrix(config)
@@ -82,7 +90,9 @@ def test_provider_release_matrices_are_explicit(cuda_config_module):
 def test_provider_release_matrix_rejects_duplicate_architectures(
     cuda_config_module,
 ):
-    config = json.loads((REPO_ROOT / "ci" / "cuda-versions.json").read_text())
+    config = json.loads(
+        (REPO_ROOT / "ci" / "cuda-versions.json").read_text(encoding="utf-8")
+    )
     invalid_config = deepcopy(config)
     invalid_config["jit_cache"][0]["x86_64_provider_architectures"].append("8.0")
 
@@ -93,6 +103,7 @@ def test_provider_release_matrix_rejects_duplicate_architectures(
 
 
 @pytest.mark.cpu_only
+@requires_posix_bash
 def test_jit_cache_python_setup_hardens_incomplete_downloads(tmp_path):
     common_script = REPO_ROOT / "scripts" / "jit_cache_build_common.sh"
     fake_python = tmp_path / "python"
@@ -129,6 +140,7 @@ test "${{PIP_BUILD_CONSTRAINT}}" = /tmp/original-build-constraint
 
 
 @pytest.mark.cpu_only
+@requires_posix_bash
 @pytest.mark.parametrize("cuda_version", ["13.0", "130", "13.4", "134", "14.0"])
 def test_sccache_uses_release_for_all_cuda_versions(cuda_version):
     common_script = REPO_ROOT / "scripts" / "jit_cache_build_common.sh"
@@ -150,7 +162,9 @@ printf ' %s %s' "${{FLASHINFER_SCCACHE_INSTALL_SOURCE}}" "${{FLASHINFER_SCCACHE_
 
 @pytest.mark.cpu_only
 def test_pr_aot_matrix_waits_for_published_cuda_image_tag():
-    workflow = (REPO_ROOT / ".github" / "workflows" / "pr-test.yml").read_text()
+    workflow = (REPO_ROOT / ".github" / "workflows" / "pr-test.yml").read_text(
+        encoding="utf-8"
+    )
 
     assert 'grep -q "^flashinfer/flashinfer-ci-${cuda}:" ci/docker-tags.yml' in workflow
     assert "AOT image not published" in workflow
@@ -247,7 +261,9 @@ def test_wheel_index_recognizes_provider_distributions(
 
 def _workflow(name: str) -> dict:
     yaml = pytest.importorskip("yaml")
-    return yaml.safe_load((REPO_ROOT / ".github" / "workflows" / name).read_text())
+    return yaml.safe_load(
+        (REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+    )
 
 
 @pytest.mark.parametrize("caller", ["release.yml", "nightly-release.yml"])
