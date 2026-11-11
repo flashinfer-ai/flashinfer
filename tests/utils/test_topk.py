@@ -2255,8 +2255,9 @@ def _race_num_sms():
     return num_sms
 
 
-def test_top_k_multi_cta_reuses_shared_memory_between_rows():
+def test_top_k_multi_cta_reuses_shared_memory_between_rows(set_topk_algo):
     """A CTA must finish collecting one row before loading the next into shared memory."""
+    set_topk_algo("multi_cta")
     _require_sm80_for_bf16()
     num_sms = _race_num_sms()
     num_rows, vocab_size, k = 3 * num_sms, 65536, 4096
