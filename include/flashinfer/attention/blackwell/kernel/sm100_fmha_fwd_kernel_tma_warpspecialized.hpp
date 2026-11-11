@@ -178,7 +178,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
   CUTLASS_DEVICE void operator()(const Params& params, char* smem) {
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
+    cudaGridDependencySynchronize();
 #endif
 
     TileScheduler tile_scheduler{params.tile_scheduler};

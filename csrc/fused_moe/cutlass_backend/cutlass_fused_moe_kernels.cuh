@@ -275,7 +275,7 @@ __global__ void buildMinLatencyActiveExpertMapsKernel(
     int const start_expert, int const end_expert, int const num_experts_per_node,
     bool const smart_routing, int const cluster_rank, int const cluster_size,
     int const num_experts_smem) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
   // Use one block to process the min latency case
@@ -368,7 +368,7 @@ __global__ void buildMinLatencyActiveExpertMapsKernel(
       expert_first_token_offset[i_exp] = num_active * num_tokens;
     }
   }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -430,7 +430,7 @@ __global__ void fusedBuildExpertMapsSortFirstTokenKernel(
   int local_token_permuted_indices[EXPERTS_PER_TOKEN];
 
   // Wait PDL before reading token_selected_experts
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
 
@@ -471,7 +471,7 @@ __global__ void fusedBuildExpertMapsSortFirstTokenKernel(
                                      extractor, local_expert_first_token_offset);
 
 // We are done with compute, launch the dependent kernels while the stores are in flight
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
@@ -671,7 +671,7 @@ __global__ void blockExpertPrefixSumKernel(int const* token_selected_experts,
   int const num_blocks_per_seq = gridDim.y;
   int const token_id = block_id * kNumTokensPerBlock + threadIdx.x;
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
 
@@ -700,7 +700,7 @@ __global__ void blockExpertPrefixSumKernel(int const* token_selected_experts,
     blocked_expert_counts[target_expert_id * num_blocks_per_seq + block_id] = index + has_matched;
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -754,7 +754,7 @@ __global__ void globalExpertPrefixSumLargeKernel(int const* blocked_expert_count
   int offset = threadIdx.x * num_elem_per_thread;
   int cnt = 0;
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
 
@@ -783,7 +783,7 @@ __global__ void globalExpertPrefixSumLargeKernel(int const* blocked_expert_count
     }
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -797,7 +797,7 @@ __global__ void globalExpertPrefixSumKernel(int const* blocked_expert_counts,
   using BlockScan = cub::BlockScan<int, kNumThreadsPerBlock>;
   __shared__ typename BlockScan::TempStorage temp_storage;
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
 
@@ -817,7 +817,7 @@ __global__ void globalExpertPrefixSumKernel(int const* blocked_expert_counts,
     }
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -880,7 +880,7 @@ __global__ void mergeExpertPrefixSumKernel(int const* blocked_expert_counts,
   int const num_blocks_per_seq = gridDim.y;
   int const token_id = block_id * blockDim.x + threadIdx.x;
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
 
@@ -895,7 +895,7 @@ __global__ void mergeExpertPrefixSumKernel(int const* blocked_expert_counts,
     unpermuted_row_to_permuted_row[unpermuted_row] = permuted_row;
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -1402,7 +1402,7 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
     return;
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
 
@@ -1471,7 +1471,7 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
   // pointers) is only needed for active experts.
   // For decode (1 token, top_k=8, 128 experts), this skips ~120 of 128 experts.
   if (gemm_m == 0) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
     return;
@@ -1535,7 +1535,7 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
   computeTmaWarpSpecializedInputPointers(
       layout_info2, gemm_m, gemm2_n, gemm2_k, num_tokens_before_expert, expert, gemm2_in, weights2,
       fc2_weight_scale, bias2, gemm2_output, router_scales, permuted_row_to_unpermuted_row, expert);
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -1614,7 +1614,7 @@ __global__ void expandInputRowsKernel(
           BlockScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4,
       "NVFP4 4over6 requires NVFP4 block scaling");
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
 
@@ -1800,7 +1800,7 @@ __global__ void expandInputRowsKernel(
     }
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
@@ -1990,7 +1990,7 @@ __global__ void finalizeMoeRoutingKernel(
   auto const* expanded_permuted_rows_v = reinterpret_cast<InputElem const*>(expanded_permuted_rows);
   auto* reduced_row_ptr_v = reinterpret_cast<OutputElem*>(reduced_row_ptr);
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
 
@@ -2031,7 +2031,7 @@ __global__ void finalizeMoeRoutingKernel(
     OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
     reduced_row_ptr_v[elem_index] = output_elem;
   }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -2051,7 +2051,7 @@ __global__ void finalizeMoeRoutingNoFillingKernel(
   assert(unpadded_cols % 4 == 0);
   assert(unpadded_cols <= padded_cols);
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
 
@@ -2134,7 +2134,7 @@ __global__ void finalizeMoeRoutingNoFillingKernel(
       reduced_row_ptr_v[elem_index] = output_elem;
     }
   }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -2493,7 +2493,7 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
 
   int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
   for (int64_t token = blockIdx.x; token < num_valid_tokens; token += gridDim.x) {
@@ -2653,7 +2653,7 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
     }
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 

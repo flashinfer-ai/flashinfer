@@ -474,7 +474,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
                        float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
+    cudaGridDependencySynchronize();
 #endif
     // apply rotary embedding to q matrix
     q_vec = vec_apply_llama_rope<vec_size, bdx>(
@@ -482,7 +482,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   } else {
 // do not apply rotary embedding to q matrix
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
+    cudaGridDependencySynchronize();
 #endif
     q_vec.cast_load(q + batch_idx * q_stride_n + qo_head_idx * q_stride_h + tx * vec_size);
   }
@@ -619,7 +619,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     }
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -986,7 +986,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
                                                           float(head_dim_kpe));
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
   // load q_nope and q_pe tile
 #pragma unroll
@@ -1113,7 +1113,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
     }
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
