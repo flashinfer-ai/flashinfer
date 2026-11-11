@@ -42,6 +42,10 @@ from flashinfer.tllm_enums import (
     DEFAULT_SWIGLU_LIMIT,
 )
 from flashinfer.utils import get_compute_capability
+from flashinfer.quantization.nvfp4_quantization_utils import (
+    _UNSET,
+    NVFP44Over6Config,
+)
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.trace.templates.gemm import grouped_gemm_nt_masked_trace
 from flashinfer.cute_dsl.utils import get_num_sm
@@ -77,6 +81,7 @@ def grouped_gemm_nt_masked(
     a_per_token_scale: Optional[torch.Tensor] = None,
     out_scale: Optional[torch.Tensor] = None,
     global_scale: Optional[torch.Tensor] = None,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     **kwargs,
 ):
     r"""Masked, batched, block-scaled GEMM on Blackwell (SM100/SM103) and Rubin (SM107).
@@ -204,13 +209,23 @@ def grouped_gemm_nt_masked(
         quantizing a BF16 output with that function.  Requires
         ``mma_tiler_mn[0] == 128``, ``n`` a multiple of ``mma_tiler_mn[1]``
         and ``n_out`` a multiple of 64.  Works with or without
-        ``activation_type``.  Raises ``ValueError`` when
-        ``FLASHINFER_NVFP4_4OVER6`` or ``FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH``
+        ``activation_type``.  Raises ``ValueError`` when 4over6 is enabled
+        (see ``nvfp4_4over6``) or ``FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH``
         is set, since the epilogue does not implement those recipes.
     global_scale : Optional[torch.Tensor]
         Required when ``c_dtype="float4_e2m1fn"``.  Contiguous ``float32``
         tensor of shape ``(l,)`` with the per-batch NVFP4 global scale, as the
         ``a_global_sf`` argument of ``scaled_fp4_grouped_quantize``.
+    nvfp4_4over6 : NVFP44Over6Config or None
+        NVFP4 4over6 recipe of the NVFP4 output, with the semantics of the
+        same argument of ``scaled_fp4_grouped_quantize``.  The epilogue only
+        implements the standard recipe, so a resolved 4over6 recipe raises
+        ``ValueError``.
+
+        - omitted (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables.
+        - ``None``: 4over6 off. The environment is ignored.
+        - :class:`NVFP44Over6Config`: not supported.
     **kwargs
         Additional keyword arguments.  Currently recognized:
 
@@ -303,6 +318,7 @@ def grouped_gemm_nt_masked(
                 ("a_per_token_scale", a_per_token_scale, None),
                 ("out_scale", out_scale, None),
                 ("global_scale", global_scale, None),
+                ("nvfp4_4over6", nvfp4_4over6, _UNSET),
             )
             if value is not default
         ]
@@ -375,6 +391,7 @@ def grouped_gemm_nt_masked(
             a_per_token_scale=a_per_token_scale,
             out_scale=out_scale,
             global_scale=global_scale,
+            nvfp4_4over6=nvfp4_4over6,
             **kwargs,
         )
 

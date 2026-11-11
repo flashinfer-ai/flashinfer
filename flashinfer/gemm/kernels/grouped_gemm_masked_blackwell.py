@@ -69,7 +69,12 @@ from flashinfer.cute_dsl.fp4_common import (
     nvfp4_compute_output_scale,
     rcp_approx_ftz,
 )
-from flashinfer.quantization.nvfp4_quantization_utils import env_flag_enabled
+from flashinfer.quantization.nvfp4_quantization_utils import (
+    _UNSET,
+    NVFP44Over6Config,
+    env_flag_enabled,
+    resolve_nvfp4_4over6,
+)
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
@@ -4051,9 +4056,9 @@ def _reject_gated_activation_args(
         raise ValueError(f"{', '.join(stray)} require activation_type")
 
 
-# TRTLLM_DISABLE_FP4_QUANT_FAST_MATH is the alias honored by the CUDA quantizer.
-_NVFP4_RECIPE_ENV_VARS = (
-    "FLASHINFER_NVFP4_4OVER6",
+# The fast-math switch has no parameter; TRTLLM_DISABLE_FP4_QUANT_FAST_MATH is
+# the alias honored by the CUDA quantizer.
+_NVFP4_FAST_MATH_ENV_VARS = (
     "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
     "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
 )
@@ -4069,10 +4074,19 @@ def _validate_nvfp4_output(
     n_out,
     l,
     mma_tiler_mn,
+    nvfp4_4over6,
 ) -> None:
     # The epilogue implements only the default recipe; these switches change
     # the standalone quantizers, so the fused output would silently diverge.
-    enabled = [name for name in _NVFP4_RECIPE_ENV_VARS if env_flag_enabled(name)]
+    recipe = resolve_nvfp4_4over6(nvfp4_4over6)
+    if recipe is not None:
+        raise ValueError(
+            "c_dtype='float4_e2m1fn' only implements the default NVFP4 recipe, "
+            f"but 4over6 is enabled ({recipe!r} from nvfp4_4over6= or "
+            "FLASHINFER_NVFP4_4OVER6); pass nvfp4_4over6=None or quantize the "
+            "output with a separate kernel"
+        )
+    enabled = [name for name in _NVFP4_FAST_MATH_ENV_VARS if env_flag_enabled(name)]
     if enabled:
         raise ValueError(
             "c_dtype='float4_e2m1fn' only implements the default NVFP4 "
@@ -4154,6 +4168,7 @@ def _grouped_gemm_nt_masked_sm100(
     a_per_token_scale: Optional[torch.Tensor] = None,
     out_scale: Optional[torch.Tensor] = None,
     global_scale: Optional[torch.Tensor] = None,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     **kwargs,
 ):
     """
@@ -4234,7 +4249,7 @@ def _grouped_gemm_nt_masked_sm100(
         ``False``.
     activation_type, swiglu_alpha, swiglu_beta, swiglu_limit, alpha_up, a_per_token_scale
         Fused gated activation; see ``grouped_gemm_nt_masked``.
-    out_scale, global_scale
+    out_scale, global_scale, nvfp4_4over6
         NVFP4 output (``c_dtype="float4_e2m1fn"``); see ``grouped_gemm_nt_masked``.
     **kwargs
         Additional keyword arguments.  Currently recognized:
@@ -4295,8 +4310,12 @@ def _grouped_gemm_nt_masked_sm100(
             raise NotImplementedError(
                 f"{feature} does not support: " + ", ".join(unsupported)
             )
-    if not quantize_output and (out_scale is not None or global_scale is not None):
-        raise ValueError("out_scale and global_scale require c_dtype='float4_e2m1fn'")
+    if not quantize_output and (
+        out_scale is not None or global_scale is not None or nvfp4_4over6 is not _UNSET
+    ):
+        raise ValueError(
+            "out_scale, global_scale and nvfp4_4over6 require c_dtype='float4_e2m1fn'"
+        )
 
     if is_swap_ab:
         a_torch, sfa_torch = rhs
@@ -4401,6 +4420,7 @@ def _grouped_gemm_nt_masked_sm100(
             n_out=n // 2 if activation_type is not None else n,
             l=l,
             mma_tiler_mn=mma_tiler_mn,
+            nvfp4_4over6=nvfp4_4over6,
         )
 
     if is_combine_fusion:
