@@ -14,11 +14,14 @@
 
 """Task definitions for the FMHA decode TS kernel.
 
-The schedule follows the SwapsMmaAb decode pipeline shape:
+Shared K/V streams follow the SwapsMmaAb decode pipeline shape:
 
 - HEAD: initial Q / K setup and first BMM1 wave
 - LOOP: staggered K/V loads with Qk0 -> Pv0 -> Qk1 -> Pv1
 - TAIL: final V loads, final BMM2, final correction/output
+
+Separate-operand conversion creates independent K and V tasks and rings;
+the MMA task still issues QK and PV serially.
 
 Each schedule is written as explicit TS resource transitions. Producer
 resources use acquire/work/commit; consumer resources use wait/work/release.
@@ -51,13 +54,12 @@ from cutlass.experimental.task_scheduling.schedule_builder import (
 )
 from cutlass.experimental.task_scheduling.task import Task
 
-from ....sage.modes import SageScoreScaling
-from ...stage import FmhaStage
-from ...task_compat import task_context_kwargs
-from ..direct_sparse_metadata import DirectSparseMetadataView
-from ..direct_sparse_metadata import HeadIndexedMetadataView
-from ..fmha_decode_config import FmhaDecodeConfig
-from ..fmha_decode_constants import (
+from ...sage.modes import SageScoreScaling
+from ..stage import FmhaStage
+from ..task_compat import task_context_kwargs
+from .direct_sparse_metadata import DirectSparseMetadataView, HeadIndexedMetadataView
+from .fmha_decode_config import FmhaDecodeConfig
+from .fmha_decode_constants import (
     KV_INST0,
     KV_INST1,
     KV_KIND_K,
@@ -65,7 +67,7 @@ from ..fmha_decode_constants import (
 )
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 
-from ..fmha_decode_resources.helpers_common import (
+from .fmha_decode_resources.helpers_common import (
     split_kv_grid_coord,
     UniformQueryOffsets,
     _assume_nonnegative_i32,
@@ -73,7 +75,7 @@ from ..fmha_decode_resources.helpers_common import (
     _q_seq_bounds,
     _warp_broadcast_i32,
 )
-from ..fmha_decode_resources.helpers_kv_tile_idx import (
+from .fmha_decode_resources.helpers_kv_tile_idx import (
     _runtime_last_valid_page_idx,
     _runtime_configured_local_kv_tiles,
     _runtime_total_kv_tiles,
@@ -2670,6 +2672,98 @@ def create_mma_task_split_kv(
     )
 
 
+def create_mma_task_dual_transform_kv(
+    smem_q: MemoryResource,
+    tmem_k: MemoryResource,
+    tmem_v: MemoryResource,
+    tmem_s0: MemoryResource,
+    smem_p0: MemoryResource,
+    tmem_o: MemoryResource,
+    cfg: FmhaDecodeConfig,
+    *,
+    domain: int | cutlass.Int32,
+    **kw: TaskKwarg,
+) -> Task:
+    """Create the MMA task that reads K and V from separate converted FIFOs.
+
+    HEAD issues QK for the first tile. Each LOOP iteration issues QK for the
+    next tile before PV for the current one, so QK can proceed while Softmax
+    still owns the current P. TAIL issues the last PV after releasing Q.
+    """
+    assert cfg.uses_dual_kv_transform
+
+    @schedule
+    def mma_schedule(
+        smem_q: MemoryResource,
+        tmem_k: MemoryResource,
+        tmem_v: MemoryResource,
+        tmem_s0: MemoryResource,
+        smem_p0: MemoryResource,
+        tmem_o: MemoryResource,
+    ):
+        """Issue QK from the K FIFO and PV from the V FIFO for each work tile."""
+
+        def prelude():
+            """Initialize descriptor slots that stay valid across work tiles."""
+            smem_q.init_descriptor_state()
+            tmem_k.init_descriptor_state()
+            tmem_v.init_descriptor_state()
+            smem_p0.init_descriptor_state()
+
+        def body(q_desc):
+            """Issue the HEAD/LOOP/TAIL QK and PV waves for one work tile."""
+            _consume_staged_qk_mma(
+                tmem_k, tmem_s0, q_desc, "k_desc_0", "qk_mma_head", FmhaStage.Head, cfg
+            )
+            with domain_loop(0, domain, 1, unroll=1):
+                _consume_staged_qk_mma(
+                    tmem_k,
+                    tmem_s0,
+                    q_desc,
+                    "k_desc_0",
+                    "qk_mma_loop",
+                    FmhaStage.Loop,
+                    cfg,
+                )
+                _consume_staged_pv_mma(
+                    tmem_v,
+                    smem_p0,
+                    tmem_o,
+                    "v_desc_0",
+                    "vp_mma_loop",
+                    0,
+                    FmhaStage.Loop,
+                    cfg,
+                )
+            smem_q.release()
+            _consume_staged_pv_mma(
+                tmem_v,
+                smem_p0,
+                tmem_o,
+                "v_desc_0",
+                "vp_mma_tail",
+                0,
+                FmhaStage.Tail,
+                cfg,
+            )
+
+        _decode_work_tile_schedule_with_invariant_bridge(
+            cfg, None, prelude, lambda: smem_q.q_desc(), lambda: smem_q.wait(), body
+        )
+
+    return DecodeGenTask(
+        src_resources=[smem_q, tmem_k, tmem_v, smem_p0],
+        dst_resources=[tmem_s0, tmem_o],
+        cfg=cfg,
+        warp_idx=cfg.mma_warp_idx,
+        num_warps=cfg.mma_num_warps,
+        schedule=mma_schedule(smem_q, tmem_k, tmem_v, tmem_s0, smem_p0, tmem_o),
+        num_registers=cfg.mma_load_task_num_registers,
+        name="MmaTask",
+        **kw,
+    )
+
+
 def create_mma_task_one_inst_qkv(
     smem_q: MemoryResource,
     smem_k: MemoryResource,
@@ -2827,6 +2921,122 @@ def create_mma_task_one_inst_qkv(
 # Mirrors LoadTask's shared-KV cadence and converts raw K/V into the Q-side
 # MMA input type before MmaTask consumes it.
 # ======================================================================
+def create_kv_operand_transform_task(
+    smem_kv: MemoryResource,
+    converted_kv: MemoryResource,
+    cfg: FmhaDecodeConfig,
+    *,
+    domain: int | cutlass.Int32,
+    is_v: bool,
+    **kw: TaskKwarg,
+) -> Task:
+    """Create the converter for one operand of the dual K/V transform.
+
+    Each call creates one task. ``is_v`` selects its operand and warp group.
+    The destination is an FP8 SMEM ring for D256 Keeps or a TMEM FIFO for
+    the dual-transform Swaps profile. K runs one tile ahead of V, matching
+    the MMA task: HEAD converts the first K tile, each
+    LOOP iteration converts the next K (or the current V), and TAIL converts
+    the last V. Every tile converts all ``num_head_dim_stages_kv`` stages.
+    """
+    assert cfg.uses_dual_kv_transform or cfg.uses_dual_smem_transform
+    label = "transform_v0" if is_v else "transform_k0"
+    # The SMEM dual transform runs V in the transform_kv1 warp group.
+    v_warp_idx = (
+        cfg.transform_kv1_warp_idx
+        if cfg.uses_dual_smem_transform
+        else cfg.transform_v_warp_idx
+    )
+    v_num_warps = (
+        cfg.transform_kv1_num_warps
+        if cfg.uses_dual_smem_transform
+        else cfg.transform_v_num_warps
+    )
+    v_num_registers = (
+        cfg.transform_kv1_task_num_registers
+        if cfg.uses_dual_smem_transform
+        else cfg.transform_v_task_num_registers
+    )
+
+    # At D512 the four unrolled per-stage bodies of each converter crowd the
+    # Q64 softmax out of the instruction cache. Register-prefetched D256 also
+    # keeps one conversion body per operand. Select the head slice at run time.
+    stages = cfg.num_head_dim_stages_kv
+    early_prefetch = cfg.uses_prefetched_smem_nvfp4_transform
+    flatten_loop = stages == 4 or early_prefetch
+
+    @schedule
+    def conversion_schedule(smem_kv: MemoryResource, converted_kv: MemoryResource):
+        """Convert one operand's raw ring into its converted FIFO for each work tile."""
+        smem_kv.init_descriptor_state()
+
+        def body():
+            """Convert every tile of one work tile into the converted FIFO."""
+            converted_kv.init_load_state()
+
+            def convert_stage(work):
+                """Convert one raw stage into one converted FIFO slot."""
+                converted_kv.acquire()
+                smem_kv.wait()
+                work()
+                converted_kv.commit()
+                smem_kv.release()
+
+            def convert_prefetched_stage(read_row):
+                """Release the raw slot before waiting for the FP8 destination."""
+                smem_kv.wait()
+                packet = read_row()
+                smem_kv.release()
+                converted_kv.acquire()
+                converted_kv.transform_prefetched_row(packet=packet)
+                converted_kv.commit()
+
+            def convert_tile():
+                """Convert one KV tile, one head-dimension stage at a time."""
+                for head_stage in range(stages):
+                    if early_prefetch:
+                        convert_prefetched_stage(
+                            lambda head_stage=head_stage: smem_kv.prefetch_nvfp4_row(
+                                head_dim_stage_idx=head_stage
+                            )
+                        )
+                    else:
+                        convert_stage(
+                            lambda head_stage=head_stage: getattr(converted_kv, label)(
+                                head_dim_stage_idx=head_stage
+                            )
+                        )
+
+            if not is_v:
+                convert_tile()
+            if flatten_loop:
+                with domain_loop(0, domain * stages, 1, unroll=1):
+                    if early_prefetch:
+                        convert_prefetched_stage(smem_kv.prefetch_nvfp4_loop_row)
+                    else:
+                        convert_stage(getattr(converted_kv, f"{label}_loop_stage"))
+            else:
+                with domain_loop(0, domain, 1, unroll=1):
+                    convert_tile()
+            if is_v:
+                convert_tile()
+
+        _decode_work_tile_schedule(cfg, None, body)
+
+    return DecodeGenTask(
+        src_resources=[smem_kv],
+        dst_resources=[converted_kv],
+        cfg=cfg,
+        warp_idx=v_warp_idx if is_v else cfg.transform_kv_warp_idx,
+        num_warps=v_num_warps if is_v else cfg.transform_kv_num_warps,
+        schedule=conversion_schedule(smem_kv, converted_kv),
+        num_registers=v_num_registers if is_v else cfg.transform_kv_task_num_registers,
+        name="TransformVTask" if is_v else "TransformKTask",
+        domain_scale=stages if flatten_loop else 1,
+        **kw,
+    )
+
+
 def create_transform_kv_task(
     smem_kv: MemoryResource | None,
     smem_k0: MemoryResource | None,

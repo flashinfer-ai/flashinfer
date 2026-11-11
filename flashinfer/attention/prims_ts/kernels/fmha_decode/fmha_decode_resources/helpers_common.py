@@ -958,3 +958,42 @@ def gather_byte_of_words(
         write_only_types=[Int32],
         read_only_args=[w0, w1, w2, w3, pair_sel],
     )
+
+
+@cute.jit
+def load_nvfp4_row_scale_words(
+    src_sf_base: cutlass.Array,
+    row: Int32,
+    head_dim_stage_idx: Int32 | int,
+    *,
+    sf_bytes_per_token: Constexpr[int],
+    sf_tile_bytes: Constexpr[int],
+    is_v: Constexpr[bool],
+) -> tuple[Int32, Int32]:
+    """Load eight E4M3 scales for one 128-value row slice as two words."""
+    if cutlass.const_expr(not is_v):
+        scales = cutlass.Array(
+            src_sf_base.data_ptr(),
+            dtype=Int64,
+            shape=(sf_tile_bytes // 8,),
+            addrspace=3,
+        )
+        pair = scales[row * Int32(sf_bytes_per_token // 8) + Int32(head_dim_stage_idx)]
+        return Int32(pair), Int32(pair >> Int64(32))
+    else:
+        # V interleaves four tokens: each lane gathers its byte from eight words.
+        scales = cutlass.Array(
+            src_sf_base.data_ptr(),
+            dtype=Int32,
+            shape=(sf_tile_bytes // 4,),
+            addrspace=3,
+        )
+        base = (row >> Int32(2)) * Int32(sf_bytes_per_token) + Int32(
+            head_dim_stage_idx * 8
+        )
+        words = [scales[base + Int32(i)] for i in range(8)]
+        token = row & Int32(3)
+        return (
+            gather_byte_of_words(words[0], words[1], words[2], words[3], token),
+            gather_byte_of_words(words[4], words[5], words[6], words[7], token),
+        )

@@ -23,8 +23,8 @@ Q tiles of 48 rows or more, for fixed grouped paged queries:
 
 | Tile | Head dim | Q / K/V storage | Output | CTAs per SM |
 | --- | --- | --- | --- | --- |
-| Swaps Q48 | 128, 256 | FP8 / NVFP4 | FP16, BF16 | 2 |
-| Swaps Q64 | 128 | FP8 / NVFP4 | FP16, BF16 | 2 |
+| Swaps Q48 | 128, 256 | FP8 / NVFP4 | FP16, BF16 | 1 |
+| Swaps Q64 | 128 | FP8 / NVFP4 | FP16, BF16 | 1 |
 | Swaps Q64 | 256, 512 | FP8 / NVFP4 | FP16, BF16 | 1 |
 | Swaps Q128 | 128, 256 | FP8 / NVFP4 | FP16, BF16 | 1 |
 | Keeps Q128 | 128 | FP8 / FP8 | FP16, BF16 | 1 |
@@ -37,19 +37,28 @@ FP8 output keep their narrower tiles. D512/Q128 is rejected: its PV
 accumulators alone need all 512 TMEM columns. D512 converts K and V in
 separate warp groups. Keeps Q64 NVFP4 converts K/V into FP8 SMEM rings in
 separate warp groups: one per KV instance at D128, one per operand at D256.
-It requires the grouped token/head layout.
+It requires the grouped token/head layout. This table describes supported
+profiles, not a performance ranking. Keeps Q64 is effective for D256,
+while D128 selection depends on query grouping and work per CTA. Swaps Q64
+also provides D512 coverage, where the Keeps NVFP4 profile is not implemented.
 
 Native SM107 targets use compact FP4 repacking for TMEM conversion and retain
-dense nibble pairs for SMEM conversion. When a KV tile matches one page, the
-native SM107 fast SMEM converter loads and converts one 16-byte chunk at a time
-to shorten register live ranges. Other page geometries and targets retain
-whole-row lookahead. D256 defaults can use the 327-KiB shared-memory capacity
-for three complete raw K/V tiles; family targets retain
-the portable capacity. The BF16-output policy also compares Q1 Keeps on full
-Q grids and on underfilled grids with at least 32K KV tokens. Extra waves from
-underfilled Keeps grids retain at least 8K KV tokens per CTA. Full Q grids and
-those extra-wave launches use one complete raw K/V tile; underfilled one-wave
-launches retain three. FP16 and FP8 output keep their existing policies.
+dense nibble pairs for SMEM conversion. Dense D256 one-instance Keeps profiles
+with matching page and KV-tile sizes prefetch each packed row and its scales
+into registers, then release raw SMEM before waiting for the converted FP8
+slot. Separate K/V groups retain one conversion body per operand in the
+steady-state loop. Three complete raw K/V tiles provide load lookahead;
+bounded runtime splits retain up to 128 page IDs for their local window.
+
+Other matching-page fast SMEM profiles stream 16-byte chunks. Cross-page
+profiles and other targets retain their existing whole-row lookahead.
+Native SM107 D256 can use the 327-KiB shared-memory capacity; family targets
+retain the portable capacity. The BF16-output policy compares Q1 Keeps on
+full Q grids and on underfilled grids with at least 32K KV tokens. Extra
+waves from underfilled Keeps grids retain at least 8K KV tokens per CTA.
+Non-prefetched full-grid profiles use one raw K/V tile; underfilled one-wave
+launches retain three. Explicit launch controls take precedence, and FP16
+and FP8 output retain their dispatch choices.
 
 Automatic grouped-Q selection accounts for software conversion cost on SM107.
 Split candidates whose logical Q grid exceeds the shared fused-counter reserve
@@ -301,8 +310,7 @@ captured addresses and shapes.
 | [`../../decode.py`](../../decode.py) | Public validation, planning, workspace binding, JIT caching, and launch adaptation |
 | [`fmha_decode_config.py`](fmha_decode_config.py) | Kernel configuration and automatic launch selection |
 | [`fmha_decode_kernel.py`](fmha_decode_kernel.py) | TS kernel construction and launch |
-| [`fmha_decode_tasks/fmha_decode_tasks.py`](fmha_decode_tasks/fmha_decode_tasks.py) | Ordered load, MMA, softmax, correction, store, and scheduler work |
-| [`fmha_decode_tasks/fmha_decode_dual_transform_task.py`](fmha_decode_tasks/fmha_decode_dual_transform_task.py) | Separate K and V conversion tasks and their MMA task |
+| [`fmha_decode_tasks.py`](fmha_decode_tasks.py) | Ordered load, MMA, softmax, correction, store, and scheduler work |
 | [`fmha_decode_resources/`](fmha_decode_resources/) | GMEM/SMEM/TMEM resources and pipeline state |
 | [`reduction.py`](reduction.py) | Separate split-KV reduction |
 | [`block_sparse_prepare.py`](block_sparse_prepare.py) | Prepare of a block-sparse plan's compact route records from BSR or bitmask inputs |

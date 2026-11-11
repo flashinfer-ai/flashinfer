@@ -19,7 +19,7 @@ from typing import ClassVar
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64
+from cutlass import Int32
 from cutlass.experimental import primitives as prims
 from cutlass.experimental.task_scheduling.enums import WorkAttr
 from cutlass.experimental.task_scheduling.memory import (
@@ -37,9 +37,13 @@ from cutlass.experimental.task_scheduling.resources import (
 from ...._hardware import is_sm107_compile_target
 from ...placeholder_helpers import _placeholder_smem_array
 from ..fmha_decode_config import FmhaDecodeConfig
-from ..fmha_decode_constants import KV_INST0, KV_KIND_K, KV_KIND_V
+from ..fmha_decode_constants import (
+    KV_INST0,
+    KV_KIND_K,
+    KV_KIND_V,
+    NVFP4_ROW_PACKED_WORDS,
+)
 from .helpers_common import (
-    gather_byte_of_words,
     _TASK_CACHE_WARP_GRP_THREAD_IDX,
     Constexpr,
     DecodeGenResourceBase,
@@ -47,6 +51,7 @@ from .helpers_common import (
     _decode_gen_task_cache,
     _major_k_stride_bytes,
     _qkv_smem_swizzle,
+    load_nvfp4_row_scale_words,
 )
 from .smem_resources import SmemKvResource, SmemKvTileResource
 from .tmem_transformed_kv import (
@@ -163,6 +168,37 @@ def unpack_e2m1x8_word(word: Int32) -> tuple[Int32, Int32]:
         read_only_args=[lo, hi],
     )
     return first, second
+
+
+@cute.jit
+def store_nvfp4_fp8_row_block(
+    dst_words: cutlass.Array,
+    row: Int32,
+    block: Constexpr[int],
+    word0: Int32,
+    word1: Int32,
+    scale_word: Int32,
+) -> None:
+    """Convert sixteen packed FP4 values into one 16-byte swizzled FP8 block."""
+    fp8_words = []
+    packed_words = (word0, word1)
+    for w in cutlass.range_constexpr(2):
+        if cutlass.const_expr(_has_packed_e4m3_e2m1_mul()):
+            unpacked = unpack_e2m1x8_word(packed_words[w])
+            for part in cutlass.range_constexpr(2):
+                fp8_words.append(
+                    _mul_e2m1x4_e4m3x4_bx(unpacked[part], scale_word, block % 4)
+                )
+        else:
+            scale = (scale_word >> Int32((block % 4) * 8)) & Int32(255)
+            converted = _cvt_e2m1_word_to_e4m3_words(packed_words[w], scale)
+            fp8_words.append(converted[0])
+            fp8_words.append(converted[1])
+    (
+        dst_words.data_ptr()
+        + row * Int32(32)
+        + ((Int32(block) ^ (row & Int32(7))) << Int32(2))
+    ).store(cutlass.Vector.from_elements(tuple(fp8_words), Int32), alignment=16)
 
 
 @dataclass(kw_only=True)
@@ -480,48 +516,15 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
             shape=(cfg.smem_transformed_kv_tile_bytes // 4,),
             addrspace=3,
         )
-        sf_bytes_per_token = cfg.smem_kv_sf_bytes_per_token
-        scales_per_stage = cfg.head_dim_kv_stage // 16
-        # scale_words = (scales of blocks 0-3, scales of blocks 4-7), one
-        # E4M3 byte per 16-column block.
-        if cutlass.const_expr(not is_v):
-            # K scales are token-major: 8 contiguous bytes for this stage.
-            src_sf_qwords = cutlass.Array(
-                src_sf_base.data_ptr(),
-                dtype=Int64,
-                shape=(cfg.smem_kv_sf_tile_bytes // 8,),
-                addrspace=3,
-            )
-            sf_qword = src_sf_qwords[
-                row * Int32(sf_bytes_per_token // 8) + Int32(head_dim_stage_idx)
-            ]
-            scale_words = (Int32(sf_qword), Int32(sf_qword >> Int64(32)))
-        else:
-            # V scales interleave four tokens: byte (r//4)*4*S + blk*4 + r%4
-            # for S scale bytes per token, i.e. byte r%4 of word (r//4)*S + blk.
-            src_sf_words = cutlass.Array(
-                src_sf_base.data_ptr(),
-                dtype=Int32,
-                shape=(cfg.smem_kv_sf_tile_bytes // 4,),
-                addrspace=3,
-            )
-            word_base = (row >> Int32(2)) * Int32(sf_bytes_per_token) + Int32(
-                head_dim_stage_idx * scales_per_stage
-            )
-            words = [
-                src_sf_words[word_base + Int32(blk)] for blk in range(scales_per_stage)
-            ]
-            token_in_group = row & Int32(3)
-            scale_words = (
-                gather_byte_of_words(
-                    words[0], words[1], words[2], words[3], token_in_group
-                ),
-                gather_byte_of_words(
-                    words[4], words[5], words[6], words[7], token_in_group
-                ),
-            )
+        scale_words = load_nvfp4_row_scale_words(
+            src_sf_base,
+            row,
+            head_dim_stage_idx,
+            sf_bytes_per_token=cfg.smem_kv_sf_bytes_per_token,
+            sf_tile_bytes=cfg.smem_kv_sf_tile_bytes,
+            is_v=is_v,
+        )
         src_swizzle = (row >> Int32(1)) & Int32(3)
-        dst_swizzle = row & Int32(7)
         # Stream each chunk through SM107's fallback conversion when the
         # KV tile occupies one page, shortening packed-data live ranges.
         # Cross-page tiles retain whole-row lookahead for load/convert overlap.
@@ -549,34 +552,13 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
                 ).load(count=4, alignment=16)
             for half in cutlass.range_constexpr(2):
                 blk = chunk * 2 + half
-                fp8_words = []
-                for w in cutlass.range_constexpr(2):
-                    if cutlass.const_expr(_has_packed_e4m3_e2m1_mul()):
-                        unpacked = unpack_e2m1x8_word(packed_chunk[half * 2 + w])
-                        for part in cutlass.range_constexpr(2):
-                            fp8_words.append(
-                                _mul_e2m1x4_e4m3x4_bx(
-                                    unpacked[part], scale_words[blk // 4], blk % 4
-                                )
-                            )
-                    else:
-                        # The f16x2 converter consumes dense nibble pairs.
-                        # Avoid expanding to bytes only to repack them again.
-                        scale = (scale_words[blk // 4] >> Int32((blk % 4) * 8)) & Int32(
-                            255
-                        )
-                        converted = _cvt_e2m1_word_to_e4m3_words(
-                            packed_chunk[half * 2 + w], scale
-                        )
-                        fp8_words.append(converted[0])
-                        fp8_words.append(converted[1])
-                (
-                    dst_words.data_ptr()
-                    + row * Int32(32)
-                    + ((Int32(blk) ^ dst_swizzle) << Int32(2))
-                ).store(
-                    cutlass.Vector.from_elements(tuple(fp8_words), Int32),
-                    alignment=16,
+                store_nvfp4_fp8_row_block(
+                    dst_words,
+                    row,
+                    blk,
+                    packed_chunk[half * 2],
+                    packed_chunk[half * 2 + 1],
+                    scale_words[blk // 4],
                 )
 
     @cute.jit
@@ -690,24 +672,16 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
             shape=(cfg.smem_transformed_kv_tile_bytes // 4,),
             addrspace=3,
         )
-        dst_swizzle = row & Int32(7)
         for chunk in cutlass.range_constexpr(4):
             for half in cutlass.range_constexpr(2):
                 blk = chunk * 2 + half
-                scale = (packet[16 + blk // 4] >> Int32((blk % 4) * 8)) & Int32(255)
-                fp8_words = []
-                for w in cutlass.range_constexpr(2):
-                    converted = _cvt_e2m1_word_to_e4m3_words(
-                        packet[chunk * 4 + half * 2 + w], scale
-                    )
-                    fp8_words.append(converted[0])
-                    fp8_words.append(converted[1])
-                (
-                    dst_words.data_ptr()
-                    + row * Int32(32)
-                    + ((Int32(blk) ^ dst_swizzle) << Int32(2))
-                ).store(
-                    cutlass.Vector.from_elements(tuple(fp8_words), Int32), alignment=16
+                store_nvfp4_fp8_row_block(
+                    dst_words,
+                    row,
+                    blk,
+                    packet[chunk * 4 + half * 2],
+                    packet[chunk * 4 + half * 2 + 1],
+                    packet[NVFP4_ROW_PACKED_WORDS + blk // 4],
                 )
         cute.arch.fence_view_async_shared()
 

@@ -33,10 +33,6 @@ BYTES_PER_KIB = 1024
 # metadata and scratch) must fit it; TOTAL_SMEM_BUDGET_KIB sizes the Q and
 # K/V pipelines below it.
 SMEM_CAPACITY_KIB = 227
-# Shared memory the system reserves for each resident CTA. N co-resident CTAs
-# share 228 KiB, so each can use (SMEM_CAPACITY_KIB + 1 - N) / N KiB.
-SMEM_RESERVED_PER_CTA_KIB = 1
-
 # The M64N256 profile stages one 256-row K or V tile per shared-ring slot. A
 # 16-bit tile is 64 KiB, so three stages, the 16-KiB Q stage, the tail
 # exchange and the metadata fill the SM100 carveout. A byte-wide tile is
@@ -53,6 +49,11 @@ KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES = 4
 # (0, 2, 1, 3) lets P alias S unchanged with V in natural order. The score
 # column mapping undoes the permutation for masking and Sage scales.
 KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM = (0, 2, 1, 3)
+
+# A fast SMEM conversion row has 128 FP4 values: sixteen packed 32-bit words.
+# Its register payload appends eight E4M3 scales packed into two more words.
+NVFP4_ROW_PACKED_WORDS = 16
+NVFP4_ROW_PACKET_WORDS = NVFP4_ROW_PACKED_WORDS + 2
 
 # Keep the old maximum as the exponent reference while a new maximum is at
 # most eight log2 units larger. This avoids an output-correction round without

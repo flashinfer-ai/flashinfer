@@ -23,7 +23,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
 import cutlass
-from cutlass import Int64
 import cutlass.cute as cute
 from cutlass import Int32, Uint32, Uint8
 from cutlass.experimental import primitives as prims
@@ -48,6 +47,8 @@ from ...._block_sparse.common import (
 from ..fmha_decode_config import FmhaDecodeConfig
 from ..direct_sparse_metadata import DirectSparseMetadataView
 from ..fmha_decode_constants import (
+    NVFP4_ROW_PACKED_WORDS,
+    NVFP4_ROW_PACKET_WORDS,
     KV_INST0,
     KV_INST1,
     KV_KIND_K,
@@ -64,7 +65,6 @@ from ...placeholder_helpers import (
     _placeholder_smem_array,
 )
 from .helpers_common import (
-    gather_byte_of_words,
     _TASK_CACHE_WARP_GRP_THREAD_IDX,
     _TASK_CACHE_KV_PAGE_IDX_UB,
     _TASK_CACHE_KV_RAW_TILE_BASE,
@@ -81,6 +81,7 @@ from .helpers_common import (
     _major_k_stride_bytes,
     _q_group_token_base,
     _qkv_smem_swizzle,
+    load_nvfp4_row_scale_words,
 )
 from .helpers_kv_tile_idx import (
     _load_runtime_seq_len_kv,
@@ -735,6 +736,18 @@ class SmemKvTileResource(DecodeGenResourceBase):
     _desc_base: prims.Tcgen05SmemDesc = None
     kv_desc_slot: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     v_desc_slot: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    prefetched_nvfp4: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+
+    def __post_init__(self) -> None:
+        """Prepare the shape-stable raw-row payload before task dispatch."""
+        super().__post_init__()
+        self.prefetched_nvfp4 = TaskLocalVariable(
+            dtype=cutlass.Array,
+            default_factory=lambda: cutlass.Array(
+                Int32, NVFP4_ROW_PACKET_WORDS, space=cutlass.AddressSpace.rmem
+            ),
+            docs="Packed row retained after releasing raw SMEM.",
+        )
 
     def _init_placeholder_state(self) -> None:
         """Create placeholder split K/V SMEM and descriptor state."""
@@ -1514,23 +1527,6 @@ class SmemKvTileResource(DecodeGenResourceBase):
         stage_offset_bytes = stage_info.stage_idx * Int32(tile_bytes)
         return self._desc_base.advance_start_address(stage_offset_bytes)
 
-    prefetched_nvfp4: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
-
-    def __post_init__(self) -> None:
-        """Prepare the shape-stable raw-row payload before task dispatch."""
-        DecodeGenResourceBase.__post_init__(self)
-        object.__setattr__(
-            self,
-            "prefetched_nvfp4",
-            TaskLocalVariable(
-                dtype=cutlass.Array,
-                default_factory=lambda: cutlass.Array(
-                    Int32, 18, space=cutlass.AddressSpace.rmem
-                ),
-                docs="Packed row retained after releasing raw SMEM.",
-            ),
-        )
-
     @cute.jit
     def load_nvfp4_row(
         self, stage_info: StageInfo, *, head_dim_stage_idx: Int32 | int
@@ -1547,51 +1543,21 @@ class SmemKvTileResource(DecodeGenResourceBase):
             shape=(cfg.smem_kv_storage_tile_bytes // 4,),
             addrspace=3,
         )
-        sf_bytes_per_token = cfg.smem_kv_sf_bytes_per_token
-        scales_per_stage = cfg.head_dim_kv_stage // 16
-        # scale_words = (scales of blocks 0-3, scales of blocks 4-7), one
-        # E4M3 byte per 16-column block.
-        if cutlass.const_expr(not is_v):
-            # K scales are token-major: 8 contiguous bytes for this stage.
-            src_sf_qwords = cutlass.Array(
-                src_sf_base.data_ptr(),
-                dtype=Int64,
-                shape=(cfg.smem_kv_sf_tile_bytes // 8,),
-                addrspace=3,
-            )
-            sf_qword = src_sf_qwords[
-                row * Int32(sf_bytes_per_token // 8) + Int32(head_dim_stage_idx)
-            ]
-            scale_words = (Int32(sf_qword), Int32(sf_qword >> Int64(32)))
-        else:
-            # V scales interleave four tokens: byte (r//4)*4*S + blk*4 + r%4
-            # for S scale bytes per token, i.e. byte r%4 of word (r//4)*S + blk.
-            src_sf_words = cutlass.Array(
-                src_sf_base.data_ptr(),
-                dtype=Int32,
-                shape=(cfg.smem_kv_sf_tile_bytes // 4,),
-                addrspace=3,
-            )
-            word_base = (row >> Int32(2)) * Int32(sf_bytes_per_token) + Int32(
-                head_dim_stage_idx * scales_per_stage
-            )
-            words = [
-                src_sf_words[word_base + Int32(blk)] for blk in range(scales_per_stage)
-            ]
-            token_in_group = row & Int32(3)
-            scale_words = (
-                gather_byte_of_words(
-                    words[0], words[1], words[2], words[3], token_in_group
-                ),
-                gather_byte_of_words(
-                    words[4], words[5], words[6], words[7], token_in_group
-                ),
-            )
+        scale_words = load_nvfp4_row_scale_words(
+            src_sf_base,
+            row,
+            head_dim_stage_idx,
+            sf_bytes_per_token=cfg.smem_kv_sf_bytes_per_token,
+            sf_tile_bytes=cfg.smem_kv_sf_tile_bytes,
+            is_v=is_v,
+        )
         src_swizzle = (row >> Int32(1)) & Int32(3)
         # Sixteen packed words and two four-scale words survive raw-slot release.
-        packet = cutlass.Array(Int32, 18, space=cutlass.AddressSpace.rmem)
-        packet[16] = scale_words[0]
-        packet[17] = scale_words[1]
+        packet = cutlass.Array(
+            Int32, NVFP4_ROW_PACKET_WORDS, space=cutlass.AddressSpace.rmem
+        )
+        packet[NVFP4_ROW_PACKED_WORDS] = scale_words[0]
+        packet[NVFP4_ROW_PACKED_WORDS + 1] = scale_words[1]
         for chunk in cutlass.range_constexpr(4):
             words = (
                 src_words.data_ptr()

@@ -76,7 +76,6 @@ from .fmha_decode_constants import (
     KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES,
     MAX_KV_STAGE_SMEM_KIB,
     SMEM_CAPACITY_KIB,
-    SMEM_RESERVED_PER_CTA_KIB,
 )
 from .fmha_decode_resources import (
     SmemBlockSparseKvMetadataResource,
@@ -110,7 +109,9 @@ from .fmha_decode_resources.sage_scales import (
     SageKScalesResource,
     SageVScalesResource,
 )
-from .fmha_decode_tasks.fmha_decode_tasks import (
+from .fmha_decode_tasks import (
+    create_kv_operand_transform_task,
+    create_mma_task_dual_transform_kv,
     PackedDecodeWorkQueue,
     ScheduleTokenThrottleResource,
     SparseMembershipLifetimeResource,
@@ -137,10 +138,6 @@ from .fmha_decode_tasks.fmha_decode_tasks import (
 from .reduction import (  # noqa: F401
     decode_gen_separate_reduction_kernel,
     fmha_decode_separate_reduction_launch,
-)
-from .fmha_decode_tasks.fmha_decode_dual_transform_task import (
-    create_mma_task_dual_transform_kv,
-    create_dual_transform_kv_task,
 )
 
 _PERSISTENT_SCHEDULE_TOKEN_STAGES = 2
@@ -267,8 +264,6 @@ def _decode_min_blocks_per_mp(cfg: FmhaDecodeConfig, seq_len_kv: int | None) -> 
     hand-off cost for a long enough mainloop; the established profiles below
     retain their existing unconditional launch bounds.
     """
-    if cfg.target_ctas_per_sm == 2:
-        return 2
     kv256_reallocation = cfg.tile_size_kv == 256 and (
         seq_len_kv is None
         or _compute_total_kv_tiles(seq_len_kv, cfg.tile_size_kv)
@@ -281,23 +276,6 @@ def _decode_min_blocks_per_mp(cfg: FmhaDecodeConfig, seq_len_kv: int | None) -> 
         or (cfg.tile_size_q == 16 and cfg.q_dtype_bytes == 1)
         or (cfg.use_keeps_mma_ab and cfg.tile_size_q == 128)
     )
-
-
-class DecodeTaskManager(TaskManager):
-    """Match TS register redistribution to the kernel's CTA launch bound."""
-
-    def __init__(self, *, num_ctas_per_sm: int = 1, **kwargs):
-        """Record ``cfg.target_ctas_per_sm`` before building the task graph."""
-        self.num_ctas_per_sm = num_ctas_per_sm
-        super().__init__(**kwargs)
-
-    def _default_task_registers(self) -> int:
-        """Split the default grant across resident CTAs, in 8-register quanta.
-
-        Overrides TaskManager's hook (hence the name); tasks without an explicit
-        grant must start from this CTA's share of the register file.
-        """
-        return super()._default_task_registers() // (self.num_ctas_per_sm * 8) * 8
 
 
 def _compute_static_num_skipped_kv_tiles(cfg: FmhaDecodeConfig, seq_len_kv: int) -> int:
@@ -1682,13 +1660,6 @@ def _build_decode_gen_schedule(
         smem_page_offsets._init_placeholder_state()
         smem_allocator, clc_response_alloc = allocate_smem()
     launch_smem_bytes = smem_bytes(smem_allocator)
-    if cfg.target_ctas_per_sm > 1:
-        # Every resident CTA pays the system reservation that
-        # SMEM_CAPACITY_KIB already excludes for one CTA.
-        smem_capacity_bytes = (
-            (target_smem_kib + SMEM_RESERVED_PER_CTA_KIB) * BYTES_PER_KIB
-            - cfg.target_ctas_per_sm * SMEM_RESERVED_PER_CTA_KIB * BYTES_PER_KIB
-        ) // cfg.target_ctas_per_sm
     if launch_smem_bytes > smem_capacity_bytes:
         raise ValueError(
             "decode resources exceed the SM shared-memory capacity: "
@@ -1935,7 +1906,7 @@ def _build_decode_gen_schedule(
     transform_v_task = None
     transform_kv1_task = None
     if cfg.uses_dual_kv_transform:
-        transform_kv_task = create_dual_transform_kv_task(
+        transform_kv_task = create_kv_operand_transform_task(
             smem_k0,
             transformed_kv,
             cfg,
@@ -1944,7 +1915,7 @@ def _build_decode_gen_schedule(
             domain_bias=0,
             **task_runtime_kwargs,
         )
-        transform_v_task = create_dual_transform_kv_task(
+        transform_v_task = create_kv_operand_transform_task(
             smem_v0,
             transformed_v,
             cfg,
@@ -1955,7 +1926,7 @@ def _build_decode_gen_schedule(
         )
     elif cfg.uses_dual_smem_transform:
         transform_kv_task, transform_kv1_task = (
-            create_dual_transform_kv_task(
+            create_kv_operand_transform_task(
                 raw,
                 ring,
                 cfg,
@@ -2675,8 +2646,7 @@ def build_decode_task_manager(
         lse_ptr=None,
     )
 
-    tm = DecodeTaskManager(
-        num_ctas_per_sm=cfg.target_ctas_per_sm,
+    tm = TaskManager(
         tasks=task_list,
         resource_dependency_graph=resource_dependency_graph,
         dma_consumer_release_labels=dma_consumer_release_labels,
@@ -3014,8 +2984,7 @@ def _run_decode_gen_active(
         prims.tcgen05_relinquish_alloc_permit()
     init_warp += 1
 
-    task_manager = DecodeTaskManager(
-        num_ctas_per_sm=cfg.target_ctas_per_sm,
+    task_manager = TaskManager(
         tasks=task_list,
         resource_dependency_graph=dep_graph,
         dma_consumer_release_labels=dma_consumer_release_labels,

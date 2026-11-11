@@ -492,8 +492,8 @@ _GROUPED_Q_REDUCTION_COST = {
 _GROUPED_Q_REDUCTION_SEQ_LEN_FACTOR = 128.0
 
 # GB300 NVFP4 measurements at B128/KV128K/Q4,Q6,Q8,Q12. Conversion and
-# softmax include the two-resident-CTA Q48 and D128/Q64 profiles. In particular,
-# D256 Q128 loses to two Q48 CTAs despite scanning K/V only once.
+# softmax include the wide Swaps profiles; revalidate their costs after changes
+# to staging or register grants.
 # Keeps Q64 with SMEM-converted NVFP4 K/V measured 1.26-1.50x (D128) and
 # 1.05-1.10x (D256) faster than the transformed Swaps Q64 profile at 64
 # grouped rows on GB300.
@@ -1035,39 +1035,12 @@ class FmhaDecodeConfig:
     # Select profiles whose task roles hand registers between producer and compute
     # warps.
     @property
-    def can_use_compact_nvfp4_q64(self) -> bool:
-        """Whether this one-instance TMEM recipe has a qualified compact variant."""
-        return (
-            not self.use_keeps_mma_ab
-            and self.tile_size_q == 64
-            and self.headdim == 128
-            and self.use_fp8_q
-            and self.use_nvfp4_kv
-            and self.num_insts_kv == 1
-            and self.store_transformed_kv_in_tmem
-        )
-
-    @property
-    def uses_compact_nvfp4_q64(self) -> bool:
-        """Whether the finalized buffers fit the two-CTA D128/Q64 profile."""
-        return (
-            self.can_use_compact_nvfp4_q64
-            and self.q_stages == 1
-            and self.kv_stages <= 4
-            and self.page_offsets_stages <= 6
-            and self.tmem_total_cols <= TMEM_MAX_ALLOCATION_COLUMNS // 2
-        )
-
-    @property
     def uses_x4_nvfp4_transform_loads(self) -> bool:
         """Whether NVFP4 K/V conversion issues one x4 LDSM per 16 columns.
 
-        An x4 load covers a warp's 32 K rows (or both 16-column V blocks) in
-        one instruction; two x2 loads cover the same data with more live
-        address registers but more loads in flight. Q48+ budgets of at most
-        128 converter registers (48 compact, 80 dual, 128 one-CTA) run faster
-        with x4 on GB300 (D256/Q64 2.31 -> 2.19 ms); the 184-register narrow
-        budgets run 1-3% faster with x2 and keep it.
+        An x4 load covers a warp's 32 K rows or both 16-column V blocks.
+        Bounded converter grants use x4 to reduce address state; narrow
+        profiles retain x2 to keep more loads in flight.
         """
         transform_regs = self.transform_kv_task_num_registers
         return (
@@ -1098,19 +1071,6 @@ class FmhaDecodeConfig:
         TMEM when every scale would be exactly one. Both are exact.
         """
         return self.uses_large_q_swaps_tile and not self.streams_scores_in_q32_bands
-
-    @property
-    def target_ctas_per_sm(self) -> int:
-        """Number of CTAs this profile is budgeted to keep resident per SM.
-
-        Q48 and the compact D128/Q64 profile target two CTAs, so their launch
-        bound, shared memory, TMEM columns, and register grants are each sized
-        for half an SM. Explicitly deeper FIFOs and every other profile keep
-        one CTA.
-        """
-        if self.use_keeps_mma_ab:
-            return 1
-        return 2 if self.tile_size_q == 48 or self.uses_compact_nvfp4_q64 else 1
 
     @property
     def softmax_stats_payload_groups(self) -> int:
@@ -1157,11 +1117,7 @@ class FmhaDecodeConfig:
         """
         if not self.uses_task_register_reallocation:
             return None
-        if self.target_ctas_per_sm == 2:
-            # Q64 holds sixteen running-max groups as well as its scores.
-            # The smaller correction fragments leave room for that state.
-            preferred = 136 if self.tile_size_q == 64 else 120
-        elif self.uses_large_q_swaps_tile:
+        if self.uses_large_q_swaps_tile:
             preferred = 200
         elif self.use_transform_kv:
             preferred = 168 if self.headdim == 64 and self.num_insts_kv != 1 else 184
@@ -1175,7 +1131,7 @@ class FmhaDecodeConfig:
         # whole SM register file. Complete 8-register/thread quanta leave
         # unused SM registers when a CTA has more than 16 warps.
         total_warps = self.threads_per_cta // WARP_THREADS
-        initial_regs = 65536 // (self.target_ctas_per_sm * self.threads_per_cta * 8) * 8
+        initial_regs = 65536 // (self.threads_per_cta * 8) * 8
         softmax_warps = self.softmax0_num_warps + (
             self.softmax1_num_warps if self.num_insts_kv != 1 else 0
         )
@@ -1215,8 +1171,6 @@ class FmhaDecodeConfig:
     @property
     def correction_task_num_registers(self) -> int | None:
         """Correction warps' setmaxnreg grant, or None without reallocation."""
-        if self.target_ctas_per_sm == 2:
-            return 48 if self.tile_size_q == 64 else 56
         if not self.uses_task_register_reallocation:
             return None
         if self.uses_dual_kv_transform:
@@ -1243,8 +1197,6 @@ class FmhaDecodeConfig:
     @property
     def mma_load_task_num_registers(self) -> int | None:
         """MMA/load/page-offset warps' setmaxnreg grant, or None without reallocation."""
-        if self.target_ctas_per_sm == 2:
-            return 24 if self.tile_size_q == 64 else 32
         if not self.uses_task_register_reallocation:
             return None
         if self.uses_large_q_swaps_tile:
@@ -1256,8 +1208,6 @@ class FmhaDecodeConfig:
     @property
     def transform_kv_task_num_registers(self) -> int | None:
         """K/V (or dual-transform K) converter grant, or None without a transform."""
-        if self.target_ctas_per_sm == 2:
-            return 48
         if not self.use_transform_kv:
             return None
         if self.uses_fast_smem_nvfp4_transform:
@@ -4082,15 +4032,6 @@ def _finalize_static_decode_config(
         ),
         explicit_fields,
     )
-    if cfg.can_use_compact_nvfp4_q64:
-        # Automatic Q candidates inherit a previously finalized config. Reset
-        # only implicit FIFO depths before selecting their residency budget;
-        # explicitly deeper rings retain the qualified one-CTA layout.
-        _set_if_implicit(cfg, "transformed_kv_stages", 0, explicit_fields)
-        _set_if_implicit(cfg, "kv_stages", 4, explicit_fields)
-    if cfg.target_ctas_per_sm == 2:
-        _set_if_implicit(cfg, "kv_stages", 4, explicit_fields)
-
     if cfg.store_transformed_kv_in_tmem:
         # Allocate the remaining TMEM columns to transformed K/V eagerly.
         if (
@@ -4100,13 +4041,13 @@ def _finalize_static_decode_config(
             rings = 2 if cfg.uses_dual_kv_transform else 1
             stage_cols = cfg.tmem_transformed_kv_stage_cols * rings
             cfg.transformed_kv_stages = (
-                TMEM_MAX_ALLOCATION_COLUMNS // cfg.target_ctas_per_sm
+                TMEM_MAX_ALLOCATION_COLUMNS
                 - cfg.tmem_total_cols
                 + stage_cols * cfg.transformed_kv_stages
                 # tmem_total_cols already includes the tmem of transform kv task. drop it
             ) // stage_cols
 
-    if cfg.tile_size_kv != 256 and cfg.target_ctas_per_sm != 2:
+    if cfg.tile_size_kv != 256:
         _set_if_implicit(cfg, "kv_stages", cfg.inferred_kv_stages, explicit_fields)
     if (
         cfg.headdim == 512
@@ -4114,7 +4055,6 @@ def _finalize_static_decode_config(
         and cfg.store_transformed_kv_in_tmem
         and not cfg.uses_dual_kv_transform
         and not cfg.use_keeps_mma_ab
-        and cfg.target_ctas_per_sm == 1
     ):
         # One raw ring carries K then V for each of the four head-dimension
         # stages. A depth of one whole K/V tile (eight stages) keeps the ring
@@ -4182,7 +4122,6 @@ def _finalize_static_decode_config(
         and cfg.use_nvfp4_kv
         and cfg.use_fp8_q
         and cfg.num_insts_kv == 1
-        and cfg.target_ctas_per_sm == 1
         and (
             (cfg.store_transformed_kv_in_tmem and cfg.tile_size_q <= 32)
             or cfg.uses_dual_smem_transform
@@ -5193,7 +5132,7 @@ def _resolve_grouped_q_launch_candidates(
             -FULL_GRID_SPLIT_MIN_TOKENS_PER_CTA
             // (cost_tile_size_kv * cost_num_insts_kv)
         )
-    if probe.use_keeps_mma_ab and probe.target_ctas_per_sm == 1:
+    if probe.use_keeps_mma_ab:
         # A lone resident CTA cannot hide pipeline fills behind another CTA.
         # Keep underfilled grids within one wave unless the native SM107
         # BF16-output converter qualifies for long extra waves.
@@ -6276,10 +6215,10 @@ def _validate_profile_support(
         and cfg.use_fp8_q
         and cfg.store_transformed_kv_in_tmem
         and cfg.threads_per_cta == 512
-        and cfg.tmem_total_cols <= TMEM_MAX_ALLOCATION_COLUMNS // 2
+        and cfg.tmem_total_cols <= TMEM_MAX_ALLOCATION_COLUMNS
     ):
         raise ValueError(
-            "Q48 requires D128/D256 NVFP4 KV with FP8 Q and a two-CTA TMEM budget"
+            "Q48 requires D128/D256 NVFP4 KV with FP8 Q, 512 threads, and a valid TMEM budget"
         )
     if tile_size_q >= 48 and (
         cfg.tmem_o_cols_per_head_dim_stage * cfg.num_head_dim_stages_kv
