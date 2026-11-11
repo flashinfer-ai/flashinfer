@@ -25,6 +25,7 @@ from importlib import resources
 import math
 from typing import Sequence
 
+from flashinfer.jit.core import logger
 from flashinfer.tllm_enums import ActivationType, WeightLayout
 
 SUPPORTED_BF16_TILE_N = (8, 16, 32, 64, 128, 192, 256)
@@ -1269,7 +1270,11 @@ def apply_fused_finalize(
             top_k=top_k,
             num_experts=num_local_experts,
         )
-    except (ValueError, RuntimeError):
+    except (ValueError, RuntimeError) as exc:
+        logger.debug(
+            "[Prims-TS MoE] Keeping the unfused FC2 epilogue for tactic "
+            f"[{pair.tile_n}, {pair.moe_config_index}]: {exc}"
+        )
         return pair
     return PrimsTsGemmPair(
         tile_n=pair.tile_n,
