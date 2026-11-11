@@ -54,7 +54,7 @@ from ...cute_dsl.fp4_common import (
     st_global_u64,
     warp_reduce,
 )
-from ...cute_dsl.utils import get_num_sm
+from ...utils import get_device_sm_count
 from ..nvfp4_quantization_utils import (
     nvfp4_4over6_cache_key,
     _UNSET,
@@ -2751,7 +2751,7 @@ def nvfp4_quantize_cute_dsl(
     else:
         global_scale_arg = float(global_scale)
 
-    num_sm = get_num_sm(input.device)
+    num_sm = get_device_sm_count(input.device)
 
     num_sf_blocks_per_row = k // NVFP4_SF_VEC_SIZE
 
@@ -3008,7 +3008,7 @@ def nvfp4_quantize_smooth_cute_dsl(
     )
     num_blocks = min(
         (padded_m + rows_per_block - 1) // rows_per_block,
-        get_num_sm(input.device) * _BLOCKS_PER_SM,
+        get_device_sm_count(input.device) * _BLOCKS_PER_SM,
     )
     kernel_fn(
         input,
@@ -3124,7 +3124,7 @@ def silu_and_mul_nvfp4_quantize_cute_dsl(
             [float(global_scale)], dtype=torch.float32, device=input.device
         )
 
-    num_sm = get_num_sm(input.device)
+    num_sm = get_device_sm_count(input.device)
     num_sf_blocks_per_row = k // NVFP4_SF_VEC_SIZE
 
     disable_fp4_quant_fast_math = _env_flag_enabled(
@@ -3411,7 +3411,8 @@ def nvfp4_quantize_per_token_cute_dsl(
     # Match the compiled minimum-occupancy budget instead of launching a CTA
     # for every row in the worst-case allocation.
     num_blocks = min(
-        padded_m, get_num_sm(input.device) * (_MAX_THREADS_PER_BLOCK // threads)
+        padded_m,
+        get_device_sm_count(input.device) * (_MAX_THREADS_PER_BLOCK // threads),
     )
     kernel_fn = _get_compiled_kernel_nvfp4_per_token(
         dtype_key,

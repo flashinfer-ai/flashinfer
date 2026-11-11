@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Non-Cake baselines ("arms") of the Cake causal conv1d + SiLU training benchmarks
-``bench_cake_causal_conv1d_train.py`` (single rank) and ``bench_cake_causal_conv1d_train_kcp.py`` (context parallel).
+``bench_cake_causal_conv1d_nondet_train.py`` (single rank) and ``bench_cake_causal_conv1d_nondet_train_kcp.py``
+(context parallel).
 
 Every arm is the public training entry point of another library, called through autograd on the benchmark's own
 tensors without a copy (``[S, C]`` maps to ``[1, S, C]`` or to its channel-last ``[1, C, S]`` view).  Index tensors

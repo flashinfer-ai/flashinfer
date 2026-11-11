@@ -1069,7 +1069,7 @@ kernel_cake_kimi_k3_fp8_projection_672ce42def926496cd3b(const __grid_constant__ 
                     }
                     asm volatile("barrier.sync %0, 128;" :: "r"(2 + epi_group) : "memory");
                 } else {
-                    unsigned long long pbase = (unsigned long long)(tile_2 * split + rank_2) * 16384 + (unsigned long long)lane_row + (unsigned long long)tok_g0 * 128;
+                    unsigned long long pbase = (unsigned long long)(tile_2 * split + rank_2) * 16384ull + (unsigned long long)lane_row + (unsigned long long)tok_g0 * 128ull;
                     #pragma unroll
                     for (int t = 0; t < 128; t++) {
                         partials[pbase + (unsigned long long)(t * 128)] = _tmem_load_0[t];
@@ -1088,7 +1088,7 @@ kernel_cake_kimi_k3_fp8_projection_672ce42def926496cd3b(const __grid_constant__ 
                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                     int t_first = rank_2 * tok_per_cta;
                     int t_last = ((128) < (t_first + tok_per_cta) ? (128) : (t_first + tok_per_cta));
-                    unsigned long long rbase = (unsigned long long)(tile_2 * split) * 16384 + (unsigned long long)lane_row;
+                    unsigned long long rbase = (unsigned long long)(tile_2 * split) * 16384ull + (unsigned long long)lane_row;
                     #pragma unroll
                     for (int tb = 0; tb < 128; tb += 8) {
                         if (t_first < tb + 8 && t_last > tb && tok_g0 <= tb && tb < tok_g0 + 128) {
@@ -1103,7 +1103,7 @@ kernel_cake_kimi_k3_fp8_projection_672ce42def926496cd3b(const __grid_constant__ 
                                 #pragma unroll
                                 for (int j_12 = 0; j_12 < 8; j_12++) {
                                     int s_j = ((s_0 + j_12) < (split - 1) ? (s_0 + j_12) : (split - 1));
-                                    unsigned long long rank_off = rbase + (unsigned long long)s_j * 16384;
+                                    unsigned long long rank_off = rbase + (unsigned long long)s_j * 16384ull;
                                     #pragma unroll
                                     for (int u_1 = 0; u_1 < 8; u_1++) {
                                         parts[u_1 * 8 + j_12] = partials[rank_off + (unsigned long long)((tb + u_1) * 128)];

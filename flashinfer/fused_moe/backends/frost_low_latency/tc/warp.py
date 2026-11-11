@@ -45,6 +45,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from .route_members import route_members
 from .block_scale import promote_block_scaled
 from ..fma.activations import apply_activation
+from ..fma.fp4_weight import scaled_quad, weight_scale
 from ..quantization import _mul
 from .....cute_dsl.fp4_common import cvt_f32_to_e4m3
 
@@ -147,6 +148,7 @@ class WarpGroupedProjection:
         stream: cuda.CUstream,
         dequant=None,
         mid_quant=None,
+        block_scales=None,
     ):
         a = cute.make_tensor(
             weights.iterator,
@@ -177,7 +179,32 @@ class WarpGroupedProjection:
         self.a_layout = utils.LayoutEnum.from_tensor(a)
         self.b_layout = utils.LayoutEnum.from_tensor(b)
         self.c_layout = utils.LayoutEnum.COL_MAJOR
-        self.weight_only = self.a_dtype == cutlass.Float8E4M3FN and self.b_dtype in (
+        self.packed_nvfp4 = block_scales is not None
+        if cutlass.const_expr(self.packed_nvfp4 and self.weight_first):
+            raise ValueError("Packed NVFP4 requires cooperative gathering")
+        if cutlass.const_expr(
+            self.tile_k == 256
+            and not (
+                self.packed_nvfp4
+                or (
+                    self.a_dtype == cutlass.Float8E4M3FN
+                    and self.b_dtype == cutlass.BFloat16
+                )
+            )
+        ):
+            raise ValueError("K256 requires packed NVFP4 or qualified BF16 W8A16")
+        self.weight_k = self.tile_k // 2 if self.packed_nvfp4 else self.tile_k
+        if cutlass.const_expr(self.packed_nvfp4):
+            if cutlass.const_expr(
+                self.a_dtype not in (cutlass.Uint8, cutlass.Int8)
+                or self.b_dtype not in (cutlass.BFloat16, cutlass.Float16)
+            ):
+                raise TypeError(
+                    "NVFP4 grouped MMA requires packed bytes and 16-bit inputs"
+                )
+        self.weight_only = (
+            self.packed_nvfp4 or self.a_dtype == cutlass.Float8E4M3FN
+        ) and self.b_dtype in (
             cutlass.BFloat16,
             cutlass.Float16,
         )
@@ -194,6 +221,7 @@ class WarpGroupedProjection:
             )
         if cutlass.const_expr(self.a_dtype.width != 16 and self.a_dtype.width != 8):
             raise TypeError("a_dtype should be float16 or float8")
+        # Packed scale stages always need the cooperative producer.
         # E4M3 weights use cooperative gather unless a bounded W8A16 schedule
         # explicitly selects the serial producer.
         # Dense 16-bit weights use it at T >= 8 to overlap the weight copy;
@@ -201,7 +229,8 @@ class WarpGroupedProjection:
         # The optional dense weight-first tactic retains a serial activation
         # producer; the original tactics keep main's cooperative schedule.
         self.cooperative_gather = not self.weight_first and (
-            (self.a_dtype == cutlass.Float8E4M3FN and not self.serial_gather)
+            self.packed_nvfp4
+            or (self.a_dtype == cutlass.Float8E4M3FN and not self.serial_gather)
             or cute.size(ids) >= 8 * self.top_k
         )
         # Per-tensor FP8 benefits from initializing immutable padded rows once.
@@ -211,17 +240,22 @@ class WarpGroupedProjection:
             self.native_fp8 and not self.block_scaled and self.group_size < 8
         )
         self._setup_attributes()
+        if cutlass.const_expr(self.packed_nvfp4):
+            self.a_smem_layout_staged = sm90_utils.make_smem_layout_a(
+                self.a_layout, (64, 8, self.weight_k), self.a_dtype, self.ab_stage
+            )
         if cutlass.const_expr(self.split_gate):
             weight_layout = cute.composition(
                 self.a_smem_layout_staged,
                 cute.make_layout(
-                    (32, self.tile_k, self.ab_stage), stride=(1, 64, 64 * self.tile_k)
+                    (32, self.weight_k, self.ab_stage),
+                    stride=(1, 64, 64 * self.weight_k),
                 ),
             )
         else:
             weight_layout = self.a_smem_layout_staged
         tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
-            a, weight_layout, (self.rows_per_tile, self.tile_k), 1
+            a, weight_layout, (self.rows_per_tile, self.weight_k), 1
         )
         grid = (cute.size(output, mode=[1]) // self.rows_per_tile, 1, cute.size(ids))
 
@@ -243,13 +277,38 @@ class WarpGroupedProjection:
                 self.buffer_align_bytes,
             ]
 
-        self.shared_storage = SharedStorage
+        self.shared_storage: type = SharedStorage
+        if cutlass.const_expr(self.packed_nvfp4):
+
+            @cute.struct
+            class PackedSharedStorage:
+                mainloop_pipeline_array_ptr: cute.struct.MemRange[
+                    cutlass.Int64, self.ab_stage * 2
+                ]
+                sA: cute.struct.Align[
+                    cute.struct.MemRange[
+                        self.a_dtype, cute.cosize(self.a_smem_layout_staged)
+                    ],
+                    self.buffer_align_bytes,
+                ]
+                sS: cute.struct.MemRange[
+                    cutlass.Uint8, 64 * (self.tile_k // 16) * self.ab_stage
+                ]
+                sB: cute.struct.Align[
+                    cute.struct.MemRange[
+                        self.b_dtype, cute.cosize(self.b_smem_layout_staged)
+                    ],
+                    self.buffer_align_bytes,
+                ]
+
+            self.shared_storage = PackedSharedStorage
         self.kernel(
             b,
             output,
             route_ids,
             dequant,
             mid_quant,
+            block_scales,
             tma_atom_a,
             tma_tensor_a,
             self.tiled_mma,
@@ -268,6 +327,7 @@ class WarpGroupedProjection:
         route_ids: cute.Tensor,
         dequant,
         mid_quant,
+        block_scales,
         tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,
         tiled_mma: cute.TiledMma,
@@ -339,20 +399,27 @@ class WarpGroupedProjection:
                 sB = storage.sB.get_tensor(
                     b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
                 )
+                if cutlass.const_expr(self.packed_nvfp4):
+                    sS = storage.sS.get_tensor(
+                        cute.make_layout(
+                            (64, self.tile_k // 16, self.ab_stage),
+                            stride=(self.tile_k // 16, 1, 64 * (self.tile_k // 16)),
+                        )
+                    )
                 sC_ptr = cute.recast_ptr(
                     sA.iterator, epi_smem_layout_staged.inner, dtype=self.c_dtype
                 )
                 sC = cute.make_tensor(sC_ptr, epi_smem_layout_staged.outer)
                 gA_mkl = cute.local_tile(
                     mA_mkl,
-                    (self.rows_per_tile, 8, self.tile_k),
+                    (self.rows_per_tile, 8, self.weight_k),
                     (pid_m, pid_n, None, route_ids[bidz]),
                     proj=(1, None, 1),
                 )
                 if cutlass.const_expr(self.split_gate):
                     gGate_mkl = cute.local_tile(
                         mA_mkl,
-                        (32, 8, self.tile_k),
+                        (32, 8, self.weight_k),
                         (
                             pid_m + cute.size(mA_mkl, mode=[0]) // 64,
                             pid_n,
@@ -372,8 +439,8 @@ class WarpGroupedProjection:
                     half_outer = cute.composition(
                         sA.layout,
                         cute.make_layout(
-                            (32, self.tile_k, self.ab_stage),
-                            stride=(1, 64, 64 * self.tile_k),
+                            (32, self.weight_k, self.ab_stage),
+                            stride=(1, 64, 64 * self.weight_k),
                         ),
                     )
                     sUp = cute.make_tensor(sA.iterator, half_outer)
@@ -397,38 +464,57 @@ class WarpGroupedProjection:
                         cute.group_modes(sGate, 0, 2),
                         cute.group_modes(gGate_mkl, 0, 2),
                     )
-                tCsA = thr_mma.partition_A(sA)
-                tCsB = thr_mma.partition_B(sB)
-                if cutlass.const_expr(self.weight_only):
-                    # Keep checkpoint weights compact through TMA/shared memory.
-                    # Convert unscaled E4M3 fragments exactly for 16-bit MMA.
-                    tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0].shape)
-                    rawA = cute.make_rmem_tensor(tCrA.shape, self.a_dtype)
-                    copy_atom_a = cute.make_copy_atom(
-                        cute.nvgpu.CopyUniversalOp(), self.a_dtype
+                if cutlass.const_expr(self.packed_nvfp4):
+                    a_coordinates = thr_mma.partition_A(
+                        cute.make_identity_tensor((64, self.tile_k))
                     )
-                else:
-                    tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
-                    copy_atom_a = cute.make_copy_atom(
-                        cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4), self.a_dtype
+                    tCsB = thr_mma.partition_B(sB)
+                    tCrA = tiled_mma.make_fragment_A(a_coordinates.shape)
+                    tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
+                    copy_b = cute.make_tiled_copy_B(
+                        cute.make_copy_atom(
+                            cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 2), self.b_dtype
+                        ),
+                        tiled_mma,
                     )
-                tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
-                copy_a = cute.make_tiled_copy_A(copy_atom_a, tiled_mma)
-                copy_b = cute.make_tiled_copy_B(
-                    cute.make_copy_atom(
-                        cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 2), self.b_dtype
-                    ),
-                    tiled_mma,
-                )
-                copy_a_thr = copy_a.get_slice(tidx)
-                copy_b_thr = copy_b.get_slice(tidx)
-                copy_sa = copy_a_thr.partition_S(sA)
-                copy_sb = copy_b_thr.partition_S(sB)
-                if cutlass.const_expr(self.weight_only):
-                    copy_ra = copy_a_thr.retile(rawA)
+                    copy_b_thr = copy_b.get_slice(tidx)
+                    copy_sb = copy_b_thr.partition_S(sB)
+                    copy_rb = copy_b_thr.retile(tCrB)
                 else:
-                    copy_ra = copy_a_thr.retile(tCrA)
-                copy_rb = copy_b_thr.retile(tCrB)
+                    tCsA = thr_mma.partition_A(sA)
+                    tCsB = thr_mma.partition_B(sB)
+                    if cutlass.const_expr(self.weight_only):
+                        # Keep checkpoint weights compact through TMA/shared memory.
+                        # Convert unscaled E4M3 fragments exactly for 16-bit MMA.
+                        tCrA = tiled_mma.make_fragment_A(
+                            tCsA[None, None, None, 0].shape
+                        )
+                        rawA = cute.make_rmem_tensor(tCrA.shape, self.a_dtype)
+                        copy_atom_a = cute.make_copy_atom(
+                            cute.nvgpu.CopyUniversalOp(), self.a_dtype
+                        )
+                    else:
+                        tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
+                        copy_atom_a = cute.make_copy_atom(
+                            cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4), self.a_dtype
+                        )
+                    tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
+                    copy_a = cute.make_tiled_copy_A(copy_atom_a, tiled_mma)
+                    copy_b = cute.make_tiled_copy_B(
+                        cute.make_copy_atom(
+                            cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 2), self.b_dtype
+                        ),
+                        tiled_mma,
+                    )
+                    copy_a_thr = copy_a.get_slice(tidx)
+                    copy_b_thr = copy_b.get_slice(tidx)
+                    copy_sa = copy_a_thr.partition_S(sA)
+                    copy_sb = copy_b_thr.partition_S(sB)
+                    if cutlass.const_expr(self.weight_only):
+                        copy_ra = copy_a_thr.retile(rawA)
+                    else:
+                        copy_ra = copy_a_thr.retile(tCrA)
+                    copy_rb = copy_b_thr.retile(tCrB)
                 acc_shape = tCgC.shape
                 coordinates = tiled_mma.get_slice(tidx).partition_C(
                     cute.make_identity_tensor((64, 8))
@@ -493,6 +579,32 @@ class WarpGroupedProjection:
                                     mainloop_pipeline.producer_commit(
                                         mainloop_producer_state
                                     )
+                        # Live scales share the producer stage and CTA barriers.
+                        if cutlass.const_expr(self.packed_nvfp4):
+                            for sf_chunk in cutlass.range_constexpr(
+                                64 * (self.tile_k // 16) // 128
+                            ):
+                                sf_linear = tidx + sf_chunk * 128
+                                sf_row = sf_linear // (self.tile_k // 16)
+                                sf_col = sf_linear % (self.tile_k // 16)
+                                sf_global_row = pid_m * self.rows_per_tile + sf_row
+                                if cutlass.const_expr(self.split_gate):
+                                    if sf_row >= 32:
+                                        sf_global_row = (
+                                            pid_m * 32
+                                            + sf_row
+                                            - 32
+                                            + cute.size(block_scales, mode=[1]) // 2
+                                        )
+                                sS[sf_row, sf_col, mainloop_producer_state.index] = (
+                                    block_scales[
+                                        expert,
+                                        sf_global_row,
+                                        mainloop_producer_state.count
+                                        * (self.tile_k // 16)
+                                        + sf_col,
+                                    ].to(cutlass.Uint8)
+                                )
                         for bn in cutlass.range_constexpr(
                             self.group_size if self.static_padding_once else 8
                         ):
@@ -564,11 +676,24 @@ class WarpGroupedProjection:
                     # The TMA barrier orders weights only. This CTA barrier also
                     # waits for the software activation stores in either schedule.
                     cute.arch.sync_threads()
-                    cute.copy(
-                        copy_a, copy_sa[None, None, None, consumer.index], copy_ra
-                    )
-                    if cutlass.const_expr(self.weight_only):
-                        tCrA.store(rawA.load().to(self.b_dtype))
+                    if cutlass.const_expr(self.packed_nvfp4):
+                        # NVFP4 E2M1 * finite E4M3 block scale is exact in FP16/BF16.
+                        # Keep packed bytes through TMA/shared memory; unpack only the
+                        # MMA registers. Global expert scales remain after the dot.
+                        for element in cutlass.range_constexpr(cute.size(tCrA)):
+                            row, column = a_coordinates[element]
+                            packed = sA[row, column // 2, consumer.index]
+                            scale = weight_scale(
+                                sS[row, column // 16, consumer.index], 16
+                            )
+                            quad = scaled_quad(packed.to(cutlass.Uint16), scale, True)
+                            tCrA[element] = quad[column % 2].to(self.b_dtype)
+                    else:
+                        cute.copy(
+                            copy_a, copy_sa[None, None, None, consumer.index], copy_ra
+                        )
+                        if cutlass.const_expr(self.weight_only):
+                            tCrA.store(rawA.load().to(self.b_dtype))
                     cute.copy(
                         copy_b, copy_sb[None, None, None, consumer.index], copy_rb
                     )
@@ -653,6 +778,32 @@ class WarpGroupedProjection:
                                     mainloop_pipeline.producer_commit(
                                         mainloop_producer_state
                                     )
+                        # Live scales share the producer stage and CTA barriers.
+                        if cutlass.const_expr(self.packed_nvfp4):
+                            for sf_chunk in cutlass.range_constexpr(
+                                64 * (self.tile_k // 16) // 128
+                            ):
+                                sf_linear = tidx + sf_chunk * 128
+                                sf_row = sf_linear // (self.tile_k // 16)
+                                sf_col = sf_linear % (self.tile_k // 16)
+                                sf_global_row = pid_m * self.rows_per_tile + sf_row
+                                if cutlass.const_expr(self.split_gate):
+                                    if sf_row >= 32:
+                                        sf_global_row = (
+                                            pid_m * 32
+                                            + sf_row
+                                            - 32
+                                            + cute.size(block_scales, mode=[1]) // 2
+                                        )
+                                sS[sf_row, sf_col, mainloop_producer_state.index] = (
+                                    block_scales[
+                                        expert,
+                                        sf_global_row,
+                                        mainloop_producer_state.count
+                                        * (self.tile_k // 16)
+                                        + sf_col,
+                                    ].to(cutlass.Uint8)
+                                )
                         for bn in cutlass.range_constexpr(
                             self.group_size if self.static_padding_once else 8
                         ):
@@ -755,7 +906,16 @@ class WarpGroupedProjection:
 
     @cute.jit
     def epilogue(self, value, gate, dequant, mid_quant, expert):
-        if cutlass.const_expr(self.weight_only):
+        if cutlass.const_expr(self.packed_nvfp4):
+            if cutlass.const_expr(self.fc1):
+                value = _mul(value, dequant[expert, 0])
+                if cutlass.const_expr(self.split_gate):
+                    gate = _mul(gate, dequant[expert, 1])
+                value = value.to(self.b_dtype).to(cutlass.Float32)
+                gate = gate.to(self.b_dtype).to(cutlass.Float32)
+            else:
+                value = _mul(value, dequant[expert])
+        elif cutlass.const_expr(self.weight_only):
             # Apply live expert scales after the dot product; pre-scaling and
             # rounding weights would change the checkpoint's numerical contract.
             value = _mul(value, dequant[expert])
