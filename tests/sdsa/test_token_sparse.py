@@ -152,3 +152,348 @@ def test_union_key_limit_examples() -> None:
         pytest.skip("The examples are for 227 KiB of shared memory")
     results = doctest.testmod(flashinfer.sdsa.token_sparse)
     assert results.attempted and not results.failed
+
+
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _nvfp4_pages(pages, page_size, head_dim, swizzled, data_pad=64, sf_pad=16):
+    """Random packed K/V pages and random scales with distinct page strides."""
+    scale_dim, data_dim = head_dim // 16, head_dim // 2
+    data_buf = torch.randint(
+        256,
+        (pages, 2, page_size * data_dim + data_pad),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    data = data_buf[:, :, : page_size * data_dim].view(pages, 2, 1, page_size, data_dim)
+    # Log-uniform positive scales across E4M3's normal and subnormal range.
+    sf_linear = torch.exp2(
+        torch.empty(pages, 2, page_size, scale_dim, device="cuda").uniform_(-9, 8.8)
+    ).to(torch.float8_e4m3fn)
+    sf_buf = torch.zeros(
+        pages, 2, page_size * scale_dim + sf_pad, dtype=torch.uint8, device="cuda"
+    )
+    v_layout = sf_linear[:, 1]
+    if swizzled:
+        v_layout = (
+            v_layout.reshape(pages, page_size // 4, 4, 4, scale_dim // 4)
+            .permute(0, 1, 3, 4, 2)
+            .contiguous()
+        )
+    sf_buf[:, 0, : page_size * scale_dim].copy_(
+        sf_linear[:, 0].contiguous().view(torch.uint8).reshape(pages, -1)
+    )
+    sf_buf[:, 1, : page_size * scale_dim].copy_(
+        v_layout.contiguous().view(torch.uint8).reshape(pages, -1)
+    )
+    sf = (
+        sf_buf[:, :, : page_size * scale_dim]
+        .view(torch.float8_e4m3fn)
+        .view(pages, 2, 1, page_size, scale_dim)
+    )
+    packed = data.reshape(pages, 2, page_size, data_dim)
+    return data, sf, packed, sf_linear
+
+
+def _decode_nvfp4(packed, sf_linear):
+    lut = torch.tensor(_E2M1 + tuple(-v for v in _E2M1), device=packed.device)
+    codes = torch.stack((packed & 15, packed >> 4), -1).flatten(-2).long()
+    values = lut[codes] * sf_linear.float().repeat_interleave(16, dim=-1)
+    return (values / 6).to(torch.float8_e4m3fn)
+
+
+def _expected_gather(decoded, slots, lengths, head_dim):
+    rows, _, top_k = slots.shape
+    expected = torch.zeros(rows, top_k, 2, head_dim, device="cuda")
+    for row, length in enumerate(lengths.tolist()):
+        for side in (0, 1):
+            chosen = slots[row, side, :length].long()
+            expected[row, :length, side] = (
+                decoded[:, side]
+                .reshape(-1, head_dim)[chosen.clamp(min=0)]
+                .float()
+                .masked_fill(chosen[:, None] < 0, 0)
+            )
+    return expected
+
+
+@pytest.mark.parametrize(
+    "page_size,swizzled", [(4, True), (64, True), (4, False), (64, False), (6, False)]
+)
+@pytest.mark.parametrize("head_dim", [64, 128, 192, 256, 320])
+def test_gather_nvfp4_selected_tokens(page_size, swizzled, head_dim):
+    """Packed pages gather to FP8 without reading invalid or padded slots."""
+    from flashinfer.sdsa.token_sparse import gather_nvfp4_kv_cache
+
+    torch.manual_seed(1234 + page_size + head_dim)
+    pages, rows, top_k = 7, 3, 512
+    data, sf, packed, sf_linear = _nvfp4_pages(pages, page_size, head_dim, swizzled)
+    assert data.stride(0) != sf.stride(0)
+    slots = torch.randint(
+        pages * page_size, (rows, 2, top_k), device="cuda", dtype=torch.int32
+    )
+    lengths = torch.tensor([0, 17, top_k], device="cuda", dtype=torch.int32)
+    slots[0].fill_(2**30)  # ignored because the row is empty
+    slots[2, 0, 0] = -1  # a negative slot inside the prefix reads as zero
+    # Row 1 keeps valid slots past its length; they must still produce zeros.
+    out = torch.empty(
+        rows * top_k, 1, 1, 2 * head_dim, device="cuda", dtype=torch.float8_e4m3fn
+    )
+    tables = torch.empty_like(slots)
+    decoded = _decode_nvfp4(packed, sf_linear)
+
+    def run():
+        gather_nvfp4_kv_cache(
+            tuple(data.unbind(1)),
+            tuple(sf.unbind(1)),
+            slots,
+            lengths,
+            out=out,
+            block_tables=tables,
+            v_sf_swizzled=swizzled,
+        )
+
+    def check():
+        torch.testing.assert_close(
+            out.view(rows, top_k, 2, head_dim).float(),
+            _expected_gather(decoded, slots, lengths, head_dim),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            tables,
+            torch.arange(rows * top_k, device="cuda", dtype=torch.int32)
+            .reshape(rows, 1, top_k)
+            .expand(-1, 2, -1),
+        )
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    # Replay with a changed slot and changed lengths.
+    slots[2, 1, 0] = (slots[2, 1, 0] + 1) % (pages * page_size)
+    lengths.copy_(torch.tensor([3, 40, top_k - 5], device="cuda", dtype=torch.int32))
+    slots[0].copy_(slots[2])
+    out.view(torch.uint8).fill_(0x38)  # stale 1.0 values must be overwritten
+    graph.replay()
+    check()
+
+
+def test_gather_nvfp4_input_offsets_beyond_int32():
+    """Pages past 2 GiB of packed data are addressed without wrapping."""
+    from flashinfer.sdsa.token_sparse import gather_nvfp4_kv_cache
+
+    torch.manual_seed(7)
+    page_size, head_dim, top_k = 64, 128, 8
+    pages = 2**31 // (2 * page_size * head_dim // 2) + 2
+    data_dim, scale_dim = head_dim // 2, head_dim // 16
+    data = torch.zeros(
+        pages, 2, 1, page_size, data_dim, dtype=torch.uint8, device="cuda"
+    )
+    assert data[-1].data_ptr() - data.data_ptr() > 2**31
+    data[-1].random_(0, 256)
+    sf = torch.ones(
+        pages, 2, 1, page_size, scale_dim, dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    sf[-1] = torch.exp2(
+        torch.empty(2, 1, page_size, scale_dim, device="cuda").uniform_(-6, 8)
+    ).to(torch.float8_e4m3fn)
+    slots = (pages - 1) * page_size + torch.randint(
+        page_size, (1, 2, top_k), device="cuda", dtype=torch.int32
+    )
+    lengths = torch.tensor([top_k], device="cuda", dtype=torch.int32)
+    out = torch.empty(1 * top_k, 1, 1, 2 * head_dim, device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    gather_nvfp4_kv_cache(
+        tuple(data.unbind(1)),
+        tuple(sf.unbind(1)),
+        slots,
+        lengths,
+        out=out,
+        block_tables=torch.empty_like(slots),
+        v_sf_swizzled=False,
+    )
+    last = _decode_nvfp4(
+        data[-1].reshape(1, 2, page_size, data_dim),
+        sf[-1].reshape(1, 2, page_size, scale_dim),
+    )
+    local = slots - (pages - 1) * page_size
+    torch.testing.assert_close(
+        out.view(1, top_k, 2, head_dim).float(),
+        _expected_gather(last, local, lengths, head_dim),
+        rtol=0,
+        atol=0,
+    )
+
+
+def _gather_inputs(page_size=4, head_dim=64, rows=1, top_k=4, device="cuda"):
+    data = tuple(
+        torch.zeros(2, 1, page_size, head_dim // 2, dtype=torch.uint8, device=device)
+        for _ in range(2)
+    )
+    scales = tuple(
+        torch.ones(
+            2, 1, page_size, head_dim // 16, dtype=torch.float8_e4m3fn, device=device
+        )
+        for _ in range(2)
+    )
+    slots = torch.zeros(rows, 2, top_k, dtype=torch.int32, device=device)
+    return dict(
+        paged_kv_cache=data,
+        kv_cache_sf=scales,
+        slots=slots,
+        seq_lens=torch.full((rows,), top_k, dtype=torch.int32, device=device),
+        out=torch.empty(
+            rows * top_k, 1, 1, 2 * head_dim, dtype=torch.float8_e4m3fn, device=device
+        ),
+        block_tables=torch.empty_like(slots),
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid,match",
+    [
+        ("slots_rank", "slot lists shaped"),
+        ("data_dtype", "uint8"),
+        ("page_size", "four-token"),
+        ("head_dim", "four-token"),
+        ("device", "same CUDA device"),
+    ],
+)
+def test_gather_nvfp4_rejects_invalid_inputs(invalid, match):
+    """Invalid shapes, dtypes and devices fail with a clear message."""
+    from flashinfer.sdsa.token_sparse import gather_nvfp4_kv_cache
+
+    kwargs = _gather_inputs(
+        page_size=6 if invalid == "page_size" else 4,
+        head_dim=96 if invalid == "head_dim" else 64,
+    )
+    if invalid == "slots_rank":
+        kwargs["slots"] = kwargs["slots"][0]
+    elif invalid == "data_dtype":
+        kwargs["paged_kv_cache"] = tuple(
+            t.view(torch.int8) for t in kwargs["paged_kv_cache"]
+        )
+    elif invalid == "device":
+        kwargs["seq_lens"] = kwargs["seq_lens"].cpu()
+    with pytest.raises(ValueError, match=match):
+        gather_nvfp4_kv_cache(**kwargs)
+
+
+def test_gather_nvfp4_runs_on_the_tensors_device():
+    """The launch follows the tensors' device, not the current device."""
+    from flashinfer.sdsa.token_sparse import gather_nvfp4_kv_cache
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Requires two GPUs")
+    torch.manual_seed(11)
+    packed = torch.randint(256, (2, 2, 1, 4, 32), dtype=torch.uint8)
+    results = []
+    for device in ("cuda:0", "cuda:1"):
+        kwargs = _gather_inputs(page_size=4, head_dim=64, top_k=4, device=device)
+        kwargs["paged_kv_cache"][0].copy_(packed[:, 0])
+        kwargs["paged_kv_cache"][1].copy_(packed[:, 1])
+        kwargs["slots"].copy_(torch.tensor([[[0, 1, 2, 3], [4, 5, 6, 7]]]))
+        with torch.cuda.device(0):
+            gather_nvfp4_kv_cache(**kwargs)
+        torch.cuda.synchronize(device)
+        results.append(kwargs["out"].float().cpu())
+    torch.testing.assert_close(results[0], results[1], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("cache_index", [None, 0, 1, 2, 3])
+def test_gather_nvfp4_rejects_missing_page_dimensions(cache_index):
+    """Malformed cache ranks are rejected even when there is no gather work."""
+    from flashinfer.sdsa.token_sparse import gather_nvfp4_kv_cache
+
+    caches = [
+        torch.empty(2, 1, 4, width, dtype=dtype, device="cuda")
+        for width, dtype in [(32, torch.uint8)] * 2 + [(4, torch.float8_e4m3fn)] * 2
+    ]
+    if cache_index is None:
+        # These matching rank-three shapes formerly passed every layout check.
+        caches = [t[:, :, 0].contiguous() for t in caches]
+    else:
+        caches[cache_index] = caches[cache_index].flatten(1, 2)
+    slots = torch.empty(0, 2, 4, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="rank-four HND"):
+        gather_nvfp4_kv_cache(
+            tuple(caches[:2]),
+            tuple(caches[2:]),
+            slots,
+            torch.empty(0, dtype=torch.int32, device="cuda"),
+            out=torch.empty(0, 1, 1, 128, dtype=torch.float8_e4m3fn, device="cuda"),
+            block_tables=torch.empty_like(slots),
+        )
+
+
+@pytest.mark.parametrize("page_size,head_dim", [(0, 64), (4, 0)])
+def test_gather_nvfp4_rejects_empty_page_or_head(page_size, head_dim):
+    """The kernel's page division and scale swizzle require positive extents."""
+    from flashinfer.sdsa.token_sparse import gather_nvfp4_kv_cache
+
+    data = tuple(
+        torch.empty(2, 1, page_size, head_dim // 2, dtype=torch.uint8, device="cuda")
+        for _ in range(2)
+    )
+    scales = tuple(
+        torch.empty(
+            2, 1, page_size, head_dim // 16, dtype=torch.float8_e4m3fn, device="cuda"
+        )
+        for _ in range(2)
+    )
+    slots = torch.empty(0, 2, 4, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="positive page_size and head_dim"):
+        gather_nvfp4_kv_cache(
+            data,
+            scales,
+            slots,
+            torch.empty(0, dtype=torch.int32, device="cuda"),
+            out=torch.empty(
+                0, 1, 1, 2 * head_dim, dtype=torch.float8_e4m3fn, device="cuda"
+            ),
+            block_tables=torch.empty_like(slots),
+        )
+
+
+def test_gather_nvfp4_output_offsets_beyond_int32():
+    """Large FP8 workspaces must not wrap their byte offsets at 2 GiB."""
+    from flashinfer.sdsa.token_sparse import gather_nvfp4_kv_cache
+
+    rows, top_k, head_dim = 10923, 512, 192
+    data = tuple(
+        torch.full((1, 1, 4, head_dim // 2), 0x22, dtype=torch.uint8, device="cuda")
+        for _ in range(2)
+    )
+    scales = tuple(
+        torch.full(
+            (1, 1, 4, head_dim // 16), 6.0, dtype=torch.float8_e4m3fn, device="cuda"
+        )
+        for _ in range(2)
+    )
+    slots = torch.zeros(rows, 2, top_k, dtype=torch.int32, device="cuda")
+    out = torch.full(
+        (rows * top_k, 1, 1, 2 * head_dim),
+        float("nan"),
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    tables = torch.empty_like(slots)
+    gather_nvfp4_kv_cache(
+        data,
+        scales,
+        slots,
+        torch.full((rows,), top_k, dtype=torch.int32, device="cuda"),
+        out=out,
+        block_tables=tables,
+    )
+    # Each nibble is E2M1 1.0 and the scale cancels the workspace divisor.
+    edges = torch.stack((out[0], out[-1])).float()
+    torch.testing.assert_close(edges, torch.ones_like(edges), atol=0, rtol=0)
+    expected = torch.arange(top_k, device="cuda", dtype=torch.int32)
+    expected += (rows - 1) * top_k
+    torch.testing.assert_close(tables[-1], expected.expand(2, -1))

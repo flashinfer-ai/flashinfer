@@ -15,7 +15,9 @@ import torch
 from ..api_logging import flashinfer_api
 from ..cute_dsl.launch import launch
 from ..topk_varlen.kernels import block_scan
+from ..utils import get_compute_capability
 from ..trace.templates.sdsa import (
+    gather_nvfp4_kv_cache_trace,
     group_union_masks_trace,
     token_sparse_kv_indices_trace,
 )
@@ -405,3 +407,160 @@ def group_union_masks(
             module="token_sparse_union",
             key_files=(__file__, block_scan.__file__),
         )
+
+
+@flashinfer_api(trace=gather_nvfp4_kv_cache_trace)
+def gather_nvfp4_kv_cache(
+    paged_kv_cache: tuple[torch.Tensor, torch.Tensor],
+    kv_cache_sf: tuple[torch.Tensor, torch.Tensor],
+    slots: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    block_tables: torch.Tensor,
+    v_sf_swizzled: bool = True,
+) -> None:
+    """Gather selected NVFP4 MQA tokens into caller-owned FP8 workspace.
+
+    Parameters
+    ----------
+    paged_kv_cache : tuple[torch.Tensor, torch.Tensor]
+        K/V uint8 HND pages, each shaped
+        ``[pages, 1, page_size, head_dim // 2]``, with matching strides and
+        contiguous token data. ``page_size`` is a positive multiple of four;
+        ``head_dim`` is a positive multiple of 64.
+    kv_cache_sf : tuple[torch.Tensor, torch.Tensor]
+        K/V FP8 E4M3 block-scale pages, each shaped
+        ``[pages, 1, page_size, head_dim // 16]``, with matching strides.
+        K scales are linear. V scales follow ``v_sf_swizzled``.
+    slots : torch.Tensor
+        Int32 physical token indices shaped ``[rows, 2, top_k]``, K then V,
+        contiguous in the last dimension. Nonnegative indices within each
+        valid prefix must address allocated pages; they are not range-checked,
+        since that would need a host synchronization. Entries outside the
+        valid prefix produce zero output. A negative index inside the valid
+        prefix also produces a zero K/V token, which attention does not mask:
+        it still receives softmax weight. Producers should place selected
+        tokens first and bound them with ``seq_lens``.
+    seq_lens : torch.Tensor
+        Contiguous int32 ``[rows]`` valid-prefix lengths in ``[0, top_k]``.
+    out : torch.Tensor
+        Caller-owned contiguous FP8 E4M3 output shaped
+        ``[rows * top_k, 1, 1, 2 * head_dim]``, with K then V per token.
+        Must not overlap the inputs.
+    block_tables : torch.Tensor
+        Caller-owned contiguous int32 output shaped ``[rows, 2, top_k]``.
+        Both sides receive local token indices ``row * top_k + column``.
+        Must not overlap the inputs.
+    v_sf_swizzled : bool
+        Whether V scales use TRT-LLM's HND four-token swizzle, as in caches
+        written for trtllm-gen attention; ``page_size`` must then be a
+        multiple of four. Pass False for linear V scales, as written by
+        :func:`flashinfer.page.nvfp4_quantize_append_paged_kv_cache`.
+
+    Notes
+    -----
+    All tensors must be on the same CUDA device. Outputs are written in place.
+    Outputs represent decoded NVFP4 values divided by six, excluding the
+    global scales. Multiply BMM1's K scale and BMM2's V scale by six. This
+    covers NVFP4's full normalized range without FP8 saturation. The result
+    is rounded to E4M3: products of E2M1 values and E4M3 scales can need more
+    mantissa bits, and small scales can become subnormal or zero. Global
+    query and probability scales are independent of this conversion.
+    Requires compute capability 8.9 or newer; validated on SM100 and SM103.
+    """
+    from ._token_sparse_nvfp4 import (
+        FP4_VALUES_PER_BYTE,
+        GATHER_TOKENS_PER_TILE,
+        HEAD_DIM_ALIGNMENT,
+        KV_COMPONENTS,
+        NVFP4_SCALE_BLOCK_SIZE,
+        V_SCALE_SWIZZLE_TOKENS,
+        gather_kernel,
+    )
+    import triton
+
+    k, v = paged_kv_cache
+    ks, vs = kv_cache_sf
+    if any(t.ndim != 4 for t in (k, v, ks, vs)):
+        raise ValueError("Expected rank-four HND K/V data and scale pages")
+    if slots.ndim != 3:
+        raise ValueError("Expected int32 K/V slot lists shaped [rows, 2, top_k]")
+    rows, sides, top_k = slots.shape
+    dim = k.shape[-1] * FP4_VALUES_PER_BYTE.value
+    if k.shape[2] <= 0 or dim <= 0:
+        raise ValueError("Expected positive page_size and head_dim")
+    if k.dtype != torch.uint8 or v.dtype != torch.uint8:
+        raise ValueError("NVFP4 data must be uint8")
+    if ks.dtype != torch.float8_e4m3fn or vs.dtype != ks.dtype:
+        raise ValueError("NVFP4 block scales must be FP8 E4M3")
+    if k.shape != v.shape or k.stride() != v.stride() or k.shape[1] != 1:
+        raise ValueError("Expected matching HND MQA K/V pages")
+    if (
+        ks.shape != vs.shape
+        or ks.stride() != vs.stride()
+        or ks.shape != (*k.shape[:-1], dim // NVFP4_SCALE_BLOCK_SIZE.value)
+    ):
+        raise ValueError("Expected matching K/V scale pages")
+    if (
+        (v_sf_swizzled and k.shape[2] % V_SCALE_SWIZZLE_TOKENS.value)
+        or dim % HEAD_DIM_ALIGNMENT.value
+        or k.stride(-2) != dim // FP4_VALUES_PER_BYTE.value
+        or k.stride(-1) != 1
+        or ks.stride(-2) != dim // NVFP4_SCALE_BLOCK_SIZE.value
+        or ks.stride(-1) != 1
+    ):
+        raise ValueError(
+            "Expected contiguous token data and HND four-token scale swizzle"
+        )
+    if (
+        sides != KV_COMPONENTS.value
+        or slots.dtype != torch.int32
+        or slots.stride(-1) != 1
+        or seq_lens.shape != (rows,)
+        or seq_lens.dtype != torch.int32
+        or not seq_lens.is_contiguous()
+    ):
+        raise ValueError("Expected int32 K/V slot lists and one length per row")
+    if (
+        out.shape != (rows * top_k, 1, 1, KV_COMPONENTS.value * dim)
+        or not out.is_contiguous()
+        or out.dtype != torch.float8_e4m3fn
+    ):
+        raise ValueError("Expected contiguous FP8 K/V output rows")
+    if (
+        block_tables.shape != slots.shape
+        or not block_tables.is_contiguous()
+        or block_tables.dtype != torch.int32
+    ):
+        raise ValueError("Expected contiguous int32 output block tables")
+    tensors = (k, v, ks, vs, slots, seq_lens, out, block_tables)
+    if not all(t.is_cuda and t.device == k.device for t in tensors):
+        raise ValueError("All inputs and outputs must be on the same CUDA device")
+    # Triton converts to FP8 E4M3 only from compute capability 8.9.
+    if get_compute_capability(k.device) < (8, 9):
+        raise NotImplementedError(
+            "gather_nvfp4_kv_cache requires compute capability 8.9 or newer"
+        )
+    if rows:
+        # Triton launches on the current device; match the tensors' device.
+        with torch.cuda.device(k.device):
+            gather_kernel[(rows, triton.cdiv(top_k, GATHER_TOKENS_PER_TILE.value))](
+                k,
+                v,
+                ks,
+                vs,
+                slots,
+                seq_lens,
+                out,
+                block_tables,
+                k.stride(0),
+                ks.stride(0),
+                k.shape[2],
+                dim,
+                top_k,
+                slots.stride(0),
+                slots.stride(1),
+                BLOCK_DIM=triton.next_power_of_2(dim),
+                V_SF_SWIZZLED=v_sf_swizzled,
+            )

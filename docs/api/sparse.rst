@@ -43,6 +43,7 @@ Token-Sparse Attention Inputs
 
 Build cache-slot lists for token-sparse attention.
 Build grouped key unions and masks for masked dense attention.
+Gather selected NVFP4 KV-cache tokens into an FP8 attention workspace.
 
 .. currentmodule:: flashinfer.sdsa.token_sparse
 
@@ -52,6 +53,7 @@ Build grouped key unions and masks for masked dense attention.
     token_sparse_kv_indices
     group_union_masks
     union_key_limit
+    gather_nvfp4_kv_cache
 
 
 SDSA Indexer
