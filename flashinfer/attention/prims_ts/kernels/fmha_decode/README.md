@@ -40,8 +40,11 @@ separate warp groups: one per KV instance at D128, one per operand at D256.
 It requires the grouped token/head layout.
 
 Native SM107 targets use compact FP4 repacking for TMEM conversion and retain
-dense nibble pairs for SMEM conversion. D256 defaults can use the 327-KiB
-shared-memory capacity for three complete raw K/V tiles; family targets retain
+dense nibble pairs for SMEM conversion. When a KV tile matches one page, the
+native SM107 fast SMEM converter loads and converts one 16-byte chunk at a time
+to shorten register live ranges. Other page geometries and targets retain
+whole-row lookahead. D256 defaults can use the 327-KiB shared-memory capacity
+for three complete raw K/V tiles; family targets retain
 the portable capacity. The BF16-output policy also compares Q1 Keeps on full
 Q grids and on underfilled grids with at least 32K KV tokens. Extra waves from
 underfilled Keeps grids retain at least 8K KV tokens per CTA. Full Q grids and

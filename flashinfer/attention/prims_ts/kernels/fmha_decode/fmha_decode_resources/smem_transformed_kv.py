@@ -34,6 +34,7 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
+from ...._hardware import is_sm107_compile_target
 from ...placeholder_helpers import _placeholder_smem_array
 from ..fmha_decode_config import FmhaDecodeConfig
 from ..fmha_decode_constants import KV_INST0, KV_KIND_K, KV_KIND_V
@@ -540,22 +541,37 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
             )
         src_swizzle = (row >> Int32(1)) & Int32(3)
         dst_swizzle = row & Int32(7)
-        # Issue all four 16-byte loads before converting so they overlap.
-        packed = [
-            (
-                src_words.data_ptr()
-                + row * Int32(16)
-                + ((Int32(chunk) ^ src_swizzle) << Int32(2))
-            ).load(count=4, alignment=16)
-            for chunk in range(4)
-        ]
+        # Stream each chunk through SM107's fallback conversion when the
+        # KV tile occupies one page, shortening packed-data live ranges.
+        # Cross-page tiles retain whole-row lookahead for load/convert overlap.
+        prefetch_row = not (
+            is_sm107_compile_target() and cfg.num_tokens_per_page == cfg.tile_size_kv
+        )
+        packed = []
+        if cutlass.const_expr(prefetch_row):
+            packed = [
+                (
+                    src_words.data_ptr()
+                    + row * Int32(16)
+                    + ((Int32(chunk) ^ src_swizzle) << Int32(2))
+                ).load(count=4, alignment=16)
+                for chunk in range(4)
+            ]
         for chunk in cutlass.range_constexpr(4):
+            if cutlass.const_expr(prefetch_row):
+                packed_chunk = packed[chunk]
+            else:
+                packed_chunk = (
+                    src_words.data_ptr()
+                    + row * Int32(16)
+                    + ((Int32(chunk) ^ src_swizzle) << Int32(2))
+                ).load(count=4, alignment=16)
             for half in cutlass.range_constexpr(2):
                 blk = chunk * 2 + half
                 fp8_words = []
                 for w in cutlass.range_constexpr(2):
                     if cutlass.const_expr(_has_packed_e4m3_e2m1_mul()):
-                        unpacked = unpack_e2m1x8_word(packed[chunk][half * 2 + w])
+                        unpacked = unpack_e2m1x8_word(packed_chunk[half * 2 + w])
                         for part in cutlass.range_constexpr(2):
                             fp8_words.append(
                                 _mul_e2m1x4_e4m3x4_bx(
@@ -569,7 +585,7 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
                             255
                         )
                         converted = _cvt_e2m1_word_to_e4m3_words(
-                            packed[chunk][half * 2 + w], scale
+                            packed_chunk[half * 2 + w], scale
                         )
                         fp8_words.append(converted[0])
                         fp8_words.append(converted[1])
