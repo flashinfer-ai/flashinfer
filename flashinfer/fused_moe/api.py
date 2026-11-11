@@ -3411,6 +3411,14 @@ class BatchInvariantBf16Config:
         return "BatchInvariantBf16Config()"
 
 
+# Design notes: the kernels of this backend took optimisation ideas from the package's other MoE backends: the swapped-AB
+# decode records as ranked members of the dispatcher's space follow Prims-TS (the open counterpart of TRTLLM-Gen's MoE
+# GEMMs: its swap-AB low-latency templates and tile-N ladder) and TRTLLM-Gen's fp8 per-tensor decode tactics; the fused
+# activation and e4m3 requantisation at the static per-tensor multiplier in GEMM1's epilogue follows Prims-TS's fused
+# activation and TRTLLM-Gen's fp8 per-tensor contract, whose surface this backend mirrors; the PDL wait / trigger
+# placement and the launch's tile bound on the persistent grid follow Prims-TS and TRTLLM-Gen; the routing, permutation,
+# combine and the ranking contract are the bf16 backend's. Each is a placement of the class's dataflow: the same bits,
+# placed as those kernels place theirs.
 @dataclass(frozen=True)
 class BatchInvariantFp8PerTensorConfig:
     """The batch-invariant fp8 per-tensor MoE backend: the W8A8 classes ``moe.e4m3.<act>`` of the mode documented in
