@@ -1079,6 +1079,7 @@ def pytest_collection_modifyitems(config, items):
     import warnings
 
     from flashinfer.jit.mamba.checkpointing_ssu import gen_checkpointing_ssu_module
+    from flashinfer.utils import device_support_pdl
 
     # The prewarm is purely an optimization: any failure below degrades to
     # the normal serial first-touch JIT compile at test time (where a real
@@ -1090,7 +1091,8 @@ def pytest_collection_modifyitems(config, items):
             spec
             for spec in (
                 gen_checkpointing_ssu_module(
-                    **dict(zip(_CHECKPOINTING_SSU_VARIANT_FIELDS, variant, strict=True))
+                    **dict(zip(_CHECKPOINTING_SSU_VARIANT_FIELDS, variant, strict=True)),
+                    enable_two_kernel=device_support_pdl(torch.device("cuda")),
                 )
                 for variant in _CHECKPOINTING_SSU_VARIANTS
             )
