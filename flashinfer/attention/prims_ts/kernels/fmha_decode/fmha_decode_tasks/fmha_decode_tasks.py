@@ -273,7 +273,14 @@ def _can_hold_native_page_window(
         smem_page_offsets is None
         or not smem_page_offsets.use_native_paged_kv
         or cfg.use_sliding_window_causal
-        or not cfg.fixed_seqlen
+        or (
+            not cfg.fixed_seqlen
+            and not (
+                cfg.runtime_split_kv
+                and cfg.runtime_page_window
+                and cfg.runtime_page_window_pages > 32
+            )
+        )
     ):
         return False
     if cfg.runtime_split_kv:

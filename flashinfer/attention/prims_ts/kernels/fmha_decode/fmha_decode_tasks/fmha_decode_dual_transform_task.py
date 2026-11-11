@@ -82,10 +82,11 @@ def create_dual_transform_kv_task(
     )
 
     # At D512 the four unrolled per-stage bodies of each converter crowd the
-    # Q64 softmax out of the instruction cache. Run the steady state once per
-    # raw stage instead and select the stage at run time.
+    # Q64 softmax out of the instruction cache. Register-prefetched D256 also
+    # keeps one conversion body per operand. Select the head slice at run time.
     stages = cfg.num_head_dim_stages_kv
-    flatten_loop = stages == 4
+    early_prefetch = cfg.uses_prefetched_smem_nvfp4_transform
+    flatten_loop = stages == 4 or early_prefetch
 
     @schedule
     def conversion_schedule(smem_kv: MemoryResource, tmem_kv: MemoryResource):
@@ -107,17 +108,35 @@ def create_dual_transform_kv_task(
             def convert_tile():
                 """Convert one KV tile, one head-dimension stage at a time."""
                 for head_stage in range(stages):
-                    convert_stage(
-                        lambda head_stage=head_stage: getattr(tmem_kv, label)(
+                    if early_prefetch:
+                        smem_kv.wait()
+                        packet = smem_kv.prefetch_nvfp4_row(
                             head_dim_stage_idx=head_stage
                         )
-                    )
+                        smem_kv.release()
+                        tmem_kv.acquire()
+                        tmem_kv.transform_prefetched_row(packet=packet)
+                        tmem_kv.commit()
+                    else:
+                        convert_stage(
+                            lambda head_stage=head_stage: getattr(tmem_kv, label)(
+                                head_dim_stage_idx=head_stage
+                            )
+                        )
 
             if not is_v:
                 convert_tile()
             if flatten_loop:
                 with domain_loop(0, domain * stages, 1, unroll=1):
-                    convert_stage(getattr(tmem_kv, f"{label}_loop_stage"))
+                    if early_prefetch:
+                        smem_kv.wait()
+                        packet = smem_kv.prefetch_nvfp4_loop_row()
+                        smem_kv.release()
+                        tmem_kv.acquire()
+                        tmem_kv.transform_prefetched_row(packet=packet)
+                        tmem_kv.commit()
+                    else:
+                        convert_stage(getattr(tmem_kv, f"{label}_loop_stage"))
             else:
                 with domain_loop(0, domain, 1, unroll=1):
                     convert_tile()

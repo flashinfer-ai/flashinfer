@@ -920,6 +920,25 @@ class FmhaDecodeConfig:
         return self.use_q_token_kv_block_sparse_route
 
     @property
+    def uses_prefetched_smem_nvfp4_transform(self) -> bool:
+        """Whether dense SM107 D256 conversion releases raw rows before FP8 work."""
+        return (
+            is_sm107_compile_target()
+            and self.uses_dual_smem_transform
+            and self.headdim == 256
+            and self.num_tokens_per_page == self.tile_size_kv
+            and not self.use_block_sparse
+            and not self.uses_scattered_page_route
+        )
+
+    @property
+    def runtime_page_window_pages(self) -> int:
+        """Capacity of the existing CTA-relative runtime page-window profile."""
+        if self.uses_prefetched_smem_nvfp4_transform:
+            return 128
+        return 32
+
+    @property
     def uses_page_offsets_task(self) -> bool:
         """Whether a page-table producer task stages page IDs for the load warp.
 
@@ -1242,9 +1261,9 @@ class FmhaDecodeConfig:
         if not self.use_transform_kv:
             return None
         if self.uses_fast_smem_nvfp4_transform:
-            # A converter thread keeps one row's 64 packed bytes, its scales
-            # and addresses live; 56 registers do not spill.
-            return 56
+            # Early raw release keeps the packed row live across the output
+            # acquire. The larger grant still leaves Softmax its preferred budget.
+            return 72 if self.uses_prefetched_smem_nvfp4_transform else 56
         if self.uses_dual_kv_transform:
             return 80
         if self.uses_large_q_swaps_tile:
@@ -6717,10 +6736,15 @@ def make_decode_config(
             or selected_grouped_q_recipe.waves > 1
         )
     ):
-        # Full launch grids, including split-filled grids, need less raw
-        # lookahead. One complete K/V tile improves SM107 throughput;
-        # underfilled launches retain three tiles to hide input latency.
-        _set_if_implicit(cfg, "kv_stages", 4, explicit_fields)
+        # Register-prefetched rows release raw slots before conversion, so
+        # three complete K/V tiles can hide TMA latency behind both converters.
+        # The existing stream keeps one raw tile for full launch grids.
+        _set_if_implicit(
+            cfg,
+            "kv_stages",
+            12 if cfg.uses_prefetched_smem_nvfp4_transform else 4,
+            explicit_fields,
+        )
 
     _validate_mixed_kv_dtype_profile(cfg)
     _validate_kv256_static_config(cfg)

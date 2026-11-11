@@ -938,3 +938,23 @@ def _route_is_proxy(route_flags: Int32) -> cutlass.Boolean:
     return cutlass.Boolean(
         (route_flags & Int32(_SOFTMAX_ROUTE_IS_PROXY_FLAG)) != Int32(0)
     )
+
+
+@cute.jit
+def gather_byte_of_words(
+    w0: Int32, w1: Int32, w2: Int32, w3: Int32, byte_idx: Int32
+) -> Int32:
+    """Return byte ``byte_idx`` (0-3) of each word, packed w0 low to w3 high.
+
+    Two PRMTs pick the byte from (w0, w1) and (w2, w3); a third packs the
+    resulting halves.
+    """
+    pair_sel = byte_idx | ((byte_idx + Int32(4)) << Int32(4))
+    return cute.arch.inline_ptx(
+        "{ .reg .b32 lo, hi; "
+        "prmt.b32 lo, {$r0}, {$r1}, {$r4}; "
+        "prmt.b32 hi, {$r2}, {$r3}, {$r4}; "
+        "prmt.b32 {$w0}, lo, hi, 0x5410; }",
+        write_only_types=[Int32],
+        read_only_args=[w0, w1, w2, w3, pair_sel],
+    )

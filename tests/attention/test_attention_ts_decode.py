@@ -10389,9 +10389,10 @@ def test_attention_ts_decode_large_tile_size_q(
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize("queries", (1, 12), ids=lambda value: f"q{value}")
-def test_attention_ts_decode_large_grouped_nvfp4_grid(queries: int):
+@pytest.mark.parametrize("page", (64, 128), ids=lambda value: f"p{value}")
+def test_attention_ts_decode_large_grouped_nvfp4_grid(queries: int, page: int):
     """Padded Q1 and large grouped grids share public workspace and graph paths."""
-    batch, heads_q, heads_kv, dim, page, context = 64, 32, 4, 256, 64, 2048
+    batch, heads_q, heads_kv, dim, context = 64, 32, 4, 256, 2048
     spec = _resolve_decode_launch_spec(
         torch.cuda.current_device(),
         batch,

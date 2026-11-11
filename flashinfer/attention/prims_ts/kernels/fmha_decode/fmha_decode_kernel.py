@@ -4118,12 +4118,15 @@ def fmha_decode_launch(
         and not cfg.use_sliding_window_causal
         and not cfg.uses_scattered_page_route
         and not cfg.use_block_sparse
-        and cfg.num_insts_kv * (cfg.tile_size_kv // cfg.num_tokens_per_page) <= 32
+        and cfg.num_insts_kv * (cfg.tile_size_kv // cfg.num_tokens_per_page)
+        <= cfg.runtime_page_window_pages
     )
     use_runtime_window = cutlass.Boolean(False)
     if cutlass.const_expr(can_hold_runtime_window):
         pages_per_tile = cfg.tile_size_kv // cfg.num_tokens_per_page
-        window_tiles = (32 // pages_per_tile // cfg.num_insts_kv) * cfg.num_insts_kv
+        window_tiles = (
+            cfg.runtime_page_window_pages // pages_per_tile // cfg.num_insts_kv
+        ) * cfg.num_insts_kv
         use_runtime_window = s_k <= requested_splits[0] * Int32(
             window_tiles * cfg.tile_size_kv
         )

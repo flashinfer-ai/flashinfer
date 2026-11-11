@@ -39,6 +39,7 @@ from ...placeholder_helpers import _placeholder_smem_array
 from ..fmha_decode_config import FmhaDecodeConfig
 from ..fmha_decode_constants import KV_INST0, KV_KIND_K, KV_KIND_V
 from .helpers_common import (
+    gather_byte_of_words,
     _TASK_CACHE_WARP_GRP_THREAD_IDX,
     Constexpr,
     DecodeGenResourceBase,
@@ -137,26 +138,6 @@ def _cvt_e2m1x2_byte_to_bf16x2(packed_byte: Int32) -> Int32:
         "mov.b32 {$w0}, {b0, b1}; }",
         write_only_types=[Int32],
         read_only_args=[packed_byte & Int32(0xFF)],
-    )
-
-
-@cute.jit
-def gather_byte_of_words(
-    w0: Int32, w1: Int32, w2: Int32, w3: Int32, byte_idx: Int32
-) -> Int32:
-    """Return byte ``byte_idx`` (0-3) of each word, packed w0 low to w3 high.
-
-    Two PRMTs pick the byte from (w0, w1) and (w2, w3); a third packs the
-    resulting halves.
-    """
-    pair_sel = byte_idx | ((byte_idx + Int32(4)) << Int32(4))
-    return cute.arch.inline_ptx(
-        "{ .reg .b32 lo, hi; "
-        "prmt.b32 lo, {$r0}, {$r1}, {$r4}; "
-        "prmt.b32 hi, {$r2}, {$r3}, {$r4}; "
-        "prmt.b32 {$w0}, lo, hi, 0x5410; }",
-        write_only_types=[Int32],
-        read_only_args=[w0, w1, w2, w3, pair_sel],
     )
 
 
@@ -688,6 +669,46 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
                     dst_pair_base,
                 )
 
+        cute.arch.fence_view_async_shared()
+
+    @producer_work
+    @cute.jit
+    def transform_prefetched_row(
+        self, stage_info: StageInfo, *, packet: cutlass.Array
+    ) -> None:
+        """Convert a register-resident row into the acquired FP8 SMEM slot."""
+        # ProdWork: only the register payload is read after the raw slot is released.
+        cfg = self.cfg
+        row = _decode_gen_task_cache(stage_info)[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+        dst_base = self._smem_base_kv.subview(
+            stage_info.stage_idx
+            * (cfg.smem_transformed_kv_tile_bytes // cfg.qk_dtype_bytes)
+        )
+        dst_words = cutlass.Array(
+            dst_base.data_ptr(),
+            dtype=Int32,
+            shape=(cfg.smem_transformed_kv_tile_bytes // 4,),
+            addrspace=3,
+        )
+        dst_swizzle = row & Int32(7)
+        for chunk in cutlass.range_constexpr(4):
+            for half in cutlass.range_constexpr(2):
+                blk = chunk * 2 + half
+                scale = (packet[16 + blk // 4] >> Int32((blk % 4) * 8)) & Int32(255)
+                fp8_words = []
+                for w in cutlass.range_constexpr(2):
+                    converted = _cvt_e2m1_word_to_e4m3_words(
+                        packet[chunk * 4 + half * 2 + w], scale
+                    )
+                    fp8_words.append(converted[0])
+                    fp8_words.append(converted[1])
+                (
+                    dst_words.data_ptr()
+                    + row * Int32(32)
+                    + ((Int32(blk) ^ dst_swizzle) << Int32(2))
+                ).store(
+                    cutlass.Vector.from_elements(tuple(fp8_words), Int32), alignment=16
+                )
         cute.arch.fence_view_async_shared()
 
     @producer_work
