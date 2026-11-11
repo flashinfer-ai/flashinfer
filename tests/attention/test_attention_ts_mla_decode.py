@@ -1217,6 +1217,116 @@ def _empty_mla_runtime() -> mla_decode_module._MLARuntime:
     )
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        pytest.param({}, id="default-bound"),
+        pytest.param(
+            dict(
+                seq_len_q=4,
+                num_qo_heads=128,
+                q_dtype=_FP8,
+                store_softmax_stats=True,
+                use_kv_bounds=True,
+                mask_type="dense",
+            ),
+            id="legacy-bound-fp8-stats",
+        ),
+        pytest.param(dict(max_kv_len=128, max_q_len=2), id="explicit-bound-short-kv"),
+    ],
+)
+def test_attention_ts_mla_trusted_workspace_size(monkeypatch, options):
+    """Trusted sizing reuses the same policy without repeated host checks."""
+    from contextlib import nullcontext
+    from flashinfer.attention.prims_ts import _hardware
+
+    monkeypatch.setattr(torch.cuda, "device", lambda *_: nullcontext())
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 0))
+    monkeypatch.setattr(
+        mla_decode_module, "get_max_active_clusters", lambda size: 148 // size
+    )
+    monkeypatch.setattr(_hardware, "get_max_active_clusters", lambda size: 148 // size)
+    monkeypatch.setattr(mla_decode_module, "get_device_sm_count", lambda *_: 148)
+    args = (
+        dict(
+            batch_size=2,
+            num_qo_heads=16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            page_size=32,
+            max_kv_len=8192,
+            device="cuda:0",
+        )
+        | options
+    )
+    cache = mla_decode_module._resolve_mla_decode_launch_spec
+    cache.cache_clear()
+    try:
+        # A cold trusted call must still populate the ordinary policy cache.
+        expected = get_prims_ts_batch_mla_decode_workspace_size(**args, validate=False)
+        before = cache.cache_info()
+        assert get_prims_ts_batch_mla_decode_workspace_size(**args) == expected
+
+        def unexpected_check(*_args, **_kwargs):
+            pytest.fail("trusted workspace sizing must not repeat validation")
+
+        for name in (
+            "_validate_positive_int",
+            "_validate_mla_dims",
+            "_validate_page_size",
+            "_validate_mla_max_kv_len",
+            "_validate_mla_query_head_extent",
+            "_validate_mask",
+            "_validate_mla_dtype_pair",
+            "_validate_runtime_device",
+            "_make_mla_workspace_layout",
+        ):
+            monkeypatch.setattr(mla_decode_module, name, unexpected_check)
+        monkeypatch.setattr(torch.cuda, "get_device_capability", unexpected_check)
+        assert (
+            get_prims_ts_batch_mla_decode_workspace_size(**args, validate=False)
+            == expected
+        )
+        after = cache.cache_info()
+        assert after.misses == before.misses == 1
+        assert after.currsize == before.currsize == 1
+        assert after.hits == before.hits + 2
+    finally:
+        cache.cache_clear()
+
+
+def test_attention_ts_mla_workspace_size_validation():
+    """Default validation and ambiguous Q-bound rejection remain unchanged."""
+    args = dict(
+        batch_size=2,
+        num_qo_heads=16,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        page_size=32,
+        max_kv_len=8192,
+        device="cuda:0",
+    )
+    with pytest.raises(TypeError, match="validate must be a bool"):
+        get_prims_ts_batch_mla_decode_workspace_size(**args, validate=0)
+    with pytest.raises(ValueError, match="batch_size must be positive"):
+        get_prims_ts_batch_mla_decode_workspace_size(**(args | dict(batch_size=0)))
+    with pytest.raises(NotImplementedError, match="kv_lora_rank=512"):
+        get_prims_ts_batch_mla_decode_workspace_size(**(args | dict(kv_lora_rank=256)))
+    with pytest.raises(ValueError, match="seq_len_q and max_q_len must agree"):
+        get_prims_ts_batch_mla_decode_workspace_size(
+            **args, seq_len_q=2, max_q_len=3, validate=False
+        )
+
+
+@pytest.mark.parametrize("kernel_bytes", (0, 1, 256, 257))
+def test_attention_ts_mla_workspace_size_without_lse(kernel_bytes):
+    """Without final LSE, only the kernel section's trailing alignment remains."""
+    layout = mla_decode_module._make_mla_workspace_layout(
+        kernel_bytes, 2, 16, 3, include_lse=False
+    )
+    assert layout.total_bytes == mla_decode_module._align_up(kernel_bytes)
+
+
 def test_attention_ts_mla_public_surfaces_hide_internal_tuning_policy():
     """Keep kernel policy automatic and the public signatures explicit."""
 
@@ -3695,20 +3805,25 @@ def test_attention_ts_mla_decode_generic_packed_logical_rows(heads, dtype):
 def test_attention_ts_mla_replanned_sizes(heads, dtype, packed_query):
     """Replanned problem sizes retain numerical accuracy and graph replay."""
     wrapper = BatchMLADecodePagedTSWrapper()
+
+    def workspace_size(batch, sq, sk):
+        return get_prims_ts_batch_mla_decode_workspace_size(
+            batch_size=batch,
+            num_qo_heads=heads,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            page_size=32,
+            max_kv_len=sk,
+            max_q_len=sq,
+            q_dtype=dtype,
+            out_dtype=torch.bfloat16,
+            device="cuda",
+            validate=False,
+        )
+
     workspace = torch.empty(
         max(
-            get_prims_ts_batch_mla_decode_workspace_size(
-                batch_size=batch,
-                num_qo_heads=heads,
-                kv_lora_rank=512,
-                qk_rope_head_dim=64,
-                page_size=32,
-                max_kv_len=sk,
-                max_q_len=sq,
-                q_dtype=dtype,
-                out_dtype=torch.bfloat16,
-                device="cuda",
-            )
+            workspace_size(batch, sq, sk)
             for batch, sq, sk in ((2, 1, 513), (3, 3, 641), (1, 5, 769), (2, 1, 514))
         ),
         dtype=torch.uint8,
@@ -3764,6 +3879,10 @@ def test_attention_ts_mla_replanned_sizes(heads, dtype, packed_query):
     out = torch.empty_like(output)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
+        assert (
+            workspace_size(batch, sq, sk)
+            == wrapper._plan_state.workspace_layout.total_bytes
+        )
         run(out=out, validate=False)
     graph.replay()
     torch.cuda.synchronize()

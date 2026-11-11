@@ -5862,6 +5862,149 @@ def test_attention_ts_decode_shared_arch_guard_rejects_unsupported_gpu(
             query()
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        pytest.param({}, id="fixed-defaults"),
+        pytest.param(
+            dict(
+                seq_len_q=4,
+                page_size=4,
+                storage_page_size=16,
+                q_dtype=torch.bfloat16,
+                kv_dtype=_FP8,
+                out_dtype=torch.bfloat16,
+                mask_type="causal",
+                kv_layout="NHD",
+                window_left=1023,
+                use_attention_sinks=True,
+                store_softmax_stats=True,
+            ),
+            id="fixed-subpages-stats",
+        ),
+        pytest.param(
+            dict(
+                qo_indptr=(0, 2, 5),
+                max_q_len=3,
+                q_dtype=torch.bfloat16,
+                v_dtype=_FP8,
+                split_kv=False,
+            ),
+            id="packed-mixed-pv",
+        ),
+    ],
+)
+def test_attention_ts_decode_trusted_workspace_size(monkeypatch, options):
+    """Trusted sizing reuses validated policies without checks or readbacks."""
+    from contextlib import nullcontext
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    _mock_decode_hardware(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "device", lambda *_: nullcontext())
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda size: 152 // size,
+    )
+    args = (
+        dict(
+            batch_size=2,
+            num_qo_heads=16,
+            num_kv_heads=2,
+            head_dim=128,
+            page_size=32,
+            max_kv_len=8192,
+            device="cuda:0",
+        )
+        | options
+    )
+    if "qo_indptr" in args:
+        args["qo_indptr"] = torch.tensor(args["qo_indptr"], dtype=torch.int32)
+        validate_offsets = decode_module._validate_qo_indptr
+        # Exercise real metadata/value checks using CPU storage in this host test.
+        monkeypatch.setattr(
+            decode_module,
+            "_validate_qo_indptr",
+            lambda offsets, *, expected_device, batch_size: validate_offsets(
+                offsets, expected_device=offsets.device, batch_size=batch_size
+            ),
+        )
+    cache = decode_module._resolve_decode_launch_spec
+    cache.cache_clear()
+    try:
+        expected = get_prims_ts_batch_decode_workspace_size(**args)
+        before = cache.cache_info()
+
+        def unexpected_check(*_args, **_kwargs):
+            pytest.fail("trusted workspace sizing must not validate or read back")
+
+        for name in (
+            "_validate_positive_int",
+            "_validate_seq_len_q",
+            "_validate_head_geometry",
+            "_validate_decode_query_head_extent",
+            "_validate_head_dim",
+            "_validate_page_size",
+            "_validate_storage_page_size",
+            "_validate_max_kv_len",
+            "_validate_layout",
+            "_validate_mask",
+            "_validate_window_left",
+            "_validate_dtype_pair",
+            "_validate_runtime_device",
+            "_validate_qo_indptr",
+            "_read_packed_q_plan_metadata",
+        ):
+            monkeypatch.setattr(decode_module, name, unexpected_check)
+        monkeypatch.setattr(torch.cuda, "get_device_capability", unexpected_check)
+        monkeypatch.setattr(torch.Tensor, "tolist", unexpected_check)
+        monkeypatch.setattr(torch.Tensor, "item", unexpected_check)
+        monkeypatch.setattr(torch.Tensor, "cpu", unexpected_check)
+        assert (
+            get_prims_ts_batch_decode_workspace_size(**args, validate=False) == expected
+        )
+        after = cache.cache_info()
+        assert after.misses == before.misses == 1
+        assert after.currsize == before.currsize == 1
+        assert after.hits == before.hits + 1
+    finally:
+        cache.cache_clear()
+
+
+def test_attention_ts_decode_workspace_size_validation(monkeypatch):
+    """Default checks and sizing-critical alias constraints remain in force."""
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    args = dict(
+        batch_size=2,
+        num_qo_heads=16,
+        num_kv_heads=2,
+        head_dim=128,
+        page_size=32,
+        max_kv_len=8192,
+        device="cuda:0",
+    )
+    with pytest.raises(TypeError, match="validate must be a bool"):
+        get_prims_ts_batch_decode_workspace_size(**args, validate=0)
+    with pytest.raises(ValueError, match="batch_size must be positive"):
+        get_prims_ts_batch_decode_workspace_size(**(args | dict(batch_size=0)))
+    with pytest.raises(ValueError, match="num_qo_heads must be divisible"):
+        get_prims_ts_batch_decode_workspace_size(**(args | dict(num_qo_heads=3)))
+    with pytest.raises(ValueError, match="fixed seq_len_q and max_q_len must agree"):
+        get_prims_ts_batch_decode_workspace_size(**args, max_q_len=2, validate=False)
+    offsets = torch.tensor([0, 2, 5], dtype=torch.int32)
+    with pytest.raises(ValueError, match="max_q_len is required"):
+        get_prims_ts_batch_decode_workspace_size(
+            **args, qo_indptr=offsets, validate=False
+        )
+    # Let the default path reach the real value check without CUDA storage.
+    monkeypatch.setattr(
+        decode_module, "_resolve_cuda_device", lambda _: (torch.device("cpu"), 0)
+    )
+    with pytest.raises(ValueError, match="per-request Q length larger"):
+        get_prims_ts_batch_decode_workspace_size(**args, qo_indptr=offsets, max_q_len=2)
+
+
 def test_attention_ts_decode_auto_launch_persists_only_above_one_sm_wave(
     monkeypatch,
 ):
@@ -9991,26 +10134,34 @@ def test_attention_ts_decode_replanned_sizes(dtype, packed_query, layout):
     """Replanned problem sizes retain numerical accuracy and graph replay."""
     out_dtype = torch.float16 if dtype == _FP8 else torch.bfloat16
     wrapper = BatchDecodePagedTSWrapper(layout)
+
+    def workspace_size(batch, sq, sk, offsets):
+        return get_prims_ts_batch_decode_workspace_size(
+            batch_size=batch,
+            num_qo_heads=16,
+            num_kv_heads=2,
+            head_dim=128,
+            page_size=32,
+            max_kv_len=sk,
+            seq_len_q=sq,
+            qo_indptr=offsets,
+            max_q_len=sq,
+            q_dtype=dtype,
+            out_dtype=out_dtype,
+            kv_layout=layout,
+            device="cuda",
+            validate=False,
+        )
+
     workspace = torch.empty(
         max(
-            get_prims_ts_batch_decode_workspace_size(
-                batch_size=batch,
-                num_qo_heads=16,
-                num_kv_heads=2,
-                head_dim=128,
-                page_size=32,
-                max_kv_len=sk,
-                seq_len_q=sq,
-                qo_indptr=(
-                    torch.arange(batch + 1, dtype=torch.int32, device="cuda") * sq
-                )
+            workspace_size(
+                batch,
+                sq,
+                sk,
+                torch.arange(batch + 1, dtype=torch.int32, device="cuda") * sq
                 if packed_query
                 else None,
-                max_q_len=sq,
-                q_dtype=dtype,
-                out_dtype=out_dtype,
-                kv_layout=layout,
-                device="cuda",
             )
             for batch, sq, sk in (
                 (2, 1, 8193),
@@ -10092,6 +10243,10 @@ def test_attention_ts_decode_replanned_sizes(dtype, packed_query, layout):
     out = torch.empty_like(output)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
+        assert (
+            workspace_size(batch, sq, sk, qo_indptr)
+            == wrapper._plan_state.workspace_layout.total_bytes
+        )
         run(out=out, validate=False)
     graph.replay()
     torch.cuda.synchronize()

@@ -70,8 +70,13 @@ metadata values back to the host. FMHA preserves initialized caller scratch
 by planning with `initialize_workspace=False`.
 
 Use the existing `get_prims_ts_batch_*_workspace_size` helpers outside
-capture. Zero caller-owned FMHA scratch before its first trusted standalone
-launch and re-zero it when workspace-layout inputs change; wrappers
+capture. Their default `validate=True` checks geometry and device support;
+FMHA also checks packed-Q offset values. For already-validated inputs,
+`validate=False` skips those repeated checks and offset readbacks while
+preserving alias resolution and the same internal policy cache. The caller
+owns hardware, geometry, dtype and metadata validity; a cold policy lookup
+may still query device properties. Zero caller-owned FMHA scratch before its
+first trusted standalone launch and re-zero it when workspace-layout inputs change; wrappers
 initialize control storage by default. Alternatively, FMHA plans for one
 device may share one buffer of at least the largest size returned for them:
 zero the whole buffer once, bind the same full tensor to every plan (not
