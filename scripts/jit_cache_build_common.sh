@@ -174,6 +174,37 @@ run_bounded_parallel() {
   return $failed
 }
 
+# Lint the AOT spec list of each provider architecture: no spec may name a CUDA
+# target its provider cannot carry (see check_jit_spec_gencodes.py). Generates
+# specs only, so it needs the CUDA image and flashinfer installed but no GPU and
+# no compiling. One process per provider: the target list is fixed when flashinfer
+# is first imported.
+#
+# Args: $1 - CONCURRENCY (>= 1), $2... - provider architectures.
+# Returns 0 when every provider passed, else 1.
+_JIT_CACHE_COMMON_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+lint_provider_specs() {
+  local provider_architecture=$1
+  python3 "${_JIT_CACHE_COMMON_DIR}/check_jit_spec_gencodes.py" \
+    --provider "${provider_architecture}" 2>&1 \
+    | sed -u "s/^/[${provider_architecture}] /"
+}
+
+run_provider_spec_lint() {
+  local concurrency=$1
+  shift
+  if ! [[ "${concurrency}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: spec lint concurrency must be a positive integer, got '${concurrency}'"
+    return 1
+  fi
+  local started_at=${SECONDS}
+  run_bounded_parallel "${concurrency}" lint_provider_specs "$@" || {
+    echo "ERROR: A provider spec lists CUDA targets the provider cannot carry"
+    return 1
+  }
+  echo "✓ Provider spec CUDA targets linted in $(( SECONDS - started_at )) s"
+}
+
 # Verify that the selected compiler matches the CUDA matrix entry.
 #
 # Args:
