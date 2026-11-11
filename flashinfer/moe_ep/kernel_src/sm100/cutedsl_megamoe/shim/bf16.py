@@ -54,8 +54,17 @@ class MegaMoEBf16Config:
     apply_routing_weights_before_fc2: bool = True
     enable_iket: bool = False
     use_custom_finalize: bool = dataclasses.field(default=False, kw_only=True)
+    batch_invariant: bool = dataclasses.field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+            bf16_plan_config,
+            validate_bf16_batch_invariant,
+        )
+
+        if type(self.batch_invariant) is not bool:
+            raise ValueError("batch_invariant must be a bool.")
+        validate_bf16_batch_invariant(self)
         if self.world_size < 1 or not 0 <= self.rank < self.world_size:
             raise ValueError("rank must be in [0, world_size).")
         if self.num_tokens_per_rank <= 0:
@@ -68,13 +77,7 @@ class MegaMoEBf16Config:
             raise ValueError("hidden must be divisible by 32.")
         if self.intermediate % 64:
             raise ValueError("intermediate must be divisible by 64.")
-        if self.mma_tiler_mnk != (256, 256, 64):
-            raise ValueError("BF16 MegaMoE requires mma_tiler_mnk=(256, 256, 64).")
-        if self.cluster_shape_mnk != (2, 1, 1) or not self.use_2cta_instrs:
-            raise ValueError(
-                "BF16 MegaMoE requires cluster_shape_mnk=(2, 1, 1) "
-                "and use_2cta_instrs=True."
-            )
+        bf16_plan_config(self)
         if self.token_back_mode not in (
             "epi_warps",
             "standalone_warps",
@@ -119,20 +122,44 @@ class MegaMoEBf16Frontend:
         self._gate_up_clamp = config.gate_up_clamp
         self._mega_key: Optional[tuple] = None
         self._mega: Optional[_CompiledMega] = None
+        self._arithmetic_fingerprint: Optional[str] = None
+
+    def _same_clamp(self, a: Optional[float], b: Optional[float]) -> bool:
+        if not self._config.batch_invariant:
+            return a == b
+        from flashinfer.moe_ep.batch_invariant.spec import f32_bits
+
+        return (None if a is None else f32_bits(abs(a))) == (
+            None if b is None else f32_bits(abs(b))
+        )
 
     @property
     def config(self) -> MegaMoEBf16Config:
-        if self._gate_up_clamp == self._config.gate_up_clamp:
+        if self._same_clamp(self._gate_up_clamp, self._config.gate_up_clamp):
             return self._config
         return dataclasses.replace(self._config, gate_up_clamp=self._gate_up_clamp)
 
     def set_gate_up_clamp(self, clamp: Optional[float]) -> None:
-        if self._gate_up_clamp != clamp:
+        if not self._same_clamp(self._gate_up_clamp, clamp):
             ensure_not_capturing("set_gate_up_clamp (clamp change)")
             self._release_workspace()
             self._gate_up_clamp = clamp
             self._mega_key = None
             self._mega = None
+            self._arithmetic_fingerprint = None
+
+    @property
+    def batch_invariant_fingerprint(self) -> Optional[str]:
+        """Arithmetic receipt, memoized independently of scheduling and capacity."""
+        if not self._config.batch_invariant:
+            return None
+        if self._arithmetic_fingerprint is None:
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+                bf16_batch_invariant_fingerprint,
+            )
+
+            self._arithmetic_fingerprint = bf16_batch_invariant_fingerprint(self.config)
+        return self._arithmetic_fingerprint
 
     def apply_knobs(self, knobs: dict) -> None:
         """Apply a validated BF16 tuning configuration and invalidate its compile."""
@@ -183,6 +210,7 @@ class MegaMoEBf16Frontend:
             c.intermediate,
             c.mma_tiler_mnk,
             c.cluster_shape_mnk,
+            c.use_2cta_instrs,
             c.load_balance_mode,
             c.group_hint,
             c.force_static_sched,
@@ -196,6 +224,8 @@ class MegaMoEBf16Frontend:
             c.apply_routing_weights_before_fc2,
             c.enable_iket,
             c.use_custom_finalize,
+            c.batch_invariant,
+            self.batch_invariant_fingerprint,
         )
 
     def _ensure_compiled(self, inputs: MegaMoEBf16Inputs) -> _CompiledMega:
@@ -203,13 +233,21 @@ class MegaMoEBf16Frontend:
         if self._mega is not None and self._mega_key == key:
             return self._mega
 
+        c = self.config
+        if c.batch_invariant:
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+                validate_bf16_batch_invariant_compile_target,
+                validate_bf16_batch_invariant_device,
+            )
+
+            validate_bf16_batch_invariant_device()
+            validate_bf16_batch_invariant_compile_target()
         ensure_not_capturing("cute.compile + symmetric-heap allocation")
         self._release_workspace()
         import cutlass
         import cutlass.cute as cute
         from moe_bf16_glu.megamoe_kernel_bf16 import Sm100MegaMoEBf16Kernel
 
-        c = self.config
         cluster_size = c.cluster_shape_mnk[0] * c.cluster_shape_mnk[1]
         sm_count = torch.cuda.get_device_properties(
             torch.cuda.current_device()
@@ -238,6 +276,7 @@ class MegaMoEBf16Frontend:
             hidden=c.hidden,
             fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
             skip_topk_reduce=c.use_custom_finalize,
+            mask_invalid_routes=c.batch_invariant,
             token_back_by_dispatch=c.token_back_mode != "epi_warps",
             token_back_mode=c.token_back_mode,
             epi_flag_batch=c.epi_flag_batch,
@@ -245,6 +284,7 @@ class MegaMoEBf16Frontend:
             gate_up_clamp=self._gate_up_clamp,
             apply_topk_in_fc1=c.apply_routing_weights_before_fc2,
         )
+        kernel.batch_invariant_chain = c.batch_invariant
         local_bytes, shared_bytes = kernel.get_workspace_sizes()
         local_workspace = torch.zeros(local_bytes, dtype=torch.uint8, device="cuda")
         shared_workspace = sym_zeros((shared_bytes,), torch.uint8)
@@ -481,12 +521,16 @@ def get_symm_buffer_for_bf16_mega_moe(
     apply_routing_weights_before_fc2: bool = True,
     enable_in_kernel_fc2_reduce: bool = False,
     use_custom_finalize: bool = False,
+    batch_invariant: bool = False,
     knobs: Optional[dict] = None,
 ) -> MegaMoEBf16SymmBuffer:
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
     )
     from .knob_cache import resolve_knobs
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+        BF16_BATCH_INVARIANT_VERSION,
+    )
     from .tuner import (
         describe_invalid_knobs,
         is_valid_bf16_for_config,
@@ -503,7 +547,13 @@ def get_symm_buffer_for_bf16_mega_moe(
             topk=num_topk,
             max_tokens=num_max_tokens,
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+            apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
             use_custom_finalize=use_custom_finalize,
+            batch_invariant=batch_invariant,
+            batch_invariant_version=(
+                BF16_BATCH_INVARIANT_VERSION if batch_invariant else None
+            ),
+            gate_up_clamp=clamp,
         )
     cfg = MegaMoEBf16Config(
         rank=rank,
@@ -517,6 +567,7 @@ def get_symm_buffer_for_bf16_mega_moe(
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         use_custom_finalize=use_custom_finalize,
+        batch_invariant=batch_invariant,
     )
     if not is_valid_bf16_for_config(cfg, knobs):
         raise ValueError(

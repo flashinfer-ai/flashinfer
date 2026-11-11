@@ -19,6 +19,9 @@ lean_exe quantconformance where
 lean_exe samplingconformance where
   root := `SamplingMain
 
+lean_exe megamoeconformance where
+  root := `MegaMoEMain
+
 lean_exe axioms where
   root := `Axioms
   supportInterpreter := true
