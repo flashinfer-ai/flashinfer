@@ -73,6 +73,8 @@ _INFERENCE_CANDIDATE_ORDER = (
     30,
 )
 
+_GENPHASE_CANDIDATE_ORDER = (8, 3, 0, 1, 2, 4, 5, 6, 7, 9, 10)
+
 
 def _unique_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Normalize tuple-valued knobs and retain each choice's first occurrence."""
@@ -233,6 +235,18 @@ def sm107_candidates(
             candidate
             for index in _INFERENCE_CANDIDATE_ORDER
             for candidate in out[index * stride : (index + 1) * stride]
+        ]
+    else:
+        # Only the eight wider-tile choices expand the reduction axis.
+        stride = 2 if allow_in_kernel_fc2_reduce else 1
+        base_count = 8 * stride
+        groups = [out[i : i + stride] for i in range(0, base_count, stride)]
+        groups.extend([candidate] for candidate in out[base_count:])
+        out = [
+            candidate
+            for index in _GENPHASE_CANDIDATE_ORDER
+            if index < len(groups)
+            for candidate in groups[index]
         ]
     return out
 

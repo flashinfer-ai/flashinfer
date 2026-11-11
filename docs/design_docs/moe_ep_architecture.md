@@ -871,8 +871,9 @@ and the recovery state machine.
 
 ### Offline live-token tuning
 
-Rubin inference searches all 32 default candidates unless capped. Their order
-mixes tile widths and launch shapes in short prefixes. `--max-candidates N`
+Rubin inference searches all 32 default candidates unless capped. GenPhase uses
+8 or 11, depending on the datatype. Both lists order choices for prefix-limited
+searches. `--max-candidates N`
 takes the first N unique choices from each eligible variant independently;
 shorter lists are used in full. The low-level Python tuner also accepts an
 ordered `candidates` list. Repeated choices are removed before measurement,
