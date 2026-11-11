@@ -116,3 +116,51 @@ def test_custom_jit_ragged_run_without_kv_cache_sf_passes_none():
 
     (run_args,) = module.calls
     assert run_args[_NUM_FIXED_RUN_ARGS:] == (None, None)
+
+
+@pytest.mark.cpu_only
+def test_custom_jit_ragged_run_positional_scales_without_kv_cache_sf():
+    # Callers that pass the scales positionally (the only way before kv_cache_sf
+    # was forwarded here) keep working when kv_cache_sf is omitted.
+    names = ["maybe_k_cache_sf", "user_bias", "maybe_v_cache_sf"]
+    q, k, v = _qkv()
+    wrapper, module = _custom_jit_wrapper(names, q.shape[0])
+    k_sf = torch.ones(q.shape[0], k.shape[1])
+    v_sf = torch.ones(q.shape[0], k.shape[1])
+    bias, scalar = torch.zeros(3), 0.5
+
+    wrapper.run(q, k, v, k_sf, bias, v_sf, scalar, enable_pdl=False)
+
+    (run_args,) = module.calls
+    forwarded = run_args[_NUM_FIXED_RUN_ARGS:]
+    expected = (k_sf, bias, v_sf, scalar)
+    assert len(forwarded) == len(expected)
+    assert all(a is b for a, b in zip(forwarded, expected, strict=True))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("packed", [False, True])
+def test_custom_jit_ragged_run_positional_scales_with_kv_cache_sf(packed):
+    # Passing the scales both positionally and through kv_cache_sf does not
+    # shift the positional args that follow them.
+    names = ["maybe_k_cache_sf", "user_bias", "maybe_v_cache_sf"]
+    q, k, v = _qkv()
+    wrapper, module = _custom_jit_wrapper(names, q.shape[0])
+    k_sf = torch.ones(q.shape[0], k.shape[1])
+    v_sf = torch.full((q.shape[0], k.shape[1]), 2.0)
+    if packed:
+        kv_cache_sf = torch.stack([k_sf, v_sf], dim=1)
+        k_sf, v_sf = kv_cache_sf.unbind(dim=1)
+    else:
+        kv_cache_sf = (k_sf, v_sf)
+    bias, scalar = torch.zeros(3), 0.5
+
+    wrapper.run(
+        q, k, v, k_sf, bias, v_sf, scalar, kv_cache_sf=kv_cache_sf, enable_pdl=False
+    )
+
+    (run_args,) = module.calls
+    forwarded = run_args[_NUM_FIXED_RUN_ARGS:]
+    assert len(forwarded) == 4
+    assert torch.equal(forwarded[0], k_sf) and torch.equal(forwarded[2], v_sf)
+    assert forwarded[1] is bias and forwarded[3] == scalar

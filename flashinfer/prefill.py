@@ -5556,6 +5556,47 @@ def _compute_mask_indptr(
     return mask_indptr
 
 
+def _same_tensor_view(a, b) -> bool:
+    return (
+        isinstance(a, torch.Tensor)
+        and isinstance(b, torch.Tensor)
+        and a.data_ptr() == b.data_ptr()
+        and a.shape == b.shape
+        and a.stride() == b.stride()
+    )
+
+
+def _drop_positional_kv_sf(
+    jit_additional_tensor_names: List[str],
+    known_bufs: dict,
+    user_args: tuple,
+    kv_sf_bufs: dict,
+) -> tuple:
+    """Remove scale tensors a caller also passed positionally.
+
+    Before ``kv_cache_sf`` was forwarded on the custom-JIT ragged path, the
+    ``maybe_k_cache_sf`` / ``maybe_v_cache_sf`` slots were filled from
+    ``*args``. A positional arg in such a slot that is the same view as the
+    scale taken from ``kv_cache_sf`` is a duplicate and is dropped, so the
+    remaining positional args keep their slots.
+    """
+    slot = 0
+    duplicate_slots = []
+    for name in jit_additional_tensor_names:
+        if name in known_bufs:
+            continue
+        if (
+            name in kv_sf_bufs
+            and slot < len(user_args)
+            and _same_tensor_view(user_args[slot], kv_sf_bufs[name])
+        ):
+            duplicate_slots.append(slot)
+        slot += 1
+    if not duplicate_slots:
+        return user_args
+    return tuple(a for i, a in enumerate(user_args) if i not in duplicate_slots)
+
+
 class BatchPrefillWithRaggedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with a ragged (tensor) KV cache for a
     batch of requests.
@@ -7837,18 +7878,30 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             enable_pdl,
         ]
         if self._jit_module is not None:
+            jit_known_bufs = {
+                "maybe_custom_mask": self._custom_mask_buf,
+                "maybe_mask_indptr": self._mask_indptr_buf,
+                "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
+                    q.shape[1], self.device
+                ),
+            }
+            if k_sf is not None:
+                # Callers that still pass the scales positionally as well keep
+                # working: drop those duplicates so later positional args keep
+                # their slots. Without kv_cache_sf the scale slots are filled
+                # from *args as before.
+                args = _drop_positional_kv_sf(
+                    self._jit_additional_tensor_names,
+                    jit_known_bufs,
+                    args,
+                    {"maybe_k_cache_sf": k_sf, "maybe_v_cache_sf": v_sf},
+                )
+                jit_known_bufs["maybe_k_cache_sf"] = k_sf
+                jit_known_bufs["maybe_v_cache_sf"] = v_sf
             run_args.extend(
                 prepare_jit_additional_args(
                     self._jit_additional_tensor_names,
-                    {
-                        "maybe_custom_mask": self._custom_mask_buf,
-                        "maybe_mask_indptr": self._mask_indptr_buf,
-                        "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
-                            q.shape[1], self.device
-                        ),
-                        "maybe_k_cache_sf": k_sf,
-                        "maybe_v_cache_sf": v_sf,
-                    },
+                    jit_known_bufs,
                     args,
                 )
             )
