@@ -1121,3 +1121,60 @@ def test_wide_route_selection():
         batch=8, max_q_len=1, num_heads=48, max_seq_len=342305, sm_count=152
     )
     assert not narrow.wide and narrow.lse_bias == LSE_BIAS
+
+
+@pytest.mark.parametrize(
+    "batch,max_q_len,num_heads,q_lens",
+    [
+        (1, 8, 12, [1]),  # spec-decode graph bound 8, one token decoding
+        (1, 8, 8, [1]),
+        (1, 4, 16, [1]),
+        (1, 8, 12, [2]),
+        (2, 8, 12, [1, 1]),
+    ],
+)
+def test_loose_max_q_len_routes_on_the_rows_the_query_holds(
+    batch, max_q_len, num_heads, q_lens
+):
+    # A loose max_q_len bound (max_q_len * H > 48) with fewer than 32 rows in the whole query
+    # used to pick the wide route, whose 32-row output box cannot fit the query (#8995).
+    rows = sum(q_lens) * num_heads
+    assert use_wide_route(max_q_len * num_heads) and rows < 32
+    plan = plan_mla_nvfp4_paged_decode(
+        batch=batch,
+        max_q_len=max_q_len,
+        num_heads=num_heads,
+        max_seq_len=8192,
+        sm_count=148,
+        rows=rows,
+    )
+    # No request holds more rows than the query, so the row tiles are sized for `rows`.
+    assert not plan.wide and plan.main_kind == f"main_rt{plan.rt}"
+    assert (plan.rt, plan.m_tiles) == rt_for_rows(rows)
+    assert plan.rt * plan.m_tiles >= max(q_lens) * num_heads
+    if batch == 1:
+        # A single request: the same plan as the exact bound.
+        exact = plan_mla_nvfp4_paged_decode(
+            batch=batch,
+            max_q_len=max(q_lens),
+            num_heads=num_heads,
+            max_seq_len=8192,
+            sm_count=148,
+            rows=rows,
+        )
+        assert plan == exact
+    assert plan.rows_max == rows
+
+
+def test_loose_max_q_len_keeps_the_wide_route_when_the_query_fills_it():
+    # 13 tokens x 12 heads = 156 rows: some request may hold all of them, so the bound of
+    # 8 tokens (96 rows) per request still decides, as before.
+    plan = plan_mla_nvfp4_paged_decode(
+        batch=3, max_q_len=8, num_heads=12, max_seq_len=4096, sm_count=152, rows=156
+    )
+    assert plan.wide and plan.m_tiles == wide_tiles(96)
+    # 5 tokens x 12 heads = 60 rows under a bound of 8 tokens: wide, sized for 60 rows.
+    plan = plan_mla_nvfp4_paged_decode(
+        batch=2, max_q_len=8, num_heads=12, max_seq_len=4096, sm_count=152, rows=60
+    )
+    assert plan.wide and plan.m_tiles == wide_tiles(60)

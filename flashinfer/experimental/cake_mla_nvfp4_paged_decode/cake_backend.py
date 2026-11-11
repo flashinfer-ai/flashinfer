@@ -250,6 +250,11 @@ def plan_mla_nvfp4_paged_decode(
 
     ``rows`` is the number of packed (token, head) rows the query actually holds (the split partials and the
     merge grid are sized by it); it defaults to the dense ``batch * max_q_len * num_heads``.
+
+    ``max_q_len`` may be a loose upper bound (for example a CUDA-graph bound for speculative decode). No request
+    holds more rows than the whole query, so the route and the row tiles follow
+    ``min(max_q_len * num_heads, rows)``: a loose bound must not pick the wide route for a query with fewer rows
+    than one wide output box.
     """
     if batch <= 0 or max_q_len <= 0 or num_heads <= 0:
         raise ValueError("batch, max_q_len and num_heads must be positive")
@@ -258,12 +263,13 @@ def plan_mla_nvfp4_paged_decode(
         raise ValueError(
             f"rows must be in [1, batch * max_q_len * num_heads = {batch * max_q_len * num_heads}], got {rows_max}"
         )
-    wide = use_wide_route(max_q_len * num_heads)
+    rows_per_request = min(max_q_len * num_heads, rows_max)
+    wide = use_wide_route(rows_per_request)
     wide_clusters = 0
     if wide:
         # Persistent wide clusters: C clusters per request take its (tile, split) pieces round-robin; the split
         # count makes the pieces divide evenly over C.
-        rt, m_tiles = WIDE_BLOCK_M, wide_tiles(max_q_len * num_heads)
+        rt, m_tiles = WIDE_BLOCK_M, wide_tiles(rows_per_request)
         wide_clusters = wide_clusters_per_request(sm_count, batch)
         max_by_len = max(
             1, (int(max_seq_len) + TILE_TOK - 1) // TILE_TOK // MIN_TILES_PER_SPLIT
@@ -274,7 +280,7 @@ def plan_mla_nvfp4_paged_decode(
             else wide_num_split(wide_clusters, m_tiles, max_by_len, MAX_SPLITS)
         )
     else:
-        rt, m_tiles = rt_for_rows(max_q_len * num_heads)
+        rt, m_tiles = rt_for_rows(rows_per_request)
         items = batch * m_tiles
         splits = (
             int(num_split)
