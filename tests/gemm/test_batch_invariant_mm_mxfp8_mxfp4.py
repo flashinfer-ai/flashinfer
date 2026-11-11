@@ -745,6 +745,11 @@ def test_fingerprint_refuses_what_the_operator_refuses():
         bi.fingerprint(
             "mm_mxfp8_mxfp4", N=4092, K=4096, out_dtype=torch.bfloat16, arch="sm_100"
         )
+    for N, K in ((0, 128), (128, 0)):
+        with pytest.raises(ValueError, match="must be positive"):
+            bi.fingerprint(
+                "mm_mxfp8_mxfp4", N=N, K=K, out_dtype=torch.bfloat16, arch="sm_100"
+            )
     assert bi.fingerprint(
         "mm_mxfp8_mxfp4", N=4096, K=4096 + 64, out_dtype=torch.bfloat16, arch="sm_107"
     )
@@ -764,6 +769,20 @@ def test_unsupported_errors_advise_no_fallback():
     assert (
         "regular backends" not in msg and "call without batch_invariant=True" not in msg
     )
+
+
+@needs_device
+def test_invalid_weight_dtype_reports_the_mixed_class():
+    """A weight of another dtype on a supported device is refused under the mixed class's name with the operator's own
+    hint (the packing check is shared with the fp4 class, whose name must not appear)."""
+    a = torch.zeros(8, 256, dtype=torch.float8_e4m3fn, device="cuda")
+    b = torch.zeros(128, 64, dtype=torch.bfloat16, device="cuda")
+    sf = torch.zeros(1, dtype=torch.uint8, device="cuda")
+    with pytest.raises(bi.BatchInvariantUnsupportedError) as e:
+        flashinfer.mm_mxfp8_mxfp4(a, b, sf, sf)
+    msg = str(e.value)
+    assert "gemm.mxfp4w8a" in msg and "packed fp4" in msg
+    assert "regular backends" not in msg and "`gemm.fp4`" not in msg
 
 
 @needs_device

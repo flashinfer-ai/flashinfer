@@ -157,6 +157,10 @@ def _mm_mxfp4w8a_fingerprint(
     from ..gemm.batch_invariant.spec import k_granule, spec_fingerprint
 
     fmt = mx_class_for("mxfp4w8a", _mx_family(arch, "mm_mxfp8_mxfp4"))
+    if N <= 0 or K <= 0:
+        raise ValueError(
+            f"fingerprint('mm_mxfp8_mxfp4'): N {N} and K {K} must be positive"
+        )
     gran = k_granule(fmt)
     if K % gran:  # the operator's contract: the class exists for these weights only
         raise ValueError(

@@ -1256,15 +1256,16 @@ def _run_mx(
 # ----------------------------------------------------------------------------- the 4-bit classes
 
 
-def _packed_fp4(t: torch.Tensor, name: str) -> torch.Tensor:
-    """A packed-fp4 operand (two e2m1 values per byte) as its uint8 view, no copy."""
+def _packed_fp4(t: torch.Tensor, name: str, cls: str = CLASS_FP4) -> torch.Tensor:
+    """A packed-fp4 operand (two e2m1 values per byte) as its uint8 view, no copy; ``cls`` names the caller's class in
+    the error."""
     if t.dtype == torch.uint8:
         return t
     fp4x2 = getattr(torch, "float4_e2m1fn_x2", None)
     if fp4x2 is not None and t.dtype == fp4x2:
         return t.view(torch.uint8)
     raise unsupported(
-        CLASS_FP4,
+        cls,
         f"{name} of dtype {t.dtype}",
         "packed fp4 operands (uint8, or float4_e2m1fn_x2: two e2m1 values per byte)",
     )
@@ -1509,7 +1510,7 @@ def prepare_mxfp4w8a_operands(
             f"A of dtype {a.dtype}",
             "float8_e4m3fn A (the output of mxfp8_quantize)",
         )
-    b = _packed_fp4(b, "B")
+    b = _packed_fp4(b, "B", CLASS_MXW48)
     if a.dim() != 2 or b.dim() != 2:
         raise unsupported(
             cls,
