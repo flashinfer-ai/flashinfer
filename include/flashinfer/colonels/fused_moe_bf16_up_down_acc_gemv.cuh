@@ -119,11 +119,12 @@ __global__ __launch_bounds__(WARPS * 32, 1) void fused_moe_bf16_wgmma_up_down_ac
   }
 
   const float4* x_local_vec = reinterpret_cast<const float4*>(x + token * K);
+  // The full expert bank can contain more than INT_MAX elements.
   const float4* w13_local_vec =
-      reinterpret_cast<const float4*>(w13 + expert_id * N * K + warpN * WN * K);
+      reinterpret_cast<const float4*>(w13 + size_t(expert_id) * N * K + warpN * WN * K);
 
-  const bf16* w2_local_vec =
-      w2 + expert_id * N2 * K2 + blockIdx.z * (N2 / Z_SPLIT) * K2 + blockIdx.x * K2_PER_BLOCK;
+  const bf16* w2_local_vec = w2 + size_t(expert_id) * N2 * K2 + blockIdx.z * (N2 / Z_SPLIT) * K2 +
+                             blockIdx.x * K2_PER_BLOCK;
 
   // lane_id is decomposed as
   //   group_id     = lane_id / LANES_K_DOWN   in [0, N_SPLIT_LANES)

@@ -16,6 +16,8 @@ bool run(TensorView input, TensorView w1, TensorView w2_tensor,
   for (auto tensor : {input, w1, w2_tensor, sorted, experts, padded_count, weights, output}) {
     CHECK_INPUT(tensor);
     TVM_FFI_ICHECK_EQ(tensor.device().device_id, input.device().device_id);
+  }
+  for (auto tensor : {input, sorted, experts, padded_count, weights, output}) {
     TVM_FFI_ICHECK_LE(tensor.numel(), INT_MAX);
   }
   for (auto tensor : {input, w1, w2_tensor, output}) {
@@ -30,6 +32,15 @@ bool run(TensorView input, TensorView w1, TensorView w2_tensor,
   TVM_FFI_ICHECK_EQ(input.ndim(), 2);
   TVM_FFI_ICHECK_EQ(w1.ndim(), 3);
   TVM_FFI_ICHECK_EQ(w2_tensor.ndim(), 3);
+  // Expert-bank offsets are 64-bit; per-expert indexing and folded TMA row
+  // coordinates still use 32-bit arithmetic.
+  for (auto tensor : {w1, w2_tensor}) {
+    for (int dim = 0; dim < 3; ++dim) {
+      TVM_FFI_ICHECK_LE(tensor.size(dim), INT_MAX);
+    }
+    TVM_FFI_ICHECK_LE(tensor.size(1) * tensor.size(2), INT_MAX);
+    TVM_FFI_ICHECK_LE(tensor.size(0) * tensor.size(1), INT_MAX);
+  }
   TVM_FFI_ICHECK_EQ(output.dtype(), dl_bfloat16);
   TVM_FFI_ICHECK_EQ(sorted.dtype(), dl_int32);
   TVM_FFI_ICHECK_EQ(experts.dtype(), dl_int32);
