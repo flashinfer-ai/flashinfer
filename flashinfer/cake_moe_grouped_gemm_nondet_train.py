@@ -193,6 +193,17 @@ def cake_moe_grouped_gemm_nondet_train_dgrad(
     ``N % 64 == 0`` are required.  The programs are copies of the deterministic
     package's and give its bits (no alert under torch's deterministic mode).  See
     ``cake_moe_grouped_gemm_nondet_train_forward`` for the prepared form.
+
+    Parameters
+    ----------
+    g : torch.Tensor
+        BF16 ``[sum_m, N]`` packed output-gradient rows.
+    w : torch.Tensor
+        BF16 ``[E, N, K]`` expert weights, read in place.
+    offs : torch.Tensor
+        int32 device cumulative end offsets ``[E]``, or leading-zero ``m_indptr [E + 1]``.
+    out : torch.Tensor, optional
+        Caller-owned BF16 ``[sum_m, K]`` output; allocated when omitted.
     """
     from .experimental.cake.cake_moe_grouped_gemm_nondet_train import (
         cake_moe_grouped_gemm_nondet_train_dgrad as _impl,
@@ -237,6 +248,23 @@ def cake_moe_grouped_gemm_nondet_train_wgrad(
     build, else the overwrite into a scratch followed by ``out.add_``
     (``cake_moe_grouped_gemm_nondet_train_prepare_wgrad`` and the package README give the routes and
     the numerical contract).
+
+    Parameters
+    ----------
+    g : torch.Tensor
+        BF16 ``[sum_m, N]`` packed output-gradient rows.
+    x : torch.Tensor
+        BF16 ``[sum_m, K]`` packed activation rows.
+    offs : torch.Tensor
+        int32 device cumulative end offsets ``[E]``, or leading-zero ``m_indptr [E + 1]``.
+    out : torch.Tensor, optional
+        Caller-owned ``[E, N, K]`` output; required when accumulating.
+    out_dtype : torch.dtype, optional
+        ``torch.bfloat16`` or ``torch.float32``; defaults to ``out.dtype`` or bfloat16 without ``out``.
+    num_groups : int, optional
+        Expert count ``E``; must be supplied for ``m_indptr`` input.
+    accumulate : bool, default=False
+        Add the weight gradient into ``out`` instead of overwriting it.
     """
     from .experimental.cake.cake_moe_grouped_gemm_nondet_train import (
         cake_moe_grouped_gemm_nondet_train_wgrad as _impl,
@@ -271,6 +299,17 @@ def cake_moe_grouped_gemm_nondet_train_prepare_forward(
     ``out`` may be row-padded (any row stride, unit column
     stride).  The programs are copies of the deterministic package's and give
     its bits.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        BF16 ``[sum_m, K]`` packed activation rows.
+    w : torch.Tensor
+        BF16 ``[E, N, K]`` expert weights.
+    offs : torch.Tensor
+        int32 device cumulative end offsets ``[E]``, or leading-zero ``m_indptr [E + 1]``.
+    out : torch.Tensor, optional
+        Caller-owned BF16 ``[sum_m, N]`` output; allocated when omitted.
     """
     from .experimental.cake.cake_moe_grouped_gemm_nondet_train.cake_backend import (
         cake_moe_grouped_gemm_nondet_train_prepare_forward as _impl,
@@ -295,6 +334,17 @@ def cake_moe_grouped_gemm_nondet_train_prepare_dgrad(
     holds for ``K``, ``sum_m`` and ``E``, its 3 / 3 head / tail twin where
     ``dgrad_wide_ts33`` holds).  The programs are copies of the deterministic
     package's and give its bits.
+
+    Parameters
+    ----------
+    g : torch.Tensor
+        BF16 ``[sum_m, N]`` packed output-gradient rows.
+    w : torch.Tensor
+        BF16 ``[E, N, K]`` expert weights, read in place.
+    offs : torch.Tensor
+        int32 device cumulative end offsets ``[E]``, or leading-zero ``m_indptr [E + 1]``.
+    out : torch.Tensor, optional
+        Caller-owned BF16 ``[sum_m, K]`` output; allocated when omitted.
     """
     from .experimental.cake.cake_moe_grouped_gemm_nondet_train.cake_backend import (
         cake_moe_grouped_gemm_nondet_train_prepare_dgrad as _impl,
@@ -346,6 +396,23 @@ def cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
     that captured it may replay); every other plan key is the overwrite's
     (module docstring, accumulate mode).  Each ``launch()`` and each replay of a
     graph that captured it adds again.
+
+    Parameters
+    ----------
+    g : torch.Tensor
+        BF16 ``[sum_m, N]`` packed output-gradient rows.
+    x : torch.Tensor
+        BF16 ``[sum_m, K]`` packed activation rows.
+    offs : torch.Tensor
+        int32 device cumulative end offsets ``[E]``, or leading-zero ``m_indptr [E + 1]``.
+    out : torch.Tensor, optional
+        Caller-owned ``[E, N, K]`` output; required when accumulating.
+    out_dtype : torch.dtype, optional
+        ``torch.bfloat16`` or ``torch.float32``; defaults to ``out.dtype`` or bfloat16 without ``out``.
+    num_groups : int, optional
+        Expert count ``E``; must be supplied for ``m_indptr`` input.
+    accumulate : bool, default=False
+        Add the weight gradient into ``out`` instead of overwriting it.
     """
     from .experimental.cake.cake_moe_grouped_gemm_nondet_train.cake_backend import (
         cake_moe_grouped_gemm_nondet_train_prepare_wgrad as _impl,
@@ -454,6 +521,11 @@ def is_cake_moe_grouped_gemm_nondet_train_supported(
     dtype).  False without CUDA, for a device that is not CUDA or not visible, and
     for an architecture without the programs.  The query loads no program and
     launches nothing.
+
+    Parameters
+    ----------
+    device : torch.device, optional
+        Device to query; ``None`` selects the current CUDA device.
     """
     if not torch.cuda.is_available():
         return False

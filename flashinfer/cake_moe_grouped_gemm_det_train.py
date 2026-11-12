@@ -128,6 +128,17 @@ def cake_moe_grouped_gemm_det_train_dgrad(
     read in place (no transpose copy), ``offs`` is ``[E]`` int32 device end
     offsets (or ``m_indptr`` ``[E + 1]``) and ``out`` is ``[sum_m, K]`` bfloat16.  ``K % 256 == 0`` and
     ``N % 64 == 0`` are required.  See ``cake_moe_grouped_gemm_det_train_forward`` for the prepared form.
+
+    Parameters
+    ----------
+    g : torch.Tensor
+        BF16 ``[sum_m, N]`` packed output-gradient rows.
+    w : torch.Tensor
+        BF16 ``[E, N, K]`` expert weights, read in place.
+    offs : torch.Tensor
+        int32 device cumulative end offsets ``[E]``, or leading-zero ``m_indptr [E + 1]``.
+    out : torch.Tensor, optional
+        Caller-owned BF16 ``[sum_m, K]`` output; allocated when omitted.
     """
     from .experimental.cake.cake_moe_grouped_gemm_det_train import (
         cake_moe_grouped_gemm_det_train_dgrad as _impl,
@@ -176,6 +187,23 @@ def cake_moe_grouped_gemm_det_train_wgrad(
     (``cake_moe_grouped_gemm_det_train_prepare_wgrad`` and the package README
     give the routes; a prepared launch is CUDA-graph capturable and every
     launch and replay adds again).  ``sum_m == 0`` leaves ``out`` unchanged.
+
+    Parameters
+    ----------
+    g : torch.Tensor
+        BF16 ``[sum_m, N]`` packed output-gradient rows.
+    x : torch.Tensor
+        BF16 ``[sum_m, K]`` packed activation rows.
+    offs : torch.Tensor
+        int32 device cumulative end offsets ``[E]``, or leading-zero ``m_indptr [E + 1]``.
+    out : torch.Tensor, optional
+        Caller-owned ``[E, N, K]`` output; required when accumulating.
+    out_dtype : torch.dtype, optional
+        ``torch.bfloat16`` or ``torch.float32``; defaults to ``out.dtype`` or bfloat16 without ``out``.
+    num_groups : int, optional
+        Expert count ``E``; must be supplied for ``m_indptr`` input.
+    accumulate : bool, default=False
+        Add the weight gradient into ``out`` instead of overwriting it.
     """
     from .experimental.cake.cake_moe_grouped_gemm_det_train import (
         cake_moe_grouped_gemm_det_train_wgrad as _impl,
@@ -209,6 +237,17 @@ def cake_moe_grouped_gemm_det_train_prepare_forward(
     ``fwd_wide_ts33`` holds).
     ``out`` may be row-padded (any row stride, unit column
     stride).
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        BF16 ``[sum_m, K]`` packed activation rows.
+    w : torch.Tensor
+        BF16 ``[E, N, K]`` expert weights.
+    offs : torch.Tensor
+        int32 device cumulative end offsets ``[E]``, or leading-zero ``m_indptr [E + 1]``.
+    out : torch.Tensor, optional
+        Caller-owned BF16 ``[sum_m, N]`` output; allocated when omitted.
     """
     from .experimental.cake.cake_moe_grouped_gemm_det_train.cake_backend import (
         cake_moe_grouped_gemm_det_train_prepare_forward as _impl,
@@ -232,6 +271,17 @@ def cake_moe_grouped_gemm_det_train_prepare_dgrad(
     ``wide_dgrad_archs``, its L2 evict-first twin where ``dgrad_evict_first``
     holds for ``K``, ``sum_m`` and ``E``, its 3 / 3 head / tail twin where
     ``dgrad_wide_ts33`` holds).
+
+    Parameters
+    ----------
+    g : torch.Tensor
+        BF16 ``[sum_m, N]`` packed output-gradient rows.
+    w : torch.Tensor
+        BF16 ``[E, N, K]`` expert weights, read in place.
+    offs : torch.Tensor
+        int32 device cumulative end offsets ``[E]``, or leading-zero ``m_indptr [E + 1]``.
+    out : torch.Tensor, optional
+        Caller-owned BF16 ``[sum_m, K]`` output; allocated when omitted.
     """
     from .experimental.cake.cake_moe_grouped_gemm_det_train.cake_backend import (
         cake_moe_grouped_gemm_det_train_prepare_dgrad as _impl,
@@ -279,6 +329,23 @@ def cake_moe_grouped_gemm_det_train_prepare_wgrad(
     mode).  No row (``sum_m == 0``) launches nothing and leaves ``out``
     unchanged.  Each ``launch()`` and each replay of a graph that captured it
     adds again; keep the launch alive while such a graph may replay.
+
+    Parameters
+    ----------
+    g : torch.Tensor
+        BF16 ``[sum_m, N]`` packed output-gradient rows.
+    x : torch.Tensor
+        BF16 ``[sum_m, K]`` packed activation rows.
+    offs : torch.Tensor
+        int32 device cumulative end offsets ``[E]``, or leading-zero ``m_indptr [E + 1]``.
+    out : torch.Tensor, optional
+        Caller-owned ``[E, N, K]`` output; required when accumulating.
+    out_dtype : torch.dtype, optional
+        ``torch.bfloat16`` or ``torch.float32``; defaults to ``out.dtype`` or bfloat16 without ``out``.
+    num_groups : int, optional
+        Expert count ``E``; must be supplied for ``m_indptr`` input.
+    accumulate : bool, default=False
+        Add the weight gradient into ``out`` instead of overwriting it.
     """
     from .experimental.cake.cake_moe_grouped_gemm_det_train.cake_backend import (
         cake_moe_grouped_gemm_det_train_prepare_wgrad as _impl,
@@ -397,6 +464,11 @@ def is_cake_moe_grouped_gemm_det_train_supported(
     dtype).  False without CUDA, for a device that is not CUDA or not visible, and
     for an architecture without the programs.  The query loads no program and
     launches nothing.
+
+    Parameters
+    ----------
+    device : torch.device, optional
+        Device to query; ``None`` selects the current CUDA device.
     """
     if not torch.cuda.is_available():
         return False

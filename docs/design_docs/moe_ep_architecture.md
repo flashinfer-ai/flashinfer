@@ -98,7 +98,7 @@ kind, and both paths hand the inner kernel the same `SplitKernelContext`:
 
 | Backend | Config | Interface | Transport |
 |---|---|---|---|
-| `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back; optional CFT counted writes over the NVLink fabric (SM100+, CUDA 13.4+, driver 615+); a Lamport transport for small steps (SM100 / SM103 / SM107, up to 64 ranks; `include/flashinfer/comm/moe_alltoall_lamport.cuh`); up to 256 ranks. Kernels follow TensorRT-LLM's (`kernels/moe/communication/`) |
+| `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back; up to 256 ranks. `sync_protocol` picks how receivers learn of arrivals: `fence` (completion flags behind a system-scope fence), `sentinel` (they poll a sentinel word that every pushed vector replaces; SM100 / SM103 / SM107, up to 64 ranks; `include/flashinfer/comm/moe_alltoall_sentinel.cuh`) or `auto` (default: `sentinel` for steps of at most 256 tokens per rank that it can carry, else `fence`). Every rank passes the same `sync_protocol`; if any rank cannot run `sentinel`, all of them use `fence`. Kernels follow TensorRT-LLM's (`kernels/moe/communication/`) |
 | `cake` | `CakeAlltoAllConfig` | `MoEEpCommunication` | One-sided put/get like `nvlink_one_sided`, running generated Cake kernels (`cake/kernels.py`, `csrc/cake_moe_alltoall*`); SM100/SM103 only |
 | `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`nvlink_two_sided/kernels.py`, `csrc/nvlink_two_sided_*`); `num_experts % 4 == 0` |
 | `nccl_ep` | `NcclEpConfig` | Fleet/Handle | see below |
@@ -870,6 +870,14 @@ masked out. See `core/comm/fault_tolerance.py` and the runbook for the protocol
 and the recovery state machine.
 
 ### Offline live-token tuning
+
+Rubin inference searches all 32 default candidates unless capped. GenPhase uses
+8 or 11, depending on the datatype. Both lists order choices for prefix-limited
+searches. `--max-candidates N`
+takes the first N unique choices from each eligible variant independently;
+shorter lists are used in full. The low-level Python tuner also accepts an
+ordered `candidates` list. Repeated choices are removed before measurement,
+with JSON lists and Python tuples treated alike. Custom order is preserved.
 
 CuTeDSL MegaMoE tuning records both workspace capacity (`max_tokens`) and
 benchmark workload (`live_tokens`) in each JSON entry. Different workloads at

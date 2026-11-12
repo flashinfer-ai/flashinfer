@@ -64,7 +64,7 @@ gdn_prefill_paged_q4_k4_v8_d128_ps64.json
 gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
 sdsa_gather_key_sample_page_size64_dim128.json
-group_union_masks_top_k2048.json
+sdsa_group_union_masks_top_k2048.json
 recurrent_kda_q8_v16_d128.json
 packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
@@ -73,6 +73,8 @@ gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
+mm_bf16_fp8_N4096_K4096.json
+mm_fp16_fp8_N4096_K4096.json
 gemm_fp8_nt_groupwise_n1536_k7168.json
 group_gemm_fp8_nt_groupwise_contiguous_g2_n128_k128.json
 gemm_mxfp8_N4096_K4096.json
@@ -83,6 +85,10 @@ gelu_and_mul_h16384.json
 gelu_tanh_and_mul_h16384.json
 fp8_paged_mqa_logits_nn2_H64_D128_bs64.json
 fp4_paged_mqa_logits_nn2_H64_Dp64_bs64.json
+fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_kv2_d128_sl144_ps4.json
+fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_hnd_kv2_d128_sl144_ps4.json
+fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_e5m2_kv2_d128_sl144_ps4.json
+fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_hnd_e5m2_kv2_d128_sl144_ps4.json
 gqa_paged_decode_h32_kv8_d128_ps16.json
 gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
@@ -165,7 +171,7 @@ silu_and_mul_h16384.json
 silu_and_mul_mxfp8_experts_quantize_k8192.json
 silu_and_mul_nvfp4_quantize_k16384.json
 sdsa_thresholds_from_sample_counters2.json
-token_sparse_kv_indices_top_k2048_lists2.json
+sdsa_token_sparse_kv_indices_top_k2048_lists2.json
 sdsa_top_k_from_candidates_pair2_range2.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
@@ -743,6 +749,19 @@ for N, K in ((4096, 4096), (256, 7168)):
     ).T  # [K, N] column-major; b.T is contiguous
     with contextlib.suppress(Exception):
         flashinfer.mm_bf16(a, b, backend="auto")
+
+# ── W8A16 FP8 GEMM (bf16 activation, e4m3 weight [N, K], per-tensor scale) ────
+# Trace is dumped before kernel launch; suppress Hopper/Blackwell-only failures.
+with contextlib.suppress(Exception):
+    M, K, N = 128, 4096, 4096
+    b_w8a16 = torch.zeros(N, K, dtype=torch.float8_e4m3fn, device=device)
+    alpha_w8a16 = torch.ones(1, dtype=torch.float32, device=device)
+    flashinfer.gemm.mm_bf16_fp8(
+        torch.zeros(M, K, dtype=torch.bfloat16, device=device), b_w8a16, alpha_w8a16
+    )
+    flashinfer.gemm.mm_fp16_fp8(
+        torch.zeros(M, K, dtype=torch.float16, device=device), b_w8a16, alpha_w8a16
+    )
 
 # ── GEMM fp8 block-scale (DeepSeek-V3 q_proj: M×7168→1536, block=128) ────────
 # Trace is dumped before kernel launch; suppress SM100-only runtime failures.
@@ -2517,6 +2536,30 @@ with contextlib.suppress(Exception):
         _nqsm_v_scale,
     )
 
+# fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping: flat slot mapping.
+with contextlib.suppress(Exception):
+    from flashinfer import (
+        fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping,
+    )
+
+    for _fpth_layout in ("NHD", "HND"):
+        for _fpth_format in ("e4m3", "e5m2"):
+            _fpth_inputs = (
+                fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping.fi_init(
+                    nnz_kv=4,
+                    num_pages=4,
+                    num_kv_heads=2,
+                    head_dim=128,
+                    page_size=4,
+                    kv_layout=_fpth_layout,
+                    kv_data_type=_fpth_format,
+                    device=device,
+                )
+            )
+            fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
+                **_fpth_inputs
+            )
+
 # nvfp4_quantize_append_paged_mla_kv_cache: packed ckv plus FP8 kpe cache.
 with contextlib.suppress(Exception):
     from flashinfer import nvfp4_quantize_append_paged_mla_kv_cache
@@ -3652,7 +3695,7 @@ finally:
         dist.destroy_process_group()
 
 # ── Token-sparse attention inputs: K/V slot lists, group unions and masks ─────
-from flashinfer.token_sparse import group_union_masks, token_sparse_kv_indices
+from flashinfer.sdsa.token_sparse import group_union_masks, token_sparse_kv_indices
 
 token_sparse_kv_indices.fi_trace(
     save_dir=SAVE_DIR,

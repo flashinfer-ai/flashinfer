@@ -580,7 +580,8 @@ e.g. ``cuda:rank``). With ``world_size > 1`` the NCCL and NVLink backends
 ``group`` to support CUDA all-to-all (an NCCL process group), checked at
 construction before any resource is armed. Operands must be contiguous 4-D
 CUDA tensors of the construction ``dtype`` (float16 / bfloat16 / float32
-only) on the construction device, every dim positive, and ``nbytes`` at most
+plus the PCIe types listed below) on the construction device, every dim positive,
+and ``nbytes`` at most
 ``max_bytes``; the element count of any one operand must additionally stay
 within the int32 kernel index range. ``scatter_heads`` requires
 ``H % world_size == 0``
@@ -896,7 +897,13 @@ the fused multiply-add epilogue (``ow256_fma``) and a group of 2 ranks the
 baseline build with the fused multiply-add epilogue (``fma``); on SM103 groups
 of 8 and 4 ranks run ``ow256_fma`` and groups of 2 ranks ``fma``; on SM107 a
 group of 4 ranks runs the build with bulk row stores (``bulk``); the other
-groups of 2 ranks and SM90 run the baseline build.  The ``fma`` builds contract
+groups of 2 ranks run the baseline build; SM90 runs the build whose epilogue
+stages each head in shared memory for three storer warps (``sw3``) on every
+group size, except that under this default a group of 8 ranks on SM90 runs the
+baseline build on rows with a hidden size of at least 6144 and at least 8192
+rows per rank (``cake_qkv_exchange_plan.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD``);
+a build named by ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT`` runs on every
+row.  The ``fma`` builds contract
 the norm and RoPE multiply-adds into single-rounding fused multiply-adds, so
 their stored bits can differ from those of the builds without it; both agree
 within the kernel's accuracy tolerance, and the builds without the fused
@@ -928,7 +935,7 @@ size (``cake_qkv_exchange_plan.SHAPE_GATE_K_TABLE``: 8192, 16384 or 32768 rows,
 ``per_dest_k_table=0`` restores the single threshold of 16384 and an explicit
 ``per_dest_large_m`` replaces the table).  On SM103 and SM100 a group of 8 ranks
 runs a call whose destination band is not a multiple of 256 columns while every
-Q / K / V group is (for example hidden 3072) with at least 4096 rows per rank
+Q / K / V group is (for example hidden 3072) with at least 2048 rows per rank
 on the 256-column pair tile across band edges, each tile storing its two heads
 to their own destinations, as one persistent launch
 (``cake_qkv_exchange_plan.XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD``;

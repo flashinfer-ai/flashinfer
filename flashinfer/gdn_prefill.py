@@ -1577,7 +1577,7 @@ def chunk_gated_delta_rule(
     - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
       (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
-    - Requires SM8x (Ampere), SM90 (Hopper), SM100 (Blackwell) or SM120. The
+    - Requires SM8x (Ampere), SM90 (Hopper), SM100/SM103 (Blackwell), SM107 or SM120. The
       SM100 path requires ``head_size == 128``. On SM100/SM103, ``gdn_cp``
       supports structurally legal equal-head, GQA, and GVA shapes on
       CUDA 12.8, CUDA 12.9, and CUDA 13; SM107 supports the same shapes with
