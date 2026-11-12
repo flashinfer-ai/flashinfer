@@ -28,7 +28,10 @@ from flashinfer.utils import get_compute_capability
 def test_rejected_query_mask_preserves_accepted_plan(
     backend, captured, metadata_device
 ):
-    if get_compute_capability(torch.device("cuda")) != (10, 0):
+    cc = get_compute_capability(torch.device("cuda"))
+    if cc[0] < 8:
+        pytest.skip("Requires BF16 query support")
+    if backend == "auto" and cc != (10, 0):
         pytest.skip("Exercises the SM100 paged auto admission boundary")
     if backend == "auto" and not _cudnn_supports_paged_auto():
         pytest.skip("Requires a qualified cuDNN paged auto runtime")
