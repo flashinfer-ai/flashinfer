@@ -3,6 +3,8 @@ markdown-it-py>=2.2.0
 mdurl~=0.1
 pygments>=2.13.0,<3.0.0
 pytest-timeout
+pyyaml
+responses
 rich>=13
 safetensors>=0.6
 scipy
