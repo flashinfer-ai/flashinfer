@@ -52,6 +52,7 @@ and grid dependency control.
 
 import ctypes
 import functools
+import math
 from typing import Union
 
 import cutlass
@@ -89,6 +90,15 @@ class _Pointer(Pointer):
         self._c_pointer = None
         assert int(self._pointer) % self._assumed_align == 0, (
             f"pointer must be {self._assumed_align} bytes aligned"
+        )
+
+    def __add__(self, offset: int) -> Pointer:  # type: ignore[override]
+        # An offset pointer may be less aligned than its base: keep the gcd of the two
+        # instead of inheriting the base's assumed_align (TensorRT-LLM #19184).
+        offset_bytes = offset * self._dtype.width // 8
+        assumed_align = math.gcd(offset_bytes, self._assumed_align)
+        return _Pointer(
+            self._pointer + offset_bytes, self._dtype, self._addr_space, assumed_align
         )
 
     def size_in_bytes(self) -> int:
