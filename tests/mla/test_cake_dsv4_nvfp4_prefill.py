@@ -792,6 +792,57 @@ def test_nvfp4_prefill_route_builds_match_the_oracle(spec, variant, monkeypatch)
     _check(case, out)
 
 
+@pytest.mark.parametrize(
+    "heads, extra_topk, variant",
+    [
+        pytest.param(32, 128, "nvfp4_h64_tmem_v_prefill", id="h32-tmem-v"),
+        pytest.param(128, 128, "nvfp4_h128_prefill", id="h128"),
+        pytest.param(128, 512, "nvfp4_h128_v_unit_pairs_prefill", id="h128-v-unit-pairs"),
+    ],
+)
+def test_nvfp4_prefill_output_rows_past_2g_elements(
+    heads, extra_topk, variant, monkeypatch
+):
+    """The per-token TMEM-V and two-CTA H128 bodies store O through computed
+    element offsets: rows whose output starts past 2**31 elements land in
+    place (the other builds store O through tensor maps)."""
+    _require_cake_arch()
+    if variant == "nvfp4_h128_v_unit_pairs_prefill" and tuple(
+        get_compute_capability(torch.device("cuda"))
+    ) != (10, 3):
+        variant = "nvfp4_h128_prefill"
+    rows = (1 << 31) // (heads * _HEAD_DIM) + 256
+    # BF16 query and O, the packed query, and the case builder's FP32 temporaries.
+    need = rows * heads * (2 * _HEAD_DIM * 2 + 384 + 3 * _HEAD_DIM * 4)
+    if torch.cuda.mem_get_info()[0] < need + (4 << 30):
+        pytest.skip(f"needs about {need >> 30} GiB of free device memory")
+    calls = _routed(monkeypatch)
+    case = _case(
+        seed=13,
+        heads=heads,
+        topk=128,
+        extra_topk=extra_topk,
+        q_lens=(rows // 2, rows - rows // 2),
+    )
+    out = _run(case)
+    torch.cuda.synchronize()
+    assert calls == [variant]
+    lse = _lse(case)
+    for part in (slice(0, 64), slice(rows - 512, rows)):
+        sub = dict(
+            case,
+            query=case["query"][part],
+            main_idx=case["main_idx"][part],
+            main_lens=case["main_lens"][part],
+            extra_idx=case["extra_idx"][part],
+            extra_lens=case["extra_lens"][part],
+        )
+        ref_out, ref_lse = _oracle(sub)
+        assert torch.isfinite(out[part].float()).all()
+        torch.testing.assert_close(out[part].float(), ref_out, **_O_TOL)
+        torch.testing.assert_close(lse[part], ref_lse, **_LSE_TOL)
+
+
 @pytest.mark.parametrize("heads", [16, 32])
 def test_nvfp4_query_block_is_deterministic(heads):
     """Repeated launches of a query-block body give the same bits."""
