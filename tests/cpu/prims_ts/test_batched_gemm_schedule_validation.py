@@ -3101,6 +3101,38 @@ def test_runner_cli_accepts_batch_mode(monkeypatch):
 
 
 @pytest.mark.cpu_only
+def test_runner_cli_profile_launches_without_reference_or_benchmark(monkeypatch):
+    import flashinfer.prims_ts.batched_gemm.batched_gemm_run as batched_gemm_run
+
+    captured = {}
+
+    def unexpected(**kwargs):
+        raise AssertionError("--profile must not run the reference or benchmark")
+
+    monkeypatch.setattr(batched_gemm_run, "reference_check", unexpected)
+    monkeypatch.setattr(batched_gemm_run, "benchmark", unexpected)
+    monkeypatch.setattr(
+        batched_gemm_run, "profile", lambda **kwargs: captured.update(kwargs)
+    )
+
+    assert (
+        batched_gemm_run.main(["--profile", "--host-input-gen", "--num-tokens", "64"])
+        == 0
+    )
+    assert captured["num_tokens"] == 64
+    assert captured["input_device"] == "cpu"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("conflict", ("--benchmark", "--validate-only"))
+def test_runner_cli_profile_rejects_other_modes(conflict):
+    import flashinfer.prims_ts.batched_gemm.batched_gemm_run as batched_gemm_run
+
+    with pytest.raises(SystemExit):
+        batched_gemm_run.main(["--profile", conflict])
+
+
+@pytest.mark.cpu_only
 def test_validation_rejects_deepseek_fp8_fused_gated_activation():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         ActKind,
