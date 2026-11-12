@@ -5,14 +5,49 @@
 
 import functools
 import importlib
+import os
+from types import SimpleNamespace
+from typing import Optional
 
 import torch
 from packaging.version import Version
 
-from .api_logging import flashinfer_api
+from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .trace.templates.qsa import qsa_forward_trace, qsa_indexed_forward_trace
+from .utils import (
+    get_compute_capability,
+    register_custom_op,
+    register_fake_op,
+)
 
-__all__ = ["qsa_forward", "qsa_indexed_forward"]
+__all__ = ["qsa_forward", "qsa_indexed_forward", "qsa_topk_indexer"]
+
+# QSA stage-1 indexer contract constants (fixed by the kernel).
+QSA_INDEXER_NUM_HEADS = 4  # index heads summed into the block score
+QSA_INDEXER_HEAD_DIM = 128  # per-head indexer vector width
+QSA_INDEXER_BLOCK_SIZE = 4  # tokens per compressed block (CR)
+QSA_INDEXER_BLOCK_TOPK = 512  # blocks selected per query
+QSA_INDEXER_PAGE_BLOCKS = 64  # compressed blocks per cache page
+# CR * BLOCK_TOPK token slots + (CR - 1) causal-tail slots + 1 count column.
+QSA_INDEXER_PACKED_WIDTH = 2052
+
+# Backends accepted by qsa_topk_indexer. "specialized" is the only fused
+# implementation of this op; "auto" routes to it whenever it can serve the
+# call. There is no composable / reference backend in FlashInfer for this
+# contract, so a call that "specialized" cannot serve raises
+# NotImplementedError (with the reason recorded) instead of falling back.
+QSA_TOPK_INDEXER_BACKENDS = ("auto", "specialized")
+
+# Kill switch: set FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 to force the
+# non-fused path. For this op that path does not exist, so the call raises
+# NotImplementedError; the switch still guarantees the specialized kernel is
+# never dispatched.
+_SPECIALIZED_KILL_SWITCH = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
+
+# Observability: per-backend dispatch counts and the reasons recorded each
+# time "specialized" declined a call.
+qsa_topk_indexer_dispatch_stats: dict = {"specialized": 0}
+qsa_topk_indexer_fallback_reasons: list = []
 
 
 @functools.cache
@@ -153,3 +188,212 @@ def qsa_indexed_forward(
     """
     result = _cudnn_ops().qsa_indexed_forward(q, k, v, indices, scale)
     return result["out"], result["out_fp32"], result["lse"]
+
+
+@functools.cache
+def _get_qsa_topk_indexer_module():
+    from .jit import gen_qsa_topk_indexer_module
+
+    module = gen_qsa_topk_indexer_module().build_and_load()
+
+    @register_custom_op("flashinfer::qsa_topk_indexer", mutates_args=("packed",))
+    def _qsa_topk_indexer(
+        packed: torch.Tensor,
+        qi: torch.Tensor,
+        ck_cache: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        cpage_base: torch.Tensor,
+    ) -> None:
+        module.run(qi, ck_cache, cu_seqlens, cpage_base, packed)
+
+    @register_fake_op("flashinfer::qsa_topk_indexer")
+    def _fake_qsa_topk_indexer(
+        packed: torch.Tensor,
+        qi: torch.Tensor,
+        ck_cache: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        cpage_base: torch.Tensor,
+    ) -> None:
+        pass
+
+    return SimpleNamespace(run=_qsa_topk_indexer)
+
+
+def _check_qsa_topk_indexer_inputs(
+    qi: torch.Tensor,
+    ck_cache: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cpage_base: torch.Tensor,
+    out: Optional[torch.Tensor],
+) -> None:
+    if not (
+        qi.is_cuda and ck_cache.is_cuda and cu_seqlens.is_cuda and cpage_base.is_cuda
+    ):
+        raise ValueError("qsa_topk_indexer requires CUDA tensors.")
+    device = qi.device
+    for name, t in (
+        ("ck_cache", ck_cache),
+        ("cu_seqlens", cu_seqlens),
+        ("cpage_base", cpage_base),
+    ):
+        if t.device != device:
+            raise ValueError(f"{name} must be on {device}, got {t.device}.")
+    if qi.dtype != torch.float8_e4m3fn or ck_cache.dtype != torch.float8_e4m3fn:
+        raise ValueError("qi and ck_cache must be float8_e4m3fn.")
+    if cu_seqlens.dtype != torch.int32 or cpage_base.dtype != torch.int32:
+        raise ValueError("cu_seqlens and cpage_base must be int32.")
+    if qi.ndim != 3 or qi.shape[1:] != (QSA_INDEXER_NUM_HEADS, QSA_INDEXER_HEAD_DIM):
+        raise ValueError(
+            f"qi must have shape [T, {QSA_INDEXER_NUM_HEADS}, "
+            f"{QSA_INDEXER_HEAD_DIM}], got {tuple(qi.shape)}."
+        )
+    if ck_cache.ndim != 4 or ck_cache.shape[1:] != (
+        QSA_INDEXER_PAGE_BLOCKS,
+        1,
+        QSA_INDEXER_HEAD_DIM,
+    ):
+        raise ValueError(
+            f"ck_cache must have shape [num_pages, {QSA_INDEXER_PAGE_BLOCKS}, 1, "
+            f"{QSA_INDEXER_HEAD_DIM}], got {tuple(ck_cache.shape)}."
+        )
+    if cu_seqlens.ndim != 1 or cpage_base.ndim != 1:
+        raise ValueError("cu_seqlens and cpage_base must be 1-D.")
+    if cu_seqlens.shape[0] != cpage_base.shape[0] + 1:
+        raise ValueError(
+            "cu_seqlens must have shape [batch + 1] matching cpage_base [batch]; got "
+            f"{tuple(cu_seqlens.shape)} and {tuple(cpage_base.shape)}."
+        )
+    for name, t in (
+        ("qi", qi),
+        ("ck_cache", ck_cache),
+        ("cu_seqlens", cu_seqlens),
+        ("cpage_base", cpage_base),
+    ):
+        if not t.is_contiguous():
+            raise ValueError(f"{name} must be contiguous.")
+    if out is not None:
+        if out.device != device or out.dtype != torch.int32:
+            raise ValueError("out must be an int32 tensor on the input device.")
+        if (
+            out.shape != (qi.shape[0], QSA_INDEXER_PACKED_WIDTH)
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                f"out must be contiguous with shape [T, {QSA_INDEXER_PACKED_WIDTH}], "
+                f"got {tuple(out.shape)}."
+            )
+
+
+def _qsa_topk_indexer_unservable_reason(qi: torch.Tensor) -> Optional[str]:
+    """Why the "specialized" backend cannot serve this call, or None.
+
+    GPU-free guards first (the kill switch), then the device guard. Contract
+    violations (dtype / geometry / contiguity) are caller errors and raise
+    ValueError in _check_qsa_topk_indexer_inputs instead.
+    """
+    if os.environ.get(_SPECIALIZED_KILL_SWITCH) == "1":
+        return f"{_SPECIALIZED_KILL_SWITCH}=1 disables the specialized kernel"
+    cc = get_compute_capability(qi.device)
+    if cc != (10, 7):
+        return f"specialized kernel targets SM107 only; device is sm{cc[0]}{cc[1]}"
+    return None
+
+
+@flashinfer_experimental_api(
+    feature="QSA stage-1 token top-k block indexer (FP8 paged compressed keys, SM107)"
+)
+def qsa_topk_indexer(
+    qi: torch.Tensor,
+    ck_cache: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cpage_base: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    backend: str = "auto",
+) -> torch.Tensor:
+    r"""Select the top-scoring key blocks for each packed query token (QSA
+    stage 1) and expand them to packed token indices for
+    :func:`qsa_indexed_forward`.
+
+    For every query token, each visible compressed block is scored as
+    ``sum_h relu(qi[t, h] . ck[block])`` over the ``4`` index heads, the top
+    ``512`` blocks are selected with a **deterministic tie-break (the lower
+    block index wins)**, selections are expanded to ``4`` token ids per block,
+    the partial causal tail of up to ``3`` tokens is appended, and the result
+    is written in ascending token-id order with ``-1`` padding and the valid
+    count in the last column.
+
+    A token at position ``pos`` within its request sees ``(pos + 1) // 4``
+    complete compressed blocks (including its own); rows whose visible blocks
+    all fit in the selection budget are emitted directly as the identity
+    selection without touching ``qi`` or ``ck_cache``.
+
+    The kernel is bitwise deterministic, allocation-free at run time and safe
+    to capture in a CUDA graph (warm up once before capture to build the JIT
+    module).
+
+    Backend selection follows the specialized-kernel pattern:
+    ``QSA_TOPK_INDEXER_BACKENDS = ("auto", "specialized")``. ``"specialized"``
+    (this kernel) is the only fused implementation of the op, and FlashInfer
+    has no composable / reference implementation of this contract, so when the
+    specialized kernel cannot serve a call — the device is not SM107, or the
+    kill switch ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` is set — both
+    ``backend="auto"`` and ``backend="specialized"`` raise
+    ``NotImplementedError`` naming the reason rather than silently running a
+    different backend; the reason is also appended to
+    ``flashinfer.qsa.qsa_topk_indexer_fallback_reasons``. Successful dispatches
+    are counted in ``flashinfer.qsa.qsa_topk_indexer_dispatch_stats``. The kill
+    switch guarantees the specialized kernel is never dispatched even on
+    ``backend="auto"``.
+
+    Parameters
+    ----------
+    qi : torch.Tensor
+        FP8 (e4m3) indexer queries, shape ``[T, 4, 128]``; ``T`` is the packed
+        token count over all requests.
+    ck_cache : torch.Tensor
+        FP8 (e4m3) paged compressed-key cache, shape
+        ``[num_pages, 64, 1, 128]``: 64 compressed blocks (of 4 tokens each)
+        per page.
+    cu_seqlens : torch.Tensor
+        int32 ``[batch + 1]`` request boundaries in the packed token dimension
+        (``cu_seqlens[-1] == T``). Values are read on the device only.
+    cpage_base : torch.Tensor
+        int32 ``[batch]`` first page of each request's contiguous page range
+        in ``ck_cache``.
+    out : Optional[torch.Tensor]
+        Caller-owned int32 ``[T, 2052]`` output; allocated when omitted.
+    backend : str
+        ``"auto"`` (default) or ``"specialized"``. Both resolve to the
+        specialized SM107 kernel when it can serve the call; see the backend
+        selection notes above for the failure behavior.
+
+    Returns
+    -------
+    packed : torch.Tensor
+        int32 ``[T, 2052]``: the selected token ids of each row sorted
+        ascending, then ``-1`` padding; the last column holds the row's valid
+        count. Directly consumable by :func:`qsa_indexed_forward`.
+    """
+    if backend not in QSA_TOPK_INDEXER_BACKENDS:
+        raise ValueError(
+            f"backend must be one of {QSA_TOPK_INDEXER_BACKENDS}, got {backend!r}."
+        )
+    _check_qsa_topk_indexer_inputs(qi, ck_cache, cu_seqlens, cpage_base, out)
+    reason = _qsa_topk_indexer_unservable_reason(qi)
+    if reason is not None:
+        qsa_topk_indexer_fallback_reasons.append(reason)
+        raise NotImplementedError(
+            f"qsa_topk_indexer cannot run the specialized kernel ({reason}), "
+            "and FlashInfer has no composable fallback implementation of this "
+            "contract; use the serving stack's generic indexer path instead."
+        )
+    if out is None:
+        out = torch.empty(
+            (qi.shape[0], QSA_INDEXER_PACKED_WIDTH),
+            dtype=torch.int32,
+            device=qi.device,
+        )
+    _get_qsa_topk_indexer_module().run(out, qi, ck_cache, cu_seqlens, cpage_base)
+    qsa_topk_indexer_dispatch_stats["specialized"] += 1
+    return out
