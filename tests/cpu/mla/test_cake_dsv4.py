@@ -3809,7 +3809,8 @@ def test_sm107a_short_query_decode_keeps_the_uniform_route(arch):
     (at most 2 from 256 rows), or on topk4x items at most 4 (at most 8 from 256
     rows); fewer rows, longer requests and the other architectures take the
     lane-gather route from 128 rows, but SM103 keeps the uniform-gather route
-    for every SWA-only decode launch (``max_q_len < 257``)."""
+    for SWA-only decode launches of at most 2 query rows per request."""
+    assert cake._FP8_PERSISTENT_SWA_DECODE_UNIFORM == {"sm_103a": 2}
     assert cake._FP8_PERSISTENT_SHORT_QUERY_UNIFORM == {
         "sm_107a": ((160, 1, False), (256, 2, False), (160, 4, True), (256, 8, True))
     }
@@ -3838,13 +3839,16 @@ def test_sm107a_short_query_decode_keeps_the_uniform_route(arch):
         ("swa", 160, 2, False),
         ("swa", 4096, 2, True),
         ("swa", 384, 4, False),
+        ("swa", 1024, 4, False),
+        ("swa", 4096, 8, False),
+        ("swa", 4096, 3, False),
         ("swa", 514, 257, False),
     ):
         sparse_topk, page_size = _SHORT_QUERY_ITEMS[item]
         uniform = (
             tokens < 128
             or (arch == "sm_107a" and sm107_uniform)
-            or (arch == "sm_103a" and item == "swa" and max_q_len < 257)
+            or (arch == "sm_103a" and item == "swa" and max_q_len <= 2)
         )
         expected = (
             "fp8_h128_prefill_source_persistent_uniform"

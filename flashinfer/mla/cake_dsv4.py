@@ -1030,11 +1030,14 @@ _FP8_PERSISTENT_SHORT_QUERY_UNIFORM = {
 }
 
 
-# Architectures whose SWA-only decode launches (``max_q_len < 257``) keep the
-# uniform-gather route at every row count.  GB300 (152 SMs), 128 heads, q_len
-# 1, newest-first windows, 128-2048 rows: lane-issued route (its PDL-free twin
-# from 384 rows) 11.58-84.75 us -> uniform 11.17-84.18 us (1.002-1.044x).
-_FP8_PERSISTENT_SWA_DECODE_UNIFORM = frozenset({"sm_103a"})
+# Architectures whose SWA-only decode launches keep the uniform-gather route at
+# every row count, with the longest request (``max_q_len``) they apply to.
+# GB300 (152 SMs), 128 heads, newest-first windows: q_len 1 at 128-4096 rows,
+# lane-issued route (its PDL-free twin from 384 rows) 11.58-160.90 us ->
+# uniform 11.17-160.38 us (1.002-1.044x); q_len 2 at 512-4096 rows 0.993-1.016x
+# (noise); q_len 4 and 8 lose from 1024 rows (0.939-0.989x), so they keep the
+# lane-issued route.
+_FP8_PERSISTENT_SWA_DECODE_UNIFORM = {"sm_103a": 2}
 
 
 def _fp8_persistent_program(
@@ -1051,7 +1054,7 @@ def _fp8_persistent_program(
         swa
         and arch in _FP8_PERSISTENT_SWA_DECODE_UNIFORM
         and max_q_len is not None
-        and max_q_len < 257
+        and max_q_len <= _FP8_PERSISTENT_SWA_DECODE_UNIFORM[arch]
     ):
         return "fp8_h128_prefill_source_persistent_uniform"
     entries = _FP8_PERSISTENT_SHORT_QUERY_UNIFORM.get(arch, ()) if arch else ()
