@@ -1,7 +1,9 @@
 """Minimax Sparse Attention operations.
 
 Sparse prefill, sparse decode, and top-k selection support SM100, SM103, SM120,
-and SM121 Blackwell GPUs. Proxy scoring remains SM120/SM121-only.
+and SM121 Blackwell GPUs. Proxy scoring remains SM120/SM121-only. The fused
+variable-length block-score top-k indexer (``msa_blockscore_topk_indexer``) is
+SM107-only.
 """
 
 import torch
@@ -44,6 +46,11 @@ from .cake_icp_indexer import (
     prepare_msa_icp_indexer,
 )
 from .sparse_topk_select import msa_topk_select
+from .blockscore_indexer import (
+    is_msa_blockscore_indexer_supported,
+    msa_blockscore_indexer_stats,
+    msa_blockscore_topk_indexer,
+)
 
 # Legacy aggregate capability flag retained for callers that only target
 # SM120/SM121. Mixed-architecture callers should query supports_packed_kv().
@@ -62,6 +69,9 @@ def supports_packed_kv(device: torch.device | str) -> bool:
 __all__ = [
     "MSASparseAttentionWorkspace",
     "SUPPORTS_PACKED_KV",
+    "is_msa_blockscore_indexer_supported",
+    "msa_blockscore_indexer_stats",
+    "msa_blockscore_topk_indexer",
     "msa_decode_nvfp4_specialized_stats",
     "msa_decode_nvfp4_specialized_warmup",
     "msa_icp_comm_layout",
