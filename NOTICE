@@ -46,3 +46,12 @@ and FlashInfer PR #4266 provenance. The fixed-order batched GEMM retains
 code derived from batch_invariant_ops, Copyright 2025 Thinking Machines Lab,
 under the MIT License (licenses/LICENSE.batch-invariant-ops.txt).
 Pinned sources and modifications: flashinfer/experimental/hc_sum_sm100/SOURCES.md.
+
+The experimental MOSCA MegaMoE backend (flashinfer/experimental/mosca/) includes code from DeepGEMM,
+Copyright (c) 2025 DeepSeek, under the MIT License (flashinfer/experimental/mosca/LICENSE.DeepGEMM):
+17 headers vendored byte-identical to upstream (csrc/vendor/deep_gemm/), and the SM100 FP8 x FP4
+MegaMoE kernel header modified for MOSCA (csrc/megamoe/sm100_fp8_fp4_mega_moe.cuh).
+The backend's planner, launcher and weight preparation are adapted from the same project.
+vendor/deep_gemm.json records the upstream hashes. The vendored headers include CUTLASS/CuTe headers,
+which FlashInfer bundles in 3rdparty/cutlass.
+Source: https://github.com/sgl-project/DeepGEMM/tree/1ff3932f0f9d9187b92afb476da4e3ade10a6575
