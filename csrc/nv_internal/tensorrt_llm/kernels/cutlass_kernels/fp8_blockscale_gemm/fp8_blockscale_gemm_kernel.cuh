@@ -1104,7 +1104,7 @@ __global__ void scale_128x128_kernel(OutputType* output, ScaleType* scales,
       InputType const* input_d = input_line;
 
       for (int j = 0; j < 4; j++) {
-        if (scales_idx_x * 128 + i * 32 + lane_id >= dim_x) {
+        if (scales_idx_x * 128 + j * 32 + lane_id >= dim_x) {
           break;
         } else {
           input_amax = InputType(std::max(float(input_amax), std::fabs(float(input_d[lane_id]))));
