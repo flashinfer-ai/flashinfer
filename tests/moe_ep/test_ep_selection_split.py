@@ -16,6 +16,8 @@ from tests.moe_ep import test_split_fused_moe_kernel_vs_reference as problem
 
 @pytest.mark.arch_blackwell
 def test_split_only_search_replay_and_capture(monkeypatch, tmp_path):
+    if torch.version.cuda and int(torch.version.cuda.split(".")[0]) < 13:
+        pytest.skip("EP runtime wheels require CUDA 13+")
     problem._require_backend(TrtllmBf16Config)
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         pytest.skip("single-GPU test")
