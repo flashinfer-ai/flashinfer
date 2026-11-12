@@ -182,9 +182,11 @@ the two 64-row halves of a block-scaled M128 QK) and ``nvfp4_h128_prefill``
 (``H128``, one two-CTA cluster per token, 64 heads per CTA). As the FP8
 route takes an E4M3 query, they take the query packed by the caller: the call
 packs nothing. A BF16 query runs the decode family at any row count, as it
-did before the prefill bodies; on the DSv4 prefill shapes (128 to 8192 rows)
+did before the prefill bodies. On the DSv4 prefill shapes (128 to 8192 rows)
 the prefill bodies with a packed query run 1.05-6.5x faster than the decode
-family. The prefill bodies read the
+family; below 64 rows the decode family is often the faster one. The decode
+family caps a row at 12 candidate tiles, so wider tables (C128 layers past
+1408 compressed entries) run only with a packed query. The prefill bodies read the
 pools through 32-byte-pitch data-row and scale-row tensor maps, and write the
 final BF16 output and base-2 LSE directly (no split, no merge), so their
 workspace carve has one split (no ``partial_O`` region); the LSE lands in the
@@ -4122,7 +4124,9 @@ def _nvfp4_plan(
         raise ValueError("at least one candidate tile is required")
     if total_tiles > _NVFP4_MAX_SPLITS:
         raise ValueError(
-            f"total candidate tiles {total_tiles} exceeds the NVFP4 route cap {_NVFP4_MAX_SPLITS}"
+            f"total candidate tiles {total_tiles} exceeds the NVFP4 route cap {_NVFP4_MAX_SPLITS}; "
+            "a query packed with cake_dsv4_nvfp4_pack_query runs the prefill bodies, "
+            "which take any table width"
         )
     num_head_tiles = _ceil_div(heads, _NVFP4_TILE_Q)
     common = dict(

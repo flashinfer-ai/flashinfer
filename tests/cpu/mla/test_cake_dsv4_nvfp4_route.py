@@ -361,7 +361,9 @@ def test_nvfp4_plan_head_tiles_and_caps():
             sm_count=148,
         )
     # 13 candidate tiles exceed the split cap (12) of every member.
-    with pytest.raises(ValueError, match="exceeds the NVFP4 route cap"):
+    with pytest.raises(
+        ValueError, match="exceeds the NVFP4 route cap.*cake_dsv4_nvfp4_pack_query"
+    ):
         _nvfp4_plan(
             num_query_tokens=1,
             num_heads=128,
