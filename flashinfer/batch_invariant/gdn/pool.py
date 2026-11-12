@@ -1,19 +1,20 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The per-pool state of the GDN class and its three placements.
+"""The per-pool state of the GDN class and its placements.
 
 An fp32 state pool ``[S, HV, 128, 128]`` passed as ``initial_state`` holds, per slot, the state at the sequence's last
-64-token boundary. The class keeps next to it, keyed by the pool tensor, what the pool cannot hold: the raw rows of the
-open chunk (at most 63 per slot), the rows of the chunk's solve that the step kernel caches per (slot, v-head) (the
-normalized keys, the log2 gates and betas, the M and X rows of the blocked inverse, the VKS and NV rows), a bf16 copy
-of the boundary state and the open-row count. Three placements compute the class's term:
+64-token boundary. The class keeps next to it, keyed by the pool's storage, what the pool cannot hold: the rows of the
+open chunk's solve that the step kernel caches per (slot, v-head) (the normalized keys, the log2 gates and betas, the M
+and X rows of the blocked inverse, the VKS and NV rows), a bf16 copy of the boundary state and the open-row count. Two
+kernels compute the class's term:
 
-* the step kernel (:meth:`GdnPool.step`): one launch appends one token per slot and returns its row; the 64th row of
-  a chunk commits the next boundary state. It reads its count on the device, so a decode step needs no host metadata;
-* the step kernel once per token (:meth:`GdnPool.extend` for short calls);
-* the pinned prefill over the open chunk plus the new tokens (:meth:`GdnPool.extend` otherwise): the whole chunks in
-  one call that writes the boundary state, the open tail in a second call from it. The tail's cached rows are rebuilt
-  by the step kernel before the slot's next step (``pending``); until then the slot's count cell is negative and a
+* the step kernel: one launch appends one token per slot and returns its row (:meth:`GdnPool.step`), or, in its span
+  form, a run of tokens per slot (:meth:`GdnPool.span`); the 64th row of a chunk commits the next boundary state. It
+  reads its count on the device, so neither form needs host metadata;
+* the pinned prefill for whole chunks from a boundary (:meth:`GdnPool.extend_whole_chunks`, :meth:`GdnPool.extend`):
+  one call in place that also returns the rows of the open tails and stores each sequence's last boundary state as a
+  checkpoint. The tails' raw rows are kept next to the pool (one launch) and their cached rows built by one span
+  launch before the slot's next step (:meth:`GdnPool.rebuild`); until then the slot's count cell is negative and a
   step launched without that rebuild (a captured graph) returns NaN rows for it.
 """
 
@@ -21,12 +22,12 @@ from __future__ import annotations
 
 import functools
 import weakref
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 
-from .spec import CHUNK, HEAD_DIM, extend_split, uses_step_kernel
+from .spec import CHUNK, HEAD_DIM
 
 _IO = torch.bfloat16
 #: Count-cell values of the step kernel: bit 8 asks for a refresh of the bf16 state copy, negative marks unbuilt rows.
@@ -67,11 +68,30 @@ def get_pool(pool: torch.Tensor, num_q_heads: int) -> "GdnPool":
     return gp
 
 
-def _pinned(rows, cu, cu_cpu, pool, read_slots, write_slots, scale, output=None):
-    """The class's term: the chunked prefill without context parallelism, from the pool's fp32 states."""
+def _pinned(
+    rows,
+    cu,
+    cu_cpu,
+    pool,
+    read_slots,
+    write_slots,
+    scale,
+    output=None,
+    checkpoints=None,
+):
+    """The class's term: the chunked prefill without context parallelism, from the pool's fp32 states.
+    ``checkpoints = (rows, starts)`` stores 64-token boundary states in the pool rows listed (-1 skips one)."""
     from ...gdn_prefill import chunk_gated_delta_rule
 
     q, k, v, g, beta = rows
+    extra = {}
+    if checkpoints is not None:
+        extra = dict(
+            state_checkpoints=pool,
+            checkpoint_every_n_tokens=CHUNK,
+            checkpoint_state_indices=checkpoints[0],
+            checkpoint_cu_starts=checkpoints[1],
+        )
     out, _ = chunk_gated_delta_rule(
         q,
         k,
@@ -91,6 +111,7 @@ def _pinned(rows, cu, cu_cpu, pool, read_slots, write_slots, scale, output=None)
         backend="flashinfer",
         use_cp=False,
         gate_domain="log",
+        **extra,
     )
     return out
 
@@ -104,11 +125,6 @@ class GdnPool:
         def zeros(*shape, dtype=_IO):
             return torch.zeros(shape, dtype=dtype, device=dev)
 
-        self.hist_q = zeros(S, CHUNK, HQ, HEAD_DIM)
-        self.hist_k = zeros(S, CHUNK, HQ, HEAD_DIM)
-        self.hist_v = zeros(S, CHUNK, HV, HEAD_DIM)
-        self.hist_g = zeros(S, CHUNK, HV, dtype=torch.float32)
-        self.hist_beta = zeros(S, CHUNK, HV, dtype=torch.float32)
         self.kn = zeros(S, CHUNK, HQ, HEAD_DIM)
         self.state_bf16 = zeros(S, HV, HEAD_DIM, HEAD_DIM)
         self.cnt = torch.full((S, HV), STALE, dtype=torch.int32, device=dev)
@@ -118,34 +134,15 @@ class GdnPool:
         self.x_rows = zeros(S, HV, CHUNK, CHUNK)
         self.vks_rows = zeros(S, HV, CHUNK, HEAD_DIM)
         self.nv_rows = zeros(S, HV, CHUNK, HEAD_DIM)
-        #: slot -> (rows the step kernel has built, open rows): tails a prefill left for the next step to rebuild
-        self.pending: Dict[int, Tuple[int, int]] = {}
+        #: the ``prefix_lens`` of a call whose sequences all start at a chunk boundary
+        self.zero_prefix = zeros(S, dtype=torch.int32)
+        #: slot -> open rows a prefill left for the next step to build (their raw rows are in ``_hist``)
+        self.pending: Dict[int, int] = {}
+        self._hist: Optional[Tuple[torch.Tensor, ...]] = None
+        self._no_out = torch.empty((0, HV, HEAD_DIM), dtype=_IO, device=dev)
 
-    @property
-    def _hist(self):
-        S = self.slots
+    def _side(self):
         return (
-            self.hist_q.view(S * CHUNK, self.HQ, HEAD_DIM),
-            self.hist_k.view(S * CHUNK, self.HQ, HEAD_DIM),
-            self.hist_v.view(S * CHUNK, self.HV, HEAD_DIM),
-            self.hist_g.view(S * CHUNK, self.HV),
-            self.hist_beta.view(S * CHUNK, self.HV),
-        )
-
-    def _idx(self, values, dtype=torch.int64) -> torch.Tensor:
-        return torch.as_tensor(np.asarray(values), dtype=dtype, device=self.device)
-
-    def _launch(self, pool, rows, slots, out, scale) -> None:
-        q, k, v, g, beta = rows
-        _module().gdn_batch_invariant_decode_step(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            slots,
-            out,
-            pool,
             self.state_bf16,
             self.cnt,
             self.ring_l,
@@ -155,79 +152,93 @@ class GdnPool:
             self.x_rows,
             self.vks_rows,
             self.nv_rows,
-            self.hist_q,
-            self.hist_k,
-            self.hist_v,
-            self.hist_g,
-            self.hist_beta,
-            scale,
         )
 
-    def _set_counts(self, slot_list: Sequence[int], values: Sequence[int]) -> None:
-        if len(slot_list) == 0:
-            return
-        cells = self._idx(values, torch.int32)[:, None].expand(-1, self.HV)
-        self.cnt.index_copy_(0, self._idx(slot_list), cells.contiguous())
+    def _idx(self, values, dtype=torch.int32) -> torch.Tensor:
+        return torch.as_tensor(np.asarray(values), dtype=dtype, device=self.device)
 
-    def counts(self, slot_list: Sequence[int]) -> List[int]:
-        """The open rows of each slot (one device read for the slots without a pending tail)."""
-        live = [self.pending[s][1] if s in self.pending else -1 for s in slot_list]
-        ask = [i for i, n in enumerate(live) if n < 0]
-        if ask:
-            cells = self.cnt[:, 0].index_select(
-                0, self._idx([slot_list[i] for i in ask])
+    def stash(self, slots, starts, ends, slot_list, tails, packed, pool) -> None:
+        """Keep rows ``[starts[i], ends[i])`` of ``packed``, the open tail a prefill left in ``slots[i]``, for
+        :meth:`rebuild`; a slot without a tail is marked for a refresh of its bf16 state copy."""
+        if self._hist is None:
+            rows = self.slots * CHUNK
+            self._hist = tuple(
+                torch.zeros((rows, *x.shape[1:]), dtype=x.dtype, device=self.device)
+                for x in packed
             )
-            for i, c in zip(ask, cells.tolist(), strict=True):
-                live[i] = int(c) & (CHUNK - 1)
-        return live
+        _module().gdn_batch_invariant_stash(
+            *packed, slots, starts, ends, pool, self.cnt, *self._hist
+        )
+        for slot, n in zip(slot_list, tails, strict=True):
+            if n:
+                self.pending[slot] = n
+            else:
+                self.pending.pop(slot, None)
 
-    def reset(self, slot_list: Sequence[int]) -> None:
-        """The slots' states are taken as chunk boundaries: open rows dropped, the bf16 copy refreshed by the next step."""
-        for s in slot_list:
-            self.pending.pop(s, None)
-        self._set_counts(slot_list, [STALE] * len(slot_list))
-
-    def catch_up(self, pool: torch.Tensor, slot_list: Sequence[int], scale) -> None:
-        """Rebuild the cached rows of the listed slots' pending tails: the step kernel over their raw rows."""
+    def rebuild(self, pool: torch.Tensor, slot_list: Sequence[int]) -> None:
+        """Build the cached rows of the listed slots' pending tails: one span launch over their kept rows."""
         work = [
-            (s, *self.pending[s]) for s in dict.fromkeys(slot_list) if s in self.pending
+            (s, self.pending.pop(s))
+            for s in dict.fromkeys(slot_list)
+            if s in self.pending
         ]
         if not work:
             return
-        self._set_counts(
-            [s for s, _, _ in work], [b if b > 0 else STALE for _, b, _ in work]
+        m = self._idx(
+            [
+                [s for s, _ in work],
+                [s * CHUNK for s, _ in work],
+                [s * CHUNK + n for s, n in work],
+            ]
         )
-        hist = self._hist
-        scratch = torch.empty(
-            (len(work), self.HV, HEAD_DIM), dtype=_IO, device=self.device
+        self.span(
+            pool,
+            m[0],
+            m[1],
+            m[2],
+            self.zero_prefix[: len(work)],
+            self._hist,
+            1.0,
+            self._no_out,
         )
-        for j in range(max(live - built for _, built, live in work)):
-            act = [(s, built + j) for s, built, live in work if built + j < live]
-            rows = self._idx([s * CHUNK + r for s, r in act])
-            self._launch(
-                pool,
-                tuple(h.index_select(0, rows) for h in hist),
-                self._idx([s for s, _ in act], torch.int32),
-                scratch[: len(act)],
-                scale,
-            )
-        for s, _, _ in work:
-            del self.pending[s]
 
     def step(self, pool, slots, q, k, v, g, beta, scale, out) -> None:
         """One token per slot: ``out[i]`` is the row of ``slots[i]``'s sequence at its position."""
         if self.pending:
-            self.catch_up(pool, slots.tolist(), scale)
-        self._launch(pool, (q, k, v, g, beta), slots, out, scale)
+            self.rebuild(pool, slots.tolist())
+        _module().gdn_batch_invariant_decode_step(
+            q, k, v, g, beta, slots, out, pool, *self._side(), scale
+        )
+
+    def span(self, pool, slots, starts, ends, prefix, packed, scale, out) -> None:
+        """Rows ``[starts[i], ends[i])`` of ``packed`` appended to ``slots[i]`` in one launch (int32 device tensors).
+        ``prefix[i] % 64`` must be the slot's open-row count, or 0 to start from the slot's state as a chunk boundary;
+        the rows of a slot that holds another count are NaN and the slot is left as it was. An empty run at a boundary
+        only marks the bf16 state copy for a refresh."""
+        q, k, v, g, beta = packed
+        _module().gdn_batch_invariant_decode_span(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            slots,
+            starts,
+            ends,
+            prefix,
+            out,
+            pool,
+            *self._side(),
+            scale,
+        )
 
     def extend_whole_chunks(self, pool, slots, offs, cu, packed, scale, out) -> bool:
         """A prefill of whole chunks from the slots' states: the caller's tensors as they are, nothing read back before
         the kernel and the bookkeeping after it. False (nothing done) when a sequence leaves an open tail."""
-        lens = [b - a for a, b in zip(offs, offs[1:], strict=False)]
-        if uses_step_kernel(max(lens)) or any(n % CHUNK for n in lens):
+        if any((b - a) % CHUNK for a, b in zip(offs, offs[1:], strict=False)):
             return False
         if cu is None:
-            cu = self._idx(offs, torch.int32)
+            cu = self._idx(offs)
         _pinned(packed, cu, list(offs), pool, slots, slots, scale, output=out)
         if self.pending:
             for s in slots.tolist():
@@ -249,136 +260,73 @@ class GdnPool:
     ) -> None:
         """Append tokens ``[offs[i], offs[i + 1])`` of ``packed`` to slot ``slot_list[i]`` (``slots`` and the int32
         offsets ``cu`` on the device), which holds ``counts[i]`` open rows; a slot at 0 starts from its state as a chunk
-        boundary. ``out`` receives the rows."""
-        lens = [offs[i + 1] - offs[i] for i in range(len(slot_list))]
-        if uses_step_kernel(max(lens)):
-            self.reset([s for s, c in zip(slot_list, counts, strict=True) if c == 0])
-            self._extend_steps(pool, slots, slot_list, lens, offs, packed, scale, out)
-        else:
-            self._extend_prefill(
-                pool, slot_list, counts, lens, offs, packed, scale, out
+        boundary. ``out`` receives the rows. At least one sequence brings a whole chunk."""
+        N = len(slot_list)
+        if not any(counts):
+            # one prefill call in place, each sequence's last boundary state stored as a checkpoint; the rows after
+            # it are kept for the step kernel to build from
+            rows, starts, tail_starts = [], [0], []
+            for i, slot in enumerate(slot_list):
+                chunks = (offs[i + 1] - offs[i]) // CHUNK
+                rows += [-1] * (chunks - 1) + [slot] * (chunks > 0)
+                starts.append(len(rows))
+                tail_starts.append(offs[i] + chunks * CHUNK)
+            meta = self._idx(
+                np.concatenate([rows, starts, [-1] * N, tail_starts, offs[1:], offs])
             )
-
-    def _extend_steps(
-        self, pool, slots, slot_list, lens, offs, packed, scale, out
-    ) -> None:
-        self.catch_up(pool, slot_list, scale)
-        N, T = len(lens), lens[0]
-        if all(n == T for n in lens):
-            if T == 1:
-                self._launch(pool, packed, slots, out, scale)
-                return
-            # token-major copies: launch j takes token j of every sequence as one contiguous batch
-            rows = tuple(
-                x.view(N, T, *x.shape[1:]).transpose(0, 1).contiguous() for x in packed
+            cuts = np.cumsum([0, len(rows), N + 1, N, N, N, N + 1])
+            ck_rows, ck_starts, no_write, t0, t1, cu_up = (
+                meta[a:b] for a, b in zip(cuts, cuts[1:], strict=False)
             )
-            o = torch.empty((T, N, self.HV, HEAD_DIM), dtype=_IO, device=self.device)
-            for j in range(T):
-                self._launch(pool, tuple(r[j] for r in rows), slots, o[j], scale)
-            out.view(N, T, self.HV, HEAD_DIM).copy_(o.transpose(0, 1))
-            return
-        for j in range(max(lens)):
-            act = [i for i, n in enumerate(lens) if j < n]
-            rows = self._idx([offs[i] + j for i in act])
-            o = torch.empty(
-                (len(act), self.HV, HEAD_DIM), dtype=_IO, device=self.device
-            )
-            self._launch(
+            _pinned(
+                packed,
+                cu if cu is not None else cu_up,
+                list(offs),
                 pool,
-                tuple(x.index_select(0, rows) for x in packed),
-                self._idx([slot_list[i] for i in act], torch.int32),
-                o,
+                slots,
+                no_write,
                 scale,
+                output=out,
+                checkpoints=(ck_rows, ck_starts),
             )
-            out.index_copy_(0, rows, o)
-
-    def _run_pinned(self, pool, segs, packed, write: bool, scale, out) -> None:
-        """One pinned call over ``segs``: per sequence ``(slot, open rows replayed, first new row, new rows)``."""
-        cu = [0]
-        for _, n_hist, _, n_new in segs:
-            cu.append(cu[-1] + n_hist + n_new)
-        slots = self._idx([s for s, _, _, _ in segs], torch.int32)
-        write_slots = slots if write else torch.full_like(slots, -1)
-        cu_dev = self._idx(cu, torch.int32)
-        has_hist = any(n_hist for _, n_hist, _, _ in segs)
-        contiguous = not has_hist and all(
-            a[2] + a[3] == b[2] for a, b in zip(segs, segs[1:], strict=False)
-        )
-        if contiguous:
-            a, b = segs[0][2], segs[-1][2] + segs[-1][3]
-            rows = tuple(x[a:b] for x in packed)
-            _pinned(rows, cu_dev, cu, pool, slots, write_slots, scale, output=out[a:b])
+            tails = [offs[i + 1] - t for i, t in enumerate(tail_starts)]
+            self.stash(slots, t0, t1, slot_list, tails, packed, pool)
             return
-        if not has_hist and len(segs) <= 32:
-            rows = tuple(
-                torch.cat([x[st : st + n] for _, _, st, n in segs]) for x in packed
-            )
-            o = _pinned(rows, cu_dev, cu, pool, slots, write_slots, scale)
-            for (_, _, st, n), c in zip(segs, cu, strict=False):
-                out[st : st + n].copy_(o[c : c + n])
-            return
-        hist_src, hist_dst, new_src, new_dst = [], [], [], []
-        for (slot, n_hist, start, n_new), base in zip(segs, cu, strict=False):
-            hist_src.append(slot * CHUNK + np.arange(n_hist))
-            hist_dst.append(base + np.arange(n_hist))
-            new_src.append(start + np.arange(n_new))
-            new_dst.append(base + n_hist + np.arange(n_new))
-        src, dst = (
-            self._idx(np.concatenate(new_src)),
-            self._idx(np.concatenate(new_dst)),
-        )
-        if has_hist:
-            rows = tuple(
-                torch.empty((cu[-1], *x.shape[1:]), dtype=x.dtype, device=x.device)
-                for x in packed
-            )
-            for r, x in zip(rows, packed, strict=True):
-                r.index_copy_(0, dst, x.index_select(0, src))
-            hs, hd = (
-                self._idx(np.concatenate(hist_src)),
-                self._idx(np.concatenate(hist_dst)),
-            )
-            for r, h in zip(rows, self._hist, strict=True):
-                r.index_copy_(0, hd, h.index_select(0, hs))
-            o = _pinned(rows, cu_dev, cu, pool, slots, write_slots, scale)
-            out.index_copy_(0, src, o.index_select(0, dst))
-        else:
-            rows = tuple(x.index_select(0, src) for x in packed)
-            o = _pinned(rows, cu_dev, cu, pool, slots, write_slots, scale)
-            out.index_copy_(0, src, o)
-
-    def _extend_prefill(
-        self, pool, slot_list, counts, lens, offs, packed, scale, out
-    ) -> None:
-        # three pinned calls at most: open chunks to their boundary, whole chunks, open tails
-        heads, bodies, tails = [], [], []
-        hist_src, hist_dst, cells = [], [], []
+        # open chunks first (to their boundary, or the whole piece), then whole chunks, then open tails
+        self.rebuild(pool, [s for s, c in zip(slot_list, counts, strict=True) if c])
+        for s in slot_list:
+            self.pending.pop(s, None)
+        pre, body, post = [], [], []
         for i, slot in enumerate(slot_list):
-            c, n, start = counts[i], lens[i], offs[i]
-            built = self.pending.get(slot, (c, c))[0] if c else 0
-            if c and c + n >= CHUNK:
-                heads.append((slot, c, start, CHUNK - c))
-                start, n, c, built = start + CHUNK - c, n - (CHUNK - c), 0, 0
-            whole, tail = extend_split(c, n)
+            c, start, end = counts[i], offs[i], offs[i + 1]
+            if c:
+                cut = min(end, start + CHUNK - c)
+                pre.append((slot, start, cut, c))
+                if cut - start < CHUNK - c:
+                    continue
+                start = cut
+            whole = (end - start) // CHUNK * CHUNK
             if whole:
-                bodies.append((slot, 0, start, whole))
-                start, n, built = start + whole, n - whole, 0
-            if tail:
-                tails.append((slot, c, start, n))
-                hist_src.append(start + np.arange(n))
-                hist_dst.append(slot * CHUNK + c + np.arange(n))
-                self.pending[slot] = (built, tail)
-            else:
-                self.pending.pop(slot, None)
-            cells.append(PENDING if tail else STALE)
-        for segs, write in ((heads, True), (bodies, True), (tails, False)):
-            if segs:
-                self._run_pinned(pool, segs, packed, write, scale, out)
-        if tails:
-            src, dst = (
-                self._idx(np.concatenate(hist_src)),
-                self._idx(np.concatenate(hist_dst)),
-            )
-            for h, x in zip(self._hist, packed, strict=True):
-                h.index_copy_(0, dst, x.index_select(0, src))
-        self._set_counts(slot_list, cells)
+                body.append((slot, start, whole))
+            if whole or end > start:
+                post.append((slot, start + whole, end, 0))
+        for runs in (pre, None, post):
+            if runs is None:
+                if body:
+                    self._pinned_gathered(pool, body, packed, scale, out)
+            elif runs:
+                m = self._idx(np.asarray(runs).T.copy())
+                self.span(pool, m[0], m[1], m[2], m[3], packed, scale, out)
+
+    def _pinned_gathered(self, pool, segs, packed, scale, out) -> None:
+        """One pinned call over whole-chunk pieces ``(slot, first row, rows)`` that do not tile the packed rows."""
+        cu = [0]
+        for _, _, n in segs:
+            cu.append(cu[-1] + n)
+        slots = self._idx([s for s, _, _ in segs])
+        src = self._idx(
+            np.concatenate([st + np.arange(n) for _, st, n in segs]), torch.int64
+        )
+        rows = tuple(x.index_select(0, src) for x in packed)
+        o = _pinned(rows, self._idx(cu), cu, pool, slots, slots, scale)
+        out.index_copy_(0, src, o)
