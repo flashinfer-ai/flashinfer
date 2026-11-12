@@ -131,9 +131,10 @@ class TorchF32:
 
     @staticmethod
     def fmaxc(a: torch.Tensor, b: Union[torch.Tensor, float]) -> torch.Tensor:
-        """The device's ``max.f32``: a zero tie is ``+0`` when either operand is ``+0`` (``-0`` only for two ``-0``)."""
+        """The device's ``max.f32``: the non-NaN operand when one is NaN, and a zero tie is ``+0`` when either operand is
+        ``+0`` (``-0`` only for two ``-0``)."""
         b = torch.as_tensor(b, dtype=torch.float32)
-        r = torch.maximum(a, b)
+        r = torch.fmax(a, b)
         zero_tie = (a == 0) & (b == 0)
         pos = (torch.signbit(a) == False) | (torch.signbit(b) == False)  # noqa: E712
         return torch.where(zero_tie & pos, torch.zeros_like(r), r)

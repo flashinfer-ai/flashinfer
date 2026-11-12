@@ -37,13 +37,16 @@ _OUT_DTYPE = {"bf16": torch.bfloat16, "f32": torch.float32, "e4m3": torch.float8
 
 
 def weight_multipliers(w: torch.Tensor) -> torch.Tensor:
-    """FlashInfer's per-expert E4M3 multipliers of ``w [E, N, K]``: ``448 / amax`` (1 for an all-zero expert), fp32."""
+    """FlashInfer's per-expert E4M3 multipliers of ``w [E, N, K]``: ``448 / amax`` (1 for an all-zero expert), fp32; an
+    expert whose amax is below ``448 / FLT_MAX`` takes the largest finite multiplier, so finite weights never quantize through
+    an infinite multiplier."""
     amax = w.detach().to(torch.float32).abs().amax(dim=(-1, -2))
     if not bool(torch.isfinite(amax).all()):
         raise ValueError(f"{CLASS}: the expert weights must be finite")
-    return torch.where(amax > 0, E4M3_MAX / amax, torch.ones_like(amax)).to(
-        torch.float32
-    )
+    finite_floor = E4M3_MAX / torch.finfo(torch.float32).max
+    return torch.where(
+        amax > 0, E4M3_MAX / amax.clamp_min(finite_floor), torch.ones_like(amax)
+    ).to(torch.float32)
 
 
 def _scale_tensor(m, name: str, device: torch.device) -> torch.Tensor:

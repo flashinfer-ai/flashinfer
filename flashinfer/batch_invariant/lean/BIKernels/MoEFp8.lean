@@ -119,15 +119,16 @@ theorem swapped_fp8_not_dense (cfg : GEMM.Config) (h : swappedOKFp8 cfg = true) 
   | false => simp [swappedOKFp8, hs] at h
   | true => simp [GEMM.ConfigOK, hs]
 
-/-- **Every record of either fp8 space computes the same tile**: a swapped record's tile result is any dense record's (the dense
-class's configuration erasure, `GEMM.config_invariance`), so the two spaces together are one guarantee space; the W8A8 chain is
-applied to that tile's accumulators after the fold, record-independently. -/
+/-- **Every record of either fp8 space computes the same tile**: a swapped record's tile result at the fp8 classes' 32-wide step
+(`GEMM.tileResult32`, the `mma32` fold) is any dense record's (the dense fp8 class's configuration erasure,
+`GEMM.config_invariance32`), so the two spaces together are one guarantee space; the W8A8 chain is applied to that tile's
+accumulators after the fold, record-independently. -/
 theorem swapped_fp8_eq_dense (c₁ c₂ : GEMM.Config) (S₁ S₂ : Nat) (p q : GEMM.GTerm) (a : GEMM.RowData) (b : GEMM.ColData) (kb nblk : Nat) :
-    GEMM.tileResult c₁ S₁ p a b kb nblk = GEMM.tileResult c₂ S₂ q a b kb nblk :=
-  GEMM.config_invariance c₁ c₂ S₁ S₂ p q a b kb nblk
+    GEMM.tileResult32 c₁ S₁ p a b kb nblk = GEMM.tileResult32 c₂ S₂ q a b kb nblk :=
+  GEMM.config_invariance32 c₁ c₂ S₁ S₂ p q a b kb nblk
 
 theorem swapped_fp8_space_invariant : ∀ c₁ ∈ swappedSpaceFp8, ∀ c₂ ∈ swappedSpaceFp8, ∀ (S₁ S₂ : Nat) (p q : GEMM.GTerm) (a : GEMM.RowData) (b : GEMM.ColData) (kb nblk : Nat),
-    GEMM.tileResult c₁ S₁ p a b kb nblk = GEMM.tileResult c₂ S₂ q a b kb nblk :=
-  GEMM.space_invariant swappedSpaceFp8
+    GEMM.tileResult32 c₁ S₁ p a b kb nblk = GEMM.tileResult32 c₂ S₂ q a b kb nblk :=
+  GEMM.space_invariant32 swappedSpaceFp8
 
 end BIK.MoEFp8

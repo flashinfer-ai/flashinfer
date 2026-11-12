@@ -304,6 +304,9 @@ class SwappedGroupedGemmFp8:
         )
         s_off = storage.group_off.get_tensor(cute.make_layout((MAX_E + 1,)))
         s_pre = storage.group_pre.get_tensor(cute.make_layout((MAX_E + 1,)))
+        # the tables read ``counts``, the predecessor chain's writes: every warp waits for the preceding grid first (a
+        # no-op when nothing before triggered early; the weight prefetch follows the wait)
+        cute.arch.griddepcontrol_wait()
         if warp_idx == EPILOGUE_WARPS[0]:
             build_group_tables(
                 counts, E, tn, s_off, s_pre

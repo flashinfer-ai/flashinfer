@@ -874,6 +874,21 @@ def test_layer_matches_the_class_composition(act):
         assert (im["a"].float().abs() == 448).any()
 
 
+def test_weight_multipliers_stay_finite_for_tiny_experts():
+    """An expert whose largest magnitude is below ``448 / FLT_MAX`` would take an infinite ``448 / amax``; the multiplier is
+    clamped to the largest finite one, so the quantized bytes stay finite (an all-zero expert keeps the unit multiplier)."""
+    from flashinfer.fused_moe.batch_invariant.api_fp8 import weight_multipliers
+
+    w = torch.zeros(3, 16, 32, dtype=torch.bfloat16)
+    w[0, 0, 0] = 2.0**-120
+    w[1, 3, 5] = 0.5
+    m = weight_multipliers(w)
+    assert torch.isfinite(m).all() and m[0] == torch.finfo(torch.float32).max
+    assert m[1] == 448.0 / 0.5 and m[2] == 1.0
+    q = (w.float() * m.view(-1, 1, 1)).to(torch.float8_e4m3fn).float()
+    assert torch.isfinite(q).all()
+
+
 @needs_device
 def test_the_largest_expert_count_routes_and_runs():
     """1024 experts: the class's routing from the logits equals the CPU model and the layer equals the class composition."""

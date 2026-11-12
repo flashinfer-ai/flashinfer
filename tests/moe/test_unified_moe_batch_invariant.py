@@ -1532,6 +1532,20 @@ def test_layer_matches_the_class_composition(act):
     assert torch.equal(bits(out.cpu()), bits(ref))
 
 
+def test_reference_max_takes_the_non_nan_operand():
+    """``TorchF32.fmaxc`` is the device's ``max.f32``: the non-NaN operand when one operand is NaN, ``+0`` on a zero tie with a
+    ``+0``, ``-0`` only for two ``-0``."""
+    from flashinfer.fused_moe.batch_invariant.reference import TorchF32
+
+    nan = float("nan")
+    r = TorchF32.fmaxc(
+        torch.tensor([nan, 1.0, -0.0, -0.0]), torch.tensor([0.0, nan, 0.0, -0.0])
+    )
+    assert r[0] == 0.0 and r[1] == 1.0
+    assert r[2] == 0.0 and not torch.signbit(r[2])
+    assert r[3] == 0.0 and torch.signbit(r[3])
+
+
 @needs_device
 def test_the_largest_expert_count_routes_and_runs():
     """1024 experts (the routing kernel's widest bucket, the group tables' size): the class's routing from the logits
