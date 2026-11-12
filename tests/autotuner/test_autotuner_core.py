@@ -1718,17 +1718,15 @@ def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
         use_cold_l2_cache=True,
         cuda_graph_profile_replays=2,
     )
-    allocations = []
-    original_empty = torch.empty
+    flushes = []
+    original_make_l2_flush = autotuner_module.make_l2_flush
 
-    def tracked_empty(*args, **kwargs):
-        result = original_empty(*args, **kwargs)
-        if kwargs.get("dtype") == torch.int8:
-            allocations.append((result.numel(), result.device))
-        return result
+    def tracked_make_l2_flush(num_bytes, device):
+        flushes.append((num_bytes, device))
+        return original_make_l2_flush(num_bytes, device)
 
     monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda device_id: 4096)
-    monkeypatch.setattr(torch, "empty", tracked_empty)
+    monkeypatch.setattr(autotuner_module, "make_l2_flush", tracked_make_l2_flush)
     monkeypatch.setattr(
         "flashinfer.autotuner.autotuner.delay_kernel", lambda delay_us: None
     )
@@ -1736,7 +1734,7 @@ def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
     latency = tuner._profile_single_kernel(runner, inputs, 0, config)
 
     assert latency >= 0
-    assert allocations == [(8192, inputs[0].device)]
+    assert flushes == [(8192, inputs[0].device)]
 
 
 class _CudaAddRunner(DummyRunner):

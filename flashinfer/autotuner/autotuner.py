@@ -36,6 +36,7 @@ from flashinfer.utils import (
     next_positive_power_of_2,
     is_confidential_compute,
     get_globaltimer_kernel,
+    make_l2_flush,
 )
 
 from flashinfer.jit.core import logger
@@ -4086,10 +4087,8 @@ class AutoTuner:
             # Twice L2 matches the standalone benchmark policy and prevents
             # static operands passed through kwargs (for example MoE weights)
             # from remaining resident between samples.
-            flush_buffer = torch.empty(
-                2 * self._get_l2_cache_size_in_bytes(device.index),
-                dtype=torch.int8,
-                device=device,
+            l2_flush = make_l2_flush(
+                2 * self._get_l2_cache_size_in_bytes(device.index), device
             )
             num_samples = repeat * profile_replays
             graph = torch.cuda.CUDAGraph() if tuning_config.use_cuda_graph else None
@@ -4139,7 +4138,7 @@ class AutoTuner:
                     delay_kernel(delay_kernel_time_usec)
 
                 for sample_idx in range(num_samples):
-                    flush_buffer.zero_()
+                    l2_flush()
                     starts[sample_idx].record(stream)
                     if graph is not None:
                         graph.replay()
@@ -4466,8 +4465,8 @@ class AutoTuner:
         of a multi-kernel tactic are honestly included, queue-saturation
         effects are not (see ``MeasurementPolicy``).
 
-        Cold-L2 is achieved by zeroing an L2-sized flush buffer once per
-        iteration.  ``zero_()`` dispatches a fill KERNEL (not a memset), so
+        Cold-L2 is achieved by reading an L2-sized flush buffer once per
+        iteration.  The read is a reduction KERNEL, so
         it is handed to ``_cupti_measure_spans`` as a prologue that runs and
         is synced BEFORE the correlation window opens; running it inside the
         window would fold ~100 us of flush into the tactic's measured span
@@ -4490,10 +4489,10 @@ class AutoTuner:
 
         with _profile_measurement_scope():
             graph = None
-            flush_buffer = None
+            l2_flush = None
 
             def prepare():
-                nonlocal graph, flush_buffer
+                nonlocal graph, l2_flush
                 for _ in range(self.warmup):
                     runner(inputs, tactic=tactic, **kwargs)
 
@@ -4502,10 +4501,8 @@ class AutoTuner:
                         (t.device for t in inputs if isinstance(t, torch.Tensor)),
                         torch.device("cuda"),
                     )
-                    flush_buffer = torch.empty(
-                        self._get_l2_cache_size_in_bytes() * 3,
-                        device=device,
-                        dtype=torch.int8,
+                    l2_flush = make_l2_flush(
+                        self._get_l2_cache_size_in_bytes() * 3, device
                     )
 
                 if tuning_config.use_cuda_graph:
@@ -4521,9 +4518,9 @@ class AutoTuner:
                     graph.replay()
 
             def prologue():
-                # zero_ launches a fill kernel; exclude it from the span.
-                if flush_buffer is not None:
-                    flush_buffer.zero_()
+                # The flush launches a reduction kernel; exclude it from the span.
+                if l2_flush is not None:
+                    l2_flush()
 
             spans_ms = _cupti_measure_spans(
                 run_iteration,
