@@ -183,10 +183,11 @@ the two 64-row halves of a block-scaled M128 QK) and ``nvfp4_h128_prefill``
 route takes an E4M3 query, they take the query packed by the caller: the call
 packs nothing. A BF16 query runs the decode family at any row count, as it
 did before the prefill bodies. On the DSv4 prefill shapes (128 to 8192 rows)
-the prefill bodies with a packed query run 1.05-6.5x faster than the decode
-family; below 64 rows the decode family is often the faster one. The decode
-family caps a row at 12 candidate tiles, so wider tables (C128 layers past
-1408 compressed entries) run only with a packed query. The prefill bodies read the
+the prefill bodies with a packed query run 1.04-6.5x faster than the decode
+family on B200 and GB300; below 64 rows the decode family is often the
+faster one. The decode family caps a row at 12 candidate tiles, so wider
+tables (C128 layers past 1408 compressed entries) run only with a packed
+query. The prefill bodies read the
 pools through 32-byte-pitch data-row and scale-row tensor maps, and write the
 final BF16 output and base-2 LSE directly (no split, no merge), so their
 workspace carve has one split (no ``partial_O`` region); the LSE lands in the
