@@ -279,6 +279,9 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
                               (experts_per_group * topk_group <= MaxNumExpertsUnit);
 
   if (is_single_group || is_multi_group) {
+    if (num_tokens == 0) {
+      return;  // a zero-sized grid is a launch error, not an empty launch
+    }
     cudaLaunchConfig_t config;
     auto* kernel_instance =
         &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, NumDeepseekExperts, true>;
@@ -305,9 +308,10 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
     config.numAttrs = 1;
     config.attrs = attrs;
 
-    cudaLaunchKernelEx(&config, kernel_instance, scores, topk_values, topk_indices, bias,
-                       num_tokens, n_group, topk_group, topk, num_experts, num_experts / n_group,
-                       routed_scaling_factor, routing_replay_out);
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel_instance, scores, topk_values, topk_indices,
+                                       bias, num_tokens, n_group, topk_group, topk, num_experts,
+                                       num_experts / n_group, routed_scaling_factor,
+                                       routing_replay_out));
     sync_check_cuda_error(stream);
   } else {
     // TODO: call the generic path (previous implementation) or signal unsupported config.
