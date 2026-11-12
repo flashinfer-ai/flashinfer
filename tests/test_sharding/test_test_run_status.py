@@ -87,6 +87,8 @@ def test_worker_missing_before_python_starts_prevents_publication(
     "route,outcome",
     [
         ("torchrun", "passed"),
+        ("mega", "passed"),
+        ("mega", "assertion"),
         ("torchrun", "assertion"),
         ("torchrun", "internal"),
         ("torchrun", "crash"),
@@ -102,6 +104,10 @@ def test_communication_wrappers_report_execution_outcomes(
     tmp_path: Path, route: str, outcome: str
 ) -> None:
     wrapper, test_path = {
+        "mega": (
+            "task_test_multi_gpu_comm_kernels.sh",
+            "tests/moe_ep/test_sm107_auto_multirank.py",
+        ),
         "torchrun": (
             "task_test_multi_gpu_comm_kernels.sh",
             "tests/attention/test_parallel_attention.py",
@@ -128,7 +134,9 @@ def test_communication_wrappers_report_execution_outcomes(
         "test_run_status.py",
     ]:
         shutil.copy(ROOT / "scripts" / name, scripts / name)
-    (scripts / "setup_test_env.sh").write_text("install_and_verify() { :; }\n")
+    (scripts / "setup_test_env.sh").write_text(
+        "install_and_verify() { :; }\nsetup_moe_ep_test_env() { :; }\n"
+    )
     test_file = tmp_path / test_path
     test_file.parent.mkdir(parents=True, exist_ok=True)
     if outcome == "collection":
@@ -147,6 +155,23 @@ def test_communication_wrappers_report_execution_outcomes(
         (tmp_path / "conftest.py").write_text(
             'def pytest_sessionstart(session):\n    raise RuntimeError("internal error")\n'
         )
+    if route == "mega":
+        (tmp_path / "torch.py").write_text(
+            "from types import SimpleNamespace\n"
+            "version = SimpleNamespace(cuda='13.4')\n"
+            "cuda = SimpleNamespace(is_available=lambda: True, "
+            "get_device_capability=lambda: (10, 7))\n"
+        )
+        with test_file.open("a") as stream:
+            stream.write(
+                '\nimport os\nassert os.environ["FAIL_ON_DISTRIBUTED_SKIP"] == "1"\n'
+                'assert os.environ["CUTE_DSL_ARCH"] == "sm_107a"\n'
+            )
+    elif route == "torchrun" and outcome == "passed":
+        with test_file.open("a") as stream:
+            stream.write(
+                '\nimport os\nassert "FAIL_ON_DISTRIBUTED_SKIP" not in os.environ\n'
+            )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     for name in ["mpirun", "torchrun"]:
@@ -158,6 +183,7 @@ def test_communication_wrappers_report_execution_outcomes(
         )
         executable.chmod(0o755)
     env = dict(os.environ)
+    env.pop("FAIL_ON_DISTRIBUTED_SKIP", None)
     env.update(
         PATH=f"{fake_bin}:{env['PATH']}",
         PIP_CONSTRAINT=os.devnull,
