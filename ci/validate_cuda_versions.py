@@ -134,7 +134,7 @@ def _toml_string_arrays(path: Path, section: str) -> dict[str, list[str]]:
     """Read the simple string arrays used by a pyproject table."""
     values: dict[str, list[str]] = {}
     in_section = False
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if stripped.startswith("["):
             if in_section:
@@ -185,7 +185,7 @@ def _validate_dependency_policy(
     requirements_path = repo_root / "requirements.txt"
     requirements = {
         line.strip()
-        for line in requirements_path.read_text().splitlines()
+        for line in requirements_path.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     }
     optional_dependencies = _toml_string_arrays(
@@ -307,7 +307,7 @@ def _validate_devcontainer(
         raise ConfigError(f"missing development container for {label}: {path}")
 
     try:
-        devcontainer = _mapping(json.loads(path.read_text()), str(path))
+        devcontainer = _mapping(json.loads(path.read_text(encoding="utf-8")), str(path))
     except json.JSONDecodeError as error:
         raise ConfigError(f"invalid JSON in {path}: {error}") from error
 
@@ -403,7 +403,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        config = json.loads(args.config.read_text())
+        config = json.loads(args.config.read_text(encoding="utf-8"))
         validate_cuda_config(config, args.repo_root)
     except (ConfigError, OSError, json.JSONDecodeError) as error:
         print(f"ERROR: {error}", file=sys.stderr)

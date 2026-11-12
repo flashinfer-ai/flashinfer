@@ -581,11 +581,14 @@ def cake_gqa_nondet_train_forward(
     device_index = q.device.index
     ws = workspace if workspace is not None else default_workspace(device_index)
     scale = _scale(softmax_scale)
+    # The kernel stores ``out`` in 32-byte pieces: a caller's ``out`` off a 32-byte boundary gets an aligned buffer,
+    # copied in after the launch.
+    dst = out if out.data_ptr() % 32 == 0 else torch.empty_like(out)
     values = {
         "Q": q,
         "K": k,
         "V": v,
-        "O": out,
+        "O": dst,
         "LSE": lse,
         "cu_seqlens_q": cu_seqlens_q,
         "cu_seqlens_k": cu_seqlens_k,
@@ -598,6 +601,8 @@ def cake_gqa_nondet_train_forward(
     }
     with torch.cuda.device(device_index), tvm_ffi.use_torch_stream():
         _launch("fwd", values, dims, device_index)
+    if dst is not out:
+        out.copy_(dst)
     return out, lse
 
 
@@ -717,6 +722,9 @@ def cake_gqa_nondet_train_backward(
             dk_out.zero_()
             dv_out.zero_()
         return dq, dk_out, dv_out
+    # The dQ GEMM stores ``dq`` in 32-byte pieces: a caller's ``dq`` off a 32-byte boundary gets an aligned buffer,
+    # copied in after the launches.
+    dst = dq if dq.data_ptr() % 32 == 0 else torch.empty_like(dq)
     device_index = device.index
     ws = workspace if workspace is not None else default_workspace(device_index)
     segments = dims["num_segments"]
@@ -789,7 +797,6 @@ def cake_gqa_nondet_train_backward(
                     "LSE": lse,
                     "LSE_log2": lse_log2,
                     "dPsum": dpsum,
-                    "dQ_accum": dq_accum,
                 },
                 dims,
                 device_index,
@@ -831,6 +838,7 @@ def cake_gqa_nondet_train_backward(
                 "pair_base": pair_base,
                 "pair_order": pair_order,
                 "dq_accum": dq_accum,
+                "dQ": dst,
                 "dk_out": win_k,
                 "dv_out": win_v,
                 "row_map": None,
@@ -855,6 +863,9 @@ def cake_gqa_nondet_train_backward(
                         "h0": h0,
                         "hc": hc,
                         "accumulate": 1 if index else 0,
+                        # The last range finishes every Q tile left: its dQ GEMM writes BF16 dQ for all of them; an
+                        # earlier range writes it for the tiles whose key range it ends.
+                        "finalize": 2 if index == len(plan["ranges"]) - 1 else 1,
                     }
                     _launch(_MAIN_STAGE[mode], at, dims, device_index, **chunk)
                     _launch("bwd_dq", at, dims, device_index, **chunk)
@@ -884,9 +895,8 @@ def cake_gqa_nondet_train_backward(
                 dims,
                 device_index,
             )
-        _launch(
-            "bwd_post", {**common, "dQ_accum": dq_accum, "dQ": dq}, dims, device_index
-        )
+        if dst is not dq:
+            dq.copy_(dst)
     return dq, dk_out, dv_out
 
 

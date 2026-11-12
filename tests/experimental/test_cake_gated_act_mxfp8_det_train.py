@@ -19,7 +19,7 @@ Tests for the Cake fused SwiGLU + MXFP8 quantization training kernels
 Every output byte -- the E4M3 codes of the rowwise and colwise values and the
 E8M0 scale bytes in the swizzled 128 x 4 layout -- is compared exactly, with no
 tolerance, against a plain-torch reference of the same math
-(``tests/test_helpers/cake_gated_act_mxfp8_det_train_reference.py``).  Every
+(``tests/experimental/test_helpers/cake_gated_act_mxfp8_det_train_reference.py``).  Every
 program of every route (forward / backward x rowwise / colwise / both) on the
 device's architecture runs directly, whatever the selection rule would pick, on
 unit normals, block-scaled normals, special values (NaN, Inf, zero and
@@ -35,7 +35,7 @@ CUDA Graph replay, the absence of rebuilds on a changed shape and the
 ``build.json`` contract.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 ``flashinfer.cake_gated_act_mxfp8_det_train`` facade is covered by
@@ -50,8 +50,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers import cake_gated_act_mxfp8_det_train_reference as reference
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers import (
+    cake_gated_act_mxfp8_det_train_reference as reference,
+)
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_gated_act_mxfp8_det_train")
 cake_build = cake_package("cake_gated_act_mxfp8_det_train", "cake_build")
@@ -65,19 +67,25 @@ ROUTES = {
     "bwd_col": (True, False, True),
     "bwd_both": (True, True, True),
 }
-# Entry-point shapes (M, K): M * K = 2^14, 2^16, 2^21, 2^22, 2^23, 2^24, 2^25,
-# 2^26 and 2^28, at which the selection rule picks every program of each route
-# on each architecture.
+# Entry-point shapes (M, K): M * K = 2^14, 2^16, 2^17, 2^19, 2^21, 3 * 2^20,
+# 2^22, 3 * 2^21, 2^23, 2^24, 2^25, 7 * 2^23, 2^26, 2^28 and 2^29, at which the
+# selection rule picks every program of each route on each architecture.
 ENTRY_SHAPES = (
     (128, 128),
     (256, 256),
+    (256, 512),
+    (512, 1024),
     (2048, 1024),
+    (1536, 2048),
     (2048, 2048),
+    (3072, 2048),
     (4096, 2048),
     (4096, 4096),
     (8192, 4096),
+    (7168, 8192),
     (8192, 8192),
     (32768, 8192),
+    (65536, 8192),
 )
 # (M, K): one tile row of scale tiles; odd counts of 128-column scale tiles.
 PROGRAM_SHAPES = ((128, 128), (256, 384), (384, 256))

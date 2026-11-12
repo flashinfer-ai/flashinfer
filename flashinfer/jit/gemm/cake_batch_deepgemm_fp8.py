@@ -621,6 +621,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan1",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_batch_deepgemm_fp8_927fea695cd92359d999": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_927fea695cd92359d999",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_927fea695cd92359d999_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_927fea695cd92359d999_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_batch_deepgemm_fp8_929a5561abc99caa7f4f": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_929a5561abc99caa7f4f",
         "sources": [
@@ -1017,6 +1029,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan1",
         "arches": ["sm_107a"],
     },
+    "cake_batch_deepgemm_fp8_f11e92be540f2e9e1ca1": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_f11e92be540f2e9e1ca1",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_f11e92be540f2e9e1ca1_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_f11e92be540f2e9e1ca1_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_batch_deepgemm_fp8_f239d5b14db9706be968": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_f239d5b14db9706be968",
         "sources": [
@@ -1344,6 +1368,14 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_90284e378e31f0382475",
     },
+    "cake_batch_deepgemm_fp8_927fea695cd92359d999_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_927fea695cd92359d999",
+    },
+    "cake_batch_deepgemm_fp8_927fea695cd92359d999_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_927fea695cd92359d999",
+    },
     "cake_batch_deepgemm_fp8_929a5561abc99caa7f4f_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_batch_deepgemm_fp8_929a5561abc99caa7f4f",
@@ -1539,6 +1571,14 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_batch_deepgemm_fp8_eeb77812570514381d69_sm_107a": {
         "arch": "sm_107a",
         "program": "cake_batch_deepgemm_fp8_eeb77812570514381d69",
+    },
+    "cake_batch_deepgemm_fp8_f11e92be540f2e9e1ca1_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_f11e92be540f2e9e1ca1",
+    },
+    "cake_batch_deepgemm_fp8_f11e92be540f2e9e1ca1_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_f11e92be540f2e9e1ca1",
     },
     "cake_batch_deepgemm_fp8_f239d5b14db9706be968_sm_100a": {
         "arch": "sm_100a",
@@ -2126,15 +2166,39 @@ _SM107A_MMSETUP_TWINS: dict[str, tuple[str, int, int | None]] = {
 }
 
 
+# SM100a / SM103a masked_m setup twins (148 / 152 SMs), the same form: an N=512
+# K=128 key with at least ``b_min`` groups whose route picks the BLOCK_N 192
+# masked stage runs its twin (measured faster on B200 and GB300).
+_SM100A_SM103A_MMSETUP_NK = (512, 128)
+_SM100A_SM103A_MMSETUP_TWINS: dict[str, tuple[str, int, int | None]] = {
+    # BLOCK_N 192, four stages, K tile 128.
+    "cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9": (
+        "cake_batch_deepgemm_fp8_f11e92be540f2e9e1ca1",
+        64,
+        None,
+    ),
+}
+
+# Per architecture: the (N, K) of its masked_m setup twins and their table.
+_MMSETUP_TABLES: dict[
+    str, tuple[tuple[int, int], dict[str, tuple[str, int, int | None]]]
+] = {
+    "sm_100a": (_SM100A_SM103A_MMSETUP_NK, _SM100A_SM103A_MMSETUP_TWINS),
+    "sm_103a": (_SM100A_SM103A_MMSETUP_NK, _SM100A_SM103A_MMSETUP_TWINS),
+    "sm_107a": (_SM107A_MMSETUP_NK, _SM107A_MMSETUP_TWINS),
+}
+
+
 def _mmsetup_twin(
     arch: str, B: int, N: int, K: int, stages: tuple[tuple[Any, ...], ...]
 ) -> tuple[tuple[Any, ...], ...] | None:
     """``stages`` with the masked_m setup twin in place of its parent
-    (``_SM107A_MMSETUP_TWINS``), or ``None`` when the key keeps the parent."""
-    if arch != "sm_107a" or (N, K) != _SM107A_MMSETUP_NK or len(stages) != 1:
+    (``_MMSETUP_TABLES``), or ``None`` when the key keeps the parent."""
+    table = _MMSETUP_TABLES.get(arch)
+    if table is None or table[0] != (N, K) or len(stages) != 1:
         return None
     stage = stages[0]
-    twin = _SM107A_MMSETUP_TWINS.get(stage[0]) if stage[1] == "masked_bn" else None
+    twin = table[1].get(stage[0]) if stage[1] == "masked_bn" else None
     if twin is None:
         return None
     program, b_min, b_max = twin
@@ -2211,13 +2275,14 @@ _ROUTES: tuple[_Route, ...] = (
            parent="seed_swap_bm"),
     # The N=512, K=128 geometry, by B, CTA = B * ceil(expected_m / 128) and M. A
     # one-shot n512_k128 grid covers every (group, M tile, N tile) a masked_m <= M
-    # reaches, and M > 1024 takes the persistent masked_bn programs; expected_m only
-    # selects the route.
+    # reaches, and M > 1024 takes the persistent masked_bn programs (with at most
+    # eight CTAs, the masked_m-once form of the BLOCK_N 32 eight-stage build);
+    # expected_m only selects the route.
     _bcta("seed_n512_k128__b1_bn32", (512, 128), (1, 1), (None, 7),
           ("cake_batch_deepgemm_fp8_c580972984193a63c3c2", "n512_k128", 32, "grid_max"),
           m=(None, 1024)),
     _bcta("seed_n512_k128__b1_mbn32", (512, 128), (1, 1), (None, 7),
-          ("cake_batch_deepgemm_fp8_929a5561abc99caa7f4f", "masked_bn", 32, 128, "grid_m"),
+          ("cake_batch_deepgemm_fp8_927fea695cd92359d999", "masked_bn", 32, 128, "grid_m"),
           m=(1025, None)),
     _bcta("seed_n512_k128__b1_bn192", (512, 128), (1, 1), (8, None),
           ("cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9", "masked_bn", 192, 128)),
@@ -2225,7 +2290,7 @@ _ROUTES: tuple[_Route, ...] = (
           ("cake_batch_deepgemm_fp8_8d6890e370790c5f11f1", "n512_k128", 32, "grid_max"),
           m=(None, 1024)),
     _bcta("seed_n512_k128__b2_8_mbn32", (512, 128), (2, 8), (None, 8),
-          ("cake_batch_deepgemm_fp8_929a5561abc99caa7f4f", "masked_bn", 32, 128, "grid_m"),
+          ("cake_batch_deepgemm_fp8_927fea695cd92359d999", "masked_bn", 32, 128, "grid_m"),
           m=(1025, None)),
     _bcta("seed_n512_k128__b2_8_bn128", (512, 128), (2, 8), (9, 32),
           ("cake_batch_deepgemm_fp8_c1541da977c9a379e49b", "masked_bn", 128, 128)),
@@ -2706,8 +2771,8 @@ def select(
     """The first table row of ``arch`` that matches, as a :class:`RoutePlan`; ``None`` = named gap.
 
     ``sm_count`` is the SM count the table was exported for (the ``DISPATCH_TABLES``
-    key); it only enters the launch grids.  An SM107a masked_m setup twin
-    (``_SM107A_MMSETUP_TWINS``) takes its parent's stage on its keys.
+    key); it only enters the launch grids.  A masked_m setup twin
+    (``_MMSETUP_TABLES``) takes its parent's stage on its keys.
     """
     for row in _TABLE[arch]:
         if _matches(row, arch, B, M, N, K, expected_m):

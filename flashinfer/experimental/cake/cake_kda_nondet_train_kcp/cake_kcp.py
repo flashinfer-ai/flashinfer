@@ -571,6 +571,15 @@ HOST_TRIM_DEFAULT = (
 # (the A/B record).  The same kernels with the same arguments but data pointers in the same order: bitwise.
 DEFAULT_WS_VALUES = (0, 1)
 DEFAULT_WS_DEFAULT = 1
+# Kept-set pool: 1 (shipped) = the kept set of a checkpoint pass of a workspace=None call (the hand-off's tape set or
+# rows set, :func:`_tape_alloc`) comes from a package-private CUDA memory pool per device (:func:`_kept_pool`), each
+# tensor's leading extent rounded up to 16 steps per power of two (:func:`_kept_extent`), so the set that lives from a
+# recompute to the node's backward never splits a block the caching allocator's default pool frees and reallocates
+# around it (the arena of a workspace=None call); a caller-held workspace's arena is not freed per call, so its calls
+# keep the default pool; 0 = the default pool everywhere (the previous form), via _kcp_test_knobs only (the A/B
+# record).  Placement only, the same kernels with the same arguments but data pointers: bitwise.
+KEPT_POOLS = (0, 1)
+KEPT_POOL_DEFAULT = 1
 # Forward prologue (fwd_prologue): "trim2" (shipped) = "trim" plus the intra record's table rule once per plan and
 # path (:func:`_intra_writes_tables_kept`) and no second capability check of a default call's in-kernel Q / K L2 norm
 # on the device the first one checked; "trim" = the forward's operand checks once per operand signature
@@ -658,6 +667,7 @@ P2_KNOBS = {  # knob -> admitted values
     "saved_carry": SAVED_CARRIES,
     "fwd_o_fuse": FWD_O_FUSES,
     "default_ws": DEFAULT_WS_VALUES,
+    "kept_pool": KEPT_POOLS,
     "fwd_prologue": FWD_PROLOGUES,
 }
 # Shipped defaults of the schedule / fused-walk pair (adopted together, the keep
@@ -5077,7 +5087,10 @@ class CakeKDANondetKcpOptions:
     the saved set and the saved-mode backward reads it; ``0`` = that backward re-walks the forward carries -- the same
     remaining launches, bitwise; ``_kcp_test_knobs`` only), ``default_ws`` (``1`` shipped: a ``workspace=None`` call
     runs on a workspace the package keeps, whose device storage lives for the call alone, :func:`_default_acquire`;
-    ``0`` = a new workspace per call, the same launches, bitwise; ``_kcp_test_knobs`` only), ``bwd_tape_order``
+    ``0`` = a new workspace per call, the same launches, bitwise; ``_kcp_test_knobs`` only), ``kept_pool`` (``1``
+    shipped: a checkpoint pass's kept set of a ``workspace=None`` call comes from the package-private pool of its
+    device, :func:`_kept_pool`; ``0`` =
+    the caching allocator's default pool, the same launches, bitwise; ``_kcp_test_knobs`` only), ``bwd_tape_order``
     (``"under_b1"`` shipped: the saved-mode backward's K1 tape replay after the b1 issue where :func:`_tape_order`
     admits it, else before ``kcp_dav``; ``"first"`` = before ``kcp_dav`` in every backward, the same launches,
     bitwise; ``_kcp_test_knobs`` only), ``bwd_k3_stream`` (``"side"`` shipped: the backward's dm-form K3 on the side
@@ -5121,6 +5134,7 @@ class CakeKDANondetKcpOptions:
     saved_carry: int = SAVED_CARRY_DEFAULT  # shipped 1 = the forward's carry plane stays in the saved set and the saved-mode backward skips the P > 1 re-walk + carry merges; 0 = the re-walk, _kcp_test_knobs only
     fwd_o_fuse: int = FWD_O_FUSE_DEFAULT  # shipped 1 = the forward that keeps no tape runs kcp_fwdh_o (out, no tape) in place of the tape walk(s) + fwd_o; 0 = the tape walk(s) + fwd_o, _kcp_test_knobs only
     default_ws: int = DEFAULT_WS_DEFAULT  # shipped 1 = a workspace=None call runs on a package-kept workspace (host objects kept, device storage per call); 0 = a new workspace per call, _kcp_test_knobs only
+    kept_pool: int = KEPT_POOL_DEFAULT  # shipped 1 = a checkpoint pass's kept set of a workspace=None call comes from the package-private pool of its device (_kept_pool); 0 = the default pool, _kcp_test_knobs only
     fwd_prologue: str = FWD_PROLOGUE_DEFAULT  # "trim2" shipped = "trim" with less host work before the first launch; "trim" = the operand checks once per operand signature; "base" = the previous host prologue; the same checks and launches (FWD_PROLOGUES), _kcp_test_knobs only
 
     def check(self) -> CakeKDANondetKcpOptions:
@@ -5253,6 +5267,7 @@ def _validate_options(kwargs: dict[str, Any]) -> CakeKDANondetKcpOptions:
                         "saved_carry",
                         "fwd_o_fuse",
                         "default_ws",
+                        "kept_pool",
                     )
                     else str(raw.pop(key))
                 )
@@ -5710,6 +5725,9 @@ def _record(kind: str, call: CakeKDANondetKcpCall) -> None:
         # bytes (cake_kda_nondet_train_kcp_handoff_bytes(..., saved_rows=...)): the set actually kept, not the request
         "saved_rows": call.scratch.get("saved_rows"),
         "saved_rows_bytes": call.scratch.get("saved_rows_bytes"),
+        # whether the forward's kept set (the tape set or a rows set) came from the package-private pool of its device
+        # (_kept_pool); None without a kept set
+        "kept_pool": call.scratch.get("kept_pool"),
         # the place of a backward's K1 tape replay ("first" / "under_b1": the order run, _tape_order; None on a forward)
         # and why a backward under the knob value "under_b1" ran "first" (None otherwise)
         "bwd_tape_order": call.scratch.get("bwd_tape_order"),
@@ -6383,15 +6401,132 @@ def _tape_shapes(call: CakeKDANondetKcpCall) -> dict[str, tuple[int, ...]]:
     }
 
 
+# The package-private pools of the checkpoint passes' kept sets (the knob kept_pool, shipped 1): one torch.cuda.MemPool
+# per device index, made at the first kept set of a checkpoint pass on that device and kept until
+# default_workspace_cache_clear() drops it.  A recompute
+# keeps its set from inside the call -- whose workspace=None arena is allocated at the call's start and freed at its end
+# (_default_acquire / _default_release) -- to the node's backward, which then allocates the larger backward arena.  In
+# the caching allocator's default pool the set lands in the remainder of the block the forward arena was cut from, so
+# that block cannot serve the backward arena and the reserved memory grows by up to an arena per call (measured on
+# GB300, CP4, H = 64, 65536 tokens per pack: +5.0 GiB steady with the gate, +10.1 GiB with the raw gate, the allocated
+# peak +0.8 GiB).  In its own pool the set reuses its own blocks: the pool holds the largest set kept at a time (the wy
+# rows: 768 B per internal token-head, about 0.8 GiB per rank at 16384 tokens and H = 64), which the default pool's
+# other allocations cannot use and torch.cuda.empty_cache() does not release while the pool lives (after
+# default_workspace_cache_clear() it does).  The row count of a set changes from pack to pack (each document's rows are padded to
+# whole chunks), and a block cut for one pack's rows does not fit a slightly larger set; so each kept tensor's block is
+# cut for its leading extent rounded up to 16 steps per power of two (:func:`_kept_extent`, at most 1/16 more), so packs
+# of nearby sizes take the same blocks (_kept_tensors).  A caller-held workspace's arena stays allocated between calls,
+# so nothing is freed and reallocated around its kept set: its calls keep the default pool, whose blocks the set then
+# shares with the step's other allocations.  A saving forward outside a checkpoint (saved_rows="intra" / "wy" on a
+# plain autograd call) keeps its rows in the default pool: they live until each layer's backward, and their blocks then
+# serve the next step's other allocations.
+# Host time: the kept sets are allocated where the GPU waits for the host (a recompute's first launches follow the
+# call's host work with nothing queued), so _tape_alloc makes the begin / end / release calls of use_mem_pool itself
+# (no generator, no second capture check) and rounds a tensor only when its rows exceed the largest extent rounded so
+# far for its name and trailing shape (_KEPT_EXTENTS) or the previous tensor of that key is still alive (_KEPT_LAST):
+# otherwise the freed block of that extent serves the exact shape.  Measured on GB300 (alloc, 5-tensor tape set /
+# 2-tensor rows set): default pool 7.3 / 3.0 us, use_mem_pool + rounding + resize_ 19.9 / 11.2 us, this 9.0 / 4.4 us.
+_MEM_POOL = getattr(torch.cuda, "MemPool", None)
+_USE_MEM_POOL = getattr(torch.cuda, "use_mem_pool", None)
+_POOL_BEGIN = getattr(torch._C, "_cuda_beginAllocateCurrentThreadToPool", None)
+_POOL_END = getattr(torch._C, "_cuda_endAllocateToPool", None)
+_POOL_RELEASE = getattr(torch._C, "_cuda_releasePool", None)
+_KEPT_POOLS: dict[int, Any] = {}
+# per (device index, buffer name, trailing shape): the largest leading extent rounded so far in the device's pool
+_KEPT_EXTENTS: dict[tuple, int] = {}
+# per the same key: a weak reference to the last tensor allocated (a live one keeps its block)
+_KEPT_LAST: dict[tuple, Any] = {}
+
+
+def _kept_extent(n: int) -> int:
+    """The leading extent a kept tensor of ``n`` rows (token rows; chunks for the ``h`` tape) is allocated with in the
+    package-private pool: ``n`` rounded up to a multiple of ``2 ** (bit_length(n) - 5)`` (16 steps per power of two,
+    at most 1/16 more), so the sets of packs of nearby sizes take the same blocks."""
+    step = 1 << max(n.bit_length() - 5, 0)
+    return -(-n // step) * step
+
+
+def _kept_pool(call: CakeKDANondetKcpCall) -> Any:
+    """The pool the kept set of ``call`` comes from: the package-private pool of its device (:data:`_KEPT_POOLS`)
+    when the knob ``kept_pool`` is 1, the call has no caller-held workspace (``scratch["default_ws"]`` set: a
+    ``workspace=None`` call), this thread runs a checkpoint pass (:func:`_checkpoint_pass`) outside a CUDA-graph
+    capture and the torch has ``torch.cuda.MemPool``; ``None`` (the caching allocator's default pool) otherwise.
+    Placement only: the launches and their arguments but the data pointers are the same."""
+    if (
+        not call.opts.kept_pool
+        or _MEM_POOL is None
+        or _USE_MEM_POOL is None
+        or call.device.type != "cuda"
+        or call.scratch.get("default_ws") is None
+    ):
+        return None
+    if torch.cuda.is_current_stream_capturing() or _checkpoint_pass() is None:
+        return None
+    index = call.device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    pool = _KEPT_POOLS.get(index)
+    if pool is None:
+        pool = _KEPT_POOLS.setdefault(index, _MEM_POOL())
+    return pool
+
+
+def _kept_tensors(
+    index: int,
+    names: tuple[str, ...],
+    shapes: dict[str, tuple[int, ...]],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """The kept tensors ``names`` of ``shapes``, allocated while the pool of device ``index`` is active: the exact
+    shape when its rows fit the largest extent rounded so far for the key (:data:`_KEPT_EXTENTS`) and the key's
+    previous tensor is freed (:data:`_KEPT_LAST`), so the freed block of that extent serves it; else the leading
+    extent rounded up (:func:`_kept_extent`) and resized in place to the rows (the storage keeps the rounded size; a
+    contiguous base tensor, not a ``[:n]`` view of a temporary base, which costs about 4 us of host time)."""
+    tape = {}
+    for n in names:
+        shape = shapes[n]
+        rows, *rest = shape
+        key = (index, n, *rest)
+        last = _KEPT_LAST.get(key)
+        if rows <= _KEPT_EXTENTS.get(key, -1) and (last is None or last() is None):
+            t = _alloc(shape, torch.bfloat16, device)
+        else:
+            extent = _kept_extent(rows)
+            if extent > _KEPT_EXTENTS.get(key, -1):
+                _KEPT_EXTENTS[key] = extent
+            t = _alloc((extent, *rest), torch.bfloat16, device).resize_(shape)
+        _KEPT_LAST[key] = weakref.ref(t)
+        tape[n] = t
+    return tape
+
+
 def _tape_alloc(
     call: CakeKDANondetKcpCall,
     names: tuple[str, ...] = cake_kcp_plan.KCP_HANDOFF_BUFFERS,
 ) -> dict[str, torch.Tensor]:
     """Fresh per-call tensors of the buffers ``names`` (the tape set by default, or a rows set of
     :data:`cake_kcp_plan.KCP_SAVED_ROWS`; every element a launch of the forward reads is written by one of the
-    forward's own launches; :data:`_HANDOFF_POISON` NaN-fills them first, for the tests)."""
+    forward's own launches; :data:`_HANDOFF_POISON` NaN-fills them first, for the tests), from the pool
+    :func:`_kept_pool` picks (``scratch["kept_pool"]``: whether it was the package-private one)."""
     shapes = _tape_shapes(call)
-    tape = {n: _alloc(shapes[n], torch.bfloat16, call.device) for n in names}
+    pool = _kept_pool(call)
+    call.scratch["kept_pool"] = pool is not None
+    if pool is None:
+        tape = {n: _alloc(shapes[n], torch.bfloat16, call.device) for n in names}
+    else:
+        index = call.device.index
+        if index is None:
+            index = torch.cuda.current_device()
+        if _POOL_BEGIN is None or _POOL_END is None or _POOL_RELEASE is None:
+            with _USE_MEM_POOL(pool, call.device):
+                tape = _kept_tensors(index, names, shapes, call.device)
+        else:  # the calls use_mem_pool makes; _kept_pool returns no pool under a capture
+            _POOL_BEGIN(index, pool.id)
+            try:
+                tape = _kept_tensors(index, names, shapes, call.device)
+            finally:
+                _POOL_END(index, pool.id)
+                _POOL_RELEASE(index, pool.id)
     if _HANDOFF_POISON:
         for t in tape.values():
             t.fill_(float("nan"))
@@ -7677,10 +7812,14 @@ def _default_release(call: CakeKDANondetKcpCall) -> None:
 
 
 def default_workspace_cache_clear() -> int:
-    """Drop every workspace the package keeps for ``workspace=None`` calls and the kept checks of their in-kernel
-    Q / K L2 norm; returns the number of workspaces dropped.  They hold no device memory between calls but their
-    scratch table buffers (KiB, on the rows whose intra record writes the chunk tables), which go back to the
-    caching allocator; the next call of each key builds a new workspace.  ``DEFAULT_WS_STATS`` is left as it is.
+    """Drop every workspace the package keeps for ``workspace=None`` calls, the kept checks of their in-kernel
+    Q / K L2 norm and the package-private pools their checkpoint passes keep the kept set in (:data:`_KEPT_POOLS`);
+    returns the number of workspaces dropped.  The workspaces hold no device memory between calls but their scratch
+    table buffers (KiB, on the rows whose intra record writes the chunk tables), which go back to the caching
+    allocator; the next call of each key builds a new workspace.  A pool keeps its blocks (about one kept set per
+    device) reserved between calls and ``torch.cuda.empty_cache()`` does not release the blocks of a live pool:
+    after the pools are dropped it does (a kept set alive at that moment keeps its blocks until it is freed), and
+    the next checkpoint pass of a ``workspace=None`` call makes a new pool.  ``DEFAULT_WS_STATS`` is left as it is.
     :func:`set_backend` calls it.  One ``popitem`` per key, each atomic, so a release on another thread meanwhile
     never breaks the loop."""
     n = 0
@@ -7690,6 +7829,9 @@ def default_workspace_cache_clear() -> int:
         except KeyError:  # empty
             break
     _L2N_DEFAULT_OK.clear()
+    _KEPT_POOLS.clear()
+    _KEPT_EXTENTS.clear()
+    _KEPT_LAST.clear()
     return n
 
 
@@ -9364,6 +9506,13 @@ def _handoff_phase(*inputs: Any) -> str | None:
             break
     else:
         return None
+    return _checkpoint_pass()
+
+
+def _checkpoint_pass() -> str | None:
+    """The checkpoint pass of this thread from its innermost default saved-tensor hooks and graph task alone
+    (:func:`_handoff_phase` without its grad-mode and input checks): ``"original"``, ``"recompute"``,
+    ``"reentrant"`` or ``None``."""
     if _TOP_HOOKS is None:
         return None
     try:

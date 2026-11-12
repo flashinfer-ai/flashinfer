@@ -554,7 +554,3 @@ On main, #8924 already removed the module `flashinfer.grouped_mm.cake`, the name
 | `flashinfer.experimental.cake_gqa_train.default_workspace` | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_gqa_nondet_train.cake_backend.default_workspace` (internal; not exported by the package or the facade). Calls with `workspace=None` use it; `flashinfer.cake_gqa_nondet_train.cake_gqa_nondet_train_workspace` makes a workspace to pass | #9054 |
 | `flashinfer.experimental.cake_gqa_train.cake_backend.{varlen_gqa_attention, gqa_attention_fwd, gqa_attention_bwd, workspace_bytes}` | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_gqa_nondet_train.cake_backend.{cake_gqa_nondet, cake_gqa_nondet_train_forward, cake_gqa_nondet_train_backward, cake_gqa_nondet_train_workspace_bytes}` | #8939 |
 | `flashinfer.experimental.cake_gqa_train.cake_backend.{VarlenGQAAttentionFunction, Workspace, DkvAccSource}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_gqa_nondet_train.{CakeGQANondetFunction, CakeGQANondetWorkspace, CakeGQANondetDkvAccSource}` | #8939 |
-
-## Reserved names
-
-- `flashinfer.cake_dsa_sparse_attention_det_train`: DSA sparse attention `det`, not implemented.

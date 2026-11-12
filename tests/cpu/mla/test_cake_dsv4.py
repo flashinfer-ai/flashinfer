@@ -1334,8 +1334,10 @@ def test_sm107a_registers_the_fp8_decode_route_only():
         "fp8_h64_prefill_source_persistent_m64_multi_tile",
         "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4",
         "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4_bcl",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4_l2pf",
         "fp8_lowhead_prefill",
         "fp8_lowhead_prefill_overlap",
+        "fp8_lowhead_prefill_vblock",
     }
     for spec in _ARCH_REGISTRATIONS["sm_107a"]["variants"].values():
         assert all(source.startswith("sm_107a/") for source in spec["sources"])
@@ -2311,6 +2313,14 @@ _PERSISTENT_PLAN = _plan(
     ("parameter", "max_q_len"),
     ("parameter", "batch_size"),
 )
+# The L2 prefetch sibling's stand-in plan: the persistent plan with the
+# compressed-KV pool and its row count before the grid.
+_L2PF_PLAN = [
+    *_PERSISTENT_PLAN[:-3],
+    ("buffer", "compressed_KV_cache"),
+    ("parameter", "compressed_KV_rows"),
+    *_PERSISTENT_PLAN[-3:],
+]
 
 
 def _run_fake_persistent_fp8_h128(monkeypatch, *, cum_seq_lens_q, max_q_len):
@@ -3307,6 +3317,7 @@ def _run_fake_lowhead_swa_fp8(monkeypatch, *, arch, num_heads, batch_size, q_len
         for route in (
             "fp8_lowhead_prefill",
             "fp8_lowhead_prefill_overlap",
+            "fp8_lowhead_prefill_vblock",
             "fp8_h64_prefill_source_persistent_m64",
             "fp8_h64_prefill_source_persistent_m64_multi_tile",
         )
@@ -4039,8 +4050,9 @@ def test_sibling_gates_know_every_oversized_binding():
     """The programs whose generated bindings launch in CUDA 13.4's oversized
     shared-memory mode are exactly the K=64 and four-stage siblings the gates
     hold, the SM107 split producer the K=64 gate holds and the four-stage
-    sibling's TMEM-batch sibling where it has a program of its own (it
-    launches only where the four-stage gate passed), each with the dynamic
+    sibling's TMEM-batch and L2 prefetch siblings where they have programs of
+    their own (they launch only where the four-stage gate passed), each with
+    the dynamic
     shared memory its gate compares with the device's oversized ceiling; every
     other program, including those the gates fall back to, launches in the
     standard mode."""
@@ -4072,6 +4084,13 @@ def test_sibling_gates_know_every_oversized_binding():
             bcl = VARIANTS[arch].get(f"{route}_kv4_bcl", four_stage)
             if bcl != four_stage:
                 gated[bcl] = smem
+    # So does the L2 prefetch sibling (cake._kv4_l2pf_variant).
+    for arch, smem in cake._KV4_SIBLING_OVERSIZED_SMEM_BYTES.items():
+        for route in cake._KV4_SIBLING_ROUTES:
+            four_stage = VARIANTS[arch][f"{route}_kv4"]
+            l2pf = VARIANTS[arch].get(f"{route}_kv4_l2pf", four_stage)
+            if l2pf != four_stage:
+                gated[l2pf] = smem
     oversized = {}
     for path in sorted(_get_csrc_dir().glob("*/*_binding.cu")):
         text = path.read_text(encoding="utf-8")
@@ -4625,12 +4644,26 @@ def _bf16_out_at(rows, num_heads, offset):
 
 
 def _run_fake_h64_decode_fp8(
-    monkeypatch, *, arch, width, tokens, workspace=None, out=None, max_q_len=1
+    monkeypatch,
+    *,
+    arch,
+    width,
+    tokens,
+    workspace=None,
+    out=None,
+    max_q_len=1,
+    sm_count=208,
+    page=64,
+    batch_size=None,
+    cum_seq_lens_q=None,
 ):
     """Drive run_cake_dsv4 on CPU tensors for a dense FP8/H64 decode call of
     ``tokens`` rows in requests of ``max_q_len`` rows (default one) over
-    ``width`` keys on ``arch`` (208 SMs); return the launched programs, their
-    bound arguments and the output."""
+    ``width`` keys on ``arch`` (``sm_count`` SMs, default 208), the
+    compressed cache on pages of ``page`` rows (default 64); return the
+    launched programs, their bound arguments and the output.
+    ``batch_size`` (default ``tokens // max_q_len``) is the request count
+    and ``cum_seq_lens_q`` the request offsets of a ragged call."""
     plans = {
         route: _PERSISTENT_PLAN
         for route in (
@@ -4641,6 +4674,9 @@ def _run_fake_h64_decode_fp8(
             f"{_M64_MULTI_TILE_ROUTE}_kv4_bcl",
         )
     }
+    plans[f"{_M64_MULTI_TILE_ROUTE}_kv4_l2pf"] = _L2PF_PLAN
+    if batch_size is None:
+        batch_size = tokens // max_q_len
     recorder = _install_fake_variants(monkeypatch, plans)
     programs = []
 
@@ -4650,7 +4686,7 @@ def _run_fake_h64_decode_fp8(
 
     monkeypatch.setattr(cake, "_variant_module", module)
     monkeypatch.setattr(cake, "_target_arch", lambda device: arch)
-    monkeypatch.setattr(cake, "_device_sm_count", lambda device: 208)
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: sm_count)
     table, lens = _combined_metadata(tokens, width - 128)
     if workspace is None:
         workspace = _aligned_u8(
@@ -4659,22 +4695,22 @@ def _run_fake_h64_decode_fp8(
     result = cake.run_cake_dsv4(
         query=torch.zeros((tokens, 64, 512), dtype=torch.float8_e4m3fn),
         swa_kv_cache=torch.zeros((4, 1, 256, 512), dtype=torch.float8_e4m3fn),
-        compressed_kv_cache=torch.zeros((4, 1, 64, 512), dtype=torch.float8_e4m3fn),
+        compressed_kv_cache=torch.zeros((4, 1, page, 512), dtype=torch.float8_e4m3fn),
         workspace_buffer=workspace,
         out=out,
         bmm1_scale=0.5,
         bmm2_scale=1.0,
         sinks=None,
         max_q_len=max_q_len,
-        cum_seq_lens_q=None,
-        seq_lens=torch.full((tokens // max_q_len,), 1000, dtype=torch.int32),
+        cum_seq_lens_q=cum_seq_lens_q,
+        seq_lens=torch.full((batch_size,), 1000, dtype=torch.int32),
         backend="cake",
         sparse_indices=table,
         sparse_topk_lens=lens,
     )
     calls = [
-        dict(zip((name for _, name in _PERSISTENT_PLAN), call, strict=True))
-        for call in recorder.calls
+        dict(zip((name for _, name in plans[program]), call, strict=True))
+        for program, call in zip(programs, recorder.calls, strict=True)
     ]
     return programs, calls, result
 
@@ -6594,6 +6630,7 @@ def test_h64_split_fallbacks_launch_the_route_as_main(
 
 _LOWHEAD_PREFILL_ROUTE = "fp8_lowhead_prefill"
 _OVERLAP_SIBLING = f"{_LOWHEAD_PREFILL_ROUTE}_overlap"
+_VBLOCK_SIBLING = f"{_LOWHEAD_PREFILL_ROUTE}_vblock"
 _OVERLAP_TOKENS = (1, 12, 48, 61, 62, 63, 64, 65, 72, 80, 104, 108)
 
 
@@ -6679,15 +6716,15 @@ def test_overlap_variant_needs_a_sibling_program_of_its_own(monkeypatch):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
-@pytest.mark.parametrize("tokens", [12, 64, 65, 108])
+@pytest.mark.parametrize("tokens", [12, 27, 28, 64, 65, 108])
 @pytest.mark.parametrize("enable_pdl", [False, True])
 def test_fp8_lowhead_prefill_launch_takes_the_overlap_sibling(
     monkeypatch, arch, tokens, enable_pdl
 ):
     """A low-head prefill launch on 216 SMs runs one CTA per work item over
-    two items per row with ``partials(1)``; SM107 runs it on the early-PV
-    sibling up to 64 rows and on the route's program above, with either PDL
-    switch."""
+    two items per row with ``partials(1)``; SM107 runs it on the V-block
+    sibling over four items per row up to 27 rows, on the early-PV sibling
+    up to 64 rows and on the route's program above, with either PDL switch."""
     monkeypatch.setattr(cake, "_device_sm_count", lambda device: _SM107_SM_COUNT)
     L = _RecordingLauncher(
         arch,
@@ -6704,7 +6741,10 @@ def test_fp8_lowhead_prefill_launch_takes_the_overlap_sibling(
         if arch == "sm_107a" and tokens <= 64
         else _LOWHEAD_PREFILL_ROUTE
     )
-    work = {"grid": (2 * tokens, 1, 1), "total_work_items": 2 * tokens}
+    items = 2 * tokens
+    if arch == "sm_107a" and tokens <= 27:
+        program, items = _VBLOCK_SIBLING, 4 * tokens
+    work = {"grid": (items, 1, 1), "total_work_items": items}
     assert L.calls == [(program, {**work, **L.partials(1)})]
 
 
@@ -7226,3 +7266,726 @@ def test_row_tiled_mtp_decode_chunks_pick_their_program_per_launch(monkeypatch):
     grids = [(c["grid_x"], c["grid_y"], c["grid_z"]) for c in calls]
     assert grids == [(120, 1, 1), (80, 1, 1)]
     assert [c["total_work_items"] for c in calls] == [120, 80]
+
+
+# --------------------------------------------------------------------------- #
+# TMEM-batch sibling: SM107's one-token decode window (c4, items 1152 wide)    #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.cpu_only
+def test_bcl_decode_window_bounds():
+    """One decode window: 64 heads, one-token requests over items 1152 wide
+    with compressed pages of 64 rows (the c4 layer), 176-208 rows, at most one
+    row per SM, on devices of 212 or 216 SMs."""
+    assert cake._KV4_BCL_DECODE_WINDOWS == {(1, 1152, 64): (176, 208)}
+    assert frozenset({212, 216}) == cake._KV4_BCL_DECODE_SM_COUNTS
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize("sm_count", [148, 208, 212, 216, 232])
+def test_four_stage_launches_take_the_bcl_sibling_in_its_decode_window(
+    monkeypatch, arch, sm_count
+):
+    """Where SM107 routes the TMEM-batch sibling to a program of its own, a
+    four-stage launch of a 64-head call of one-token requests over items 1152
+    wide with compressed pages of 64 rows takes it at 176-208 rows on 212 or
+    216 SMs.  The same launch on other SM counts, at 175 or 209 rows, with
+    compressed pages of 2 rows or of an unknown size, over other widths, of
+    two-token requests or of other head counts keeps the four-stage key, and
+    SM100 and SM103 keep it."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(jit, "VARIANTS", _bcl_variants())
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: sm_count)
+    own = arch == "sm_107a"
+    for num_heads in (32, 64, 128):
+        for max_q_len in (1, 2):
+            for sparse_topk in (1024, 1151, 1152, 1153):
+                for page in (None, 2, 64):
+                    for tokens in (144, 160, 175, 176, 177, 192, 207, 208, 209, 256):
+                        shape = dict(
+                            num_heads=num_heads,
+                            max_q_len=max_q_len,
+                            num_query_tokens=tokens,
+                            sparse_topk=sparse_topk,
+                        )
+                        takes = (
+                            own
+                            and num_heads == 64
+                            and max_q_len == 1
+                            and sparse_topk == 1152
+                            and page == 64
+                            and 176 <= tokens <= 208
+                            and tokens <= sm_count
+                            and sm_count in (212, 216)
+                        )
+                        variant = cake._kv4_bcl_variant(
+                            _KV4_SIBLING,
+                            arch=arch,
+                            device=_DEVICE,
+                            compressed_page_size=page,
+                            **shape,
+                        )
+                        expected = _BCL_SIBLING if takes else _KV4_SIBLING
+                        assert variant == expected, (shape, page)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_count,ceiling", [(208, 416), (212, 424), (216, 432)])
+@pytest.mark.parametrize("page", [None, 2, 64])
+def test_bcl_mtp_window_does_not_read_the_page_size(
+    monkeypatch, sm_count, ceiling, page
+):
+    """The MTP window (2-4 query tokens) takes the same launches whatever the
+    compressed page size, as before the decode window."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(jit, "VARIANTS", _bcl_variants())
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: sm_count)
+    for max_q_len in (2, 4):
+        for sparse_topk, tokens, takes in (
+            (640, 107, False),
+            (640, 108, True),
+            (768, ceiling, True),
+            (768, ceiling + 1, False),
+            (769, 120, False),
+            (1152, 192, False),
+        ):
+            variant = cake._kv4_bcl_variant(
+                _KV4_SIBLING,
+                arch="sm_107a",
+                device=_DEVICE,
+                num_heads=64,
+                max_q_len=max_q_len,
+                num_query_tokens=tokens,
+                sparse_topk=sparse_topk,
+                compressed_page_size=page,
+            )
+            expected = _BCL_SIBLING if takes else _KV4_SIBLING
+            assert variant == expected, (max_q_len, sparse_topk, tokens)
+
+
+@pytest.mark.cpu_only
+def test_bcl_decode_window_reads_the_sm_count_last(monkeypatch):
+    """A decode-window shape reads the device's SM count only once its rows
+    are in the window and SM107 routes the sibling to a program of its own;
+    shapes outside the window never read it."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    read = []
+
+    def sm_count(device):
+        read.append(device)
+        return _SM107_SM_COUNT
+
+    monkeypatch.setattr(jit, "VARIANTS", _bcl_variants())
+    monkeypatch.setattr(cake, "_device_sm_count", sm_count)
+    decode = dict(num_heads=64, max_q_len=1, sparse_topk=1152)
+    for tokens, page in ((175, 64), (209, 64), (192, 2), (192, None)):
+        variant = cake._kv4_bcl_variant(
+            _KV4_SIBLING,
+            arch="sm_107a",
+            device=_DEVICE,
+            num_query_tokens=tokens,
+            compressed_page_size=page,
+            **decode,
+        )
+        assert variant == _KV4_SIBLING, (tokens, page)
+    assert read == []
+    variant = cake._kv4_bcl_variant(
+        _KV4_SIBLING,
+        arch="sm_107a",
+        device=_DEVICE,
+        num_query_tokens=192,
+        compressed_page_size=64,
+        **decode,
+    )
+    assert variant == _BCL_SIBLING
+    assert read == [_DEVICE]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("page", [64, 2, None])
+def test_fp8_h64_m64_launch_takes_the_bcl_sibling_in_its_decode_window(
+    monkeypatch, page
+):
+    """On 216 SMs the multi-tile M64 launches of a 64-head call of one-token
+    requests over items 1152 wide run the TMEM-batch sibling at 176-208 rows
+    when the launch values carry compressed pages of 64 rows, over the
+    four-stage sibling's grid and partials; launch values with pages of 2 rows
+    or without a page size, and 175 or 209 rows, run the four-stage sibling."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(jit, "VARIANTS", _bcl_variants())
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: _SM107_SM_COUNT)
+    page_values = {} if page is None else {"compressed_page_size": page}
+    for tokens in (175, 176, 192, 208, 209):
+        L = _RecordingLauncher(
+            "sm_107a",
+            Q=torch.empty(0),
+            num_query_tokens=tokens,
+            num_heads=64,
+            sparse_topk=1152,
+            max_q_len=1,
+            **page_values,
+        )
+        cake._dispatch_route(_M64_MULTI_TILE_ROUTE, L)
+        window = page == 64 and 176 <= tokens <= 208
+        program = _BCL_SIBLING if window else _KV4_SIBLING
+        launch = {"grid": (tokens, 1, 1), "total_work_items": tokens}
+        assert L.calls == [(program, {**launch, **L.partials(1)})], tokens
+
+
+@pytest.mark.cpu_only
+def test_run_cake_dsv4_launches_the_bcl_sibling_in_its_decode_window(monkeypatch):
+    """run_cake_dsv4 on SM107 with the TMEM-batch sibling routed to a program
+    of its own: dense FP8/H64 one-token decode calls over items 1152 wide on
+    the multi-tile M64 route launch it at 176-208 rows with compressed pages
+    of 64 rows on 212 and 216 SMs, and the four-stage sibling at 175 and 209
+    rows, with compressed pages of 2 rows and on 208 SMs, one CTA per row
+    either way."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(jit, "VARIANTS", _bcl_variants())
+    for sm_count, page, tokens, program in (
+        (216, 64, 176, _BCL_SIBLING),
+        (216, 64, 192, _BCL_SIBLING),
+        (216, 64, 208, _BCL_SIBLING),
+        (212, 64, 176, _BCL_SIBLING),
+        (212, 64, 208, _BCL_SIBLING),
+        (216, 64, 175, _KV4_SIBLING),
+        (216, 64, 209, _KV4_SIBLING),
+        (212, 64, 209, _KV4_SIBLING),
+        (216, 2, 192, _KV4_SIBLING),
+        (212, 2, 192, _KV4_SIBLING),
+        (208, 64, 192, _KV4_SIBLING),
+        (208, 64, 208, _KV4_SIBLING),
+    ):
+        shape = (sm_count, page, tokens)
+        programs, calls, _ = _run_fake_h64_decode_fp8(
+            monkeypatch,
+            arch="sm_107a",
+            width=1152,
+            tokens=tokens,
+            sm_count=sm_count,
+            page=page,
+        )
+        (bound,) = calls
+        assert programs == [program], shape
+        assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (tokens, 1, 1)
+        assert bound["total_work_items"] == bound["num_query_tokens"] == tokens
+        assert bound["max_q_len"] == 1, shape
+
+
+# --------------------------------------------------------------------------- #
+# L2 prefetch sibling: SM107's four-stage M64 program for few-row c4 decode   #
+# --------------------------------------------------------------------------- #
+
+_L2PF_SIBLING = f"{_KV4_SIBLING}_l2pf"
+# The delivered rule: (sparse_topk, max_q_len) -> most rows of the launch.
+_L2PF_CEILINGS = {(640, 1): 47, (640, 4): 64, (512, 1): 41, (512, 4): 56}
+
+
+def _l2pf_variants():
+    """The registry with SM107's L2 prefetch and TMEM-batch siblings routed to
+    programs of their own (stand-in names); every other entry is the
+    registry's."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    table = {arch: dict(variants) for arch, variants in jit.VARIANTS.items()}
+    table["sm_107a"][_BCL_SIBLING] = "cake_dsv4_tmem_batch"
+    table["sm_107a"][_L2PF_SIBLING] = "cake_dsv4_l2_prefetch"
+    return table
+
+
+def _l2pf_takes(
+    arch, sm_count, *, num_heads, max_q_len, num_query_tokens, sparse_topk, batch, page
+):
+    """The delivered rule restated: SM107 with the sibling routed to a program
+    of its own, 64 heads, compressed pages of 64 rows, a (width, request
+    length) of the rule at most its rows, a uniform launch past one-token
+    requests, 212 or 216 SMs and at most one row per SM."""
+    ceiling = _L2PF_CEILINGS.get((sparse_topk, max_q_len))
+    uniform = batch is not None and num_query_tokens == batch * max_q_len
+    return (
+        arch == "sm_107a"
+        and num_heads == 64
+        and page == 64
+        and ceiling is not None
+        and num_query_tokens <= ceiling
+        and (max_q_len == 1 or uniform)
+        and sm_count in (212, 216)
+        and num_query_tokens <= sm_count
+    )
+
+
+@pytest.mark.cpu_only
+def test_l2pf_window_bounds():
+    """The L2 prefetch window: 64 heads, compressed pages of 64 rows (the c4
+    layer), four (item width, request length) entries with their row
+    ceilings, devices of 212 or 216 SMs."""
+    assert cake._KV4_L2PF_HEADS == 64
+    assert cake._KV4_L2PF_PAGE == 64
+    assert cake._KV4_L2PF_MAX_TOKENS == _L2PF_CEILINGS
+    assert frozenset({212, 216}) == cake._KV4_L2PF_SM_COUNTS
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize("sm_count", [148, 208, 212, 216, 232])
+def test_four_stage_launches_take_the_l2pf_sibling_in_its_window(
+    monkeypatch, arch, sm_count
+):
+    """Where SM107 routes the L2 prefetch sibling to a program of its own, a
+    four-stage launch takes it exactly inside the delivered rule: at the row
+    ceiling of each entry and not one row above, never for other widths, head
+    counts, request lengths (2, 3 or 5 tokens) or page sizes (2 rows or
+    unknown), never for a non-uniform or unknown request count past one-token
+    requests, and never on other SM counts.  SM100 and SM103 keep the
+    four-stage key."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(jit, "VARIANTS", _l2pf_variants())
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: sm_count)
+    tokens_grid = (1, 31, 32, 40, 41, 42, 47, 48, 55, 56, 57, 58, 63, 64, 65, 66, 120)
+    for num_heads in (32, 64, 128):
+        for max_q_len in (1, 2, 3, 4, 5):
+            for sparse_topk in (384, 511, 512, 513, 639, 640, 641, 1152):
+                for page in (None, 2, 64):
+                    for tokens in tokens_grid:
+                        batches = {tokens // max_q_len + 1, None}
+                        if tokens % max_q_len == 0:
+                            batches.add(tokens // max_q_len)
+                        for batch in batches:
+                            shape = dict(
+                                num_heads=num_heads,
+                                max_q_len=max_q_len,
+                                num_query_tokens=tokens,
+                                sparse_topk=sparse_topk,
+                            )
+                            takes = _l2pf_takes(
+                                arch, sm_count, batch=batch, page=page, **shape
+                            )
+                            variant = cake._kv4_l2pf_variant(
+                                _KV4_SIBLING,
+                                arch=arch,
+                                device=_DEVICE,
+                                batch_size=batch,
+                                compressed_page_size=page,
+                                **shape,
+                            )
+                            expected = _L2PF_SIBLING if takes else _KV4_SIBLING
+                            assert variant == expected, (shape, batch, page)
+    window = dict(num_heads=64, max_q_len=1, num_query_tokens=40, sparse_topk=640)
+    for other in (
+        _M64_MULTI_TILE_ROUTE,
+        _BCL_SIBLING,
+        _L2PF_SIBLING,
+        "fp8_h64_prefill_source_persistent_m64",
+        "fp8_lowhead_prefill",
+        "fp8_lowhead_prefill_kv4",
+        f"{_UNIFORM_ROUTE}_k64",
+    ):
+        variant = cake._kv4_l2pf_variant(
+            other,
+            arch=arch,
+            device=_DEVICE,
+            batch_size=40,
+            compressed_page_size=64,
+            **window,
+        )
+        assert variant == other
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_count", [212, 216])
+@pytest.mark.parametrize(
+    "sparse_topk,max_q_len,ceiling", [(w, q, t) for (w, q), t in _L2PF_CEILINGS.items()]
+)
+def test_l2pf_rule_edges(monkeypatch, sm_count, sparse_topk, max_q_len, ceiling):
+    """Each entry takes a uniform launch at its row ceiling and keeps the
+    four-stage key one request above it, for the same launch over compressed
+    pages of 2 rows, on 208 SMs and, past one-token requests, as a ragged
+    launch of one request fewer."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(jit, "VARIANTS", _l2pf_variants())
+    count = {"sm": sm_count}
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: count["sm"])
+
+    def variant(tokens, *, batch=None, page=64):
+        if batch is None:
+            batch = tokens // max_q_len
+        return cake._kv4_l2pf_variant(
+            _KV4_SIBLING,
+            arch="sm_107a",
+            device=_DEVICE,
+            num_heads=64,
+            max_q_len=max_q_len,
+            num_query_tokens=tokens,
+            sparse_topk=sparse_topk,
+            batch_size=batch,
+            compressed_page_size=page,
+        )
+
+    edge = ceiling - ceiling % max_q_len
+    assert variant(edge) == _L2PF_SIBLING
+    assert variant(edge + max_q_len) == _KV4_SIBLING
+    assert variant(edge, page=2) == _KV4_SIBLING
+    if max_q_len > 1:
+        assert variant(edge - 1, batch=edge // max_q_len) == _KV4_SIBLING
+    count["sm"] = 208
+    assert variant(edge) == _KV4_SIBLING
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_l2pf_sibling_extends_the_four_stage_contract(arch):
+    """SM100 and SM103 route the L2 prefetch sibling to their four-stage key's
+    program, the route's own, so none of their launches takes it.  SM107
+    routes it to a program of its own, built for SM107 only, whose argument
+    plan is the four-stage sibling's with the compressed-KV pool and its row
+    count before the PDL switch; the host binds both names."""
+    from flashinfer.jit.cake_dsv4 import MODULES, VARIANTS
+
+    variants = VARIANTS[arch]
+    four_stage = variants[_KV4_SIBLING]
+    assert _L2PF_SIBLING in variants
+    l2pf = variants[_L2PF_SIBLING]
+    plan = get_cake_dsv4_spec(_L2PF_SIBLING, arch=arch)["arg_plan"]
+    four_stage_plan = get_cake_dsv4_spec(_KV4_SIBLING, arch=arch)["arg_plan"]
+    if arch != "sm_107a":
+        assert l2pf == four_stage == variants[_M64_MULTI_TILE_ROUTE]
+        assert plan == four_stage_plan
+        return
+    assert l2pf != four_stage
+    assert l2pf not in (variants[_M64_MULTI_TILE_ROUTE], variants[_BCL_SIBLING])
+    assert MODULES[l2pf]["arches"] == ["sm_107a"]
+    added = (("buffer", "compressed_KV_cache"), ("parameter", "compressed_KV_rows"))
+    at = four_stage_plan.index(("launch", "enable_pdl"))
+    assert plan == (*four_stage_plan[:at], *added, *four_stage_plan[at:])
+    assert all(cake.is_bindable_arg(kind, name) for kind, name in added)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("launchable", [True, False])
+def test_fp8_h64_m64_launch_takes_the_l2pf_sibling(
+    monkeypatch, arch, enable_pdl, launchable
+):
+    """On 216 SMs with the L2 prefetch sibling routed to a program of its own,
+    SM107 runs the multi-tile M64 launches of the rule (here items 640 wide)
+    on it over the four-stage sibling's grid and partials, with either PDL
+    switch; the launches one request above the ceiling, of 3-token requests
+    or over compressed pages of 2 rows run the four-stage sibling; where the
+    process cannot launch that sibling, and on SM100 and SM103, the route's
+    program runs."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(jit, "VARIANTS", _l2pf_variants())
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: _SM107_SM_COUNT)
+    monkeypatch.setattr(
+        cake, "_kv4_sibling_launchable", lambda gate_arch, device: launchable
+    )
+    four_stage = arch == "sm_107a" and launchable
+    for tokens, max_q_len, batch, page, window in (
+        (32, 1, 32, 64, True),
+        (47, 1, 47, 64, True),
+        (48, 1, 48, 64, False),
+        (64, 4, 16, 64, True),
+        (68, 4, 17, 64, False),
+        (60, 3, 20, 64, False),
+        (40, 1, 40, 2, False),
+        (40, 1, 40, None, False),
+    ):
+        page_values = {} if page is None else {"compressed_page_size": page}
+        L = _RecordingLauncher(
+            arch,
+            Q=torch.empty(0),
+            num_query_tokens=tokens,
+            num_heads=64,
+            sparse_topk=640,
+            max_q_len=max_q_len,
+            batch_size=batch,
+            enable_pdl=enable_pdl,
+            **page_values,
+        )
+        cake._dispatch_route(_M64_MULTI_TILE_ROUTE, L)
+        if four_stage:
+            program = _L2PF_SIBLING if window else _KV4_SIBLING
+        else:
+            program = _M64_MULTI_TILE_ROUTE
+        launch = {"grid": (tokens, 1, 1), "total_work_items": tokens}
+        assert L.calls == [(program, {**launch, **L.partials(1)})], (tokens, max_q_len)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_count", [208, 212, 216])
+def test_l2pf_and_bcl_windows_do_not_overlap(monkeypatch, sm_count):
+    """No launch is in both siblings' windows: the TMEM-batch sibling never
+    takes a launch of the L2 prefetch rule, and the L2 prefetch step keeps
+    every TMEM-batch launch."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(jit, "VARIANTS", _l2pf_variants())
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: sm_count)
+    for (sparse_topk, max_q_len), ceiling in _L2PF_CEILINGS.items():
+        for tokens in range(max_q_len, ceiling + 1, max_q_len):
+            shape = dict(
+                num_heads=64,
+                max_q_len=max_q_len,
+                num_query_tokens=tokens,
+                sparse_topk=sparse_topk,
+            )
+            bcl = cake._kv4_bcl_variant(
+                _KV4_SIBLING,
+                arch="sm_107a",
+                device=_DEVICE,
+                compressed_page_size=64,
+                **shape,
+            )
+            assert bcl == _KV4_SIBLING, shape
+    for shape in (
+        dict(num_heads=64, max_q_len=4, num_query_tokens=120, sparse_topk=640),
+        dict(num_heads=64, max_q_len=2, num_query_tokens=108, sparse_topk=512),
+        dict(num_heads=64, max_q_len=1, num_query_tokens=192, sparse_topk=1152),
+    ):
+        variant = cake._kv4_l2pf_variant(
+            _BCL_SIBLING,
+            arch="sm_107a",
+            device=_DEVICE,
+            batch_size=shape["num_query_tokens"] // shape["max_q_len"],
+            compressed_page_size=64,
+            **shape,
+        )
+        assert variant == _BCL_SIBLING, shape
+
+
+@pytest.mark.cpu_only
+def test_run_cake_dsv4_launches_the_l2pf_sibling_in_its_window(monkeypatch):
+    """run_cake_dsv4 on SM107 with the L2 prefetch sibling routed to a program
+    of its own: dense FP8/H64 decode calls over compressed pages of 64 rows
+    that the host sends to the four-stage sibling launch the L2 prefetch
+    sibling inside the rule on 212 and 216 SMs, one CTA per row, bound to the
+    compressed-KV pool and its row count; the first rows past each ceiling,
+    the c128 layer (pages of 2 rows) and a 208-SM device launch the
+    four-stage sibling."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(jit, "VARIANTS", _l2pf_variants())
+    for sm_count, width, max_q_len, tokens, page, program in (
+        (216, 640, 1, 32, 64, _L2PF_SIBLING),
+        (216, 640, 1, 47, 64, _L2PF_SIBLING),
+        (212, 640, 1, 40, 64, _L2PF_SIBLING),
+        (216, 640, 4, 60, 64, _L2PF_SIBLING),
+        (212, 640, 4, 64, 64, _L2PF_SIBLING),
+        (216, 512, 1, 41, 64, _L2PF_SIBLING),
+        (212, 512, 1, 40, 64, _L2PF_SIBLING),
+        (216, 512, 4, 56, 64, _L2PF_SIBLING),
+        (212, 512, 4, 44, 64, _L2PF_SIBLING),
+        (216, 640, 1, 58, 64, _KV4_SIBLING),
+        (212, 640, 1, 57, 64, _KV4_SIBLING),
+        (216, 640, 4, 68, 64, _KV4_SIBLING),
+        (216, 512, 1, 42, 64, _KV4_SIBLING),
+        (216, 512, 4, 60, 64, _KV4_SIBLING),
+        (216, 640, 1, 40, 2, _KV4_SIBLING),
+        (208, 640, 1, 40, 64, _KV4_SIBLING),
+        (208, 512, 4, 56, 64, _KV4_SIBLING),
+    ):
+        shape = (sm_count, width, max_q_len, tokens, page)
+        programs, calls, _ = _run_fake_h64_decode_fp8(
+            monkeypatch,
+            arch="sm_107a",
+            width=width,
+            tokens=tokens,
+            max_q_len=max_q_len,
+            sm_count=sm_count,
+            page=page,
+        )
+        (bound,) = calls
+        assert programs == [program], shape
+        assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (tokens, 1, 1)
+        assert bound["total_work_items"] == bound["num_query_tokens"] == tokens
+        assert bound["max_q_len"] == max_q_len, shape
+        if program == _L2PF_SIBLING:
+            pool = bound["compressed_KV_cache"]
+            assert bound["compressed_KV_rows"] == pool.shape[0] == 4 * page, shape
+            assert pool.dtype == torch.uint8 and pool.shape[1] == 512, shape
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm_count,width,tokens,chunk,program",
+    [
+        (216, 640, 96, 32, _L2PF_SIBLING),
+        (212, 512, 120, 40, _L2PF_SIBLING),
+        (216, 1152, 384, 192, _BCL_SIBLING),
+        (212, 1152, 384, 192, _BCL_SIBLING),
+        (208, 640, 96, 32, _KV4_SIBLING),
+        (208, 1152, 384, 192, _KV4_SIBLING),
+    ],
+)
+def test_row_tiled_one_token_chunks_take_the_rule_siblings(
+    monkeypatch, sm_count, width, tokens, chunk, program
+):
+    """A workspace of ``chunk`` rows tiles a dense FP8/H64 one-token decode
+    call outside both one-token rules (items 640 and 512 wide past the L2
+    prefetch ceilings, items 1152 wide past the decode window) into chunks
+    inside one: on 212 and 216 SMs every chunk launches the rule's sibling, on
+    208 SMs the four-stage sibling, one CTA per row, each bound to one-token
+    requests and the call's batch size (chunks after the first are ragged
+    launches over all the call's requests)."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(jit, "VARIANTS", _l2pf_variants())
+    plan = cake._route_plan(
+        _M64_MULTI_TILE_ROUTE, num_query_tokens=tokens, num_heads=64, sparse_topk=width
+    )
+    chunk_bytes = cake._launch_workspace_bytes(plan, chunk, 64, tokens + 1)
+    rows = cake._rows_per_launch(
+        plan,
+        num_query_tokens=tokens,
+        num_heads=64,
+        batch_size=tokens,
+        workspace_bytes=chunk_bytes,
+    )
+    assert rows == chunk
+    programs, calls, _ = _run_fake_h64_decode_fp8(
+        monkeypatch,
+        arch="sm_107a",
+        width=width,
+        tokens=tokens,
+        sm_count=sm_count,
+        workspace=_aligned_u8(chunk_bytes),
+    )
+    shape = (sm_count, width, tokens, chunk)
+    assert programs == [program] * (tokens // chunk), shape
+    for bound in calls:
+        assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (chunk, 1, 1)
+        assert bound["total_work_items"] == bound["num_query_tokens"] == chunk
+        assert bound["max_q_len"] == 1, shape
+        assert bound["batch_size"] == tokens, shape
+
+
+# --------------------------------------------------------------------------- #
+# V-block sibling: SM107's low-head prefill over four items per row           #
+# --------------------------------------------------------------------------- #
+
+_VBLOCK_TOKENS = (1, 8, 12, 24, 25, 26, 27, 28, 48, 64, 65)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize(
+    "sm_count,ceiling", [(216, 27), (212, 26), (208, 26), (264, 27)]
+)
+def test_sm107a_lowhead_launches_take_the_vblock_sibling_up_to_its_ceiling(
+    monkeypatch, arch, sm_count, ceiling
+):
+    """SM107 routes the low-head prefill route's V-block sibling to a program
+    of its own, with the route's arguments, and runs it on launches of at most
+    27 rows on 216 SMs, a ceiling scaled down with a smaller SM count and kept
+    on a larger one; SM100 and SM103 route the sibling to the route's program
+    and launch the route."""
+    from flashinfer.jit.cake_dsv4 import VARIANTS
+
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: sm_count)
+    assert {_LOWHEAD_PREFILL_ROUTE} == cake._VBLOCK_SIBLING_ROUTES
+    assert cake._VBLOCK_SIBLING_MAX_TOKENS == {"sm_107a": 27}
+    assert cake._VBLOCK_SIBLING_MEASURED_SMS == {"sm_107a": 216}
+    assert cake._VBLOCK_ITEMS_PER_TOKEN == 4
+    route, sibling = _LOWHEAD_PREFILL_ROUTE, _VBLOCK_SIBLING
+    own = arch == "sm_107a"
+    programs = VARIANTS[arch]
+    assert (programs[sibling] != programs[route]) == own
+    assert (programs[sibling] != programs[_OVERLAP_SIBLING]) == own
+    assert (
+        get_cake_dsv4_spec(sibling, arch=arch)["arg_plan"]
+        == get_cake_dsv4_spec(route, arch=arch)["arg_plan"]
+    )
+    for tokens in _VBLOCK_TOKENS:
+        expected = sibling if own and tokens <= ceiling else route
+        variant = cake._vblock_variant(
+            route, arch=arch, num_query_tokens=tokens, device=_DEVICE
+        )
+        assert variant == expected, tokens
+    for other in (
+        _OVERLAP_SIBLING,
+        "fp8_lowhead_one_partition",
+        "fp8_lowhead_h64",
+        "fp8_h64_prefill_source_persistent_m64",
+    ):
+        variant = cake._vblock_variant(
+            other, arch=arch, num_query_tokens=12, device=_DEVICE
+        )
+        assert variant == other
+
+
+@pytest.mark.cpu_only
+def test_vblock_variant_needs_a_sibling_program_of_its_own(monkeypatch):
+    """A launch takes the V-block sibling only where its architecture routes
+    the sibling to a program other than the route's and the early-PV
+    sibling's: a table without the sibling, one that routes it to either of
+    those programs and one of another architecture run the route; an
+    architecture without a ceiling never reads the device's SM count."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: 216)
+    route, overlap, sibling = (
+        _LOWHEAD_PREFILL_ROUTE,
+        _OVERLAP_SIBLING,
+        _VBLOCK_SIBLING,
+    )
+    low, early, block = "cake_dsv4_low_head", "cake_dsv4_early_pv", "cake_dsv4_v_block"
+    for table, expected in (
+        ({"sm_107a": {route: low, overlap: early, sibling: block}}, sibling),
+        ({"sm_107a": {route: low, overlap: early}}, route),
+        ({"sm_107a": {route: low, overlap: early, sibling: low}}, route),
+        ({"sm_107a": {route: low, overlap: early, sibling: early}}, route),
+        ({"sm_103a": {route: low, overlap: early, sibling: block}}, route),
+    ):
+        monkeypatch.setattr(jit, "VARIANTS", table)
+        variant = cake._vblock_variant(
+            route, arch="sm_107a", num_query_tokens=12, device=_DEVICE
+        )
+        assert variant == expected
+
+    def no_sm_count(device):
+        raise AssertionError("read the SM count")
+
+    monkeypatch.setattr(cake, "_device_sm_count", no_sm_count)
+    for arch in ("sm_100a", "sm_103a"):
+        variant = cake._vblock_variant(
+            route, arch=arch, num_query_tokens=12, device=_DEVICE
+        )
+        assert variant == route
+
+
+@pytest.mark.cpu_only
+def test_sm107a_vblock_sibling_is_a_program_of_its_own():
+    """The V-block sibling's sm_107a program differs from the route's and the
+    early-PV sibling's and launches with the same dynamic shared memory."""
+    import re
+
+    from flashinfer.jit.cake_dsv4 import VARIANTS, _get_csrc_dir
+
+    programs = VARIANTS["sm_107a"]
+    route, overlap, sibling = (
+        programs[_LOWHEAD_PREFILL_ROUTE],
+        programs[_OVERLAP_SIBLING],
+        programs[_VBLOCK_SIBLING],
+    )
+    assert len({route, overlap, sibling}) == 3
+    smem = {
+        program: re.findall(
+            r"config\.dynamicSmemBytes = (\d+);",
+            (_get_csrc_dir() / f"sm_107a/{program}_binding.cu").read_text(
+                encoding="utf-8"
+            ),
+        )
+        for program in (route, overlap, sibling)
+    }
+    assert smem[sibling] == smem[overlap] == smem[route] == ["205952"]

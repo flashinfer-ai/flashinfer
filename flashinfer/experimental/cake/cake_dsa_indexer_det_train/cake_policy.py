@@ -126,7 +126,7 @@ POLICY_FIELDS = (
     "sample_class_rule",  # [tiny-unit sample tiles, shift permille] for the wide-unit programs (shift only) and the tiny dispatch class (tiles and shift), or None; explicit knobs override it
     "sample_long_rule",  # [physical scan kinds, shift permille] of the long-unit calls of those kinds (more than sample_dispatch_mean_tiles_max mean unit tiles), or None; an explicit shift knob overrides it
     "sample_shift_rule",  # [min top_k, shift permille] replacing sample_shift_permille from that top_k on, or None (the default shift on every call); an explicit sample_shift_permille knob overrides both
-    "lsf_programs",  # the architecture ships the longest-first segment order copy (scan key suffix :lsf) of every scan program; the host runs it on packed calls whose key segments differ in length (#7549)
+    "lsf_programs",  # the architecture ships longest-first segment order copies (scan key suffix :lsf) of its scan programs; the host runs the decided program's copy on packed calls whose key segments differ in length (#7549), the program itself where the registry has no copy of it
     "lsf_single_rule",  # [min mean unit tiles] from which a one-segment FP8 call of the wide unit runs the :lsf copy of its program, or None (never); read only by select_fp8_program
     "static_scan_kinds",  # physical scan kinds whose programs keep the static unit enumeration on a ticket architecture: they never touch the ticket tail, so the host gives their runners none
     "far_sample",  # 1: the sampled first threshold of the ascending-tile-order programs ranks the far sample tiles only (the tile nearest the diagonal left out); 0: every sample tile
@@ -159,7 +159,8 @@ POLICY_FIELDS = (
     "rank_t16",  # the staged rank finalize runs its 16-item thread form on the sort-slot counts of rank_t16_slots (lever FRT)
     "rank_t16_slots",  # sort-slot counts (threads x finalize_items) whose staged form runs as 16-item threads (half the threads), ascending
     "rank_persist_max_k",  # the persistent two-row pipelined rank finalize serves the staged bulk calls with top_k <= this on the architecture (lever FRP-K; 0 = the one-row program everywhere; program key tag :persist)
-    "rank_persist_ctas_per_sm",  # persistent CTAs per SM: the :persist programs launch min(num_queries, this x SM count) CTAs, each walking rows bid, bid + grid, ...
+    "rank_persist_ctas_per_sm",  # persistent CTAs per SM: the :persist programs launch min(num_queries, this x (SM count - rank_persist_spare_sms)) CTAs, each walking rows bid, bid + grid, ...
+    "rank_persist_spare_sms",  # SMs the persistent rank grid is sized without: the grid is a multiple of the other SMs, so a block of another stream on up to this many SMs adds no partial wave to its walk (#7548)
     "merge_rank",  # a split call whose finalize is the slab rank form (window <= rank_slab_window_max, top_k <= MERGE_RANK_MAX_TOP_K) runs the merge with the rank finalize fused in (key merge:rank:w<window>) and launches no finalize program
 )
 
@@ -214,9 +215,11 @@ SAMPLE_SHIFT_PERMILLE_BOUNDS = (-1000, 10000)
 # (``ticket_static_path``: the scan never touches the word) or runs a program of
 # ``static_scan_kinds``.  A scan program whose registry record lists the
 # architecture in ``ticket_arg_arches`` draws from its ``TicketWord`` block
-# instead and never reads this tail (the eager entry hands it the tail's first
-# 16 bytes); every plan still carries the tail, so the size does not depend on
-# the program.
+# instead and never draws from this tail (the eager entry hands it the tail's
+# first 16 bytes); its :lsf copies (sm_107a's l6 ticket programs) still keep the
+# segment order in the tail, which every launch writes before it reads, so the
+# host zeroes nothing for them.  Every plan carries the tail, so the size does
+# not depend on the program.
 TICKET_TAIL_BYTES = 8 * (16 + 1024)
 
 
@@ -316,7 +319,8 @@ _INT = ("tile_keys", "block_q_narrow", "block_q_wide", "block_q_l6", "candidate_
         "sample_tiles_max", "sample_tiles_short_units", "sample_tiles_tiny_units", "sample_shift_permille", "far_sample",
         "check_period_max", "check_period_knob_max", "check_period_cap_divisor", "finalize_items",
         "finalize_threads_small", "finalize_top_k_small", "finalize_threads", "rank_top_k_min",
-        "rank_slab_window_max", "rank_bulk_align_bytes", "rank_persist_max_k", "rank_persist_ctas_per_sm")  # fmt: skip
+        "rank_slab_window_max", "rank_bulk_align_bytes", "rank_persist_max_k", "rank_persist_ctas_per_sm",
+        "rank_persist_spare_sms")  # fmt: skip
 _BOOL = (
     "wide_pair_snake_only",
     "snake_default",
@@ -474,6 +478,7 @@ class DispatchPolicy:
     rank_t16_slots: list
     rank_persist_max_k: int
     rank_persist_ctas_per_sm: int
+    rank_persist_spare_sms: int
     merge_rank: bool
 
     @classmethod
@@ -819,6 +824,8 @@ class DispatchPolicy:
             )
         if raw["rank_persist_ctas_per_sm"] <= 0:
             raise ValueError("policy['rank_persist_ctas_per_sm'] must be positive")
+        if raw["rank_persist_spare_sms"] < 0:
+            raise ValueError("policy['rank_persist_spare_sms'] must be >= 0")
         for name in ("tile_keys", "block_q_narrow", "block_q_wide", "block_q_l6", "candidate_entry_bytes",
                      "candidate_multiplier", "candidate_multiplier_unsampled", "candidate_slack", "split_max",
                      "split_min_range_tiles",
@@ -1623,11 +1630,16 @@ def merge_key(rank_window: Optional[int] = None) -> str:
 
 
 def finalize_grid(choice: "ProgramChoice", num_sms: int) -> int:
-    """CTAs of a call's finalize launch: ``min(num_queries, rank_persist_ctas x SM count)`` for the persistent rank program (lever
-    FRP-K; every CTA walks the rows ``bid, bid + grid, ...``), one CTA per row otherwise (at least one CTA)."""
+    """CTAs of a call's finalize launch: ``min(num_queries, rank_persist_ctas x (SM count - rank_persist_spare))`` for the
+    persistent rank program (lever FRP-K; every CTA walks the rows ``bid, bid + grid, ...``; at least one SM), one CTA per row
+    otherwise (at least one CTA).  The grid is a multiple of the SMs that remain after the spare ones: where the CTAs one
+    SM holds at a time divide ``rank_persist_ctas`` (sm_107a: 4 of the 256-thread program on a 1024-thread SM, 8 per
+    SM), a block of another stream on up to ``rank_persist_spare`` SMs leaves the static row walk whole waves of the
+    other SMs instead of a short extra wave (#7548)."""
     rows = max(1, int(choice.num_queries))
     if choice.rank_persistent:
-        return max(1, min(rows, int(choice.rank_persist_ctas) * int(num_sms)))
+        sms = max(1, int(num_sms) - int(choice.rank_persist_spare))
+        return max(1, min(rows, int(choice.rank_persist_ctas) * sms))
     return rows
 
 
@@ -1833,6 +1845,9 @@ class ProgramChoice:
     )
     rank_persistent: bool  # the persistent two-row pipelined form of the staged bulk rank finalize (lever FRP-K; key tag :persist)
     rank_persist_ctas: int  # persistent CTAs per SM of that form (0 when the call runs a one-row program)
+    rank_persist_spare: (
+        int  # SMs that form's grid leaves out (0 when the call runs a one-row program)
+    )
     scan_key: str
     merge_key: Optional[str]
     merge_rank: bool  # the merge program finalizes the split rows itself (key merge:rank:w*): no finalize launch
@@ -1903,6 +1918,9 @@ def select_program(
     unpaired wide program is in ``scan_keys`` (without a registry it stays off, as the l6 preference); ``split_wave_scope``
     limits the two-way wave split.  A record's ``desc_walk_kinds`` runs the descending-walk twin of the decided program
     (key kind ``<kind>_desc``) where it names the kind for the call's sampling mode and ``scan_keys`` has the twin.
+    Where the record sets ``lsf_programs``, a packed call of unequal key segments runs the longest-first copy of the
+    decided program (key suffix ``:lsf``) unless ``scan_keys`` has the program but not the copy; every rule that asks
+    ``scan_keys`` for a program looks up its key without the suffix, so the copy never changes the plan.
     ``snake_packed_rule`` keeps packed calls of few mean unit tiles over more than a few
     waves in the plain unit order (``snake_for``), and ``snake_l6_fallback_waves`` lets a sampling-off call the l6 preference moves run the plain-order
     l6 program where the snake-order one is not registered, within that many waves of the planned program's persistent
@@ -1945,7 +1963,9 @@ def select_program(
     pair = (not split) and policy.pair_for(T, Tkv, S, r, grid, K, block_q)
     # lever LSF (#7549): the longest-first segment order pays off only where the segments differ, so the copy that
     # carries it runs on packed calls whose key segments are not all equal (one segment, or num_keys == S x the
-    # call's max_seqlen_k, runs the program without it; without max_seqlen_k the host cannot tell and runs the copy)
+    # call's max_seqlen_k, runs the program without it; without max_seqlen_k the host cannot tell and runs the copy).
+    # The copy never changes the plan: every rule below that asks ``scan_keys`` for a program looks up its key without
+    # the suffix, and the decided program takes the suffix last, where the registry has its copy
     lsf = (
         policy.lsf_programs
         and S >= LSF_MIN_SEGMENTS
@@ -1969,7 +1989,6 @@ def select_program(
             policy.tile_unroll_for("wide", K, wide_snake, block_q),
             wide_snake,
             policy.sample_fit_for(T, Tkv, S, r, cap, physical_kind("wide", "wide")),
-            lsf,
         )
         if scan_keys is not None and wide_key in scan_keys:
             pair = False
@@ -2000,7 +2019,6 @@ def select_program(
             policy.tile_unroll_for("l6", K, solo_snake, policy.block_q_l6),
             solo_snake,
             solo_fit,
-            lsf,
         )
         if (
             scan_keys is not None
@@ -2013,7 +2031,6 @@ def select_program(
                 policy.tile_unroll_for("l6", K, False, policy.block_q_l6),
                 False,
                 solo_fit,
-                lsf,
             )
             solo_plain = True
         if scan_keys is not None and solo_key in scan_keys:
@@ -2075,13 +2092,26 @@ def select_program(
     merge_rank = policy.merge_rank_for(split, K, rank_window, rank_two_level)
     scan_entries = grid_ctas * block_q * cap
     staging = T * n_split * K if split else 0
-    key = scan_key(physical, unroll, snake, fit, lsf)
+    key = scan_key(physical, unroll, snake, fit)
     # desc_walk_kinds: the descending-walk twin of the decided program, where the record names its kind for the call's
     # sampling mode and the registry has it (no registry: off); the plan, the knobs and the workspace stay
     if scan_keys is not None and policy.desc_walk_for(physical, tiles > 0):
-        desc_key = scan_key(f"{physical}_desc", unroll, snake, fit, lsf)
+        desc_key = scan_key(f"{physical}_desc", unroll, snake, fit)
         if desc_key in scan_keys:
             key = desc_key
+    # lever LSF: the decided program runs its longest-first copy, but where the registry has the program and not its
+    # copy it runs in the argument order (sm_107a registers the copies of its two l6 ticket programs only, sm_100a and
+    # sm_103a that of every program); without a registry, or for a key it has in neither form (the BF16 key of an FP8
+    # decision, which ``select_fp8_program`` maps to an FP8 program), the copy stays
+    if (
+        lsf
+        and scan_keys is not None
+        and key in scan_keys
+        and key + ":lsf" not in scan_keys
+    ):
+        lsf = False
+    if lsf:
+        key += ":lsf"
     return ProgramChoice(
         num_queries=T,
         num_keys=Tkv,
@@ -2121,6 +2151,7 @@ def select_program(
         rank_persist_ctas=int(policy.rank_persist_ctas_per_sm)
         if rank_persistent
         else 0,
+        rank_persist_spare=int(policy.rank_persist_spare_sms) if rank_persistent else 0,
         scan_key=key,
         merge_key=(merge_key(rank_window) if merge_rank else MERGE_KEY)
         if split

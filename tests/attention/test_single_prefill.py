@@ -4,8 +4,8 @@ import pytest
 import torch
 
 import flashinfer
-from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
-from tests.test_helpers.test_helpers import ref_single_prefill
+from tests.quantization.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
+from tests.attention.test_helpers.test_helpers import ref_single_prefill
 
 
 def head_dim_512_supported() -> bool:

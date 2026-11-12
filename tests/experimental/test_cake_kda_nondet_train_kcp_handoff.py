@@ -91,14 +91,14 @@ from tests.experimental.test_cake_kda_nondet_train_kcp_dist import (
     cake_kcp,
     cake_kcp_plan,
 )
-from tests.test_helpers.cake_kda_det_train_reference import (
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (
     LOWER_BOUND,
     kda_exact_raw_with_grads,
     kda_exact_with_grads,
     make_inputs,
     make_raw_inputs,
 )
-from tests.test_helpers.cake_kda_det_train_reference_l2n import (
+from tests.experimental.test_helpers.cake_kda_det_train_reference_l2n import (
     kda_exact_l2n_with_grads,
     kda_exact_raw_l2n_with_grads,
 )
@@ -1507,6 +1507,7 @@ def _run_rank_rows(
         grad: bool = True,
         twice: bool = False,
         entry=None,
+        knobs=None,
     ):
         """One step of the autograd entry with ``saved_rows=rows`` and ``checkpoint_handoff=mode``, direct or under a
         non-reentrant checkpoint: the outputs and gradients of each backward (``twice``: two, the first with
@@ -1515,11 +1516,13 @@ def _run_rank_rows(
         moves of SAVED_ROWS_STATS and HANDOFF_STATS.  ``poison_rows``: NaN-filled kept rows before the forward's
         launches (``_HANDOFF_POISON``); ``poison_arena``: the caller workspace's local arena NaN-filled between the
         forward and the backward (direct); ``hooks``: a saved-tensor hooks context around the forward; ``grad=False``:
-        the forward under no_grad and no backward."""
+        the forward under no_grad and no backward; ``knobs``: the call's ``_kcp_test_knobs``."""
         if poison_free:
             _poison(device)
         lv = leaves()
         kw = {}
+        if knobs is not None:
+            kw["_kcp_test_knobs"] = knobs
         if handle is not None:
             kw["recompute_handle"] = handle
         if keep is not None:
@@ -1695,6 +1698,10 @@ def _run_rank_rows(
         (res_f,), recs = run(form)
         measure(form, res_f, light)
         flags[f"{form}_kept"] = kept(recs, form)
+        # outside a checkpoint the rows stay in the caching allocator's default pool
+        flags[f"{form}_default_pool"] = (
+            T_r == 0 or recs["orig"].get("kept_pool") is False
+        )
         flags[f"{form}_launches"] = launches(recs, recs_light, form)
         flags[f"{form}_stats"] = (
             recs["rows"] == rows_stats(form, 1, 1)
@@ -1788,6 +1795,35 @@ def _run_rank_rows(
             and recs["handoff"] == {}
         )
         flags[f"{form}_handoff_launches"] = launches(recs, recs_light_ck, form)
+        # a caller-held workspace: both passes keep the set in the default pool (its arena is not freed per call);
+        # workspace=None: both passes keep it in the package-private pool of the device (the knob kept_pool, shipped
+        # 1), and with kept_pool=0 in the default pool, bitwise the same
+        flags[f"{form}_handoff_held_default_pool"] = T_r == 0 or (
+            recs["orig"].get("kept_pool") is False
+            and recs["fwd"].get("kept_pool") is False
+        )
+        (res_n,), recs_n = run(form, mode="on", ckpt=True, workspace=None)
+        measure(f"{form}_handoff_per_call", res_n, light)
+        flags[f"{form}_handoff_per_call_kept"] = kept(recs_n, form, every)
+        flags[f"{form}_handoff_kept_pool"] = T_r == 0 or (
+            recs_n["orig"].get("kept_pool") is True
+            and recs_n["fwd"].get("kept_pool") is True
+            and device.index in cake_kcp._KEPT_POOLS
+        )
+        previous_knobs = cake_kcp_plan.enable_test_knobs(True)
+        try:
+            (res_k,), recs_k = run(
+                form, mode="on", ckpt=True, workspace=None, knobs={"kept_pool": 0}
+            )
+        finally:
+            cake_kcp_plan.enable_test_knobs(previous_knobs)
+        flags[f"{form}_handoff_kept_pool0_bitwise"] = _same(res_k, res_n) and (
+            T_r == 0
+            or (
+                recs_k["orig"].get("kept_pool") is False
+                and recs_k["fwd"].get("kept_pool") is False
+            )
+        )
         for keep in ("states", "transfer"):
             (res_h,), recs_h = run(
                 form, mode="on", ckpt=True, handle=handle_type(), keep=keep
@@ -2076,7 +2112,10 @@ def test_saved_rows_gpu_rows(row) -> None:
     NaN-filled between the forward and the backward (and the light path so poisoned; each poisoned run bitwise its
     unpoisoned twin), over two backwards (``retain_graph``, the second bitwise the first; also on the lean arena),
     as the checkpoint hand-off's rows form (``checkpoint_handoff="on"``) with and without a recompute handle of both
-    tiers (the recompute issues no collective) and with a poisoned arena, with ``"off"`` and ``"auto"`` in a
+    tiers (the recompute issues no collective; on a caller workspace both passes keep the rows in the default pool,
+    on a per-call workspace in the package-private pool of the device, and with the test knob ``kept_pool=0`` in the
+    default pool, bitwise the same; a plain node keeps them in the default pool) and with a poisoned arena, with
+    ``"off"`` and ``"auto"`` in a
     checkpoint pass, under ``save_on_cpu`` (refused, the light set; a run that cannot run fails the row), with ranks
     that keep different sets, through the facade, through the functional entries and under ``graph="replay"``
     (eager, capture, replays); the rows kept by the forwards and read by the backward with the byte query's bytes
@@ -2640,6 +2679,159 @@ def test_handoff_phase_probe_reads_the_checkpoint_passes() -> None:
     with torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t):
         fn(torch.ones(4, requires_grad=True))
     assert seen == [None], seen
+
+
+def test_kept_pool_knob_and_rule() -> None:
+    """``kept_pool`` is a private test knob: refused without :func:`cake_kcp_plan.enable_test_knobs`, never a public
+    keyword, validated against :data:`cake_kcp.KEPT_POOLS`, shipped 1.  :func:`cake_kcp._kept_pool` picks the
+    package-private pool of the device in both passes of a non-reentrant checkpoint for a ``workspace=None`` call
+    with the knob at 1, and the default pool (``None``) outside a checkpoint pass, for a caller-held workspace, with
+    the knob at 0 and off CUDA.  :func:`cake_kcp._kept_extent` rounds up to 16 steps per power of two."""
+    from torch.utils.checkpoint import checkpoint
+
+    got = [cake_kcp._kept_extent(n) for n in (0, 1, 31, 32, 33, 64, 65)]
+    assert got == [0, 1, 31, 32, 34, 64, 68], got
+    for n in (257, 16384, 16385, 16448, 17000, 2**20 + 1):
+        e = cake_kcp._kept_extent(n)
+        step = 1 << max(n.bit_length() - 5, 0)
+        assert n <= e < n + step and e % step == 0 and 16 * (e - n) < n, (n, e)
+    assert cake_kcp._kept_extent(16448) == 17408
+    assert cake_kcp.KEPT_POOL_DEFAULT == 1 and cake_kcp.KEPT_POOLS == (0, 1)
+    assert cake_kcp.P2_KNOBS["kept_pool"] == cake_kcp.KEPT_POOLS
+    on = cake_kcp._options({})
+    assert on.kept_pool == 1
+    previous = cake_kcp_plan.enable_test_knobs(False)
+    try:
+        with pytest.raises(ValueError, match="enable_test_knobs"):
+            cake_kcp._options({"_kcp_test_knobs": {"kept_pool": 0}})
+        with pytest.raises(TypeError):
+            cake_kcp._options({"kept_pool": 0})
+        cake_kcp_plan.enable_test_knobs(True)
+        off = cake_kcp._options({"_kcp_test_knobs": {"kept_pool": 0}})
+        assert off.kept_pool == 0
+        for bad in (2, -1):
+            with pytest.raises(ValueError):
+                cake_kcp._options({"_kcp_test_knobs": {"kept_pool": bad}})
+    finally:
+        cake_kcp_plan.enable_test_knobs(previous)
+    devices = [torch.device("cpu")]
+    if torch.cuda.is_available():
+        devices.append(torch.device("cuda", torch.cuda.current_device()))
+    for device in devices:
+        # scratch["default_ws"]: "hit" / "miss" / "bypass" for a workspace=None call, None for a caller-held one
+        call_on = types.SimpleNamespace(
+            opts=on, device=device, scratch={"default_ws": "hit"}
+        )
+        call_off = types.SimpleNamespace(
+            opts=off, device=device, scratch={"default_ws": "hit"}
+        )
+        call_held = types.SimpleNamespace(
+            opts=on, device=device, scratch={"default_ws": None}
+        )
+        seen: list = []
+
+        def fn(x, calls=(call_on, call_off, call_held), seen=seen):
+            seen.append(tuple(cake_kcp._kept_pool(c) for c in calls))
+            return x * x
+
+        assert cake_kcp._kept_pool(call_on) is None  # outside a checkpoint pass
+        x = torch.ones(4, device=device, requires_grad=True)
+        checkpoint(fn, x, use_reentrant=False).sum().backward()
+        if device.type != "cuda":
+            assert seen == [(None, None, None), (None, None, None)], seen
+            continue
+        pool = cake_kcp._KEPT_POOLS[device.index]
+        assert seen == [(pool, None, None), (pool, None, None)], seen
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or cake_kcp._MEM_POOL is None,
+    reason="CUDA device and torch.cuda.MemPool required",
+)
+def test_default_workspace_cache_clear_drops_the_kept_pools() -> None:
+    """A package-private kept-set pool keeps a freed tensor's blocks reserved, and ``torch.cuda.empty_cache()`` does
+    not release them while the pool lives; :func:`cake_kcp.default_workspace_cache_clear` drops the pools (not
+    counted in its result), after which ``empty_cache`` releases them.  A tensor of a dropped pool stays valid and
+    its blocks go back once it is freed."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    cake_kcp.default_workspace_cache_clear()
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    base = torch.cuda.memory_reserved(device)
+    nbytes = 64 << 20
+    pool = cake_kcp._KEPT_POOLS.setdefault(device.index, cake_kcp._MEM_POOL())
+    with cake_kcp._USE_MEM_POOL(pool, device):
+        freed = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        alive = torch.full((nbytes,), 7, dtype=torch.uint8, device=device)
+    del freed
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    held = torch.cuda.memory_reserved(device)
+    # the live pool keeps the freed tensor's block
+    assert held >= base + 2 * nbytes, (base, held)
+    assert cake_kcp.default_workspace_cache_clear() == 0
+    assert not cake_kcp._KEPT_POOLS
+    del pool
+    torch.cuda.empty_cache()
+    dropped = torch.cuda.memory_reserved(device)
+    assert held - dropped >= nbytes, (held, dropped)
+    assert int(alive[0]) == 7 and int(alive[-1]) == 7
+    del alive
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    assert dropped - torch.cuda.memory_reserved(device) >= nbytes
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or cake_kcp._MEM_POOL is None,
+    reason="CUDA device and torch.cuda.MemPool required",
+)
+def test_kept_tensors_round_once_then_take_the_exact_shape() -> None:
+    """:func:`cake_kcp._kept_tensors` rounds a key's first tensor (:func:`cake_kcp._kept_extent`, resized in place
+    to its rows), serves a later tensor of no more rows with its exact shape from the freed block (no new reserved
+    memory), rounds again while the key's previous tensor is alive and above the largest rounded extent, and keys
+    on the trailing shape; :func:`cake_kcp.default_workspace_cache_clear` forgets the extents."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    cake_kcp.default_workspace_cache_clear()
+    pool = cake_kcp._MEM_POOL()
+    row = 64 * 128 * 2  # bytes per row: blocks above 10 MiB, one segment each
+
+    def kept(rows: int, heads: int = 64) -> torch.Tensor:
+        with cake_kcp._USE_MEM_POOL(pool, device):
+            t = cake_kcp._kept_tensors(
+                device.index, ("w",), {"w": (rows, heads, 128)}, device
+            )["w"]
+        assert t.shape == (rows, heads, 128) and t.is_contiguous() and t._base is None
+        return t
+
+    first = kept(1000)
+    assert first.untyped_storage().nbytes() == cake_kcp._kept_extent(1000) * row
+    ptr = first.data_ptr()
+    del first
+    torch.cuda.synchronize(device)
+    reserved = torch.cuda.memory_reserved(device)
+    exact = kept(990)
+    assert exact.untyped_storage().nbytes() == 990 * row and exact.data_ptr() == ptr
+    assert torch.cuda.memory_reserved(device) == reserved
+    # the previous tensor is alive: rounded, in another block
+    other = kept(1010)
+    assert other.untyped_storage().nbytes() == cake_kcp._kept_extent(1010) * row
+    assert other.data_ptr() != ptr
+    del exact, other
+    # above the largest rounded extent: rounded again
+    above = kept(1100)
+    assert above.untyped_storage().nbytes() == cake_kcp._kept_extent(1100) * row
+    del above
+    # another trailing shape is another key: its first tensor is rounded
+    heads = kept(990, heads=32)
+    assert heads.untyped_storage().nbytes() == cake_kcp._kept_extent(990) * row // 2
+    del heads
+    assert len(cake_kcp._KEPT_EXTENTS) == 2
+    cake_kcp.default_workspace_cache_clear()
+    assert not cake_kcp._KEPT_EXTENTS and not cake_kcp._KEPT_LAST
+    pool = None  # dropped: empty_cache releases its blocks
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")

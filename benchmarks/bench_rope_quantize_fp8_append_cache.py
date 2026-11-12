@@ -25,7 +25,7 @@ from flashinfer.utils import get_gpu_memory_bandwidth
 
 # Add the project root to Python path to import test helpers
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from tests.test_helpers.rope_reference import RotaryEmbedding
+from tests.attention.test_helpers.rope_reference import RotaryEmbedding
 
 
 def benchmark_config(

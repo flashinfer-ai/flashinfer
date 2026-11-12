@@ -1,4 +1,4 @@
-"""Persistent CuTe-DSL artifacts for GDN prefill and WY HMMA kernels."""
+"""Persistent CuTe-DSL artifacts for GDN WY HMMA kernels."""
 
 import errno
 import hashlib
