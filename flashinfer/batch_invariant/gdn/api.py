@@ -293,8 +293,7 @@ def chunk_gated_delta_rule_batch_invariant(
             prefix = gp.zero_prefix[:N]
         else:
             prefix = prefix_lens.to(device=dev, dtype=torch.int32).contiguous()
-        if gp.pending:
-            gp.rebuild(pool, slots.tolist())
+        gp.rebuild(pool)
         gp.span(pool, slots, cu[:-1], cu[1:], prefix, rows, scale_f, out)
         return (out, pool) if output_final_state else out
     if prefix_lens is None and gp.extend_whole_chunks(

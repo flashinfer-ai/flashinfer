@@ -27,12 +27,12 @@ from typing import Dict, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from .spec import CHUNK, HEAD_DIM
+from ..support import unsupported
+from .spec import CHUNK, CLASS, HEAD_DIM
 
 _IO = torch.bfloat16
-#: Count-cell values of the step kernel: bit 8 asks for a refresh of the bf16 state copy, negative marks unbuilt rows.
+#: Count-cell value of the step kernel that asks for a refresh of the bf16 state copy (negative marks unbuilt rows).
 STALE = 256
-PENDING = -1
 _POOLS: Dict[Tuple[int, int, int, torch.device], "GdnPool"] = {}
 
 
@@ -125,7 +125,7 @@ class GdnPool:
         def zeros(*shape, dtype=_IO):
             return torch.zeros(shape, dtype=dtype, device=dev)
 
-        self.kn = zeros(S, CHUNK, HQ, HEAD_DIM)
+        self.kn = zeros(S, CHUNK, HV, HEAD_DIM)
         self.state_bf16 = zeros(S, HV, HEAD_DIM, HEAD_DIM)
         self.cnt = torch.full((S, HV), STALE, dtype=torch.int32, device=dev)
         self.ring_l = zeros(S, HV, CHUNK, dtype=torch.float32)
@@ -160,14 +160,15 @@ class GdnPool:
     def stash(self, slots, starts, ends, slot_list, tails, packed, pool) -> None:
         """Keep rows ``[starts[i], ends[i])`` of ``packed``, the open tail a prefill left in ``slots[i]``, for
         :meth:`rebuild`; a slot without a tail is marked for a refresh of its bf16 state copy."""
+        rows = packed[1:]
         if self._hist is None:
-            rows = self.slots * CHUNK
+            n = self.slots * CHUNK
             self._hist = tuple(
-                torch.zeros((rows, *x.shape[1:]), dtype=x.dtype, device=self.device)
-                for x in packed
+                torch.zeros((n, *x.shape[1:]), dtype=x.dtype, device=self.device)
+                for x in rows
             )
         _module().gdn_batch_invariant_stash(
-            *packed, slots, starts, ends, pool, self.cnt, *self._hist
+            *rows, slots, starts, ends, pool, self.cnt, *self._hist
         )
         for slot, n in zip(slot_list, tails, strict=True):
             if n:
@@ -175,15 +176,18 @@ class GdnPool:
             else:
                 self.pending.pop(slot, None)
 
-    def rebuild(self, pool: torch.Tensor, slot_list: Sequence[int]) -> None:
-        """Build the cached rows of the listed slots' pending tails: one span launch over their kept rows."""
-        work = [
-            (s, self.pending.pop(s))
-            for s in dict.fromkeys(slot_list)
-            if s in self.pending
-        ]
-        if not work:
+    def rebuild(self, pool: torch.Tensor) -> None:
+        """Build the cached rows of every pending tail: one span launch over the kept rows, which skips a slot whose
+        count cell no longer marks it (a later call restarted it)."""
+        if not self.pending:
             return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "a slot of this pool holds a prefill's open tail: run the first call after the prefill outside the"
+                " CUDA graph capture"
+            )
+        work = list(self.pending.items())
+        self.pending.clear()
         m = self._idx(
             [
                 [s for s, _ in work],
@@ -191,21 +195,21 @@ class GdnPool:
                 [s * CHUNK + n for s, n in work],
             ]
         )
+        k, v, g, beta = self._hist
         self.span(
             pool,
             m[0],
             m[1],
             m[2],
             self.zero_prefix[: len(work)],
-            self._hist,
+            (k, k, v, g, beta),
             1.0,
             self._no_out,
         )
 
     def step(self, pool, slots, q, k, v, g, beta, scale, out) -> None:
         """One token per slot: ``out[i]`` is the row of ``slots[i]``'s sequence at its position."""
-        if self.pending:
-            self.rebuild(pool, slots.tolist())
+        self.rebuild(pool)
         _module().gdn_batch_invariant_decode_step(
             q, k, v, g, beta, slots, out, pool, *self._side(), scale
         )
@@ -240,9 +244,6 @@ class GdnPool:
         if cu is None:
             cu = self._idx(offs)
         _pinned(packed, cu, list(offs), pool, slots, slots, scale, output=out)
-        if self.pending:
-            for s in slots.tolist():
-                self.pending.pop(s, None)
         self.cnt.index_fill_(0, slots.long(), STALE)
         return True
 
@@ -263,8 +264,7 @@ class GdnPool:
         boundary. ``out`` receives the rows. At least one sequence brings a whole chunk."""
         N = len(slot_list)
         if not any(counts):
-            # one prefill call in place, each sequence's last boundary state stored as a checkpoint; the rows after
-            # it are kept for the step kernel to build from
+            # one prefill call in place with the last boundary states as checkpoints; the tails' rows are kept
             rows, starts, tail_starts = [], [0], []
             for i, slot in enumerate(slot_list):
                 chunks = (offs[i + 1] - offs[i]) // CHUNK
@@ -293,9 +293,18 @@ class GdnPool:
             self.stash(slots, t0, t1, slot_list, tails, packed, pool)
             return
         # open chunks first (to their boundary, or the whole piece), then whole chunks, then open tails
-        self.rebuild(pool, [s for s, c in zip(slot_list, counts, strict=True) if c])
-        for s in slot_list:
-            self.pending.pop(s, None)
+        self.rebuild(pool)
+        cont = [i for i, c in enumerate(counts) if c]
+        held = self.cnt[:, 0].index_select(
+            0, self._idx([slot_list[i] for i in cont], torch.int64)
+        )
+        for i, h in zip(cont, held.tolist(), strict=True):
+            if h != counts[i]:
+                raise unsupported(
+                    CLASS,
+                    f"prefix_lens[{i}] at chunk row {counts[i]} on a slot holding {h} open rows",
+                    "a sequence continued where its slot's open chunk ends",
+                )
         pre, body, post = [], [], []
         for i, slot in enumerate(slot_list):
             c, start, end = counts[i], offs[i], offs[i + 1]

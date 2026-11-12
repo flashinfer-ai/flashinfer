@@ -461,6 +461,80 @@ def test_ragged_prefill_then_decode():
 
 
 @needs_device
+def test_crossing_spans_on_a_large_grid():
+    """More CTAs than fit the device at once, runs that commit a chunk, v-heads sharing a key head."""
+    HQ, HV = 16, 48
+    B, start, T = 24, 40, 40
+    seqs = [_inputs(start + T, HQ, HV, 300 + i) for i in range(B)]
+    refs = [_reference(x, s0)[0] for x, s0 in seqs]
+    pool = _pool(HV, B)
+    for i, (_, s0) in enumerate(seqs):
+        pool[i] = s0
+    slots = list(range(B))
+
+    def cat(a, b):
+        return tuple(torch.cat([x[j][a:b] for x, _ in seqs]) for j in range(5))
+
+    out = _bi(
+        pool, slots, cat(0, start), cu=[start * i for i in range(B + 1)], prefix=[0] * B
+    )
+    for i in range(B):
+        assert torch.equal(out[start * i : start * (i + 1)], refs[i][:start]), i
+    out = flashinfer.chunk_gated_delta_rule(
+        *cat(start, start + T),
+        initial_state=pool,
+        state_indices=_i32(slots),
+        cu_seqlens=_i32([T * i for i in range(B + 1)]),
+        cu_seqlens_cpu=[T * i for i in range(B + 1)],
+        prefix_lens=torch.full((B,), start, dtype=torch.int64, device="cuda"),
+        use_qk_l2norm_in_kernel=True,
+        gate_domain="log",
+        batch_invariant=True,
+    )
+    for i in range(B):
+        assert torch.equal(out[T * i : T * (i + 1)], refs[i][start:]), i
+        want = _reference(_cut(seqs[i][0], 0, CHUNK), seqs[i][1])[1][0]
+        assert torch.equal(pool[i], want), i
+
+
+@needs_device
+def test_calls_after_a_ragged_prefill():
+    """The tail a prefill leaves is built by whatever call comes next: a span, a mixed call, another prefill."""
+    HQ, HV = 4, 8
+    x, s0 = _inputs(400, HQ, HV, 21)
+    ref, _ = _reference(x, s0)
+    pool = _pool(HV, 3)
+    for slot in range(3):
+        pool[slot] = s0
+        assert torch.equal(_bi(pool, [slot], _cut(x, 0, 101)), ref[:101])
+    gp = get_pool(pool, HQ)
+    assert sorted(gp.pending) == [0, 1, 2]
+    assert torch.equal(_bi(pool, [0], _cut(x, 101, 110), prefix=[101]), ref[101:110])
+    assert not gp.pending
+    with pytest.raises(BatchInvariantUnsupportedError):
+        _bi(pool, [1], _cut(x, 101, 300), prefix=[100])
+    assert torch.equal(_bi(pool, [1], _cut(x, 101, 300), prefix=[101]), ref[101:300])
+    assert torch.equal(_bi(pool, [1], _cut(x, 300, 301)), ref[300:301])
+    pool[2] = s0
+    assert torch.equal(_bi(pool, [2], _cut(x, 0, 70)), ref[:70])
+    assert torch.equal(_bi(pool, [2], _cut(x, 70, 71)), ref[70:71])
+
+
+@needs_device
+def test_capture_with_a_pending_tail_raises():
+    HQ, HV = 4, 8
+    x, s0 = _inputs(80, HQ, HV, 23)
+    pool = _pool(HV, 1)
+    pool[0] = s0
+    _bi(pool, [0], _cut(x, 0, 70))
+    graph = torch.cuda.CUDAGraph()
+    with pytest.raises(RuntimeError), torch.cuda.graph(graph):
+        _bi(pool, [0], _cut(x, 70, 71))
+    torch.cuda.synchronize()
+    assert torch.equal(_bi(pool, [0], _cut(x, 70, 71)), _reference(x, s0)[0][70:71])
+
+
+@needs_device
 def test_span_as_cuda_graph():
     """A multi-token step on caller-owned buffers reads nothing on the host, so it captures."""
     HQ, HV = 16, 32
