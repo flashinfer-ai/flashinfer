@@ -21,11 +21,11 @@ def test_paged_gqa_auto_retained_capture(dtype, backend, return_lse, dim):
         cudnn.backend_version() < 92400
         or Version(cudnn.__version__) < Version("1.33.0")
         or not cudnn_prefill._cudnn_supports_paged_gqa_auto(dim)
-        or torch.cuda.get_device_capability() != (10, 0)
+        or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
         or not cudnn_prefill.cudnn_frontend_frost_runtime_available()
     ):
         pytest.skip(
-            "requires B200, cuDNN 9.24+, FE 1.33+ matching native and its DSL runtime"
+            "requires B200/B300, cuDNN 9.24+, FE 1.33+ matching native and its DSL runtime"
         )
     torch.manual_seed(171)
     batch, capacity, max_kv, hq, hk, page = 2, 128, 16384, 32, 8, 16
