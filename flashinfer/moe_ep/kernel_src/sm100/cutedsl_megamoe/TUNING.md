@@ -16,6 +16,35 @@ recipe (hardware, container, versions, harness invocation) is in the
 
 ## BF16 input and output fusion
 
+BF16 `batch_invariant=True` sessions tune M128/M256, N128/N256 and
+K64/K128/K256 tiles across the two load-balancing modes and three token-back
+carriers. M128 uses one CTA per cluster; M256 uses a two-CTA instruction
+group. Candidates retain the original ascending K16 fold: K must divide
+both hidden and intermediate dimensions after rounding each up to 64.
+Candidates that cannot fit at least one A/B pipeline stage in shared memory
+are filtered as well. The admitted tile variants share the existing arithmetic
+fingerprint, including the original K64 padding semantics. Explicit tile
+overrides derive the corresponding cluster and CTA mode unless provided.
+Batch-invariant tuning records use a separate admission-policy version so
+older single-tile records do not suppress the expanded search.
+
+The same BF16 backend supports SM107 with native `sm_107a` compilation. Its
+shared-memory admission uses the CUDA oversized-mode budget of 334848 bytes
+per CTA; SM100/SM103 retain 232448 bytes. Oversized mode requires a compatible
+CUDA/CuTe launcher; the standard driver opt-in attribute can still report
+232448 bytes on SM107. The existing K64 padding and ordered K16 arithmetic are unchanged.
+SM107 has an independent architecture fingerprint; compatibility targets
+captured for SM100 are rejected before allocating the compiled-kernel workspace on SM107.
+
+Multi-GPU SM107 NVLink execution needs a Rubin-aware NCCL, introduced in
+[NCCL 2.32.3](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2323/release-notes/rel_2-32-3.html).
+NCCL 2.30.7 only enumerates 18 NVLink ports per GPU; on 36-port Rubin systems,
+the incomplete topology can fail communicator initialization with
+`Failed to find reverse path`. NCCL 2.32.6 includes the 36-port support.
+When replacing NCCL in a prebuilt PyTorch environment, verify `ncclGetVersion`
+from the loaded `libnccl.so.2`: `torch.cuda.nccl.version()` can retain
+PyTorch's build-time version.
+
 BF16-activation CuTeDSL backends share a single staging launch for the
 activation, expert IDs, routing weights and full routing-capacity tail.
 The vectorized path requires contiguous CUDA tensors and 16-byte-aligned
