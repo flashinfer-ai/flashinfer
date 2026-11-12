@@ -966,6 +966,20 @@ def device_support_pdl(device: torch.device) -> bool:
     return major >= 9
 
 
+def resolve_enable_pdl(enable_pdl: Optional[bool], device: torch.device) -> bool:
+    """Resolve an ``enable_pdl`` argument for ``device``.
+
+    ``None`` enables programmatic dependent launch (PDL) where the device
+    supports it; ``True`` and ``False`` are returned unchanged; any other value
+    raises ``TypeError``.
+    """
+    if enable_pdl is None:
+        return device_support_pdl(device)
+    if not isinstance(enable_pdl, bool):
+        raise TypeError("enable_pdl must be a bool or None")
+    return enable_pdl
+
+
 def ceil_div(x: int, y: int) -> int:
     """
     Perform ceiling division of two integers.

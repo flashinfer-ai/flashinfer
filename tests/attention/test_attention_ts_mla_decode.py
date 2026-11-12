@@ -16,10 +16,12 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, replace
 import inspect
 import functools
 import math
+import textwrap
 from types import SimpleNamespace
 from typing import Sequence
 
@@ -45,13 +47,16 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from flashinfer.attention.prims_ts import (
     BatchMLADecodePagedTSWrapper,
+    BatchSparseMLADecodePagedTSWrapper,
     MLAAttentionTuning,
     batch_mla_decode_with_paged_kv_cache,
+    get_prims_ts_sparse_mla_decode_workspace_size,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
     make_mla_decode_config,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.kernel import (
+    MlaDecodeTs,
     build_mla_decode_task_manager,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.resources import (
@@ -66,8 +71,15 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.query import (
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
     make_throughput_latency_mla_config,
 )
+from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.kernel import (
+    ThroughputLatencyMlaDecodeTs,
+)
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.parallel_reduction import (
     GMEM_REDUCTION_RUNTIME_SPLIT_WINDOWS,
+    run_parallel_gmem_reduction_kernel,
+)
+from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.reduction import (
+    run_gmem_reduction_kernel,
 )
 from flashinfer.mla import (
     get_prims_ts_batch_mla_decode_workspace_size,
@@ -1218,6 +1230,11 @@ def test_attention_ts_mla_public_surfaces_hide_internal_tuning_policy():
     violations = []
     for surface in surfaces:
         for parameter in inspect.signature(surface).parameters.values():
+            if parameter.name == "enable_pdl":
+                # The FlashInfer-wide PDL switch, resolved at planning.
+                assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+                assert parameter.default is None
+                continue
             if parameter.kind is inspect.Parameter.VAR_KEYWORD:
                 violations.append(f"{surface.__qualname__}.**{parameter.name}")
                 continue
@@ -1275,6 +1292,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "workspace_buffer",
         "validate",
         "tuning",
+        "enable_pdl",
     )
     for name in (
         "device",
@@ -1315,6 +1333,191 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
     assert run_parameters["qo_indptr"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
+
+
+class _MLACompileReached(Exception):
+    """Ends a CPU plan at the compile call."""
+
+
+def _cpu_mla_kernel(family: str):
+    """Build a 2CTA kernel for ``"2cta"`` and a 1CTA kernel otherwise."""
+    if family == "2cta":
+        return MlaDecodeTs()
+    return ThroughputLatencyMlaDecodeTs(
+        batch_size=1,
+        num_heads=8,
+        seq_len_q=1,
+        seq_len_k=4096,
+        max_active_clusters=148,
+        logical_num_heads=8,
+        logical_seq_len_q=1,
+        tile_size_q=8,
+    )
+
+
+def _capture_mla_compile_specs(monkeypatch) -> list:
+    """Record each spec a plan hands to the compiler and stop the plan there."""
+    compile_specs = []
+
+    def compile_spec_only(compile_spec):
+        compile_specs.append(compile_spec)
+        raise _MLACompileReached
+
+    monkeypatch.setattr(
+        mla_decode_module, "_get_compiled_mla_decode", compile_spec_only
+    )
+    return compile_specs
+
+
+@pytest.mark.parametrize("family", ("1cta", "2cta"))
+def test_attention_ts_mla_plan_enable_pdl_reaches_the_compiled_kernel(
+    monkeypatch, family
+):
+    """plan(enable_pdl=...) sets the compiled kernel's flag and its compile key."""
+
+    launch_spec = mla_decode_module._MLADecodeLaunchSpec(
+        kernel=_cpu_mla_kernel(family),
+        policy=(),
+        kernel_workspace_bytes=0,
+        split_kv=1,
+    )
+    monkeypatch.setattr(
+        mla_decode_module,
+        "_resolve_cuda_device",
+        lambda _device: (torch.device("cuda", 0), 0),
+    )
+    monkeypatch.setattr(
+        mla_decode_module, "_resolve_mla_decode_launch_spec", lambda *_a: launch_spec
+    )
+    # Keep the CPU-built specs out of the shared compile-spec cache.
+    monkeypatch.setattr(
+        mla_decode_module,
+        "_cached_mla_decode_compile_spec",
+        mla_decode_module._make_mla_decode_compile_spec,
+    )
+    compile_specs = _capture_mla_compile_specs(monkeypatch)
+    for enable_pdl in (False, True):
+        with pytest.raises(_MLACompileReached):
+            BatchMLADecodePagedTSWrapper().plan(
+                0,
+                1,
+                8,
+                _LATENT_DIM,
+                _ROPE_DIM,
+                _DEFAULT_PAGE_SIZE,
+                4096,
+                max_q_len=1,
+                packed_query=False,
+                q_dtype=torch.bfloat16,
+                kv_dtype=torch.bfloat16,
+                out_dtype=torch.bfloat16,
+                workspace_buffer=torch.empty(0, dtype=torch.int8),
+                validate=False,
+                enable_pdl=enable_pdl,
+            )
+    without_pdl, with_pdl = compile_specs
+    assert without_pdl.kernel.enable_pdl is False
+    assert with_pdl.kernel.enable_pdl is True
+    # The spec is the compiled-kernel cache key: the plans never share a kernel.
+    assert without_pdl != with_pdl
+
+
+@pytest.mark.parametrize("family", ("swap", "2cta"))
+def test_attention_ts_sparse_mla_plan_enable_pdl_reaches_the_compiled_kernel(
+    monkeypatch, family
+):
+    """The sparse plan recompiles under its own enable_pdl, not the resolver's."""
+
+    launch_spec = mla_decode_module._MLADecodeLaunchSpec(
+        kernel=_cpu_mla_kernel(family),
+        policy=(),
+        kernel_workspace_bytes=0,
+        split_kv=1,
+    )
+    resolved_spec = mla_decode_module._make_mla_decode_compile_spec(
+        launch_spec,
+        device_index=0,
+        num_qo_heads=64,
+        kv_lora_rank=_LATENT_DIM,
+        qk_rope_head_dim=_ROPE_DIM,
+        page_size=1,
+        q_dtype_key="bfloat16",
+        out_dtype_key="bfloat16",
+        max_q_len=1,
+        packed_query=False,
+        enable_pdl=True,
+    )
+
+    def resolve_sparse_plan(_device, _batch_size, _num_qo_heads, **plan_kwargs):
+        # The resolver takes no enable_pdl: PDL does not change the scratch.
+        assert "enable_pdl" not in plan_kwargs
+        profile = SimpleNamespace(family=family, split_kv=1)
+        return torch.device("cpu"), profile, resolved_spec, {}, 256, 1, None
+
+    monkeypatch.setattr(
+        mla_decode_module, "_resolve_sparse_mla_plan", resolve_sparse_plan
+    )
+    compile_specs = _capture_mla_compile_specs(monkeypatch)
+    plan_kwargs = dict(max_topk=128, q_dtype=torch.bfloat16)
+    assert (
+        get_prims_ts_sparse_mla_decode_workspace_size(
+            "cpu", 1, 64, enable_pdl=True, **plan_kwargs
+        )
+        == 256
+    )
+    for enable_pdl in (False, True):
+        with pytest.raises(_MLACompileReached):
+            BatchSparseMLADecodePagedTSWrapper().plan(
+                "cpu", 1, 64, enable_pdl=enable_pdl, **plan_kwargs
+            )
+    without_pdl, with_pdl = compile_specs
+    assert without_pdl.kernel.enable_pdl is False
+    assert with_pdl.kernel.enable_pdl is True
+    assert without_pdl != with_pdl
+
+
+def _is_mla_pdl_guard(node: ast.AST) -> bool:
+    """Match ``if cutlass.const_expr(<the kernel's enable_pdl>):``."""
+    return (
+        isinstance(node, ast.If)
+        and isinstance(node.test, ast.Call)
+        and ast.unparse(node.test.func) == "cutlass.const_expr"
+        and [ast.unparse(arg) for arg in node.test.args]
+        in (["self.enable_pdl"], ["use_pdl"])
+    )
+
+
+@pytest.mark.parametrize(
+    "grid_body",
+    (
+        MlaDecodeTs.split_kv_kernel,
+        MlaDecodeTs.reduction_kernel,
+        MlaDecodeTs.parallel_reduction_kernel,
+        ThroughputLatencyMlaDecodeTs.dense_kernel,
+        run_gmem_reduction_kernel,
+        run_parallel_gmem_reduction_kernel,
+    ),
+    ids=lambda grid_body: grid_body.__qualname__,
+)
+def test_attention_ts_mla_pdl_grids_wait_and_release_under_enable_pdl(grid_body):
+    """Every MLA producer and reducer grid launched under ``enable_pdl`` waits
+    for the preceding grid and releases the following one, both only under
+    that flag."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(grid_body)))
+    actions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and ast.unparse(node.value) == "prims.GridDepAction"
+    ]
+    guarded = {
+        id(node)
+        for guard in ast.walk(tree)
+        if _is_mla_pdl_guard(guard)
+        for node in ast.walk(guard)
+    }
+    assert {action.attr for action in actions} == {"WAIT", "LAUNCH_DEPENDENTS"}
+    assert all(id(action) in guarded for action in actions)
 
 
 def test_attention_ts_mla_decode_wrapper_trace_names_softmax_rescale_threshold_log2():

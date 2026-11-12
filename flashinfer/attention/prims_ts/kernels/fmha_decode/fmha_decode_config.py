@@ -697,9 +697,10 @@ class FmhaDecodeConfig:
     query_major_memberships: bool = False
     # None preserves each sparse family's default in raw/static configs too.
     share_pattern_across_kv_heads: bool | None = None
-    # Allow the attention grid to acquire a programmatic launch dependency.
-    # Callers must opt in only when a producer was launched immediately before
-    # attention on the same stream and will release that dependency.
+    # Launch attention and its standalone reducer with programmatic dependent
+    # launch: each grid waits for the preceding grid before it reads any input
+    # and releases the following grid at its tail. ``make_decode_config``
+    # resolves the effective value (see ``supports_pdl``).
     use_pdl: bool = False
     heads_q_per_kv: int = 0
     groups_tokens_heads_q: bool = False
@@ -1656,9 +1657,22 @@ class FmhaDecodeConfig:
         return self.use_separate_reduction_kernel
 
     @property
-    def use_parallel_separate_reduction_pdl(self) -> bool:
-        """Order every production standalone reducer through PDL."""
-        return self.use_separate_reduction_kernel
+    def supports_pdl(self) -> bool:
+        """Whether a requested PDL launch keeps PDL.
+
+        Split launches keep PDL only with nonpersistent attention and a
+        standalone GMEM reducer; split launches with a fused GMEM reduction,
+        a cluster reduction, or a persistent scheduler launch with plain
+        stream ordering.
+        """
+        return not (
+            self.use_split_kv
+            and (
+                not self.use_separate_reduction_kernel
+                or self.use_cluster_smem_reduction
+                or self.use_persistent_scheduler
+            )
+        )
 
     @property
     def parallel_reduction_padded_splits(self) -> int:
@@ -3916,6 +3930,17 @@ def _finalize_warp_roles(cfg: FmhaDecodeConfig) -> None:
         next_warp_idx += role.num_warps
 
 
+def _resolve_effective_pdl(cfg: FmhaDecodeConfig, requested_pdl: bool) -> None:
+    """Set ``cfg.use_pdl`` once the launch mode is final.
+
+    This is the single rule for the effective PDL flag, applied by both the
+    static and the shape-driven paths of ``make_decode_config``: a requested
+    PDL launch keeps PDL only when ``cfg.supports_pdl``; otherwise it launches
+    with plain stream ordering. It never turns PDL on.
+    """
+    cfg.use_pdl = requested_pdl and cfg.supports_pdl
+
+
 def _make_static_decode_config(
     headdim: int = 128,
     args: object | None = None,
@@ -3929,6 +3954,7 @@ def _make_static_decode_config(
     config object, or a tuple/list of those sources. Only ``FmhaDecodeConfig``
     fields are read from it. ``None`` values mean "keep the default"; mappings
     are the appropriate source when omitted fields should remain implicit.
+    A requested ``use_pdl`` is resolved by ``_resolve_effective_pdl``.
     """
     cfg = FmhaDecodeConfig(headdim=headdim)
     explicit_fields = _apply_config_source(cfg, args)
@@ -3947,6 +3973,7 @@ def _make_static_decode_config(
     _validate_mixed_kv_dtype_profile(cfg)
     _validate_kv256_static_config(cfg)
     _finalize_warp_roles(cfg)
+    _resolve_effective_pdl(cfg, cfg.use_pdl)
     cfg.fixed_seqlen = fixed_seqlen
     return cfg
 
@@ -5322,15 +5349,7 @@ def _validate_profile_support(
         and use_groups_tokens_heads_q
         and cfg.uses_q_token_kv_block_sparse_page_route
     )
-    if (
-        cfg.use_pdl
-        and cfg.use_split_kv
-        and (
-            not cfg.use_separate_reduction_kernel
-            or cfg.use_cluster_smem_reduction
-            or cfg.use_persistent_scheduler
-        )
-    ):
+    if cfg.use_pdl and not cfg.supports_pdl:
         raise ValueError(
             "split PDL requires nonpersistent attention with a standalone GMEM reducer"
         )
@@ -5691,8 +5710,9 @@ def make_decode_config(
     """Build the static decode kernel config and apply auto-selection policy.
 
     When no launch-shape inputs are supplied, this is the simple static config
-    constructor: it reads only ``FmhaDecodeConfig`` fields from ``args`` and
-    applies static profile defaults. When launch-shape inputs are supplied, it
+    constructor: it reads only ``FmhaDecodeConfig`` fields from ``args``,
+    applies static profile defaults and resolves the effective ``use_pdl``
+    with the same rule as step 6. When launch-shape inputs are supplied, it
     additionally runs the decode kernel-selection workflow below.
 
     ``q_dtype``, ``k_dtype``, and ``v_dtype`` select independent storage types.
@@ -5734,7 +5754,10 @@ def make_decode_config(
        reducer with inline reduction as a support fallback. A jointly scored
        recipe keeps its exact fanout; the legacy launch path may search
        downward for a one-wave cluster split.
-    6. Validate the final profile combination before returning the config.
+    6. Resolve the effective ``use_pdl`` (``_resolve_effective_pdl``): every
+       step above runs with PDL off, so PDL never changes the selected launch;
+       a requested PDL launch keeps it only when ``supports_pdl``. Validate
+       the final profile combination before returning the config.
 
     Outside joint grouped-Q selection, attention-sink paths retain their
     existing launch mode. Explicit launch modes are still validated.
@@ -5790,6 +5813,10 @@ def make_decode_config(
     validate_sliding_window_args(sliding_window_causal, attention_window_size)
     cfg = FmhaDecodeConfig(headdim=headdim)
     explicit_fields = _apply_config_source(cfg, args)
+    # PDL never steers launch selection: every probe below runs with it off,
+    # and the effective flag is resolved once the launch mode is final.
+    requested_pdl = cfg.use_pdl
+    cfg.use_pdl = False
     # Policy selection uses the planned lengths; only the compiled program
     # replaces them with runtime operands.
     fixed_seqlen = cfg.fixed_seqlen
@@ -5992,6 +6019,8 @@ def make_decode_config(
     _validate_mixed_kv_dtype_profile(cfg)
     _validate_kv256_static_config(cfg)
     _finalize_warp_roles(cfg)
+
+    _resolve_effective_pdl(cfg, requested_pdl)
 
     _validate_profile_support(
         cfg=cfg,

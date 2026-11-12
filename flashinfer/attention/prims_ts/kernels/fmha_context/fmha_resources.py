@@ -462,6 +462,9 @@ class FmhaConfig:
     # Misc
     buffer_align_bytes: int = 1024
     tmem_bar_id: int = 2
+    # Launch with PDL: wait for the preceding grid before the first global
+    # read and release the dependent grid after the CTA's last global write.
+    enable_pdl: bool = False
     cluster_shape_mn: tuple[int, int] = (1, 1)
     block_warps: int = 16
 

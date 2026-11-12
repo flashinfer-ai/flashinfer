@@ -255,22 +255,6 @@ def _runtime_active_splits_kv(
 
 
 @cute.jit
-def runtime_split_kv_is_active(
-    cfg: FmhaDecodeConfig,
-    seq_len_kv: Int32,
-    seq_len_q: Int32,
-    q_token_base: Int32,
-    split_idx: Int32,
-) -> cutlass.Boolean:
-    """Test a split's first tile without dividing by its runtime local span."""
-    total_kv_tiles = _runtime_total_kv_tiles(cfg, seq_len_kv, seq_len_q, q_token_base)
-    local_kv_tiles = _runtime_configured_local_kv_tiles(
-        cfg, seq_len_kv, seq_len_q, q_token_base
-    )
-    return split_idx * local_kv_tiles < total_kv_tiles
-
-
-@cute.jit
 def _runtime_execution_splits_kv(
     cfg: FmhaDecodeConfig,
     seq_len_kv: Int32,

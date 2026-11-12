@@ -286,8 +286,8 @@ def run_parallel_reduction_kernel(
     publishes a neutral-or-valid ``(FP32 LSE, BF16 O[512])`` state to DSMEM and
     rank zero performs the final merge. Arithmetic remains FP32.
 
-    For a one-wave producer, the caller waits for its post-TMEM dependent-launch
-    signal before entering this body.
+    Under ``enable_pdl`` the caller waits for the producer grid before this
+    body and releases the following grid after it.
     """
 
     if cutlass.const_expr(finalize_attention and cluster_size != 1):

@@ -896,8 +896,6 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 "prims-ts",
                 "requires an integral Q/KV head ratio between 1 and 128",
             )
-        elif args.enable_pdl:
-            print("[WARNING] prims-ts does not expose PDL; ignoring --enable_pdl.")
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -1188,6 +1186,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             mask_type=prims_ts_mask_type,
             seq_lens_kv=actual_seq_lens_kv.flatten().tolist(),
             workspace_buffer=workspace_buffer,
+            enable_pdl=args.enable_pdl,
         )
 
     backend_outputs = {}
@@ -1663,8 +1662,6 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             )
         elif num_qo_heads % num_kv_heads != 0:
             _drop_backend(backends, "prims-ts", "requires Hq to be divisible by Hkv")
-        elif args.enable_pdl:
-            print("[WARNING] prims-ts does not expose PDL; ignoring --enable_pdl.")
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -1937,6 +1934,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             output_scale=prims_ts_output_scale,
             uniform_packed_lengths=not args.random_actual_seq_len,
             has_q_offset=causal and s_qo != s_kv,
+            enable_pdl=args.enable_pdl,
         )
 
     # Prepare wrappers (after FP8 conversion so we have correct dtypes)
@@ -2617,8 +2615,6 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             )
         elif num_qo_heads % num_kv_heads != 0:
             _drop_backend(backends, "prims-ts", "requires Hq to be divisible by Hkv")
-        elif args.enable_pdl:
-            print("[WARNING] prims-ts does not expose PDL; ignoring --enable_pdl.")
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -2914,6 +2910,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             softmax_scale=prims_ts_softmax_scale,
             output_scale=prims_ts_output_scale,
             out_dtype=out_dtype,
+            enable_pdl=args.enable_pdl,
         )
 
     # Build the input argument for trtllm-fmha-v2 once, in whichever layout was
@@ -3504,8 +3501,6 @@ def testBatchMLAPagedAttentionWrapper(args):
                 "prims-ts",
                 "requires page_size in {16, 32, 64, 128}",
             )
-        elif args.enable_pdl:
-            print("[WARNING] prims-ts does not expose PDL; ignoring --enable_pdl.")
     if mla_softmax_rescale_threshold_log2 != 0.0 and "prims-ts" not in backends:
         print(
             "[WARNING] --mla_softmax_rescale_threshold_log2 applies only to "
@@ -3700,6 +3695,7 @@ def testBatchMLAPagedAttentionWrapper(args):
             tuning=prims_ts.MLAAttentionTuning(
                 softmax_rescale_threshold_log2=mla_softmax_rescale_threshold_log2
             ),
+            enable_pdl=args.enable_pdl,
         )
 
     direct_out = None

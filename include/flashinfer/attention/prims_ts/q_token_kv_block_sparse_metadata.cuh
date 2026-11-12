@@ -94,7 +94,9 @@ struct QTokenKvBlockSparseTouchedMetadataParams {
   uint_fastdiv subpages_per_storage_page;
   uint_fastdiv pattern_heads;
   int32_t locator_page_stride;
-  bool release_pdl;
+  // Launch with programmatic dependent launch (PDL): every kernel waits for
+  // the preceding grid before reading its inputs and releases its dependent.
+  bool enable_pdl;
   // True: a complete current block competes inside top-k; append only a partial tail.
   // False: exclude the current block from top-k and always append its visible tokens.
   bool count_current_block_in_topk;
@@ -242,8 +244,22 @@ template <typename PositionType>
 __device__ __forceinline__ void ReleasePdlDependents(
     const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params) {
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  if (params.release_pdl) {
+  if (params.enable_pdl) {
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  }
+#endif
+}
+
+// Under PDL, wait for the preceding grid, which may write the sparse-block
+// selection or the other inputs, before the first global memory access. The
+// release follows the wait, so a dependent grid never starts before the grid
+// that precedes this one has completed.
+template <typename PositionType>
+__device__ __forceinline__ void WaitForPdlPrimary(
+    const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params) {
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if (params.enable_pdl) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
   }
 #endif
 }
@@ -300,6 +316,7 @@ template <typename PositionType, bool PackedQuery>
 __global__
 __launch_bounds__(kQTokenKvBlockSparseQ1BlockThreads) void QTokenKvBlockSparseQ1MetadataKernel(
     const __grid_constant__ QTokenKvBlockSparseTouchedMetadataParams<PositionType> params) {
+  WaitForPdlPrimary(params);
   ReleasePdlDependents(params);
   __shared__ QTokenKvBlockSparseRouteState route;
   if (threadIdx.x == 0) {
@@ -522,6 +539,7 @@ __global__ __launch_bounds__(
                                                                          QTokenKvBlockSparseTouchedMetadataParams<
                                                                              PositionType>
                                                                              params) {
+  WaitForPdlPrimary(params);
   ReleasePdlDependents(params);
   constexpr int kBlockThreads =
       QTokenKvBlockSparseTouchedMetadataKernelTraits<GroupSize>::kBlockThreads;
@@ -534,9 +552,9 @@ __global__ __launch_bounds__(
 
   __shared__ QTokenKvBlockSparseTouchedMetadataSharedStorage<kBlockThreads, kItemsPerThread> shared;
 
-  // Initialize CTA-local state before reading semantic inputs. This metadata
-  // kernel has no producer dependency. Its entry release lets the attention
-  // prologue overlap; the consumer wait still covers all output stores.
+  // Initialize CTA-local state before reading semantic inputs. The entry
+  // release lets the attention prologue overlap; the consumer wait still
+  // covers all output stores.
   if (threadIdx.x == 0) {
     shared.route = {0, -1, 0, 0, -1, -1};
     shared.union_pages = 0;
@@ -709,6 +727,7 @@ template <typename PositionType, int GroupSize, bool PackedQuery, bool QueryMajo
 __global__
 __launch_bounds__(kQTokenKvBlockSparseBitmapBlockThreads) void QTokenKvBlockSparseBitmapMetadataKernel(
     const __grid_constant__ QTokenKvBlockSparseTouchedMetadataParams<PositionType> params) {
+  WaitForPdlPrimary(params);
   ReleasePdlDependents(params);
   const uint32_t group = blockIdx.x / params.pattern_heads;
   const uint32_t head = blockIdx.x % params.pattern_heads;
@@ -1044,6 +1063,26 @@ __launch_bounds__(kQTokenKvBlockSparseBitmapBlockThreads) void QTokenKvBlockSpar
   }
 }
 
+// One metadata grid; enable_pdl sets the programmatic stream serialization
+// attribute that the in-kernel wait and release pair with.
+template <typename PositionType>
+cudaError_t LaunchQTokenKvBlockSparseMetadataKernel(
+    void (*kernel)(const QTokenKvBlockSparseTouchedMetadataParams<PositionType>), int64_t grid,
+    int block, size_t smem_bytes, cudaStream_t stream,
+    const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params) {
+  cudaLaunchConfig_t config = {};
+  config.gridDim = dim3(static_cast<uint32_t>(grid));
+  config.blockDim = dim3(static_cast<uint32_t>(block));
+  config.dynamicSmemBytes = smem_bytes;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = params.enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+  return cudaLaunchKernelEx(&config, kernel, params);
+}
+
 // Cached per host thread, device, and kernel specialization: no shared mutable
 // host state, device-count limit, or repeated setup in a prepared launch.
 struct QTokenKvBlockSparseUnionLaunchState {
@@ -1118,20 +1157,20 @@ cudaError_t LaunchQTokenKvBlockSparseTouchedMetadataTyped(
     }
   }
   if (use_map) {
-    map_kernel<<<routes, kQTokenKvBlockSparseBitmapBlockThreads, map_smem_bytes, stream>>>(params);
-  } else {
-    sort_kernel<<<routes, kSortBlockThreads, 0, stream>>>(params);
+    return LaunchQTokenKvBlockSparseMetadataKernel<PositionType>(
+        map_kernel, routes, kQTokenKvBlockSparseBitmapBlockThreads, map_smem_bytes, stream, params);
   }
-  return cudaGetLastError();
+  return LaunchQTokenKvBlockSparseMetadataKernel<PositionType>(
+      sort_kernel, routes, kSortBlockThreads, 0, stream, params);
 }
 
 template <typename PositionType, bool PackedQuery>
 cudaError_t LaunchQTokenKvBlockSparseQ1MetadataTyped(
     QTokenKvBlockSparseTouchedMetadataParams<PositionType> params, cudaStream_t stream) {
   auto kernel = QTokenKvBlockSparseQ1MetadataKernel<PositionType, PackedQuery>;
-  kernel<<<params.groups* static_cast<uint32_t>(params.pattern_heads),
-           kQTokenKvBlockSparseQ1BlockThreads, 0, stream>>>(params);
-  return cudaGetLastError();
+  return LaunchQTokenKvBlockSparseMetadataKernel<PositionType>(
+      kernel, static_cast<int64_t>(params.groups) * static_cast<uint32_t>(params.pattern_heads),
+      kQTokenKvBlockSparseQ1BlockThreads, 0, stream, params);
 }
 
 }  // namespace detail

@@ -2339,9 +2339,11 @@ def test_sparse_task_cache_accessors_reuse_the_existing_two_slots() -> None:
         pytest.param(64, True, id="paged"),
     ),
 )
+@pytest.mark.parametrize("enable_pdl", (False, True))
 def test_block_sparse_config_derives_storage_layout_from_page_size(
     page_size: int | None,
     expected_use_paged_kv: bool,
+    enable_pdl: bool,
 ) -> None:
     cfg = block_sparse_config._make_block_sparse_config(
         block_sparse_config._BlockSparseCompileKey(
@@ -2363,12 +2365,170 @@ def test_block_sparse_config_derives_storage_layout_from_page_size(
             use_persistent_scheduler=False,
             use_parallel_sparse_kv_loads=False,
             page_size=page_size,
+            enable_pdl=enable_pdl,
         )
     )
 
     assert cfg.use_paged_kv is expected_use_paged_kv
+    assert cfg.use_pdl is enable_pdl
     if page_size is not None:
         assert cfg.num_tokens_per_page == page_size
+
+
+class _RoutePrepareBuilt(Exception):
+    """Ends a CPU adapter compile once its route prepare is built."""
+
+
+@pytest.mark.parametrize("sparse_format", ("bsr", "bitmask"))
+@pytest.mark.parametrize("enable_pdl", (False, True))
+def test_block_sparse_prepares_follow_enable_pdl(
+    monkeypatch: pytest.MonkeyPatch, sparse_format: str, enable_pdl: bool
+) -> None:
+    """A Sage block-sparse plan's two prepares launch under its enable_pdl."""
+    from flashinfer.attention.prims_ts._block_sparse import compiler
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import (
+        block_sparse_prepare,
+    )
+    from flashinfer.attention.prims_ts.sage import prepare as sage_prepare
+
+    built = {}
+
+    def record(name: str, prepare_type: type, stop: bool) -> Callable[..., object]:
+        def build(**kwargs: object) -> object:
+            built[name] = prepare_type(**kwargs)
+            if stop:
+                raise _RoutePrepareBuilt
+            return built[name]
+
+        return build
+
+    monkeypatch.setattr(
+        sage_prepare,
+        "_PrepareSageScales",
+        record("sage", sage_prepare._PrepareSageScales, stop=False),
+    )
+    for name in ("_PrepareBsrRoutes", "_PrepareBitmaskRoutes"):
+        prepare_type = getattr(block_sparse_prepare, name)
+        monkeypatch.setattr(
+            block_sparse_prepare, name, record("routes", prepare_type, stop=True)
+        )
+    # A CPU stand-in for one B200: the config reads the device capability.
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_args: (10, 0))
+    key = block_sparse_config._BlockSparseCompileKey(
+        device_index=0,
+        batch_size=1,
+        seq_len_q=64,
+        seq_len_kv=4096,
+        num_qo_heads=8,
+        num_kv_heads=8,
+        head_dim=_HEAD_DIM,
+        q_block_size=64,
+        kv_block_size=64,
+        kv_route_size=256,
+        dtype_key="int8",
+        out_dtype_key="bfloat16",
+        v_dtype_key="float8_e4m3fn",
+        mask_type="dense",
+        use_kv_valid_bits=False,
+        use_persistent_scheduler=True,
+        use_parallel_sparse_kv_loads=False,
+        sparse_format=sparse_format,
+        sage=prims_ts.SageAttentionConfig(k_block_size=16),
+        enable_pdl=enable_pdl,
+    )
+    with pytest.raises(_RoutePrepareBuilt):
+        compiler._compile_block_sparse(key)
+    assert built["routes"].use_pdl is enable_pdl
+    assert built["sage"].enable_pdl is enable_pdl
+
+
+class _PlanReachedCompile(Exception):
+    """Ends a CPU plan at its compile-cache lookup, carrying the compile key."""
+
+
+@pytest.mark.parametrize(
+    ("enable_pdl", "device_supports_pdl", "expected_pdl"),
+    (
+        pytest.param(False, True, False, id="false"),
+        pytest.param(True, False, True, id="true"),
+        pytest.param(None, False, False, id="none-unsupported"),
+        pytest.param(None, True, True, id="none-supported"),
+    ),
+)
+@pytest.mark.parametrize("paged", (False, True), ids=("contiguous", "paged"))
+def test_block_sparse_plan_enable_pdl_reaches_compile_key(
+    monkeypatch: pytest.MonkeyPatch,
+    paged: bool,
+    enable_pdl: bool | None,
+    device_supports_pdl: bool,
+    expected_pdl: bool,
+) -> None:
+    """plan() keys the compiled adapter by its resolved enable_pdl."""
+    import flashinfer.utils
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+
+    device = torch.device("cuda", 1)
+
+    def device_support_pdl(queried: torch.device) -> bool:
+        assert queried == device
+        return device_supports_pdl
+
+    def stop_at_compile(key: object) -> None:
+        raise _PlanReachedCompile(key)
+
+    monkeypatch.setattr(flashinfer.utils, "device_support_pdl", device_support_pdl)
+    monkeypatch.setattr(
+        block_sparse_module,
+        "_resolve_cuda_device",
+        lambda _device: (device, device.index),
+    )
+    monkeypatch.setattr(
+        block_sparse_module, "_validate_runtime_device", lambda _device: None
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: object())
+    monkeypatch.setattr(torch.cuda, "device", lambda _index: nullcontext())
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_args: (10, 0))
+    monkeypatch.setattr(
+        fmha_decode_config, "_select_auto_launch_mode", lambda **_kwargs: "static"
+    )
+    # Resolve uncached, so no launch spec built on these stubs stays cached.
+    monkeypatch.setattr(
+        block_sparse_plan,
+        "_resolve_block_sparse_launch_spec",
+        block_sparse_config._resolve_block_sparse_launch_spec.__wrapped__,
+    )
+    monkeypatch.setattr(
+        block_sparse_plan, "_get_compiled_block_sparse", stop_at_compile
+    )
+
+    wrapper_type = (
+        block_sparse_module.BlockSparsePagedTSWrapper
+        if paged
+        else block_sparse_module.BlockSparseTSWrapper
+    )
+    page_size = (64,) if paged else ()
+    with pytest.raises(_PlanReachedCompile) as reached:
+        wrapper_type().plan(
+            1,
+            64,
+            256,
+            1,
+            1,
+            _HEAD_DIM,
+            64,
+            64,
+            *page_size,
+            device=device,
+            max_blocks_per_row=4,
+            use_kv_valid_bits=False,
+            enable_pdl=enable_pdl,
+        )
+
+    (key,) = reached.value.args
+    assert isinstance(key, block_sparse_config._BlockSparseCompileKey)
+    assert key.enable_pdl is expected_pdl
 
 
 @pytest.mark.parametrize(

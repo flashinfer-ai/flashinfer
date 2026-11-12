@@ -63,7 +63,7 @@ Resource and task flow:
                 | UmmaAsync |
                 +-----+-----+
                       |
-                      | StoreTask preloads optional rowcol scales,
+                      | StoreTask: PDL wait, preloads optional rowcol scales,
                       | waits accumulator, Tmem to Regs load,
                       | scales / bias, optional gated SiLU, TMA store
                       v
@@ -73,7 +73,8 @@ Resource and task flow:
                  +---------+
 
 WorkQueue: every task advances the same persistent tile stream.
-PdlWait runs before LoadATask; LoadATask signals PdlLaunch after the loop.
+Under ``enable_pdl``, LoadATask and StoreTask wait on PdlWait before their
+first global access, and LoadATask signals PdlLaunch after the loop.
 """
 
 import os
@@ -147,6 +148,10 @@ _NVFP4_GLOBAL_MAX = _FP8_E4M3_MAX * _FP4_E2M1_MAX
 # One E4M3 block scale per 16 FP4 K elements. E8M0 is not supported.
 _SF_VEC_SIZE = 16
 sf_dtype = cutlass.Float8E4M3FN
+# Compile-time: programmatic dependent launch. Decides the launch attribute,
+# every griddepcontrol.wait and the griddepcontrol.launch_dependents; False
+# emits none of them.
+enable_pdl = True
 # Compile-time: FP8 per-token (M) and per-channel (N) epilogue scales.
 use_per_token_channel_scale = False
 # Compile-time: fused SwiGLU in the epilogue. B/bias/weight_scale are
@@ -2766,14 +2771,19 @@ def create_work_queue(
 def create_load_a_task(
     gmem_ab_resource: GmemAbResource,
     smem_a_resource: SmemAbResource,
-    pdl_wait: PdlWaitBarrier,
-    pdl_launch: PdlLaunchBarrier,
+    pdl_wait: Optional[PdlWaitBarrier],
+    pdl_launch: Optional[PdlLaunchBarrier],
     work_queue: WorkQueue,
     num_k_tiles: int,
     smem_sf_resource: SmemSfResource = None,
 ) -> Task:
     """
     Create the A TMA load task. NVFP4 also loads SFA on this warp.
+
+    Under ``enable_pdl`` the task waits on ``pdl_wait`` before its first A
+    (and SFA) load and signals ``pdl_launch`` after its last one. Without it
+    both barriers are ``None``. ``@schedule`` rejects ``None``, so they are
+    left out of the call and of the task's resources.
     """
 
     if cutlass.const_expr(use_nvfp4_block_scale):
@@ -2783,11 +2793,11 @@ def create_load_a_task(
             gmem_ab: GmemAbResource,
             smem_a: SmemAbResource,
             smem_sf: SmemSfResource,
-            pdl_wait_resource: PdlWaitBarrier,
-            pdl_launch_resource: PdlLaunchBarrier,
             wq: WorkQueue,
+            *pdl_resources,
         ) -> None:
-            pdl_wait_resource.wait_griddep()
+            if cutlass.const_expr(enable_pdl):
+                pdl_resources[0].wait_griddep()
             smem_a.init_load_state()
             smem_sf.init_load_state()
             with work_tile_loop(wq):
@@ -2823,29 +2833,36 @@ def create_load_a_task(
                 wq.wait()
                 wq.get_and_advance_work_tile()
                 wq.release()
-            pdl_launch_resource.launch_griddep()
+            if cutlass.const_expr(enable_pdl):
+                pdl_resources[1].launch_griddep()
 
-        result = load_a_schedule(
-            gmem_ab_resource,
-            smem_a_resource,
-            smem_sf_resource,
-            pdl_wait,
-            pdl_launch,
-            work_queue,
-        )
-        dst_resources = [smem_a_resource, smem_sf_resource, pdl_launch]
+        if cutlass.const_expr(enable_pdl):
+            result = load_a_schedule(
+                gmem_ab_resource,
+                smem_a_resource,
+                smem_sf_resource,
+                work_queue,
+                pdl_wait,
+                pdl_launch,
+            )
+            dst_resources = [smem_a_resource, smem_sf_resource, pdl_launch]
+        else:
+            result = load_a_schedule(
+                gmem_ab_resource, smem_a_resource, smem_sf_resource, work_queue
+            )
+            dst_resources = [smem_a_resource, smem_sf_resource]
     else:
 
         @schedule
         def load_a_schedule(
             gmem_ab: GmemAbResource,
             smem_a: SmemAbResource,
-            pdl_wait_resource: PdlWaitBarrier,
-            pdl_launch_resource: PdlLaunchBarrier,
             wq: WorkQueue,
+            *pdl_resources,
         ) -> None:
-            # PDL wait gates the A-load stream before any persistent work is issued.
-            pdl_wait_resource.wait_griddep()
+            if cutlass.const_expr(enable_pdl):
+                # PDL wait gates the A-load stream before any persistent work is issued.
+                pdl_resources[0].wait_griddep()
             smem_a.init_load_state()
             with work_tile_loop(wq):
                 gmem_ab.init_tile_coords()
@@ -2862,15 +2879,24 @@ def create_load_a_task(
                 wq.wait()
                 wq.get_and_advance_work_tile()
                 wq.release()
-            # PDL launch is emitted only after all persistent A-load work completes.
-            pdl_launch_resource.launch_griddep()
+            if cutlass.const_expr(enable_pdl):
+                # PDL launch is emitted only after all persistent A-load work completes.
+                pdl_resources[1].launch_griddep()
 
-        result = load_a_schedule(
-            gmem_ab_resource, smem_a_resource, pdl_wait, pdl_launch, work_queue
-        )
-        dst_resources = [smem_a_resource, pdl_launch]
+        if cutlass.const_expr(enable_pdl):
+            result = load_a_schedule(
+                gmem_ab_resource, smem_a_resource, work_queue, pdl_wait, pdl_launch
+            )
+            dst_resources = [smem_a_resource, pdl_launch]
+        else:
+            result = load_a_schedule(gmem_ab_resource, smem_a_resource, work_queue)
+            dst_resources = [smem_a_resource]
+    if cutlass.const_expr(enable_pdl):
+        src_resources = [gmem_ab_resource, pdl_wait, work_queue]
+    else:
+        src_resources = [gmem_ab_resource, work_queue]
     return Task(
-        src_resources=[gmem_ab_resource, pdl_wait, work_queue],
+        src_resources=src_resources,
         dst_resources=dst_resources,
         warp_idx=num_epilogue_warps,
         num_warps=1,
@@ -2891,6 +2917,13 @@ def create_load_b_task(
 ) -> Task:
     """
     Create the B TMA load task. NVFP4 also loads SFB on this warp.
+
+    B and SFB are the weights. Under ``enable_pdl`` this task loads them
+    without waiting on the preceding grid, so the first ``ab_stages`` B and
+    SFB stages of each CTA overlap that grid's tail. Later stages are
+    reacquired behind the MMA's release, which follows A data that LoadATask
+    loaded after its wait. A kernel that may still be running when this GEMM
+    starts must therefore not write the weights.
     """
 
     if cutlass.const_expr(use_nvfp4_block_scale):
@@ -2950,7 +2983,7 @@ def create_load_b_task(
             smem_b: SmemAbResource,
             wq: WorkQueue,
         ) -> None:
-            # B-load schedule has the same coordinate flow as A but no PDL dependency.
+            # Same coordinate flow as A, but no PDL wait: B holds the weights.
             smem_b.init_load_state()
             with work_tile_loop(wq):
                 gmem_ab.init_tile_coords()
@@ -3204,12 +3237,16 @@ def create_store_task(
     """
     Create the epilogue store task.
 
-    ``pdl_wait`` is the same barrier LoadATask waits on. It is passed into
-    the schedule only for the per-token/per-channel epilogue, which reads
-    ``x_scale``/``weight_scale`` from global memory before the first
-    accumulator wait and cannot inherit the grid dependency through
-    TMA -> MMA -> TMEM. ``@schedule`` rejects ``None``, so the unused
-    barrier is omitted from the call rather than passed as a null.
+    ``pdl_wait`` is the same barrier LoadATask waits on. Under ``enable_pdl``
+    the store task waits on it before anything else, for every epilogue.
+    Before its first accumulator wait the epilogue reads per-call inputs
+    (``x_scale``, ``weight_scale``, ``positions``) and stages the Q/K norm
+    weights, and on a CTA's first tile nothing orders those reads after
+    LoadATask's wait through TMA -> MMA -> TMEM. The epilogue's next step is
+    the first accumulator wait, which already needs LoadATask's wait and a
+    full mainloop, so waiting first delays only those few reads.
+    Without ``enable_pdl`` the barrier is ``None``. ``@schedule`` rejects
+    ``None``, so it is left out of the call and of the task's resources.
     """
     subtile_cnt = mma_tiler_mnk[1] // (num_epilogue_warps // 4) // _EPILOGUE_TILE_N
     overlap_prefix_subtiles = (
@@ -3224,9 +3261,9 @@ def create_store_task(
         *optional_resources,
     ) -> None:
         # t2r_rmem flows from TmemCResource.load_subtile() into GmemDResource.store().
-        if cutlass.const_expr(use_per_token_channel_scale):
+        if cutlass.const_expr(enable_pdl):
             pdl_wait_resource = optional_resources[0]
-            # Gate the scale loads on the producing kernel under PDL.
+            # Every global read and write of the epilogue follows the preceding grid.
             pdl_wait_resource.wait_griddep()
         tmem_c.init_store_state()
         if cutlass.const_expr(use_fused_qknorm_rope):
@@ -3296,7 +3333,7 @@ def create_store_task(
             wq.get_and_advance_work_tile()
             wq.release()
 
-    if cutlass.const_expr(use_per_token_channel_scale):
+    if cutlass.const_expr(enable_pdl):
         # CuTe DSL 4.9 rejects mutating a Python list while tracing this
         # staged branch. Keep the source schedule and resources identical
         # while constructing the two constexpr variants directly.
@@ -3497,8 +3534,9 @@ def _create_gemm_pipeline(
             act_b_mcast_template,
         )
         smem_sfb_resource._alloc = smem_sfb_alloc
-    pdl_wait = PdlWaitBarrier(name="PdlWait")
-    pdl_launch = PdlLaunchBarrier(name="PdlLaunch")
+    # Without PDL the kernel has no grid-dependency barriers at all.
+    pdl_wait = PdlWaitBarrier(name="PdlWait") if enable_pdl else None
+    pdl_launch = PdlLaunchBarrier(name="PdlLaunch") if enable_pdl else None
 
     tmem_c_resource = create_tmem_c_resource(
         num_epilogue_warps,
@@ -3593,7 +3631,7 @@ def _create_gemm_pipeline(
         work_queue,
         num_k_tiles,
         num_epilogue_warps,
-        pdl_wait if use_per_token_channel_scale else None,
+        pdl_wait,
     )
     task_list = [load_a_task, load_b_task, mma_task, store_task]
 
@@ -3613,32 +3651,34 @@ def _create_gemm_pipeline(
         )
         task_list.append(work_schedule_task)
 
-    # Dependency graph records value/pipeline flow between resources.
-    resource_dependency_graph = {
-        pdl_launch: [],
-        smem_a_resource: [gmem_ab_resource, pdl_wait, work_queue],
-        smem_b_resource: [gmem_ab_resource, work_queue],
-        tmem_c_resource: (
-            [
-                smem_a_resource,
-                smem_b_resource,
-                smem_sfa_resource,
-                smem_sfb_resource,
-                work_queue,
-            ]
-            if use_nvfp4_block_scale
-            else [smem_a_resource, smem_b_resource, work_queue]
-        ),
-        gmem_d_resource: (
-            [tmem_c_resource, work_queue, pdl_wait]
-            if use_per_token_channel_scale
-            else [tmem_c_resource, work_queue]
-        ),
-    }
+    # Dependency graph records value/pipeline flow between resources. Under
+    # PDL, the pdl_wait edges make the TaskManager check that A, SFA and every
+    # epilogue global access follow a wait_griddep in the task that produces
+    # them. B and SFB are the weights (see create_load_b_task).
+    pdl_upstream = [pdl_wait] if enable_pdl else []
+    resource_dependency_graph = {pdl_launch: []} if enable_pdl else {}
+    resource_dependency_graph.update(
+        {
+            smem_a_resource: [gmem_ab_resource, *pdl_upstream, work_queue],
+            smem_b_resource: [gmem_ab_resource, work_queue],
+            tmem_c_resource: (
+                [
+                    smem_a_resource,
+                    smem_b_resource,
+                    smem_sfa_resource,
+                    smem_sfb_resource,
+                    work_queue,
+                ]
+                if use_nvfp4_block_scale
+                else [smem_a_resource, smem_b_resource, work_queue]
+            ),
+            gmem_d_resource: [tmem_c_resource, work_queue, *pdl_upstream],
+        }
+    )
     if cutlass.const_expr(use_nvfp4_block_scale):
         resource_dependency_graph[smem_sfa_resource] = [
             gmem_ab_resource,
-            pdl_wait,
+            *pdl_upstream,
             work_queue,
         ]
         resource_dependency_graph[smem_sfb_resource] = [gmem_ab_resource, work_queue]
@@ -4329,7 +4369,7 @@ def host_function(
             cluster=cluster_shape_mnk,
             fallback_cluster=fallback_cluster_shape_mnk,
             stream=stream,
-            use_pdl=True,
+            use_pdl=enable_pdl,
         )
     else:
         kernel(
@@ -4359,5 +4399,5 @@ def host_function(
             block=[block_size, 1, 1],
             cluster=cluster_shape_mnk,
             stream=stream,
-            use_pdl=True,
+            use_pdl=enable_pdl,
         )

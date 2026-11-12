@@ -734,7 +734,6 @@ def test_attention_ts_context_public_surfaces_hide_internal_tuning() -> None:
     forbidden_exact_names = {
         "args",
         "backend",
-        "enable_pdl",
         "groups_tokens_heads_q",
         "head_dim_per_cta_v",
         "implementation",
@@ -752,6 +751,8 @@ def test_attention_ts_context_public_surfaces_hide_internal_tuning() -> None:
         "variable_window_cta_starts",
         # The VC-Attention recipe of a plan, a numerics contract.
         "vc_config",
+        # The FlashInfer-wide programmatic dependent launch switch.
+        "enable_pdl",
     }
     violations = []
     for surface in surfaces:
@@ -816,6 +817,7 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "uniform_packed_lengths",
         "has_q_offset",
         "paged_v_tail_is_zero",
+        "enable_pdl",
     )
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY
@@ -845,6 +847,7 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
     assert plan_parameters["uniform_packed_lengths"].default is False
     assert plan_parameters["has_q_offset"].default is True
     assert plan_parameters["paged_v_tail_is_zero"].default is False
+    assert plan_parameters["enable_pdl"].default is None
     assert not hasattr(BatchPrefillPagedTSWrapper, "plan_live")
     assert not hasattr(context_module, "PlanSpec")
     assert not hasattr(context_module, "PlanHints")
@@ -907,6 +910,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "lse_mode",
         "use_attention_sinks",
         "sage",
+        "enable_pdl",
     )
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY
@@ -939,6 +943,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
     )
     assert plan_parameters["head_dim_vo"].default is None
     assert plan_parameters["sage"].default is None
+    assert plan_parameters["enable_pdl"].default is None
     assert run_parameters["sage"].default is None
     assert run_parameters["qo_indptr"].default is None
     assert run_parameters["kv_indptr"].default is None
@@ -974,6 +979,7 @@ def test_attention_ts_context_paged_one_shot_exposes_fixed_table_contract() -> N
         "return_lse": False,
         "attention_sinks": None,
         "lse_mode": "base2",
+        "enable_pdl": None,
     }
 
     assert tuple(parameters) == (*required_parameters, *keyword_only_defaults)
@@ -1837,6 +1843,107 @@ def test_attention_ts_context_uses_ldtm_stat_default_is_off():
         uses_ldtm_stat=True,
     )
     assert enabled_fmha.cfg.uses_ldtm_stat is True
+
+
+def test_attention_ts_context_enable_pdl_is_compile_identity():
+    """enable_pdl is compiled-kernel identity and sets the kernel config."""
+    from dataclasses import fields
+
+    from flashinfer.attention.prims_ts.sage.layout import (
+        _SageKSection,
+        _SageQSection,
+        _SageScaleLayout,
+        _SageVSection,
+    )
+    from flashinfer.attention.prims_ts.sage.prepare import _PrepareSageScales
+
+    for spec_type in (
+        context_module._ContextCompileSpec,
+        context_module._PagedContextCompileSpec,
+    ):
+        field = {f.name: f for f in fields(spec_type)}["enable_pdl"]
+        assert field.compare and field.hash is not False
+        assert field.default is False
+
+    assert FmhaTs(d=128).cfg.enable_pdl is False
+    assert FmhaTs(d=128, enable_pdl=True).cfg.enable_pdl is True
+
+    layout = _SageScaleLayout(
+        k_tokens=_SageKSection(
+            length=128, block_size=128, source_block_size=128, tile_atoms=4
+        ),
+        q_rows=_SageQSection(
+            seq_len_q=128,
+            q_block_size=128,
+            heads_q_per_kv=1,
+            rows_per_tile=128,
+            heads_interleaved=False,
+        ),
+        v_rows=_SageVSection(headdim=128, has_mean=False),
+    )
+    assert _PrepareSageScales(layout=layout, num_kv_heads=1).enable_pdl is False
+    assert (
+        _PrepareSageScales(layout=layout, num_kv_heads=1, enable_pdl=True).enable_pdl
+        is True
+    )
+
+
+class _ContextKernelBuilt(Exception):
+    """Ends a CPU plan once it has built the kernel it would compile."""
+
+
+@pytest.mark.parametrize("paged", (False, True), ids=("contiguous", "paged"))
+def test_attention_ts_context_plan_enable_pdl_reaches_compiled_kernel(
+    monkeypatch, paged: bool
+):
+    """plan(enable_pdl=...) decides the PDL flag of the kernel it compiles."""
+    import contextlib
+
+    # A CPU stand-in for one B200: no CUDA context and a fixed occupancy.
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_cuda_device",
+        lambda _device: (torch.device("cpu"), 0),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_a, **_k: (10, 0))
+    monkeypatch.setattr(torch.cuda, "device", lambda _index: contextlib.nullcontext())
+    monkeypatch.setattr(context_module, "get_max_active_clusters", lambda _size: 148)
+    for resolver in ("_resolve_context_scheduler", "_resolve_paged_context_scheduler"):
+        monkeypatch.setattr(context_module, resolver, lambda _g: "static_persistent")
+    # Uncached, so the CPU-planned specs stay out of the shared caches.
+    for cached in (
+        "_context_compile_spec",
+        "_paged_context_compile_spec",
+        "_get_compiled_context",
+        "_get_compiled_paged_context",
+    ):
+        monkeypatch.setattr(
+            context_module, cached, getattr(context_module, cached).__wrapped__
+        )
+    make_context_kernel = context_module._make_context_kernel
+    kernels = []
+
+    def build_and_stop(**kwargs):
+        kernels.append(make_context_kernel(**kwargs))
+        raise _ContextKernelBuilt
+
+    monkeypatch.setattr(context_module, "_make_context_kernel", build_and_stop)
+    wrapper = BatchPrefillPagedTSWrapper() if paged else BatchPrefillTSWrapper()
+    for enable_pdl in (False, True):
+        with pytest.raises(_ContextKernelBuilt):
+            wrapper.plan(
+                device="cuda:0",
+                batch_size=1,
+                max_q_len=128,
+                max_kv_len=128,
+                num_qo_heads=4,
+                num_kv_heads=4,
+                head_dim=_HEAD_DIM,
+                q_dtype=torch.bfloat16,
+                k_dtype=torch.bfloat16,
+                enable_pdl=enable_pdl,
+            )
+    assert [kernel.cfg.enable_pdl for kernel in kernels] == [False, True]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

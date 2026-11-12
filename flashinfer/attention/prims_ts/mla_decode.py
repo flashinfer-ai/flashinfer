@@ -32,6 +32,7 @@ from ._scales import (
     resolve_scale,
     scale_types,
 )
+from ...utils import resolve_enable_pdl as _resolve_enable_pdl
 
 
 from .kernels.mla_decode.helpers.nvfp4_kv import (
@@ -1163,12 +1164,14 @@ def _make_mla_decode_compile_spec(
     runtime_kv_lengths: bool = False,
     write_final_lse: bool = True,
     scale_types: tuple[bool, bool, bool] = (False, False, False),
+    enable_pdl: bool = True,
 ) -> _MLADecodeCompileSpec:
     """Keep policy resolution plan-specific and JIT identity batch-free."""
 
     kernel = copy.copy(launch_spec.kernel)
     kernel.lse_base_on_e = False
     kernel.runtime_kv_lengths = runtime_kv_lengths
+    kernel.enable_pdl = enable_pdl
     return _MLADecodeCompileSpec(
         device_index=device_index,
         kernel_signature=_mla_kernel_compile_signature(kernel),
@@ -1692,6 +1695,7 @@ class BatchMLADecodePagedTSWrapper:
         workspace_buffer: Optional[torch.Tensor] = None,
         validate: bool = True,
         tuning: Optional[MLAAttentionTuning] = None,
+        enable_pdl: Optional[bool] = None,
     ) -> None:
         """Compile one static MLA shape and bind its reusable workspace.
 
@@ -1776,6 +1780,11 @@ class BatchMLADecodePagedTSWrapper:
             when enabling it for FP8. BF16 P is not scaled. The value is
             compiled into the kernel, so each distinct value builds its own
             kernel. It is range-checked even when ``validate`` is False.
+        enable_pdl : bool, optional
+            Launch every kernel of the plan with programmatic dependent launch
+            (PDL); each kernel waits in-kernel for the preceding grid before it
+            reads its inputs. ``None`` (default) enables it on devices that
+            support PDL.
         """
 
         lse_mode = validate_lse_mode(lse_mode)
@@ -1811,6 +1820,7 @@ class BatchMLADecodePagedTSWrapper:
         output_scale = normalize_scale(output_scale, "output_scale", device)
         if validate:
             _validate_runtime_device(device)
+        enable_pdl = _resolve_enable_pdl(enable_pdl, device)
 
         required_page_columns = _ceil_div(max_kv_len, page_size)
 
@@ -1846,6 +1856,7 @@ class BatchMLADecodePagedTSWrapper:
             runtime_kv_lengths=True,
             write_final_lse=lse_mode != "none",
             scale_types=(*scale_types(softmax_scale, output_scale), False),
+            enable_pdl=enable_pdl,
         )
         policy = spec.policy
         workspace_layout = _make_mla_workspace_layout(
@@ -2036,6 +2047,7 @@ def batch_mla_decode_with_paged_kv_cache(
     workspace_buffer: Optional[torch.Tensor] = None,
     validate: bool = True,
     tuning: Optional[MLAAttentionTuning] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """One-shot convenience wrapper for fixed or packed-query MLA decode.
 
@@ -2087,6 +2099,10 @@ def batch_mla_decode_with_paged_kv_cache(
         ``softmax_rescale_threshold_log2`` T quantizes FP8 P at
         ``448 * 2**-T`` instead of 448, which costs E4M3 precision for
         probabilities far below the anchor.
+    enable_pdl : bool, optional
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL; see
+        :meth:`BatchMLADecodePagedTSWrapper.plan`.
 
     Returns
     -------
@@ -2202,6 +2218,7 @@ def batch_mla_decode_with_paged_kv_cache(
         workspace_buffer=workspace_buffer,
         validate=validate,
         tuning=tuning,
+        enable_pdl=enable_pdl,
         lse_mode=validate_lse_mode(lse_mode)
         if return_lse or lse is not None
         else "none",
@@ -2676,9 +2693,10 @@ def resolve_sparse_d576_reload_plan(
     compiled for the top-k capacity rounded up to whole 128-key tiles (it uses
     the capacity only through its tile count). Below one wave the plan splits
     each top-k list over ``split_kv`` CTAs (and the 512 V columns over
-    ``head_dim_ctas``); the parallel GMEM reducer, launched with PDL, merges
-    the partials and publishes natural-log LSE. The split is fixed per plan,
-    so a CUDA graph captured from it uses one compiled kernel.
+    ``head_dim_ctas``); the parallel GMEM reducer, PDL-launched under the
+    plan's ``enable_pdl``, merges the partials and publishes natural-log LSE.
+    The split is fixed per plan, so a CUDA graph captured from it uses one
+    compiled kernel.
     """
     import cutlass
 
@@ -2887,6 +2905,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         softmax_scale: GlobalScale | None = None,
         output_scale: GlobalScale = 1.0,
         kv_cache_scale: GlobalScale = 1.0,
+        enable_pdl: Optional[bool] = None,
     ):
         """Plan D512/D576 attention over one primary and an optional extra pool.
 
@@ -2965,6 +2984,11 @@ class BatchSparseMLADecodePagedTSWrapper:
         schedules), and a positive value T also quantizes E4M3 P at
         ``448 * 2**-T`` instead of 448, with the precision cost described
         there.
+
+        ``enable_pdl`` launches every kernel of the plan with programmatic
+        dependent launch (PDL); each kernel waits in-kernel for the preceding
+        grid before it reads its inputs. ``None`` (default) enables it on
+        devices that support PDL.
         """
         (device, profile, spec, sections, byte_end, _, output_quant) = (
             _resolve_sparse_mla_plan(
@@ -3035,6 +3059,15 @@ class BatchSparseMLADecodePagedTSWrapper:
                 kernel.finalize_output = True
             kernel.direct_sparse = True
             kernel.direct_sparse_capacities = (max_topk, max_extra_topk)
+            spec = replace(
+                spec,
+                kernel=kernel,
+                kernel_signature=_mla_kernel_compile_signature(kernel),
+            )
+        enable_pdl = _resolve_enable_pdl(enable_pdl, device)
+        if kernel.enable_pdl != enable_pdl:
+            kernel = copy.copy(kernel)
+            kernel.enable_pdl = enable_pdl
             spec = replace(
                 spec,
                 kernel=kernel,
@@ -3491,6 +3524,8 @@ def get_prims_ts_sparse_mla_decode_workspace_size(*plan_args, **plan_kwargs):
     compiling a kernel. Bind the resulting byte buffer to the wrapper constructor
     and call plan() before graph capture; run() is the prepared standalone launch.
     """
+    # PDL does not change the scratch layout.
+    plan_kwargs.pop("enable_pdl", None)
     _, _, _, _, size_bytes, _, _ = _resolve_sparse_mla_plan(*plan_args, **plan_kwargs)
     return size_bytes
 
@@ -3526,6 +3561,7 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     cos_sin_cache=None,
     out_scale=None,
     tuning=None,
+    enable_pdl: Optional[bool] = None,
 ):
     """Eager plan-and-run helper using separate source indices and lengths.
 
@@ -3533,8 +3569,11 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     composition remain external. softmax_scale includes attention/Q/K descales;
     output_scale includes the V descale and optional output multiplier.
     Source contracts, output quantization arguments, ``tuning`` and return
-    layouts follow
-    :class:`BatchSparseMLADecodePagedTSWrapper`.
+    layouts follow :class:`BatchSparseMLADecodePagedTSWrapper`.
+
+    ``enable_pdl`` launches the plan's kernels with programmatic dependent
+    launch (PDL). ``None`` (default) enables it on devices that support PDL;
+    see :meth:`BatchSparseMLADecodePagedTSWrapper.plan`.
     """
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
@@ -3574,6 +3613,7 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
         softmax_scale=softmax_scale,
         output_scale=output_scale,
         kv_cache_scale=kv_cache_scale,
+        enable_pdl=enable_pdl,
     )
     return wrapper.run(
         query,

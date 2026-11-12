@@ -26,6 +26,7 @@ from flashinfer.api_logging import flashinfer_api
 from flashinfer.utils import (
     backend_requirement,
     get_compute_capability,
+    resolve_enable_pdl,
     supported_compute_capability,
 )
 
@@ -208,6 +209,29 @@ def _output(
     return out, output_quant_scale, allocated_scale
 
 
+def _resolve_pdl(
+    enable_pdl: Optional[bool],
+    device: torch.device,
+    config: Optional[PrimsTsGemmConfig] = None,
+) -> bool:
+    """Resolve a public ``enable_pdl`` argument for one call.
+
+    ``None`` enables PDL on devices that support it, and a value that is not
+    a bool raises ``TypeError``. An explicit ``config`` already carries the
+    decision: ``None`` keeps ``config.enable_pdl`` and a bool must equal it,
+    so a caller passing a config never silently gains or loses PDL.
+    """
+    if enable_pdl is None and config is not None:
+        return config.enable_pdl
+    enable_pdl = resolve_enable_pdl(enable_pdl, device)
+    if config is not None and config.enable_pdl != enable_pdl:
+        raise ValueError(
+            f"enable_pdl={enable_pdl} does not match "
+            f"config.enable_pdl={config.enable_pdl}"
+        )
+    return enable_pdl
+
+
 def _overlap_epilogue_supported(config: PrimsTsGemmConfig) -> bool:
     # The SwiGLU store is per 32-column subtile, like the linear one, so it can
     # retire the first subtile early. Packed NVFP4 output is a direct store.
@@ -224,6 +248,10 @@ def _overlap_epilogue_supported(config: PrimsTsGemmConfig) -> bool:
 
 
 def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
+    # Checked before the lookup: 1 == True, so a non-bool would otherwise
+    # match a cached config.
+    if not isinstance(config.enable_pdl, bool):
+        raise TypeError("PrimsTsGemmConfig.enable_pdl must be a bool")
     module = _KERNEL_MODULES.get(config)
     if module is not None:
         return module
@@ -246,6 +274,8 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
                 config.output_format
             ],
         )
+        # One flag for the launch attribute, the waits and launch_dependents.
+        module.enable_pdl = config.enable_pdl
         module.use_per_token_channel_scale = config.operand_format == "fp8_e4m3"
         module.use_gated_activation = config.epilogue == "swiglu"
         module.use_fused_qknorm_rope = config.epilogue == "qkv_qknorm_rope"
@@ -334,6 +364,55 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
         return module
 
 
+def _kernel_name(
+    config: PrimsTsGemmConfig,
+    ab_stages: int,
+    max_active_clusters: int,
+    debug_checks: bool,
+) -> str:
+    """Name of the on-disk compiled kernel.
+
+    The disk cache keys a kernel by this name and the source hash only, so
+    every config field that changes the program must appear here. Stages
+    appear as the count the module resolved.
+    """
+
+    def field(value: object) -> str:
+        if value is None:
+            return "x"
+        if isinstance(value, tuple):
+            return "x".join(str(item) for item in value)
+        return str(value)
+
+    name = "_".join(
+        (
+            f"sm{config.arch}",
+            config.operand_format,
+            config.output_format,
+            config.epilogue,
+            f"bias{int(config.has_bias)}",
+            f"hd{field(config.head_dim)}",
+            f"neox{field(config.is_neox)}",
+            f"tm{config.tile_m}",
+            f"tn{config.tile_n}",
+            f"tk{config.tile_k}",
+            f"f4mk{config.nvfp4_mma_k}",
+            f"epiw{field(config.epilogue_warps)}",
+            f"overlap{int(config.tmem_overlap)}",
+            f"tma{int(config.use_tma_store)}",
+            f"splitqkv{int(config.separate_qkv_output)}",
+            f"abs{ab_stages}",
+            f"cluster{field(config.cluster_shape)}",
+            config.scheduler,
+            f"bucket{field(config.shape_bucket)}",
+            f"qkvs{int(config.has_qkv_scale)}",
+            f"pdl{int(config.enable_pdl)}",
+            f"mac{max_active_clusters}",
+        )
+    )
+    return name + "_dbg" if debug_checks else name
+
+
 def _compile(
     config: PrimsTsGemmConfig,
     module: ModuleType,
@@ -411,40 +490,9 @@ def _compile(
                 options="--opt-level 2 --enable-tvm-ffi",
             )
 
-        def field(value: object) -> str:
-            if value is None:
-                return "x"
-            if isinstance(value, tuple):
-                return "x".join(str(item) for item in value)
-            return str(value)
-
-        kernel_name = "_".join(
-            (
-                f"sm{config.arch}",
-                config.operand_format,
-                config.output_format,
-                config.epilogue,
-                f"bias{int(config.has_bias)}",
-                f"hd{field(config.head_dim)}",
-                f"neox{field(config.is_neox)}",
-                f"tm{config.tile_m}",
-                f"tn{config.tile_n}",
-                f"tk{config.tile_k}",
-                f"f4mk{config.nvfp4_mma_k}",
-                f"epiw{field(config.epilogue_warps)}",
-                f"overlap{int(config.tmem_overlap)}",
-                f"tma{int(config.use_tma_store)}",
-                f"splitqkv{int(config.separate_qkv_output)}",
-                f"abs{module.ab_stages}",
-                f"cluster{field(config.cluster_shape)}",
-                config.scheduler,
-                f"bucket{field(config.shape_bucket)}",
-                f"qkvs{int(config.has_qkv_scale)}",
-                f"mac{max_active_clusters}",
-            )
+        kernel_name = _kernel_name(
+            config, module.ab_stages, max_active_clusters, debug_checks
         )
-        if debug_checks:
-            kernel_name += "_dbg"
         compiled = build_and_load_cute_dsl_kernel(
             "prims_ts_dense_gemm",
             kernel_name,
@@ -576,7 +624,13 @@ class PreparedFp4Linear:
     Static kernel configuration, weights, weight scales, optional bias, and
     Q/K normalization weights are resolved once. Steady-state calls pass Torch
     tensors directly to a cached TVM-FFI launcher on the caller's current
-    stream; DLPack adaptation is confined to compilation.
+    stream; DLPack adaptation is confined to compilation. ``enable_pdl`` is
+    part of the kernel configuration, so it is resolved once as well: ``None``
+    (default) enables PDL on devices that support it, and with an explicit
+    ``config`` ``None`` keeps ``config.enable_pdl`` while a bool must equal it.
+    Under PDL the kernel reads the prepared weights and weight scales before
+    its wait for the preceding kernel, so a kernel that may still be running
+    must not write them.
     """
 
     def __init__(
@@ -599,6 +653,7 @@ class PreparedFp4Linear:
         tile_k: int = 256,
         tmem_overlap: bool = False,
         config: Optional[PrimsTsGemmConfig] = None,
+        enable_pdl: Optional[bool] = None,
     ) -> None:
         device = _validate_cuda_tensors(
             weight_packed,
@@ -609,6 +664,7 @@ class PreparedFp4Linear:
             k_norm,
             qkv_scale,
         )
+        enable_pdl = _resolve_pdl(enable_pdl, device, config)
         if (
             weight_packed.dtype != torch.uint8
             or weight_packed.ndim != 2
@@ -650,6 +706,7 @@ class PreparedFp4Linear:
             nvfp4_mma_k=mma_k,
             tmem_overlap=tmem_overlap,
             has_qkv_scale=qkv_scale is not None,
+            enable_pdl=enable_pdl,
         )
         if (
             self.config.arch != arch
@@ -819,6 +876,7 @@ class PreparedFp4Linear:
                 scale_c=self._scale_c_tensor,
                 scale_gate=self._scale_gate_tensor,
                 qkv_scale=self.qkv_scale,
+                enable_pdl=self.config.enable_pdl,
             )
             if self.output_format == "nvfp4_e2m1":
                 if self._return_quant_scale:
@@ -887,6 +945,7 @@ def prepare_fp4_linear(
     tile_k: int = 256,
     tmem_overlap: bool = False,
     config: Optional[PrimsTsGemmConfig] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> PreparedFp4Linear:
     """Prepare a fixed packed-NVFP4 linear projection.
 
@@ -896,6 +955,15 @@ def prepare_fp4_linear(
     supported devices. ``tmem_overlap=True`` uses eight epilogue warps and
     alternating accumulator windows to overlap the next tile's MMA with
     output stores. It requires ``tile_k=256`` and BF16 output and is opt-in.
+
+    ``enable_pdl`` launches every call of the prepared projection with
+    programmatic dependent launch (PDL); ``None`` (default) enables it on
+    devices that support PDL. Each call then waits in-kernel for the
+    preceding kernel before it reads the activation or writes the output,
+    but reads ``weight_packed`` and ``weight_block_scale`` before that wait,
+    so a kernel that may still be running must not write them. With
+    ``config``, ``None`` follows ``config.enable_pdl`` and a bool must equal
+    it.
     """
     return PreparedFp4Linear(
         weight_packed,
@@ -910,6 +978,7 @@ def prepare_fp4_linear(
         tile_k=tile_k,
         tmem_overlap=tmem_overlap,
         config=config,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -926,11 +995,13 @@ def prepare_fp4_linear_swiglu(
     tile_k: int = 256,
     tmem_overlap: bool = False,
     config: Optional[PrimsTsGemmConfig] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> PreparedFp4Linear:
     """Prepare a fixed packed-NVFP4 linear+SwiGLU projection.
 
     ``tmem_overlap=True`` alternates two accumulator windows so the next
     tile's MMA overlaps this tile's SwiGLU epilogue, as for the linear path.
+    ``enable_pdl`` is as for :func:`prepare_fp4_linear`.
     """
     return PreparedFp4Linear(
         weight_packed,
@@ -945,6 +1016,7 @@ def prepare_fp4_linear_swiglu(
         tile_k=tile_k,
         tmem_overlap=tmem_overlap,
         config=config,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -965,11 +1037,14 @@ def prepare_fp4_qkv_qknorm_rope(
     tmem_overlap: bool = False,
     qkv_scale=None,
     config=None,
+    enable_pdl: Optional[bool] = None,
 ) -> PreparedFp4Linear:
     """Prepare a fixed packed-NVFP4 QKV+QKNorm+RoPE projection.
 
     ``tmem_overlap=True`` releases the accumulator after the QKNorm sum pass,
     so the next tile's MMA overlaps the normalize/RoPE/store pass (MMA-K=64).
+    ``enable_pdl`` is as for :func:`prepare_fp4_linear`; the Q/K norm weights,
+    ``positions`` and ``cos_sin`` are read after the wait.
     """
     if num_q_heads != num_kv_heads:
         raise ValueError("the copied QKV specialization requires equal Q/KV heads")
@@ -990,6 +1065,7 @@ def prepare_fp4_qkv_qknorm_rope(
         tile_k=tile_k,
         tmem_overlap=tmem_overlap,
         config=config,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -1012,6 +1088,8 @@ def _fp8(
     qkv_scale: Optional[torch.Tensor] = None,
     config: Optional[PrimsTsGemmConfig] = None,
     op_name: str = "prims_ts_fp8_linear",
+    *,
+    enable_pdl: Optional[bool] = None,
 ):
     device = _validate_cuda_tensors(
         a,
@@ -1027,6 +1105,7 @@ def _fp8(
         output_quant_scale,
         qkv_scale,
     )
+    enable_pdl = _resolve_pdl(enable_pdl, device, config)
     if a.dtype != _FP8 or weight.dtype != _FP8 or a.ndim != 2 or weight.ndim != 2:
         raise ValueError("a and weight must be rank-2 torch.float8_e4m3fn tensors")
     m, k = a.shape
@@ -1070,6 +1149,7 @@ def _fp8(
         head_dim=head_dim,
         is_neox=is_neox,
         has_qkv_scale=qkv_scale is not None,
+        enable_pdl=enable_pdl,
     )
     scale_gate = _scalar(device, 1.0) if qscale is not None else None
     if config is not None:
@@ -1149,6 +1229,8 @@ def _fp4(
     is_neox: Optional[bool] = None,
     qkv_scale: Optional[torch.Tensor] = None,
     op_name: str = "prims_ts_fp4_linear",
+    *,
+    enable_pdl: Optional[bool] = None,
 ):
     device = _validate_cuda_tensors(
         a_packed,
@@ -1164,6 +1246,7 @@ def _fp4(
         output_quant_scale,
         qkv_scale,
     )
+    enable_pdl = _resolve_pdl(enable_pdl, device)
     if (
         a_packed.dtype != torch.uint8
         or weight_packed.dtype != torch.uint8
@@ -1226,6 +1309,7 @@ def _fp4(
         head_dim=head_dim,
         is_neox=is_neox,
         has_qkv_scale=qkv_scale is not None,
+        enable_pdl=enable_pdl,
         a=a_packed,
         weight=weight_packed,
         output=c,
@@ -1264,6 +1348,7 @@ def fp8_linear(
     out_dtype=torch.bfloat16,
     output_quant_scale=None,
     out=None,
+    enable_pdl: Optional[bool] = None,
 ):
     """FP8 ``[M, K]`` times ``[N, K]`` with per-token and per-channel scales.
 
@@ -1288,6 +1373,13 @@ def fp8_linear(
             tensor; writing it does not change later calls.
         out: Optional preallocated output. BF16 shape is ``[M, N]``. FP8
             shape is ``[M, N]``.
+        enable_pdl: Launch with programmatic dependent launch (PDL).
+            ``None`` (default) enables it on devices that support PDL.
+            The kernel then waits in-kernel for the preceding kernel
+            before it reads the other inputs or writes the output, but
+            reads ``weight`` before that wait, so a kernel that may
+            still be running must not write it. With ``config``,
+            ``None`` follows ``config.enable_pdl`` and a bool must equal it.
 
     Returns:
         The output tensor. When ``out_dtype`` is FP8 and
@@ -1306,6 +1398,7 @@ def fp8_linear(
         qkv_scale=qkv_scale,
         config=config,
         op_name="prims_ts_fp8_linear",
+        enable_pdl=enable_pdl,
     )
 
 
@@ -1322,6 +1415,7 @@ def fp8_linear_swiglu(
     out_dtype=torch.bfloat16,
     output_quant_scale=None,
     out=None,
+    enable_pdl: Optional[bool] = None,
 ):
     """FP8 fused linear and SwiGLU with per-token and per-channel scales.
 
@@ -1345,6 +1439,13 @@ def fp8_linear_swiglu(
             the kernel uses ``1`` and the returned scale is a separate
             tensor; writing it does not change later calls.
         out: Optional preallocated output of shape ``[M, N / 2]``.
+        enable_pdl: Launch with programmatic dependent launch (PDL).
+            ``None`` (default) enables it on devices that support PDL.
+            The kernel then waits in-kernel for the preceding kernel
+            before it reads the other inputs or writes the output, but
+            reads ``weight`` before that wait, so a kernel that may
+            still be running must not write it. With ``config``,
+            ``None`` follows ``config.enable_pdl`` and a bool must equal it.
 
     Returns:
         The output tensor. When ``out_dtype`` is FP8 and
@@ -1362,6 +1463,7 @@ def fp8_linear_swiglu(
         out,
         config=config,
         op_name="prims_ts_fp8_swiglu",
+        enable_pdl=enable_pdl,
     )
 
 
@@ -1386,6 +1488,7 @@ def fp8_qkv_qknorm_rope(
     out_dtype=torch.bfloat16,
     output_quant_scale=None,
     out=None,
+    enable_pdl: Optional[bool] = None,
 ):
     """FP8 QKV projection with QK RMSNorm and RoPE.
 
@@ -1423,6 +1526,13 @@ def fp8_qkv_qknorm_rope(
             the kernel uses ``1`` and the returned scale is a separate
             tensor; writing it does not change later calls.
         out: Optional preallocated output of shape ``[M, N]``.
+        enable_pdl: Launch with programmatic dependent launch (PDL).
+            ``None`` (default) enables it on devices that support PDL.
+            The kernel then waits in-kernel for the preceding kernel
+            before it reads the other inputs or writes the output, but
+            reads ``qkv_weight`` before that wait, so a kernel that may
+            still be running must not write it. With ``config``,
+            ``None`` follows ``config.enable_pdl`` and a bool must equal it.
 
     Returns:
         The output tensor. When ``out_dtype`` is FP8 and
@@ -1453,6 +1563,7 @@ def fp8_qkv_qknorm_rope(
         qkv_scale,
         config,
         op_name="prims_ts_fp8_qkv",
+        enable_pdl=enable_pdl,
     )
 
 
@@ -1470,6 +1581,7 @@ def fp4_linear(
     out_dtype=torch.bfloat16,
     output_quant_scale=None,
     out=None,
+    enable_pdl: Optional[bool] = None,
 ):
     """Packed NVFP4 ``[M, K]`` times ``[N, K]``.
 
@@ -1493,6 +1605,13 @@ def fp4_linear(
             the kernel uses ``1`` and the returned scale is a separate
             tensor; writing it does not change later calls.
         out: Optional preallocated output of shape ``[M, N]``.
+        enable_pdl: Launch with programmatic dependent launch (PDL).
+            ``None`` (default) enables it on devices that support PDL.
+            The kernel then waits in-kernel for the preceding kernel
+            before it reads the other inputs or writes the output, but
+            reads ``weight_packed`` and ``weight_block_scale`` before that
+            wait, so a kernel that may still be running must not write
+            them.
 
     Returns:
         The output tensor. When ``out_dtype`` is FP8 and
@@ -1511,6 +1630,7 @@ def fp4_linear(
         output_quant_scale,
         out,
         op_name="prims_ts_fp4_linear",
+        enable_pdl=enable_pdl,
     )
 
 
@@ -1528,6 +1648,7 @@ def fp4_linear_swiglu(
     out_dtype=torch.bfloat16,
     output_quant_scale=None,
     out=None,
+    enable_pdl: Optional[bool] = None,
 ):
     """Packed NVFP4 fused linear and SwiGLU.
 
@@ -1552,6 +1673,13 @@ def fp4_linear_swiglu(
             separate tensor; writing it does not change later calls.
         out: Optional preallocated output. BF16 and FP8 shape is
             ``[M, N / 2]``. Packed NVFP4 shape is ``[M, N / 4]``.
+        enable_pdl: Launch with programmatic dependent launch (PDL).
+            ``None`` (default) enables it on devices that support PDL.
+            The kernel then waits in-kernel for the preceding kernel
+            before it reads the other inputs or writes the output, but
+            reads ``weight_packed`` and ``weight_block_scale`` before that
+            wait, so a kernel that may still be running must not write
+            them.
 
     Returns:
         The output tensor. FP8 output with no ``output_quant_scale``
@@ -1572,6 +1700,7 @@ def fp4_linear_swiglu(
         output_quant_scale,
         out,
         op_name="prims_ts_fp4_swiglu",
+        enable_pdl=enable_pdl,
     )
 
 
@@ -1597,6 +1726,7 @@ def fp4_qkv_qknorm_rope(
     out_dtype=torch.bfloat16,
     output_quant_scale=None,
     out=None,
+    enable_pdl: Optional[bool] = None,
 ):
     """Packed NVFP4 QKV projection with QK RMSNorm and RoPE.
 
@@ -1630,6 +1760,13 @@ def fp4_qkv_qknorm_rope(
         output_quant_scale: Not used. Quantized output is not supported
             for this epilogue.
         out: Optional preallocated ``[M, N]`` bfloat16 output.
+        enable_pdl: Launch with programmatic dependent launch (PDL).
+            ``None`` (default) enables it on devices that support PDL.
+            The kernel then waits in-kernel for the preceding kernel
+            before it reads the other inputs or writes the output, but
+            reads ``qkv_weight_packed`` and ``qkv_weight_block_scale`` before that
+            wait, so a kernel that may still be running must not write
+            them.
 
     Returns:
         The ``[M, N]`` bfloat16 output tensor.
@@ -1662,4 +1799,5 @@ def fp4_qkv_qknorm_rope(
         is_neox,
         qkv_scale,
         op_name="prims_ts_fp4_qkv",
+        enable_pdl=enable_pdl,
     )

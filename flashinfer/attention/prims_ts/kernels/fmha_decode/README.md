@@ -68,30 +68,41 @@ existing row masks and guarded stores discard those rows, and QK/softmax/PV
 do not mix different queries. TMA zero-fills beyond the packed allocation.
 Other packed attention paths retain their ragged Q descriptors.
 
-The combined QToken-KvBlock-Sparse-Attention metadata+attention API uses programmatic dependent launch
-(PDL) for its final metadata-to-attention handoff. QToken-KvBlock-Sparse-Attention metadata producers
-release at entry to overlap the attention prologue; the dependency wait still
-covers completion of every metadata CTA. Attention allocates and initializes its task
-barriers, SMEM, and TMEM first, then waits immediately before TaskManager can
-read either output. Split-KV QToken-KvBlock-Sparse-Attention sends every configured split CTA through that
-initialization and acquire, then contracts the useful runtime prefix. Pruned
-split CTAs use the same TMEM teardown and dependent-release helpers before a
-CTA-uniform PTX exit. Padded packed-Q CTAs have no task resources; they still
-acquire through their explicit zero-work path and signal a following reducer
-when one exists. A final nonsplit attention grid has no dependent to release.
-Standalone attention over an already-built QToken-KvBlock-Sparse-Attention metadata triple remains stream
-ordered and does not enter this PDL chain.
+`enable_pdl` (default `None`: on for devices that support it) launches the
+decode grids with programmatic dependent launch (PDL): the
+QToken-KvBlock-Sparse-Attention metadata kernel, the block-sparse route
+prepare, attention and the standalone split reducer. For attention and the
+standalone reducer one compile-time flag, `FmhaDecodeConfig.use_pdl`, decides
+the grid's PDL launch attribute, every `griddepcontrol.wait` and every
+`griddepcontrol.launch_dependents`. Launch selection runs with PDL off, so PDL
+never changes the selected launch; a requested PDL launch then keeps PDL only
+when the selected launch supports it. Split launches keep it with nonpersistent
+attention and a standalone GMEM reducer; split launches with fused or cluster
+reduction run with plain stream ordering. The metadata kernel takes the plan's
+resolved `enable_pdl` as a launch argument and the route prepare compiles it
+in; each decides its own launch attribute, wait and release with it.
 
-When split-KV uses a separate reduction kernel, each active attention CTA
-signals at its true tail after task completion and TMEM teardown. Deferred QToken-KvBlock-Sparse-Attention
-split padding retires as described above, while other runtime-inactive CTAs use
-their terminal zero-work branch. The reducer initializes its register state
-and any required shared-memory storage, then waits before reading any
-producer-written partial output or statistics.
-Independent query-offset metadata may be read before that wait. QToken-KvBlock-Sparse-Attention sequence
-lengths remain behind it because they originate in the metadata producer two
-PDL stages upstream. This preserves producer-to-reducer overlap while gating
-every producer-dependent global-memory read.
+Each PDL grid waits for the preceding grid before its first access to global
+memory that grid may write, and releases the following grid after that wait:
+
+- QToken-KvBlock-Sparse-Attention metadata waits at entry and releases right
+  after it, so attention launches while the metadata runs; the attention wait
+  still covers completion of every metadata CTA.
+- The block-sparse route prepare waits at entry, before its first global
+  access, and releases after its last route store.
+- Attention waits at kernel entry when its tile predicate reads packed query
+  offsets or runtime K/V lengths, including QToken-KvBlock-Sparse-Attention
+  route lengths. A nonpersistent block-sparse CTA waits before it reads its
+  prepared row header, which precedes its resource setup. Otherwise attention
+  allocates and initializes its task barriers, SMEM and TMEM first and waits
+  immediately before TaskManager can read any input. Device global scales are
+  loaded after that wait on every path.
+- Split CTAs outside the useful runtime prefix and padded Q tiles hold no task
+  resources; they wait and release before they retire. Active CTAs release
+  after task completion and TMEM teardown.
+- The standalone reducer waits before its first global read (query offsets,
+  lengths, partial outputs and statistics) and releases after its output
+  stores.
 
 The separate reducer uses one 512-thread CTA per 8 KiB output slice for
 S2--S4. S5--S16 use one 512-thread CTA per 2 KiB slice: four adjacent lanes

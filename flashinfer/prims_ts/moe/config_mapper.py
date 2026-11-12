@@ -1252,6 +1252,17 @@ def _with_spec_overrides_pair(
 
 
 def _with_pdl_pair(pair: PrimsTsGemmPair, *, enable_pdl: bool) -> PrimsTsGemmPair:
+    """Apply one ``enable_pdl`` to both GEMMs of a MoE pair.
+
+    FC1 is built with ``skip_early_exit_pdl=0`` and issues
+    ``griddepcontrol.launch_dependents`` only after its own
+    ``griddepcontrol.wait``. Routing outputs (``tile_idx``, ``mn_limit``,
+    ``num_non_exiting_ctas``, the token permutation and the top-k routing
+    weights) are therefore complete before FC2, the DeepSeek FP8 activation
+    kernel or finalize can launch. FC2 (``skip_early_exit_pdl`` when it uses early exit)
+    and finalize read routing outputs before their own wait on that basis, so
+    FC1 must keep its wait ahead of its trigger.
+    """
     return PrimsTsGemmPair(
         tile_n=pair.tile_n,
         moe_config_index=pair.moe_config_index,

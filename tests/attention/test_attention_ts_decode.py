@@ -77,8 +77,13 @@ from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants imp
 )
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
     _build_decode_gen_schedule,
+    _decode_acquires_at_entry,
     _decode_min_blocks_per_mp,
+    _q_seq_bounds_reads_memory,
     build_decode_task_manager,
+)
+from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.helpers_common import (
+    UniformQueryOffsets,
 )
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.helpers_kv_tile_idx import (
     _runtime_last_valid_page_idx,
@@ -2688,6 +2693,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "workspace_buffer",
         "max_kv_len",
         "validate",
+        "enable_pdl",
     )
     assert tuple(inspect.signature(BatchDecodePagedTSWrapper.__init__).parameters) == (
         "self",
@@ -2721,6 +2727,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "initialize_workspace",
         "softmax_scale",
         "output_scale",
+        "enable_pdl",
     )
     run_parameters = inspect.signature(BatchDecodePagedTSWrapper.run).parameters
     assert tuple(run_parameters) == (
@@ -2759,7 +2766,6 @@ _FORBIDDEN_DECODE_TUNING_PARAMETERS = frozenset(
         "autotuner",
         "config",
         "enable_clc",
-        "enable_pdl",
         "fixed_split_size",
         "groups_tokens_heads_q",
         "kv_stages",
@@ -2826,6 +2832,11 @@ def test_attention_ts_decode_public_surfaces_have_no_internal_tuning_knobs() -> 
                 assert parameter.default is True
                 assert parameter.annotation in (bool, "bool")
                 continue
+            if parameter.name == "enable_pdl":
+                # The FlashInfer-wide PDL switch, resolved at planning.
+                assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+                assert parameter.default is None
+                continue
             if parameter.kind is inspect.Parameter.VAR_KEYWORD:
                 violations.append(f"{surface.__qualname__}.**{parameter.name}")
                 continue
@@ -2848,6 +2859,172 @@ def test_attention_ts_decode_public_surfaces_have_no_internal_tuning_knobs() -> 
                 violations.append(f"{surface.__qualname__}.{parameter.name}")
 
     assert violations == []
+
+
+@pytest.mark.parametrize(
+    ("split_kv_mode", "num_heads_q", "persistent", "expected_pdl"),
+    (
+        ("disabled", 8, False, True),
+        ("disabled", 8, True, True),
+        ("gmem_reduction_with_separate_kernel", 16, False, True),
+        ("gmem_reduction", 8, False, False),
+        ("cluster_smem_reduction", 8, False, False),
+    ),
+)
+def test_attention_ts_decode_pdl_never_changes_the_launch(
+    split_kv_mode: str, num_heads_q: int, persistent: bool, expected_pdl: bool
+) -> None:
+    """PDL is resolved after launch selection and only where it is supported."""
+
+    def make(use_pdl: bool):
+        args = {"fixed_seqlen": True, "use_pdl": use_pdl}
+        if persistent:
+            args["use_persistent_scheduler"] = True
+        splits_kv = 1 if split_kv_mode == "disabled" else 4
+        return make_decode_config(
+            headdim=128,
+            args=args,
+            seq_len_q=1,
+            seq_len_kv=8192,
+            batch_size=1,
+            num_heads_q=num_heads_q,
+            num_heads_kv=1,
+            q_dtype=BFloat16,
+            k_dtype=BFloat16,
+            v_dtype=BFloat16,
+            o_dtype=BFloat16,
+            qkv_layout="pagedKv",
+            num_tokens_per_page=32,
+            split_kv_mode=split_kv_mode,
+            splits_kv=splits_kv,
+            max_splits_kv=splits_kv if splits_kv > 1 else None,
+            mask_type="dense",
+            auto_tuner=False,
+        )
+
+    without_pdl = make(False)
+    with_pdl = make(True)
+    assert not without_pdl.use_pdl
+    assert with_pdl.use_pdl is expected_pdl
+    assert with_pdl.supports_pdl is expected_pdl
+    assert replace(with_pdl, use_pdl=False) == without_pdl
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "num_heads_q", "seq_len_q", "seq_len_kv", "launch", "expected_pdl"),
+    (
+        (1, 64, 1, 8192, "separate_reducer", True),
+        (1, 8, 2, 65536, "fused_reducer", False),
+        (1, 8, 1, 8192, "cluster", False),
+        # Split-KV clears the persistent scheduler, so automatic persistence
+        # is a direct launch.
+        (256, 8, 1, 8192, "persistent", True),
+    ),
+    ids=("separate_reducer", "fused_reducer", "cluster", "persistent"),
+)
+def test_attention_ts_decode_pdl_never_changes_the_auto_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    batch_size: int,
+    num_heads_q: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    launch: str,
+    expected_pdl: bool,
+) -> None:
+    """Automatic selection resolves the same launch with and without PDL."""
+    from contextlib import nullcontext
+
+    _mock_decode_hardware(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda cluster_size: 152 // cluster_size,
+    )
+
+    def resolve(use_pdl: bool):
+        return _resolve_decode_launch_spec.__wrapped__(
+            0,
+            batch_size,
+            num_heads_q,
+            1,
+            128,
+            32,
+            seq_len_kv,
+            seq_len_q,
+            "bfloat16",
+            "bfloat16",
+            "bfloat16",
+            "bfloat16",
+            "HND",
+            "dense",
+            False,
+            -1,
+            use_pdl=use_pdl,
+        )
+
+    without_pdl = resolve(False)
+    with_pdl = resolve(True)
+    cfg = with_pdl.config
+    if not cfg.use_split_kv:
+        selected = "persistent" if cfg.use_persistent_scheduler else "direct"
+    elif cfg.use_cluster_smem_reduction:
+        selected = "cluster"
+    elif cfg.use_separate_reduction_kernel:
+        selected = "separate_reducer"
+    else:
+        selected = "fused_reducer"
+    assert selected == launch
+    assert not without_pdl.config.use_pdl
+    assert cfg.use_pdl is expected_pdl
+    assert cfg.supports_pdl is expected_pdl
+    assert replace(with_pdl, config=replace(cfg, use_pdl=False)) == without_pdl
+
+
+_STATIC_SPLIT = {"use_split_kv": True, "splits_kv": 4, "max_splits_kv": 4}
+
+
+@pytest.mark.parametrize(
+    ("launch_args", "expected_pdl"),
+    (
+        ({}, True),
+        ({"use_persistent_scheduler": True}, True),
+        ({**_STATIC_SPLIT, "use_separate_reduction_kernel": True}, True),
+        (_STATIC_SPLIT, False),
+        ({**_STATIC_SPLIT, "use_cluster_smem_reduction": True}, False),
+    ),
+    ids=("direct", "persistent", "separate_reducer", "fused_reducer", "cluster"),
+)
+def test_attention_ts_decode_static_config_resolves_pdl(
+    launch_args: dict[str, object], expected_pdl: bool
+) -> None:
+    """The shape-less constructor applies the same effective PDL rule."""
+
+    without_pdl = make_decode_config(headdim=128, args={**launch_args})
+    with_pdl = make_decode_config(headdim=128, args={**launch_args, "use_pdl": True})
+    assert not without_pdl.use_pdl
+    assert with_pdl.supports_pdl is expected_pdl
+    assert with_pdl.use_pdl is expected_pdl
+    assert replace(with_pdl, use_pdl=False) == without_pdl
+
+
+def test_attention_ts_decode_entry_acquire_follows_query_offset_reads() -> None:
+    """A PDL decode CTA acquires at entry only before a load of query offsets or KV lengths."""
+
+    offsets = make_ptr(Int32, 16, cute.AddressSpace.gmem, assumed_align=4)
+    uniform = UniformQueryOffsets(4)
+    packed = FmhaDecodeConfig(use_variable_seqlens_q=True)
+    assert _q_seq_bounds_reads_memory(packed, offsets)
+    assert not _q_seq_bounds_reads_memory(packed, uniform)
+    assert not _q_seq_bounds_reads_memory(FmhaDecodeConfig(), offsets)
+
+    pdl = FmhaDecodeConfig(use_variable_seqlens_q=True, use_pdl=True)
+    assert _decode_acquires_at_entry(pdl, offsets, False)
+    assert _decode_acquires_at_entry(pdl, uniform, True)
+    # Uniform query offsets and static KV lengths: nothing to read before
+    # resource setup, so the acquire waits until after it.
+    assert not _decode_acquires_at_entry(pdl, uniform, False)
+    assert not _decode_acquires_at_entry(packed, offsets, True)
 
 
 def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state():
@@ -5082,11 +5259,13 @@ def test_attention_ts_decode_one_shot_forwards_split_kv(
         workspace_buffer=None if workspace_mode == "owned" else workspace,
         max_kv_len=32,
         validate=workspace_mode != "trusted",
+        enable_pdl=False,
     )
 
     assert output is wrapper.run.return_value
     wrapper.plan.assert_called_once()
     assert wrapper.plan.call_args.kwargs["head_dim"] == 64
+    assert wrapper.plan.call_args.kwargs["enable_pdl"] is False
     assert wrapper.run.call_args.kwargs["kv_scale_factors"] is kv_scale_factors
     assert wrapper.plan.call_args.kwargs["split_kv"] is split_kv
     assert wrapper.plan.call_args.kwargs["k_dtype"] is cache.dtype
