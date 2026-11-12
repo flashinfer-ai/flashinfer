@@ -1515,7 +1515,14 @@ kernel_cake_gdn_c2cc4dde363f0f11c73d(const __grid_constant__ CUtensorMap Q, cons
                         for (int state_vec_init = 0; state_vec_init < 8; state_vec_init++) {
                             long long state_vec_index_init = state_base_init + (long long)(state_col_block_init * 32) + (long long)(state_vec_init * 4);
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(initial_state + state_vec_index_init);
+                                const float* state_ptr = initial_state + state_vec_index_init;
+                                // Tensor views need only element alignment; keep vector loads for aligned bases.
+                                float4 _v4;
+                                if ((reinterpret_cast<uint64_t>(state_ptr) & 15) == 0) {
+                                    _v4 = *reinterpret_cast<const float4*>(state_ptr);
+                                } else {
+                                    _v4 = make_float4(state_ptr[0], state_ptr[1], state_ptr[2], state_ptr[3]);
+                                }
                                 state_init_frag[state_vec_init * 4 + 0] = _v4.x;
                                 state_init_frag[state_vec_init * 4 + 1] = _v4.y;
                                 state_init_frag[state_vec_init * 4 + 2] = _v4.z;
@@ -2494,7 +2501,14 @@ kernel_cake_gdn_c2cc4dde363f0f11c73d(const __grid_constant__ CUtensorMap Q, cons
                         int empty_state_col = empty_state_vec * 4;
                         float _vec_load_0[4];
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + (long long)empty_state_col);
+                            const float* state_ptr = initial_state + empty_initial_base + (long long)empty_state_col;
+                            // Tensor views need only element alignment; keep vector loads for aligned bases.
+                            float4 _v4;
+                            if ((reinterpret_cast<uint64_t>(state_ptr) & 15) == 0) {
+                                _v4 = *reinterpret_cast<const float4*>(state_ptr);
+                            } else {
+                                _v4 = make_float4(state_ptr[0], state_ptr[1], state_ptr[2], state_ptr[3]);
+                            }
                             _vec_load_0[0 + 0] = _v4.x;
                             _vec_load_0[0 + 1] = _v4.y;
                             _vec_load_0[0 + 2] = _v4.z;

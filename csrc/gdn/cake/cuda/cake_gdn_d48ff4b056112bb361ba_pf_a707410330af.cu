@@ -15,6 +15,22 @@
 // clang-format off
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_gdn_device_common.cuh"
+
+// State views guarantee element alignment, not vector alignment.
+static __device__ __forceinline__ float2 cake_load_initial_f32x2(const float* ptr) {
+    if ((reinterpret_cast<uint64_t>(ptr) & 7) == 0) {
+        return *reinterpret_cast<const float2*>(ptr);
+    }
+    return make_float2(ptr[0], ptr[1]);
+}
+
+static __device__ __forceinline__ float4 cake_load_initial_f32x4(const float* ptr) {
+    if ((reinterpret_cast<uint64_t>(ptr) & 15) == 0) {
+        return *reinterpret_cast<const float4*>(ptr);
+    }
+    return make_float4(ptr[0], ptr[1], ptr[2], ptr[3]);
+}
+
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
@@ -1254,12 +1270,12 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                                 int state_col_pair_init = state_col_half_init * 64 + state_col_group_init * 8 + (lane & 3) * 2;
                                 const int state_reg_base_init = state_col_group_init * 4;
                                 {
-                                    float2 _v2_0 = *reinterpret_cast<const float2*>(initial_state + state_base_top_init + (long long)state_col_pair_init);
+                                    float2 _v2_0 = cake_load_initial_f32x2(initial_state + state_base_top_init + (long long)state_col_pair_init);
                                     state_init_frag[state_reg_base_init] = _v2_0.x;
                                     state_init_frag[state_reg_base_init + 1] = _v2_0.y;
                                 }
                                 {
-                                    float2 _v2_1 = *reinterpret_cast<const float2*>(initial_state + state_base_bot_init + (long long)state_col_pair_init);
+                                    float2 _v2_1 = cake_load_initial_f32x2(initial_state + state_base_bot_init + (long long)state_col_pair_init);
                                     state_init_frag[state_reg_base_init + 2] = _v2_1.x;
                                     state_init_frag[state_reg_base_init + 2 + 1] = _v2_1.y;
                                 }
@@ -2067,224 +2083,224 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                     long long empty_output_base = output_state_head_base_cg1 + (long long)empty_state_row * 128ll;
                     float empty_stage[128];
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 0ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 0ll);
                         empty_stage[0 + 0] = _v4.x;
                         empty_stage[0 + 1] = _v4.y;
                         empty_stage[0 + 2] = _v4.z;
                         empty_stage[0 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 4ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 4ll);
                         empty_stage[4 + 0] = _v4.x;
                         empty_stage[4 + 1] = _v4.y;
                         empty_stage[4 + 2] = _v4.z;
                         empty_stage[4 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 8ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 8ll);
                         empty_stage[8 + 0] = _v4.x;
                         empty_stage[8 + 1] = _v4.y;
                         empty_stage[8 + 2] = _v4.z;
                         empty_stage[8 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 12ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 12ll);
                         empty_stage[12 + 0] = _v4.x;
                         empty_stage[12 + 1] = _v4.y;
                         empty_stage[12 + 2] = _v4.z;
                         empty_stage[12 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 16ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 16ll);
                         empty_stage[16 + 0] = _v4.x;
                         empty_stage[16 + 1] = _v4.y;
                         empty_stage[16 + 2] = _v4.z;
                         empty_stage[16 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 20ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 20ll);
                         empty_stage[20 + 0] = _v4.x;
                         empty_stage[20 + 1] = _v4.y;
                         empty_stage[20 + 2] = _v4.z;
                         empty_stage[20 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 24ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 24ll);
                         empty_stage[24 + 0] = _v4.x;
                         empty_stage[24 + 1] = _v4.y;
                         empty_stage[24 + 2] = _v4.z;
                         empty_stage[24 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 28ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 28ll);
                         empty_stage[28 + 0] = _v4.x;
                         empty_stage[28 + 1] = _v4.y;
                         empty_stage[28 + 2] = _v4.z;
                         empty_stage[28 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 32ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 32ll);
                         empty_stage[32 + 0] = _v4.x;
                         empty_stage[32 + 1] = _v4.y;
                         empty_stage[32 + 2] = _v4.z;
                         empty_stage[32 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 36ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 36ll);
                         empty_stage[36 + 0] = _v4.x;
                         empty_stage[36 + 1] = _v4.y;
                         empty_stage[36 + 2] = _v4.z;
                         empty_stage[36 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 40ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 40ll);
                         empty_stage[40 + 0] = _v4.x;
                         empty_stage[40 + 1] = _v4.y;
                         empty_stage[40 + 2] = _v4.z;
                         empty_stage[40 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 44ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 44ll);
                         empty_stage[44 + 0] = _v4.x;
                         empty_stage[44 + 1] = _v4.y;
                         empty_stage[44 + 2] = _v4.z;
                         empty_stage[44 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 48ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 48ll);
                         empty_stage[48 + 0] = _v4.x;
                         empty_stage[48 + 1] = _v4.y;
                         empty_stage[48 + 2] = _v4.z;
                         empty_stage[48 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 52ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 52ll);
                         empty_stage[52 + 0] = _v4.x;
                         empty_stage[52 + 1] = _v4.y;
                         empty_stage[52 + 2] = _v4.z;
                         empty_stage[52 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 56ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 56ll);
                         empty_stage[56 + 0] = _v4.x;
                         empty_stage[56 + 1] = _v4.y;
                         empty_stage[56 + 2] = _v4.z;
                         empty_stage[56 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 60ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 60ll);
                         empty_stage[60 + 0] = _v4.x;
                         empty_stage[60 + 1] = _v4.y;
                         empty_stage[60 + 2] = _v4.z;
                         empty_stage[60 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 64ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 64ll);
                         empty_stage[64 + 0] = _v4.x;
                         empty_stage[64 + 1] = _v4.y;
                         empty_stage[64 + 2] = _v4.z;
                         empty_stage[64 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 68ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 68ll);
                         empty_stage[68 + 0] = _v4.x;
                         empty_stage[68 + 1] = _v4.y;
                         empty_stage[68 + 2] = _v4.z;
                         empty_stage[68 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 72ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 72ll);
                         empty_stage[72 + 0] = _v4.x;
                         empty_stage[72 + 1] = _v4.y;
                         empty_stage[72 + 2] = _v4.z;
                         empty_stage[72 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 76ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 76ll);
                         empty_stage[76 + 0] = _v4.x;
                         empty_stage[76 + 1] = _v4.y;
                         empty_stage[76 + 2] = _v4.z;
                         empty_stage[76 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 80ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 80ll);
                         empty_stage[80 + 0] = _v4.x;
                         empty_stage[80 + 1] = _v4.y;
                         empty_stage[80 + 2] = _v4.z;
                         empty_stage[80 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 84ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 84ll);
                         empty_stage[84 + 0] = _v4.x;
                         empty_stage[84 + 1] = _v4.y;
                         empty_stage[84 + 2] = _v4.z;
                         empty_stage[84 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 88ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 88ll);
                         empty_stage[88 + 0] = _v4.x;
                         empty_stage[88 + 1] = _v4.y;
                         empty_stage[88 + 2] = _v4.z;
                         empty_stage[88 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 92ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 92ll);
                         empty_stage[92 + 0] = _v4.x;
                         empty_stage[92 + 1] = _v4.y;
                         empty_stage[92 + 2] = _v4.z;
                         empty_stage[92 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 96ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 96ll);
                         empty_stage[96 + 0] = _v4.x;
                         empty_stage[96 + 1] = _v4.y;
                         empty_stage[96 + 2] = _v4.z;
                         empty_stage[96 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 100ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 100ll);
                         empty_stage[100 + 0] = _v4.x;
                         empty_stage[100 + 1] = _v4.y;
                         empty_stage[100 + 2] = _v4.z;
                         empty_stage[100 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 104ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 104ll);
                         empty_stage[104 + 0] = _v4.x;
                         empty_stage[104 + 1] = _v4.y;
                         empty_stage[104 + 2] = _v4.z;
                         empty_stage[104 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 108ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 108ll);
                         empty_stage[108 + 0] = _v4.x;
                         empty_stage[108 + 1] = _v4.y;
                         empty_stage[108 + 2] = _v4.z;
                         empty_stage[108 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 112ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 112ll);
                         empty_stage[112 + 0] = _v4.x;
                         empty_stage[112 + 1] = _v4.y;
                         empty_stage[112 + 2] = _v4.z;
                         empty_stage[112 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 116ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 116ll);
                         empty_stage[116 + 0] = _v4.x;
                         empty_stage[116 + 1] = _v4.y;
                         empty_stage[116 + 2] = _v4.z;
                         empty_stage[116 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 120ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 120ll);
                         empty_stage[120 + 0] = _v4.x;
                         empty_stage[120 + 1] = _v4.y;
                         empty_stage[120 + 2] = _v4.z;
                         empty_stage[120 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 124ll);
+                        float4 _v4 = cake_load_initial_f32x4(initial_state + empty_initial_base + 124ll);
                         empty_stage[124 + 0] = _v4.x;
                         empty_stage[124 + 1] = _v4.y;
                         empty_stage[124 + 2] = _v4.z;
