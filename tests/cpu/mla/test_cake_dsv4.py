@@ -1351,13 +1351,19 @@ def test_sm107a_registers_the_fp8_decode_route_only():
 def test_registered_sources_exist_and_shared_sources_live_in_common(arch):
     """Every registered source is on disk; a source both architectures compile
     lives under ``common/`` and every ``common/`` source is compiled by both.
+    A variant one architecture alone registers (the NVFP4 H128 ``v_unit_pairs``
+    build, sm_103a) has its sources in that architecture's directory.
     """
     from flashinfer.jit.cake_dsv4 import _get_csrc_dir
 
     csrc_dir = _get_csrc_dir()
     other = "sm_103a" if arch == "sm_100a" else "sm_100a"
     for variant, spec in _ARCH_REGISTRATIONS[arch]["variants"].items():
-        twin = _ARCH_REGISTRATIONS[other]["variants"][variant]["sources"]
+        twin_spec = _ARCH_REGISTRATIONS[other]["variants"].get(variant)
+        if twin_spec is None:
+            assert variant == "nvfp4_h128_v_unit_pairs_prefill", (arch, variant)
+            assert all(s.startswith(f"{arch}/") for s in spec["sources"]), spec
+        twin = twin_spec["sources"] if twin_spec is not None else []
         for source in spec["sources"]:
             assert (csrc_dir / source).is_file(), (arch, variant, source)
             assert (source in twin) == source.startswith("common/"), (
@@ -1406,6 +1412,11 @@ _HOST_TMA_SOURCE_TENSORS = frozenset(
         "main_cache_g4f",
         "extra_cache_g4d",
         "extra_cache_g4f",
+        # NVFP4 prefill bodies: the pools' scale-row views (run_cake_dsv4_nvfp4
+        # builds them beside the data-row views the SWA_cache / compressed_KV_cache
+        # aliases carry).
+        "SWA_sf",
+        "compressed_KV_sf",
         # SM107 split-KV producer: the [pieces, heads, 512] partial-O view.
         "partial_O_pieces",
     }
