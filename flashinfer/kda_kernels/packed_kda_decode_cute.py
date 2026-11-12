@@ -63,6 +63,7 @@ from cutlass._mlir.dialects import llvm as mlir_llvm
 from cutlass.cute.runtime import make_fake_stream
 import tvm_ffi  # noqa: F401 -- TVM FFI required for zero-overhead dispatch
 
+from ..gdn_kernels.cute_dsl_cache_naming import persist_cute_dsl_compile
 from ..jit.cpp_ext import is_cuda_version_at_least
 from ..utils import get_compute_capability
 
@@ -2040,7 +2041,12 @@ def _make_compile_inputs(
     )
 
 
+_CUTE_DSL_MODULE = "packed_kda_decode"
+_SOURCE_FILES = (os.path.realpath(__file__),)
+
+
 @functools.cache
+@persist_cute_dsl_compile(_CUTE_DSL_MODULE, _SOURCE_FILES)
 def _get_compiled(
     tile_v: int,
     ilp_rows: int,

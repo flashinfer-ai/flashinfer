@@ -101,15 +101,20 @@ from cutlass.cute.nvgpu import cpasync
 
 try:
     from . import _umma_helpers_rubin as U
-    from .device_target import gdn_compile_options, gdn_device_target
+    from .cute_dsl_cache_naming import make_kernel_name
+    from .device_target import gdn_compile_options, gdn_device_target, target_arch
+    from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 except (
     ImportError
 ):  # tests and benchmarks may load this file by path, outside the package
     from flashinfer.gdn_kernels import _umma_helpers_rubin as U
+    from flashinfer.gdn_kernels.cute_dsl_cache_naming import make_kernel_name
     from flashinfer.gdn_kernels.device_target import (
         gdn_compile_options,
         gdn_device_target,
+        target_arch,
     )
+    from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
 RING_SLOTS = 32
 RING_MASK = RING_SLOTS - 1
@@ -4351,6 +4356,8 @@ class GdnReplayMtpUmmaRubin:
 
 
 _KERNELS: dict = {}
+_CUTE_DSL_MODULE = "gdn_replay_mtp_umma_rubin"
+_KEY_FILES = (__file__, U.__file__)
 
 
 def _get_kernel(
@@ -4393,21 +4400,26 @@ def _get_kernel(
     )
     fn = _KERNELS.get(key)
     if fn is None:
-        fn = GdnReplayMtpUmmaRubin.compile(
-            device,
-            T,
-            h,
-            hv,
-            u_bf16,
-            use_row_order,
-            hpc,
-            sr,
-            sr_rounds,
-            persistent,
-            h_io,
-            hv_io,
-            min_blocks,
-            parts,
+        fn = build_and_load_cute_dsl_kernel(
+            _CUTE_DSL_MODULE,
+            make_kernel_name("umma_rubin", target_arch(key[0]), *key[1:]),
+            lambda: GdnReplayMtpUmmaRubin.compile(
+                device,
+                T,
+                h,
+                hv,
+                u_bf16,
+                use_row_order,
+                hpc,
+                sr,
+                sr_rounds,
+                persistent,
+                h_io,
+                hv_io,
+                min_blocks,
+                parts,
+            ),
+            extra_key_files=_KEY_FILES,
         )
         _KERNELS[key] = fn
     return fn

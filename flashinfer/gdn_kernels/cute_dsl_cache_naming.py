@@ -14,8 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 import hashlib
+import inspect
 import re
+from typing import Callable, Sequence
 
 import torch
 
@@ -45,6 +48,8 @@ def format_name_part(value) -> str:
         return "t" + "x".join(format_name_part(v) for v in value)
     if isinstance(value, str):
         return _SANITIZE.sub("_", value.removeprefix("torch."))
+    if isinstance(value, type) and value.__module__.startswith("cutlass"):
+        return _SANITIZE.sub("_", value.__name__)
     raise TypeError(
         f"Unsupported cache-key component type {type(value).__name__}: {value!r}"
     )
@@ -61,3 +66,31 @@ def make_kernel_name(*parts) -> str:
         digest = hashlib.sha256(name.encode()).hexdigest()[:16]
         name = f"{name[:_MAX_NAME_LEN]}_h{digest}"
     return name
+
+
+def persist_cute_dsl_compile(
+    module_name: str, key_files: Sequence[str]
+) -> Callable[[Callable], Callable]:
+    """Persist a TVM-FFI ``cute.compile`` factory in the CuTe-DSL disk cache.
+
+    The kernel name is the function name plus every argument, so each argument
+    must be a codegen parameter that :func:`format_name_part` accepts.
+    """
+
+    def decorator(fn: Callable) -> Callable:
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
+            bound = sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+            name = make_kernel_name(fn.__name__.lstrip("_"), *bound.arguments.values())
+            return build_and_load_cute_dsl_kernel(
+                module_name, name, lambda: fn(*args, **kwargs), tuple(key_files)
+            )
+
+        return wrapper
+
+    return decorator

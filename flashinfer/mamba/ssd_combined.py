@@ -22,6 +22,7 @@ This module provides the combined forward pass for Mamba2 SSD, combining:
 """
 
 import functools
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -34,6 +35,7 @@ from cutlass import Int32
 from cutlass.base_dsl.compiler import GenerateLineInfo  # profiling
 
 from ..api_logging import flashinfer_api
+from ..gdn_kernels.cute_dsl_cache_naming import persist_cute_dsl_compile
 from ..jit.mamba.seq_chunk_cumsum import gen_seq_chunk_cumsum_module
 from ..trace.templates.mamba import ssd_combined_trace_dispatch
 from ..triton.kernels.ssd_chunk_state import chunk_cumsum_fwd
@@ -46,7 +48,15 @@ def _get_seq_chunk_cumsum_module():
     return gen_seq_chunk_cumsum_module().build_and_load()
 
 
+_CUTE_DSL_MODULE = "mamba_ssd_combined"
+_SOURCE_FILES = tuple(
+    os.path.join(os.path.dirname(os.path.realpath(__file__)), name)
+    for name in ("ssd_combined.py", "ssd_kernel.py", "ssd_tile_scheduler.py")
+)
+
+
 @functools.cache
+@persist_cute_dsl_compile(_CUTE_DSL_MODULE, _SOURCE_FILES)
 def _get_compiled_ssd_kernel(
     chunk_size: int,
     headdim: int,
