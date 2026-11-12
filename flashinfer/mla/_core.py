@@ -1981,11 +1981,11 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         ``cum_seq_lens_q`` is provided. SM100/SM103/SM107 accept BF16 or FP8
         E4M3; SM120/SM121 accepts BF16. With ``backend="cake"`` and
         ``kv_cache_format="nvfp4"`` on SM100/SM103 the query is either BF16
-        (the NVFP4 decode family, fewer than 128 metadata rows) or packed
+        (the NVFP4 decode family) or packed
         NVFP4, uint8 with last dimension 384 (the cache's row format: codes,
         then the 28 E4M3 scale factors), which runs the NVFP4 prefill bodies
-        at any row count; the call packs nothing, so a BF16 query of 128 rows
-        or more is refused. :func:`flashinfer.mla.cake_dsv4_nvfp4_pack_query`
+        at any row count; the call packs nothing.
+        :func:`flashinfer.mla.cake_dsv4_nvfp4_pack_query`
         packs a BF16 query. The output is BF16 with last dimension 512.
     swa_kv_cache : torch.Tensor
         SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses an opaque

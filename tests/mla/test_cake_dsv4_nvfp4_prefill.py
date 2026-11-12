@@ -344,10 +344,15 @@ def _oracle(case, *, main_lens="given", extra_lens="given", chunk: int = 32):
     return out, lse
 
 
+# The cases of this file pass the packed query (the prefill bodies) from this
+# many metadata rows on and the BF16 query (the decode family) below it; the
+# route takes either query at any row count.
+_PACK_FROM_ROWS = 128
+
+
 def _packs(case) -> bool:
-    """The route's call takes the packed query from 128 metadata rows on (the
-    NVFP4 prefill bodies); below that the BF16 query runs the decode family."""
-    return case["rows"] >= cake._NVFP4_PREFILL_MIN_TOKENS
+    """Whether :func:`_run` passes the packed query by default."""
+    return case["rows"] >= _PACK_FROM_ROWS
 
 
 def _run(
@@ -398,7 +403,7 @@ def _route_layout(rows: int, heads: int, topk: int, extra_topk: int, prefill=Non
     """The workspace carve of one route call: one split for the prefill bodies
     (they write the final O and LSE), the decode plan's splits for the decode
     family."""
-    prefill = rows >= cake._NVFP4_PREFILL_MIN_TOKENS if prefill is None else prefill
+    prefill = rows >= _PACK_FROM_ROWS if prefill is None else prefill
     if prefill:
         splits = 1
     else:
@@ -416,9 +421,9 @@ def _route_layout(rows: int, heads: int, topk: int, extra_topk: int, prefill=Non
     )
 
 
-def _lse(case) -> torch.Tensor:
+def _lse(case, prefill=None) -> torch.Tensor:
     layout = _route_layout(
-        case["rows"], case["heads"], case["topk"], case["extra_topk"]
+        case["rows"], case["heads"], case["topk"], case["extra_topk"], prefill
     )
     offset, _ = layout.lse
     return (
@@ -431,12 +436,12 @@ def _lse(case) -> torch.Tensor:
     )
 
 
-def _check(case, out, **oracle_kwargs):
+def _check(case, out, prefill=None, **oracle_kwargs):
     torch.cuda.synchronize()
     ref_out, ref_lse = _oracle(case, **oracle_kwargs)
     assert torch.isfinite(out.float()).all()
     torch.testing.assert_close(out.float(), ref_out, **_O_TOL)
-    torch.testing.assert_close(_lse(case), ref_lse, **_LSE_TOL)
+    torch.testing.assert_close(_lse(case, prefill), ref_lse, **_LSE_TOL)
 
 
 _GRID = [
@@ -826,10 +831,56 @@ def test_nvfp4_query_block_takes_a_padded_index_pitch(monkeypatch):
     _check(case, out)
 
 
+@pytest.mark.parametrize(
+    "spec, variant",
+    [
+        pytest.param(
+            dict(heads=16, topk=128, q_lens=(683, 1365), lens_rule="window"),
+            "nvfp4_qb_h16_prefill",
+            id="h16-query-block",
+        ),
+        pytest.param(
+            dict(heads=128, topk=512, extra_topk=512, q_lens=(100, 156)),
+            "nvfp4_h128",
+            id="h128",
+        ),
+    ],
+)
+@pytest.mark.parametrize("view", ["offset", "odd-stride"])
+def test_nvfp4_prefill_vector_index_bodies_refuse_unreadable_tables(
+    spec, variant, view, monkeypatch
+):
+    """The H128 and query-block prefill builds load index rows 16 bytes at a
+    time: a table off 16-byte alignment, or with a row stride that is not a
+    multiple of 4 elements, raises before any launch and leaves ``out``
+    untouched; a 16-byte offset view with a 4-multiple stride runs in place,
+    bitwise equal to the contiguous table."""
+    _require_cake_arch()
+    calls = _routed(monkeypatch)
+    case = _case(seed=21, pool_pages=96, **spec)
+    first = _run(case)
+    assert calls and calls[-1].startswith(variant), calls
+    rows, width = case["main_idx"].shape
+    pad = 1 if view == "offset" else 3
+    parent = torch.full((rows, width + 4 + pad), -1, dtype=torch.int32, device="cuda")
+    start = pad if view == "offset" else 0
+    parent[:, start : start + width] = case["main_idx"]
+    bad = dict(case, main_idx=parent[:, start : start + width])
+    out = torch.full_like(first, float("nan"))
+    with pytest.raises(ValueError, match="sparse_indices must"):
+        _run(bad, out=out)
+    torch.cuda.synchronize()
+    assert torch.isnan(out.float()).all()
+    good_parent = torch.full((rows, width + 8), -1, dtype=torch.int32, device="cuda")
+    good_parent[:, 4 : 4 + width] = case["main_idx"]
+    good = dict(case, main_idx=good_parent[:, 4 : 4 + width])
+    assert good["main_idx"].data_ptr() % 16 == 0
+    assert torch.equal(_run(good), first)
+
+
 def test_nvfp4_query_format_selects_the_family(monkeypatch):
-    """A packed query runs the prefill bodies at any row count; a BF16 query
-    runs the decode family below 128 rows and is refused from 128 rows on (the
-    call packs nothing)."""
+    """A packed query runs the prefill bodies and a BF16 query the decode
+    family, each at any row count (the call packs nothing)."""
     _require_cake_arch()
     calls = []
     original = cake._nvfp4_prefill
@@ -849,8 +900,9 @@ def test_nvfp4_query_format_selects_the_family(monkeypatch):
     ref_out, _ = _oracle(small)
     torch.testing.assert_close(out.float(), ref_out, **_O_TOL)
     large = _case(seed=5, heads=16, topk=128, q_lens=(64, 64))
-    with pytest.raises(ValueError, match="cake_dsv4_nvfp4_pack_query"):
-        _run(large, packed=False)
+    out = _run(large, packed=False)
+    assert calls == [127]
+    _check(large, out, prefill=False)
     out = _run(large)
     assert calls == [127, 128]
     _check(large, out)

@@ -181,8 +181,10 @@ shifted windows are gathered and transformed once), the per-token builds
 the two 64-row halves of a block-scaled M128 QK) and ``nvfp4_h128_prefill``
 (``H128``, one two-CTA cluster per token, 64 heads per CTA). As the FP8
 route takes an E4M3 query, they take the query packed by the caller: the call
-packs nothing. A BF16 query runs the decode family, below 128 metadata rows;
-from 128 rows on it is refused (pack it first). The prefill bodies read the
+packs nothing. A BF16 query runs the decode family at any row count, as it
+did before the prefill bodies; on the DSv4 prefill shapes (128 to 8192 rows)
+the prefill bodies with a packed query run 1.05-6.5x faster than the decode
+family. The prefill bodies read the
 pools through 32-byte-pitch data-row and scale-row tensor maps, and write the
 final BF16 output and base-2 LSE directly (no split, no merge), so their
 workspace carve has one split (no ``partial_O`` region); the LSE lands in the
@@ -306,8 +308,7 @@ _NVFP4_PV_PLAN_MERGE_US = 1.5
 # heads_per_cta is the smallest power of two whose grid T x ceil(H / hpc) stays within one CTA per SM (round 45).
 _NVFP4_MERGE_HEADS_PER_CTA = 16
 # NVFP4 prefill bodies: a caller-packed NVFP4 query runs them (see the module docstring);
-# the decode family takes a BF16 query of fewer than _NVFP4_PREFILL_MIN_TOKENS metadata rows.
-_NVFP4_PREFILL_MIN_TOKENS = 128
+# a BF16 query runs the decode family at any row count.
 # The per-token body takes up to 64 heads, the two-CTA body 128. Its builds (``_nvfp4_prefill_route``):
 # ``tmem_v`` keeps V^T in TMEM (at most 32 heads); ``early_gather`` gathers a CTA's first item before
 # the index hand-off (one item per CTA: at most as many query tokens as SMs); ``o_boxes`` stores O
@@ -353,6 +354,20 @@ _NVFP4_PREFILL_VARIANTS = (
     _NVFP4_VARIANT_H64_Q_PREFETCH_PREFILL,
     _NVFP4_VARIANT_H128_PREFILL,
     _NVFP4_VARIANT_H128_V_UNIT_PAIRS_PREFILL,
+)
+# Prefill bodies that load index rows 16 bytes (four int32) at a time with cp.async or vector loads: the
+# two-CTA H128 builds and the query-block builds. Their tables must start 16-byte aligned and keep a row
+# stride that is a multiple of 4 elements (:func:`_check_index_row_alignment`); the per-token H <= 64
+# builds read one index at a time.
+_NVFP4_PREFILL_VECTOR_INDEX_VARIANTS = frozenset(
+    {
+        _NVFP4_VARIANT_QB_H16_PREFILL,
+        _NVFP4_VARIANT_QB_H16_BREAKS_PREFILL,
+        _NVFP4_VARIANT_QB_H32_PREFILL,
+        _NVFP4_VARIANT_QB_H32_LATE_CLAIM_PREFILL,
+        _NVFP4_VARIANT_H128_PREFILL,
+        _NVFP4_VARIANT_H128_V_UNIT_PAIRS_PREFILL,
+    }
 )
 _NVFP4_H64_PREFILL_MAX_HEADS = 64
 _NVFP4_TMEM_V_MAX_HEADS = 32
@@ -527,8 +542,10 @@ def _check_index_row_alignment(table: torch.Tensor, name: str) -> None:
     ``data_ptr + 4 * (t * row_stride + c)`` with ``c`` a multiple of 4, so the
     table must start 16-byte aligned and, past one row, have a row stride that
     is a multiple of 4 elements. Row-tiled launches slice the table by row,
-    which keeps both properties. The NVFP4 family reads its tables one index
-    at a time and does not call this.
+    which keeps both properties. The NVFP4 decode family and the per-token
+    H <= 64 prefill builds read their tables one index at a time; the NVFP4
+    H128 and query-block prefill builds load 16-byte rows and call this
+    (``_NVFP4_PREFILL_VECTOR_INDEX_VARIANTS``).
     """
     misaligned = table.data_ptr() % _INDEX_ROW_ALIGN
     if misaligned:
@@ -4339,7 +4356,7 @@ def run_cake_dsv4_nvfp4(
     lse_scale: float = 1.0,
 ) -> torch.Tensor:
     """Launch the CAKE DSv4 NVFP4 route for ``query``: BF16 ``[rows, num_heads, 512]``
-    (the decode family, fewer than 128 metadata rows) or packed NVFP4 ``uint8
+    (the decode family) or packed NVFP4 ``uint8
     [rows, num_heads, 384]`` (the prefill bodies; see the module docstring and
     :func:`cake_dsv4_nvfp4_pack_query`).
 
@@ -4355,8 +4372,8 @@ def run_cake_dsv4_nvfp4(
     parity with :func:`run_cake_dsv4` but unused, and ``max_q_len`` is only a
     work-mapping constant of the prefill bodies: the kernels consume flat token
     coordinates. A packed query runs the NVFP4 prefill bodies
-    (:func:`_nvfp4_prefill`); a BF16 query runs the decode family and is
-    refused from 128 metadata rows on. The base-2 LSE is written to the
+    (:func:`_nvfp4_prefill`); a BF16 query runs the decode family. The base-2
+    LSE is written to the
     workspace (not returned). No device memory is allocated.
     """
     if backend != "cake":
@@ -4502,12 +4519,6 @@ def run_cake_dsv4_nvfp4(
         )
     raw = _workspace_bytes(workspace_buffer)
     prefill = packed_query
-    if not prefill and num_query_tokens >= _NVFP4_PREFILL_MIN_TOKENS:
-        raise ValueError(
-            f"{num_query_tokens} metadata rows run the NVFP4 prefill bodies, which take "
-            "the query packed to the NVFP4 row format: pass "
-            "cake_dsv4_nvfp4_pack_query(query) (uint8 [rows, heads, 384])"
-        )
     # The prefill bodies write the final O and LSE directly, so their carve has one
     # split (no partial_O) whatever the decode plan would split into.
     layout = cake_dsv4_workspace_layout(
@@ -4751,6 +4762,12 @@ def _nvfp4_prefill(
         arch=arch,
     )
     _require_nvfp4_variant(variant, arch=arch)
+    if variant in _NVFP4_PREFILL_VECTOR_INDEX_VARIANTS:
+        # Refused before any launch (and before the length fill below), as the
+        # BF16 / FP8 route refuses such tables in resolve_cake_dsv4_sparse_metadata.
+        _check_index_row_alignment(main_indices, "sparse_indices")
+        if extra_width:
+            _check_index_row_alignment(extra_indices, "extra_sparse_indices")
 
     q_packed = query_rows
 
