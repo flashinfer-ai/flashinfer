@@ -2993,7 +2993,8 @@ def test_fp8_wider_than_1152_is_rejected_on_every_path(arch, num_heads, page_siz
     rows of every head count -- raises one ValueError from the route before
     any launch, naming the width, the limit, the C128 layers past 128K context
     that reach it and the routes that run them (the NVFP4 cache only up to its
-    route's 1536 slots); 1152 itself still routes."""
+    route's 1536 slots, and not on SM107, which registers no NVFP4 program);
+    1152 itself still routes."""
     assert cake._FP8_MAX_WIDTH == 1152
     sm_count = _SM107_SM_COUNT if arch == "sm_107a" else _SM_COUNT
     shapes = (
@@ -3027,8 +3028,11 @@ def test_fp8_wider_than_1152_is_rejected_on_every_path(arch, num_heads, page_siz
             assert "at most 1152 sparse slots" in message
             assert "past 128K context" in message
             assert "backend='trtllm-gen'" in message
-            # The NVFP4 cache is named only for rows its route takes.
-            assert ("kv_cache_format='nvfp4'" in message) == (sparse_topk <= 1536)
+            # The NVFP4 cache is named only for rows its route takes, and only
+            # where NVFP4 programs are registered (SM107 has none).
+            assert ("kv_cache_format='nvfp4'" in message) == (
+                sparse_topk <= 1536 and arch != "sm_107a"
+            )
 
 
 @pytest.mark.cpu_only

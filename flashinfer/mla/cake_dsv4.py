@@ -1580,9 +1580,15 @@ def _route(
     if dtype == torch.float8_e4m3fn:
         if sparse_topk > _FP8_MAX_WIDTH:
             # The backend='cake' NVFP4 route takes up to _NVFP4_MAX_SPLITS
-            # tiles of 128 slots per token; only rows within it are sent there.
+            # tiles of 128 slots per token; only rows within it are sent there,
+            # and only on the architectures that register NVFP4 programs
+            # (``arch=None``: the architecture-independent choice).
+            from ..jit.cake_dsv4 import _NVFP4_IDENTITIES
+
             nvfp4_max_width = _NVFP4_MAX_SPLITS * _TILE_KV
-            if sparse_topk <= nvfp4_max_width:
+            if sparse_topk <= nvfp4_max_width and (
+                arch is None or arch in _NVFP4_IDENTITIES
+            ):
                 elsewhere = (
                     "Run these rows with backend='trtllm-gen' on this cache, or on "
                     "an NVFP4 KV cache (kv_cache_format='nvfp4'), whose "
