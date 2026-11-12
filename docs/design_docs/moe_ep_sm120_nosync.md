@@ -183,7 +183,7 @@ description of [#8806](https://github.com/flashinfer-ai/flashinfer/pull/8806).
 | RTX 6000D (Broadcom) | EP4 | 125.7 (2.35×) | 448.3 (1.49×) | 696.8 (1.35×) | 776.0 (1.24×) |
 | RTX 6000D (Broadcom) | EP8, every pair P2P | 142.8 (2.21×) | 309.8 (1.65×) | 397.9 (1.51×) | 544.3 (1.20×) |
 | RTX PRO 6000 | EP4 | 124.9 (2.41×) | 389.1 (1.56×) | 599.7 (1.40×) | 700.4 (1.25×) |
-| RTX PRO 6000 | EP8 `auto` | 174.1 (1.72×) | 369.6 (1.40×) | 434.2 (1.33×) | 704.5 (0.91×) |
+| RTX PRO 6000 | EP8, cake `lsa_where_reachable` (P2P within a socket, GIN across) | 172.6 (1.73×) | 371.0 (1.40×) | 435.7 (1.33×) | 703.5 (0.91×) |
 
 ## Limits and known gaps
 
