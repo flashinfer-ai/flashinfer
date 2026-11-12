@@ -57,27 +57,43 @@ def route(monkeypatch, dim=256, qs=(2049, 257, 1), ks=None, **changes):
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
 @pytest.mark.parametrize("page", [16, 64])
-@pytest.mark.parametrize("dim,hk", [(128, 2), (128, 4), (256, 16)])
+@pytest.mark.parametrize(
+    "dim,hk",
+    [(128, 2), (128, 4), (256, 16), (256, 8), (256, 4), (256, 2), (256, 1)],
+)
 def test_full_prefill_additions(monkeypatch, cc, page, dim, hk):
     assert route(monkeypatch, dim, hk=hk, cc=cc, page_size=page)
 
 
-@pytest.mark.parametrize("dim,batch,hk", [(256, 8, 16), (128, 32, 4)])
+@pytest.mark.parametrize(
+    "dim,batch,hk",
+    [
+        (256, 8, 16),
+        (256, 16, 8),
+        (256, 16, 4),
+        (256, 16, 2),
+        (256, 16, 1),
+        (128, 32, 4),
+    ],
+)
 def test_full_prefill_batch_edge(monkeypatch, dim, batch, hk):
     assert route(monkeypatch, dim, qs=[1027] * batch, hk=hk)
     assert not route(monkeypatch, dim, qs=[1027] * (batch + 1), hk=hk)
 
 
-def test_full_prefill_work_floor_and_length_edges(monkeypatch):
-    assert not route(monkeypatch, qs=[1023])
-    assert route(monkeypatch, qs=[1024])
-    assert not route(monkeypatch, qs=[511], hq=64, hk=64)
-    assert route(monkeypatch, qs=[512], hq=64, hk=64)
-    assert route(monkeypatch, qs=[16384])
-    assert not route(monkeypatch, qs=[16385])
+@pytest.mark.parametrize("group", [1, 2, 4, 8, 16])
+def test_full_prefill_work_floor_and_length_edges(monkeypatch, group):
+    assert not route(monkeypatch, qs=[1023], hk=16 // group)
+    assert route(monkeypatch, qs=[1024], hk=16 // group)
+    assert not route(monkeypatch, qs=[511], hq=64, hk=64 // group)
+    assert route(monkeypatch, qs=[512], hq=64, hk=64 // group)
+    assert route(monkeypatch, qs=[16384], hk=16 // group)
+    assert not route(monkeypatch, qs=[16385], hk=16 // group)
     # Equal maxima and a large total cannot hide a partial request.
-    assert not route(monkeypatch, qs=[2049, 257], ks=[2049, 2049])
-    assert not route(monkeypatch, qs=[2049, 257], max_q=4096, max_kv=4096)
+    assert not route(monkeypatch, qs=[2049, 257], ks=[2049, 2049], hk=16 // group)
+    assert not route(
+        monkeypatch, qs=[2049, 257], max_q=4096, max_kv=4096, hk=16 // group
+    )
 
 
 class DeviceOnly:
@@ -91,8 +107,9 @@ class DeviceOnly:
 
 
 @pytest.mark.parametrize("field", ["kv_lens", "qo_indptr_host", "seq_lens_q"])
-def test_full_prefill_no_device_readback(monkeypatch, field):
-    assert not route(monkeypatch, **{field: DeviceOnly()})
+@pytest.mark.parametrize("group", [1, 2, 4, 8, 16])
+def test_full_prefill_no_device_readback(monkeypatch, field, group):
+    assert not route(monkeypatch, hk=16 // group, **{field: DeviceOnly()})
 
 
 @pytest.mark.parametrize(
@@ -107,7 +124,8 @@ def test_full_prefill_no_device_readback(monkeypatch, field):
         dict(hq=128, hk=128),
         dict(hq=4, hk=4),
         dict(hk=0),
-        dict(hk=8),
+        dict(hq=64, hk=2),
+        dict(hq=24, hk=8),
         dict(kv_lens=None),
         dict(seq_lens_q=torch.tensor([2049, 257, 1])),
         dict(total_q=999),

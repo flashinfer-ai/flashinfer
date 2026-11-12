@@ -8,7 +8,9 @@ import flashinfer
 from flashinfer.cudnn import prefill as cp
 
 
-@pytest.mark.parametrize("dim,group", [(128, 4), (256, 1)])
+@pytest.mark.parametrize(
+    "dim,group", [(128, 4), (256, 1), (256, 2), (256, 4), (256, 8), (256, 16)]
+)
 @pytest.mark.parametrize("page", [16, 64])
 @pytest.mark.parametrize("return_lse", [False, True])
 def test_full_prefill_auto_retained_capture(dim, group, page, return_lse):

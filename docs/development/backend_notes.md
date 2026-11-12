@@ -148,8 +148,9 @@ from a development FE build does not establish released-wheel qualification.
 ### Additional Blackwell full-prefill admission
 
 With stable FE 1.33+, the same public graph path admits BF16 HND full prefills
-on SM100 and SM103 with page sizes 16 or 64. D256 MHA supports batch 1–8;
-D128 GQA groups 4/8 support batch 1–32. Query heads remain in 8–64.
+on SM100 and SM103 with page sizes 16 or 64. D256 MHA supports batch 1–8,
+D256 GQA groups 2/4/8/16 support batch 1–16, and D128 GQA groups 4/8 support
+batch 1–32. Query heads remain in 8–64.
 Every actual Q length must equal its KV length, and the declared Q/KV maxima
 must equal the actual maximum in 512–16384. The paired-work floor is 16 Mi.
 

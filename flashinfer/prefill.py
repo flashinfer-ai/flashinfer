@@ -2641,7 +2641,13 @@ def _blackwell_paged_full_prefill_auto_cudnn(
         and hk > 0
         and hq % hk == 0
         and (
-            (head_dim_qk == 256 and hq == hk and 1 <= batch <= 8)
+            (
+                head_dim_qk == 256
+                and (
+                    (hq == hk and 1 <= batch <= 8)
+                    or (hq // hk in (2, 4, 8, 16) and 1 <= batch <= 16)
+                )
+            )
             or (head_dim_qk == 128 and hq // hk in (4, 8) and 1 <= batch <= 32)
         )
         and page_size in (16, 64)
