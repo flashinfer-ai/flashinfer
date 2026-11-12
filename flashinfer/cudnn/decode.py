@@ -8,7 +8,6 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.attention import cudnn_batch_decode_trace
 from ..utils import log2e
 from .utils import (
-    cudnn_frontend_accepts_cuda_graph_replay_hint,
     get_cudnn_fmha_gen_module,
     get_cudnn_attention_handle,
     supports_ordered_cudnn_execution,
@@ -168,12 +167,12 @@ if CUDNN_AVAILABLE:
 
         # A caller that captures the graph's execute into a CUDA graph pays a
         # plan's per-execute host cost once, at capture: tell cudnn-frontend
-        # (1.31+) so its heuristics lead with the plan that is fastest on the
+        # so its heuristics lead with the plan that is fastest on the
         # GPU alone (the d256 decode tile's split-KV plan) instead of the one
         # that also covers an eager caller's extra launch. The hint changes no
-        # numerics; an older frontend is not given the keyword.
+        # numerics; every supported frontend accepts the keyword.
         graph_kwargs: dict[str, Any] = {}
-        if is_cuda_graph_compatible and cudnn_frontend_accepts_cuda_graph_replay_hint():
+        if is_cuda_graph_compatible:
             graph_kwargs["is_cuda_graph_replay_expected"] = True
 
         # Decode represents fixed-length queries with dense strided Q/O
