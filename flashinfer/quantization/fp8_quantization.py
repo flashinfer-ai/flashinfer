@@ -542,7 +542,7 @@ def mxfp8_quantize(
     Parameters
     ----------
     input : torch.Tensor
-Contiguous CUDA input of shape ``[..., M, K]`` with dtype fp16/bf16
+        Contiguous CUDA input of shape ``[..., M, K]`` with dtype fp16/bf16
         for ``"cuda"``. Its CPU host path takes a 2-D fp32 input.
         The ``"cute-dsl"`` backend additionally supports fp32 CUDA input and
         prepares non-contiguous strided inputs when necessary. It requires
