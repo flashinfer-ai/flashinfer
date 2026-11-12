@@ -435,6 +435,11 @@ def test_cooperative_gate_over_several_blocks(
     _skip_unless_sm120()
     config = heuristics.make_config(block_tokens, num_split_k, shape["num_experts"])
     assert config.cooperative_gate == (block_tokens <= 3 * config.num_logical_ctas)
+    # More blocks than worker groups on any SM count (a 188-SM board runs 23 groups of
+    # 8 CTAs), and a partial last block.
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device())
+    groups = sms.multi_processor_count // config.num_logical_ctas
+    num_tokens = max(num_tokens, block_tokens * (groups + 2) + 5)
     plan = _run_case(
         num_tokens, **shape, num_shared=num_shared, with_mask=True, config=config
     )
