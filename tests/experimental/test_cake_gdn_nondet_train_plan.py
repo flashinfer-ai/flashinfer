@@ -24,7 +24,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_chain = cake_package("cake_gdn_nondet_train", "cake_chain")
 cake_plan = cake_package("cake_gdn_nondet_train", "cake_plan")

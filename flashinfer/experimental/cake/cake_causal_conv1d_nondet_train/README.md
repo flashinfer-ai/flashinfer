@@ -25,16 +25,15 @@ rounding per output, and the SiLU derivative taken at the FP32 preactivation.
 The following parts are the deterministic KCP package's:
 
 - the context contract
-- the forward and head programs (this package's copies of the deterministic programs)
+- the two-launch forward (FlashInfer PR #9225; see The forward)
+- the forward, history-row and head programs (this package's copies of the deterministic programs)
 - the halo exchanges
 - the recompute handle
 - graph replay
 - the multi-tensor calls
 
 Of the programs, only the backward after the head program differs: it overlaps the halo exchange, and its `dweight`
-sum is unordered. The forward program is the same, but its launch grid follows the architecture
-(`kcp.FWD_RESERVE_SMS`). On sm_107a it is the deterministic route's grid, one SM short of the co-resident CTA count.
-On sm_100a and sm_103a it is the full co-resident grid, which measured faster there. `y` does not depend on the grid.
+sum is unordered.
 
 - **Halo exchange:** one `all_to_all_single` per direction and call. The
   forward delivers the history rows into the history pool `hist`
@@ -104,6 +103,42 @@ deterministic mode" means `torch.use_deterministic_algorithms(True)`.
   to the deterministic KCP package (`cake_causal_conv1d_det_kcp(...,
   cooperative=True)`).
 
+### The forward
+
+The forward runs two programs:
+
+1. The main program reads no received history row. It writes every row, and it writes the first rows of a
+   continuing fragment as at a document start. It is the single-rank `fwd` route program: the program that this
+   package's single-rank forward runs for the call's `C` and token count. It takes each of the rank's fragments as a
+   document of its own, launches its record's full co-resident grid and takes its token chunks from zeroed counters,
+   as the single-rank forward does.
+2. The history-row program (`kcp_fwd_halo`) runs after the exchange's wait. It writes `y` of the first
+   `min(3, len)` rows of every fragment with a history row again, from the received pool, with the `kcp_fwd`
+   program's instructions. `y` therefore keeps the bits of the one-launch forward (the `kcp_fwd` program with the
+   context's history table). The program runs only when the rank receives history rows.
+
+The order depends on the entry and the architecture:
+
+- Single call: on every architecture, both programs run after the exchange's wait (`kcp.FWD_OVERLAP_ARCHS` is
+  empty).
+- Multi call on sm_107a (`kcp.MULTI_FWD_OVERLAP_ARCHS`) with more than one rank: the first tensor's main program runs
+  while the exchange is in flight, and its history-row program runs after the wait. The other tensors run both
+  programs after the wait.
+- Multi call on sm_100a and sm_103a: every tensor runs both programs after the wait.
+
+The sets are the deterministic package's (`kcp.FWD_MAIN_ARCHS`, `kcp.MULTI_FWD_MAIN_ARCHS`, `kcp.FWD_OVERLAP_ARCHS`
+and `kcp.MULTI_FWD_OVERLAP_ARCHS`), measured there against the one-launch forward. The exchange, its wait and the
+collectives are the same in every form. Every forward launch is on the caller's stream. With one rank no collective
+is issued.
+
+Outside `kcp.FWD_MAIN_ARCHS` (for the multi entry, `kcp.MULTI_FWD_MAIN_ARCHS`) the main program would be the
+`kcp_fwd` program: after the wait, the one-launch forward with the context's history table and no history-row
+program; before the wait, with every `hist_row_off` entry `-1`, followed by the history-row program. Every supported
+architecture is in both sets, so the shipped forward does not launch the `kcp_fwd` program. Its launch grid follows
+the architecture (`kcp.FWD_RESERVE_SMS`): on sm_107a it is one SM short of the co-resident CTA count when that grid
+holds every channel tile, and on sm_100a and sm_103a it is the full co-resident grid. `y` does not depend on any
+grid.
+
 ### The backward
 
 The head program writes the FP32 derivative of each continuing fragment's
@@ -122,8 +157,41 @@ deterministic route's head program. Then:
    accumulator copies in the order the runs end. The copies are summed once per
    channel tile.
 3. After the wait, on a rank that receives tail rows, the tail-row program
-   (`kcp_bwd_halo`) rewrites `dx` of the last three rows of each such
+   (`kcp_bwd_halo`) writes `dx` of the last three rows of each such
    fragment from the received rows.
+
+With one rank, every launch is on the caller's stream: the main program writes
+every row, and the tail-row program writes the tail rows again after it.
+
+With more than one rank, the head program, the concatenation of a multi
+call's send rows, the exchange issue, the wait and the tail-row program run on
+a high-priority side stream of the device. The main program starts on the
+caller's stream at once, because it reads no head row. It leaves the last rows
+of each fragment that receives tail rows to the tail-row program (its
+`skip_row_off` table is the context's `tail_row_off`). The two programs
+therefore write disjoint rows, and the tail-row program runs as soon as the
+exchange arrives, beside the main program instead of after it. The caller's
+stream joins the side stream after the main program. The buffers that the side
+stream fills are allocated on the caller's stream before the fork. The programs
+and their inputs are the same, and each `dx` row comes from the program that
+writes it with one rank, so no bit changes.
+
+The main program splits each lane into units of `M` tokens
+(`kcp_jit.dyn_plan`). Lane `j` starts at token `j x NL x M` (`NL` units per
+lane), and a CTA whose lane is done takes units from the ends of the other
+lanes. When 64-token units leave the last lane of each channel tile empty,
+`M` is 64, or 56 (`kcp_jit.DYN_IDLE_UNIT`) when 56-token units leave more
+idle CTAs (the grid's CTAs less the lanes that have tokens; 64 on a tie):
+the idle CTAs take units from the start, and small units balance the lanes
+best. Otherwise every lane is busy and `M` is the multiple of 8 from
+64 to 128 with the least lane cost: the lane bound `NL x M` tokens plus 3.2
+tokens per unit, plus 0.3 x `M` tokens for the last unit, which the other CTAs
+finish when an SM is busy. Only the plans whose lanes' claim counts fit the
+kernel's 16-bit fields count; when none of them fits (very long sequences),
+`M` doubles from 256 until a plan fits. One 10240-channel tensor of 32768
+tokens per rank gets 104 on a 148-SM B200 and 64 on GB300, GB200 and VR200;
+8192 channels of 16384 tokens get 64 on B200, GB300 and GB200, and 56 on the
+212-SM VR200 (16 idle CTAs instead of 4).
 
 Under any of these conditions, the one-program backward (`kcp_bwd`) runs after the wait instead:
 
@@ -209,8 +277,8 @@ A one-thread side kernel on GB200 (sm_100a, 152 SMs) barely changes the time:
 
 | Side kernel on another stream | shape A next-to / alone | shape B next-to / alone |
 | --- | --- | --- |
-| one thread, 2 ms | 1.000 | 1.002 |
-| one thread, 4 ms | 0.999 | 1.006 |
+| one thread, 2 ms | 0.999 | 0.999 |
+| one thread, 4 ms | 0.998 | 1.000 |
 
 The next table shows a resident kernel on another stream that holds `k` SMs. `N` is the SM count. The
 ratio columns give the time next to the resident kernel divided by the time alone. The `k = 0` rows give the
@@ -218,15 +286,15 @@ unloaded backward time. The previous non-deterministic backward ran as one progr
 
 | GPU | `k` | ideal `N / (N - k)` | shape A | shape B | previous backward, A / B |
 | --- | --- | --- | --- | --- | --- |
-| GB200 (sm_100a, 152 SMs) | 0 | 1 | 365.0 us | 493.1 us | 395.0 us / 560.5 us |
-| GB200 | 16 | 1.118 | 1.087 (396.7 us) | 1.175 (579.5 us) | 667.5 us / 921.1 us |
-| GB200 | 32 | 1.267 | 1.208 (440.8 us) | 1.286 (634.2 us) | 687.8 us / 914.1 us |
-| B200 (sm_100a, 148 SMs) | 0 | 1 | 384.3 us | 519.2 us | 423.9 us / 583.7 us |
-| B200 | 16 | 1.121 | 1.114 (428.0 us) | 1.190 (618.0 us) | 738.0 us / 973.8 us |
-| B200 | 32 | 1.276 | 1.258 (483.3 us) | 1.295 (672.6 us) | 743.4 us / 975.9 us |
+| GB200 (sm_100a, 152 SMs) | 0 | 1 | 360.1 us | 466.0 us | 395.0 us / 560.5 us |
+| GB200 | 16 | 1.118 | 1.091 (392.9 us) | 1.183 (551.1 us) | 667.5 us / 921.1 us |
+| GB200 | 32 | 1.267 | 1.210 (435.6 us) | 1.284 (598.2 us) | 687.8 us / 914.1 us |
+| B200 (sm_100a, 148 SMs) | 0 | 1 | 370.1 us | 486.4 us | 423.9 us / 583.7 us |
+| B200 | 16 | 1.121 | 1.159 (428.9 us) | 1.190 (578.6 us) | 738.0 us / 973.8 us |
+| B200 | 32 | 1.276 | 1.289 (477.1 us) | 1.320 (642.2 us) | 743.4 us / 975.9 us |
 
-For shape A, the slowdown closely follows the share of SMs the resident kernel holds and stays at or below the ideal ratio. For
-shape B it is above the ideal ratio.
+The slowdown follows the share of SMs the resident kernel holds. For shape A on GB200 it stays below the ideal
+ratio. For shape A on B200 and for shape B on both GPUs it is at most 0.07 above the ideal ratio.
 
 `bwd_reserve_sms=K` is an opt-in alternative (SM100 / SM103 only). It runs the one-program backward
 after the exchange with a grid `K x ctas_per_sm` CTAs short. A kernel holding up
@@ -242,7 +310,7 @@ With `recompute_handle=CakeCausalConv1dNondetKcpRecomputeHandle()`, the checkpoi
 recompute of a call issues no collective:
 
 1. The original forward exchanges as always and stores `hist` in the handle (key `"conv"`). The handle retains `n_hist_rows x C x 2` bytes per tensor.
-2. Torch's recompute of that forward inside the backward binds `hist` and launches the forward program on it, with no gather, no collective and no wait.
+2. Torch's recompute of that forward inside the backward binds `hist` and launches the forward programs on it (both after the binding, as in the waiting form), with no gather, no collective and no wait.
 3. The backward still exchanges once.
 
 The handle has these rules:
@@ -259,6 +327,6 @@ tensors that share the context, such as a layer's q, k and v. It uses one halo e
 direction instead of `n`.
 
 - Inputs: each `xs[i]` is BF16 `[T_r, C_i]` and each `weights[i]` is FP32 `[C_i, 4]`. Each `C_i` is a multiple of 8, and they may differ.
-- Exchange: the tensors' send rows travel side by side in one `all_to_all_single`. After the wait, the rows are copied into each tensor's own pool.
-- Programs: each tensor then runs the single call's programs. Outputs and `dx` are bitwise one single call per tensor. Each `dweight` is that tensor's own unordered partial.
+- Exchange: the tensors' send rows travel side by side in one `all_to_all_single`. After the wait, when the call uses the side stream (more than one rank, every tensor on the overlapped pair) and every tensor has the same width, each tensor's tail-row program reads its rows in place in the received pool, and the programs run concurrently on the side stream and streams forked from it. Otherwise the rows are copied into each tensor's own pool.
+- Programs: each tensor then runs the single call's programs. In the forward on sm_107a, the first tensor's main program runs before the wait (see The forward). Outputs and `dx` are bitwise one single call per tensor. Each `dweight` is that tensor's own unordered partial.
 - Keywords: one `bwd_reserve_sms` value applies to every tensor. One recompute handle covers the whole call; its `"conv"` entry holds the `n` history pools.

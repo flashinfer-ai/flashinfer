@@ -59,7 +59,7 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake_gdn_nondet_train", "cake_backend")
 cake_chain = cake_package("cake_gdn_nondet_train", "cake_chain")
@@ -150,18 +150,24 @@ def _inputs(
 
 
 # The forward route sets that take a call off the prep's forward (prep, wy_tc2, fwd_ho), with their off values: a test
-# that holds this package's prep forward to the deterministic package's bits turns them off in both packages.
+# that holds this package's prep forward to the deterministic package's bits turns them off in both packages.  The
+# deterministic package's round-once tail and FP32 dv_local adjoint switches (F32X_TAIL_ARCHS, DVL32_ARCHS) are off
+# there too, so its value-head group of three runs tail_g3 on dhu_tc2, the bits this package's fixed-order tails
+# reproduce.
 PREP_FORWARD_OFF = (
     ("FWD_A_ARCHS", ()),
     ("FWD_SPLIT_ARCHS", ()),
     ("FWD_A_SERIAL_KEEP", {}),
+    ("F32X_TAIL_ARCHS", ()),
+    ("DVL32_ARCHS", ()),
 )
 
 
 def _prep_forward_on_both(monkeypatch) -> None:
     """Keep both packages on the prep's forward: FWD_A_ARCHS and FWD_SPLIT_ARCHS empty in this package, and each
     setting of :data:`PREP_FORWARD_OFF` off in the deterministic package where that package has it (a deterministic
-    package that runs the A or the split forward would otherwise compare other forward bits)."""
+    package that runs the A or the split forward, or its round-once tail / FP32 dv_local adjoint, would otherwise
+    compare other bits)."""
     monkeypatch.setattr(cake_chain, "FWD_A_ARCHS", ())
     monkeypatch.setattr(cake_chain, "FWD_SPLIT_ARCHS", ())
     det_chain = cake_package("cake_gdn_det_train", "cake_chain")

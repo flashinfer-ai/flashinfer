@@ -157,6 +157,22 @@ def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device, backen
         torch.cuda.synchronize()
 
 
+@pytest.mark.parametrize("sf_layout", [SfLayout.layout_linear, SfLayout.layout_128x4])
+def test_mxfp8_quantize_empty(sf_layout):
+    if not torch.cuda.is_available() or not _is_mxfp8_supported(torch.device("cuda")):
+        pytest.skip("MXFP8 quantization requires SM100 or newer")
+    x = torch.empty((0, 512), dtype=torch.bfloat16, device="cuda")
+    q, sf = mxfp8_quantize(x, sf_swizzle_layout=sf_layout)
+    assert q.shape == x.shape and q.dtype == torch.float8_e4m3fn
+    assert sf.numel() == 0 and sf.dtype == torch.uint8
+    with pytest.raises(NotImplementedError, match="fp16/bf16"):
+        mxfp8_quantize(x.float(), sf_swizzle_layout=sf_layout)
+    # A rejected zero-grid launch must not surface in the next CUDA operation.
+    probe = torch.ones(16, device="cuda")
+    torch.testing.assert_close(probe + 1, torch.full_like(probe, 2))
+    torch.cuda.synchronize()
+
+
 def _mxfp8_grouped_test_input(batch_shape, dtype, init_data):
     if init_data == "random":
         return (torch.randn(batch_shape, dtype=torch.float32, device="cuda") * 16).to(

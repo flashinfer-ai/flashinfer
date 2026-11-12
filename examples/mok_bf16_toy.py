@@ -237,8 +237,9 @@ class TrainingIteration:
     pair returned by ``quantize_mok_mxfp8_weights``) runs the routed experts in
     native MXFP8. ``recompute`` discards the forward context and rebuilds it
     with ``recompute_forward_context`` before backward (activation
-    checkpointing). ``accumulators`` are six FP32 tensors zeroed and filled by
-    an ``fp32_wgrad`` adapter.
+    checkpointing); with ``save_context=False`` (BF16 routed experts, needs
+    ``recompute``) the forward stores no context at all. ``accumulators`` are
+    six FP32 tensors zeroed and filled by an ``fp32_wgrad`` adapter.
     """
 
     def __init__(
@@ -256,7 +257,12 @@ class TrainingIteration:
         mxfp8_weights=None,
         recompute=False,
         accumulators=None,
+        save_context=True,
     ):
+        if not save_context and not recompute:
+            raise ValueError(
+                "save_context=False needs recompute=True: backward reads the recomputed context"
+            )
         if (
             x.dtype != torch.bfloat16
             or dy.dtype != torch.bfloat16
@@ -285,6 +291,7 @@ class TrainingIteration:
         self.weights = weights
         self.swiglu_limit = swiglu_limit
         self.recompute = recompute
+        self.save_context = save_context
         self.accumulators = accumulators
         if mxfp8_weights is None:
             self.forward_weights = self.backward_weights = weights
@@ -310,6 +317,7 @@ class TrainingIteration:
             self.scores,
             *self.forward_weights,
             swiglu_limit=limit,
+            save_context=self.save_context,
         )
         if self.recompute:
             self.context = None

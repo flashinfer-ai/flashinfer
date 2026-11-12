@@ -222,7 +222,7 @@ python benchmarks/bench_sm110_xqa.py --warmup-ms 250 --output sm110-xqa-native.j
 ```
 
 `tests/experimental/test_cake_sm110_xqa.py` is the backend suite: it imports
-the package alone (through `tests/test_helpers/cake_package.py`), checks the
+the package alone (through `tests/cake/test_helpers/cake_package.py`), checks the
 `build.json` contract against the registry, the route and grid rules on the
 CPU, and on an SM110 device the FP32-oracle correctness, the bitwise
 determinism of repeated launches, side-stream launches and CUDA-graph

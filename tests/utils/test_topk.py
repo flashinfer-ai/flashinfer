@@ -24,7 +24,7 @@ import flashinfer
 import flashinfer.utils as flashinfer_utils
 from flashinfer.topk import can_implement_filtered_topk
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.parametrize import parametrize_product
+from tests.infra.test_helpers.parametrize import parametrize_product
 
 
 @pytest.fixture
@@ -2226,6 +2226,116 @@ def test_ragged_transform_multi_cta_short_rows(num_rows, top_k, dtype):
             os.environ.pop("FLASHINFER_TOPK_ALGO", None)
         else:
             os.environ["FLASHINFER_TOPK_ALGO"] = old_algo
+
+
+# Regression tests for cross-CTA races in the multi-CTA radix kernels. A row long enough
+# to span several CTAs is processed by one CTA group, and each group walks rows
+# group_id, group_id + num_groups, ... The races need a peer CTA of the group to run late,
+# so plain runs rarely hit them; these tests repeat the triggering row sequences and check
+# every row exactly. num_groups depends on the SM count and the shared-memory budget, so the
+# first num_sms rows are ordinary (k < vocab) and the next 2 * num_sms rows have k >= vocab:
+# for any num_groups <= num_sms, every group runs an ordinary row followed by at least two
+# k >= vocab rows.
+_RACE_VOCAB = 128256  # fp32 rows of this length always need more than one CTA
+_RACE_REPEATS = 10
+
+
+def _race_row_k(num_sms, vocab_size, device, generator):
+    k = torch.full((3 * num_sms,), vocab_size, dtype=torch.int32, device=device)
+    k[:num_sms] = torch.randint(
+        1, vocab_size, (num_sms,), device=device, generator=generator
+    ).to(torch.int32)
+    return k
+
+
+def _race_num_sms():
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if num_sms <= 16:
+        pytest.skip("multi-CTA radix top-k requires more than 16 SMs")
+    return num_sms
+
+
+def test_top_k_mask_logits_multi_cta_trivial_rows_after_ordinary_row():
+    """A k >= vocab row must not clear the group histogram while a peer CTA still reads it
+    for the group's previous ordinary row."""
+    num_sms = _race_num_sms()
+    device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(0)
+    k = _race_row_k(num_sms, _RACE_VOCAB, device, generator)
+    logits = torch.randn(
+        k.numel(), _RACE_VOCAB, device=device, generator=generator, dtype=torch.float32
+    )
+
+    sorted_logits = logits.sort(dim=-1, descending=True).values
+    kth = sorted_logits.gather(-1, (k.long().clamp(max=_RACE_VOCAB) - 1)[:, None])
+    kept = (logits >= kth) | (k[:, None] >= _RACE_VOCAB)
+    expected = torch.where(kept, logits, torch.full_like(logits, float("-inf")))
+
+    for _ in range(_RACE_REPEATS):
+        out = flashinfer.sampling.top_k_mask_logits(logits, k)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_top_k_renorm_probs_multi_cta_trivial_row_after_ordinary_row(deterministic):
+    """A k >= vocab row must not reset the group's top-k sum while a peer CTA still reads
+    the previous ordinary row's sum."""
+    num_sms = _race_num_sms()
+    device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(0)
+    k = _race_row_k(num_sms, _RACE_VOCAB, device, generator)
+    probs = torch.rand(
+        k.numel(), _RACE_VOCAB, device=device, generator=generator, dtype=torch.float32
+    )
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+
+    sorted_probs = probs.sort(dim=-1, descending=True).values
+    kth = sorted_probs.gather(-1, (k.long().clamp(max=_RACE_VOCAB) - 1)[:, None])
+    kept = torch.where(
+        (probs >= kth) | (k[:, None] >= _RACE_VOCAB), probs, torch.zeros_like(probs)
+    )
+    expected = kept / kept.sum(dim=-1, keepdim=True)
+
+    for _ in range(_RACE_REPEATS):
+        out = flashinfer.sampling.top_k_renorm_probs(
+            probs, k, is_deterministic=deterministic
+        )
+        torch.testing.assert_close(out, expected, rtol=1e-3, atol=1e-7)
+
+
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_top_k_page_table_transform_multi_cta_publishes_all_indices(
+    deterministic, set_topk_algo
+):
+    """Every CTA's pass-2 index writes must be visible to the peers that translate them
+    through the page table after the group barrier."""
+    num_sms = _race_num_sms()
+    set_topk_algo("multi_cta")
+    device = "cuda"
+    num_rows, max_len, k = 2 * num_sms, 131072, 2048
+    generator = torch.Generator(device=device).manual_seed(0)
+    # Four score levels: every selected index ties with the pivot, so all k slots are
+    # written in pass 2 (the == pivot pass).
+    scores = torch.randint(
+        0, 4, (num_rows, max_len), device=device, generator=generator
+    ).to(torch.float32)
+    # Odd page ids: an untranslated (stale) index shows up as an even value.
+    src_page_table = (
+        torch.arange(max_len, device=device, dtype=torch.int32) * 2 + 1
+    ).repeat(num_rows, 1)
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+    kth = scores.topk(k, dim=-1).values[:, -1:]
+
+    for _ in range(_RACE_REPEATS):
+        out = torch.full((num_rows, k), -7, device=device, dtype=torch.int32)
+        flashinfer.top_k_page_table_transform(
+            scores, src_page_table, lengths, k, deterministic=deterministic, out=out
+        )
+        assert bool(((out % 2 == 1) & (out > 0) & (out < 2 * max_len)).all())
+        raw = ((out - 1) // 2).long()
+        assert bool((scores.gather(-1, raw) >= kth).all())
+        sorted_raw = raw.sort(dim=-1).values
+        assert bool((sorted_raw[:, 1:] != sorted_raw[:, :-1]).all())
 
 
 @pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered"])

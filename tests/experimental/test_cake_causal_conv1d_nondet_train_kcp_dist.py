@@ -32,6 +32,10 @@ most eight ranks).  Per row and rank:
   and the per-phase collective counts of the deterministic suite (one halo exchange per direction, one more in a
   plain recompute, none in a recompute with a handle);
 - the handle retains exactly the history pool;
+- the two-launch forward (knobs ``fwd_main`` x ``fwd_overlap``, the same on every rank): ``LAST_CALL["fwd"]`` names
+  the form the rank ran (the overlapped form on a rank with tokens, the history-row program when the rank receives
+  history rows) and ``y`` / ``hist`` are bitwise the one-launch forward's (``fwd_main`` 0, ``fwd_overlap`` 0: the
+  previous forward) and the deterministic KCP forward's;
 - a 1-thread kernel resident on another stream does not stall the backward (FlashInfer issues #7038 / #7548: the
   main backward is an ordinary launch; ``busy <= 2 x alone``).
 
@@ -88,7 +92,7 @@ def _run_rank(
     from flashinfer.experimental.cake.cake_kda_det_train_kcp import (
         cake_kcp_plan as plan,
     )
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     det_kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
 
@@ -237,6 +241,48 @@ def _run_rank(
         direct["dx"], det["dx"]
     )
     flags["dw_within_budget_of_deterministic"] = ratio(direct["dw"], det["dw"]) <= 1.0
+    # The two-launch forward: every (fwd_main, fwd_overlap) form, the same on every rank, records its form in
+    # LAST_CALL["fwd"] (the overlapped form with the exchange in flight on a rank with tokens; the history-row program
+    # when the rank receives history rows and the form has two launches) and gives y / hist bitwise the one-launch
+    # forward's (fwd_main 0, fwd_overlap 0) and the deterministic KCP forward's.
+    y_det_f, hist_det_f = det_kcp.cake_causal_conv1d_det_train_kcp_forward(x, w, ctx)
+    torch.cuda.synchronize(device)
+    one = None
+    fwd_bitwise, fwd_recorded = True, True
+    for fwd_main in (0, 1):
+        for fwd_overlap in (0, 1):
+            conv_kcp._set_test_knobs({"fwd_main": fwd_main, "fwd_overlap": fwd_overlap})
+            try:
+                for _ in range(2):
+                    y_f, hist_f = conv_kcp.cake_causal_conv1d_nondet_train_kcp_forward(
+                        x, w, ctx
+                    )
+                    torch.cuda.synchronize(device)
+                    if one is None:
+                        one = (y_f.clone(), hist_f.clone())
+                    want = (
+                        {
+                            "main": "sr" if fwd_main else "f",
+                            "form": "pair" if fwd_overlap else "wait",
+                            "repair": bool(fwd_main or fwd_overlap) and n_hist > 0,
+                        }
+                        if x.shape[0]
+                        else {"main": None, "form": "wait", "repair": False}
+                    )
+                    fwd_recorded = fwd_recorded and conv_kcp.LAST_CALL["fwd"] == want
+                    fwd_bitwise = (
+                        fwd_bitwise
+                        and same(y_f, one[0])
+                        and same(hist_f, one[1])
+                        and same(y_f, y_det_f)
+                        and same(hist_f, hist_det_f)
+                        and same(y_f, det["y"])
+                    )
+            finally:
+                conv_kcp._set_test_knobs(None)
+                conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
+    flags["fwd_forms_bitwise"] = fwd_bitwise
+    flags["fwd_forms_recorded"] = fwd_recorded
     # The independent reference: the global FP64 oracle of the whole pack, the rank's tokens gathered from it.
     y_ref, dx_ref, dw_ref = _reference(x_all.to(device), w, cu_dev, dy_all.to(device))
     info["y_ratio_to_one_bf16_ulp_vs_fp64"] = ulp_ratio(

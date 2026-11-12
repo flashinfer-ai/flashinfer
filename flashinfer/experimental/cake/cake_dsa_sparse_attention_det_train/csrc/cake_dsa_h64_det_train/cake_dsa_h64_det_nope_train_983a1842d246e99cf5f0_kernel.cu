@@ -83,9 +83,19 @@ kernel_cake_dsa_h64_det_nope_train_983a1842d246e99cf5f0(unsigned long long* boun
     const int cta_rank = 0;
 
     // === Task calls (declaration order) ===
+#if __CUDA_ARCH__ == 1070
+#else
     int row = blockIdx.x * 8 + warp;
+#endif
     int lane_1 = lane;
+#if __CUDA_ARCH__ == 1070
+    int first = blockIdx.x * 64 + warp * 8;
+    int row = first + lane_1;
+    int zero_row = 0;
+    if (lane_1 < 8 && row < num_rows) {
+#else
     if (row < num_rows) {
+#endif
         int exps[1];
         long long bbase = (long long)row * (long long)bound_stride;
         unsigned long long pairs = bound[bbase + (long long)part_stride];
@@ -174,11 +184,32 @@ kernel_cake_dsa_h64_det_nope_train_983a1842d246e99cf5f0(unsigned long long* boun
             e_p_0 = _min_13;
         }
         exps[0] = e_p_0;
+#if __CUDA_ARCH__ == 1070
+        e_lat[row] = exps[0] & 65535 | skip << 16;
+        row_pairs[row] = (unsigned int)pairs;
+        if (zero_acc == 2 || zero_acc == 1 && touched != 0) {
+            zero_row = 1;
+#else
         __syncwarp();
         if (lane_1 == 0) {
             e_lat[row] = exps[0] & 65535 | skip << 16;
             row_pairs[row] = (unsigned int)pairs;
+#endif
         }
+#if __CUDA_ARCH__ == 1070
+    }
+    __syncwarp();
+    unsigned int zmask = __ballot_sync(0xFFFFFFFF, zero_row != 0);
+    if (zmask != 0) {
+        int zero4[4];
+        zero4[0] = 0;
+        zero4[1] = 0;
+        zero4[2] = 0;
+        zero4[3] = 0;
+        if ((zmask & 1) != 0) {
+            int zrow_0 = first;
+            long long lbase_0 = (long long)zrow_0 * (long long)dkv_stride;
+#else
         if (zero_acc == 2 || zero_acc == 1 && touched != 0) {
             int zero4[4];
             zero4[0] = 0;
@@ -186,24 +217,206 @@ kernel_cake_dsa_h64_det_nope_train_983a1842d246e99cf5f0(unsigned long long* boun
             zero4[2] = 0;
             zero4[3] = 0;
             long long lbase = (long long)row * (long long)dkv_stride;
+#endif
             {
                 int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+#if __CUDA_ARCH__ == 1070
+                *reinterpret_cast<int4*>(dkv_acc + lbase_0 + (long long)(lane_1 * 4)) = _iv4;
+#else
                 *reinterpret_cast<int4*>(dkv_acc + lbase + (long long)(lane_1 * 4)) = _iv4;
+#endif
             }
             {
                 int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+#if __CUDA_ARCH__ == 1070
+                *reinterpret_cast<int4*>(dkv_acc + lbase_0 + (long long)(128 + lane_1 * 4)) = _iv4;
+#else
                 *reinterpret_cast<int4*>(dkv_acc + lbase + (long long)(128 + lane_1 * 4)) = _iv4;
+#endif
             }
             {
                 int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+#if __CUDA_ARCH__ == 1070
+                *reinterpret_cast<int4*>(dkv_acc + lbase_0 + (long long)(256 + lane_1 * 4)) = _iv4;
+#else
                 *reinterpret_cast<int4*>(dkv_acc + lbase + (long long)(256 + lane_1 * 4)) = _iv4;
+#endif
             }
             {
                 int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+#if __CUDA_ARCH__ == 1070
+                *reinterpret_cast<int4*>(dkv_acc + lbase_0 + (long long)(384 + lane_1 * 4)) = _iv4;
+#else
                 *reinterpret_cast<int4*>(dkv_acc + lbase + (long long)(384 + lane_1 * 4)) = _iv4;
+#endif
             }
             if (lane_1 < 4) {
+#if __CUDA_ARCH__ == 1070
+                cnt64[(long long)zrow_0 * 4ll + (long long)lane_1] = 0ull;
+            }
+        }
+        if ((zmask >> 1 & 1) != 0) {
+            int zrow_1 = first + 1;
+            long long lbase_1 = (long long)zrow_1 * (long long)dkv_stride;
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_1 + (long long)(lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_1 + (long long)(128 + lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_1 + (long long)(256 + lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_1 + (long long)(384 + lane_1 * 4)) = _iv4;
+            }
+            if (lane_1 < 4) {
+                cnt64[(long long)zrow_1 * 4ll + (long long)lane_1] = 0ull;
+            }
+        }
+        if ((zmask >> 2 & 1) != 0) {
+            int zrow_2 = first + 2;
+            long long lbase_2 = (long long)zrow_2 * (long long)dkv_stride;
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_2 + (long long)(lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_2 + (long long)(128 + lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_2 + (long long)(256 + lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_2 + (long long)(384 + lane_1 * 4)) = _iv4;
+            }
+            if (lane_1 < 4) {
+                cnt64[(long long)zrow_2 * 4ll + (long long)lane_1] = 0ull;
+            }
+        }
+        if ((zmask >> 3 & 1) != 0) {
+            int zrow_3 = first + 3;
+            long long lbase_3 = (long long)zrow_3 * (long long)dkv_stride;
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_3 + (long long)(lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_3 + (long long)(128 + lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_3 + (long long)(256 + lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_3 + (long long)(384 + lane_1 * 4)) = _iv4;
+            }
+            if (lane_1 < 4) {
+                cnt64[(long long)zrow_3 * 4ll + (long long)lane_1] = 0ull;
+            }
+        }
+        if ((zmask >> 4 & 1) != 0) {
+            int zrow_4 = first + 4;
+            long long lbase_4 = (long long)zrow_4 * (long long)dkv_stride;
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_4 + (long long)(lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_4 + (long long)(128 + lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_4 + (long long)(256 + lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_4 + (long long)(384 + lane_1 * 4)) = _iv4;
+            }
+            if (lane_1 < 4) {
+                cnt64[(long long)zrow_4 * 4ll + (long long)lane_1] = 0ull;
+            }
+        }
+        if ((zmask >> 5 & 1) != 0) {
+            int zrow_5 = first + 5;
+            long long lbase_5 = (long long)zrow_5 * (long long)dkv_stride;
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_5 + (long long)(lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_5 + (long long)(128 + lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_5 + (long long)(256 + lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_5 + (long long)(384 + lane_1 * 4)) = _iv4;
+            }
+            if (lane_1 < 4) {
+                cnt64[(long long)zrow_5 * 4ll + (long long)lane_1] = 0ull;
+            }
+        }
+        if ((zmask >> 6 & 1) != 0) {
+            int zrow_6 = first + 6;
+            long long lbase_6 = (long long)zrow_6 * (long long)dkv_stride;
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_6 + (long long)(lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_6 + (long long)(128 + lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_6 + (long long)(256 + lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_6 + (long long)(384 + lane_1 * 4)) = _iv4;
+            }
+            if (lane_1 < 4) {
+                cnt64[(long long)zrow_6 * 4ll + (long long)lane_1] = 0ull;
+            }
+        }
+        if ((zmask >> 7 & 1) != 0) {
+            int zrow_7 = first + 7;
+            long long lbase_7 = (long long)zrow_7 * (long long)dkv_stride;
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_7 + (long long)(lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_7 + (long long)(128 + lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_7 + (long long)(256 + lane_1 * 4)) = _iv4;
+            }
+            {
+                int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
+                *reinterpret_cast<int4*>(dkv_acc + lbase_7 + (long long)(384 + lane_1 * 4)) = _iv4;
+            }
+            if (lane_1 < 4) {
+                cnt64[(long long)zrow_7 * 4ll + (long long)lane_1] = 0ull;
+#else
                 cnt64[(long long)row * 4ll + (long long)lane_1] = 0ull;
+#endif
             }
         }
     }

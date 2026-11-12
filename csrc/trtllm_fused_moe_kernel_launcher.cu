@@ -5170,11 +5170,14 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
  public:
   static constexpr std::array<int32_t, 4> mBaseSupportedTileNums = {8, 16, 32, 64};
 
-  static std::vector<int32_t> getSupportedTileNums(btg::Dtype dtype_act, btg::Dtype dtype_weights) {
+  static std::vector<int32_t> getSupportedTileNums(btg::Dtype dtype_act, btg::Dtype dtype_weights,
+                                                   batchedGemm::gemm::BiasType gemm1_bias_type) {
     std::vector<int32_t> tiles(mBaseSupportedTileNums.begin(), mBaseSupportedTileNums.end());
     if (dtype_act != btg::Dtype::Bfloat16) {
       tiles.push_back(128);
-      if ((dtype_weights == btg::Dtype::E2m1 && dtype_act == btg::Dtype::E2m1) ||
+      // NVFP4 tile-192 kernels do not support the MN-bias LoRA epilogue.
+      if ((dtype_weights == btg::Dtype::E2m1 && dtype_act == btg::Dtype::E2m1 &&
+           gemm1_bias_type != batchedGemm::gemm::BiasType::Mn) ||
           (dtype_weights == btg::Dtype::MxE2m1 && dtype_act == btg::Dtype::MxE4m3)) {
         tiles.push_back(192);
       }
@@ -5588,7 +5591,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     Array<Array<int64_t>> valid_configs;
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
-    std::vector<int32_t> tile_sizes = getSupportedTileNums(dtype_act, dtype_weights);
+    std::vector<int32_t> tile_sizes =
+        getSupportedTileNums(dtype_act, dtype_weights, gemm1_bias_type);
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts, num_experts);
 
@@ -6385,7 +6389,7 @@ Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
 
   // Determine supported tile sizes
   std::vector<int32_t> mSupportedTileN =
-      FP4BlockScaleLauncher::getSupportedTileNums(mDtypeAct, mDtypeWeights);
+      FP4BlockScaleLauncher::getSupportedTileNums(mDtypeAct, mDtypeWeights, gemm1_bias_type_enum);
   // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size

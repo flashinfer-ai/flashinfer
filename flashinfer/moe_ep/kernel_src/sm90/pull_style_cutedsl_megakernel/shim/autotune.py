@@ -73,14 +73,53 @@ def _sweep_geometries() -> List[Dict[str, Any]]:
     return out
 
 
+# Dispatch-pull variants added to every epi_warps candidate from this buffer
+# size on (one active dispatch warp only): rotation alone, and three rows in
+# flight in the full 4-slot buffer, without and with rotation.  Which one wins
+# depends on the tile and scale mode (H200 sweeps); smaller buffers keep the
+# serial pull, where batching measured slower.  Ping-pong tiles get the
+# rotation only: batching never measured faster there.
+_PULL_VARIANT_MIN_TOKENS = 1024
+_PULL_VARIANTS: tuple[Dict[str, Any], ...] = (
+    {"dispatch_pull_rotate": True},
+    {"compact_pull_buffer": False, "dispatch_pull_batch": 3},
+    {
+        "compact_pull_buffer": False,
+        "dispatch_pull_batch": 3,
+        "dispatch_pull_rotate": True,
+    },
+)
+
+
+# Blockwise swap-AB M256 N72/N80: one task holds an expert's 65-80 rows, where
+# N64 needs a second, nearly empty tile and blockwise N128 spills.
+_BLOCKWISE_N72_N80_GEOMETRIES: tuple[Dict[str, Any], ...] = tuple(
+    {
+        "swap_ab": True,
+        "pingpong": False,
+        "mma_tiler_mnk": (256, n, 128),
+        "cluster_shape_mnk": (1, 1, 1),
+        "fp8_accum_mode": "1xacc",
+        "group_hint": None,
+        "tail_split_pairs": False,
+    }
+    for n in (72, 80)
+)
+
+
 def hopper_fp8_candidates(
     *,
     fp8_scale_mode: str = "per_tensor",
     max_tokens: int = 0,
+    active_dispatch_warps: int = 1,
+    dedup_dispatch: bool = False,
 ) -> List[Dict[str, Any]]:
     """Default candidate knob dicts: heuristic winner first, then every
-    geometry that wins some bucket of the drop's sweep.  The heuristic
-    winner leads so a tie keeps the established default."""
+    geometry that wins some bucket of the drop's sweep (blockwise also the
+    swap-AB M256 N72/N80 tiles), then (for large buffers with one active
+    dispatch warp and no dispatch dedup) the dispatch-pull variants of the
+    ``epi_warps`` candidates.  The heuristic winner leads so a tie keeps the
+    established default."""
     out: List[Dict[str, Any]] = []
     seen = set()
 
@@ -90,7 +129,7 @@ def hopper_fp8_candidates(
                 (k, tuple(v) if isinstance(v, tuple) else v) for k, v in knobs.items()
             )
         )
-        if key not in seen and is_valid(knobs):
+        if key not in seen and is_valid(knobs, fp8_scale_mode=fp8_scale_mode):
             seen.add(key)
             out.append(knobs)
 
@@ -101,6 +140,19 @@ def hopper_fp8_candidates(
     for geometry in _sweep_geometries():
         for token_back in ("epi_warps", "reuse_dispatch_warps"):
             _add({**geometry, "token_back_mode": token_back})
+    if fp8_scale_mode == "blockwise":
+        for geometry in _BLOCKWISE_N72_N80_GEOMETRIES:
+            _add({**geometry, "token_back_mode": "epi_warps"})
+    if (
+        max_tokens >= _PULL_VARIANT_MIN_TOKENS
+        and active_dispatch_warps == 1
+        and not dedup_dispatch
+    ):
+        for knobs in list(out):
+            if knobs.get("token_back_mode") == "epi_warps":
+                for pull in _PULL_VARIANTS:
+                    if not (knobs.get("pingpong") and "dispatch_pull_batch" in pull):
+                        _add({**knobs, **pull})
     return out
 
 
@@ -409,6 +461,8 @@ def autotune_hopper_fp8_mega_moe(
         candidates = hopper_fp8_candidates(
             fp8_scale_mode=cfg.fp8_scale_mode,
             max_tokens=cfg.num_tokens_per_rank,
+            active_dispatch_warps=cfg.active_dispatch_warps,
+            dedup_dispatch=cfg.dedup_dispatch,
         )
 
     def _record(winner: Dict[str, Any], p50_s: float) -> None:

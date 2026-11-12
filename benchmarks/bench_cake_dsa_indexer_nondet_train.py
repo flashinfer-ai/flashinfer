@@ -52,7 +52,7 @@ peak extra device memory and the workspace bytes.  Per row the script prints
 ``det`` ms, ``nondet`` ms and ``det / nondet`` (above 1: the non-deterministic
 package is faster), and a summary table at the end.  ``--verify`` judges every
 arm, its rows put in ascending id order first, against the FP64 / FP32
-reference of ``tests/test_helpers/cake_dsa_indexer_reference.py`` (small rows
+reference of ``tests/experimental/test_helpers/cake_dsa_indexer_reference.py`` (small rows
 only).
 
 Usage::
@@ -82,7 +82,7 @@ from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
 from flashinfer.experimental.cake.cake_dsa_indexer_nondet_train import (  # noqa: E402
     cake_backend as nondet_backend,
 )
-from tests.test_helpers import cake_dsa_indexer_reference as ref  # noqa: E402
+from tests.experimental.test_helpers import cake_dsa_indexer_reference as ref  # noqa: E402
 
 
 def _load_det_bench():

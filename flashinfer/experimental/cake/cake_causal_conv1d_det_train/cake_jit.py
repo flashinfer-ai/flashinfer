@@ -146,7 +146,12 @@ with ``fast_roll=True, roll_prefetch=True`` (each rolled pass loads the
 next pass's rows before it computes) on sm_107a from 2048; for
 520 <= C < 1024 sm_107a runs its fallback's build again under its own name
 (``c_band=520``, the channel band's copy; its ``dx`` and ``dweight`` matched
-the fold-overlap program's bit for bit on every measured row).  The programs of
+the fold-overlap program's bit for bit on every measured row).  From its
+token floor each arch's SM-wide row-group program (one CTA per SM) also runs
+the single-tile rows from C = 520 on which it folds five sub-tiles per CTA
+(384 threads, 520 <= C < 616 on sm_100a and sm_103a) or three (256 threads,
+520 <= C < 688 on sm_107a); the programs above keep those rows below the
+floor and the rows from 616 (sm_107a: 688) at every S.  The programs of
 the six other routes are the same bodies built with ``dtype_flags=True`` (the
 ``flags`` scalar; untyped tap / bias pointers) plus ``bias=True`` for the
 bias routes and ``grad_pre="fp32"`` for the ``_fp32g`` routes, their backward
@@ -607,7 +612,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd",
         "select_rule": {
             "channels": {
-                "sm_100a": 512,
+                "sm_100a": [
+                    512,
+                    616,
+                ],
                 "sm_103a": 768,
                 "sm_107a": 1024,
             },
@@ -694,7 +702,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd",
         "select_rule": {
             "channels": {
-                "sm_103a": 512,
+                "sm_103a": [
+                    512,
+                    616,
+                ],
                 "sm_107a": 512,
             },
             "kind": "channels_at_least",
@@ -2654,6 +2665,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "sm_100a": [
                     264,
                     344,
+                    520,
                 ],
             },
             "kind": "channels_tokens_at_least",
@@ -2745,6 +2757,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "sm_103a": [
                     264,
                     480,
+                    520,
                 ],
             },
             "kind": "channels_tokens_at_least",
@@ -2836,6 +2849,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "sm_107a": [
                     264,
                     344,
+                    520,
                 ],
             },
             "kind": "channels_tokens_at_least",
@@ -2921,7 +2935,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd",
         "select_rule": {
             "channels": {
-                "sm_107a": 520,
+                "sm_107a": [
+                    520,
+                    688,
+                ],
             },
             "kind": "channels_at_least",
         },

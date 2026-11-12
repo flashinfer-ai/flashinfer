@@ -60,7 +60,7 @@ with and without a caller-owned buffer, and the package's per-(device,
 stream) buffer of the calls that pass none.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 ``flashinfer.cake_causal_conv1d_det_train`` facade and the ``flashinfer``
@@ -78,7 +78,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_causal_conv1d_det_train")
 cake_build = cake_package("cake_causal_conv1d_det_train", "cake_build")
@@ -269,13 +269,16 @@ ONE_TILE_ROWS = {
 }
 # Rows whose plan, launch and gradients the narrow-tile tests check per route:
 # C 576 / 640 below every token floor of ``FWD_NARROW_FLOORS`` (S = 4097) and
-# above every floor (S = 40961, the forward on ``FWD_WIDE_SPLIT_TABLE``).
+# above every floor (S = 40961, the forward on ``FWD_WIDE_SPLIT_TABLE``), and
+# C 576 at S = 65536, from every token floor of the default backward's SM-wide
+# band (``BWD_SM_CTA_RULE``).
 NARROW_CASES = (
     (1000, 224, "perf"),
     (4097, 576, (1000, 0, 3, 3094)),
     (4097, 640, (1000, 0, 3, 3094)),
     (40961, 576, (1000, 0, 3, 39958)),
     (40961, 640, (1000, 0, 3, 39958)),
+    (65536, 576, "perf"),
     (4097, 1016, (1000, 0, 3, 3094)),
 )
 # The call settings that resolve to each backward route (the forward route
@@ -1074,7 +1077,10 @@ def test_main_grid_literal_table() -> None:
 # sm_107a) takes the row-group program's rows on its channel bands from its
 # token floor: sm_100a 264 <= C < 280 and 344 <= C < 440 from S = 65536,
 # sm_103a 264 <= C < 472 and 480 <= C < 512 from S = 24576, sm_107a
-# 264 <= C < 296 and 344 <= C < 416 from S = 32768.  The rows are
+# 264 <= C < 296 and 344 <= C < 416 from S = 32768; and on every arch from
+# C = 520 while it folds five sub-tiles (384 threads: 520 <= C < 616) or
+# three (sm_107a's 256 threads: 520 <= C < 688), from the same floor, in
+# place of the program the rows below take below the floor.  The rows are
 # the kernel module's rules-test rows on both sides of the token and channel
 # boundaries; C = 512 is the first channel-selected program of every arch.
 # From C = 512: sm_100a runs the eight-token-stage program, sm_103a the
@@ -1097,9 +1103,9 @@ BWD_SM_CTA = {
 }
 # arch -> (channel bands [lo, hi), token floor) of the SM-wide row-group program.
 BWD_SM_CTA_RULE = {
-    "sm_100a": (((264, 280), (344, 440)), 65536),
-    "sm_103a": (((264, 472), (480, 512)), 24576),
-    "sm_107a": (((264, 296), (344, 416)), 32768),
+    "sm_100a": (((264, 280), (344, 440), (520, 616)), 65536),
+    "sm_103a": (((264, 472), (480, 512), (520, 616)), 24576),
+    "sm_107a": (((264, 296), (344, 416), (520, 688)), 32768),
 }
 BWD_AT_512 = {
     "sm_100a": "cake_causal_conv1d_det_train_37e428406a0cc4a8ca1b",
@@ -1127,7 +1133,8 @@ BWD_SELECTION_TOKENS = (
 BWD_SELECTION_CHANNELS = (
     *(128, 248, 255, 256, 264, 272, 280, 288, 296, 336, 344, 384, 408, 416),
     *(432, 440, 464, 472, 480, 504, 511, 512),
-    *(516, 519, 520, 640, 760, 767, 768, 1016, 1023, 1024),
+    *(516, 519, 520, 576, 608, 615, 616, 640, 680, 687, 688, 760, 767, 768),
+    *(1016, 1023, 1024),
 )
 
 
@@ -1137,16 +1144,16 @@ def _sm_cta_band(arch: str, C: int) -> bool:
 
 
 def _bwd_selection_of_record(arch: str, S: int, C: int) -> str:
+    if _sm_cta_band(arch, C):
+        _, floor = BWD_SM_CTA_RULE[arch]
+        if floor <= S:
+            return BWD_SM_CTA[arch]
     if BWD_STAGE8_FROM[arch] <= C:
         return BWD_STAGE8
     if arch == "sm_107a" and C >= 520:
         return BWD_C520_R200
     if C >= 512:
         return BWD_AT_512[arch]
-    if _sm_cta_band(arch, C):
-        _, floor = BWD_SM_CTA_RULE[arch]
-        if floor <= S:
-            return BWD_SM_CTA[arch]
     if arch in ("sm_100a", "sm_103a") and C >= 264:
         return BWD_ROW_GROUP
     if arch == "sm_107a" and C >= 264:
@@ -1192,7 +1199,7 @@ def test_backward_selection_literal_table() -> None:
         loader.MODULES[n] for n in (BWD_C520_R200, BWD_FALLBACK["sm_107a"])
     )
     assert loader.select_rule(band) == {
-        "channels": {"sm_107a": 520},
+        "channels": {"sm_107a": [520, 688]},
         "kind": "channels_at_least",
     }
     assert band["arches"] == fallback["arches"] == ["sm_107a"]
@@ -1440,8 +1447,15 @@ def test_document_isolation() -> None:
     _check(S, C, docs, x=x2, w=w, cu=cu, dy=dy2, label="perturbed documents")
 
 
+# S 65536 x C 576: every arch's SM-wide row-group program (from its token floor).
 @pytest.mark.parametrize(
-    "case", ((1000, 512, "perf"), (4097, 2048, (1000, 0, 3, 3094))), ids=_case_id
+    "case",
+    (
+        (1000, 512, "perf"),
+        (4097, 2048, (1000, 0, 3, 3094)),
+        (65536, 576, "perf"),
+    ),
+    ids=_case_id,
 )
 def test_dweight_is_bitwise_identical_over_three_launches(case) -> None:
     S, C, docs = case
@@ -1485,7 +1499,8 @@ def test_backward_programs_switch_on_channel_count(kind) -> None:
     rows = [
         (S, docs, C) for S, docs in ((5, (2, 0, 3)), (1000, "perf")) for C in channels
     ]
-    # A token-floored program runs from its floor only: both sides of the floor at its channel threshold.
+    # A token-floored program runs from its floor only: both sides of the floor at its channel threshold, and
+    # at the floor the top channel count of its band (below the route's next threshold).
     for floored, floor in _token_floors(arch, kind).values():
         rows += [
             (S, "perf", C)
@@ -1493,6 +1508,10 @@ def test_backward_programs_switch_on_channel_count(kind) -> None:
             for S in (floor - 8, floor)
             for C in (T - 8, T, T + 8)
         ]
+        for T in floored:
+            end = min((t for t in thresholds if t > T), default=None)
+            if end is not None and end - 8 > T + 8:
+                rows.append((floor, "perf", end - 8))
     launched = set()
     for S, docs, C in rows:
         selected = loader.selected_modules(arch, kind, C=C, S=S)
@@ -2123,10 +2142,12 @@ def test_narrow_tiles_launch_and_keep_y_and_dx_bits(kind, monkeypatch) -> None:
     """On the narrow single-tile rows each route launches its route's plan
     (``NARROW_SPLIT_TABLE`` on the ``NARROW_TILE_ROUTES``, one tile elsewhere;
     the forward's C 576 / 640 on ``FWD_WIDE_SPLIT_TABLE`` from the device
-    architecture's ``FWD_NARROW_FLOORS`` floor) for the backward and for the
-    forward its inputs select; ``y`` and ``dx`` are bitwise the one-tile
-    plan's, ``dweight`` / ``dbias`` are bitwise reproducible and within the
-    route's tolerance of the reference."""
+    architecture's ``FWD_NARROW_FLOORS`` floor; the default backward's SM-wide
+    band rows from its ``BWD_SM_CTA_RULE`` floor on that program's plan, one
+    whole channel tile of ``threads // (C / 8)`` sub-tiles) for the backward
+    and for the forward its inputs select; ``y`` and ``dx`` are bitwise the
+    one-tile plan's, ``dweight`` / ``dbias`` are bitwise reproducible and
+    within the route's tolerance of the reference."""
 
     _require_route(kind)
     fwd_kind = FORWARD_OF[kind]
@@ -2162,6 +2183,17 @@ def test_narrow_tiles_launch_and_keep_y_and_dx_bits(kind, monkeypatch) -> None:
             floor = FWD_NARROW_FLOORS.get(arch, {}).get(C // 8)
             if role == "fwd" and narrow and floor is not None and floor <= S:
                 want = FWD_WIDE_SPLIT_TABLE[C]
+            if (
+                role == "bwd"
+                and route == "bwd"
+                and _bwd_selection_of_record(arch, S, C) == BWD_SM_CTA.get(arch)
+            ):
+                # The SM-wide row-group program's band: one channel tile of the
+                # whole width, as many row groups as its threads fold.
+                threads = loader.MODULES[BWD_SM_CTA[arch]]["grid_rule"]["geometry"][
+                    "threads"
+                ]
+                want = (C // 8, threads // (C // 8), 1)
             got = (values["ct_vec"], values["n_sub"], values["n_ch_tiles"])
             assert got == want, (kind, route, C, got, want)
         y = cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
@@ -2309,7 +2341,8 @@ def test_workspace_bytes_and_layout() -> None:
     device = _device()
     arch = _arch()
     # The capacity owner: the backward program of the largest grid_mult x ctas_per_sm x taps over every
-    # backward route sizes the public buffer (every owner of the routes' fallback geometry shares it, so
+    # backward route of the routes' fallback geometry (the SM-wide program, below, can need more in its
+    # bands) sizes the public buffer (every owner of the routes' fallback geometry shares it, so
     # their rows differ by grid_mult x ctas_per_sm alone -- grid_mult over-decomposes the token streams and
     # the partial rows grow with it -- and their bytes by that times taps).
     record = loader.workspace_record(arch)
@@ -2403,18 +2436,27 @@ def test_workspace_bytes_and_layout() -> None:
                     selected["library"],
                 )
     # The SM-wide row-group program counts at the channels of its bands and nowhere else (at C = 1280 its
-    # one channel tile per CTA would outgrow the other programs' rows), and there they still bound it: the
-    # public buffer is the largest over the owners of the shared geometry at every C.
+    # one channel tile per CTA would outgrow the other programs' rows): the public buffer is the largest over
+    # the owners counted at C, the owners of the shared geometry everywhere and the SM-wide program in its
+    # bands, where its one channel tile per CTA can outgrow them (sm_107a from C 520).
     sm_cta = loader.MODULES.get(BWD_SM_CTA.get(arch, ""))
     for C in range(8, 1281, 8):
         capacity = cake_causal_conv1d_det_train_backward_workspace_bytes(1, C, device)
+        counted_owners = loader.workspace_owners(arch, C)
         assert capacity == max(
+            loader.workspace_layout(owner, C, device_index=device.index)["total_bytes"]
+            for owner in counted_owners
+        ), C
+        assert capacity >= max(
             loader.workspace_layout(owner, C, device_index=device.index)["total_bytes"]
             for owner in shared
         ), C
         if sm_cta is not None:
-            counted = sm_cta in loader.workspace_owners(arch, C)
+            counted = sm_cta in counted_owners
             assert counted == _sm_cta_band(arch, C), C
+            assert [
+                owner for owner in counted_owners if owner is not sm_cta
+            ] == shared, C
             if counted:
                 layout = loader.workspace_layout(sm_cta, C, device_index=device.index)
                 assert layout["total_bytes"] <= capacity, C

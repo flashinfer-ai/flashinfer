@@ -8,6 +8,7 @@ from ..backends.split.comm.nccl_ep.config import NcclEpConfig
 from ..backends.split.kernel.identity.config import IdentityConfig
 
 __all__ = [
+    "AutoConfig",
     "IdentityConfig",
     "MegaConfig",
     "SplitConfig",
@@ -51,3 +52,30 @@ class MegaConfig:
     # TODO: This should probably just be passed via a top level parameter
     # when preprocess_weights is False, instead of the regular weights
     transformed_weights: object | None = None
+
+
+@dataclass
+class AutoConfig:
+    """Select a complete EP path from explicitly configured candidates.
+
+    Each split candidate keeps its configured transport. ``candidate`` pins one
+    entry while still allowing tuning within it. An unset value compares all
+    eligible entries during an enabled ``autotune_v2()`` warmup.
+    """
+
+    candidates: tuple[MegaConfig | SplitConfig, ...]
+    candidate: int | None = None
+
+    def __post_init__(self):
+        self.candidates = tuple(self.candidates)
+        if not self.candidates or any(
+            not isinstance(c, (MegaConfig, SplitConfig)) for c in self.candidates
+        ):
+            raise ValueError(
+                "AutoConfig requires explicit MegaConfig/SplitConfig candidates"
+            )
+        if self.candidate is not None and (
+            type(self.candidate) is not int
+            or not 0 <= self.candidate < len(self.candidates)
+        ):
+            raise ValueError("candidate must index AutoConfig.candidates")

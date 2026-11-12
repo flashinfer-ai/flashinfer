@@ -47,7 +47,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 PACKAGE = "cake_moe_grouped_gemm_det_train"
 cb = cake_package(PACKAGE, "cake_backend")
