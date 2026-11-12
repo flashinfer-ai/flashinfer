@@ -870,8 +870,8 @@ __global__ void scale_1x128_kernel(OutputType* output, ScaleType* scales,
 
     InputType amax = find_max_elem_in_warp(input_amax);
     // A tiny nonzero amax would make 448 / amax overflow to inf and the quantized block NaN.
-    amax = tensorrt_llm::common::cuda_max(amax, InputType(1e-10f));
-    ScaleType scale = 448.f / ScaleType(amax);
+    // Floor in fp32: InputType(1e-10f) would flush to 0 for half and give 448 / 0 again.
+    ScaleType scale = 448.f / tensorrt_llm::common::cuda_max(ScaleType(amax), ScaleType(1e-10f));
 
     if (lane_id == 0) {
       scales[(size_t)scales_idx_x * stride_scale_dim_y + scales_idx_y] = ScaleType(1.f / scale);
@@ -989,8 +989,8 @@ __global__ void scale_1x128_kernel(OutputType* output, float* scales, InputType 
     //         __hmax(__habs(input_frag[2]), __habs(input_frag[3]))));
 
     // A tiny nonzero amax would make 448 / amax overflow to inf and the quantized block NaN.
-    amax = tensorrt_llm::common::cuda_max(amax, InputType(1e-10f));
-    float scale = 448.f / float(amax);
+    // Floor in fp32: InputType(1e-10f) would flush to 0 for half and give 448 / 0 again.
+    float scale = 448.f / tensorrt_llm::common::cuda_max(float(amax), 1e-10f);
 
     if (kernel_utils::elect_one_sync(lane_id)) {
       scale_output = float(1.f / scale);
@@ -1054,8 +1054,8 @@ __global__ void scale_1x128_reshape_kernel(OutputType* output, ScaleType* scales
 
     InputType amax = find_max_elem_in_warp(input_amax);
     // A tiny nonzero amax would make 448 / amax overflow to inf and the quantized block NaN.
-    amax = tensorrt_llm::common::cuda_max(amax, InputType(1e-10f));
-    ScaleType scale = 448.f / ScaleType(amax);
+    // Floor in fp32: InputType(1e-10f) would flush to 0 for half and give 448 / 0 again.
+    ScaleType scale = 448.f / tensorrt_llm::common::cuda_max(ScaleType(amax), ScaleType(1e-10f));
 
     if (lane_id == 0) {
       scales[(size_t)scales_idx_h * scales_along_dim_x * stride_scale_dim_y +
@@ -1116,8 +1116,8 @@ __global__ void scale_128x128_kernel(OutputType* output, ScaleType* scales,
 
     InputType amax = find_max_elem_in_warp(input_amax);
     // A tiny nonzero amax would make 448 / amax overflow to inf and the quantized block NaN.
-    amax = tensorrt_llm::common::cuda_max(amax, InputType(1e-10f));
-    ScaleType scale = 448.f / ScaleType(amax);
+    // Floor in fp32: InputType(1e-10f) would flush to 0 for half and give 448 / 0 again.
+    ScaleType scale = 448.f / tensorrt_llm::common::cuda_max(ScaleType(amax), ScaleType(1e-10f));
 
     if (lane_id == 0) {
       scales[scales_idx_y * scales_along_dim_x + scales_idx_x] = ScaleType(1.f / scale);
