@@ -163,8 +163,8 @@ pytest tests/moe_ep/test_moe_ep_sm120_w4a8_nosync_mega.py
 # timing: one MoE layer per call, CUDA graph, cold L2, identical seeded routes across backends
 B="python benchmarks/bench_megamoe_mxfp4_sm120.py --ep 4 --shape flash --capacity 128 --tokens 1 2 8 16 32 64 128"
 C="--cold-l2 --repeats 1 --rounds 20"
-$B --backend nosync --save-routing /tmp/rt $C   # cake fallback + NosyncOptions() (cake's table); EP8: add --transport all_gin
-$B --backend cake   --load-routing /tmp/rt $C   # EP8: --transport all_gin or lsa_where_reachable
+$B --backend nosync --save-routing /tmp/rt $C   # cake fallback + NosyncOptions() (cake's table); EP8: add --transport lsa_where_reachable
+$B --backend cake   --load-routing /tmp/rt $C   # EP8: --transport lsa_where_reachable
 ```
 
 The environment variables the tests read are listed in
@@ -173,14 +173,15 @@ The environment variables the tests read are listed in
 ## Performance summary
 
 Commit `3ffd6c87`, all backends from that tree, cold L2, µs per MoE layer, DeepSeek-V4-Flash routed experts
-(H 4096, I 2048, 256 experts, top-6); speedup is cake ÷ this kernel. The full
+(H 4096, I 2048, 256 experts, top-6); speedup is cake ÷ this kernel, cake with its fastest table on each host
+(RTX 6000D EP8: `lsa_where_reachable` with `NCCL_IB_HCA==mlx5_0`, every pair LSA). The full
 tables (three model shapes, cutedsl and DeepEP + CUTLASS columns) are in the PR
 description of [#8806](https://github.com/flashinfer-ai/flashinfer/pull/8806).
 
 | Host | Config | 1 token / rank | 8 | 32 | 128 |
 | --- | --- | --- | --- | --- | --- |
 | RTX 6000D (Broadcom) | EP4 | 125.7 (2.35×) | 448.3 (1.49×) | 696.8 (1.35×) | 776.0 (1.24×) |
-| RTX 6000D (Broadcom) | EP8, every pair P2P | 142.8 (2.35×) | 309.8 (1.72×) | 397.9 (1.93×) | 544.3 (2.34×) |
+| RTX 6000D (Broadcom) | EP8, every pair P2P | 142.8 (2.21×) | 309.8 (1.65×) | 397.9 (1.51×) | 544.3 (1.20×) |
 | RTX PRO 6000 | EP4 | 124.9 (2.41×) | 389.1 (1.56×) | 599.7 (1.40×) | 700.4 (1.25×) |
 | RTX PRO 6000 | EP8 `auto` | 174.1 (1.72×) | 369.6 (1.40×) | 434.2 (1.33×) | 704.5 (0.91×) |
 
