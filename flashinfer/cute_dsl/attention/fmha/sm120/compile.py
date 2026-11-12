@@ -320,8 +320,8 @@ def compile_sm120_fmha_fp8_ragged_kernel(
     from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
     device = torch.device(device)
-    if torch.cuda.get_device_capability(device) != (12, 0):
-        raise RuntimeError("SM120 PRIMS FMHA compilation requires SM120")
+    if torch.cuda.get_device_capability(device) not in ((12, 0), (12, 1)):
+        raise RuntimeError("SM120 PRIMS FMHA compilation requires SM120 or SM121")
     kernel_name = (
         f"ragged_{_dtype_name(in_dtype)}_{_dtype_name(out_dtype)}"
         f"_hq{num_qo_heads}_hkv{num_kv_heads}_d{head_dim}"
@@ -373,8 +373,8 @@ def compile_sm120_fmha_fp8_paged_kernel(
     from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
     device = torch.device(device)
-    if torch.cuda.get_device_capability(device) != (12, 0):
-        raise RuntimeError("SM120 PRIMS FMHA compilation requires SM120")
+    if torch.cuda.get_device_capability(device) not in ((12, 0), (12, 1)):
+        raise RuntimeError("SM120 PRIMS FMHA compilation requires SM120 or SM121")
     kernel_name = (
         f"paged_hnd_{_dtype_name(in_dtype)}_{_dtype_name(out_dtype)}"
         f"_hq{num_qo_heads}_hkv{num_kv_heads}_d{head_dim}"

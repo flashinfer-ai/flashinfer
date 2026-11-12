@@ -19,9 +19,9 @@ def _has_required_cutlass_dsl() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() != (12, 0)
+    or torch.cuda.get_device_capability() not in ((12, 0), (12, 1))
     or not _has_required_cutlass_dsl(),
-    reason="requires SM120 and nvidia-cutlass-dsl>=4.7.0",
+    reason="requires SM120/SM121 and nvidia-cutlass-dsl>=4.7.0",
 )
 
 

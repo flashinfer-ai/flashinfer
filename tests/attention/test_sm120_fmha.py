@@ -5,7 +5,7 @@
 The same compiled ragged/paged handles are exercised with different sequence
 lengths, batch sizes, total-token counts, and paged block-table widths.
 
-Run on an SM120 (Blackwell GeForce) GPU:
+Run on an SM120 (Blackwell GeForce) or SM121 (DGX Spark) GPU:
     pytest tests/attention/test_sm120_fmha.py -v
 """
 
@@ -24,8 +24,8 @@ if not is_cute_dsl_experimental_available():
 _device = torch.device("cuda") if torch.cuda.is_available() else None
 
 pytestmark = pytest.mark.skipif(
-    _device is None or get_compute_capability(_device) != (12, 0),
-    reason="SM120 FMHA requires SM120 GPU (compute capability 12.0)",
+    _device is None or get_compute_capability(_device) not in ((12, 0), (12, 1)),
+    reason="SM120 FMHA requires an SM120 or SM121 GPU (compute capability 12.0 or 12.1)",
 )
 
 from flashinfer.attention.cute_dsl.sm120_fmha import (

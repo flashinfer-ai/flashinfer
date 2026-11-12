@@ -48,7 +48,7 @@ import torch
 from cutlass.cute.typing import Float32, Int32
 from packaging.version import Version
 
-from flashinfer.utils import ceil_div
+from flashinfer.utils import ceil_div, get_compute_capability, is_sm12x_supported
 
 
 _MIN_CUTLASS_DSL_VERSION = Version("4.7.0")
@@ -81,11 +81,12 @@ def _cutlass_dtype(torch_dtype: torch.dtype):
 
 
 def _check_sm120(device: torch.device) -> None:
-    major, minor = torch.cuda.get_device_capability(device)
-    if not (major == 12 and minor == 0):
+    # SM121 has the same 101376 B per-block shared memory the configs are sized for.
+    major, minor = get_compute_capability(device)
+    if not is_sm12x_supported(device) or (major, minor) not in ((12, 0), (12, 1)):
         raise RuntimeError(
-            f"SM120 FMHA kernel requires SM120 GPU (compute capability 12.0), "
-            f"got {major}.{minor}"
+            "SM120 FMHA kernel requires an SM120 or SM121 GPU (compute capability "
+            f"12.0 or 12.1), got {major}.{minor}"
         )
 
 
@@ -293,7 +294,7 @@ def sm120_fmha_fp8_ragged_prefill(
     Raises
     ------
     RuntimeError
-        If the GPU is not SM120 or the configuration is not supported.
+        If the GPU is not SM120/SM121 or the configuration is not supported.
     """
     _check_cutlass_dsl_version()
 
@@ -480,7 +481,7 @@ def sm120_fmha_fp8_paged_prefill(
     Raises
     ------
     RuntimeError
-        If the GPU is not SM120 or the configuration is unsupported.
+        If the GPU is not SM120/SM121 or the configuration is unsupported.
     ValueError
         If required arguments are missing or shapes are inconsistent.
     """

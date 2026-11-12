@@ -632,7 +632,7 @@ Backend Legend:
 - batch_invariant: FlashInfer's batch-invariant kernels (`batch_invariant=True`: a row's bits depend only on its own
   inputs, never on the batch size, its position or the configuration; Blackwell SM100 / SM103 / SM107; see
   `flashinfer/batch_invariant/README.md` and [Batch-invariant mode](#batch-invariant-mode))
-- cute-dsl-prims: SM120 PRIMS FP8 batch-prefill kernels. Ragged inputs use
+- cute-dsl-prims: SM120/SM121 PRIMS FP8 batch-prefill kernels. Ragged inputs use
   packed NHD storage, while paged K/V uses HND storage. Paged attention accepts
   the standard combined cache or separate K/V pools without copying. The
   backend supports FP32 log2 LSE and requires `cutlass.experimental`.
