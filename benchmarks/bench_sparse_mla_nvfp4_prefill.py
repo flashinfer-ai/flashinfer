@@ -45,11 +45,15 @@ _D_LATENT = 512
 _PAGE_SIZE = 64
 
 
-def _median_us(fn, warmup_ms: int, measure_ms: int) -> float:
+def _median_us(fn, warmup_ms: int, measure_ms: int, use_cuda_graph=False) -> float:
     fn()
     torch.cuda.synchronize()
     measurements = bench_gpu_time(
-        fn, dry_run_time_ms=warmup_ms, repeat_time_ms=measure_ms
+        fn,
+        dry_run_time_ms=warmup_ms,
+        repeat_time_ms=measure_ms,
+        use_cuda_graph=use_cuda_graph,
+        cold_l2_cache=not use_cuda_graph,
     )
     return float(np.median(measurements)) * 1e3
 
@@ -76,12 +80,25 @@ def main() -> None:
             "Profiler API, and exit"
         ),
     )
+    parser.add_argument(
+        "--cuda-graph", action="store_true", help="Time CUDA Graph replay with warm L2"
+    )
+    parser.add_argument(
+        "--full-pipeline",
+        action="store_true",
+        help="Include separate Q RoPE and inverse-RoPE/FP8 output kernels",
+    )
+    parser.add_argument(
+        "--customer-q",
+        type=int,
+        nargs="+",
+        help="Run only CP=4 full-pipeline customer cases; KV=4*Q, H=64",
+    )
     args = parser.parse_args()
+    print("Timing: warm-L2 CUDA Graph" if args.cuda_graph else "Timing: eager, cold L2")
 
     if not is_sm120a_supported(torch.device("cuda")):
         raise SystemExit("NVFP4 sparse MLA requires SM120/SM121")
-    if args.num_tokens <= 64:
-        raise SystemExit("paired FP8 prefill requires --num-tokens > 64")
     if args.num_heads not in (16, 32, 64, 128):
         raise SystemExit("NVFP4 prefill supports 16/32/64/128 heads")
     if args.mega and args.num_heads % 32:
@@ -90,6 +107,27 @@ def main() -> None:
         )
     if args.profile_once and len(args.topk) != 1:
         raise SystemExit("--profile-once requires exactly one --topk value")
+
+    if args.customer_q:
+        from tests.attention.sparse_mla_prefill_utils import (
+            prefill_fixture,
+            native_prefill_calls,
+        )
+
+        print("Q,KV,H,full_pipeline_us")
+        for qlen in args.customer_q:
+            f = prefill_fixture(
+                1,
+                "nvfp4",
+                heads=64,
+                prefill_tokens=qlen,
+                prefill_cp_size=4,
+                keep_decoded=False,
+            )
+            fn = native_prefill_calls(f)[0] if args.mega else f["baseline"]
+            us = _median_us(fn, args.warmup_ms, args.measure_ms, args.cuda_graph)
+            print(f"{qlen},{4 * qlen},64,{us:.4f}")
+        return
 
     torch.manual_seed(args.seed)
     kv_bf16 = (
@@ -290,6 +328,31 @@ def main() -> None:
 
         run_nv()
         torch.cuda.synchronize()
+        if args.full_pipeline and not args.mega:
+            from tests.attention.sparse_mla_prefill_utils import rope, epilogue
+
+            original_q = q
+            q = torch.empty_like(original_q)
+            positions = torch.arange(args.num_tokens, device="cuda", dtype=torch.int32)
+            freq = 10000.0 ** (-torch.arange(32, device="cuda").float() / 32)
+            angles = positions.float()[:, None] * freq
+            cs = torch.cat((angles.cos(), angles.sin()), -1).contiguous()
+            fp8_quant = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+            nv_quant = torch.empty_like(fp8_quant)
+            fp8_sf = torch.empty(*q.shape[:2], 16, device="cuda", dtype=torch.uint8)
+            nv_sf = torch.empty_like(fp8_sf)
+            attention_fp8, attention_nv = run_fp8, run_nv
+
+            def run_fp8():
+                rope(original_q, positions, cs, q)
+                attention_fp8()
+                epilogue(fp8_out, positions, cs, fp8_quant, fp8_sf)
+
+            def run_nv():
+                rope(original_q, positions, cs, q)
+                attention_nv()
+                epilogue(nv_out, positions, cs, nv_quant, nv_sf)
+
         if args.profile_once:
             torch.cuda.cudart().cudaProfilerStart()
             run_nv()
@@ -301,8 +364,10 @@ def main() -> None:
                 f"topk={topk},extra_topk={args.extra_topk}"
             )
             return
-        fp8_us = _median_us(run_fp8, args.warmup_ms, args.measure_ms)
-        inclusive_us = _median_us(run_nv, args.warmup_ms, args.measure_ms)
+        fp8_us = _median_us(run_fp8, args.warmup_ms, args.measure_ms, args.cuda_graph)
+        inclusive_us = _median_us(
+            run_nv, args.warmup_ms, args.measure_ms, args.cuda_graph
+        )
         run_fp8()
         run_nv()
         torch.cuda.synchronize()
@@ -319,6 +384,8 @@ def main() -> None:
         cosine = torch.nn.functional.cosine_similarity(
             nv_out.float(), fp8_out.float(), dim=-1
         )
+        if args.full_pipeline and not args.mega:
+            q = original_q
         print(
             f"{topk},{args.extra_topk},{args.extra_page_size},"
             f"{fp8_us:.3f},{inclusive_us:.3f},"
