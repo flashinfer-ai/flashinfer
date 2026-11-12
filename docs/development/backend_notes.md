@@ -145,6 +145,21 @@ physical token origins, changed lengths/page tables and retained graph replay.
 The version and native flags are necessary dependencies; benchmark evidence
 from a development FE build does not establish released-wheel qualification.
 
+### Additional Blackwell full-prefill admission
+
+With stable FE 1.33+, the same public graph path admits BF16 HND full prefills
+on SM100 and SM103 with page sizes 16 or 64. D256 MHA supports batch 1–8;
+D128 GQA groups 4/8 support batch 1–32. Query heads remain in 8–64.
+Every actual Q length must equal its KV length, and the declared Q/KV maxima
+must equal the actual maximum in 512–16384. The paired-work floor is 16 Mi.
+
+This extension uses existing CPU offsets/lengths only. Independent Q masks,
+device-only metadata, and larger declaration bounds do not extend admission.
+The original routes remain available under their existing guards. D256 keeps
+its matching native packed-split/physical-origin checks. FE's full-prefill
+placement is a dependency; a source-build result is not released-wheel or
+serving/TTFT qualification. Neither FI admission nor execution forces an engine.
+
 ## Grouped FP8 GEMM
 
 `flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous` is the standalone
