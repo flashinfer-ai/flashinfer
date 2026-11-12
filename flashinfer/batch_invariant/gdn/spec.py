@@ -3,7 +3,7 @@
 """The GDN class ``gdn.bf16.c64`` behind ``chunk_gated_delta_rule(batch_invariant=True)``: its constants, the chunk
 arithmetic of a call and the fingerprint.
 
-The class's term is the native SM100 / SM103 chunked GDN prefill (the chunk-64 CuTe-DSL kernel of
+The class's term is the native SM100 / SM103 / SM107 chunked GDN prefill (the chunk-64 CuTe-DSL kernel of
 ``flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py`` without context parallelism, log-domain gates, the Q / K
 l2-norm of ``gdn_kernels/qk_l2norm.py``, fp32 state): a sequence's rows and its state at every multiple of 64 tokens
 are functions of the sequence's own inputs and its initial state. Decode computes row ``p`` of that term from rows
@@ -24,8 +24,8 @@ CLASS = "gdn.bf16.c64"
 #: The kernel's chunk: boundaries are absolute multiples of it.
 CHUNK = 64
 HEAD_DIM = 128
-#: The compute capabilities the class is stated and tested for: SM100 (B200) and SM103 (B300).
-GDN_ARCHS = ((10, 0), (10, 3))
+#: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300) and SM107 (Rubin).
+GDN_ARCHS = ((10, 0), (10, 3), (10, 7))
 #: Calls with fewer tokens per sequence than this run in the step kernel alone; the others take the prefill kernel for
 #: their whole chunks and the step kernel for the rows of open chunks.
 STEP_MAX_TOKENS = CHUNK

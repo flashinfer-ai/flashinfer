@@ -19,7 +19,7 @@ from .core import JitSpec, current_compilation_context, gen_jit_spec
 
 
 def gen_gdn_batch_invariant_module() -> JitSpec:
-    """The decode step of the batch-invariant GDN class (SM100 / SM103)."""
+    """The decode step of the batch-invariant GDN class (SM100 / SM103 / SM107)."""
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
         supported_major_versions=[10]
     )
