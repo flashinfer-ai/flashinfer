@@ -672,6 +672,26 @@ def test_a_rewrite_reprepares_only_the_weight_set_that_changed():
     assert stats["weight_sets"] == 2 and stats["reprepared"] == 1
 
 
+def test_a_racing_reprepare_is_validated_against_the_call():
+    """A replacement entry that postdates a further rewrite is re-prepared again."""
+    life = _Lifecycle()
+    wrapper = bind(life)
+    a, out = torch.ones(2), torch.empty(2)
+    wrapper(x=a, out=out)  # state 1, versions recorded
+    key = next(iter(wrapper._states))
+    old = wrapper._states[key]
+    a.fill_(3.0)  # the live tensor is now ahead of both entries below
+    # A racing call re-prepared at the earlier contents; its entry is stale
+    # against this call's tensors and must not serve.
+    wrapper._states[key] = ({"serial": 99}, old[1], old[2], old[3])
+    entry = wrapper._reprepare(
+        key, "x", old, (a,), {"x": a, "out": out}, torch.device("cpu")
+    )
+    assert life.setups == 2  # the replacement was refused, setup re-ran
+    assert entry[0] == {"serial": 2} and entry is wrapper._states[key]
+    assert life.teardowns == [{"serial": 99}]
+
+
 def test_an_inference_tensor_is_served_with_identity_keying_only():
     """An inference-mode tensor tracks no version: no refusal, no re-prepare."""
     life = _Lifecycle()

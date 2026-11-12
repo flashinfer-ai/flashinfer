@@ -41,7 +41,9 @@ inference-mode tensor — is keyed on identity alone), which torch bumps on
 every in-place operation through its dispatcher: a call whose setup inputs no longer match
 is prepared afresh under the same key, or refused with ``StaleSetupError``
 once a capture has frozen the binding (a captured graph replays against the
-prepared state's addresses). A write that bypasses torch's dispatcher — a raw
+prepared state's addresses). Re-preparing tears the old state down, so — as
+with ``release()`` — a rewrite is the engine's to quiesce: a call in flight
+holds the state it was handed. A write that bypasses torch's dispatcher — a raw
 copy into the storage — moves no counter and stays invisible; an engine mode
 that rewrites weights that way is the consumer's to refuse.
 
@@ -406,17 +408,25 @@ class SetupBoundCallable:
         The lock is held across the delete, the teardown and the new prepare, as
         ``_prepare`` already holds it across setup: a racing call sees the state
         before or after, never between, and a capture observed meanwhile keeps the
-        old state. A teardown that raises leaves nothing prepared; the next call
-        prepares afresh.
+        old state. A racing call's replacement is checked against this call's
+        tensors before it serves: a further rewrite may postdate it. A teardown
+        that raises leaves nothing prepared; the next call prepares afresh.
+        Like ``release()``, this assumes the engine quiesces calls around a weight
+        rewrite — which a rewrite already requires, since an in-place rewrite
+        during a call corrupts the computation the setup state serves.
         """
         with self._lock:
             current = self._states.get(key)
             if current is not old:
-                if current is not None:
-                    return current  # a racing call already re-prepared this key
-                return self._prepare(
-                    key, tensors, kwargs, device
-                )  # its teardown failed
+                if current is None:
+                    # The racing call's teardown failed; nothing is prepared.
+                    return self._prepare(key, tensors, kwargs, device)
+                again = self._stale_input(current, tensors)
+                if again is None:
+                    return current  # a racing call re-prepared; the entry is current
+                # The replacement postdates a further rewrite: re-apply the rules
+                # to it (the lock is re-entrant).
+                return self._reprepare(key, again, current, tensors, kwargs, device)
             if self._frozen or _is_capturing(device):
                 raise self._stale_refusal(stale)
             del self._states[key]
