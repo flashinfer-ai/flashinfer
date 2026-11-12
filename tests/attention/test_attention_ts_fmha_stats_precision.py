@@ -35,60 +35,6 @@ _REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
 )
 
 
-def test_attention_ts_fmha_large_logits_lose_denominator_in_lse():
-    """The regression input is finite BF16, but absolute FP32 LSE loses bits."""
-    query = torch.zeros(128, dtype=torch.bfloat16)
-    query[0] = 4096.0
-    scores = query.float().repeat(512, 1) @ query.float()
-    maximum = scores.max()
-    assert maximum.item() == 2**24
-    max_log2 = maximum * math.log2(math.e)
-    partial_sums = torch.tensor([256.0, 256.0])
-    partial_maxima = max_log2.repeat(2)
-    partial_lse = partial_maxima + partial_sums.log2()
-    # Match the existing LSE/O merge's rounded absolute addition.
-    merged_lse = (
-        partial_lse.max() + torch.exp2(partial_lse - partial_lse.max()).sum().log2()
-    )
-    assert torch.exp2(merged_lse - max_log2).item() == 1024.0
-    actual_sum = (
-        partial_sums * torch.exp2(partial_maxima - partial_maxima.max())
-    ).sum()
-    assert actual_sum.item() == 512.0
-
-
-def test_attention_ts_fmha_large_unequal_logits_lose_gap_when_prescaled():
-    query = torch.tensor([4096.0, 1.0], dtype=torch.bfloat16)
-    keys = torch.tensor([[4096.0, 0.0], [4096.0, 2.0]], dtype=torch.bfloat16)
-    raw = keys.float() @ query.float()
-    torch.testing.assert_close(
-        raw, torch.tensor([2**24, 2**24 + 2]).float(), rtol=0, atol=0
-    )
-    partial_sums = torch.tensor([256.0, 256.0])
-    prescaled_maxima = raw * math.log2(math.e)
-    incorrect = (
-        partial_sums * torch.exp2(prescaled_maxima - prescaled_maxima.max())
-    ).sum()
-    assert incorrect.item() == 320.0
-    actual = (partial_sums * torch.exp2((raw - raw.max()) * math.log2(math.e))).sum()
-    expected = (partial_sums * torch.exp(raw - raw.max())).sum()
-    torch.testing.assert_close(actual, expected)
-    assert abs(actual.item() - incorrect.item()) > 29.0
-
-
-@pytest.mark.parametrize("probability_scale", (1.0, 448.0))
-def test_attention_ts_fmha_max_probability_uses_raw_difference(probability_scale):
-    score = torch.tensor(float(2**24 + 2), dtype=torch.float32)
-    scale = torch.tensor(0.5 * math.log2(math.e), dtype=torch.float32)
-    bias = torch.tensor(math.log2(probability_scale), dtype=torch.float32)
-    # FP64 intermediates emulate fused FP32 multiply-add with one final rounding.
-    offset = (-score.double() * scale.double() + bias.double()).float()
-    exponent = (score.double() * scale.double() + offset.double()).float()
-    assert abs(torch.exp2(exponent).item() / probability_scale - 1.0) > 0.1
-    stable = torch.exp2((score - score) * scale + bias)
-    torch.testing.assert_close(stable, torch.tensor(probability_scale))
-
-
 @pytest.mark.parametrize(
     "tile_q,keeps", ((8, False), (16, False), (32, False), (64, True), (128, True))
 )

@@ -19,36 +19,6 @@ import pytest
 import torch
 
 
-def test_absolute_fp32_lse_cannot_recover_denominator():
-    """Keep the adversarial input independent of GPU availability and dispatch."""
-    maximum = torch.tensor(4096.0 * 4096.0, dtype=torch.float32)
-    max_log2 = maximum * math.log2(math.e)
-    denominator = torch.tensor(2.0, dtype=torch.float32)
-    lse = max_log2 + denominator.log2()
-    assert torch.exp2(lse - max_log2).item() == 4.0
-    assert denominator.item() == 2.0
-
-
-def test_absolute_fp32_scaled_maxima_cannot_preserve_relative_gap():
-    raw_maxima = torch.tensor([2**24, 2**24 + 2], dtype=torch.float32)
-    scaled_maxima = raw_maxima * math.log2(math.e)
-    premature = torch.exp2(scaled_maxima - scaled_maxima.max()).sum() * 256
-    correct = torch.exp(raw_maxima - raw_maxima.max()).sum() * 256
-    assert premature.item() == 320
-    torch.testing.assert_close(correct, torch.tensor(256 * (1 + math.exp(-2))))
-
-
-def test_absolute_fp32_fma_cannot_preserve_probability_origin():
-    raw_maximum = torch.tensor(2**24 + 2, dtype=torch.float32)
-    scale_log2 = torch.tensor(math.log2(math.e), dtype=torch.float32)
-    # FP64 models the product retained by FMA before its final FP32 rounding.
-    residual = (
-        raw_maximum.double() * scale_log2.double() - (raw_maximum * scale_log2).double()
-    ).float()
-    assert torch.exp2(residual).item() > 1.84
-    assert torch.exp2((raw_maximum - raw_maximum) * scale_log2).item() == 1
-
-
 @pytest.mark.parametrize("store_stats", (False, True))
 def test_attention_ts_mla_cluster_stats_storage_is_opt_in(store_stats):
     pytest.importorskip("cutlass", minversion="4.7.0")

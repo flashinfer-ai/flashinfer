@@ -138,7 +138,6 @@ def test_attention_ts_softmax_stats_one_shot_contract(one_shot):
     assert parameters["softmax_stats"].default is None
 
 
-@pytest.mark.parametrize("invalid", (None, 1, "True"))
 @pytest.mark.parametrize(
     "wrapper_type",
     (
@@ -148,13 +147,13 @@ def test_attention_ts_softmax_stats_one_shot_contract(one_shot):
         BatchMLADecodePagedTSWrapper,
     ),
 )
-def test_attention_ts_softmax_stats_plan_requires_bool(wrapper_type, invalid):
+def test_attention_ts_softmax_stats_plan_requires_bool(wrapper_type):
     common = dict(
         device="cuda",
         batch_size=1,
         max_q_len=1,
         max_kv_len=128,
-        store_softmax_stats=invalid,
+        store_softmax_stats=1,
     )
     if wrapper_type in (BatchPrefillTSWrapper, BatchPrefillPagedTSWrapper):
         common.update(

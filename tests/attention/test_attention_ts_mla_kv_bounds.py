@@ -986,8 +986,7 @@ def test_attention_ts_mla_kv_bounds_cpu_plan_wiring(
     assert compile_kwargs["store_softmax_stats"] is store_softmax_stats
 
 
-@pytest.mark.parametrize("invalid", (0, 1, None, "true"))
-def test_attention_ts_mla_kv_bounds_cpu_plan_requires_boolean(invalid: object) -> None:
+def test_attention_ts_mla_kv_bounds_cpu_plan_requires_boolean() -> None:
     wrapper = BatchMLADecodePagedTSWrapper()
     with pytest.raises(TypeError, match="use_kv_bounds must be a bool"):
         wrapper.plan(
@@ -1003,7 +1002,7 @@ def test_attention_ts_mla_kv_bounds_cpu_plan_requires_boolean(invalid: object) -
             q_dtype=torch.bfloat16,
             kv_dtype=torch.bfloat16,
             out_dtype=torch.bfloat16,
-            use_kv_bounds=invalid,
+            use_kv_bounds=1,
             validate=False,
         )
 

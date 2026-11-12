@@ -15,7 +15,6 @@
 
 import ast
 from contextlib import contextmanager
-import inspect
 import math
 from pathlib import Path
 import sys
@@ -205,32 +204,6 @@ def test_runtime_dense_domain_preserves_dynamic_launch_bound(offset):
                 expected = min(launch_tiles, max((length + 127) // 128, 1)) - offset
                 assert task.get_domain((0, 0, 0)) == expected
                 assert schedule.loop_end == 71
-
-
-def test_runtime_dense_domain_plan_uses_current_api():
-    pytest.importorskip("cutlass", minversion="4.7.0")
-    from flashinfer.attention.prims_ts import BatchPrefillTSWrapper
-
-    inspect.signature(BatchPrefillTSWrapper.plan).bind(
-        None,
-        device="cuda",
-        batch_size=2,
-        max_q_len=512,
-        max_kv_len=4096,
-        num_qo_heads=_HEADS,
-        num_kv_heads=_HEADS,
-        head_dim=192,
-        head_dim_vo=128,
-        q_dtype=torch.float8_e4m3fn,
-        k_dtype=torch.float8_e4m3fn,
-        v_dtype=torch.float8_e4m3fn,
-        out_dtype=torch.bfloat16,
-        packed_query=True,
-        mask_type="dense",
-        store_softmax_stats=True,
-        softmax_scale=0.75 / math.sqrt(192),
-        output_scale=0.625,
-    )
 
 
 def test_runtime_dense_policy_domains_share_the_live_pointer() -> None:

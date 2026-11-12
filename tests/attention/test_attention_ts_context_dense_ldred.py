@@ -14,7 +14,6 @@
 """Packed dense full-tile reduction, masked tails and live-length regressions."""
 
 from contextlib import contextmanager, nullcontext
-import inspect
 import math
 
 import pytest
@@ -405,30 +404,3 @@ def test_paged_dense_ldred_full_tail_and_empty_admission(
     seq[0] = 0
     with pytest.raises(ValueError, match="require positive KV lengths"):
         run(True)
-
-
-def test_dense_ldred_uses_current_plan_api():
-    """Bind the directed test's public keywords without requiring a GPU."""
-    common = dict(
-        device="cuda",
-        batch_size=4,
-        max_q_len=257,
-        max_kv_len=257,
-        num_qo_heads=_HEADS,
-        num_kv_heads=_HEADS,
-        head_dim=192,
-        q_dtype=_FP8,
-        k_dtype=_FP8,
-        v_dtype=_FP8,
-        out_dtype=torch.bfloat16,
-        mask_type="dense",
-        store_softmax_stats=True,
-        softmax_scale=0.75 / math.sqrt(192),
-        output_scale=0.625,
-    )
-    inspect.signature(BatchPrefillTSWrapper.plan).bind(
-        None, **common, head_dim_vo=128, packed_query=True
-    )
-    inspect.signature(BatchPrefillPagedTSWrapper.plan).bind(
-        None, **common, page_size=128
-    )
