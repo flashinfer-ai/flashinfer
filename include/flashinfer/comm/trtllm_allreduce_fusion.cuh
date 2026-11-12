@@ -1081,6 +1081,9 @@ struct LamportComm {
   __device__ __forceinline__ LamportComm(void** workspace, int rank) {
     counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
     flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
+    // Bytes the previous Lamport kernel wrote to its sub-buffer. Every Lamport kernel on this
+    // workspace reads and writes it, whatever its dtype, so it stays in bytes; readers round it
+    // up to whole 16-byte stores.
     clear_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[4];
     flag_value = *flag_ptr;
     int comm_size = reinterpret_cast<int*>(workspace[NRanks * 3])[3];
@@ -1663,7 +1666,8 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
   // residual_in has completed.
   FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
   LamportComm<NRanks> comm(params.workspace, params.rank);
-  int clear_access = comm.clear_size / VEC_SIZE;
+  int clear_access =
+      static_cast<int>((comm.clear_size + details::kBytesPerAccess - 1) / details::kBytesPerAccess);
 
   for (int idx = access_id; idx < tot_access; idx += access_stride) {
     vec_t<T, VEC_SIZE> val;
@@ -1701,7 +1705,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
     fused_op(sum_val, tidx);
   }
 
-  comm.update(params.size * NRanks);
+  comm.update(params.size * NRanks * static_cast<int>(sizeof(T)));
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   if constexpr (TriggerCompletionAtEnd) {

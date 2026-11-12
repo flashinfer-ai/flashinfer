@@ -579,7 +579,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     non-lamport flag: kernel_flag_ptr[1] = 0;
     lamport flag: kernel_flag_ptr[2] = 0;
     lamport triple buffer offset: kernel_flag_ptr[3] = lamport_comm_size;
-    lamport clear size: kernel_flag_ptr[4] = 0;
+    lamport clear size in bytes: kernel_flag_ptr[4] = 0;
     """
     # malloc cuda memory of int32_t * 5
     flag_ptr = cudart.cudaMalloc(5 * 4)
