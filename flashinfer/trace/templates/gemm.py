@@ -1338,6 +1338,18 @@ bmm_mxfp8_trace = TraceTemplate(
 )
 
 
+def bmm_mxfp8_trace_dispatch(**kwargs):
+    """Return the TraceTemplate for a ``bmm_mxfp8`` call. MXFP8 output (``out_scale``) has
+    no template yet, so it resolves to None: tracing records nothing and Trace Apply keeps
+    the original call, since a registered solution cannot fill ``out_scale``."""
+    if kwargs.get("out_scale") is not None:
+        return None
+    return bmm_mxfp8_trace
+
+
+bmm_mxfp8_trace_dispatch.templates = [bmm_mxfp8_trace]  # type: ignore[attr-defined]
+
+
 # ── tinygemm_bf16 (small bf16 GEMM with bias) ────────────────────────────────
 
 

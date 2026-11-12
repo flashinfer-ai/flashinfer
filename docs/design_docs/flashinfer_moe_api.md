@@ -887,6 +887,7 @@ python scripts/generate_moe_activation_matrix.py --write
 | --- | --- | --- | --- |
 | `b12x_nvfp4` | `B12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
 | `b12x_w4a16` | `B12xW4A16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
+| `batch_invariant_bf16` | `BatchInvariantBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cake` | `CakeWarpDecodeConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiLU`, `SiTU` |
 | `cake_stepfun` | `CakeStepFunConfig` | `BF16×BF16` | `SwiGLUStep` |
 | `cake_stepfun` | `CakeStepFunConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLUStep` |
@@ -947,7 +948,7 @@ python scripts/generate_moe_activation_matrix.py --write
 | `prims_ts` | `PrimsTsConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2`, `SiLU` |
 | `sm12x_fp8` | `SM12xFp8Config` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `sm12x_mxfp8_mxfp4` | `SM12xMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU` |
-| `sm12x_nvfp4` | `SM12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `ReLU2` |
+| `sm12x_nvfp4` | `SM12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SiTU`, `ReLU2` |
 | `sm12x_nvfp4_bf16` | `SM12xNvfp4Bf16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
 | `trtllm_bf16_routed` | `TrtllmBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `ReLU2` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×BF16` | `SwiGLU` |

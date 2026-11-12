@@ -6,14 +6,19 @@ Each check compares two authoritative sources to detect drift between code
 and documentation. Pure static analysis: grep / AST / filesystem, no GPU,
 no imports of flashinfer.
 
+"Agent guidance" is AGENTS.md plus the reference pages it links under
+docs/development/ (AGENT_GUIDANCE_DOCS).
+
 Checks:
-  env_vars_consistency        — AGENTS.md FLASHINFER_* env var table vs
-                                real os.environ/getenv reads in code.
-  supported_arch_consistency  — AGENTS.md "Supported GPU Architectures"
-                                line vs `is_sm*_supported()` predicates and
+  env_vars_consistency        — FLASHINFER_* env vars named in the agent
+                                guidance vs real os.environ/getenv reads in
+                                code.
+  supported_arch_consistency  — the agent guidance "FlashInfer supports
+                                NVIDIA ..." line vs `is_sm*_supported()`
+                                predicates and
                                 `supported_major_versions=[...]` lists in
                                 the JIT layer.
-  quickref_paths_exist        — every file path mentioned in AGENTS.md
+  quickref_paths_exist        — every file path mentioned in agent guidance
                                 code blocks / tables really exists in repo.
   skill_refs_exist            — file paths inside .claude/skills/*/SKILL.md
                                 still exist in the codebase.
@@ -39,7 +44,7 @@ from .register_checks import (
     get_check,
 )
 from .configure_checks import (
-    AGENTS_MD,
+    AGENT_GUIDANCE_DOCS,
     CSRC_DIR,
     DOCS_DIR,
     FLASHINFER_PKG,
@@ -187,11 +192,19 @@ def collect_env_vars_in_code() -> set[str]:
     return set(collect_env_var_reads_in_code())
 
 
+def _agent_guidance_texts() -> list[tuple[Path, str]]:
+    return [
+        (doc, doc.read_text("utf-8", "replace"))
+        for doc in AGENT_GUIDANCE_DOCS
+        if doc.exists()
+    ]
+
+
 def collect_env_vars_in_agents_md() -> set[str]:
-    if not AGENTS_MD.exists():
-        return set()
-    text = AGENTS_MD.read_text("utf-8", "replace")
-    return set(_ENV_VAR_DOCREF_RE.findall(text)) - _ENV_VAR_EXCLUSIONS
+    found: set[str] = set()
+    for _, text in _agent_guidance_texts():
+        found.update(_ENV_VAR_DOCREF_RE.findall(text))
+    return found - _ENV_VAR_EXCLUSIONS
 
 
 def check_env_vars_consistency() -> list[Finding]:
@@ -217,11 +230,11 @@ def check_env_vars_consistency() -> list[Finding]:
 # supported_arch_consistency
 # ---------------------------------------------------------------------------
 
-# Single canonical sentence in AGENTS.md:
+# Single canonical sentence in the agent guidance (docs/development/testing.md):
 #   "FlashInfer supports NVIDIA SM75, SM80, SM86, SM89, SM90, SM103, SM110,
 #    SM120, and SM121."
 _AGENTS_ARCH_LINE_RE = re.compile(
-    r"FlashInfer supports NVIDIA ((?:SM\d+[a-z]?(?:, and | and |, )?)+)"
+    r"FlashInfer supports NVIDIA ((?:SM\d+[a-z]?(?:,\s+and\s+|\s+and\s+|,\s+)?)+)"
 )
 _SM_TOKEN_RE = re.compile(r"SM(\d+)[a-z]?")
 _SUPPORTED_MAJOR_RE = re.compile(r"supported_major_versions\s*=\s*\[([^\]]*)\]")
@@ -229,14 +242,11 @@ _IS_SM_PREDICATE_RE = re.compile(r"def\s+(is_sm(\d+)([a-z])?_supported)\s*\(")
 
 
 def collect_arches_doc() -> set[int]:
-    if not AGENTS_MD.exists():
-        return set()
-    text = AGENTS_MD.read_text("utf-8", "replace")
-    m = _AGENTS_ARCH_LINE_RE.search(text)
-    if not m:
-        return set()
-    fragment = m.group(1)
-    return {int(x) for x in _SM_TOKEN_RE.findall(fragment)}
+    for _, text in _agent_guidance_texts():
+        m = _AGENTS_ARCH_LINE_RE.search(text)
+        if m:
+            return {int(x) for x in _SM_TOKEN_RE.findall(m.group(1))}
+    return set()
 
 
 def collect_arches_code() -> tuple[set[int], set[int]]:
@@ -282,7 +292,8 @@ def check_supported_arch() -> list[Finding]:
             Finding(
                 check=SUPPORTED_ARCH,
                 location="AGENTS.md",
-                message="Could not find 'FlashInfer supports NVIDIA ...' arch line",
+                message="Could not find 'FlashInfer supports NVIDIA ...' arch "
+                "line in the agent guidance",
             )
         )
         return out
@@ -295,7 +306,7 @@ def check_supported_arch() -> list[Finding]:
                     check=SUPPORTED_ARCH,
                     location=f"flashinfer/utils.py (is_sm{cap}*_supported)",
                     message=f"SM{cap} has is_sm{cap}*_supported() predicate but is "
-                    f"not in AGENTS.md supported-arch list",
+                    f"not in the agent-guidance supported-arch list",
                 )
             )
     # Every major in supported_major_versions[] should be reflected by at least
@@ -308,7 +319,7 @@ def check_supported_arch() -> list[Finding]:
                     check=SUPPORTED_ARCH,
                     location="flashinfer/jit/* (supported_major_versions)",
                     message=f"Major SM{mj}x referenced in supported_major_versions=[] "
-                    f"but no SM{mj}? appears in AGENTS.md arch list",
+                    f"but no SM{mj}? appears in the agent-guidance arch list",
                 )
             )
     return out
@@ -435,9 +446,14 @@ def iter_markdown_paths(text: str) -> list[str]:
 
 
 def check_quickref_paths_exist() -> list[Finding]:
-    if not AGENTS_MD.exists():
-        return []
-    text = AGENTS_MD.read_text("utf-8", "replace")
+    out: list[Finding] = []
+    for doc, text in _agent_guidance_texts():
+        out.extend(_check_doc_paths_exist(doc, text))
+    return out
+
+
+def _check_doc_paths_exist(doc: Path, text: str) -> list[Finding]:
+    rel = str(doc.relative_to(FLASHINFER_ROOT))
     out: list[Finding] = []
     seen: set[str] = set()
     for path, line in iter_markdown_path_locations(text):
@@ -465,8 +481,8 @@ def check_quickref_paths_exist() -> list[Finding]:
         out.append(
             Finding(
                 check=QUICKREF_PATHS,
-                location=f"AGENTS.md:{line}",
-                file="AGENTS.md",
+                location=f"{rel}:{line}",
+                file=rel,
                 line=line,
                 message=f"Referenced path does not exist: `{path}`",
             )
