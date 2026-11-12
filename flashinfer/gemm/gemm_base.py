@@ -74,6 +74,7 @@ from .gemm_mm_fp4_cute_dsl import (
     precompile_mm_fp4_tactics,
 )
 from .gemm_mm_mxfp8_precompile import precompile_mm_mxfp8_tactics
+from .mxfp8_smallm_sm107 import dispatch_mm_mxfp8_specialized
 from .gemm_mm_mxfp8_cute_dsl import (
     _b12x_gemm_mxfp8_requirement,
     _b12x_gemm_mxfp8_runner,
@@ -8090,6 +8091,33 @@ def _cudnn_mm_mxfp8_runner():
     return CudnnMmMxfp8GemmRunner()
 
 
+# The CC list spans every arch mm_mxfp8 itself supports: the specialized
+# backend must stay selectable (explicitly and in auto resolution) everywhere,
+# because its dispatcher owns the exact device gate (CC 10.7) and serves
+# explicit "specialized" calls on other devices via the composable path. The
+# auto heuristic never returns "specialized", so the broad list adds no auto
+# candidate. The decorator also supplies is_compute_capability_supported,
+# which suitable_auto_backends calls on EVERY registered checker.
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
+def _specialized_mm_mxfp8_requirement(
+    a: torch.Tensor,  # unused
+    b: torch.Tensor,  # unused
+    a_descale: torch.Tensor,  # unused
+    b_descale: torch.Tensor,  # unused
+    out: Optional[torch.Tensor] = None,  # unused
+    out_dtype: torch.dtype = torch.bfloat16,  # unused
+    use_8x4_sf_layout: bool = True,  # unused
+    backend: str = "auto",  # unused
+    batch_invariant: bool = False,  # unused
+):
+    # The specialized backend is always selectable: a call its kernel cannot
+    # serve (shape off the allowlist, non-SM107 device, kill switch, JIT
+    # failure) takes the composable dequant + torch.mm path inside mm_mxfp8,
+    # never another fused backend. Input-representability errors (e.g. 8x4 or
+    # 2D scale layouts) are raised there with a precise message.
+    return True
+
+
 def _heuristic_func_mm_mxfp8(
     suitable_backends: List[str],
     a: torch.Tensor,
@@ -8125,8 +8153,24 @@ def _heuristic_func_mm_mxfp8(
     return []
 
 
+# Backends of mm_mxfp8, as plain strings. "specialized" is the agent-generated
+# SM107 small-M kernel (flashinfer/gemm/mxfp8_smallm_sm107.py); "auto" routes
+# to it only on its shape allowlist and otherwise runs the heuristic order.
+MM_MXFP8_BACKENDS = (
+    "auto",
+    "specialized",
+    "cutlass",
+    "cute-dsl",
+    "cutedsl_low_latency",
+    "trtllm",
+    "cudnn",
+    "b12x",
+)
+
+
 @backend_requirement(
     {
+        "specialized": _specialized_mm_mxfp8_requirement,
         "cutlass": _cutlass_gemm_mxfp8_requirement,
         "trtllm": _trtllm_gemm_mxfp8_requirement,
         "cute-dsl": _cute_dsl_gemm_mxfp8_requirement,
@@ -8148,7 +8192,14 @@ def mm_mxfp8(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = False,
     backend: Literal[
-        "cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn", "b12x", "auto"
+        "cutlass",
+        "cute-dsl",
+        "cutedsl_low_latency",
+        "trtllm",
+        "cudnn",
+        "b12x",
+        "specialized",
+        "auto",
     ] = "auto",
     *,
     batch_invariant: bool = False,
@@ -8190,7 +8241,7 @@ def mm_mxfp8(
     use_8x4_sf_layout: bool
         Whether the scale tensors for a are in 8x4 layout (vs 128x4).
 
-    backend: Literal["cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn", "b12x", "auto"]
+    backend: Literal["cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn", "b12x", "specialized", "auto"]
         The backend to use for the operation. Defaults to ``"auto"``.
         ``"auto"`` selects the CUTLASS backend when available and otherwise
         falls back to the cuDNN backend. On SM107, with CUTLASS available, the
@@ -8213,6 +8264,17 @@ def mm_mxfp8(
           ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``.
         - The ``"cudnn"`` backend consumes block scales in the F8_128x4 swizzled
           layout (``use_8x4_sf_layout=False``) and is supported on SM100/103/107/110/120/121.
+        - The ``"specialized"`` backend is an agent-generated SM107 small-M
+          kernel for decode-size shapes (bf16 out, 1D swizzled 128x4 scales).
+          ``"auto"`` routes to it only on its exact measured (M, N, K)
+          allowlist (``flashinfer/mm_mxfp8_specialized_sm107_workloads.json``),
+          ahead of the SM107 autotuner ranking, which keeps serving every
+          other shape. An explicitly selected backend is never silently
+          swapped: explicit ``backend="specialized"`` that cannot serve a call
+          (off-list shape, non-SM107 device, kill switch, JIT failure) takes
+          the composable dequant + ``torch.mm`` path, never another fused
+          backend. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at call
+          time) forces the composable/stock path.
 
     batch_invariant: bool
         ``True`` runs the batch-invariant MXFP8 GEMM class in place of the
@@ -8286,6 +8348,31 @@ def mm_mxfp8(
             device=a.device,
             dtype=out_dtype,
         )
+
+    # The "specialized" backend (agent-generated SM107 small-M kernel): "auto"
+    # routes to it only on its strict (M, N, K) allowlist of measured
+    # decode-size shapes, resolved by exact shape BEFORE the heuristic /
+    # autotuner candidate ranking below (which on SM107 ranks CUTLASS,
+    # CuTe-DSL and cuDNN and keeps serving every off-allowlist shape). An
+    # explicitly selected backend is never swapped, so only
+    # backend="specialized" or "auto" can reach it, and explicit "specialized"
+    # that cannot be served takes the composable path inside the dispatcher
+    # (True is then returned). FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 forces
+    # the composable/stock path. See flashinfer/gemm/mxfp8_smallm_sm107.py.
+    if backend in ("auto", "specialized"):
+        if dispatch_mm_mxfp8_specialized(
+            a,
+            b,
+            a_descale,
+            b_descale,
+            out,
+            out_dtype,
+            use_8x4_sf_layout,
+            explicit=backend == "specialized",
+        ):
+            return out
+        # Only backend="auto" reaches here (the dispatcher always serves
+        # explicit "specialized", on the kernel or the composable path).
 
     workspace_buffer = _get_stream_cache_buf(
         "mm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, a.device

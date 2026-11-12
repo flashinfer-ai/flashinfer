@@ -70,6 +70,14 @@ MXFP8 GEMM
     mm_mxfp8
     bmm_mxfp8
 
+``mm_mxfp8`` carries a ``"specialized"`` backend: an agent-generated SM107
+small-M kernel that ``backend="auto"`` selects only on its measured (M, N, K)
+allowlist (``flashinfer/mm_mxfp8_specialized_sm107_workloads.json``). An
+explicitly selected backend is never silently swapped; explicit
+``backend="specialized"`` that cannot serve a call takes the composable
+dequant + ``torch.mm`` path. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``
+(read at call time) forces the composable/stock path.
+
 MXFP8 x MXFP4 GEMM (MXFP4 weight, MXFP8 activation)
 ----------------------------------------------------
 
