@@ -2561,16 +2561,23 @@ def _blackwell_paged_auto_cudnn(
     kv_lens,
     seq_lens_q=None,
 ):
-    """Measured D128 domains; feature compatibility is checked by plan."""
+    """Measured D128 domains; use actual paired work when already on CPU."""
     prefix = 64 <= max_q <= 1024 and 2048 <= max_kv <= 32768 and max_kv >= 4 * max_q
     full = 1024 <= max_q <= 8192 and max_q == max_kv and seq_lens_q is None
-    if not (prefix or full):
+    bounded = 1 <= batch <= 4 and (prefix or full)
+    can_extend = (
+        seq_lens_q is None
+        and kv_lens is not None
+        and kv_lens.device.type == "cpu"
+        and qo_indptr_host.device.type == "cpu"
+    )
+    if not (bounded or can_extend):
         return False
     if not (
         layout == "HND"
         and q_dtype == kv_dtype == o_dtype == torch.bfloat16
         and head_dim_qk == head_dim_vo == 128
-        and 1 <= batch <= 4
+        and batch > 0
         and 8 <= hq <= 64
         and hk > 0
         and hq % hk == 0
@@ -2589,26 +2596,50 @@ def _blackwell_paged_auto_cudnn(
         return prefix
     q_bounds = qo_indptr_host.tolist()
     lengths = kv_lens.flatten().tolist()
-    if full:
-        # Maxima alone cannot distinguish full from mixed-prefix batches.
-        # Reuse CPU metadata; never stage lengths back just for dispatch.
-        q_lengths = [
-            end - start for start, end in zip(q_bounds, q_bounds[1:], strict=False)
-        ]
-        if not (
+    q_lengths = [
+        end - start for start, end in zip(q_bounds, q_bounds[1:], strict=False)
+    ]
+    work = hq * sum(
+        q_len * kv_len for q_len, kv_len in zip(q_lengths, lengths, strict=False)
+    )
+    if bounded:
+        # Keep every previously admitted shape, including short-Q prefixes and
+        # the original 8 Mi work floor. Wider domains must only add admission.
+        bounded_full = full and (
             len(q_lengths) == len(lengths) == batch
             and max(q_lengths) >= 1024
             and all(
                 q_len == kv_len and q_len > 0
                 for q_len, kv_len in zip(q_lengths, lengths, strict=True)
             )
-        ):
-            return False
-    work = hq * sum(
-        (end - start) * length
-        for start, end, length in zip(q_bounds, q_bounds[1:], lengths, strict=False)
+        )
+        if (prefix or bounded_full) and work >= 8 * 1024 * 1024:
+            return True
+    if not can_extend:
+        return False
+    if not (
+        len(q_lengths) == len(lengths) == batch
+        and q_bounds[0] == 0
+        and q_bounds[-1] == total_q
+        and max(q_lengths) <= max_q
+        and max(lengths) <= max_kv
+        and all(
+            0 < q_len <= kv_len
+            for q_len, kv_len in zip(q_lengths, lengths, strict=True)
+        )
+        and work >= 16 * 1024 * 1024
+    ):
+        return False
+    actual_max_q, actual_max_kv = max(q_lengths), max(lengths)
+    if all(q_len == kv_len for q_len, kv_len in zip(q_lengths, lengths, strict=True)):
+        return 1024 <= actual_max_q <= 16384
+    # Mixed batches with short requests need separate qualification even when
+    # a longer request inflates the graph declaration and aggregate work.
+    return (
+        all(q_len > 128 for q_len in q_lengths)
+        and actual_max_q <= 8192
+        and 2048 <= actual_max_kv <= 32768
     )
-    return work >= 8 * 1024 * 1024
 
 
 # Ragged-prefill `auto` on Blackwell: tried in this order, first eligible wins.
