@@ -94,6 +94,7 @@ def fixture(
     input_scale=1.0,
     with_sink=True,
     keep_decoded=True,
+    inline=True,
 ):
     from flashinfer.mla import (
         SparseMLASm120Wrapper,
@@ -149,7 +150,7 @@ def fixture(
                     footer
                 )
             # The same packer emits FlashMLA/vLLM's inline record ABI.
-            cache = pack(kv.squeeze(2), kv_layout="NHD", inline_scale=True)
+            cache = pack(kv.squeeze(2), kv_layout="NHD", inline_scale=inline)
         else:
             cache = quantize_kv_dsv4(kv)
             if keep_decoded:
@@ -177,7 +178,7 @@ def fixture(
     if cache_format in ("v41_fp8", "v41_mixed"):
         wrapper = SparseMLASm120Wrapper(
             backend="sparse",
-            kv_scale_format="ue8m0_g32_inline",
+            kv_scale_format="ue8m0_g32_inline" if inline else "ue8m0_g32",
             compute_precision="fp8",
             extra_kv_fp4=cache_format == "v41_mixed",
         )
@@ -226,6 +227,7 @@ def prefill_fixture(
     history_tokens=0,
     with_sink=True,
     keep_decoded=True,
+    inline=True,
 ):
     """Interleaved query CP with the full gathered KV pool on each device.
 
@@ -245,6 +247,7 @@ def prefill_fixture(
         pool_tokens=requests * primary_slots,
         extra_pool_tokens=requests * extra_slots,
         keep_decoded=keep_decoded,
+        inline=inline,
         with_sink=with_sink,
     )
     generator = torch.Generator().manual_seed(43)

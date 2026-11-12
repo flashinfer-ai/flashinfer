@@ -695,13 +695,14 @@ def test_cake_rejects_inline_formats(sm12x):
         )
 
 
+@pytest.mark.parametrize("inline", [False, True])
 @pytest.mark.parametrize("topk", [0, 1, 64, 65, 128, 512])
-def test_inline_prefill_matches_reference(topk, sm12x):
+def test_inline_prefill_matches_reference(topk, inline, sm12x):
     """Cover a short pipeline, partial tiles, and ring reuse against FP64."""
     from tests.attention.sparse_mla_test_utils import dequantize_kv_dsv4_1
 
     footer, _ = _caches("none", 32, 64, seed=128)
-    cache = _inline_view(footer, _FP8, 32)
+    cache = _inline_view(footer, _FP8, 32) if inline else footer
     torch.manual_seed(135)
     q = torch.randn(128, 32, 512, device="cuda", dtype=torch.bfloat16) / 10
     width = max(64, (topk + 63) // 64 * 64)
@@ -712,7 +713,8 @@ def test_inline_prefill_matches_reference(topk, sm12x):
     scores = q.double() @ selected.transpose(1, 2) * 512**-0.5
     reference = torch.softmax(scores, dim=-1) @ selected
     wrapper = flashinfer.mla.SparseMLASm120Wrapper(
-        kv_scale_format="ue8m0_g32_inline", compute_precision="fp8"
+        kv_scale_format="ue8m0_g32_inline" if inline else "ue8m0_g32",
+        compute_precision="fp8",
     )
     out = torch.empty_like(q)
     lse = wrapper.run(

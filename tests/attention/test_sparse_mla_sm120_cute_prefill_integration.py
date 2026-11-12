@@ -6,9 +6,10 @@ import torch
 from tests.attention.sparse_mla_prefill_utils import prefill_fixture, numerical_metrics
 
 
+@pytest.mark.parametrize("inline", [False, True])
 @pytest.mark.parametrize("heads", [8, 16, 32, 64])
 @pytest.mark.parametrize("rank", [0, 3])
-def test_public_prefill_specializations(heads, rank):
+def test_public_prefill_specializations(heads, rank, inline):
     f = prefill_fixture(
         2,
         "v41_fp8",
@@ -18,6 +19,7 @@ def test_public_prefill_specializations(heads, rank):
         prefill_cp_rank=rank,
         history_tokens=128,
         with_sink=heads != 8,
+        inline=inline,
     )
 
     def mega():
@@ -130,3 +132,99 @@ def test_pitched_inline_rows_and_lse_stride():
     assert (storage[:, 16:] == 1234.0).all()
     for padded in backing:
         assert (padded[..., 528:] == 0xA5).all()
+
+
+@pytest.mark.parametrize("tokens", [1, 4, 16, 32, 64])
+@pytest.mark.parametrize("inline", [False, True])
+def test_explicit_small_query_prefill(tokens, inline):
+    """Small Q is legal for prefill even when auto dispatch prefers decode."""
+    from tests.attention.sparse_mla_prefill_utils import fixture, rope, epilogue
+    from flashinfer.mla._sparse_mla_sm120._execution import (
+        get_sparse_mla_sm120_module,
+        resolve_attention,
+        resolve_model_type,
+    )
+
+    f = fixture(tokens, 32, "v41_fp8", inline=inline, extra_page_size=2)
+    q, caches, ids = f["q"], f["caches"], f["indices"]
+    if not inline:
+        # Preserve footer packing while leaving sentinel bytes between pages.
+        for i, cache in enumerate(caches):
+            flat = cache.reshape(cache.shape[0], -1)
+            storage = torch.full(
+                (flat.shape[0], flat.shape[1] + 16),
+                0xA5,
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            view = storage[:, : flat.shape[1]].view_as(cache)
+            view.copy_(cache)
+            caches[i] = view
+    props = torch.cuda.get_device_properties(q.device)
+    lse = torch.empty(q.shape[:2], device=q.device, dtype=torch.float32)
+    plan = resolve_attention(
+        model=resolve_model_type(512, "ue8m0_g32_inline" if inline else "ue8m0_g32"),
+        tokens=tokens,
+        heads=32,
+        topk=128,
+        extra_topk=512,
+        page_size=64,
+        extra_page_size=2,
+        page_stride_bytes=caches[0].stride(0),
+        extra_page_stride_bytes=caches[1].stride(0),
+        row_stride_bytes=528,
+        extra_row_stride_bytes=528,
+        indices_stride=128,
+        extra_indices_stride=512,
+        lse_stride=32,
+        has_lengths=True,
+        has_extra_lengths=True,
+        has_sink=True,
+        extra_fp4=False,
+        variant=1,
+        precision="fp8",
+        cpb=0,
+        sm_count=props.multi_processor_count,
+        max_shared_bytes=props.shared_memory_per_block_optin,
+    )
+    module = get_sparse_mla_sm120_module()
+
+    def args(query):
+        return (
+            plan,
+            query,
+            caches[0],
+            ids[0],
+            f["context"],
+            lse,
+            f["context"],
+            lse,
+            512**-0.5,
+            f["lengths"][0],
+            f["sink"],
+            caches[1],
+            ids[1],
+            f["lengths"][1],
+            0.6931471805599453,
+        )
+
+    def mega():
+        module.execute_attention_rope_fp8(
+            *args(q), f["positions"], f["cs"], f["out"].view(torch.uint8), f["scales"]
+        )
+
+    mega()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mega()
+    graph.replay()
+    metrics = numerical_metrics(f, lse, torch.arange(tokens, device="cuda"))
+    assert metrics["relative_l2"] < 0.07, metrics
+    assert metrics["lse_max_abs"] < 0.06, metrics
+    expected = f["out"].float().clone(), f["scales"].clone(), lse.clone()
+    rope(q, f["positions"], f["cs"], f["rotated"])
+    module.execute_attention(*args(f["rotated"]))
+    epilogue(f["context"], f["positions"], f["cs"], f["out"], f["scales"])
+    torch.testing.assert_close(lse, expected[2], rtol=1e-6, atol=2e-6)
+    assert (f["out"].float() != expected[0]).float().mean().item() < 0.001
+    torch.testing.assert_close(f["scales"], expected[1], rtol=0, atol=0)

@@ -3,6 +3,7 @@
 #pragma once
 #include <cute/atom/copy_traits_sm75.hpp>
 #include <cutlass/pipeline/sm90_pipeline.hpp>
+#include <flashinfer/fastdiv.cuh>
 
 #include "common.cuh"
 namespace flashinfer::sparse_mla_sm120::cute_prefill::integrated {
@@ -22,7 +23,27 @@ struct Params : cute_prefill::Params {
   bf16* bf16_output;
   size_t lse_stride;
   float lse_scale;
+  size_t page_stride, extra_page_stride;
+  int page_size, extra_page_size;
+  flashinfer::uint_fastdiv page_div, extra_page_div;
 };
+
+// Footer pages store all payload rows followed by all 16-byte scale rows.
+// Inline rows keep their original flat addressing specialization.
+template <bool Inline, bool Scale>
+__device__ __forceinline__ const uint8_t* cache_row(const Params& p, bool extra, int id) {
+  const uint8_t* cache = extra ? p.extra_kv : p.kv;
+  if constexpr (Inline) {
+    return cache + size_t(max(id, 0)) * (extra ? p.extra_stride : p.kv_stride) + (Scale ? 512 : 0);
+  } else {
+    uint32_t page, row;
+    (extra ? p.extra_page_div : p.page_div).divmod(uint32_t(max(id, 0)), page, row);
+    const size_t page_stride = extra ? p.extra_page_stride : p.page_stride;
+    const int page_size = extra ? p.extra_page_size : p.page_size;
+    return cache + size_t(page) * page_stride +
+           (Scale ? size_t(page_size) * 512 + row * 16 : row * 512);
+  }
+}
 enum class Role { load_k, load_v, mma_qk, mma_pv };
 using Pipeline = cutlass::PipelineAsync<3>;
 struct alignas(128) Shared {
@@ -51,7 +72,7 @@ using MicroTransposed =
 // quantization-group size alone does not determine FP32 reduction order.
 // Host validation accepts H=8/16/32/64. FullHeadTiles is selected for H%32==0;
 // the remaining cases contain only whole eight-head PV warps.
-template <bool Mega, int PQuantGroup = 32, bool FullHeadTiles = false>
+template <bool Mega, int PQuantGroup = 32, bool FullHeadTiles = false, bool Inline = true>
 __global__ __launch_bounds__(384, 1) void prefill(Params p) {
   static_assert(PQuantGroup == 32 || PQuantGroup == 64);
   extern __shared__ __align__(128) unsigned char raw[];
@@ -109,8 +130,6 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       const int length = extra ? extra_len : main_len;
       const int width = extra ? p.extra_topk : p.topk;
       const int* ids = (extra ? p.extra_indices : p.indices) + size_t(token) * width;
-      const uint8_t* cache = extra ? p.extra_kv : p.kv;
-      const int stride = extra ? p.extra_stride : p.kv_stride;
       // Cache all 64 sparse row IDs per loader warp, reused across feature slices.
       const int id_lo = tile_start + lane < length ? ids[tile_start + lane] : -1;
       const int id_hi = tile_start + lane + 32 < length ? ids[tile_start + lane + 32] : -1;
@@ -124,7 +143,7 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
           int id = warp ? id_hi : id_lo;
           uint8_t* dst = sm.k_sf[tile & 1] + loader_tid * 16;
           uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-          const uint8_t* src = cache + size_t(max(id, 0)) * stride + 512;
+          const uint8_t* src = cache_row<Inline, true>(p, extra, id);
           asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(address), "l"(src),
                        "r"(id >= 0 ? 16 : 0)
                        : "memory");
@@ -137,7 +156,7 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
           int id = __shfl_sync(0xffffffff, n < 32 ? id_lo : id_hi, n % 32);
           uint32_t address =
               static_cast<uint32_t>(__cvta_generic_to_shared(dst + MicroLayout{}(n, d)));
-          const uint8_t* src = cache + size_t(max(id, 0)) * stride + feature_base + d;
+          const uint8_t* src = cache_row<Inline, false>(p, extra, id) + feature_base + d;
           asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(address), "l"(src),
                        "r"(id >= 0 ? 16 : 0)
                        : "memory");
@@ -166,8 +185,6 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       const int length = extra ? extra_len : main_len;
       const int width = extra ? p.extra_topk : p.topk;
       const int* ids = (extra ? p.extra_indices : p.indices) + size_t(token) * width;
-      const uint8_t* cache = extra ? p.extra_kv : p.kv;
-      const int stride = extra ? p.extra_stride : p.kv_stride;
       // Cache all 64 sparse row IDs per loader warp, reused across feature slices.
       const int id_lo = tile_start + lane < length ? ids[tile_start + lane] : -1;
       const int id_hi = tile_start + lane + 32 < length ? ids[tile_start + lane + 32] : -1;
@@ -181,7 +198,7 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
           int id = (warp % 2) ? id_hi : id_lo;
           uint8_t* dst = sm.v_sf[tile & 1] + loader_tid * 16;
           uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-          const uint8_t* src = cache + size_t(max(id, 0)) * stride + 512;
+          const uint8_t* src = cache_row<Inline, true>(p, extra, id);
           asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(address), "l"(src),
                        "r"(id >= 0 ? 16 : 0)
                        : "memory");
@@ -194,7 +211,7 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
           int id = __shfl_sync(0xffffffff, n < 32 ? id_lo : id_hi, n % 32);
           uint32_t address =
               static_cast<uint32_t>(__cvta_generic_to_shared(dst + MicroLayout{}(n, d)));
-          const uint8_t* src = cache + size_t(max(id, 0)) * stride + feature_base + d;
+          const uint8_t* src = cache_row<Inline, false>(p, extra, id) + feature_base + d;
           asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(address), "l"(src),
                        "r"(id >= 0 ? 16 : 0)
                        : "memory");
