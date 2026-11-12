@@ -2120,9 +2120,9 @@ kernel_cake_dsv4_nvfp4_h128_prefill_sm103a(const __grid_constant__ CUtensorMap t
                     float inv_sum = ((total_sum > 0.0f) ? _rcp_5 : 0.0f);
                     int head_idx = my_row_1;
                     head_idx = bid % 2 * 64 + my_row_1;
-                    int direct_o_offset = (mapped_query_idx_3 * num_heads + head_idx) * 512 + v_chunk * 256;
-                    int partial_o_offset = (mapped_query_idx_3 * num_heads + head_idx + split_idx_2) * 512 + n_half_1 * 256;
-                    int o_offset = partial_o_offset;
+                    long long direct_o_offset = ((long long)mapped_query_idx_3 * (long long)num_heads + (long long)head_idx) * 512ll + (long long)(v_chunk * 256);
+                    long long partial_o_offset = ((long long)mapped_query_idx_3 * (long long)num_heads + (long long)(head_idx + split_idx_2)) * 512ll + (long long)(n_half_1 * 256);
+                    long long o_offset = partial_o_offset;
                     if (n_half_1 == 0 && head_idx < num_heads) {
                         float _log2_6;
                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_6) : "f"(total_sum));

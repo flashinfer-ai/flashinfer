@@ -1110,6 +1110,7 @@ kernel_cake_dsv4_nvfp4_h64_tmem_v_early_gather_prefill(const __grid_constant__ C
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float total_sum = smem_sum[co_thread] + smem_sum[co_thread ^ 64];
                     float final_max = smem_fmax[co_thread];
+                    float ep_lsm = smem_sum[lane] + smem_sum[lane + 64];
                     mbarrier_arrive(sum_empty_addr);
                     if (co_half == 0 && co_head < num_heads) {
                         float _log2_6;
@@ -1119,7 +1120,6 @@ kernel_cake_dsv4_nvfp4_h64_tmem_v_early_gather_prefill(const __grid_constant__ C
                     int ep_c = lane & 3;
                     int ep_a = lane >> 2;
                     int ep_odd = ep_a & 1;
-                    float ep_lsm = smem_sum[lane] + smem_sum[lane + 64];
                     float _rcp_7 = approx_rcp(ep_lsm);
                     float ep_lf = ((ep_lsm > 0.0f) ? _rcp_7 : 0.0f) * output_scale;
                     float ep_f[16];
@@ -1239,35 +1239,35 @@ kernel_cake_dsv4_nvfp4_h64_tmem_v_early_gather_prefill(const __grid_constant__ C
                         }
                         int ep_head_0 = 2 * ep_c;
                         if (ep_head_0 < num_heads) {
-                            *(reinterpret_cast<unsigned int*>(O + ((co_query * num_heads + ep_head_0) * 512 + ep_dim)) + (0)) = ep_pack[0];
+                            *(reinterpret_cast<unsigned int*>(O + (((long long)co_query * (long long)num_heads + (long long)ep_head_0) * 512ll + (long long)ep_dim)) + (0)) = ep_pack[0];
                         }
                         int ep_head_1 = 2 * ep_c + 1;
                         if (ep_head_1 < num_heads) {
-                            *(reinterpret_cast<unsigned int*>(O + ((co_query * num_heads + ep_head_1) * 512 + ep_dim)) + (0)) = ep_pack[1];
+                            *(reinterpret_cast<unsigned int*>(O + (((long long)co_query * (long long)num_heads + (long long)ep_head_1) * 512ll + (long long)ep_dim)) + (0)) = ep_pack[1];
                         }
                         int ep_head_2 = 8 + 2 * ep_c;
                         if (ep_head_2 < num_heads) {
-                            *(reinterpret_cast<unsigned int*>(O + ((co_query * num_heads + ep_head_2) * 512 + ep_dim)) + (0)) = ep_pack[2];
+                            *(reinterpret_cast<unsigned int*>(O + (((long long)co_query * (long long)num_heads + (long long)ep_head_2) * 512ll + (long long)ep_dim)) + (0)) = ep_pack[2];
                         }
                         int ep_head_3 = 8 + 2 * ep_c + 1;
                         if (ep_head_3 < num_heads) {
-                            *(reinterpret_cast<unsigned int*>(O + ((co_query * num_heads + ep_head_3) * 512 + ep_dim)) + (0)) = ep_pack[3];
+                            *(reinterpret_cast<unsigned int*>(O + (((long long)co_query * (long long)num_heads + (long long)ep_head_3) * 512ll + (long long)ep_dim)) + (0)) = ep_pack[3];
                         }
                         int ep_head_4 = 16 + 2 * ep_c;
                         if (ep_head_4 < num_heads) {
-                            *(reinterpret_cast<unsigned int*>(O + ((co_query * num_heads + ep_head_4) * 512 + ep_dim)) + (0)) = ep_pack[4];
+                            *(reinterpret_cast<unsigned int*>(O + (((long long)co_query * (long long)num_heads + (long long)ep_head_4) * 512ll + (long long)ep_dim)) + (0)) = ep_pack[4];
                         }
                         int ep_head_5 = 16 + 2 * ep_c + 1;
                         if (ep_head_5 < num_heads) {
-                            *(reinterpret_cast<unsigned int*>(O + ((co_query * num_heads + ep_head_5) * 512 + ep_dim)) + (0)) = ep_pack[5];
+                            *(reinterpret_cast<unsigned int*>(O + (((long long)co_query * (long long)num_heads + (long long)ep_head_5) * 512ll + (long long)ep_dim)) + (0)) = ep_pack[5];
                         }
                         int ep_head_6 = 24 + 2 * ep_c;
                         if (ep_head_6 < num_heads) {
-                            *(reinterpret_cast<unsigned int*>(O + ((co_query * num_heads + ep_head_6) * 512 + ep_dim)) + (0)) = ep_pack[6];
+                            *(reinterpret_cast<unsigned int*>(O + (((long long)co_query * (long long)num_heads + (long long)ep_head_6) * 512ll + (long long)ep_dim)) + (0)) = ep_pack[6];
                         }
                         int ep_head_7 = 24 + 2 * ep_c + 1;
                         if (ep_head_7 < num_heads) {
-                            *(reinterpret_cast<unsigned int*>(O + ((co_query * num_heads + ep_head_7) * 512 + ep_dim)) + (0)) = ep_pack[7];
+                            *(reinterpret_cast<unsigned int*>(O + (((long long)co_query * (long long)num_heads + (long long)ep_head_7) * 512ll + (long long)ep_dim)) + (0)) = ep_pack[7];
                         }
                         if (ph == 3) {
                             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
