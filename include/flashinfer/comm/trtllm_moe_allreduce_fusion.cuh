@@ -26,6 +26,8 @@ namespace details {
 static constexpr int CVT_FP4_ELTS_PER_THREAD = 8;
 static constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 static constexpr int kBytesPerAccess = 16;
+// The Lamport clear-size slot counts 16-bit units (see LamportComm); one store clears this many.
+static constexpr int kClearUnitsPerAccess = kBytesPerAccess / 2;
 static constexpr int kOneShotMaxToken = 128;
 static constexpr int kBarrierFlagCount = 256;
 
@@ -719,9 +721,11 @@ struct LamportComm {
   __device__ __forceinline__ LamportComm(void** workspace, int rank) {
     counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
     flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
-    // Bytes the previous Lamport kernel wrote to its sub-buffer. Every Lamport kernel on this
-    // workspace reads and writes it, whatever its dtype, so it stays in bytes; readers round it
-    // up to whole 16-byte stores.
+    // Size of the previous Lamport kernel's write to its sub-buffer, in 16-bit units. Every
+    // Lamport kernel on this workspace reads and writes it whatever its dtype, including the
+    // cake kernels (csrc/cake_trtllm_moe_allreduce_union, csrc/cake_moe_finalize_allreduce_fusion),
+    // which count bf16 / fp16 elements, so the unit is fixed at 2 bytes; readers round it up to
+    // whole 16-byte stores.
     clear_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[4];
     flag_value = *flag_ptr;
     int comm_size = reinterpret_cast<int*>(workspace[NRanks * 3])[3];
@@ -981,8 +985,8 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
 
   cudaGridDependencySynchronize();
   LamportComm<NRanks> comm(params.workspace, params.rank);
-  int clear_access =
-      static_cast<int>((comm.clear_size + details::kBytesPerAccess - 1) / details::kBytesPerAccess);
+  int clear_access = static_cast<int>((comm.clear_size + details::kClearUnitsPerAccess - 1) /
+                                      details::kClearUnitsPerAccess);
 
   // * MoE related
   int threadid_in_cluster = cluster.thread_rank();
@@ -1084,7 +1088,7 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
     fused_op<AllReduceOut, ResidualOut, NormOut, QuantOut, T, VEC_SIZE>(sum_val, idx, tidx,
                                                                         access_id_in_token, params);
   }
-  comm.update(params.size * NRanks * static_cast<int>(sizeof(T)));
+  comm.update(params.size * NRanks * static_cast<int>(sizeof(T)) / 2);
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
@@ -1286,8 +1290,8 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
 
   cudaGridDependencySynchronize();
   LamportComm<NRanks> comm(params.workspace, params.rank);
-  int clear_access =
-      static_cast<int>((comm.clear_size + details::kBytesPerAccess - 1) / details::kBytesPerAccess);
+  int clear_access = static_cast<int>((comm.clear_size + details::kClearUnitsPerAccess - 1) /
+                                      details::kClearUnitsPerAccess);
 
   // * MoE related
   int threadid_in_cluster = cluster.thread_rank();
@@ -1399,7 +1403,7 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
     fused_op<false, ResidualOut, NormOut, QuantOut, T, VEC_SIZE>(sum_val, idx, tidx,
                                                                  access_id_in_token, params);
   }
-  comm.update(params.size * NRanks * static_cast<int>(sizeof(T)));
+  comm.update(params.size * NRanks * static_cast<int>(sizeof(T)) / 2);
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
