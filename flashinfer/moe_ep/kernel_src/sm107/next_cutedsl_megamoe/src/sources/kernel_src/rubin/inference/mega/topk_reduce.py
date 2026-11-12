@@ -196,8 +196,8 @@ class TopkReduce:
         topk_indices: Optional[cute.Tensor] = None,
     ):
         if cutlass.const_expr(topk_indices is not None):
-            if cutlass.const_expr(self.num_experts is None or self.combine_format.is_quantized):
-                raise ValueError("Masked combine requires BF16 storage and a static expert count.")
+            if cutlass.const_expr(self.num_experts is None):
+                raise ValueError("Masked combine requires a static expert count.")
         threads = self._threads
         total_workers = reduced_output.shape[0] * self.hidden_tiles
         grid = [(total_workers + threads - 1) // threads, 1, 1]
@@ -241,11 +241,11 @@ class TopkReduce:
             )
 
         if cutlass.const_expr(self.combine_format.act_dtype is cutlass.Float8E4M3FN):
-            self._reduce_mxfp8(combine_quant, sf, topk_score, reduced_output).launch(
+            self._reduce_mxfp8(combine_quant, sf, topk_score, reduced_output, topk_indices).launch(
                 grid=grid, block=block, stream=stream
             )
         else:
-            self._reduce_fp4(combine_quant, sf, topk_score, reduced_output).launch(
+            self._reduce_fp4(combine_quant, sf, topk_score, reduced_output, topk_indices).launch(
                 grid=grid, block=block, stream=stream
             )
 
@@ -336,13 +336,14 @@ class TopkReduce:
         combine_sf: cute.Tensor,  # depth-2 broadcast view: logical (token, topk, hidden) e8m0
         topk_score: Optional[cute.Tensor],
         reduced_output: cute.Tensor,
+        topk_indices: Optional[cute.Tensor] = None,
     ):
         threads = self._threads
         hidden_per_thread = self.hidden_per_thread
         hidden_tiles = self.hidden_tiles
         num_topk: cutlass.Constexpr[int] = self.num_topk
         needs_guard = self.require_predicate
-        prefetch = self.prefetch
+        prefetch = self.prefetch and topk_indices is None
         out_dtype = reduced_output.element_type
 
         worker_idx = cute.arch.block_idx()[0] * Int32(threads) + cute.arch.thread_idx()[0]
@@ -377,32 +378,39 @@ class TopkReduce:
             fp8_dtype = self.combine_format.act_dtype
             load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), fp8_dtype, num_bits_per_copy=128)
             acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+            acc.fill(0)
 
             for k in cutlass.range_constexpr(0, num_topk, 1):
-                term = cute.make_rmem_tensor((hidden_per_thread,), fp8_dtype)
-                cute.copy(load_atom, mark_alignment(codes[k, None], hidden_per_thread * fp8_dtype.width // 8), term)
-                value = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
-                value.store(term.load().to(cutlass.Float32))
+                valid_route = True
+                if cutlass.const_expr(topk_indices is not None):
+                    expert = topk_indices[token_idx, Int32(k)]
+                    valid_route = (expert >= 0) & (expert < self.num_experts)
+                # Masked slots may contain stale payloads, scales and NaN scores.
+                if valid_route:
+                    term = cute.make_rmem_tensor((hidden_per_thread,), fp8_dtype)
+                    cute.copy(load_atom, mark_alignment(codes[k, None], hidden_per_thread * fp8_dtype.width // 8), term)
+                    value = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+                    value.store(term.load().to(cutlass.Float32))
 
-                if cutlass.const_expr(not prefetch):
-                    scale_reg[k] = sf[k, 0]
-                    if cutlass.const_expr(topk_score is not None):
-                        score_reg[k] = topk_score[token_idx, Int32(k)]
-
-                scale = Float32(scale_reg[k])  # e8m0 -> f32
-                scale_pair = (scale, scale)
-                score_pair = (Float32(score_reg[k]), Float32(score_reg[k]))
-
-                for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
-                    dequant_pair = cute.arch.mul_packed_f32x2((value[i], value[i + 1]), scale_pair)
-                    if cutlass.const_expr(k != 0):
-                        acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(dequant_pair, score_pair, (acc[i], acc[i + 1]))
-                    else:
+                    if cutlass.const_expr(not prefetch):
+                        scale_reg[k] = sf[k, 0]
                         if cutlass.const_expr(topk_score is not None):
-                            acc[i], acc[i + 1] = cute.arch.mul_packed_f32x2(dequant_pair, score_pair)
+                            score_reg[k] = topk_score[token_idx, Int32(k)]
+
+                    scale = Float32(scale_reg[k])  # e8m0 -> f32
+                    scale_pair = (scale, scale)
+                    score_pair = (Float32(score_reg[k]), Float32(score_reg[k]))
+
+                    for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                        dequant_pair = cute.arch.mul_packed_f32x2((value[i], value[i + 1]), scale_pair)
+                        if cutlass.const_expr(k != 0):
+                            acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(dequant_pair, score_pair, (acc[i], acc[i + 1]))
                         else:
-                            acc[i] = dequant_pair[0]
-                            acc[i + 1] = dequant_pair[1]
+                            if cutlass.const_expr(topk_score is not None):
+                                acc[i], acc[i + 1] = cute.arch.mul_packed_f32x2(dequant_pair, score_pair)
+                            else:
+                                acc[i] = dequant_pair[0]
+                                acc[i + 1] = dequant_pair[1]
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))
@@ -419,13 +427,14 @@ class TopkReduce:
         combine_sf: cute.Tensor,  # depth-2 broadcast view: logical (token, topk, hidden) bf16 amax
         topk_score: Optional[cute.Tensor],
         reduced_output: cute.Tensor,
+        topk_indices: Optional[cute.Tensor] = None,
     ):
         threads = self._threads
         hidden_per_thread = self.hidden_per_thread
         hidden_tiles = self.hidden_tiles
         num_topk: cutlass.Constexpr[int] = self.num_topk
         needs_guard = self.require_predicate
-        prefetch = self.prefetch
+        prefetch = self.prefetch and topk_indices is None
         out_dtype = reduced_output.element_type
 
         worker_idx = cute.arch.block_idx()[0] * Int32(threads) + cute.arch.thread_idx()[0]
@@ -459,41 +468,48 @@ class TopkReduce:
 
             load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float4E2M1FN, num_bits_per_copy=64)
             acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+            acc.fill(0)
 
             for k in cutlass.range_constexpr(0, num_topk, 1):
-                term = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float4E2M1FN)
-                cute.copy(
-                    load_atom, mark_alignment(codes[k, None], hidden_per_thread * cutlass.Float4E2M1FN.width // 8), term
-                )
-                value = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
-                # Dev-only knob (MEGA_F4CVT_USE_MANUAL): manual LUT/PRMT decode vs
-                # the HW cvt path, so both SASS forms can be compared on device;
-                # one is kept once chosen. Read inline on purpose -- never a
-                # customer-facing option. Both decoders are bit-exact.
-                if cutlass.const_expr(os.environ.get("MEGA_F4CVT_USE_MANUAL", "0") == "1"):
-                    cvt_e2m1_to_fp32_optimal_ptx(term, value)
-                else:
-                    cvt_e2m1_to_fp32_cvt_ptx(term, value)
-
-                if cutlass.const_expr(not prefetch):
-                    scale_reg[k] = sf[k, 0]
-                    if cutlass.const_expr(topk_score is not None):
-                        score_reg[k] = topk_score[token_idx, Int32(k)]
-
-                # amax (bf16) -> per-element scale; (1/6) folds the fp4 grid max.
-                scale = Float32(scale_reg[k]) * Float32(Nvfp4E2M1RcpLimit)
-                scale_pair = (scale, scale)
-                score_pair = (Float32(score_reg[k]), Float32(score_reg[k]))
-
-                for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
-                    dequant_pair = cute.arch.mul_packed_f32x2((value[i], value[i + 1]), scale_pair)
-                    if cutlass.const_expr(k != 0):
-                        acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(dequant_pair, score_pair, (acc[i], acc[i + 1]))
-                    elif cutlass.const_expr(topk_score is not None):
-                        acc[i], acc[i + 1] = cute.arch.mul_packed_f32x2(dequant_pair, score_pair)
+                valid_route = True
+                if cutlass.const_expr(topk_indices is not None):
+                    expert = topk_indices[token_idx, Int32(k)]
+                    valid_route = (expert >= 0) & (expert < self.num_experts)
+                # Masked slots may contain stale payloads, scales and NaN scores.
+                if valid_route:
+                    term = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float4E2M1FN)
+                    cute.copy(
+                        load_atom, mark_alignment(codes[k, None], hidden_per_thread * cutlass.Float4E2M1FN.width // 8), term
+                    )
+                    value = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+                    # Dev-only knob (MEGA_F4CVT_USE_MANUAL): manual LUT/PRMT decode vs
+                    # the HW cvt path, so both SASS forms can be compared on device;
+                    # one is kept once chosen. Read inline on purpose -- never a
+                    # customer-facing option. Both decoders are bit-exact.
+                    if cutlass.const_expr(os.environ.get("MEGA_F4CVT_USE_MANUAL", "0") == "1"):
+                        cvt_e2m1_to_fp32_optimal_ptx(term, value)
                     else:
-                        acc[i] = dequant_pair[0]
-                        acc[i + 1] = dequant_pair[1]
+                        cvt_e2m1_to_fp32_cvt_ptx(term, value)
+
+                    if cutlass.const_expr(not prefetch):
+                        scale_reg[k] = sf[k, 0]
+                        if cutlass.const_expr(topk_score is not None):
+                            score_reg[k] = topk_score[token_idx, Int32(k)]
+
+                    # amax (bf16) -> per-element scale; (1/6) folds the fp4 grid max.
+                    scale = Float32(scale_reg[k]) * Float32(Nvfp4E2M1RcpLimit)
+                    scale_pair = (scale, scale)
+                    score_pair = (Float32(score_reg[k]), Float32(score_reg[k]))
+
+                    for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                        dequant_pair = cute.arch.mul_packed_f32x2((value[i], value[i + 1]), scale_pair)
+                        if cutlass.const_expr(k != 0):
+                            acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(dequant_pair, score_pair, (acc[i], acc[i + 1]))
+                        elif cutlass.const_expr(topk_score is not None):
+                            acc[i], acc[i + 1] = cute.arch.mul_packed_f32x2(dequant_pair, score_pair)
+                        else:
+                            acc[i] = dequant_pair[0]
+                            acc[i + 1] = dequant_pair[1]
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))

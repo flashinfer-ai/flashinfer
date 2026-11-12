@@ -38,8 +38,10 @@ from typing import Any, Callable
 
 MAX_ROWS_QUANTUM = 128
 # The kernel's ``active_rows`` scalar packs this call's rows (low 16 bits) and the largest
-# per-rank row count of the call (high 16 bits): a host ABI limit on the row capacity.
-ACTIVE_ROWS_FIELD_MAX = 0xFFFF
+# per-rank row count of the call (high bits).  It is a signed 32-bit kernel argument whose
+# high half the kernel decodes with an arithmetic shift, so the row count must fit in 15 bits:
+# a host ABI limit on the row capacity.
+ACTIVE_ROWS_FIELD_MAX = 0x7FFF
 # Supported region: the parameter domain the generator traced and verified (bucket discovery
 # and compile grid).  The source's own guards cover the switch tuples and integer ranges;
 # these bounds keep deployments inside the verified expert-count domain.
@@ -306,7 +308,7 @@ def resolve(
     check_supported_region(params)
     if params.max_rows > ACTIVE_ROWS_FIELD_MAX:
         raise GeometryError(
-            f"max_rows {params.max_rows} exceeds the kernel ABI's 16-bit active_rows field "
+            f"max_rows {params.max_rows} exceeds the kernel ABI's 15-bit active_rows field "
             f"(at most {ACTIVE_ROWS_FIELD_MAX // MAX_ROWS_QUANTUM * MAX_ROWS_QUANTUM} rows per rank)"
         )
     env = params.env()

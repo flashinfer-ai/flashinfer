@@ -41,7 +41,7 @@ Quantized-base GEMM with runtime BF16 LoRA (SM90, SM100, SM103)
 BF16 LoRA factors consumed as given (Cake generated programs). ``lora_scale=None`` disables the
 adapter even if ``d`` / ``lora_b`` are passed; pass a device scalar to apply it.  The NVFP4
 operator also takes a prepared adapter (``lora_adapter=prepare_nvfp4_lora_adapter(lora_b,
-lora_scale, alpha)``: the adapter folded once at the switch, SVDQuant-equivalent numerics).
+lora_scale, alpha)``: the adapter is folded once at the switch, with SVDQuant-equivalent numerics).
 
 .. autosummary::
     :toctree: ../generated
@@ -85,6 +85,17 @@ FP8 GEMM
     group_deepgemm_fp8_nt_groupwise
     batch_deepgemm_fp8_nt_groupwise
     fp8_blockscale_gemm_sm90
+
+16-bit x FP8 GEMM (FP8 weight, bf16 / fp16 activation)
+-------------------------------------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    mm_bf16_fp8
+    mm_bf16_fp8_workspace_bytes
+    mm_fp16_fp8
+    mm_fp16_fp8_workspace_bytes
 
 Low-latency TRT-LLM FP8 GEMM weight prep (also exported from ``flashinfer``):
 

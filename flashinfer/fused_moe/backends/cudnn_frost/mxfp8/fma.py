@@ -14,6 +14,7 @@ from ..activations import ACTIVATIONS, is_gated
 
 _TAG = "cudnn_frost-mxfp8-fma-v1"
 _ROOT = Path(__file__).parent
+_DEVICE_ROOT = _ROOT.parents[1] / "frost_low_latency" / "fma" / "mxfp8"
 _KERNELS = ("fma_fc1.py", "fma_fc2.py", "fma_common.py")
 
 
@@ -35,9 +36,12 @@ def source_digest(mixed=False):
     # Include imported conversion helpers and the native launch ABI. A change
     # must invalidate both persistent compilation and autotuning results.
     paths = [
-        *(_ROOT / name for name in _KERNELS),
+        *(_DEVICE_ROOT / name for name in _KERNELS),
         Path(__file__),
-        _ROOT.parent / "fma_activations.py",
+        _DEVICE_ROOT.parents[1] / "activation.py",
+        _DEVICE_ROOT.parents[1] / "quantization.py",
+        _DEVICE_ROOT.parents[1] / "io.py",
+        _DEVICE_ROOT.parent / "activations.py",
         _ROOT.parent / "activations.py",
         _ROOT.parents[3] / "cute_dsl" / "fp4_common.py",
         _ROOT.parents[3] / "quantization" / "quantization_cute_dsl_utils.py",
@@ -57,8 +61,11 @@ def _requirements():
     return tuple(
         (path, common._digest(path))
         for path in (
-            *(_ROOT / name for name in _KERNELS),
-            _ROOT.parent / "fma_activations.py",
+            *(_DEVICE_ROOT / name for name in _KERNELS),
+            _DEVICE_ROOT.parent / "activations.py",
+            _DEVICE_ROOT.parents[1] / "activation.py",
+            _DEVICE_ROOT.parents[1] / "quantization.py",
+            _DEVICE_ROOT.parents[1] / "io.py",
         )
     )
 
@@ -148,7 +155,7 @@ def _source(
     config = (tokens, hidden, intermediate, experts, topk, swizzled, first, mixed)
     activation = activation if first else "identity"
     source = (
-        (_ROOT / name).read_text()
+        (_DEVICE_ROOT / name).read_text()
         + f"\n# FMA source identity: {source_identity}\n_FMA_CONFIG = {config!r}\n"
         + f"_ACTIVATION = {activation!r}\n_GATED = {is_gated(activation)!r}\n"
         + _COMPILE

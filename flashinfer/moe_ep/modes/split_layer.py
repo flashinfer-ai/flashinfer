@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import logging
 import weakref
-from typing import TYPE_CHECKING, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -56,6 +57,7 @@ from ..core.validation.common import (
 )
 from ..weights import MoEWeightPack
 from .config import SplitConfig
+from ..backends.split.comm.nvlink_one_sided.config import NVLinkOneSidedConfig
 from ..backends.split.kernel.identity.config import IdentityConfig
 
 if TYPE_CHECKING:
@@ -114,6 +116,7 @@ class MoEEpSplitGraphState:
         "_topk_ids",
         "_topk_weights",
         "_out",
+        "_runtime_max_tokens_per_rank",
         "_buffer_signatures",
         "_destroyed",
     )
@@ -140,6 +143,7 @@ class MoEEpSplitGraphState:
         self._topk_ids = t.topk_ids
         self._topk_weights = t.topk_weights
         self._out = out
+        self._runtime_max_tokens_per_rank = t.runtime_max_tokens_per_rank
         # Tensor metadata is mutable: retaining the tensor alone does not
         # preserve the binding if the caller uses set_(), resize_(), or .data.
         self._buffer_signatures = {
@@ -230,6 +234,13 @@ class MoEEpSplitGraphState:
                     f"got {actual}. Copy new values into the registered tensor "
                     "in place instead of rebinding it or changing its metadata."
                 )
+        if t.runtime_max_tokens_per_rank != self._runtime_max_tokens_per_rank:
+            # The dispatch records this value as a kernel argument.
+            raise ValueError(
+                "MoEEpSplitGraphState: runtime_max_tokens_per_rank must stay "
+                f"{self._runtime_max_tokens_per_rank}, the value the state was "
+                f"created with; got {t.runtime_max_tokens_per_rank}."
+            )
 
     def destroy(self) -> None:
         """Release the persistent handle, if any. Idempotent.
@@ -289,6 +300,32 @@ class _StageTimer:
         self._timings[self._stage] = (self._start, end)
 
 
+def _communication_backend(backend, kernel: SplitKernelBackend):
+    """The communication config for this kernel. A kernel that packs its
+    dispatch rows keeps NVLink one-sided on its fence protocol: the sentinel
+    protocol rewrites payload words equal to its sentinel, which preserves
+    BF16 values but not other bytes. The backend's name stands for its default
+    config, which uses the sentinel protocol for small steps."""
+    if not kernel.packs_dispatch_payload:
+        return backend
+    if isinstance(backend, str) and backend == NVLinkOneSidedConfig.backend_name:
+        backend = NVLinkOneSidedConfig()
+    if (
+        isinstance(backend, NVLinkOneSidedConfig)
+        and backend._effective_sync_protocol() != "fence"
+    ):
+        return dataclasses.replace(
+            backend,
+            sync_protocol="fence",
+            cft=None,
+            cft_max_tokens_for_dispatch=None,
+            cft_max_tokens_for_combine=None,
+            lamport=None,
+            lamport_max_tokens=None,
+        )
+    return backend
+
+
 class MoEEpSplitLayer(nn.Module):
     """Expert-Parallel layer: dispatch → inner kernel → combine.
 
@@ -305,7 +342,14 @@ class MoEEpSplitLayer(nn.Module):
 
     Each path turns its dispatch output into the same
     :class:`SplitKernelContext`, so the inner kernel is shared.
+
+    A forward runs the stages in :attr:`STAGES` order: ``quantize`` turns the
+    hidden states into the dispatch payload (the kernel's quantization or
+    packing; no work when tokens travel unquantized), ``dispatch`` and
+    ``combine`` run the transport, and ``compute`` the inner kernel.
     """
+
+    STAGES = ("quantize", "dispatch", "compute", "combine")
 
     def __init__(
         self,
@@ -314,6 +358,8 @@ class MoEEpSplitLayer(nn.Module):
         weights: MoEWeightPack,
         fleet_knobs: Sequence[AlgoKnob] = (),
         backend: Union[str, SplitConfig, object] = "nccl_ep",
+        *,
+        _prepared_weights=None,
     ) -> None:
         """Validate the EP config and hand ``weights`` to the inner kernel.
 
@@ -351,11 +397,23 @@ class MoEEpSplitLayer(nn.Module):
                 split_comm_runtime_requirements(self._comm_backend_name()),
             )
 
-        self._validate_at_init()
-        self._kernel.validate_init(bootstrap, fleet_params)
+        try:
+            self._validate_at_init(validate_weights=_prepared_weights is None)
+            self._kernel.validate_init(bootstrap, fleet_params)
 
-        if type(self._kernel).requires_weights():
-            self._kernel.preprocess_weights(self._weights, fleet_params)
+            if _prepared_weights is not None:
+                self._kernel._transformed_weights = _prepared_weights
+            elif type(self._kernel).requires_weights():
+                self._kernel.preprocess_weights(self._weights, fleet_params)
+        except Exception:
+            try:
+                self._kernel.destroy()
+            finally:
+                if self._runtime is not None:
+                    finalize_moe_ep_runtime(self._runtime)
+                    self._runtime = None
+                self._destroyed = True
+            raise
         # Source pack is only needed for init-time validation and kernel
         # preprocessing; the kernel retains what it needs. Release it so the
         # layer does not pin a per-layer weight copy for the model lifetime
@@ -386,11 +444,19 @@ class MoEEpSplitLayer(nn.Module):
         self._destroyed = False
 
         # Opt-in per-stage profiling. When True, forward() records CUDA events
-        # around dispatch / compute / combine and stores elapsed GPU time (ms)
-        # in ``last_timings_ms`` after a device sync. Off by default (zero
-        # overhead on the hot path). Used by benchmarks/moe_ep/bench_moe_ep.py.
+        # around each stage (see STAGES) and stores elapsed GPU time (ms) in
+        # ``last_timings_ms`` after a device sync. Off by default (zero
+        # overhead on the hot path). Used by benchmarks/moe_ep/bench_moe_ep_fleet.py.
         self.enable_timing = False
         self.last_timings_ms: dict[str, float] = {}
+        # Optional per-stage callback: ``stage_hook(stage)`` returns a context
+        # manager that forward() enters around each stage, on the current
+        # stream. Unlike enable_timing it never synchronizes, so it may record
+        # CUDA events while a graph is being captured; the caller reads them
+        # after the replay. Used by benchmarks/moe_ep/bench_moe_ep.py.
+        self.stage_hook: Optional[
+            Callable[[str], contextlib.AbstractContextManager[None]]
+        ] = None
 
     def _comm_backend_name(self) -> str:
         name = getattr(self._comm_backend, "backend_name", self._comm_backend)
@@ -414,11 +480,12 @@ class MoEEpSplitLayer(nn.Module):
             )
         return on_communication
 
-    def _validate_at_init(self) -> None:
+    def _validate_at_init(self, *, validate_weights=True) -> None:
         validate_bootstrap_world_size(self._bootstrap)
-        validate_fleet_weights(
-            self._weights, self._fleet_params, self._bootstrap.world_size
-        )
+        if validate_weights:
+            validate_fleet_weights(
+                self._weights, self._fleet_params, self._bootstrap.world_size
+            )
         if self._uses_communication():
             self._validate_communication_config()
         else:
@@ -535,6 +602,17 @@ class MoEEpSplitLayer(nn.Module):
             t.topk_weights,
             self._fleet_params,
         )
+        runtime_max = t.runtime_max_tokens_per_rank
+        if runtime_max is not None and not (
+            max(t.num_tokens, 1)
+            <= runtime_max
+            <= self._fleet_params.max_tokens_per_rank
+        ):
+            raise MoEEpConfigError(
+                f"runtime_max_tokens_per_rank={runtime_max} must lie in "
+                f"[max(num_tokens, 1)={max(t.num_tokens, 1)}, "
+                f"max_tokens_per_rank={self._fleet_params.max_tokens_per_rank}]"
+            )
 
         capturing = _is_capturing()
         if graph_state is not None:
@@ -585,6 +663,38 @@ class MoEEpSplitLayer(nn.Module):
             self._warmed = True
         return out
 
+    def _forward_prepared(self, t, state, *, compute=None, output=None):
+        """Execute on persistent transport storage owned by an EP selection plan."""
+        if self._destroyed or state.destroyed:
+            raise MoEEpConfigError("The prepared split workspace has been destroyed")
+        validate_split_forward_inputs(
+            t.hidden_states, t.topk_ids, t.topk_weights, self._fleet_params
+        )
+        if t.runtime_max_tokens_per_rank != state._runtime_max_tokens_per_rank:
+            raise ValueError(
+                "runtime_max_tokens_per_rank changed; prepare another plan"
+            )
+        output = state.out if output is None else output
+        if self._uses_communication():
+            out = self._communication_dispatch_compute_combine(
+                t, output, compute=compute
+            )
+        else:
+            # Fleet handles bind weights at creation; refresh their contents
+            # when eager callers provide a different routing buffer.
+            if t.topk_weights.data_ptr() != state._topk_weights.data_ptr():
+                state._topk_weights.copy_(t.topk_weights)
+            handle = state._handle
+            handle.update(HandleParams(topk_ids=t.topk_ids))
+            try:
+                out = self._fleet_dispatch_compute_combine(
+                    handle, t, output, out_is_stable=True, compute=compute
+                )
+            finally:
+                handle.complete()
+        self._warmed = True
+        return out
+
     def destroy(self) -> None:
         """Tear down graph state, then the transport, then comm runtime.
 
@@ -606,6 +716,9 @@ class MoEEpSplitLayer(nn.Module):
         # when that raises, or the bootstrap ref_count leaks and the layer keeps
         # serving forward() on a half-destroyed transport.
         try:
+            # Before the transport: the kernel's per-forward state may still
+            # reference its receive buffers.
+            self._kernel.destroy()
             if self._communication is not None:
                 self._communication.destroy()
                 self._communication = None
@@ -626,11 +739,18 @@ class MoEEpSplitLayer(nn.Module):
         self,
         timings: "dict[str, tuple[torch.cuda.Event, torch.cuda.Event]]",
         stage: str,
-    ) -> "contextlib.AbstractContextManager[None]":
-        """Time one forward stage into ``timings`` when ``enable_timing`` is set."""
+    ) -> "contextlib.AbstractContextManager[object]":
+        """Bracket one forward stage with ``stage_hook`` and, when
+        ``enable_timing`` is set, time it into ``timings``."""
+        if self.stage_hook is None:
+            if self.enable_timing:
+                return _StageTimer(timings, stage)
+            return contextlib.nullcontext()
+        stack = contextlib.ExitStack()
         if self.enable_timing:
-            return _StageTimer(timings, stage)
-        return contextlib.nullcontext()
+            stack.enter_context(_StageTimer(timings, stage))
+        stack.enter_context(self.stage_hook(stage))
+        return stack
 
     def _publish_timings(
         self, timings: "dict[str, tuple[torch.cuda.Event, torch.cuda.Event]]"
@@ -767,17 +887,18 @@ class MoEEpSplitLayer(nn.Module):
         out: torch.Tensor,
         *,
         out_is_stable: bool = False,
+        compute=None,
     ) -> torch.Tensor:
         """Dispatch, run the inner kernel and combine on a bound handle."""
         timings: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
+        with self._stage(timings, "quantize"):
+            payload = self._kernel.pack_dispatch_payload(t.hidden_states)
         with self._stage(timings, "dispatch"):
-            dispatched = handle.dispatch(
-                DispatchInputParams(
-                    x=[self._kernel.pack_dispatch_payload(t.hidden_states)]
-                )
-            )
+            dispatched = handle.dispatch(DispatchInputParams(x=[payload]))
         with self._stage(timings, "compute"):
-            expert_out = self._kernel.compute(self._fleet_kernel_context(dispatched))
+            expert_out = (compute or self._kernel.compute)(
+                self._fleet_kernel_context(dispatched)
+            )
         with self._stage(timings, "combine"):
             combined = handle.combine(
                 CombineInputParams(x=[expert_out], out=out, out_is_stable=out_is_stable)
@@ -826,8 +947,9 @@ class MoEEpSplitLayer(nn.Module):
                     max_tokens_per_rank=fp.max_tokens_per_rank,
                     hidden_size=fp.token_hidden_size,
                     dtype=_TOKEN_DTYPE_BY_BYTES[fp.dtype_bytes],
+                    dispatch_format=self._kernel.dispatch_format(),
                 ),
-                self._comm_backend,
+                _communication_backend(self._comm_backend, self._kernel),
             )
         elif self._communication.params.top_k != top_k:
             raise MoEEpConfigError(
@@ -869,20 +991,34 @@ class MoEEpSplitLayer(nn.Module):
         )
 
     def _communication_dispatch_compute_combine(
-        self, t: "MoEEpTensors", out: torch.Tensor
+        self, t: "MoEEpTensors", out: torch.Tensor, *, compute=None
     ) -> torch.Tensor:
         """Dispatch, run the inner kernel and combine over the communication."""
         comm = self._ensure_communication(t.topk_ids.shape[1])
         timings: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
+        # Registered backends need not take the keyword unless it is used.
+        extra = (
+            {}
+            if t.runtime_max_tokens_per_rank is None
+            else {"runtime_max_tokens_per_rank": t.runtime_max_tokens_per_rank}
+        )
+        with self._stage(timings, "quantize"):
+            if comm.params.dispatch_format is None:
+                values = self._kernel.pack_dispatch_payload(t.hidden_states)
+                scales = None
+            else:
+                values, scales = self._kernel.quantize_for_dispatch(t.hidden_states)
         with self._stage(timings, "dispatch"):
             received = comm.dispatch(
-                self._kernel.pack_dispatch_payload(t.hidden_states),
+                values,
                 t.topk_ids,
                 t.topk_weights,
+                hidden_states_scale=scales,
+                **extra,
             )
         with self._stage(timings, "compute"):
             ctx = self._communication_kernel_context(comm, received)
-            expert_out = self._kernel.compute(ctx)
+            expert_out = (compute or self._kernel.compute)(ctx)
         with self._stage(timings, "combine"):
             combined = comm.combine(expert_out.reshape(ctx.num_tokens, -1), output=out)
         self._publish_timings(timings)
@@ -891,19 +1027,16 @@ class MoEEpSplitLayer(nn.Module):
     def _communication_kernel_context(
         self, comm: MoEEpCommunication, received: MoEEpDispatchResult
     ) -> SplitKernelContext:
-        # The inner kernels take RANK_MAJOR routing as ids local to this rank,
-        # with -1 for picks this rank does not own.
-        first_local = comm.ep_rank * comm.num_local_experts
-        ids = received.topk_ids
-        is_local = (ids >= first_local) & (ids < first_local + comm.num_local_experts)
+        # The received routing goes to the inner kernel as GLOBAL ids; it
+        # evaluates only the picks in this rank's local expert range.
         return SplitKernelContext(
             expert_tensors=received.hidden_states.view(
                 comm.ep_size, received.tokens_per_rank, -1
             ),
             num_tokens=comm.ep_size * received.tokens_per_rank,
             fleet_params=self._fleet_params,
-            recv_topk_idx=torch.where(
-                is_local, ids - first_local, torch.full_like(ids, -1)
-            ),
+            recv_topk_idx=received.topk_ids,
             recv_topk_weights=received.topk_weights,
+            recv_topk_idx_global=True,
+            expert_tensors_scale=received.hidden_states_scale,
         )

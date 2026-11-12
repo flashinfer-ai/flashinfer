@@ -10,7 +10,7 @@ package's own argument errors surface unchanged). The kernels, the adapter,
 the host tables and the configuration switches are covered by the backend
 suites (``test_mok_bf16.py``, ``test_mok_mxfp8.py`` and the torchrun
 suites), which import the package only through
-:func:`tests.test_helpers.cake_package.cake_package`. The argument-forwarding
+:func:`tests.cake.test_helpers.cake_package.cake_package`. The argument-forwarding
 checks call the workspace factory, which resolves the current CUDA device, so
 a CUDA device is required.
 """
@@ -30,6 +30,7 @@ ENTRY_POINTS = (
 RE_EXPORTS = (
     "COMM_SMS",
     "IMBALANCE_COMM_SMS",
+    "IMBALANCE_DEVICE_THRESHOLDS",
     "IMBALANCE_THRESHOLD",
     "IMBALANCE_THRESHOLDS",
     "MOK_PRECISIONS",

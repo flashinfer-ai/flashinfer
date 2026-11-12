@@ -83,9 +83,19 @@ def prepare_kimi_k3_latent_moe_front(
     Returns
     -------
     KimiK3LatentMoeRunner
-        Calling it launches the route on the current stream with no CUDA
-        allocation or host synchronization and returns the three outputs.  CUDA
-        Graph capture of the runner is supported; prepare outside capture.
+        Calling it launches the route on the current stream with no host
+        synchronization and returns the three outputs; an eager split prefill
+        plan uses that stream's FP32 partial workspace (allocated at the
+        stream's first split launch and grown to the largest plan launched
+        there), a captured one a block of the graph's memory pool.  The runner
+        owns its control words, so launches on distinct streams or graphs never
+        mix device state; a runner must not run concurrently with itself, and
+        graphs that share one memory pool must not replay concurrently.  CUDA
+        Graph capture of the runner is supported; prepare before capture, once
+        per layer and shape.  The fold form of the TP8 prefill rows on 152-SM
+        parts launches cooperatively: its whole grid must be resident at once,
+        so launch it on a stream that offers that many SMs (not a smaller
+        green context).
     """
     return _backend(backend).prepare_kimi_k3_latent_moe_front(
         x, gate_weight, down_weight, shared_gate_up_weight, logits, latent, shared_act
@@ -107,11 +117,14 @@ def kimi_k3_latent_moe_front(
     r"""Run the Kimi-K3 LatentMoE front projections of one rank once.
 
     Equivalent to :func:`prepare_kimi_k3_latent_moe_front` followed by one
-    launch; returns ``(logits, latent, shared_act)``.
+    launch; returns ``(logits, latent, shared_act)``.  Eager calls share one set
+    of control words per device, stream and size (calls on one stream are
+    stream-ordered); a call under CUDA Graph capture takes fresh words, which
+    are never freed, so prefer a prepared runner under capture.
     """
-    return _backend(backend).prepare_kimi_k3_latent_moe_front(
+    return _backend(backend).kimi_k3_latent_moe_front(
         x, gate_weight, down_weight, shared_gate_up_weight, logits, latent, shared_act
-    )()
+    )
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -165,9 +178,21 @@ def prepare_kimi_k3_latent_moe_tail(
     Returns
     -------
     KimiK3LatentMoeRunner
-        Calling it launches the route on the current stream with no CUDA
-        allocation or host synchronization and returns ``(y_workspace, out)``.
-        CUDA Graph capture of the runner is supported; prepare outside capture.
+        Calling it launches the route on the current stream with no host
+        synchronization and returns ``(y_workspace, out)``; an eager split
+        prefill plan uses that stream's FP32 partial workspace (allocated at the
+        stream's first split launch and grown to the largest plan launched
+        there), a captured one a block of the graph's memory pool.  The runner
+        owns its control words, so launches on distinct streams or graphs never
+        mix device state; a runner must not run concurrently with itself (nor
+        share its outputs or ``y_workspace`` with a concurrent runner), and
+        graphs that share one memory pool must not replay concurrently.  CUDA
+        Graph capture of the runner is supported; prepare before capture, once
+        per layer and shape.  The routes whose CTAs wait for rows that other
+        CTAs normalise (most decode tail rows and the fused prefill GEMMs)
+        launch cooperatively: their whole grid must be resident at once, so
+        launch them on a stream that offers that many SMs (not a smaller green
+        context).
     """
     return _backend(backend).prepare_kimi_k3_latent_moe_tail(
         routed,
@@ -199,9 +224,12 @@ def kimi_k3_latent_moe_tail(
     r"""Run the Kimi-K3 LatentMoE tail of one rank once.
 
     Equivalent to :func:`prepare_kimi_k3_latent_moe_tail` followed by one
-    launch; returns ``out``.
+    launch; returns ``out``.  Eager calls share one set of control words per
+    device, stream and size (calls on one stream are stream-ordered); a call
+    under CUDA Graph capture takes fresh words, which are never freed, so
+    prefer a prepared runner under capture.
     """
-    _backend(backend).prepare_kimi_k3_latent_moe_tail(
+    return _backend(backend).kimi_k3_latent_moe_tail(
         routed,
         norm_weight,
         up_weight,
@@ -211,8 +239,7 @@ def kimi_k3_latent_moe_tail(
         tp=tp,
         rank=rank,
         y_workspace=y_workspace,
-    )()
-    return out
+    )
 
 
 __all__ = [

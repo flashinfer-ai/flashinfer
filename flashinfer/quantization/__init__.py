@@ -14,15 +14,20 @@ Licensed under the Apache License, Version 2.0.
 # Re-export packbits functions
 from .packbits import packbits, segment_packbits
 
+# Re-export CSF block-scale compression
+from .csf import CsfScales, encode_csf_scales, expand_csf_scales
+
 # Re-export JIT module generator (used by tests and AOT compilation)
 from ..jit.quantization import gen_quantization_module
 
 # Re-export FP8 quantization
 from .fp8_quantization import (
     mxfp8_quantize,
+    mxfp8_quantize_bshd,
     mxfp8_grouped_quantize,
     mxfp8_dequantize_host,
     per_token_group_quant_8bit,
+    silu_and_mul_mxfp8_experts_quantize,
 )
 
 # Re-export FP4 quantization (all public symbols)
@@ -84,13 +89,19 @@ __all__ = [
     # Packbits
     "packbits",
     "segment_packbits",
+    # CSF block scales
+    "CsfScales",
+    "encode_csf_scales",
+    "expand_csf_scales",
     # JIT module generator
     "gen_quantization_module",
     # FP8
     "mxfp8_quantize",
+    "mxfp8_quantize_bshd",
     "mxfp8_grouped_quantize",
     "mxfp8_dequantize_host",
     "per_token_group_quant_8bit",
+    "silu_and_mul_mxfp8_experts_quantize",
     # FP4
     "SfLayout",
     "block_scale_interleave",

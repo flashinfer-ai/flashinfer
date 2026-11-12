@@ -1,6 +1,7 @@
 """NVLink one-sided dispatch/combine: model-shaped round trips, round sequences
-with changing token counts and rank skew, and the workspace layout. A subset of
-the cases also runs on the Cake backend, which implements the same protocol.
+with changing token counts and rank skew, the workspace layout and the CFT
+logical endpoints over the workspace. A subset of the cases also runs on the
+Cake backend, which implements the same protocol.
 
 Each multi-rank case spawns one process per EP rank from this pytest process,
 so a single ``pytest`` run covers every EP size the machine has GPUs for:
@@ -25,10 +26,6 @@ import torch
 
 FP8_E4M3_MAX = 448.0
 FP4_E2M1_MAX = 6.0
-# Bytes one fabric.try_put moves; payload rows that are not a multiple of it
-# take the fence path even when CFT is requested.
-CFT_ALIGNMENT_BYTES = 16
-CFT_MAX_TOKENS = 128
 
 
 @dataclass(frozen=True)
@@ -125,17 +122,21 @@ class Case:
     """A workload sharing one communicator across ``rounds``, with no host
     synchronization between rounds.
 
-    ``backend`` names the moe_ep communication backend. ``mode`` maps to
-    ``NVLinkOneSidedConfig.cft``: auto (None), fence (False) or cft (True);
-    Cake has no CFT transport and only runs ``auto``. ``payload_in_workspace`` writes the expert output into the
-    combine input region before combine. ``fp8_combine`` sends combine payloads
-    as FP8. ``graph`` captures the whole round sequence in one CUDA graph and
-    replays it.
+    ``backend`` names the moe_ep communication backend. ``mode`` is
+    ``NVLinkOneSidedConfig.sync_protocol``: auto and sentinel take the
+    sentinel protocol for the steps it carries (auto up to its token limit)
+    and the fence protocol for the others, fence the fence protocol only. A
+    sentinel case skips where the sentinel protocol is unavailable; an auto
+    case then runs every step on the fence protocol. Cake has no protocol to
+    select and only runs ``auto``. ``payload_in_workspace`` writes
+    the expert output into the combine input region before combine.
+    ``fp8_combine`` sends combine payloads as FP8. ``graph`` captures the whole
+    round sequence in one CUDA graph and replays it.
     """
 
     model: ModelShape
     rounds: tuple[Round, ...]
-    mode: Literal["auto", "fence", "cft"] = "auto"
+    mode: Literal["auto", "fence", "sentinel"] = "auto"
     payload_in_workspace: bool = False
     fp8_combine: bool = False
     graph: bool = False
@@ -286,8 +287,12 @@ def _cpu(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
 # ----------------------------------------------------------------------------
 
 
+def _protocol(sentinel) -> str:
+    return "sentinel" if sentinel else "fence"
+
+
 class _RecordingModule:
-    """Forwards to the kernel module and records each launch's CFT flag."""
+    """Forwards to the kernel module and records each launch's protocol."""
 
     def __init__(self, module, launches: list) -> None:
         self._module = module
@@ -297,11 +302,13 @@ class _RecordingModule:
         return getattr(self._module, name)
 
     def moe_a2a_dispatch(self, *args):
-        self._launches.append(("dispatch", bool(args[10])))
+        assert args[10] is False, "CFT counted writes requested"
+        self._launches.append(("dispatch", _protocol(args[13])))
         return self._module.moe_a2a_dispatch(*args)
 
     def moe_a2a_combine(self, *args):
-        self._launches.append(("combine", bool(args[11])))
+        assert args[11] is False, "CFT counted writes requested"
+        self._launches.append(("combine", _protocol(args[17])))
         return self._module.moe_a2a_combine(*args)
 
 
@@ -349,20 +356,19 @@ def _run_case(case: Case, rank: int) -> dict:
     )
     if one_sided:
         config = NVLinkOneSidedConfig(
-            cft={"auto": None, "fence": False, "cft": True}[case.mode],
+            sync_protocol=case.mode,
             timeout_sec=30,
             **options,
         )
     else:
-        assert case.mode == "auto", "Cake has no CFT transport to select"
+        assert case.mode == "auto", "Cake has no protocol to select"
         config = CakeAlltoAllConfig(**options)
     comm = create_communication(
         BootstrapConfig(world_size=case.ep_size, rank=rank), params, config
     )
     try:
-        cft_enabled = one_sided and comm.cft_enabled
-        if case.mode == "cft" and not cft_enabled:
-            return {"skip": "CFT counted writes are unavailable on this platform"}
+        if case.mode == "sentinel" and not comm.sentinel_enabled:
+            return {"skip": "the sentinel protocol is unavailable here"}
         launches: list = []
         combine_offsets: list = []
         if one_sided:
@@ -386,7 +392,7 @@ def _run_case(case: Case, rank: int) -> dict:
                     slots,
                     weights,
                     hidden_states_scale=sf,
-                    max_tokens_per_rank=maximum,
+                    runtime_max_tokens_per_rank=maximum,
                     eplb_local_stats=stats,
                 )
                 combine_offsets.append(comm._round["combine_offset"])
@@ -432,7 +438,7 @@ def _run_case(case: Case, rank: int) -> dict:
             outputs = sequence()
         torch.cuda.synchronize()
 
-        # Region boundaries stay fixed across token counts and transports.
+        # Region boundaries stay fixed across token counts and protocols.
         assert len(set(combine_offsets)) == 1, combine_offsets
         result = {
             "rank": rank,
@@ -448,7 +454,7 @@ def _run_case(case: Case, rank: int) -> dict:
                 for o in outputs
             ],
             "launches": launches,
-            "cft_enabled": cft_enabled,
+            "sentinel_max_tokens": comm.sentinel_max_tokens if one_sided else 0,
         }
         dist.barrier()
         return result
@@ -503,9 +509,10 @@ def _run(case: Case) -> list[dict]:
 
 
 def _verify_dispatch(
-    case: Case, results: list[dict], receiver: int, index: int
+    case: Case, results: list[dict], receiver: int, index: int, sentinel: bool
 ) -> None:
-    """Received rows, payload bytes, routing and padding against the inputs."""
+    """Received rows, payload bytes, routing and padding against the inputs;
+    a sentinel step's row of token ``t`` from a source is its row ``t``."""
     payload, sf, slots, weights = results[receiver]["outputs"][index]["dispatch"]
     maximum = max(case.rounds[index].tokens)
     payload = payload.view(case.ep_size, maximum, -1)
@@ -528,6 +535,8 @@ def _verify_dispatch(
         order = observed_ids.argsort()
         exact = dict(rtol=0, atol=0)
         torch.testing.assert_close(observed_ids[order], expected_ids, **exact)
+        if sentinel:
+            torch.testing.assert_close(torch.where(valid)[0], observed_ids, **exact)
         torch.testing.assert_close(
             slots[source, ~valid], torch.full_like(slots[source, ~valid], -1)
         )
@@ -586,32 +595,18 @@ def _assert_results(case: Case, results: list[dict]) -> None:
         assert len(result["outputs"]) == len(case.rounds)
         expected_launches = []
         for i, spec in enumerate(case.rounds):
-            payload, sf, slots, weights = result["inputs"][i]
+            sentinel = (
+                case.mode in ("auto", "sentinel")
+                and not case.eplb
+                and max(spec.tokens) <= result["sentinel_max_tokens"]
+            )
             _verify_combine(case, results, rank, i)
             if result["outputs"][i]["dispatch"] is not None:
-                _verify_dispatch(case, results, rank, i)
-            requested = (
-                result["cft_enabled"]
-                and case.mode != "fence"
-                and (case.mode == "cft" or max(spec.tokens) <= CFT_MAX_TOKENS)
-            )
-            # Wire eligibility, computed independently of the backend.
-            rows = (
-                (payload, slots, weights)
-                if sf is None
-                else (payload, sf, slots, weights)
-            )
-            dispatch_cft = requested and all(
-                t.shape[1] * t.element_size() % CFT_ALIGNMENT_BYTES == 0 for t in rows
-            )
-            combine_cft = (
-                requested
-                and case.model.hidden_size
-                * (1 if case.fp8_combine else 2)
-                % CFT_ALIGNMENT_BYTES
-                == 0
-            )
-            expected_launches += [("dispatch", dispatch_cft), ("combine", combine_cft)]
+                _verify_dispatch(case, results, rank, i, sentinel)
+            expected_launches += [
+                ("dispatch", _protocol(sentinel)),
+                ("combine", _protocol(sentinel)),
+            ]
             if case.eplb:
                 expected = torch.stack(
                     [
@@ -632,8 +627,7 @@ def _assert_results(case: Case, results: list[dict]) -> None:
 # ----------------------------------------------------------------------------
 
 # A four-rank communicator reused across changing token counts and peer
-# dependencies, including zero-token and delayed ranks. 128/129 tokens straddle
-# the automatic CFT threshold.
+# dependencies, including zero-token and delayed ranks.
 _ROUND_SEQUENCE = (
     Round((3, 0, 2, 1), Routing.LOCAL, 0),
     Round((1, 129, 0, 5), Routing.SPREAD, 1),
@@ -648,6 +642,17 @@ _ROUND_SEQUENCE = (
     Round((129, 1, 0, 0), Routing.SPREAD, 0),
 )
 
+_MODEL_EP_SIZES = (
+    (MODELS["gpt_oss"], 4),
+    (MODELS["deepseek_v3"], 8),
+    (MODELS["deepseek_r1_nvfp4"], 8),
+    (MODELS["qwen3_5_397b_a17b"], 8),
+    (MODELS["deepseek_v4_flash"], 4),
+    (MODELS["deepseek_v4_pro"], 8),
+    (MODELS["kimi_k3"], 8),
+    (MODELS["deepseek_v41_flash_dspark"], 4),
+)
+
 CASES = [
     # Model shapes, equal token counts on every rank.
     *[
@@ -658,31 +663,44 @@ CASES = [
             ),
             id=f"model-{model.name}-ep{ep_size}-tokens{num_tokens}",
         )
-        for model, ep_size in (
-            (MODELS["gpt_oss"], 4),
-            (MODELS["deepseek_v3"], 8),
-            (MODELS["deepseek_r1_nvfp4"], 8),
-            (MODELS["qwen3_5_397b_a17b"], 8),
-            (MODELS["deepseek_v4_flash"], 4),
-            (MODELS["deepseek_v4_pro"], 8),
-            (MODELS["kimi_k3"], 8),
-            (MODELS["deepseek_v41_flash_dspark"], 4),
-        )
+        for model, ep_size in _MODEL_EP_SIZES
         for num_tokens in (1, 128, 1024)
     ],
-    # BF16/FP8 combine with external or workspace-resident expert output.
+    # The sentinel protocol at the model shapes it carries (hidden_size a
+    # multiple of 256).
+    *[
+        pytest.param(
+            Case(
+                model=model,
+                rounds=(Round((num_tokens,) * ep_size, Routing.SPREAD, -1),),
+                mode="sentinel",
+            ),
+            id=f"model-{model.name}-ep{ep_size}-tokens{num_tokens}-sentinel",
+        )
+        for model, ep_size in _MODEL_EP_SIZES
+        if model.hidden_size % 256 == 0
+        for num_tokens in (1, 128)
+    ],
+    # BF16/FP8 combine with external or workspace-resident expert output (the
+    # sentinel protocol combines BF16 only).
     *[
         pytest.param(
             Case(
                 model=MODELS["deepseek_v3"],
                 rounds=(Round((9, 5), Routing.SPREAD, -1),),
+                mode=mode,
                 payload_in_workspace=payload_in_workspace,
                 fp8_combine=fp8_combine,
             ),
             id=f"combine-{'fp8' if fp8_combine else 'bf16'}-"
-            f"{'workspace' if payload_in_workspace else 'external'}",
+            f"{'workspace' if payload_in_workspace else 'external'}"
+            f"{'-sentinel' if mode == 'sentinel' else ''}",
         )
-        for fp8_combine in (False, True)
+        for mode, fp8_combine in (
+            ("auto", False),
+            ("auto", True),
+            ("sentinel", False),
+        )
         for payload_in_workspace in (False, True)
     ],
     *[
@@ -702,8 +720,10 @@ CASES = [
             ("auto", False, True),
             ("auto", False, False),
             ("auto", True, True),
-            ("cft", True, True),
             ("fence", True, True),
+            ("sentinel", False, True),
+            ("sentinel", False, False),
+            ("sentinel", True, True),
         )
     ],
     # Rank-distinct EPLB statistics, including a rank with no input tokens.
@@ -784,7 +804,7 @@ def test_nvlink_one_sided(case: Case) -> None:
 def test_workspace_layout(cft: bool) -> None:
     """Regions are disjoint, aligned and fixed by the allocation-time capacities."""
     from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided.kernels import (
-        get_nvlink_one_sided_module,
+        get_nvlink_one_sided_alltoall_module,
         layout_constants,
     )
 
@@ -794,7 +814,7 @@ def test_workspace_layout(cft: bool) -> None:
     combine_input_bytes = ep_size * capacity * hidden * 2
     combine_recv_bytes = ep_size * capacity * hidden if cft else 0
     layout = torch.empty(index.NUM_METAINFO_FIELDS, dtype=torch.int64)
-    get_nvlink_one_sided_module().moe_a2a_get_workspace_layout(
+    get_nvlink_one_sided_alltoall_module().moe_a2a_get_workspace_layout(
         ep_size,
         capacity,
         top_k,
@@ -841,3 +861,120 @@ def test_workspace_layout(cft: bool) -> None:
     else:
         assert field("COMBINE_RECV_SIZE_INDEX") == 0
         assert combine_end <= total
+
+
+def _cft_endpoints_worker(rank: int, world: int, out_dir: str) -> None:
+    """Bind, query, release, rebind and destroy the CFT logical endpoints of a
+    workspace; writes the result of this rank."""
+    import torch.distributed as dist
+
+    from flashinfer.comm.comm_backend import TorchDistBackend
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        MoEEpCommParams,
+        NVLinkOneSidedAlltoAll,
+        NVLinkOneSidedConfig,
+        create_communication,
+    )
+    from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided.cft import (
+        CftEndpoints,
+    )
+
+    def alltoall():
+        return create_communication(
+            BootstrapConfig(world_size=world, rank=rank),
+            MoEEpCommParams(
+                num_experts=8 * world,
+                top_k=8,
+                max_tokens_per_rank=16,
+                hidden_size=1024,
+                dtype=torch.bfloat16,
+            ),
+            NVLinkOneSidedConfig(sync_protocol="fence"),
+        )
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend="cpu:gloo,cuda:nccl",
+        init_method=f"file://{os.path.join(out_dir, 'rendezvous')}",
+        rank=rank,
+        world_size=world,
+        device_id=torch.device("cuda", rank),
+    )
+    try:
+        if NVLinkOneSidedAlltoAll.is_platform_supported():
+            local = None
+        else:
+            local = "nvlink_one_sided is not supported on this GPU"
+        reasons = [None] * world
+        dist.all_gather_object(reasons, local)
+        if any(reasons):
+            torch.save(
+                {"skip": next(r for r in reasons if r)},
+                os.path.join(out_dir, f"rank{rank}.pt"),
+            )
+            return
+        comm_backend = TorchDistBackend()
+        a2a = alltoall()
+        try:
+            endpoints = CftEndpoints.bind(a2a, comm_backend)
+            if endpoints is None:
+                result = {"skip": "CFT logical endpoints are not available"}
+            else:
+                ids = endpoints.ids()
+                gathered = [None] * world
+                dist.all_gather_object(gathered, ids.tolist())
+                second_bind = CftEndpoints.bind(a2a, comm_backend)
+                endpoints.release()
+                endpoints.rebind(comm_backend, ids)
+                # The endpoints keep the workspace after the all-to-all is gone.
+                a2a.destroy()
+                ids_without_alltoall = endpoints.ids().tolist()
+                endpoints.destroy()
+                workspaces_left = len(NVLinkOneSidedAlltoAll._WORKSPACES)
+                a2a = alltoall()
+                endpoints = CftEndpoints.bind(a2a, comm_backend)
+                rebound = endpoints is not None
+                if rebound:
+                    endpoints.destroy()
+                result = {
+                    "ids": ids.tolist(),
+                    "gathered": gathered,
+                    "second_bind": second_bind,
+                    "ids_without_alltoall": ids_without_alltoall,
+                    "workspaces_left": workspaces_left,
+                    "rebound": rebound,
+                }
+        finally:
+            a2a.destroy()
+        torch.save(result, os.path.join(out_dir, f"rank{rank}.pt"))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_cft_endpoints() -> None:
+    """Every rank sees the same logical-endpoint ID per rank, a rebind after a
+    release keeps the IDs, a process holds one binding, and the endpoints keep
+    the workspace until they are destroyed."""
+    import torch.multiprocessing as mp
+
+    world = 2
+    if torch.cuda.device_count() < world:
+        pytest.skip(f"requires {world} GPUs")
+    with tempfile.TemporaryDirectory() as out_dir:
+        mp.spawn(_cft_endpoints_worker, args=(world, out_dir), nprocs=world, join=True)
+        results = [
+            torch.load(os.path.join(out_dir, f"rank{r}.pt"), weights_only=False)
+            for r in range(world)
+        ]
+    if "skip" in results[0]:
+        assert all("skip" in r for r in results), "inconsistent support across ranks"
+        pytest.skip(results[0]["skip"])
+    assert all(r["gathered"] == results[0]["gathered"] for r in results)
+    assert all(r["ids"] == results[0]["ids"] for r in results)
+    for r in results:
+        assert r["second_bind"] is None
+        assert r["ids_without_alltoall"] == r["ids"]
+        assert r["workspaces_left"] == 0
+        assert r["rebound"]
+    assert len(set(results[0]["ids"])) == world

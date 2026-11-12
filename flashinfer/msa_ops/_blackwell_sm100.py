@@ -46,10 +46,59 @@ tensors -- so the eager warm call reads once and CUDA graph capture never
 synchronizes.  ``cu_seqlens_q[0]`` / ``cu_seqlens_k[0]`` must be 0 on this
 route.  A batch with one request below the thresholds takes the union route
 as a whole.
+
+Persistent K-major prefill route.  A prefill call the long route's
+length-independent predicate admits (flat GQA-16, or paged GQA-8 at 64 pages
+and more / GQA-16 at 64 pages and more for this route, above 64 for the long
+route; BF16 Q/K/V; causal; no explicit ``q_offset``; unit temperature scale)
+whose requests do not all reach the long route's length thresholds is served
+by the persistent K-major producer (``kmaj_p``) and the exact-BF16 combine when
+its shape guards admit the batch: a flat batch spans more than 64 KV blocks,
+and the batch is outside the (longest request at least 14336 queries, shortest
+KV at most 12288 tokens) box; every other such batch keeps the union route.  The host builds one selected-block CSR and one work list over every
+request of the call (``_build_kmaj_p_plan``), launches the producer once on a
+persistent grid of min(work items, SMs) CTAs and the combine once.  Like the
+long route, the plan reads the request boundaries and the per-row counts to
+the host: the route synchronizes in an eager call and is captured only through
+an ``MSASparseAttentionWorkspace`` warmed by an eager call with the exact
+tensors.
+
+Uniform FP8 decode route.  A decode call with FP8 Q, K and V (paged, causal,
+``force_fused=True``, 1-32 query tokens per request, no explicit ``q_offset``)
+is served by the lean swapped-orientation program in the launch tier its
+host rule resolves from the work items, the SM count and the page-table width
+(``_lean_launch_plan``: split count 1 / 2 / 4 / 8, K/V ring 8 or 11 stages,
+the occupancy-2 entry on compute capability 10.3).  The context bound of the
+tier is the page-table width times 128 tokens (``_lean_kv_len_bound``), a host
+quantity: no call reads ``seqused_k`` to the host, eager or captured, and the
+kernel reads each request's context on the device.  Every tier threshold is a
+multiple of 128 tokens, so a page table of ceil(longest context / 128) pages
+resolves the tier of the longest context; a page table wider than the longest
+context can resolve a slower tier.  An eager call without a workspace on
+compute capability 10.0 or 10.3 whose launch lies in the narrow box (32 Q
+heads over 4 KV heads, eight query tokens per request, at least 32 requests,
+context bound at most 2048 tokens) is served by the eight-token fused program
+instead
+(``_uniform_fp8_uses_fuseq8``).  CUDA graph capture, and
+the eager calls that carry a workspace (its warm-up), never select the fused
+program: the program has a hard context bound and a replay does not pass the
+host's guard, while a captured decode is typically replayed as the contexts
+grow.
+
+Uniform FP8 prefill route.  A prefill call with FP8 Q, K and V is served on
+measured shapes only: paged K/V, causal, no explicit ``q_offset``, one
+request over 64 Q heads and 4 KV heads, and either one query token with a
+page table of one page or, on compute capability 10.3 only, 146 query tokens
+with a page table of two pages (``_use_prefill_fp8q`` and
+``_prefill_fp8q_targets``).  The unfolded union program converts the
+E4M3 Q to BF16 in its Q ingress (route
+``prefill_union:float8_e4m3fn:float8_e4m3fn:paged:gqa0:any``) and writes a
+BF16 output.  Every other FP8-Q prefill call raises ``NotImplementedError``.
 """
 
 from __future__ import annotations
 
+import bisect
 import functools
 import math
 import threading
@@ -79,15 +128,113 @@ _SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3), (10, 7)}
 _M128_Q_TILE = 256
 _GQA8_Q_TILE = 32
 _GQA16_Q_TILE = 16
-# Lever P-PERS (persistent heavy-first tile loop): the folded-GQA union prefill
-# retraces run a persistent tile loop.  The kernel rebuilds the tile / KV-head
-# extents from its scalar arguments and reads its CTA count from grid_dim.x, so
-# the host launches min(tiles x KV heads, SMs) CTAs on a one-dimensional grid
-# (mirror of ``minimax_sparse_attention_prefill_sm100.union_persistent_grid``;
-# ``_UNION_PERSISTENT_FOLDED`` mirrors the Cake default of
-# ``UNION_PERSISTENT_FOLDED``).  The base grid ``(tiles, heads, 1)`` would run
-# every item ``heads`` times.
-_UNION_PERSISTENT_FOLDED = True
+# Lever P-PERS (persistent heavy-first tile loop): three BF16 GQA-16 union
+# prefill programs run a persistent tile loop (the configs built with
+# ``union_persistent``: flat GQA-16, paged GQA-16 and paged GQA-16 causal
+# mask64).  The kernel rebuilds the tile / KV-head extents from its scalar
+# arguments and reads its CTA count from grid_dim.x, so the host launches
+# min(tiles x KV heads, SMs) CTAs on a one-dimensional grid (mirror of
+# ``minimax_sparse_attention_prefill_sm100.union_persistent_grid``); the base
+# grid ``(tiles, heads, 1)`` would run every item ``heads`` times.  The GQA-8
+# programs and the paged GQA-16 causal_large program are the official
+# one-tile-per-CTA builds on the ``(tiles, heads)`` grid (their persistent
+# builds timed slower); a persistent program must not take that grid.
+_UNION_PERSISTENT_ROUTES = (
+    "prefill_union:bfloat16:bfloat16:flat:gqa16:any",
+    "prefill_union:bfloat16:bfloat16:paged:gqa16:any",
+    "prefill_union:bfloat16:bfloat16:paged:gqa16:causal_mask64",
+)
+# L2 evict-first decode: the paged BF16 M16 decode program built with its K / V
+# TMA copies under the L2 ``evict_first`` eviction priority (route
+# ``decode_m16:bfloat16:bfloat16:paged:l2ef``) computes the same bytes as the
+# unhinted program.  Measured on compute capability 10.0 and 10.3, it is
+# faster when the batch under-fills the device (at most two work items per SM)
+# and the longest context is at least 40960 tokens, and slower for a short KV
+# or a batch several waves deep; so ``_use_decode_l2ef`` takes it per launch
+# from quantities the launch has.  The decode entry keeps no host copy of the
+# KV lengths (no device-to-host copy, graph capture), so the page-table width
+# stands in for the longest context: 320 pages of 128 tokens.  The program is
+# registered for both targets; ``_DECODE_L2EF_TARGETS`` names the targets
+# whose measurement accepted it.
+_DECODE_L2EF_TARGETS = ("sm100a", "sm103a")
+_DECODE_L2EF_ITEMS_FACTOR = (2, 1)
+_DECODE_L2EF_MIN_KV_LEN = 40960
+_DECODE_L2EF_MIN_PAGES = -(-_DECODE_L2EF_MIN_KV_LEN // _BLOCK_SIZE)
+# Pair-ticket decode: the pair form of the paged BF16 M16 decode program
+# (route ``decode_m16:bfloat16:bfloat16:paged:qpair``) gives one ticket two
+# query tokens of a request (tokens 2j and 2j + 1) over one KV head.  With
+# eight Q heads per KV head the one-token tile computes eight columns it never
+# stores; the second token fills them, and the ticket walks the union of the
+# two tokens' selected blocks once, in descending block order, each token
+# masked to exact -inf on the blocks it did not select.  Each token keeps its
+# block order but not the split of its blocks between the two softmax warp
+# groups (a reduction-order change); the tickets halve.  Measured on compute
+# capability 10.0 and 10.3 with 32 Q heads over 4 KV heads and eight query
+# tokens per request, it is faster up to a 6223-token context; on longer
+# contexts the two tokens share fewer blocks.  ``_use_decode_qpair`` takes it
+# per launch, the page-table width standing in for the longest context: 49
+# pages of 128 tokens.
+_DECODE_QPAIR_TARGETS = ("sm100a", "sm103a")
+_DECODE_QPAIR_SEQLEN_Q = 8
+_DECODE_QPAIR_NUM_Q_HEADS = 32
+_DECODE_QPAIR_NUM_KV_HEADS = 4
+_DECODE_QPAIR_MAX_KV_LEN = 6223
+_DECODE_QPAIR_MAX_PAGES = -(-_DECODE_QPAIR_MAX_KV_LEN // _BLOCK_SIZE)
+# Decode on the union program: a paged causal BF16 decode call with eight query
+# tokens per request over 64 Q heads and 4 KV heads, 64 or 128 requests, no
+# explicit ``q_offset`` and a page table of at most 10 pages is the prefill call
+# of the folded GQA-16 union program (route
+# ``prefill_union:bfloat16:bfloat16:paged:gqa16:causal_mask64``) with
+# ``cu_seqlens_q = arange(batch_size + 1) * seqlen_q`` and the all-zero
+# ``cu_seqlens_k`` / ``q_offsets`` carrier of paged prefill (the program reads
+# ``kv_lens`` and derives the right-aligned causal offsets).  Measured on
+# compute capability 10.0 and 10.3, it is faster than the M16 decode program
+# at these shapes; the page-table width stands in for the longest context, so a
+# page table wider than 10 pages keeps the decode program.  The two int32
+# carriers are written once per (device, batch, seqlen_q) and only re-bound
+# afterwards (``_decode_union_carriers``): the union program is the only
+# launch of the call.
+_DECODE_UNION_TARGETS = ("sm100a", "sm103a")
+_DECODE_UNION_SEQLEN_Q = 8
+_DECODE_UNION_NUM_Q_HEADS = 64
+_DECODE_UNION_NUM_KV_HEADS = 4
+_DECODE_UNION_BATCHES = (64, 128)
+_DECODE_UNION_MAX_PAGES = 10
+# Uniform FP8 prefill on the union program: a paged causal prefill call with
+# FP8 Q, K and V, one request of one query token over 64 Q heads and 4 KV
+# heads, no explicit ``q_offset`` and a page table of one page is served by the
+# unfolded union program that converts the E4M3 Q to BF16 in its Q ingress
+# (route ``prefill_union:float8_e4m3fn:float8_e4m3fn:paged:gqa0:any``, BF16
+# output).  Measured on compute capability 10.0 and 10.3 at this shape.  On
+# compute capability 10.3 the same program also serves one request of 146 query
+# tokens with a page table of two pages (``_PREFILL_FP8Q_Q146_*``), measured
+# there only; ``_use_prefill_fp8q`` and ``_prefill_fp8q_targets`` admit no
+# other FP8-Q prefill call.
+_PREFILL_FP8Q_TARGETS = ("sm100a", "sm103a")
+_PREFILL_FP8Q_BATCH_SIZE = 1
+_PREFILL_FP8Q_TOTAL_Q = 1
+_PREFILL_FP8Q_NUM_Q_HEADS = 64
+_PREFILL_FP8Q_NUM_KV_HEADS = 4
+_PREFILL_FP8Q_MAX_PAGES = 1
+_PREFILL_FP8Q_Q146_TARGETS = ("sm103a",)
+_PREFILL_FP8Q_Q146_TOTAL_Q = 146
+_PREFILL_FP8Q_Q146_MAX_PAGES = 2
+# One-launch persistent K-major prefill: the fused form of the persistent
+# producer and its combine (route ``kmaj_p_fused:<layout>:gqa<g>``) runs the
+# combine in the producer's softmax warps after a grid-wide rendezvous, on a
+# co-resident grid of min(work items, SMs) CTAs launched cooperatively.  The
+# output, ``lse`` and ``temperature_lse`` are bitwise those of the two-launch
+# route on the same partials.  Measured on compute capability 10.0 and 10.3,
+# it is faster on short batches, where the gap between the two launches is
+# most of the span; on longer batches the combine's own wider grid is faster.
+# ``_use_kmaj_p_fused`` takes it per call from the plan's work-item count and
+# the query-token count, with per-target bounds; the plan decides it before it
+# orders the work list (the count does not depend on the order), and a fused
+# batch keeps the Q-resident order.  Every completed launch leaves the two
+# grid-barrier words zero; the host zeroes them once.
+_KMAJ_P_FUSED_MAX_WORK_ITEMS = {"sm100a": 324, "sm103a": 660}
+_KMAJ_P_FUSED_QUERY_TOKENS = {"sm100a": (7, 7), "sm103a": (1, 13)}
+_KMAJ_P_FUSED_BARRIER_WORDS = 2
 
 
 def _union_persistent_grid(
@@ -104,12 +251,13 @@ def _prefill_launch_grid(
     num_q_heads: int,
     num_kv_heads: int,
     num_sms: int,
+    persistent: bool,
 ) -> tuple[int, int, int]:
     """Launch grid of the prefill programs (mirror of the Cake dispatcher).
 
     Official grid: x = the compact query-tile upper bound, y = the KV heads of a
-    folded-GQA program or the query heads of a general one.  The folded-GQA
-    union retraces take the persistent grid when ``_UNION_PERSISTENT_FOLDED``.
+    folded-GQA program or the query heads of a general one.  A route of
+    ``_UNION_PERSISTENT_ROUTES`` (``persistent``) takes the persistent grid.
     """
     q_tile = (
         _GQA8_Q_TILE
@@ -120,12 +268,324 @@ def _prefill_launch_grid(
     )
     tiles = (int(total_q) + q_tile - 1) // q_tile + int(batch_size) - 1
     heads = int(num_kv_heads) if folded_gqa_group else int(num_q_heads)
-    if folded_gqa_group and _UNION_PERSISTENT_FOLDED:
+    if persistent:
         return _union_persistent_grid(tiles, heads, num_sms)
     return (tiles, heads, 1)
 
 
-_UNIFORM_FP8_EVEN_WAVE_GRID = 128
+# Lean uniform-FP8 paged decode: the swapped-orientation program behind every
+# ``decode_uniform_fp8:paged:lean:*`` route, one program per launch tier.  The
+# host resolves the tier from quantities the launch has -- the work items
+# (tokens x KV heads), the device's SM count and the page-table width, whose
+# context bound is width x 128 tokens -- and never guesses one:
+#   splits: one split when the page table holds fewer than four page pairs
+#   (16 selected blocks at most, two per pair) or the items alone fill more
+#   than half the SMs, else the largest of 2 / 4 / 8 with one page pair per
+#   split and items x splits CTAs at most the SMs.  Four and eight splits run
+#   one cluster of ``splits`` CTAs per item (the partial merge goes through
+#   distributed shared memory; the grid is exactly items x splits); two splits
+#   merge through fp32 partial pools; one and two splits run the persistent
+#   grid min(items x splits, SMs).
+#   K/V ring: 11 stages when the context bound is at most
+#   ``_LEAN_KV_TIER_MAX_KV_LEN`` tokens, else 8.
+#   occupancy 2 (the targets of ``_LEAN_OCC2_TARGETS``): a one-split launch
+#   with more items than SMs and a context bound at most
+#   ``_LEAN_OCC2_MAX_KV_LEN``, or in the long band up to
+#   ``_LEAN_OCC2_LONG_MAX_KV_LEN`` with items at most
+#   ``_LEAN_OCC2_LONG_WAVE_FACTOR`` x SMs or at least
+#   ``_LEAN_OCC2_LONG_ITEMS_FACTOR`` x SMs, takes the two-CTA entry (five
+#   stages, two P^T slots) on the grid min(items, 2 x SMs).
+# The context bound is the page-table width x ``_BLOCK_SIZE`` tokens
+# (``_lean_kv_len_bound``): a host quantity, so no call reads ``seqused_k`` to
+# the host, eager or captured.  It is at least every request's context (the
+# kernel reads those on the device), and every tier threshold below is a
+# multiple of ``_BLOCK_SIZE``, so a page table of ceil(longest context / 128)
+# pages resolves the tier the kernel's host rule resolves from the longest
+# context; a wider page table can resolve a slower tier.  Every constant
+# mirrors the kernel's host rule.
+_LEAN_ROUTE = "decode_uniform_fp8:paged:lean"
+_LEAN_TOPK = 16
+_LEAN_SPLIT_COUNTS = (1, 2, 4, 8)
+_LEAN_CLUSTER_SPLITS = (4, 8)
+_LEAN_KV_STAGES = 8
+_LEAN_KV_STAGES_SHORT = 11
+_LEAN_KV_TIER_MAX_KV_LEN = 16384
+_LEAN_OCC2_TARGETS = ("sm103a",)
+_LEAN_OCC2_MAX_KV_LEN = 8192
+_LEAN_OCC2_ITEMS_FACTOR = (1, 1)
+_LEAN_OCC2_KV_STAGES = 5
+_LEAN_OCC2_MIN_BLOCKS = 2
+_LEAN_OCC2_LONG_MAX_KV_LEN = 16384
+_LEAN_OCC2_LONG_WAVE_FACTOR = 2
+_LEAN_OCC2_LONG_ITEMS_FACTOR = 8
+_LEAN_PARTIAL_ROWS_PER_SPLIT = 128
+
+
+class _LeanLaunchPlan(NamedTuple):
+    """One lean launch: its split count, K/V ring depth, grid and CTAs per SM."""
+
+    splits: int
+    kv_stages: int
+    grid: int
+    min_blocks: int
+
+
+def _lean_max_pairs(max_pages: int) -> int:
+    return (min(int(max_pages), _LEAN_TOPK) + 1) // 2
+
+
+def _lean_splits(*, items: int, num_sms: int, max_pages: int) -> int:
+    if items <= 0 or num_sms <= 0 or max_pages <= 0:
+        raise ValueError(
+            "lean uniform FP8 decode: items, num_sms and max_pages must be positive"
+        )
+    pairs = _lean_max_pairs(max_pages)
+    if pairs < 4 or items * 2 > num_sms:
+        return 1
+    best = 1
+    for splits in _LEAN_SPLIT_COUNTS[1:]:
+        if splits <= pairs and items * splits <= num_sms:
+            best = splits
+    return best
+
+
+def _lean_kv_stages(*, max_kv_len: int) -> int:
+    if max_kv_len <= 0:
+        raise ValueError("lean uniform FP8 decode: max_kv_len must be positive")
+    if max_kv_len <= _LEAN_KV_TIER_MAX_KV_LEN:
+        return _LEAN_KV_STAGES_SHORT
+    return _LEAN_KV_STAGES
+
+
+def _lean_occupancy(
+    *,
+    target: BlackwellMSATarget,
+    items: int,
+    num_sms: int,
+    splits: int,
+    max_kv_len: int,
+) -> int:
+    if target not in _LEAN_OCC2_TARGETS or splits != 1:
+        return 1
+    num, den = _LEAN_OCC2_ITEMS_FACTOR
+    if items * den > num_sms * num and max_kv_len <= _LEAN_OCC2_MAX_KV_LEN:
+        return _LEAN_OCC2_MIN_BLOCKS
+    long_band = _LEAN_OCC2_MAX_KV_LEN < max_kv_len <= _LEAN_OCC2_LONG_MAX_KV_LEN
+    long_items = (
+        items <= _LEAN_OCC2_LONG_WAVE_FACTOR * num_sms
+        or items >= _LEAN_OCC2_LONG_ITEMS_FACTOR * num_sms
+    )
+    if items > num_sms and long_band and long_items:
+        return _LEAN_OCC2_MIN_BLOCKS
+    return 1
+
+
+def _lean_grid(*, items: int, splits: int, num_sms: int, min_blocks: int) -> int:
+    if splits in _LEAN_CLUSTER_SPLITS:
+        return items * splits
+    return min(items * splits, num_sms * min_blocks)
+
+
+def _lean_launch_plan(
+    *,
+    target: BlackwellMSATarget,
+    items: int,
+    num_sms: int,
+    max_pages: int,
+    max_kv_len: int,
+) -> _LeanLaunchPlan:
+    items, num_sms = int(items), int(num_sms)
+    max_pages, max_kv_len = int(max_pages), int(max_kv_len)
+    kv_stages = _lean_kv_stages(max_kv_len=max_kv_len)
+    splits = _lean_splits(items=items, num_sms=num_sms, max_pages=max_pages)
+    min_blocks = _lean_occupancy(
+        target=target,
+        items=items,
+        num_sms=num_sms,
+        splits=splits,
+        max_kv_len=max_kv_len,
+    )
+    if min_blocks == _LEAN_OCC2_MIN_BLOCKS:
+        kv_stages = _LEAN_OCC2_KV_STAGES
+    grid = _lean_grid(
+        items=items, splits=splits, num_sms=num_sms, min_blocks=min_blocks
+    )
+    return _LeanLaunchPlan(splits, kv_stages, grid, min_blocks)
+
+
+def _lean_route(plan: _LeanLaunchPlan) -> str:
+    """Route key (without its stage) of the program that runs ``plan``."""
+    if plan.min_blocks == _LEAN_OCC2_MIN_BLOCKS:
+        return f"{_LEAN_ROUTE}:occ2"
+    return f"{_LEAN_ROUTE}:s{plan.splits}:kv{plan.kv_stages}"
+
+
+def _lean_kv_len_bound(max_pages: int) -> int:
+    """The context bound of one lean launch: the page-table width x
+    ``_BLOCK_SIZE`` tokens.  A host quantity -- no device read, eager or under
+    CUDA graph capture -- and at least every request's context."""
+    max_pages = int(max_pages)
+    if max_pages <= 0:
+        raise ValueError("lean uniform FP8 decode: max_pages must be positive")
+    return max_pages * _BLOCK_SIZE
+
+
+def _lean_split_pools(
+    workspace: Optional[MSASparseAttentionWorkspace],
+    *,
+    items: int,
+    splits: int,
+    lse: torch.Tensor,
+    q2k_indices: torch.Tensor,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """The split pools of one lean launch: two splits merge through fp32
+    partials (``items x 2 x 128`` rows of ``O^T``, one ``M`` and one ``D`` per
+    row) and a completion counter per item; one split and the cluster tiers
+    never read them, so the LSE and the selection stand in.  The program resets
+    each item's counter after its merge, so the counter is zeroed when it is
+    created -- once per warmed workspace, or once per (device, stream) without
+    one (``_lean_completion_counter``) -- and only re-bound afterwards."""
+    if splits != 2:
+        alias = lse.reshape(-1)
+        return {
+            "partial_O": alias,
+            "partial_M": alias,
+            "partial_D": alias,
+            "split_completion": q2k_indices.reshape(-1),
+        }
+    rows = items * splits * _LEAN_PARTIAL_ROWS_PER_SPLIT
+    previous = None
+    if workspace is not None:
+        previous = workspace._buffers.get("lean_split_completion")
+    pools = {
+        "partial_O": _workspace_buffer(
+            workspace,
+            "lean_partial_o",
+            (rows, _HEAD_DIM),
+            dtype=torch.float32,
+            device=device,
+        ),
+        "partial_M": _workspace_buffer(
+            workspace, "lean_partial_m", (rows,), dtype=torch.float32, device=device
+        ),
+        "partial_D": _workspace_buffer(
+            workspace, "lean_partial_d", (rows,), dtype=torch.float32, device=device
+        ),
+    }
+    if workspace is None:
+        pools["split_completion"] = _lean_completion_counter(device, items)
+        return pools
+    pools["split_completion"] = _workspace_buffer(
+        workspace,
+        "lean_split_completion",
+        (items,),
+        dtype=torch.int32,
+        device=device,
+    )
+    if pools["split_completion"] is not previous:
+        pools["split_completion"].zero_()
+    return pools
+
+
+# Eight-token fused uniform-FP8 paged decode: the program behind
+# ``decode_uniform_fp8:paged:fuseq8``, chosen before the lean tiers on the
+# narrow box of the kernel's host selector -- exactly ``_FUSEQ8_NUM_Q_HEADS``
+# Q heads over ``_FUSEQ8_NUM_KV_HEADS`` KV heads, ``_FUSEQ8_SEQLEN_Q`` query
+# tokens per request, at least ``_FUSEQ8_MIN_BATCH`` requests and a context
+# bound of at most ``_FUSEQ8_KV_MAX`` tokens; every other launch takes its
+# lean tier.  One work item per (request, KV head) on the persistent grid
+# min(items, SMs); the program never reads the split pools, so the one-split
+# stand-ins of ``_lean_split_pools`` are passed.  The context bound is the
+# lean tiers' ``_lean_kv_len_bound`` (page-table width x 128 tokens, at least
+# every request's context, so the program's context bound holds).  Every
+# constant mirrors the kernel's host
+# rule.  Only the targets of ``_FUSEQ8_TARGETS`` take part; a launch on any
+# other target is outside the box and keeps the lean path unchanged.  Capture
+# never selects the fused program, and neither does an eager call with a
+# workspace (the warm-up a capture must match launch for launch): the program
+# has a hard context bound and a graph replay does not pass the host's guard
+# (``_uniform_fp8_uses_fuseq8``).
+_FUSEQ8_ROUTE = "decode_uniform_fp8:paged:fuseq8"
+_FUSEQ8_TARGETS = ("sm100a", "sm103a")
+_FUSEQ8_NUM_Q_HEADS = 32
+_FUSEQ8_NUM_KV_HEADS = 4
+_FUSEQ8_SEQLEN_Q = 8
+_FUSEQ8_MIN_BATCH = 32
+_FUSEQ8_KV_MAX = 2048
+
+
+def _fuseq8_narrow_applies(
+    *,
+    target: BlackwellMSATarget,
+    total_q: int,
+    seqlen_q: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    max_kv_len: int,
+) -> bool:
+    """Whether one uniform FP8 decode launch runs the fused program (the
+    kernel's ``uniform_fp8_program``).  A launch on a target outside
+    ``_FUSEQ8_TARGETS``, or whose head counts or query tokens per request are
+    not the box's, keeps its lean path unchecked; inside them, a token count
+    that is not a whole number of requests or a non-positive batch or context
+    is an error, never a lean fallback."""
+    if target not in _FUSEQ8_TARGETS:
+        return False
+    if not (
+        int(num_q_heads) == _FUSEQ8_NUM_Q_HEADS
+        and int(num_kv_heads) == _FUSEQ8_NUM_KV_HEADS
+        and int(seqlen_q) == _FUSEQ8_SEQLEN_Q
+    ):
+        return False
+    total_q, seqlen_q = int(total_q), int(seqlen_q)
+    if seqlen_q <= 0 or total_q % seqlen_q:
+        raise ValueError(
+            f"MSA uniform FP8 decode: {total_q} query tokens are not a whole "
+            f"number of {seqlen_q}-token requests"
+        )
+    batch, max_kv_len = total_q // seqlen_q, int(max_kv_len)
+    if batch <= 0 or max_kv_len <= 0:
+        raise ValueError(
+            f"MSA uniform FP8 decode: batch ({batch}) and the context bound "
+            f"({max_kv_len}) must be positive"
+        )
+    return batch >= _FUSEQ8_MIN_BATCH and max_kv_len <= _FUSEQ8_KV_MAX
+
+
+def _uniform_fp8_uses_fuseq8(
+    *,
+    workspace: Optional[MSASparseAttentionWorkspace],
+    capturing: bool,
+    target: BlackwellMSATarget,
+    total_q: int,
+    seqlen_q: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    max_kv_len: int,
+) -> bool:
+    """Whether one uniform FP8 decode launch runs the fused program: never
+    under CUDA graph capture and never with a workspace (the capture's eager
+    warm-up, whose launches the capture must repeat), since the fused program
+    has a hard context bound and a replay does not pass the host's guard;
+    otherwise ``_fuseq8_narrow_applies``.  The numerics of either program are
+    unchanged; only the route differs."""
+    if capturing or workspace is not None:
+        return False
+    return _fuseq8_narrow_applies(
+        target=target,
+        total_q=total_q,
+        seqlen_q=seqlen_q,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        max_kv_len=max_kv_len,
+    )
+
+
+def _fuseq8_grid(*, items: int, num_sms: int) -> int:
+    """The fused program's persistent grid: one CTA per SM at most."""
+    return min(int(items), int(num_sms))
+
 
 _LONG_WORK_GROUP_BUCKETS = (128, 64, 32, 16, 8, 4, 2, 1)
 _LONG_GROUP_BOUNDARIES = _LONG_WORK_GROUP_BUCKETS[:-1]
@@ -143,6 +603,15 @@ _LONG_QSPLIT_SLOT_SHIFT = 24
 _LONG_QSPLIT_SINGLE_SHIFT = 28
 # BF16 dequant scales per u8x32 partial row (one per 32-column segment).
 _LONG_PARTIAL_SEGMENT_COUNT = 4
+# Persistent K-major prefill route (``kmaj_p``; module docstring).  Its shape
+# guards are pure functions of the request lengths: a flat batch must span more
+# than ``_KMAJ_P_FLAT_KV_FLOOR_BLOCKS`` KV blocks; a batch whose longest request
+# has at least ``_KMAJ_P_MAX_Q_LEN`` queries and whose shortest KV spans at most
+# ``_KMAJ_P_LONG_Q_MIN_KV_LEN`` tokens stays on the union program (a shape box
+# drawn around measured precision, not a performance rule).
+_KMAJ_P_FLAT_KV_FLOOR_BLOCKS = 64
+_KMAJ_P_MAX_Q_LEN = 14336
+_KMAJ_P_LONG_Q_MIN_KV_LEN = 12288
 
 _MODE_DECODE_ONLY = 1
 _SPLIT_ADAPTIVE = 0
@@ -156,7 +625,11 @@ _GRID_AXES = {"grid_x": 0, "grid_y": 1, "grid_z": 2}
 
 
 class MSASparseAttentionWorkspace:
-    """Caller-owned storage for SM100/SM103 MSA CUDA graph capture.
+    """Caller-owned storage for MSA CUDA graph capture on SM100/SM103 and
+    SM107's packed-NVFP4 paged-KV routes.
+
+    On SM107, this workspace is supported only by the packed-NVFP4 paged-KV
+    prefill and decode routes.
 
     Construct one workspace per captured sparse-attention invocation. Warm it
     by calling the operation eagerly with the exact tensors, options, and CUDA
@@ -168,9 +641,11 @@ class MSASparseAttentionWorkspace:
     cannot be passed through Python again; graph replay remains valid for the
     lifetime of the workspace.
 
-    The multi-request long-prefill route reads the request boundaries from
-    ``cu_seqlens_q`` and ``cu_seqlens_k`` / ``seqused_k`` to the host in the
-    eager warm call and keeps them for that binding: pass the same tensor
+    The multi-request long-prefill route and the persistent K-major route read
+    the request boundaries from ``cu_seqlens_q`` and ``cu_seqlens_k`` /
+    ``seqused_k`` to the host in the eager warm call (the uniform FP8 decode
+    route reads nothing: its tier comes from the page-table width); the
+    workspace keeps them for that binding: pass the same tensor
     objects to every later call (a rebuilt ``cu_seqlens`` tensor -- a new
     object, even at the old address -- is read again at the cost of one
     synchronization) and rewrite their contents only through torch operations,
@@ -190,6 +665,10 @@ class MSASparseAttentionWorkspace:
         # ``cu_seqlens`` views and the partial pools, keyed by the q2k binding
         # and the request lengths (``_long_prefill_state``).
         self._long_prefill: dict = {}
+        # Persistent K-major route: the whole-batch plan and the BF16 partial
+        # pools, keyed by the q2k binding and the request lengths
+        # (``_kmaj_p_state``).
+        self._kmaj_p: dict = {}
         # Host copy of the request boundaries of one (cu_seqlens_q, cu_seqlens_k
         # | seqused_k) binding with weak references to the two tensor objects;
         # filled by the eager warm call, read during capture (``_request_lengths``).
@@ -205,11 +684,10 @@ class MSASparseAttentionWorkspace:
 
 _topk_warmed_devices: set[tuple[int, str]] = set()
 _topk_warmed_devices_lock = threading.Lock()
-# Top-K16 v2 launch plan (duplicated verbatim from
-# loom/examples/weave/minimax_sparse_topk_select_v2_sm100.py::topk_grid_plan because this module
-# cannot import loom).  loom/tests/test_blackwell_msa_export_topk_plan.py (CPU pytest) exec's this copy
-# from its source and asserts the plan and every _TOPK_* constant agree with the module over a shape
-# grid; tools/msa_rebench/dev/topk_v2_check.py repeats the check on the GPU steps.
+# Top-K16 v2 launch plan (duplicated verbatim from the Cake generator's
+# ``topk_grid_plan``, which this module cannot import).  The generator's CPU test
+# exec's this copy from its source and asserts the plan and every _TOPK_*
+# constant agree with the module over a shape grid.
 _TOPK_QT = 16
 _TOPK_SLICES = (1, 2, 4, 8, 16)
 _TOPK_WAVE_CTAS = 444
@@ -304,7 +782,7 @@ def _topk_grid_plan(
 
 def _topk_radix_route(slice_len: int) -> str:
     """The radix select's production instance for a planned slice (duplicated verbatim from
-    loom/examples/weave/minimax_sparse_topk_select_v2_sm100.py::topk_radix_route): ``topk_select_keq`` (the
+    the Cake generator's ``topk_radix_route``): ``topk_select_keq`` (the
     lever T9 pass-0 all-equal fold) for a streamed slice above the candidate cap ``_TOPK_CAND_CAP`` and up to
     ``_TOPK_KEQ_MAX_SLEN`` blocks, ``topk_select`` for a stage-only slice (the fold cannot fire) and beyond the
     bound -- a cost choice, both instances are bit-identical on every input."""
@@ -316,8 +794,8 @@ def _topk_radix_route(slice_len: int) -> str:
 def _topk_route(
     total_q: int, num_heads: int, num_valid_pages: int, max_k_tiles: int
 ) -> str:
-    """Shape-only program choice (duplicated verbatim from
-    loom/examples/weave/minimax_sparse_topk_select_v2_sm100.py::topk_route): ``topk_select_streaming`` (the
+    """Shape-only program choice (duplicated verbatim from the Cake generator's
+    ``topk_route``): ``topk_select_streaming`` (the
     one-CTA-per-row program) for small latency-bound multi-pass grids -- at most ``_TOPK_STREAM_MAX_ROWS`` rows,
     at most ``_TOPK_STREAM_MAX_NVP`` valid pages and a planned slice above the candidate cap; ``topk_select_q32``
     (the 32-query instance) for an even ``total_q >= _TOPK_Q32_MIN_Q`` whose 32-query plan has a slice in
@@ -404,6 +882,28 @@ _eager_dummies_lock = threading.Lock()
 # Workspace-free long-prefill calls keep the state of their latest binding only.
 _implicit_long_prefill_states: dict[tuple, dict] = {}
 _implicit_long_prefill_states_lock = threading.Lock()
+_implicit_kmaj_p_states: dict[tuple, dict] = {}
+_implicit_kmaj_p_states_lock = threading.Lock()
+# The two-split lean completion counters of workspace-free calls, one per
+# (device, stream): zeroed once when created, then reset by the program itself
+# (each item's second arrival merges and stores 0).  Only launches that
+# complete in order on one stream may share a counter, so the key is the launch
+# stream (the one ``_bind_workspace`` binds); ``cudaStreamPerThread`` (handle 2)
+# names a different stream in each thread, so its key adds the thread.  An
+# external stream destroyed with work pending, whose handle a new stream then
+# reuses, is outside this contract -- the torch caching allocator assumes the
+# same of stream handles.
+_lean_completion_counters: dict[tuple[int, int, int], torch.Tensor] = {}
+_lean_completion_counters_lock = threading.Lock()
+# The ``cu_seqlens_q`` and all-zero ``cu_seqlens_k`` carriers of workspace-free
+# decode calls on the union program, one pair per (device, batch, seqlen_q):
+# written once on the creating stream, which is then synchronized, and never
+# written or freed afterwards, so a launch on any stream reads the final
+# values.  The admission box bounds the entries (two batch sizes, one seqlen_q).
+_decode_union_carriers_cache: dict[
+    tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]
+] = {}
+_decode_union_carriers_lock = threading.Lock()
 
 
 def is_blackwell_msa_device(device: torch.device | str) -> bool:
@@ -435,7 +935,7 @@ def _device_facts(device_index: int) -> tuple[BlackwellMSATarget, int]:
     compute_capability = get_compute_capability(device)
     if compute_capability not in _SUPPORTED_COMPUTE_CAPABILITIES:
         raise RuntimeError(
-            "the SM100/SM103 MSA backend requires compute capability 10.0 or 10.3; "
+            "the Blackwell MSA backend requires compute capability 10.0, 10.3 or 10.7; "
             f"got {compute_capability[0]}.{compute_capability[1]}"
         )
     if compute_capability == (10, 7):
@@ -597,6 +1097,29 @@ def _eager_dummy(
             tensor = torch.empty(shape, dtype=dtype, device=device)
             _eager_dummies[key] = tensor
     return tensor
+
+
+def _lean_completion_counter(device: torch.device, items: int) -> torch.Tensor:
+    """The completion counter of one workspace-free two-split lean launch: the
+    first ``items`` entries of this (device, stream)'s counter.  Two splits run
+    only at ``items * 2 <= num_sms``, so ``num_sms // 2`` entries hold every
+    launch, and the counter never grows."""
+
+    index, stream = _device_index(device), _stream_ptr(device)
+    key = (index, stream, threading.get_ident() if stream == 2 else 0)
+    with _lean_completion_counters_lock:
+        counter = _lean_completion_counters.get(key)
+        if counter is None:
+            counter = torch.zeros(
+                _num_sms(device) // 2, dtype=torch.int32, device=device
+            )
+            _lean_completion_counters[key] = counter
+    if items > counter.numel():
+        raise RuntimeError(
+            f"lean two-split launch of {items} items exceeds the completion "
+            f"counter's num_sms // 2 = {counter.numel()} entries"
+        )
+    return counter[:items]
 
 
 def _tensor_signature(tensor: torch.Tensor) -> tuple:
@@ -973,14 +1496,242 @@ def _prefill_route(
     )
 
 
-def _decode_route(*, q_dtype: torch.dtype, k_dtype: torch.dtype, paged: bool) -> str:
+def _decode_route(
+    *,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    paged: bool,
+    l2ef: bool = False,
+    qpair: bool = False,
+) -> str:
+    if l2ef and qpair:
+        raise ValueError("a decode launch takes the l2ef or the qpair form, not both")
     layout = "paged" if paged else "flat"
-    return f"decode_m16:{_DTYPE_NAMES[q_dtype]}:{_DTYPE_NAMES[k_dtype]}:{layout}"
+    form = ":l2ef" if l2ef else ":qpair" if qpair else ""
+    return f"decode_m16:{_DTYPE_NAMES[q_dtype]}:{_DTYPE_NAMES[k_dtype]}:{layout}{form}"
+
+
+def _use_decode_qpair(
+    *,
+    target: BlackwellMSATarget,
+    paged: bool,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    seqlen_q: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    max_pages: int,
+) -> bool:
+    """Whether one M16 decode launch takes the pair-ticket paged program.
+
+    Every clause is a pure function of the launch: a target of
+    ``_DECODE_QPAIR_TARGETS``, the paged BF16 Q / BF16 K-V program,
+    ``_DECODE_QPAIR_SEQLEN_Q`` query tokens per request over
+    ``_DECODE_QPAIR_NUM_Q_HEADS`` Q heads and ``_DECODE_QPAIR_NUM_KV_HEADS`` KV
+    heads, and a page table of at most ``_DECODE_QPAIR_MAX_PAGES`` pages.  An
+    input the predicate cannot judge is refused.
+    """
+    if max_pages < 0:
+        raise ValueError(f"max_pages must be non-negative, got {max_pages}")
+    return (
+        target in _DECODE_QPAIR_TARGETS
+        and bool(paged)
+        and q_dtype == torch.bfloat16
+        and k_dtype == torch.bfloat16
+        and int(seqlen_q) == _DECODE_QPAIR_SEQLEN_Q
+        and int(num_q_heads) == _DECODE_QPAIR_NUM_Q_HEADS
+        and int(num_kv_heads) == _DECODE_QPAIR_NUM_KV_HEADS
+        and 0 < max_pages <= _DECODE_QPAIR_MAX_PAGES
+    )
+
+
+def _decode_qpair_grid(
+    *, total_q: int, num_kv_heads: int, num_sms: int
+) -> tuple[int, int]:
+    """``(CTAs, max_task_claims)`` of a pair launch: ``total_q / 2 *
+    num_kv_heads`` tickets on at most one CTA per SM, each CTA claiming at most
+    ``max_task_claims + 1`` tickets."""
+    if total_q <= 0 or total_q % 2:
+        raise ValueError(
+            f"a pair launch needs a positive even token count, got {total_q}"
+        )
+    tasks = total_q // 2 * num_kv_heads
+    ctas = min(tasks, num_sms)
+    return ctas, (tasks + ctas - 1) // ctas - 1
+
+
+def _use_decode_union(
+    *,
+    target: BlackwellMSATarget,
+    paged: bool,
+    causal: bool,
+    derive_q_offset: bool,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+    seqlen_q: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    batch_size: int,
+    max_pages: int,
+) -> bool:
+    """Whether one decode call is served by the folded GQA-16 union program.
+
+    Every clause is a pure function of the call: a target of
+    ``_DECODE_UNION_TARGETS``, paged causal BF16 Q / K / V, no explicit
+    ``q_offset``, ``_DECODE_UNION_SEQLEN_Q`` query tokens per request over
+    ``_DECODE_UNION_NUM_Q_HEADS`` Q heads and ``_DECODE_UNION_NUM_KV_HEADS`` KV
+    heads, a batch size of ``_DECODE_UNION_BATCHES`` and a page table of at most
+    ``_DECODE_UNION_MAX_PAGES`` pages.  An input the predicate cannot judge is
+    refused.
+    """
+    if max_pages < 0:
+        raise ValueError(f"max_pages must be non-negative, got {max_pages}")
+    return (
+        target in _DECODE_UNION_TARGETS
+        and bool(paged)
+        and bool(causal)
+        and bool(derive_q_offset)
+        and q_dtype == torch.bfloat16
+        and k_dtype == torch.bfloat16
+        and v_dtype == torch.bfloat16
+        and int(seqlen_q) == _DECODE_UNION_SEQLEN_Q
+        and int(num_q_heads) == _DECODE_UNION_NUM_Q_HEADS
+        and int(num_kv_heads) == _DECODE_UNION_NUM_KV_HEADS
+        and int(batch_size) in _DECODE_UNION_BATCHES
+        and 0 < max_pages <= _DECODE_UNION_MAX_PAGES
+    )
+
+
+def _use_prefill_fp8q(
+    *,
+    paged: bool,
+    causal: bool,
+    derive_q_offset: bool,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+    num_q_heads: int,
+    num_kv_heads: int,
+    batch_size: int,
+    total_q: int,
+    max_pages: int,
+) -> bool:
+    """Whether one FP8-Q prefill call lies in the box of the FP8-Q union program.
+
+    Every clause is a pure function of the call's shape: paged causal FP8 Q /
+    K / V, no explicit ``q_offset``, ``_PREFILL_FP8Q_BATCH_SIZE`` request over
+    ``_PREFILL_FP8Q_NUM_Q_HEADS`` Q heads and ``_PREFILL_FP8Q_NUM_KV_HEADS`` KV
+    heads, and either ``_PREFILL_FP8Q_TOTAL_Q`` query token with a page table
+    of ``_PREFILL_FP8Q_MAX_PAGES`` page or ``_PREFILL_FP8Q_Q146_TOTAL_Q`` query
+    tokens with a page table of ``_PREFILL_FP8Q_Q146_MAX_PAGES`` pages (``topk``
+    is 16 on every call).  The caller adds the target clause
+    (``_prefill_fp8q_targets``) after the shape clauses, so a call outside the
+    box is declined before any device query.
+    """
+    fp8 = torch.float8_e4m3fn
+    return (
+        bool(paged)
+        and bool(causal)
+        and bool(derive_q_offset)
+        and q_dtype == fp8
+        and k_dtype == fp8
+        and v_dtype == fp8
+        and int(num_q_heads) == _PREFILL_FP8Q_NUM_Q_HEADS
+        and int(num_kv_heads) == _PREFILL_FP8Q_NUM_KV_HEADS
+        and int(batch_size) == _PREFILL_FP8Q_BATCH_SIZE
+        and (
+            (
+                int(total_q) == _PREFILL_FP8Q_TOTAL_Q
+                and int(max_pages) == _PREFILL_FP8Q_MAX_PAGES
+            )
+            or (
+                int(total_q) == _PREFILL_FP8Q_Q146_TOTAL_Q
+                and int(max_pages) == _PREFILL_FP8Q_Q146_MAX_PAGES
+            )
+        )
+    )
+
+
+def _prefill_fp8q_targets(total_q: int) -> tuple[str, ...]:
+    """The targets that serve an FP8-Q prefill call inside the box.
+
+    A call of ``_PREFILL_FP8Q_Q146_TOTAL_Q`` query tokens is served on
+    ``_PREFILL_FP8Q_Q146_TARGETS`` only; a call of one query token on
+    ``_PREFILL_FP8Q_TARGETS``.
+    """
+    if int(total_q) == _PREFILL_FP8Q_Q146_TOTAL_Q:
+        return _PREFILL_FP8Q_Q146_TARGETS
+    return _PREFILL_FP8Q_TARGETS
+
+
+def _use_decode_l2ef(
+    *,
+    target: BlackwellMSATarget,
+    paged: bool,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    items: int,
+    num_sms: int,
+    max_pages: int,
+) -> bool:
+    """Whether one M16 decode launch takes the L2 evict-first paged program.
+
+    ``items`` counts the persistent work items (queries x KV heads) and
+    ``max_pages`` is the page-table width, the longest context in 128-token
+    pages.  Every clause is a pure function of the launch: a target of
+    ``_DECODE_L2EF_TARGETS``, the paged BF16 Q / BF16 K-V program,
+    ``items * den <= num * num_sms`` for ``(num, den) =
+    _DECODE_L2EF_ITEMS_FACTOR`` and ``max_pages >= _DECODE_L2EF_MIN_PAGES``.
+    An input the predicate cannot judge is refused.
+    """
+    if items <= 0 or num_sms <= 0:
+        raise ValueError(
+            f"items and num_sms must be positive, got {items} and {num_sms}"
+        )
+    if max_pages < 0:
+        raise ValueError(f"max_pages must be non-negative, got {max_pages}")
+    num, den = _DECODE_L2EF_ITEMS_FACTOR
+    return (
+        target in _DECODE_L2EF_TARGETS
+        and bool(paged)
+        and q_dtype == torch.bfloat16
+        and k_dtype == torch.bfloat16
+        and items * den <= num * num_sms
+        and max_pages >= _DECODE_L2EF_MIN_PAGES
+    )
 
 
 def _long_prefill_route(*, paged: bool, group_size: int) -> str:
     layout = "paged" if paged else "flat"
     return f"long_bf16_reverse:{layout}:gqa{group_size}"
+
+
+def _kmaj_p_route(*, paged: bool, group_size: int) -> str:
+    layout = "paged" if paged else "flat"
+    return f"kmaj_p:{layout}:gqa{group_size}"
+
+
+def _kmaj_p_fused_route(*, paged: bool, group_size: int) -> str:
+    layout = "paged" if paged else "flat"
+    return f"kmaj_p_fused:{layout}:gqa{group_size}"
+
+
+def _use_kmaj_p_fused(
+    *, target: BlackwellMSATarget, work_count: int, total_q: int
+) -> bool:
+    """Whether a batch the persistent K-major route serves runs as the fused
+    one-launch program: at most the target's work items, and query tokens
+    within the target's bounds (mirror of the generator's
+    ``fuse1_short_admits``)."""
+
+    if work_count <= 0 or total_q <= 0:
+        raise ValueError("work_count and total_q must be positive")
+    max_work_items = _KMAJ_P_FUSED_MAX_WORK_ITEMS.get(target)
+    if max_work_items is None:
+        return False
+    low, high = _KMAJ_P_FUSED_QUERY_TOKENS[target]
+    return work_count <= max_work_items and low <= total_q <= high
 
 
 def _fp8_q1_schedule(
@@ -1023,59 +1774,6 @@ def _fp8_q1_schedule(
     return ""
 
 
-# Lever D4b(dynpair) ships with the route off by default: the two-token
-# ticket program costs 6-11 % on per-token random block selections.  Turning the mirror
-# on needs a Cake re-export that registers ``decode_uniform_fp8:paged_dynpair`` again
-# (``exports/blackwell_msa/export.PRODUCTION_ROUTE_KEYS``); this package carries only
-# the single-token program.
-_UNIFORM_FP8_DYNPAIR_ROUTE = (
-    False  # mirror of minimax_sparse_attention_sm100.UNIFORM_FP8_DYNPAIR_ROUTE
-)
-_UNIFORM_FP8_SINGLE_ROUTE = "decode_uniform_fp8:paged"
-_UNIFORM_FP8_DYNPAIR_ROUTE_KEY = "decode_uniform_fp8:paged_dynpair"
-
-
-def _uniform_fp8_dynpair(seqlen_q: int) -> bool:
-    """Even ``seqlen_q`` in [2, 32] takes the two-token ticket program when the route is on.
-
-    Mirror of ``minimax_sparse_attention_sm100.uniform_fp8_dynpair_route`` (lever
-    D4b(dynpair), shipped off): query pairs ``(2 i, 2 i + 1)`` never straddle a
-    request; the kernel pairs the two tokens of a ticket when their selected-block lists
-    are equal and runs them one after the other otherwise; the output is bitwise the
-    single-token program's.  Same kernel ABI, grid rule and launch arguments as the
-    single-token route.
-    """
-    seqlen_q = int(seqlen_q)
-    return _UNIFORM_FP8_DYNPAIR_ROUTE and 2 <= seqlen_q <= 32 and seqlen_q % 2 == 0
-
-
-def _uniform_fp8_route(seqlen_q: int) -> str:
-    """Route key of the uniform FP8 Q/K/V paged decode program for ``seqlen_q``."""
-    return (
-        _UNIFORM_FP8_DYNPAIR_ROUTE_KEY
-        if _uniform_fp8_dynpair(seqlen_q)
-        else _UNIFORM_FP8_SINGLE_ROUTE
-    )
-
-
-def _uniform_fp8_decode_grid(
-    *, total_work_items: int, num_sms: int, seqlen_q: int
-) -> int:
-    physical_grid = min(total_work_items, num_sms)
-    default_waves = (total_work_items + physical_grid - 1) // physical_grid
-    even_waves = (
-        total_work_items + _UNIFORM_FP8_EVEN_WAVE_GRID - 1
-    ) // _UNIFORM_FP8_EVEN_WAVE_GRID
-    if (
-        seqlen_q >= 4
-        and num_sms >= _UNIFORM_FP8_EVEN_WAVE_GRID
-        and total_work_items % _UNIFORM_FP8_EVEN_WAVE_GRID == 0
-        and even_waves == default_waves
-    ):
-        return _UNIFORM_FP8_EVEN_WAVE_GRID
-    return physical_grid
-
-
 _LONG_MIN_REQUEST_LEN = 8192
 
 
@@ -1091,8 +1789,14 @@ def _long_prefill_candidate(
     q_offset_is_none: bool,
     return_temperature_lse: bool,
     lse_temperature_scale: float,
+    admit_64_pages: bool = False,
 ) -> bool:
-    """The length-independent half of the long-prefill predicate."""
+    """The length-independent half of the long-prefill predicate.
+
+    ``admit_64_pages`` is the persistent K-major route's rule: paged GQA-16
+    batches of exactly 64 pages qualify for it (the long route's own rule
+    stays ``max_pages > 64``; its length rule never admits such a batch).
+    """
 
     return bool(
         (
@@ -1100,7 +1804,10 @@ def _long_prefill_candidate(
                 paged
                 and (
                     (group_size == 8 and max_pages >= 64)
-                    or (group_size == 16 and max_pages > 64)
+                    or (
+                        group_size == 16
+                        and (max_pages > 64 or (admit_64_pages and max_pages == 64))
+                    )
                 )
             )
             or (not paged and group_size == 16)
@@ -1153,14 +1860,99 @@ def _use_long_prefill(
             return_temperature_lse=return_temperature_lse,
             lse_temperature_scale=lse_temperature_scale,
         )
-        and min(q_lens) >= _LONG_MIN_REQUEST_LEN
+        and _long_prefill_length_rule(q_lens=q_lens, k_lens=k_lens, paged=paged)
+    )
+
+
+def _long_prefill_length_rule(
+    *, q_lens: tuple[int, ...], k_lens: tuple[int, ...], paged: bool
+) -> bool:
+    """The length half of :func:`_use_long_prefill`: every request has at least
+    8192 queries and, on flat K/V, at least 8192 keys."""
+
+    return bool(
+        min(q_lens) >= _LONG_MIN_REQUEST_LEN
         and (paged or min(k_lens) >= _LONG_MIN_REQUEST_LEN)
     )
 
 
-# Lever P10 (mirror of minimax_sparse_attention_long_prefill_sm100.prefill_union_census /
-# union_census_prefers_union / union_census_route; the Cake test
-# loom/tests/test_minimax_sparse_prefill_union_census_route.py pins the parity): a paged GQA-16
+def _kmaj_p_flat_admits(*, k_lens: tuple[int, ...], paged: bool) -> bool:
+    """A flat batch reaches the persistent route only when its longest request
+    spans more than 64 KV blocks, the floor the paged GQA-16 admission applies
+    through its page count; paged batches pass."""
+
+    if paged:
+        return True
+    return max(k_lens) > _KMAJ_P_FLAT_KV_FLOOR_BLOCKS * _BLOCK_SIZE
+
+
+def _kmaj_p_q_admits(*, q_lens: tuple[int, ...], k_lens: tuple[int, ...]) -> bool:
+    """Outside the (longest request at least ``_KMAJ_P_MAX_Q_LEN`` queries,
+    shortest KV at most ``_KMAJ_P_LONG_Q_MIN_KV_LEN`` tokens) box."""
+
+    return not (
+        max(q_lens) >= _KMAJ_P_MAX_Q_LEN and min(k_lens) <= _KMAJ_P_LONG_Q_MIN_KV_LEN
+    )
+
+
+def _kmaj_p_admits(
+    *, q_lens: tuple[int, ...], k_lens: tuple[int, ...], paged: bool
+) -> bool:
+    """All shape guards of the persistent K-major route."""
+
+    return _kmaj_p_flat_admits(k_lens=k_lens, paged=paged) and _kmaj_p_q_admits(
+        q_lens=q_lens, k_lens=k_lens
+    )
+
+
+def _use_kmaj_p_prefill(
+    *,
+    q_lens: tuple[int, ...],
+    k_lens: tuple[int, ...],
+    paged: bool,
+    group_size: int,
+    max_pages: int,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+    causal: bool,
+    q_offset_is_none: bool,
+    return_temperature_lse: bool,
+    lse_temperature_scale: float,
+) -> bool:
+    """Whether the call is served by the persistent K-major route.
+
+    The long route's length-independent predicate must hold and its length rule
+    must not (the long route declines the batch), and the shape guards of
+    :func:`_kmaj_p_admits` must admit it.  A batch the length rule admits never
+    reaches this route, whichever program the union census picks for it; a
+    batch the guards decline keeps the union route.
+    """
+
+    if len(q_lens) < 1 or len(q_lens) != len(k_lens):
+        raise ValueError("q_lens and k_lens must carry one entry per request")
+    return bool(
+        _long_prefill_candidate(
+            paged=paged,
+            group_size=group_size,
+            max_pages=max_pages,
+            q_dtype=q_dtype,
+            k_dtype=k_dtype,
+            v_dtype=v_dtype,
+            causal=causal,
+            q_offset_is_none=q_offset_is_none,
+            return_temperature_lse=return_temperature_lse,
+            lse_temperature_scale=lse_temperature_scale,
+            admit_64_pages=True,
+        )
+        and not _long_prefill_length_rule(q_lens=q_lens, k_lens=k_lens, paged=paged)
+        and _kmaj_p_admits(q_lens=q_lens, k_lens=k_lens, paged=paged)
+    )
+
+
+# Lever P10 (mirror of the generator's prefill_union_census /
+# union_census_prefers_union / union_census_route; the generator's CPU test
+# pins the parity): a paged GQA-16
 # request the long route admits takes the folded union program when its tokens select (nearly)
 # the same KV blocks -- the exact per-tile union census from ``q2k_indices`` (torch ops, one
 # three-counter device-to-host read at the long route's own plan sync point, cached per binding)
@@ -1495,7 +2287,7 @@ def _long_prefill_tail_split_work(
     max_rounds=_LONG_WORK_TAIL_SPLIT_MAX_ROUNDS,
 ):
     """Halve the items that finish inside the simulated tail wave while the simulated makespan drops (mirror
-    of the Weave module's tail_split_long_prefill_work; bitwise-neutral host reordering)."""
+    of the generator's tail_split_long_prefill_work; bitwise-neutral host reordering)."""
     current = list(work)
     for _round in range(max(0, int(max_rounds))):
         ordered = sorted(current, key=lambda item: item[0], reverse=True)
@@ -1561,7 +2353,7 @@ def _long_prefill_tail_split_work(
 
 def _long_prefill_first_query_tokens(work, *, row_starts_host, q_indices_by_head):
     """The first (lowest) query token of every item, q_indices_by_head[head][row_start + q_begin] (mirror of
-    the Weave module's first_query_tokens_of_long_prefill_work; one gather + one copy per head)."""
+    the generator's first_query_tokens_of_long_prefill_work; one gather + one copy per head)."""
     positions = [[] for _head in q_indices_by_head]
     slots = [[] for _head in q_indices_by_head]
     for index, (
@@ -1583,7 +2375,7 @@ def _long_prefill_first_query_tokens(work, *, row_starts_host, q_indices_by_head
 
 
 def _long_prefill_order_work_q_resident(work, first_tokens, *, window, fill_groups):
-    """Launch order of lever P1b (mirror of the Weave module's order_long_prefill_work_q_resident): the items
+    """Launch order of lever P1b (mirror of the generator's order_long_prefill_work_q_resident): the items
     with at least fill_groups groups sorted by (head, first_token // window, group_count desc, kv_block,
     q_begin), then the smaller items in bucket-descending (stable) order.  A permutation of work."""
     if len(first_tokens) != len(work):
@@ -1614,6 +2406,33 @@ def _long_prefill_order_work_q_resident(work, first_tokens, *, window, fill_grou
     return [item for _key, item in bulk] + fill
 
 
+def _long_prefill_work_group_cap(
+    *,
+    paged: bool,
+    num_kv_heads: int,
+    total_q: int,
+    topk: int,
+    num_sms: int,
+    group_size: int,
+    total_rows: int,
+) -> int:
+    """The largest work bucket of one launch: about two waves of equal items over
+    the upper bound of the group count, raised for paged GQA-8 at exactly 64
+    pages; flat launches take the full bucket range."""
+
+    q_tokens_per_group = 128 // group_size
+    work_group_cap = _LONG_WORK_GROUP_BUCKETS[0]
+    if paged:
+        total_groups_upper = (
+            num_kv_heads * total_q * topk + q_tokens_per_group - 1
+        ) // q_tokens_per_group
+        target = max(1, (total_groups_upper + 2 * num_sms - 1) // (2 * num_sms))
+        work_group_cap = min(128, 1 << (target - 1).bit_length())
+        if group_size == 8 and total_rows == 64:
+            work_group_cap = max(work_group_cap, 64)
+    return work_group_cap
+
+
 def _build_long_prefill_plan(
     q2k_indices: torch.Tensor,
     *,
@@ -1634,15 +2453,15 @@ def _build_long_prefill_plan(
     total_rows = (total_k + _BLOCK_SIZE - 1) // _BLOCK_SIZE
     nnz_per_head = total_q * topk
     q_tokens_per_group = 128 // group_size
-    work_group_cap = _LONG_WORK_GROUP_BUCKETS[0]
-    if paged:
-        total_groups_upper = (
-            num_kv_heads * total_q * topk + q_tokens_per_group - 1
-        ) // q_tokens_per_group
-        target = max(1, (total_groups_upper + 2 * num_sms - 1) // (2 * num_sms))
-        work_group_cap = min(128, 1 << (target - 1).bit_length())
-        if group_size == 8 and total_rows == 64:
-            work_group_cap = max(work_group_cap, 64)
+    work_group_cap = _long_prefill_work_group_cap(
+        paged=paged,
+        num_kv_heads=num_kv_heads,
+        total_q=total_q,
+        topk=topk,
+        num_sms=num_sms,
+        group_size=group_size,
+        total_rows=total_rows,
+    )
     buckets = tuple(
         value for value in _LONG_WORK_GROUP_BUCKETS if value <= work_group_cap
     )
@@ -1897,7 +2716,7 @@ def _run_long_prefill(
     )
     pools = state["pools"]
     max_len_q = max(q_lens)
-    # Block-scaled u8x32 partials (CAKE-1183 partial-byte round): one aligned
+    # Block-scaled u8x32 partials (the partial-byte round): one aligned
     # 128-byte u8 payload line per (split, token, head) row plus four BF16
     # dequant scales per row, written by the producer as two aligned pairs and
     # read back by the combine.  Both pools are sized by the longest request
@@ -2064,6 +2883,523 @@ def _run_long_prefill(
 
 
 # ---------------------------------------------------------------------------
+# Persistent K-major prefill: one whole-batch plan, one producer, one combine
+# ---------------------------------------------------------------------------
+
+
+def _kmaj_p_request_rows(
+    *, k_lens: tuple[int, ...], paged: bool, max_pages: int
+) -> tuple[tuple[int, ...], tuple[int, ...], int]:
+    """``(row_base, pages, total_rows)`` of the whole-batch CSR: request ``b`` owns
+    the rows ``row_base[b] .. row_base[b] + pages[b]``.  Paged requests own
+    ``max_pages`` rows each (the page table's row width, so a row is
+    ``batch * max_pages + kv_block``); flat requests own their block count."""
+
+    if paged:
+        if int(max_pages) <= 0:
+            raise ValueError("the paged persistent route needs max_pages > 0")
+        pages = tuple(int(max_pages) for _k_len in k_lens)
+    else:
+        pages = tuple((int(k_len) + _BLOCK_SIZE - 1) // _BLOCK_SIZE for k_len in k_lens)
+    row_base = []
+    running = 0
+    for count in pages:
+        row_base.append(running)
+        running += count
+    return tuple(row_base), pages, running
+
+
+def _kmaj_p_assign_requests(work, *, row_base):
+    """Rewrite the work entries ``(head, row, q_begin, q_count, 0, row)`` of the
+    whole-batch CSR into the producer's ``(head, row, q_begin, q_count, batch,
+    kv_block)``: ``batch`` owns the row and ``kv_block`` is the row's index
+    within that request."""
+
+    bases = list(row_base)
+    out = []
+    for group_count, (head, row, q_begin, q_count, _zero, _again) in work:
+        batch = bisect.bisect_right(bases, int(row)) - 1
+        if batch < 0:
+            raise AssertionError("a work row precedes the first request")
+        out.append(
+            (
+                group_count,
+                (
+                    int(head),
+                    int(row),
+                    int(q_begin),
+                    int(q_count),
+                    int(batch),
+                    int(row) - bases[batch],
+                ),
+            )
+        )
+    return out
+
+
+def _build_kmaj_p_plan(
+    q2k_indices: torch.Tensor,
+    *,
+    target: BlackwellMSATarget,
+    q_lens: tuple[int, ...],
+    k_lens: tuple[int, ...],
+    paged: bool,
+    max_pages: int,
+    num_sms: int,
+    group_size: int,
+) -> dict:
+    """One exact CSR of the selected blocks of every request plus the work list
+    of one producer launch.
+
+    The CSR row of (request ``b``, block ``kv_block``) is ``row_base[b] +
+    kv_block`` (:func:`_kmaj_p_request_rows`); the packed payload keeps the
+    long route's form ``q_local | slot << 24 | single << 28`` with ``q_local``
+    the request-local query index (the producer adds ``cu_seqlens_q[batch]``),
+    and ``split_counts`` is the combine's ``[total_q, num_kv_heads]`` table over
+    the batch.  The long route's binary decomposition, tail split and
+    Q-resident order run unchanged over the whole-batch rows.  Whether the
+    batch runs as the fused program (``plan["fused"]``,
+    :func:`_use_kmaj_p_fused`) is decided on that list;
+    :func:`_kmaj_p_assign_requests` then fills the ``batch`` / ``kv_block``
+    fields.  For one request the plan is the long route's.  Like
+    :func:`_build_long_prefill_plan` this reads the per-row counts to the host.
+    """
+
+    num_kv_heads, total_q, topk = (int(value) for value in q2k_indices.shape)
+    if topk != _TOPK:
+        raise ValueError("the persistent K-major route requires topk=16")
+    if group_size not in {8, 16} or (not paged and group_size != 16):
+        raise ValueError(
+            "the persistent K-major route requires paged GQA8/GQA16 or flat GQA16"
+        )
+    if total_q > _LONG_QSPLIT_Q_MASK:
+        raise ValueError(
+            "the persistent K-major route exceeds the packed query-index range"
+        )
+    if len(q_lens) < 1 or len(q_lens) != len(k_lens):
+        raise ValueError("q_lens and k_lens must carry one entry per request")
+    if sum(q_lens) != total_q:
+        raise ValueError(
+            f"cu_seqlens_q describes {sum(q_lens)} query rows but q2k_indices "
+            f"holds {total_q}"
+        )
+    device = q2k_indices.device
+    row_base, pages, total_rows = _kmaj_p_request_rows(
+        k_lens=k_lens, paged=paged, max_pages=max_pages
+    )
+    requests = len(q_lens)
+    nnz_per_head = total_q * topk
+    q_tokens_per_group = 128 // group_size
+    work_group_cap = _long_prefill_work_group_cap(
+        paged=paged,
+        num_kv_heads=num_kv_heads,
+        total_q=total_q,
+        topk=topk,
+        num_sms=num_sms,
+        group_size=group_size,
+        total_rows=int(max_pages) if paged else 0,
+    )
+    buckets = tuple(
+        value for value in _LONG_WORK_GROUP_BUCKETS if value <= work_group_cap
+    )
+
+    q_lens_t = torch.tensor(q_lens, dtype=torch.int64, device=device)
+    request_of_token = torch.repeat_interleave(
+        torch.arange(requests, dtype=torch.int64, device=device), q_lens_t
+    )
+    q_start_of_token = torch.repeat_interleave(
+        torch.cumsum(q_lens_t, dim=0) - q_lens_t, q_lens_t
+    )
+    q_local = torch.arange(total_q, dtype=torch.int64, device=device) - q_start_of_token
+    row_base_of_token = torch.tensor(
+        row_base, dtype=torch.int64, device=device
+    ).index_select(0, request_of_token)
+    pages_of_token = torch.tensor(pages, dtype=torch.int64, device=device).index_select(
+        0, request_of_token
+    )
+
+    row_ptr = torch.zeros(
+        (num_kv_heads, total_rows + 1), dtype=torch.int32, device=device
+    )
+    qsplit = torch.full(
+        (num_kv_heads, nnz_per_head), -1, dtype=torch.int32, device=device
+    )
+    # [total_q, num_kv_heads] (the combine's layout) straight from the reduction.
+    by_query = q2k_indices.transpose(0, 1)
+    valid_all = (by_query >= 0) & (
+        by_query < pages_of_token.view(total_q, 1, 1).to(by_query.dtype)
+    )
+    split_counts = valid_all.sum(dim=2, dtype=torch.int32)
+    counts_by_head: list[torch.Tensor] = []
+    q_indices_by_head: list[torch.Tensor] = []
+    for head in range(num_kv_heads):
+        linear = (
+            q2k_indices[head].to(torch.int64) + row_base_of_token.view(total_q, 1)
+        ).reshape(-1)
+        positions = torch.nonzero(
+            valid_all[:, head, :].reshape(-1), as_tuple=False
+        ).flatten()
+        blocks = linear.index_select(0, positions)
+        counts = torch.bincount(blocks, minlength=total_rows).to(torch.int32)
+        row_ptr[head, 1:] = torch.cumsum(counts, dim=0, dtype=torch.int32)
+        counts_by_head.append(counts)
+        order = torch.argsort(blocks, stable=True)
+        sorted_positions = positions.index_select(0, order)
+        q_indices = torch.div(sorted_positions, topk, rounding_mode="floor")
+        slots = sorted_positions - q_indices * topk
+        packed = q_local.index_select(0, q_indices).to(torch.int32) | (
+            slots.to(torch.int32) << _LONG_QSPLIT_SLOT_SHIFT
+        )
+        packed |= (split_counts[:, head].index_select(0, q_indices) == 1).to(
+            torch.int32
+        ) << _LONG_QSPLIT_SINGLE_SHIFT
+        qsplit[head, : packed.numel()] = packed
+        q_indices_by_head.append(q_indices)
+
+    counts_host = torch.stack(counts_by_head).cpu().tolist()
+    work = _long_prefill_decompose_work(
+        counts_host, buckets=buckets, q_tokens_per_group=q_tokens_per_group
+    )
+    if not work:
+        raise ValueError(
+            "the persistent K-major route requires at least one selected edge"
+        )
+    work = _long_prefill_tail_split_work(
+        work, sm_count=int(num_sms), q_tokens_per_group=q_tokens_per_group
+    )
+    row_starts_host = []
+    for head_counts in counts_host:
+        starts = [0]
+        for count in head_counts:
+            starts.append(starts[-1] + int(count))
+        row_starts_host.append(starts)
+    first_tokens = _long_prefill_first_query_tokens(
+        work, row_starts_host=row_starts_host, q_indices_by_head=q_indices_by_head
+    )
+    work = _long_prefill_order_work_q_resident(
+        work,
+        first_tokens,
+        window=_LONG_WORK_ORDER_Q_WINDOW,
+        fill_groups=min(_LONG_WORK_ORDER_FILL_GROUPS, work_group_cap),
+    )
+    fused = _use_kmaj_p_fused(target=target, work_count=len(work), total_q=total_q)
+    work = _kmaj_p_assign_requests(work, row_base=row_base)
+    metadata = torch.tensor(
+        [entry for _group, entry in work], dtype=torch.int32, device=device
+    )
+    return {
+        "scheduler_metadata": metadata,
+        "k2q_row_ptr": row_ptr,
+        "k2q_qsplit_indices": qsplit,
+        "split_counts": split_counts,
+        "work_count": len(work),
+        "total_rows": total_rows,
+        "nnz_per_head": nnz_per_head,
+        "fused": fused,
+    }
+
+
+def _kmaj_p_state(
+    *,
+    target: BlackwellMSATarget,
+    workspace: Optional[MSASparseAttentionWorkspace],
+    q2k_indices: torch.Tensor,
+    lengths: _RequestLengths,
+    paged: bool,
+    max_pages: int,
+    num_sms: int,
+    group_size: int,
+) -> dict:
+    """The whole-batch plan of one persistent-route binding (``state["plan"]``)
+    and its BF16 partial pools (``state["pools"]``).
+
+    Keyed like the long route's state by the q2k binding and the request
+    lengths; a mismatch rebuilds the plan in one eager call -- the route's
+    synchronization point -- and forgets the workspace's warmed launches.  The
+    pools outlive a rebuild and are reallocated only when the batch's row count
+    changes.
+    """
+
+    signature = (
+        q2k_indices.device.type,
+        q2k_indices.device.index,
+        int(q2k_indices.data_ptr()),
+        int(q2k_indices._version),
+        tuple(q2k_indices.shape),
+        tuple(lengths.q_lens),
+        tuple(lengths.k_lens),
+        paged,
+        max_pages,
+        num_sms,
+        group_size,
+        target,
+    )
+    if workspace is not None:
+        state = workspace._kmaj_p
+    else:
+        with _implicit_kmaj_p_states_lock:
+            state = _implicit_kmaj_p_states.pop(signature, {})
+            _implicit_kmaj_p_states.clear()
+            _implicit_kmaj_p_states[signature] = state
+    if state.get("signature") != signature:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "the persistent K-major prefill plan must be warmed before CUDA "
+                "graph capture"
+            )
+        pools = state.get("pools", {})
+        state.clear()
+        state["pools"] = pools
+        if workspace is not None:
+            workspace._warmed_launches.clear()
+        rows = sum(lengths.q_lens)
+        state["plan"] = _build_kmaj_p_plan(
+            q2k_indices[:, :rows],
+            target=target,
+            q_lens=lengths.q_lens,
+            k_lens=lengths.k_lens,
+            paged=paged,
+            max_pages=max_pages,
+            num_sms=num_sms,
+            group_size=group_size,
+        )
+        state["signature"] = signature
+        state["q2k_owner"] = q2k_indices
+    return state
+
+
+def _run_kmaj_p_prefill(
+    *,
+    target: BlackwellMSATarget,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    temperature_lse: torch.Tensor,
+    q2k_indices: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_k: Optional[torch.Tensor],
+    q_offsets: Optional[torch.Tensor],
+    kv_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    paged: bool,
+    group_size: int,
+    max_pages: int,
+    softmax_scale_log2: float,
+    lse_temperature_scale: float,
+    return_softmax_lse: bool,
+    return_temperature_lse: bool,
+    workspace: Optional[MSASparseAttentionWorkspace],
+    capturing: bool,
+    lengths: _RequestLengths,
+) -> None:
+    """Serve every request of the call on the persistent K-major route.
+
+    One whole-batch plan drives one producer launch on a persistent grid of
+    min(work items, SMs) CTAs -- each work item names its request, and the
+    producer addresses ``q`` / ``out`` rows through ``cu_seqlens_q[batch]`` and
+    its K/V through ``cu_seqlens_k[batch]`` (flat) or ``kv_lens[batch]`` and
+    ``page_table[batch * max_pages + kv_block]`` (paged) -- and one combine
+    launch over the batch's rows.  The exact BF16 partials (payload and LSE, no
+    dequant scales) live in pools sized by the batch.  The caller's tensors are
+    bound unsliced except for the prefix of rows ``cu_seqlens_q`` describes;
+    ``cu_seqlens_q[0]`` and ``cu_seqlens_k[0]`` must be 0.  A paged ``cu_k`` of
+    ``None`` binds the all-zero carrier as on the other prefill routes.  The
+    (producer, combine) pair records one warmed-launch signature.  A batch
+    :func:`_use_kmaj_p_fused` admits runs instead as one cooperative launch of
+    the fused program on the producer's grid (:func:`_launch_kmaj_p_fused`).
+    """
+
+    total_q, num_q_heads, _ = (int(value) for value in q.shape)
+    num_kv_heads = int(k.shape[1])
+    q_lens, k_lens = lengths.q_lens, lengths.k_lens
+    if lengths.q_first != 0 or lengths.k_first != 0:
+        raise ValueError(
+            "the persistent K-major route addresses requests from row 0: "
+            "cu_seqlens_q[0] and cu_seqlens_k[0] must be 0"
+        )
+    rows = sum(q_lens)
+    if rows > total_q:
+        raise ValueError("cu_seqlens_q addresses more query rows than q holds")
+    if not paged and sum(k_lens) > int(k.shape[0]):
+        raise ValueError("cu_seqlens_k addresses more K/V rows than k holds")
+    num_sms = _num_sms(q.device)
+    state = _kmaj_p_state(
+        workspace=workspace,
+        target=target,
+        q2k_indices=q2k_indices,
+        lengths=lengths,
+        paged=paged,
+        max_pages=max_pages,
+        num_sms=num_sms,
+        group_size=group_size,
+    )
+    plan = state["plan"]
+    pools = state["pools"]
+    partial_o = _long_state_tensor(
+        pools,
+        "partial_o_bf16",
+        (_TOPK * rows * num_q_heads * _HEAD_DIM,),
+        dtype=torch.bfloat16,
+        device=q.device,
+    ).view(_TOPK, rows, num_q_heads, _HEAD_DIM)
+    partial_lse = _long_state_tensor(
+        pools,
+        "partial_lse",
+        (_TOPK * rows * num_q_heads,),
+        dtype=torch.float32,
+        device=q.device,
+    ).view(_TOPK, rows, num_q_heads)
+    partial_temperature_lse = partial_lse
+    if return_temperature_lse:
+        partial_temperature_lse = _long_state_tensor(
+            pools,
+            "partial_temperature_lse",
+            (_TOPK * rows * num_q_heads,),
+            dtype=torch.float32,
+            device=q.device,
+        ).view(_TOPK, rows, num_q_heads)
+    route = _kmaj_p_route(paged=paged, group_size=group_size)
+    forward_program = _program(f"{route}:main", target)
+    combine_program = _program(f"{route}:reduce", target)
+    if paged and cu_k is None:
+        cu_k = _paged_prefill_cu_seqlens_k(
+            kv_lens, workspace=workspace, name="prefill_cu_seqlens_k"
+        )
+        if q_offsets is None:
+            q_offsets = cu_k
+    forward_grid = (max(1, min(int(plan["work_count"]), num_sms)), 1, 1)
+    forward = {
+        "q": q[:rows],
+        "k": k,
+        "v": v,
+        "scheduler_metadata": plan["scheduler_metadata"],
+        "k2q_row_ptr": plan["k2q_row_ptr"],
+        "k2q_qsplit_indices": plan["k2q_qsplit_indices"],
+        "partial_o": partial_o,
+        "partial_lse": partial_lse,
+        "partial_temperature_lse": partial_temperature_lse,
+        "cu_seqlens_q": cu_q,
+        "cu_seqlens_k": cu_k,
+        "q_offsets": q_offsets,
+        "kv_lens": kv_lens,
+        "page_table": page_table if paged else q2k_indices.reshape(-1),
+        "total_q": rows,
+        "num_q_heads": num_q_heads,
+        "num_kv_heads": num_kv_heads,
+        "total_rows": int(plan["total_rows"]),
+        "nnz_per_head": int(plan["nnz_per_head"]),
+        "num_work_items": int(plan["work_count"]),
+        "topk": _TOPK,
+        "max_pages": max_pages if paged else 0,
+        "causal": 1,
+        "derive_q_offset": 1,
+        "softmax_scale_log2": softmax_scale_log2,
+        "lse_temperature_scale": lse_temperature_scale,
+        "return_temperature_lse": int(return_temperature_lse),
+    }
+    combine_grid = ((rows * num_q_heads + 31) // 32, 1, 1)
+    combine = {
+        "partial_o": partial_o,
+        "partial_lse": partial_lse,
+        "partial_temperature_lse": partial_temperature_lse,
+        "split_counts": plan["split_counts"],
+        "out": out[:rows],
+        "lse": lse[:rows],
+        "temperature_lse": temperature_lse[:rows],
+        "total_q": rows,
+        "num_q_heads": num_q_heads,
+        "num_kv_heads": num_kv_heads,
+        "qhead_per_kv": group_size,
+        "topk": _TOPK,
+        "return_softmax_lse": int(return_softmax_lse or return_temperature_lse),
+        "return_temperature_lse": int(return_temperature_lse),
+    }
+    if plan["fused"]:
+        _launch_kmaj_p_fused(
+            target=target,
+            route=_kmaj_p_fused_route(paged=paged, group_size=group_size),
+            grid=forward_grid,
+            forward=forward,
+            combine=combine,
+            pools=pools,
+            device=q.device,
+            workspace=workspace,
+            capturing=capturing,
+        )
+        return
+    signature = _launch_signature(
+        route=route,
+        target=target,
+        tensors=(*_signature_tensors(forward), *_signature_tensors(combine)),
+        scalars=(
+            *_signature_scalars(forward),
+            *_signature_scalars(combine),
+            combine_grid,
+        ),
+        grid=forward_grid,
+    )
+    _check_warmed_launch(workspace, signature, capturing=capturing)
+    forward_program.launch(forward_grid, **forward)
+    combine_program.launch(combine_grid, **combine)
+    _record_successful_launch(workspace, signature, capturing=capturing)
+
+
+def _launch_kmaj_p_fused(
+    *,
+    target: BlackwellMSATarget,
+    route: str,
+    grid: tuple[int, int, int],
+    forward: dict[str, Any],
+    combine: dict[str, Any],
+    pools: dict,
+    device: torch.device,
+    workspace: Optional[MSASparseAttentionWorkspace],
+    capturing: bool,
+) -> None:
+    """One cooperative launch of the fused program on the producer's grid.
+
+    It takes the producer's arguments, then the combine's split counts and
+    outputs, the two grid-barrier words and ``return_softmax_lse``.  The words
+    live beside the partial pools; they are zeroed when allocated, and every
+    completed launch leaves them zero.
+    """
+
+    barrier = pools.get("grid_barrier")
+    if not (isinstance(barrier, torch.Tensor) and barrier.device == device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "the fused persistent K-major grid barrier must be warmed "
+                "before CUDA graph capture"
+            )
+        barrier = torch.zeros(
+            (_KMAJ_P_FUSED_BARRIER_WORDS,), dtype=torch.int32, device=device
+        ).view(torch.uint32)
+        pools["grid_barrier"] = barrier
+    arguments = {
+        **forward,
+        "split_counts": combine["split_counts"],
+        "out": combine["out"],
+        "lse": combine["lse"],
+        "temperature_lse": combine["temperature_lse"],
+        "grid_barrier": barrier,
+        "return_softmax_lse": combine["return_softmax_lse"],
+    }
+    program = _program(f"{route}:main", target)
+    signature = _launch_signature(
+        route=route,
+        target=target,
+        tensors=_signature_tensors(arguments),
+        scalars=_signature_scalars(arguments),
+        grid=grid,
+    )
+    _check_warmed_launch(workspace, signature, capturing=capturing)
+    program.launch(grid, **arguments)
+    _record_successful_launch(workspace, signature, capturing=capturing)
+
+
+# ---------------------------------------------------------------------------
 # Single-launch routes
 # ---------------------------------------------------------------------------
 
@@ -2130,6 +3466,14 @@ def _run_prefill(
         dtype=torch.uint8,
         device=q.device,
     )
+    route = _prefill_route(
+        q_dtype=q.dtype,
+        k_dtype=k.dtype,
+        paged=paged,
+        folded_gqa_group=folded_gqa_group,
+        causal=causal,
+        max_pages=max_pages,
+    )
     grid = _prefill_launch_grid(
         total_q=total_q,
         batch_size=batch_size,
@@ -2137,6 +3481,7 @@ def _run_prefill(
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
         num_sms=int(get_device_sm_count(q.device)),
+        persistent=route in _UNION_PERSISTENT_ROUTES,
     )
     if cu_k is None:
         # Lever P-H1d: paged prefill without caller offsets binds the all-zero
@@ -2154,7 +3499,8 @@ def _run_prefill(
         if q_offsets is None:
             q_offsets = cu_k
     arguments = {
-        "q": q,
+        # FP8 Q (route prefill_union:float8_e4m3fn:...) is bound as its E4M3 bytes.
+        "q": q.view(torch.uint8) if q.dtype == torch.float8_e4m3fn else q,
         "k": k.view(torch.uint8) if fp8_kv else k,
         "k_scale": scale_dummy,
         "v": v.view(torch.uint8) if fp8_kv else v,
@@ -2184,14 +3530,6 @@ def _run_prefill(
         "return_softmax_lse": int(return_softmax_lse or return_temperature_lse),
         "return_temperature_lse": int(return_temperature_lse),
     }
-    route = _prefill_route(
-        q_dtype=q.dtype,
-        k_dtype=k.dtype,
-        paged=paged,
-        folded_gqa_group=folded_gqa_group,
-        causal=causal,
-        max_pages=max_pages,
-    )
     _launch_route(
         route,
         target=target,
@@ -2224,7 +3562,9 @@ def _run_decode_m16(
     workspace: Optional[MSASparseAttentionWorkspace],
     capturing: bool,
 ) -> None:
-    """The direct persistent M16 decode: one wave strides over (query, KV head) tickets."""
+    """The direct persistent M16 decode: one wave strides over (query, KV head)
+    tickets, or over (query pair, KV head) tickets on the pair route
+    (``_use_decode_qpair``)."""
 
     fp8 = k.dtype == torch.float8_e4m3fn
     total_q, num_q_heads, _ = (int(value) for value in q.shape)
@@ -2265,7 +3605,24 @@ def _run_decode_m16(
         workspace, "decode_status", (2,), dtype=torch.int32, device=q.device
     )
     total_tasks = total_q * num_kv_heads
-    physical_ctas = min(total_tasks, _num_sms(q.device))
+    num_sms = _num_sms(q.device)
+    qpair = _use_decode_qpair(
+        target=target,
+        paged=paged,
+        q_dtype=q.dtype,
+        k_dtype=k.dtype,
+        seqlen_q=seqlen_q,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        max_pages=max_pages,
+    )
+    if qpair:
+        physical_ctas, max_task_claims = _decode_qpair_grid(
+            total_q=total_q, num_kv_heads=num_kv_heads, num_sms=num_sms
+        )
+    else:
+        physical_ctas = min(total_tasks, num_sms)
+        max_task_claims = (total_tasks + physical_ctas - 1) // physical_ctas - 1
     grid = (physical_ctas, 1, 1)
     arguments = {
         "Q": q,
@@ -2305,7 +3662,7 @@ def _run_decode_m16(
         "num_kv_heads": num_kv_heads,
         "max_kv_tiles": _TOPK,
         "max_splits": 1,
-        "max_task_claims": (total_tasks + physical_ctas - 1) // physical_ctas - 1,
+        "max_task_claims": max_task_claims,
         "softmax_scale_log2": softmax_scale_log2,
         "k_global_scale": 1.0,
         "v_global_scale": 1.0,
@@ -2316,12 +3673,131 @@ def _run_decode_m16(
         "msa_max_pages": max_pages,
         "msa_split_policy": _SPLIT_ADAPTIVE,
     }
-    route = _decode_route(q_dtype=q.dtype, k_dtype=k.dtype, paged=paged)
+    l2ef = not qpair and _use_decode_l2ef(
+        target=target,
+        paged=paged,
+        q_dtype=q.dtype,
+        k_dtype=k.dtype,
+        items=total_tasks,
+        num_sms=num_sms,
+        max_pages=max_pages,
+    )
+    route = _decode_route(
+        q_dtype=q.dtype, k_dtype=k.dtype, paged=paged, l2ef=l2ef, qpair=qpair
+    )
     _launch_route(
         route,
         target=target,
         grid=grid,
         arguments=arguments,
+        workspace=workspace,
+        capturing=capturing,
+    )
+
+
+def _decode_union_carriers(
+    workspace: Optional[MSASparseAttentionWorkspace],
+    *,
+    batch_size: int,
+    seqlen_q: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(cu_seqlens_q, zeros)`` of a decode call on the union program.
+
+    ``cu_seqlens_q = arange(batch_size + 1) * seqlen_q`` and an all-zero
+    ``(batch_size + 1,)`` int32 carrier bound as ``cu_seqlens_k`` and
+    ``q_offsets`` (the paged program reads ``kv_lens`` / ``page_table`` and
+    derives the causal offsets).  Both are written when they are created and
+    only re-bound afterwards, so the union program is the only launch of a
+    steady-state call.  With a workspace they are workspace buffers whose names
+    carry the batch size (and ``seqlen_q``), written on the workspace's stream;
+    a capture finds them warmed or raises.  Without one they are created once
+    per (device, batch, seqlen_q), the creating stream is synchronized, and they
+    are never written again.
+    """
+
+    shape = (batch_size + 1,)
+    if workspace is not None:
+        q_name = f"decode_union_cu_seqlens_q_b{batch_size}_s{seqlen_q}"
+        k_name = f"decode_union_cu_seqlens_k_b{batch_size}"
+        previous_q = workspace._buffers.get(q_name)
+        previous_k = workspace._buffers.get(k_name)
+        cu_q = _workspace_buffer(
+            workspace, q_name, shape, dtype=torch.int32, device=device
+        )
+        zeros = _workspace_buffer(
+            workspace, k_name, shape, dtype=torch.int32, device=device
+        )
+        if cu_q is not previous_q:
+            torch.arange(0, shape[0] * seqlen_q, seqlen_q, out=cu_q)
+        if zeros is not previous_k:
+            zeros.zero_()
+        return cu_q, zeros
+    key = (_device_index(device), batch_size, seqlen_q)
+    with _decode_union_carriers_lock:
+        carriers = _decode_union_carriers_cache.get(key)
+        if carriers is None:
+            cu_q = torch.arange(
+                0, shape[0] * seqlen_q, seqlen_q, dtype=torch.int32, device=device
+            )
+            zeros = torch.zeros(shape, dtype=torch.int32, device=device)
+            torch.cuda.current_stream(device).synchronize()
+            carriers = (cu_q, zeros)
+            _decode_union_carriers_cache[key] = carriers
+    return carriers
+
+
+def _run_decode_union(
+    *,
+    target: BlackwellMSATarget,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    q2k_indices: torch.Tensor,
+    kv_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    max_pages: int,
+    seqlen_q: int,
+    softmax_scale_log2: float,
+    return_softmax_lse: bool,
+    workspace: Optional[MSASparseAttentionWorkspace],
+    capturing: bool,
+    **_unused: Any,
+) -> None:
+    """A decode call served by the folded GQA-16 union prefill program
+    (``_use_decode_union``): the prefill call with the carriers of
+    ``_decode_union_carriers``, ``out`` and ``lse`` the decode buffers."""
+
+    batch_size = int(q.shape[0]) // seqlen_q
+    cu_q, zeros = _decode_union_carriers(
+        workspace, batch_size=batch_size, seqlen_q=seqlen_q, device=q.device
+    )
+    _run_prefill(
+        target=target,
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        lse=lse,
+        temperature_lse=lse,
+        q2k_indices=q2k_indices,
+        cu_q=cu_q,
+        cu_k=zeros,
+        q_offsets=zeros,
+        kv_lens=kv_lens,
+        page_table=page_table,
+        paged=True,
+        folded_gqa_group=int(q.shape[1]) // int(k.shape[1]),
+        batch_size=batch_size,
+        max_pages=max_pages,
+        causal=True,
+        derive_q_offset=True,
+        softmax_scale_log2=softmax_scale_log2,
+        lse_temperature_scale=1.0,
+        return_softmax_lse=return_softmax_lse,
+        return_temperature_lse=False,
         workspace=workspace,
         capturing=capturing,
     )
@@ -2349,9 +3825,13 @@ def _run_fp8_direct(
     workspace: Optional[MSASparseAttentionWorkspace],
     capturing: bool,
 ) -> None:
-    """One direct FP8-MMA decode program (BF16-Q xform2 or uniform FP8 Q/K/V)."""
+    """One direct FP8-MMA decode program: a BF16-Q xform2 specialization, or
+    a uniform FP8 Q/K/V program -- the fused program where
+    ``_uniform_fp8_uses_fuseq8`` admits it, else the lean program of the tier
+    ``_lean_launch_plan`` resolves (``route`` is ``_LEAN_ROUTE``; the full route
+    key names the program and tier)."""
 
-    uniform = route in (_UNIFORM_FP8_SINGLE_ROUTE, _UNIFORM_FP8_DYNPAIR_ROUTE_KEY)
+    uniform = route == _LEAN_ROUTE
     total_q, num_q_heads, _ = (int(value) for value in q.shape)
     num_kv_heads = int(k.shape[1])
     arguments: dict[str, Any] = {
@@ -2371,27 +3851,50 @@ def _run_fp8_direct(
         "num_kv_heads": num_kv_heads,
     }
     if uniform:
-        total_work_items = total_q * num_kv_heads
+        max_kv_len = _lean_kv_len_bound(max_pages)
+        num_sms = _num_sms(q.device)
+        if _uniform_fp8_uses_fuseq8(
+            workspace=workspace,
+            capturing=capturing,
+            target=target,
+            total_q=total_q,
+            seqlen_q=seqlen_q,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            max_kv_len=max_kv_len,
+        ):
+            items = (total_q // int(seqlen_q)) * num_kv_heads
+            route = _FUSEQ8_ROUTE
+            splits = 1
+            grid_x = _fuseq8_grid(items=items, num_sms=num_sms)
+        else:
+            items = total_q * num_kv_heads
+            plan = _lean_launch_plan(
+                target=target,
+                items=items,
+                num_sms=num_sms,
+                max_pages=max_pages,
+                max_kv_len=max_kv_len,
+            )
+            route = _lean_route(plan)
+            splits = plan.splits
+            grid_x = plan.grid
         arguments.update(
             total_q=total_q,
             seqlen_q=seqlen_q,
             output_scale=output_scale,
             K_scale=k.view(torch.uint8),
             V_scale=v.view(torch.uint8),
-            partial_O=lse.reshape(-1),
-            partial_M=lse.reshape(-1),
-            partial_D=lse.reshape(-1),
-            split_completion=q2k_indices.reshape(-1),
-        )
-        grid = (
-            _uniform_fp8_decode_grid(
-                total_work_items=total_work_items,
-                num_sms=_num_sms(q.device),
-                seqlen_q=seqlen_q,
+            **_lean_split_pools(
+                workspace,
+                items=items,
+                splits=splits,
+                lse=lse,
+                q2k_indices=q2k_indices,
+                device=q.device,
             ),
-            1,
-            1,
         )
+        grid = (grid_x, 1, 1)
     else:
         arguments["num_requests"] = total_q
         grid = (total_q, num_kv_heads, 1)
@@ -2714,13 +4217,18 @@ def blackwell_msa_sparse_attention(
 
     Route selection is input-derived (module docstring).  A call whose
     requests all qualify for the selected-block long route is served request
-    by request.  With several requests the host needs their boundaries: they
-    are read from ``cu_seqlens_q`` and ``cu_seqlens_k`` / ``seqused_k`` on
-    every call without a workspace, and once per binding (same tensor
-    objects, pointers, versions and ``q``/``k`` extents) with an
-    ``MSASparseAttentionWorkspace``; ``cu_seqlens_q[0]`` and
-    ``cu_seqlens_k[0]`` must be 0 on that route.  The union route reads no
+    by request; a call the long route's length-independent predicate admits
+    but its length rule declines is served on the persistent K-major route
+    when its shape guards admit the batch.  With several requests the host
+    needs their boundaries: they are read from ``cu_seqlens_q`` and
+    ``cu_seqlens_k`` / ``seqused_k`` on every call without a workspace, and
+    once per binding (same tensor objects, pointers, versions and ``q``/``k``
+    extents) with an ``MSASparseAttentionWorkspace``; ``cu_seqlens_q[0]`` and
+    ``cu_seqlens_k[0]`` must be 0 on those routes.  The union route reads no
     host lengths.
+    FP8 Q (over FP8 K/V) is served on measured shapes only and writes a BF16
+    output; every other FP8-Q call raises ``NotImplementedError`` (module
+    docstring, uniform FP8 prefill route).
     """
 
     specialized, nvfp4_decline_reason = _try_nvfp4_prefill(
@@ -2760,7 +4268,31 @@ def blackwell_msa_sparse_attention(
     total_q, num_q_heads, num_kv_heads, group_size = _validate_attention_tensors(
         q, k, v, q2k_indices
     )
-    if q.dtype == torch.float8_e4m3fn:
+    if q.dtype == torch.float8_e4m3fn and not (
+        _use_prefill_fp8q(
+            paged=page_table is not None,
+            causal=causal,
+            derive_q_offset=q_offset is None,
+            q_dtype=q.dtype,
+            k_dtype=k.dtype,
+            v_dtype=v.dtype,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            batch_size=(
+                int(cu_seqlens_q.numel()) - 1
+                if isinstance(cu_seqlens_q, torch.Tensor)
+                else -1
+            ),
+            total_q=total_q,
+            max_pages=(
+                int(page_table.shape[1])
+                if isinstance(page_table, torch.Tensor) and page_table.ndim == 2
+                else -1
+            ),
+        )
+        and _select_target(q.device) in _prefill_fp8q_targets(total_q)
+    ):
+        # Uniform FP8 prefill outside the measured box (module docstring).
         raise NotImplementedError(
             "uniform FP8 Q/K/V is supported only by sparse decode"
         )
@@ -2800,7 +4332,12 @@ def blackwell_msa_sparse_attention(
             raise ValueError("lse_temperature_scale must be positive and finite")
         target = _select_target(q.device)
         out = _workspace_buffer(
-            workspace, "prefill_out", tuple(q.shape), dtype=q.dtype, device=q.device
+            workspace,
+            "prefill_out",
+            tuple(q.shape),
+            # FP8 Q (the uniform FP8 prefill box) writes a BF16 output.
+            dtype=torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype,
+            device=q.device,
         )
         lse = _workspace_buffer(
             workspace,
@@ -2853,17 +4390,24 @@ def blackwell_msa_sparse_attention(
         )
         k_outer_dim = int(k.shape[0])
         lengths: Optional[_RequestLengths] = None
+        candidate = _long_prefill_candidate(**predicate)
+        # The persistent route also takes paged GQA-16 batches of exactly 64
+        # pages; their lengths are read like every other candidate's.
+        kmaj_candidate = candidate or _long_prefill_candidate(
+            **predicate, admit_64_pages=True
+        )
         if batch_size == 1:
             # One request: the lengths are the tensor extents; no device read.
             lengths = _RequestLengths((total_q,), (k_outer_dim,), 0, 0)
-        elif (
-            _long_prefill_candidate(**predicate)
-            and total_q >= _LONG_MIN_REQUEST_LEN * batch_size
-            and (paged or k_outer_dim >= _LONG_MIN_REQUEST_LEN * batch_size)
+        elif kmaj_candidate and (
+            paged or k_outer_dim > _KMAJ_P_FLAT_KV_FLOOR_BLOCKS * _BLOCK_SIZE
         ):
-            # Several requests that may all qualify: read their boundaries
-            # (once per workspace binding, never during capture) and decide
-            # per request.
+            # Several requests of a long-route candidate: read their boundaries
+            # (once per workspace binding, never during capture) and decide per
+            # request between the long route, the persistent K-major route and
+            # the union route.  Every candidate batch is read, not only the
+            # ones whose total could reach the long thresholds: the persistent
+            # route's shape guards need the lengths as well.
             lengths = _request_lengths(
                 workspace,
                 cu_q=cu_q,
@@ -2894,8 +4438,23 @@ def blackwell_msa_sparse_attention(
             # Lever P10: same-block selections take the folded union program
             # (``prefill_union:...:paged:gqa16:causal_large``).
             use_long = False
+        use_kmaj_p = False
+        if not use_long and lengths is not None and kmaj_candidate:
+            # One request never meets the persistent route's longest-request
+            # box (its lower edge, 14336 queries, is above the long route's
+            # 8192-query threshold), so the one-request shortcut's lengths
+            # (the tensor extents) decide without a device read.
+            use_kmaj_p = (
+                lengths.q_first == 0
+                and lengths.k_first == 0
+                and _use_kmaj_p_prefill(
+                    q_lens=lengths.q_lens, k_lens=lengths.k_lens, **predicate
+                )
+            )
         if use_long:
             _run_long_prefill(group_size=group_size, lengths=lengths, **common)
+        elif use_kmaj_p:
+            _run_kmaj_p_prefill(group_size=group_size, lengths=lengths, **common)
         else:
             folded_gqa_group = (
                 group_size
@@ -2944,7 +4503,10 @@ def blackwell_msa_sparse_decode_attention(
     """Run sparse decode on compute capability 10.0 or 10.3.
 
     ``out``, when given, is the destination of every route and the returned
-    tensor; the routes never copy into it.
+    tensor; the routes never copy into it.  The uniform FP8 route resolves its
+    launch tier from the page-table width (``max_pages`` x 128 tokens; module
+    docstring): it reads nothing to the host, and a page table wider than the
+    longest context can resolve a slower tier.
     """
 
     del partial_dtype
@@ -3067,7 +4629,7 @@ def blackwell_msa_sparse_decode_attention(
                     "force_fused=True, and no explicit q_offset"
                 )
             _run_fp8_direct(
-                route=_uniform_fp8_route(int(seqlen_q)),
+                route=_LEAN_ROUTE,
                 output_scale=output_scale,
                 **common,
             )
@@ -3094,6 +4656,21 @@ def blackwell_msa_sparse_decode_attention(
                     output_scale=output_scale,
                     **common,
                 )
+            elif _use_decode_union(
+                target=target,
+                paged=paged,
+                causal=causal,
+                derive_q_offset=derive_q_offset,
+                q_dtype=q.dtype,
+                k_dtype=k.dtype,
+                v_dtype=v.dtype,
+                seqlen_q=int(seqlen_q),
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                batch_size=batch_size,
+                max_pages=max_pages,
+            ):
+                _run_decode_union(return_softmax_lse=return_softmax_lse, **common)
             else:
                 _run_decode_m16(
                     causal=causal, derive_q_offset=derive_q_offset, **common

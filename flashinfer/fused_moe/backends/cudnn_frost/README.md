@@ -7,6 +7,18 @@ SHA-256 manifest, with no precompiled `.o` files. Required cuDNN Frost device he
 are included in each generated source. The deployed process does not import
 `cudnn-frontend`, construct a cuDNN Frost graph, or run the cuDNN Frost graph compiler.
 
+All packaged Tensor Core source families are generated from cuDNN Frontend
+`0d72d59efd21401c7e13d606584fef2544e45934`, including ordinary FC1/FC2,
+dedicated GATHER, and qualified NVFP4 COMBINE kernels. This revision is shared
+by BF16, NVFP4, MXFP8 and MXFP8 × MXFP4 on their packaged SM107a/SM120a paths.
+The catalogs retain their existing tile, cluster, activation and routing-mode
+coverage. Geometry constants are reconstructed from the producer's source;
+device-dependent pipeline depths and descriptor workspace sizes are resolved
+by `device.py` during preparation. Source hashes qualify compiled and tuned
+kernel identities when a producer update changes an implementation.
+The SwiGLUStep export graph uses a zero-slope lower clip for its up branch,
+preserving the `[-7, 7]` clamp with the current Frost ReLU semantics.
+
 The stable MoELayer configurations are `CudnnFrostBf16Config`,
 `CudnnFrostMxfp8Config`, `CudnnFrostNvfp4Config`, and
 `CudnnFrostMxfp8Mxfp4Config`, exported from `flashinfer.fused_moe`. They can be
@@ -59,6 +71,12 @@ CuTe DSL compiler stack and source contents; persisted tactic identities also
 include the compiler stack. Upgrading CuTe DSL therefore recompiles kernels
 and invalidates old cuDNN Frost tactic choices. Compilation and native executor setup
 must finish before CUDA Graph capture.
+
+Epilogue chunk sizes share the same source template. The existing constant and
+source-fragment parameters carry activation expressions, geometry-dependent
+quantization unrolling and host descriptor alignment. Catalog recipes retain
+their individual constants and fragments, preserving the producer's concrete
+source and kernel identities.
 
 The sources use `cutlass.experimental.primitives` and the experimental tensor
 map API. Admission checks compiler capabilities instead of imposing a version
@@ -156,7 +174,12 @@ two outputs per warp at T=1 and four at T=2..4. Other shapes retain their
 existing Tensor Core candidates. The `bf16/fma*.py` sources use
 the shared persistent JIT cache, external PTXAS and graph resource retention.
 
-All four FMA dtype paths share `fma_activations.py`. FC1 specializes the activation
+The FMA device bodies now live under `../frost_low_latency/fma/`; the local
+`fma*.py` device modules are compatibility imports. These legacy host adapters
+retain their geometry admission, launch ABI, persistent cache, and numerical
+contract. Their source hashes cover the shared implementation.
+
+All four legacy FMA dtype paths share `../frost_low_latency/fma/activations.py`. FC1 specializes the activation
 at compile time; non-gated variants omit gate weight/scale loads and the second
 dot product. FC1 compilation and tactic identities include the activation, while
 FC2's compiled source is shared across activations. The supported contracts are
@@ -240,23 +263,36 @@ positive multiples of 128, at most 2^20; `1 <= top_k <= E <= 1024`;
 `1 <= T <= min(2^20, tune_max_num_tokens)`; expanded rows must satisfy the
 native int32 bound. Candidate selection checks each stage's artifact dimension
 and activation contracts; missing legal stages are reported during packing.
-BF16 retains its existing measured geometry policy until its shape-specific
-artifact contracts are generalized and validated.
+BF16 uses the same bounded selection for unmeasured shapes with legal artifacts
+for both stages.
 
 The heuristic uses expanded rows `T * top_k`, estimated rows per active expert,
 each stage's N/K, packed weight type, tile orientation, CTA/cluster geometry and
-SM count. It retains up to four unfused artifacts per stage and two fused FC1
-representatives. NVFP4 retains a third fused cluster family when the average
+the device's cached cluster launch capacities. It retains up to two pre-gathered
+and four GATHER FC1 artifacts on SM107a; devices without GATHER retain up to four
+pre-gathered artifacts. Two fused FC1 representatives remain per input layout.
+Store selection accounts for token-tile occupancy and retains alternate STG/TMA
+stores alongside operand orientations and CTA groups. FC2 retains up to four
+artifacts, divided equally between ordinary and COMBINE layouts when both are
+available. NVFP4 retains a third fused representative when the average
 expanded rows per expert fill a token tile, allowing larger cluster alternatives
 to compete with the smaller clusters. These are analytic estimates, not measured
 performance guarantees. Actual routing stays on the GPU. During autotuning, each
-unfused stage is ranked separately on the prepared routing, keeping two choices.
-FC1 timing includes intermediate requantization. The outer tuner compares at
-most eight complete pipelines, or ten with the third NVFP4 fused candidate.
+unfused stage is ranked separately on the prepared routing, keeping the two
+pre-gathered FC1 choices and the best GATHER choice. FC1 timing includes
+intermediate requantization. The outer tuner compares these and their fused
+alternatives as complete pipelines, including each input layout's routing cost.
 Ordinary calls use deterministic candidates or a cached winner without timing
 stages.
 The existing measured FMA scope is unchanged. Candidate identities and the
 heuristic policy version participate in cache keys.
+
+The complete SM107 SwiGLU profiles cover both uniform and skewed routing. Their
+first TC pair minimizes the worst relative slowdown against each routing's
+measured best pair; geometric mean breaks ties. This only orders the retained
+stage identities for calls without tuning. Autotuning still compares all retained
+pairs using the caller's routing, and the two distributions need not share a
+winner. Source artifacts and candidate membership are unchanged by reordering.
 
 All ten default activations additionally offer an independent small-token FMA
 tactic on SM107a: E64/H2048/I1408/K6 at T=1..4, and E12/H7168/I3072/K2 at T=1.
@@ -503,6 +539,45 @@ The native pipeline gathers packed inputs, runs FC1/activation and intermediate
 NVFP4 quantization, runs FC2 with BF16 output, and reduces routed outputs in
 FP32 before the final BF16 conversion.
 
+SM107a also offers normal singleton and swapped 2-CTA FC2 COMBINE candidates
+with fused weighted output reduction. They consume compact grouped tokens and
+the existing segmented scales through immutable A/SFA or B/SFB tensor maps.
+The swapped candidate stages weighted fragments as 128 tokens by 256 features
+before bulk reduction, shares routing loads within each warp, and uses 64-column
+TMEM loads to avoid register spills. Routing directly writes inverse
+token/slot indices and folds each expert's FP32 FC2 descale into the current
+top-k score. The runner clears the final output before every COMBINE launch,
+including CUDA Graph replay; no extra metadata conversion kernel is needed.
+Top-k is specialized during plan preparation, so one frozen recipe serves all
+supported routing configurations without a runtime cuDNN dependency.
+
+COMBINE candidates are limited to the validated range `1 <= top_k <= 8`.
+Larger top-k values remain supported through ordinary FC2 and FP32 finalization.
+This bound applies to both live and captured selection, including complete
+shortlist profiles. BF16 accumulation can lose substantial contributions at
+large fan-out; changing the atomic order does not prevent that loss.
+
+COMBINE rounds each weighted contribution to BF16 and accumulates in BF16,
+instead of materializing each expert's BF16 result before FP32 weighting and
+reduction. It therefore has a distinct numerical contract and ABI
+`cudnn_frost_block_scale_grouped_gemm2_combine` (with `_swap_ab` for the swapped
+orientation). Existing FC2/finalize candidates
+remain available. Offline shortlists retain their original choices and add a
+bounded COMBINE pool for online tuning. FC2 stage ranking includes finalization
+for both paths. Ordinary FC2 and COMBINE use separate routing layouts, so each
+layout is prepared and ranked independently. When both are present, the best
+candidate from each layout enters complete-pipeline tuning, which makes the
+final choice including routing costs. Stage timing excludes preparation; all
+candidates within a ranking call consume the same valid metadata layout.
+SM120 and standalone grouped GEMM calls retain their existing paths.
+
+To regenerate a COMBINE recipe with the local Frontend exporter, use NVFP4
+`--op grouped_gemm2 --combine-output --cta-group 1 --store-mode stg` and a
+qualified SM107 singleton config, or `--cta-group 2` with
+`CONFIG_sm100_256x256x128_128x256x64_cluster2x1_2ctamma_swapAB`.
+Its reported STG store mode denotes the fused reduction; the exporter preserves
+the bulk COMBINE staging path.
+
 On SM107a, normal-orientation FC1 also has a fused quantization variant. Its
 graph marks the post-activation intermediate as BF16 before applying the FP32
 global quantization scale. Frost preserves that BF16 conversion in registers,
@@ -663,7 +738,30 @@ backends that support it (TRT-LLM BF16 supports SwiGLU and ReLU2).
 
 ## Independent full MoE and automatic selection
 
-The full path is:
+On SM107a, all four dtypes also offer dedicated GATHER FC1 kernels, in normal
+and swap-AB orientations with one- or two-CTA MMA. Routing creates expert
+offsets and a grouped-row-to-input-token index on the device. FC1 gathers the
+original input rows inside its asynchronous mainloop, avoiding the expanded
+token buffer's write/read pass. Block-scale input scales use linear rows with
+a 16-byte-aligned pitch; already aligned linear scales are borrowed directly,
+and other input layouts are converted once per original token. Weight scales
+and FC2's intermediate scales retain their existing layouts.
+
+The catalog records this ABI as `moe_mode=gather` with a `token_index` launch
+prefix. The exporter accepts `--gather-input` for FC1. These frozen Python
+sources have no runtime cuDNN Frontend dependency. Device preparation sizes
+the GATHER scale scratch and AB rings together, including descriptor-root
+limits. The standalone APIs for already grouped inputs continue to discover
+the NONE-mode kernels by default.
+
+MoELayer keeps the pre-gathered candidates and adds a bounded GATHER pool.
+Stage tuning prepares the two input layouts separately, then complete-pipeline
+tuning includes routing and input-scale conversion when selecting a winner.
+GATHER FC1 can be paired with either ordinary FC2 or NVFP4 COMBINE FC2.
+Normal-orientation block-scale GATHER also offers fused intermediate
+quantization. SM120a retains its existing templates.
+
+The pre-gathered full path is:
 
 ```text
 precomputed top-k ids/weights
@@ -913,7 +1011,14 @@ MXFP4), each with its `_swap_ab` counterpart. Up to eight compute warps issue
 warp-level `mma.sync` from TMA-filled shared memory: block-scaled
 `kind::mxf8f6f4` for MXFP8 and MXFP8 × MXFP4 (E2M1 weights unpacked in
 registers) and `kind::mxf4nvf4` for NVFP4, with the scale factors as register
-operands. A scheduler warp runs the same grouped persistent scheduler as SM100.
+operands. The MXFP8 × MXFP4 sources create their A and B TMA descriptors with
+CUTLASS's default 128-byte L2 promotion: the packed E2M1 weight has 64-byte K
+rows (128 values per fp8 K-tile), and without the hint every row is its own
+DRAM request, which held the W4A8 kernels at ~0.85 TB/s on an RTX PRO 6000
+(FC1 of 12 experts, 7168/3072, 16 tokens: 343 µs) against 1.19 TB/s and 253 µs
+with it, level with the CuTe-DSL and CUTLASS mixed-input kernels. The BF16,
+MXFP8 and NVFP4 SM120 sources still carry the DSL default (no promotion);
+128-byte rows measure the same either way, 64-byte BF16 K tiles do not. A scheduler warp runs the same grouped persistent scheduler as SM100.
 The templates address tokens and token scales by coordinate on one global TMA
 descriptor each and store through STG, so they patch no tensormap: the
 workspace is one 128-byte scheduler-counter slot. There is no CTA pair,
@@ -928,7 +1033,12 @@ activation of the topology expands through its exact source fragments. Kernel
 IDs start with `sm120_cudnn_frost_`, and catalog and shortlist records carry
 `arch: sm_120a`.
 
-All SM120 sources are exported from cuDNN Frontend `89f40871`. Each host
+The current SM120 producer revision is listed at the start of this document.
+It includes TMA L2 promotion on every SM120 template and sizes the packed
+E2M1 side of a mixed pair at its 64-byte row in the SMEM footprint check,
+as `device.py` does here. It also masks K-padding scale bytes in block-scale
+mainloops and uses an unsigned ballot when finding the scheduler's winning
+lane. Each host
 zeroes its scheduler counter with a one-thread kernel before the PDL main
 launch, as the SM100 MoE hosts do, so the exported TVM-FFI function needs no
 caller-side reset. Like the SM107 sources, the schedulers take `G+1` explicit
@@ -949,6 +1059,17 @@ fuse the intermediate quantization (E4M3 data and segmented E8M0 scales, both
 through STG) in the normal orientation, for the tiles whose warp tile drains
 whole 32-column quantization blocks. cuDNN Frost cannot store packed FP4 on
 SM120, so NVFP4 plans always use the separate intermediate quantizer.
+
+The SM120 MXFP8 × MXFP4 shortlists were re-measured after the promotion fix
+(the ranking changed: the shipped tables, measured on the unpromoted kernels,
+kept narrow tiles that had been fastest), cold in L2, through the complete
+MoE pipeline with the other stage fixed to its autotuned winner: every legal
+FC1 kernel (SwiGLU for the gated class, ReLU2 for the non-gated one, the other
+activations taking their class's tiles) ranked by its stage time plus the
+requantization launch it does or does not need, every FC2 kernel by its stage
+time, uniform routing at every bucket and skewed routing at 128, 512 and 2048
+tokens, geometric mean of the per-routing normalized latencies, two per stage
+and profile, with a 1024-token bucket added to the eight shipped ones.
 
 Admission, token-count shortlists, the heuristic pool for unlisted shapes,
 the native routing/finalize adapters and the MoELayer
@@ -1157,7 +1278,7 @@ Example build-box export (repeat with the other tile/store modes and shape):
 python -m flashinfer.fused_moe.backends.cudnn_frost.export \
   --op grouped_gemm2 \
   --output-dir flashinfer/fused_moe/backends/cudnn_frost/artifacts/bf16 \
-  --cudnn-frost-revision 667fe4ce8ce437866217066f075fd4dcecad6eac \
+  --cudnn-frost-revision 0d72d59efd21401c7e13d606584fef2544e45934 \
   --config CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma \
   --cta-group 2 --store-mode stg --experts 12 --n 7168 --k 3072
 ```
@@ -1209,7 +1330,7 @@ CuTe DSL revisions:
 ```bash
 python -m flashinfer.fused_moe.backends.cudnn_frost.export \
   --output-dir flashinfer/fused_moe/backends/cudnn_frost/artifacts/bf16 \
-  --cudnn-frost-revision 667fe4ce8ce437866217066f075fd4dcecad6eac \
+  --cudnn-frost-revision 0d72d59efd21401c7e13d606584fef2544e45934 \
   --config CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma \
   --store-mode tma \
   --experts 8 --n 256 --k 128

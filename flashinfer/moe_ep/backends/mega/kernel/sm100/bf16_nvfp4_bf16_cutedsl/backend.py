@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ......config import BootstrapConfig, FleetParams
+from ......config import BootstrapConfig, FinalizeMode, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.kernel.workspace_pool import epilogue_pool_key, knobs_pool_key
@@ -46,7 +46,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config = config
-        self.supports_unfinalized_output = not config.do_finalize
+        self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
         self._autotune_pending = config.knobs == "auto"
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
@@ -115,8 +115,8 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
-            apply_topk_in_fc1=k.apply_topk_in_fc1,
-            defer_topk_reduce=not k.do_finalize,
+            apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
+            use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
@@ -135,9 +135,9 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             self.ep_world_size,
             gate_up_clamp=config.gate_up_clamp,
             activation_clamp=config.activation_clamp,
-            apply_topk_in_fc1=config.apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=(config.apply_routing_weights_before_fc2),
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
-            defer_topk_reduce=not config.do_finalize,
+            use_custom_finalize=config.finalize_mode is FinalizeMode.NONE,
             fc1_alpha=config.fc1_alpha,
             fc2_alpha=config.fc2_alpha,
             fc1_norm_const=config.fc1_norm_const,
@@ -148,7 +148,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             situ_linear_beta=config.situ_linear_beta,
             knobs=self._workspace_knobs(fleet_params),
         )
-        if not config.do_finalize:
+        if config.finalize_mode is FinalizeMode.NONE:
             workspace._unfinalized_route_map = torch.arange(
                 fleet_params.max_tokens_per_rank * config.top_k,
                 dtype=torch.int32,
@@ -156,7 +156,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             ).view(fleet_params.max_tokens_per_rank, config.top_k)
             workspace._unfinalized_weights = (
                 torch.ones_like(workspace.topk_weights)
-                if config.apply_topk_in_fc1
+                if config.apply_routing_weights_before_fc2
                 else workspace.topk_weights
             )
         return workspace
@@ -179,9 +179,9 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             config.intermediate_size,
             config.top_k,
             _resolve_gate_up_clamp(config),
-            config.apply_topk_in_fc1,
+            config.apply_routing_weights_before_fc2,
             config.enable_in_kernel_fc2_reduce,
-            config.do_finalize,
+            config.finalize_mode,
             epilogue_pool_key(config.fc1_alpha),
             epilogue_pool_key(config.fc2_alpha),
             epilogue_pool_key(config.fc1_norm_const),
@@ -322,7 +322,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         from ......cute_dsl.megamoe.bf16_nvfp4 import bf16_nvfp4_mega_moe
 
         if self.supports_unfinalized_output:
-            raise ValueError("do_finalize=False requires compute_unfinalized()")
+            raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
         try:
             if self._autotune_pending:
                 from ......cute_dsl.megamoe.bf16_nvfp4 import (
@@ -368,7 +368,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         from ......cute_dsl.megamoe.bf16_nvfp4 import bf16_nvfp4_mega_moe
 
         if not self.supports_unfinalized_output:
-            raise ValueError("compute_unfinalized() requires do_finalize=False")
+            raise ValueError("compute_unfinalized() requires finalize_mode=NONE")
         if workspace._staging_inputs is None:
             raise ValueError("compute_unfinalized() requires stage_inputs() first")
         num_tokens = workspace._staging_inputs[0].shape[0]

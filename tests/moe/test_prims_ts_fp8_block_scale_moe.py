@@ -42,11 +42,6 @@ def cache_permute_indices():
     return {}
 
 
-def _skip_prims_ts_on_sm107() -> None:
-    if get_compute_capability(torch.device("cuda")) == (10, 7):
-        pytest.skip("Prims-TS MoE kernels support SM100 and SM103, not SM107")
-
-
 @pytest.mark.parametrize(
     ("quant_mode", "case_id"),
     [
@@ -59,7 +54,6 @@ def test_prims_ts_fp8_block_scale_moe_smoke(
     case_id,
     cache_permute_indices,
 ):
-    _skip_prims_ts_on_sm107()
     if case_id == "deepseek":
         num_tokens = 128
         hidden_size = 512
@@ -108,7 +102,6 @@ def test_prims_ts_fp8_block_scale_moe_smoke(
 def test_prims_ts_deepseek_fp8_block_scale_tile16_smoke(
     cache_permute_indices,
 ):
-    _skip_prims_ts_on_sm107()
     run_moe_test(
         num_tokens=128,
         hidden_size=512,
@@ -143,8 +136,50 @@ def test_prims_ts_deepseek_fp8_block_scale_tile16_smoke(
     )
 
 
+def test_prims_ts_deepseek_fp8_block32_smoke(cache_permute_indices):
+    """[32,32] DeepSeek scales at a TP-sharded intermediate size.
+
+    ``intermediate_size=160`` is the TP4 shard of a 640-wide expert: FC1 has
+    320 rows (a partial 128-row weight tile) and FC2 reduces over K=160 (a
+    partial 128-wide K tile). The group-32 activation requantization is
+    covered through FC2 and the final comparison.
+    """
+    run_moe_test(
+        num_tokens=128,
+        hidden_size=512,
+        intermediate_size=160,
+        moe_impl=FP8BlockScaleMoe(
+            fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK,
+            block_size=32,
+        ),
+        routing_config={
+            "num_experts": 64,
+            "top_k": 8,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.Renormalize,
+            "compatible_moe_impls": [FP8BlockScaleMoe],
+            "compatible_intermediate_size": [160],
+            "compatible_activation_types": [ActivationType.Swiglu],
+            "enable_autotune": False,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP8BlockScaleMoe],
+            "compatible_gemm_backends": [MoeGemmBackend.PRIMS_TS],
+        },
+        activation_type=ActivationType.Swiglu,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.bfloat16,
+        moe_gemm_backend=MoeGemmBackend.PRIMS_TS,
+    )
+
+
 def test_prims_ts_deepseek_fp8_accepts_fp32_logits(cache_permute_indices):
-    _skip_prims_ts_on_sm107()
     run_moe_test(
         num_tokens=32,
         hidden_size=512,
@@ -192,8 +227,6 @@ def test_prims_ts_mxfp8_block_scale_bias(
     moe_gemm_backend,
     cache_permute_indices,
 ):
-    if moe_gemm_backend is MoeGemmBackend.PRIMS_TS:
-        _skip_prims_ts_on_sm107()
     num_tokens = 32
     hidden_size = 512
     intermediate_size = 512
@@ -252,10 +285,11 @@ def test_prims_ts_mxfp8_block_scale_routed_modes_match_logits(
     cache_permute_indices,
 ):
     """Packed and unpacked MXFP8 Prims-TS routed inputs match the logits path."""
-    _skip_prims_ts_on_sm107()
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
-        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+        pytest.skip(
+            "These tests are only guaranteed to work on SM100, SM103, and SM107 GPUs."
+        )
     if not is_prims_ts_available():
         pytest.skip("Prims-TS dependencies are unavailable")
 

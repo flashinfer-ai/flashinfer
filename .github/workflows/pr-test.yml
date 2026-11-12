@@ -1,10 +1,15 @@
 # CI workflow using AWS self-hosted runners.
-# Runs AOT build tests and GPU unit tests on push/PR to main.
+# Runs AOT build tests, GPU unit tests and the CPU-only tests/cpu suite on PRs
+# to main, and on main itself on a schedule.
 # Uses ci/bash.sh for Docker execution (same as Jenkins).
 #
 # Permission Control:
-# - Push to main: Always runs
-# - PRs: run only when the 'run-ci' label is applied, for every contributor.
+# - main: a scheduled full-suite run three times a day (not per merge). Per-merge
+#   runs shared one cancel-in-progress group, so each merge cancelled the last:
+#   about 90% of them never finished. A scheduled run is never cancelled, runs
+#   every lane to completion (no fail-fast), and a failure opens or updates a
+#   tracking issue; the next green run closes it.
+# - PRs: run when 'run-ci' or the bot's 'run-ci-focused' label is applied.
 #   Applying the label is the trigger, so new commits need a new trigger:
 #   @flashinfer-bot run.
 #
@@ -20,8 +25,10 @@
 name: PR Test
 
 on:
-  push:
-    branches: [main]
+  # Off the 00:00 UTC nightly-release slot; one run per Asia / EU / US workday.
+  # Minute 17, not 0: GitHub delays or drops scheduled runs at the top of the hour.
+  schedule:
+    - cron: '17 4,12,20 * * *'
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, labeled, ready_for_review]
@@ -39,8 +46,11 @@ on:
 concurrency:
   # A label other than run-ci can never start tests, so it gets its own group and
   # does not cancel - otherwise label churn would discard running GPU jobs.
-  group: pr-test-${{ github.ref }}${{ (github.event.action == 'labeled' && github.event.label.name != 'run-ci') && '-noop' || '' }}
-  cancel-in-progress: ${{ !(github.event.action == 'labeled' && github.event.label.name != 'run-ci') }}
+  # Scheduled runs on main get their own group and never cancel each other: at
+  # most one runs and one waits, so a slow run delays the next instead of wasting
+  # itself.
+  group: pr-test-${{ github.event_name == 'schedule' && 'scheduled-' || '' }}${{ github.ref }}${{ (github.event.action == 'labeled' && github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-focused') && '-noop' || '' }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' && !(github.event.action == 'labeled' && github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-focused') }}
 
 permissions:
   contents: read
@@ -69,7 +79,7 @@ jobs:
           EVENT_ACTION: ${{ github.event.action }}
           LABEL_NAME: ${{ github.event.label.name }}
         run: |
-          # Always allow push to main and workflow_dispatch
+          # Always allow scheduled runs on main and workflow_dispatch
           if [[ "${{ github.event_name }}" != "pull_request" ]]; then
             echo "authorized=true" >> "$GITHUB_OUTPUT"
             echo "Not a PR, authorized"
@@ -79,9 +89,9 @@ jobs:
           # Authorize on run-ci being applied, not on it being present: presence
           # would re-authorize every later push, which is the auto-trigger this
           # gate removes.
-          if [[ "$EVENT_ACTION" == "labeled" && "$LABEL_NAME" == "run-ci" ]]; then
+          if [[ "$EVENT_ACTION" == "labeled" && ( "$LABEL_NAME" == "run-ci" || "$LABEL_NAME" == "run-ci-focused" ) ]]; then
             echo "authorized=true" >> "$GITHUB_OUTPUT"
-            echo "run-ci label applied, authorized"
+            echo "$LABEL_NAME label applied, authorized"
             exit 0
           fi
 
@@ -103,11 +113,92 @@ jobs:
       test_count: ${{ steps.matrix.outputs.count }}
       # Surfaced so the required check can say a green result was scoped.
       test_scope: ${{ steps.scope.outputs.test_path }}
+      h100_disabled: ${{ steps.matrix.outputs.h100_disabled }}
+      spec_lint_matrix: ${{ steps.matrix.outputs.spec_lint_matrix }}
+      spec_lint_count: ${{ steps.matrix.outputs.spec_lint_count }}
+      checkout_sha: ${{ steps.scope.outputs.checkout_sha || github.sha }}
+      snapshot_base: ${{ steps.scope.outputs.snapshot_base }}
+      snapshot_tree: ${{ steps.scope.outputs.snapshot_tree }}
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      # Built here rather than written inline in the test job because the
+      # `@flashinfer-bot run <paths>` publishes the requested scope as a `ci/test-scope`
+      # commit status on this SHA (see ci-bot-commands.yml). Read it verbatim - the
+      # comment was parsed once, there, and nothing is re-parsed here.
+      #
+      # Statuses come back newest-first, so the newest for this context is the last
+      # command issued. No status means nobody asked for a scope: run the full suite.
+      # Because the status is keyed to the SHA, a scope cannot outlive the commit it was
+      # requested for.
+      - name: Read requested test scope
+        id: scope
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_SHA: ${{ github.sha }}
+          REQUIRE_SNAPSHOT: ${{ github.event.label.name == 'run-ci-focused' }}
+        run: |
+          # The combined endpoint (/status, not /statuses) returns one entry per
+          # context, already the latest. Using it means re-triggering overwrites
+          # cleanly without this step deduplicating by hand, and without depending on
+          # the raw list's ordering, which is not a documented guarantee.
+          STATUSES=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status")
+          SCOPE=$(jq -r '
+              .statuses
+              | map(select(.context | test("^ci/test-scope-[0-9]+$")))
+              | map({n: (.context | sub("^ci/test-scope-"; "") | tonumber),
+                     d: (.description // "")})
+              | sort_by(.n) | map(.d) | map(select(. != "")) | join(" ")' <<< "$STATUSES")
+          SNAPSHOT=$(jq -r '[.statuses[] | select(.context == "ci/test-snapshot")][0].description // ""' <<< "$STATUSES")
+          if [ "${REQUIRE_SNAPSHOT:-false}" = true ] && [ -z "$SNAPSHOT" ]; then
+            echo "::error::Automatic test snapshot was cleared or is missing. Issue a new bot run command."
+            exit 1
+          fi
+          if [ -n "$SNAPSHOT" ]; then
+            if [[ ! "$SNAPSHOT" =~ ^[0-9a-f]{40}\ [0-9a-f]{40}\ [0-9a-f]{40}\ [0-9a-f]{16}$ ]]; then
+              echo "::error::Invalid automatic test snapshot. Issue a new bot run command."
+              exit 1
+            fi
+            read -r SELECTED_BASE SELECTED_MERGE SELECTED_TREE SELECTED_SCOPE <<< "$SNAPSHOT"
+            ACTUAL_SCOPE=$(printf '%s' "$SCOPE" | sha256sum | cut -c1-16)
+            if [ "$ACTUAL_SCOPE" != "$SELECTED_SCOPE" ]; then
+              echo "::error::The automatic scope does not match its snapshot. Issue a new bot run command."
+              exit 1
+            fi
+            # Reconstruct the selected source independently of GitHub's merge ref.
+            # No PR scripts, hooks, or submodule contents run during preparation.
+            for sha in "$SELECTED_BASE" "$HEAD_SHA"; do
+              git cat-file -e "${sha}^{commit}" 2>/dev/null || git fetch --no-tags origin "$sha"
+            done
+            git -c core.hooksPath=/dev/null checkout --detach "$SELECTED_BASE"
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+              git -c user.name=flashinfer-ci -c user.email=flashinfer-ci@nvidia.com \
+              -c core.hooksPath=/dev/null -c rerere.enabled=false \
+              merge --no-ff --no-edit "$HEAD_SHA"
+            ACTUAL_TREE=$(git rev-parse 'HEAD^{tree}')
+            if [ "$ACTUAL_TREE" != "$SELECTED_TREE" ]; then
+              echo "::error::Merged source differs from AI-selected tree. Issue a new bot run command."
+              exit 1
+            fi
+            echo "Verified AI-selected tree $ACTUAL_TREE (selection $SELECTED_MERGE)"
+            echo "checkout_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            echo "snapshot_base=${SELECTED_BASE}" >> "$GITHUB_OUTPUT"
+            echo "snapshot_tree=${SELECTED_TREE}" >> "$GITHUB_OUTPUT"
+          else
+            echo "checkout_sha=${EVENT_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -z "$SCOPE" ]; then
+            echo "No requested scope for ${HEAD_SHA}; running the full suite"
+          else
+            echo "Requested scope: ${SCOPE}"
+          fi
+          echo "test_path=${SCOPE}" >> "$GITHUB_OUTPUT"
 
       - name: Validate CUDA configuration
         run: python3 ci/validate_cuda_versions.py
@@ -164,39 +255,6 @@ jobs:
             echo "::notice::Skipping build - only docs/config files changed"
           fi
 
-      # Built here rather than written inline in the test job because the
-      # `@flashinfer-bot run <paths>` publishes the requested scope as a `ci/test-scope`
-      # commit status on this SHA (see ci-bot-commands.yml). Read it verbatim - the
-      # comment was parsed once, there, and nothing is re-parsed here.
-      #
-      # Statuses come back newest-first, so the newest for this context is the last
-      # command issued. No status means nobody asked for a scope: run the full suite.
-      # Because the status is keyed to the SHA, a scope cannot outlive the commit it was
-      # requested for.
-      - name: Read requested test scope
-        id: scope
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          # The combined endpoint (/status, not /statuses) returns one entry per
-          # context, already the latest. Using it means re-triggering overwrites
-          # cleanly without this step deduplicating by hand, and without depending on
-          # the raw list's ordering, which is not a documented guarantee.
-          SCOPE=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" --jq '
-              .statuses
-              | map(select(.context | test("^ci/test-scope-[0-9]+$")))
-              | map({n: (.context | sub("^ci/test-scope-"; "") | tonumber),
-                     d: (.description // "")})
-              | sort_by(.n) | map(.d) | map(select(. != "")) | join(" ")')
-          if [ -z "$SCOPE" ]; then
-            echo "No requested scope for ${HEAD_SHA}; running the full suite"
-          else
-            echo "Requested scope: ${SCOPE}"
-          fi
-          echo "test_path=${SCOPE}" >> "$GITHUB_OUTPUT"
-
       # skip_aot / skip_gpu dispatch inputs have to drop entries before the
       # matrix expands - a job-level `if` cannot see the matrix context, and
       # skipping inside the job would still claim a runner first.
@@ -209,20 +267,40 @@ jobs:
           # Targets requested by the triggering `@flashinfer-bot run <paths>` comment,
           # already validated in the step above. Empty for an unparameterised run.
           REQUESTED_TEST_PATH: ${{ steps.scope.outputs.test_path }}
+          H100_ON_PRS: 'true'
+          EVENT_NAME: ${{ github.event_name }}
         run: |
+          RUN_H100=true
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$H100_ON_PRS" != "true" ]; then
+            RUN_H100=false
+            echo "::notice title=H100 lane disabled on PRs::H100 tests run only in scheduled main runs and manual workflow_dispatch runs until runner capacity is restored" >&2
+          fi
+          echo "h100_disabled=$([ "$RUN_H100" = "true" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
           # A targeted run on a lane never tests more than that lane's bare run: H100
           # gets the request as-is (its bare run covers tests/); A10G and T4 get it
           # intersected with their shard lists, and a lane left with nothing is skipped.
-          A10G_SCOPE=""; T4_SCOPE=""
+          # A10G is intersected per shard: each shard whose files overlap the request
+          # runs as its own job, so a targeted run keeps the bare run's balancing and
+          # -k splits, and shards left with nothing are not scheduled.
+          A10G_SCOPES=(); T4_SCOPE=""; H100_SCOPE=""
           if [ "$SKIP_GPU" != "true" ] && [ -n "${REQUESTED_TEST_PATH}" ]; then
-            A10G_SCOPE=$(python3 scripts/pr_checks/targeted_lane_scope.py \
-              --scripts scripts/task_jit_run_tests_part{1,2,3,4,5}.sh \
-              --targets "${REQUESTED_TEST_PATH}")
+            for shard in 1 2 3 4 5; do
+              A10G_SCOPES[$shard]=$(python3 scripts/pr_checks/targeted_lane_scope.py \
+                --scripts "scripts/task_jit_run_tests_part${shard}.sh" \
+                --targets "${REQUESTED_TEST_PATH}")
+              echo "A10G shard ${shard} targeted scope: ${A10G_SCOPES[$shard]:-<none: shard not scheduled>}"
+            done
             T4_SCOPE=$(python3 scripts/pr_checks/targeted_lane_scope.py \
               --scripts scripts/task_jit_run_tests_t4.sh \
               --targets "${REQUESTED_TEST_PATH}")
-            echo "A10G targeted scope: ${A10G_SCOPE:-<none: lane not scheduled>}"
             echo "T4 targeted scope:   ${T4_SCOPE:-<none: lane not scheduled>}"
+            # tests/cpu belongs to the CPU Unittest lane, which runs on every run.
+            # The H100 lane ignores it, so drop it from the H100 scope here: a
+            # request naming only tests/cpu then schedules no H100 job instead of
+            # one that collects nothing.
+            H100_SCOPE=$(tr ' ' '\n' <<< "${REQUESTED_TEST_PATH}" \
+              | grep -Ev '^tests/+cpu(/|$)' | paste -sd ' ' - || true)
+            echo "H100 targeted scope: ${H100_SCOPE:-<none: lane not scheduled>}"
           fi
           {
             if [ "$SKIP_AOT" != "true" ]; then
@@ -247,11 +325,33 @@ jobs:
               done
             fi
 
+            # tests/cpu runs on every run, whatever scope was requested. Its
+            # tests check contracts across modules (package parity, stub
+            # configs, wrapper attributes), so a change in one directory breaks
+            # a CPU test that a scope naming that directory would not select.
+            # It needs no GPU and takes about 5 minutes on a CPU runner, and
+            # through fail-fast it stops the GPU lanes early when it fails.
+            # The GPU lanes leave it out: the H100 lane ignores tests/cpu and
+            # the A10G/T4 shard lists name no file under it.
+            if [ "$SKIP_GPU" != "true" ]; then
+              jq -nc '{
+                name: "CPU Unittest",
+                kind: "cpu",
+                gpu_name: "CPU",
+                runner: ["self-hosted", "linux", "x64", "cpu", "on-demand"],
+                cuda: "cu129",
+                script: "task_run_unit_tests.sh",
+                test_path: "tests/cpu",
+                timeout: 60
+              }'
+            fi
+
             if [ "$SKIP_GPU" != "true" ] && [ -z "${REQUESTED_TEST_PATH}" ]; then
               for shard in 1 2 3 4 5; do
                 jq -nc --arg shard "$shard" '{
                   name: "JIT Unittest \($shard) (A10G)",
                   kind: "gpu",
+                  gpu_name: "A10G",
                   runner: ["self-hosted", "linux", "x64", "gpu", "sm86", "on-demand"],
                   cuda: "cu129",
                   script: "task_jit_run_tests_part\($shard).sh",
@@ -262,50 +362,58 @@ jobs:
               jq -nc '{
                 name: "JIT Unittest (T4)",
                 kind: "gpu",
+                gpu_name: "T4",
                 runner: ["self-hosted", "linux", "x64", "gpu", "sm75", "on-demand"],
                 cuda: "cu129",
                 script: "task_jit_run_tests_t4.sh",
                 timeout: 360
               }'
 
-              jq -nc '{
-                name: "JIT Unittest (H100)",
-                kind: "h100",
-                runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
-                cuda: "cu129",
-                script: "task_run_unit_tests.sh",
-                timeout: 480
-              }'
+              if [ "$RUN_H100" = "true" ]; then
+                jq -nc '{
+                  name: "JIT Unittest (H100)",
+                  kind: "h100",
+                  gpu_name: "H100",
+                  runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
+                  cuda: "cu129",
+                  script: "task_run_unit_tests.sh",
+                  timeout: 480
+                }'
+              fi
             elif [ "$SKIP_GPU" != "true" ]; then
               # A `@flashinfer-bot run <paths>` comment retargets the GPU lanes at those
               # paths. There is deliberately no arch selection: tests carry their own
               # arch guards (is_sm90a_supported() and friends) and skip themselves where
               # unsupported - nobody has to keep a path-to-arch mapping in sync with the
-              # tests. Per-lane scopes (A10G_SCOPE / T4_SCOPE) are computed above the
+              # tests. Per-lane scopes (A10G_SCOPES / T4_SCOPE) are computed above the
               # brace group, which is piped into jq and so runs in a subshell.
               #
-              # The default shards (task_jit_run_tests_part*.sh) are fixed pytest lists
-              # and take no arguments, so a targeted run uses task_run_unit_tests.sh --
-              # the script that forwards "$@" into TEST_PATH -- on every GPU runner.
+              # A10G runs its bare-run shard scripts, restricted to the scope through
+              # JIT_TEST_SCOPE (see scripts/jit_test_logging.sh). T4 and H100 use
+              # task_run_unit_tests.sh, the script that forwards "$@" into TEST_PATH.
               #
               # This step does NOT parse the PR body. Turning a declared scope into paths
               # happens once, in whoever issues the trigger (a reviewer, or the screening
               # watcher posting under its own identity). CI runs what it is told.
-              if [ -n "${A10G_SCOPE}" ]; then
-                jq -nc --arg test_path "${A10G_SCOPE}" '{
-                  name: "Targeted Unittest (A10G)",
-                  kind: "gpu",
-                  runner: ["self-hosted", "linux", "x64", "gpu", "sm86", "on-demand"],
-                  cuda: "cu129",
-                  script: "task_run_unit_tests.sh",
-                  test_path: $test_path,
-                  timeout: 360
-                }'
-              fi
+              for shard in 1 2 3 4 5; do
+                if [ -n "${A10G_SCOPES[$shard]:-}" ]; then
+                  jq -nc --arg shard "$shard" --arg test_path "${A10G_SCOPES[$shard]}" '{
+                    name: "Targeted Unittest \($shard) (A10G)",
+                    kind: "gpu",
+                    gpu_name: "A10G",
+                    runner: ["self-hosted", "linux", "x64", "gpu", "sm86", "on-demand"],
+                    cuda: "cu129",
+                    script: "task_jit_run_tests_part\($shard).sh",
+                    test_path: $test_path,
+                    timeout: 360
+                  }'
+                fi
+              done
               if [ -n "${T4_SCOPE}" ]; then
                 jq -nc --arg test_path "${T4_SCOPE}" '{
                   name: "Targeted Unittest (T4)",
                   kind: "gpu",
+                  gpu_name: "T4",
                   runner: ["self-hosted", "linux", "x64", "gpu", "sm75", "on-demand"],
                   cuda: "cu129",
                   script: "task_run_unit_tests.sh",
@@ -313,21 +421,39 @@ jobs:
                   timeout: 360
                 }'
               fi
-              jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
-                name: "Targeted Unittest (H100)",
-                kind: "h100",
-                runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
-                cuda: "cu129",
-                script: "task_run_unit_tests.sh",
-                test_path: $test_path,
-                timeout: 480
-              }'
+              if [ "$RUN_H100" = "true" ] && [ -n "${H100_SCOPE}" ]; then
+                jq -nc --arg test_path "${H100_SCOPE}" '{
+                  name: "Targeted Unittest (H100)",
+                  kind: "h100",
+                  gpu_name: "H100",
+                  runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
+                  cuda: "cu129",
+                  script: "task_run_unit_tests.sh",
+                  test_path: $test_path,
+                  timeout: 480
+                }'
+              fi
             fi
           } | jq -sc '{include: .}' > matrix.json
 
           echo "matrix=$(cat matrix.json)" >> $GITHUB_OUTPUT
           echo "count=$(jq '.include | length' matrix.json)" >> $GITHUB_OUTPUT
           jq -r '.include[].name' matrix.json
+
+          # Provider spec lint: one quick lane per published CUDA image, ahead of the
+          # hours-long AOT builds it guards, so a spec naming a CUDA target its
+          # provider cannot carry fails the PR in minutes. Dropped with the AOT lanes.
+          {
+            if [ "$SKIP_AOT" != "true" ]; then
+              for cuda in $(jq -r '.[].label' <<< "${RUNTIME_CUDA_MATRIX}"); do
+                if grep -q "^flashinfer/flashinfer-ci-${cuda}:" ci/docker-tags.yml; then
+                  jq -nc --arg cuda "$cuda" '{cuda: $cuda}'
+                fi
+              done
+            fi
+          } | jq -sc '{include: .}' > spec-lint-matrix.json
+          echo "spec_lint_matrix=$(cat spec-lint-matrix.json)" >> "$GITHUB_OUTPUT"
+          echo "spec_lint_count=$(jq '.include | length' spec-lint-matrix.json)" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Tests - AOT build imports and GPU unit tests
@@ -336,6 +462,8 @@ jobs:
   # them on the first failure. As separate jobs, fail-fast is scoped per group
   # and the other groups keep running on billed on-demand capacity long after
   # the result is known. Entries still start in parallel; nothing is serialized.
+  # Scheduled runs on main turn fail-fast off: they exist to report every broken
+  # lane, not the first one.
   # ---------------------------------------------------------------------------
   test:
     name: ${{ matrix.name }}
@@ -346,18 +474,35 @@ jobs:
       needs.setup.outputs.test_count != '0'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
+    permissions:
+      contents: read
+      actions: read
+      # Scheduled runs on main request the compile-cache upload role (see
+      # "Get compile cache upload credentials"). The role's trust policy, not
+      # this file, restricts it to refs/heads/main: a pull request run, even
+      # one that edits this workflow, gets a token whose subject the policy
+      # rejects.
+      id-token: write
     strategy:
-      fail-fast: true
+      fail-fast: ${{ github.event_name != 'schedule' }}
       matrix: ${{ fromJSON(needs.setup.outputs.test_matrix) }}
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
       MATRIX_ARCH: ${{ matrix.runner[2] }}
       MATRIX_CUDA: ${{ matrix.cuda }}
+      CI_GPU_NAME: ${{ matrix.gpu_name }}
       MATRIX_KIND: ${{ matrix.kind }}
       TEST_SCRIPT: ${{ matrix.script }}
       # Empty for every lane except the experimental one. Quoted at the use site and
       # never interpolated into script text - it originates from the PR body.
       TEST_PATH_ARG: ${{ matrix.test_path }}
+      # GPU lanes route their JIT compiles through the AOT lanes' S3 sccache.
+      # On unless the repository variable FLASHINFER_GPU_TEST_SCCACHE is '0',
+      # which turns it off for A/B timing without a code change. The `|| '1'`
+      # matters: an unset variable is null, and `null != '0'` is false because
+      # mismatched types are compared as numbers (null and '0' both become 0).
+      # The CPU lane compiles nothing, so it skips sccache too.
+      GPU_TEST_SCCACHE: ${{ matrix.kind != 'aot' && matrix.kind != 'cpu' && (vars.FLASHINFER_GPU_TEST_SCCACHE || '1') != '0' && '1' || '0' }}
     steps:
       - name: Cleanup
         if: matrix.kind != 'h100'
@@ -393,11 +538,32 @@ jobs:
 
       - uses: actions/checkout@v5
         with:
-          submodules: recursive
+          ref: ${{ needs.setup.outputs.checkout_sha }}
           # Self-hosted runners keep the workspace between jobs, so the token
           # must not be left behind in .git/config. Nothing here uses git after
-          # checkout, and submodules authenticate during the checkout itself.
+          # checkout. Submodules initialize after source snapshot verification.
           persist-credentials: false
+
+      - name: Prepare selected source and submodules
+        env:
+          SELECTED_BASE: ${{ needs.setup.outputs.snapshot_base }}
+          SELECTED_TREE: ${{ needs.setup.outputs.snapshot_tree }}
+        run: |
+          if [ -n "$SELECTED_BASE" ]; then
+            [[ "$SELECTED_BASE" =~ ^[0-9a-f]{40}$ && "$SELECTED_TREE" =~ ^[0-9a-f]{40}$ ]]
+            PINNED_HEAD=$(git rev-parse HEAD)
+            if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+              git fetch --no-tags --unshallow origin "$PINNED_HEAD" "$SELECTED_BASE"
+            fi
+            git cat-file -e "${SELECTED_BASE}^{commit}" 2>/dev/null || git fetch --no-tags origin "$SELECTED_BASE"
+            git -c core.hooksPath=/dev/null checkout --detach "$SELECTED_BASE"
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+              git -c user.name=flashinfer-ci -c user.email=flashinfer-ci@nvidia.com \
+              -c core.hooksPath=/dev/null -c rerere.enabled=false \
+              merge --no-ff --no-edit "$PINNED_HEAD"
+            [ "$(git rev-parse 'HEAD^{tree}')" = "$SELECTED_TREE" ]
+          fi
+          git submodule update --init --recursive
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -413,6 +579,10 @@ jobs:
           SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
           AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
+          # Provider builds overlapped per job (see the script). The repository
+          # variable AOT_PROVIDER_CONCURRENCY overrides it, and 1 restores the
+          # serial loop, for A/B timing without a code change.
+          AOT_PROVIDER_CONCURRENCY: ${{ vars.AOT_PROVIDER_CONCURRENCY || '2' }}
         run: |
           if [ "${TEST_SCRIPT}" != "task_test_jit_cache_package_build_import.sh" ]; then
             echo "::error::Unexpected AOT test script: ${TEST_SCRIPT}"
@@ -425,10 +595,170 @@ jobs:
             -e AWS_ACCESS_KEY_ID \
             -e AWS_SECRET_ACCESS_KEY \
             -e SCCACHE_STATS_DIR /workspace/sccache-stats \
+            -e AOT_PROVIDER_CONCURRENCY "${AOT_PROVIDER_CONCURRENCY}" \
             --no-gpu "./scripts/${TEST_SCRIPT}"
 
+      - name: Configure compile cache
+        if: matrix.kind != 'aot' && matrix.kind != 'cpu'
+        env:
+          S3_BUCKET: ${{ vars.SCCACHE_BUCKET || 'flashinfer-build-cache' }}
+          S3_REGION: ${{ vars.SCCACHE_REGION || 'us-west-2' }}
+          UPLOAD_ROLE: ${{ vars.COMPILE_CACHE_S3_ROLE_ARN }}
+        run: |
+          # Shared S3 layer of the compile cache (see ci/compile_cache_s3.sh):
+          # one tarball per CI image ID, GPU and lane. A10G shards test different
+          # files, so each shard is its own lane; targeted runs share the lane
+          # of the bare run they narrow.
+          case "${TEST_SCRIPT}" in
+            task_jit_run_tests_part[1-5].sh) LANE="${TEST_SCRIPT#task_jit_run_tests_}"; LANE="${LANE%.sh}" ;;
+            *) LANE=all ;;
+          esac
+          if [ -n "${S3_BUCKET}" ] && [ -n "${S3_REGION}" ]; then
+            echo "CI_COMPILE_CACHE_S3_URL=https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/compile-cache/main" >> "${GITHUB_ENV}"
+            echo "CI_COMPILE_CACHE_S3_LANE=${CI_GPU_NAME}/${LANE}" >> "${GITHUB_ENV}"
+            # Only scheduled runs on main write, and only once an admin has
+            # created the upload role. A writer compiles in a directory no
+            # earlier job on this runner (any of them a pull request) can have
+            # touched: a new path per job, and no shared pip cache, which PR
+            # containers write as root.
+            if [ "${GITHUB_EVENT_NAME}" = "schedule" ] && [ "${GITHUB_REF}" = "refs/heads/main" ] \
+                && [ -n "${UPLOAD_ROLE}" ]; then
+              echo "CI_COMPILE_CACHE_WRITER_DIR=$(mktemp -u "${RUNNER_TEMP}/compile-cache-writer.XXXXXXXX")" >> "${GITHUB_ENV}"
+              echo "CI_PIP_CACHE_DIR=" >> "${GITHUB_ENV}"
+            fi
+          fi
+
+      - name: Run Test
+        if: matrix.kind != 'aot'
+        env:
+          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
+          SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ env.GPU_TEST_SCCACHE == '1' && secrets.SCCACHE_AWS_ACCESS_KEY_ID || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.GPU_TEST_SCCACHE == '1' && secrets.SCCACHE_AWS_SECRET_ACCESS_KEY || '' }}
+          # Kernel compile cache kept across this runner's jobs (see ci/bash.sh).
+          # runner.workspace is the parent of the checkout, so the Cleanup step's
+          # wipe of the checkout leaves it, and on the H100 hosts it sits on the
+          # large NVMe work volume rather than the small root filesystem.
+          CI_COMPILE_CACHE_DIR: ${{ runner.workspace }}/flashinfer-compile-cache
+          CI_COMPILE_CACHE_RUNNER: ${{ runner.name }}
+          # PR/manual runs consume private copies. Only scheduled runs on main
+          # update seeds; main has no push trigger, so a push condition here
+          # would leave every seed empty.
+          CI_COMPILE_CACHE_MODE: ${{ github.event_name == 'schedule' && github.ref == 'refs/heads/main' && 'read-write' || 'read-only' }}
+        run: |
+          case "${TEST_SCRIPT}" in
+            task_jit_run_tests_part[1-5].sh|task_jit_run_tests_t4.sh|task_run_unit_tests.sh) ;;
+            *)
+              echo "::error::Unexpected GPU test script: ${TEST_SCRIPT}"
+              exit 1
+              ;;
+          esac
+          # ci/bash.sh options must precede the command. The credentials are
+          # forwarded by name so ci/bash.sh never echoes their values.
+          DOCKER_ARGS=()
+          LANE_COMMAND=("./scripts/${TEST_SCRIPT}")
+          if [ "${GPU_TEST_SCCACHE}" = "1" ]; then
+            mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
+            DOCKER_ARGS+=(
+              -e SCCACHE_BUCKET "${SCCACHE_BUCKET}"
+              -e SCCACHE_REGION "${SCCACHE_REGION}"
+              -e AWS_ACCESS_KEY_ID
+              -e AWS_SECRET_ACCESS_KEY
+              -e SCCACHE_STATS_DIR /workspace/sccache-stats
+            )
+            LANE_COMMAND=(./scripts/run_with_test_sccache.sh "${LANE_COMMAND[@]}")
+          fi
+          TEST_RUNNER_ARGS=()
+          if [ "${MATRIX_KIND}" = "h100" ]; then
+            TEST_RUNNER_ARGS+=(--workers-per-gpu 2)
+            # The CPU Unittest lane runs tests/cpu on every run, so the H100
+            # lane's tests/ collection leaves it out. ci/bash.sh appends its own
+            # --ignore and forwards PYTEST_ADDOPTS into GPU containers.
+            export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+${PYTEST_ADDOPTS} }--ignore=tests/cpu"
+          elif [ "${MATRIX_KIND}" = "cpu" ]; then
+            # No GPU in the container. ci/bash.sh forwards the lane identity
+            # only for GPU containers, so pass it here for summary.py.
+            # tests/cpu peaks near 4 GiB host RSS per file on H100, so 16
+            # workers fit the CPU runners the AOT lanes use (the arm64 one has
+            # 64 vCPU and ~500 GiB). More would not help: the slowest file,
+            # about 250 s, sets the floor.
+            DOCKER_ARGS+=(
+              --no-gpu
+              -e CI_GPU_NAME "${CI_GPU_NAME}"
+              -e CI_TEST_SCRIPT "${TEST_SCRIPT}"
+              -e CI_MATRIX_CUDA "${MATRIX_CUDA}"
+            )
+            TEST_RUNNER_ARGS+=(--workers 16)
+          fi
+          # Per-build compile times, summarized by the "Summarize JIT build times"
+          # step. Appended: DOCKER_ARGS already carries the sccache settings.
+          mkdir -p junit
+          DOCKER_ARGS+=(-e FLASHINFER_JIT_BUILD_LOG /workspace/junit/jit-builds.jsonl)
+          if [ "${MATRIX_KIND}" = "gpu" ] && [ "${TEST_SCRIPT}" = "task_run_unit_tests.sh" ]; then
+            # Targeted T4 runs compile with the same Ninja parallelism as the
+            # bare-run T4 script (MAX_JOBS=nproc) instead of test_utils.sh's
+            # 12 GB-per-nvcc budget, which was sized for H100 and resolves to
+            # MAX_JOBS=1 on these 8-vCPU / 30 GiB runners. The shard scripts have
+            # run these files at nproc without an OOM, and a 9-job targeted run of
+            # test_batch_prefill_kernels.py peaked at 12.3 GiB process-tree RSS.
+            DOCKER_ARGS+=(-e MAX_JOBS "$(nproc)")
+          fi
+          TEST_TARGETS=()
+          if [ -n "${TEST_PATH_ARG:-}" ]; then
+            # Read into an array and expand quoted, rather than relying on word
+            # splitting: this keeps the shell safe on its own terms instead of
+            # inheriting the validator's charset guarantee. Globbing is off for the
+            # same reason.
+            set -f
+            read -r -a TEST_TARGETS <<< "${TEST_PATH_ARG}"
+            set +f
+          fi
+          if [ "${#TEST_TARGETS[@]}" -gt 0 ] && [ "${TEST_SCRIPT}" != "task_run_unit_tests.sh" ]; then
+            # A10G shard scripts take no arguments; their pytest wrapper skips files
+            # outside JIT_TEST_SCOPE. Comma-joined because ci/bash.sh word-splits
+            # -e values.
+            DOCKER_ARGS+=(-e JIT_TEST_SCOPE "$(IFS=,; echo "${TEST_TARGETS[*]}")")
+            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "${LANE_COMMAND[@]}"
+          elif [ "${#TEST_TARGETS[@]}" -gt 0 ]; then
+            # --test-path, not bare positionals: task_run_unit_tests.sh forwards "$@"
+            # to unit_test_runner.py, whose parser takes the scope as an option (or the
+            # TEST_PATH env var, which ci/bash.sh does not forward into the container).
+            # Bare paths fail argument-preflight with "unrecognized arguments".
+            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "${LANE_COMMAND[@]}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
+          else
+            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "${LANE_COMMAND[@]}" "${TEST_RUNNER_ARGS[@]}"
+          fi
+
+      # Runs even when tests fail or the run is cancelled: whatever was
+      # compiled is still valid. Credentials are requested only now, so they
+      # never reach the test step and stay short-lived.
+      - name: Get compile cache upload credentials
+        if: always() && env.CI_COMPILE_CACHE_WRITER_DIR != ''
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.COMPILE_CACHE_S3_ROLE_ARN }}
+          aws-region: ${{ vars.SCCACHE_REGION || 'us-west-2' }}
+          role-session-name: compile-cache-${{ github.run_id }}
+          role-duration-seconds: 900
+
+      - name: Upload compile cache
+        if: always() && env.CI_COMPILE_CACHE_WRITER_DIR != ''
+        env:
+          S3_BUCKET: ${{ vars.SCCACHE_BUCKET || 'flashinfer-build-cache' }}
+        run: |
+          # Keyed by the immutable image ID, as ci/compile_cache.sh restores it.
+          IMAGE_ID=$(docker image inspect --format '{{.Id}}' "${DOCKER_IMAGE}" 2>/dev/null || true)
+          if [[ ${IMAGE_ID} =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            bash ci/compile_cache_s3.sh upload "s3://${S3_BUCKET}/compile-cache/main" \
+              "${IMAGE_ID#sha256:}" "${CI_COMPILE_CACHE_S3_LANE}" "${CI_COMPILE_CACHE_WRITER_DIR}" || true
+          else
+            echo "::warning::image ID of ${DOCKER_IMAGE} unavailable; compile cache not uploaded"
+          fi
+          sudo -n rm -rf "${CI_COMPILE_CACHE_WRITER_DIR}" || rm -rf "${CI_COMPILE_CACHE_WRITER_DIR}" || true
+
       - name: Display sccache stats
-        if: always() && matrix.kind == 'aot'
+        if: always() && (matrix.kind == 'aot' || env.GPU_TEST_SCCACHE == '1')
         run: |
           STATS_FILE="${GITHUB_WORKSPACE}/sccache-stats/sccache-stats.txt"
           if [ -s "${STATS_FILE}" ]; then
@@ -438,7 +768,7 @@ jobs:
           fi
 
       - name: Record sccache job metadata
-        if: always() && matrix.kind == 'aot'
+        if: always() && (matrix.kind == 'aot' || env.GPU_TEST_SCCACHE == '1')
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
           IMAGE_DIGESTS=$(docker image inspect --format '{{json .RepoDigests}}' "${DOCKER_IMAGE}" 2>/dev/null || printf 'unavailable')
@@ -448,68 +778,131 @@ jobs:
             printf 'docker_image_repo_digests=%s\n' "${IMAGE_DIGESTS}"
             printf 'matrix_cuda=%s\n' "${MATRIX_CUDA}"
             printf 'matrix_arch=%s\n' "${MATRIX_ARCH}"
+            printf 'matrix_kind=%s\n' "${MATRIX_KIND}"
+            printf 'test_script=%s\n' "${TEST_SCRIPT}"
           } > "${GITHUB_WORKSPACE}/sccache-stats/job-metadata.txt"
 
       - name: Upload sccache stats
-        if: always() && matrix.kind == 'aot'
+        if: always() && (matrix.kind == 'aot' || env.GPU_TEST_SCCACHE == '1')
         uses: actions/upload-artifact@v4
         with:
-          name: sccache-stats-${{ matrix.cuda }}-${{ matrix.runner[2] }}
+          # GPU lanes share a CUDA/runner pair, so they add the matrix index.
+          name: ${{ matrix.kind == 'aot' && format('sccache-stats-{0}-{1}', matrix.cuda, matrix.runner[2]) || format('sccache-stats-{0}-{1}-{2}', matrix.kind, matrix.cuda, strategy.job-index) }}
           path: sccache-stats/
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Run Test
-        if: matrix.kind != 'aot'
+      - name: Summarize JIT build times
+        if: always() && matrix.kind != 'aot'
         run: |
-          case "${TEST_SCRIPT}" in
-            task_jit_run_tests_part[1-5].sh|task_jit_run_tests_t4.sh|task_run_unit_tests.sh) ;;
-            *)
-              echo "::error::Unexpected GPU test script: ${TEST_SCRIPT}"
-              exit 1
-              ;;
-          esac
-          TEST_RUNNER_ARGS=()
-          if [ "${MATRIX_KIND}" = "h100" ]; then
-            TEST_RUNNER_ARGS+=(--workers-per-gpu 2)
-          fi
-          if [ -n "${TEST_PATH_ARG:-}" ]; then
-            # Read into an array and expand quoted, rather than relying on word
-            # splitting: this keeps the shell safe on its own terms instead of
-            # inheriting the validator's charset guarantee. Globbing is off for the
-            # same reason.
-            set -f
-            read -r -a TEST_TARGETS <<< "${TEST_PATH_ARG}"
-            set +f
-            # --test-path, not bare positionals: task_run_unit_tests.sh forwards "$@"
-            # to unit_test_runner.py, whose parser takes the scope as an option (or the
-            # TEST_PATH env var, which ci/bash.sh does not forward into the container).
-            # Bare paths fail argument-preflight with "unrecognized arguments".
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
+          if command -v python3 >/dev/null; then
+            python3 scripts/summarize_jit_builds.py junit/jit-builds.jsonl || true
+            python3 scripts/summarize_jit_builds.py --markdown \
+              junit/jit-builds.jsonl >> "${GITHUB_STEP_SUMMARY}" || true
           else
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}"
+            echo "::warning::python3 unavailable on runner; JIT build summary skipped"
           fi
 
       - name: Make JUnit XML readable
-        if: ${{ always() && (matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}
+        if: ${{ always() && matrix.kind != 'aot' }}
         run: |
           if [ -d junit ]; then
             sudo chmod -R a+rX junit
           fi
 
       - name: Upload JUnit XML and telemetry
-        if: ${{ always() && (matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}
+        if: ${{ always() && matrix.kind != 'aot' }}
         uses: actions/upload-artifact@v4
         with:
-          name: junit-${{ matrix.kind == 'h100' && 'h100' || matrix.script }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Non-H100 names add the runner SM: A10G and T4 rows can run the same script.
+          name: junit-${{ (matrix.kind == 'h100' || matrix.kind == 'cpu') && matrix.kind || format('{0}-{1}', matrix.script, matrix.runner[4]) }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             junit/**/*.xml
             junit/**/*.telemetry.json
             junit/**/*.meta.json
+            junit/**/*.results.json
+            junit/**/*.log
             junit/**/*.memory.csv
+            junit/resource-telemetry/**/*
+            junit/memory_summary.csv
+            junit/test_timings.csv
+            junit/source_summary.csv
+            junit/collection-*/*.log
+            junit/jit-builds.jsonl
+            junit/run-summary.json
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Make shard JUnit XML readable
+        if: ${{ always() && matrix.kind == 'gpu' }}
+        run: |
+          if [ -d junit-shard ]; then
+            sudo chmod -R a+rX junit-shard
+          fi
+
+      - name: Upload shard JUnit XML
+        if: ${{ always() && matrix.kind == 'gpu' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-shard-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            junit-shard/**/*.xml
+            junit-shard/**/resource-telemetry/**/*
+            junit-shard/**/*.memory.csv
+            junit-shard/**/memory_summary.csv
+            junit-shard/**/test_timings.csv
+            junit-shard/**/source_summary.csv
+            junit-shard/**/run-summary.json
+            junit-shard/**/*.telemetry.json
+            junit-shard/**/*.meta.json
+            junit-shard/**/*.results.json
+            junit-shard/**/*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+
+  # ---------------------------------------------------------------------------
+  # Provider spec lint - quick CUDA-target check ahead of the AOT builds
+  #
+  # The AOT lanes build every provider wheel (hours). The release builds reject a
+  # provider whose modules carry another architecture's CUDA target or PTX, which
+  # a PR used to find out only from the nightly. This generates each provider's
+  # spec list (no compiling, no GPU) and checks the explicit -gencode flags. The
+  # AOT lanes repeat it first thing, so their fail-fast still stops the matrix.
+  # ---------------------------------------------------------------------------
+  spec-lint:
+    name: Provider Spec Lint (${{ matrix.cuda }})
+    needs: [gate, setup]
+    if: |
+      needs.gate.outputs.authorized == 'true' &&
+      needs.setup.outputs.skip_build != 'true' &&
+      needs.setup.outputs.spec_lint_count != '0'
+    runs-on: [self-hosted, linux, x64, cpu, on-demand]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.spec_lint_matrix) }}
+    env:
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
+    steps:
+      - name: Cleanup
+        run: |
+          docker ps -q | xargs -r docker stop 2>/dev/null || true
+          docker ps -aq | xargs -r docker rm 2>/dev/null || true
+          sudo rm -rf "${GITHUB_WORKSPACE:?}"/* || true
+          sudo rm -rf "${GITHUB_WORKSPACE:?}"/.[!.]* || true
+          docker image prune -f || true
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.setup.outputs.checkout_sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Lint provider spec CUDA targets
+        run: bash ci/bash.sh "${DOCKER_IMAGE}" --no-gpu ./scripts/task_check_jit_spec_gencodes.sh
 
   # ---------------------------------------------------------------------------
   # Test Results Summary
@@ -521,6 +914,7 @@ jobs:
       - gate
       - setup
       - test
+      - spec-lint
     runs-on: ubuntu-latest
     steps:
       - name: Check Authorization
@@ -655,6 +1049,167 @@ jobs:
           echo "::warning::CI skipped — pending authorization"
           exit 1
 
+      - name: Checkout (for skip-all analysis)
+        if: needs.gate.outputs.authorized == 'true' && github.event_name == 'pull_request'
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download H100 JUnit artifacts
+        if: needs.gate.outputs.authorized == 'true' && needs.test.result != 'cancelled'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-h100-*
+          path: junit-h100
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Download CPU JUnit artifacts
+        if: needs.gate.outputs.authorized == 'true' && needs.test.result != 'cancelled'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-cpu-*
+          path: junit-cpu
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Download shard JUnit artifacts (A10G/T4)
+        if: needs.gate.outputs.authorized == 'true' && needs.test.result != 'cancelled'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-shard-*
+          path: junit-shards
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Check skip-all test files
+        id: skip-all
+        if: needs.gate.outputs.authorized == 'true' && github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          SUMMARY_ARGS=""
+          if [ -f junit-h100/run-summary.json ]; then
+            SUMMARY_ARGS="--summary junit-h100/run-summary.json"
+          fi
+          # The CPU lane runs the same sharded runner, so it has a run summary.
+          if [ -f junit-cpu/run-summary.json ]; then
+            SUMMARY_ARGS="$SUMMARY_ARGS --summary junit-cpu/run-summary.json --junit-dir junit-cpu"
+          fi
+
+          # A10G/T4 shard lanes produce raw JUnit XML (no run-summary.json).
+          # Discover them from the merged download directory.
+          SHARD_ARGS=""
+          if [ -d junit-shards ]; then
+            # The merged artifact flattens all shard uploads into one tree.
+            # Infer lane names from the XML paths: the shard scripts write
+            # junit-shard/tests/..., so after merge we get
+            # junit-shards/tests/... from each lane.  Since the download
+            # merges all lanes into one directory, we label the combined
+            # tree as "A10G+T4" — individual lane attribution would require
+            # per-lane artifact naming, which the shard scripts don't do.
+            SHARD_ARGS="--junit-xml-lane A10G+T4 junit-shards"
+          fi
+
+          if [ -z "$SUMMARY_ARGS" ] && [ -z "$SHARD_ARGS" ]; then
+            echo "No JUnit artifacts found; skipping skip-all check"
+            echo "skip_all_found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SKIP_ALL_EXIT=0
+          REPORT=$(python3 scripts/pr_checks/check_skip_all.py \
+            --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
+            $SUMMARY_ARGS \
+            $SHARD_ARGS \
+            --junit-dir junit-h100 \
+            --github-actions 2>&1) || SKIP_ALL_EXIT=$?
+          echo "$REPORT"
+
+          if [ "$SKIP_ALL_EXIT" -ne 0 ]; then
+            echo "::error::check_skip_all.py failed with exit code $SKIP_ALL_EXIT"
+            exit "$SKIP_ALL_EXIT"
+          fi
+          echo "$REPORT"
+
+          if echo "$REPORT" | grep -qF "⚠️ **skip-all**"; then
+            echo "skip_all_found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_all_found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Append to step summary.
+          {
+            echo ""
+            echo "$REPORT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Save the report for the PR comment step.
+          echo "$REPORT" > "$RUNNER_TEMP/skip-all-report.md"
+
+      - name: Comment on PR about skip-all findings
+        if: steps.skip-all.outputs.skip_all_found == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Build comment body from the saved report.
+          {
+            echo "⚠️ **Skip-all detection (IKL-569)**"
+            echo ""
+            echo "Some changed test files had **all nodes skipped** on every CI lane."
+            echo "This means CI passed without executing any of the new or modified tests."
+            echo ""
+            echo "<details>"
+            echo "<summary>Full report</summary>"
+            echo ""
+            cat "$RUNNER_TEMP/skip-all-report.md"
+            echo ""
+            echo "</details>"
+            echo ""
+            echo "Please check whether the skipped tests are expected (e.g. SM arch not"
+            echo "available on any lane) or indicate a gap in CI coverage."
+          } > "$RUNNER_TEMP/skip-all-comment.md"
+
+          # Avoid duplicate comments on re-runs by deleting any prior bot comment
+          # with our marker.
+          EXISTING=$(gh api \
+            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --paginate --jq '.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("Skip-all detection (IKL-569)")) | .id')
+          for ID in $EXISTING; do
+            gh api -X DELETE "/repos/${{ github.repository }}/issues/comments/${ID}" || true
+          done
+
+          gh pr comment "$PR_NUMBER" --body-file "$RUNNER_TEMP/skip-all-comment.md"
+
+      - name: Check trace reference coverage
+        id: trace-coverage
+        if: needs.gate.outputs.authorized == 'true' && github.event_name == 'pull_request'
+        run: |
+          TRACE_EXIT=0
+          REPORT=$(python3 scripts/pr_checks/check_trace_coverage.py \
+            --github-actions 2>&1) || TRACE_EXIT=$?
+          echo "$REPORT"
+
+          if [ "$TRACE_EXIT" -ne 0 ]; then
+            echo "::error::check_trace_coverage.py failed with exit code $TRACE_EXIT"
+            exit "$TRACE_EXIT"
+          fi
+          echo "$REPORT"
+          {
+            echo ""
+            echo "$REPORT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if echo "$REPORT" | grep -q "gap"; then
+            echo "trace_gaps=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "trace_gaps=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check Results
         if: needs.gate.outputs.authorized == 'true'
         env:
@@ -663,6 +1218,14 @@ jobs:
           # TARGET_RE happens to exclude quotes and backticks, but that guarantee lives
           # in another file and must not be what keeps this step from being injectable.
           TEST_SCOPE: ${{ needs.setup.outputs.test_scope }}
+          SKIP_ALL_FOUND: ${{ steps.skip-all.outputs.skip_all_found }}
+          TRACE_GAPS: ${{ steps.trace-coverage.outputs.trace_gaps }}
+          H100_DISABLED: ${{ needs.setup.outputs.h100_disabled }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          TEST_MATRIX: ${{ needs.setup.outputs.test_matrix }}
         run: |
           echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -688,16 +1251,80 @@ jobs:
           echo "Tests: ${{ needs.setup.outputs.test_count }}, result: $RESULT" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
+          # A matrix failure hides cancelled siblings in needs.test.result. Read
+          # this attempt only; diagnostics must not change the required verdict.
+          if [ "${{ needs.setup.outputs.test_count }}" != "0" ]; then
+            if timeout 20s gh api --paginate \
+                "/repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" \
+                --jq '{jobs: [.jobs[] | {name, run_id, run_attempt, status, conclusion, html_url}]}' \
+                > "$RUNNER_TEMP/test-lane-jobs.json" && \
+              jq -nr --argjson matrix "$TEST_MATRIX" \
+                --argjson run "$RUN_ID" --argjson attempt "$RUN_ATTEMPT" \
+                --slurpfile pages "$RUNNER_TEMP/test-lane-jobs.json" '
+                  [$pages[].jobs[] | select(.run_id == $run and .run_attempt == $attempt)] as $jobs
+                  | [$matrix.include[].name as $name
+                     | [$jobs[] | select(.name == $name)] as $matches
+                     | if ($matches | length) != 1 then
+                         {name: $name, result: (if ($matches | length) == 0 then "missing" else "unknown" end)}
+                       else $matches[0]
+                         | .result = (if .status != "completed" then (.status // "unknown") else (.conclusion // "unknown") end)
+                       end] as $lanes
+                  | "### Matrix lane outcomes (attempt \($attempt))", "",
+                    ($lanes | group_by(.result) | map("\(length) \(.[0].result)") | join(", ")), "",
+                    (if any($lanes[]; .result != "success") then
+                       "Coverage is incomplete. Cancelled, skipped, missing or unfinished lanes do not establish passing coverage."
+                     else "All planned matrix lanes completed successfully." end), "",
+                    "| Lane | Outcome | Details |", "| --- | --- | --- |",
+                    ($lanes | sort_by(if .result == "failure" then 0 elif .result == "success" then 2 else 1 end)[]
+                     | "| \(.name) | \(.result) | \(if .html_url then "[Open job](\(.html_url))" else "Unavailable" end) |"), ""
+                ' > "$RUNNER_TEMP/test-lane-summary.md"; then
+              cat "$RUNNER_TEMP/test-lane-summary.md" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "Matrix lane outcomes unavailable (API or metadata error); per-lane coverage is unknown." >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
           # A scope is sticky per SHA: re-applying run-ci by hand on a commit that
           # once had a scoped bot run silently reuses it, so this required check can
           # go green having run three narrow lanes. The job names change from "JIT
           # Unittest" to "Targeted Unittest", but that is easy to miss on a check
           # list -- say it outright on the check a merge decision actually reads.
+          # The H100 lane is temporarily off on PRs (see Build Test Matrix). A scope
+          # only H100 covered now schedules nothing and passes, so say so here.
+          if [ "$H100_DISABLED" == "true" ]; then
+            echo "> **H100 lane temporarily disabled on PRs** — H100 tests run only in scheduled main runs and manual workflow_dispatch runs." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
           if [ -n "${TEST_SCOPE:-}" ]; then
             echo "> **Scoped run — NOT the full suite.**" >> $GITHUB_STEP_SUMMARY
-            echo "> Tested only: \`${TEST_SCOPE}\`" >> $GITHUB_STEP_SUMMARY
-            echo "> Comment \`@flashinfer-bot run\` with no paths for full coverage." >> $GITHUB_STEP_SUMMARY
+            echo "> Tested only: \`${TEST_SCOPE}\`, plus \`tests/cpu\` on the CPU lane" >> $GITHUB_STEP_SUMMARY
+            echo "> Comment \`@flashinfer-bot run all\` for full coverage." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "$SKIP_ALL_FOUND" == "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ⚠️ **Some changed test files had all nodes skipped on every lane.**" >> $GITHUB_STEP_SUMMARY
+            echo "> See the skip-all report above for details." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "$TRACE_GAPS" == "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ⚠️ **Some GDN/KDA trace definitions are missing numerical coverage.**" >> $GITHUB_STEP_SUMMARY
+            echo "> See the trace coverage report above for details." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # The provider spec lint is its own job, so the matrix result above does
+          # not cover it; a skipped lint (no published image, skip_aot) is not a failure.
+          SPEC_LINT="${{ needs.spec-lint.result }}"
+          echo "Provider spec lint: $SPEC_LINT" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$SPEC_LINT" == "failure" ] || [ "$SPEC_LINT" == "cancelled" ]; then
+            echo "Result: Tests Failed" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
 
           if [ "$RESULT" == "success" ] || [ "$RESULT" == "skipped" ]; then
@@ -709,3 +1336,53 @@ jobs:
           # cancelled test means "stopped early", not "flaky".
           echo "Result: Tests Failed" >> $GITHUB_STEP_SUMMARY
           exit 1
+
+  # ---------------------------------------------------------------------------
+  # Report scheduled main results - one open tracking issue while main is red
+  # ---------------------------------------------------------------------------
+  report-main-status:
+    name: Report Main Status
+    if: github.event_name == 'schedule' && !cancelled()
+    needs: [test-results-summary]
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RESULT: ${{ needs.test-results-summary.result }}
+      RUN_ID: ${{ github.run_id }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      SHA: ${{ github.sha }}
+      TITLE: "Scheduled PR Test is failing on main"
+    steps:
+      - name: Open, update or close the tracking issue
+        run: |
+          # A re-run keeps its run ID, so an old run re-run late must not override
+          # the result of a newer scheduled run that has already finished.
+          NEWER=$(gh run list --workflow pr-test.yml --event schedule --branch main \
+            --status completed --limit 20 --json databaseId \
+            --jq "map(select(.databaseId > $RUN_ID)) | length")
+          if [ "$NEWER" != "0" ]; then
+            echo "A newer scheduled run has already finished; leaving the issue to it"
+            exit 0
+          fi
+
+          ISSUE=$(gh issue list --state open --search "in:title \"$TITLE\"" \
+            --json number,title --jq "map(select(.title == \"$TITLE\"))[0].number // empty")
+
+          if [ "$RESULT" == "success" ]; then
+            if [ -n "$ISSUE" ]; then
+              gh issue close "$ISSUE" --comment "Green again at $SHA: $RUN_URL"
+            fi
+            exit 0
+          fi
+
+          BODY="Scheduled run on \`$SHA\` failed: $RUN_URL"
+          if [ -n "$ISSUE" ]; then
+            gh issue comment "$ISSUE" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" \
+              --body "$BODY. This issue gets a comment per failed run and closes on the next green one."
+          fi

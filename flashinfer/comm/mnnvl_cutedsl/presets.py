@@ -54,6 +54,12 @@ from .kernel_bt import (
     BT_FINALIZE_GB300_TP16_H8192_K10_PRESET_1,
     BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_0,
     BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_1,
+    BT_ALL_REDUCE_GB300_TP4_H8192_FUSED,
+    BT_ALL_REDUCE_GB300_TP4_H8192_PRESET_0,
+    BT_FINALIZE_GB300_TP4_H8192_K10,
+    BT_ALL_REDUCE_RUBIN_TP4_H8192_FUSED,
+    BT_ALL_REDUCE_RUBIN_TP4_H8192_PRESET_0,
+    BT_FINALIZE_RUBIN_TP4_H8192_K10,
 )
 from .kernel_ll import (
     LL_ALL_REDUCE_GB300_TP4_H5120,
@@ -70,6 +76,16 @@ from .kernel_ll import (
     LL_ALL_REDUCE_GB300_TP8_H8192,
     LL_FINALIZE_GB300_TP16_H8192_K10,
     LL_FINALIZE_GB300_TP8_H8192_K10,
+    LL_ALL_REDUCE_GB300_TP4_H8192,
+    LL_ALL_REDUCE_GB300_TP4_H8192_BULK,
+    LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_25_TO_64,
+    LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_65_TO_192,
+    LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_193_TO_320,
+    LL_FINALIZE_GB300_TP4_H8192_K10,
+    LL_ALL_REDUCE_RUBIN_TP4_H8192,
+    LL_ALL_REDUCE_RUBIN_TP4_H8192_BULK,
+    LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT,
+    LL_FINALIZE_RUBIN_TP4_H8192_K10,
 )
 from .kernel_ht import (
     HT_ALL_REDUCE_GB300_H3584,
@@ -83,6 +99,8 @@ from .kernel_ht import (
     HT_ALL_REDUCE_GB300_TP8_H8192,
     HT_FINALIZE_GB300_TP16_H8192_K10,
     HT_FINALIZE_GB300_TP8_H8192_K10,
+    HT_FINALIZE_GB300_TP4_H8192_K10,
+    HT_FINALIZE_RUBIN_TP4_H8192_K10,
 )
 
 __all__ = [
@@ -531,6 +549,114 @@ def _h7168_profiles(
     )
 
 
+# hidden_size=8192, bf16, top_k=10, TP4, with one route table per measured
+# architecture. Each bound is the largest swept M at which the lower-M target
+# was still ahead.
+#
+# All-reduce with the norm: the multicast one-shot LL wins the smallest M,
+# then (on Rubin) the LL publish that splits multicast and per-rank bulk
+# copies once the publish is byte bound, then the three-launch BT, and from a
+# few hundred tokens the one-launch fused BT, which overlaps publish,
+# reduction and materialization. Static and dynamic FP8 output share these
+# routes; every target has both epilogues.
+#
+# Without the norm the LL path drops its cluster-wide barrier, so LL keeps a
+# wider range, and the one-launch LL two-shot moves fewer bytes per GPU than
+# the one-shot (on GB300 it replaces the three-launch BT entirely); it has no
+# dynamic FP8 epilogue, which a norm-free workspace never needs.
+#
+# Finalize keeps LL for the smallest M, then BT. With the norm, HT takes over
+# for the largest M, where it hides the top_k gather in its producer warps;
+# HT cannot compile the norm out, so the norm-free finalize stays on BT.
+_RUBIN = (10, 7)
+_GB300 = (10, 3)
+
+
+def _h8192_tp4_profile(
+    compute_capability: tuple[int, int],
+    finalize_routes: MRangeDispatch,
+    all_reduce_routes: MRangeDispatch,
+) -> StaticProfile:
+    return StaticProfile(
+        tp_size=4,
+        hidden_size=8192,
+        top_k=10,
+        dtype=torch.bfloat16,
+        finalize_routes=finalize_routes,
+        all_reduce_routes=all_reduce_routes,
+        compute_capability=compute_capability,
+    )
+
+
+def _routes(*ranges: tuple[int | None, ProtocolKind, object]) -> MRangeDispatch:
+    return MRangeDispatch(
+        upper_bounds=tuple(upper for upper, _, _ in ranges),
+        targets=tuple(_target(protocol, preset) for _, protocol, preset in ranges),
+    )
+
+
+_LL = ProtocolKind.LL
+_BT = ProtocolKind.BT
+_HT = ProtocolKind.HT
+
+_H8192_TP4_RUBIN_PROFILE = _h8192_tp4_profile(
+    _RUBIN,
+    _routes(
+        (32, _LL, LL_FINALIZE_RUBIN_TP4_H8192_K10),
+        (2048, _BT, BT_FINALIZE_RUBIN_TP4_H8192_K10),
+        (None, _HT, HT_FINALIZE_RUBIN_TP4_H8192_K10),
+    ),
+    _routes(
+        (16, _LL, LL_ALL_REDUCE_RUBIN_TP4_H8192),
+        (48, _LL, LL_ALL_REDUCE_RUBIN_TP4_H8192_BULK),
+        (256, _BT, BT_ALL_REDUCE_RUBIN_TP4_H8192_PRESET_0),
+        (None, _BT, BT_ALL_REDUCE_RUBIN_TP4_H8192_FUSED),
+    ),
+)
+_H8192_TP4_RUBIN_NO_NORM_PROFILE = _h8192_tp4_profile(
+    _RUBIN,
+    _routes(
+        (48, _LL, LL_FINALIZE_RUBIN_TP4_H8192_K10),
+        (None, _BT, BT_FINALIZE_RUBIN_TP4_H8192_K10),
+    ),
+    _routes(
+        (16, _LL, LL_ALL_REDUCE_RUBIN_TP4_H8192),
+        (64, _LL, LL_ALL_REDUCE_RUBIN_TP4_H8192_BULK),
+        (128, _BT, BT_ALL_REDUCE_RUBIN_TP4_H8192_PRESET_0),
+        (384, _LL, LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT),
+        (None, _BT, BT_ALL_REDUCE_RUBIN_TP4_H8192_FUSED),
+    ),
+)
+_H8192_TP4_GB300_PROFILE = _h8192_tp4_profile(
+    _GB300,
+    _routes(
+        (24, _LL, LL_FINALIZE_GB300_TP4_H8192_K10),
+        (768, _BT, BT_FINALIZE_GB300_TP4_H8192_K10),
+        (None, _HT, HT_FINALIZE_GB300_TP4_H8192_K10),
+    ),
+    _routes(
+        (16, _LL, LL_ALL_REDUCE_GB300_TP4_H8192),
+        (384, _BT, BT_ALL_REDUCE_GB300_TP4_H8192_PRESET_0),
+        (None, _BT, BT_ALL_REDUCE_GB300_TP4_H8192_FUSED),
+    ),
+)
+_H8192_TP4_GB300_NO_NORM_PROFILE = _h8192_tp4_profile(
+    _GB300,
+    _routes(
+        (32, _LL, LL_FINALIZE_GB300_TP4_H8192_K10),
+        (None, _BT, BT_FINALIZE_GB300_TP4_H8192_K10),
+    ),
+    _routes(
+        (8, _LL, LL_ALL_REDUCE_GB300_TP4_H8192),
+        (24, _LL, LL_ALL_REDUCE_GB300_TP4_H8192_BULK),
+        (64, _LL, LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_25_TO_64),
+        (192, _LL, LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_65_TO_192),
+        (320, _LL, LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_193_TO_320),
+        (None, _BT, BT_ALL_REDUCE_GB300_TP4_H8192_FUSED),
+    ),
+)
+
+
 LL_ONLY_CONFIG = MNNVLCuteDSLConfig(
     profiles=(
         StaticProfile(
@@ -868,6 +994,8 @@ DEFAULT_CONFIG = MNNVLCuteDSLConfig(
                 ),
             ),
         ),
+        _H8192_TP4_RUBIN_PROFILE,
+        _H8192_TP4_GB300_PROFILE,
         *_h5120_profiles(_h5120_default_finalize, _h5120_default_all_reduce),
         *_h7168_profiles(_h7168_default_finalize, _h7168_default_all_reduce),
     )
@@ -875,6 +1003,10 @@ DEFAULT_CONFIG = MNNVLCuteDSLConfig(
 
 
 NO_NORM_CONFIG = MNNVLCuteDSLConfig(
-    profiles=_h5120_profiles(_h5120_no_norm_finalize, _h5120_no_norm_all_reduce),
+    profiles=(
+        _H8192_TP4_RUBIN_NO_NORM_PROFILE,
+        _H8192_TP4_GB300_NO_NORM_PROFILE,
+        *_h5120_profiles(_h5120_no_norm_finalize, _h5120_no_norm_all_reduce),
+    ),
     applies_rms_norm=False,
 )

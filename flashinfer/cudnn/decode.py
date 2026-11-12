@@ -8,7 +8,6 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.attention import cudnn_batch_decode_trace
 from ..utils import log2e
 from .utils import (
-    cudnn_frontend_accepts_cuda_graph_replay_hint,
     get_cudnn_fmha_gen_module,
     get_cudnn_attention_handle,
     supports_ordered_cudnn_execution,
@@ -26,8 +25,8 @@ except ImportError:
     CUDNN_AVAILABLE = False
 
 
-def _create_cudnn_handle(stream: torch.cuda.Stream):
-    return get_cudnn_attention_handle(cudnn, stream)
+def _create_cudnn_handle(stream=None, *, device=None):
+    return get_cudnn_attention_handle(cudnn, stream, device=device)
 
 
 # Tensor ids
@@ -168,12 +167,12 @@ if CUDNN_AVAILABLE:
 
         # A caller that captures the graph's execute into a CUDA graph pays a
         # plan's per-execute host cost once, at capture: tell cudnn-frontend
-        # (1.31+) so its heuristics lead with the plan that is fastest on the
+        # so its heuristics lead with the plan that is fastest on the
         # GPU alone (the d256 decode tile's split-KV plan) instead of the one
         # that also covers an eager caller's extra launch. The hint changes no
-        # numerics; an older frontend is not given the keyword.
+        # numerics; every supported frontend accepts the keyword.
         graph_kwargs: dict[str, Any] = {}
-        if is_cuda_graph_compatible and cudnn_frontend_accepts_cuda_graph_replay_hint():
+        if is_cuda_graph_compatible:
             graph_kwargs["is_cuda_graph_replay_expected"] = True
 
         # Decode represents fixed-length queries with dense strided Q/O
@@ -229,6 +228,7 @@ if CUDNN_AVAILABLE:
             cudnn_k_cache.set_uid(UIDs.K_UID.value)
             cudnn_v_cache.set_uid(UIDs.V_UID.value)
 
+            cudnn_k_block_tables = cudnn_v_block_tables = None
             if block_tables is not None:
                 nd_block_tables = block_tables.reshape(
                     block_tables.shape[0], 1, block_tables.shape[1], 1
@@ -288,7 +288,9 @@ if CUDNN_AVAILABLE:
                 attn_scale=scale,
                 paged_attention_k_table=cudnn_k_block_tables,
                 paged_attention_v_table=cudnn_v_block_tables,
-                paged_attention_max_seq_len_kv=max_sequence_kv,
+                paged_attention_max_seq_len_kv=(
+                    max_sequence_kv if block_tables is not None else None
+                ),
                 compute_data_type=cudnn.data_type.FLOAT,
                 **mask_kwargs,
                 **({"stats_use_log2": True} if stats_use_log2 else {}),
@@ -523,17 +525,23 @@ def _execute_decode(
     stats_use_log2=False,
 ):
     """Bind call-local pointers and apply the public base-2 LSE contract."""
-    device = q.device
-    handle_ = _create_cudnn_handle(
-        torch.cuda.current_stream(device.index if device.type == "cuda" else device)
-    )
+    handle_ = _create_cudnn_handle(device=q.device)
+
+    # Dense attention observes the descriptor's (B, H, S) stats
+    # layout. Expose that view while retaining the public token-major storage.
+    lse_binding = lse
+    if return_lse and block_tables is None:
+        if q.dim() == 4:
+            lse_binding = lse.view(q.shape[0], q.shape[2], q.shape[1]).transpose(1, 2)
+        else:
+            lse_binding = lse.unsqueeze(-1)
 
     if execution_bindings is not None:
         # UIDs are fixed by preparation; tensor observation remains FE's job.
         # Each call owns its sequence, including during capture and rebind.
         buffers = [q, k_cache, v_cache, out]
         if return_lse:
-            buffers.append(lse)
+            buffers.append(lse_binding)
         if sinks is not None:
             buffers.append(sinks)
         buffers.extend(
@@ -553,7 +561,7 @@ def _execute_decode(
             UIDs.O_UID.value: out,
         }
         if return_lse:
-            var_map[UIDs.STATS_UID.value] = lse
+            var_map[UIDs.STATS_UID.value] = lse_binding
         if sinks is not None:
             var_map[UIDs.SINK_UID.value] = sinks
         if actual_seq_lens_q is not None:

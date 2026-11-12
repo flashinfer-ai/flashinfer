@@ -220,6 +220,92 @@ def test_w4a16_static_tiler_uses_64_when_intermediate_not_128_aligned():
     assert tile_n == 64
 
 
+def _ultra_fc2_tile_fits(**overrides):
+    """Qwen3.6-35B-A3B decode FC2 (N=2048, K=512) with the TC-decode ultra tile."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel import (
+        _candidate_tile_fits,
+    )
+
+    kwargs = dict(
+        problem_n=2048,
+        problem_k=512,
+        cta_m_blocks=1,
+        tile_n=512,
+        tile_k=32,
+        cta_threads=256,
+        max_shared_mem=101_376 - 512,
+        scale_format="e4m3_k16",
+        weight_layout="packed",
+    )
+    kwargs.update(overrides)
+    return _candidate_tile_fits(**kwargs)
+
+
+@cute_dsl_available
+def test_w4a16_forced_tile_validation_accepts_tc_decode_ultra_fc2_tile():
+    """The selector's tile_k=32 ultra FC2 tile sits below the search floor but
+    must survive the force_tile_config re-pin across the custom-op boundary."""
+    assert not _ultra_fc2_tile_fits()
+    assert _ultra_fc2_tile_fits(enforce_search_floor=False)
+
+
+@cute_dsl_available
+def test_w4a16_forced_tile_validation_keeps_correctness_constraints():
+    """Relaxing the search floor must not admit misaligned or oversized tiles."""
+    assert not _ultra_fc2_tile_fits(enforce_search_floor=False, tile_k=8)
+    assert not _ultra_fc2_tile_fits(enforce_search_floor=False, tile_n=768)
+    assert not _ultra_fc2_tile_fits(enforce_search_floor=False, max_shared_mem=1024)
+
+
+@cute_dsl_available
+@sm120_required
+@cuda_13_required
+def test_w4a16_tc_decode_ultra_fc2_tile_survives_custom_op_repin():
+    """Regression for the W4A16 decode crash on Qwen3.6-35B-A3B shapes: the
+    auto-selected (tile_k=32, tile_n=512) FC2 tile is re-pinned through
+    force_tile_config by the torch custom op and must compile to the same
+    geometry instead of raising ``force_tile_config fc2 tile ... does not fit``.
+    """
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel import (
+        compile_w4a16_fused_moe,
+    )
+
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    selected_ultra = False
+    for size_m in (1, 2, 4):
+        kwargs = dict(
+            size_m=size_m,
+            hidden_size=2048,
+            intermediate_size=512,
+            num_experts=128,
+            top_k=8,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            moe_block_size=8,
+            max_m_blocks=16,
+            element_dtype="bf16",
+            sms=props.multi_processor_count,
+            max_shared_mem=props.shared_memory_per_block_optin,
+            weight_layout="packed",
+            scale_format="e4m3_k16",
+            w13_layout="packed",
+            direct_topk_routes=True,
+            tc_decode_fused_sum=True,
+        )
+        auto = compile_w4a16_fused_moe(**kwargs)
+        tiles = (auto.fc1_tile_k, auto.fc1_tile_n, auto.fc2_tile_k, auto.fc2_tile_n)
+        selected_ultra |= tiles[2:] == (32, 512)
+        repinned = compile_w4a16_fused_moe(**kwargs, force_tile_config=tiles)
+        assert (
+            repinned.fc1_tile_k,
+            repinned.fc1_tile_n,
+            repinned.fc2_tile_k,
+            repinned.fc2_tile_n,
+        ) == tiles
+    assert selected_ultra, "shape no longer reaches the TC-decode ultra FC2 tile"
+
+
 @cute_dsl_available
 def test_w4a16_quant_mode_selects_internal_workspace(monkeypatch):
     """Callers provide quant_mode; dispatch owns the concrete workspace type."""
@@ -4941,6 +5027,87 @@ class TestUnroutedPairs:
                 ids[:num_tokens],
                 f"wrapper m={num_tokens}/{pattern}",
             )
+
+
+@cute_dsl_available
+@sm120_required
+@cuda_13_required
+class TestWorkspaceBucketing:
+    """Workspace growth must not thrash kernel caches (vllm#47458).
+
+    ``_get_cached_workspace`` replaces the cached workspace when a larger
+    routed_rows arrives, and ``workspace.max_rows`` is baked into the
+    static/micro kernel cache keys - so every new high-water mark used to
+    invalidate all previously compiled kernels for the backend and trigger
+    multi-second MLIR recompiles at serving time. Allocations are therefore
+    bucketed on a power-of-two ladder (floor 128).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_workspace_cache(self):
+        # _WORKSPACE_CACHE is process-global: start empty, and release the
+        # CUDA workspaces afterwards even if the test fails.
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+        md._WORKSPACE_CACHE.clear()
+        yield
+        md._WORKSPACE_CACHE.clear()
+
+    def test_bucket_ladder(self):
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
+            _bucket_workspace_rows,
+        )
+
+        assert _bucket_workspace_rows(1) == 128
+        assert _bucket_workspace_rows(128) == 128
+        assert _bucket_workspace_rows(129) == 256
+        assert _bucket_workspace_rows(640) == 1024
+        assert _bucket_workspace_rows(32768) == 32768
+
+    def test_workspace_stable_within_bucket(self):
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+        device = torch.device("cuda")
+        kwargs = dict(
+            backend="static",
+            state_E=8,
+            weight_E=8,
+            k=512,
+            n=256,
+            num_topk=4,
+            device=device,
+        )
+        ws_small = md._get_cached_workspace(routed_rows=4, **kwargs)
+        assert ws_small.max_rows >= 128
+        # Growth within the bucket must return the SAME workspace object, so
+        # kernels compiled against its max_rows stay cache-valid.
+        ws_mid = md._get_cached_workspace(routed_rows=128, **kwargs)
+        assert ws_mid is ws_small
+        # Crossing the bucket boundary is allowed to reallocate (bounded,
+        # O(log) times), never once per new high-water mark.
+        ws_big = md._get_cached_workspace(routed_rows=129, **kwargs)
+        assert ws_big.max_rows == 256
+        ws_big2 = md._get_cached_workspace(routed_rows=200, **kwargs)
+        assert ws_big2 is ws_big
+
+    def test_dynamic_workspace_not_bucketed(self):
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+        kwargs = dict(
+            backend="dynamic",
+            state_E=8,
+            weight_E=8,
+            k=512,
+            n=256,
+            num_topk=4,
+            device=torch.device("cuda"),
+        )
+        # The dynamic kernel does not key on max_rows, and its M-tile is
+        # derived from routed_rows; bucketing 100 -> 128 rows would cross a
+        # tile band and mismatch the workspace cache key on the next call.
+        ws = md._get_cached_workspace(routed_rows=100, **kwargs)
+        assert ws.routed_rows_capacity == 100
+        assert md._get_cached_workspace(routed_rows=100, **kwargs) is ws
 
 
 if __name__ == "__main__":

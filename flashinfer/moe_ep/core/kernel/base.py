@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 if TYPE_CHECKING:
     import torch
 
+    from ....fused_moe.api import QuantFormat
+
     from ...config import BootstrapConfig, FleetParams
     from ...tensors import MoEEpTensors
     from ...weights import MoEWeightPack
@@ -25,7 +27,17 @@ class SplitKernelContext:
     fleet_params: "FleetParams"
     recv_topk_idx: Optional["torch.Tensor"] = None
     recv_topk_weights: Optional["torch.Tensor"] = None
+    # Id space of ``recv_topk_idx``. True: GLOBAL expert ids, as the
+    # MoEEpCommunication transports deliver them; picks outside this rank's
+    # local expert range (another rank's experts, ``invalid_expert_id``) are
+    # for the kernel to skip. False: ids local to this rank, with -1 for picks
+    # it does not own, as the Fleet/Handle transports deliver them.
+    recv_topk_idx_global: bool = False
     recv_count: Optional["torch.Tensor"] = None
+    # Per-token scale factors of ``expert_tensors`` when the tokens were
+    # quantized before dispatch (see SplitKernelBackend.dispatch_format), one
+    # row per received token; None when ``expert_tensors`` is unquantized.
+    expert_tensors_scale: Optional["torch.Tensor"] = None
 
 
 class SplitKernelBackend(ABC):
@@ -70,8 +82,42 @@ class SplitKernelBackend(ABC):
         budget)."""
         return x
 
+    @property
+    def packs_dispatch_payload(self) -> bool:
+        """Whether :meth:`pack_dispatch_payload` sends other bytes than the BF16
+        tokens, which the transport must then carry byte for byte."""
+        return False
+
+    def dispatch_format(self) -> "Optional[QuantFormat]":
+        """Activation format to quantize tokens to before a rank-major dispatch.
+
+        Applies only to the MoEEpCommunication path, whose transports carry
+        quantized rows plus a row-aligned scale payload. ``None`` (the default)
+        dispatches the unquantized tokens. A backend that returns a format
+        implements :meth:`quantize_for_dispatch` and accepts the received
+        values with ``SplitKernelContext.expert_tensors_scale`` in
+        :meth:`compute`.
+        """
+        return None
+
+    def quantize_for_dispatch(
+        self, x: "torch.Tensor"
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """Quantize ``[num_tokens, hidden]`` tokens to :meth:`dispatch_format`.
+
+        Returns ``(values, scales)``, each a 2D tensor with one row per token.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not quantize tokens before dispatch"
+        )
+
     @abstractmethod
     def compute(self, ctx: SplitKernelContext) -> "torch.Tensor": ...
+
+    def destroy(self) -> None:  # noqa: B027 - intentional no-op default
+        """Drop per-forward state, which may reference the transport's
+        receive buffers. The layer calls this before it destroys the
+        transport, whose buffers must not outlive it."""
 
 
 class MegaKernelBackend(ABC):
@@ -83,6 +129,7 @@ class MegaKernelBackend(ABC):
     supports_output_view: bool = False
     supports_unfinalized_output: bool = False
     supports_live_token_tuning: bool = False
+    supports_auto_workspaces: bool = False
     _knob_cache_module: str
 
     def __init__(self, config: object) -> None:
@@ -95,7 +142,66 @@ class MegaKernelBackend(ABC):
         self._profile_knobs: dict[tuple[int, int | None], dict] = {}
         self._autotune_winner: dict[str, Any] | None = None
 
-    def get_tuned_knobs(self) -> dict[str, Any]:
+    @classmethod
+    def create(cls, config: Any) -> MegaKernelBackend:
+        """Construct a backend, including an opt-in variant selector."""
+        return cls(config)
+
+    def ep_weight_pack(self, weights):
+        """Convert the selector's [up, gate] FC1 rows to the backend's input order."""
+        return weights
+
+    def ep_selected_config(self, workspace):
+        return self.get_tuned_config(workspace)
+
+    def ep_prepare_fixed(self, workspace, weights):
+        """Compile a fixed EP plan locally, before any rank launches it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support fixed EP preparation"
+        )
+
+    def ep_validate_selection(self, fleet_params, selection):
+        """Validate a cached fixed configuration before collective allocation."""
+        import dataclasses
+
+        from flashinfer.autotuner.autotuner import _json_to_tactic
+        from .registry import create_mega_kernel
+
+        config = dataclasses.replace(
+            self._config,
+            kernel_variant=selection["kernel_variant"],
+            knobs={k: _json_to_tactic(v) for k, v in selection["knobs"].items()},
+        )
+        kernel = create_mega_kernel(config)
+        kernel.bind_ep_bootstrap(self._ep_bootstrap)
+        kernel.validate_init(self._ep_bootstrap, fleet_params)
+
+    def ep_force_tune(self, workspace, tensors, weights, output):
+        """Run a fresh inner search for an explicitly forced outer search."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support forced EP tuning"
+        )
+
+    def ep_tuning_fallback(self):
+        import dataclasses
+
+        return dataclasses.replace(self._config, knobs=None)
+
+    def ep_tuning_contract(self, fleet_params):
+        """Describe complete-forward tuning support for an outer EP selector."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support complete-EP selection"
+        )
+
+    def get_tuned_config(self, workspace: Any = None) -> Any:
+        """Return a fixed kernel config for the selected automatic result."""
+        import dataclasses
+
+        if not dataclasses.is_dataclass(self._config) or isinstance(self._config, type):
+            raise TypeError("this MegaMoE backend does not expose a dataclass config")
+        return dataclasses.replace(self._config, knobs=self.get_tuned_knobs(workspace))
+
+    def get_tuned_knobs(self, workspace: Any = None) -> dict[str, Any]:
         """Return a copy of the last completed automatic tuning result."""
         if self._autotune_winner is None:
             raise RuntimeError(
@@ -206,6 +312,14 @@ class MegaKernelBackend(ABC):
 
     def _tuning_key(self, fleet_params: "FleetParams") -> dict[str, Any]:
         raise NotImplementedError
+
+    def coordinate_workspace_replacement(self, workspace: Any) -> bool:
+        """Agree whether later selection needs new storage for captured graphs.
+
+        Called on every EP rank before input staging. Backends may perform a
+        collective here; no rank may allocate replacement storage until it returns.
+        """
+        return False
 
     def _tuning_cache(self) -> Any:
         return importlib.import_module(self._knob_cache_module)
@@ -334,6 +448,20 @@ class MegaKernelBackend(ABC):
         """Run the fused kernel. ``output=None`` (cutedsl backends) returns a
         zero-copy view of the workspace output, valid under stream ordering
         until the next launch on this session's buffers."""
+
+    def _compute_prepared(
+        self,
+        workspace: Any,
+        transformed_weights: Any,
+        *,
+        output: "torch.Tensor | None",
+    ) -> "torch.Tensor":
+        """Execute immediately after the layer validates and stages a forward.
+
+        Backends may omit checks already covered by that path. Public staged
+        execution continues through ``compute``.
+        """
+        return self.compute(workspace, transformed_weights, output=output)
 
     def compute_unfinalized(
         self,

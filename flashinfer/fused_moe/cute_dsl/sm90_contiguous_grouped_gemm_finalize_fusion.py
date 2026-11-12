@@ -42,16 +42,16 @@ def _get_compiled_finalize_kernel(
     num_experts: int,
     num_tokens: int,
     out_rows: int,
-    a_ptr,
-    b_ptr,
-    out_ptr,
-    tile_idx_ptr,
-    mn_limit_ptr,
-    token_id_ptr,
-    num_tiles_ptr,
-    token_scales_ptr,
+    a_ptr: int,
+    b_ptr: int,
+    out_ptr: int,
+    tile_idx_ptr: int,
+    mn_limit_ptr: int,
+    token_id_ptr: int,
+    num_tiles_ptr: int,
+    token_scales_ptr: int,
     max_active_clusters: int,
-    stream,
+    stream: int,
     ab_dtype: type,
     c_dtype: type,
     tile_shape_mn: Tuple[int, int],
@@ -68,6 +68,11 @@ def _get_compiled_finalize_kernel(
     (tile_size/cluster_shape_mn/raster_along_m tactics, ``topk``,
     ``use_fused_finalize``, ``max_active_clusters``, ``enable_pdl``) form the
     process-local compile key.
+
+    The kernel is compiled as a TVM-FFI function so that a launch takes the
+    raw device addresses, the dimensions and the stream handle directly (a
+    few microseconds of host time); pointer objects are built only here, as
+    compile-time examples of the pointer types.
     """
     cache_key = (
         ab_dtype,
@@ -93,16 +98,20 @@ def _get_compiled_finalize_kernel(
         raster_along_m=raster_along_m,
         enable_pdl=enable_pdl,
     )
+
+    def ptr(dtype: type, address: int, align: int):
+        return make_ptr(dtype, address, cute.AddressSpace.gmem, assumed_align=align)
+
     compiled = cute.compile(
         gemm.wrapper,
-        a_ptr,
-        b_ptr,
-        out_ptr,
-        tile_idx_ptr,
-        mn_limit_ptr,
-        token_id_ptr,
-        num_tiles_ptr,
-        token_scales_ptr,
+        ptr(ab_dtype, a_ptr, 16),
+        ptr(ab_dtype, b_ptr, 16),
+        ptr(c_dtype, out_ptr, 16),
+        ptr(cutlass.Int32, tile_idx_ptr, 4),
+        ptr(cutlass.Int32, mn_limit_ptr, 4),
+        ptr(cutlass.Int32, token_id_ptr, 4),
+        ptr(cutlass.Int32, num_tiles_ptr, 4),
+        ptr(cutlass.Float32, token_scales_ptr, 4),
         permuted_m,
         n,
         k,
@@ -110,7 +119,8 @@ def _get_compiled_finalize_kernel(
         num_tokens,
         out_rows,
         max_active_clusters=max_active_clusters,
-        stream=stream,
+        stream=cuda.CUstream(stream),
+        options="--enable-tvm-ffi",
     )
     _finalize_kernel_cache[cache_key] = compiled
     return compiled
@@ -139,6 +149,10 @@ def sm90_contiguous_grouped_gemm_finalize_fusion(
     the caller must pass a zero-initialized ``out [num_tokens, hidden]``.
     Deterministic mode scatters to ``out [num_tokens * topk, hidden]`` and
     leaves the routing-weight reduction to the host pipeline.
+
+    ``a``, ``w2_weight`` and ``out`` must be 16-byte aligned (checked on every
+    call); the int32 routing metadata and ``token_final_scales`` must be 4-byte
+    aligned (not checked per call).
     """
     major, minor = get_compute_capability(a.device)
     if major != 9:
@@ -183,44 +197,17 @@ def sm90_contiguous_grouped_gemm_finalize_fusion(
     max_active_clusters = get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
-    a_ptr = make_ptr(ab_dtype, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-    b_ptr = make_ptr(
-        ab_dtype, w2_weight.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
-    )
-    out_ptr = make_ptr(
-        c_dtype, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
-    )
-    tile_idx_ptr = make_ptr(
-        cutlass.Int32,
-        tile_idx_to_expert_idx.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=4,
-    )
-    mn_limit_ptr = make_ptr(
-        cutlass.Int32,
-        tile_idx_to_mn_limit.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=4,
-    )
-    token_id_ptr = make_ptr(
-        cutlass.Int32,
-        permuted_idx_to_expanded_idx.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=4,
-    )
-    num_tiles_ptr = make_ptr(
-        cutlass.Int32,
-        num_non_exiting_tiles.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=4,
-    )
-    token_scales_ptr = make_ptr(
-        cutlass.Float32,
-        token_final_scales.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=4,
-    )
-    stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
+    a_ptr = a.data_ptr()
+    b_ptr = w2_weight.data_ptr()
+    out_ptr = out.data_ptr()
+    tile_idx_ptr = tile_idx_to_expert_idx.data_ptr()
+    mn_limit_ptr = tile_idx_to_mn_limit.data_ptr()
+    token_id_ptr = permuted_idx_to_expanded_idx.data_ptr()
+    num_tiles_ptr = num_non_exiting_tiles.data_ptr()
+    token_scales_ptr = token_final_scales.data_ptr()
+    if (a_ptr | b_ptr | out_ptr) % 16:
+        raise ValueError("a, w2_weight and out must be 16-byte aligned")
+    stream = torch.cuda.current_stream(a.device).cuda_stream
 
     compiled = _get_compiled_finalize_kernel(
         permuted_m=permuted_m,
@@ -263,6 +250,6 @@ def sm90_contiguous_grouped_gemm_finalize_fusion(
         num_local_experts,
         num_tokens,
         out_rows,
-        stream=stream,
+        stream,
     )
     return out

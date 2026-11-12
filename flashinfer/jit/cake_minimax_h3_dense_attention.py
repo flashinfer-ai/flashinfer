@@ -1,68 +1,83 @@
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Generated program of the MiniMax-H3 dense BF16 self-attention: the persistent 128-row
+Q-tile kernel with the ping-pong schedule between its two warp groups and the in-kernel
+merge of the last wave's split K/V ranges (ATTENTION), shipped for sm_90a, sm_100a,
+sm_103a, sm_120a and sm_121a. The host module
+``flashinfer.diffusion_ops.cake_minimax_h3_dense_attention`` computes the launch plan
+and the grid and launches it behind ``minimax_h3_dense_attention``.
+
+Generated file: every value below is derived from the exported sources and checked
+against them; do not edit.
 """
-Copyright (c) 2026 by FlashInfer team.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+from __future__ import annotations
 
-  http://www.apache.org/licenses/LICENSE-2.0
+from . import cake_program
+from .core import JitSpec
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
-from pathlib import Path
-
-from . import env as jit_env
-from .core import (
-    JitSpec,
-    current_compilation_context,
-    gen_jit_spec,
-    refresh_current_compilation_context,
+ATTENTION = cake_program.CakeProgram(
+    name="cake_minimax_h3_dense_attention_1ec8efce8d0b0be5f54a",
+    operator_dir="cake_minimax_h3_dense_attention",
+    kernel="kernel_cake_minimax_h3_dense_attention_1ec8efce8d0b0be5f54a",
+    sources=(
+        "cake_minimax_h3_dense_attention_1ec8efce8d0b0be5f54a_kernel.cu",
+        "cake_minimax_h3_dense_attention_1ec8efce8d0b0be5f54a_binding.cu",
+    ),
+    targets=("sm_90a", "sm_100a", "sm_103a", "sm_120a", "sm_121a"),
+    compile_options=(
+        ("sm_90a", ()),
+        ("sm_100a", ()),
+        ("sm_103a", ()),
+        ("sm_120a", ()),
+        ("sm_121a", ()),
+    ),
+    args=(
+        "Q_map",
+        "K_map",
+        "V_map",
+        "O",
+        "partial_ws",
+        "split_counters",
+        "tokens",
+        "num_q_tiles",
+        "num_kv_tiles",
+        "total_work",
+        "split_base",
+        "split_k",
+        "split_tiles",
+        "softmax_scale_log2",
+        "q_scale_bf16x2",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=("Q_map", "K_map", "V_map", "O", "partial_ws", "split_counters"),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=99456,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
 )
 
-
-_CUDA_SOURCE_NAME = "cake_minimax_h3_dense_attention_sm120a.cu"
-_SUPPORTED_MAJOR_VERSIONS = [9, 10, 12]
+PROGRAMS: tuple[cake_program.CakeProgram, ...] = (ATTENTION,)
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+def aot_specs(target: str) -> tuple[JitSpec, ...]:
+    """JIT specs of every program shipping ``target``, for the ahead-of-time build."""
+    return cake_program.aot_specs(PROGRAMS, target)
 
 
-def _minimax_h3_dense_attention_cuda_source() -> Path:
-    packaged = jit_env.FLASHINFER_CSRC_DIR / _CUDA_SOURCE_NAME
-    if packaged.is_file():
-        return packaged
-    source_tree = _repo_root() / "csrc" / _CUDA_SOURCE_NAME
-    if source_tree.is_file():
-        return source_tree
-    raise FileNotFoundError(
-        f"MiniMax-H3 dense attention CUDA source not found. Checked:\n  - {packaged}\n  - {source_tree}"
-    )
-
-
-def gen_minimax_h3_dense_attention_module() -> JitSpec:
-    """JIT spec for the SM120 (GB202) dense BF16 MiniMax-H3 attention kernel.
-
-    The device code (TMA + ldmatrix + mma.sync) also compiles for SM90a/SM100a/SM103a so the
-    route can be validated there; SM120 is the performance target.
-    """
-
-    compilation_context = current_compilation_context
-    if not compilation_context.TARGET_CUDA_ARCHS:
-        compilation_context = refresh_current_compilation_context()
-    nvcc_flags = compilation_context.get_nvcc_flags_list(
-        supported_major_versions=_SUPPORTED_MAJOR_VERSIONS
-    )
-    return gen_jit_spec(
-        "minimax_h3_dense_attention_sm120a_v1",
-        [_minimax_h3_dense_attention_cuda_source()],
-        extra_cuda_cflags=nvcc_flags,
-    )
-
-
-__all__ = ["gen_minimax_h3_dense_attention_module"]
+__all__ = ["ATTENTION", "PROGRAMS", "aot_specs"]

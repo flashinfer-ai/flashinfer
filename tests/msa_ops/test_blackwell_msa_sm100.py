@@ -17,6 +17,7 @@ Canonical public-API correctness coverage for MSA on SM100 and SM103.
 """
 
 import math
+import warnings
 from typing import Any
 
 import pytest
@@ -428,6 +429,183 @@ CASES = [
         ),
         id="decode-paged-uniform-fp8-q2",
     ),
+    # the lean uniform-FP8 tiers (items = batch x seqlen_q x KV heads; the
+    # page-table width is ceil(max kv / 128)): one cluster of eight per item,
+    # the two-split fp32 pools, one split at each ring depth, the
+    # occupancy-2 entry (compute capability 10.3; 10.0 runs the same case on
+    # the one-split 11-stage program) and the two-split tier under graph capture
+    pytest.param(
+        _attention_case(
+            "sparse_decode",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            batch_size=1,
+            seqlen_q=1,
+            kv_lens=[2048],
+            num_q_heads=32,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=81,
+            force_fused=True,
+        ),
+        id="decode-paged-uniform-fp8-lean-s8-cluster",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_decode",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            batch_size=4,
+            seqlen_q=8,
+            kv_lens=[1200, 1100, 900, 1024],
+            num_q_heads=16,
+            num_kv_heads=2,
+            topk=16,
+            causal=True,
+            seed=83,
+            force_fused=True,
+        ),
+        id="decode-paged-uniform-fp8-lean-s2-pools",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_decode",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            batch_size=8,
+            seqlen_q=8,
+            kv_lens=[1000, 777, 1500, 2048, 640, 1024, 1900, 1111],
+            num_q_heads=32,
+            num_kv_heads=2,
+            topk=16,
+            causal=True,
+            seed=85,
+            force_fused=True,
+        ),
+        id="decode-paged-uniform-fp8-lean-s1-kv11",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_decode",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            batch_size=4,
+            seqlen_q=8,
+            kv_lens=[16385, 16400, 16390, 16500],
+            num_q_heads=32,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=87,
+            force_fused=True,
+        ),
+        id="decode-paged-uniform-fp8-lean-s1-kv8-long",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_decode",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            batch_size=8,
+            seqlen_q=8,
+            kv_lens=[4096, 3000, 2048, 1500, 8192, 5000, 1024, 777],
+            num_q_heads=64,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=89,
+            force_fused=True,
+        ),
+        id="decode-paged-uniform-fp8-lean-occ2-on-cc103",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_decode",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            batch_size=8,
+            seqlen_q=4,
+            kv_lens=[1200, 640, 900, 1024, 512, 1100, 777, 1000],
+            num_q_heads=16,
+            num_kv_heads=2,
+            topk=16,
+            causal=True,
+            seed=91,
+            force_fused=True,
+            cuda_graph=True,
+        ),
+        id="decode-paged-uniform-fp8-lean-s2-graph",
+    ),
+    # the eight-token fused program on its narrow box (32 Q heads over 4 KV
+    # heads, eight tokens per request, at least 32 requests, a page table of at
+    # most 16 pages = 2048 tokens): the 32-request row at the batch floor, the
+    # 64-request row and a 128-request row whose longest context sits on the
+    # 2048 boundary -- eager calls without a workspace, the only calls that
+    # select it
+    pytest.param(
+        _attention_case(
+            "sparse_decode",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            batch_size=32,
+            seqlen_q=8,
+            kv_lens=[753 + (41 * i) % 495 for i in range(32)],
+            num_q_heads=32,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=99,
+            force_fused=True,
+            use_workspace=False,
+        ),
+        id="decode-paged-uniform-fp8-fuseq8-b32",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_decode",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            batch_size=64,
+            seqlen_q=8,
+            kv_lens=[750 + (37 * i) % 501 for i in range(64)],
+            num_q_heads=32,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=93,
+            force_fused=True,
+            use_workspace=False,
+        ),
+        id="decode-paged-uniform-fp8-fuseq8-b64",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_decode",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            batch_size=128,
+            seqlen_q=8,
+            kv_lens=[752 + (31 * i) % 497 for i in range(127)] + [2048],
+            num_q_heads=32,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=95,
+            force_fused=True,
+            use_workspace=False,
+        ),
+        id="decode-paged-uniform-fp8-fuseq8-b128-kv2048",
+    ),
     pytest.param(
         _attention_case(
             "sparse_decode",
@@ -564,6 +742,237 @@ CASES = [
         ),
         id="decode-paged-bf16-m16-ragged",
     ),
+    # L2 evict-first paged BF16 decode: eight requests of eight queries over
+    # four KV heads (256 work items, under two waves) with a longest context
+    # above 40960 tokens; the hinted program on compute capability 10.0 and
+    # 10.3, the unhinted one elsewhere, both against the same reference.
+    pytest.param(
+        _attention_case(
+            "sparse_decode",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="paged",
+            batch_size=8,
+            seqlen_q=8,
+            kv_lens=[41088, 40960, 1024, 896, 768, 640, 512, 384],
+            num_q_heads=32,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=77,
+            force_fused=True,
+        ),
+        id="decode-paged-bf16-q8-gqa8-l2ef-batch8",
+    ),
+    # Pair-ticket paged BF16 decode: 32 Q heads over 4 KV heads, eight query
+    # tokens per request and a page table of at most 49 pages (contexts up to
+    # 6223 tokens): the pair program on compute capability 10.0 and 10.3, the
+    # one-token program elsewhere, both against the same reference.
+    pytest.param(
+        _attention_case(
+            "sparse_decode",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="paged",
+            batch_size=16,
+            seqlen_q=8,
+            kv_lens=[6223] + [128 + (389 * i) % 5900 for i in range(15)],
+            num_q_heads=32,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=101,
+            force_fused=True,
+        ),
+        id="decode-paged-bf16-q8-gqa8-qpair-batch16",
+    ),
+    # Paged BF16 decode on the union program: 64 Q heads over 4 KV heads,
+    # eight query tokens per request, 64 or 128 requests and contexts of
+    # 750-1250 tokens (a page table of at most 10 pages): the folded GQA-16
+    # union prefill program on compute capability 10.0 and 10.3, with a
+    # workspace, without one and under CUDA graph capture, against the same
+    # reference as the decode program.
+    *(
+        pytest.param(
+            _attention_case(
+                "sparse_decode",
+                q_dtype="bfloat16",
+                kv_dtype="bfloat16",
+                kv_layout="paged",
+                batch_size=batch_size,
+                seqlen_q=8,
+                kv_lens=[750 + (337 * i) % 501 for i in range(batch_size)],
+                num_q_heads=64,
+                num_kv_heads=4,
+                topk=16,
+                causal=True,
+                seed=seed,
+                cuda_graph=cuda_graph,
+                use_workspace=use_workspace,
+            ),
+            id=f"decode-paged-bf16-q8-gqa16-union-batch{batch_size}{suffix}",
+        )
+        for batch_size, seed, cuda_graph, use_workspace, suffix in (
+            (64, 113, False, True, ""),
+            (128, 127, False, True, ""),
+            (64, 131, False, False, "-no-workspace"),
+            (128, 137, True, True, "-graph"),
+        )
+    ),
+    # Persistent K-major prefill route: paged GQA-16 above 64 pages, paged
+    # GQA-8 at 64 pages (captured) and flat GQA-16 above 64 KV blocks, every
+    # batch with a request below the long route's 8192-query threshold.
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="paged",
+            q_lens=[700, 300],
+            kv_lens=[8320, 8300],
+            num_q_heads=16,
+            num_kv_heads=1,
+            topk=16,
+            causal=True,
+            seed=71,
+        ),
+        id="prefill-paged-bf16-gqa16-kmaj-persistent",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="paged",
+            q_lens=[900, 300],
+            kv_lens=[8192, 7000],
+            num_q_heads=16,
+            num_kv_heads=2,
+            topk=16,
+            causal=True,
+            seed=73,
+            cuda_graph=True,
+        ),
+        id="prefill-paged-bf16-gqa8-kmaj-persistent-graph",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="flat_varlen",
+            q_lens=[1024],
+            kv_lens=[8320],
+            num_q_heads=16,
+            num_kv_heads=1,
+            topk=16,
+            causal=True,
+            seed=75,
+        ),
+        id="prefill-flat-bf16-gqa16-kmaj-persistent",
+    ),
+    # Fused one-launch persistent route: the short batches (seven query
+    # tokens on both targets, thirteen on compute capability 10.3 only; the
+    # thirteen-token batch takes the two launches on 10.0), captured once.
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="paged",
+            q_lens=[7],
+            kv_lens=[20487],
+            num_q_heads=64,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=77,
+            cuda_graph=True,
+        ),
+        id="prefill-paged-bf16-gqa16-kmaj-fused-q7-graph",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="paged",
+            q_lens=[7],
+            kv_lens=[9000],
+            num_q_heads=16,
+            num_kv_heads=2,
+            topk=16,
+            causal=True,
+            seed=79,
+        ),
+        id="prefill-paged-bf16-gqa8-kmaj-fused-q7",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="flat_varlen",
+            q_lens=[13],
+            kv_lens=[8320],
+            num_q_heads=16,
+            num_kv_heads=1,
+            topk=16,
+            causal=True,
+            seed=81,
+        ),
+        id="prefill-flat-bf16-gqa16-kmaj-fused-q13",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            q_lens=[1],
+            kv_lens=[97],
+            num_q_heads=64,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=83,
+        ),
+        id="prefill-paged-fp8q-q1-box",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            q_lens=[1],
+            kv_lens=[128],
+            num_q_heads=64,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=85,
+            use_workspace=False,
+        ),
+        id="prefill-paged-fp8q-q1-box-no-workspace",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            q_lens=[1],
+            kv_lens=[1],
+            num_q_heads=64,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=87,
+            cuda_graph=True,
+        ),
+        id="prefill-paged-fp8q-q1-kv1-box-graph",
+    ),
 ]
 
 
@@ -597,7 +1006,7 @@ def _dtype(name: str) -> torch.dtype:
 
 
 def _output_dtype(q: torch.Tensor) -> torch.dtype:
-    """Uniform FP8 Q/K/V decode returns BF16; every other route returns q's dtype."""
+    """Uniform FP8 Q/K/V calls (decode, prefill) return BF16; other routes q's dtype."""
     return torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
 
 
@@ -1055,7 +1464,8 @@ def test_sm100_sm103_msa_public_api_correctness(case: dict[str, Any]) -> None:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=capture_stream):
             actual = run()
-        inputs["q"].mul_(0.5).add_(0.125)
+        # FP8 tensors have no in-place CUDA arithmetic: perturb in float, store back.
+        inputs["q"].copy_((inputs["q"].float() * 0.5 + 0.125).to(inputs["q"].dtype))
         graph.replay()
         torch.cuda.synchronize()
     else:
@@ -1075,3 +1485,794 @@ def test_sm100_sm103_msa_public_api_correctness(case: dict[str, Any]) -> None:
         assert actual[2].shape == expected[2].shape
         assert actual[2].dtype == torch.float32
         _assert_lse_close(actual[2], expected[2])
+
+
+# The narrow-box shape under CUDA graph capture: captured with every context at
+# most 2048 tokens, replayed after ``seqused_k`` and the selections grow past
+# the fused program's context bound (6400-8192 tokens, and above 8192).  The
+# capture keeps the lean tier, whose context bound is the page-table width x
+# 128 tokens -- sized by the grown contexts, read by no call -- so the replay
+# matches the reference at the grown contexts.
+@pytest.mark.parametrize(
+    "grown_base",
+    [6500, 9000],
+    ids=["replay-kv6500-7999", "replay-kv9000-10499"],
+)
+def test_uniform_fp8_narrow_box_graph_replays_after_the_contexts_grow(grown_base):
+    device = _require_supported_gpu()
+    from flashinfer.msa_ops import (
+        MSASparseAttentionWorkspace,
+        msa_sparse_decode_attention,
+    )
+
+    batch, seqlen_q = 64, 8
+    grown_lens = [grown_base + (53 * i) % 1500 for i in range(batch)]
+    captured_lens = [750 + (37 * i) % 501 for i in range(batch)]
+    case = _attention_case(
+        "sparse_decode",
+        q_dtype=_FP8,
+        kv_dtype=_FP8,
+        kv_layout="paged",
+        batch_size=batch,
+        seqlen_q=seqlen_q,
+        kv_lens=grown_lens,
+        num_q_heads=32,
+        num_kv_heads=4,
+        topk=16,
+        causal=True,
+        seed=97,
+        force_fused=True,
+        cuda_graph=True,
+    )
+    # the grown state sizes the cache and the page table; the capture runs on
+    # the same tensors holding the short contexts and their selections
+    inputs = _make_attention_inputs(case, device)
+    assert inputs["page_table"].shape[1] * BLOCK_SIZE >= max(grown_lens)
+    grown_seqused = inputs["seqused_k"].clone()
+    grown_q2k = inputs["q2k_indices"].clone()
+    captured_q2k = _make_q2k(
+        q_lens=inputs["q_lens"],
+        kv_lens=captured_lens,
+        kv_heads=case["num_kv_heads"],
+        topk=case["topk"],
+        causal=case["causal"],
+        q_offset=None,
+        selection_mode=case["selection_mode"],
+        seed=case["seed"] + 202,
+        device=device,
+    )
+    inputs["seqused_k"].copy_(
+        torch.tensor(captured_lens, dtype=torch.int32, device=device)
+    )
+    inputs["q2k_indices"].copy_(captured_q2k)
+
+    workspace = MSASparseAttentionWorkspace(device=device)
+    run = lambda: _invoke_attention(  # noqa: E731
+        inputs, workspace, None, msa_sparse_decode_attention
+    )
+    capture_stream = torch.cuda.Stream(device=device)
+    capture_stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(capture_stream):
+        for _ in range(3):
+            run()
+    capture_stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        actual = run()
+
+    inputs["seqused_k"].copy_(grown_seqused)
+    inputs["q2k_indices"].copy_(grown_q2k)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected = _reference_attention(inputs)
+    torch.testing.assert_close(actual[0], expected[0], atol=0.1, rtol=0.1)
+    _assert_lse_close(actual[1], expected[1])
+
+
+# The two-split lean tier without a workspace: its completion counter is cached
+# per (device, stream), zeroed once when created and reset by the program after
+# each item's merge, so an eager call is one kernel and repeated calls on one
+# stream reuse one counter.  The shape is the hq64/hkv4 eight-token decode
+# (items = batch x seqlen_q x 4), its batch chosen on the device's SM count.
+def _current_device() -> torch.device:
+    _require_supported_gpu()
+    return torch.device("cuda", torch.cuda.current_device())
+
+
+def _two_split_inputs(
+    device: torch.device, *, batch: int, seqlen_q: int, kv_base: int, seed: int
+) -> dict[str, Any]:
+    case = _attention_case(
+        "sparse_decode",
+        q_dtype=_FP8,
+        kv_dtype=_FP8,
+        kv_layout="paged",
+        batch_size=batch,
+        seqlen_q=seqlen_q,
+        kv_lens=[kv_base + (97 * i) % 401 for i in range(batch)],
+        num_q_heads=64,
+        num_kv_heads=4,
+        topk=16,
+        causal=True,
+        seed=seed,
+        force_fused=True,
+        use_workspace=False,
+    )
+    return _make_attention_inputs(case, device)
+
+
+def _lean_plan(backend: Any, inputs: dict[str, Any]) -> Any:
+    device = inputs["q"].device
+    max_pages = int(inputs["page_table"].shape[1])
+    return backend._lean_launch_plan(
+        target=backend._select_target(device),
+        items=int(inputs["q"].shape[0]) * int(inputs["k"].shape[1]),
+        num_sms=backend._num_sms(device),
+        max_pages=max_pages,
+        max_kv_len=backend._lean_kv_len_bound(max_pages),
+    )
+
+
+def _two_split_batch(backend: Any, device: torch.device, seqlen_q: int) -> int:
+    """The smallest batch whose launch plan has two splits on this device."""
+    for batch in range(1, 65):
+        plan = backend._lean_launch_plan(
+            target=backend._select_target(device),
+            items=batch * seqlen_q * 4,
+            num_sms=backend._num_sms(device),
+            max_pages=10,
+            max_kv_len=backend._lean_kv_len_bound(10),
+        )
+        if plan.splits == 2:
+            return batch
+    raise AssertionError(f"no batch has two splits at seqlen_q {seqlen_q}")
+
+
+def _counter_storage(backend: Any, device: torch.device) -> torch.Tensor:
+    """The whole cached counter of ``device``'s current stream."""
+    key = (device.index, backend._stream_ptr(device), 0)
+    return backend._lean_completion_counters[key]
+
+
+def _assert_matches_reference(
+    actual: tuple[torch.Tensor, ...], expected: tuple[torch.Tensor, ...]
+) -> None:
+    torch.testing.assert_close(actual[0], expected[0], atol=0.1, rtol=0.1)
+    _assert_lse_close(actual[1], expected[1])
+
+
+def test_uniform_fp8_two_split_eager_calls_are_one_kernel_on_one_counter():
+    device = _current_device()
+    from flashinfer.msa_ops import _blackwell_sm100 as backend
+    from flashinfer.msa_ops import msa_sparse_decode_attention
+    from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
+
+    seqlen_q = 8
+    batch = _two_split_batch(backend, device, seqlen_q)
+    sets = [
+        _two_split_inputs(
+            device, batch=batch, seqlen_q=seqlen_q, kv_base=kv_base, seed=seed
+        )
+        for kv_base, seed in ((800, 131), (3706, 137))
+    ]
+    for inputs in sets:
+        plan = _lean_plan(backend, inputs)
+        assert plan.splits == 2, (batch, plan)
+    expected = [_reference_attention(inputs) for inputs in sets]
+    run = lambda inputs: _invoke_attention(  # noqa: E731
+        inputs, None, None, msa_sparse_decode_attention
+    )
+    for inputs in sets:  # load the program outside the profiled window
+        run(inputs)
+    torch.cuda.synchronize()
+
+    calls = 200
+    outputs = []
+
+    def window():
+        outputs.clear()
+        for call in range(calls):
+            outputs.append(run(sets[call % 2]))
+
+    # Every CUDA activity of the window, read between sentinel kernels that
+    # prove the session kept it whole (a session can lose its device records;
+    # see tests.cake.test_helpers.cake_profiler).  When every session lost them, the
+    # outputs and counters of the last window are still checked before the
+    # launch count is skipped.
+    lost = None
+    try:
+        kernels = cuda_kernel_names(window, exclude=())
+    except pytest.skip.Exception as skipped:
+        lost = skipped
+    for call, actual in enumerate(outputs):
+        _assert_matches_reference(actual, expected[call % 2])
+    counter = _counter_storage(backend, device)
+    assert counter.numel() == backend._num_sms(device) // 2
+    assert int(counter.abs().sum()) == 0, "every merge reset its counter"
+    if lost is not None:
+        raise lost
+    assert len(kernels) == calls, sorted(set(kernels))
+    assert len(set(kernels)) == 1, sorted(set(kernels))
+
+
+def test_uniform_fp8_two_split_calls_on_two_streams_overlap_on_two_counters():
+    device = _current_device()
+    from flashinfer.msa_ops import _blackwell_sm100 as backend
+    from flashinfer.msa_ops import msa_sparse_decode_attention
+
+    seqlen_q = 8
+    batch = _two_split_batch(backend, device, seqlen_q)
+    sets = [
+        _two_split_inputs(
+            device, batch=batch, seqlen_q=seqlen_q, kv_base=kv_base, seed=seed
+        )
+        for kv_base, seed in ((800, 139), (7273, 149))
+    ]
+    for inputs in sets:
+        assert _lean_plan(backend, inputs).splits == 2
+    expected = [_reference_attention(inputs) for inputs in sets]
+    run = lambda inputs: _invoke_attention(  # noqa: E731
+        inputs, None, None, msa_sparse_decode_attention
+    )
+    streams = [torch.cuda.Stream(device=device) for _ in sets]
+    assert streams[0].cuda_stream != streams[1].cuda_stream
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream(device))
+    outputs: list[list[tuple[torch.Tensor, ...]]] = [[], []]
+    # no synchronization between the calls: both streams first spin for longer
+    # than two host calls take, so their launches become ready together
+    for _ in range(50):
+        for stream in streams:
+            with torch.cuda.stream(stream):
+                torch.cuda._sleep(2_000_000)
+        for index, stream in enumerate(streams):
+            with torch.cuda.stream(stream):
+                outputs[index].append(run(sets[index]))
+    torch.cuda.synchronize()
+    for index in range(2):
+        for actual in outputs[index]:
+            _assert_matches_reference(actual, expected[index])
+    counters = []
+    for stream in streams:
+        with torch.cuda.stream(stream):
+            counters.append(_counter_storage(backend, device))
+    assert counters[0].data_ptr() != counters[1].data_ptr()
+    for counter in counters:
+        assert int(counter.abs().sum()) == 0
+
+
+def test_uniform_fp8_two_split_counter_tail_stays_zero_across_item_counts():
+    device = _current_device()
+    from flashinfer.msa_ops import _blackwell_sm100 as backend
+    from flashinfer.msa_ops import msa_sparse_decode_attention
+
+    # one-token requests over four KV heads: items = 4 x batch.  64 and 32
+    # items, then the fewest and the most items two splits take on this
+    # device (num_sms // 4 < items <= num_sms // 2); a count that resolves
+    # more splits never reads the counter
+    capacity = backend._num_sms(device) // 2
+    fewest = (backend._num_sms(device) // 4) // 4 * 4 + 4
+    most = capacity // 4 * 4
+    sequence = list(dict.fromkeys([64, 32, fewest, most]))
+    run = lambda inputs: _invoke_attention(  # noqa: E731
+        inputs, None, None, msa_sparse_decode_attention
+    )
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    two_split = []
+    with torch.cuda.stream(stream):
+        for seed, items in enumerate(sequence):
+            inputs = _two_split_inputs(
+                device, batch=items // 4, seqlen_q=1, kv_base=900, seed=151 + seed
+            )
+            plan = _lean_plan(backend, inputs)
+            if items in (fewest, most):
+                assert plan.splits == 2, (items, plan)
+            if plan.splits == 2:
+                two_split.append(items)
+            actual = run(inputs)
+            stream.synchronize()
+            _assert_matches_reference(actual, _reference_attention(inputs))
+            if two_split:
+                counter = _counter_storage(backend, device)
+                assert counter.numel() == capacity
+                assert int(counter.abs().sum()) == 0, (items, counter.tolist())
+    assert len(two_split) >= 2, two_split
+
+
+def test_uniform_fp8_capture_without_a_workspace_still_raises():
+    device = _current_device()
+    from flashinfer.msa_ops import _blackwell_sm100 as backend
+    from flashinfer.msa_ops import msa_sparse_decode_attention
+
+    seqlen_q = 8
+    batch = _two_split_batch(backend, device, seqlen_q)
+    inputs = _two_split_inputs(
+        device, batch=batch, seqlen_q=seqlen_q, kv_base=800, seed=157
+    )
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    cached = dict(backend._lean_completion_counters)
+    graph = torch.cuda.CUDAGraph()
+    refused = pytest.raises(RuntimeError, match="requires an explicit")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the refused capture leaves an empty graph
+        with refused, torch.cuda.graph(graph, stream=stream):
+            _invoke_attention(inputs, None, None, msa_sparse_decode_attention)
+    torch.cuda.synchronize()
+    assert backend._lean_completion_counters == cached, "capture reached no cache"
+
+
+def test_uniform_fp8_two_split_on_a_second_device_uses_its_own_counter():
+    first = _require_supported_gpu()
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    from flashinfer.msa_ops import _blackwell_sm100 as backend
+    from flashinfer.msa_ops import msa_sparse_decode_attention
+    from flashinfer.utils import get_compute_capability
+
+    devices = [torch.device("cuda", 0), torch.device("cuda", 1)]
+    if get_compute_capability(devices[1]) != get_compute_capability(first):
+        pytest.skip("requires two devices of one compute capability")
+    seqlen_q = 8
+    run = lambda inputs: _invoke_attention(  # noqa: E731
+        inputs, None, None, msa_sparse_decode_attention
+    )
+    counters = []
+    with torch.cuda.device(0):
+        # device 0 is current for every call, including those on cuda:1
+        for device in reversed(devices):
+            batch = _two_split_batch(backend, device, seqlen_q)
+            inputs = _two_split_inputs(
+                device, batch=batch, seqlen_q=seqlen_q, kv_base=800, seed=163
+            )
+            assert _lean_plan(backend, inputs).splits == 2
+            expected = _reference_attention(inputs)
+            for _ in range(20):
+                actual = run(inputs)
+                assert actual[0].device == device
+                _assert_matches_reference(actual, expected)
+            torch.cuda.synchronize(device)
+            counter = _counter_storage(backend, device)
+            assert counter.device == device
+            assert int(counter.abs().sum()) == 0
+            counters.append(counter)
+            assert torch.cuda.current_device() == 0
+    assert counters[0].data_ptr() != counters[1].data_ptr()
+
+
+# Paged BF16 decode on the union program (``_use_decode_union``): 64 Q heads
+# over 4 KV heads, eight query tokens per request, 64 or 128 requests and a
+# page table of at most 10 pages.  The call launches the folded GQA-16 union
+# prefill program alone: its two int32 carriers (``cu_seqlens_q`` and the
+# all-zero ``cu_seqlens_k`` / ``q_offsets``) are written when they are created
+# and only re-bound afterwards.
+def _union_inputs(
+    device: torch.device, *, batch: int, seed: int, use_workspace: bool = True
+) -> dict[str, Any]:
+    case = _attention_case(
+        "sparse_decode",
+        q_dtype="bfloat16",
+        kv_dtype="bfloat16",
+        kv_layout="paged",
+        batch_size=batch,
+        seqlen_q=8,
+        kv_lens=[750 + (337 * i) % 501 for i in range(batch)],
+        num_q_heads=64,
+        num_kv_heads=4,
+        topk=16,
+        causal=True,
+        seed=seed,
+        use_workspace=use_workspace,
+    )
+    return _make_attention_inputs(case, device)
+
+
+def _assert_union_call(backend: Any, inputs: dict[str, Any]) -> None:
+    """``inputs`` is a call the dispatcher serves with the union program."""
+    q, k = inputs["q"], inputs["k"]
+    assert backend._use_decode_union(
+        target=backend._select_target(q.device),
+        paged=True,
+        causal=True,
+        derive_q_offset=True,
+        q_dtype=q.dtype,
+        k_dtype=k.dtype,
+        v_dtype=inputs["v"].dtype,
+        seqlen_q=8,
+        num_q_heads=int(q.shape[1]),
+        num_kv_heads=int(k.shape[1]),
+        batch_size=int(q.shape[0]) // 8,
+        max_pages=int(inputs["page_table"].shape[1]),
+    )
+
+
+def _assert_bitwise(actual: tuple[torch.Tensor, ...], other: tuple[torch.Tensor, ...]):
+    assert len(actual) == len(other)
+    for left, right in zip(actual, other, strict=True):
+        assert torch.equal(left, right)
+
+
+@pytest.mark.parametrize("batch", [64, 128])
+def test_union_decode_matches_the_decode_program_within_its_tolerance(
+    batch, monkeypatch
+):
+    device = _current_device()
+    from flashinfer.msa_ops import _blackwell_sm100 as backend
+    from flashinfer.msa_ops import msa_sparse_decode_attention
+
+    inputs = _union_inputs(device, batch=batch, seed=167 + batch)
+    _assert_union_call(backend, inputs)
+    run = lambda: _invoke_attention(  # noqa: E731
+        inputs, None, None, msa_sparse_decode_attention
+    )
+    union = run()
+    # the same call with the box closed takes the M16 decode program
+    monkeypatch.setattr(backend, "_DECODE_UNION_BATCHES", ())
+    decode = run()
+    torch.cuda.synchronize()
+    expected = _reference_attention(inputs)
+    for actual in (union, decode):
+        torch.testing.assert_close(actual[0], expected[0], atol=0.01, rtol=0.01)
+        _assert_lse_close(actual[1], expected[1])
+    # the union program's natural LSE is the decode program's, within the
+    # decode LSE tolerance (same convention: natural log, -inf on empty rows)
+    torch.testing.assert_close(union[0], decode[0], atol=0.01, rtol=0.01)
+    _assert_lse_close(union[1], decode[1])
+
+
+def test_union_decode_graph_replay_is_the_eager_call_bitwise():
+    device = _current_device()
+    from flashinfer.msa_ops import (
+        MSASparseAttentionWorkspace,
+        msa_sparse_decode_attention,
+    )
+
+    inputs = _union_inputs(device, batch=128, seed=173)
+    # A workspace that took part in a capture is not reused eagerly: the eager
+    # calls compared against the replay run on a workspace of their own.
+    workspace = MSASparseAttentionWorkspace(device=device)
+    eager_workspace = MSASparseAttentionWorkspace(device=device)
+    run = lambda ws: _invoke_attention(  # noqa: E731
+        inputs, ws, None, msa_sparse_decode_attention
+    )
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            run(workspace)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = run(workspace)
+    for scale in (1.0, 0.5):
+        inputs["q"].mul_(scale)
+        with torch.cuda.stream(stream):
+            graph.replay()
+            replayed = tuple(t.clone() for t in captured)
+            eager = tuple(t.clone() for t in run(eager_workspace))
+        stream.synchronize()
+        _assert_bitwise(replayed, eager)
+        expected = _reference_attention(inputs)
+        torch.testing.assert_close(replayed[0], expected[0], atol=0.01, rtol=0.01)
+        _assert_lse_close(replayed[1], expected[1])
+
+
+def test_union_decode_capture_with_an_unwarmed_carrier_raises(monkeypatch):
+    device = _current_device()
+    from flashinfer.msa_ops import _blackwell_sm100 as backend
+    from flashinfer.msa_ops import (
+        MSASparseAttentionWorkspace,
+        msa_sparse_decode_attention,
+    )
+
+    inputs = _union_inputs(device, batch=64, seed=179)
+    workspace = MSASparseAttentionWorkspace(device=device)
+    run = lambda: _invoke_attention(  # noqa: E731
+        inputs, workspace, None, msa_sparse_decode_attention
+    )
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    # warm every other buffer of the call through the decode program
+    with monkeypatch.context() as patch:
+        patch.setattr(backend, "_DECODE_UNION_BATCHES", ())
+        with torch.cuda.stream(stream):
+            run()
+        stream.synchronize()
+    assert not any(name.startswith("decode_union_") for name in workspace._buffers)
+    graph = torch.cuda.CUDAGraph()
+    refused = pytest.raises(RuntimeError, match="decode_union_cu_seqlens_q_b64_s8")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the refused capture leaves an empty graph
+        with refused, torch.cuda.graph(graph, stream=stream):
+            run()
+    torch.cuda.synchronize()
+    assert not any(name.startswith("decode_union_") for name in workspace._buffers)
+
+
+def test_union_decode_eager_calls_without_a_workspace_are_one_kernel():
+    device = _current_device()
+    from flashinfer.msa_ops import _blackwell_sm100 as backend
+    from flashinfer.msa_ops import msa_sparse_decode_attention
+    from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
+
+    sets = [_union_inputs(device, batch=64, seed=181, use_workspace=False)]
+    sets.append(_union_inputs(device, batch=128, seed=191, use_workspace=False))
+    for inputs in sets:
+        _assert_union_call(backend, inputs)
+    expected = [_reference_attention(inputs) for inputs in sets]
+    run = lambda inputs: _invoke_attention(  # noqa: E731
+        inputs, None, None, msa_sparse_decode_attention
+    )
+    first = [run(inputs) for inputs in sets]  # creates the carriers
+    torch.cuda.synchronize()
+    calls = 40
+    outputs = []
+
+    def window():
+        outputs.clear()
+        for call in range(calls):
+            outputs.append(run(sets[call % 2]))
+
+    # Every CUDA activity of the window, read between sentinel kernels that
+    # prove the session kept it whole (tests.cake.test_helpers.cake_profiler).  When
+    # every session lost them, the outputs and carriers of the last window are
+    # still checked before the launch count is skipped.
+    lost = None
+    try:
+        kernels = cuda_kernel_names(window, exclude=())
+    except pytest.skip.Exception as skipped:
+        lost = skipped
+    for call, actual in enumerate(outputs):
+        _assert_bitwise(actual, first[call % 2])
+        torch.testing.assert_close(
+            actual[0], expected[call % 2][0], atol=0.01, rtol=0.01
+        )
+        _assert_lse_close(actual[1], expected[call % 2][1])
+    for inputs in sets:
+        key = (backend._device_index(device), int(inputs["q"].shape[0]) // 8, 8)
+        cu_q, zeros = backend._decode_union_carriers_cache[key]
+        assert cu_q.tolist() == [8 * i for i in range(key[1] + 1)]
+        assert int(zeros.abs().sum()) == 0 and zeros.numel() == key[1] + 1
+    if lost is not None:
+        raise lost
+    assert len(kernels) == calls, sorted(set(kernels))
+    assert len(set(kernels)) == 1, sorted(set(kernels))
+
+
+def test_union_decode_carriers_created_on_one_stream_serve_another():
+    device = _current_device()
+    from flashinfer.msa_ops import _blackwell_sm100 as backend
+    from flashinfer.msa_ops import msa_sparse_decode_attention
+
+    inputs = _union_inputs(device, batch=128, seed=193, use_workspace=False)
+    key = (backend._device_index(device), 128, 8)
+    backend._decode_union_carriers_cache.pop(key, None)
+    expected = _reference_attention(inputs)
+    run = lambda: _invoke_attention(  # noqa: E731
+        inputs, None, None, msa_sparse_decode_attention
+    )
+    streams = [torch.cuda.Stream(device=device) for _ in range(2)]
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(streams[0]):
+        torch.cuda._sleep(2_000_000)
+        created = run()
+    assert key in backend._decode_union_carriers_cache
+    with torch.cuda.stream(streams[1]):
+        reused = run()
+    torch.cuda.synchronize()
+    for actual in (created, reused):
+        torch.testing.assert_close(actual[0], expected[0], atol=0.01, rtol=0.01)
+        _assert_lse_close(actual[1], expected[1])
+
+
+# Uniform FP8 prefill is served on measured shapes only (one request over 64 Q
+# heads and 4 KV heads, paged causal: one query token with a one-page table,
+# and on compute capability 10.3 also 146 query tokens with a two-page table);
+# the calls just outside them -- two requests, two or 147 query tokens, a
+# two-page table for one token, a three-page table for 146 tokens, GQA 8,
+# non-causal, an explicit ``q_offset`` (the derived value, passed), flat K/V --
+# raise as every FP8-Q prefill call did before: the same exception type and
+# the same text.
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"q_lens": [1, 1], "kv_lens": [97, 97]},
+        {"q_lens": [2], "kv_lens": [97]},
+        {"kv_lens": [200]},
+        {"num_kv_heads": 8},
+        {"causal": False},
+        {"q_offset": [96]},
+        {"kv_layout": "flat_varlen"},
+        {"q_lens": [146, 146], "kv_lens": [146, 146]},
+        {"q_lens": [147], "kv_lens": [147]},
+        {"q_lens": [146], "kv_lens": [300]},
+        {"q_lens": [146], "kv_lens": [146], "num_kv_heads": 8},
+    ],
+    ids=[
+        "batch2",
+        "seqlen-q2",
+        "page-width2",
+        "gqa8",
+        "noncausal",
+        "explicit-q-offset",
+        "flat",
+        "q146-batch2",
+        "seqlen-q147",
+        "q146-page-width3",
+        "q146-gqa8",
+    ],
+)
+def test_uniform_fp8_prefill_outside_its_box_is_declined(change):
+    device = _require_supported_gpu()
+    from flashinfer.msa_ops import msa_sparse_attention, msa_sparse_decode_attention
+
+    case = _attention_case(
+        "sparse_prefill",
+        q_dtype=_FP8,
+        kv_dtype=_FP8,
+        kv_layout="paged",
+        q_lens=[1],
+        kv_lens=[97],
+        num_q_heads=64,
+        num_kv_heads=4,
+        topk=16,
+        causal=True,
+        seed=89,
+    )
+    inputs = _make_attention_inputs({**case, **change}, device)
+    with pytest.raises(
+        NotImplementedError,
+        match="^uniform FP8 Q/K/V is supported only by sparse decode$",
+    ) as declined:
+        _invoke_attention(
+            inputs, None, msa_sparse_attention, msa_sparse_decode_attention
+        )
+    assert declined.type is NotImplementedError
+
+
+# The 146-token shape is served on compute capability 10.3 only; compute
+# capability 10.0 declines it with the same exception type and text.
+def test_uniform_fp8_prefill_q146_is_declined_on_sm100():
+    device = _require_supported_gpu()
+    from flashinfer.msa_ops import msa_sparse_attention, msa_sparse_decode_attention
+    from flashinfer.utils import get_compute_capability
+
+    if get_compute_capability(device) != (10, 0):
+        pytest.skip("compute capability 10.3 serves the 146-token shape")
+    case = _attention_case(
+        "sparse_prefill",
+        q_dtype=_FP8,
+        kv_dtype=_FP8,
+        kv_layout="paged",
+        q_lens=[146],
+        kv_lens=[146],
+        num_q_heads=64,
+        num_kv_heads=4,
+        topk=16,
+        causal=True,
+        seed=149,
+    )
+    inputs = _make_attention_inputs(case, device)
+    with pytest.raises(
+        NotImplementedError,
+        match="^uniform FP8 Q/K/V is supported only by sparse decode$",
+    ):
+        _invoke_attention(
+            inputs, None, msa_sparse_attention, msa_sparse_decode_attention
+        )
+
+
+# Inside the box the program converts the E4M3 Q to BF16 in its Q ingress (an
+# exact conversion) and otherwise runs as the BF16-Q program over the same FP8
+# cache (route prefill_union:bfloat16:float8_e4m3fn:paged:gqa0:any), so every
+# output equals, bit for bit, the call on ``q.to(torch.bfloat16)``.  Q is
+# scaled by 8 (exact in E4M3) so that the logits spread (standard deviation
+# about 0.9): the reference LSE of a zero Q then lies outside the LSE
+# tolerance, so the reference check sees Q as well.  The 146-token cases run
+# on compute capability 10.3, the only target that serves that shape.
+@pytest.mark.parametrize(
+    ("q_len", "kv_len", "use_workspace", "cuda_graph", "temperature_scale", "seed"),
+    [
+        (1, 97, True, False, 0.7, 103),
+        (1, 128, False, False, 1.0, 107),
+        (1, 1, True, True, 1.0, 109),
+        (1, 128, True, True, 0.7, 113),
+        (146, 146, True, False, 0.7, 127),
+        (146, 256, False, False, 1.0, 131),
+        (146, 146, True, True, 1.0, 137),
+        (146, 200, True, True, 0.7, 139),
+    ],
+    ids=[
+        "kv97-temperature",
+        "kv128-no-workspace",
+        "kv1-graph",
+        "kv128-graph-temperature",
+        "q146-kv146-temperature",
+        "q146-kv256-no-workspace",
+        "q146-kv146-graph",
+        "q146-kv200-graph-temperature",
+    ],
+)
+def test_uniform_fp8_prefill_box_is_the_bf16_q_call_bitwise(
+    q_len, kv_len, use_workspace, cuda_graph, temperature_scale, seed
+):
+    device = _require_supported_gpu()
+    from flashinfer.msa_ops import (
+        MSASparseAttentionWorkspace,
+        msa_sparse_attention,
+        msa_sparse_decode_attention,
+    )
+    from flashinfer.utils import get_compute_capability
+
+    if q_len != 1 and get_compute_capability(device) != (10, 3):
+        pytest.skip("the 146-token shape is served on compute capability 10.3")
+
+    case = _attention_case(
+        "sparse_prefill",
+        q_dtype=_FP8,
+        kv_dtype=_FP8,
+        kv_layout="paged",
+        q_lens=[q_len],
+        kv_lens=[kv_len],
+        num_q_heads=64,
+        num_kv_heads=4,
+        topk=16,
+        causal=True,
+        seed=seed,
+        return_temperature_lse=temperature_scale != 1.0,
+        lse_temperature_scale=temperature_scale,
+    )
+    inputs = _make_attention_inputs(case, device)
+    inputs["q"].copy_((inputs["q"].float() * 8.0).to(inputs["q"].dtype))
+
+    def new_workspace() -> Any:
+        if not use_workspace:
+            return None
+        return MSASparseAttentionWorkspace(device=device)
+
+    def run(call_inputs: dict[str, Any], workspace: Any) -> tuple[torch.Tensor, ...]:
+        return _invoke_attention(
+            call_inputs,
+            workspace,
+            msa_sparse_attention,
+            msa_sparse_decode_attention,
+        )
+
+    if cuda_graph:
+        # A workspace that took part in a capture is not reused eagerly.
+        captured_workspace = new_workspace()
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                run(inputs, captured_workspace)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = run(inputs, captured_workspace)
+        # FP8 tensors have no in-place CUDA arithmetic: perturb in float, store back.
+        inputs["q"].copy_((inputs["q"].float() * 0.5 + 0.125).to(inputs["q"].dtype))
+        with torch.cuda.stream(stream):
+            graph.replay()
+        stream.synchronize()
+        actual = tuple(t.clone() for t in captured)
+    else:
+        actual = tuple(t.clone() for t in run(inputs, new_workspace()))
+    upcast = run({**inputs, "q": inputs["q"].to(torch.bfloat16)}, new_workspace())
+    torch.cuda.synchronize()
+    assert actual[0].dtype == torch.bfloat16
+    _assert_bitwise(actual, upcast)
+
+    expected = _reference_attention(inputs)
+    torch.testing.assert_close(actual[0], expected[0], atol=0.1, rtol=0.1)
+    _assert_lse_close(actual[1], expected[1])
+    if temperature_scale != 1.0:
+        _assert_lse_close(actual[2], expected[2])
+    # the reference check sees Q: a zero Q moves the reference LSE outside
+    # the LSE tolerance
+    zero_q = (inputs["q"].float() * 0.0).to(inputs["q"].dtype)
+    blind = _reference_attention({**inputs, "q": zero_q})
+    assert not torch.allclose(blind[1], expected[1], atol=0.05, rtol=0.01)

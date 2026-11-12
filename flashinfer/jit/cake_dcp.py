@@ -249,14 +249,35 @@ def _load_dcp_spec_static_module(
 # On-device load-balanced DCP families (CAKE-685 round 3)
 # ---------------------------------------------------------------------------
 #
-# Each family ships shape-independent programs for both architectures
-# (``cuda/dcp_spec/<family>/kernel.cu``; a family with ``program_variants``
-# folds its programs into that one source and ``-DCAKE_FMHA_DCP_<KEY>=<value>``
-# selects the program's text; the shared-base prologue is switched by
-# ``__CUDA_ARCH__``).  Its 32- and 64-row packed instances are the
-# manifest members' ``defines`` (``-DN_ROWS=32`` / ``64``), selected by the
-# packed-row tile the request's speculative rows need; batch, heads, lengths,
-# rank and world are runtime kernel arguments.
+# Each family ships shape-independent programs for both architectures (the
+# shared-base prologue is switched by ``__CUDA_ARCH__``).  A manifest member's
+# ``sources`` names the program body it compiles: either the family's folded
+# ``cuda/dcp_spec/<family>/kernel.cu`` (a family with ``program_variants``
+# folds those programs into that one source and
+# ``-DCAKE_FMHA_DCP_<KEY>=<value>`` selects the program's text), or a
+# per-instance unit
+# ``cuda/dcp_spec/<family>/cake_fmha_<family>_program<P>_n<N>.cu`` that
+# holds one program for one packed-row tile (the E4M3 head_dim-128
+# family's program 0, the head_dim-256 family's programs 1 and 2).  A family
+# can mix both forms; the loader passes the same defines to either.  The 32-
+# and 64-row packed instances are the members' ``defines`` (``-DN_ROWS=32`` /
+# ``64``), selected by the packed-row tile the request's speculative rows
+# need; every member also defines ``Q_BOX_TOKENS``, the tokens per Q TMA box
+# of its program, from which the adapter encodes the Q tensor map (the
+# swapped-QK whole-tile programs load 32-row boxes, every other program the
+# 64-row tile).  Batch, heads, lengths, rank and world are runtime kernel
+# arguments.
+#
+# Dynamic shared memory: the launch binding sets and launches with it.  The
+# BF16 and E4M3 head_dim-256 bindings hold a constant equal to the family's
+# ``dynamic_shared_memory_bytes``.  The E4M3 head_dim-128 programs differ
+# (program 0: 177152 bytes, programs 1 and 2: 160768), so that family has no
+# family-level value: each member defines ``DYNAMIC_SMEM_BYTES`` (passed with
+# the other member defines) and its binding reads that define.  The balanced
+# route's ``launch.shared_mem_bytes`` records the same sizes for readers of
+# the registry: one integer when every program of the family uses the same
+# size, else an object mapping each program value (as a string) to its bytes.
+# No loader code reads that route field.
 
 DcpBalancedFamily = Literal[
     "dcp_spec_bf16_balanced",
@@ -359,6 +380,16 @@ def _get_dcp_balanced_sources(
         raise RuntimeError(
             f"Cake FMHA DCP member {family} {selector!r} does not define N_ROWS={n_rows}"
         )
+    q_box_tokens = defines.get("Q_BOX_TOKENS")
+    if (
+        not isinstance(q_box_tokens, int)
+        or isinstance(q_box_tokens, bool)
+        or q_box_tokens <= 0
+    ):
+        raise RuntimeError(
+            f"Cake FMHA DCP member {family} {selector!r} does not define Q_BOX_TOKENS "
+            "(the tokens per Q TMA box of its program)"
+        )
     launch_binding = (
         get_cake_fmha_csrc_dir() / _get_dcp_family(family)["binding_source"]
     )
@@ -378,10 +409,14 @@ def gen_dcp_spec_balanced_module(
 
     The family's program (``program`` selects it for families with
     ``program_variants``; see :func:`dcp_balanced_program_variants`) is
-    instantiated with the manifest member's defines (``-DN_ROWS``).  The
-    exported launch binding owns the kernel's thread count and dynamic shared
-    memory; the FlashInfer adapter encodes the tensor maps, carves the
-    caller-owned scratch and calls it as ``CAKE_FMHA_DCP_BALANCED_LAUNCH``.
+    instantiated with the manifest member's defines (``-DN_ROWS``, and
+    ``-DDYNAMIC_SMEM_BYTES`` for a family whose programs differ in dynamic
+    shared memory).  The exported launch binding owns the kernel's thread
+    count and sets the dynamic shared memory: a constant equal to the
+    family's ``dynamic_shared_memory_bytes``, or the member's
+    ``DYNAMIC_SMEM_BYTES`` define when the family has no family-level value.
+    The FlashInfer adapter encodes the tensor maps, carves the caller-owned
+    scratch and calls the binding as ``CAKE_FMHA_DCP_BALANCED_LAUNCH``.
     """
 
     uri = get_dcp_spec_balanced_uri(family, target, n_rows, program)

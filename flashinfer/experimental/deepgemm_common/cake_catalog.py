@@ -72,7 +72,9 @@ class Catalog:
     ``definitions`` (compile-line macro names the loader supplies, e.g. the SM
     count) and per-architecture ``compile_flags`` (``{arch: [...]}``); a route
     shared by every architecture may carry per-architecture SM counts
-    (``"num_sms": {arch: n}``). Nothing is hashed or re-verified at import;
+    (``"num_sms": {arch: n}``); a merged program may name its ``arg_plan`` in the
+    catalog's top-level ``arg_plans`` table instead of listing it inline
+    (``programs()`` returns the list). Nothing is hashed or re-verified at import;
     ``closure_sha256`` is a build receipt, not a load-time gate.
     """
 
@@ -110,11 +112,15 @@ class Catalog:
         return tuple(sorted(self._data["arches"]))
 
     def programs(self, arch: str) -> Mapping[str, Mapping[str, Any]]:
-        """Program records compiled for ``arch`` (name -> record)."""
+        """Program records compiled for ``arch`` (name -> record).
+
+        A record whose ``arg_plan`` names an entry of the catalog's ``arg_plans``
+        table is returned with that list in place of the name.
+        """
         self._require_arch(arch)
         if self.merged:
             return {
-                name: record
+                name: self._resolve_arg_plan(name, record)
                 for name, record in self._data["programs"].items()
                 if arch in record["arches"]
             }
@@ -127,6 +133,28 @@ class Catalog:
             raise KeyError(
                 f"{self.label} catalog has no program {name!r} for {arch}"
             ) from error
+
+    def _resolve_arg_plan(
+        self, name: str, record: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """``record`` with a shared ``arg_plan`` name replaced by the referenced list.
+
+        Programs of one launch surface can share one argument plan: the plan is
+        listed once under the catalog's top-level ``arg_plans`` table and each
+        record names it (``"arg_plan": "<key>"``). An inline list is returned as
+        it is; a name the table does not carry is a malformed catalog.
+        """
+        plan = record.get("arg_plan")
+        if not isinstance(plan, str):
+            return record
+        try:
+            shared = self._data["arg_plans"][plan]
+        except KeyError as error:
+            raise ValueError(
+                f"{self.label} program {name!r} names the shared argument plan "
+                f"{plan!r}, which the catalog's 'arg_plans' table does not carry"
+            ) from error
+        return {**record, "arg_plan": shared}
 
     def routes(self, arch: str) -> Mapping[str, Mapping[str, Any]]:
         """Route records of ``arch`` (route key -> route)."""

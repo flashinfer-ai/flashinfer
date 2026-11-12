@@ -9,7 +9,7 @@ Historical `92dd334` knob profiles are candidate settings for this newer
 kernel, not new measurements; tuning caches from that drop are invalidated.
 
 Qualify correctness first using the [Rubin runbook](../../../../../docs/design_docs/moe_ep_sm107_qualification.md).
-NVFP4, MXFP8 E4M3/E5M2, and MXFP4/MXFP8 require native SM107 and
+NVFP4, MXFP4, MXFP8 E4M3/E5M2, and MXFP4/MXFP8 require native SM107 and
 a compatible CuTe DSL build. Export `CUTE_DSL_ARCH=sm_107a` before Python
 starts. Record the compiler stack and absolute latency with each result.
 
@@ -21,6 +21,42 @@ Use `--dtype mxfp4_mxfp8 --arch sm107` for mixed-format offline tuning, or
 MXFP8 activation staging and uses packed E2M1 weights with block-32 E8M0
 scales. Its tuning cache entries are separate from the MXFP8-weight entries.
 
+Use `Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig` for MXFP4 weights and
+activations (W4A4), or `--dtype mxfp4 --arch sm107` in the offline tuner.
+Both operands use packed E2M1 with per-32 E8M0 scales. Weight preparation
+is shared with MXFP4/MXFP8, including canonical prequantized weights without
+requantization. Hidden and intermediate sizes must be multiples of 128.
+BF16 inputs use fused quantization and route staging; `quantize_input=False`
+accepts packed FP4 input and E8M0 scales in `MoEEpTensors.scales`.
+
+W4A4 defaults to tile K256 with standard inference or GenPhase. GenPhase retains
+its N128/N256, uniform CGA4, BF16-combine and capacity constraints; the N64
+FP8 decode path is not admitted. Native tuning and caches distinguish W4A4
+from NVFP4 and mixed MXFP4/MXFP8. The benchmark accepts `--quant-kind mxfp4`.
+
+Routing value checks are disabled by default. With
+`FLASHINFER_SM107_MEGA_CHECK_ROUTES=1`, contiguous BF16 inputs and top-k up to 32
+use NVFP4, MXFP4 or MXFP8 staging to check route bounds, duplicate experts and
+finite unmasked scores in the quantization kernel. These checks remain active
+during graph replay. Unsupported layouts and prequantized inputs use separate
+routing validation. Set
+`FLASHINFER_SM107_FUSED_ROUTE_CHECK=0` to use separate validation for diagnostics.
+
+NVFP4, MXFP4 and MXFP8 staging also mask trailing routing rows in the quantization launch,
+including when replaying graphs with different live row counts in a shared
+workspace. Empty inputs and tails exceeding 16 routing elements per live CTA
+thread retain a separate parallel fill. Set
+`FLASHINFER_SM107_FUSED_TAIL_MASK=0` to use the separate tail clear for diagnostics.
+
+NVFP4 backend defaults for `fc1_alpha`, `fc2_alpha`, and `fc1_norm_const`
+bind a workspace-owned read-only ones tensor instead of filling three tensors
+on every call. Explicit contiguous FP32 tensors are also bound directly; other
+layouts retain the copy path. The default tensor is separate from mutable
+workspace scalar storage so pooled layers and captured graphs cannot overwrite
+each other's default values. Valid strided FP32 vectors are accepted on the
+first invocation as well as after warmup; shape, device and positive-finite
+value checks still apply.
+
 ## What the benchmark measures
 
 `benchmarks/moe_ep/backends/mega/kernel/sm107/bench_moe_ep_sm107_block_scaled_mega.py` reports:
@@ -29,9 +65,11 @@ scales. Its tuning cache entries are separate from the MXFP8-weight entries.
   required output/reset operations and dispatch, both GEMMs, and combine.
 - `--mode compute`: inputs staged once, then backend `compute()` with a
   preallocated owned output reused across calls. Includes the backend wrapper,
-  required resets/reduction, kernel, and output copy, but no recurring input staging.
+  required resets/reduction and kernel, but no recurring input staging. Separate
+  reduction writes aligned contiguous outputs directly; other layouts and
+  in-kernel reduction use a workspace output followed by a copy.
 - `--mode forward`: public `MoEEpLayer.forward()` with BF16 inputs, including
-  validation, Torch quantization/staging, owned output handling, and the kernel.
+  validation, quantization/staging, owned output handling, and the kernel.
 - `--execution eager|graph`: eager launches or replay of a warmed CUDA
   graph. These are separate series, not interchangeable measurements.
 
@@ -105,7 +143,95 @@ measured MXFP8 optimum.
 
 Engine configuration has the same distinction: `knobs=None` preserves
 explicit fields, `knobs="cache"` performs lookup with heuristic fallback,
-and a dictionary overrides fields. Online `knobs="auto"` is unsupported.
+and a dictionary overrides fields. `knobs="auto"` also permits collective
+tuning during a FlashInfer `autotune_v2()` warmup. It uses the same candidates
+and sampled numerical checks as the offline tuner.
+
+Automatic selection checks FlashInfer records first, then the MegaMoE cache
+file, using the same capacity/live-token buckets and numerical compatibility
+rules. Replay can import a compatible file record into memory. Tuning requires
+matching measurement provenance; an older record without it triggers a search.
+Every selected winner is also written to the configured MegaMoE file, including on a
+FlashInfer cache hit. Disabling the MegaMoE file with
+`FLASHINFER_MOE_EP_KNOB_CACHE=off` does not disable FlashInfer's cache.
+The installed winner and its cache identity belong to the workspace. Returning
+to an earlier store or policy reselects from that store if a different winner
+has since been installed.
+
+Compatibility uses the existing MegaMoE backend revision, standard FlashInfer
+v2 environment metadata, and numerical, device and resource checks. Python
+source files are not hashed for tuning compatibility. Update `BACKEND_REVISION`
+in `shim/knob_cache.py` when kernel or knob semantics invalidate previous results.
+
+Without an enabled autotune context, an automatic layer can install a cached
+winner; a miss uses its initial heuristic configuration and leaves tuning
+pending. Initial allocation does not read either cache, so rank-local files
+cannot change allocation before collective selection. All EP ranks must enter
+matching contexts and forwards. Use `autotune_v2()` for automatic persistent
+output. The protocol publishes on EP rank zero; every rank participates in
+selection and execution:
+
+```python
+with autotune_v2():
+    layer.warmup(tensors)  # Construct the layer with knobs="auto".
+```
+
+A later process can load the managed store with `autotune_v2(mode="replay")`.
+No `cache=` filename is required. `persistent_cache=False` disables both managed
+storage and the MegaMoE compatibility file for the context. Protocol records
+are not read or written by the v1 JSON API.
+
+`tuning_buckets` and `round_up=True` are not supported for automatic selection
+and raise before cache lookup or tuning. Prepare workspaces with the desired
+capacities instead; selection retains MegaMoE's capacity/live-token lookup.
+
+The default measurement preserves the native CUDA-event loop. Explicit
+`MeasurementPolicy(execution_mode="eager")` includes per-call host overhead;
+`execution_mode="cuda_graph"` captures and replays the prepared candidate.
+`cold_l2=True` flushes L2 before each measured invocation, outside its timed
+interval. Every mode measures the kernel boundary without input staging and
+takes the median of matched maximum-rank samples. Policies have separate cache
+identities. Capture-unsupported candidates are skipped collectively; GPU launch
+failures abort. The diagnostic CUPTI timer uses a collective CUDA-event fallback
+if tracing is unavailable on any rank, as in the framework's ordinary profiler.
+
+Tune before CUDA graph capture. Automatic workspaces are private to their
+layer. Winner installation retains staged inputs and transformed weights and
+can replace output buffers, kernel scratch and compiled state. Reacquire borrowed
+output views after selection. Once captured, a workspace cannot
+install another winner. A later Python forward that needs selection replaces
+the default workspace before staging inputs and keeps the old storage alive
+until layer destruction. Existing graphs continue to use their original
+workspace. The replacement shares transformed weights and needs its own graph
+capture. Tuning and graph replay must run sequentially.
+Repeated capture and replacement can retain more than two workspaces. Use
+explicit handles when old workspaces need to be released before layer destruction.
+Each eager automatic forward coordinates selection across the EP group, even
+when this rank needs no change. A peer may have invalidated its local cache.
+Default workspaces also coordinate replacement before allocating storage.
+CUDA graph replay does not run these host checks.
+
+For explicit lifetime control, use `layer.create_workspace(capacity)` on an
+automatic layer. Each handle has independent storage and selection state, even
+at the same capacity. Pass it to `warmup(..., workspace=handle)` inside the v2
+context, then capture `forward(..., workspace=handle)`. Handles keep stable
+addresses after capture; later tuning requires another handle. Destroy a handle
+collectively only after retiring its referencing graphs and synchronizing all
+work that uses it. A store/policy switch or `autotune_v2_reload()` invalidates
+the automatic selection's local identity.
+Automatic handles accept the offline `live_tokens` profile hint but warn at
+creation that it does not affect automatic selection. Their lookup uses the
+actual warmup or forward batch, taking the maximum live count across EP ranks.
+`layer.get_tuned_knobs(workspace=handle)` returns that handle's selected
+configuration; omitting `workspace` returns the default workspace's result.
+Neither getter allocates or performs selection.
+Warm up again before capture after changing the cache or measurement policy.
+If the new store has no compatible winner and tuning is disabled, an uncaptured
+workspace returns to its initial configuration instead of keeping the old
+store's winner. Captured explicit handles retain their prepared configuration.
+Adding `moe_ep.sm107.cutedsl.native.v1` to `skip_ops` forces initial knobs without
+cache lookup or search. Apply it before capture; a captured explicit handle
+with a selected winner requires a new handle to prepare the fallback.
 
 ## Benchmark workloads
 
@@ -200,6 +326,36 @@ Report Torch staging cost separately when evaluating a fused staging implementat
 
 ## Offline tuning
 
+The regular inference grid has 32 candidates. It retains the original 16 in
+the same order, then adds N64 tiles at two K depths and uniform-cluster
+phase-interleaved launches for N128/N256. The added launches use cluster
+sizes two and four, epilogue flag batches `(2, 4)`, and FC2 bulk stores on/off.
+N64 bulk stores use one TMA stage; wider tiles use two. The GenPhase grid is
+unchanged. Layer warmup and the offline CLI use the same candidate generator.
+
+The CLI always searches afresh and leaves its input workspace unchanged. It
+writes each winner to the managed FlashInfer v2 store and the MegaMoE file on
+EP rank zero. The default store is `FLASHINFER_CACHE_DIR/autotune`;
+`FLASHINFER_AUTOTUNE_CACHE_DIR` overrides its root directory. Applications use
+`autotune_v2()` or `autotune_v2(mode="replay")` to reuse these results.
+The managed record and MegaMoE file include implementation, dependency,
+fixed-resource and measurement compatibility information.
+
+Pass `--kernel-variant auto` to search inference and GenPhase in one run.
+Both use the same generated inputs and complete-forward timing. Variants that
+cannot support the capacity or numerical settings are excluded. The CLI writes
+each variant's winner and the overall selection through the same v2 protocol
+as layer warmup, bypassing cached winners at both levels. It does not install
+or prepare the final winner after the search.
+
+`--max-candidates` limits each variant's grid separately. `--sweep schedule`
+resolves each variant's base on EP rank zero and shares the grid across ranks.
+An explicit `--base-knobs` dictionary is applied to both variants. The sweep
+fails before tuning if an eligible variant has no valid schedule candidates;
+use a compatible base or select an explicit variant. Workload, warmup and
+measurement options apply to both searches. The default remains
+`--kernel-variant inference`.
+
 Use a separate cache file for each qualification job to avoid concurrent
 writers. Start with the regular candidate grid; use a schedule sweep with
 production-like skew after correctness passes:
@@ -214,8 +370,9 @@ timeout --kill-after=15s 3600s torchrun --standalone --nproc_per_node=4 \
 ```
 
 The tuner verifies collective candidate agreement, rejects invalid geometry
-before symmetric allocation, checks sampled outputs against a Torch oracle,
-then measures isolated CUDA-event launches. It reduces each iteration with
+before symmetric allocation, prepares each candidate on every rank before
+launching, checks sampled outputs against a Torch oracle, then measures isolated
+CUDA-event launches. Preparation failures are reported across the EP group. It reduces each iteration with
 MAX across ranks before taking the median. Only a candidate passing the
 numerical checks can enter the cache. Runtime failures stop the job;
 relaunch in fresh workers instead of continuing on a failed CUDA context.

@@ -15,11 +15,16 @@ limitations under the License.
 """
 
 import math
+import os
 
 import pytest
 import torch
 import torch.nn.functional as F
-from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
+from tests.infra.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
+from tests.utils.test_helpers.pdl import late_store
 
 import flashinfer
 from flashinfer.jit import env as jit_env
@@ -161,8 +166,13 @@ def test_norm(batch_size, hidden_size, dtype, specify_out, enable_pdl, contiguou
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize("pattern", ["zero", "tiny", "sparse", "alternating", "large"])
-def test_rmsnorm_output_contract(shape, dtype, padded, pattern):
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_rmsnorm_output_contract(shape, dtype, padded, pattern, enable_pdl):
     """Exercise finite edge inputs and caller-owned output storage on the public API."""
+    if enable_pdl and not device_support_pdl(torch.device("cuda")):
+        # rmsnorm() silently turns enable_pdl=True into a plain launch below SM90;
+        # skip instead of counting that launch as PDL coverage.
+        pytest.skip("PDL requires SM90+")
     hidden = shape[-1]
     storage_shape = (*shape[:-1], hidden + 16) if padded else shape
     input_storage = torch.full(storage_shape, -23, dtype=dtype, device="cuda")
@@ -194,7 +204,7 @@ def test_rmsnorm_output_contract(shape, dtype, padded, pattern):
     previous = None
     for poison in (float("nan"), 17.0):
         out.fill_(poison)
-        returned = flashinfer.norm.rmsnorm(x, weight, out=out, enable_pdl=False)
+        returned = flashinfer.norm.rmsnorm(x, weight, out=out, enable_pdl=enable_pdl)
         torch.cuda.synchronize()
         assert returned is out
         assert torch.isfinite(out).all()
@@ -207,6 +217,572 @@ def test_rmsnorm_output_contract(shape, dtype, padded, pattern):
         if previous is not None:
             torch.testing.assert_close(out, previous, rtol=0, atol=0)
         previous = out.clone()
+
+
+# ---------------------------------------------------------------------------
+# PDL ordering. With enable_pdl the norm kernels are launched with programmatic
+# stream serialization, so they may start while the previous kernel is still
+# running. They must not read what that kernel is still writing (RAW) or write
+# what it is still reading (WAR) before griddepcontrol.wait.
+# ---------------------------------------------------------------------------
+
+# The producer releases its dependents on entry, spins, and only then copies.
+# A dependent that reads before griddepcontrol.wait sees the NaN left in a
+# destination (RAW); one that writes before it changes the bytes the producer
+# copies out (WAR). The probe reads a flag before its own wait, so it records
+# whether a dependent launch overlapped the producer at all on this setup.
+_PDL_RACE_CUDA = r"""
+// Only the stream header, not ATen/cuda/CUDAContext.h: that one pulls in the
+// cuBLAS / cuSPARSE headers, which a toolkit with just nvcc and cudart lacks.
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAStream.h>
+#include <torch/extension.h>
+
+#include <cstdint>
+#include <vector>
+
+constexpr int kMaxJobs = 4;
+
+struct CopyJobs {
+  uint8_t* dst[kMaxJobs];
+  const uint8_t* src[kMaxJobs];
+  int64_t nbytes[kMaxJobs];
+  int num_jobs;
+};
+
+__global__ void trigger_spin_copy_kernel(CopyJobs jobs, int64_t spin_cycles) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+  int64_t start = clock64();
+  while (clock64() - start < spin_cycles) {
+  }
+  int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  int64_t tid = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+  for (int j = 0; j < jobs.num_jobs; ++j) {
+    for (int64_t i = tid; i < jobs.nbytes[j]; i += stride) {
+      jobs.dst[j][i] = jobs.src[j][i];
+    }
+  }
+}
+
+__global__ void pdl_probe_kernel(const int32_t* flag, int32_t* observed) {
+  // Read before griddepcontrol.wait on purpose: a stale value means this
+  // dependent ran while the producer was still spinning.
+  int32_t seen = *reinterpret_cast<const volatile int32_t*>(flag);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.wait;");
+#endif
+  if (threadIdx.x == 0) {
+    *observed = seen;
+  }
+}
+
+void pdl_trigger_spin_copy(std::vector<at::Tensor> dsts, std::vector<at::Tensor> srcs,
+                           int64_t spin_cycles) {
+  TORCH_CHECK(dsts.size() == srcs.size(), "dsts and srcs differ in length");
+  TORCH_CHECK(dsts.size() <= kMaxJobs, "too many copy jobs");
+  CopyJobs jobs{};
+  jobs.num_jobs = static_cast<int>(dsts.size());
+  for (size_t j = 0; j < dsts.size(); ++j) {
+    TORCH_CHECK(dsts[j].is_cuda() && srcs[j].is_cuda(), "copy jobs must be on CUDA");
+    TORCH_CHECK(dsts[j].is_contiguous() && srcs[j].is_contiguous(),
+                "copy jobs must be contiguous storage");
+    int64_t n = dsts[j].numel() * dsts[j].element_size();
+    TORCH_CHECK(n == srcs[j].numel() * srcs[j].element_size(), "copy job size mismatch");
+    jobs.dst[j] = static_cast<uint8_t*>(dsts[j].data_ptr());
+    jobs.src[j] = static_cast<const uint8_t*>(srcs[j].data_ptr());
+    jobs.nbytes[j] = n;
+  }
+  trigger_spin_copy_kernel<<<64, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(jobs,
+                                                                               spin_cycles);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void pdl_probe(at::Tensor flag, at::Tensor observed) {
+  TORCH_CHECK(flag.is_cuda() && observed.is_cuda(), "probe tensors must be on CUDA");
+  TORCH_CHECK(flag.scalar_type() == at::kInt && observed.scalar_type() == at::kInt,
+              "probe tensors must be int32");
+  cudaLaunchConfig_t config = {};
+  config.gridDim = dim3(1);
+  config.blockDim = dim3(32);
+  config.dynamicSmemBytes = 0;
+  config.stream = c10::cuda::getCurrentCUDAStream();
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  config.attrs = attrs;
+  config.numAttrs = 1;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&config, pdl_probe_kernel,
+                                    static_cast<const int32_t*>(flag.data_ptr()),
+                                    static_cast<int32_t*>(observed.data_ptr())));
+}
+"""
+
+_PDL_SPIN_CYCLES = 4_000_000
+# Raise for local stress runs; CI keeps the default.
+_PDL_REPEATS = int(os.environ.get("FLASHINFER_NORM_PDL_REPEATS", "5"))
+_PDL_SEED = 3605
+
+# (api, shape, padded): one entry per CuTe variant the SM90 dispatch can pick,
+# see the cluster / cp.async / compact-vs-strided selection in
+# flashinfer/norm/kernels/{rmsnorm,fused_add_rmsnorm}.py. M = 264 keeps every
+# SM of a 132-SM part busy twice over.
+#
+# Weights are deliberately not part of the contract: they are static
+# parameters, and reading them before griddepcontrol.wait (for example to
+# prefetch them) is a legitimate optimisation. The producer therefore only
+# writes or reads activations, the residual and the output.
+_PDL_RACE_CASES = [
+    ("rmsnorm", (264, 128), False),
+    ("rmsnorm", (264, 4096), False),
+    ("rmsnorm", (264, 4096), True),
+    ("rmsnorm", (264, 131072), False),
+    ("rmsnorm", (66, 4, 128), False),
+    ("fused_add_rmsnorm", (264, 128), False),
+    ("fused_add_rmsnorm", (264, 4096), False),
+    ("fused_add_rmsnorm", (264, 32768), False),
+]
+
+
+def _pdl_case_id(case):
+    api, shape, padded = case
+    return f"{api}-{'x'.join(map(str, shape))}{'-padded' if padded else ''}"
+
+
+_pdl_race_module_cache = {}
+
+
+def _pdl_race_module():
+    major, minor = torch.cuda.get_device_capability()
+    key = (major, minor)
+    if key not in _pdl_race_module_cache:
+        from torch.utils.cpp_extension import load_inline
+
+        _pdl_race_module_cache[key] = load_inline(
+            name=f"test_norm_pdl_race_sm{major}{minor}",
+            cpp_sources=[
+                "void pdl_trigger_spin_copy(std::vector<at::Tensor> dsts, "
+                "std::vector<at::Tensor> srcs, int64_t spin_cycles);\n"
+                "void pdl_probe(at::Tensor flag, at::Tensor observed);"
+            ],
+            cuda_sources=[_PDL_RACE_CUDA],
+            extra_cuda_cflags=[
+                f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+            ],
+            functions=["pdl_trigger_spin_copy", "pdl_probe"],
+            verbose=False,
+        )
+        module = _pdl_race_module_cache[key]
+        # Load both kernels eagerly: a lazily loaded module cannot be loaded
+        # while a CUDA graph is being captured.
+        flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+        observed = torch.zeros(1, dtype=torch.int32, device="cuda")
+        module.pdl_trigger_spin_copy([], [], 0)
+        module.pdl_probe(flag, observed)
+        torch.cuda.synchronize()
+    return _pdl_race_module_cache[key]
+
+
+def _skip_unless_pdl():
+    if not device_support_pdl(torch.device("cuda")):
+        # enable_pdl=True is turned into a plain launch below SM90, which would
+        # make every race test pass without testing anything.
+        pytest.skip("PDL requires SM90+")
+
+
+_pdl_overlap_cache = {}
+
+
+def _pdl_overlap_runs(mode):
+    """How many of ``_PDL_REPEATS`` probe runs started a PDL dependent while
+    the producer was still spinning."""
+    key = (torch.cuda.current_device(), mode)
+    if key not in _pdl_overlap_cache:
+        module = _pdl_race_module()
+        flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+        one = torch.ones(1, dtype=torch.int32, device="cuda")
+        observed = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+
+        def fn():
+            module.pdl_trigger_spin_copy([flag], [one], _PDL_SPIN_CYCLES)
+            module.pdl_probe(flag, observed)
+
+        run = _pdl_launcher(mode, fn)
+        stale = 0
+        for _ in range(_PDL_REPEATS):
+            flag.zero_()
+            observed.fill_(-1)
+            torch.cuda.synchronize()
+            run()
+            torch.cuda.synchronize()
+            assert int(flag.item()) == 1
+            assert int(observed.item()) in (0, 1)
+            stale += int(observed.item()) == 0
+        _pdl_overlap_cache[key] = stale
+    return _pdl_overlap_cache[key]
+
+
+def _skip_unless_pdl_overlaps(mode):
+    """Skip where a PDL dependent cannot overlap the producer: the race tests
+    would pass there without testing anything."""
+    _skip_unless_pdl()
+    if os.environ.get("CUDA_LAUNCH_BLOCKING", "0") not in ("", "0"):
+        pytest.skip("CUDA_LAUNCH_BLOCKING serializes launches; PDL cannot overlap")
+    if _pdl_overlap_runs(mode) == 0:
+        # Something serialized the launches, e.g. a sanitizer or profiler.
+        pytest.skip(
+            f"{mode}: no PDL dependent ran ahead of the producer in "
+            f"{_PDL_REPEATS} probe runs, so the race tests cannot fail here"
+        )
+
+
+def _bits(t):
+    return t.view(torch.int16) if t.element_size() == 2 else t.view(torch.int32)
+
+
+def _assert_bitwise(actual, expected, what):
+    a, e = _bits(actual), _bits(expected)
+    bad = a != e
+    if bad.any():
+        rows = bad.reshape(-1, bad.shape[-1]).any(dim=-1).nonzero().flatten()
+        raise AssertionError(
+            f"{what}: {int(bad.sum())} of {bad.numel()} elements differ bitwise; "
+            f"first differing flattened rows {rows[:8].tolist()}"
+        )
+
+
+def _pdl_launcher(mode, fn):
+    """Return a callable that runs ``fn`` eagerly or replays it from a CUDA graph."""
+    if mode == "eager":
+        return fn
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+    return graph.replay
+
+
+class _PdlNormCase:
+    """Storage for one race case. Every tensor the producer touches is the
+    contiguous storage; the norm sees the (possibly padded) view."""
+
+    def __init__(self, api, shape, padded, dtype):
+        self.api, self.shape, self.padded, self.dtype = api, shape, padded, dtype
+        hidden = shape[-1]
+        self.storage_shape = (*shape[:-1], hidden + 16) if padded else shape
+        gen = torch.Generator(device="cuda").manual_seed(_PDL_SEED)
+        self.src_x = torch.randn(
+            self.storage_shape, generator=gen, device="cuda", dtype=torch.float32
+        ).to(dtype)
+        self.src_r = torch.randn(
+            self.storage_shape, generator=gen, device="cuda", dtype=torch.float32
+        ).to(dtype)
+        self.src_w = (
+            torch.rand(hidden, generator=gen, device="cuda", dtype=torch.float32) + 0.5
+        ).to(dtype)
+        self.x = torch.empty_like(self.src_x)
+        self.r = torch.empty_like(self.src_r)
+        self.w = torch.empty_like(self.src_w)
+        self.out = torch.empty_like(self.src_x)
+
+    def view(self, t):
+        return t[..., 8:-8] if self.padded else t
+
+    def call(self, enable_pdl):
+        if self.api == "rmsnorm":
+            flashinfer.norm.rmsnorm(
+                self.view(self.x),
+                self.w,
+                out=self.view(self.out),
+                enable_pdl=enable_pdl,
+            )
+        else:
+            flashinfer.norm.fused_add_rmsnorm(
+                self.view(self.x), self.view(self.r), self.w, enable_pdl=enable_pdl
+            )
+
+    def reset(self):
+        """Clean inputs, poisoned output; padding keeps a known value."""
+        self.x.copy_(self.src_x)
+        self.r.copy_(self.src_r)
+        self.w.copy_(self.src_w)
+        self.out.fill_(17.0)
+
+    def results(self):
+        if self.api == "rmsnorm":
+            return {"out": self.out.clone()}
+        return {"input": self.x.clone(), "residual": self.r.clone()}
+
+    def reference(self, enable_pdl):
+        """The same call on synchronized inputs: the bitwise target."""
+        self.reset()
+        torch.cuda.synchronize()
+        self.call(enable_pdl)
+        torch.cuda.synchronize()
+        return self.results()
+
+
+def _check_shape_fits(case):
+    api, shape, _ = case
+    if api == "fused_add_rmsnorm":
+        _skip_if_fused_norm_smem_exceeds_limit(
+            shape[-1], torch.bfloat16, torch.device("cuda")
+        )
+
+
+@pytest.mark.parametrize("mode", ["eager", "graph"])
+def test_pdl_race_probe_sees_overlap(mode):
+    """Calibration for the race tests below: they can only fail where a PDL
+    dependent actually starts while the producer spins. Like them, this skips
+    with the reason on setups where it never does."""
+    _skip_unless_pdl_overlaps(mode)
+
+
+@pytest.mark.parametrize("case", _PDL_RACE_CASES, ids=_pdl_case_id)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("mode", ["eager", "graph"])
+def test_norm_pdl_waits_before_reading(case, dtype, mode):
+    """RAW: activations written by a still-running producer must not be read
+    early. Weights are excluded, see ``_PDL_RACE_CASES``."""
+    _skip_unless_pdl_overlaps(mode)
+    _check_shape_fits(case)
+    module = _pdl_race_module()
+    c = _PdlNormCase(*case, dtype)
+    expected = c.reference(enable_pdl=True)
+
+    dsts, srcs = [c.x], [c.src_x]
+    if c.api == "fused_add_rmsnorm":
+        dsts.append(c.r)
+        srcs.append(c.src_r)
+
+    def fn():
+        module.pdl_trigger_spin_copy(dsts, srcs, _PDL_SPIN_CYCLES)
+        c.call(enable_pdl=True)
+
+    run = _pdl_launcher(mode, fn)
+    for rep in range(_PDL_REPEATS):
+        c.reset()
+        for t in dsts:
+            t.fill_(float("nan"))
+        torch.cuda.synchronize()
+        run()
+        torch.cuda.synchronize()
+        for name, value in c.results().items():
+            _assert_bitwise(
+                value,
+                expected[name],
+                f"{_pdl_case_id(case)} {dtype} {mode} "
+                f"seed={_PDL_SEED} repeat={rep} {name}",
+            )
+
+
+@pytest.mark.parametrize("case", _PDL_RACE_CASES, ids=_pdl_case_id)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("mode", ["eager", "graph"])
+def test_norm_pdl_waits_before_writing(case, dtype, mode):
+    """WAR: buffers a still-running producer reads must not be overwritten early."""
+    _skip_unless_pdl_overlaps(mode)
+    _check_shape_fits(case)
+    module = _pdl_race_module()
+    c = _PdlNormCase(*case, dtype)
+    expected = c.reference(enable_pdl=True)
+
+    if c.api == "rmsnorm":
+        watched = {"out": c.out}
+    else:
+        watched = {"input": c.x, "residual": c.r}
+    snapshots = {name: torch.empty_like(t) for name, t in watched.items()}
+
+    def fn():
+        module.pdl_trigger_spin_copy(
+            list(snapshots.values()), list(watched.values()), _PDL_SPIN_CYCLES
+        )
+        c.call(enable_pdl=True)
+
+    run = _pdl_launcher(mode, fn)
+    for rep in range(_PDL_REPEATS):
+        c.reset()
+        before = {name: t.clone() for name, t in watched.items()}
+        for s in snapshots.values():
+            s.fill_(-1.0)
+        torch.cuda.synchronize()
+        run()
+        torch.cuda.synchronize()
+        tag = f"{_pdl_case_id(case)} {dtype} {mode} seed={_PDL_SEED} repeat={rep}"
+        for name in watched:
+            _assert_bitwise(
+                snapshots[name], before[name], f"{tag} {name} overwritten early"
+            )
+        for name, value in c.results().items():
+            _assert_bitwise(value, expected[name], f"{tag} {name}")
+
+
+@pytest.mark.parametrize("case", _PDL_RACE_CASES, ids=_pdl_case_id)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_norm_pdl_matches_plain_launch(case, dtype):
+    """The PDL and non-PDL builds of a kernel give bitwise identical results."""
+    _skip_unless_pdl()
+    _check_shape_fits(case)
+    c = _PdlNormCase(*case, dtype)
+    with_pdl = c.reference(enable_pdl=True)
+    without_pdl = c.reference(enable_pdl=False)
+    for name, value in with_pdl.items():
+        _assert_bitwise(
+            value, without_pdl[name], f"{_pdl_case_id(case)} {dtype} {name}"
+        )
+
+
+@pytest.mark.parametrize(
+    "hidden_size",
+    # The last two are not multiples of 16 and exercise the divisor fallback.
+    [
+        8192,
+        16384,
+        32768,
+        40960,
+        49152,
+        57344,
+        58112,
+        65536,
+        98304,
+        131072,
+        262144,
+        100001,
+        2097160,
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_norm_cluster_budget_keeps_async_copy(hidden_size, dtype):
+    """A cluster size that fits the cp.async budget must be the one chosen.
+
+    ``_compute_cluster_n`` sizes the shared-memory tile that ``use_async_copy``
+    gates; picking a smaller size turns cp.async off while the per-thread
+    fragment is still large, which spills to local memory.
+    """
+    cutlass = pytest.importorskip("cutlass")
+    from flashinfer.norm.kernels.rmsnorm import RMSNormKernel
+    from flashinfer.norm.utils import max_cluster_n
+
+    cute_dtype = {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }[dtype]
+    kernel = RMSNormKernel(cute_dtype, hidden_size)
+    if kernel.sm_version < 90:
+        pytest.skip("cluster reduction requires SM90+")
+
+    # A cluster that does not divide H leaves the row tail uncovered.
+    assert hidden_size % kernel.cluster_n == 0
+
+    elem_size = cute_dtype.width // 8
+    device = torch.cuda.current_device()
+    optin = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    affordable = [
+        cluster_n
+        for cluster_n in (1, 2, 4, 8, 16)
+        if cluster_n <= max_cluster_n(kernel.sm_version)
+        and hidden_size % cluster_n == 0
+        and RMSNormKernel._estimate_smem_bytes(hidden_size, cluster_n, elem_size)
+        <= optin // 2
+    ]
+    if not affordable:
+        pytest.skip(
+            f"no cluster_n fits the occupancy target at hidden_size={hidden_size}; "
+            f"got cluster_n={kernel.cluster_n}"
+        )
+
+    assert kernel.cluster_n in affordable, (
+        f"cluster_n={kernel.cluster_n} for hidden_size={hidden_size} {dtype}: "
+        f"{affordable} satisfy the occupancy target, but cp.async is "
+        f"{'on' if kernel.use_async_copy else 'off'}"
+    )
+    assert kernel.use_async_copy
+
+
+@pytest.mark.parametrize("probed", [8, None])
+@pytest.mark.parametrize("sm_version", [120, 121])
+@pytest.mark.parametrize(
+    "hidden_size,dtype",
+    [
+        (131072, torch.float32),
+        (163840, torch.float32),
+        (524288, torch.float16),
+        (1048576, torch.bfloat16),
+    ],
+)
+def test_norm_cluster_n_capped_on_sm12x(
+    monkeypatch, probed, sm_version, hidden_size, dtype
+):
+    """DGX Spark (SM121) rejects 16-CTA clusters (#8745).
+
+    The norm kernels must stay at or below the driver's largest cluster, and at
+    the portable 8 on SM12x when the driver cannot answer.
+    """
+    cutlass = pytest.importorskip("cutlass")
+    from types import SimpleNamespace
+
+    import flashinfer.norm.utils as norm_utils
+    from flashinfer.norm.kernels.fused_add_rmsnorm import FusedAddRMSNormKernel
+    from flashinfer.norm.kernels.rmsnorm import RMSNormKernel
+
+    monkeypatch.setattr(norm_utils, "_probe_max_cluster_n", lambda *_: probed)
+
+    # SM120 / SM121 opt-in shared memory per block (99 KiB).
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *_: SimpleNamespace(shared_memory_per_block_optin=101376),
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    cute_dtype = {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }[dtype]
+    for kernel_cls in (RMSNormKernel, FusedAddRMSNormKernel):
+        cluster_n = kernel_cls._compute_cluster_n(hidden_size, cute_dtype, sm_version)
+        assert cluster_n <= 8 and hidden_size % cluster_n == 0, (
+            kernel_cls.__name__,
+            cluster_n,
+        )
+
+
+@pytest.mark.parametrize(
+    "hidden_size,dtype",
+    [
+        (65536, torch.float16),  # cluster_n=2
+        (58112, torch.bfloat16),  # cluster_n=2 at the cp.async threshold
+        (131072, torch.float16),  # cluster_n=4
+        (163840, torch.float32),  # cluster_n=8
+        (524288, torch.float16),  # cluster_n=16
+        (1048576, torch.float16),  # cluster_n=16 with cp.async off
+    ],
+)
+def test_norm_large_hidden_size(hidden_size, dtype):
+    """Run the per-row layouts chosen for large hidden sizes on real data.
+
+    One case per cluster size the kernel selects above the cp.async threshold,
+    including the no-candidate-fit fallback.  The layout is per row, so a small
+    batch still exercises the same cluster and cp.async configuration.
+    """
+    from flashinfer.norm import _use_cuda_norm
+
+    # The public entry point falls back to the CUDA JIT norm kernels when the
+    # CuTe DSL cannot target this device, or when the env var forces it; those
+    # layouts are not the ones under test here.
+    if _use_cuda_norm(torch.device("cuda", torch.cuda.current_device())):
+        pytest.skip("CuTe-DSL RMSNorm is not the active path on this device")
+
+    x = torch.randn(2, hidden_size, device="cuda", dtype=dtype)
+    w = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+    y_ref = llama_rms_norm(x, w)
+    y = flashinfer.norm.rmsnorm(x, w)
+
+    # Scale with the storage dtype; bf16 rounding is ~1.6e-2 at this size.
+    tol = max(1e-3, 4 * torch.finfo(dtype).eps)
+    torch.testing.assert_close(y_ref, y, rtol=tol, atol=tol)
 
 
 @parametrize_product(
@@ -581,6 +1157,84 @@ def test_layernorm(batch_size, hidden_size, dtype):
 
     out = flashinfer.layernorm(x, gamma, beta, eps)
     out_ref = F.layer_norm(x.float(), (hidden_size,), gamma, beta, eps).to(dtype)
+
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "hidden_size,row_padding,input_offset,weight_offset,broadcast",
+    [
+        pytest.param(128, 0, 0, 0, False, id="dense"),
+        pytest.param(128, 128, 0, 0, False, id="padded"),
+        pytest.param(128, 136, 8, 0, False, id="padded_offset"),
+        pytest.param(128, 1, 0, 0, False, id="odd_stride"),
+        pytest.param(128, 1, 1, 0, False, id="unaligned_input"),
+        pytest.param(128, 16, 0, 1, False, id="unaligned_weights"),
+        pytest.param(129, 129, 0, 0, False, id="odd_hidden"),
+        pytest.param(128, 0, 0, 0, True, id="broadcast"),
+        pytest.param(24576, 16, 0, 0, False, id="large_shared"),
+        pytest.param(None, 2, 0, 0, False, id="no_shared_memory"),
+    ],
+)
+def test_layernorm_cuda_row_stride(
+    hidden_size, row_padding, input_offset, weight_offset, broadcast, monkeypatch
+):
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    if hidden_size is None:
+        # Exceed even the opt-in limit so the kernel must reread global input.
+        max_smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+        hidden_size = 2 * (max_smem // 4 + 1)
+
+    torch.manual_seed(0)
+    batch_size, eps = 3, 1e-6
+    storage = torch.full(
+        (batch_size, hidden_size + row_padding + input_offset),
+        7.0,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    rows = storage[:, input_offset : input_offset + hidden_size]
+    rows.copy_(torch.randn_like(rows))
+    # Retain storage for all rows even in the broadcast case: a broken dense
+    # read then stays inside the allocation and fails the numerical comparison.
+    x = rows[:1].expand(batch_size, -1) if broadcast else rows
+    storage_before = storage.clone()
+    gamma = torch.randn(hidden_size + weight_offset, device="cuda")[weight_offset:]
+    beta = torch.randn(hidden_size + weight_offset, device="cuda")[weight_offset:]
+
+    x64 = x.double()
+    centered = x64 - x64.mean(dim=-1, keepdim=True)
+    out_ref = (
+        centered
+        * torch.rsqrt(centered.square().mean(dim=-1, keepdim=True) + eps)
+        * gamma.double()
+        + beta.double()
+    ).to(x.dtype)
+    out = flashinfer.layernorm(x, gamma, beta, eps)
+
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(storage, storage_before, rtol=0, atol=0)
+
+
+def test_layernorm_cuda_row_offset_beyond_int32(monkeypatch):
+    """The second row starts past INT32_MAX, so it needs the 64-bit offset path."""
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    hidden_size, eps = 128, 1e-6
+    # An odd stride selects the scalar path, where offsets count single elements.
+    row_stride = 2**31 + 1
+    numel = row_stride + hidden_size
+    if torch.cuda.mem_get_info()[0] < numel * 2 + (1 << 30):
+        pytest.skip("needs about 5 GB of free GPU memory")
+
+    torch.manual_seed(0)
+    storage = torch.empty(numel, dtype=torch.bfloat16, device="cuda")
+    x = storage.as_strided((2, hidden_size), (row_stride, 1))
+    x.copy_(torch.randn(2, hidden_size, dtype=torch.bfloat16, device="cuda"))
+    gamma = torch.randn(hidden_size, device="cuda")
+    beta = torch.randn(hidden_size, device="cuda")
+
+    out = flashinfer.layernorm(x, gamma, beta, eps)
+    out_ref = F.layer_norm(x.float(), (hidden_size,), gamma, beta, eps).to(x.dtype)
 
     torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
 
@@ -1055,6 +1709,49 @@ def test_norm_compilation_without_fp8():
 
     # Verify the module loaded successfully
     assert module is not None
+
+
+# The public API takes CuTe DSL kernels where they are supported, so call the CUDA kernels.
+def _rmsnorm_quant_cuda(out, x, residual, w, scale, enable_pdl):
+    flashinfer.norm.get_norm_module().rmsnorm_quant(out, x, w, scale, 1e-6, enable_pdl)
+
+
+def _fused_add_rmsnorm_quant_cuda(out, x, residual, w, scale, enable_pdl):
+    flashinfer.norm.get_norm_module().fused_add_rmsnorm_quant(
+        out, x, residual, w, scale, 1e-6, enable_pdl
+    )
+
+
+@pytest.mark.parametrize(
+    "norm_quant",
+    [
+        _rmsnorm_quant_cuda,
+        _fused_add_rmsnorm_quant_cuda,
+    ],
+)
+def test_norm_quant_pdl_waits_for_scale(norm_quant):
+    x = torch.randn(128, 4096, dtype=torch.bfloat16, device="cuda")
+    if not device_support_pdl(x.device):
+        pytest.skip("PDL not supported on this device")
+    residual = torch.randn_like(x)
+    w = torch.randn(4096, dtype=torch.bfloat16, device="cuda")
+    scale_value = 0.5
+
+    expected = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scale = torch.tensor([scale_value], device="cuda")
+    norm_quant(expected, x.clone(), residual.clone(), w, scale, enable_pdl=False)
+
+    # The scale the previous kernel is still producing, as in a dynamic-scale pipeline.
+    # No other kernel may run between that producer and the norm kernel.
+    out = torch.empty_like(expected)
+    x, residual = x.clone(), residual.clone()
+    scale = torch.tensor([scale_value * 4], device="cuda")
+    late_store(scale, scale_value)
+    norm_quant(out, x, residual, w, scale, enable_pdl=True)
+
+    torch.testing.assert_close(
+        out.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+    )
 
 
 if __name__ == "__main__":

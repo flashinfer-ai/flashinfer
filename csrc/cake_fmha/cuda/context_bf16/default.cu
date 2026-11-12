@@ -1052,6 +1052,25 @@ __device__ __forceinline__ void fence_async_shared() {
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 }
 
+// The tail KV block's V rows v_valid..127 (keys at or past the request's length: the rest of its last page, and the
+// pages past it, which the page producer clamps to the last page) become +0 before its PV MMA reads them.  Their P is
+// exactly 0, but 0 x NaN is NaN inside the MMA: a NaN there poisoned every output column of the tile.  One V row is
+// one 128-byte swizzle row in each 64-column half (the swizzle permutes 16-byte units inside a row), so whole rows
+// are cleared without the swizzle.  The MMA warp calls it after the block's kv_full wait and before its p_full wait;
+// fence.proxy.async orders the stores before the MMA's async-proxy reads.
+__device__ __forceinline__ void zero_v_tail(unsigned int stage_addr, int v_valid) {
+    unsigned int lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+    #pragma unroll
+    for (unsigned int h = 0; h < 2; h++) {
+        for (unsigned int u = (unsigned int)v_valid * 8 + lane; u < 1024; u += 32) {
+            asm volatile("st.shared.v4.b32 [%0], {%1, %1, %1, %1};" :: "r"(stage_addr + h * 16384 + u * 16), "r"(0) : "memory");
+        }
+    }
+    fence_async_shared();
+    __syncwarp();
+}
+
 
 __device__ __forceinline__ uint64_t make_smem_desc(int addr) {
     const int SBO = 1024;
@@ -1313,6 +1332,12 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                     }
                 }
 #endif  // IS_CAUSAL
+                // The block count is 0 for a request without keys, and for a causal tile whose rows see no key
+                // with max_n exactly 0 (q - kv = 2 * (m_block + 1) * TOK_PER_STAGE). Such a tile runs one block,
+                // all masked, as in the generated programs: with none, the MMA warp waits for a K/V stage that
+                // the load warp never fills. Every role clamps alike, in asm so that the compiler derives no
+                // range fact from the clamp and builds the loops as before.
+                asm("max.u32 %0, %0, 1;" : "+r"(num_n_blocks));
                 int causal_row;
                 unsigned int num_masked_iters;
                 {
@@ -2362,6 +2387,7 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                     }
                 }
 #endif  // IS_CAUSAL
+                asm("max.u32 %0, %0, 1;" : "+r"(num_n_blocks_1));
                 int unit = bh_1 % (unsigned int)(NUM_Q_HEADS / PACK_G);
                 int q_head_base = unit * PACK_G;
                 int row_tok = (warp % 4 * 32 + lane) / (unsigned int)PACK_G;
@@ -2536,6 +2562,8 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
 #endif  // ENABLE_SINK
                     }
                 }
+                asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
                 mbarrier_arrive(corr_done_addr);
                 mbarrier_arrive(corr_done_addr + 8);
             }
@@ -2600,6 +2628,10 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                     }
                 }
 #endif  // IS_CAUSAL
+                asm("max.u32 %0, %0, 1;" : "+r"(num_n_blocks_2));
+                // The first PV's block (the highest) holds the request's last keys: its V rows from v_valid on are past
+                // the length.
+                int v_valid = seqlen_kv_bh_2 - (int)(num_n_blocks_2 - 1) * BLOCK_N;
                 mbarrier_wait(q_full_addr, _phase_q_full_0);
                 _phase_q_full_0 ^= 1;
                 mbarrier_wait(q_full_addr + 8, _phase_q_full_1);
@@ -2722,6 +2754,12 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                 elect_commit(kv_empty_addr + (mma_kv_stage) * 8);
                 mma_kv_stage += 1;
                 if (mma_kv_stage == 3) { mma_kv_stage = 0; mma_kv_phase ^= 1; }
+                // The first PV's V block holds the request's last keys: zero its rows from v_valid on once it
+                // lands (the KV loop below waits the same phase again).
+                if (v_valid < BLOCK_N) {
+                    mbarrier_wait(kv_full_addr + (mma_kv_stage) * 8, mma_kv_phase);
+                    zero_v_tail(smem_kv_addr + mma_kv_stage * 32768, v_valid);
+                }
                 unsigned int first_pv = 1;
                 #pragma unroll 1
                 for (unsigned int n_iter_3 = 0; n_iter_3 < num_n_blocks_2 - 1; n_iter_3++) {
@@ -3173,6 +3211,7 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                     }
                 }
 #endif  // IS_CAUSAL
+                asm("max.u32 %0, %0, 1;" : "+r"(num_n_blocks_3));
                 unsigned int b_idx = bh_3 / (unsigned int)(NUM_Q_HEADS / PACK_G);
                 int pt_base = b_idx * (unsigned int)page_row_stride;
                 int last_slot = (seqlen_kv_bh_3 - 1) / PAGE_SIZE;
@@ -3183,12 +3222,21 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                     mbarrier_wait(page_empty_addr + (po_stage) * 8, _phase_page_empty);
                     if (elect_sync()) {
                         int pg_idx = po_stage * 16;
-                        #pragma unroll
-                        for (int chunk = 0; chunk < BLOCK_N / KV_TOK_CHUNK; chunk++) {
-                            int _min_0 = (((base_tok + chunk * KV_TOK_CHUNK) / PAGE_SIZE) < (last_slot) ? ((base_tok + chunk * KV_TOK_CHUNK) / PAGE_SIZE) : (last_slot));
-                            int slot = _min_0;
-                            smem_pages[pg_idx + chunk] = page_table_k[pt_base + slot];
-                            smem_pages[pg_idx + 8 + chunk] = page_table_v[pt_base + slot];
+                        // A request without keys reads no table slot: page 2**30 is past any pool, so the
+                        // TMA loads fill its masked block with zeros.
+                        if (seqlen_kv_bh_3 == 0) {
+                            #pragma unroll
+                            for (int chunk = 0; chunk < BLOCK_N / KV_TOK_CHUNK; chunk++) {
+                                smem_pages[pg_idx + chunk] = 1073741824;
+                                smem_pages[pg_idx + 8 + chunk] = 1073741824;
+                            }
+                        } else {
+                            #pragma unroll
+                            for (int chunk_1 = 0; chunk_1 < BLOCK_N / KV_TOK_CHUNK; chunk_1++) {
+                                int slot = (((base_tok + chunk_1 * KV_TOK_CHUNK) / PAGE_SIZE) < (last_slot) ? ((base_tok + chunk_1 * KV_TOK_CHUNK) / PAGE_SIZE) : (last_slot));
+                                smem_pages[pg_idx + chunk_1] = page_table_k[pt_base + slot];
+                                smem_pages[pg_idx + 8 + chunk_1] = page_table_v[pt_base + slot];
+                            }
                         }
                         mbarrier_arrive(page_full_addr + (po_stage) * 8);
                     }
@@ -3282,6 +3330,7 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                     }
                 }
 #endif  // IS_CAUSAL
+                asm("max.u32 %0, %0, 1;" : "+r"(num_n_blocks_4));
                 int unit_1 = bh_4 % (unsigned int)(NUM_Q_HEADS / PACK_G);
                 int kv_head = unit_1 * PACK_G / HEADS_PER_GROUP;
                 int tok_q0 = (unsigned int)cu_seq_lens_q[bh_4] + m_block_4 * 2 * (unsigned int)TOK_PER_STAGE;
@@ -3341,6 +3390,7 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
     }
 
     // Cleanup
+    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
     __syncthreads(); // barrier before TMEM dealloc
 
     if (warp == 0) {
