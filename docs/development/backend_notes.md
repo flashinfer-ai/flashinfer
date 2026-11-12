@@ -78,8 +78,12 @@ winners and timing thresholds.
 
 Explicit paged cuDNN plans pass `window_left` through the common graph contract.
 The prepared and scaled execution paths use the same window. A value of `-1`
-disables it; a nonnegative W includes keys from p-W through p, with bottom-right
-query alignment. The low level converts this to cuDNN's W+1 inclusive bound.
+disables it. For a nonnegative W, let p = query_index + KV_length - Q_length
+denote the bottom-right aligned query position. With `causal=True`, eligible keys
+range from p-W through p. With `causal=False`, the window only excludes keys
+below p-W; keys above p remain eligible up to the valid KV length. Both cases
+also respect the valid sequence bounds. The low level converts W to cuDNN's W+1
+inclusive left bound.
 The window remains a plan-time attribute and cannot change in a retained capture.
 Paged automatic admission still excludes windows pending separate qualification.
 
