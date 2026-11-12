@@ -92,6 +92,28 @@ def _cudnn_supports_paged_auto() -> bool:
         return False
 
 
+@functools.cache
+def _cudnn_supports_paged_gqa_auto(head_dim: int) -> bool:
+    """D256 needs FE 1.33 placement and matching native split origins."""
+    if head_dim != 256 or not _cudnn_supports_paged_auto():
+        return False
+    try:
+        from packaging.version import Version
+
+        binder = getattr(getattr(cudnn, "_pybind_module", None), "_SdpaThdBinder", None)
+        return (
+            Version(cudnn.__version__) >= Version("1.33.0")
+            and bool(getattr(binder, f"supports_paged_d{head_dim}_packed_split", False))
+            and bool(
+                getattr(
+                    binder, f"supports_paged_d{head_dim}_split_physical_origins", False
+                )
+            )
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 # Execute-time shape override for the ragged (token-indptr) path. cuDNN
 # finalizes one execution plan per declared (batch, max_seq_len) -- 55-70 ms on
 # SM100, ~1 s when a kernel variant compiles -- and serving changes both every

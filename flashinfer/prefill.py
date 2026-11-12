@@ -48,6 +48,7 @@ from .cudnn.prefill import (
     _cudnn_supports_direct_seqlens,
     _cudnn_supports_paged_token_offsets,
     _cudnn_supports_paged_auto,
+    _cudnn_supports_paged_gqa_auto,
     CudnnPrefillGraph,
     _PrefillMetadata,
     _CudnnPrefillPlan,
@@ -2542,6 +2543,75 @@ def _validate_paged_query_lengths(backend, seq_lens_q, qo_indptr_host):
     )
 
 
+def _blackwell_paged_gqa_auto_cudnn(
+    device,
+    layout,
+    q_dtype,
+    kv_dtype,
+    o_dtype,
+    head_dim_qk,
+    head_dim_vo,
+    batch,
+    hq,
+    hk,
+    max_q,
+    max_kv,
+    page_size,
+    total_q,
+    qo_indptr_host,
+    kv_lens,
+    seq_lens_q=None,
+):
+    """Measured D256 prefix domain using already available CPU lengths."""
+    if not (
+        layout == "HND"
+        and q_dtype == kv_dtype == o_dtype == torch.bfloat16
+        and head_dim_qk == head_dim_vo
+        and head_dim_qk == 256
+        and 1 <= batch <= 4
+        and 8 <= hq <= 64
+        and hk > 0
+        and hq % hk == 0
+        and hq // hk in (2, 4, 8, 16)
+        and page_size == 16
+        and 64 <= max_q <= 1024
+        and 2048 <= max_kv <= 32768
+        and qo_indptr_host.device.type == "cpu"
+        and kv_lens is not None
+        and kv_lens.device.type == "cpu"
+        and (seq_lens_q is None or seq_lens_q.device.type == "cpu")
+    ):
+        return False
+    bounds = qo_indptr_host.tolist()
+    capacities = [end - start for start, end in zip(bounds, bounds[1:], strict=False)]
+    queries = capacities if seq_lens_q is None else seq_lens_q.flatten().tolist()
+    lengths = kv_lens.flatten().tolist()
+    if not (
+        len(capacities) == len(queries) == len(lengths) == batch
+        and bounds[0] == 0
+        and bounds[-1] == total_q
+        and all(
+            64 <= q <= min(capacity, max_q)
+            for q, capacity in zip(queries, capacities, strict=True)
+        )
+        and all(
+            q <= 1024 and 2048 <= kv <= max_kv and kv >= 4 * q
+            for q, kv in zip(queries, lengths, strict=True)
+        )
+        # Do not let a long declaration hide short requests. The graph's
+        # short-row and long-row plans change at Q128 (see shape overrides).
+        and all((q <= 128) == (max_q <= 128) for q in queries)
+    ):
+        return False
+    # The measured floor includes completed eager time, not just GPU replay.
+    work_floor = 16 * 1024 * 1024
+    return (
+        hq * sum(q * kv for q, kv in zip(queries, lengths, strict=True)) >= work_floor
+        and get_compute_capability(device) == (10, 0)
+        and _cudnn_supports_paged_gqa_auto(head_dim_qk)
+    )
+
+
 def _blackwell_paged_auto_cudnn(
     device,
     layout,
@@ -2561,7 +2631,27 @@ def _blackwell_paged_auto_cudnn(
     kv_lens,
     seq_lens_q=None,
 ):
-    """Measured D128 domains; use actual paired work when already on CPU."""
+    """Measured paged domains; use actual paired work when already on CPU."""
+    if head_dim_qk == 256:
+        return _blackwell_paged_gqa_auto_cudnn(
+            device,
+            layout,
+            q_dtype,
+            kv_dtype,
+            o_dtype,
+            head_dim_qk,
+            head_dim_vo,
+            batch,
+            hq,
+            hk,
+            max_q,
+            max_kv,
+            page_size,
+            total_q,
+            qo_indptr_host,
+            kv_lens,
+            seq_lens_q,
+        )
     prefix = 64 <= max_q <= 1024 and 2048 <= max_kv <= 32768 and max_kv >= 4 * max_q
     full = 1024 <= max_q <= 8192 and max_q == max_kv and seq_lens_q is None
     bounded = 1 <= batch <= 4 and (prefix or full)
