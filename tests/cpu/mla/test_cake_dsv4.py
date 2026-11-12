@@ -3136,12 +3136,13 @@ def test_sm107a_fp8_h64_source_exact_row_launches_the_m64_program(monkeypatch, t
         assert program in registered
 
 
-# FP8 routes SM107 refuses by design: it builds no low-head decode program for
-# compressed items (get_cake_dsv4_spec names the programs it runs), so
-# run_cake_dsv4 raises for them.  Per route, the head counts that reach it.
+# FP8 routes SM107 refuses by design: it builds no source-exact program for
+# the 8/16-head shape lock (get_cake_dsv4_spec names the programs it runs), so
+# run_cake_dsv4 raises for it.  Per route, the head counts that reach it.  The
+# 8/16/32-head decode rows over compressed items up to 384 wide run the M64
+# body on SM107 (_fp8_lowhead_narrow_uses_one_partition), not the
+# one-partition producer it does not build.
 _SM107_REFUSED_FP8_ROUTES = {
-    # 8/16/32-head decode rows over compressed items up to 384 wide.
-    "fp8_lowhead_one_partition": (8, 16, 32),
     # The 8/16-head shape lock of three ragged requests of up to 5 tokens.
     "fp8_h8_h16_source_exact": (8, 16),
 }
