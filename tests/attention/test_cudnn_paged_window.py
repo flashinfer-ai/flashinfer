@@ -10,19 +10,23 @@ from flashinfer.cudnn import prefill as cudnn_prefill
     not cudnn_prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support"
 )
 @pytest.mark.parametrize(
-    "dim,window,page",
+    "dim,window,page,causal",
     [
-        (64, 0, 16),
-        (64, 127, 64),
-        (128, 0, 64),
-        (128, 127, 16),
-        (256, 127, 64),
-        (256, 1023, 16),
+        (64, 0, 16, True),
+        (64, 127, 64, True),
+        (128, 0, 64, True),
+        (128, 127, 16, True),
+        (256, 127, 64, True),
+        (256, 1023, 16, True),
+        (128, -1, 16, True),
+        (128, 127, 16, False),
     ],
 )
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("dtype,backend", [(torch.bfloat16, "cudnn")])
-def test_paged_window_retained_capture(dtype, backend, return_lse, dim, window, page):
+def test_paged_window_retained_capture(
+    dtype, backend, return_lse, dim, window, page, causal
+):
     """Inclusive windows survive replanning, retained replay and scale fallback."""
     from packaging.version import Version
 
@@ -71,7 +75,7 @@ def test_paged_window_retained_capture(dtype, backend, return_lse, dim, window, 
             hk,
             dim,
             page,
-            causal=True,
+            causal=causal,
             window_left=window,
             q_data_type=dtype,
             seq_lens=kv_lengths,
@@ -83,7 +87,7 @@ def test_paged_window_retained_capture(dtype, backend, return_lse, dim, window, 
         assert wrapper._backend == "cudnn"
         assert wrapper._cudnn_plan is not None
         metadata = wrapper._cudnn_plan.metadata
-        assert metadata.window_left == window
+        assert metadata.window_left == (window if window >= 0 else None)
         assert metadata._token_offsets
         assert metadata.cu_seq_lens_q is None
         assert metadata.actual_seq_lens_q is not None
@@ -121,12 +125,13 @@ def test_paged_window_retained_capture(dtype, backend, return_lse, dim, window, 
                 .reshape(max_kv, hk, dim)[:nk]
                 .double()
             )
-            mask = torch.arange(nk, device="cuda")[None, :] > (
-                torch.arange(nq, device="cuda")[:, None] + nk - nq
-            )
-            mask |= torch.arange(nk, device="cuda")[None, :] < (
-                torch.arange(nq, device="cuda")[:, None] + nk - nq - window
-            )
+            positions = torch.arange(nq, device="cuda")[:, None] + nk - nq
+            keys_idx = torch.arange(nk, device="cuda")[None, :]
+            mask = torch.zeros((nq, nk), device="cuda", dtype=torch.bool)
+            if causal:
+                mask |= keys_idx > positions
+            if window >= 0:
+                mask |= keys_idx < positions - window
             for head in range(hq):
                 scores = (
                     q[rows, head].double()
