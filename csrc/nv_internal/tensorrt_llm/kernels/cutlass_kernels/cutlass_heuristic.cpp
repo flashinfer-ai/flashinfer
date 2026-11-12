@@ -17,6 +17,7 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 
 #ifdef __GNUC__  // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic push
@@ -672,6 +673,25 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
     };
     result.erase(std::remove_if(result.begin(), result.end(), never_dispatches), result.end());
   }
+  // Consumer Blackwell (SM120 RTX PRO 6000, SM121 GB10 / DGX Spark) has 99 KiB of shared memory
+  // per block, against 228 KiB on SM100. Only CtaShape128x128x64B fits there with the FINALIZE
+  // epilogue (~80 KiB); the 128x256x64B / 256x128x64B / 128x128x128B tiles overflow.
+  {
+    constexpr int kMinSmemForFullTileSet = 120 * 1024;
+    int device = 0;
+    tensorrt_llm::common::check_cuda_error(cudaGetDevice(&device));
+    int maxSmem = 0;
+    tensorrt_llm::common::check_cuda_error(
+        cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    if (maxSmem < kMinSmemForFullTileSet) {
+      result.erase(std::remove_if(result.begin(), result.end(),
+                                  [](CutlassGemmConfig const& c) {
+                                    return c.tile_config_sm120 !=
+                                           CutlassTileConfigSM120::CtaShape128x128x64B;
+                                  }),
+                   result.end());
+    }
+  }
   return result;
 }
 
@@ -693,7 +713,11 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
   if (sm >= 100 && sm < 120 && (config_type_param & CutlassGemmConfig::BLACKWELL)) {
     return get_candidate_configs_sm100(config_type_param, sm);
   }
-  if (sm >= 120 && (config_type_param & CutlassGemmConfig::BLACKWELL)) {
+  // The SM120 list only serves FP4 and mixed FP8 x FP4; pure-int weight-only (W4A16 / W8A16)
+  // on SM120 / SM121 falls through to the generic tiles below.
+  if (sm >= 120 && (config_type_param & CutlassGemmConfig::BLACKWELL) &&
+      ((config_type_param & CutlassGemmConfig::FP4_ONLY) ||
+       (config_type_param & CutlassGemmConfig::FP8FP4_MIXED))) {
     return get_candidate_configs_sm120(config_type_param);
   }
 
