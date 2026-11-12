@@ -44,6 +44,14 @@ On cuDNN Frontend 1.32, cover the bitmap boundary at 512/513 tokens.
 
 ## Attention plan and CUDA Graph lifetime
 
+FlashInfer requires cuDNN Frontend >=1.32.0. Attention code can rely on its
+cumulative-length graph arguments, shape-override constructor, short-cache
+placement, and CUDA-graph replay hint. Do not retain compatibility branches for
+older FE releases. Backend versions and native/runtime capabilities remain
+separate: token offsets require backend 9.24 (mixed masks/FP8 require 9.25), and
+the single-token GQA Stats bug is guarded until 9.27. Keep checks that ensure
+both backend and FROST remain usable through the common graph contract.
+
 ### Buffer ownership and graph bounds
 
 Old captures can retain a previous provider's metadata pointers after `auto`
