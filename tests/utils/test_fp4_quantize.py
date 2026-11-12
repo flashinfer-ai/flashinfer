@@ -57,7 +57,17 @@ def _is_fp4_supported(device: torch.device) -> bool:
 
 DTYPES = [torch.float16, torch.bfloat16]
 # The batch dimension doesn't need to be multiple of 128
-SHAPES = [(128, 64), (256, 128), (120, 64), (200, 256), (2048, 2048)]
+SHAPES = [
+    (128, 64),
+    (256, 128),
+    (120, 64),
+    (200, 256),
+    (2048, 2048),
+    # 4800 / 8 = 600 column threads: a 512-thread block covers the row in two passes and the
+    # second one ends inside a warp (88 = 2 * 32 + 24), so the scale-factor shuffle runs in a
+    # partially active warp.
+    (8, 4800),
+]
 BATCH_SHAPES = [
     (1, 256, 128),
     (2, 128, 64),
@@ -275,6 +285,31 @@ def test_fp4_quantization(
             scale_ans = out_scale
         torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
         torch.testing.assert_close(scale_ans, scale_ref, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("sf_use_ue8m0", [False, True])
+@pytest.mark.parametrize("is_swizzled", [False, True])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_fp4_quantize_zero_rows(sf_use_ue8m0, is_swizzled, device):
+    """An input with no rows returns empty outputs and leaves no CUDA error behind.
+
+    The launcher used to launch a zero-sized grid, which fails with
+    cudaErrorInvalidValue that the next CUDA call then reports.
+    """
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    n = 64
+    sf_vec_size = 32 if sf_use_ue8m0 else 16
+    x = torch.empty((0, n), dtype=torch.bfloat16, device=device)
+    global_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+    out, out_scale = fp4_quantize(
+        x, global_scale, sf_vec_size, sf_use_ue8m0, is_swizzled, backend="cuda"
+    )
+    torch.cuda.synchronize()
+    assert out.shape == (0, n // 2)
+    assert out_scale.dtype == torch.uint8 and out_scale.device == out.device
+    # The next kernel must run: a sticky launch error would surface here.
+    assert torch.ones(4, device=device).sum().item() == 4.0
 
 
 @pytest.mark.parametrize("backend", FP4_BACKENDS)

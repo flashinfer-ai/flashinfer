@@ -110,6 +110,26 @@ inline __device__ void quantizeAndStore(QuantT* dstPtr, uint4 vec, T const clamp
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // FP4/MXFP8 Conversion Functions
 
+// Member mask for the __shfl_xor_sync butterfly among the NUM_THREADS_PER_SF lanes that share one
+// scale factor; the xor-1 / xor-2 exchange never leaves this aligned lane group.
+//
+// Not the full warp: a sync shuffle waits for every lane in its mask to reach the same call site,
+// and not every lane of a warp gets there. In quantize_with_block_size the column loop strides by
+// blockDim, so the lanes past the last column skip the cvt call, and blockDim itself need not be a
+// multiple of 32 (a block of 200 threads leaves its last warp with 8 launched lanes). A full mask
+// then names lanes that are waiting at the CTA barrier at the end of the kernel (deadlock) or were
+// never launched (undefined). Every column boundary is a multiple of the group size, so the lanes
+// of one group always reach the same shuffles together.
+template <int NUM_THREADS_PER_SF>
+inline __device__ uint32_t cvt_sf_group_shfl_mask() {
+  static_assert(NUM_THREADS_PER_SF == 2 || NUM_THREADS_PER_SF == 4, "Unsupported SF group size.");
+  constexpr uint32_t groupSize = static_cast<uint32_t>(NUM_THREADS_PER_SF);
+  constexpr uint32_t groupMask = (1U << groupSize) - 1U;
+  uint32_t laneId = 0;
+  asm("mov.u32 %0, %%laneid;" : "=r"(laneId));
+  return groupMask << (laneId & ~(groupSize - 1U));
+}
+
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -464,10 +484,11 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
   constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
   // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
   if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
-  }
-  if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
+    uint32_t const sfGroupMask = cvt_sf_group_shfl_mask<CVT_NUM_THREADS_PER_SF>();
+    localMax = cuda_max(__shfl_xor_sync(sfGroupMask, localMax, 1), localMax);
+    if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
+      localMax = cuda_max(__shfl_xor_sync(sfGroupMask, localMax, 2), localMax);
+    }
   }
   // Get the final absolute maximum values.
   float vecMax = float(cuda_max(localMax.x, localMax.y));
@@ -647,12 +668,13 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     }
 
     if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
-      error4 = __fadd_rn(error4, __shfl_xor_sync(uint32_t(-1), error4, 1));
-      error6 = __fadd_rn(error6, __shfl_xor_sync(uint32_t(-1), error6, 1));
-    }
-    if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
-      error4 = __fadd_rn(error4, __shfl_xor_sync(uint32_t(-1), error4, 2));
-      error6 = __fadd_rn(error6, __shfl_xor_sync(uint32_t(-1), error6, 2));
+      uint32_t const sfGroupMask = cvt_sf_group_shfl_mask<CVT_NUM_THREADS_PER_SF>();
+      error4 = __fadd_rn(error4, __shfl_xor_sync(sfGroupMask, error4, 1));
+      error6 = __fadd_rn(error6, __shfl_xor_sync(sfGroupMask, error6, 1));
+      if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
+        error4 = __fadd_rn(error4, __shfl_xor_sync(sfGroupMask, error4, 2));
+        error6 = __fadd_rn(error6, __shfl_xor_sync(sfGroupMask, error6, 2));
+      }
     }
 
     if (error4 < error6) {
@@ -814,7 +836,8 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& ve
   constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
   if constexpr (CVT_NUM_THREADS_PER_SF == 2) {
     // For block 32, we need to reduce the local max across two threads.
-    localMax = __hmax2(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+    localMax = __hmax2(
+        __shfl_xor_sync(cvt_sf_group_shfl_mask<CVT_NUM_THREADS_PER_SF>(), localMax, 1), localMax);
   }
 
   // Get the final absolute maximum values.
@@ -888,10 +911,11 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_wa
   constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
   // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
   if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
-  }
-  if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
+    uint32_t const sfGroupMask = cvt_sf_group_shfl_mask<CVT_NUM_THREADS_PER_SF>();
+    localMax = cuda_max(__shfl_xor_sync(sfGroupMask, localMax, 1), localMax);
+    if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
+      localMax = cuda_max(__shfl_xor_sync(sfGroupMask, localMax, 2), localMax);
+    }
   }
   // Get the final absolute maximum values.
   float vecMax = float(cuda_max(localMax.x, localMax.y));

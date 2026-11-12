@@ -465,6 +465,12 @@ quantize_with_block_size(
       }
     }
   }
+  // The dependent grid may launch once every CTA has triggered or exited, and one thread's trigger
+  // counts for its CTA. Make every thread's out / SFout stores device-visible and wait for the
+  // whole CTA before any thread triggers, or a consumer GEMM past griddepcontrol.wait reads
+  // partial output.
+  __threadfence();
+  __syncthreads();
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
@@ -693,6 +699,12 @@ quantize_with_block_size_tma(
       }
     }
   }
+  // The dependent grid may launch once every CTA has triggered or exited, and one thread's trigger
+  // counts for its CTA. Make every thread's out / SFout stores device-visible and wait for the
+  // whole CTA before any thread triggers, or a consumer GEMM past griddepcontrol.wait reads
+  // partial output.
+  __threadfence();
+  __syncthreads();
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
