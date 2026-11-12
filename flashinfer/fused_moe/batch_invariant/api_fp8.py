@@ -17,6 +17,7 @@ the dataflow.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Sequence, Tuple
 
@@ -232,6 +233,15 @@ def check_shape_e4m3(H: int, I: int, E: int) -> None:
         raise unsupported(CLASS, f"num_experts {E}", f"1 <= num_experts <= {MAX_E}")
 
 
+@functools.lru_cache(maxsize=4096)
+def _accepted(config: Knobs, N: int, K: int, E: int, chain: Fp8Chain) -> bool:
+    """``blocks.compile.can_implement`` memoised on its arguments (a record's acceptance at a shape is static; the op asks at
+    every launch)."""
+    from .blocks.compile import can_implement
+
+    return can_implement(config, N, K, E, chain)
+
+
 def grouped_gemm_fp8(
     a: torch.Tensor,
     w: torch.Tensor,
@@ -252,11 +262,7 @@ def grouped_gemm_fp8(
     side, :mod:`.blocks.swap`) the swapped body on the same dense rows -- a placement, the same bits. ``Tk`` (default:
     the rows of ``out``, else of ``a``) is the expanded row count; ``a`` may carry more rows (the swapped body's last token box then
     stays inside the buffer instead of being zero-filled past it). The persistent grid is a launch argument."""
-    from .blocks.compile import (
-        can_implement,
-        get_compiled_grouped,
-        get_compiled_swapped,
-    )
+    from .blocks.compile import get_compiled_grouped, get_compiled_swapped
 
     R, K, E, N, Tk = _check_grouped_operands(
         "grouped_gemm_fp8",
@@ -276,7 +282,7 @@ def grouped_gemm_fp8(
         or inv.numel() != 1
     ):
         raise ValueError("grouped_gemm_fp8: s_w [E] fp32, s_a and inv 1-element fp32")
-    if not can_implement(config, N, K, E, chain):
+    if not _accepted(config, N, K, E, chain):
         raise ValueError(
             f"grouped_gemm_fp8: {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()})"
         )
