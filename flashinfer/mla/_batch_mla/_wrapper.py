@@ -13,6 +13,11 @@ from typing import Any, ClassVar, Literal, Optional, Protocol, Tuple, Union, ove
 
 import torch
 
+from ._decode_fp8_sm90 import (
+    _mla_dec_fp8q_sm90_dispatch,
+    _mla_dec_fp8q_sm90_prepare,
+)
+
 from ...api_logging import (
     _warn_from_external_caller,
     flashinfer_api,
@@ -637,7 +642,40 @@ class BatchMLAPagedAttentionWrapper:
             query_layout = "split" if legacy_flat else "packed"
         if kv_cache_layout is None:
             kv_cache_layout = "split" if legacy_flat else "packed"
+        _fp8q_sm90_explicit_output_dtype = output_dtype
         output_dtype = q_data_type if output_dtype is None else output_dtype
+        # mla_decode_fp8_paged_sm90: fp8 Q over an fp8 packed paged cache on
+        # SM90, where no stock backend has an fp8-Q MLA form. The underlying
+        # plan is made for the exact bf16-dequantised query (bf16 holds every
+        # e4m3 value exactly) with bf16 output; run() dispatches the
+        # specialized all-fp8 kernel at the supported contract and otherwise
+        # dequantises Q into this stock plan (see
+        # flashinfer/mla/_batch_mla/_decode_fp8_sm90.py).
+        self._mla_dec_fp8q_sm90_state = None
+        self._mla_dec_fp8q_sm90_requested = False
+        if (
+            q_data_type == torch.float8_e4m3fn
+            and kv_data_type == torch.float8_e4m3fn
+            and _fp8q_sm90_explicit_output_dtype in (None, torch.bfloat16)
+            and _get_compute_capability(self.device) == (9, 0)
+        ):
+            self._mla_dec_fp8q_sm90_requested = True
+            _mla_dec_fp8q_sm90_prepare(
+                self,
+                plan_metadata,
+                num_heads,
+                head_dim_ckv,
+                head_dim_kpe,
+                page_size,
+                causal,
+                sm_scale,
+                lse_mode,
+                skip_softmax,
+                use_sinks,
+                _fp8q_sm90_explicit_output_dtype,
+            )
+            q_data_type = torch.bfloat16
+            output_dtype = torch.bfloat16
         if (
             kv_data_type == torch.float8_e4m3fn
             and scale_mode == "default"
@@ -895,6 +933,7 @@ class BatchMLAPagedAttentionWrapper:
         ckv_scale: Optional[float] = None,
         ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
+        q_scale: Optional[float] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         bmm1_scale: Optional[MLABmmScale] = None,
@@ -1022,6 +1061,34 @@ class BatchMLAPagedAttentionWrapper:
             raise RuntimeError(
                 "BatchMLAPagedAttentionWrapper.run() called before plan()."
             )
+
+        # mla_decode_fp8_paged_sm90: fp8 Q on the SM90 MLA route — the
+        # specialized all-fp8 kernel at the supported contract, exact
+        # dequantisation into the stock plan otherwise (including under
+        # FLASHINFER_DISABLE_MLA_DECODE_FP8_PAGED_SM90). `q_scale` is the
+        # scalar fp8-q descale; on the fallback it is applied during
+        # dequantisation and consumed.
+        _fp8q_first = query[0] if isinstance(query, (tuple, list)) else query
+        if getattr(self, "_mla_dec_fp8q_sm90_requested", False) and (
+            isinstance(_fp8q_first, torch.Tensor)
+            and _fp8q_first.dtype == torch.float8_e4m3fn
+        ):
+            _fp8q_res, query = _mla_dec_fp8q_sm90_dispatch(
+                self,
+                query,
+                kv_cache,
+                out,
+                lse,
+                return_lse,
+                q_scale,
+                ckv_scale,
+                ckv_scale_arr,
+                kpe_scale,
+                sinks,
+                skip_softmax_threshold_scale_factor,
+            )
+            if _fp8q_res is not None:
+                return _fp8q_res
 
         if is_unplanned_cutlass:
             widths = (512, 64)
