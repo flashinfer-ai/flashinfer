@@ -123,6 +123,8 @@ void Run(TensorView a_topk_ids, TensorView a_topk_weights, TensorView a_topk_pac
       << KERNEL_NAME << ": requires (num_experts <= 128)";
   TVM_FFI_CHECK((a_top_k <= 8LL), ValueError)
       << KERNEL_NAME << ": requires (top_k <= 8)";
+  TVM_FFI_CHECK((a_local_experts_start_idx >= 0LL), ValueError)
+      << KERNEL_NAME << ": requires (local_experts_start_idx >= 0)";
   TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
       << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)

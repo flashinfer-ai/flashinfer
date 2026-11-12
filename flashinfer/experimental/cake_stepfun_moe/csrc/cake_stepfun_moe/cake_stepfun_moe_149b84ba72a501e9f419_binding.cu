@@ -107,6 +107,8 @@ void Run(TensorView a_scores, TensorView a_topk_weights, TensorView a_topk_packe
       << KERNEL_NAME << ": requires (num_tokens <= 4)";
   TVM_FFI_CHECK((a_num_experts <= 128LL), ValueError)
       << KERNEL_NAME << ": requires (num_experts <= 128)";
+  TVM_FFI_CHECK((a_top_k <= 8LL), ValueError)
+      << KERNEL_NAME << ": requires (top_k <= 8)";
   TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
       << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)

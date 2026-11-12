@@ -84,7 +84,7 @@ from . import cake_build
 # route (per-stage units and the full routing -> FC1 -> [requant] -> FC2 ->
 # finalize path per family and tile) naming its architectures, token count
 # and ordered stages -- is not part of the runtime registry; it lives with the
-# tests as ``tests/experimental/test_helpers/cake_stepfun_moe_routes.json``.
+# tests as ``tests/test_helpers/cake_stepfun_moe_routes.json``.
 #
 # What to compile (the translation units, the compile flags and the per-entry
 # closure digest) is recorded in ``build.json`` (see ``cake_build``), whose
@@ -198,7 +198,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 4: fc2 nvfp4_bf16tok tiles 32, 256 (2 programs)
+    # 4: fc2 nvfp4_bf16tok tiles 8, 16, 32, 64, 256 (5 programs)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -268,7 +268,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 7: fc2 nvfp4 tiles 16, 32, 256 (3 programs)
+    # 7: fc2 nvfp4 tiles 8, 16, 32, 64, 256 (5 programs)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -535,28 +535,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 19: fc2 nvfp4_bf16tok tiles 8, 16, 64 (3 programs)
-    [
-        ["tma_buffer", "A"],
-        ["tma_buffer", "B"],
-        ["tma_buffer", "SFA"],
-        ["tma_buffer", "SFB"],
-        ["tma_buffer", "C"],
-        ["buffer", "tile_expert"],
-        ["buffer", "tile_mn_limit"],
-        ["buffer", "num_non_exiting_ctas"],
-        ["buffer", "work_counter"],
-        ["buffer", "scale_c"],
-        ["parameter", "grid_m"],
-        ["parameter", "grid_n"],
-        ["parameter", "K_tiles"],
-        ["buffer", "token_sf"],
-        ["launch", "enable_pdl"],
-        ["grid", "grid_x"],
-        ["grid", "grid_y"],
-        ["grid", "grid_z"],
-    ],
-    # 20: fc2 mxfp8 tiles 8, 16, 32 (3 programs)
+    # 19: fc2 mxfp8 tiles 8, 16, 32 (3 programs)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -575,27 +554,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 21: fc2 nvfp4 tiles 8, 64 (2 programs)
-    [
-        ["tma_buffer", "A"],
-        ["tma_buffer", "B"],
-        ["tma_buffer", "SFA"],
-        ["tma_buffer", "SFB"],
-        ["tma_buffer", "C"],
-        ["buffer", "tile_expert"],
-        ["buffer", "tile_mn_limit"],
-        ["buffer", "num_non_exiting_ctas"],
-        ["buffer", "work_counter"],
-        ["buffer", "scale_c"],
-        ["parameter", "grid_m"],
-        ["parameter", "grid_n"],
-        ["parameter", "K_tiles"],
-        ["launch", "enable_pdl"],
-        ["grid", "grid_x"],
-        ["grid", "grid_y"],
-        ["grid", "grid_z"],
-    ],
-    # 22: fc1 bf16 tiles 8, 16, 32 (3 programs)
+    # 20: fc1 bf16 tiles 8, 16, 32 (3 programs)
     [
         ["tma_buffer", "A"],
         ["buffer", "B"],
@@ -615,7 +574,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 23: fc2 fp8 tiles 8, 16, 32 (3 programs)
+    # 21: fc2 fp8 tiles 8, 16, 32 (3 programs)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -633,7 +592,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 24: fc2 fp8 tiles 128, 256 (2 programs)
+    # 22: fc2 fp8 tiles 128, 256 (2 programs)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -650,7 +609,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 25: fc2 bf16 tiles 64, 128, 256 (3 programs)
+    # 23: fc2 bf16 tiles 64, 128, 256 (3 programs)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -737,7 +696,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "act_alpha": "float32",
         "act_beta": "float32",
     },
-    # 5: fc2 nvfp4_bf16tok tiles 32, 256 (2 programs)
+    # 5: fc2 nvfp4_bf16tok tiles 8, 16, 32, 64, 256 (5 programs)
     {
         "A": "uint8",
         "B": "uint8",
@@ -780,7 +739,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "act_alpha": "float32",
         "act_beta": "float32",
     },
-    # 8: fc2 nvfp4 tiles 16, 32, 256 (3 programs)
+    # 8: fc2 nvfp4 tiles 8, 16, 32, 64, 256 (5 programs)
     {
         "A": "uint8",
         "B": "uint8",
@@ -936,21 +895,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "num_tiles": "int32",
         "work_counter": "int32",
     },
-    # 20: fc2 nvfp4_bf16tok tiles 8, 16, 64 (3 programs)
-    {
-        "A": "uint8",
-        "B": "uint8",
-        "SFA": "uint8",
-        "SFB": "uint8",
-        "C": "bfloat16",
-        "tile_expert": "int32",
-        "tile_mn_limit": "int32",
-        "num_non_exiting_ctas": "int32",
-        "work_counter": "int32",
-        "scale_c": "float32",
-        "token_sf": "float32",
-    },
-    # 21: fc2 mxfp8 tiles 8, 16, 32 (3 programs)
+    # 20: fc2 mxfp8 tiles 8, 16, 32 (3 programs)
     {
         "A": "uint8",
         "B": "uint8",
@@ -962,20 +907,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "num_tiles": "int32",
         "work_counter": "int32",
     },
-    # 22: fc2 nvfp4 tiles 8, 64 (2 programs)
-    {
-        "A": "uint8",
-        "B": "uint8",
-        "SFA": "uint8",
-        "SFB": "uint8",
-        "C": "bfloat16",
-        "tile_expert": "int32",
-        "tile_mn_limit": "int32",
-        "num_non_exiting_ctas": "int32",
-        "work_counter": "int32",
-        "scale_c": "float32",
-    },
-    # 23: fc1 bf16 tiles 8, 16, 32 (3 programs)
+    # 21: fc1 bf16 tiles 8, 16, 32 (3 programs)
     {
         "A": "bfloat16",
         "B": "bfloat16",
@@ -987,7 +919,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "work_counter": "int32",
         "clamp_limit": "float32",
     },
-    # 24: fc2 fp8 tiles 8, 16, 32 (3 programs)
+    # 22: fc2 fp8 tiles 8, 16, 32 (3 programs)
     {
         "A": "uint8",
         "B": "uint8",
@@ -998,7 +930,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "work_counter": "int32",
         "scale_c": "float32",
     },
-    # 25: fc2 fp8 tiles 128, 256 (2 programs)
+    # 23: fc2 fp8 tiles 128, 256 (2 programs)
     {
         "A": "uint8",
         "B": "uint8",
@@ -1008,7 +940,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "num_tiles": "int32",
         "scale_c": "float32",
     },
-    # 26: fc2 bf16 tiles 64, 128, 256 (3 programs)
+    # 24: fc2 bf16 tiles 64, 128, 256 (3 programs)
     {
         "A": "bfloat16",
         "B": "bfloat16",
@@ -1047,28 +979,28 @@ _PROGRAMS: dict[str, tuple[str, int, int, int, list[int], list[int], int]] = {
     "151b3e849cd52a227427": ("fc2", 2, 3, 2, [256, 1, 1], [2, 1, 1], 181376),
     "153ef8a2626c47b36ad2": ("routing", 0, 1, 0, [416, 1, 1], [1, 1, 1], 5248),
     "1f6526215da971bcc9c6": ("fc1", 3, 4, 3, [512, 1, 1], [1, 1, 1], 188544),
-    "207264b4f5afb1793f23": ("fc2", 19, 20, 4, [512, 1, 1], [1, 1, 1], 199040),
+    "207264b4f5afb1793f23": ("fc2", 4, 5, 4, [512, 1, 1], [1, 1, 1], 199040),
     "26a28a148a1411bd53b5": ("routing", 0, 0, 0, [384, 1, 1], [1, 1, 1], 4864),
-    "26edf45a86b9afe56815": ("fc2", 20, 21, 4, [512, 1, 1], [1, 1, 1], 119296),
+    "26edf45a86b9afe56815": ("fc2", 19, 20, 4, [512, 1, 1], [1, 1, 1], 119296),
     "27eba75722ade3773779": ("routing", 1, 2, 0, [320, 1, 1], [1, 1, 1], 4096),
     "28619698637f40d1fa2d": ("fc1", 6, 7, 5, [512, 1, 1], [1, 1, 1], 199040),
-    "2b4c507bf99c30c92543": ("fc2", 21, 22, 4, [512, 1, 1], [1, 1, 1], 183424),
+    "2b4c507bf99c30c92543": ("fc2", 7, 8, 4, [512, 1, 1], [1, 1, 1], 183424),
     "3243c1101f8f83d67462": ("routing", 0, 1, 0, [224, 1, 1], [1, 1, 1], 2944),
-    "364dc5e6c49377c27b79": ("fc1", 22, 23, 1, [384, 1, 1], [1, 1, 1], 210048),
+    "364dc5e6c49377c27b79": ("fc1", 20, 21, 1, [384, 1, 1], [1, 1, 1], 210048),
     "36c6bd00714e0bbf252c": ("routing", 0, 0, 0, [256, 1, 1], [8, 1, 1], 1408),
     "38bad85beb6a61c84bca": ("routing", 1, 2, 0, [192, 1, 1], [1, 1, 1], 2560),
     "3a5388a6a052318613bd": ("fc2", 7, 8, 4, [512, 1, 1], [2, 1, 1], 219264),
-    "3c3e3d7bf81779f17064": ("fc2", 19, 20, 4, [512, 1, 1], [1, 1, 1], 212608),
-    "3cec6179da3b3834f473": ("fc1", 22, 23, 1, [384, 1, 1], [1, 1, 1], 224384),
+    "3c3e3d7bf81779f17064": ("fc2", 4, 5, 4, [512, 1, 1], [1, 1, 1], 212608),
+    "3cec6179da3b3834f473": ("fc1", 20, 21, 1, [384, 1, 1], [1, 1, 1], 224384),
     "3fea9f2972306530e112": ("routing", 0, 1, 0, [192, 1, 1], [1, 1, 1], 2560),
-    "3ffef72b1c7ffd7f5ef8": ("fc2", 23, 24, 2, [256, 1, 1], [1, 1, 1], 212096),
+    "3ffef72b1c7ffd7f5ef8": ("fc2", 21, 22, 2, [256, 1, 1], [1, 1, 1], 212096),
     "4120432c808d60d09d02": ("fc1", 8, 10, 2, [256, 1, 1], [1, 1, 1], 105984),
     "44ad161d50ffbc995694": ("routing", 0, 0, 0, [512, 1, 1], [8, 1, 1], 1664),
     "468943c4d21a141a598c": ("routing", 1, 2, 0, [160, 1, 1], [1, 1, 1], 2176),
-    "473b3ed97ca34adb1911": ("fc2", 23, 24, 2, [256, 1, 1], [1, 1, 1], 214144),
+    "473b3ed97ca34adb1911": ("fc2", 21, 22, 2, [256, 1, 1], [1, 1, 1], 214144),
     "486e203b0db053728da1": ("fc1", 8, 10, 2, [512, 1, 1], [2, 1, 1], 201856),
     "490aa8adecdb6209bb9c": ("routing", 1, 2, 0, [480, 1, 1], [1, 1, 1], 6016),
-    "4d39cc1bd1356a2b3566": ("fc2", 24, 25, 2, [256, 1, 1], [2, 1, 1], 181248),
+    "4d39cc1bd1356a2b3566": ("fc2", 22, 23, 2, [256, 1, 1], [2, 1, 1], 181248),
     "5144f41bbd707c277a10": ("routing", 0, 0, 0, [128, 1, 1], [1, 1, 1], 0),
     "52e00418e5fbb3658e6c": ("routing", 0, 1, 0, [512, 1, 1], [1, 1, 1], 6400),
     "53458328057cfece24fd": ("finalize", 9, 11, 0, [256, 1, 1], [1, 1, 1], 0),
@@ -1083,7 +1015,7 @@ _PROGRAMS: dict[str, tuple[str, int, int, int, list[int], list[int], int]] = {
     "617db619833b05d03f14": ("routing", 0, 0, 0, [480, 1, 1], [1, 1, 1], 6016),
     "641673f58a6362969174": ("routing", 1, 2, 0, [512, 1, 1], [8, 1, 1], 1664),
     "650f390c7908e735b6b8": ("routing", 0, 0, 0, [160, 1, 1], [1, 1, 1], 2176),
-    "667764a3fa267f85926f": ("fc2", 24, 25, 2, [256, 1, 1], [2, 1, 1], 205824),
+    "667764a3fa267f85926f": ("fc2", 22, 23, 2, [256, 1, 1], [2, 1, 1], 205824),
     "71dc19e5913b86c81df9": ("requant", 10, 12, 0, [128, 1, 1], [1, 1, 1], 0),
     "73af683d678f64679a42": ("finalize", 9, 13, 0, [256, 1, 1], [1, 1, 1], 0),
     "7517857ff7d76e0dc9b8": ("finalize", 9, 11, 0, [256, 1, 1], [1, 1, 1], 0),
@@ -1100,36 +1032,36 @@ _PROGRAMS: dict[str, tuple[str, int, int, int, list[int], list[int], int]] = {
     "8f16181b96ffd8a94362": ("routing", 0, 1, 0, [448, 1, 1], [1, 1, 1], 5632),
     "91d8e602f2d067496ea3": ("routing", 0, 0, 0, [448, 1, 1], [1, 1, 1], 5632),
     "94829f81f49d9cd83238": ("routing", 1, 2, 0, [384, 1, 1], [1, 1, 1], 4864),
-    "94969f032e90041ddaab": ("fc2", 20, 21, 4, [512, 1, 1], [1, 1, 1], 136064),
+    "94969f032e90041ddaab": ("fc2", 19, 20, 4, [512, 1, 1], [1, 1, 1], 136064),
     "98389094462077483771": ("fc1", 12, 15, 7, [512, 1, 1], [2, 1, 1], 176256),
     "98534e8bfabc615ff7d5": ("routing", 0, 1, 0, [480, 1, 1], [1, 1, 1], 6016),
     "9a305f39c4182bc865be": ("routing", 0, 1, 0, [128, 1, 1], [1, 1, 1], 1152),
-    "a4a11b14b7fc96229730": ("fc2", 25, 26, 8, [256, 1, 1], [2, 1, 1], 214016),
+    "a4a11b14b7fc96229730": ("fc2", 23, 24, 8, [256, 1, 1], [2, 1, 1], 214016),
     "a5b8153548cab6dd4a26": ("fc1", 8, 10, 2, [512, 1, 1], [2, 1, 1], 226432),
     "ae217b5e6c838affbdf0": ("routing", 0, 1, 0, [128, 1, 1], [1, 1, 1], 1152),
     "ae6ca81a0800a8c71538": ("fc2", 5, 6, 9, [384, 1, 1], [2, 1, 1], 197248),
     "ae7dcfbf2d3e0cc4a20b": ("fc2", 5, 6, 9, [384, 1, 1], [2, 1, 1], 189056),
     "ae9bbf9c9644097f8828": ("routing", 1, 2, 0, [448, 1, 1], [1, 1, 1], 5632),
-    "af32c4e6a3c0d0e036bf": ("fc2", 19, 20, 4, [512, 1, 1], [1, 1, 1], 183424),
+    "af32c4e6a3c0d0e036bf": ("fc2", 4, 5, 4, [512, 1, 1], [1, 1, 1], 183424),
     "b398b040e1b8ef869e3c": ("fc1", 17, 15, 5, [384, 1, 1], [2, 1, 1], 209024),
     "b8722b9a6936e6a4c924": ("fc1", 13, 16, 10, [896, 1, 1], [2, 1, 1], 193152),
     "bf81684716f8abab06d1": ("routing", 1, 2, 0, [512, 1, 1], [1, 1, 1], 6400),
-    "c1118bec4cfea74fa04e": ("fc2", 25, 26, 8, [256, 1, 1], [2, 1, 1], 222208),
+    "c1118bec4cfea74fa04e": ("fc2", 23, 24, 8, [256, 1, 1], [2, 1, 1], 222208),
     "c16c727913eac39c7f25": ("fc1", 12, 15, 7, [640, 1, 1], [4, 1, 1], 224384),
     "c1a1ea765b3fb9132f49": ("routing", 1, 2, 0, [224, 1, 1], [1, 1, 1], 2944),
     "c3d9de1e9d6270fc651c": ("fc1", 14, 9, 8, [384, 1, 1], [2, 1, 1], 201856),
-    "c3df92890bea6316d938": ("fc2", 21, 22, 4, [512, 1, 1], [1, 1, 1], 199040),
+    "c3df92890bea6316d938": ("fc2", 7, 8, 4, [512, 1, 1], [1, 1, 1], 199040),
     "c476df668d159348bc57": ("routing", 0, 0, 0, [416, 1, 1], [1, 1, 1], 5248),
     "c515b08780ee51d11666": ("fc2", 18, 19, 1, [384, 1, 1], [1, 1, 1], 214144),
     "c96f943c65b2c8eaa9ab": ("fc1", 12, 15, 7, [512, 1, 1], [1, 1, 1], 217600),
     "cad86e812c35e9572739": ("fc1", 14, 9, 8, [384, 1, 1], [2, 1, 1], 210048),
     "cbdd540435fadd0d63f6": ("routing", 1, 2, 0, [256, 1, 1], [8, 1, 1], 1408),
     "ce56d77c382736e1c912": ("fc1", 3, 4, 3, [512, 1, 1], [1, 1, 1], 210560),
-    "ce5e4aee5124c2a50192": ("fc2", 20, 21, 4, [512, 1, 1], [1, 1, 1], 147072),
+    "ce5e4aee5124c2a50192": ("fc2", 19, 20, 4, [512, 1, 1], [1, 1, 1], 147072),
     "cecd60278603dcc4678d": ("routing", 0, 1, 0, [1024, 1, 1], [8, 1, 1], 3200),
     "d2bfac69e4b5b7c5f961": ("fc1", 14, 9, 8, [384, 1, 1], [2, 1, 1], 226432),
     "d2ed453ef29437abcbfe": ("routing", 0, 0, 0, [224, 1, 1], [1, 1, 1], 2944),
-    "d53109285a57b12da009": ("fc2", 25, 26, 8, [256, 1, 1], [2, 1, 1], 214016),
+    "d53109285a57b12da009": ("fc2", 23, 24, 8, [256, 1, 1], [2, 1, 1], 214016),
     "d5c6f1eaf5f0c70097c8": ("routing", 0, 0, 0, [352, 1, 1], [1, 1, 1], 4480),
     "d8ed340b82ed5d180872": ("routing", 0, 0, 0, [256, 1, 1], [1, 1, 1], 3328),
     "da3cce1da37ee8392722": ("requant", 10, 12, 0, [128, 1, 1], [1, 1, 1], 0),
@@ -1139,12 +1071,12 @@ _PROGRAMS: dict[str, tuple[str, int, int, int, list[int], list[int], int]] = {
     "e07259ed5242a5ed08f5": ("fc1", 3, 4, 3, [512, 1, 1], [1, 1, 1], 199040),
     "e2293bcb1ccd0fb0fa95": ("fc1", 12, 15, 7, [640, 1, 1], [1, 1, 1], 193280),
     "e236d0a22b1241463649": ("fc1", 8, 10, 2, [256, 1, 1], [1, 1, 1], 207872),
-    "e2c03be2acbc48deccaf": ("fc1", 22, 23, 1, [384, 1, 1], [1, 1, 1], 211072),
+    "e2c03be2acbc48deccaf": ("fc1", 20, 21, 1, [384, 1, 1], [1, 1, 1], 211072),
     "ef40785c53887398a669": ("finalize", 9, 13, 0, [256, 1, 1], [1, 1, 1], 0),
     "f10c6f853ce09601ded6": ("fc1", 15, 17, 11, [640, 1, 1], [2, 1, 1], 170112),
     "f44269ae056bce32e72d": ("fc2", 5, 6, 4, [512, 1, 1], [2, 1, 1], 187520),
     "f496b224df3869be9686": ("fc2", 7, 8, 9, [384, 1, 1], [2, 1, 1], 220288),
-    "f4d6d750fa13240db475": ("fc2", 23, 24, 2, [256, 1, 1], [1, 1, 1], 226432),
+    "f4d6d750fa13240db475": ("fc2", 21, 22, 2, [256, 1, 1], [1, 1, 1], 226432),
     "f705b4bad90742efa82b": ("routing", 0, 1, 0, [288, 1, 1], [1, 1, 1], 3712),
     "f7ef47dbe2fd5582df03": ("routing", 0, 0, 0, [288, 1, 1], [1, 1, 1], 3712),
     "f8b951ca28630f6cded8": ("fc1", 16, 18, 7, [640, 1, 1], [2, 1, 1], 170112),
@@ -1295,11 +1227,11 @@ _FC2: dict[str, tuple[str, int, int, str, str]] = {
     "024867aa963132f48ac0": ("nvfp4_bf16tok", 256, 256, "r128c4", "tiles"),
     "0d02520bcc278529cf27": ("bf16", 16, 128, "none", "resident"),
     "151b3e849cd52a227427": ("fp8", 64, 128, "none", "tiles"),
-    "207264b4f5afb1793f23": ("nvfp4_bf16tok", 8, 512, "r8c4", "resident"),
+    "207264b4f5afb1793f23": ("nvfp4_bf16tok", 8, 512, "r8c4", "tiles"),
     "26edf45a86b9afe56815": ("mxfp8", 16, 256, "r8c4", "resident"),
-    "2b4c507bf99c30c92543": ("nvfp4", 64, 512, "r8c4", "resident"),
+    "2b4c507bf99c30c92543": ("nvfp4", 64, 512, "r8c4", "tiles"),
     "3a5388a6a052318613bd": ("nvfp4", 32, 512, "r8c4", "tiles"),
-    "3c3e3d7bf81779f17064": ("nvfp4_bf16tok", 16, 512, "r8c4", "resident"),
+    "3c3e3d7bf81779f17064": ("nvfp4_bf16tok", 16, 512, "r8c4", "tiles"),
     "3ffef72b1c7ffd7f5ef8": ("fp8", 8, 256, "none", "resident"),
     "473b3ed97ca34adb1911": ("fp8", 32, 256, "none", "resident"),
     "4d39cc1bd1356a2b3566": ("fp8", 128, 128, "none", "resident"),
@@ -1310,9 +1242,9 @@ _FC2: dict[str, tuple[str, int, int, str, str]] = {
     "a4a11b14b7fc96229730": ("bf16", 128, 64, "none", "resident"),
     "ae6ca81a0800a8c71538": ("mxfp8", 128, 128, "r128c4", "tiles"),
     "ae7dcfbf2d3e0cc4a20b": ("mxfp8", 256, 128, "r128c4", "tiles"),
-    "af32c4e6a3c0d0e036bf": ("nvfp4_bf16tok", 64, 512, "r8c4", "resident"),
+    "af32c4e6a3c0d0e036bf": ("nvfp4_bf16tok", 64, 512, "r8c4", "tiles"),
     "c1118bec4cfea74fa04e": ("bf16", 64, 128, "none", "resident"),
-    "c3df92890bea6316d938": ("nvfp4", 8, 512, "r8c4", "resident"),
+    "c3df92890bea6316d938": ("nvfp4", 8, 512, "r8c4", "tiles"),
     "c515b08780ee51d11666": ("bf16", 32, 128, "none", "resident"),
     "ce5e4aee5124c2a50192": ("mxfp8", 8, 256, "r8c4", "resident"),
     "d53109285a57b12da009": ("bf16", 256, 64, "none", "resident"),

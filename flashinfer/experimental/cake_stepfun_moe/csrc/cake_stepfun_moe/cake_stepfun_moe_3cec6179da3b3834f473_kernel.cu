@@ -18,30 +18,6 @@
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_stepfun_moe_device_common.cuh"
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 32
-#define TMEM_ACCUM_OFFSET 0
-#define NUM_K_PIPE_STAGES 6
-#define NUM_MMA_PIPE_STAGES 2
-#define NUM_WORK_PIPE_STAGES 3
-#define NUM_THROTTLE_PIPE_STAGES 3
-#define SMEM_SMEM_A_OFF 1024
-#define SMEM_SMEM_A_STAGE_BYTES 32768
-#define SMEM_SMEM_A_STRIDE 32768
-#define SMEM_SMEM_B_OFF 197632
-#define SMEM_SMEM_B_STAGE_BYTES 4096
-#define SMEM_SMEM_B_STRIDE 4096
-#define SMEM_EPI_STAGING_OFF 222208
-#define SMEM_EPI_STAGING_STAGE_BYTES 2048
-#define SMEM_EPI_STAGING_STRIDE 2048
-#define SMEM_EPI_STAGING_U32_OFF 222208
-#define SMEM_EPI_STAGING_U32_STAGE_BYTES 2048
-#define SMEM_EPI_STAGING_U32_STRIDE 2048
-#define SMEM_WORK_RESPONSE_OFF 224256
-#define SMEM_WORK_RESPONSE_STAGE_BYTES 16
-#define SMEM_WORK_RESPONSE_STRIDE 16
-#define SMEM_TOTAL 224384
-#define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
 
@@ -89,7 +65,7 @@ kernel_cake_stepfun_moe_3cec6179da3b3834f473(const __grid_constant__ CUtensorMap
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_a = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_a_addr = smem + 1024;
     __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 197632);
@@ -100,23 +76,24 @@ kernel_cake_stepfun_moe_3cec6179da3b3834f473(const __grid_constant__ CUtensorMap
     const int epi_staging_u32_addr = smem + 222208;
     unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 224256);
     const int work_response_addr = smem + 224256;
+
+    // Kernel setup ops
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&C))) : "memory");
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    int _vec_load_0[1];
+    int vec_load[1];
     {
         uint32_t _scalar_bits_0;
         asm volatile("ld.global.b32 %0, [%1];"
             : "=r"(_scalar_bits_0) : "l"((const void*)(num_tiles + (0))) : "memory");
-        _vec_load_0[0] = (int32_t)_scalar_bits_0;
+        vec_load[0] = (int32_t)_scalar_bits_0;
     }
-    unsigned int num_live = (unsigned int)_vec_load_0[0];
+    unsigned int num_live = (unsigned int)vec_load[0];
     unsigned int first = (unsigned int)bid;
     unsigned int first_m = first % (unsigned int)grid_m;
     unsigned int first_n = first / (unsigned int)grid_m;
 
-    // Mbarrier init (9 pipeline groups, 0 ordered-sequence groups, 34 barriers)
-    // Mbarriers at smem_raw[0..272)
+    // Mbarrier init (34 barriers at smem_raw[0..272))
 
     if (warp == 0) {
         // --- pipeline 'k_pipe' ---
@@ -159,10 +136,10 @@ kernel_cake_stepfun_moe_3cec6179da3b3834f473(const __grid_constant__ CUtensorMap
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
 
     // Kernel post-init ops
-    const int tmem_accum = taddr;
     if (warp >= 4 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
     }
@@ -185,14 +162,14 @@ kernel_cake_stepfun_moe_3cec6179da3b3834f473(const __grid_constant__ CUtensorMap
                 if (valid == 0) {
                     break;
                 }
-                int _vec_load_1[1];
+                int vec_load_0[1];
                 {
                     uint32_t _scalar_bits_0;
                     asm volatile("ld.global.b32 %0, [%1];"
                         : "=r"(_scalar_bits_0) : "l"((const void*)(tile_expert + (n_tile))) : "memory");
-                    _vec_load_1[0] = (int32_t)_scalar_bits_0;
+                    vec_load_0[0] = (int32_t)_scalar_bits_0;
                 }
-                int expert = _vec_load_1[0];
+                int expert = vec_load_0[0];
                 mbarrier_wait(throttle_empty_addr + (throttle_stage) * 8, _phase_throttle_empty);
                 mbarrier_arrive(throttle_full_addr + (throttle_stage) * 8);
                 throttle_stage += 1;
@@ -251,23 +228,23 @@ kernel_cake_stepfun_moe_3cec6179da3b3834f473(const __grid_constant__ CUtensorMap
                 if (live_tiles_1 <= n_tile_1 * (unsigned int)grid_m + m_tile_2 + 64) {
                     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
                 }
-                int _vec_load_2[1];
+                int vec_load_1[1];
                 {
                     uint32_t _scalar_bits_0;
                     asm volatile("ld.global.b32 %0, [%1];"
                         : "=r"(_scalar_bits_0) : "l"((const void*)(tile_mn_limit + (n_tile_1))) : "memory");
-                    _vec_load_2[0] = (int32_t)_scalar_bits_0;
+                    vec_load_1[0] = (int32_t)_scalar_bits_0;
                 }
-                int valid_rows = (unsigned int)_vec_load_2[0] - n_tile_1 * 16;
+                int valid_rows = (unsigned int)vec_load_1[0] - n_tile_1 * 16;
                 for (int row_group = 0; row_group < 2; row_group++) {
-                    int _vec_load_3[1];
+                    int vec_load_2[1];
                     {
                         uint32_t _scalar_bits_1;
                         asm volatile("ld.global.b32 %0, [%1];"
                             : "=r"(_scalar_bits_1) : "l"((const void*)(route_map + (n_tile_1 * 16 + (unsigned int)(row0 + row_group * 8)))) : "memory");
-                        _vec_load_3[0] = (int32_t)_scalar_bits_1;
+                        vec_load_2[0] = (int32_t)_scalar_bits_1;
                     }
-                    routed[row_group] = _vec_load_3[0];
+                    routed[row_group] = vec_load_2[0];
                 }
                 #pragma unroll 1
                 for (int iter_k_1 = 0; iter_k_1 < K_tiles; iter_k_1++) {
@@ -339,7 +316,6 @@ kernel_cake_stepfun_moe_3cec6179da3b3834f473(const __grid_constant__ CUtensorMap
             unsigned int n_tile_3 = 0;
             unsigned int _phase_mma_free = 1;
             unsigned int _phase_a_full = 0;
-            unsigned int _phase_b_full = 0;
             unsigned int _phase_work_full_2 = 0;
             #pragma unroll 1
             for (unsigned int _tile_2 = 0; _tile_2 < (unsigned int)grid_m * (unsigned int)max_tiles; _tile_2++) {
@@ -350,7 +326,7 @@ kernel_cake_stepfun_moe_3cec6179da3b3834f473(const __grid_constant__ CUtensorMap
                 #pragma unroll 1
                 for (int iter_k_2 = 0; iter_k_2 < K_tiles; iter_k_2++) {
                     mbarrier_wait(a_full_addr + (stage_2) * 8, _phase_a_full);
-                    mbarrier_wait(b_full_addr + (stage_2) * 8, _phase_b_full);
+                    mbarrier_wait(b_full_addr + (stage_2) * 8, _phase_a_full);
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int _mma_a_lo_0 = make_warp_uniform((((smem_a_addr) >> 4) & 0x3FFF) + (stage_2) * 2048);
@@ -403,7 +379,7 @@ kernel_cake_stepfun_moe_3cec6179da3b3834f473(const __grid_constant__ CUtensorMap
                         elect_commit(k_done_addr + (stage_2) * 8);
                     }
                     stage_2 += 1;
-                    if (stage_2 == 6) { stage_2 = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; }
+                    if (stage_2 == 6) { stage_2 = 0; _phase_a_full ^= 1; }
                 }
                 acc_stage += 1;
                 if (acc_stage == 2) { acc_stage = 0; _phase_mma_free ^= 1; }
@@ -447,22 +423,22 @@ kernel_cake_stepfun_moe_3cec6179da3b3834f473(const __grid_constant__ CUtensorMap
                 if (valid_3 == 0) {
                     break;
                 }
-                int _vec_load_4[1];
+                int vec_load_3[1];
                 {
                     uint32_t _scalar_bits_0;
                     asm volatile("ld.global.b32 %0, [%1];"
                         : "=r"(_scalar_bits_0) : "l"((const void*)(tile_expert + (n_tile_4))) : "memory");
-                    _vec_load_4[0] = (int32_t)_scalar_bits_0;
+                    vec_load_3[0] = (int32_t)_scalar_bits_0;
                 }
-                int expert_1 = _vec_load_4[0];
-                int _vec_load_5[1];
+                int expert_1 = vec_load_3[0];
+                int vec_load_4[1];
                 {
                     uint32_t _scalar_bits_1;
                     asm volatile("ld.global.b32 %0, [%1];"
                         : "=r"(_scalar_bits_1) : "l"((const void*)(tile_mn_limit + (n_tile_4))) : "memory");
-                    _vec_load_5[0] = (int32_t)_scalar_bits_1;
+                    vec_load_4[0] = (int32_t)_scalar_bits_1;
                 }
-                int valid_rows_1 = (unsigned int)_vec_load_5[0] - n_tile_4 * 16;
+                int valid_rows_1 = (unsigned int)vec_load_4[0] - n_tile_4 * 16;
                 float cl = clamp_limit[expert_1];
                 float neg_cl;
                 asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(neg_cl) : "f"(0.0f), "f"(cl));
