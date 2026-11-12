@@ -1379,6 +1379,40 @@ def _slim_wheel(wheel_path: Path) -> dict[str, int]:
     return stats
 
 
+@contextmanager
+def _staged_header(header: Path, patched: bytes, stage: Path):
+    """Hold ``patched`` in ``header`` for the block, then restore the original.
+
+    ``stage`` holds the backup of the original and the temporary files; it lies
+    outside the packaged ``include`` tree, so no wheel ships them.
+    """
+    backup = stage / (header.name + ".flashinfer-orig")
+    for leftover in stage.glob(f"{header.name}.*.tmp"):
+        leftover.unlink()
+    if backup.exists():
+        os.replace(backup, header)
+    original = header.read_bytes()
+    if patched == original:
+        yield
+        return
+
+    def write(path: Path, data: bytes) -> None:
+        """Write ``data`` through a temporary file in ``stage`` and ``os.replace``."""
+        temporary = stage / f"{path.name}.{os.getpid()}.tmp"
+        try:
+            temporary.write_bytes(data)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    write(backup, original)
+    try:
+        write(header, patched)
+        yield
+    finally:
+        os.replace(backup, header)
+
+
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     _prepare_for_wheel()
     if os.name != "nt":
@@ -1387,17 +1421,13 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         return name
 
     spdlog_patch = _load_spdlog_patch()
-    header = (
-        _root / "3rdparty" / "spdlog" / "include" / spdlog_patch.SPDLOG_FORMAT_HEADER
-    )
+    spdlog = _root / "3rdparty" / "spdlog"
+    header = spdlog / "include" / spdlog_patch.SPDLOG_FORMAT_HEADER
     original = header.read_bytes()
     patched = spdlog_patch.patch_bundled_format_h(original.decode("utf-8")).encode(
         "utf-8"
     )
-    try:
-        header.write_bytes(patched)
+    with _staged_header(header, patched, stage=spdlog):
         name = orig.build_wheel(wheel_directory, config_settings, metadata_directory)
-    finally:
-        header.write_bytes(original)
     _slim_wheel(Path(wheel_directory) / name)
     return name
