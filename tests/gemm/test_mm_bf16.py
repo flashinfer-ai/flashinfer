@@ -253,7 +253,11 @@ def test_mm_bf16_tinygemm_pdl_waits_for_bias(monkeypatch):
 
         if cc_num == 90:
             program = routergemm._tinygemm2_wgmma_program(a, weight, True, True)
-            assert program is not None
+            # No wgmma window admits (8, 768, 7168); that shape keeps the reference.
+            if (m, n, k) == (8, 768, 7168):
+                assert program is None
+            else:
+                assert program is not None
         elif cc_num in (100, 103, 107):
             program = routergemm._tinygemm2_tcgen05_program(a, weight, out, True, True)
             if (m, n, k) == (28, 2048, 3072):
