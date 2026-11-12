@@ -3495,7 +3495,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
     DTypeO* o_ptr_base =
         o + o_indptr[request_idx] * o_stride_n + (kv_head_idx * group_size) * o_stride_h;
-    float* tmp_v_ptr_base = partition_kv
+    float* tmp_v_ptr_base = (partition_kv && tmp_v != nullptr)
                                 ? tmp_v + (o_indptr[request_idx] + kv_tile_idx) * o_stride_n +
                                       (kv_head_idx * group_size) * o_stride_h
                                 : nullptr;
@@ -4289,9 +4289,9 @@ __device__ __forceinline__ void vosplit_write_o(
 
 template <typename KTraits, bool SAME_KV_STRIDES = false, typename Params, typename SmemStorage>
 __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
-    const Params params, SmemStorage& smem_storage, float* tmp_v, const dim3 tid = threadIdx,
+    const Params params, SmemStorage& smem_storage, const dim3 tid = threadIdx,
     const uint32_t bx = blockIdx.x, const uint32_t kv_head_idx = blockIdx.z,
-    const uint32_t num_kv_heads = gridDim.z) {
+    const uint32_t num_kv_heads = gridDim.z, float* tmp_v = nullptr) {
   using DTypeQ = typename Params::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
   if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
@@ -4435,7 +4435,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         q + q_indptr[request_idx] * q_stride_n + (kv_head_idx * group_size) * q_stride_h;
     DTypeO* o_ptr_base =
         o + o_indptr[request_idx] * o_stride_n + (kv_head_idx * group_size) * o_stride_h;
-    float* tmp_v_ptr_base = partition_kv
+    float* tmp_v_ptr_base = (partition_kv && tmp_v != nullptr)
                                 ? tmp_v + (o_indptr[request_idx] + kv_tile_idx) * o_stride_n +
                                       (kv_head_idx * group_size) * o_stride_h
                                 : nullptr;
@@ -4985,7 +4985,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
     const __grid_constant__ Params params, float* tmp_v) {
   extern __shared__ uint8_t smem[];
   auto& smem_storage = reinterpret_cast<typename KTraits::SharedStoragePaged&>(smem);
-  BatchPrefillWithPagedKVCacheDevice<KTraits, SAME_KV_STRIDES>(params, smem_storage, tmp_v);
+  BatchPrefillWithPagedKVCacheDevice<KTraits, SAME_KV_STRIDES>(params, smem_storage, threadIdx,
+                                                              blockIdx.x, blockIdx.z, gridDim.z,
+                                                              tmp_v);
 }
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
