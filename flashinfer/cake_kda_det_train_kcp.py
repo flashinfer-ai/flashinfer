@@ -16,22 +16,22 @@ limitations under the License.
 Deterministic context-parallel (KCP) packed KDA (Kimi Delta Attention) chunked training
 (SM100 / SM103 / SM107), the Cake backend.
 
-The packed batch is split over the ranks of a process group (``partition_det_kcp``), every rank
+The packed batch is split over the ranks of a process group (``cake_kda_det_train_kcp_partition``), every rank
 holds its fragments of the documents, and the per-document state recurrences cross the rank
-boundaries through the plan's collectives (``build_context_det_kcp``).  The per-rank launch
+boundaries through the plan's collectives (``cake_kda_det_train_kcp_build_context``).  The per-rank launch
 sequences, the autograd Function, the plan and the generated kernels live in
-``flashinfer.experimental.cake_kda_det_train_kcp``; the single-rank entry points are in
+``flashinfer.experimental.cake.cake_kda_det_train_kcp``; the single-rank entry points are in
 ``flashinfer.cake_kda_det_train``::
 
-    from flashinfer.cake_kda_det_train_kcp import partition_det_kcp, build_context_det_kcp, chunk_kda_det_kcp
+    from flashinfer.cake_kda_det_train_kcp import cake_kda_det_train_kcp_partition, cake_kda_det_train_kcp_build_context, cake_kda_det_kcp
 
-    part = partition_det_kcp(cu_seqlens_global_cpu, world_size)          # once per batch layout
-    ctx = build_context_det_kcp(part, group, rank, device)               # tables and collectives of this rank
-    out_local = chunk_kda_det_kcp(q_local, k_local, v_local, g_local, beta_local, ctx)   # autograd
-    out_local, saved = chunk_kda_det_fwd_kcp(q_local, k_local, v_local, g_local, beta_local, ctx)
-    grads = chunk_kda_det_bwd_kcp(q_local, k_local, v_local, g_local, beta_local, ctx, dout_local, saved=saved)
+    part = cake_kda_det_train_kcp_partition(cu_seqlens_global_cpu, world_size)          # once per batch layout
+    ctx = cake_kda_det_train_kcp_build_context(part, group, rank, device)               # tables and collectives of this rank
+    out_local = cake_kda_det_kcp(q_local, k_local, v_local, g_local, beta_local, ctx)   # autograd
+    out_local, saved = cake_kda_det_train_kcp_forward(q_local, k_local, v_local, g_local, beta_local, ctx)
+    grads = cake_kda_det_train_kcp_backward(q_local, k_local, v_local, g_local, beta_local, ctx, dout_local, saved=saved)
 
-    ctx_next = build_context_det_kcp(part_next, group, rank, device, heads=H)   # prepare the next pack while
+    ctx_next = cake_kda_det_train_kcp_build_context(part_next, group, rank, device, heads=H)   # prepare the next pack while
                                                                                # this one runs: no host wait
 
 The width-4 causal convolution with halo of the same partition takes this module's ``ctx``.
@@ -39,20 +39,60 @@ The width-4 causal convolution with halo of the same partition takes this module
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Optional
 
 import torch
 
-from .api_logging import flashinfer_experimental_api
-from .cake_kda_det_train import _FEATURE, DEFAULT_SCALE
+from .api_logging import flashinfer_api
+from .cake_kda_det_train import DEFAULT_SCALE
 
-# The KCP entry points forward to ``flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp`` (the per-rank
+# The KCP entry points forward to ``flashinfer.experimental.cake.cake_kda_det_train_kcp.cake_kcp`` (the per-rank
 # launch sequences over the kernels of the ``cake_kcp_jit`` registry) and ``cake_kcp_plan`` (the partition, the
 # context's tables and collectives, the byte queries).  Every keyword is forwarded; nothing is validated here.
 
+# The keywords the three entries with ``**options`` forward to the backend entry of the same name: the raw gate
+# keywords, the options of ``CakeKDADetKcpOptions`` (``cake_kcp._OPTION_KEYS``) and the private test hook, with the
+# backend's defaults.  They are listed here, not read from the backend, so that importing this module loads no
+# backend module; the API test checks that each entry's signature equals the backend entry's.
+_FORWARDED_KEYWORDS = (
+    ("use_gate_in_kernel", False, "bool"),
+    ("A_log", None, "Optional[torch.Tensor]"),
+    ("dt_bias", None, "Optional[torch.Tensor]"),
+    ("lower_bound", None, "Optional[float]"),
+    ("save_transfer", None, "Optional[bool]"),
+    ("exchange", "auto", "str"),
+    ("head_groups", 1, "int"),
+    ("offset_class", "fla", "str"),
+    ("debug_sequence", False, "bool"),
+    ("spec3_probe", "off", "str"),
+    ("graph", "off", "str"),
+    ("_kcp_test_knobs", None, "Optional[dict[str, Any]]"),
+)
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def partition_det_kcp(
+
+def _forwarding_signature(fn):
+    """Give entry ``fn`` the signature of the keywords it accepts: its own parameters without ``**options``, then
+    :data:`_FORWARDED_KEYWORDS` as keyword-only parameters.  ``fn`` still takes ``**options`` and forwards them; the
+    backend refuses an unknown keyword (``TypeError``).  Returns ``fn`` itself."""
+    sig = inspect.signature(fn)
+    params = [
+        p
+        for p in sig.parameters.values()
+        if p.kind is not inspect.Parameter.VAR_KEYWORD
+    ]
+    params += [
+        inspect.Parameter(
+            name, inspect.Parameter.KEYWORD_ONLY, default=default, annotation=annotation
+        )
+        for name, default, annotation in _FORWARDED_KEYWORDS
+    ]
+    fn.__signature__ = sig.replace(parameters=params)
+    return fn
+
+
+@flashinfer_api
+def cake_kda_det_train_kcp_partition(
     cu_seqlens_global_cpu: Any,
     world_size: int,
     layout: str = "contiguous",
@@ -72,21 +112,27 @@ def partition_det_kcp(
         ``"contiguous"`` (equal token shares in order), ``"zigzag"`` or ``"zigzag_per_document"`` (the load-balanced
         layouts); ``fragments`` gives an explicit ragged layout instead, and ``cut_points`` (per document the
         ``2 * world_size + 1`` cut offsets) applies to ``layout="zigzag_per_document"`` only.
+    fragments : optional
+        Explicit ragged layout: ``fragments[rank] = [(doc, off, len), ...]``, or a flat
+        ``[(doc, off, len, rank), ...]`` list. ``doc`` is the document index, ``off`` its
+        token offset within that document, ``len`` the token count, and ``rank`` the owner.
+    cut_points : optional
+        Per-document ``2 * world_size + 1`` cut offsets for ``layout="zigzag_per_document"``.
 
     Returns
     -------
-    ``PartitionDetKcp``: per rank its fragments (document, token range) of the batch; the input of
-    :func:`build_context_det_kcp` on every rank.
+    ``CakeKDADetKcpPartition``: per rank its fragments (document, token range) of the batch; the input of
+    :func:`cake_kda_det_train_kcp_build_context` on every rank.
     """
-    from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp_plan
 
-    return cake_kcp_plan.partition_det_kcp(
+    return cake_kcp_plan.cake_kda_det_train_kcp_partition(
         cu_seqlens_global_cpu, world_size, layout, fragments, cut_points=cut_points
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def build_context_det_kcp(
+@flashinfer_api
+def cake_kda_det_train_kcp_build_context(
     part: Any,
     group: Any,
     rank: int,
@@ -102,8 +148,8 @@ def build_context_det_kcp(
 
     Parameters
     ----------
-    part : PartitionDetKcp
-        From :func:`partition_det_kcp`, the same object on every rank.
+    part : CakeKDADetKcpPartition
+        From :func:`cake_kda_det_train_kcp_partition`, the same object on every rank.
     group
         The ``torch.distributed`` process group of the context-parallel ranks.
     rank : int
@@ -124,11 +170,11 @@ def build_context_det_kcp(
 
     Returns
     -------
-    ``ContextDetKcp``: the argument every KCP entry point takes; reusable across calls of the same batch layout.
+    ``CakeKDADetKcpContext``: the argument every KCP entry point takes; reusable across calls of the same batch layout.
     """
-    from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp_plan
 
-    return cake_kcp_plan.build_context_det_kcp(
+    return cake_kcp_plan.cake_kda_det_train_kcp_build_context(
         part,
         group,
         rank,
@@ -140,8 +186,9 @@ def build_context_det_kcp(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def chunk_kda_det_fwd_kcp(
+@flashinfer_api
+@_forwarding_signature
+def cake_kda_det_train_kcp_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -162,23 +209,23 @@ def chunk_kda_det_fwd_kcp(
     Parameters
     ----------
     q, k, v, g, beta : torch.Tensor
-        This rank's shard of the operands of :func:`~flashinfer.cake_kda_det_train.chunk_kda_det_fwd` (the tokens of its fragments, in the
+        This rank's shard of the operands of :func:`~flashinfer.cake_kda_det_train.cake_kda_det_train_forward` (the tokens of its fragments, in the
         partition's order): BF16 ``[1, S_local, H, 128]`` ``q, k, v``, FP32 ``g``, BF16 ``[1, S_local, H]`` ``beta``.
-    ctx : ContextDetKcp
-        From :func:`build_context_det_kcp`.
+    ctx : CakeKDADetKcpContext
+        From :func:`cake_kda_det_train_kcp_build_context`.
     scale : float, optional
         Output scale; ``128 ** -0.5`` when ``None``.
     save_for_backward : bool
-        Write the saved set (the local saved set of :func:`~flashinfer.cake_kda_det_train.chunk_kda_det_fwd` plus the boundary states the backward
+        Write the saved set (the local saved set of :func:`~flashinfer.cake_kda_det_train.cake_kda_det_train_forward` plus the boundary states the backward
         starts from).
     save_mode : str
-        ``"light"`` or ``"tape"`` as for :func:`~flashinfer.cake_kda_det_train.chunk_kda_det_fwd`.
+        ``"light"`` or ``"tape"`` as for :func:`~flashinfer.cake_kda_det_train.cake_kda_det_train_forward`.
     boundary_mode : str
         ``"saved"`` keeps the received boundary states in the saved set; ``"replay"`` saves nothing and lets the
         backward replay the forward's exchanges.
-    workspace : WorkspaceDetKcp, optional
+    workspace : CakeKDADetKcpWorkspace, optional
         A reused workspace of this rank; without one the call allocates its own.  One workspace may serve every
-        prepared pack of the rank (``WorkspaceDetKcp.reserve(ctxs, H)`` sizes it for all of them up front).
+        prepared pack of the rank (``CakeKDADetKcpWorkspace.reserve(ctxs, H)`` sizes it for all of them up front).
     use_qk_l2norm_in_kernel : bool
         Keyword-only, default ``False`` (unchanged behavior).  ``True`` normalizes ``q`` and ``k`` inside the
         kernels: per token and per 128-channel head, ``q * rsqrt(sum(q * q) + 1e-6)`` in FP32, rounded once to BF16
@@ -188,27 +235,27 @@ def chunk_kda_det_fwd_kcp(
         address 16-byte aligned, token stride >= H*128 (no overlapping rows); never copied).  The saved set keeps
         the raw ``q`` / ``k`` (the caller's tensors) and adds the FP32 per-token rstd ``[2, S_local, H]``;
         normalized ``q`` / ``k`` are never saved.  The workspace must be of the same mode
-        (``WorkspaceDetKcp(use_qk_l2norm_in_kernel=True)``).  Until the single-rank in-kernel normalization
+        (``CakeKDADetKcpWorkspace(use_qk_l2norm_in_kernel=True)``).  Until the single-rank in-kernel normalization
         programs are available on the device, ``True`` raises ``NotImplementedError`` on every rank alike.  With
         ``False`` every launch, saved tensor, key and byte is unchanged.
     **options
         Further KCP options (``save_transfer``, ``exchange``, ``head_groups``, ``offset_class``, ``graph``),
         forwarded.
-        The raw gate mode of :func:`~flashinfer.cake_kda_det_train.chunk_kda_det_fwd` (keywords
+        The raw gate mode of :func:`~flashinfer.cake_kda_det_train.cake_kda_det_train_forward` (keywords
         ``use_gate_in_kernel``, ``A_log``, ``dt_bias``, ``lower_bound``, forwarded like the options) applies to this
         rank's shard: with ``use_gate_in_kernel=True`` ``g`` is the rank's raw gate (BF16, any view under the
         single-rank stride rule, never copied), ``A_log`` FP32 ``[H]`` and ``dt_bias`` FP32 ``[H * 128]`` or
         ``[H, 128]`` are the full parameters (the same tensors on every rank) and ``lower_bound`` is required
         (``-5 <= lower_bound < 0``); the workspace must be of the same mode
-        (``WorkspaceDetKcp(use_gate_in_kernel=True)``).
+        (``CakeKDADetKcpWorkspace(use_gate_in_kernel=True)``).
 
     Returns
     -------
-    ``(out, saved)``: ``out`` BF16 like ``v`` (this rank's tokens); ``saved`` a ``SavedDetKcp`` or ``None``.
+    ``(out, saved)``: ``out`` BF16 like ``v`` (this rank's tokens); ``saved`` a ``CakeKDADetKcpSaved`` or ``None``.
     """
-    from .experimental.cake_kda_det_train_kcp import cake_kcp
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp
 
-    return cake_kcp.chunk_kda_det_fwd_kcp(
+    return cake_kcp.cake_kda_det_train_kcp_forward(
         q,
         k,
         v,
@@ -225,8 +272,9 @@ def chunk_kda_det_fwd_kcp(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def chunk_kda_det_bwd_kcp(
+@flashinfer_api
+@_forwarding_signature
+def cake_kda_det_train_kcp_backward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -247,32 +295,35 @@ def chunk_kda_det_bwd_kcp(
     Parameters
     ----------
     q, k, v, g, beta, ctx
-        The forward's inputs (same contracts as :func:`chunk_kda_det_fwd_kcp`).
+        The forward's inputs (same contracts as :func:`cake_kda_det_train_kcp_forward`).
     dout : torch.Tensor
         BF16 gradient of this rank's ``out``.
-    saved : SavedDetKcp, optional
+    saved : CakeKDADetKcpSaved, optional
         The forward's saved set; without one the forward is replayed (checkpointing).
-    scale, save_mode, workspace, **options
-        As for :func:`chunk_kda_det_fwd_kcp`; the backward reads its own options, among them ``spec3_probe``: the
+    scale, save_mode, workspace
+        As for :func:`cake_kda_det_train_kcp_forward`; the backward reads its own options, among them ``spec3_probe``: the
         debug probe of the first saved-mode backward, ``"off"`` by default, ``"record"``, ``"warn"`` or
         ``"assert"`` (the same value on every rank); and the forward's raw gate keywords.
+    **options
+        Additional options and raw-gate keywords of :func:`cake_kda_det_train_kcp_forward`.
     use_qk_l2norm_in_kernel : bool
         Keyword-only, default ``False``: the forward's value.  With ``True`` ``dq`` / ``dk`` are the gradients of
         the raw ``q`` / ``k``; a saved set or a workspace of the other mode raises ``ValueError``.
 
     Returns
     -------
-    Five tensors in the explicit gate mode (``use_gate_in_kernel=False``): ``(dq, dk, dv, dbeta, dg)`` of this
-    rank's tokens, BF16 ``dq, dk, dv, dbeta``, FP32 ``dg``.  Seven tensors in raw gate mode
-    (``use_gate_in_kernel=True``): ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg`` the BF16 gradient of the
-    rank's raw gate, ``dA_log`` FP32 ``[H]`` and ``ddt_bias`` FP32 (``dt_bias``'s shape) this rank's partial sums --
-    the gradients through its own tokens.  Sum them over the context-parallel group like the gradients of any
-    replicated parameter, or with :func:`reduce_gate_param_grads_det_kcp` for a bitwise reproducible sum (an NCCL
-    all-reduce does not fix its summation order).
+    tuple of torch.Tensor
+        Five tensors in the explicit gate mode (``use_gate_in_kernel=False``): ``(dq, dk, dv, dbeta, dg)`` of this
+        rank's tokens, BF16 ``dq, dk, dv, dbeta``, FP32 ``dg``.  Seven tensors in raw gate mode
+        (``use_gate_in_kernel=True``): ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg`` the BF16 gradient of the
+        rank's raw gate, ``dA_log`` FP32 ``[H]`` and ``ddt_bias`` FP32 (``dt_bias``'s shape) this rank's partial sums --
+        the gradients through its own tokens.  Sum them over the context-parallel group like the gradients of any
+        replicated parameter, or with :func:`cake_kda_det_train_kcp_reduce_gate_param_grads` for a bitwise reproducible sum (an NCCL
+        all-reduce does not fix its summation order).
     """
-    from .experimental.cake_kda_det_train_kcp import cake_kcp
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp
 
-    return cake_kcp.chunk_kda_det_bwd_kcp(
+    return cake_kcp.cake_kda_det_train_kcp_backward(
         q,
         k,
         v,
@@ -289,8 +340,9 @@ def chunk_kda_det_bwd_kcp(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def chunk_kda_det_kcp(
+@flashinfer_api
+@_forwarding_signature
+def cake_kda_det_kcp(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -308,12 +360,24 @@ def chunk_kda_det_kcp(
     **options: Any,
 ) -> torch.Tensor:
     r"""Autograd-enabled context-parallel packed KDA chunked training step of this rank's fragments (the forward of
-    :func:`chunk_kda_det_fwd_kcp`; the backward of :func:`chunk_kda_det_bwd_kcp` from its saved set).
+    :func:`cake_kda_det_train_kcp_forward`; the backward of :func:`cake_kda_det_train_kcp_backward` from its saved set).
 
     Parameters
     ----------
-    recompute_handle : RecomputeHandleDetKcp, optional
-        Keyword-only, default ``None`` (unchanged behavior).  A handle (``flashinfer.cake_kda_det_train_kcp.RecomputeHandleDetKcp``
+    q, k, v, g, beta : torch.Tensor
+        This rank's input rows, with the contracts of :func:`cake_kda_det_train_kcp_forward`.
+    ctx
+        This rank's context from :func:`cake_kda_det_train_kcp_build_context`.
+    scale : float, optional
+        Output scale; ``128 ** -0.5`` when ``None``.
+    save_mode : str, default="light"
+        Local saved-set mode of :func:`cake_kda_det_train_kcp_forward`.
+    boundary_mode : str, default="saved"
+        Keep boundary states with ``"saved"`` or recompute them with ``"replay"``.
+    workspace : optional
+        Caller-owned workspace of this package and the same gate and normalization modes.
+    recompute_handle : CakeKDADetKcpRecomputeHandle, optional
+        Keyword-only, default ``None`` (unchanged behavior).  A handle (``flashinfer.cake_kda_det_train_kcp.CakeKDADetKcpRecomputeHandle``
         or any object with an ``entries`` dict, such as the convolution's handle of the same layer) makes the
         ``torch.utils.checkpoint`` recompute of this call run without the forward state exchange: the original
         forward exchanges as always and stores its incoming states (the saved set's own tensors, key ``"kda"``) in
@@ -329,25 +393,25 @@ def chunk_kda_det_kcp(
         ``save_transfer=False`` (bitwise the default form; the backward re-sends the maps).  ``"transfer"``: it also
         keeps the owner's c1 receive tensor (``save_transfer=True``; not with ``exchange="ring"``).  An explicit
         ``save_transfer`` must agree with the tier (``"states"`` -> ``False``, ``"transfer"`` -> ``True``); a
-        contradicting value raises ``ValueError``.  The retained bytes are ``kda_det_saved_bytes_kcp(ctx, H=...,
+        contradicting value raises ``ValueError``.  The retained bytes are ``cake_kda_det_train_kcp_saved_bytes(ctx, H=...,
         checkpoint_keep=..., with_conv=False)``.
     use_qk_l2norm_in_kernel : bool
-        Keyword-only, default ``False``.  As for :func:`chunk_kda_det_fwd_kcp`; the gradients go to the raw ``q`` /
+        Keyword-only, default ``False``.  As for :func:`cake_kda_det_train_kcp_forward`; the gradients go to the raw ``q`` /
         ``k``, and a recompute handle's fingerprint records the mode (its entry does not change: the recompute
         writes its rstd afresh).
     **options
-        As for :func:`chunk_kda_det_fwd_kcp`, the raw gate keywords included: in raw gate mode the gradients go to
+        As for :func:`cake_kda_det_train_kcp_forward`, the raw gate keywords included: in raw gate mode the gradients go to
         the raw gate (BF16), ``A_log`` and ``dt_bias`` (FP32; this rank's partial sums, see
-        :func:`chunk_kda_det_bwd_kcp`), and a recompute handle's entry records the mode and ``lower_bound``.
+        :func:`cake_kda_det_train_kcp_backward`), and a recompute handle's entry records the mode and ``lower_bound``.
 
     Returns
     -------
     torch.Tensor
         BF16 ``out`` like ``v`` (this rank's tokens).
     """
-    from .experimental.cake_kda_det_train_kcp import cake_kcp
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp
 
-    return cake_kcp.chunk_kda_det_kcp(
+    return cake_kcp.cake_kda_det_kcp(
         q,
         k,
         v,
@@ -365,8 +429,8 @@ def chunk_kda_det_kcp(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def kda_det_workspace_bytes_kcp(
+@flashinfer_api
+def cake_kda_det_train_kcp_workspace_bytes(
     ctx: Any,
     *,
     H: int = 64,
@@ -379,9 +443,9 @@ def kda_det_workspace_bytes_kcp(
     use_gate_in_kernel: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> int:
-    """Bytes of this rank's KCP workspace for ``H`` heads: the local arena (that of :func:`~flashinfer.cake_kda_det_train.kda_det_train_workspace_bytes`
+    """Bytes of this rank's KCP workspace for ``H`` heads: the local arena (that of :func:`~flashinfer.cake_kda_det_train.cake_kda_det_train_workspace_bytes`
     for a backward workspace; a forward-only one takes the KCP forward layout, 2432 B per internal token-head) plus
-    the boundary pools of the context's collectives, as ``WorkspaceDetKcp`` allocates them (the backward's send pools
+    the boundary pools of the context's collectives, as ``CakeKDADetKcpWorkspace`` allocates them (the backward's send pools
     share the forward's storage; the ring exchange's hop pools, allocated by the first ``exchange="ring"`` call, are
     not counted).  The saved set and the convolution's halo rows are per-call tensors, so ``C`` does not change it,
     and ``save_transfer`` does not change a backward workspace.  A forward-only workspace (``backward=False``) has
@@ -391,20 +455,44 @@ def kda_det_workspace_bytes_kcp(
     it holds the first two.  Once a forward without a saved set has allocated the rest, it holds
     ``cake_kcp_plan.kcp_arena_layout(ctx, H=H, backward=False, save_transfer=save_transfer)["lazy"]`` bytes more.
     Under ``exchange="ring"`` it never holds the c1 receive pool.  ``ctx`` may be a list of contexts: the bytes of
-    one workspace that serves all of them (``WorkspaceDetKcp.reserve(ctxs, H)``): each pool at its largest need and
+    one workspace that serves all of them (``CakeKDADetKcpWorkspace.reserve(ctxs, H)``): each pool at its largest need and
     the largest local arena, not their sum.  ``local_arena`` / ``lean_passes`` are those of the workspace
-    (``WorkspaceDetKcp(local_arena="lean", lean_passes=...)``, opt-in: the backward's lean local arena, its tail in
+    (``CakeKDADetKcpWorkspace(local_arena="lean", lean_passes=...)``, opt-in: the backward's lean local arena, its tail in
     ``lean_passes`` passes, two by default, with its small tail-count table, on the head counts it serves);
     ``None`` keeps the arena above.  ``use_gate_in_kernel``: the workspace's gate mode
-    (``WorkspaceDetKcp(use_gate_in_kernel=True)``: the raw mode's local arena, the replay arena; the pools do not
+    (``CakeKDADetKcpWorkspace(use_gate_in_kernel=True)``: the raw mode's local arena, the replay arena; the pools do not
     change).  ``use_qk_l2norm_in_kernel``: the workspace's in-kernel Q / K L2 norm mode
-    (``WorkspaceDetKcp(use_qk_l2norm_in_kernel=True)``: the local arena of that mode, the replay arena; the pools do
-    not change)."""
-    from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
+    (``CakeKDADetKcpWorkspace(use_qk_l2norm_in_kernel=True)``: the local arena of that mode, the replay arena; the pools do
+    not change).
+
+    Parameters
+    ----------
+    ctx
+        This rank's context from :func:`cake_kda_det_train_kcp_build_context`.
+    H : int, default=64
+        Number of KDA heads.
+    save_mode : str
+        Local saved-set mode of the call, ``"light"`` by default.
+    backward : bool
+        Size a backward-capable workspace when ``True``; otherwise size a forward-only workspace.
+    save_transfer : bool, optional
+        Whether to retain forward transfer buffers; default resolution is described above.
+    C : int
+        Convolution channel count for halo rows; does not change workspace bytes.
+    local_arena : str, optional
+        Local arena mode; ``"lean"`` opts into the lower-memory backward arena.
+    lean_passes : int, optional
+        Tail passes of the lean local arena; ``None`` uses its default.
+    use_gate_in_kernel : bool
+        Raw-gate mode of the call and its workspace.
+    use_qk_l2norm_in_kernel : bool
+        In-kernel query/key normalization mode of the call and its workspace.
+    """
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp_plan
 
     if save_transfer is None:
         save_transfer = cake_kcp_plan.SAVE_TRANSFER_DEFAULT
-    return cake_kcp_plan.kda_det_workspace_bytes_kcp(
+    return cake_kcp_plan.cake_kda_det_train_kcp_workspace_bytes(
         ctx,
         H=H,
         save_mode=save_mode,
@@ -418,22 +506,34 @@ def kda_det_workspace_bytes_kcp(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def reduce_gate_param_grads_det_kcp(
+@flashinfer_api
+def cake_kda_det_train_kcp_reduce_gate_param_grads(
     ctx: Any, dA_log: torch.Tensor, ddt_bias: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The raw gate mode's full ``(dA_log, ddt_bias)`` from every rank's partial sums (:func:`chunk_kda_det_bwd_kcp`),
+    """The raw gate mode's full ``(dA_log, ddt_bias)`` from every rank's partial sums (:func:`cake_kda_det_train_kcp_backward`),
     bitwise reproducible: one all-gather on ``ctx.group``, then an FP32 sum in rank order on every rank, so every
     rank gets the same bits under every schedule.  An NCCL all-reduce gives the same sum to FP32 rounding but does
     not fix its summation order.  A collective: every rank of ``ctx.group`` calls it.  With ``world_size == 1``
-    copies of the inputs; with ``world_size > 1`` and no initialized process group it raises ``RuntimeError``."""
-    from .experimental.cake_kda_det_train_kcp import cake_kcp
+    copies of the inputs; with ``world_size > 1`` and no initialized process group it raises ``RuntimeError``.
 
-    return cake_kcp.reduce_gate_param_grads_det_kcp(ctx, dA_log, ddt_bias)
+    Parameters
+    ----------
+    ctx
+        This rank's KCP context; every rank of ``ctx.group`` must call the collective.
+    dA_log : torch.Tensor
+        This rank's FP32 partial gradient of ``A_log`` from the KCP backward.
+    ddt_bias : torch.Tensor
+        This rank's FP32 partial gradient of ``dt_bias`` from the KCP backward.
+    """
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp
+
+    return cake_kcp.cake_kda_det_train_kcp_reduce_gate_param_grads(
+        ctx, dA_log, ddt_bias
+    )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def kda_det_saved_bytes_kcp(
+@flashinfer_api
+def cake_kda_det_train_kcp_saved_bytes(
     ctx: Any,
     *,
     H: int = 64,
@@ -445,20 +545,42 @@ def kda_det_saved_bytes_kcp(
     use_qk_l2norm_in_kernel: bool = False,
     use_gate_in_kernel: bool = False,
 ) -> int:
-    """Bytes of this rank's KCP saved set for ``H`` heads: the local saved set (:func:`~flashinfer.cake_kda_det_train.kda_det_train_saved_bytes`), the
+    """Bytes of this rank's KCP saved set for ``H`` heads: the local saved set (:func:`~flashinfer.cake_kda_det_train.cake_kda_det_train_saved_bytes`), the
     boundary states, and (``with_conv``) the convolution's history rows of ``C`` channels.  ``checkpoint_keep``
     (``"states"`` | ``"transfer"``): instead the bytes a recompute handle of that tier retains for the layer
-    (:func:`chunk_kda_det_kcp`; plus one convolution's history rows with ``with_conv``).  ``save_transfer``: ``None``
+    (:func:`cake_kda_det_kcp`; plus one convolution's history rows with ``with_conv``).  ``save_transfer``: ``None``
     is ``False`` without a tier; with one, an explicit value that contradicts it raises ``ValueError``.
     ``use_qk_l2norm_in_kernel``: the saved set of the in-kernel Q / K L2 norm adds its FP32 rstd, ``8 * S_local * H``
     bytes (a recompute handle's bytes do not change).  ``use_gate_in_kernel``: the call's gate mode; the bytes do not
     depend on it, but with ``use_qk_l2norm_in_kernel=True`` the query raises ``NotImplementedError`` while the
-    in-kernel Q / K L2 norm is not available in that gate mode, as the call does."""
-    from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
+    in-kernel Q / K L2 norm is not available in that gate mode, as the call does.
+
+    Parameters
+    ----------
+    ctx
+        This rank's context from :func:`cake_kda_det_train_kcp_build_context`.
+    H : int, default=64
+        Number of KDA heads.
+    save_mode : str
+        Local saved-set mode of the call, ``"light"`` by default.
+    save_transfer : bool, optional
+        Whether to retain forward transfer buffers; default resolution is described above.
+    with_conv : bool
+        Include the convolution history rows when ``True``.
+    C : int
+        Convolution channel count used to size halo rows.
+    checkpoint_keep : str, optional
+        Recompute-handle tier, ``"states"`` or ``"transfer"``; ``None`` queries the ordinary call.
+    use_qk_l2norm_in_kernel : bool
+        In-kernel query/key normalization mode of the call and its workspace.
+    use_gate_in_kernel : bool
+        Raw-gate mode of the call and its workspace.
+    """
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp_plan
 
     if save_transfer is None and checkpoint_keep is None:
         save_transfer = False
-    return cake_kcp_plan.kda_det_saved_bytes_kcp(
+    return cake_kcp_plan.cake_kda_det_train_kcp_saved_bytes(
         ctx,
         H=H,
         save_mode=save_mode,
@@ -471,8 +593,8 @@ def kda_det_saved_bytes_kcp(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def kda_det_comm_bytes_kcp(
+@flashinfer_api
+def cake_kda_det_train_kcp_comm_bytes(
     ctx: Any,
     *,
     H: int = 64,
@@ -483,14 +605,30 @@ def kda_det_comm_bytes_kcp(
 ) -> dict:
     """Bytes this rank sends and receives in one training step (forward and backward) for ``H`` heads and ``C``
     convolution channels: the state summaries, the boundary states and the halo rows of the context's collectives,
-    as a table per collective and per boundary (``cake_kcp_plan.kda_det_comm_bytes_kcp``).  ``checkpoint_keep``: the
+    as a table per collective and per boundary (``cake_kcp_plan.cake_kda_det_train_kcp_comm_bytes``).  ``checkpoint_keep``: the
     traffic of a checkpointed step with a recompute handle of that tier (the tier fixes ``save_transfer``; ``None``
-    is ``False`` without a tier; an explicit value that contradicts the tier raises ``ValueError``)."""
-    from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
+    is ``False`` without a tier; an explicit value that contradicts the tier raises ``ValueError``).
+
+    Parameters
+    ----------
+    ctx
+        This rank's context from :func:`cake_kda_det_train_kcp_build_context`.
+    H : int, default=64
+        Number of KDA heads.
+    C : int
+        Convolution channel count used to size halo rows.
+    save_transfer : bool, optional
+        Whether to retain forward transfer buffers; default resolution is described above.
+    boundary_mode : str
+        Boundary-state mode of the call, ``"saved"`` by default.
+    checkpoint_keep : str, optional
+        Recompute-handle tier, ``"states"`` or ``"transfer"``; ``None`` queries the ordinary call.
+    """
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp_plan
 
     if save_transfer is None and checkpoint_keep is None:
         save_transfer = False
-    return cake_kcp_plan.kda_det_comm_bytes_kcp(
+    return cake_kcp_plan.cake_kda_det_train_kcp_comm_bytes(
         ctx,
         H=H,
         C=C,
@@ -503,12 +641,12 @@ def kda_det_comm_bytes_kcp(
 # The types of the route, resolved on first access so that importing this module imports neither the KCP host
 # module (torch.distributed, the KCP loader) nor the plan: public name -> the submodule that defines it.
 _LAZY_TYPES = {
-    "ContextDetKcp": "cake_kcp_plan",
-    "OptionsDetKcp": "cake_kcp",
-    "PartitionDetKcp": "cake_kcp_plan",
-    "RecomputeHandleDetKcp": "cake_kcp",
-    "SavedDetKcp": "cake_kcp",
-    "WorkspaceDetKcp": "cake_kcp",
+    "CakeKDADetKcpContext": "cake_kcp_plan",
+    "CakeKDADetKcpOptions": "cake_kcp",
+    "CakeKDADetKcpPartition": "cake_kcp_plan",
+    "CakeKDADetKcpRecomputeHandle": "cake_kcp",
+    "CakeKDADetKcpSaved": "cake_kcp",
+    "CakeKDADetKcpWorkspace": "cake_kcp",
 }
 
 
@@ -519,7 +657,9 @@ def __getattr__(name: str) -> Any:
     from importlib import import_module  # noqa: PLC0415
 
     return getattr(
-        import_module(f"flashinfer.experimental.cake_kda_det_train_kcp.{submodule}"),
+        import_module(
+            f"flashinfer.experimental.cake.cake_kda_det_train_kcp.{submodule}"
+        ),
         name,
     )
 
@@ -530,19 +670,19 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "DEFAULT_SCALE",
-    "ContextDetKcp",  # noqa: F822 - resolved by __getattr__
-    "OptionsDetKcp",  # noqa: F822
-    "PartitionDetKcp",  # noqa: F822
-    "RecomputeHandleDetKcp",  # noqa: F822
-    "SavedDetKcp",  # noqa: F822
-    "WorkspaceDetKcp",  # noqa: F822
-    "build_context_det_kcp",
-    "chunk_kda_det_bwd_kcp",
-    "chunk_kda_det_fwd_kcp",
-    "chunk_kda_det_kcp",
-    "kda_det_comm_bytes_kcp",
-    "kda_det_saved_bytes_kcp",
-    "kda_det_workspace_bytes_kcp",
-    "partition_det_kcp",
-    "reduce_gate_param_grads_det_kcp",
+    "CakeKDADetKcpContext",  # noqa: F822 - resolved by __getattr__
+    "CakeKDADetKcpOptions",  # noqa: F822
+    "CakeKDADetKcpPartition",  # noqa: F822
+    "CakeKDADetKcpRecomputeHandle",  # noqa: F822
+    "CakeKDADetKcpSaved",  # noqa: F822
+    "CakeKDADetKcpWorkspace",  # noqa: F822
+    "cake_kda_det_kcp",
+    "cake_kda_det_train_kcp_backward",
+    "cake_kda_det_train_kcp_build_context",
+    "cake_kda_det_train_kcp_comm_bytes",
+    "cake_kda_det_train_kcp_forward",
+    "cake_kda_det_train_kcp_partition",
+    "cake_kda_det_train_kcp_reduce_gate_param_grads",
+    "cake_kda_det_train_kcp_saved_bytes",
+    "cake_kda_det_train_kcp_workspace_bytes",
 ]

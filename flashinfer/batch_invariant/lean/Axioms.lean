@@ -1,3 +1,5 @@
+-- Copyright (c) 2026 by FlashInfer team.
+-- SPDX-License-Identifier: Apache-2.0
 import Lean
 import BIKernels
 /-! `lake exe axioms`: the enforced axiom policy of the library.
@@ -17,11 +19,13 @@ open Lean
 
 def standardAxioms : List Name := [``propext, ``Classical.choice, ``Quot.sound]
 def decidedAxiom : Name := ``Lean.ofReduceBool
-/-- The named `native_decide` theorems: the exhaustive checks over the generator's configuration space and the
-dispatcher's picks (hundreds of records, beyond what kernel `decide` evaluates in reasonable time). -/
+/-- The named `native_decide` theorems: the exhaustive checks over the generators' configuration spaces and the GEMM
+dispatcher's picks (hundreds of records, beyond what kernel `decide` evaluates in reasonable time), the attention spec cases
+(terms of tens of kilobytes) and the attention class-separation theorems. -/
 def decidedTheorems : List Name :=
   [``BIK.gemm_space_ok, ``BIK.gemm_space_c4_ok, ``BIK.gemm_space_c4_cta_twins, ``BIK.gemm_dispatch_in_space,
    ``BIK.gemm_fp8_space_ok, ``BIK.gemm_fp8_space_c4_ok, ``BIK.gemm_fp8_space_c4_cta_twins, ``BIK.gemm_fp8_dispatch_in_space,
+   ``BIK.gemm_fp8bs_space_ok, ``BIK.gemm_fp8bs_dispatch_in_space,
    ``BIK.gemm_mx8_space_ok, ``BIK.gemm_mx8_space_c4_ok, ``BIK.gemm_mx8_space_c4_cta_twins, ``BIK.gemm_mx8_dispatch_in_space,
    ``BIK.gemm_mx8_space_decode_ok, ``BIK.gemm_mx8_space_c2_ok,
    ``BIK.gemm_mx8k64_space_ok, ``BIK.gemm_mx8k64_space_c4_ok, ``BIK.gemm_mx8k64_space_c4_cta_twins, ``BIK.gemm_mx8k64_dispatch_in_space,
@@ -33,7 +37,8 @@ def decidedTheorems : List Name :=
    ``BIK.gemm_mx4_space_ok, ``BIK.gemm_mx4_space_c4_ok, ``BIK.gemm_mx4_space_c4_cta_twins, ``BIK.gemm_mx4_dispatch_in_space,
    ``BIK.gemm_mx4_space_decode_ok, ``BIK.gemm_mx4_space_c2_ok,
    ``BIK.gemm_mx4k128_space_ok, ``BIK.gemm_mx4k128_space_c4_ok, ``BIK.gemm_mx4k128_space_c4_cta_twins, ``BIK.gemm_mx4k128_dispatch_in_space,
-   ``BIK.gemm_mx4k128_space_decode_ok, ``BIK.gemm_mx4k128_space_c2_ok]
+   ``BIK.gemm_mx4k128_space_decode_ok, ``BIK.gemm_mx4k128_space_c2_ok,
+   ``BIK.attn_a0_spec, ``BIK.attn_a1_spec, ``BIK.attn_a2_spec, ``BIK.attn_a3_spec, ``BIK.attn_a4_spec, ``BIK.attn_a5_spec, ``BIK.attn_a6_spec, ``BIK.attn_a7_spec, ``BIK.attn_a8_spec, ``BIK.attn_a9_spec, ``BIK.attn_space_d64_size, ``BIK.attn_space_d64_ok, ``BIK.attn_space_d128_size, ``BIK.attn_space_d128_ok, ``BIK.attn_space_d256_size, ``BIK.attn_space_d256_ok, ``BIK.Attn.output_depends_on_C, ``BIK.Attn.output_depends_on_D, ``BIK.Attn.output_depends_on_D_64]
 def moduleOf (env : Environment) (n : Name) : Option Name :=
   match env.getModuleIdxFor? n with
   | some idx => env.header.moduleNames[idx.toNat]?

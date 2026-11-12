@@ -53,7 +53,7 @@ from flashinfer.msa_ops import (  # noqa: E402
     prepare_msa_nvfp4_sparse_decode,
 )
 from flashinfer.testing import bench_gpu_time_with_cupti  # noqa: E402
-from tests.test_helpers.cake_msa_nvfp4_inputs import (  # noqa: E402
+from tests.experimental.test_helpers.cake_msa_nvfp4_inputs import (  # noqa: E402
     build_decode_inputs,
     upstream_route_kwargs,
 )

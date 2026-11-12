@@ -10,14 +10,13 @@ stable API; its backend package,
 imported on first use.
 
 The mode is part of every name, and no entry takes a ``deterministic``
-keyword.  The forward is fixed-order.  The backward adds the dQ partials (and
-the row-map dK / dV adds) with atomic FP32 reductions, so its gradients are not
-bitwise reproducible run to run.  Under
-``torch.use_deterministic_algorithms(True)`` the backward raises PyTorch's
-alert after its checks and before it allocates or launches anything; with
-``warn_only=True`` it warns and runs.  It never falls back to a deterministic
-implementation.  The deterministic package ``flashinfer.cake_gqa_det_train`` is
-planned.
+keyword.  Every sum of the forward and the backward has one fixed order: the
+backward stores dS^T into a workspace chunk sized by the workspace's
+``budget_bytes`` (default 16 GiB), sums dK and dV in tensor memory, computes
+dQ as a GEMM over the workspace and folds row-map destinations in window
+order.  ``out``, ``lse``, dQ and every dK / dV form therefore repeat bit for
+bit run to run for one shape, one ``max_seqlen_k`` and one budget, and
+nothing raises PyTorch's determinism alert.
 
 ``cake_gqa_nondet`` is the autograd entry (its Function is
 ``CakeGQANondetFunction``); the forward and backward halves, the workspace and

@@ -22,7 +22,7 @@ from flashinfer.gdn2_prefill import chunk_gated_delta_rule2
 from flashinfer.gdp_prefill import chunk_gated_delta_product
 from flashinfer.trace.templates.gdn2 import gdn2_prefill_trace
 from flashinfer.trace.templates.gdp import gdp_prefill_trace
-from tests.test_helpers.cudnn_linear_attention import (
+from tests.gdn.test_helpers.cudnn_linear_attention import (
     serial_delta_product,
     serial_delta_rule2,
 )

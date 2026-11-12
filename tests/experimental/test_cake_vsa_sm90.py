@@ -21,7 +21,7 @@ BF16 stages on the same planner bytes, plus the two quantizer stages) and the gr
 checked against the MHA route on replicated inputs -- bit for bit on the static programs).
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 ``flashinfer.cake_vsa_sm90`` facade and the ``flashinfer.sparse`` wrapper
@@ -39,7 +39,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_vsa_sm90")
 cake_build = cake_package("cake_vsa_sm90", "cake_build")

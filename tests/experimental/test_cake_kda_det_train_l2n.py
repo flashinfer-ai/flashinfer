@@ -27,10 +27,10 @@ import types
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
-cake_backend = cake_package("cake_kda_det_train", "cake_backend")
-cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+cake_backend = cake_package("cake.cake_kda_det_train", "cake_backend")
+cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
 
 D = cake_backend.D
 CPU = torch.device("cpu")
@@ -154,7 +154,7 @@ def test_l2n_modes_are_the_registrys() -> None:
 
 def _saved(S: int, H: int, **fields):
     a = torch.zeros(S, H, 64, dtype=torch.bfloat16)
-    return cake_backend.KdaDetChunkSaved(
+    return cake_backend.CakeKDADetChunkSaved(
         cake_backend.SAVED_VERSION, a, a, None, S, H, 1, cake_backend.SCALE, **fields
     )
 
@@ -162,7 +162,7 @@ def _saved(S: int, H: int, **fields):
 def test_saved_set_fields_and_their_checks() -> None:
     S, H = 3, 2
     fields = {
-        f.name: f.default for f in dataclasses.fields(cake_backend.KdaDetChunkSaved)
+        f.name: f.default for f in dataclasses.fields(cake_backend.CakeKDADetChunkSaved)
     }
     assert fields["qk_rstd"] is None and fields["qk_l2norm"] is False
     for version in (cake_backend.SAVED_VERSION, cake_backend.SAVED_VERSION_TAPE):
@@ -320,7 +320,7 @@ def test_saved_set_backward_keeps_qn_kn_in_the_arena(arch: str) -> None:
                     arch=arch,
                     gate=gate,
                     l2n=mode,
-                    arena=cake_backend.KdaDetArena(lean=True),
+                    arena=cake_backend.CakeKDADetArena(lean=True),
                 )
                 assert lean_report["bwd_qn_kn"] == rows * S * H
         # 64 tokens in 8 documents: R = 640 internal rows > 2 S, dv2 does not fit the dq / dk bytes
@@ -506,7 +506,7 @@ def test_autograd_node_returns_one_gradient_slot_per_input(
     import inspect
 
     n_inputs = (
-        len(inspect.signature(cake_backend.ChunkKDADetFunction.forward).parameters) - 1
+        len(inspect.signature(cake_backend.CakeKDADetFunction.forward).parameters) - 1
     )
     seen = {}
 
@@ -514,7 +514,7 @@ def test_autograd_node_returns_one_gradient_slot_per_input(
         seen.update(kwargs)
         return tuple(torch.zeros(1) for _ in range(5))
 
-    monkeypatch.setattr(cake_backend, "chunk_kda_det_bwd", fake_bwd)
+    monkeypatch.setattr(cake_backend, "cake_kda_det_train_backward", fake_bwd)
     t = torch.zeros(1)
     ctx = types.SimpleNamespace(
         saved_tensors=(
@@ -540,7 +540,7 @@ def test_autograd_node_returns_one_gradient_slot_per_input(
         extra_fields=("qk_rstd",),
         problem=(1, 1, 1),
     )
-    grads = cake_backend.ChunkKDADetFunction.backward(ctx, torch.zeros(1))
+    grads = cake_backend.CakeKDADetFunction.backward(ctx, torch.zeros(1))
     assert len(grads) == n_inputs
     assert seen["use_qk_l2norm_in_kernel"] is True
     assert seen["saved"].qk_l2norm is True and seen["saved"].qk_rstd is t
@@ -582,7 +582,9 @@ def _bits(x: torch.Tensor) -> torch.Tensor:
 
 
 def test_kda_reference_is_bitwise_the_shared_gdn_reference() -> None:
-    from tests.test_helpers import cake_kda_det_train_reference_l2n as kda_l2n
+    from tests.experimental.test_helpers import (
+        cake_kda_det_train_reference_l2n as kda_l2n,
+    )
 
     gdn = _cake_l2n()
     assert not gdn.flush_denormal_active()
@@ -613,7 +615,9 @@ def test_kda_reference_is_bitwise_the_shared_gdn_reference() -> None:
 def test_kda_reference_normalizes_and_pulls_back_like_fp64() -> None:
     """The device-order FP32 reference is within a few FP32 ulps of the FP64 normalization and its exact pullback
     (a guard against an order that is bitwise equal to a wrong formula)."""
-    from tests.test_helpers import cake_kda_det_train_reference_l2n as kda_l2n
+    from tests.experimental.test_helpers import (
+        cake_kda_det_train_reference_l2n as kda_l2n,
+    )
 
     g = torch.Generator().manual_seed(1)
     x = (torch.randn(256, 2, D, generator=g) * 3).to(torch.bfloat16)
@@ -702,14 +706,14 @@ def test_fallback_replay_counts_no_qk_apply(arch: str) -> None:
 # ---------------------------------------------------------------------------------------------------------------
 # device rows (skip without an exported device or without the l2n records of its architecture)
 
-from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
     LOWER_BOUND,
     elementwise_gate,
     error_metrics,
     make_inputs,
     make_raw_inputs,
 )
-from tests.test_helpers import cake_kda_det_train_reference_l2n as ref_l2n  # noqa: E402
+from tests.experimental.test_helpers import cake_kda_det_train_reference_l2n as ref_l2n  # noqa: E402
 
 ATOL = RTOL = (
     1e-2  # the package's declared elementwise gate (test_cake_kda_det_train.py)
@@ -778,7 +782,7 @@ def _g(inputs: dict, raw_gate: bool) -> torch.Tensor:
 
 def _fwd(inputs, raw_gate=False, **kwargs):
     i = inputs
-    return cake_backend.chunk_kda_det_fwd(
+    return cake_backend.cake_kda_det_train_forward(
         i["q"],
         i["k"],
         i["v"],
@@ -793,7 +797,7 @@ def _fwd(inputs, raw_gate=False, **kwargs):
 
 def _bwd(inputs, saved, raw_gate=False, **kwargs):
     i = inputs
-    return cake_backend.chunk_kda_det_bwd(
+    return cake_backend.cake_kda_det_train_backward(
         i["q"],
         i["k"],
         i["v"],
@@ -987,7 +991,7 @@ def test_l2n_checkpoint_recompute_is_bitwise_the_first_forward(
         leaves = [inputs[n].detach().clone().requires_grad_(True) for n in names]
 
         def f(*xs):
-            return cake_backend.chunk_kda_det(
+            return cake_backend.cake_kda_det(
                 *xs, inputs["cu_seqlens"], use_qk_l2norm_in_kernel=True
             )
 
@@ -1053,7 +1057,7 @@ def test_l2n_fused_equals_the_fallback_route(shape) -> None:
     lengths, H = shape
     inputs = _l2n_inputs(lengths, H, device)
     S, N = sum(lengths), len(lengths)
-    ws = cake_backend.KdaDetWorkspace.for_problem(S, N, H, device, l2n="fallback")
+    ws = cake_backend.CakeKDADetWorkspace.for_problem(S, N, H, device, l2n="fallback")
     assert ws.l2n == "fallback" and ws.plan.dispatched("qk_pullback", "light")
     out_a, saved_a = _fwd(inputs)
     out_b, saved_b = _fwd(inputs, workspace=ws)
@@ -1085,7 +1089,7 @@ def test_l2n_fallback_launch_counts_are_the_launches(shape) -> None:
         launched.append(name)
         cake_jit.run_module(name, values, grid=grid, device_index=device_index)
 
-    ws = cake_backend.KdaDetWorkspace.for_problem(
+    ws = cake_backend.CakeKDADetWorkspace.for_problem(
         S, N, H, device, launcher=recording, l2n="fallback"
     )
     p = ws.plan
@@ -1120,17 +1124,17 @@ def test_l2n_saved_set_backward_allocates_what_the_flag_off_backward_does(
     lengths, H = (4000, 96), 32
     S, N = sum(lengths), len(lengths)
     inputs = _l2n_inputs(lengths, H, device, raw_gate=raw_gate)
-    ws_on = cake_backend.KdaDetWorkspace.for_problem(
+    ws_on = cake_backend.CakeKDADetWorkspace.for_problem(
         S, N, H, device, save_mode=save_mode, gate=gate, l2n=mode
     )
-    ws_off = cake_backend.KdaDetWorkspace.for_problem(
+    ws_off = cake_backend.CakeKDADetWorkspace.for_problem(
         S, N, H, device, save_mode=save_mode, gate=gate
     )
     i = inputs
     qn = ref_l2n.qk_l2norm(i["q"].cpu())[0].to(device)
     kn = ref_l2n.qk_l2norm(i["k"].cpu())[0].to(device)
     _, saved_on = _fwd(inputs, raw_gate, workspace=ws_on)
-    _, saved_off = cake_backend.chunk_kda_det_fwd(
+    _, saved_off = cake_backend.cake_kda_det_train_forward(
         qn,
         kn,
         i["v"],
@@ -1152,7 +1156,7 @@ def test_l2n_saved_set_backward_allocates_what_the_flag_off_backward_does(
 
     peak_on = peak(lambda: _bwd(inputs, saved_on, raw_gate, workspace=ws_on))
     peak_off = peak(
-        lambda: cake_backend.chunk_kda_det_bwd(
+        lambda: cake_backend.cake_kda_det_train_backward(
             qn,
             kn,
             i["v"],
@@ -1194,7 +1198,7 @@ def test_l2n_fallback_route_matches_the_exact_reference(
     lengths, H = shape
     inputs = _l2n_inputs(lengths, H, device, raw_gate=raw_gate)
     S, N = sum(lengths), len(lengths)
-    ws = cake_backend.KdaDetWorkspace.for_problem(
+    ws = cake_backend.CakeKDADetWorkspace.for_problem(
         S, N, H, device, gate="raw" if raw_gate else "g", l2n="fallback"
     )
     assert ws.l2n == "fallback" and ws.plan.dispatched("qk_pullback", "light")
@@ -1267,7 +1271,7 @@ def test_l2n_refusals_on_device() -> None:
     i = inputs
     out, saved = _fwd(inputs)
     with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel"):
-        cake_backend.chunk_kda_det_bwd(
+        cake_backend.cake_kda_det_train_backward(
             i["q"].contiguous(),
             i["k"].contiguous(),
             i["v"],
@@ -1277,7 +1281,7 @@ def test_l2n_refusals_on_device() -> None:
             i["dout"],
             saved=saved,
         )
-    ws_off = cake_backend.KdaDetWorkspace.for_problem(sum(lengths), 2, H, device)
+    ws_off = cake_backend.CakeKDADetWorkspace.for_problem(sum(lengths), 2, H, device)
     with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel"):
         _fwd(inputs, workspace=ws_off)
     bad_q = torch.zeros(sum(lengths), H, 2 * D, dtype=torch.bfloat16, device=device)[
@@ -1318,9 +1322,9 @@ def test_l2n_batched_replay_reads_no_unwritten_row_of_the_next_group(
         return t
 
     monkeypatch.setattr(cake_backend, "_alloc", nan_alloc)
-    arena = cake_backend.KdaDetArena(batch_tokens=batch_tokens)
+    arena = cake_backend.CakeKDADetArena(batch_tokens=batch_tokens)
     for case in ("replay first", "replay after"):
-        ws = cake_backend.KdaDetWorkspace.for_problem(
+        ws = cake_backend.CakeKDADetWorkspace.for_problem(
             S, N, H, device, arena=arena, doc_lengths=lengths, gate=gate, l2n="fused"
         )
         ws.arena.fill_(0xFF)

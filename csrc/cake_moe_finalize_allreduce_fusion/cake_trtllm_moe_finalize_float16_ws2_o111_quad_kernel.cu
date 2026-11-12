@@ -121,7 +121,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws2_o111_quad(__half* __restrict__ allre
     long long control_address = workspace_tensor[6];
     int* control_0 = reinterpret_cast<int*>(control_address);
     int control_bytes_per_buffer_word = control_0[3];
-    long long comm_stride_elems = (long long)control_bytes_per_buffer_word / 2;
+    long long comm_stride_elems = (long long)control_bytes_per_buffer_word / 2ll;
     long long workspace_address = workspace_tensor[4 + rank];
     __half* workspace_local = reinterpret_cast<__half*>(workspace_address);
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -261,7 +261,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws2_o111_quad(__half* __restrict__ allre
             int top_k_opaque = top_k;
             asm("" : "+r"(top_k_opaque));
             {
-                long long expert_elem_0 = (long long)((route_index_qa < 0) ? 0 : route_index_qa) * 7168 + (long long)(cluster_thread * 8);
+                long long expert_elem_0 = (long long)((route_index_qa < 0) ? 0 : route_index_qa) * 7168ll + (long long)(cluster_thread * 8);
                 unsigned int row_words_0[4] = {0};
                 asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.s32 p, %5, 0;\n\t@p ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];\n\t}" : "+r"(row_words_0[0 + 0]), "+r"(row_words_0[0 + 1]), "+r"(row_words_0[0 + 2]), "+r"(row_words_0[0 + 3]) : "l"(allreduce_in + expert_elem_0 + 0), "r"((int)(top_k_opaque > route_base)));
                 #pragma unroll
@@ -278,7 +278,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws2_o111_quad(__half* __restrict__ allre
                 route_scales[0] = row_scale_0[0];
             }
             {
-                long long expert_elem_1 = (long long)((route_index_qb < 0) ? 0 : route_index_qb) * 7168 + (long long)(cluster_thread * 8);
+                long long expert_elem_1 = (long long)((route_index_qb < 0) ? 0 : route_index_qb) * 7168ll + (long long)(cluster_thread * 8);
                 unsigned int row_words_1[4] = {0};
                 asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.s32 p, %5, 0;\n\t@p ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];\n\t}" : "+r"(row_words_1[0 + 0]), "+r"(row_words_1[0 + 1]), "+r"(row_words_1[0 + 2]), "+r"(row_words_1[0 + 3]) : "l"(allreduce_in + expert_elem_1 + 0), "r"((int)(top_k > route_base + 1)));
                 #pragma unroll
@@ -295,7 +295,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws2_o111_quad(__half* __restrict__ allre
                 route_scales[1] = row_scale_1[0];
             }
             {
-                long long expert_elem_2 = (long long)((route_index_qc < 0) ? 0 : route_index_qc) * 7168 + (long long)(cluster_thread * 8);
+                long long expert_elem_2 = (long long)((route_index_qc < 0) ? 0 : route_index_qc) * 7168ll + (long long)(cluster_thread * 8);
                 unsigned int row_words_2[4] = {0};
                 asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.s32 p, %5, 0;\n\t@p ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];\n\t}" : "+r"(row_words_2[0 + 0]), "+r"(row_words_2[0 + 1]), "+r"(row_words_2[0 + 2]), "+r"(row_words_2[0 + 3]) : "l"(allreduce_in + expert_elem_2 + 0), "r"((int)(top_k > route_base + 2)));
                 #pragma unroll
@@ -312,7 +312,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws2_o111_quad(__half* __restrict__ allre
                 route_scales[2] = row_scale_2[0];
             }
             {
-                long long expert_elem_3 = (long long)((route_index_qd < 0) ? 0 : route_index_qd) * 7168 + (long long)(cluster_thread * 8);
+                long long expert_elem_3 = (long long)((route_index_qd < 0) ? 0 : route_index_qd) * 7168ll + (long long)(cluster_thread * 8);
                 unsigned int row_words_3[4] = {0};
                 asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.s32 p, %5, 0;\n\t@p ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];\n\t}" : "+r"(row_words_3[0 + 0]), "+r"(row_words_3[0 + 1]), "+r"(row_words_3[0 + 2]), "+r"(row_words_3[0 + 3]) : "l"(allreduce_in + expert_elem_3 + 0), "r"((int)(top_k > route_base + 3)));
                 #pragma unroll
@@ -664,20 +664,20 @@ kernel_cake_trtllm_moe_finalize_float16_ws2_o111_quad(__half* __restrict__ allre
             scaled_f16_6[_lp] = *(uint32_t*)&_h2;
         }
         int access = token * 896 + cluster_thread;
-        long long slot = (long long)rank * (long long)total_access * 8 + (long long)access * 8;
+        long long slot = (long long)rank * (long long)total_access * 8ll + (long long)access * 8ll;
         asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer0 + slot), "r"((scaled_f16_6)[0]), "r"((scaled_f16_6)[1]), "r"((scaled_f16_6)[2]), "r"((scaled_f16_6)[3]) : "memory");
         asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer1 + slot), "r"((scaled_f16_6)[0]), "r"((scaled_f16_6)[1]), "r"((scaled_f16_6)[2]), "r"((scaled_f16_6)[3]) : "memory");
     }
     unsigned int clear_words[4];
     #pragma unroll
     for (int word = 0; word < 4; word++) {
-        clear_words[word] = 2147516416;
+        clear_words[word] = 2147516416ll;
     }
     long long clear_base = (long long)control_dirty * comm_stride_elems;
     #pragma unroll 4
     for (int clear_access = first_access; clear_access < control_clear_word / 8; clear_access += access_stride) {
         {
-            auto _gst_5 = workspace_local + (clear_base + (long long)clear_access * 8);
+            auto _gst_5 = workspace_local + (clear_base + (long long)clear_access * 8ll);
             __builtin_assume(__isGlobal(_gst_5));
             reinterpret_cast<int4*>(_gst_5)[0] = reinterpret_cast<int4*>(clear_words)[0];
         }
