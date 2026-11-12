@@ -1044,8 +1044,14 @@ __global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
   int64_t const vecBegin = blockIdx.y * stepsPerSlice * vecsPerStep;
   int64_t const vecEnd = min(numVecs, vecBegin + stepsPerSlice * vecsPerStep);
 
-  // The permutation and the expert weights come from routing, which completed before the GEMMs
-  // this kernel depends on could start, so they are read before waiting on the primary kernel.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // Wait on the primary kernel before reading anything another kernel wrote, including the
+  // permutation and expert weights below.
+  if constexpr (KernelParams::UsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+
   int permutedIdx = -1;
   float scale = 0.f;
   if (lane < params.topK) {
@@ -1056,13 +1062,6 @@ __global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
                 : 1.f;
   }
   unsigned const localMask = __ballot_sync(FullMask, permutedIdx != -1);
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  if constexpr (KernelParams::UsePdl) {
-    cudaGridDependencySynchronize();
-  }
-#endif
-
   auto* outVecPtr = reinterpret_cast<VecElem*>(params.outPtr + tokenIdx * params.hiddenDim);
   // Warp-uniform bound: every lane takes part in the shuffles below, and the lanes past the end of
   // the slice skip their loads and stores.
