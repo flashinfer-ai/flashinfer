@@ -4072,20 +4072,16 @@ def _finalize_static_decode_config(
             else max(2, fitting_stages - fitting_stages % 2),
             explicit_fields,
         )
-    if cfg.uses_dual_smem_transform:
-        # Two FP8 slots per ring hold one D256 tile's two head-dim stages.
-        # Eight raw stages (two tiles per K and V ring) keep enough K/V in
-        # flight; fewer measured 1.25x slower at B128/sQ8 on GB300.
+    if cfg.uses_second_smem_converter:
+        # Keeps uses one Q stage and two FP8 slots per converter ring.
+        # Eight raw stages keep K/V loads ahead of conversion.
         _set_if_implicit(cfg, "q_stages", 1, explicit_fields)
         _set_if_implicit(cfg, "kv_stages", 8, explicit_fields)
-        _set_if_implicit(cfg, "transformed_kv_stages", 2, explicit_fields)
-    if cfg.uses_per_inst_smem_transform:
-        # Eight dense raw stages keep enough K/V in flight; one Q stage and
-        # two FP8 slots per converter ring fit them in SMEM. A third slot
-        # would make each K wait on an earlier V release.
-        _set_if_implicit(cfg, "q_stages", 1, explicit_fields)
-        _set_if_implicit(cfg, "kv_stages", 8, explicit_fields)
-        _set_if_implicit(cfg, "transformed_kv_stages", 2, explicit_fields)
+        if (
+            "transformed_kv_stages" not in explicit_fields
+            or cfg.transformed_kv_stages == 0
+        ):
+            cfg.transformed_kv_stages = 2
     if cfg.uses_dual_kv_transform:
         # Stage one complete KV tile per operand: every head-dimension stage
         # of K and of V. Each converter then advances a whole tile without
@@ -4112,9 +4108,7 @@ def _finalize_static_decode_config(
         and cfg.transformed_kv_stages == 0
     ):
         # SMEM-backed mixed modes still need a real number of stages.
-        _set_if_implicit(
-            cfg, "transformed_kv_stages", min(cfg.kv_stages, 4), explicit_fields
-        )
+        cfg.transformed_kv_stages = min(cfg.kv_stages, 4)
 
     if (
         is_sm107_compile_target()
@@ -6018,6 +6012,7 @@ def _validate_profile_support(
     if use_keeps_mma_ab:
         if cfg.use_transform_kv and not (
             cfg.uses_second_smem_converter
+            and cfg.transform_kv1_num_warps == 4
             and tile_size_q == 64
             and cfg.transformed_kv_stages > 0
             and cfg.groups_tokens_heads_q
@@ -6026,7 +6021,7 @@ def _validate_profile_support(
             # wide-head groups keep the Swaps head bands.
             raise ValueError(
                 "KeepsMmaAb transform-KV supports only FP8 Q with NVFP4 K/V at "
-                "grouped Q64 with D128 per-instance or D256 K/V SMEM converters"
+                "grouped Q64 with four-warp D128 per-instance or D256 K/V SMEM converters"
             )
         if headdim not in (64, 128, 192, 256):
             raise ValueError(
@@ -6244,7 +6239,7 @@ def _validate_profile_support(
         and not cfg.use_attention_sinks
         and cfg.num_insts_kv == 1
         and not cfg.use_fp8_output
-        and cfg.tmem_stats_cols >= cfg.num_softmax_scale_groups * 2
+        and cfg.tmem_stats_cols >= cfg.softmax_stats_payload_groups * 2
         and cfg.tmem_total_cols <= TMEM_MAX_ALLOCATION_COLUMNS
     ):
         raise ValueError(

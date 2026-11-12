@@ -1619,6 +1619,7 @@ def _plan_case(
     max_q_len: Optional[int] = None,
     kv_scale_factors=None,
     dynamic_kv: bool = True,
+    lse_mode: str = "none",
 ):
     wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
     seq_len_q = 1 if case.q.ndim == 3 else int(case.q.shape[1])
@@ -1648,6 +1649,7 @@ def _plan_case(
         window_left=case.window_left,
         max_q_len=seq_len_q if max_q_len is None else max_q_len,
         seq_lens_kv=seq_lens_kv,
+        lse_mode=lse_mode,
     )
 
     return wrapper
@@ -10217,6 +10219,64 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch):
         _resolve_decode_launch_spec.cache_clear()
 
 
+@pytest.mark.parametrize(
+    "head_dim,keeps,tile,overrides,error",
+    (
+        (128, True, 64, {"transformed_kv_stages": 0}, None),
+        (256, True, 64, {"transformed_kv_stages": 0}, None),
+        (128, True, 64, {"transformed_kv_stages": 3}, None),
+        (256, True, 64, {"transformed_kv_stages": 3}, None),
+        (128, True, 64, {"transform_kv1_num_warps": 2}, "KeepsMmaAb transform-KV"),
+        (256, True, 64, {"transform_kv1_num_warps": 2}, "KeepsMmaAb transform-KV"),
+        (128, False, 48, {"tmem_stats_cols": 24}, "sufficient TMEM"),
+        (128, False, 48, {"tmem_stats_cols": 31}, "sufficient TMEM"),
+        (128, False, 48, {"tmem_stats_cols": 32}, None),
+    ),
+)
+def test_attention_ts_decode_nvfp4_resource_overrides(
+    head_dim, keeps, tile, overrides, error
+):
+    """Explicit NVFP4 resources honor auto depth and reject incomplete coverage."""
+
+    def make_config():
+        return make_decode_config(
+            headdim=head_dim,
+            args={
+                "use_keeps_mma_ab": keeps,
+                "groups_tokens_heads_q": True,
+                "tile_size_q": tile,
+                "kv_stages": 4,
+                "use_persistent_scheduler": False,
+                **overrides,
+            },
+            seq_len_q=6 if tile == 48 else 8,
+            seq_len_kv=769,
+            batch_size=2,
+            num_heads_q=8,
+            num_heads_kv=1,
+            q_dtype=Float8E4M3FN,
+            k_dtype=Float4E2M1FN,
+            v_dtype=Float4E2M1FN,
+            o_dtype=BFloat16,
+            qkv_layout="pagedKv",
+            num_tokens_per_page=64,
+            mask_type="causal",
+            split_kv_mode="disabled",
+            auto_tuner=False,
+        )
+
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            make_config()
+    else:
+        cfg = make_config()
+        if "transformed_kv_stages" in overrides:
+            requested = overrides["transformed_kv_stages"]
+            assert cfg.transformed_kv_stages > 0
+            if requested:
+                assert cfg.transformed_kv_stages == requested
+
+
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize(
     "head_dim,tile_size_q,seq_len_q,seq_len_kv,heads_q_per_kv,output_dtype,split_kv_mode,page_size,use_keeps_mma_ab",
@@ -10360,8 +10420,38 @@ def test_attention_ts_decode_large_tile_size_q(
         q_tokens_per_cta=cfg.q_tokens_per_cta,
         mask_type="causal",
     )
-    wrapper = _plan_case(case, max_kv_len=seq_len_kv, kv_scale_factors=scale_factors)
+    check_lse = not cfg.use_split_kv and not use_keeps_mma_ab
+    wrapper = _plan_case(
+        case,
+        max_kv_len=seq_len_kv,
+        kv_scale_factors=scale_factors,
+        lse_mode="base2" if check_lse else "none",
+    )
     out = torch.empty_like(case.q, dtype=output_dtype)
+    lse = None
+    if check_lse:
+        from tests.attention.test_attention_ts_context import (
+            _softmax_statistics_reference,
+        )
+
+        lse = torch.full(case.q.shape[:-1], torch.nan, device="cuda")
+        k_cache = _dequantize_nvfp4_cache(case.k_cache, scale_factors[0], _FP8)
+        expected_lse = []
+        sinks = torch.full((heads_q_per_kv,), -torch.inf, device="cuda")
+        for batch in range(case.q.shape[0]):
+            length = int(case.seq_lens_kv[batch])
+            pages = case.block_tables[batch, : (length + page_size - 1) // page_size]
+            keys = k_cache[pages.long()].transpose(1, 2).reshape(-1, 1, head_dim)
+            keys = keys[:length]
+            _, stats = _softmax_statistics_reference(
+                case.q[batch],
+                keys,
+                torch.zeros_like(keys, dtype=torch.float32),
+                scale=case.softmax_scale,
+                sinks=sinks,
+            )
+            expected_lse.append(stats / math.log(2))
+        expected_lse = torch.stack(expected_lse)
 
     def run():
         return wrapper.run(
@@ -10373,18 +10463,25 @@ def test_attention_ts_decode_large_tile_size_q(
             output_scale=case.output_scale,
             kv_scale_factors=scale_factors,
             out=out,
+            lse=lse,
             validate=False,
         )
 
     run()
     _assert_case_correct(out, case)
+    if check_lse:
+        torch.testing.assert_close(lse, expected_lse, atol=0.015, rtol=0.002)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
     out.fill_(float("nan"))
+    if check_lse:
+        lse.fill_(torch.nan)
     graph.replay()
     torch.cuda.synchronize()
     _assert_case_correct(out, case)
+    if check_lse:
+        torch.testing.assert_close(lse, expected_lse, atol=0.015, rtol=0.002)
 
 
 @_REQUIRES_PRIMTS_GPU

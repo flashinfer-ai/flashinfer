@@ -3948,6 +3948,33 @@ class TmemCorrResource(DecodeGenResourceBase):
         )
         logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
         if cutlass.const_expr(not cfg.use_split_kv):
+            if cutlass.const_expr(cfg.lse_mode != "none"):
+                # Four lanes in warp zero own the logical rows represented by
+                # each scale pair; exclude padded queries before publishing LSE.
+                col_group_idx = thread_idx & Int32(3)
+                row_offset = _q_tile_output_row_base(cfg, logical_q_group_idx)
+                for scale_idx in cutlass.range_constexpr(cfg.num_softmax_scale_groups):
+                    row_in_tile = (
+                        Int32((scale_idx // 2) * 8)
+                        + col_group_idx * Int32(2)
+                        + Int32(scale_idx % 2)
+                    )
+                    self._final_row_weight(
+                        logical_h_k_idx,
+                        logical_b_idx,
+                        row_offset + row_in_tile,
+                        reduced_sum[scale_idx],
+                        final_max[scale_idx],
+                        warp_idx == Int32(0)
+                        and lane_idx < Int32(4)
+                        and _q_row_is_valid_for_seq(
+                            cfg,
+                            self.h_r,
+                            logical_q_group_idx,
+                            row_in_tile,
+                            self.seq_len_q,
+                        ),
+                    )
             return
         logical_kv_idx = logical_b_idx * self.num_heads_kv + logical_h_k_idx
         cta_idx_kv = _logical_cta_kv_idx(cfg, stage_info)
