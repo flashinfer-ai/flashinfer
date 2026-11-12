@@ -153,11 +153,24 @@ def _elig_args(device="cpu", T=4, **over):
 
 def test_allowlist_rejects_large_batches_and_flags():
     # CPU tensors: everything up to the device check must already reject
+    # the 17..255 gap (containing the measured FI-held T=64 class) rejects
     a = _elig_args(T=64)
     a["input"] = torch.zeros((64, H), dtype=torch.bfloat16)
     a["token_selected_experts"] = torch.zeros((64, K), dtype=torch.int32)
     a["token_final_scales"] = torch.zeros((64, K), dtype=torch.float32)
     assert "num_tokens=64" in _eligibility(**a)
+    # the expanded band [256, 4096] admits, interior points by interpolation
+    for t_in in (256, 512, 2048, 4096):
+        b = _elig_args(T=t_in)
+        b["input"] = torch.zeros((t_in, H), dtype=torch.bfloat16)
+        b["token_selected_experts"] = torch.zeros((t_in, K), dtype=torch.int32)
+        b["token_final_scales"] = torch.zeros((t_in, K), dtype=torch.float32)
+        assert _eligibility(**b) == "device cpu"  # passes every band guard
+    c = _elig_args(T=5000)
+    c["input"] = torch.zeros((5000, H), dtype=torch.bfloat16)
+    c["token_selected_experts"] = torch.zeros((5000, K), dtype=torch.int32)
+    c["token_final_scales"] = torch.zeros((5000, K), dtype=torch.float32)
+    assert "num_tokens=5000" in _eligibility(**c)
     assert "min_latency_mode" == _eligibility(
         **_elig_args(flags={"min_latency_mode": True})
     )
@@ -182,7 +195,7 @@ def test_stats_report_build_state_and_counters():
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("T", [1, 4, 16])
+@pytest.mark.parametrize("T", [1, 4, 16, 256, 1024, 2048])
 def test_specialized_matches_reference_and_stock(T, monkeypatch):
     _sm90_or_skip()
     device = torch.device("cuda:0")
@@ -210,6 +223,8 @@ def test_specialized_matches_reference_and_stock(T, monkeypatch):
 
 
 def test_above_envelope_takes_the_stock_path():
+    # T=64 sits in the excluded 17..255 gap: the measured class where the
+    # stock cutlass kernel held at contract
     _sm90_or_skip()
     device = torch.device("cuda:0")
     b = _make(64, device)

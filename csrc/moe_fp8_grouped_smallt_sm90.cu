@@ -448,15 +448,55 @@ void launch_moe_grouped(const void* X, const void* W13, const float* W13S,
 // capturable with a stable workspace pointer.
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// Byte layout of the caller-owned workspace. T < 256 uses only the fp16 fc1
+// intermediate of the small path; T >= 256 carries the grouped path's five
+// buffers at the measured entry point's exact sizes (16-byte-aligned
+// segments).
+struct MoeWsLayout {
+  size_t raw_off, hb_off, partial_off, ibuf_off, tasks_off, total;
+  int max_tasks;
+};
+
+inline size_t moe_align16(size_t x) { return (x + 15) & ~size_t(15); }
+
+MoeWsLayout moe_grouped_ws_layout(int64_t T, int64_t K, int64_t I, int64_t H,
+                                  int64_t E) {
+  MoeWsLayout L;
+  const int64_t pairs = T * K;
+  L.max_tasks = (int)(E + (pairs + 63) / 64);
+  L.raw_off = 0;
+  L.hb_off = moe_align16(L.raw_off + (size_t)pairs * 2 * I * 2);   // bf16
+  L.partial_off = moe_align16(L.hb_off + (size_t)pairs * I * 2);   // bf16
+  L.ibuf_off = moe_align16(L.partial_off + (size_t)pairs * H * 2); // fp16
+  L.tasks_off =
+      moe_align16(L.ibuf_off + (size_t)(3 * E + E + 1 + pairs) * 4);
+  L.total = moe_align16(L.tasks_off + (size_t)L.max_tasks * 2 * 4);
+  return L;
+}
+
+}  // namespace
+
 // Workspace bytes the dispatcher must plan-allocate for a (tokens, top_k,
-// intermediate_size) call: the fp16 fc1 intermediate, one I-row per
-// (token, selected expert) pair.
+// intermediate_size, hidden_size, num_experts) call: T < 256 uses the small
+// path's fp16 fc1 intermediate; T >= 256 the grouped path's buffers at the
+// measured entry point's sizes.
 int64_t moe_fp8_grouped_smallt_sm90_plan_workspace_bytes(int64_t tokens, int64_t top_k,
-                                                         int64_t intermediate_size) {
+                                                         int64_t intermediate_size,
+                                                         int64_t hidden_size,
+                                                         int64_t num_experts) {
   TVM_FFI_ICHECK_GE(tokens, 1);
   TVM_FFI_ICHECK_GE(top_k, 1);
   TVM_FFI_ICHECK_GE(intermediate_size, 1);
-  return tokens * top_k * intermediate_size * (int64_t)sizeof(__half);
+  TVM_FFI_ICHECK_GE(hidden_size, 1);
+  TVM_FFI_ICHECK_GE(num_experts, 1);
+  if (tokens < 256) {
+    return tokens * top_k * intermediate_size * (int64_t)sizeof(__half);
+  }
+  return (int64_t)moe_grouped_ws_layout(tokens, top_k, intermediate_size,
+                                        hidden_size, num_experts)
+      .total;
 }
 
 void moe_fp8_grouped_smallt_sm90_run(TensorView hidden_states, TensorView fc1_weights,
@@ -489,8 +529,11 @@ void moe_fp8_grouped_smallt_sm90_run(TensorView hidden_states, TensorView fc1_we
   const int KTOP = static_cast<int>(topk_ids.size(1));
 
   TVM_FFI_ICHECK_GE(T, 1);
-  TVM_FFI_ICHECK_LT(T, 256) << "the small-batch path serves T < 256 "
-                               "(dispatcher allowlist: T <= 16)";
+  // T < 256 runs the small path; T >= 256 the grouped (expert-binned) path.
+  // The dispatcher allowlist is the measured won BANDS: T <= 16 and
+  // 256 <= T <= 4096 (interior points by band interpolation between the
+  // measured classes; the 17..255 gap — containing the measured FI-held
+  // T=64 class — stays on the stock path).
   TVM_FFI_ICHECK_EQ(fc1_weights.size(1), 2 * (int64_t)I)
       << "fc1 must be gated (rows [0:I]=up, [I:2I]=gate)";
   TVM_FFI_ICHECK_EQ(fc1_weights.size(2), H);
@@ -508,7 +551,8 @@ void moe_fp8_grouped_smallt_sm90_run(TensorView hidden_states, TensorView fc1_we
   TVM_FFI_ICHECK_EQ(topk_weights.size(0), T);
   TVM_FFI_ICHECK_EQ(topk_weights.size(1), KTOP);
   TVM_FFI_ICHECK_GE((int64_t)workspace.numel(),
-                    moe_fp8_grouped_smallt_sm90_plan_workspace_bytes(T, KTOP, I))
+                    moe_fp8_grouped_smallt_sm90_plan_workspace_bytes(
+                        T, KTOP, I, H, E))
       << "workspace too small: plan with plan_workspace_bytes(" << T << ", " << KTOP
       << ", " << I << ")";
 
@@ -524,13 +568,30 @@ void moe_fp8_grouped_smallt_sm90_run(TensorView hidden_states, TensorView fc1_we
   ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
   const cudaStream_t stream = get_stream(hidden_states.device());
 
-  launch_moe_small(hidden_states.data_ptr(), fc1_weights.data_ptr(),
-                   static_cast<const float*>(fc1_scales.data_ptr()),
-                   fc2_weights.data_ptr(),
-                   static_cast<const float*>(fc2_scales.data_ptr()),
-                   static_cast<const int*>(topk_ids.data_ptr()),
-                   static_cast<const float*>(topk_weights.data_ptr()),
-                   out.data_ptr(), workspace.data_ptr(), T, H, I, E, KTOP, stream);
+  if (T < 256) {
+    launch_moe_small(hidden_states.data_ptr(), fc1_weights.data_ptr(),
+                     static_cast<const float*>(fc1_scales.data_ptr()),
+                     fc2_weights.data_ptr(),
+                     static_cast<const float*>(fc2_scales.data_ptr()),
+                     static_cast<const int*>(topk_ids.data_ptr()),
+                     static_cast<const float*>(topk_weights.data_ptr()),
+                     out.data_ptr(), workspace.data_ptr(), T, H, I, E, KTOP,
+                     stream);
+  } else {
+    const MoeWsLayout L = moe_grouped_ws_layout(T, KTOP, I, H, E);
+    char* wp = static_cast<char*>(workspace.data_ptr());
+    launch_moe_grouped(hidden_states.data_ptr(), fc1_weights.data_ptr(),
+                       static_cast<const float*>(fc1_scales.data_ptr()),
+                       fc2_weights.data_ptr(),
+                       static_cast<const float*>(fc2_scales.data_ptr()),
+                       static_cast<const int*>(topk_ids.data_ptr()),
+                       static_cast<const float*>(topk_weights.data_ptr()),
+                       out.data_ptr(), wp + L.raw_off, wp + L.hb_off,
+                       wp + L.partial_off,
+                       reinterpret_cast<int*>(wp + L.ibuf_off),
+                       reinterpret_cast<int2*>(wp + L.tasks_off), T, H, I, E,
+                       KTOP, L.max_tasks, stream);
+  }
   cudaError_t status = cudaGetLastError();
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "moe_fp8_grouped_smallt_sm90 launch failed: " << cudaGetErrorString(status);

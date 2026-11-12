@@ -1810,18 +1810,20 @@ def cutlass_fused_moe(
     """
     if use_fused_finalize is None:
         use_fused_finalize = not torch.are_deterministic_algorithms_enabled()
-    # moe_fp8_grouped_smallt_sm90: specialized SM90 small-batch (T <= 16)
-    # fast-path for the DeepSeek-style fp8 [128,128]-block-scale format; the
-    # measured envelope where it beats the serving engines' dispatched triton
-    # fused-MoE. Larger batches (measured LOSSES at T >= 64) and every other
-    # configuration keep the stock cutlass path; see
+    # moe_fp8_grouped_smallt_sm90: specialized SM90 fast-path for the
+    # DeepSeek-style fp8 [128,128]-block-scale format on the measured won
+    # bands — T <= 16 (beats the engines' dispatched triton fused-MoE) and
+    # 256 <= T <= 4096 (beats FI's own stock cutlass dsfp8 route at
+    # contract; interior points by band interpolation). The 17..255 gap
+    # (containing the measured T=64 class, where the stock kernel held) and
+    # every other configuration keep the stock cutlass path; see
     # flashinfer/fused_moe/smallt_sm90.py for the allowlist and the
     # FLASHINFER_DISABLE_MOE_FP8_GROUPED_SMALLT_SM90 kill-switch.
     if (
         use_deepseek_fp8_block_scale
         and backend == "cutlass"
         and input.dim() == 2
-        and input.shape[0] <= 16
+        and (input.shape[0] <= 16 or 256 <= input.shape[0] <= 4096)
     ):
         from .smallt_sm90 import _moe_smallt_sm90_try_dispatch
 

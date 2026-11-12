@@ -22,7 +22,7 @@ ALLOWLIST (fails closed to the stock cutlass path otherwise): SM90 device,
 DeepSeek-style fp8 [128,128]-block-scale weights (``quant_scales ==
 [fc1_block_scales, fc2_block_scales]``), bf16 unquantized activations, bf16
 output, gated SiLU (Swiglu) activation, no biases / input_sf / swiglu
-parameters / expert parallelism / min-latency mode, and **T <= 16 tokens**
+parameters / expert parallelism / min-latency mode, and token counts inside the measured won bands **T <= 16 or 256 <= T <= 4096**
 — the measured envelope where this kernel beats the serving engines'
 dispatched triton fused-MoE on the captured GLM-class routing. At the
 measured T >= 64 classes the kernel LOSES to that incumbent (0.55-0.81x),
@@ -49,7 +49,16 @@ from ..jit.core import logger
 from ..utils import get_compute_capability
 
 _DISABLE_ENV = "FLASHINFER_DISABLE_MOE_FP8_GROUPED_SMALLT_SM90"
-_MAX_TOKENS = 16  # the measured won envelope; T >= 64 measured LOSSES keep stock
+_MAX_TOKENS = 16  # small-path band cap (measured won rows T=1/4/16)
+# Expansion (measured vs FI's own grouped-fp8 route at contract): the
+# candidate also wins the T=256/1024/4096 classes against the stock cutlass
+# dsfp8 path, so a second band [256, 4096] is admitted; interior points
+# (e.g. T=512/2048) are admitted by BAND INTERPOLATION between the measured
+# classes, the same semantics as the shipped 1..16 band. The 17..255 gap —
+# containing the measured T=64 class, where FI's own kernel held at contract
+# (and in-venv) — stays on the stock path.
+_BAND2_LO = 256
+_BAND2_HI = 4096
 _COMPUTE_CAPABILITY = (9, 0)
 
 _counters: Dict[str, int] = {
@@ -132,8 +141,9 @@ def _eligibility(
     if input.dtype != torch.bfloat16 or input.dim() != 2:
         return f"input {input.dtype} dim={input.dim()}"
     T = input.shape[0]
-    if not (1 <= T <= _MAX_TOKENS):
-        return f"num_tokens={T} outside the measured small-T envelope"
+    if not (1 <= T <= _MAX_TOKENS or _BAND2_LO <= T <= _BAND2_HI):
+        return (f"num_tokens={T} outside the measured won bands "
+                f"[1,{_MAX_TOKENS}] u [{_BAND2_LO},{_BAND2_HI}]")
     if output_dtype != torch.bfloat16:
         return f"output_dtype={output_dtype}"
     if not isinstance(quant_scales, (list, tuple)) or len(quant_scales) != 2:
@@ -261,7 +271,10 @@ def _moe_smallt_sm90_try_dispatch(
         if input.device.index is not None
         else torch.cuda.current_device()
     )
-    need = int(module.plan_workspace_bytes(_MAX_TOKENS, KTOP, I))
+    H_sz = input.shape[1]
+    E_sz = fc1_expert_weights.shape[0]
+    band_cap = _MAX_TOKENS if T <= _MAX_TOKENS else _BAND2_HI
+    need = int(module.plan_workspace_bytes(band_cap, KTOP, I, H_sz, E_sz))
     ws = _workspaces.get(dev_index)
     if ws is None or ws.numel() < need or ws.device != input.device:
         if capturing:
