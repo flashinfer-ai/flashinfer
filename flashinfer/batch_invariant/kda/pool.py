@@ -15,13 +15,14 @@ from one the class wrote. Two placements compute the class's term:
 * the chunked prefill on its pinned route (``api._pinned``) for the rows that form whole chunks from a boundary.
 
 ``api._append`` appends several tokens per sequence with both: the step kernel up to the next boundary, the prefill
-kernel over the whole chunks, the step kernel for the tail.
+kernel over the whole chunks, the step kernel for the tail. :meth:`ExactPool.span` is the step kernel looping over
+several rows per slot in one launch.
 """
 
 from __future__ import annotations
 
 import functools
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -164,66 +165,50 @@ class ExactPool:
             )
         return cells[:, 0].tolist()
 
-    def steps(
+    def span(
         self,
         pool: torch.Tensor,
-        slot_list: Sequence[int],
-        spans: Sequence[Tuple[int, int]],
+        slot_ids: torch.Tensor,
         packed: Tuple[torch.Tensor, ...],
-        A_log,
-        dt_bias,
-        lower_bound,
-        scale,
-    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-        """Packed rows ``[spans[i][0], spans[i][1])`` through the step kernel for slot ``slot_list[i]``: launch ``j``
-        takes the ``j``-th row of every sequence that has one. Returns ``(packed positions, rows)`` pairs."""
-        dev = self.device
-        lens = [e - s for s, e in spans]
-        n = max(lens, default=0)
-        if n == 0:
-            return []
-        args = (A_log, dt_bias, lower_bound, scale)
-        N = len(spans)
-        starts = [s for s, _ in spans]
-        if min(lens) == n:
-            # equal spans: one token-major gather per input, launch j takes plane j
-            slots = torch.tensor(list(slot_list), dtype=torch.int32, device=dev)
-            src = (
-                torch.tensor(starts, dtype=torch.int64, device=dev)[None, :]
-                + torch.arange(n, device=dev)[:, None]
-            ).reshape(-1)
-            planes = tuple(
-                x.index_select(0, src).view(n, N, *x.shape[1:]) for x in packed
-            )
-            out = torch.empty((n, N, self.H, HEAD_DIM), dtype=_IO, device=dev)
-            for j in range(n):
-                q_j, k_j, v_j, g_j, b_j = (x[j] for x in planes)
-                self.step(pool, slots, q_j, k_j, v_j, g_j, b_j, *args, out[j])
-            return [(src, out.view(n * N, self.H, HEAD_DIM))]
-        # unequal spans: the same planes with a negative slot (which the kernel skips) where a sequence has no row j
-        slots = torch.tensor(
-            [[slot_list[i] if j < lens[i] else -1 for i in range(N)] for j in range(n)],
-            dtype=torch.int32,
-            device=dev,
+        out: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        lower_bound: float,
+        scale: float,
+        *,
+        starts: Optional[torch.Tensor] = None,
+        lens: Optional[torch.Tensor] = None,
+        stride: int = 0,
+    ) -> None:
+        """Sequence ``i`` appends packed rows ``[starts[i], starts[i] + lens[i])`` (int32, on the device; ``stride``
+        rows from row ``i * stride`` when ``stride`` is given instead) to slot ``slot_ids[i]`` and writes their rows
+        into ``out`` at the same positions. One launch: each block loops over its rows and commits every chunk it
+        completes."""
+        q, k, v, g, beta = packed
+        none = slot_ids if stride else None
+        _module().kda_batch_invariant_decode_span(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            slot_ids,
+            none if stride else starts,
+            none if stride else lens,
+            int(stride),
+            out,
+            pool,
+            self.state_bf16,
+            self.cnt,
+            self.prefix,
+            self.k_inv_rows,
+            self.k_inv_f32_rows,
+            self.rhs_rows,
+            self.update_rows,
+            self.l_rows,
+            self.stamp,
+            A_log,
+            dt_bias.reshape(self.H, HEAD_DIM),
+            float(scale),
+            float(lower_bound) * GATE_LOG2_E * 0.5,
         )
-        src = torch.tensor(
-            [[starts[i] + j if j < lens[i] else 0 for i in range(N)] for j in range(n)],
-            dtype=torch.int64,
-            device=dev,
-        ).reshape(-1)
-        planes = tuple(x.index_select(0, src).view(n, N, *x.shape[1:]) for x in packed)
-        out = torch.empty((n, N, self.H, HEAD_DIM), dtype=_IO, device=dev)
-        for j in range(n):
-            q_j, k_j, v_j, g_j, b_j = (x[j] for x in planes)
-            self.step(pool, slots[j], q_j, k_j, v_j, g_j, b_j, *args, out[j])
-        live = torch.tensor(
-            [j * N + i for j in range(n) for i in range(N) if j < lens[i]],
-            dtype=torch.int64,
-            device=dev,
-        )
-        return [
-            (
-                src.index_select(0, live),
-                out.view(n * N, self.H, HEAD_DIM).index_select(0, live),
-            )
-        ]

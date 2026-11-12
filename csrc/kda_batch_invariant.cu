@@ -91,6 +91,73 @@ void kda_batch_invariant_decode_step(TensorView q, TensorView k, TensorView v, T
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(kda_batch_invariant_decode_step, kda_batch_invariant_decode_step);
 
+// stride > 0: every sequence appends `stride` rows from row i * stride (starts / lens unused)
+void kda_batch_invariant_decode_span(TensorView q, TensorView k, TensorView v, TensorView g,
+                                     TensorView beta, TensorView slots, TensorView starts,
+                                     TensorView lens, int64_t stride, TensorView out,
+                                     TensorView state, TensorView state_bf16, TensorView cnt,
+                                     TensorView prefix, TensorView k_inv_rows,
+                                     TensorView k_inv_f32_rows, TensorView rhs_rows,
+                                     TensorView update_rows, TensorView l_rows, TensorView stamp,
+                                     TensorView a_log, TensorView dt_bias, double scale,
+                                     double half_gate_scale_log2) {
+  namespace bi = kda::bi_decode;
+  CHECK_DIM(3, q);
+  CHECK_DIM(4, state);
+  const int64_t rows = q.size(0), num_heads = q.size(1), num_slots = state.size(0);
+  const int64_t batch = slots.numel();
+  TVM_FFI_ICHECK(q.size(2) == bi::D) << "head dim must be 128";
+  TVM_FFI_ICHECK(k.numel() == q.numel() && v.numel() == q.numel() && g.numel() == q.numel() &&
+                 out.numel() == q.numel());
+  TVM_FFI_ICHECK(beta.numel() == rows * num_heads);
+  if (stride > 0) {
+    TVM_FFI_ICHECK(batch * stride <= rows) << "the spans leave the packed rows";
+  } else {
+    TVM_FFI_ICHECK(starts.numel() == batch && lens.numel() == batch);
+  }
+  TVM_FFI_ICHECK(state.size(1) == num_heads && state.size(2) == bi::D && state.size(3) == bi::D);
+  const int64_t sh = num_slots * num_heads;
+  TVM_FFI_ICHECK(state_bf16.numel() == state.numel() && cnt.numel() == sh);
+  TVM_FFI_ICHECK(prefix.numel() == sh * bi::D && stamp.numel() == sh * bi::STAMP);
+  const int64_t cached = sh * bi::CH * bi::D;
+  TVM_FFI_ICHECK(k_inv_rows.numel() == cached && k_inv_f32_rows.numel() == cached &&
+                 rhs_rows.numel() == cached && update_rows.numel() == cached);
+  TVM_FFI_ICHECK(l_rows.numel() == sh * bi::CH * bi::CH);
+  TVM_FFI_ICHECK(a_log.numel() == num_heads && dt_bias.numel() == num_heads * bi::D);
+  for (TensorView t :
+       {q, k, v, g, beta, out, state_bf16, k_inv_rows, rhs_rows, update_rows, l_rows}) {
+    check_dtype(t, kDLBfloat, 16, "a bf16 tensor");
+    CHECK_CONTIGUOUS(t);
+  }
+  for (TensorView t : {state, prefix, k_inv_f32_rows, stamp, a_log, dt_bias}) {
+    check_dtype(t, kDLFloat, 32, "an fp32 tensor");
+    CHECK_CONTIGUOUS(t);
+  }
+  for (TensorView t : {slots, starts, lens, cnt}) {
+    check_dtype(t, kDLInt, 32, "an int32 tensor");
+    CHECK_CONTIGUOUS(t);
+  }
+  CHECK_DEVICE(q, state);
+  CHECK_DEVICE(slots, state);
+
+  ffi::CUDADeviceGuard device_guard(q.device().device_id);
+  const cudaStream_t stream = get_stream(q.device());
+  cudaError_t status = bi::DecodeSpan(
+      ptr<const uint16_t>(q), ptr<const uint16_t>(k), ptr<const uint16_t>(v),
+      ptr<const uint16_t>(g), ptr<const uint16_t>(beta), ptr<const int>(slots),
+      stride > 0 ? nullptr : ptr<const int>(starts), stride > 0 ? nullptr : ptr<const int>(lens),
+      static_cast<int>(stride), ptr<uint16_t>(out), ptr<float>(state), ptr<uint16_t>(state_bf16),
+      ptr<int>(cnt), ptr<float>(prefix), ptr<uint16_t>(k_inv_rows), ptr<float>(k_inv_f32_rows),
+      ptr<uint16_t>(rhs_rows), ptr<uint16_t>(update_rows), ptr<uint16_t>(l_rows), ptr<float>(stamp),
+      ptr<const float>(a_log), ptr<const float>(dt_bias), static_cast<float>(scale),
+      static_cast<float>(half_gate_scale_log2), static_cast<int>(batch),
+      static_cast<int>(num_heads), stream);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "kda_batch_invariant_decode_span failed: " << cudaGetErrorString(status);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(kda_batch_invariant_decode_span, kda_batch_invariant_decode_span);
+
 void kda_batch_invariant_begin(TensorView slots, TensorView state, TensorView state_bf16,
                                TensorView cnt, TensorView stamp) {
   namespace bi = kda::bi_decode;

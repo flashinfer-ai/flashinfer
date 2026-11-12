@@ -40,7 +40,7 @@ import torch
 
 from ..support import check_device, unsupported
 from .pool import ExactPool, get_pool
-from .spec import CLASS, HEAD_DIM, KDA_ARCHS, ROUTE, append_split
+from .spec import CHUNK, CLASS, HEAD_DIM, KDA_ARCHS, ROUTE, append_split
 
 _IO = torch.bfloat16
 
@@ -371,9 +371,9 @@ def _append(
 ) -> torch.Tensor:
     """``lens[i]`` packed tokens appended to slot ``slot_ids[i]``, which holds ``counts[i]`` open rows (``None``: a
     prefill, every slot's state is taken as a chunk boundary and its open rows are dropped): the rows up to
-    the next boundary through the step kernel, the whole chunks from it in one pinned call that writes the boundary
-    state, the tail through the step kernel (:func:`.spec.append_split`). Both kernels give the full call's rows by
-    the prefill kernel's causality, the hypothesis the class rests on."""
+    the next boundary in one launch of the step kernel, the whole chunks from it in one pinned call that writes the
+    boundary state, the tail in one more launch of the step kernel (:func:`.spec.append_split`). Both kernels give
+    the full call's rows by the prefill kernel's causality, the hypothesis the class rests on."""
     dev = pool.device
     slot_list = _host_slots(slot_ids, int(pool.shape[0]))
     offs = [0]
@@ -389,15 +389,29 @@ def _append(
         short = [slot_list[i] for i, (_, w, _) in enumerate(splits) if not w]
         ep.begin(pool, torch.tensor(short, dtype=torch.int32, device=dev))
     scale_f = HEAD_DIM**-0.5 if scale is None else float(scale)
-    step_args = (A_log, dt_bias, lower_bound, scale_f)
+    rows = torch.empty_like(packed[2])
 
-    pairs = ep.steps(
-        pool,
-        slot_list,
-        [(offs[i], offs[i] + head) for i, (head, _, _) in enumerate(splits)],
-        packed,
-        *step_args,
-    )
+    def spans(pieces: List[Tuple[int, int]]) -> None:
+        """Rows ``[start, start + n)`` of sequence ``i`` through the step kernel, written into ``rows``: one launch."""
+        if any(n for _, n in pieces):
+            ep.span(
+                pool,
+                slot_ids,
+                packed,
+                rows,
+                A_log,
+                dt_bias,
+                lower_bound,
+                scale_f,
+                starts=torch.tensor(
+                    [s for s, _ in pieces], dtype=torch.int32, device=dev
+                ),
+                lens=torch.tensor(
+                    [n for _, n in pieces], dtype=torch.int32, device=dev
+                ),
+            )
+
+    spans([(offs[i], head) for i, (head, _, _) in enumerate(splits)])
     whole = [i for i, (_, w, _) in enumerate(splits) if w]
     if whole and all(head == 0 and tail == 0 for head, _, tail in splits):
         # whole chunks from boundaries only: the caller's rows and the pool's slots as they are
@@ -414,15 +428,15 @@ def _append(
         ep.begin(pool, slot_ids)
     elif whole and _gathers_tokens(splits, int(pool.shape[1])):
         # the whole chunks gathered into one packed input, run on the pool's slots in place
-        spans = [
+        pieces = [
             (offs[i] + splits[i][0], offs[i] + splits[i][0] + splits[i][1])
             for i in whole
         ]
         src = torch.tensor(
-            [r for a, b in spans for r in range(a, b)], dtype=torch.int64, device=dev
+            [r for a, b in pieces for r in range(a, b)], dtype=torch.int64, device=dev
         )
         cu = [0]
-        for a, b in spans:
+        for a, b in pieces:
             cu.append(cu[-1] + b - a)
         idx32 = torch.tensor(
             [slot_list[i] for i in whole], dtype=torch.int32, device=dev
@@ -437,12 +451,11 @@ def _append(
             scale,
             indices=idx32,
         )
-        rows = torch.empty_like(packed[2])
-        pairs.append((src, out))
+        rows.index_copy_(0, src, out)
         ep.begin(pool, idx32)
     elif whole:
         # the pinned kernel over the caller's rows as they are: each sequence's whole chunks are one segment from its
-        # slot's state, its other rows are segments of their own from a zero state whose rows are replaced below
+        # slot's state, its other rows are segments of their own from a zero state whose rows are replaced
         cuts, real = [0], []
         for head, w, tail in splits:
             for n, is_whole in ((head, False), (w, True), (tail, False)):
@@ -458,7 +471,7 @@ def _append(
             (len(cuts) - 1, *pool.shape[1:]), dtype=pool.dtype, device=dev
         )
         init.index_copy_(0, seg, pool.index_select(0, idx))
-        rows, final = _pinned(
+        full, final = _pinned(
             packed,
             torch.tensor(cuts, dtype=torch.int64, device=dev),
             init,
@@ -467,19 +480,18 @@ def _append(
             lower_bound,
             scale,
         )
+        heads = [
+            r
+            for i, (head, _, _) in enumerate(splits)
+            for r in range(offs[i], offs[i] + head)
+        ]
+        if heads:
+            hsrc = torch.tensor(heads, dtype=torch.int64, device=dev)
+            full.index_copy_(0, hsrc, rows.index_select(0, hsrc))
+        rows = full
         pool.index_copy_(0, idx, final.index_select(0, seg))
         ep.begin(pool, idx.to(torch.int32))
-    else:
-        rows = torch.empty_like(packed[2])
-    pairs += ep.steps(
-        pool,
-        slot_list,
-        [(offs[i] + head + w, offs[i + 1]) for i, (head, w, _) in enumerate(splits)],
-        packed,
-        *step_args,
-    )
-    for src, out in pairs:
-        rows.index_copy_(0, src, out)
+    spans([(offs[i] + head + w, tail) for i, (head, w, tail) in enumerate(splits)])
     return rows
 
 
@@ -543,6 +555,21 @@ def recurrent_kda_batch_invariant_extend(
         g.reshape(-1, HV, HEAD_DIM).contiguous(),
         beta.reshape(-1, HV).contiguous(),
     )
+    if T < 2 * CHUNK:
+        # fewer rows than two chunks: the step kernel alone, one launch, the open-row count read on the device
+        rows = torch.empty_like(packed[2])
+        ep.span(
+            initial_state,
+            slot_ids,
+            packed,
+            rows,
+            A_log,
+            dt_bias,
+            lower_bound,
+            HEAD_DIM**-0.5 if scale is None else float(scale),
+            stride=T,
+        )
+        return rows.view(v.shape)
     rows = _append(
         ep,
         initial_state,
