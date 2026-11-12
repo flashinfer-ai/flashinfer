@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The batch-invariant KDA class ``kda.bf16.c16`` behind ``recurrent_kda(batch_invariant=True)`` (SM100 / SM103).
+"""The batch-invariant KDA class ``kda.bf16.c16`` behind ``recurrent_kda(batch_invariant=True)`` (SM100 / SM103 / SM107).
 
 Every comparison is ``torch.equal``; nothing uses a tolerance. The reference term is the pinned chunked prefill of the
 whole sequence in one call. Set ``FLASHINFER_KDA_BI_HASH_DIR`` to a directory to record the output hashes in one process

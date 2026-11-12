@@ -324,7 +324,7 @@ def fingerprint(op: str, **dims) -> str:
     ``gemm.nvfp4.*`` otherwise), the chunk count, the chain's ``mul.rn`` by the caller's alpha and the conversion are
     the specification; the alpha's value and the block scales are inputs.
 
-    ``recurrent_kda`` takes no dimension: the class ``kda.bf16.c16`` is the native SM100 / SM103 chunked KDA prefill
+    ``recurrent_kda`` takes no dimension: the class ``kda.bf16.c16`` is the native SM100 / SM103 / SM107 chunked KDA prefill
     kernel on its pinned route (16-token chunks, fp32 state, the fused gate and Q / K normalization) and the decode
     step kernel that computes its rows one token at a time; the head count, the batch, the slot and the position are
     not dimensions of the per-head term, and the receipt digests the kernel sources that are the term.

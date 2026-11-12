@@ -463,7 +463,7 @@ def recurrent_kda(
             Keyword-only. ``True`` runs the batch-invariant class ``kda.bf16.c16``
             (``flashinfer.batch_invariant``) in place of the backends: every
             output row and every state at a multiple of 16 tokens is the
-            native SM100 / SM103 chunked prefill kernel's, so decode row ``p``
+            native SM100 / SM103 / SM107 chunked prefill kernel's, so decode row ``p``
             of a request is bit for bit the row a prefill of the whole sequence
             gives at ``p``, whatever the batch, the neighbours or the slot. The
             state is an fp32 pool ``initial_state`` ``[slots, HV, 128, 128]``

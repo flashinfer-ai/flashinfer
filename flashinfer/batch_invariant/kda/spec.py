@@ -3,7 +3,7 @@
 """The KDA class ``kda.bf16.c16`` behind ``recurrent_kda(batch_invariant=True)``: its constants, the chunk arithmetic
 and the fingerprint.
 
-The class's term is the native SM100 / SM103 chunked KDA prefill (the BT = 16 CuTe-DSL kernel of
+The class's term is the native SM100 / SM103 / SM107 chunked KDA prefill (the BT = 16 CuTe-DSL kernel of
 ``flashinfer/kda_kernels/kda_chunked_bt16.py`` on its persistent ``engine`` route, fused Q / K l2-norm, in-kernel gate
 ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``, in-kernel beta sigmoid, fp32 state): a sequence's rows and its
 state at every multiple of 16 tokens are functions of the sequence's own inputs and its initial state. Decode computes
@@ -27,8 +27,9 @@ CHUNK = 16
 HEAD_DIM = 128
 #: The two BT=16 routes ("decomp" and the persistent "engine") do not agree bitwise; the class is the engine's term.
 ROUTE = "engine"
-#: The compute capabilities the class is stated and tested for: SM100 (B200) and SM103 (B300).
-KDA_ARCHS = ((10, 0), (10, 3))
+#: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300) and SM107 (Rubin), which
+#: give one set of bits for the same inputs.
+KDA_ARCHS = ((10, 0), (10, 3), (10, 7))
 #: The source files that define the term: relative to the ``flashinfer`` package, and to its C++ include directory.
 TERM_SOURCES = ("kda_kernels/kda_chunked_bt16.py",)
 TERM_INCLUDES = ("flashinfer/kda/batch_invariant_decode.cuh",)
