@@ -105,6 +105,16 @@ that condition. Decline the extension if independent query-length overrides or
 device-only KV lengths prevent proof. Preserve the existing prefix policy
 without introducing a dispatch readback.
 
+SM100 BF16 paged D128 auto retains its original bounded-prefix/full domains.
+With existing CPU Q offsets and KV lengths, it additionally admits larger
+batches and longer prefill at `num_qo_heads * sum(q_i * kv_i) >= 16 Mi`.
+Full prefill requires every `q_i == kv_i`, with maximum Q in 1024–16384.
+Other admitted prefixes require every Q length above 128, maximum Q at most
+8192, and maximum KV in 2048–32768. HND/page16 and the existing head/dtype,
+feature and runtime guards still apply. Short requests mixed with long ones
+do not qualify for this extension merely because their declaration is large.
+Independent Q overrides and device-only metadata keep the original policy.
+
 ## Grouped FP8 GEMM
 
 `flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous` is the standalone
