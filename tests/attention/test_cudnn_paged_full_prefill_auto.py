@@ -43,7 +43,7 @@ def test_full_prefill_auto_retained_capture(dim, group, page, return_lse):
         paged_kv_last_page_len_buf=last.cuda(),
     )
 
-    def plan():
+    def plan(expected_backend="cudnn"):
         wrapper.plan(
             ptr,
             pageptr,
@@ -60,7 +60,9 @@ def test_full_prefill_auto_retained_capture(dim, group, page, return_lse):
             max_token_per_sequence=max_s,
             max_sequence_kv=max_s,
         )
-        assert wrapper._backend == "cudnn" and wrapper._cudnn_plan is not None
+        assert wrapper._backend == expected_backend
+        if expected_backend == "cudnn":
+            assert wrapper._cudnn_plan is not None
 
     out = torch.empty(total, hq, dim, device="cuda", dtype=q.dtype)
     lse = torch.empty(total, hq, device="cuda", dtype=torch.float32)
@@ -78,6 +80,7 @@ def test_full_prefill_auto_retained_capture(dim, group, page, return_lse):
     def check():
         for b, n in enumerate(lengths.tolist()):
             rows = slice(int(ptr[b]), int(ptr[b + 1]))
+            nq = int(ptr[b + 1] - ptr[b])
             keys = (
                 k[table[b].long()].transpose(1, 2).reshape(max_s, hk, dim)[:n].double()
             )
@@ -86,7 +89,7 @@ def test_full_prefill_auto_retained_capture(dim, group, page, return_lse):
             )
             mask = (
                 torch.arange(n, device="cuda")[None, :]
-                > torch.arange(n, device="cuda")[:, None]
+                > torch.arange(nq, device="cuda")[:, None] + n - nq
             )
             for h in range(hq):
                 scores = q[rows, h].double() @ keys[:, h // group].T * dim**-0.5
@@ -122,3 +125,22 @@ def test_full_prefill_auto_retained_capture(dim, group, page, return_lse):
     capture.replay()
     check()
     assert cp._prefill_graph_builds == builds
+
+    # Keep the captured bounds, but use a short prefix outside full-prefill
+    # admission. Both KV rows now use every page, so FA2 and the retained
+    # cuDNN capture must observe the same updated mappings and Q partitions.
+    lengths.fill_(max_s)
+    ptr[1] = total // 2
+    last.copy_((lengths - 1) % page + 1)
+    indices.copy_(table.flatten())
+    q.mul_(-0.5)
+    kv.mul_(0.75)
+    plan(expected_backend="fa2")
+    run()
+    check()
+    out.fill_(torch.nan)
+    lse.fill_(torch.nan)
+    capture.replay()
+    check()
+    assert cp._prefill_graph_builds == builds
+    capture.reset()
