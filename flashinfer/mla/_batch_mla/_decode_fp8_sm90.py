@@ -350,6 +350,7 @@ def _mla_dec_fp8q_sm90_prepare(
         k_descale=k_descale,
         sm_scale=float(sm_scale),
         device_index=device_index,
+        scales_cached=None,
     )
     counters["plans_prepared"] += 1
 
@@ -521,10 +522,14 @@ def _mla_dec_fp8q_sm90_dispatch(
             dtype=torch.bfloat16,
             device=device,
         )
-    # Scalar descales are written into plan-owned buffers; under CUDA-graph
+    # Scalar descales are written into plan-owned buffers only when they
+    # change (per-tensor serve scales are constant across steps, so the
+    # steady-state hot path launches no extra kernels); under CUDA-graph
     # capture the values present at capture are baked (like sm_scale).
-    state.q_descale.fill_(qs)
-    state.k_descale.fill_(ks)
+    if state.scales_cached != (qs, ks):
+        state.q_descale.fill_(qs)
+        state.k_descale.fill_(ks)
+        state.scales_cached = (qs, ks)
     module.run(
         q_packed.view(state.batch_size, state.q_len, _NUM_HEADS, _DIMQ),
         kv_packed,
