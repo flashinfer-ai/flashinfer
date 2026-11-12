@@ -530,10 +530,12 @@ def get_symm_buffer_for_bf16_mega_moe(
     from .knob_cache import resolve_knobs
     from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
         BF16_BATCH_INVARIANT_VERSION,
+        bf16_plan_config,
     )
     from .tuner import (
         describe_invalid_knobs,
         is_valid_bf16_for_config,
+        reject_explicit_knobs,
         with_checked_knobs,
     )
 
@@ -555,20 +557,30 @@ def get_symm_buffer_for_bf16_mega_moe(
             ),
             gate_up_clamp=clamp,
         )
-    cfg = MegaMoEBf16Config(
-        rank=rank,
-        world_size=world_size,
-        num_tokens_per_rank=num_max_tokens,
-        num_topk=num_topk,
-        num_total_experts=num_total_experts,
-        hidden=hidden,
-        intermediate=intermediate,
-        gate_up_clamp=clamp,
-        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
-        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
-        use_custom_finalize=use_custom_finalize,
-        batch_invariant=batch_invariant,
-    )
+    reject_explicit_knobs(knobs)
+    config_fields = {f.name for f in dataclasses.fields(MegaMoEBf16Config)}
+    config_knobs = {key: value for key, value in knobs.items() if key in config_fields}
+    try:
+        # Admission must see the selected plan: the default tile may exceed
+        # shared memory even when a narrower pinned or cached tile fits.
+        config_knobs.update(dataclasses.asdict(bf16_plan_config(knobs=knobs)))
+        cfg = MegaMoEBf16Config(
+            rank=rank,
+            world_size=world_size,
+            num_tokens_per_rank=num_max_tokens,
+            num_topk=num_topk,
+            num_total_experts=num_total_experts,
+            hidden=hidden,
+            intermediate=intermediate,
+            gate_up_clamp=clamp,
+            apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+            use_custom_finalize=use_custom_finalize,
+            batch_invariant=batch_invariant,
+            **config_knobs,
+        )
+    except ValueError as exc:
+        raise ValueError(f"unsupported BF16 MegaMoE knobs {knobs}: {exc}") from exc
     if not is_valid_bf16_for_config(cfg, knobs):
         raise ValueError(
             f"unsupported BF16 MegaMoE knobs {knobs}: "

@@ -14,12 +14,18 @@ from types import SimpleNamespace
 import pytest
 
 from flashinfer.batch_invariant import CLASSES, class_name, fingerprint
-from flashinfer.batch_invariant.fp_interface.term import sexpr, size
+from flashinfer.batch_invariant.fp_interface import term as shared_term
+from flashinfer.batch_invariant.fp_interface.term import (
+    fingerprint as term_fingerprint,
+    sexpr,
+    size,
+)
 from flashinfer.moe_ep.batch_invariant.spec import (
     ALLOWED_PLANS,
     ALLOWED_PLAN_CONFIGS,
     OrderedTermAlgebra,
     PlanConfig,
+    _fingerprint_component,
     component_terms,
     f32_bits,
     fc1_activation,
@@ -188,6 +194,97 @@ def test_existing_v1_fingerprints_remain_unchanged():
     assert all(case["args"]["arch"] == "sm_107" for case in saved[60:])
     for case in saved:
         assert spec_fingerprint(**case["args"]) == case["fingerprint"]
+
+
+@pytest.mark.parametrize("early", (False, True))
+@pytest.mark.parametrize("clamp", (None, -0.0, -2.0, float("inf"), float("nan")))
+@pytest.mark.parametrize("valid_routes", (None, (False, True, False)))
+def test_incremental_component_hash_matches_shared_sexpr(early, clamp, valid_routes):
+    terms = component_terms(
+        **SHAPE,
+        apply_routing_weights_before_fc2=early,
+        gate_up_clamp=clamp,
+        valid_routes=valid_routes,
+    )
+    for term in terms.values():
+        assert _fingerprint_component(term) == term_fingerprint(term)
+
+
+def test_incremental_hash_keeps_operand_association_and_mma_initialization():
+    fp = OrderedTermAlgebra()
+    a, b, c = (fp.op("ref.f32", name) for name in ("a", "b", "c"))
+    operands = fp.op("operand.k16", "fc1.gate", 0, 16)
+    pairs = (
+        (fp.add(a, b), fp.add(b, a)),
+        (fp.mul(a, b), fp.mul(b, a)),
+        (fp.fma(a, b, c), fp.fma(b, a, c)),
+        (fp.add(fp.add(a, b), c), fp.add(a, fp.add(b, c))),
+        (fp.fma(a, b, c), fp.add(fp.mul(a, b), c)),
+        (fp.const(0.0), fp.const(-0.0)),
+        (
+            fp.op("mma.init.bf16.k16", operands),
+            fp.op("mma.acc.bf16.k16", fp.const(0.0), operands),
+        ),
+    )
+    for left, right in pairs:
+        assert _fingerprint_component(left) == term_fingerprint(left)
+        assert _fingerprint_component(right) == term_fingerprint(right)
+        assert _fingerprint_component(left) != _fingerprint_component(right)
+    for k in (0, 32, 64, 96, 128, 160, 256):
+        term = mma_fold(fp, k)
+        assert _fingerprint_component(term) == term_fingerprint(term)
+    # This serializer is specific to MegaMoE's ordered atoms. Shared algebra
+    # operators retain their own normalization and serialization semantics.
+    with pytest.raises(ValueError, match="unvalidated MegaMoE component primitive"):
+        _fingerprint_component(shared_term.TermAlgebra().const(0.0))
+
+
+def test_fingerprint_construction_does_not_grow_the_shared_interner():
+    before = len(shared_term._TABLE)
+    for hidden in (32, 160, 224, 1024):
+        for early in (False, True):
+            args = dict(hidden=hidden, intermediate=192, top_k=3, num_experts=12)
+            specification(**args, apply_routing_weights_before_fc2=early)
+            spec_fingerprint(**args, apply_routing_weights_before_fc2=early)
+    assert len(shared_term._TABLE) == before
+
+
+def test_large_fingerprint_has_bounded_peak_and_retained_memory():
+    # A fresh interpreter prevents existing symbolic nodes or receipt cache
+    # hits from concealing allocations. Trace only fingerprint work, not imports.
+    code = """
+import gc
+import json
+import tracemalloc
+from flashinfer.batch_invariant.fp_interface import term
+from flashinfer.moe_ep.batch_invariant.spec import specification, spec_fingerprint
+gc.collect()
+before = len(term._TABLE)
+tracemalloc.start()
+receipts = []
+for early in (False, True):
+    args = dict(hidden=65536, intermediate=65536, top_k=32, num_experts=256,
+                apply_routing_weights_before_fc2=early, gate_up_clamp=2.0)
+    spec = specification(**args)
+    assert set(spec['components']) == {'fc1_gate', 'fc1_up', 'activation', 'fc2', 'finalize'}
+    receipts.append(spec_fingerprint(**args))
+gc.collect()
+current, peak = tracemalloc.get_traced_memory()
+assert len(term._TABLE) == before, (before, len(term._TABLE))
+assert peak < 32 * 1024**2, peak
+assert current < 2 * 1024**2, current
+# Captured from the original v1 serializer for this real 4096-step FC2 fold.
+assert receipts[1] == 'megamoe-bf16-e438134b1e5b5353', receipts
+print(json.dumps(dict(peak=peak, retained=current, receipts=receipts)))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("early", (False, True))

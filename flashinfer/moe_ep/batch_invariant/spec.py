@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Sequence
 
-from ...batch_invariant.fp_interface.term import Term, TermAlgebra, fingerprint
+from ...batch_invariant.fp_interface.term import Term, TermAlgebra
 
 SPEC_VERSION = 1
 MMA_K = 16
@@ -152,6 +152,66 @@ class OrderedTermAlgebra(TermAlgebra):
 
     def widen(self, a: Term) -> Term:
         return self.op("widen.bf16.f32", a)
+
+
+class _FingerprintTermAlgebra(OrderedTermAlgebra):
+    def __init__(self):
+        # Runtime receipts must not retain every shape in the shared interner.
+        # Public symbolic builders keep their existing global identity semantics.
+        self._table = {}
+
+
+_COMPONENT_OPS = frozenset(
+    "op:" + name
+    for name in (
+        "f32_bits",
+        "bf16_bits",
+        "add.rn.f32",
+        "mul.rn.f32",
+        "fma.rn.f32",
+        "ex2.approx.ftz.f32",
+        "rcp.approx.ftz.f32",
+        "min.NaN.f32",
+        "max.NaN.f32",
+        "cvt.rn.bf16.f32",
+        "widen.bf16.f32",
+        "operand.k16",
+        "mma.init.bf16.k16",
+        "mma.acc.bf16.k16",
+        "ref.f32",
+        "ref.bf16",
+        "input.f32",
+        "input.expert_id",
+        "route.valid",
+        "select.lazy",
+    )
+)
+
+
+def _fingerprint_component(term: Term) -> str:
+    """Hash the shared S-expression bytes without retaining expanded prefixes.
+
+    MegaMoE uses only generic ordered ``op:`` nodes, with none of the shared
+    serializer's commutative or pretty-print aliases. Keep that boundary
+    explicit rather than changing serialization for other operator classes.
+    The stack holds nodes and delimiters, never each accumulator's full text.
+    """
+    digest = hashlib.sha256()
+    stack: list[Any] = [term]
+    while stack:
+        item = stack.pop()
+        if not isinstance(item, Term):
+            digest.update(str(item).encode())
+            continue
+        if item.op not in _COMPONENT_OPS:
+            raise ValueError(f"unvalidated MegaMoE component primitive: {item.op}")
+        digest.update(("(" + item.op + " ").encode())
+        stack.append(")")
+        for index, arg in enumerate(reversed(item.args)):
+            if index:
+                stack.append(" ")
+            stack.append(arg)
+    return digest.hexdigest()[:16]
 
 
 def fc1_activation_accumulator(fp, gate, up, weight=None, clamp=None):
@@ -416,6 +476,7 @@ def specification(
         apply_routing_weights_before_fc2,
         gate_up_clamp,
         arch,
+        fp=_FingerprintTermAlgebra(),
     )
     return {
         "class": "megamoe.bf16",
@@ -428,7 +489,9 @@ def specification(
         "apply_routing_weights_before_fc2": apply_routing_weights_before_fc2,
         "clamp_bits": None if gate_up_clamp is None else f32_bits(abs(gate_up_clamp)),
         "composition": COMPOSITION,
-        "components": {name: fingerprint(term) for name, term in terms.items()},
+        "components": {
+            name: _fingerprint_component(term) for name, term in terms.items()
+        },
     }
 
 

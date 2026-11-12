@@ -619,6 +619,115 @@ def test_resource_admission_depends_on_shape_experts_and_token_back(monkeypatch)
         with_checked_knobs(_config(), knobs)
 
 
+@pytest.mark.parametrize("source", ("pinned", "cache"))
+@pytest.mark.parametrize(
+    "tile,cluster,use_2cta,smem_bytes",
+    [
+        ((256, 128, 64), (2, 1, 1), True, 214064),
+        ((128, 128, 64), (1, 1, 1), False, 222256),
+    ],
+)
+def test_factory_admits_selected_plan_when_default_exceeds_smem(
+    monkeypatch, tmp_path, source, tile, cluster, use_2cta, smem_bytes
+):
+    import torch
+
+    import flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant as policy
+    from flashinfer.moe_ep.batch_invariant.spec import PlanConfig
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16, knob_cache
+
+    monkeypatch.setattr(policy, "bf16_batch_invariant_arch", lambda: "sm_100")
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
+    monkeypatch.setattr(knob_cache, "_current_device_name", lambda: "testgpu")
+    capacity = policy.bf16_batch_invariant_smem_capacity("sm_100")
+    assert policy.bf16_plan_smem_bytes(21504, 4, PlanConfig()) == 238640 > capacity
+    assert (
+        policy.bf16_plan_smem_bytes(21504, 4, PlanConfig(tile, cluster, use_2cta))
+        == smem_bytes
+        < capacity
+    )
+
+    knobs = {"mma_tiler_mnk": tile}
+    if source == "cache":
+        knob_cache.record_knobs(
+            knobs,
+            dtype="bf16",
+            world_size=1,
+            hidden=21504,
+            intermediate=256,
+            num_experts=4,
+            topk=2,
+            max_tokens=1,
+            device="testgpu",
+            batch_invariant=True,
+            apply_routing_weights_before_fc2=True,
+        )
+
+    def fake_zeros(shape, dtype):
+        tensor = torch.zeros(shape, dtype=dtype)
+        tensor._mega_plain_alloc = True
+        return tensor
+
+    monkeypatch.setattr(bf16, "sym_zeros", fake_zeros)
+    workspace = bf16.get_symm_buffer_for_bf16_mega_moe(
+        4,
+        1,
+        2,
+        21504,
+        256,
+        0,
+        1,
+        batch_invariant=True,
+        knobs=knobs if source == "pinned" else None,
+    )
+    try:
+        config = workspace._frontend.config
+        assert config.mma_tiler_mnk == tile
+        assert config.cluster_shape_mnk == cluster
+        assert config.use_2cta_instrs is use_2cta
+        assert config.batch_invariant is True
+        assert workspace.x.shape == workspace.output_activation.shape == (1, 21504)
+    finally:
+        workspace.destroy()
+
+
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"hidden": 256}, "explicit config fields"),
+        ({"batch_invariant": False}, "explicit config fields"),
+        ({"apply_topk_in_fc1": False}, "explicit config fields"),
+        ({"future_numerical_knob": True}, "future_numerical_knob"),
+        ({"use_2cta_instrs": False}, "use_2cta_instrs"),
+        ({"mma_tiler_mnk": (256, 256, 64)}, "shared-memory bytes"),
+    ],
+)
+def test_factory_rejects_invalid_selected_plan_before_allocation(
+    monkeypatch, overrides, message
+):
+    import flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant as policy
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16
+
+    monkeypatch.setattr(policy, "bf16_batch_invariant_arch", lambda: "sm_100")
+    monkeypatch.setattr(
+        bf16,
+        "sym_zeros",
+        lambda *_a, **_kw: pytest.fail("allocated before rejecting selected knobs"),
+    )
+    with pytest.raises(ValueError, match=message):
+        bf16.get_symm_buffer_for_bf16_mega_moe(
+            4,
+            1,
+            2,
+            21504,
+            256,
+            0,
+            1,
+            batch_invariant=True,
+            knobs={"mma_tiler_mnk": (256, 128, 64), **overrides},
+        )
+
+
 @pytest.mark.parametrize(
     "hidden,intermediate,tile,message",
     [

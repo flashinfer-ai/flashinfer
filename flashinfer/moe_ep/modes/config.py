@@ -67,6 +67,7 @@ def _batch_invariant_numerical_contract(config: MegaConfig | SplitConfig):
     from ..backends.mega.kernel.sm100.common.batch_invariant import (
         BF16_BATCH_INVARIANT_VERSION,
     )
+    from ..batch_invariant.spec import f32_bits
 
     kernel = config.megakernel
     if type(kernel) is not Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig or (
@@ -75,17 +76,18 @@ def _batch_invariant_numerical_contract(config: MegaConfig | SplitConfig):
         raise ValueError(
             "Batch-invariant EP selection only recognizes the SM100 BF16 CuTeDSL backend"
         )
+    clamp = (
+        kernel.gate_up_clamp
+        if kernel.gate_up_clamp is not None
+        else kernel.activation_clamp
+    )
     return {
         "family": "sm100_bf16_cutedsl",
         "version": BF16_BATCH_INVARIANT_VERSION,
         "intermediate": kernel.intermediate_size,
         "top_k": kernel.top_k,
         "activation": "swiglu",
-        "gate_up_clamp": (
-            kernel.gate_up_clamp
-            if kernel.gate_up_clamp is not None
-            else kernel.activation_clamp
-        ),
+        "gate_up_clamp_bits": None if clamp is None else f32_bits(abs(clamp)),
         "apply_routing_weights_before_fc2": kernel.apply_routing_weights_before_fc2,
     }
 

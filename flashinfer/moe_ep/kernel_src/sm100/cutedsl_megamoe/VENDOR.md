@@ -30,6 +30,15 @@ replace its own device snapshot.
 
 ## Pending local diffs vs upstream
 
+- **Single-CTA dynamic scheduling:**
+  `src/moe_nvfp4_swapab/fc1_fc2_fuse_sched.py` publishes atomic-counter work
+  through a warp shuffle for one-CTA clusters, followed by the existing local
+  scheduler-to-consumer pipeline. Only multi-CTA clusters use the DSMEM
+  asynchronous-store publication protocol, whose PTX instruction requires at
+  least two CTAs. This fixes newly admitted M128 BF16 plans; paired-CTA
+  scheduling and the arithmetic trace are unchanged. Reapply until upstream
+  absorbs the fix.
+
 - **BF16 batch-invariant tile variants:**
   `src/moe_bf16_glu/kernel_bf16_glu_fc12.py` admits M128 single-CTA and M256
   paired-CTA tiles, N128/N256 and K64/K128/K256, with one instruction group

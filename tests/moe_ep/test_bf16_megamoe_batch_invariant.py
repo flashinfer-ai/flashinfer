@@ -435,6 +435,101 @@ def test_bf16_batch_invariant_across_batches_and_plans(
     _run_matrix(0, 1, weight_before_fc2, request.config.getoption("--full"))
 
 
+@pytest.mark.parametrize("weight_before_fc2", (False, True))
+@pytest.mark.parametrize(
+    "geometry,schedule,carrier",
+    (
+        pytest.param(
+            (128, 128, 64), "atomic_counter", "epi_warps", id="one_cta_atomic_epi"
+        ),
+        pytest.param(
+            (128, 128, 256),
+            "atomic_counter",
+            "standalone_warps",
+            id="one_cta_atomic_standalone",
+        ),
+        pytest.param(
+            (128, 256, 128),
+            "atomic_counter",
+            "reuse_dispatch_warps",
+            id="one_cta_atomic_reuse",
+        ),
+        pytest.param(
+            (128, 128, 64), "static", "epi_warps", id="one_cta_static_control"
+        ),
+        pytest.param(
+            (256, 128, 64),
+            "atomic_counter",
+            "standalone_warps",
+            id="two_cta_atomic_control",
+        ),
+    ),
+)
+def test_bf16_batch_invariant_scheduler_sanitizer(
+    geometry, schedule, carrier, weight_before_fc2, monkeypatch
+):
+    """Exercise atomic claim publication under device memory checking.
+
+    Run this target with ``compute-sanitizer --tool memcheck --error-exitcode 1
+    python -m pytest``. The former singleton-cluster st.async can pass ordinary
+    bitwise checks while memcheck reports an invalid shared-memory write.
+    Include first and subsequent claims, all carriers, and both control paths.
+    """
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        pytest.skip("single-rank sanitizer regression")
+    _require_cuda()
+    import torch
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
+    problem = _problem(0, 1, hidden=224, intermediate=256)
+    baseline = {"load_balance_mode": "static", "token_back_mode": "epi_warps"}
+    with _session(problem, 0, 1, 257, baseline, weight_before_fc2) as (stage, launch):
+        stage(torch.arange(257, device="cuda"))
+        anchor = torch.empty_like(problem[0])
+        launch(anchor)
+        torch.cuda.synchronize()
+        assert torch.isfinite(anchor).all() and torch.count_nonzero(anchor) > 0
+
+    paired = geometry[0] == 256
+    knobs = dict(
+        mma_tiler_mnk=geometry,
+        cluster_shape_mnk=(2 if paired else 1, 1, 1),
+        use_2cta_instrs=paired,
+        load_balance_mode=schedule,
+        token_back_mode=carrier,
+    )
+    small = torch.tensor([19, 20, 1, 53], device="cuda")
+    with _session(problem, 0, 1, 257, knobs, weight_before_fc2) as (stage, launch):
+        # Active CTAs claim another ID after publishing their first tile.
+        # Larger cohorts also cross the M128 and M256 token-tile boundaries.
+        for order in (
+            small,
+            torch.arange(129, device="cuda"),
+            torch.arange(257, device="cuda"),
+        ):
+            stage(order)
+            output = torch.empty_like(anchor[order])
+            for _ in range(2):
+                launch(output)
+                _assert_bits(output, anchor[order], f"scheduler sanitizer, {knobs}")
+        stage(small)
+        output = torch.empty_like(anchor[small])
+        launch(output)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch(output)
+        prime = small.roll(2)
+        for masked in (False, True, False):
+            stage(prime)
+            graph.replay()
+            _assert_bits(output, anchor[prime], "scheduler graph prime")
+            stage(small, masked=masked)
+            graph.replay()
+            _assert_bits(output, anchor[small], "scheduler graph masked routes")
+        del graph
+
+
 def test_bf16_batch_invariant_public_layer_autotune_and_reload(monkeypatch):
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         pytest.skip("single-rank public-layer autotune smoke")

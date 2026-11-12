@@ -316,8 +316,10 @@ BF16, W4A4, W4A8, and W4A16 are supported through the unified compute path (`MoE
 
 ### Batch-invariant BF16 MegaMoE
 
-The initial batch-invariant implementation supports the SM100/SM103 BF16 CuTeDSL
-MegaMoE backend, selected explicitly through `MegaConfig`:
+Batch-invariant execution supports the SM100/SM103/SM107 BF16 CuTeDSL
+MegaMoE backend, selected explicitly through `MegaConfig`. SM107 requires native
+`sm_107a` compilation and a CUDA/CuTe launcher with oversized shared-memory
+support; multi-GPU NVLink execution also needs a Rubin-aware NCCL.
 
 ```python
 from flashinfer.moe_ep import (
@@ -347,8 +349,8 @@ weight is NaN; they do not read a prior invocation's combine cells.
 
 Batch-invariant mode disables in-kernel FC2 atomic reduction and uses an ordered
 finalizer. It requires finalized output; `FinalizeMode.NONE` is unsupported.
-The kernel geometry, accumulation, activation and routing-weight placement
-remain fixed across all permitted plans. In particular,
+Permitted tile geometries preserve the same ordered K16 accumulation,
+activation and routing-weight placement. In particular,
 `apply_routing_weights_before_fc2` selects a numerical calculation: keep its
 value fixed when comparing batches. Create a new layer to change numerical
 settings after construction; mutating a configuration does not update an
@@ -357,12 +359,17 @@ heuristic fallbacks must all satisfy the batch-invariant configuration restricti
 Changing communication scheduling alone may remain eligible where it preserves
 that calculation.
 
-The initial allowlist fixes `mma_tiler_mnk=(256, 256, 64)`,
-`cluster_shape_mnk=(2, 1, 1)`, `flag_batch=1`, `epi_flag_batch=(1, 1)` and
-`group_hint=None`. Static and atomic-counter task assignment and the three
-existing token-back carriers remain eligible. Integer task counters do not
-accumulate output values. An unrecognized knob or numerical implementation is
-rejected rather than silently admitted.
+The tile family admits M128/M256, N128/N256 and K64/K128/K256. M128 uses one CTA
+with `cluster_shape_mnk=(1, 1, 1)`; M256 uses paired CTAs with
+`cluster_shape_mnk=(2, 1, 1)`. Tile K must divide both hidden and intermediate
+sizes after rounding each up to 64, preserving the original padded K16 trace.
+Every selected plan must fit at least one A/B pipeline stage in shared memory:
+232448 bytes per CTA on SM100/SM103 or 334848 bytes in SM107 oversized mode.
+`flag_batch=1`, `epi_flag_batch=(1, 1)` and `group_hint=None` remain fixed.
+Static and atomic-counter task assignment and the three token-back carriers
+remain eligible, giving up to 72 plans before shape and resource filtering.
+Integer task counters do not accumulate output values. An unrecognized knob or
+numerical implementation is rejected rather than silently admitted.
 
 Use this backend directly for the initial implementation. SM100 BF16 does not
 yet implement the outer `AutoConfig` complete-EP selection protocol. An
@@ -387,7 +394,7 @@ receipt = fingerprint(
     num_experts=num_experts,
     apply_routing_weights_before_fc2=True,
     gate_up_clamp=None,
-    arch="sm_100",  # sm_103 is also supported; defaults to the active device
+    arch="sm_100",  # sm_103 / sm_107 also supported; defaults to the active device
 )
 ```
 
@@ -400,15 +407,16 @@ The BI activation runs this same chain through a device backend with pinned
 As in ordinary MegaMoE, the effective clamp is `abs(gate_up_clamp)`, so opposite
 signs of the same clamp magnitude share a receipt. FP32 constants are identified
 by bits, including the negative-zero lower bound of a zero clamp.
-Early and late routing-weight placement have different fingerprints. All six
-admitted schedules/carriers of one calculation share one fingerprint. Batch,
+Early and late routing-weight placement have different fingerprints. All
+admitted tile/schedule/carrier plans of one calculation share one fingerprint. Batch,
 capacity, packing order and pointers are absent from the receipt; input and
 weight values and ordered routing slots remain runtime inputs.
 
 The digest binds component terms and their composition rather than expanding a
 full dense FFN expression. It is a specification identifier, not a source hash or
-a proof certificate. Policy version 2 caches also match this arithmetic digest;
-version 1 entries and entries with a missing or mismatched digest are not reused.
+a proof certificate. Admission-policy version 3 caches also match this arithmetic
+digest; older-policy entries and entries with a missing or mismatched digest
+are not reused. The arithmetic specification remains version 1.
 
 `batch_invariant/lean/BIKernels/MegaMoE.lean` proves the K64-to-K16 lowering,
 configuration agreement, token permutation/sub-batch invariance and logical
