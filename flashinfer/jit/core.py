@@ -832,6 +832,10 @@ def gen_jit_spec(
         # non debug mode
         cuda_cflags += ["-DNDEBUG", "-O3"]
         cflags += ["-DNDEBUG", "-O3"]
+    else:
+        # non debug mode on Windows: -O2 is set above, NDEBUG as on Linux
+        cuda_cflags += ["-DNDEBUG"]
+        cflags += ["-DNDEBUG"]
 
     # useful for ncu source correlation
     if os.environ.get("FLASHINFER_JIT_LINEINFO", "0") == "1":
