@@ -37,6 +37,9 @@ def get_windows_header_overlay(
     )
     for header in headers:
         source = source_root / header
+        # Skip stubbed downloads (CPU tests); verify_symlinked_headers flags real gaps.
+        if not source.is_file():
+            continue
         content = source.read_bytes().decode("utf-8")
         if header == _PATCHED_HEADER:
             old_count = content.count(_OLD_DECLARATION)
