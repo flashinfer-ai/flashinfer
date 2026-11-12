@@ -29,8 +29,11 @@
 """Microbenchmark for sparse-MLA paged attention on SM120.
 
 ``--mega`` selects fused Q RoPE, attention, inverse RoPE and FP8 output for
-DSv4.1 prefill. Unsupported rows remain in the report as NaN. Without it,
-timings cover attention alone. Compare checkout reports outside this script.
+DSv4.1 prefill at every Q size. NaN marks rows outside this mode.
+``--full-pipeline`` times the same work with separate transform kernels;
+otherwise timings cover attention alone. ``--force-prefill`` selects prefill
+for DSv4.1 non-mega measurements too. Compare checkout reports outside this script.
+``--cuda-graph`` uses warm-L2 replay; eager timing flushes L2.
 
 Sweeps representative shapes:
 
@@ -39,10 +42,10 @@ Sweeps representative shapes:
 * DSv3.2 (d_qk=576, page_block_size=64, 656 B/token)
 * DSv4.1 (d_qk=512, page_block_size=64, 528 B/token) in the footer-scale and
   inline-scale (FlashMLA V4.1 record) placements, with and without the 288 B
-  FP4 compressed cache; timed per call with CUPTI on a cold L2
+  FP4 compressed cache
 
-The KV pool is sized ≫ L2 so the analytical KV bandwidth reflects DRAM-bound
-large-cache prefill. Reports median latency, KV bandwidth, and analytical
+The KV pool exceeds L2, though repeated graph replays can retain selected rows.
+Reports median latency, effective KV bandwidth, and analytical
 attention TFLOPs. Requires sm120a / sm121a.
 """
 
@@ -144,7 +147,9 @@ def quantize_kv_dsv3_2(kv_bf16: torch.Tensor) -> torch.Tensor:
 # ── Benchmark one config ─────────────────────────────────────────────────────
 
 
-def bench_sparse_mla_sm120(num_heads, topk, num_tokens, with_sink=False, seed=0):
+def bench_sparse_mla_sm120(
+    num_heads, topk, num_tokens, with_sink=False, seed=0, use_cuda_graph=False
+):
     """Returns (median_us, kv_bw_gbps, attn_tflops)."""
     torch.manual_seed(seed)
     device = torch.device("cuda")
@@ -197,7 +202,13 @@ def bench_sparse_mla_sm120(num_heads, topk, num_tokens, with_sink=False, seed=0)
     # Warm + measure.
     fn()
     torch.cuda.synchronize()
-    measurements = bench_gpu_time(fn, dry_run_time_ms=100, repeat_time_ms=1000)
+    measurements = bench_gpu_time(
+        fn,
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
+        use_cuda_graph=use_cuda_graph,
+        cold_l2_cache=not use_cuda_graph,
+    )
     ms = float(np.median(measurements))
 
     # KV bandwidth: read num_tokens * topk slots × 584 bytes/slot from gmem.
@@ -242,6 +253,7 @@ def bench_sparse_mla_sm120_dsv4_dual(
     extra_topk_length=None,
     with_sink=False,
     seed=0,
+    use_cuda_graph=False,
 ):
     """Returns (median_us, kv_bw_gbps, attn_tflops) for DSv4 dual-cache prefill.
 
@@ -304,7 +316,13 @@ def bench_sparse_mla_sm120_dsv4_dual(
 
     fn()
     torch.cuda.synchronize()
-    measurements = bench_gpu_time(fn, dry_run_time_ms=100, repeat_time_ms=1000)
+    measurements = bench_gpu_time(
+        fn,
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
+        use_cuda_graph=use_cuda_graph,
+        cold_l2_cache=not use_cuda_graph,
+    )
     ms = float(np.median(measurements))
 
     actual_extra_topk = _actual_extra_topk(topk_extra, extra_topk_length)
@@ -323,6 +341,7 @@ def bench_sparse_mla_sm120_dsv3_2(
     seed=0,
     kv_scale_format="arbitrary_fp32",
     prefill_impl="auto",
+    use_cuda_graph=False,
 ):
     """Returns (median_us, kv_bw_gbps, attn_tflops) for DSv3.2.
 
@@ -386,7 +405,13 @@ def bench_sparse_mla_sm120_dsv3_2(
 
     fn()
     torch.cuda.synchronize()
-    measurements = bench_gpu_time(fn, dry_run_time_ms=100, repeat_time_ms=1000)
+    measurements = bench_gpu_time(
+        fn,
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
+        use_cuda_graph=use_cuda_graph,
+        cold_l2_cache=not use_cuda_graph,
+    )
     ms = float(np.median(measurements))
 
     bpt = 656  # DSv3.2 INLINE per-token bytes
@@ -450,6 +475,9 @@ def bench_sparse_mla_sm120_dsv41(
     seed=0,
     mega=False,
     prefill_impl="auto",
+    use_cuda_graph=False,
+    full_pipeline=False,
+    force_prefill=False,
 ):
     """Returns (median_us, kv_bw_gbps) for DeepSeek-V4.1 on 64-token pages.
 
@@ -457,9 +485,9 @@ def bench_sparse_mla_sm120_dsv41(
     "ue8m0_g32_inline"``) over the footer-scale pages (``"ue8m0_g32"``).
     ``extra_topk`` adds a compressed cache (FP4 records with ``extra_fp4``).
     ``compute_precision`` is the wrapper's (``"bf16"`` runs the full-BF16 route).
-    Pools exceed L2, and every call starts with a flushed L2.
+    Eager timing flushes L2; graph timing reuses buffers (warm L2).
     """
-    if mega and (num_tokens <= 64 or num_heads % 32 or compute_precision == "bf16"):
+    if mega and (compute_precision == "bf16"):
         return float("nan"), float("nan")
     if prefill_impl == "swapab":
         return float("nan"), float("nan")  # No DSv4.1 swapAB instantiation.
@@ -496,32 +524,100 @@ def bench_sparse_mla_sm120_dsv41(
     output = torch.empty(
         num_tokens, num_heads, 512, device=device, dtype=torch.bfloat16
     )
-    if mega:
-        positions = torch.arange(num_tokens, device=device, dtype=torch.int32)
-        inv_freq = 10000.0 ** (-torch.arange(32, device=device).float() / 32)
-        angles = positions.float()[:, None] * inv_freq
-        cos_sin = torch.cat((angles.cos(), angles.sin()), -1).contiguous()
-        output = torch.empty_like(output, dtype=torch.float8_e4m3fn)
-        scales = torch.empty(
-            num_tokens, num_heads, 16, device=device, dtype=torch.uint8
-        )
-        run = functools.partial(
-            wrapper.run_mega, positions=positions, cos_sin=cos_sin, output_scales=scales
-        )
-    else:
-        run = wrapper.run
+    positions = torch.arange(num_tokens, device=device, dtype=torch.int32)
+    inv_freq = 10000.0 ** (-torch.arange(32, device=device).float() / 32)
+    angles = positions.float()[:, None] * inv_freq
+    cos_sin = torch.cat((angles.cos(), angles.sin()), -1).contiguous()
+    quantized = torch.empty_like(output, dtype=torch.float8_e4m3fn)
+    scales = torch.empty(num_tokens, num_heads, 16, device=device, dtype=torch.uint8)
+    rotated = torch.empty_like(q)
 
-    def fn():
-        run(
-            q,
-            main,
-            indices,
-            output,
-            512**-0.5,
-            extra_kv_cache=extra,
-            extra_indices=extra_indices,
-            prefill_impl=prefill_impl,
+    if mega or force_prefill:
+        from flashinfer.mla._sparse_mla_sm120._execution import (
+            resolve_attention,
+            get_sparse_mla_sm120_module,
+            resolve_model_type,
         )
+
+        props = torch.cuda.get_device_properties(device)
+        plan = resolve_attention(
+            model=resolve_model_type(
+                512, "ue8m0_g32_inline" if inline else "ue8m0_g32"
+            ),
+            tokens=num_tokens,
+            heads=num_heads,
+            topk=topk,
+            extra_topk=extra_topk,
+            page_size=_DSV41_PAGE,
+            extra_page_size=_DSV41_PAGE if extra_topk else 0,
+            page_stride_bytes=main.stride(0),
+            extra_page_stride_bytes=extra.stride(0) if extra_topk else 0,
+            row_stride_bytes=528,
+            extra_row_stride_bytes=(288 if extra_fp4 else 528) if extra_topk else 0,
+            indices_stride=topk,
+            extra_indices_stride=extra_topk,
+            lse_stride=num_heads,
+            has_lengths=False,
+            has_extra_lengths=False,
+            has_sink=False,
+            extra_fp4=extra_fp4,
+            variant=1,
+            precision=compute_precision,
+            cpb=0,
+            sm_count=props.multi_processor_count,
+            max_shared_bytes=props.shared_memory_per_block_optin,
+        )
+        module = get_sparse_mla_sm120_module()
+        lse = torch.empty(q.shape[:2], device=device, dtype=torch.float32)
+
+    def attention(query):
+        if mega or force_prefill:
+            arguments = (
+                plan,
+                query,
+                main,
+                indices,
+                output,
+                lse,
+                output,
+                lse,
+                512**-0.5,
+                None,
+                None,
+                extra,
+                extra_indices,
+                None,
+                1.0,
+            )
+            if mega:
+                module.execute_attention_rope_fp8(
+                    *arguments, positions, cos_sin, quantized.view(torch.uint8), scales
+                )
+            else:
+                module.execute_attention(*arguments)
+        else:
+            wrapper.run(
+                query,
+                main,
+                indices,
+                output,
+                512**-0.5,
+                extra_kv_cache=extra,
+                extra_indices=extra_indices,
+                prefill_impl=prefill_impl,
+            )
+
+    if full_pipeline and not mega:
+        from tests.attention.sparse_mla_prefill_utils import rope, epilogue
+
+        def fn():
+            rope(q, positions, cos_sin, rotated)
+            attention(rotated)
+            epilogue(output, positions, cos_sin, quantized, scales)
+    else:
+
+        def fn():
+            attention(q)
 
     fn()
     torch.cuda.synchronize()
@@ -529,13 +625,48 @@ def bench_sparse_mla_sm120_dsv41(
         fn,
         dry_run_time_ms=100,
         repeat_time_ms=1000,
-        enable_cupti=True,
-        cold_l2_cache=True,
+        enable_cupti=not use_cuda_graph,
+        use_cuda_graph=use_cuda_graph,
+        cold_l2_cache=not use_cuda_graph,
     )
     ms = float(np.median(measurements))
     extra_bpt = 288 if extra_fp4 else 528
     kv_bytes = num_tokens * (topk * 528 + extra_topk * extra_bpt)
     return ms * 1e3, kv_bytes * 1e-6 / ms
+
+
+def bench_customer_prefill(
+    num_tokens, *, mega=False, inline=True, use_cuda_graph=False
+):
+    """CP=4 query partition, full gathered KV, H=64, causal SWA+sparse IDs."""
+    from tests.attention.sparse_mla_prefill_utils import prefill_fixture, fused_call
+
+    f = prefill_fixture(
+        1,
+        "v41_fp8",
+        heads=64,
+        prefill_tokens=num_tokens,
+        prefill_cp_size=4,
+        keep_decoded=False,
+        inline=inline,
+    )
+    fn = (lambda: fused_call(f)) if mega else f["baseline"]
+    fn()
+    torch.cuda.synchronize()
+    return (
+        float(
+            np.median(
+                bench_gpu_time(
+                    fn,
+                    dry_run_time_ms=100,
+                    repeat_time_ms=1000,
+                    use_cuda_graph=use_cuda_graph,
+                    cold_l2_cache=not use_cuda_graph,
+                )
+            )
+        )
+        * 1e3
+    )
 
 
 if __name__ == "__main__":
@@ -551,13 +682,47 @@ if __name__ == "__main__":
     parser.add_argument(
         "--compute-precision", choices=("default", "fp8", "bf16"), default="default"
     )
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="Time CUDA Graph replay with warm L2; eager timing flushes L2",
+    )
+    parser.add_argument(
+        "--full-pipeline",
+        action="store_true",
+        help="Time separate Q RoPE, attention, inverse output RoPE and FP8 quantization for DSv4.1",
+    )
+    parser.add_argument(
+        "--force-prefill",
+        action="store_true",
+        help="Explicitly select DSv4.1 prefill, including Q <= 64",
+    )
+    parser.add_argument(
+        "--customer-q",
+        type=int,
+        nargs="+",
+        help="Run only CP=4 full-pipeline customer cases; KV=4*Q, H=64, both FP8 layouts",
+    )
     args = parser.parse_args()
+    print("Timing: warm-L2 CUDA Graph" if args.cuda_graph else "Timing: eager, cold L2")
 
     if not is_sm120a_supported(torch.device("cuda")):
         raise SystemExit("Sparse-MLA SM120 requires sm120a.")
 
+    if args.customer_q:
+        print("Q,KV,H,layout,full_pipeline_us")
+        for qlen in args.customer_q:
+            for inline in (False, True):
+                us = bench_customer_prefill(
+                    qlen, mega=args.mega, inline=inline, use_cuda_graph=args.cuda_graph
+                )
+                print(
+                    f"{qlen},{4 * qlen},64,{'inline' if inline else 'footer'},{us:.4f}"
+                )
+        raise SystemExit(0)
+
     if args.mega:
-        print("NaN = unsupported mega row (non-DSv4.1, decode, H<32, or BF16).")
+        print("NaN = not benchmarked by this mode (non-DSv4.1 or BF16 mega).")
 
     # (num_heads, topk, num_tokens). T <= 64 hits decode; T > 64 hits prefill.
     decode_configs = [
@@ -651,7 +816,9 @@ if __name__ == "__main__":
     print("-" * len(header))
     for h, k, t in decode_configs:
         lat_us, kvbw, tfl = (
-            (float("nan"),) * 3 if args.mega else bench_sparse_mla_sm120(h, k, t)
+            (float("nan"),) * 3
+            if args.mega or args.full_pipeline
+            else bench_sparse_mla_sm120(h, k, t, use_cuda_graph=args.cuda_graph)
         )
         print(f"{h:>10}  {k:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}")
 
@@ -661,7 +828,9 @@ if __name__ == "__main__":
     print("-" * len(header))
     for h, k, t in prefill_configs:
         lat_us, kvbw, tfl = (
-            (float("nan"),) * 3 if args.mega else bench_sparse_mla_sm120(h, k, t)
+            (float("nan"),) * 3
+            if args.mega or args.full_pipeline
+            else bench_sparse_mla_sm120(h, k, t, use_cuda_graph=args.cuda_graph)
         )
         print(f"{h:>10}  {k:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}")
 
@@ -672,9 +841,14 @@ if __name__ == "__main__":
     for h, k_extra, t, extra_pbs, extra_len in dual_prefill_configs:
         lat_us, kvbw, tfl = (
             (float("nan"),) * 3
-            if args.mega
+            if args.mega or args.full_pipeline
             else bench_sparse_mla_sm120_dsv4_dual(
-                h, k_extra, t, extra_pbs, extra_topk_length=extra_len
+                h,
+                k_extra,
+                t,
+                extra_pbs,
+                extra_topk_length=extra_len,
+                use_cuda_graph=args.cuda_graph,
             )
         )
         extra_len_label = "full" if extra_len is None else str(extra_len)
@@ -694,7 +868,9 @@ if __name__ == "__main__":
     print("-" * len(header))
     for h, t in dsv3_2_configs:
         lat_us, kvbw, tfl = (
-            (float("nan"),) * 3 if args.mega else bench_sparse_mla_sm120_dsv3_2(h, t)
+            (float("nan"),) * 3
+            if args.mega or args.full_pipeline
+            else bench_sparse_mla_sm120_dsv3_2(h, t, use_cuda_graph=args.cuda_graph)
         )
         print(
             f"{h:>10}  {2048:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}"
@@ -712,9 +888,13 @@ if __name__ == "__main__":
         for h, t in dsv3_2_prefill_configs:
             lat_us, kvbw, tfl = (
                 (float("nan"),) * 3
-                if args.mega
+                if args.mega or args.full_pipeline
                 else bench_sparse_mla_sm120_dsv3_2(
-                    h, t, kv_scale_format=fmt, prefill_impl=args.prefill_impl
+                    h,
+                    t,
+                    kv_scale_format=fmt,
+                    prefill_impl=args.prefill_impl,
+                    use_cuda_graph=args.cuda_graph,
                 )
             )
             print(
@@ -728,11 +908,11 @@ if __name__ == "__main__":
         f"{'footer (us)':>12}  {'inline (us)':>12}  {'inline/footer':>13}"
     )
     print()
-    print("DSv4.1 (page_block_size=64, cold L2, CUPTI):")
+    print("DSv4.1 (page_block_size=64):")
     print(dsv41_header)
     print("-" * len(dsv41_header))
     for label, topk, extra_topk in (("512", 512, 0), ("128+fp4", 128, 512)):
-        for t in (1, 4, 16, 64, 1024):
+        for t in (1, 4, 16, 32, 64, 1024):
             for h in (8, 16, 32, 64):
                 footer_us, _ = bench_sparse_mla_sm120_dsv41(
                     h,
@@ -741,6 +921,9 @@ if __name__ == "__main__":
                     extra_topk,
                     extra_fp4=bool(extra_topk),
                     mega=args.mega,
+                    use_cuda_graph=args.cuda_graph,
+                    full_pipeline=args.full_pipeline,
+                    force_prefill=args.force_prefill,
                     prefill_impl=args.prefill_impl,
                     compute_precision=args.compute_precision,
                 )
@@ -752,6 +935,9 @@ if __name__ == "__main__":
                     extra_fp4=bool(extra_topk),
                     inline=True,
                     mega=args.mega,
+                    use_cuda_graph=args.cuda_graph,
+                    full_pipeline=args.full_pipeline,
+                    force_prefill=args.force_prefill,
                     prefill_impl=args.prefill_impl,
                     compute_precision=args.compute_precision,
                 )
