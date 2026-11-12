@@ -150,7 +150,7 @@ def parse_quantization_args(line, parser):
         type=int,
         required=False,
         default=32,
-        help="sfVecSize for quantization. Default: 32",
+        help="K is padded up to a multiple of this (mxfp8_quantize). Default: 32",
     )
     parser.add_argument(
         "--backends",
@@ -254,10 +254,14 @@ def testMxfp8Quantize(args):
     run_refcheck = args.refcheck
     res = []
 
-    # Validate k is divisible by alignment (sf_vec_size)
-    sf_vec_size = alignment
-    if k % sf_vec_size != 0:
-        raise ValueError(f"k ({k}) must be divisible by {sf_vec_size} (sf_vec_size)")
+    # MXFP8 scales cover 32 elements; `alignment` pads K up to a multiple of it.
+    sf_vec_size = 32
+    if k % sf_vec_size != 0 or alignment % sf_vec_size != 0:
+        raise ValueError(
+            f"k ({k}) and alignment ({alignment}) must be divisible by "
+            f"{sf_vec_size} (sf_vec_size)"
+        )
+    padded_k = (k + alignment - 1) // alignment * alignment
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     if len(backends) == 0:
@@ -357,8 +361,8 @@ def testMxfp8Quantize(args):
                     dequantized = flashinfer.mxfp8_dequantize_host(
                         x_q_cpu, sf_cpu, is_sf_swizzled_layout=is_sf_swizzled_layout
                     )
-                    # Move back to GPU for comparison
-                    dequantized = dequantized.to(input_tensor.device)
+                    # Move back to GPU for comparison; drop the K padding.
+                    dequantized = dequantized.to(input_tensor.device)[:, :k]
                     # Compare with original input (allowing for quantization error)
                     (
                         num_different_elements,
@@ -419,10 +423,11 @@ def testMxfp8Quantize(args):
             # Read: input tensor
             # Write: quantized tensor (fp8) + scale factors
             num_elements = m * k
-            num_scale_factors = num_elements // sf_vec_size
+            num_output_elements = m * padded_k  # K padded to `alignment`
+            num_scale_factors = num_output_elements // sf_vec_size
             problem_bytes = (
                 num_elements * input_dtype.itemsize  # input read
-                + num_elements * 1  # quantized output write (fp8 = 1 byte)
+                + num_output_elements * 1  # quantized output write (fp8 = 1 byte)
                 + num_scale_factors * 1  # scale factors write (1 byte each)
             )
             # Quantization is memory-bound, TFLOPS not primary metric
