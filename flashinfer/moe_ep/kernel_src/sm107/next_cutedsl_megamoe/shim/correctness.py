@@ -100,6 +100,29 @@ def sampled_reference(
                 partial, dst=global_source, op=dist.ReduceOp.SUM, group=process_group
             )
         if source_rank == cfg.rank:
+            if cfg.shared_quant_kind:
+                shared_l1, shared_l2 = symm_buffer._shared_weights
+                shared = compute_megamoe_reference_sm107_block_scaled(
+                    local[0],
+                    local[1],
+                    torch.zeros(
+                        (sample_size, 1), dtype=torch.int32, device=local[0].device
+                    ),
+                    torch.ones(
+                        (sample_size, 1), dtype=torch.float32, device=local[0].device
+                    ),
+                    shared_l1[0].permute(0, 2, 1),
+                    shared_l1[1],
+                    shared_l2[0].permute(0, 2, 1),
+                    shared_l2[1],
+                    quant_kind="mxfp8_e4m3",
+                    combine_dtype="bf16",
+                    local_expert_offset=0,
+                    gate_up_clamp=cfg.gate_up_clamp,
+                    apply_routing_weights_before_fc2=False,
+                    weight_scales_are_swizzled=True,
+                )
+                partial = partial + shared.float()
             expected = partial[:count].to(torch.bfloat16)
     return indices, expected
 

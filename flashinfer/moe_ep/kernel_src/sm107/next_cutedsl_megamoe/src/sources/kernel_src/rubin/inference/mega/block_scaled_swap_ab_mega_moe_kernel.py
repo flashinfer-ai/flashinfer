@@ -5,7 +5,7 @@ from typing import ClassVar, Optional, Tuple
 import cuda.bindings.driver as cuda
 
 import cutlass
-from .....helpers.ptx_helpers import barrier_sync_unaligned
+from .....helpers.ptx_helpers import barrier_sync_unaligned, red_add_release_gpu_s32
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
@@ -44,6 +44,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
     fc1_output_region: ClassVar[str] = "rubin.mega_moe.fc1_output"
     fc1_output_sf_region: ClassVar[str] = "rubin.mega_moe.fc1_output_sf"
     fc1_done_counter_region: ClassVar[str] = "rubin.mega_moe.fc1_done_counter"
+    shared_input_sf_region: ClassVar[str] = "rubin.mega_moe.shared_input_sf"
+    shared_ready_region: ClassVar[str] = "rubin.mega_moe.shared_ready"
+    shared_fc1_region: ClassVar[str] = "rubin.mega_moe.shared_fc1"
+    shared_fc1_sf_region: ClassVar[str] = "rubin.mega_moe.shared_fc1_sf"
+    shared_fc2_region: ClassVar[str] = "rubin.mega_moe.shared_fc2"
     epilogue_warp_ids: ClassVar[Tuple[int, int, int, int]] = (0, 1, 2, 3)
     mma_warp_id: ClassVar[int] = 4
     tma_a_warp_id: ClassVar[int] = 5
@@ -62,6 +67,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "intermediate_gateup_size": StaticOrRuntimeIntegerType,
             "hidden_size": StaticOrRuntimeIntegerType,
             "quant_kind": str,
+            "shared_quant_kind": OptionalRequirement(Optional[str]),
             "a_major_mode": OperandMajorMode,
             "b_major_mode": OperandMajorMode,
             "combine_format": CombineFormat,
@@ -105,6 +111,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
         self.hidden_size = problem_desc["hidden_size"]
         self.quant_kind = QuantKind(problem_desc["quant_kind"])
+        self.shared_quant_kind = problem_desc.get("shared_quant_kind")
         self.a_dtype = self.quant_kind.weight_dtype
         self.b_dtype = self.quant_kind.activation_dtype
         self.sf_dtype = self.quant_kind.sf_dtype
@@ -244,6 +251,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         )
 
     def _validate_geometry(self) -> None:
+        if self.shared_quant_kind is not None:
+            if self.quant_kind is not QuantKind.mxfp4_mxfp8 or self.shared_quant_kind != "mxfp8_e4m3":
+                raise ValueError("Shared weights require MXFP4 routed weights and MXFP8 E4M3 shared weights.")
+            if self.reduce_topk_in_kernel or self.combine_format.is_quantized:
+                raise ValueError("Shared experts require separate BF16 combine.")
         static_expert_dimensions = (
             isinstance(self.expert_count, int),
             isinstance(self.intermediate_gateup_size, int),
@@ -391,6 +403,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         sf_column_count = round_up(ceil_div(intermediate_downproj, self.sf_vec_size), 4)
         max_sf_rows = self.token_comm.worst_case_sf_token_count
         counter_slot_count = self.token_comm.max_fc1_ready_slot_count
+        self.shared_counter_offset = counter_slot_count
+        if self.shared_quant_kind is not None:
+            counter_slot_count += ceil_div(self.max_tokens_per_rank, self.mma_tiler_mnk[1])
 
         device_workspace = DeviceWorkspace()
         device_workspace.register(
@@ -417,6 +432,23 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             byte_alignment=16,
             reset="tail_reset",
         )
+        if self.shared_quant_kind is not None:
+            shared_rows = round_up(self.max_tokens_per_rank, 128)
+            for name, dtype, shape in (
+                (self.shared_input_sf_region, self.sf_dtype, (shared_rows, self.hidden_size // self.sf_vec_size)),
+                (self.shared_fc1_region, self.b_dtype, (shared_rows, intermediate_downproj)),
+                (self.shared_fc1_sf_region, self.sf_dtype, (shared_rows, sf_column_count)),
+                (self.shared_fc2_region, cutlass.BFloat16, (shared_rows, 1, self.hidden_size)),
+            ):
+                device_workspace.register(
+                    name, dtype, shape, buffer_space="local",
+                    mem_order=tuple(reversed(range(len(shape)))), byte_alignment=128,
+                )
+            device_workspace.register(
+                self.shared_ready_region, cutlass.Int32,
+                (ceil_div(self.max_tokens_per_rank, self.mma_tiler_mnk[1]),),
+                buffer_space="local", byte_alignment=16, reset="tail_reset",
+            )
         self.scheduler.register_device_workspace(device_workspace)
         self.token_comm.register_device_workspace(device_workspace)
         device_workspace.finalize()
@@ -472,6 +504,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"situ{self.situ_beta}x{self.situ_linear_beta}_"
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
             f"{'inkernel_redg' if self.reduce_topk_in_kernel else 'separate_reduce'}"
+            + (f"_shared{self.shared_quant_kind}" if self.shared_quant_kind is not None else "")
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -550,6 +583,14 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 fc1_norm_const=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
             )
 
+        if self.shared_quant_kind is not None:
+            fake_arguments["shared_weights"] = (
+                fake_tensor(cutlass.Float8E4M3FN, (1, hidden, intermediate_gateup), (2, 0, 1), {0, 2}, 16),
+                fake_tensor(self.sf_dtype, (1, fc1_weight_sf_columns), (1, 0), {0}, 16),
+                fake_tensor(cutlass.Float8E4M3FN, (1, intermediate_downproj, hidden), (2, 0, 1), {0, 2}, 16),
+                fake_tensor(self.sf_dtype, (1, fc2_weight_sf_columns), (1, 0), {0}, 16),
+            )
+
         compiled = cute.compile[cute.EnableTVMFFI(True)](self, **fake_arguments)
         if out_path is None:
             return compiled
@@ -602,6 +643,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_alpha: Optional[cute.Tensor] = None,  # (local_experts,)
         fc2_alpha: Optional[cute.Tensor] = None,  # (local_experts,)
         fc1_norm_const: Optional[cute.Tensor] = None,  # (local_experts,)
+        shared_weights = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
 
@@ -633,6 +675,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                         f"{self.quant_kind} folds its rescale into the e8m0 scale factors, "
                         f"so {scalar_name} must be None."
                     )
+
+        if cutlass.const_expr((shared_weights is None) != (self.shared_quant_kind is None)):
+            raise ValueError("Shared weights must match the compiled kernel.")
 
         router_topk_scores = topk_scores if cutlass.const_expr(self.apply_topk_at_fc1) else None
         local_rank = peer_rank_ptr_mapper_host.rank
@@ -794,6 +839,17 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             self.epilogue.prepare_tma_store_params(fc1_output_gemm, fc2_output)
         )
 
+        shared_tma_params = None
+        shared_outputs = None
+        shared_token_count = None
+        shared_output = None
+        if cutlass.const_expr(shared_weights is not None):
+            shared_token_count = Int32(output_activation.shape[0])
+            shared_tma_params, shared_outputs = self._prepare_shared_tensors(
+                activation, shared_weights
+            )
+            shared_output = shared_outputs[3]
+
         grid = self.scheduler.get_grid_shape(max_active_clusters=self.launch_cluster_count)
         self._device_workspace.remove_device_members()
         kernel = self._kernel(
@@ -831,6 +887,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc1_alpha,
             fc2_alpha,
             fc1_norm_const,
+            shared_tma_params,
+            shared_outputs,
+            shared_token_count,
         )
         if cutlass.const_expr(self.mixed_cga_config.is_mixed):
             kernel.launch(
@@ -854,10 +913,78 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         if cutlass.const_expr(not self.reduce_topk_in_kernel):
             reduce_scores = None if cutlass.const_expr(self.apply_topk_at_fc1) else topk_scores
             reduce_indices = topk_indices if cutlass.const_expr(self.masks_invalid_combine_slots) else None
-            self._topk_reduce(
-                pre_reduced_activation, pre_reduced_activation_sf, output_activation, reduce_scores, stream,
-                topk_indices=reduce_indices,
+            if cutlass.const_expr(shared_output is not None):
+                if shared_token_count > 0:
+                    self._topk_reduce(
+                        pre_reduced_activation, pre_reduced_activation_sf, output_activation, reduce_scores, stream,
+                        topk_indices=reduce_indices, shared_output=shared_output,
+                    )
+            else:
+                self._topk_reduce(
+                    pre_reduced_activation, pre_reduced_activation_sf, output_activation, reduce_scores, stream,
+                    topk_indices=reduce_indices,
+                )
+
+    @cute.jit
+    def _prepare_shared_tensors(self, activation: cute.Tensor, weights):
+        hidden = self.hidden_size
+        intermediate = self.intermediate_gateup_size // 2
+        rows = round_up(self.max_tokens_per_rank, 128)
+        one = Int32(1)
+        fc1_weight, fc1_sf, fc2_weight, fc2_sf = weights
+        if cutlass.const_expr(fc1_weight.element_type is not cutlass.Float8E4M3FN or fc2_weight.element_type is not cutlass.Float8E4M3FN):
+            raise TypeError("Shared weights must retain E4M3 payloads.")
+        if cutlass.const_expr(fc1_sf.element_type is not self.sf_dtype or fc2_sf.element_type is not self.sf_dtype):
+            raise TypeError("Shared scales must be E8M0.")
+        def weight_view(weight, width, reduction):
+            return cute.make_tensor(
+                weight.iterator,
+                cute.make_layout((Int32(width), Int32(reduction), one),
+                    stride=(weight.stride[2], weight.stride[1], weight.stride[0])),
             )
+        def scale_view(pointer, tokens, width):
+            return cute.make_tensor(pointer, blockscaled_utils.tile_atom_to_shape_SF(
+                (Int32(tokens), Int32(width), one), self.sf_vec_size
+            ))
+        fc1_b = cute.make_tensor(activation.iterator, cute.make_layout(
+            (Int32(activation.shape[0]), Int32(hidden), one),
+            stride=(activation.stride[0], activation.stride[1], 0),
+        ))
+        fc1_sfb = scale_view(self._device_workspace.ptr(self.shared_input_sf_region), rows, hidden)
+        fc1_output = self._device_workspace.tensor(self.shared_fc1_region)
+        fc2_b = cute.make_tensor(fc1_output.iterator, cute.make_layout(
+            (Int32(rows), Int32(intermediate), one), stride=(*fc1_output.stride, 0)
+        ))
+        fc2_sfb = scale_view(self._device_workspace.ptr(self.shared_fc1_sf_region), rows, intermediate)
+        params = self._mainloop.shared_mainloop.prepare_tma_load_params(
+            fc1_a=weight_view(fc1_weight, intermediate * 2, hidden), fc1_b=fc1_b,
+            fc1_sfa=scale_view(fc1_sf.iterator, round_up(intermediate * 2, 128), hidden), fc1_sfb=fc1_sfb,
+            fc2_a=weight_view(fc2_weight, hidden, intermediate), fc2_b=fc2_b,
+            fc2_sfa=scale_view(fc2_sf.iterator, round_up(hidden, 128), round_up(intermediate, 128)), fc2_sfb=fc2_sfb,
+        )
+        fc2_output = self._device_workspace.tensor(self.shared_fc2_region)
+        fc1_store, fc1_store_tensor, _, _ = self.epilogue.shared_epilogue.prepare_tma_store_params(fc2_b, fc2_output)
+        return params, (fc1_store, fc1_store_tensor, fc2_sfb, fc2_output)
+
+    @cute.jit
+    def _stage_shared_input_scales(self, source: cute.Tensor, live_tokens: Int32, cta: Int32, tidx: Int32):
+        # The public input scales are row-major; TMA consumes the block-scaled layout.
+        rows = round_up(self.max_tokens_per_rank, 128)
+        destination = cute.make_tensor(
+            self._device_workspace.ptr(self.shared_input_sf_region),
+            blockscaled_utils.tile_atom_to_shape_SF((rows, self.hidden_size, 1), self.sf_vec_size),
+        )
+        ready = self._device_workspace.ptr(self.shared_ready_region)
+        lane = tidx % Int32(32)
+        warp = (tidx // Int32(32)) % Int32(4)
+        worker = cta * Int32(4) + warp
+        workers = Int32(self.mixed_cga_config.total_cta_cnt * 4)
+        for row in cutlass.range(worker, live_tokens, workers):
+            for column in cutlass.range(lane, self.hidden_size // self.sf_vec_size, 32):
+                destination[row, column * self.sf_vec_size, 0] = source[row, column]
+            cute.arch.sync_warp()
+            with cute.arch.elect_one():
+                red_add_release_gpu_s32(ready + row // Int32(self.mma_tiler_mnk[1]), Int32(1))
 
     @cute.kernel
     def _kernel(
@@ -896,6 +1023,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_alpha: Optional[cute.Tensor],
         fc2_alpha: Optional[cute.Tensor],
         fc1_norm_const: Optional[cute.Tensor],
+        shared_tma_params,
+        shared_outputs,
+        shared_token_count: Optional[Int32],
     ):
         """Compose TokenComm, Scheduler, Mainloop, and Epilogue."""
         self._mainloop.materialize_codegen_members()
@@ -976,6 +1106,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             smem_base=smem_base,
             device_workspace=self._device_workspace,
             is_fallback_cluster=is_fallback_cluster,
+            **({"shared_token_count": shared_token_count} if self.shared_quant_kind is not None else {}),
         )
         scheduler = self.scheduler
 
@@ -985,6 +1116,12 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc1_done_counter_pointer=fc1_done_counter.iterator,
             fc2_spin_threshold=fc2_spin_threshold,
             fc1_ready_counter_pointer=self.token_comm.fc1_ready_counter_pointer(self._device_workspace),
+            shared_expert_idx=self.local_expert_count if self.shared_quant_kind is not None else None,
+            shared_counter_offset=self.shared_counter_offset,
+            shared_ready_counter_pointer=(
+                self._device_workspace.ptr(self.shared_ready_region)
+                if self.shared_quant_kind is not None else None
+            ),
         )
         optional_epilogue_args = GatedActEpilogueArgs(
             fc1_alpha=fc1_alpha, fc2_alpha=fc2_alpha, fc1_norm_const=fc1_norm_const, topk_scores=pool_topk_scores
@@ -1042,6 +1179,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 ab_pipeline_state=tma_a_pipeline_state,
                 sched_consumer=sched_consumer,
                 kernel_extension=kernel_extension,
+                shared_tma_params=shared_tma_params[:8] if shared_tma_params is not None else None,
             )
             iket.range_pop()
 
@@ -1064,6 +1202,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 kernel_extension=kernel_extension,
                 fc1_done_counter_pointer=fc1_done_counter.iterator,
                 fc2_spin_threshold=fc2_spin_threshold,
+                shared_tma_params=shared_tma_params[8:] if shared_tma_params is not None else None,
             )
             iket.range_pop()
 
@@ -1077,6 +1216,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 ab_pipeline_state=mma_pipeline_state,
                 acc_pipeline=acc_pipeline,
                 sched_consumer=sched_consumer,
+                shared_expert_idx=self.local_expert_count if self.shared_quant_kind is not None else None,
             )
             iket.range_pop()
 
@@ -1107,6 +1247,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 fc2_output_sf,
                 peer_rank_ptr_mapper,
                 optional_epilogue_args,
+                shared_outputs=shared_outputs,
             )
             tmem_allocator.relinquish_alloc_permit()
             tmem_allocator.free(tmem_allocator.retrieve_ptr(self.acc_dtype), self._mainloop.num_tmem_alloc_cols)
@@ -1117,6 +1258,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
             if warp_idx < Int32(self.token_in_end_warp_idx):
                 iket.range_push("mega.token_in")
+                if cutlass.const_expr(shared_token_count is not None):
+                    self._stage_shared_input_scales(activation_sf, shared_token_count, linear_cta_idx, thread_idx)
                 self.token_comm.token_in(self._smem_workspace, smem_base)
                 iket.range_pop()
                 if cutlass.const_expr(

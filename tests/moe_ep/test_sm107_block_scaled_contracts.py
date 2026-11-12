@@ -385,6 +385,7 @@ def test_router_vector_tail_has_allocated_storage(capacity, topk):
 
 def _workspace():
     ws = object.__new__(Sm107BlockScaledSymmBuffer)
+    ws._shared_weights = None
     ws.config = _config()
     ws.device = torch.device("cpu")
     ws._destroyed = False

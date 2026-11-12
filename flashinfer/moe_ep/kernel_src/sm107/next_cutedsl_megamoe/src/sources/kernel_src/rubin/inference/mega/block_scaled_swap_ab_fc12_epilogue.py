@@ -1059,6 +1059,19 @@ class SwapABGatedActEpilogue(KernelComponent):
             self.fc2_tma_stages = 0
             self.fc2_staging_spec = None
 
+        self.shared_epilogue = None
+        if problem_desc.get("shared_quant_kind") is not None:
+            self.shared_epilogue = SwapABGatedActEpilogue(
+                ProblemDesc({**problem_desc, "quant_kind": "mxfp8_e4m3", "shared_quant_kind": None}),
+                ImplDesc({
+                    **{key: value for key, value in impl_desc.items() if key != "fc2_tma_stages"},
+                    "communication_enabled": False,
+                    "reduce_topk_in_kernel": False,
+                    "token_back_push_data": False,
+                    "fc2_use_bulk": False,
+                }),
+            )
+
     @classmethod
     def epilogue_sync_barrier(cls) -> pipeline.NamedBarrier:
         """The one barrier every epilogue rendezvous uses: all four warps, arrive-and-wait.
@@ -1228,6 +1241,7 @@ class SwapABGatedActEpilogue(KernelComponent):
         fc2_output_sf: Optional[cute.Tensor],
         peer_rank_ptr_mapper: Optional[SymmetricBufferDevice],
         optional_epi_args: Optional[GatedActEpilogueArgs] = None,
+        shared_outputs = None,
     ):
         if cutlass.const_expr(not smem_workspace.finalized):
             raise RuntimeError("SwapABGatedActEpilogue.run requires a finalized SmemWorkspace.")
@@ -1280,6 +1294,22 @@ class SwapABGatedActEpilogue(KernelComponent):
             optional_epi_args,
         )
 
+        if cutlass.const_expr((shared_outputs is None) != (self.shared_epilogue is None)):
+            raise ValueError("Shared outputs must match the compiled epilogue.")
+        if cutlass.const_expr(shared_outputs is not None):
+            shared_args = GatedActEpilogueArgs(
+                fc1_alpha=None, fc2_alpha=None, fc1_norm_const=None, topk_scores=None
+            )
+            shared_fc1_epi = SwapABFc1Epilogue(
+                self.shared_epilogue, tidx, fc1_staging_pointer, kernel_extension,
+                shared_outputs[0], shared_outputs[1], shared_outputs[2],
+                fc1_done_counter, shared_args,
+            )
+            shared_fc2_epi = SwapABFc2Epilogue(
+                self.shared_epilogue, tidx, None, None, None, shared_outputs[3],
+                None, None, None, None, shared_args,
+            )
+
         acc_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_accumulator_pipeline_stages
         )
@@ -1296,20 +1326,52 @@ class SwapABGatedActEpilogue(KernelComponent):
 
         while work_tile_info.is_valid_tile:
             tmem_acc_current = tmem_acc[None, None, acc_consumer_state.index]
-            if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
-                fc1_epi(
-                    work_tile_info=work_tile_info,
-                    tmem_acc_tensor=tmem_acc_current,
-                    acc_pipeline=acc_pipeline,
-                    acc_consumer_state=acc_consumer_state,
-                )
+            if cutlass.const_expr(shared_outputs is not None):
+                if kernel_extension.is_shared_tile(work_tile_info):
+                    if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
+                        shared_fc1_epi(
+                            work_tile_info=work_tile_info,
+                            tmem_acc_tensor=tmem_acc_current,
+                            acc_pipeline=acc_pipeline,
+                            acc_consumer_state=acc_consumer_state,
+                        )
+                    else:
+                        shared_fc2_epi(
+                            work_tile_info=work_tile_info,
+                            tmem_acc_tensor=tmem_acc_current,
+                            acc_pipeline=acc_pipeline,
+                            acc_consumer_state=acc_consumer_state,
+                        )
+                else:
+                    if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
+                        fc1_epi(
+                            work_tile_info=work_tile_info,
+                            tmem_acc_tensor=tmem_acc_current,
+                            acc_pipeline=acc_pipeline,
+                            acc_consumer_state=acc_consumer_state,
+                        )
+                    else:
+                        fc2_epi(
+                            work_tile_info=work_tile_info,
+                            tmem_acc_tensor=tmem_acc_current,
+                            acc_pipeline=acc_pipeline,
+                            acc_consumer_state=acc_consumer_state,
+                        )
             else:
-                fc2_epi(
-                    work_tile_info=work_tile_info,
-                    tmem_acc_tensor=tmem_acc_current,
-                    acc_pipeline=acc_pipeline,
-                    acc_consumer_state=acc_consumer_state,
-                )
+                if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
+                    fc1_epi(
+                        work_tile_info=work_tile_info,
+                        tmem_acc_tensor=tmem_acc_current,
+                        acc_pipeline=acc_pipeline,
+                        acc_consumer_state=acc_consumer_state,
+                    )
+                else:
+                    fc2_epi(
+                        work_tile_info=work_tile_info,
+                        tmem_acc_tensor=tmem_acc_current,
+                        acc_pipeline=acc_pipeline,
+                        acc_consumer_state=acc_consumer_state,
+                    )
             prev_work_tile_info = work_tile_info
             cur_was_linear1 = prev_work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1)
 
@@ -1326,7 +1388,14 @@ class SwapABGatedActEpilogue(KernelComponent):
             if cur_was_linear1:
                 flag_tracker = fc1_epi.signal_fc1_done(prev_work_tile_info, work_tile_info, flag_tracker)
             else:
-                flag_tracker = fc2_epi.signal_fc2_done(prev_work_tile_info, work_tile_info, flag_tracker)
+                if cutlass.const_expr(shared_outputs is not None):
+                    if kernel_extension.is_shared_tile(prev_work_tile_info):
+                        # Keep pending routed signals; shared FC2 has no token-back counter.
+                        flag_tracker = flag_tracker.accumulate(work_tile_info.phase, self.fc2_epi_flag_batch, Int64(0))
+                    else:
+                        flag_tracker = fc2_epi.signal_fc2_done(prev_work_tile_info, work_tile_info, flag_tracker)
+                else:
+                    flag_tracker = fc2_epi.signal_fc2_done(prev_work_tile_info, work_tile_info, flag_tracker)
         # Tail flush
         flag_tracker.fire()
 

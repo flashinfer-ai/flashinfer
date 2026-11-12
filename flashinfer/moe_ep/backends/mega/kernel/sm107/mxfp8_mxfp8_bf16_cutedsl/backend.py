@@ -201,6 +201,9 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
             gate_up_clamp=_resolve_gate_up_clamp(k),
+            shared_quant_kind="mxfp8_e4m3"
+            if getattr(k, "shared_expert", False)
+            else None,
         )
 
     def live_token_buckets(self, fleet_params: FleetParams) -> list[int]:
@@ -239,6 +242,9 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                 quant_kind=k.kind,
                 kernel_variant=k.kernel_variant,
                 combine_dtype=k.combine_dtype,
+                shared_quant_kind="mxfp8_e4m3"
+                if getattr(k, "shared_expert", False)
+                else None,
             )
         if k.knobs == "cache":
             knobs = self._workspace_knobs(fleet_params)
@@ -351,8 +357,14 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
 
         from ..automatic import prepare_auto_configuration
 
+        prepared_weights = transformed_weights
+        if workspace.config.shared_quant_kind:
+            from ..shared_weights import bind_prepared_weights
+
+            transformed_weights = bind_prepared_weights(workspace, prepared_weights)
+
         prepare_auto_configuration(
-            self, workspace, transformed_weights, output, num_tokens
+            self, workspace, prepared_weights, output, num_tokens
         )
         view = sm107_block_scaled_mega_moe(
             output,
@@ -403,6 +415,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             k.fallback_cluster_shape_mn,
             k.max_sm_count,
             knobs_pool_key(self._knob_overrides(fleet_params)),
+            *(("shared_mxfp8_e4m3",) if getattr(k, "shared_expert", False) else ()),
         )
 
     def _forget_workspace_state(self, workspace: Any) -> None:

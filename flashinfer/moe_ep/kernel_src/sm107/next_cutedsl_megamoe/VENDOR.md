@@ -185,6 +185,16 @@ upstream `main` up to `413da003` have the same code):
   cost of at most one extra terminal FC1 claim per cluster. Re-apply this fix
   when the drop is re-exported until upstream carries it.
 
+Shared-expert fusion adds local changes to both inference and GenPhase FC12
+mainloops, entry kernels, the common extension and epilogue, and BF16 reduction.
+One replicated E4M3 expert runs alongside MXFP4 routed experts and contributes
+to each live local token. `fc12_mapping.py` and `fc12_scheduler.py` append its
+tasks without using routed expert indices; `non_clc_mixed_cga.py` reserves
+workspace for every possible fallback cluster. These changes are opt-in through
+`shared_quant_kind` and are not part of the pinned export. Preserve them on
+refresh until upstream includes them. The numerical and API contract is in the
+[architecture notes](../../../../../docs/design_docs/moe_ep_architecture.md).
+
 The NVFP4 and MXFP8 reducers also accept route IDs and skip masked slots before
 loading payloads, scales or scores. The standard kernel advertises masked-slot
 handling for all separate reducers. These quantized-reduction changes are not
@@ -197,7 +207,7 @@ This shim change is outside the exported payload. The local patch inventory
 above is separate from the historical upstream qualification evidence; run the
 registered strict single/multirank suites when updating or rebasing these patches.
 All remaining exported implementation files retain the pinned export, apart
-from the previously documented comment and the scheduler fix above.
+from the local differences documented above.
 
 ## Related trees
 

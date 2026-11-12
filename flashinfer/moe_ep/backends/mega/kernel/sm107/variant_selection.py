@@ -16,6 +16,7 @@ from .....core.kernel.base import MegaKernelBackend
 from .....core.tuning_state import AutoTuningState
 from .....core.validation.common import MoEEpConfigError
 from .forward_tuning import ForwardExecution
+from .shared_weights import bind_prepared_weights
 from .automatic import prepared_for_serving, record_prepared
 
 if TYPE_CHECKING:
@@ -202,6 +203,7 @@ class RubinVariantBackend(MegaKernelBackend):
                 for knobs in sm107_candidates(
                     cfg.quant_kind,
                     kernel_variant=variant,
+                    shared_quant_kind=cfg.shared_quant_kind,
                     allow_in_kernel_fc2_reduce=self._config.in_kernel_fc2_reduce
                     and cfg.combine_dtype == "bf16",
                 ):
@@ -257,7 +259,8 @@ class RubinVariantBackend(MegaKernelBackend):
             raise RuntimeError(
                 "Warm up pending variant tuning before CUDA graph capture"
             )
-        workspace.workspace.prepare(*weights)
+        routed = bind_prepared_weights(workspace.workspace, weights)
+        workspace.workspace.prepare(*routed)
 
     def stage_inputs(self, t, workspace, *, quantize_input):
         workspace.tensors = t
@@ -356,6 +359,7 @@ class _VariantProtocol:
         self.candidates = candidates
         self.warmup_iters, self.timed_iters = warmup_iters, timed_iters
         self.install_winner = install_winner
+        self.routed_weights = bind_prepared_weights(owner.workspace, weights)
 
     def _contract(self, variants, context):
         from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
@@ -372,8 +376,8 @@ class _VariantProtocol:
         # Native compatibility covers numerical settings, SM budget and environment.
         native = RubinTuningProtocol(
             self.output,
-            self.weights[0],
-            self.weights[1],
+            self.routed_weights[0],
+            self.routed_weights[1],
             owner.workspace,
             num_tokens=self.tensors.num_tokens,
             process_group=self.backend.ep_comm_group
@@ -407,7 +411,7 @@ class _VariantProtocol:
         kernel = backend._backend(record["variant"], record["knobs"])
         workspace = kernel._allocate_workspace(owner.fleet)
         _prepare_collectively(
-            lambda: workspace.prepare(*self.weights),
+            lambda: workspace.prepare(*bind_prepared_weights(workspace, self.weights)),
             backend.ep_world_size,
             backend.ep_comm_group if backend.ep_world_size > 1 else None,
         )
@@ -545,6 +549,7 @@ class _VariantProtocol:
             for variant in variants:
                 kernel = backend._backend(variant)
                 workspace = kernel._allocate_workspace(owner.fleet)
+                bind_prepared_weights(workspace, self.weights)
                 execution = ForwardExecution(
                     kernel,
                     self.tensors,
@@ -564,14 +569,15 @@ class _VariantProtocol:
                     else sm107_candidates(
                         workspace.config.quant_kind,
                         kernel_variant=variant,
+                        shared_quant_kind=workspace.config.shared_quant_kind,
                         allow_in_kernel_fc2_reduce=backend._config.in_kernel_fc2_reduce
                         and workspace.config.combine_dtype == "bf16",
                     )
                 )
                 protocol = RubinTuningProtocol(
                     self.output,
-                    self.weights[0],
-                    self.weights[1],
+                    self.routed_weights[0],
+                    self.routed_weights[1],
                     workspace,
                     num_tokens=self.tensors.num_tokens,
                     candidates=knobs_to_try,
@@ -595,8 +601,8 @@ class _VariantProtocol:
                     try:
                         knobs, score, _ = _sweep_sm107_block_scaled_mega_moe(
                             self.output,
-                            self.weights[0],
-                            self.weights[1],
+                            self.routed_weights[0],
+                            self.routed_weights[1],
                             workspace,
                             num_tokens=self.tensors.num_tokens,
                             candidates=choices,
