@@ -392,7 +392,7 @@ def _workspace(case, device):
     return torch.zeros(max_workspace_bytes(rows), dtype=torch.uint8, device=device)
 
 
-def _run(case, *, dense_q_len=None, graph=False, num_split=None):
+def _run(case, *, dense_q_len=None, max_q_len=None, graph=False, num_split=None):
     device = case["q_nope"].device
     num_heads = case["num_heads"]
     total_q = case["q_nope"].shape[0]
@@ -441,7 +441,7 @@ def _run(case, *, dense_q_len=None, graph=False, num_split=None):
             out=out,
             lse=lse,
             cum_seq_lens_q=case["q_indptr"],
-            max_q_len=max(case["q_lens"]),
+            max_q_len=max_q_len or max(case["q_lens"]),
             **kwargs,
         )
     if not graph:
@@ -543,6 +543,22 @@ def test_packed_variable_query(num_heads, q_lens, kv_lens, sigma):
     )
     out, lse, runner = _run(case)
     assert runner.plan.main_kind == _route(num_heads, max(q_lens))
+    ref, ref_lse = _reference(case)
+    _check(out, ref)
+    _check_lse(lse, ref_lse)
+
+
+@pytest.mark.parametrize("kv_len", [1024, 8192, 32768])
+def test_packed_query_under_a_loose_max_q_len(kv_len):
+    # #8995: one token of 12 heads (cum_seq_lens_q [0, 1]) under a spec-decode graph
+    # bound max_q_len 8 used to pick the wide route and fail to bind its 32-row output
+    # box over 12 rows; it now plans on the 12 rows and matches the reference.
+    _skip_unless_supported()
+    device = torch.device("cuda")
+    case = _make_case([1], [kv_len], 12, seed=625005, device=device, return_lse=True)
+    assert case["q_indptr"].tolist() == [0, 1]
+    out, lse, runner = _run(case, max_q_len=8)
+    assert runner.plan.main_kind == _route(12, 1)
     ref, ref_lse = _reference(case)
     _check(out, ref)
     _check_lse(lse, ref_lse)
