@@ -27,7 +27,7 @@ import pytest
 import torch
 
 from flashinfer.cudnn import linear_attention
-from tests.test_helpers.cudnn_linear_attention import (
+from tests.gdn.test_helpers.cudnn_linear_attention import (
     assert_rel_close,
     requires_cudnn_linear_attention,
     serial_delta_rule,

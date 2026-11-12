@@ -20,7 +20,7 @@ import torch
 from flashinfer import SfLayout, mm_fp4, nvfp4_quantize
 from flashinfer.experimental.cake_nvfp4_per_token import cake_backend as cb
 from flashinfer.experimental.cake_nvfp4_per_token.cake_jit import KERNELS
-from tests.test_helpers.cake_nvfp4_per_token import (
+from tests.quantization.test_helpers.cake_nvfp4_per_token import (
     VALIDATED_GEMM_FAMILIES,
     VALIDATED_OFF_MATRIX_FAMILY,
     required_kernel_keys,

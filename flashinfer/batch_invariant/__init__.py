@@ -4,13 +4,14 @@
 
 The package holds the engine of the batch-invariant kernels (the canonical reduction plan, the floating-point interface
 ``fp_interface`` in its symbolic and device backends, the term language and its fingerprints) and the Lean project that
-proves the engine's reduction orders; each kernel class lives next to its FlashInfer operator (``flashinfer/gemm/batch_invariant``). ``README.md``
+proves the engine's reduction orders; each kernel class lives next to its FlashInfer operator (``flashinfer/gemm/batch_invariant``) or, for the
+operators without a package of their own, in a subpackage here (``quantization``, ``sampling``). ``README.md``
 next to this file is the contract: the guarantee (R1-R4), the flag semantics, the tests and how to check the proofs.
 """
 
 from __future__ import annotations
 
-from typing import Callable, Dict, NamedTuple, Union
+from typing import Callable, Dict, NamedTuple, Optional, Sequence, Union
 
 import torch
 
@@ -79,6 +80,22 @@ def _bmm_fp8_fingerprint(
     return spec_fingerprint(K, _out_fmt(out_dtype), chunks_for(N, K, fmt), fmt)
 
 
+def _gemm_fp8_nt_groupwise_fingerprint(
+    K: int, out_dtype: Union[torch.dtype, str]
+) -> str:
+    from ..gemm.batch_invariant.spec import spec_fingerprint
+
+    return spec_fingerprint(
+        K, _out_fmt(out_dtype, "gemm_fp8_nt_groupwise"), 1, "e4m3_bs"
+    )
+
+
+def _attention_fingerprint(head_dim: int) -> str:
+    from ..attention.batch_invariant.spec import spec_fingerprint
+
+    return spec_fingerprint(head_dim)
+
+
 def _mx_family(arch, op: str = "mm_mxfp8") -> str:
     """The architecture family behind ``arch``: a family name (``"sm_100"`` / ``"sm_103"`` / ``"sm_107"``), a compute
     capability such as ``(10, 7)``, a ``torch.device``, or None for the current CUDA device."""
@@ -133,13 +150,117 @@ def _mm_fp4_fingerprint(
     )
 
 
+def _moe_bf16_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+) -> str:
+    """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantBf16Config``: ``method`` is a
+    :class:`flashinfer.RoutingMethodType` (or its name) among the ones the class implements, with ``n_group`` /
+    ``topk_group`` for ``DeepSeekV3``'s group-limited selection (``RoutingConfig``'s values; the groups are a parameter of
+    the routing term), or the class's own method name (``spec.METHODS``; a grouped one as ``<method>_g<n>x<t>``, the same
+    class as the enum form with the groups) or a ``spec.RoutingMethod``; ``act`` an ``ActivationConfig`` of the layer (its
+    scalars are the class's parameters), ``"swiglu"`` / ``"relu2"`` (the default gated / ungated chains), or a chain name of
+    ``spec.ACTS`` / ``spec.UNGATED_ACTS`` with ``params`` (and ``gated`` for the names in both tables). The receipt names
+    a class some layer can build: the runner's bounds and group rule apply here as ``ValueError``."""
+    # absolute on purpose: the JIT cache keys follow relative imports, and the MoE specification is not part of the GEMM
+    # modules' closures
+    from flashinfer.fused_moe.batch_invariant import spec
+    from flashinfer.fused_moe.batch_invariant.blocks.scheduler import MAX_E
+    from flashinfer.tllm_enums import RoutingMethodType
+
+    if not 1 <= num_experts <= MAX_E:
+        raise ValueError(
+            f"fingerprint('fused_moe'): num_experts {num_experts} must lie in [1, {MAX_E}]"
+        )
+    if not 1 <= top_k <= min(num_experts, spec.MAX_TOP_K):
+        raise ValueError(
+            f"fingerprint('fused_moe'): top_k {top_k} must lie in [1, min(num_experts, {spec.MAX_TOP_K})]"
+        )
+    if isinstance(method, str) and method in RoutingMethodType.__members__:
+        method = RoutingMethodType[method]
+    if isinstance(method, RoutingMethodType):
+        if method not in spec.METHOD_OF_FLASHINFER:
+            raise ValueError(
+                f"the batch-invariant MoE classes do not implement routing method {method!r}"
+            )
+        rm = spec.METHOD_OF_FLASHINFER[method]
+    elif isinstance(method, str):
+        rm = spec.method_named(method)
+    elif isinstance(method, spec.RoutingMethod):
+        rm = method
+    else:
+        raise TypeError(
+            f"method must be a RoutingMethodType, its name or a RoutingMethod, got {method!r}"
+        )
+    if (n_group or 0) > 1 or (topk_group or 0) > 1:
+        n_group, topk_group = int(n_group or 0), int(topk_group or 0)
+        if rm.grouped and (rm.n_group, rm.topk_group) != (n_group, topk_group):
+            raise ValueError(
+                f"method {rm.name!r} carries the groups {rm.n_group} x {rm.topk_group}; n_group / topk_group give "
+                f"{n_group} x {topk_group}"
+            )
+        if not rm.grouped and rm != spec.SIGMOID_BIAS_RENORM_SCALED:
+            raise ValueError(
+                "expert groups (n_group / topk_group) are a parameter of the DeepSeekV3 routing term"
+            )
+        if not 1 <= topk_group <= n_group:
+            raise ValueError(
+                f"n_group {n_group}, topk_group {topk_group} over {num_experts} experts for top_k {top_k}: "
+                + str(spec.group_shape_error(num_experts, top_k, n_group, topk_group))
+            )
+        rm = rm.with_groups(n_group, topk_group)
+    # the runner's group rule (the groups a term of DeepSeekV3 alone, the shape rule), as a ValueError here
+    rule = spec.group_rule_error(rm, num_experts, top_k)
+    if rule is not None:
+        raise ValueError(
+            f"n_group {rm.n_group}, topk_group {rm.topk_group} over {num_experts} experts for top_k {top_k}: {rule}"
+        )
+    if not isinstance(act, str):
+        a = spec.activation_of(act)
+        name, params, gated = a.act, a.params, a.gated
+    elif act == "swiglu":
+        name, gated = "silu", True
+    elif act == "relu2":
+        name, gated = "relu2", False
+    elif act in spec.ACTS or act in spec.UNGATED_ACTS:
+        name = act
+        if gated is None:
+            gated = act in spec.ACTS
+    else:
+        raise ValueError(f"no MoE chain named {act!r}")
+    return spec.spec_fingerprint(
+        H, I, top_k, num_experts, rm, "bf16", name, params, gated
+    )
+
+
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
+    # the unified MoE layer with `BatchInvariantBf16Config`: the routing method and the activation (gated SwiGLU / ungated
+    # ReLU^2) are dimensions of the class; the hidden and intermediate sizes fix the two GEMM classes
+    "fused_moe": ClassInfo(
+        "moe.bf16",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_bf16_fingerprint,
+        ("method", "act", "params", "gated", "n_group", "topk_group"),
+    ),
     "mm_bf16": ClassInfo("gemm.bf16", ("N", "K"), _mm_bf16_fingerprint, ("bias",)),
     # the fp8 input dtype is a dimension: e4m3 and e5m2 are two classes (gemm.e4m3.*, gemm.e5m2.*) of one API; the output
     # dtype (bf16 / fp16) is the chain's conversion; the batch is not a dimension (every element is one launch of the class)
     "bmm_fp8": ClassInfo(
         "gemm.fp8", ("N", "K", "dtype", "out_dtype"), _bmm_fp8_fingerprint
+    ),
+    # the block-scale fp8 class (DeepSeek-style 1x128 / 128x128 fp32 scales applied once per 128-element K block): K and the
+    # output dtype are its dimensions (N enters neither the fold nor a chunk rule: the class has no split variant)
+    "gemm_fp8_nt_groupwise": ClassInfo(
+        "gemm.e4m3.kblock128", ("K", "out_dtype"), _gemm_fp8_nt_groupwise_fingerprint
     ),
     # the architecture is a dimension of the MXFP8 class: the sm_107 instruction folds 64 elements per step, the sm_100 /
     # sm_103 one 32 (gemm.mxfp8.*64 vs gemm.mxfp8.*); `arch` defaults to the current CUDA device's
@@ -155,6 +276,17 @@ CLASSES: Dict[str, ClassInfo] = {
         ("N", "K", "out_dtype"),
         _mm_fp4_fingerprint,
         ("use_nvfp4", "arch"),
+    ),
+    # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
+    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class
+    "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_fingerprint
+    ),
+    "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_fingerprint
+    ),
+    "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_fingerprint
     ),
 }
 
@@ -175,6 +307,11 @@ def fingerprint(op: str, **dims) -> str:
     output ``out_dtype`` (bf16 / fp16): the 32-wide fp8 step, the chain's ``mul.rn`` by the device product of the two
     per-tensor scales and its conversion are the specification; the scales' values, like the operands, are inputs, and
     the batch is not a dimension (every element is one launch of the class).
+    ``gemm_fp8_nt_groupwise`` takes ``K`` and ``out_dtype`` (bf16 / fp16): the block-scale class ``gemm.e4m3.kblock128``
+    (e4m3 operands, fp32 scales per 1x128 block of A and per 128x128 block of B) folds each 128-element K block with the
+    32-wide fp8 step from +0 and the block partials in block order with ``fma.rn(mul.rn(s_a, s_b), P, acc)``; the scales'
+    values, like the operands, are inputs, and N enters nothing (no split variant).
+
     ``mm_mxfp8`` takes ``N, K`` and ``out_dtype`` (bf16 / fp16), and optionally ``arch`` (an architecture family
     ``"sm_100"`` / ``"sm_103"`` / ``"sm_107"``, a compute capability or a device; the current CUDA device by default):
     the block-scaled step of that architecture's instruction (32 e4m3 elements with one UE8M0 scale per row on SM100 /
@@ -187,12 +324,21 @@ def fingerprint(op: str, **dims) -> str:
     ``gemm.nvfp4.*`` otherwise), the chunk count, the chain's ``mul.rn`` by the caller's alpha and the conversion are
     the specification; the alpha's value and the block scales are inputs.
 
+    The attention wrappers take ``head_dim``: the tile and chunk grid, the online-softmax step and the chunk merge are
+    functions of the head dim alone; the batch, the sequence lengths, the page size, the KV layout and the configuration
+    do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``, ``BatchDecodeWithPagedKVCacheWrapper`` and
+    ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint (their outputs for one token are the same bits). The
+    sliding window (``window_left``) is a per-call input of the class, like the KV position: the receipt is the digest of the
+    class's no-window sample row and covers windowed calls too.
+
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
     >>> fingerprint("mm_bf16", N=4096, K=4096, bias=True)  # doctest: +SKIP
     'gemm-bf16-kfold-bias-...'
     >>> fingerprint("bmm_fp8", N=4096, K=4096, dtype=torch.float8_e4m3fn, out_dtype=torch.bfloat16)  # doctest: +SKIP
     'gemm-e4m3-kfold-scaled-...'
+    >>> fingerprint("gemm_fp8_nt_groupwise", K=7168, out_dtype=torch.bfloat16)  # doctest: +SKIP
+    'gemm-e4m3-kblock128-...'
     >>> fingerprint("mm_mxfp8", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_107")  # doctest: +SKIP
     'gemm-mxfp8-k64-kfold-...'
     >>> fingerprint("mm_fp4", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_100")  # doctest: +SKIP
@@ -216,7 +362,8 @@ def fingerprint(op: str, **dims) -> str:
 
 def class_name(op: str) -> str:
     """The consistency class (family) name behind the API ``op`` (``"gemm.bf16"``; ``"gemm.fp8"`` for the two fp8 classes
-    ``gemm.e4m3`` / ``gemm.e5m2`` behind ``bmm_fp8``; ``"gemm.mxfp8"`` for the two MXFP8 classes behind ``mm_mxfp8``;
+    ``gemm.e4m3`` / ``gemm.e5m2`` behind ``bmm_fp8``; ``"gemm.e4m3.kblock128"`` behind ``gemm_fp8_nt_groupwise``;
+    ``"gemm.mxfp8"`` for the two MXFP8 classes behind ``mm_mxfp8``;
     ``"gemm.fp4"`` for the NVFP4 and MXFP4 classes behind ``mm_fp4``)."""
     info = CLASSES.get(op)
     if info is None:
@@ -236,7 +383,9 @@ __all__ = [
     "is_supported_device",
 ]
 
-# The quantization classes register themselves here (their module keeps the mode's registry generic).
+# The quantization and sampling classes register themselves here (their modules keep the mode's registry generic).
 from .quantization.classes import register as _register_quantization  # noqa: E402
+from .sampling.classes import register as _register_sampling  # noqa: E402
 
 _register_quantization(CLASSES, ClassInfo)
+_register_sampling(CLASSES, ClassInfo)

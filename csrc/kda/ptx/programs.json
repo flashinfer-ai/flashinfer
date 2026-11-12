@@ -158,6 +158,42 @@
       "out_box_depth": 2,
       "handoff_flags": true,
       "cluster_x": 2
+    },
+    "optimized_varlen_uniform_h64_t60": {
+      "kernel": "kernel_kda_fwd_stream_m128",
+      "module_ident": "kda_fwd_stream_m128_uniform_t60",
+      "dynamic_smem_bytes": 232448,
+      "v_box_rows": 16,
+      "out_box_depth": 2,
+      "handoff_flags": true,
+      "cluster_x": 1
+    },
+    "optimized_varlen_uniform_h64_t60p": {
+      "kernel": "kernel_kda_fwd_stream_m128",
+      "module_ident": "kda_fwd_stream_m128_uniform_t60p_r326",
+      "dynamic_smem_bytes": 232448,
+      "v_box_rows": 16,
+      "out_box_depth": 2,
+      "handoff_flags": true,
+      "cluster_x": 1
+    },
+    "optimized_varlen_uniform_h64_dual_dd": {
+      "kernel": "kernel_kda_fwd_stream_m128",
+      "module_ident": "kda_fwd_stream_m128_dual187dd",
+      "dynamic_smem_bytes": 232448,
+      "v_box_rows": 16,
+      "out_box_depth": 2,
+      "handoff_flags": true,
+      "cluster_x": 1
+    },
+    "optimized_varlen_uniform_h64_dual_dd90": {
+      "kernel": "kernel_kda_fwd_stream_m128",
+      "module_ident": "kda_fwd_stream_m128_dual187dd90",
+      "dynamic_smem_bytes": 232448,
+      "v_box_rows": 16,
+      "out_box_depth": 2,
+      "handoff_flags": true,
+      "cluster_x": 1
     }
   }
 }

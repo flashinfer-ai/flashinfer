@@ -15,7 +15,7 @@ prebuilt from `aot/` when the package ships them and JIT-built by FlashInfer
 from `build.json` otherwise (see "Layout of this package").
 
 The path is deterministic: the same inputs, hardware and plan give bitwise
-the same outputs and gradients.  det entries are always deterministic (no deterministic keyword). The non-deterministic package is flashinfer.cake_kda_train / cake_kda_train_kcp; its entries require deterministic=False explicitly (any other value raises ValueError).
+the same outputs and gradients.  det entries are always deterministic (no deterministic keyword). The non-deterministic package is flashinfer.cake_kda_nondet_train / cake_kda_nondet_train_kcp; its entries take no mode keyword.
 
 ## Public entry points (`flashinfer/cake_kda_det_train.py`)
 
@@ -652,7 +652,7 @@ record in both modes.
 ## Context-parallel training (KCP)
 
 The context-parallel entry points (`flashinfer.cake_kda_det_train_kcp`) and
-their package (`flashinfer/experimental/cake_kda_det_train_kcp`: the plan, the
+their package (`flashinfer/experimental/cake/cake_kda_det_train_kcp`: the plan, the
 per-rank launch sequences, the KCP programs and their manifests) run the
 chunk stages of this package at each rank's shape; see that package's
 README.
@@ -695,14 +695,14 @@ The registry holds the 67 records (65 programs) for `sm_100a`, `sm_103a` and
 stage), exported from the kernel snapshot named in the pull request.
 
 Tests: `tests/experimental/test_cake_kda_det_train.py` (the backend suite: imports
-only this package through `tests/test_helpers/cake_package`; the registry and
+only this package through `tests/cake/test_helpers/cake_package`; the registry and
 plan tests run everywhere, the kernel tests skip without a compute capability
 10.0 / 10.3 / 10.7 device) against the exact FP64 per-document recurrence of
-`tests/test_helpers/cake_kda_det_train_reference.py`,
+`tests/experimental/test_helpers/cake_kda_det_train_reference.py`,
 `tests/experimental/test_cake_kda_det_train_raw_gate_accuracy.py` (the raw gate
 mode's accuracy against the activated-gate paths, both measured against the
 FP64 reference) and `tests/experimental/test_cake_kda_det_train_api.py` (the
 public entry points;
 `tests/experimental/test_cake_kda_det_train_names.py` checks the previous names).
 Benchmark: `benchmarks/bench_cake_kda_det_train.py`.  The context-parallel
-path has its own package, `flashinfer/experimental/cake_kda_det_train_kcp`.
+path has its own package, `flashinfer/experimental/cake/cake_kda_det_train_kcp`.

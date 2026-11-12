@@ -412,3 +412,165 @@ def test_sm_count_leaves_every_other_route_unchanged(key):
     name = routes[None].variant_name
     assert "_pf_" not in name
     assert ("_gatestream_full" in name) is (key["arch"] != "sm_107a")
+
+
+_F16IO_SM107A = "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_"
+_F16IO_BASE_SM107A = _F16IO_SM107A + "sm107a_i64meta_"
+_GATESTREAM_F16IO_SM107A = _F16IO_SM107A + "gatestream_full_sm107a_i64meta_"
+_GATESTREAM_F16IO_PF_SM107A = _F16IO_SM107A + "gatestream_full_pf_sm107a_i64meta_"
+
+
+def _f16_io_key(arch, num_q_heads, num_v_heads, lens):
+    return dict(
+        _bf16_state_key(arch, num_q_heads, num_v_heads, lens, state_dtype="float32"),
+        io_dtype="float16",
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("num_q_heads", "num_v_heads", "lens", "suffix", "base_suffix"),
+    (
+        # The seven fixed-head FP16-I/O FP32-state keys with several short full-DV tiles per
+        # CTA (2048, 2048, 1024, 512, 1024, 512 and 256 tiles; the last on 128 CTAs).
+        (8, 32, (256,) * 64, "3400019c1c9d", "0a518d13901e"),
+        (16, 32, (256,) * 64, "4b324091b0c8", "31dac57f676c"),
+        (4, 16, (256,) * 64, "892e1bbebce0", "4806529ee52a"),
+        (2, 8, (256,) * 64, "1e9b588b8066", "6b1531103546"),
+        (16, 64, (512,) * 16, "926c590d59ab", "723b365a5ec7"),
+        (32, 32, (512,) * 16, "a7c45dca3f9d", "7dadd112e990"),
+        (16, 16, (512,) * 16, "de5a927b5f1c", "6fe2e96200a2"),
+    ),
+)
+def test_sm107a_f16io_gate_stream_twin_and_its_prefetch_twin(
+    num_q_heads, num_v_heads, lens, suffix, base_suffix
+):
+    # The FP16-I/O full-DV body takes its gate-stream twin under the same rule as the
+    # BF16-I/O bodies (nominal 212 clusters), as its prefetch twin when the launch grid
+    # gives some CTA a second tile, else the twin without the prefetch.
+    key = _f16_io_key("sm_107a", num_q_heads, num_v_heads, lens)
+    tiles = len(lens) * max(num_q_heads, num_v_heads)
+    for sm_count in (None, 212, 216):
+        route = cake_gdn.select_cake_gdn_prefill_variant(**key, sm_count=sm_count)
+        assert route == cake_gdn.CakeGDNRoute(
+            "flashinfer.gdn_prefill.noncp.full_dv",
+            _GATESTREAM_F16IO_PF_SM107A + suffix,
+            True,
+            False,
+        ), sm_count
+    one_cta_per_tile = cake_gdn.select_cake_gdn_prefill_variant(**key, sm_count=tiles)
+    assert one_cta_per_tile.variant_name == _GATESTREAM_F16IO_SM107A + suffix
+    records = {r["name"]: r for r in cake_gdn._manifest()["variants"]}
+    base = records[_F16IO_BASE_SM107A + base_suffix]
+    twin = records[_GATESTREAM_F16IO_SM107A + suffix]
+    prefetch = records[_GATESTREAM_F16IO_PF_SM107A + suffix]
+    for record in (twin, prefetch):
+        assert record["architectures"] == ["sm_107a"]
+        for field in ("specializations", "metadata_i64", "tma_abi"):
+            assert record[field] == base[field], field
+        for field in ("params", "template"):
+            assert record["host_binding"][field] == base["host_binding"][field], field
+    assert (
+        prefetch["host_binding"]["cuda_symbol"]
+        == twin["host_binding"]["cuda_symbol"] + "_pf"
+    )
+    assert twin["outputs"] != base["outputs"] != prefetch["outputs"] != twin["outputs"]
+    for prefix, record in (
+        (_GATESTREAM_F16IO_SM107A, twin),
+        (_GATESTREAM_F16IO_PF_SM107A, prefetch),
+    ):
+        shipped = {
+            (r["host_binding"]["cuda_symbol"], json.dumps(r["outputs"]))
+            for name, r in records.items()
+            if name.startswith(prefix)
+        }
+        assert shipped == {
+            (record["host_binding"]["cuda_symbol"], json.dumps(record["outputs"]))
+        }
+    # Long sequences keep the base body (mean length above 512 tokens).
+    long = cake_gdn.select_cake_gdn_prefill_variant(
+        **_f16_io_key("sm_107a", num_q_heads, num_v_heads, (2048,) * len(lens))
+    )
+    assert long.variant_name == base["name"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "key",
+    (
+        # One tile a CTA (128 tiles on 128 CTAs): no twin.
+        _f16_io_key("sm_107a", 2, 8, (512,) * 16),
+        # The other architectures ship no FP16-I/O gate-stream twin: the base record.
+        _f16_io_key("sm_100a", 8, 32, (256,) * 64),
+        _f16_io_key("sm_103a", 8, 32, (256,) * 64),
+        _f16_io_key("sm_100a", 16, 32, (256,) * 32),
+        _f16_io_key("sm_103a", 16, 32, (256,) * 32),
+    ),
+    ids=(
+        "sm107a_one_tile_per_cta",
+        "sm100a_hq8_hv32",
+        "sm103a_hq8_hv32",
+        "sm100a_hq16_hv32",
+        "sm103a_hq16_hv32",
+    ),
+)
+def test_f16io_keys_without_a_shipped_gate_stream_twin_keep_their_base(key):
+    routes = {
+        sm_count: cake_gdn.select_cake_gdn_prefill_variant(**key, sm_count=sm_count)
+        for sm_count in (None, 148, 160, 212, 216)
+    }
+    assert len(set(routes.values())) == 1, routes
+    name = routes[None].variant_name
+    assert "_gatestream_full" not in name, name
+    record = cake_gdn._kernel_record(name)
+    schedule = record["source_schedule"].removeprefix(PREFIX)
+    assert schedule.startswith("flashinfer_blackwell_gdn_prefill_initial_f16io"), (
+        schedule
+    )
+
+
+@pytest.mark.cpu_only
+def test_sm107a_bf16_state_hq2_hv8_gate_stream_twin_and_its_prefetch_twin():
+    # The Qwen3.5 TP8 BF16-state split (Hq2/Hv8) with several short full-DV tiles per CTA
+    # (64 x 256 tokens: 512 tiles) takes the BF16-state gate-stream twin, as its prefetch
+    # twin when the launch grid gives some CTA a second tile, else the twin without it.
+    key = _bf16_state_key("sm_107a", 2, 8, (256,) * 64)
+    for sm_count in (None, 212, 216):
+        route = cake_gdn.select_cake_gdn_prefill_variant(**key, sm_count=sm_count)
+        assert route == cake_gdn.CakeGDNRoute(
+            "flashinfer.gdn_prefill.noncp.full_dv",
+            _GATESTREAM_BF16_PF_SM107A + "d28a977c404a",
+            True,
+            False,
+        ), sm_count
+    one_cta_per_tile = cake_gdn.select_cake_gdn_prefill_variant(**key, sm_count=512)
+    assert one_cta_per_tile.variant_name == _GATESTREAM_BF16_SM107A + "d28a977c404a"
+    records = {r["name"]: r for r in cake_gdn._manifest()["variants"]}
+    base = records[_BF16STATE_SM107A + "sm107a_i64meta_d5225057d28d"]
+    for prefix in (_GATESTREAM_BF16_SM107A, _GATESTREAM_BF16_PF_SM107A):
+        record = records[prefix + "d28a977c404a"]
+        for field in ("specializations", "metadata_i64", "tma_abi"):
+            assert record[field] == base[field], field
+        for field in ("params", "template"):
+            assert record["host_binding"][field] == base["host_binding"][field], field
+        # The gate-stream program's own body and unit, shared with its other records.
+        shipped = {
+            (r["host_binding"]["cuda_symbol"], json.dumps(r["outputs"]))
+            for name, r in records.items()
+            if name.startswith(prefix)
+        }
+        assert shipped == {
+            (record["host_binding"]["cuda_symbol"], json.dumps(record["outputs"]))
+        }
+    # Long sequences (mean above 512 tokens) leave the gate-stream twins: up to 2048 tokens per
+    # sequence the key's vec2-full twin of the base record, above that the base record itself.
+    long = cake_gdn.select_cake_gdn_prefill_variant(
+        **_bf16_state_key("sm_107a", 2, 8, (2048,) * 64)
+    )
+    assert long.variant_name == base["name"].replace(
+        "_sm107a_i64meta_", "_sm107a_vec2full_i64meta_"
+    )
+    longer = cake_gdn.select_cake_gdn_prefill_variant(
+        **_bf16_state_key("sm_107a", 2, 8, (8192,) * 64)
+    )
+    assert longer.variant_name == base["name"]

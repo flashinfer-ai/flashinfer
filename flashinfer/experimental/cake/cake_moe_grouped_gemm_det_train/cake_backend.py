@@ -18,6 +18,9 @@ Cake backend: ragged BF16 MoE grouped GEMM (SM100 / SM103 / SM107).
 Three operations over ``E`` groups of rows described by an int32 **device**
 tensor ``offs[E]`` of cumulative end offsets (never read on the host):
 
+The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
+
 * ``fwd``:   ``Y[offs[e-1]:offs[e]]  = X[offs[e-1]:offs[e]] @ W[e].T``
 * ``dgrad``: ``dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]``
 * ``wgrad``: ``dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]`` (bf16 or fp32 output)
@@ -37,7 +40,7 @@ route's ``main_wide`` stage) when the output columns are a multiple of
 ``wide_dgrad_archs``, else the 256-column tile (``main``).  On the
 architectures of ``dgrad_evict_first_archs`` the data gradient launches the
 twin of its wide tile that loads G and stores dX with the L2 evict-first policy
-(``main_wide_ef``) when the groups average at least
+(``main_wide_ef``) when the groups average at least the architecture's
 ``dgrad_evict_first_min_rows`` rows (``sum_m // E``) and dX has at least
 ``dgrad_evict_first_min_k`` columns (``K``).  On the architectures of
 ``dgrad_wide_ts33_archs`` the data gradient launches the twin of its wide tile
@@ -53,7 +56,10 @@ architectures of
 ``fwd_lwh_ef_archs`` the forward pass launches the twin of its wide tile that
 releases the last wave of tiles in halves and stores Y with the L2 evict-first
 policy (``main_wide_ef``) when its reduction ``K`` (the columns of x) is at most
-``fwd_lwh_ef_max_k``, the down projection of an MoE layer.  The weight gradient takes the
+``fwd_lwh_ef_max_k``, the down projection of an MoE layer; on those of
+``fwd_evict_first_archs`` it launches the twin of its wide tile that loads X and
+stores Y with that policy (``main_wide_ef`` too) when ``K`` is at least
+``fwd_evict_first_min_k``, the gate/up projection.  The weight gradient takes the
 512-wide k tile when ``K`` is a multiple of 512, the architecture is listed in
 ``k512_archs`` and the groups average at least the architecture's
 ``k512_min_rows_per_group`` rows, else the 256-wide tile.  It launches the
@@ -113,36 +119,72 @@ Accumulate mode.  ``cake_moe_grouped_gemm_det_train_prepare_wgrad(..., out=out, 
 ``fuse_wgrad_accumulation``) adds the weight gradient into ``out``:
 ``out[e] <- out[e] + G_e^T X_e``, Megatron's gradient-accumulation fusion into an
 fp32 or bf16 ``main_grad``.  The host plans the launch exactly as the overwrite of
-``out.dtype`` (route, k tile, stage, grid, tail split, raster, wave mode); the bound
-programs write that overwrite into a contiguous scratch of ``out.dtype``
-(``E * N * K`` elements) that the preparation allocates and the launch owns, and the
-launch adds it with ``out.add_`` on the same stream (``plan["accumulate"] ==
-"composed"``; ``"off"`` for an overwrite).  ``out`` then holds AccumulateGrad's bits
-of the deterministic weight gradient in its dtype, bitwise reproducible run to run.
-The checks before anything is allocated or bound: ``out`` given, ``out_dtype`` None
-or ``out.dtype``, bfloat16 or float32, three dimensions with unit stride along
-``K``, rows and experts that cannot overlap (row stride at least ``K``, expert stride
-at least ``N`` row strides) and no byte shared with ``g``, ``x`` or ``offs``.
-``sum_m == 0`` launches nothing and leaves ``out`` unchanged.  A launch adds once
-more at every ``launch()`` and every CUDA graph replay.
+``out.dtype`` (route, k tile, stage, grid, tail split, raster, wave mode);
+``plan["accumulate"]`` records how the launch adds (``"off"`` for an overwrite).
+``"fused"``: the 512-wide k tile, where the route serves the main stage's
+accumulate build (the stage of its name with ``ACC_SUFFIX``: the same argument
+plan, launch shape and host plan, an epilogue that adds each element of C once
+in place) on the device's architecture and, when the plan splits its tail
+(``tail_splits > 1``), the tail-reduce stage's accumulate build
+(``TAIL_REDUCE_ACC``) on the route of that tail (the 256-wide k tile's for
+``main_halves_k256t``), which sums the ordered partials in their fixed order and
+adds the sum into C once; every such build's library can load by the loader's
+static rule (its prebuilt file under ``aot/``, else a FlashInfer JIT toolkit with
+``nvcc``, JIT not disabled, at its ``build.json`` ``min_cuda``:
+:func:`acc_library_loadable`, nothing built or probed), and C is
+``ACC_ALIGN``-byte aligned (its base, row pitch and expert pitch).  The programs
+write ``out`` in place; no scratch.  ``"composed"``
+(``plan["accumulate_reason"]``, the first that fails in this order:
+``"tile_k"`` the 256-wide k tile, ``"stage"`` a main stage without an
+accumulate build (every bf16 ``out``), ``"tail"`` a split tail whose route
+serves no ``TAIL_REDUCE_ACC``, ``"min_cuda"`` a build that cannot load,
+``"alignment"``; the last two with one ``UserWarning`` per process each): the
+bound programs write the overwrite into a contiguous scratch of ``out.dtype``
+(``E * N * K`` elements) that the preparation allocates and the launch owns, and
+the launch adds it with ``out.add_`` on the same stream.  Both routes give
+``out`` AccumulateGrad's bits of the deterministic weight gradient in its dtype,
+the same bits: one round-to-nearest add of the overwrite's ``dW`` per element of
+``out`` (an empty group adds exact zeros, so ``-0.0`` becomes ``+0.0``), bitwise
+reproducible run to run.  The checks before anything is allocated or bound:
+``out`` given, ``out_dtype`` None or ``out.dtype``, bfloat16 or float32, three
+dimensions with unit stride along ``K``, rows and experts that cannot overlap
+(row stride at least ``K``, expert stride at least ``N`` row strides) and no byte
+shared with ``g``, ``x`` or ``offs``.  ``sum_m == 0`` launches nothing and
+leaves ``out`` unchanged.  A launch adds once more at every ``launch()`` and
+every CUDA graph replay.
 """
 
 from __future__ import annotations
 
 import functools
+import inspect
 import math
+import os
+import sys
 import threading
+import warnings
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import torch
 import tvm_ffi
 
+from .cake_build import (
+    _jit_toolchain,
+    _local_cuda_version,
+    _version,
+    libraries_by_name,
+    prebuilt_path,
+)
 from .cake_jit import (
     HOST_PLAN_CONSTANTS,
     PROGRAMS,
+    ROUTES,
+    library_name,
     load_module,
     program_registered,
+    record_name,
     select_module,
     stage_binding,
     stage_served,
@@ -159,9 +201,22 @@ DESCRIPTOR_ALIGN = 128  # bytes; CUtensorMap slots of the caller-owned workspace
 # summed by the tail-reduce stage of that tile's route.
 K256_TAIL_TILE_K = 256
 _DTYPE_NAMES = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
-# ``plan["accumulate"]`` of a weight gradient: an overwrite, or the overwrite into a scratch and an add
-# (module docstring, accumulate mode).
-ACCUMULATE_MODES = ("off", "composed")
+# Accumulate mode (module docstring): the stage that adds into C is the overwrite stage's name with this
+# suffix, on the same weight-gradient route.
+ACC_SUFFIX = "_acc"
+# The tail-reduce stage of a weight-gradient route and its accumulate build: the ordered sum of a split
+# tail's partials, stored into C or added into C once.
+TAIL_REDUCE = "tail_reduce"
+TAIL_REDUCE_ACC = TAIL_REDUCE + ACC_SUFFIX
+# The byte alignment of C's base, row pitch and expert pitch the accumulate builds need (the width of
+# their vector accesses of C); a less aligned ``out`` takes the composed route.
+ACC_ALIGN = 32
+# ``plan["accumulate"]`` of a weight gradient: an overwrite, the accumulate builds adding into ``out`` in
+# place, or the overwrite into a scratch and an add (module docstring, accumulate mode).
+ACCUMULATE_MODES = ("off", "fused", "composed")
+# The once-per-process warnings of this module that were issued (the composed route taken because an
+# accumulate build cannot load, or for the alignment).
+_WARNED: set[str] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -198,15 +253,142 @@ def sm_count(device: torch.device) -> int:
     return _device_facts(_device_index(device))[1]
 
 
+# This package's module prefix (the vendored name of a vendored copy).
+_PACKAGE = __name__.rpartition(".")[0]
+
+
+def _caller_stacklevel() -> int:
+    """The ``stacklevel`` of the nearest frame outside this package and flashinfer, for a warning issued by
+    the function that calls this one: the caller of the entry point, also through the facade and its
+    decorators."""
+    frame = inspect.currentframe()
+    level = 0
+    while frame is not None:
+        parent = frame.f_back
+        level += 1
+        if parent is not None:
+            name = str(parent.f_globals.get("__name__", ""))
+            if not (
+                name == _PACKAGE
+                or name.startswith(_PACKAGE + ".")
+                or name == "flashinfer"
+                or name.startswith("flashinfer.")
+            ):
+                return level
+        frame = parent
+    return 2
+
+
+def _warn_once(key: str, message: str) -> None:
+    """A ``UserWarning`` naming the caller's frame, the first time ``key`` warns in this process."""
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    warnings.warn(message, UserWarning, stacklevel=_caller_stacklevel())
+
+
+def _acc_stages(out_dtype: str, arch: str) -> tuple[str, tuple[str, ...]]:
+    """``(route, stages)``: the 512-wide k tile weight-gradient route of ``out_dtype`` (``"bfloat16"`` /
+    ``"float32"``) and the accumulate builds of its main stages (``<twin>`` + ``ACC_SUFFIX``, not the
+    tail reduce's) it serves on ``arch``."""
+    name = record_name("wgrad", out_dtype=out_dtype, tile_k=512)
+    route = ROUTES.get(name)
+    if route is None or arch not in route["arches"]:
+        return name, ()
+    return name, tuple(
+        dict.fromkeys(
+            item["name"]
+            for item in route["stages"]
+            if item["name"].endswith(ACC_SUFFIX)
+            and item["name"] != TAIL_REDUCE_ACC
+            and stage_served(name, item["name"], arch)
+        )
+    )
+
+
+def acc_stage_served(out_dtype: str, arch: str) -> bool:
+    """True when the 512-wide k tile route of ``out_dtype`` (``"bfloat16"`` / ``"float32"``) serves the
+    accumulate build of a main stage (a stage named ``<twin>`` + ``ACC_SUFFIX``) on ``arch`` (the registry
+    alone; whether its library can load is :func:`acc_library_loadable`)."""
+    return bool(_acc_stages(out_dtype, arch)[1])
+
+
+@functools.cache
+def _jit_cuda_version() -> Optional[tuple[int, int]]:
+    """``(major, minor)`` of the toolkit FlashInfer's JIT builds with, the version ``cake_build.jit_spec``
+    holds an entry's ``min_cuda`` against; None when the loader cannot build: FlashInfer's JIT is not
+    importable, ``FLASHINFER_DISABLE_JIT`` is set, or the CUDA path has no ``bin/nvcc`` (FlashInfer's
+    version query then reports PyTorch's CUDA version, which compiles nothing) or cannot be resolved.
+    Asked once per process."""
+    if os.environ.get("FLASHINFER_DISABLE_JIT"):
+        return None
+    try:
+        # Any manifest library: the name only labels the error when the JIT is not importable.
+        _gen_jit_spec, get_cuda_version = _jit_toolchain(
+            next(iter(libraries_by_name()))
+        )
+        # _jit_toolchain imported FlashInfer's toolchain module; the package's only flashinfer
+        # import stays the JIT fallback of cake_build.py.
+        cpp_ext = sys.modules["flashinfer.jit.cpp_ext"]
+        if not Path(cpp_ext.get_cuda_path(), "bin", "nvcc").is_file():
+            return None
+        return _local_cuda_version(get_cuda_version)
+    except (RuntimeError, OSError):
+        return None
+
+
+def acc_library_loadable(name: str, stage: str, arch: str) -> bool:
+    """Whether the library of ``stage`` of route ``name`` on ``arch`` can load, by the loader's own static rule
+    (``cake_build.load_library``): its prebuilt file under ``aot/`` exists, or FlashInfer's JIT toolkit
+    (``nvcc`` present, JIT not disabled: :func:`_jit_cuda_version`) reaches the entry's ``build.json``
+    ``min_cuda`` (``cake_build.jit_spec`` refuses a lower one).  Nothing is
+    built, loaded or probed: an ahead-of-time build below an entry's floor ships no file for it, and a JIT
+    toolkit below it would raise at the preparation, so such an accumulate build is not bound (the composed
+    route, ``plan["accumulate_reason"] == "min_cuda"``)."""
+    binding = stage_binding(name, stage, arch)
+    library = library_name(binding["program"], arch, binding["specializations"])
+    if prebuilt_path(library).is_file():
+        return True
+    toolkit = _jit_cuda_version()
+    return toolkit is not None and toolkit >= _version(
+        libraries_by_name()[library]["min_cuda"]
+    )
+
+
 def generated_program_available(
-    device: torch.device, op: str = "fwd", out_dtype: Optional[torch.dtype] = None
+    device: torch.device,
+    op: str = "fwd",
+    out_dtype: Optional[torch.dtype] = None,
+    *,
+    accumulate: bool = False,
 ) -> bool:
-    """True when this checkout registers the program of ``op`` for ``device``."""
+    """True when this checkout registers the program of ``op`` for ``device``.
+
+    With ``accumulate=True`` (weight gradient only): True when the 512-wide k tile route of
+    ``out_dtype`` (either output dtype when None; False for a dtype the weight gradient does not
+    write) serves the accumulate build of a main stage on the device's architecture whose library
+    can load (:func:`acc_library_loadable`), that is when some weight gradient into an ``out`` of
+    that dtype can take the fused route (``plan["accumulate"] == "fused"``; a call whose plan splits
+    its tail also needs the ``TAIL_REDUCE_ACC`` build of its tail's route, :func:`wgrad_accumulate_mode`);
+    the composed route needs only the overwrite programs."""
+    _require_flag(accumulate, "accumulate", "generated_program_available")
+    if accumulate and op != "wgrad":
+        raise ValueError(
+            f"generated_program_available: accumulate=True applies to the weight gradient, got op={op!r}"
+        )
     arch = arch_for(device)
     if arch is None:
         return False
     name = _DTYPE_NAMES.get(out_dtype) if out_dtype is not None else None
-    return program_registered(op, arch, out_dtype=name)
+    if not accumulate:
+        return program_registered(op, arch, out_dtype=name)
+    if out_dtype is not None and name is None:
+        return False
+    for dtype in (name,) if name else ("bfloat16", "float32"):
+        route, stages = _acc_stages(dtype, arch)
+        if any(acc_library_loadable(route, stage, arch) for stage in stages):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -491,13 +673,14 @@ def dgrad_evict_first(
 
     ``k`` is the dgrad ``K``, the columns of ``dX`` (``w.shape[2]``); the reduction runs
     over ``N`` (``w.shape[1]``).  The twin keeps each group's weights resident in L2 when a
-    group spans many 256-row blocks: the groups average at least
-    ``dgrad_evict_first_min_rows`` rows (``sum_m // num_groups``) and every 256-row block
-    has at least ``dgrad_evict_first_min_k / wide_block_n`` column tiles."""
+    group spans many 256-row blocks: on the architectures of ``dgrad_evict_first_archs``,
+    the groups average at least the architecture's ``dgrad_evict_first_min_rows`` rows
+    (``sum_m // num_groups``) and every 256-row block has at least
+    ``dgrad_evict_first_min_k / wide_block_n`` column tiles (the gate/up projection)."""
     c = constants or host_plan_constants()
     return (
         arch in c["dgrad_evict_first_archs"]
-        and sum_m // max(num_groups, 1) >= int(c["dgrad_evict_first_min_rows"])
+        and sum_m // max(num_groups, 1) >= int(c["dgrad_evict_first_min_rows"][arch])
         and k >= int(c["dgrad_evict_first_min_k"])
     )
 
@@ -567,6 +750,23 @@ def fwd_lwh_ef(
     return arch in c["fwd_lwh_ef_archs"] and k <= int(c["fwd_lwh_ef_max_k"])
 
 
+def fwd_evict_first(
+    k: int,
+    arch: str,
+    constants: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Whether the forward pass's wide tile takes its twin that loads X and stores Y
+    with the L2 evict-first policy.
+
+    ``k`` is the forward ``K``, the reduction dimension (``x.shape[1]``, equal to
+    ``w.shape[2]``).  The twin serves the long reductions of the gate/up projection,
+    ``K >= fwd_evict_first_min_k``, on the architectures of ``fwd_evict_first_archs``,
+    whatever the group sizes; a shorter reduction (the down projection) keeps the
+    plain wide tile."""
+    c = constants or host_plan_constants()
+    return arch in c["fwd_evict_first_archs"] and k >= int(c["fwd_evict_first_min_k"])
+
+
 def wgrad_k256_tail(
     k: int,
     arch: str,
@@ -608,16 +808,16 @@ def select_row_stage(
     """``(stage, tile_n)`` of route ``name`` for ``fwd`` / ``dgrad``: ``main_wide`` with the wide
     tile (``fwd_dgrad_tile_n``) where the route serves it on ``arch``, else ``main`` with
     ``block_n``; a data gradient takes ``main_wide_ef`` in place of ``main_wide`` where
-    ``dgrad_evict_first`` holds, and a forward pass where ``fwd_lwh_ef`` holds, when the
-    route serves that stage on ``arch``; else ``main_wide_ts33`` where
-    ``dgrad_wide_ts33`` (a data gradient) or ``fwd_wide_ts33`` (a forward pass) holds
-    and the route serves it on ``arch``."""
+    ``dgrad_evict_first`` holds, and a forward pass where ``fwd_lwh_ef`` or
+    ``fwd_evict_first`` holds, when the route serves that stage on ``arch``; else
+    ``main_wide_ts33`` where ``dgrad_wide_ts33`` (a data gradient) or ``fwd_wide_ts33``
+    (a forward pass) holds and the route serves it on ``arch``."""
     c = constants or host_plan_constants()
     tile_n = fwd_dgrad_tile_n(op, n, k, arch, c)
     if tile_n != int(c["block_n"]) and stage_served(name, "main_wide", arch):
         if (
             (op == "dgrad" and dgrad_evict_first(k, arch, sum_m, num_groups, c))
-            or (op == "fwd" and fwd_lwh_ef(k, arch, c))
+            or (op == "fwd" and (fwd_lwh_ef(k, arch, c) or fwd_evict_first(k, arch, c)))
         ) and stage_served(name, "main_wide_ef", arch):
             return "main_wide_ef", tile_n
         if (
@@ -663,6 +863,43 @@ def select_wgrad_stage(
     return stage, wave
 
 
+def wgrad_accumulate_mode(
+    name: str,
+    stage: str,
+    tile_k: int,
+    arch: str,
+    *,
+    reduce_name: Optional[str] = None,
+    aligned: bool = True,
+) -> tuple[str, Optional[str]]:
+    """``(plan["accumulate"], plan["accumulate_reason"])`` of a weight gradient that adds into its output,
+    for the route ``name``, main stage ``stage`` and k tile ``tile_k`` the overwrite of the same output dtype
+    selects on ``arch`` (module docstring, accumulate mode).  ``reduce_name`` is the route whose
+    tail-reduce stage sums the plan's split tail (``tail_splits > 1``), None when the tail is not split.
+
+    ``("fused", None)`` when every condition holds; else ``("composed", reason)`` with the first that fails:
+    ``"tile_k"`` (not the 512-wide k tile), ``"stage"`` (the route serves no ``stage + ACC_SUFFIX`` on
+    ``arch``), ``"tail"`` (a split tail whose route serves no ``TAIL_REDUCE_ACC`` on ``arch``: the
+    overwriting tail reduce would store over C), ``"min_cuda"`` (the library of one of those builds cannot
+    load, :func:`acc_library_loadable`) or ``"alignment"`` (``out`` is not ``ACC_ALIGN``-byte aligned,
+    ``aligned``)."""
+    if tile_k != 512:
+        return "composed", "tile_k"
+    acc_stage = stage + ACC_SUFFIX
+    if not stage_served(name, acc_stage, arch):
+        return "composed", "stage"
+    builds = [(name, acc_stage)]
+    if reduce_name is not None:
+        if not stage_served(reduce_name, TAIL_REDUCE_ACC, arch):
+            return "composed", "tail"
+        builds.append((reduce_name, TAIL_REDUCE_ACC))
+    if not all(acc_library_loadable(route, build, arch) for route, build in builds):
+        return "composed", "min_cuda"
+    if not aligned:
+        return "composed", "alignment"
+    return "fused", None
+
+
 # ---------------------------------------------------------------------------
 # Prepared launches
 # ---------------------------------------------------------------------------
@@ -687,9 +924,22 @@ try:
     _current_device = torch._C._cuda_getDevice
 except AttributeError:  # pragma: no cover - older torch
     _current_device = torch.cuda.current_device
+# The version-counter bump of a tensor written in place outside torch (a fused accumulate launch).
+try:
+    _increment_version = torch.autograd.graph.increment_version
+except AttributeError:  # pragma: no cover - older torch
+    _increment_version = torch._C._increment_version
 
 # The workspace kinds a program's argument plan may name, by argument name.
 STREAM_WORKSPACES = ("sched", "wave_sync")
+# Arguments a generated program may name beside the operands it addresses through TMA descriptors: the
+# operands' row-addressed bases, the same tensors as ``A`` / ``B`` (``_bind`` passes them where the
+# argument plan names them).  A build on an architecture outside ``ROW_BASE_READ_ARCHS`` never reads its
+# row bases, and the host binds a one-element view of the operand there: no copy, any row stride, safe
+# under CUDA graph capture.  (Today only the 256-wide k tile's ``main_wave`` program on sm_100a /
+# sm_103a takes row bases, and it does not read them.)
+OPERAND_ALIASES = {"A_rows": "A", "B_rows": "B"}
+ROW_BASE_READ_ARCHS = ("sm_107a",)
 # Stream workspaces (module docstring): one buffer per (kind, device index,
 # CUDA stream handle), created on the first launch on that stream.
 _stream_workspaces: dict[tuple[str, int, int], torch.Tensor] = {}
@@ -956,20 +1206,25 @@ class CakeMoEGroupedGemmDetLaunch:
     current stream's (module docstring), resolved at every launch, as is the
     probed queue split where ``plan["queue_split"]`` is ``"probed"``.
 
-    A weight gradient prepared with ``accumulate=True`` (``plan["accumulate"]
-    == "composed"``) adds into ``out`` at every ``launch()`` and every replay of
-    a graph that captured it (it is not idempotent): ``add_from`` is the
-    scratch the bound programs write, and the launch adds it into ``out`` with
-    ``out.add_`` on the same stream (which bumps ``out._version`` at
-    ``launch()`` and at capture, not at a graph replay), outside autograd.  The
-    scratch is owned by the prepared launch, as its descriptor slots are, and
-    is allocated on the stream current at the preparation (no
-    ``record_stream``), so one prepared accumulate launch must not be in flight
-    on two streams at once, the launch must be kept alive while any graph that
-    captured it may replay (a graph does not keep the scratch alive), and after
-    a launch on another stream it must be kept alive until that launch
-    completes.  A launch prepared inside a captured backward allocates the
-    scratch from, and returns it to, the graph's pool within that backward.
+    A weight gradient prepared with ``accumulate=True`` adds into ``out`` at
+    every ``launch()`` and every replay of a graph that captured it (it is not
+    idempotent).  On the fused route (``plan["accumulate"] == "fused"``,
+    ``bump_version``) the bound accumulate builds add into ``out`` in place and
+    the launch bumps ``out._version`` with
+    ``torch.autograd.graph.increment_version`` (not for an inference tensor).
+    On the composed route (``plan["accumulate"] == "composed"``) ``add_from``
+    is the scratch the bound programs write, and the launch adds it into
+    ``out`` with ``out.add_`` on the same stream, outside autograd.  Either
+    route bumps ``out._version`` at ``launch()`` and at capture, not at a
+    graph replay.  The composed scratch is owned by the prepared launch, as its
+    descriptor slots are, and is allocated on the stream current at the
+    preparation (no ``record_stream``), so one prepared accumulate launch must
+    not be in flight on two streams at once, the launch must be kept alive
+    while any graph that captured it may replay (a graph does not keep the
+    scratch alive), and after a launch on another stream it must be kept alive
+    until that launch completes.  A launch prepared inside a captured backward
+    allocates the scratch from, and returns it to, the graph's pool within that
+    backward.
     """
 
     op: str
@@ -983,9 +1238,11 @@ class CakeMoEGroupedGemmDetLaunch:
     # descriptor slots and the fp32 tail partials.  Kept alive with the launch.
     workspaces: tuple[torch.Tensor, ...] = field(default=(), repr=False)
     device_index: int = -1
-    # Accumulate mode: the contiguous scratch of ``out.dtype`` the bound programs write, added into
-    # ``out`` after them; None for an overwrite.
+    # Composed accumulate: the contiguous scratch of ``out.dtype`` the bound programs write, added into
+    # ``out`` after them; None otherwise.
     add_from: Optional[torch.Tensor] = field(default=None, repr=False)
+    # Fused accumulate: the programs wrote ``out`` in place; bump its version counter after the launch.
+    bump_version: bool = False
 
     def launch(self) -> torch.Tensor:
         if self.zero_fill:
@@ -1008,11 +1265,13 @@ class CakeMoEGroupedGemmDetLaunch:
                     arguments = bound
                 item.entry(*arguments)
         if self.add_from is not None:
-            # Outside autograd: ``out`` may be a leaf that requires grad, or an inference tensor
-            # (updated in place only in inference mode).
+            # Outside autograd, as the fused route's in-place write: ``out`` may be a leaf that requires
+            # grad, or an inference tensor (updated in place only in inference mode).
             mode = torch.inference_mode if self.out.is_inference() else torch.no_grad
             with mode():
                 self.out.add_(self.add_from)
+        elif self.bump_version and not self.out.is_inference():
+            _increment_version(self.out)
         return self.out
 
     __call__ = launch
@@ -1080,6 +1339,21 @@ def _aligned_bytes(nbytes: int, device: torch.device, what: str) -> torch.Tensor
     return ws
 
 
+def _row_base(t: torch.Tensor, operand: str, program: str, arch: str) -> torch.Tensor:
+    """The row-base argument of ``operand`` (``t``, two or more dimensions) for a launch on ``arch``: ``t``
+    itself where the build reads rows through it (``ROW_BASE_READ_ARCHS``), refused unless its rows are
+    dense (row stride = row width; a single row has any stride); else a one-element view at ``t``'s first
+    element."""
+    if arch not in ROW_BASE_READ_ARCHS:
+        return t.as_strided((1,), (1,))
+    if t.size(-2) > 1 and t.stride(-2) != t.size(-1):
+        raise ValueError(
+            f"{operand} must have dense rows (row stride {t.size(-1)}, got {t.stride(-2)}): the {arch} "
+            f"build {program} also reads its rows through a plain pointer; pass a contiguous tensor"
+        )
+    return t
+
+
 def _bind(
     name: str, stage: str, kwargs: dict[str, Any], arch: str, *, split: bool = False
 ) -> _Launch:
@@ -1087,7 +1361,8 @@ def _bind(
     its entry (the binding encodes the operands' TMA descriptors by value at every launch).  A buffer the
     plan names after a stream workspace kind is left to ``CakeMoEGroupedGemmDetLaunch.launch``; with ``split`` so
     are ``c0`` / ``c1``, which a launch replaces by the probed split of its ``sched`` once known, and the
-    queue probe is built here."""
+    queue probe is built here.  An argument of ``OPERAND_ALIASES`` the plan names gets the operand it
+    aliases (``_row_base``)."""
     binding = stage_binding(name, stage, arch)
     program = PROGRAMS[binding["program"]]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
@@ -1101,6 +1376,15 @@ def _bind(
             arguments.append(None)
         elif arg in kwargs:
             arguments.append(kwargs[arg])
+        elif OPERAND_ALIASES.get(arg) in kwargs:
+            arguments.append(
+                _row_base(
+                    kwargs[OPERAND_ALIASES[arg]],
+                    OPERAND_ALIASES[arg],
+                    binding["program"],
+                    arch,
+                )
+            )
         else:
             raise KeyError(
                 f"generated program {binding['program']!r} (route {name!r}, stage {stage!r}) "
@@ -1131,6 +1415,7 @@ def _finish(
     *,
     zero_fill: bool = False,
     add_from: Optional[torch.Tensor] = None,
+    bump_version: bool = False,
 ) -> CakeMoEGroupedGemmDetLaunch:
     return CakeMoEGroupedGemmDetLaunch(
         op=op,
@@ -1143,6 +1428,7 @@ def _finish(
         workspaces=tuple(workspaces),
         device_index=_device_index(out.device),
         add_from=add_from,
+        bump_version=bump_version,
     )
 
 
@@ -1254,7 +1540,9 @@ def cake_moe_grouped_gemm_det_train_prepare_forward(
     ``x``: ``[sum_m, K]`` bf16; ``w``: ``[E, N, K]`` bf16; ``offs``: int32
     ``[E]`` device end offsets; ``N % 256 == 0``, ``K % 64 == 0`` (the
     512-column tile when ``N % 512 == 0`` on the architectures of
-    ``wide_fwd_archs``, its 3 / 3 head / tail twin where ``fwd_wide_ts33`` holds).
+    ``wide_fwd_archs``, its L2 evict-first twin where ``fwd_lwh_ef`` or
+    ``fwd_evict_first`` holds for ``K``, its 3 / 3 head / tail twin where
+    ``fwd_wide_ts33`` holds).
     ``out`` may be row-padded (any row stride, unit column
     stride).
     """
@@ -1350,6 +1638,15 @@ def _check_accumulate_out(
             )
 
 
+def _accumulate_aligned(out: torch.Tensor) -> bool:
+    """Whether the base, the row pitch and (more than one expert) the expert pitch of ``out`` are
+    ``ACC_ALIGN``-byte aligned, as the accumulate builds need."""
+    size = out.element_size()
+    if int(out.data_ptr()) % ACC_ALIGN or int(out.stride(1)) * size % ACC_ALIGN:
+        return False
+    return out.shape[0] <= 1 or int(out.stride(0)) * size % ACC_ALIGN == 0
+
+
 def cake_moe_grouped_gemm_det_train_prepare_wgrad(
     g: torch.Tensor,
     x: torch.Tensor,
@@ -1374,17 +1671,20 @@ def cake_moe_grouped_gemm_det_train_prepare_wgrad(
     ``out`` (required, bf16 or fp32; ``out_dtype`` None or ``out.dtype``; rows
     and experts that do not overlap, no memory shared with ``g``, ``x`` or
     ``offs``; ``ValueError`` otherwise, before anything is allocated or
-    bound).  The launch runs the overwrite of this plan into a contiguous
-    scratch of ``out.dtype`` (``E * N * K`` elements: ``4 * E * N * K`` bytes
-    for fp32) that this preparation allocates and the launch owns, then
-    ``out.add_(scratch)`` on the same stream, so ``out`` holds AccumulateGrad's
-    bits of the deterministic weight gradient in its dtype, bitwise
-    reproducible run to run (an empty group adds exact zeros: its values stay,
-    ``-0.0`` may become ``+0.0``).  ``plan["accumulate"]`` is ``"composed"``
-    (``"off"`` for an overwrite) and every other plan key is the overwrite's.
-    No row (``sum_m == 0``) launches nothing and leaves ``out`` unchanged.  Each
-    ``launch()`` and each replay of a graph that captured it adds again; keep
-    the launch alive while such a graph may replay.
+    bound), so ``out`` holds AccumulateGrad's bits of the deterministic weight
+    gradient in its dtype, bitwise reproducible run to run (an empty group
+    adds exact zeros: its values stay, ``-0.0`` becomes ``+0.0``).
+    ``plan["accumulate"]`` is ``"fused"`` (the accumulate builds of the main
+    stage and, for a split tail, of the tail reduce add into ``out`` in place:
+    ``stages`` is the overwrite's with ``ACC_SUFFIX`` on each) or
+    ``"composed"`` (the overwrite of this plan into a contiguous scratch of
+    ``out.dtype``, ``E * N * K`` elements that this preparation allocates and
+    the launch owns, then ``out.add_(scratch)`` on the same stream;
+    ``plan["accumulate_reason"]`` says why); both give the same bits, and
+    every other plan key is the overwrite's (module docstring, accumulate
+    mode).  No row (``sum_m == 0``) launches nothing and leaves ``out``
+    unchanged.  Each ``launch()`` and each replay of a graph that captured it
+    adds again; keep the launch alive while such a graph may replay.
     """
     _require_flag(
         accumulate, "accumulate", "cake_moe_grouped_gemm_det_train_prepare_wgrad"
@@ -1433,7 +1733,15 @@ def cake_moe_grouped_gemm_det_train_prepare_wgrad(
         )
     if out.device != device:
         raise ValueError("out must be on the device of the operands")
-    if num_groups * out.stride(0) > int(c["int32_elems"]):
+    # The kernels address C with 32-bit offsets over its whole span (an expert stride of 0 or a row
+    # pitch above K included), so bound the span, not E times the expert stride; the binding also
+    # takes each stride as a 32-bit value (a one-group out's expert stride adds nothing to the span).
+    out_span = 1 + sum(
+        (size - 1) * stride
+        for size, stride in zip(out.shape, out.stride(), strict=True)
+        if size > 0
+    )
+    if out_span > int(c["int32_elems"]) or max(out.stride()) > int(c["int32_elems"]):
         raise ValueError(
             "the output span exceeds the 32-bit element addressing of the kernel"
         )
@@ -1463,9 +1771,9 @@ def cake_moe_grouped_gemm_det_train_prepare_wgrad(
         else name
     )
     reduce_threads = 0
-    if stage_served(reduce_name, "tail_reduce", arch):
+    if stage_served(reduce_name, TAIL_REDUCE, arch):
         reduce_program = PROGRAMS[
-            stage_binding(reduce_name, "tail_reduce", arch)["program"]
+            stage_binding(reduce_name, TAIL_REDUCE, arch)["program"]
         ]
         reduce_threads = int(reduce_program["launch"]["block"][0])
     plan = plan_wgrad(
@@ -1480,7 +1788,41 @@ def cake_moe_grouped_gemm_det_train_prepare_wgrad(
         constants=c,
     )
     plan["wave_mode"] = int(c["wave_sync_mode"][arch]) if wave else 0
-    plan["accumulate"] = "composed" if accumulate else "off"
+    mode, reason = "off", None
+    if accumulate:
+        # The route, the tile, the stage and the plan are the overwrite's (the twin's); only the
+        # binding differs (module docstring, accumulate mode).
+        mode, reason = wgrad_accumulate_mode(
+            name,
+            main_stage,
+            tile_k,
+            arch,
+            reduce_name=reduce_name if plan["tail_splits"] > 1 else None,
+            aligned=_accumulate_aligned(out),
+        )
+        if reason == "min_cuda":
+            _warn_once(
+                "accumulate_min_cuda",
+                "cake_moe_grouped_gemm_det_train_prepare_wgrad(accumulate=True): the accumulate build of the "
+                f"{main_stage} stage or of its tail reduce on {arch} is neither prebuilt nor buildable by "
+                "FlashInfer's JIT "
+                "toolkit (not importable, FLASHINFER_DISABLE_JIT set, no nvcc, or below its build.json "
+                "min_cuda), so the "
+                "weight gradient is written to a "
+                "scratch and added with out.add_ (the composed route, same bits, "
+                'plan["accumulate"] == "composed"); this warning is issued once per process',
+            )
+        elif reason == "alignment":
+            _warn_once(
+                "accumulate_alignment",
+                "cake_moe_grouped_gemm_det_train_prepare_wgrad(accumulate=True): out is not "
+                f"{ACC_ALIGN}-byte aligned (base, row pitch or expert pitch), so the weight "
+                "gradient is written to a scratch and added with out.add_ (the composed route, same "
+                'bits, plan["accumulate"] == "composed"); this warning is issued once per process',
+            )
+    plan["accumulate"] = mode
+    if reason is not None:
+        plan["accumulate_reason"] = reason
     if sum_m == 0:
         # No row: an overwrite stores exact zeros, an accumulate leaves out as it is (no launch, no add).
         return _finish("wgrad", name, plan, out, (), [], [], zero_fill=not accumulate)
@@ -1497,11 +1839,12 @@ def cake_moe_grouped_gemm_det_train_prepare_wgrad(
         device=device,
     )
     workspaces: list = [slots, partials]
-    # The tensor the bound programs write: out, or in accumulate mode a contiguous scratch of its dtype
-    # (allocated here, owned by the launch; from the graph's pool when the preparation runs under capture).
+    # The tensor the bound programs write: out (an overwrite, or the fused route adding in place), or on
+    # the composed route a contiguous scratch of its dtype (allocated here, owned by the launch; from the
+    # graph's pool when the preparation runs under capture).
     add_from = None
     target = out
-    if accumulate:
+    if mode == "composed":
         add_from = target = torch.empty(
             num_groups, n, k, dtype=out.dtype, device=device
         )
@@ -1524,8 +1867,9 @@ def cake_moe_grouped_gemm_det_train_prepare_wgrad(
         wave_mode=plan["wave_mode"],
         grid=plan["grid"],
     )
-    stages = [main_stage]
-    launches = [_bind(name, main_stage, main_kwargs, arch)]
+    suffix = ACC_SUFFIX if mode == "fused" else ""
+    stages = [main_stage + suffix]
+    launches = [_bind(name, stages[0], main_kwargs, arch)]
     if splits > 1:
         reduce_kwargs = dict(
             partials=partials,
@@ -1541,8 +1885,8 @@ def cake_moe_grouped_gemm_det_train_prepare_wgrad(
             raster_rows=plan["raster_rows"],
             grid=plan["tail_reduce_grid"],
         )
-        stages.append("tail_reduce")
-        launches.append(_bind(reduce_name, "tail_reduce", reduce_kwargs, arch))
+        stages.append(TAIL_REDUCE + suffix)
+        launches.append(_bind(reduce_name, stages[-1], reduce_kwargs, arch))
     return _finish(
         "wgrad",
         name,
@@ -1552,6 +1896,7 @@ def cake_moe_grouped_gemm_det_train_prepare_wgrad(
         launches,
         workspaces,
         add_from=add_from,
+        bump_version=mode == "fused",
     )
 
 

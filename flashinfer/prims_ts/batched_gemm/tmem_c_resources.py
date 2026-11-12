@@ -411,6 +411,7 @@ class TmemCResource(MemoryResource):
         desc_b_mma_base: prims.Tcgen05SmemDesc,
         smem_b_stage_ptr: Int64,
         first_k_tile: Constexpr[Optional[bool]] = None,
+        k_subblock: Constexpr[Optional[int]] = None,
     ) -> None:
         self._mma_impl(
             stage_info,
@@ -418,6 +419,7 @@ class TmemCResource(MemoryResource):
             desc_b_mma_base,
             smem_a_stage_ptr=smem_a_stage_ptr,
             first_k_tile=first_k_tile,
+            k_subblock=k_subblock,
         )
 
     @producer_work
@@ -564,8 +566,14 @@ class TmemCResource(MemoryResource):
         sfb_stage_col_offset=None,
         tmem_cast_a_addr=None,
         first_k_tile: Constexpr[Optional[bool]] = None,
+        k_subblock: Constexpr[Optional[int]] = None,
     ) -> None:
-        """Execute MMA (accumulates across K-tiles). Branches on BF16 vs FP4."""
+        """Execute MMA (accumulates across K-tiles). Branches on BF16 vs FP4.
+
+        ``k_subblock`` restricts the issue to one DeepSeek scale block of the K
+        tile (``deepseek_fp8_block_size // mma_k`` MMAs starting from a fresh
+        accumulator). The caller acquires one accumulator stage per sub-block.
+        """
         desc_a_mma = desc_a_mma_base
         desc_b_mma = desc_b_mma_base
         stage_col_offset = stage_info.stage_idx * self.cfg.tmem_overlap_window_cols
@@ -579,6 +587,12 @@ class TmemCResource(MemoryResource):
         )
 
         num_kblocks = self.cfg.tile_k // self.cfg.mma_k
+        kblock_begin = 0
+        kblock_end = num_kblocks
+        if cutlass.const_expr(k_subblock is not None):
+            kblocks_per_sub = self.cfg.deepseek_fp8_block_size // self.cfg.mma_k
+            kblock_begin = k_subblock * kblocks_per_sub
+            kblock_end = kblock_begin + kblocks_per_sub
         is_first_ktile = stage_info.loop_offset == Int32(0)
         if cutlass.const_expr(first_k_tile is not None):
             is_first_ktile = cutlass.Boolean(first_k_tile)
@@ -589,7 +603,7 @@ class TmemCResource(MemoryResource):
                 mma_kind = prims.Tcgen05MMAKind.F8F6F4
             else:
                 mma_kind = prims.Tcgen05MMAKind.F16
-            for kblock_idx in cutlass.range_constexpr(num_kblocks):
+            for kblock_idx in cutlass.range_constexpr(kblock_begin, kblock_end):
                 if cutlass.const_expr(self.cfg.has_cast_a):
                     desc_a_increment = 0
                 else:
@@ -614,7 +628,7 @@ class TmemCResource(MemoryResource):
                 else:
                     desc_a = desc_a_mma + desc_a_increment
 
-                if cutlass.const_expr(kblock_idx == 0):
+                if cutlass.const_expr(kblock_idx == kblock_begin):
                     if cutlass.const_expr(self.cfg.use_deepseek_fp8):
                         accumulate = cutlass.Boolean(False)
                     else:
@@ -642,7 +656,7 @@ class TmemCResource(MemoryResource):
                     + Int32(0x100000),
                     cutlass.Float32,
                 )
-                for kblock_idx in cutlass.range_constexpr(num_kblocks):
+                for kblock_idx in cutlass.range_constexpr(kblock_begin, kblock_end):
                     desc_a_increment = _mma_smem_desc_increment(
                         kblock_idx,
                         mma_k=self.cfg.mma_k,
@@ -659,7 +673,7 @@ class TmemCResource(MemoryResource):
                     desc_a = desc_a_mma_1 + desc_a_increment
                     desc_b = desc_b_mma + desc_b_increment
 
-                    if cutlass.const_expr(kblock_idx == 0):
+                    if cutlass.const_expr(kblock_idx == kblock_begin):
                         accumulate = cutlass.Boolean(False)
                     else:
                         accumulate = cutlass.Boolean(True)

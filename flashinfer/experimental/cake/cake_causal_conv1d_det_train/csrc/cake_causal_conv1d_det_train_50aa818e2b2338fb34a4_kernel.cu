@@ -318,7 +318,7 @@ kernel_cake_causal_conv1d_det_train_50aa818e2b2338fb34a4(__nv_bfloat16* __restri
             #pragma unroll
             for (int j = 0; j < 8; j++) {
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64 + (long long)j) * 4);
+                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64 + (long long)j) * 4ll);
                     wr[j * 4 + 0] = _v4.x;
                     wr[j * 4 + 1] = _v4.y;
                     wr[j * 4 + 2] = _v4.z;
@@ -835,7 +835,7 @@ kernel_cake_causal_conv1d_det_train_50aa818e2b2338fb34a4(__nv_bfloat16* __restri
             #pragma unroll
             for (int j_2 = 0; j_2 < 8; j_2++) {
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64_1 + (long long)j_2) * 4);
+                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64_1 + (long long)j_2) * 4ll);
                     wr_1[j_2 * 4 + 0] = _v4.x;
                     wr_1[j_2 * 4 + 1] = _v4.y;
                     wr_1[j_2 * 4 + 2] = _v4.z;
@@ -1319,7 +1319,7 @@ kernel_cake_causal_conv1d_det_train_50aa818e2b2338fb34a4(__nv_bfloat16* __restri
             #pragma unroll
             for (int j_4 = 0; j_4 < 8; j_4++) {
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64_2 + (long long)j_4) * 4);
+                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64_2 + (long long)j_4) * 4ll);
                     wr_2[j_4 * 4 + 0] = _v4.x;
                     wr_2[j_4 * 4 + 1] = _v4.y;
                     wr_2[j_4 * 4 + 2] = _v4.z;
@@ -1760,7 +1760,7 @@ kernel_cake_causal_conv1d_det_train_50aa818e2b2338fb34a4(__nv_bfloat16* __restri
         }
         #pragma unroll
         for (int j_6 = 0; j_6 < 8; j_6++) {
-            long long pidx = ((long long)rank * C64 + (long long)c0_0 + (long long)j_6) * 4;
+            long long pidx = ((long long)rank * C64 + (long long)c0_0 + (long long)j_6) * 4ll;
             {
                 float4 _v4 = make_float4(tot[j_6 * 4 + 0], tot[j_6 * 4 + 1], tot[j_6 * 4 + 2], tot[j_6 * 4 + 3]);
                 *reinterpret_cast<float4*>(partial + pidx) = _v4;

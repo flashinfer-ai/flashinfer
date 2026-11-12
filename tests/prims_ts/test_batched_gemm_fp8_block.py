@@ -129,6 +129,13 @@ def _with_deepseek_tile(cfg, tile_n):
     return cfg
 
 
+def _with_deepseek_block32(cfg):
+    """[32,32] scales: four scale sub-blocks per 128-wide K tile."""
+    cfg = dict(cfg)
+    cfg.update(deepseek_fp8_block_size=32)
+    return cfg
+
+
 def _mx_fc1_base():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         ActKind,
@@ -230,6 +237,130 @@ def test_deepseek_fp8_fc2_correctness_small(tile_n):
         problem_k=128,
         **_with_deepseek_tile(_deepseek_fp8_fc2_variant(), tile_n),
     )
+
+
+def test_deepseek_fp8_fc1_partial_weight_tile():
+    """M=320 (2 x 160) at block 128: the last 128-row weight tile is partial.
+
+    swapAB zero-fills the missing rows through the A TMA map and predicates
+    them in the epilogue, so whole-tile scales still cover the remainder.
+    """
+    _require_sm100()
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+    assert reference_check(
+        num_experts=2,
+        num_tokens=8,
+        top_k=1,
+        problem_n=320,
+        problem_k=256,
+        **_with_deepseek_tile(_deepseek_fp8_fc1_variant(), 8),
+    )
+
+
+@pytest.mark.parametrize("tile_n", [8, 64, 128])
+def test_deepseek_fp8_block32_fc2_correctness(tile_n):
+    """FC2 at [32,32] scales with K=160: the TP4 contract's five K blocks."""
+    _require_sm100()
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+    assert reference_check(
+        num_experts=2,
+        num_tokens=max(tile_n, 8),
+        top_k=1,
+        problem_n=256,
+        problem_k=160,
+        **_with_deepseek_block32(
+            _with_deepseek_tile(_deepseek_fp8_fc2_variant(), tile_n)
+        ),
+    )
+
+
+@pytest.mark.parametrize("tile_n", [8, 64, 128])
+def test_deepseek_fp8_block32_fc1_correctness(tile_n):
+    """FC1 at [32,32] scales with M=320: ten row groups over three weight tiles.
+
+    ``tile_n=64`` takes the atomic absmax scratch, the others the SMEM
+    exchange path.
+    """
+    _require_sm100()
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+    assert reference_check(
+        num_experts=2,
+        num_tokens=max(tile_n, 8),
+        top_k=1,
+        problem_n=320,
+        problem_k=256,
+        **_with_deepseek_block32(
+            _with_deepseek_tile(_deepseek_fp8_fc1_variant(), tile_n)
+        ),
+    )
+
+
+@pytest.mark.parametrize("tile_n", [8, 128])
+@pytest.mark.parametrize(
+    ("stage", "problem_n", "problem_k"),
+    [
+        pytest.param("fc1", 320, 2560, id="fc1"),
+        pytest.param("fc2", 2560, 160, id="fc2"),
+    ],
+)
+def test_deepseek_fp8_block32_moe_default_config_contract_shape(
+    stage, problem_n, problem_k, tile_n
+):
+    """Each GEMM of the TP4 contract (H=2560, I=160) on the mapped MoE tactic.
+
+    The small block-32 tests use a four-stage pipeline; the MoE rows stage
+    five to eight K tiles and, at ``tile_n=128``, 2 KB of activation scales
+    per stage.
+    """
+    _require_sm100()
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+    from flashinfer.prims_ts.moe.config_mapper import (
+        map_trtllm_deepseek_fp8_moe_tactic,
+    )
+
+    pair = map_trtllm_deepseek_fp8_moe_tactic(
+        [tile_n, 0],
+        num_tokens=256,
+        top_k=10,
+        num_local_experts=512,
+        enable_pdl=True,
+        deepseek_fp8_block_size=32,
+    )
+    config_spec = pair.fc1.cfg if stage == "fc1" else pair.fc2.cfg
+
+    assert reference_check(
+        num_experts=512,
+        num_tokens=256,
+        top_k=10,
+        problem_n=problem_n,
+        problem_k=problem_k,
+        **config_spec.kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        pytest.param({"tile_k": 256}, "tile_k=128", id="tile_k-stays-128"),
+        pytest.param({"mma_m": 128}, "split-M", id="block32-needs-split-m-epilogue"),
+        pytest.param(
+            {"deepseek_fp8_block_size": 64}, "must be 32 or 128", id="block-64"
+        ),
+    ],
+)
+def test_deepseek_fp8_block32_config_rejections(overrides, match):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        BatchedGemmConfig,
+        validate_config,
+    )
+
+    cfg = _with_deepseek_block32(_with_deepseek_tile(_deepseek_fp8_fc2_variant(), 8))
+    cfg.update(overrides)
+    with pytest.raises(ValueError, match=match):
+        validate_config(BatchedGemmConfig(**cfg))
 
 
 @pytest.mark.parametrize(

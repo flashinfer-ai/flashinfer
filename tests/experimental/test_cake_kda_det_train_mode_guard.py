@@ -14,8 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 The deterministic single-rank KDA training entries (``flashinfer.cake_kda_det_train``) refuse a workspace, a saved
-set or an arena option of the non-deterministic package (``flashinfer.cake_kda_train`` with
-``deterministic=False``) with ``ValueError`` naming the mode.  The non-deterministic types carry the attributes
+set or an arena option of the non-deterministic package (``flashinfer.cake_kda_nondet_train``) with ``ValueError`` naming the mode.  The non-deterministic types carry the attributes
 the deterministic checks read, so only their type tells them apart.  The CPU tests use stand-ins and the
 non-deterministic types built on the host; the GPU tests use a workspace and a saved set the non-deterministic
 package allocates and writes.
@@ -30,9 +29,9 @@ import torch
 
 import flashinfer.cake_kda_det_train as det_api
 from flashinfer.experimental.cake.cake_kda_det_train import cake_backend, cake_jit
-from tests.test_helpers.cake_kda_det_train_reference import make_inputs
+from tests.experimental.test_helpers.cake_kda_det_train_reference import make_inputs
 
-ND_BACKEND = "flashinfer.experimental.cake.cake_kda_train.cake_backend"
+ND_BACKEND = "flashinfer.experimental.cake.cake_kda_nondet_train.cake_backend"
 
 LENGTHS, HEADS = (63, 1, 65), 2
 
@@ -47,8 +46,8 @@ def _refused(name: str, value: object, det_type: str) -> str:
         + re.escape(f"; the deterministic entries take a {det_type} (")
         + ".*"
         + re.escape(
-            "; the non-deterministic package is flashinfer.cake_kda_train / flashinfer.cake_kda_train_kcp "
-            "(deterministic=False)"
+            "; the non-deterministic package is flashinfer.cake_kda_nondet_train / "
+            "flashinfer.cake_kda_nondet_train_kcp"
         )
     )
 
@@ -80,7 +79,7 @@ def _nd_saved_on_host() -> object:
     nd = importlib.import_module(ND_BACKEND)
     S = sum(LENGTHS)
     a = torch.zeros(S, HEADS, 64, dtype=torch.bfloat16)
-    return nd.KdaChunkSaved(
+    return nd.CakeKDANondetChunkSaved(
         version=cake_backend.SAVED_VERSION,
         Aqk=a,
         Akk=a.clone(),
@@ -140,7 +139,7 @@ def test_workspace_helper_refuses_a_foreign_object(name: str) -> None:
 def test_entries_refuse_nd_host_objects() -> None:
     nd = importlib.import_module(ND_BACKEND)
     q, k, v, g, beta, cu, dout = _operands("cpu")
-    nd_arena, nd_saved = nd.KdaArena(), _nd_saved_on_host()
+    nd_arena, nd_saved = nd.CakeKDANondetArena(), _nd_saved_on_host()
     assert type(nd_saved).__module__ == ND_BACKEND
     with pytest.raises(
         ValueError, match=_refused("saved", nd_saved, "CakeKDADetChunkSaved")
@@ -182,13 +181,13 @@ def test_det_objects_pass_the_package_check() -> None:
 
 def test_det_entries_refuse_an_nd_workspace_and_saved_set() -> None:
     device = _device_or_skip()
-    nd_api = importlib.import_module("flashinfer.cake_kda_train")
+    nd_api = importlib.import_module("flashinfer.cake_kda_nondet_train")
     q, k, v, g, beta, cu, dout = _operands(device)
     S, N = sum(LENGTHS), len(LENGTHS)
-    nd_ws = nd_api.kda_train_workspace(S, N, HEADS, device, deterministic=False)
+    nd_ws = nd_api.cake_kda_nondet_train_workspace(S, N, HEADS, device)
     assert type(nd_ws).__module__ == ND_BACKEND
-    _nd_out, nd_saved = nd_api.chunk_kda_fwd(
-        q, k, v, g, beta, cu, workspace=nd_ws, deterministic=False
+    _nd_out, nd_saved = nd_api.cake_kda_nondet_train_forward(
+        q, k, v, g, beta, cu, workspace=nd_ws
     )
     assert type(nd_saved).__module__ == ND_BACKEND
     _out, saved = det_api.cake_kda_det_train_forward(q, k, v, g, beta, cu)

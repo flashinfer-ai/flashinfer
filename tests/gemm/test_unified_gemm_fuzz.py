@@ -68,7 +68,7 @@ import contextlib
 import os
 import random
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 import pytest
@@ -194,6 +194,9 @@ class GemmAdapter:
     min_dim: int = (
         1  # minimum N/K (some kernels require a min tile, e.g. mxfp8 needs n,k >= 128)
     )
+    unit: int = (
+        0  # >0: draw M and N as random multiples of this (kernels that tile both)
+    )
 
 
 # --- bf16 mm: no quant convention -> the cross-backend EQUALITY oracle is valid here ----------
@@ -292,6 +295,35 @@ def _run_mxfp8_bmm(a, b, out, backend, cfg):
         b, True
     )  # b is the [B,N,K] weight; do NOT .contiguous() the transpose
     bmm_mxfp8(a_q, b_q.transpose(-2, -1), a_s, b_s, out.dtype, out, backend=backend)
+
+
+def _run_mxfp8_bmm_cute_dsl(a, b, out, backend, cfg):
+    # cute-dsl (SM107) as _run_mxfp8_bmm, plus its MXFP8-output mode: for a bf16 `out`, the
+    # float8_e4m3fn output and out_scale must equal mxfp8_quantize(out) bit for bit, with no
+    # scale byte stored past out_scale.
+    _run_mxfp8_bmm(a, b, out, backend, cfg)
+    if out.dtype != torch.bfloat16:
+        return
+    nb, m, n = out.shape
+    ref_q, ref_s = mxfp8_quantize(out.reshape(nb * m, n), True)
+    a_q, a_s = mxfp8_quantize(a, True)
+    b_q, b_s = mxfp8_quantize(b, True)
+    q = torch.empty(out.shape, device=out.device, dtype=torch.float8_e4m3fn)
+    need = ref_s.numel()
+    scale = torch.full([need + 512], 0xAB, device=out.device, dtype=torch.uint8)
+    bmm_mxfp8(
+        a_q,
+        b_q.transpose(-2, -1),
+        a_s,
+        b_s,
+        torch.float8_e4m3fn,
+        q,
+        backend=backend,
+        out_scale=scale[:need],
+    )
+    assert (scale[need:] == 0xAB).all(), "MXFP8 output stored scales past out_scale"
+    assert torch.equal(scale[:need], ref_s.view(torch.uint8).reshape(-1))
+    assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8).view(nb, m, n))
 
 
 _ADAPTERS = [
@@ -404,6 +436,26 @@ _ADAPTERS = [
         min_dim=128,  # mxfp8 needs n,k >= 128; bmm_mxfp8 does NOT enforce it (silent garbage) -- see
         # _gen B2 note: the fuzzer stays in the supported regime, the missing guard is reported.
     ),
+    GemmAdapter(
+        key="bmm_mxfp8_cute_dsl",
+        op_shape="bmm",
+        quant_mode="mxfp8",
+        backends=("cute-dsl",),
+        # same declared recipe as bmm_mxfp8 -> the conformance auditor cross-checks it vs cudnn
+        convention={
+            "a_scale": "block-32",
+            "b_scale": "block-32",
+            "global": "none",
+            "layout": "mx",
+            "b_memory": "column-major (transpose view)",
+        },
+        supported=lambda sm: sm == 107,
+        run=_run_mxfp8_bmm_cute_dsl,
+        deterministic=True,
+        align=128,
+        min_dim=128,
+        unit=128,  # the SM107 kernel needs m and n to be multiples of 128
+    ),
     # EXTEND:
     # * mm_fp8 (trtllm_low_latency): decode-only shape regime (M<=16, K>=8192, N in {2560,5120} +
     #   prepare_low_latency_gemm_weights) -> needs its OWN shape distribution, not the uniform _gen.
@@ -437,7 +489,10 @@ _CONVENTION_DIVERGENCES = [
 # xfail only if an invariant actually fails -> they keep the xpass "fixed -> remove me" signal.
 _KNOWN_FAILURES = [
     (
-        lambda cfg: cfg.adapter.key == "bmm_mxfp8" and cfg.b > 1 and (cfg.m % 128) != 0,
+        lambda cfg: cfg.adapter.key.startswith("bmm_mxfp8")
+        and cfg.backend != "cute-dsl"
+        and cfg.b > 1
+        and (cfg.m % 128) != 0,
         "TRACKED: flashinfer-ai/flashinfer#3604. "
         "bmm_mxfp8 returns GARBAGE/inf for batch indices > 0 when b>1 AND M is not a multiple of 128 "
         "(batch 0 is always correct; b==1 is correct for any M; b>1 with M%128==0 is correct). This is "
@@ -564,7 +619,7 @@ def _gen(seed) -> Cfg:
         # (else it silently NaNs instead of NOT_SUPPORTED -- a minor robustness gap, out of scope).
         if torch.float8_e5m2 in (fp8_idt, fp8_mdt):
             backends = tuple(b for b in backends if b != "cutlass")
-    return Cfg(
+    cfg = Cfg(
         seed=seed,
         adapter=ad,
         backend=rng.choice(backends),
@@ -578,6 +633,11 @@ def _gen(seed) -> Cfg:
         noncontig=noncontig,
         use_8x4=use_8x4,
     )
+    if ad.unit:
+        cfg = replace(
+            cfg, m=ad.unit * rng.randint(1, 32), n=ad.unit * rng.randint(1, 16)
+        )
+    return cfg
 
 
 if _SKIP is not None or not any(a.supported(_SM) for a in _ADAPTERS):

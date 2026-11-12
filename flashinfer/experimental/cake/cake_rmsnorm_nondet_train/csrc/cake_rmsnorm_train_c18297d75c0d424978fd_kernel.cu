@@ -356,7 +356,7 @@ kernel_cake_rmsnorm_train_c18297d75c0d424978fd(__nv_bfloat16* __restrict__ g, __
                 float kx = rq * rq * rq * cq;
                 float nkx = -kx;
                 if (row6a < row_end) {
-                    unsigned long long dx_base = (unsigned long long)row6a * 256;
+                    unsigned long long dx_base = (unsigned long long)row6a * 256ull;
                     float2 rr = make_float2(rq, rq);
                     float2 rrn = make_float2(-rq, -rq);
                     float2 nn = make_float2(nkx, nkx);
@@ -423,7 +423,7 @@ kernel_cake_rmsnorm_train_c18297d75c0d424978fd(__nv_bfloat16* __restrict__ g, __
             }
             asm volatile("cp.async.wait_group 0;");
         }
-        unsigned long long pbase = (unsigned long long)c * 256;
+        unsigned long long pbase = (unsigned long long)c * 256ull;
         #pragma unroll
         for (int v_3 = 0; v_3 < 1; v_3++) {
             int fcol = (v_3 * 32 + tir) * 8;
@@ -473,7 +473,7 @@ kernel_cake_rmsnorm_train_c18297d75c0d424978fd(__nv_bfloat16* __restrict__ g, __
             float2 _v2 = make_float2(fold_acc[0 + 0], fold_acc[0 + 1]);
             *reinterpret_cast<float2*>(partial + pbase + (unsigned long long)pcol) = _v2;
         }
-        unsigned long long lbase = (unsigned long long)(n_chunks + c) * 256;
+        unsigned long long lbase = (unsigned long long)(n_chunks + c) * 256ull;
         {
             float2 _v2 = make_float2(fold_c[0 + 0], fold_c[0 + 1]);
             *reinterpret_cast<float2*>(partial + lbase + (unsigned long long)pcol) = _v2;

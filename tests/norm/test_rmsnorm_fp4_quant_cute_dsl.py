@@ -27,7 +27,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 from flashinfer.cute_dsl.utils import is_cute_dsl_available
-from tests.test_helpers.utils_fp4 import (
+from tests.quantization.test_helpers.utils_fp4 import (
     E2M1_TO_FLOAT32,
     cast_from_fp4,
     pack_fp4_values,
