@@ -937,8 +937,10 @@ def autotune(
         tuning_buckets: Optional sequence of integer measurement points.
             When provided, replaces the default power-of-2 buckets for all
             operations within this context.  For example,
-            ``tuning_buckets=(64, 128, 256, 512, 1024)`` profiles exactly
-            those batch sizes.  Duplicates are removed and values are sorted
+            ``tuning_buckets=(64, 128, 256, 512, 1024)`` profiles those batch
+            sizes.  Listed sizes that an op maps to the same bucket share one
+            tuned entry, profiled at the size equal to that bucket, or else at
+            the largest of them.  Duplicates are removed and values are sorted
             automatically.  Must contain **at least one** value when provided;
             pass ``None`` (or omit) to inherit the current buckets.
 
@@ -952,6 +954,8 @@ def autotune(
             for throughput-oriented serving, cover the larger range.
 
         round_up: Controls how runtime sizes map to profiled buckets.
+            Ignored when ``tuning_buckets`` is given (each op's own mapper
+            is used then).
 
             * ``None`` (default) -- inherit from enclosing ``autotune()``
               context, or ``False`` if there is none.
@@ -1015,19 +1019,19 @@ def autotune(
     ``map_to_tuning_buckets`` maps the runtime size to the nearest profiled
     bucket, so an unsupported raw size never reaches the kernel directly.
 
-    **Round-up beyond the largest bucket** -- When ``round_up=True`` and the
-    runtime size exceeds every bucket, the value is clamped to the largest
-    bucket (see :func:`~flashinfer.fused_moe.utils.round_to_nearest_bucket`).
+    **Round-up beyond the largest bucket** -- When ``round_up=True`` is used
+    without ``tuning_buckets`` and the runtime size exceeds every bucket, the
+    value is clamped to the largest bucket (see
+    :func:`~flashinfer.fused_moe.utils.round_to_nearest_bucket`).
 
     **Nested / sequential contexts** -- Overrides are managed on a per-thread
     stack.  A nested ``autotune()`` pushes its overrides; on exit the outer
     context's values are restored.  Sequential contexts are fully independent.
-    Different buckets produce different cache keys, so entries never collide.
 
-    **Using both parameters together** is fully supported:
-    ``autotune(tuning_buckets=(100, 300, 600), round_up=True)`` profiles
-    at 100, 300, and 600 and rounds runtime sizes *up* to the nearest of
-    those buckets at inference time.
+    **Using both parameters together** -- ``round_up`` has no effect.  Each
+    op's own mapper decides which bucket a runtime size uses, and a size whose
+    op bucket no listed size maps to finds no tuned entry inside the context
+    and uses the default tactic.
 
     Examples::
 
@@ -1043,7 +1047,7 @@ def autotune(
         with autotune(False, cache="my_configs.json", round_up=True):
             model(inputs)
 
-        # Combine custom buckets with round-up
+        # round_up has no effect together with tuning_buckets
         with autotune(True, tuning_buckets=(100, 300, 600), round_up=True):
             model(inputs)  # profiles at 100, 300, 600
 
@@ -2668,12 +2672,9 @@ class AutoTuner:
     ) -> tuple[tuple[int, ...], ...] | None:
         """Return the largest tuned profile for a lookup above the tuned range.
 
-        A lookup's bucket can lie above every bucket tuned for the op: the
-        runtime size exceeds the tuned sizes, or tuning ran under
-        ``autotune(tuning_buckets=...)`` and stored its top bucket under a
-        value the op's own ``map_to_tuning_buckets`` never produces (e.g.
-        21504 stored as 21504 but looked up as its next power of two, 32768).
-        Either way the lookup would silently use the untuned fallback.
+        A lookup's bucket can lie above every bucket tuned for the op when the
+        runtime size exceeds the tuned sizes; the lookup would then silently
+        use the untuned fallback.
 
         Candidates are the tuned profiles in the active in-memory partition,
         the user-loaded configs and the hydrated entries of the active
@@ -2804,8 +2805,22 @@ class AutoTuner:
             new_gen: tuple[int, ...] | Callable[[int], Iterable[int]]
             new_map: Callable[[int], int]
             if buckets is not None:
-                new_gen = tuple(sorted(set(buckets)))
-                new_map = make_bucket_mapper(new_gen, round_map=round_up_flag)
+                # Keep the op's own mapper so tuning and inference build the
+                # same cache key even if the largest bucket is off the op's grid
+                # (e.g. 21504 vs. 32768).
+                new_map = spec.map_to_tuning_buckets
+                # Profile one listed size per key: the size equal to the key,
+                # else the largest.  The smallest would store e.g. the tactic
+                # measured at M=1 under key 1024.
+                sizes_by_key: dict[int, list[int]] = {}
+                for size in sorted(set(buckets)):
+                    sizes_by_key.setdefault(new_map(size), []).append(size)
+                new_gen = tuple(
+                    sorted(
+                        key if key in sizes else sizes[-1]
+                        for key, sizes in sizes_by_key.items()
+                    )
+                )
             elif round_up_flag:
                 if isinstance(spec.gen_tuning_buckets, (list, tuple)):
                     sorted_gen = tuple(sorted(set(spec.gen_tuning_buckets)))
