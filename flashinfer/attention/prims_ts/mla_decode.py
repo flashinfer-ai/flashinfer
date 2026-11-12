@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -2887,8 +2888,13 @@ class BatchSparseMLADecodePagedTSWrapper:
         softmax_scale: GlobalScale | None = None,
         output_scale: GlobalScale = 1.0,
         kv_cache_scale: GlobalScale = 1.0,
+        compile: bool = True,
     ):
         """Plan D512/D576 attention over one primary and an optional extra pool.
+
+        With ``compile=False``, resolve the plan without compiling or loading a
+        kernel. ``_state["compile_spec"]`` identifies the finalized specialization;
+        call ``plan()`` with compilation enabled before ``run()``.
 
         ``kv_cache_format="nvfp4"`` uses the DS v4.1 D512 format: 256 packed
         E2M1 bytes followed by 32 E4M3 scales in linear block16 order. Every
@@ -3040,7 +3046,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                 kernel=kernel,
                 kernel_signature=_mla_kernel_compile_signature(kernel),
             )
-        compiled = _get_compiled_mla_decode(spec)
+        compiled = _get_compiled_mla_decode(spec) if compile else None
         self._state = dict(
             reload_d576=reload_d576,
             device=device,
@@ -3066,6 +3072,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             output_quant=output_quant,
             buffers=buffers,
             workspace=workspace,
+            compile_spec=spec,
             compiled=compiled,
             softmax_scale=softmax_scale,
             output_scale=output_scale,
@@ -3276,6 +3283,8 @@ class BatchSparseMLADecodePagedTSWrapper:
         state = self._state
         if state is None:
             raise RuntimeError("plan() must be called before run()")
+        if state["compiled"] is None:
+            raise RuntimeError("plan(compile=True) must be called before run()")
         _validate_query(
             query,
             packed_query=state["packed_query"],

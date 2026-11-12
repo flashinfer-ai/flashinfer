@@ -1,4 +1,5 @@
 """
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 Copyright (c) 2026 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,7 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 from . import env as jit_env
-from .core import JitSpec, _record_jit_build, get_tmpdir, logger
+from .core import JitSpec, MissingJITCacheError, _record_jit_build, get_tmpdir, logger
 from ._cute_dsl_source import (
     _hash_source_files,
     cute_dsl_strict_cache_key as cute_dsl_strict_cache_key,
@@ -153,9 +154,14 @@ class JitSpecCuteDsl(JitSpec):
 
     @property
     def lock_path(self) -> Path:
-        # Module-level lock: kernels of one op family serialize their builds
-        # (meta.json wipes/writes must not race sibling kernel exports).
+        # Module metadata and exports are shared by kernels of one op family.
         return get_tmpdir() / f"{self.module_dir_name}.lock"
+
+    @property
+    def kernel_lock_path(self) -> Path:
+        # Keep locks outside module_dir: it can be replaced on invalidation,
+        # and creating it before meta.json would make it appear stale.
+        return get_tmpdir() / f"{self.module_dir_name}.{self.kernel_name}.lock"
 
     @property
     def meta_path(self) -> Path:
@@ -191,7 +197,7 @@ class JitSpecCuteDsl(JitSpec):
     def build(self) -> None:
         """Compile via ``cute.compile`` and export the ``.o`` artifact.
 
-        Runs under ``lock_path`` when invoked via ``build_and_load()``.
+        The caller must hold ``lock_path`` for this low-level operation.
         Persistence failures degrade gracefully: the in-process kernel is
         kept for load(); only the disk write is lost.
         Stale modules (dsl version / source change) are wiped like a ninja rebuild.
@@ -213,14 +219,36 @@ class JitSpecCuteDsl(JitSpec):
                 f"{self.object_path}: {e}. The kernel will be recompiled next run."
             )
 
+    def build_and_load(self) -> Any:
+        """Compile distinct kernels concurrently and publish under the module lock."""
+        from filelock import FileLock
+
+        cached = self.try_load()
+        if cached is not None:
+            return cached
+        with FileLock(self.kernel_lock_path, thread_local=False):
+            with FileLock(self.lock_path, thread_local=False):
+                cached = self.try_load()
+                if cached is not None:
+                    return cached
+                if os.environ.get("FLASHINFER_DISABLE_JIT"):
+                    raise MissingJITCacheError(
+                        "JIT compilation is disabled via FLASHINFER_DISABLE_JIT, "
+                        "but the required CuTe-DSL kernel is not in the disk cache.",
+                        spec=self,
+                    )
+            started = time.perf_counter()
+            self._compiled_kernel = self.compile_fn()
+            _record_jit_build(self.toolchain, self.name, time.perf_counter() - started)
+            with FileLock(self.lock_path, thread_local=False):
+                self._persist()
+                return self.load()
+
     def compile_and_persist(self) -> None:
-        """Compile outside the module lock; commit the artifact under it.
+        """Compile unconditionally, then commit under the module lock.
 
-        ``build_and_load()`` holds the module lock for the whole build.
-        This variant runs ``compile_fn`` unlocked and takes the lock only
-        for the stale-module wipe and the artifact export (~ms).
-
-        Meant for parallel precompilation workers.
+        Persistence is best-effort; on-demand callers can retain the compiled
+        kernel in memory when exporting fails.
         """
         from filelock import FileLock
 
@@ -228,22 +256,23 @@ class JitSpecCuteDsl(JitSpec):
         self._compiled_kernel = self.compile_fn()
         _record_jit_build(self.toolchain, self.name, time.perf_counter() - started)
         with FileLock(self.lock_path, thread_local=False):
-            if (
-                self.module_dir.exists()
-                and _read_meta(self.meta_path) != self.expected_meta
-            ):
-                logger.info(
-                    f"Invalidating stale CuTe-DSL module {self.module_dir_name}"
-                )
-                shutil.rmtree(self.module_dir, ignore_errors=True)
-            try:
-                self._export()
-            except Exception as e:  # noqa: BLE001 -- persistence is best-effort
-                logger.warning(
-                    f"Failed to persist CuTe-DSL kernel {self.name} to "
-                    f"{self.object_path}: {e}. The kernel will be recompiled "
-                    f"next run."
-                )
+            self._persist()
+
+    def _persist(self) -> None:
+        """Invalidate and export with the caller holding the module lock."""
+        if (
+            self.module_dir.exists()
+            and _read_meta(self.meta_path) != self.expected_meta
+        ):
+            logger.info(f"Invalidating stale CuTe-DSL module {self.module_dir_name}")
+            shutil.rmtree(self.module_dir, ignore_errors=True)
+        try:
+            self._export()
+        except Exception as e:  # noqa: BLE001 -- persistence is best-effort
+            logger.warning(
+                f"Failed to persist CuTe-DSL kernel {self.name} to "
+                f"{self.object_path}: {e}. The kernel will be recompiled next run."
+            )
 
     def load(self) -> Any:
         """The kernel to hand back: the exported artifact whenever one exists.
