@@ -175,11 +175,10 @@ def unpack_trtllm_moe_output(
     gemm1_lora_delta: Optional[torch.Tensor],
     expert_weights: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
-    """Translate the ``Array<Tensor>`` returned by ``FusedMoeLauncher::run``.
+    """Translate the ``Array<Optional<Tensor>>`` returned by ``FusedMoeLauncher::run``.
 
     A slot the launcher borrowed from the caller rather than allocated comes back
-    empty, and calling ``from_dlpack`` on it raises "invalid capsule". That is the
-    case for ``output``, which the caller always provides, and for
+    as ``None``. That is the case for ``output``, which the caller always provides, and for
     ``expert_weights`` whenever the caller passed a buffer down. For those two we
     return the caller's own tensor instead of unpacking the slot.
     """
@@ -194,7 +193,7 @@ def unpack_trtllm_moe_output(
 
     # do_finalize=False: index 1 is expert_weights. Only convert it when the
     # launcher owned (allocated) the buffer -- converting a borrowed slot would
-    # dlpack an empty Tensor and raise "invalid capsule".
+    # pass None to from_dlpack.
     weights = (
         expert_weights
         if expert_weights is not None and expert_weights.numel() > 0

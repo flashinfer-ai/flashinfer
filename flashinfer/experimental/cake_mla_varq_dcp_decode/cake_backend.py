@@ -44,6 +44,7 @@ limitations under the License.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -51,12 +52,13 @@ import torch
 import tvm_ffi
 
 from .cake_jit import (
-    MODULES,
-    load_cake_mla_varq_dcp_decode_module,
+    ARG_PLANS,
+    FFI_ENTRY,
+    load_program,
     main_route_available,
     route_name,
-    select_main_module,
-    select_merge_module,
+    select_main_program,
+    select_merge_program,
 )
 
 # DeepSeek MLA geometry served by the generated program.
@@ -416,10 +418,19 @@ def max_cake_mla_varq_dcp_decode_workspace_size(
     return total
 
 
-def _carve(flat: torch.Tensor, layout: dict[str, Any], name: str, dtype, shape):
+def _carve(
+    flat: torch.Tensor,
+    layout: dict[str, Any],
+    name: str,
+    dtype,
+    shape,
+    *,
+    zero: bool = True,
+):
     offset, nbytes = layout[name]
     region = flat[offset : offset + nbytes]
-    region.zero_()
+    if zero:
+        region.zero_()
     return region.view(dtype).view(shape)
 
 
@@ -447,8 +458,8 @@ class CakeMLAVarQDcpDecodeRunner:
     page_size: int
     item_groups: int
     plan: dict[str, Any]
-    main_module: str
-    merge_module: Optional[str]
+    main_program: str
+    merge_program: Optional[str]
     main_kwargs: dict[str, Any]
     merge_kwargs: Optional[dict[str, Any]]
     workspace: dict[str, torch.Tensor]
@@ -481,11 +492,7 @@ class CakeMLAVarQDcpDecodeRunner:
     @property
     def route(self) -> str:
         return route_name(
-            self.arch,
-            self.dtype,
-            self.page_size,
-            self.item_groups,
-            self.plan["partition_mode"],
+            self.dtype, self.page_size, self.item_groups, self.plan["partition_mode"]
         )
 
     @property
@@ -497,21 +504,20 @@ class CakeMLAVarQDcpDecodeRunner:
             item_groups=self.item_groups,
             partition_mode=int(self.plan["partition_mode"]),
             launches_merge=self.launches_merge,
-            main_module=self.main_module,
-            merge_module=self.merge_module,
+            main_program=self.main_program,
+            merge_program=self.merge_program,
             grid=tuple(self.main_kwargs["grid"]),
             merge_grid=tuple(self.merge_kwargs["grid"]) if self.merge_kwargs else None,
         )
 
 
 def _bind_stage(
-    module_name: str, kwargs: dict[str, Any]
+    role: str, program: str, arch: str, kwargs: dict[str, Any]
 ) -> tuple[Callable[..., Any], tuple]:
-    """Order ``kwargs`` by the generated argument plan of ``module_name``."""
-    record = MODULES[module_name]
+    """Order ``kwargs`` by the generated argument plan of ``role`` and load ``program``."""
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
     arguments = []
-    for kind, name in record["arg_plan"]:
+    for kind, name in ARG_PLANS[role]:
         if kind == "grid":
             arguments.append(grid[name])
         elif name in kwargs:
@@ -526,15 +532,17 @@ def _bind_stage(
             arguments.append(value)
         else:
             raise KeyError(
-                f"generated module {module_name!r} expects argument {name!r} "
+                f"generated program {program!r} ({role}) expects argument {name!r} "
                 f"({kind}); host binding provides {sorted(kwargs)}"
             )
-    module = load_cake_mla_varq_dcp_decode_module(module_name)
-    return getattr(module, record["ffi_entry"]), tuple(arguments)
+    module = load_program(program, arch)
+    return getattr(module, FFI_ENTRY), tuple(arguments)
 
 
-def _arch_for(device: torch.device) -> str:
-    capability = torch.cuda.get_device_capability(device)
+@functools.cache
+def _device_arch(device_index: int) -> str:
+    """Generated-program architecture of one CUDA device (queried once per process)."""
+    capability = torch.cuda.get_device_capability(device_index)
     arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
     if arch is None:
         raise ValueError(
@@ -542,6 +550,22 @@ def _arch_for(device: torch.device) -> str:
             f"(got {capability[0]}.{capability[1]})"
         )
     return arch
+
+
+@functools.cache
+def _device_sm_count(device_index: int) -> int:
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
+def _device_index(device: torch.device) -> int:
+    return torch.cuda.current_device() if device.index is None else int(device.index)
+
+
+def _int32_dense(tensor: torch.Tensor) -> torch.Tensor:
+    """The tensor itself when it is already a dense int32 vector, else one dense int32 copy."""
+    if tensor.dtype == torch.int32 and tensor.is_contiguous():
+        return tensor
+    return tensor.contiguous().to(torch.int32)
 
 
 def generated_program_available(
@@ -552,11 +576,12 @@ def generated_program_available(
     item_groups: int = 4,
     partition_mode: int = 0,
 ) -> bool:
-    """True when this checkout registers the main variant for ``device``."""
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
-    return arch is not None and main_route_available(
-        arch, dtype, page_size, item_groups, partition_mode
-    )
+    """True when this checkout registers the main variant and supports ``device``."""
+    try:
+        _device_arch(_device_index(device))
+    except ValueError:
+        return False
+    return main_route_available(dtype, page_size, item_groups, partition_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -723,8 +748,14 @@ def prepare_cake_mla_varq_dcp_decode(
 
     Every allocation happens here (the optional ``out`` / ``lse``, int32
     copies of non-int32 index tensors); the workspace regions are carved out
-    of the caller's ``workspace_buffer`` and the scheduler state is zeroed
-    once.  The returned runner launches with no allocation.  ``unit_min``,
+    of the caller's ``workspace_buffer`` and the scheduler state (counters,
+    slot flags, split table, control words) is zeroed once; the partial
+    output / LSE regions are not touched -- the kernels write them before any
+    read, every read being ordered after an acquire of the slot flag.  The
+    KV cache may be a strided page pool (one layer of
+    ``[num_pages, L, page_size, 576]``): the descriptors carry its strides and
+    only the 576-wide row must be dense.  The returned runner launches with no
+    allocation.  ``unit_min``,
     ``unit_ratio``, ``static_tiles`` and ``partition_mode`` expose the host
     plan knobs for tests and benchmarks; ``None`` selects the production
     defaults.  Nothing reads a CUDA tensor's contents: ``max_seq_len`` is the
@@ -760,8 +791,9 @@ def prepare_cake_mla_varq_dcp_decode(
         raise ValueError("Expected all tensors on one CUDA device")
     if workspace_buffer.dtype != torch.uint8 or not workspace_buffer.is_contiguous():
         raise ValueError("workspace_buffer must be a contiguous uint8 CUDA tensor")
-    arch = _arch_for(device)
-    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    device_index = _device_index(device)
+    arch = _device_arch(device_index)
+    num_sms = _device_sm_count(device_index)
     plan = plan_varq_dcp_decode(
         batch_size=batch_size,
         max_q_len=max_q_len,
@@ -774,17 +806,17 @@ def prepare_cake_mla_varq_dcp_decode(
         partition_mode=partition_mode,
     )
     item_groups = item_groups_for(int(plan["items"]))
-    main_module = select_main_module(
-        arch, dtype, page_size, item_groups, plan["partition_mode"]
+    main_program = select_main_program(
+        dtype, page_size, item_groups, plan["partition_mode"]
     )
-    merge_module = select_merge_module(arch) if launches_merge(plan) else None
+    merge_program = select_merge_program() if launches_merge(plan) else None
 
     if kv_cache.ndim == 4:
         kv_cache = kv_cache.squeeze(1)
+    if kv_cache.stride(-1) != 1:
+        raise ValueError("kv_cache rows (the 576-wide last axis) must be dense")
+    # A view when the query is dense, otherwise one compact copy (reshape copies).
     q_flat = query.reshape(-1, HEAD_DIM_QK)
-    if not q_flat.is_contiguous():
-        q_flat = q_flat.contiguous()
-    kv_cache = kv_cache.contiguous()
     if dtype == "fp8":
         # The FP8 descriptors are byte-typed (u8 carrier over the e4m3 payload).
         q_flat = q_flat.view(torch.uint8)
@@ -799,13 +831,13 @@ def prepare_cake_mla_varq_dcp_decode(
     lse_flat = lse.reshape(-1)
     if not o_flat.is_contiguous() or not lse_flat.is_contiguous():
         raise ValueError("out / lse must be contiguous compact tensors")
-    page_table_i32 = page_table.to(torch.int32).contiguous()
-    seq_lens_i32 = seq_lens.to(torch.int32).contiguous()
-    cum_i32 = cum_seq_lens_q.to(torch.int32).contiguous()
+    page_table_i32 = _int32_dense(page_table)
+    seq_lens_i32 = _int32_dense(seq_lens)
+    cum_i32 = _int32_dense(cum_seq_lens_q)
     causal_source = (
         seq_lens if causal_seqlens_kv_global is None else causal_seqlens_kv_global
     )
-    causal_i32 = causal_source.to(torch.int32).contiguous()
+    causal_i32 = _int32_dense(causal_source)
 
     layout = workspace_layout(plan)
     flat = workspace_buffer.view(-1)
@@ -818,11 +850,18 @@ def prepare_cake_mla_varq_dcp_decode(
     partial_slots = partial_rows // TILE_Q
     items = int(plan["items"])
     if plan["can_split"]:
+        # Written by the unit that owns a slot before it release-stores the
+        # slot flag; read only after an acquire of that flag.  No memset.
         partial_o = _carve(
-            flat, layout, "partial_o", torch.bfloat16, (partial_rows * HEAD_DIM_V,)
+            flat,
+            layout,
+            "partial_o",
+            torch.bfloat16,
+            (partial_rows * HEAD_DIM_V,),
+            zero=False,
         )
         partial_lse = _carve(
-            flat, layout, "partial_lse", torch.float32, (partial_rows,)
+            flat, layout, "partial_lse", torch.float32, (partial_rows,), zero=False
         )
     else:
         # No item can split: the kernel never stores a partial; bind the
@@ -897,7 +936,7 @@ def prepare_cake_mla_varq_dcp_decode(
     )
     assert tuple(main_kwargs) == MAIN_KWARGS
     merge_kwargs: Optional[dict[str, Any]] = None
-    if merge_module is not None:
+    if merge_program is not None:
         if plan["static_only"]:
             raise AssertionError("a static-only plan cannot split")
         merge_kwargs = dict(
@@ -915,19 +954,21 @@ def prepare_cake_mla_varq_dcp_decode(
             grid=(int(plan["merge_grid"]), 1, 1),
         )
         assert tuple(merge_kwargs) == MERGE_KWARGS
-    main_entry, main_arguments = _bind_stage(main_module, main_kwargs)
+    main_entry, main_arguments = _bind_stage("main", main_program, arch, main_kwargs)
     merge_entry: Optional[Callable[..., Any]] = None
     merge_arguments: tuple = ()
-    if merge_module is not None and merge_kwargs is not None:
-        merge_entry, merge_arguments = _bind_stage(merge_module, merge_kwargs)
+    if merge_program is not None and merge_kwargs is not None:
+        merge_entry, merge_arguments = _bind_stage(
+            "merge", merge_program, arch, merge_kwargs
+        )
     return CakeMLAVarQDcpDecodeRunner(
         arch,
         dtype,
         page_size,
         item_groups,
         plan,
-        main_module,
-        merge_module,
+        main_program,
+        merge_program,
         main_kwargs,
         merge_kwargs,
         workspace,

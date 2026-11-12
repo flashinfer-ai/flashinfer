@@ -24,6 +24,11 @@ Thank you for contributing to FlashInfer! Before we review your pull request, pl
 
 - [ ] Tests have been added or updated as needed.
 - [ ] All tests are passing (`unittest`, etc.).
+- [ ] This PR requires **full-scope** CI, not targeted tests (expensive; justify below).
+      Reason: <!-- e.g. cross-cutting change to shared infrastructure -->
+
+  Suggested CI test targets (optional; paths under `tests/`, whitespace-separated — a starting
+  point for `@flashinfer-bot run <targets>` / `/bot run <targets>`, reviewers may adjust): `tests/...`
 
 ## 🔬 Experimental Track
 

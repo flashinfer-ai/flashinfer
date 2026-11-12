@@ -220,7 +220,7 @@ _FLASH_KDA_PERSISTENT_TASK_REFILL_CHUNKS = 2
 _flash_kda_tensor_cache: dict[tuple, torch.Tensor] = {}
 _flash_kda_tensor_cache_lock = threading.Lock()
 
-_PackedMetadataSignature = tuple[int, int, int, int, bool]
+_PackedMetadataSignature = tuple[Optional[int], int, int, int, bool]
 _PersistentTaskPlan = tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
 _PackedTaskMetadata = tuple[
     tuple[int, ...],
@@ -539,25 +539,29 @@ class _RecurrentKDAPrefillWorkspaceBase:
 
 
 class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
-    """Caller-owned storage required for recurrent-KDA CUDA graph capture.
+    """Caller-owned storage for native recurrent-KDA CUDA graph capture.
+
+    Auto-selected cuDNN leaves this workspace unused and manages its own scratch.
 
     Construct one workspace per captured
     :func:`flashinfer.kda.recurrent_kda` invocation on the graph's CUDA
     device. Warm it by invoking that function eagerly with the exact tensors
-    and capture stream, then synchronize that stream before capture. The
-    workspace owns optional final-state scratch, backend metadata, TMA
+    and capture stream, then synchronize that stream before capture. Packed
+    offsets must retain their warmed values through capture and replay.
+    Inference tensors have no version counter, so their offsets are reread on
+    every eager call.
+
+    The workspace owns optional final-state scratch, backend metadata, TMA
     descriptors, and schedule-specific scratch for the lifetime of the graph.
     On SM100-family devices this includes beta padding, M64/M128-N32/M128-N16
     and BT64 descriptor storage, small-BH packet-ring storage, and BT16
     prepare/chain metadata, factors, and independent descriptor storage.
-    Persistent M128 is an eager-only B200/GB200 route; explicit workspaces use
-    non-persistent direct, M64, small-BH, or eligible BT16 schedules so graph
-    capture never synchronizes sequence lengths to construct host task bins.
+    Cake's persistent M128 route is eager-only; its explicit workspaces use
+    non-persistent schedules to avoid reading sequence lengths on the host.
 
-    A workspace binds to its first stream. Once it participates in capture it
-    cannot be passed to Python again, either eagerly or in another capture.
-    Graph replay does not invoke Python and remains valid for the lifetime of
-    the workspace.
+    Native use binds the workspace to its first stream. After native capture,
+    another native Python call cannot reuse it. Graph replay remains valid
+    for the lifetime of the workspace.
     """
 
 
@@ -603,6 +607,22 @@ def _is_contiguous_cuda_tensor(
         and tensor.device == device
         and tensor.dtype == dtype
         and tensor.is_contiguous()
+    )
+
+
+def _supports_strided_qkv(tensor: torch.Tensor) -> bool:
+    """Layout contract for rank-4 BF16 Q/K/V after shape validation."""
+    if tensor.is_contiguous():
+        return tensor.data_ptr() % 16 == 0
+    return (
+        tensor.stride()[-2:] == (tensor.shape[-1], 1)
+        and tensor.stride(1) >= tensor.shape[2] * tensor.shape[3]
+        and tensor.stride(1) % 8 == 0
+        and tensor.data_ptr() % 16 == 0
+        and (
+            tensor.shape[0] == 1
+            or tensor.stride(0) == tensor.shape[1] * tensor.stride(1)
+        )
     )
 
 
@@ -2648,8 +2668,10 @@ def _cached_packed_task_metadata(
 ) -> _PackedTaskMetadata:
     """Cache host-built sequence order and optional persistent task bins."""
 
+    version = None if cu_seqlens.is_inference() else int(cu_seqlens._version)
+    capturing = torch.cuda.is_current_stream_capturing()
     signature = (
-        int(cu_seqlens._version),
+        version,
         total_tokens,
         num_heads,
         sm_count,
@@ -2658,12 +2680,13 @@ def _cached_packed_task_metadata(
     with workspace._packed_metadata_lock:
         cached_metadata = workspace._packed_metadata
         if (
-            workspace._packed_metadata_tensor is cu_seqlens
+            (version is not None or capturing)
+            and workspace._packed_metadata_tensor is cu_seqlens
             and workspace._packed_metadata_signature == signature
             and cached_metadata is not None
         ):
             return cached_metadata
-        if torch.cuda.is_current_stream_capturing():
+        if capturing:
             raise RuntimeError(
                 "packed recurrent_kda prefill metadata is not warmed for "
                 "CUDA graph capture; eagerly invoke the same offsets once "
@@ -3138,6 +3161,23 @@ def _bind_workspace(
         )
 
 
+def _tensor_byte_range(tensor: torch.Tensor) -> tuple[int, int]:
+    start = tensor.data_ptr()
+    if tensor.is_contiguous():
+        return start, start + tensor.nbytes
+    span = 1 + sum(
+        (size - 1) * stride
+        for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+        if size > 0
+    )
+    return start, start + span * tensor.element_size()
+
+
+def _overlaps_range(start: int, end: int, tensor: torch.Tensor) -> bool:
+    other_start, other_end = _tensor_byte_range(tensor)
+    return start < other_end and other_start < end
+
+
 def _storage_ranges_overlap(
     left: torch.Tensor,
     right: torch.Tensor,
@@ -3145,23 +3185,11 @@ def _storage_ranges_overlap(
     if left.device != right.device or left.numel() == 0 or right.numel() == 0:
         return False
 
-    def storage_end(tensor: torch.Tensor) -> int:
-        max_element_offset = sum(
-            (size - 1) * stride
-            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
-            if size > 0
-        )
-        return tensor.data_ptr() + (max_element_offset + 1) * tensor.element_size()
-
-    left_start = left.data_ptr()
-    right_start = right.data_ptr()
-    left_end = storage_end(left)
-    right_end = storage_end(right)
-    return left_start < right_end and right_start < left_end
+    return _overlaps_range(*_tensor_byte_range(left), right)
 
 
 def _check_output_does_not_overlap_inputs(
-    output: torch.Tensor,
+    output: Optional[torch.Tensor],
     *,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3170,6 +3198,10 @@ def _check_output_does_not_overlap_inputs(
     beta: torch.Tensor,
     initial_state: Optional[torch.Tensor],
 ) -> None:
+    if output is None or output.numel() == 0:
+        return
+    output_device = output.device
+    output_start, output_end = _tensor_byte_range(output)
     for name, tensor in (
         ("q", q),
         ("k", k),
@@ -3178,7 +3210,9 @@ def _check_output_does_not_overlap_inputs(
         ("beta", beta),
         ("initial_state", initial_state),
     ):
-        if tensor is not None and _storage_ranges_overlap(output, tensor):
+        if tensor is None or tensor.device != output_device or tensor.numel() == 0:
+            continue
+        if _overlaps_range(output_start, output_end, tensor):
             raise ValueError(
                 f"output must not overlap {name} for frozen recurrent_kda prefill"
             )
@@ -5492,10 +5526,13 @@ def _generated_affine_state_indices_i64(
 ) -> torch.Tensor:
     """Return the warmed int64 carrier used by the affine state scatter."""
 
-    source_version = int(state_indices._version)
+    source_version = (
+        None if state_indices.is_inference() else int(state_indices._version)
+    )
     destination_ptr = plan.state_indices_i64.data_ptr()
     if not (
         not capturing
+        and source_version is not None
         and workspace._generated_affine_state_indices_tensor is state_indices
         and workspace._generated_affine_state_indices_version == source_version
         and workspace._generated_affine_state_indices_destination_ptr == destination_ptr
@@ -6179,7 +6216,7 @@ def _run_flash_kda_prefill(
     else:
         out_buf = output
     _check_output_does_not_overlap_inputs(
-        out_buf,
+        output,
         q=q,
         k=k,
         v=v,
@@ -6898,8 +6935,8 @@ def _sm120_kda_prefill_rejection_reason(
         return "device compute capability is not 12.0"
 
     device = q.device
-    if not _is_contiguous_cuda_tensor(q, dtype=torch.bfloat16, device=device):
-        return "q must be a contiguous CUDA bfloat16 tensor"
+    if q.dtype != torch.bfloat16:
+        return "q must be a CUDA bfloat16 tensor"
     if q.ndim != 4:
         return "q must be rank 4"
     batch_size, tokens, num_heads, head_dim = q.shape
@@ -6907,11 +6944,21 @@ def _sm120_kda_prefill_rejection_reason(
         return f"the head dimension is fixed at {_FLASH_KDA_HEAD_DIM}"
     if num_heads <= 0 or batch_size <= 0:
         return "B and H must be positive"
-    for name, tensor in (("k", k), ("v", v), ("g", g)):
-        if not _is_contiguous_cuda_tensor(tensor, dtype=torch.bfloat16, device=device):
-            return f"{name} must be a contiguous CUDA bfloat16 tensor"
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.device != device
+            or tensor.dtype != torch.bfloat16
+        ):
+            return f"{name} must be a CUDA bfloat16 tensor on q's device"
         if tensor.shape != q.shape:
             return f"{name} must have q's shape; GQA and V != K are unsupported"
+        if not _supports_strided_qkv(tensor):
+            return f"{name} must have dense head/features and aligned token rows with a flattenable batch"
+    if not _is_contiguous_cuda_tensor(g, dtype=torch.bfloat16, device=device):
+        return "g must be a contiguous CUDA bfloat16 tensor"
+    if g.shape != q.shape:
+        return "g must have q's shape"
     if not _is_contiguous_cuda_tensor(
         beta, dtype=torch.bfloat16, device=device
     ) or beta.shape != (batch_size, tokens, num_heads):

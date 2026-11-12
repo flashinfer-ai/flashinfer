@@ -8,7 +8,7 @@ Welcome to FlashInfer's documentation!
 
 `Blog <https://flashinfer.ai/>`_ | `Discussion Forum <https://github.com/orgs/flashinfer-ai/discussions>`_ | `GitHub <https://github.com/flashinfer-ai/flashinfer/>`_
 
-FlashInfer is a library and kernel generator for Large Language Models that provides high-performance implementation of LLM GPU kernels such as FlashAttention, PageAttention and LoRA. FlashInfer focus on LLM serving and inference, and delivers state-of-the-art performance across diverse scenarios.
+FlashInfer is a library and kernel generator for Large Language Models that provides high-performance implementation of LLM GPU kernels such as FlashAttention, PageAttention and LoRA. FlashInfer focuses on LLM serving and inference, and delivers state-of-the-art performance across diverse scenarios.
 
 .. toctree::
    :maxdepth: 2
@@ -28,8 +28,8 @@ FlashInfer is a library and kernel generator for Large Language Models that prov
 
    tutorials/recursive_attention
    tutorials/kv_layout
-   mxfp4_situ_moe
    tutorials/generated/jax_tvm_ffi/index
+   tutorials/cake_kimi_k3_situ
 
 .. toctree::
    :maxdepth: 2
@@ -37,14 +37,41 @@ FlashInfer is a library and kernel generator for Large Language Models that prov
 
    api/attention
    api/attn_scores
+   api/cake_causal_conv1d_nondet_train
+   api/cake_dsa_indexer_det_train
+   api/cake_dsa_indexer_nondet_train
+   api/cake_dsa_sparse_attention_det_train
+   api/cake_dsa_sparse_attention_nondet_train
    api/cake_fmha
+   api/cake_fused_qk_rope_append
+   api/cake_fused_qk_rope_fp8_append
+   api/cake_gdn_det_train
+   api/cake_gdn_det_train_kcp
+   api/cake_gdn_nondet_train
+   api/cake_gdn_nondet_train_kcp
+   api/cake_gqa_nondet_train
+   api/cake_gqa_det_train
+   api/cake_kda_det_train
+   api/cake_kda_det_train_kcp
+   api/cake_kda_nondet_train
+   api/cake_kda_nondet_train_kcp
+   api/cake_lm_head_det_train
+   api/cake_lm_head_nondet_train
+   api/cake_moe_grouped_gemm_det_train
+   api/cake_moe_grouped_gemm_nondet_train
+   api/cake_mxfp4_situ_moe
    api/cake_sampling
+   api/cake_stepfun_moe
    api/gemm
    api/grouped_mm
    api/fused_moe
+   api/megamoe
+   api/moe_ep_kimi_k3
+   api/moe_ep_communication
    api/cascade
    api/comm
    api/sparse
+   api/qsa
    api/pod
    api/cudnn
    api/cute_dsl
@@ -60,6 +87,7 @@ FlashInfer is a library and kernel generator for Large Language Models that prov
    api/gdn_decode
    api/gdn_fused_decode
    api/gdn_prefill
+   api/gdn_paged
    api/gdn2_prefill
    api/gdp_prefill
    api/kda

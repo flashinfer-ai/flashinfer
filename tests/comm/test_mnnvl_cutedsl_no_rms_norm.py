@@ -36,7 +36,18 @@ from flashinfer.comm.mnnvl_cutedsl import (
     HT_ONLY_CONFIG,
     LL_ONLY_CONFIG,
     NO_NORM_CONFIG,
+    KernelTarget,
+    MNNVLCuteDSLConfig,
+    MRangeDispatch,
+    ProtocolKind,
+    StaticProfile,
 )
+from flashinfer.comm.mnnvl_cutedsl.kernel_bt import (
+    BTAllReduceTuning,
+    BTCollectiveTuning,
+    BTFinalizeTuning,
+)
+from flashinfer.comm.mnnvl_cutedsl.kernel_bt import protocol as bt_protocol
 from flashinfer.comm.mnnvl_cutedsl_ar import MNNVLCuteDSLAllReduceFusionWorkspace
 from flashinfer.utils import is_sm100a_supported
 
@@ -268,6 +279,44 @@ def test_disabled_norm_requires_a_residual_output(distributed_group):
         )
 
 
+@pytest.mark.parametrize("protocol", ("ll", "bt"))
+@torch.inference_mode()
+def test_disabled_norm_plain_all_reduce(distributed_group, protocol):
+    """Without the norm and the residual, the all-reduce path is a plain all-reduce.
+
+    The token count is not a multiple of the TP size.
+    """
+    group = distributed_group
+    rank = dist.get_rank(group)
+    m = 1025
+    workspace = _workspace(protocol, m, group, add_residual=False, apply_rms_norm=False)
+    try:
+        generator = torch.Generator(device="cuda").manual_seed(5300 + rank)
+        local = _sanitize_negative_zero(
+            torch.randn(
+                m, HIDDEN_SIZE, generator=generator, dtype=torch.bfloat16, device="cuda"
+            )
+        )
+        expected = _sanitize_negative_zero(
+            _ordered_reduce(local, group).to(torch.bfloat16)
+        )
+        for _ in range(3):
+            residual_out = torch.empty_like(local)
+            returned = allreduce_fusion(
+                input=local,
+                workspace=workspace,
+                pattern=AllReduceFusionPattern.kARResidualRMSNorm,
+                launch_with_pdl=True,
+                residual_out=residual_out,
+            )
+            assert returned.data_ptr() == residual_out.data_ptr()
+            assert torch.equal(
+                residual_out.view(torch.int16), expected.view(torch.int16)
+            )
+    finally:
+        workspace.destroy()
+
+
 @torch.inference_mode()
 def test_high_throughput_rejects_disabled_norm(distributed_group):
     """HT fuses the norm into a warp group, so it cannot be compiled out."""
@@ -404,5 +453,387 @@ def test_no_norm_config_materializes_all_reduced_finalize(distributed_group):
             ).to(torch.bfloat16)
         )
         assert torch.equal(returned.view(torch.int16), expected.view(torch.int16))
+    finally:
+        workspace.destroy()
+
+
+def _fused_bt_config(
+    tp_size: int, apply_rms_norm: bool, lag: int, enable_pdl: bool = True
+) -> MNNVLCuteDSLConfig:
+    def route(preset):
+        return MRangeDispatch(
+            upper_bounds=(None,), targets=(KernelTarget(ProtocolKind.BT, preset),)
+        )
+
+    return MNNVLCuteDSLConfig(
+        profiles=(
+            StaticProfile(
+                tp_size=tp_size,
+                hidden_size=HIDDEN_SIZE,
+                top_k=TOP_K,
+                dtype=torch.bfloat16,
+                finalize_routes=route(BTFinalizeTuning()),
+                all_reduce_routes=route(
+                    BTAllReduceTuning(
+                        collective=BTCollectiveTuning(
+                            rms_threads=512, enable_pdl=enable_pdl
+                        ),
+                        fused=True,
+                        fused_lag=lag,
+                    )
+                ),
+            ),
+        ),
+        applies_rms_norm=apply_rms_norm,
+    )
+
+
+@pytest.mark.parametrize("lag", (1, 3))
+@pytest.mark.parametrize("m", (3, 1025))
+@torch.inference_mode()
+def test_fused_bt_plain_all_reduce(distributed_group, lag, m):
+    """The one-launch BT all-reduce matches the rank-ordered FP32 sum bitwise.
+
+    It shares its stage counter and mailboxes with the three-launch finalize
+    path, so the calls are interleaved on one workspace.
+    """
+    group = distributed_group
+    rank = dist.get_rank(group)
+    tp_size = dist.get_world_size(group)
+    workspace = _workspace(
+        "bt",
+        m,
+        group,
+        add_residual=False,
+        apply_rms_norm=False,
+        config=_fused_bt_config(tp_size, False, lag),
+    )
+    try:
+        generator = torch.Generator(device="cuda").manual_seed(6100 + rank)
+        local = _sanitize_negative_zero(
+            torch.randn(
+                m, HIDDEN_SIZE, generator=generator, dtype=torch.bfloat16, device="cuda"
+            )
+        )
+        expected = _sanitize_negative_zero(
+            _ordered_reduce(local, group).to(torch.bfloat16)
+        )
+        routed = torch.randn(
+            m * TOP_K,
+            HIDDEN_SIZE,
+            generator=generator,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        weights = torch.randn(
+            m, TOP_K, generator=generator, dtype=torch.bfloat16, device="cuda"
+        )
+        shared = torch.randn(
+            m, HIDDEN_SIZE, generator=generator, dtype=torch.bfloat16, device="cuda"
+        )
+        indices = torch.arange(m * TOP_K, dtype=torch.int32, device="cuda").reshape(
+            m, TOP_K
+        )
+        expected_finalize = _sanitize_negative_zero(
+            _ordered_reduce(
+                _local_finalize(routed, weights, indices, shared), group
+            ).to(torch.bfloat16)
+        )
+        for _ in range(4):
+            residual_out = torch.empty_like(local)
+            allreduce_fusion(
+                input=local,
+                workspace=workspace,
+                pattern=AllReduceFusionPattern.kARResidualRMSNorm,
+                launch_with_pdl=True,
+                residual_out=residual_out,
+            )
+            assert torch.equal(
+                residual_out.view(torch.int16), expected.view(torch.int16)
+            )
+            finalize_out = torch.empty_like(local)
+            allreduce_fusion(
+                input=routed,
+                workspace=workspace,
+                pattern=AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm,
+                launch_with_pdl=True,
+                residual_out=finalize_out,
+                expanded_idx_to_permuted_idx=indices,
+                expert_scale_factor=weights,
+                shared_expert_output=shared,
+            )
+            assert torch.equal(
+                finalize_out.view(torch.int16), expected_finalize.view(torch.int16)
+            )
+    finally:
+        workspace.destroy()
+
+
+@pytest.mark.parametrize("lag", (1, 3))
+@pytest.mark.parametrize("m", (3, 1025))
+@torch.inference_mode()
+def test_fused_bt_residual_rms_norm(distributed_group, lag, m):
+    """With the norm on, the one-launch BT path matches an FP32 reference."""
+    group = distributed_group
+    rank = dist.get_rank(group)
+    tp_size = dist.get_world_size(group)
+    workspace = _workspace("bt", m, group, config=_fused_bt_config(tp_size, True, lag))
+    try:
+        generator = torch.Generator(device="cuda").manual_seed(6300 + rank)
+        local = _sanitize_negative_zero(
+            torch.randn(
+                m, HIDDEN_SIZE, generator=generator, dtype=torch.bfloat16, device="cuda"
+            )
+        )
+        residual = torch.randn(
+            m,
+            HIDDEN_SIZE,
+            generator=torch.Generator(device="cuda").manual_seed(6400),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        gamma = torch.randn(
+            HIDDEN_SIZE,
+            generator=torch.Generator(device="cuda").manual_seed(6500),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        prenorm = (_ordered_reduce(local, group) + residual.float()).to(torch.bfloat16)
+        values = prenorm.float()
+        expected_norm = (
+            values * torch.rsqrt(values.pow(2).mean(-1, keepdim=True) + RMS_EPS)
+        ) * gamma.float()
+        for _ in range(3):
+            residual_out = torch.empty_like(local)
+            norm_out = torch.empty_like(local)
+            allreduce_fusion(
+                input=local,
+                workspace=workspace,
+                pattern=AllReduceFusionPattern.kARResidualRMSNorm,
+                launch_with_pdl=True,
+                residual_in=residual,
+                rms_gamma=gamma,
+                rms_eps=RMS_EPS,
+                residual_out=residual_out,
+                norm_out=norm_out,
+            )
+            assert torch.equal(
+                residual_out.view(torch.int16),
+                _sanitize_negative_zero(prenorm).view(torch.int16),
+            )
+            torch.testing.assert_close(
+                norm_out.float(), expected_norm, rtol=2**-7, atol=2**-6
+            )
+    finally:
+        workspace.destroy()
+
+
+@torch.inference_mode()
+def test_fused_bt_dynamic_schedule_across_token_counts(distributed_group):
+    """The per-stage work-ticket counters stay consistent when consecutive
+    calls use different token counts."""
+    group = distributed_group
+    rank = dist.get_rank(group)
+    tp_size = dist.get_world_size(group)
+    capacity = 1025
+    workspace = _workspace(
+        "bt",
+        capacity,
+        group,
+        add_residual=False,
+        apply_rms_norm=False,
+        config=_fused_bt_config(tp_size, False, 3),
+    )
+    try:
+        generator = torch.Generator(device="cuda").manual_seed(6700 + rank)
+        local = _sanitize_negative_zero(
+            torch.randn(
+                capacity,
+                HIDDEN_SIZE,
+                generator=generator,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+        )
+        expected = _sanitize_negative_zero(
+            _ordered_reduce(local, group).to(torch.bfloat16)
+        )
+        for m in (1025, 3, 700, 1, 1025, 512, 2, 1025):
+            residual_out = torch.empty_like(local[:m])
+            allreduce_fusion(
+                input=local[:m],
+                workspace=workspace,
+                pattern=AllReduceFusionPattern.kARResidualRMSNorm,
+                launch_with_pdl=True,
+                residual_out=residual_out,
+            )
+            assert torch.equal(
+                residual_out.view(torch.int16), expected[:m].view(torch.int16)
+            )
+    finally:
+        workspace.destroy()
+
+
+def _fused_bt_inputs(m: int, seed: int, group):
+    rank = dist.get_rank(group)
+    local = _sanitize_negative_zero(
+        torch.randn(
+            m,
+            HIDDEN_SIZE,
+            generator=torch.Generator(device="cuda").manual_seed(seed + rank),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+    )
+    residual = torch.randn(
+        m,
+        HIDDEN_SIZE,
+        generator=torch.Generator(device="cuda").manual_seed(seed + 100),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    gamma = torch.randn(
+        HIDDEN_SIZE,
+        generator=torch.Generator(device="cuda").manual_seed(seed + 200),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    prenorm = (_ordered_reduce(local, group) + residual.float()).to(torch.bfloat16)
+    values = prenorm.float()
+    expected_norm = (
+        values * torch.rsqrt(values.pow(2).mean(-1, keepdim=True) + RMS_EPS)
+    ) * gamma.float()
+    return local, residual, gamma, _sanitize_negative_zero(prenorm), expected_norm
+
+
+def _check_fused_bt_calls(
+    workspace,
+    group,
+    token_counts,
+    *,
+    apply_rms_norm: bool,
+    write_residual_output: bool = True,
+    launch_with_pdl: bool = True,
+    seed: int = 6800,
+) -> None:
+    capacity = max(token_counts)
+    local, residual, gamma, prenorm, expected_norm = _fused_bt_inputs(
+        capacity, seed, group
+    )
+    plain = _sanitize_negative_zero(_ordered_reduce(local, group).to(torch.bfloat16))
+    for m in token_counts:
+        residual_out = torch.empty_like(local[:m]) if write_residual_output else None
+        if apply_rms_norm:
+            norm_out = torch.empty_like(local[:m])
+            allreduce_fusion(
+                input=local[:m],
+                workspace=workspace,
+                pattern=AllReduceFusionPattern.kARResidualRMSNorm,
+                launch_with_pdl=launch_with_pdl,
+                residual_in=residual[:m],
+                rms_gamma=gamma,
+                rms_eps=RMS_EPS,
+                residual_out=residual_out,
+                norm_out=norm_out,
+            )
+            torch.testing.assert_close(
+                norm_out.float(), expected_norm[:m], rtol=2**-7, atol=2**-6
+            )
+            if residual_out is not None:
+                assert torch.equal(
+                    residual_out.view(torch.int16), prenorm[:m].view(torch.int16)
+                )
+        else:
+            allreduce_fusion(
+                input=local[:m],
+                workspace=workspace,
+                pattern=AllReduceFusionPattern.kARResidualRMSNorm,
+                launch_with_pdl=launch_with_pdl,
+                residual_out=residual_out,
+            )
+            assert torch.equal(
+                residual_out.view(torch.int16), plain[:m].view(torch.int16)
+            )
+
+
+def _fused_bt_workspace(group, capacity, apply_rms_norm, **overrides):
+    tp_size = dist.get_world_size(group)
+    kwargs = dict(
+        config=_fused_bt_config(
+            tp_size, apply_rms_norm, 3, overrides.pop("enable_pdl", True)
+        )
+    )
+    if not apply_rms_norm:
+        kwargs.update(add_residual=False, apply_rms_norm=False)
+    kwargs.update(overrides)
+    return _workspace("bt", capacity, group, **kwargs)
+
+
+@pytest.mark.parametrize("apply_rms_norm", (False, True), ids=("plain", "norm"))
+@torch.inference_mode()
+def test_fused_bt_without_pdl(distributed_group, apply_rms_norm):
+    """The one-launch BT path compiled without programmatic dependent launch."""
+    workspace = _fused_bt_workspace(
+        distributed_group, 1025, apply_rms_norm, enable_pdl=False
+    )
+    try:
+        _check_fused_bt_calls(
+            workspace,
+            distributed_group,
+            (1025, 3, 700, 1025),
+            apply_rms_norm=apply_rms_norm,
+            launch_with_pdl=False,
+        )
+    finally:
+        workspace.destroy()
+
+
+@torch.inference_mode()
+def test_fused_bt_norm_without_residual_output(distributed_group):
+    """With the norm on and write_residual_output=False only norm_out is
+    written."""
+    workspace = _fused_bt_workspace(
+        distributed_group, 1025, True, write_residual_output=False
+    )
+    try:
+        _check_fused_bt_calls(
+            workspace,
+            distributed_group,
+            (1025, 3, 700, 1025),
+            apply_rms_norm=True,
+            write_residual_output=False,
+        )
+    finally:
+        workspace.destroy()
+
+
+@pytest.mark.parametrize("apply_rms_norm", (False, True), ids=("plain", "norm"))
+@torch.inference_mode()
+def test_fused_bt_progresses_with_partial_residency(
+    distributed_group, monkeypatch, apply_rms_norm
+):
+    """The one-launch BT path completes when most of its grid is not resident.
+
+    The grid is four CTAs per SM. A 1024-thread CTA leaves room for at most
+    one more on an SM (2048 threads), so at least half of the grid can only
+    start after resident CTAs exit, as when MPS, an SM partition or another
+    kernel leaves the collective fewer SMs. A schedule in which a CTA that has
+    not started owns work that resident CTAs wait on hangs here; claiming
+    every ticket from the counter keeps all claimed work on running CTAs.
+    """
+    sm_count = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    monkeypatch.setattr(bt_protocol, "_fused_grid_ctas", lambda device: 4 * sm_count)
+    # More tokens than SMs, so tokens of non-resident CTAs exist.
+    capacity = 4 * sm_count + 5
+    workspace = _fused_bt_workspace(distributed_group, capacity, apply_rms_norm)
+    try:
+        _check_fused_bt_calls(
+            workspace,
+            distributed_group,
+            (capacity, 3, sm_count + 1, capacity),
+            apply_rms_norm=apply_rms_norm,
+        )
     finally:
         workspace.destroy()

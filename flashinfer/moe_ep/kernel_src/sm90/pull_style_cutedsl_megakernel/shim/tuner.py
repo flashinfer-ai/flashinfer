@@ -18,7 +18,9 @@ Two knob classes (same taxonomy as the SM100 tree):
     ``swap_ab`` / ``pingpong`` / ``mma_tiler_mnk`` / ``cluster_shape_mnk`` /
     ``fp8_accum_mode`` select numerically equivalent execution geometries,
     so they live in the perf class together with ``group_hint`` /
-    ``tail_split_pairs`` / ``flag_batch`` / ``epi_flag_batch``.
+    ``tail_split_pairs`` / ``flag_batch`` / ``epi_flag_batch`` and the
+    dispatch-pull fields (``compact_pull_buffer`` / ``dispatch_pull_batch`` /
+    ``dispatch_pull_rotate``).
 
 The built-in heuristic (:func:`default_knobs`) wraps the kernel drop's
 token-bucket table (``moe_hopper_fp8/heuristic_config.py``), so
@@ -31,6 +33,8 @@ from __future__ import annotations
 import dataclasses
 import itertools
 from typing import Any, Dict, Iterator, Optional, Tuple
+
+from flashinfer.moe_ep._compat import deprecated_aliases
 
 # --- knob value-sets (geometry domains mirror the kernel ctor validation;
 # see kernel_fp8_glu_fc12{,_swapab}.py _validate_mma_tiler_and_cluster_shape).
@@ -79,6 +83,13 @@ PERF_KNOBS: Dict[str, Tuple[Any, ...]] = {
     "tail_split_pairs": (False, True),
     "flag_batch": (1, 2, 4, 8),
     "epi_flag_batch": ((1, 1), (2, 2), (2, 4), (4, 4), (4, 8)),
+    # Dispatch pull (output-invariant): the compact buffer (one slot per
+    # active dispatch warp), rows in flight per active dispatch warp, and the
+    # per-pass rotation of the warp -> row assignment.  See
+    # :func:`validate_dispatch_pull` for the legal combinations.
+    "compact_pull_buffer": (True, False),
+    "dispatch_pull_batch": (1, 2, 3, 4),
+    "dispatch_pull_rotate": (False, True),
 }
 
 # Geometry knob names resolved as one unit by the heuristic table / cache.
@@ -89,6 +100,55 @@ GEOMETRY_KNOBS = (
     "cluster_shape_mnk",
     "fp8_accum_mode",
 )
+
+# Dispatch-pull tactic fields and the values a tactic that omits them gets:
+# the compact buffer and the serial, unrotated pull.
+PULL_KNOB_DEFAULTS: Dict[str, Any] = {
+    "compact_pull_buffer": True,
+    "dispatch_pull_batch": 1,
+    "dispatch_pull_rotate": False,
+}
+
+
+def validate_dispatch_pull(
+    *,
+    compact_pull_buffer: bool,
+    dispatch_pull_batch: int,
+    dispatch_pull_rotate: bool,
+    token_back_mode: str,
+    dedup_dispatch: bool,
+    grouped_token_back: bool,
+    active_dispatch_warps: int,
+) -> None:
+    """Raise ``ValueError`` unless the dispatch-pull fields fit the layout.
+
+    A batch > 1 keeps its extra rows in the idle slots of the 4-slot pull
+    buffer of the serial ``epi_warps`` dispatch path; dispatch-side
+    token-back keeps the serial, unrotated pull loop.  Mirrors the kernel's
+    ``TokenInPullTokenBackPush`` checks; shared by the FP8 and packed-FP4
+    configs.
+    """
+    if type(dispatch_pull_batch) is not int or not 1 <= dispatch_pull_batch <= 4:
+        raise ValueError("dispatch_pull_batch must be an int in 1..4")
+    if type(dispatch_pull_rotate) is not bool:
+        raise ValueError("dispatch_pull_rotate must be a bool")
+    if dispatch_pull_rotate and token_back_mode != "epi_warps":
+        # Dispatch-side token-back keeps the unrotated serial pull loop.
+        raise ValueError("dispatch_pull_rotate requires token_back_mode='epi_warps'")
+    if dispatch_pull_batch > 1:
+        if compact_pull_buffer:
+            raise ValueError(
+                "dispatch_pull_batch > 1 requires compact_pull_buffer=False"
+            )
+        if token_back_mode != "epi_warps" or dedup_dispatch or grouped_token_back:
+            raise ValueError(
+                "dispatch_pull_batch > 1 requires token_back_mode='epi_warps' "
+                "without dedup_dispatch / grouped_token_back"
+            )
+        if dispatch_pull_batch * active_dispatch_warps > 4:
+            raise ValueError(
+                "dispatch_pull_batch * active_dispatch_warps must not exceed the 4 pull slots"
+            )
 
 
 def default_knobs(
@@ -122,11 +182,19 @@ def default_knobs(
     }
 
 
-def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
+def is_valid(
+    knobs: Dict[str, Any],
+    *,
+    apply_routing_weights_before_fc2: bool = True,
+    fp8_scale_mode: Optional[str] = None,
+) -> bool:
     """``True`` if ``knobs`` is a compilable SM90 FP8 MegaMoE combo.
 
     Mirrors the kernel ctor / config ``__post_init__`` rules; unspecified
-    knobs fall back to the kernel defaults, so a partial dict is fine.
+    knobs fall back to the kernel defaults, so a partial dict is fine.  The
+    swap-AB N72/N80 token tiles are blockwise-only: they are rejected when
+    ``fp8_scale_mode`` is given and is not ``"blockwise"``.
     """
     swap_ab = bool(knobs.get("swap_ab", False))
     pingpong = bool(knobs.get("pingpong", False))
@@ -136,7 +204,9 @@ def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
     in_kernel = knobs.get("in_kernel_fc2_reduce", False)
 
     if swap_ab:
-        if m not in (128, 256) or n not in (8, 16, 32, 64, 128):
+        if m not in (128, 256) or n not in (8, 16, 32, 64, 72, 80, 128):
+            return False
+        if n in (72, 80) and (m != 256 or fp8_scale_mode not in (None, "blockwise")):
             return False
         if pingpong and m != 128:
             return False
@@ -165,7 +235,7 @@ def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
         return False
     # Kernel invariant: the in-kernel reduce collapses topk before a separate
     # reducer could apply routing weights.
-    if in_kernel and not apply_topk_in_fc1:
+    if in_kernel and not apply_routing_weights_before_fc2:
         return False
     if knobs.get("active_dispatch_warps", 1) not in (1, 2, 4):
         return False
@@ -180,8 +250,27 @@ def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
             "reuse_dispatch_warps"
         ):
             return False
-        if in_kernel or not apply_topk_in_fc1:
+        if in_kernel or not apply_routing_weights_before_fc2:
             return False
+    pull = dict(PULL_KNOB_DEFAULTS)
+    pull.update((k, knobs[k]) for k in PULL_KNOB_DEFAULTS if k in knobs)
+    token_back_mode = knobs.get("token_back_mode")
+    if token_back_mode is None:
+        token_back_mode = (
+            "reuse_dispatch_warps"
+            if knobs.get("token_back_by_dispatch", False)
+            else "epi_warps"
+        )
+    try:
+        validate_dispatch_pull(
+            **pull,
+            token_back_mode=token_back_mode,
+            dedup_dispatch=bool(knobs.get("dedup_dispatch", False)),
+            grouped_token_back=grouped,
+            active_dispatch_warps=knobs.get("active_dispatch_warps", 1),
+        )
+    except ValueError:
+        return False
     return True
 
 
@@ -228,8 +317,10 @@ __all__ = [
     "CORRECTNESS_KNOBS",
     "GEOMETRY_KNOBS",
     "PERF_KNOBS",
+    "PULL_KNOB_DEFAULTS",
     "default_knobs",
     "is_valid",
     "iter_candidates",
+    "validate_dispatch_pull",
     "with_knobs",
 ]

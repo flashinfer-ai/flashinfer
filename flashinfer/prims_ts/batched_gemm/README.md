@@ -60,20 +60,22 @@ batched_gemm/
 | Scheduling         | Static HW grid; dynamic persistent CLC scheduling                         |
 | Clustering         | `cluster_m` = 1 or 2 (multi-CTA barrier routing)                          |
 | Scale-factor paths | TMA route, LDGSTS gather, TMA.GATHER4, compact STTM, fused UTCCP          |
-| Activation         | fused gated activation (SwiGLU, GeGLU, SILU, ReLU²) or none               |
+| Activation         | fused gated (SwiGLU, GeGLU, SiTU), elementwise (SiLU, ReLU²), or none      |
 | Epilogue           | per-channel bias, clamp, fused quantization                               |
 | Partial tiles      | TMA-OOB optimization with `mn_limit` predication                          |
 | Perf features      | programmatic dependent launch (PDL)                                       |
 
 The table above describes the standalone batched GEMM kernel. The Python MoE
 backend in `flashinfer/fused_moe/backends/prims_ts` maps a smaller curated set of
-FC1/FC2 configurations from `flashinfer/prims_ts/moe/prims_ts_moe_configs.json`
-and reuses the TRT-LLM routing/finalize code.
+FC1/FC2 configurations from architecture-specific package resources:
+`flashinfer/prims_ts/moe/prims_ts_moe_configs.json` for SM100/SM103 and
+`prims_ts_moe_configs_sm107.json` for SM107. It reuses the TRT-LLM
+routing/finalize code.
 
 ## MoE Integration Parity Gaps
 
 PrimsTS MoE is intended to track the TRT-LLM Gen MoE backend, but it is not at
-feature parity yet. The current integration is limited to SM100/SM103, shuffled
+feature parity yet. The current integration is limited to SM100/SM103/SM107, shuffled
 `WeightLayout.MajorK` or `WeightLayout.BlockMajorK` weights, and the following
 dtype families:
 
@@ -106,6 +108,10 @@ Kernel-level performance/configuration gaps inherited by the MoE backend:
   one epilogue subtile, and no max-TMEM-overlap path. Treat this as a PrimsTS
   kernel/config limitation; the current TRT-LLM Gen tests do not establish
   DeepSeek FP8 `ClusterDimX=2` or tile-N 256 support.
+- DeepSeek FP8 scale blocks are 128x128 by default; `deepseek_fp8_block_size=32`
+  selects 32x32 blocks (vLLM's re-blocked TP shards) on the swap-AB split-M
+  epilogue (`mma_m=64`) only. The K tile stays 128 wide and is drained once per
+  32-wide sub-block, so expect roughly 4x the DeepSeek epilogue work per tile.
 - Output block scaling and sub-byte output formats are only available in the
   supported swap-AB/gated epilogue forms. The MXFP4 x BF16 cast-A path currently
   stores plain BF16/FP16 output.

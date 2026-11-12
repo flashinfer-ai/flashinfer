@@ -509,7 +509,13 @@ __device__ __forceinline__ void replay_state_mma_8bit_chain(
 #pragma unroll
   for (int i = 0; i < D_ROWS_PER_THREAD; ++i) {
     float const a = per_thread_amax[i];
-    encode_scale_per_row[i] = (a == 0.f) ? 1.f : (QUANT_MAX / a);
+    float denominator = a;
+    if constexpr (std::is_same_v<state_t, __nv_fp8_e4m3>) {
+      // Keep nonzero FP8 values normal after decoding into FP32.
+      constexpr float MINIMUM_AMAX = QUANT_MAX * 0x1p-117f;
+      denominator = (a < MINIMUM_AMAX) ? MINIMUM_AMAX : a;
+    }
+    encode_scale_per_row[i] = (a == 0.f) ? 1.f : (QUANT_MAX / denominator);
   }
 
   // ── STG decode_scale (one writer per (cache, head, d_row)).
@@ -1371,10 +1377,11 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
   if (cache_slot == params.pad_slot_id) return;
 
   auto const* __restrict__ ring_start_ptr = reinterpret_cast<int32_t const*>(params.ring_start);
-  int const ring_start = __ldg(&ring_start_ptr[cache_slot]);
+  int const ring_start =
+      __ldg(&ring_start_ptr[tracker_offset(cache_slot, params.ring_start_stride)]);
 
   auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
-  int const prev_k = prev_ptr[cache_slot];
+  int const prev_k = prev_ptr[tracker_offset(cache_slot, params.prev_num_accepted_stride)];
 
   // ── Varlen vs non-varlen prologue.  The kernel branches once on the
   // VARLEN template; downstream helpers receive `seq_len` (constexpr-foldable

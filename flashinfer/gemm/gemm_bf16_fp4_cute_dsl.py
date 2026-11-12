@@ -19,9 +19,9 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from ..utils import _get_cache_buf, get_compute_capability, get_device_sm_count
+from ..utils import _get_stream_cache_buf, get_compute_capability, get_device_sm_count
 from .gemm_base import _check_cute_dsl_availability
-from .gemm_bf16_fp4 import _unswizzle_sf_128x4
+from .gemm_bf16_fp4 import _cute_dsl_uses_sm100_layout, _unswizzle_sf_128x4
 
 _BF16_FP4_ALPHA_ONE_CACHE: dict = {}
 
@@ -453,13 +453,14 @@ def _prepare_cute_dsl(
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Dispatch weight preparation to the architecture-specific DSL kernel."""
     major, minor = get_compute_capability(b.device)
-    if (major, minor) in ((10, 0), (10, 3)):
+    if _cute_dsl_uses_sm100_layout(major, minor):
         return _prepare_cute_dsl_sm100(b, b_descale, alpha, block_size)
     elif major == 12:
         return _prepare_cute_dsl_sm12x(b, b_descale, alpha, block_size)
     else:
         raise NotImplementedError(
-            f"cute-dsl w4a16 GEMM only supports SM100/103 and SM12x; got {major}.{minor}"
+            "cute-dsl w4a16 GEMM only supports SM100/103/107 and SM12x; "
+            f"got {major}.{minor}"
         )
 
 
@@ -639,6 +640,47 @@ def _sm100_bf16_fp4_tactic_configs() -> List[Tuple]:
 
 _SM100_BF16_FP4_TACTICS = tuple(_sm100_bf16_fp4_tactic_configs())
 
+_SM100_BF16_FP4_TACTIC_ORDER = {t: i for i, t in enumerate(_SM100_BF16_FP4_TACTICS)}
+
+# Untuned pick, memoized on (m, n, k, sm_count) -- everything it depends on.
+_SM100_BF16_FP4_DEFAULT_TACTIC_CACHE: Dict[Tuple[int, int, int, int], Tuple] = {}
+
+
+def _sm100_bf16_fp4_tactic_ctas(tactic: Tuple, m: int, n: int) -> int:
+    """Tile count for a public ``(m, n)``, in CTAs.
+
+    The kernel's M mode carries public output channels ``n`` and its N mode
+    public rows ``m`` (see ``_sm100_bf16_fp4_tactic_configs``).  A 256-wide M
+    tile is the ``use_2cta_instrs`` tile and takes two CTAs; the rest take one.
+    """
+    (tile_n, tile_m, _), _, _ = tactic
+    ctas_per_tile = 2 if tile_n == 256 else 1
+    return -(-n // tile_n) * ctas_per_tile * -(-m // tile_m)
+
+
+def _select_sm100_bf16_fp4_default_tactic(
+    valid_tactics: List[Tuple], m: int, n: int, sm_count: int
+) -> Tuple:
+    """Pick the no-autotune fallback tactic for the SM100/103 dense W4A16 GEMM.
+
+    Ranks by ``waves x per-CTA bytes`` (``tile_n`` FP4 weights at half a byte,
+    ``tile_m`` BF16 activations at two): a wider row tile cuts waves but makes
+    each CTA dearer, so the best tile grows with ``m``.  A heuristic; callers
+    that need the last few percent should autotune.
+    """
+
+    def rank(tactic: Tuple) -> Tuple:
+        tile_n, tile_m, _ = tactic[0]
+        waves = -(-_sm100_bf16_fp4_tactic_ctas(tactic, m, n) // sm_count)
+        return (
+            waves * (tile_n + 4 * tile_m),
+            bool(tactic[2]),
+            _SM100_BF16_FP4_TACTIC_ORDER[tactic],
+        )
+
+    return min(valid_tactics, key=rank)
+
+
 _SM100_BF16_FP4_CUTE_DSL_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
@@ -717,7 +759,7 @@ def _get_sm100_bf16_fp4_kernel(
         k,
         max_active_clusters=max_active_clusters,
         stream=stream,
-        options="--opt-level 3 --enable-tvm-ffi",
+        options="--opt-level 2 --enable-tvm-ffi",
     )
     _SM100_BF16_FP4_KERNEL_CACHE[cache_key] = compiled
     return compiled
@@ -862,15 +904,22 @@ def _cute_dsl_sm100_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
         ) -> torch.Tensor:
             a, b, b_descale, alpha_for_launch, _, out, _ = inputs
             if tactic == -1:
-                valid = self.get_valid_tactics(inputs, None)
-                if valid:
-                    tactic = valid[0]
-                else:
-                    m, k = map(int, a.shape)
-                    raise ValueError(
-                        "no SM100 cute-dsl w4a16 tactic supports "
-                        f"m={m}, n={int(b.shape[0])}, k={k}"
+                m, k = map(int, a.shape)
+                n = int(b.shape[0])
+                sm_count = get_device_sm_count(a.device)
+                cache_key = (m, n, k, sm_count)
+                tactic = _SM100_BF16_FP4_DEFAULT_TACTIC_CACHE.get(cache_key)
+                if tactic is None:
+                    valid = self.get_valid_tactics(inputs, None)
+                    if not valid:
+                        raise ValueError(
+                            "no SM100 cute-dsl w4a16 tactic supports "
+                            f"m={m}, n={n}, k={k}"
+                        )
+                    tactic = _select_sm100_bf16_fp4_default_tactic(
+                        valid, m, n, sm_count
                     )
+                    _SM100_BF16_FP4_DEFAULT_TACTIC_CACHE[cache_key] = tactic
             return _launch_cute_dsl_sm100(
                 a,
                 b,
@@ -963,6 +1012,35 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             # index must not replay on a different SM count.
             return (out_dtype, n, k, get_device_sm_count(a.device))
 
+        def validate_tactic(self, inputs: List[torch.Tensor], tactic: int) -> bool:
+            """Reject a cached GEMV tactic outside its single-row domain."""
+            return self._validate_tactic_for_m(inputs, tactic, int(inputs[0].shape[0]))
+
+        def validate_tactic_for_profile(
+            self, inputs: List[torch.Tensor], tactic: int, profile: OptimizationProfile
+        ) -> bool:
+            """Validate a warm bucket against its profiled row count."""
+            return self._validate_tactic_for_m(
+                inputs, tactic, int(profile.get_opt_shapes()[0][0])
+            )
+
+        def _validate_tactic_for_m(
+            self, inputs: List[torch.Tensor], tactic: int, m: int
+        ) -> bool:
+            if tactic == -1:
+                return True
+            a, b, _, _, _, _, block_size = inputs
+            n = int(b.shape[1]) // 2
+            k = int(b.shape[0]) * int(block_size)
+            configs = _bf16_fp4_cute_dsl_tactic_configs(
+                n, k, get_device_sm_count(a.device)
+            )
+            if not 0 <= tactic < len(configs):
+                return False
+            return configs[tactic][7] != "gemv" or (
+                m == 1 and get_compute_capability(a.device)[0] == 12
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -1047,13 +1125,13 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                     splits, a.dtype, out_dtype, enable_pdl=enable_pdl
                 )
                 if splits > 1:
-                    partial = _get_cache_buf(
+                    partial = _get_stream_cache_buf(
                         "mm_bf16_fp4_split_k_partial",
                         splits * m * n * 4,
                         a.device,
                     ).view(torch.float32)
                 else:
-                    partial = _get_cache_buf(
+                    partial = _get_stream_cache_buf(
                         "mm_bf16_fp4_split_k_partial_dummy", 16, a.device
                     ).view(torch.float32)
                 compiled(a, b, b_sf_u8, out, partial, alpha_for_launch)
@@ -1095,13 +1173,13 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                     )
                 # The compiled call launches the reduce kernel as well, so
                 # ``out`` is final on return.
-                partial = _get_cache_buf(
+                partial = _get_stream_cache_buf(
                     "mm_bf16_fp4_split_k_partial",
                     k_splits * m * n * 4,
                     a.device,
                 ).view(torch.float32)
             else:
-                partial = _get_cache_buf(
+                partial = _get_stream_cache_buf(
                     "mm_bf16_fp4_split_k_partial_dummy", 16, a.device
                 ).view(torch.float32)
             compiled(a, b, b_sf_u8, out, partial, alpha_for_launch)
@@ -1128,7 +1206,7 @@ def _compute_cute_dsl(
     ``(K // block_size, N)`` uint8 SF in S0E5M3 format (reformatted from FP8-E4M3
     by :func:`_e4m3_to_s0e5m3`) returned by :func:`_prepare_cute_dsl`.
     """
-    if get_compute_capability(a.device) in ((10, 0), (10, 3)):
+    if _cute_dsl_uses_sm100_layout(*get_compute_capability(a.device)):
         return _compute_cute_dsl_sm100(
             a,
             b,

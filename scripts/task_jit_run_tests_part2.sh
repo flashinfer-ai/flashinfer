@@ -6,18 +6,16 @@ set -x
 : ${CUDA_VISIBLE_DEVICES:=0}
 : ${SKIP_INSTALL:=0}
 
-# Source test environment setup (handles package overrides like TVM-FFI)
 source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/jit_test_logging.sh"
 
 if [ "$SKIP_INSTALL" = "0" ]; then
   install_flashinfer_editable
 fi
 
-# Run each test file separately to isolate CUDA memory issues
-pytest -s tests/utils/test_jit_example.py
-pytest -s tests/utils/test_jit_warmup.py
+# Separate processes release CUDA memory between files.
+pytest -s tests/attention/test_logits_cap.py
+pytest -s tests/attention/test_sliding_window.py
+pytest -s tests/attention/test_tensor_cores_decode.py
 pytest -s tests/utils/test_norm.py
-pytest -s tests/attention/test_block_sparse.py
-pytest -s tests/attention/test_rope.py
-pytest -s tests/attention/test_mla_page.py
-pytest -s tests/utils/test_quantization.py
+pytest -s tests/utils/test_jit_warmup.py

@@ -315,8 +315,18 @@ def alphamoe_fused_router(
 ) -> AlphaMoERoutePlan:
     r"""Route FP32 logits and build an AlphaMoE aligned plan (SM100/SM103).
 
-    One cooperative generated kernel performs top-k selection, selected-logit
-    softmax, per-expert counting, block padding, and grouped route scatter.
+    Generated kernels perform top-k selection, selected-logit softmax,
+    per-expert counting, block padding, and grouped route scatter. The token
+    count selects the launch: one CTA for at most 8 tokens, one cooperative
+    grid up to 512 tokens, and a cooperative grid followed by a tail kernel
+    above that. Calls with 512 experts and ``has_shared_expert=False`` use
+    dedicated entries for most token counts and ``top_k`` values; up to 128
+    tokens these run as one thread-block cluster without a grid barrier.
+    Calls with 256, 257 or 384 experts, ``has_shared_expert=False``, 129 to
+    512 tokens and ``top_k`` from 8 to 10 use dedicated medium entries. From
+    129 to 256 tokens, calls with 256, 257, 384 or 512 experts,
+    ``has_shared_expert=False``, ``top_k`` from 8 to 10 and ``block_m`` 5, 8
+    or 16 (8 or 16 at 256 experts) run as one thread-block cluster.
     With ``has_shared_expert=True``, the last expert is forced into the final
     route slot and the remaining ``top_k - 1`` experts are selected from
     ``[0, num_experts - 1)``.
@@ -326,7 +336,8 @@ def alphamoe_fused_router(
     logits : torch.Tensor
         Contiguous FP32 CUDA tensor shaped ``(num_tokens, num_experts)``.
         ``num_tokens`` must be positive and ``num_experts`` must be in
-        ``[1, 512]``. Logits are expected to be finite.
+        ``[1, 512]``. Logits must be finite; the result for NaN or
+        infinite logits is unspecified.
     top_k : int
         Routes per token, in ``[1, min(num_experts, 16)]``.
     block_m : int
@@ -354,9 +365,11 @@ def alphamoe_fused_router(
     -----
     When routed logits are exactly equal, the selected expert set and its order
     are unspecified; no lower-expert-ID tie break is guaranteed.
-    The frozen CUDA device source is compiled with ``--use_fast_math``;
-    its SHA256 is
-    ``ec5bc689e68264a11a56a17fb10f699bc3733a521dea916b71ecda51d4227801``.
+    The frozen CUDA device source of the original entries has SHA256
+    ``ec5bc689e68264a11a56a17fb10f699bc3733a521dea916b71ecda51d4227801``;
+    the routed 512-expert entries are generated separately
+    (``csrc/alphamoe_router/cake_*.cu``). All are compiled with
+    ``--use_fast_math``.
     The operation has no dependency on an AlphaMoE compute kernel and its plan
     can feed either the W8A8 or NVFP4 fused up/down path.
     """

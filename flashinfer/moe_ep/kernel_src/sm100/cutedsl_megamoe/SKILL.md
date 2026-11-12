@@ -2,9 +2,16 @@
 
 ## Layout
 
+The explicit GenPhase prototype is independently owned by
+[`../next_cutedsl_megamoe`](../next_cutedsl_megamoe/VENDOR.md). This legacy
+package lazily re-exports its six public GenPhase names. Follow that package's
+[update workflow](../next_cutedsl_megamoe/SKILL.md) for GenPhase changes; keep
+this older snapshot separate. The default backend heuristics do not select
+GenPhase automatically.
+
 ```
 kernel_src/sm100/cutedsl_megamoe/
-├── src/                    ← VERBATIM kernel-team drop; NEVER edit or add files here
+├── src/                    ← kernel-team drop plus patches inventoried in VENDOR.md
 │   ├── common/
 │   ├── src/                ← CuTeDSL core src (bootstrap, dispatch, sym_buffer, …)
 │   ├── moe_mxfp8_glu/      ← MXFP8 kernel implementation
@@ -32,10 +39,11 @@ kernel_src/sm100/cutedsl_megamoe/
                                against deep_gemm / the kernel-repo tester)
 ```
 
-Core principle: **`src/` is a verbatim copy of the kernel-team drop — no injected
-files, no edits.** Every adaptation (path bootstrap, symbol re-exports, API
-shims) lives in `shim/`. A new drop is a pure replace of `src/`; the only work
-is updating `shim/` to whatever the new `src/` exposes.
+Core principle: **keep `src/` equal to the kernel-team drop except for the
+explicit pending-upstream patches in `VENDOR.md`.** Reapply and requalify those
+patches after a drop until upstream absorbs them. Every adaptation (path bootstrap, symbol re-exports, API
+shims) lives in `shim/`. A new drop replaces the source baseline; reapply the
+pending patches and update `shim/` to whatever the new `src/` exposes.
 
 Layering: `moe_ep` backends import from the package (`__init__.py`) only →
 `__init__.py` re-exports from `shim/` → `shim/` imports the raw kernel packages
@@ -61,8 +69,8 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
 
 ## When the kernel team drops a new version of src/
 
-1. **Replace `src/` verbatim** with the drop's five kernel packages — no injected
-   files, no edits (the drop is a full repo; copy only these four dirs):
+1. **Replace `src/`** with the drop's five kernel packages (the drop is a full
+   repo; copy only these dirs):
    ```bash
    rm -rf flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/{common,src,moe_bf16_glu,moe_mxfp8_glu,moe_nvfp4_swapab}
    cp -r <new_drop>/{common,src,moe_bf16_glu,moe_mxfp8_glu,moe_nvfp4_swapab} \
@@ -70,6 +78,9 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
    ```
    Do NOT copy the drop's repo scaffolding (`ci/`, `tester/`, `tests/`, `scripts/`,
    `.git`, `pyproject.toml`, `dispatch_test.py`, `README.md`).
+   Reapply each pending-upstream patch in `VENDOR.md` that the drop has not
+   absorbed. Requalify them with the tests under "Sparse combine and tail-reset
+   contracts" below, in addition to the tests in step 5.
 
 2. **Path bootstrap needs nothing** — it lives in `shim/_paths.py` and points at
    the sibling `src/` dir, so a verbatim drop just works. (Ignore any bootstrap
@@ -135,3 +146,43 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
   package (each tree's shim bootstraps its own `src/` paths at import; core
   must never import a specific kernel tree, or it would trip the sm90/sm100
   process-exclusivity guard for the other tree's sessions).
+
+## Sparse combine and tail-reset contracts
+
+For NVFP4/MXFP8 capacities at most 1024, CTA0 computes the last valid route
+extent and publishes it through a dedicated local counter region. All dispatch
+warps acquire that publication. Only enough CTAs to cover the extent perform
+histogram/scatter work; CTA0 contributes the skipped CTAs' high-word completion
+count for every expert, including empty experts. The full launch grid still
+participates in every grid/peer barrier. Keep physical-capacity metadata strides
+and original flat route IDs, including holes and a lone final-capacity route.
+The extent/ready region is reset only in the late local clear, after all roles
+have drained. Larger capacities and callers without that region retain the
+original dispatch. This changes no public call signature.
+
+Separate BF16 reduction in the NVFP4/MXFP8 kernels receives the original top-k
+indices and a static expert count. Invalid routes suppress both the payload
+load and the score, including NaN scores. Quantized combine, deferred reduction
+and atomic in-kernel reduction retain their existing contracts; in-kernel
+reduction still needs the per-launch output clear.
+
+For EP>1, a shared reset prefix of at most 16 KiB is cleared by CTA0's four
+dispatch warps. Preserve the all-role tail rendezvous, both peer barriers and
+the drain's grid joins. Every clearing thread executes a system fence, followed
+by a CTA rendezvous before the publication barrier's peer notification. Only
+that barrier's grid prologue is omitted; its grid epilogue remains. Local
+counters are still cleared after the publication barrier, except that the
+optimized path preserves the grid counter's phase: clearing it after an odd
+number of joins could hide the final completion bit from a slower CTA. The
+NVLink phase/signal storage stays outside both reset prefixes. EP1, larger
+shared prefixes and NCU retain distributed reset.
+
+Validate poisoned BF16 combine cells and scores through captured route changes
+in `tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py`. That file also
+checks the sparse-dispatch workspace boundary; reset admission is covered in
+`tests/moe_ep/test_mega_workspace_knobs.py`. Qualify repeated multirank launches
+independently at EP2 and EP4 through
+`tests/moe_ep/test_mega_cuda_graph_multirank.py`, including route identities,
+both words of expert counters against the original full-grid control, reset
+boundaries, and complete NVFP4/MXFP8 routing transitions. The `mega` entry point
+selects these communication and routing-transition regressions.

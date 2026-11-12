@@ -92,9 +92,7 @@ def test_mla_lse_base_public_forwarding(monkeypatch, entrypoint, return_lse, sel
         seen.append(kwargs)
         return expected_result
 
-    monkeypatch.setattr(
-        _core, "_trtllm_batch_decode_with_kv_cache_mla_impl", implementation
-    )
+    monkeypatch.setattr(_core, "_mla_with_kv_cache_impl", implementation)
     kwargs = _cpu_mla_arguments()
     if selector != "omitted":
         kwargs["return_lse_base"] = selector
@@ -106,12 +104,14 @@ def test_mla_lse_base_public_forwarding(monkeypatch, entrypoint, return_lse, sel
 
 
 def _require_trtllm_gen(device: torch.device) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("trtllm-gen requires CUDA")
     major, minor = get_compute_capability(device)
-    # SM100 (B200) and SM103 (B300) only; an SM101/SM102 part would otherwise
+    # SM100, SM103, and SM107 only; an SM101/SM102 part would otherwise
     # fall through to an unsupported launch instead of skipping.
-    if (major, minor) not in ((10, 0), (10, 3)):
+    if (major, minor) not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip(
-            "trtllm-gen requires SM100/SM103, got "
+            "trtllm-gen requires SM100/SM103/SM107, got "
             f"sm{major}{minor}; the LSE base is kernel-side and cannot be checked here"
         )
 
@@ -301,49 +301,73 @@ def _run_cute_dsl_decode(
 
 
 @pytest.mark.parametrize("with_lse", [False, True])
-def test_planned_trtllm_launch_lse_scale(with_lse):
+@pytest.mark.parametrize("base_e", [False, True])
+def test_planned_trtllm_launch_lse_scale(with_lse, base_e):
     from flashinfer.mla._batch_mla._backends.trtllm_gen_backend import (
         _BatchMLAPagedAttentionTrtllmGenBackend,
     )
 
     calls = []
-    backend = _BatchMLAPagedAttentionTrtllmGenBackend.__new__(
-        _BatchMLAPagedAttentionTrtllmGenBackend
+    backend = _BatchMLAPagedAttentionTrtllmGenBackend(
+        torch.empty(16, dtype=torch.uint8)
     )
-    backend._module = SimpleNamespace(
-        trtllm_paged_attention_decode=lambda *args: calls.append(args)
-    )
-    backend._float_workspace_buffer = torch.empty(16, dtype=torch.uint8)
+    backend._native_run = lambda *args: calls.append(args)
+    backend._sparse_mla_top_k = 0
+    backend._uses_shared_paged_kv_idx = True
+    backend._use_fp16_softmax = None
     backend._multi_ctas_kv_counter_buffer = object()
-    backend._block_tables = object()
-    backend._seq_lens = object()
-    backend._max_q_len = 1
+    backend._block_tables = torch.zeros(BATCH_SIZE, 4, dtype=torch.int32)
+    backend._seq_lens = torch.full((BATCH_SIZE,), SEQ_LEN, dtype=torch.int32)
+    backend._max_q_len = backend._q_len = 1
     backend._max_seq_len = SEQ_LEN
-    backend._batch_size = BATCH_SIZE
+    backend._batch_size = backend._total_q = BATCH_SIZE
+    backend._num_heads = NUM_HEADS
+    backend._kv_lora_rank = KV_LORA_RANK
+    backend._qk_rope_head_dim = QK_ROPE_HEAD_DIM
+    backend._page_size = PAGE_SIZE
+    backend._q_data_type = backend._kv_data_type = torch.bfloat16
+    backend._has_ragged_query = False
+    backend._bmm1_scale = BMM1_SCALE
+    backend._bmm2_scale = 1.0
     backend._sm_count = 148
     backend._enable_pdl = False
-    lse = object() if with_lse else None
+    lse = torch.empty(BATCH_SIZE, NUM_HEADS) if with_lse else None
     token_stride, head_stride = (NUM_HEADS, 1) if with_lse else (0, 0)
-    backend._launch_native(
-        out=object(),
-        query=object(),
-        kv_cache=object(),
-        bmm1_scale=BMM1_SCALE,
-        bmm2_scale=1.0,
-        sinks=None,
-        cum_seq_lens_q=None,
-        skip_softmax_threshold_scale_factor=None,
+    backend.run_from_wrapper(
+        out=torch.empty(BATCH_SIZE, NUM_HEADS, KV_LORA_RANK, dtype=torch.bfloat16),
+        query=torch.empty(BATCH_SIZE, NUM_HEADS, QK_HEAD_DIM, dtype=torch.bfloat16),
+        kv_cache=torch.empty(4, PAGE_SIZE, QK_HEAD_DIM, dtype=torch.bfloat16),
         lse=lse,
-        lse_stride_tokens=token_stride,
-        lse_stride_heads=head_stride,
+        return_lse=with_lse,
+        return_lse_base_on_e=base_e,
+        profiler_buffer=None,
+        kv_len=None,
+        page_table=None,
+        o_scale=None,
+        ckv_scale=None,
+        ckv_scale_arr=None,
+        kpe_scale=None,
+        sinks=None,
+        skip_softmax_threshold_scale_factor=None,
+        bmm1_scale=None,
+        bmm2_scale=None,
     )
     (args,) = calls
     assert len(args) == 36
     assert args[28] is lse
-    assert args[29:] == (1.0, token_stride, head_stride, False, None, 0, None)
+    assert args[29:] == (
+        math.log(2) if base_e else 1.0,
+        token_stride,
+        head_stride,
+        False,
+        None,
+        0,
+        None,
+    )
 
 
-def test_planned_monolithic_launch_lse_scale():
+@pytest.mark.parametrize("base_e", [False, True])
+def test_planned_monolithic_launch_lse_scale(base_e):
     from flashinfer.mla._batch_mla._backends.cute_dsl_monolithic_backend import (
         _BatchMLAPagedAttentionCuteDslMonolithicBackend,
     )
@@ -358,6 +382,7 @@ def test_planned_monolithic_launch_lse_scale():
         compiled_kernel=lambda *args: calls.append(args),
         cum_seq_lens_q=None,
     )
+    backend._lse_scale = math.log(2.0) if base_e else 1.0
     launch_args = tuple(object() for _ in range(13))
     backend._launch_compiled_kernel(launch_args, sinks=None)
     (args,) = calls
@@ -365,10 +390,9 @@ def test_planned_monolithic_launch_lse_scale():
     assert args[:10] == launch_args[:10]
     assert args[10:13] == (None, None, 0)
     assert args[13:16] == launch_args[10:]
-    assert args[16] == math.log(2.0)
+    assert args[16] == (math.log(2.0) if base_e else 1.0)
 
 
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("backend", ["trtllm-gen", "cute-dsl-monolithic"])
 @pytest.mark.parametrize("dtype", _MLA_DTYPES)
 @pytest.mark.parametrize("return_lse", [False, True])
@@ -377,6 +401,16 @@ def test_planned_mla_preserves_lse_base(backend, dtype, return_lse, seq_len):
     """Planned adapters retain their native LSE units after the ABI expansion."""
     device = torch.device("cuda")
     _require_trtllm_gen(device)
+    if backend.startswith("cute-dsl"):
+        from flashinfer.cute_dsl.availability import (
+            is_cute_dsl_arch_supported,
+            is_cute_dsl_available,
+        )
+
+        if not is_cute_dsl_available():
+            pytest.skip("CuTe DSL is unavailable")
+        if not is_cute_dsl_arch_supported(*get_compute_capability(device)):
+            pytest.skip("installed CuTe DSL does not support this GPU architecture")
     query, kv_cache, block_tables, seq_lens = _mla_decode_inputs(
         device, dtype, seq_len=seq_len
     )
@@ -776,3 +810,107 @@ def test_lse_base_default_still_differs_across_backends():
     torch.testing.assert_close(
         ratio, torch.full_like(ratio, LOG2E), rtol=2e-2, atol=2e-2
     )
+
+
+def _graph_scale_case(dtype):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+        (10, 7),
+    ):
+        pytest.skip("requires SM100, SM103 or SM107 validation surface")
+    torch.manual_seed(71)
+    q = torch.randn(1, 1, 16, 320, device="cuda").to(dtype)
+    kv = torch.randn(4, 32, 320, device="cuda").to(dtype)
+    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    return dict(
+        query=q,
+        kv_cache=kv,
+        workspace_buffer=workspace,
+        qk_nope_head_dim=64,
+        kv_lora_rank=256,
+        qk_rope_head_dim=64,
+        block_tables=torch.arange(4, dtype=torch.int32, device="cuda").view(1, 4),
+        seq_lens=torch.tensor([113], dtype=torch.int32, device="cuda"),
+        max_seq_len=128,
+        backend="trtllm-gen",
+        enable_pdl=False,
+    )
+
+
+def _graph_scale_reference(case, scale1, scale2):
+    q = case["query"].float().reshape(1, 16, 320)
+    pages = case["kv_cache"][case["block_tables"].flatten().long()]
+    kv = pages.float().reshape(-1, 320)[: int(case["seq_lens"][0])]
+    scores = torch.einsum("qhd,kd->qhk", q, kv) * scale1
+    out = torch.einsum("qhk,kd->qhd", scores.softmax(-1), kv[:, :256]) * scale2
+    lse = scores.logsumexp(-1) / math.log(2)
+    return out, lse
+
+
+@pytest.mark.parametrize("ragged", [False, True])
+def test_functional_tensor_scales_and_lse_survive_graph_replay(ragged):
+    case = _graph_scale_case(torch.float8_e4m3fn)
+    scale1 = torch.tensor([0.125], device="cuda")
+    scale2 = torch.tensor([0.75], device="cuda")
+    out = torch.empty(1, 1, 16, 256, dtype=torch.bfloat16, device="cuda")
+    lse = torch.empty(1, 1, 16, dtype=torch.float32, device="cuda")
+
+    if ragged:
+        case.update(
+            query=case["query"].view(1, 16, 320),
+            cum_seq_lens_q=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+            max_q_len=1,
+        )
+        out = out.view(1, 16, 256)
+        lse = None
+
+    def call():
+        return flashinfer.mla.trtllm_prefill_with_kv_cache_mla(
+            **case,
+            out=out,
+            lse=lse,
+            return_lse=not ragged,
+            bmm1_scale=scale1,
+            bmm2_scale=scale2,
+        )
+
+    result = call()
+    if ragged:
+        assert result is out
+    else:
+        assert result[0] is out and result[1] is lse
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        call()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        call()
+    previous = None
+    for first, second in [(0.125, 0.75), (0.25, 1.25)]:
+        scale1.fill_(first)
+        scale2.fill_(second)
+        graph.replay()
+        expected, expected_lse = _graph_scale_reference(case, first, second)
+        # Keep existing FP8 tolerances, but prove these inputs can reject broken
+        # outputs and scales instead of allowing a near-zero result to pass.
+        assert not torch.allclose(
+            torch.zeros_like(expected), expected, rtol=1e-1, atol=1e-1
+        )
+        ignored_first, _ = _graph_scale_reference(case, 1.0, second)
+        assert not torch.allclose(ignored_first, expected, rtol=1e-1, atol=1e-1)
+        ignored_second, _ = _graph_scale_reference(case, first, 1.0)
+        assert not torch.allclose(ignored_second, expected, rtol=1e-1, atol=1e-1)
+        if previous is not None:
+            assert not torch.allclose(previous, expected, rtol=1e-1, atol=1e-1)
+        previous = expected.clone()
+        torch.testing.assert_close(
+            out.reshape_as(expected).float(), expected, rtol=1e-1, atol=1e-1
+        )
+        if not ragged:
+            torch.testing.assert_close(
+                lse.reshape_as(expected_lse), expected_lse, rtol=1e-2, atol=1e-2
+            )

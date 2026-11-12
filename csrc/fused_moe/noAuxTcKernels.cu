@@ -11,6 +11,8 @@
 
 #ifdef FLASHINFER_CAKE_BACKEND
 #include "cake_deepseek_fused_routing/cake_deepseek_fused_routing_kernels.cu"
+#include "cake_deepseek_fused_routing/cake_deepseek_fused_routing_kernels_sm107a_mt.cu"
+#include "cake_deepseek_fused_routing/cake_deepseek_fused_routing_kernels_sm107a_single.cu"
 #include "cake_deepseek_fused_routing_launch.cuh"
 #endif
 
@@ -40,7 +42,9 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
                                         double const routedScalingFactor,
                                         int16_t* routingReplayOut) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  // cudaGridDependencySynchronize() is griddepcontrol.wait plus a compiler memory barrier. Without
+  // the barrier the scores / bias loads could be hoisted above the wait.
+  cudaGridDependencySynchronize();
 #endif
 
   // declare shared memory structure
@@ -173,11 +177,16 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
       if (laneIdx < topk) {
         smemInterTopScores[warpIdx * MaxNumTopExperts + laneIdx] = topScores[laneIdx];
         smemInterTopExperts[warpIdx * MaxNumTopExperts + laneIdx] = topExperts[laneIdx];
+      } else if (laneIdx < MaxNumTopExperts) {
+        // warp 0 reduces all MaxNumTopExperts slots of every warp: the slots past topk must not
+        // be whatever the previous kernel left in shared memory
+        smemInterTopScores[warpIdx * MaxNumTopExperts + laneIdx] = invalidScoreFloat;
+        smemInterTopExperts[warpIdx * MaxNumTopExperts + laneIdx] = MaxNumExperts - 1;
       }
     }
     __syncthreads();
     if (warpIdx == 0) {
-      int constexpr NumInterTopKPerThread = (NumInterTopK * NumExpertWarps - 1) / WARP_SIZE + 1;
+      int constexpr NumInterTopKPerThread = (NumInterTopK - 1) / WARP_SIZE + 1;
       float intermidiateScore[NumInterTopKPerThread];
       int32_t intermidiateExpert[NumInterTopKPerThread];
       for (int i = laneIdx; i < NumInterTopKPerThread * WARP_SIZE; i += WARP_SIZE) {
@@ -228,7 +237,7 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -260,9 +269,7 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
   TLLM_CHECK_WITH_INFO(status == cudaSuccess, "Cake fused routing launch failed: %s",
                        cudaGetErrorString(status));
   sync_check_cuda_error(stream);
-  return;
-#endif
-
+#else
   // Check if we can use the optimized deepseek_v3_topk_kernel
   bool const is_single_group = (n_group == 1) && (num_experts <= NumKimiK2Experts);
 
@@ -272,6 +279,9 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
                               (experts_per_group * topk_group <= MaxNumExpertsUnit);
 
   if (is_single_group || is_multi_group) {
+    if (num_tokens == 0) {
+      return;  // a zero-sized grid is a launch error, not an empty launch
+    }
     cudaLaunchConfig_t config;
     auto* kernel_instance =
         &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, NumDeepseekExperts, true>;
@@ -298,9 +308,10 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
     config.numAttrs = 1;
     config.attrs = attrs;
 
-    cudaLaunchKernelEx(&config, kernel_instance, scores, topk_values, topk_indices, bias,
-                       num_tokens, n_group, topk_group, topk, num_experts, num_experts / n_group,
-                       routed_scaling_factor, routing_replay_out);
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel_instance, scores, topk_values, topk_indices,
+                                       bias, num_tokens, n_group, topk_group, topk, num_experts,
+                                       num_experts / n_group, routed_scaling_factor,
+                                       routing_replay_out));
     sync_check_cuda_error(stream);
   } else {
     // TODO: call the generic path (previous implementation) or signal unsupported config.
@@ -310,6 +321,7 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
                          "original pytorch implementation.",
                          n_group, num_experts, topk_group);
   }
+#endif
 }
 
 #define INSTANTIATE_NOAUX_TC(InputT, BiasT, OutputT, IdxT)                              \
@@ -356,6 +368,12 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
       << "scores and bias must be CUDA tensors";
   TVM_FFI_ICHECK(scores.device().device_id == bias.device().device_id)
       << "scores and bias must be on the same device";
+  // Both kernels address scores as a dense [num_tokens, num_experts] row-major matrix and write
+  // dense [num_tokens, topk] outputs; strided views are rejected instead of silently misread.
+  CHECK_CONTIGUOUS(scores);
+  CHECK_CONTIGUOUS(bias);
+  CHECK_CONTIGUOUS(topk_values);
+  CHECK_CONTIGUOUS(topk_indices);
   TVM_FFI_ICHECK(bias.dim() == 1 && bias.numel() == num_experts)
       << "bias must be 1D with length == number of experts (%ld)";
   TVM_FFI_ICHECK(num_experts % n_group == 0) << "num_experts should be divisible by n_group";
@@ -397,6 +415,7 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
     TVM_FFI_ICHECK(replay.sizes()[1] == topk) << "routing_replay_out dim1 must equal topk";
     TVM_FFI_ICHECK(encode_dlpack_dtype(replay.dtype()) == int16_code_val)
         << "routing_replay_out must be int16 dtype";
+    CHECK_CONTIGUOUS(replay);
     replay_ptr = reinterpret_cast<int16_t*>(replay.data_ptr());
   }
 

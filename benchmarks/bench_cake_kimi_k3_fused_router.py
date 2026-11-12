@@ -14,13 +14,15 @@
 
 """Benchmark the experimental Kimi-K3 fused MoE router on SM100/SM103.
 
-The 28 routed shapes (``num_tokens in {1, 2, ..., 8192}`` x ``block_m in
-{8, 16}``) are timed with CUPTI (``--cupti``, cupti-python >= 13) or CUDA
-events and a cold L2 between iterations.  When ``sglang`` is importable the
-same tensors are also routed by SGLang's ``moe_route_radix.route_radix`` plus
-``moe_align.moe_align_block_size`` (the two-launch equivalent of this one
-launch); the two arms are measured in interleaved rounds and the per-row and
-geometric-mean speedups are printed.
+The 28 measured cells (``num_tokens in {1, 2, ..., 8192}`` x ``block_m in
+{8, 16}``) and a set of token counts between them (served by the
+neighbouring cell's arm) are the default rows; ``--rows`` also takes any
+``m<num_tokens>_bm<block_m>`` row.  Rows are timed with CUPTI (``--cupti``,
+cupti-python >= 13) or CUDA events and a cold L2 between iterations.  When
+``sglang`` is importable the same tensors are also routed by SGLang's
+``moe_route_radix.route_radix`` plus ``moe_align.moe_align_block_size``
+(the two-launch equivalent of this one launch); the two arms are measured in
+interleaved rounds and the per-row and geometric-mean speedups are printed.
 
 Usage::
 
@@ -30,13 +32,14 @@ Usage::
 import argparse
 import json
 import math
+import re
 
 import torch
 
 from flashinfer.experimental.kimi_k3_fused_router.cake_backend import (
     BLOCK_M_VALUES,
+    MEASURED_NUM_TOKENS,
     NUM_EXPERTS,
-    SUPPORTED_NUM_TOKENS,
     TOP_K,
     allocate_kimi_k3_route_plan,
     max_route_blocks,
@@ -44,11 +47,21 @@ from flashinfer.experimental.kimi_k3_fused_router.cake_backend import (
 from flashinfer.fused_moe import prepare_kimi_k3_fused_router
 from flashinfer.testing import bench_gpu_time
 
+# Token counts between the measured cells, one per arm range.
+ARBITRARY_NUM_TOKENS = (3, 28, 29, 100, 300, 700, 1000, 1100, 3000, 8000)
 ROWS = {
     f"m{rows}_bm{bm}": (rows, bm)
     for bm in BLOCK_M_VALUES
-    for rows in SUPPORTED_NUM_TOKENS
+    for rows in (*MEASURED_NUM_TOKENS, *ARBITRARY_NUM_TOKENS)
 }
+
+
+def parse_row(name):
+    """``(num_tokens, block_m)`` of a row named ``m<num_tokens>_bm<block_m>``."""
+    match = re.fullmatch(r"m([1-9][0-9]*)_bm([0-9]+)", name)
+    if match is None or int(match.group(2)) not in BLOCK_M_VALUES:
+        raise SystemExit(f"row {name!r}: not m<num_tokens>_bm<block_m>")
+    return int(match.group(1)), int(match.group(2))
 
 
 def make_inputs(num_tokens, device, seed=0):
@@ -159,10 +172,10 @@ def main():
     device = torch.device("cuda", 0)
     results = []
     print(f"{torch.cuda.get_device_name(device)}, {len(args.rows)} rows")
-    header = f"{'row':<14}{'arm':>5}{'grid':>6}{'fused us':>10}"
+    header = f"{'row':<14}{'arm':>9}{'grid':>6}{'fused us':>10}"
     have_sglang = None
     for name in args.rows:
-        num_tokens, block_m = ROWS[name]
+        num_tokens, block_m = parse_row(name)
         logits, bias = make_inputs(
             num_tokens, device, seed=4568000 + num_tokens + block_m
         )
@@ -188,7 +201,7 @@ def main():
         if baseline is None:
             fused_us = _median_us(runner, cupti=args.cupti)
             row["fused_us"] = fused_us
-            print(f"{name:<14}{runner.arm:>5}{runner.grid_x:>6}{fused_us:>10.2f}")
+            print(f"{name:<14}{runner.arm:>9}{runner.grid_x:>6}{fused_us:>10.2f}")
         else:
             fused_us, baseline_us = _paired_us(
                 runner, baseline, cupti=args.cupti, rounds=args.rounds
@@ -197,7 +210,7 @@ def main():
                 fused_us=fused_us, sglang_us=baseline_us, speedup=baseline_us / fused_us
             )
             print(
-                f"{name:<14}{runner.arm:>5}{runner.grid_x:>6}{fused_us:>10.2f}"
+                f"{name:<14}{runner.arm:>9}{runner.grid_x:>6}{fused_us:>10.2f}"
                 f"{baseline_us:>11.2f}{baseline_us / fused_us:>9.3f}"
             )
         results.append(row)

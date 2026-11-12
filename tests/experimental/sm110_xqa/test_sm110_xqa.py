@@ -7,7 +7,7 @@ import math
 import pytest
 import torch
 
-from flashinfer.experimental.sm110_xqa.jit import get_manifest
+from flashinfer.experimental.sm110_xqa import cake_jit
 from flashinfer.sm110_xqa import attention, prepare
 
 
@@ -140,18 +140,14 @@ def test_decode_runtime_partitions_and_counter_replay(partition_tokens, capacity
     lengths = [0, 65, capacity]
     seq = torch.tensor(lengths, device="cuda", dtype=torch.int32)
     plan = prepare(q, kv, seq, partition_tokens=partition_tokens)
-    manifest = get_manifest()
-    producer = manifest["routes"]["decode_fp16_contiguous"]
     partitions = (capacity + partition_tokens - 1) // partition_tokens
-    expected_route = (
-        producer["single_partition_route"]
-        if partitions == 1 and producer["merge_stats_cache"]
-        else "decode_fp16_contiguous"
-    )
-    assert plan.route == expected_route
-    assert manifest["routes"][plan.route]["merge_stats_cache"] == (
-        producer["merge_stats_cache"] and partitions > 1
-    )
+    # The record follows the partition count (a cluster program when the
+    # registry ships one for the count, else the workspace merge); the grid
+    # carries the count.
+    assert plan.route == cake_jit.select_decode_record(ratio=8, partitions=partitions)
+    assert cake_jit.MODULES[plan.route]["stage"] == "decode"
+    assert plan.program == cake_jit.MODULES[plan.route]["library"]
+    assert plan.grid == (partitions, 4, 3)
     expected = _oracle(q[:, None], kv.float(), lengths)[:, 0]
     partial, statistics, counters = plan.workspace
     assert partial.shape == (96, partitions, 128)
@@ -188,29 +184,6 @@ def test_decode_caller_workspace_is_initialized_once_at_prepare():
     )
 
 
-def test_decode_stats_cache_rejects_misaligned_caller_statistics():
-    if not get_manifest()["routes"]["decode_fp16_contiguous"]["merge_stats_cache"]:
-        pytest.skip("requires a frozen stats-cache producer")
-    q = _sample((1, 32, 128))
-    kv = _sample((1, 2, 4, 257, 128), seed=53)
-    seq = torch.tensor([257], device="cuda", dtype=torch.int32)
-    statistics = torch.empty(32 * 2 * 2 + 1, device="cuda", dtype=torch.float32)[
-        1:
-    ].view(32, 2, 2)
-    assert statistics.is_contiguous() and statistics.data_ptr() % 8 == 4
-    workspace = (
-        torch.empty((32, 2, 128), device="cuda", dtype=torch.float32),
-        statistics,
-        torch.empty((1, 4), device="cuda", dtype=torch.int32),
-    )
-    out = torch.full_like(q, float("nan"))
-    plan = prepare(q, kv, seq, out=out, workspace=workspace, partition_tokens=256)
-    # Exercise the native TensorView address check before any device launch.
-    with pytest.raises(ValueError, match="statistics.*alignment"):
-        plan.run()
-    assert torch.isnan(out).all().item()
-
-
 CONTIGUOUS_CASES = [
     (1, 20, 256, 8, "causal", "uniform"),
     (1, 1, 1, 8, "causal", "normal"),
@@ -232,7 +205,11 @@ CACHE_CASES = [
 ]
 
 
-KERNELS = ("tcgen05", "register_mma", "tmem")
+KERNELS = ("auto", "tmem", "pair")
+
+
+def _q_tiles(queries, ratio):
+    return (queries * ratio + 127) // 128
 
 
 def _tree_case(
@@ -245,10 +222,12 @@ def _tree_case(
     mask_kind,
     fp8,
     paged,
-    kernel="tcgen05",
+    kernel="auto",
 ):
-    if kernel == "tmem" and ratio != 8:
-        pytest.skip("tmem routes are frozen for GQA ratio 8")
+    if kernel == "pair" and (not fp8 or _q_tiles(queries, ratio) % 2):
+        pytest.skip(
+            "pair routes serve E4M3 KV with an even number of 128-row Q tiles per head"
+        )
     q = _sample((batch, queries, 4 * ratio, 512), distribution)
     kv = _sample((batch, 2, 4, capacity, 512), distribution, seed=29)
     kv[:, 0].mul_(0.5)
@@ -323,75 +302,27 @@ def test_tree_cache(
 
 TMEM_CASES = [
     # (batch, queries, ratio): even and odd numbers of 128-row Q tiles per KV head
-    # (the (2, 2, 1) K/V-multicast form and the (2, 1, 1) Q-multicast fallback).
+    # (the (2, 2, 1) K/V-multicast form and the (2, 1, 1) Q-multicast fallback) at every
+    # GQA ratio (one frozen trace per ratio: the Q tile is ratio heads x 128 / ratio tokens).
     (1, 20, 8),
     (2, 32, 8),
     (1, 7, 8),
     (1, 33, 8),
+    (1, 65, 2),
+    (1, 64, 2),
+    (1, 40, 4),
+    (2, 20, 4),
+    (1, 9, 16),
+    (1, 5, 16),
 ]
+PAIR_CASES = [case for case in TMEM_CASES if _q_tiles(case[1], case[2]) % 2 == 0]
+ODD_CASES = [case for case in TMEM_CASES if _q_tiles(case[1], case[2]) % 2 == 1]
+CACHE_MODES = [(False, False), (False, True), (True, False), (True, True)]
+FP8_MODES = [(True, False), (True, True)]
 
 
-@pytest.mark.parametrize("kernel", ("tmem", "auto"))
-@pytest.mark.parametrize(
-    "fp8,paged", [(False, False), (False, True), (True, False), (True, True)]
-)
-@pytest.mark.parametrize("batch,queries,ratio", TMEM_CASES)
-def test_tree_tmem_all_cache_modes(batch, queries, ratio, fp8, paged, kernel):
-    _tree_case(
-        batch, queries, 256, ratio, None, "uniform", "binary_tree", fp8, paged, kernel
-    )
-
-
-@pytest.mark.parametrize(
-    "fp8,paged", [(False, False), (False, True), (True, False), (True, True)]
-)
-def test_auto_routes_to_tmem(fp8, paged):
-    q = _sample((1, 20, 32, 512))
-    kv = _sample((1, 2, 4, 256, 512), seed=29)
-    seq = torch.full((1,), 256, device="cuda", dtype=torch.int32)
-    stored, pages, _, k_scale, v_scale = _cache(kv, fp8, paged)
-    prepared = prepare(
-        q,
-        stored,
-        seq,
-        mask=_mask(20, 1, "causal"),
-        page_table=pages,
-        page_size=128 if paged else 0,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        kernel="auto",
-    )
-    precision = "fp8" if fp8 else "fp16"
-    layout = "paged" if paged else "contiguous"
-    assert prepared.route == f"tree_{precision}_{layout}_tmem"
-    assert get_manifest()["routes"][prepared.route]["kernel"] == "tmem"
-
-
-@pytest.mark.parametrize("fp8,paged", [(False, False), (False, True), (True, True)])
-def test_tmem_rejects_other_gqa_ratios(fp8, paged):
-    q = _sample((1, 20, 16, 512))
-    kv = _sample((1, 2, 4, 256, 512), seed=29)
-    seq = torch.full((1,), 256, device="cuda", dtype=torch.int32)
-    stored, pages, _, k_scale, v_scale = _cache(kv, fp8, paged)
-    with pytest.raises(ValueError, match="GQA ratio 8"):
-        prepare(
-            q,
-            stored,
-            seq,
-            mask=_mask(20, 1, "causal"),
-            page_table=pages,
-            page_size=128 if paged else 0,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            kernel="tmem",
-        )
-
-
-@pytest.mark.parametrize(
-    "fp8,paged", [(False, False), (False, True), (True, False), (True, True)]
-)
-def test_auto_keeps_register_routes_off_ratio_8(fp8, paged):
-    q = _sample((1, 20, 16, 512))
+def _prepare_auto(queries, ratio, fp8, paged, kernel="auto"):
+    q = _sample((1, queries, 4 * ratio, 512))
     kv = _sample((1, 2, 4, 256, 512), seed=29)
     seq = torch.full((1,), 256, device="cuda", dtype=torch.int32)
     stored, pages, dense, k_scale, v_scale = _cache(kv, fp8, paged)
@@ -399,57 +330,94 @@ def test_auto_keeps_register_routes_off_ratio_8(fp8, paged):
         q,
         stored,
         seq,
-        mask=_mask(20, 1, "causal"),
+        mask=_mask(queries, 1, "causal"),
         page_table=pages,
         page_size=128 if paged else 0,
         k_scale=k_scale,
         v_scale=v_scale,
-        kernel="auto",
+        kernel=kernel,
     )
-    precision, layout = "fp8" if fp8 else "fp16", "paged" if paged else "contiguous"
-    suffix = "_mma_split" if (not fp8 and paged) else "_mma"
-    assert prepared.route == f"tree_{precision}_{layout}{suffix}"
-    expected = _oracle(q, dense, [256], _mask(20, 1, "causal"))
+    return prepared, q, dense
+
+
+@pytest.mark.parametrize("kernel", ("tmem", "auto"))
+@pytest.mark.parametrize("fp8,paged", CACHE_MODES)
+@pytest.mark.parametrize("batch,queries,ratio", TMEM_CASES)
+def test_tree_tmem_all_cache_modes(batch, queries, ratio, fp8, paged, kernel):
+    _tree_case(
+        batch, queries, 256, ratio, None, "uniform", "binary_tree", fp8, paged, kernel
+    )
+
+
+@pytest.mark.parametrize("kernel", ("pair", "auto"))
+@pytest.mark.parametrize("fp8,paged", FP8_MODES)
+@pytest.mark.parametrize("batch,queries,ratio", PAIR_CASES)
+def test_tree_pair_fp8_cache_modes(batch, queries, ratio, fp8, paged, kernel):
+    _tree_case(
+        batch, queries, 256, ratio, None, "uniform", "binary_tree", fp8, paged, kernel
+    )
+
+
+@pytest.mark.parametrize("fp8,paged", FP8_MODES)
+@pytest.mark.parametrize("batch,queries,ratio", PAIR_CASES)
+def test_auto_routes_fp8_even_tiles_to_pair(batch, queries, ratio, fp8, paged):
+    prepared, _, _ = _prepare_auto(queries, ratio, fp8, paged)
+    cache = "page128" if paged else "contig"
+    assert prepared.route == f"tree_fp8_{cache}_g{ratio}_pair"
+    assert prepared.route == cake_jit.select_record(
+        precision="fp8", cache=cache, ratio=ratio, q_len=queries, kernel="auto"
+    )
+    assert prepared.program == cake_jit.MODULES[prepared.route]["library"]
+
+
+@pytest.mark.parametrize("fp8,paged", CACHE_MODES)
+@pytest.mark.parametrize("batch,queries,ratio", TMEM_CASES)
+def test_auto_routes_the_other_shapes_to_tmem(batch, queries, ratio, fp8, paged):
+    if fp8 and _q_tiles(queries, ratio) % 2 == 0:
+        pytest.skip("E4M3 KV with an even Q-tile count routes to pair")
+    prepared, q, dense = _prepare_auto(queries, ratio, fp8, paged)
+    precision = "fp8" if fp8 else "fp16"
+    cache = "page128" if paged else "contig"
+    form = "even" if _q_tiles(queries, ratio) % 2 == 0 else "odd"
+    assert prepared.route == f"tree_{precision}_{cache}_g{ratio}_tmem_{form}"
+    assert prepared.program == cake_jit.MODULES[prepared.route]["library"]
+    expected = _oracle(q, dense, [256], _mask(queries, 1, "causal"))
     torch.testing.assert_close(prepared.run(), expected, atol=1e-2, rtol=1e-2)
 
 
-SPLIT_KERNELS = ("register_mma_split", "register_mma_auto")
+@pytest.mark.parametrize("fp8,paged", CACHE_MODES)
+def test_tmem_accepts_every_gqa_ratio(fp8, paged):
+    for ratio, queries in ((2, 65), (4, 40), (8, 20), (16, 9)):
+        prepared, q, dense = _prepare_auto(queries, ratio, fp8, paged, kernel="tmem")
+        assert f"_g{ratio}_tmem_" in prepared.route
+        expected = _oracle(q, dense, [256], _mask(queries, 1, "causal"))
+        torch.testing.assert_close(prepared.run(), expected, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("kernel", SPLIT_KERNELS)
-@pytest.mark.parametrize(
-    "batch,queries,capacity,ratio,lengths,distribution", CACHE_CASES
-)
-def test_tree_fp16_paged_split(
-    batch, queries, capacity, ratio, lengths, distribution, kernel
-):
-    _tree_case(
-        batch,
-        queries,
-        capacity,
-        ratio,
-        lengths,
-        distribution,
-        "causal" if lengths is None else "binary_tree",
-        False,
-        True,
-        kernel,
-    )
+@pytest.mark.parametrize("paged", [False, True])
+def test_pair_rejects_fp16_kv(paged):
+    with pytest.raises(ValueError, match="E4M3"):
+        _prepare_auto(20, 8, False, paged, kernel="pair")
 
 
-@pytest.mark.parametrize("kernel", ("register_mma_auto",))
-@pytest.mark.parametrize("fp8,paged", [(False, False), (True, False), (True, True)])
-def test_tree_auto_falls_back_to_register_mma(fp8, paged, kernel):
-    _tree_case(1, 20, 256, 8, None, "uniform", "causal", fp8, paged, kernel)
+@pytest.mark.parametrize("fp8,paged", FP8_MODES)
+@pytest.mark.parametrize("batch,queries,ratio", ODD_CASES)
+def test_pair_rejects_odd_q_tile_counts(batch, queries, ratio, fp8, paged):
+    with pytest.raises(ValueError, match="even number of 128-row Q tiles"):
+        _prepare_auto(queries, ratio, fp8, paged, kernel="pair")
 
 
-@pytest.mark.parametrize("fp8,paged", [(False, False), (True, False), (True, True)])
-def test_split_kernel_rejects_other_cache_modes(fp8, paged):
+RETIRED_KERNELS = ("tcgen05", "register_mma", "register_mma_split", "register_mma_auto")
+
+
+@pytest.mark.parametrize("kernel", RETIRED_KERNELS)
+@pytest.mark.parametrize("fp8,paged", [(False, False), (False, True), (True, False)])
+def test_retired_tree_kernels_are_rejected(fp8, paged, kernel):
     q = _sample((1, 20, 32, 512))
     kv = _sample((1, 2, 4, 256, 512), seed=29)
     seq = torch.full((1,), 256, device="cuda", dtype=torch.int32)
     stored, pages, _, k_scale, v_scale = _cache(kv, fp8, paged)
-    with pytest.raises(ValueError, match="register_mma_split"):
+    with pytest.raises(ValueError, match="is retired"):
         prepare(
             q,
             stored,
@@ -459,16 +427,78 @@ def test_split_kernel_rejects_other_cache_modes(fp8, paged):
             page_size=128 if paged else 0,
             k_scale=k_scale,
             v_scale=v_scale,
-            kernel="register_mma_split",
+            kernel=kernel,
         )
 
 
-def test_decode_rejects_register_mma_kernel():
+@pytest.mark.parametrize(
+    "kernel", ("tmem", "pair", "register_mma", "register_mma_auto")
+)
+def test_decode_rejects_tree_kernel_names(kernel):
     q = _sample((1, 32, 128))
     kv = _sample((1, 2, 4, 256, 128), seed=23)
     seq = torch.full((1,), 256, device="cuda", dtype=torch.int32)
-    with pytest.raises(ValueError, match="tcgen05 kernel family"):
-        prepare(q, kv, seq, kernel="register_mma")
+    with pytest.raises(
+        ValueError, match="D128 decode has only the tcgen05 kernel family"
+    ):
+        prepare(q, kv, seq, kernel=kernel)
+
+
+@pytest.mark.parametrize("kernel", ("auto", "tcgen05"))
+def test_decode_accepts_auto_and_its_previous_name(kernel):
+    q = _sample((2, 32, 128))
+    kv = _sample((2, 2, 4, 300, 128), seed=24)
+    lengths = [300, 129]
+    seq = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    plan = prepare(q, kv, seq, kernel=kernel)
+    assert cake_jit.MODULES[plan.route]["stage"] == "decode"
+    expected = _oracle(q[:, None], kv.float(), lengths)[:, 0]
+    torch.testing.assert_close(plan.run(), expected, atol=1e-2, rtol=1e-2)
+
+
+def test_decode_rejects_misaligned_addresses_before_launch():
+    q = _sample((1, 32, 128))
+    kv = _sample((1, 2, 4, 257, 128), seed=53)
+    seq = torch.tensor([257], device="cuda", dtype=torch.int32)
+    out = torch.full_like(q, float("nan"))
+
+    def workspace(partial=None, statistics=None):
+        return (
+            torch.empty((32, 2, 128), device="cuda", dtype=torch.float32)
+            if partial is None
+            else partial,
+            torch.empty((32, 2, 2), device="cuda", dtype=torch.float32)
+            if statistics is None
+            else statistics,
+            torch.empty((1, 4), device="cuda", dtype=torch.int32),
+        )
+
+    # Softmax statistics are read as 8-byte pairs: a 4-byte offset is refused.
+    statistics = torch.empty(32 * 2 * 2 + 1, device="cuda", dtype=torch.float32)[
+        1:
+    ].view(32, 2, 2)
+    assert statistics.is_contiguous() and statistics.data_ptr() % 8 == 4
+    with pytest.raises(
+        ValueError, match="statistics has insufficient address alignment"
+    ):
+        prepare(q, kv, seq, out=out, workspace=workspace(statistics=statistics))
+    # Partial outputs and the output are stored in 16-byte vectors.
+    partial = torch.empty(32 * 2 * 128 + 2, device="cuda", dtype=torch.float32)[
+        2:
+    ].view(32, 2, 128)
+    assert partial.data_ptr() % 16 == 8
+    with pytest.raises(ValueError, match="partial has insufficient address alignment"):
+        prepare(q, kv, seq, out=out, workspace=workspace(partial=partial))
+    shifted = torch.empty(32 * 128 + 1, device="cuda", dtype=torch.float16)[1:].view(
+        1, 32, 128
+    )
+    assert shifted.data_ptr() % 16 == 2
+    with pytest.raises(ValueError, match="out has insufficient address alignment"):
+        prepare(q, kv, seq, out=shifted, workspace=workspace())
+    # Q and KV are TMA descriptor sources (16-byte base addresses).
+    with pytest.raises(ValueError, match="q has insufficient address alignment"):
+        prepare(shifted, kv, seq, out=out, workspace=workspace())
+    assert torch.isnan(out).all().item()
 
 
 def test_tree_rejects_unknown_kernel():
@@ -484,18 +514,23 @@ def test_tree_rejects_unknown_kernel():
     "fp8,paged", [(False, False), (False, True), (True, False), (True, True)]
 )
 def test_packed_tree(fp8, paged, kernel):
-    counts, lengths = (7, 33), (129, 257)
-    uniform_q = _sample((2, 33, 32, 512), "normal")
+    # The pair route needs an even number of 128-row Q tiles per head: 32 x 8 = 256 rows (two tiles)
+    # for the packed pair case, 33 x 8 = 264 rows (three tiles) for the other families.
+    if kernel == "pair" and not fp8:
+        pytest.skip("pair routes serve E4M3 KV")
+    max_q = 32 if kernel == "pair" else 33
+    counts, lengths = (7, max_q), (129, 257)
+    uniform_q = _sample((2, max_q, 32, 512), "normal")
     kv = _sample((2, 2, 4, 384, 512), "normal", seed=31)
     kv[:, 0].mul_(0.5)
     kv[:, 1].mul_(2.0)
-    uniform_mask = _mask(33, 2, "binary_tree")
+    uniform_mask = _mask(max_q, 2, "binary_tree")
     q = torch.cat([uniform_q[index, :count] for index, count in enumerate(counts)])
     mask = torch.cat(
         [uniform_mask[index, :count] for index, count in enumerate(counts)]
     )
     seq = torch.tensor(lengths, device="cuda", dtype=torch.int32)
-    offsets = torch.tensor([0, 7, 40], device="cuda", dtype=torch.int32)
+    offsets = torch.tensor([0, 7, 7 + max_q], device="cuda", dtype=torch.int32)
     stored, pages, dense, k_scale, v_scale = _cache(kv, fp8, paged)
     expected = torch.cat(
         [
@@ -522,7 +557,7 @@ def test_packed_tree(fp8, paged, kernel):
         page_table=pages,
         page_size=128 if paged else 0,
         q_cu_seq_lens=offsets,
-        max_q_len=33,
+        max_q_len=max_q,
         k_scale=k_scale,
         v_scale=v_scale,
         kernel=kernel,
@@ -541,13 +576,8 @@ def test_prepared_decode_nondefault_stream_and_graph_replay(partition_tokens):
     preparation_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(preparation_stream):
         plan = prepare(q, kv, seq, partition_tokens=partition_tokens)
-    producer = get_manifest()["routes"]["decode_fp16_contiguous"]
-    expected_route = (
-        producer["single_partition_route"]
-        if partition_tokens >= 512 and producer["merge_stats_cache"]
-        else "decode_fp16_contiguous"
-    )
-    assert plan.route == expected_route
+    assert plan.route == "decode_fp16_contig"
+    assert plan.grid == ((512 + partition_tokens - 1) // partition_tokens, 4, 2)
     stream = torch.cuda.Stream()
     stream.wait_stream(preparation_stream)
     with torch.cuda.stream(stream):

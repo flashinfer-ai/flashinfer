@@ -226,12 +226,13 @@ def test_capability_probes_stay_jit_free(monkeypatch) -> None:
         "glm53_nope",
         "dots3_swa",
         "dsv4_1",
+        "dsv4_1_inline",
     }
     assert configs["dsv4"].supports_decode(num_heads=64, topk=256)
     assert configs["dsv4_1"].bytes_per_token == 528
     nvfp4 = supported_sparse_mla_sm120_configs(kv_cache_format="nvfp4")
     assert nvfp4["dsv4"].bytes_per_token == 384
-    assert nvfp4["dsv4"].supported_num_heads() == (16, 32, 64, 128)
+    assert nvfp4["dsv4"].supported_num_heads() == (8, 16, 32, 64, 128)
     assert (48, 384) in _DECODE_DSV4_DISPATCH
     assert (256, 384) not in _DECODE_DSV4_DISPATCH
     assert (64, 512) not in _DECODE_DOTS3_SWA_DISPATCH
@@ -299,6 +300,7 @@ def test_supported_configs_families(sm120_module, ordinary_format_facts) -> None
         "glm53_nope",
         "dots3_swa",
         "dsv4_1",
+        "dsv4_1_inline",
     }
     assert all(
         isinstance(config, SparseMLASm120DecodeConfig) for config in configs.values()
@@ -351,6 +353,7 @@ def test_supported_configs_families(sm120_module, ordinary_format_facts) -> None
     assert dsv4_1.topks == frozenset({512})  # the V4.1 indexer topk
     assert dsv4_1.min_topk == 1
     assert dsv4_1.bytes_per_token == 528
+    assert configs["dsv4_1_inline"] == dsv4_1  # same envelope, inline records
     assert (64, 512) in _DECODE_DSV4_1_DISPATCH
     assert (48, 384) in _DECODE_DSV4_1_DISPATCH  # off the calibrated grid
     assert (256, 512) not in _DECODE_DSV4_1_DISPATCH
@@ -371,12 +374,29 @@ def test_supported_configs_nvfp4_envelope(sm120_module) -> None:
     dsv4 = configs["dsv4"]
     assert dsv4.kv_cache_format == "nvfp4"
     assert dsv4.bytes_per_token == 384
-    assert dsv4.supported_num_heads() == (16, 32, 64, 128)
+    assert dsv4.supported_num_heads() == (8, 16, 32, 64, 128)
     assert dsv4.supported_topk() == (128, 512)
-    assert dsv4.extra_page_block_sizes == frozenset({2, 64})
+    assert dsv4.extra_page_block_sizes == frozenset({2, 32, 64})
+    assert dsv4.page_block_size_is_runtime
     assert dsv4.supports_decode(64, 128)
-    assert not dsv4.supports_decode(8, 128)
+    assert dsv4.supports_decode(64, 512, page_block_size=32)
+    assert dsv4.supports_decode(8, 128, page_block_size=32)
+    assert not dsv4.supports_decode(8, 256)
     assert not dsv4.supports_decode(64, 256)
+
+    # The static envelope must stay in parity with the compiled C++ facts.
+    from flashinfer.mla._sparse_mla_sm120._execution import dsv4_nvfp4_format_info
+
+    facts = dsv4_nvfp4_format_info()
+    assert facts["runtime_page"] is True
+    assert facts["query_dim"] == 512
+    assert facts["value_dim"] == 512
+    assert facts["page_size"] == 64
+    assert facts["chunk_width"] == 64
+    assert facts["bytes_per_token"] == 384
+    assert set(facts["extra_page_sizes"]) == set(dsv4.extra_page_block_sizes)
+    assert tuple(sorted(set(facts["heads"]))) == dsv4.supported_num_heads()
+    assert tuple(sorted(set(facts["topks"]))) == dsv4.supported_topk()
 
     with pytest.raises(ValueError, match="kv_cache_format"):
         supported_sparse_mla_sm120_configs(kv_cache_format="int4")

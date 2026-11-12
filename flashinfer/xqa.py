@@ -212,6 +212,7 @@ def xqa(
     v_sf_cache: Optional[torch.Tensor] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA kernel.
+
     Parameters
     ----------
     q : torch.Tensor
@@ -311,7 +312,7 @@ def xqa(
     - num_q_heads from q.shape[-2]
     - head_dim from q.shape[-1]
     - input_dtype from q.dtype
-    - kv_cache_dtype from k.dtype
+    - kv_cache_dtype from k_cache.dtype
     - head_group_ratio from num_q_heads // num_kv_heads
     - max_seq_len from page_table.shape[-1] * page_size
     """
@@ -556,6 +557,7 @@ def xqa_mla(
     enable_pdl: Optional[bool] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA MLA (Multi-Head Latent Attention) kernel.
+
     Parameters
     ----------
     q : torch.Tensor

@@ -39,7 +39,7 @@ from .....core.comm.fault_tolerance import (
     FaultToleranceMixin,
     reject_graph_capture as _reject_graph_capture_impl,
 )
-from .....core.comm.fleet import Fleet, _BACKEND_REGISTRY
+from .....core.comm.fleet import Fleet, register_fleet
 # from .....api_logging import flashinfer_api  # disabled per PR #3453 review
 
 if TYPE_CHECKING:
@@ -91,6 +91,7 @@ def _resolve_store(bootstrap: "BootstrapConfig"):
     return resolve_rendezvous_store(bootstrap, subsystem="nixl_ep")
 
 
+@register_fleet("nixl_ep")
 class NixlEpFleet(FaultToleranceMixin, Fleet):
     """Owns a ``nixl_ep.Buffer`` for one rank."""
 
@@ -371,7 +372,3 @@ class NixlEpFleet(FaultToleranceMixin, Fleet):
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
             self.destroy()
-
-
-# Module-load side effect: register the backend.
-_BACKEND_REGISTRY["nixl_ep"] = NixlEpFleet

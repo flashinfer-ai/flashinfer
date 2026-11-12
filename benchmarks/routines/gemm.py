@@ -156,11 +156,14 @@ def parse_gemm_args(line, parser):
             "cublaslt",
             "cute-dsl",
             "cute-dsl-native",
+            "blackwell-native",
+            "blackwell-tiled",
             "b12x",
             "auto",
             "tinygemm",
             "cutile",
             "trtllm_low_latency",
+            "cutedsl_low_latency",
         ],
         help="Kernel backends to test. Default: cudnn",
     )
@@ -326,7 +329,7 @@ def testGemmFp8NtGroupwise(args):
     b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
 
     def run_backend(backend, a_fp8, b_fp8, a_scale, b_scale):
-        if backend in ["cutlass", "trtllm", "cutile"]:
+        if backend in ["cutlass", "trtllm", "cutile", "cute-dsl", "auto"]:
             return flashinfer.gemm.gemm_fp8_nt_groupwise(
                 a=a_fp8,
                 b=b_fp8,
@@ -850,7 +853,8 @@ def testMmFp8(args):
 
     This test:
     1. Generates random input tensors and quantizes them to FP8
-    2. Pre-shuffles the weight tensor into the low-latency block layout
+    2. Pre-shuffles the weight tensor into the low-latency block layout for
+       trtllm_low_latency; every other backend takes the unprocessed (n, k) weight
     3. Runs mm_fp8
     4. Runs reference check against the unquantized bf16 GEMM
     5. Measures performance metrics (TFLOPS, TB/sec)
@@ -879,7 +883,13 @@ def testMmFp8(args):
     k = args.k
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
-    autotune_supported_backends = ["trtllm_low_latency"]
+    autotune_supported_backends = [
+        "trtllm_low_latency",
+        "cublas",
+        "cudnn",
+        "cutlass",
+        "auto",
+    ]
     res = []
 
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
@@ -929,9 +939,14 @@ def testMmFp8(args):
         print(f"[VVERBOSE] {input_inv_s = }")
         print(f"[VVERBOSE] {mat2_inv_s = }")
 
+    def weight_for(backend):
+        # Only trtllm_low_latency reads the prepared layout; "auto" follows the
+        # weight it is given, and gets the unprocessed one here.
+        return mat2_prepared if backend == "trtllm_low_latency" else mat2_fp8
+
     # Programmatically filter backends by probing each backend with a trial
-    # call (mm_fp8 has no @backend_requirement decorator; it raises on
-    # unsupported backends/architectures).
+    # call (mm_fp8's @backend_requirement raises on unsupported
+    # backends/architectures/layouts).
     # NOTE: unlike some other testers, backends without autotune support are
     # kept when --autotune is set (they just skip the warmup loop below and
     # are reported without the "_autotune" suffix).
@@ -940,7 +955,7 @@ def testMmFp8(args):
         try:
             flashinfer.mm_fp8(
                 input_fp8,
-                mat2_prepared,
+                weight_for(backend),
                 alpha,
                 out_dtype=res_dtype,
                 backend=backend,
@@ -958,10 +973,10 @@ def testMmFp8(args):
         print("[ERROR] No backends passed validation. Exiting.")
         return res
 
-    def run_backend(backend, input_fp8, mat2_prepared, alpha):
+    def run_backend(backend, input_fp8, mat2, alpha):
         return flashinfer.mm_fp8(
             input_fp8,
-            mat2_prepared,
+            mat2,
             alpha,
             out_dtype=res_dtype,
             backend=backend,
@@ -983,7 +998,9 @@ def testMmFp8(args):
                     print(f"[INFO] Autotune warmup for mm_fp8: {warmup_iters} iters")
                 with autotune(True, cache=cache_path):
                     for _ in range(warmup_iters):
-                        run_backend(cur_backend, input_fp8, mat2_prepared, alpha)
+                        run_backend(
+                            cur_backend, input_fp8, weight_for(cur_backend), alpha
+                        )
     elif cache_path:
         with autotune(False, cache=cache_path):
             pass
@@ -994,7 +1011,7 @@ def testMmFp8(args):
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(
-                cur_backend, input_fp8, mat2_prepared, alpha
+                cur_backend, input_fp8, weight_for(cur_backend), alpha
             ).detach()
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
@@ -1004,7 +1021,7 @@ def testMmFp8(args):
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
             cold_l2_cache=True,
-            input_args=(cur_backend, input_fp8, mat2_prepared, alpha),
+            input_args=(cur_backend, input_fp8, weight_for(cur_backend), alpha),
         )
 
     tested_backends = list(outputs.keys())
@@ -1107,6 +1124,7 @@ def testBmmMxfp8(args):
     run_refcheck = args.refcheck
     autotune_supported_backends = [
         "cudnn",
+        "cute-dsl",
     ]
     res = []
 
@@ -1116,10 +1134,17 @@ def testBmmMxfp8(args):
         return res
 
     res_dtype = dtype_str_to_torch_dtype(args.out_dtype)
-    if res_dtype not in [torch.bfloat16, torch.float16]:
+    if res_dtype not in [torch.bfloat16, torch.float16, torch.float8_e4m3fn]:
         raise ValueError(
-            f"Unsupported res dtype: {res_dtype}. Supported dtypes are bfloat16 and float16."
+            f"Unsupported res dtype: {res_dtype}. Supported dtypes are bfloat16, float16 "
+            "and (cute-dsl) fp8_e4m3."
         )
+    # fp8_e4m3 output = MXFP8 output: e4m3 data plus a 128x4-swizzled UE8M0 scale per 32 columns
+    mxfp8_out = res_dtype == torch.float8_e4m3fn
+    if mxfp8_out:
+        for cur_backend in [b for b in backends if b != "cute-dsl"]:
+            print(f"[INFO] {cur_backend} backend does not support fp8_e4m3 output")
+            backends.remove(cur_backend)
     ## Done parsing input arguments
 
     if getattr(args, "autotune", False):
@@ -1157,8 +1182,14 @@ def testBmmMxfp8(args):
         print(f"[VVERBOSE] {mat2_scale.shape = }")
         print(f"[VVERBOSE] {mat2_scale.dtype = }")
 
+    out_scale = (
+        torch.empty(batch_size * m * n // 32, device=device, dtype=torch.uint8)
+        if mxfp8_out
+        else None
+    )
+
     def run_backend(backend, input_mxfp8, mat2_mxfp8, input_scale, mat2_scale):
-        if backend == "cudnn":
+        if backend in ("cudnn", "cute-dsl"):
             return flashinfer.gemm.bmm_mxfp8(
                 A=input_mxfp8,
                 B=mat2_mxfp8,
@@ -1166,9 +1197,18 @@ def testBmmMxfp8(args):
                 B_scale=mat2_scale,
                 dtype=res_dtype,
                 backend=backend,
+                out_scale=out_scale,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
+
+    def dequantized(output):
+        if not mxfp8_out:
+            return output
+        values = output.reshape(batch_size * m, n).view(torch.uint8).cpu()
+        return flashinfer.mxfp8_dequantize_host(values, out_scale.cpu(), True).to(
+            device
+        )
 
     has_reference_output = False
     if run_refcheck:
@@ -1202,9 +1242,11 @@ def testBmmMxfp8(args):
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
-            outputs[cur_backend] = run_backend(
-                cur_backend, input_mxfp8, mat2_mxfp8, input_scale, mat2_scale
-            ).detach()
+            outputs[cur_backend] = dequantized(
+                run_backend(
+                    cur_backend, input_mxfp8, mat2_mxfp8, input_scale, mat2_scale
+                ).detach()
+            )
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -1256,6 +1298,7 @@ def testBmmMxfp8(args):
                 m * k * torch.float8_e4m3fn.itemsize
                 + n * k * torch.float8_e4m3fn.itemsize
                 + m * n * res_dtype.itemsize
+                + (m * n // 32 if mxfp8_out else 0)
             ) * batch_size
             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec

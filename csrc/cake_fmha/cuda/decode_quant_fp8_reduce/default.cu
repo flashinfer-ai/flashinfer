@@ -44,8 +44,18 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define NUM_MAIN_STAGES 1
 #define THREADS 32
 #define HEAD_DIM 128
-#define FIXED_NUM_SPLITS 0
-#define USE_PDL 0
+// The route's fixed-plan module: 8 splits and a PDL launch; 0 = the runtime split count, no PDL.
+#ifndef CAKE_FMHA_REDUCE_FIXED_NUM_SPLITS
+#define CAKE_FMHA_REDUCE_FIXED_NUM_SPLITS 0
+#endif
+#ifndef CAKE_FMHA_REDUCE_USE_PDL
+#define CAKE_FMHA_REDUCE_USE_PDL 0
+#endif
+#define FIXED_NUM_SPLITS CAKE_FMHA_REDUCE_FIXED_NUM_SPLITS
+#define USE_PDL CAKE_FMHA_REDUCE_USE_PDL
+#if FIXED_NUM_SPLITS != 0 && FIXED_NUM_SPLITS != 8
+#error "the fixed-plan reducer loads eight split statistics"
+#endif
 
 #include <math_constants.h>
 
@@ -72,7 +82,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(32) void
-kernel_cake_fmha_decode_quant_fp8_reduce(float* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, uint8_t* __restrict__ O, float* __restrict__ bmm2_scale_ptr, int num_split)
+kernel_cake_fmha_decode_quant_fp8_reduce(float* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, uint8_t* __restrict__ O, float* __restrict__ bmm2_scale_ptr, int num_split, float bmm2_scalar)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -84,12 +94,37 @@ kernel_cake_fmha_decode_quant_fp8_reduce(float* __restrict__ partial_O, float* _
     const int num_bids = gridDim.x;
 
     // === Task calls (dependency order) ===
-    float output_scale = bmm2_scale_ptr[0];
+    float output_scale = ((bmm2_scale_ptr != nullptr) ? bmm2_scale_ptr[0] : bmm2_scalar);
     int bh = blockIdx.x;
     int split_stride = ((FIXED_NUM_SPLITS != 0) ? FIXED_NUM_SPLITS : num_split);
     int stat_base = bh * split_stride;
+#if USE_PDL
+    {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+#endif  // USE_PDL
     float max_m = -CAKE_FMHA_INF;
     float fixed_max[8];
+#if FIXED_NUM_SPLITS != 0
+    {
+        float4 _v4_lo = *reinterpret_cast<const float4*>(partial_max + stat_base);
+        float4 _v4_hi = *reinterpret_cast<const float4*>(partial_max + stat_base + 4);
+        fixed_max[0] = _v4_lo.x;
+        fixed_max[1] = _v4_lo.y;
+        fixed_max[2] = _v4_lo.z;
+        fixed_max[3] = _v4_lo.w;
+        fixed_max[4] = _v4_hi.x;
+        fixed_max[5] = _v4_hi.y;
+        fixed_max[6] = _v4_hi.z;
+        fixed_max[7] = _v4_hi.w;
+        #pragma unroll
+        for (int s0 = 0; s0 < FIXED_NUM_SPLITS; s0++) {
+            float m_s = fixed_max[s0];
+            float _max_1 = max_noftz(max_m, m_s);
+            max_m = _max_1;
+        }
+    }
+#else
     {
         #pragma unroll 8
         for (int s0 = 0; s0 < num_split; s0++) {
@@ -98,6 +133,7 @@ kernel_cake_fmha_decode_quant_fp8_reduce(float* __restrict__ partial_O, float* _
             max_m = _max_1;
         }
     }
+#endif  // FIXED_NUM_SPLITS
     int d_base = lane * 4;
     int po_base = bh * split_stride * HEAD_DIM + d_base;
     float sum_w = 0.0f;
@@ -105,6 +141,28 @@ kernel_cake_fmha_decode_quant_fp8_reduce(float* __restrict__ partial_O, float* _
     float acc1 = 0.0f;
     float acc2 = 0.0f;
     float acc3 = 0.0f;
+#if FIXED_NUM_SPLITS != 0
+    {
+        float4 _s4_lo = *reinterpret_cast<const float4*>(partial_sum + stat_base);
+        float4 _s4_hi = *reinterpret_cast<const float4*>(partial_sum + stat_base + 4);
+        float fixed_sum[8] = {_s4_lo.x, _s4_lo.y, _s4_lo.z, _s4_lo.w, _s4_hi.x, _s4_hi.y, _s4_hi.z, _s4_hi.w};
+        #pragma unroll
+        for (int s1 = 0; s1 < FIXED_NUM_SPLITS; s1++) {
+            float m_s1 = fixed_max[s1];
+            if (m_s1 != -CAKE_FMHA_INF) {
+                float _exp2_1 = approx_exp2(m_s1 - max_m);
+                float w_s = _exp2_1 * fixed_sum[s1];
+                sum_w = sum_w + w_s;
+                int po_off = po_base + s1 * HEAD_DIM;
+                float4 _p4 = *reinterpret_cast<const float4*>(partial_O + po_off);
+                acc0 = acc0 + w_s * _p4.x;
+                acc1 = acc1 + w_s * _p4.y;
+                acc2 = acc2 + w_s * _p4.z;
+                acc3 = acc3 + w_s * _p4.w;
+            }
+        }
+    }
+#else
     {
         #pragma unroll 8
         for (int s1 = 0; s1 < num_split; s1++) {
@@ -129,6 +187,7 @@ kernel_cake_fmha_decode_quant_fp8_reduce(float* __restrict__ partial_O, float* _
             }
         }
     }
+#endif  // FIXED_NUM_SPLITS
     float _rcp_0 = approx_rcp(sum_w);
     float final_scale = ((sum_w == 0.0f) ? 0.0f : _rcp_0) * output_scale;
     float out_pair0[2];

@@ -3,23 +3,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Literal, Optional, Tuple
+
+from flashinfer.moe_ep._compat import deprecated_aliases
+
+if TYPE_CHECKING:
+    import torch
 
 
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 @dataclass
 class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
-    """Kernel params for ``kernel_src.sm107.next_cutedsl_megamoe.sm107_block_scaled_mega_moe``.
+    """Configure Rubin inference with NVFP4 activations and weights.
 
-    The Rubin inference block-scaled swap-AB fused dispatch + FC1 + SwiGLU +
-    FC2 + combine mega kernel (``BlockScaledSwapAbMegaMoeKernel``) at quant
-    kind nvfp4: nvfp4 activations x nvfp4 weights -> bf16 output, sf_vec_size
-    16 (FP8-E4M3 block scales), gate/up interleave 16.  The per-expert
-    fc1_alpha / fc2_alpha / fc1_norm_const dequant scalars are identically 1
-    (weights and activations quantize with norm_const=1.0), so they are
-    omitted from the kernel ABI.
+    The kernel fuses dispatch, FC1, activation, FC2, and combine with BF16 output.
+    It uses E4M3 scales per 16 values and 16-row gate/up stripes. SwiGLU is the default;
+    SiTU requires both positive, finite beta parameters.
+
+    input_norm_const controls BF16 input staging. Per-expert alpha tensors
+    correct GEMM accumulators; fc1_norm_const scales intermediate quantization.
     """
 
-    intermediate_size: int  # post-SwiGLU width; FC1 GEMM N is 2*intermediate_size
+    intermediate_size: int  # width after activation; FC1 N is 2*intermediate_size
     top_k: int
     kernel_name: str = "sm107_nvfp4_nvfp4_bf16_cutedsl"
     gate_up_clamp: Optional[float] = None
@@ -28,7 +33,7 @@ class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
-    apply_topk_in_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     schedule_policy: Tuple[str, Optional[int]] = ("grouped", None)
     work_id_mode: Literal["grid_stride", "atomic_counter"] = "grid_stride"
     fc2_use_bulk: bool = False
@@ -41,7 +46,19 @@ class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # (e.g. preferred (4, 1) + fallback (2, 1)). None -> uniform launch.
     fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None
     # None preserves the fields above; a dict overrides KNOB_KEYS.
-    # "cache" uses an offline winner or the heuristic fallback. Online "auto"
-    # is unsupported because the kernel fixes its knobs at construction.
+    # "cache" uses an offline winner or heuristic; "auto" also permits a
+    # search during an enabled FlashInfer autotune warmup, before capture.
     knobs: dict | str | None = None
     max_sm_count: Optional[int] = None
+    activation: Literal["swiglu", "situ"] = "swiglu"
+    situ_beta: Optional[float] = None
+    situ_linear_beta: Optional[float] = None
+    input_norm_const: float = 1.0
+    fc1_alpha: Optional["torch.Tensor"] = None
+    fc2_alpha: Optional["torch.Tensor"] = None
+    fc1_norm_const: Optional["torch.Tensor"] = None
+    # "auto" compares eligible variants with knobs="auto" during warmup.
+    # GenPhase requires cluster (4, 1), fc2_use_bulk=True, and <=1024 tokens/rank.
+    kernel_variant: Literal["inference", "genphase", "auto"] = "inference"
+    # Quantizes the FC2 return payload; the operator still returns BF16.
+    combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"

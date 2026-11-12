@@ -40,23 +40,26 @@ struct Fp8WeightQuad {
   uint8_t h1_e1;
 };
 
+// Scale readers key on the stored format, not on where the scales sit: UE8M0
+// bytes may live in a footer buffer (DSV4) or inline in the KV row
+// (DSV4_1_INLINE), and FP32 scales are always inline.
 template <typename KV>
 __device__ __forceinline__ uint8_t qk_k_scale_selector(const uint8_t* scale_base, int blk) {
   if constexpr (KV::SCALE_FORMAT == ScaleFormat::ARBITRARY_FP32) {
     return 0x7F;
-  } else if constexpr (KV::SCALE_IN_KV_SMEM) {
-    return KV::scale_to_ue8m0(reinterpret_cast<const float*>(scale_base)[blk]);
-  } else {
+  } else if constexpr (KV::SCALE_FORMAT == ScaleFormat::UE8M0_BYTE) {
     return scale_base[blk];
+  } else {
+    return KV::scale_to_ue8m0(reinterpret_cast<const float*>(scale_base)[blk]);
   }
 }
 
 template <typename KV>
 __device__ __forceinline__ float kv_scale_fp32(const uint8_t* scale_base, int blk) {
-  if constexpr (KV::SCALE_IN_KV_SMEM) {
-    return reinterpret_cast<const float*>(scale_base)[blk];
-  } else {
+  if constexpr (KV::SCALE_FORMAT == ScaleFormat::UE8M0_BYTE) {
     return fp32_from_exponent_byte(scale_base[blk]);
+  } else {
+    return reinterpret_cast<const float*>(scale_base)[blk];
   }
 }
 

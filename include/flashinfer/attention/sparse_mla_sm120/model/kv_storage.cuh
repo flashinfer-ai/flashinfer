@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <type_traits>
 
 #include "model_type.h"
 
@@ -51,6 +52,7 @@ struct ScaleSpec {
 
 template <int DataBytes, int ScaleBytes>
 struct FooterScaleLayout {
+  static constexpr bool INLINE = false;
   static constexpr int DATA_BYTES = DataBytes;
   static constexpr int SCALE_BYTES = ScaleBytes;
   static constexpr int BYTES_PER_TOKEN = DataBytes + ScaleBytes;
@@ -73,3 +75,39 @@ struct FooterScaleLayout {
            row * (selected ? ScaleBytes : Other::SCALE_BYTES);
   }
 };
+
+// Inline-scale records: each token's scale bytes follow its data bytes, so a
+// record is self-contained and the indices address records as rows of the
+// whole cache. `row` is that flat row index; the record width is the row
+// advance.
+template <int DataBytes, int ScaleBytes>
+struct InlineScaleLayout {
+  static constexpr bool INLINE = true;
+  static constexpr int DATA_BYTES = DataBytes;
+  static constexpr int SCALE_BYTES = ScaleBytes;
+  static constexpr int BYTES_PER_TOKEN = DataBytes + ScaleBytes;
+  template <typename Index>
+  __host__ __device__ static constexpr auto data_offset(Index row) {
+    return row * BYTES_PER_TOKEN;
+  }
+  template <typename Index>
+  __host__ __device__ static constexpr auto scale_offset(Index row) {
+    return row * BYTES_PER_TOKEN + DataBytes;
+  }
+  // FooterScaleLayout's selection interface; records carry no page geometry,
+  // so the page size is ignored.
+  template <typename Other, typename Index>
+  __host__ __device__ static constexpr auto selected_data_offset(bool selected, Index row) {
+    return row * (selected ? BYTES_PER_TOKEN : Other::BYTES_PER_TOKEN);
+  }
+  template <typename Other, typename PageSize, typename Index>
+  __host__ __device__ static constexpr auto selected_scale_offset(bool selected, PageSize,
+                                                                  Index row) {
+    return row * (selected ? BYTES_PER_TOKEN : Other::BYTES_PER_TOKEN) +
+           (selected ? DataBytes : Other::DATA_BYTES);
+  }
+};
+
+template <bool Inline, int DataBytes, int ScaleBytes>
+using ScalePlacement = std::conditional_t<Inline, InlineScaleLayout<DataBytes, ScaleBytes>,
+                                          FooterScaleLayout<DataBytes, ScaleBytes>>;

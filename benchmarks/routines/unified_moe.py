@@ -1,8 +1,10 @@
-"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, and b12x MoE runners."""
+"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, b12x, SM12x, cuDNN grouped-GEMM, TRTLLM and CuTe-DSL MoE runners."""
 
 from __future__ import annotations
 
 import argparse
+import functools
+import subprocess
 from collections import defaultdict
 from typing import Any
 
@@ -18,11 +20,17 @@ from flashinfer.fused_moe import (
     BackendOptions,
     B12xNvfp4Config,
     B12xW4A16Config,
+    CudnnGroupedGemmBf16Config,
+    CudnnGroupedGemmFp8PerTensorConfig,
+    CudnnGroupedGemmMxfp8Config,
+    CudnnGroupedGemmNvfp4Config,
     CutlassBf16Config,
     CutlassFp8PerTensorConfig,
+    CutlassMxfp8Config,
     CutlassMxfp8Mxfp4Config,
     CutlassNvfp4Config,
     CutlassW4A16Config,
+    CuteDslConfig,
     CuTileBf16Config,
     CuTileFp8PerTensorBf16Config,
     CuTileFp8PerTensorConfig,
@@ -49,10 +57,13 @@ from flashinfer.fused_moe import (
     ReLU,
     ReLU2,
     RoutingConfig,
+    SM12xNvfp4Bf16Config,
+    SM12xNvfp4Config,
     SiLU,
     SiTU,
     SwiGLU,
     SwiGLUStep,
+    TrtllmFp8BlockConfig,
 )
 from flashinfer.fused_moe.prepare import (
     _quantize_mxfp4_linear,
@@ -77,22 +88,70 @@ from .moe_utils import (
 _BACKEND_CONFIGS = {
     ("bf16", "cutlass"): CutlassBf16Config,
     ("bf16", "cutile"): CuTileBf16Config,
+    ("bf16", "cudnn"): CudnnGroupedGemmBf16Config,
     ("nvfp4", "cutlass"): CutlassNvfp4Config,
     ("nvfp4", "cutile"): CuTileNvfp4Config,
     ("nvfp4", "b12x"): B12xNvfp4Config,
+    ("nvfp4", "sm12x"): SM12xNvfp4Config,
+    ("nvfp4", "cudnn"): CudnnGroupedGemmNvfp4Config,
     ("nvfp4_w4a16", "cutile"): CuTileNvfp4Bf16Config,
     ("nvfp4_w4a16", "b12x"): B12xW4A16Config,
+    ("nvfp4_w4a16", "sm12x"): SM12xNvfp4Bf16Config,
     ("mxfp4", "cutile"): CuTileMxfp4Config,
     ("mxfp4_w4a16", "cutlass"): CutlassW4A16Config,
     ("mxfp4_w4a16", "cutile"): CuTileMxfp4Bf16Config,
     ("fp8", "cutile"): CuTileFp8PerTensorConfig,
     ("fp8", "cutlass"): CutlassFp8PerTensorConfig,
+    ("fp8", "cudnn"): CudnnGroupedGemmFp8PerTensorConfig,
     ("fp8_w8a16", "cutile"): CuTileFp8PerTensorBf16Config,
     ("mxfp8", "cutile"): CuTileMxfp8Config,
+    ("mxfp8", "cutlass"): CutlassMxfp8Config,
+    ("mxfp8", "cudnn"): CudnnGroupedGemmMxfp8Config,
+    ("mxfp8", "trtllm"): TrtllmFp8BlockConfig,
+    ("mxfp8", "cute_dsl"): CuteDslConfig,
     ("mxfp8_w8a16", "cutile"): CuTileMxfp8Bf16Config,
     ("mxfp4_w4a8", "cutile"): CuTileMxfp4Mxfp8Config,
     ("mxfp4_w4a8", "cutlass"): CutlassMxfp8Mxfp4Config,
 }
+
+# Backends consuming a pre-quantized activation pack built once, outside the
+# timed region, by their config's ``prepare_activations``. The other quantized
+# backends read BF16 and quantize in-kernel, or (_TIMED_INPUT_QUANTIZATION)
+# quantize inside the timed region through ``input_quantizer``.
+_PREQUANTIZED_ACTIVATIONS = (
+    CutlassNvfp4Config,
+    CutlassMxfp8Config,
+    CudnnGroupedGemmMxfp8Config,
+    CudnnGroupedGemmNvfp4Config,
+    TrtllmFp8BlockConfig,
+    CuteDslConfig,
+)
+# Backends whose weight and activation preparers take the layer's ``quant``.
+_QUANT_AWARE_PREPARERS = (TrtllmFp8BlockConfig, CuteDslConfig)
+# Backends taking pre-quantized activations whose BF16 conversion is timed, to
+# match the API boundary of the backends that quantize in-kernel.
+_TIMED_INPUT_QUANTIZATION = (
+    CutlassFp8PerTensorConfig,
+    CudnnGroupedGemmFp8PerTensorConfig,
+    CutlassMxfp8Mxfp4Config,
+)
+# Per-tensor FP8 backends taking the static multipliers as ``prepare_weights`` inputs.
+_STATIC_FP8_PER_TENSOR = (CutlassFp8PerTensorConfig, CudnnGroupedGemmFp8PerTensorConfig)
+
+
+def _fp8_per_tensor_static_scales(
+    hidden_states: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Static multipliers: ``fp8_max / amax`` of the activations and a fixed 32."""
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    amax = hidden_states.float().abs().amax()
+    return {
+        "hidden_states_scale_global": torch.where(
+            amax > 0, fp8_max / amax, torch.ones_like(amax)
+        ),
+        "intermediate_scale_global": torch.tensor(32.0, device=hidden_states.device),
+    }
+
 
 _ACTIVATIONS = {
     ActivationType.Swiglu: SwiGLU,
@@ -115,7 +174,7 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
     parser.add_argument(
         "--backends",
         nargs="+",
-        choices=("cutlass", "cutile", "b12x"),
+        choices=("cutlass", "cutile", "b12x", "sm12x", "cudnn", "trtllm", "cute_dsl"),
         default=["cutlass", "cutile"],
         help="Unified MoE backends to benchmark with the same inputs.",
     )
@@ -134,12 +193,31 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
         default=ActivationType.Swiglu,
     )
     parser.add_argument(
+        "--swiglu-limit",
+        type=float,
+        default=None,
+        help="Optional finite positive SwiGLU clamp limit.",
+    )
+    parser.add_argument(
+        "--routed-scaling-factor",
+        type=float,
+        default=1.0,
+        help="Scale applied to normalized precomputed top-k weights.",
+    )
+    parser.add_argument(
+        "--capture-telemetry",
+        action="store_true",
+        help="Print GPU clock/power/throttle state around each timed backend.",
+    )
+    parser.add_argument(
         "--autotune",
         action="store_true",
         default=False,
         help="Autotune each backend independently before measuring it.",
     )
     args = parser.parse_args(line)
+    if not np.isfinite(args.routed_scaling_factor) or args.routed_scaling_factor <= 0:
+        raise ValueError("routed_scaling_factor must be positive and finite")
     args.backends = list(dict.fromkeys(args.backends))
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
@@ -194,6 +272,7 @@ def _canonical_inputs(args, activation, device: torch.device):
         args.num_tokens, args.top_k, dtype=torch.float32, device=device
     )
     topk_weights /= topk_weights.sum(dim=1, keepdim=True)
+    topk_weights *= args.routed_scaling_factor
     activations = MoEActivationPack(
         hidden_states_q=hidden_states,
         hidden_states_scale=None,
@@ -288,6 +367,9 @@ def _prepare_weight_view(
     activation,
     args,
     device: torch.device,
+    fp8_static_scales: dict[str, torch.Tensor],
+    nvfp4_source=None,
+    nvfp4_mma_source=None,
 ):
     common = {
         "num_local_experts": args.num_experts,
@@ -296,8 +378,12 @@ def _prepare_weight_view(
         "activation": activation,
         "device": device,
     }
-    if quant_variant == "bf16" or backend == "cutlass":
+    if config_type in _STATIC_FP8_PER_TENSOR:
+        common.update(fp8_static_scales)
+    if quant_variant == "bf16" or backend in ("cutlass", "cudnn"):
         return config_type.prepare_weights(w1, w2, **common)
+    if config_type in _QUANT_AWARE_PREPARERS:
+        return config_type.prepare_weights(w1, w2, quant=_quant_config(args), **common)
 
     if quant_variant.startswith(("fp8", "mxfp8")):
         block_scaled = quant_variant.startswith("mxfp8")
@@ -306,37 +392,34 @@ def _prepare_weight_view(
         return config_type.prepare_weights(q1, s1, q2, s2, **common)
 
     if quant_variant.startswith("nvfp4"):
-        w1_q, w1_scale, w1_global = _quantize_cutile_nvfp4_source(w1)
-        w2_q, w2_scale, w2_global = _quantize_cutile_nvfp4_source(w2)
+        if nvfp4_source is None:
+            nvfp4_source = (
+                *_quantize_cutile_nvfp4_source(w1),
+                *_quantize_cutile_nvfp4_source(w2),
+            )
+        w1_q, w1_scale, w1_global, w2_q, w2_scale, w2_global = nvfp4_source
+        if backend == "b12x" and quant_variant == "nvfp4":
+            assert nvfp4_mma_source is not None
+            (
+                w1_q,
+                w1_scale_storage,
+                w1_scale_mma,
+                w1_global,
+                w2_q,
+                w2_scale_storage,
+                w2_scale_mma,
+                w2_global,
+            ) = nvfp4_mma_source
+            return {
+                "w1_weight": w1_q,
+                "w1_weight_sf": w1_scale_mma,
+                "w1_alpha": w1_global,
+                "w2_weight": w2_q,
+                "w2_weight_sf": w2_scale_mma,
+                "w2_alpha": w2_global,
+                "fc2_input_scale": torch.ones(1, device=device),
+            }
         if backend == "b12x":
-            # b12x consumes swizzled scales with padding per expert, not
-            # cuTile's logical checkpoint scales (notably for ragged N).
-            w1_scale = _swizzle_cutile_fp4_scales(w1_scale, scale_block_size=16)
-            w2_scale = _swizzle_cutile_fp4_scales(w2_scale, scale_block_size=16)
-            if quant_variant == "nvfp4":
-                from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
-
-                return {
-                    "w1_weight": w1_q,
-                    "w1_weight_sf": convert_sf_to_mma_layout(
-                        w1_scale,
-                        m=w1.shape[1],
-                        k=w1.shape[2],
-                        num_groups=args.num_experts,
-                        sf_vec_size=16,
-                    ),
-                    "w1_alpha": w1_global,
-                    "w2_weight": w2_q,
-                    "w2_weight_sf": convert_sf_to_mma_layout(
-                        w2_scale,
-                        m=w2.shape[1],
-                        k=w2.shape[2],
-                        num_groups=args.num_experts,
-                        sf_vec_size=16,
-                    ),
-                    "w2_alpha": w2_global,
-                    "fc2_input_scale": torch.ones(1, device=device),
-                }
             common = {"activation": activation}
         return config_type.prepare_weights(
             w1_q,
@@ -440,7 +523,7 @@ def _reference_activation(
     return result.to(torch.bfloat16)
 
 
-def _config_for_backend(args, activation, backend_config) -> MoEConfig:
+def _quant_config(args) -> QuantConfig:
     weight_format, activation_format = {
         "bf16": (QuantFormat.BF16, QuantFormat.BF16),
         "nvfp4": (QuantFormat.NVFP4, QuantFormat.NVFP4),
@@ -453,9 +536,17 @@ def _config_for_backend(args, activation, backend_config) -> MoEConfig:
         "mxfp8_w8a16": (QuantFormat.MXFP8, QuantFormat.BF16),
         "mxfp4_w4a8": (QuantFormat.MXFP4, QuantFormat.MXFP8),
     }[args.quant_variant]
+    return QuantConfig(weight=weight_format, activation=activation_format)
+
+
+def _config_for_backend(args, activation, backend_config) -> MoEConfig:
     return MoEConfig(
-        routing=RoutingConfig(num_experts=args.num_experts, top_k=args.top_k),
-        quant=QuantConfig(weight=weight_format, activation=activation_format),
+        routing=RoutingConfig(
+            num_experts=args.num_experts,
+            top_k=args.top_k,
+            routed_scaling_factor=args.routed_scaling_factor,
+        ),
+        quant=_quant_config(args),
         experts=ExpertConfig(intermediate_size=args.intermediate_size),
         activation=activation,
         backend=BackendOptions((backend_config,)),
@@ -467,6 +558,27 @@ def _config_for_backend(args, activation, backend_config) -> MoEConfig:
     )
 
 
+def _set_b12x_benchmark_swiglu(runner, activation, args, device) -> None:
+    runner.activation = "swigluoai_uninterleave"
+    runner._inner = runner._wrapper_cls(
+        num_experts=args.num_experts,
+        top_k=args.top_k,
+        hidden_size=args.hidden_size,
+        intermediate_size=args.intermediate_size,
+        use_cuda_graph=True,
+        max_num_tokens=max(1, args.num_tokens),
+        num_local_experts=args.num_experts,
+        expert_map=None,
+        device=device,
+        activation=runner.activation,
+        quant_mode="nvfp4",
+        source_format="modelopt",
+        swiglu_alpha=activation.alpha,
+        swiglu_beta=activation.beta,
+        swiglu_limit=activation.limit,
+    )
+
+
 def _choose_tactic(args, runner, inputs: list[torch.Tensor]):
     if not args.autotune and args.autotune_cache is None:
         return -1
@@ -474,8 +586,11 @@ def _choose_tactic(args, runner, inputs: list[torch.Tensor]):
         _, tactic = AutoTuner.get().choose_one(
             custom_op=f"moe_{runner.backend_key}",
             runners=[runner],
-            tuning_config=runner.tuning_config,
+            tuning_config=runner.tuning_config_for(inputs),
             inputs=inputs,
+            # Profiling builds plain input lists; stateful runners (TRTLLM)
+            # take their launch state from the packed call instead.
+            **runner.launch_kwargs_for(inputs),
         )
     return tactic
 
@@ -488,19 +603,25 @@ def _measure_runner(
     *,
     input_quantizer=None,
     bf16_input=None,
+    hidden_index: int = 1,
 ):
-    runner.forward(inputs, tactic=tactic, do_preparation=True)
+    # Rebuilt input lists below drop the packed call's launch state.
+    launch_kwargs = runner.launch_kwargs_for(inputs)
+    runner.forward(inputs, tactic=tactic, do_preparation=True, **launch_kwargs)
     torch.cuda.synchronize()
 
     def run(*profile_inputs):
         if input_quantizer is None:
             packed = list(profile_inputs)
         else:
-            # CUTLASS FP8 takes prequantized input. Include its public BF16
-            # conversion in the timed graph to match cuTile's API boundary.
+            # Prequantized input: include its public BF16 conversion in the
+            # timed graph to match cuTile's API boundary.
             packed = list(profile_inputs[1:])
-            packed[1], packed[-1] = input_quantizer(profile_inputs[0])
-        return runner.forward(packed, tactic=tactic)
+            quantized, scale = input_quantizer(profile_inputs[0])
+            packed[hidden_index] = quantized
+            if scale is not None:  # per-tensor FP8 keeps its scale in the view
+                packed[-1] = scale
+        return runner.forward(packed, tactic=tactic, **launch_kwargs)
 
     profile_inputs = tuple(inputs) if input_quantizer is None else (bf16_input, *inputs)
     output = run(*profile_inputs).detach().clone()
@@ -517,6 +638,27 @@ def _measure_runner(
         input_args=profile_inputs,
     )
     return output, float(np.median(times)), float(np.std(times))
+
+
+def _print_gpu_telemetry(label: str) -> None:
+    print(f"TELEMETRY {label}")
+    commands = (
+        (
+            "nvidia-smi",
+            "--query-gpu=pstate,clocks.sm,clocks.mem,power.draw,power.limit,temperature.gpu,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ),
+        ("nvidia-smi", "-q", "-d", "PERFORMANCE"),
+    )
+    for command in commands:
+        output = subprocess.run(
+            command, check=True, capture_output=True, text=True
+        ).stdout
+        if command[1] == "-q":
+            begin = output.index("    Clocks Event Reasons")
+            end = output.index("    Sparse Operation Mode", begin)
+            output = output[begin:end]
+        print(output.rstrip())
 
 
 def run_unified_moe_test(args):
@@ -541,6 +683,10 @@ def run_unified_moe_test(args):
             f"unified_moe supports activations [{supported}], got "
             f"{args.activation_type.name}"
         ) from None
+    if args.swiglu_limit is not None:
+        if not isinstance(activation, SwiGLU):
+            raise ValueError("--swiglu-limit is valid only with SwiGLU")
+        activation = SwiGLU(limit=args.swiglu_limit)
 
     activations, w1, w2 = _canonical_inputs(args, activation, device)
     reference = (
@@ -550,7 +696,48 @@ def run_unified_moe_test(args):
     arch = major * 10 + minor
     assert activations.topk_ids is not None
     active_experts = int(activations.topk_ids.unique().numel())
+    fp8_static_scales = _fp8_per_tensor_static_scales(activations.hidden_states_q)
+    nvfp4_source = None
+    nvfp4_mma_source = None
+    if args.quant_variant == "nvfp4":
+        from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+        w1_q, w1_scale, w1_global = _quantize_cutile_nvfp4_source(w1)
+        w2_q, w2_scale, w2_global = _quantize_cutile_nvfp4_source(w2)
+        nvfp4_source = (
+            w1_q,
+            w1_scale,
+            w1_global,
+            w2_q,
+            w2_scale,
+            w2_global,
+        )
+        w1_scale = _swizzle_cutile_fp4_scales(w1_scale, scale_block_size=16)
+        w2_scale = _swizzle_cutile_fp4_scales(w2_scale, scale_block_size=16)
+        nvfp4_mma_source = (
+            w1_q,
+            w1_scale,
+            convert_sf_to_mma_layout(
+                w1_scale,
+                m=w1.shape[1],
+                k=w1.shape[2],
+                num_groups=args.num_experts,
+                sf_vec_size=16,
+            ),
+            w1_global,
+            w2_q,
+            w2_scale,
+            convert_sf_to_mma_layout(
+                w2_scale,
+                m=w2.shape[1],
+                k=w2.shape[2],
+                num_groups=args.num_experts,
+                sf_vec_size=16,
+            ),
+            w2_global,
+        )
     results = []
+    outputs = {}
 
     for backend in args.backends:
         config_type = _BACKEND_CONFIGS.get((args.quant_variant, backend))
@@ -568,17 +755,33 @@ def run_unified_moe_test(args):
             continue
 
         backend_config = config_type()
-        config = _config_for_backend(args, activation, backend_config)
+        backend_activation = activation
+        b12x_swiglu_override = (
+            backend == "b12x"
+            and isinstance(activation, SwiGLU)
+            and activation.limit != SwiGLU().limit
+        )
+        if b12x_swiglu_override:
+            backend_activation = SwiGLU()
+        config = _config_for_backend(args, backend_activation, backend_config)
         try:
             backend_activations = activations
-            if config_type is CutlassNvfp4Config:
-                # CUTLASS NVFP4 consumes the TRT-LLM canonical pre-quantized
-                # pack; b12x / cuTile NVFP4 quantize BF16 in-kernel. Inside the
-                # guard so an unaligned hidden_size skips this backend like any
-                # other unsupported configuration.
-                x_q, x_sf = CutlassNvfp4Config.prepare_activations(
-                    activations.hidden_states_q
+            prepare_activations = getattr(config_type, "prepare_activations", None)
+            if config_type in _STATIC_FP8_PER_TENSOR:
+                prepare_activations = functools.partial(
+                    prepare_activations,
+                    hidden_states_scale_global=fp8_static_scales[
+                        "hidden_states_scale_global"
+                    ],
                 )
+            if config_type in _QUANT_AWARE_PREPARERS:
+                prepare_activations = functools.partial(
+                    prepare_activations, quant=config.quant
+                )
+            if config_type in _PREQUANTIZED_ACTIVATIONS:
+                # Inside the guard so an unaligned hidden_size skips this
+                # backend like any other unsupported configuration.
+                x_q, x_sf = prepare_activations(activations.hidden_states_q)
                 backend_activations = MoEActivationPack(
                     hidden_states_q=x_q,
                     hidden_states_scale=x_sf,
@@ -593,15 +796,18 @@ def run_unified_moe_test(args):
                 config_type,
                 w1,
                 w2,
-                activation,
+                backend_activation,
                 args,
                 device,
+                fp8_static_scales,
+                nvfp4_source,
+                nvfp4_mma_source,
             )
             weights = MoEWeightPack()
             weights.prepare_for(runner.backend_key, view)
             input_quantizer = None
-            if backend == "cutlass" and args.quant_variant in ("fp8", "mxfp4_w4a8"):
-                input_quantizer = config_type.prepare_activations
+            if config_type in _TIMED_INPUT_QUANTIZATION:
+                input_quantizer = prepare_activations
                 quantized, scale = input_quantizer(activations.hidden_states_q)
                 backend_activations = MoEActivationPack(
                     hidden_states_q=quantized,
@@ -610,9 +816,24 @@ def run_unified_moe_test(args):
                     topk_weights=activations.topk_weights,
                 )
             inputs = runner.pack_inputs(backend_activations, weights)
+            if b12x_swiglu_override:
+                _set_b12x_benchmark_swiglu(runner, activation, args, device)
+            hidden_index = 1
+            if input_quantizer is not None:
+                # The packed slot the timed input conversion rewrites.
+                hidden_index = next(
+                    i
+                    for i, tensor in enumerate(inputs)
+                    if tensor is backend_activations.hidden_states_q
+                )
             # Like mm_fp4, execute the fallback once to reject configurations
             # that pass the coarse architecture check but fail at runtime.
-            runner.forward(inputs, tactic=-1, do_preparation=True)
+            runner.forward(
+                inputs,
+                tactic=-1,
+                do_preparation=True,
+                **runner.launch_kwargs_for(inputs),
+            )
             torch.cuda.synchronize()
         except (NotImplementedError, RuntimeError, TypeError, ValueError) as error:
             print(
@@ -628,6 +849,8 @@ def run_unified_moe_test(args):
             _, prequantized_median, prequantized_std = _measure_runner(
                 args, runner, inputs, tactic
             )
+        if args.capture_telemetry:
+            _print_gpu_telemetry(f"{backend} before")
         output, median_time, std_time = _measure_runner(
             args,
             runner,
@@ -635,10 +858,15 @@ def run_unified_moe_test(args):
             tactic,
             input_quantizer=input_quantizer,
             bf16_input=activations.hidden_states_q,
+            hidden_index=hidden_index,
         )
+        if args.capture_telemetry:
+            _print_gpu_telemetry(f"{backend} after")
+        outputs[backend] = output
         backend_label = f"{backend}_autotune" if args.autotune else backend
 
         refcheck_passed: bool | str = ""
+        relative_l2: float | str = ""
         if reference is not None:
             # Quantized modes are compared with the original BF16 weights, so
             # their tolerance includes the expected FP4 weight error.
@@ -651,6 +879,13 @@ def run_unified_moe_test(args):
                 print(f"[ERROR] {runner.backend_key} failed the shared reference check")
                 if not args.allow_output_mismatch:
                     raise
+            relative_l2 = float(
+                (
+                    (output.float() - reference.float()).norm()
+                    / reference.float().norm().clamp_min(1e-12)
+                ).item()
+            )
+            print(f"[PRECISION] {backend_label}:: relative_l2 {relative_l2:.8e}")
 
         tflops = calculate_moe_tflops(
             args.num_tokens,
@@ -678,9 +913,11 @@ def run_unified_moe_test(args):
             median_time,
             torch.bfloat16,
             weight_dtype,
-            # CUTLASS NVFP4 reads a pre-quantized FP4 + E4M3-scale pack; the
-            # other NVFP4 backends read BF16 and quantize in-kernel.
-            input_format="nvfp4" if config_type is CutlassNvfp4Config else None,
+            # Pre-quantized packs are read in their quantized format; the
+            # other backends read BF16.
+            input_format=(
+                weight_format if config_type in _PREQUANTIZED_ACTIVATIONS else None
+            ),
             weight_format=weight_format,
             routing_logits_dtype=None,
             active_experts=active_experts,
@@ -703,20 +940,40 @@ def run_unified_moe_test(args):
             intermediate_size=args.intermediate_size,
             num_experts=args.num_experts,
             top_k=args.top_k,
+            routed_scaling_factor=args.routed_scaling_factor,
             routing_method="precomputed",
             input_dtype=args.input_dtype,
             weight_dtype=weight_format or "bfloat16",
             activation_type=activation.type.name,
+            swiglu_limit=(activation.limit if isinstance(activation, SwiGLU) else ""),
             quant_variant=args.quant_variant,
             autotune=args.autotune,
             tactic=repr(tuple(tactic) if isinstance(tactic, (tuple, list)) else tactic),
             refcheck_passed=refcheck_passed,
+            relative_l2=relative_l2,
+            runner_backend_key=runner.backend_key,
+            capture_telemetry=args.capture_telemetry,
             fp4_mode=weight_format or "",
             cold_l2_cache=True,
             prequantized_median_time=prequantized_median,
             prequantized_std_time=prequantized_std,
         )
         results.append(current)
+
+    if "sm12x" in outputs and "b12x" in outputs:
+        pairwise_relative_l2 = float(
+            (
+                (outputs["sm12x"].float() - outputs["b12x"].float()).norm()
+                / outputs["b12x"].float().norm().clamp_min(1e-12)
+            ).item()
+        )
+        print(
+            "[PRECISION] sm12x_vs_b12x:: pairwise_relative_l2 "
+            f"{pairwise_relative_l2:.8e}"
+        )
+        for current in results:
+            if current["resolved_backend"] in ("sm12x", "b12x"):
+                current["pairwise_relative_l2"] = pairwise_relative_l2
 
     if not results:
         print("[ERROR] No unified MoE backends passed runtime validation.")
