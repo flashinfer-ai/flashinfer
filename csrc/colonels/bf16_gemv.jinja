@@ -1,0 +1,25 @@
+#include "flashinfer/colonels/fused_moe_bf16_up_down_acc_gemv.cuh"
+{% include "binding.jinja" %}
+launch_fused_moe_kernel_up_down_acc_gemv<
+        {{ config.BN }},
+        {{ config.WN }},
+        {{ config.Z_SPLIT }},
+        moe_activation::Kind::{{ config.ACTIVATION }}
+    >(
+        x,
+        w,
+        w2,
+        out,
+        topk_ids,
+        topk_weights,
+        top_k,
+        M,
+        N,
+        K,
+        num_experts,
+        scaling_factor,
+        moe_activation::make_params<moe_activation::Kind::{{ config.ACTIVATION }}>(activation_params),
+        stream
+    );
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, run);

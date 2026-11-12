@@ -25,6 +25,7 @@ configuration.  They group related tensors for ergonomics (no more counting
 
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 from collections.abc import Mapping
 import math
@@ -35,6 +36,8 @@ from typing import Any, ClassVar, Dict, Literal, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
+
+from .backends.colonels.tactics import ColonelsTactic
 
 from ..tllm_enums import (
     DEFAULT_POWLU_M,
@@ -375,6 +378,21 @@ class GeGLU(ActivationConfig):
 @dataclass(frozen=True)
 class ReLU2(ActivationConfig):
     type: ClassVar[ActivationType] = ActivationType.Relu2
+
+
+@dataclass(frozen=True)
+class ClampedReLU2(ActivationConfig):
+    """Squared soft-clamped ReLU: ``(limit * tanh(relu(x) / limit)) ** 2``."""
+
+    type: ClassVar[ActivationType] = ActivationType.ClampedRelu2
+    limit: float = 0.5
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _validate_finite("limit", self.limit, positive=True)
+        value = ctypes.c_float(self.limit).value
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("limit must be positive and finite in float32")
 
 
 @dataclass(frozen=True)
@@ -3279,8 +3297,101 @@ class FrostLowLatencyConfig:
         )
 
 
+@dataclass(frozen=True)
+class ColonelsBf16Config:
+    """Colonels fused BF16 MoE on SM90/SM103.
+
+    Empty ``tactics`` uses a bounded search across kernel families. Pass entries
+    from ``get_colonels_tactics(..., exhaustive=True)`` for a custom search.
+    """
+
+    tactics: Tuple[ColonelsTactic, ...] = ()
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (90, 103)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tactics, tuple) or any(
+            not isinstance(t, ColonelsTactic) for t in self.tactics
+        ):
+            raise TypeError("tactics must be a tuple of ColonelsTactic values")
+
+    @staticmethod
+    def prepare_weights(
+        w1,
+        w2,
+        *,
+        num_local_experts,
+        hidden_size,
+        intermediate_size,
+        activation=None,
+        device=None,
+        expert_map=None,
+    ):
+        from .backends.colonels.prepare import prepare_weights
+
+        return prepare_weights(
+            w1,
+            w2,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+            expert_map=expert_map,
+        )
+
+
+@dataclass(frozen=True)
+class ColonelsFp8BlockConfig(ColonelsBf16Config):
+    """Hopper E4M3 W8A8, K128 activation and 128x128 weight scales."""
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch == 90
+
+    @staticmethod
+    def prepare_weights(
+        w1,
+        w2,
+        *,
+        num_local_experts,
+        hidden_size,
+        intermediate_size,
+        activation=None,
+        device=None,
+        w1_scale=None,
+        w2_scale=None,
+        expert_map=None,
+    ):
+        from .backends.colonels.prepare import prepare_weights
+
+        return prepare_weights(
+            w1,
+            w2,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+            fp8=True,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            expert_map=expert_map,
+        )
+
+    @staticmethod
+    def prepare_activations(x):
+        from .backends.colonels.prepare import prepare_activations
+
+        return prepare_activations(x)
+
+
 # Union type for backend config
 BackendConfigType = Union[
+    ColonelsBf16Config,
+    ColonelsFp8BlockConfig,
     FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
@@ -3326,6 +3437,8 @@ BackendConfigType = Union[
 ]
 
 ALL_BACKEND_CONFIGS = (
+    ColonelsBf16Config,
+    ColonelsFp8BlockConfig,
     FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
@@ -3480,6 +3593,11 @@ class MoEConfig:
     def _validate_fused_shared_experts(self) -> None:
         s = self.experts.num_fused_shared_experts
         if s == 0:
+            return
+
+        if self.backend.candidates and all(
+            isinstance(b, ColonelsBf16Config) for b in self.backend
+        ):
             return
 
         # Only DeepSeekV3 routing emits shared-expert slots.

@@ -18,7 +18,12 @@ import importlib
 import warnings
 
 # Unified MoE API
-from .api import (  # noqa: F401
+from .backends.colonels.tactics import get_colonels_tactics as get_colonels_tactics
+from .api import (
+    ColonelsBf16Config,
+    ColonelsFp8BlockConfig,
+    ColonelsTactic,
+    ClampedReLU2,  # noqa: F401
     # Typed activation values
     ActivationConfig,
     GELU,
@@ -324,6 +329,11 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "ColonelsBf16Config",
+    "ColonelsFp8BlockConfig",
+    "ColonelsTactic",
+    "ClampedReLU2",
+    "get_colonels_tactics",
     "alphamoe_fp8_block_scale_aligned_moe",
     "alphamoe_interleave_gated_weights",
     # Typed activation values

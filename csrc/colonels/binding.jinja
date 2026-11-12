@@ -1,0 +1,117 @@
+#include "tvm_ffi_utils.h"
+#include "flashinfer/colonels/fused_moe_activation.h"
+#include <climits>
+
+using tvm::ffi::Optional;
+using tvm::ffi::TensorView;
+
+bool run(TensorView input, TensorView w1, TensorView w2_tensor,
+         TensorView sorted, TensorView experts, TensorView padded_count,
+         TensorView weights, TensorView output,
+         Optional<TensorView> input_scale, Optional<TensorView> weight_scale,
+         Optional<TensorView> down_scale, Optional<TensorView> scratch,
+         Optional<TensorView> completion,
+         int64_t topk, int64_t pipeline_stages, double scale, double clamp,
+         bool cluster_fallback, int64_t stream_ptr) {
+  for (auto tensor : {input, w1, w2_tensor, sorted, experts, padded_count, weights, output}) {
+    CHECK_INPUT(tensor);
+    TVM_FFI_ICHECK_EQ(tensor.device().device_id, input.device().device_id);
+    TVM_FFI_ICHECK_LE(tensor.numel(), INT_MAX);
+  }
+  for (auto tensor : {input, w1, w2_tensor, output}) {
+    TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16, 0);
+  }
+  for (auto optional : {input_scale, weight_scale, down_scale, scratch, completion}) {
+    if (optional.has_value()) {
+      CHECK_INPUT(optional.value());
+      TVM_FFI_ICHECK_EQ(optional.value().device().device_id, input.device().device_id);
+    }
+  }
+  TVM_FFI_ICHECK_EQ(input.ndim(), 2);
+  TVM_FFI_ICHECK_EQ(w1.ndim(), 3);
+  TVM_FFI_ICHECK_EQ(w2_tensor.ndim(), 3);
+  TVM_FFI_ICHECK_EQ(output.dtype(), dl_bfloat16);
+  TVM_FFI_ICHECK_EQ(sorted.dtype(), dl_int32);
+  TVM_FFI_ICHECK_EQ(experts.dtype(), dl_int32);
+  TVM_FFI_ICHECK_EQ(padded_count.dtype(), dl_int32);
+  TVM_FFI_ICHECK_EQ(weights.dtype(), dl_float32);
+  TVM_FFI_ICHECK_EQ(padded_count.numel(), 1);
+  TVM_FFI_ICHECK_GT(topk, 0);
+  TVM_FFI_ICHECK_LE(topk, INT_MAX);
+  int M = input.size(0), K = input.size(1), N = w1.size(1), num_experts = w1.size(0);
+  int top_k = topk, stages = pipeline_stages, sorted_num = sorted.numel();
+  int block_m = {{ config.BM }};
+  TVM_FFI_ICHECK_GT(M, 0);
+  TVM_FFI_ICHECK_EQ(w1.size(2), K);
+  TVM_FFI_ICHECK_EQ(w2_tensor.size(0), num_experts);
+  TVM_FFI_ICHECK_EQ(w2_tensor.size(1), K);
+  TVM_FFI_ICHECK_EQ(w2_tensor.size(2), N / {{ ratio }});
+  TVM_FFI_ICHECK_EQ(output.ndim(), 2);
+  TVM_FFI_ICHECK_EQ(output.size(0), M);
+  TVM_FFI_ICHECK_EQ(output.size(1), K);
+  TVM_FFI_ICHECK_EQ(weights.numel(), int64_t(M) * top_k);
+  TVM_FFI_ICHECK_GT(K, 0);
+  TVM_FFI_ICHECK_GT(N, 0);
+  TVM_FFI_ICHECK_GT(num_experts, 0);
+  TVM_FFI_ICHECK_EQ(K % 128, 0);
+  TVM_FFI_ICHECK_EQ(N % {{ 16 if variant == "bf16_gemv" else 128 }}, 0);
+  {% if variant == 'bf16_gemv' %}
+  TVM_FFI_ICHECK_EQ(sorted.numel(), int64_t(M) * top_k);
+  {% else %}
+  TVM_FFI_ICHECK_GT(sorted.numel(), 0);
+  TVM_FFI_ICHECK_EQ(sorted.numel() % block_m, 0);
+  TVM_FFI_ICHECK_GE(experts.numel(), sorted.numel() / block_m);
+  {% endif %}
+  {% if fp8 %}
+  TVM_FFI_ICHECK_EQ(input.dtype(), dl_float8_e4m3fn);
+  TVM_FFI_ICHECK(input_scale.has_value() && weight_scale.has_value() && down_scale.has_value());
+  TVM_FFI_ICHECK_EQ(input_scale.value().dtype(), dl_float32);
+  TVM_FFI_ICHECK_EQ(weight_scale.value().dtype(), dl_float32);
+  TVM_FFI_ICHECK_EQ(down_scale.value().dtype(), dl_float32);
+  TVM_FFI_ICHECK_EQ(input_scale.value().numel(), int64_t(M) * (K / 128));
+  TVM_FFI_ICHECK_EQ(weight_scale.value().numel(), int64_t(num_experts) * (N / 128) * (K / 128));
+  TVM_FFI_ICHECK_EQ(down_scale.value().numel(), int64_t(num_experts) * (K / 128) * (N / 256));
+  using Input = __nv_fp8_e4m3;
+  const float* x_scale = static_cast<float*>(input_scale.value().data_ptr());
+  const float* w_scale = static_cast<float*>(weight_scale.value().data_ptr());
+  const float* w2_scale = static_cast<float*>(down_scale.value().data_ptr());
+  {% else %}
+  TVM_FFI_ICHECK_EQ(input.dtype(), dl_bfloat16);
+  using Input = __nv_bfloat16;
+  {% endif %}
+  TVM_FFI_ICHECK_EQ(w1.dtype(), input.dtype());
+  TVM_FFI_ICHECK_EQ(w2_tensor.dtype(), input.dtype());
+  auto x = static_cast<Input*>(input.data_ptr());
+  auto w = static_cast<Input*>(w1.data_ptr());
+  auto w2 = static_cast<Input*>(w2_tensor.data_ptr());
+  auto out = static_cast<__nv_bfloat16*>(output.data_ptr());
+  auto sorted_token_ids = static_cast<int*>(sorted.data_ptr());
+  auto topk_ids = sorted_token_ids;
+  auto expert_ids = static_cast<int*>(experts.data_ptr());
+  auto num_tokens_post_padded = static_cast<int*>(padded_count.data_ptr());
+  auto topk_weights = static_cast<float*>(weights.data_ptr());
+  auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  float scaling_factor = scale;
+  moe_activation::ParamDict activation_params;
+  {% if config.ACTIVATION == 'RELU_CLAMP_SQ' %}
+  activation_params.emplace("clamp", clamp);
+  {% endif %}
+  int* experts_done = nullptr;
+  if (completion.has_value()) {
+    TVM_FFI_ICHECK({{ 'true' if completion_supported else 'false' }}) << "Completion flags require Hopper persistent kernels";
+    TVM_FFI_ICHECK_EQ(completion.value().dtype(), dl_int32);
+    const int split_k = std::max(1, N / {{ config.BN * config.WN or 1 }});
+    TVM_FFI_ICHECK_GE(completion.value().numel(), int64_t(M) * top_k * split_k + 1);
+    experts_done = static_cast<int*>(completion.value().data_ptr());
+  }
+  __nv_bfloat16* scratchpad = nullptr;
+  {% if gmem %}
+  TVM_FFI_ICHECK(scratch.has_value());
+  TVM_FFI_ICHECK_EQ(scratch.value().dtype(), dl_bfloat16);
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(scratch.value().data_ptr()) % 16, 0);
+  int sms;
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, input.device().device_id);
+  TVM_FFI_ICHECK_GE(scratch.value().numel(), int64_t(sms) * std::min(block_m, 128) * (N / {{ ratio }}));
+  scratchpad = static_cast<__nv_bfloat16*>(scratch.value().data_ptr());
+  {% endif %}
+  return

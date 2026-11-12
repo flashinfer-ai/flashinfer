@@ -892,6 +892,8 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cake_stepfun` | `CakeStepFunConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLUStep` |
 | `cake_stepfun` | `CakeStepFunConfig` | `MXFP8×MXFP8` | `SwiGLUStep` |
 | `cake_stepfun` | `CakeStepFunConfig` | `NVFP4×NVFP4` | `SwiGLUStep` |
+| `colonels_bf16` | `ColonelsBf16Config` | `BF16×BF16` | `SwiGLU`, `ReLU2`, `ClampedReLU2` |
+| `colonels_fp8_block` | `ColonelsFp8BlockConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `cudnn_frost_bf16` | `CudnnFrostBf16Config` | `BF16×BF16` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_frost_mxfp8` | `CudnnFrostMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_frost_mxfp8_mxfp4` | `CudnnFrostMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
@@ -1245,3 +1247,16 @@ All sixteen FMA choices remain available; other shapes and custom parameters
 retain FMA. No new public configuration or cross-backend auto-dispatch rule is
 introduced. See [the Frost guide](../frost_low_latency_moe.md#grouped-deepseek-block-fp8-on-sm90-and-sm120)
 for numerical boundaries and a full routed-expert GPU-time reproducer.
+
+
+## Colonels backend contribution
+
+`ColonelsBf16Config` and `ColonelsFp8BlockConfig` use the as-built activation/weight
+pack API, runner capability checks, and two-stage autotuner. Their self-contained
+CUDA sources use the normal NVCC JIT/AOT path. FlashInfer's `moe_sort` supplies
+expert-aligned routes; no vLLM sorting dependency is required. The BF16 runner
+also introduces the typed `ClampedReLU2(limit)` activation.
+
+See [the backend guide](../../flashinfer/fused_moe/backends/colonels/README.md) for
+the SM90/SM103 feature matrix, weight layouts, FP8 preparation, expert maps,
+shared experts, graph warmup, and the direct buffer/completion interface.

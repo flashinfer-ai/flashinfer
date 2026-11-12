@@ -1,0 +1,35 @@
+#include "flashinfer/colonels/fused_moe_bf16_up_down_acc_sm100_gmem_persistent.cuh"
+{% include "binding.jinja" %}
+moe_sm100_gmem_persistent::dispatch_stages<
+        {{ config.BM }},
+        {{ config.CLUSTERS }},
+        {{ config.RED_STORE }},
+        moe_activation::Kind::{{ config.ACTIVATION }},
+        {{ config.WEIGHT_EVICTION }},
+        {{ config.EPILOGUE_WARPS }},
+        {{ config.PRODUCER_WARPS }}
+    >(
+        stages,
+        x,
+        w,
+        w2,
+        out,
+        scratchpad,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        top_k,
+        M,
+        N,
+        K,
+        num_experts,
+        sorted_num,
+        block_m,
+        scaling_factor,
+        moe_activation::make_params<moe_activation::Kind::{{ config.ACTIVATION }}>(activation_params),
+        stream,
+        cluster_fallback
+    );
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, run);

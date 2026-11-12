@@ -1,5 +1,3 @@
-"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, b12x, SM12x, cuDNN grouped-GEMM, TRTLLM and CuTe-DSL MoE runners."""
-
 from __future__ import annotations
 
 import argparse
@@ -19,6 +17,9 @@ from flashinfer.fused_moe import (
     BackendOptions,
     B12xNvfp4Config,
     B12xW4A16Config,
+    ClampedReLU2,
+    ColonelsBf16Config,
+    ColonelsFp8BlockConfig,
     CudnnGroupedGemmBf16Config,
     CudnnGroupedGemmFp8PerTensorConfig,
     CudnnGroupedGemmMxfp8Config,
@@ -88,6 +89,7 @@ _BACKEND_CONFIGS = {
     ("bf16", "cutlass"): CutlassBf16Config,
     ("bf16", "cutile"): CuTileBf16Config,
     ("bf16", "cudnn"): CudnnGroupedGemmBf16Config,
+    ("bf16", "colonels"): ColonelsBf16Config,
     ("nvfp4", "cutlass"): CutlassNvfp4Config,
     ("nvfp4", "cutile"): CuTileNvfp4Config,
     ("nvfp4", "b12x"): B12xNvfp4Config,
@@ -102,6 +104,8 @@ _BACKEND_CONFIGS = {
     ("fp8", "cutile"): CuTileFp8PerTensorConfig,
     ("fp8", "cutlass"): CutlassFp8PerTensorConfig,
     ("fp8", "cudnn"): CudnnGroupedGemmFp8PerTensorConfig,
+    ("deepseek_fp8", "colonels"): ColonelsFp8BlockConfig,
+    ("deepseek_fp8", "trtllm"): TrtllmFp8BlockConfig,
     ("fp8_w8a16", "cutile"): CuTileFp8PerTensorBf16Config,
     ("mxfp8", "cutile"): CuTileMxfp8Config,
     ("mxfp8", "cutlass"): CutlassMxfp8Config,
@@ -118,6 +122,7 @@ _BACKEND_CONFIGS = {
 # backends read BF16 and quantize in-kernel, or (_TIMED_INPUT_QUANTIZATION)
 # quantize inside the timed region through ``input_quantizer``.
 _PREQUANTIZED_ACTIVATIONS = (
+    ColonelsFp8BlockConfig,
     CutlassNvfp4Config,
     CutlassMxfp8Config,
     CudnnGroupedGemmMxfp8Config,
@@ -159,6 +164,7 @@ _ACTIVATIONS = {
     ActivationType.GegluTanh: GeGLUTanh,
     ActivationType.Situ: SiTU,
     ActivationType.Relu2: ReLU2,
+    ActivationType.ClampedRelu2: ClampedReLU2,
     ActivationType.Identity: Identity,
     ActivationType.Gelu: GELU,
     ActivationType.Relu: ReLU,
@@ -173,7 +179,16 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
     parser.add_argument(
         "--backends",
         nargs="+",
-        choices=("cutlass", "cutile", "b12x", "sm12x", "cudnn", "trtllm", "cute_dsl"),
+        choices=(
+            "cutlass",
+            "cutile",
+            "b12x",
+            "sm12x",
+            "cudnn",
+            "trtllm",
+            "cute_dsl",
+            "colonels",
+        ),
         default=["cutlass", "cutile"],
         help="Unified MoE backends to benchmark with the same inputs.",
     )
@@ -357,7 +372,7 @@ def _prepare_weight_view(
     }
     if config_type in _STATIC_FP8_PER_TENSOR:
         common.update(fp8_static_scales)
-    if quant_variant == "bf16" or backend in ("cutlass", "cudnn"):
+    if quant_variant == "bf16" or backend in ("cutlass", "cudnn", "colonels"):
         return config_type.prepare_weights(w1, w2, **common)
     if config_type in _QUANT_AWARE_PREPARERS:
         return config_type.prepare_weights(w1, w2, quant=_quant_config(args), **common)
@@ -490,6 +505,10 @@ def _reference_activation(
         values = values.float()
         if isinstance(activation, ReLU2):
             result = F.relu(values).square()
+        elif isinstance(activation, ClampedReLU2):
+            result = (
+                activation.limit * torch.tanh(F.relu(values) / activation.limit)
+            ).square()
         elif isinstance(activation, Identity):
             result = values
         elif isinstance(activation, GELU):
@@ -511,6 +530,7 @@ def _quant_config(args) -> QuantConfig:
         "mxfp4": (QuantFormat.MXFP4, QuantFormat.MXFP4),
         "mxfp4_w4a16": (QuantFormat.MXFP4, QuantFormat.BF16),
         "fp8": (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
+        "deepseek_fp8": (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
         "fp8_w8a16": (QuantFormat.FP8PerTensor, QuantFormat.BF16),
         "mxfp8": (QuantFormat.MXFP8, QuantFormat.MXFP8),
         "mxfp8_w8a16": (QuantFormat.MXFP8, QuantFormat.BF16),
@@ -768,6 +788,8 @@ def run_unified_moe_test(args):
         )
         if args.quant_variant.startswith(("fp8", "mxfp8")):
             weight_format = "mxfp8" if args.quant_variant.startswith("mxfp8") else "fp8"
+        elif args.quant_variant == "deepseek_fp8":
+            weight_format = "fp8_block_scale"
         weight_dtype = torch.uint8 if weight_format else torch.bfloat16
         tb_per_sec = calculate_moe_kernel_bandwidth(
             args.num_tokens,

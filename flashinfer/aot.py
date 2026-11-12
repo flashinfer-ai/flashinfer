@@ -223,6 +223,7 @@ from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
 from .jit.sampling import gen_sampling_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
+from .jit.colonels import gen_colonels_aot_modules
 from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
@@ -912,6 +913,10 @@ def gen_all_modules(
             jit_specs.append(gen_act_and_mul_module(act_name))
 
     if add_moe:
+        if has_sm90:
+            jit_specs.extend(gen_colonels_aot_modules(90))
+        if has_sm103a_exact:
+            jit_specs.extend(gen_colonels_aot_modules(103))
         jit_specs.append(gen_gemm_module())
         if has_sm100a_exact or has_sm103a_exact:
             jit_specs.append(gen_alphamoe_nvfp4_sm100_module())
