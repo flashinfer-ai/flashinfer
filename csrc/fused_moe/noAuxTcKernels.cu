@@ -177,11 +177,16 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
       if (laneIdx < topk) {
         smemInterTopScores[warpIdx * MaxNumTopExperts + laneIdx] = topScores[laneIdx];
         smemInterTopExperts[warpIdx * MaxNumTopExperts + laneIdx] = topExperts[laneIdx];
+      } else if (laneIdx < MaxNumTopExperts) {
+        // warp 0 reduces all MaxNumTopExperts slots of every warp: the slots past topk must not
+        // be whatever the previous kernel left in shared memory
+        smemInterTopScores[warpIdx * MaxNumTopExperts + laneIdx] = invalidScoreFloat;
+        smemInterTopExperts[warpIdx * MaxNumTopExperts + laneIdx] = MaxNumExperts - 1;
       }
     }
     __syncthreads();
     if (warpIdx == 0) {
-      int constexpr NumInterTopKPerThread = (NumInterTopK * NumExpertWarps - 1) / WARP_SIZE + 1;
+      int constexpr NumInterTopKPerThread = (NumInterTopK - 1) / WARP_SIZE + 1;
       float intermidiateScore[NumInterTopKPerThread];
       int32_t intermidiateExpert[NumInterTopKPerThread];
       for (int i = laneIdx; i < NumInterTopKPerThread * WARP_SIZE; i += WARP_SIZE) {
