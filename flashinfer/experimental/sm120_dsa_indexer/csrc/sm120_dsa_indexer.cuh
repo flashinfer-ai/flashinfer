@@ -2210,13 +2210,26 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
             reinterpret_cast<const float*>(smem + L::kWOff + qs * kBlockQ * kNumHeads * 4);
         const uint32_t* sqsf =
             reinterpret_cast<const uint32_t*>(smem + L::kQsfOff + qs * L::kQsfBytes);
-        // FP4 under the rebalance: the block's B fragments and their scales
-        // stay in registers for all its tiles instead of an ldmatrix per MMA.
-        constexpr bool kQRegs = kRebalance && kFp4;
+        // Operands every tile rereads stay in registers. FP8's head weights
+        // stay in shared memory: with its fragments held, the extra registers
+        // cost more moves than the loads they replace.
+        constexpr bool kQRegs = kRebalance && (kFp4 || kMode == Mode::kScan);
         constexpr int kQR = kQRegs ? kBlockQ : 1, kQK = kQRegs ? kKSteps : 1,
                       kQN = kQRegs ? kNTiles : 1;
         uint32_t qf[kQR][kQK][kQN][2];
         uint32_t qsf_r[kQR][kQN];
+        constexpr bool kWRegs = kFp4 && kMode == Mode::kScan && kRebalance;
+        constexpr int kWR = kWRegs ? kBlockQ : 1, kWN = kWRegs ? kNTiles : 1;
+        float wr[kWR][kWN][2];
+        if constexpr (kWRegs) {
+#pragma unroll
+          for (int qi = 0; qi < kWR; ++qi)
+#pragma unroll
+            for (int nt = 0; nt < kWN; ++nt) {
+              wr[qi][nt][0] = sw[qi * kNumHeads + nt * 8 + t4 * 2];
+              wr[qi][nt][1] = sw[qi * kNumHeads + nt * 8 + t4 * 2 + 1];
+            }
+        }
         if constexpr (kQRegs) {
 #pragma unroll
           for (int qi = 0; qi < kQR; ++qi)
@@ -2225,7 +2238,7 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
 #pragma unroll
               for (int ks = 0; ks < kQK; ++ks)
                 ldmatrix_x2(qf[qi][ks][nt], sq + b_off[ks] + (qi * kNumHeads + nt * 8) * F::kRow);
-              qsf_r[qi][nt] = sqsf[qi * kNumHeads + nt * 8 + g];
+              if constexpr (kFp4) qsf_r[qi][nt] = sqsf[qi * kNumHeads + nt * 8 + g];
             }
         }
 
@@ -2268,8 +2281,10 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
           for (int nt = 0; nt < kNTiles; ++nt) {
             const float* d = acc[nt];
             const int h0 = nt * 8 + t4 * 2;
-            const float w0 = sw[qi * kNumHeads + h0];
-            const float w1 = sw[qi * kNumHeads + h0 + 1];
+            const float w0 =
+                kWRegs ? wr[kWRegs ? qi : 0][kWRegs ? nt : 0][0] : sw[qi * kNumHeads + h0];
+            const float w1 =
+                kWRegs ? wr[kWRegs ? qi : 0][kWRegs ? nt : 0][1] : sw[qi * kNumHeads + h0 + 1];
             partial_0 = __fadd_rn(
                 partial_0, __fmaf_rn(fmaxf(d[0], 0.0f), w0, __fmul_rn(fmaxf(d[1], 0.0f), w1)));
             partial_1 = __fadd_rn(
