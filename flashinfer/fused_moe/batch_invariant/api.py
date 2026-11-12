@@ -262,11 +262,33 @@ def _grouped_out(
     return out
 
 
+_FUSED_KERNELS: Dict[str, tuple] = {}
+
+
+def _fused_kernels() -> tuple:
+    """The fused flow's kernel entries (the gather and combine getters with their warp rules, the launch's tile bound),
+    imported on first use (the package keeps its imports light: the CuTe-DSL modules load when a kernel is first needed)
+    and kept: an import statement on the launch path costs the host at every call."""
+    k = _FUSED_KERNELS.get("k")
+    if k is None:
+        from .combine import get_compiled_combine, warps_per_token
+        from .permute import get_compiled_gather, warps_per_row
+        from .schedule import launch_tile_bound
+
+        k = _FUSED_KERNELS["k"] = (
+            get_compiled_gather,
+            warps_per_row,
+            get_compiled_combine,
+            warps_per_token,
+            launch_tile_bound,
+        )
+    return k
+
+
 def launch_grid(device: torch.device, config: Knobs, Tk: int, E: int, N: int) -> int:
     """The persistent grid of a grouped launch: the device's co-resident cluster capacity for the record's cluster size,
     clipped to the launch's tile bound (a placement: which CTA computes a tile, never the bits)."""
-    from .schedule import launch_tile_bound
-
+    launch_tile_bound = _fused_kernels()[4]
     return min(persistent_clusters(device, config), launch_tile_bound(config, Tk, E, N))
 
 
@@ -346,7 +368,6 @@ def grouped_gemm_gather(
     as :func:`grouped_gemm` on the materialised permutation (the stage holds the same bytes, the fold is the same). The
     gather form belongs to the swapped records (a dense record raises)."""
     from .blocks.compile import get_compiled_swapped
-    from .schedule import launch_tile_bound
 
     if (
         x.dtype != torch.bfloat16
@@ -416,9 +437,7 @@ def grouped_gemm_gather(
     if Tk == 0:
         return out
     if grid is None:
-        grid = min(
-            persistent_clusters(x.device, config), launch_tile_bound(config, Tk, E, N)
-        )
+        grid = launch_grid(x.device, config, Tk, E, N)
     kernel(
         x,
         src,
@@ -683,8 +702,7 @@ def gather_rows(
     x_buf = torch.empty(Tk + pad, H, dtype=x.dtype, device=x.device)
     x_perm = x_buf[:Tk]
     if Tk:
-        from .permute import get_compiled_gather, warps_per_row
-
+        get_compiled_gather, warps_per_row = _fused_kernels()[:2]
         al = 16 // x.element_size()
         get_compiled_gather(k, fmt, warps_per_row(Tk, H // al, sm_count_of(x.device)))(
             x, src, x_perm, Tk, H
@@ -702,10 +720,9 @@ def combine_rows(
 ) -> None:
     """The slot-order combine of the fused flow: ``out[t] = cvt_bf16(fold_r add(acc, mul(f32(y[dest[t, r]]), w[t, r])))``
     through the shared combine kernel (``w_round``: the f32 weights enter as their bf16 rounding)."""
-    from .combine import get_compiled_combine, warps_per_token
-
     T, H = out.shape
     if T:
+        get_compiled_combine, warps_per_token = _fused_kernels()[2:4]
         get_compiled_combine(
             k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(y.device)), w_round
         )(y, dest, scales, out, T, H)

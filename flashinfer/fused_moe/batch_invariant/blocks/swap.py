@@ -38,6 +38,7 @@ launch, so every warp waits for it before the group tables.
 from __future__ import annotations
 
 import dataclasses
+import functools
 from typing import Dict, List, Tuple, Union
 
 import cuda.bindings.driver as cuda
@@ -90,16 +91,15 @@ MIN_TOKEN_TILE: Dict[str, int] = {"bf16": 8, "e4m3": 16}
 MIN_TOKEN_TILE_64 = 16
 
 
+@functools.lru_cache(maxsize=None)
 def token_tiles_of(weight_tile: int, in_fmt: str = "bf16") -> Tuple[int, ...]:
     """The token tiles a weight tile takes for an operand format: the narrow dense tiles from the format's narrowest, the
-    64-row tile from 16."""
+    64-row tile from 16 (memoised: the record predicate runs at every launch)."""
     lo = max(MIN_TOKEN_TILE[in_fmt], MIN_TOKEN_TILE_64 if weight_tile == 64 else 0)
     return tuple(t for t in TILES_N_NARROW if t >= lo)
 
 
 TOKEN_TILES = TILES_N_NARROW  # every swapped record's token tile is one of the narrow dense tiles (8, 16, 32)
-# the token tiles a weight tile takes (the bf16 classes)
-TOKEN_TILES_OF_WEIGHT = {wt: token_tiles_of(wt, "bf16") for wt in WEIGHT_TILES}
 
 
 def swap_knobs(
