@@ -58,14 +58,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_PIPE_STAGES 1
-#define SMEM_TILE_OFF 128
-#define SMEM_TILE_STAGE_BYTES 8192
-#define SMEM_TILE_STRIDE 8192
-#define SMEM_TOTAL 8320
-#define THREADS 128
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -191,12 +183,11 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     unsigned int* tile = reinterpret_cast<unsigned int*>(smem_raw + 128);
     const int tile_addr = smem + 128;
 
-    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 1 barriers)
-    // Mbarriers at smem_raw[0..8)
+    // Mbarrier init (1 barriers at smem_raw[0..8))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -223,7 +214,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
     if (warp == 0) {
         if (elect_sync()) {
             mbarrier_arrive_expect_tx(full_addr, tile_bytes);
-            cp_async_bulk_gmem2smem(tile_addr + (unsigned int)(0 * 8192), x + (global_row * (unsigned long long)K + (unsigned long long)first_block * 32), tile_bytes, full_addr);
+            cp_async_bulk_gmem2smem(tile_addr + (unsigned int)(0 * 8192), x + (global_row * (unsigned long long)K + (unsigned long long)first_block * 32ull), tile_bytes, full_addr);
         }
     }
     int _vec_load_0[1];
@@ -325,7 +316,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
             magnitudes[29] = fabsf(magnitudes[29]);
             magnitudes[30] = fabsf(magnitudes[30]);
             magnitudes[31] = fabsf(magnitudes[31]);
-            float2 _reg_reduce_max2_1 = {-CAKE_INF, -CAKE_INF};
+            float2 _reg_reduce_max2_1 = {-CUDART_INF_F, -CUDART_INF_F};
             _reg_reduce_max2_1.x = max_noftz(_reg_reduce_max2_1.x, max_noftz(magnitudes[0], magnitudes[1]));
             _reg_reduce_max2_1.y = max_noftz(_reg_reduce_max2_1.y, max_noftz(magnitudes[2], magnitudes[3]));
             _reg_reduce_max2_1.x = max_noftz(_reg_reduce_max2_1.x, max_noftz(magnitudes[4], magnitudes[5]));
@@ -351,9 +342,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
             unsigned int normal = ((exponent != 0) ? 1 : 0);
             unsigned int large_subnormal = ((mantissa > 4194304) ? 1 : 0);
             unsigned int scale_byte = ((exponent + (has_mantissa & (normal | large_subnormal))) < (254) ? (exponent + (has_mantissa & (normal | large_subnormal))) : (254));
-            unsigned int inverse_nonzero_bits = 254 - scale_byte << 23;
-            unsigned int zero_bits = 0;
-            unsigned int inverse_bits = ((scale_byte == 0) ? zero_bits : inverse_nonzero_bits);
+            unsigned int inverse_bits = 254 - scale_byte << 23;
             float inverse = 0.0f;
             inverse = reinterpret_cast<float*>(&inverse_bits)[0];
             const float2 _scale2_2 = {inverse, inverse};
@@ -438,7 +427,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
             codes[6] = ((swap_two != 0) ? half[2] : half[6]);
             codes[7] = ((swap_two != 0) ? half[3] : half[7]);
             unsigned long long task = global_row * (unsigned long long)BLOCKS_PER_ROW + (unsigned long long)block_col;
-            unsigned long long q_offset = task * 32;
+            unsigned long long q_offset = task * 32ull;
             {
                 const unsigned* _raw_stv8_19 = reinterpret_cast<const unsigned*>(codes);
                 asm volatile(
@@ -450,7 +439,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
             unsigned int k_tile = block_col / 4;
             unsigned int scale_col = block_col - k_tile * 4;
             unsigned long long tile_linear = ((unsigned long long)group * (unsigned long long)PM_TILES + (unsigned long long)m_tile) * (unsigned long long)PK_TILES + (unsigned long long)k_tile;
-            unsigned long long scale_offset = tile_linear * 512 + (unsigned long long)(row_in_tile & 31) * 16 + (unsigned long long)(row_in_tile >> 5) * 4 + (unsigned long long)scale_col;
+            unsigned long long scale_offset = tile_linear * 512ull + (unsigned long long)(row_in_tile & 31) * 16ull + (unsigned long long)(row_in_tile >> 5) * 4ull + (unsigned long long)scale_col;
             *(reinterpret_cast<unsigned char*>(scales + scale_offset) + (0)) = (unsigned char)(scale_byte);
         }
     }
