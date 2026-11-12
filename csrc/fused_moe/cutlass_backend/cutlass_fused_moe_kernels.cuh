@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1928,6 +1928,42 @@ void expandInputRowsKernelLauncher(
       fp8_expert_residual_scale, fp8_token_scale_ptr_array);
 }
 
+template <class T>
+__global__ void padEmptyFp8BlockScaleMoeInputKernel(
+    T* permuted_input, int64_t const* expert_first_token_offset,
+    int64_t* gemm_expert_first_token_offset, int num_experts_per_node, int64_t hidden_size) {
+  for (int index = threadIdx.x; index <= num_experts_per_node; index += blockDim.x) {
+    gemm_expert_first_token_offset[index] = expert_first_token_offset[index];
+  }
+
+  if (expert_first_token_offset[num_experts_per_node] != 0) {
+    return;
+  }
+
+  for (int64_t index = threadIdx.x; index < hidden_size; index += blockDim.x) {
+    permuted_input[index] = T(0);
+  }
+  __syncthreads();
+
+  // Assign the zero row to the final local expert. The all-gather/reduce-scatter
+  // finalizer ignores it because no real token selected that expert.
+  if (threadIdx.x == 0) {
+    gemm_expert_first_token_offset[num_experts_per_node] = 1;
+  }
+}
+
+template <class T>
+void padEmptyFp8BlockScaleMoeInput(T* permuted_input, int64_t const* expert_first_token_offset,
+                                   int64_t* gemm_expert_first_token_offset,
+                                   int num_experts_per_node, int64_t hidden_size,
+                                   cudaStream_t stream) {
+  constexpr int threads = 256;
+  // Normal stream ordering waits for input expansion even when it uses PDL.
+  padEmptyFp8BlockScaleMoeInputKernel<<<1, threads, 0, stream>>>(
+      permuted_input, expert_first_token_offset, gemm_expert_first_token_offset,
+      num_experts_per_node, hidden_size);
+}
+
 #define INSTANTIATE_EXPAND_INPUT_ROWS(InputActivationsType, ExpandedActivationsType)               \
   template void expandInputRowsKernelLauncher<InputActivationsType, ExpandedActivationsType>(      \
       InputActivationsType const* unpermuted_input, ExpandedActivationsType* permuted_output,      \
@@ -3074,6 +3110,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
 
   size_t const permuted_data_size = permuted_elems * dtype_size;
   size_t const expert_first_token_offset_size = (num_experts_per_node + 1) * sizeof(int64_t);
+  size_t const gemm_expert_first_token_offset_size =
+      use_deepseek_fp8_block_scale ? expert_first_token_offset_size : 0;
   size_t const permuted_token_final_scales_size =
       mayHaveFinalizeFused() ? num_moe_inputs * sizeof(float) : 0;
   size_t const glu_inter_size =
@@ -3194,6 +3232,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
   ADD(blocked_expert_counts_cumsum);
   ADD(blocked_row_to_unpermuted_row);
   ADD(expert_first_token_offset);
+  ADD(gemm_expert_first_token_offset);
   ADD(permuted_token_final_scales);
   ADD(overlapped_gemm1_gemm2_inputs);
   ADD(overlapped_gemm1_gemm2_outputs);
@@ -3278,6 +3317,7 @@ void CutlassMoeFCRunner<
   blocked_row_to_unpermuted_row_ = getWsPtr(int{}, "blocked_row_to_unpermuted_row");
 
   expert_first_token_offset_ = getWsPtr(int64_t{}, "expert_first_token_offset");
+  gemm_expert_first_token_offset_ = getWsPtr(int64_t{}, "gemm_expert_first_token_offset");
 
   // We check if the provided config uses fused finalize and disable it if it does not
   bool gemm2_using_finalize_fusion =
@@ -4431,6 +4471,18 @@ void CutlassMoeFCRunner<
         (use_w4afp8 && !use_fp8_input) ? quant_params.groupwise.fc1.act_scales : nullptr,
         fp8_token_dequant_scale, fp8_expert_residual_scale, act_fp8_token_scale_ptr_array,
         enable_pdl, stream);
+
+    int64_t* gemm_expert_first_token_offset = expert_first_token_offset_;
+    // Grouped FP8 block-scale GEMMs need at least one local row. For an empty EP
+    // rank, pad a zero row using separate GEMM offsets. Preserve routing metadata
+    // so the all-gather/reduce-scatter finalizer discards the dummy row.
+    if (use_deepseek_fp8_block_scale && parallelism_config.ep_size > 1 && !enable_alltoall) {
+      TLLM_CHECK(gemm_expert_first_token_offset_ != nullptr);
+      padEmptyFp8BlockScaleMoeInput(gemm1_input_expand, expert_first_token_offset_,
+                                    gemm_expert_first_token_offset_, num_experts_per_node,
+                                    hidden_size, stream);
+      gemm_expert_first_token_offset = gemm_expert_first_token_offset_;
+    }
     auto const* gemm1_input = gemm1_input_expand;
 
     sync_check_cuda_error(stream);
@@ -4478,7 +4530,7 @@ void CutlassMoeFCRunner<
     }
     sync_check_cuda_error(stream);
     Self::gemm1(moe_gemm_runner_, blockscale_gemm_runner, gemm1_input, gemm1_result,
-                glu_inter_result_, expert_first_token_offset_,
+                glu_inter_result_, gemm_expert_first_token_offset,
                 humming_permuted_token_selected_experts, gemm1_tma_ws_input, fc1_expert_weights,
                 fc1_expert_biases, num_valid_tokens_ptr, fc1_int_scales, fc1_fp8_dequant,
                 use_wfp4afp8 ? fc2_wfp4afp8_quant_scale : fc2_fp8_quant, act_fp8_token_scale_,
@@ -4500,7 +4552,7 @@ void CutlassMoeFCRunner<
     sync_check_cuda_error(stream);
     Self::gemm2(
         moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, gemm2_result, final_output,
-        expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases,
+        gemm_expert_first_token_offset, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases,
         fc2_int_scales, fc2_fp8_dequant, fc2_fp4_act_scale_, quant_params,
         token_topk_unpermuted_scales, permuted_token_final_scales_, unpermuted_row_to_permuted_row,
         permuted_row_to_unpermuted_row_, token_selected_experts, num_valid_tokens_ptr, num_rows,
