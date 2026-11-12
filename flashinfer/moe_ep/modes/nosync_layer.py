@@ -43,13 +43,16 @@ class NosyncOptions:
     ``max_tokens_per_rank`` (at most 128, the range where the kernel is measured faster than
     the cake and cutedsl backends) must be the same on every rank. ``transport`` and
     ``tokens_per_item`` are the nosync kernel's
-    (:class:`~flashinfer.moe_ep.Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig`). ``top_k`` and
+    (:class:`~flashinfer.moe_ep.Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig`); ``transport``
+    ``None`` (default) takes the per-pair table the configured cake backend resolved
+    (``transport_table``, including ``"auto"`` / ``"tuned"``), so both kernels move data
+    between each pair of ranks the same way; ``"p2p"`` with any other backend. ``top_k`` and
     ``swiglu_limit`` (``inf`` for unclamped SwiGLU) default to the configured backend's when it
     is the cake or cutedsl SM120 MXFP4 backend; set them for any other backend.
     """
 
     max_tokens_per_rank: int = 128
-    transport: str = "p2p"
+    transport: str | tuple[int, ...] | None = None
     tokens_per_item: int | None = None
     top_k: int | None = None
     swiglu_limit: float | None = None
@@ -162,11 +165,23 @@ class MoEEpNosyncLayer(nn.Module):
                 "kernel holds a copy of the packed weights (%.2f GiB on this rank)",
                 extra / 2**30,
             )
+        transport = options.transport
+        if transport is None:
+            transport = "p2p"
+            if kernel_name == "sm120_mxfp4_mxfp8_bf16_cake":
+                # collective, like the nosync workspace below; cake resolves its table here
+                table = self.base._ensure_workspace().transport_table
+                transport = tuple(int(c) for c in table.cells)
+                logger.info(
+                    "NosyncOptions: transport follows the cake table %s %s",
+                    table.name,
+                    transport,
+                )
         config = Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig(
             intermediate_size=intermediate,
             top_k=top_k,
             swiglu_limit=limit,
-            transport=options.transport,
+            transport=transport,
             tokens_per_item=options.tokens_per_item,
         )
         params = FleetParams(

@@ -111,7 +111,7 @@ def _fallback_config(args):
             Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig as Config,
         )
 
-        transport = os.environ.get(
+        transport = getattr(args, "cake_transport", None) or os.environ.get(
             "FLASHINFER_TEST_SM120_CAKE_TRANSPORT",
             "all_gin" if args.ep > 4 else "all_lsa",
         )
@@ -492,6 +492,28 @@ def test_sm120_nosync_auto_transport():
             capacity=256,
             tokens=[1, 20, 128, 256],
             transport="auto",
+            uneven=True,
+        )
+    )
+
+
+@pytest.mark.parametrize("cake_transport", ["all_gin", "lsa_where_reachable"])
+def test_sm120_nosync_follows_cake_table(cake_transport):
+    """transport=None: the nosync kernel takes the per-pair table the cake backend resolved
+    (GIN for every pair, or P2P where NCCL maps the pair and GIN elsewhere)."""
+    if not _NIC:
+        pytest.skip("set FLASHINFER_TEST_MEGAMOE_SM120_NIC=1 on a GIN-capable host")
+    if not _sm120_gpus(8):
+        pytest.skip("requires 8 SM120 GPUs")
+    _run(
+        _args(
+            ep=8,
+            hidden=4096,
+            intermediate=2048,
+            capacity=256,
+            tokens=[1, 20, 128, 256],
+            transport=None,
+            cake_transport=cake_transport,
             uneven=True,
         )
     )

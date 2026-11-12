@@ -282,8 +282,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--nosync-transport",
         choices=["p2p", "nic", "auto"],
-        default="p2p",
-        help="nosync: transport",
+        default=None,
+        help="nosync: transport (default: the cake table, see --transport)",
     )
     args = parser.parse_args()
     if args.cold_l2 and args.repeats != 1:

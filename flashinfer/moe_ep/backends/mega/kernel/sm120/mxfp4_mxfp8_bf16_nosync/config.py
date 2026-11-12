@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 TRANSPORTS = ("p2p", "auto", "nic")
@@ -45,8 +46,12 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig:
       peer-to-peer stores, the others (e.g. across CPU sockets where that path is slow) send
       over the NIC with NCCL GIN.
     * ``"nic"``: NCCL GIN for every other rank.
+    * a flat tuple of ``world_size * world_size`` cells in the cake backend's encoding
+      (``0`` self, ``1`` peer-to-peer, ``2`` GIN, symmetric): the transport of each pair, e.g.
+      the table the cake backend resolved for this deployment (``NosyncOptions`` passes it
+      on). Without a GIN cell it is ``"p2p"``; a peer-to-peer cell must be a pair NCCL maps.
 
-    ``"auto"`` and ``"nic"`` need NCCL 2.30.7 with the Device API and a GIN-capable network;
+    ``"auto"``, ``"nic"`` and tables with GIN cells need NCCL 2.30.7 with the Device API and a GIN-capable network;
     every rank must use the same value. Which pairs NCCL maps depends on the NICs it may use:
     with ``NCCL_IB_HCA`` naming a single NIC every pair stayed mapped on an 8x RTX 6000D host
     with ConnectX-8 PCIe switches, so ``"auto"`` sent the cross-socket pairs over P2P too;
@@ -64,14 +69,33 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig:
     top_k: int
     kernel_name: str = "sm120_mxfp4_mxfp8_bf16_nosync"
     swiglu_limit: float = 10.0
-    transport: str = "p2p"
+    transport: str | tuple[int, ...] = "p2p"
     tokens_per_item: int | None = None
     fast_math: bool = True
 
     def __post_init__(self) -> None:
-        if self.transport not in TRANSPORTS:
+        if isinstance(self.transport, (tuple, list)):
+            cells = tuple(int(c) for c in self.transport)
+            world = math.isqrt(len(cells))
+            if (
+                world * world != len(cells)
+                or any(c not in (0, 1, 2) for c in cells)
+                or any(
+                    (cells[i * world + j] == 0) != (i == j)
+                    or cells[i * world + j] != cells[j * world + i]
+                    for i in range(world)
+                    for j in range(world)
+                )
+            ):
+                raise ValueError(
+                    "a transport table is world_size * world_size cells, 0 on the diagonal "
+                    f"only, 1 (P2P) or 2 (GIN) elsewhere, symmetric; got {self.transport!r}"
+                )
+            self.transport = cells
+        elif self.transport not in TRANSPORTS:
             raise ValueError(
-                f"transport must be one of {TRANSPORTS}, got {self.transport!r}"
+                f"transport must be one of {TRANSPORTS} or a per-pair table, "
+                f"got {self.transport!r}"
             )
         if self.tokens_per_item is not None and (
             self.tokens_per_item not in TOKENS_PER_ITEM

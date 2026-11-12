@@ -29,7 +29,7 @@ layer = MoEEpLayer(
     bootstrap, fleet_params,
     PrequantizedMoEWeights(w13=..., w2=..., w13_scale=..., w2_scale=...),
     backend=MegaConfig(megakernel=Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig(...), ...),
-    nosync=NosyncOptions(),  # max_tokens_per_rank=128, transport="p2p", tokens_per_item=None
+    nosync=NosyncOptions(),  # max_tokens_per_rank=128, transport=None (cake's table), tokens_per_item=None
 )
 ```
 
@@ -121,12 +121,19 @@ work.
 
 `transport` selects how a pair of ranks reaches each other:
 
-- `"p2p"` (default): PCIe peer stores between every pair (torch symmetric memory).
+- `None` (the `NosyncOptions` default): with the cake backend configured, the
+  per-pair table cake resolved (its `transport_table`, including `"auto"` /
+  `"tuned"`), so both kernels reach each pair of ranks the same way: P2P where
+  cake uses LSA, GIN where it uses GIN; with any other backend `"p2p"`.
+- `"p2p"` (the default of `Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig`): PCIe
+  peer stores between every pair (torch symmetric memory).
 - `"auto"`: the buffer is one NCCL symmetric window; pairs NCCL maps for
   load/store use P2P, the others use NCCL GIN puts over the NIC.
 - `"nic"`: GIN for every other rank.
+- a flat tuple of `world_size * world_size` cells in cake's encoding (`0` self,
+  `1` P2P, `2` GIN, symmetric); a P2P cell must be a pair NCCL maps.
 
-`"auto"` and `"nic"` need NCCL 2.30.7 with the Device API and a GIN-capable
+`"auto"`, `"nic"` and tables with GIN cells need NCCL 2.30.7 with the Device API and a GIN-capable
 network, and every rank must use the same value. The GIN path is a separate JIT
 module per GIN backend (proxy / GDAKI / GPI) with the NCCL device code in the
 device pass only. A token goes once to each GIN rank's inbox, whatever number of
@@ -149,14 +156,14 @@ the same on both RTX 6000D hosts.
 ## Tests and benchmark
 
 ```bash
-# correctness; FLASHINFER_TEST_MEGAMOE_SM120_NIC=1 adds the GIN tests (nic at EP 2/4/8, auto at EP8),
+# correctness; FLASHINFER_TEST_MEGAMOE_SM120_NIC=1 adds the GIN tests (nic at EP 2/4/8, auto and cake's tables at EP8),
 # FLASHINFER_TEST_SM120_CUTEDSL=1 the cutedsl fallback (NVSHMEM; not on RTX 6000D)
 pytest tests/moe_ep/test_moe_ep_sm120_w4a8_nosync_mega.py
 
 # timing: one MoE layer per call, CUDA graph, cold L2, identical seeded routes across backends
 B="python benchmarks/bench_megamoe_mxfp4_sm120.py --ep 4 --shape flash --capacity 128 --tokens 1 2 8 16 32 64 128"
 C="--cold-l2 --repeats 1 --rounds 20"
-$B --backend nosync --save-routing /tmp/rt $C   # cake fallback + NosyncOptions(); EP8: add --transport all_gin
+$B --backend nosync --save-routing /tmp/rt $C   # cake fallback + NosyncOptions() (cake's table); EP8: add --transport all_gin
 $B --backend cake   --load-routing /tmp/rt $C   # EP8: --transport all_gin or lsa_where_reachable
 ```
 

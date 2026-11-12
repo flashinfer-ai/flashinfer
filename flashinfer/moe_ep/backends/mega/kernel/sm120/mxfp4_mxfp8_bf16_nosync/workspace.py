@@ -143,9 +143,17 @@ class NosyncWorkspace:
         top_k: int,
         hidden: int,
         intermediate: int,
-        transport: str,
+        transport: str | tuple[int, ...],
         fast_math: bool,
     ) -> None:
+        if isinstance(transport, tuple):  # per-pair table (config.py): 1 P2P, 2 GIN
+            if len(transport) != world_size * world_size:
+                raise ValueError(
+                    f"the transport table has {len(transport)} cells, expected "
+                    f"{world_size * world_size} for {world_size} ranks"
+                )
+            if 2 not in transport:
+                transport = "p2p"
         self.group = group
         self.rank = rank
         self.world_size = world_size
@@ -200,10 +208,12 @@ class NosyncWorkspace:
         )
         self.destroyed = False
 
-    def _init_nccl_window(self, num_bytes: int, transport: str) -> None:
+    def _init_nccl_window(
+        self, num_bytes: int, transport: str | tuple[int, ...]
+    ) -> None:
         """The buffer as one NCCL symmetric window on the group's communicator: load/store peer
-        pointers where NCCL maps a pair, NCCL GIN for the rest ("auto") or for every other rank
-        ("nic")."""
+        pointers where NCCL maps a pair, NCCL GIN for the rest ("auto"), for every other rank
+        ("nic") or for the pairs a table marks GIN."""
         group, rank, ranks = self.group, self.rank, self.world_size
         torch.distributed.barrier(
             group=group
@@ -226,7 +236,18 @@ class NosyncWorkspace:
         peers = [int(p) for p in session.megamoe_sm120_gin_session_peers(handle)]
         mask = 0
         for w in range(ranks):
-            if w != rank and (transport == "nic" or peers[w] == 0):
+            if w == rank:
+                continue
+            if isinstance(transport, tuple):
+                gin = transport[rank * ranks + w] == 2
+                if not gin and peers[w] == 0:
+                    raise RuntimeError(
+                        f"the transport table puts ranks {rank} and {w} on P2P, but NCCL does "
+                        "not map that pair for load/store"
+                    )
+            else:
+                gin = transport == "nic" or peers[w] == 0
+            if gin:
                 mask |= 1 << w
         # the kernel sends and receives over the same transport per pair: the masks must agree
         masks: list[Any] = [None] * ranks
