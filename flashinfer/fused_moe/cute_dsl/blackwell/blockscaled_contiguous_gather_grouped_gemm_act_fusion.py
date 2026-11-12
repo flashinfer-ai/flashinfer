@@ -3191,17 +3191,17 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             tCrSFC.store(tCrSFC_pvscale.load().to(self.sf_dtype))
 
                         #
-                        # Store SFC to global memory
+                        # Store SFC to global memory (guarded for the N boundary)
                         #
-                        # TODO: Need to think about predicate on it
-                        # if cute.elem_less():
-                        if cutlass.const_expr(self.is_mxfp8_output):
-                            # Preserve those raw codes with scalar byte stores;
-                            # the generic auto-vectorizer requires at least 32 bits.
-                            for vi in cutlass.range_constexpr(cute.size(tCrSFC)):
-                                tCgSFC[vi] = tCrSFC[vi]
-                        else:
-                            cute.autovec_copy(tCrSFC, tCgSFC)
+                        # SF blocks past the last column alias the next 128 rows' SFs.
+                        if sfc_subtile_idx_mn[1] < cute.size(tCgSFC_mn, mode=[4]):
+                            if cutlass.const_expr(self.is_mxfp8_output):
+                                # Preserve those raw codes with scalar byte stores;
+                                # the generic auto-vectorizer requires at least 32 bits.
+                                for vi in cutlass.range_constexpr(cute.size(tCrSFC)):
+                                    tCgSFC[vi] = tCrSFC[vi]
+                            else:
+                                cute.autovec_copy(tCrSFC, tCgSFC)
 
                         #
                         # Compute quantized output values and convert to C type
