@@ -390,7 +390,9 @@ def _append(
         short = [slot_list[i] for i, (_, w, _) in enumerate(splits) if not w]
         ep.begin(pool, torch.tensor(short, dtype=torch.int32, device=dev))
     scale_f = HEAD_DIM**-0.5 if scale is None else float(scale)
-    rows = torch.empty_like(packed[2])
+    rows = None
+    if any(head or tail for head, _, tail in splits):
+        rows = torch.empty_like(packed[2])
 
     def spans(pieces: List[Tuple[int, int]]) -> None:
         """Rows ``[start, start + n)`` of sequence ``i`` through the step kernel, written into ``rows``: one launch."""
@@ -455,8 +457,7 @@ def _append(
         rows.index_copy_(0, src, out)
         ep.begin(pool, idx32)
     elif whole:
-        # the pinned kernel over the caller's rows as they are: each sequence's whole chunks are one segment from its
-        # slot's state, its other rows are segments of their own from a zero state whose rows are replaced
+        # the caller's rows as they are: head and tail rows are zero-state segments whose rows are replaced
         cuts, real = [0], []
         for head, w, tail in splits:
             for n, is_whole in ((head, False), (w, True), (tail, False)):
@@ -493,6 +494,8 @@ def _append(
         pool.index_copy_(0, idx, final.index_select(0, seg))
         ep.begin(pool, idx.to(torch.int32))
     spans([(offs[i] + head + w, tail) for i, (head, w, tail) in enumerate(splits)])
+    if rows is None:
+        raise RuntimeError("an append call without rows")
     return rows
 
 
@@ -538,7 +541,8 @@ def recurrent_kda_batch_invariant_extend(
     bf16 ``[N, T, HV, 128]`` rows; row ``t`` of a sequence at position ``p`` is row ``p + t`` of its prefill. Fewer
     than 32 rows per sequence are one launch of the step kernel, which reads the open-row counts on the device and
     commits the chunks it completes; longer calls read the counts on the host and run their whole chunks through the
-    prefill kernel."""
+    prefill kernel. Caller-given slots are read back and checked, so only a call on the default slots can be
+    captured in a CUDA graph; as in a decode step, the heads of a slot are taken to hold one count."""
     H, HV = _check_inputs(q, k, v, g, beta)
     _check_params(A_log, dt_bias, lower_bound, HV)
     check_device(q.device, CLASS, KDA_ARCHS)

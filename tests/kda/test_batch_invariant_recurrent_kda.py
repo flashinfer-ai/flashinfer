@@ -27,7 +27,7 @@ needs_device = pytest.mark.skipif(
     not torch.cuda.is_available()
     or not bi.is_supported_device(torch.device("cuda"), KDA_ARCHS)
     or not kda_prefill_cute._is_cute_dsl_kda_runtime_available(),
-    reason="needs a CUDA device of SM100 / SM103 with the CuTe DSL KDA prefill",
+    reason="needs a CUDA device of SM100 / SM103 / SM107 with the CuTe DSL KDA prefill",
 )
 
 D = 128
@@ -498,6 +498,7 @@ def test_multi_token_steps_equal_one_shot(h, T):
     )
     ids = torch.tensor(slots, dtype=torch.int32, device="cuda")
     pos = list(n0)
+    outs = []
     for _ in range(2):
         stack = lambda key: torch.stack(
             [s[key][q0 : q0 + T] for s, q0 in zip(seqs, pos, strict=True)], 0
@@ -518,22 +519,25 @@ def test_multi_token_steps_equal_one_shot(h, T):
             assert torch.equal(out[i], ref[pos[i] : pos[i] + T]), (
                 f"request {i} at {pos[i]}"
             )
+        outs.append(out)
         pos = [q0 + T for q0 in pos]
         rows = bi_decode(tokens(seqs, pos), pool, slots, p)
         for i, ref in enumerate(refs):
             assert torch.equal(rows[i], ref[pos[i]]), f"request {i} decode at {pos[i]}"
         pos = [q0 + 1 for q0 in pos]
+    _check_hash(f"extend_T{T}_h{h}", torch.cat(outs, 0))
 
 
 @needs_device
-def test_multi_token_step_replayed_as_a_graph():
+@pytest.mark.parametrize("T", [3, 20])
+def test_multi_token_step_replayed_as_a_graph(T):
     """A multi-token step on the default slots reads nothing on the host: captured once, replayed across chunk
-    boundaries, its rows are the one-shot prefill's."""
+    boundaries (20 rows commit one or two chunks per launch), its rows are the one-shot prefill's."""
     from flashinfer.batch_invariant.kda.api import recurrent_kda_batch_invariant_extend
 
-    h, T = 16, 3
+    h = 16
     p = params(h)
-    seqs = [make_seq(120, h, SEED + 700 + i, GATES["long"]) for i in range(3)]
+    seqs = [make_seq(30 + 12 * T, h, SEED + 700 + i, GATES["long"]) for i in range(3)]
     n0 = [5, 16, 30]
     refs = [one_shot(s, p)[0] for s in seqs]
     pool = new_pool(seqs, [0, 1, 2])
@@ -687,6 +691,31 @@ def test_prefill_refuses_bad_slots(slots):
     pool = torch.zeros(4, h, D, D, device="cuda")
     with pytest.raises(BatchInvariantUnsupportedError, match="slot"):
         bi_prefill(seqs, pool, slots, p)
+
+
+@needs_device
+@pytest.mark.parametrize("slots", [[0, 0], [0, 7], [-1, 0]])
+def test_multi_token_step_refuses_bad_slots(slots):
+    from flashinfer.batch_invariant.kda.api import recurrent_kda_batch_invariant_extend
+
+    h, T = 16, 4
+    p = params(h)
+    seqs = [make_seq(T, h, SEED + 90 + i, GATES["steep"]) for i in range(2)]
+    pool = torch.zeros(4, h, D, D, device="cuda")
+    stack = lambda key: torch.stack([s[key] for s in seqs], 0)  # noqa: E731
+    with pytest.raises(BatchInvariantUnsupportedError, match="slot"):
+        recurrent_kda_batch_invariant_extend(
+            stack("q"),
+            stack("k"),
+            stack("v"),
+            stack("g"),
+            stack("beta"),
+            A_log=p["A_log"],
+            dt_bias=p["dt_bias"],
+            initial_state=pool,
+            lower_bound=LB,
+            ssm_state_indices=torch.tensor(slots, dtype=torch.int32, device="cuda"),
+        )
 
 
 @needs_device

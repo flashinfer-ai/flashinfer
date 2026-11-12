@@ -189,9 +189,7 @@ __device__ __forceinline__ void inv_update(Tile& inv, const Frag& pw) {
   }
 }
 
-// SPAN = false: one token per block, row b of the inputs. SPAN = true: block (b, h) appends rows
-// [start, start + len) of the packed inputs to its slot in one launch, committing every chunk it
-// completes.
+// SPAN: a block appends rows [start, start + len) of the packed inputs to its slot; else row b.
 template <bool SPAN>
 __global__ void __launch_bounds__(NTHR, MINB)
     DecodeKernel(const uint16_t* __restrict__ q, const uint16_t* __restrict__ k,
@@ -254,8 +252,7 @@ __global__ void __launch_bounds__(NTHR, MINB)
   uint16_t* Lpool = Lc + sh * CH * CH;
   float* Ppool = pref + sh * D;
 
-  // phase-independent loads first: state tile, raw rows, gate constants. The last warp copies no
-  // state: it copies the cached rows, which the first barrier of a step then need not wait for
+  // phase-independent loads first; the last warp copies the cached rows instead of the state tile
   if (warp < NTHR / 32 - 1)
     for (int u = tid; u < D * 16; u += NTHR - 32)
       cp_async16(Ssm + (u >> 4) * SD + (u & 15) * 8, S16 + (size_t)u * 8);
@@ -432,8 +429,7 @@ __global__ void __launch_bounds__(NTHR, MINB)
     if (!SPAN && warp == NTHR / 32 - 1) cp_async_wait_all();
     __syncthreads();
 
-    // state_k / state_q = bf16(S) . [k_decay_p, q_decay_p]; key s ^ 8 at k-position s as in the
-    // prefill
+    // state_k / state_q = bf16(S) . [k_decay_p, q_decay_p]; key s ^ 8 at k-position s
     {
       uint32_t B[16];
       {
@@ -498,8 +494,7 @@ __global__ void __launch_bounds__(NTHR, MINB)
       }
     }
     __syncthreads();
-    // the state tile is done: on the 16th row its room takes the first fp32 half-state of the
-    // commit now
+    // the state tile is done: on the 16th row its room takes the commit's first fp32 half-state
     float* const blk = reinterpret_cast<float*>(Ssm) + (size_t)warp * 16 * FS;
     const float* Srow = S32 + (size_t)(16 * warp) * D;
     if (p == CH - 1) {
@@ -569,8 +564,7 @@ __global__ void __launch_bounds__(NTHR, MINB)
     }
     __syncthreads();
 
-    // update column p = rhs . A_inv[p]; o = bf16((state_q + bf16(update) . QK[p]) * scale); token s
-    // ^ 8 at k s
+    // update column p = rhs . A_inv[p]; o = bf16((state_q + bf16(update) . QK[p]) * scale)
     {
       const size_t aoff =
           (size_t)((lane & 7) + 8 * (lane >> 4)) * SD + 16 * warp + 8 * ((lane >> 3) & 1);
@@ -607,8 +601,7 @@ __global__ void __launch_bounds__(NTHR, MINB)
         continue;
       }
 
-      // chunk completion: S' = S * exp2(g_prefix[15]) + bf16(update) @ k_restore, through
-      // warp-private blocks
+      // chunk completion: S' = S * exp2(g_prefix[15]) + bf16(update) @ k_restore
       __syncthreads();
       // every load is issued before the first one is used
       float2 kf4[CH * (D / 2) / NTHR];
@@ -738,8 +731,7 @@ inline cudaError_t DecodeStep(const uint16_t* q, const uint16_t* k, const uint16
   return cudaGetLastError();
 }
 
-// Sequence i appends rows [starts[i], starts[i] + lens[i]) of the packed inputs to slot slots[i];
-// with starts == nullptr every sequence appends `stride` rows from row i * stride. One launch.
+// Rows [starts[i], starts[i] + lens[i]) go to slot slots[i]; starts == nullptr: `stride` rows each.
 inline cudaError_t DecodeSpan(const uint16_t* q, const uint16_t* k, const uint16_t* v,
                               const uint16_t* g, const uint16_t* beta, const int* slots,
                               const int* starts, const int* lens, int stride, uint16_t* out,

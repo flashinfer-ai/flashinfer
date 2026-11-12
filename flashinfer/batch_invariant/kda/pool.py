@@ -185,7 +185,9 @@ class ExactPool:
         into ``out`` at the same positions. One launch: each block loops over its rows and commits every chunk it
         completes."""
         q, k, v, g, beta = packed
-        none = slot_ids if stride else None
+        if not stride and (starts is None or lens is None):
+            raise ValueError("span needs starts and lens, or a stride")
+        # with a stride the kernel ignores starts and lens: any int32 tensor stands in for them
         _module().kda_batch_invariant_decode_span(
             q,
             k,
@@ -193,8 +195,8 @@ class ExactPool:
             g,
             beta,
             slot_ids,
-            none if stride else starts,
-            none if stride else lens,
+            slot_ids if stride else starts,
+            slot_ids if stride else lens,
             int(stride),
             out,
             pool,

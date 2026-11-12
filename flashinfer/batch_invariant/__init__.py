@@ -326,7 +326,7 @@ def fingerprint(op: str, **dims) -> str:
 
     ``recurrent_kda`` takes no dimension: the class ``kda.bf16.c16`` is the native SM100 / SM103 / SM107 chunked KDA prefill
     kernel on its pinned route (16-token chunks, fp32 state, the fused gate and Q / K normalization) and the decode
-    step kernel that computes its rows one token at a time; the head count, the batch, the slot and the position are
+    step kernel that computes its rows from the open chunk's cached rows; the head count, the batch, the slot and the position are
     not dimensions of the per-head term, and the receipt digests the kernel sources that are the term.
 
     The attention wrappers take ``head_dim``: the tile and chunk grid, the online-softmax step and the chunk merge are

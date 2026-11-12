@@ -139,6 +139,8 @@ void kda_batch_invariant_decode_span(TensorView q, TensorView k, TensorView v, T
   }
   CHECK_DEVICE(q, state);
   CHECK_DEVICE(slots, state);
+  CHECK_DEVICE(starts, state);
+  CHECK_DEVICE(lens, state);
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());

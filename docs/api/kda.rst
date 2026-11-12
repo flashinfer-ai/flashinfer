@@ -209,7 +209,7 @@ Batch-invariant mode
 ``recurrent_kda(..., batch_invariant=True)`` runs the batch-invariant class
 ``kda.bf16.c16`` of :mod:`flashinfer.batch_invariant` for prefill, chunked
 prefill and decode on an fp32 state pool: every output row is the native
-SM100 / SM103 chunked prefill kernel's, so a token's decode output is bit for
+SM100 / SM103 / SM107 chunked prefill kernel's, so a token's decode output is bit for
 bit its prefill output whatever the batch. Decode is one launch of a step
 kernel that computes the prefill's row from the boundary state and cached rows
 of the open 16-token chunk. The contract (fp32 pool addressed by
