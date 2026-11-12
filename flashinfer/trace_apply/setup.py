@@ -35,14 +35,23 @@ shape, stride, dtype and device — never on their contents. A Definition name
 is a shape class, not a layer: every MoE layer of a model shares one name and
 holds its own weights, so one state per key is one state per weight set, and
 the view of the same storage an engine passes call after call keys the same.
-Identity cannot see bytes change behind a stable address; an engine mode that
-rewrites weights in place is the consumer's to refuse.
+Identity cannot see bytes change behind a stable address, so each entry also
+records the tensors' version counters (a tensor that tracks none — an
+inference-mode tensor — is keyed on identity alone), which torch bumps on
+every in-place operation through its dispatcher: a call whose setup inputs no longer match
+is prepared afresh under the same key, or refused with ``StaleSetupError``
+once a capture has frozen the binding (a captured graph replays against the
+prepared state's addresses). A write that bypasses torch's dispatcher — a raw
+copy into the storage — moves no counter and stays invisible; an engine mode
+that rewrites weights that way is the consumer's to refuse.
 
 Refused, with ``SetupStateError`` (a ``RuntimeError``, never ``ImportError``):
 a weight set first seen inside CUDA-graph capture (setup allocates and
 synchronizes; run every weight set eagerly before capturing), a new weight set
 after the first capture (the key set freezes, so a misdeclared activation read
-cannot grow state without bound), more than ``MAX_WEIGHT_SETS`` weight sets, a
+cannot grow state without bound), a setup input changed in place that cannot be
+re-prepared — the binding frozen, or the change first seen during capture
+(``StaleSetupError``) — more than ``MAX_WEIGHT_SETS`` weight sets, a
 positional call, a call from another process (a state does not survive fork),
 a setup input that is absent or not a tensor, a setup that raises, a setup
 that calls its own Definition with a new weight set (refused, not left waiting
@@ -68,7 +77,12 @@ import time
 from collections.abc import Callable, Mapping
 from typing import Any
 
-__all__ = ["MAX_WEIGHT_SETS", "SetupBoundCallable", "SetupStateError"]
+__all__ = [
+    "MAX_WEIGHT_SETS",
+    "SetupBoundCallable",
+    "SetupStateError",
+    "StaleSetupError",
+]
 
 #: Upper bound on the weight sets one bound callable retains. A Definition is
 #: shared by every layer of a model, so the bound is a layer count with room,
@@ -76,6 +90,11 @@ __all__ = ["MAX_WEIGHT_SETS", "SetupBoundCallable", "SetupStateError"]
 MAX_WEIGHT_SETS = 1024
 
 _StateKey = tuple[tuple[str, int, tuple[int, ...], tuple[int, ...], str, str], ...]
+
+#: One retained weight set: the state, the live tensors (kept so their storage
+#: cannot be recycled), their version counters at prepare time (None for a
+#: tensor that tracks none), and the allocator bytes the prepare added.
+_Entry = tuple[Any, tuple[Any, ...], tuple[int | None, ...], int]
 
 
 class SetupStateError(RuntimeError):
@@ -85,6 +104,13 @@ class SetupStateError(RuntimeError):
     ``SealedPackageError`` gives: an engine must not read a refusal as an
     unavailable optional integration and silently fall back to stock kernels.
     """
+
+
+class StaleSetupError(SetupStateError):
+    """A setup input changed in place after its state was prepared, and the
+    binding is frozen: a CUDA-graph capture replays against the prepared
+    state's addresses, so the state cannot be replaced. A change seen before
+    any capture is instead re-prepared under the same key."""
 
 
 def _is_capturing(device: Any) -> bool:
@@ -109,6 +135,18 @@ def _is_capturing(device: Any) -> bool:
     return index != torch.cuda.current_device() and (
         torch.cuda.is_current_stream_capturing()
     )
+
+
+def _tensor_version(tensor: Any) -> int | None:
+    """The tensor's in-place-mutation counter; None when it tracks none.
+
+    An inference-mode tensor has no version counter; such an input is keyed on
+    identity alone, as before this check existed.
+    """
+    try:
+        return tensor._version
+    except RuntimeError:
+        return None
 
 
 def _call_device(tensors: tuple[Any, ...], kwargs: Mapping[str, Any]) -> Any:
@@ -242,7 +280,7 @@ class SetupBoundCallable:
         # ``_preparing`` below, instead of waiting forever on the lock it holds.
         self._lock = threading.RLock()
         self._preparing = False
-        self._states: dict[_StateKey, tuple[Any, tuple[Any, ...]]] = {}
+        self._states: dict[_StateKey, _Entry] = {}
         self._frozen = False
         self._released = False
         self._stats: dict[str, Any] = {
@@ -251,6 +289,8 @@ class SetupBoundCallable:
             "seconds": 0.0,
             "retained_bytes": 0,
             "refused_in_capture": 0,
+            "reprepared": 0,
+            "refused_stale": 0,
         }
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
@@ -294,10 +334,19 @@ class SetupBoundCallable:
         entry = self._states.get(key)
         if entry is None:
             entry = self._prepare(key, tensors, kwargs, device)
-        elif not self._frozen and _is_capturing(device):
-            # The first capture freezes the key set: a weight set that appears
-            # later cannot have been prepared before the graphs were recorded.
-            self._frozen = True
+        else:
+            stale = self._stale_input(entry, tensors)
+            if stale is not None:
+                if self._frozen or _is_capturing(device):
+                    raise self._stale_refusal(stale)
+                entry = self._reprepare(key, stale, entry, tensors, kwargs, device)
+            elif not self._frozen and _is_capturing(device):
+                # The first capture freezes the key set: a weight set that appears
+                # later cannot have been prepared before the graphs were recorded.
+                # Under the lock, so a freeze cannot land inside a re-prepare's
+                # delete-and-teardown of the state a graph is recording.
+                with self._lock:
+                    self._frozen = True
         kwargs[self.state_param] = entry[0]
         return self._run(**kwargs)
 
@@ -317,13 +366,81 @@ class SetupBoundCallable:
             tensors.append(value)
         return tuple(tensors)
 
+    def _stale_input(self, entry: _Entry, tensors: tuple[Any, ...]) -> str | None:
+        """The first setup input mutated in place since the state was prepared, if any.
+
+        Reads the tensor's version counter, which torch bumps on every in-place
+        operation through its dispatcher. A write that bypasses the dispatcher
+        (a raw copy into the storage) moves no counter and stays invisible.
+        """
+        for name, tensor, version in zip(
+            self.setup_inputs, tensors, entry[2], strict=True
+        ):
+            if version is None:
+                continue  # an inference tensor tracks no counter: identity only
+            if _tensor_version(tensor) != version:
+                return name
+        return None
+
+    def _stale_refusal(self, stale: str) -> StaleSetupError:
+        """The counted refusal of a re-prepare a capture forbids."""
+        self._stats["refused_stale"] += 1
+        return StaleSetupError(
+            f"{self.name}: setup input {stale!r} changed in place after its state "
+            "was prepared, and a CUDA-graph capture replays against that state's "
+            "addresses, so it cannot be replaced; rewrite weights out of place "
+            "(fresh storage keys as a new weight set), or before the first capture"
+        )
+
+    def _reprepare(
+        self,
+        key: _StateKey,
+        stale: str,
+        old: _Entry,
+        tensors: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+        device: Any,
+    ) -> _Entry:
+        """Re-run setup for a weight set whose input changed in place, under the same key.
+
+        The lock is held across the delete, the teardown and the new prepare, as
+        ``_prepare`` already holds it across setup: a racing call sees the state
+        before or after, never between, and a capture observed meanwhile keeps the
+        old state. A teardown that raises leaves nothing prepared; the next call
+        prepares afresh.
+        """
+        with self._lock:
+            current = self._states.get(key)
+            if current is not old:
+                if current is not None:
+                    return current  # a racing call already re-prepared this key
+                return self._prepare(
+                    key, tensors, kwargs, device
+                )  # its teardown failed
+            if self._frozen or _is_capturing(device):
+                raise self._stale_refusal(stale)
+            del self._states[key]
+            self._stats["weight_sets"] = len(self._states)
+            self._stats["retained_bytes"] -= old[3]
+            if self._teardown is not None:
+                try:
+                    self._teardown(old[0])
+                except Exception as error:
+                    raise SetupStateError(
+                        f"{self.name}: the teardown of the state prepared before "
+                        f"{stale!r} changed raised {type(error).__name__}: {error}"
+                    ) from error
+            entry = self._prepare(key, tensors, kwargs, device)
+            self._stats["reprepared"] += 1
+            return entry
+
     def _prepare(
         self,
         key: _StateKey,
         tensors: tuple[Any, ...],
         kwargs: Mapping[str, Any],
         device: Any,
-    ) -> tuple[Any, tuple[Any, ...]]:
+    ) -> _Entry:
         """Return the state for ``key``, running setup once under the capture rules."""
         import torch
 
@@ -331,6 +448,13 @@ class SetupBoundCallable:
             entry = self._states.get(key)
             if entry is not None:
                 return entry
+            if self._released:
+                # __call__ checks lock-free; re-check under the lock, or a release
+                # racing a prepare would retain a state nothing tears down.
+                raise SetupStateError(
+                    f"{self.name}: this binding was released; its states are torn down "
+                    "and a later import binds afresh"
+                )
             if self._preparing:
                 raise SetupStateError(
                     f"{self.name}: setup re-entered its own bound callable with a new "
@@ -376,12 +500,19 @@ class SetupBoundCallable:
             elapsed = time.monotonic() - started
             after = torch.cuda.memory_allocated(device) if cuda else 0
             # The tensors are kept beside the state so their storage cannot be
-            # recycled, and their addresses re-keyed, while the state lives.
-            entry = self._states[key] = (state, tensors)
+            # recycled, and their addresses re-keyed, while the state lives; the
+            # version counters let a later call see an in-place rewrite.
+            versions = tuple(_tensor_version(tensor) for tensor in tensors)
+            entry = self._states[key] = (
+                state,
+                tensors,
+                versions,
+                max(0, after - before),
+            )
             self._stats["runs"] += 1
             self._stats["weight_sets"] = len(self._states)
             self._stats["seconds"] += elapsed
-            self._stats["retained_bytes"] += max(0, after - before)
+            self._stats["retained_bytes"] += entry[3]
             return entry
 
     def _context(
@@ -469,7 +600,9 @@ class SetupBoundCallable:
 
     def stats(self) -> dict[str, Any]:
         """``runs``, ``weight_sets``, ``seconds``, ``retained_bytes`` (torch
-        allocator delta across setup, CUDA only) and ``refused_in_capture``."""
+        allocator delta across setup, CUDA only), ``refused_in_capture``,
+        ``reprepared`` (states re-run because a setup input changed in place)
+        and ``refused_stale`` (a re-prepare a capture forbade)."""
         return dict(self._stats)
 
     @property
@@ -504,9 +637,9 @@ class SetupBoundCallable:
             if self._teardown is None:
                 return
             failures: list[Exception] = []
-            for state, _ in states.values():
+            for entry in states.values():
                 try:
-                    self._teardown(state)
+                    self._teardown(entry[0])
                 except Exception as error:
                     failures.append(error)
             if failures:
