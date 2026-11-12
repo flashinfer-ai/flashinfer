@@ -10320,6 +10320,10 @@ def test_attention_ts_decode_nvfp4_resource_overrides(
             False,
         ),
         (512, 64, 6, 769, 8, torch.float16, "gmem_reduction", 16, False),
+        # Page64 enables D512 V-scale swizzling. Five/six query tokens exercise
+        # partial/aligned 16-row output bands, including LSE publication.
+        (512, 64, 5, 769, 8, torch.float16, "disabled", 64, False),
+        (512, 64, 6, 769, 8, torch.float16, "disabled", 64, False),
         (512, 128, 12, 769, 8, torch.float16, "disabled", 32, False),
         # Keeps Q64 with SMEM-converted NVFP4 K/V: per-instance converters at
         # D128, separate K and V converters at D256.
