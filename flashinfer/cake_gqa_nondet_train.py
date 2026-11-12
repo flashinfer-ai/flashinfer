@@ -140,8 +140,10 @@ def cake_gqa_nondet(
 
     Parameters
     ----------
-    q, k, v : torch.Tensor
-        BF16 ``[T_q, H_q, 256]`` and ``[T_k, H_kv, 256]``; query head ``h`` reads key head ``h / (H_q / H_kv)``.
+    q : torch.Tensor
+        BF16 ``[T_q, H_q, 256]`` queries.
+    k, v : torch.Tensor
+        BF16 ``[T_k, H_kv, 256]`` keys and values; query head ``h`` reads key head ``h / (H_q / H_kv)``.
     cu_seqlens_q, cu_seqlens_k : torch.Tensor
         int32 ``[B + 1]`` on the device, ``cu[0] = 0``, non-decreasing, ``cu_q[B] = T_q``, ``cu_k[B] = T_k``.
     softmax_scale : float, optional
@@ -285,8 +287,10 @@ def cake_gqa_nondet_train_backward(
     ----------
     q, k, v : torch.Tensor
         The forward's operands (see :func:`cake_gqa_nondet`).
-    out, lse : torch.Tensor
-        The forward's BF16 ``[T_q, H_q, 256]`` output and FP32 ``[H_q, T_q]`` LSE.
+    out : torch.Tensor
+        The forward's BF16 ``[T_q, H_q, 256]`` output.
+    lse : torch.Tensor
+        The forward's FP32 ``[H_q, T_q]`` LSE.
     dout : torch.Tensor
         Contiguous BF16 ``[T_q, H_q, 256]`` gradient of ``out``.
     cu_seqlens_q, cu_seqlens_k : torch.Tensor
@@ -403,8 +407,10 @@ def cake_gqa_nondet_train_workspace_bytes(
         ``H_q``, the query heads.
     num_segments : int
         ``B``, the segments (``len(cu_seqlens_q) - 1``).
-    total_k, num_heads_kv : int, optional
-        ``T_k`` and ``H_kv``; with both given the per-call dS^T workspace is included.
+    total_k : int, optional
+        ``T_k``; with ``num_heads_kv`` also given the per-call dS^T workspace is included.
+    num_heads_kv : int, optional
+        ``H_kv``, given together with ``total_k``.
     max_seqlen_k : int, optional
         As in :func:`cake_gqa_nondet`.
     row_map : bool
