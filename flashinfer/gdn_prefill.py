@@ -1558,7 +1558,7 @@ def chunk_gated_delta_rule(
         Keyword-only. ``True`` runs the batch-invariant class ``gdn.bf16.c64``
         (``flashinfer.batch_invariant``) in place of the backends: every
         output row and every state at a multiple of 64 tokens is the native
-        SM100 / SM103 chunked prefill kernel's without context parallelism,
+        SM100 / SM103 / SM107 chunked prefill kernel's without context parallelism,
         so decode row ``p`` of a request is bit for bit the row a prefill of
         the whole sequence gives at ``p``, whatever the batch, the neighbours
         or the slot. The state is an fp32 pool ``initial_state``

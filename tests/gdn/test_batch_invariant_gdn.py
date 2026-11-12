@@ -39,7 +39,8 @@ def _supported():
 
 
 needs_device = pytest.mark.skipif(
-    not _supported(), reason="the class gdn.bf16.c64 needs SM100 / SM103 and CUDA 13"
+    not _supported(),
+    reason="the class gdn.bf16.c64 needs SM100 / SM103 / SM107 and CUDA 13",
 )
 
 
