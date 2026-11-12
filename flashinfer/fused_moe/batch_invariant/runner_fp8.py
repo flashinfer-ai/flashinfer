@@ -113,8 +113,8 @@ class BatchInvariantFp8PerTensorRunner(BatchInvariantMoeRunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
-        self._validate_pack_contract(act)
         self._require_built()
+        self._validate_pack_contract(act)
         from .api import route, route_plan
         from .api_fp8 import MoEWeightsE4M3
 
