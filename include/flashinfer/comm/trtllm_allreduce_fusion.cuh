@@ -1656,8 +1656,12 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
   int access_id = index_helper.access_id;
   int access_stride = index_helper.access_stride;
   int tot_access = index_helper.tot_access;
-  vec_t<T, VEC_SIZE> clear_vec;
-  clear_vec.fill(neg_zero_v<T>);
+  // The clear pattern is fp32 -0 (0x80000000 per word) for every T. A later Lamport kernel of any
+  // dtype on this workspace must still see "not written": an fp32 reader needs the full word, a
+  // bf16 / fp16 reader (trtllm or cake) tests each 16-bit half for 0x8000 and finds it in the high
+  // half. bf16 -0 pairs (0x80008000) would read as a finished fp32 value.
+  vec_t<float, details::kBytesPerAccess / sizeof(float)> clear_vec;
+  clear_vec.fill(-0.0f);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
@@ -1686,7 +1690,8 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
   }
   for (int idx = access_id; idx < clear_access; idx += access_stride) {
     // Clear comm buffer that previous kernel used
-    clear_vec.store(reinterpret_cast<T*>(comm.clear_buf) + idx * VEC_SIZE);
+    clear_vec.store(reinterpret_cast<float*>(comm.clear_buf) +
+                    idx * details::kClearUnitsPerAccess / 2);
   }
 
   for (int idx = access_id, tidx = token_id; idx < tot_access;

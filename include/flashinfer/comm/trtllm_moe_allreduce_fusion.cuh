@@ -980,8 +980,12 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
   // Total number of access in unit of VEC_SIZE to handle (token_num * hidden_dim)
   // This is within one rank
   int tot_access = params.size / VEC_SIZE;
-  vec_t<T, VEC_SIZE> clear_vec;
-  clear_vec.fill(neg_zero_v<T>);
+  // The clear pattern is fp32 -0 (0x80000000 per word) for every T. A later Lamport kernel of any
+  // dtype on this workspace must still see "not written": an fp32 reader needs the full word, a
+  // bf16 / fp16 reader (trtllm or cake) tests each 16-bit half for 0x8000 and finds it in the high
+  // half. bf16 -0 pairs (0x80008000) would read as a finished fp32 value.
+  vec_t<float, details::kBytesPerAccess / sizeof(float)> clear_vec;
+  clear_vec.fill(-0.0f);
 
   cudaGridDependencySynchronize();
   LamportComm<NRanks> comm(params.workspace, params.rank);
@@ -1055,8 +1059,8 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
 
   // * Clear previous buffer
   for (int idx = access_id; idx < clear_access; idx += access_stride) {
-    int offset = idx * VEC_SIZE;
-    clear_vec.store(reinterpret_cast<T*>(comm.clear_buf) + offset);
+    clear_vec.store(reinterpret_cast<float*>(comm.clear_buf) +
+                    idx * details::kClearUnitsPerAccess / 2);
   }
 
   // * AR Load + Fusion
@@ -1285,8 +1289,12 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
   // Total number of access in unit of VEC_SIZE to handle (token_num * hidden_dim)
   // This is within one rank
   int tot_access = params.size / VEC_SIZE;
-  vec_t<T, VEC_SIZE> clear_vec;
-  clear_vec.fill(neg_zero_v<T>);
+  // The clear pattern is fp32 -0 (0x80000000 per word) for every T. A later Lamport kernel of any
+  // dtype on this workspace must still see "not written": an fp32 reader needs the full word, a
+  // bf16 / fp16 reader (trtllm or cake) tests each 16-bit half for 0x8000 and finds it in the high
+  // half. bf16 -0 pairs (0x80008000) would read as a finished fp32 value.
+  vec_t<float, details::kBytesPerAccess / sizeof(float)> clear_vec;
+  clear_vec.fill(-0.0f);
 
   cudaGridDependencySynchronize();
   LamportComm<NRanks> comm(params.workspace, params.rank);
@@ -1374,7 +1382,8 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
 
   // * Clear previous buffer
   for (int idx = access_id; idx < clear_access; idx += access_stride) {
-    clear_vec.store(reinterpret_cast<T*>(comm.clear_buf) + idx * VEC_SIZE);
+    clear_vec.store(reinterpret_cast<float*>(comm.clear_buf) +
+                    idx * details::kClearUnitsPerAccess / 2);
   }
 
   // * AR Load + Fusion
