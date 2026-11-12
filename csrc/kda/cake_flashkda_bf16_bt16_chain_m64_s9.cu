@@ -1034,13 +1034,11 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
                         : "memory");
                 }
                 int chunk_tokens = seq_len_2 - chunk_idx_1 * 16;
-                if (__builtin_expect(chunk_tokens < 16, 0)) {
-                    // The V box of a tail chunk reads past eos into the next sequence's tokens. The zero W and QK'
-                    // rows there do not cancel a non-finite V, so the V halves past eos are cleared before use.
+                if (chunk_tokens < 16) {
                     #pragma unroll
                     for (int v_pair = 0; v_pair < 4; v_pair++) {
                         int v_token = v_pair / 2 * 8 + lane_quad_2 * 2;
-                        v_prefetch_bits[v_pair] &= v_token + 1 < chunk_tokens ? 0xFFFFFFFFu : (v_token < chunk_tokens ? 0xFFFFu : 0u);
+                        v_prefetch_bits[v_pair] = v_prefetch_bits[v_pair] & ((v_token + 1 < chunk_tokens) ? 4294967295u : ((v_token < chunk_tokens) ? 65535 : 0));
                     }
                 }
                 mbarrier_wait(old_out_ready_addr + (compute_stage) * 8, _phase_old_out_ready);
