@@ -239,9 +239,15 @@ void fused_add_rmsnorm_fp8_block_quant(TensorView output, TensorView block_scale
   const unsigned int num_blocks = hidden_size / 128;
   TVM_FFI_ICHECK_EQ(block_scale.size(0), scale_ue8m0 ? (num_blocks + 3) / 4 : num_blocks);
   TVM_FFI_ICHECK_EQ(block_scale.size(1), m_pad);
-  // The kernel writes row r at r * stride(0), so overlapping rows would clobber each other.
-  TVM_FFI_ICHECK(block_scale.size(0) == 1 || block_scale.stride(0) >= m_pad)
-      << "block_scale rows must not overlap";
+  if (scale_ue8m0) {
+    // flashinfer.deep_gemm reads packed UE8M0 without a transform and asserts this TMA pitch.
+    TVM_FFI_ICHECK_EQ(block_scale.stride(0), m_pad)
+        << "packed UE8M0 block_scale must be contiguous";
+  } else {
+    // The kernel writes row r at r * stride(0), so overlapping rows would clobber each other.
+    TVM_FFI_ICHECK(block_scale.size(0) == 1 || block_scale.stride(0) >= m_pad)
+        << "block_scale rows must not overlap";
+  }
   // Kernel covers each row single-wave with no per-thread bounds guard: hidden_size must be a whole
   // number of warps of vectors -> <= 16384 and a multiple of 32*vec_size (256 for <=8192, 512
   // above).

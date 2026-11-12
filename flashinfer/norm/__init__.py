@@ -1532,7 +1532,8 @@ def fused_add_rmsnorm_fp8_block_quant(
           reads it without a layout transform. Shape ``(ceil(hidden_size / 512),
           round_up(batch_size, 4))``. Each scale is ``ceil_to_ue8m0(amax / 448)``, stored as
           its exponent byte, four consecutive blocks per int32 (little-endian); the unused bytes of
-          a row's last int32 are zero.
+          a row's last int32 are zero. Must be contiguous, since :mod:`flashinfer.deep_gemm`
+          requires the row pitch ``round_up(batch_size, 4)``.
     normed_out : Optional[torch.Tensor]
         bf16/fp16 normed output, shape ``(batch_size, hidden_size)`` (for consumers that need the
         pre-quant activation, e.g. an MoE router). ``None`` skips this write.

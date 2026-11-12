@@ -1121,6 +1121,7 @@ def test_fused_add_rmsnorm_fp8_block_quant_rejects_unsupported_hidden(hidden_siz
         "block_scale_ue8m0_shape",
         "block_scale_ue8m0_floor_rows",
         "block_scale_overlapping_rows",
+        "block_scale_ue8m0_padded_pitch",
         "normed_out_dtype",
     ],
 )
@@ -1163,6 +1164,10 @@ def test_fused_add_rmsnorm_fp8_block_quant_rejects_bad_outputs(bad):
         )
     elif bad == "block_scale_overlapping_rows":
         block_scale = block_scale.as_strided(block_scale.shape, (m_pad // 2, 1))
+    elif bad == "block_scale_ue8m0_padded_pitch":
+        block_scale = torch.empty(3, m_pad + 4, dtype=torch.int32, device="cuda")[
+            :, :m_pad
+        ]
     elif bad == "normed_out_dtype":
         normed_out = normed_out.to(torch.float32)
 
