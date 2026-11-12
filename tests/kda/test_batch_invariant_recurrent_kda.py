@@ -474,10 +474,11 @@ def test_decode_lengths_from_a_nonzero_state(h, gate, length):
 
 @needs_device
 @pytest.mark.parametrize("h", HEADS)
-@pytest.mark.parametrize("T", [2, 5, 16, 23, 40])
+@pytest.mark.parametrize("T", [2, 5, 16, 23, 31, 32, 40])
 def test_multi_token_steps_equal_one_shot(h, T):
-    """Several tokens appended to open chunks at mixed phases: the step kernel to the boundary, the prefill kernel over
-    the whole chunks, the step kernel for the tail, then single-token decode again."""
+    """Several tokens appended to open chunks at mixed phases, then single-token decode again: fewer than 32 tokens
+    in one launch of the step kernel (which commits the chunks it completes), 32 and more with the step kernel to the
+    boundary, the prefill kernel over the whole chunks and the step kernel for the tail."""
     from flashinfer.batch_invariant.kda.api import recurrent_kda_batch_invariant_extend
 
     p = params(h)
@@ -522,6 +523,64 @@ def test_multi_token_steps_equal_one_shot(h, T):
         for i, ref in enumerate(refs):
             assert torch.equal(rows[i], ref[pos[i]]), f"request {i} decode at {pos[i]}"
         pos = [q0 + 1 for q0 in pos]
+
+
+@needs_device
+def test_multi_token_step_replayed_as_a_graph():
+    """A multi-token step on the default slots reads nothing on the host: captured once, replayed across chunk
+    boundaries, its rows are the one-shot prefill's."""
+    from flashinfer.batch_invariant.kda.api import recurrent_kda_batch_invariant_extend
+
+    h, T = 16, 3
+    p = params(h)
+    seqs = [make_seq(120, h, SEED + 700 + i, GATES["long"]) for i in range(3)]
+    n0 = [5, 16, 30]
+    refs = [one_shot(s, p)[0] for s in seqs]
+    pool = new_pool(seqs, [0, 1, 2])
+    bi_prefill(
+        [sub(s, 0, n) for s, n in zip(seqs, n0, strict=True)], pool, [0, 1, 2], p
+    )
+    grab = lambda pos: {
+        key: torch.stack(
+            [s[key][q0 : q0 + T] for s, q0 in zip(seqs, pos, strict=True)], 0
+        )
+        for key in ("q", "k", "v", "g", "beta")
+    }  # noqa: E731
+    static = {key: t.clone() for key, t in grab(n0).items()}
+
+    def step():
+        return recurrent_kda_batch_invariant_extend(
+            static["q"],
+            static["k"],
+            static["v"],
+            static["g"],
+            static["beta"],
+            A_log=p["A_log"],
+            dt_bias=p["dt_bias"],
+            initial_state=pool,
+            lower_bound=LB,
+        )
+
+    first = step()
+    for i, ref in enumerate(refs):
+        assert torch.equal(first[i], ref[n0[i] : n0[i] + T])
+    s_ = torch.cuda.Stream()
+    s_.wait_stream(torch.cuda.current_stream())
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s_), torch.cuda.graph(g, stream=s_):
+        out = step()
+    torch.cuda.current_stream().wait_stream(s_)
+    torch.cuda.synchronize()
+    for r in range(1, 12):
+        pos = [n + r * T for n in n0]
+        for key, t in grab(pos).items():
+            static[key].copy_(t)
+        g.replay()
+        torch.cuda.synchronize()
+        for i, ref in enumerate(refs):
+            assert torch.equal(out[i], ref[pos[i] : pos[i] + T]), (
+                f"round {r}, request {i}"
+            )
 
 
 @needs_device

@@ -15,7 +15,8 @@ pool (:mod:`.pool`). Call shapes:
   of the step kernel computes row ``p`` of the sequence from the boundary state and the open chunk's cached rows, and
   the 16th row of a chunk commits the next boundary state;
 * a multi-token decode step (several tokens appended to an open chunk) has no spelling in ``recurrent_kda``'s
-  arguments yet; :func:`recurrent_kda_batch_invariant_extend` is its entry. The call shape decides for every sequence
+  arguments yet; :func:`recurrent_kda_batch_invariant_extend` is its entry (one launch of the step kernel for fewer
+  than 32 tokens per sequence). The call shape decides for every sequence
   of a call: in a prefill call a sequence with a single token also starts from its slot's state as a boundary;
 * speculative decode (``num_spec_tokens``) is not in the class yet and raises.
 
@@ -534,7 +535,10 @@ def recurrent_kda_batch_invariant_extend(
 ) -> torch.Tensor:
     """A multi-token decode step of the class: ``[N, T, HV, 128]`` (``beta`` ``[N, T, HV]``) appended to each slot's
     open chunk, where ``recurrent_kda``'s ``[B, T > 1]`` form would start a prefill from the slot's state. Returns the
-    bf16 ``[N, T, HV, 128]`` rows; row ``t`` of a sequence at position ``p`` is row ``p + t`` of its prefill."""
+    bf16 ``[N, T, HV, 128]`` rows; row ``t`` of a sequence at position ``p`` is row ``p + t`` of its prefill. Fewer
+    than 32 rows per sequence are one launch of the step kernel, which reads the open-row counts on the device and
+    commits the chunks it completes; longer calls read the counts on the host and run their whole chunks through the
+    prefill kernel."""
     H, HV = _check_inputs(q, k, v, g, beta)
     _check_params(A_log, dt_bias, lower_bound, HV)
     check_device(q.device, CLASS, KDA_ARCHS)
@@ -545,8 +549,12 @@ def recurrent_kda_batch_invariant_extend(
     N, T = q.shape[:2]
     if N == 0 or T == 0:
         raise unsupported(CLASS, "an empty call", "at least one token per sequence")
-    slot_ids = _slot_ids(ssm_state_indices, N, q.device, int(initial_state.shape[0]))
-    slot_list = _host_slots(slot_ids, int(initial_state.shape[0]))
+    S = int(initial_state.shape[0])
+    slot_ids = _slot_ids(ssm_state_indices, N, q.device, S)
+    # caller-given slots are read back and checked; the default arange needs no check, so that call captures
+    slot_list = (
+        list(range(N)) if ssm_state_indices is None else _host_slots(slot_ids, S)
+    )
     ep = get_pool(initial_state)
     packed = (
         q.reshape(-1, H, HEAD_DIM).contiguous(),
