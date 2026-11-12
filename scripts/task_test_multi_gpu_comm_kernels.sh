@@ -115,7 +115,7 @@ print(int(bool(torch.version.cuda)
             local -a TEST_STATUS_PYTEST_COMMAND
             local -a torchrun_env=()
             if [[ " $SM107_TEST_FILES " == *" $test_file "* ]]; then
-                torchrun_env+=(FAIL_ON_DISTRIBUTED_SKIP=1 CUTE_DSL_ARCH=sm_107a)
+                torchrun_env+=(FAIL_ON_DISTRIBUTED_SKIP=1 FLASHINFER_STRICT_MOE_EP_TESTS=1 CUTE_DSL_ARCH=sm_107a)
             fi
             test_status_pytest_command "${receipt}" torchrun
             rm -f "$junit_file"
