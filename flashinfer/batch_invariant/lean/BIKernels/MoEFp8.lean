@@ -85,14 +85,14 @@ end BIK.MoEFp8
 
 /-! ## The swapped records of the fp8 per-tensor classes
 
-The fp8 swapped body (`fused_moe/batch_invariant/blocks/fp8_swap_kernel.py`) is the bf16 swapped body on e4m3 operands with the W8A8
+The fp8 swapped body (`fused_moe/batch_invariant/blocks/swap.py` at the e4m3 format) is the bf16 swapped body on e4m3 operands with the W8A8
 chains: `Cᵀ` per expert, the expert's weight rows on the MMA's M side (128 or 64 rows per CTA) and the group's tokens on its N
 side as a narrow tile of 16 or 32 rows (`kind::f8f6f4` takes N >= 16). The tcgen05 step folds the same K sequence per output element
 whichever operand carries the token, so every output element is the dense fp8 class's `kfold` of the row's data and the expert's
 column, and the chain per element is the grouped fp8 body's (`gluQuantE4m3T` / `actQuantE4m3T` / `scaledOutT` on the same
 accumulator): the swapped records are placements, and the dispatcher ranks them with the grouped records. The 64-row weight tile's
 TMEM layout gives a thread the rows `r` and `r + 8` (the interleaved weight's up / gate pair) instead of lane `+8`: which register
-holds the gate, never the term. The predicate mirrors `blocks/fp8_swap_kernel.is_swapped_record`; the space is the four records. -/
+holds the gate, never the term. The predicate mirrors `blocks/swap.is_swapped_record` at the e4m3 format; the space is the four records. -/
 
 namespace BIK.MoEFp8
 
