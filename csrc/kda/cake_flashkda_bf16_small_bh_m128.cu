@@ -907,6 +907,7 @@ kernel_flashkda_bf16_small_bh_m128(__nv_bfloat16* __restrict__ q, FlashKDATensor
                 mbarrier_wait(old_out_ready_addr + (compute_stage) * 8, _phase_old_out_ready);
                 float _tmem_load_2[32];
                 tmem_ld_x32(&_tmem_load_2[0], taddr + 224 + (unsigned int)tmem_row_base);
+                int chunk_tokens = seq_len - chunk_idx * 32;
                 #pragma unroll
                 for (int residual_half = 0; residual_half < 2; residual_half++) {
                     float residual_v[16];
@@ -925,6 +926,14 @@ kernel_flashkda_bf16_small_bh_m128(__nv_bfloat16* __restrict__ q, FlashKDATensor
                     #pragma unroll
                     for (int _ls = 0; _ls < 8; _ls++)
                         mul_f32x2_inplace(&reinterpret_cast<float2*>(residual_v)[_ls], reinterpret_cast<const float2*>(residual_beta)[_ls]);
+                    if (__builtin_expect(chunk_tokens < 32, 0)) {
+                        // The V box of a tail chunk reads past eos into the next sequence's tokens; a zero beta does
+                        // not cancel a non-finite V there, so the rows past eos are selected to zero.
+                        #pragma unroll
+                        for (int residual_col_1 = 0; residual_col_1 < 16; residual_col_1++) {
+                            residual_v[residual_col_1] = residual_half * 16 + residual_col_1 < chunk_tokens ? residual_v[residual_col_1] : 0.0f;
+                        }
+                    }
                     uint32_t residual_v_bf16[8];
                     #pragma unroll
                     for (int _lp = 0; _lp < 8; _lp++) {

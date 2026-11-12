@@ -935,6 +935,7 @@ kernel_flashkda_bf16_small_bh_m128(__nv_bfloat16* __restrict__ q, FlashKDATensor
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                     : "=f"(_tmem_load_2[0]), "=f"(_tmem_load_2[1]), "=f"(_tmem_load_2[2]), "=f"(_tmem_load_2[3]), "=f"(_tmem_load_2[4]), "=f"(_tmem_load_2[5]), "=f"(_tmem_load_2[6]), "=f"(_tmem_load_2[7]), "=f"(_tmem_load_2[8]), "=f"(_tmem_load_2[9]), "=f"(_tmem_load_2[10]), "=f"(_tmem_load_2[11]), "=f"(_tmem_load_2[12]), "=f"(_tmem_load_2[13]), "=f"(_tmem_load_2[14]), "=f"(_tmem_load_2[15]), "=f"(_tmem_load_2[16]), "=f"(_tmem_load_2[17]), "=f"(_tmem_load_2[18]), "=f"(_tmem_load_2[19]), "=f"(_tmem_load_2[20]), "=f"(_tmem_load_2[21]), "=f"(_tmem_load_2[22]), "=f"(_tmem_load_2[23]), "=f"(_tmem_load_2[24]), "=f"(_tmem_load_2[25]), "=f"(_tmem_load_2[26]), "=f"(_tmem_load_2[27]), "=f"(_tmem_load_2[28]), "=f"(_tmem_load_2[29]), "=f"(_tmem_load_2[30]), "=f"(_tmem_load_2[31])
                     : "r"(taddr + 224 + (unsigned int)tmem_row_base));
+                int chunk_tokens = seq_len - chunk_idx * 32;
                 #pragma unroll
                 for (int residual_half = 0; residual_half < 2; residual_half++) {
                     float residual_v[16];
@@ -953,6 +954,14 @@ kernel_flashkda_bf16_small_bh_m128(__nv_bfloat16* __restrict__ q, FlashKDATensor
                     #pragma unroll
                     for (int _ls = 0; _ls < 8; _ls++)
                         mul_f32x2_inplace(&reinterpret_cast<float2*>(residual_v)[_ls], reinterpret_cast<const float2*>(residual_beta)[_ls]);
+                    if (__builtin_expect(chunk_tokens < 32, 0)) {
+                        // The V box of a tail chunk reads past eos into the next sequence's tokens; a zero beta does
+                        // not cancel a non-finite V there, so the rows past eos are selected to zero.
+                        #pragma unroll
+                        for (int residual_col_1 = 0; residual_col_1 < 16; residual_col_1++) {
+                            residual_v[residual_col_1] = residual_half * 16 + residual_col_1 < chunk_tokens ? residual_v[residual_col_1] : 0.0f;
+                        }
+                    }
                     uint32_t residual_v_bf16[8];
                     #pragma unroll
                     for (int _lp = 0; _lp < 8; _lp++) {
