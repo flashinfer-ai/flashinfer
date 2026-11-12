@@ -375,10 +375,22 @@ __global__ void __launch_bounds__(NTHR, MINB)
       reinterpret_cast<uint32_t*>(Usm + (size_t)(p + 1) * SD)[e] = 0u;
     }
     if (moved && j == 0) {
-      for (int e = tid; e < D * D; e += NTHR) {
-        const uint16_t x16 = (uint16_t)(f2bf_x2(S32[e], 0.0f) & 0xffffu);
-        Ssm[(e >> 7) * SD + (e & 127)] = x16;
-        S16[e] = x16;
+      // two 8-value pieces per round: their loads are issued before the first one is used
+      for (int e = tid; e < D * D / 8; e += 2 * NTHR) {
+        float4 x[2], y[2];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+          x[i] = *reinterpret_cast<const float4*>(S32 + 8 * (e + i * NTHR));
+          y[i] = *reinterpret_cast<const float4*>(S32 + 8 * (e + i * NTHR) + 4);
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+          const int e8 = 8 * (e + i * NTHR);
+          const uint4 w = make_uint4(f2bf_x2(x[i].x, x[i].y), f2bf_x2(x[i].z, x[i].w),
+                                     f2bf_x2(y[i].x, y[i].y), f2bf_x2(y[i].z, y[i].w));
+          *reinterpret_cast<uint4*>(Ssm + (e8 >> 7) * SD + (e8 & 127)) = w;
+          *reinterpret_cast<uint4*>(S16 + e8) = w;
+        }
       }
       if (tid < STAMP) Stamp[tid] = S32[tid];
     }
@@ -486,6 +498,15 @@ __global__ void __launch_bounds__(NTHR, MINB)
       }
     }
     __syncthreads();
+    // the state tile is done: on the 16th row its room takes the first fp32 half-state of the
+    // commit now
+    float* const blk = reinterpret_cast<float*>(Ssm) + (size_t)warp * 16 * FS;
+    const float* Srow = S32 + (size_t)(16 * warp) * D;
+    if (p == CH - 1) {
+      for (int u = lane; u < 256; u += 32)
+        cp_async16(blk + (u >> 4) * FS + (u & 15) * 4, Srow + (size_t)(u >> 4) * D + (u & 15) * 4);
+      cp_async_commit();
+    }
 
     // rhs row p = bf16(beta) * (v - bf16(state_k)) in bf16 arithmetic; the 16 x 16 inverse (warp 2)
     if (tid < D / 2) {
@@ -589,18 +610,20 @@ __global__ void __launch_bounds__(NTHR, MINB)
       // chunk completion: S' = S * exp2(g_prefix[15]) + bf16(update) @ k_restore, through
       // warp-private blocks
       __syncthreads();
-      for (int e2 = tid; e2 < CH * (D / 2); e2 += NTHR) {
-        const int j = e2 >> 6, dd = 2 * (e2 & 63);
-        const float2 f = j == CH - 1 ? *reinterpret_cast<const float2*>(kfrow + dd)
-                                     : *reinterpret_cast<const float2*>(Fpool + (size_t)j * D + dd);
-        *reinterpret_cast<uint32_t*>(Ksm + (size_t)j * SD + dd) =
-            f2bf_x2(f.x * egsm[dd], f.y * egsm[dd + 1]);
+      // every load is issued before the first one is used
+      float2 kf4[CH * (D / 2) / NTHR];
+#pragma unroll
+      for (int i = 0; i < CH * (D / 2) / NTHR; ++i) {
+        const int e2 = tid + i * NTHR, j = e2 >> 6, dd = 2 * (e2 & 63);
+        kf4[i] = j == CH - 1 ? *reinterpret_cast<const float2*>(kfrow + dd)
+                             : *reinterpret_cast<const float2*>(Fpool + (size_t)j * D + dd);
       }
-      float* const blk = reinterpret_cast<float*>(Ssm) + (size_t)warp * 16 * FS;
-      const float* Srow = S32 + (size_t)(16 * warp) * D;
-      for (int u = lane; u < 256; u += 32)
-        cp_async16(blk + (u >> 4) * FS + (u & 15) * 4, Srow + (size_t)(u >> 4) * D + (u & 15) * 4);
-      cp_async_commit();
+#pragma unroll
+      for (int i = 0; i < CH * (D / 2) / NTHR; ++i) {
+        const int e2 = tid + i * NTHR, j = e2 >> 6, dd = 2 * (e2 & 63);
+        *reinterpret_cast<uint32_t*>(Ksm + (size_t)j * SD + dd) =
+            f2bf_x2(kf4[i].x * egsm[dd], kf4[i].y * egsm[dd + 1]);
+      }
       cp_async_wait_all();
       __syncthreads();
 #pragma unroll 1
@@ -671,11 +694,19 @@ __global__ void BeginKernel(const int* __restrict__ idx, const float* __restrict
   const size_t sh = (size_t)slot * H + h;
   const float* S32 = state + sh * D * D;
   uint16_t* S16 = state16 + sh * D * D;
-  for (int e = tid; e < D * D / 8; e += NTHR) {
-    const float4 x = *reinterpret_cast<const float4*>(S32 + 8 * e),
-                 y = *reinterpret_cast<const float4*>(S32 + 8 * e + 4);
-    *reinterpret_cast<uint4*>(S16 + 8 * e) =
-        make_uint4(f2bf_x2(x.x, x.y), f2bf_x2(x.z, x.w), f2bf_x2(y.x, y.y), f2bf_x2(y.z, y.w));
+  // four 8-value pieces per round: their loads are issued before the first one is used
+  for (int e = tid; e < D * D / 8; e += 4 * NTHR) {
+    float4 x[4], y[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      x[i] = *reinterpret_cast<const float4*>(S32 + 8 * (e + i * NTHR));
+      y[i] = *reinterpret_cast<const float4*>(S32 + 8 * (e + i * NTHR) + 4);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      *reinterpret_cast<uint4*>(S16 + 8 * (e + i * NTHR)) =
+          make_uint4(f2bf_x2(x[i].x, x[i].y), f2bf_x2(x[i].z, x[i].w), f2bf_x2(y[i].x, y[i].y),
+                     f2bf_x2(y[i].z, y[i].w));
   }
   if (tid < STAMP) stamp[sh * STAMP + tid] = S32[tid];
   if (tid == 0) cnt[sh] = 0;
