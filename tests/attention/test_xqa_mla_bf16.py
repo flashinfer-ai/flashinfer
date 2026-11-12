@@ -27,11 +27,13 @@ workspace_size = 128 * 1024 * 1024
 @pytest.mark.parametrize("scale", [1.0, 0.5])
 @pytest.mark.parametrize("page_size", [32, 64, 128])
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
+@pytest.mark.parametrize("num_q_heads", [8, 16, 32, 64, 128])
 def test_xqa_mla_batch_decode_bf16(
     batch_size: int,
     scale: float,
     page_size: int,
     enable_pdl: bool,
+    num_q_heads: int,
 ):
     if not is_sm12x_supported(torch.device("cuda")):
         pytest.skip(
@@ -50,7 +52,6 @@ def test_xqa_mla_batch_decode_bf16(
     max_seq_len = 1024
 
     # Deepseek attention config (decode-MLA).
-    num_q_heads = 128
     qk_nope_head_dim = 128
     qk_rope_head_dim = 64
     kv_lora_rank = 512

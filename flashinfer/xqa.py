@@ -26,6 +26,7 @@ from .jit.xqa import (
     gen_xqa_module_mla,
     ragged_q_changes_build,
     swap_ab_eligible,
+    xqa_mla_head_group,
 )
 from .jit.utils import filename_safe_dtype_map
 from .utils import (
@@ -457,6 +458,15 @@ def xqa(
     )
 
 
+def _pad_heads(x: torch.Tensor, num_heads: int) -> torch.Tensor:
+    """Zero-pad the head dimension (``dim=-2``) of ``x`` to ``num_heads``.
+
+    Pads bytes, so FP8 inputs need no FP8 pad kernel; zero bytes are 0.0 in FP8 and BF16.
+    """
+    pad = num_heads - x.shape[-2]
+    return torch.nn.functional.pad(x.view(torch.uint8), (0, 0, 0, pad)).view(x.dtype)
+
+
 @functools.cache
 def get_xqa_module_mla(
     input_dtype: torch.dtype,
@@ -563,7 +573,8 @@ def xqa_mla(
     q : torch.Tensor
         Query tensor with shape ``[batch_size, beam_width, num_q_heads, head_dim]``.
         Data type should be torch.float8_e4m3fn.
-        Now only beam_width 1 is supported.
+        Now only beam_width 1 is supported. ``num_q_heads`` must be one of
+        8, 16, 32, 64 or 128.
     k_cache: torch.Tensor
         Paged K cache tensor with shape ``[total_num_cache_heads, head_dim]``.
         Data type should be torch.float8_e4m3fn
@@ -604,7 +615,8 @@ def xqa_mla(
     The function automatically infers several parameters from tensor shapes:
     - batch_size from q.shape[0]
     - head_dim from q.shape[-1]
-    - head_group_ratio is fixed to 128 for MLA
+    - head_group_ratio from num_q_heads: 128, or 64 for 8 to 64 heads (fewer than 64
+      heads run on zero-padded query heads)
     - max_seq_len from page_table.shape[-1] * page_size
     """
     # Handle optional parameters
@@ -618,13 +630,9 @@ def xqa_mla(
     head_dim = q.shape[-1]
     num_q_heads = q.shape[-2]
 
-    # Calculate head_group_ratio (MLA has 1 KV head, so ratio = num_q_heads)
-    head_group_ratio = num_q_heads
-    if head_group_ratio != 128:
-        raise ValueError(
-            f"XQA MLA only supports 128 query heads (head_group_ratio=128), "
-            f"got {num_q_heads} query heads"
-        )
+    # MLA has 1 KV head, so the head group is the query head count, rounded up to a
+    # kernel head group (64 or 128).
+    head_group_ratio = xqa_mla_head_group(num_q_heads)
 
     # Calculate max_seq_len from page_table and page_size
     num_pages_per_seq = page_table.shape[-1]
@@ -643,11 +651,17 @@ def xqa_mla(
         head_group_ratio,
         False,
     )
+    kernel_q, kernel_output = q, output
+    if head_group_ratio != num_q_heads:
+        kernel_q = _pad_heads(q, head_group_ratio)
+        kernel_output = output.new_empty(
+            *output.shape[:-2], head_group_ratio, output.shape[-1]
+        )
     xqa_module.xqa_mla(
         sm_count,
         q_scale,
-        output,
-        q,
+        kernel_output,
+        kernel_q,
         k_cache,
         v_cache,
         page_table,
@@ -659,3 +673,5 @@ def xqa_mla(
         workspace_buffer,
         enable_pdl,
     )
+    if kernel_output is not output:
+        output.copy_(kernel_output[..., :num_q_heads, :])

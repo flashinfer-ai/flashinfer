@@ -591,13 +591,13 @@ def gen_xqa(
         )
 
     if has_sm120 or has_sm121:
-        for token_per_page in token_per_page_:
+        for token_per_page, head_group_ratio in product(token_per_page_, (64, 128)):
             yield gen_xqa_module_mla(
                 input_dtype=torch.float8_e4m3fn,
                 kv_cache_dtype=torch.float8_e4m3fn,
                 page_size=token_per_page,
                 head_dim=576,
-                head_group_ratio=128,
+                head_group_ratio=head_group_ratio,
                 use_sliding_window=False,
             )
 

@@ -343,8 +343,10 @@ struct SharedMemB {
   struct XVBuffer {
     VBuffer v;
     CgaXBuffer x;
-    uint8_t
-        pad[headGrpSize * 128 * 2 - sizeof(VBuffer) - sizeof(CgaXBuffer)];  // for output swizzling
+    // for output swizzling: each of the 8 math warps needs a multiple of 8 rows of
+    // (warpTile.x=128) bf16 outputs. 128 * 128 * 2 bytes gives 16 rows per warp, which also
+    // divides the 16-row warp tile of head group 64.
+    uint8_t pad[mha::max(headGrpSize, 128U) * 128 * 2 - sizeof(VBuffer) - sizeof(CgaXBuffer)];
   };
 
   XVBuffer xv[nbXVBufs];
@@ -929,8 +931,9 @@ __device__ inline Producer::WarpAcc Producer::scaleAndSoftmax(ThrdRegRowMax& row
   rowMaxLog2e = dedupFromQuad(warp, quadRowMaxLog2e);
   storeRowMaxAsync<warpTile.y>(nextRowMaxLog2eBar, smemNext.rowMaxLog2e, rowMaxLog2e, tileBaseRow,
                                lane);
-  nextRowMaxLog2eBar.arrive_tx_relaxed(
-      sizeof(rowMaxLog2e));  // notify that the next CTA can read rowMax now.
+  nextRowMaxLog2eBar.arrive_tx_relaxed(laneOwnsRow<warpTile.y>(lane)
+                                           ? sizeof(rowMaxLog2e)
+                                           : 0U);  // notify that the next CTA can read rowMax now.
 
   WarpAcc x;
 // apply softmax
@@ -1341,8 +1344,10 @@ __device__ inline void Consumer::compute() {
         args.partialResults[maxNbSubSeq * idxInputTokenGlobal + idxSubSeq].chunks[tileIdx.y];
 #pragma unroll
     for (uint32_t i = 0; i < ThrdRegRowMax::size; i++) {
-      chunk.rowMaxLog2e[warp_size * i + lane] = accRowMaxLog2e[i];
-      chunk.rowSum[warp_size * i + lane] = accRowSum[i];
+      if (laneOwnsRow<warpTile.y>(lane)) {
+        chunk.rowMaxLog2e[warp_size * i + lane] = accRowMaxLog2e[i];
+        chunk.rowSum[warp_size * i + lane] = accRowSum[i];
+      }
     }
   }
   smem.xBars[idxXVBufLast].consumed.arrive();

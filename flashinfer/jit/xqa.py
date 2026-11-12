@@ -50,6 +50,24 @@ def ragged_q_changes_build(q_seq_len: int, head_group_ratio: int) -> bool:
     return swap_ab_eligible(q_seq_len, head_group_ratio) and _has_sm90_target()
 
 
+# Query head counts XQA MLA accepts (one KV head, so head count == head group).
+XQA_MLA_NUM_Q_HEADS = (8, 16, 32, 64, 128)
+
+
+def xqa_mla_head_group(num_q_heads: int) -> int:
+    """Head group of the XQA MLA kernel that serves ``num_q_heads`` query heads.
+
+    The kernel is built for 64 or 128 heads. Fewer heads run the 64-head kernel on
+    zero-padded query heads: rows are independent, so padding costs only math.
+    """
+    if num_q_heads not in XQA_MLA_NUM_Q_HEADS:
+        raise ValueError(
+            f"XQA MLA supports {list(XQA_MLA_NUM_Q_HEADS)} query heads, "
+            f"got {num_q_heads}"
+        )
+    return 128 if num_q_heads == 128 else 64
+
+
 def gen_xqa_module(
     input_dtype: torch.dtype,
     kv_cache_dtype: torch.dtype,
@@ -188,7 +206,9 @@ def gen_xqa_module_mla(
     head_group_ratio: int,
     use_sliding_window: bool = False,
 ) -> JitSpec:
-    assert head_group_ratio == 128, "Only head group ratio 128 is supported for xqa MLA"
+    assert head_group_ratio in (64, 128), (
+        "Only head group ratio 64 or 128 is supported for xqa MLA"
+    )
     assert head_dim == 576, "Only head dim 576 is supported for xqa_module_mla"
     assert input_dtype in (torch.float8_e4m3fn, torch.bfloat16), (
         f"Only fp8 and bf16 input are supported for xqa_module_mla, got {input_dtype}"

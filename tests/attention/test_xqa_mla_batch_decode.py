@@ -17,11 +17,13 @@ workspace_size = 128 * 1024 * 1024
 @pytest.mark.parametrize("scale", [1.0, 0.5])
 @pytest.mark.parametrize("page_size", [32, 64, 128])
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
+@pytest.mark.parametrize("num_q_heads", [8, 16, 32, 64, 128])
 def test_xqa_mla_batch_decode(
     batch_size: int,
     scale: float,
     page_size: int,
     enable_pdl: bool,
+    num_q_heads: int,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 12:
@@ -36,7 +38,6 @@ def test_xqa_mla_batch_decode(
     max_seq_len = 1024
 
     # Deepseek attention config (decode-MLA)
-    num_q_heads = 128
     qk_nope_head_dim = 128
     qk_rope_head_dim = 64
     kv_lora_rank = 512
@@ -275,3 +276,157 @@ def test_tensor_scales_tune_and_bind_current_inputs(tensor_scale_case, monkeypat
         rtol=3e-2,
         atol=3e-2,
     )
+
+
+def _skip_unless_sm12x():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("requires SM120 or SM121")
+
+
+def _head_group_case(batch_size, page_size, max_seq_len, num_q_heads, dtype, seed):
+    """Paged decode inputs with mixed lengths (including 1 and tile edges).
+
+    Every query head shares a direction ``u`` and each request's last token is a large
+    multiple of ``u``, so every head's running max jumps on its last KV tile.
+    """
+    device = "cuda"
+    g = torch.Generator(device=device)
+    g.manual_seed(seed)
+    lens = torch.randint(1, max_seq_len + 1, (batch_size,), generator=g, device=device)
+    for i, edge in enumerate([max_seq_len, 1, 63, 64, 65, page_size + 1][:batch_size]):
+        lens[i] = min(edge, max_seq_len)
+    lens = lens.int()
+    pages_per_seq = (lens + page_size - 1) // page_size
+    align = 128 // page_size
+    width = (int(pages_per_seq.max()) + align - 1) // align * align
+    num_pages = int(pages_per_seq.sum())
+    page_ids = torch.randperm(num_pages, generator=g, device=device).int()
+    block_tables = torch.zeros(batch_size, width, dtype=torch.int32, device=device)
+    offset = 0
+    for b in range(batch_size):
+        n = int(pages_per_seq[b])
+        block_tables[b, :n] = page_ids[offset : offset + n]
+        offset += n
+    u = torch.randn(576, generator=g, device=device)
+    u = u / u.norm()
+    query = 0.5 * torch.randn(
+        batch_size, 1, num_q_heads, 576, generator=g, device=device
+    )
+    query += 2 * u
+    kv_cache = 0.5 * torch.randn(num_pages, page_size, 576, generator=g, device=device)
+    for b in range(batch_size):
+        last = int(lens[b]) - 1
+        kv_cache[block_tables[b, last // page_size], last % page_size] = 30 * u
+    return query.to(dtype), kv_cache.to(dtype), block_tables, lens
+
+
+def _xqa_decode(query, kv_cache, block_tables, seq_lens, out=None):
+    global global_xqa_workspace_buffer
+    if global_xqa_workspace_buffer is None:
+        global_xqa_workspace_buffer = torch.zeros(
+            workspace_size, dtype=torch.int8, device="cuda"
+        )
+    return flashinfer.decode.xqa_batch_decode_with_kv_cache_mla(
+        query=query,
+        kv_cache=kv_cache.unsqueeze(1),
+        workspace_buffer=global_xqa_workspace_buffer,
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=block_tables.shape[1] * kv_cache.shape[1],
+        out=out,
+        bmm1_scale=1.0 / (128 + 64) ** 0.5,
+        bmm2_scale=1.0,
+        enable_pdl=False,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("page_size", [16, 32, 64, 128])
+def test_xqa_mla_head_groups_match_128_head_kernel(dtype, page_size):
+    """Query heads are independent rows, so 64 heads (64-head kernel) and 8/16/32 heads
+    (64-head kernel on zero-padded heads) must reproduce the 128-head kernel bit for bit."""
+    _skip_unless_sm12x()
+    query, kv_cache, block_tables, seq_lens = _head_group_case(
+        6, page_size, 3000, 128, dtype, seed=page_size
+    )
+    out_128 = _xqa_decode(query, kv_cache, block_tables, seq_lens)
+    for num_q_heads in (8, 16, 32, 64):
+        for start in (0, 128 - num_q_heads):
+            heads = slice(start, start + num_q_heads)
+            out = _xqa_decode(
+                query[:, :, heads].contiguous(), kv_cache, block_tables, seq_lens
+            )
+            assert torch.equal(out, out_128[:, :, heads]), (num_q_heads, start)
+
+
+@pytest.mark.parametrize("num_q_heads", [16, 64])
+def test_xqa_mla_head_groups_cuda_graph(num_q_heads):
+    """Graph replay of the padded (16) and native (64) head-group paths matches eager."""
+    _skip_unless_sm12x()
+    query, kv_cache, block_tables, seq_lens = _head_group_case(
+        8, 64, 1024, num_q_heads, torch.float8_e4m3fn, seed=11
+    )
+    out = torch.empty(8, num_q_heads, 512, dtype=torch.bfloat16, device="cuda")
+    _xqa_decode(query, kv_cache, block_tables, seq_lens, out=out)  # build + warm up
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        _xqa_decode(query, kv_cache, block_tables, seq_lens, out=out)
+    torch.cuda.current_stream().wait_stream(stream)
+    for scale in (0.5, 2.0):
+        query.copy_((query.float() * scale).to(query.dtype))
+        graph.replay()
+        eager = _xqa_decode(query, kv_cache, block_tables, seq_lens)
+        torch.cuda.synchronize()
+        assert torch.equal(out, eager.squeeze(1))
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("num_q_heads", [16, 64])
+def test_xqa_mla_head_groups_planned_wrapper(dtype, num_q_heads):
+    """BatchMLAPagedAttentionWrapper(backend="xqa") plans the new head counts and matches
+    the functional call bit for bit."""
+    _skip_unless_sm12x()
+    batch_size, page_size = 5, 32
+    query, kv_cache, block_tables, seq_lens = _head_group_case(
+        batch_size, page_size, 777, num_q_heads, dtype, seed=3
+    )
+    expected = _xqa_decode(query, kv_cache, block_tables, seq_lens)
+    metadata = flashinfer.mla.MLAPlanMetadata.dense(
+        torch.arange(batch_size + 1, dtype=torch.int32, device="cuda"),
+        block_tables,
+        seq_lens,
+        max_q_len=1,
+    )
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+        torch.empty(workspace_size, dtype=torch.uint8, device="cuda"), backend="xqa"
+    )
+    wrapper.plan(
+        metadata=metadata,
+        num_heads=num_q_heads,
+        head_dim_ckv=512,
+        head_dim_kpe=64,
+        page_size=page_size,
+        causal=False,
+        sm_scale=1.0 / (128 + 64) ** 0.5,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        output_dtype=torch.bfloat16,
+        enable_pdl=False,
+        scale_mode="bmm-scalar",
+    )
+    out = torch.empty(batch_size, num_q_heads, 512, dtype=torch.bfloat16, device="cuda")
+    wrapper.run(
+        query=query.squeeze(1),
+        kv_cache=kv_cache,
+        out=out,
+        bmm1_scale=1.0 / (128 + 64) ** 0.5,
+        bmm2_scale=1.0,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected.squeeze(1))
