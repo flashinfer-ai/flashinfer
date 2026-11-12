@@ -308,8 +308,8 @@ class BatchInvariantMoeRunner(MoERunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
-        self._validate_pack_contract(act)
         self._require_built()
+        self._validate_pack_contract(act)
         from .api import MoEWeights, route, route_plan
 
         cfg = self.config
