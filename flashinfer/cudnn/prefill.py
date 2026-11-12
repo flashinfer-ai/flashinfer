@@ -43,38 +43,22 @@ _CUDNN_NATIVE_HN_SUPPORTED = bool(
 
 @functools.cache
 def _cudnn_supports_direct_seqlens(dtype: torch.dtype, *, mixed: bool = False) -> bool:
-    """True if cuDNN can consume token-unit indptr buffers directly for `dtype`.
+    """Whether the backend supports token-unit offsets for this graph.
 
-    Requires cu_seq_len_q/kv SDPA inputs and per-tensor ragged-offset
-    multipliers on the unified SDPA engine (forward only):
-    - fp16/bf16: cuDNN backend 9.24+ with cudnn-frontend 1.25+
-    - fp8 (e4m3/e5m2): cuDNN backend 9.25+ with cudnn-frontend 1.27+ (the first
-      release whose sdpa_fp8 python binding exposes cu_seq_len_q/kv)
-
-    `mixed=True` additionally requires *mixed-form* sequence lengths (cu_seq_len
-    on one side, per-batch on the other). This is the paged path, which pairs a
-    token-unit cu_seq_len_q with an actual-length seq_len_kv (KV addressed via
-    the page table). It needs cuDNN backend 9.25+ and a cudnn-frontend carrying
-    the per-side relaxation (frontend PR #430; released in 1.27+).
-
-    Note: this is a pure version compare against the runtime backend and the FE
-    package version (the practical proxy for the FE's compiled-against cuDNN).
-    The FE exposes no compiled/effective-version query, so a feature-probe with
-    NOT_SUPPORTED fallback is left as a follow-up.
+    FlashInfer's FE >=1.32 floor supplies the cumulative-length inputs and
+    ragged-offset multipliers. The backend still needs 9.24 for fp16/bf16,
+    or 9.25 for FP8 and mixed cumulative/per-batch mask lengths.
     """
     if not CUDNN_AVAILABLE:
         return False
-    if mixed or (dtype in (torch.float8_e4m3fn, torch.float8_e5m2)):
-        min_backend, min_frontend = 92500, (1, 27)
+    if mixed or dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        min_backend = 92500
     elif dtype in (torch.float16, torch.bfloat16):
-        min_backend, min_frontend = 92400, (1, 25)
+        min_backend = 92400
     else:
         return False
     try:
-        if cudnn.backend_version() < min_backend:
-            return False
-        major, minor = map(int, cudnn.__version__.split(".")[:2])
-        return (major, minor) >= min_frontend
+        return cudnn.backend_version() >= min_backend
     except Exception:
         return False
 
@@ -98,18 +82,33 @@ def _cudnn_supports_paged_auto() -> bool:
     if not CUDNN_AVAILABLE:
         return False
     try:
-        from packaging.version import Version
-
-        # FE 1.31 still excludes shape overrides from paged split selection.
-        # The floor must include the bounded-paged selector fixes; native
-        # support alone is insufficient. Prereleases stay below that floor.
-        version = Version(cudnn.__version__)
         binder = getattr(getattr(cudnn, "_pybind_module", None), "_SdpaThdBinder", None)
         return (
-            version >= Version("1.32.0")
-            and cudnn_frontend_frost_runtime_available()
+            cudnn_frontend_frost_runtime_available()
             and cudnn.backend_version() >= 92400
             and bool(getattr(binder, "supports_paged_packed_split", False))
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+@functools.cache
+def _cudnn_supports_paged_gqa_auto(head_dim: int) -> bool:
+    """D256 needs FE 1.33 placement and matching native split origins."""
+    if head_dim != 256 or not _cudnn_supports_paged_auto():
+        return False
+    try:
+        from packaging.version import Version
+
+        binder = getattr(getattr(cudnn, "_pybind_module", None), "_SdpaThdBinder", None)
+        return (
+            Version(cudnn.__version__) >= Version("1.33.0")
+            and bool(getattr(binder, f"supports_paged_d{head_dim}_packed_split", False))
+            and bool(
+                getattr(
+                    binder, f"supports_paged_d{head_dim}_split_physical_origins", False
+                )
+            )
         )
     except (AttributeError, TypeError, ValueError):
         return False
@@ -147,15 +146,11 @@ def _cudnn_single_token_gqa_ragged_stats_broken() -> bool:
 
 @functools.cache
 def _cudnn_version_supports_shape_override() -> bool:
-    """SDPA shape override needs the unified engine's support (cuDNN 9.22+) and a
-    cudnn-frontend whose pygraph takes is_override_shape_enabled (1.29+)."""
+    """The supported FE supplies shape overrides; the backend needs 9.22+."""
     if not CUDNN_AVAILABLE:
         return False
     try:
-        if cudnn.backend_version() < 92200:
-            return False
-        major, minor = map(int, cudnn.__version__.split(".")[:2])
-        return (major, minor) >= (1, 29)
+        return cudnn.backend_version() >= 92200
     except Exception:
         return False
 
@@ -166,9 +161,8 @@ def _cudnn_supports_bounded_ragged(*, d128: bool = False) -> bool:
     if not CUDNN_AVAILABLE:
         return False
     try:
-        version = tuple(map(int, cudnn.__version__.split(".")[:2]))
         binder = getattr(getattr(cudnn, "_pybind_module", None), "_SdpaThdBinder", None)
-        return version >= (1, 31) and bool(
+        return bool(
             getattr(
                 binder,
                 "supports_nonpaged_d128_packed_split"
@@ -813,11 +807,8 @@ if CUDNN_AVAILABLE:
                 cudnn_cu_seq_lens_q.set_uid(UIDs.ACTUAL_SEQ_LENS_Q_UID.value)
 
                 padding_mask = True
-                # These kwargs postdate cudnn-frontend 1.13 (cu_seq_len_*:
-                # 1.25+; implementation / attention_implementation: 1.14+). The
-                # declared >=1.30 floor covers both, but the runtime cuDNN
-                # backend version still gates this path, so they stay confined
-                # to it, which _cudnn_supports_direct_seqlens guards.
+                # The runtime backend gates cumulative masks even though
+                # every supported FE accepts these graph arguments.
                 seq_len_kwargs = {
                     "cu_seq_len_q": cudnn_cu_seq_lens_q,
                     # cu_seq_lens are unified-engine-only; pin the
@@ -968,8 +959,6 @@ if CUDNN_AVAILABLE:
                     use_causal_mask_bottom_right=bottom_right_causal_mask,
                     use_padding_mask=padding_mask,
                     **mask_kwargs,
-                    # cu_seq_len kwargs (direct path) exist on sdpa_fp8 only in
-                    # cudnn-frontend 1.27+; the version gate guarantees that.
                     **seq_len_kwargs,
                     paged_attention_k_table=(
                         cudnn_k_block_tables if block_tables is not None else None
@@ -2256,8 +2245,8 @@ def cudnn_batch_prefill_with_kv_cache(
         ``"tokens"``: offsets are plain token-unit prefix sums
         (``qo_indptr``/``kv_indptr`` style, the FlashInfer convention). For
         non-paged KV, token-unit indptrs are consumed directly by the kernel
-        with no conversion pre-pass on cuDNN backend 9.24+ with cudnn-frontend
-        1.25+ (fp16/bf16) or backend 9.25+ with cudnn-frontend 1.27+ (fp8);
+        with no conversion pre-pass on cuDNN backend 9.24+ (fp16/bf16)
+        or backend 9.25+ (fp8);
         otherwise FlashInfer scales them to element units internally.
     out : Optional[torch.Tensor]
         Pre-allocated contiguous output tensor on ``q``'s device, shape
