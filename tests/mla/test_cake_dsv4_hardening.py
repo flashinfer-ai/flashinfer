@@ -2226,8 +2226,9 @@ def test_dsv4_layer_rows(h_q, layer, form):
     """Every DeepSeek-V4 layer row the FP8 route serves: the masked columns
     contribute nothing and the output matches the reference.  Covers the
     low-head decode rows wider than one producer partition and the 8-head
-    prefill rows, which run the persistent or the M64 body."""
-    _skip_unless_cake_gpu()
+    prefill rows, which run the persistent or the M64 body.  SM107 runs every
+    row too: its low-head decode rows over compressed items take the M64 body."""
+    _skip_unless_cake_gpu(sm107=True)
     case = _dsv4_layer_case(h_q, layer, form)
     _assert_poison_inert(case, _workspace_128mib(), float_scales=True)
 
@@ -2238,7 +2239,7 @@ def test_dsv4_c128_rows_past_128k_raise_before_any_launch(h_q, form):
     """A C128 layer past 128K context (128 + 2048 slots at 256K) is wider than
     any FP8 body takes: the call raises before it launches anything and leaves
     ``out`` untouched."""
-    _skip_unless_cake_gpu()
+    _skip_unless_cake_gpu(sm107=True)
     case = _dsv4_layer_case(h_q, "c128-128k", form, width=2176)
     out = case.nan_out()
     with pytest.raises(ValueError, match=r"sparse_topk 2176: .* at most 1152") as e:
@@ -2265,7 +2266,7 @@ def test_dsv4_c128_mtp_rows_at_the_compression_boundary(
     sign flip must move every row.  Runs the persistent and the M64 bodies
     (and the one-partition producer at 8/16/32 heads, width 320, 8
     requests)."""
-    _skip_unless_cake_gpu()
+    _skip_unless_cake_gpu(sm107=True)
     seq = [640 + 128 * b for b in range(batch)]
     lens = [max((s - 4 + i + 1) // 128, 1) for s in seq for i in range(4)]
     assert lens[:4] == [4, 4, 4, 5]
