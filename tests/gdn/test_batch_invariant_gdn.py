@@ -290,20 +290,15 @@ def test_multi_token_steps(heads, T):
 
 
 @needs_device
-@pytest.mark.parametrize("T", [2, 8, 16, 32])
-def test_placements_agree(T, monkeypatch):
-    """The step kernel once per token and the prefill over the open chunk are one term."""
-    from flashinfer.batch_invariant.gdn import pool as gdn_pool
-
+@pytest.mark.parametrize("T", [2, 8, 16, 32, 63])
+def test_placements_agree(T):
+    """One span launch of T tokens and T single steps are one term, rows and pool."""
     HQ, HV = 16, 32
     starts = [0, 64 - T // 2, 31]
     seqs = [_inputs(s + 2 * T, HQ, HV, 17 * T + s) for s in starts]
     refs = [_reference(x, s0)[0] for x, s0 in seqs]
     results = []
-    for forced in (True, False):
-        monkeypatch.setattr(
-            gdn_pool, "uses_step_kernel", lambda n, forced=forced: forced
-        )
+    for span in (True, False):
         pool = _pool(HV, 4)
         for i, (s, (x, s0)) in enumerate(zip(starts, seqs, strict=True)):
             pool[i] = s0
@@ -318,11 +313,16 @@ def test_placements_agree(T, monkeypatch):
                 )
                 for j in range(5)
             )
-            outs.append(
-                _bi(pool, [0, 1, 2], packed, cu=[0, T, 2 * T, 3 * T], prefix=pos)
-            )
+            if span:
+                o = _bi(pool, [0, 1, 2], packed, cu=[0, T, 2 * T, 3 * T], prefix=pos)
+            else:
+                o = torch.empty_like(packed[2])
+                for t in range(T):
+                    tok = tuple(x[t::T].contiguous() for x in packed)
+                    o[t::T] = _bi(pool, [0, 1, 2], tok, cu=[0, 1, 2, 3])
+            outs.append(o)
             for i, p in enumerate(pos):
-                assert torch.equal(outs[-1][T * i : T * (i + 1)], refs[i][p : p + T])
+                assert torch.equal(o[T * i : T * (i + 1)], refs[i][p : p + T])
         results.append((torch.cat(outs), pool.clone()))
     assert torch.equal(results[0][0], results[1][0])
     assert torch.equal(results[0][1], results[1][1])
@@ -381,18 +381,141 @@ def test_cuda_graph_step_equals_eager():
 
 @needs_device
 def test_step_without_rebuild_returns_nan():
+    """A prefill leaves its open tail's cached rows to the next call; a step launched past that returns NaN."""
+    from flashinfer.batch_invariant.gdn import pool as gdn_pool
+
     HQ, HV = 4, 8
-    x, s0 = _inputs(40, HQ, HV, 11)
+    x, s0 = _inputs(110, HQ, HV, 11)
+    ref, _ = _reference(x, s0)
     pool = _pool(HV, 2)
     pool[0] = s0
-    _bi(pool, [0], _cut(x, 0, 30))
+    assert torch.equal(_bi(pool, [0], _cut(x, 0, 100)), ref[:100])
     gp = get_pool(pool, HQ)
-    assert 0 in gp.pending
-    q, k, v, g, beta = _cut(x, 30, 31)
+    assert gp.pending == {0: 36}
+    q, k, v, g, beta = _cut(x, 100, 101)
     out = torch.empty_like(v)
-    gp._launch(pool, (q, k, v, g, beta), _i32([0]), out, D**-0.5)
+    gdn_pool._module().gdn_batch_invariant_decode_step(
+        q, k, v, g, beta, _i32([0]), out, pool, *gp._side(), D**-0.5
+    )
     assert torch.isnan(out.float()).all()
-    assert torch.equal(_bi(pool, [0], _cut(x, 30, 31)), _reference(x, s0)[0][30:31])
+    assert torch.equal(_bi(pool, [0], _cut(x, 100, 101)), ref[100:101])
+    assert not gp.pending
+    assert torch.equal(_bi(pool, [0], _cut(x, 101, 110), prefix=[101]), ref[101:110])
+
+
+@needs_device
+def test_wrong_prefix_returns_nan_and_keeps_the_slot():
+    HQ, HV = 4, 8
+    x, s0 = _inputs(40, HQ, HV, 11)
+    ref, _ = _reference(x, s0)
+    pool = _pool(HV, 2)
+    pool[0] = s0
+    assert torch.equal(_bi(pool, [0], _cut(x, 0, 30)), ref[:30])
+    before = pool.clone()
+    for wrong in (29, 31, 95):
+        out = _bi(pool, [0], _cut(x, 30, 33), prefix=[wrong])
+        assert torch.isnan(out.float()).all()
+    assert torch.equal(pool, before)
+    assert torch.equal(_bi(pool, [0], _cut(x, 30, 33), prefix=[30]), ref[30:33])
+    assert torch.equal(_bi(pool, [0], _cut(x, 33, 34)), ref[33:34])
+
+
+@needs_device
+def test_ragged_prefill_then_decode():
+    """Whole chunks and open tails in one call: rows, boundary states and the steps after it."""
+    HQ, HV = 16, 32
+    lens = [200, 64, 37, 1061, 128, 5]
+    seqs = [_inputs(n + 70, HQ, HV, 900 + i) for i, n in enumerate(lens)]
+    refs = [_reference(x, s0)[0] for x, s0 in seqs]
+    pool = _pool(HV, 8)
+    slots = [5, 0, 7, 2, 3, 6]
+    for s, (_, s0) in zip(slots, seqs, strict=True):
+        pool[s] = s0
+    cu = [0]
+    for n in lens:
+        cu.append(cu[-1] + n)
+    packed = tuple(
+        torch.cat([x[j][:n] for (x, _), n in zip(seqs, lens, strict=True)])
+        for j in range(5)
+    )
+    out = _bi(pool, slots, packed, cu=cu)
+    for i, n in enumerate(lens):
+        assert torch.equal(out[cu[i] : cu[i + 1]], refs[i][:n]), i
+        b = n // CHUNK * CHUNK
+        want = _reference(_cut(seqs[i][0], 0, b), seqs[i][1])[1][0] if b else seqs[i][1]
+        assert torch.equal(pool[slots[i]], want), i
+    rows = []
+    for t in range(70):
+        tok = tuple(
+            torch.cat(
+                [x[j][n + t : n + t + 1] for (x, _), n in zip(seqs, lens, strict=True)]
+            )
+            for j in range(5)
+        )
+        rows.append(_bi(pool, slots, tok, cu=list(range(len(lens) + 1))))
+    rows = torch.stack(rows)
+    for i, n in enumerate(lens):
+        assert torch.equal(rows[:, i], refs[i][n : n + 70]), i
+    _record("ragged-then-decode", torch.cat([out, rows.flatten(0, 1)]))
+
+
+@needs_device
+def test_span_as_cuda_graph():
+    """A multi-token step on caller-owned buffers reads nothing on the host, so it captures."""
+    HQ, HV = 16, 32
+    B, T, calls = 3, 5, 30
+    seqs = [_inputs(T * calls, HQ, HV, 700 + i) for i in range(B)]
+    refs = [_reference(x, s0)[0] for x, s0 in seqs]
+    pool = _pool(HV, B)
+    for i, (_, s0) in enumerate(seqs):
+        pool[i] = s0
+    bufs = tuple(
+        torch.empty((B * T, *x.shape[1:]), dtype=x.dtype, device="cuda")
+        for x in seqs[0][0]
+    )
+    out = torch.empty((B * T, HV, D), dtype=torch.bfloat16, device="cuda")
+    cu = _i32([T * i for i in range(B + 1)])
+    prefix = torch.zeros(B, dtype=torch.int32, device="cuda")
+    slots = _i32(list(range(B)))
+
+    def call():
+        q, k, v, g, beta = bufs
+        flashinfer.chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=pool,
+            state_indices=slots,
+            cu_seqlens=cu,
+            prefix_lens=prefix,
+            use_qk_l2norm_in_kernel=True,
+            gate_domain="log",
+            output=out,
+            batch_invariant=True,
+        )
+
+    def load(c):
+        for j, buf in enumerate(bufs):
+            buf.copy_(torch.cat([x[j][T * c : T * (c + 1)] for x, _ in seqs]))
+        prefix.fill_(T * c)
+
+    load(0)
+    call()
+    for i in range(B):
+        assert torch.equal(out[T * i : T * (i + 1)], refs[i][:T])
+    graph = torch.cuda.CUDAGraph()
+    load(1)
+    with torch.cuda.graph(graph):
+        call()
+    for c in range(1, calls):
+        load(c)
+        graph.replay()
+        for i in range(B):
+            assert torch.equal(
+                out[T * i : T * (i + 1)], refs[i][T * c : T * (c + 1)]
+            ), (c, i)
 
 
 @needs_device
@@ -461,7 +584,7 @@ def test_spec_arithmetic():
             assert whole % CHUNK == 0 and 0 <= tail < CHUNK
             assert whole + tail == count + n
         assert spec.commits(count) == (spec.next_count(count) == 0)
-    assert spec.uses_step_kernel(15) and not spec.uses_step_kernel(16)
+    assert spec.uses_step_kernel(63) and not spec.uses_step_kernel(64)
 
 
 @needs_device
@@ -490,7 +613,6 @@ def test_unsupported_raises():
         dict(beta_is_logit=True),
         dict(A_log=torch.zeros(HV, device="cuda")),
         dict(output=torch.empty(8, HV, D, device="cuda")),
-        dict(prefix_lens=_i32([5])),
         dict(prefix_lens=torch.zeros(1, device="cuda")),
     ]
     for kwargs in bad:
@@ -626,5 +748,6 @@ def test_slot_outside_the_pool_returns_nan():
     _bi(pool, [0, 1], x, cu=[0, 1, 2], prefix=[0, 0])
     out = _bi(pool, [1, 7], x, cu=[0, 1, 2])
     assert torch.isnan(out[1].float()).all() and not torch.isnan(out[0].float()).any()
-    with pytest.raises(BatchInvariantUnsupportedError):
-        _bi(pool, [1, 1], x, cu=[0, 1, 2], prefix=[1, 1])
+    y, _ = _inputs(6, HQ, HV, 5)
+    out = _bi(pool, [9, 0], y, cu=[0, 3, 6], prefix=[0, 1])
+    assert torch.isnan(out[:3].float()).all() and not torch.isnan(out[3:].float()).any()

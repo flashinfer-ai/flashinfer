@@ -73,7 +73,7 @@ def commits (count : Nat) : Bool := count + 1 == 64
 def nextCount (count : Nat) : Nat := (count + 1) % 64
 /-- A call appending `n` tokens to `count` open rows: `(whole, tail)`. -/
 def extendSplit (count n : Nat) : Nat × Nat := (boundary (count + n), phase (count + n))
-def usesStepKernel (maxTokens : Nat) : Bool := decide (maxTokens < 16)
+def usesStepKernel (maxTokens : Nat) : Bool := decide (maxTokens < 64)
 
 theorem boundary_add_phase (p : Nat) : boundary p + phase p = p := by
   unfold boundary phase; omega

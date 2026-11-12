@@ -16,12 +16,18 @@ pool (:mod:`.pool`). Call shapes:
   from its slot's state as a chunk boundary; any other sequence continues its slot's open chunk, whose row count must
   equal ``prefix_lens[i] % 64``. This is the form for multi-token decode steps and for prefill pieces cut anywhere.
 
-A new sequence loaded into a slot must therefore start with a prefill call or carry ``prefix_lens``; a one-token call
-without ``prefix_lens`` always continues what the slot holds. As for the operator's other state-pool routes, every slot
-index must be unique and in range, and ``cu_seqlens_cpu`` must agree with ``cu_seqlens``; a decode call's ``cu_seqlens``
-are taken to be ``arange(N + 1)``. None of this is checked on the device (a decode step and a prefill of whole chunks
-read nothing back); the calls that read the slots and offsets on the host check them there. ``output_final_state=True`` returns the pool, whose slots hold the
-states at the last chunk boundaries.
+A call whose sequences bring fewer than 64 tokens is one launch that reads nothing on the host (pass
+``cu_seqlens_cpu``, or fewer than 64 tokens in all, so that the offsets are known without a read); it checks
+``prefix_lens`` on the device, and a sequence whose slot holds another open-row count gets NaN rows while its slot is
+left as it was. A prefill that leaves an open tail returns its rows and keeps the tail's raw rows next to the pool; the
+slot's next call builds its cached rows first (a captured decode step cannot, and returns NaN rows for such a slot: run
+the first step after a prefill eagerly). A new sequence loaded into a slot must start with a prefill call or carry
+``prefix_lens``; a one-token
+call without it always continues what the slot holds. As for the operator's other state-pool routes, every slot index
+must be unique and in range, and ``cu_seqlens_cpu`` must agree with ``cu_seqlens``; a decode call's ``cu_seqlens`` are
+taken to be ``arange(N + 1)``. Only the calls that bring whole chunks together with open chunks or tails read the
+slots on the host and check them there. ``output_final_state=True`` returns the pool, whose slots hold the states at
+the last chunk boundaries.
 
 Every unsupported argument raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 """
@@ -35,7 +41,7 @@ import torch
 
 from ..support import check_device, unsupported
 from .pool import get_pool
-from .spec import CHUNK, CLASS, GDN_ARCHS, HEAD_DIM
+from .spec import CHUNK, CLASS, GDN_ARCHS, HEAD_DIM, uses_step_kernel
 
 _IO = torch.bfloat16
 
@@ -261,45 +267,55 @@ def chunk_gated_delta_rule_batch_invariant(
         )
     out = output if output is not None else torch.empty_like(v)
 
+    rows = (q, k, v, g, beta)
     if T == N and prefix_lens is None:
         if cu_seqlens_cpu is not None:
             _checked_offsets([int(x) for x in cu_seqlens_cpu], T)
-        gp.step(pool, slots, q, k, v, g, beta, scale_f, out)
-    else:
+        gp.step(pool, slots, *rows, scale_f, out)
+        return (out, pool) if output_final_state else out
+    cu = cu_seqlens
+    if cu is not None and (cu.dtype != torch.int32 or cu.device != dev):
+        cu = None
+    # fewer than 64 tokens in the call, or per sequence by the host offsets: the step kernel alone, nothing read back
+    offs = None
+    if cu_seqlens_cpu is not None or T >= CHUNK or cu_seqlens is None:
         offs = _host_offsets(cu_seqlens, cu_seqlens_cpu, T)
-        cu = cu_seqlens
-        if cu is not None and (cu.dtype != torch.int32 or cu.device != dev):
-            cu = None
-        rows = (q, k, v, g, beta)
-        if prefix_lens is None and gp.extend_whole_chunks(
-            pool, slots, offs, cu, rows, scale_f, out
-        ):
-            return (out, pool) if output_final_state else out
-        slot_list = slots.tolist()
-        if len(set(slot_list)) != N or min(slot_list) < 0 or max(slot_list) >= gp.slots:
-            raise unsupported(
-                CLASS,
-                "state_indices that repeat a slot or leave the pool",
-                "one distinct in-range slot per sequence",
+    if offs is None or uses_step_kernel(
+        max(b - a for a, b in zip(offs, offs[1:], strict=False))
+    ):
+        if cu is None:
+            cu = (
+                torch.tensor(offs, dtype=torch.int32, device=dev)
+                if offs is not None
+                else cu_seqlens.to(device=dev, dtype=torch.int32)
             )
         if prefix_lens is None:
-            counts = [0] * N
+            prefix = gp.zero_prefix[:N]
         else:
-            prefix = prefix_lens.tolist()
-            if any(p < 0 for p in prefix):
-                raise unsupported(CLASS, "a negative prefix_lens", "token counts")
-            counts = [int(p) % CHUNK for p in prefix]
-        cont = [i for i, c in enumerate(counts) if c]
-        if cont:
-            held = gp.counts([slot_list[i] for i in cont])
-            for i, h in zip(cont, held, strict=True):
-                if h != counts[i]:
-                    raise unsupported(
-                        CLASS,
-                        f"prefix_lens[{i}] at chunk row {counts[i]} on a slot holding {h} open rows",
-                        "a sequence continued where its slot's open chunk ends (resume is exact at multiples of 64)",
-                    )
-        gp.extend(pool, slots, slot_list, counts, offs, cu, rows, scale_f, out)
+            prefix = prefix_lens.to(device=dev, dtype=torch.int32).contiguous()
+        if gp.pending:
+            gp.rebuild(pool, slots.tolist())
+        gp.span(pool, slots, cu[:-1], cu[1:], prefix, rows, scale_f, out)
+        return (out, pool) if output_final_state else out
+    if prefix_lens is None and gp.extend_whole_chunks(
+        pool, slots, offs, cu, rows, scale_f, out
+    ):
+        return (out, pool) if output_final_state else out
+    slot_list = slots.tolist()
+    if len(set(slot_list)) != N or min(slot_list) < 0 or max(slot_list) >= gp.slots:
+        raise unsupported(
+            CLASS,
+            "state_indices that repeat a slot or leave the pool",
+            "one distinct in-range slot per sequence",
+        )
+    if prefix_lens is None:
+        counts = [0] * N
+    else:
+        prefix = prefix_lens.tolist()
+        if any(p < 0 for p in prefix):
+            raise unsupported(CLASS, "a negative prefix_lens", "token counts")
+        counts = [int(p) % CHUNK for p in prefix]
+    gp.extend(pool, slots, slot_list, counts, offs, cu, rows, scale_f, out)
     if output_final_state:
         return out, pool
     return out

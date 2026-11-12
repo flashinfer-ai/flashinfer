@@ -26,8 +26,9 @@ CHUNK = 64
 HEAD_DIM = 128
 #: The compute capabilities the class is stated and tested for: SM100 (B200) and SM103 (B300).
 GDN_ARCHS = ((10, 0), (10, 3))
-#: Calls with fewer tokens per sequence than this run the step kernel per token, the others the prefill kernel.
-STEP_MAX_TOKENS = 16
+#: Calls with fewer tokens per sequence than this run in the step kernel alone; the others take the prefill kernel for
+#: their whole chunks and the step kernel for the rows of open chunks.
+STEP_MAX_TOKENS = CHUNK
 #: The kernel sources the fingerprint digests (package-relative, and relative to the C++ include directory).
 TERM_SOURCES = (
     "gdn_kernels/blackwell/gated_delta_net_chunked.py",

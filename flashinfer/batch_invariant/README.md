@@ -237,31 +237,39 @@ never takes them. Today's GDN decode kernels run a per-token recurrence whose bi
 token's decode output and its prefill output disagree; the class is what the mode promises instead.
 
 A decode step does not update the state token by token. The pool slot holds the state at the sequence's last chunk
-boundary; the class keeps, next to the pool and keyed by the pool tensor, the raw rows since that boundary (at most 63
-per slot), the rows of the open chunk's solve that row `p` depends on (the normalized keys, the log2 gates and betas,
-the M and X rows of the blocked inverse, the VKS and NV rows), a bf16 copy of the boundary state and the open-row
-count. The step kernel (`include/flashinfer/gdn/batch_invariant_decode.cuh`, one CTA per (request, v-head), one launch
-per step) computes row `p` of the prefill from them: every tensor-core product of the prefill is a tcgen05 `kind::f16`
-fold, and the bf16 `mma.sync.aligned.m16n8k16` fold with the same operands, k-order and starting accumulator gives the
-same fp32 bits at every stage shape, so the step issues them as `mma.sync` from registers and repeats the prefill's
-scalar epilogues operation for operation (the file is built without fast math and with `-fmad=false`; the one fused
-multiply-add is the prefill's own, in the 8 x 8 Gauss-Jordan). The 64th row of a chunk folds the next boundary state
-and writes it to the pool. The step reads its count on the device and nothing on the host.
+boundary; the class keeps, next to the pool and keyed by the pool's storage, the rows of the open chunk's solve that
+row `p` depends on (the normalized keys, the log2 gates and betas, the M and X rows of the blocked inverse, the VKS
+and NV rows), a bf16 copy of the boundary state and the open-row count. The step kernel
+(`include/flashinfer/gdn/batch_invariant_decode.cuh`, one CTA per (request, v-head), one launch per step) computes row
+`p` of the prefill from them: every tensor-core product of the prefill is a tcgen05 `kind::f16` fold, and the bf16
+`mma.sync.aligned.m16n8k16` fold with the same operands, k-order and starting accumulator gives the same fp32 bits at
+every stage shape, so the step issues them as `mma.sync` from registers and repeats the prefill's scalar epilogues
+operation for operation (the file is built without fast math and with `-fmad=false`; the one fused multiply-add is the
+prefill's own, in the 8 x 8 Gauss-Jordan). The 64th row of a chunk folds the next boundary state and writes it to the
+pool. The step reads its count on the device and nothing on the host.
 
-Calls with several tokens per sequence take one of two placements of the same term, chosen by the call's shape alone
-(`spec.STEP_MAX_TOKENS`): the step kernel once per token below 16 tokens per sequence, and from 16 on the prefill
-kernel over the open chunk plus the new tokens (the whole chunks in one call that writes the boundary state, the open
-tail in a second call from it). After the prefill placement the slot's cached rows are rebuilt by the step kernel
-before its next step; until then its count cell is negative and a step launched without that rebuild (a captured
-graph) returns NaN rows for the slot instead of another sequence's bits, as it does for a slot index outside the pool.
-While any slot of the pool waits for its rebuild, a decode step reads its slot indices on the host to find the ones
-it must rebuild; with none waiting it reads nothing. Per slot the class holds
-`HV * (32 KB + 48.5 KB) + 64 * (HQ * 768 + HV * 264)` bytes next to the pool (5.5 MB at 16 / 48 heads).
+Calls with several tokens per sequence take placements of the same term, chosen by the call's shape alone
+(`spec.STEP_MAX_TOKENS`). A call whose sequences bring fewer than 64 tokens is one launch of the step kernel's span
+form: it appends each sequence's run of rows to its slot in a loop, with the open chunk's tiles resident in shared
+memory, commits a chunk inside the loop when a run crosses a boundary, and checks `prefix_lens` against the slot's
+count on the device, so it reads nothing on the host and can be captured in a CUDA graph. A sequence whose
+`prefix_lens` is not where its slot's open chunk ends gets NaN rows and its slot is left as it was, as for a slot index
+outside the pool: never another sequence's bits. A call that brings whole chunks runs them through the prefill kernel:
+from chunk boundaries it is one prefill call in place over the caller's tensors, which also returns the rows of the
+open tails and stores each sequence's last boundary state as a checkpoint in its pool slot. One more launch keeps the
+tails' raw rows next to the pool; their cached rows are built by one span launch before the slot's next step. Until
+then the slot's count cell is negative and a step launched without that rebuild (a captured graph) returns NaN rows
+for the slot. While any slot of the pool waits for its rebuild, a call reads its slot indices on the host to find the
+ones it must rebuild; with none waiting it reads nothing. A sequence that continues an open chunk and brings whole
+chunks first completes its chunk in a span launch. Per slot the class holds
+`HV * (32 KB + 48.5 KB) + 64 * HQ * 256` bytes next to the pool (4.1 MB at 16 / 48 heads), and
+`64 * (HQ * 512 + HV * 264)` more (1.3 MB) once a prefill has left an open tail in the pool.
 
 What the caller owes the class: a new sequence loaded into a slot starts with a prefill call (more tokens than
 sequences) or carries `prefix_lens`; a one-token call without `prefix_lens` continues what the slot holds (nothing
-detects a slot whose state the caller replaced). Slot indices are unique and inside the pool; `cu_seqlens_cpu` agrees
-with `cu_seqlens`; a decode call's `cu_seqlens` are `arange(N + 1)`. `output_final_state` returns the pool. A state
+detects a slot whose state the caller replaced). Slot indices are unique and inside the pool (checked on the host
+only by the calls that bring whole chunks from open chunks or leave tails); `cu_seqlens_cpu` agrees with `cu_seqlens`
+and spares a call of 64 tokens or more the read of `cu_seqlens`; a decode call's `cu_seqlens` are `arange(N + 1)`. `output_final_state` returns the pool. A state
 saved for reuse (a prefix cache) is exact at multiples of 64 tokens, where the slot's state is the sequence's state.
 The decode entries (`gated_delta_rule_decode_pretranspose`, `gated_delta_rule_mtp`) do not take the flag: they compute
 the gates from the raw parameters and keep another state layout; a decode step of the class is a one-token call of
@@ -271,8 +279,8 @@ the gates from the raw parameters and keep another state layout; a decode step o
 prefill as the fold of the chunk step over 64-row chunks. Two hypotheses are taken, both checked bit for bit on the
 device together with determinism and independence of the batch: the chunk step is causal (the outputs of a chunk
 prefix are the prefix of the chunk's outputs) and the row step returns the chunk step's last output on the same rows.
-Proved from them: the decode row equals the prefill row at every position (`decode_eq_prefill`), the prefill placement
-of a multi-token call returns the prefill's rows (`replay_eq_prefill`), the commit rule (the boundary state advances
+Proved from them: the decode row equals the prefill row at every position (`decode_eq_prefill`), the prefill kernel
+run over whole chunks and an open tail returns the prefill's rows (`replay_eq_prefill`), the commit rule (the boundary state advances
 on a chunk's 64th row) carries the prefill's boundary states (`pool_eq_stateAfter`), and a call's whole chunks and
 tail are the position arithmetic (`extend_boundary`). The packed call is modelled as the per-sequence terms by
 definition (`batch_term` only unfolds it); the pool's bookkeeping in `pool.py` (pending rebuilds, count cells) is

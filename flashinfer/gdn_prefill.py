@@ -1574,7 +1574,9 @@ def chunk_gated_delta_rule(
         sequence consumed before the call) a sequence at a multiple of 64
         starts from its slot's state and any other sequence continues its
         open chunk, which is the form for multi-token decode steps and for
-        pieces cut anywhere. A new sequence in a slot must start with a
+        pieces cut anywhere; a sequence whose ``prefix_lens`` is not where
+        its slot's open chunk ends gets NaN rows from a call of fewer than
+        64 tokens per sequence. A new sequence in a slot must start with a
         prefill call or carry ``prefix_lens``. ``output_final_state=True``
         returns the pool (the states at the last chunk boundaries, not the
         states after the last token); ``max_seqlen`` is not used. Requires ``backend="auto"``,
