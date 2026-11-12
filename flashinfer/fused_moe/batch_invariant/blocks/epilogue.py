@@ -2,7 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Group-masked epilogue block: TMEM -> registers, the chain, predicated vector stores.
 
-Chains (:class:`GroupedChain`; the class's ``plain`` / ``swiglu`` / ``relu2`` names map onto it):
+The epilogue block of the grouped bodies (:mod:`.kernel`, :mod:`.swap`) is a chain object (:class:`GroupedEpilogueBlock`:
+the bf16 classes' :class:`GroupedChain`, the fp8 per-tensor classes' :class:`Fp8Chain`); the loops below take it as a
+compile-time constant, so every format-dependent choice (the operand format, the per-tile scale, the paired 8-bit
+conversion, the store vector) is a ``const_expr`` branch and each format compiles to its own kernel.
+
+Chains of the bf16 classes (:class:`GroupedChain`; the class's ``plain`` / ``swiglu`` / ``relu2`` names map onto it):
 
 * ``plain``: every accumulator element ``cvt.rn`` to the output type (GEMM2, or the fp32 oracle output of either GEMM);
 * ``glu``: GEMM1's B rows are gate/up-interleaved in groups of ``GROUP = 8`` (accumulator columns ``16q + r`` hold
@@ -14,12 +19,26 @@ Chains (:class:`GroupedChain`; the class's ``plain`` / ``swiglu`` / ``relu2`` na
 * ``act``: the ungated chain (``spec.act_elem``: ReLU^2 of one accumulator, GEMM1 of the ``relu2`` class) on every
   accumulator element, stored like ``plain``.
 
+Chains of the fp8 per-tensor classes (:class:`Fp8Chain`, the W8A8 chains of :mod:`..spec_fp8`):
+
+* ``glu`` / ``act`` with the e4m3 output: GEMM1's fused quantization (``spec_fp8.glu_quant_e4m3_elem`` on the (gate, up)
+  pair in one thread's fragment, ``act_quant_e4m3_elem`` on the single accumulator): the activation on the alpha-scaled
+  fp32 accumulators, the ``mul.rn`` by the intermediate multiplier (``mSi[0]``, read as given), then two outputs per
+  ``cvt.rn.satfinite.e4m3x2.f32`` (each value's conversion is independent of its pairing) into byte registers;
+* ``plain`` scaled with the bf16 output: GEMM2 (``spec_fp8.scaled_out_elem``, ``alpha2 = mul(s_inter, s_w2[e])``);
+* ``plain`` unscaled with the fp32 output: the raw accumulators (the oracle of the device suite).
+
+The per-tile alpha ``mul(mSa[0], mAlpha[e])`` is formed once per tile (``spec_fp8.w8a8_alpha``: the dense fp8 class's
+alpha); the three scale tensors are the fp8 chains' extra operands (:attr:`GroupedEpilogueBlock.scale_operands`), absent
+from the bf16 kernels.
+
 Stores: the converted fragment goes registers -> shared memory in the TMEM load's thread layout (its widest vectors,
 into a row-padded buffer, ``STAGE_PAD``; one subtile buffer per epilogue warpgroup), then shared -> global by the
 warpgroup with consecutive lanes on consecutive 8-element chunks of one row (``make_tiled_copy_tv``: 16-byte chunks,
 whole lines per warp instruction), each chunk copied under a plain branch on ``row < row_end`` (the group's real end:
 rows of the tile beyond it are padding or belong to other experts and are owned by their tiles) and the column bound;
-for glu the chunks are the up positions (accumulator columns ``16q .. 16q + 7`` -> output columns ``8q ..``). The direct
+for glu the chunks are the up positions (accumulator columns ``16q .. 16q + 7`` -> output columns ``8q ..``); an 8-bit
+output stages 8-byte register vectors and 8-byte chunks (its staging rows are skewed by ``STAGE_PAD`` bytes). The direct
 register -> global path (thread = row, one copy per fragment vector under the same branches) remains for the f32 oracle
 outputs. Two facts of the lowering shape both paths: a predicated ``cute.copy`` lowers to element-wise stores, and a
 dynamic row stride needs ``cute.assume(divby)`` or the vector copies scalarize. Either path moves the same converted
@@ -34,7 +53,7 @@ from typing import List, Optional, Tuple
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-from cutlass import Boolean, Float32, Int32
+from cutlass import Boolean, Float32, Int32, Uint8
 from cutlass._mlir.dialects import arith
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.nvgpu import tcgen05
@@ -43,12 +62,15 @@ from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
 from ....batch_invariant.fp_interface.exact import f32_bits
 from ....batch_invariant.quantization.cute_ext import CuteF32, bitcast_i32_to_f32
+from ....batch_invariant.quantization.cvt_fp8 import cvt_f32x2_to_fp8x2
 from ....gemm.batch_invariant.blocks.operands import ACC_DTYPE
 from ..spec import ACT_PARAMS, ACTS, UNGATED_ACTS, act_elem, glu_elem
+from ..spec_fp8 import act_quant_pre, glu_quant_pre, scaled_out_elem, w8a8_alpha
 
 GROUP = 8  # gate/up interleave granularity (columns): u x8, g x8, u x8, ...
 KINDS = ("plain", "glu", "act")
-OUT_FMTS = ("bf16", "f16", "f32")
+OUT_FMTS = ("bf16", "f16", "f32")  # the bf16 classes' output formats
+OUT_FMTS_FP8 = ("e4m3", "bf16", "f32")  # the fp8 per-tensor classes' output formats
 STAGED_STORE = True  # the shared-memory staged, row-coalesced store of the 16-bit outputs (False: the direct path everywhere)
 BAR_EPI_STAGE = (
     4  # named barrier ids BAR_EPI_STAGE + warpgroup (the dense blocks use 1 and 2)
@@ -56,7 +78,11 @@ BAR_EPI_STAGE = (
 BAR_EPI_JOIN = (
     3  # every epilogue warpgroup once, after its last TMEM load, before the TMEM free
 )
-STAGED_OUT_FMTS = ("bf16", "f16")
+STAGED_OUT_FMTS = (
+    "bf16",
+    "f16",
+    "e4m3",
+)  # the 16- and 8-bit outputs stage; the f32 oracle takes the direct path
 # elements of row padding in the staging buffer: a 16-byte skew per row, so the TMEM lanes' (thread = row) 16-byte stores
 # spread over the banks
 STAGE_PAD = 8
@@ -65,6 +91,12 @@ STAGE_PAD = 8
 def staged_store(out_fmt: str) -> bool:
     """Whether a grouped kernel with this output format stages its stores (its kernel then allocates the staging buffers)."""
     return STAGED_STORE and out_fmt in STAGED_OUT_FMTS
+
+
+def store_vec_max(out_dt) -> int:
+    """The widest register vector of the stores: 16 bytes, or 8 for an 8-bit output (its staging rows are skewed by
+    ``STAGE_PAD`` bytes)."""
+    return 8 if out_dt.width == 8 else 16 // (out_dt.width // 8)
 
 
 def staging_layout(out_dt, epi_tile, warpgroups: int):
@@ -81,11 +113,62 @@ def staging_bytes(out_dt, epi_tile, warpgroups: int) -> int:
 
 
 @dataclass(frozen=True)
-class GroupedChain:
-    """The epilogue chain of a grouped GEMM: ``kind`` (``plain``, the gated ``glu`` on an accumulator pair, or the
-    ungated ``act`` on one accumulator), the activation, the output format and the activation's parameters (binary32
-    values, ``None`` for an absent clamp / scale: ``spec.ACT_PARAMS``). ``describe()`` names it, parameters included
-    (their bit patterns), so every parameter set is its own compiled kernel."""
+class GroupedEpilogueBlock:
+    """The epilogue block of the grouped bodies: what a chain object declares to the kernels, resolved at trace time.
+
+    * ``in_fmt``: the operand format the chain belongs to (the kernels' operand block, :class:`.kernel.DenseOperands`, is
+      keyed by it); ``out_fmt`` / ``pair`` / ``kind`` / ``act`` / ``params``: the chain itself; ``describe()`` names the
+      compiled object;
+    * ``scale_operands``: whether the kernel takes the three scale tensors (``alpha [E]``, ``sa [1]``, ``si [1]``: the fp8
+      classes' per-expert weight scales, the A operand's scale and the intermediate multiplier) as further operands;
+      ``scaled``: whether the per-tile alpha ``mul(sa[0], alpha[e])`` is formed and applied; ``paired_cvt``: whether two
+      outputs convert per instruction into byte registers (the e4m3 output);
+    * ``elem(fp, acc, acc_gate, alpha_e, inv)``: one output element of the chain from the accumulator (and its gate
+      partner for a paired chain), every op through ``fp`` (the kernels' ``MoeF32``): converted for the 16- and 32-bit
+      outputs, the fp32 value before the paired conversion for the 8-bit one.
+
+    A requantising epilogue block of a block-scaled class (its own scale operands, its chain and conversion) implements
+    this surface; the loops below need nothing else of it."""
+
+    kind: str
+    act: str
+    out_fmt: str
+    params: Tuple[Optional[float], ...]
+
+    @property
+    def in_fmt(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def pair(self) -> bool:
+        """Whether the chain pairs two accumulators (the gated chains: the (gate, up) pair)."""
+        return self.kind == "glu"
+
+    def describe(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def scale_operands(self) -> bool:
+        return False
+
+    @property
+    def scaled(self) -> bool:
+        return False
+
+    @property
+    def paired_cvt(self) -> bool:
+        return False
+
+    def elem(self, fp, acc, acc_gate, alpha_e=None, inv=None):
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class GroupedChain(GroupedEpilogueBlock):
+    """The epilogue chain of a grouped GEMM of the bf16 classes: ``kind`` (``plain``, the gated ``glu`` on an accumulator
+    pair, or the ungated ``act`` on one accumulator), the activation, the output format and the activation's parameters
+    (binary32 values, ``None`` for an absent clamp / scale: ``spec.ACT_PARAMS``). ``describe()`` names it, parameters
+    included (their bit patterns), so every parameter set is its own compiled kernel."""
 
     kind: str = "plain"
     act: str = "silu"
@@ -101,8 +184,18 @@ class GroupedChain:
         assert len(self.params) == expected, (self, expected)
 
     @property
-    def pair(self) -> bool:
-        return self.kind == "glu"
+    def in_fmt(self) -> str:
+        return "bf16"
+
+    def elem(self, fp, acc, acc_gate, alpha_e=None, inv=None):
+        """One output element, converted: the gated term of the (gate, up) accumulator pair, the ungated activation of
+        one accumulator, or the plain conversion; every op in fp32 through ``fp`` (the chain's parameters are
+        compile-time constants of the kernel)."""
+        if self.pair:
+            return glu_elem(fp, acc_gate, acc, self.act, self.out_fmt, self.params)
+        if self.kind == "act":
+            return act_elem(fp, acc, self.act, self.out_fmt, self.params)
+        return fp.cvt_out(acc, self.out_fmt)
 
     def describe(self) -> str:
         suffix = "".join(
@@ -125,6 +218,73 @@ class GroupedChain:
             "silu",
             "bf16" if chain == "swiglu" else out_fmt,
         )
+
+
+@dataclass(frozen=True)
+class Fp8Chain(GroupedEpilogueBlock):
+    """The epilogue chain of a grouped GEMM of the fp8 per-tensor classes: ``kind`` (``glu`` on the (gate, up) pair, ``act``
+    on one accumulator, or ``plain``), the activation and its binary32 parameters, whether the class's alpha scales the
+    accumulators (``scaled``: the W8A8 chains; unscaled ``plain`` / ``f32`` is the raw-accumulator oracle) and the output
+    format. The kernels of these chains take the three scale operands. ``describe()`` names it, parameters included, so
+    every parameter set is its own compiled kernel."""
+
+    kind: str = "plain"
+    act: str = "silu"
+    out_fmt: str = "bf16"
+    params: Tuple[Optional[float], ...] = ()
+    scaled: bool = True
+
+    def __post_init__(self):
+        assert self.kind in KINDS and self.out_fmt in OUT_FMTS_FP8, self
+        assert self.act in (UNGATED_ACTS if self.kind == "act" else ACTS), self
+        expected = len(ACT_PARAMS.get(self.act, ())) if self.kind == "glu" else 0
+        assert len(self.params) == expected, (self, expected)
+        if self.kind in ("glu", "act"):
+            assert self.scaled and self.out_fmt == "e4m3", (
+                "the activation chains are GEMM1's fused quantization: scaled, e4m3 out"
+            )
+        else:
+            assert self.out_fmt in ("bf16", "f32") and (
+                self.scaled or self.out_fmt == "f32"
+            ), (
+                "GEMM2 converts the scaled accumulator to bf16; the unscaled chain is the fp32 oracle"
+            )
+
+    @property
+    def in_fmt(self) -> str:
+        return "e4m3"
+
+    @property
+    def scale_operands(self) -> bool:
+        return True
+
+    @property
+    def paired_cvt(self) -> bool:
+        return self.out_fmt == "e4m3"
+
+    def elem(self, fp, acc, acc_gate, alpha_e=None, inv=None):
+        """One output element in fp32 (before the paired e4m3 conversion) for the e4m3 outputs, converted for the others;
+        every op through ``fp``."""
+        if self.pair:
+            return fp.mul(
+                glu_quant_pre(fp, acc_gate, acc, alpha_e, self.act, self.params), inv
+            )
+        if self.kind == "act":
+            return fp.mul(act_quant_pre(fp, acc, alpha_e, self.act, self.params), inv)
+        if self.scaled:
+            return scaled_out_elem(fp, acc, alpha_e, self.out_fmt)
+        return fp.cvt_out(acc, self.out_fmt)
+
+    def describe(self) -> str:
+        suffix = "".join(
+            "_pn" if v is None else f"_p{f32_bits(v):08x}" for v in self.params
+        )
+        scale = "w8a8" if self.scaled else "raw"
+        return f"{self.kind}_{self.act}_{scale}_{self.out_fmt}{suffix}"
+
+
+#: GEMM2 of the W8A8 classes: the scaled accumulator converted to bf16.
+GEMM2_CHAIN = Fp8Chain("plain", "silu", "bf16", (), True)
 
 
 def fragment_offsets(frag_layout) -> List[Tuple[int, int]]:
@@ -230,18 +390,6 @@ def select_f32(cond: Boolean, a: Float32, b: Float32, *, loc=None, ip=None) -> F
     )
 
 
-def _chain_elem(chain: GroupedChain, acc, acc_gate):
-    """One output element of the chain, converted: the gated term of the (gate, up) accumulator pair, the ungated
-    activation of one accumulator, or the plain conversion; every op in fp32 through ``MoeF32`` (the chain's
-    parameters are compile-time constants of the kernel)."""
-    fp = MoeF32
-    if chain.pair:
-        return glu_elem(fp, acc_gate, acc, chain.act, chain.out_fmt, chain.params)
-    if chain.kind == "act":
-        return act_elem(fp, acc, chain.act, chain.out_fmt, chain.params)
-    return fp.cvt_out(acc, chain.out_fmt)
-
-
 @cute.jit
 def grouped_epilogue_loop(
     st,
@@ -259,11 +407,19 @@ def grouped_epilogue_loop(
     epi_warpgroups: cutlass.Constexpr = 1,
     sC: cute.Tensor = None,
     cta_v: Int32 = None,
+    mAlpha: cute.Tensor = None,
+    mSa: cute.Tensor = None,
+    mSi: cute.Tensor = None,
 ):
-    """``sC``: the staging buffers (``staging_layout(out, epi_tile, epi_warpgroups)``) of the staged store, or None;
-    ``cta_v``: this CTA's index inside its MMA (0, or 0 / 1 for the 2-CTA instructions), which with ``mma_m_in_cluster``
-    locates its rows in the cluster tile."""
+    """``chain``: the epilogue block (:class:`GroupedEpilogueBlock`); ``sC``: the staging buffers (``staging_layout(out,
+    epi_tile, epi_warpgroups)``) of the staged store, or None; ``cta_v``: this CTA's index inside its MMA (0, or 0 / 1 for
+    the 2-CTA instructions), which with ``mma_m_in_cluster`` locates its rows in the cluster tile; ``mAlpha`` / ``mSa`` /
+    ``mSi``: the scale operands of a chain with ``scale_operands`` (the per-expert weight dequantization scale ``s_w[e]``,
+    the A operand's scale, the intermediate multiplier read as given), None otherwise."""
     pair = chain.pair
+    paired_cvt = (
+        chain.paired_cvt
+    )  # the 8-bit output: two values per conversion into byte registers
     out_dt = mOut.element_type
     wg = tidx // 128  # the epilogue warpgroup (warp-uniform)
     tidx = tidx % 128  # the thread's lane slice inside it
@@ -319,7 +475,7 @@ def grouped_epilogue_loop(
     cF_epi = cute.flat_divide(tCcF, epi_tile)
     frag = thr_t2r.partition_D(cF_epi)[(None, None, None, 0, 0, 0, 0, 0)]
     offs = fragment_offsets(frag.layout)
-    ve, partner, is_out = store_plan(offs, pair, 16 // (out_dt.width // 8))
+    ve, partner, is_out = store_plan(offs, pair, store_vec_max(out_dt))
     nv = len(offs)
     rows_in_frag = sorted(
         {m for m, _ in offs}
@@ -339,8 +495,8 @@ def grouped_epilogue_loop(
     )  # ((ve, NVEC), T2R_M, T2R_N, SUB_M, SUB_N, RestM, RestN, RestL)
     nvec = cute.size(tRG_rC.shape[0][1])
     n1, n2 = cute.size(tRG_rC.shape[1]), cute.size(tRG_rC.shape[2])
-    # the staged, row-coalesced store (16-bit outputs, 128-row layouts: thread = TMEM lane = tile row)
-    staged = sC is not None and cta_v is not None and out_dt.width == 16
+    # the staged, row-coalesced store (the 8- and 16-bit outputs, 128-row layouts: thread = TMEM lane = tile row)
+    staged = sC is not None and cta_v is not None and out_dt.width in (8, 16)
     tn = st.mma_tiler[1]
     cta_m = st.cta_tile_shape_mnk[0]
     epi_m = epi_n = CH = RS = SM = SN = (
@@ -385,7 +541,7 @@ def grouped_epilogue_loop(
         ]  # this warpgroup's buffer (EPI_M, EPI_N local columns)
         atom_s2g = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), out_dt, num_bits_per_copy=GROUP * out_dt.width
-        )  # 16 B
+        )  # one chunk of GROUP elements
         tiled_s2g = cute.make_tiled_copy_tv(
             atom_s2g,
             cute.make_layout((RS, CH), stride=(CH, 1)),
@@ -407,15 +563,28 @@ def grouped_epilogue_loop(
         mOutFlat = cute.make_tensor(
             mOut.iterator, cute.make_layout((Tk, N_out), stride=(ld, 1))
         )
+    inv = None
+    if cutlass.const_expr(paired_cvt):
+        inv = mSi[0]  # the intermediate multiplier, as given
     acc_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Consumer, st.num_acc_stage
     )
     work_tile = tile_sched.initial_work_tile_info()
     while work_tile.is_valid_tile:
-        row0, row_end, n_tile = work_tile.row0, work_tile.row_end, work_tile.n_tile
+        row0, row_end, n_tile, e = (
+            work_tile.row0,
+            work_tile.row_end,
+            work_tile.n_tile,
+            work_tile.e,
+        )
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()
         rows_left = row_end - row0
+        alpha_e = None
+        if cutlass.const_expr(chain.scaled):
+            alpha_e = w8a8_alpha(
+                MoeF32, mSa[0], mAlpha[e]
+            )  # the tile's alpha: one mul.rn per tile
         gC = cute.local_tile(
             cute.domain_offset((row0, 0, 0), mC), tiler_mn, (None, None, None)
         )
@@ -465,13 +634,31 @@ def grouped_epilogue_loop(
                         live[offs[v][0]], tTR_rAcc[v], Float32(1.0)
                     )
                 # the chain, in fp32, per element (pair)
-                for v in cutlass.range_constexpr(nv):
-                    if cutlass.const_expr(is_out[v]):
-                        tTR_rC[v] = _chain_elem(
-                            chain,
-                            tTR_rAcc[v],
-                            tTR_rAcc[partner[v]] if cutlass.const_expr(pair) else None,
-                        )
+                if cutlass.const_expr(paired_cvt):
+                    # two outputs per cvt.rn.satfinite.e4m3x2.f32 (any two output positions: each byte goes to its own register)
+                    outs = [v for v in range(nv) if is_out[v]]
+                    assert len(outs) % 2 == 0, offs
+                    for q in cutlass.range_constexpr(0, len(outs), 2):
+                        v0, v1 = outs[q], outs[q + 1]
+                        g0 = tTR_rAcc[partner[v0]] if cutlass.const_expr(pair) else None
+                        g1 = tTR_rAcc[partner[v1]] if cutlass.const_expr(pair) else None
+                        y0 = chain.elem(MoeF32, tTR_rAcc[v0], g0, alpha_e, inv)
+                        y1 = chain.elem(MoeF32, tTR_rAcc[v1], g1, alpha_e, inv)
+                        pr = cvt_f32x2_to_fp8x2(y0, y1, "e4m3")
+                        tTR_rC[v0] = (pr & 0xFF).to(Uint8)
+                        tTR_rC[v1] = (pr >> 8).to(Uint8)
+                else:
+                    for v in cutlass.range_constexpr(nv):
+                        if cutlass.const_expr(is_out[v]):
+                            tTR_rC[v] = chain.elem(
+                                MoeF32,
+                                tTR_rAcc[v],
+                                tTR_rAcc[partner[v]]
+                                if cutlass.const_expr(pair)
+                                else None,
+                                alpha_e,
+                                inv,
+                            )
                 if cutlass.const_expr(staged):
                     # registers -> this warpgroup's staging buffer (the TMEM load's thread layout); the rows of a skipped warp
                     # (all past the group's end) stay stale and are predicated off below

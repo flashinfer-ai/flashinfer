@@ -1,28 +1,32 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The fp8 grouped GEMMs' dispatcher: the dense fp8 class's ranking heuristic at the grouped launch's shape.
+"""The fp8 grouped GEMMs' dispatcher: the shared ranking contract of :mod:`.schedule` at the fp8 per-tensor classes' chains.
 
-As for the bf16 classes (:mod:`.schedule`): a grouped GEMM is the dense class under a different scheduler, so its records
-are ranked by the dense dispatcher's model at the dense shape whose tiles, M tail and operand bytes are the grouped
-launch's (``M`` = the rows of one active expert, ``N`` = the active experts' weight rows side by side), for the fp8 format
-(``in_fmt="e4m3"``: the format's MMA rate and operand bytes), mapped onto the grouped space and filtered by the grouped fp8
-body's acceptance. Numerics-neutral: every record of the space computes the class.
+As for the bf16 classes: a grouped GEMM is the dense class under a different scheduler, so its records are ranked by the
+dense dispatcher's model at the dense shape whose tiles, M tail and operand bytes are the grouped launch's (``M`` = the rows
+of one active expert, ``N`` = the active experts' weight rows side by side), for the fp8 format (the chain's ``in_fmt``:
+the format's MMA rate and operand bytes, the e4m3 output of GEMM1's chain one byte, the W8A8 chain's node count in the
+exposed-epilogue term), over the grouped and the swapped record spaces of the format, filtered by the bodies' acceptance.
+The functions here name the fp8 classes' entry points on :mod:`.schedule`'s functions (one ranking, one record cost, one
+memo). Numerics-neutral: every record of the space computes the class.
 """
 
 from __future__ import annotations
 
-import functools
 from typing import List, Optional, Tuple
 
 from ...gemm.batch_invariant.generator import Knobs
-from .blocks.fp8_epilogue import GEMM2_CHAIN, Fp8Chain
+from .blocks.epilogue import GEMM2_CHAIN, Fp8Chain
 from .schedule import (
-    record_cost,
     TOP_K,
     active_experts,
-    grouped_knobs,
-    raster_for,
+    all_valid_configs,
+    all_valid_configs_bf16,
+    all_valid_configs_swapped,
+    chain_nodes,
+    rank_grouped,
     rows_per_expert,
+    swapped_knobs,
 )
 
 IN_FMT = "e4m3"
@@ -36,73 +40,34 @@ def gemm1_chain(act: str = "silu", params=(), gated: bool = True) -> Fp8Chain:
 def all_valid_configs_fp8(
     N: int, K: int, E: int, chain: Fp8Chain = GEMM2_CHAIN, clusters=None
 ) -> List[Knobs]:
-    """The configuration space the grouped fp8 guarantee is claimed over, for a weight shape and a chain."""
-    from .blocks.fp8_compile import can_implement_grouped_fp8
-
-    return [
-        k
-        for k in grouped_knobs(clusters)
-        if can_implement_grouped_fp8(k, N, K, E, chain)
-    ]
+    """The grouped record space the fp8 guarantee is claimed over, for a weight shape and a chain."""
+    return all_valid_configs(N, K, E, chain, clusters)
 
 
 def swapped_knobs_fp8() -> List[Knobs]:
-    """The swapped record space of the fp8 classes (:mod:`.blocks.fp8_swap_kernel`): the swapped 1-CTA records at 128 or 64
-    weight rows x 16 / 32 tokens (``kind::f8f6f4`` takes N >= 16), no cluster, swizzle 1. Disjoint from the grouped space (the
-    swapped flag); the body reads the same dense rows through a TMA box."""
-    from .blocks.fp8_swap_kernel import swapped_knobs
-
-    return swapped_knobs()
+    """The swapped record space of the fp8 classes (:mod:`.blocks.swap`): the swapped 1-CTA records at 128 or 64 weight rows
+    x 16 / 32 tokens (``kind::f8f6f4`` takes N >= 16), no cluster, swizzle 1. Disjoint from the grouped space (the swapped
+    flag); the body reads the same dense rows through a TMA box."""
+    return swapped_knobs(IN_FMT)
 
 
 def all_valid_configs_swapped_fp8(
     N: int, K: int, E: int, chain: Fp8Chain = GEMM2_CHAIN
 ) -> List[Knobs]:
-    """The swapped records the fp8 swapped body accepts for a weight shape and a chain."""
-    from .blocks.fp8_compile import can_implement_swapped_fp8
-
-    return [
-        k for k in swapped_knobs_fp8() if can_implement_swapped_fp8(k, N, K, E, chain)
-    ]
+    """The swapped records the swapped body accepts for a weight shape and a chain of the fp8 classes."""
+    return all_valid_configs_swapped(N, K, E, chain)
 
 
 def all_valid_configs_fp8_both(
     N: int, K: int, E: int, chain: Fp8Chain = GEMM2_CHAIN, clusters=None
 ) -> List[Knobs]:
     """Both record spaces of the fp8 classes for a weight shape and a chain: the grouped records, then the swapped ones."""
-    return all_valid_configs_fp8(
-        N, K, E, chain, clusters
-    ) + all_valid_configs_swapped_fp8(N, K, E, chain)
+    return all_valid_configs_bf16(N, K, E, chain, clusters)
 
 
 def chain_nodes_fp8(chain: Fp8Chain) -> int:
-    """The node count of a W8A8 chain's term (the S-expression :mod:`..spec_fp8` builds for one output element: GEMM1's fused
-    e4m3 quantization of the gated or the ungated activation on the alpha-scaled accumulators, GEMM2's scaled conversion): the
-    exposed-epilogue term's cost unit (:func:`.schedule.exposed_epilogue_cycles`)."""
-    from . import mterm as term
-    from . import spec_fp8 as M8
-
-    alg = term.TermAlgebra()
-    alpha, inv = alg.sym("alpha"), alg.sym("inv")
-    if chain.pair:
-        t = M8.glu_quant_e4m3_elem(
-            alg,
-            alg.leaf("g", 0, 0),
-            alg.leaf("u", 0, 0),
-            alpha,
-            inv,
-            chain.act,
-            chain.params,
-        )
-    elif chain.kind == "act":
-        t = M8.act_quant_e4m3_elem(
-            alg, alg.leaf("x", 0), alpha, inv, chain.act, chain.params
-        )
-    elif chain.scaled:
-        t = M8.scaled_out_elem(alg, alg.leaf("x", 0), alpha, chain.out_fmt)
-    else:
-        return 1
-    return term.sexpr(t).count("(")
+    """The node count of a W8A8 chain's term (:func:`.schedule.chain_nodes`): the exposed-epilogue term's cost unit."""
+    return chain_nodes(chain)
 
 
 def rank_grouped_fp8(
@@ -118,105 +83,10 @@ def rank_grouped_fp8(
     n_active: Optional[int] = None,
     swap: Optional[bool] = None,
 ) -> List[Knobs]:
-    """The ranked records for one fp8 GEMM over both record spaces, as the bf16 backend's ``schedule.rank_grouped``: the grouped
-    records the fp8 body accepts for the weight shape and the chain (at a decode-sized ``rows`` the dense dispatcher's structural
-    guard selects the candidates) and the swapped records the fp8 swapped body accepts (``swap``: None ranks them with the rest,
-    True keeps only them, False excludes them), ordered by the dense fp8 class's estimate at ``(M = rows, N = n_active * N, K)``
-    (the fp8 instruction rate and operand bytes; the e4m3 output of GEMM1's chain is one byte) times the pair term and the swapped
-    records' spill factor, plus the last tile's exposed epilogue chain (the W8A8 chain's node count) and the token box's zero-fill
-    at the format's element width, rounded to three significant digits; each tile family priced once at the enumeration's raster
-    and the grouped scheduler's structural raster first among its twins; each of the best ceil(k/2) records is followed by its
-    raster twin, then the rank order fills the list: distinct records, at most ``k``, never empty for an implementable shape.
-    Numerics-neutral: every record of either space computes the class. Memoised on its arguments (all hashable scalars; the
-    chain is a frozen dataclass): the runner ranks at every forward without a tactic, once per token count."""
-    return list(
-        _rank_grouped_fp8(
-            rows, N, K, E, chain, sm_count, family, k, nominal, n_active, swap
-        )
+    """The ranked records for one fp8 GEMM over both record spaces: :func:`.schedule.rank_grouped` at the chain's format."""
+    return rank_grouped(
+        rows, N, K, E, chain, sm_count, family, k, nominal, n_active, swap, IN_FMT
     )
-
-
-@functools.lru_cache(maxsize=16384)
-def _rank_grouped_fp8(
-    rows: int,
-    N: int,
-    K: int,
-    E: int,
-    chain: Fp8Chain,
-    sm_count: Optional[int],
-    family: Optional[str],
-    k: int,
-    nominal: bool,
-    n_active: Optional[int],
-    swap: Optional[bool],
-) -> Tuple[Knobs, ...]:
-    import dataclasses
-
-    from ...gemm.batch_invariant.heuristic import decode_sane
-    from .blocks.fp8_compile import can_implement_grouped_fp8, can_implement_swapped_fp8
-
-    fam = family or "sm_107"
-    dense = (
-        []
-        if swap is True
-        else [
-            c for c in grouped_knobs() if can_implement_grouped_fp8(c, N, K, E, chain)
-        ]
-    )
-    swapped = (
-        []
-        if swap is False
-        else [
-            c
-            for c in swapped_knobs_fp8()
-            if can_implement_swapped_fp8(c, N, K, E, chain)
-        ]
-    )
-    space = dense + swapped
-    guarded = [c for c in dense if decode_sane(c, rows, False)] or dense
-    nodes = chain_nodes_fp8(chain)
-
-    def key(i, c):
-        est = record_cost(
-            c,
-            rows,
-            n_active or E,
-            N,
-            K,
-            nodes,
-            chain.pair,
-            fam,
-            sm_count,
-            IN_FMT,
-            nominal,
-        )
-        return (
-            float(f"{est:.3g}"),
-            0 if (c.swap_ab or c.raster_along == raster_for(c, rows)) else 1,
-            i,
-        )
-
-    ranked = [
-        c for _k, c in sorted((key(i, c), c) for i, c in enumerate(guarded + swapped))
-    ]
-    members = set(space)
-    out: List[Knobs] = []
-    seen = set()
-    for rec in ranked[: -(-k // 2)]:
-        twin = dataclasses.replace(
-            rec, raster_along="n" if rec.raster_along == "m" else "m"
-        )
-        for cand in (rec, twin):
-            if cand not in seen and (cand is rec or cand in members):
-                out.append(cand)
-                seen.add(cand)
-    for rec in ranked:
-        if len(out) >= k:
-            break
-        if rec not in seen:
-            out.append(rec)
-            seen.add(rec)
-    return tuple(out[:k])
 
 
 def default_configs_fp8(

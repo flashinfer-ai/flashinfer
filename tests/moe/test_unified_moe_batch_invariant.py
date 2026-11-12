@@ -882,7 +882,7 @@ def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch
     wait) -- and its builder asserts the shipped placement is one of them, so a placement outside the rule cannot build the
     box form; the gather form, which waits before its tables, builds under any."""
     from flashinfer.fused_moe.batch_invariant import pdl
-    from flashinfer.fused_moe.batch_invariant.blocks.swap_bf16 import SwappedGroupedGemm
+    from flashinfer.fused_moe.batch_invariant.blocks.swap import SwappedGroupedGemm
     from flashinfer.fused_moe.batch_invariant.schedule import swapped_knobs
 
     cfg = swapped_knobs()[0]

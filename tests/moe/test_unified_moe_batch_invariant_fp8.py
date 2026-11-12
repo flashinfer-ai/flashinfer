@@ -19,6 +19,8 @@ weight preparation's multipliers and the dispatcher's membership in the enumerat
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 
@@ -50,7 +52,10 @@ from flashinfer.fused_moe import (
     SwiGLUStep,
 )
 from flashinfer.fused_moe.api import ALL_BACKEND_CONFIGS, _DEFAULT_BACKEND
-from flashinfer.fused_moe.batch_invariant.runner import BatchInvariantMoeRunner
+from flashinfer.fused_moe.batch_invariant.runner import (
+    BatchInvariantMoeRunner,
+    BatchInvariantMoeRunnerBase,
+)
 from flashinfer.fused_moe.batch_invariant.runner_fp8 import (
     MOE_FP8_ARCHS,
     BatchInvariantFp8PerTensorRunner,
@@ -252,7 +257,10 @@ def test_backend_is_registered_and_never_a_default_candidate():
         for a in (89, 90, 100, 103, 107, 110, 120, 121)
         if BatchInvariantFp8PerTensorConfig.supported(a)
     ] == [100, 103, 107]
-    assert issubclass(BatchInvariantFp8PerTensorRunner, BatchInvariantMoeRunner)
+    # both class runners are the shared base's (the pack / plan / launch flow with the format hooks)
+    assert issubclass(BatchInvariantFp8PerTensorRunner, BatchInvariantMoeRunnerBase)
+    assert issubclass(BatchInvariantMoeRunner, BatchInvariantMoeRunnerBase)
+    assert not issubclass(BatchInvariantFp8PerTensorRunner, BatchInvariantMoeRunner)
     assert (
         BatchInvariantFp8PerTensorRunner.backend_key
         == "batch_invariant_fp8_per_tensor"
@@ -426,40 +434,40 @@ def test_expert_and_slot_bounds_at_every_entry_point():
 
 
 def test_ranking_is_memoised_per_token_count():
-    """``rank_grouped_fp8`` (the dispatcher's enumeration, acceptance and pricing of both fp8 record spaces) is memoised on its
-    scalar arguments (the chain a frozen dataclass): a repeated call is a cache hit returning an equal list, and
-    ``default_configs_fp8`` (the ``fused_moe_fp8`` path without records) hits twice per call; the lists are copies."""
+    """``rank_grouped_fp8`` (the shared dispatcher's enumeration, acceptance and pricing of both fp8 record spaces at the
+    chain's format) is memoised on its scalar arguments (the chain a frozen dataclass) in the one memo of ``schedule``: a
+    repeated call is a cache hit returning an equal list, and ``default_configs_fp8`` (the ``fused_moe_fp8`` path without
+    records) hits twice per call; the lists are copies."""
+    from flashinfer.fused_moe.batch_invariant.schedule import _rank_grouped
     from flashinfer.fused_moe.batch_invariant.schedule_fp8 import (
-        _rank_grouped_fp8,
         default_configs_fp8,
         gemm1_chain,
         rank_grouped_fp8,
     )
 
-    _rank_grouped_fp8.cache_clear()
+    _rank_grouped.cache_clear()
     args = (7, 1536, 2048, 128, gemm1_chain("silu"), 212, "sm_107", 3)
     a = rank_grouped_fp8(*args, n_active=56)
-    misses = _rank_grouped_fp8.cache_info().misses
+    misses = _rank_grouped.cache_info().misses
     b = rank_grouped_fp8(*args, n_active=56)
     assert b == a and b is not a and len(a) == 3
-    assert _rank_grouped_fp8.cache_info().hits == 1
-    assert _rank_grouped_fp8.cache_info().misses == misses
+    assert _rank_grouped.cache_info().hits == 1
+    assert _rank_grouped.cache_info().misses == misses
     a.clear()
     assert rank_grouped_fp8(*args, n_active=56) == b
     c = default_configs_fp8(1, 8, 2048, 768, 128, 212, "sm_107", True)
-    hits = _rank_grouped_fp8.cache_info().hits
+    hits = _rank_grouped.cache_info().hits
     assert default_configs_fp8(1, 8, 2048, 768, 128, 212, "sm_107", True) == c
-    assert _rank_grouped_fp8.cache_info().hits == hits + 2
+    assert _rank_grouped.cache_info().hits == hits + 2
 
 
 def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch):
-    """The fp8 swapped body reads the plan's group counts before its PDL wait (the predecessor's predecessor's output,
-    complete under the chain's trigger rule ``pdl.BOX_FORM_TRIGGERS``) and its builder asserts the shipped placement is one
-    of them, as the bf16 swapped body's does."""
+    """The swapped body at an fp8 chain reads the plan's group counts under the chain's trigger rule
+    (``pdl.BOX_FORM_TRIGGERS``: the dependents launch after the predecessor's own wait, the body's own wait before the tables
+    is the margin) and its builder asserts the shipped placement is one of them, as it does for the bf16 chains; the gather
+    form belongs to the bf16 classes."""
     from flashinfer.fused_moe.batch_invariant import pdl
-    from flashinfer.fused_moe.batch_invariant.blocks.fp8_swap_kernel import (
-        SwappedGroupedGemmFp8,
-    )
+    from flashinfer.fused_moe.batch_invariant.blocks.swap import SwappedGroupedGemm
     from flashinfer.fused_moe.batch_invariant.schedule_fp8 import (
         gemm1_chain,
         swapped_knobs_fp8,
@@ -467,10 +475,105 @@ def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch
 
     cfg = swapped_knobs_fp8()[0]
     assert pdl.TRIGGER in pdl.BOX_FORM_TRIGGERS
-    SwappedGroupedGemmFp8(cfg, gemm1_chain("silu"))
+    SwappedGroupedGemm(cfg, gemm1_chain("silu"))
+    with pytest.raises(AssertionError):
+        SwappedGroupedGemm(cfg, gemm1_chain("silu"), gather=True)
     monkeypatch.setattr(pdl, "TRIGGER", "early")
     with pytest.raises(AssertionError):
-        SwappedGroupedGemmFp8(cfg, gemm1_chain("silu"))
+        SwappedGroupedGemm(cfg, gemm1_chain("silu"))
+
+
+def test_one_body_per_form_serves_both_formats():
+    """The grouped and the swapped bodies are one source each, parametrised by the chain's operand format and epilogue block:
+    the fp8 chains declare their format and scale operands, the bf16 chains none; the swapped record space follows the
+    format's instruction (``kind::f8f6f4`` takes 16 or 32 tokens, ``kind::f16`` 8 as well); the compiled objects keep their
+    names and one JIT module (``batch_invariant_moe``) holds both formats' kernels, with no format-specific body in its
+    source closure; the bodies take a chain of either format and the gather form stays the bf16 classes'."""
+    from flashinfer.batch_invariant import jit
+    from flashinfer.fused_moe.batch_invariant.blocks import compile as C
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import (
+        GEMM2_CHAIN,
+        Fp8Chain,
+        GroupedChain,
+        GroupedEpilogueBlock,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.kernel import (
+        K_BLOCKS_OF,
+        DenseOperands,
+        GroupedBlockGemm,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.swap import (
+        SwappedGroupedGemm,
+        is_swapped_record,
+        swapped_knobs,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule import rank_grouped
+    from flashinfer.fused_moe.batch_invariant.schedule_fp8 import gemm1_chain
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+
+    bf16, fp8 = GroupedChain.legacy("swiglu"), gemm1_chain("silu")
+    for ch in (bf16, GroupedChain("plain", "silu", "f32"), fp8, GEMM2_CHAIN):
+        assert isinstance(ch, GroupedEpilogueBlock)
+    assert (bf16.in_fmt, bf16.scale_operands, bf16.scaled, bf16.paired_cvt) == (
+        "bf16",
+        False,
+        False,
+        False,
+    )
+    assert (fp8.in_fmt, fp8.scale_operands, fp8.scaled, fp8.paired_cvt, fp8.pair) == (
+        "e4m3",
+        True,
+        True,
+        True,
+        True,
+    )
+    assert (GEMM2_CHAIN.scaled, GEMM2_CHAIN.paired_cvt) == (True, False)
+    raw = Fp8Chain("plain", "silu", "f32", (), False)
+    assert raw.scale_operands and not raw.scaled
+    # the record spaces of the two formats
+    assert [(c.tile_m, c.tile_n) for c in swapped_knobs("bf16")] == [
+        (128, 8),
+        (128, 16),
+        (128, 32),
+        (64, 16),
+        (64, 32),
+    ]
+    assert [(c.tile_m, c.tile_n) for c in swapped_knobs("e4m3")] == [
+        (128, 16),
+        (128, 32),
+        (64, 16),
+        (64, 32),
+    ]
+    sw8 = swapped_knobs("bf16")[0]
+    assert is_swapped_record(sw8, "bf16") and not is_swapped_record(sw8, "e4m3")
+    assert not C.can_implement_swapped(sw8, 256, 512, 8, fp8)
+    assert C.can_implement_swapped(sw8, 256, 512, 8, "plain")
+    # the bodies take a chain of either format; the operand block follows the chain
+    dense = Knobs((128, 128), (1, 1), False, True, "m", 1)
+    for ch in (bf16, fp8):
+        body = GroupedBlockGemm(dense, ch)
+        assert body.in_fmt == ch.in_fmt and body.operands == DenseOperands(ch.in_fmt)
+        sw = swapped_knobs(ch.in_fmt)[0]
+        assert SwappedGroupedGemm(sw, ch).operands.in_fmt == ch.in_fmt
+    assert K_BLOCKS_OF["swapped"]["bf16"] == K_BLOCKS_OF["swapped"]["e4m3"]
+    with pytest.raises(AssertionError):
+        SwappedGroupedGemm(swapped_knobs("e4m3")[0], fp8, gather=True)
+    # the object names carry the format; one JIT module, no format-specific body in its closure
+    assert C.kernel_name(dense, bf16) == "grouped_bf16_swiglu_bf16_" + dense.describe()
+    assert C.kernel_name(dense, fp8).startswith("grouped_e4m3_glu_silu_w8a8_e4m3_")
+    assert C.swapped_kernel_name(swapped_knobs("e4m3")[0], GEMM2_CHAIN).startswith(
+        "swapped_e4m3_plain_silu_w8a8_bf16_"
+    )
+    assert C.MODULE == "batch_invariant_moe" and "batch_invariant_moe_fp8" not in jit.MODULE_ROOTS
+    srcs = jit.relative_sources("batch_invariant_moe")
+    assert not any("fp8_" in os.path.basename(s) or "swap_bf16" in s for s in srcs), srcs
+    for body in ("compile", "kernel", "swap", "epilogue"):
+        assert f"fused_moe/batch_invariant/blocks/{body}.py" in srcs
+    # the shared ranking at the chain's format: the fp8 chain's list is a subset of its own space
+    ranked = rank_grouped(1, 1536, 2048, 128, fp8, 212, "sm_107", 3, False, 8)
+    assert ranked and all(C.can_implement(c, 1536, 2048, 128, fp8) for c in ranked)
+    with pytest.raises(AssertionError):
+        rank_grouped(1, 1536, 2048, 128, fp8, 212, "sm_107", 3, False, 8, in_fmt="bf16")
 
 
 def _adversarial_accumulators(limits, n_random: int, seed: int) -> torch.Tensor:
@@ -662,7 +765,7 @@ def test_input_quantization_and_dequantization_scales_are_the_declared_chains():
 def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
     """The dispatcher's pick for every bench geometry and token count lies in the enumerated grouped fp8 space of its GEMM, for
     the gated and the ungated classes, at the nominal parts; the ranked list is short, distinct and inside the space."""
-    from flashinfer.fused_moe.batch_invariant.blocks.fp8_epilogue import GEMM2_CHAIN
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GEMM2_CHAIN
     from flashinfer.fused_moe.batch_invariant.schedule import rows_per_expert
     from flashinfer.fused_moe.batch_invariant.schedule_fp8 import (
         all_valid_configs_fp8,
@@ -781,7 +884,7 @@ def _reference_ffn(
         grouped_gemm_fp8,
     )
     from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GROUP
-    from flashinfer.fused_moe.batch_invariant.blocks.fp8_epilogue import Fp8Chain
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import Fp8Chain
     from flashinfer.fused_moe.batch_invariant.schedule_fp8 import all_valid_configs_fp8
     from flashinfer.gemm.batch_invariant.api import mm_fp8_batch_invariant
     from flashinfer.gemm.batch_invariant.schedule import chunks_for
@@ -1086,7 +1189,7 @@ def test_swapped_records_equal_the_grouped_records():
     the dense buffer with and without the token tile's pad rows past the live ones (the last tiles' boxes then read the pad, or
     are zero-filled past the buffer: never stored)."""
     from flashinfer.fused_moe.batch_invariant.api_fp8 import grouped_gemm_fp8
-    from flashinfer.fused_moe.batch_invariant.blocks.fp8_epilogue import (
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import (
         GEMM2_CHAIN,
         Fp8Chain,
     )

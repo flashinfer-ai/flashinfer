@@ -191,6 +191,85 @@ class MoEWeights:
         )
 
 
+def _check_grouped_operands(
+    name: str,
+    a: torch.Tensor,
+    w: torch.Tensor,
+    counts: torch.Tensor,
+    Tk: Optional[int],
+    out: Optional[torch.Tensor],
+    dtype: torch.dtype,
+    align: int,
+    kind: str,
+) -> Tuple[int, int, int, int, int]:
+    """The grouped GEMM entries' shared operand rules (``(R, K, E, N, Tk)``): ``a [R, K]`` and ``w [E, N, K]`` of the
+    class's operand ``dtype``, K-contiguous and 16-byte-aligned (``align`` elements), one K, at most ``MAX_E`` experts,
+    ``Tk`` in ``[0, R]`` (the rows of ``out`` by default, else of ``a``), ``counts`` a contiguous int32 ``[E]``."""
+    if a.dtype != dtype or w.dtype != dtype or a.dim() != 2 or w.dim() != 3:
+        raise TypeError(f"{name} takes {kind} a [Tk, K] and w [E, N, K]")
+    R, K = a.shape
+    E, N, K2 = w.shape
+    if E > MAX_E:
+        raise ValueError(f"{name}: {E} experts; the group tables hold at most {MAX_E}")
+    if Tk is None:
+        Tk = out.shape[0] if out is not None else R
+    if not 0 <= Tk <= R:
+        raise ValueError(f"{name}: Tk {Tk} must lie in [0, {R}] (the rows of a)")
+    if (
+        K != K2
+        or a.stride(1) != 1
+        or w.stride(2) != 1
+        or w.stride(1) != K
+        or a.stride(0) % align
+        or w.stride(0) % align
+        or K % align
+    ):
+        raise ValueError(
+            f"{name}: K-contiguous, 16-byte-aligned operands of one K "
+            f"(a {tuple(a.shape)} strides {tuple(a.stride())}, w {tuple(w.shape)} strides {tuple(w.stride())})"
+        )
+    if (
+        counts.dtype != torch.int32
+        or tuple(counts.shape) != (E,)
+        or not counts.is_contiguous()
+    ):
+        raise ValueError(f"{name}: counts must be a contiguous int32 [E]")
+    return R, K, E, N, Tk
+
+
+def _grouped_out(
+    name: str,
+    out: Optional[torch.Tensor],
+    Tk: int,
+    n_out: int,
+    out_dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """The output buffer of a grouped GEMM entry: ``[Tk, n_out]`` of the chain's dtype, row-major and 16-byte-aligned
+    (allocated when not given)."""
+    if out is None:
+        out = torch.empty(Tk, n_out, dtype=out_dtype, device=device)
+    oal = 16 // out.element_size()
+    if (
+        tuple(out.shape) != (Tk, n_out)
+        or out.dtype != out_dtype
+        or out.stride(1) != 1
+        or out.stride(0) % oal
+    ):
+        raise ValueError(
+            f"{name}: out must be a 16-byte-aligned row-major [Tk, n_out] of the chain's dtype"
+        )
+    return out
+
+
+def launch_grid(device: torch.device, config: Knobs, Tk: int, E: int, N: int) -> int:
+    """The persistent grid of a grouped launch: the device's co-resident cluster capacity for the record's cluster size,
+    clipped to the launch's tile bound (a placement: which CTA computes a tile, never the bits)."""
+    from .schedule import launch_tile_bound
+
+    return min(persistent_clusters(device, config), launch_tile_bound(config, Tk, E, N))
+
+
 def grouped_gemm(
     a: torch.Tensor,
     w: torch.Tensor,
@@ -207,67 +286,24 @@ def grouped_gemm(
     bf16 row-major; ``chain`` ``plain`` -> ``[Tk, N]`` in ``out_dtype`` (bf16 / f16 / f32), ``swiglu`` -> ``[Tk, N / 2]`` bf16
     (``w`` interleaved as :func:`interleave_fc1`), ``relu2`` -> ``[Tk, N]`` bf16 (the ungated chain). The record selects the
     body: a dense record runs the grouped body, a swapped record (``config.swap_ab``: a 128- or 64-row weight tile x 8 / 16 /
-    32 tokens, the weights on the MMA's M side, :mod:`.blocks.swap_bf16`) the swapped body on the same dense rows -- a
+    32 tokens, the weights on the MMA's M side, :mod:`.blocks.swap`) the swapped body on the same dense rows -- a
     placement, the same bits. ``Tk`` (default: the rows of ``out``, else of ``a``) is the expanded row count; ``a`` may carry more rows (the
     swapped body's last token box then stays inside the buffer instead of being zero-filled past it). The persistent grid is a
     launch argument: the device's co-resident cluster capacity for the record's cluster size."""
     from .blocks.compile import get_compiled_grouped, get_compiled_swapped
-    from .schedule import launch_tile_bound
 
-    if (
-        a.dtype != torch.bfloat16
-        or w.dtype != torch.bfloat16
-        or a.dim() != 2
-        or w.dim() != 3
-    ):
-        raise TypeError("grouped_gemm takes bf16 a [Tk, K] and w [E, N, K]")
-    R, K = a.shape
-    E, N, K2 = w.shape
-    if E > MAX_E:
-        raise ValueError(
-            f"grouped_gemm: {E} experts; the group tables hold at most {MAX_E}"
-        )
-    if (
-        K != K2
-        or a.stride(1) != 1
-        or w.stride(2) != 1
-        or w.stride(1) != K
-        or a.stride(0) % 8
-        or w.stride(0) % 8
-    ):
-        raise ValueError(
-            "grouped_gemm: K-contiguous, 16-byte-aligned operands of one K "
-            f"(a {tuple(a.shape)} strides {tuple(a.stride())}, w {tuple(w.shape)} strides {tuple(w.stride())})"
-        )
-    if Tk is None:
-        Tk = out.shape[0] if out is not None else R
-    if not 0 <= Tk <= R:
-        raise ValueError(f"grouped_gemm: Tk {Tk} must lie in [0, {R}] (the rows of a)")
-    if (
-        counts.dtype != torch.int32
-        or tuple(counts.shape) != (E,)
-        or not counts.is_contiguous()
-    ):
-        raise ValueError("grouped_gemm: counts must be a contiguous int32 [E]")
+    R, K, E, N, Tk = _check_grouped_operands(
+        "grouped_gemm", a, w, counts, Tk, out, torch.bfloat16, 8, "bf16"
+    )
     if isinstance(chain, str):
         if chain not in ("plain", "swiglu", "relu2"):
             raise ValueError(f"unknown chain {chain!r}")
         chain = GroupedChain.legacy(chain, _OUT[out_dtype])
     n_out = N // 2 if chain.pair else N
-    out_dtype = _DTYPE_OF[
-        chain.out_fmt
-    ]  # the chain's output format (the gated chains convert once, to bf16)
-    if out is None:
-        out = torch.empty(Tk, n_out, dtype=out_dtype, device=a.device)
-    if (
-        tuple(out.shape) != (Tk, n_out)
-        or out.dtype != out_dtype
-        or out.stride(1) != 1
-        or out.stride(0) % 8
-    ):
-        raise ValueError(
-            "grouped_gemm: out must be a 16-byte-aligned row-major [Tk, n_out] of the chain's dtype"
-        )
+    # the chain's output format (the gated chains convert once, to bf16)
+    out = _grouped_out(
+        "grouped_gemm", out, Tk, n_out, _DTYPE_OF[chain.out_fmt], a.device
+    )
     kernel = (
         get_compiled_swapped(config, chain)
         if config.swap_ab
@@ -280,10 +316,7 @@ def grouped_gemm(
             :Tk
         ]  # the grouped body's A has the output's rows (one symbol); the swapped body's R is free
     if grid is None:
-        # the persistent grid clipped to the launch's tile bound (a placement: which CTA computes a tile)
-        grid = min(
-            persistent_clusters(a.device, config), launch_tile_bound(config, Tk, E, N)
-        )
+        grid = launch_grid(a.device, config, Tk, E, N)
     kernel(
         a.unsqueeze(-1),
         w.permute(1, 2, 0),
@@ -584,6 +617,110 @@ def route_plan(
 PLAN_MULTI_MIN_N = 16384  # from this many slots the plan runs as the two-launch block form (the same outputs)
 
 
+def _check_fused_inputs(
+    name: str,
+    x: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    out: Optional[torch.Tensor],
+    w_hidden: int,
+    dtype: torch.dtype,
+    align: int,
+    kind: str,
+) -> Tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The fused entries' shared input rules (``(T, H, k, experts, scales, out)``): ``x [T, H]`` of the class's operand
+    ``dtype``, row-major and 16-byte-aligned (``align`` elements), its H the weights', ``token_selected_experts [T, k]`` int32
+    with ``1 <= k <= MAX_TOP_K`` (a shard's k is the global routing's, so E does not bound it here), ``token_final_scales [T,
+    k]`` fp32, ``out`` a row-major 16-byte-aligned bf16 ``[T, H]`` (allocated when not given)."""
+    if x.dtype != dtype or x.dim() != 2 or x.stride(1) != 1 or x.stride(0) % align:
+        raise TypeError(f"{name}: x must be a row-major, 16-byte-aligned {kind} [T, H]")
+    T, H = x.shape
+    if w_hidden != H:
+        raise ValueError(f"{name}: x has H = {H}, the weights H = {w_hidden}")
+    k = token_selected_experts.shape[1]
+    if (
+        tuple(token_selected_experts.shape) != (T, k)
+        or token_selected_experts.dtype != torch.int32
+    ):
+        raise TypeError(f"{name}: token_selected_experts must be an int32 [T, k]")
+    if not 1 <= k <= S.MAX_TOP_K:
+        raise ValueError(
+            f"{name}: {k} slots per token; the plan, gather and combine kernels fold at most {S.MAX_TOP_K}"
+        )
+    if (
+        tuple(token_final_scales.shape) != (T, k)
+        or token_final_scales.dtype != torch.float32
+    ):
+        raise TypeError(f"{name}: token_final_scales must be a float32 [T, k]")
+    if out is None:
+        out = torch.empty(T, H, dtype=torch.bfloat16, device=x.device)
+    if (
+        tuple(out.shape) != (T, H)
+        or out.dtype != torch.bfloat16
+        or out.stride(1) != 1
+        or out.stride(0) % 8
+    ):
+        raise ValueError(
+            f"{name}: out must be a row-major, 16-byte-aligned bf16 [T, H]"
+        )
+    return (
+        T,
+        H,
+        k,
+        token_selected_experts.contiguous(),
+        token_final_scales.contiguous(),
+        out,
+    )
+
+
+def gather_rows(
+    x: torch.Tensor, src: torch.Tensor, k: int, Tk: int, pad: int, fmt: str
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The permuted rows of the fused flow: ``(x_buf [Tk + pad, H], x_perm = x_buf[:Tk])`` of ``x``'s dtype, gathered by the
+    shared gather kernel through the plan's slots (``fmt`` names the row format of the kernel: ``bf16`` / ``e4m3``). The pad
+    rows past the live ones are a swapped record's token box; they are never stored."""
+    T, H = x.shape
+    x_buf = torch.empty(Tk + pad, H, dtype=x.dtype, device=x.device)
+    x_perm = x_buf[:Tk]
+    if Tk:
+        from .permute import get_compiled_gather, warps_per_row
+
+        al = 16 // x.element_size()
+        get_compiled_gather(k, fmt, warps_per_row(Tk, H // al, sm_count_of(x.device)))(
+            x, src, x_perm, Tk, H
+        )
+    return x_buf, x_perm
+
+
+def combine_rows(
+    y: torch.Tensor,
+    dest: torch.Tensor,
+    scales: torch.Tensor,
+    out: torch.Tensor,
+    k: int,
+    w_round: bool,
+) -> None:
+    """The slot-order combine of the fused flow: ``out[t] = cvt_bf16(fold_r add(acc, mul(f32(y[dest[t, r]]), w[t, r])))``
+    through the shared combine kernel (``w_round``: the f32 weights enter as their bf16 rounding)."""
+    from .combine import get_compiled_combine, warps_per_token
+
+    T, H = out.shape
+    if T:
+        get_compiled_combine(
+            k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(y.device)), w_round
+        )(y, dest, scales, out, T, H)
+
+
+def swapped_pads(config1: Knobs, config2: Knobs) -> Tuple[int, int]:
+    """A swapped record reads a token box of its tile's rows at every group's row: the dense buffer it reads carries that
+    many rows past the live ones, so the last tiles' boxes stay inside it (rows past the live ones are computed and never
+    stored); 0 for a dense record."""
+    return (
+        config1.tile_n if config1.swap_ab else 0,
+        config2.tile_n if config2.swap_ab else 0,
+    )
+
+
 def permute_plan(
     experts: torch.Tensor, E: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -660,50 +797,25 @@ def fused_moe(
     the launch's tile bound (the default), or the device's capacity (a placement either way). ``w_round``: the f32 ``weights`` enter the fold as their bf16
     rounding, done by the combine kernel (the pre-routed packed-word convention: the bits of rounding them on the host first,
     without the host's passes over the slots)."""
-    from .combine import get_compiled_combine, warps_per_token
-    from .permute import get_compiled_gather, warps_per_row
     from .schedule import default_configs
 
     if not isinstance(w, MoEWeights):
         w = MoEWeights.prepare(*w)
-    if x.dtype != torch.bfloat16 or x.dim() != 2 or x.stride(1) != 1 or x.stride(0) % 8:
-        raise TypeError("fused_moe: x must be a row-major, 16-byte-aligned bf16 [T, H]")
-    T, H = x.shape
-    if w.hidden_size != H:
-        raise ValueError(f"fused_moe: x has H = {H}, the weights H = {w.hidden_size}")
-    k = token_selected_experts.shape[1]
-    if (
-        tuple(token_selected_experts.shape) != (T, k)
-        or token_selected_experts.dtype != torch.int32
-    ):
-        raise TypeError("fused_moe: token_selected_experts must be an int32 [T, k]")
-    if not 1 <= k <= S.MAX_TOP_K:
-        # the bound of the slots per token (a shard's k is the global routing's, so E does not bound it here)
-        raise ValueError(
-            f"fused_moe: {k} slots per token; the plan, gather and combine kernels fold at most {S.MAX_TOP_K}"
-        )
-    if (
-        tuple(token_final_scales.shape) != (T, k)
-        or token_final_scales.dtype != torch.float32
-    ):
-        raise TypeError("fused_moe: token_final_scales must be a float32 [T, k]")
-    experts = token_selected_experts.contiguous()
-    scales = token_final_scales.contiguous()
+    T, H, k, experts, scales, out = _check_fused_inputs(
+        "fused_moe",
+        x,
+        token_selected_experts,
+        token_final_scales,
+        out,
+        w.hidden_size,
+        torch.bfloat16,
+        8,
+        "bf16",
+    )
     E, I = w.num_experts, w.intermediate_size
     if E > MAX_E:
         raise ValueError(
             f"fused_moe: {E} experts; the plan and the grouped GEMMs hold at most {MAX_E}"
-        )
-    if out is None:
-        out = torch.empty(T, H, dtype=torch.bfloat16, device=x.device)
-    if (
-        tuple(out.shape) != (T, H)
-        or out.dtype != torch.bfloat16
-        or out.stride(1) != 1
-        or out.stride(0) % 8
-    ):
-        raise ValueError(
-            "fused_moe: out must be a row-major, 16-byte-aligned bf16 [T, H]"
         )
     if config1 is None or config2 is None:
         c1, c2 = default_configs(T, k, H, I, E, *_part(x.device), gated=w.gated)
@@ -712,10 +824,7 @@ def fused_moe(
         plan if plan is not None else permute_plan(experts, E)
     )  # ``plan``: ``route_plan``'s outputs, the same integers
     Tk = T * k
-    # a swapped record reads a token box of its tile's rows at every group's row: the dense buffer it reads carries that many
-    # rows past the live ones, so the last tiles' boxes stay inside it (rows past the live ones are computed and never stored)
-    pad1 = config1.tile_n if config1.swap_ab else 0
-    pad2 = config2.tile_n if config2.swap_ab else 0
+    pad1, pad2 = swapped_pads(config1, config2)
     a_buf = torch.empty(Tk + pad2, I, dtype=torch.bfloat16, device=x.device)
     g1 = None if grid_clip else persistent_clusters(x.device, config1)
     g2 = None if grid_clip else persistent_clusters(x.device, config2)
@@ -728,22 +837,15 @@ def fused_moe(
             x, src, k, w.w1i, counts, config1, w.chain1, out=a_buf[:Tk], Tk=Tk, grid=g1
         )  # [Tk, I] bf16
     else:
-        x_buf = torch.empty(Tk + pad1, H, dtype=torch.bfloat16, device=x.device)
-        x_perm = x_buf[:Tk]
-        if Tk:
-            get_compiled_gather(
-                k, "bf16", warps_per_row(Tk, H // 8, sm_count_of(x.device))
-            )(x, src, x_perm, Tk, H)
+        x_buf, x_perm = gather_rows(x, src, k, Tk, pad1, "bf16")
         a = grouped_gemm(
             x_buf, w.w1i, counts, config1, w.chain1, out=a_buf[:Tk], Tk=Tk, grid=g1
         )  # [Tk, I] bf16
     y = grouped_gemm(
         a_buf, w.w2, counts, config2, "plain", torch.bfloat16, Tk=Tk, grid=g2
     )  # [Tk, H] bf16
-    if finalize and T:
-        get_compiled_combine(
-            k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(x.device)), w_round
-        )(y, dest, scales, out, T, H)
+    if finalize:
+        combine_rows(y, dest, scales, out, k, w_round)
     if return_intermediates:
         return out, dict(
             counts=counts,

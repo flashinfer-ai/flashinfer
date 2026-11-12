@@ -1,10 +1,12 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The swapped body of the bf16 MoE classes: ``C^T`` per expert, with the expert's weight rows on the MMA's M side (a
-128-row tile streamed by TMA with the expert as the batch coordinate) and the group's tokens on the N side as a **narrow
-token tile** (8, 16 or 32 rows: the swapped records of :mod:`..schedule`), read as a TMA box from the dense permuted
-activations at the group's row (``x_perm`` for GEMM1, the dense intermediate for GEMM2) -- the same dense rows the grouped
-body reads, so no second packing. Rows past the group's end (the next group's rows or the buffer's tail) are computed and
+"""The swapped body of the MoE classes: ``C^T`` per expert, with the expert's weight rows on the MMA's M side (a 128- or
+64-row tile streamed by TMA with the expert as the batch coordinate) and the group's tokens on the N side as a **narrow
+token tile** (8, 16 or 32 rows: the swapped records of :mod:`..schedule`; ``kind::f8f6f4`` takes 16 or 32), read as a TMA
+box from the dense permuted activations at the group's row (``x_perm`` for GEMM1, the dense intermediate for GEMM2) -- the
+same dense rows the grouped body reads, so no second packing. One body for the bf16 and the fp8 per-tensor classes, as
+:mod:`.kernel`: the operand block (:class:`.kernel.DenseOperands`, keyed by the chain's operand format) and the epilogue
+block (the chain: the bf16 chains, or the W8A8 chains with their scale operands) are resolved at trace time. Rows past the group's end (the next group's rows or the buffer's tail) are computed and
 never stored: the MMA is token-local on N. One TMA pipeline carries the weight tile and the token box of one k-tile per
 stage, two swizzle atoms of K per stage (the grouped records' step), the dense ``mma_loop`` folds them, and the
 transposed group-masked epilogue stores token ``j`` of the tile as output row ``row0 + j``.
@@ -23,7 +25,9 @@ weight rows per CTA. The dispatcher ranks the swapped records with the grouped o
 
 Operands: ``rows (R, K, 1)`` K-major (the dense permuted rows; ``R >= Tk``: with ``R >= Tk + token_tile`` the last tiles'
 boxes stay inside the buffer, else they are zero-filled past it), ``w (N, K, E)`` K-major, ``out (Tk, Nout)`` row-major
-(``Nout = N`` plain and ungated, ``N / 2`` gated; bf16 / f16 / f32), ``counts (E,)`` int32.
+(``Nout = N`` plain and ungated, ``N / 2`` gated; bf16 / f16 / f32, or the uint8 bytes of e4m3 for the fp8 classes'
+GEMM1), ``counts (E,)`` int32; for a chain with scale operands ``alpha (E,)``, ``sa (1,)``, ``si (1,)`` fp32 as for the
+grouped body (:meth:`SwappedGroupedGemm.with_scales`).
 The gather form (``gather=True``, :meth:`SwappedGroupedGemm.gathered`): the token tile's rows gathered by the TMA's gather4
 mode from the unpermuted ``x (T, K)`` through the plan's ``src`` (row ``p`` reads ``x[src[p] // k_div]``; rows past the
 group's end repeat its last row and are never stored), one swizzle atom of K per stage (the gather4 box is the atom): GEMM1
@@ -34,30 +38,33 @@ launch, so every warp waits for it before the group tables.
 from __future__ import annotations
 
 import dataclasses
-from typing import List, Union
+from typing import Dict, List, Tuple, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
-from cutlass import Int32
+from cutlass import Int32, Uint8
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutlass.tensor_utils import LayoutEnum
 from cutlass.utils.blackwell_helpers import get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
+from ....batch_invariant.quantization.cvt_fp8 import cvt_f32x2_to_fp8x2
 from ....gemm.batch_invariant.blocks.mainloop import mma_loop
-from ....gemm.batch_invariant.blocks.operands import (
-    ACC_DTYPE,
-    BAR_TMEM_ALLOC,
-    IN_DT,
-    StaticPlan,
+from ....gemm.batch_invariant.blocks.operands import ACC_DTYPE, BAR_TMEM_ALLOC
+from ....gemm.batch_invariant.generator import TILES_N_NARROW, Knobs
+from ..spec_fp8 import w8a8_alpha
+from .epilogue import (
+    BAR_EPI_JOIN,
+    GROUP,
+    GroupedChain,
+    GroupedEpilogueBlock,
+    MoeF32,
+    fragment_offsets,
 )
-from ....gemm.batch_invariant.generator import TILES_N_NARROW, Knobs, MainloopBlock
-from .epilogue import BAR_EPI_JOIN, GROUP, GroupedChain, _chain_elem, fragment_offsets
-from .kernel import GROUPED_K_BLOCKS
+from .kernel import DenseOperands
 from .scheduler import MAX_E, TABLE_SMEM_BYTES, GroupScheduler, build_group_tables
 from .. import pdl
 
@@ -77,41 +84,57 @@ WEIGHT_TILES = (
     WEIGHT_TILE,
     64,
 )  # the weight tiles: 128 rows, or 64 (the two-row TMEM layout: twice the CTAs of a small weight)
-TOKEN_TILES = TILES_N_NARROW  # the swapped records' token tiles (8, 16, 32)
-# the token tiles a weight tile takes: the 64-row tile from 16 tokens (a 64 x 8 tile holds too little work per CTA)
-TOKEN_TILES_OF_WEIGHT = {
-    WEIGHT_TILE: TILES_N_NARROW,
-    64: tuple(t for t in TILES_N_NARROW if t >= 16),
-}
+#: The narrowest token tile of each operand format's instruction: ``kind::f16`` admits N >= 8, ``kind::f8f6f4`` N >= 16.
+MIN_TOKEN_TILE: Dict[str, int] = {"bf16": 8, "e4m3": 16}
+#: The 64-row weight tile takes token tiles from 16 (a 64 x 8 tile holds too little work per CTA).
+MIN_TOKEN_TILE_64 = 16
+
+
+def token_tiles_of(weight_tile: int, in_fmt: str = "bf16") -> Tuple[int, ...]:
+    """The token tiles a weight tile takes for an operand format: the narrow dense tiles from the format's narrowest, the
+    64-row tile from 16."""
+    lo = max(MIN_TOKEN_TILE[in_fmt], MIN_TOKEN_TILE_64 if weight_tile == 64 else 0)
+    return tuple(t for t in TILES_N_NARROW if t >= lo)
+
+
+TOKEN_TILES = TILES_N_NARROW  # every swapped record's token tile is one of the narrow dense tiles (8, 16, 32)
+# the token tiles a weight tile takes (the bf16 classes)
+TOKEN_TILES_OF_WEIGHT = {wt: token_tiles_of(wt, "bf16") for wt in WEIGHT_TILES}
 
 
 def swap_knobs(
-    token_tile: int = TOKEN_TILES[0], raster: str = "m", weight_tile: int = WEIGHT_TILE
+    token_tile: int = None,
+    raster: str = "m",
+    weight_tile: int = WEIGHT_TILE,
+    in_fmt: str = "bf16",
 ) -> Knobs:
-    """The bf16 classes' swapped record with ``token_tile`` tokens on the MMA's N side and ``weight_tile`` (128 or 64) weight
-    rows on its M side, 1-CTA, no cluster."""
-    assert token_tile in TOKEN_TILES_OF_WEIGHT[weight_tile], (token_tile, weight_tile)
+    """The classes' swapped record with ``token_tile`` tokens (the format's narrowest by default) on the MMA's N side and
+    ``weight_tile`` (128 or 64) weight rows on its M side, 1-CTA, no cluster."""
+    tiles = token_tiles_of(weight_tile, in_fmt)
+    token_tile = tiles[0] if token_tile is None else token_tile
+    assert token_tile in tiles, (token_tile, weight_tile, in_fmt)
     return Knobs(
         (weight_tile, token_tile), (1, 1), False, True, raster, 1, swap_ab=True
     )
 
 
-def swapped_knobs() -> List[Knobs]:
-    """The swapped record space of the bf16 classes: one record per (weight tile, token tile) -- 128 x 8 / 16 / 32 and 64 x 16 / 32."""
+def swapped_knobs(in_fmt: str = "bf16") -> List[Knobs]:
+    """The swapped record space of a format's classes: one record per (weight tile, token tile) -- 128 x 8 / 16 / 32 and
+    64 x 16 / 32 for bf16; 128 x 16 / 32 and 64 x 16 / 32 for e4m3."""
     return [
-        swap_knobs(tn, weight_tile=wt)
+        swap_knobs(tn, weight_tile=wt, in_fmt=in_fmt)
         for wt in WEIGHT_TILES
-        for tn in TOKEN_TILES_OF_WEIGHT[wt]
+        for tn in token_tiles_of(wt, in_fmt)
     ]
 
 
-def is_swapped_record(knobs: Knobs) -> bool:
-    """A record the swapped body takes: the swapped 1-CTA record at one of the weight tiles and its narrow token tiles, no
-    cluster, swizzle 1, no in-cluster split, no in-CTA chunk fold, the TMA store flag of every record."""
+def is_swapped_record(knobs: Knobs, in_fmt: str = "bf16") -> bool:
+    """A record the swapped body takes for the format: the swapped 1-CTA record at one of the weight tiles and its narrow
+    token tiles, no cluster, swizzle 1, no in-cluster split, no in-CTA chunk fold, the TMA store flag of every record."""
     return (
         knobs.swap_ab
         and knobs.tile_m in WEIGHT_TILES
-        and knobs.tile_n in TOKEN_TILES_OF_WEIGHT[knobs.tile_m]
+        and knobs.tile_n in token_tiles_of(knobs.tile_m, in_fmt)
         and knobs.cluster_shape_mn == (1, 1)
         and not knobs.use_2cta_instrs
         and knobs.swizzle_size == 1
@@ -127,19 +150,32 @@ def plan_knobs_of(knobs: Knobs) -> Knobs:
 
 
 class SwappedGroupedGemm:
-    """``out[p, n] = chain(sum_k rows[p, k] w[n, k, e(p)])`` for every dense row ``p`` of every group, the weights as the MMA's A
-    and the group's rows as a narrow TMA box on its B side. The persistent grid (``max_active_clusters``, in CTAs) is a dynamic
-    launch argument: which CTA computes a tile, never the bits."""
+    """``out[p, n] = chain(sum_k rows[p, k] w[n, k, e(p)])`` for every dense row ``p`` of every group (with the fp8 classes'
+    chains ``alpha = mul(sa[0], alpha[e(p)])`` scales the accumulators), the weights as the MMA's A and the group's rows as a
+    narrow TMA box on its B side. The persistent grid (``max_active_clusters``, in CTAs) is a dynamic launch argument: which
+    CTA computes a tile, never the bits. The chain's operand format selects the operand block and the record space; a chain
+    with scale operands launches through :meth:`with_scales`; the gather form belongs to the bf16 classes."""
 
     def __init__(
-        self, knobs: Knobs, chain: Union[str, GroupedChain], gather: bool = False
+        self,
+        knobs: Knobs,
+        chain: Union[str, GroupedEpilogueBlock],
+        gather: bool = False,
     ):
         if isinstance(chain, str):
             chain = GroupedChain.legacy(chain, "bf16")
-        assert isinstance(chain, GroupedChain), chain
-        assert is_swapped_record(knobs), (
-            "the swapped body takes the narrow swapped records (128 or 64 weight rows x the narrow token tiles, 1-CTA)",
+        assert isinstance(chain, GroupedEpilogueBlock), chain
+        self.in_fmt = chain.in_fmt
+        self.operands = DenseOperands(self.in_fmt)
+        assert is_swapped_record(knobs, self.in_fmt), (
+            "the swapped body takes the narrow swapped records of the format (128 or 64 weight rows x its narrow token "
+            "tiles, 1-CTA)",
             knobs,
+            self.in_fmt,
+        )
+        assert not gather or self.in_fmt == "bf16", (
+            "the gather form is the bf16 classes'",
+            self.in_fmt,
         )
         self.knobs, self.chain, self.gather = knobs, chain, gather
         self.token_tile, self.weight_tile = knobs.tile_n, knobs.tile_m
@@ -161,9 +197,51 @@ class SwappedGroupedGemm:
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        """The TMA-box form: ``rows (R, K, 1)`` the dense permuted rows."""
-        assert not self.gather
-        self._launch(rows, w, out, counts, max_active_clusters, stream, None, Int32(1))
+        """The TMA-box form of the chains without scale operands: ``rows (R, K, 1)`` the dense permuted rows."""
+        assert not self.gather and not self.chain.scale_operands
+        self._launch(
+            rows,
+            w,
+            out,
+            counts,
+            max_active_clusters,
+            stream,
+            None,
+            Int32(1),
+            None,
+            None,
+            None,
+        )
+
+    @cute.jit
+    def with_scales(
+        self,
+        rows: cute.Tensor,
+        w: cute.Tensor,
+        out: cute.Tensor,
+        counts: cute.Tensor,
+        alpha: cute.Tensor,
+        sa: cute.Tensor,
+        si: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The TMA-box form of the chains with scale operands (the fp8 per-tensor classes): ``alpha (E,)`` the per-expert
+        weight scales, ``sa (1,)`` the A operand's scale, ``si (1,)`` the intermediate multiplier."""
+        assert not self.gather and self.chain.scale_operands
+        self._launch(
+            rows,
+            w,
+            out,
+            counts,
+            max_active_clusters,
+            stream,
+            None,
+            Int32(1),
+            alpha,
+            sa,
+            si,
+        )
 
     @cute.jit
     def gathered(
@@ -179,30 +257,36 @@ class SwappedGroupedGemm:
     ):
         """The gather form: ``x (T, K)`` the unpermuted rows, ``src (>= Tk,)`` int32 the plan's slot of every expanded row."""
         assert self.gather
-        self._launch(x, w, out, counts, max_active_clusters, stream, src, k_div)
+        self._launch(
+            x, w, out, counts, max_active_clusters, stream, src, k_div, None, None, None
+        )
 
-    def _launch(self, rows, w, out, counts, max_active_clusters, stream, src, k_div):
+    def _launch(
+        self,
+        rows,
+        w,
+        out,
+        counts,
+        max_active_clusters,
+        stream,
+        src,
+        k_div,
+        alpha,
+        sa,
+        si,
+    ):
         if cutlass.const_expr(rows.element_type != w.element_type):
             raise TypeError(
                 f"rows and w must have one type: {rows.element_type} != {w.element_type}"
             )
-        assert rows.element_type is IN_DT["bf16"], rows.element_type
         # the gather form's slab is one swizzle atom of K wide (the gather4 box is the atom): it keeps the format's default stage
-        k_blocks = None if self.gather else GROUPED_K_BLOCKS
-        st = StaticPlan(
-            plan_knobs_of(self.knobs),
-            w.element_type,
-            rows.element_type,
-            ACC_DTYPE,
-            LayoutEnum.from_tensor(w).mma_major_mode(),
-            LayoutEnum.from_tensor(rows).mma_major_mode(),
-            LayoutEnum.ROW_MAJOR,
-            c_in_smem=False,
-            extra_smem_bytes=TABLE_SMEM_BYTES,
-            k_blocks=k_blocks,
+        body = "gather" if self.gather else "swapped"
+        # the weights are the plan's A operand, the token rows its B operand
+        st = self.operands.plan(
+            plan_knobs_of(self.knobs), w, rows, TABLE_SMEM_BYTES, body
         )
         self.st = st
-        self.block = MainloopBlock("bf16", inner_steps=k_blocks)
+        self.block = self.operands.mainloop(body)
         self.lowering = self.block.lowering()
         assert st.mma_tiler[2] == self.block.k_block, (st.mma_tiler, self.block.k_block)
         assert (
@@ -276,6 +360,9 @@ class SwappedGroupedGemm:
             st.a_smem_layout_staged,
             st.b_smem_layout_staged,
             st.epi_tile,
+            alpha,
+            sa,
+            si,
         ).launch(
             grid=(1, 1, max_active_clusters),
             block=[THREADS, 1, 1],
@@ -300,6 +387,9 @@ class SwappedGroupedGemm:
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
         epi_tile: cute.Tile,
+        mAlpha: cute.Tensor = None,
+        mSa: cute.Tensor = None,
+        mSi: cute.Tensor = None,
     ):
         st = self.st
         tn, wt = self.token_tile, self.weight_tile
@@ -307,12 +397,11 @@ class SwappedGroupedGemm:
         if warp_idx == TMA_WARP:
             cpasync.prefetch_descriptor(tma_atom_w)
             cpasync.prefetch_descriptor(tma_atom_tok)
-        # programmatic dependent launch: the wait for the predecessor grid sits in each warp before its first read of the
-        # predecessor's output (the token rows); the weight loads and the group tables (the plan: complete before this grid
-        # launched, as no kernel of the chain triggers before its own wait) do not wait, so the weight ring fills during the
-        # launch; the trigger placement is the chain's (``pdl.TRIGGER``). Reading the counts below, before the wait, relies
-        # on that rule (``pdl.BOX_FORM_TRIGGERS``, asserted at the builder); the gather form, whose predecessor is the plan
-        # itself, waits first.
+        # programmatic dependent launch: every warp waits for the preceding grid before the group tables (the tables read
+        # ``counts``, the predecessor chain's writes: a no-op when nothing before triggered early, and the rule that no kernel
+        # of the chain triggers before its own wait -- ``pdl.BOX_FORM_TRIGGERS``, asserted at the builder -- is the margin);
+        # the producer waits once more before its first read of the predecessor's output (the token rows), the epilogue
+        # before its first store; the trigger placement is the chain's (``pdl.TRIGGER``).
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
         )
@@ -375,10 +464,7 @@ class SwappedGroupedGemm:
         )
         s_off = storage.group_off.get_tensor(cute.make_layout((MAX_E + 1,)))
         s_pre = storage.group_pre.get_tensor(cute.make_layout((MAX_E + 1,)))
-        if cutlass.const_expr(self.gather):
-            # the gather form follows the plan's launch directly (no gather kernel between): the tables read the plan's
-            # counts, so every warp waits for the predecessor first (the weight prefetch then follows the wait)
-            cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_wait()  # the tables read the predecessor chain's counts
         if warp_idx == EPILOGUE_WARPS[0]:
             build_group_tables(
                 counts, E, tn, s_off, s_pre
@@ -506,6 +592,9 @@ class SwappedGroupedGemm:
                 N,
                 epi_tile,
                 acc_pipeline,
+                mAlpha=mAlpha,
+                mSa=mSa,
+                mSi=mSi,
             )
             tmem.relinquish_alloc_permit()
             # the allocator warp alone frees the columns: the epilogue warpgroup's warps join here after their last TMEM loads
@@ -753,6 +842,9 @@ def swapped_epilogue_loop(
     N: Int32,
     epi_tile: cute.Tile,
     acc_pipeline,
+    mAlpha: cute.Tensor = None,
+    mSa: cute.Tensor = None,
+    mSi: cute.Tensor = None,
 ):
     """The transposed group-masked epilogue: the accumulator tile is (weight rows, tokens); the 128-row TMEM layout gives
     thread ``t`` weight row ``t`` of the tile and its token columns (the record's N tile). Gated chain: the gate accumulators
@@ -760,8 +852,12 @@ def swapped_epilogue_loop(
     ``(n // 16) * 8 + n % 8``; plain and ungated chains: every lane stores column ``n``. Token ``j`` of the tile is dense row
     ``row0 + j``, stored iff ``< row_end``. Every output element's chain is computed by one thread from the same accumulator
     value in the same fp32 sequence as the grouped body's epilogue (one element per store: the token columns of a thread's
-    weight row are not contiguous in the output, so this body's stores are scalars by construction)."""
+    weight row are not contiguous in the output, so this body's stores are scalars by construction). The chains with scale
+    operands (``mAlpha`` / ``mSa`` / ``mSi``, as in the grouped epilogue) form ``alpha_e = mul(sa, alpha[e])`` per tile and
+    read ``inv = si[0]`` as given; the e4m3 outputs are converted in pairs (two token columns of one weight row; each value's
+    conversion is independent of its pairing) and stored as bytes."""
     pair = chain.pair
+    paired_cvt = chain.paired_cvt
     tiler_mn = cute.slice_(st.mma_tiler, (None, None, 0))
     tCtAcc = transform_partitioned_tensor_layout(tCtAcc_base)
     copy_atom_t2r = get_tmem_load_op(
@@ -809,15 +905,26 @@ def swapped_epilogue_loop(
     rows = [m for m, _ in offs]  # the register's weight row inside the thread's pair
     tTR_rAcc = cute.make_rmem_tensor(frag.shape, ACC_DTYPE)
     tTR_cF = cute.group_modes(tTR_cF, 3, cute.rank(tTR_cF))
+    inv = None
+    if cutlass.const_expr(paired_cvt):
+        inv = mSi[0]
     acc_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Consumer, st.num_acc_stage
     )
     work_tile = tile_sched.initial_work_tile_info()
     while work_tile.is_valid_tile:
-        row0, row_end, n_tile = work_tile.row0, work_tile.row_end, work_tile.n_tile
+        row0, row_end, n_tile, e = (
+            work_tile.row0,
+            work_tile.row_end,
+            work_tile.n_tile,
+            work_tile.e,
+        )
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()
         rows_left = cutlass.min(row_end, Tk) - row0  # valid tokens of this tile
+        alpha_e = None
+        if cutlass.const_expr(chain.scaled):
+            alpha_e = w8a8_alpha(MoeF32, mSa[0], mAlpha[e])
         tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_state.index)]
         acc_pipeline.consumer_wait(acc_state)
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
@@ -854,18 +961,52 @@ def swapped_epilogue_loop(
                 store_ok = n_glob < N
             # the chain of a token column is computed only where the column is a live token of the group (a warp-uniform
             # branch: every lane of the warp holds the same column), so a tile with few live tokens pays few chains
-            for v in cutlass.range_constexpr(nv):
-                if cutlass.const_expr(pair and rows[v] != 0):
-                    continue  # a gate register (two_rows): folded into its up register's chain
-                j = col0 + Int32(cols[v])
-                if j < rows_left:
-                    val = _chain_elem(
-                        chain,
-                        tTR_rAcc[v],
-                        gate[v] if cutlass.const_expr(pair) else None,
-                    )
-                    if store_ok & (n_glob + Int32(rows[v]) < N):
-                        mOut[(row0 + j, out_col + Int32(rows[v]))] = val
+            if cutlass.const_expr(paired_cvt):
+                outs = ups if cutlass.const_expr(pair) else list(range(nv))
+                assert len(outs) % 2 == 0, offs
+                for q in cutlass.range_constexpr(0, len(outs), 2):
+                    v0, v1 = outs[q], outs[q + 1]
+                    j0 = col0 + Int32(cols[v0])
+                    j1 = col0 + Int32(cols[v1])
+                    if (j0 < rows_left) | (j1 < rows_left):
+                        y0 = chain.elem(
+                            MoeF32,
+                            tTR_rAcc[v0],
+                            gate[v0] if cutlass.const_expr(pair) else None,
+                            alpha_e,
+                            inv,
+                        )
+                        y1 = chain.elem(
+                            MoeF32,
+                            tTR_rAcc[v1],
+                            gate[v1] if cutlass.const_expr(pair) else None,
+                            alpha_e,
+                            inv,
+                        )
+                        pr = cvt_f32x2_to_fp8x2(y0, y1, "e4m3")
+                        if store_ok & (j0 < rows_left) & (n_glob + Int32(rows[v0]) < N):
+                            mOut[(row0 + j0, out_col + Int32(rows[v0]))] = (
+                                pr & 0xFF
+                            ).to(Uint8)
+                        if store_ok & (j1 < rows_left) & (n_glob + Int32(rows[v1]) < N):
+                            mOut[(row0 + j1, out_col + Int32(rows[v1]))] = (pr >> 8).to(
+                                Uint8
+                            )
+            else:
+                for v in cutlass.range_constexpr(nv):
+                    if cutlass.const_expr(pair and rows[v] != 0):
+                        continue  # a gate register (two_rows): folded into its up register's chain
+                    j = col0 + Int32(cols[v])
+                    if j < rows_left:
+                        val = chain.elem(
+                            MoeF32,
+                            tTR_rAcc[v],
+                            gate[v] if cutlass.const_expr(pair) else None,
+                            alpha_e,
+                            inv,
+                        )
+                        if store_ok & (n_glob + Int32(rows[v]) < N):
+                            mOut[(row0 + j, out_col + Int32(rows[v]))] = val
         with cute.arch.elect_one():
             acc_pipeline.consumer_release(acc_state)
         acc_state.advance()

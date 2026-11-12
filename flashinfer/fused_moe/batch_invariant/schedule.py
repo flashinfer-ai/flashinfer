@@ -8,13 +8,16 @@ the part's roofline with nominal constants, no measured tables) at the dense sha
 bytes are the grouped launch's: ``M`` = the rows of one active expert (the per-group tail of the row tile), ``N`` =
 the active experts' weight rows side by side (every group's tiles count, and the weights, the dominant operand of the
 op in every regime, are read once per group). Two record spaces are ranked together: the grouped records (the dense
-records at swizzle 1: the group scheduler has no raster swizzle) and the swapped records (:mod:`.blocks.swap_bf16`:
-the weights on the MMA's M side, 128 rows per CTA, the group's tokens a narrow N tile of 8 / 16 / 32 rows), which the
+records at swizzle 1: the group scheduler has no raster swizzle) and the swapped records (:mod:`.blocks.swap`: the
+weights on the MMA's M side, 128 or 64 rows per CTA, the group's tokens a narrow N tile of 8 / 16 / 32 rows), which the
 dense model prices as it prices a swapped decode record -- the weights' rows on the M side with one CTA per 128 of
 them, the tokens' rows on the N side in token tiles -- so the CTA count and the operand bytes per CTA of each body
 enter one estimate and the pick follows the shape, never a rows-per-expert switch. The ranking is filtered by each
-body's acceptance. Numerics-neutral: every record of either space is canonical (the same bits), so the dispatcher may
-depend on anything; the ranked list is what the autotuner profiles under ``batch_invariant``.
+body's acceptance. The contract serves every class of the backend: the chain object names its operand format (the
+format's MMA rate, operand bytes, record space and acceptance), the bf16 classes' legacy names stand for their chains
+(:mod:`.schedule_fp8` ranks the fp8 per-tensor classes through the same functions). Numerics-neutral: every record of
+either space is canonical (the same bits), so the dispatcher may depend on anything; the ranked list is what the
+autotuner profiles under ``batch_invariant``.
 """
 
 from __future__ import annotations
@@ -26,7 +29,9 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 from ...gemm.batch_invariant.generator import CLUSTERS, Knobs, knob_product
 
 if TYPE_CHECKING:
-    from .blocks.epilogue import GroupedChain
+    from .blocks.epilogue import GroupedEpilogueBlock
+
+ChainLike = Union[str, "GroupedEpilogueBlock"]
 
 #: How many ranked records per GEMM the autotuner profiles (the Cartesian product over the two GEMMs is the tactic space).
 TOP_K = 3
@@ -83,8 +88,13 @@ def grouped_knobs(clusters=None) -> List[Knobs]:
     return list(_grouped_knobs(CLUSTERS if clusters is None else tuple(clusters)))
 
 
+def chain_format(chain: ChainLike) -> str:
+    """The operand format of a chain: a bf16 legacy name's is ``bf16``, a chain object's its own."""
+    return "bf16" if isinstance(chain, str) else chain.in_fmt
+
+
 def all_valid_configs(
-    N: int, K: int, E: int, chain: str = "plain", clusters=None
+    N: int, K: int, E: int, chain: ChainLike = "plain", clusters=None
 ) -> List[Knobs]:
     """The grouped record space the guarantee is claimed over, for a weight shape and a chain (the swapped records are the
     second space: :func:`all_valid_configs_swapped`; the guarantee covers both)."""
@@ -96,50 +106,80 @@ def all_valid_configs(
 
 
 @functools.lru_cache(maxsize=None)
-def _swapped_knobs() -> Tuple[Knobs, ...]:
-    from .blocks.swap_bf16 import swapped_knobs as _swapped
+def _swapped_knobs(in_fmt: str) -> Tuple[Knobs, ...]:
+    from .blocks.swap import swapped_knobs as _swapped
 
-    return tuple(_swapped())
+    return tuple(_swapped(in_fmt))
 
 
-def swapped_knobs() -> List[Knobs]:
-    """The swapped record space of the bf16 classes (:mod:`.blocks.swap_bf16`): the swapped 1-CTA records at the narrow token
-    tiles (a 128-row weight tile x 8 / 16 / 32 tokens, a 64-row one x 16 / 32), one per (weight tile, token tile), no cluster,
-    swizzle 1. Disjoint from the grouped space (the
-    swapped flag); the body reads the same dense rows through a TMA box."""
-    return list(_swapped_knobs())
+def swapped_knobs(in_fmt: str = "bf16") -> List[Knobs]:
+    """The swapped record space of a format's classes (:mod:`.blocks.swap`): the swapped 1-CTA records at the format's narrow
+    token tiles (a 128-row weight tile x 8 / 16 / 32 tokens and a 64-row one x 16 / 32 for bf16; 128 or 64 x 16 / 32 for
+    e4m3), one per (weight tile, token tile), no cluster, swizzle 1. Disjoint from the grouped space (the swapped flag); the
+    body reads the same dense rows through a TMA box."""
+    return list(_swapped_knobs(in_fmt))
 
 
 def all_valid_configs_swapped(
-    N: int, K: int, E: int, chain: str = "plain"
+    N: int, K: int, E: int, chain: ChainLike = "plain"
 ) -> List[Knobs]:
-    """The swapped records the swapped body accepts for a weight shape and a chain."""
+    """The swapped records the swapped body accepts for a weight shape and a chain (the chain's format's space)."""
     from .blocks.compile import can_implement_swapped
 
-    return [k for k in swapped_knobs() if can_implement_swapped(k, N, K, E, chain)]
+    return [
+        k
+        for k in swapped_knobs(chain_format(chain))
+        if can_implement_swapped(k, N, K, E, chain)
+    ]
 
 
 def all_valid_configs_bf16(
-    N: int, K: int, E: int, chain: str = "plain", clusters=None
+    N: int, K: int, E: int, chain: ChainLike = "plain", clusters=None
 ) -> List[Knobs]:
-    """Both record spaces for a weight shape and a chain: the grouped records, then the swapped ones."""
+    """Both record spaces for a weight shape and a chain: the grouped records, then the swapped ones (the chain's format)."""
     return all_valid_configs(N, K, E, chain, clusters) + all_valid_configs_swapped(
         N, K, E, chain
     )
 
 
 @functools.lru_cache(maxsize=None)
-def chain_nodes(chain: Union[str, "GroupedChain"]) -> int:
-    """The node count of the chain's term, the S-expression :mod:`.spec` builds for one output element: the gated term on the
-    (gate, up) accumulator pair, the ungated term on one accumulator, or the plain conversion (one node). A legacy name maps
-    onto the class's default chain of that kind (``swiglu`` = the gated SiLU, ``relu2``, ``plain``)."""
+def chain_nodes(chain: ChainLike) -> int:
+    """The node count of the chain's term, the S-expression the spec builds for one output element -- :mod:`.spec` for the
+    bf16 chains (the gated term on the (gate, up) accumulator pair, the ungated term on one accumulator, or the plain
+    conversion, one node; a shared sub-term is work once), :mod:`.spec_fp8` for the W8A8 chains (GEMM1's fused e4m3
+    quantization of the gated or the ungated activation on the alpha-scaled accumulators, GEMM2's scaled conversion; the
+    printed term's nodes): the exposed-epilogue term's cost unit. A legacy name maps onto the class's default chain of that
+    kind (``swiglu`` = the gated SiLU, ``relu2``, ``plain``)."""
     from . import mterm as term
     from . import spec as M
-    from .blocks.epilogue import GroupedChain
+    from .blocks.epilogue import Fp8Chain, GroupedChain
 
     if isinstance(chain, str):
         chain = GroupedChain.legacy(chain, "bf16")
     alg = term.TermAlgebra()
+    if isinstance(chain, Fp8Chain):
+        from . import spec_fp8 as M8
+
+        alpha, inv = alg.sym("alpha"), alg.sym("inv")
+        if chain.pair:
+            t = M8.glu_quant_e4m3_elem(
+                alg,
+                alg.leaf("g", 0, 0),
+                alg.leaf("u", 0, 0),
+                alpha,
+                inv,
+                chain.act,
+                chain.params,
+            )
+        elif chain.kind == "act":
+            t = M8.act_quant_e4m3_elem(
+                alg, alg.leaf("x", 0), alpha, inv, chain.act, chain.params
+            )
+        elif chain.scaled:
+            t = M8.scaled_out_elem(alg, alg.leaf("x", 0), alpha, chain.out_fmt)
+        else:
+            return 1
+        return term.sexpr(t).count("(")
     if chain.pair:
         t = M.glu_elem(
             alg,
@@ -363,14 +403,14 @@ def rank_grouped(
     N: int,
     K: int,
     E: int,
-    chain: Union[str, "GroupedChain"],
+    chain: ChainLike,
     sm_count: Optional[int] = None,
     family: Optional[str] = None,
     k: int = TOP_K,
     nominal: bool = False,
     n_active: Optional[int] = None,
     swap: Optional[bool] = None,
-    in_fmt: str = "bf16",
+    in_fmt: Optional[str] = None,
 ) -> List[Knobs]:
     """The ranked records for one GEMM over both record spaces: the grouped records the grouped body accepts for the weight
     shape and the chain (at a decode-sized ``rows`` the dense dispatcher's structural guard, `heuristic.decode_sane`: 1-CTA
@@ -386,11 +426,14 @@ def rank_grouped(
     scheduler (`raster_for`) first among its twins, best first, ties in the spaces' enumeration order. ``chain`` is a legacy
     name or the GEMM's :class:`.blocks.epilogue.GroupedChain` (its term prices the epilogue). As in the dense
     ``rank_topk``, each of the best ceil(k/2) records is followed by its raster twin, then the rank order fills the list:
-    distinct records, at most ``k``, never empty for an implementable shape. Memoised on its arguments (all hashable
-    scalars): the runner ranks at every forward without a tactic, once per token count."""
+    distinct records, at most ``k``, never empty for an implementable shape. ``in_fmt`` is the chain's operand format
+    (given, it must agree with the chain's). Memoised on its arguments (all hashable scalars; a chain is a frozen
+    dataclass): the runner ranks at every forward without a tactic, once per token count."""
+    fmt = chain_format(chain)
+    assert in_fmt is None or in_fmt == fmt, (in_fmt, fmt, chain)
     return list(
         _rank_grouped(
-            rows, N, K, E, chain, sm_count, family, k, nominal, n_active, swap, in_fmt
+            rows, N, K, E, chain, sm_count, family, k, nominal, n_active, swap, fmt
         )
     )
 
@@ -401,7 +444,7 @@ def _rank_grouped(
     N: int,
     K: int,
     E: int,
-    chain: Union[str, "GroupedChain"],
+    chain: ChainLike,
     sm_count: Optional[int],
     family: Optional[str],
     k: int,
@@ -424,11 +467,13 @@ def _rank_grouped(
     swapped = (
         []
         if swap is False
-        else [c for c in swapped_knobs() if can_implement_swapped(c, N, K, E, chain)]
+        else [
+            c for c in swapped_knobs(in_fmt) if can_implement_swapped(c, N, K, E, chain)
+        ]
     )
     space = dense + swapped
     guarded = [c for c in dense if decode_sane(c, rows, False)] or dense
-    nodes = chain_nodes(chain if not isinstance(chain, str) else chain)
+    nodes = chain_nodes(chain)
     from .blocks.epilogue import GroupedChain
 
     pair = (

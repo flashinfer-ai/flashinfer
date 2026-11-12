@@ -3,7 +3,9 @@
 """The fp8 per-tensor MoE classes ``moe.e4m3.<act>`` (W8A8): the weight view, the static input quantization, the grouped fp8
 GEMMs (placements of the dense fp8 class) and the fused FFN on pre-routed tokens.
 
-The routing, the deterministic permutation and the slot-order combine are the bf16 classes' (:mod:`.api`). The scales follow
+The routing, the deterministic permutation, the slot-order combine and the launch glue (the operand rules, the gather of the
+permuted rows, the grid) are the bf16 classes' (:mod:`.api`); the kernels are the shared grouped and swapped bodies at the
+fp8 chains (:mod:`.blocks.epilogue.Fp8Chain`). The scales follow
 FlashInfer's per-tensor convention: the caller's ``hidden_states_scale_global`` and ``intermediate_scale_global`` are
 multipliers (``q = cvt(mul(x, m))``), the expert weights are quantized here with one multiplier per expert and GEMM
 (``448 / amax``, as :func:`flashinfer.fused_moe.prepare.prepare_trtllm_fp8_per_tensor_weights` forms it), and the class's
@@ -21,13 +23,21 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import torch
 
 from ...batch_invariant.support import unsupported
-from ...gemm.batch_invariant.api import persistent_clusters, sm_count_of
 from ...gemm.batch_invariant.generator import Knobs
 from . import spec as S
-from .api import interleave_fc1, permute_plan
-from .blocks.fp8_epilogue import GEMM2_CHAIN, Fp8Chain
+from .api import (
+    _check_fused_inputs,
+    _check_grouped_operands,
+    _grouped_out,
+    combine_rows,
+    gather_rows,
+    interleave_fc1,
+    launch_grid,
+    permute_plan,
+    swapped_pads,
+)
+from .blocks.epilogue import GEMM2_CHAIN, Fp8Chain
 from .blocks.scheduler import MAX_E
-from .schedule import launch_tile_bound
 from .reference_fp8 import dequant_scale, quantize_e4m3_static
 from .spec_fp8 import E4M3_MAX
 
@@ -238,52 +248,27 @@ def grouped_gemm_fp8(
     row-major, ``w [E, N, K]`` e4m3 row-major, ``s_w [E]`` fp32, ``s_a [1]`` fp32 (the A operand's dequantization scale), ``inv [1]``
     fp32 (the intermediate multiplier of the e4m3 chains; ignored by the others). The e4m3 chains return ``float8_e4m3fn
     [Tk, N / 2]`` (gated) or ``[Tk, N]``; the plain chain bf16 / fp32 ``[Tk, N]``. The record selects the body: a dense record runs
-    the grouped fp8 body, a swapped record (``config.swap_ab``: 128 or 64 weight rows x 16 / 32 tokens, the weights on the MMA's M
-    side, :mod:`.blocks.fp8_swap_kernel`) the swapped body on the same dense rows -- a placement, the same bits. ``Tk`` (default:
+    the grouped body, a swapped record (``config.swap_ab``: 128 or 64 weight rows x 16 / 32 tokens, the weights on the MMA's M
+    side, :mod:`.blocks.swap`) the swapped body on the same dense rows -- a placement, the same bits. ``Tk`` (default:
     the rows of ``out``, else of ``a``) is the expanded row count; ``a`` may carry more rows (the swapped body's last token box then
     stays inside the buffer instead of being zero-filled past it). The persistent grid is a launch argument."""
-    from .blocks.fp8_compile import (
-        can_implement_fp8,
-        get_compiled_grouped_fp8,
-        get_compiled_swapped_fp8,
+    from .blocks.compile import (
+        can_implement,
+        get_compiled_grouped,
+        get_compiled_swapped,
     )
 
-    if (
-        a.dtype != torch.float8_e4m3fn
-        or w.dtype != torch.float8_e4m3fn
-        or a.dim() != 2
-        or w.dim() != 3
-    ):
-        raise TypeError("grouped_gemm_fp8 takes e4m3 a [Tk, K] and w [E, N, K]")
-    R, K = a.shape
-    E, N, K2 = w.shape
-    if E > MAX_E:
-        raise ValueError(
-            f"grouped_gemm_fp8: {E} experts; the group tables hold at most {MAX_E}"
-        )
-    if Tk is None:
-        Tk = out.shape[0] if out is not None else R
-    if not 0 <= Tk <= R:
-        raise ValueError(
-            f"grouped_gemm_fp8: Tk {Tk} must lie in [0, {R}] (the rows of a)"
-        )
-    if (
-        K != K2
-        or a.stride(1) != 1
-        or not w.is_contiguous()
-        or a.stride(0) % ALIGN_E4M3
-        or K % ALIGN_E4M3
-    ):
-        raise ValueError(
-            "grouped_gemm_fp8: K-contiguous, 16-byte-aligned operands of one K "
-            f"(a {tuple(a.shape)} strides {tuple(a.stride())}, w {tuple(w.shape)})"
-        )
-    if (
-        counts.dtype != torch.int32
-        or tuple(counts.shape) != (E,)
-        or not counts.is_contiguous()
-    ):
-        raise ValueError("grouped_gemm_fp8: counts must be a contiguous int32 [E]")
+    R, K, E, N, Tk = _check_grouped_operands(
+        "grouped_gemm_fp8",
+        a,
+        w,
+        counts,
+        Tk,
+        out,
+        torch.float8_e4m3fn,
+        ALIGN_E4M3,
+        "e4m3",
+    )
     if (
         s_w.dtype != torch.float32
         or s_w.numel() != E
@@ -291,31 +276,21 @@ def grouped_gemm_fp8(
         or inv.numel() != 1
     ):
         raise ValueError("grouped_gemm_fp8: s_w [E] fp32, s_a and inv 1-element fp32")
-    if not can_implement_fp8(config, N, K, E, chain):
+    if not can_implement(config, N, K, E, chain):
         raise ValueError(
             f"grouped_gemm_fp8: {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()})"
         )
     n_out = N // 2 if chain.pair else N
-    out_dtype = _OUT_DTYPE[chain.out_fmt]
-    if out is None:
-        out = torch.empty(Tk, n_out, dtype=out_dtype, device=a.device)
-    oal = 16 // out.element_size()
-    if (
-        tuple(out.shape) != (Tk, n_out)
-        or out.dtype != out_dtype
-        or out.stride(1) != 1
-        or out.stride(0) % oal
-    ):
-        raise ValueError(
-            "grouped_gemm_fp8: out must be a 16-byte-aligned row-major [Tk, n_out] of the chain's dtype"
-        )
+    out = _grouped_out(
+        "grouped_gemm_fp8", out, Tk, n_out, _OUT_DTYPE[chain.out_fmt], a.device
+    )
     out_k = out.view(torch.uint8) if chain.out_fmt == "e4m3" else out
     if Tk == 0:
         return out
     kernel = (
-        get_compiled_swapped_fp8(config, chain)
+        get_compiled_swapped(config, chain)
         if config.swap_ab
-        else get_compiled_grouped_fp8(config, chain)
+        else get_compiled_grouped(config, chain)
     )
     if not config.swap_ab and Tk != R:
         a = a[
@@ -329,7 +304,7 @@ def grouped_gemm_fp8(
         s_w.reshape(-1).to(torch.float32),
         s_a.reshape(1).to(torch.float32),
         inv.reshape(1).to(torch.float32),
-        min(persistent_clusters(a.device, config), launch_tile_bound(config, Tk, E, N)),
+        launch_grid(a.device, config, Tk, E, N),
     )
     return out
 
@@ -352,55 +327,22 @@ def fused_moe_fp8(
     ``config2``: the grouped records (any record of the space gives the same bits; the dispatcher's pick by default).
     ``w_round``: the f32 weights enter the fold as their bf16 rounding (the pre-routed packed-word convention), by the combine
     kernel. An id outside ``[0, E)`` is a dropped slot (the term ``+0``), as in the bf16 op."""
-    from .combine import get_compiled_combine, warps_per_token
-    from .permute import get_compiled_gather, warps_per_row
     from .schedule_fp8 import default_configs_fp8
 
-    if (
-        xq.dtype != torch.float8_e4m3fn
-        or xq.dim() != 2
-        or xq.stride(1) != 1
-        or xq.stride(0) % ALIGN_E4M3
-    ):
-        raise TypeError(
-            "fused_moe_fp8: xq must be a row-major, 16-byte-aligned e4m3 [T, H]"
-        )
-    T, H = xq.shape
-    if w.hidden_size != H:
-        raise ValueError(
-            f"fused_moe_fp8: xq has H = {H}, the weights H = {w.hidden_size}"
-        )
-    k = token_selected_experts.shape[1]
-    if (
-        tuple(token_selected_experts.shape) != (T, k)
-        or token_selected_experts.dtype != torch.int32
-    ):
-        raise TypeError("fused_moe_fp8: token_selected_experts must be an int32 [T, k]")
-    if (
-        tuple(token_final_scales.shape) != (T, k)
-        or token_final_scales.dtype != torch.float32
-    ):
-        raise TypeError("fused_moe_fp8: token_final_scales must be a float32 [T, k]")
-    if not 1 <= k <= S.MAX_TOP_K:
-        raise ValueError(
-            f"fused_moe_fp8: {k} slots per token; the plan, gather and combine kernels fold at most {S.MAX_TOP_K}"
-        )
-    experts = token_selected_experts.contiguous()
-    scales = token_final_scales.contiguous()
+    T, H, k, experts, scales, out = _check_fused_inputs(
+        "fused_moe_fp8",
+        xq,
+        token_selected_experts,
+        token_final_scales,
+        out,
+        w.hidden_size,
+        torch.float8_e4m3fn,
+        ALIGN_E4M3,
+        "e4m3",
+    )
     E, I = w.num_experts, w.intermediate_size
     check_shape_e4m3(H, I, E)
     dev = xq.device
-    if out is None:
-        out = torch.empty(T, H, dtype=torch.bfloat16, device=dev)
-    if (
-        tuple(out.shape) != (T, H)
-        or out.dtype != torch.bfloat16
-        or out.stride(1) != 1
-        or out.stride(0) % 8
-    ):
-        raise ValueError(
-            "fused_moe_fp8: out must be a row-major, 16-byte-aligned bf16 [T, H]"
-        )
     if config1 is None or config2 is None:
         from ...gemm.batch_invariant.api import part_of
 
@@ -413,16 +355,8 @@ def fused_moe_fp8(
         plan if plan is not None else permute_plan(experts, E)
     )  # ``plan``: ``route_plan``'s outputs, the same integers
     Tk = T * k
-    # a swapped record reads a token box of its tile's rows at every group's row: the dense buffer it reads carries that many
-    # rows past the live ones, so the last tiles' boxes stay inside it (rows past the live ones are computed and never stored)
-    pad1 = config1.tile_n if config1.swap_ab else 0
-    pad2 = config2.tile_n if config2.swap_ab else 0
-    x_buf = torch.empty(Tk + pad1, H, dtype=torch.float8_e4m3fn, device=dev)
-    x_perm = x_buf[:Tk]
-    if Tk:
-        get_compiled_gather(k, "e4m3", warps_per_row(Tk, H // 16, sm_count_of(dev)))(
-            xq, src, x_perm, Tk, H
-        )
+    pad1, pad2 = swapped_pads(config1, config2)
+    x_buf, x_perm = gather_rows(xq, src, k, Tk, pad1, "e4m3")
     a_buf = torch.empty(Tk + pad2, I, dtype=torch.float8_e4m3fn, device=dev)
     a = grouped_gemm_fp8(
         x_buf,
@@ -439,10 +373,7 @@ def fused_moe_fp8(
     y = grouped_gemm_fp8(
         a_buf, w.w2q, w.s_w2, w.s_inter, w.m_inter, counts, config2, GEMM2_CHAIN, Tk=Tk
     )  # [Tk, H] bf16
-    if T:
-        get_compiled_combine(
-            k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(dev)), w_round
-        )(y, dest, scales, out, T, H)
+    combine_rows(y, dest, scales, out, k, w_round)
     if return_intermediates:
         return out, dict(
             counts=counts,
