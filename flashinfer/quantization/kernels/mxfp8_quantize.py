@@ -33,7 +33,7 @@ from typing import Callable, Tuple
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32, Uint8
+from cutlass import Float32, Int32, Uint8, Uint64
 
 from ...cute_dsl.fp4_common import (
     fmax_f32,
@@ -208,8 +208,11 @@ class MXFP8QuantizeLinearKernel:
     - 4T/SF (small problems): 4 threads per SF block, 8 elements per thread,
       2 shuffle reductions, 8 SF blocks per warp
 
-    This kernel is M-agnostic: compiled once per (K, dtype, pdl, use_2t)
+    This kernel is M-agnostic: compiled once per (K, dtype, pdl, use_2t, K_padded)
     combination.
+
+    With ``K < K_padded`` the input is ``[M, K]`` and the output is ``[M, K_padded]``:
+    tensor[:K] is quantized and tensor[K:K_padded] is zero filled (fp8 zeros, scale 0).
     """
 
     WARPS_PER_BLOCK = 16  # 16 warps = 512 threads per block
@@ -220,6 +223,7 @@ class MXFP8QuantizeLinearKernel:
         K: int,
         enable_pdl: bool = False,
         use_2t_per_sf: bool = True,
+        K_padded: int | None = None,
     ):
         self.is_bfloat16 = dtype == cutlass.BFloat16
         self.is_float32 = dtype == cutlass.Float32
@@ -235,10 +239,19 @@ class MXFP8QuantizeLinearKernel:
             self._threads_per_sf = THREADS_PER_SF_SMALL
             self._sf_blocks_per_warp = SF_BLOCKS_PER_WARP_SMALL
 
-        self.SF_BLOCKS_PER_TB = self.WARPS_PER_BLOCK * self._sf_blocks_per_warp
-
-        assert K % SF_VEC_SIZE == 0
-        self.num_sf_blocks_per_row = K // SF_VEC_SIZE
+        self.K = K
+        self.K_padded = K if K_padded is None else K_padded
+        assert self.K % SF_VEC_SIZE == 0 and 0 < self.K <= self.K_padded
+        assert self.K_padded % SF_VEC_SIZE == 0
+        self.has_pad = self.K_padded > self.K
+        # Warps that quantize; the last one zero-fills the padding when there is any.
+        self.compute_warps = (
+            self.WARPS_PER_BLOCK - 1 if self.has_pad else self.WARPS_PER_BLOCK
+        )
+        self.SF_BLOCKS_PER_TB = self.compute_warps * self._sf_blocks_per_warp
+        # Scale blocks per row of the padded output, and of the input.
+        self.num_sf_blocks_per_row = self.K_padded // SF_VEC_SIZE
+        self.valid_sf_blocks_per_row = self.K // SF_VEC_SIZE
 
     @cute.jit
     def __call__(
@@ -287,14 +300,19 @@ class MXFP8QuantizeLinearKernel:
         sf_idx_in_warp = lane_idx // threads_per_sf
         thread_in_sf = lane_idx % threads_per_sf
 
-        sf_blocks_per_tb = self.WARPS_PER_BLOCK * sf_blocks_per_warp
-        num_sf_blocks_per_row = self.num_sf_blocks_per_row
+        sf_blocks_per_tb = self.compute_warps * sf_blocks_per_warp
+        # Blocks of the *input* row; the output and scales rows are `num_sf_blocks_per_row`.
+        num_sf_blocks_per_row = self.valid_sf_blocks_per_row
 
         sf_idx_base = (
             bidx * sf_blocks_per_tb + warp_idx * sf_blocks_per_warp + sf_idx_in_warp
         )
 
         sf_idx = sf_idx_base
+        if cutlass.const_expr(self.has_pad):
+            # The zero-fill warp quantizes nothing: start it past the end.
+            if warp_idx >= self.compute_warps:
+                sf_idx = total_sf_blocks
         while sf_idx < total_sf_blocks:
             row_idx = sf_idx // num_sf_blocks_per_row
             col_idx = sf_idx % num_sf_blocks_per_row
@@ -398,9 +416,47 @@ class MXFP8QuantizeLinearKernel:
                 st_global_u64(output_ptr_i64, fp8_packed)
 
             if thread_in_sf == Int32(0):
-                mScales[sf_idx] = scale_ue8m0
+                mScales[row_idx * self.num_sf_blocks_per_row + col_idx] = scale_ue8m0
 
             sf_idx = sf_idx + grid_dim_x * sf_blocks_per_tb
+
+        if cutlass.const_expr(self.has_pad):
+            if warp_idx == self.compute_warps:
+                # Zero fp8 columns [K, K_padded) and zero scales [valid, total) of every row this
+                # CTA owns (rows bidx, bidx + grid, ...). 8 bytes per lane per step: the row
+                # starts and `K` are multiples of 32 bytes.
+                fp8_pad = (
+                    (self.num_sf_blocks_per_row - self.valid_sf_blocks_per_row)
+                    * SF_VEC_SIZE
+                    // 8
+                )
+                sf_pad = self.num_sf_blocks_per_row - self.valid_sf_blocks_per_row
+                m_rows = total_sf_blocks // self.valid_sf_blocks_per_row
+                row = bidx
+                while row < m_rows:
+                    row_output = mOutput[row, None]
+                    for i in cutlass.range_constexpr(
+                        (fp8_pad + WARP_SIZE - 1) // WARP_SIZE
+                    ):
+                        c = lane_idx + i * WARP_SIZE
+                        if c < fp8_pad:
+                            st_global_u64(
+                                get_ptr_as_int64(
+                                    row_output, Int32(self.K) + c * Int32(8)
+                                ),
+                                Uint64(0),
+                            )
+                    for i in cutlass.range_constexpr(
+                        (sf_pad + WARP_SIZE - 1) // WARP_SIZE
+                    ):
+                        c = lane_idx + i * WARP_SIZE
+                        if c < sf_pad:
+                            mScales[
+                                row * self.num_sf_blocks_per_row
+                                + self.valid_sf_blocks_per_row
+                                + c
+                            ] = Uint8(0)
+                    row = row + grid_dim_x
 
         # PDL: Signal that dependent kernels can start early
         if cutlass.const_expr(self.enable_pdl):
@@ -956,29 +1012,36 @@ def _get_compiled_kernel_mxfp8_linear(
     K: int,
     enable_pdl: bool = False,
     use_2t_per_sf: bool = True,
+    K_padded: int | None = None,
 ) -> Tuple[Callable, int]:
     """
     Get or compile LINEAR layout kernel with TVM-FFI.
 
-    Cached by (K, dtype, pdl, use_2t) - M-agnostic, device-independent
-    compilation.
+    Cached by (K, dtype, pdl, use_2t, K_padded) - M-agnostic, device-independent
+    compilation. With ``K < K_padded`` the input is ``[M, K]`` and the kernel
+    zero-fills tensor[K:K_padded] of the ``[M, K_padded]`` output.
 
     Returns:
         Tuple of (compiled_kernel, sf_blocks_per_tb) where sf_blocks_per_tb
         is used by the caller to compute num_blocks at runtime.
     """
     cutlass_dtype = _CUTLASS_DTYPE_MAP[dtype_key]
-    kernel_obj = MXFP8QuantizeLinearKernel(cutlass_dtype, K, enable_pdl, use_2t_per_sf)
+    kernel_obj = MXFP8QuantizeLinearKernel(
+        cutlass_dtype, K, enable_pdl, use_2t_per_sf, K_padded
+    )
 
     # Use symbolic M for dynamic batch sizes
     sym_m = cute.sym_int()
 
     # Create fake tensors for compilation
     input_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass_dtype, (sym_m, K), stride_order=(1, 0), assumed_align=16
+        cutlass_dtype, (sym_m, kernel_obj.K), stride_order=(1, 0), assumed_align=16
     )
     output_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8, (sym_m, K), stride_order=(1, 0), assumed_align=16
+        cutlass.Uint8,
+        (sym_m, kernel_obj.K_padded),
+        stride_order=(1, 0),
+        assumed_align=16,
     )
     sym_scale_size = cute.sym_int()
     scales_fake = cute.runtime.make_fake_compact_tensor(
@@ -1379,7 +1442,12 @@ def mxfp8_quantize_cute_dsl(
 
     padded_k = ((k + alignment - 1) // alignment) * alignment
 
-    if padded_k > k:
+    # The linear layout zero-fills the padding inside the kernel (see
+    # `MXFP8QuantizeLinearKernel`), so the unpadded input goes in as it is. The swizzled
+    # layouts still read a zero-padded copy.
+    fuse_pad = padded_k > k and not is_sf_swizzled_layout
+
+    if padded_k > k and not fuse_pad:
         # Pad input with zeros - padding columns must be zero to produce zero FP8 output
         input_padded = torch.zeros(m, padded_k, dtype=input.dtype, device=input.device)
         input_padded[:, :k] = input
@@ -1483,11 +1551,13 @@ def mxfp8_quantize_cute_dsl(
         scale_output_size = total_sf_blocks
 
         kernel_fn, sf_blocks_per_tb = _get_compiled_kernel_mxfp8_linear(
-            dtype_key, padded_k, enable_pdl, use_2t
+            dtype_key, k, enable_pdl, use_2t, padded_k
         )
 
+        # The kernel quantizes the input's blocks; the padding's are written, not computed.
+        work_sf_blocks = m * (k // SF_VEC_SIZE) if fuse_pad else total_sf_blocks
         num_blocks = min(
-            (total_sf_blocks + sf_blocks_per_tb - 1) // sf_blocks_per_tb, target_grid
+            (work_sf_blocks + sf_blocks_per_tb - 1) // sf_blocks_per_tb, target_grid
         )
 
         fp8_output = torch.empty(m, padded_k, dtype=torch.uint8, device=input.device)
@@ -1495,7 +1565,7 @@ def mxfp8_quantize_cute_dsl(
             scale_output_size, dtype=torch.uint8, device=input.device
         )
 
-        kernel_fn(input_padded, fp8_output, scale_output, total_sf_blocks, num_blocks)
+        kernel_fn(input_padded, fp8_output, scale_output, work_sf_blocks, num_blocks)
 
     fp8_tensor = fp8_output.view(torch.float8_e4m3fn)
 
