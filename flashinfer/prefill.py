@@ -4270,7 +4270,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     paged_kv_indptr, paged_kv_last_page_len, seq_lens, page_size
                 )
             )
-        if kv_lens_arr_host is not None:
+        # fa2 derives kv lengths from the page table and never reads this
+        # buffer, so skip the copy, which syncs when the host lengths are
+        # pageable. A cuDNN graph retained from an earlier plan still reads it.
+        if kv_lens_arr_host is not None and (
+            self._backend != "fa2"
+            or (self.is_cuda_graph_enabled and self._cudnn_q_lens_buffer is not None)
+        ):
             required_size = len(kv_lens_arr_host)
             if required_size > self._kv_lens_buffer.shape[0]:
                 self._kv_lens_buffer = torch.empty(
