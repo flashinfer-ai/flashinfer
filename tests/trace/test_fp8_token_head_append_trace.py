@@ -1,5 +1,6 @@
 """Regression tests for standalone FP8 token/head cache trace replay."""
 
+import ast
 import json
 from pathlib import Path
 
@@ -158,4 +159,9 @@ def test_fp8_token_head_committed_trace_replay(path):
         if definition["name"].startswith(t.name_prefix + "_kv")
     )
     inputs = namespace[template.init.__name__](nnz_kv=4, num_pages=4, device="cpu")
-    assert op.fi_trace(**inputs) == definition
+    replayed = op.fi_trace(**inputs)
+    # Compare ASTs because ast.unparse formatting varies across Python versions.
+    assert ast.dump(ast.parse(replayed.pop("init"))) == ast.dump(
+        ast.parse(definition.pop("init"))
+    )
+    assert replayed == definition
