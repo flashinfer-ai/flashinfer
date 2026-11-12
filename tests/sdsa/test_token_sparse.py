@@ -15,12 +15,22 @@ from flashinfer.sdsa.token_sparse import (
 )
 
 pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires a CUDA device"
+)
+# The token-sparse index kernels are SM10x only; the NVFP4 gather needs FP8
+# E4M3 conversion, available from compute capability 8.9.
+requires_sm10x = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
     reason="token-sparse attention requires SM10x",
+)
+requires_fp8 = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
+    reason="the NVFP4 gather requires compute capability 8.9",
 )
 same = partial(torch.testing.assert_close, rtol=0, atol=0, equal_nan=True)
 
 
+@requires_sm10x
 @pytest.mark.parametrize("top_k", [512, 2048])
 @pytest.mark.parametrize(
     ("tokens", "requests_per_token"), [(1, 1), (3, 2), (77, 1), (5, 4)]
@@ -62,6 +72,7 @@ def test_token_sparse_kv_indices_match_reference_and_replay(
         graph.replay()
 
 
+@requires_sm10x
 @pytest.mark.parametrize("at_limit", [False, True])
 @pytest.mark.parametrize("top_k", [512, 2048])
 @pytest.mark.parametrize("group", [1, 4, 16])
@@ -147,6 +158,7 @@ def test_group_union_masks_match_reference_and_replay(
     check()
 
 
+@requires_sm10x
 def test_union_key_limit_examples() -> None:
     if torch.cuda.get_device_properties().shared_memory_per_block_optin != 227 * 1024:
         pytest.skip("The examples are for 227 KiB of shared memory")
@@ -218,6 +230,7 @@ def _expected_gather(decoded, slots, lengths, head_dim):
     return expected
 
 
+@requires_fp8
 @pytest.mark.parametrize(
     "page_size,swizzled", [(4, True), (64, True), (4, False), (64, False), (6, False)]
 )
@@ -282,6 +295,7 @@ def test_gather_nvfp4_selected_tokens(page_size, swizzled, head_dim):
     check()
 
 
+@requires_fp8
 def test_gather_nvfp4_input_offsets_beyond_int32():
     """Pages past 2 GiB of packed data are addressed without wrapping."""
     from flashinfer.sdsa.token_sparse import gather_nvfp4_kv_cache
@@ -354,6 +368,7 @@ def _gather_inputs(page_size=4, head_dim=64, rows=1, top_k=4, device="cuda"):
     )
 
 
+@requires_fp8
 @pytest.mark.parametrize(
     "invalid,match",
     [
@@ -384,6 +399,7 @@ def test_gather_nvfp4_rejects_invalid_inputs(invalid, match):
         gather_nvfp4_kv_cache(**kwargs)
 
 
+@requires_fp8
 def test_gather_nvfp4_runs_on_the_tensors_device():
     """The launch follows the tensors' device, not the current device."""
     from flashinfer.sdsa.token_sparse import gather_nvfp4_kv_cache
@@ -405,6 +421,7 @@ def test_gather_nvfp4_runs_on_the_tensors_device():
     torch.testing.assert_close(results[0], results[1], rtol=0, atol=0)
 
 
+@requires_fp8
 @pytest.mark.parametrize("cache_index", [None, 0, 1, 2, 3])
 def test_gather_nvfp4_rejects_missing_page_dimensions(cache_index):
     """Malformed cache ranks are rejected even when there is no gather work."""
@@ -431,6 +448,7 @@ def test_gather_nvfp4_rejects_missing_page_dimensions(cache_index):
         )
 
 
+@requires_fp8
 @pytest.mark.parametrize("page_size,head_dim", [(0, 64), (4, 0)])
 def test_gather_nvfp4_rejects_empty_page_or_head(page_size, head_dim):
     """The kernel's page division and scale swizzle require positive extents."""
@@ -460,6 +478,7 @@ def test_gather_nvfp4_rejects_empty_page_or_head(page_size, head_dim):
         )
 
 
+@requires_fp8
 def test_gather_nvfp4_output_offsets_beyond_int32():
     """Large FP8 workspaces must not wrap their byte offsets at 2 GiB."""
     from flashinfer.sdsa.token_sparse import gather_nvfp4_kv_cache

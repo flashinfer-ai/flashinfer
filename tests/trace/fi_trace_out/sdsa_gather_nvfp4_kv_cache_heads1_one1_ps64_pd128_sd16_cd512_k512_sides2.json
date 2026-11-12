@@ -133,6 +133,12 @@
         "top_k"
       ],
       "dtype": "int32"
+    },
+    "v_sf_swizzled": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true,
+      "description": "V scales use the four-token swizzle (default) rather than a linear layout."
     }
   },
   "outputs": {

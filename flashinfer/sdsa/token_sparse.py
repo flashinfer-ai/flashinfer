@@ -427,8 +427,8 @@ def gather_nvfp4_kv_cache(
     paged_kv_cache : tuple[torch.Tensor, torch.Tensor]
         K/V uint8 HND pages, each shaped
         ``[pages, 1, page_size, head_dim // 2]``, with matching strides and
-        contiguous token data. ``page_size`` is a positive multiple of four;
-        ``head_dim`` is a positive multiple of 64.
+        contiguous token data. ``page_size`` is positive, and a multiple of
+        four for swizzled V scales; ``head_dim`` is a positive multiple of 64.
     kv_cache_sf : tuple[torch.Tensor, torch.Tensor]
         K/V FP8 E4M3 block-scale pages, each shaped
         ``[pages, 1, page_size, head_dim // 16]``, with matching strides.

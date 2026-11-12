@@ -338,6 +338,11 @@ gather_nvfp4_kv_cache_trace = TraceTemplate(
         "seq_lens": Tensor(["rows"]),
         "out": Tensor(["output_tokens", "one", "one", "content_dim"]),
         "block_tables": Tensor(["rows", "sides", "top_k"]),
+        "v_sf_swizzled": Scalar(
+            "bool",
+            optional=True,
+            description="V scales use the four-token swizzle (default) rather than a linear layout.",
+        ),
     },
     outputs={
         "out": Tensor(
