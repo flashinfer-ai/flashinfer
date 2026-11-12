@@ -212,14 +212,13 @@ __global__ void __launch_bounds__(NTHR, SPAN ? 2 : MINB)
                      const int* __restrict__ prefix, uint16_t* __restrict__ out, float* state,
                      uint16_t* state16, int* cnt, float* ring_l, float* ring_b, uint16_t* Kn,
                      uint16_t* Mc, uint16_t* Xc, uint16_t* Vc, uint16_t* Nc, float scale, int HQ,
-                     int HV, int num_slots) {
+                     int HV, int num_slots, int num_tokens) {
   extern __shared__ __align__(16) unsigned char smem[];
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
   const int h = blockIdx.x % HV, b = blockIdx.x / HV;
   const int slot = idx[b];
   const bool no_slot = slot < 0 || slot >= num_slots;
   const int kh = h / (HV / HQ);
-  const bool owner = (h % (HV / HQ)) == 0;
   int* cnt_cell = cnt + (size_t)(no_slot ? 0 : slot) * HV + h;
   const int e = SPAN ? prefix[b] : 1;
   const int c0 = no_slot ? -1 : *reinterpret_cast<volatile int*>(cnt_cell);
@@ -228,6 +227,9 @@ __global__ void __launch_bounds__(NTHR, SPAN ? 2 : MINB)
   if (SPAN) {
     row0 = starts[b];
     ntok = ends[b] - row0;
+    if (row0 < 0 || ntok < 0 || row0 + ntok > num_tokens) return;
+    // a launch without an output builds rows a prefill left unbuilt, and nothing else
+    if (out == nullptr && c0 != kPending) return;
     if (e < 0) {
       bad = true;
     } else if ((e & 63) == 0) {
@@ -293,7 +295,7 @@ __global__ void __launch_bounds__(NTHR, SPAN ? 2 : MINB)
   const size_t sh = (size_t)slot * HV + h;
   uint16_t* S16 = state16 + sh * D * D;
   float* S32 = state + sh * D * D;
-  uint16_t* Kpool = Kn + ((size_t)slot * CH * HQ + kh) * D;  // row j at + j * HQ * D
+  uint16_t* Kpool = Kn + ((size_t)slot * CH * HV + h) * D;  // row j at + j * HV * D
   uint16_t* Mpool = Mc + sh * CH * CH;
   uint16_t* Xpool = Xc + sh * CH * CH;
   uint16_t* Vpool = Vc + sh * CH * D;
@@ -329,7 +331,7 @@ __global__ void __launch_bounds__(NTHR, SPAN ? 2 : MINB)
           cp_async16(Ssm + (u >> 4) * SD + (u & 15) * 8, S16 + (size_t)u * 8);
       for (int u = tid; u < p * 16; u += NTHR) {
         const int j = u >> 4, c8 = (u & 15) * 8;
-        cp_async16(Ksm + j * SD + c8, Kpool + (size_t)j * HQ * D + c8);
+        cp_async16(Ksm + j * SD + c8, Kpool + (size_t)j * HV * D + c8);
       }
       if (SPAN) {
         for (int u = tid; u < p * 16; u += NTHR) {
@@ -387,7 +389,7 @@ __global__ void __launch_bounds__(NTHR, SPAN ? 2 : MINB)
       if (lane < 16) {
         *reinterpret_cast<uint4*>(Ksm + (size_t)p * SD + 8 * lane) = kn;
         *reinterpret_cast<uint4*>(knrow + 8 * lane) = kn;
-        if (owner) *reinterpret_cast<uint4*>(Kpool + (size_t)p * HQ * D + 8 * lane) = kn;
+        *reinterpret_cast<uint4*>(Kpool + (size_t)p * HV * D + 8 * lane) = kn;
       }
       if (tid < SC / 2) reinterpret_cast<uint32_t*>(xrow)[tid] = 0u;
     }
@@ -427,8 +429,7 @@ __global__ void __launch_bounds__(NTHR, SPAN ? 2 : MINB)
         AReg A;
         load_a(A, Ssm + (size_t)(16 * warp) * SD, SD, lane);
         if (!SPAN) {
-          // the warp's state rows are in registers: their bytes take 16 rows of the VKS (warps 0-3)
-          // or NV (4-7) tile
+          // the warp's state rows are in registers: VKS (warps 0-3) or NV rows take their place
           const uint16_t* src = warp < 4 ? Vpool : Npool;
           const int j0 = 16 * (warp & 3);
           uint16_t* dst = Ssm + (size_t)(16 * warp) * SD;
@@ -743,7 +744,7 @@ __global__ void __launch_bounds__(NTHR, SPAN ? 2 : MINB)
     if (!SPAN) {
       for (int u = tid; u < (CH - 1) * 16; u += NTHR)
         cp_async16(Nsm + (u >> 4) * SD + (u & 15) * 8,
-                   Kpool + (size_t)(u >> 4) * HQ * D + (u & 15) * 8);
+                   Kpool + (size_t)(u >> 4) * HV * D + (u & 15) * 8);
       cp_async_commit();
       if (tid < 16)
         *reinterpret_cast<uint4*>(Nsm + (size_t)(CH - 1) * SD + 8 * tid) =
@@ -819,12 +820,11 @@ __global__ void __launch_bounds__(NTHR, SPAN ? 2 : MINB)
 
 // One CTA per (sequence, open row): a prefill's open tail rows are kept next to their slot.
 __global__ void __launch_bounds__(NTHR)
-    StashKernel(const uint16_t* __restrict__ q, const uint16_t* __restrict__ k,
-                const uint16_t* __restrict__ v, const float* __restrict__ gl,
-                const float* __restrict__ gb, const int* __restrict__ idx,
-                const int* __restrict__ starts, const int* __restrict__ ends, int* cnt,
-                uint16_t* hq, uint16_t* hk, uint16_t* hv, float* hg, float* hb, int HQ, int HV,
-                int num_slots) {
+    StashKernel(const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
+                const float* __restrict__ gl, const float* __restrict__ gb,
+                const int* __restrict__ idx, const int* __restrict__ starts,
+                const int* __restrict__ ends, int* cnt, uint16_t* hk, uint16_t* hv, float* hg,
+                float* hb, int HQ, int HV, int num_slots) {
   const int tid = threadIdx.x, i = blockIdx.x / (CH - 1), j = blockIdx.x % (CH - 1);
   const int slot = idx[i];
   if (slot < 0 || slot >= num_slots) return;
@@ -833,12 +833,9 @@ __global__ void __launch_bounds__(NTHR)
     for (int h = tid; h < HV; h += NTHR) cnt[(size_t)slot * HV + h] = n > 0 ? kPending : kStale;
   if (j >= n) return;
   const size_t src = (size_t)starts[i] + j, dst = (size_t)slot * CH + j;
-  for (int u = tid; u < HQ * 16; u += NTHR) {
-    reinterpret_cast<uint4*>(hq + dst * HQ * D)[u] =
-        reinterpret_cast<const uint4*>(q + src * HQ * D)[u];
+  for (int u = tid; u < HQ * 16; u += NTHR)
     reinterpret_cast<uint4*>(hk + dst * HQ * D)[u] =
         reinterpret_cast<const uint4*>(k + src * HQ * D)[u];
-  }
   for (int u = tid; u < HV * 16; u += NTHR)
     reinterpret_cast<uint4*>(hv + dst * HV * D)[u] =
         reinterpret_cast<const uint4*>(v + src * HV * D)[u];
@@ -848,15 +845,14 @@ __global__ void __launch_bounds__(NTHR)
   }
 }
 
-inline cudaError_t LaunchStash(const uint16_t* q, const uint16_t* k, const uint16_t* v,
-                               const float* g, const float* beta, const int* slots,
-                               const int* starts, const int* ends, int* cnt, uint16_t* hist_q,
-                               uint16_t* hist_k, uint16_t* hist_v, float* hist_g, float* hist_beta,
-                               int batch, int num_q_heads, int num_v_heads, int num_slots,
-                               cudaStream_t stream) {
-  StashKernel<<<batch*(CH - 1), NTHR, 0, stream>>>(q, k, v, g, beta, slots, starts, ends, cnt,
-                                                   hist_q, hist_k, hist_v, hist_g, hist_beta,
-                                                   num_q_heads, num_v_heads, num_slots);
+inline cudaError_t LaunchStash(const uint16_t* k, const uint16_t* v, const float* g,
+                               const float* beta, const int* slots, const int* starts,
+                               const int* ends, int* cnt, uint16_t* hist_k, uint16_t* hist_v,
+                               float* hist_g, float* hist_beta, int batch, int num_q_heads,
+                               int num_v_heads, int num_slots, cudaStream_t stream) {
+  StashKernel<<<batch*(CH - 1), NTHR, 0, stream>>>(k, v, g, beta, slots, starts, ends, cnt, hist_k,
+                                                   hist_v, hist_g, hist_beta, num_q_heads,
+                                                   num_v_heads, num_slots);
   return cudaGetLastError();
 }
 
@@ -867,7 +863,7 @@ inline cudaError_t LaunchStep(const uint16_t* q, const uint16_t* k, const uint16
                               float* state, uint16_t* state_bf16, int* cnt, float* ring_l,
                               float* ring_b, uint16_t* kn, uint16_t* m_rows, uint16_t* x_rows,
                               uint16_t* vks_rows, uint16_t* nv_rows, float scale, int batch,
-                              int num_q_heads, int num_v_heads, int num_slots,
+                              int num_q_heads, int num_v_heads, int num_slots, int num_tokens,
                               cudaStream_t stream) {
   const size_t smem = SPAN ? kSpanSmemBytes : kSmemBytes;
   cudaError_t status = cudaFuncSetAttribute(
@@ -875,7 +871,8 @@ inline cudaError_t LaunchStep(const uint16_t* q, const uint16_t* k, const uint16
   if (status != cudaSuccess) return status;
   DecodeStepKernel<SPAN><<<batch * num_v_heads, NTHR, smem, stream>>>(
       q, k, v, g, beta, slots, starts, ends, prefix, out, state, state_bf16, cnt, ring_l, ring_b,
-      kn, m_rows, x_rows, vks_rows, nv_rows, scale, num_q_heads, num_v_heads, num_slots);
+      kn, m_rows, x_rows, vks_rows, nv_rows, scale, num_q_heads, num_v_heads, num_slots,
+      num_tokens);
   return cudaGetLastError();
 }
 
