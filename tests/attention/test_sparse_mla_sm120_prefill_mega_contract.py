@@ -2,10 +2,16 @@
 
 import pytest
 import torch
-from tests.attention.sparse_mla_prefill_utils import fixture
+from tests.attention.sparse_mla_prefill_utils import (
+    fixture,
+    poison_mega_destinations,
+    assert_mega_outputs,
+    fused_call,
+    numerical_metrics,
+)
 
 
-@pytest.mark.parametrize("cache_format", ["v41_fp8"])
+@pytest.mark.parametrize("cache_format", ["fp8", "v41_fp8"])
 @pytest.mark.parametrize("tokens,heads", [(128, 16), (128, 64)])
 @pytest.mark.parametrize("empty", [False, True])
 def test_fused_single_cache_and_empty_prefill(cache_format, tokens, heads, empty):
@@ -32,23 +38,28 @@ def test_fused_single_cache_and_empty_prefill(cache_format, tokens, heads, empty
     )
     epilogue(f["context"], f["positions"], f["cs"], f["out"], f["scales"])
     expected, scales = f["out"].float().clone(), f["scales"].clone()
-    actual_lse = f["wrapper"].run_mega(
+    actual_out = torch.empty_like(f["out"])
+    actual_scales = torch.empty_like(scales)
+    actual_lse = torch.empty_like(lse)
+    poison_mega_destinations(actual_out, actual_scales, actual_lse, scales)
+    f["wrapper"].run_mega(
         f["q"],
         f["caches"][0],
         f["indices"][0],
-        f["out"],
+        actual_out,
         512**-0.5,
         positions=f["positions"],
         cos_sin=f["cs"],
-        output_scales=f["scales"],
+        output_scales=actual_scales,
+        out_lse=actual_lse,
         **opts,
     )
-    torch.testing.assert_close(actual_lse, lse, atol=0, rtol=0)
-    torch.testing.assert_close(f["out"].float(), expected, atol=0, rtol=0)
-    torch.testing.assert_close(f["scales"], scales, atol=0, rtol=0)
+    assert_mega_outputs(
+        (actual_out, actual_scales, actual_lse), (expected, scales, lse)
+    )
     if empty:
         assert torch.isneginf(actual_lse).all()
-        assert not torch.count_nonzero(f["out"].float())
+        assert not torch.count_nonzero(actual_out.float())
 
 
 @pytest.mark.parametrize(
@@ -128,10 +139,19 @@ def test_mega_v41_cache_layouts(inline, mixed, tokens):
     )
     f["post"]()
     expected, scales = f["out"].float().clone(), f["scales"].clone()
-    actual_lse = fused_call(f)
-    torch.testing.assert_close(actual_lse, lse, atol=2e-6, rtol=1e-6)
-    assert (f["out"].float() != expected).float().mean().item() < 0.001
-    torch.testing.assert_close(f["scales"], scales, atol=0, rtol=0)
+    f["out"] = torch.empty_like(f["out"])
+    f["scales"] = torch.empty_like(scales)
+    actual_lse = torch.empty_like(lse)
+    fused_call(f, out_lse=actual_lse)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused_call(f, out_lse=actual_lse)
+    for _ in range(2):
+        poison_mega_destinations(f["out"], f["scales"], actual_lse, scales)
+        graph.replay()
+        assert_mega_outputs(
+            (f["out"], f["scales"], actual_lse), (expected, scales, lse)
+        )
 
 
 @pytest.mark.parametrize("cache_format", ["v41_fp8"])
@@ -158,3 +178,76 @@ def test_mega_graph_kernel_boundaries(cache_format, tokens, tmp_path):
     assert len(kernels) == 1, text
     assert all("sparse_mla" in node for node in kernels), text
     assert len(nodes) == len(kernels), text
+
+
+@pytest.mark.parametrize(
+    "cache_format,inline", [("fp8", False), ("v41_fp8", False), ("v41_fp8", True)]
+)
+@pytest.mark.parametrize("tokens", [1, 16, 64])
+@pytest.mark.parametrize("topk", [128, 4096])
+def test_default_mega_decode_merge(cache_format, inline, tokens, topk):
+    """The public decode route must write all outputs in either merge branch."""
+    f = fixture(
+        tokens,
+        32,
+        cache_format,
+        inline=inline,
+        topk=topk,
+        extra_topk=0,
+        ragged=True,
+        with_sink=False,
+    )
+    lengths = torch.tensor([topk, 0, 1, 63, 64, 65, topk - 1], device="cuda")
+    f["lengths"][0].copy_(lengths[torch.arange(tokens, device="cuda") % len(lengths)])
+    _check_default_mega(f, variant=0, large_merge=topk > 2048)
+
+
+@pytest.mark.parametrize("heads", [16, 32, 64])
+@pytest.mark.parametrize("route", ["single", "dual", "full_tile"])
+def test_dsv4_mega_prefill_routes(heads, route):
+    f = fixture(
+        65,
+        heads,
+        "fp8",
+        extra_topk=0 if route == "single" else 128,
+        ragged=True,
+        with_sink=False,
+    )
+    if route == "full_tile":
+        # Omitting lengths selects the full-tile implementation. Negative IDs
+        # still mask individual candidates, including an entirely empty row.
+        for i, ids in enumerate(f["indices"]):
+            if ids is not None:
+                ids[0].fill_(-1)
+                f["lengths"][i] = None
+    _check_default_mega(
+        f,
+        variant=2 if route == "single" else 3,
+        implementation="fulltile" if route == "full_tile" else "mg",
+    )
+
+
+def _check_default_mega(f, *, variant, implementation=None, large_merge=None):
+    expected = tuple(x.clone() for x in f["baseline"]())
+    f["out"] = torch.empty_like(f["out"])
+    f["scales"] = torch.empty_like(f["scales"])
+    lse = torch.empty_like(expected[2])
+    fused_call(f, out_lse=lse)
+    plan = next(iter(f["wrapper"]._prepared_calls.values())).plan.inspect()
+    assert plan["variant"] == variant, plan
+    if implementation is not None:
+        assert plan["implementation"] == implementation, plan
+    if large_merge is not None:
+        assert (plan["scratch_split_stride"] > 32) == large_merge, plan
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused_call(f, out_lse=lse)
+    for _ in range(2):
+        poison_mega_destinations(f["out"], f["scales"], lse, expected[1])
+        graph.replay()
+        assert_mega_outputs((f["out"], f["scales"], lse), expected)
+    rows = torch.tensor([0, f["q"].shape[0] - 1], device="cuda").unique()
+    metrics = numerical_metrics(f, lse, rows)
+    assert metrics["finite_output"], metrics
+    assert metrics["relative_l2"] < 0.07, metrics
+    assert metrics["lse_max_abs"] < 0.06, metrics

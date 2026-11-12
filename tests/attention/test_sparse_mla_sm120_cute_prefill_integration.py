@@ -3,7 +3,12 @@
 import pytest
 import torch
 
-from tests.attention.sparse_mla_prefill_utils import prefill_fixture, numerical_metrics
+from tests.attention.sparse_mla_prefill_utils import (
+    prefill_fixture,
+    numerical_metrics,
+    poison_mega_destinations,
+    assert_mega_outputs,
+)
 
 
 @pytest.mark.parametrize("inline", [False, True])
@@ -22,6 +27,8 @@ def test_public_prefill_specializations(heads, rank, inline):
         inline=inline,
     )
 
+    actual_lse = torch.empty(f["q"].shape[:2], device="cuda")
+
     def mega():
         return f["wrapper"].run_mega(
             f["q"],
@@ -37,6 +44,7 @@ def test_public_prefill_specializations(heads, rank, inline):
             extra_kv_cache=f["caches"][1],
             extra_indices=f["indices"][1],
             extra_topk_length=f["lengths"][1],
+            out_lse=actual_lse,
             return_lse=True,
             lse_scale=0.6931471805599453,
         )
@@ -55,22 +63,19 @@ def test_public_prefill_specializations(heads, rank, inline):
             ids[2, ::7] = -1
             ids[66, :] = -1
         f["positions"].add_(1)
+        # Keep the reference before poisoning every captured destination.
+        expected = tuple(x.clone() for x in f["baseline"]())
+        metrics = numerical_metrics(f, expected[2], rows)
+        assert metrics["finite_output"], metrics
+        assert metrics["relative_l2"] < 0.07, metrics
+        assert metrics["lse_max_abs"] < 0.06, metrics
+        poison_mega_destinations(f["out"], f["scales"], actual_lse, expected[1])
         graph.replay()
-        metrics = numerical_metrics(f, prepared.lse, rows)
+        metrics = numerical_metrics(f, actual_lse, rows)
         assert metrics["finite_output"]
         assert metrics["relative_l2"] < 0.07, metrics
         assert metrics["lse_max_abs"] < 0.06, metrics
-        fused = f["out"].float().clone(), f["scales"].clone(), prepared.lse.clone()
-        # This calls Mega=false, with separate RoPE and output quantization.
-        _, _, lse = f["baseline"]()
-        metrics = numerical_metrics(f, lse, rows)
-        assert metrics["relative_l2"] < 0.07, metrics
-        assert metrics["lse_max_abs"] < 0.06, metrics
-        torch.testing.assert_close(lse, fused[2], atol=2e-6, rtol=1e-6)
-        # Compiler contraction may change values at a quantization boundary.
-        disagreement = (f["out"].float() != fused[0]).float().mean().item()
-        assert disagreement < 0.001, disagreement
-        torch.testing.assert_close(f["scales"], fused[1], atol=0, rtol=0)
+        assert_mega_outputs((f["out"], f["scales"], actual_lse), expected)
 
 
 def test_pitched_inline_rows_and_lse_stride():
@@ -124,6 +129,7 @@ def test_pitched_inline_rows_and_lse_stride():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         mega(lse)
+    poison_mega_destinations(f["out"], f["scales"], lse, expected[1])
     graph.replay()
     for actual, wanted in zip(
         (f["out"].float(), f["scales"], lse), expected, strict=True
@@ -217,6 +223,7 @@ def test_explicit_small_query_prefill(tokens, inline):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         mega()
+    poison_mega_destinations(f["out"], f["scales"], lse, f["scales"].clone())
     graph.replay()
     metrics = numerical_metrics(f, lse, torch.arange(tokens, device="cuda"))
     assert metrics["relative_l2"] < 0.07, metrics

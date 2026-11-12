@@ -286,7 +286,12 @@ def independent_reference(f, rows=None):
             continue
         if decoded is None:
             raise ValueError("independent reference requires keep_decoded=True")
-        idx, lens = indices[rows], lengths[rows]
+        idx = indices[rows]
+        lens = (
+            lengths[rows]
+            if lengths is not None
+            else torch.full((idx.shape[0],), idx.shape[1], device=idx.device)
+        )
         selected.append(decoded[idx.clamp_min(0).long()].double())
         valid.append(
             (idx >= 0)
@@ -328,7 +333,7 @@ def numerical_metrics(f, lse, rows=None):
     )
 
 
-def fused_call(f):
+def fused_call(f, *, out_lse=None):
     """Native fused kernels with the same prepared dispatch as the baseline."""
     return f["wrapper"].run_mega(
         f["q"],
@@ -346,4 +351,29 @@ def fused_call(f):
         extra_topk_length=f["lengths"][1],
         return_lse=True,
         lse_scale=math.log(2),
+        out_lse=out_lse,
     )
+
+
+def poison_mega_destinations(out, scales, lse, expected_scales):
+    """Make every missing output write observable, including after graph capture."""
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    scales.copy_(expected_scales.bitwise_xor(0xFF))
+
+
+def assert_mega_outputs(actual, expected):
+    """Compare separate-transform and fused results without hiding missing writes."""
+    out, scales, lse = actual
+    expected_out, expected_scales, expected_lse = expected
+    assert torch.isfinite(out.float()).all()
+    assert not torch.isnan(lse).any()
+    torch.testing.assert_close(lse, expected_lse, atol=2e-6, rtol=1e-6)
+    assert (out.float() != expected_out.float()).float().mean().item() < 0.001
+    # E4M3 spacing is at most 1/8 of a normal value; subnormal spacing is
+    # 2**-9. Bound the size as well as the count of rounding disagreements.
+    # Exact scale equality below makes this a bound in common output units.
+    torch.testing.assert_close(
+        out.float(), expected_out.float(), atol=2**-9, rtol=0.125
+    )
+    torch.testing.assert_close(scales, expected_scales, atol=0, rtol=0)
