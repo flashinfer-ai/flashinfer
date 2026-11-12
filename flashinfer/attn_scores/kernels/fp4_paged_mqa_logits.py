@@ -447,6 +447,7 @@ class FP4MQALogitsKernel:
         use_batched_store: bool = True,
         use_flat_logits_view=None,
         use_two_level_task_loop=None,
+        enable_pdl: bool = False,
         *,
         arch: str,
     ):
@@ -500,6 +501,10 @@ class FP4MQALogitsKernel:
         # output row stride (see _atom_out_row_base).
         self.N = self.next_n_atom * num_heads
         self.num_sms = num_sms
+        # Programmatic dependent launch: the prologue overlaps the previous
+        # kernel's tail, and the schedule / lengths it may have produced are
+        # read only after griddepcontrol_wait.
+        self.enable_pdl = enable_pdl
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
         # When True, skip the in-kernel SMEM warp_transpose for KV SF; assume
@@ -1047,6 +1052,7 @@ class FP4MQALogitsKernel:
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
+            use_pdl=self.enable_pdl,
         )
 
     @cute.kernel
@@ -1115,19 +1121,21 @@ class FP4MQALogitsKernel:
         NUM_BLOCKS_PER_MMA = self.num_blocks_per_mma
         PHYS_BLOCK_KV = self.phys_block_kv
         sm_idx = bidz
-        start_q = mScheduleMeta[(sm_idx, 0)]
-        start_kv_half = mScheduleMeta[(sm_idx, 1)]
-        end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
-        end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
+        if cutlass.const_expr(not self.enable_pdl):
+            start_q = mScheduleMeta[(sm_idx, 0)]
+            start_kv_half = mScheduleMeta[(sm_idx, 1)]
+            end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
+            end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
         # Early mContextLens load: overlap ~200-cycle L2 latency with the
         # entire prologue setup (pipelines, SMEM alloc, TMA partition, etc.)
         # Clamp to avoid OOB when start_q == batch_size (zero-work CTA sentinel).
         # Note: zero-work CTAs get a stale current_num_kv (from the last batch
         # element), but it is never used because has_work will be False.
-        start_q_clamped = min(start_q, batch_size - 1)
-        current_num_kv = (
-            self._atom_ctx_len(start_q_clamped, mContextLens) + self.block_kv - 1
-        ) // self.block_kv
+        if cutlass.const_expr(not self.enable_pdl):
+            start_q_clamped = min(start_q, batch_size - 1)
+            current_num_kv = (
+                self._atom_ctx_len(start_q_clamped, mContextLens) + self.block_kv - 1
+            ) // self.block_kv
 
         if is_tma_warp:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -1515,6 +1523,20 @@ class FP4MQALogitsKernel:
         # per-branch duplication is semantics-preserving.
 
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+
+        if cutlass.const_expr(self.enable_pdl):
+            # Every global read and write follows the wait: the schedule and
+            # lengths may come from the previous kernel, and a graph may reuse
+            # the logits buffer the previous kernel's consumer still reads.
+            cute.arch.griddepcontrol_wait()
+            start_q = mScheduleMeta[(sm_idx, 0)]
+            start_kv_half = mScheduleMeta[(sm_idx, 1)]
+            end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
+            end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
+            start_q_clamped = min(start_q, batch_size - 1)
+            current_num_kv = (
+                self._atom_ctx_len(start_q_clamped, mContextLens) + self.block_kv - 1
+            ) // self.block_kv
 
         # ===== WARP-SPECIALIZED EXECUTION =====
 
@@ -3206,6 +3228,10 @@ class FP4MQALogitsKernel:
                 if q_idx < batch_size:
                     q_pipeline.consumer_release(q_cons_state)
                     q_cons_state.advance()
+
+            if cutlass.const_expr(self.enable_pdl):
+                # Logits are stored: dependents may start their prologue.
+                cute.arch.griddepcontrol_launch_dependents()
 
             # TMEM dealloc: math warps are allocator + last consumer
             tmem.relinquish_alloc_permit()

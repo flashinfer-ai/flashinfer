@@ -94,6 +94,7 @@ from ..trace.templates.attn_scores import (
 )
 from ..utils import (
     backend_requirement,
+    device_support_pdl,
     get_device_index,
     get_device_sm_count,
     supported_compute_capability,
@@ -956,6 +957,7 @@ def _cached_compile_fp8_kernel(
     # validates them.
     num_epi_subtiles: int,
     w_cache_regs: Optional[int],
+    enable_pdl: bool,
     arch: str,
 ):
     from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
@@ -1029,6 +1031,7 @@ def _cached_compile_fp8_kernel(
         acc_dtype=acc_dtype,
         output_dtype=output_dtype,
         w_cache_regs=w_cache_regs,
+        enable_pdl=enable_pdl,
         # Construction-time arch gates (is_rubin levers, TMEM columns) must
         # follow the compile target, not the DSL's ambient device-0 probe.
         arch=arch,
@@ -1053,7 +1056,7 @@ def _cached_compile_fp8_kernel(
     tag = (
         f"fp8_bs{block_size}_H{num_heads}_D{head_dim}_nn{next_n}"
         f"_sms{num_sms}_epi{epi_dtype}_acc{acc_dtype}_out{output_dtype}"
-        f"_sub{num_epi_subtiles}_w{w_cache_regs or 0}_{arch}"
+        f"_sub{num_epi_subtiles}_w{w_cache_regs or 0}_pdl{int(enable_pdl)}_{arch}"
     )
     return build_and_load_cute_dsl_kernel(
         "attn_scores_fp8",
@@ -1151,6 +1154,7 @@ def _cached_compile_fp4_kernel(
     # same kernel -- a warm from one call site would silently miss from the
     # other. Forcing every caller to pass it keeps the key canonical.
     num_next_n_atoms: int,
+    enable_pdl: bool,
 ):
     from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from .kernels import FP4MQALogitsKernel
@@ -1219,6 +1223,7 @@ def _cached_compile_fp4_kernel(
         output_dtype=output_dtype,
         # kernel kwarg name is fixed (verbatim TRT-LLM port)
         remove_online_sf_transpose=is_kv_sf_interleaved,
+        enable_pdl=enable_pdl,
         # Construction-time arch gates (atom cap, is_rubin levers) must follow
         # the compile target, not the DSL's ambient device-0 probe.
         arch=arch,
@@ -1245,7 +1250,7 @@ def _cached_compile_fp4_kernel(
         f"fp4_bs{block_size}_H{num_heads}_D{head_dim}_nn{next_n}"
         f"_at{num_next_n_atoms}"
         f"_sms{num_sms}_epi{epi_dtype}_out{output_dtype}"
-        f"_sub{num_epi_subtiles}_sfI{int(is_kv_sf_interleaved)}_{arch}"
+        f"_sub{num_epi_subtiles}_sfI{int(is_kv_sf_interleaved)}_pdl{int(enable_pdl)}_{arch}"
     )
     return build_and_load_cute_dsl_kernel(
         "attn_scores_fp4",
@@ -1465,6 +1470,7 @@ def _check_fp8_paged_mqa_logits_supported(
     acc_dtype: torch.dtype = torch.float32,
     schedule_meta: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> bool:
     """Return True when the FP8 kernel supports this problem, else raise ``ValueError``.
 
@@ -1606,6 +1612,7 @@ def fp8_paged_mqa_logits(
     acc_dtype: torch.dtype = torch.float32,
     schedule_meta: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """FP8 paged MQA logits for Blackwell (SM100/SM103) and Rubin (SM107).
 
@@ -1805,6 +1812,11 @@ def fp8_paged_mqa_logits(
                          Bigger is fine -- e.g. one address-stable max-batch
                          buffer shared across captures; only the first
                          batch_size*next_n rows are written.
+        enable_pdl:      launch with programmatic dependent launch, so the
+                         kernel's prologue overlaps the previous kernel on the
+                         stream; it reads its inputs only after that kernel
+                         completes.  None (default) enables it where the device
+                         supports it.
 
     Returns:
         logits: [batch_size*next_n, max_seq_len]  output_dtype
@@ -1927,6 +1939,8 @@ def fp8_paged_mqa_logits(
     )
     dev_index = get_device_index(q.device)
     num_epi_subtiles, w_cache_regs = _fp8_epilogue_policy(H, next_n, cutlass_epi)
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(q.device)
     with _on_device(dev_index):
         compiled = _cached_compile_fp8_kernel(
             block_size,
@@ -1939,6 +1953,7 @@ def fp8_paged_mqa_logits(
             cutlass_out,
             num_epi_subtiles,
             w_cache_regs,
+            enable_pdl,
             _arch_for_launch(dev_index, "fp8_paged_mqa_logits"),
         )
         compiled(
@@ -1970,6 +1985,7 @@ def _check_fp4_paged_mqa_logits_supported(
     is_kv_sf_interleaved: bool = False,
     schedule_meta: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> bool:
     """Return True when the FP4 kernel supports this problem, else raise ``ValueError``.
 
@@ -2123,6 +2139,7 @@ def fp4_paged_mqa_logits(
     is_kv_sf_interleaved: bool = False,
     schedule_meta: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """FP4 (MXFP4) paged MQA logits for Blackwell (SM100/SM103) and Rubin (SM107).
 
@@ -2381,6 +2398,11 @@ def fp4_paged_mqa_logits(
                          Bigger is fine -- e.g. one address-stable max-batch
                          buffer shared across captures; only the first
                          batch_size*next_n rows are written.
+        enable_pdl:      launch with programmatic dependent launch, so the
+                         kernel's prologue overlaps the previous kernel on the
+                         stream; it reads its inputs only after that kernel
+                         completes.  None (default) enables it where the device
+                         supports it.
 
     Returns:
         logits: [batch_size*next_n, max_seq_len]  output_dtype
@@ -2545,6 +2567,8 @@ def fp4_paged_mqa_logits(
         )
 
     dev_index = get_device_index(q.device)
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(q.device)
     with _on_device(dev_index):
         compiled = _cached_compile_fp4_kernel(
             block_size,
@@ -2558,6 +2582,7 @@ def fp4_paged_mqa_logits(
             is_kv_sf_interleaved,
             _arch_for_launch(dev_index, "fp4_paged_mqa_logits"),
             num_atoms,
+            enable_pdl,
         )
         compiled(
             kv_flat,
@@ -2699,6 +2724,7 @@ def precompile_paged_mqa_logits(
                             _to_cutlass(out_dtype),
                             num_epi_subtiles,
                             w_cache_regs,
+                            True,  # enable_pdl: the default on every SM10x target
                             arch,
                         )
 
@@ -2728,6 +2754,7 @@ def precompile_paged_mqa_logits(
                             False,
                             arch,
                             num_atoms,
+                            True,  # enable_pdl: the default on every SM10x target
                         )
 
         # The schedule kernel is keyed on the aligned *scheduler row count*,

@@ -1694,6 +1694,77 @@ def test_fp4_out_and_schedule_meta_paths():
     torch.testing.assert_close(ret.float()[valid], ref.float()[valid], atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+def test_enable_pdl_is_bit_identical_and_keyed(variant):
+    """enable_pdl only moves the schedule and length reads behind
+    griddepcontrol_wait and adds the dependent-launch trigger, so the PDL and
+    non-PDL kernels agree bit for bit; they must be distinct compile-cache
+    entries so one can never serve the other."""
+    device = "cuda"
+    if not is_sm100a_supported(torch.device(device)):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
+    from flashinfer.attn_scores import attn_scores as A
+
+    B, next_n, ctx, block_size = 4, 2, 4096, 64
+    if variant == "fp8":
+        q, kv, w, cl, bt = _make_fp8_case(B, next_n, ctx, block_size, device)
+        cache = A._cached_compile_fp8_kernel
+
+        def run(enable_pdl):
+            return fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx, enable_pdl=enable_pdl)
+
+    else:
+        num_heads, head_dim = 64, 128
+        torch.manual_seed(13)
+        cl = torch.full((B,), ctx, dtype=torch.int32, device=device)
+        bt, num_total_blocks = _make_paged_kv(B, block_size, cl, device)
+        q_bf = torch.randn(
+            B, next_n, num_heads, head_dim, device=device, dtype=torch.bfloat16
+        )
+        kv_bf = torch.randn(
+            num_total_blocks,
+            block_size,
+            1,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        w = torch.randn(B * next_n, num_heads, device=device, dtype=torch.float32)
+        q_packed, sf_packed = _per_token_cast_to_fp4(q_bf.view(-1, head_dim), gran_k=32)
+        q = q_packed.view(torch.uint8).view(B, next_n, num_heads, head_dim // 2)
+        q_sf = sf_packed.view(torch.int32).view(B, next_n, num_heads)
+        kv, _ = _kv_cache_cast_to_fp4(kv_bf)
+        cache = A._cached_compile_fp4_kernel
+
+        def run(enable_pdl):
+            return fp4_paged_mqa_logits(
+                q,
+                q_sf,
+                kv,
+                w,
+                bt,
+                cl,
+                ctx,
+                output_dtype=torch.float32,
+                enable_pdl=enable_pdl,
+            )
+
+    with_pdl = run(True).clone()
+    entries = cache.cache_info().currsize
+    without_pdl = run(False)
+    assert cache.cache_info().currsize == entries + 1, (
+        "the PDL and non-PDL kernels must be distinct cache entries"
+    )
+    torch.cuda.synchronize()
+    valid = _valid_causal_mask(cl, next_n, ctx, device)
+    assert torch.isfinite(with_pdl[valid]).all()
+    torch.testing.assert_close(
+        with_pdl.float()[valid], without_pdl.float()[valid], atol=0, rtol=0
+    )
+
+
 def test_fp8_input_validation():
     """Guard rails: bad out= size, unsupported dtype, and non-int32/CPU inputs must raise."""
     device = "cuda"
@@ -3495,7 +3566,7 @@ def test_precompile_targets_the_requested_device():
     precompile_paged_mqa_logits(device=torch.device("cuda", target), variants=("fp8",))
 
     hits = _cached_compile_fp8_kernel.cache_info().hits
-    _cached_compile_fp8_kernel(64, 64, 128, 1, sms, f32, f32, f32, 1, None, arch)
+    _cached_compile_fp8_kernel(64, 64, 128, 1, sms, f32, f32, f32, 1, None, True, arch)
     assert _cached_compile_fp8_kernel.cache_info().hits == hits + 1, (
         f"precompile(device=cuda:{target}) produced no entry for "
         f"(num_sms={sms}, arch={arch})"
@@ -3508,7 +3579,7 @@ def test_precompile_targets_the_requested_device():
     with contextlib.suppress(Exception):
         other_arch = "sm_90a" if arch != "sm_90a" else "sm_80"
         _cached_compile_fp8_kernel(
-            64, 64, 128, 1, sms, f32, f32, f32, 1, None, other_arch
+            64, 64, 128, 1, sms, f32, f32, f32, 1, None, True, other_arch
         )
     assert _cached_compile_fp8_kernel.cache_info().misses > misses, (
         "a different arch reused the cache entry -- arch is not in the key"
@@ -3553,7 +3624,7 @@ def test_precompile_warms_fp4_float32_output():
     for out_dtype in (torch.bfloat16, torch.float32):
         hits = _cached_compile_fp4_kernel.cache_info().hits
         _cached_compile_fp4_kernel(
-            64, 64, 128, 1, sms, f32, _to_cutlass(out_dtype), 1, False, arch, 1
+            64, 64, 128, 1, sms, f32, _to_cutlass(out_dtype), 1, False, arch, 1, True
         )
         assert _cached_compile_fp4_kernel.cache_info().hits == hits + 1, (
             f"precompile did not warm fp4 output_dtype={out_dtype}"
@@ -3562,7 +3633,7 @@ def test_precompile_warms_fp4_float32_output():
     # a dtype outside the warmed set must miss, or the assertions above are vacuous
     misses = _cached_compile_fp4_kernel.cache_info().misses
     _cached_compile_fp4_kernel(
-        64, 64, 128, 1, sms, f32, _to_cutlass(torch.float16), 1, False, arch, 1
+        64, 64, 128, 1, sms, f32, _to_cutlass(torch.float16), 1, False, arch, 1, True
     )
     assert _cached_compile_fp4_kernel.cache_info().misses > misses, (
         "float16 was not warmed but did not miss -- the cache key ignores "
