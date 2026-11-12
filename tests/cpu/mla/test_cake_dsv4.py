@@ -3166,7 +3166,9 @@ def test_every_sm107a_fp8_route_result_has_a_registered_kernel_or_is_refused(
     refused: dict[str, set] = {}
     routed = rejected = 0
     for num_heads in (8, 16, 32, 64, 128):
-        for sparse_topk, page_size in _SWEEP_WIDTHS:
+        # Every FP8 width up to 1152 routes on SM107; a C128 item past
+        # 128K context (2176 slots) is the width the route rejects.
+        for sparse_topk, page_size in (*_SWEEP_WIDTHS, (2176, 2)):
             for batch_size, max_q_len, ragged in _SWEEP_QUERIES:
                 tokens = _canonical_query_tokens(batch_size, max_q_len, ragged)
                 try:
