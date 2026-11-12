@@ -123,6 +123,28 @@ feature and runtime guards still apply. Short requests mixed with long ones
 do not qualify for this extension merely because their declaration is large.
 Independent Q overrides and device-only metadata keep the original policy.
 
+### SM100 D256 paged GQA admission
+
+The BF16 HND/page-16 prefix extension requires cuDNN 9.24+, FE 1.33+,
+and native packed-split and physical-origin capability flags for the requested
+width. It uses the same public cuDNN graph contract and never forces an engine.
+D128 admission is independent of this extension; D64 remains on the native route.
+
+Admission requires CPU query offsets and KV lengths, plus CPU query masks when
+provided. Device-only metadata retains the native route without an admission
+readback. Compute work from paired actual lengths, `Hq * sum(Qi * KVi)`;
+physical slots and maximum lengths must not overestimate this work. The floor
+is 16 Mi. The measured domain is batch 1–4,
+Q 64–1024, KV 2048–32768, 8–64 query heads, and GQA groups 2/4/8/16, with each
+KV length at least four times its query length. Every request must stay in the
+same Q<=128 or Q>128 class as the declared maximum. Small-work and mixed-class
+cases remain on the native route.
+
+Test the automatic route with strided Q, independent actual query masks,
+physical token origins, changed lengths/page tables and retained graph replay.
+The version and native flags are necessary dependencies; benchmark evidence
+from a development FE build does not establish released-wheel qualification.
+
 ## Grouped FP8 GEMM
 
 `flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous` is the standalone
