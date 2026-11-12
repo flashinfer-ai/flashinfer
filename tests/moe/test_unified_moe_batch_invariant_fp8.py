@@ -564,9 +564,14 @@ def test_one_body_per_form_serves_both_formats():
     assert C.swapped_kernel_name(swapped_knobs("e4m3")[0], GEMM2_CHAIN).startswith(
         "swapped_e4m3_plain_silu_w8a8_bf16_"
     )
-    assert C.MODULE == "batch_invariant_moe" and "batch_invariant_moe_fp8" not in jit.MODULE_ROOTS
+    assert (
+        C.MODULE == "batch_invariant_moe"
+        and "batch_invariant_moe_fp8" not in jit.MODULE_ROOTS
+    )
     srcs = jit.relative_sources("batch_invariant_moe")
-    assert not any("fp8_" in os.path.basename(s) or "swap_bf16" in s for s in srcs), srcs
+    assert not any("fp8_" in os.path.basename(s) or "swap_bf16" in s for s in srcs), (
+        srcs
+    )
     for body in ("compile", "kernel", "swap", "epilogue"):
         assert f"fused_moe/batch_invariant/blocks/{body}.py" in srcs
     # the shared ranking at the chain's format: the fp8 chain's list is a subset of its own space
