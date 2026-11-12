@@ -111,18 +111,6 @@ ARG_PLANS: dict[str, list[list[str]]] = {
 }
 
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_grouped_fp8_gemm_005d45335e5b2a81f511": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_005d45335e5b2a81f511",
-        "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_005d45335e5b2a81f511_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_005d45335e5b2a81f511_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan3",
-        "arches": ["sm_100a", "sm_103a"],
-    },
     "cake_grouped_fp8_gemm_007fd314577a65b33485": {
         "kernel": "kernel_cake_grouped_fp8_gemm_007fd314577a65b33485",
         "sources": [
@@ -195,6 +183,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_grouped_fp8_gemm_1c465144240239ebb5ca": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_1c465144240239ebb5ca",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_1c465144240239ebb5ca_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_1c465144240239ebb5ca_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan2",
+        "arches": ["sm_107a"],
+    },
     "cake_grouped_fp8_gemm_28b94ccb85e6d2d50961": {
         "kernel": "kernel_cake_grouped_fp8_gemm_28b94ccb85e6d2d50961",
         "sources": [
@@ -207,17 +207,17 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_grouped_fp8_gemm_31c7f6826b9f7a2db092": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_31c7f6826b9f7a2db092",
+    "cake_grouped_fp8_gemm_348a937af226cd4d36f9": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_348a937af226cd4d36f9",
         "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_31c7f6826b9f7a2db092_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_31c7f6826b9f7a2db092_binding.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_348a937af226cd4d36f9_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_348a937af226cd4d36f9_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
         "tma_abi": "grid_constant",
-        "arg_plan": "plan3",
-        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": "plan2",
+        "arches": ["sm_107a"],
     },
     "cake_grouped_fp8_gemm_377ece00c70003b8d19f": {
         "kernel": "kernel_cake_grouped_fp8_gemm_377ece00c70003b8d19f",
@@ -279,18 +279,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_grouped_fp8_gemm_4bc792d174cd731a0c83": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_4bc792d174cd731a0c83",
-        "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_4bc792d174cd731a0c83_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_4bc792d174cd731a0c83_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan2",
-        "arches": ["sm_107a"],
-    },
     "cake_grouped_fp8_gemm_4c6307d24f3915e88028": {
         "kernel": "kernel_cake_grouped_fp8_gemm_4c6307d24f3915e88028",
         "sources": [
@@ -302,18 +290,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "tma_abi": "grid_constant",
         "arg_plan": "plan3",
         "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_grouped_fp8_gemm_5de6d5210d65397342e6": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_5de6d5210d65397342e6",
-        "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_5de6d5210d65397342e6_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_5de6d5210d65397342e6_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan2",
-        "arches": ["sm_107a"],
     },
     "cake_grouped_fp8_gemm_664e5f82737cd4cdfee3": {
         "kernel": "kernel_cake_grouped_fp8_gemm_664e5f82737cd4cdfee3",
@@ -350,18 +326,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "tma_abi": "grid_constant",
         "arg_plan": "plan3",
         "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_grouped_fp8_gemm_7d47498ed624652758e0": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_7d47498ed624652758e0",
-        "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_7d47498ed624652758e0_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_7d47498ed624652758e0_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan2",
-        "arches": ["sm_107a"],
     },
     "cake_grouped_fp8_gemm_7ee216a957327349cf41": {
         "kernel": "kernel_cake_grouped_fp8_gemm_7ee216a957327349cf41",
@@ -417,6 +381,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_grouped_fp8_gemm_81776e4fac03dbc1d9b1": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_81776e4fac03dbc1d9b1",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_81776e4fac03dbc1d9b1_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_81776e4fac03dbc1d9b1_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan3",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_grouped_fp8_gemm_917859181466ebe2dd3b": {
         "kernel": "kernel_cake_grouped_fp8_gemm_917859181466ebe2dd3b",
         "sources": [
@@ -440,18 +416,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "tma_abi": "grid_constant",
         "arg_plan": "plan2",
         "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_grouped_fp8_gemm_9adbd24351b1197720a1": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_9adbd24351b1197720a1",
-        "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_9adbd24351b1197720a1_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_9adbd24351b1197720a1_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan2",
-        "arches": ["sm_107a"],
     },
     "cake_grouped_fp8_gemm_9bbdce371d7ecbc3fc43": {
         "kernel": "kernel_cake_grouped_fp8_gemm_9bbdce371d7ecbc3fc43",
@@ -477,18 +441,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_grouped_fp8_gemm_ad951349d53d895b5975": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_ad951349d53d895b5975",
-        "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_ad951349d53d895b5975_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_ad951349d53d895b5975_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan3",
-        "arches": ["sm_103a"],
-    },
     "cake_grouped_fp8_gemm_b51037becc0c4cf72026": {
         "kernel": "kernel_cake_grouped_fp8_gemm_b51037becc0c4cf72026",
         "sources": [
@@ -500,6 +452,30 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "tma_abi": "grid_constant",
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_grouped_fp8_gemm_b7998f5a844bc15e8046": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_b7998f5a844bc15e8046",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_b7998f5a844bc15e8046_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_b7998f5a844bc15e8046_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan2",
+        "arches": ["sm_107a"],
+    },
+    "cake_grouped_fp8_gemm_c8362befbf3dfd399943": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_c8362befbf3dfd399943",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_c8362befbf3dfd399943_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_c8362befbf3dfd399943_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan3",
+        "arches": ["sm_103a"],
     },
     "cake_grouped_fp8_gemm_c8a9c3fa0b10ff00c03a": {
         "kernel": "kernel_cake_grouped_fp8_gemm_c8a9c3fa0b10ff00c03a",
@@ -542,6 +518,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_grouped_fp8_gemm_e5b03355800ab7a0ea1e": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_e5b03355800ab7a0ea1e",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_e5b03355800ab7a0ea1e_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_e5b03355800ab7a0ea1e_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan2",
+        "arches": ["sm_107a"],
+    },
     "cake_grouped_fp8_gemm_f2e4effd9e0455a7e297": {
         "kernel": "kernel_cake_grouped_fp8_gemm_f2e4effd9e0455a7e297",
         "sources": [
@@ -553,6 +541,30 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "tma_abi": "grid_constant",
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_grouped_fp8_gemm_f5bd6248f0fed48acd1c": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_f5bd6248f0fed48acd1c",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_f5bd6248f0fed48acd1c_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_f5bd6248f0fed48acd1c_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan3",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_grouped_fp8_gemm_fc4f7f2c12a2e62e320c": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_fc4f7f2c12a2e62e320c",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_fc4f7f2c12a2e62e320c_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_fc4f7f2c12a2e62e320c_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan2",
+        "arches": ["sm_107a"],
     },
     "cake_grouped_fp8_gemm_ff32d0570617af1d5c2e": {
         "kernel": "kernel_cake_grouped_fp8_gemm_ff32d0570617af1d5c2e",
@@ -569,14 +581,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
 }
 
 MODULES: dict[str, dict[str, str]] = {
-    "cake_grouped_fp8_gemm_005d45335e5b2a81f511_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_grouped_fp8_gemm_005d45335e5b2a81f511",
-    },
-    "cake_grouped_fp8_gemm_005d45335e5b2a81f511_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_grouped_fp8_gemm_005d45335e5b2a81f511",
-    },
     "cake_grouped_fp8_gemm_007fd314577a65b33485_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_grouped_fp8_gemm_007fd314577a65b33485",
@@ -625,6 +629,10 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_grouped_fp8_gemm_12f65758f84c60eb3d18",
     },
+    "cake_grouped_fp8_gemm_1c465144240239ebb5ca_sm_107a": {
+        "arch": "sm_107a",
+        "program": "cake_grouped_fp8_gemm_1c465144240239ebb5ca",
+    },
     "cake_grouped_fp8_gemm_28b94ccb85e6d2d50961_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_grouped_fp8_gemm_28b94ccb85e6d2d50961",
@@ -633,13 +641,9 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_grouped_fp8_gemm_28b94ccb85e6d2d50961",
     },
-    "cake_grouped_fp8_gemm_31c7f6826b9f7a2db092_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_grouped_fp8_gemm_31c7f6826b9f7a2db092",
-    },
-    "cake_grouped_fp8_gemm_31c7f6826b9f7a2db092_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_grouped_fp8_gemm_31c7f6826b9f7a2db092",
+    "cake_grouped_fp8_gemm_348a937af226cd4d36f9_sm_107a": {
+        "arch": "sm_107a",
+        "program": "cake_grouped_fp8_gemm_348a937af226cd4d36f9",
     },
     "cake_grouped_fp8_gemm_377ece00c70003b8d19f_sm_100a": {
         "arch": "sm_100a",
@@ -681,10 +685,6 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_grouped_fp8_gemm_488f15389de98fd92896",
     },
-    "cake_grouped_fp8_gemm_4bc792d174cd731a0c83_sm_107a": {
-        "arch": "sm_107a",
-        "program": "cake_grouped_fp8_gemm_4bc792d174cd731a0c83",
-    },
     "cake_grouped_fp8_gemm_4c6307d24f3915e88028_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_grouped_fp8_gemm_4c6307d24f3915e88028",
@@ -692,10 +692,6 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_grouped_fp8_gemm_4c6307d24f3915e88028_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_grouped_fp8_gemm_4c6307d24f3915e88028",
-    },
-    "cake_grouped_fp8_gemm_5de6d5210d65397342e6_sm_107a": {
-        "arch": "sm_107a",
-        "program": "cake_grouped_fp8_gemm_5de6d5210d65397342e6",
     },
     "cake_grouped_fp8_gemm_664e5f82737cd4cdfee3_sm_100a": {
         "arch": "sm_100a",
@@ -720,10 +716,6 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_grouped_fp8_gemm_7bcd26069f3a219a87e7_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_grouped_fp8_gemm_7bcd26069f3a219a87e7",
-    },
-    "cake_grouped_fp8_gemm_7d47498ed624652758e0_sm_107a": {
-        "arch": "sm_107a",
-        "program": "cake_grouped_fp8_gemm_7d47498ed624652758e0",
     },
     "cake_grouped_fp8_gemm_7ee216a957327349cf41_sm_100a": {
         "arch": "sm_100a",
@@ -757,6 +749,14 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_grouped_fp8_gemm_815c907592a28b332939",
     },
+    "cake_grouped_fp8_gemm_81776e4fac03dbc1d9b1_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_grouped_fp8_gemm_81776e4fac03dbc1d9b1",
+    },
+    "cake_grouped_fp8_gemm_81776e4fac03dbc1d9b1_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_grouped_fp8_gemm_81776e4fac03dbc1d9b1",
+    },
     "cake_grouped_fp8_gemm_917859181466ebe2dd3b_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_grouped_fp8_gemm_917859181466ebe2dd3b",
@@ -772,10 +772,6 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_grouped_fp8_gemm_942f06939975f32fd8d7_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_grouped_fp8_gemm_942f06939975f32fd8d7",
-    },
-    "cake_grouped_fp8_gemm_9adbd24351b1197720a1_sm_107a": {
-        "arch": "sm_107a",
-        "program": "cake_grouped_fp8_gemm_9adbd24351b1197720a1",
     },
     "cake_grouped_fp8_gemm_9bbdce371d7ecbc3fc43_sm_100a": {
         "arch": "sm_100a",
@@ -793,10 +789,6 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_grouped_fp8_gemm_a14c6ac9847f0cefb838",
     },
-    "cake_grouped_fp8_gemm_ad951349d53d895b5975_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_grouped_fp8_gemm_ad951349d53d895b5975",
-    },
     "cake_grouped_fp8_gemm_b51037becc0c4cf72026_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_grouped_fp8_gemm_b51037becc0c4cf72026",
@@ -804,6 +796,14 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_grouped_fp8_gemm_b51037becc0c4cf72026_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_grouped_fp8_gemm_b51037becc0c4cf72026",
+    },
+    "cake_grouped_fp8_gemm_b7998f5a844bc15e8046_sm_107a": {
+        "arch": "sm_107a",
+        "program": "cake_grouped_fp8_gemm_b7998f5a844bc15e8046",
+    },
+    "cake_grouped_fp8_gemm_c8362befbf3dfd399943_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_grouped_fp8_gemm_c8362befbf3dfd399943",
     },
     "cake_grouped_fp8_gemm_c8a9c3fa0b10ff00c03a_sm_100a": {
         "arch": "sm_100a",
@@ -829,6 +829,10 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_grouped_fp8_gemm_e032da34f6810f0aa5b6",
     },
+    "cake_grouped_fp8_gemm_e5b03355800ab7a0ea1e_sm_107a": {
+        "arch": "sm_107a",
+        "program": "cake_grouped_fp8_gemm_e5b03355800ab7a0ea1e",
+    },
     "cake_grouped_fp8_gemm_f2e4effd9e0455a7e297_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_grouped_fp8_gemm_f2e4effd9e0455a7e297",
@@ -836,6 +840,18 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_grouped_fp8_gemm_f2e4effd9e0455a7e297_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_grouped_fp8_gemm_f2e4effd9e0455a7e297",
+    },
+    "cake_grouped_fp8_gemm_f5bd6248f0fed48acd1c_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_grouped_fp8_gemm_f5bd6248f0fed48acd1c",
+    },
+    "cake_grouped_fp8_gemm_f5bd6248f0fed48acd1c_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_grouped_fp8_gemm_f5bd6248f0fed48acd1c",
+    },
+    "cake_grouped_fp8_gemm_fc4f7f2c12a2e62e320c_sm_107a": {
+        "arch": "sm_107a",
+        "program": "cake_grouped_fp8_gemm_fc4f7f2c12a2e62e320c",
     },
     "cake_grouped_fp8_gemm_ff32d0570617af1d5c2e_sm_100a": {
         "arch": "sm_100a",
@@ -855,12 +871,12 @@ ROUTES: dict[str, Any] = {
     "bs_ue8m0_n256_run32": "cake_grouped_fp8_gemm_6da15715d9ab967a1cc3",
     "bs_ue8m0_n256_s16": "cake_grouped_fp8_gemm_007fd314577a65b33485",
     "bs_ue8m0_swap": "cake_grouped_fp8_gemm_7ee216a957327349cf41",
-    "bs_ue8m0_swap_bm64": "cake_grouped_fp8_gemm_ad951349d53d895b5975",
-    "bs_ue8m0_swap_c1": "cake_grouped_fp8_gemm_31c7f6826b9f7a2db092",
+    "bs_ue8m0_swap_bm64": "cake_grouped_fp8_gemm_c8362befbf3dfd399943",
+    "bs_ue8m0_swap_c1": "cake_grouped_fp8_gemm_81776e4fac03dbc1d9b1",
     "bs_ue8m0_swap_carry": "cake_grouped_fp8_gemm_07c6b16218daec7a1273",
     "bs_ue8m0_swap_carry_s16": "cake_grouped_fp8_gemm_4c6307d24f3915e88028",
     "bs_ue8m0_swap_rp32": "cake_grouped_fp8_gemm_7bcd26069f3a219a87e7",
-    "bs_ue8m0_swap_rp32_s11": "cake_grouped_fp8_gemm_005d45335e5b2a81f511",
+    "bs_ue8m0_swap_rp32_s11": "cake_grouped_fp8_gemm_f5bd6248f0fed48acd1c",
     "bs_ue8m0_swap_run32": "cake_grouped_fp8_gemm_9bbdce371d7ecbc3fc43",
     "bs_ue8m0_swap_s16": "cake_grouped_fp8_gemm_01c4698d7aa0a8a6e940",
     "deepk_c2_ab6_scale1_direct_store_m32": "cake_grouped_fp8_gemm_c8a9c3fa0b10ff00c03a",
@@ -882,10 +898,11 @@ ROUTES: dict[str, Any] = {
 }
 
 SM107A_ROUTES: dict[str, str] = {
-    "bs_ue8m0_n128": "cake_grouped_fp8_gemm_9adbd24351b1197720a1",
-    "bs_ue8m0_n128_run32": "cake_grouped_fp8_gemm_5de6d5210d65397342e6",
-    "bs_ue8m0_n256": "cake_grouped_fp8_gemm_4bc792d174cd731a0c83",
-    "bs_ue8m0_n256_run32": "cake_grouped_fp8_gemm_7d47498ed624652758e0",
+    "bs_ue8m0_n128": "cake_grouped_fp8_gemm_348a937af226cd4d36f9",
+    "bs_ue8m0_n128_run32": "cake_grouped_fp8_gemm_fc4f7f2c12a2e62e320c",
+    "bs_ue8m0_n256": "cake_grouped_fp8_gemm_e5b03355800ab7a0ea1e",
+    "bs_ue8m0_n256_lpf": "cake_grouped_fp8_gemm_b7998f5a844bc15e8046",
+    "bs_ue8m0_n256_run32": "cake_grouped_fp8_gemm_1c465144240239ebb5ca",
 }
 
 # Tile geometry of every host route (including routes without an exported
@@ -896,6 +913,7 @@ ROUTE_GEOMETRY: dict[str, dict[str, int]] = {
     "bs_ue8m0_n128_run32": {"tile_m": 128, "tile_n": 128, "cluster_ctas": 1},
     "bs_ue8m0_n128_s16": {"tile_m": 128, "tile_n": 128, "cluster_ctas": 1},
     "bs_ue8m0_n256": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 1},
+    "bs_ue8m0_n256_lpf": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 1},
     "bs_ue8m0_n256_run32": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 1},
     "bs_ue8m0_n256_s16": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 1},
     "bs_ue8m0_swap": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 2},

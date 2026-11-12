@@ -781,7 +781,9 @@ class MoEEpMegaLayer(nn.Module):
         self._staged_kernel = kernel
         self._staged_workspace = backend_workspace
         self._staged_transformed = transformed_weights
-        return self.compute_staged(output=output)
+        return kernel._compute_prepared(
+            backend_workspace, transformed_weights, output=output
+        )
 
     def forward_unfinalized(
         self,

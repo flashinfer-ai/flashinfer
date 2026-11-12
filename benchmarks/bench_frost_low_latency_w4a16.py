@@ -457,7 +457,12 @@ def main():
     p.add_argument("--experts", type=int, default=512)
     p.add_argument("--top-k", type=int, default=10)
     p.add_argument("--cache-mode", choices=("warm", "cold"), default="warm")
-    p.add_argument("--expert-reuse", choices=("shared", "disjoint"), default="disjoint")
+    p.add_argument(
+        "--expert-reuse",
+        choices=("shared", "half", "disjoint"),
+        default="disjoint",
+        help="half alternates two disjoint top-k expert groups across tokens",
+    )
     p.add_argument("--output", type=Path, required=True)
     a = p.parse_args()
     is_fp16 = a.activation_dtype == "fp16"
@@ -475,7 +480,7 @@ def main():
     a.output.parent.mkdir(parents=True, exist_ok=True)
     cc = torch.cuda.get_device_capability()
     nv_native_archs = {
-        "expanded-bf16": ((9, 0),),
+        "expanded-bf16": ((9, 0), (10, 3)),
         "cutile": ((9, 0), (12, 0), (12, 1)),
         "cute-dsl": ((10, 0), (10, 3)),
         "sm12x": ((12, 0), (12, 1)),
@@ -583,6 +588,8 @@ def main():
     ids = torch.arange(t * k, device="cuda", dtype=torch.int32).reshape(t, k)
     if a.expert_reuse == "shared":
         ids.remainder_(k)
+    elif a.expert_reuse == "half":
+        ids.remainder_(2 * k)
     scores = torch.randn(t, k, device="cuda").softmax(-1).bfloat16().float()
     original_ids, original_scores = ids.clone(), scores.clone()
     if reuse_control:
@@ -815,7 +822,10 @@ def main():
     assert isinstance(frost_runner, FrostLowLatencyRunner)
 
     def frost(tactic):
-        frost_layer._winners[frost_bucket] = (frost_runner, ("ffma", *tactic))
+        selected_tactic = (
+            tuple(tactic) if tactic[0] == "warp_mma" else ("ffma", *tactic)
+        )
+        frost_layer._winners[frost_bucket] = (frost_runner, selected_tactic)
         return frost_layer(act, frost_pack)
 
     if reuse_control:
@@ -1069,14 +1079,14 @@ def main():
 
     frost_inputs = frost_runner.pack_inputs(act, frost_pack)
     for tactic in frost_runner.get_valid_tactics(frost_inputs, None):
-        assert tactic[0] == "ffma"
-        measure("frost", tuple(tactic[1:]))
+        assert tactic[0] in ("ffma", "warp_mma")
+        measure("frost", tuple(tactic[1:] if tactic[0] == "ffma" else tactic))
     for tactic in native_tactics:
         measure("native", tactic)
     result["native_search"] = (
         "All 16 original Frost FC1/FC2 column pairs; identical checkpoint and numerical contract"
         if reuse_control
-        else "All advertised native choices plus default; cuTile additionally enumerates the selected/all supported block-size stage pairs; SM120 native uses all same-thread small/large-tile pairs; expanded FP16 ranks top-two per stage plus default"
+        else "All advertised native choices plus default; cuTile additionally enumerates the selected/all supported block-size stage pairs; SM120 native uses all same-thread small/large-tile pairs; expanded BF16/FP16 use stage-ranked pairs plus default, not the full Cartesian search"
     )
     result["native_tactic_count"] = len(native_tactics)
     selected = {

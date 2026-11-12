@@ -42,7 +42,7 @@ FP32 weight.  A case whose route the device does not export is skipped with
 the reason.
 
 Like ``test_cake_rmsnorm_det_train.py`` this suite names its package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so the vendored-package gate runs it against a vendored copy.
 """
 
@@ -66,7 +66,7 @@ import pytest
 import torch
 import torch.utils.checkpoint
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_det_train")
 loader = cake_package("cake_rmsnorm_det_train", "cake_jit")

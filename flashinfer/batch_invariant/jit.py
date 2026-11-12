@@ -7,8 +7,10 @@ closure** as the key files: the transitive closure of relative imports (module- 
 root files (:data:`MODULE_ROOTS`) within the mode's directories (:data:`MODE_DIRS`) plus the ``__init__`` of every package on
 the way. A change to any file a kernel's
 generated code depends on therefore invalidates the module's cached objects, while the API module stays outside the
-closure and can change freely. Everything else (module directory, ``meta.json``, locking, ``FLASHINFER_DISABLE_JIT``,
-``FLASHINFER_CUTE_DSL_DISABLE_CACHE``) is FlashInfer's.
+closure and can change freely. Sources the walk reaches that are host-side selection code, not kernel code (the dispatcher's
+chunk rule and ranking heuristic: they choose a kernel, they never enter one), are excluded per module (:data:`MODULE_NON_KERNEL_SOURCES`)
+so an edit to them keeps every compiled object valid. Everything else (module directory, ``meta.json``, locking,
+``FLASHINFER_DISABLE_JIT``, ``FLASHINFER_CUTE_DSL_DISABLE_CACHE``) is FlashInfer's.
 """
 
 from __future__ import annotations
@@ -32,23 +34,79 @@ _FI_DIR = Path(__file__).resolve().parents[1]  # the flashinfer package
 MODE_DIRS: Tuple[Path, ...] = (
     _FI_DIR / "batch_invariant",
     _FI_DIR / "gemm" / "batch_invariant",
+    _FI_DIR / "attention" / "batch_invariant",
+    _FI_DIR / "fused_moe" / "batch_invariant",
 )
 
 #: Root files of every cache module, relative to the flashinfer package; the module's closure is the transitive
 #: relative-import closure of these files within the mode's directories.
 MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
-    # the GEMM kernels and the split-K fixup share one module: both roots, so an edit to either invalidates its objects
-    "batch_invariant_gemm_bf16": (
+    # the GEMM kernels (both operand formats) and the split-K fixup share one module: both roots, so an edit to either
+    # invalidates its objects
+    "batch_invariant_gemm": (
         "gemm/batch_invariant/blocks/compile.py",
         "gemm/batch_invariant/fixup.py",
+    ),
+    # the block-scaled kernels (the MXFP8 classes): their own module, so an edit to the block-scaled body leaves the dense
+    # module's objects valid and vice versa (the split's fixup stays in the dense module)
+    "batch_invariant_gemm_blockscaled": (
+        "gemm/batch_invariant/blocks/compile_blockscaled.py",
+    ),
+    # the block-scale fp8 kernels (the DeepSeek-style class behind gemm_fp8_nt_groupwise): their own module
+    "batch_invariant_gemm_fp8_blockscale": (
+        "gemm/batch_invariant/blocks/compile_fp8bs.py",
+    ),
+    # the attention kernels (the row body, the Swaps-AB decode body) and the split-KV fixup share one module
+    "batch_invariant_attention": (
+        "attention/batch_invariant/blocks/compile.py",
+        "attention/batch_invariant/swaps/compile.py",
+        "attention/batch_invariant/fixup.py",
+    ),
+    # the bf16 MoE kernels: the grouped GEMM (which composes the dense GEMM blocks: they are in its closure), the
+    # routing, permutation and combine kernels; the MoE API, dispatcher and runner stay outside
+    "batch_invariant_moe": (
+        "fused_moe/batch_invariant/blocks/compile.py",
+        "fused_moe/batch_invariant/route.py",
+        "fused_moe/batch_invariant/route_plan.py",
+        "fused_moe/batch_invariant/permute.py",
+        "fused_moe/batch_invariant/combine.py",
     ),
 }
 
 #: Sources outside the mode's directories that a module's kernels import absolutely, relative to the flashinfer
 #: package: the relative-import closure cannot reach them, so they are keyed explicitly (a missing file is an error).
 MODULE_EXTRA_SOURCES: Dict[str, Tuple[str, ...]] = {
-    "batch_invariant_gemm_bf16": (
+    "batch_invariant_gemm": (
         "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
+    ),
+    "batch_invariant_gemm_blockscaled": (
+        "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
+    ),
+    "batch_invariant_gemm_fp8_blockscale": (
+        "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
+    ),
+}
+
+#: Sources within the mode's directories that the closure walk reaches but that no kernel binary depends on (host-side
+#: selection code: the dispatcher's chunk rule and ranking heuristic), relative to the flashinfer package; removed from the key after
+#: the walk, so an edit to them (or recalibrated constants) does not recompile the module's kernels.
+MODULE_NON_KERNEL_SOURCES: Dict[str, Tuple[str, ...]] = {
+    "batch_invariant_gemm": (
+        "gemm/batch_invariant/schedule.py",
+        "gemm/batch_invariant/heuristic.py",
+    ),
+    "batch_invariant_gemm_blockscaled": (
+        "gemm/batch_invariant/schedule.py",
+        "gemm/batch_invariant/heuristic.py",
+    ),
+    # the grouped kernels compose the dense GEMM blocks, whose closure reaches the GEMM dispatcher files
+    "batch_invariant_moe": (
+        "gemm/batch_invariant/schedule.py",
+        "gemm/batch_invariant/heuristic.py",
+    ),
+    "batch_invariant_gemm_fp8_blockscale": (
+        "gemm/batch_invariant/schedule.py",
+        "gemm/batch_invariant/heuristic.py",
     ),
 }
 
@@ -113,6 +171,15 @@ def module_sources(module: str) -> Tuple[Path, ...]:
         if not p.exists():
             raise FileNotFoundError(f"{module}: cache key source {r} is missing")
         seen.add(p)
+    for r in MODULE_NON_KERNEL_SOURCES.get(module, ()):
+        p = (_FI_DIR / r).resolve()
+        if p not in seen:
+            # a listed exclusion that is not in the closure is a stale entry (the file moved, or stopped being imported):
+            # silently ignoring it would let a renamed dispatcher file back into the cache key
+            raise FileNotFoundError(
+                f"{module}: non-kernel source {r} is not in the module's import closure; update MODULE_NON_KERNEL_SOURCES"
+            )
+        seen.discard(p)
     return tuple(sorted(seen))
 
 

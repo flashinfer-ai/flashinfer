@@ -124,15 +124,41 @@ BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300 = 16
 # build where the loader names one (``_RENDERED_WORK_BIN_TURN_SHORT_ROUTES``,
 # see _work_bin_turn_short_program): at most this many 32-token chunks in the
 # longest task and at least this many tasks per SM.  That build stores each
-# task's final state with per-warp TMA boxes; on sm_100a it spills more in the
-# chunk loop than the stock store and binds a tensor map of the final state on
-# every call, which pays only where the bins turn their state over every few
-# chunks and the launch has many such tasks per SM.  Measured on a 148-SM
-# sm_100a: 64-token tasks at 768 and 1024 tasks gain; 256 tasks of 64 tokens
-# and launches of up to 255-token tasks do not.  Every other turnover launch
-# keeps the turnover build (the stock store there).
+# task's final state with per-warp TMA boxes and, for a pool updated in place,
+# loads each task's entering state with TMA boxes from a bin's second task on;
+# it binds a tensor map of the final state on every call, which pays only where
+# the bins turn their state over every few chunks and the launch has many such
+# tasks per SM.  Measured on a 148-SM sm_100a: 64-token tasks at 768 and 1024
+# tasks gain; 256 tasks of 64 tokens and launches of up to 255-token tasks do
+# not.  Every other turnover launch keeps the turnover build (the stock store
+# there).
 BF16_WORK_BIN_TURNOVER_SHORT_TASK_CHUNKS = 2
 BF16_WORK_BIN_TURNOVER_SHORT_MIN_TASKS_PER_SM = 4
+# The work-bin turnover launches that take their module's 128-token turnover
+# build where the loader names one (``_RENDERED_WORK_BIN_TURN_E128_ROUTES``,
+# see _work_bin_turn_e128_program): every sequence exactly this many tokens.
+# That build loads the entering state of a bin's first task on the compute
+# warps (the loader warp starts at the bin's second task); its bits are those
+# of the turnover build.  Measured on a 152-SM sm_103a: launches of 128-token
+# sequences gain at 1.1 to 33 tasks per SM, while launches of 97 to 127 tokens
+# per sequence lose on some shapes, so every other turnover launch keeps the
+# turnover build.
+BF16_WORK_BIN_TURN_E128_LEN = 128
+# The work-bin launches that take their module's TMEM-preload build where the
+# loader names one (``_RENDERED_WORK_BIN_PRELOAD_ROUTES``, see
+# _work_bin_preload_program): work bins from the strict bin test, an initial
+# state, every sequence between these two lengths in tokens, and more tasks
+# than SMs.  That build loads the next
+# task's entering state into tensor memory on the prep warps while the current
+# task runs (every preloading task spans at least two 32-token or four 16-token
+# chunks); its
+# bits are those of the work-bin build.  Every other work-bin launch keeps the
+# work-bin build (its loader and layout cost more than the load it hides on
+# shorter tasks, and on the bins of a bounded launch that the strict test
+# keeps one task per CTA, whose pair bins are no longer in chunks than its
+# longest task).
+BF16_WORK_BIN_PRELOAD_MIN_LEN = 64
+BF16_WORK_BIN_PRELOAD_MAX_LEN = 256
 # Fixed cost of one (sequence, head) task, in 32-token chunks, outside its chunk
 # loop: a CTA of the one-task-per-CTA body pays it for every task, a bin of the
 # turnover build hides it beside the previous task's chunks.  An unbounded
@@ -220,12 +246,32 @@ M64_OWNER_HELPER_WORD_STRIDE = 3
 # launch takes at most as many as the device holds and needs two.  A launch
 # beyond the last row keeps its pair-share or routed program, and so does
 # every launch while a part's table is empty.  Per part:
-# M64_OWNER_HELPER_MIN_SEQ_LEN_GB300 on a 152-SM sm_103a.  Both rows come from
-# paired timings of 8 to 36 tasks at 1024 to 16384 tokens per sequence on
-# B200 and GB300 with two helpers per task (three helpers never beat two in
-# the measured sweep); 36 tasks is the largest count measured.
-M64_OWNER_HELPER_MIN_SEQ_LEN: tuple[tuple[int, ...], ...] = ((36, 1024),)
-M64_OWNER_HELPER_MIN_SEQ_LEN_GB300: tuple[tuple[int, ...], ...] = ((36, 1024),)
+# M64_OWNER_HELPER_MIN_SEQ_LEN_GB300 on a 152-SM sm_103a.  The (36, 1024) rows
+# come from paired timings of 8 to 36 tasks at 1024 to 16384 tokens per
+# sequence on B200 and GB300 with two helpers per task (three helpers never
+# beat two in the measured sweep).
+# A row of one helper takes the module's hybrid build
+# (``_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES``, see
+# _m64_owner_helper_hybrid_factory): the helper prepares half of each task's
+# chunks and the two owners the other half.  It takes only a launch whose
+# sequences all have the same length and that the pair-share rule takes;
+# every other launch the row holds keeps its pair-share or routed program.
+# The B200 row (48, 2048, 1) covers the 37 to 48 tasks whose pair-share row
+# is (48, 2048): in paired timings of 144 held-out equal-length launches of
+# 38 to 48 tasks at 2049 to 14000 tokens the hybrid ran 0.87 to 0.98 times
+# the pair-share time on two B200s, every launch faster.  The GB300 row
+# (50, 2048, 1) covers 37 to 50 tasks, inside the pair-share row (64, 2048):
+# in paired timings of 301 equal-length launches of 38 to 50 tasks at 2048 to
+# 14000 tokens the hybrid ran 0.88 to 1.00 times the pair-share time on two
+# GB300s, no launch slower.
+M64_OWNER_HELPER_MIN_SEQ_LEN: tuple[tuple[int, ...], ...] = (
+    (36, 1024),
+    (48, 2048, 1),
+)
+M64_OWNER_HELPER_MIN_SEQ_LEN_GB300: tuple[tuple[int, ...], ...] = (
+    (36, 1024),
+    (50, 2048, 1),
+)
 # The bin-mix build of a work-bin turnover program (see _work_bin_mix_plan):
 # the work-bin table of a launch with more tasks than SMs leaves bins of two
 # tasks beside bins of one, and the two-task bins set the span.  Each two-task
@@ -1385,7 +1431,8 @@ def _m64_owner_helper_count(
     count holds ``total_tasks``) must hold ``min_seq_len``; its helper count
     (else ``M64_OWNER_HELPER_DEFAULT_HELPERS``) is cut to what the device holds
     at once beside two owners per task (``_m64_cooperative_capacity``, probed
-    only for a launch a row takes) and must stay at least two.
+    only for a launch a row takes) and must stay at least two, or at least one
+    on a row of one helper (the hybrid build's rows).
     """
     if gpu_arch not in ("sm_100a", "sm_103a") or total_tasks < 1:
         return 0
@@ -1403,7 +1450,7 @@ def _m64_owner_helper_count(
         M64_OWNER_HELPER_MAX_HELPERS,
         _m64_cooperative_capacity(device) // total_tasks - 2,
     )
-    return helpers if helpers >= 2 else 0
+    return helpers if helpers >= min(wanted, 2) else 0
 
 
 def _m64_owner_helper_program(name, *args, **kwargs):
@@ -1430,6 +1477,37 @@ def _m64_owner_helper_factory(name, *args, **kwargs):
         return _factory(name, *args, **kwargs)
     kernel = _kda_registry.PreparedKernel(program, detect_gpu_arch())
     kernel.m64_owner_helper = True
+    return kernel
+
+
+def _m64_owner_helper_hybrid_program(name, *args, **kwargs):
+    """The ``_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES`` build of the factory
+    row's module, or ``None``: the module needs its owner/helper build too
+    (``_m64_owner_helper_program``), and an architecture whose table is empty
+    has none."""
+    if _m64_owner_helper_program(name, *args, **kwargs) is None:
+        return None
+    arch = detect_gpu_arch()
+    rows = _kda_registry.FACTORIES.get(arch, {}).get(name, {})
+    module = rows.get(_kda_registry._key(args, kwargs))
+    routes = getattr(_kda_registry, "_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES", {})
+    return routes.get(arch, {}).get(module)
+
+
+# The launches a one-helper row of the owner/helper rule takes run the loader's
+# ``_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES`` build of the module on a grid
+# (tasks, 3): the helper prepares the chunks c % 8 >= 4 (sm_100a) or c % 4 >= 2
+# (sm_103a) of its task and the two owners the others, with the same bits as the
+# pair-share and routed programs.
+def _m64_owner_helper_hybrid_factory(name, *args, **kwargs):
+    """The hybrid owner/helper build of the factory row's M64 module, else
+    ``_m64_owner_helper_factory``."""
+    program = _m64_owner_helper_hybrid_program(name, *args, **kwargs)
+    if program is None:
+        return _m64_owner_helper_factory(name, *args, **kwargs)
+    kernel = _kda_registry.PreparedKernel(program, detect_gpu_arch())
+    kernel.m64_owner_helper = True
+    kernel.m64_owner_helper_hybrid = True
     return kernel
 
 
@@ -1579,6 +1657,84 @@ def _work_bin_turn_short_program(
     for module, turnover in turn.items():
         if turnover == program and module in short:
             return short[module]
+    return None
+
+
+def _work_bin_turn_e128_scope(seq_lens) -> bool:
+    """Whether a work-bin turnover launch of ``seq_lens`` takes the 128-token
+    turnover build: every sequence holds exactly
+    ``BF16_WORK_BIN_TURN_E128_LEN`` tokens."""
+    return min(seq_lens) == max(seq_lens) == BF16_WORK_BIN_TURN_E128_LEN
+
+
+def _work_bin_turn_e128_program(program, gpu_arch: str, seq_lens):
+    """The ``_RENDERED_WORK_BIN_TURN_E128_ROUTES`` build beside the work-bin
+    turnover build ``program`` (``_RENDERED_WORK_BIN_TURN_ROUTES``) for a launch
+    of ``seq_lens``, or ``None``: ``None`` on an architecture whose table is
+    empty (no further work) and for a launch outside
+    _work_bin_turn_e128_scope."""
+    if program is None:
+        return None
+    e128 = getattr(_kda_registry, "_RENDERED_WORK_BIN_TURN_E128_ROUTES", {}).get(
+        gpu_arch, {}
+    )
+    if not e128 or not _work_bin_turn_e128_scope(seq_lens):
+        return None
+    turn = _kda_registry._RENDERED_WORK_BIN_TURN_ROUTES.get(gpu_arch, {})
+    for module, turnover in turn.items():
+        if turnover == program and module in e128:
+            return e128[module]
+    return None
+
+
+def _work_bin_preload_scope(
+    seq_lens,
+    num_heads: int,
+    sm_count: int,
+    use_initial_state: bool,
+    strict_bins: bool,
+) -> bool:
+    """Whether a work-bin launch of ``seq_lens`` at ``num_heads`` heads on
+    ``sm_count`` SMs takes the TMEM-preload build: work bins from the strict
+    bin test (``strict_bins``, ``_DirectWorkBinRoute.strict``), an initial
+    state, every sequence between ``BF16_WORK_BIN_PRELOAD_MIN_LEN`` and
+    ``BF16_WORK_BIN_PRELOAD_MAX_LEN`` tokens and more tasks than SMs."""
+    return (
+        strict_bins
+        and use_initial_state
+        and min(seq_lens) >= BF16_WORK_BIN_PRELOAD_MIN_LEN
+        and max(seq_lens) <= BF16_WORK_BIN_PRELOAD_MAX_LEN
+        and len(seq_lens) * num_heads > sm_count
+    )
+
+
+def _work_bin_preload_program(
+    program,
+    gpu_arch: str,
+    seq_lens,
+    num_heads: int,
+    sm_count: int,
+    use_initial_state: bool,
+    strict_bins: bool,
+):
+    """The ``_RENDERED_WORK_BIN_PRELOAD_ROUTES`` build beside the work-bin build
+    ``program`` (``_RENDERED_WORK_BIN_ROUTES``) for a launch of ``seq_lens`` at
+    ``num_heads`` heads on ``sm_count`` SMs, or ``None``: ``None`` on an
+    architecture whose table is empty (no further work) and for a launch
+    outside _work_bin_preload_scope."""
+    if program is None:
+        return None
+    preload = getattr(_kda_registry, "_RENDERED_WORK_BIN_PRELOAD_ROUTES", {}).get(
+        gpu_arch, {}
+    )
+    if not preload or not _work_bin_preload_scope(
+        seq_lens, num_heads, sm_count, use_initial_state, strict_bins
+    ):
+        return None
+    bins = _kda_registry._RENDERED_WORK_BIN_ROUTES.get(gpu_arch, {})
+    for module, work_bin in bins.items():
+        if work_bin == program and module in preload:
+            return preload[module]
     return None
 
 
@@ -2718,13 +2874,16 @@ class _DirectWorkBinRoute:
     ``turnover_bins_only``: it asks for them for the turnover build only
     (``_build_body`` drops them where the module has none); ``turnover``: it
     takes the module's turnover build where the loader names one;
-    ``task_cost``: the per-task chunk cost its bin table charges.
+    ``task_cost``: the per-task chunk cost its bin table charges;
+    ``strict``: its work bins come from the strict bin test (rule 1 of
+    ``_direct_work_bin_route``; never for the bins of rules 2 and 3).
     """
 
     work_bins: bool = False
     turnover_bins_only: bool = False
     turnover: bool = False
     task_cost: int = 0
+    strict: bool = False
 
 
 def _direct_work_bin_route(
@@ -2838,6 +2997,7 @@ def _direct_work_bin_route(
             if bounded_bins
             else 0
         ),
+        strict=strict,
     )
 
 
@@ -4116,6 +4276,7 @@ class FlashKDABlackwellBF16FusedLaunch:
         owner_helpers = 0
         owner_helper_pool = 0
         m64_owner_helpers = 0
+        m64_owner_helper_hybrid = False
         if use_bt16_prepare_chain:
             self.prepare_module = self._build_body(
                 partial(_factory, "compiled_tf32_bt16_prepare"),
@@ -4390,12 +4551,35 @@ class FlashKDABlackwellBF16FusedLaunch:
                     )
                     if m64_owner_helpers < 1:
                         m64_owner_helpers = 0
+                elif m64_owner_helpers == 1:
+                    # A one-helper row takes the hybrid build, and only for a
+                    # launch of equal sequence lengths that the pair-share
+                    # rule takes; any other launch keeps today's program.
+                    m64_lengths = {
+                        end - start
+                        for start, end in zip(offsets, offsets[1:], strict=False)
+                    }
+                    m64_owner_helper_hybrid = (
+                        pair_share
+                        and len(m64_lengths) == 1
+                        and _m64_owner_helper_hybrid_program(
+                            "compiled_bf16_fused_m64", **m64_body
+                        )
+                        is not None
+                    )
+                    if not m64_owner_helper_hybrid:
+                        m64_owner_helpers = 0
             m64_factory = partial(
                 _m64_pair_share_factory if pair_share else _factory,
                 "compiled_bf16_fused_m64",
             )
+            m64_owner_helper_factory = (
+                _m64_owner_helper_hybrid_factory
+                if m64_owner_helper_hybrid
+                else _m64_owner_helper_factory
+            )
             self.module = self._build_body(
-                partial(_m64_owner_helper_factory, "compiled_bf16_fused_m64")
+                partial(m64_owner_helper_factory, "compiled_bf16_fused_m64")
                 if m64_owner_helpers
                 else m64_factory,
                 **m64_body,
@@ -4453,6 +4637,7 @@ class FlashKDABlackwellBF16FusedLaunch:
         num_work_bins = 0
         bin_mix_plan = None
         turn_short_program = None
+        preload_program = None
         if getattr(self.module, "work_bins", False):
             # A body built with work bins reads its bin table through seq_order
             # and runs one CTA per bin.
@@ -4520,7 +4705,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             # A turnover launch of short tasks with many tasks per SM that
             # takes neither build takes the module's short-task turnover build
             # where the loader names one: the same bins, table and bits with
-            # the per-warp TMA final-state store.
+            # the per-warp TMA final-state store and TMA entering-state loads.
             if (
                 bin_mix_plan is None
                 and uses_default_fused_m128
@@ -4532,6 +4717,32 @@ class FlashKDABlackwellBF16FusedLaunch:
                     seq_lens,
                     num_heads,
                     sm_count,
+                )
+                # Else a turnover launch whose sequences all hold exactly
+                # BF16_WORK_BIN_TURN_E128_LEN tokens takes the module's
+                # 128-token turnover build where the loader names one: the
+                # same bins, table and bits with the compute warps loading a
+                # bin's first entering state (swapped in below like the
+                # short-task build).
+                if turn_short_program is None:
+                    turn_short_program = _work_bin_turn_e128_program(
+                        getattr(self.module, "name", None), gpu_arch, seq_lens
+                    )
+            # A work-bin launch (no turnover) whose bins come from the strict
+            # bin test, with an initial state whose sequences hold
+            # BF16_WORK_BIN_PRELOAD_MIN_LEN to BF16_WORK_BIN_PRELOAD_MAX_LEN
+            # tokens and that has more tasks than SMs takes the module's
+            # TMEM-preload build where the loader names one: the same bins,
+            # table and bits (swapped in below), on the N32 and N16 bodies alike.
+            if uses_default_fused_m128:
+                preload_program = _work_bin_preload_program(
+                    getattr(self.module, "name", None),
+                    gpu_arch,
+                    seq_lens,
+                    num_heads,
+                    sm_count,
+                    initial_state is not None,
+                    work_bin_route.strict,
                 )
             work_bin_upload = _upload_int32_batch(
                 q.device,
@@ -4631,6 +4842,13 @@ class FlashKDABlackwellBF16FusedLaunch:
                 )
                 self.module = turn_short_module
                 self.ir = turn_short_module.schedule
+            if preload_program is not None:
+                preload_module = _kda_registry.PreparedKernel(preload_program, gpu_arch)
+                self._qkv_carrier_names[id(preload_module)] = (
+                    self._qkv_carrier_names.get(id(self.module), ())
+                )
+                self.module = preload_module
+                self.ir = preload_module.schedule
             if bin_mix_plan is not None:
                 # The bin-mix build runs the same bins on the same grid; a
                 # refused cooperative launch takes the turnover program
@@ -4667,6 +4885,8 @@ class FlashKDABlackwellBF16FusedLaunch:
             m64_fallback_grid = self.grid
             self.grid = (total_tasks, 2 + self.m64_owner_helpers, 1)
             self.schedule += f"_owner{self.m64_owner_helpers}helper"
+            if getattr(self.module, "m64_owner_helper_hybrid", False):
+                self.schedule += "_hybrid"
         self.prepare_grid = (bt16_prepare_total_ctas, 1, 1)
         qkv_carriers = self._qkv_carrier_names.get(id(self.module), ())
         self.args = {
@@ -8140,18 +8360,19 @@ def _mixlen_split(stock, args, kwargs):
         )
         <= capacity
     )
-    # "rng": one owner/helper part over the first..last long sequence, then the
-    # short head / tail parts, all on the caller stream.  "cc": one side-stream
-    # owner/helper part per run of long sequences, short runs on the caller stream.
+    # "rng": one side-stream owner/helper part over the first..last long
+    # sequence; the short head / tail parts run beside it on the caller stream.
+    # "cc": one side-stream owner/helper part per run of long sequences, short
+    # runs on the caller stream.
     if rng_fits:
         mode = "rng"
         plan = []
         if first > 0:
             plan.append((0, first - 1, False, 0))
-        plan.append((first, last, True, 0))
+        plan.append((first, last, True, 1))
         if last < num_seqs - 1:
             plan.append((last + 1, num_seqs - 1, False, 0))
-        # owner/helper part first, the short tails after it
+        # owner/helper part enqueued first, the short tails after it
         plan.sort(key=lambda part: not part[2])
     elif cc_fits:
         mode = "cc"

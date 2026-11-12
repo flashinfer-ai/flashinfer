@@ -58,11 +58,11 @@ from flashinfer.quantization.nvfp4_quantization_utils import (
     resolve_nvfp4_4over6,
 )
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers import cute_dsl_moe_swap_ab_reference as swap_ab_reference
-from tests.test_helpers.cute_dsl_moe_swap_ab_reference import (
+from tests.moe.test_helpers import cute_dsl_moe_swap_ab_reference as swap_ab_reference
+from tests.moe.test_helpers.cute_dsl_moe_swap_ab_reference import (
     assert_cute_dsl_moe_bits,
 )
-from tests.test_helpers.w4a16_reference import (
+from tests.moe_ep.test_helpers.w4a16_reference import (
     assert_w4a16_bits,
     split_w4a16_reference_from_tensors,
 )
@@ -2247,6 +2247,64 @@ class TestCuteDslMoeW4A16:
         )
 
         _assert_moe_quant_mode_reference(result, ref_output, "w4a16")
+
+    @pytest.mark.parametrize(
+        "tactic",
+        [
+            ((256, 128, 256), (2, 1), True),
+            ((128, 8, 256), (1, 1), True),
+        ],
+    )
+    def test_unfused_batch_invariant(self, tactic: tuple):
+        from flashinfer import cute_dsl_fused_moe
+        from flashinfer.fused_moe.cute_dsl.tuner import W4A16_MOE_TACTICS
+
+        pool, hidden_size, intermediate_size = 1024, 2688, 1856
+        num_experts, top_k = 128, 6
+        assert (tactic, tactic) in W4A16_MOE_TACTICS
+        tensors = create_moe_tensors(
+            num_tokens=pool,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            gated=False,
+        )
+
+        def run(rows):
+            return cute_dsl_fused_moe(
+                x=tensors["x_bf16"][rows].contiguous(),
+                x_sf=None,
+                token_selected_experts=tensors["token_selected_experts"][
+                    rows
+                ].contiguous(),
+                token_final_scales=tensors["token_final_scales"][rows].contiguous(),
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=None,
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                num_experts=num_experts,
+                top_k=top_k,
+                quant_mode="w4a16",
+                use_fused_finalize=False,
+                activation_type=ActivationType.Relu2.value,
+                tactic=(tactic, tactic),
+            )
+
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        probe = 5
+        alone = run(torch.tensor([probe], device="cuda"))[0]
+        for m in (2, 7, 64, 65, 513, pool):
+            rows = torch.randperm(pool, device="cuda", generator=gen)[:m]
+            rows[m // 2] = probe
+            assert torch.equal(run(rows)[m // 2], alone), m
+        full = run(torch.arange(pool, device="cuda"))
+        perm = torch.randperm(pool, device="cuda", generator=gen)
+        assert torch.equal(run(perm), full[perm])
 
 
 # =============================================================================

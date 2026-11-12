@@ -87,11 +87,11 @@ the eight-rank Blackwell carrier), so no separate all-reduce kernel or
 collective runs. The delivered architectures and world sizes are recorded in
 the loader's route tables (``flashinfer.jit.cake_fp8_rowwise_gemm_allreduce``);
 a device or group outside them raises instead of falling back.
-Operands are contiguous CUDA tensors with ``N`` a positive multiple of the
-delivered route's column tile (256 on SM100 / SM103), ``K_l`` a
-positive multiple of 128, any positive ``M`` with ``M * N <= 2**30``, and the
-process's torch symmetric-memory backend being the default ``CUDA`` backend or
-``NVSHMEM`` (the Cake backend never selects one itself). The symmetric
+Operands are contiguous CUDA tensors starting at a 16-byte aligned address
+(``a``, ``w``, ``w_scale`` and a caller-provided ``out``), with ``N`` a positive
+multiple of 256 and at most ``134184960``, ``K_l`` a positive multiple of 128,
+any positive ``M`` with ``M * N <= 2**30``, and the process's torch
+symmetric-memory backend being the default ``CUDA`` backend or ``NVSHMEM`` (the Cake backend never selects one itself). The symmetric
 workspace of a group grows to the largest ``M`` seen; that growth is the only
 collective after the first call.
 
@@ -580,7 +580,8 @@ e.g. ``cuda:rank``). With ``world_size > 1`` the NCCL and NVLink backends
 ``group`` to support CUDA all-to-all (an NCCL process group), checked at
 construction before any resource is armed. Operands must be contiguous 4-D
 CUDA tensors of the construction ``dtype`` (float16 / bfloat16 / float32
-only) on the construction device, every dim positive, and ``nbytes`` at most
+plus the PCIe types listed below) on the construction device, every dim positive,
+and ``nbytes`` at most
 ``max_bytes``; the element count of any one operand must additionally stay
 within the int32 kernel index range. ``scatter_heads`` requires
 ``H % world_size == 0``
@@ -667,11 +668,12 @@ for the full integration)::
         o_ = attention(q_, k_, v_)
         o = comm.gather_heads(o_)    # [B,S_global,H_local,D] -> [B,S_local,H,D]
 
-Existing callers can continue passing ``max_elems=...`` instead of
-``max_bytes=...``; the constructor multiplies it by ``dtype.itemsize``.
-Pass only one capacity argument. ``comm.max_elems`` remains available in the
-construction dtype, while ``comm.max_bytes`` is the byte capacity used by the
-new packed-chunk API.
+The v0.7.2 spelling ``max_elems=...`` (a capacity in elements of ``dtype``)
+is still accepted and converted to ``max_elems * dtype.itemsize`` bytes with a
+``DeprecationWarning``; it is deprecated since v0.7.3 and scheduled for
+removal in a future release. Pass exactly one capacity argument. ``comm.max_elems``,
+the v0.7.2 attribute, remains available in the construction dtype;
+``comm.max_bytes`` is the byte capacity used by the packed-chunk API.
 
 Preallocated outputs and NCCL staging can be reused across serialized calls::
 
@@ -773,6 +775,40 @@ Prepared QKV workspaces and ordinary staging workspaces are not interchangeable.
 .. autoclass:: UlyssesQKVWorkspace
     :members:
 
+Low-Precision Implementation Primitives
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The following internal helpers support numerical tests, trace definitions,
+and kernel benchmarks. They are not exported from ``flashinfer.comm``;
+applications should use the prepared ``UlyssesCommunicator`` QKV API above.
+
+.. currentmodule:: flashinfer.comm._ulysses_lowp
+
+.. autosummary::
+    :toctree: ../generated
+
+    capability
+    payload_spec
+    k_sum_v_amax
+    q_grouped_amax
+    k_grouped_amax
+    boundary_descriptors
+    merge_boundary_amax
+    k_boundary_minmax
+    derive_k_boundary_amax
+    zero_scale_and_padding
+    quant_q_into_payload
+    quant_kv_into_payload
+    quant_qkv_pack
+    unpack_for_sage
+    local_stats
+    finalize_stats
+    quant_and_pack
+    verify_duplicate_scale_slots
+    quant_v_fp8_with_scale
+
+.. currentmodule:: flashinfer.comm
+
 Head-Chunk Layout and Transport Primitives
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -855,16 +891,33 @@ count (``launches_per_call``).
 The producer build is selected per architecture and world size
 (``cake_qkv_norm_rope_exchange_overlap.PRODUCER_VARIANT_DEFAULT_BY_ARCH_WORLD``
 of the JIT loader): on SM100 a group of 8 ranks runs the build with wide
-operand loads and bulk row stores (``bulk_ow256``), a group of 4 ranks the
-build with wide operand loads (``ow256``); on SM103 groups of 8 and 4 ranks run
-``ow256``; on SM107 a group of 4 ranks runs the build with bulk row stores
-(``bulk``); groups of 2 ranks and SM90 run the baseline build.  Every build
-stores identical bits; the wide-load builds require 32-byte-aligned ``cos_sin``
-and norm-weight tensors (a misaligned view raises and names the opt-out).  The
+operand loads, bulk row stores and the fused multiply-add epilogue
+(``bulk_ow256_fma``), a group of 4 ranks the build with wide operand loads and
+the fused multiply-add epilogue (``ow256_fma``) and a group of 2 ranks the
+baseline build with the fused multiply-add epilogue (``fma``); on SM103 groups
+of 8 and 4 ranks run ``ow256_fma`` and groups of 2 ranks ``fma``; on SM107 a
+group of 4 ranks runs the build with bulk row stores (``bulk``); the other
+groups of 2 ranks run the baseline build; SM90 runs the build whose epilogue
+stages each head in shared memory for three storer warps (``sw3``) on every
+group size, except that under this default a group of 8 ranks on SM90 runs the
+baseline build on rows with a hidden size of at least 6144 and at least 8192
+rows per rank (``cake_qkv_exchange_plan.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD``);
+a build named by ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT`` runs on every
+row.  The ``fma`` builds contract
+the norm and RoPE multiply-adds into single-rounding fused multiply-adds, so
+their stored bits can differ from those of the builds without it; both agree
+within the kernel's accuracy tolerance, and the builds without the fused
+multiply-add epilogue store identical bits.  Every build requires ``cos_sin``
+and norm-weight tensors that start at 16-byte-aligned addresses, the wide-load
+builds at 32-byte-aligned ones (a misaligned view raises; for the 32-byte bases
+the error names the opt-out).  The
 environment variable ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT`` (``auto`` /
 ``shipped`` / a delivered build name) overrides the selection per session,
-rank-uniformly; the baseline build stays delivered beside every variant, and a
-build that is not delivered for the session's tile width raises and names the
+rank-uniformly; the baseline build stays delivered beside every variant.  A
+default build that is not delivered for the session's tile width (the two-rank
+``fma`` build at a 128-column tile, for example hidden 768 with 6 heads over 2
+ranks) runs the baseline build instead; a build named by the environment
+variable that is not delivered for the tile width raises and names the
 delivered ones.  The host plan's group scaling follows the same keying
 (``cake_qkv_exchange_plan.GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD``): on SM100
 groups of 4 and 2 ranks and on SM103 every group size double the token-tile
@@ -880,9 +933,9 @@ producer once per destination run of its tile table (the first launch carrying
 the folded rendezvous); the threshold depends on the world size and the hidden
 size (``cake_qkv_exchange_plan.SHAPE_GATE_K_TABLE``: 8192, 16384 or 32768 rows,
 ``per_dest_k_table=0`` restores the single threshold of 16384 and an explicit
-``per_dest_large_m`` replaces the table).  On SM103 a group of 8 ranks runs a
-call whose destination band is not a multiple of 256 columns while every
-Q / K / V group is (for example hidden 3072) with at least 4096 rows per rank
+``per_dest_large_m`` replaces the table).  On SM103 and SM100 a group of 8 ranks
+runs a call whose destination band is not a multiple of 256 columns while every
+Q / K / V group is (for example hidden 3072) with at least 2048 rows per rank
 on the 256-column pair tile across band edges, each tile storing its two heads
 to their own destinations, as one persistent launch
 (``cake_qkv_exchange_plan.XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD``;

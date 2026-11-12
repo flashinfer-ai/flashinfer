@@ -49,6 +49,15 @@ constexpr unsigned int MASK_ALL_LANES = 0xFFFFFFFFu;
 constexpr unsigned int num_bits_uint32 = 32u;
 }  // namespace constants
 
+// Element offset of a slot's ring_start / prev_num_accepted: 32-bit operands,
+// 64-bit product (slot * stride can exceed 2^31).  The host checks that the
+// stride fits in int32; cache slots are << 2^31.  The tracker loads sit on the
+// kernels' serial prologue: a full 64x64 multiply here measurably slowed
+// small-batch decode on B200.
+__device__ __forceinline__ int64_t tracker_offset(int64_t slot, int64_t stride) {
+  return static_cast<int64_t>(static_cast<int32_t>(slot)) * static_cast<int32_t>(stride);
+}
+
 // Round x up to the next multiple of Y (Y must be a power of 2).
 template <int Y>
 constexpr int next_multiple_of(int x) {

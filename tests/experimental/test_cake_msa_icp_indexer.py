@@ -15,7 +15,7 @@ limitations under the License.
 
 GPU tests of the MiniMax-M3 index-context-parallel (ICP) indexer kernels
 (``flashinfer.msa_ops.msa_icp_*`` and ``prepare_msa_icp_indexer``) against the
-CPU oracle of ``tests/test_helpers/cake_msa_icp_inputs.py``.
+CPU oracle of ``tests/experimental/test_helpers/cake_msa_icp_inputs.py``.
 
 Single GPU: the ``W`` ranks of a TP2 / TP4 group run on one device.  Each rank
 keeps its own index-K shard, score rows, carrier and receive storage; the
@@ -72,7 +72,7 @@ import torch
 
 import flashinfer.msa_ops as msa_ops
 from flashinfer.experimental.cake_msa_icp_indexer import cake_backend, cake_jit
-from tests.test_helpers import cake_msa_icp_inputs as ref
+from tests.experimental.test_helpers import cake_msa_icp_inputs as ref
 
 FP8 = torch.float8_e4m3fn
 H = ref.NUM_HEADS
@@ -1830,6 +1830,44 @@ def test_fused_prefill_is_byte_identical_to_the_materialized_chain(
     )
     for r in range(lay.tp):
         assert_words(fused[r], mat[r], f"{what}: rank {r} fused vs materialized")
+    assert_guard(guard, what)
+
+
+@pytest.mark.parametrize("scenario", PREFILL_SCENARIOS)
+def test_fused_prefill_n256_lists_are_byte_identical(
+    monkeypatch, scenario: str
+) -> None:
+    """TP2 P256: the list build with two pages per MMA (``score_topk16_n256``,
+    taken here for every window) writes the carrier rows of the materialized
+    path, padding rows included."""
+    lay = ref.IcpLayout(256, 2)
+    if not cake_jit.has_role("score_topk16_n256", cake_jit.device_arch(DEV.index)):
+        pytest.skip("no score_topk16_n256 program on this architecture")
+    monkeypatch.setattr(cake_backend, "N256_MIN_TOKENS", 1)
+    case, fast = _make_prefill(lay.page_size, scenario)
+    exp = prefill_expect(case, lay, fast=fast, with_global=not fast)
+    what = f"{case.label} {lay.name} n256"
+    mat = run_prefill(
+        case,
+        lay,
+        exp,
+        initialize=False,
+        what=f"{what} materialized",
+        check_scores=False,
+    )
+    t_max = max(w.total_q for w in case.windows())
+    pool, guard = prefill_pool(t_max, case.batch)
+    fused = run_prefill(
+        case,
+        lay,
+        exp,
+        initialize=False,
+        what=f"{what} fused",
+        carriers=_poisoned_carriers(lay, case.total_q),
+        pool=pool,
+    )
+    for r in range(lay.tp):
+        assert_words(fused[r], mat[r], f"{what}: rank {r} n256 vs materialized")
     assert_guard(guard, what)
 
 
