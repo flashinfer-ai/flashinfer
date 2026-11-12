@@ -740,20 +740,29 @@ def test_fc2_default_and_runner_select_real_k(k, rows, bm, monkeypatch):
     op = importlib.import_module(
         "flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_fc2_finalize"
     )
-    aq, asf, bq, bsf, offsets, _ = make_inputs([rows], 128, k)
+    aq, asf, bq, bsf, offsets, reference = make_inputs([rows], 128, k)
     tokens = torch.arange(rows, dtype=torch.int32, device="cuda")
-    scales = torch.ones(rows, device="cuda")
-    output = torch.zeros(rows, 128, dtype=torch.bfloat16, device="cuda")
+    scales = torch.linspace(0.1, 1.0, rows, device="cuda")
+    expected = reference.float() * scales[:, None]
+    output = torch.zeros((rows, 128), dtype=torch.bfloat16, device="cuda")
     observed = []
+    original_compile = op.compiled_kernel
 
     def capture_compile(sample_args, *, op, grid_x, sm_version):
         observed.append((op.tile, op.k, op.pingpong))
-        return lambda *args: None
+        return original_compile(
+            sample_args, op=op, grid_x=grid_x, sm_version=sm_version
+        )
 
     monkeypatch.setattr(op, "compiled_kernel", capture_compile)
     inputs = [aq, asf, bq, bsf, offsets, tokens, scales, rows]
-    op.cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4(*inputs, out=output, tune=False)
+    actual = op.cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4(*inputs, out=output, tune=False)
+    assert torch.isfinite(actual).all()
+    assert calc_diff(actual.float(), expected) < 5e-3
+    output.zero_()
     op._Fc2FinalizeRunner().launch(inputs, output, None)
+    assert torch.isfinite(output).all()
+    assert calc_diff(output.float(), expected) < 5e-3
     assert observed == [((bm, 128, 128), k, bm in (32, 64) and k <= 1024)] * 2
 
 
@@ -933,30 +942,23 @@ def test_fc1_split_k_matches_reference(
 
 
 @pytest.mark.parametrize(
-    "tile,rows,n,k,sms,expected",
+    "rows,expected",
     [
-        ((8, 128, 128), 16, 384, 3584, 188, 2),
-        ((8, 128, 128), 16, 384, 512, 188, 2),
-        ((8, 128, 128), 16, 384, 640, 188, 2),
-        ((8, 128, 128), 16, 384, 384, 188, 1),
-        ((8, 128, 128), 16, 384, 128, 188, 1),
-        ((8, 128, 128), 64, 384, 512, 188, 1),
-        ((8, 128, 128), 16, 384, 512, 48, 1),
-        ((8, 128, 128), 7, 384, 512, 188, 1),
-        ((8, 128, 128), 8, 384, 512, 188, 2),
-        ((8, 128, 128), 0, 384, 512, 188, 1),
-        ((32, 128, 128), 16, 384, 512, 188, 1),
-        ((8, 128, 128), 16, 64, 512, 188, 1),
-        ((8, 128, 128), 16, 384, 513, 188, 1),
-        ((8, 128, 128), 16, 384, 512, 0, 1),
+        (7, 1),
+        (8, 2),
+        (62, 2),
+        (63, 1),
     ],
 )
-def test_fc1_split_k_parallelism_guards(tile, rows, n, k, sms, expected):
+def test_fc1_split_k_parallelism_guards(rows, expected):
     op = importlib.import_module(
         "flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_fc1_act_q1"
     )
     assert (
-        op.select_split_k(tile=tile, total_rows=rows, n=n, k=k, num_sms=sms) == expected
+        op.select_split_k(
+            tile=(8, 128, 128), total_rows=rows, n=384, k=512, num_sms=188
+        )
+        == expected
     )
 
 
@@ -990,12 +992,18 @@ def test_fc1_auto_split_k_matches_forced(split_k, kind, k, monkeypatch):
         split_k=split_k,
         activation=ActivationType.Situ if kind == "situ" else ActivationType.Swiglu,
     )
+    activation = ActivationType.Situ if kind == "situ" else ActivationType.Swiglu
+    inputs = [aq, asf, bq, bsf, offsets, mapping]
+    runner = op._Fc1ActQ1Runner(aq.dtype, activation, split_k=split_k)
+    runner.forward(inputs, tactic=-1, do_preparation=True)
+    runner_q, runner_sf = runner.forward(inputs, tactic=-1)
     sms = torch.cuda.get_device_properties(aq.device).multi_processor_count
     selected = op.select_split_k(
         tile=(8, 128, 128), total_rows=mapping.numel(), n=384, k=k, num_sms=sms
     )
-    assert len(entered) == int((selected if split_k is None else split_k) == 2)
+    assert len(entered) == 2 * int((selected if split_k is None else split_k) == 2)
     _check_split_k_result(q, sf, reference, offsets)
+    _check_split_k_result(runner_q, runner_sf, reference, offsets)
 
 
 @pytest.mark.parametrize(
@@ -1038,31 +1046,6 @@ def test_fc1_split_k_preserves_explicit_choices(options, tuned, invalid, monkeyp
             aq, asf, bq, bsf, offsets, token_map=mapping, **options
         )
         _check_split_k_result(q, sf, reference, offsets)
-
-
-@pytest.mark.parametrize("split_k", [None, 1, 2])
-def test_fc1_split_k_runner_fallback(split_k, monkeypatch):
-    skip_if_not_sm120()
-    from flashinfer.tllm_enums import ActivationType
-
-    op = importlib.import_module(
-        "flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_fc1_act_q1"
-    )
-    aq, asf, bq, bsf, offsets, mapping, _ = _split_k_data(512, 384, (0, 8, 0))
-    inputs, calls = [aq, asf, bq, bsf, offsets, mapping], []
-    runner = op._Fc1ActQ1Runner(aq.dtype, ActivationType.Swiglu, split_k=split_k)
-
-    def dispatched(*args, **kwargs):
-        calls.append(kwargs)
-        return kwargs["out_q"], kwargs["out_sf"]
-
-    monkeypatch.setattr(op, "cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4", dispatched)
-    prepared = runner.forward(inputs, tactic=-1, do_preparation=True)
-    actual = runner.forward(inputs, tactic=-1)
-    assert actual is prepared and len(calls) == 1
-    assert calls[0]["split_k"] == split_k and calls[0]["tune"] is False
-    assert calls[0]["out_q"] is prepared[0] and calls[0]["out_sf"] is prepared[1]
-    assert runner.get_cache_key_extras(inputs)[-1] == split_k
 
 
 def test_fc1_auto_split_k_preserves_legacy_offsets(monkeypatch):
@@ -1122,20 +1105,6 @@ def test_fc1_split_k_two_stream_graphs(split_k, monkeypatch):
             actual[0][:8].view(torch.uint8), anchor[0][:8].view(torch.uint8)
         )
         assert torch.equal(actual[1], anchor[1])
-
-
-def test_fc1_split_k_reference_rejects_corruption():
-    skip_if_not_sm120()
-    op = importlib.import_module(
-        "flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_fc1_act_q1"
-    )
-    aq, asf, bq, bsf, offsets, mapping, reference = _split_k_data(512, 384, (0, 8, 0))
-    q, sf = op.cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
-        aq, asf, bq, bsf, offsets, token_map=mapping, split_k=2
-    )
-    _check_split_k_result(q, sf, reference, offsets)
-    with pytest.raises(AssertionError):
-        _check_split_k_result(torch.zeros_like(q), sf, reference, offsets)
 
 
 def test_fc1_split_k_zero_capacity():

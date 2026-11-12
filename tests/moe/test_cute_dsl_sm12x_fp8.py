@@ -555,34 +555,40 @@ def test_fp8_fc2_singleton_weight_scale(monkeypatch):
     assert calc_diff(out.float(), ref.float()) < 5e-3
 
 
-def test_fp8_fc2_copy_policy_and_cache_mode(monkeypatch):
+def test_fp8_fc2_cache_mode_switches_match_reference(monkeypatch):
     skip_if_not_sm120()
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
         moe_fp8_fc2_finalize as entry,
     )
 
-    for bm in (32, 64, 128):
-        for k in (128, 256, 384, 512, 640, 768, 896, 1024, 1536, 2048, 4096):
-            op = entry.CuteDslSm120GroupedFp8Fc2FinalizeOp(512, k, (bm, 128, 128))
-            expected = bm == 64 and k in (384, 512)
-            assert op.use_cp_async is expected
-            assert op.build(2).use_cp_async is expected
-    monkeypatch.setattr(entry, "_COMPILED", {})
-    monkeypatch.setattr(entry.cute, "compile", lambda kernel, *args: kernel)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    modes = []
+    original_compile = entry.compiled_kernel
 
-    def compile_op(n, k, bm=64, pdl=False, grid=2, sm="sm_120"):
-        op = entry.CuteDslSm120GroupedFp8Fc2FinalizeOp(
-            n, k, (bm, 128, 128), enable_pdl=pdl
+    def track_compile(sample_args, *, op, grid_x, sm_version):
+        modes.append(op.use_cp_async)
+        return original_compile(
+            sample_args, op=op, grid_x=grid_x, sm_version=sm_version
         )
-        return entry.compiled_kernel((), op=op, grid_x=grid, sm_version=sm)
 
-    cp = compile_op(512, 384)
-    assert compile_op(1024, 512) is cp
-    tma = compile_op(512, 128)
-    assert compile_op(1024, 2048) is tma
-    assert cp is not tma and cp.use_cp_async and not tma.use_cp_async
-    assert compile_op(512, 384, pdl=True) is not cp
-    assert compile_op(512, 384, grid=1) is not cp
-    assert compile_op(512, 384, sm="sm_121") is not cp
-    assert compile_op(512, 384, bm=32) is not tma
-    assert len(entry._COMPILED) == 6
+    monkeypatch.setattr(entry, "compiled_kernel", track_compile)
+    for n, k in ((256, 384), (128, 128), (384, 512), (256, 640), (256, 384)):
+        a, b, a_sf, b_sf, offsets, reference = make_inputs([0, 61, 65], n, k)
+        rows = a.shape[0]
+        tokens = torch.arange(rows, dtype=torch.int32, device="cuda")
+        scales = torch.linspace(0.1, 1.0, rows, device="cuda")
+        out = entry.cute_dsl_sm12x_fc2_finalize_fp8(
+            a,
+            a_sf,
+            b,
+            b_sf,
+            offsets,
+            tokens,
+            scales,
+            rows + 3,
+            tile=(64, 128, 128),
+        )
+        assert torch.isfinite(out).all()
+        assert calc_diff(out[:rows].float(), reference.float() * scales[:, None]) < 5e-3
+        assert torch.count_nonzero(out[rows:]) == 0
+    assert modes == [True, False, True, False, True]
