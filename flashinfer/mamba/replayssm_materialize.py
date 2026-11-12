@@ -302,11 +302,14 @@ def replayssm_materialize(
         Shared-seed mode requires one fresh seed per layer, shape ``(L,)``,
         each with uniform low 32 bits.
     philox_rounds : int
-        JIT number of Philox stochastic-rounding rounds. Zero disables
-        stochastic rounding under the default Philox policy.
+        JIT number of Philox stochastic-rounding rounds (default 0). Zero
+        disables stochastic rounding under the default Philox policy.
+        Shared-seed mode does not run Philox: zero is normalized to 10,
+        positive counts are retained for JIT compatibility, and negative
+        values are rejected.
     sr_rng : str
         ``"philox"`` (default) or ``"shared_seed"``. Shared-seed mode requires
-        positive rounds, supports FP16/FP8 E4M3/INT8 state, and deliberately
+        a seed per layer, supports FP16/FP8 E4M3/INT8 state, and deliberately
         correlates rounding across a layer's elements. Model-quality
         equivalence has not been validated. Caller policy is never selected
         by a launch tuner.
@@ -398,13 +401,12 @@ def replayssm_materialize(
         raise ValueError("slot and metadata shapes are inconsistent")
     if sr_rng not in ("philox", "shared_seed"):
         raise ValueError("sr_rng must be 'philox' or 'shared_seed'")
-    if sr_rng == "shared_seed" and (
-        philox_rounds <= 0
-        or state_dtype not in (torch.float16, torch.float8_e4m3fn, torch.int8)
-    ):
-        raise ValueError(
-            "shared_seed requires positive rounds and FP16, FP8 E4M3 or INT8 state"
-        )
+    if sr_rng == "shared_seed":
+        if philox_rounds < 0:
+            raise ValueError("shared_seed requires nonnegative philox_rounds")
+        if state_dtype not in (torch.float16, torch.float8_e4m3fn, torch.int8):
+            raise ValueError("shared_seed requires FP16, FP8 E4M3 or INT8 state")
+        philox_rounds = philox_rounds or 10
     if philox_rounds > 0:
         seed_count = layers if sr_rng == "shared_seed" else 1
         if (

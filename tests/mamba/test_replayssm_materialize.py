@@ -44,7 +44,7 @@ def _materialize(
     active_request_indices: torch.Tensor | None = None,
     pad_slot_id: int = -1,
     rand_seed: torch.Tensor | None = None,
-    philox_rounds: int = 0,
+    philox_rounds: int | None = None,
     sr_rng: str = "philox",
     dependency_inputs: list[torch.Tensor] | None = None,
     dependency_outputs: list[torch.Tensor] | None = None,
@@ -86,7 +86,7 @@ def _materialize(
         ring_buffer_len=ring_buffer_len,
         pad_slot_id=pad_slot_id,
         rand_seed=rand_seed,
-        philox_rounds=philox_rounds,
+        **({"philox_rounds": philox_rounds} if philox_rounds is not None else {}),
         sr_rng=sr_rng,
         dependency_inputs=dependency_inputs,
         dependency_outputs=dependency_outputs,
@@ -552,14 +552,17 @@ def _layer_philox_seed(base_seed: int, layer: int) -> int:
     return value if value < (1 << 63) else value - (1 << 64)
 
 
-@pytest.mark.parametrize("sr_rng", ["philox", "shared_seed"])
+@pytest.mark.parametrize(
+    "sr_rng,rounds",
+    [("philox", 5), ("shared_seed", None), ("shared_seed", 0), ("shared_seed", 5)],
+)
 @pytest.mark.parametrize(
     "state_dtype",
     [torch.float16, torch.float8_e4m3fn, torch.int8],
     ids=["fp16", "fp8", "int8"],
 )
 def test_replayssm_materialize_multilayer_sr_matches_checkpointing(
-    state_dtype: torch.dtype, sr_rng: str
+    state_dtype: torch.dtype, sr_rng: str, rounds: int | None
 ) -> None:
     """Each layer uses its selected provider for replay; zero/inactive rows copy or stay."""
     torch.manual_seed(21)
@@ -592,6 +595,7 @@ def test_replayssm_materialize_multilayer_sr_matches_checkpointing(
         device="cuda",
     )
     before = [tensor.clone() for tensor in state]
+    round_kwargs = {"philox_rounds": rounds} if rounds is not None else {}
     before_scales = [tensor.clone() for tensor in scales] if quantized else None
     expected = [tensor.clone() for tensor in state]
     expected_scales = [tensor.clone() for tensor in scales] if quantized else None
@@ -660,7 +664,7 @@ def test_replayssm_materialize_multilayer_sr_matches_checkpointing(
             [1, 0, -1, -1], dtype=torch.int32, device="cuda"
         ),
         rand_seed=seeds,
-        philox_rounds=5,
+        **round_kwargs,
         sr_rng=sr_rng,
         state_scales=scales,
     )
@@ -698,7 +702,7 @@ def test_replayssm_materialize_multilayer_sr_matches_checkpointing(
         ring_len,
         active_request_indices=torch.full((4,), -1, dtype=torch.int32, device="cuda"),
         rand_seed=seeds,
-        philox_rounds=5,
+        **round_kwargs,
         sr_rng=sr_rng,
         state_scales=scales,
     )
@@ -715,7 +719,8 @@ def test_replayssm_materialize_multilayer_sr_matches_checkpointing(
     ("state_dtype", "rounds", "sr_rng"),
     [
         (torch.bfloat16, 5, "shared_seed"),
-        (torch.float16, 0, "shared_seed"),
+        (torch.float32, 0, "shared_seed"),
+        (torch.float16, -1, "shared_seed"),
         (torch.float16, 5, "unknown"),
     ],
 )
@@ -723,6 +728,22 @@ def test_replayssm_materialize_rejects_invalid_rng(state_dtype, rounds, sr_rng):
     with pytest.raises(ValueError, match="sr_rng|shared_seed"):
         gen_replayssm_materialize_module(
             state_dtype, torch.bfloat16, torch.float32, 64, 128, 1, 8, rounds, sr_rng
+        )
+    with pytest.raises(ValueError, match="sr_rng|shared_seed"):
+        _materialize(
+            [torch.empty(2, 1, 64, 128, dtype=state_dtype, device="cuda")],
+            [torch.empty(2, 1, 12, 64, dtype=torch.bfloat16, device="cuda")],
+            [torch.empty(2, 1, 12, 128, dtype=torch.bfloat16, device="cuda")],
+            [torch.empty(2, 1, 12, device="cuda")],
+            [torch.empty(1, device="cuda")],
+            torch.zeros(1, 1, dtype=torch.int32, device="cuda"),
+            torch.ones(1, 1, dtype=torch.int32, device="cuda"),
+            torch.zeros(1, dtype=torch.int32, device="cuda"),
+            torch.ones(1, dtype=torch.int32, device="cuda"),
+            ring_buffer_len=12,
+            rand_seed=torch.ones(1, dtype=torch.int64, device="cuda"),
+            philox_rounds=rounds,
+            sr_rng=sr_rng,
         )
 
 
@@ -753,6 +774,28 @@ def test_replayssm_materialize_shared_seed_jit_contract(monkeypatch, tmp_path):
             "constexpr bool SHARED_SEED = true;"
             in (tmp_path / shared[0] / "replayssm_materialize_config.inc").read_text()
         )
+        base = args[:-1]
+        default = jit.gen_replayssm_materialize_module(*base, sr_rng="shared_seed")
+        zero = jit.gen_replayssm_materialize_module(
+            *base, philox_rounds=0, sr_rng="shared_seed"
+        )
+        ten = jit.gen_replayssm_materialize_module(
+            *base, philox_rounds=10, sr_rng="shared_seed"
+        )
+        assert default[0] == zero[0] == ten[0]
+        assert default[0] != shared[0]
+        assert (
+            "PHILOX_ROUNDS = 10;"
+            in (tmp_path / default[0] / "replayssm_materialize_config.inc").read_text()
+        )
+        phi_zero = jit.gen_replayssm_materialize_module(*base)
+        assert (
+            phi_zero[0]
+            == jit.gen_replayssm_materialize_module(
+                *base, philox_rounds=0, sr_rng="philox"
+            )[0]
+        )
+        assert phi_zero[0].endswith("_pr_0")
 
 
 @pytest.mark.parametrize("seed_kind", ["missing", "scalar", "matrix", "wrong_dtype"])
@@ -779,6 +822,6 @@ def test_replayssm_materialize_shared_seed_requires_per_layer_seeds(seed_kind):
             torch.zeros(1, dtype=torch.int32, device="cuda"),
             ring_buffer_len=1,
             rand_seed=seeds[seed_kind],
-            philox_rounds=5,
+            philox_rounds=0,
             sr_rng="shared_seed",
         )

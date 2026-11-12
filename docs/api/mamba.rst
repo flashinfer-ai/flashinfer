@@ -26,13 +26,15 @@ ring and a persistent checkpoint. Only accepted history contributes to a flush;
 unaccepted ring padding is ignored by both monolithic and two-kernel paths.
 
 The default ``sr_rng="philox"`` preserves Philox stochastic rounding.
-``philox_rounds=0`` uses round-to-nearest; supported positive round counts enable
-SR. For FP16, FP8 E4M3 and INT8 persistent state, the explicit
+Under this policy, omitting ``rand_seed`` selects round-to-nearest in
+``checkpointing_ssu``; a supplied seed requires positive ``philox_rounds``
+(default 10). For FP16, FP8 E4M3 and INT8 persistent state, the explicit
 ``sr_rng="shared_seed"`` option uses the invocation seed's uniform low 32 bits
 without running Philox. The repeated random words are correlated. Supply a
 fresh uniform seed for each invocation and layer through ``rand_seed``; in this
-mode a positive ``philox_rounds`` enables SR but its count is unused. Shared-seed
-mode rejects zero rounds, a missing seed, BF16 state and FP32 state. Neither
+mode the ``philox_rounds`` count is unused. Zero is normalized to 10 for JIT
+compatibility; existing positive counts are retained. Shared-seed mode rejects
+negative rounds, a missing seed, BF16 state and FP32 state. Neither
 policy changes the current round-to-nearest working-state readout.
 
 The optional ``main_pipeline_stages`` and ``main_ctas_per_sm`` controls expose
@@ -46,8 +48,10 @@ currently covers CTA caps 1 through 32.
 ReplaySSM prefix materialization accepts the same explicit ``sr_rng`` policy.
 The default Philox path keeps its scalar base-seed contract and derives a stream
 per layer. With ``sr_rng="shared_seed"``, provide a contiguous CUDA int64 tensor
-of shape ``(L,)`` with one fresh uniform-low-32-bit seed for each layer. Positive
-rounds enable this opt-in for FP16, FP8 E4M3 and INT8 state; zero-prefix copies and
+of shape ``(L,)`` with one fresh uniform-low-32-bit seed for each layer. No
+round-count argument is required for shared-seed FP16, FP8 E4M3 or INT8 state;
+omitted or zero rounds normalize to 10. The default Philox policy keeps
+round-to-nearest with the materializer's default zero rounds. Zero-prefix copies and
 inactive requests retain their existing behavior. Launch tuning never changes
 the caller's rounding policy or round count.
 

@@ -110,6 +110,6 @@ def make():
         eligible_packed_tie_all_noise=True,
         eligible_packed_tie_offsets=[-1, 0, 1],
         eligible_companion_original_exponent=127,
-        actual_new_packed_x4_path_tested=True,
+        packed_x4_wrapper_tested=True,
     )
     return result, coverage

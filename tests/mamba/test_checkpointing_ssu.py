@@ -6179,8 +6179,8 @@ def test_checkpointing_ssu_ignores_inactive_ring_rows(
 ):
     """Future append rows must not enter replay as NaN * zero.
 
-    This own-clean comparison exercises software SR too; it needs no
-    hardware-only stochastic-rounding reference or model checkpoint.
+    Compare clean and NaN-poisoned padding with the same kernel, including
+    software SR, without a model checkpoint or hardware-only reference.
     """
     from flashinfer.utils import device_support_pdl
 
@@ -6377,8 +6377,13 @@ def test_checkpointing_ssu_shared_seed_policy(state_dtype, algorithm, history):
                 dt_softplus=True,
                 state_batch_indices=indices,
                 state_scale=scales,
-                rand_seed=noise if rounds and not omit_seed else None,
-                philox_rounds=rounds,
+                rand_seed=(
+                    noise
+                    if (mode == "shared_seed" or rounds or seed_value is not None)
+                    and not omit_seed
+                    else None
+                ),
+                **({"philox_rounds": rounds} if rounds is not None else {}),
                 d_split=1,
                 enable_pdl=False,
                 **({"sr_rng": mode} if mode else {}),
@@ -6414,20 +6419,29 @@ def test_checkpointing_ssu_shared_seed_policy(state_dtype, algorithm, history):
         assert exact(lo[0], hi[0]) and not exact(lo[1][1], hi[1][1])
     repeated = run("shared_seed")
     assert all(exact(a, b) for a, b in zip(shared, repeated, strict=True))
+    for rounds in (None, 0, 10):
+        normalized = run("shared_seed", rounds=rounds)
+        assert all(exact(a, b) for a, b in zip(shared, normalized, strict=True))
     if history == 9:
         poisoned = run("shared_seed", poison=True)
         assert all(exact(a, b) for a, b in zip(shared, poisoned, strict=True))
     implicit, explicit = run(None, rounds=0), run("philox", rounds=0)
     assert all(exact(a, b) for a, b in zip(implicit, explicit, strict=True))
+    no_seed_default = run(None, rounds=None)
+    assert all(exact(a, b) for a, b in zip(implicit, no_seed_default, strict=True))
     for expected, actual in zip(untouched, readonly, strict=True):
         assert torch.equal(expected, actual)
     if history == 8 and algorithm == "monolith":
         with pytest.raises(ValueError, match="sr_rng must"):
             run("unknown")
-        with pytest.raises(ValueError, match="positive philox_rounds"):
-            run("shared_seed", rounds=0)
+        with pytest.raises(ValueError, match="nonnegative philox_rounds"):
+            run("shared_seed", rounds=-1)
         with pytest.raises(ValueError, match="requires rand_seed"):
-            run("shared_seed", omit_seed=True)
+            run("shared_seed", rounds=0, omit_seed=True)
+        with pytest.raises(AssertionError, match="philox_rounds must be > 0"):
+            run("philox", rounds=0, seed_value=0)
+        with pytest.raises(AssertionError, match="philox_rounds must be > 0"):
+            run("philox", rounds=-1)
         if state_dtype == torch.float16:
             original_state = state0
             for unsupported in (torch.bfloat16, torch.float32):
@@ -6440,7 +6454,7 @@ def test_checkpointing_ssu_shared_seed_policy(state_dtype, algorithm, history):
 
 
 def test_checkpointing_ssu_shared_seed_jit_contract(monkeypatch, tmp_path):
-    """The public policy is part of the JIT key and only cheap mode gets its flag."""
+    """The RNG policy is part of the JIT key; only shared_seed gets its flag."""
     from flashinfer.jit.mamba import checkpointing_ssu as jit
 
     requests = []
@@ -6482,6 +6496,44 @@ def test_checkpointing_ssu_shared_seed_jit_contract(monkeypatch, tmp_path):
         assert flag not in phi[2]["extra_cuda_cflags"]
         assert flag in cheap[2]["extra_cuda_cflags"]
         assert len(cheap[1]) == 3 and all(path.is_file() for path in cheap[1])
+        base = args[:-2]
+        shared_default = jit.gen_checkpointing_ssu_module(*base, sr_rng="shared_seed")
+        shared_ten = jit.gen_checkpointing_ssu_module(
+            *base, philox_rounds=10, sr_rng="shared_seed"
+        )
+        shared_zero = jit.gen_checkpointing_ssu_module(
+            *base, philox_rounds=0, sr_rng="shared_seed"
+        )
+        assert shared_default[0] == shared_zero[0] == shared_ten[0]
+        assert shared_default[0] != cheap[0]
+        assert (
+            shared_default[0]
+            == jit.get_checkpointing_ssu_uri(*base, sr_rng="shared_seed")
+            == jit.get_checkpointing_ssu_uri(
+                *base, philox_rounds=10, sr_rng="shared_seed"
+            )
+        )
+        assert shared_zero[0] == jit.get_checkpointing_ssu_uri(
+            *base, philox_rounds=0, sr_rng="shared_seed"
+        )
+        assert (
+            "PHILOX_ROUNDS = 10;"
+            in (
+                tmp_path / shared_default[0] / "checkpointing_ssu_config.inc"
+            ).read_text()
+        )
+        phi_default = jit.gen_checkpointing_ssu_module(*base)
+        assert phi_default[0] == jit.get_checkpointing_ssu_uri(*base)
+        assert "_pr_" not in phi_default[0]
+        for factory in (
+            jit.get_checkpointing_ssu_uri,
+            jit.gen_checkpointing_ssu_module,
+        ):
+            with pytest.raises(ValueError, match="nonnegative"):
+                factory(*base, philox_rounds=-1, sr_rng="shared_seed")
+            for unsupported in (torch.bfloat16, torch.float32):
+                with pytest.raises(ValueError, match="FP16, FP8 E4M3 or INT8"):
+                    factory(unsupported, *base[1:], sr_rng="shared_seed")
 
 
 @pytest.mark.parametrize(

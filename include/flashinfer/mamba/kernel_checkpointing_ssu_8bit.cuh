@@ -701,8 +701,7 @@ __device__ __forceinline__ void encode_state_replay_8bit(
         if (rand_pos == 0) {
           int64_t const philox_off =
               state_ptr_offset + (int64_t)row_lo * DSTATE + (frag_col_base + n_base);
-          // INT8 shares one runtime-policy body to keep nonflush code identical.
-          // FP8 retains compile-time policy selection to avoid its measured overhead.
+          // INT8 selects the SR policy at runtime; FP8 selects it at compile time.
           if constexpr (std::is_same_v<state_t, int8_t>) {
             conversion::sr_random4x_runtime<PHILOX_ROUNDS>(rand_seed, philox_off, rand_idx[0],
                                                            rand_idx[1], rand_idx[2], rand_idx[3],
@@ -1311,12 +1310,12 @@ __device__ __forceinline__ void ssu_checkpoint_8bit(SmemT& smem,
       smem, params, warp, lane, prev_k, d_tile, cache_slot, head, /*must_checkpoint=*/true,
       frag_y_DxT, encode_scale_per_row, total_scale);
 
-  // ── Philox seed for stochastic rounding (deferred to reduce register pressure) ──
+  // Stochastic-rounding seed, loaded here to reduce register pressure.
   [[maybe_unused]] int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
   // `state_ptr_offset` is int64 — matches Triton's `base_rand =
   // cache_batch_idx * stride_state_batch + ...` (cache_batch_idx is .to(int64)).
-  // Full 64 bits flow through `philox_randint4x`, which splits low/high
-  // across Philox c0/c1.  No collision risk at large serving cache sizes.
+  // Under the Philox policy, all 64 bits flow through `philox_randint4x`,
+  // which splits low/high across c0/c1. Shared-seed rounding ignores the offset.
   int64_t const state_ptr_offset =
       cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE;
 

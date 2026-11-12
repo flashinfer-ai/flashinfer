@@ -846,16 +846,18 @@ def checkpointing_ssu(
     rand_seed : Optional[torch.Tensor]
         Single-element int64 CUDA tensor for stochastic rounding seed.
     philox_rounds : int
-        Positive values enable stochastic rounding (default 10). The count
-        selects Philox rounds only when sr_rng='philox'; zero retains RN.
+        Philox rounds for stochastic rounding (default 10). Under
+        sr_rng='philox', omitting rand_seed selects RN. Shared-seed mode does
+        not run Philox: zero is normalized to 10, positive counts are retained
+        for JIT compatibility, and negative values are rejected.
     sr_rng : str
         'philox' (default) preserves the original random sequence.
         'shared_seed' reuses the low 32 seed bits for all checkpoint
         conversions; the random words are correlated across elements. The low
         32 bits must be uniform and fresh per invocation, with each layer using
-        its own seed. Requires a seed, positive
-        philox_rounds and FP16, FP8 E4M3 or INT8 state. No Philox is run
-        in shared_seed mode. Generate the invocation seed outside timing.
+        its own seed. Requires a seed and FP16, FP8 E4M3 or INT8 state.
+        No Philox is run
+        in shared_seed mode.
     d_split : Optional[int]
         Per-head DIM split factor.  This is only exposed for benchmarking.
         Do not use it cause it will make things slow.
@@ -982,14 +984,15 @@ def checkpointing_ssu(
     if sr_rng not in ("philox", "shared_seed"):
         raise ValueError(f"sr_rng must be 'philox' or 'shared_seed', got {sr_rng!r}")
     if sr_rng == "shared_seed":
-        if rand_seed is None or philox_rounds <= 0:
-            raise ValueError(
-                "shared_seed requires rand_seed and positive philox_rounds; zero remains RN"
-            )
+        if rand_seed is None:
+            raise ValueError("shared_seed requires rand_seed")
+        if philox_rounds < 0:
+            raise ValueError("shared_seed requires nonnegative philox_rounds")
         if state.dtype not in (torch.float16, torch.float8_e4m3fn, torch.int8):
             raise ValueError(
                 "shared_seed SR supports FP16, FP8 E4M3 and INT8 state only"
             )
+        philox_rounds = philox_rounds or 10
 
     # Validate rand_seed / philox_rounds
     if rand_seed is not None:

@@ -59,13 +59,12 @@ def gen_replayssm_materialize_module(
         )
     if sr_rng not in ("philox", "shared_seed"):
         raise ValueError("sr_rng must be 'philox' or 'shared_seed'")
-    if sr_rng == "shared_seed" and (
-        philox_rounds <= 0
-        or state_dtype not in (torch.float16, torch.float8_e4m3fn, torch.int8)
-    ):
-        raise ValueError(
-            "shared_seed requires positive rounds and FP16, FP8 E4M3 or INT8 state"
-        )
+    if sr_rng == "shared_seed":
+        if philox_rounds < 0:
+            raise ValueError("shared_seed requires nonnegative philox_rounds")
+        if state_dtype not in (torch.float16, torch.float8_e4m3fn, torch.int8):
+            raise ValueError("shared_seed requires FP16, FP8 E4M3 or INT8 state")
+        philox_rounds = philox_rounds or 10
     uri = (
         f"replayssm_materialize_s_{_NAME[state_dtype]}_i_{_NAME[input_dtype]}"
         f"_a_{_NAME[matrixA_dtype]}_d_{dim}_ds_{dstate}_hpg_{heads_per_group}"

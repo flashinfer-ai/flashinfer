@@ -1235,8 +1235,8 @@ __device__ __forceinline__ void ssu_checkpoint(SmemT& smem, CheckpointingSsuPara
   int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
   // `state_ptr_offset` is int64 — matches Triton's `base_rand =
   // cache_batch_idx * stride_state_batch + ...` (cache_batch_idx is .to(int64)).
-  // Full 64 bits flow through `philox_randint4x`, which splits low/high
-  // across Philox c0/c1.  No collision risk at large serving cache sizes.
+  // Under the Philox policy, all 64 bits flow through `philox_randint4x`,
+  // which splits low/high across c0/c1. Shared-seed rounding ignores the offset.
   int64_t const state_ptr_offset =
       cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE;
   state_t* const state_w_base = reinterpret_cast<state_t*>(params.state) +
