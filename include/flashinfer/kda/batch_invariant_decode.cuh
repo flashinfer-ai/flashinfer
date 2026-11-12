@@ -254,19 +254,17 @@ __global__ void __launch_bounds__(NTHR, MINB)
   uint16_t* Lpool = Lc + sh * CH * CH;
   float* Ppool = pref + sh * D;
 
-  // phase-independent loads first: state tile, raw rows, gate constants
-  for (int u = tid; u < D * 16; u += NTHR)
-    cp_async16(Ssm + (u >> 4) * SD + (u & 15) * 8, S16 + (size_t)u * 8);
+  // phase-independent loads first: state tile, raw rows, gate constants. The last warp copies no
+  // state: it copies the cached rows, which the first barrier of a step then need not wait for
+  if (warp < NTHR / 32 - 1)
+    for (int u = tid; u < D * 16; u += NTHR - 32)
+      cp_async16(Ssm + (u >> 4) * SD + (u & 15) * 8, S16 + (size_t)u * 8);
   cp_async_commit();
   const int L = lane & 7, isq = (lane >> 3) & 1;
   uint4 r0 = make_uint4(0, 0, 0, 0), r1 = r0;
   uint32_t vp = 0u;
   uint16_t braw = 0, bnext = 0;
-  float gx = 0.0f, ghalf = 0.0f, gbias = 0.0f;
-  if (tid < D) {
-    ghalf = ex2a(a_log[h] * 1.4426950408889634f) * 0.5f;
-    gbias = dt_bias[(size_t)h * D + tid];
-  }
+  float gx = 0.0f, araw = 0.0f, gbias = 0.0f;
   if (SPAN) {
     if (tid < 64) {
       const uint16_t* src = (tid < 32 ? (tid < 16 ? q : k) : (tid < 48 ? v : gt)) + bh * D;
@@ -274,6 +272,10 @@ __global__ void __launch_bounds__(NTHR, MINB)
     }
     cp_async_commit();
     if (tid == D) bnext = bt[bh];
+    if (tid < D) {
+      araw = a_log[h];
+      gbias = dt_bias[(size_t)h * D + tid];
+    }
   } else {
     if (warp == 0 && lane < 16) {
       const uint16_t* src = (isq ? q : k) + bh * D;
@@ -281,7 +283,11 @@ __global__ void __launch_bounds__(NTHR, MINB)
       r1 = *reinterpret_cast<const uint4*>(src + 64 + 8 * L);
     }
     if (tid < D / 2) vp = *reinterpret_cast<const uint32_t*>(v + bh * D + 2 * tid);
-    if (tid < D) gx = ghalf * (bf2f(gt[bh * D + tid]) + gbias);
+    // the uses stay behind the loads: a use would hold back the loads issued after it
+    if (tid < D) {
+      const float al = ex2a(a_log[h] * 1.4426950408889634f);
+      gx = (al * 0.5f) * (bf2f(gt[bh * D + tid]) + dt_bias[(size_t)h * D + tid]);
+    }
     if (tid == D) braw = bt[bh];
   }
   float pprev = 0.0f;
@@ -299,14 +305,16 @@ __global__ void __launch_bounds__(NTHR, MINB)
       ((cur0.x ^ old0.x) | (cur0.y ^ old0.y) | (cur0.z ^ old0.z) | (cur0.w ^ old0.w) |
        (cur1.x ^ old1.x) | (cur1.y ^ old1.y) | (cur1.z ^ old1.z) | (cur1.w ^ old1.w)) != 0u;
   int p = moved ? 0 : (c0 & (CH - 1));
-  for (int u = tid; u < p * 16; u += NTHR) {
-    const int j = u >> 4, c8 = (u & 15) * 8;
-    cp_async16(Ksm + j * SD + c8, Kpool + (size_t)j * D + c8);
-    cp_async16(Rsm + j * SD + c8, Rpool + (size_t)j * D + c8);
-    cp_async16(Usm + j * SD + c8, Upool + (size_t)j * D + c8);
-  }
+  if (warp == NTHR / 32 - 1)
+    for (int u = lane; u < p * 16; u += 32) {
+      const int j = u >> 4, c8 = (u & 15) * 8;
+      cp_async16(Ksm + j * SD + c8, Kpool + (size_t)j * D + c8);
+      cp_async16(Rsm + j * SD + c8, Rpool + (size_t)j * D + c8);
+      cp_async16(Usm + j * SD + c8, Upool + (size_t)j * D + c8);
+    }
   cp_async_commit();
   Lsm[tid] = (tid >> 4) < p ? lraw : (uint16_t)0;
+  const float ghalf = ex2a(araw * 1.4426950408889634f) * 0.5f;
 #pragma unroll 1
   for (int j = 0; j < n; ++j) {
     if (SPAN) {
@@ -360,7 +368,7 @@ __global__ void __launch_bounds__(NTHR, MINB)
       ss = ss + __shfl_xor_sync(0xffffffffu, ss, 1);
       inv = rsqa(ss + 1e-6f);
     }
-    if (!SPAN) cp_async_wait_all();
+    if (!SPAN && warp < NTHR / 32 - 1) cp_async_wait_all();
     __syncthreads();
     for (int e = tid; e < (CH - 1 - p) * (SD / 2); e += NTHR) {
       reinterpret_cast<uint32_t*>(Rsm + (size_t)(p + 1) * SD)[e] = 0u;
@@ -408,6 +416,8 @@ __global__ void __launch_bounds__(NTHR, MINB)
         }
       }
     }
+    // the cached rows are first read behind this barrier
+    if (!SPAN && warp == NTHR / 32 - 1) cp_async_wait_all();
     __syncthreads();
 
     // state_k / state_q = bf16(S) . [k_decay_p, q_decay_p]; key s ^ 8 at k-position s as in the
