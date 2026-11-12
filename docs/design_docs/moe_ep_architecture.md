@@ -871,6 +871,14 @@ and the recovery state machine.
 
 ### Offline live-token tuning
 
+Rubin inference searches all 32 default candidates unless capped. GenPhase uses
+8 or 11, depending on the datatype. Both lists order choices for prefix-limited
+searches. `--max-candidates N`
+takes the first N unique choices from each eligible variant independently;
+shorter lists are used in full. The low-level Python tuner also accepts an
+ordered `candidates` list. Repeated choices are removed before measurement,
+with JSON lists and Python tuples treated alike. Custom order is preserved.
+
 CuTeDSL MegaMoE tuning records both workspace capacity (`max_tokens`) and
 benchmark workload (`live_tokens`) in each JSON entry. Different workloads at
 the same capacity coexist; retuning the same pair replaces its winner. No
