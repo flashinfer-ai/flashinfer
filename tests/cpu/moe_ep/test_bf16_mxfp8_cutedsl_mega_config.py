@@ -89,6 +89,7 @@ def test_mixed_knobs_and_candidates():
 
     candidates = bf16_mxfp8_candidates()
     assert len(candidates) == 18
+    assert {c["num_activation_stages"] for c in candidates} == {4}
     assert all(is_valid_bf16_mxfp8(c) for c in candidates)
     assert {_impl_key(c) for c in candidates} == _LEGAL_IMPLS
     assert {c["token_back_mode"] for c in candidates} == {

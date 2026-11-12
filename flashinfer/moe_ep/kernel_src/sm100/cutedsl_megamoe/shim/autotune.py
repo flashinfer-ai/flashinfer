@@ -149,14 +149,14 @@ def bf16_mxfp8_candidates(
     *,
     enable_in_kernel_fc2_reduce: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Default BF16/MXFP8 candidate knob dicts (ikr x impl tuple x flag_batch x token-back).
+    """Default BF16/MXFP8 candidate knob dicts (ikr x impl tuple x flag_batch x token-back x stages).
 
     Eighteen candidates: three legal implementation tuples (N128/tmem,
     N256/smem, N256/tmem-overlap) x ``flag_batch`` {1, 4} x
     ``token_back_mode`` {``epi_warps``, ``reuse_dispatch_warps``}, with the
     dispatch-warp half also timing ``epi_flag_batch=(1, 1)`` (see
-    :func:`_bf16_mxfp8_epi_flag_batches`).  ``standalone_warps`` is
-    unsupported.
+    :func:`_bf16_mxfp8_epi_flag_batches`), x ``num_activation_stages`` {4}.
+    ``standalone_warps`` is unsupported.
     Enabling IKR doubles the number of candidates to 36.
     """
     out: List[Dict[str, Any]] = []
@@ -191,16 +191,18 @@ def bf16_mxfp8_candidates(
             for flag_batch in (1, 4):
                 for token_back in ("epi_warps", "reuse_dispatch_warps"):
                     for epi_flag_batch in _bf16_mxfp8_epi_flag_batches(token_back):
-                        knobs = dict(
-                            base,
-                            **impl,
-                            flag_batch=flag_batch,
-                            epi_flag_batch=epi_flag_batch,
-                            token_back_mode=token_back,
-                            in_kernel_fc2_reduce=ikr,
-                        )
-                        if is_valid_bf16_mxfp8(knobs):
-                            out.append(knobs)
+                        for stages in (4,):
+                            knobs = dict(
+                                base,
+                                **impl,
+                                flag_batch=flag_batch,
+                                epi_flag_batch=epi_flag_batch,
+                                token_back_mode=token_back,
+                                in_kernel_fc2_reduce=ikr,
+                                num_activation_stages=stages,
+                            )
+                            if is_valid_bf16_mxfp8(knobs):
+                                out.append(knobs)
     return out
 
 
