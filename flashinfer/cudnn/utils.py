@@ -18,7 +18,7 @@ import functools
 import inspect
 import threading
 import weakref
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 
@@ -170,82 +170,17 @@ def get_cudnn_fmha_gen_module():
     return op
 
 
-# cudnn-frontend 1.30.0 is the first release whose DEFAULT SM100 f16/bf16 SDPA
-# forward engine (the CuTe-DSL "FROST" row) serves paged decode: multi-token rows
-# ride its decode tile, and an attention sink at q_len_per_req == 1, which the
-# classic backend engine declines, falls through to it at plan time. Older
-# frontends serve FlashInfer's decode graphs with the backend engine only.
-CUDNN_FRONTEND_FROST_DECODE_MIN_VERSION: Tuple[int, int, int] = (1, 30, 0)
-
-
-def cudnn_frontend_version() -> Optional[Tuple[int, ...]]:
-    """The installed cudnn-frontend python package's version, or ``None``.
-
-    ``"1.31.0.dev123"`` parses to ``(1, 31, 0)``; a missing package or a
-    version string without a numeric prefix gives ``None``.
-    """
-    try:
-        import cudnn  # noqa: PLC0415 -- optional dependency, imported lazily
-    except Exception:  # noqa: BLE001 -- any import failure means "not available"
-        return None
-    raw = getattr(cudnn, "__version__", None)
-    if not raw:
-        return None
-    parts = []
-    for piece in str(raw).split("+")[0].split("."):
-        digits = ""
-        for ch in piece:
-            if not ch.isdigit():
-                break
-            digits += ch
-        if not digits:
-            break
-        parts.append(int(digits))
-    return tuple(parts) if parts else None
-
-
 def cudnn_frontend_serves_frost_decode(compute_capability: Tuple[int, int]) -> bool:
-    """Whether cuDNN's FROST SDPA decode paths serve this device by default.
+    """Whether an importable supported FE serves this device's decode tile.
 
-    True on SM100 / SM103 (the Blackwell parts with the decode tile; Rubin's
-    row has none yet) with cudnn-frontend at least
-    :data:`CUDNN_FRONTEND_FROST_DECODE_MIN_VERSION`. No environment variable is
-    involved: the row is a default engine of the frontend.
-    """
-    version = cudnn_frontend_version()
-    if version is None:
-        return False
-    # "1.30" parses to (1, 30): pad before comparing so it is not short of 1.30.0.
-    if (tuple(version) + (0, 0, 0))[:3] < CUDNN_FRONTEND_FROST_DECODE_MIN_VERSION:
-        return False
-    return tuple(compute_capability) in ((10, 0), (10, 3))
-
-
-@functools.cache
-def cudnn_frontend_accepts_cuda_graph_replay_hint() -> bool:
-    """Whether the installed cudnn-frontend's ``pygraph`` takes the keyword-only
-    ``is_cuda_graph_replay_expected`` hint and its ``cudnn.graph`` helper
-    forwards graph keywords to it (1.31+).
-
-    The hint tells the frontend's heuristics that the graph's ``execute`` is
-    captured into a CUDA graph and replayed, so a plan's per-execute host
-    cost is paid once; the d256 decode tile then leads with its split-KV
-    plan. Probed from the signatures rather than the version so a frontend
-    without the keyword (or the compiled ``pygraph`` of 1.29 and older,
-    which has no Python signature) is simply not given it.
+    FE >=1.32 includes the SM100/SM103 default FROST decode paths. Runtime
+    importability and device support remain independent of that package floor.
     """
     try:
-        import cudnn  # noqa: PLC0415 -- optional dependency, imported lazily
-    except Exception:  # noqa: BLE001 -- any import failure means "not available"
+        import cudnn  # noqa: PLC0415 -- keep runtime availability checks lazy
+    except Exception:  # noqa: BLE001 -- an import failure means unavailable
         return False
-    try:
-        ctor = inspect.signature(cudnn.pygraph.__init__).parameters
-        helper = inspect.signature(cudnn.graph).parameters
-    except (AttributeError, TypeError, ValueError):
-        return False
-    return "is_cuda_graph_replay_expected" in ctor and any(
-        p.kind is inspect.Parameter.VAR_KEYWORD for p in helper.values()
-    )
+    return cudnn is not None and tuple(compute_capability) in ((10, 0), (10, 3))
 
 
 @functools.cache
@@ -255,15 +190,10 @@ def cudnn_frontend_frost_runtime_available() -> bool:
     the frontend's own floor (``cudnn.frost.buffers.CUTEDSL_MIN_VERSION``,
     4.7.0 today).
 
-    Both this package and cudnn-frontend admit ``nvidia-cutlass-dsl`` 4.6.2 in
-    their dependency metadata, which is below that floor. On such an install
-    the frontend's FROST rows decline and its backend engine serves the graph
-    (~8x slower than fa2 on multi-token rows), so a performance-driven
-    ``auto`` choice must not count on the frontend version alone. The check
-    is the frontend's own (``cutedsl_state`` / ``cutedsl_too_old``, which
-    the SDPA forward engines gate on): internal DSL builds count as new
-    enough, as they do there. A frontend without those helpers (1.29 and
-    older, which have no FROST decode rows either) reports False.
+    Consult the frontend's own runtime check rather than inferring capability
+    from package metadata. Its kernel floor can rise independently, and a
+    missing or broken DSL import must still leave automatic selection on its
+    fallback. Internal DSL builds follow the frontend's policy as well.
     """
     try:
         from cudnn.frost.buffers import (  # noqa: PLC0415 -- optional dependency
@@ -277,21 +207,3 @@ def cudnn_frontend_frost_runtime_available() -> bool:
         return bool(installed) and not cutedsl_too_old(version)
     except Exception:  # noqa: BLE001 -- a probe that fails is a runtime that is not there
         return False
-
-
-# cudnn-frontend 1.30 ranks its FROST decode tile ahead of the backend engine for
-# multi-token rows only from a declared 2048-token cache; below that the backend's
-# prefill-class engine goes first (~8x fa2's time). 1.31 ranks the tile first at
-# every cache length (NVIDIA/cudnn-frontend#1420).
-CUDNN_FRONTEND_SHORT_CACHE_LEAD_MIN_VERSION: Tuple[int, int, int] = (1, 31, 0)
-
-
-def cudnn_frontend_leads_short_caches() -> bool:
-    """Whether the installed cudnn-frontend ranks its decode tile first for
-    multi-token rows at every declared cache length (1.31+)."""
-    version = cudnn_frontend_version()
-    if version is None:
-        return False
-    return (tuple(version) + (0, 0, 0))[
-        :3
-    ] >= CUDNN_FRONTEND_SHORT_CACHE_LEAD_MIN_VERSION

@@ -122,7 +122,7 @@ device) and ``test_cake_mhc_nondet_train_api.py`` (the
 
 The largest cases hold the FP64 reference in row blocks of 8192 tokens.  Like
 ``test_cake_mhc_det_train.py`` this suite exercises the backend packages alone
-(both named through ``tests.test_helpers.cake_package``) and imports nothing
+(both named through ``tests.cake.test_helpers.cake_package``) and imports nothing
 else from flashinfer.
 """
 
@@ -139,7 +139,7 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 KEY = "cake.cake_mhc_nondet_train"
 pkg = cake_package(KEY)

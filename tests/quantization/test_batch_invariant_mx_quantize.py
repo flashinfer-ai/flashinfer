@@ -30,7 +30,7 @@ from flashinfer.batch_invariant.quantization.mx_api import (
     mxfp4_quantize_batch_invariant,
     mxfp8_quantize_batch_invariant,
 )
-from tests.test_helpers.batch_invariant_quant import (
+from tests.quantization.test_helpers.batch_invariant_quant import (
     FI_LAYOUTS,
     adversarial_inputs,
     same_bits,

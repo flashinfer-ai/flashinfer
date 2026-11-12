@@ -75,14 +75,17 @@ kernel_cake_dsa_h64_det_nope_train_02223183ecc7ab5cc5c9(int* dkv_acc, int* __res
 
     // === Task calls (declaration order) ===
     int row = blockIdx.x * 8 + warp;
-    int lane_1 = lane;
     if (row < num_rows) {
+        int lane_1 = lane;
         int word0 = e_lat[row];
         int e = word0 << 16 >> 16;
         int touched = (int)(e != 127);
-        int bad = 0;
+        int n[16];
+        float prev[16];
+        unsigned long long worst = 0ull;
+        unsigned int pairs = 0;
+        int e_r = 0;
         if (touched != 0) {
-            unsigned long long worst = 0ull;
             unsigned long long cq_0 = cnt64[(long long)row * 4ll];
             unsigned long long _max_0 = ((worst) > (cq_0) ? (worst) : (cq_0));
             worst = _max_0;
@@ -95,7 +98,94 @@ kernel_cake_dsa_h64_det_nope_train_02223183ecc7ab5cc5c9(int* dkv_acc, int* __res
             unsigned long long cq_3 = cnt64[(long long)row * 4ll + 3ll];
             unsigned long long _max_3 = ((worst) > (cq_3) ? (worst) : (cq_3));
             worst = _max_3;
-            unsigned long long slack = (unsigned long long)row_pairs[row] << (unsigned long long)(word0 >> 16);
+            pairs = row_pairs[row];
+            {
+                const int4* _ivptr_4 = reinterpret_cast<const int4*>(dkv_acc + ((long long)row * (long long)dkv_stride + (long long)(lane_1 * 4)) + 0);
+                int4 _ivld_4;
+                _ivld_4 = *_ivptr_4;
+                n[0 + 0] = _ivld_4.x;
+                n[0 + 1] = _ivld_4.y;
+                n[0 + 2] = _ivld_4.z;
+                n[0 + 3] = _ivld_4.w;
+            }
+            {
+                const int4* _ivptr_5 = reinterpret_cast<const int4*>(dkv_acc + ((long long)row * (long long)dkv_stride + (long long)(128 + lane_1 * 4)) + 0);
+                int4 _ivld_5;
+                _ivld_5 = *_ivptr_5;
+                n[4 + 0] = _ivld_5.x;
+                n[4 + 1] = _ivld_5.y;
+                n[4 + 2] = _ivld_5.z;
+                n[4 + 3] = _ivld_5.w;
+            }
+            {
+                const int4* _ivptr_6 = reinterpret_cast<const int4*>(dkv_acc + ((long long)row * (long long)dkv_stride + (long long)(256 + lane_1 * 4)) + 0);
+                int4 _ivld_6;
+                _ivld_6 = *_ivptr_6;
+                n[8 + 0] = _ivld_6.x;
+                n[8 + 1] = _ivld_6.y;
+                n[8 + 2] = _ivld_6.z;
+                n[8 + 3] = _ivld_6.w;
+            }
+            {
+                const int4* _ivptr_7 = reinterpret_cast<const int4*>(dkv_acc + ((long long)row * (long long)dkv_stride + (long long)(384 + lane_1 * 4)) + 0);
+                int4 _ivld_7;
+                _ivld_7 = *_ivptr_7;
+                n[12 + 0] = _ivld_7.x;
+                n[12 + 1] = _ivld_7.y;
+                n[12 + 2] = _ivld_7.z;
+                n[12 + 3] = _ivld_7.w;
+            }
+            if (accumulate != 0) {
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(dst_packed + ((long long)row * (long long)dst_row_stride + (long long)(lane_1 * 4)) + 0);
+                    prev[0 + 0] = _v4.x;
+                    prev[0 + 1] = _v4.y;
+                    prev[0 + 2] = _v4.z;
+                    prev[0 + 3] = _v4.w;
+                }
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(dst_packed + ((long long)row * (long long)dst_row_stride + (long long)(128 + lane_1 * 4)) + 0);
+                    prev[4 + 0] = _v4.x;
+                    prev[4 + 1] = _v4.y;
+                    prev[4 + 2] = _v4.z;
+                    prev[4 + 3] = _v4.w;
+                }
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(dst_packed + ((long long)row * (long long)dst_row_stride + (long long)(256 + lane_1 * 4)) + 0);
+                    prev[8 + 0] = _v4.x;
+                    prev[8 + 1] = _v4.y;
+                    prev[8 + 2] = _v4.z;
+                    prev[8 + 3] = _v4.w;
+                }
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(dst_packed + ((long long)row * (long long)dst_row_stride + (long long)(384 + lane_1 * 4)) + 0);
+                    prev[12 + 0] = _v4.x;
+                    prev[12 + 1] = _v4.y;
+                    prev[12 + 2] = _v4.z;
+                    prev[12 + 3] = _v4.w;
+                }
+            }
+        } else {
+            n[0] = 0;
+            n[1] = 0;
+            n[2] = 0;
+            n[3] = 0;
+            n[4] = 0;
+            n[5] = 0;
+            n[6] = 0;
+            n[7] = 0;
+            n[8] = 0;
+            n[9] = 0;
+            n[10] = 0;
+            n[11] = 0;
+            n[12] = 0;
+            n[13] = 0;
+            n[14] = 0;
+            n[15] = 0;
+        }
+        int bad = 0;
+        if (touched != 0) {
+            unsigned long long slack = (unsigned long long)pairs << (unsigned long long)(word0 >> 16);
             if (worst >= 2147483648ull || worst + slack >= 2147483648ull) {
                 bad = 1;
             }
@@ -106,72 +196,47 @@ kernel_cake_dsa_h64_det_nope_train_02223183ecc7ab5cc5c9(int* dkv_acc, int* __res
             s_lat = __uint_as_float((unsigned int)(e + 127) << 23);
         }
         int col_0 = lane_1 * 4;
-        int n4[4];
         float v4[4];
-        if (touched != 0) {
-            {
-                const int4* _ivptr_4 = reinterpret_cast<const int4*>(dkv_acc + ((long long)row * (long long)dkv_stride + (long long)col_0) + 0);
-                int4 _ivld_4;
-                _ivld_4 = *_ivptr_4;
-                n4[0 + 0] = _ivld_4.x;
-                n4[0 + 1] = _ivld_4.y;
-                n4[0 + 2] = _ivld_4.z;
-                n4[0 + 3] = _ivld_4.w;
-            }
-        } else {
-            n4[0] = 0;
-            n4[1] = 0;
-            n4[2] = 0;
-            n4[3] = 0;
-        }
-        v4[0] = mul_f32_rn_noftz((float)n4[0], s_lat);
+        v4[0] = mul_f32_rn_noftz((float)n[0], s_lat);
         if (bad != 0) {
             v4[0] = nan;
         }
-        v4[1] = mul_f32_rn_noftz((float)n4[1], s_lat);
+        v4[1] = mul_f32_rn_noftz((float)n[1], s_lat);
         if (bad != 0) {
             v4[1] = nan;
         }
-        v4[2] = mul_f32_rn_noftz((float)n4[2], s_lat);
+        v4[2] = mul_f32_rn_noftz((float)n[2], s_lat);
         if (bad != 0) {
             v4[2] = nan;
         }
-        v4[3] = mul_f32_rn_noftz((float)n4[3], s_lat);
+        v4[3] = mul_f32_rn_noftz((float)n[3], s_lat);
         if (bad != 0) {
             v4[3] = nan;
         }
         if (accumulate != 0) {
             if (touched != 0) {
-                float prev4[4];
-                {
-                    float4 _v4 = *reinterpret_cast<const float4*>(dst_packed + ((long long)row * (long long)dst_row_stride + (long long)col_0) + 0);
-                    prev4[0 + 0] = _v4.x;
-                    prev4[0 + 1] = _v4.y;
-                    prev4[0 + 2] = _v4.z;
-                    prev4[0 + 3] = _v4.w;
+                if (n[0] != 0 || bad != 0) {
+                    float _add_12;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_12) : "f"(prev[0]), "f"(v4[0]));
+                    prev[0] = _add_12;
                 }
-                if (n4[0] != 0 || bad != 0) {
-                    float _add_6;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_6) : "f"(prev4[0]), "f"(v4[0]));
-                    prev4[0] = _add_6;
+                if (n[1] != 0 || bad != 0) {
+                    float _add_13;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_13) : "f"(prev[1]), "f"(v4[1]));
+                    prev[1] = _add_13;
                 }
-                if (n4[1] != 0 || bad != 0) {
-                    float _add_7;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_7) : "f"(prev4[1]), "f"(v4[1]));
-                    prev4[1] = _add_7;
+                if (n[2] != 0 || bad != 0) {
+                    float _add_14;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_14) : "f"(prev[2]), "f"(v4[2]));
+                    prev[2] = _add_14;
                 }
-                if (n4[2] != 0 || bad != 0) {
-                    float _add_8;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_8) : "f"(prev4[2]), "f"(v4[2]));
-                    prev4[2] = _add_8;
-                }
-                if (n4[3] != 0 || bad != 0) {
-                    float _add_9;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_9) : "f"(prev4[3]), "f"(v4[3]));
-                    prev4[3] = _add_9;
+                if (n[3] != 0 || bad != 0) {
+                    float _add_15;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_15) : "f"(prev[3]), "f"(v4[3]));
+                    prev[3] = _add_15;
                 }
                 {
-                    float4 _v4 = make_float4(prev4[0 + 0], prev4[0 + 1], prev4[0 + 2], prev4[0 + 3]);
+                    float4 _v4 = make_float4(prev[0 + 0], prev[0 + 1], prev[0 + 2], prev[0 + 3]);
                     *reinterpret_cast<float4*>(dst_packed + (long long)row * (long long)dst_row_stride + (long long)col_0) = _v4;
                 }
             }
@@ -190,72 +255,47 @@ kernel_cake_dsa_h64_det_nope_train_02223183ecc7ab5cc5c9(int* dkv_acc, int* __res
             reinterpret_cast<int2*>(dst_latent + ((long long)row * (long long)dst_lat_stride + (long long)col_0))[0] = reinterpret_cast<int2*>(packed)[0];
         }
         int col_1 = 128 + lane_1 * 4;
-        int n4_0[4];
         float v4_0[4];
-        if (touched != 0) {
-            {
-                const int4* _ivptr_10 = reinterpret_cast<const int4*>(dkv_acc + ((long long)row * (long long)dkv_stride + (long long)col_1) + 0);
-                int4 _ivld_10;
-                _ivld_10 = *_ivptr_10;
-                n4_0[0 + 0] = _ivld_10.x;
-                n4_0[0 + 1] = _ivld_10.y;
-                n4_0[0 + 2] = _ivld_10.z;
-                n4_0[0 + 3] = _ivld_10.w;
-            }
-        } else {
-            n4_0[0] = 0;
-            n4_0[1] = 0;
-            n4_0[2] = 0;
-            n4_0[3] = 0;
-        }
-        v4_0[0] = mul_f32_rn_noftz((float)n4_0[0], s_lat);
+        v4_0[0] = mul_f32_rn_noftz((float)n[4], s_lat);
         if (bad != 0) {
             v4_0[0] = nan;
         }
-        v4_0[1] = mul_f32_rn_noftz((float)n4_0[1], s_lat);
+        v4_0[1] = mul_f32_rn_noftz((float)n[5], s_lat);
         if (bad != 0) {
             v4_0[1] = nan;
         }
-        v4_0[2] = mul_f32_rn_noftz((float)n4_0[2], s_lat);
+        v4_0[2] = mul_f32_rn_noftz((float)n[6], s_lat);
         if (bad != 0) {
             v4_0[2] = nan;
         }
-        v4_0[3] = mul_f32_rn_noftz((float)n4_0[3], s_lat);
+        v4_0[3] = mul_f32_rn_noftz((float)n[7], s_lat);
         if (bad != 0) {
             v4_0[3] = nan;
         }
         if (accumulate != 0) {
             if (touched != 0) {
-                float prev4_1[4];
-                {
-                    float4 _v4 = *reinterpret_cast<const float4*>(dst_packed + ((long long)row * (long long)dst_row_stride + (long long)col_1) + 0);
-                    prev4_1[0 + 0] = _v4.x;
-                    prev4_1[0 + 1] = _v4.y;
-                    prev4_1[0 + 2] = _v4.z;
-                    prev4_1[0 + 3] = _v4.w;
+                if (n[4] != 0 || bad != 0) {
+                    float _add_16;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_16) : "f"(prev[4]), "f"(v4_0[0]));
+                    prev[4] = _add_16;
                 }
-                if (n4_0[0] != 0 || bad != 0) {
-                    float _add_12;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_12) : "f"(prev4_1[0]), "f"(v4_0[0]));
-                    prev4_1[0] = _add_12;
+                if (n[5] != 0 || bad != 0) {
+                    float _add_17;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_17) : "f"(prev[5]), "f"(v4_0[1]));
+                    prev[5] = _add_17;
                 }
-                if (n4_0[1] != 0 || bad != 0) {
-                    float _add_13;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_13) : "f"(prev4_1[1]), "f"(v4_0[1]));
-                    prev4_1[1] = _add_13;
+                if (n[6] != 0 || bad != 0) {
+                    float _add_18;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_18) : "f"(prev[6]), "f"(v4_0[2]));
+                    prev[6] = _add_18;
                 }
-                if (n4_0[2] != 0 || bad != 0) {
-                    float _add_14;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_14) : "f"(prev4_1[2]), "f"(v4_0[2]));
-                    prev4_1[2] = _add_14;
-                }
-                if (n4_0[3] != 0 || bad != 0) {
-                    float _add_15;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_15) : "f"(prev4_1[3]), "f"(v4_0[3]));
-                    prev4_1[3] = _add_15;
+                if (n[7] != 0 || bad != 0) {
+                    float _add_19;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_19) : "f"(prev[7]), "f"(v4_0[3]));
+                    prev[7] = _add_19;
                 }
                 {
-                    float4 _v4 = make_float4(prev4_1[0 + 0], prev4_1[0 + 1], prev4_1[0 + 2], prev4_1[0 + 3]);
+                    float4 _v4 = make_float4(prev[4 + 0], prev[4 + 1], prev[4 + 2], prev[4 + 3]);
                     *reinterpret_cast<float4*>(dst_packed + (long long)row * (long long)dst_row_stride + (long long)col_1) = _v4;
                 }
             }
@@ -274,72 +314,47 @@ kernel_cake_dsa_h64_det_nope_train_02223183ecc7ab5cc5c9(int* dkv_acc, int* __res
             reinterpret_cast<int2*>(dst_latent + ((long long)row * (long long)dst_lat_stride + (long long)col_1))[0] = reinterpret_cast<int2*>(packed_1)[0];
         }
         int col_2 = 256 + lane_1 * 4;
-        int n4_1[4];
         float v4_1[4];
-        if (touched != 0) {
-            {
-                const int4* _ivptr_16 = reinterpret_cast<const int4*>(dkv_acc + ((long long)row * (long long)dkv_stride + (long long)col_2) + 0);
-                int4 _ivld_16;
-                _ivld_16 = *_ivptr_16;
-                n4_1[0 + 0] = _ivld_16.x;
-                n4_1[0 + 1] = _ivld_16.y;
-                n4_1[0 + 2] = _ivld_16.z;
-                n4_1[0 + 3] = _ivld_16.w;
-            }
-        } else {
-            n4_1[0] = 0;
-            n4_1[1] = 0;
-            n4_1[2] = 0;
-            n4_1[3] = 0;
-        }
-        v4_1[0] = mul_f32_rn_noftz((float)n4_1[0], s_lat);
+        v4_1[0] = mul_f32_rn_noftz((float)n[8], s_lat);
         if (bad != 0) {
             v4_1[0] = nan;
         }
-        v4_1[1] = mul_f32_rn_noftz((float)n4_1[1], s_lat);
+        v4_1[1] = mul_f32_rn_noftz((float)n[9], s_lat);
         if (bad != 0) {
             v4_1[1] = nan;
         }
-        v4_1[2] = mul_f32_rn_noftz((float)n4_1[2], s_lat);
+        v4_1[2] = mul_f32_rn_noftz((float)n[10], s_lat);
         if (bad != 0) {
             v4_1[2] = nan;
         }
-        v4_1[3] = mul_f32_rn_noftz((float)n4_1[3], s_lat);
+        v4_1[3] = mul_f32_rn_noftz((float)n[11], s_lat);
         if (bad != 0) {
             v4_1[3] = nan;
         }
         if (accumulate != 0) {
             if (touched != 0) {
-                float prev4_2[4];
-                {
-                    float4 _v4 = *reinterpret_cast<const float4*>(dst_packed + ((long long)row * (long long)dst_row_stride + (long long)col_2) + 0);
-                    prev4_2[0 + 0] = _v4.x;
-                    prev4_2[0 + 1] = _v4.y;
-                    prev4_2[0 + 2] = _v4.z;
-                    prev4_2[0 + 3] = _v4.w;
-                }
-                if (n4_1[0] != 0 || bad != 0) {
-                    float _add_18;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_18) : "f"(prev4_2[0]), "f"(v4_1[0]));
-                    prev4_2[0] = _add_18;
-                }
-                if (n4_1[1] != 0 || bad != 0) {
-                    float _add_19;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_19) : "f"(prev4_2[1]), "f"(v4_1[1]));
-                    prev4_2[1] = _add_19;
-                }
-                if (n4_1[2] != 0 || bad != 0) {
+                if (n[8] != 0 || bad != 0) {
                     float _add_20;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_20) : "f"(prev4_2[2]), "f"(v4_1[2]));
-                    prev4_2[2] = _add_20;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_20) : "f"(prev[8]), "f"(v4_1[0]));
+                    prev[8] = _add_20;
                 }
-                if (n4_1[3] != 0 || bad != 0) {
+                if (n[9] != 0 || bad != 0) {
                     float _add_21;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_21) : "f"(prev4_2[3]), "f"(v4_1[3]));
-                    prev4_2[3] = _add_21;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_21) : "f"(prev[9]), "f"(v4_1[1]));
+                    prev[9] = _add_21;
+                }
+                if (n[10] != 0 || bad != 0) {
+                    float _add_22;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_22) : "f"(prev[10]), "f"(v4_1[2]));
+                    prev[10] = _add_22;
+                }
+                if (n[11] != 0 || bad != 0) {
+                    float _add_23;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_23) : "f"(prev[11]), "f"(v4_1[3]));
+                    prev[11] = _add_23;
                 }
                 {
-                    float4 _v4 = make_float4(prev4_2[0 + 0], prev4_2[0 + 1], prev4_2[0 + 2], prev4_2[0 + 3]);
+                    float4 _v4 = make_float4(prev[8 + 0], prev[8 + 1], prev[8 + 2], prev[8 + 3]);
                     *reinterpret_cast<float4*>(dst_packed + (long long)row * (long long)dst_row_stride + (long long)col_2) = _v4;
                 }
             }
@@ -358,72 +373,47 @@ kernel_cake_dsa_h64_det_nope_train_02223183ecc7ab5cc5c9(int* dkv_acc, int* __res
             reinterpret_cast<int2*>(dst_latent + ((long long)row * (long long)dst_lat_stride + (long long)col_2))[0] = reinterpret_cast<int2*>(packed_2)[0];
         }
         int col_3 = 384 + lane_1 * 4;
-        int n4_2[4];
         float v4_2[4];
-        if (touched != 0) {
-            {
-                const int4* _ivptr_22 = reinterpret_cast<const int4*>(dkv_acc + ((long long)row * (long long)dkv_stride + (long long)col_3) + 0);
-                int4 _ivld_22;
-                _ivld_22 = *_ivptr_22;
-                n4_2[0 + 0] = _ivld_22.x;
-                n4_2[0 + 1] = _ivld_22.y;
-                n4_2[0 + 2] = _ivld_22.z;
-                n4_2[0 + 3] = _ivld_22.w;
-            }
-        } else {
-            n4_2[0] = 0;
-            n4_2[1] = 0;
-            n4_2[2] = 0;
-            n4_2[3] = 0;
-        }
-        v4_2[0] = mul_f32_rn_noftz((float)n4_2[0], s_lat);
+        v4_2[0] = mul_f32_rn_noftz((float)n[12], s_lat);
         if (bad != 0) {
             v4_2[0] = nan;
         }
-        v4_2[1] = mul_f32_rn_noftz((float)n4_2[1], s_lat);
+        v4_2[1] = mul_f32_rn_noftz((float)n[13], s_lat);
         if (bad != 0) {
             v4_2[1] = nan;
         }
-        v4_2[2] = mul_f32_rn_noftz((float)n4_2[2], s_lat);
+        v4_2[2] = mul_f32_rn_noftz((float)n[14], s_lat);
         if (bad != 0) {
             v4_2[2] = nan;
         }
-        v4_2[3] = mul_f32_rn_noftz((float)n4_2[3], s_lat);
+        v4_2[3] = mul_f32_rn_noftz((float)n[15], s_lat);
         if (bad != 0) {
             v4_2[3] = nan;
         }
         if (accumulate != 0) {
             if (touched != 0) {
-                float prev4_3[4];
-                {
-                    float4 _v4 = *reinterpret_cast<const float4*>(dst_packed + ((long long)row * (long long)dst_row_stride + (long long)col_3) + 0);
-                    prev4_3[0 + 0] = _v4.x;
-                    prev4_3[0 + 1] = _v4.y;
-                    prev4_3[0 + 2] = _v4.z;
-                    prev4_3[0 + 3] = _v4.w;
-                }
-                if (n4_2[0] != 0 || bad != 0) {
+                if (n[12] != 0 || bad != 0) {
                     float _add_24;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_24) : "f"(prev4_3[0]), "f"(v4_2[0]));
-                    prev4_3[0] = _add_24;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_24) : "f"(prev[12]), "f"(v4_2[0]));
+                    prev[12] = _add_24;
                 }
-                if (n4_2[1] != 0 || bad != 0) {
+                if (n[13] != 0 || bad != 0) {
                     float _add_25;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_25) : "f"(prev4_3[1]), "f"(v4_2[1]));
-                    prev4_3[1] = _add_25;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_25) : "f"(prev[13]), "f"(v4_2[1]));
+                    prev[13] = _add_25;
                 }
-                if (n4_2[2] != 0 || bad != 0) {
+                if (n[14] != 0 || bad != 0) {
                     float _add_26;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_26) : "f"(prev4_3[2]), "f"(v4_2[2]));
-                    prev4_3[2] = _add_26;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_26) : "f"(prev[14]), "f"(v4_2[2]));
+                    prev[14] = _add_26;
                 }
-                if (n4_2[3] != 0 || bad != 0) {
+                if (n[15] != 0 || bad != 0) {
                     float _add_27;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_27) : "f"(prev4_3[3]), "f"(v4_2[3]));
-                    prev4_3[3] = _add_27;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_27) : "f"(prev[15]), "f"(v4_2[3]));
+                    prev[15] = _add_27;
                 }
                 {
-                    float4 _v4 = make_float4(prev4_3[0 + 0], prev4_3[0 + 1], prev4_3[0 + 2], prev4_3[0 + 3]);
+                    float4 _v4 = make_float4(prev[12 + 0], prev[12 + 1], prev[12 + 2], prev[12 + 3]);
                     *reinterpret_cast<float4*>(dst_packed + (long long)row * (long long)dst_row_stride + (long long)col_3) = _v4;
                 }
             }

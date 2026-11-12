@@ -118,12 +118,13 @@ argument; the backend reads no environment variable.
 
 The keyword selects the launch form of the backward's main program; the
 forward and the backward's head program are the same in both forms.  The
-forward is also an ordinary launch one SM short of the co-resident CTA count
-(`kcp.FWD_RESERVE_SMS`) whenever that grid holds every channel tile of `C`
-(else it takes the full grid).  Beside one small kernel of another stream that
-occupies a single SM, all CTAs of the shorter grid can then start at once; a
-kernel on more SMs still makes some of them wait for a later wave.  `y` does
-not depend on its grid.
+forward's `kcp_fwd` program is also an ordinary launch one SM short of the
+co-resident CTA count (`kcp.FWD_RESERVE_SMS`) whenever that grid holds every
+channel tile of `C` (else it takes the full grid).  Beside one small kernel of
+another stream that occupies a single SM, all CTAs of the shorter grid can then
+start at once; a kernel on more SMs still makes some of them wait for a later
+wave.  The single-rank main program of the two-launch forward (below) launches
+its record's full co-resident grid.  `y` does not depend on its grid.
 
 | `cooperative` | program | behavior |
 |---|---|---|
@@ -147,6 +148,37 @@ tensor this way and runs the other tensors' programs after the wait, so it
 also adds one program per call; on sm_100a, where this measured no gain, the
 multi entry waits first (`MULTI_BWD_OVERLAP_ARCHS`).  `cooperative=True` waits
 before its launch.
+
+### Two-launch forward
+
+The forward can run as two programs: a main program that reads no received
+history row, then the `kcp_fwd_halo` program, which writes `y` of the first
+`min(3, len)` rows of every fragment with a history row again from the
+received pool with the `kcp_fwd` program's instructions, so `y` keeps the bits
+of the one-launch forward.  The second program runs only when the rank
+receives history rows.
+
+- Main program: on the architectures of `kcp.FWD_MAIN_ARCHS`, the single-rank
+  `fwd` route program (the program the single-rank forward runs for the call's
+  `C` and token count) on the rank's fragments, each a document of its own,
+  with its full co-resident grid and token-chunk counters; elsewhere the
+  `kcp_fwd` program.
+- Order: on the architectures of `kcp.FWD_OVERLAP_ARCHS`, with an exchange in
+  flight (more than one rank), the main program runs before the exchange's
+  wait and the `kcp_fwd_halo` program after it; a `kcp_fwd` main program then
+  runs with every `hist_row_off` entry `-1`.  Otherwise the forward runs after
+  the wait: the single-rank main program and the `kcp_fwd_halo` program, or,
+  with the `kcp_fwd` program as main, the one-launch forward (the `kcp_fwd`
+  program with the context's table, no second program).
+- Multi entry: its own sets, `kcp.MULTI_FWD_MAIN_ARCHS` and
+  `kcp.MULTI_FWD_OVERLAP_ARCHS`.  It overlaps its first tensor only; the other
+  tensors run after the wait.
+
+The sets come from measurements of each entry against the one-launch forward
+(their comment in `kcp.py`).  On every architecture the single call runs the
+single-rank main program after the wait; so does the multi entry on sm_100a
+and sm_103a, and on sm_107a the multi entry overlaps its first tensor.  The
+exchange, its wait and the collectives are the same in every form.
 
 ### Halo exchange
 
@@ -177,7 +209,7 @@ tensor with the same `cooperative`.  With one rank no collective is issued.
 recompute of a call issue no collective: the original forward exchanges and
 stores `hist` in the handle (key `"conv"`; `n_hist_rows x C x 2` bytes retained
 per tensor), and torch's recompute of that forward inside the backward binds it
-and launches the forward program on it, with no gather, no collective and no
+and launches the forward's programs on it, with no gather, no collective and no
 wait.  The backward still exchanges once.  One handle serves one call (single
 or multi) of one micro-step and is created outside the outermost checkpoint
 region; every rank passes a handle for the same call or none.  A handle is

@@ -554,7 +554,7 @@ kernel_cake_lm_head_loss_91c52039389b3bb39d02(const __grid_constant__ CUtensorMa
                 float dz_d = dlogp[d_off + rin_r];
                 float _fdiv_0 = __fdiv_rn(dz_d, tau_t);
                 dz_d = _fdiv_0;
-                int dz_skip = ((rin_lbl < 0) ? 1 : 0);
+                int dz_skip = ((rin_lbl < 0ll) ? 1 : 0);
                 int dz_col = (int)rin_lbl - ep_off_n;
                 #pragma unroll 1
                 for (int ep_kc = 0; ep_kc < 1; ep_kc++) {

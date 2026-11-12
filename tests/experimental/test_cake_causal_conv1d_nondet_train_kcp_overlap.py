@@ -36,7 +36,7 @@ from flashinfer.experimental.cake import cake_causal_conv1d_nondet_train as pkg
 from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
     kcp as conv_kcp,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 from tests.test_cake_causal_conv1d_det_train_kcp import (
     DW_ATOL,
     DW_RTOL,
@@ -68,21 +68,44 @@ def _stream_workspace() -> torch.Tensor | None:
     return pkg._BACKWARD_WORKSPACES.get(key)
 
 
+class _TwoRanks:
+    """A context that reports two ranks (so that the multi entry calls the exchange) and is otherwise ``ctx``."""
+
+    world_size = 2
+
+    def __init__(self, ctx) -> None:
+        self._ctx = ctx
+
+    def __getattr__(self, name):
+        return getattr(self._ctx, name)
+
+
 def _recorder(monkeypatch) -> list[str]:
-    """The roles of the programs the backward launches, in launch order, with ``"wait"`` where it waits for the
-    exchange (the exchange returns a clone of the rank's receive pool and a work object that records its wait)."""
+    """The roles of the programs the forward and the backward launch, in launch order, with ``"wait"`` where they wait
+    for the exchange (the exchange returns a clone of the rank's receive pool and a work object that records its
+    wait).  A record of the zero-history registry (the two-launch forward's single-rank main program) reports its own
+    role there (``"fwd"``)."""
 
     order: list[str] = []
     roles: dict[int, str] = {}
     launch_plan, launch_trim = conv_kcp._launch_plan, conv_kcp._launch_trim
+    zero_history_plan = conv_kcp._zero_history_plan
     launch_with_grid, run_module = conv_kcp._launch_with_grid, conv_kcp.run_module
     exchange = conv_kcp._exchange
 
     def role(name: str) -> str:
-        return conv_kcp._loader.MODULES[name]["role"]
+        record = conv_kcp._loader.MODULES.get(name)
+        if record is None:
+            record = conv_kcp._zero_history.MODULES[name]
+        return record["role"]
 
     def recording_plan(name, grid, device_index):
         info = launch_plan(name, grid, device_index)
+        roles[id(info)] = role(name)
+        return info
+
+    def recording_zero_history_plan(name, grid, device_index):
+        info = zero_history_plan(name, grid, device_index)
         roles[id(info)] = role(name)
         return info
 
@@ -103,11 +126,14 @@ def _recorder(monkeypatch) -> list[str]:
             order.append("wait")
 
     def recording_exchange(send, **kwargs):
-        recv, work = exchange(send, **kwargs)
+        ctx = kwargs["ctx"]
+        inner = ctx._ctx if isinstance(ctx, _TwoRanks) else ctx
+        recv, work = exchange(send, **{**kwargs, "ctx": inner})
         assert work is None, "one rank: the package's exchange returns no work"
         return recv.clone(), _Work()
 
     monkeypatch.setattr(conv_kcp, "_launch_plan", recording_plan)
+    monkeypatch.setattr(conv_kcp, "_zero_history_plan", recording_zero_history_plan)
     monkeypatch.setattr(conv_kcp, "_launch_trim", recording_trim)
     monkeypatch.setattr(conv_kcp, "_launch_with_grid", recording_with_grid)
     monkeypatch.setattr(conv_kcp, "run_module", recording_run)

@@ -43,7 +43,7 @@ on an architecture at a hidden size (:func:`route_module`).  On sm_100a and
 sm_103a every kernel moves 64-bit vectors (4 BF16 values) per thread and is
 built for one hidden size (the ``_h<hidden>`` libraries; the record's
 ``hidden``): the forward in 256-thread CTAs on sm_100a and 128-thread CTAs on
-sm_103a, the backward in 512-thread CTAs (on sm_100a 480 at hidden 4096 and
+sm_103a, the backward in 512-thread CTAs (on sm_100a 384 at hidden 4096 and
 256 at hidden 5120 and 7168) and the accumulating backward in 768-thread
 CTAs.  On sm_107a the hidden-4096 forward and writing backward move 256-bit
 vectors (16 values) in 128-thread CTAs, and the accumulating backward has L2
@@ -385,7 +385,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "head_bwd",
     },
-    "cake_mhc_train_head_bwd__lw64_t480_h4096": {
+    "cake_mhc_train_head_bwd__lw64_t384_h4096": {
         "arches": [
             "sm_100a",
         ],
@@ -399,18 +399,18 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "vectors", "threads": 480, "vector_elems": 4},
+        "grid_rule": {"kind": "vectors", "threads": 384, "vector_elems": 4},
         "hidden": 4096,
-        "kernel": "cake_mhc_train_head_bwd__lw64_t480_h4096",
-        "kernel_symbol": "kernel_cake_mhc_train_head_bwd__lw64_t480_h4096",
+        "kernel": "cake_mhc_train_head_bwd__lw64_t384_h4096",
+        "kernel_symbol": "kernel_cake_mhc_train_head_bwd__lw64_t384_h4096",
         "launch": {
-            "block": (480, 1, 1),
+            "block": (384, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_head_bwd__lw64_t480_h4096",
+        "library": "cake_mhc_train_head_bwd__lw64_t384_h4096",
         "logical": {
             "T": "rows",
             "dx": "dx",
@@ -810,7 +810,7 @@ ROUTES: dict[str, dict[str, dict[int, str]]] = {
             7168: "cake_mhc_train_head_fwd__lw64_t256_h7168",
         },
         "head_bwd": {
-            4096: "cake_mhc_train_head_bwd__lw64_t480_h4096",
+            4096: "cake_mhc_train_head_bwd__lw64_t384_h4096",
             5120: "cake_mhc_train_head_bwd__lw64_t256_h5120",
             7168: "cake_mhc_train_head_bwd__lw64_t256_h7168",
         },

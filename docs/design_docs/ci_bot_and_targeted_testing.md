@@ -138,6 +138,40 @@ The two model calls request evidence files, then a structured decision:
 must cite broad impact supported by source and CI evidence; uncertainty or missing
 evidence is not a reason to run everything.
 
+The 300,000-character JSON context cap applies to both requests after credential
+redaction. Evidence is budgeted before the first request: retain changed-file
+metadata first, prefer changed tests and nearby files in the inventory, and omit
+whole patches or whole source bodies when they cannot fit. Omission counts are
+included in `omitted_evidence`, and unread source paths in `unavailable_evidence`.
+CI routing bodies stay complete. Eager file reads reserve space for the model's
+second-stage file requests, including retries of omitted `configuration_files`
+that exist in the pinned tree. Per-path omission records have a separate bounded
+allowance; excess records increment a count without consuming source space.
+A full-suite decision is downgraded to maintainer review if the PR description
+or changed-file metadata was incomplete, or the files response count differs
+from the captured PR count. Matching counts alone do not prove snapshot identity.
+
+The Actions log records each request stage, serialized size, section sizes, and
+omission counts without logging source contents or credentials. The internal
+daemon uses the same budgeting module, deployed separately.
+
+For an offline reproduction, save the PR and paginated files API responses as
+JSON and ensure the base and head histories are already in a local checkout:
+
+```bash
+python scripts/pr_checks/replay_ai_scope.py \
+  --source-repo /path/to/flashinfer \
+  --pr-json /tmp/pr.json --files-json /tmp/files.json \
+  --base-sha <full-base-commit> \
+  --read-path tests/path/test_file.py
+```
+
+The replay runs the real selector with a fake model, reports both request sizes,
+and returns `needs_maintainer`; it does not assess coverage. No inference key or
+network access is used, and no PR code is imported. To replay the internal
+daemon, also pass `--internal-bot-root /path/to/ci-bot`,
+`--ci-repo /path/to/flashinfer-ci`, and `--ci-ref <CI-definition-commit>`.
+
 Focused or inconclusive results produce an advisory comment for developer review
 and an explicit run command. They publish no statuses and apply no labels, leaving
 any current CI run alone. Only `full_suite` starts an automatic run, with an empty

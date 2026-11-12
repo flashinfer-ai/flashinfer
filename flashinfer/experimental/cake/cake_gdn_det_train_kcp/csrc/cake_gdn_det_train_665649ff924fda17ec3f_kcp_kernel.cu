@@ -298,7 +298,7 @@ kernel_cake_gdn_det_train_665649ff924fda17ec3f_kcp(const __grid_constant__ CUten
             int dht_slot = dht_index[seg];
             if (dht_slot >= 0) {
                 int dht_tile = (head / dht_hg * dht_n + dht_slot) * dht_hg + head % dht_hg;
-                long long dht_base = (long long)dht_tile * (long long)tile_stride * 16384 + (long long)(k_row * 128);
+                long long dht_base = (long long)dht_tile * (long long)tile_stride * 16384ll + (long long)(k_row * 128);
                 #pragma unroll
                 for (int blk = 0; blk < 8; blk++) {
                     #pragma unroll
@@ -340,7 +340,7 @@ kernel_cake_gdn_det_train_665649ff924fda17ec3f_kcp(const __grid_constant__ CUten
             unsigned int dvi_c[32];
             if (nc > 0) {
                 int trow_s = row0 + (nc - 1) * 64 + t_row;
-                long long t_base_s = ((long long)trow_s * (long long)num_heads + (long long)head) * 128;
+                long long t_base_s = ((long long)trow_s * (long long)num_heads + (long long)head) * 128ll;
                 #pragma unroll
                 for (int blk_2 = 0; blk_2 < 4; blk_2++) {
                     {
@@ -358,7 +358,7 @@ kernel_cake_gdn_det_train_665649ff924fda17ec3f_kcp(const __grid_constant__ CUten
                 int gc = c0 + c;
                 float decay = gamma[(long long)gc * (long long)num_heads + (long long)head];
                 int trow = row0 + c * 64 + t_row;
-                long long t_base = ((long long)trow * (long long)num_heads + (long long)head) * 128;
+                long long t_base = ((long long)trow * (long long)num_heads + (long long)head) * 128ll;
                 #pragma unroll
                 for (int g = 0; g < 2; g++) {
                     float dh4[64];
@@ -459,7 +459,7 @@ kernel_cake_gdn_det_train_665649ff924fda17ec3f_kcp(const __grid_constant__ CUten
                 mbarrier_arrive(bdv_ready_addr);
                 int c_n = ((c > 0) ? c - 1 : 0);
                 int trow_n = row0 + c_n * 64 + t_row;
-                long long t_base_n = ((long long)trow_n * (long long)num_heads + (long long)head) * 128;
+                long long t_base_n = ((long long)trow_n * (long long)num_heads + (long long)head) * 128ll;
                 #pragma unroll
                 for (int blk_4 = 0; blk_4 < 4; blk_4++) {
                     {
@@ -474,7 +474,7 @@ kernel_cake_gdn_det_train_665649ff924fda17ec3f_kcp(const __grid_constant__ CUten
             int out_slot = out_index[seg];
             if (out_slot >= 0) {
                 int out_tile = (head / out_hg * out_n + out_slot) * out_hg + head % out_hg;
-                long long out_base = (long long)out_tile * (long long)tile_stride * 16384 + (long long)(k_row * 128);
+                long long out_base = (long long)out_tile * (long long)tile_stride * 16384ll + (long long)(k_row * 128);
                 #pragma unroll
                 for (int blk_5 = 0; blk_5 < 8; blk_5++) {
                     float _tmem_load_0[16];

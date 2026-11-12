@@ -11,9 +11,9 @@ def require_sources():
     source = Path(__file__).parent / "csrc"
     if not all((source / name).is_file() for name in ("binding.cu", "kernels.cuh")):
         raise RuntimeError(
-            "HC sum-state CUDA sources are absent. Install this FlashInfer revision "
-            "from source or a wheel built with "
-            "FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=0."
+            "HC sum-state CUDA sources are absent from this FlashInfer installation. "
+            "Install a wheel containing the HC JIT sources (nightlies: "
+            "https://flashinfer.ai/whl), or install FlashInfer from source."
         )
     return source
 

@@ -19,7 +19,7 @@ the packing oracle of its operand layouts, the validated shape set against
 ``build.json`` contract.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 ``flashinfer.prefill.prepare_nvfp4_ptilemax_attention`` public entry is covered
@@ -32,7 +32,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_nvfp4_ptilemax_attention")
 backend = cake_package("cake_nvfp4_ptilemax_attention", "cake_backend")

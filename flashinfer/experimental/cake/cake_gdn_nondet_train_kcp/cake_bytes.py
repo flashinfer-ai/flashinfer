@@ -64,7 +64,9 @@ with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
   ``gcum`` / ``rowscale`` / ``qscale`` ``[R, HV]`` (the host skips #1 and the walk
   entirely); ``save_mode="light_akk"`` (the in-kernel norm only) adds #1's
   ``Akk`` tape alone (``[R, HV, 64]`` BF16, ``128 R HV`` bytes: its light replay
-  runs #1 without the block inverse).  ``M_seg`` is retained with
+  runs #1 without the block inverse).  ``save_mode`` left unset (``None``) is the
+  call's default: ``"light_akk"`` with ``use_qk_l2norm_in_kernel=True``,
+  ``"light"`` without it.  ``M_seg`` is retained with
   ``save_transfer`` and with ``save_mode="full"`` (whose backward runs no transfer
   walk); the light ``save_transfer=False`` form re-runs the transfer walks
   (KDA semantics).  ``boundary_mode="replay"`` keeps no ``S_in`` /
@@ -135,7 +137,7 @@ from .cake_kcp_plan import (
 )
 from .cake_options import REUSE_RECOMPUTE_TAPES_DEFAULT
 from .cake_options import SAVE_MODES as _OPTION_SAVE_MODES
-from .cake_options import SAVE_MODES_AKK
+from .cake_options import SAVE_MODES_AKK, default_save_mode
 
 SAVE_MODES = _OPTION_SAVE_MODES
 # The save modes that keep #1's Akk tape for the solve-free light replay (mirror of cake_kcp.AKK_SAVE_MODES) and the
@@ -238,9 +240,13 @@ def _mode(value: str, allowed: tuple[str, ...], name: str) -> str:
     return value
 
 
-def _save_mode(save_mode: str, l2n: bool) -> str:
-    """``save_mode`` checked against :data:`SAVE_MODES`; a mode of :data:`AKK_SAVE_MODES` needs the in-kernel norm
-    (the ``ValueError`` of ``CakeGDNNondetKcpOptions.check``: the replay program is built in its in-kernel-norm form only)."""
+def _save_mode(save_mode: str | None, l2n: bool) -> str:
+    """``save_mode`` checked against :data:`SAVE_MODES` (``None``: the call's default, ``"light_akk"`` with the
+    in-kernel norm and ``"light"`` without it, as ``CakeGDNNondetKcpOptions`` resolves it); a mode of
+    :data:`AKK_SAVE_MODES` needs the in-kernel norm (the ``ValueError`` of ``CakeGDNNondetKcpOptions.check``: the
+    replay program is built in its in-kernel-norm form only)."""
+    if save_mode is None:
+        save_mode = default_save_mode(l2n)
     _mode(save_mode, SAVE_MODES, "save_mode")
     if save_mode in AKK_SAVE_MODES and not l2n:
         raise ValueError(
@@ -389,7 +395,7 @@ def cake_gdn_nondet_train_kcp_saved_layout(
     *,
     H_qk: int,
     HV: int,
-    save_mode: str = "light",
+    save_mode: str | None = None,
     boundary_mode: str = "saved",
     save_transfer: bool = SAVE_TRANSFER_DEFAULT,
     with_conv: bool = True,
@@ -398,6 +404,8 @@ def cake_gdn_nondet_train_kcp_saved_layout(
     use_qk_l2norm_in_kernel: bool = False,
 ) -> dict[str, int]:
     """The saved set of one layer on this rank, term by term in bytes (design table 4.1; module docstring).
+    ``save_mode`` left unset (``None``) is the call's default: ``"light_akk"`` with ``use_qk_l2norm_in_kernel=True``
+    (the ``akk`` term, ``128 R HV`` bytes), ``"light"`` without it.
     ``P`` overrides the plan's segment count (the call's ``segments`` option; the range the call accepts) for the
     ``M_seg`` term; ``use_qk_l2norm_in_kernel``: the ``qk_rstd`` term (``8 T_r H_qk``, saved boundary only).
     ``with_conv`` (default ``True``) adds ``hist``, the layer convolution's saved history rows: the module's
@@ -406,7 +414,7 @@ def cake_gdn_nondet_train_kcp_saved_layout(
     H_qk, HV = _check(H_qk, HV)
     l2n = _flag(use_qk_l2norm_in_kernel, "use_qk_l2norm_in_kernel")
     C = _channels(H_qk, HV, C)
-    _save_mode(save_mode, l2n)
+    save_mode = _save_mode(save_mode, l2n)
     _mode(boundary_mode, BOUNDARY_MODES, "boundary_mode")
     hp = ctx.heads(HV)
     P = _segments(ctx, hp.P, P)
@@ -459,7 +467,7 @@ def cake_gdn_nondet_train_kcp_saved_bytes(
     *,
     H_qk: int,
     HV: int,
-    save_mode: str = "light",
+    save_mode: str | None = None,
     boundary_mode: str = "saved",
     save_transfer: bool = SAVE_TRANSFER_DEFAULT,
     with_conv: bool = True,
@@ -503,7 +511,7 @@ def cake_gdn_nondet_train_kcp_workspace_layout(
     *,
     H_qk: int,
     HV: int,
-    save_mode: str = "light",
+    save_mode: str | None = None,
     boundary_mode: str = "saved",
     save_transfer: bool = SAVE_TRANSFER_DEFAULT,
     backward: bool = True,
@@ -635,12 +643,14 @@ def cake_gdn_nondet_train_kcp_workspace_layout(
       forward and the recompute) and binds the ``save_mode="light"`` figures of the same options (``Akk`` in the
       arena at #1, re-created by the replay form or held by the kept hand-off), so a checkpointed ``"light_akk"``
       layer is sized with ``save_mode="light"``.
+    * ``save_mode`` left unset (``None``): the call's default, ``"light_akk"`` with ``use_qk_l2norm_in_kernel=True``
+      and ``"light"`` without it.
     """
     H_qk, HV = _check(H_qk, HV)
     l2n = _flag(use_qk_l2norm_in_kernel, "use_qk_l2norm_in_kernel")
     with_set = _flag(save_for_backward, "save_for_backward")
     C = _channels(H_qk, HV, C)
-    _save_mode(save_mode, l2n)
+    save_mode = _save_mode(save_mode, l2n)
     _mode(boundary_mode, BOUNDARY_MODES, "boundary_mode")
     _mode(group_reduce, GROUP_REDUCE, "group_reduce")
     _mode(graph, GRAPH_MODES, "graph")
@@ -941,7 +951,7 @@ def cake_gdn_nondet_train_kcp_workspace_bytes(
     *,
     H_qk: int,
     HV: int,
-    save_mode: str = "light",
+    save_mode: str | None = None,
     boundary_mode: str = "saved",
     save_transfer: bool = SAVE_TRANSFER_DEFAULT,
     backward: bool = True,
@@ -957,9 +967,11 @@ def cake_gdn_nondet_train_kcp_workspace_bytes(
 ) -> int:
     """Caller-held workspace bytes of one rank (the ``workspace`` entry of :func:`cake_gdn_nondet_train_kcp_workspace_layout`): the
     most the workspace binds in the forward or the backward of these options (the calls that query covers).
-    ``save_mode="light_akk"`` gives the figure of a call outside a checkpoint; under
+    ``save_mode`` left unset (``None``) is the call's default (``"light_akk"`` with ``use_qk_l2norm_in_kernel=True``,
+    ``"light"`` without it).  ``save_mode="light_akk"`` gives the figure of a call outside a checkpoint; under
     ``torch.utils.checkpoint(use_reentrant=False)`` the call runs as ``"light"`` and binds the ``save_mode="light"``
-    figure, so a checkpointed ``"light_akk"`` layer is sized with ``save_mode="light"``."""
+    figure, so a checkpointed ``"light_akk"`` layer (the default with the norm included) is sized with
+    ``save_mode="light"``."""
     return cake_gdn_nondet_train_kcp_workspace_layout(
         ctx,
         H_qk=H_qk,

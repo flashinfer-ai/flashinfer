@@ -141,9 +141,10 @@ def cake_dsa_indexer_det_train_topk(
         with other calls and kernels between runs: on the ticket architectures
         the backend then zeroes the buffer's ticket word before every run,
         while its own workspace is zeroed once at prepare.
-    indices, scores : Optional[torch.Tensor]
-        Caller-owned ``[T, top_k]`` int32 / float32 outputs; allocated when
-        omitted.
+    indices : Optional[torch.Tensor]
+        Caller-owned ``[T, top_k]`` int32 output; allocated when omitted.
+    scores : Optional[torch.Tensor]
+        Caller-owned ``[T, top_k]`` float32 output; allocated when omitted.
     return_scores : bool
         ``False``: indices only; ``scores`` must be omitted and ``None`` is
         returned in its place (the scores are still computed internally).

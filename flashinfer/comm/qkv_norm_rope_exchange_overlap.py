@@ -313,8 +313,12 @@ class QkvNormRopeExchangeOverlap:
     8 ranks run the ``bulk_ow256_fma`` build -- wide operand loads, bulk row stores and the fused multiply-add
     epilogue --, SM100 groups of 4 ranks and SM103 groups of 8 or 4 ranks the ``ow256_fma`` build -- wide operand
     loads and the fused multiply-add epilogue --, SM100 and SM103 groups of 2 ranks the ``fma`` build -- the fused
-    multiply-add epilogue --, SM107 groups of 4 ranks the ``bulk`` build -- bulk row stores --, the other groups and
-    SM90 the baseline build).  The builds without the fused multiply-add epilogue store identical bits; an ``fma``
+    multiply-add epilogue --, SM107 groups of 4 ranks the ``bulk`` build -- bulk row stores --, SM90 the ``sw3``
+    build -- the epilogue stages each head in shared memory for three storer warps --, the other groups the baseline
+    build).  Under this default, SM90 groups of 8 ranks run the baseline build on rows with ``hidden >= 6144`` and
+    ``batch * s_local >= 8192`` (``cake_qkv_exchange_plan.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD``); a build named by
+    the environment variable below runs on every row.  The builds without the fused multiply-add epilogue store
+    identical bits; an ``fma``
     build rounds the norm and RoPE multiply-adds once, so its stored bits can differ from theirs within the kernel's
     accuracy tolerance.  Every build requires ``cos_sin`` and norm-weight tensors that start at 16-byte-aligned
     addresses, the wide-load builds at 32-byte-aligned ones (a misaligned view raises; for the 32-byte bases the
@@ -331,8 +335,10 @@ class QkvNormRopeExchangeOverlap:
 
     The Cake backend also applies per-architecture row-count gates to each call's host plan
     (``cake_qkv_exchange_plan.SHAPE_GATE_DEFAULT_BY_ARCH``; SM100 / SM103: a call with ``batch * s_local <= 4096``
-    rows publishes one readiness word per destination, a call with ``>= 16384`` rows launches the producer once per
-    destination run; SM90: a call with ``<= 4096`` rows publishes one readiness word per destination and a call
+    rows publishes one readiness word per destination, and the per-destination producer launch threshold follows
+    ``cake_qkv_exchange_plan.SHAPE_GATE_K_TABLE`` by world size and hidden size (8192, 16384 or 32768 rows);
+    ``per_dest_k_table=0`` restores 16384 and an explicit ``per_dest_large_m`` overrides the table.
+    SM90: a call with ``<= 4096`` rows publishes one readiness word per destination and a call
     with ``>= 16384`` rows runs the persistent producer grid over every SM -- ``reserved_sms_large_m = 16384``, no
     reserved SMs --, the per-destination launch gate off; SM107: no per-architecture gate).  Three (architecture,
     world size) cells differ from these tables (``cake_qkv_exchange_plan.SHAPE_GATE_DEFAULT_BY_ARCH_WORLD``): a group
@@ -352,7 +358,7 @@ class QkvNormRopeExchangeOverlap:
     (``cake_qkv_exchange_plan.SHAPE_GATE_K_TABLE``; ``per_dest_k_table=0`` in the same variable restores the one-band
     threshold, an explicit ``per_dest_large_m`` replaces the table).  SM103 and SM100 groups of 8 ranks run a call whose
     destination band is not a multiple of 256 columns while every Q / K / V group is (e.g. hidden 3072) with the
-    256-column pair tile across band edges from 4096 rows per rank on, as one persistent launch
+    256-column pair tile across band edges from 2048 rows per rank on, as one persistent launch
     (``cake_qkv_exchange_plan.XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD``; ``xband_min_m=N`` in the same variable sets the
     threshold, ``xband_min_m=0`` switches it off).  Neither changes the stored bits.
     ``describe()`` reports the resolved build (``producer_variant``), scale

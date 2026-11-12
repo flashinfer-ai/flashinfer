@@ -931,7 +931,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "fp8_lowhead_prefill",
         "arches": ["sm_107a"],
         "identity": {
-            "sm_107a": "1d8b01c91f7a6f9a037cae845dea4e9fd06dce03169b69bcaca61e2bdae6cae1",
+            "sm_107a": "af63049e241f0893c206390c9119f3be022bf32513fb73a58f1f6a221a8e1ba2",
         },
     },
     "cake_dsv4_27a5d41ecb0fd5ecec7b": {
@@ -1245,7 +1245,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "fp8_lowhead_prefill",
         "arches": ["sm_107a"],
         "identity": {
-            "sm_107a": "6bd9ce7f949a9bc4cc3317c21a21c68b78d0eff016a2d39a40703430eec29e58",
+            "sm_107a": "e524e06c9e670a135bc145055678ae3274c88f3f94f4e2695c12069b101a52db",
         },
     },
     "cake_dsv4_88757d413062636b5640": {
@@ -1355,7 +1355,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "fp8_lowhead_prefill",
         "arches": ["sm_107a"],
         "identity": {
-            "sm_107a": "a8d5ba04be6a4871b6810cb5d6725b25d438915aac666a9dc93dd692dfb9c936",
+            "sm_107a": "be235b6174a4e79388b4ab2221712ff4ed8006954ab3fa6fa366e3574e100ece",
         },
     },
     "cake_dsv4_cbf3168c696847fd3f69": {

@@ -2673,10 +2673,10 @@ def test_one_token_per_sequence_accepts_2d_dt_bias(num_seqs):
 
 @pytest.mark.parametrize("num_seqs", [0, 4, 64])
 @pytest.mark.parametrize("D", [64, 128])
-def test_one_token_per_sequence_rejects_fp32_state(num_seqs, D):
+def test_one_token_per_sequence_rejects_unsupported_state_dtype(num_seqs, D):
     H = 8
-    inputs = _one_token_per_sequence_inputs(num_seqs, H, D, torch.float32)
+    inputs = _one_token_per_sequence_inputs(num_seqs, H, D, torch.float16)
     output = torch.full_like(inputs[2], 7.0)
-    with pytest.raises(TypeError, match="bfloat16 state"):
+    with pytest.raises(TypeError, match="bfloat16 or float32 state"):
         _run_one_token_per_sequence(inputs, inputs[6], inputs[7], output=output)
     assert torch.all(output == 7.0)

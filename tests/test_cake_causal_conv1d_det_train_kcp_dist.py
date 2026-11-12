@@ -34,11 +34,14 @@ fragment that reads its history from three predecessor ranks).  Per row and rank
   rows the rank sends, among them the backward's ``dpre`` head rows, the halo adjoints, and the pools it receives);
   ``y`` / ``hist`` / ``dx`` / halo rows are the same in the two forms, and the autograd entry's default is the
   explicit call of ``COOPERATIVE_DEFAULT``;
+- the two-launch forward (knobs ``fwd_main`` x ``fwd_overlap``, the same on every rank): ``LAST_CALL["fwd"]`` names
+  the form the rank ran (the overlapped form on a rank with tokens, the history-row program when the rank receives
+  history rows) and ``y`` / ``hist`` are bitwise the one-launch forward's;
 - against the global FP64 oracle of the whole pack and the shipped zero-history backward of the whole pack (no CP),
   at the single-GPU suite's tolerances: ``y`` / ``dx`` within one BF16 ulp of FP64, ``dx`` within the no-CP clause,
   and the ranks' ``dweight`` partials summed in rank order within the ``dweight`` budget of the FP64 ``dweight``;
 - a steady explicit forward + backward of each form issues no host-to-device copy, no synchronizing operation and
-  no device allocation (``tests/test_helpers/cake_host_sync.py``), bitwise the first call;
+  no device allocation (``tests/experimental/test_helpers/cake_host_sync.py``), bitwise the first call;
 - per-document zigzag rows: the longest document is a chain of ``2 W`` fragments over every rank.
 
 ``ROWS`` are W = 2 / 4 / 8; ``ROWS_SCALE`` are per-document zigzag at W = 16 / 32 / 64 (FlashInfer issue #7815: at
@@ -473,6 +476,41 @@ def _run_rank(
         direct, forms[conv_kcp.COOPERATIVE_DEFAULT]
     )
 
+    # The two-launch forward: every (fwd_main, fwd_overlap) form, the same on every rank, records its form in
+    # LAST_CALL["fwd"] (the overlapped form with the exchange in flight on a rank with tokens; the history-row program
+    # when the rank receives history rows and the form has two launches) and gives y / hist bitwise the one-launch
+    # forward's.
+    fwd_bitwise, fwd_recorded = True, True
+    for fwd_main in (0, 1):
+        for fwd_overlap in (0, 1):
+            conv_kcp._set_test_knobs({"fwd_main": fwd_main, "fwd_overlap": fwd_overlap})
+            try:
+                for _ in range(2):
+                    y_f, hist_f = conv_kcp.cake_causal_conv1d_det_train_kcp_forward(
+                        x, w, ctx
+                    )
+                    torch.cuda.synchronize(device)
+                    want = (
+                        {
+                            "main": "sr" if fwd_main else "f",
+                            "form": "pair" if fwd_overlap else "wait",
+                            "repair": bool(fwd_main or fwd_overlap) and n_hist > 0,
+                        }
+                        if x.shape[0]
+                        else {"main": None, "form": "wait", "repair": False}
+                    )
+                    fwd_recorded = fwd_recorded and conv_kcp.LAST_CALL["fwd"] == want
+                    fwd_bitwise = (
+                        fwd_bitwise
+                        and same(y_f, forms[True]["y"])
+                        and same(hist_f, forms[True]["hist"])
+                    )
+            finally:
+                conv_kcp._set_test_knobs(None)
+                conv_kcp.cake_causal_conv1d_det_train_kcp_host_cache_clear()
+    flags["fwd_forms_bitwise"] = fwd_bitwise
+    flags["fwd_forms_recorded"] = fwd_recorded
+
     # Against the global FP64 oracle of the whole pack (the KCP SiLU' policy; the rank's tokens gathered from it) and
     # the shipped zero-history backward of the whole pack (no CP), at the single-GPU suite's tolerances.  The ranks'
     # dweight partials are all-gathered and added in rank order (the same order on every rank).
@@ -519,7 +557,7 @@ def _run_rank(
     # Steady state: an explicit forward + backward of each form after the calls above issues no host-to-device copy,
     # no synchronizing operation (the probe queued before it still runs when the host returns) and no device
     # allocation or free; bitwise the first calls.
-    from tests.test_helpers.cake_host_sync import (
+    from tests.experimental.test_helpers.cake_host_sync import (
         allocator_counts,
         census,
         nonblocking,

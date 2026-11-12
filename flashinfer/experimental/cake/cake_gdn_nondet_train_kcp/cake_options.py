@@ -29,8 +29,10 @@ Public fields (defaults are the shipped behaviour)::
                                             forward tape ("full"); "light_akk" (use_qk_l2norm_in_kernel=True only) is
                                             "light" plus the BF16 Akk tape of #1 (R * HV * 128 bytes), so the light
                                             replay runs #1 without its block inverse (fwd_prep_replay_l2n, every other
-                                            output bit for bit #1's); every value but "light" is opt-in only, and under
-                                            torch.utils.checkpoint(use_reentrant=False) "light_akk" saves as "light"
+                                            output bit for bit #1's); under torch.utils.checkpoint(use_reentrant=False)
+                                            "light_akk" saves as "light".  None (the default) = "light_akk" with
+                                            use_qk_l2norm_in_kernel=True, "light" without it (resolved in
+                                            __post_init__); "full" is opt-in only
     boundary_mode   "saved" | "replay"      keep the saved set, or keep nothing and re-run the whole module forward
                                             (summaries, exchange, merge) inside the backward (checkpoint replay)
     precision_mode  0 | 1 | 2               transfer-walk build record (template numbering): 0 = shipped TF32 hi/lo (2-MMA,
@@ -114,7 +116,11 @@ EXCHANGE_DEFAULT = "a2a"
 RING_MAX_HOPS = 2  # exchange="ring" needs every document chain within this many hops (n_d_max - 1 <= 2)
 SAVE_TRANSFER_DEFAULT = True
 SAVE_MODES = ("light", "light_akk", "full")
-SAVE_MODE_DEFAULT = "light"  # every other value is opt-in only
+# the save mode of a call that leaves save_mode unset (None, resolved in CakeGDNNondetKcpOptions.__post_init__ by
+# default_save_mode): SAVE_MODE_DEFAULT_L2N with use_qk_l2norm_in_kernel=True, SAVE_MODE_DEFAULT without the norm
+# ("light_akk" needs it); "full" is opt-in only
+SAVE_MODE_DEFAULT = "light"
+SAVE_MODE_DEFAULT_L2N = "light_akk"
 # the save modes that also keep #1's BF16 Akk tape for the light replay (use_qk_l2norm_in_kernel=True only: the replay
 # program is built in its in-kernel-norm form only)
 SAVE_MODES_AKK = ("light_akk",)
@@ -208,6 +214,14 @@ TEST_KNOB_DEFAULTS: dict[str, Any] = {
 }
 
 
+def default_save_mode(use_qk_l2norm_in_kernel: Any) -> str:
+    """The save mode of a call that leaves ``save_mode`` unset: :data:`SAVE_MODE_DEFAULT_L2N` (``"light_akk"``) with
+    the in-kernel norm (``use_qk_l2norm_in_kernel is True``), :data:`SAVE_MODE_DEFAULT` (``"light"``) otherwise."""
+    return (
+        SAVE_MODE_DEFAULT_L2N if use_qk_l2norm_in_kernel is True else SAVE_MODE_DEFAULT
+    )
+
+
 def validate_heads(H_qk: int, HV: int) -> int:
     """``r = HV / H_qk`` of a legal head pair (``HV % H_qk == 0``, both >= 1); ``ValueError`` otherwise."""
     H_qk, HV = int(H_qk), int(HV)
@@ -244,7 +258,9 @@ class CakeGDNNondetKcpOptions:
 
     exchange: str = EXCHANGE_DEFAULT
     save_transfer: bool = SAVE_TRANSFER_DEFAULT
-    save_mode: str = SAVE_MODE_DEFAULT
+    # None = the shipped default, resolved in __post_init__ (default_save_mode: "light_akk" with the in-kernel norm,
+    # "light" without it)
+    save_mode: str | None = None
     boundary_mode: str = BOUNDARY_MODE_DEFAULT
     precision_mode: int = PRECISION_MODE_DEFAULT
     transfer_walk: str = TRANSFER_WALK_DEFAULT
@@ -261,6 +277,10 @@ class CakeGDNNondetKcpOptions:
     test_knobs: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        # whether save_mode was left unset (make_options re-resolves it when it merges other fields into an instance)
+        self._save_mode_unset = self.save_mode is None
+        if self.save_mode is None:
+            self.save_mode = default_save_mode(self.use_qk_l2norm_in_kernel)
         if self.reuse_recompute_tapes is None:
             # the shipped default: the kept-tape backward; under CUDA-graph replay the kept tapes are the arena's own
             # (a captured graph bakes their addresses), guarded by the workspace's call count (cake_kcp._kept_stale)
@@ -412,6 +432,9 @@ def make_options(options: Any = None, /, **kwargs: Any) -> CakeGDNNondetKcpOptio
     ``TypeError``: no option is ever read from anywhere but the call)."""
     if isinstance(options, CakeGDNNondetKcpOptions):
         if kwargs:
+            if options._save_mode_unset and "save_mode" not in kwargs:
+                # an instance that left save_mode unset keeps it unset: the merged fields resolve it
+                kwargs = {**kwargs, "save_mode": None}
             options = dataclasses.replace(options, **kwargs)
         return options.check()
     merged: dict[str, Any] = {}
@@ -459,6 +482,7 @@ __all__ = [
     "SAVE_MODES",
     "SAVE_MODES_AKK",
     "SAVE_MODE_DEFAULT",
+    "SAVE_MODE_DEFAULT_L2N",
     "SAVE_TRANSFER_DEFAULT",
     "SCHEDULES",
     "SCHEDULE_DEFAULT",
@@ -469,6 +493,7 @@ __all__ = [
     "TRANSFER_WALK_DEFAULT",
     "USE_QK_L2NORM_DEFAULT",
     "CakeGDNNondetKcpOptions",
+    "default_save_mode",
     "make_options",
     "validate_heads",
     "validate_ring",

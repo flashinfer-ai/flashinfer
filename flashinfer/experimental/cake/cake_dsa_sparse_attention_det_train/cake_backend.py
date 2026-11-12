@@ -78,7 +78,12 @@ limitations under the License.
 #   parts separately) -- and the row's pair count ``N``.  While ``T * topk <
 #   2 ** 26`` one reduction per pair packs the count with a 12-bit term (a pair
 #   with a small term adds its full-resolution term to the count word instead),
-#   and :data:`PACK_WORD` tells ``bwd_grid`` how to read the words.
+#   and :data:`PACK_WORD` tells ``bwd_grid`` how to read the words.  A backward
+#   of ``2 ** 26 <= T * topk < 2 ** 27`` runs the pack27 builds instead (a
+#   27-bit count with 10-bit terms, :func:`_pack27_order`), chosen from the
+#   shapes.  On sm_100a and sm_103a the NoPE program's row bound runs its
+#   pipelined build (two 128-slot blocks in flight, the same words,
+#   :func:`_nope_pipe_order`), chosen from the device's architecture.
 # * ``bwd_grid``: per destination row the grid exponents ``e = ceil(log2 B_row)
 #   - 30 - L`` (``L`` = :data:`GRID_SHIFT`), latent and rope, and the counter
 #   skip threshold ``2 ** t`` with ``t = 30 - ceil(log2 N)`` (packed into the
@@ -473,6 +478,38 @@ def generated_program_available(
     if backward:
         needed += cake_jit.BACKWARD_STAGES_OF[program]
     return all(stage in stages for stage in needed)
+
+
+def _pack27_order(order: tuple, program: str, num_queries: int, topk: int) -> tuple:
+    """``order`` with the pack27 builds of the row bound and its grid (``cake_jit.PACK27_STAGES``) in place of the
+    pack builds when the backward has ``2 ** 26 <= num_queries * topk < 2 ** 27`` pair slots (where the pack builds
+    fall back to three reductions per pair) and ``program``'s record registers them: the shapes alone choose, so a
+    binding stays capturable and the bits stay those of its shapes."""
+    if not (1 << 26) <= int(num_queries) * int(topk) < (1 << 27):
+        return order
+    swap = {
+        cake_jit.stage_name(stage, program): cake_jit.stage_name(pack27, program)
+        for stage, pack27 in cake_jit.PACK27_STAGES.items()
+    }
+    if not all(stage in cake_jit.registered_stages(program) for stage in swap.values()):
+        return order
+    return tuple(swap.get(key, key) if isinstance(key, str) else key for key in order)
+
+
+def _nope_pipe_order(order: tuple, program: str, arch: Optional[str]) -> tuple:
+    """``order`` with the pipelined NoPE row-bound builds (``cake_jit.NOPE_PIPE_STAGES``) in place of the row bound
+    they replace on the architectures that run them (``cake_jit.NOPE_PIPE_ARCHES``), each where ``program``'s record
+    registers it for ``arch``: the device's architecture alone chooses, and the words are the replaced stage's bit for
+    bit."""
+    if program != cake_jit.NOPE_PROGRAM or arch not in cake_jit.NOPE_PIPE_ARCHES:
+        return order
+    registered = cake_jit.registered_stages(program)
+    swap = {
+        stage: pipe
+        for stage, pipe in cake_jit.NOPE_PIPE_STAGES.items()
+        if pipe in registered and arch in cake_jit.stage_arches(pipe, program)
+    }
+    return tuple(swap.get(key, key) if isinstance(key, str) else key for key in order)
 
 
 def _program_stages(names: tuple[str, ...], program: str) -> tuple[str, ...]:
@@ -873,8 +910,9 @@ def _layout_of(sizes: list[tuple[str, int]]) -> dict:
 
 # u64 words between the row-bound words of one accumulator row (latent, rope and the pair count; NoPE latent and the
 # pair count; a packed launch keeps the count in the latent word and the small terms in the count word): words in
-# different 128-byte lines spread the row-bound stage's reductions over more of L2.
-BOUND_PART_STRIDE = {cake_jit.PROGRAM: 96, cake_jit.NOPE_PROGRAM: 128}
+# different 128-byte lines spread the row-bound stage's reductions over more of L2.  The RoPE program packs them 4
+# words apart (a shorter whole backward on the packed trainer rows); the NoPE program keeps 128 (no measured effect).
+BOUND_PART_STRIDE = {cake_jit.PROGRAM: 4, cake_jit.NOPE_PROGRAM: 128}
 
 
 def accumulator_columns(program: str = cake_jit.PROGRAM) -> int:
@@ -1547,7 +1585,41 @@ PERSISTENT_GRIDS: dict[str, Callable[[int, int, int], int]] = {
     "bwd_redo": lambda num_queries, num_kv, sm_count: redo_launch_grid(
         num_queries, sm_count
     ),
+    # the listed fold (accumulate mode): one CTA per SM walks the redo list (any grid gives the same bits)
+    "bwd_fold_list": lambda num_queries, num_kv, sm_count: max(1, int(sm_count)),
 }
+
+
+def accumulate_stages(stages, program: str, accumulate: bool) -> list:
+    """``stages`` with the accumulate-mode builds in place of the redo preparation and the fold when the backward
+    adds into the caller's ``dkv_acc`` and ``program`` registers them (``cake_jit.ACCUMULATE_STAGES_OF``)."""
+    alt = cake_jit.ACCUMULATE_STAGES_OF[program]
+    record = cake_jit.record(program)
+    if not accumulate or not all(stage in record for stage in alt.values()):
+        return list(stages)
+    return [
+        alt.get(stage, stage) if isinstance(stage, str) else stage for stage in stages
+    ]
+
+
+# Per-architecture grids of the stages whose CTA covers a per-architecture count of rows: the row grids
+# (``ROWS[arch]`` destination rows per CTA, the pack27 build too) and the key norms (``UNITS[arch]`` units per CTA)
+# of the sm_107a builds.  sm_100a and sm_103a build the warp-per-row row grid and the shipped two-unit key norm and
+# keep the generated rules (``ceil(num_dst / 8)``, ``ceil(max(num_kv, num_queries, num_dst) / 16)``), as does every
+# other (stage, arch).
+_ROWS_PER_CTA = {"sm_107a": 64}
+_UNITS_PER_CTA = {"sm_107a": 32}
+
+
+def _arch_grid(stage: str, arch: str, scalars: dict) -> Optional[tuple[int, int, int]]:
+    base = stage.removeprefix("nope_")
+    num_dst = scalars.get("num_dst", scalars["num_kv"])
+    if base in ("bwd_grid", "bwd_grid_pack27") and arch in _ROWS_PER_CTA:
+        return (max(1, -(-int(num_dst) // _ROWS_PER_CTA[arch])), 1, 1)
+    if base == "bwd_norm" and arch in _UNITS_PER_CTA:
+        units = max(int(scalars["num_kv"]), int(scalars["num_queries"]), int(num_dst))
+        return (max(1, -(-units // _UNITS_PER_CTA[arch])), 1, 1)
+    return None
 
 
 def _stage_entry(
@@ -1560,6 +1632,8 @@ def _stage_entry(
     """Resolve ``stage`` of ``program`` for ``arch``: the generated launcher, its grid (the generated rule over the
     plan's ``num_queries``, ``num_kv``, ``topk`` and ``num_dst`` -- the destination rows of the dK/dV accumulator --
     unless ``grid`` replaces it) and the entry of the loaded module."""
+    if grid is None:
+        grid = _arch_grid(stage, arch, scalars)
     if grid is None:
         grid = cake_launch.GRID[stage](
             scalars["num_queries"],
@@ -1746,6 +1820,31 @@ def _num_dst(
     if dkv_acc is not None and dkv_dst_map is not None:
         return int(dkv_acc.shape[0])
     return int(num_kv)
+
+
+#: The (plan, architecture) pairs whose main launches walk the tokens in descending order (``token_base = T - 1``,
+#: ``token_step = -1``) when the backward runs a single key pass: those where no measured row of the plan is slower
+#: with it.  Every other pair and every multi-pass backward keep ascending order.
+#: The order changes no bits: every sum is an integer sum.
+DESCENDING_TOKEN_PLANS = frozenset(
+    {
+        ("rope", "sm_103a"),
+        ("rope", "sm_107a"),
+        ("nope", "sm_103a"),
+        ("nope", "sm_107a"),
+    }
+)
+
+
+def token_order(
+    num_queries: int, arch: str, single_pass: bool, plan: str
+) -> dict[str, int]:
+    """``token_base`` / ``token_step`` of the main launches of ``plan`` (``"rope"`` or ``"nope"``; ``token =
+    token_base + token_step * (blockIdx.x + k * gridDim.x)``): descending for a single key pass where
+    :data:`DESCENDING_TOKEN_PLANS` names (plan, arch), ascending otherwise."""
+    if single_pass and (plan, arch) in DESCENDING_TOKEN_PLANS:
+        return dict(token_base=int(num_queries) - 1, token_step=-1)
+    return dict(token_base=0, token_step=1)
 
 
 def _plan(
@@ -1942,8 +2041,7 @@ def _plan(
         sm_scale=scale,
         scale_log2=scale * LOG2E,
         derive_length=int(derive_length),
-        token_base=0,  # one CTA per token, token = blockIdx.x
-        token_step=1,
+        **token_order(T, arch, passes == 1, "rope"),  # the main launches' token order
     )
     if backward:
         # main / redo of one launch: dq_mode 0, the dQ partial unread (a placeholder of its dtype at bind time);
@@ -1972,7 +2070,9 @@ def _plan(
     if backward:
         # every registered backward stage, in the record's order, on every call; a multi-pass backward runs the
         # compaction and the pass build of the main stage per key range in place of bwd_main
-        stage_list: list = list(cake_jit.BACKWARD_STAGES)
+        stage_list: list = accumulate_stages(
+            cake_jit.BACKWARD_STAGES, cake_jit.PROGRAM, fold_mode == FOLD_ACCUMULATE
+        )
         if passes > 1:
             pass_overrides = tuple(
                 dict(pass_lo=lo, pass_hi=hi, dq_mode=key_pass_dq_mode(index, passes))
@@ -1984,7 +2084,7 @@ def _plan(
                 for index in range(passes)
                 for stage in cake_jit.KEY_PASS_STAGES
             ]
-        backward_order = tuple(stage_list)
+        backward_order = _pack27_order(tuple(stage_list), cake_jit.PROGRAM, T, topk)
         sm_count = _sm_count(_device_index(device))
         for key in backward_order:
             stage = key[0] if isinstance(key, tuple) else key
@@ -3471,7 +3571,9 @@ def cake_dsa_sparse_attention_det_varlen(
     index rows as is (the behaviour of the first release).  A caller
     ``topk_length`` is a position cut applied before compaction (slots at
     positions ``>= topk_length[t]`` are invalid regardless of content); the
-    kernels then read the compacted rows and their counts.  ``max_seqlen_q/k``
+    kernels then read the compacted rows and their counts.  On the stage route
+    a cut that is not a contiguous int32 ``[T]`` tensor on the rows' device
+    raises ``ValueError`` before either launch.  ``max_seqlen_q/k``
     are accepted for signature parity and not used on the host.  ``dkv_acc`` /
     ``dkv_dst_map`` / ``key_passes`` / ``dkv_direct`` (default ``None``) /
     ``check_dst_map`` (default ``False``) as in
@@ -3485,6 +3587,8 @@ def cake_dsa_sparse_attention_det_varlen(
         )
         == "index_prep"
     ):
+        # the stage reads T lengths through the pointer: a caller cut is checked before anything is allocated
+        _check_length_cut(topk_length, gather_kv_indices)
         arch = _nope_arch(gather_kv_indices)
         topk = int(gather_kv_indices.shape[1])
         device = gather_kv_indices.device
@@ -3590,6 +3694,7 @@ NOPE_PERSISTENT_GRIDS: dict[str, Callable[[int, int, int], int]] = {
     "nope_bwd_redo": lambda num_queries, num_kv, sm_count: redo_launch_grid(
         num_queries, sm_count
     ),
+    "nope_bwd_fold_list": lambda num_queries, num_kv, sm_count: max(1, int(sm_count)),
 }
 
 
@@ -3779,8 +3884,7 @@ def _plan_nope(
         search_iters=1,
         causal=0,
         convert=0,
-        token_base=0,  # token = token_base + token_step * (blockIdx.x + k * gridDim.x): the persistent loop
-        token_step=1,
+        **token_order(T, arch, True, "nope"),  # the persistent loop (one key pass)
         # the single key pass of the main stage (the pass operands are never read)
         pass_lo=0,
         pass_hi=S,
@@ -3806,7 +3910,12 @@ def _plan_nope(
     entries: dict[str, _StageEntry] = {fwd: _stage_entry(fwd, arch, scalars, program)}
     backward_order: tuple[str, ...] = ()
     if backward:
-        backward_order = cake_jit.NOPE_BACKWARD_STAGES
+        accumulated = accumulate_stages(
+            cake_jit.NOPE_BACKWARD_STAGES, program, fold_mode == FOLD_ACCUMULATE
+        )
+        backward_order = _nope_pipe_order(
+            _pack27_order(tuple(accumulated), program, T, topk), program, arch
+        )
         sm_count = _sm_count(_device_index(device))
         for stage in backward_order:
             rule = NOPE_PERSISTENT_GRIDS.get(stage)
@@ -4603,16 +4712,18 @@ class CakeDSASparseAttentionDetNopeFunction(torch.autograd.Function):
 
 
 class _NopeBackwardPrep:
-    """What the NoPE autograd wrappers settle at forward time for their backward, so that the backward's host work
-    before its first launch is the completion of the binding key with ``dout``'s geometry, the cache lookup, the
-    per-call allocations and the binding of the launch values: the options, the geometry key without ``dout`` and
-    without the accumulator, the presence flag of the lengths and the replay recipe of a consumed ``o_lo``.  It
-    holds no produced tensor: the saved outputs, the index rows, ``o_lo`` and the lengths go through
-    ``ctx.save_for_backward`` in one fixed order (seven tensors), so that under activation checkpointing nothing of
-    size outlives the forward.  The caller-owned accumulator stays here -- a tensor ``dkv_acc`` (validated here,
-    :func:`_check_dkv_acc`; ``check_dst_map`` synchronizes here) with its pointer operand and ``dkv_dst_map`` in
-    ``operands`` -- or as the zero-argument callable a deferred accumulator comes from, resolved and validated in
-    the backward (:data:`DkvAccSource`).
+    """What the NoPE autograd wrappers settle at forward time for their backward: the options, the presence flag of
+    the lengths and the replay recipe of a consumed ``o_lo``.  The backward keys its binding by the tensors it
+    receives (:func:`backward_binding_key_nope` over the saved tensors, ``dout`` and the accumulator), not by the
+    forward's: the plan bakes the strides and start offset of the index rows, ``q_latent`` and ``kv_latent``, and a
+    saved-tensor hook (``torch.autograd.graph.save_on_cpu``, an activation offloader) may hand them back in another
+    layout -- a column slice or an offset view comes back contiguous at offset 0 -- so an eager and an offloaded
+    step of one geometry each plan and run over their own layout.  It holds no produced tensor: the saved outputs,
+    the index rows, ``o_lo`` and the lengths go through ``ctx.save_for_backward`` in one fixed order (seven
+    tensors), so that under activation checkpointing nothing of size outlives the forward.  The caller-owned
+    accumulator stays here -- a tensor ``dkv_acc`` (validated here, :func:`_check_dkv_acc`; ``check_dst_map``
+    synchronizes here) with its pointer operand and ``dkv_dst_map`` in ``operands`` -- or as the zero-argument
+    callable a deferred accumulator comes from, resolved and validated in the backward (:data:`DkvAccSource`).
 
     The backward uses the storage of the saved ``o_lo`` as scratch (``o_lo_spent``); a later backward of the same
     node (``retain_graph=True``) first runs the forward again over the saved rows into the saved ``out`` / ``lse`` /
@@ -4627,8 +4738,6 @@ class _NopeBackwardPrep:
         "dkv_dst_map",
         "dkv_acc_source",
         "operands",
-        "key_head",
-        "key_mid",
         "replay_derive",
         "o_lo_spent",
     )
@@ -4675,20 +4784,6 @@ class _NopeBackwardPrep:
         self.dkv_acc, self.dkv_dst_map = acc_tensor, dkv_dst_map
         self.dkv_acc_source = None if acc_tensor is not None else dkv_acc
         self.has_topk_length = topk_length is not None
-        # the backward key with dout's slot (index 7) and the accumulator's geometry and the o_lo flag (indices
-        # 10, 11, 12) left open: completed per backward call
-        key = backward_binding_key_nope(
-            q_latent,
-            kv_latent,
-            indices,
-            out,
-            o_lo,
-            lse,
-            None,
-            topk_length,
-            self.softmax_scale,
-        )
-        self.key_head, self.key_mid = key[:7], key[8:10]
         ctx.save_for_backward(
             q_latent,
             kv_latent,
@@ -4743,11 +4838,21 @@ class _NopeBackwardPrep:
             self._replay_forward(
                 q_latent, kv_latent, indices, out, lse, o_lo, topk_length
             )
-        key = (
-            self.key_head
-            + (_geometry(dout),)
-            + self.key_mid
-            + (_geometry(dkv_acc), _geometry(dst_map), True)
+        # keyed by the saved tensors, which a saved-tensor hook may have handed back in another layout than the
+        # forward's (see the class docstring)
+        key = backward_binding_key_nope(
+            q_latent,
+            kv_latent,
+            indices,
+            out,
+            o_lo,
+            lse,
+            dout,
+            topk_length,
+            self.softmax_scale,
+            dkv_acc=dkv_acc,
+            dkv_dst_map=dst_map,
+            o_lo_scratch=True,
         )
         binding = _binding(
             key,
@@ -5123,6 +5228,21 @@ def _check_index_rows(
     ):
         raise ValueError("topk_length must be a contiguous int32 [T] tensor")
     return num_rows, topk
+
+
+def _check_length_cut(topk_length: Optional[torch.Tensor], rows: torch.Tensor) -> None:
+    """A caller cut for the index-preparation stage over the ``[T, K_slots]`` index ``rows``: ``None`` or a
+    contiguous int32 ``[T]`` tensor on the rows' device.  The stage reads ``T`` lengths through the pointer and its
+    binding checks no shape, so a shorter cut would be read past its end."""
+    if topk_length is not None and (
+        topk_length.shape != rows.shape[:1]
+        or topk_length.dtype != torch.int32
+        or not topk_length.is_contiguous()
+        or topk_length.device != rows.device
+    ):
+        raise ValueError(
+            "topk_length must be a contiguous int32 [T] tensor on the device of the index rows"
+        )
 
 
 def _index_prep_launch(
