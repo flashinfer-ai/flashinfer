@@ -797,7 +797,9 @@ def test_nvfp4_prefill_route_builds_match_the_oracle(spec, variant, monkeypatch)
     [
         pytest.param(32, 128, "nvfp4_h64_tmem_v_prefill", id="h32-tmem-v"),
         pytest.param(128, 128, "nvfp4_h128_prefill", id="h128"),
-        pytest.param(128, 512, "nvfp4_h128_v_unit_pairs_prefill", id="h128-v-unit-pairs"),
+        pytest.param(
+            128, 512, "nvfp4_h128_v_unit_pairs_prefill", id="h128-v-unit-pairs"
+        ),
     ],
 )
 def test_nvfp4_prefill_output_rows_past_2g_elements(
