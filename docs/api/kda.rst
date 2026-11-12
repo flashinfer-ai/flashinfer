@@ -203,6 +203,20 @@ includes per-shape latencies, correctness, trial medians and baseline identity.
         --flash-kda-source-dir /path/to/FlashKDA --output ptx-results.json
     pytest tests/kda/test_recurrent_kda_ptx.py
 
+Batch-invariant mode
+~~~~~~~~~~~~~~~~~~~~
+
+``recurrent_kda(..., batch_invariant=True)`` runs the batch-invariant class
+``kda.bf16.c16`` of :mod:`flashinfer.batch_invariant` for prefill, chunked
+prefill and decode on an fp32 state pool: every output row is the native
+SM100 / SM103 / SM107 chunked prefill kernel's, so a token's decode output is bit for
+bit its prefill output whatever the batch. Decode is one launch of a step
+kernel that computes the prefill's row from the boundary state and cached rows
+of the open 16-token chunk. The contract (fp32 pool addressed by
+``ssm_state_indices``, chunked prefill cut at multiples of 16 tokens, the
+supported arguments, CUDA graphs) is in ``flashinfer/batch_invariant/README.md``;
+``flashinfer.batch_invariant.fingerprint("recurrent_kda")`` names the class.
+
 .. _apikda_decode:
 
 flashinfer.kda_decode

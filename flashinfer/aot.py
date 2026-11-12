@@ -220,6 +220,7 @@ from .jit.page import gen_page_module
 from .jit.quantization import gen_quantization_module
 from .jit.rope import gen_rope_module
 from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
+from .jit.kda_batch_invariant import gen_kda_batch_invariant_module
 from .jit.sampling import gen_sampling_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
@@ -1182,6 +1183,8 @@ def gen_all_modules(
         ]
         if has_sm100 or has_sm103 or has_sm107:
             jit_specs.append(gen_blackwell_softmax_module())
+        if has_sm100 or has_sm103:
+            jit_specs.append(gen_kda_batch_invariant_module())
         # Cake radix sampling: one fatbin over every 9.x-12.x target (clusters + DSM only).
         if any(
             (has_sm90, has_sm100, has_sm103, has_sm107, has_sm110, has_sm120, has_sm121)

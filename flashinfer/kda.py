@@ -205,6 +205,7 @@ def recurrent_kda(
         "small-bh",
         "cudnn",
     ] = "auto",
+    batch_invariant: bool = False,
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -458,6 +459,33 @@ def recurrent_kda(
             selected slots of ``initial_state`` in place. ``output_final_state``
             returns that pool, not a gathered per-sequence copy. State-pool calls
             are not automatically selected for cuDNN.
+        batch_invariant (bool):
+            Keyword-only. ``True`` runs the batch-invariant class ``kda.bf16.c16``
+            (``flashinfer.batch_invariant``) in place of the backends: every
+            output row and every state at a multiple of 16 tokens is the
+            native SM100 / SM103 / SM107 chunked prefill kernel's, so decode row ``p``
+            of a request is bit for bit the row a prefill of the whole sequence
+            gives at ``p``, whatever the batch, the neighbours or the slot. The
+            state is an fp32 pool ``initial_state`` ``[slots, HV, 128, 128]``
+            addressed by ``ssm_state_indices`` (``arange`` when omitted) and
+            updated in place; a slot holds the state at the sequence's last
+            16-token boundary and the class keeps what the open chunk needs
+            next to the pool, so a chunked prefill cuts at multiples of 16
+            tokens except for its last piece (a prefill discards the slot's
+            open rows), and a call with one token per sequence is a decode step
+            (one launch of a step kernel). A slot whose state the
+            caller replaced starts a new chunk; a slot reset after a request
+            shorter than 16 tokens must be prefilled with more than one token.
+            Requires ``backend="auto"``, bf16 activations, head dim 128,
+            ``HV == H`` (a power of two), ``A_log`` / ``dt_bias`` with
+            ``use_gate_in_kernel``, ``use_qk_l2norm_in_kernel`` and
+            ``beta_is_logit``, a finite negative ``lower_bound``; speculative
+            decode, checkpoints, ``initial_state_source``, ``seq_order``,
+            ``prefill_workspace`` and the frozen-verify arguments are not in
+            the class. Unsupported inputs raise
+            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+            instead of falling back. ``fingerprint("recurrent_kda")`` names the
+            class; see ``flashinfer/batch_invariant/README.md``.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -483,6 +511,44 @@ def recurrent_kda(
         raise ValueError(
             "backend must be 'auto', 'cute-dsl', 'cute-dsl-persistent', 'tirx', 'ptx', 'cake', 'small-bh', or 'cudnn', "
             f"got {backend!r}"
+        )
+    if batch_invariant:
+        from .batch_invariant.kda.api import recurrent_kda_batch_invariant
+
+        return recurrent_kda_batch_invariant(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            output=output,
+            beta_is_logit=beta_is_logit,
+            backend=backend,
+            refused=dict(
+                num_spec_tokens=num_spec_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                initial_state_source=initial_state_source,
+                initial_state_indices=initial_state_indices,
+                seq_order=seq_order,
+                prefill_workspace=prefill_workspace,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                checkpoint_state_indices=checkpoint_state_indices,
+                disable_state_update=disable_state_update,
+                correction_cache=correction_cache,
+                kg_cache=kg_cache,
+            ),
         )
     if backend == "cute-dsl-persistent":
         from .kda_prefill_persistent import _run_persistent_kda

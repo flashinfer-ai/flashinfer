@@ -16,3 +16,5 @@ import BIKernels.Sampling
 import BIKernels.SamplingCases
 import BIKernels.MoE
 import BIKernels.MoECases
+import BIKernels.Kda
+import BIKernels.KdaCases
