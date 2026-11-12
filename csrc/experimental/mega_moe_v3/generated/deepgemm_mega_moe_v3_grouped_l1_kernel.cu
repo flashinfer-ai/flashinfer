@@ -1039,6 +1039,8 @@ kernel_deepgemm_mega_moe_v3_grouped_l1(DeepgemmTensorMap const* A, DeepgemmTenso
 
     __syncwarp();
 
+    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     // TMEM alloc (512 columns, 272 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (warp == 0) {
@@ -1049,8 +1051,6 @@ kernel_deepgemm_mega_moe_v3_grouped_l1(DeepgemmTensorMap const* A, DeepgemmTenso
     }
 
     __syncthreads();
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
     const int taddr = tmem_addr_storage[0];

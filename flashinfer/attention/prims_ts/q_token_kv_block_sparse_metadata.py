@@ -37,7 +37,7 @@ from __future__ import annotations
 import functools
 import math
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, Optional
 
 import torch
@@ -45,6 +45,7 @@ from flashinfer.api_logging import flashinfer_experimental_api
 
 from ...utils import device_support_pdl
 from ._block_sparse.common import _num_sparse_pattern_heads
+from ._scales import GlobalScale, normalize_scale, resolve_scale, scale_types
 
 _Q_TOKEN_KV_BLOCK_SPARSE_MIN_BLOCK_SIZE = 4
 _Q_TOKEN_KV_BLOCK_SPARSE_BLOCK_SIZES = (4, 8, 16, 32, 64, 128)
@@ -242,7 +243,7 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
     qo_indptr: Optional[torch.Tensor]
     metadata_run: Any
     group_size: int
-    use_packed_q: bool
+    packed_query: bool
     sparse_block_size: int
     storage_page_size: int
     max_seq_len_kv: int
@@ -260,7 +261,7 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
     ) -> None:
         """Launch the prepared CUDA metadata kernel without shape resolution."""
 
-        if self.use_packed_q:
+        if self.packed_query:
             self.metadata_run(
                 block_indices,
                 block_table,
@@ -318,8 +319,8 @@ class _PrimsTSQTokenKvBlockSparsePlan:
     """
 
     _metadata_plan: _PrimsTSQTokenKvBlockSparseMetadataPlan
-    _bmm1_scale: float
-    _bmm2_scale: float
+    _bmm1_scale: GlobalScale
+    _bmm2_scale: GlobalScale
     _attention_plan: Any
     _query: _QTokenKvBlockSparseTensorDescriptor
     _block_indices: _QTokenKvBlockSparseTensorDescriptor
@@ -338,8 +339,8 @@ class _PrimsTSQTokenKvBlockSparsePlan:
         query_positions: torch.Tensor,
         *,
         out: torch.Tensor,
-        sm_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
+        sm_scale: Optional[GlobalScale] = None,
+        v_scale: Optional[GlobalScale] = None,
     ) -> torch.Tensor:
         """Launch prepared QToken-KvBlock-Sparse-Attention metadata and attention on the current stream."""
 
@@ -373,6 +374,32 @@ class _PrimsTSQTokenKvBlockSparsePlan:
         _validate_16byte_alignment(query, "query")
         _validate_16byte_alignment(out, "out")
 
+        scale_qk = resolve_scale(sm_scale, self._bmm1_scale, "sm_scale", query.device)
+        scale_v = resolve_scale(v_scale, self._bmm2_scale, "v_scale", query.device)
+        return self.run_unchecked(
+            query,
+            block_indices,
+            block_table,
+            token_to_request,
+            query_positions,
+            out=out,
+            sm_scale=scale_qk,
+            v_scale=scale_v,
+        )
+
+    def run_unchecked(
+        self,
+        query: torch.Tensor,
+        block_indices: torch.Tensor,
+        block_table: torch.Tensor,
+        token_to_request: Optional[torch.Tensor],
+        query_positions: torch.Tensor,
+        *,
+        out: torch.Tensor,
+        sm_scale: GlobalScale,
+        v_scale: GlobalScale,
+    ) -> torch.Tensor:
+        """Launch tensors and scales that satisfy the prepared plan's ABI."""
         direct_q1_inputs = None
         if self._attention_plan._direct_q1_inputs:
             direct_q1_inputs = (
@@ -394,21 +421,11 @@ class _PrimsTSQTokenKvBlockSparsePlan:
         attention_out = _flatten_fixed_q_token_kv_block_sparse_groups(
             out, self._fixed_query_group_size
         )
-        from .decode import _validate_scale
-
-        scale_qk = (
-            self._bmm1_scale
-            if sm_scale is None
-            else _validate_scale(sm_scale, "sm_scale")
-        )
-        scale_v = (
-            self._bmm2_scale if v_scale is None else _validate_scale(v_scale, "v_scale")
-        )
         self._attention_plan._run_unchecked(
             attention_query,
             attention_out,
-            scale_qk,
-            scale_v,
+            sm_scale,
+            v_scale,
             direct_q1_inputs,
         )
         return out
@@ -429,13 +446,15 @@ class _QTokenKvBlockSparsePlanConfig:
     max_seq_len_kv: int
     device: torch.device
     workspace_buffer: torch.Tensor
-    use_packed_q: bool
+    packed_query: bool
     split_kv: bool
     share_pattern_across_kv_heads: bool
     count_current_block_in_topk: bool
-    q_data_type: torch.dtype
-    kv_data_type: torch.dtype
-    o_data_type: torch.dtype
+    q_dtype: torch.dtype
+    kv_dtype: torch.dtype
+    out_dtype: torch.dtype
+    sm_scale: GlobalScale
+    v_scale: GlobalScale
 
 
 def _q_token_tensor_abi_key(
@@ -496,14 +515,16 @@ class QTokenKvBlockSparsePagedTSWrapper:
         device: torch.device | str | int,
         workspace_buffer: torch.Tensor,
         group_size: int = 1,
-        use_packed_q: bool = False,
+        packed_query: bool = False,
         split_kv: bool = True,
         share_pattern_across_kv_heads: bool = True,
         count_current_block_in_topk: bool = True,
         mask_type: Literal["causal"] = "causal",
-        q_data_type: torch.dtype = torch.float16,
-        kv_data_type: Optional[torch.dtype] = None,
-        o_data_type: Optional[torch.dtype] = None,
+        q_dtype: torch.dtype = torch.float16,
+        kv_dtype: Optional[torch.dtype] = None,
+        out_dtype: Optional[torch.dtype] = None,
+        sm_scale: Optional[GlobalScale] = None,
+        v_scale: GlobalScale = 1.0,
     ) -> None:
         """Publish a capacity-only QToken-KvBlock-Sparse-Attention plan.
 
@@ -533,8 +554,13 @@ class QTokenKvBlockSparsePagedTSWrapper:
 
         ``split_kv=True`` permits automatic useful split fanout; False forces
         one KV partition and omits split scratch. Pass False for prefill and
-        True for decode, independently of ``use_packed_q``. Workspace sizing
+        True for decode, independently of ``packed_query``. Workspace sizing
         must use the same value. Change it only by replanning outside capture.
+
+        ``sm_scale`` and ``v_scale`` independently accept host floats or CUDA
+        FP32 tensors of shape () or (1,). They establish the compiled argument kinds
+        and default run values. Softmax scales are in natural units. Device
+        values must remain finite and positive and may change during replay.
         """
 
         from .decode import (
@@ -559,21 +585,27 @@ class QTokenKvBlockSparsePagedTSWrapper:
             raise ValueError(
                 "QToken-KvBlock-Sparse-Attention requires mask_type='causal'"
             )
-        if not isinstance(use_packed_q, bool):
-            raise TypeError("use_packed_q must be a bool")
+        if not isinstance(packed_query, bool):
+            raise TypeError("packed_query must be a bool")
         for dtype, name in (
-            (q_data_type, "q_data_type"),
-            (kv_data_type, "kv_data_type"),
-            (o_data_type, "o_data_type"),
+            (q_dtype, "q_dtype"),
+            (kv_dtype, "kv_dtype"),
+            (out_dtype, "out_dtype"),
         ):
             if dtype is not None and not isinstance(dtype, torch.dtype):
                 raise TypeError(f"{name} must be a torch.dtype")
-        if kv_data_type is None:
-            kv_data_type = q_data_type
-        if o_data_type is None:
-            o_data_type = q_data_type
+        if kv_dtype is None:
+            kv_dtype = q_dtype
+        if out_dtype is None:
+            out_dtype = q_dtype
         planned_device, device_index = _resolve_cuda_device(device)
         _validate_runtime_device(planned_device)
+        sm_scale = normalize_scale(
+            head_dim**-0.5 if sm_scale is None else sm_scale,
+            "sm_scale",
+            planned_device,
+        )
+        v_scale = normalize_scale(v_scale, "v_scale", planned_device)
         if not isinstance(workspace_buffer, torch.Tensor):
             raise TypeError("workspace_buffer must be a torch.Tensor")
         if workspace_buffer.device != planned_device:
@@ -590,12 +622,12 @@ class QTokenKvBlockSparsePagedTSWrapper:
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
-            q_dtype=q_data_type,
-            kv_dtype=kv_data_type,
-            out_dtype=o_data_type,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            out_dtype=out_dtype,
             device=planned_device,
             num_query_groups=batch_size,
-            use_packed_q=use_packed_q,
+            packed_query=packed_query,
             sparse_block_size=kv_block_size,
             split_kv=split_kv,
             share_pattern_across_kv_heads=share_pattern_across_kv_heads,
@@ -622,13 +654,15 @@ class QTokenKvBlockSparsePagedTSWrapper:
             max_seq_len_kv=max_seq_len_kv,
             device=planned_device,
             workspace_buffer=workspace_buffer,
-            use_packed_q=use_packed_q,
+            packed_query=packed_query,
             split_kv=split_kv,
             share_pattern_across_kv_heads=share_pattern_across_kv_heads,
             count_current_block_in_topk=count_current_block_in_topk,
-            q_data_type=q_data_type,
-            kv_data_type=kv_data_type,
-            o_data_type=o_data_type,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            out_dtype=out_dtype,
+            sm_scale=sm_scale,
+            v_scale=v_scale,
         )
         with self._plan_lock:
             self._config = candidate
@@ -654,9 +688,10 @@ class QTokenKvBlockSparsePagedTSWrapper:
         *,
         seq_lens: Optional[torch.Tensor] = None,
         qo_indptr: Optional[torch.Tensor] = None,
-        sm_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
+        sm_scale: Optional[GlobalScale] = None,
+        v_scale: Optional[GlobalScale] = None,
         out: Optional[torch.Tensor] = None,
+        validate: bool = True,
     ) -> torch.Tensor:
         """Build live routes and launch the current QToken attention plan.
 
@@ -692,7 +727,11 @@ class QTokenKvBlockSparsePagedTSWrapper:
         stable tensor storage. A changed packed extent or retained K/V/offset
         storage triggers a new preparation outside capture. ``sm_scale`` and
         ``v_scale`` are live launch scalars, so frameworks may update Q/K and V
-        dequantization scales without rebuilding the capacity plan.
+        dequantization scales without rebuilding the capacity plan. Each scale
+        independently accepts a host float or a contiguous CUDA FP32 tensor
+        of shape () or (1,) on the planned device. Run overrides must preserve the
+        respective plan-time type; omitted operands inherit the plan defaults.
+        Tensor values must remain finite and positive, without host readback.
 
         Parameters
         ----------
@@ -726,16 +765,26 @@ class QTokenKvBlockSparsePagedTSWrapper:
             CUDA Int32 packed-route offsets. Required for packed Q and omitted
             for fixed Q; each route must stay within one request and contain
             at most the planned ``group_size`` tokens.
-        sm_scale : float, optional
-            Softmax scale, defaulting to ``head_dim**-0.5``. Include Q/K
-            dequantization scales here when using FP8 inputs.
-        v_scale : float, optional
+        sm_scale : float or torch.Tensor, optional
+            Softmax scale. Omitted values inherit ``plan()``'s scale, which
+            defaults to ``head_dim**-0.5``. Include Q/K dequantization scales
+            here when using FP8 inputs.
+        v_scale : float or torch.Tensor, optional
             Value-cache dequantization scale applied to the output,
-            defaulting to one.
+            inheriting ``plan()``'s scale when omitted. The plan defaults to one.
         out : torch.Tensor, optional
             Caller-owned output with Q's logical shape and the planned output
             dtype. When omitted, the wrapper retains and reuses its output.
             Must not overlap any input or workspace storage; this is not checked.
+
+        validate : bool, optional
+            Validate tensor metadata and prepare changed bindings (default True).
+            Set False only after a successful validated run with the same plan.
+            All tensors must preserve their validated shapes, strides, devices,
+            dtypes and alignment; K/V and qo_indptr must also retain their storage.
+            Contents may change, and Q, indexer, table, per-token metadata and out
+            may use replacement storage with the same ABI. Scale overrides are
+            still checked. Revalidate after changing bindings or calling plan().
 
         Returns
         -------
@@ -744,11 +793,37 @@ class QTokenKvBlockSparsePagedTSWrapper:
         """
 
         config = self._require_config()
+        sm_scale = resolve_scale(sm_scale, config.sm_scale, "sm_scale", config.device)
+        v_scale = resolve_scale(v_scale, config.v_scale, "v_scale", config.device)
+        if not validate:
+            if self._prepared_plan is None:
+                raise RuntimeError(
+                    "run with validate=True after plan() before validate=False"
+                )
+            if out is None:
+                out = self._default_out
+                if out is None:
+                    raise RuntimeError(
+                        "supply out or first run with validate=True and out=None"
+                    )
+                _validate_q_token_kv_block_sparse_plan_tensor(
+                    out, "out", self._prepared_plan._out
+                )
+            return self._prepared_plan.run_unchecked(
+                q,
+                indexer_block_ids,
+                block_table,
+                token_to_request,
+                seq_lens if seq_lens is not None else query_positions,
+                out=out,
+                sm_scale=sm_scale,
+                v_scale=v_scale,
+            )
         if not isinstance(q, torch.Tensor):
             raise TypeError("q must be a torch.Tensor")
-        if q.device != config.device or q.dtype != config.q_data_type:
-            raise ValueError("q must use the planned device and q_data_type")
-        if config.use_packed_q:
+        if q.device != config.device or q.dtype != config.q_dtype:
+            raise ValueError("q must use the planned device and q_dtype")
+        if config.packed_query:
             if q.ndim != 3 or qo_indptr is None:
                 raise ValueError("packed Q requires [total_q,Hq,D] and qo_indptr")
             _validate_q_token_kv_block_sparse_qo_indptr_tensor(
@@ -773,7 +848,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
             raise ValueError("q must use the planned query-head and head dimensions")
         num_query_tokens = (
             int(q.shape[0])
-            if config.use_packed_q
+            if config.packed_query
             else (config.batch_size * config.group_size)
         )
         expected_ids_shape = (
@@ -789,7 +864,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
         fixed_query_len = 0
         if seq_lens is not None:
             if (
-                config.use_packed_q
+                config.packed_query
                 or token_to_request is not None
                 or query_positions is not None
             ):
@@ -823,7 +898,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
         )
         if (
             k_cache.device != config.device
-            or k_cache.dtype != config.kv_data_type
+            or k_cache.dtype != config.kv_dtype
             or tuple(k_cache.shape[1:])
             != (config.num_kv_heads, config.page_size, config.head_dim)
         ):
@@ -846,19 +921,20 @@ class QTokenKvBlockSparsePagedTSWrapper:
                     raise RuntimeError(
                         "run once eagerly before capture when out is not supplied"
                     )
-                self._default_out = torch.empty_like(q, dtype=config.o_data_type)
+                self._default_out = torch.empty_like(q, dtype=config.out_dtype)
             out = self._default_out
         elif not isinstance(out, torch.Tensor):
             raise TypeError("out must be a torch.Tensor")
         elif (
             out.shape != q.shape
             or out.device != config.device
-            or out.dtype != config.o_data_type
+            or out.dtype != config.out_dtype
         ):
             raise ValueError("out must match q shape and the planned output dtype")
 
         prepared_key = (
             fixed_query_len,
+            scale_types(sm_scale, v_scale),
             _q_token_tensor_abi_key(q),
             _q_token_tensor_abi_key(indexer_block_ids),
             _q_token_tensor_abi_key(block_table),
@@ -886,7 +962,8 @@ class QTokenKvBlockSparsePagedTSWrapper:
                         config.workspace_buffer,
                         out=out,
                         max_seq_len_kv=config.max_seq_len_kv,
-                        bmm1_scale=sm_scale,
+                        bmm1_scale=config.sm_scale,
+                        bmm2_scale=config.v_scale,
                         qo_indptr=qo_indptr,
                         group_size=config.group_size,
                         sparse_block_size=config.kv_block_size,
@@ -1006,7 +1083,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     out_dtype: Optional[torch.dtype] = None,
     device: Optional[torch.device | str | int] = None,
     num_query_groups: Optional[int] = None,
-    use_packed_q: bool = False,
+    packed_query: bool = False,
     sparse_block_size: int = 4,
     split_kv: bool = True,
     share_pattern_across_kv_heads: bool = True,
@@ -1106,7 +1183,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         _dtype_key(out_dtype),
         "HND",
         "causal",
-        use_packed_q,
+        packed_query,
         -1,
         storage_page_size,
         True,
@@ -1114,12 +1191,11 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         split_kv,
         share_pattern_across_kv_heads,
     )
-    # Eligible FP8 G2..G8/page-4 profiles consume one bit-plane per query.
+    # Eligible Keeps G2..G8/page-4 profiles consume one bit-plane per query.
     # Other profiles and the standalone metadata API retain page-byte masks.
     query_major_memberships = (
         sparse_block_size == 4
-        and spec.config.use_fp8_qkv
-        and spec.config.supports_query_major_memberships
+        and replace(spec.config, fixed_seqlen=True).supports_query_major_memberships
     )
     if query_major_memberships:
         page_capacity = (page_capacity + 31) // 32 * 32
@@ -1151,6 +1227,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         out_dtype,
         use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
         use_split_kv=spec.config.use_split_kv,
+        scratch_reserve=spec.scratch_reserve,
     )
     attention_scratch_bytes = attention_layout.total_bytes
     attention_workspace_byte_offset = _align_up_q_token_kv_block_sparse_workspace(
@@ -1181,7 +1258,7 @@ def get_q_token_kv_block_sparse_workspace_size(
     *,
     block_topk: int,
     max_seq_len_kv: int,
-    o_data_type: Optional[torch.dtype] = None,
+    out_dtype: Optional[torch.dtype] = None,
     qo_indptr: Optional[torch.Tensor] = None,
     group_size: int = 1,
     kv_block_size: int = 4,
@@ -1227,7 +1304,7 @@ def get_q_token_kv_block_sparse_workspace_size(
         Static maximum visible logical K/V length in tokens, including current
         query or MTP tokens. It may be smaller than the reserved block-table
         capacity and must not change across replay of a prepared CUDA graph.
-    o_data_type : torch.dtype, optional
+    out_dtype : torch.dtype, optional
         Output dtype used to size attention partials. It defaults to the query
         dtype.
     qo_indptr : torch.Tensor, optional
@@ -1266,7 +1343,7 @@ def get_q_token_kv_block_sparse_workspace_size(
         block_table,
         block_topk,
         max_seq_len_kv=max_seq_len_kv,
-        out_dtype=o_data_type,
+        out_dtype=out_dtype,
         qo_indptr=qo_indptr,
         group_size=group_size,
         sparse_block_size=kv_block_size,
@@ -1301,8 +1378,8 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors(
         raise TypeError("k_cache must be a torch.Tensor")
     if not isinstance(block_table, torch.Tensor):
         raise TypeError("block_table must be a torch.Tensor")
-    use_packed_q = qo_indptr is not None
-    if use_packed_q:
+    packed_query = qo_indptr is not None
+    if packed_query:
         if query.ndim != 3:
             raise ValueError(
                 "packed QToken-KvBlock-Sparse-Attention query must have shape [total_q,Hq,D]"
@@ -1341,7 +1418,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors(
     if out_dtype is None:
         out_dtype = query.dtype
     return _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
-        int(query.shape[0]) if use_packed_q else groups * group_size,
+        int(query.shape[0]) if packed_query else groups * group_size,
         block_topk,
         block_table.shape[1],
         k_cache.shape[2],
@@ -1355,7 +1432,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors(
         out_dtype=out_dtype,
         device=query.device,
         num_query_groups=groups,
-        use_packed_q=use_packed_q,
+        packed_query=packed_query,
         sparse_block_size=sparse_block_size,
         split_kv=split_kv,
         share_pattern_across_kv_heads=share_pattern_across_kv_heads,
@@ -1425,13 +1502,13 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
     )
     rows, block_topk = block_indices.shape[0], block_indices.shape[-1]
     pattern_heads = block_indices.shape[1] if block_indices.ndim == 3 else 1
-    use_packed_q = qo_indptr is not None
-    if use_packed_q:
+    packed_query = qo_indptr is not None
+    if packed_query:
         _validate_q_token_kv_block_sparse_qo_indptr_tensor(
             qo_indptr,
             expected_device=block_indices.device,
         )
-    groups = int(qo_indptr.numel()) - 1 if use_packed_q else None
+    groups = int(qo_indptr.numel()) - 1 if packed_query else None
     expected_shapes = _get_q_token_kv_block_sparse_metadata_output_shapes(
         rows,
         block_topk,
@@ -1475,7 +1552,7 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
     enable_pdl = device_support_pdl(block_indices.device)
     metadata_module = _get_prims_ts_q_token_kv_block_sparse_metadata_module()
     release_attention_pdl = enable_pdl and release_attention_pdl
-    if use_packed_q:
+    if packed_query:
         metadata_module.run_packed(
             block_indices,
             block_table,
@@ -1645,11 +1722,11 @@ def _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
 
     sparse_block_size = _validate_sparse_block_size(sparse_block_size)
     rows = block_indices.shape[0]
-    use_packed_q = qo_indptr is not None
+    packed_query = qo_indptr is not None
     _resolve_num_query_groups(
         rows,
         group_size,
-        int(qo_indptr.numel()) - 1 if use_packed_q else None,
+        int(qo_indptr.numel()) - 1 if packed_query else None,
     )
     max_seq_len_kv = _validate_q_token_kv_block_sparse_max_seq_len_kv(
         max_seq_len_kv,
@@ -1660,12 +1737,12 @@ def _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
     if query_major_memberships:
         metadata_run = (
             metadata_module.run_packed_query_major
-            if use_packed_q
+            if packed_query
             else metadata_module.run_fixed_query_major
         )
     else:
         metadata_run = (
-            metadata_module.run_packed if use_packed_q else metadata_module.run_fixed
+            metadata_module.run_packed if packed_query else metadata_module.run_fixed
         )
     return _PrimsTSQTokenKvBlockSparseMetadataPlan(
         q_token_kv_block_sparse_page_indices=q_token_kv_block_sparse_page_indices,
@@ -1674,7 +1751,7 @@ def _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
         qo_indptr=qo_indptr,
         metadata_run=metadata_run,
         group_size=group_size,
-        use_packed_q=use_packed_q,
+        packed_query=packed_query,
         sparse_block_size=sparse_block_size,
         storage_page_size=storage_page_size,
         max_seq_len_kv=max_seq_len_kv,
@@ -1696,8 +1773,8 @@ def _prepare_q_token_kv_block_sparse_attention(
     *,
     out: torch.Tensor,
     max_seq_len_kv: int,
-    bmm1_scale: Optional[float] = None,
-    bmm2_scale: float = 1.0,
+    bmm1_scale: Optional[GlobalScale] = None,
+    bmm2_scale: GlobalScale = 1.0,
     qo_indptr: Optional[torch.Tensor] = None,
     group_size: int = 1,
     sparse_block_size: int = 4,
@@ -1764,9 +1841,9 @@ def _prepare_q_token_kv_block_sparse_attention(
         Static maximum visible logical K/V length in tokens, including current
         query or MTP tokens. It must fit within each dense block-table row and
         remain unchanged across CUDA graph replay.
-    bmm1_scale : float, optional
+    bmm1_scale : float or torch.Tensor, optional
         Scale applied to QK scores. It defaults to ``head_dim**-0.5``.
-    bmm2_scale : float
+    bmm2_scale : float or torch.Tensor
         Scale applied to the attention output.
     qo_indptr : torch.Tensor, optional
         Contiguous CUDA Int32 cumulative route offsets selecting packed-query
@@ -1796,9 +1873,9 @@ def _prepare_q_token_kv_block_sparse_attention(
     if not isinstance(out, torch.Tensor):
         raise TypeError("out must be a caller-owned torch.Tensor")
 
-    use_packed_q = qo_indptr is not None
+    packed_query = qo_indptr is not None
     fixed_query_group_size = None
-    if use_packed_q:
+    if packed_query:
         if query.ndim != 3:
             raise ValueError(
                 "packed QToken-KvBlock-Sparse-Attention query must have shape [total_q,Hq,D]"
@@ -1866,13 +1943,14 @@ def _prepare_q_token_kv_block_sparse_attention(
         count_current_block_in_topk=count_current_block_in_topk,
     )
     views = layout.bind(workspace_buffer)
-    from .decode import _prepare_prims_ts_batch_decode_plan, _validate_scale
+    from .decode import _prepare_prims_ts_batch_decode_plan
 
-    scale_qk = _validate_scale(
+    scale_qk = normalize_scale(
         query.shape[-1] ** -0.5 if bmm1_scale is None else bmm1_scale,
         "bmm1_scale",
+        query.device,
     )
-    scale_v = _validate_scale(bmm2_scale, "bmm2_scale")
+    scale_v = normalize_scale(bmm2_scale, "bmm2_scale", query.device)
     # Generic FMHA sees one query group as a route, so its route-local
     # sequence-length parameters receive G, not the full request length.
     attention_plan, _ = _prepare_prims_ts_batch_decode_plan(
@@ -1885,7 +1963,7 @@ def _prepare_q_token_kv_block_sparse_attention(
         out=attention_out,
         seq_len_q=group_size,
         qo_indptr=qo_indptr,
-        max_seq_len_q=group_size if use_packed_q else None,
+        max_q_len=group_size if packed_query else None,
         out_dtype=out.dtype,
         mask_type="causal",
         window_left=-1,
@@ -1909,6 +1987,8 @@ def _prepare_q_token_kv_block_sparse_attention(
         direct_q1_max_model_len=max_seq_len_kv if group_size == 1 else None,
         direct_q1_fixed_query_len=fixed_query_len,
         allow_head_aware_locators=group_size > 1,
+        softmax_scale=scale_qk,
+        output_scale=scale_v,
     )
     # Preparation only binds shapes and storage; attention does not read these
     # outputs until metadata runs. Use its resolved format for the producer.
@@ -1963,10 +2043,10 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
     group_size: int = 1,
     kv_block_size: int = 4,
     mask_type: Literal["causal"] = "causal",
-    sm_scale: Optional[float] = None,
-    v_scale: Optional[float] = None,
+    sm_scale: Optional[GlobalScale] = None,
+    v_scale: Optional[GlobalScale] = None,
     out: Optional[torch.Tensor] = None,
-    o_data_type: Optional[torch.dtype] = None,
+    out_dtype: Optional[torch.dtype] = None,
     qo_indptr: Optional[torch.Tensor] = None,
     split_kv: bool = True,
     share_pattern_across_kv_heads: bool = True,
@@ -2028,9 +2108,9 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         Semantic sparse K/V block size: 4/8/16/32/64/128, default four.
     mask_type : {"causal"}
         QToken-KvBlock-Sparse-Attention currently supports causal masking only.
-    sm_scale : float, optional
+    sm_scale : float or torch.Tensor, optional
         Softmax scale, defaulting to ``head_dim**-0.5``.
-    v_scale : float, optional
+    v_scale : float or torch.Tensor, optional
         Value-cache dequantization scale applied to the attention output,
         defaulting to one. Frameworks using an FP8 K/V cache should pass the
         cache's live V scale.
@@ -2038,7 +2118,7 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         Caller-owned output with the same logical shape as ``q``.
         Must be disjoint from all inputs, including indexer/request metadata,
         and from ``workspace_buffer``. Storage overlap is not checked.
-    o_data_type : torch.dtype, optional
+    out_dtype : torch.dtype, optional
         Output dtype, defaulting to ``out.dtype`` or ``q.dtype``.
     qo_indptr : torch.Tensor, optional
         CUDA Int32 packed-route offsets.
@@ -2075,8 +2155,8 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         )
     if out is not None and not isinstance(out, torch.Tensor):
         raise TypeError("out must be a torch.Tensor")
-    if o_data_type is None:
-        o_data_type = out.dtype if out is not None else q.dtype
+    if out_dtype is None:
+        out_dtype = out.dtype if out is not None else q.dtype
     if qo_indptr is None:
         if q.ndim != 5:
             raise ValueError(
@@ -2085,12 +2165,12 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         if group_size != q.shape[2]:
             raise ValueError("fixed group_size must match q.shape[2]")
         batch_size = int(q.shape[0] * q.shape[1])
-        use_packed_q = False
+        packed_query = False
     else:
         if q.ndim != 3:
             raise ValueError("packed q must have shape [total_q,Hq,D]")
         batch_size = int(qo_indptr.numel()) - 1
-        use_packed_q = True
+        packed_query = True
 
     wrapper = QTokenKvBlockSparsePagedTSWrapper()
     wrapper.plan(
@@ -2105,14 +2185,16 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         device=q.device,
         workspace_buffer=workspace_buffer,
         group_size=group_size,
-        use_packed_q=use_packed_q,
+        packed_query=packed_query,
         mask_type=mask_type,
         split_kv=split_kv,
         share_pattern_across_kv_heads=share_pattern_across_kv_heads,
         count_current_block_in_topk=count_current_block_in_topk,
-        q_data_type=q.dtype,
-        kv_data_type=k_cache.dtype,
-        o_data_type=o_data_type,
+        q_dtype=q.dtype,
+        kv_dtype=k_cache.dtype,
+        out_dtype=out_dtype,
+        sm_scale=sm_scale,
+        v_scale=1.0 if v_scale is None else v_scale,
     )
     return wrapper.run(
         q,

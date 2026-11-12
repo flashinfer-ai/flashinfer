@@ -42,7 +42,7 @@
 #define CAKE_VARIANT_NS variant_cake_trtllm_mla_blackwell_74250d91903d28576cba_sm_100a_ad8028b1017e
 #endif
 #ifndef CAKE_PROGRAM_KERNEL
-#define CAKE_PROGRAM_KERNEL kernel_cake_trtllm_mla_blackwell_74250d91903d28576cba
+#define CAKE_PROGRAM_KERNEL kernel_cake_trtllm_mla_blackwell_7caa905d3847d2737402
 #endif
 // Stringise the expansion of a macro argument: the dispatch (and launch) messages
 // name the family (and the kernel).

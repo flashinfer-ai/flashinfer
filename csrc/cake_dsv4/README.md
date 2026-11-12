@@ -5,8 +5,28 @@ Generated device kernels and TVM-FFI launchers for SM100 / SM103 behind
 inputs with head dimension 512 (BF16 output); `kv_cache_format="nvfp4"` selects
 the NVFP4 decode family (`run_cake_dsv4_nvfp4`; see the host module docstring).
 Select the backend explicitly; `backend="auto"` keeps the architecture-based
-selection. Programmatic dependent launch and the TRTLLM-GEN RopeQuant epilogue
-are not supported.
+selection. `enable_pdl` launches the FP8 persistent and M64 programs as
+programmatic dependents (they wait for the previous grid before their first
+global read and trigger their own dependents right after); without it, the
+H128 persistent program's `_no_pdl` twin, the same kernel without the two
+`griddepcontrol` instructions, runs on SM103 launches of at least 384 query rows
+and on SM100 calls whose longest request has at least 257 query tokens. On SM107
+the FP8 H128 uniform-gather persistent route's `_k64` sibling, the same work
+with every MMA a one-CTA M128 tile at K=64, runs on launches of at least 48
+query rows; SM107 decode launches of at least 160 query rows also take that
+route instead of the lane-gather one when each request holds one query row (at
+most 2 from 256 rows) or, on calls that read a 64-row-page compressed cache
+(compress ratio 4), at most 4 query rows (at most 8 from 256 rows).
+The other BF16 / FP8 programs launch without it, and the NVFP4 family rejects
+it. On SM107 the FP8 low-head prefill route's `_overlap` sibling, the same work
+with the P x V MMAs started on the low half of P and the output drained per V
+block, runs on launches of at most 64 query rows (scaled down with the SM count
+below 216 SMs); routing its `VARIANTS` key to the route's program retires it.
+Its `_vblock` sibling, the same work split into one 128-column V block of the
+output per CTA (four CTAs per query row) with the same output bits, runs before
+it on launches of at most 27 query rows (scaled down with the SM count below
+216 SMs); routing its `VARIANTS` key to the route's or the `_overlap` sibling's
+program retires it. The TRTLLM-GEN RopeQuant epilogue is not supported.
 
 ```python
 from flashinfer.mla import (
@@ -37,8 +57,11 @@ out = trtllm_batch_decode_sparse_mla_dsv4(
 
 `flashinfer/jit/cake_dsv4.py` registers each variant per architecture: its
 sources, nvcc flags, an identity that names the JIT module, and the `arg_plan`
-the host binds by name. `flashinfer/mla/cake_dsv4.py` resolves the sparse
-metadata, carves the caller-owned workspace, picks the route (`_route`, or
+the host binds by name. The BF16 / FP8 registrations are read from three literal
+tables: `ARG_PLANS` (the argument plans), `MODULES` (one record per program:
+sources, flags, plan, architectures, identity per architecture) and `VARIANTS`
+(architecture -> variant key -> program). `flashinfer/mla/cake_dsv4.py` resolves
+the sparse metadata, carves the caller-owned workspace, picks the route (`_route`, or
 `_nvfp4_plan` for the NVFP4 cache) and launches the variant kernels directly,
 reducers included; shapes without an exported kernel are rejected before any
 launch. Bindings perform no device allocation.
@@ -53,7 +76,9 @@ launch. Bindings perform no device allocation.
   (`sparse_indices [T, sparse_topk]`) and separate (`sparse_indices [T, 128]` +
   `extra_sparse_indices [T, topk_c]`, lengths via `sparse_topk_lens` or
   `extra_sparse_topk_lens`) tables are resolved without copies; int32, unit column
-  stride, free row stride.
+  stride, a 16-byte aligned start and, with more than one row, a row stride that
+  is a multiple of 4 (the kernels load index rows 16 bytes at a time; the host
+  rejects other tables).
 * Padded rows: `num_query_tokens = T` is the metadata row count; `query` / `out`
   may carry more rows, rows `>= T` are neither read nor written.
 * Workspace (contiguous, 128-byte aligned): `[0, 1024)` reserved,
@@ -66,8 +91,8 @@ launch. Bindings perform no device allocation.
 ## Tests
 
 ```bash
-pytest tests/mla/test_cake_dsv4.py -q                        # routing, binding, workspace, metadata (CPU)
-pytest tests/mla/test_cake_dsv4_nvfp4_route.py -q            # NVFP4 planner, variant names, workspace (CPU)
+pytest tests/cpu/mla/test_cake_dsv4.py -q                    # routing, binding, workspace, metadata (CPU)
+pytest tests/cpu/mla/test_cake_dsv4_nvfp4_route.py -q        # NVFP4 planner, variant names, workspace (CPU)
 pytest tests/mla/test_cake_dsv4_hardening.py -q              # numerical and graph-replay checks (SM100/SM103 GPU)
 pytest tests/attention/test_sparse_mla_blackwell_dsv4_nvfp4.py -q  # NVFP4 cache ops and cake decode (GPU: SM100/SM103; cache ops also SM120/SM121)
 ```

@@ -63,6 +63,32 @@ larger shapes therefore retain the original policy; a token-only cutoff would
 lose useful weight reuse. T5/T6 diagnostic probes within the small shape show
 approximately 1–5% improvement, smaller than the T8 routing transition.
 
+## Repeatability and the existing non-fused option
+
+The fused TC epilogue adds expert contributions to BF16 output with atomics.
+The order in which CTAs arrive can change, so identical inputs can produce
+different output bits. Passing a numerical tolerance does not establish
+bitwise repeatability. CUDA Graph replay does not impose a fixed order on
+those cross-CTA additions.
+
+Callers that need a fixed-order combine can use the existing preplanned
+route: build `compile_w4a16_fused_moe` with `direct_topk_routes=False` and
+`tc_decode_fused_sum=False`, then pass that plan as `fused_launch` to
+`run_w4a16_moe`. This writes BF16 expert outputs and uses the separate top-k
+sum with FP32 accumulation instead of the fused BF16 atomic epilogue. The
+runtime honors the non-fused plan even when the shape qualifies for fused
+TC decode. Retain the plan and provide its correctly sized workspaces before
+CUDA Graph capture.
+
+This is a low-level plan choice, not a new unified-MoE determinism flag. It
+can add route-packing and reduction work. It also has different rounding
+boundaries from the atomic path; their results need not match bitwise.
+Repeatability should be qualified for the concrete hardware, software and
+tactic in use, rather than assumed across devices or compiler versions.
+The regression test checks repeated eager execution and retained-graph
+replay of the non-fused path with poisoned output and scratch, including
+live shared/permuted routes and invalid slots.
+
 ## Reproduction and correctness
 
 Run this command on the parent revision and this change with the same settings;

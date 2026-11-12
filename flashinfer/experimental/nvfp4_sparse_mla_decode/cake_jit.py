@@ -14,23 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Host plan and loader glue of the Cake experimental NVFP4 sparse MLA decode
-program (SM100 / SM103), the ``backend="cake"`` of
+programs (SM100 / SM103), the ``backend="cake"`` of
 :func:`flashinfer.mla.nvfp4_sparse_mla_decode`.
 
-Contract of the program: ``out[t, h] = out_scale * softmax_k(qk_scale *
+Contract of a program: ``out[t, h] = out_scale * softmax_k(qk_scale *
 q[t, h] . K[indices[t, k]]) @ V[indices[t, k]]`` over E4M3 ``[T, 16, 576]``
 queries (``q``, handed to the kernel as int32 words), 352-byte NVFP4 cache
-rows (``kv``, the flat uint8 row pool), int32 ``[T, topk]`` row ids with
-``-1`` marking an empty slot (``indices``) and a BF16 ``[T, 16, 512]`` output
-(``out``); ``qk_scale`` is the base-2 softmax scale (``bmm1_scale *
-log2(e)``), ``out_scale`` the output scale and ``keys_per_cta`` the keys each
-CTA of the token's cluster owns.  One thread-block cluster of ``C`` CTAs
-serves one query token (grid ``(T, C, 1)``, cluster ``(1, C, 1)``, 448
-threads): CTA ``c`` walks the keys ``[c * keys_per_cta, (c + 1) *
-keys_per_cta)`` in 32-key stages and either writes the normalized output
-directly (``C = 1``) or merges its fp32 partials with the cluster peers
-through distributed shared memory.  ``C`` is one of :data:`CLUSTER_SIZES`,
-one program per cluster size; :mod:`.cake_backend` plans it per launch.
+rows (``kv``, the row pool as int32 words, and ``kv_rows``, the same pool as
+``[rows, 352]`` bytes the kernel's TMA gather map is encoded from), int32
+``[T, topk]`` row ids with ``-1`` marking an empty slot (``indices``) and a
+BF16 ``[T, 16, 512]`` output (``out``); ``qk_scale`` is the base-2 softmax
+scale (``bmm1_scale * log2(e)``), ``out_scale`` the output scale and
+``keys_per_cta`` the keys each CTA of the token's cluster owns
+(``ceil(topk / C)``).  One thread-block cluster of ``C`` CTAs serves one query
+token (grid ``(T, C, 1)``, cluster ``(1, C, 1)``, 512 threads): CTA ``c``
+takes the keys ``[c * keys_per_cta, (c + 1) * keys_per_cta)`` in 128-key
+tiles on the tensor core (tcgen05, TMEM) and either writes the normalized
+output directly (``C = 1``) or merges its fp32 partials with the cluster
+peers through distributed shared memory.  A program is built for one cluster
+size ``C`` of :data:`CLUSTER_SIZES` and one split bound ``max_keys`` of
+:data:`MAX_KEYS`: a launch whose ``keys_per_cta`` is at most 64, 128, 192 or
+256 runs the program of that bound (:func:`program_max_keys`; 0 is the
+general program, any split); :mod:`.cake_backend` plans ``C`` per launch.
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
 device translation unit, a tvm-ffi binding and an occupancy query unit,
@@ -39,20 +44,19 @@ program's ``library`` stem (its ``build.json`` entries are
 ``<library>_<arch>``), the architectures it is delivered for, the source
 ``module`` and ``build`` keywords it was rendered from, its launch record,
 the argument plan of its ``run`` entry, the kernel-parameter -> logical-
-argument map, the cluster size and the stage constants of the host planner
-(``cluster``, ``keys_per_stage``, ``max_keys_per_cta``), the grid rule
-:func:`launch_grid` evaluates, the name of the occupancy entry
-(``occupancy_entry``: ``max_active_clusters(device, block_x, block_y,
-block_z, cluster_x, cluster_y, cluster_z, dynamic_smem_bytes, cooperative)``,
-the one-wave cluster capacity the planner asks each program for) and the
-workspace rule (``None``: the kernel owns no scratch).  What to compile --
-sources, digests, nvcc flags -- is recorded once in ``build.json`` next to
-this file; :mod:`.cake_build` serves the library from a prebuilt ``aot/``
-file when a builder compiled it and otherwise through FlashInfer's JIT from
-the same sources and flags.  Every ``build.json`` entry records
-``--use_fast_math`` (the flag the kernel was validated and measured with);
-the loader passes ``use_fast_math=False`` so that the manifest, not the
-loader, states it.
+argument map, the cluster size and split bound of the host planner
+(``cluster``, ``max_keys``), the grid rule :func:`launch_grid` evaluates,
+the name of the occupancy entry (``occupancy_entry``:
+``max_active_clusters(device, block_x, block_y, block_z, cluster_x,
+cluster_y, cluster_z, dynamic_smem_bytes, cooperative)``, the one-wave
+cluster capacity the planner asks for) and the workspace rule (``None``: the
+kernel owns no scratch).  What to compile -- sources, digests, nvcc flags --
+is recorded once in ``build.json`` next to this file; :mod:`.cake_build`
+serves the library from a prebuilt ``aot/`` file when a builder compiled it
+and otherwise through FlashInfer's JIT from the same sources and flags.
+Every ``build.json`` entry records ``--use_fast_math`` (the flag the kernel
+was validated and measured with); the loader passes ``use_fast_math=False``
+so that the manifest, not the loader, states it.
 
 The derived leaves of a record (``kernel_symbol``, ``launch.block``,
 ``launch.cluster``, ``launch.cooperative``, ``launch.dynamic_smem_bytes``,
@@ -86,10 +90,14 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (10, 3): "sm_103a",
 }
 
-# Thread-block cluster sizes (CTAs per query token) the program is delivered
-# for, one record each; 7 is not a variant of the program (see
-# ``cake_backend.PLAN_CTAS``).
+# Thread-block cluster sizes (CTAs per query token) the programs are delivered
+# for; 7 is not a variant of the kernel (see ``cake_backend.PLAN_CTAS``).
 CLUSTER_SIZES = (1, 2, 3, 4, 5, 6, 8)
+# Split bounds of the programs: a launch whose CTAs own at most 64, 128, 192 or
+# 256 keys runs the program built for that bound (its tile count is a
+# constant), a larger split the general program (0).  One record per (cluster
+# size, split bound).
+MAX_KEYS = (0, 64, 128, 192, 256)
 
 # The derived leaves of every record (``kernel_symbol``, ``launch.block``,
 # ``launch.cluster``, ``launch.cooperative``, ``launch.dynamic_smem_bytes``,
@@ -98,7 +106,7 @@ CLUSTER_SIZES = (1, 2, 3, 4, 5, 6, 8)
 # ``launch.dynamic_smem_bytes`` is the kernel's computed shared memory at the
 # last render.
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_nvfp4_sparse_mla_decode_b321ca1b7dfea243bca6": {
+    "cake_nvfp4_sparse_mla_decode_9627a6efb66a046f8cf2": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -106,6 +114,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "kv"],
+            ["buffer", "kv_nope"],
             ["buffer", "indices"],
             ["buffer", "out"],
             ["parameter", "topk"],
@@ -118,39 +127,41 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "build": {
             "cluster": 1,
+            "debug": 0,
+            "max_keys": 0,
         },
         "cluster": 1,
         "ffi_entry": "run",
         "grid_rule": {
             "kind": "tokens_by_cluster",
         },
-        "kernel": "cake_nvfp4_sparse_mla_decode_b321ca1b7dfea243bca6",
-        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_b321ca1b7dfea243bca6",
-        "keys_per_stage": 32,
+        "kernel": "cake_nvfp4_sparse_mla_decode_9627a6efb66a046f8cf2",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_9627a6efb66a046f8cf2",
         "launch": {
-            "block": (448, 1, 1),
+            "block": (512, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 192256,
+            "dynamic_smem_bytes": 218880,
             "use_pdl": False,
         },
-        "library": "cake_nvfp4_sparse_mla_decode_b321ca1b7dfea243bca6",
+        "library": "cake_nvfp4_sparse_mla_decode_9627a6efb66a046f8cf2",
         "logical": {
             "indices": "indices",
             "keys_per_cta": "keys_per_cta",
             "kv": "kv",
+            "kv_nope": "kv_rows",
             "out": "out",
             "out_scale": "out_scale",
             "q": "q",
             "qk_scale": "qk_scale",
             "topk": "topk",
         },
-        "max_keys_per_cta": 2048,
-        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode",
+        "max_keys": 0,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
         "occupancy_entry": "max_active_clusters",
         "workspace_rule": None,
     },
-    "cake_nvfp4_sparse_mla_decode_9db88fc2ce17eaf2d27e": {
+    "cake_nvfp4_sparse_mla_decode_614e9562bde9684ffb9a": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -158,6 +169,227 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 1,
+            "debug": 0,
+            "max_keys": 64,
+        },
+        "cluster": 1,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_614e9562bde9684ffb9a",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_614e9562bde9684ffb9a",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 96000,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_614e9562bde9684ffb9a",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 64,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_803702f746170d774fb5": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 1,
+            "debug": 0,
+            "max_keys": 128,
+        },
+        "cluster": 1,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_803702f746170d774fb5",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_803702f746170d774fb5",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 96000,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_803702f746170d774fb5",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 128,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_f20b02d097659bdc47bd": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 1,
+            "debug": 0,
+            "max_keys": 192,
+        },
+        "cluster": 1,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_f20b02d097659bdc47bd",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_f20b02d097659bdc47bd",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 218880,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_f20b02d097659bdc47bd",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 192,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_aa370e07497081bfeea1": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 1,
+            "debug": 0,
+            "max_keys": 256,
+        },
+        "cluster": 1,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_aa370e07497081bfeea1",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_aa370e07497081bfeea1",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 218880,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_aa370e07497081bfeea1",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 256,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_02da9b5a54d5a66aafb9": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
             ["buffer", "indices"],
             ["buffer", "out"],
             ["parameter", "topk"],
@@ -170,39 +402,41 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "build": {
             "cluster": 2,
+            "debug": 0,
+            "max_keys": 0,
         },
         "cluster": 2,
         "ffi_entry": "run",
         "grid_rule": {
             "kind": "tokens_by_cluster",
         },
-        "kernel": "cake_nvfp4_sparse_mla_decode_9db88fc2ce17eaf2d27e",
-        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_9db88fc2ce17eaf2d27e",
-        "keys_per_stage": 32,
+        "kernel": "cake_nvfp4_sparse_mla_decode_02da9b5a54d5a66aafb9",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_02da9b5a54d5a66aafb9",
         "launch": {
-            "block": (448, 1, 1),
+            "block": (512, 1, 1),
             "cluster": (1, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 226816,
+            "dynamic_smem_bytes": 219264,
             "use_pdl": False,
         },
-        "library": "cake_nvfp4_sparse_mla_decode_9db88fc2ce17eaf2d27e",
+        "library": "cake_nvfp4_sparse_mla_decode_02da9b5a54d5a66aafb9",
         "logical": {
             "indices": "indices",
             "keys_per_cta": "keys_per_cta",
             "kv": "kv",
+            "kv_nope": "kv_rows",
             "out": "out",
             "out_scale": "out_scale",
             "q": "q",
             "qk_scale": "qk_scale",
             "topk": "topk",
         },
-        "max_keys_per_cta": 2048,
-        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode",
+        "max_keys": 0,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
         "occupancy_entry": "max_active_clusters",
         "workspace_rule": None,
     },
-    "cake_nvfp4_sparse_mla_decode_525c3da3db366af4b77c": {
+    "cake_nvfp4_sparse_mla_decode_1fd3c893bae4ad90f276": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -210,6 +444,227 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 2,
+            "debug": 0,
+            "max_keys": 64,
+        },
+        "cluster": 2,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_1fd3c893bae4ad90f276",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_1fd3c893bae4ad90f276",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 2, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 129152,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_1fd3c893bae4ad90f276",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 64,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_0425e3543bb9c12ba2fc": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 2,
+            "debug": 0,
+            "max_keys": 128,
+        },
+        "cluster": 2,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_0425e3543bb9c12ba2fc",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_0425e3543bb9c12ba2fc",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 2, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 129152,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_0425e3543bb9c12ba2fc",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 128,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_44f4999c79cea6a046fc": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 2,
+            "debug": 0,
+            "max_keys": 192,
+        },
+        "cluster": 2,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_44f4999c79cea6a046fc",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_44f4999c79cea6a046fc",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 2, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 219264,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_44f4999c79cea6a046fc",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 192,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_cfb063781561be8fdba1": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 2,
+            "debug": 0,
+            "max_keys": 256,
+        },
+        "cluster": 2,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_cfb063781561be8fdba1",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_cfb063781561be8fdba1",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 2, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 219264,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_cfb063781561be8fdba1",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 256,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_0631dd655f25a545f52f": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
             ["buffer", "indices"],
             ["buffer", "out"],
             ["parameter", "topk"],
@@ -222,39 +677,41 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "build": {
             "cluster": 3,
+            "debug": 0,
+            "max_keys": 0,
         },
         "cluster": 3,
         "ffi_entry": "run",
         "grid_rule": {
             "kind": "tokens_by_cluster",
         },
-        "kernel": "cake_nvfp4_sparse_mla_decode_525c3da3db366af4b77c",
-        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_525c3da3db366af4b77c",
-        "keys_per_stage": 32,
+        "kernel": "cake_nvfp4_sparse_mla_decode_0631dd655f25a545f52f",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_0631dd655f25a545f52f",
         "launch": {
-            "block": (448, 1, 1),
+            "block": (512, 1, 1),
             "cluster": (1, 3, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 226816,
+            "dynamic_smem_bytes": 220416,
             "use_pdl": False,
         },
-        "library": "cake_nvfp4_sparse_mla_decode_525c3da3db366af4b77c",
+        "library": "cake_nvfp4_sparse_mla_decode_0631dd655f25a545f52f",
         "logical": {
             "indices": "indices",
             "keys_per_cta": "keys_per_cta",
             "kv": "kv",
+            "kv_nope": "kv_rows",
             "out": "out",
             "out_scale": "out_scale",
             "q": "q",
             "qk_scale": "qk_scale",
             "topk": "topk",
         },
-        "max_keys_per_cta": 2048,
-        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode",
+        "max_keys": 0,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
         "occupancy_entry": "max_active_clusters",
         "workspace_rule": None,
     },
-    "cake_nvfp4_sparse_mla_decode_b5c9cbf01c57fe28ab5c": {
+    "cake_nvfp4_sparse_mla_decode_b58aec4c312bfac8960e": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -262,6 +719,227 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 3,
+            "debug": 0,
+            "max_keys": 64,
+        },
+        "cluster": 3,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_b58aec4c312bfac8960e",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_b58aec4c312bfac8960e",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 3, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 130304,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_b58aec4c312bfac8960e",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 64,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_fb0887ac7c6ddde37463": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 3,
+            "debug": 0,
+            "max_keys": 128,
+        },
+        "cluster": 3,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_fb0887ac7c6ddde37463",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_fb0887ac7c6ddde37463",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 3, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 130304,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_fb0887ac7c6ddde37463",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 128,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_30edcc16ece68f64276b": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 3,
+            "debug": 0,
+            "max_keys": 192,
+        },
+        "cluster": 3,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_30edcc16ece68f64276b",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_30edcc16ece68f64276b",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 3, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 220416,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_30edcc16ece68f64276b",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 192,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_d46057a4092ef860ca92": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 3,
+            "debug": 0,
+            "max_keys": 256,
+        },
+        "cluster": 3,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_d46057a4092ef860ca92",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_d46057a4092ef860ca92",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 3, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 220416,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_d46057a4092ef860ca92",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 256,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_2beb3ac65e8202fb7fef": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
             ["buffer", "indices"],
             ["buffer", "out"],
             ["parameter", "topk"],
@@ -274,39 +952,41 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "build": {
             "cluster": 4,
+            "debug": 0,
+            "max_keys": 0,
         },
         "cluster": 4,
         "ffi_entry": "run",
         "grid_rule": {
             "kind": "tokens_by_cluster",
         },
-        "kernel": "cake_nvfp4_sparse_mla_decode_b5c9cbf01c57fe28ab5c",
-        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_b5c9cbf01c57fe28ab5c",
-        "keys_per_stage": 32,
+        "kernel": "cake_nvfp4_sparse_mla_decode_2beb3ac65e8202fb7fef",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_2beb3ac65e8202fb7fef",
         "launch": {
-            "block": (448, 1, 1),
+            "block": (512, 1, 1),
             "cluster": (1, 4, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 226816,
+            "dynamic_smem_bytes": 219520,
             "use_pdl": False,
         },
-        "library": "cake_nvfp4_sparse_mla_decode_b5c9cbf01c57fe28ab5c",
+        "library": "cake_nvfp4_sparse_mla_decode_2beb3ac65e8202fb7fef",
         "logical": {
             "indices": "indices",
             "keys_per_cta": "keys_per_cta",
             "kv": "kv",
+            "kv_nope": "kv_rows",
             "out": "out",
             "out_scale": "out_scale",
             "q": "q",
             "qk_scale": "qk_scale",
             "topk": "topk",
         },
-        "max_keys_per_cta": 2048,
-        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode",
+        "max_keys": 0,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
         "occupancy_entry": "max_active_clusters",
         "workspace_rule": None,
     },
-    "cake_nvfp4_sparse_mla_decode_79fa77f600e1320149dd": {
+    "cake_nvfp4_sparse_mla_decode_49b00dcecc9e9934529f": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -314,6 +994,227 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 4,
+            "debug": 0,
+            "max_keys": 64,
+        },
+        "cluster": 4,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_49b00dcecc9e9934529f",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_49b00dcecc9e9934529f",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 4, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 129408,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_49b00dcecc9e9934529f",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 64,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_d542b3efeb634430ee60": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 4,
+            "debug": 0,
+            "max_keys": 128,
+        },
+        "cluster": 4,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_d542b3efeb634430ee60",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_d542b3efeb634430ee60",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 4, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 129408,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_d542b3efeb634430ee60",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 128,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_7a101562cfca6ea9996c": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 4,
+            "debug": 0,
+            "max_keys": 192,
+        },
+        "cluster": 4,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_7a101562cfca6ea9996c",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_7a101562cfca6ea9996c",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 4, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 219520,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_7a101562cfca6ea9996c",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 192,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_1f1a7edd888d8a0da211": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 4,
+            "debug": 0,
+            "max_keys": 256,
+        },
+        "cluster": 4,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_1f1a7edd888d8a0da211",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_1f1a7edd888d8a0da211",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 4, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 219520,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_1f1a7edd888d8a0da211",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 256,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_7ca1b6bf3a40d094efa6": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
             ["buffer", "indices"],
             ["buffer", "out"],
             ["parameter", "topk"],
@@ -326,39 +1227,41 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "build": {
             "cluster": 5,
+            "debug": 0,
+            "max_keys": 0,
         },
         "cluster": 5,
         "ffi_entry": "run",
         "grid_rule": {
             "kind": "tokens_by_cluster",
         },
-        "kernel": "cake_nvfp4_sparse_mla_decode_79fa77f600e1320149dd",
-        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_79fa77f600e1320149dd",
-        "keys_per_stage": 32,
+        "kernel": "cake_nvfp4_sparse_mla_decode_7ca1b6bf3a40d094efa6",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_7ca1b6bf3a40d094efa6",
         "launch": {
-            "block": (448, 1, 1),
+            "block": (512, 1, 1),
             "cluster": (1, 5, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 226816,
+            "dynamic_smem_bytes": 220160,
             "use_pdl": False,
         },
-        "library": "cake_nvfp4_sparse_mla_decode_79fa77f600e1320149dd",
+        "library": "cake_nvfp4_sparse_mla_decode_7ca1b6bf3a40d094efa6",
         "logical": {
             "indices": "indices",
             "keys_per_cta": "keys_per_cta",
             "kv": "kv",
+            "kv_nope": "kv_rows",
             "out": "out",
             "out_scale": "out_scale",
             "q": "q",
             "qk_scale": "qk_scale",
             "topk": "topk",
         },
-        "max_keys_per_cta": 2048,
-        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode",
+        "max_keys": 0,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
         "occupancy_entry": "max_active_clusters",
         "workspace_rule": None,
     },
-    "cake_nvfp4_sparse_mla_decode_5339f8b94959bd44e7f4": {
+    "cake_nvfp4_sparse_mla_decode_fa8ce8d9ceb0162c5ffa": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -366,6 +1269,227 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 5,
+            "debug": 0,
+            "max_keys": 64,
+        },
+        "cluster": 5,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_fa8ce8d9ceb0162c5ffa",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_fa8ce8d9ceb0162c5ffa",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 5, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 130048,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_fa8ce8d9ceb0162c5ffa",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 64,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_b0504562acde0b04a18d": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 5,
+            "debug": 0,
+            "max_keys": 128,
+        },
+        "cluster": 5,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_b0504562acde0b04a18d",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_b0504562acde0b04a18d",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 5, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 130048,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_b0504562acde0b04a18d",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 128,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_3a530e125689f2e26d2f": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 5,
+            "debug": 0,
+            "max_keys": 192,
+        },
+        "cluster": 5,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_3a530e125689f2e26d2f",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_3a530e125689f2e26d2f",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 5, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 220160,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_3a530e125689f2e26d2f",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 192,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_031e5e115fe4406c1991": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 5,
+            "debug": 0,
+            "max_keys": 256,
+        },
+        "cluster": 5,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_031e5e115fe4406c1991",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_031e5e115fe4406c1991",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 5, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 220160,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_031e5e115fe4406c1991",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 256,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_06aeadf2d8ac7424c83e": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
             ["buffer", "indices"],
             ["buffer", "out"],
             ["parameter", "topk"],
@@ -378,39 +1502,41 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "build": {
             "cluster": 6,
+            "debug": 0,
+            "max_keys": 0,
         },
         "cluster": 6,
         "ffi_entry": "run",
         "grid_rule": {
             "kind": "tokens_by_cluster",
         },
-        "kernel": "cake_nvfp4_sparse_mla_decode_5339f8b94959bd44e7f4",
-        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_5339f8b94959bd44e7f4",
-        "keys_per_stage": 32,
+        "kernel": "cake_nvfp4_sparse_mla_decode_06aeadf2d8ac7424c83e",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_06aeadf2d8ac7424c83e",
         "launch": {
-            "block": (448, 1, 1),
+            "block": (512, 1, 1),
             "cluster": (1, 6, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 226816,
+            "dynamic_smem_bytes": 220800,
             "use_pdl": False,
         },
-        "library": "cake_nvfp4_sparse_mla_decode_5339f8b94959bd44e7f4",
+        "library": "cake_nvfp4_sparse_mla_decode_06aeadf2d8ac7424c83e",
         "logical": {
             "indices": "indices",
             "keys_per_cta": "keys_per_cta",
             "kv": "kv",
+            "kv_nope": "kv_rows",
             "out": "out",
             "out_scale": "out_scale",
             "q": "q",
             "qk_scale": "qk_scale",
             "topk": "topk",
         },
-        "max_keys_per_cta": 2048,
-        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode",
+        "max_keys": 0,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
         "occupancy_entry": "max_active_clusters",
         "workspace_rule": None,
     },
-    "cake_nvfp4_sparse_mla_decode_79fc3ddfe4254b845585": {
+    "cake_nvfp4_sparse_mla_decode_eb71b60ae1631b05e289": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -418,6 +1544,227 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 6,
+            "debug": 0,
+            "max_keys": 64,
+        },
+        "cluster": 6,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_eb71b60ae1631b05e289",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_eb71b60ae1631b05e289",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 6, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 130688,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_eb71b60ae1631b05e289",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 64,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_043cd6a507373b4c1379": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 6,
+            "debug": 0,
+            "max_keys": 128,
+        },
+        "cluster": 6,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_043cd6a507373b4c1379",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_043cd6a507373b4c1379",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 6, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 130688,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_043cd6a507373b4c1379",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 128,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_952b02dc16cdc94d4c96": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 6,
+            "debug": 0,
+            "max_keys": 192,
+        },
+        "cluster": 6,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_952b02dc16cdc94d4c96",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_952b02dc16cdc94d4c96",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 6, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 220800,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_952b02dc16cdc94d4c96",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 192,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_165f65c46b5d41cdab69": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 6,
+            "debug": 0,
+            "max_keys": 256,
+        },
+        "cluster": 6,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_165f65c46b5d41cdab69",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_165f65c46b5d41cdab69",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 6, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 220800,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_165f65c46b5d41cdab69",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 256,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_2d84c2577cbebd591cd9": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
             ["buffer", "indices"],
             ["buffer", "out"],
             ["parameter", "topk"],
@@ -430,35 +1777,257 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "build": {
             "cluster": 8,
+            "debug": 0,
+            "max_keys": 0,
         },
         "cluster": 8,
         "ffi_entry": "run",
         "grid_rule": {
             "kind": "tokens_by_cluster",
         },
-        "kernel": "cake_nvfp4_sparse_mla_decode_79fc3ddfe4254b845585",
-        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_79fc3ddfe4254b845585",
-        "keys_per_stage": 32,
+        "kernel": "cake_nvfp4_sparse_mla_decode_2d84c2577cbebd591cd9",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_2d84c2577cbebd591cd9",
         "launch": {
-            "block": (448, 1, 1),
+            "block": (512, 1, 1),
             "cluster": (1, 8, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 226816,
+            "dynamic_smem_bytes": 220032,
             "use_pdl": False,
         },
-        "library": "cake_nvfp4_sparse_mla_decode_79fc3ddfe4254b845585",
+        "library": "cake_nvfp4_sparse_mla_decode_2d84c2577cbebd591cd9",
         "logical": {
             "indices": "indices",
             "keys_per_cta": "keys_per_cta",
             "kv": "kv",
+            "kv_nope": "kv_rows",
             "out": "out",
             "out_scale": "out_scale",
             "q": "q",
             "qk_scale": "qk_scale",
             "topk": "topk",
         },
-        "max_keys_per_cta": 2048,
-        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode",
+        "max_keys": 0,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_b65bf21f01d35c10e07e": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 8,
+            "debug": 0,
+            "max_keys": 64,
+        },
+        "cluster": 8,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_b65bf21f01d35c10e07e",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_b65bf21f01d35c10e07e",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 8, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 129920,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_b65bf21f01d35c10e07e",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 64,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_801249552261fb7e5d8c": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 8,
+            "debug": 0,
+            "max_keys": 128,
+        },
+        "cluster": 8,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_801249552261fb7e5d8c",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_801249552261fb7e5d8c",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 8, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 129920,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_801249552261fb7e5d8c",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 128,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_f139efb8395e9b8eb339": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 8,
+            "debug": 0,
+            "max_keys": 192,
+        },
+        "cluster": 8,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_f139efb8395e9b8eb339",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_f139efb8395e9b8eb339",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 8, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 220032,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_f139efb8395e9b8eb339",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 192,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
+    },
+    "cake_nvfp4_sparse_mla_decode_abfc3b744b2207189ce2": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "kv_nope"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 8,
+            "debug": 0,
+            "max_keys": 256,
+        },
+        "cluster": 8,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
+        },
+        "kernel": "cake_nvfp4_sparse_mla_decode_abfc3b744b2207189ce2",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_abfc3b744b2207189ce2",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 8, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 220032,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_sparse_mla_decode_abfc3b744b2207189ce2",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "kv_nope": "kv_rows",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys": 256,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode_tc",
         "occupancy_entry": "max_active_clusters",
         "workspace_rule": None,
     },
@@ -497,38 +2066,63 @@ def sm_count(device_index: int) -> int:
     return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
 
 
-def record_for(cluster: int) -> str:
-    """The name of the one record of ``cluster`` CTAs per token (``RuntimeError``
-    when none or more than one is: the route has one program per cluster size)."""
+def program_max_keys(keys_per_cta: int) -> int:
+    """The split bound of the program a launch of ``keys_per_cta`` keys per CTA
+    runs: the smallest of :data:`MAX_KEYS` holding it, 0 (the general program)
+    past 256."""
+    kpc = int(keys_per_cta)
+    return next((bound for bound in MAX_KEYS[1:] if kpc <= bound), 0)
+
+
+def record_for(cluster: int, max_keys: int) -> str:
+    """The name of the one record of ``cluster`` CTAs per token built for splits
+    of at most ``max_keys`` keys (``RuntimeError`` when none or more than one
+    is: the route has one program per cluster size and split bound)."""
     names = [
-        name for name, record in MODULES.items() if int(record["cluster"]) == cluster
+        name
+        for name, record in MODULES.items()
+        if int(record["cluster"]) == cluster and int(record["max_keys"]) == max_keys
     ]
     if len(names) != 1:
         raise RuntimeError(
             f"Cake NVFP4 sparse MLA decode delivers {len(names)} programs of cluster "
-            f"size {cluster}; the delivered cluster sizes are {CLUSTER_SIZES}"
+            f"size {cluster} and split bound {max_keys}; the delivered cluster sizes "
+            f"are {CLUSTER_SIZES}, the split bounds {MAX_KEYS}"
         )
     return names[0]
 
 
-def registered_clusters(arch: str) -> set[int]:
-    """Cluster sizes whose program is delivered for ``arch``."""
+def registered_programs(arch: str) -> set[tuple[int, int]]:
+    """``(cluster size, split bound)`` of every program delivered for ``arch``."""
     return {
-        int(record["cluster"])
+        (int(record["cluster"]), int(record["max_keys"]))
         for record in MODULES.values()
         if arch in record["arches"]
     }
 
 
-def select_module(arch: str, cluster: int) -> str:
-    """The record name of the program of ``cluster`` CTAs per token delivered for
-    ``arch`` (``NotImplementedError`` when this checkout delivers none)."""
-    if int(cluster) not in registered_clusters(arch):
+def registered_clusters(arch: str) -> set[int]:
+    """Cluster sizes whose programs are delivered for ``arch``, every split bound
+    of the size included."""
+    programs = registered_programs(arch)
+    return {
+        cluster
+        for cluster in CLUSTER_SIZES
+        if all((cluster, bound) in programs for bound in MAX_KEYS)
+    }
+
+
+def select_module(arch: str, cluster: int, keys_per_cta: int) -> str:
+    """The record name of the program of ``cluster`` CTAs per token that serves
+    ``keys_per_cta`` keys per CTA on ``arch`` (``NotImplementedError`` when this
+    checkout delivers none)."""
+    key = (int(cluster), program_max_keys(keys_per_cta))
+    if key not in registered_programs(arch):
         raise NotImplementedError(
-            f"The generated NVFP4 sparse MLA decode program (cluster size {cluster}) "
-            f"is not delivered for {arch} in this checkout"
+            f"The generated NVFP4 sparse MLA decode program (cluster size {key[0]}, "
+            f"split bound {key[1]}) is not delivered for {arch} in this checkout"
         )
-    return record_for(int(cluster))
+    return record_for(*key)
 
 
 def library_name(name: str, arch: str) -> str:
@@ -615,6 +2209,7 @@ __all__ = [
     "ARCHES",
     "ARCH_BY_CAPABILITY",
     "CLUSTER_SIZES",
+    "MAX_KEYS",
     "MODULES",
     "arch_for_capability",
     "device_arch",
@@ -622,8 +2217,10 @@ __all__ = [
     "launch_grid",
     "library_name",
     "load",
+    "program_max_keys",
     "record_for",
     "registered_clusters",
+    "registered_programs",
     "run_module",
     "select_module",
     "sm_count",

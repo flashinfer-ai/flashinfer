@@ -27,18 +27,42 @@ from .core import (
     logger,
     sm100a_nvcc_flags,
     sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
 )
 from .utils import write_if_different
 
 _SOURCE_FILE = "cake_megamoe_topk_reduce_kernels.cu"
 _BINDING_HEADER = "cake_megamoe_topk_reduce_binding.cuh"
-_KERNEL_SYMBOL = "kernel_cake_megamoe_workspace_topk_reduce_bfloat16_h4096_k6"
-# One arch-neutral generated source serves every datacenter-Blackwell target;
-# each module compiles it with its own ``-gencode`` and runs on the exact
-# compute capability it was built for.
+# The reducer in seven CTA shapes (threads x BF16 values per thread, with or
+# without the L2::256B prefetch size; the last three add each BF16 partial with
+# add.rn.f32.bf16 and load with L2::evict_first); all seven write bit-identical
+# rows.
+_KERNEL_SYMBOLS = (
+    "kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t512x2",
+    "kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t512x4",
+    "kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t512x4_pf256",
+    "kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t1024x4_pf256",
+    "kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t64x8_badd_l2ef",
+    "kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t256x2_badd_l2ef",
+    "kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t256x4_badd_l2ef",
+)
+# One arch-neutral generated source serves every target (sm_100a, sm_103a, sm_107a);
+# each module compiles it with its own ``-gencode``, runs on the exact compute
+# capability it was built for and launches the shape its architecture's token
+# tiers pick for the live token count (``CAKE_MEGAMOE_TOPK_REDUCE_ARCH``).
 _ARCHS: dict[str, dict[str, Any]] = {
-    "sm_100a": {"capability": (10, 0), "nvcc_flags": sm100a_nvcc_flags},
-    "sm_103a": {"capability": (10, 3), "nvcc_flags": sm103a_nvcc_flags},
+    "sm_100a": {
+        "capability": (10, 0),
+        "nvcc_flags": sm100a_nvcc_flags + ["-DCAKE_MEGAMOE_TOPK_REDUCE_ARCH=100"],
+    },
+    "sm_103a": {
+        "capability": (10, 3),
+        "nvcc_flags": sm103a_nvcc_flags + ["-DCAKE_MEGAMOE_TOPK_REDUCE_ARCH=103"],
+    },
+    "sm_107a": {
+        "capability": (10, 7),
+        "nvcc_flags": sm107a_nvcc_flags + ["-DCAKE_MEGAMOE_TOPK_REDUCE_ARCH=107"],
+    },
 }
 _CAPABILITY_TO_ARCH = {record["capability"]: arch for arch, record in _ARCHS.items()}
 _SUPPORTED_CAPABILITIES = tuple(sorted(_CAPABILITY_TO_ARCH))
@@ -83,7 +107,7 @@ def supports_device(device: torch.device | int | str | None = None) -> bool:
 
 
 def resolve_arch(device: torch.device | int | str | None = None) -> str:
-    """Return the reducer arch (``sm_100a`` / ``sm_103a``) for ``device``.
+    """Return the reducer arch (``sm_100a`` / ``sm_103a`` / ``sm_107a``) for ``device``.
 
     Raises ``NotImplementedError`` when the device has no reducer build; the
     caller is expected to fall back to the CuTeDSL terminal reducer.

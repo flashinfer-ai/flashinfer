@@ -2570,10 +2570,18 @@ class CutlassHummingConfig:
 
 @dataclass(frozen=True)
 class CuteDslConfig:
-    """CuteDSL FP4 backend for W4A4, W4A8, and W4A16.
+    """CuteDSL block-scaled backend for W4A4, W4A8, MXFP8, and W4A16.
 
     The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
+    ``swap_ab=True`` selects the Blackwell activations-on-B implementation and
+    its 16-row gated weight layout. Prepare weights with the same option.
+    ``prepare_weights`` is static: even when called through a config instance,
+    pass ``swap_ab=True`` explicitly to select that layout.
+    W4A16 always uses activations on B; False selects its in-kernel transpose
+    for compatibility with the original 64-row layout.
     """
+
+    swap_ab: bool = False
 
     @classmethod
     def supported(cls, arch: int) -> bool:
@@ -2592,12 +2600,14 @@ class CuteDslConfig:
         activation: Optional[ActivationConfig] = None,
         device=None,
         nvfp4_4over6: Optional[NVFP44Over6Config] = None,
+        swap_ab: bool = False,
     ):
         """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
         Register the result with ``MoEWeightPack.prepare_for("cute_dsl", ...)``.
-        ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or NVFP4×BF16 (CuTe-DSL W4A16).
-        Defaults to NVFP4×NVFP4.
+        ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8, or NVFP4×BF16
+        (CuTe-DSL W4A16). Defaults to NVFP4×NVFP4.
+        ``swap_ab`` must match the layer's ``CuteDslConfig.swap_ab``.
 
         ``nvfp4_4over6`` must equal the layer's ``QuantConfig.nvfp4_4over6``
         (see that field): it selects the NVFP4×NVFP4 pack's
@@ -2616,9 +2626,30 @@ class CuteDslConfig:
             activation=activation,
             device=device,
             nvfp4_4over6=nvfp4_4over6,
+            swap_ab=swap_ab,
         )
 
+    @staticmethod
+    def prepare_activations(hidden_states_bf16, *, quant: Optional[QuantConfig] = None):
+        """Quantize BF16 activations to MXFP8 for MXFP8×MXFP8.
+
+        Returns the canonical linear pack shared with
+        ``TrtllmFp8BlockConfig.prepare_activations``: E4M3 ``[M, H]`` and
+        row-major E8M0 scales ``[M, H // 32]``.
+        """
+        from .prepare import prepare_trtllm_fp8_block_activations
+
+        pair = (QuantFormat.MXFP8, QuantFormat.MXFP8)
+        quant = _mxfp8_activation_quant(quant, pair, "CuteDslConfig")
+        if quant.swizzled_scale_factors is True:
+            raise ValueError(
+                "CuteDslConfig consumes only the linear activation scale layout."
+            )
+        return prepare_trtllm_fp8_block_activations(hidden_states_bf16, quant=quant)
+
     def __repr__(self) -> str:
+        if self.swap_ab:
+            return "CuteDslConfig(swap_ab=True)"
         return "CuteDslConfig()"
 
 
@@ -2732,9 +2763,15 @@ class SM12xNvfp4Config:
     scales are taken from the optional view keys ``"w1_input_global_scale"``
     and ``"w2_input_global_scale"`` (FP32 scalars, the quantization multiplier
     ``1 / input_scale``) and default to 1. Requires ``hidden_size % 128 == 0``
-    and ``intermediate_size % 64 == 0``. Supports ``SwiGLU`` with default
-    scalars and ``ReLU2``. Expert parallelism and fused shared experts are not
-    supported.
+    and ``intermediate_size % 64 == 0``. Supports ``SwiGLU`` with default alpha
+    and beta and a finite positive limit, ``SiTU`` with a finite linear
+    scale and no clamp limit, and ``ReLU2``. On 188-SM devices, compatible
+    calls select between the monolithic kernel and native modular operators
+    by shape. Non-default SwiGLU limits, SiTU and explicit PDL requests use
+    the modular operators; gated calls to those operators require
+    ``intermediate_size % 128 == 0``. Default SwiGLU retains the monolithic
+    path when only 64-column alignment is available. Expert parallelism and
+    fused shared experts are not supported.
     """
 
     @classmethod
@@ -2946,14 +2983,16 @@ class CudnnFrostMxfp8Mxfp4Config:
 
 @dataclass(frozen=True)
 class FrostLowLatencyConfig:
-    """Low-token routed MoE on SM100/SM103/SM107, with FMA-only SM120 support.
+    """Low-token routed MoE on SM80/SM90/SM100/SM103/SM107/SM120.
+
+    SM80 supports BF16/FP16 inputs and weights.
 
     SM90 supports BF16, FP16, ordinary per-tensor FP8, DeepSeek FP8 and
     NVFP4/MXFP4/MXINT4-weight with BF16/FP16-activation FMA.
     Explicit opt-in; omitted from the default backend list. Autotuning selects
     Tensor Core tile sizes or a scalar FMA tactic (top-k <= 32) using the same
     prepared weights and numerical contract. Both are multi-kernel pipelines,
-    with precomputed routing and no EP communication. The Tensor Core path
+    with precomputed routing and no EP communication. The MX Tensor Core path
     overlaps its fused GU/activation/quantizer and Down GEMM through PDL.
     Set ``max_num_tokens`` up to 8 for tuning; the default admits at most 2.
     Prepare other backend views as well to permit fallback for larger inputs.
@@ -2965,12 +3004,25 @@ class FrostLowLatencyConfig:
     outputs to the configured BF16/FP16 output dtype. Combine uses ordered,
     separate FP32 multiplication and addition. Packed routing scores retain
     BF16 rounding regardless of the input/output dtype. This is distinct from
-    the MX intermediate quantization/combine contract.
+    the MX intermediate quantization/combine contract. SM80, SM90 and SM120 also
+    offer grouped BF16/FP16 Tensor Core candidates at H=2048/I=512/top-k=10,
+    T=4 or 8, with finalized matching output dtype. SM80 admits default SwiGLU
+    and ReLU2; SM90/SM120 add GeGLU, and ReLU2/SiLU use T8 on SM90 and T4/T8
+    on SM120. SM120 also admits GeGLUTanh and default SiTU/SwiGLUStep
+    at T4/T8 with matching BF16/FP16 types. SM80 additionally admits BF16 default SwiGLU at
+    H=7168/I=2048/top-k=8 and T=4 or 8. These projections share the typed
+    intermediate and ordered combine contract;
+    FMA remains the untuned default and a tuning candidate.
 
     Ordinary per-tensor E4M3 FP8 uses static calibration multipliers, with
     BF16 FC1 preactivation rounding as in the CUTLASS per-tensor backbone.
     Activation and intermediate quantization remain fused into FC1; FC2
     produces BF16 expert/final outputs with ordered FP32 multiply/add combine.
+    On SM90, finalized default SwiGLU/SiTU at H=2048/I=512/top-k=10, T=4 or 8,
+    and ReLU2 at T=8 also offer grouped E4M3 WGMMA with bounded-K64 FP32 partial
+    promotion. SM120 adds grouped E4M3 warp MMA for the same shape, with
+    default SwiGLU/SiTU/ReLU2 at T4/T8. Static scales stay live, and FMA
+    remains the untuned default and tuning candidate.
     The TRT-LLM per-tensor path retains FP32 preactivations, so its rounding
     contract differs even with identical quantized weights and scales.
 
@@ -2999,6 +3051,15 @@ class FrostLowLatencyConfig:
     NVFP4 weights/inputs use shared FMA with H divisible by 512, I by 128,
     and top-k at most 32. It retains BF16 activation/expert rounding and
     separate FP32 multiply/add combine; the 4over6 recipe is not supported.
+
+    With MXFP8 activations and MXFP8/MXFP4 weights, or NVFP4 activations and
+    NVFP4 weights, expert IDs outside ``[0, num_experts)`` mark unrouted slots.
+    For these format pairs, finalization ignores those slots, including their
+    scores, and raw output writes zero rows with the usual identity route
+    mapping. Raw routing scores are returned unchanged apart from packed BF16
+    rounding; a downstream reducer must also exclude unrouted slots before
+    multiplying scores that may be NaN or Inf. Other format pairs require
+    expert IDs in ``[0, num_experts)``.
     """
 
     max_num_tokens: int = 2
@@ -3009,7 +3070,7 @@ class FrostLowLatencyConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (90, 100, 103, 107, 120)
+        return arch in (80, 90, 100, 103, 107, 120)
 
     @staticmethod
     def prepare_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
@@ -3224,8 +3285,135 @@ class FrostLowLatencyConfig:
         )
 
 
+# Design notes: the kernels of this backend took optimisation ideas from the package's other MoE backends: the swapped-AB
+# decode records and the PDL wait / trigger placement follow Prims-TS (the open counterpart of TRTLLM-Gen's MoE GEMMs)
+# and TRTLLM-Gen's routing and finalize kernels; the token gather folded into GEMM1 follows the CuTe-DSL MoE kernels' and
+# cuDNN Frost's GATHER variants; the slot-ordered combine follows Frost low-latency's in-kernel slot fold and the CUTLASS
+# backend's unfused finalize. Each is a placement of the class's dataflow: the same bits, placed as those kernels place
+# theirs.
+@dataclass(frozen=True)
+class BatchInvariantBf16Config:
+    """The batch-invariant MoE backend: the bf16 classes of the mode documented in ``flashinfer/batch_invariant/README.md``
+    (one class per typed activation and parameter set: ``SwiGLU`` with any ``alpha`` / ``beta`` / ``limit``,
+    ``SwiGLUStep``, ``GeGLU``, ``GeGLUTanh``, ``SiTU``, ``PowLU``; ``ReLU2``, ``Identity``, ``GELU``, ``ReLU``, ``SiLU``),
+    on SM100 / SM103 / SM107.
+
+    Every output bit is a function of the token's own row, its ``top_k`` experts and routing weights and the expert
+    weights alone: the batch size and composition, the row's position, the expert loads and the grouped-GEMM record the
+    dispatcher or the autotuner picks never enter the dataflow (run-to-run determinism, batch / permutation / sub-batch
+    invariance, configuration agreement; the proofs are the ``MoE`` Lean module of the mode). The combine is the
+    slot-order fp32 fold of the class; ``MoEFinalizeConfig(do_finalize=False)`` leaves it to the caller and returns the
+    layer's triple ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``: GEMM2's bf16 rows grouped by expert
+    in expert order and, inside a group, in token-slot order (a function of the routing alone, so the rows are
+    reproducible; rows past the valid ones are not written), the weights as the combine folds them (fp32 from logits,
+    where the other backends return bf16: the fold widens a bf16 weight exactly, so a receiver that needs bf16 rounds
+    them itself; fp32 for fp32 pre-routed weights; the mode's bf16 for packed and bf16 pre-routed weights) and the flat
+    ``[num_tokens * top_k]`` int32 map, ``-1`` for a dropped slot. The class's slot-order fold over the triple is the
+    finalized output bit for bit: ``flashinfer.fused_moe.batch_invariant.api.combine_unfinalized(*triple)`` computes it
+    with the combine kernel of the finalized forward. ``use_fused_finalize`` is ignored (the combine is never an atomic
+    finalize).
+    All three routing input modes are taken: ``FromLogits`` runs the class's own routing (``Default``, ``Renormalize``,
+    ``RenormalizeNaive``, ``Sigmoid``, ``SigmoidRenorm``, ``TopK``, ``Llama4`` (``top_k = 1``), ``TopKSigmoid`` and
+    ``DeepSeekV3`` with or without expert groups), the pre-routed modes take the caller's ids and weights under any
+    ``RoutingConfig``: a routing term the from-logits mode has no class for (the group shape rule, ``Llama4`` with
+    ``top_k > 1``, ``MiniMax2``) is refused at a from-logits call, never at construction. A ``-inf`` logit (a framework's expert mask) is not an exact mask: the class's declared ``exp`` clamps
+    its argument below, so a masked expert keeps a positive score of the smallest magnitudes; while ``top_k`` unmasked
+    experts exist it is never selected and the weights are exactly those of the row without it, otherwise masked experts
+    fill the remaining slots (in index order; by their bias for the biased methods) with such weights, and a fully masked
+    row is not a defined routing. A NaN logit is never selected and contributes nothing to the normalisation: the row
+    maximum skips it, its softmax term is ``+0`` (not the clamped ``exp`` of a ``-inf`` logit) and its selection score is
+    NaN under every method, so the other experts' weights are the row's with the NaN experts absent; when fewer than
+    ``top_k`` experts of a row have a non-NaN score, each remaining slot takes the lowest expert index the row has not
+    taken, with a NaN weight: the row's output is NaN and every id stays in range. A pre-routed expert id outside
+    ``[0, num_experts)`` is a dropped slot: neither gathered nor computed, it contributes ``+0`` to its token's combine
+    whatever its weight (a token whose slots are all dropped gives a zero row); nothing is validated on the host.
+    Unsupported inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend never falls
+    back and is not a default candidate: name it in ``BackendOptions`` (alone, it skips the shootout). The layer's own
+    checks come first: ``MoELayer`` runs every candidate's support check at construction (this backend refuses
+    ``top_k`` / ``num_experts`` beyond its bounds, fused shared experts and a local expert range outside the experts;
+    the routing term is checked at the from-logits call) and
+    reports the rejections as its ``RuntimeError`` listing each reason, and at the call its pack
+    filter admits only a bf16 ``[num_tokens, H]`` activation (an fp16 one is its ``NotImplementedError``: no usable
+    backend); what reaches the runner (an unimplemented method from logits, a bias or expert groups against the method,
+    a weight view of another activation or configuration, the runner driven directly) raises
+    ``BatchInvariantUnsupportedError``.
+
+    Expert parallelism: a shard (``ExpertConfig(local_expert_offset=offset, local_num_experts=E_local)``, weights prepared
+    for its ``E_local`` experts) routes over the ``num_experts`` global experts (from logits, or the caller's global ids)
+    and computes the slots whose expert lies in ``[offset, offset + E_local)``; every other slot is dropped (the term
+    ``+0`` in its token's fold, ``-1`` in the unfinalized map), so the rank's output is the dense class's fold restricted
+    to its experts: within one placement of the experts over the ranks every guarantee holds per rank, and the rows of
+    the unfinalized form are bit for bit the dense run's rows for those slots. The dense output is recovered bit for bit
+    by folding the ranks' unfinalized rows in slot order (the class's combine); a sum of the ranks' finalized partials is
+    another association and is not promised to equal it.
+
+    Weights: ``prepare_weights`` takes the canonical ``w1 [E, 2I, H]`` (rows ``[up, gate]``) for the gated activations or
+    ``w1 [E, I, H]`` for the ungated ones, and ``w2 [E, H, I]``, bf16 (``E`` the local experts of a shard); the activation
+    names the chain of the view; activations are bf16 ``[num_tokens, H]`` as given.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103, 107)
+
+    @staticmethod
+    def prepare_weights(
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        *,
+        num_local_experts: Optional[int] = None,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+        activation: Optional["ActivationConfig"] = None,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Any]:
+        """The backend's weight view: the gate / up rows interleaved for a gated activation, as given for an ungated one,
+        and the activation's chain (``activation`` defaults to ``SwiGLU()``). A supplied ``num_local_experts`` /
+        ``hidden_size`` / ``intermediate_size`` must agree with the weights' geometry (``ValueError`` otherwise)."""
+        from .batch_invariant.api import MoEWeights
+        from .batch_invariant.spec import activation_of
+
+        chain = activation_of(activation if activation is not None else SwiGLU())
+        if w1.dim() != 3 or w2.dim() != 3:
+            raise TypeError(
+                "BatchInvariantBf16Config.prepare_weights takes w1 [E, N1, H] and w2 [E, H, I]"
+            )
+        E, N1, H = w1.shape
+        for name, given, actual in (
+            ("num_local_experts", num_local_experts, E),
+            ("hidden_size", hidden_size, H),
+            ("intermediate_size", intermediate_size, N1 // 2 if chain.gated else N1),
+        ):
+            if given is not None and int(given) != actual:
+                raise ValueError(
+                    f"BatchInvariantBf16Config.prepare_weights: {name} {given} does not match the weights' "
+                    f"{actual} (w1 {tuple(w1.shape)}, w2 {tuple(w2.shape)}, "
+                    f"{'gated' if chain.gated else 'ungated'} activation)"
+                )
+        w1 = w1.to(device=device) if device is not None else w1
+        w2 = w2.to(device=device) if device is not None else w2
+        return MoEWeights.prepare(
+            w1.to(torch.bfloat16),
+            w2.to(torch.bfloat16),
+            gated=chain.gated,
+            act=chain.act,
+            params=chain.params,
+        ).view()
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states: torch.Tensor, *, quant: Optional["QuantConfig"] = None
+    ) -> Tuple[torch.Tensor, None]:
+        """bf16 activations as given (no scale)."""
+        return hidden_states.to(torch.bfloat16).contiguous(), None
+
+    def __repr__(self) -> str:
+        return "BatchInvariantBf16Config()"
+
+
 # Union type for backend config
 BackendConfigType = Union[
+    BatchInvariantBf16Config,
     FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
@@ -3271,6 +3459,7 @@ BackendConfigType = Union[
 ]
 
 ALL_BACKEND_CONFIGS = (
+    BatchInvariantBf16Config,
     FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
@@ -3413,6 +3602,14 @@ class MoEConfig:
         # Not in check_support(): MoELayer swallows its exceptions to filter
         # backends, so errors raised there surface as "no backend available".
         self._validate_fused_shared_experts()
+        if (
+            len({c.swap_ab for c in self.backend if isinstance(c, CuteDslConfig)}) > 1
+            and self.activation.is_gated
+        ):
+            raise ValueError(
+                "Mixed CuteDslConfig swap_ab modes need separate gated weight "
+                "views; use a separate MoELayer for each mode."
+            )
 
     def _validate_fused_shared_experts(self) -> None:
         s = self.experts.num_fused_shared_experts
@@ -3593,8 +3790,14 @@ class MoEActivationPack:
     # Pair-specific scales documented above; None for BF16 and per-tensor FP8.
     hidden_states_scale: Optional[Tensor]
     # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
-    # A negative id marks an unrouted slot (e.g. CUDA-graph padding) only on
-    # b12x for now; other backends define no behavior for negative ids.
+    # Runners that route through the TRT-LLM-Gen routing kernels (TRTLLM,
+    # Prims-TS, and CuteDSL via moe_sort) skip every id outside this rank's
+    # [local_expert_offset, local_expert_offset + local_num_experts), negative
+    # ids included. b12x treats a negative id as an unrouted slot (e.g.
+    # CUDA-graph padding). frost_low_latency accepts IDs outside [0, num_experts)
+    # as unrouted for its MXFP8 and NVFP4 activation paths; see
+    # FrostLowLatencyConfig for exact format pairs and finalized/raw semantics.
+    # Other backends define no behavior for negative IDs.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
     # [M, top_k] routing weights: float32 for PackedPrecomputed; bfloat16 or
     # float32 for TRTLLM UnpackedPrecomputed.
@@ -3748,8 +3951,8 @@ class MoEWeightPack:
     ``get_view(key)``.
 
     Holding multiple materializations is intentional — that's the memory cost
-    the user pays for cross-backend autotune.  Each view is the exact kwargs
-    dict that runner's ``forward`` expects for weight-side arguments.
+    the user pays for cross-backend autotune.  Each view contains the weight
+    tensors and layout metadata consumed by its runner.
 
     Every ``XxxConfig.prepare_weights`` takes the same canonical source
     layout: ``w1`` is ``[E, 2I, H]`` for gated activations with rows in
@@ -3758,14 +3961,14 @@ class MoEWeightPack:
     want ``[gate, up]`` swap halves inside their prepare helper.
     """
 
-    native_views: Dict[str, Dict[str, Tensor]] = field(default_factory=dict)
+    native_views: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
-    def prepare_for(self, backend_key: str, view: Dict[str, Tensor]) -> None:
+    def prepare_for(self, backend_key: str, view: Dict[str, Any]) -> None:
         """Register a backend-native weight view.  Caller owns the quantization
         / swizzle / layout conversion — this method just stores the result."""
         self.native_views[backend_key] = view
 
-    def get_view(self, backend_key: str) -> Dict[str, Tensor]:
+    def get_view(self, backend_key: str) -> Dict[str, Any]:
         if backend_key not in self.native_views:
             raise KeyError(
                 f"Weights not prepared for backend {backend_key!r}. "

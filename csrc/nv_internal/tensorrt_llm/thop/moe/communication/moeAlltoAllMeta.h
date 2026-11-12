@@ -96,8 +96,27 @@ enum MoeA2AMetaInfoIndex : int64_t
     CFT_ENABLED_INDEX = 23,
     // Total required bytes per rank, including all control buffers, payloads and alignment padding.
     WORKSPACE_SIZE_INDEX = 24,
+
+    // Sentinel protocol (flashinfer/comm/moe_alltoall_sentinel.cuh), appended after the regions above
+    // by moe_a2a_sentinel_extend_workspace_layout. Every field is zero when it is not allocated.
+    // Landing rows per source rank: the largest max_tokens_per_rank of a sentinel step.
+    SENTINEL_MAX_NUM_TOKENS_INDEX = 25,
+    // Payload format (moe_alltoall_sentinel::PayloadFormat) and hidden size the landing rows hold.
+    SENTINEL_PAYLOAD_FORMAT_INDEX = 26,
+    SENTINEL_HIDDEN_SIZE_INDEX = 27,
+    // Round state: int32 words (epoch, ...), then a uint64 receive-source mask per token slot.
+    SENTINEL_STATE_OFFSET_INDEX = 28,
+    // Landing rows: payload, scale and weight rows, then two sets of expert-id rows.
+    SENTINEL_LANDING_OFFSET_INDEX = 29,
+    // Combine landing rows: one bf16 partial row per (source rank, token).
+    SENTINEL_COMBINE_LANDING_OFFSET_INDEX = 30,
+    // Receive buffers of a sentinel dispatch, packed like the dispatch payload region.
+    SENTINEL_RECV_OFFSET_INDEX = 31,
+    // Reserved receive capacity, including payload alignment padding.
+    SENTINEL_RECV_SIZE_INDEX = 32,
+
     // Number of int64_t entries in the metadata tensor; not a stored layout field.
-    NUM_METAINFO_FIELDS = 25
+    NUM_METAINFO_FIELDS = 33
 };
 
 using MoeA2AWorkspaceLayout = std::array<int64_t, NUM_METAINFO_FIELDS>;
@@ -132,6 +151,14 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
         {"MOE_A2A_EPLB_STATS_NUM_EXPERTS_INDEX", EPLB_STATS_NUM_EXPERTS_INDEX},
         {"MOE_A2A_CFT_ENABLED_INDEX", CFT_ENABLED_INDEX},
         {"MOE_A2A_WORKSPACE_SIZE_INDEX", WORKSPACE_SIZE_INDEX},
+        {"MOE_A2A_SENTINEL_MAX_NUM_TOKENS_INDEX", SENTINEL_MAX_NUM_TOKENS_INDEX},
+        {"MOE_A2A_SENTINEL_PAYLOAD_FORMAT_INDEX", SENTINEL_PAYLOAD_FORMAT_INDEX},
+        {"MOE_A2A_SENTINEL_HIDDEN_SIZE_INDEX", SENTINEL_HIDDEN_SIZE_INDEX},
+        {"MOE_A2A_SENTINEL_STATE_OFFSET_INDEX", SENTINEL_STATE_OFFSET_INDEX},
+        {"MOE_A2A_SENTINEL_LANDING_OFFSET_INDEX", SENTINEL_LANDING_OFFSET_INDEX},
+        {"MOE_A2A_SENTINEL_COMBINE_LANDING_OFFSET_INDEX", SENTINEL_COMBINE_LANDING_OFFSET_INDEX},
+        {"MOE_A2A_SENTINEL_RECV_OFFSET_INDEX", SENTINEL_RECV_OFFSET_INDEX},
+        {"MOE_A2A_SENTINEL_RECV_SIZE_INDEX", SENTINEL_RECV_SIZE_INDEX},
         {"MOE_A2A_NUM_METAINFO_FIELDS", NUM_METAINFO_FIELDS},
         {"MOE_A2A_MAX_RANKS", kMaxRanks},
         {"MOE_A2A_MAX_TOP_K", kMaxTopK},

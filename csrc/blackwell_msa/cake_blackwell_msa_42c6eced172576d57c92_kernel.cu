@@ -393,10 +393,13 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     return result;
 }
 
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_blackwell_msa_42c6eced172576d57c92
+#endif
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_blackwell_msa_42c6eced172576d57c92(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap k_scale, const __grid_constant__ CUtensorMap v, const __grid_constant__ CUtensorMap v_scale, __nv_bfloat16* __restrict__ out, float* __restrict__ lse, float* __restrict__ temperature_lse, int* __restrict__ q2k_indices, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int* __restrict__ q_offsets, int* __restrict__ kv_lens, int* __restrict__ page_table, int total_q, int num_q_heads, int num_kv_heads, int topk, int batch_size, int uniform_q_len, int max_pages, int causal, int derive_q_offset, float softmax_scale_log2, float k_global_scale, float v_global_scale, float lse_temperature_scale, int return_softmax_lse, int return_temperature_lse)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap k_scale, const __grid_constant__ CUtensorMap v, const __grid_constant__ CUtensorMap v_scale, __nv_bfloat16* __restrict__ out, float* __restrict__ lse, float* __restrict__ temperature_lse, int* __restrict__ q2k_indices, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int* __restrict__ q_offsets, int* __restrict__ kv_lens, int* __restrict__ page_table, int total_q, int num_q_heads, int num_kv_heads, int topk, int batch_size, int uniform_q_len, int max_pages, int causal, int derive_q_offset, float softmax_scale_log2, float k_global_scale, float v_global_scale, float lse_temperature_scale, int return_softmax_lse, int return_temperature_lse)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -2176,20 +2179,24 @@ kernel_cake_blackwell_msa_42c6eced172576d57c92(const __grid_constant__ CUtensorM
                 int n_block_1 = num_n_blocks_3 - 1 - n_iter_1;
                 int token_base = k_start_3 + n_block_1 * 128;
                 int page_head = kv_head_3;
+#ifndef CAKE_FLAT_KV
                 int physical_page = page_table[batch_3 * max_pages + n_block_1];
                 if (physical_page < 0) {
                     physical_page = 0;
                 }
                 token_base = 0;
                 page_head = physical_page * num_kv_heads + kv_head_3;
+#endif
                 mbarrier_wait(kv_src_empty_addr, kv_src_empty_phase);
                 kv_src_empty_phase ^= 1;
                 if (elect_sync()) {
                     mbarrier_arrive_expect_tx(kv_src_full_addr, 16384);
                     int token0 = token_base;
                     int token1 = token_base + 64;
+#ifndef CAKE_FLAT_KV
                     token0 = 0;
                     token1 = 64;
+#endif
                     tma_3d_gmem2smem(kv_quant_smem_addr, (&k), 0, token0, page_head, kv_src_full_addr);
                     tma_3d_gmem2smem(kv_quant_smem_addr + 8192, (&k), 0, token1, page_head, kv_src_full_addr);
                 }
@@ -2201,8 +2208,10 @@ kernel_cake_blackwell_msa_42c6eced172576d57c92(const __grid_constant__ CUtensorM
                     mbarrier_arrive_expect_tx(kv_src_full_addr, 16384);
                     int token0_1 = token_base;
                     int token1_1 = token_base + 64;
+#ifndef CAKE_FLAT_KV
                     token0_1 = 0;
                     token1_1 = 64;
+#endif
                     tma_3d_gmem2smem(kv_quant_smem_addr, (&v), 0, token0_1, page_head, kv_src_full_addr);
                     tma_3d_gmem2smem(kv_quant_smem_addr + 8192, (&v), 0, token1_1, page_head, kv_src_full_addr);
                 }

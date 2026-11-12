@@ -168,19 +168,18 @@ __device__ __forceinline__ void mbarrier_wait_cluster_hint(
 }
 
 
-__device__ __forceinline__ void tcgen05_mma_mxf4nvf4_bs_cta2(
+
+__device__ __forceinline__ void tcgen05_mma_mxf4nvf4_bs_cta2_leader(
     int taddr, uint64_t a_desc, uint64_t b_desc, uint32_t i_desc,
-    int sfa_taddr, int sfb_taddr, int enable_input_d) {
+    int sfa_taddr, int sfb_taddr, int enable_input_d, uint32_t leader) {
     asm volatile(
         "{\n\t"
-        ".reg .pred p;\n\t"
+        ".reg .pred leader, p;\n\t"
+        "setp.ne.b32 leader, %7, 0;\n\t"
         "setp.ne.b32 p, %6, 0;\n\t"
-        "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.scale_vec::4X"
-        " [%0], %1, %2, %3, [%4], [%5], p;\n\t"
+        "@leader tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.scale_vec::4X [%0], %1, %2, %3, [%4], [%5], p;\n\t"
         "}\n"
-        :: "r"(taddr), "l"(a_desc), "l"(b_desc),
-           "r"(i_desc), "r"(sfa_taddr), "r"(sfb_taddr),
-           "r"(enable_input_d));
+        :: "r"(taddr), "l"(a_desc), "l"(b_desc), "r"(i_desc), "r"(sfa_taddr), "r"(sfb_taddr), "r"(enable_input_d), "r"(leader) : "memory");
 }
 
 
@@ -252,11 +251,16 @@ __device__ __forceinline__ uint64_t make_sf_cp_desc_lo_sbo128(int lo) {
 }
 
 
-__device__ __forceinline__ void tcgen05_cp_32x128b_warpx4_cta2(
-    int taddr, uint64_t s_desc) {
+
+__device__ __forceinline__ void tcgen05_cp_32x128b_warpx4_cta2_leader(
+    int taddr, uint64_t s_desc, uint32_t leader) {
     asm volatile(
-        "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-        :: "r"(taddr), "l"(s_desc));
+        "{\n\t"
+        ".reg .pred leader;\n\t"
+        "setp.ne.b32 leader, %2, 0;\n\t"
+        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t"
+        "}\n"
+        :: "r"(taddr), "l"(s_desc), "r"(leader) : "memory");
 }
 
 
@@ -280,6 +284,7 @@ __device__ __forceinline__ void tma_store_4d(
         " [%0, {%1, %2, %3, %4}], [%5];"
         :: "l"(tmap), "r"(x), "r"(y), "r"(z), "r"(w), "r"(smem_addr) : "memory");
 }
+
 
 
 
@@ -532,7 +537,6 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_48daf3781ff6b1c46b43(const __grid_con
     if (warp == 1) {
         { // mma_main
             unsigned int mma_tma_stage = 0;
-            unsigned int acc_stage = 0;
             unsigned int work_stage_1 = 0;
             unsigned int _phase_epilogue_done = 1;
             unsigned int _phase_tma_full = 0;
@@ -540,67 +544,66 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_48daf3781ff6b1c46b43(const __grid_con
             if (cta_rank == 0) {
                 #pragma unroll 1
                 for (unsigned int _tile_iter_1 = 0; _tile_iter_1 < m_tiles / CTA_GROUP * N_TILES; _tile_iter_1++) {
-                    mbarrier_wait(epilogue_done_addr + (acc_stage) * 8, _phase_epilogue_done);
+                    mbarrier_wait(epilogue_done_addr, _phase_epilogue_done);
                     #pragma unroll 1
                     for (int iter_k_1 = 0; iter_k_1 < NUM_K_ITERS; iter_k_1++) {
                         mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int init_flag = ((iter_k_1 == 0) ? 1 : 0);
-                        if (elect_sync()) {
-                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa, make_sf_cp_desc_lo_sbo128((((smem_v4_addr) >> 4) + (mma_tma_stage) * 2432)));
-                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb, make_sf_cp_desc_lo_sbo128((((smem_v8_addr) >> 4) + (mma_tma_stage) * 2432)));
-                            tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 4), make_sf_cp_desc_lo_sbo128((((smem_v8_addr) >> 4) + (mma_tma_stage) * 2432 + 32)));
-                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 4, make_sf_cp_desc_lo_sbo128((((smem_v5_addr) >> 4) + (mma_tma_stage) * 2432)));
-                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 8, make_sf_cp_desc_lo_sbo128((((smem_v9_addr) >> 4) + (mma_tma_stage) * 2432)));
-                            tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 8 + 4), make_sf_cp_desc_lo_sbo128((((smem_v9_addr) >> 4) + (mma_tma_stage) * 2432 + 32)));
-                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 8, make_sf_cp_desc_lo_sbo128((((smem_v6_addr) >> 4) + (mma_tma_stage) * 2432)));
-                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 16, make_sf_cp_desc_lo_sbo128((((smem_v10_addr) >> 4) + (mma_tma_stage) * 2432)));
-                            tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 16 + 4), make_sf_cp_desc_lo_sbo128((((smem_v10_addr) >> 4) + (mma_tma_stage) * 2432 + 32)));
-                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 12, make_sf_cp_desc_lo_sbo128((((smem_v7_addr) >> 4) + (mma_tma_stage) * 2432)));
-                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 24, make_sf_cp_desc_lo_sbo128((((smem_v11_addr) >> 4) + (mma_tma_stage) * 2432)));
-                            tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 24 + 4), make_sf_cp_desc_lo_sbo128((((smem_v11_addr) >> 4) + (mma_tma_stage) * 2432 + 32)));
-                            int _smem_desc_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
-                            int _smem_desc_lo_1 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
-                            {
-                                uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_0) | ((uint64_t)0x40004040 << 32);
-                                uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_1) | ((uint64_t)0x40004040 << 32);
+                        uint32_t _elected_0 = elect_sync();
+                        tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_tmem_sfa, make_sf_cp_desc_lo_sbo128((((smem_v4_addr) >> 4) + (mma_tma_stage) * 2432)), _elected_0);
+                        tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_tmem_sfb, make_sf_cp_desc_lo_sbo128((((smem_v8_addr) >> 4) + (mma_tma_stage) * 2432)), _elected_0);
+                        tcgen05_cp_32x128b_warpx4_cta2_leader((tmem_tmem_sfb + 4), make_sf_cp_desc_lo_sbo128((((smem_v8_addr) >> 4) + (mma_tma_stage) * 2432 + 32)), _elected_0);
+                        tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_tmem_sfa + 4, make_sf_cp_desc_lo_sbo128((((smem_v5_addr) >> 4) + (mma_tma_stage) * 2432)), _elected_0);
+                        tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_tmem_sfb + 8, make_sf_cp_desc_lo_sbo128((((smem_v9_addr) >> 4) + (mma_tma_stage) * 2432)), _elected_0);
+                        tcgen05_cp_32x128b_warpx4_cta2_leader((tmem_tmem_sfb + 8 + 4), make_sf_cp_desc_lo_sbo128((((smem_v9_addr) >> 4) + (mma_tma_stage) * 2432 + 32)), _elected_0);
+                        tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_tmem_sfa + 8, make_sf_cp_desc_lo_sbo128((((smem_v6_addr) >> 4) + (mma_tma_stage) * 2432)), _elected_0);
+                        tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_tmem_sfb + 16, make_sf_cp_desc_lo_sbo128((((smem_v10_addr) >> 4) + (mma_tma_stage) * 2432)), _elected_0);
+                        tcgen05_cp_32x128b_warpx4_cta2_leader((tmem_tmem_sfb + 16 + 4), make_sf_cp_desc_lo_sbo128((((smem_v10_addr) >> 4) + (mma_tma_stage) * 2432 + 32)), _elected_0);
+                        tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_tmem_sfa + 12, make_sf_cp_desc_lo_sbo128((((smem_v7_addr) >> 4) + (mma_tma_stage) * 2432)), _elected_0);
+                        tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_tmem_sfb + 24, make_sf_cp_desc_lo_sbo128((((smem_v11_addr) >> 4) + (mma_tma_stage) * 2432)), _elected_0);
+                        tcgen05_cp_32x128b_warpx4_cta2_leader((tmem_tmem_sfb + 24 + 4), make_sf_cp_desc_lo_sbo128((((smem_v11_addr) >> 4) + (mma_tma_stage) * 2432 + 32)), _elected_0);
+                        int _smem_desc_lo_1 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
+                        int _smem_desc_lo_2 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
+                        {
+                            uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_1) | ((uint64_t)0x40004040 << 32);
+                            uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_2) | ((uint64_t)0x40004040 << 32);
 
-                                tcgen05_mma_mxf4nvf4_bs_cta2(tmem_accum, a_desc + 0, b_desc + 0,
-                                    0x10400480U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, ((init_flag) ? 0 : 1));
-                            }
-                            int _smem_desc_lo_2 = (((smem_a_addr + 32) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
-                            int _smem_desc_lo_3 = (((smem_b_addr + 32) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
-                            {
-                                uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_2) | ((uint64_t)0x40004040 << 32);
-                                uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_3) | ((uint64_t)0x40004040 << 32);
+                            tcgen05_mma_mxf4nvf4_bs_cta2_leader(tmem_accum, a_desc + 0, b_desc + 0,
+                                0x10400480U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, ((init_flag) ? 0 : 1), _elected_0);
+                        }
+                        int _smem_desc_lo_3 = (((smem_a_addr + 32) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
+                        int _smem_desc_lo_4 = (((smem_b_addr + 32) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
+                        {
+                            uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_3) | ((uint64_t)0x40004040 << 32);
+                            uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_4) | ((uint64_t)0x40004040 << 32);
 
-                                tcgen05_mma_mxf4nvf4_bs_cta2(tmem_accum, a_desc + 0, b_desc + 0,
-                                    0x10400480U, tmem_tmem_sfa + 4 + 0, tmem_tmem_sfb + 8 + 0, 1);
-                            }
-                            int _smem_desc_lo_4 = (((smem_a_addr + 64) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
-                            int _smem_desc_lo_5 = (((smem_b_addr + 64) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
-                            {
-                                uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_4) | ((uint64_t)0x40004040 << 32);
-                                uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_5) | ((uint64_t)0x40004040 << 32);
+                            tcgen05_mma_mxf4nvf4_bs_cta2_leader(tmem_accum, a_desc + 0, b_desc + 0,
+                                0x10400480U, tmem_tmem_sfa + 4 + 0, tmem_tmem_sfb + 8 + 0, 1, _elected_0);
+                        }
+                        int _smem_desc_lo_5 = (((smem_a_addr + 64) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
+                        int _smem_desc_lo_6 = (((smem_b_addr + 64) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
+                        {
+                            uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_5) | ((uint64_t)0x40004040 << 32);
+                            uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_6) | ((uint64_t)0x40004040 << 32);
 
-                                tcgen05_mma_mxf4nvf4_bs_cta2(tmem_accum, a_desc + 0, b_desc + 0,
-                                    0x10400480U, tmem_tmem_sfa + 8 + 0, tmem_tmem_sfb + 16 + 0, 1);
-                            }
-                            int _smem_desc_lo_6 = (((smem_a_addr + 96) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
-                            int _smem_desc_lo_7 = (((smem_b_addr + 96) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
-                            {
-                                uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_6) | ((uint64_t)0x40004040 << 32);
-                                uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_7) | ((uint64_t)0x40004040 << 32);
+                            tcgen05_mma_mxf4nvf4_bs_cta2_leader(tmem_accum, a_desc + 0, b_desc + 0,
+                                0x10400480U, tmem_tmem_sfa + 8 + 0, tmem_tmem_sfb + 16 + 0, 1, _elected_0);
+                        }
+                        int _smem_desc_lo_7 = (((smem_a_addr + 96) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
+                        int _smem_desc_lo_8 = (((smem_b_addr + 96) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
+                        {
+                            uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_7) | ((uint64_t)0x40004040 << 32);
+                            uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_8) | ((uint64_t)0x40004040 << 32);
 
-                                tcgen05_mma_mxf4nvf4_bs_cta2(tmem_accum, a_desc + 0, b_desc + 0,
-                                    0x10400480U, tmem_tmem_sfa + 12 + 0, tmem_tmem_sfb + 24 + 0, 1);
-                            }
+                            tcgen05_mma_mxf4nvf4_bs_cta2_leader(tmem_accum, a_desc + 0, b_desc + 0,
+                                0x10400480U, tmem_tmem_sfa + 12 + 0, tmem_tmem_sfb + 24 + 0, 1, _elected_0);
                         }
                         elect_commit_cg2_multicast(mma_done_addr + (mma_tma_stage) * 8, (uint16_t)(3));
                         mma_tma_stage += 1;
                         if (mma_tma_stage == 5) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
                     }
-                    elect_commit_cg2_multicast(mainloop_done_addr + (acc_stage) * 8, (uint16_t)(3));
+                    elect_commit_cg2_multicast(mainloop_done_addr, (uint16_t)(3));
                     _phase_epilogue_done ^= 1;
                     mbarrier_wait(work_full_addr + (work_stage_1) * 8, _phase_work_full_1);
                     uint32_t _clc_valid_1 = 0;
@@ -640,7 +643,6 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_48daf3781ff6b1c46b43(const __grid_con
     // ---- Role: epilogue ----
     if (warp >= 2 && warp <= 9) {
         { // epilogue_main
-            unsigned int acc_stage_1 = 0;
             unsigned int work_stage_2 = 0;
             const int epi_warp = warp % 4;
             const int head_half = (warp - 2) / 4;
@@ -656,7 +658,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_48daf3781ff6b1c46b43(const __grid_con
             unsigned int _phase_work_full_2 = 0;
             #pragma unroll 1
             for (unsigned int _tile_iter_2 = 0; _tile_iter_2 < m_tiles / CTA_GROUP * N_TILES; _tile_iter_2++) {
-                mbarrier_wait(mainloop_done_addr + (acc_stage_1) * 8, _phase_mainloop_done);
+                mbarrier_wait(mainloop_done_addr, _phase_mainloop_done);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int group_1 = this_bid_1 / (unsigned int)tiles_per_group;
                 int first_m_1 = group_1 * GROUP_M;
@@ -691,7 +693,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_48daf3781ff6b1c46b43(const __grid_con
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
-                        :: "r"((epilogue_done_addr + (acc_stage_1) * 8) & 0xFEFFFFFF) : "memory");
+                        :: "r"((epilogue_done_addr) & 0xFEFFFFFF) : "memory");
                 }
                 _phase_mainloop_done ^= 1;
                 int destination = head / HEADS_PER_DESTINATION;
@@ -822,8 +824,12 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_48daf3781ff6b1c46b43(const __grid_con
                                     debug_chunk[j_5] = normalized[4 * c_1 + j_5];
                                 }
                                 {
-                                    int4 _iv4 = make_int4(debug_chunk[0 + 0], debug_chunk[0 + 1], debug_chunk[0 + 2], debug_chunk[0 + 3]);
-                                    *reinterpret_cast<int4*>(((kind == 0) ? debug_q_words : debug_k_words) + (debug_row + (unsigned long long)(4 * c_1)) + 0) = _iv4;
+                                    auto _gst_7 = ((kind == 0) ? debug_q_words : debug_k_words) + (debug_row + (unsigned long long)(4 * c_1));
+                                    __builtin_assume(__isGlobal(_gst_7));
+                                    {
+                                        int4 _iv4 = make_int4(debug_chunk[0 + 0], debug_chunk[0 + 1], debug_chunk[0 + 2], debug_chunk[0 + 3]);
+                                        *reinterpret_cast<int4*>(_gst_7 + 0) = _iv4;
+                                    }
                                 }
                             }
                         }
@@ -868,24 +874,24 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_48daf3781ff6b1c46b43(const __grid_con
                             for (int _lr = 1; _lr < 16; _lr++) {
                                 amax = max_noftz(amax, absolute[_lr]);
                             }
-                            float _rcp_7 = approx_rcp(6.0f);
-                            float sf_value = global_scale * (amax * _rcp_7);
-                            uint16_t _e4m3x2_9;
-                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_9) : "f"(0.0f), "f"(sf_value));
-                            uint8_t _cvt_satfinite_e4m3_f32_8 = (uint8_t)_e4m3x2_9;
-                            uint32_t _f16x2_decode_10;
+                            float _rcp_8 = approx_rcp(6.0f);
+                            float sf_value = global_scale * (amax * _rcp_8);
+                            uint16_t _e4m3x2_10;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_10) : "f"(0.0f), "f"(sf_value));
+                            uint8_t _cvt_satfinite_e4m3_f32_9 = (uint8_t)_e4m3x2_10;
+                            uint32_t _f16x2_decode_11;
                             float sf_rounded;
-                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_10) : "h"(_e4m3x2_9));
-                            uint16_t _f16_decode_10 = (uint16_t)_f16x2_decode_10;
-                            asm("cvt.f32.f16 %0, %1;" : "=f"(sf_rounded) : "h"(_f16_decode_10));
-                            float _rcp_11 = approx_rcp(sf_rounded * global_scale_rcp);
-                            float output_scale = fminf(_rcp_11, 3.4028234663852886e+38f);
+                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_11) : "h"(_e4m3x2_10));
+                            uint16_t _f16_decode_11 = (uint16_t)_f16x2_decode_11;
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(sf_rounded) : "h"(_f16_decode_11));
+                            float _rcp_12 = approx_rcp(sf_rounded * global_scale_rcp);
+                            float output_scale = fminf(_rcp_12, 3.4028235e+38f);
                             float2 _f2_4 = make_float2(output_scale, output_scale);
                             #pragma unroll
                             for (int j_8 = 0; j_8 < 8; j_8++) {
-                                float2 _f32x2_mul_a_12 = make_float2(values[2 * j_8], values[2 * j_8 + 1]);
+                                float2 _f32x2_mul_a_13 = make_float2(values[2 * j_8], values[2 * j_8 + 1]);
                                 float2 scaled_1;
-                                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_12), "l"(*(const unsigned long long*)&_f2_4));
+                                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_13), "l"(*(const unsigned long long*)&_f2_4));
                                 quant_values[2 * j_8] = scaled_1.x;
                                 quant_values[2 * j_8 + 1] = scaled_1.y;
                             }
@@ -958,24 +964,24 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_48daf3781ff6b1c46b43(const __grid_con
                             for (int _lr = 1; _lr < 16; _lr++) {
                                 amax_1 = max_noftz(amax_1, absolute_1[_lr]);
                             }
-                            float _rcp_13 = approx_rcp(6.0f);
-                            float sf_value_1 = global_scale * (amax_1 * _rcp_13);
-                            uint16_t _e4m3x2_15;
-                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_15) : "f"(0.0f), "f"(sf_value_1));
-                            uint8_t _cvt_satfinite_e4m3_f32_14 = (uint8_t)_e4m3x2_15;
-                            uint32_t _f16x2_decode_16;
+                            float _rcp_14 = approx_rcp(6.0f);
+                            float sf_value_1 = global_scale * (amax_1 * _rcp_14);
+                            uint16_t _e4m3x2_16;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_16) : "f"(0.0f), "f"(sf_value_1));
+                            uint8_t _cvt_satfinite_e4m3_f32_15 = (uint8_t)_e4m3x2_16;
+                            uint32_t _f16x2_decode_17;
                             float sf_rounded_1;
-                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_16) : "h"(_e4m3x2_15));
-                            uint16_t _f16_decode_16 = (uint16_t)_f16x2_decode_16;
-                            asm("cvt.f32.f16 %0, %1;" : "=f"(sf_rounded_1) : "h"(_f16_decode_16));
-                            float _rcp_17 = approx_rcp(sf_rounded_1 * global_scale_rcp);
-                            float output_scale_1 = fminf(_rcp_17, 3.4028234663852886e+38f);
+                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_17) : "h"(_e4m3x2_16));
+                            uint16_t _f16_decode_17 = (uint16_t)_f16x2_decode_17;
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(sf_rounded_1) : "h"(_f16_decode_17));
+                            float _rcp_18 = approx_rcp(sf_rounded_1 * global_scale_rcp);
+                            float output_scale_1 = fminf(_rcp_18, 3.4028235e+38f);
                             float2 _f2_5 = make_float2(output_scale_1, output_scale_1);
                             #pragma unroll
                             for (int j_11 = 0; j_11 < 8; j_11++) {
-                                float2 _f32x2_mul_a_18 = make_float2(values_1[2 * j_11], values_1[2 * j_11 + 1]);
+                                float2 _f32x2_mul_a_19 = make_float2(values_1[2 * j_11], values_1[2 * j_11 + 1]);
                                 float2 scaled_2;
-                                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_18), "l"(*(const unsigned long long*)&_f2_5));
+                                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_19), "l"(*(const unsigned long long*)&_f2_5));
                                 quant_values_1[2 * j_11] = scaled_2.x;
                                 quant_values_1[2 * j_11 + 1] = scaled_2.y;
                             }

@@ -38,6 +38,41 @@ Cake VSA
     run_cake_vsa
 
 
+Token-Sparse Attention Inputs
+-----------------------------
+
+Build cache-slot lists for token-sparse attention.
+Build grouped key unions and masks for masked dense attention.
+
+.. currentmodule:: flashinfer.sdsa.token_sparse
+
+.. autosummary::
+    :toctree: ../generated
+
+    token_sparse_kv_indices
+    group_union_masks
+    union_key_limit
+
+
+SDSA Indexer
+------------
+
+Score, select and quantize the keys of the SDSA (Simplified DSA) indexer, which
+has one query head and no head weights.
+
+.. currentmodule:: flashinfer.sdsa
+
+.. autosummary::
+    :toctree: ../generated
+
+    indexer_scores
+    indexer_threshold_select
+    top_k_from_candidates
+    gather_key_sample
+    thresholds_from_sample
+    quantize_write_index_qk_nvfp4
+
+
 .. currentmodule:: flashinfer.sparse
 
 
@@ -45,9 +80,9 @@ flashinfer.msa_ops
 ==================
 
 Minimax Sparse Attention (MSA) sparse prefill, sparse decode, and top-k
-selection dispatch on compute capability 10.0/10.3/10.7 (SM100/SM103/SM107) and
-SM120/SM121 Blackwell GPUs. The proxy-score operations remain SM120/SM121
-only. On compute capability 10.0/10.3/10.7, NVFP4 K/V is served by dedicated
+selection dispatch on SM100/SM103/SM107/SM120/SM121. ``msa_proxy_score`` also
+supports SM90; only ``msa_proxy_score_fp4`` is SM120/SM121-only. On
+SM100/SM103/SM107, packed NVFP4 K/V is served by dedicated
 paged-KV prefill and decode routes that take the four regions of a packed
 NVFP4 page -- K data, K scales, V data, V scales -- as strided views of one
 allocation, for the MiniMax-M3 head geometry (head dimension 128, page size
@@ -116,3 +151,74 @@ capture the same inputs take the generic decode route.
     msa_sparse_decode_attention
     msa_topk_select
     prepare_msa_nvfp4_sparse_decode
+
+MiniMax-M3 ICP indexer
+----------------------
+
+Experimental per-rank kernels of the MiniMax-M3 index-context-parallel (ICP)
+indexer on compute capability 10.0, 10.3 and 10.7 (exact ``sm_100a``,
+``sm_103a`` and ``sm_107a`` builds). The index keys are sharded by context across
+a TP2 or TP4 group (P128 pages: rows interleaved across ranks; P256 pages:
+contiguous 128-row halves for TP2, 64-row quarters for TP4), and every rank
+holds the FP8 queries of all four index heads. Scores are raw FP32 ``q . k``
+maxima per logical 128-token block (B128); selection ranks them descending,
+puts the forced begin/end blocks first and breaks exact ties toward the lower
+block id. The entry points follow the MSA sharded-indexer contract: a device
+plan and a chunked prefill scorer, a prefill Top16 selector into carrier rows,
+a decode scorer, a decode Top16 selector that publishes into the owner ranks'
+receive rows, and the owner-side merge. The caller owns every buffer and the
+collective steps (receive-storage rendezvous, the prefill all-to-all); the
+kernels never allocate or synchronize with the host and are CUDA Graph safe.
+The receive storage is laid out by ``msa_icp_comm_layout``; zero it and its
+counters once and never reset them. Generation-tagged receive rows need at
+least two sparse layers between uses of one slot set. Version 1 supports four
+index heads.
+
+The default decode chain is the score plane
+(``msa_icp_decode_index_score_sharded``) followed by
+``msa_icp_topk_select_publish``; ``msa_icp_decode_score_publish`` fuses the two
+steps and is an option. The plan's ``decode`` runs the fused chain when given a
+``pool``, and without one on compute capability 10.7 at P128 (TP2 and TP4) from 8 requests
+on, in a pool the plan allocates once (``fused_decode_min_batch``). With
+``enable_pdl`` on compute capability 10.0 and 10.3 at 64 or 128 local K rows per
+page, the score plane, and on 10.7 at 32 or 64, both the score plane and the
+fused chain's list scorer, read ``seq_lens`` and ``block_table`` and start
+loading the history index-K pages before they wait on the preceding kernel;
+that kernel must not write them and must be launched
+without programmatic dependent launch or wait on its own predecessor before it
+triggers (``enable_pdl=False`` removes this requirement). Call ``warmup()`` on
+the plan returned by ``prepare_msa_icp_indexer`` on every rank before the first
+exchange and before CUDA Graph capture: it loads every kernel into the device's
+context, so that no first launch waits on module loading while a peer's merge
+spins.
+
+``msa_icp_prefill_score_select`` fuses the prefill score and local Top16 steps
+of one query window: a list scorer keeps per-work-item Top16 lists in a
+caller-owned uint8 ``pool`` (``msa_icp_prefill_pool_bytes``) and a list merger
+writes the same carrier rows as ``msa_icp_index_score_sharded`` followed by
+``msa_icp_topk_select_prefill``, without the score scratch. The plan's
+``prefill_local`` runs it when given a ``pool``; ``prefill_pool_shape()`` and
+``prefill_window_tokens()`` size the pool for windows of at most
+``min(8192, max_num_batched_tokens)`` tokens. ``fused_prefill`` on the plan is
+the serving default per layout (``cake_backend.FUSED_PREFILL``); it is ``False``
+on every layout in this version, so the fused path runs only on request.
+
+.. autosummary::
+    :toctree: ../generated
+
+    prepare_msa_icp_indexer
+    msa_icp_index_score_sharded_plan
+    msa_icp_index_score_sharded_plan_device
+    msa_icp_index_score_sharded
+    msa_icp_topk_select_prefill
+    msa_icp_prefill_score_select
+    msa_icp_decode_index_score_sharded
+    msa_icp_topk_select_publish
+    msa_icp_decode_score_publish
+    msa_icp_merge_candidates
+    msa_icp_index_score_plan_storage
+    msa_icp_index_score_columns
+    msa_icp_decode_score_columns
+    msa_icp_decode_pool_bytes
+    msa_icp_prefill_pool_bytes
+    msa_icp_comm_layout

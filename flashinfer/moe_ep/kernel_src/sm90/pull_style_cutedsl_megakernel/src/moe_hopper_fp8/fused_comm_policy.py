@@ -33,7 +33,8 @@ def resolve_fused_comm_optimizations(
 ) -> FusedCommOptimizations:
     """Resolve layout capability without changing arithmetic or readiness.
 
-    K and input precision do not change the M256/N64 BF16 consumer layout.
+    K and input precision do not change the M256 x N64/N72/N80 BF16 consumer
+    layout.
     Complete channel clusters make every selected store a four-byte aligned
     pair; token tails are guarded in the epilogue. Kernel geometry is validated
     by callers: M256 already excludes the current M128-only pingpong schedule.
@@ -54,7 +55,8 @@ def resolve_fused_comm_optimizations(
         shared_protocol
         and bf16_output
         and combine_format == "bf16"
-        and tile[:2] == (256, 64)
+        and tile[0] == 256
+        and tile[1] in (64, 72, 80)
         and shape is not None
         and shape[2] > 0
         and cluster[0] > 0

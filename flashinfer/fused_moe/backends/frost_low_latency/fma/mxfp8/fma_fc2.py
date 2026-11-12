@@ -92,10 +92,13 @@ def _kernel(
             total = cutlass.Float32(0.0)
             for s in cutlass.range_constexpr(k):
                 if cutlass.const_expr(unified):
-                    score = scores[token, s]
-                    if cutlass.const_expr(narrow_weights):
-                        score = score.to(cutlass.BFloat16)
-                    total = _fma(shared[tid, s], score.to(cutlass.Float32), total)
+                    expert_id = ids[token, s]
+                    # Skip padding before reading its score: 0 * NaN/Inf is NaN.
+                    if expert_id >= 0 and expert_id < cute.size(weights, mode=[0]):
+                        score = scores[token, s]
+                        if cutlass.const_expr(narrow_weights):
+                            score = score.to(cutlass.BFloat16)
+                        total = _fma(shared[tid, s], score.to(cutlass.Float32), total)
                 else:
                     total = total + shared[tid, s]
             out[token, row + tid] = total.to(cutlass.BFloat16)

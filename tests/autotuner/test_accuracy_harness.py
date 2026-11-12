@@ -116,6 +116,7 @@ def test_graph_study_real_selection_and_numerics(monkeypatch, profile_inputs):
     )
     assert AutoTuner._instance is original
     assert len(report["trials"]) == 3
+    assert report["validation"]["output_refresh"] == "unavailable"
     for row in report["trials"]:
         assert row["cache_hit"]
         assert row["profile_count"] == (3 if profile_inputs == "retained" else 6)
@@ -181,33 +182,60 @@ def test_graph_study_rejects_all_failed_tactics(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_graph_study_does_not_hide_bad_shared_output(monkeypatch):
+@pytest.mark.parametrize("inference_output", [False, True])
+@pytest.mark.parametrize("kind", ["correct", "wrong", "no_write"])
+def test_graph_study_validates_shared_output(monkeypatch, inference_output, kind):
+    from contextlib import nullcontext
+
     from flashinfer.autotuner import TunableRunner
 
     module = _harness()
-    output = torch.empty(4, device="cuda")
+    original = AutoTuner._instance
+    with torch.inference_mode(inference_output):
+        output = torch.empty(4, device="cuda")
+        unrelated = torch.empty_like(output)
+    refresh = module.build_bmm_fp8(1, 4, 4).prepare_validation
+    refreshes = []
+
+    def prepare(output, inputs):
+        assert not torch.cuda.is_current_stream_capturing()
+        refreshes.append(output.data_ptr())
+        refresh(output, inputs)
 
     class Runner(TunableRunner):
         def get_valid_tactics(self, inputs, profile):
             return [0]
 
         def forward(self, inputs, tactic=-1, **kwargs):
-            return torch.add(inputs[0], 1 if tactic == -1 else 2, out=output)
+            with torch.inference_mode():
+                torch.add(
+                    inputs[0],
+                    2 if tactic == 0 and kind == "wrong" else 1,
+                    out=unrelated if tactic == 0 and kind == "no_write" else output,
+                )
+            return output
 
     monkeypatch.setattr(
         AutoTuner,
         "_profile_single_kernel",
         lambda self, runner, inputs, tactic, config, **kw: 1.0 if tactic == 0 else 2.0,
     )
-    with pytest.raises(AssertionError):
-        module.graph_selection_study(
-            "test.bad_output",
+    with nullcontext() if kind == "correct" else pytest.raises(AssertionError):
+        report = module.graph_selection_study(
+            "test.shared_output",
             [Runner()],
             TuningConfig(),
             [torch.ones(4, device="cuda")],
             {},
             _study_args(),
+            prepare_validation=prepare,
         )
+        assert report["trials"][0]["cache_hit"]
+        assert report["trials"][0]["tactic"] == "0"
+        assert report["validation"]["output_refresh"] == "fixture_callback"
+    assert refreshes == [output.data_ptr()] * (3 if kind == "correct" else 2)
+    assert AutoTuner._instance is original
+    assert not torch.is_inference_mode_enabled()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

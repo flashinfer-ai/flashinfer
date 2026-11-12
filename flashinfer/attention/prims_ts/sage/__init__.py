@@ -23,6 +23,8 @@
 * ``index``: device-side index math and loads over the layout.
 * ``modes``: the names of how a softmax obtains and applies the K scales.
 * ``int32_scores``: INT8 Q/K accumulated as INT32 scores on a float bias.
+* ``plan``: the host-side state of a plan's prepared buffer and its compiled
+  prepare launch, for plans that run the prepare as its own launch.
 
 Each attention kernel keeps its own resources, pipelines and softmax for
 the scales; only these components are shared. This package imports the
@@ -34,10 +36,10 @@ from .config import (
     SAGE_K_BLOCK_SIZES,
     SageAttentionConfig,
     SageAttentionParams,
-    flat_scale_numel,
-    flat_scale_slot,
     is_power_of_two,
-    log2_block_size,
+    sage_flat_scale_numel,
+    sage_flat_scale_slot,
+    sage_log2_block_size,
     sage_scale_shapes,
     validate_sage_params,
     validate_sage_recipe,
@@ -47,10 +49,10 @@ __all__ = [
     "SAGE_K_BLOCK_SIZES",
     "SageAttentionConfig",
     "SageAttentionParams",
-    "flat_scale_numel",
-    "flat_scale_slot",
     "is_power_of_two",
-    "log2_block_size",
+    "sage_flat_scale_numel",
+    "sage_flat_scale_slot",
+    "sage_log2_block_size",
     "sage_scale_shapes",
     "validate_sage_params",
     "validate_sage_recipe",

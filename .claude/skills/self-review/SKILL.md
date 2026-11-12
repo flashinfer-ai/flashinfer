@@ -61,7 +61,7 @@ From [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) (Pull Request Guidelines):
   (`benchmarks/flashinfer_benchmark.py` or a named script), with the GPU and problem sizes.
   A speedup ratio without absolute numbers, or numbers without a GPU, is not enough. Use the
   `benchmark-kernel` skill to produce them.
-- Documentation referenced by the change (`CLAUDE.md`, `.claude/skills/`, `docs/`) is
+- Documentation referenced by the change (`AGENTS.md`, `.claude/skills/`, `docs/`) is
   updated in the same PR.
 - **Backwards compatibility.** If the change removes or renames a public API, or changes a
   signature, default, or semantics, say so explicitly in the PR description.
@@ -80,3 +80,9 @@ Produce a findings list labeled by confidence, in two groups:
 Fix group 1, re-run Step 1 and the checks in Step 2, then draft the PR description in the
 template with group 2 under "Reviewer Notes". A self-review that finds nothing on a
 non-trivial diff is a signal to look again, not a pass.
+
+The template's suggested-CI-targets field is optional; if you fill it in, list the test files
+the diff touches or the test directories covering touched source, as real paths relative to
+the repo root under `tests/` (e.g. `tests/gemm/test_mm_fp4.py tests/utils/`), not source paths.
+Leave the full-scope checkbox unticked unless the change is cross-cutting, and give the reason
+if you tick it.

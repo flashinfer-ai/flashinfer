@@ -338,13 +338,11 @@ def prepare_for_launch(
     record, split_count, grid = route(batch, capacity, num_splits)
 
     bindings = _bindings(q, kv, output, lengths, q_scale)
-    bindings["kv_capacity"] = capacity
     buffers = workspace_for(record, batch, split_count, q.device)
     bindings.update(buffers)
     workspace = tuple(buffers.values())
     arguments = tuple(cake_jit.argument_list(record, bindings, grid=grid))
-    symbol = cake_jit.MODULES[record]["kernel_symbol"]
-    stages = ((_entry(record, _device_index(q.device)), arguments, symbol),)
+    stages = ((_entry(record, _device_index(q.device)), arguments),)
     return {
         "route": record,
         "num_splits": split_count,
@@ -353,7 +351,6 @@ def prepare_for_launch(
         "bindings": bindings,
         "workspace": workspace,
         "stages": stages,
-        "launch_names": [stage[2] for stage in stages],
         "workspace_bytes": sum(t.numel() * t.element_size() for t in workspace),
     }
 
@@ -367,7 +364,7 @@ def launch_prepared(prepared: dict[str, Any]) -> Any:
     ordered streams, including event-ordered handoffs, is supported.
     """
     with tvm_ffi.use_torch_stream():
-        for call, arguments, _name in prepared["stages"]:
+        for call, arguments in prepared["stages"]:
             call(*arguments)
     return prepared["O"]
 

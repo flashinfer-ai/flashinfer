@@ -23,6 +23,7 @@ Three kernels per MoE layer:
 Design doc: docs/design_docs/cute_dsl_moe_sm90.md.
 """
 
+import functools
 from typing import Any, NamedTuple, Optional, Tuple
 
 import torch
@@ -41,6 +42,7 @@ from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
     moe_unpermute,
+    SM90_CUTE_DSL_MOE_ACTIVATION_TYPES,
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
     validate_cute_dsl_moe_swiglu_config,
@@ -88,6 +90,15 @@ def _sm90_moe_autotune_op_name(
     return f"CuteDslFusedMoE::run_moe_sm90::{activation_name}"
 
 
+@functools.lru_cache(maxsize=None)
+def _get_runner(**config: Any) -> CuteDslFusedMoESm90Runner:
+    """The runner of one static MoE configuration (holds no tensors, so one
+    instance serves every call with that configuration). Construction
+    validates the activation parameters; a rejected configuration is not
+    cached."""
+    return CuteDslFusedMoESm90Runner(forward_impl=_moe_core_impl, **config)
+
+
 def _moe_core_impl(
     x: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -130,6 +141,9 @@ def _moe_core_impl(
         raise ValueError(
             f"cute_dsl_fused_moe_bf16 requires SM90 (Hopper). Got SM{major}{minor}."
         )
+    if token_final_scales.dtype != torch.float32:
+        # GEMM2's finalize reads the scales as float32; fail before any launch.
+        raise ValueError("token_final_scales must be float32")
 
     num_tokens, hidden = x.shape
 
@@ -375,9 +389,21 @@ def cute_dsl_fused_moe_bf16(
     """
     if num_local_experts is None:
         num_local_experts = num_experts
-    activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
-    validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
-    validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+    # Validates the activation configuration (once per configuration).
+    runner = _get_runner(
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        local_expert_offset=local_expert_offset,
+        use_fused_finalize=use_fused_finalize,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type,
+        swiglu_alpha=float(swiglu_alpha),
+        swiglu_beta=float(swiglu_beta),
+        swiglu_limit=float(swiglu_limit),
+        situ_beta=None if situ_beta is None else float(situ_beta),
+        situ_linear_beta=None if situ_linear_beta is None else float(situ_linear_beta),
+    )
 
     num_tokens, hidden = x.shape
     if num_tokens == 0:
@@ -388,21 +414,6 @@ def cute_dsl_fused_moe_bf16(
     if moe_output is None:
         moe_output = torch.empty(num_tokens, hidden, dtype=x.dtype, device=x.device)
 
-    runner = CuteDslFusedMoESm90Runner(
-        forward_impl=_moe_core_impl,
-        num_experts=num_experts,
-        top_k=top_k,
-        num_local_experts=num_local_experts,
-        local_expert_offset=local_expert_offset,
-        use_fused_finalize=use_fused_finalize,
-        enable_pdl=enable_pdl,
-        activation_type=int(activation),
-        swiglu_alpha=float(swiglu_alpha),
-        swiglu_beta=float(swiglu_beta),
-        swiglu_limit=float(swiglu_limit),
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-    )
     inputs = [
         x,
         token_selected_experts,
@@ -414,7 +425,7 @@ def cute_dsl_fused_moe_bf16(
     if tactic is not None:
         return runner(inputs, tactic=tactic, intermediate_buffer=intermediate_buffer)
     _, best_tactic = AutoTuner.get().choose_one(
-        _sm90_moe_autotune_op_name(activation, situ_beta),
+        _sm90_moe_autotune_op_name(runner.activation_type, situ_beta),
         [runner],
         runner.tuning_config,
         inputs,
@@ -494,7 +505,11 @@ class CuteDslBf16MoEWrapper:
             situ_linear_beta: Optional SiTU tanh clamp of the up branch
                 (requires ``situ_beta``).
         """
-        activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+        activation, _ = normalize_cute_dsl_moe_activation_type(
+            activation_type,
+            SM90_CUTE_DSL_MOE_ACTIVATION_TYPES,
+            backend="the SM90 CuTe-DSL MoE",
+        )
         validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
         self.activation_type = int(activation)

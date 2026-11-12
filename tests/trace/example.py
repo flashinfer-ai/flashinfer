@@ -13,7 +13,24 @@ The output directory is controlled by FLASHINFER_TRACE_DUMP_DIR.
 Requires a CUDA-capable GPU.
 
 Results:
+- ulysses_exchange_chunks_ws1_c256.json
+- ulysses_lowp_k_sum_v_amax_h8_d64.json
+- ulysses_lowp_q_grouped_amax_h8_d64_p8.json
+- ulysses_lowp_k_grouped_amax_h8_d64_p8.json
+- ulysses_lowp_quant_qkv_pack_h8_d64_p8.json
+- ulysses_lowp_unpack_for_sage_h1_d64_p8.json
+- ulysses_lowp_k_sum_v_amax_h8_d128.json
+- ulysses_lowp_q_grouped_amax_h8_d128_p8.json
+- ulysses_lowp_k_grouped_amax_h8_d128_p8.json
+- ulysses_lowp_quant_qkv_pack_h8_d128_p8.json
+- ulysses_lowp_unpack_for_sage_h1_d128_p8.json
+- ulysses_scatter_qkv_sage2_sm90_h8_d64_p8_u513.json
+- ulysses_scatter_qkv_sage2_sm90_h8_d128_p8_u513.json
+- ulysses_scatter_qkv_sage2_sm89_sm120_h8_d64_p8_u513.json
+- ulysses_scatter_qkv_sage2_sm89_sm120_h8_d128_p8_u513.json
 - We would get these example json files under fi_trace_out directory:
+qsa_forward_h12_kv1_d256.json
+qsa_indexed_forward_h12_kv1_d256.json
 alphamoe_fused_router_e512_k8_bm16_shared0.json
 alphamoe_nvfp4_aligned_moe_topk2_e4_h256_n256_bm8.json
 bmm_mxfp8_N128_K128.json
@@ -37,13 +54,17 @@ fmha_v2_prefill_sm120_h4_d128.json
 fmha_v2_prefill_sm120_h96_d128.json
 fmha_v2_prefill_sm120_h20_d256.json
 gdn_decode_qk4_v8_d128.json
+gdn_decode_paged_qk4_v8_d128.json
 gdn_fused_decode_h5120_v48_d128.json
 gdn_mtp_qk4_v8_d128.json
 gdn_replayssm_commit_k2_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
 gdn_prefill_gates_q4_k4_v8_d128.json
+gdn_prefill_paged_q4_k4_v8_d128_ps64.json
 gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
+sdsa_gather_key_sample_page_size64_dim128.json
+sdsa_group_union_masks_top_k2048.json
 recurrent_kda_q8_v16_d128.json
 packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
@@ -52,6 +73,8 @@ gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
+mm_bf16_fp8_N4096_K4096.json
+mm_fp16_fp8_N4096_K4096.json
 gemm_fp8_nt_groupwise_n1536_k7168.json
 group_gemm_fp8_nt_groupwise_contiguous_g2_n128_k128.json
 gemm_mxfp8_N4096_K4096.json
@@ -66,6 +89,9 @@ gqa_paged_decode_h32_kv8_d128_ps16.json
 gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
 gqa_ragged_h32_kv8_d128.json
+sdsa_indexer_scores_page_size64_dim128.json
+sdsa_indexer_scores_page_size64_dim64.json
+sdsa_indexer_threshold_select_page_size64_dim128_counters2_pair2.json
 layernorm_h768.json
 layernorm_quant_h768.json
 linear_nvfp4_svdquant_N3072_K3072_K_packed1536_rank32.json
@@ -77,13 +103,16 @@ minimax_h3_nvfp4_pre_attention_p8_hdst7_d128.json
 minimax_h3_qkv_quantize_pack_p8_hdst7_d128_pk64.json
 mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
+mla_swa_decode_sq1_h64_d1088_dv1024_ps64.json
 attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
 prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32.json
+prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32_scales_ft.json
 prims_ts_decode_wrapper_tuple_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_ps32.json
 attention_ts_decode_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
+prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4_scales_tf.json
 prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
@@ -117,13 +146,19 @@ pcie_ipc_all_gather_tp4_h6144.json
 pcie_ipc_reduce_scatter_tp4_h6144.json
 prims_ts_block_sparse_h8_kv8_d128_qb64_kb64.json
 prims_ts_block_sparse_dense_h8_kv8_d128_qb64_kb64.json
+prims_ts_block_sparse_dense_h8_kv8_d128_qb64_kb64_scales_tt.json
 prims_ts_block_sparse_wrapper_h8_kv8_d128.json
 prims_ts_block_sparse_wrapper_dense_h8_kv8_d128.json
 prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64.json
 prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64.json
 prims_ts_paged_block_sparse_wrapper_combined_h8_kv8_d128_ps64.json
 prims_ts_paged_block_sparse_wrapper_tuple_h8_kv8_d128_ps64.json
+prims_ts_bf16_moe_partitioned_topk2_e8_h1024_i512_p2.json
+prims_ts_fp4_block_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
+prims_ts_fp8_block_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
+prims_ts_fp8_per_tensor_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
 quantize_nvfp4_smooth_N3072.json
+sdsa_quantize_write_index_qk_nvfp4_dim128_page_size64_packed_dim64_scales8.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_sigmoid_gate_nh32_h64.json
@@ -131,6 +166,9 @@ rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
 silu_and_mul_mxfp8_experts_quantize_k8192.json
 silu_and_mul_nvfp4_quantize_k16384.json
+sdsa_thresholds_from_sample_counters2.json
+sdsa_token_sparse_kv_indices_top_k2048_lists2.json
+sdsa_top_k_from_candidates_pair2_range2.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
@@ -162,6 +200,7 @@ MSA (msa_*) files require SM120/SM121 (consumer Blackwell) GPUs.
 dsv41_fp4_quantize_*_sparse_mla_cache_*.json and dsv41_fp8_quantize_*_sparse_mla_cache_*.json
 are only generated on SM120/SM121 GPUs.
 trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
+trtllm_batch_decode_token_sparse_h16_kv1_d256_ps1_topk512.json requires SM100/SM103 GPUs.
 trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
 top_k_varlen_n4096_k512.json (windowed prefill mode, gvr_2) requires SM100/SM103/SM107 GPUs.
 """
@@ -210,6 +249,7 @@ from flashinfer.comm import (
 )
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 from flashinfer.fi_trace import fi_trace
+from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
 from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.mla import BatchMLAPagedAttentionWrapper
 from flashinfer.prefill import (
@@ -218,6 +258,7 @@ from flashinfer.prefill import (
     fmha_v2_prefill_deepseek,
     fmha_v2_prefill_sm120,
 )
+from flashinfer.prims_ts.moe import MoePartitionResources
 from flashinfer.utils import is_sm100a_supported
 from tests.trace.example_moe_layer import generate as generate_moe_layer_traces
 from tests.utils_fp8 import to_float8
@@ -226,6 +267,25 @@ from tests.utils_fp8 import to_float8
 generate_moe_layer_traces(SAVE_DIR)
 
 device = "cuda"
+
+# Metadata-only SM90 MLA+SWA example, also usable without SM90 hardware.
+from flashinfer.mla import (
+    batch_decode_with_kv_cache_mla_swa,
+    get_mla_swa_workspace_size_bytes,
+)
+
+batch_decode_with_kv_cache_mla_swa.fi_trace(
+    save_dir=SAVE_DIR,
+    query=torch.empty((1, 1, 64, 1088), device="meta", dtype=torch.bfloat16),
+    kv_cache=torch.empty((9, 64, 1088), device="meta", dtype=torch.bfloat16),
+    workspace_buffer=torch.empty(
+        get_mla_swa_workspace_size_bytes(1, 1), device="meta", dtype=torch.uint8
+    ),
+    block_tables=torch.empty((1, 9), device="meta", dtype=torch.int32),
+    seq_lens=torch.empty((1,), device="meta", dtype=torch.int32),
+    window_left=512,
+    sm_scale=0.0625,
+)
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
 
 # PCIe traces need only world_size and tensor metadata, not an IPC allocation
@@ -461,6 +521,37 @@ flashinfer.apply_rope_with_cos_sin_cache_inplace(
 )
 
 
+def example_qsa():
+    capability = torch.cuda.get_device_capability(device)
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        print("Skipping QSA examples: requires SM100/SM103/SM107")
+        return
+    q = torch.randn(8, 12, 256, dtype=torch.bfloat16, device=device)
+    k = torch.randn(8, 1, 256, dtype=torch.bfloat16, device=device)
+    v = torch.randn_like(k)
+    token = torch.arange(8, device=device, dtype=torch.int32)
+    zeros = torch.zeros_like(token)
+    first = torch.tensor([0, 4], device=device, dtype=torch.int32)
+    flashinfer.qsa_forward(
+        q,
+        k,
+        v,
+        torch.ones(8, 2, device=device, dtype=torch.uint8),
+        zeros,
+        token,
+        zeros,
+        zeros,
+        first,
+        first + 3,
+    )
+    if capability in ((10, 0), (10, 3)):
+        indices = torch.where(token[None, :] <= token[:, None], token[None, :], -1)
+        flashinfer.qsa_indexed_forward(q, k, v, indices)
+
+
+example_qsa()
+
+
 def example_dsv41_fp4_cache():
     from flashinfer.mla import (
         dsv41_fp4_quantize_append_sparse_mla_cache,
@@ -654,6 +745,19 @@ for N, K in ((4096, 4096), (256, 7168)):
     ).T  # [K, N] column-major; b.T is contiguous
     with contextlib.suppress(Exception):
         flashinfer.mm_bf16(a, b, backend="auto")
+
+# ── W8A16 FP8 GEMM (bf16 activation, e4m3 weight [N, K], per-tensor scale) ────
+# Trace is dumped before kernel launch; suppress Hopper/Blackwell-only failures.
+with contextlib.suppress(Exception):
+    M, K, N = 128, 4096, 4096
+    b_w8a16 = torch.zeros(N, K, dtype=torch.float8_e4m3fn, device=device)
+    alpha_w8a16 = torch.ones(1, dtype=torch.float32, device=device)
+    flashinfer.gemm.mm_bf16_fp8(
+        torch.zeros(M, K, dtype=torch.bfloat16, device=device), b_w8a16, alpha_w8a16
+    )
+    flashinfer.gemm.mm_fp16_fp8(
+        torch.zeros(M, K, dtype=torch.float16, device=device), b_w8a16, alpha_w8a16
+    )
 
 # ── GEMM fp8 block-scale (DeepSeek-V3 q_proj: M×7168→1536, block=128) ────────
 # Trace is dumped before kernel launch; suppress SM100-only runtime failures.
@@ -966,6 +1070,20 @@ block_sparse_attention.fi_trace(
     out=bs_out,
 )
 
+# Device global multipliers remain tensor inputs in the benchmark schema.
+block_sparse_attention.fi_trace(
+    save_dir=SAVE_DIR,
+    q=bs_q,
+    k=bs_k,
+    v=bs_v,
+    q_block_size=bs_q_block,
+    kv_block_size=bs_kv_block,
+    use_block_sparse=False,
+    sm_scale=torch.full((1,), bs_D**-0.5, dtype=torch.float32, device=device),
+    output_scale=torch.full((1,), 0.75, dtype=torch.float32, device=device),
+    out=bs_out,
+)
+
 # ── PrimTS paged block-sparse (both public cache forms) ──────────────────
 bs_page_size = 64
 bs_pages_per_request = bs_Skv // bs_page_size
@@ -1130,6 +1248,22 @@ from flashinfer.trace.templates.gdn import gdn_prefill_trace
 flashinfer.gdn_prefill.chunk_gated_delta_rule.fi_trace(
     **gdn_prefill_trace(use_gate_in_kernel=True).init(total_seq_len=256, device=device),
     backend="cudnn",
+    save_dir=SAVE_DIR,
+)
+
+# ── GDN on a paged recurrent-state pool (trace-only) ─────────────────────────
+import flashinfer.gdn_paged
+from flashinfer.trace.templates.gdn import (
+    gdn_decode_paged_trace,
+    gdn_prefill_paged_trace,
+)
+
+flashinfer.gdn_paged.chunk_gated_delta_rule_paged.fi_trace(
+    **gdn_prefill_paged_trace.init(total_seq_len=256, page_size=64, device=device),
+    save_dir=SAVE_DIR,
+)
+flashinfer.gdn_paged.gated_delta_rule_decode_paged.fi_trace(
+    **gdn_decode_paged_trace.init(batch_size=4, page_size=64, device=device),
     save_dir=SAVE_DIR,
 )
 
@@ -2107,6 +2241,167 @@ flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe.fi_trace(
     **_pts_moe_fp4_common,
 )
 
+# Partitioned Prims-TS APIs consume two prepared MajorK shards and caller-owned
+# streams. Use TP-N/TP-K here so FC1 is split by output rows while FC2 is split
+# by reduction K, matching the public two-way partition contract.
+_pts_partition_device = torch.device("cuda", torch.cuda.current_device())
+_pts_properties = torch.cuda.get_device_properties(_pts_partition_device)
+_pts_green_streams, _pts_green_resources = split_device_green_ctx_by_sm_count(
+    _pts_partition_device, [_pts_properties.multi_processor_count // 2]
+)
+_pts_partition_resources = MoePartitionResources(
+    streams=(_pts_green_streams[0], _pts_green_streams[1])
+)
+_pts_partition_common = dict(
+    routing_logits=_pts_moe_logits,
+    routing_bias=_pts_moe_bias,
+    topk_ids=None,
+    hidden_states=_pts_moe_hidden_bf16,
+    num_experts=_pts_moe_E,
+    top_k=_pts_moe_K,
+    n_group=None,
+    topk_group=None,
+    intermediate_size=_pts_moe_I,
+    local_expert_offset=0,
+    local_num_experts=_pts_moe_E,
+    partition_resources=_pts_partition_resources,
+    partition_strategy="tp_n_tp_k",
+    routed_scaling_factor=None,
+    routing_method_type=1,
+)
+_pts_partition_w1_bf16 = tuple(
+    torch.empty(
+        _pts_moe_E,
+        _pts_moe_I,
+        _pts_moe_H,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w2_bf16 = tuple(
+    torch.empty(
+        _pts_moe_E,
+        _pts_moe_H,
+        _pts_moe_I // 2,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    for _ in range(2)
+)
+flashinfer.prims_ts_bf16_moe_partitioned.fi_trace(
+    expert_weights=None,
+    gemm1_weights=_pts_partition_w1_bf16,
+    gemm2_weights=_pts_partition_w2_bf16,
+    **_pts_partition_common,
+)
+
+_pts_partition_w1_fp8 = tuple(
+    shard.to(torch.float8_e4m3fn) for shard in _pts_partition_w1_bf16
+)
+_pts_partition_w2_fp8 = tuple(
+    shard.to(torch.float8_e4m3fn) for shard in _pts_partition_w2_bf16
+)
+flashinfer.prims_ts_fp8_per_tensor_scale_moe_partitioned.fi_trace(
+    expert_weights=None,
+    gemm1_weights=_pts_partition_w1_fp8,
+    output1_scales_scalar=_pts_moe_tensor_scales,
+    output1_scales_gate_scalar=_pts_moe_tensor_scales,
+    gemm2_weights=_pts_partition_w2_fp8,
+    output2_scales_scalar=_pts_moe_tensor_scales,
+    use_routing_scales_on_input=False,
+    **{
+        **_pts_partition_common,
+        "hidden_states": _pts_moe_hidden_fp8,
+    },
+)
+
+_pts_partition_w1_fp4 = tuple(
+    torch.empty(
+        _pts_moe_E,
+        _pts_moe_I,
+        _pts_moe_H // 2,
+        dtype=torch.uint8,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w2_fp4 = tuple(
+    torch.empty(
+        _pts_moe_E,
+        _pts_moe_H,
+        _pts_moe_I // 4,
+        dtype=torch.uint8,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w1_fp4_scale = tuple(
+    torch.empty(
+        _pts_moe_E * _pts_moe_I * (_pts_moe_H // 16),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w2_fp4_scale = tuple(
+    torch.empty(
+        _pts_moe_E * _pts_moe_H * ((_pts_moe_I // 2) // 16),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    for _ in range(2)
+)
+flashinfer.prims_ts_fp4_block_scale_moe_partitioned.fi_trace(
+    topk_weights=None,
+    hidden_states_scale=_pts_moe_hidden_fp4_scale.reshape(-1),
+    gemm1_weights=_pts_partition_w1_fp4,
+    gemm1_weights_scale=_pts_partition_w1_fp4_scale,
+    gemm2_weights=_pts_partition_w2_fp4,
+    gemm2_weights_scale=_pts_partition_w2_fp4_scale,
+    output1_scale_scalar=_pts_moe_tensor_scales,
+    output1_scale_gate_scalar=_pts_moe_tensor_scales,
+    output2_scale_scalar=_pts_moe_tensor_scales,
+    **{
+        **_pts_partition_common,
+        "hidden_states": _pts_moe_hidden_fp4,
+    },
+)
+
+_pts_partition_hidden_mxfp8_scale = torch.empty(
+    _pts_moe_T * (_pts_moe_H // 32),
+    dtype=torch.uint8,
+    device=device,
+)
+_pts_partition_w1_fp8_scale = tuple(
+    torch.empty(
+        _pts_moe_E * _pts_moe_I * (_pts_moe_H // 32),
+        dtype=torch.uint8,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w2_fp8_scale = tuple(
+    torch.empty(
+        _pts_moe_E * _pts_moe_H * ((_pts_moe_I // 2) // 32),
+        dtype=torch.uint8,
+        device=device,
+    )
+    for _ in range(2)
+)
+flashinfer.prims_ts_fp8_block_scale_moe_partitioned.fi_trace(
+    expert_weights=None,
+    hidden_states_scale=_pts_partition_hidden_mxfp8_scale,
+    gemm1_weights=_pts_partition_w1_fp8,
+    gemm1_weights_scale=_pts_partition_w1_fp8_scale,
+    gemm2_weights=_pts_partition_w2_fp8,
+    gemm2_weights_scale=_pts_partition_w2_fp8_scale,
+    **{
+        **_pts_partition_common,
+        "hidden_states": _pts_moe_hidden_fp8,
+    },
+)
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 files = sorted(SAVE_DIR.glob("*.json"))
 print(f"\nWrote {len(files)} definition files:\n")
@@ -2295,6 +2590,21 @@ _sp_probs = _sp_probs / _sp_probs.sum(dim=-1, keepdim=True)
 _sp_logits = torch.randn(64, 32000, dtype=torch.float32, device=device)
 with contextlib.suppress(Exception):
     flashinfer.softmax(_sp_logits, temperature=1.0)
+with contextlib.suppress(Exception):
+    flashinfer.softmax(
+        _sp_logits.to(torch.bfloat16),
+        temperature=1.0,
+        batch_invariant=True,
+        out_dtype=torch.float32,
+    )
+with contextlib.suppress(Exception):
+    flashinfer.log_softmax(_sp_logits, temperature=1.0)
+with contextlib.suppress(Exception):
+    _lp_ids = torch.randint(0, 32000, (64,), dtype=torch.int64, device=device)
+    flashinfer.log_probs(_sp_logits, _lp_ids, temperature=1.0)
+with contextlib.suppress(Exception):
+    _lp_ids_k = torch.randint(0, 32000, (64, 4), dtype=torch.int64, device=device)
+    flashinfer.log_probs(_sp_logits, _lp_ids_k, temperature=1.0)
 with contextlib.suppress(Exception):
     flashinfer.sampling_from_probs(_sp_probs)
 with contextlib.suppress(Exception):
@@ -2550,30 +2860,58 @@ for _pts_semantic_PS in (32, 4):
         )
 
         _pts_wrapper = _PrimTSDecodeWrapper(kv_layout="HND")
-        _pts_wrapper.plan(
-            _pts_q.device,
-            _pts_B,
-            _pts_Hq,
-            _pts_Hkv,
-            _pts_D,
-            _pts_semantic_PS,
-            _pts_SK,
-            max_seq_len_q=_pts_SQ,
-            packed_query=False,
-            q_data_type=_pts_q.dtype,
-            k_data_type=_pts_k.dtype,
-            v_data_type=_pts_v.dtype,
-            o_data_type=torch.bfloat16,
-            mask_type="causal",
-            workspace_buffer=_pts_workspace,
-            storage_page_size=_pts_PS,
-        )
-        _pts_wrapper.run(
-            _pts_q,
-            _pts_cache,
-            _pts_seq_lens,
-            _pts_block_tables,
-        )
+        for _pts_plan_seq_lens in (None, [_pts_SK] * _pts_B):
+            _pts_wrapper.plan(
+                _pts_q.device,
+                _pts_B,
+                _pts_Hq,
+                _pts_Hkv,
+                _pts_D,
+                _pts_semantic_PS,
+                _pts_SK,
+                max_q_len=_pts_SQ,
+                packed_query=False,
+                q_dtype=_pts_q.dtype,
+                k_dtype=_pts_k.dtype,
+                v_dtype=_pts_v.dtype,
+                out_dtype=torch.bfloat16,
+                mask_type="causal",
+                workspace_buffer=_pts_workspace,
+                storage_page_size=_pts_PS,
+                seq_lens_kv=_pts_plan_seq_lens,
+            )
+            _pts_wrapper.run(
+                _pts_q,
+                _pts_cache,
+                None if _pts_plan_seq_lens is not None else _pts_seq_lens,
+                _pts_block_tables,
+            )
+
+        if _pts_semantic_PS == 32:
+            # Mixed float/tensor ABI, with the tensor inherited from the plan.
+            _pts_output_scale = torch.full(
+                (1,), 0.75, dtype=torch.float32, device=device
+            )
+            _pts_wrapper.plan(
+                _pts_q.device,
+                _pts_B,
+                _pts_Hq,
+                _pts_Hkv,
+                _pts_D,
+                _pts_semantic_PS,
+                _pts_SK,
+                max_q_len=_pts_SQ,
+                q_dtype=_pts_q.dtype,
+                k_dtype=_pts_k.dtype,
+                v_dtype=_pts_v.dtype,
+                out_dtype=torch.bfloat16,
+                mask_type="causal",
+                softmax_scale=_pts_D**-0.5,
+                output_scale=_pts_output_scale,
+                workspace_buffer=_pts_workspace,
+            )
+            _pts_wrapper.run(_pts_q, _pts_cache, _pts_seq_lens, _pts_block_tables)
+
 
 # PrimTS MLA decode: the same causal SQ4 contract through all three public
 # surfaces (SM100/SM103 only).
@@ -2624,6 +2962,23 @@ with contextlib.suppress(Exception):
         max_kv_len=_pmla_SK,
     )
 
+    # The reverse mixed ABI: device QK multiplier and host output multiplier.
+    _attention_ts_mla_decode.fi_trace(
+        save_dir=SAVE_DIR,
+        query=_pmla_q,
+        kv_cache=_pmla_cache,
+        block_tables=_pmla_block_tables,
+        seq_lens_kv=_pmla_seq_lens,
+        kv_lora_rank=_pmla_CKV,
+        qk_rope_head_dim=_pmla_KPE,
+        mask_type="causal",
+        max_kv_len=_pmla_SK,
+        softmax_scale=torch.full(
+            (1,), _pmla_D**-0.5, dtype=torch.float32, device=device
+        ),
+        output_scale=0.75,
+    )
+
     _pmla_workspace_size = _prims_ts_mla_ws_size(
         _pmla_B,
         _pmla_H,
@@ -2631,7 +2986,7 @@ with contextlib.suppress(Exception):
         _pmla_KPE,
         _pmla_PS,
         _pmla_SK,
-        max_seq_len_q=_pmla_SQ,
+        max_q_len=_pmla_SQ,
         q_dtype=_pmla_q.dtype,
         kv_dtype=_pmla_cache.dtype,
         out_dtype=torch.bfloat16,
@@ -2648,7 +3003,7 @@ with contextlib.suppress(Exception):
         max_kv_len=_pmla_SK,
         kv_lora_rank=_pmla_CKV,
         qk_rope_head_dim=_pmla_KPE,
-        max_seq_len_q=_pmla_SQ,
+        max_q_len=_pmla_SQ,
         mask_type="causal",
     )
 
@@ -2661,11 +3016,11 @@ with contextlib.suppress(Exception):
         _pmla_KPE,
         _pmla_PS,
         _pmla_SK,
-        max_seq_len_q=_pmla_SQ,
+        max_q_len=_pmla_SQ,
         packed_query=False,
-        q_data_type=_pmla_q.dtype,
-        kv_data_type=_pmla_cache.dtype,
-        o_data_type=torch.bfloat16,
+        q_dtype=_pmla_q.dtype,
+        kv_dtype=_pmla_cache.dtype,
+        out_dtype=torch.bfloat16,
         mask_type="causal",
         workspace_buffer=_pmla_workspace,
     )
@@ -2695,6 +3050,20 @@ with contextlib.suppress(Exception):
         device=device,
     )
     trtllm_batch_decode_with_kv_cache(**_tbs_inputs)
+
+# trtllm_batch_decode_with_kv_cache with token-sparse attention (each query
+# token attends to its own K and V slot lists; SM100/103 only).
+with contextlib.suppress(Exception):
+    from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+    from flashinfer.trace.templates.attention import (
+        _trtllm_batch_decode_token_sparse_init,
+    )
+
+    trtllm_batch_decode_with_kv_cache(
+        **_trtllm_batch_decode_token_sparse_init(
+            num_tokens=4, num_heads=16, head_dim=256, sparse_top_k=512, device=device
+        )
+    )
 
 # concat_mla_k (DeepSeek MLA K concat, fixed shape per docstring).
 with contextlib.suppress(Exception):
@@ -3123,6 +3492,102 @@ with contextlib.suppress(Exception):
             _fp4_in["max_seq_len"],
         )
 
+
+# Ulysses trace schemas can be generated on CPU, independently of kernel support.
+def dump_ulysses_exchange_chunks_trace(save_dir):
+    from types import SimpleNamespace
+
+    from flashinfer.comm import UlyssesCommunicator
+
+    # A schema-only single-rank reference. No communicator construction or
+    # collective is needed; real multi-rank payloads are tested in tests/comm/.
+    definition = UlyssesCommunicator.exchange_chunks.fi_trace(
+        self=SimpleNamespace(world_size=1),
+        x=torch.empty(1, 1, 1, 256, dtype=torch.uint8),
+        dtype=torch.uint8,
+    )
+    path = save_dir / f"{definition['name']}.json"
+    path.write_text(json.dumps(definition, indent=2) + "\n")
+
+
+dump_ulysses_exchange_chunks_trace(SAVE_DIR)
+
+
+def dump_ulysses_lowp_traces(save_dir):
+    from flashinfer.comm import _ulysses_lowp as lowp
+
+    for head_dim in (64, 128):
+        q = torch.empty(1, 65, 8, head_dim, dtype=torch.bfloat16)
+        mean = torch.empty(1, 8, head_dim, dtype=q.dtype)
+        qs = torch.empty(1, 8, 3, dtype=torch.float32)
+        ks = torch.empty(1, 8, 2, dtype=torch.float32)
+        spec = lowp.payload_spec(
+            batch_size=1,
+            local_sequence=65,
+            num_heads=8,
+            head_dim=head_dim,
+            world_size=8,
+        )
+        calls = (
+            (lowp.k_sum_v_amax, dict(k=q, v=q)),
+            (lowp.q_grouped_amax, dict(q=q, rank=0, world_size=8)),
+            (lowp.k_grouped_amax, dict(k=q, k_mean_global=mean, rank=0, world_size=8)),
+            (
+                lowp.quant_qkv_pack,
+                dict(
+                    q=q,
+                    k=q,
+                    v=q,
+                    k_mean_global=mean,
+                    q_amax_final=qs,
+                    k_amax_final=ks,
+                    v_scale_global=mean.float(),
+                    rank=0,
+                    world_size=8,
+                ),
+            ),
+            (
+                lowp.unpack_for_sage,
+                dict(
+                    recv_u8=torch.empty(8, spec["chunk_bytes"], dtype=torch.uint8),
+                    batch_size=1,
+                    local_sequence=65,
+                    local_heads=1,
+                    head_dim=head_dim,
+                    world_size=8,
+                ),
+            ),
+        )
+        for fn, kwargs in calls:
+            definition = fn.fi_trace(**kwargs)
+            path = save_dir / f"{definition['name']}.json"
+            path.write_text(json.dumps(definition, indent=2) + "\n")
+
+
+dump_ulysses_lowp_traces(SAVE_DIR)
+
+
+def dump_ulysses_qkv_traces(save_dir):
+    from types import SimpleNamespace
+
+    from flashinfer.comm import UlyssesCommunicator
+
+    # Schema generation only. Real execution obtains this metadata from
+    # comm.prepare_qkv(), called collectively by all ranks before inference.
+    # Do not create a communicator or launch collectives in this example.
+    for layout in ("sage2_sm90", "sage2_sm89_sm120"):
+        metadata = SimpleNamespace(layout=layout, world_size=8, used_sequence=513)
+        for head_dim in (64, 128):
+            q = torch.empty(1, 65, 8, head_dim, dtype=torch.bfloat16)
+            definition = UlyssesCommunicator.scatter_qkv.fi_trace(
+                q=q, k=q, v=q, workspace=metadata
+            )
+            path = save_dir / f"{definition['name']}.json"
+            path.write_text(json.dumps(definition, indent=2) + "\n")
+
+
+dump_ulysses_qkv_traces(SAVE_DIR)
+
 # ── top_k_varlen (DeepSeek sparse-attention indexer top-k) ─────────────────
 # decode shape: one row per request, per-request lengths; the radix_cutlass
 # backend runs on any GPU -> top_k_varlen_n8192_k1024.json
@@ -3200,3 +3665,115 @@ try:
 finally:
     if _ulysses_owns_process_group:
         dist.destroy_process_group()
+
+# ── Token-sparse attention inputs: K/V slot lists, group unions and masks ─────
+from flashinfer.sdsa.token_sparse import group_union_masks, token_sparse_kv_indices
+
+token_sparse_kv_indices.fi_trace(
+    save_dir=SAVE_DIR,
+    positions=torch.empty(4, 2048, dtype=torch.int32),
+    requests=torch.zeros(4, dtype=torch.int32),
+    block_table=torch.empty(2, 64, dtype=torch.int32),
+    block_tables=torch.empty(8, 2, 2048, dtype=torch.int32),
+    seq_lens=torch.empty(8, dtype=torch.int32),
+    requests_per_token=2,
+)
+
+group_union_masks.fi_trace(
+    save_dir=SAVE_DIR,
+    positions=torch.empty(8, 2048, dtype=torch.int32),
+    query_rows=torch.arange(8, dtype=torch.int32),
+    group_unions=torch.arange(2, dtype=torch.int32),
+    requests=torch.zeros(2, dtype=torch.int32),
+    block_table=torch.empty(1, 256, dtype=torch.int32),
+    union=torch.empty(2, 8192, dtype=torch.int32),
+    union_sizes=torch.empty(2, dtype=torch.int32),
+    mask=torch.empty(8, 256, dtype=torch.int32),
+    num_keys=16384,
+)
+
+# ── SDSA (Simplified DSA) indexer ─────────────────────────────────────────────
+from flashinfer.sdsa import (
+    gather_key_sample,
+    indexer_scores,
+    indexer_threshold_select,
+    quantize_write_index_qk_nvfp4,
+    thresholds_from_sample,
+    top_k_from_candidates,
+)
+
+indexer_scores.fi_trace(
+    save_dir=SAVE_DIR,
+    query=torch.empty(8, 128, dtype=torch.bfloat16),
+    key_cache=torch.empty(64, 64, 128, dtype=torch.bfloat16),
+    block_table=torch.empty(4, 16, dtype=torch.int32),
+    context_lengths=torch.empty(4, dtype=torch.int32),
+    requests=torch.arange(4, dtype=torch.int32),
+    scores=torch.empty(8, 1024),
+)
+
+indexer_scores.fi_trace(
+    save_dir=SAVE_DIR,
+    query=torch.empty(8, 64, dtype=torch.uint8),
+    key_cache=torch.empty(64, 64, 64, dtype=torch.uint8),
+    block_table=torch.empty(4, 16, dtype=torch.int32),
+    context_lengths=torch.empty(4, dtype=torch.int32),
+    requests=torch.arange(4, dtype=torch.int32),
+    scores=torch.empty(8, 1024),
+    query_scales=torch.empty(8, 8, dtype=torch.float8_e4m3fn),
+    key_scales=torch.empty(64, 64, 8, dtype=torch.float8_e4m3fn),
+)
+
+quantize_write_index_qk_nvfp4.fi_trace(
+    save_dir=SAVE_DIR,
+    key=torch.empty(16, 128, dtype=torch.bfloat16),
+    slots=torch.arange(16, dtype=torch.int64),
+    query=torch.empty(16, 128, dtype=torch.bfloat16),
+    query_rows=torch.arange(16, dtype=torch.int64),
+    key_cache=torch.empty(4, 64, 64, dtype=torch.uint8),
+    key_scales=torch.empty(4, 64, 8, dtype=torch.float8_e4m3fn),
+    packed_query=torch.empty(16, 64, dtype=torch.uint8),
+    query_scales=torch.empty(16, 8, dtype=torch.float8_e4m3fn),
+)
+
+indexer_threshold_select.fi_trace(
+    save_dir=SAVE_DIR,
+    query=torch.empty(256, 128, dtype=torch.bfloat16),
+    key_cache=torch.empty(64, 64, 128, dtype=torch.bfloat16),
+    row_ends=torch.empty(256, dtype=torch.int32),
+    tile_requests=torch.zeros(2, dtype=torch.int32),
+    block_table=torch.empty(1, 64, dtype=torch.int32),
+    thresholds=torch.empty(256),
+    counters=torch.empty(256, 2, dtype=torch.int32),
+    candidates=torch.empty(256, 4096, 2, dtype=torch.int32),
+    max_context=4096,
+    top_k=2048,
+    arrivals=torch.zeros(2, dtype=torch.int32),
+    ranges=torch.empty(2, 256, dtype=torch.int32),
+)
+
+gather_key_sample.fi_trace(
+    save_dir=SAVE_DIR,
+    key_cache=torch.empty(64, 64, 128, dtype=torch.bfloat16),
+    block_table=torch.empty(2, 32, dtype=torch.int32),
+    offsets=torch.empty(128, dtype=torch.uint8),
+    sample_ends=torch.empty(2, dtype=torch.int32),
+    sample_keys=torch.empty(2, 128, 128, dtype=torch.bfloat16),
+    samples_per_run=3,
+    pages_per_run=2,
+)
+
+thresholds_from_sample.fi_trace(
+    save_dir=SAVE_DIR,
+    sample_scores=torch.empty(256, 128),
+    sample_top=torch.empty(256, 64, dtype=torch.int32),
+    thresholds=torch.empty(256),
+    counters=torch.empty(256, 2, dtype=torch.int32),
+)
+
+top_k_from_candidates.fi_trace(
+    save_dir=SAVE_DIR,
+    candidates=torch.empty(256, 4096, 2, dtype=torch.int32),
+    ranges=torch.empty(2, 256, dtype=torch.int32),
+    top_keys=torch.empty(256, 2048, dtype=torch.int32),
+)

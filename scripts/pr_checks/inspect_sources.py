@@ -223,8 +223,10 @@ def collect_module_alias_exports(
     A `.rst` file may document ``flashinfer.comm.vllm_all_reduce`` whose
     actual definition lives in ``flashinfer.comm.vllm_ar`` as ``def all_reduce``
     (decorated with ``@flashinfer_api``). We follow ``ast.ImportFrom`` chains
-    inside any ``__init__.py`` (and other modules) to surface the *aliased*
-    name under the *importing* module's dotted path.
+    inside package ``__init__.py`` files to surface the *aliased* name under
+    the importing module. Ordinary implementation modules count imports as
+    re-exports only when they declare ``__all__``; its contents are not
+    evaluated. Internal imports still resolve public re-export chains.
 
     Returns ``{importing_module_dotted: set(alias_name, ...)}`` containing
     aliases that ultimately resolve to a ``@decorator``-decorated top-level
@@ -271,6 +273,8 @@ def collect_module_alias_exports(
         def visit_ClassDef(self, node: ast.ClassDef) -> None:
             return
 
+    public_modules: set[str] = set()
+
     for py_file in sorted(pkg_root.rglob("*.py")):
         try:
             tree = ast.parse(
@@ -281,9 +285,27 @@ def collect_module_alias_exports(
         importer_mod = module_name(py_file, pkg_root)
         importer_parts = importer_mod.split(".")
         is_package = py_file.name == "__init__.py"
+        if is_package:
+            public_modules.add(importer_mod)
+        else:
+            for node in tree.body:
+                if isinstance(node, ast.Assign):
+                    targets = node.targets
+                elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                    targets = [node.target]
+                else:
+                    continue
+                if any(
+                    isinstance(target, ast.Name) and target.id == "__all__"
+                    for target in targets
+                ):
+                    public_modules.add(importer_mod)
+                    break
         visitor = ModuleScopeImportFromVisitor()
         visitor.visit(tree)
         for node in visitor.imports:
+            if any((alias.asname or alias.name) == "__all__" for alias in node.names):
+                public_modules.add(importer_mod)
             level = node.level or 0
             target_mod: str
             if level > 0:
@@ -316,7 +338,8 @@ def collect_module_alias_exports(
                 if surfaced in target_names:
                     continue
                 target_names.add(surfaced)
-                aliases.setdefault(importer_mod, set()).add(surfaced)
+                if importer_mod in public_modules:
+                    aliases.setdefault(importer_mod, set()).add(surfaced)
                 changed = True
     return aliases
 

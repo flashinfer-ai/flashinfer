@@ -61,7 +61,11 @@ def msa_sparse_attention(
     workspace: Optional[MSASparseAttentionWorkspace] = None,
     out: Optional[torch.Tensor] = None,
 ):
-    """Minimax Sparse Attention forward for SM90, SM100/SM103 and SM120/SM121 GPUs.
+    """Minimax Sparse Attention forward for SM90, SM100/SM103, SM107
+    (packed-NVFP4 paged K/V only), and SM120/SM121 GPUs.
+
+    SM107 currently supports only packed-NVFP4 paged-KV and follows the
+    SM100/SM103 requirements for that route described below.
 
     Each query attends only the top-K KV blocks selected in ``q2k_indices``.
     Query tokens are processed in tiles: each tile runs one online softmax over
@@ -274,6 +278,11 @@ def msa_sparse_attention(
             raise NotImplementedError(
                 "SM90 msa_sparse_attention is causal; causal=False is not supported"
             )
+        if q2k_indices.shape[-1] != 16:
+            raise NotImplementedError(
+                f"SM90 msa_sparse_attention supports topk=16 only, got "
+                f"{q2k_indices.shape[-1]}"
+            )
         from ._sm90_dispatch import sparse_prefill_sm90
 
         if out is None:
@@ -414,6 +423,7 @@ def _union_tile_config(group_size: int):
 
 
 def _get_compiled_union(topk: int, tokens_per_tile: int):
+    """Compile, and cache, the union prefill body for this geometry."""
     import cutlass
     import cutlass.cute as cute
 

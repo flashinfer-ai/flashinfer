@@ -128,7 +128,13 @@ def build_bmm_fp8(m, n, k):
     def reference():
         return torch.bmm(a8.float(), b8.float()) * a_scale * b_scale
 
+    @torch.inference_mode()
+    def prepare_validation(output, inputs):
+        # bmm_fp8 allocates this output separately from its inputs and workspace.
+        output.fill_(float("nan"))
+
     call.reference = reference
+    call.prepare_validation = prepare_validation
     return call
 
 
@@ -451,7 +457,9 @@ def interleaved_graph_samples(graphs, rounds, replays, prequeue_cycles):
     return samples
 
 
-def graph_selection_study(op, runners, config, inputs, kwargs, args):
+def graph_selection_study(
+    op, runners, config, inputs, kwargs, args, *, prepare_validation=None
+):
     """Fresh cache searches with retained pre-/post-tuning default controls."""
     from torch.utils._pytree import tree_map
 
@@ -570,6 +578,8 @@ def graph_selection_study(op, runners, config, inputs, kwargs, args):
                 (chosen, chosen_output),
                 (after, after_output),
             ):
+                if prepare_validation is not None:
+                    prepare_validation(output, inputs)
                 graph.replay()
                 torch.cuda.synchronize()
                 torch.testing.assert_close(
@@ -607,6 +617,9 @@ def graph_selection_study(op, runners, config, inputs, kwargs, args):
         "trials": rows,
         "trial_isolation": "fresh tuner/cache; same process and retained runner/input objects",
         "validation": {
+            "output_refresh": "fixture_callback"
+            if prepare_validation is not None
+            else "unavailable",
             "events": "outside captured graph",
             "prequeue_cycles": args.prequeue_cycles,
             "replays": args.validation_replays,
@@ -706,7 +719,15 @@ def main():
             )
         op, (runners, config, inputs, kwargs) = next(iter(captured.items()))
         try:
-            result = graph_selection_study(op, runners, config, inputs, kwargs, args)
+            result = graph_selection_study(
+                op,
+                runners,
+                config,
+                inputs,
+                kwargs,
+                args,
+                prepare_validation=getattr(call, "prepare_validation", None),
+            )
         except Exception as exc:
             with open(args.out, "w") as handle:
                 json.dump(

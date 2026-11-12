@@ -237,6 +237,7 @@ Utility Functions
 
     convert_to_block_layout
     reorder_rows_for_gated_act_gemm
+    interleave_cute_dsl_moe_weights
     interleave_moe_weights_for_sm90_mixed_gemm
     interleave_moe_scales_for_sm90_mixed_gemm
     preprocess_moe_weights_for_sm90_mixed_gemm_humming
@@ -684,8 +685,10 @@ uses Prims-TS. NVFP4 and MXFP4 reuse ``TrtllmFp4Config``, BF16 reuses
 ``TrtllmBf16Config``, MXFP8 reuses ``TrtllmFp8BlockConfig``, and per-tensor FP8
 reuses ``TrtllmFp8PerTensorConfig``. DeepSeekFp8 activations and scales match
 ``TrtllmFp8BlockConfig``, but the weight payloads are shuffled with epilogue
-tile 64 and must not be registered under ``trtllm_fp8_block``. One shared view
-can be registered for both keys::
+tile 64 and must not be registered under ``trtllm_fp8_block``. Prims-TS also
+accepts 32x32 DeepSeekFp8 scale blocks (``hidden_states_scale`` of shape
+``[hidden_size / 32, num_tokens]`` with matching weight scales), which the
+TRT-LLM Gen path does not. One shared view can be registered for both keys::
 
     backend = PrimsTsConfig()
     quant = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
@@ -713,8 +716,10 @@ can be registered for both keys::
     )
     output = MoELayer(config)(activations, weights)
 
-``intermediate_size`` must be a multiple of 128. Fused shared experts and
-LoRA stay out of scope.
+``intermediate_size`` must be a multiple of 128, except for DeepSeekFp8 with
+32x32 scale blocks and MajorK weights, where ``hidden_size`` and
+``intermediate_size`` need only be multiples of 32 (BlockMajorK weights keep
+the 128 requirement). Fused shared experts and LoRA stay out of scope.
 
 .. autosummary::
     :toctree: ../generated
@@ -725,8 +730,8 @@ LoRA stay out of scope.
 Prims-TS Fused MoE
 ------------------
 
-Experimental Blackwell (SM100) Prims-TS backends.  Public entry points match
-the corresponding ``trtllm_*`` APIs.
+Experimental SM100, SM103, and SM107 Prims-TS backends.  Public entry points
+match the corresponding ``trtllm_*`` APIs.
 
 .. autosummary::
     :toctree: ../generated
@@ -739,16 +744,34 @@ the corresponding ``trtllm_*`` APIs.
     prims_ts_fp8_block_scale_routed_moe
     prims_ts_fp8_per_tensor_scale_moe
 
+The ``*_partitioned`` variants split one MoE layer across two green-context
+streams with caller-owned weight shards and are supported on SM107 (Rubin)
+only (see
+``flashinfer.prims_ts.moe.MoePartitionResources`` and
+``flashinfer.prims_ts.moe.shard_prepared_moe_weights``):
+
+.. autosummary::
+    :toctree: ../generated
+
+    prims_ts_bf16_moe_partitioned
+    prims_ts_fp4_block_scale_moe_partitioned
+    prims_ts_fp8_block_scale_moe_partitioned
+    prims_ts_fp8_per_tensor_scale_moe_partitioned
+
 These symbols are defined in the backend modules and re-exported from
 :mod:`flashinfer.fused_moe`:
 
 * :func:`flashinfer.fused_moe.backends.prims_ts.bf16_op.prims_ts_bf16_moe`
+* :func:`flashinfer.fused_moe.backends.prims_ts.bf16_op.prims_ts_bf16_moe_partitioned`
 * :func:`flashinfer.fused_moe.backends.prims_ts.bf16_op.prims_ts_bf16_routed_moe`
 * :func:`flashinfer.fused_moe.backends.prims_ts.fp4_op.prims_ts_fp4_block_scale_moe`
+* :func:`flashinfer.fused_moe.backends.prims_ts.fp4_op.prims_ts_fp4_block_scale_moe_partitioned`
 * :func:`flashinfer.fused_moe.backends.prims_ts.fp4_op.prims_ts_fp4_block_scale_routed_moe`
 * :func:`flashinfer.fused_moe.backends.prims_ts.fp8_op.prims_ts_fp8_block_scale_moe`
+* :func:`flashinfer.fused_moe.backends.prims_ts.fp8_op.prims_ts_fp8_block_scale_moe_partitioned`
 * :func:`flashinfer.fused_moe.backends.prims_ts.fp8_op.prims_ts_fp8_block_scale_routed_moe`
 * :func:`flashinfer.fused_moe.backends.prims_ts.fp8_op.prims_ts_fp8_per_tensor_scale_moe`
+* :func:`flashinfer.fused_moe.backends.prims_ts.fp8_op.prims_ts_fp8_per_tensor_scale_moe_partitioned`
 
 Standalone TRT-LLM Gen Routing
 ------------------------------
@@ -768,6 +791,18 @@ CuteDSL Fused MoE
 
 The CuteDSL backends are conditionally available when the
 ``nvidia-cutlass-dsl`` package is installed.
+
+With NVFP4 expert weights on Blackwell, :func:`cute_dsl_fused_moe` and
+:class:`CuteDslMoEWrapper` support two activation-precision choices:
+
+* ``quant_mode="w4a4"`` uses packed NVFP4 activations and FP4 MMA.
+* ``quant_mode="w4a16"`` keeps activations in BF16 and dequantizes packed
+  NVFP4 weights online for BF16 MMA. The FC1-to-FC2 activation handoff also
+  remains BF16.
+
+For more on the W4A16 design and performance, see
+`Faster-than-light NVFP4 decode—with precision
+<https://humansand.ai/blog/faster-than-light-nvfp4-decode>`_ by Ziang Li at humans& ai.
 
 .. autosummary::
     :toctree: ../generated

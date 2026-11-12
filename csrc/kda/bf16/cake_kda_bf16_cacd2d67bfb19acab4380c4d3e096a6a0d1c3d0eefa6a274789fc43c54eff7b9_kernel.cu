@@ -1294,8 +1294,8 @@ kernel_cake_kda_bf16_cacd2d67bfb19acab4380c4d3e096a6a0d1c3d0eefa6a274789fc43c54e
     #define checkpoint_snapshot_done_addr (mbar_base + 608)
     #define work_item_ready_addr (mbar_base + 640)
     #define aux_pairwise_inputs_ready_addr (mbar_base + 648)
-    #define aux_pairwise_consumed_addr (mbar_base + 688)
-    #define aux_inverse_ready_addr (mbar_base + 728)
+    #define aux_pairwise_consumed_addr (mbar_base + 816)
+    #define aux_inverse_ready_addr (mbar_base + 896)
     #define short_beta_ready_addr (mbar_base + 768)
 
     const int bid = blockIdx.x;
@@ -1447,7 +1447,7 @@ kernel_cake_kda_bf16_cacd2d67bfb19acab4380c4d3e096a6a0d1c3d0eefa6a274789fc43c54e
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_10_32) : "r"(lane), "n"(3), "r"((uint32_t)(1)));
         mbarrier_init(smem + 256 + lane * 8, _mbarrier_init_count_10_32);
         uint32_t _mbarrier_init_count_10_64 = 32;
-        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_10_64) : "r"(lane), "n"(22), "r"((uint32_t)(128)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_10_64) : "r"(lane), "n"(27), "r"((uint32_t)(128)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_10_64) : "r"(lane), "n"(17), "r"((uint32_t)(1)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_10_64) : "r"(lane), "n"(16), "r"((uint32_t)(4)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_10_64) : "r"(lane), "n"(12), "r"((uint32_t)(1)));
@@ -1458,6 +1458,9 @@ kernel_cake_kda_bf16_cacd2d67bfb19acab4380c4d3e096a6a0d1c3d0eefa6a274789fc43c54e
         mbarrier_init(smem + 512 + lane * 8, _mbarrier_init_count_10_64);
         if (lane < 5) {
             mbarrier_init(smem + 768 + lane * 8, 1);
+        }
+        if (lane < 20) {
+            mbarrier_init(smem + 816 + lane * 8, 32);
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
@@ -2071,7 +2074,7 @@ kernel_cake_kda_bf16_cacd2d67bfb19acab4380c4d3e096a6a0d1c3d0eefa6a274789fc43c54e
                 for (int aux_iter = 0; aux_iter < num_aux_iters; aux_iter++) {
                     int chunk_idx_2 = aux_iter * 2 + aux_instance;
                     int stage_f32 = aux_stage * 5376;
-                    mbarrier_wait(aux_pairwise_inputs_ready_addr + (aux_stage) * 8, _phase_aux_pairwise_inputs_ready);
+                    mbarrier_wait(aux_pairwise_inputs_ready_addr + ((unsigned int)chunk_idx_2 % 10) * 8, (unsigned int)chunk_idx_2 / 10 % 2);
                     unsigned int a_frag[4];
                     unsigned int b_frag[4];
                     float acc[8];
@@ -2694,7 +2697,7 @@ kernel_cake_kda_bf16_cacd2d67bfb19acab4380c4d3e096a6a0d1c3d0eefa6a274789fc43c54e
                     }
                     __syncwarp();
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    mbarrier_arrive(aux_pairwise_consumed_addr + (aux_stage) * 8);
+                    mbarrier_arrive(aux_pairwise_consumed_addr + ((unsigned int)chunk_idx_2 % 10) * 8);
                     int lane_row = lane % 16;
                     int lane_col = lane / 16 * 8;
                     int byte_off_16 = (int)aux_stage * 5120 + lane_row * 128 + lane_col * 2;
@@ -2712,7 +2715,7 @@ kernel_cake_kda_bf16_cacd2d67bfb19acab4380c4d3e096a6a0d1c3d0eefa6a274789fc43c54e
                         : "memory");
                     __syncwarp();
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    mbarrier_arrive(aux_inverse_ready_addr + (aux_stage) * 8);
+                    mbarrier_arrive(aux_inverse_ready_addr + ((unsigned int)chunk_idx_2 % 10) * 8);
                     aux_stage += 1;
                     if (aux_stage == 5) { aux_stage = 0; _phase_aux_pairwise_inputs_ready ^= 1; }
                     aux_stage += 1;
@@ -3414,14 +3417,14 @@ kernel_cake_kda_bf16_cacd2d67bfb19acab4380c4d3e096a6a0d1c3d0eefa6a274789fc43c54e
                 }
                 asm volatile("barrier.sync %0, 128;" :: "r"(10 + prep_instance) : "memory");
                 {
-                    mbarrier_arrive(aux_pairwise_inputs_ready_addr + (prep_stage) * 8);
+                    mbarrier_arrive(aux_pairwise_inputs_ready_addr + ((unsigned int)chunk_idx_3 % 10) * 8);
                 }
                 unsigned int a_frag_1[4];
                 unsigned int b_frag_1[4];
                 float acc_1[8];
                 long long tape_scaled_base = 0;
                 {
-                    mbarrier_wait(aux_pairwise_consumed_addr + (prep_stage) * 8, _phase_aux_pairwise_consumed);
+                    mbarrier_wait(aux_pairwise_consumed_addr + ((unsigned int)chunk_idx_3 % 10) * 8, (unsigned int)chunk_idx_3 / 10 % 2);
                 }
                 {
                     int stage_f32_0 = prep_stage * 5376;
@@ -3477,7 +3480,7 @@ kernel_cake_kda_bf16_cacd2d67bfb19acab4380c4d3e096a6a0d1c3d0eefa6a274789fc43c54e
                     }
                 }
                 {
-                    mbarrier_wait(aux_inverse_ready_addr + (prep_stage) * 8, _phase_aux_inverse_ready);
+                    mbarrier_wait(aux_inverse_ready_addr + ((unsigned int)chunk_idx_3 % 10) * 8, (unsigned int)chunk_idx_3 / 10 % 2);
                 }
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("barrier.sync %0, 128;" :: "r"(10 + prep_instance) : "memory");
