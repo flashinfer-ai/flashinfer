@@ -108,7 +108,7 @@ def test_paged_window_retained_capture(
             q_scale=q_scale,
         )
 
-    def check(q_scale=1.0):
+    def check(q_scale=1.0, include_lse=True):
         for b, (nq, nk) in enumerate(
             zip(q_lengths.tolist(), kv_lengths.tolist(), strict=True)
         ):
@@ -144,7 +144,7 @@ def test_paged_window_retained_capture(
                 torch.testing.assert_close(
                     out[rows, head].float(), ref.float(), atol=0.02, rtol=0.02
                 )
-                if return_lse:
+                if return_lse and include_lse:
                     torch.testing.assert_close(
                         lse[rows, head],
                         scores.logsumexp(-1).float(),
@@ -180,4 +180,13 @@ def test_paged_window_retained_capture(
     with torch.cuda.stream(stream):
         capture.replay()
     torch.cuda.current_stream().wait_stream(stream)
+    check()
+
+    # The legacy forward API changes the window without calling plan(). It
+    # must not execute the old window's prepared graph just because causal
+    # stayed the same. Subsequent run() also uses the new window.
+    window = 0 if window != 0 else 127
+    out = wrapper.forward(q, (k, v), causal=causal, window_left=window)
+    check(include_lse=False)
+    run()
     check()
