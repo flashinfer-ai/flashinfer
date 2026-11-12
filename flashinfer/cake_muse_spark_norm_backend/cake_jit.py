@@ -4603,7 +4603,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
-            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -4749,19 +4748,21 @@ MODULES: dict[str, dict[str, Any]] = {
             "windows": {
                 "sm_100a": [
                     [
-                        64,
+                        71,
                         128,
                     ],
                 ],
                 "sm_103a": [
                     [
-                        64,
-                        128,
+                        74,
+                        78,
                     ],
-                ],
-                "sm_107a": [
                     [
-                        64,
+                        90,
+                        97,
+                    ],
+                    [
+                        108,
                         128,
                     ],
                 ],
@@ -4917,7 +4918,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "windows": {
                 "sm_107a": [
                     [
-                        128,
+                        92,
                         256,
                     ],
                 ],
@@ -5396,6 +5397,10 @@ MODULES: dict[str, dict[str, Any]] = {
                 ],
                 "sm_103a": [
                     [
+                        78,
+                        90,
+                    ],
+                    [
                         128,
                         255,
                     ],
@@ -5555,23 +5560,31 @@ MODULES: dict[str, dict[str, Any]] = {
                 "sm_100a": [
                     [
                         0,
-                        16,
+                        18,
                     ],
                 ],
                 "sm_103a": [
                     [
                         0,
-                        16,
+                        19,
+                    ],
+                    [
+                        36,
+                        57,
                     ],
                 ],
                 "sm_107a": [
                     [
                         1,
-                        16,
+                        26,
                     ],
                     [
-                        32,
-                        64,
+                        46,
+                        79,
+                    ],
+                    [
+                        92,
+                        101,
                     ],
                 ],
             },
@@ -5756,6 +5769,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -5909,6 +5923,12 @@ MODULES: dict[str, dict[str, Any]] = {
                     [
                         255,
                         256,
+                    ],
+                ],
+                "sm_107a": [
+                    [
+                        101,
+                        128,
                     ],
                 ],
             },
@@ -8504,19 +8524,23 @@ MODULES: dict[str, dict[str, Any]] = {
                 "sm_100a": [
                     [
                         0,
-                        16,
+                        18,
+                    ],
+                    [
+                        37,
+                        42,
                     ],
                 ],
                 "sm_103a": [
                     [
                         0,
-                        16,
+                        17,
                     ],
                 ],
                 "sm_107a": [
                     [
                         1,
-                        16,
+                        14,
                     ],
                 ],
             },
@@ -8839,14 +8863,18 @@ MODULES: dict[str, dict[str, Any]] = {
             "windows": {
                 "sm_100a": [
                     [
-                        16,
-                        64,
+                        18,
+                        37,
+                    ],
+                    [
+                        42,
+                        71,
                     ],
                 ],
                 "sm_103a": [
                     [
-                        16,
-                        64,
+                        17,
+                        76,
                     ],
                 ],
                 "sm_107a": [
@@ -8855,8 +8883,12 @@ MODULES: dict[str, dict[str, Any]] = {
                         1,
                     ],
                     [
-                        16,
-                        32,
+                        14,
+                        48,
+                    ],
+                    [
+                        49,
+                        92,
                     ],
                 ],
             },
@@ -9180,14 +9212,22 @@ MODULES: dict[str, dict[str, Any]] = {
             "windows": {
                 "sm_100a": [
                     [
-                        16,
-                        64,
+                        18,
+                        71,
                     ],
                 ],
                 "sm_103a": [
                     [
-                        16,
-                        64,
+                        19,
+                        36,
+                    ],
+                    [
+                        57,
+                        74,
+                    ],
+                    [
+                        97,
+                        108,
                     ],
                 ],
                 "sm_107a": [
@@ -9196,8 +9236,12 @@ MODULES: dict[str, dict[str, Any]] = {
                         1,
                     ],
                     [
-                        16,
-                        32,
+                        26,
+                        46,
+                    ],
+                    [
+                        79,
+                        92,
                     ],
                 ],
             },
@@ -10336,20 +10380,20 @@ MODULES: dict[str, dict[str, Any]] = {
             "windows": {
                 "sm_100a": [
                     [
-                        64,
+                        71,
                         128,
                     ],
                 ],
                 "sm_103a": [
                     [
-                        64,
+                        76,
                         128,
                     ],
                 ],
                 "sm_107a": [
                     [
-                        32,
-                        128,
+                        48,
+                        49,
                     ],
                 ],
             },
@@ -15843,7 +15887,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "gated_residual_rmsnorm_mode0_pdl": [
             "cake_muse_spark_norm_e76096bfbf74c9e0ff9d",
             "cake_muse_spark_norm_4cda6b20b0130dd5dbea",
-            "cake_muse_spark_norm_174629cf5a3c3c6cf1e1",
+            "cake_muse_spark_norm_5ada555ddfba18312f8a",
             "cake_muse_spark_norm_05457dec91e9b359a3a5",
             "cake_muse_spark_norm_f6e3c1db2952ed80c64d",
         ],
