@@ -2068,6 +2068,15 @@ def test_routing_constants_are_read_from_the_cache_under_graph_capture():
     eager = bits(layer(pack, W))  # the constants of this expert count are now cached
     b0, s0 = api._const(dev, E, 0.0), api._const(dev, 1, 1.0)
     assert api._const(dev, E, 0.0) is b0 and api._const(dev, 1, 1.0) is s0
+    # the probe constant below must be unmet in this process: another suite's expert count may have cached it
+    api._CONST.pop(
+        (
+            dev.index if dev.index is not None else torch.cuda.current_device(),
+            3 * E,
+            0.0,
+        ),
+        None,
+    )
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         layer(pack, W)
