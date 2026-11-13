@@ -5822,6 +5822,31 @@ def _compute_mask_indptr(
     return mask_indptr
 
 
+def _drop_positional_kv_sf(
+    jit_additional_tensor_names: List[str],
+    num_scalar_args: int,
+    known_bufs: dict,
+    user_args: tuple,
+    kv_sf_names: Tuple[str, ...] = ("maybe_k_cache_sf", "maybe_v_cache_sf"),
+) -> tuple:
+    """Remove scale tensors a caller also passed positionally.
+
+    Before ``kv_cache_sf`` was forwarded on the custom-JIT ragged path, the
+    ``maybe_k_cache_sf`` / ``maybe_v_cache_sf`` slots were filled from
+    ``*args``. If ``*args`` has that legacy layout (one entry per declared
+    tensor not in ``known_bufs``, scale slots included, plus the scalars), the
+    entries in the scale slots are dropped so the remaining positional args
+    keep their slots; ``kv_cache_sf`` provides the scales. Any other length is
+    the new layout and is left untouched, so a user tensor is never removed
+    just because it aliases a scale.
+    """
+    slot_names = [n for n in jit_additional_tensor_names if n not in known_bufs]
+    scale_slots = [i for i, n in enumerate(slot_names) if n in kv_sf_names]
+    if not scale_slots or len(user_args) != len(slot_names) + num_scalar_args:
+        return user_args
+    return tuple(a for i, a in enumerate(user_args) if i not in scale_slots)
+
+
 class BatchPrefillWithRaggedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with a ragged (tensor) KV cache for a
     batch of requests.
@@ -6059,12 +6084,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
             # jit_args[7] is additional_tensor_names from gen_customize_batch_prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
+            self._jit_additional_scalar_names = list(jit_args[9])
             self._jit_use_token_head_sf = bool(
                 jit_kwargs.get("use_token_head_sf", False)
             )
         else:
             self._jit_module = None
             self._jit_additional_tensor_names = []
+            self._jit_additional_scalar_names = []
             self._jit_use_token_head_sf = False
 
         if variant_owns_mask and self._jit_module is None:
@@ -8107,16 +8134,30 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             enable_pdl,
         ]
         if self._jit_module is not None:
+            jit_known_bufs = {
+                "maybe_custom_mask": self._custom_mask_buf,
+                "maybe_mask_indptr": self._mask_indptr_buf,
+                "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
+                    q.shape[1], self.device
+                ),
+            }
+            if k_sf is not None:
+                # Callers that still pass the scales positionally as well keep
+                # working: drop those duplicates so later positional args keep
+                # their slots. Without kv_cache_sf the scale slots are filled
+                # from *args as before.
+                args = _drop_positional_kv_sf(
+                    self._jit_additional_tensor_names,
+                    len(self._jit_additional_scalar_names),
+                    jit_known_bufs,
+                    args,
+                )
+                jit_known_bufs["maybe_k_cache_sf"] = k_sf
+                jit_known_bufs["maybe_v_cache_sf"] = v_sf
             run_args.extend(
                 prepare_jit_additional_args(
                     self._jit_additional_tensor_names,
-                    {
-                        "maybe_custom_mask": self._custom_mask_buf,
-                        "maybe_mask_indptr": self._mask_indptr_buf,
-                        "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
-                            q.shape[1], self.device
-                        ),
-                    },
+                    jit_known_bufs,
                     args,
                 )
             )
