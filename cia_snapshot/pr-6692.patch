@@ -1,0 +1,74 @@
+diff --git a/csrc/fused_moe/cake_mxfp4_situ_moe/cake_mxfp4_situ_moe_cute_manifest.json b/csrc/fused_moe/cake_mxfp4_situ_moe/cake_mxfp4_situ_moe_cute_manifest.json
+index a6e493c827a..508744e28dd 100644
+--- a/csrc/fused_moe/cake_mxfp4_situ_moe/cake_mxfp4_situ_moe_cute_manifest.json
++++ b/csrc/fused_moe/cake_mxfp4_situ_moe/cake_mxfp4_situ_moe_cute_manifest.json
+@@ -5671,10 +5671,10 @@
+         "sha256": "d88e4987e71e51dcd69175ad6a994a18fa8603b093638c60e971c99892102455"
+       },
+       {
+-        "bytes": 287921,
++        "bytes": 288629,
+         "kind": "integration",
+         "path": "flashinfer/fused_moe/cake_cute/cake_mxfp4_situ_moe_plan.py",
+-        "sha256": "0ad649cdee097f7bcce5b1684439b1a35af53887b9d8869ca7180c553b643937"
++        "sha256": "050d0623e6f8a51ab15a8a10104ac21dc44bbd6cccadada1537b1cebeede3685"
+       },
+       {
+         "bytes": 454,
+diff --git a/csrc/fused_moe/cake_mxfp4_situ_moe/cake_mxfp4_situ_moe_manifest.json b/csrc/fused_moe/cake_mxfp4_situ_moe/cake_mxfp4_situ_moe_manifest.json
+index 0c89eb8dfcd..4c4f857025f 100644
+--- a/csrc/fused_moe/cake_mxfp4_situ_moe/cake_mxfp4_situ_moe_manifest.json
++++ b/csrc/fused_moe/cake_mxfp4_situ_moe/cake_mxfp4_situ_moe_manifest.json
+@@ -5901,10 +5901,10 @@
+         "sha256": "4b86adf8db4b2fc320f6343cfcccac7bf0a16c81cdde3ab761675be4a90935ae"
+       },
+       {
+-        "bytes": 287911,
++        "bytes": 288619,
+         "kind": "integration",
+         "path": "flashinfer/fused_moe/cake/cake_mxfp4_situ_moe_plan.py",
+-        "sha256": "95fba24e6f383126ed4ba233453ab2e54bbbdd2b354599f8b72ce3c87a8dccdf"
++        "sha256": "6576e9f7f4bd757813c9dd15f5c7c530229e0accaf660f60bf44291927f3c211"
+       },
+       {
+         "bytes": 454,
+diff --git a/flashinfer/fused_moe/cake/cake_mxfp4_situ_moe_plan.py b/flashinfer/fused_moe/cake/cake_mxfp4_situ_moe_plan.py
+index 84076e87331..e0c93492787 100644
+--- a/flashinfer/fused_moe/cake/cake_mxfp4_situ_moe_plan.py
++++ b/flashinfer/fused_moe/cake/cake_mxfp4_situ_moe_plan.py
+@@ -4356,6 +4356,15 @@ class _GemmModule:
+     _unused_situ_operands = staticmethod(_unused_situ_operands)
+     cluster_split_grid = staticmethod(swapab_cluster_split_grid)
+ 
++    @staticmethod
++    def pack_g1_geom(*, items_per_group: int, grid: int, split_form: bool) -> int:
++        """The plain chain's GEMM1 launch geometry packed for the finalize kernel's late-item first-box L2 prefetch
++        (decoded device-side as ``grid = g1_geom & 4095``, ``items_per_group = g1_geom >> 12 & 4095`` and
++        ``split_form = g1_geom >> 24 & 1``); 0 is the unknown geometry (nothing prefetched, same output)."""
++        if not (0 <= int(grid) <= 4095 and 0 <= int(items_per_group) <= 4095):
++            raise ValueError(f"g1_geom field out of range: grid={grid}, items_per_group={items_per_group}")
++        return int(grid) | (int(items_per_group) << 12) | (int(bool(split_form)) << 24)
++
+     @staticmethod
+     def form_config(n_tile: int, kbps: int = 4, *, situ: bool = False, m_group: int | None = None,
+                     row_group_list: bool | None = None, sf_blocked: bool | None = None,
+diff --git a/flashinfer/fused_moe/cake_cute/cake_mxfp4_situ_moe_plan.py b/flashinfer/fused_moe/cake_cute/cake_mxfp4_situ_moe_plan.py
+index de19cc5e61d..7e318435481 100644
+--- a/flashinfer/fused_moe/cake_cute/cake_mxfp4_situ_moe_plan.py
++++ b/flashinfer/fused_moe/cake_cute/cake_mxfp4_situ_moe_plan.py
+@@ -4356,6 +4356,15 @@ class _GemmModule:
+     _unused_situ_operands = staticmethod(_unused_situ_operands)
+     cluster_split_grid = staticmethod(swapab_cluster_split_grid)
+ 
++    @staticmethod
++    def pack_g1_geom(*, items_per_group: int, grid: int, split_form: bool) -> int:
++        """The plain chain's GEMM1 launch geometry packed for the finalize kernel's late-item first-box L2 prefetch
++        (decoded device-side as ``grid = g1_geom & 4095``, ``items_per_group = g1_geom >> 12 & 4095`` and
++        ``split_form = g1_geom >> 24 & 1``); 0 is the unknown geometry (nothing prefetched, same output)."""
++        if not (0 <= int(grid) <= 4095 and 0 <= int(items_per_group) <= 4095):
++            raise ValueError(f"g1_geom field out of range: grid={grid}, items_per_group={items_per_group}")
++        return int(grid) | (int(items_per_group) << 12) | (int(bool(split_form)) << 24)
++
+     @staticmethod
+     def form_config(n_tile: int, kbps: int = 4, *, situ: bool = False, m_group: int | None = None,
+                     row_group_list: bool | None = None, sf_blocked: bool | None = None,

@@ -1,0 +1,920 @@
+diff --git a/flashinfer/experimental/cake_dsa_train/build.json b/flashinfer/experimental/cake_dsa_train/build.json
+index 245de96a08e..e0463689421 100644
+--- a/flashinfer/experimental/cake_dsa_train/build.json
++++ b/flashinfer/experimental/cake_dsa_train/build.json
+@@ -125,7 +125,7 @@
+     },
+     {
+       "arch": "sm_100a",
+-      "closure_sha256": "150060d4a54dd6b6c42c32b82aa560de79a20e2ff1bc8c1c10a50c7efd8b7356",
++      "closure_sha256": "0d9496d577c9e7f858c2b56e913e80f18f2f6cdbb90e94bc22db63a314c275a3",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
+       "min_cuda": "12.8",
+@@ -137,7 +137,7 @@
+       "path": "aot/cake_dsa_h64_train_726ceb6d3890375e922d_sm_100a.so",
+       "sha256": {
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_726ceb6d3890375e922d_binding.cu": "825aeaa10375cf443de2ab674f1ce4619f930953b4577437936925f3bf335d00",
+-        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_726ceb6d3890375e922d_kernel.cu": "2d7215a173715fb7f74b13f5775d683544c0cbf300c386ea5e3ca218a1785052"
++        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_726ceb6d3890375e922d_kernel.cu": "e11f5cb30aaa523a49f8d5e52eda9136872670923d643fb50aeb6f80e2e7a8f3"
+       },
+       "sources": [
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_726ceb6d3890375e922d_kernel.cu",
+@@ -146,7 +146,7 @@
+     },
+     {
+       "arch": "sm_103a",
+-      "closure_sha256": "2f1bdcd0a4991a3334f1e51505fdff81c5f9de516f1b64ef3fb31e67d73a3454",
++      "closure_sha256": "b83de83b1ac7c4f6bce20a606cb70e4ce0f0fc31017479275e8a4b043cdca7ff",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
+       "min_cuda": "12.9",
+@@ -158,7 +158,7 @@
+       "path": "aot/cake_dsa_h64_train_726ceb6d3890375e922d_sm_103a.so",
+       "sha256": {
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_726ceb6d3890375e922d_binding.cu": "825aeaa10375cf443de2ab674f1ce4619f930953b4577437936925f3bf335d00",
+-        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_726ceb6d3890375e922d_kernel.cu": "2d7215a173715fb7f74b13f5775d683544c0cbf300c386ea5e3ca218a1785052"
++        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_726ceb6d3890375e922d_kernel.cu": "e11f5cb30aaa523a49f8d5e52eda9136872670923d643fb50aeb6f80e2e7a8f3"
+       },
+       "sources": [
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_726ceb6d3890375e922d_kernel.cu",
+@@ -167,7 +167,7 @@
+     },
+     {
+       "arch": "sm_107a",
+-      "closure_sha256": "863a01fdefaf0cd9f0f0704be2bb1a1d6fdbc61165d268ed620177a8f8e778f0",
++      "closure_sha256": "1d069d576b37aff8ef579254076b118509aa3e194ea35b4c4280d95e36356559",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_107a,code=sm_107a",
+       "min_cuda": "13.0",
+@@ -179,7 +179,7 @@
+       "path": "aot/cake_dsa_h64_train_726ceb6d3890375e922d_sm_107a.so",
+       "sha256": {
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_726ceb6d3890375e922d_binding.cu": "825aeaa10375cf443de2ab674f1ce4619f930953b4577437936925f3bf335d00",
+-        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_726ceb6d3890375e922d_kernel.cu": "2d7215a173715fb7f74b13f5775d683544c0cbf300c386ea5e3ca218a1785052"
++        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_726ceb6d3890375e922d_kernel.cu": "e11f5cb30aaa523a49f8d5e52eda9136872670923d643fb50aeb6f80e2e7a8f3"
+       },
+       "sources": [
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_726ceb6d3890375e922d_kernel.cu",
+@@ -188,7 +188,7 @@
+     },
+     {
+       "arch": "sm_100a",
+-      "closure_sha256": "ccbd9f64360faef28e4ba28a7f0ad7f55c7e7ad96b8417e63699921f2d93e79e",
++      "closure_sha256": "b3af5938b16e888f98c3348d31e972fc8c12b158ea2ebfe58b73fd78685c184b",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
+       "min_cuda": "12.8",
+@@ -200,7 +200,7 @@
+       "path": "aot/cake_dsa_h64_train_76061910b68bb0506c5e_sm_100a.so",
+       "sha256": {
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_76061910b68bb0506c5e_binding.cu": "59374fe284a505478875e85bd7ec096b2a626382a79c00ec03d930aaac7f8dee",
+-        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_76061910b68bb0506c5e_kernel.cu": "613e07574786688947e46f21bbfe12fdd304507cc7f310c0afd3b0f247da754f"
++        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_76061910b68bb0506c5e_kernel.cu": "761bbb9aafcc70d905cf246ec7d88cb6ed243e1546cb104450a11675b9452e1c"
+       },
+       "sources": [
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_76061910b68bb0506c5e_kernel.cu",
+@@ -209,7 +209,7 @@
+     },
+     {
+       "arch": "sm_103a",
+-      "closure_sha256": "ed6a03d910facc72a0d3aff2280eeb691e5443ac048166da6c8d6250e39ea207",
++      "closure_sha256": "a633299580909e56864b02927897f0809c5f52cec3971d139aa513ddfd42eef2",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
+       "min_cuda": "12.9",
+@@ -221,7 +221,7 @@
+       "path": "aot/cake_dsa_h64_train_76061910b68bb0506c5e_sm_103a.so",
+       "sha256": {
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_76061910b68bb0506c5e_binding.cu": "59374fe284a505478875e85bd7ec096b2a626382a79c00ec03d930aaac7f8dee",
+-        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_76061910b68bb0506c5e_kernel.cu": "613e07574786688947e46f21bbfe12fdd304507cc7f310c0afd3b0f247da754f"
++        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_76061910b68bb0506c5e_kernel.cu": "761bbb9aafcc70d905cf246ec7d88cb6ed243e1546cb104450a11675b9452e1c"
+       },
+       "sources": [
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_76061910b68bb0506c5e_kernel.cu",
+@@ -230,7 +230,7 @@
+     },
+     {
+       "arch": "sm_107a",
+-      "closure_sha256": "b33826ba5159f8152be50800fba9a57d355ce57b5aefbe5823d1016769f74587",
++      "closure_sha256": "806180d46da4028d7e36f9cbb3293bae445821702bced66338680336291e1531",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_107a,code=sm_107a",
+       "min_cuda": "13.0",
+@@ -242,7 +242,7 @@
+       "path": "aot/cake_dsa_h64_train_76061910b68bb0506c5e_sm_107a.so",
+       "sha256": {
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_76061910b68bb0506c5e_binding.cu": "59374fe284a505478875e85bd7ec096b2a626382a79c00ec03d930aaac7f8dee",
+-        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_76061910b68bb0506c5e_kernel.cu": "613e07574786688947e46f21bbfe12fdd304507cc7f310c0afd3b0f247da754f"
++        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_76061910b68bb0506c5e_kernel.cu": "761bbb9aafcc70d905cf246ec7d88cb6ed243e1546cb104450a11675b9452e1c"
+       },
+       "sources": [
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_76061910b68bb0506c5e_kernel.cu",
+@@ -377,7 +377,7 @@
+     },
+     {
+       "arch": "sm_100a",
+-      "closure_sha256": "33c2c1bcb0c6446ab11544de5305bf5bb39ba0a13b8b5619ac1eaddc1d1c0b6b",
++      "closure_sha256": "4abd219f08d1c3194ec5b04bbbea8c1c3f6f8076877d6036dbe974e86a8c5f26",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
+       "min_cuda": "12.8",
+@@ -389,7 +389,7 @@
+       "path": "aot/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_sm_100a.so",
+       "sha256": {
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_binding.cu": "1cc468f50d2de52c5ca339efa892e2cb4b67f8f0047dba9c503f1bf15bccdfd8",
+-        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_kernel.cu": "9bac5f3adc4cc7318b8434b3d5630ad44a2547fbe4371475b00e13de9ec5af18"
++        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_kernel.cu": "844ee5592ffa1986362acb300054c019b74d734cb508a5778ff9776ce04d6d38"
+       },
+       "sources": [
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_kernel.cu",
+@@ -398,7 +398,7 @@
+     },
+     {
+       "arch": "sm_103a",
+-      "closure_sha256": "8a1f43a4768e1faab0067c6baed50e4f294b2a2aaffcec4f26d7fc0cfd4f3e14",
++      "closure_sha256": "d492e206d5a2f86cd7503606a82f8a6b702741b4dbec0a774e62c7a2cbdf31be",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
+       "min_cuda": "12.9",
+@@ -410,7 +410,7 @@
+       "path": "aot/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_sm_103a.so",
+       "sha256": {
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_binding.cu": "1cc468f50d2de52c5ca339efa892e2cb4b67f8f0047dba9c503f1bf15bccdfd8",
+-        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_kernel.cu": "9bac5f3adc4cc7318b8434b3d5630ad44a2547fbe4371475b00e13de9ec5af18"
++        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_kernel.cu": "844ee5592ffa1986362acb300054c019b74d734cb508a5778ff9776ce04d6d38"
+       },
+       "sources": [
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_kernel.cu",
+@@ -419,7 +419,7 @@
+     },
+     {
+       "arch": "sm_107a",
+-      "closure_sha256": "842d780b1787d543aaa28bf35d87478404850719457d79429c152a98d5800783",
++      "closure_sha256": "705cbba431f6916b571877411aa8d12ebbc32dd796928665e148bb65dfd7e277",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_107a,code=sm_107a",
+       "min_cuda": "13.0",
+@@ -431,7 +431,7 @@
+       "path": "aot/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_sm_107a.so",
+       "sha256": {
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_binding.cu": "1cc468f50d2de52c5ca339efa892e2cb4b67f8f0047dba9c503f1bf15bccdfd8",
+-        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_kernel.cu": "9bac5f3adc4cc7318b8434b3d5630ad44a2547fbe4371475b00e13de9ec5af18"
++        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_kernel.cu": "844ee5592ffa1986362acb300054c019b74d734cb508a5778ff9776ce04d6d38"
+       },
+       "sources": [
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_kernel.cu",
+@@ -503,7 +503,7 @@
+     },
+     {
+       "arch": "sm_100a",
+-      "closure_sha256": "6d348882c9b595418c16839306fff484b0eb70952665cfb0e08f20b0ae0187e0",
++      "closure_sha256": "e93ad09321fa3f76856ac75bfbe8aba75d07050fc3a08d6d392220d21c80e926",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
+       "min_cuda": "12.8",
+@@ -515,7 +515,7 @@
+       "path": "aot/cake_dsa_h64_train_e29d165e3abca62c430b_sm_100a.so",
+       "sha256": {
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_binding.cu": "5a68160c14e2fa156a8eb2ca5af6304b1fec2c171150e9d46e47d006d8bb9223",
+-        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_kernel.cu": "7e042e5c7d9901bfa2e9c44b26a91872eb89cd624fe6b85f9933a3b30a5eb7ba"
++        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_kernel.cu": "05dce64963cd49d2955c3f8bbe5346b8f3d317b68cd1ab9bc8b1617d0bec2054"
+       },
+       "sources": [
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_kernel.cu",
+@@ -524,7 +524,7 @@
+     },
+     {
+       "arch": "sm_103a",
+-      "closure_sha256": "5fe2fb56c525666df21114601886096b33f9817a40e7c5b5c3fde4690c8a1790",
++      "closure_sha256": "832b2bba6e0b2ea79d7acc797608c22177368832149e577e0a06172ebb962dba",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
+       "min_cuda": "12.9",
+@@ -536,7 +536,7 @@
+       "path": "aot/cake_dsa_h64_train_e29d165e3abca62c430b_sm_103a.so",
+       "sha256": {
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_binding.cu": "5a68160c14e2fa156a8eb2ca5af6304b1fec2c171150e9d46e47d006d8bb9223",
+-        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_kernel.cu": "7e042e5c7d9901bfa2e9c44b26a91872eb89cd624fe6b85f9933a3b30a5eb7ba"
++        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_kernel.cu": "05dce64963cd49d2955c3f8bbe5346b8f3d317b68cd1ab9bc8b1617d0bec2054"
+       },
+       "sources": [
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_kernel.cu",
+@@ -545,7 +545,7 @@
+     },
+     {
+       "arch": "sm_107a",
+-      "closure_sha256": "ed6b0d2eb2324b72616712f980c37942cb92d6411a0ad2344c60a29b45689aa3",
++      "closure_sha256": "89e76e2f93dcbdb5de3fa602607cbefa13539ca2c580c8a4b6f40db300e5b9c8",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_107a,code=sm_107a",
+       "min_cuda": "13.0",
+@@ -557,7 +557,7 @@
+       "path": "aot/cake_dsa_h64_train_e29d165e3abca62c430b_sm_107a.so",
+       "sha256": {
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_binding.cu": "5a68160c14e2fa156a8eb2ca5af6304b1fec2c171150e9d46e47d006d8bb9223",
+-        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_kernel.cu": "7e042e5c7d9901bfa2e9c44b26a91872eb89cd624fe6b85f9933a3b30a5eb7ba"
++        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_kernel.cu": "05dce64963cd49d2955c3f8bbe5346b8f3d317b68cd1ab9bc8b1617d0bec2054"
+       },
+       "sources": [
+         "csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_kernel.cu",
+diff --git a/flashinfer/experimental/cake_dsa_train/csrc/cake_dsa_h64_train/cake_dsa_h64_train_726ceb6d3890375e922d_kernel.cu b/flashinfer/experimental/cake_dsa_train/csrc/cake_dsa_h64_train/cake_dsa_h64_train_726ceb6d3890375e922d_kernel.cu
+index cb038ed19fc..f81d1eee04a 100644
+--- a/flashinfer/experimental/cake_dsa_train/csrc/cake_dsa_h64_train/cake_dsa_h64_train_726ceb6d3890375e922d_kernel.cu
++++ b/flashinfer/experimental/cake_dsa_train/csrc/cake_dsa_h64_train/cake_dsa_h64_train_726ceb6d3890375e922d_kernel.cu
+@@ -245,6 +245,8 @@ kernel_cake_dsa_h64_train_726ceb6d3890375e922d(const __grid_constant__ CUtensorM
+ 
+     // Kernel post-init ops
+     const int tmem_tmem = taddr;
++    // The warp's TMEM lane quarter: warp w of a warpgroup may access only lanes 32 (w % 4) .. 32 (w % 4) + 31.
++    const int tmem_lane_base = (tid & 96) << 16;
+ 
+     // ---- Role: gather ----
+     if (warp <= 3) {
+@@ -462,7 +464,7 @@ kernel_cake_dsa_h64_train_726ceb6d3890375e922d(const __grid_constant__ CUtensorM
+                     "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&s[0])), "=r"(*reinterpret_cast<uint32_t*>(&s[1])), "=r"(*reinterpret_cast<uint32_t*>(&s[2])), "=r"(*reinterpret_cast<uint32_t*>(&s[3])), "=r"(*reinterpret_cast<uint32_t*>(&s[4])), "=r"(*reinterpret_cast<uint32_t*>(&s[5])), "=r"(*reinterpret_cast<uint32_t*>(&s[6])), "=r"(*reinterpret_cast<uint32_t*>(&s[7])), "=r"(*reinterpret_cast<uint32_t*>(&s[8])), "=r"(*reinterpret_cast<uint32_t*>(&s[9])), "=r"(*reinterpret_cast<uint32_t*>(&s[10])), "=r"(*reinterpret_cast<uint32_t*>(&s[11])), "=r"(*reinterpret_cast<uint32_t*>(&s[12])), "=r"(*reinterpret_cast<uint32_t*>(&s[13])), "=r"(*reinterpret_cast<uint32_t*>(&s[14])), "=r"(*reinterpret_cast<uint32_t*>(&s[15])), "=r"(*reinterpret_cast<uint32_t*>(&s[16])), "=r"(*reinterpret_cast<uint32_t*>(&s[17])), "=r"(*reinterpret_cast<uint32_t*>(&s[18])), "=r"(*reinterpret_cast<uint32_t*>(&s[19])), "=r"(*reinterpret_cast<uint32_t*>(&s[20])), "=r"(*reinterpret_cast<uint32_t*>(&s[21])), "=r"(*reinterpret_cast<uint32_t*>(&s[22])), "=r"(*reinterpret_cast<uint32_t*>(&s[23])), "=r"(*reinterpret_cast<uint32_t*>(&s[24])), "=r"(*reinterpret_cast<uint32_t*>(&s[25])), "=r"(*reinterpret_cast<uint32_t*>(&s[26])), "=r"(*reinterpret_cast<uint32_t*>(&s[27])), "=r"(*reinterpret_cast<uint32_t*>(&s[28])), "=r"(*reinterpret_cast<uint32_t*>(&s[29])), "=r"(*reinterpret_cast<uint32_t*>(&s[30])), "=r"(*reinterpret_cast<uint32_t*>(&s[31]))
+-                    : "r"(tmem_tmem));
++                    : "r"(tmem_tmem + tmem_lane_base));
+                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                 float p[32];
+                 float _fma_0 = __fmaf_rn(s[0], scale_log2, -lse0);
+@@ -679,7 +681,7 @@ kernel_cake_dsa_h64_train_726ceb6d3890375e922d(const __grid_constant__ CUtensorM
+                     "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&dp[0])), "=r"(*reinterpret_cast<uint32_t*>(&dp[1])), "=r"(*reinterpret_cast<uint32_t*>(&dp[2])), "=r"(*reinterpret_cast<uint32_t*>(&dp[3])), "=r"(*reinterpret_cast<uint32_t*>(&dp[4])), "=r"(*reinterpret_cast<uint32_t*>(&dp[5])), "=r"(*reinterpret_cast<uint32_t*>(&dp[6])), "=r"(*reinterpret_cast<uint32_t*>(&dp[7])), "=r"(*reinterpret_cast<uint32_t*>(&dp[8])), "=r"(*reinterpret_cast<uint32_t*>(&dp[9])), "=r"(*reinterpret_cast<uint32_t*>(&dp[10])), "=r"(*reinterpret_cast<uint32_t*>(&dp[11])), "=r"(*reinterpret_cast<uint32_t*>(&dp[12])), "=r"(*reinterpret_cast<uint32_t*>(&dp[13])), "=r"(*reinterpret_cast<uint32_t*>(&dp[14])), "=r"(*reinterpret_cast<uint32_t*>(&dp[15])), "=r"(*reinterpret_cast<uint32_t*>(&dp[16])), "=r"(*reinterpret_cast<uint32_t*>(&dp[17])), "=r"(*reinterpret_cast<uint32_t*>(&dp[18])), "=r"(*reinterpret_cast<uint32_t*>(&dp[19])), "=r"(*reinterpret_cast<uint32_t*>(&dp[20])), "=r"(*reinterpret_cast<uint32_t*>(&dp[21])), "=r"(*reinterpret_cast<uint32_t*>(&dp[22])), "=r"(*reinterpret_cast<uint32_t*>(&dp[23])), "=r"(*reinterpret_cast<uint32_t*>(&dp[24])), "=r"(*reinterpret_cast<uint32_t*>(&dp[25])), "=r"(*reinterpret_cast<uint32_t*>(&dp[26])), "=r"(*reinterpret_cast<uint32_t*>(&dp[27])), "=r"(*reinterpret_cast<uint32_t*>(&dp[28])), "=r"(*reinterpret_cast<uint32_t*>(&dp[29])), "=r"(*reinterpret_cast<uint32_t*>(&dp[30])), "=r"(*reinterpret_cast<uint32_t*>(&dp[31]))
+-                    : "r"(tmem_tmem + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 1048576));
+                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                 float ds[32];
+                 ds[0] = p[0] * (dp[0] - dl0) * sm_scale;
+@@ -753,7 +755,7 @@ kernel_cake_dsa_h64_train_726ceb6d3890375e922d(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq[31]))
+-                : "r"(tmem_tmem + 192));
++                : "r"(tmem_tmem + tmem_lane_base + 192));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dq_bf16[16];
+             #pragma unroll
+@@ -794,7 +796,7 @@ kernel_cake_dsa_h64_train_726ceb6d3890375e922d(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_10[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[31]))
+-                : "r"(tmem_tmem + 192 + 1048576));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 1048576));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dq_10_bf16[16];
+             #pragma unroll
+@@ -835,7 +837,7 @@ kernel_cake_dsa_h64_train_726ceb6d3890375e922d(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_23[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[31]))
+-                : "r"(tmem_tmem + 192 + 64));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 64));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dq_23_bf16[16];
+             #pragma unroll
+@@ -876,7 +878,7 @@ kernel_cake_dsa_h64_train_726ceb6d3890375e922d(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_36[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[31]))
+-                : "r"(tmem_tmem + 192 + 64 + 1048576));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 64 + 1048576));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dq_36_bf16[16];
+             #pragma unroll
+@@ -917,7 +919,7 @@ kernel_cake_dsa_h64_train_726ceb6d3890375e922d(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_49[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[31]))
+-                : "r"(tmem_tmem + 192 + 128));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 128));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dq_49_bf16[16];
+             #pragma unroll
+@@ -958,7 +960,7 @@ kernel_cake_dsa_h64_train_726ceb6d3890375e922d(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_62[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[31]))
+-                : "r"(tmem_tmem + 192 + 128 + 1048576));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 128 + 1048576));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dq_62_bf16[16];
+             #pragma unroll
+@@ -999,7 +1001,7 @@ kernel_cake_dsa_h64_train_726ceb6d3890375e922d(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_75[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[31]))
+-                : "r"(tmem_tmem + 192 + 192));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 192));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dq_75_bf16[16];
+             #pragma unroll
+@@ -1040,7 +1042,7 @@ kernel_cake_dsa_h64_train_726ceb6d3890375e922d(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_88[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[31]))
+-                : "r"(tmem_tmem + 192 + 192 + 1048576));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 192 + 1048576));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dq_88_bf16[16];
+             #pragma unroll
+@@ -1081,7 +1083,7 @@ kernel_cake_dsa_h64_train_726ceb6d3890375e922d(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dqr[0])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[1])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[2])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[3])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[4])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[5])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[6])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[7])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[8])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[9])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[10])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[11])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[12])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[13])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[14])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[15])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[16])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[17])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[18])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[19])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[20])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[21])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[22])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[23])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[24])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[25])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[26])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[27])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[28])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[29])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[30])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[31]))
+-                : "r"(tmem_tmem + 448));
++                : "r"(tmem_tmem + tmem_lane_base + 448));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dqr_bf16[16];
+             #pragma unroll
+@@ -1214,22 +1216,22 @@ kernel_cake_dsa_h64_train_726ceb6d3890375e922d(const __grid_constant__ CUtensorM
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&a0[0])), "=r"(*reinterpret_cast<uint32_t*>(&a0[1])), "=r"(*reinterpret_cast<uint32_t*>(&a0[2])), "=r"(*reinterpret_cast<uint32_t*>(&a0[3])), "=r"(*reinterpret_cast<uint32_t*>(&a0[4])), "=r"(*reinterpret_cast<uint32_t*>(&a0[5])), "=r"(*reinterpret_cast<uint32_t*>(&a0[6])), "=r"(*reinterpret_cast<uint32_t*>(&a0[7])), "=r"(*reinterpret_cast<uint32_t*>(&a0[8])), "=r"(*reinterpret_cast<uint32_t*>(&a0[9])), "=r"(*reinterpret_cast<uint32_t*>(&a0[10])), "=r"(*reinterpret_cast<uint32_t*>(&a0[11])), "=r"(*reinterpret_cast<uint32_t*>(&a0[12])), "=r"(*reinterpret_cast<uint32_t*>(&a0[13])), "=r"(*reinterpret_cast<uint32_t*>(&a0[14])), "=r"(*reinterpret_cast<uint32_t*>(&a0[15]))
+-                    : "r"(tmem_tmem + 64 + wg * 32));
++                    : "r"(tmem_tmem + tmem_lane_base + 64 + wg * 32));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[0])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[1])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[2])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[3])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[4])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[5])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[6])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[7])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[8])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[9])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[10])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[11])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[12])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[13])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[14])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[15]))
+-                    : "r"(tmem_tmem + 64 + wg * 32 + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 64 + wg * 32 + 1048576));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&a1[0])), "=r"(*reinterpret_cast<uint32_t*>(&a1[1])), "=r"(*reinterpret_cast<uint32_t*>(&a1[2])), "=r"(*reinterpret_cast<uint32_t*>(&a1[3])), "=r"(*reinterpret_cast<uint32_t*>(&a1[4])), "=r"(*reinterpret_cast<uint32_t*>(&a1[5])), "=r"(*reinterpret_cast<uint32_t*>(&a1[6])), "=r"(*reinterpret_cast<uint32_t*>(&a1[7])), "=r"(*reinterpret_cast<uint32_t*>(&a1[8])), "=r"(*reinterpret_cast<uint32_t*>(&a1[9])), "=r"(*reinterpret_cast<uint32_t*>(&a1[10])), "=r"(*reinterpret_cast<uint32_t*>(&a1[11])), "=r"(*reinterpret_cast<uint32_t*>(&a1[12])), "=r"(*reinterpret_cast<uint32_t*>(&a1[13])), "=r"(*reinterpret_cast<uint32_t*>(&a1[14])), "=r"(*reinterpret_cast<uint32_t*>(&a1[15]))
+-                    : "r"(tmem_tmem + 128 + wg * 32));
++                    : "r"(tmem_tmem + tmem_lane_base + 128 + wg * 32));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[0])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[1])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[2])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[3])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[4])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[5])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[6])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[7])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[8])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[9])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[10])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[11])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[12])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[13])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[14])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[15]))
+-                    : "r"(tmem_tmem + 128 + wg * 32 + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 128 + wg * 32 + 1048576));
+                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                 asm volatile("tcgen05.fence::before_thread_sync;");
+                 mbarrier_arrive(dkv_a_drained_addr);
+@@ -1240,7 +1242,7 @@ kernel_cake_dsa_h64_train_726ceb6d3890375e922d(const __grid_constant__ CUtensorM
+                         "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                         : "=r"(*reinterpret_cast<uint32_t*>(&rk[0])), "=r"(*reinterpret_cast<uint32_t*>(&rk[1])), "=r"(*reinterpret_cast<uint32_t*>(&rk[2])), "=r"(*reinterpret_cast<uint32_t*>(&rk[3])), "=r"(*reinterpret_cast<uint32_t*>(&rk[4])), "=r"(*reinterpret_cast<uint32_t*>(&rk[5])), "=r"(*reinterpret_cast<uint32_t*>(&rk[6])), "=r"(*reinterpret_cast<uint32_t*>(&rk[7])), "=r"(*reinterpret_cast<uint32_t*>(&rk[8])), "=r"(*reinterpret_cast<uint32_t*>(&rk[9])), "=r"(*reinterpret_cast<uint32_t*>(&rk[10])), "=r"(*reinterpret_cast<uint32_t*>(&rk[11])), "=r"(*reinterpret_cast<uint32_t*>(&rk[12])), "=r"(*reinterpret_cast<uint32_t*>(&rk[13])), "=r"(*reinterpret_cast<uint32_t*>(&rk[14])), "=r"(*reinterpret_cast<uint32_t*>(&rk[15]))
+-                        : "r"(tmem_tmem + wg * 32));
++                        : "r"(tmem_tmem + tmem_lane_base + wg * 32));
+                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                     asm volatile("tcgen05.fence::before_thread_sync;");
+                     mbarrier_arrive(dkr_drained_addr);
+@@ -1386,22 +1388,22 @@ kernel_cake_dsa_h64_train_726ceb6d3890375e922d(const __grid_constant__ CUtensorM
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&a0[0])), "=r"(*reinterpret_cast<uint32_t*>(&a0[1])), "=r"(*reinterpret_cast<uint32_t*>(&a0[2])), "=r"(*reinterpret_cast<uint32_t*>(&a0[3])), "=r"(*reinterpret_cast<uint32_t*>(&a0[4])), "=r"(*reinterpret_cast<uint32_t*>(&a0[5])), "=r"(*reinterpret_cast<uint32_t*>(&a0[6])), "=r"(*reinterpret_cast<uint32_t*>(&a0[7])), "=r"(*reinterpret_cast<uint32_t*>(&a0[8])), "=r"(*reinterpret_cast<uint32_t*>(&a0[9])), "=r"(*reinterpret_cast<uint32_t*>(&a0[10])), "=r"(*reinterpret_cast<uint32_t*>(&a0[11])), "=r"(*reinterpret_cast<uint32_t*>(&a0[12])), "=r"(*reinterpret_cast<uint32_t*>(&a0[13])), "=r"(*reinterpret_cast<uint32_t*>(&a0[14])), "=r"(*reinterpret_cast<uint32_t*>(&a0[15]))
+-                    : "r"(tmem_tmem + 64 + wg * 32));
++                    : "r"(tmem_tmem + tmem_lane_base + 64 + wg * 32));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[0])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[1])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[2])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[3])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[4])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[5])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[6])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[7])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[8])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[9])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[10])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[11])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[12])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[13])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[14])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[15]))
+-                    : "r"(tmem_tmem + 64 + wg * 32 + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 64 + wg * 32 + 1048576));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&a1[0])), "=r"(*reinterpret_cast<uint32_t*>(&a1[1])), "=r"(*reinterpret_cast<uint32_t*>(&a1[2])), "=r"(*reinterpret_cast<uint32_t*>(&a1[3])), "=r"(*reinterpret_cast<uint32_t*>(&a1[4])), "=r"(*reinterpret_cast<uint32_t*>(&a1[5])), "=r"(*reinterpret_cast<uint32_t*>(&a1[6])), "=r"(*reinterpret_cast<uint32_t*>(&a1[7])), "=r"(*reinterpret_cast<uint32_t*>(&a1[8])), "=r"(*reinterpret_cast<uint32_t*>(&a1[9])), "=r"(*reinterpret_cast<uint32_t*>(&a1[10])), "=r"(*reinterpret_cast<uint32_t*>(&a1[11])), "=r"(*reinterpret_cast<uint32_t*>(&a1[12])), "=r"(*reinterpret_cast<uint32_t*>(&a1[13])), "=r"(*reinterpret_cast<uint32_t*>(&a1[14])), "=r"(*reinterpret_cast<uint32_t*>(&a1[15]))
+-                    : "r"(tmem_tmem + 128 + wg * 32));
++                    : "r"(tmem_tmem + tmem_lane_base + 128 + wg * 32));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[0])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[1])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[2])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[3])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[4])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[5])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[6])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[7])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[8])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[9])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[10])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[11])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[12])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[13])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[14])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[15]))
+-                    : "r"(tmem_tmem + 128 + wg * 32 + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 128 + wg * 32 + 1048576));
+                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                 asm volatile("tcgen05.fence::before_thread_sync;");
+                 mbarrier_arrive(dkv_b_drained_addr);
+diff --git a/flashinfer/experimental/cake_dsa_train/csrc/cake_dsa_h64_train/cake_dsa_h64_train_76061910b68bb0506c5e_kernel.cu b/flashinfer/experimental/cake_dsa_train/csrc/cake_dsa_h64_train/cake_dsa_h64_train_76061910b68bb0506c5e_kernel.cu
+index 31c3119cc44..bee501dead1 100644
+--- a/flashinfer/experimental/cake_dsa_train/csrc/cake_dsa_h64_train/cake_dsa_h64_train_76061910b68bb0506c5e_kernel.cu
++++ b/flashinfer/experimental/cake_dsa_train/csrc/cake_dsa_h64_train/cake_dsa_h64_train_76061910b68bb0506c5e_kernel.cu
+@@ -245,6 +245,8 @@ kernel_cake_dsa_h64_train_76061910b68bb0506c5e(const __grid_constant__ CUtensorM
+ 
+     // Kernel post-init ops
+     const int tmem_tmem = taddr;
++    // The warp's TMEM lane quarter: warp w of a warpgroup may access only lanes 32 (w % 4) .. 32 (w % 4) + 31.
++    const int tmem_lane_base = (tid & 96) << 16;
+ 
+     // ---- Role: gather ----
+     if (warp <= 3) {
+@@ -462,7 +464,7 @@ kernel_cake_dsa_h64_train_76061910b68bb0506c5e(const __grid_constant__ CUtensorM
+                     "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&s[0])), "=r"(*reinterpret_cast<uint32_t*>(&s[1])), "=r"(*reinterpret_cast<uint32_t*>(&s[2])), "=r"(*reinterpret_cast<uint32_t*>(&s[3])), "=r"(*reinterpret_cast<uint32_t*>(&s[4])), "=r"(*reinterpret_cast<uint32_t*>(&s[5])), "=r"(*reinterpret_cast<uint32_t*>(&s[6])), "=r"(*reinterpret_cast<uint32_t*>(&s[7])), "=r"(*reinterpret_cast<uint32_t*>(&s[8])), "=r"(*reinterpret_cast<uint32_t*>(&s[9])), "=r"(*reinterpret_cast<uint32_t*>(&s[10])), "=r"(*reinterpret_cast<uint32_t*>(&s[11])), "=r"(*reinterpret_cast<uint32_t*>(&s[12])), "=r"(*reinterpret_cast<uint32_t*>(&s[13])), "=r"(*reinterpret_cast<uint32_t*>(&s[14])), "=r"(*reinterpret_cast<uint32_t*>(&s[15])), "=r"(*reinterpret_cast<uint32_t*>(&s[16])), "=r"(*reinterpret_cast<uint32_t*>(&s[17])), "=r"(*reinterpret_cast<uint32_t*>(&s[18])), "=r"(*reinterpret_cast<uint32_t*>(&s[19])), "=r"(*reinterpret_cast<uint32_t*>(&s[20])), "=r"(*reinterpret_cast<uint32_t*>(&s[21])), "=r"(*reinterpret_cast<uint32_t*>(&s[22])), "=r"(*reinterpret_cast<uint32_t*>(&s[23])), "=r"(*reinterpret_cast<uint32_t*>(&s[24])), "=r"(*reinterpret_cast<uint32_t*>(&s[25])), "=r"(*reinterpret_cast<uint32_t*>(&s[26])), "=r"(*reinterpret_cast<uint32_t*>(&s[27])), "=r"(*reinterpret_cast<uint32_t*>(&s[28])), "=r"(*reinterpret_cast<uint32_t*>(&s[29])), "=r"(*reinterpret_cast<uint32_t*>(&s[30])), "=r"(*reinterpret_cast<uint32_t*>(&s[31]))
+-                    : "r"(tmem_tmem));
++                    : "r"(tmem_tmem + tmem_lane_base));
+                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                 float p[32];
+                 float _fma_0 = __fmaf_rn(s[0], scale_log2, -lse0);
+@@ -679,7 +681,7 @@ kernel_cake_dsa_h64_train_76061910b68bb0506c5e(const __grid_constant__ CUtensorM
+                     "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&dp[0])), "=r"(*reinterpret_cast<uint32_t*>(&dp[1])), "=r"(*reinterpret_cast<uint32_t*>(&dp[2])), "=r"(*reinterpret_cast<uint32_t*>(&dp[3])), "=r"(*reinterpret_cast<uint32_t*>(&dp[4])), "=r"(*reinterpret_cast<uint32_t*>(&dp[5])), "=r"(*reinterpret_cast<uint32_t*>(&dp[6])), "=r"(*reinterpret_cast<uint32_t*>(&dp[7])), "=r"(*reinterpret_cast<uint32_t*>(&dp[8])), "=r"(*reinterpret_cast<uint32_t*>(&dp[9])), "=r"(*reinterpret_cast<uint32_t*>(&dp[10])), "=r"(*reinterpret_cast<uint32_t*>(&dp[11])), "=r"(*reinterpret_cast<uint32_t*>(&dp[12])), "=r"(*reinterpret_cast<uint32_t*>(&dp[13])), "=r"(*reinterpret_cast<uint32_t*>(&dp[14])), "=r"(*reinterpret_cast<uint32_t*>(&dp[15])), "=r"(*reinterpret_cast<uint32_t*>(&dp[16])), "=r"(*reinterpret_cast<uint32_t*>(&dp[17])), "=r"(*reinterpret_cast<uint32_t*>(&dp[18])), "=r"(*reinterpret_cast<uint32_t*>(&dp[19])), "=r"(*reinterpret_cast<uint32_t*>(&dp[20])), "=r"(*reinterpret_cast<uint32_t*>(&dp[21])), "=r"(*reinterpret_cast<uint32_t*>(&dp[22])), "=r"(*reinterpret_cast<uint32_t*>(&dp[23])), "=r"(*reinterpret_cast<uint32_t*>(&dp[24])), "=r"(*reinterpret_cast<uint32_t*>(&dp[25])), "=r"(*reinterpret_cast<uint32_t*>(&dp[26])), "=r"(*reinterpret_cast<uint32_t*>(&dp[27])), "=r"(*reinterpret_cast<uint32_t*>(&dp[28])), "=r"(*reinterpret_cast<uint32_t*>(&dp[29])), "=r"(*reinterpret_cast<uint32_t*>(&dp[30])), "=r"(*reinterpret_cast<uint32_t*>(&dp[31]))
+-                    : "r"(tmem_tmem + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 1048576));
+                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                 float ds[32];
+                 ds[0] = p[0] * (dp[0] - dl0) * sm_scale;
+@@ -756,7 +758,7 @@ kernel_cake_dsa_h64_train_76061910b68bb0506c5e(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq[31]))
+-                : "r"(tmem_tmem + 192));
++                : "r"(tmem_tmem + tmem_lane_base + 192));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx = pbase + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -964,7 +966,7 @@ kernel_cake_dsa_h64_train_76061910b68bb0506c5e(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_10[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[31]))
+-                : "r"(tmem_tmem + 192 + 1048576));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 1048576));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx_11 = pbase + 4096 + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -1172,7 +1174,7 @@ kernel_cake_dsa_h64_train_76061910b68bb0506c5e(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_24[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[31]))
+-                : "r"(tmem_tmem + 192 + 64));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 64));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx_25 = pbase + 8192 + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -1380,7 +1382,7 @@ kernel_cake_dsa_h64_train_76061910b68bb0506c5e(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_38[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[31]))
+-                : "r"(tmem_tmem + 192 + 64 + 1048576));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 64 + 1048576));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx_39 = pbase + 12288 + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -1588,7 +1590,7 @@ kernel_cake_dsa_h64_train_76061910b68bb0506c5e(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_52[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[31]))
+-                : "r"(tmem_tmem + 192 + 128));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 128));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx_53 = pbase + 16384 + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -1796,7 +1798,7 @@ kernel_cake_dsa_h64_train_76061910b68bb0506c5e(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_66[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[31]))
+-                : "r"(tmem_tmem + 192 + 128 + 1048576));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 128 + 1048576));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx_67 = pbase + 20480 + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -2004,7 +2006,7 @@ kernel_cake_dsa_h64_train_76061910b68bb0506c5e(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_80[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[31]))
+-                : "r"(tmem_tmem + 192 + 192));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 192));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx_81 = pbase + 24576 + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -2212,7 +2214,7 @@ kernel_cake_dsa_h64_train_76061910b68bb0506c5e(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_94[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[31]))
+-                : "r"(tmem_tmem + 192 + 192 + 1048576));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 192 + 1048576));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx_95 = pbase + 28672 + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -2420,7 +2422,7 @@ kernel_cake_dsa_h64_train_76061910b68bb0506c5e(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dqr[0])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[1])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[2])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[3])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[4])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[5])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[6])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[7])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[8])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[9])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[10])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[11])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[12])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[13])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[14])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[15])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[16])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[17])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[18])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[19])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[20])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[21])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[22])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[23])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[24])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[25])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[26])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[27])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[28])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[29])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[30])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[31]))
+-                : "r"(tmem_tmem + 448));
++                : "r"(tmem_tmem + tmem_lane_base + 448));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx_108 = pbase + 32768 + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -2722,22 +2724,22 @@ kernel_cake_dsa_h64_train_76061910b68bb0506c5e(const __grid_constant__ CUtensorM
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&a0[0])), "=r"(*reinterpret_cast<uint32_t*>(&a0[1])), "=r"(*reinterpret_cast<uint32_t*>(&a0[2])), "=r"(*reinterpret_cast<uint32_t*>(&a0[3])), "=r"(*reinterpret_cast<uint32_t*>(&a0[4])), "=r"(*reinterpret_cast<uint32_t*>(&a0[5])), "=r"(*reinterpret_cast<uint32_t*>(&a0[6])), "=r"(*reinterpret_cast<uint32_t*>(&a0[7])), "=r"(*reinterpret_cast<uint32_t*>(&a0[8])), "=r"(*reinterpret_cast<uint32_t*>(&a0[9])), "=r"(*reinterpret_cast<uint32_t*>(&a0[10])), "=r"(*reinterpret_cast<uint32_t*>(&a0[11])), "=r"(*reinterpret_cast<uint32_t*>(&a0[12])), "=r"(*reinterpret_cast<uint32_t*>(&a0[13])), "=r"(*reinterpret_cast<uint32_t*>(&a0[14])), "=r"(*reinterpret_cast<uint32_t*>(&a0[15]))
+-                    : "r"(tmem_tmem + 64 + wg * 32));
++                    : "r"(tmem_tmem + tmem_lane_base + 64 + wg * 32));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[0])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[1])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[2])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[3])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[4])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[5])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[6])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[7])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[8])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[9])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[10])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[11])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[12])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[13])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[14])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[15]))
+-                    : "r"(tmem_tmem + 64 + wg * 32 + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 64 + wg * 32 + 1048576));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&a1[0])), "=r"(*reinterpret_cast<uint32_t*>(&a1[1])), "=r"(*reinterpret_cast<uint32_t*>(&a1[2])), "=r"(*reinterpret_cast<uint32_t*>(&a1[3])), "=r"(*reinterpret_cast<uint32_t*>(&a1[4])), "=r"(*reinterpret_cast<uint32_t*>(&a1[5])), "=r"(*reinterpret_cast<uint32_t*>(&a1[6])), "=r"(*reinterpret_cast<uint32_t*>(&a1[7])), "=r"(*reinterpret_cast<uint32_t*>(&a1[8])), "=r"(*reinterpret_cast<uint32_t*>(&a1[9])), "=r"(*reinterpret_cast<uint32_t*>(&a1[10])), "=r"(*reinterpret_cast<uint32_t*>(&a1[11])), "=r"(*reinterpret_cast<uint32_t*>(&a1[12])), "=r"(*reinterpret_cast<uint32_t*>(&a1[13])), "=r"(*reinterpret_cast<uint32_t*>(&a1[14])), "=r"(*reinterpret_cast<uint32_t*>(&a1[15]))
+-                    : "r"(tmem_tmem + 128 + wg * 32));
++                    : "r"(tmem_tmem + tmem_lane_base + 128 + wg * 32));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[0])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[1])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[2])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[3])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[4])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[5])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[6])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[7])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[8])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[9])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[10])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[11])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[12])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[13])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[14])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[15]))
+-                    : "r"(tmem_tmem + 128 + wg * 32 + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 128 + wg * 32 + 1048576));
+                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                 asm volatile("tcgen05.fence::before_thread_sync;");
+                 mbarrier_arrive(dkv_a_drained_addr);
+@@ -2748,7 +2750,7 @@ kernel_cake_dsa_h64_train_76061910b68bb0506c5e(const __grid_constant__ CUtensorM
+                         "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                         : "=r"(*reinterpret_cast<uint32_t*>(&rk[0])), "=r"(*reinterpret_cast<uint32_t*>(&rk[1])), "=r"(*reinterpret_cast<uint32_t*>(&rk[2])), "=r"(*reinterpret_cast<uint32_t*>(&rk[3])), "=r"(*reinterpret_cast<uint32_t*>(&rk[4])), "=r"(*reinterpret_cast<uint32_t*>(&rk[5])), "=r"(*reinterpret_cast<uint32_t*>(&rk[6])), "=r"(*reinterpret_cast<uint32_t*>(&rk[7])), "=r"(*reinterpret_cast<uint32_t*>(&rk[8])), "=r"(*reinterpret_cast<uint32_t*>(&rk[9])), "=r"(*reinterpret_cast<uint32_t*>(&rk[10])), "=r"(*reinterpret_cast<uint32_t*>(&rk[11])), "=r"(*reinterpret_cast<uint32_t*>(&rk[12])), "=r"(*reinterpret_cast<uint32_t*>(&rk[13])), "=r"(*reinterpret_cast<uint32_t*>(&rk[14])), "=r"(*reinterpret_cast<uint32_t*>(&rk[15]))
+-                        : "r"(tmem_tmem + wg * 32));
++                        : "r"(tmem_tmem + tmem_lane_base + wg * 32));
+                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                     asm volatile("tcgen05.fence::before_thread_sync;");
+                     mbarrier_arrive(dkr_drained_addr);
+@@ -2894,22 +2896,22 @@ kernel_cake_dsa_h64_train_76061910b68bb0506c5e(const __grid_constant__ CUtensorM
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&a0[0])), "=r"(*reinterpret_cast<uint32_t*>(&a0[1])), "=r"(*reinterpret_cast<uint32_t*>(&a0[2])), "=r"(*reinterpret_cast<uint32_t*>(&a0[3])), "=r"(*reinterpret_cast<uint32_t*>(&a0[4])), "=r"(*reinterpret_cast<uint32_t*>(&a0[5])), "=r"(*reinterpret_cast<uint32_t*>(&a0[6])), "=r"(*reinterpret_cast<uint32_t*>(&a0[7])), "=r"(*reinterpret_cast<uint32_t*>(&a0[8])), "=r"(*reinterpret_cast<uint32_t*>(&a0[9])), "=r"(*reinterpret_cast<uint32_t*>(&a0[10])), "=r"(*reinterpret_cast<uint32_t*>(&a0[11])), "=r"(*reinterpret_cast<uint32_t*>(&a0[12])), "=r"(*reinterpret_cast<uint32_t*>(&a0[13])), "=r"(*reinterpret_cast<uint32_t*>(&a0[14])), "=r"(*reinterpret_cast<uint32_t*>(&a0[15]))
+-                    : "r"(tmem_tmem + 64 + wg * 32));
++                    : "r"(tmem_tmem + tmem_lane_base + 64 + wg * 32));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[0])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[1])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[2])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[3])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[4])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[5])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[6])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[7])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[8])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[9])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[10])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[11])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[12])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[13])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[14])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[15]))
+-                    : "r"(tmem_tmem + 64 + wg * 32 + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 64 + wg * 32 + 1048576));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&a1[0])), "=r"(*reinterpret_cast<uint32_t*>(&a1[1])), "=r"(*reinterpret_cast<uint32_t*>(&a1[2])), "=r"(*reinterpret_cast<uint32_t*>(&a1[3])), "=r"(*reinterpret_cast<uint32_t*>(&a1[4])), "=r"(*reinterpret_cast<uint32_t*>(&a1[5])), "=r"(*reinterpret_cast<uint32_t*>(&a1[6])), "=r"(*reinterpret_cast<uint32_t*>(&a1[7])), "=r"(*reinterpret_cast<uint32_t*>(&a1[8])), "=r"(*reinterpret_cast<uint32_t*>(&a1[9])), "=r"(*reinterpret_cast<uint32_t*>(&a1[10])), "=r"(*reinterpret_cast<uint32_t*>(&a1[11])), "=r"(*reinterpret_cast<uint32_t*>(&a1[12])), "=r"(*reinterpret_cast<uint32_t*>(&a1[13])), "=r"(*reinterpret_cast<uint32_t*>(&a1[14])), "=r"(*reinterpret_cast<uint32_t*>(&a1[15]))
+-                    : "r"(tmem_tmem + 128 + wg * 32));
++                    : "r"(tmem_tmem + tmem_lane_base + 128 + wg * 32));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[0])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[1])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[2])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[3])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[4])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[5])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[6])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[7])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[8])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[9])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[10])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[11])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[12])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[13])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[14])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[15]))
+-                    : "r"(tmem_tmem + 128 + wg * 32 + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 128 + wg * 32 + 1048576));
+                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                 asm volatile("tcgen05.fence::before_thread_sync;");
+                 mbarrier_arrive(dkv_b_drained_addr);
+diff --git a/flashinfer/experimental/cake_dsa_train/csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_kernel.cu b/flashinfer/experimental/cake_dsa_train/csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_kernel.cu
+index f94a78aa8aa..d8c0adb5e2a 100644
+--- a/flashinfer/experimental/cake_dsa_train/csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_kernel.cu
++++ b/flashinfer/experimental/cake_dsa_train/csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_kernel.cu
+@@ -245,6 +245,8 @@ kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667(const __grid_constant__ CUtensorM
+ 
+     // Kernel post-init ops
+     const int tmem_tmem = taddr;
++    // The warp's TMEM lane quarter: warp w of a warpgroup may access only lanes 32 (w % 4) .. 32 (w % 4) + 31.
++    const int tmem_lane_base = (tid & 96) << 16;
+ 
+     // ---- Role: gather ----
+     if (warp <= 3) {
+@@ -462,7 +464,7 @@ kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667(const __grid_constant__ CUtensorM
+                     "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&s[0])), "=r"(*reinterpret_cast<uint32_t*>(&s[1])), "=r"(*reinterpret_cast<uint32_t*>(&s[2])), "=r"(*reinterpret_cast<uint32_t*>(&s[3])), "=r"(*reinterpret_cast<uint32_t*>(&s[4])), "=r"(*reinterpret_cast<uint32_t*>(&s[5])), "=r"(*reinterpret_cast<uint32_t*>(&s[6])), "=r"(*reinterpret_cast<uint32_t*>(&s[7])), "=r"(*reinterpret_cast<uint32_t*>(&s[8])), "=r"(*reinterpret_cast<uint32_t*>(&s[9])), "=r"(*reinterpret_cast<uint32_t*>(&s[10])), "=r"(*reinterpret_cast<uint32_t*>(&s[11])), "=r"(*reinterpret_cast<uint32_t*>(&s[12])), "=r"(*reinterpret_cast<uint32_t*>(&s[13])), "=r"(*reinterpret_cast<uint32_t*>(&s[14])), "=r"(*reinterpret_cast<uint32_t*>(&s[15])), "=r"(*reinterpret_cast<uint32_t*>(&s[16])), "=r"(*reinterpret_cast<uint32_t*>(&s[17])), "=r"(*reinterpret_cast<uint32_t*>(&s[18])), "=r"(*reinterpret_cast<uint32_t*>(&s[19])), "=r"(*reinterpret_cast<uint32_t*>(&s[20])), "=r"(*reinterpret_cast<uint32_t*>(&s[21])), "=r"(*reinterpret_cast<uint32_t*>(&s[22])), "=r"(*reinterpret_cast<uint32_t*>(&s[23])), "=r"(*reinterpret_cast<uint32_t*>(&s[24])), "=r"(*reinterpret_cast<uint32_t*>(&s[25])), "=r"(*reinterpret_cast<uint32_t*>(&s[26])), "=r"(*reinterpret_cast<uint32_t*>(&s[27])), "=r"(*reinterpret_cast<uint32_t*>(&s[28])), "=r"(*reinterpret_cast<uint32_t*>(&s[29])), "=r"(*reinterpret_cast<uint32_t*>(&s[30])), "=r"(*reinterpret_cast<uint32_t*>(&s[31]))
+-                    : "r"(tmem_tmem));
++                    : "r"(tmem_tmem + tmem_lane_base));
+                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                 float p[32];
+                 float _fma_0 = __fmaf_rn(s[0], scale_log2, -lse0);
+@@ -679,7 +681,7 @@ kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667(const __grid_constant__ CUtensorM
+                     "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&dp[0])), "=r"(*reinterpret_cast<uint32_t*>(&dp[1])), "=r"(*reinterpret_cast<uint32_t*>(&dp[2])), "=r"(*reinterpret_cast<uint32_t*>(&dp[3])), "=r"(*reinterpret_cast<uint32_t*>(&dp[4])), "=r"(*reinterpret_cast<uint32_t*>(&dp[5])), "=r"(*reinterpret_cast<uint32_t*>(&dp[6])), "=r"(*reinterpret_cast<uint32_t*>(&dp[7])), "=r"(*reinterpret_cast<uint32_t*>(&dp[8])), "=r"(*reinterpret_cast<uint32_t*>(&dp[9])), "=r"(*reinterpret_cast<uint32_t*>(&dp[10])), "=r"(*reinterpret_cast<uint32_t*>(&dp[11])), "=r"(*reinterpret_cast<uint32_t*>(&dp[12])), "=r"(*reinterpret_cast<uint32_t*>(&dp[13])), "=r"(*reinterpret_cast<uint32_t*>(&dp[14])), "=r"(*reinterpret_cast<uint32_t*>(&dp[15])), "=r"(*reinterpret_cast<uint32_t*>(&dp[16])), "=r"(*reinterpret_cast<uint32_t*>(&dp[17])), "=r"(*reinterpret_cast<uint32_t*>(&dp[18])), "=r"(*reinterpret_cast<uint32_t*>(&dp[19])), "=r"(*reinterpret_cast<uint32_t*>(&dp[20])), "=r"(*reinterpret_cast<uint32_t*>(&dp[21])), "=r"(*reinterpret_cast<uint32_t*>(&dp[22])), "=r"(*reinterpret_cast<uint32_t*>(&dp[23])), "=r"(*reinterpret_cast<uint32_t*>(&dp[24])), "=r"(*reinterpret_cast<uint32_t*>(&dp[25])), "=r"(*reinterpret_cast<uint32_t*>(&dp[26])), "=r"(*reinterpret_cast<uint32_t*>(&dp[27])), "=r"(*reinterpret_cast<uint32_t*>(&dp[28])), "=r"(*reinterpret_cast<uint32_t*>(&dp[29])), "=r"(*reinterpret_cast<uint32_t*>(&dp[30])), "=r"(*reinterpret_cast<uint32_t*>(&dp[31]))
+-                    : "r"(tmem_tmem + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 1048576));
+                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                 float ds[32];
+                 ds[0] = p[0] * (dp[0] - dl0) * sm_scale;
+@@ -756,7 +758,7 @@ kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq[31]))
+-                : "r"(tmem_tmem + 192));
++                : "r"(tmem_tmem + tmem_lane_base + 192));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx = pbase + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -964,7 +966,7 @@ kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_10[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[31]))
+-                : "r"(tmem_tmem + 192 + 1048576));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 1048576));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx_11 = pbase + 4096 + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -1172,7 +1174,7 @@ kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_24[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_24[31]))
+-                : "r"(tmem_tmem + 192 + 64));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 64));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx_25 = pbase + 8192 + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -1380,7 +1382,7 @@ kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_38[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_38[31]))
+-                : "r"(tmem_tmem + 192 + 64 + 1048576));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 64 + 1048576));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx_39 = pbase + 12288 + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -1588,7 +1590,7 @@ kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_52[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_52[31]))
+-                : "r"(tmem_tmem + 192 + 128));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 128));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx_53 = pbase + 16384 + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -1796,7 +1798,7 @@ kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_66[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_66[31]))
+-                : "r"(tmem_tmem + 192 + 128 + 1048576));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 128 + 1048576));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx_67 = pbase + 20480 + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -2004,7 +2006,7 @@ kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_80[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_80[31]))
+-                : "r"(tmem_tmem + 192 + 192));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 192));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx_81 = pbase + 24576 + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -2212,7 +2214,7 @@ kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_94[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_94[31]))
+-                : "r"(tmem_tmem + 192 + 192 + 1048576));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 192 + 1048576));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx_95 = pbase + 28672 + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -2420,7 +2422,7 @@ kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dqr[0])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[1])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[2])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[3])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[4])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[5])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[6])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[7])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[8])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[9])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[10])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[11])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[12])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[13])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[14])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[15])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[16])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[17])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[18])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[19])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[20])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[21])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[22])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[23])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[24])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[25])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[26])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[27])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[28])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[29])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[30])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[31]))
+-                : "r"(tmem_tmem + 448));
++                : "r"(tmem_tmem + tmem_lane_base + 448));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             long long pidx_108 = pbase + 32768 + (long long)(ctid * 4);
+             if (dq_mode == 1) {
+@@ -2683,22 +2685,22 @@ kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667(const __grid_constant__ CUtensorM
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&a0[0])), "=r"(*reinterpret_cast<uint32_t*>(&a0[1])), "=r"(*reinterpret_cast<uint32_t*>(&a0[2])), "=r"(*reinterpret_cast<uint32_t*>(&a0[3])), "=r"(*reinterpret_cast<uint32_t*>(&a0[4])), "=r"(*reinterpret_cast<uint32_t*>(&a0[5])), "=r"(*reinterpret_cast<uint32_t*>(&a0[6])), "=r"(*reinterpret_cast<uint32_t*>(&a0[7])), "=r"(*reinterpret_cast<uint32_t*>(&a0[8])), "=r"(*reinterpret_cast<uint32_t*>(&a0[9])), "=r"(*reinterpret_cast<uint32_t*>(&a0[10])), "=r"(*reinterpret_cast<uint32_t*>(&a0[11])), "=r"(*reinterpret_cast<uint32_t*>(&a0[12])), "=r"(*reinterpret_cast<uint32_t*>(&a0[13])), "=r"(*reinterpret_cast<uint32_t*>(&a0[14])), "=r"(*reinterpret_cast<uint32_t*>(&a0[15]))
+-                    : "r"(tmem_tmem + 64 + wg * 32));
++                    : "r"(tmem_tmem + tmem_lane_base + 64 + wg * 32));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[0])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[1])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[2])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[3])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[4])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[5])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[6])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[7])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[8])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[9])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[10])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[11])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[12])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[13])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[14])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[15]))
+-                    : "r"(tmem_tmem + 64 + wg * 32 + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 64 + wg * 32 + 1048576));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&a1[0])), "=r"(*reinterpret_cast<uint32_t*>(&a1[1])), "=r"(*reinterpret_cast<uint32_t*>(&a1[2])), "=r"(*reinterpret_cast<uint32_t*>(&a1[3])), "=r"(*reinterpret_cast<uint32_t*>(&a1[4])), "=r"(*reinterpret_cast<uint32_t*>(&a1[5])), "=r"(*reinterpret_cast<uint32_t*>(&a1[6])), "=r"(*reinterpret_cast<uint32_t*>(&a1[7])), "=r"(*reinterpret_cast<uint32_t*>(&a1[8])), "=r"(*reinterpret_cast<uint32_t*>(&a1[9])), "=r"(*reinterpret_cast<uint32_t*>(&a1[10])), "=r"(*reinterpret_cast<uint32_t*>(&a1[11])), "=r"(*reinterpret_cast<uint32_t*>(&a1[12])), "=r"(*reinterpret_cast<uint32_t*>(&a1[13])), "=r"(*reinterpret_cast<uint32_t*>(&a1[14])), "=r"(*reinterpret_cast<uint32_t*>(&a1[15]))
+-                    : "r"(tmem_tmem + 128 + wg * 32));
++                    : "r"(tmem_tmem + tmem_lane_base + 128 + wg * 32));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[0])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[1])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[2])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[3])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[4])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[5])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[6])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[7])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[8])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[9])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[10])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[11])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[12])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[13])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[14])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[15]))
+-                    : "r"(tmem_tmem + 128 + wg * 32 + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 128 + wg * 32 + 1048576));
+                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                 asm volatile("tcgen05.fence::before_thread_sync;");
+                 mbarrier_arrive(dkv_a_drained_addr);
+@@ -2709,7 +2711,7 @@ kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667(const __grid_constant__ CUtensorM
+                         "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                         : "=r"(*reinterpret_cast<uint32_t*>(&rk[0])), "=r"(*reinterpret_cast<uint32_t*>(&rk[1])), "=r"(*reinterpret_cast<uint32_t*>(&rk[2])), "=r"(*reinterpret_cast<uint32_t*>(&rk[3])), "=r"(*reinterpret_cast<uint32_t*>(&rk[4])), "=r"(*reinterpret_cast<uint32_t*>(&rk[5])), "=r"(*reinterpret_cast<uint32_t*>(&rk[6])), "=r"(*reinterpret_cast<uint32_t*>(&rk[7])), "=r"(*reinterpret_cast<uint32_t*>(&rk[8])), "=r"(*reinterpret_cast<uint32_t*>(&rk[9])), "=r"(*reinterpret_cast<uint32_t*>(&rk[10])), "=r"(*reinterpret_cast<uint32_t*>(&rk[11])), "=r"(*reinterpret_cast<uint32_t*>(&rk[12])), "=r"(*reinterpret_cast<uint32_t*>(&rk[13])), "=r"(*reinterpret_cast<uint32_t*>(&rk[14])), "=r"(*reinterpret_cast<uint32_t*>(&rk[15]))
+-                        : "r"(tmem_tmem + wg * 32));
++                        : "r"(tmem_tmem + tmem_lane_base + wg * 32));
+                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                     asm volatile("tcgen05.fence::before_thread_sync;");
+                     mbarrier_arrive(dkr_drained_addr);
+@@ -2791,22 +2793,22 @@ kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667(const __grid_constant__ CUtensorM
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&a0[0])), "=r"(*reinterpret_cast<uint32_t*>(&a0[1])), "=r"(*reinterpret_cast<uint32_t*>(&a0[2])), "=r"(*reinterpret_cast<uint32_t*>(&a0[3])), "=r"(*reinterpret_cast<uint32_t*>(&a0[4])), "=r"(*reinterpret_cast<uint32_t*>(&a0[5])), "=r"(*reinterpret_cast<uint32_t*>(&a0[6])), "=r"(*reinterpret_cast<uint32_t*>(&a0[7])), "=r"(*reinterpret_cast<uint32_t*>(&a0[8])), "=r"(*reinterpret_cast<uint32_t*>(&a0[9])), "=r"(*reinterpret_cast<uint32_t*>(&a0[10])), "=r"(*reinterpret_cast<uint32_t*>(&a0[11])), "=r"(*reinterpret_cast<uint32_t*>(&a0[12])), "=r"(*reinterpret_cast<uint32_t*>(&a0[13])), "=r"(*reinterpret_cast<uint32_t*>(&a0[14])), "=r"(*reinterpret_cast<uint32_t*>(&a0[15]))
+-                    : "r"(tmem_tmem + 64 + wg * 32));
++                    : "r"(tmem_tmem + tmem_lane_base + 64 + wg * 32));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[0])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[1])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[2])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[3])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[4])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[5])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[6])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[7])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[8])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[9])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[10])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[11])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[12])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[13])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[14])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[15]))
+-                    : "r"(tmem_tmem + 64 + wg * 32 + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 64 + wg * 32 + 1048576));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&a1[0])), "=r"(*reinterpret_cast<uint32_t*>(&a1[1])), "=r"(*reinterpret_cast<uint32_t*>(&a1[2])), "=r"(*reinterpret_cast<uint32_t*>(&a1[3])), "=r"(*reinterpret_cast<uint32_t*>(&a1[4])), "=r"(*reinterpret_cast<uint32_t*>(&a1[5])), "=r"(*reinterpret_cast<uint32_t*>(&a1[6])), "=r"(*reinterpret_cast<uint32_t*>(&a1[7])), "=r"(*reinterpret_cast<uint32_t*>(&a1[8])), "=r"(*reinterpret_cast<uint32_t*>(&a1[9])), "=r"(*reinterpret_cast<uint32_t*>(&a1[10])), "=r"(*reinterpret_cast<uint32_t*>(&a1[11])), "=r"(*reinterpret_cast<uint32_t*>(&a1[12])), "=r"(*reinterpret_cast<uint32_t*>(&a1[13])), "=r"(*reinterpret_cast<uint32_t*>(&a1[14])), "=r"(*reinterpret_cast<uint32_t*>(&a1[15]))
+-                    : "r"(tmem_tmem + 128 + wg * 32));
++                    : "r"(tmem_tmem + tmem_lane_base + 128 + wg * 32));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[0])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[1])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[2])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[3])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[4])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[5])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[6])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[7])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[8])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[9])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[10])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[11])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[12])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[13])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[14])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[15]))
+-                    : "r"(tmem_tmem + 128 + wg * 32 + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 128 + wg * 32 + 1048576));
+                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                 asm volatile("tcgen05.fence::before_thread_sync;");
+                 mbarrier_arrive(dkv_b_drained_addr);
+diff --git a/flashinfer/experimental/cake_dsa_train/csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_kernel.cu b/flashinfer/experimental/cake_dsa_train/csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_kernel.cu
+index 45154db545d..7797a7653ca 100644
+--- a/flashinfer/experimental/cake_dsa_train/csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_kernel.cu
++++ b/flashinfer/experimental/cake_dsa_train/csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_kernel.cu
+@@ -245,6 +245,8 @@ kernel_cake_dsa_h64_train_e29d165e3abca62c430b(const __grid_constant__ CUtensorM
+ 
+     // Kernel post-init ops
+     const int tmem_tmem = taddr;
++    // The warp's TMEM lane quarter: warp w of a warpgroup may access only lanes 32 (w % 4) .. 32 (w % 4) + 31.
++    const int tmem_lane_base = (tid & 96) << 16;
+ 
+     // ---- Role: gather ----
+     if (warp <= 3) {
+@@ -462,7 +464,7 @@ kernel_cake_dsa_h64_train_e29d165e3abca62c430b(const __grid_constant__ CUtensorM
+                     "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&s[0])), "=r"(*reinterpret_cast<uint32_t*>(&s[1])), "=r"(*reinterpret_cast<uint32_t*>(&s[2])), "=r"(*reinterpret_cast<uint32_t*>(&s[3])), "=r"(*reinterpret_cast<uint32_t*>(&s[4])), "=r"(*reinterpret_cast<uint32_t*>(&s[5])), "=r"(*reinterpret_cast<uint32_t*>(&s[6])), "=r"(*reinterpret_cast<uint32_t*>(&s[7])), "=r"(*reinterpret_cast<uint32_t*>(&s[8])), "=r"(*reinterpret_cast<uint32_t*>(&s[9])), "=r"(*reinterpret_cast<uint32_t*>(&s[10])), "=r"(*reinterpret_cast<uint32_t*>(&s[11])), "=r"(*reinterpret_cast<uint32_t*>(&s[12])), "=r"(*reinterpret_cast<uint32_t*>(&s[13])), "=r"(*reinterpret_cast<uint32_t*>(&s[14])), "=r"(*reinterpret_cast<uint32_t*>(&s[15])), "=r"(*reinterpret_cast<uint32_t*>(&s[16])), "=r"(*reinterpret_cast<uint32_t*>(&s[17])), "=r"(*reinterpret_cast<uint32_t*>(&s[18])), "=r"(*reinterpret_cast<uint32_t*>(&s[19])), "=r"(*reinterpret_cast<uint32_t*>(&s[20])), "=r"(*reinterpret_cast<uint32_t*>(&s[21])), "=r"(*reinterpret_cast<uint32_t*>(&s[22])), "=r"(*reinterpret_cast<uint32_t*>(&s[23])), "=r"(*reinterpret_cast<uint32_t*>(&s[24])), "=r"(*reinterpret_cast<uint32_t*>(&s[25])), "=r"(*reinterpret_cast<uint32_t*>(&s[26])), "=r"(*reinterpret_cast<uint32_t*>(&s[27])), "=r"(*reinterpret_cast<uint32_t*>(&s[28])), "=r"(*reinterpret_cast<uint32_t*>(&s[29])), "=r"(*reinterpret_cast<uint32_t*>(&s[30])), "=r"(*reinterpret_cast<uint32_t*>(&s[31]))
+-                    : "r"(tmem_tmem));
++                    : "r"(tmem_tmem + tmem_lane_base));
+                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                 float p[32];
+                 float _fma_0 = __fmaf_rn(s[0], scale_log2, -lse0);
+@@ -679,7 +681,7 @@ kernel_cake_dsa_h64_train_e29d165e3abca62c430b(const __grid_constant__ CUtensorM
+                     "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&dp[0])), "=r"(*reinterpret_cast<uint32_t*>(&dp[1])), "=r"(*reinterpret_cast<uint32_t*>(&dp[2])), "=r"(*reinterpret_cast<uint32_t*>(&dp[3])), "=r"(*reinterpret_cast<uint32_t*>(&dp[4])), "=r"(*reinterpret_cast<uint32_t*>(&dp[5])), "=r"(*reinterpret_cast<uint32_t*>(&dp[6])), "=r"(*reinterpret_cast<uint32_t*>(&dp[7])), "=r"(*reinterpret_cast<uint32_t*>(&dp[8])), "=r"(*reinterpret_cast<uint32_t*>(&dp[9])), "=r"(*reinterpret_cast<uint32_t*>(&dp[10])), "=r"(*reinterpret_cast<uint32_t*>(&dp[11])), "=r"(*reinterpret_cast<uint32_t*>(&dp[12])), "=r"(*reinterpret_cast<uint32_t*>(&dp[13])), "=r"(*reinterpret_cast<uint32_t*>(&dp[14])), "=r"(*reinterpret_cast<uint32_t*>(&dp[15])), "=r"(*reinterpret_cast<uint32_t*>(&dp[16])), "=r"(*reinterpret_cast<uint32_t*>(&dp[17])), "=r"(*reinterpret_cast<uint32_t*>(&dp[18])), "=r"(*reinterpret_cast<uint32_t*>(&dp[19])), "=r"(*reinterpret_cast<uint32_t*>(&dp[20])), "=r"(*reinterpret_cast<uint32_t*>(&dp[21])), "=r"(*reinterpret_cast<uint32_t*>(&dp[22])), "=r"(*reinterpret_cast<uint32_t*>(&dp[23])), "=r"(*reinterpret_cast<uint32_t*>(&dp[24])), "=r"(*reinterpret_cast<uint32_t*>(&dp[25])), "=r"(*reinterpret_cast<uint32_t*>(&dp[26])), "=r"(*reinterpret_cast<uint32_t*>(&dp[27])), "=r"(*reinterpret_cast<uint32_t*>(&dp[28])), "=r"(*reinterpret_cast<uint32_t*>(&dp[29])), "=r"(*reinterpret_cast<uint32_t*>(&dp[30])), "=r"(*reinterpret_cast<uint32_t*>(&dp[31]))
+-                    : "r"(tmem_tmem + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 1048576));
+                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                 float ds[32];
+                 ds[0] = p[0] * (dp[0] - dl0) * sm_scale;
+@@ -753,7 +755,7 @@ kernel_cake_dsa_h64_train_e29d165e3abca62c430b(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq[31]))
+-                : "r"(tmem_tmem + 192));
++                : "r"(tmem_tmem + tmem_lane_base + 192));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dq_bf16[16];
+             #pragma unroll
+@@ -794,7 +796,7 @@ kernel_cake_dsa_h64_train_e29d165e3abca62c430b(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_10[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_10[31]))
+-                : "r"(tmem_tmem + 192 + 1048576));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 1048576));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dq_10_bf16[16];
+             #pragma unroll
+@@ -835,7 +837,7 @@ kernel_cake_dsa_h64_train_e29d165e3abca62c430b(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_23[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_23[31]))
+-                : "r"(tmem_tmem + 192 + 64));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 64));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dq_23_bf16[16];
+             #pragma unroll
+@@ -876,7 +878,7 @@ kernel_cake_dsa_h64_train_e29d165e3abca62c430b(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_36[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_36[31]))
+-                : "r"(tmem_tmem + 192 + 64 + 1048576));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 64 + 1048576));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dq_36_bf16[16];
+             #pragma unroll
+@@ -917,7 +919,7 @@ kernel_cake_dsa_h64_train_e29d165e3abca62c430b(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_49[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_49[31]))
+-                : "r"(tmem_tmem + 192 + 128));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 128));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dq_49_bf16[16];
+             #pragma unroll
+@@ -958,7 +960,7 @@ kernel_cake_dsa_h64_train_e29d165e3abca62c430b(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_62[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_62[31]))
+-                : "r"(tmem_tmem + 192 + 128 + 1048576));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 128 + 1048576));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dq_62_bf16[16];
+             #pragma unroll
+@@ -999,7 +1001,7 @@ kernel_cake_dsa_h64_train_e29d165e3abca62c430b(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_75[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_75[31]))
+-                : "r"(tmem_tmem + 192 + 192));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 192));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dq_75_bf16[16];
+             #pragma unroll
+@@ -1040,7 +1042,7 @@ kernel_cake_dsa_h64_train_e29d165e3abca62c430b(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dq_88[0])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[1])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[2])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[3])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[4])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[5])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[6])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[7])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[8])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[9])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[10])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[11])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[12])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[13])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[14])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[15])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[16])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[17])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[18])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[19])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[20])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[21])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[22])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[23])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[24])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[25])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[26])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[27])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[28])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[29])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[30])), "=r"(*reinterpret_cast<uint32_t*>(&dq_88[31]))
+-                : "r"(tmem_tmem + 192 + 192 + 1048576));
++                : "r"(tmem_tmem + tmem_lane_base + 192 + 192 + 1048576));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dq_88_bf16[16];
+             #pragma unroll
+@@ -1081,7 +1083,7 @@ kernel_cake_dsa_h64_train_e29d165e3abca62c430b(const __grid_constant__ CUtensorM
+                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                 : "=r"(*reinterpret_cast<uint32_t*>(&dqr[0])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[1])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[2])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[3])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[4])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[5])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[6])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[7])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[8])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[9])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[10])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[11])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[12])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[13])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[14])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[15])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[16])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[17])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[18])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[19])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[20])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[21])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[22])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[23])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[24])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[25])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[26])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[27])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[28])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[29])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[30])), "=r"(*reinterpret_cast<uint32_t*>(&dqr[31]))
+-                : "r"(tmem_tmem + 448));
++                : "r"(tmem_tmem + tmem_lane_base + 448));
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             uint32_t dqr_bf16[16];
+             #pragma unroll
+@@ -1175,22 +1177,22 @@ kernel_cake_dsa_h64_train_e29d165e3abca62c430b(const __grid_constant__ CUtensorM
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&a0[0])), "=r"(*reinterpret_cast<uint32_t*>(&a0[1])), "=r"(*reinterpret_cast<uint32_t*>(&a0[2])), "=r"(*reinterpret_cast<uint32_t*>(&a0[3])), "=r"(*reinterpret_cast<uint32_t*>(&a0[4])), "=r"(*reinterpret_cast<uint32_t*>(&a0[5])), "=r"(*reinterpret_cast<uint32_t*>(&a0[6])), "=r"(*reinterpret_cast<uint32_t*>(&a0[7])), "=r"(*reinterpret_cast<uint32_t*>(&a0[8])), "=r"(*reinterpret_cast<uint32_t*>(&a0[9])), "=r"(*reinterpret_cast<uint32_t*>(&a0[10])), "=r"(*reinterpret_cast<uint32_t*>(&a0[11])), "=r"(*reinterpret_cast<uint32_t*>(&a0[12])), "=r"(*reinterpret_cast<uint32_t*>(&a0[13])), "=r"(*reinterpret_cast<uint32_t*>(&a0[14])), "=r"(*reinterpret_cast<uint32_t*>(&a0[15]))
+-                    : "r"(tmem_tmem + 64 + wg * 32));
++                    : "r"(tmem_tmem + tmem_lane_base + 64 + wg * 32));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[0])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[1])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[2])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[3])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[4])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[5])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[6])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[7])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[8])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[9])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[10])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[11])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[12])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[13])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[14])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[15]))
+-                    : "r"(tmem_tmem + 64 + wg * 32 + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 64 + wg * 32 + 1048576));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&a1[0])), "=r"(*reinterpret_cast<uint32_t*>(&a1[1])), "=r"(*reinterpret_cast<uint32_t*>(&a1[2])), "=r"(*reinterpret_cast<uint32_t*>(&a1[3])), "=r"(*reinterpret_cast<uint32_t*>(&a1[4])), "=r"(*reinterpret_cast<uint32_t*>(&a1[5])), "=r"(*reinterpret_cast<uint32_t*>(&a1[6])), "=r"(*reinterpret_cast<uint32_t*>(&a1[7])), "=r"(*reinterpret_cast<uint32_t*>(&a1[8])), "=r"(*reinterpret_cast<uint32_t*>(&a1[9])), "=r"(*reinterpret_cast<uint32_t*>(&a1[10])), "=r"(*reinterpret_cast<uint32_t*>(&a1[11])), "=r"(*reinterpret_cast<uint32_t*>(&a1[12])), "=r"(*reinterpret_cast<uint32_t*>(&a1[13])), "=r"(*reinterpret_cast<uint32_t*>(&a1[14])), "=r"(*reinterpret_cast<uint32_t*>(&a1[15]))
+-                    : "r"(tmem_tmem + 128 + wg * 32));
++                    : "r"(tmem_tmem + tmem_lane_base + 128 + wg * 32));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[0])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[1])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[2])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[3])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[4])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[5])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[6])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[7])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[8])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[9])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[10])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[11])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[12])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[13])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[14])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[15]))
+-                    : "r"(tmem_tmem + 128 + wg * 32 + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 128 + wg * 32 + 1048576));
+                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                 asm volatile("tcgen05.fence::before_thread_sync;");
+                 mbarrier_arrive(dkv_a_drained_addr);
+@@ -1201,7 +1203,7 @@ kernel_cake_dsa_h64_train_e29d165e3abca62c430b(const __grid_constant__ CUtensorM
+                         "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                         : "=r"(*reinterpret_cast<uint32_t*>(&rk[0])), "=r"(*reinterpret_cast<uint32_t*>(&rk[1])), "=r"(*reinterpret_cast<uint32_t*>(&rk[2])), "=r"(*reinterpret_cast<uint32_t*>(&rk[3])), "=r"(*reinterpret_cast<uint32_t*>(&rk[4])), "=r"(*reinterpret_cast<uint32_t*>(&rk[5])), "=r"(*reinterpret_cast<uint32_t*>(&rk[6])), "=r"(*reinterpret_cast<uint32_t*>(&rk[7])), "=r"(*reinterpret_cast<uint32_t*>(&rk[8])), "=r"(*reinterpret_cast<uint32_t*>(&rk[9])), "=r"(*reinterpret_cast<uint32_t*>(&rk[10])), "=r"(*reinterpret_cast<uint32_t*>(&rk[11])), "=r"(*reinterpret_cast<uint32_t*>(&rk[12])), "=r"(*reinterpret_cast<uint32_t*>(&rk[13])), "=r"(*reinterpret_cast<uint32_t*>(&rk[14])), "=r"(*reinterpret_cast<uint32_t*>(&rk[15]))
+-                        : "r"(tmem_tmem + wg * 32));
++                        : "r"(tmem_tmem + tmem_lane_base + wg * 32));
+                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                     asm volatile("tcgen05.fence::before_thread_sync;");
+                     mbarrier_arrive(dkr_drained_addr);
+@@ -1283,22 +1285,22 @@ kernel_cake_dsa_h64_train_e29d165e3abca62c430b(const __grid_constant__ CUtensorM
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&a0[0])), "=r"(*reinterpret_cast<uint32_t*>(&a0[1])), "=r"(*reinterpret_cast<uint32_t*>(&a0[2])), "=r"(*reinterpret_cast<uint32_t*>(&a0[3])), "=r"(*reinterpret_cast<uint32_t*>(&a0[4])), "=r"(*reinterpret_cast<uint32_t*>(&a0[5])), "=r"(*reinterpret_cast<uint32_t*>(&a0[6])), "=r"(*reinterpret_cast<uint32_t*>(&a0[7])), "=r"(*reinterpret_cast<uint32_t*>(&a0[8])), "=r"(*reinterpret_cast<uint32_t*>(&a0[9])), "=r"(*reinterpret_cast<uint32_t*>(&a0[10])), "=r"(*reinterpret_cast<uint32_t*>(&a0[11])), "=r"(*reinterpret_cast<uint32_t*>(&a0[12])), "=r"(*reinterpret_cast<uint32_t*>(&a0[13])), "=r"(*reinterpret_cast<uint32_t*>(&a0[14])), "=r"(*reinterpret_cast<uint32_t*>(&a0[15]))
+-                    : "r"(tmem_tmem + 64 + wg * 32));
++                    : "r"(tmem_tmem + tmem_lane_base + 64 + wg * 32));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[0])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[1])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[2])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[3])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[4])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[5])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[6])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[7])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[8])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[9])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[10])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[11])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[12])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[13])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[14])), "=r"(*reinterpret_cast<uint32_t*>(&((a0 + 16))[15]))
+-                    : "r"(tmem_tmem + 64 + wg * 32 + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 64 + wg * 32 + 1048576));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&a1[0])), "=r"(*reinterpret_cast<uint32_t*>(&a1[1])), "=r"(*reinterpret_cast<uint32_t*>(&a1[2])), "=r"(*reinterpret_cast<uint32_t*>(&a1[3])), "=r"(*reinterpret_cast<uint32_t*>(&a1[4])), "=r"(*reinterpret_cast<uint32_t*>(&a1[5])), "=r"(*reinterpret_cast<uint32_t*>(&a1[6])), "=r"(*reinterpret_cast<uint32_t*>(&a1[7])), "=r"(*reinterpret_cast<uint32_t*>(&a1[8])), "=r"(*reinterpret_cast<uint32_t*>(&a1[9])), "=r"(*reinterpret_cast<uint32_t*>(&a1[10])), "=r"(*reinterpret_cast<uint32_t*>(&a1[11])), "=r"(*reinterpret_cast<uint32_t*>(&a1[12])), "=r"(*reinterpret_cast<uint32_t*>(&a1[13])), "=r"(*reinterpret_cast<uint32_t*>(&a1[14])), "=r"(*reinterpret_cast<uint32_t*>(&a1[15]))
+-                    : "r"(tmem_tmem + 128 + wg * 32));
++                    : "r"(tmem_tmem + tmem_lane_base + 128 + wg * 32));
+                 asm volatile(
+                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
+                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+                     : "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[0])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[1])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[2])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[3])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[4])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[5])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[6])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[7])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[8])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[9])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[10])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[11])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[12])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[13])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[14])), "=r"(*reinterpret_cast<uint32_t*>(&((a1 + 16))[15]))
+-                    : "r"(tmem_tmem + 128 + wg * 32 + 1048576));
++                    : "r"(tmem_tmem + tmem_lane_base + 128 + wg * 32 + 1048576));
+                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                 asm volatile("tcgen05.fence::before_thread_sync;");
+                 mbarrier_arrive(dkv_b_drained_addr);

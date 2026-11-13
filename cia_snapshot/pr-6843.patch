@@ -1,0 +1,18 @@
+diff --git a/flashinfer/attention/prims_ts/mla_decode.py b/flashinfer/attention/prims_ts/mla_decode.py
+index b62bd1081f..0c8c982a85 100644
+--- a/flashinfer/attention/prims_ts/mla_decode.py
++++ b/flashinfer/attention/prims_ts/mla_decode.py
+@@ -1459,11 +1459,8 @@ def _launch_mla_decode(
+         runtime.sparse_inputs,
+         runtime.bmm1_scale,
+         runtime.bmm2_scale,
+-        **(
+-            {"output_quant_args": runtime.output_quant_args}
+-            if runtime.output_quant_args is not None
+-            else {}
+-        ),
++        # The compiled ABI retains this argument even when quantization is disabled.
++        runtime.output_quant_args,
+     )
+     return runtime.out
+ 

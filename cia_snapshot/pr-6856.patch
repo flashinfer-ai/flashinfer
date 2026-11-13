@@ -1,0 +1,607 @@
+diff --git a/benchmarks/bench_paged_mqa_logits.py b/benchmarks/bench_paged_mqa_logits.py
+index ea7fb9e29b1..838eedb25a8 100644
+--- a/benchmarks/bench_paged_mqa_logits.py
++++ b/benchmarks/bench_paged_mqa_logits.py
+@@ -26,6 +26,12 @@
+   several times graph_ms; a serving stack that launches eagerly should look at
+   this one.
+ 
++``--calls-per-graph N`` (N > 1) captures N back-to-back calls that share one
++schedule computed outside the graph, as a serving stack's indexer layers do, and
++reports graph_ms per call.  Consecutive launches are where programmatic
++dependent launch (``enable_pdl``, ``--disable-pdl`` to compare) overlaps one
++call's prologue with the previous call's tail; one call per replay cannot show it.
++
+ The fp4 next_n=4 atom decomposition is a fixed internal rule (direct on Rubin,
+ two atoms of 2 on SM100/SM103) chosen from a forced-decomposition sweep run
+ with this script's timing methodology on B100 and Rubin -- see the policy
+@@ -49,6 +55,7 @@
+ import torch
+ 
+ from flashinfer import (
++    compute_paged_mqa_logits_schedule,
+     fp4_paged_mqa_logits,
+     fp8_paged_mqa_logits,
+     min_block_table_width,
+@@ -132,13 +139,25 @@ def _make_inputs(kind, batch, seq_len, next_n, block_size, device, num_heads):
+     return (q, q_sf, kv, weights, block_tables, seq_lens, seq_len)
+ 
+ 
+-def _call(kind, args, out):
++def _call(kind, args, out, enable_pdl, schedule_meta=None):
++    kw = dict(out=out, enable_pdl=enable_pdl, schedule_meta=schedule_meta)
+     if kind == "fp8":
+-        return fp8_paged_mqa_logits(*args, out=out)
+-    return fp4_paged_mqa_logits(*args, out=out)
++        return fp8_paged_mqa_logits(*args, **kw)
++    return fp4_paged_mqa_logits(*args, **kw)
+ 
+ 
+-def bench_one(kind, batch, seq_len, next_n, block_size, iters, device, num_heads):
++def bench_one(
++    kind,
++    batch,
++    seq_len,
++    next_n,
++    block_size,
++    iters,
++    device,
++    num_heads,
++    enable_pdl,
++    calls_per_graph,
++):
+     args = _make_inputs(kind, batch, seq_len, next_n, block_size, device, num_heads)
+     rows = batch * next_n
+     # NaN-filled so the self-check below is deterministic: an unwritten cell
+@@ -152,7 +171,7 @@ def bench_one(kind, batch, seq_len, next_n, block_size, iters, device, num_heads
+     )
+ 
+     # Warm: JIT compile + schedule-bucket compile happen here, outside timing.
+-    _call(kind, args, out)
++    _call(kind, args, out, enable_pdl)
+     torch.cuda.synchronize()
+     # Self-check on exactly the region the API defines: row b*next_n + t holds
+     # scores for positions 0 .. seq_lens[b] - next_n + t (see the Returns
+@@ -173,10 +192,17 @@ def bench_one(kind, batch, seq_len, next_n, block_size, iters, device, num_heads
+             "or the kernel left a defined cell unwritten"
+         )
+ 
+-    # Graph replay: device work only (the schedule recompute is captured too).
++    # Graph replay: device work only (the schedule recompute is captured too,
++    # unless --calls-per-graph shares one precomputed schedule).
+     g = torch.cuda.CUDAGraph()
++    schedule = None
++    if calls_per_graph > 1:
++        schedule = compute_paged_mqa_logits_schedule(
++            args[-2], next_n=next_n, variant=kind
++        )
+     with torch.cuda.graph(g):
+-        _call(kind, args, out)
++        for _ in range(calls_per_graph):
++            _call(kind, args, out, enable_pdl, schedule)
+     g.replay()
+     torch.cuda.synchronize()
+     start, stop = torch.cuda.Event(True), torch.cuda.Event(True)
+@@ -187,16 +213,16 @@ def bench_one(kind, batch, seq_len, next_n, block_size, iters, device, num_heads
+             g.replay()
+         stop.record()
+         torch.cuda.synchronize()
+-        reps.append(start.elapsed_time(stop) / iters)
++        reps.append(start.elapsed_time(stop) / (iters * calls_per_graph))
+     graph_ms = sorted(reps)[len(reps) // 2]
+ 
+     # Eager wall-clock: the full public path, host dispatch included.
+     for _ in range(10):
+-        _call(kind, args, out)
++        _call(kind, args, out, enable_pdl)
+     torch.cuda.synchronize()
+     t0 = time.perf_counter()
+     for _ in range(iters):
+-        _call(kind, args, out)
++        _call(kind, args, out, enable_pdl)
+     torch.cuda.synchronize()
+     eager_ms = (time.perf_counter() - t0) / iters * 1e3
+     return graph_ms, eager_ms
+@@ -221,6 +247,19 @@ def main():
+         "GLM-style indexer); fp4 requires 64 and other values are skipped for it.",
+     )
+     p.add_argument("--iters", type=int, default=100)
++    p.add_argument(
++        "--calls-per-graph",
++        type=int,
++        default=1,
++        help="back-to-back calls per captured graph, sharing one precomputed "
++        "schedule; graph_ms is reported per call",
++    )
++    p.add_argument(
++        "--disable-pdl",
++        action="store_true",
++        help="launch without programmatic dependent launch (default: enabled "
++        "where the device supports it)",
++    )
+     args = p.parse_args()
+ 
+     dev = torch.device("cuda", torch.cuda.current_device())
+@@ -249,6 +288,8 @@ def main():
+                                 args.iters,
+                                 dev,
+                                 heads,
++                                False if args.disable_pdl else None,
++                                args.calls_per_graph,
+                             )
+                         except (ValueError, RuntimeError) as e:
+                             print(
+diff --git a/flashinfer/attn_scores/attn_scores.py b/flashinfer/attn_scores/attn_scores.py
+index b0b5a257703..76b689c1af1 100644
+--- a/flashinfer/attn_scores/attn_scores.py
++++ b/flashinfer/attn_scores/attn_scores.py
+@@ -94,6 +94,7 @@
+ )
+ from ..utils import (
+     backend_requirement,
++    device_support_pdl,
+     get_device_index,
+     get_device_sm_count,
+     supported_compute_capability,
+@@ -956,6 +957,7 @@ def _cached_compile_fp8_kernel(
+     # validates them.
+     num_epi_subtiles: int,
+     w_cache_regs: Optional[int],
++    enable_pdl: bool,
+     arch: str,
+ ):
+     from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+@@ -1029,6 +1031,7 @@ def _cached_compile_fp8_kernel(
+         acc_dtype=acc_dtype,
+         output_dtype=output_dtype,
+         w_cache_regs=w_cache_regs,
++        enable_pdl=enable_pdl,
+         # Construction-time arch gates (is_rubin levers, TMEM columns) must
+         # follow the compile target, not the DSL's ambient device-0 probe.
+         arch=arch,
+@@ -1053,7 +1056,7 @@ def _compile_fn():
+     tag = (
+         f"fp8_bs{block_size}_H{num_heads}_D{head_dim}_nn{next_n}"
+         f"_sms{num_sms}_epi{epi_dtype}_acc{acc_dtype}_out{output_dtype}"
+-        f"_sub{num_epi_subtiles}_w{w_cache_regs or 0}_{arch}"
++        f"_sub{num_epi_subtiles}_w{w_cache_regs or 0}_pdl{int(enable_pdl)}_{arch}"
+     )
+     return build_and_load_cute_dsl_kernel(
+         "attn_scores_fp8",
+@@ -1151,6 +1154,7 @@ def _cached_compile_fp4_kernel(
+     # same kernel -- a warm from one call site would silently miss from the
+     # other. Forcing every caller to pass it keeps the key canonical.
+     num_next_n_atoms: int,
++    enable_pdl: bool,
+ ):
+     from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+     from .kernels import FP4MQALogitsKernel
+@@ -1219,6 +1223,7 @@ def _cached_compile_fp4_kernel(
+         output_dtype=output_dtype,
+         # kernel kwarg name is fixed (verbatim TRT-LLM port)
+         remove_online_sf_transpose=is_kv_sf_interleaved,
++        enable_pdl=enable_pdl,
+         # Construction-time arch gates (atom cap, is_rubin levers) must follow
+         # the compile target, not the DSL's ambient device-0 probe.
+         arch=arch,
+@@ -1245,7 +1250,7 @@ def _compile_fn():
+         f"fp4_bs{block_size}_H{num_heads}_D{head_dim}_nn{next_n}"
+         f"_at{num_next_n_atoms}"
+         f"_sms{num_sms}_epi{epi_dtype}_out{output_dtype}"
+-        f"_sub{num_epi_subtiles}_sfI{int(is_kv_sf_interleaved)}_{arch}"
++        f"_sub{num_epi_subtiles}_sfI{int(is_kv_sf_interleaved)}_pdl{int(enable_pdl)}_{arch}"
+     )
+     return build_and_load_cute_dsl_kernel(
+         "attn_scores_fp4",
+@@ -1465,6 +1470,7 @@ def _check_fp8_paged_mqa_logits_supported(
+     acc_dtype: torch.dtype = torch.float32,
+     schedule_meta: Optional[torch.Tensor] = None,
+     out: Optional[torch.Tensor] = None,
++    enable_pdl: Optional[bool] = None,
+ ) -> bool:
+     """Return True when the FP8 kernel supports this problem, else raise ``ValueError``.
+ 
+@@ -1606,6 +1612,7 @@ def fp8_paged_mqa_logits(
+     acc_dtype: torch.dtype = torch.float32,
+     schedule_meta: Optional[torch.Tensor] = None,
+     out: Optional[torch.Tensor] = None,
++    enable_pdl: Optional[bool] = None,
+ ) -> torch.Tensor:
+     """FP8 paged MQA logits for Blackwell (SM100/SM103) and Rubin (SM107).
+ 
+@@ -1805,6 +1812,11 @@ def fp8_paged_mqa_logits(
+                          Bigger is fine -- e.g. one address-stable max-batch
+                          buffer shared across captures; only the first
+                          batch_size*next_n rows are written.
++        enable_pdl:      launch with programmatic dependent launch, so the
++                         kernel's prologue overlaps the previous kernel on the
++                         stream; it reads its inputs only after that kernel
++                         completes.  None (default) enables it where the device
++                         supports it.
+ 
+     Returns:
+         logits: [batch_size*next_n, max_seq_len]  output_dtype
+@@ -1927,6 +1939,8 @@ def fp8_paged_mqa_logits(
+     )
+     dev_index = get_device_index(q.device)
+     num_epi_subtiles, w_cache_regs = _fp8_epilogue_policy(H, next_n, cutlass_epi)
++    if enable_pdl is None:
++        enable_pdl = device_support_pdl(q.device)
+     with _on_device(dev_index):
+         compiled = _cached_compile_fp8_kernel(
+             block_size,
+@@ -1939,6 +1953,7 @@ def fp8_paged_mqa_logits(
+             cutlass_out,
+             num_epi_subtiles,
+             w_cache_regs,
++            enable_pdl,
+             _arch_for_launch(dev_index, "fp8_paged_mqa_logits"),
+         )
+         compiled(
+@@ -1970,6 +1985,7 @@ def _check_fp4_paged_mqa_logits_supported(
+     is_kv_sf_interleaved: bool = False,
+     schedule_meta: Optional[torch.Tensor] = None,
+     out: Optional[torch.Tensor] = None,
++    enable_pdl: Optional[bool] = None,
+ ) -> bool:
+     """Return True when the FP4 kernel supports this problem, else raise ``ValueError``.
+ 
+@@ -2123,6 +2139,7 @@ def fp4_paged_mqa_logits(
+     is_kv_sf_interleaved: bool = False,
+     schedule_meta: Optional[torch.Tensor] = None,
+     out: Optional[torch.Tensor] = None,
++    enable_pdl: Optional[bool] = None,
+ ) -> torch.Tensor:
+     """FP4 (MXFP4) paged MQA logits for Blackwell (SM100/SM103) and Rubin (SM107).
+ 
+@@ -2381,6 +2398,11 @@ def fp4_paged_mqa_logits(
+                          Bigger is fine -- e.g. one address-stable max-batch
+                          buffer shared across captures; only the first
+                          batch_size*next_n rows are written.
++        enable_pdl:      launch with programmatic dependent launch, so the
++                         kernel's prologue overlaps the previous kernel on the
++                         stream; it reads its inputs only after that kernel
++                         completes.  None (default) enables it where the device
++                         supports it.
+ 
+     Returns:
+         logits: [batch_size*next_n, max_seq_len]  output_dtype
+@@ -2545,6 +2567,8 @@ def fp4_paged_mqa_logits(
+         )
+ 
+     dev_index = get_device_index(q.device)
++    if enable_pdl is None:
++        enable_pdl = device_support_pdl(q.device)
+     with _on_device(dev_index):
+         compiled = _cached_compile_fp4_kernel(
+             block_size,
+@@ -2558,6 +2582,7 @@ def fp4_paged_mqa_logits(
+             is_kv_sf_interleaved,
+             _arch_for_launch(dev_index, "fp4_paged_mqa_logits"),
+             num_atoms,
++            enable_pdl,
+         )
+         compiled(
+             kv_flat,
+@@ -2699,6 +2724,7 @@ def precompile_paged_mqa_logits(
+                             _to_cutlass(out_dtype),
+                             num_epi_subtiles,
+                             w_cache_regs,
++                            True,  # enable_pdl: the default on every SM10x target
+                             arch,
+                         )
+ 
+@@ -2728,6 +2754,7 @@ def precompile_paged_mqa_logits(
+                             False,
+                             arch,
+                             num_atoms,
++                            True,  # enable_pdl: the default on every SM10x target
+                         )
+ 
+         # The schedule kernel is keyed on the aligned *scheduler row count*,
+diff --git a/flashinfer/attn_scores/kernels/fp4_paged_mqa_logits.py b/flashinfer/attn_scores/kernels/fp4_paged_mqa_logits.py
+index 595850e237a..e3260c60963 100644
+--- a/flashinfer/attn_scores/kernels/fp4_paged_mqa_logits.py
++++ b/flashinfer/attn_scores/kernels/fp4_paged_mqa_logits.py
+@@ -447,6 +447,7 @@ def __init__(
+         use_batched_store: bool = True,
+         use_flat_logits_view=None,
+         use_two_level_task_loop=None,
++        enable_pdl: bool = False,
+         *,
+         arch: str,
+     ):
+@@ -500,6 +501,10 @@ def __init__(
+         # output row stride (see _atom_out_row_base).
+         self.N = self.next_n_atom * num_heads
+         self.num_sms = num_sms
++        # Programmatic dependent launch: the prologue overlaps the previous
++        # kernel's tail, and the schedule / lengths it may have produced are
++        # read only after griddepcontrol_wait.
++        self.enable_pdl = enable_pdl
+         self.num_epi_subtiles = num_epi_subtiles
+         self.epi_dtype = epi_dtype
+         # When True, skip the in-kernel SMEM warp_transpose for KV SF; assume
+@@ -1047,6 +1052,7 @@ class SharedStorage:
+             block=[self.threads_per_cta, 1, 1],
+             cluster=(*self.cluster_shape_mn, 1),
+             stream=stream,
++            use_pdl=self.enable_pdl,
+         )
+ 
+     @cute.kernel
+@@ -1115,19 +1121,21 @@ def kernel(
+         NUM_BLOCKS_PER_MMA = self.num_blocks_per_mma
+         PHYS_BLOCK_KV = self.phys_block_kv
+         sm_idx = bidz
+-        start_q = mScheduleMeta[(sm_idx, 0)]
+-        start_kv_half = mScheduleMeta[(sm_idx, 1)]
+-        end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
+-        end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
++        if cutlass.const_expr(not self.enable_pdl):
++            start_q = mScheduleMeta[(sm_idx, 0)]
++            start_kv_half = mScheduleMeta[(sm_idx, 1)]
++            end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
++            end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
+         # Early mContextLens load: overlap ~200-cycle L2 latency with the
+         # entire prologue setup (pipelines, SMEM alloc, TMA partition, etc.)
+         # Clamp to avoid OOB when start_q == batch_size (zero-work CTA sentinel).
+         # Note: zero-work CTAs get a stale current_num_kv (from the last batch
+         # element), but it is never used because has_work will be False.
+-        start_q_clamped = min(start_q, batch_size - 1)
+-        current_num_kv = (
+-            self._atom_ctx_len(start_q_clamped, mContextLens) + self.block_kv - 1
+-        ) // self.block_kv
++        if cutlass.const_expr(not self.enable_pdl):
++            start_q_clamped = min(start_q, batch_size - 1)
++            current_num_kv = (
++                self._atom_ctx_len(start_q_clamped, mContextLens) + self.block_kv - 1
++            ) // self.block_kv
+ 
+         if is_tma_warp:
+             cpasync.prefetch_descriptor(tma_atom_a)
+@@ -1516,6 +1524,20 @@ def kernel(
+ 
+         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+ 
++        if cutlass.const_expr(self.enable_pdl):
++            # Every global read and write follows the wait: the schedule and
++            # lengths may come from the previous kernel, and a graph may reuse
++            # the logits buffer the previous kernel's consumer still reads.
++            cute.arch.griddepcontrol_wait()
++            start_q = mScheduleMeta[(sm_idx, 0)]
++            start_kv_half = mScheduleMeta[(sm_idx, 1)]
++            end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
++            end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
++            start_q_clamped = min(start_q, batch_size - 1)
++            current_num_kv = (
++                self._atom_ctx_len(start_q_clamped, mContextLens) + self.block_kv - 1
++            ) // self.block_kv
++
+         # ===== WARP-SPECIALIZED EXECUTION =====
+ 
+         if is_tma_warp_0:
+@@ -3207,6 +3229,10 @@ def kernel(
+                     q_pipeline.consumer_release(q_cons_state)
+                     q_cons_state.advance()
+ 
++            if cutlass.const_expr(self.enable_pdl):
++                # Logits are stored: dependents may start their prologue.
++                cute.arch.griddepcontrol_launch_dependents()
++
+             # TMEM dealloc: math warps are allocator + last consumer
+             tmem.relinquish_alloc_permit()
+             # Pass the static column count: dealloc must be marked exclusive for
+diff --git a/flashinfer/attn_scores/kernels/fp8_paged_mqa_logits.py b/flashinfer/attn_scores/kernels/fp8_paged_mqa_logits.py
+index 6f3748b4e5b..4e1a9c3603e 100644
+--- a/flashinfer/attn_scores/kernels/fp8_paged_mqa_logits.py
++++ b/flashinfer/attn_scores/kernels/fp8_paged_mqa_logits.py
+@@ -294,6 +294,7 @@ def __init__(
+         use_two_level_task_loop=None,
+         use_paired_pipeline_polls=None,
+         w_cache_regs=None,
++        enable_pdl: bool = False,
+         *,
+         arch: str,
+     ):
+@@ -351,6 +352,10 @@ def __init__(
+         self.next_n = next_n
+         self.N = next_n * num_heads
+         self.num_sms = num_sms
++        # Programmatic dependent launch: the prologue overlaps the previous
++        # kernel's tail, and the schedule / lengths it may have produced are
++        # read only after griddepcontrol_wait.
++        self.enable_pdl = enable_pdl
+         self.num_epi_subtiles = num_epi_subtiles
+         self.epi_dtype = epi_dtype
+         self.epi_bytes = 2 if epi_dtype == cutlass.Float16 else 4
+@@ -673,6 +678,7 @@ class SharedStorage:
+             block=[self.threads_per_cta, 1, 1],
+             cluster=(*self.cluster_shape_mn, 1),
+             stream=stream,
++            use_pdl=self.enable_pdl,
+         )
+ 
+     @cute.kernel
+@@ -732,10 +738,11 @@ def kernel(
+         NUM_BLOCKS_PER_MMA = self.num_blocks_per_mma
+         PHYS_BLOCK_KV = self.phys_block_kv
+         sm_idx = bidz
+-        start_q = mScheduleMeta[(sm_idx, 0)]
+-        start_kv_half = mScheduleMeta[(sm_idx, 1)]
+-        end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
+-        end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
++        if cutlass.const_expr(not self.enable_pdl):
++            start_q = mScheduleMeta[(sm_idx, 0)]
++            start_kv_half = mScheduleMeta[(sm_idx, 1)]
++            end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
++            end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
+ 
+         if is_tma_warp:
+             cpasync.prefetch_descriptor(tma_atom_a)
+@@ -1061,10 +1068,11 @@ def kernel(
+         # Clamp to avoid OOB when start_q == batch_size (zero-work CTA
+         # sentinel). Zero-work CTAs get a stale current_num_kv, never used
+         # because has_work will be False.
+-        start_q_clamped = min(start_q, batch_size - 1)
+-        current_num_kv = (
+-            mContextLens[start_q_clamped] + self.block_kv - 1
+-        ) // self.block_kv
++        if cutlass.const_expr(not self.enable_pdl):
++            start_q_clamped = min(start_q, batch_size - 1)
++            current_num_kv = (
++                mContextLens[start_q_clamped] + self.block_kv - 1
++            ) // self.block_kv
+ 
+         # ===== SCHEDULER STATE: sunk into each warp-role branch =====
+         # Each warp role derives its own scheduler-state copy (end_kv_idx,
+@@ -1080,6 +1088,20 @@ def kernel(
+ 
+         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+ 
++        if cutlass.const_expr(self.enable_pdl):
++            # Every global read and write follows the wait: the schedule and
++            # lengths may come from the previous kernel, and a graph may reuse
++            # the logits buffer the previous kernel's consumer still reads.
++            cute.arch.griddepcontrol_wait()
++            start_q = mScheduleMeta[(sm_idx, 0)]
++            start_kv_half = mScheduleMeta[(sm_idx, 1)]
++            end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
++            end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
++            start_q_clamped = min(start_q, batch_size - 1)
++            current_num_kv = (
++                mContextLens[start_q_clamped] + self.block_kv - 1
++            ) // self.block_kv
++
+         # ===== WARP-SPECIALIZED EXECUTION =====
+ 
+         if is_tma_warp_0:
+@@ -2423,6 +2445,10 @@ def kernel(
+                     q_pipeline.consumer_release(q_cons_state)
+                     q_cons_state.advance()
+ 
++            if cutlass.const_expr(self.enable_pdl):
++                # Logits are stored: dependents may start their prologue.
++                cute.arch.griddepcontrol_launch_dependents()
++
+             # TMEM dealloc: math warps are allocator + last consumer
+             tmem.relinquish_alloc_permit()
+             # Static column count, mirroring the fp4 kernel (DKG d9adb3cfa77).
+diff --git a/tests/attn_scores/test_attn_scores.py b/tests/attn_scores/test_attn_scores.py
+index 3748ee1543c..8e8cd339df9 100644
+--- a/tests/attn_scores/test_attn_scores.py
++++ b/tests/attn_scores/test_attn_scores.py
+@@ -1694,6 +1694,77 @@ def test_fp4_out_and_schedule_meta_paths():
+     torch.testing.assert_close(ret.float()[valid], ref.float()[valid], atol=0, rtol=0)
+ 
+ 
++@pytest.mark.parametrize("variant", ["fp8", "fp4"])
++def test_enable_pdl_is_bit_identical_and_keyed(variant):
++    """enable_pdl only moves the schedule and length reads behind
++    griddepcontrol_wait and adds the dependent-launch trigger, so the PDL and
++    non-PDL kernels agree bit for bit; they must be distinct compile-cache
++    entries so one can never serve the other."""
++    device = "cuda"
++    if not is_sm100a_supported(torch.device(device)):
++        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
++
++    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
++    from flashinfer.attn_scores import attn_scores as A
++
++    B, next_n, ctx, block_size = 4, 2, 4096, 64
++    if variant == "fp8":
++        q, kv, w, cl, bt = _make_fp8_case(B, next_n, ctx, block_size, device)
++        cache = A._cached_compile_fp8_kernel
++
++        def run(enable_pdl):
++            return fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx, enable_pdl=enable_pdl)
++
++    else:
++        num_heads, head_dim = 64, 128
++        torch.manual_seed(13)
++        cl = torch.full((B,), ctx, dtype=torch.int32, device=device)
++        bt, num_total_blocks = _make_paged_kv(B, block_size, cl, device)
++        q_bf = torch.randn(
++            B, next_n, num_heads, head_dim, device=device, dtype=torch.bfloat16
++        )
++        kv_bf = torch.randn(
++            num_total_blocks,
++            block_size,
++            1,
++            head_dim,
++            device=device,
++            dtype=torch.bfloat16,
++        )
++        w = torch.randn(B * next_n, num_heads, device=device, dtype=torch.float32)
++        q_packed, sf_packed = _per_token_cast_to_fp4(q_bf.view(-1, head_dim), gran_k=32)
++        q = q_packed.view(torch.uint8).view(B, next_n, num_heads, head_dim // 2)
++        q_sf = sf_packed.view(torch.int32).view(B, next_n, num_heads)
++        kv, _ = _kv_cache_cast_to_fp4(kv_bf)
++        cache = A._cached_compile_fp4_kernel
++
++        def run(enable_pdl):
++            return fp4_paged_mqa_logits(
++                q,
++                q_sf,
++                kv,
++                w,
++                bt,
++                cl,
++                ctx,
++                output_dtype=torch.float32,
++                enable_pdl=enable_pdl,
++            )
++
++    with_pdl = run(True).clone()
++    entries = cache.cache_info().currsize
++    without_pdl = run(False)
++    assert cache.cache_info().currsize == entries + 1, (
++        "the PDL and non-PDL kernels must be distinct cache entries"
++    )
++    torch.cuda.synchronize()
++    valid = _valid_causal_mask(cl, next_n, ctx, device)
++    assert torch.isfinite(with_pdl[valid]).all()
++    torch.testing.assert_close(
++        with_pdl.float()[valid], without_pdl.float()[valid], atol=0, rtol=0
++    )
++
++
+ def test_fp8_input_validation():
+     """Guard rails: bad out= size, unsupported dtype, and non-int32/CPU inputs must raise."""
+     device = "cuda"
+@@ -3495,7 +3566,7 @@ def test_precompile_targets_the_requested_device():
+     precompile_paged_mqa_logits(device=torch.device("cuda", target), variants=("fp8",))
+ 
+     hits = _cached_compile_fp8_kernel.cache_info().hits
+-    _cached_compile_fp8_kernel(64, 64, 128, 1, sms, f32, f32, f32, 1, None, arch)
++    _cached_compile_fp8_kernel(64, 64, 128, 1, sms, f32, f32, f32, 1, None, True, arch)
+     assert _cached_compile_fp8_kernel.cache_info().hits == hits + 1, (
+         f"precompile(device=cuda:{target}) produced no entry for "
+         f"(num_sms={sms}, arch={arch})"
+@@ -3508,7 +3579,7 @@ def test_precompile_targets_the_requested_device():
+     with contextlib.suppress(Exception):
+         other_arch = "sm_90a" if arch != "sm_90a" else "sm_80"
+         _cached_compile_fp8_kernel(
+-            64, 64, 128, 1, sms, f32, f32, f32, 1, None, other_arch
++            64, 64, 128, 1, sms, f32, f32, f32, 1, None, True, other_arch
+         )
+     assert _cached_compile_fp8_kernel.cache_info().misses > misses, (
+         "a different arch reused the cache entry -- arch is not in the key"
+@@ -3553,7 +3624,7 @@ def test_precompile_warms_fp4_float32_output():
+     for out_dtype in (torch.bfloat16, torch.float32):
+         hits = _cached_compile_fp4_kernel.cache_info().hits
+         _cached_compile_fp4_kernel(
+-            64, 64, 128, 1, sms, f32, _to_cutlass(out_dtype), 1, False, arch, 1
++            64, 64, 128, 1, sms, f32, _to_cutlass(out_dtype), 1, False, arch, 1, True
+         )
+         assert _cached_compile_fp4_kernel.cache_info().hits == hits + 1, (
+             f"precompile did not warm fp4 output_dtype={out_dtype}"
+@@ -3562,7 +3633,7 @@ def test_precompile_warms_fp4_float32_output():
+     # a dtype outside the warmed set must miss, or the assertions above are vacuous
+     misses = _cached_compile_fp4_kernel.cache_info().misses
+     _cached_compile_fp4_kernel(
+-        64, 64, 128, 1, sms, f32, _to_cutlass(torch.float16), 1, False, arch, 1
++        64, 64, 128, 1, sms, f32, _to_cutlass(torch.float16), 1, False, arch, 1, True
+     )
+     assert _cached_compile_fp4_kernel.cache_info().misses > misses, (
+         "float16 was not warmed but did not miss -- the cache key ignores "

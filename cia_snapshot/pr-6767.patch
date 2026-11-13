@@ -1,0 +1,606 @@
+diff --git a/csrc/alphamoe_nvfp4_c386_up.cu b/csrc/alphamoe_nvfp4_c386_up.cu
+index 1f335d99960..6d383501669 100644
+--- a/csrc/alphamoe_nvfp4_c386_up.cu
++++ b/csrc/alphamoe_nvfp4_c386_up.cu
+@@ -663,7 +663,7 @@ kernel_alpha_moe_nvfp4_up_workspace_contiguous_gate_up(const __grid_constant__ C
+                         int workspace_tile_c = original_tile_c_1 + 2 * record_half;
+                         bool record_has_upper_c = ((record_half == 0) ? pair_upper_c_1 : second_upper_c_1);
+                         int live_record_subtiles_c = ((record_has_upper_c) ? 2 : 1);
+-                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)(physical_feature_1 << 16) + (unsigned int)(record_half * 16);
++                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)((consumer_warp_1 * 32) << 16) + (unsigned int)(record_half * 16);
+                         int up_addr = gate_addr + 32;
+                         float _tmem_load_0[16];
+                         tmem_ld_x16(&_tmem_load_0[0], gate_addr);
+diff --git a/csrc/alphamoe_nvfp4_c388_up.cu b/csrc/alphamoe_nvfp4_c388_up.cu
+index bf96efa9fb0..c23629265c8 100644
+--- a/csrc/alphamoe_nvfp4_c388_up.cu
++++ b/csrc/alphamoe_nvfp4_c388_up.cu
+@@ -703,7 +703,7 @@ kernel_alpha_moe_nvfp4_up_workspace_contiguous_gate_up_two_consumer(const __grid
+                         int workspace_tile_c = original_tile_c_1 + 2 * record_half;
+                         bool record_has_upper_c = ((record_half == 0) ? pair_upper_c_1 : second_upper_c_1);
+                         int live_record_subtiles_c = ((record_has_upper_c) ? 2 : 1);
+-                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)(physical_feature_1 << 16) + (unsigned int)(record_half * 16);
++                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)((consumer_warp_1 * 32) << 16) + (unsigned int)(record_half * 16);
+                         int up_addr = gate_addr + 32;
+                         float _tmem_load_0[16];
+                         tmem_ld_x16(&_tmem_load_0[0], gate_addr);
+diff --git a/csrc/alphamoe_nvfp4_sm100.cu b/csrc/alphamoe_nvfp4_sm100.cu
+index 7e0848c6827..38a332f3c3f 100644
+--- a/csrc/alphamoe_nvfp4_sm100.cu
++++ b/csrc/alphamoe_nvfp4_sm100.cu
+@@ -788,7 +788,7 @@ kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace(const __grid_constant__ CUt
+             for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                 mbarrier_wait(down_ready_addr + (down_stage_c) * 8, _phase_down_ready);
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+-                int down_addr = taddr + (unsigned int)(physical_feature << 16) + down_stage_c * 8;
++                int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + down_stage_c * 8;
+                 float _tmem_load_0[8];
+                 tmem_ld_x8(&_tmem_load_0[0], down_addr);
+                 asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -1559,7 +1559,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
+                 #pragma unroll 1
+                 for (int record_half = 0; record_half < half_count_c; record_half++) {
+                     int workspace_record_c = (blockIdx.x + 2 * record_half) * gridDim.y + blockIdx.y;
+-                    int gate_addr = taddr + (unsigned int)(physical_feature << 16) + (unsigned int)(record_half * 16);
++                    int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + (unsigned int)(record_half * 16);
+                     int up_addr = gate_addr + 32;
+                     float _tmem_load_0[16];
+                     tmem_ld_x16(&_tmem_load_0[0], gate_addr);
+@@ -2273,7 +2273,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
+                 _phase_up_ready_0 ^= 1;
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+                 asm volatile("barrier.sync 15, 128;" ::: "memory");
+-                int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++                int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+                 int up_addr = gate_addr + 16;
+                 float _tmem_load_0[16];
+                 tmem_ld_x16(&_tmem_load_0[0], gate_addr);
+@@ -3001,7 +3001,7 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, co
+                 for (int ob_c = 0; ob_c < K / 128; ob_c++) {
+                     mbarrier_wait(output_ready_addr + (output_stage_c) * 8, _phase_output_ready);
+                     asm volatile("tcgen05.fence::after_thread_sync;");
+-                    int down_addr = taddr + (unsigned int)(physical_feature << 16) + output_stage_c * 16;
++                    int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + output_stage_c * 16;
+                     float _tmem_load_0[16];
+                     tmem_ld_x16(&_tmem_load_0[0], down_addr);
+                     asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -3630,7 +3630,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
+                 _phase_up_ready_0 ^= 1;
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+                 asm volatile("barrier.sync 15, 128;" ::: "memory");
+-                int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++                int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+                 int up_addr = gate_addr + 16;
+                 float _tmem_load_0[16];
+                 tmem_ld_x16(&_tmem_load_0[0], gate_addr);
+@@ -4592,7 +4592,7 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
+                 for (int ob_c = 0; ob_c < K / 128; ob_c++) {
+                     mbarrier_wait(output_ready_addr + (output_stage_c) * 8, _phase_output_ready);
+                     asm volatile("tcgen05.fence::after_thread_sync;");
+-                    int down_addr = taddr + (unsigned int)(physical_feature << 16) + output_stage_c * 16;
++                    int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + output_stage_c * 16;
+                     float _tmem_load_0[16];
+                     tmem_ld_x16(&_tmem_load_0[0], down_addr);
+                     asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -5266,7 +5266,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
+                 _phase_up_ready_0 ^= 1;
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+                 asm volatile("barrier.sync 15, 128;" ::: "memory");
+-                int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++                int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+                 int up_addr = gate_addr + 16;
+                 float _tmem_load_0[16];
+                 tmem_ld_x16(&_tmem_load_0[0], gate_addr);
+@@ -6065,7 +6065,7 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
+                 for (int ob_c = 0; ob_c < K / 128; ob_c++) {
+                     mbarrier_wait(output_ready_addr + (output_stage_c) * 8, _phase_output_ready);
+                     asm volatile("tcgen05.fence::after_thread_sync;");
+-                    int down_addr = taddr + (unsigned int)(physical_feature << 16) + output_stage_c * 16;
++                    int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + output_stage_c * 16;
+                     float _tmem_load_0[16];
+                     tmem_ld_x16(&_tmem_load_0[0], down_addr);
+                     asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -6599,7 +6599,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
+             mbarrier_wait(up_ready_addr, _phase_up_ready_0);
+             _phase_up_ready_0 ^= 1;
+             asm volatile("tcgen05.fence::after_thread_sync;");
+-            int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++            int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+             int up_addr = gate_addr + 8;
+             float _tmem_load_0[8];
+             tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+@@ -7303,7 +7303,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
+             mbarrier_wait(up_ready_addr, _phase_up_ready_0);
+             _phase_up_ready_0 ^= 1;
+             asm volatile("tcgen05.fence::after_thread_sync;");
+-            int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++            int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+             int up_addr = gate_addr + 8;
+             float _tmem_load_0[8];
+             tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+@@ -8067,7 +8067,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
+                 _phase_up_ready_0 ^= 1;
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+                 asm volatile("barrier.sync 15, 128;" ::: "memory");
+-                int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++                int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+                 int up_addr = gate_addr + 16;
+                 float _tmem_load_0[16];
+                 tmem_ld_x16(&_tmem_load_0[0], gate_addr);
+@@ -9029,7 +9029,7 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
+                 for (int ob_c = 0; ob_c < K / 128; ob_c++) {
+                     mbarrier_wait(output_ready_addr + (output_stage_c) * 8, _phase_output_ready);
+                     asm volatile("tcgen05.fence::after_thread_sync;");
+-                    int down_addr = taddr + (unsigned int)(physical_feature << 16) + output_stage_c * 16;
++                    int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + output_stage_c * 16;
+                     float _tmem_load_0[16];
+                     tmem_ld_x16(&_tmem_load_0[0], down_addr);
+                     asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -9708,7 +9708,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
+                 _phase_up_ready_0 ^= 1;
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+                 asm volatile("barrier.sync 15, 128;" ::: "memory");
+-                int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++                int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+                 int up_addr = gate_addr + 16;
+                 float _tmem_load_0[16];
+                 tmem_ld_x16(&_tmem_load_0[0], gate_addr);
+@@ -10507,7 +10507,7 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
+                 for (int ob_c = 0; ob_c < K / 128; ob_c++) {
+                     mbarrier_wait(output_ready_addr + (output_stage_c) * 8, _phase_output_ready);
+                     asm volatile("tcgen05.fence::after_thread_sync;");
+-                    int down_addr = taddr + (unsigned int)(physical_feature << 16) + output_stage_c * 16;
++                    int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + output_stage_c * 16;
+                     float _tmem_load_0[16];
+                     tmem_ld_x16(&_tmem_load_0[0], down_addr);
+                     asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -11044,7 +11044,7 @@ kernel_alpha_moe_nvfp4_up_split_k4_workspace(const __grid_constant__ CUtensorMap
+             mbarrier_wait(up_ready_addr, _phase_up_ready_0);
+             _phase_up_ready_0 ^= 1;
+             asm volatile("tcgen05.fence::after_thread_sync;");
+-            int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++            int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+             int up_addr = gate_addr + 8;
+             float _tmem_load_0[8];
+             tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+@@ -11785,7 +11785,7 @@ kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace(const __grid_constant__ CUt
+             for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                 mbarrier_wait(down_ready_addr + (down_stage_c) * 8, _phase_down_ready);
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+-                int down_addr = taddr + (unsigned int)(physical_feature << 16) + down_stage_c * 8;
++                int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + down_stage_c * 8;
+                 float _tmem_load_0[8];
+                 tmem_ld_x8(&_tmem_load_0[0], down_addr);
+                 asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -12355,7 +12355,7 @@ kernel_alpha_moe_nvfp4_up_split_k4_workspace(const __grid_constant__ CUtensorMap
+             mbarrier_wait(up_ready_addr, _phase_up_ready_0);
+             _phase_up_ready_0 ^= 1;
+             asm volatile("tcgen05.fence::after_thread_sync;");
+-            int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++            int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+             int up_addr = gate_addr + 8;
+             float _tmem_load_0[8];
+             tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+@@ -12982,7 +12982,7 @@ kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace(const __grid_constant__ CUt
+             for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                 mbarrier_wait(down_ready_addr + (down_stage_c) * 8, _phase_down_ready);
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+-                int down_addr = taddr + (unsigned int)(physical_feature << 16) + down_stage_c * 8;
++                int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + down_stage_c * 8;
+                 float _tmem_load_0[8];
+                 tmem_ld_x8(&_tmem_load_0[0], down_addr);
+                 asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -13960,7 +13960,7 @@ kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ AlphamoeTensorMap64 x, co
+                 _phase_up_ready_0 ^= 1;
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+                 asm volatile("barrier.sync 15, 128;" ::: "memory");
+-                int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++                int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+                 int up_addr = gate_addr + 16;
+                 float _tmem_load_0[16];
+                 tmem_ld_x16(&_tmem_load_0[0], gate_addr);
+@@ -14147,7 +14147,7 @@ kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ AlphamoeTensorMap64 x, co
+                 for (int ob_c = 0; ob_c < K / 128; ob_c++) {
+                     mbarrier_wait(down_ready_addr + (down_stage_c) * 8, _phase_down_ready);
+                     asm volatile("tcgen05.fence::after_thread_sync;");
+-                    int down_addr = taddr + 32 + (unsigned int)(physical_feature << 16) + down_stage_c * 16;
++                    int down_addr = taddr + 32 + (unsigned int)((consumer_warp * 32) << 16) + down_stage_c * 16;
+                     float _tmem_load_2[16];
+                     tmem_ld_x16(&_tmem_load_2[0], down_addr);
+                     asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -15087,7 +15087,7 @@ kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ AlphamoeTensorMap64 x, co
+                 _phase_up_ready_0 ^= 1;
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+                 asm volatile("barrier.sync 15, 128;" ::: "memory");
+-                int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++                int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+                 int up_addr = gate_addr + 16;
+                 float _tmem_load_0[16];
+                 tmem_ld_x16(&_tmem_load_0[0], gate_addr);
+@@ -15274,7 +15274,7 @@ kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ AlphamoeTensorMap64 x, co
+                 for (int ob_c = 0; ob_c < K / 128; ob_c++) {
+                     mbarrier_wait(down_ready_addr + (down_stage_c) * 8, _phase_down_ready);
+                     asm volatile("tcgen05.fence::after_thread_sync;");
+-                    int down_addr = taddr + 32 + (unsigned int)(physical_feature << 16) + down_stage_c * 16;
++                    int down_addr = taddr + 32 + (unsigned int)((consumer_warp * 32) << 16) + down_stage_c * 16;
+                     float _tmem_load_2[16];
+                     tmem_ld_x16(&_tmem_load_2[0], down_addr);
+                     asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -15838,7 +15838,7 @@ kernel_alpha_moe_nvfp4_up_split_k2_workspace(const __grid_constant__ CUtensorMap
+             mbarrier_wait(up_ready_addr, _phase_up_ready_0);
+             _phase_up_ready_0 ^= 1;
+             asm volatile("tcgen05.fence::after_thread_sync;");
+-            int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++            int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+             int up_addr = gate_addr + 8;
+             float _tmem_load_0[8];
+             tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+@@ -16576,7 +16576,7 @@ kernel_alpha_moe_nvfp4_down_split_k2_merge_workspace(const __grid_constant__ CUt
+             for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                 mbarrier_wait(down_ready_addr + (down_stage_c) * 8, _phase_down_ready);
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+-                int down_addr = taddr + (unsigned int)(physical_feature << 16) + down_stage_c * 8;
++                int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + down_stage_c * 8;
+                 float _tmem_load_0[8];
+                 tmem_ld_x8(&_tmem_load_0[0], down_addr);
+                 asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -17147,7 +17147,7 @@ kernel_alpha_moe_nvfp4_up_split_k2_workspace(const __grid_constant__ CUtensorMap
+             mbarrier_wait(up_ready_addr, _phase_up_ready_0);
+             _phase_up_ready_0 ^= 1;
+             asm volatile("tcgen05.fence::after_thread_sync;");
+-            int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++            int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+             int up_addr = gate_addr + 8;
+             float _tmem_load_0[8];
+             tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+@@ -17771,7 +17771,7 @@ kernel_alpha_moe_nvfp4_down_split_k2_merge_workspace(const __grid_constant__ CUt
+             for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                 mbarrier_wait(down_ready_addr + (down_stage_c) * 8, _phase_down_ready);
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+-                int down_addr = taddr + (unsigned int)(physical_feature << 16) + down_stage_c * 8;
++                int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + down_stage_c * 8;
+                 float _tmem_load_0[8];
+                 tmem_ld_x8(&_tmem_load_0[0], down_addr);
+                 asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -18295,7 +18295,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
+             mbarrier_wait(up_ready_addr, _phase_up_ready_0);
+             _phase_up_ready_0 ^= 1;
+             asm volatile("tcgen05.fence::after_thread_sync;");
+-            int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++            int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+             int up_addr = gate_addr + 8;
+             float _tmem_load_0[8];
+             tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+@@ -19009,7 +19009,7 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
+             for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                 mbarrier_wait(down_ready_addr + (down_stage_c) * 8, _phase_down_ready);
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+-                int down_addr = taddr + (unsigned int)(physical_feature << 16) + down_stage_c * 8;
++                int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + down_stage_c * 8;
+                 float _tmem_load_0[8];
+                 tmem_ld_x8(&_tmem_load_0[0], down_addr);
+                 asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -19578,7 +19578,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
+             mbarrier_wait(up_ready_addr, _phase_up_ready_0);
+             _phase_up_ready_0 ^= 1;
+             asm volatile("tcgen05.fence::after_thread_sync;");
+-            int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++            int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+             int up_addr = gate_addr + 8;
+             float _tmem_load_0[8];
+             tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+@@ -20178,7 +20178,7 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
+             for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                 mbarrier_wait(down_ready_addr + (down_stage_c) * 8, _phase_down_ready);
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+-                int down_addr = taddr + (unsigned int)(physical_feature << 16) + down_stage_c * 8;
++                int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + down_stage_c * 8;
+                 float _tmem_load_0[8];
+                 tmem_ld_x8(&_tmem_load_0[0], down_addr);
+                 asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -22857,7 +22857,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
+             mbarrier_wait(up_ready_addr, _phase_up_ready_0);
+             _phase_up_ready_0 ^= 1;
+             asm volatile("tcgen05.fence::after_thread_sync;");
+-            int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++            int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+             int up_addr = gate_addr + 8;
+             float _tmem_load_0[8];
+             tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+@@ -23581,7 +23581,7 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
+                 for (int single_ob_c = blockIdx.z; single_ob_c < K / 128; single_ob_c += gridDim.z) {
+                     mbarrier_wait(down_ready_addr + (down_stage_c) * 8, _phase_down_ready);
+                     asm volatile("tcgen05.fence::after_thread_sync;");
+-                    int single_addr_c = taddr + (unsigned int)(physical_feature << 16) + down_stage_c * 8 + (unsigned int)single_slot_c;
++                    int single_addr_c = taddr + (unsigned int)((consumer_warp * 32) << 16) + down_stage_c * 8 + (unsigned int)single_slot_c;
+                     float _tmem_load_0[1];
+                     asm volatile(
+                         "tcgen05.ld.sync.aligned.32x32b.x1.b32"
+@@ -23629,7 +23629,7 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
+                 for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                     mbarrier_wait(down_ready_addr + (down_stage_c) * 8, _phase_down_ready);
+                     asm volatile("tcgen05.fence::after_thread_sync;");
+-                    int down_addr = taddr + (unsigned int)(physical_feature << 16) + down_stage_c * 8;
++                    int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + down_stage_c * 8;
+                     float _tmem_load_1[8];
+                     tmem_ld_x8(&_tmem_load_1[0], down_addr);
+                     asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -24271,7 +24271,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
+                 _phase_up_ready_0 ^= 1;
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+                 asm volatile("barrier.sync 15, 128;" ::: "memory");
+-                int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++                int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+                 int up_addr = gate_addr + 16;
+                 float _tmem_load_0[16];
+                 tmem_ld_x16(&_tmem_load_0[0], gate_addr);
+@@ -25191,7 +25191,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
+                 #pragma unroll 1
+                 for (int record_half = 0; record_half < half_count_c; record_half++) {
+                     int workspace_record_c = (original_tile_c + 2 * record_half) * gridDim.y + blockIdx.y;
+-                    int gate_addr = taddr + (unsigned int)(physical_feature << 16) + (unsigned int)(record_half * 16);
++                    int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + (unsigned int)(record_half * 16);
+                     int up_addr = gate_addr + 32;
+                     float _tmem_load_0[16];
+                     tmem_ld_x16(&_tmem_load_0[0], gate_addr);
+@@ -26165,7 +26165,7 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
+                 for (int ob_c = 0; ob_c < K / 128; ob_c++) {
+                     mbarrier_wait(output_ready_addr + (output_stage_c) * 8, _phase_output_ready);
+                     asm volatile("tcgen05.fence::after_thread_sync;");
+-                    int down_addr = taddr + (unsigned int)(physical_feature << 16) + output_stage_c * 16;
++                    int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + output_stage_c * 16;
+                     float _tmem_load_0[16];
+                     tmem_ld_x16(&_tmem_load_0[0], down_addr);
+                     asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -27882,7 +27882,7 @@ kernel_alpha_moe_nvfp4_up_split_k4_workspace(const __grid_constant__ CUtensorMap
+             mbarrier_wait(up_ready_addr, _phase_up_ready_0);
+             _phase_up_ready_0 ^= 1;
+             asm volatile("tcgen05.fence::after_thread_sync;");
+-            int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++            int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+             int up_addr = gate_addr + 8;
+             float _tmem_load_0[8];
+             tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+@@ -28400,7 +28400,7 @@ kernel_alpha_moe_nvfp4_up_split_k4_workspace(const __grid_constant__ CUtensorMap
+             mbarrier_wait(up_ready_addr, _phase_up_ready_0);
+             _phase_up_ready_0 ^= 1;
+             asm volatile("tcgen05.fence::after_thread_sync;");
+-            int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++            int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+             int up_addr = gate_addr + 8;
+             float _tmem_load_0[8];
+             tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+@@ -29264,7 +29264,7 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
+             for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                 mbarrier_wait(down_ready_addr + (down_stage_c) * 8, _phase_down_ready);
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+-                int down_addr = taddr + (unsigned int)(physical_feature << 16) + down_stage_c * 8;
++                int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + down_stage_c * 8;
+                 float _tmem_load_0[8];
+                 tmem_ld_x8(&_tmem_load_0[0], down_addr);
+                 asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -29846,7 +29846,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
+             mbarrier_wait(up_ready_addr, _phase_up_ready_0);
+             _phase_up_ready_0 ^= 1;
+             asm volatile("tcgen05.fence::after_thread_sync;");
+-            int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++            int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+             int up_addr = gate_addr + 8;
+             float _tmem_load_0[8];
+             tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+@@ -30716,7 +30716,7 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
+             for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                 mbarrier_wait(output_ready_addr + (output_stage_c) * 8, _phase_output_ready);
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+-                int down_addr = taddr + (unsigned int)(physical_feature << 16) + output_stage_c * 8;
++                int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + output_stage_c * 8;
+                 float _tmem_load_0[8];
+                 tmem_ld_x8(&_tmem_load_0[0], down_addr);
+                 asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -31430,7 +31430,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
+                     int workspace_tile_c = original_tile_c + 2 * record_half;
+                     bool record_has_upper_c = ((record_half == 0) ? pair_upper_c : second_upper_c);
+                     int live_record_subtiles_c = ((record_has_upper_c) ? 2 : 1);
+-                    int gate_addr = taddr + (unsigned int)(physical_feature << 16) + (unsigned int)(record_half * 16);
++                    int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + (unsigned int)(record_half * 16);
+                     int up_addr = gate_addr + 32;
+                     float _tmem_load_0[16];
+                     tmem_ld_x16(&_tmem_load_0[0], gate_addr);
+@@ -32322,7 +32322,7 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
+                 for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                     mbarrier_wait(output_ready_addr + (output_stage_c) * 8, _phase_output_ready);
+                     asm volatile("tcgen05.fence::after_thread_sync;");
+-                    int down_addr = taddr + (unsigned int)(physical_feature << 16) + output_stage_c * 8;
++                    int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + output_stage_c * 8;
+                     float _tmem_load_0[8];
+                     tmem_ld_x8(&_tmem_load_0[0], down_addr);
+                     asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -32975,7 +32975,7 @@ kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace(const __grid_constant
+             for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                 mbarrier_wait(down_ready_addr + (down_stage_c) * 8, _phase_down_ready);
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+-                int down_addr = taddr + (unsigned int)(physical_feature << 16) + down_stage_c * 8;
++                int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + down_stage_c * 8;
+                 float _tmem_load_0[8];
+                 tmem_ld_x8(&_tmem_load_0[0], down_addr);
+                 asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -33744,7 +33744,7 @@ kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace(const __grid_constant
+             for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                 mbarrier_wait(down_ready_addr + (down_stage_c) * 8, _phase_down_ready);
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+-                int down_addr = taddr + (unsigned int)(physical_feature << 16) + down_stage_c * 8;
++                int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + down_stage_c * 8;
+                 float _tmem_load_0[8];
+                 tmem_ld_x8(&_tmem_load_0[0], down_addr);
+                 asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -34735,7 +34735,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
+                         int workspace_tile_c = original_tile_c_1 + 2 * record_half;
+                         bool record_has_upper_c = ((record_half == 0) ? pair_upper_c_1 : second_upper_c_1);
+                         int live_record_subtiles_c = ((record_has_upper_c) ? 2 : 1);
+-                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)(physical_feature_1 << 16) + (unsigned int)(record_half * 16);
++                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)((consumer_warp_1 * 32) << 16) + (unsigned int)(record_half * 16);
+                         int up_addr = gate_addr + 32;
+                         float _tmem_load_0[16];
+                         tmem_ld_x16(&_tmem_load_0[0], gate_addr);
+@@ -35693,7 +35693,7 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
+                 for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                     mbarrier_wait(output_ready_addr + (output_stage_c) * 8, _phase_output_ready);
+                     asm volatile("tcgen05.fence::after_thread_sync;");
+-                    int down_addr = taddr + (unsigned int)(physical_feature << 16) + output_stage_c * 32;
++                    int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + output_stage_c * 32;
+                     if (live_subtiles_c >= 2) {
+                         float _tmem_load_0[16];
+                         tmem_ld_x16(&_tmem_load_0[0], down_addr);
+@@ -36696,7 +36696,7 @@ kernel_alpha_moe_nvfp4_down_workspace_c358_preparedw2_evictfirst(const __grid_co
+                 for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                     mbarrier_wait(output_ready_addr + (output_stage_c) * 8, _phase_output_ready);
+                     asm volatile("tcgen05.fence::after_thread_sync;");
+-                    int down_addr = taddr + (unsigned int)(physical_feature << 16) + output_stage_c * 32;
++                    int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + output_stage_c * 32;
+                     if (live_subtiles_c >= 2) {
+                         float _tmem_load_0[16];
+                         tmem_ld_x16(&_tmem_load_0[0], down_addr);
+@@ -37380,7 +37380,7 @@ kernel_alpha_moe_nvfp4_down_workspace_c358nd_k256panels(const __grid_constant__
+                 for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                     mbarrier_wait(output_ready_addr + (output_stage_c) * 8, _phase_output_ready);
+                     asm volatile("tcgen05.fence::after_thread_sync;");
+-                    int down_addr = taddr + (unsigned int)(physical_feature << 16) + output_stage_c * 32;
++                    int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + output_stage_c * 32;
+                     if (live_subtiles_c >= 2) {
+                         float _tmem_load_0[16];
+                         tmem_ld_x16(&_tmem_load_0[0], down_addr);
+@@ -46463,7 +46463,7 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
+             for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                 mbarrier_wait(output_ready_addr + (output_stage_c) * 8, _phase_output_ready);
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+-                int down_addr = taddr + (unsigned int)(physical_feature << 16) + output_stage_c * 8;
++                int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + output_stage_c * 8;
+                 float _tmem_load_0[8];
+                 tmem_ld_x8(&_tmem_load_0[0], down_addr);
+                 asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -47782,7 +47782,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
+                         int workspace_tile_c = original_tile_c_1 + 2 * record_half;
+                         bool record_has_upper_c = ((record_half == 0) ? pair_upper_c_1 : second_upper_c_1);
+                         int live_record_subtiles_c = ((record_has_upper_c) ? 2 : 1);
+-                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)(physical_feature_1 << 16) + (unsigned int)(record_half * 16);
++                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)((consumer_warp_1 * 32) << 16) + (unsigned int)(record_half * 16);
+                         int up_addr = gate_addr + 32;
+                         float _tmem_load_0[16];
+                         tmem_ld_x16(&_tmem_load_0[0], gate_addr);
+@@ -49742,7 +49742,7 @@ kernel_alpha_moe_nvfp4_up_workspace_readback_x8_m128(const __grid_constant__ CUt
+                         int workspace_tile_c = original_tile_c_1 + 2 * record_half;
+                         bool record_has_upper_c = ((record_half == 0) ? pair_upper_c_1 : second_upper_c_1);
+                         int live_record_subtiles_c = ((record_has_upper_c) ? 2 : 1);
+-                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)(physical_feature_1 << 16) + (unsigned int)(record_half * 16);
++                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)((consumer_warp_1 * 32) << 16) + (unsigned int)(record_half * 16);
+                         int up_addr = gate_addr + 32;
+                         float _tmem_load_0[8];
+                         tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+@@ -50954,7 +50954,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave(const __grid_con
+                     int workspace_tile_c = original_tile_c + 2 * record_half;
+                     bool record_has_upper_c = ((record_half == 0) ? pair_upper_c : second_upper_c);
+                     int live_record_subtiles_c = ((record_has_upper_c) ? 2 : 1);
+-                    int gate_addr = taddr + (unsigned int)(physical_feature << 16) + (unsigned int)(record_half * 16);
++                    int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + (unsigned int)(record_half * 16);
+                     int up_addr = gate_addr + 32;
+                     float _tmem_load_0[8];
+                     tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+@@ -52059,7 +52059,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1(const __grid_const
+                     int workspace_tile_c = original_tile_c + 2 * record_half;
+                     bool record_has_upper_c = ((record_half == 0) ? pair_upper_c : second_upper_c);
+                     int live_record_subtiles_c = ((record_has_upper_c) ? 2 : 1);
+-                    int gate_addr = taddr + (unsigned int)(physical_feature << 16) + (unsigned int)(record_half * 16);
++                    int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + (unsigned int)(record_half * 16);
+                     int up_addr = gate_addr + 32;
+                     float _tmem_load_0[8];
+                     tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+@@ -53056,7 +53056,7 @@ kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes(const __grid_constant__ CUt
+             for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                 mbarrier_wait(output_ready_addr + (output_stage_c) * 8, _phase_output_ready);
+                 asm volatile("tcgen05.fence::after_thread_sync;");
+-                int down_addr = taddr + (unsigned int)(physical_feature << 16) + output_stage_c * 8;
++                int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + output_stage_c * 8;
+                 float _tmem_load_0[8];
+                 tmem_ld_x8(&_tmem_load_0[0], down_addr);
+                 asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -53579,7 +53579,7 @@ kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b(const __grid_constan
+             mbarrier_wait(up_ready_addr, _phase_up_ready_0);
+             _phase_up_ready_0 ^= 1;
+             asm volatile("tcgen05.fence::after_thread_sync;");
+-            int gate_addr = taddr + (unsigned int)(physical_feature << 16);
++            int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16);
+             int up_addr = gate_addr + 8;
+             float _tmem_load_0[8];
+             tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+@@ -55030,7 +55030,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw
+                         int workspace_tile_c = original_tile_c + 2 * record_half;
+                         bool record_has_upper_c = ((record_half == 0) ? pair_upper_c : second_upper_c);
+                         int live_record_subtiles_c = ((record_has_upper_c) ? 2 : 1);
+-                        int gate_addr = taddr + (unsigned int)(physical_feature << 16) + (unsigned int)(record_half * 16);
++                        int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + (unsigned int)(record_half * 16);
+                         float _tmem_load_0[8];
+                         tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+                         asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -56489,7 +56489,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw
+                         int workspace_tile_c = original_tile_c + 2 * record_half;
+                         bool record_has_upper_c = ((record_half == 0) ? pair_upper_c : second_upper_c);
+                         int live_record_subtiles_c = ((record_has_upper_c) ? 2 : 1);
+-                        int gate_addr = taddr + (unsigned int)(physical_feature << 16) + (unsigned int)(record_half * 16);
++                        int gate_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + (unsigned int)(record_half * 16);
+                         float _tmem_load_0[8];
+                         tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+                         asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -57324,7 +57324,7 @@ kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v7fitz(const __g
+                 for (int ob_c = z_item_c; ob_c < K / 128; ob_c += z_eff_c) {
+                     mbarrier_wait(output_ready_addr + (output_stage_c) * 8, _phase_output_ready);
+                     asm volatile("tcgen05.fence::after_thread_sync;");
+-                    int down_addr = taddr + (unsigned int)(physical_feature << 16) + output_stage_c * 8;
++                    int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + output_stage_c * 8;
+                     float _tmem_load_0[8];
+                     tmem_ld_x8(&_tmem_load_0[0], down_addr);
+                     asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -58288,7 +58288,7 @@ kernel_alpha_moe_nvfp4_down_c360_preparedw2_evictfirst(const __grid_constant__ C
+                 for (int ob_c = blockIdx.z; ob_c < K / 128; ob_c += gridDim.z) {
+                     mbarrier_wait(output_ready_addr + (output_stage_c) * 8, _phase_output_ready);
+                     asm volatile("tcgen05.fence::after_thread_sync;");
+-                    int down_addr = taddr + (unsigned int)(physical_feature << 16) + output_stage_c * 8;
++                    int down_addr = taddr + (unsigned int)((consumer_warp * 32) << 16) + output_stage_c * 8;
+                     float _tmem_load_0[8];
+                     tmem_ld_x8(&_tmem_load_0[0], down_addr);
+                     asm volatile("tcgen05.wait::ld.sync.aligned;");
+@@ -59184,7 +59184,7 @@ kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_c340el_evictlast_w1(const __gri
+                         int workspace_tile_c = original_tile_c_1 + 2 * record_half;
+                         bool record_has_upper_c = ((record_half == 0) ? pair_upper_c_1 : second_upper_c_1);
+                         int live_record_subtiles_c = ((record_has_upper_c) ? 2 : 1);
+-                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)(physical_feature_1 << 16) + (unsigned int)(record_half * 16);
++                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)((consumer_warp_1 * 32) << 16) + (unsigned int)(record_half * 16);
+                         int up_addr = gate_addr + 32;
+                         float _tmem_load_0[16];
+                         tmem_ld_x16(&_tmem_load_0[0], gate_addr);
+@@ -61233,7 +61233,7 @@ kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_c340sr_selfroute(const __grid_c
+                         int workspace_tile_c = original_tile_c + 2 * record_half;
+                         bool record_has_upper_c = ((record_half == 0) ? pair_upper_c_1 : second_upper_c_1);
+                         int live_record_subtiles_c = ((record_has_upper_c) ? 2 : 1);
+-                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)(physical_feature_1 << 16) + (unsigned int)(record_half * 16);
++                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)((consumer_warp_1 * 32) << 16) + (unsigned int)(record_half * 16);
+                         int up_addr = gate_addr + 32;
+                         float _tmem_load_0[16];
+                         tmem_ld_x16(&_tmem_load_0[0], gate_addr);
+@@ -62248,7 +62248,7 @@ kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_m128_c336el_evictlast_w1(const
+                         int workspace_tile_c = original_tile_c_1 + 2 * record_half;
+                         bool record_has_upper_c = ((record_half == 0) ? pair_upper_c_1 : second_upper_c_1);
+                         int live_record_subtiles_c = ((record_has_upper_c) ? 2 : 1);
+-                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)(physical_feature_1 << 16) + (unsigned int)(record_half * 16);
++                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)((consumer_warp_1 * 32) << 16) + (unsigned int)(record_half * 16);
+                         int up_addr = gate_addr + 32;
+                         float _tmem_load_0[8];
+                         tmem_ld_x8(&_tmem_load_0[0], gate_addr);
+@@ -64300,7 +64300,7 @@ kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_m128_c336sr_selfroute(const __g
+                         int workspace_tile_c = original_tile_c + 2 * record_half;
+                         bool record_has_upper_c = ((record_half == 0) ? pair_upper_c_1 : second_upper_c_1);
+                         int live_record_subtiles_c = ((record_has_upper_c) ? 2 : 1);
+-                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)(physical_feature_1 << 16) + (unsigned int)(record_half * 16);
++                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)((consumer_warp_1 * 32) << 16) + (unsigned int)(record_half * 16);
+                         int up_addr = gate_addr + 32;
+                         float _tmem_load_0[8];
+                         tmem_ld_x8(&_tmem_load_0[0], gate_addr);
