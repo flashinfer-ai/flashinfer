@@ -1011,6 +1011,89 @@ def test_fused_add_rmsnorm_fp8_block_quant(batch_size, hidden_size, dtype, enabl
     )
 
 
+@pytest.mark.parametrize("batch_size", [1, 19, 989])
+@pytest.mark.parametrize("hidden_size", [1280, 4096, 7168, 16384])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("scale_ue8m0", [False, True])
+def test_fused_add_rmsnorm_fp8_block_quant_formats(
+    batch_size, hidden_size, dtype, scale_ue8m0
+):
+    # Packed UE8M0 scales and a skipped normed_out must be exact transforms of the fp32-scale call:
+    # same normalization, deep_gemm's ceil_to_ue8m0 + byte packing, and no other output changes.
+    eps = 1e-6
+    x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda") * 0.1
+    residual = torch.randn_like(x) * 0.1
+    weight = torch.randn(hidden_size, dtype=dtype, device="cuda")
+    m_pad = (batch_size + 3) & ~3
+    num_blocks = hidden_size // 128
+
+    def run(scale_dtype, with_normed):
+        out = torch.empty(
+            batch_size, hidden_size, dtype=torch.float8_e4m3fn, device="cuda"
+        )
+        rows = (num_blocks + 3) // 4 if scale_dtype == torch.int32 else num_blocks
+        # -1 poisons the bytes the kernel must zero past the last block of a packed row.
+        block_scale = torch.full((rows, m_pad), -1, dtype=scale_dtype, device="cuda")
+        normed_out = torch.empty_like(x) if with_normed else None
+        res = residual.clone()
+        flashinfer.norm.fused_add_rmsnorm_fp8_block_quant(
+            out, block_scale, normed_out, x, res, weight, eps
+        )
+        return out.view(torch.uint8), block_scale.t()[:batch_size], normed_out, res
+
+    _, _, normed_ref, res_ref = run(torch.float32, True)
+    scale_dtype = torch.int32 if scale_ue8m0 else torch.float32
+    out_a, scale_a, normed_a, res_a = run(scale_dtype, True)
+    out_b, scale_b, normed_b, res_b = run(scale_dtype, False)
+    assert normed_b is None
+    assert torch.equal(out_a, out_b)
+    assert torch.equal(scale_a, scale_b)
+    assert torch.equal(res_a, res_b)
+    assert torch.equal(normed_a, normed_ref)
+    assert torch.equal(res_a, res_ref)
+    if not scale_ue8m0:
+        return
+
+    blocks = normed_ref.float().view(batch_size, num_blocks, 128)
+    bits = (blocks.abs().amax(-1).clamp_min(1e-4) / 448.0).view(torch.int32)
+    exponent = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).int()
+    q_ref = blocks * torch.exp2(127.0 - exponent.float()).unsqueeze(-1)
+    q_ref = q_ref.to(torch.float8_e4m3fn).view(batch_size, hidden_size)
+    assert torch.equal(out_a, q_ref.view(torch.uint8))
+    packed_ref = torch.zeros(
+        batch_size, scale_a.size(1) * 4, dtype=torch.uint8, device="cuda"
+    )
+    packed_ref[:, :num_blocks] = exponent.to(torch.uint8)
+    assert torch.equal(scale_a.contiguous(), packed_ref.view(torch.int32))
+
+
+def test_fused_add_rmsnorm_fp8_block_quant_ue8m0_inf_block():
+    # An fp16 normed value that overflows to inf must not produce the E8M0 NaN code (255) or a
+    # negative inverse scale: the scale byte saturates at 254 and the fp8 output of that block
+    # matches the fp32-scale call.
+    batch_size, hidden_size = 4, 1024
+    x = torch.randn(batch_size, hidden_size, dtype=torch.float16, device="cuda")
+    residual = torch.zeros_like(x)
+    weight = torch.full((hidden_size,), 3e4, dtype=torch.float16, device="cuda")
+    m_pad = (batch_size + 3) & ~3
+    outs = []
+    for scale_dtype, rows in ((torch.float32, 8), (torch.int32, 2)):
+        out = torch.empty(
+            batch_size, hidden_size, dtype=torch.float8_e4m3fn, device="cuda"
+        )
+        block_scale = torch.empty(rows, m_pad, dtype=scale_dtype, device="cuda")
+        normed = torch.empty_like(x)
+        flashinfer.norm.fused_add_rmsnorm_fp8_block_quant(
+            out, block_scale, normed, x, residual.clone(), weight
+        )
+        outs.append(out.view(torch.uint8).view(batch_size, 8, 128))
+    inf_blocks = normed.view(batch_size, 8, 128).isinf().any(-1)
+    assert inf_blocks.any()
+    exponents = block_scale.t()[:batch_size].contiguous().view(torch.uint8)
+    assert (exponents[inf_blocks] == 254).all()
+    assert torch.equal(outs[0][inf_blocks], outs[1][inf_blocks])
+
+
 @pytest.mark.parametrize("hidden_size", [1152, 32768])
 def test_fused_add_rmsnorm_fp8_block_quant_rejects_unsupported_hidden(hidden_size):
     # single-wave contract: hidden_size must be <= 16384 and a multiple of 32*vec_size
@@ -1038,6 +1121,10 @@ def test_fused_add_rmsnorm_fp8_block_quant_rejects_unsupported_hidden(hidden_siz
         "out_shape",
         "block_scale_dtype",
         "block_scale_stride",
+        "block_scale_ue8m0_shape",
+        "block_scale_ue8m0_floor_rows",
+        "block_scale_overlapping_rows",
+        "block_scale_ue8m0_padded_pitch",
         "normed_out_dtype",
     ],
 )
@@ -1045,7 +1132,10 @@ def test_fused_add_rmsnorm_fp8_block_quant_rejects_bad_outputs(bad):
     # The kernel reinterprets the output buffers with fixed types (e4m3 out, fp32 block_scale,
     # input-dtype normed_out) and indexes block_scale unit-stride along m, so each of these would
     # silently corrupt memory without a host-side check.
-    batch_size, hidden_size = 64, 1024
+    batch_size, hidden_size = (
+        64,
+        1280,
+    )  # 10 blocks: packed UE8M0 needs ceil(10 / 4) = 3 rows
     dtype = torch.bfloat16
     x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
     residual = torch.randn_like(x)
@@ -1068,6 +1158,19 @@ def test_fused_add_rmsnorm_fp8_block_quant_rejects_bad_outputs(bad):
         block_scale = torch.empty(
             m_pad, hidden_size // 128, dtype=torch.float32, device="cuda"
         ).t()
+    elif bad == "block_scale_ue8m0_shape":
+        # packed UE8M0 holds four blocks per int32, so the fp32 row count is too large
+        block_scale = block_scale.view(torch.int32)
+    elif bad == "block_scale_ue8m0_floor_rows":
+        block_scale = torch.empty(
+            hidden_size // 512, m_pad, dtype=torch.int32, device="cuda"
+        )
+    elif bad == "block_scale_overlapping_rows":
+        block_scale = block_scale.as_strided(block_scale.shape, (m_pad // 2, 1))
+    elif bad == "block_scale_ue8m0_padded_pitch":
+        block_scale = torch.empty(3, m_pad + 4, dtype=torch.int32, device="cuda")[
+            :, :m_pad
+        ]
     elif bad == "normed_out_dtype":
         normed_out = normed_out.to(torch.float32)
 
