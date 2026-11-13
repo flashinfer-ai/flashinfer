@@ -27,6 +27,8 @@ namespace routingCustom {
 // type is not part of the mangled name, so a mismatch would silently be UB).
 bool launchBlockKernel(Data const& data, void* stream);
 bool launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
+bool launchBlockPermutationKernel(Data const& data, void* stream);
+bool launchSmallClusterPermutationKernel(Data const& data, void* stream);
 bool launchClusterKernel(Data const& data, void* stream);
 void launchCoopKernel(Data const& data, int numBlocksCoop, uint32_t numThreadsHist, void* stream);
 void launchInitExpertCounts(Data const& data, uint32_t numThreadsHist, void* stream);
@@ -37,6 +39,19 @@ void launchOffsetsKernel(Data const& data, int numBlocksOffsets, uint32_t numThr
 }  // namespace routingCustom
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Token count up to which the single-cluster permutation beats the cooperative kernel.
+static constexpr int32_t MaxNumTokensSingleClusterWithCoop = 4096;
+
+// Token count up to which one CTA permutes the expanded indexes faster than a cluster, whose
+// barriers and distributed shared memory reads cost more than the extra work per thread.
+static constexpr int32_t MaxNumTokensBlockPermutation = 256;
+// Above, up to this many precomputed tokens go to the NumBlocksPerSmallCluster-CTA cluster,
+// whose histogram exchange is cheaper than the full cluster's.
+static constexpr int32_t MaxNumTokensSmallClusterPermutation = 3072;
+// Token count up to which the single-block kernels, which let the next kernel launch while they
+// run, beat the single-CTA permutation.
+static constexpr int32_t MaxNumTokensSingleBlockOverBlockPermutation = 8;
 
 // Implementation of shared post-topK pipeline for all routing methods.
 // When topK is already computed (mPtrTopKIds or mPtrTopKPacked), we don't need
@@ -84,11 +99,40 @@ void runPostTopKPipeline(DataType const& data, void* stream) {
   // runPostTopKPipeline only handles pre-computed topK (mPtrTopKIds or mPtrTopKPacked),
   // never raw scores. The cluster kernel's routingPermutation uses thread-per-expanded-index
   // for both input types (LoadExpertIdxFromGlobal=true), so the capacity is
-  // NumBlocksPerCluster * NumThreads = 8192 tokens.
-  bool const useSingleCluster =
-      (smMajor >= 9) && (data.mNumTokens <= routingCustom::MaxNumTokensSingleCluster);
+  // NumBlocksPerCluster * NumThreads = 8192 tokens. Past MaxNumTokensSingleClusterWithCoop
+  // tokens the cooperative kernel, which spreads the permutation over all SMs, is faster.
+  // Requires SM90+ (grid-sync), numExperts <= 1024.
+  // Note: NumTop8Experts is used for template instantiation but does NOT limit runtime topK —
+  // the coop kernel uses hardcoded MaxExpandedIdxPerThread=64 and runtime params.mTopK.
+  bool const canUseCoop = (smMajor >= 9) && (data.mNumExperts <= 1024) &&
+                          (data.mPtrPermutedIdxSize != nullptr) &&
+                          (data.mPtrExpertCounts != nullptr);
+  int32_t const maxNumTokensSingleCluster =
+      canUseCoop ? MaxNumTokensSingleClusterWithCoop : routingCustom::MaxNumTokensSingleCluster;
+  bool const useSingleCluster = (smMajor >= 9) && (data.mNumTokens <= maxNumTokensSingleCluster);
+  bool const useSingleBlock = useStaticBlock || useDynBlock;
+  bool const useBlockPermutation =
+      (smMajor >= 9) && (data.mNumTokens <= MaxNumTokensBlockPermutation) &&
+      (data.mNumTokens > MaxNumTokensSingleBlockOverBlockPermutation || !useSingleBlock);
 
-  if (useDynBlock) {
+  bool const useSmallClusterPermutation = (smMajor >= 9) &&
+                                          (data.mNumTokens > MaxNumTokensBlockPermutation) &&
+                                          (data.mNumTokens <= MaxNumTokensSmallClusterPermutation);
+  if (useSmallClusterPermutation) {
+    bool const launched = routingCustom::launchSmallClusterPermutationKernel(customData, stream);
+    FLASHINFER_CHECK(
+        launched, "runPostTopKPipeline: no compiled tier covers numExperts=", data.mNumExperts,
+        " topK=", data.mTopK,
+        " for the post-topK permutation (small-cluster path). Add a matching Tier<E, K> to "
+        "PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> in RoutingCustomPolicy.cuh.");
+  } else if (useBlockPermutation) {
+    bool const launched = routingCustom::launchBlockPermutationKernel(customData, stream);
+    FLASHINFER_CHECK(
+        launched, "runPostTopKPipeline: no compiled tier covers numExperts=", data.mNumExperts,
+        " topK=", data.mTopK,
+        " for the post-topK permutation (block path). Add a matching Tier<E, K> to "
+        "PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> in RoutingCustomPolicy.cuh.");
+  } else if (useDynBlock) {
     bool const launched = routingCustom::launchDynBlockKernel(customData, numThreadsHist, stream);
     FLASHINFER_CHECK(
         launched, "runPostTopKPipeline: no compiled tier covers numExperts=", data.mNumExperts,
@@ -111,13 +155,6 @@ void runPostTopKPipeline(DataType const& data, void* stream) {
                      "Tier<E, K> to (Cluster)PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> in "
                      "RoutingCustomPolicy.cuh.");
   } else {
-    // Check if we can use the coop path (more efficient for medium token counts)
-    // Requires SM90+ (grid-sync), numExperts <= 1024.
-    // Note: NumTop8Experts is used for template instantiation but does NOT limit runtime topK —
-    // the coop kernel uses hardcoded MaxExpandedIdxPerThread=64 and runtime params.mTopK.
-    bool const canUseCoop = (smMajor >= 9) && (data.mNumExperts <= 1024) &&
-                            (data.mPtrPermutedIdxSize != nullptr) &&
-                            (data.mPtrExpertCounts != nullptr);
     bool useCoop = false;
     CoopLaunchSMCounts coopLaunchSMCounts{0, 0};
     int numBlocksCoop = 0;
