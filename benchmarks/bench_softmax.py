@@ -17,9 +17,12 @@ from flashinfer.testing.utils import bench_gpu_time
 def benchmark_torch_softmax(logits: torch.Tensor) -> float:
     """Benchmark torch's native softmax."""
     measurements = bench_gpu_time(
-        lambda: torch.softmax(logits, dim=-1),
+        lambda x: torch.softmax(x, dim=-1),
         dry_run_time_ms=100,
         repeat_time_ms=1000,
+        input_args=(logits,),
+        enable_cupti=True,
+        use_cuda_graph=True,
     )
     return np.median(measurements)
 
@@ -27,10 +30,15 @@ def benchmark_torch_softmax(logits: torch.Tensor) -> float:
 @torch.inference_mode()
 def benchmark_flashinfer_softmax(logits: torch.Tensor) -> float:
     """Benchmark flashinfer's softmax."""
+    # PDL is off so that each call is timed alone; in a graph, PDL also overlaps the
+    # prologue of the split path's second kernel with the end of the first.
     measurements = bench_gpu_time(
-        lambda: flashinfer.sampling.softmax(logits, temperature=None, enable_pdl=False),
+        lambda x: flashinfer.sampling.softmax(x, temperature=None, enable_pdl=False),
         dry_run_time_ms=100,
         repeat_time_ms=1000,
+        input_args=(logits,),
+        enable_cupti=True,
+        use_cuda_graph=True,
     )
     return np.median(measurements)
 

@@ -1621,8 +1621,97 @@ def test_softmax_split_output_overlap(offset):
             softmax(workspace, logits, output, None, 1.0, False)
 
 
-# Batches of at most 128 rows with a vocabulary of at least 24576 take the vocab-splitting
-# map-reduce kernels; the rest take the fused kernel.
+# Vocabularies of at least 24576 split each row over up to 32 CTAs while batch_size * slices
+# fits in two CTAs per SM; odd vocabularies give single-element vectors and an unaligned last
+# slice, and the masks leave whole slices (or whole rows but one token) at -inf.
+@pytest.mark.parametrize("batch_size", [1, 3, 17, 64])
+@pytest.mark.parametrize("vocab_size", [24576, 32001, 128256, 151937])
+@pytest.mark.parametrize("mask", ["none", "slices", "one_token", "random"])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_softmax_split_corner_cases(batch_size, vocab_size, mask, enable_pdl):
+    torch.manual_seed(batch_size * vocab_size)
+    if enable_pdl and not device_support_pdl(torch.device("cuda")):
+        pytest.skip("PDL not supported on this device")
+    logits = torch.randn(batch_size, vocab_size, device="cuda") * 5
+    if mask == "slices":
+        # Mask a prefix that covers many whole slices, so most partials are empty.
+        keep = torch.randint(1, vocab_size // 4, (batch_size, 1), device="cuda")
+        cols = torch.arange(vocab_size, device="cuda")
+        logits.masked_fill_(cols < vocab_size - keep, float("-inf"))
+    elif mask == "one_token":
+        token = torch.randint(0, vocab_size, (batch_size,), device="cuda")
+        kept = logits.gather(1, token[:, None])
+        logits.fill_(float("-inf")).scatter_(1, token[:, None], kept)
+    elif mask == "random":
+        logits.masked_fill_(torch.rand_like(logits) < 0.9, float("-inf"))
+        logits[:, 0] = 0.0  # keep every row finite somewhere
+    temperature = torch.rand(batch_size, device="cuda") * 2 + 0.05
+    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+    # Call the OnlineSoftmax module directly: the public API routes to other kernels on Blackwell.
+    softmax = flashinfer.sampling.get_sampling_module().softmax
+
+    probs = softmax(workspace, logits, temperature, 0.0, enable_pdl)
+    expected = torch.softmax(logits / temperature[:, None], dim=-1)
+    torch.testing.assert_close(probs, expected, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(
+        probs.sum(-1), torch.ones(batch_size, device="cuda"), atol=1e-4, rtol=0
+    )
+
+    # Scalar temperature, and replays of a captured graph with new inputs.
+    probs = softmax(workspace, logits, None, 0.7, enable_pdl)
+    torch.testing.assert_close(
+        probs, torch.softmax(logits / 0.7, dim=-1), atol=1e-5, rtol=1e-4
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_probs = softmax(workspace, logits, temperature, 0.0, enable_pdl)
+    for _ in range(2):
+        logits.copy_(logits.roll(1, dims=-1))
+        temperature.copy_(temperature.roll(1))
+        graph.replay()
+        expected = torch.softmax(logits / temperature[:, None], dim=-1)
+        torch.testing.assert_close(graph_probs, expected, atol=1e-5, rtol=1e-4)
+
+
+# Powers of two from 1 to 512 rows cross every slice count the heuristic picks, from 32
+# down to the fused kernel, on any GPU.
+@pytest.mark.parametrize("batch_size", [2**i for i in range(10)])
+@pytest.mark.parametrize("vocab_size", [24576, 32000, 64000, 128000, 256000])
+@pytest.mark.parametrize("temperature", [0.5, 1.0, 2.0])
+def test_softmax_split_slice_counts(batch_size, vocab_size, temperature):
+    if batch_size * vocab_size > 2**26:
+        pytest.skip("skip the largest shapes to keep the sweep quick")
+    torch.manual_seed(batch_size + vocab_size)
+    logits = torch.randn(batch_size, vocab_size, device="cuda")
+    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+    softmax = flashinfer.sampling.get_sampling_module().softmax
+    probs = softmax(workspace, logits, None, temperature, False)
+    expected = torch.softmax(logits / temperature, dim=-1)
+    torch.testing.assert_close(probs, expected, atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("vocab_size", [24576, 151937])
+def test_softmax_split_extreme_logits(vocab_size):
+    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+    softmax = flashinfer.sampling.get_sampling_module().softmax
+    logits = torch.full((5, vocab_size), -20.0, device="cuda")
+    logits[0, -1] = 42.0  # a single dominant token in the last slice
+    logits[1] = float("-inf")  # an all -inf row is NaN, as in torch
+    logits[2, 0] = float("inf")  # a +inf logit is NaN, as in torch
+    logits[3] = torch.linspace(-3e38, 3e38, vocab_size, device="cuda")
+    # 1 ULP of a ~1e10 logit is a large exponent: the max element must still get exactly 0.
+    logits[4] = torch.randn(vocab_size, device="cuda") * 1e10
+    for temperature in (1.0, 0.001):
+        probs = softmax(workspace, logits, None, temperature, False)
+        expected = torch.softmax(logits / temperature, dim=-1)
+        torch.testing.assert_close(
+            probs, expected, atol=1e-5, rtol=1e-4, equal_nan=True
+        )
+        assert probs[0].max().item() <= 1.0
+
+
+# Vocabularies of at least 24576 take the vocab-splitting map-reduce kernels when the batch is
+# small enough; the rest take the fused kernel.
 @pytest.mark.parametrize("batch_size,vocab_size", [(128, 4096), (4, 32768)])
 def test_softmax_pdl_waits_for_temperature(batch_size, vocab_size):
     logits = torch.randn(batch_size, vocab_size, device="cuda")
