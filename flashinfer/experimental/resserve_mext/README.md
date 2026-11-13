@@ -32,3 +32,7 @@ pytest tests/experimental/test_resserve_mext.py
 
 Ported from [ResServe commit 51b9068](https://github.com/ShawRong/resserve/commit/51b906836a69fa43915040314df57bc9f23030ad).
 Original copyright and license notices are retained in the source files.
+
+- `csrc/common/fold/sm10x/{host,kernel_sm100_fold}.py`: Fold GEMM host and kernel.
+- `csrc/nvfp4/cuda/nvfp4_quant_kernels.cu`: row-pair activation quantizer.
+- `csrc/common/fp4/nvfp4_utils.cuh`: shared FP4 quantization helpers.

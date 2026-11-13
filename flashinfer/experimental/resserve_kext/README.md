@@ -35,3 +35,8 @@ pytest tests/experimental/test_resserve_kext.py
 
 Ported from [ResServe commit 51b9068](https://github.com/ShawRong/resserve/commit/51b906836a69fa43915040314df57bc9f23030ad).
 Original copyright and license notices are retained in the source files.
+
+- `csrc/nvfp4/quant.py` and `csrc/nvfp4/cuda/nvfp4_quant_entry.cu`: allocation
+  and pack dispatch.
+- `csrc/nvfp4/cuda/nvfp4_residue_pack{8,16}.cu`: selected-channel residue packing.
+- `csrc/common/fp4/nvfp4_utils.cuh`: shared FP4 quantization helpers.
