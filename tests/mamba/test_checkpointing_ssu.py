@@ -128,14 +128,16 @@ def _pdl_supported() -> bool:
 
 
 def _skip_without_pdl() -> None:
-    """Skip the calling test when the current device lacks PDL support."""
+    """Skip the calling test when the device cannot run the split."""
     if not _pdl_supported():
-        pytest.skip("checkpointing_ssu PDL requires a PDL-capable (SM90+) device")
+        pytest.skip(
+            "checkpointing_ssu two-kernel split requires a PDL-capable (SM90+) device"
+        )
 
 
 requires_pdl = pytest.mark.skipif(
     not _pdl_supported(),
-    reason="checkpointing_ssu PDL requires a PDL-capable (SM90+) device",
+    reason="checkpointing_ssu two-kernel split requires a PDL-capable (SM90+) device",
 )
 
 
@@ -1442,7 +1444,6 @@ def test_two_kernel_f32_mixed_batch():
     _run_two_kernel_state_dtype_case(torch.float32, 0, batch=64, k_cases=("mixed",))
 
 
-@requires_pdl
 def test_checkpointing_ssu_pdl_bf16():
     """PDL smoke: bf16 state.  Runs the kernel twice on the same inputs —
     once with enable_pdl=False, once with True — and asserts the outputs and
@@ -1539,7 +1540,6 @@ def test_checkpointing_ssu_pdl_bf16():
     not is_cvt_rs_supported(),
     reason=f"fp8 + Philox SR requires HW cvt.rs on one of: {cvt_rs_supported_arches_text()}",
 )
-@requires_pdl
 def test_checkpointing_ssu_pdl_fp8_philox5():
     """PDL smoke: fp8 e4m3 state + Philox-5 SR.  Same as the bf16 PDL test
     but exercises the int8/fp8 kernel binary (`checkpointing_ssu_kernel_8bit`)

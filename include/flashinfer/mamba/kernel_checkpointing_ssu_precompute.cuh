@@ -346,7 +346,7 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
 
   // ── INTERNAL PDL (precompute → main): UNCONDITIONAL — the split's mechanism,
-  cudaTriggerProgrammaticLaunchCompletion();  // main may co-launch now
+  ssu_grid_dependency_launch();  // main may co-launch now (SM90+; stripped below)
 
   // ── Grid (batch, ngroups, head_tiles) ──
   int const seq = blockIdx.x;
@@ -401,7 +401,7 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
     load_phase1_coeffs<dt_t, weight_t, matrixA_t, NPREDICTED, MAX_WINDOW, HEADS_PER_CTA, NUM_WARPS>(
         smem, params, warp, lane, first_head, seq_len, outer, seq, cache_slot, ring_start,
         must_checkpoint, prev_k);
-    cudaGridDependencySynchronize();
+    ssu_grid_dependency_wait();
   }
 
   // ── Load this group's C (W0-3 — the matmul warps; A-operand of both C·B and
