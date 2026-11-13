@@ -6,7 +6,8 @@ sources are exported under `src/{common,sources}/`, with lazy entry points in
 `common` modules.
 
 Make kernel changes in the provider before regenerating the export. Preserve
-the changes recorded in `VENDOR.md`, apply the recorded release transformations
-and verify `export_manifest.json`. Run the affected adapter, numerical and graph
-replay tests. Use `TUNING.md` for paired performance comparisons and keep
+the changes recorded in `VENDOR.md`, use the provider's release process and
+verify `export_manifest.json`. Export and release tools are not included in this
+snapshot. Run the affected adapter, numerical and graph-replay tests.
+Use `TUNING.md` for paired performance comparisons and keep
 measurement artifacts outside the source tree.
