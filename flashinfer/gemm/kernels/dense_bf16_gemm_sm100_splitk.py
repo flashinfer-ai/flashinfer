@@ -22,6 +22,11 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
+
+from ...jit.cute_dsl_core import (
+    build_and_load_cute_dsl_kernel,
+    compile_option_kwargs,
+)
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from flashinfer.gemm.kernels.dense_bf16_gemm_warp_splitk import (
@@ -1169,6 +1174,41 @@ def _to_cute_swap(a, b, out, bias):
     )
 
 
+def _splitk_form(
+    device_index: int,
+    dtype,
+    tactic: SplitKTactic,
+    use_pdl: bool,
+    has_bias: bool,
+    leading_dims: tuple[int, int, int],
+):
+    name = (
+        f"{str(dtype).removeprefix('torch.')}_m{tactic.mma_m}_n{tactic.mma_n}"
+        f"_s{tactic.split_k}_a{tactic.ab_stages}_pdl{int(use_pdl)}"
+        f"_b{int(has_bias)}_l{'x'.join(map(str, leading_dims))}"
+    )
+
+    def compile_fn():
+        with _torch.cuda.device(device_index):
+            compile_tensors = _make_compile_repr_tensors(
+                dtype, has_bias, *leading_dims
+            )
+            return cute_ext.compile(
+                _bmm_bias if has_bias else _bmm_no_bias,
+                SplitKDenseGemmKernel(
+                    tactic=tactic,
+                    use_pdl=use_pdl,
+                    has_bias=has_bias,
+                    arch=_arch(device_index),
+                ),
+                *(compile_tensors if has_bias else compile_tensors[:3]),
+                _cuda.CUstream(_torch.cuda.current_stream().cuda_stream),
+                **compile_option_kwargs(),
+            )
+
+    return "dense_bf16_gemm_sm100_splitk", name, compile_fn
+
+
 @functools.cache
 def _get_compiled_splitk_kernel(
     device_index: int,
@@ -1183,19 +1223,16 @@ def _get_compiled_splitk_kernel(
             f"split-K dense GEMM supports {_SUPPORTED_TORCH_DTYPES}; got {dtype}"
         )
 
-    with _torch.cuda.device(device_index):
-        compile_tensors = _make_compile_repr_tensors(dtype, has_bias, *leading_dims)
-        return cute_ext.compile(
-            _bmm_bias if has_bias else _bmm_no_bias,
-            SplitKDenseGemmKernel(
-                tactic=tactic,
-                use_pdl=use_pdl,
-                has_bias=has_bias,
-                arch=_arch(device_index),
-            ),
-            *(compile_tensors if has_bias else compile_tensors[:3]),
-            _cuda.CUstream(_torch.cuda.current_stream().cuda_stream),
-        )
+    module_name, name, compile_fn = _splitk_form(
+        device_index, dtype, tactic, use_pdl, has_bias, leading_dims
+    )
+    return build_and_load_cute_dsl_kernel(
+        module_name,
+        name,
+        compile_fn,
+        extra_key_files=(__file__,),
+        enable_tvm_ffi=False,
+    )
 
 
 def _validate_runtime_tensors(a, b, bias, out) -> tuple[int, int, int]:

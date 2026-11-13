@@ -22,6 +22,8 @@ from cutlass import const_expr
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.runtime import from_dlpack
 
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel, gpu_arch_options
+
 _VECTOR_WIDTH = 8
 _SUPPORTED_BLOCK_SIZES = (32, 64, 96, 128, 192, 256, 384)
 _SUPPORTED_OUTPUTS_PER_BLOCK = (1, 2, 4)
@@ -335,6 +337,36 @@ def _make_compile_repr_tensors(dtype, rows_per_block: int, n: int, k: int):
     )
 
 
+def _direct_form(
+    device_index: int,
+    dtype,
+    n: int,
+    k: int,
+    tactic: DirectTactic,
+    use_pdl: bool,
+):
+    name = (
+        f"n{n}_k{k}_b{tactic.block_size}_o{tactic.outputs_per_block}"
+        f"_r{tactic.rows_per_block}_pdl{int(use_pdl)}"
+    )
+
+    def compile_fn():
+        with _torch.cuda.device(device_index):
+            return cute_ext.compile(
+                DirectDenseGemmKernel(
+                    element_type=cutlass.BFloat16,
+                    k_extent=k,
+                    tactic=tactic,
+                    use_pdl=use_pdl,
+                ),
+                *_make_compile_repr_tensors(dtype, tactic.rows_per_block, n, k),
+                _cuda.CUstream(_torch.cuda.current_stream().cuda_stream),
+                options=" ".join(filter(None, (_COMPILE_OPTIONS, gpu_arch_options()))),
+            )
+
+    return "dense_bf16_gemm_direct", name, compile_fn
+
+
 @functools.cache
 def _get_compiled_direct_kernel(
     device_index: int,
@@ -347,18 +379,16 @@ def _get_compiled_direct_kernel(
     if dtype != _torch.bfloat16:
         raise ValueError(f"direct GEMM supports BF16; got {dtype}")
 
-    with _torch.cuda.device(device_index):
-        return cute_ext.compile(
-            DirectDenseGemmKernel(
-                element_type=cutlass.BFloat16,
-                k_extent=k,
-                tactic=tactic,
-                use_pdl=use_pdl,
-            ),
-            *_make_compile_repr_tensors(dtype, tactic.rows_per_block, n, k),
-            _cuda.CUstream(_torch.cuda.current_stream().cuda_stream),
-            options=_COMPILE_OPTIONS,
-        )
+    module_name, name, compile_fn = _direct_form(
+        device_index, dtype, n, k, tactic, use_pdl
+    )
+    return build_and_load_cute_dsl_kernel(
+        module_name,
+        name,
+        compile_fn,
+        extra_key_files=(__file__,),
+        enable_tvm_ffi=False,
+    )
 
 
 def _validate_runtime_tensors(a, b, out, tactic: DirectTactic):

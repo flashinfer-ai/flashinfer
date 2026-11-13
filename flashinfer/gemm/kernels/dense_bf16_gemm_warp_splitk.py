@@ -22,6 +22,11 @@ from cutlass.cute.nvgpu import warp
 from cutlass.cute.runtime import from_dlpack
 from cutlass.utils.distributed import multimem_st_4xb32
 
+from ...jit.cute_dsl_core import (
+    build_and_load_cute_dsl_kernel,
+    compile_option_kwargs,
+)
+
 _MMA_SHAPE = (16, 8, 16)
 _COMPUTE_WARPS = 4
 _A_LOADER_WARPS = 2
@@ -1173,6 +1178,44 @@ def _from_dlpack(tensor: _torch.Tensor, *, dynamic_m: bool = False):
     return tensor
 
 
+def _warp_form(
+    device_index: int,
+    dtype,
+    n: int,
+    k: int,
+    tactic: WarpSplitKTactic,
+    use_pdl: bool,
+    has_bias: bool,
+):
+    name = (
+        f"{str(dtype).removeprefix('torch.')}_n{n}_k{k}_o{tactic.output_tile}"
+        f"_t{tactic.token_tile}_k{tactic.k_tile}_s{tactic.stages}"
+        f"_w{tactic.b_loader_warps}_pdl{int(use_pdl)}_b{int(has_bias)}"
+    )
+
+    def compile_fn():
+        with _torch.cuda.device(device_index):
+            return cute_ext.compile(
+                CpAsyncWarpSplitKKernel(tactic, use_pdl, has_bias),
+                *(
+                    _from_dlpack(
+                        _torch.empty(shape, device="cuda", dtype=dtype),
+                        dynamic_m=dynamic_m,
+                    )
+                    for shape, dynamic_m in (
+                        ((n, k), False),
+                        ((_MAX_M, k), True),
+                        ((n,), False),
+                        ((_MAX_M, n), True),
+                    )
+                ),
+                _cuda.CUstream(_torch.cuda.current_stream().cuda_stream),
+                **compile_option_kwargs(),
+            )
+
+    return "dense_bf16_gemm_warp_splitk", name, compile_fn
+
+
 @functools.cache
 def _compile(
     device_index: int,
@@ -1183,23 +1226,16 @@ def _compile(
     use_pdl: bool,
     has_bias: bool,
 ):
-    with _torch.cuda.device(device_index):
-        return cute_ext.compile(
-            CpAsyncWarpSplitKKernel(tactic, use_pdl, has_bias),
-            *(
-                _from_dlpack(
-                    _torch.empty(shape, device="cuda", dtype=dtype),
-                    dynamic_m=dynamic_m,
-                )
-                for shape, dynamic_m in (
-                    ((n, k), False),
-                    ((_MAX_M, k), True),
-                    ((n,), False),
-                    ((_MAX_M, n), True),
-                )
-            ),
-            _cuda.CUstream(_torch.cuda.current_stream().cuda_stream),
-        )
+    module_name, name, compile_fn = _warp_form(
+        device_index, dtype, n, k, tactic, use_pdl, has_bias
+    )
+    return build_and_load_cute_dsl_kernel(
+        module_name,
+        name,
+        compile_fn,
+        extra_key_files=(__file__,),
+        enable_tvm_ffi=False,
+    )
 
 
 def run_warp_splitk_dense(a, b, out, pdl: bool, tactic: WarpSplitKTactic, bias=None):
