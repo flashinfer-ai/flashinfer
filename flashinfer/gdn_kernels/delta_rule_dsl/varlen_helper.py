@@ -9,6 +9,8 @@ BLK = 64
 CP_CHUNK_LEN_GRANULARITY = 512
 CP_DEFAULT_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_NUMERATOR = 1
 CP_DEFAULT_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_DENOMINATOR = 1
+CP_SM110_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_NUMERATOR = 4
+CP_SM110_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_DENOMINATOR = 5
 CP_SM120_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_NUMERATOR = 1
 CP_SM120_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_DENOMINATOR = 2
 CP_SM120_SHORT_HEURISTIC_MAX_HEADS = 16
@@ -177,6 +179,11 @@ def cp_short_workload_ratio_host(
     device_capability: tuple[int, int] | None = None,
     num_heads: int | None = None,
 ) -> tuple[int, int] | None:
+    if device_capability is not None and device_capability[0] == 11:
+        return (
+            CP_SM110_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_NUMERATOR,
+            CP_SM110_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_DENOMINATOR,
+        )
     if device_capability is not None and device_capability[0] == 12:
         if num_heads is None or num_heads > CP_SM120_SHORT_HEURISTIC_MAX_HEADS:
             return None
@@ -251,6 +258,26 @@ def should_use_v32_sm80_host(
         and num_seqs == V32_SM80_NUM_SEQS
         and num_q_heads == V32_SM80_NUM_Q_HEADS
         and num_v_heads == V32_SM80_NUM_V_HEADS
+    )
+
+
+def should_use_cp_sm110_host(
+    num_parallel_work: int,
+    device_capability: tuple[int, int] | None = None,
+    max_seq_len: int | None = None,
+) -> bool:
+    """Whether SM110 `use_cp="auto"` takes CP; an unknown longest sequence means no.
+
+    From a CUPTI sweep on Jetson Thor (20 SMs): CP wins only for
+    `num_parallel_work` <= 4, and only from a minimum `max_seq_len` of 2048
+    for 1, 3072 for 2-3 and 4096 for 4.
+    """
+    if device_capability is None or max_seq_len is None or device_capability[0] != 11:
+        return False
+    return (
+        (num_parallel_work == 1 and max_seq_len >= 2048)
+        or (num_parallel_work <= 3 and max_seq_len >= 3072)
+        or (num_parallel_work <= 4 and max_seq_len >= 4096)
     )
 
 

@@ -40,9 +40,10 @@ from .gdn_prefill import _cutlass_state_dtype, _mark_state_layout
 @functools.cache
 def _blackwell_compile_options(device: torch.device):
     major, minor = get_compute_capability(device)
-    if major != 10:
+    if major not in (10, 11):
         raise RuntimeError(
-            f"SM100 CP delta rule requires a compute 10.x device, got {major}.{minor}"
+            "SM100 CP delta rule requires a compute 10.x or 11.x device, "
+            f"got {major}.{minor}"
         )
     # Resolve the arch instead of formatting it: this guard only checks the
     # major, so Rubin (10.7) reaches here, and f"sm_107a" is absent from the
@@ -355,15 +356,18 @@ class CPDeltaRuleFixupHmmaSm100(CPDeltaRuleFixupHmmaSm120):
     """SM100 specialization of the HMMA fixup fallback."""
 
 
-def _utcmma_fixup_supports_output_state(output_state: torch.Tensor | None) -> bool:
-    """Whether the UTCMMA fixups can store final states into this pool.
+def _utcmma_fixup_output_state_is_aligned(output_state: torch.Tensor | None) -> bool:
+    """Whether the UTCMMA fixups may store final states with 16-byte vectors.
 
-    ``store_acc`` copies each thread's state fragment to the pool with a
+    ``store_acc`` can copy each thread's state fragment to the pool with a
     vectorized store along K that assumes a 16-byte-aligned fragment start, so
     K must be the unit-stride dimension and every other stride and the base must
     be 16-byte aligned. Other layouts (e.g. a ``[N, H, K, V]`` buffer passed as
-    its ``[N, H, V, K]`` transpose) go through the SIMT fixup, whose stores make
-    no alignment assumption. Initial-state pools are read without it as well.
+    its ``[N, H, V, K]`` transpose) compile a UTCMMA fixup without that
+    assumption instead of switching to the SIMT fixup: the two differ in
+    precision (TF32 vs FP32), so the fixup kind must depend only on the state
+    count, never on the pool layout. Initial-state pools are read without the
+    assumption as well.
     """
     if output_state is None:
         return True
@@ -387,6 +391,7 @@ def _get_fixup_kernel(
     output_state_inner_strides,
     kernel_kind,
     cu_seqlens_dtype,
+    aligned_output_state=True,
 ):
     if kernel_kind == "simt_row4":
         return CPDeltaRuleFixupSm100(
@@ -442,6 +447,7 @@ def _get_fixup_kernel(
             initial_state_inner_strides=initial_state_inner_strides,
             output_state_inner_strides=output_state_inner_strides,
             store_initial_state=needs_initial_state,
+            aligned_output_state=aligned_output_state,
         )
     raise ValueError(f"Unsupported fixup kernel kind: {kernel_kind}")
 
@@ -590,17 +596,6 @@ def cp_delta_rule_fixup_dsl_sm100(
             _kernel_kind = "utcmma64"
         else:
             _kernel_kind = "utcmma128"
-        if _kernel_kind.startswith(
-            "utcmma"
-        ) and not _utcmma_fixup_supports_output_state(output_state):
-            _kernel_kind = "simt_row4"
-    elif _kernel_kind.startswith("utcmma") and not _utcmma_fixup_supports_output_state(
-        output_state
-    ):
-        raise ValueError(
-            f"fixup kernel {_kernel_kind!r} requires a K-contiguous, 16-byte-aligned "
-            "output state pool"
-        )
     kernel = _get_fixup_kernel(
         needs_initial_state,
         store_final_state,
@@ -620,6 +615,7 @@ def cp_delta_rule_fixup_dsl_sm100(
         ),
         _kernel_kind,
         _cu_seqlens_dtype(cu_seqlens.dtype),
+        _utcmma_fixup_output_state_is_aligned(output_state),
     )
     compile_options = _blackwell_compile_options(device)
     compiled = get_cached_compile(kernel, compile_options)
