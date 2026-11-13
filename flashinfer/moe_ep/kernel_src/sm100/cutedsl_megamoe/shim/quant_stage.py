@@ -395,6 +395,7 @@ def fused_quant_stage(
     num_experts: Optional[int] = None,
     fuse_tail_mask: bool = False,
     zero_masked_scores: bool = True,
+    batch_invariant: bool = False,
 ) -> None:
     """Quantize + stage one batch into the mega symm-buffer views.
 
@@ -423,6 +424,12 @@ def fused_quant_stage(
         raise ValueError(
             f"quant_type must be one of {_QUANT_TYPES}, got {quant_type!r}"
         )
+    if batch_invariant:
+        if quant_type != "nvfp4":
+            raise ValueError("batch_invariant fused staging requires NVFP4")
+        # The BI recipe rounds each multiplication separately. A host-folded
+        # norm/6 constant can differ even when norm has the same FP32 bits.
+        scale_multiplier = None
     normal_scales = mxfp8_normal_scales or quant_type == "mxfp4"
     is_nvfp4 = quant_type == "nvfp4"
     if is_nvfp4 and mxfp8_normal_scales:
@@ -504,6 +511,7 @@ def fused_quant_stage(
         num_experts,
         fuse_tail_mask,
         zero_masked_scores,
+        batch_invariant,
     )
     stager = _STAGERS.get(key)
     if stager is None:
@@ -522,6 +530,7 @@ def fused_quant_stage(
         stager = _CompiledStager(
             dp=stager_class(topk=topk, hidden=hidden, quant_type=quant_type)
         )
+        stager.dp.batch_invariant = batch_invariant
         _STAGERS[key] = stager
 
     import cuda.bindings.driver as cuda_driver

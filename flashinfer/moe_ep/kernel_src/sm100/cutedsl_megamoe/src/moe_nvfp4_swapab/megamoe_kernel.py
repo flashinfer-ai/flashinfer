@@ -1570,6 +1570,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 self.combine_format,
                 sm_arch=get_cutedsl_target_arch(),
                 num_experts=self.num_total_experts,
+                batch_invariant=self.batch_invariant_chain,
                 persistent=self.topk_reduce_persistent,
                 num_sms=self.topk_reduce_num_sms,
             )

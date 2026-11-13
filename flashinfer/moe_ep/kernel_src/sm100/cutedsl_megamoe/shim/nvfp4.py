@@ -131,8 +131,21 @@ class MegaMoENvfp4Config:
     # gated activation (``real = fc1_alpha * scale_t * acc``).  Lets the caller
     # quantize ``x_t / scale_t`` to NVFP4 without losing the per-token range.
     enable_fc1_activation_per_token_scale: bool = False
+    batch_invariant: bool = dataclasses.field(default=False, kw_only=True)
+    input_norm_const: float = dataclasses.field(default=1.0, kw_only=True)
+    has_fc1_alpha: bool = dataclasses.field(default=True, kw_only=True)
+    has_fc2_alpha: bool = dataclasses.field(default=True, kw_only=True)
+    has_fc1_norm_const: bool = dataclasses.field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
+        if type(self.batch_invariant) is not bool:
+            raise ValueError("batch_invariant must be a bool")
+        if self.batch_invariant:
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+                validate_nvfp4_batch_invariant,
+            )
+
+            validate_nvfp4_batch_invariant(self, implementation="legacy")
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
             raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
         if self.world_size < 1:
@@ -329,6 +342,14 @@ class MegaMoENvfp4Frontend:
 
     def set_gate_up_clamp(self, clamp: Optional[float]) -> None:
         """Update ``gate_up_clamp`` and invalidate compile cache when it changes."""
+        if self._config.batch_invariant:
+            from flashinfer.moe_ep.batch_invariant.spec import f32_bits
+
+            def bits(value):
+                return None if value is None else f32_bits(abs(value))
+
+            if bits(clamp) != bits(self._config.gate_up_clamp):
+                raise ValueError("batch_invariant NVFP4 clamp is fixed at construction")
         if self._gate_up_clamp == clamp:
             return
         ensure_not_capturing("set_gate_up_clamp (clamp change)")
@@ -560,6 +581,16 @@ class MegaMoENvfp4Frontend:
     # Compile cache
     # ------------------------------------------------------------------
 
+    @property
+    def batch_invariant_fingerprint(self) -> Optional[str]:
+        if not self.config.batch_invariant:
+            return None
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_fingerprint,
+        )
+
+        return nvfp4_batch_invariant_fingerprint(self.config, implementation="legacy")
+
     def _mega_compile_key(self) -> tuple:
         c = self.config
         return (
@@ -595,6 +626,8 @@ class MegaMoENvfp4Frontend:
             c.swiglu_beta,
             c.enable_iket,
             c.enable_fc1_activation_per_token_scale,
+            c.batch_invariant,
+            self.batch_invariant_fingerprint,
         )
 
     def _ensure_mega_compiled(self, inputs: MegaMoENvfp4Inputs) -> _CompiledMega:
@@ -613,6 +646,16 @@ class MegaMoENvfp4Frontend:
         from src.token_comm import CombineFormat
 
         c = self.config
+        if c.batch_invariant:
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+                validate_bf16_batch_invariant_compile_target,
+            )
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+                validate_nvfp4_batch_invariant,
+            )
+
+            validate_nvfp4_batch_invariant(c, implementation="legacy")
+            validate_bf16_batch_invariant_compile_target()
         # The kernel now takes a CombineFormat object (was a combine_dtype string)
         # and derives local_rank from the peer mapper (was a ctor arg).
         combine_format = CombineFormat.parse(COMBINE_FORMAT_NAMES[c.combine_dtype])
@@ -665,6 +708,7 @@ class MegaMoENvfp4Frontend:
             epi_flag_batch=c.epi_flag_batch,
             combine_format=combine_format,
         )
+        kernel.batch_invariant_chain = c.batch_invariant
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
         local_workspace = torch.zeros(
@@ -1248,6 +1292,11 @@ def get_symm_buffer_for_mega_moe(
     fc2_alpha: Optional[PerExpertEpilogue] = None,
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
     enable_fc1_activation_per_token_scale: bool = False,
+    batch_invariant: bool = False,
+    input_norm_const: float = 1.0,
+    has_fc1_alpha: bool = True,
+    has_fc2_alpha: bool = True,
+    has_fc1_norm_const: bool = True,
     knobs: Optional[dict] = None,
 ) -> MegaMoESymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MegaMoE session.
@@ -1324,7 +1373,11 @@ def get_symm_buffer_for_mega_moe(
     num_experts_per_rank = num_total_experts // world_size
 
     from .knob_cache import resolve_knobs
-    from .tuner import with_checked_knobs
+    from .tuner import reject_explicit_knobs, with_checked_knobs
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+        NVFP4_BATCH_INVARIANT_VERSION,
+        nvfp4_batch_invariant_default_knobs,
+    )
 
     # knobs=None -> pure lookup: offline-tuned cache entry for this session
     # key when present, else the built-in token-count heuristic.  An explicit
@@ -1342,10 +1395,29 @@ def get_symm_buffer_for_mega_moe(
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
             apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
             use_custom_finalize=use_custom_finalize,
+            batch_invariant=batch_invariant,
+            batch_invariant_version=(
+                NVFP4_BATCH_INVARIANT_VERSION if batch_invariant else None
+            ),
+            gate_up_clamp=clamp,
+            input_norm_const=input_norm_const,
         )
     else:
         knobs = dict(knobs)
 
+    reject_explicit_knobs(knobs)
+    config_knobs = {}
+    if batch_invariant:
+        config_knobs = nvfp4_batch_invariant_default_knobs("legacy")
+        config_knobs.update(knobs)
+        fields = {field.name for field in dataclasses.fields(MegaMoENvfp4Config)}
+        config_knobs = {
+            key: value for key, value in config_knobs.items() if key in fields
+        }
+    config_knobs.setdefault(
+        "token_back_mode",
+        "reuse_dispatch_warps" if combine_dtype != "bf16" else "epi_warps",
+    )
     cfg = MegaMoENvfp4Config(
         rank=rank,
         world_size=world_size,
@@ -1366,11 +1438,14 @@ def get_symm_buffer_for_mega_moe(
         use_persistent_finalize_kernel=use_persistent_finalize_kernel,
         combine_dtype=combine_dtype,
         enable_fc1_activation_per_token_scale=enable_fc1_activation_per_token_scale,
+        batch_invariant=batch_invariant,
+        input_norm_const=input_norm_const,
+        has_fc1_alpha=has_fc1_alpha,
+        has_fc2_alpha=has_fc2_alpha,
+        has_fc1_norm_const=has_fc1_norm_const,
         # Constructed valid even before knobs land: quantized combine rejects
         # the default epi_warps token-back in __post_init__.
-        token_back_mode=(
-            "reuse_dispatch_warps" if combine_dtype != "bf16" else "epi_warps"
-        ),
+        **config_knobs,
     )
     cfg = with_checked_knobs(cfg, knobs)
     # TODO(Sep 2026) Previously we explicitly overrode the knobs here with the user request,

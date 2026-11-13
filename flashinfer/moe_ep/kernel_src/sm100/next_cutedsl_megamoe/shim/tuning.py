@@ -47,6 +47,12 @@ def is_valid_sm100_genphase_knobs(knobs: dict[str, Any], config: Any) -> bool:
         ):
             return False
     try:
+        if getattr(config, "batch_invariant", False):
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+                validate_nvfp4_batch_invariant,
+            )
+
+            validate_nvfp4_batch_invariant(config, knobs, implementation="genphase")
         dataclasses.replace(config, **knobs)
     except (TypeError, ValueError):
         return False
@@ -63,6 +69,14 @@ def default_sm100_genphase_knobs(
     FC1 work cannot fill one CGA4 wave. These estimates assume spread routing;
     skew and masked routes can change the best choice and should be tuned.
     """
+    if getattr(config, "batch_invariant", False):
+        _effective_sms(config, sm_count)
+        _live_tokens(config, live_tokens)
+        return dict(
+            mma_tiler_mnk=(256, 128, 256),
+            cluster_shape_mn=(4, 1),
+            schedule_policy=("grouped", None),
+        )
     sms = _effective_sms(config, sm_count)
     tokens = _live_tokens(config, live_tokens)
     if tokens == 0:
@@ -178,6 +192,12 @@ def is_valid_sm100_knobs(knobs, config):
     if unknown := set(knobs) - set(STANDARD_KNOB_KEYS):
         raise ValueError(f"unknown Blackwell standard knob keys: {sorted(unknown)}")
     try:
+        if getattr(config, "batch_invariant", False):
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+                validate_nvfp4_batch_invariant,
+            )
+
+            validate_nvfp4_batch_invariant(config, knobs, implementation="standard")
         dataclasses.replace(config, **knobs)
     except (TypeError, ValueError):
         return False
@@ -191,6 +211,21 @@ def sm100_standard_candidates(config, *, allow_nondeterministic=False):
     is opt-in and cannot replace a custom or persistent finalizer.
     """
     base = {key: getattr(config, key) for key in STANDARD_KNOB_KEYS}
+    if getattr(config, "batch_invariant", False):
+        proposed = [
+            dict(
+                base,
+                token_back_mode=carrier,
+                schedule_policy=schedule,
+                work_id_mode=work,
+            )
+            for carrier in ("epi_warps", "standalone_warps", "reuse_dispatch_warps")
+            for schedule, work in (
+                (("grouped", None), "grid_stride"),
+                (("phase_interleave", None), "atomic_counter"),
+            )
+        ]
+        return [knobs for knobs in proposed if is_valid_sm100_knobs(knobs, config)]
     base["mma_tiler_mnk"] = config.resolved_mma_tiler_mnk
     proposed = [base]
     reduction = (

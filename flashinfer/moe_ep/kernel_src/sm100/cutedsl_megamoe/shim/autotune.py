@@ -45,6 +45,7 @@ from .tuner import (
     is_valid_bf16_for_config,
     is_valid_bf16_mxfp8,
     is_valid_bf16_mxfp8_for_config,
+    is_valid_nvfp4_for_config,
 )
 
 # Shared base of the sweep restriction (values that won every profile so far).
@@ -60,6 +61,7 @@ def nvfp4_candidates(
     *,
     combine_format: str = "bf16",
     enable_in_kernel_fc2_reduce: bool = False,
+    batch_invariant: bool = False,
 ) -> List[Dict[str, Any]]:
     """Default NVFP4 candidate knob dicts (tile x flag_batch x token-back x ikr).
 
@@ -70,6 +72,21 @@ def nvfp4_candidates(
     the session cannot run ikr (``apply_routing_weights_before_fc2=False``) or
     must stay deterministic.
     """
+    if batch_invariant:
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_default_knobs,
+        )
+
+        if combine_format != "bf16" or enable_in_kernel_fc2_reduce:
+            raise ValueError(
+                "batch_invariant NVFP4 requires BF16 combine without in-kernel reduction"
+            )
+        base = nvfp4_batch_invariant_default_knobs("legacy")
+        return [
+            dict(base, token_back_mode=carrier, load_balance_mode=balance)
+            for carrier in ("epi_warps", "standalone_warps", "reuse_dispatch_warps")
+            for balance in ("static", "atomic_counter")
+        ]
     out: List[Dict[str, Any]] = []
     for tile in ((256, 128, 256), (256, 256, 256)):
         for flag_batch in (4, 8):
@@ -417,7 +434,15 @@ def autotune_nvfp4_mega_moe(
             sync=True,
         )
 
-    cfg = symm_buffer._frontend.config
+    frontend = symm_buffer._frontend
+    if swiglu_alpha is not None or swiglu_beta is not None:
+        frontend.set_swiglu_params(swiglu_alpha, swiglu_beta)
+    clamp = resolve_gate_up_clamp(
+        gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
+    )
+    if clamp is not None:
+        frontend.set_gate_up_clamp(clamp)
+    cfg = frontend.config
     prepare_launch = None
     if cfg.use_custom_finalize:
         n = num_tokens if num_tokens is not None else cfg.num_tokens_per_rank
@@ -447,12 +472,18 @@ def autotune_nvfp4_mega_moe(
         # Session-aware default sweep: prune ikr when the session did not
         # permit it or cannot run it, and quantized-combine-invalid combos.
         candidates = nvfp4_candidates(
+            batch_invariant=getattr(cfg, "batch_invariant", False),
             combine_format=COMBINE_FORMAT_NAMES[cfg.combine_dtype],
             enable_in_kernel_fc2_reduce=(
                 cfg.enable_in_kernel_fc2_reduce
                 and cfg.apply_routing_weights_before_fc2
                 and not cfg.use_custom_finalize
             ),
+        )
+
+    if getattr(cfg, "batch_invariant", False):
+        candidates = _session_candidates(
+            candidates, cfg, is_valid_nvfp4_for_config, what="NVFP4 MegaMoE"
         )
 
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
@@ -479,6 +510,9 @@ def autotune_nvfp4_mega_moe(
                 use_custom_finalize=cfg.use_custom_finalize,
                 p50_us=p50_s * 1e6,
                 source="autotune",
+                batch_invariant=getattr(cfg, "batch_invariant", False),
+                gate_up_clamp=cfg.gate_up_clamp,
+                input_norm_const=getattr(cfg, "input_norm_const", 1.0),
             )
 
     return autotune_knobs(

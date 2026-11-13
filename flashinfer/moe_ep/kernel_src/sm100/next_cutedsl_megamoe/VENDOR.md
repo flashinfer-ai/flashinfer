@@ -94,3 +94,16 @@ NVFP4 admits N128/CGA4; mixed MXFP4/MXFP8 admits N128/CGA4 and N64/CGA4;
 MXFP8 E4M3/E5M2 also admit N64/CGA2. All use separate BF16 finalization.
 The shim's dtype-aware tuning grid uses cache revision
 `sm100-genphase-block-scaled-auto-v6` and preserves FC2 staging depth.
+
+## NVFP4 batch-invariant integration patch
+
+Pending upstream, the two kernel entry points pass an optional
+`batch_invariant` problem field to the shared FC12 epilogue and BF16 reducer.
+The opt-in epilogue interprets FlashInfer's ordered NVFP4 activation,
+block16 requantization and FC2 conversion chains. Standard inference also
+pins instruction N and the matching two-CTA load split to the static tile;
+GenPhase already uses fixed N128 instructions. The opt-in reducer starts at
+positive zero, retains every top-k slot in order and masks both operands of
+invalid routes. These branches leave ordinary execution unchanged and must
+be retained when regenerating the provider export until incorporated upstream.
+The shim admits only the certified NVFP4 geometry and arithmetic modes.

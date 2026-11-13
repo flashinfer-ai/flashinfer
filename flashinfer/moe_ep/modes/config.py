@@ -70,11 +70,57 @@ def _batch_invariant_numerical_contract(config: MegaConfig | SplitConfig):
     from ..batch_invariant.spec import f32_bits
 
     kernel = config.megakernel
+    from ..backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.config import (
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from ..backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl.config import (
+        Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+
+    if isinstance(
+        kernel,
+        (
+            Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+            Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        ),
+    ):
+        if type(kernel) not in (
+            Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+            Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        ):
+            raise ValueError("Unsupported batch-invariant NVFP4 configuration subclass")
+        from ..backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            NVFP4_BATCH_INVARIANT_VERSION,
+            nvfp4_batch_invariant_implementation,
+            validate_nvfp4_batch_invariant,
+        )
+
+        arch = (
+            "sm_107"
+            if type(kernel) is Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+            else "sm_100"
+        )
+        validate_nvfp4_batch_invariant(kernel, arch=arch)
+        clamp = kernel.gate_up_clamp
+        if clamp is None:
+            clamp = getattr(kernel, "activation_clamp", None)
+        return {
+            "family": f"{arch}_nvfp4_cutedsl_{nvfp4_batch_invariant_implementation(kernel)}",
+            "version": NVFP4_BATCH_INVARIANT_VERSION,
+            "intermediate": kernel.intermediate_size,
+            "top_k": kernel.top_k,
+            "activation": "swiglu",
+            "gate_up_clamp_bits": None if clamp is None else f32_bits(abs(clamp)),
+            "input_norm_const_bits": f32_bits(kernel.input_norm_const),
+            "scalar_presence": (True, True, True),
+            "quantize_input": config.quantize_input,
+            "apply_routing_weights_before_fc2": kernel.apply_routing_weights_before_fc2,
+        }
     if type(kernel) is not Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig or (
         kernel.kernel_name not in ("sm100_bf16_bf16_bf16_cutedsl", "bf16_cutedsl")
     ):
         raise ValueError(
-            "Batch-invariant EP selection only recognizes the SM100 BF16 CuTeDSL backend"
+            "Batch-invariant EP selection only recognizes specified BF16 and NVFP4 CuTeDSL backends"
         )
     clamp = (
         kernel.gate_up_clamp

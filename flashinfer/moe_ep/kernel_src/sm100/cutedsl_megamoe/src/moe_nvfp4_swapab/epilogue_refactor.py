@@ -52,6 +52,12 @@ from src.ptx_helpers import (
 )
 from src.flag_batch import GpuReleaseFlagBatchTracker
 from src.sym_buffer import SymBufferDeviceBase
+from flashinfer.moe_ep.batch_invariant.nvfp4_device import (
+    ScalarF32 as BiScalarF32, PackedF32 as BiPackedF32,
+)
+from flashinfer.moe_ep.batch_invariant.nvfp4_spec import (
+    fc1_activation as bi_fc1_activation, quantize_block_precast,
+)
 
 @dataclasses.dataclass(frozen=True)
 class QuantImpl:
@@ -76,6 +82,7 @@ class QuantImpl:
     quant_kind: Union[str, CombineFormat]
     sf_vec_direction: Literal["regs_in_thread", "threads_with_the_same_reg"]
     lane_idx: Optional[Any] = None   # Int32; only the across-lane path needs it
+    batch_invariant: bool = False
 
     _orthodox_kinds: ClassVar[Tuple[str, ...]] = ("nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2")
 
@@ -197,22 +204,34 @@ class QuantImpl:
         rcp_limit = cutlass.Float32(self._data_rcp_limit)
         for vec_block_idx in cutlass.range_constexpr(n_blocks):
             block = in_blocks[None, vec_block_idx]
-            amax = self._amax_thread_fp32(block)
-            if cutlass.const_expr(norm_const is not None):
-                sfc_fp32 = amax * rcp_limit * norm_const
+            if cutlass.const_expr(self.batch_invariant):
+                scaled, sfc_e4m3 = quantize_block_precast(
+                    BiScalarF32,
+                    tuple(block[i] for i in range(Nvfp4BlockSize)),
+                    norm=norm_const,
+                )
+                scaled_regs = cute.make_rmem_tensor((vec,), cutlass.Float32)
+                for i in cutlass.range_constexpr(vec):
+                    scaled_regs[i] = scaled[i]
+                sf_values.append(sfc_e4m3)
+                data_blocks.append(scaled_regs.load().to(cutlass.Float4E2M1FN))
             else:
-                sfc_fp32 = amax * rcp_limit
-            sfc_e4m3 = sfc_fp32.to(cutlass.Float8E4M3FN)
-            sfc_rt = cutlass.Float32(sfc_e4m3)
-            if cutlass.const_expr(norm_const is not None):
-                acc_scale = norm_const * cute.arch.rcp_approx(sfc_rt)
-            else:
-                acc_scale = cute.arch.rcp_approx(sfc_rt)
-            acc_scale = cute.arch.fmin(acc_scale, Fp32Max)
-            mask = cute.arch.fmin(sfc_rt * cutlass.Float32(1e30), cutlass.Float32(1.0))
-            acc_scale = acc_scale * mask
-            sf_values.append(sfc_e4m3)
-            data_blocks.append(self._scale_to_e2m1_ssa(block, acc_scale))
+                amax = self._amax_thread_fp32(block)
+                if cutlass.const_expr(norm_const is not None):
+                    sfc_fp32 = amax * rcp_limit * norm_const
+                else:
+                    sfc_fp32 = amax * rcp_limit
+                sfc_e4m3 = sfc_fp32.to(cutlass.Float8E4M3FN)
+                sfc_rt = cutlass.Float32(sfc_e4m3)
+                if cutlass.const_expr(norm_const is not None):
+                    acc_scale = norm_const * cute.arch.rcp_approx(sfc_rt)
+                else:
+                    acc_scale = cute.arch.rcp_approx(sfc_rt)
+                acc_scale = cute.arch.fmin(acc_scale, Fp32Max)
+                mask = cute.arch.fmin(sfc_rt * cutlass.Float32(1e30), cutlass.Float32(1.0))
+                acc_scale = acc_scale * mask
+                sf_values.append(sfc_e4m3)
+                data_blocks.append(self._scale_to_e2m1_ssa(block, acc_scale))
         self._store_packed_blocks(data, data_blocks)
         sf.store(self._values_to_ssa(sf_values, cutlass.Float8E4M3FN))
         return data, sf
@@ -979,7 +998,9 @@ class SwapABSwigluFp4Epilogue:
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),                 # (fc1, fc2) done-counter publish batch
+        batch_invariant_chain: bool = False,
     ) -> None:
+        self.batch_invariant_chain = batch_invariant_chain
         if fc1_output_dtype is not cutlass.Float4E2M1FN:
             raise NotImplementedError(
                 "SwapABSwigluFp4Epilogue currently assumes fc1 output in "
@@ -1610,6 +1631,20 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         scale_is_pretranspose: cutlass.Constexpr[bool],
     ) -> cute.Tensor:
         # ── Input contract checks (compile-time): fp32, 1D, even-count, rmem ──
+        if cutlass.const_expr(self.batch_invariant_chain):
+            if cutlass.const_expr(activation_scale is not None):
+                raise ValueError("NVFP4 BI does not support per-token activation scales")
+            out = cute.make_rmem_tensor((cute.size(gate_rmem),), cutlass.Float32)
+            for i in cutlass.range_constexpr(0, cute.size(gate_rmem), 2):
+                result = bi_fc1_activation(
+                    BiPackedF32,
+                    (gate_rmem[i], gate_rmem[i + 1]),
+                    (up_rmem[i], up_rmem[i + 1]),
+                    alpha=(alpha_val, alpha_val) if alpha_val is not None else None,
+                    clamp=self.gate_up_clamp,
+                )
+                out[i], out[i + 1] = result
+            return out
         # Wrapped in const_expr so the DSL evaluates them at trace time and the
         # raise fires during compilation rather than emitting a runtime branch.
         for _name, _t in (("gate_rmem", gate_rmem), ("up_rmem", up_rmem)):
@@ -1863,7 +1898,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         # The core block quant (amax + e4m3 sfc + capped/masked acc_scale + e2m1
         # cvt) is QuantImpl's job; this method still owns the topk pre-multiply,
         # the sfc store, and the STS.64 into the shared output stage.
-        quant = QuantImpl("nvfp4", "regs_in_thread")
+        quant = QuantImpl("nvfp4", "regs_in_thread", batch_invariant=self.batch_invariant_chain)
 
         intermediate_idx = (
             work_tile_info.tile_m_idx * (self.cta_tile_m // 2)
@@ -1899,9 +1934,12 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             if cutlass.const_expr(topk_scores is not None):
                 topk_pair = (topk_scores[half], topk_scores[half])
                 for i in cutlass.range_constexpr(0, n, 2):
-                    w0, w1 = cute.arch.mul_packed_f32x2(
-                        (tok[i], tok[i + 1]), topk_pair
-                    )
+                    if cutlass.const_expr(self.batch_invariant_chain):
+                        w0, w1 = BiPackedF32.mul((tok[i], tok[i + 1]), topk_pair)
+                    else:
+                        w0, w1 = cute.arch.mul_packed_f32x2(
+                            (tok[i], tok[i + 1]), topk_pair
+                        )
                     weighted[i] = w0
                     weighted[i + 1] = w1
             else:
@@ -2242,6 +2280,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         casted = process_pipeline.f2fp(
             *loaded,
             alpha_val=alpha_val,
+            batch_invariant=self.batch_invariant_chain,
         )
         # reorder returns a bare RMEM fragment in the store's expected pre-store
         # distribution; reorder + store are paired 1:1 inside the pipeline.
@@ -2621,6 +2660,7 @@ def wrap_into_copy_standard_layout(tensor: cute.Tensor):
 def fc2_f2fp(
     *tensors,
     alpha_val: Optional[cutlass.Float32] = None,
+    batch_invariant: cutlass.Constexpr[bool] = False,
     **_,
 ) -> cute.Tensor:
     reorder_dtype = cutlass.BFloat16
@@ -2643,7 +2683,10 @@ def fc2_f2fp(
             scaled = cute.make_rmem_tensor((current_tensor_size,), cutlass.Float32)
             for i in cutlass.range_constexpr(0, current_tensor_size, 2):
                 # scaled[i] = t[i] * alpha_val
-                s0, s1 = cute.arch.mul_packed_f32x2((t[i], t[i+1]), (alpha_val, alpha_val))
+                if cutlass.const_expr(batch_invariant):
+                    s0, s1 = BiPackedF32.mul((t[i], t[i+1]), (alpha_val, alpha_val))
+                else:
+                    s0, s1 = cute.arch.mul_packed_f32x2((t[i], t[i+1]), (alpha_val, alpha_val))
                 scaled[i] = s0
                 scaled[i + 1] = s1
             dst.store(scaled.load().to(reorder_dtype))

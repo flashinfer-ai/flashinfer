@@ -99,6 +99,12 @@ def is_valid_sm107(knobs: Dict[str, Any], base_config: Any) -> bool:
     if unknown:
         raise ValueError(f"unknown SM107 knob keys: {sorted(unknown)}")
     try:
+        if getattr(base_config, "batch_invariant", False):
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+                validate_nvfp4_batch_invariant,
+            )
+
+            validate_nvfp4_batch_invariant(base_config, knobs, arch="sm_107")
         dataclasses.replace(base_config, **knobs)
     except (ValueError, TypeError):
         return False
@@ -110,6 +116,7 @@ def sm107_candidates(
     *,
     allow_in_kernel_fc2_reduce: bool = False,
     kernel_variant: str = "inference",
+    batch_invariant: bool = False,
 ) -> List[Dict[str, Any]]:
     """Default SM107 candidate knob dicts (tile x launch x epi x fc2-bulk).
 
@@ -135,6 +142,28 @@ def sm107_candidates(
     sweep them with :func:`sm107_schedule_candidates` instead.  An ikr winner
     makes the output accumulation order nondeterministic; it stays opt-in.
     """
+    if batch_invariant:
+        if quant_kind != "nvfp4" or allow_in_kernel_fc2_reduce:
+            raise ValueError(
+                "batch_invariant SM107 candidates require NVFP4 without in-kernel reduction"
+            )
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_default_knobs,
+        )
+
+        base = nvfp4_batch_invariant_default_knobs(
+            "genphase" if kernel_variant == "genphase" else "standard", arch="sm_107"
+        )
+        if kernel_variant == "genphase":
+            return [
+                dict(base, work_id_mode=work)
+                for work in ("grid_stride", "atomic_counter")
+            ]
+        return [
+            dict(base, token_back_mode=carrier, work_id_mode=work)
+            for carrier in ("epi_warps", "standalone_warps", "reuse_dispatch_warps")
+            for work in ("grid_stride", "atomic_counter")
+        ]
     tile_k = 256 if quant_kind in ("nvfp4", "mxfp4") else 128
     launches = (
         # (cluster, fallback, schedule_policy, work_id_mode)
@@ -324,7 +353,11 @@ def _sweep_sm107_block_scaled_mega_moe(
     ensure_not_capturing("SM107 collective autotune sweep")
     cfg = symm_buffer.config
     candidates = _unique_candidates(
-        sm107_candidates(cfg.quant_kind, kernel_variant=cfg.kernel_variant)
+        sm107_candidates(
+            cfg.quant_kind,
+            kernel_variant=cfg.kernel_variant,
+            batch_invariant=getattr(cfg, "batch_invariant", False),
+        )
         if candidates is None
         else candidates
     )

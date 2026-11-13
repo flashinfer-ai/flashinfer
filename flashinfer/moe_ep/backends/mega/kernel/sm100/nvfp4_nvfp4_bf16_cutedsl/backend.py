@@ -75,6 +75,10 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 "NVFP4 GenPhase requires kernel_name='sm100_nvfp4_nvfp4_bf16_cutedsl_next'."
             )
         self._kernel_config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = config
+        if config.batch_invariant:
+            from ..common.nvfp4_batch_invariant import nvfp4_batch_invariant_arch
+
+            self._arithmetic_arch = nvfp4_batch_invariant_arch()
         self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
         self._thunk_states: dict[tuple, tuple] = {}
         # knobs="auto": tune at the first compute() (weights + staged inputs
@@ -106,6 +110,16 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         fleet_params: FleetParams,
     ) -> None:
         validate_mega_arch()
+        if self._kernel_config.batch_invariant:
+            from ..common.nvfp4_batch_invariant import (
+                nvfp4_batch_invariant_arch,
+                validate_nvfp4_batch_invariant,
+            )
+
+            self._arithmetic_arch = nvfp4_batch_invariant_arch()
+            validate_nvfp4_batch_invariant(
+                self._kernel_config, arch=self._arithmetic_arch
+            )
         validate_mega_fleet_params(
             fleet_params,
             bootstrap.world_size,
@@ -160,6 +174,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
 
     def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
         k = self._kernel_config
+        from ..common.nvfp4_batch_invariant import NVFP4_BATCH_INVARIANT_VERSION
+
         return dict(
             dtype="nvfp4",
             world_size=self.ep_world_size,
@@ -173,10 +189,57 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             use_custom_finalize=self._finalize_mode(fleet_params)
             in (FinalizeMode.NONE, FinalizeMode.CAKE),
+            batch_invariant=k.batch_invariant,
+            batch_invariant_version=NVFP4_BATCH_INVARIANT_VERSION
+            if k.batch_invariant
+            else None,
+            gate_up_clamp=_resolve_gate_up_clamp(k),
+            input_norm_const=k.input_norm_const,
+        )
+
+    def _workspace_knobs(self, fleet_params):
+        from ..common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_default_knobs,
+            validate_nvfp4_batch_invariant,
+        )
+
+        selected = super()._workspace_knobs(fleet_params)
+        if not self._kernel_config.batch_invariant:
+            return selected
+        if selected is None:
+            selected = nvfp4_batch_invariant_default_knobs("legacy")
+        validate_nvfp4_batch_invariant(
+            self._kernel_config,
+            selected,
+            implementation="legacy",
+            arch=self._arithmetic_arch,
+        )
+        return selected
+
+    def batch_invariant_fingerprint(self, fleet_params):
+        if not self._kernel_config.batch_invariant:
+            return None
+        from ..common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_fingerprint,
+            validate_nvfp4_batch_invariant,
+        )
+
+        validate_nvfp4_batch_invariant(
+            self._kernel_config,
+            self._workspace_knobs(fleet_params),
+            arch=self._arithmetic_arch,
+        )
+        return nvfp4_batch_invariant_fingerprint(
+            self._kernel_config,
+            hidden=fleet_params.token_hidden_size,
+            num_experts=fleet_params.num_experts,
+            arch=self._arithmetic_arch,
+            public_inputs=True,
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
         from ......kernel_src.sm100.cutedsl_megamoe import get_symm_buffer_for_mega_moe
+        from ..common.nvfp4_batch_invariant import nvfp4_batch_invariant_metadata
 
         k = self._kernel_config
         fp = fleet_params
@@ -189,6 +252,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             2 * k.intermediate_size,
             self.ep_rank,
             self.ep_world_size,
+            **nvfp4_batch_invariant_metadata(k),
             gate_up_clamp=_resolve_gate_up_clamp(k),
             swiglu_alpha=k.swiglu_alpha,
             swiglu_beta=k.swiglu_beta,
@@ -290,6 +354,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 workspace.topk_idx,
                 workspace.topk_weights,
                 norm_const=self._kernel_config.input_norm_const,
+                batch_invariant=self._kernel_config.batch_invariant,
             )
         else:
             # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
@@ -569,6 +634,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         fp = fleet_params
         return (
             "sm100_nvfp4_nvfp4_bf16_cutedsl",
+            k.batch_invariant,
+            self.batch_invariant_fingerprint(fleet_params),
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,

@@ -85,6 +85,8 @@ class GenphaseConfigMixin:
         from .....kernel_src.sm100.next_cutedsl_megamoe import Sm100GenphaseMoeConfig
 
         k = self._config
+        from .common.nvfp4_batch_invariant import nvfp4_batch_invariant_metadata
+
         return Sm100GenphaseMoeConfig(
             num_total_experts=fleet_params.num_experts,
             max_tokens_per_rank=fleet_params.max_tokens_per_rank,
@@ -98,6 +100,7 @@ class GenphaseConfigMixin:
                 k.gate_up_clamp if k.gate_up_clamp is not None else k.activation_clamp
             ),
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
+            **nvfp4_batch_invariant_metadata(k),
         )
 
     def _genphase_config(self, fleet_params: FleetParams):

@@ -51,6 +51,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config = config
+        self._arithmetic_arch = "sm_107"
 
     def ep_weight_pack(self, weights):
         from ..automatic import ep_weight_pack
@@ -108,6 +109,12 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         self, bootstrap: BootstrapConfig, fleet_params: FleetParams
     ) -> None:
         validate_mega_arch_sm107()
+        if self._kernel_config.batch_invariant:
+            from ...sm100.common.nvfp4_batch_invariant import (
+                validate_nvfp4_batch_invariant,
+            )
+
+            validate_nvfp4_batch_invariant(self._kernel_config, arch="sm_107")
         from ......kernel_src.sm107.next_cutedsl_megamoe import require_sm107_dsl
 
         self._ensure_ep_bootstrap(bootstrap)
@@ -173,6 +180,8 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
 
     def _tuning_key(self, fleet_params: FleetParams) -> dict:
         k = self._kernel_config
+        from ...sm100.common.nvfp4_batch_invariant import NVFP4_BATCH_INVARIANT_VERSION
+
         return dict(
             dtype="nvfp4",
             world_size=self.ep_world_size,
@@ -189,6 +198,22 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
             gate_up_clamp=k.gate_up_clamp,
+            batch_invariant=k.batch_invariant,
+            batch_invariant_version=NVFP4_BATCH_INVARIANT_VERSION
+            if k.batch_invariant
+            else None,
+            input_norm_const=k.input_norm_const,
+        )
+
+    def batch_invariant_fingerprint(self, fleet_params):
+        if not self._kernel_config.batch_invariant:
+            return None
+        from ...sm100.common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_fingerprint,
+        )
+
+        return nvfp4_batch_invariant_fingerprint(
+            self._resolved_config(fleet_params), arch="sm_107"
         )
 
     def live_token_buckets(self, fleet_params: FleetParams) -> list[int]:
@@ -208,6 +233,26 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         from ......kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
 
         k = self._kernel_config
+        if k.batch_invariant:
+            from ...sm100.common.nvfp4_batch_invariant import (
+                nvfp4_batch_invariant_default_knobs,
+                nvfp4_batch_invariant_implementation,
+                validate_nvfp4_batch_invariant,
+            )
+
+            selected = nvfp4_batch_invariant_default_knobs(
+                nvfp4_batch_invariant_implementation(k), arch="sm_107"
+            )
+            if isinstance(k.knobs, dict):
+                selected.update(k.knobs)
+            elif k.knobs == "cache":
+                selected.update(self._workspace_knobs(fleet_params))
+            elif k.knobs not in (None, "auto"):
+                raise MoEEpConfigError(
+                    "knobs must be None, 'cache', 'auto', or a dictionary"
+                )
+            validate_nvfp4_batch_invariant(k, selected, arch="sm_107")
+            return selected
         if k.knobs is None:
             return {}
         if isinstance(k.knobs, dict):
@@ -290,6 +335,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
                 workspace.topk_idx,
                 workspace.topk_weights,
                 input_norm_const=self._kernel_config.input_norm_const,
+                batch_invariant=self._kernel_config.batch_invariant,
                 num_experts=workspace.config.num_total_experts,
                 workspace=workspace,
             )
@@ -406,6 +452,8 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         fp = fleet_params
         return (
             "sm107_nvfp4_nvfp4_bf16_cutedsl",
+            k.batch_invariant,
+            self.batch_invariant_fingerprint(fleet_params),
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,

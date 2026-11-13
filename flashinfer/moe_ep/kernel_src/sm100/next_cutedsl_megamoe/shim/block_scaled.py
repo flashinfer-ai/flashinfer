@@ -129,6 +129,11 @@ class BlockScaledMoeConfig:
 
     kernel_variant: Literal["inference", "genphase"] = "inference"
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
+    batch_invariant: bool = dataclasses.field(default=False, kw_only=True)
+    input_norm_const: float = dataclasses.field(default=1.0, kw_only=True)
+    has_fc1_alpha: bool = dataclasses.field(default=True, kw_only=True)
+    has_fc2_alpha: bool = dataclasses.field(default=True, kw_only=True)
+    has_fc1_norm_const: bool = dataclasses.field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
         """Validate dtype, geometry, epilogue and architecture-specific constraints."""
@@ -401,6 +406,18 @@ class BlockScaledMoeConfig:
                     "GenPhase does not use token-back or token-in flag knobs."
                 )
 
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            validate_nvfp4_batch_invariant,
+        )
+
+        if type(self.batch_invariant) is not bool:
+            raise ValueError("batch_invariant must be a bool.")
+        if self.batch_invariant:
+            for name in ("has_fc1_alpha", "has_fc2_alpha", "has_fc1_norm_const"):
+                if getattr(self, name) is not True:
+                    raise ValueError(f"batch_invariant workspace requires {name}=True.")
+        validate_nvfp4_batch_invariant(self)
+
     @property
     def experts_per_rank(self) -> int:
         return self.num_total_experts // self.world_size
@@ -546,6 +563,30 @@ class BlockScaledSymmBuffer:
         self._staged_tokens: Optional[int] = None
         self._destroyed = False
 
+        self._validate_batch_invariant_scalars()
+
+    def _validate_batch_invariant_scalars(self) -> None:
+        if not self.config.batch_invariant:
+            return
+        for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+            if getattr(self.config, f"has_{name}") is not (
+                getattr(self, name) is not None
+            ):
+                raise ValueError(
+                    f"batch_invariant scale presence does not match {name}."
+                )
+
+    @property
+    def batch_invariant_fingerprint(self) -> Optional[str]:
+        if not self.config.batch_invariant:
+            return None
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_fingerprint,
+        )
+
+        self._validate_batch_invariant_scalars()
+        return nvfp4_batch_invariant_fingerprint(self.config)
+
     def _allocate_kernel_workspace(self, kernel) -> None:
         """Allocate kernel-owned storage; staging and output pointers stay stable."""
         cfg = self.config
@@ -606,6 +647,11 @@ class BlockScaledSymmBuffer:
         from ..src.sources.api import ImplDesc, ProblemDesc
         from ..src.sources.quant_def import CombineFormat
 
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            validate_nvfp4_batch_invariant,
+        )
+
+        validate_nvfp4_batch_invariant(cfg)
         tiler = cfg.resolved_mma_tiler_mnk
         cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
         preferred_count: Optional[int] = None
@@ -649,6 +695,7 @@ class BlockScaledSymmBuffer:
         problem_desc = ProblemDesc(
             {
                 "expert_count": cfg.num_total_experts,
+                "batch_invariant": cfg.batch_invariant,
                 "intermediate_gateup_size": 2 * cfg.intermediate,
                 "hidden_size": cfg.hidden,
                 "quant_kind": cfg.quant_kind,
@@ -780,7 +827,9 @@ class BlockScaledSymmBuffer:
             raise RuntimeError(
                 "block-scaled workspace must launch on the CUDA device that owns it."
             )
+        self._validate_batch_invariant_scalars()
         key = (
+            self.batch_invariant_fingerprint,
             transformed_l1[0].data_ptr(),
             transformed_l1[1].data_ptr(),
             transformed_l2[0].data_ptr(),

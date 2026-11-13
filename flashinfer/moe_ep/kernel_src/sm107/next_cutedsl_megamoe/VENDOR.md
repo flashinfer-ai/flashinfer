@@ -199,6 +199,19 @@ registered strict single/multirank suites when updating or rebasing these patche
 All remaining exported implementation files retain the pinned export, apart
 from the previously documented comment and the scheduler fix above.
 
+## NVFP4 batch-invariant integration patch
+
+Pending upstream, both kernel entry points pass an optional `batch_invariant`
+problem field to their mainloop, shared FC12 epilogue and BF16 reducer. The
+opt-in mainloops pin instruction N and the corresponding two-CTA input split;
+GenPhase also pins the Gather4 index split. The shared epilogue interprets
+FlashInfer's ordered NVFP4 activation, block16 requantization and FC2
+conversion chains. The reducer starts at positive zero, retains every top-k
+slot in order and masks both operands of invalid routes. These branches leave
+ordinary execution unchanged. They are additional FlashInfer-owned exceptions
+to the pinned export and must be retained on regeneration until upstreamed.
+The shim admits only the certified NVFP4 geometry and arithmetic modes.
+
 ## Related trees
 
 `sm100/cutedsl_megamoe` and the SM90 drop are separate snapshots. This Rubin

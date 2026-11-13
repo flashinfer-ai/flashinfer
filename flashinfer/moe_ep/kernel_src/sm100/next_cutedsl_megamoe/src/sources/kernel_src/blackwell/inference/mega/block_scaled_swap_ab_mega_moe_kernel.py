@@ -287,6 +287,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             None if self.reduce_topk_in_kernel or self.skip_topk_reduce else TopkReduce(
                 self.hidden_size, self.topk, self.combine_format,
                 num_experts=self.expert_count, persistent=self.topk_reduce_persistent,
+                batch_invariant=bool(problem_desc.get("batch_invariant", False)),
             )
         )
         self._route_reset = ClearInvalidRoutes(

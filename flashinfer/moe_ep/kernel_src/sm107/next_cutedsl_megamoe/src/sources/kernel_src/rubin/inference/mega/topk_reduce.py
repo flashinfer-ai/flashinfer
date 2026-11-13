@@ -26,6 +26,8 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from flashinfer.moe_ep.batch_invariant.nvfp4_device import PackedF32
+
 from cutlass.cutlass_dsl import Float32, Int32, T
 from cutlass._mlir.dialects import llvm
 
@@ -164,7 +166,8 @@ class TopkReduce:
     # topk loop (small enough to not bloat registers; a CTA-broadcast read).
     _prefetch_limit: ClassVar[int] = 16
 
-    def __init__(self, hidden: int, num_topk: int, combine_format: CombineFormat, num_experts: Optional[int] = None) -> None:
+    def __init__(self, hidden: int, num_topk: int, combine_format: CombineFormat, num_experts: Optional[int] = None, *, batch_invariant: bool = False) -> None:
+        self.batch_invariant = bool(batch_invariant)
         self.hidden = int(hidden)
         self.num_topk = int(num_topk)
         self.num_experts = None if num_experts is None else int(num_experts)
@@ -285,6 +288,8 @@ class TopkReduce:
 
             load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
             acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+            if cutlass.const_expr(self.batch_invariant):
+                acc.fill(0)
 
             for k in cutlass.range_constexpr(0, num_topk, 1):
                 term = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
@@ -312,7 +317,12 @@ class TopkReduce:
 
                 for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
                     value_pair = (Float32(term[i]), Float32(term[i + 1]))
-                    if cutlass.const_expr(k != 0):
+                    if cutlass.const_expr(self.batch_invariant):
+                        if cutlass.const_expr(topk_score is None):
+                            acc[i], acc[i + 1] = PackedF32.add((acc[i], acc[i + 1]), value_pair)
+                        else:
+                            acc[i], acc[i + 1] = PackedF32.fma(value_pair, score_pair, (acc[i], acc[i + 1]))
+                    elif cutlass.const_expr(k != 0):
                         acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(value_pair, score_pair, (acc[i], acc[i + 1]))
                     else:
                         if cutlass.const_expr(topk_score is not None):

@@ -116,6 +116,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
         self.acc_dtype = acc_dtype
         self.mma_tiler_mnk = mma_tiler_mnk
+        self.batch_invariant_chain = False
         self.cluster_shape_mn = (cluster_shape_mnk[0], cluster_shape_mnk[1])
         self.use_2cta_instrs = use_2cta_instrs
         self.force_static_sched = force_static_sched
@@ -410,6 +411,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             gate_up_clamp=self.gate_up_clamp,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
+            batch_invariant_chain=self.batch_invariant_chain,
         )
 
         if self.num_sched_stages is None:
@@ -1900,7 +1902,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
                     # Non-leader CTA's TMA-B GMEM read must align with MMA's
                     # dynamic N split under 2cta (see compute_non_leader_cta_load_shift).
-                    if cutlass.const_expr(self.use_2cta_instrs):
+                    if cutlass.const_expr(self.use_2cta_instrs and not self.batch_invariant_chain):
                         if not is_leader_cta:
                             load_shift = dynamic_mainloop.compute_non_leader_cta_load_shift(
                                 valid_tokens_in_tile=work_tile_info.valid_tokens_in_cta_tile,
@@ -2028,7 +2030,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
                     # Non-leader CTA's TMA-B GMEM read must align with MMA's
                     # dynamic N split under 2cta (see compute_non_leader_cta_load_shift).
-                    if cutlass.const_expr(self.use_2cta_instrs):
+                    if cutlass.const_expr(self.use_2cta_instrs and not self.batch_invariant_chain):
                         if not is_leader_cta:
                             load_shift = dynamic_mainloop.compute_non_leader_cta_load_shift(
                                 valid_tokens_in_tile=work_tile_info.valid_tokens_in_cta_tile,
@@ -2249,7 +2251,11 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             sfa_tensor=tCtSFA,
                             sfb_tensor=tCtSFB_mma,
                             k_tile_idx=k_tile,
-                            valid_tokens_in_tile=work_tile_info.valid_tokens_in_cta_tile,
+                            valid_tokens_in_tile=(
+                                cutlass.Int32(self.mma_tiler[1])
+                                if cutlass.const_expr(self.batch_invariant_chain)
+                                else work_tile_info.valid_tokens_in_cta_tile
+                            ),
                             mma_tiler_mnk=self.mma_tiler_mnk,
                         )
                         handle.release()

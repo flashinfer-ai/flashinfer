@@ -444,6 +444,80 @@ pinned Lean toolchain is installed; without it, the generated-file consistency
 test still runs. Keep a fingerprint with its FlashInfer/compiler versions,
 architecture, EP topology and expert placement when recording an output receipt.
 
+### Batch-invariant NVFP4 MegaMoE
+
+Set `batch_invariant=True` on
+`Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` or
+`Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig`. The mode reuses the existing
+legacy, standard and GenPhase kernels with explicit arithmetic branches.
+SM100/SM103 and SM107 have separate receipts; cross-architecture output
+equality is outside the guarantee. The numerical implementation is also part
+of the receipt, so legacy, standard and GenPhase candidates are not mixed.
+
+The initial geometry allowlist is deliberately explicit:
+
+| Architecture | Implementation | Tile M/N/K | Cluster M/N | Instruction K |
+| --- | --- | --- | --- | --- |
+| SM100/SM103 | legacy | 256/128/256 | 2/1 | 64 |
+| SM100/SM103 | standard | 256/128/128 | 2/1 | 64 |
+| SM100/SM103 | GenPhase | 256/128/256 | 4/1 | 64 |
+| SM107 | standard | 256/128/256 | 2/1 | 128 |
+| SM107 | GenPhase | 256/128/256 | 4/1 | 128 |
+
+BI pins the MMA N descriptor and matching peer-CTA input mapping instead of
+changing instruction shape with the number of live tokens. Each accumulator
+uses one initialization instruction followed by ordered native K steps,
+including the selected stage's zero padding. Standard SwiGLU, the FP32 global
+scale multiplications, the per-16 E4M3 scale and E2M1 conversion, and the BF16
+FC2 wire follow the shared ordered specification. Separate finalization starts
+at +0 and visits every original route slot, using add for early routing weights
+or FMA for late weights. Invalid slots replace both operands with zero before
+the operation, without reading stale payloads.
+
+The core computation takes packed NVFP4 values and their block scales as inputs.
+The specification also describes the optional BF16 input staging to that
+boundary. BI staging always uses the fixed fused offline recipe; it does not
+fall back to a different Torch quantizer. It requires aligned contiguous CUDA
+BF16 activations and routing tensors. Prequantized callers provide the packed
+inputs and scales directly. Weight preprocessing stays outside the batch-varying
+execution; weights, scales, routing and global scale tensor values must remain
+the same when comparing batches.
+
+Both routing-weight placements and `gate_up_clamp` are supported as separate
+numerical classes. The three per-expert FP32 scale tensors remain runtime
+inputs; omitted public values become tensors of ones. The calibrated
+`input_norm_const` is part of the receipt. SiTU, custom SwiGLU constants,
+per-token FC1 scales, in-kernel atomic FC2 reduction, quantized combine wires,
+CAKE/deferred finalization and automatic cross-variant selection are rejected.
+Default and persistent ordered finalization are supported where the existing
+backend exposes them; GenPhase retains default finalization and its epilogue
+carrier. Integer task assignment and admitted carriers may vary without
+changing the receipt; flag batching stays fixed in this initial allowlist.
+Autotune candidates, cached winners and pooled
+workspaces are checked against this same policy and arithmetic fingerprint.
+
+`layer.batch_invariant_fingerprint` returns the actual receipt. A device-free
+query supplies the architecture and implementation explicitly:
+
+```python
+from flashinfer.batch_invariant import fingerprint
+
+receipt = fingerprint(
+    "megamoe_nvfp4", hidden=384, intermediate=192, top_k=3, num_experts=4,
+    arch="sm_100", implementation="legacy", input_norm_const=1.7,
+    apply_routing_weights_before_fc2=True, gate_up_clamp=2.5,
+)
+```
+
+`moe_ep/batch_invariant/nvfp4_spec.py` and the independent Lean model describe
+the compositional trace. Generated cases compare their ordered terms, including
+input/FC1 quantization, native K steps and masked finalization. As with BF16,
+opaque MMA and approximate-instruction semantics, generated CUDA and distributed
+publication require device validation. Tests compare output representations
+across batches, plans and graph replays within each class; numerical oracles
+check accuracy separately. Keep software/compiler versions and the fixed EP
+topology/expert placement with every receipt.
+
 ### Complete EP selection
 
 `AutoConfig` compares explicitly configured Mega and split candidates during an

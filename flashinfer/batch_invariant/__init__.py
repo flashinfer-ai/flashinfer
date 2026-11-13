@@ -98,7 +98,8 @@ def _attention_fingerprint(head_dim: int) -> str:
 
 def _mx_family(arch, op: str = "mm_mxfp8") -> str:
     """The architecture family behind ``arch``: a family name (``"sm_100"`` / ``"sm_103"`` / ``"sm_107"``), a compute
-    capability such as ``(10, 7)``, a ``torch.device``, or None for the current CUDA device."""
+    capability such as ``(10, 7)``, a ``torch.device``, or None for the current CUDA device.
+    """
     from ..gemm.batch_invariant.heuristic import PART_TABLE, family_of
 
     if arch is None:
@@ -169,7 +170,8 @@ def _moe_bf16_fingerprint(
     class as the enum form with the groups) or a ``spec.RoutingMethod``; ``act`` an ``ActivationConfig`` of the layer (its
     scalars are the class's parameters), ``"swiglu"`` / ``"relu2"`` (the default gated / ungated chains), or a chain name of
     ``spec.ACTS`` / ``spec.UNGATED_ACTS`` with ``params`` (and ``gated`` for the names in both tables). The receipt names
-    a class some layer can build: the runner's bounds and group rule apply here as ``ValueError``."""
+    a class some layer can build: the runner's bounds and group rule apply here as ``ValueError``.
+    """
     # absolute on purpose: the JIT cache keys follow relative imports, and the MoE specification is not part of the GEMM
     # modules' closures
     from flashinfer.fused_moe.batch_invariant import spec
@@ -263,6 +265,38 @@ def _megamoe_bf16_fingerprint(
     )
 
 
+def _megamoe_nvfp4_fingerprint(
+    hidden: int,
+    intermediate: int,
+    top_k: int,
+    num_experts: int,
+    implementation: str = "legacy",
+    apply_routing_weights_before_fc2: bool = True,
+    gate_up_clamp: float | None = None,
+    input_norm_const: float = 1.0,
+    has_fc1_alpha: bool = True,
+    has_fc2_alpha: bool = True,
+    has_fc1_norm_const: bool = True,
+    arch=None,
+) -> str:
+    from ..moe_ep.batch_invariant.nvfp4_spec import spec_fingerprint
+
+    return spec_fingerprint(
+        hidden,
+        intermediate,
+        top_k,
+        num_experts,
+        arch=_mx_family(arch, "megamoe_nvfp4"),
+        implementation=implementation,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        gate_up_clamp=gate_up_clamp,
+        input_norm_const=input_norm_const,
+        has_fc1_alpha=has_fc1_alpha,
+        has_fc2_alpha=has_fc2_alpha,
+        has_fc1_norm_const=has_fc1_norm_const,
+    )
+
+
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
     # the unified MoE layer with `BatchInvariantBf16Config`: the routing method and the activation (gated SwiGLU / ungated
@@ -278,6 +312,21 @@ CLASSES: Dict[str, ClassInfo] = {
         ("hidden", "intermediate", "top_k", "num_experts"),
         _megamoe_bf16_fingerprint,
         ("apply_routing_weights_before_fc2", "gate_up_clamp", "arch"),
+    ),
+    "megamoe_nvfp4": ClassInfo(
+        "megamoe.nvfp4",
+        ("hidden", "intermediate", "top_k", "num_experts"),
+        _megamoe_nvfp4_fingerprint,
+        (
+            "implementation",
+            "apply_routing_weights_before_fc2",
+            "gate_up_clamp",
+            "input_norm_const",
+            "has_fc1_alpha",
+            "has_fc2_alpha",
+            "has_fc1_norm_const",
+            "arch",
+        ),
     ),
     "mm_bf16": ClassInfo("gemm.bf16", ("N", "K"), _mm_bf16_fingerprint, ("bias",)),
     # the fp8 input dtype is a dimension: e4m3 and e5m2 are two classes (gemm.e4m3.*, gemm.e5m2.*) of one API; the output
@@ -334,6 +383,17 @@ def fingerprint(op: str, **dims) -> str:
     capacity, packing and scheduling are not dimensions. The environment scope additionally fixes EP
     topology, expert placement and the compiler stack. SM107 requires native ``sm_107a`` compilation
     and has its own architecture receipt. This is distinct from the regular MoE class.
+
+    ``megamoe_nvfp4`` takes the same four dimensions and isolates ``legacy``,
+    ``standard`` and ``genphase`` implementations and every architecture. Its
+    arithmetic uses E2M1 values/E4M3 block16 scales, K64 or K128 block-scaled
+    MMA, FP32 dequantization, SwiGLU, block16 intermediate requantization,
+    BF16 combine storage and ordered slot reduction. ``input_norm_const`` and
+    optional per-expert scale presence are additional dimensions. Public Mega
+    APIs materialize all three omitted scale tensors as ones, so their presence
+    defaults to True here. Scale values remain runtime inputs. The receipt's
+    main boundary is packed NVFP4 plus scales; separate components describe
+    the BF16 staging recipe. Prequantized calls supply that boundary directly.
 
     ``mm_bf16`` takes the weight shape ``N, K``: the K steps of the fold and the chunk count (a function of the
     weight shape alone) are the specification; M, the configuration and the weight's layout do not enter it. The

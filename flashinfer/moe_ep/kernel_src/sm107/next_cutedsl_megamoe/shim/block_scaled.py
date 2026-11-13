@@ -163,6 +163,11 @@ class Sm107BlockScaledMoeConfig:
 
     kernel_variant: Literal["inference", "genphase"] = "inference"
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
+    batch_invariant: bool = dataclasses.field(default=False, kw_only=True)
+    input_norm_const: float = dataclasses.field(default=1.0, kw_only=True)
+    has_fc1_alpha: bool = dataclasses.field(default=True, kw_only=True)
+    has_fc2_alpha: bool = dataclasses.field(default=True, kw_only=True)
+    has_fc1_norm_const: bool = dataclasses.field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
         if self.quant_kind not in _KIND_TABLE:
@@ -427,6 +432,18 @@ class Sm107BlockScaledMoeConfig:
                     "GenPhase does not use token-back or token-in flag knobs."
                 )
 
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            validate_nvfp4_batch_invariant,
+        )
+
+        if type(self.batch_invariant) is not bool:
+            raise ValueError("batch_invariant must be a bool.")
+        if self.batch_invariant:
+            for name in ("has_fc1_alpha", "has_fc2_alpha", "has_fc1_norm_const"):
+                if getattr(self, name) is not True:
+                    raise ValueError(f"batch_invariant workspace requires {name}=True.")
+        validate_nvfp4_batch_invariant(self, arch="sm_107")
+
     @property
     def experts_per_rank(self) -> int:
         return self.num_total_experts // self.world_size
@@ -537,6 +554,30 @@ class Sm107BlockScaledSymmBuffer:
         # Missing scalar bindings use the workspace's own tensors.
         self._bound_scalars: dict = {}
 
+        self._validate_batch_invariant_scalars()
+
+    def _validate_batch_invariant_scalars(self) -> None:
+        if not self.config.batch_invariant:
+            return
+        for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+            if getattr(self.config, f"has_{name}") is not (
+                getattr(self, name) is not None
+            ):
+                raise ValueError(
+                    f"batch_invariant scale presence does not match {name}."
+                )
+
+    @property
+    def batch_invariant_fingerprint(self) -> Optional[str]:
+        if not self.config.batch_invariant:
+            return None
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_fingerprint,
+        )
+
+        self._validate_batch_invariant_scalars()
+        return nvfp4_batch_invariant_fingerprint(self.config, arch="sm_107")
+
     def _allocate_execution_state(self) -> None:
         """Allocate reduction buffers and scratch, then reset cached bindings.
 
@@ -615,6 +656,11 @@ class Sm107BlockScaledSymmBuffer:
         from sources.api import ImplDesc, ProblemDesc
         from sources.quant_def import CombineFormat
 
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            validate_nvfp4_batch_invariant,
+        )
+
+        validate_nvfp4_batch_invariant(cfg, arch="sm_107")
         tiler = cfg.resolved_mma_tiler_mnk
         cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
         preferred_count: Optional[int] = None
@@ -658,6 +704,7 @@ class Sm107BlockScaledSymmBuffer:
         problem_desc = ProblemDesc(
             {
                 "expert_count": cfg.num_total_experts,
+                "batch_invariant": cfg.batch_invariant,
                 "intermediate_gateup_size": 2 * cfg.intermediate,
                 "hidden_size": cfg.hidden,
                 "quant_kind": cfg.quant_kind,
@@ -821,7 +868,9 @@ class Sm107BlockScaledSymmBuffer:
             raise RuntimeError(
                 "SM107 workspace must launch on the CUDA device that owns it."
             )
+        self._validate_batch_invariant_scalars()
         key = (
+            self.batch_invariant_fingerprint,
             transformed_l1[0].data_ptr(),
             transformed_l1[1].data_ptr(),
             transformed_l2[0].data_ptr(),
@@ -985,6 +1034,11 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     activation: Literal["swiglu", "situ"] = "swiglu",
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    batch_invariant: bool = False,
+    input_norm_const: float = 1.0,
+    has_fc1_alpha: bool = True,
+    has_fc2_alpha: bool = True,
+    has_fc1_norm_const: bool = True,
 ) -> Sm107BlockScaledSymmBuffer:
     """Allocate the SM107 block-scaled mega session workspace.
 
@@ -1003,6 +1057,11 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
         quant_kind=quant_kind,
         kernel_variant=kernel_variant,
         combine_dtype=combine_dtype,
+        batch_invariant=batch_invariant,
+        input_norm_const=input_norm_const,
+        has_fc1_alpha=has_fc1_alpha,
+        has_fc2_alpha=has_fc2_alpha,
+        has_fc1_norm_const=has_fc1_norm_const,
         mma_tiler_mnk=mma_tiler_mnk,
         cluster_shape_mn=cluster_shape_mn,
         fallback_cluster_shape_mn=fallback_cluster_shape_mn,

@@ -261,8 +261,10 @@ class TopkReduce:
         num_sms: Optional[int] = None,
         max_fetch: int = 8,
         fetch_rounds: int = 4,
+        batch_invariant: bool = False,
     ) -> None:
         self.hidden = int(hidden)
+        self.batch_invariant = batch_invariant
         self.num_topk = int(num_topk)
         self.num_experts = None if num_experts is None else int(num_experts)
         self.combine_format = combine_format
@@ -369,6 +371,10 @@ class TopkReduce:
     @cute.jit
     def _fma(self, lhs: _Float32Value, rhs: Float32, acc: _Float32Value) -> _Float32Value:
         """FP32 FMA with a scalar multiplier; packed on SM100+, scalar on SM90."""
+        if cutlass.const_expr(self.batch_invariant):
+            from flashinfer.moe_ep.batch_invariant.device import PackedF32
+
+            return PackedF32.fma(lhs, (rhs, rhs), acc)
         if cutlass.const_expr(self.use_scalar_math):
             if cutlass.const_expr(hasattr(cute.math, "fma")):
                 return cute.math.fma(lhs, rhs, acc)
@@ -386,6 +392,10 @@ class TopkReduce:
     @cute.jit
     def _fmul(self, lhs: _Float32Value, rhs: Float32) -> _Float32Value:
         """FP32 multiply with a scalar multiplier; packed on SM100+, scalar on SM90."""
+        if cutlass.const_expr(self.batch_invariant):
+            from flashinfer.moe_ep.batch_invariant.device import PackedF32
+
+            return PackedF32.mul(lhs, (rhs, rhs))
         if cutlass.const_expr(self.use_scalar_math):
             if cutlass.const_expr(hasattr(cute.math, "mul")):
                 return cute.math.mul(lhs, rhs)
@@ -693,8 +703,8 @@ class TopkReduce:
                 # f32 adder (add.rn.f32.bf16), no cvt. Seed with +0.0 so k == 0
                 # takes the same add and a -0.0 first term yields +0.0, exactly
                 # like fma(v, score, +0.0) on the other paths (main's +0 seed).
-                mixed_add = topk_score is None and not self.use_scalar_math and self._bf16_mixed_add
-                if cutlass.const_expr(mixed_add):
+                mixed_add = topk_score is None and not self.use_scalar_math and self._bf16_mixed_add and not self.batch_invariant
+                if cutlass.const_expr(mixed_add or self.batch_invariant):
                     for i in cutlass.range_constexpr(hidden_per_thread):
                         acc[i] = Float32(0.0)
                 # Note on load scheduling: ptxas sinks the last one or two of the
@@ -729,7 +739,17 @@ class TopkReduce:
                             score_reg[k] = score_dtype(0)
                     score = Float32(score_reg[k])
 
-                    if cutlass.const_expr(self.use_scalar_math):
+                    if cutlass.const_expr(self.batch_invariant):
+                        from flashinfer.moe_ep.batch_invariant.device import PackedF32
+
+                        for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                            values = (Float32(term[i]), Float32(term[i + 1]))
+                            previous = (acc[i], acc[i + 1])
+                            if cutlass.const_expr(topk_score is None):
+                                acc[i], acc[i + 1] = PackedF32.add(previous, values)
+                            else:
+                                acc[i], acc[i + 1] = PackedF32.fma(values, (score, score), previous)
+                    elif cutlass.const_expr(self.use_scalar_math):
                         for i in cutlass.range_constexpr(hidden_per_thread):
                             value = Float32(term[i])
                             if cutlass.const_expr(k != 0):

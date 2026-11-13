@@ -30,6 +30,16 @@ replace its own device snapshot.
 
 ## Pending local diffs vs upstream
 
+- **NVFP4 batch-invariant arithmetic:** the NVFP4 frontend binds a fixed
+  M256/N128/K256 paired-CTA geometry, K64 MMA fold and full-N descriptor.
+  `src/moe_nvfp4_swapab/kernel_fc12.py` omits dynamic short-N input shifts
+  in this mode; `epilogue_refactor.py` uses the shared ordered activation,
+  block16 requantization and FC2 conversion. `topk_reduce.py` uses an explicit
+  +0 slot fold with early add or late FMA and masked operands.
+  `src/src/inputs_process.py` binds the same pinned offline input quantizer.
+  The branches are opt-in and preserve the ordinary implementations.
+  Reapply these necessary local changes until upstream absorbs them.
+
 - **Single-CTA dynamic scheduling:**
   `src/moe_nvfp4_swapab/fc1_fc2_fuse_sched.py` publishes atomic-counter work
   through a warp shuffle for one-CTA clusters, followed by the existing local

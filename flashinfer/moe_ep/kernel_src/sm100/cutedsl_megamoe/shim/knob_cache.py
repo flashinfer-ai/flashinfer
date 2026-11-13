@@ -67,8 +67,14 @@ def _batch_invariant_version(
 ) -> Optional[int]:
     if not batch_invariant:
         return None
-    if dtype != "bf16":
-        raise ValueError("batch_invariant knob-cache entries require dtype='bf16'.")
+    if dtype not in ("bf16", "nvfp4"):
+        raise ValueError("batch_invariant knob-cache entries require BF16 or NVFP4.")
+    if dtype == "nvfp4":
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            NVFP4_BATCH_INVARIANT_VERSION,
+        )
+
+        return NVFP4_BATCH_INVARIANT_VERSION if version is None else version
     if version is None:
         from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
             BF16_BATCH_INVARIANT_VERSION,
@@ -81,6 +87,8 @@ def _batch_invariant_version(
 def _arithmetic_fingerprint(
     *,
     batch_invariant: bool,
+    dtype: str,
+    input_norm_const: float,
     hidden: int,
     intermediate: int,
     topk: int,
@@ -90,6 +98,28 @@ def _arithmetic_fingerprint(
 ) -> Optional[str]:
     if not batch_invariant:
         return None
+    if dtype == "nvfp4":
+        from flashinfer.moe_ep.batch_invariant.nvfp4_spec import (
+            spec_fingerprint as nvfp4_spec_fingerprint,
+        )
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_arch,
+        )
+
+        return nvfp4_spec_fingerprint(
+            hidden=hidden,
+            intermediate=intermediate // 2,
+            top_k=topk,
+            num_experts=num_experts,
+            arch=nvfp4_batch_invariant_arch(),
+            implementation="legacy",
+            apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+            gate_up_clamp=gate_up_clamp,
+            input_norm_const=input_norm_const,
+            has_fc1_alpha=True,
+            has_fc2_alpha=True,
+            has_fc1_norm_const=True,
+        )
     from flashinfer.moe_ep.batch_invariant.spec import spec_fingerprint
     from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
         bf16_batch_invariant_arch,
@@ -180,6 +210,16 @@ def _entry_needs_ikr(entry: Dict[str, Any]) -> bool:
     return bool(isinstance(knobs, dict) and knobs.get("in_kernel_fc2_reduce"))
 
 
+def _nvfp4_bi_plan_valid(knobs):
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+        nvfp4_batch_invariant_knobs_valid,
+    )
+
+    return nvfp4_batch_invariant_knobs_valid(
+        _knobs_from_json(knobs), implementation="legacy"
+    )
+
+
 @deprecated_aliases(
     apply_topk_in_fc1="apply_routing_weights_before_fc2",
     defer_topk_reduce="use_custom_finalize",
@@ -200,6 +240,7 @@ def _matching_entries(
     batch_invariant: bool = False,
     batch_invariant_version: Optional[int] = None,
     gate_up_clamp: Optional[float] = None,
+    input_norm_const: float = 1.0,
     device: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return the cached knob dict for this session key, or ``None`` on miss.
@@ -210,6 +251,7 @@ def _matching_entries(
         dtype, batch_invariant, batch_invariant_version
     )
     arithmetic_fingerprint = _arithmetic_fingerprint(
+        dtype=dtype,
         batch_invariant=batch_invariant,
         hidden=hidden,
         intermediate=intermediate,
@@ -217,6 +259,7 @@ def _matching_entries(
         num_experts=num_experts,
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         gate_up_clamp=gate_up_clamp,
+        input_norm_const=input_norm_const,
     )
     path = _cache_path()
     if path is None:
@@ -246,6 +289,9 @@ def _matching_entries(
         )
         and e.get("profile") in (None, "live_tokens")
         and isinstance(e.get("knobs"), dict)
+        and (
+            not batch_invariant or dtype != "nvfp4" or _nvfp4_bi_plan_valid(e["knobs"])
+        )
         and isinstance(e.get("max_tokens"), int)
         and (enable_in_kernel_fc2_reduce or not _entry_needs_ikr(e))
     ]
@@ -283,6 +329,7 @@ def lookup_knobs(
     batch_invariant: bool = False,
     batch_invariant_version: Optional[int] = None,
     gate_up_clamp: Optional[float] = None,
+    input_norm_const: float = 1.0,
     device: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     from flashinfer.moe_ep.core.tuning import select_token_entries
@@ -302,6 +349,7 @@ def lookup_knobs(
         batch_invariant=batch_invariant,
         batch_invariant_version=batch_invariant_version,
         gate_up_clamp=gate_up_clamp,
+        input_norm_const=input_norm_const,
         device=device,
     )
     matches = select_token_entries(matches, max_tokens, live_tokens)
@@ -343,6 +391,7 @@ def record_knobs(
     batch_invariant: bool = False,
     batch_invariant_version: Optional[int] = None,
     gate_up_clamp: Optional[float] = None,
+    input_norm_const: float = 1.0,
     device: Optional[str] = None,
     p50_us: Optional[float] = None,
     source: str = "autotune",
@@ -362,10 +411,13 @@ def record_knobs(
     the write failed (recording is best-effort — a read-only home directory
     must not break tuning).
     """
+    if batch_invariant and dtype == "nvfp4" and not _nvfp4_bi_plan_valid(knobs):
+        raise ValueError("cannot record an inadmissible batch-invariant NVFP4 plan")
     policy_version = _batch_invariant_version(
         dtype, batch_invariant, batch_invariant_version
     )
     arithmetic_fingerprint = _arithmetic_fingerprint(
+        dtype=dtype,
         batch_invariant=batch_invariant,
         hidden=hidden,
         intermediate=intermediate,
@@ -373,6 +425,7 @@ def record_knobs(
         num_experts=num_experts,
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         gate_up_clamp=gate_up_clamp,
+        input_norm_const=input_norm_const,
     )
     if live_tokens is None:
         live_tokens = max_tokens
@@ -399,7 +452,7 @@ def record_knobs(
         source=source,
         tuned_at=datetime.datetime.now().isoformat(timespec="seconds"),
     )
-    if dtype == "bf16":
+    if dtype in ("bf16", "nvfp4"):
         entry.update(
             batch_invariant=batch_invariant,
             batch_invariant_version=policy_version,
@@ -478,6 +531,7 @@ def resolve_knobs(
     batch_invariant: bool = False,
     batch_invariant_version: Optional[int] = None,
     gate_up_clamp: Optional[float] = None,
+    input_norm_const: float = 1.0,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else built-in heuristic.
 
@@ -509,9 +563,16 @@ def resolve_knobs(
         batch_invariant=batch_invariant,
         batch_invariant_version=batch_invariant_version,
         gate_up_clamp=gate_up_clamp,
+        input_norm_const=input_norm_const,
     )
     if cached is not None:
         return cached, "cache"
+    if batch_invariant and dtype == "nvfp4":
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_default_knobs,
+        )
+
+        return nvfp4_batch_invariant_default_knobs("legacy"), "heuristic"
     from .tuner import default_knobs
 
     # The cache keys on the precise element kind (``mxfp8_e4m3`` and

@@ -500,6 +500,24 @@ def is_valid_bf16_mxfp8_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
     )
 
 
+def is_valid_nvfp4_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
+    """Apply NVFP4 BI admission as well as the ordinary geometry rules."""
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+        validate_nvfp4_batch_invariant,
+    )
+
+    try:
+        validate_nvfp4_batch_invariant(config, knobs, implementation="legacy")
+    except (TypeError, ValueError):
+        return False
+    wire = {"bf16": "bf16", "mxfp8": "32e4m3xe8m0", "nvfp4": "16e2m1xbf16"}[
+        config.combine_dtype
+    ]
+    return _ikr_knob_permitted(config, knobs) and is_valid(
+        _effective_knobs(config, knobs), combine_format=wire
+    )
+
+
 def is_valid_bf16_nvfp4_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
     """Validate BF16/NVFP4 knobs against the session's reduction permission."""
     effective = _effective_knobs(config, knobs)
@@ -545,7 +563,17 @@ def with_knobs(config: Any, knobs: Optional[Dict[str, Any]]) -> Any:
         validate_bf16_batch_invariant,
     )
 
-    validate_bf16_batch_invariant(config, knobs)
+    is_bf16 = type(config).__name__ == "MegaMoEBf16Config"
+    if is_bf16:
+        validate_bf16_batch_invariant(config, knobs)
+    elif getattr(config, "batch_invariant", False):
+        if type(config).__name__ != "MegaMoENvfp4Config":
+            raise ValueError("unsupported batch-invariant tuning configuration")
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            validate_nvfp4_batch_invariant,
+        )
+
+        validate_nvfp4_batch_invariant(config, knobs, implementation="legacy")
     if not knobs:
         return config
     fields = {f.name for f in dataclasses.fields(config)}
@@ -556,7 +584,7 @@ def with_knobs(config: Any, knobs: Optional[Dict[str, Any]]) -> Any:
         elif key in fields:
             overrides[key] = value
         # silently drop knobs this dtype's config does not expose
-    if "batch_invariant" in fields and "mma_tiler_mnk" in fields:
+    if is_bf16 and "mma_tiler_mnk" in fields:
         overrides.update(dataclasses.asdict(bf16_plan_config(config, knobs)))
     # Other dtypes retain their existing 2-CTA derivation.
     elif "mma_tiler_mnk" in overrides and "use_2cta_instrs" in fields:
@@ -590,6 +618,10 @@ _EXPLICIT_CONFIG_FIELDS = frozenset(
         "combine_dtype",
         "enable_fc1_activation_per_token_scale",
         "batch_invariant",
+        "input_norm_const",
+        "has_fc1_alpha",
+        "has_fc2_alpha",
+        "has_fc1_norm_const",
     }
 )
 
