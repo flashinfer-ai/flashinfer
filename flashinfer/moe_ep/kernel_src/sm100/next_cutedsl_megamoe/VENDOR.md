@@ -170,3 +170,12 @@ coefficient bits. Ordinary names remain byte-for-byte unchanged. This also
 separates the standard provider's name-derived AOT symbols. Reapply this host
 metadata patch together with the BI arithmetic hooks after regenerating the
 export until upstream absorbs it.
+
+## Collective workspace preparation
+
+The FlashInfer shim agrees on local allocation and preparation failures across
+the selected EP process group before entering the symmetric heap. Winner
+installation prepares replacement local storage before freeing existing
+symmetric storage, so a failed local preparation preserves the current owner.
+Trial staging and compilation finish collectively before any trial launch.
+These agreements occur during preparation, outside serving and graph replay.

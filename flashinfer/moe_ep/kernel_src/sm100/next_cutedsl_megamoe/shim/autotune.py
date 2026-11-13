@@ -185,32 +185,37 @@ def _sweep_sm100_mega_moe(
             continue
         trial = workspace_type(
             trial_cfg,
+            **({"process_group": process_group} if process_group is not None else {}),
             **(
                 {"num_valid_tokens_tensor": live_count}
                 if live_count is not None
                 else {}
             ),
         )
-        for name in ("x", "x_sf", "topk_idx", "topk_weights"):
-            getattr(trial, name).view(torch.uint8).copy_(
-                getattr(symm_buffer, name).view(torch.uint8)
-            )
-        for name in (
-            "fc1_alpha",
-            "fc2_alpha",
-            "fc1_norm_const",
-            "fc1_activation_per_token_scale",
-        ):
-            source = getattr(symm_buffer, name, None)
-            if source is not None:
-                getattr(trial, name).copy_(source)
-        trial.note_staged_tokens(num_tokens)
-        _prepare_collectively(
-            lambda: trial.prepare(transformed_l1, transformed_l2),
+
+        def prepare_trial():
+            for name in ("x", "x_sf", "topk_idx", "topk_weights"):
+                getattr(trial, name).view(torch.uint8).copy_(
+                    getattr(symm_buffer, name).view(torch.uint8)
+                )
+            for name in (
+                "fc1_alpha",
+                "fc2_alpha",
+                "fc1_norm_const",
+                "fc1_activation_per_token_scale",
+            ):
+                source = getattr(symm_buffer, name, None)
+                if source is not None:
+                    getattr(trial, name).copy_(source)
+            trial.note_staged_tokens(num_tokens)
+            trial.prepare(transformed_l1, transformed_l2)
+            return trial if make_trial is None else make_trial(trial)
+
+        measured_trial = _prepare_collectively(
+            prepare_trial,
             cfg.world_size,
             process_group,
         )
-        measured_trial = trial if make_trial is None else make_trial(trial)
         barrier()
         measured_trial.launch(transformed_l1, transformed_l2)
         torch.cuda.synchronize()
@@ -266,9 +271,9 @@ def _sweep_sm100_mega_moe(
 
 
 def _prepare_collectively(prepare, world_size, process_group):
-    error = None
+    result, error = None, None
     try:
-        prepare()
+        result = prepare()
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
     errors = [error]
@@ -278,7 +283,9 @@ def _prepare_collectively(prepare, world_size, process_group):
         errors = [None] * world_size
         dist.all_gather_object(errors, error, group=process_group)
     if any(errors):
+        result = None
         raise RuntimeError(f"MegaMoE preparation failed on EP ranks: {errors}")
+    return result
 
 
 def autotune_sm100_block_scaled_mega_moe(

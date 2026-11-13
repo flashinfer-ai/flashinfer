@@ -365,31 +365,44 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         )
 
         cfg = self._workspace_config(fleet_params)
+        process_group = self.ep_comm_group if self.ep_world_size > 1 else None
         if cfg.kernel_variant == "genphase":
-            workspace = Sm100GenphaseSymmBuffer(cfg)
+            workspace = Sm100GenphaseSymmBuffer(cfg, process_group=process_group)
         else:
             workspace = Sm100BlockScaledSymmBuffer(
                 cfg,
+                process_group=process_group,
                 num_valid_tokens_tensor=(
                     self._config.num_valid_tokens_tensor
                     if cfg.use_persistent_finalize_kernel
                     else None
                 ),
             )
-        if self.supports_unfinalized_output:
-            workspace._unfinalized_route_map = torch.arange(
-                cfg.max_tokens_per_rank * cfg.num_topk,
-                dtype=torch.int32,
-                device=workspace.device,
-            ).view(cfg.max_tokens_per_rank, cfg.num_topk)
-            workspace._unfinalized_weights = torch.ones_like(workspace.topk_weights)
-        if self._kind() == "nvfp4":
-            for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
-                value = getattr(self._config, name)
-                if isinstance(value, (int, float)):
-                    getattr(workspace, name).fill_(value)
-                elif value is not None:
-                    getattr(workspace, name).copy_(value)
+
+        def prepare_outputs():
+            if self.supports_unfinalized_output:
+                workspace._unfinalized_route_map = torch.arange(
+                    cfg.max_tokens_per_rank * cfg.num_topk,
+                    dtype=torch.int32,
+                    device=workspace.device,
+                ).view(cfg.max_tokens_per_rank, cfg.num_topk)
+                workspace._unfinalized_weights = torch.ones_like(workspace.topk_weights)
+            if self._kind() == "nvfp4":
+                for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+                    value = getattr(self._config, name)
+                    if isinstance(value, (int, float)):
+                        getattr(workspace, name).fill_(value)
+                    elif value is not None:
+                        getattr(workspace, name).copy_(value)
+
+        from .....kernel_src.sm100.next_cutedsl_megamoe.shim import comm
+
+        comm.prepare_local(
+            prepare_outputs,
+            cfg.world_size,
+            process_group,
+            phase="backend output preparation",
+        )
         return workspace
 
     def _workspace_pool_key(self, fleet_params):

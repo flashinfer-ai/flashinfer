@@ -441,6 +441,68 @@ def test_a16_batch_invariant_deferred_partials(kind, early, monkeypatch):
             graph.reset()
 
 
+@pytest.mark.parametrize("kind", ("w4a16", "nvfp4"))
+def test_batch_invariant_scalar_overrides_restore_live_defaults_blackwell_only(
+    kind, monkeypatch
+):
+    import torch
+    from flashinfer.moe_ep import MoEEpTensors
+    from .test_nvfp4_megamoe_batch_invariant import _config as nvfp4_config
+
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        pytest.skip("single-rank scalar staging regression")
+    _device("legacy")
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    alpha = torch.ones(4, dtype=torch.float32, device="cuda")
+    norm = torch.ones_like(alpha)
+    if kind == "w4a16":
+        x, scores, ids, weights = _inputs(kind, 0, 1)
+        config = _config(kind, True)
+    else:
+        x, scores, ids, weights = _problem(0, 1, 384, 192)
+        config = nvfp4_config("legacy", True, 384, 192, knobs={})
+    config = replace(config, fc1_alpha=None, fc2_alpha=alpha, fc1_norm_const=norm)
+    inputs = MoEEpTensors(x[:17], ids[:17], scores[:17])
+    zeros = torch.zeros_like(alpha)
+    other_norm = torch.full_like(norm, 2.0)
+    overrides = replace(
+        inputs, fc1_alpha=zeros, fc2_alpha=zeros, fc1_norm_const=other_norm
+    )
+    with _layer(config, weights, 0, 1, 129, 384) as layer:
+        receipt = layer.batch_invariant_fingerprint
+        baseline = layer(inputs).clone()
+        assert torch.count_nonzero(baseline) > 0
+        assert torch.count_nonzero(layer(overrides)) == 0
+        assert torch.equal(alpha, torch.ones_like(alpha))
+        assert torch.equal(norm, torch.ones_like(norm))
+        assert_bits(
+            layer(inputs), baseline, "omitted scalar overrides restore defaults"
+        )
+        expected_norm = layer(replace(inputs, fc1_norm_const=other_norm)).clone()
+        layer(inputs)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                output = layer(inputs)
+            # A preceding invocation may have changed the shared scratch values.
+            layer(overrides)
+            for alpha_value, norm_value in ((1, 1), (0, 1), (1, 2), (1, 1)):
+                alpha.fill_(alpha_value)
+                norm.fill_(norm_value)
+                graph.replay()
+                expected = (
+                    torch.zeros_like(baseline)
+                    if not alpha_value
+                    else baseline
+                    if norm_value == 1
+                    else expected_norm
+                )
+                assert_bits(output, expected, "live config scalar graph replay")
+            assert layer.batch_invariant_fingerprint == receipt
+        finally:
+            graph.reset()
+
+
 @pytest.mark.parametrize("kind,early", (("w4a16", True), ("w8a16_e4m3", True)))
 def test_a16_batch_invariant_public_autotune_disk_reload(
     kind, early, tmp_path, monkeypatch

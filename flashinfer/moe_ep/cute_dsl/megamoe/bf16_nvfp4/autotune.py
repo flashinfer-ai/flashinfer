@@ -194,12 +194,6 @@ def autotune_bf16_nvfp4_mega_moe(
             enable_in_kernel_fc2_reduce=cfg.enable_in_kernel_fc2_reduce,
             batch_invariant=cfg.batch_invariant,
         )
-    candidates = _session_candidates(
-        candidates,
-        cfg,
-        tuner.is_valid_bf16_nvfp4_for_config,
-        what="BF16/NVFP4 MegaMoE",
-    )
 
     def prepare_launch():
         n = cfg.num_tokens_per_rank if num_tokens is None else num_tokens
@@ -297,6 +291,12 @@ def autotune_bf16_nvfp4_mega_moe(
         on_winner=record,
         prepare_launch=prepare_launch,
         config_overrides=overrides,
+        candidate_filter=lambda proposed: _session_candidates(
+            proposed,
+            cfg,
+            tuner.is_valid_bf16_nvfp4_for_config,
+            what="BF16/NVFP4 MegaMoE",
+        ),
         process_group=process_group,
         measure_launch=measure,
     )

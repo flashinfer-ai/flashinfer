@@ -275,6 +275,15 @@ the export until upstream absorbs it.
 
 ## Related trees
 
+The FlashInfer host shim prepares kernel metadata, routing indices, scalar
+buffers, local output and scratch before entering the symmetric heap. All EP
+ranks exchange local allocation failures through their process group first.
+Tuning winner installation likewise prepares replacement local storage before
+freeing any existing symmetric owner; trial staging and compilation agree on
+failure before collective execution. These checks run only at collective
+preparation boundaries, without adding host collectives to steady-state or
+captured launches. Retain this shim integration when refreshing the export.
+
 `sm100/cutedsl_megamoe` and the SM90 drop are separate snapshots. This Rubin
 drop comes from upstream's `next/` generation, with relative imports and the
 `api.py` component model; it does not replace the older SM100 packages.

@@ -506,22 +506,24 @@ class BlockScaledSymmBuffer:
             "An architecture adapter must select the compiler target."
         )
 
-    def __init__(self, config: BlockScaledMoeConfig) -> None:
+    def __init__(self, config: BlockScaledMoeConfig, *, process_group=None) -> None:
         """Allocate staging, output and kernel storage collectively before capture."""
-        comm.ensure_not_capturing("block-scaled mega workspace allocation")
-        self._require_device()
-        self._configure_dsl()
-        self._tuning_state = AutoTuningState()
         self.config: BlockScaledMoeConfig = config
-        self.device = torch.device("cuda", torch.cuda.current_device())
+        self._process_group = process_group
+        prepared = comm.prepare_local(
+            self._prepare_session_local,
+            config.world_size,
+            process_group,
+            phase="session local allocation",
+        )
+        self.device = prepared.pop("device")
+        self.kernel = prepared.pop("kernel")
+        self.sf_cols = prepared.pop("sf_cols")
+        self.topk_idx = prepared.pop("topk_idx")
+        self.__dict__.update(prepared)
+        self._tuning_state = AutoTuningState()
         cfg = config
-
-        # The driver occupancy query needs a current primary context.
-        torch.cuda.current_stream(self.device)
-
-        kernel = self._build_kernel(cfg)
-        self.kernel = kernel
-
+        kernel = self.kernel
         tokens = cfg.padded_tokens_per_rank
 
         # Staging tensors. Activation / SF / scores are pulled by peer dispatch
@@ -531,30 +533,8 @@ class BlockScaledSymmBuffer:
             self.x = comm.sym_zeros((tokens, cfg.hidden // 2), cfg.torch_act_data_dtype)
         else:
             self.x = comm.sym_zeros((tokens, cfg.hidden), cfg.torch_act_data_dtype)
-        self.sf_cols = int(
-            kernel.token_comm.plain_activation_sf_row_elements
-            if cfg.kernel_variant == "genphase"
-            else kernel.token_comm.activation_sf_hidden_padded
-        )
         self.x_sf = comm.sym_zeros((tokens, self.sf_cols), cfg.torch_act_sf_dtype)
         self.topk_weights = comm.sym_zeros((tokens, cfg.num_topk), torch.float32)
-        self.topk_idx = torch.full(
-            (tokens, cfg.num_topk), -1, dtype=torch.int32, device="cuda"
-        )
-        # Stable local-expert pointers allow per-call scaling updates in graphs.
-        # Defaults and overrides are copied on every backend staging call.
-        for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
-            setattr(
-                self,
-                name,
-                torch.ones(
-                    cfg.experts_per_rank, dtype=torch.float32, device=self.device
-                )
-                if cfg.quant_kind == "nvfp4"
-                else None,
-            )
-        if self.topk_idx.data_ptr() % 16 != 0:
-            raise RuntimeError("routing index tensor must be 16-byte aligned.")
 
         # In-kernel reduce: the combine peer-writes (red.add) each topk term
         # straight into the output, so it must live on the SYMMETRIC heap and
@@ -562,10 +542,6 @@ class BlockScaledSymmBuffer:
         if cfg.reduce_topk_in_kernel:
             self.output_activation = comm.sym_zeros(
                 (tokens, cfg.hidden), torch.bfloat16
-            )
-        else:
-            self.output_activation = torch.zeros(
-                (tokens, cfg.hidden), dtype=torch.bfloat16, device="cuda"
             )
 
         self.fc1_activation_per_token_scale = (
@@ -576,7 +552,7 @@ class BlockScaledSymmBuffer:
         if self.fc1_activation_per_token_scale is not None:
             self.fc1_activation_per_token_scale.fill_(1)
 
-        self._allocate_kernel_workspace(kernel)
+        self._allocate_kernel_workspace(kernel, local_workspace=self.local_workspace)
 
         self._compiled: Optional[Any] = None
         self._launch_key: Optional[tuple] = None
@@ -588,6 +564,57 @@ class BlockScaledSymmBuffer:
         self._destroyed = False
 
         self._validate_batch_invariant_scalars()
+
+    def _prepare_session_local(self) -> dict:
+        """Finish every local allocation before entering the symmetric heap."""
+        comm.ensure_not_capturing("block-scaled mega workspace allocation")
+        self._require_device()
+        self._configure_dsl()
+        cfg = self.config
+        device = torch.device("cuda", torch.cuda.current_device())
+        # The driver occupancy query needs a current primary context.
+        torch.cuda.current_stream(device)
+        kernel = self._build_kernel(cfg)
+        prepared = dict(
+            device=device,
+            kernel=kernel,
+            sf_cols=int(
+                kernel.token_comm.plain_activation_sf_row_elements
+                if cfg.kernel_variant == "genphase"
+                else kernel.token_comm.activation_sf_hidden_padded
+            ),
+            topk_idx=torch.full(
+                (cfg.padded_tokens_per_rank, cfg.num_topk),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            ),
+            output_activation=(
+                None
+                if cfg.reduce_topk_in_kernel
+                else torch.zeros(
+                    (cfg.padded_tokens_per_rank, cfg.hidden),
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+            ),
+            local_workspace=self._prepare_kernel_workspace_local(kernel),
+        )
+        for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+            prepared[name] = (
+                torch.ones(cfg.experts_per_rank, dtype=torch.float32, device=device)
+                if cfg.quant_kind == "nvfp4"
+                else None
+            )
+            if cfg.batch_invariant and getattr(cfg, f"has_{name}") is not (
+                prepared[name] is not None
+            ):
+                raise ValueError(
+                    f"batch_invariant scale presence does not match {name}."
+                )
+        if prepared["topk_idx"].data_ptr() % 16:
+            raise RuntimeError("routing index tensor must be 16-byte aligned.")
+        return prepared
 
     def _validate_batch_invariant_scalars(self) -> None:
         if not self.config.batch_invariant:
@@ -611,20 +638,42 @@ class BlockScaledSymmBuffer:
         self._validate_batch_invariant_scalars()
         return block_scaled_batch_invariant_fingerprint(self.config)
 
-    def _allocate_kernel_workspace(self, kernel) -> None:
-        """Allocate kernel-owned storage; staging and output pointers stay stable."""
-        cfg = self.config
-        tokens = cfg.padded_tokens_per_rank
+    def _prepare_kernel_workspace_local(self, kernel) -> torch.Tensor:
         workspace = kernel._device_workspace
         local_bytes = int(workspace.total_bytes("local"))
+        local = torch.zeros((max(local_bytes, 1),), dtype=torch.uint8, device="cuda")
+        if local.data_ptr() % 128:
+            raise RuntimeError("block-scaled mega workspaces must be 128-byte aligned.")
+        return local
+
+    def _allocate_kernel_workspace(self, kernel, *, local_workspace=None) -> None:
+        """Allocate kernel-owned storage; staging and output pointers stay stable."""
+        cfg = self.config
+        workspace = kernel._device_workspace
         shared_bytes = int(workspace.total_bytes("shared"))
         # Allocated fully zeroed, which covers require_zero_workspace_leading_bytes.
-        self.local_workspace = torch.zeros(
-            (max(local_bytes, 1),), dtype=torch.uint8, device="cuda"
-        )
+        if local_workspace is None:
+            local_workspace = comm.prepare_local(
+                lambda: self._prepare_kernel_workspace_local(kernel),
+                cfg.world_size,
+                getattr(self, "_process_group", None),
+                phase="kernel local allocation",
+            )
+        self.local_workspace = local_workspace
         self.shared_workspace: torch.Tensor | None = comm.sym_zeros(
             (max(shared_bytes, 1),), torch.uint8
         )
+        comm.prepare_local(
+            lambda: self._bind_kernel_workspace(kernel),
+            cfg.world_size,
+            getattr(self, "_process_group", None),
+            phase="symmetric workspace binding",
+        )
+
+    def _bind_kernel_workspace(self, kernel) -> None:
+        cfg = self.config
+        tokens = cfg.padded_tokens_per_rank
+        workspace = kernel._device_workspace
         self._pre_reduced_activation = None
         self._pre_reduced_activation_sf = None
         if not cfg.reduce_topk_in_kernel:
@@ -930,15 +979,17 @@ class BlockScaledSymmBuffer:
         """Replace execution scratch before capture, keeping staged inputs alive."""
         from .tuning import is_valid_sm100_knobs
 
-        comm.ensure_not_capturing("Blackwell tuning winner installation")
-        if self._destroyed or self._tuning_state.graph_captured:
-            raise RuntimeError(
-                "cannot tune a destroyed or captured Blackwell workspace"
-            )
-        if not is_valid_sm100_knobs(knobs, self.config):
-            raise ValueError("invalid Blackwell tuning knobs")
-        config = dataclasses.replace(self.config, **knobs)
-        if config != self.config:
+        def prepare_replacement():
+            comm.ensure_not_capturing("Blackwell tuning winner installation")
+            if self._destroyed or self._tuning_state.graph_captured:
+                raise RuntimeError(
+                    "cannot tune a destroyed or captured Blackwell workspace"
+                )
+            if not is_valid_sm100_knobs(knobs, self.config):
+                raise ValueError("invalid Blackwell tuning knobs")
+            config = dataclasses.replace(self.config, **knobs)
+            if config == self.config:
+                return None
             kernel = self._build_kernel(config)
             sf_cols = int(
                 kernel.token_comm.plain_activation_sf_row_elements
@@ -947,7 +998,29 @@ class BlockScaledSymmBuffer:
             )
             if sf_cols != self.sf_cols:
                 raise ValueError("tuning cannot change the staged scale layout")
+            local = self._prepare_kernel_workspace_local(kernel)
+            output = self.output_activation
+            if config.reduce_topk_in_kernel != self.config.reduce_topk_in_kernel:
+                output = (
+                    None
+                    if config.reduce_topk_in_kernel
+                    else torch.zeros(
+                        (config.padded_tokens_per_rank, config.hidden),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                )
             torch.cuda.synchronize()
+            return config, kernel, local, output
+
+        prepared = comm.prepare_local(
+            prepare_replacement,
+            self.config.world_size,
+            self._process_group,
+            phase="winner local allocation",
+        )
+        if prepared is not None:
+            config, kernel, local, output = prepared
             self._compiled = self._launch_key = self._launch_kwargs = None
             self._launch_weights = None
             self._pre_reduced_activation = self._pre_reduced_activation_sf = None
@@ -956,15 +1029,21 @@ class BlockScaledSymmBuffer:
             if config.reduce_topk_in_kernel != self.config.reduce_topk_in_kernel:
                 if self.config.reduce_topk_in_kernel:
                     comm.free_sym_tensor(self.output_activation)
-                shape = (config.padded_tokens_per_rank, config.hidden)
                 self.output_activation = (
-                    comm.sym_zeros(shape, torch.bfloat16)
+                    comm.sym_zeros(
+                        (config.padded_tokens_per_rank, config.hidden), torch.bfloat16
+                    )
                     if config.reduce_topk_in_kernel
-                    else torch.zeros(shape, dtype=torch.bfloat16, device=self.device)
+                    else output
                 )
             self.config, self.kernel = config, kernel
-            self._allocate_kernel_workspace(kernel)
-        self.prepare(transformed_l1, transformed_l2)
+            self._allocate_kernel_workspace(kernel, local_workspace=local)
+        comm.prepare_local(
+            lambda: self.prepare(transformed_l1, transformed_l2),
+            self.config.world_size,
+            self._process_group,
+            phase="winner compilation",
+        )
 
     def destroy(self) -> None:
         if self._destroyed:

@@ -379,6 +379,88 @@ def test_numerical_per_token_blackwell_only_nvfp4(
     assert_reference(
         anchor[:17], expected, 0.025, "per-token/custom independent oracle"
     )
+    if provider != "standard":
+        return
+
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.autotune import (
+        autotune_sm100_block_scaled_mega_moe,
+    )
+    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.correctness import (
+        sampled_reference,
+    )
+    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import (
+        knob_keys,
+    )
+
+    # Both scales are finite, normal FP32 values. Their product is 2, while
+    # multiplying the accumulator by expert alpha first would overflow.
+    count, experts = 17, weights.w13.shape[0]
+    alpha = torch.full((experts,), 1e38, dtype=torch.float32, device="cuda")
+    token_scale = torch.full((count,), 2e-38, dtype=torch.float32, device="cuda")
+    weights, _ = _plain_quantized_weights(
+        moe_ep.MoEWeightPack(
+            w13=torch.full(
+                (experts, 2 * INTERMEDIATE, HIDDEN),
+                0.03125,
+                dtype=torch.bfloat16,
+                device="cuda",
+            ),
+            w2=torch.full(
+                (experts, HIDDEN, INTERMEDIATE),
+                0.015625,
+                dtype=torch.bfloat16,
+                device="cuda",
+            ),
+        ),
+        INTERMEDIATE,
+    )
+    packed, scales = nvfp4_quantize_per_block_16(
+        torch.full((count, HIDDEN), 0.25, device="cuda"), 1.0
+    )
+    config = replace(
+        config,
+        top_k=1,
+        activation="swiglu",
+        situ_beta=None,
+        situ_linear_beta=None,
+        gate_up_clamp=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        input_norm_const=1.0,
+        fc1_alpha=alpha,
+        fc2_alpha=None,
+        fc1_norm_const=None,
+        finalize_mode=moe_ep.FinalizeMode.DEFAULT,
+    )
+    inputs = moe_ep.MoEEpTensors(
+        packed,
+        torch.zeros((count, 1), dtype=torch.int32, device="cuda"),
+        torch.ones((count, 1), dtype=torch.float32, device="cuda"),
+        scales=scales,
+        fc1_activation_per_token_scale=token_scale,
+    )
+    with _layer(config, weights, 0, 1, count, HIDDEN, quantize=False) as layer:
+        actual = layer.forward(inputs).clone()
+        workspace, (l1, l2) = layer._workspace, layer._transformed
+        indices, expected = sampled_reference(workspace, l1, l2, count)
+        assert_reference(actual[indices], expected, 0.02, "folded per-token scales")
+        candidate = {
+            name: getattr(workspace.config, name)
+            for name in knob_keys(workspace.config)
+        }
+        winner = autotune_sm100_block_scaled_mega_moe(
+            actual,
+            l1,
+            l2,
+            workspace,
+            num_tokens=count,
+            candidates=[candidate],
+            warmup_iters=1,
+            timed_iters=1,
+            calls_per_sample=1,
+        )
+        assert winner == candidate
 
 
 @pytest.mark.parametrize(

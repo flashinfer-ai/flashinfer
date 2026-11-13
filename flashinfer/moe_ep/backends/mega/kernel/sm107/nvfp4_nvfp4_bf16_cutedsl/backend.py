@@ -228,7 +228,10 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             Sm107BlockScaledSymmBuffer,
         )
 
-        return Sm107BlockScaledSymmBuffer(self._resolved_config(fleet_params))
+        return Sm107BlockScaledSymmBuffer(
+            self._resolved_config(fleet_params),
+            process_group=self.ep_comm_group if self.ep_world_size > 1 else None,
+        )
 
     def _knob_overrides(self, fleet_params: FleetParams) -> dict:
         """Resolve fixed overrides or the automatic workspace's initial heuristic."""

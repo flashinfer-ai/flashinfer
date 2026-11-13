@@ -314,9 +314,9 @@ def sm107_schedule_candidates(
 
 def _prepare_collectively(prepare, world_size, process_group):
     """Finish host preparation on every rank before launching collective kernels."""
-    error = None
+    result, error = None, None
     try:
-        prepare()
+        result = prepare()
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
     errors = [error]
@@ -326,7 +326,9 @@ def _prepare_collectively(prepare, world_size, process_group):
         errors = [None] * world_size
         dist.all_gather_object(errors, error, group=process_group)
     if any(errors):
+        result = None
         raise RuntimeError(f"MegaMoE preparation failed on EP ranks: {errors}")
+    return result
 
 
 def _sweep_sm107_block_scaled_mega_moe(
@@ -382,11 +384,6 @@ def _sweep_sm107_block_scaled_mega_moe(
     if num_tokens is None or not 0 <= num_tokens <= cfg.max_tokens_per_rank:
         raise ValueError("stage a valid num_tokens before autotuning.")
 
-    if y is None and make_trial is None:
-        y = torch.empty(
-            num_tokens, cfg.hidden, dtype=torch.bfloat16, device=symm_buffer.device
-        )
-
     collective = cfg.world_size > 1
     if collective:
         if (
@@ -406,6 +403,15 @@ def _sweep_sm107_block_scaled_mega_moe(
             raise ValueError(
                 "all EP ranks must use identical autotune geometry, candidates, and iteration counts"
             )
+
+    if y is None and make_trial is None:
+        y = _prepare_collectively(
+            lambda: torch.empty(
+                num_tokens, cfg.hidden, dtype=torch.bfloat16, device=symm_buffer.device
+            ),
+            cfg.world_size,
+            process_group,
+        )
 
     def barrier():
         if collective:
@@ -449,23 +455,29 @@ def _sweep_sm107_block_scaled_mega_moe(
         # No finally/collective free on failure: another rank may already be
         # inside a kernel or have a failed CUDA context. The supervisor must
         # terminate the whole job, then retry a candidate in a fresh job.
-        trial = Sm107BlockScaledSymmBuffer(trial_cfg)
-        trial.x.view(torch.uint8).copy_(symm_buffer.x.view(torch.uint8))
-        trial.x_sf.view(torch.uint8).copy_(symm_buffer.x_sf.view(torch.uint8))
-        trial.topk_idx.copy_(symm_buffer.topk_idx)
-        trial.topk_weights.copy_(symm_buffer.topk_weights)
-        if cfg.quant_kind == "nvfp4":
-            for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
-                # the scalars the workspace's launches use (bound per-call tensors by
-                # default, where the workspace tensors stay unwritten)
-                getattr(trial, name).copy_(symm_buffer._scalar_tensor(name))
-        trial.note_staged_tokens(num_tokens)
-        _prepare_collectively(
-            lambda: trial.prepare(transformed_l1, transformed_l2),
+        trial = Sm107BlockScaledSymmBuffer(
+            trial_cfg,
+            **({"process_group": process_group} if process_group is not None else {}),
+        )
+
+        def prepare_trial():
+            trial.x.view(torch.uint8).copy_(symm_buffer.x.view(torch.uint8))
+            trial.x_sf.view(torch.uint8).copy_(symm_buffer.x_sf.view(torch.uint8))
+            trial.topk_idx.copy_(symm_buffer.topk_idx)
+            trial.topk_weights.copy_(symm_buffer.topk_weights)
+            if cfg.quant_kind == "nvfp4":
+                for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+                    # Copy the actual bound per-call scales, including defaults.
+                    getattr(trial, name).copy_(symm_buffer._scalar_tensor(name))
+            trial.note_staged_tokens(num_tokens)
+            trial.prepare(transformed_l1, transformed_l2)
+            return trial if make_trial is None else make_trial(trial)
+
+        measured_trial = _prepare_collectively(
+            prepare_trial,
             cfg.world_size,
             process_group,
         )
-        measured_trial = trial if make_trial is None else make_trial(trial)
         barrier()
         for _ in range(warmup_iters):
             if make_trial is None:

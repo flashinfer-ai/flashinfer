@@ -183,6 +183,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBacken
             knobs=self._workspace_knobs(fleet_params),
             batch_invariant=config.batch_invariant,
         )
+        workspace._epilogue_default_ones = torch.ones_like(workspace.fc1_alpha)
         if config.finalize_mode is FinalizeMode.NONE:
             workspace._unfinalized_route_map = torch.arange(
                 fleet_params.max_tokens_per_rank * config.top_k,
@@ -334,12 +335,18 @@ class Bf16Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBacken
                 )
         destinations = []
         epilogue_sources = []
-        for source, destination in (
-            (t.fc1_alpha, workspace.fc1_alpha),
-            (t.fc2_alpha, workspace.fc2_alpha),
-            (t.fc1_norm_const, workspace.fc1_norm_const),
-        ):
-            if source is not None:
+        for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+            source = getattr(t, name)
+            if source is None:
+                source = getattr(self._kernel_config, name)
+            destination = getattr(workspace, name)
+            if source is None:
+                source = workspace._epilogue_default_ones
+            if isinstance(source, (int, float)):
+                destination.fill_(source)
+            else:
+                # Resolve live configuration tensors on every call without
+                # lending their storage to mutable workspace scalars.
                 destinations.append(destination)
                 epilogue_sources.append(source)
         if epilogue_sources:
@@ -356,8 +363,10 @@ class Bf16Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBacken
             else:
                 # Batch the common contiguous CUDA copies into one launch.
                 torch._foreach_copy_(destinations, epilogue_sources)
-        if t.fc1_norm_const is not None:
-            workspace._use_fc1_norm_const = True
+        workspace._use_fc1_norm_const = (
+            t.fc1_norm_const is not None
+            or self._kernel_config.fc1_norm_const is not None
+        )
         # Keep the same sources through every autotune capture and final call.
         workspace._staging_inputs = sources
 

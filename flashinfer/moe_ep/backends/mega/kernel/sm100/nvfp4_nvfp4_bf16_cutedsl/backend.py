@@ -282,6 +282,7 @@ class Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
             ),
             knobs=self._workspace_knobs(fleet_params),
         )
+        workspace._epilogue_default_ones = torch.ones_like(workspace.fc1_alpha)
         if mode is FinalizeMode.NONE:
             workspace._unfinalized_route_map = torch.arange(
                 fp.max_tokens_per_rank * k.top_k,
@@ -403,12 +404,18 @@ class Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
 
         destinations = []
         sources = []
-        for source, destination in (
-            (t.fc1_alpha, workspace.fc1_alpha),
-            (t.fc2_alpha, workspace.fc2_alpha),
-            (t.fc1_norm_const, workspace.fc1_norm_const),
-        ):
-            if source is not None:
+        for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+            source = getattr(t, name)
+            if source is None:
+                source = getattr(self._kernel_config, name)
+            destination = getattr(workspace, name)
+            if source is None:
+                source = workspace._epilogue_default_ones
+            if isinstance(source, (int, float)):
+                destination.fill_(source)
+            else:
+                # Workspace scalars own their storage; per-call overrides must
+                # never overwrite the caller's configuration defaults.
                 destinations.append(destination)
                 sources.append(source)
         if t.fc1_activation_per_token_scale is not None:
