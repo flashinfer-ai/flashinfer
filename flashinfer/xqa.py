@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from typing import Optional, Union
 import torch
 
-from .api_logging import flashinfer_api
+from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .trace.templates.page import xqa_mla_trace, xqa_trace
 from .jit.xqa import (
     gen_xqa_module,
@@ -35,6 +35,157 @@ from .utils import (
     get_compute_capability,
     device_support_pdl,
 )
+
+
+@flashinfer_experimental_api(feature="SM120 NVFP4 Decode bucket planning")
+def create_xqa_decode_bucket_plan(
+    seq_lens: torch.Tensor,
+    *,
+    page_table_width: int,
+    page_size: int = 32,
+    num_kv_heads: int = 1,
+    head_group_ratio: int = 6,
+    q_len_per_req: int = 1,
+    query_tile: int = 16,
+    mode: str = "persistent",
+    planner: str = "gpu",
+    host_seq_lens: Optional[torch.Tensor] = None,
+):
+    """Allocate and prepare an experimental reusable uniform Decode work plan.
+
+    ``seq_lens`` is contiguous CUDA int32 ``[B]`` storage with ``1 <= B <= 32``.
+    ``page_size`` is 16, 32 (default), or 64 tokens. Length values must stay
+    between zero and ``page_table_width * page_size``. The plan
+    retains this storage; its contents may change, while its address and shape
+    remain fixed. Call ``plan.prepare()`` once after updating lengths for each
+    subsequent forward, before all attention layers sharing the request order.
+    A direct plan is selected for ``B=1`` or when the static total tile bound
+    ``B * ceil(page_table_width * page_size / 256)`` fits the per-head CTA budget
+    defined below. For these
+    plans ``prepare()`` is a no-op: compute derives contiguous boundaries from
+    live device lengths. Both mode names select the same direct one-task-per-CTA
+    path; its descriptor tensors are empty and no assignment kernel is launched.
+
+    ``mode="persistent"`` intersects request intervals with global KV-work
+    buckets; ``mode="aligned"`` balances fanout within each request. Compute
+    consumes the prepared tables otherwise and never launches assignment
+    implicitly. Static selection and the CTA cap use table capacity, not a device
+    length readback, so wide reserved tables can retain a larger grid.
+    Allocate one ``plan.create_workspace()`` per concurrent compute; ordered
+    layers may share a workspace. Plan refresh, compute and Graph replay must
+    be ordered on one stream or with explicit CUDA events.
+
+    ``planner="gpu"`` (default) plans from device lengths and can be captured.
+    ``planner="host"`` requires caller-owned contiguous CPU int32
+    ``host_seq_lens[B]`` with the same values and request order as ``seq_lens``.
+    It fills pinned descriptors in compiled C++ and submits one asynchronous
+    H2D copy; there is no device-to-host length read. Update both length buffers,
+    then call host ``prepare()`` outside capture before each compute-only Graph
+    replay. CPU planning does not execute during replay. A bounded staging buffer
+    waits for its previous copy only if still in flight. Both planners preserve
+    the direct-plan no-op and use identical compute and task ownership.
+
+    ``num_kv_heads`` is positive and checked against the device grid-Y limit
+    and native workspace/index bounds. ``head_group_ratio`` is 4, 6 (default),
+    or 8 query heads per KV head. All head groups share request descriptors.
+    Their CTA target is ``ceil(SMs / num_kv_heads)``, retaining at least B owners
+    per group; scratch and request counters are independent. Direct selection
+    uses this per-group budget in place of the single-group SM count above.
+
+    ``q_len_per_req`` is a uniform query length in [1,5], default 1. T1 retains
+    the existing rank3 query/output shape; T>1 uses ``[B,T,H*R,256]``. KV lengths
+    include the complete T-token causal suffix: active lengths must be at least
+    T, or zero for padded requests. Query row t sees keys before ``L-T+t+1``.
+    A constant packed causal mask is allocated once with the plan. Groups are
+    ``H * ceil(T*R/query_tile)``; planning budgets, scratch and counters use that
+    count. ``query_tile`` is 16 by default; 32 explicitly selects native M32
+    compute for T>1. It does not change native XQA dispatch or select a tile
+    automatically. T1 requires query_tile=16.
+    No ragged queries, arbitrary tree masks or speculative-generation service
+    are enabled by this explicit module call.
+
+    This explicit call opts into the experimental SM120 backend. No model,
+    TP degree, layer count or configured maximum context length is required.
+    See ``flashinfer/experimental/xqa_decode_buckets/README.md`` for limits.
+    """
+    from .experimental.xqa_decode_buckets import create_plan
+
+    return create_plan(
+        seq_lens,
+        page_table_width=page_table_width,
+        page_size=page_size,
+        num_kv_heads=num_kv_heads,
+        head_group_ratio=head_group_ratio,
+        q_len_per_req=q_len_per_req,
+        query_tile=query_tile,
+        mode=mode,
+        planner=planner,
+        host_seq_lens=host_seq_lens,
+    )
+
+
+@flashinfer_experimental_api(feature="SM120 NVFP4 Decode buckets")
+def xqa_decode_with_buckets(
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_sf_cache: torch.Tensor,
+    v_sf_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    plan,
+    workspace,
+    *,
+    bmm1_scale: float,
+    bmm2_scale: float,
+    out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
+    """Run native XQA math using an experimental uniform-query work plan.
+
+    Supports SM120 BF16 Q/output ``[B,H*R,256]``, with ``H=plan.num_kv_heads``
+    and ``R=plan.head_group_ratio``. NHD NVFP4 K/V is ``[pages,P,H,128]`` and
+    E4M3 block scales are ``[pages,P,H,16]``, with ``P=plan.page_size`` in
+    {16,32,64}. At ``T=plan.q_len_per_req > 1``, Q/output use ``[B,T,H*R,256]``
+    and a causal suffix already included in each live KV length. Active KV
+    lengths must be >=T, with zero reserved for padded requests. Device-value
+    preconditions are caller-owned and are not read back during replay.
+    Packed data and scale byte strides are retained.
+    ``page_table`` is contiguous int32 ``[B, plan.table_width]``; all page IDs
+    reached by live lengths must address allocated cache pages. Zero-length
+    rows write zeros. There are no sliding windows, sinks, ragged queries or tree masks.
+
+    Direct plans derive split geometry from live device lengths and have a
+    no-op ``prepare()``. For prepared plans, refresh descriptors after updating
+    lengths and before their compute consumers. Selection uses static capacity
+    and never reads lengths back to the host.
+
+    ``bmm1_scale`` directly scales QK before softmax; ``bmm2_scale`` directly
+    scales V/output. They are independent effective scales. The output and
+    workspace are mutable and may not be shared by concurrent calls. Pass
+    ``out`` to avoid allocation during capture. Native XQA remains unchanged;
+    callers select their native fallback for unsupported cases.
+
+    Create the plan/workspace and warm the experimental public call before
+    compilation or capture. GPU ``plan.prepare()`` may be compiled once before
+    multiple layer consumers; Host preparation stays outside compiled consumers.
+    The local dispatcher boundary declares descriptor/workspace/output mutations.
+    """
+    from .experimental.xqa_decode_buckets import run
+
+    return run(
+        query,
+        k_cache,
+        v_cache,
+        k_sf_cache,
+        v_sf_cache,
+        page_table,
+        plan,
+        workspace,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        out=out,
+        enable_pdl=enable_pdl,
+    )
 
 
 def get_xqa_module(

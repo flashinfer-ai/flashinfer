@@ -17,6 +17,15 @@
 
 #include "cuda_hint.cuh"
 #include "defines.h"
+#ifndef FLASHINFER_XQA_TASKS
+#define FLASHINFER_XQA_TASKS 0
+#endif
+#ifndef FLASHINFER_XQA_PERSISTENT_TASKS
+#define FLASHINFER_XQA_PERSISTENT_TASKS 0
+#endif
+#ifndef FLASHINFER_XQA_PV_SYNC
+#define FLASHINFER_XQA_PV_SYNC() __syncthreads()
+#endif
 #if !(IS_MLA)
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -849,11 +858,15 @@ __device__ inline GemmOutRegTile loadGemmOutTile(Warp const& warp,
 #endif
   return dst;
 }
-// only the first nbValidRows rows are copied, to allow padding.
+/**
+ * Store the valid rows of a swizzled PV tile, skipping physical tile padding.
+ * For a multi-query suffix, dstOffset.y includes the query/head-row block offset;
+ * actualQSeqLen bounds the full request rather than only this physical row tile.
+ */
 __device__ inline void copyOutputToGlobalMem(Warp const& warp, OutputHead* dst, uint32_t nbQHeads,
 #if SPEC_DEC
                                              uint32_t headGrpSize, uint32_t idxHeadGrpOffset,
-                                             uint32_t nbValidHeadTokens,
+                                             uint32_t nbValidHeadTokens, uint32_t actualQSeqLen,
 #else
                                              uint32_t idxHeadGrp,
 #endif
@@ -883,7 +896,13 @@ __device__ inline void copyOutputToGlobalMem(Warp const& warp, OutputHead* dst, 
 #endif
       break;
     }
+#if SPEC_DEC
+    // m includes the row-block offset; only r is local to the physical tile.
+    assert(r < nbValidRows);
+    assert(m < actualQSeqLen * headGrpSize);
+#else
     assert(m < nbValidRows);
+#endif
 #if SPEC_DEC
     uint32_t const idxBeam = 0;
     uint32_t const idxInGrp = m;
@@ -891,7 +910,7 @@ __device__ inline void copyOutputToGlobalMem(Warp const& warp, OutputHead* dst, 
     uint32_t const headIdx = idxInGrp % headGrpSize;
     assert(idxBeam < beamWidth);
     uint32_t const idxHead = idxHeadGrpOffset + tokenIdx * nbQHeads + headIdx;
-    assert(idxHead < nbValidHeadTokens * nbQHeads);
+    assert(idxHead < actualQSeqLen * nbQHeads);
 #else
     uint32_t const idxBeam = m / headGrpSize;
     uint32_t const idxInGrp = m % headGrpSize;
@@ -1544,6 +1563,14 @@ __device__ inline void addAttentionSinksSpecDec(ThrdRegRowMax& globalRowSum,
 }
 #endif
 
+/**
+ * Run native QK/online-softmax/PV and, for split requests, last-CTA partial merging.
+ * Task specializations supply request/head identity, contiguous KV-tile bounds and
+ * compact scratch ownership through XQATaskContext. Causal suffix positions retain
+ * the full request length even when the current task visits only a clipped interval.
+ * Persistent callers join all copies/users before reinitializing shared barriers
+ * for another task; ordinary native launches derive ownership from the launch grid.
+ */
 #ifdef NDEBUG
 __device__ __forceinline__
 #else
@@ -1551,6 +1578,9 @@ CUBIN_EXPORT __global__
 #endif
     void
     kernel_mha_impl(
+#if FLASHINFER_XQA_TASKS
+        XQATaskContext const& task,
+#endif
 #if SPEC_DEC
         uint32_t const qSeqLen, uint32_t const nbKHeads, uint32_t const headGrpSize,
         SeqLenDataType const* __restrict__ qCuSeqLens,  // [nbReq + 1]
@@ -1590,6 +1620,11 @@ CUBIN_EXPORT __global__
 #endif
         uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
 
+#if FLASHINFER_XQA_TASKS
+  bool const isMultiBlock = task.partial_count > 1;
+  uint32_t const nbSubSeqPerSeq = task.partial_count;
+  uint32_t const idxSubSeqInSeq = task.slot - task.partial_begin;
+#else
   assert(allowMultiBlockMode || gridDim.x == 1);
   bool const isMultiBlock = allowMultiBlockMode && (gridDim.x != 1);
   uint32_t const nbSubSeqPerSeq = allowMultiBlockMode ? gridDim.x : 1;
@@ -1599,14 +1634,23 @@ CUBIN_EXPORT __global__
   // gridDim: x - K/V sequence-dim split; y - number of K or V heads per token; z - number of
   // requests
   assert(gridDim.z == batchSize && gridDim.y == nbKHeads);
+#endif
   extern __shared__ char smemByteBuf[];
   SharedMem& smem = *reinterpret_cast<SharedMem*>(&smemByteBuf[0]);
 
+#if FLASHINFER_XQA_TASKS
+  uint32_t const idxReq = task.request;
+#else
   uint32_t const idxReq = blockIdx.z;
+#endif
 #if !SPEC_DEC
   uint32_t const nbQHeads = nbKHeads * headGrpSize;
 
+#if FLASHINFER_XQA_TASKS
+  uint32_t const idxHeadGrp = task.head_group;
+#else
   uint32_t const idxHeadGrp = blockIdx.y;  // inside one request
+#endif
 #endif
 
   auto const ctaThrdId =
@@ -1620,6 +1664,21 @@ CUBIN_EXPORT __global__
   uint32_t const flatWarpIdPerRow =
       warpIdx.z * ctaShapeInWarps.x + warpIdx.x;  // per ctaShapeInWarps.y value
 
+#if FLASHINFER_XQA_PERSISTENT_TASKS
+  // The task entry joins all readers/copies before reusing these barrier objects.
+  // Invalidate each object through its original initialization owner.
+  if (task.reuse_barriers) {
+    using TaskBarrier = SharedMem::Barrier;
+    if (ctaThrdId < ctaShapeInWarps.y) smem.qBarrier[ctaThrdId].~TaskBarrier();
+    if (ctaThrdId < sizeof(smem.xBarriers) / sizeof(CtaBarrierPair)) {
+      auto& pair = (&smem.xBarriers[0][0])[ctaThrdId];
+      pair.produced.~TaskBarrier();
+      pair.consumed.~TaskBarrier();
+    }
+    if (ctaThrdId < gemm1NbWarpGrps * nbVBuffers) (smem.vBarrier(0, 0) + ctaThrdId)->~TaskBarrier();
+    if (ctaThrdId < gemm1NbWarpGrps) smem.warpGrpBar(ctaThrdId)->~TaskBarrier();
+  }
+#endif
   // initialize shared memory
   static_assert(persistentQ && ctaShapeInWarps.y == 1);
   if (ctaThrdId < ctaShapeInWarps.y) {
@@ -1661,7 +1720,7 @@ CUBIN_EXPORT __global__
 #endif
   __syncthreads();
 
-#if ENABLE_PDL
+#if ENABLE_PDL && !FLASHINFER_XQA_TASKS
   preExit();
   acqBulk();
 #endif
@@ -1689,9 +1748,14 @@ CUBIN_EXPORT __global__
   uint32_t const nbQHeadTokens = nbQHeads * actualQSeqLen;
   uint32_t const nbQKVHeads = nbQHeads + nbKHeads + nbVHeads;
 
+#if FLASHINFER_XQA_TASKS
+  uint32_t const idxHeadGrp = task.head_group;
+  uint32_t const idxHeadTokenInGrp = task.head_token_begin;
+#else
   uint32_t const nbTokenBlocksPerGrp = gridDim.y / nbKHeads;
   uint32_t const idxHeadGrp = blockIdx.y / nbTokenBlocksPerGrp;  // inside one request
   uint32_t const idxHeadTokenInGrp = (blockIdx.y % nbTokenBlocksPerGrp) * warpTile.y;
+#endif
   uint32_t const totalNbHeadTokensInGrp = actualQSeqLen * headGrpSize;
   uint32_t const nbValidHeadTokens =
       idxHeadTokenInGrp > totalNbHeadTokensInGrp
@@ -1769,7 +1833,20 @@ CUBIN_EXPORT __global__
   }
 #endif
 
+#if FLASHINFER_XQA_TASKS
+  uint32_t const logicalCacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
+  uint32_t const cacheSeqLen = mha::min(logicalCacheSeqLen, task.end_tile * ctaTile.x);
+#else
   uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
+#endif
+#if SPEC_DEC
+#if FLASHINFER_XQA_TASKS
+  // Causal suffix positions belong to the full request, never a clipped task.
+  uint32_t const maskCacheSeqLen = logicalCacheSeqLen;
+#else
+  uint32_t const maskCacheSeqLen = cacheSeqLen;
+#endif
+#endif
 #if SLIDING_WINDOW
   bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
 #if SPEC_DEC && !IS_SPEC_DEC_TREE
@@ -1787,7 +1864,11 @@ CUBIN_EXPORT __global__
 #endif
 #else
   constexpr bool rtIsReallySliding = false;
+#if FLASHINFER_XQA_TASKS
+  uint32_t const nbTotalSkipTokens = task.begin_tile * ctaTile.x;
+#else
   constexpr uint32_t nbTotalSkipTokens = 0;
+#endif
 #endif
   uint32_t const nbSkipLeadingTiles = nbTotalSkipTokens / ctaTile.x;
   uint32_t const tile0NbSkipTokens = nbTotalSkipTokens % ctaTile.x;
@@ -1796,12 +1877,20 @@ CUBIN_EXPORT __global__
 
   uint32_t const nbSeqIters = useKVCache ? divUp(cacheSeqLen, ctaTile.x) : 0;
 #if SPEC_DEC
-  uint32_t const nbSeqItersWithoutMask = (cacheSeqLen - actualQSeqLen) / ctaTile.x;
+  uint32_t const nbSeqItersWithoutMask = (maskCacheSeqLen - actualQSeqLen) / ctaTile.x;
 #endif
 
+#if FLASHINFER_XQA_TASKS
+  uint32_t const seqStrideIters = 1;
+#else
   uint32_t const seqStrideIters = nbSubSeqPerSeq;
+#endif
   constexpr bool isKVCacheQuantized = (cacheElemSize < 2);
+#if FLASHINFER_XQA_TASKS
+  uint32_t const seqIterInit = task.begin_tile;
+#else
   uint32_t const seqIterInit = nbSkipLeadingTiles + idxSubSeqInSeq;
+#endif
 #if BEAM_WIDTH > 1
   uint32_t const nbCtxCtaTiles = beamSearchParams.ctxLenList[idxReq * beamWidth] / ctaTile.x;
 #endif
@@ -1813,9 +1902,13 @@ CUBIN_EXPORT __global__
 #endif
   };
   if (warpIdx.z == 0) {
+#if FLASHINFER_XQA_TASKS
+    float const qkScale = task.qk_scale;
+#else
     float const qkScale =
         qScaleValue * (isKVCacheQuantized ? kvCacheScaleValue : 1.f) *
         rsqrtf(validElemsPerHead);  // qkScale is applied onto Q*K.T before softmax.
+#endif
     CircIdx<nbKBuffers> idxCurrSMemKBuf{nbKBuffers - 1};
     auto const getSMemKTile = [&](uint32_t idx) -> SharedMem::KSmemBuffer& {
       return smem.k[warpIdx.x][idx];
@@ -1851,7 +1944,7 @@ CUBIN_EXPORT __global__
     loadPages(idxPageBeg);
     auto loadKTilePart = [&](uint32_t seqIter, uint32_t idxBeam, uint32_t idxPart) mutable {
       assert(idxBeam < beamWidth);
-      assert(seqIter % nbSubSeqPerSeq == seqIterInit % nbSubSeqPerSeq);
+      assert(seqIter % seqStrideIters == seqIterInit % seqStrideIters);
       auto const idxNextSMemKBuf = idxCurrSMemKBuf.next();
       auto& dst = getSMemKTile(idxNextSMemKBuf);
 #if ENABLE_4BIT_KV_CACHE
@@ -1923,7 +2016,7 @@ CUBIN_EXPORT __global__
       if (idxPart + 1 == nbPartsPerCacheKHead) {
         bool const isForNextSeqIter = isConvergedTile(seqIter) || idxBeam == beamWidth - 1;
         if (isForNextSeqIter) {
-          idxPageBeg += nbPagesPerCtaTile * nbSubSeqPerSeq;
+          idxPageBeg += nbPagesPerCtaTile * seqStrideIters;
           loadPages(idxPageBeg);
         }
 #if BEAM_WIDTH > 1
@@ -2088,7 +2181,7 @@ CUBIN_EXPORT __global__
 #endif
       if (seqIter >= nbSeqItersWithoutMask || needWinEdgeMask) {
         uint32_t const nbValidCols =
-            (warpTileTokenBeg < cacheSeqLen ? cacheSeqLen - warpTileTokenBeg : 0U);
+            (warpTileTokenBeg < maskCacheSeqLen ? maskCacheSeqLen - warpTileTokenBeg : 0U);
         applyMaskFromInput(warp, acc, mask, idxHeadTokenInGrp, nbValidCols, qSeqLen, actualQSeqLen,
                            headGrpSize
 #if SLIDING_WINDOW
@@ -2136,6 +2229,11 @@ CUBIN_EXPORT __global__
       smem.warpRowSum[warpIdx.y][warpIdx.x].storeFromReg<false>(warp, regRowSum);
       unused(xBar.produced.arrive());
     }
+#if FLASHINFER_XQA_PERSISTENT_TASKS
+    // Drain speculative K loads before PV overlays Q/K storage with merge state.
+    ldgsts::waitGroup<0>();
+    NamedBarrier{2, ctaSize}.arrive();
+#endif
   } else {
     assert(warpIdx.z == 1);
 #if CTA_ROW_MAX_BACKWARD_METHOD == 3
@@ -2211,7 +2309,7 @@ CUBIN_EXPORT __global__
                              uint32_t idxBeam) mutable {  // @fixme: merge three iteration
                                                           // parameters into idxVTileGlb.
       assert(idxBeam < beamWidth);
-      assert(seqIter % nbSubSeqPerSeq == seqIterInit % nbSubSeqPerSeq);
+      assert(seqIter % seqStrideIters == seqIterInit % seqStrideIters);
       auto const idxNextSMemVBuf = idxCurrSMemVBuf.next();
       auto& dst = getSmemVTile(idxNextSMemVBuf);
 #if ENABLE_4BIT_KV_CACHE
@@ -2312,7 +2410,7 @@ CUBIN_EXPORT __global__
             (idxBeam == beamWidth - 1 || isConvergedTile(seqIter))) {
           auto const step = 1;  // cacheVTileSeqLen * gemm1NbWarpGrps / tokensPerPage;
           idxPageBeg += (idxPageBeg % nbPagesPerCtaTile == nbPagesPerCtaTile - 1
-                             ? nbPagesPerCtaTile * (nbSubSeqPerSeq - 1) + step
+                             ? nbPagesPerCtaTile * (seqStrideIters - 1) + step
                              : step);
           assert(beamWidth == 1 ||
                  cacheVTileSeqStride <= tokensPerPage &&
@@ -2339,7 +2437,7 @@ CUBIN_EXPORT __global__
         bool const isLastBeam = (idxBeam == beamWidth - 1 || isConvergedTile(seqIter));
         if (isLastVIter && isLastBeam) {
           idxPageBeg += (idxPageBeg % nbPagesPerCtaTile + step_per_viter >= nbPagesPerCtaTile
-                             ? nbPagesPerCtaTile * (nbSubSeqPerSeq - 1) + step_per_viter
+                             ? nbPagesPerCtaTile * (seqStrideIters - 1) + step_per_viter
                              : step_per_viter);
           loadPages(idxPageBeg);
         } else if (isLastVIter) {
@@ -2578,15 +2676,22 @@ CUBIN_EXPORT __global__
       flip(xBarProducedParityNext);
     }  // seqIter
 
+#if FLASHINFER_XQA_PERSISTENT_TASKS
+    // idxCurr names the speculative future buffer; earlier buffers were waited
+    // when consumed. Close both pipelines before the full-CTA task handoff.
+    syncVTileLoad(idxCurrSMemVBuf, vBarParity, false);
+    wait_parity<grpLoadV>(pWarpGrpBar, warpGrpBarParityNext);
+    NamedBarrier{2, ctaSize}.arrive_and_wait();
+#endif
     auto const fullRescaleMask = UniformRescaleMask::filled(~0U);
 
     constexpr bool needMergeGlobal = (gemm1NbWarpGrps > 1 && nbXTilesPerXIter > 1);
     if constexpr (needMergeGlobal) {
       assert(gemm1NbWarpGrps != 1);
-      __syncthreads();
+      FLASHINFER_XQA_PV_SYNC();
       smem.warpRowMax[warpIdx.y][warpIdx.x].template storeFromReg<false>(warp, globalRowMax);
       smem.warpRowSum[warpIdx.y][warpIdx.x].template storeFromReg<false>(warp, globalRowSum);
-      __syncthreads();
+      FLASHINFER_XQA_PV_SYNC();
       for (uint32_t i = 1; i < nbXTilesPerXIter; i++) {  // i = 0 is for self and we can skip
         static_assert(nbXTilesPerXIter * nbWarpGrpsPerXTile == gemm1NbWarpGrps);
         uint32_t const otherWarpGrpIdx = (warpGrpIdx + nbWarpGrpsPerXTile * i) % gemm1NbWarpGrps;
@@ -2611,7 +2716,11 @@ CUBIN_EXPORT __global__
       }
     }
 
+#if FLASHINFER_XQA_TASKS
+    float voScale = task.v_scale;
+#else
     float voScale = (isKVCacheQuantized ? kvCacheScaleValue : 1.F);
+#endif
     if (seqIterInit < nbSeqIters) {  // otherwise rcpRowSum will be NAN.
       // The attention sinks are moved to the multi-block reduction part if the multi-block is
       // enabled.
@@ -2638,12 +2747,12 @@ CUBIN_EXPORT __global__
       if constexpr (gemm1NbWarpGrps == 1) {
         // swizzle in shared memory and write output global memory
         auto& outSwizzleBuffer = smem.x[warpIdx.y][warpIdx.x];
-        __syncthreads();
+        FLASHINFER_XQA_PV_SYNC();
         storeGemmOutTile(warp, outSwizzleBuffer, tile, reorder);
         __syncwarp();
         return &outSwizzleBuffer;
       } else {
-        __syncthreads();
+        FLASHINFER_XQA_PV_SYNC();
         // store to shared memory, then merge groups.
         using PostProcSMem =
             SharedMem::XSmemBuffer[ctaShapeInWarps.y][gemm1WarpsPerGrp][gemm1NbWarpGrps];
@@ -2651,10 +2760,10 @@ CUBIN_EXPORT __global__
         SharedMem::XSmemBuffer(&postSMem)[gemm1NbWarpGrps] =
             reinterpret_cast<PostProcSMem&>(smem)[warpIdx.y][warpIdxInGrp];
         storeGemmOutTile(warp, postSMem[warpGrpIdx], tile, reorder);
-        __syncthreads();
+        FLASHINFER_XQA_PV_SYNC();
         smemFp16ArraySum<false, gemm1NbWarpGrps, gemm1NbWarpGrps>(warpGrpIdx, postSMem[0],
                                                                   postSMem);
-        __syncthreads();
+        FLASHINFER_XQA_PV_SYNC();
         return &postSMem[0];
       }
     };
@@ -2670,7 +2779,7 @@ CUBIN_EXPORT __global__
       uint32_t const dstColOffset = warpTile.x * (warpIdxInGrp + gemm1WarpsPerGrp * hs);
 #if SPEC_DEC
       copyOutputToGlobalMem(warp, &output[reqSeqOffset * nbQHeads], nbQHeads, headGrpSize,
-                            (idxHeadGrp * headGrpSize), nbValidHeadTokens,
+                            (idxHeadGrp * headGrpSize), nbValidHeadTokens, actualQSeqLen,
                             uint2{dstColOffset, nbValidRows * warpIdx.y + idxHeadTokenInGrp},
                             smemOutTile);
 #else
@@ -2692,13 +2801,22 @@ CUBIN_EXPORT __global__
       static_assert(ctaShapeInWarps.y == 1, "not implemented");
 #if SPEC_DEC
       // Includes both kHeads and qTokens.
+#if FLASHINFER_XQA_TASKS
+      uint32_t const nbIndepHeadTokens = task.group_count;
+      uint32_t const indepHeadTokenIdx = task.group;
+#else
       uint32_t const nbIndepHeadTokens = gridDim.y;
       uint32_t const indepHeadTokenIdx = blockIdx.y;
+#endif
       uint32_t const nbSeq = nbIndepHeadTokens * batchSize;
 #else
       uint32_t const nbSeq = nbKHeads * batchSize;
 #endif
+#if FLASHINFER_XQA_TASKS
+      uint32_t const nbSubSeq = task.total_slots;
+#else
       uint32_t const nbSubSeq = nbSubSeqPerSeq * nbSeq;
+#endif
       MemSegmenter<false> segmenter{scratch};
 
 #if SPEC_DEC
@@ -2706,7 +2824,11 @@ CUBIN_EXPORT __global__
 #else
       uint32_t const idxSeq = nbKHeads * idxReq + idxHeadGrp;
 #endif
+#if FLASHINFER_XQA_TASKS
+      uint32_t const idxBufBase = task.partial_begin;
+#else
       uint32_t const idxBufBase = nbSubSeqPerSeq * idxSeq;
+#endif
       uint32_t const idxBuf = idxBufBase + idxSubSeqInSeq;
       // copy row max/sum
       TinyPtr<SMemWarpRowMax> const rowMaxBuffers = segmenter.newSeg<SMemWarpRowMax>(nbSubSeq);
@@ -2726,7 +2848,7 @@ CUBIN_EXPORT __global__
         copyGrains<false, nbValidRows * ScratchBuf::cols, gemm1NbWarpGrps>(
             warpGrpIdx, &scratchBuffers[idxBuf][warpIdxInGrp + gemm1WarpsPerGrp * hs](0, 0),
             &(*smemOutTile)(0, 0));
-        __syncthreads();
+        FLASHINFER_XQA_PV_SYNC();
       }
 #if __CUDA_ARCH__ == 1210
       // GB10 (sm121): device-scope release so the partials just written to global
@@ -2763,7 +2885,7 @@ CUBIN_EXPORT __global__
         assert(old < nbSubSeqPerSeq);
         mbsmem.isLastCta = (old == lastOld);
       }
-      __syncthreads();
+      FLASHINFER_XQA_PV_SYNC();
 
       // merge if we are the last CTA.
       bool const isLastCta = mbsmem.isLastCta;
@@ -2776,7 +2898,7 @@ CUBIN_EXPORT __global__
               mergeRowMax<8>(warp, rowMaxBuffers + idxBufBase, nbSubSeqPerSeq);
           smemRowMax.storeFromReg<false>(warp, mergedRowMax);
         }
-        __syncthreads();
+        FLASHINFER_XQA_PV_SYNC();
         ThrdRegRowMax const mergedRowMax = smemRowMax.loadToReg<false>(warp);
 
         // rescale and accumulate
@@ -2837,11 +2959,11 @@ CUBIN_EXPORT __global__
             if (warpIdxInGrp == 0) {
               mbbuf.mergedRowSum[warpGrpIdx].storeFromReg<false>(warp, partialMergedRowSum);
             }
-            __syncthreads();
+            FLASHINFER_XQA_PV_SYNC();
 #ifndef NDEBUG
             assert(
                 (mbbuf.mergedRowSum[warpGrpIdx].loadToReg<false>(warp) == partialMergedRowSum)[0]);
-            __syncthreads();
+            FLASHINFER_XQA_PV_SYNC();
 #endif
 #pragma unroll
             for (uint32_t i = 0; i < gemm1NbWarpGrps; i++) {
@@ -2859,20 +2981,21 @@ CUBIN_EXPORT __global__
                               attentionSinks + headGrpSize * idxHeadGrp);
 #endif
           }
-          __syncthreads();
+          FLASHINFER_XQA_PV_SYNC();
           rescaleAcc(warp, sumAcc, fullRescaleMask, __frcp_rn(mergedRowSum));
           GemmOutRegTile const mergedOutTile = toFp16(sumAcc);
           SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(mergedOutTile, false);
           if (warpGrpIdx == 0) {
             writeOutSlice(*smemOutTile, hs);
           }
-          __syncthreads();
+          FLASHINFER_XQA_PV_SYNC();
         }
       }
     }
   }
 }
 
+#if !FLASHINFER_XQA_TASKS
 #if SPEC_DEC
 #if __CUDA_ARCH__ == 900 && M_TILESIZE == 16
 constexpr uint32_t nbCtaPerSM = 2;
@@ -3185,4 +3308,5 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                      semaphores, scratch);
   checkCuda(cudaPeekAtLastError());
 }
+#endif  // !FLASHINFER_XQA_TASKS: task entries supply their own launch/ownership.
 #endif
