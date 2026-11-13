@@ -394,7 +394,13 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params) {
       fifoEntry128ByteIndexBase += singleProtoTransfer128ByteCount;
 
       // ensure that we can over-write shmem in next iteration
-      // (it must be fully read by all threads when doing S2G above)
+      // (it must be fully read by all threads when doing S2G above).
+      // The next iteration refills shmem with cp.async.bulk, an async-proxy write that must be
+      // ordered after the protoPack stores and the S2G loads above, which go through the
+      // generic proxy.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+      asm volatile("fence.proxy.async.shared::cta;" : : : "memory");
+#endif
       __syncwarp();
     }
     if (fifoEntry128ByteIndexBase > 0) {
