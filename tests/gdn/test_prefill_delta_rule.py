@@ -311,16 +311,18 @@ def test_prefill_block_end_decay(qkv_factory, seed=0):
 @pytest.mark.parametrize("checkpoint_every_n_tokens", [0, 64])
 @pytest.mark.parametrize("seq_lens", [[100, 128], [36, 128]])
 @pytest.mark.parametrize("nonfinite_input", ["q", "k", "v", "g", "beta"])
+@pytest.mark.parametrize("nonfinite_value", ["nan", "inf"])
 def test_sm12x_next_sequence_nan_stays_out_of_partial_tail(
     qkv_factory,
+    nonfinite_value: str,
     nonfinite_input: str,
     seq_lens: list[int],
     checkpoint_every_n_tokens: int,
     seed: int = 0,
 ):
     """The last, partial chunk of a packed sequence also covers the next
-    sequence's first rows. A NaN there must not change the sequence's output,
-    final state or checkpoints."""
+    sequence's first rows. A NaN or Inf there must not change the sequence's
+    output, final state or checkpoints."""
     _skip_if_not_sm12x()
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -353,8 +355,11 @@ def test_sm12x_next_sequence_nan_stays_out_of_partial_tail(
         kwargs = {}
         if every:
             kwargs = dict(
-                state_checkpoints=torch.zeros(
+                # NaN-filled, so a checkpoint the kernel skips fails the
+                # comparison below.
+                state_checkpoints=torch.full(
                     (sum(counts), num_sab_heads, head_size, head_size),
+                    float("nan"),
                     dtype=torch.float32,
                     device=device,
                 ),
@@ -377,23 +382,25 @@ def test_sm12x_next_sequence_nan_stays_out_of_partial_tail(
         return o[:first_len], state[0], checkpoints
 
     inputs = dict(q=q, k=k, v=v, g=alpha, beta=beta)
-    ref_o, ref_state, _ = run(inputs)
+    ref_o, ref_state, ref_checkpoints = run(inputs)
 
     poisoned = inputs[nonfinite_input].clone()
-    poisoned[first_len] = float("nan")  # the second sequence's first token
+    poisoned[first_len] = float(nonfinite_value)  # the second sequence's first token
     o, state, checkpoints = run({**inputs, nonfinite_input: poisoned})
     torch.cuda.synchronize()
 
-    assert torch.isfinite(o).all()
-    assert torch.isfinite(state).all()
-    if checkpoints is not None:
-        assert torch.isfinite(checkpoints).all()
-    if not every:
-        # Rows past a sequence's end must not enter its arithmetic at all.
-        # The calls without checkpoints are also compared bit for bit with
-        # the unpoisoned run.
-        torch.testing.assert_close(o, ref_o, atol=0, rtol=0)
-        torch.testing.assert_close(state, ref_state, atol=0, rtol=0)
+    # Rows past a sequence's end must not enter its arithmetic at all, so the
+    # first sequence's results match the unpoisoned run bit for bit.
+    # assert_close does not treat NaN as equal, so a leaked NaN or Inf fails.
+    torch.testing.assert_close(o, ref_o, atol=0, rtol=0)
+    torch.testing.assert_close(state, ref_state, atol=0, rtol=0)
+    if every:
+        # A partial final block stores no checkpoint, so all of the first
+        # sequence's checkpoints come before its tail: token 64 for
+        # [100, 128], none for [36, 128]. The tail only reaches the output
+        # and the final state; this guards the checkpoint stores of the same
+        # kernel.
+        torch.testing.assert_close(checkpoints, ref_checkpoints, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("beta", [False, True])
