@@ -16,7 +16,8 @@ limitations under the License.
 
 from pathlib import Path
 
-from .core import JitSpec, gen_jit_spec, sm120a_nvcc_flags
+from .core import (JitSpec, gen_jit_spec, sm120a_nvcc_flags,
+                   sm121a_nvcc_flags)
 
 # The kernel source lives next to its host module (registered as package data
 # in pyproject.toml, like the blk64 BSA sources) so all code of the
@@ -38,6 +39,7 @@ def gen_gdn_fused_decode_module(
     d: int,
     conv_width: int,
     conv_state_len: int,
+    cc: int = 120,
 ) -> JitSpec:
     """JIT spec for one registered fused-GDN-decode layer geometry (SM120).
 
@@ -53,6 +55,11 @@ def gen_gdn_fused_decode_module(
     hence one module.  The kernel stays B-dynamic -- batch size, the query
     scale and the conv-state strides remain runtime parameters.
     """
+    # An sm_120a cubin does not load on sm_121: the 'a' suffix is an
+    # arch-specific target, not a family one.
+    arch_flags = {120: sm120a_nvcc_flags, 121: sm121a_nvcc_flags}.get(cc)
+    if arch_flags is None:
+        raise ValueError(f'fused GDN decode has no build target for cc {cc}')
     geometry = {
         "HIDDEN": hidden,
         "N_BA": n_ba,
@@ -65,8 +72,8 @@ def gen_gdn_fused_decode_module(
     }
     suffix = "_".join(f"{key.lower()}{value}" for key, value in geometry.items())
     return gen_jit_spec(
-        f"gdn_fused_decode_sm120_{suffix}",
+        f"gdn_fused_decode_sm{cc}_{suffix}",
         [_GDN_FUSED_DECODE_KERNEL_DIR / "gdn_fused_decode_sm120.cu"],
-        extra_cuda_cflags=sm120a_nvcc_flags
+        extra_cuda_cflags=arch_flags
         + [f"-DFI_GDN_{key}={value}" for key, value in geometry.items()],
     )
