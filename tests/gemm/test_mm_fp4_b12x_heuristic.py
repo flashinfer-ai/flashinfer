@@ -47,7 +47,9 @@ def patched_env(monkeypatch):
             gemm_base, "get_compute_capability", lambda device: (major, minor)
         )
         monkeypatch.setattr(
-            gemm_base, "get_cuda_version", lambda: packaging.version.Version(cuda_version)
+            gemm_base,
+            "get_cuda_version",
+            lambda: packaging.version.Version(cuda_version),
         )
 
     return apply
@@ -99,7 +101,11 @@ def test_b12x_dropped_when_unsuitable(patched_env):
     """A backend absent from ``suitable_backends`` is never auto-selected."""
     patched_env(12, 1, "13.0")
     backends = gemm_base._heuristic_func_mm_fp4(
-        ["cutlass", "cudnn"], _FakeTensor(), _FakeTensor(), _FakeTensor(),
-        _FakeTensor(), use_nvfp4=True,
+        ["cutlass", "cudnn"],
+        _FakeTensor(),
+        _FakeTensor(),
+        _FakeTensor(),
+        _FakeTensor(),
+        use_nvfp4=True,
     )
     assert backends == ["cutlass", "cudnn"]
