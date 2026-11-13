@@ -1532,6 +1532,7 @@ def test_full_path_finalize_matches_native_kernel(num_tokens, cache_permute_indi
         H,
         True,
         False,
+        None,
     )
     _sync()
     assert not torch.isnan(theirs).any()

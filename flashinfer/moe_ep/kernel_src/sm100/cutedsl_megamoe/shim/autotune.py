@@ -120,16 +120,45 @@ def mxfp8_candidates(
 def bf16_candidates(
     *,
     enable_in_kernel_fc2_reduce: bool = False,
+    batch_invariant: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return supported BF16 candidates for a session's output contract.
 
-    This is intentionally a one-entry autotune surface. Keeping the same
-    collective autotune lifecycle as the other Mega kernels means additional
-    validated geometries can be added without changing the public API.
-
+    Ordinary sessions keep their baseline geometry. BI sessions sweep the
+    admitted geometry/schedule/carrier product; the final session filter checks
+    canonical K padding and resource feasibility before any launch.
     """
+    if batch_invariant:
+        import dataclasses
+
+        from flashinfer.moe_ep.batch_invariant.spec import (
+            ALLOWED_PLAN_CONFIGS,
+            ALLOWED_PLANS,
+            PlanConfig,
+        )
+
+        baseline = PlanConfig()
+        geometries = (baseline,) + tuple(
+            geometry for geometry in ALLOWED_PLAN_CONFIGS if geometry != baseline
+        )
+        base = default_knobs(0, dtype="bf16")
+        return [
+            {
+                **base,
+                **dataclasses.asdict(geometry),
+                "load_balance_mode": schedule,
+                "token_back_mode": carrier,
+            }
+            for geometry in geometries
+            for schedule, carrier in ALLOWED_PLANS
+            if is_valid_bf16({**base, **dataclasses.asdict(geometry)})
+        ]
     out: List[Dict[str, Any]] = []
-    for ikr in (False, True) if enable_in_kernel_fc2_reduce else (False,):
+    for ikr in (
+        (False, True)
+        if enable_in_kernel_fc2_reduce and not batch_invariant
+        else (False,)
+    ):
         knobs = default_knobs(0, dtype="bf16", enable_in_kernel_fc2_reduce=ikr)
         if is_valid_bf16(knobs):
             out.append(knobs)
@@ -547,12 +576,7 @@ def autotune_bf16_mega_moe(
     warmup_iters: int = 3,
     timed_iters: int = 10,
 ) -> Dict[str, Any]:
-    """Autotune the BF16 MegaMoE session on its supported geometry.
-
-    The candidate list is one fixed geometry per permitted ikr value.  It
-    still uses the collective autotune path so later supported geometries can
-    be introduced without changing runtime behavior.
-    """
+    """Autotune admitted BF16 plans, filtering against the session's shape."""
     from .bf16 import bf16_mega_moe
 
     def launch() -> None:
@@ -569,9 +593,16 @@ def autotune_bf16_mega_moe(
 
     cfg = symm_buffer._frontend.config
     if candidates is None:
-        candidates = bf16_candidates(
-            enable_in_kernel_fc2_reduce=cfg.enable_in_kernel_fc2_reduce
-        )
+        # Shape and SMEM filtering is expected for the built-in geometry
+        # product. Warn only when a caller explicitly supplies an invalid plan.
+        candidates = [
+            knobs
+            for knobs in bf16_candidates(
+                enable_in_kernel_fc2_reduce=cfg.enable_in_kernel_fc2_reduce,
+                batch_invariant=cfg.batch_invariant,
+            )
+            if is_valid_bf16_for_config(cfg, knobs)
+        ]
     candidates = _session_candidates(
         candidates, cfg, is_valid_bf16_for_config, what="BF16 MegaMoE"
     )
@@ -581,6 +612,9 @@ def autotune_bf16_mega_moe(
         # winner is identical on all ranks after the all_reduce).
         from flashinfer.moe_ep.core.tuning import tuning_live_tokens
 
+        # A launch-level clamp override may have updated an existing frontend
+        # during the sweep. Record the arithmetic that was actually measured.
+        cfg = symm_buffer._frontend.config
         live_tokens = tuning_live_tokens(num_tokens, cfg.num_tokens_per_rank)
         if cfg.rank == 0:
             from .knob_cache import record_knobs
@@ -595,6 +629,10 @@ def autotune_bf16_mega_moe(
                 topk=cfg.num_topk,
                 max_tokens=cfg.num_tokens_per_rank,
                 live_tokens=live_tokens,
+                apply_routing_weights_before_fc2=cfg.apply_routing_weights_before_fc2,
+                use_custom_finalize=cfg.use_custom_finalize,
+                batch_invariant=cfg.batch_invariant,
+                gate_up_clamp=cfg.gate_up_clamp,
                 p50_us=p50_s * 1e6,
                 source="autotune",
             )

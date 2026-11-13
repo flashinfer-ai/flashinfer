@@ -64,7 +64,12 @@ A reserved table can exceed a capture's KV range. Declare only that range,
 preserving its storage row stride and pointer. Intersect the explicit KV maximum
 with caller-table capacity; use the same bound for the attention attribute and
 table slice. Device lengths still mask live tokens without host readback.
-Capacity must cover initialized indices and rounded graph bounds.
+Capacity must cover reserved indices and rounded graph bounds. Reserve the
+owned table from graph-mode index capacity even when declarations are exact
+(for example on Hopper). Test a small first cuDNN plan followed by a larger
+page count within that reservation, then capture at the larger bound and
+validate retained replay through shorter and longer replans. Reserved storage
+does not extend the valid length range of an already captured graph.
 
 Test changed page IDs and lengths, replacement by a caller table of another
 width, and Q-partition changes after a caller-owned first plan. Shortening a KV
@@ -75,6 +80,17 @@ selected-engine check. Keep lifetime/numerical tests independent of heuristic
 winners and timing thresholds.
 
 ### Ragged lengths and masks
+
+Explicit paged cuDNN plans pass `window_left` through the common graph contract.
+The prepared and scaled execution paths use the same window. A value of `-1`
+disables it. For a nonnegative W, let p = query_index + KV_length - Q_length
+denote the bottom-right aligned query position. With `causal=True`, eligible keys
+range from p-W through p. With `causal=False`, the window only excludes keys
+below p-W; keys above p remain eligible up to the valid KV length. Both cases
+also respect the valid sequence bounds. The low level converts W to cuDNN's W+1
+inclusive left bound.
+The window remains a plan-time attribute and cannot change in a retained capture.
+Paged automatic admission still excludes windows pending separate qualification.
 
 Valid attention lengths differ from physical ragged offsets: `seq_lens_q` can
 be shorter than its slot. Infer lengths from adjacent offsets only when omitted.
@@ -88,6 +104,12 @@ a compacted reference; checking only the latest eager call misses stale
 bindings and mask-representation transitions.
 
 ### FA2 scheduling and runtime scales
+
+Standard FA2/FA3 paged adapters reject `sinks` instead of silently dropping the
+tensor. This also applies to tensor-core decode when it uses the paged prefill
+adapter, including a fallback from another provider. Custom sink JIT modules
+retain their existing positional-argument interface; their generated kernel
+must actually include the sink variant.
 
 FA2 captures bind CPU-generated output/merge prefixes as well as indptr tensors.
 Updating indptrs after switching to cuDNN leaves schedules stale when requests
@@ -182,3 +204,27 @@ and allocations follow storage precision.
 alias `kv_dtype`. `BlockSparseTSWrapper.plan()` instead accepts `k_data_type`,
 `v_data_type`, and the common-KV alias `kv_data_type`. Use the names for the
 specific wrapper.
+
+### H100 D256 paged admission
+
+On H100 80GB HBM3 with 132 SMs, BF16 or FP16 HND/page16 D256 auto may select cuDNN
+when the native planner selects FA3. The existing short-query FA2 domain is
+retained. The domain covers batches 1–32, query heads 16–48, GQA groups 1/2/4/8/16,
+maximum Q 65–16384 and maximum KV at most 32768. Actual positive Q/KV lengths
+must already be on CPU, satisfy Q≤KV per request, match the declared maxima,
+and use physical query offsets as the valid query lengths. Independent masks
+and device-only metadata do not extend admission. Admission also requires at
+least `2**24` actual causal query-key pairs across query heads:
+`Hq * sum(q_i * (2 * kv_i - q_i + 1) // 2)`. Small workloads retain their native
+FA2/FA3 provider. The calculation uses paired CPU lengths rather than declared
+maximum lengths and adds no device readback. Existing causal, mask, window,
+sinks, split-control and runtime guards remain in force. Q, K, V and output
+must have the same BF16 or FP16 dtype; mixed precision is not admitted.
+
+The cuDNN graph uses exact H100 declarations; Blackwell's cache buckets do not
+apply. Backend and FROST remain peers behind the same public graph contract.
+A graph-mode wrapper already planned for FA2 or FA3 keeps that native provider
+and its schedule. A cuDNN-first wrapper may fall back while refreshing the
+metadata retained by its old cuDNN captures. Validate both starting orders and
+Q64/Q65 partition changes and transitions across the actual-work floor,
+including numerical output and LSE after replay.
