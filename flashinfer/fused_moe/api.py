@@ -3301,8 +3301,9 @@ class FrostLowLatencyConfig:
 class ColonelsBf16Config:
     """Colonels fused BF16 MoE on SM90/SM103.
 
-    Empty ``tactics`` uses a bounded search across kernel families. Pass entries
-    from ``get_colonels_tactics(..., exhaustive=True)`` for a custom search.
+    Empty ``tactics`` searches the complete configuration catalogue. Pass entries
+    from ``get_colonels_tactics(...)`` to restrict the search explicitly.
+    The default search includes GEMV only for batches of at most 16 tokens.
     """
 
     tactics: Tuple[ColonelsTactic, ...] = ()

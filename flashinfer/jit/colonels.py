@@ -59,7 +59,7 @@ def gen_colonels_module(variant, parameters, activation, arch):
 
 
 def gen_colonels_aot_modules(arch):
-    """Prebuild the default search; custom catalogue entries remain lazy JIT."""
+    """Prebuild the complete configuration catalogue for the architecture."""
     from ..fused_moe.backends.colonels.tactics import get_colonels_tactics
 
     modules = {}

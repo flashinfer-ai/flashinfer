@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import pytest
 import torch
@@ -32,7 +32,10 @@ from flashinfer.fused_moe.api import (
     SiTU,
     SwiGLUStep,
 )
-from flashinfer.fused_moe.backends.colonels.catalog import get_fused_moe_configs
+from flashinfer.fused_moe.backends.colonels.catalog import (
+    get_fused_moe_configs,
+    kernel_config_permutations,
+)
 from flashinfer.fused_moe.backends.colonels.prepare import interleave_gate_up
 
 
@@ -112,7 +115,7 @@ def _case(
         if tune_stages and tactic.variant.startswith("bf16_sm100")
         else (tactic,)
     )
-    allowed = set(get_colonels_tactics(_arch(), exhaustive=True))
+    allowed = set(get_colonels_tactics(_arch()))
     tactics = tuple(t for t in tactics if t in allowed)
     assert tactics
     backend = ColonelsBf16Config(tactics=tactics)
@@ -229,11 +232,26 @@ def test_expert_parallel_shared_and_graph(shared):
         torch.testing.assert_close(output, expected, rtol=0.05, atol=0.002)
 
 
-def test_autotuning():
+@pytest.mark.parametrize("m", [16, 17])
+def test_autotuning(m):
     if _arch() != 103:
         pytest.skip("Blackwell tactic")
-    layer, act, pack, reference, _ = _case(ColonelsTactic())
-    with autotune(True):
+    layer, act, pack, reference, _ = _case(ColonelsTactic(), m=m, i=16)
+    layer = MoELayer(
+        replace(
+            layer.config, backend=BackendOptions(candidates=(ColonelsBf16Config(),))
+        )
+    )
+    runner = layer.runners[0]
+    assert runner.tactics == get_colonels_tactics(_arch())
+    valid = runner.get_valid_tactics(runner.pack_inputs(act, pack), None)
+    if m > 16:
+        # Only GEMV supports this narrow shape, so the cutoff leaves no tactics.
+        assert not valid
+        return
+    gemv = ColonelsTactic(variant="bf16_gemv", block_n=16, warp_n=1, z_split=2)
+    assert tuple(asdict(gemv).values()) in valid
+    with autotune(True, tuning_buckets=(act.num_tokens,)):
         actual = layer(act, pack)
     torch.testing.assert_close(actual, reference, rtol=0.05, atol=0.002)
     assert layer.winner_backend == "colonels_bf16"
@@ -241,10 +259,19 @@ def test_autotuning():
 
 def test_catalogue_has_all_families():
     for arch in (90, 103):
-        tactics = get_colonels_tactics(arch, exhaustive=True)
-        assert set(get_colonels_tactics(arch)).issubset(tactics)
+        tactics = get_colonels_tactics(arch)
+        expected = len(get_fused_moe_configs(arch, "bf16", SwiGLU())) + len(
+            kernel_config_permutations("bf16_gemv")
+        )
+        assert len(tactics) == len(set(tactics)) == expected
         assert len({t.variant for t in tactics}) == (3 if arch == 90 else 7)
-    assert {t.variant for t in get_colonels_tactics(90, fp8=True, exhaustive=True)} == {
+    fp8_tactics = get_colonels_tactics(90, fp8=True)
+    assert (
+        len(fp8_tactics)
+        == len(set(fp8_tactics))
+        == len(get_fused_moe_configs(90, "fp8", SwiGLU()))
+    )
+    assert {t.variant for t in fp8_tactics} == {
         "w8a8",
         "w8a8_persistent",
     }

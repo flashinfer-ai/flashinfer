@@ -114,8 +114,8 @@ def _variant(config, arch, fp8):
 
 
 @cache
-def get_colonels_tactics(arch, *, fp8=False, exhaustive=False):
-    """Enumerate the complete catalogue, or a bounded default search across families."""
+def get_colonels_tactics(arch, *, fp8=False):
+    """Enumerate the complete configuration catalogue for the architecture."""
     from ...api import SwiGLU
 
     configs = get_fused_moe_configs(arch, "fp8" if fp8 else "bf16", SwiGLU())
@@ -132,39 +132,4 @@ def get_colonels_tactics(arch, *, fp8=False, exhaustive=False):
             ColonelsTactic(variant="bf16_gemv", **c)
             for c in kernel_config_permutations("bf16_gemv")
         ]
-    if exhaustive:
-        return tuple(tactics)
-    return tuple(
-        t
-        for t in tactics
-        if (
-            (
-                t.variant == "bf16_gemv"
-                and t.block_n == 128
-                and t.warp_n == 4
-                and t.z_split == 1
-            )
-            or (
-                t.variant != "bf16_gemv"
-                and t.block_m in (32, 64, 128)
-                and t.block_n in ((0, 64) if arch == 103 else (32, 64))
-                and (arch == 103 or t.stages in (2, 3))
-                and t.warp_n == (8 if arch == 90 else 4)
-                and t.clusters == 1
-                and not t.red_store
-                and not t.weight_eviction
-                and t.epilogue_warps == 4
-                and t.producer_warps == 4
-            )
-            # Large prefill batches also need the clustered GMEM configuration.
-            or (
-                t.variant == "bf16_sm100_gmem_persistent"
-                and t.block_m == 256
-                and t.stages == 6
-                and t.clusters == 2
-                and not t.red_store
-                and t.epilogue_warps == 8
-                and t.producer_warps == 8
-            )
-        )
-    )
+    return tuple(tactics)

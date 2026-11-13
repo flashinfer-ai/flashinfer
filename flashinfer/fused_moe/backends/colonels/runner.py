@@ -107,7 +107,7 @@ class ColonelsBf16Runner(MoERunner):
             )
         ):
             raise ValueError("Invalid local expert shard")
-        allowed = set(get_colonels_tactics(self.arch, fp8=self.fp8, exhaustive=True))
+        allowed = set(get_colonels_tactics(self.arch, fp8=self.fp8))
         if any(t not in allowed for t in self.tactics):
             raise ValueError(
                 "Colonels tactic is outside the architecture's kernel catalogue"

@@ -88,12 +88,13 @@ shared experts. FromLogits routing, PDL, and unfinalized output are rejected.
 ## Tuning, graphs, and direct launches
 
 `ColonelsBf16Config(tactics=...)` and `ColonelsFp8BlockConfig(tactics=...)` accept
-immutable `ColonelsTactic` values. An empty tuple selects a bounded search across
-families. `get_colonels_tactics(arch, fp8=False, exhaustive=True)` exposes the
+immutable `ColonelsTactic` values. An empty tuple searches the complete catalogue.
+`get_colonels_tactics(arch, fp8=False)` exposes the
 complete source catalogue, including tile sizes, stages, clusters, reduction
 stores, preferred cluster fallback, weight eviction, producer/epilogue warps,
 and GEMV z-splits. Geometry and launch-resource checks filter candidates before
-timing; GEMV is searched automatically for at most 16 tokens.
+timing; GEMV is searched automatically for at most 16 tokens. Explicitly supplied
+GEMV tactics can still run at larger token counts.
 
 Warm each token count and tactic before graph capture. Workspace buffers are
 retained by the runner, keyed by shape and stream, with stream-specific GMEM
