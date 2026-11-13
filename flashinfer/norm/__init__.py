@@ -25,7 +25,6 @@ This package provides high-performance normalization kernels:
 """
 
 import functools
-import math
 import os
 import warnings
 from typing import Literal, Optional, Tuple, Union
@@ -1247,9 +1246,9 @@ def _empty_norm_input(
     allow_3d: bool = False,
 ) -> bool:
     """Validate zero-row calls before bypassing either backend's zero-grid launch."""
-    if input.ndim not in ((2, 3) if allow_3d else (2,)):
+    if input.numel() != 0:
         return False
-    if math.prod(input.shape[:-1]) != 0:
+    if input.ndim not in ((2, 3) if allow_3d else (2,)):
         return False
     hidden = input.shape[-1]
     if hidden <= 0:
