@@ -705,7 +705,7 @@ def route_split(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, 
 
 
 def route_streaming(
-    b: int, n: int, npad: int, k: int, force_main: bool = False
+    b: int, n: int, npad: int, k: int, force_main: bool = False, big: bool | None = None
 ) -> dict[str, object]:
     """route() restricted to its STREAMING half (main / clus) — the varlen
     capture policy: per-row kernels must be picked from the families that are
@@ -713,7 +713,9 @@ def route_streaming(
     skipped even when the envelope n would normally land on them.  Where
     route() itself lands on main/clus this is IDENTICAL to route().
     force_main additionally skips the clus rounding, so the raw
-    min(r1, r2) R matches the CUDA else-branch exactly."""
+    min(r1, r2) R matches the CUDA else-branch exactly. ``big`` overrides the
+    regime selector (_big_regime) for a caller that decides the slab's CTA
+    shape itself (the windowed tier-0 slab, _prefill_slab_plan)."""
     if b < 1:
         raise RuntimeError(f"route_streaming requires b >= 1, got {b}")
     R = 1
@@ -732,7 +734,7 @@ def route_streaming(
             p2 = 4
         R = p2
         useclus = True
-    big = _big_regime(b, R, n >> 2)
+    big = _big_regime(b, R, n >> 2) if big is None else bool(big)
     scap = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
     cmp_ = (4096 if k > 1024 else 2048) if big else 1024
     aim = (
@@ -1145,33 +1147,40 @@ def _prefill_env_error() -> str | None:
 _PREFILL_CACHE: dict = {}
 _PREFILL_ROW_SLAB = 32768  # gridDim.y <= 65535; slab so keys stay bounded
 _PREFILL_TIER_ROWS = (75, 149, 297)  # (rows<=148, 149..296, >296) band reps
-# The tier-0 plan is the BLK=1024 non-split slab, whose compile-time pair-sample
-# gate is n > 16384, so under an envelope <= 16384 every row runs the unsampled
-# path. The tier-1 BLK=512 plan samples above its own gate (4096 for k <= 1024,
-# 8192 for k > 1024); <= 148-row launches take it when the envelope is above
-# that gate by a margin (just above the gate the freshly sampling BLK=512 plan
-# is slower than the unsampled BLK=1024 plan for b >= 32) and at most 16384
-# (above that the BLK=1024 plan samples too and is the better slab). Upstream
-# TRT-LLM refinement of #18702.
-_PREFILL_T1_MARGIN = 256
-_PREFILL_T1_MAX = 16384
-
-
-def _prefill_scpb_tier1(k: int) -> int:
-    return 8192 if k > 1024 else 4096
+# Slab tiers are row bands. Tier 0 (<= 148 rows, one CTA per row) picks its
+# CTA shape by envelope bucket (_prefill_slab_plan: 512 threads up to the 32K
+# bucket, 1024 threads from the 64K bucket) and keeps the big-regime sampling
+# scalars; tiers 1 and 2 keep route_streaming's non-big regime (tier 1: 512
+# threads, MINB 2; tier 2: 256 threads, MINB 4) with its own scalars, so up
+# to the 32K bucket a tier-0 and a tier-1 launch differ only in those
+# scalars. Upstream's refinement of #18702 sent <= 148-row launches with
+# envelopes just above the pair-sample gate (4096 / 8192 + 256 ... 16384) to
+# tier 1; it was tuned for the BLK=1024 tier-0 plan and is dropped here.
+# Re-measured on B200 after the plan split (CUPTI, rows 16-148, envelopes
+# 8.7K-16K; the 4.4K-8.7K part of the K <= 1024 band was not measured): at
+# K <= 1024 the tier-0 scalars win 15-24% for 64-148 rows and at 16 rows x
+# K = 1024, and lose 0-5% at 16 rows x K = 512; at K = 2048 the detour keeps
+# 4-11% at 16 rows and 6-9% at 8.7K for every row count, while the tier-0
+# scalars win 13-21% at 10K-16K for 64-148 rows (except 64 rows x 12K,
+# detour +6%, and 148 rows x 14-16K cold, 6-9%).
 
 
 def _prefill_tier(rows: int, n_env: int, k: int) -> int:
-    tier = 0 if rows <= 148 else 1 if rows <= 296 else 2
-    if tier == 0 and _prefill_scpb_tier1(k) + _PREFILL_T1_MARGIN < n_env <= _PREFILL_T1_MAX:
-        tier = 1
-    return tier
+    """Slab tier of a windowed launch: a pure row band (pinned by
+    test_prefill_tiers_are_row_bands). ``n_env`` and ``k`` stay in the
+    signature for the callers that route per envelope class."""
+    return 0 if rows <= 148 else 1 if rows <= 296 else 2
+
+
+_PREFILL_WIDE_BUCKET = 65536  # tier 0 changes CTA shape here (512 -> 1024 threads)
 
 
 def _prefill_bucket(n_env: int) -> int:
     # pow2-quantize the envelope so a growing envelope reuses one plan; cap at
-    # 32768 because U=8 for every n>=32768 on the tier-0 arm.
-    return min(1 << max(int(n_env) - 1, 1).bit_length(), 32768)
+    # the wide bucket: U=8 for every n>=32768 on the tier-0 arm and the only
+    # plan change past 32768 is tier 0's CTA shape at the 64K bucket
+    # (_prefill_slab_plan), so every wider envelope shares that launcher.
+    return min(1 << max(int(n_env) - 1, 1).bit_length(), _PREFILL_WIDE_BUCKET)
 
 
 def _prefill_bucket_for(n_env: int, k: int) -> int:
@@ -1375,6 +1384,31 @@ def _prefill_get(
     return lc
 
 
+def _prefill_slab_plan(tier: int, k: int, n_bucket: int) -> dict[str, object]:
+    """Streaming-slab plan of a windowed launch (pure; pinned by
+    test_prefill_tier0_slab_plan_is_pinned).
+
+    Tier 0 (<= 148 rows: one CTA per row, a single wave) picks its CTA shape
+    by envelope bucket instead of route_streaming's regime rule: the
+    512-thread (512, U 8, MINB 2) plan up to the 32K bucket and the
+    1024-thread (1024, U 8, MINB 1) plan from the 64K bucket on, which every
+    wider window maps to. Measured on B200 (CUPTI kernel time, rows 16-148,
+    K 512-2048, 3 runs, spread <= 1.5%): at 32K the 512-thread plan is 5-20%
+    faster with L2-resident logits and between 11% faster and 8% slower with
+    a cold L2; at 128K the 1024-thread CTA hides the HBM latency better and
+    is 0-11% faster hot (a wash at K = 2048), at 256K 17-25% faster hot, and
+    13-51% faster cold from 128K on; 64K sits between (within 5% hot, 5-20%
+    for 1024 threads cold) and goes with the wide side. Tiers 1 and 2 (149
+    rows and up) keep route_streaming's own regime."""
+    b_route = _PREFILL_TIER_ROWS[tier]
+    n_route = max(n_bucket, k + 1)
+    big = (n_bucket >= _PREFILL_WIDE_BUCKET) if tier == 0 else None
+    plan = route_streaming(b_route, n_route, n_route, k, force_main=True, big=big)
+    if plan["kernel"] != "main":
+        raise RuntimeError(f"prefill route did not land on gvr_main: {plan['kernel']}")
+    return plan
+
+
 def _prefill_launcher(tier: int, k: int, n_bucket: int, abs_out: bool = False) -> tuple:
     """Windowed slab plan + compiled launcher: ``_varlen_launcher``'s main branch
     with r_const=1, split=False, hint_free=True and the prefill compile flag.
@@ -1383,11 +1417,7 @@ def _prefill_launcher(tier: int, k: int, n_bucket: int, abs_out: bool = False) -
     hit = _PREFILL_CACHE.get(key)
     if hit is not None:
         return hit
-    b_route = _PREFILL_TIER_ROWS[tier]
-    n_route = max(n_bucket, k + 1)
-    plan = route_streaming(b_route, n_route, n_route, k, force_main=True)
-    if plan["kernel"] != "main":
-        raise RuntimeError(f"prefill route did not land on gvr_main: {plan['kernel']}")
+    plan = _prefill_slab_plan(tier, k, n_bucket)
     rt = plan["rt"]
     if rt["R"] != 1:
         raise RuntimeError(f"prefill requires R==1 (got {rt['R']})")
@@ -1398,6 +1428,12 @@ def _prefill_launcher(tier: int, k: int, n_bucket: int, abs_out: bool = False) -
             tpl[:6] + (False,) + (1, 0, 1), hint_free=True, prefill=True, prefill_abs=abs_out
         )
     )
+    # tier 0 keeps the big-regime sampling scalars (aim_base / sd_en) with
+    # BOTH of its CTA shapes: paired with the 512-thread plan they measured
+    # 24-46% faster than the regime-consistent scalars at K = 512 and at
+    # K = 2048 for 64-148 rows (26-46%) on B200, 3-6% slower at K = 1024 and
+    # 7-9% slower at K = 2048 with 16 rows (the reviewer's B100 numbers point
+    # the same way); see _prefill_slab_plan for the plan itself
     big = tier == 0
     # r_const==1 branch of the _varlen_launcher tuning scalars
     aim_base = (
@@ -1515,8 +1551,10 @@ def warmup_prefill(
     rows is issued in launches of at most 32768 rows, each routed on its own
     count. For every row count in ``num_rows_list`` and every power-of-two
     bucket of the bound from the first above ``top_k`` up to the one
-    covering ``max_cols`` (buckets are capped at 32768 columns; wider bounds
-    share that bucket), at both edges of the bucket, this compiles the
+    covering ``max_cols`` (buckets are capped at 65536 columns; wider bounds
+    share that bucket, and since the 64K bucket is a launcher of its own a
+    bound above 32768 needs a warm-up whose ``max_cols`` covers it), at both
+    edges of the bucket, this compiles the
     streaming engine that bound takes and the register-resident engine
     (2048-, 4096- or 8192-column class) the host admits for it. A later call
     is covered when its ``top_k`` and ``absolute_indices`` match, its bound
@@ -2429,12 +2467,22 @@ def run_varlen(
             )
         if not page_table.is_contiguous():
             raise RuntimeError("page_table must be contiguous")
-        # every column the kernels can emit (< min(envelope, width)) needs a page
-        need_pages = (min(_index(max_seq_len) // cr if max_seq_len is not None else logits.shape[1], logits.shape[1]) + ps - 1) // ps
-        if page_table.shape[1] < need_pages:
+        # engine-independent bound: every engine ranks at least the view width
+        # (the reference engine ranks exactly the view), so a table short of it
+        # is refused here, on the host, before any launch. The auto engines'
+        # stride-based bound is checked below once their envelope is known.
+        need_lo = (
+            min(
+                _index(max_seq_len) // cr if max_seq_len is not None else logits.shape[1],
+                logits.shape[1],
+            )
+            + ps
+            - 1
+        ) // ps
+        if page_table.shape[1] < need_lo:
             raise RuntimeError(
                 f"page_table has {page_table.shape[1]} pages per request; the logits width "
-                f"needs {need_pages} at page_size={ps}"
+                f"needs {need_lo} at page_size={ps}"
             )
     d = logits.get_device()
     if not 0 <= d < _GVR_MAX_DEV:
@@ -2536,12 +2584,29 @@ def run_varlen(
                     "host — pass max_seq_len (a capture-stable engine "
                     "constant) under CUDA graph capture"
                 )
-            n_env = int(kv_lens.max().item()) >> cshift
+            kv_cols = int(kv_lens.max().item()) >> cshift
             # eager mode: quantize the data-dependent envelope up to the next
             # power of two so a growing decode does not recompile at every
             # R increment (bounded plans, bounded _VARLEN_CACHE)
-            n_env = 1 << max(n_env - 1, 1).bit_length()
+            n_env = 1 << max(kv_cols - 1, 1).bit_length()
         n_env = min(max(n_env, 1), npad)
+        if page_table is not None:
+            # every column the engines can emit needs a page. The emit bound is
+            # the envelope clamped to the row STRIDE, not the view width: a view
+            # narrower than its stride ranks the arena columns up to the caller's
+            # bound, and a table sized from the view width mapped the columns
+            # beyond it through missing entries (staged as -1 on the smem-table
+            # compile, read past the row on the global-table compile) and came
+            # back as negative slots without an error. In eager mode the bound
+            # is the live kv maximum, not the power-of-two envelope the cache
+            # key quantizes it to.
+            emit_bound = n_env if max_seq_len is not None else min(max(kv_cols, 1), npad)
+            need_pages = (emit_bound + ps - 1) >> page_shift
+            if page_table.shape[1] < need_pages:
+                raise RuntimeError(
+                    f"page_table has {page_table.shape[1]} pages per request; the engine "
+                    f"envelope of {emit_bound} columns needs {need_pages} at page_size={ps}"
+                )
         if windowed:
             idx = indices
             if idx.shape[1] != k:
