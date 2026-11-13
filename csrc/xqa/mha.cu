@@ -1588,12 +1588,41 @@ CUBIN_EXPORT __global__
 #if ENABLE_4BIT_KV_CACHE
         uint32_t sf_stride_page, uint32_t sf_stride_token, uint32_t sf_stride_head,
 #endif
-        uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
+        uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr
+#ifndef GENERATE_CUBIN
+        ,
+        uint32_t splitCtaSlots = 0
+#endif
+    ) {
 
+#if ENABLE_PDL
+  preExit();
+  acqBulk();
+#endif
+  uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, blockIdx.z);
   assert(allowMultiBlockMode || gridDim.x == 1);
-  bool const isMultiBlock = allowMultiBlockMode && (gridDim.x != 1);
-  uint32_t const nbSubSeqPerSeq = allowMultiBlockMode ? gridDim.x : 1;
+  uint32_t const splitCapacity = allowMultiBlockMode ? gridDim.x : 1;
+  uint32_t nbSubSeqPerSeq = splitCapacity;
+#if !defined(GENERATE_CUBIN) && !SPEC_DEC && BEAM_WIDTH == 1 && CACHE_ELEM_ENUM == 2 && \
+    __CUDA_ARCH__ == 1200
+  if (splitCtaSlots != 0) {
+    uint32_t skipTiles = 0;
+#if SLIDING_WINDOW
+    skipTiles = cacheSeqLen > slidingWinSize ? (cacheSeqLen - slidingWinSize) / ctaTile.x : 0;
+#endif
+    uint32_t const tiles = divUp(cacheSeqLen, ctaTile.x) - skipTiles;
+    nbSubSeqPerSeq = min(splitCapacity, max(1U, tiles));
+    // At high batch sizes, merging one-tile chunks costs more than the tail wave.
+    if (batchSize * nbKHeads > splitCtaSlots && tiles <= 4) {
+      nbSubSeqPerSeq = 1;
+    }
+  }
+#endif
   uint32_t const idxSubSeqInSeq = allowMultiBlockMode ? blockIdx.x : 0;
+  if (idxSubSeqInSeq >= nbSubSeqPerSeq) {
+    return;
+  }
+  bool const isMultiBlock = nbSubSeqPerSeq > 1;
   assert(!isMultiBlock || (semaphores != nullptr && scratch != nullptr));
 
   // gridDim: x - K/V sequence-dim split; y - number of K or V heads per token; z - number of
@@ -1660,11 +1689,6 @@ CUBIN_EXPORT __global__
   }
 #endif
   __syncthreads();
-
-#if ENABLE_PDL
-  preExit();
-  acqBulk();
-#endif
 
   // The scale tensors and qCuSeqLens may be written by the previous grid;
   // do not read them before acqBulk().
@@ -1769,7 +1793,6 @@ CUBIN_EXPORT __global__
   }
 #endif
 
-  uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
 #if SLIDING_WINDOW
   bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
 #if SPEC_DEC && !IS_SPEC_DEC_TREE
@@ -2698,7 +2721,7 @@ CUBIN_EXPORT __global__
 #else
       uint32_t const nbSeq = nbKHeads * batchSize;
 #endif
-      uint32_t const nbSubSeq = nbSubSeqPerSeq * nbSeq;
+      uint32_t const nbSubSeq = splitCapacity * nbSeq;
       MemSegmenter<false> segmenter{scratch};
 
 #if SPEC_DEC
@@ -2706,7 +2729,7 @@ CUBIN_EXPORT __global__
 #else
       uint32_t const idxSeq = nbKHeads * idxReq + idxHeadGrp;
 #endif
-      uint32_t const idxBufBase = nbSubSeqPerSeq * idxSeq;
+      uint32_t const idxBufBase = splitCapacity * idxSeq;
       uint32_t const idxBuf = idxBufBase + idxSubSeqInSeq;
       // copy row max/sum
       TinyPtr<SMemWarpRowMax> const rowMaxBuffers = segmenter.newSeg<SMemWarpRowMax>(nbSubSeq);
@@ -2806,7 +2829,9 @@ CUBIN_EXPORT __global__
         // by mbbuf tiles and the mergeAndSaveOutTile swizzle buffer are ordered by the
         // __syncthreads() calls inside this loop and in mergeAndSaveOutTile.
         for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
-          loadBufAsync(warpGrpIdx, hs);
+          if (warpGrpIdx < nbSubSeqPerSeq) {
+            loadBufAsync(warpGrpIdx, hs);
+          }
           ldgsts::commitGroup();
           WarpAcc sumAcc{};
           ThrdRegRowMax partialMergedRowSum{};
@@ -2922,7 +2947,12 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
 #if ENABLE_4BIT_KV_CACHE
     uint32_t sf_stride_page, uint32_t sf_stride_token, uint32_t sf_stride_head,
 #endif
-    uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
+    uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr
+#ifndef GENERATE_CUBIN
+    ,
+    uint32_t splitCtaSlots = 0
+#endif
+) {
 #if SPEC_DEC
   kernel_mha_impl(qSeqLen, nbKHeads, headGrpSize, qCuSeqLens,
 #else
@@ -2948,7 +2978,12 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
 #if ENABLE_4BIT_KV_CACHE
                   sf_stride_page, sf_stride_token, sf_stride_head,
 #endif
-                  semaphores, scratch);
+                  semaphores, scratch
+#ifndef GENERATE_CUBIN
+                  ,
+                  splitCtaSlots
+#endif
+  );
 }
 #else
 static constexpr auto kernel_mha = kernel_mha_impl;
@@ -3083,7 +3118,7 @@ void launchMHA(
 #if ENABLE_4BIT_KV_CACHE
                      sf_stride_page_in_heads, sf_stride_token_in_heads, sf_stride_head_in_heads,
 #endif
-                     semaphores, scratch);
+                     semaphores, scratch, 0U);
   checkCuda(cudaPeekAtLastError());
 #endif  // USE_INPUT_KV
 }
@@ -3114,19 +3149,62 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if SPEC_DEC
                          uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
-                         uint32_t* semaphores, void* scratch, bool enable_pdl,
-                         uint64_t kv_stride_page, uint64_t kv_stride_token, uint64_t kv_stride_head,
+                         uint32_t* semaphores, void* scratch, uint64_t scratchBytes,
+                         bool enable_pdl, uint64_t kv_stride_page, uint64_t kv_stride_token,
+                         uint64_t kv_stride_head,
 #if ENABLE_4BIT_KV_CACHE
                          uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
 #endif
                          cudaStream_t stream) {
-  uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
-    if (!allowMultiBlockMode) {
-      return 1;
+  uint32_t splitCtaSlots = 0;
+#if !SPEC_DEC && BEAM_WIDTH == 1 && CACHE_ELEM_ENUM == 2
+  if (allowMultiBlockMode && (validElemsPerHead == 128 || validElemsPerHead == 256)) {
+    int device;
+    checkCuda(cudaGetDevice(&device));
+    static thread_local int cachedDevice = -1;
+    static thread_local int activeBlocks = 0;
+    if (cachedDevice != device) {
+      int major, minor;
+      checkCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+      checkCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
+      activeBlocks = 0;
+      if (major == 12 && minor == 0) {
+        checkCuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&activeBlocks, kernel_mha, ctaSize,
+                                                                hostSmemSize));
+      }
+      cachedDevice = device;
     }
-    return std::min<uint32_t>(std::max<uint32_t>(1U, multiProcessorCount / (batchSize * nbKHeads)),
-                              divUp(maxSeqLen, ctaTile.x));
-  }();
+    splitCtaSlots = multiProcessorCount * activeBlocks;
+  }
+#endif
+  uint32_t const nbSeq = batchSize * nbKHeads;
+  uint32_t const slots = splitCtaSlots != 0 ? splitCtaSlots : multiProcessorCount;
+  uint32_t nbSubSeqPerSeq =
+      allowMultiBlockMode
+          ? std::min(std::max(1U, slots / nbSeq), std::max(1U, divUp(maxSeqLen, ctaTile.x)))
+          : 1;
+  if (splitCtaSlots != 0) {
+    // Fill a nearly empty second wave. Short contexts can still use one active
+    // CTA per head at replay time, without changing the graph or scratch stride.
+    if (nbSeq > slots && nbSeq < 2 * slots && nbSeq - slots <= slots / 4) {
+      nbSubSeqPerSeq = std::min(8U, std::max(1U, divUp(maxSeqLen, ctaTile.x)));
+    }
+    using ScratchBuf = Array2D<LdGrain, nbValidRows, SharedMem::XSmemBuffer::cols>;
+    using HeadScratch = Vec<ScratchBuf, gemm1WarpsPerGrp * nbHeadSplits>;
+    while (nbSubSeqPerSeq > 1) {
+      uint64_t const count = uint64_t(nbSubSeqPerSeq) * nbSeq;
+      if (count <= UINT32_MAX) {
+        Segmenter<uint64_t> layout;
+        layout.newSeg<SMemWarpRowMax>(uint32_t(count), sizeof(SMemWarpRowMax));
+        layout.newSeg<SMemWarpRowMax>(uint32_t(count), sizeof(SMemWarpRowMax));
+        layout.newSeg<HeadScratch>(uint32_t(count), sizeof(HeadScratch));
+        if (layout.getEndOffset() <= std::min(scratchBytes, uint64_t(UINT32_MAX))) {
+          break;
+        }
+      }
+      --nbSubSeqPerSeq;
+    }
+  }
 #if SPEC_DEC
   const uint32_t nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, rowsPerBlock);
   dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads * nbTokenBlocksPerGrp, batchSize};
@@ -3182,7 +3260,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if ENABLE_4BIT_KV_CACHE
                      sf_stride_page_in_heads, sf_stride_token_in_heads, sf_stride_head_in_heads,
 #endif
-                     semaphores, scratch);
+                     semaphores, scratch, splitCtaSlots);
   checkCuda(cudaPeekAtLastError());
 }
 #endif
