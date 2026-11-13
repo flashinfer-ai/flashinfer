@@ -49,6 +49,7 @@ from .batched_gemm_cga import (
     needs_extended_tma_multicast,
 )
 from .mixed_cga_ts import override_tma_umma_pipeline, override_umma_atom_pipeline
+from .cache_policy import make_weight_l2_cache_hint
 from .gmem_ab_resources import nonnegative_div, nonnegative_mod
 from .smem_descriptor import build_tcgen05_smem_desc
 from cutlass.experimental import primitives as prims
@@ -63,6 +64,9 @@ class SmemSfAResource(MemoryResource):
 
     cfg: Constexpr[BatchedGemmConfig]
     tma_sfa_desc: Any = None
+    weight_tile_idx_view: Any = None
+    weight_num_token_tiles_view: Any = None
+    weight_l2_cache_hint: Any = None
     smem_buf: Any = None
     _alloc_sfa: Constexpr[Optional[SmemAllocation]] = None
     desc_a_s2t_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -109,6 +113,10 @@ class SmemSfAResource(MemoryResource):
     @cute.jit
     def init_load_state(self, stage_info: StageInfo) -> None:
         self._init_smem_sfa(stage_info.context)
+        if cutlass.const_expr(self.cfg.weight_l2_evict_first):
+            # Match the operand loader's persistent-loop state initialization.
+            # prepare_sfa_tile replaces it before any scale-factor load.
+            self.weight_l2_cache_hint = Int64(0)
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
@@ -118,7 +126,12 @@ class SmemSfAResource(MemoryResource):
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def prepare_sfa_tile(self, stage_info: StageInfo) -> None:
-        pass
+        self.weight_l2_cache_hint = make_weight_l2_cache_hint(
+            self.cfg.weight_l2_evict_first,
+            self.weight_tile_idx_view,
+            self.weight_num_token_tiles_view,
+            stage_info.work_tile.tile_idx[1],
+        )
 
     @producer_work
     @cute.jit
@@ -187,6 +200,7 @@ class SmemSfAResource(MemoryResource):
                     [],
                     multicast_mask=mcast_mask,
                     group=self.cfg.cta_group,
+                    l2_cache_hint=self.weight_l2_cache_hint,
                 )
                 return
             if cutlass.const_expr(self.cfg.is_mx_mma):
@@ -205,6 +219,7 @@ class SmemSfAResource(MemoryResource):
                     [],
                     multicast_mask=mcast_mask,
                     group=self.cfg.cta_group,
+                    l2_cache_hint=self.weight_l2_cache_hint,
                 )
                 return
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
@@ -222,6 +237,7 @@ class SmemSfAResource(MemoryResource):
                 [],
                 multicast_mask=mcast_mask,
                 group=self.cfg.cta_group,
+                l2_cache_hint=self.weight_l2_cache_hint,
             )
         else:
             prims.cp_async_bulk_tensor_shared_cta_global(
@@ -229,6 +245,7 @@ class SmemSfAResource(MemoryResource):
                 tma_desc,
                 coords,
                 barrier,
+                l2_cache_hint=self.weight_l2_cache_hint,
             )
 
     @consumer_work(returns=(desc_a_s2t_base, smem_sfa_stage_ptr))
