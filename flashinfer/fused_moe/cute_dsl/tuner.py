@@ -455,9 +455,9 @@ def _get_default_tactic() -> Tuple:
 
 
 class CuteDslFusedMoERunner(TunableRunner):
-    """TunableRunner for CuteDSL W4A4 and W4A8 MoE kernels.
+    """TunableRunner for CuteDSL W4A4, W4A8, MXFP8 and MXFP4 MoE kernels.
 
-    This runner enables auto-tuning of the W4A4 and W4A8 MoE pipelines by
+    This runner enables auto-tuning of the block-scaled MoE pipelines by
     trying different combinations of GEMM tactics.
 
     Tactic format follows TRT-LLM style:
@@ -534,9 +534,9 @@ class CuteDslFusedMoERunner(TunableRunner):
         validate_cute_dsl_moe_clamped_relu2_config(activation_type, clamped_relu2_limit)
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
         quant_mode = quant_mode.lower()
-        if quant_mode not in ("w4a4", "w4a8", "mxfp8"):
+        if quant_mode not in ("w4a4", "w4a8", "mxfp8", "mxfp4"):
             raise ValueError(f"unsupported CuTe-DSL quant_mode {quant_mode!r}")
-        if quant_mode in ("w4a8", "mxfp8") and use_per_token_activation:
+        if quant_mode in ("w4a8", "mxfp8", "mxfp4") and use_per_token_activation:
             raise ValueError(
                 f"per-token activation scaling is not supported for {quant_mode}"
             )
@@ -806,6 +806,8 @@ class CuteDslFusedMoERunner(TunableRunner):
         num_tokens = x.shape[0]
         # MXFP8 activations (E4M3 + E8M0, block 32) in both the W4A8 and MXFP8 modes.
         is_mxfp8 = self.quant_mode in ("w4a8", "mxfp8")
+        # E8M0 block-32 scales: the MXFP8-activation modes and MXFP4 x MXFP4.
+        is_mx = is_mxfp8 or self.quant_mode == "mxfp4"
         hidden_size = x.shape[1] * (1 if is_mxfp8 else 2)
         num_local_experts = w1_weight.shape[0]
         # Gated SwiGLU fuses gate+up (2*intermediate rows); non-gated ReLU^2
@@ -820,8 +822,8 @@ class CuteDslFusedMoERunner(TunableRunner):
         b_dtype = (
             cutlass.Float8E4M3FN if self.quant_mode == "mxfp8" else cutlass.Float4E2M1FN
         )
-        sf_dtype = cutlass.Float8E8M0FNU if is_mxfp8 else cutlass.Float8E4M3FN
-        sf_vec_size = 32 if is_mxfp8 else 16
+        sf_dtype = cutlass.Float8E8M0FNU if is_mx else cutlass.Float8E4M3FN
+        sf_vec_size = 32 if is_mx else 16
 
         if self.use_per_token_activation:
             if self.output_dtype == torch.float16:
@@ -1059,6 +1061,8 @@ class CuteDslFusedMoERunner(TunableRunner):
                 tactic = (
                     DEFAULT_BLACKWELL_MOE_TACTIC
                     if self.quant_mode in ("w4a8", "mxfp8")
+                    else DEFAULT_BLACKWELL_MOE_TACTIC
+                    if self.quant_mode == "mxfp4"
                     else _get_default_tactic()
                 )
             elif self.quant_mode in ("w4a8", "mxfp8"):
@@ -1141,6 +1145,7 @@ class CuteDslFusedMoERunner(TunableRunner):
             situ_linear_beta=self.situ_linear_beta,
             clamped_relu2_limit=self.clamped_relu2_limit,
             swap_ab=self.swap_ab,
+            quant_mode=self.quant_mode,
             **kwargs,
         )
 

@@ -2584,10 +2584,11 @@ def prepare_cute_dsl_weights(
     non-gated ones (ReLU2) skip it and keep their ``[E, I, H]`` rows as-is.
     The default preserves 64-row up/gate groups. ``swap_ab=True`` selects
     16-row groups on SM100/SM103 and must match the execution configuration.
-    ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8, or NVFP4×BF16
-    (CuTe-DSL W4A16). Starts from the same canonical bf16 expert weights as
-    :func:`prepare_trtllm_fp4_weights`, so a single weight set can feed both
-    backends and a shared reference.
+    ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, MXFP4×MXFP4, MXFP8×MXFP8, or
+    NVFP4×BF16 (CuTe-DSL W4A16); MXFP4 weights are packed the same way for
+    MXFP8 and MXFP4 activations. Starts from the same canonical bf16 expert
+    weights as :func:`prepare_trtllm_fp4_weights`, so a single weight set can
+    feed both backends and a shared reference.
 
     Parameters
     ----------
@@ -2622,6 +2623,7 @@ def prepare_cute_dsl_weights(
     allowed = {
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
         (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        (QuantFormat.MXFP4, QuantFormat.MXFP4),
         (QuantFormat.MXFP8, QuantFormat.MXFP8),
         (QuantFormat.NVFP4, QuantFormat.BF16),
     }
@@ -2636,7 +2638,8 @@ def prepare_cute_dsl_weights(
     w1_bf16 = w1_bf16.to(device)
     w2_bf16 = w2_bf16.to(device)
 
-    is_mxfp4 = quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+    # MXFP4 weights (E2M1 + E8M0 block 32) for MXFP8 or MXFP4 activations.
+    is_mxfp4 = quant.weight is QuantFormat.MXFP4
     is_mxfp8 = quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8)
     if (is_mxfp4 or is_mxfp8) and (hidden_size % 128 or intermediate_size % 128):
         raise ValueError(

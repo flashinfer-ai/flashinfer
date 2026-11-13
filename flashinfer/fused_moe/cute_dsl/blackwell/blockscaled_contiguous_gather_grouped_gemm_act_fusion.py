@@ -378,7 +378,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     The computation flow:
     1. GEMM: acc = alpha * (SFA * A[token_ids]) * (SFB * B)
     2. Activation: SwiGLU, SiTU, tanh-approximate GeGLU, or ReLU^2
-    3. Optional Quant: Generates SFC and quantizes output to NVFP4 or MXFP8
+    3. Optional Quant: Generates SFC and quantizes output to NVFP4, MXFP4 or MXFP8
 
     Note: Output C has N/2 columns for gated activations and N columns otherwise.
 
@@ -387,7 +387,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     - Uses TMA (Tensor Memory Access) for loading B and SFB matrices with multicast
     - Token ID mapping enables efficient gather operation during A/SFA load
     - FC1 activation fusion in the epilogue
-    - Optional NVFP4 or MXFP8 output quantization with scale factor generation
+    - Optional NVFP4, MXFP4 or MXFP8 output quantization with scale factor generation
     - Warp specialization: Scheduler (warp 10), A Sync Transform (warp 11, only used when
       use_2cta_instrs is True), LDGSTS A/SFA (warps 4-7), TMA B/SFB (warp 9), MMA (warp 8),
       Epilogue (warps 0-3)
@@ -967,8 +967,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c)
 
-        self.is_mxfp8_output = (
-            self.c_dtype is cutlass.Float8E4M3FN
+        # MX output (MXFP8 or MXFP4): a pure per-32-element E8M0 scale with no
+        # global normalization factor, unlike NVFP4's E4M3 scale.
+        self.is_mx_output = (
+            self.c_dtype in (cutlass.Float8E4M3FN, cutlass.Float4E2M1FN)
             and self.sf_dtype is cutlass.Float8E8M0FNU
             and self.sf_vec_size == 32
         )
@@ -983,6 +985,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         if cutlass.const_expr(self.pre_fc2_routing != (routing_weights is not None)):
             raise ValueError("routing_weights is required exactly with pre_fc2_routing")
+        # Its scale math (E4M3 scales over one FC2 input scale per expert) is NVFP4's.
+        if cutlass.const_expr(self.pre_fc2_routing and self.is_mx_output):
+            raise ValueError("pre_fc2_routing requires NVFP4 output")
         if cutlass.const_expr(
             self.use_clamped_relu2 != (clamped_relu2_limit is not None)
         ):
@@ -994,7 +999,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # Setup sfc tensor by filling C tensor to scale factor atom layout
         self.generate_sfc = sfc_tensor is not None
         if cutlass.const_expr(
-            self.generate_sfc and not self.is_mxfp8_output and norm_const_tensor is None
+            self.generate_sfc and not self.is_mx_output and norm_const_tensor is None
         ):
             raise ValueError("norm_const_tensor is required for NVFP4 output")
         if cutlass.const_expr(self.generate_sfc):
@@ -1786,7 +1791,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             # A: 8x LDGSTS.128 per thread with swizzle_128B for A matrix.
             # Each copy contains 32 FP4 or 16 FP8 elements.
             # SFA: one LDGSTS.32 per scale-factor atom in the MMA K tile
-            # (4 atoms for NVFP4, 1 atom for MXFP8 x MXFP4).
+            # (4 atoms for NVFP4, 2 for MXFP4, 1 for MXFP8 x MXFP4).
             #
             a_atom_copy = cute.make_copy_atom(
                 cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -2013,7 +2018,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
                     for i in range(self.sfa_copies_per_thread):
                         #
-                        # Load SFA: 4x LDGSTS.32 per thread with 512-element block swizzling
+                        # Load SFA: one LDGSTS.32 per 512-byte scale-factor atom
+                        # (4 for NVFP4, 2 for MXFP4, 1 for MXFP8 x MXFP4).
                         # Each LDGSTS.32 loads 4 scale factor elements (32 bits) from GMEM to SMEM
                         # Uses same token offset as A matrix for consistent gather operation
                         #
@@ -2021,6 +2027,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             # The mixed MMA K tile contains exactly one 512-byte
                             # scale-factor atom, so there is no atom swizzle.
                             swizzled_iterator = 0
+                        elif cutlass.const_expr(self.sfa_copies_per_thread == 2):
+                            # MXFP4 x MXFP4: two atoms per K tile. The four-atom
+                            # rotation below would index atoms 2 and 3, past
+                            # this stage's SFA buffer, so rotate over two.
+                            swizzled_iterator = ((tidx_in_warpgroup % 32) // 8) % 2 ^ i
                         else:
                             # Preserve the existing four-atom NVFP4 swizzle.
                             swizzled_iterator = (tidx_in_warpgroup % 32) // 8 ^ i
@@ -2665,11 +2676,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             )
 
             if cutlass.const_expr(self.generate_sfc):
-                # MXFP8 uses a pure per-vector E8M0 scale.  NVFP4 retains its
-                # existing global normalization factor.
+                # MXFP8/MXFP4 use a pure per-vector E8M0 scale.  NVFP4 retains
+                # its existing global normalization factor.
                 norm_const = (
                     cutlass.Float32(1.0)
-                    if cutlass.const_expr(self.is_mxfp8_output)
+                    if cutlass.const_expr(self.is_mx_output)
                     else norm_const_tensor[0]
                 )
                 # (EPI_TILE_M, EPI_TILE_N, RestM, RestN, RestL)
@@ -2680,11 +2691,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 tCgSFC_mnl = thr_copy_t2r.partition_D(gSFC_mnl)
                 tCgSFC_mnl = cute.filter_zeros(tCgSFC_mnl)
                 # (T2R, T2R_M, T2R_N)
-                # Keep MXFP8 scale codes as raw bytes from registers through
+                # Keep MX scale codes as raw bytes from registers through
                 # GMEM; the scalar store below avoids a 2-element E8M0 vector.
                 sfc_rmem_dtype = (
                     cutlass.Uint8
-                    if cutlass.const_expr(self.is_mxfp8_output)
+                    if cutlass.const_expr(self.is_mx_output)
                     else self.sf_dtype
                 )
                 tCrSFC = cute.make_rmem_tensor(
@@ -3196,7 +3207,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
                     if cutlass.const_expr(self.generate_sfc):
                         #
-                        # Quantization path for Float4E2M1FN or MXFP8 output:
+                        # Quantization path for NVFP4, MXFP4 or MXFP8 output:
                         # 1. Compute per-vector absolute max from SwiGLU result
                         # 2. Generate scale factor C (SFC) based on max values
                         # 3. Store SFC to global memory
@@ -3278,12 +3289,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                     * norm_const
                                 )
 
-                        if cutlass.const_expr(self.is_mxfp8_output):
+                        if cutlass.const_expr(self.is_mx_output):
                             # Direct FP32 -> E8M0 exists, but converting this
                             # two-element fragment produces an unsupported
                             # vector<2xE8M0> lowering. Generate the same exact
-                            # raw codes as mxfp8_quantize instead: saturating
-                            # round-toward +infinity, with byte 0 for a zero block.
+                            # raw codes as mxfp8_quantize / mxfp4_quantize
+                            # instead: saturating round-toward +infinity of
+                            # amax / dtype_max, with byte 0 for a zero block.
                             for vi in cutlass.range_constexpr(cute.size(tCrSFC)):
                                 scale_ue8m0 = float_to_ue8m0_fast(tCrSFC_pvscale[vi])
                                 tCrSFC[vi] = scale_ue8m0.to(cutlass.Uint8)
@@ -3295,7 +3307,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         #
                         # TODO: Need to think about predicate on it
                         # if cute.elem_less():
-                        if cutlass.const_expr(self.is_mxfp8_output):
+                        if cutlass.const_expr(self.is_mx_output):
                             # Preserve those raw codes with scalar byte stores;
                             # the generic auto-vectorizer requires at least 32 bits.
                             for vi in cutlass.range_constexpr(cute.size(tCrSFC)):
@@ -3317,7 +3329,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                 vec = tTR_rAcc_frg[None, vi]
                                 for ei in cutlass.range_constexpr(self.sf_vec_size):
                                     vec[ei] = vec[ei] * acc_scale
-                        elif cutlass.const_expr(self.is_mxfp8_output):
+                        elif cutlass.const_expr(self.is_mx_output):
                             for vi in cutlass.range_constexpr(0, cute.size(tCrSFC), 2):
                                 acc_scale0 = ue8m0_to_inv_scale_fast(
                                     tCrSFC[vi].to(cutlass.Uint32)
