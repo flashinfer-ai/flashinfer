@@ -1,19 +1,13 @@
 """Small integer and layout helpers shared by workspace implementations."""
 
+from ...common.utils import ceil_div, round_up
+
 from typing import Iterable, List, Tuple, Union
 
 import cutlass
 
 
 IntegerType = Union[int, cutlass.Int32, cutlass.Int64, cutlass.Uint32, cutlass.Uint64]
-
-
-def round_up(value: IntegerType, alignment: IntegerType) -> IntegerType:
-    return ((value + alignment - 1) // alignment) * alignment
-
-
-def ceil_div(value: IntegerType, divisor: IntegerType) -> IntegerType:
-    return (value + divisor - 1) // divisor
 
 
 def padded_expert_rows(token_count: IntegerType, padding_block: IntegerType) -> IntegerType:

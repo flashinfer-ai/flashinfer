@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from flashinfer.moe_ep._compat import deprecated_aliases
 
 # Bump when kernel or knob semantics invalidate previous tuning results.
-BACKEND_REVISION = "sm107-block-scaled-1667b47a-runtime-options-v1"
+BACKEND_REVISION = "sm107-block-scaled-70a6878d-runtime-v1"
 _KEY_FIELDS = (
     "backend_revision",
     "kernel_variant",
@@ -46,6 +46,8 @@ _KEY_FIELDS = (
     "situ_beta",
     "situ_linear_beta",
     "gate_up_clamp",
+    "use_tanh_sigmoid",
+    "epilogue_warpgroups",
 )
 
 
@@ -134,6 +136,8 @@ def _matching_entries(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
+    use_tanh_sigmoid: bool = False,
+    epilogue_warpgroups: int = 1,
 ) -> List[Dict[str, Any]]:
     """Return records with a compatible numerical and execution contract."""
     if entries is None:
@@ -148,6 +152,8 @@ def _matching_entries(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         gate_up_clamp=gate_up_clamp,
+        use_tanh_sigmoid=use_tanh_sigmoid,
+        epilogue_warpgroups=epilogue_warpgroups,
         device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
@@ -197,6 +203,8 @@ def lookup_record(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
+    use_tanh_sigmoid: bool = False,
+    epilogue_warpgroups: int = 1,
 ) -> Optional[Dict[str, Any]]:
     from flashinfer.moe_ep.core.tuning import select_token_entries
 
@@ -218,6 +226,8 @@ def lookup_record(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         gate_up_clamp=gate_up_clamp,
+        use_tanh_sigmoid=use_tanh_sigmoid,
+        epilogue_warpgroups=epilogue_warpgroups,
     )
     matches = select_token_entries(matches, max_tokens, live_tokens)
     if not matches:
@@ -259,6 +269,8 @@ def make_record(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
+    use_tanh_sigmoid: bool = False,
+    epilogue_warpgroups: int = 1,
 ) -> Dict[str, Any]:
     """Build a tuning record shared by FlashInfer and the MegaMoE file."""
     if knobs.get("reduce_topk_in_kernel", False) and not allow_nondeterministic:
@@ -278,6 +290,8 @@ def make_record(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         gate_up_clamp=gate_up_clamp,
+        use_tanh_sigmoid=use_tanh_sigmoid,
+        epilogue_warpgroups=epilogue_warpgroups,
         device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
@@ -417,6 +431,8 @@ def resolve_knobs(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
+    use_tanh_sigmoid: bool = False,
+    epilogue_warpgroups: int = 1,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else the built-in heuristic.
 
@@ -439,6 +455,8 @@ def resolve_knobs(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         gate_up_clamp=gate_up_clamp,
+        use_tanh_sigmoid=use_tanh_sigmoid,
+        epilogue_warpgroups=epilogue_warpgroups,
     )
     if cached is not None:
         return cached, "cache"

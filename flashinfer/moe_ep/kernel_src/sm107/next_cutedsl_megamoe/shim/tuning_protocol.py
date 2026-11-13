@@ -144,6 +144,8 @@ class RubinTuningProtocol:
             activation=cfg.activation,
             situ_beta=cfg.situ_beta,
             situ_linear_beta=cfg.situ_linear_beta,
+            use_tanh_sigmoid=cfg.use_tanh_sigmoid,
+            epilogue_warpgroups=cfg.epilogue_warpgroups,
             gate_up_clamp=cfg.gate_up_clamp,
         )
 

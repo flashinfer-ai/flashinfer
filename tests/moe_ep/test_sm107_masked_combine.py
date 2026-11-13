@@ -22,8 +22,12 @@ def test_masked_combine_graph(tokens, hidden, topk, weighted):
 
     pkg.require_sm107_dsl()
     pkg.bootstrap_paths()
-    from sources.kernel_src.rubin.inference.mega.topk_reduce import TopkReduce
-    from sources.quant_def import CombineFormat
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.helpers.topk_reduce import (
+        TopkReduce,
+    )
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.quant_def import (
+        CombineFormat,
+    )
 
     experts = 128
     # Exercise the advertised 16-byte alignment without relying on 32-byte alignment.
@@ -94,5 +98,63 @@ def test_masked_combine_graph(tokens, hidden, topk, weighted):
             torch.cuda.synchronize()
             assert torch.isfinite(output).all(), state
             torch.testing.assert_close(output, expected.bfloat16(), rtol=0, atol=0)
+    finally:
+        graph.reset()
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize("hidden", [256, 264])
+@pytest.mark.parametrize("topk", [3, 17])
+def test_polled_combine_masks_scores(hidden, topk):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Requires SM107")
+    import cutlass.cute as cute
+    from cuda.bindings import driver as cuda
+    from cutlass.cute.runtime import from_dlpack
+
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.helpers.topk_reduce import (
+        TopkReduce,
+    )
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.quant_def import (
+        CombineFormat,
+    )
+
+    experts, tokens = 64, 2
+    terms = torch.zeros((tokens, topk, hidden), device="cuda", dtype=torch.bfloat16)
+    ids = torch.full((tokens, topk), -1, device="cuda", dtype=torch.int32)
+    scores = torch.ones((tokens, topk), device="cuda")
+    output = torch.empty((tokens, hidden), device="cuda", dtype=torch.bfloat16)
+    reducer = TopkReduce(
+        hidden, topk, CombineFormat.parse("bf16"), num_experts=experts, ll_encoded=True
+    )
+    kwargs = dict(
+        combine_quant=from_dlpack(terms, assumed_align=16),
+        combine_sf=None,
+        reduced_output=from_dlpack(output, assumed_align=16),
+        topk_score=from_dlpack(scores, assumed_align=4),
+        topk_indices=from_dlpack(ids, assumed_align=4),
+        stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    executable = cute.compile(reducer, **kwargs)
+    executable(**kwargs)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            kwargs["stream"] = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+            executable(**kwargs)
+        for score in (float("nan"), float("inf"), -float("inf")):
+            ids.zero_()
+            ids[:, ::2] = -1
+            valid = ids >= 0
+            values = torch.full_like(terms, 2)
+            terms.view(torch.int16).copy_(values.view(torch.int16).bitwise_not())
+            terms.masked_fill_(~valid.unsqueeze(-1), float("nan"))
+            scores.fill_(0.5).masked_fill_(~valid, score)
+            graph.replay()
+            torch.cuda.synchronize()
+            expected = valid.sum(dim=1).unsqueeze(-1).expand_as(output).bfloat16()
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            assert (terms[valid] == 0).all()
+            assert torch.isnan(terms[~valid]).all()
     finally:
         graph.reset()

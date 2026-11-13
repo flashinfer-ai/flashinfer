@@ -38,6 +38,7 @@ class Tcgen05TmemPlan:
     accumulator_pipeline_stages: int
     sfa_columns: int
     sfb_columns: int
+    m_repeat: int = 1
 
 
 def make_tcgen05_tmem_plan(
@@ -45,9 +46,11 @@ def make_tcgen05_tmem_plan(
 ) -> Tcgen05TmemPlan:
     """Plan TMEM for canonical dense or block-scaled TCGen05 MMA.
 
-    This planner requires A and B to reside in SMEM, per-CTA M to equal 128,
-    and tile M to equal instruction M. A-from-TMEM, sparse MMA, B-reuse, and
-    custom atom layouts or permutations are outside its contract.
+    This planner requires A and B to reside in SMEM and per-CTA instruction M to
+    equal 128. Tile M may repeat the instruction twice, which is the B-reuse tile:
+    the two M halves share one B operand and land in disjoint accumulator column
+    groups, so both the accumulator and SFA column counts double while SFB is
+    unchanged. A-from-TMEM and sparse MMA are outside its contract.
     SM100/SM103 use the canonical two-stage overlap for 256-column block-scaled
     accumulators; other supported cases maximize disjoint accumulator stages.
     """
@@ -64,10 +67,11 @@ def make_tcgen05_tmem_plan(
         raise ValueError("MMA instruction M and N must be divisible by participates.")
     if tile_m % instruction_m != 0 or tile_n % instruction_n != 0 or tile_k % instruction_k != 0:
         raise ValueError("MMA instruction dimensions must divide mma_tiler_mnk.")
-    if tile_m != instruction_m:
-        raise ValueError("TCGen05 TMEM planning does not support M repetition or B-reuse.")
-    if tile_m // mma_instruction.participates != 128:
-        raise ValueError("TCGen05 TMEM planning requires per-CTA M to equal 128.")
+    m_repeat = tile_m // instruction_m
+    if m_repeat not in (1, 2):
+        raise ValueError(f"TCGen05 TMEM planning supports one or two M repeats (B-reuse), got {m_repeat}.")
+    if instruction_m // mma_instruction.participates != 128:
+        raise ValueError("TCGen05 TMEM planning requires per-CTA instruction M to equal 128.")
 
     sf_fields = (mma_instruction.sfa_type, mma_instruction.sfb_type, mma_instruction.sf_vec_size)
     has_scale_factors = any(value is not None for value in sf_fields)
@@ -84,11 +88,12 @@ def make_tcgen05_tmem_plan(
             raise ValueError("Instruction K must be divisible by sf_vec_size.")
         if tile_k % (sf_vec_size * 4) != 0:
             raise ValueError("Tile K must contain complete block-scaled basic chunks.")
-        sfa_columns = tile_k // sf_vec_size
+        # Each M repeat gets its own SFA image; B and therefore SFB are shared.
+        sfa_columns = m_repeat * (tile_k // sf_vec_size)
         sfb_columns = max(tile_n // 128, 1) * tile_k // sf_vec_size
 
     tmem_column_capacity = cute.arch.get_max_tmem_alloc_cols(arch)
-    accumulator_stage_columns = tile_n
+    accumulator_stage_columns = m_repeat * tile_n
     scale_factor_columns = sfa_columns + sfb_columns
     accumulator_stage_count = (tmem_column_capacity - scale_factor_columns) // accumulator_stage_columns
     if accumulator_stage_count < 1:
@@ -102,6 +107,7 @@ def make_tcgen05_tmem_plan(
     use_sm100_overlap = (
         arch_number in (100, 103)
         and has_scale_factors
+        and m_repeat == 1
         and accumulator_stage_columns == 256
         and accumulator_stage_count == 1
         and scale_factor_columns <= 64
@@ -123,6 +129,7 @@ def make_tcgen05_tmem_plan(
         accumulator_pipeline_stages=accumulator_pipeline_stages,
         sfa_columns=sfa_columns,
         sfb_columns=sfb_columns,
+        m_repeat=m_repeat,
     )
 
 
