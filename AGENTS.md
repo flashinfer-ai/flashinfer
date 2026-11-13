@@ -63,6 +63,12 @@ JIT-only and tested under `tests/experimental/`. Follow the
 [subtree instructions](flashinfer/experimental/AGENTS.md) and
 [experimental policy](flashinfer/experimental/README.md).
 
+## Backward compatibility
+
+Keep stable public APIs backward compatible for supported callers. Follow the
+[backward compatibility policy](CONTRIBUTING.md#backward-compatibility) for
+decorated APIs, public classes, validation, and intentional breaking changes.
+
 ## Validation and performance
 
 Run the tests affected by a change and the changed-file pre-commit hooks.

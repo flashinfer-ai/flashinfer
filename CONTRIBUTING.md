@@ -96,6 +96,42 @@ For the full policy (admission criteria, lifecycle reviews, containment rules,
 graduation checklist), see
 [flashinfer/experimental/README.md](flashinfer/experimental/README.md).
 
+# Backward Compatibility
+
+Stable public APIs, including `@flashinfer_api` functions and public class
+constructors and methods, must keep supported callers working across compatible
+releases (see [Release Versioning](#release-versioning)). When changing one:
+
+* **Keep old imports working.** Preserve top-level exports and direct submodule
+  import paths. If an API moves, re-export it from its old module with compatible
+  behavior; a new top-level import alone does not preserve the old path.
+* **Keep old calls working.** Preserve parameter names, positional order,
+  positional/keyword kinds, and defaults. Do not add a required parameter or
+  change a default. A new optional keyword-only parameter is normally safe if
+  omitting it keeps old behavior; with `**kwargs`, verify it does not intercept
+  a keyword previously forwarded elsewhere.
+* **Keep the old result contract.** Preserve supported input shapes, dtypes,
+  devices, and layouts, plus the default return type, structure, and meaning.
+  For example, an API returning a tensor by default must not start returning a
+  tuple; expose the tuple through an explicit opt-in instead.
+* **Check public classes as a whole.** Preserve construction, inherited and
+  overridden methods, and `plan`/`run` call patterns, including undecorated
+  methods that the API diff checker does not inspect.
+
+Use [`scripts/check_pr_api_diff.py`](scripts/check_pr_api_diff.py) to compare
+decorated functions/methods, exports, and module moves. Resolve its warnings
+against the actual old and new runtime behavior: a warning is a candidate break,
+and a clean check cannot prove semantic compatibility. Add focused regression
+tests for representative old positional and keyword calls, omitted options,
+accepted inputs, and returns. Check trace and JIT/AOT registration where
+applicable; removing `@flashinfer_api` also requires checking tracing and API
+visibility even if the Python function still exists.
+
+Do not introduce stable API breaks in minor or patch releases. Explain any
+intentional break, affected old calls, migration path, and release/deprecation
+plan in the PR.
+Experimental APIs and backends follow the separate policy above.
+
 # Pull Request Guidelines
 
 * **Use the default PR template.** When opening a PR, fill in the repository's PR template
