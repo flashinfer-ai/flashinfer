@@ -201,8 +201,10 @@ def unit_loop(
         tScS.iterator,
         cute.composition(tScS.layout, cute.make_layout((Q_ROWS, p_words))),
     )
+    # one tcgen05.st for the warpgroup's P columns (Repetition(p_words), 64 at the full tile): the packed bf16 pairs are
+    # written from one register block instead of two 32-column pieces
     st_atom = cute.make_copy_atom(
-        tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(min(32, p_words))), ACC_DTYPE
+        tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(p_words)), ACC_DTYPE
     )
     tiled_st = tcgen05.make_tmem_copy(st_atom, tStS_P)
     thr_st = tiled_st.get_slice(thread_idx)
