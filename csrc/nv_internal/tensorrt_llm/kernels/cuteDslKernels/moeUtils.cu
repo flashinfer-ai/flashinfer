@@ -94,7 +94,28 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_out
       dst_ptr[i] = src_ptr[i];
     }
 
-    // Note: FP4 scale factor handling is deferred to Phase 3
+#ifdef ENABLE_FP4
+    if constexpr (std::is_same_v<InputType, __nv_fp4_e2m1>) {
+      // Block-16 input scales are row-major; grouped GEMM consumes 128x4 swizzled scales.
+      // Callers that permute scales themselves pass no scale buffers.
+      if (input_sf != nullptr && permuted_sf != nullptr) {
+        int64_t constexpr kScaleTileRows = 128;
+        int64_t constexpr kScaleTileCols = 4;
+        int64_t constexpr kScaleRowGroupSize = 32;
+        int64_t constexpr kScaleRowGroups = kScaleTileRows / kScaleRowGroupSize;
+        int64_t const sf_cols = hidden_size / kSFVecSize;
+        for (int64_t col = threadIdx.x; col < sf_cols; col += kThreadsPerBlock) {
+          int64_t const dst =
+              (permuted_idx / kScaleTileRows) * (kScaleTileRows * sf_cols) +
+              (col / kScaleTileCols) * (kScaleTileRows * kScaleTileCols) +
+              (permuted_idx % kScaleRowGroupSize) * (kScaleRowGroups * kScaleTileCols) +
+              ((permuted_idx % kScaleTileRows) / kScaleRowGroupSize) * kScaleTileCols +
+              col % kScaleTileCols;
+          permuted_sf[dst] = input_sf[token_idx * sf_cols + col];
+        }
+      }
+    }
+#endif
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
