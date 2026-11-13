@@ -25,6 +25,11 @@ import flashinfer.prefill as fp
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.fixture(params=[torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def dtype(request):
+    return request.param
+
+
 def route(
     monkeypatch,
     qs,
@@ -34,6 +39,7 @@ def route(
     sms=132,
     name="NVIDIA H100 80GB HBM3",
     available=True,
+    dtype=torch.bfloat16,
     **changes,
 ):
     monkeypatch.setattr(fp, "get_compute_capability", lambda device: cc)
@@ -43,9 +49,9 @@ def route(
     args = dict(
         device=torch.device("cpu"),
         layout="HND",
-        q_dtype=torch.bfloat16,
-        kv_dtype=torch.bfloat16,
-        o_dtype=torch.bfloat16,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        o_dtype=dtype,
         head_dim_qk=256,
         head_dim_vo=256,
         batch=len(qs),
@@ -70,10 +76,13 @@ def route(
     "q,expected", [(63, False), (64, False), (65, True), (129, True)]
 )
 def test_provider_boundary_and_group_transfer(
-    monkeypatch, batch, group, hq, q, expected
+    dtype, monkeypatch, batch, group, hq, q, expected
 ):
     qs = [q] + [1] * (batch - 1)
-    assert route(monkeypatch, qs, [16384] * batch, hq=hq, hk=hq // group) is expected
+    assert (
+        route(monkeypatch, qs, [16384] * batch, hq=hq, hk=hq // group, dtype=dtype)
+        is expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -85,10 +94,18 @@ def test_provider_boundary_and_group_transfer(
         ([129, 1], [32768, 1], True),
     ],
 )
-def test_full_prefill_and_mixed_lengths_are_included(monkeypatch, qs, ks, expected):
-    assert route(monkeypatch, qs, ks) is expected
+def test_full_prefill_and_mixed_lengths_are_included(
+    dtype, monkeypatch, qs, ks, expected
+):
+    assert route(monkeypatch, qs, ks, dtype=dtype) is expected
     assert (
-        route(monkeypatch, qs, ks, seq_lens_q=torch.tensor(qs, dtype=torch.int32))
+        route(
+            monkeypatch,
+            qs,
+            ks,
+            seq_lens_q=torch.tensor(qs, dtype=torch.int32),
+            dtype=dtype,
+        )
         is expected
     )
 
@@ -97,8 +114,8 @@ def test_full_prefill_and_mixed_lengths_are_included(monkeypatch, qs, ks, expect
     "change",
     [
         dict(layout="NHD"),
-        dict(q_dtype=torch.float16),
-        dict(kv_dtype=torch.float16),
+        dict(q_dtype=torch.float32),
+        dict(kv_dtype=torch.float32),
         dict(o_dtype=torch.float32),
         dict(head_dim_qk=128),
         dict(head_dim_vo=128),
@@ -116,16 +133,16 @@ def test_full_prefill_and_mixed_lengths_are_included(monkeypatch, qs, ks, expect
         dict(qo_indptr_host=torch.tensor([1, 66], dtype=torch.int32)),
     ],
 )
-def test_unqualified_inputs_do_not_change_provider(monkeypatch, change):
-    assert not route(monkeypatch, [65], [16384], **change)
+def test_unqualified_inputs_do_not_change_provider(dtype, monkeypatch, change):
+    assert not route(monkeypatch, [65], [16384], **change, dtype=dtype)
 
 
 @pytest.mark.parametrize(
     "qs,ks",
     [([0, 65], [4096, 4096]), ([65], [64]), ([16385], [32768]), ([65], [32769])],
 )
-def test_actual_lengths_must_stay_within_the_domain(monkeypatch, qs, ks):
-    assert not route(monkeypatch, qs, ks)
+def test_actual_lengths_must_stay_within_the_domain(dtype, monkeypatch, qs, ks):
+    assert not route(monkeypatch, qs, ks, dtype=dtype)
 
 
 class DeviceOnly:
@@ -139,8 +156,8 @@ class DeviceOnly:
 
 
 @pytest.mark.parametrize("field", ["kv_lens", "seq_lens_q", "qo_indptr_host"])
-def test_no_admission_readback(monkeypatch, field):
-    assert not route(monkeypatch, [65], [16384], **{field: DeviceOnly()})
+def test_no_admission_readback(dtype, monkeypatch, field):
+    assert not route(monkeypatch, [65], [16384], **{field: DeviceOnly()}, dtype=dtype)
 
 
 @pytest.mark.parametrize(
@@ -154,16 +171,24 @@ def test_no_admission_readback(monkeypatch, field):
         dict(available=False),
     ],
 )
-def test_h100_evidence_does_not_enable_other_devices(monkeypatch, hardware):
-    assert not route(monkeypatch, [65], [16384], **hardware)
+def test_h100_evidence_does_not_enable_other_devices(dtype, monkeypatch, hardware):
+    assert not route(monkeypatch, [65], [16384], **hardware, dtype=dtype)
 
 
 class AdmissionObserved(Exception):
     pass
 
 
-def planned_route(monkeypatch, *, q=65, captured=None, requested="auto", **features):
-    route(monkeypatch, [q], [16384])
+def planned_route(
+    monkeypatch,
+    *,
+    q=65,
+    captured=None,
+    requested="auto",
+    dtype=torch.bfloat16,
+    **features,
+):
+    route(monkeypatch, [q], [16384], dtype=dtype)
     w = fp.BatchPrefillWithPagedKVCacheWrapper.__new__(
         fp.BatchPrefillWithPagedKVCacheWrapper
     )
@@ -193,7 +218,7 @@ def planned_route(monkeypatch, *, q=65, captured=None, requested="auto", **featu
     monkeypatch.setattr(fp, "_validate_paged_query_lengths", observe)
     args = dict(
         causal=True,
-        q_data_type=torch.bfloat16,
+        q_data_type=dtype,
         seq_lens=torch.tensor([16384], dtype=torch.int32),
         max_token_per_sequence=q,
         max_sequence_kv=16384,
@@ -216,9 +241,11 @@ def planned_route(monkeypatch, *, q=65, captured=None, requested="auto", **featu
 
 @pytest.mark.parametrize("captured", [None, "fa2", "fa3"])
 @pytest.mark.parametrize("q", [64, 65])
-def test_real_planner_preserves_native_capture_schedules(monkeypatch, captured, q):
+def test_real_planner_preserves_native_capture_schedules(
+    dtype, monkeypatch, captured, q
+):
     expected = captured or ("fa2" if q == 64 else "cudnn")
-    assert planned_route(monkeypatch, captured=captured, q=q) == expected
+    assert planned_route(monkeypatch, captured=captured, q=q, dtype=dtype) == expected
 
 
 @pytest.mark.parametrize(
@@ -234,25 +261,33 @@ def test_real_planner_preserves_native_capture_schedules(monkeypatch, captured, 
         dict(pos_encoding_mode="ROPE_LLAMA"),
     ],
 )
-def test_real_planner_keeps_feature_guards(monkeypatch, feature):
-    assert planned_route(monkeypatch, **feature) == "fa3"
+def test_real_planner_keeps_feature_guards(dtype, monkeypatch, feature):
+    assert planned_route(monkeypatch, **feature, dtype=dtype) == "fa3"
 
 
 @pytest.mark.parametrize("requested", ["fa2", "fa3", "cudnn"])
-def test_explicit_backends_are_preserved(monkeypatch, requested):
-    assert planned_route(monkeypatch, requested=requested) == requested
+def test_explicit_backends_are_preserved(dtype, monkeypatch, requested):
+    assert planned_route(monkeypatch, requested=requested, dtype=dtype) == requested
 
 
-def test_no_cuda_initialization():
+def test_no_cuda_initialization(
+    dtype,
+):
     assert not torch.cuda.is_initialized()
 
 
 @pytest.mark.parametrize("kv,expected", [(8097, False), (8098, True)])
-def test_actual_work_crossing(monkeypatch, kv, expected):
-    assert route(monkeypatch, [65], [kv]) is expected
+def test_actual_work_crossing(dtype, monkeypatch, kv, expected):
+    assert route(monkeypatch, [65], [kv], dtype=dtype) is expected
 
 
-def test_actual_work_uses_paired_lengths_not_declared_maxima(monkeypatch):
+def test_actual_work_uses_paired_lengths_not_declared_maxima(dtype, monkeypatch):
     # Both graphs declare B2/Q129/KV4096, but only one has enough actual work.
-    assert route(monkeypatch, [129, 129], [4096, 4096])
-    assert not route(monkeypatch, [129, 1], [4096, 1])
+    assert route(monkeypatch, [129, 129], [4096, 4096], dtype=dtype)
+    assert not route(monkeypatch, [129, 1], [4096, 1], dtype=dtype)
+
+
+@pytest.mark.parametrize("field", ["q_dtype", "kv_dtype", "o_dtype"])
+def test_mixed_precision_is_not_admitted(dtype, monkeypatch, field):
+    other = torch.float16 if dtype == torch.bfloat16 else torch.bfloat16
+    assert not route(monkeypatch, [65], [16384], dtype=dtype, **{field: other})

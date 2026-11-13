@@ -36,7 +36,8 @@ def require_h100():
 @pytest.mark.parametrize("first", ["fa2", "fa3", "cudnn"])
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("caller_table", [False, True])
-def test_hopper_paged_auto_retained_capture(first, return_lse, caller_table):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_hopper_paged_auto_retained_capture(dtype, first, return_lse, caller_table):
     require_h100()
     shapes = [[64, 64, 64, 64], [65, 63, 64, 64]]
     start = 0 if first == "fa2" else 1
@@ -57,7 +58,7 @@ def test_hopper_paged_auto_retained_capture(first, return_lse, caller_table):
         paged_kv_indices_buf=indices.clone(),
         paged_kv_last_page_len_buf=last.cuda(),
     )
-    q = torch.zeros(256, hq, d, dtype=torch.bfloat16, device="cuda")
+    q = torch.zeros(256, hq, d, dtype=dtype, device="cuda")
     kv = torch.zeros(b * nk // page, 2, hk, page, d, dtype=q.dtype, device=q.device)
     k, v = kv[:, 0], kv[:, 1]
     positions = torch.arange(nk, device=q.device).repeat(b).reshape(-1, page)
@@ -120,7 +121,10 @@ def test_hopper_paged_auto_retained_capture(first, return_lse, caller_table):
             128 * multiplier * weights * (counts - (nk - 64)).clamp_min(0) / counts
         ).float()
         torch.testing.assert_close(
-            out.float(), expected[:, None, None].expand_as(out), atol=0.02, rtol=0.02
+            out.float(),
+            expected[:, None, None].expand_as(out),
+            atol=0.002 if dtype == torch.float16 else 0.02,
+            rtol=0.002 if dtype == torch.float16 else 0.02,
         )
         if return_lse:
             torch.testing.assert_close(
@@ -176,11 +180,12 @@ def test_hopper_paged_auto_retained_capture(first, return_lse, caller_table):
 
 @pytest.mark.parametrize("nq", [64, 65, 129])
 @pytest.mark.parametrize("nk", [512, 16384])
-def test_hopper_paged_auto_runtime_scales(nq, nk):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_hopper_paged_auto_runtime_scales(dtype, nq, nk):
     require_h100()
     torch.manual_seed(83)
     hq, hk, d, page = 16, 4, 256, 16
-    q = torch.randn(nq, hq, d, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(nq, hq, d, device="cuda", dtype=dtype)
     kv = torch.randn(nk // page, 2, hk, page, d, device=q.device, dtype=q.dtype)
     k, v = kv[:, 0], kv[:, 1]
     ix = torch.randperm(nk // page, device=q.device, dtype=torch.int32)
@@ -234,13 +239,19 @@ def test_hopper_paged_auto_runtime_scales(nq, nk):
             k_scale=ks,
             v_scale=vs,
         )
-        torch.testing.assert_close(out.float(), ref.float(), atol=0.015, rtol=0.015)
+        torch.testing.assert_close(
+            out.float(),
+            ref.float(),
+            atol=0.002 if dtype == torch.float16 else 0.015,
+            rtol=0.002 if dtype == torch.float16 else 0.015,
+        )
         torch.testing.assert_close(lse, stats.float(), atol=0.003, rtol=0.003)
 
 
 @pytest.mark.parametrize("first", ["fa3", "cudnn", "cudnn_grow"])
 @pytest.mark.parametrize("return_lse", [False, True])
-def test_hopper_work_boundary_preserves_captures(first, return_lse):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_hopper_work_boundary_preserves_captures(dtype, first, return_lse):
     require_h100()
     nq, hq, hk, d, page, capacity = 65, 32, 8, 256, 16, 8192
     lengths = [8064, 8192]
@@ -261,7 +272,7 @@ def test_hopper_work_boundary_preserves_captures(first, return_lse):
             [page], dtype=torch.int32, device="cuda"
         ),
     )
-    q = torch.zeros(nq, hq, d, dtype=torch.bfloat16, device="cuda")
+    q = torch.zeros(nq, hq, d, dtype=dtype, device="cuda")
     kv = torch.zeros(capacity // page, 2, hk, page, d, dtype=q.dtype, device=q.device)
     k, v = kv[:, 0], kv[:, 1]
     positions = torch.arange(capacity, device=q.device).reshape(-1, page)
@@ -299,7 +310,10 @@ def test_hopper_work_boundary_preserves_captures(first, return_lse):
         count = torch.arange(nk - nq + 1, nk + 1, dtype=torch.float64, device=q.device)
         expected = (scale * (count - 8000).clamp_min(0) / count).float()
         torch.testing.assert_close(
-            out.float(), expected[:, None, None].expand_as(out), atol=0.002, rtol=0.02
+            out.float(),
+            expected[:, None, None].expand_as(out),
+            atol=0.002,
+            rtol=0.002 if dtype == torch.float16 else 0.02,
         )
         if return_lse:
             torch.testing.assert_close(
