@@ -251,3 +251,113 @@ def dsa_indexer_det_topk(
         return_scores=return_scores,
         enable_pdl=enable_pdl,
     )
+
+
+@flashinfer_experimental_api
+def dsa_indexer_topk(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    kv_scales: torch.Tensor,
+    weights: torch.Tensor,
+    cu_end: torch.Tensor,
+    top_k: int = 2048,
+    *,
+    cu_start: Optional[torch.Tensor] = None,
+    cand_cap: int = 12288,
+    out: Optional[torch.Tensor] = None,
+    workspace: Optional[Tuple[torch.Tensor, ...]] = None,
+) -> torch.Tensor:
+    r"""Fused FP8 indexer scoring and top-k with LiteTopK on SM100-family GPUs.
+
+    Selects the largest scores
+    ``sum_h weights[i, h] * relu(q[i, h] . kv[j]) * kv_scales[j]``
+    over each row's visible range without materializing the full logits matrix.
+    A sampled threshold filters candidates before exact selection. Rows whose
+    candidate buffers overflow or contain too few candidates are rescored and
+    selected on the GPU with bounded scratch, without host synchronization.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        ``[num_q, num_heads, 128]`` float8_e4m3fn queries; 32 or 64 heads.
+    kv : torch.Tensor
+        ``[seq_kv, 128]`` float8_e4m3fn keys; ``1 <= seq_kv <= 2**20``.
+    kv_scales : torch.Tensor
+        ``[seq_kv]`` float32 per-key dequantization scales.
+    weights : torch.Tensor
+        ``[num_q, num_heads]`` float32 head weights, including query scales.
+    cu_end : torch.Tensor
+        ``[num_q]`` int32 exclusive end of each row's visible key range.
+    top_k : int
+        Number of selected keys: 512, 1024 or 2048.
+    cu_start : Optional[torch.Tensor]
+        ``[num_q]`` int32 start of each visible range; defaults to zero. Both
+        endpoints are clamped to ``[0, seq_kv]`` on the GPU. An end before its
+        start gives an empty row.
+    cand_cap : int
+        Candidate capacity per row, a multiple of four in ``[4096, 12288]``.
+        A smaller buffer saves memory but can trigger more recovery work.
+    out : Optional[torch.Tensor]
+        Preallocated ``[num_q, top_k]`` int32 output.
+    workspace : Optional[Tuple[torch.Tensor, ...]]
+        Scratch from :func:`dsa_indexer_topk_workspace`, optionally reused for
+        smaller query/key counts. Its capacity must cover this call and its
+        candidate width must equal ``cand_cap``. Do not share it between
+        concurrent calls, alias it with inputs/outputs, or change its counters.
+
+    Returns
+    -------
+    torch.Tensor
+        ``[num_q, top_k]`` int32 indices relative to the clamped ``cu_start`` of
+        each row, unordered, with ``-1`` padding when fewer keys are visible.
+        Selection is exact for the kernel's FP32 scores, up to ties at the
+        boundary. Its scoring reduction is not bitwise identical to DeepGEMM.
+
+    Notes
+    -----
+    All tensors must be contiguous on the same CUDA device. Queries, keys,
+    scales, weights and output require 16-byte aligned data pointers. Inputs
+    and scores must be finite. Requires CUDA 12.9+ and the SM100 headers from
+    an installed ``deep_gemm`` package.
+
+    Scratch is bounded by processing at most 4096 query rows per window and a
+    recovery score pool of at most 64 MiB. Extreme score distributions can
+    trigger expensive recovery. Warm the JIT module before CUDA graph capture;
+    keep the captured input, output and workspace storage alive through replay.
+
+    This experimental revision removes ``prefix_logits`` and the ``status``
+    return: sampling is internal and failed candidate rows recover on the GPU.
+    """
+    from .experimental.dsa_indexer import run
+
+    return run(
+        q, kv, kv_scales, weights, cu_end, top_k, cu_start, cand_cap, out, workspace
+    )
+
+
+@flashinfer_experimental_api
+def dsa_indexer_topk_workspace(
+    device: torch.device,
+    num_q: int,
+    num_heads: int,
+    seq_kv: int,
+    *,
+    cand_cap: int = 12288,
+) -> Tuple[torch.Tensor, ...]:
+    """Allocate reusable scratch for :func:`dsa_indexer_topk`.
+
+    ``num_q``, ``num_heads`` and ``seq_kv`` describe the maximum intended call;
+    the same scratch can serve smaller calls if its capacities suffice.
+    Allocation is limited to 4096 query rows and 64 MiB of recovery scores.
+    ``num_heads`` must be 32 or 64, ``seq_kv`` in ``[1, 2**20]``, and
+    ``cand_cap`` a multiple of four in ``[4096, 12288]``.
+
+    Returns six tensors in launcher order: zeroed block counters, sample
+    codes, candidate scores, candidate indices, row state, and recovery scores.
+    A successful call leaves the counters zero; other scratch is overwritten.
+    Reuse only in stream order, without concurrent calls or input/output
+    aliasing. Allocate and warm the API before capturing CUDA graphs.
+    """
+    from .experimental.dsa_indexer import allocate_workspace
+
+    return allocate_workspace(device, num_q, num_heads, seq_kv, cand_cap)
