@@ -99,21 +99,36 @@ def _mixed_lens(batch, ncols, top_k, next_n, seed):
 
 
 def _run_pair(lg, lens, top_k, pt, page_size, next_n=1, cr=1):
-    loc, _ = flashinfer.top_k_varlen(
-        lg, lens, top_k, next_n=next_n, compress_ratio=cr, backend="gvr_2"
-    )
-    pg, _ = flashinfer.top_k_varlen(
-        lg,
-        lens,
-        top_k,
-        next_n=next_n,
-        compress_ratio=cr,
-        backend="gvr_2",
-        page_table=pt,
-        page_size=page_size,
+    """Window-local and paged output of the same launch shape, each written into
+    a buffer poisoned with -7 first: no slot of either may stay unwritten (the
+    API's own torch.empty buffer could already hold a valid answer)."""
+    kw = dict(next_n=next_n, compress_ratio=cr, backend="gvr_2")
+    loc = torch.full((lg.shape[0], top_k), -7, dtype=torch.int32, device=_DEV)
+    pg = torch.full_like(loc, -7)
+    flashinfer.top_k_varlen(lg, lens, top_k, out_indices=loc, **kw)
+    flashinfer.top_k_varlen(
+        lg, lens, top_k, out_indices=pg, page_table=pt, page_size=page_size, **kw
     )
     torch.cuda.synchronize()
+    assert int((loc == -7).sum()) == 0, "unwritten slots in the local output"
+    assert int((pg == -7).sum()) == 0, "unwritten slots in the paged output"
     return loc, pg
+
+
+def _launcher_key(rows, ncols, top_k, page_shift):
+    """Cache key of a hint-free decode launch at the full-width envelope."""
+    return (
+        rows,
+        ncols,
+        top_k,
+        ncols,
+        1,
+        1,
+        True,
+        page_shift,
+        _host._arch_token(),
+        _host._sm_count(),
+    )
 
 
 # rows x columns shapes spanning the four engine families of the varlen router
@@ -152,6 +167,67 @@ def test_paged_page_sizes(page_size):
     lens = _mixed_lens(rows, ncols, top_k, 1, seed=3)
     pt = _page_table(rows, ncols, page_size, seed=11)
     loc, pg = _run_pair(lg, lens, top_k, pt, page_size)
+    assert _same_rows(pg, _expected(loc, pt, 1, page_size))
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,ncols,top_k",
+    [
+        (9, 131136, 512),
+        (9, 131136, 2048),
+        (16, 131136, 512),
+        (32, 131136, 2048),
+        (128, 131136, 512),
+        (160, 65600, 2048),
+    ],
+    ids=[
+        "split9-k512",
+        "split9-k2048",
+        "split16-k512",
+        "split32-k2048",
+        "cta1024-k512",
+        "cta512-k2048",
+    ],
+)
+@pytest.mark.parametrize("page_size", [1, 64, 128], ids=lambda p: f"ps{p}")
+def test_paged_main_register_rows(rows, ncols, top_k, page_size):
+    """Main-engine launches (capacity-wide logits) whose rows mostly fit the
+    in-kernel register path: that path stages its own page-table slice, sized
+    from the register capacity (none at page size 1), and must map through the
+    request's row like the streaming path."""
+    plan = _host.route_streaming(rows, ncols, ncols, top_k, force_main=True)
+    cap = (
+        plan["tpl"][0] * _host._main_reg_vpt(plan["tpl"][0], plan["tpl"][5], ncols) * 4
+    )
+    assert cap > 0
+    lg = torch.randn((rows, ncols), dtype=torch.float32, device=_DEV)
+    gen = torch.Generator(device=_DEV).manual_seed(rows + page_size)
+    lens = torch.randint(top_k + 1, cap + 1, (rows,), generator=gen, device=_DEV)
+    # band edges, the VPT 2 / VPT 4 boundary, a short row, a streaming row, and
+    # short register rows (k + 1, 2048, 2049)
+    lens[0], lens[1], lens[2], lens[3] = cap, cap + 1, top_k, ncols
+    lens[4], lens[5] = cap // 2, cap // 2 + 1
+    lens[6], lens[7], lens[8] = top_k + 1, 2048, 2049
+    lens = lens.to(torch.int32)
+    pt = _page_table(rows, ncols, page_size, seed=41)
+    # drop the paged launcher first, so the family read below is the launch's
+    key = _launcher_key(rows, ncols, top_k, page_size.bit_length() - 1)
+    _host._VARLEN_CACHE.pop(key, None)
+    loc, pg = _run_pair(lg, lens, top_k, pt, page_size)
+    lc = _host._VARLEN_CACHE.get(key)
+    assert lc is not None and lc[0] == "main", f"{key}: {lc and lc[0]}"
+    for r in range(rows):  # the local output itself is the exact top-k
+        n = int(lens[r])
+        if n > top_k:
+            idx = loc[r].to(torch.int64)
+            assert (
+                int(idx.min()) >= 0
+                and int(idx.max()) < n
+                and idx.unique().numel() == top_k
+            )
+            ref = torch.topk(lg[r, :n], top_k).values.sort().values
+            assert torch.equal(lg[r, idx].sort().values, ref), f"row {r} inexact"
     assert _same_rows(pg, _expected(loc, pt, 1, page_size))
 
 
