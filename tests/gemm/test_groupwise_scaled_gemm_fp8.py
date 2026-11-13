@@ -116,8 +116,8 @@ def test_fp8_groupwise_gemm(
     if backend == "trtllm":
         if scale_major_mode != "MN":
             pytest.skip("trtllm only supports MN scale_major_mode")
-        if k < 256:
-            pytest.skip("k < 256")
+        if k % 256 != 0:
+            pytest.skip("trtllm requires k % 256 == 0")
     if backend == "cute-dsl":
         if not is_rubin_cute_dsl_available():
             pytest.skip("cute-dsl (SM107) requires CuTe DSL >= 4.8")
@@ -170,6 +170,45 @@ def test_fp8_groupwise_gemm(
         backend=backend,
     )
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "k,supported", [(256, True), (384, False), (512, True), (640, False)]
+)
+def test_fp8_groupwise_gemm_trtllm_k_requirement(k, supported):
+    """The trtllm requirement accepts K % 256 == 0 and rejects other K; runs on CPU."""
+    from flashinfer.gemm.gemm_base import _trtllm_gemm_fp8_nt_groupwise_requirement
+
+    m, n = 64, 7168
+    a = torch.empty((m, k), dtype=torch.float8_e4m3fn)
+    b = torch.empty((n, k), dtype=torch.float8_e4m3fn)
+    a_scale = torch.empty((k // 128, m), dtype=torch.float32)
+    b_scale = torch.empty((n // 128, k // 128), dtype=torch.float32)
+    if supported:
+        assert _trtllm_gemm_fp8_nt_groupwise_requirement(a, b, a_scale, b_scale, "MN")
+    else:
+        with pytest.raises(ValueError, match="multiple of 256"):
+            _trtllm_gemm_fp8_nt_groupwise_requirement(a, b, a_scale, b_scale, "MN")
+
+
+@pytest.mark.parametrize("m,n,k", [(64, 7168, 384)])
+def test_fp8_groupwise_gemm_trtllm_rejects_k_not_multiple_of_256(m, n, k):
+    """backend="trtllm" rejects K % 256 != 0 before reaching the kernel."""
+    if not torch.cuda.is_available():
+        pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
+    major, minor = get_compute_capability(torch.device("cuda"))
+    cc = major * 10 + minor
+    if not gemm_fp8_nt_groupwise.is_backend_supported("trtllm", cc):
+        pytest.skip(f"gemm_fp8_nt_groupwise backend trtllm does not support SM{cc}")
+
+    a = torch.empty((m, k), dtype=torch.float8_e4m3fn, device="cuda")
+    b = torch.empty((n, k), dtype=torch.float8_e4m3fn, device="cuda")
+    a_scale = torch.empty((k // 128, m), dtype=torch.float32, device="cuda")
+    b_scale = torch.empty((n // 128, k // 128), dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="multiple of 256"):
+        gemm_fp8_nt_groupwise(
+            a, b, a_scale, b_scale, "MN", out_dtype=torch.bfloat16, backend="trtllm"
+        )
 
 
 @pytest.mark.parametrize(
