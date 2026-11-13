@@ -208,7 +208,11 @@ retained. The domain covers batches 1–32, query heads 16–48, GQA groups 1/2/
 maximum Q 65–16384 and maximum KV at most 32768. Actual positive Q/KV lengths
 must already be on CPU, satisfy Q≤KV per request, match the declared maxima,
 and use physical query offsets as the valid query lengths. Independent masks
-and device-only metadata do not extend admission. Existing causal, mask, window,
+and device-only metadata do not extend admission. Admission also requires at
+least `2**24` actual causal query-key pairs across query heads:
+`Hq * sum(q_i * (2 * kv_i - q_i + 1) // 2)`. Small workloads retain their native
+FA2/FA3 provider. The calculation uses paired CPU lengths rather than declared
+maximum lengths and adds no device readback. Existing causal, mask, window,
 sinks, split-control, dtype and runtime guards remain in force.
 
 The cuDNN graph uses exact H100 declarations; Blackwell's cache buckets do not
@@ -216,4 +220,5 @@ apply. Backend and FROST remain peers behind the same public graph contract.
 A graph-mode wrapper already planned for FA2 or FA3 keeps that native provider
 and its schedule. A cuDNN-first wrapper may fall back while refreshing the
 metadata retained by its old cuDNN captures. Validate both starting orders and
-Q64/Q65 partition changes, including numerical output and LSE after replay.
+Q64/Q65 partition changes and transitions across the actual-work floor,
+including numerical output and LSE after replay.

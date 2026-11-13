@@ -73,21 +73,24 @@ def test_provider_boundary_and_group_transfer(
     monkeypatch, batch, group, hq, q, expected
 ):
     qs = [q] + [1] * (batch - 1)
-    assert route(monkeypatch, qs, [4096] * batch, hq=hq, hk=hq // group) is expected
+    assert route(monkeypatch, qs, [16384] * batch, hq=hq, hk=hq // group) is expected
 
 
 @pytest.mark.parametrize(
-    "qs,ks",
+    "qs,ks,expected",
     [
-        ([257], [257]),
-        ([513] * 4, [513] * 4),
-        ([16384], [16384]),
-        ([129, 1], [32768, 1]),
+        ([257], [257], False),
+        ([513] * 4, [513] * 4, True),
+        ([16384], [16384], True),
+        ([129, 1], [32768, 1], True),
     ],
 )
-def test_full_prefill_and_mixed_lengths_are_included(monkeypatch, qs, ks):
-    assert route(monkeypatch, qs, ks)
-    assert route(monkeypatch, qs, ks, seq_lens_q=torch.tensor(qs, dtype=torch.int32))
+def test_full_prefill_and_mixed_lengths_are_included(monkeypatch, qs, ks, expected):
+    assert route(monkeypatch, qs, ks) is expected
+    assert (
+        route(monkeypatch, qs, ks, seq_lens_q=torch.tensor(qs, dtype=torch.int32))
+        is expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -114,7 +117,7 @@ def test_full_prefill_and_mixed_lengths_are_included(monkeypatch, qs, ks):
     ],
 )
 def test_unqualified_inputs_do_not_change_provider(monkeypatch, change):
-    assert not route(monkeypatch, [65], [4096], **change)
+    assert not route(monkeypatch, [65], [16384], **change)
 
 
 @pytest.mark.parametrize(
@@ -137,7 +140,7 @@ class DeviceOnly:
 
 @pytest.mark.parametrize("field", ["kv_lens", "seq_lens_q", "qo_indptr_host"])
 def test_no_admission_readback(monkeypatch, field):
-    assert not route(monkeypatch, [65], [4096], **{field: DeviceOnly()})
+    assert not route(monkeypatch, [65], [16384], **{field: DeviceOnly()})
 
 
 @pytest.mark.parametrize(
@@ -152,7 +155,7 @@ def test_no_admission_readback(monkeypatch, field):
     ],
 )
 def test_h100_evidence_does_not_enable_other_devices(monkeypatch, hardware):
-    assert not route(monkeypatch, [65], [4096], **hardware)
+    assert not route(monkeypatch, [65], [16384], **hardware)
 
 
 class AdmissionObserved(Exception):
@@ -160,7 +163,7 @@ class AdmissionObserved(Exception):
 
 
 def planned_route(monkeypatch, *, q=65, captured=None, requested="auto", **features):
-    route(monkeypatch, [q], [4096])
+    route(monkeypatch, [q], [16384])
     w = fp.BatchPrefillWithPagedKVCacheWrapper.__new__(
         fp.BatchPrefillWithPagedKVCacheWrapper
     )
@@ -191,16 +194,16 @@ def planned_route(monkeypatch, *, q=65, captured=None, requested="auto", **featu
     args = dict(
         causal=True,
         q_data_type=torch.bfloat16,
-        seq_lens=torch.tensor([4096], dtype=torch.int32),
+        seq_lens=torch.tensor([16384], dtype=torch.int32),
         max_token_per_sequence=q,
-        max_sequence_kv=4096,
+        max_sequence_kv=16384,
     )
     args.update(features)
     with pytest.raises(AdmissionObserved):
         w.plan(
             torch.tensor([0, q], dtype=torch.int32),
-            torch.tensor([0, 256], dtype=torch.int32),
-            torch.arange(256, dtype=torch.int32),
+            torch.tensor([0, 1024], dtype=torch.int32),
+            torch.arange(1024, dtype=torch.int32),
             torch.tensor([16], dtype=torch.int32),
             32,
             8,
@@ -227,7 +230,7 @@ def test_real_planner_preserves_native_capture_schedules(monkeypatch, captured, 
         dict(use_fp16_qk_reduction=True),
         dict(fixed_split_size=128),
         dict(disable_split_kv=True),
-        dict(custom_mask=torch.ones(65 * 4096, dtype=torch.bool)),
+        dict(custom_mask=torch.ones(65 * 16384, dtype=torch.bool)),
         dict(pos_encoding_mode="ROPE_LLAMA"),
     ],
 )
@@ -242,3 +245,14 @@ def test_explicit_backends_are_preserved(monkeypatch, requested):
 
 def test_no_cuda_initialization():
     assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("kv,expected", [(8097, False), (8098, True)])
+def test_actual_work_crossing(monkeypatch, kv, expected):
+    assert route(monkeypatch, [65], [kv]) is expected
+
+
+def test_actual_work_uses_paired_lengths_not_declared_maxima(monkeypatch):
+    # Both graphs declare B2/Q129/KV4096, but only one has enough actual work.
+    assert route(monkeypatch, [129, 129], [4096, 4096])
+    assert not route(monkeypatch, [129, 1], [4096, 1])

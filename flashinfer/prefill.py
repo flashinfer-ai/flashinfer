@@ -2602,6 +2602,13 @@ def _hopper_paged_auto_cudnn(
         and (seq_lens_q is None or seq_lens_q.flatten().tolist() == queries)
     ):
         return False
+    # Amortize the cuDNN path using actual causal work, including mixed rows.
+    # A product of declared maxima would admit nearly empty ragged batches.
+    paired_work = hq * sum(
+        q * (2 * kv - q + 1) // 2 for q, kv in zip(queries, lengths, strict=True)
+    )
+    if paired_work < 1 << 24:
+        return False
     # The short-query FA2 domain is deliberately retained. Do not transfer
     # H100 measurements to H20, PCIe H100, or other Hopper devices.
     return (

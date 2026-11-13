@@ -40,7 +40,7 @@ def test_hopper_paged_auto_retained_capture(first, return_lse, caller_table):
     require_h100()
     shapes = [[64, 64, 64, 64], [65, 63, 64, 64]]
     start = 0 if first == "fa2" else 1
-    b, hq, hk, d, page, nk = 4, 32, 4, 256, 16, 1024
+    b, hq, hk, d, page, nk = 4, 32, 4, 256, 16, 4096
     pageptr = torch.arange(b + 1, dtype=torch.int32) * (nk // page)
     indices = torch.arange(b * nk // page, dtype=torch.int32, device="cuda")
     table = indices.reshape(b, nk // page).clone()
@@ -175,10 +175,11 @@ def test_hopper_paged_auto_retained_capture(first, return_lse, caller_table):
 
 
 @pytest.mark.parametrize("nq", [64, 65, 129])
-def test_hopper_paged_auto_runtime_scales(nq):
+@pytest.mark.parametrize("nk", [512, 16384])
+def test_hopper_paged_auto_runtime_scales(nq, nk):
     require_h100()
     torch.manual_seed(83)
-    hq, hk, d, nk, page = 16, 4, 256, 512, 16
+    hq, hk, d, page = 16, 4, 256, 16
     q = torch.randn(nq, hq, d, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(nk // page, 2, hk, page, d, device=q.device, dtype=q.dtype)
     k, v = kv[:, 0], kv[:, 1]
@@ -200,7 +201,7 @@ def test_hopper_paged_auto_runtime_scales(nq):
         causal=True,
         q_data_type=q.dtype,
     )
-    assert w._backend == ("fa2" if nq <= 64 else "cudnn")
+    assert w._backend == ("fa2" if nq <= 64 else "cudnn" if nk == 16384 else "fa3")
     keys = (
         k[ix.long()]
         .permute(0, 2, 1, 3)
@@ -235,3 +236,100 @@ def test_hopper_paged_auto_runtime_scales(nq):
         )
         torch.testing.assert_close(out.float(), ref.float(), atol=0.015, rtol=0.015)
         torch.testing.assert_close(lse, stats.float(), atol=0.003, rtol=0.003)
+
+
+@pytest.mark.parametrize("first", ["fa3", "cudnn"])
+@pytest.mark.parametrize("return_lse", [False, True])
+def test_hopper_work_boundary_preserves_captures(first, return_lse):
+    require_h100()
+    nq, hq, hk, d, page, capacity = 65, 32, 8, 256, 16, 8192
+    lengths = [8064, 8192]
+    start = int(first == "cudnn")
+    qptr = torch.tensor([0, nq], dtype=torch.int32)
+    indices = torch.arange(capacity // page, dtype=torch.int32, device="cuda")
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 << 20, dtype=torch.uint8, device="cuda"),
+        "HND",
+        backend="auto",
+        use_cuda_graph=True,
+        qo_indptr_buf=qptr.cuda(),
+        paged_kv_indptr_buf=torch.tensor(
+            [0, capacity // page], dtype=torch.int32, device="cuda"
+        ),
+        paged_kv_indices_buf=indices.clone(),
+        paged_kv_last_page_len_buf=torch.tensor(
+            [page], dtype=torch.int32, device="cuda"
+        ),
+    )
+    q = torch.zeros(nq, hq, d, dtype=torch.bfloat16, device="cuda")
+    kv = torch.zeros(capacity // page, 2, hk, page, d, dtype=q.dtype, device=q.device)
+    k, v = kv[:, 0], kv[:, 1]
+    positions = torch.arange(capacity, device=q.device).reshape(-1, page)
+    out = torch.empty_like(q)
+    lse = torch.empty(nq, hq, dtype=torch.float32, device=q.device)
+
+    def plan(nk):
+        w.plan(
+            qptr,
+            torch.tensor([0, nk // page], dtype=torch.int32),
+            indices[: nk // page],
+            torch.tensor([page], dtype=torch.int32),
+            hq,
+            hk,
+            d,
+            page,
+            causal=True,
+            q_data_type=q.dtype,
+            seq_lens=torch.tensor([nk], dtype=torch.int32),
+            max_token_per_sequence=nq,
+            max_sequence_kv=nk,
+        )
+
+    def run():
+        return w.run(
+            q,
+            (k, v),
+            out=out,
+            lse=lse if return_lse else None,
+            return_lse=return_lse,
+            lse_base="ln",
+        )
+
+    def check(nk, scale):
+        count = torch.arange(nk - nq + 1, nk + 1, dtype=torch.float64, device=q.device)
+        expected = (scale * (count - 8000).clamp_min(0) / count).float()
+        torch.testing.assert_close(
+            out.float(), expected[:, None, None].expand_as(out), atol=0.002, rtol=0.02
+        )
+        if return_lse:
+            torch.testing.assert_close(
+                lse, count.log().float()[:, None].expand_as(lse), atol=0.002, rtol=0.002
+            )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        v.copy_((positions >= 8000)[:, None, :, None] * 8)
+        plan(lengths[start])
+        assert w._backend == first
+        for _ in range(5):
+            run()
+        check(lengths[start], 8)
+        with torch.cuda.graph(graph, stream=stream):
+            run()
+        for phase, nk in enumerate([lengths[1 - start], lengths[start]]):
+            scale = 16 * (phase + 1)
+            v.copy_((positions >= 8000)[:, None, :, None] * scale)
+            plan(nk)
+            assert w._backend == "fa3"
+            out.fill_(float("nan"))
+            lse.fill_(float("nan"))
+            run()
+            check(nk, scale)
+            out.fill_(float("nan"))
+            lse.fill_(float("nan"))
+            graph.replay()
+            check(nk, scale)
+        stream.synchronize()
+    graph.reset()
