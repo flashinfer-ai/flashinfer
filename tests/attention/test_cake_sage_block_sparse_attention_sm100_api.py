@@ -285,7 +285,7 @@ def test_fake_mode_launches_no_cake_kernel(monkeypatch) -> None:
 def test_quantizer_refuses_inputs_off_a_32_byte_boundary(offset: int) -> None:
     q = torch.randn((1, 64, 4, _HEAD_DIM), device="cuda").bfloat16()
     k = torch.randn((1, 64, 4, _HEAD_DIM), device="cuda").bfloat16()
-    for impl in ("one_launch", "two_launch"):
+    for impl in ("one_launch", "two_launch", "tma"):
         with pytest.raises(ValueError, match="q must start on a 32-byte boundary"):
             sage_fp8_quantize_sm100(_offset_view(q, offset), k, k, impl=impl)
         with pytest.raises(ValueError, match="v must start on a 32-byte boundary"):

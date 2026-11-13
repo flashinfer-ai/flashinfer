@@ -442,6 +442,12 @@ def test_cake_sage_sm100_launches_one_kernel_per_call():
         exclude=("Memcpy",),
     )
     assert names == [loader.MODULES["quantize_qkv_c8w16"]["kernel_symbol"]], names
+    # The TMA-ring quantizer is one kernel too: vsplit=8 where its V clusters fit one wave.
+    names = cuda_kernel_names(
+        lambda: sage_fp8_quantize_sm100(q, k, v, impl="tma"),
+        exclude=("Memcpy",),
+    )
+    assert names == [loader.MODULES["quantize_qkv_tma_x8"]["kernel_symbol"]], names
     names = cuda_kernel_names(
         lambda: sage_fp8_quantize_sm100(q, k, v, impl="two_launch"),
         exclude=("Memcpy",),
@@ -583,6 +589,195 @@ def test_sage_fp8_quantize_sm100_matches_torch(shape):
         assert mismatch == 0, (
             f"{name}: {mismatch} elements differ by more than one E4M3 step"
         )
+
+
+def _quantizer_inputs(batch, heads, kv_heads, sq, sk, device, seed):
+    g = torch.Generator(device=device).manual_seed(seed)
+    q = torch.randn((batch, sq, heads, _HEAD_DIM), device=device, generator=g)
+    k = torch.randn((batch, sk, kv_heads, _HEAD_DIM), device=device, generator=g)
+    v = torch.randn((batch, sk, kv_heads, _HEAD_DIM), device=device, generator=g)
+    v[..., 3] = 0  # a zero V channel: its scale is the amax floor
+    return q.bfloat16(), k.bfloat16(), (v * 3).bfloat16()
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 8, 8, 4096, 4096),  # vsplit=4, the longest sequence
+        (1, 2, 2, 4096, 4096),  # vsplit=8
+        (1, 32, 8, 4096, 4096),  # GQA, vsplit=4
+        (2, 4, 4, 1000, 1500),  # ragged tails
+        (1, 8, 2, 65, 257),  # tails shorter than a unit and a V box
+        (1, 1, 1, 16384, 2048),  # long Q, short K/V: Q/K units on every cluster
+        (3, 2, 2, 300, 17),
+        (8, 8, 8, 512, 512),  # more V clusters than one wave (impl="tma" only)
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_tma_quantizer_matches_two_launches(shape, enable_pdl):
+    """The TMA-ring quantizer writes the bits of the two-launch quantizer."""
+    device = torch.device("cuda")
+    batch, heads, kv_heads, sq, sk = shape
+    q, k, v = _quantizer_inputs(batch, heads, kv_heads, sq, sk, device, sq * 7 + sk)
+    ref = sage_fp8_quantize_sm100(q, k, v, impl="two_launch", enable_pdl=False)
+    for _ in range(2):
+        got = sage_fp8_quantize_sm100(q, k, v, impl="tma", enable_pdl=enable_pdl)
+        torch.cuda.synchronize()
+        for name, a, b in zip(
+            ("q8", "k8", "v8", "q_scale", "k_scale", "v_scale"), got, ref, strict=True
+        ):
+            assert a.shape == b.shape, name
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), name
+
+
+@requires_sm100
+def test_tma_quantizer_refuses_sequences_beyond_its_v_boxes():
+    device = torch.device("cuda")
+    q, k, v = _quantizer_inputs(1, 2, 2, 64, 4097, device, 5)
+    with pytest.raises(ValueError, match='impl="tma"'):
+        sage_fp8_quantize_sm100(q, k, v, impl="tma")
+
+
+@requires_sm100
+def test_auto_quantizer_capture_without_an_eager_call_takes_two_launches():
+    """The TMA route's occupancy query cannot run inside a CUDA-graph capture: a capture
+    of a row no eager call has routed takes the two-launch quantizer (same bits), the
+    next eager call queries the occupancy, and a later capture takes the TMA quantizer;
+    ``impl="tma"`` in that first capture raises before anything is captured."""
+    device = torch.device("cuda")
+    index = torch.cuda.current_device()
+    arch = loader.device_arch(index)
+    q, k, v = _quantizer_inputs(1, 8, 8, 4096, 4096, device, 5)
+    ref = sage_fp8_quantize_sm100(q, k, v, impl="two_launch", enable_pdl=False)
+    sage_fp8_quantize_sm100(q, k, v, impl="two_launch")  # load the two-launch kernels
+    torch.cuda.synchronize()
+
+    def capture(fn):
+        stream = torch.cuda.Stream()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+            calls, _ = pkg._quantize_calls(q, k, v, "auto", None)
+            got = fn()
+        for t in got:
+            t.view(torch.uint8).fill_(255)
+        graph.replay()
+        torch.cuda.synchronize()
+        return [run for run, _ in calls], got
+
+    pkg._TMA_RESIDENT.clear()
+    runs, got = capture(lambda: sage_fp8_quantize_sm100(q, k, v))
+    assert loader.entry("quantize_qkv_tma_x4", arch) not in runs
+    for a, b in zip(got, ref, strict=True):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError, match="needs one eager call first"),
+        torch.cuda.stream(stream),
+        torch.cuda.graph(graph, stream=stream),
+    ):
+        sage_fp8_quantize_sm100(q, k, v, impl="tma")
+    torch.cuda.synchronize()
+    sage_fp8_quantize_sm100(q, k, v)  # eager: the cluster quantizer, and the query
+    assert ("quantize_qkv_tma_x4", index) in pkg._TMA_RESIDENT
+    runs, got = capture(lambda: sage_fp8_quantize_sm100(q, k, v))
+    assert runs == [loader.entry("quantize_qkv_tma_x4", arch)]
+    for a, b in zip(got, ref, strict=True):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+def test_auto_quantizer_routes_captured_small_rows_to_the_tma_quantizer():
+    """``impl="auto"``: eager small rows take the cluster quantizer; inside a CUDA-graph
+    capture the rows whose TMA V clusters fit one wave take the TMA quantizer (one kernel
+    node, no zero-fill), ``vsplit=8`` where that fits, and the replay writes the
+    two-launch bits."""
+    device = torch.device("cuda")
+    index = torch.cuda.current_device()
+    x8 = loader.resident_clusters(loader.MODULES["quantize_qkv_tma_x8"], index)
+    x4 = loader.resident_clusters(loader.MODULES["quantize_qkv_tma_x4"], index)
+    assert x8 >= 16 and x4 >= 16, (x8, x4)
+    route = pkg._tma_route
+    assert route(1, 2, 4096, 4096, index, one_wave=True)[:2] == (
+        "quantize_qkv_tma_x8",
+        8,
+    )
+    assert route(1, 8, 4096, 4096, index, one_wave=True)[:2] == (
+        "quantize_qkv_tma_x4",
+        4,
+    )
+    assert route(1, 8, 4096, 4097, index, one_wave=True) is None
+    assert route(8, 8, 4096, 4096, index, one_wave=True) is None
+    assert route(8, 8, 4096, 4096, index, one_wave=False)[:2] == (
+        "quantize_qkv_tma_x4",
+        4,
+    )
+    for shape, record in (
+        ((1, 2, 2, 4096, 4096), "quantize_qkv_tma_x8"),
+        ((1, 8, 8, 4096, 4096), "quantize_qkv_tma_x4"),
+    ):
+        q, k, v = _quantizer_inputs(*shape, device, 3)
+        ref = sage_fp8_quantize_sm100(q, k, v, impl="two_launch", enable_pdl=False)
+        calls, _ = pkg._quantize_calls(q, k, v, "auto", None)
+        assert [run for run, _ in calls] == [
+            loader.entry("quantize_qkv_c8w16", loader.device_arch(index))
+        ]
+        stream = torch.cuda.Stream()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream):
+            sage_fp8_quantize_sm100(q, k, v)  # warm-up on the capture stream
+            stream.synchronize()
+            with torch.cuda.graph(graph, stream=stream):
+                calls, _ = pkg._quantize_calls(q, k, v, "auto", None)
+                got = sage_fp8_quantize_sm100(q, k, v)
+        assert [run for run, _ in calls] == [
+            loader.entry(record, loader.device_arch(index))
+        ]
+        graph.replay()
+        torch.cuda.synchronize()
+        for name, a, b in zip(
+            ("q8", "k8", "v8", "q_scale", "k_scale", "v_scale"), got, ref, strict=True
+        ):
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), name
+
+
+@requires_sm100
+def test_run_module_launches_the_tma_quantizer_like_the_host_api():
+    """``run_module`` grids a ``vsplit_clusters`` record as the host API does."""
+    device = torch.device("cuda")
+    batch, heads, kv_heads, sq, sk = 1, 4, 2, 300, 2000
+    q, k, v = _quantizer_inputs(batch, heads, kv_heads, sq, sk, device, 9)
+    ref = sage_fp8_quantize_sm100(q, k, v, impl="tma")
+    out = [torch.empty_like(t) for t in ref]
+    values = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "q_out": out[0],
+        "k_out": out[1],
+        "v_out": out[2],
+        "q_scale": out[3],
+        "k_scale": out[4],
+        "v_scale": out[5],
+        "batch": batch,
+        "seqlen_q": sq,
+        "seqlen_k": sk,
+        "num_heads": heads,
+        "num_kv_heads": kv_heads,
+        "k_scale_groups": _ceil_div(sk, _K_GROUP),
+        "q_chunks": _ceil_div(sq, 64),
+        "k_chunks": _ceil_div(sk, 64),
+        "v_boxes": _ceil_div(_ceil_div(sk, 4), 256),
+        "enable_pdl": True,
+    }
+    index = torch.cuda.current_device()
+    for name in ("quantize_qkv_tma_x4", "quantize_qkv_tma_x8"):
+        for t in out:
+            t.view(torch.uint8).fill_(255)
+        loader.run_module(name, values, device_index=index)
+        torch.cuda.synchronize()
+        for a, b in zip(out, ref, strict=True):
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), name
 
 
 # Flag macros of the shared SM120 kernel source, in ``SM120_FLAGS`` order.

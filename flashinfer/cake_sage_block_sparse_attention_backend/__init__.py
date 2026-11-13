@@ -526,11 +526,81 @@ def bsa_attn_sm100_sage_fwd_cake(
 
 
 #: ``impl`` values of :func:`sage_fp8_quantize_sm100`.
-QUANTIZE_IMPLS = ("auto", "one_launch", "two_launch")
+QUANTIZE_IMPLS = ("auto", "one_launch", "two_launch", "tma")
 #: Float32 elements per 256 bytes: the alignment of each view of the one scales buffer.
 _SCALE_ALIGN = 64
 #: CTAs per cluster and warps per CTA of the one-launch quantizer.
 _CLUSTER_CTAS, _CLUSTER_WARPS = 8, 16
+
+
+#: The TMA-ring quantizer records, the larger V split first: ``vsplit`` clusters per
+#: batch and KV head, each holding the whole sequence of ``128 / vsplit`` V channels.
+_TMA_RECORDS = (("quantize_qkv_tma_x8", 8), ("quantize_qkv_tma_x4", 4))
+#: The longest K/V sequence of the TMA-ring quantizer: a cluster of 4 CTAs holds four
+#: 256-token V boxes per CTA.
+_TMA_MAX_SEQLEN_K = 4096
+_TMA_CLUSTER_CTAS, _TMA_VBOX_TOKENS, _TMA_VBOXES = 4, 256, 4
+
+
+#: Resident clusters per (TMA record, device), queried outside any CUDA-graph capture:
+#: the occupancy query loads a probe module, which invalidates a capture in progress.
+_TMA_RESIDENT: dict = {}
+
+
+def _tma_resident(name: str, device_index: int) -> Optional[int]:
+    """Clusters of ``name`` the device holds at once; ``None`` inside a capture before
+    any eager call has queried them (the caller then takes another quantizer)."""
+    key = (name, device_index)
+    resident = _TMA_RESIDENT.get(key)
+    if resident is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        resident = _loader.resident_clusters(_loader.MODULES[name], device_index)
+        _TMA_RESIDENT[key] = resident
+    return resident
+
+
+def _tma_route(
+    batch: int,
+    kv_heads: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    device_index: int,
+    *,
+    one_wave: bool,
+) -> Optional[Tuple[str, int, int]]:
+    """``(record, vsplit, resident clusters)`` of the TMA-ring quantizer for a shape.
+
+    ``one_wave=True`` (the ``"auto"`` route): the largest split whose V clusters fit
+    the clusters the device holds at once, else ``None``; on more V clusters the V
+    slices run in a second wave and the other quantizers are faster.  ``one_wave=False``
+    (``impl="tma"``): that split, else ``vsplit=4``.  ``None`` outside the kernel's
+    domain (``1 <= seqlen_k <= 4096``, ``seqlen_q >= 1``) or without the records, and
+    inside a CUDA-graph capture whose shape no eager call has routed yet.
+    """
+    if not (1 <= seqlen_k <= _TMA_MAX_SEQLEN_K and seqlen_q >= 1):
+        return None
+    shipped = [
+        (name, vsplit) for name, vsplit in _TMA_RECORDS if name in _loader.MODULES
+    ]
+    if not shipped:
+        return None
+    # A cluster of 4 CTAs holds at most one CTA per SM: past that bound no split fits
+    # one wave, without asking the driver.
+    if one_wave and batch * kv_heads * shipped[-1][
+        1
+    ] * _TMA_CLUSTER_CTAS > _loader.sm_count(device_index):
+        return None
+    for name, vsplit in shipped:
+        resident = _tma_resident(name, device_index)
+        if resident is None:
+            return None
+        if batch * kv_heads * vsplit <= resident:
+            return name, vsplit, resident
+    if one_wave:
+        return None
+    name, vsplit = shipped[-1]
+    return name, vsplit, _TMA_RESIDENT[(name, device_index)]
 
 
 def _one_launch_fits(batch: int, grid_heads: int, seqlen: int, sms: int) -> bool:
@@ -587,21 +657,40 @@ def _quantize_calls(
     q8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
     k8 = torch.empty_like(k, dtype=torch.float8_e4m3fn)
     v8 = torch.empty_like(v, dtype=torch.float8_e4m3fn)
+    tma = None
     if impl == "auto":
-        if _ONE_LAUNCH_RECORD not in _loader.MODULES:
-            impl = "two_launch"
-    if impl == "auto":
-        impl = (
-            "one_launch"
-            if _one_launch_fits(
-                batch,
-                grid_heads,
-                max(seqlen_q, seqlen_k),
-                _loader.sm_count(device_index),
+        if _ONE_LAUNCH_RECORD in _loader.MODULES and _one_launch_fits(
+            batch,
+            grid_heads,
+            max(seqlen_q, seqlen_k),
+            _loader.sm_count(device_index),
+        ):
+            impl = "one_launch"
+            # The same row inside a later CUDA-graph capture takes the TMA quantizer:
+            # query its occupancy now, outside the capture.
+            for name, _ in _TMA_RECORDS:
+                if name in _loader.MODULES:
+                    _tma_resident(name, device_index)
+        else:
+            tma = _tma_route(
+                batch, kv_heads, seqlen_q, seqlen_k, device_index, one_wave=True
             )
-            else "two_launch"
+            impl = "two_launch" if tma is None else "tma"
+    elif impl == "tma":
+        tma = _tma_route(
+            batch, kv_heads, seqlen_q, seqlen_k, device_index, one_wave=False
         )
-    if impl == "one_launch":
+        if tma is None and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                'impl="tma" inside a CUDA-graph capture needs one eager call first: '
+                "its occupancy query cannot run during a capture"
+            )
+        if tma is None:
+            raise ValueError(
+                f'impl="tma" quantizes 1 <= seqlen_k <= {_TMA_MAX_SEQLEN_K} and '
+                f"seqlen_q >= 1 tokens, got seqlen_q={seqlen_q}, seqlen_k={seqlen_k}"
+            )
+    if impl in ("one_launch", "tma"):
         # One buffer for the three scale tensors: one allocation on the host path.  Each
         # view starts on a 256-byte boundary, as a tensor of its own would: the kernels
         # read the scales with vector loads.
@@ -614,6 +703,42 @@ def _quantize_calls(
         q_scale = scales[:nq].view(batch, heads, seqlen_q)
         k_scale = scales[k_at : k_at + nk].view(batch, kv_heads, groups)
         v_scale = scales[v_at:].view(batch, kv_heads, dim)
+        if tma is not None:
+            record, vsplit, resident = tma
+            v_clusters = batch * kv_heads * vsplit
+            v_boxes = _ceil_div(
+                _ceil_div(seqlen_k, _TMA_CLUSTER_CTAS), _TMA_VBOX_TOKENS
+            )
+            calls_tma: Tuple[Tuple[Any, Tuple[Any, ...]], ...] = (
+                (
+                    _loader.entry(record, arch),
+                    (
+                        q,
+                        k,
+                        v,
+                        q8,
+                        k8,
+                        v8,
+                        q_scale,
+                        k_scale,
+                        v_scale,
+                        batch,
+                        seqlen_q,
+                        seqlen_k,
+                        heads,
+                        kv_heads,
+                        groups,
+                        _ceil_div(seqlen_q, TOKENS_PER_CTA),
+                        _ceil_div(seqlen_k, TOKENS_PER_CTA),
+                        v_boxes,
+                        int(pdl),
+                        _TMA_CLUSTER_CTAS * max(v_clusters, resident),
+                        1,
+                        1,
+                    ),
+                ),
+            )
+            return calls_tma, (q8, k8, v8, q_scale, k_scale, v_scale)
         passes = _ceil_div(max(seqlen_q, seqlen_k), 16 * _CLUSTER_WARPS * _CLUSTER_CTAS)
         calls: Tuple[Tuple[Any, Tuple[Any, ...]], ...] = (
             (
@@ -730,10 +855,16 @@ def sage_fp8_quantize_sm100(
     kernel that also reduces the V absolute maximum with atomics, then a V kernel (two
     launches plus one ``zero_`` of the V amax scratch).  ``"one_launch"``: one launch, a
     thread-block cluster per (batch, head) that reduces the V maximum in distributed shared
-    memory (no scratch).  ``"auto"`` (default) takes one launch for the small rows it is
-    faster on (``B * max(H, Hkv) * 8`` CTAs within one wave of the device, sequences up to
-    4096 tokens, outside a CUDA-graph capture) and two launches otherwise.  ``enable_pdl`` (default: on SM100/SM103)
-    launches with programmatic dependent launch.
+    memory (no scratch).  ``"tma"``: one launch that moves every input byte through shared
+    memory with TMA: ``vsplit`` 4-CTA clusters per (batch, KV head) each reduce a slice of
+    the V channels, and clusters up to those the device holds at once take Q/K tiles
+    (``seqlen_k`` up to 4096 tokens).  ``"auto"`` (default) takes one launch for the small
+    rows the cluster form is faster on outside a CUDA-graph capture (``B * max(H, Hkv) * 8``
+    CTAs within one wave of the device, sequences up to 4096 tokens); else the TMA form
+    where its V clusters fit one wave of the device (``B * Hkv * vsplit`` clusters,
+    ``seqlen_k`` up to 4096 tokens), with ``vsplit=8`` where that fits and ``vsplit=4``
+    otherwise; else two launches.  ``enable_pdl`` (default: on SM100/SM103) launches with
+    programmatic dependent launch.
     """
     calls, outputs = _quantize_calls(q, k, v, impl, enable_pdl)
     _launch(*calls)
