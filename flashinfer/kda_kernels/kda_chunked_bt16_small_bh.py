@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import os
 from typing import Optional
 
 import cutlass
@@ -25,6 +26,7 @@ from cutlass.cute.core import _pack_shape
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cutlass_dsl import dsl_user_op
 from flashinfer.cute_dsl.utils import get_max_active_clusters
+from flashinfer.gdn_kernels.cute_dsl_cache_naming import persist_cute_dsl_compile
 
 
 RCP_LN2 = 1.4426950408889634
@@ -2845,7 +2847,12 @@ def _fake_stride(dtype, shape):
     )
 
 
+_CUTE_DSL_MODULE = "kda_chunked_bt16_small_bh"
+_SOURCE_FILES = (os.path.realpath(__file__),)
+
+
 @functools.cache
+@persist_cute_dsl_compile(_CUTE_DSL_MODULE, _SOURCE_FILES)
 def _compile_k1(
     dtype: torch.dtype,
     seqlen_dtype: torch.dtype,
@@ -2911,6 +2918,7 @@ def _compile_k1(
 
 
 @functools.cache
+@persist_cute_dsl_compile(_CUTE_DSL_MODULE, _SOURCE_FILES)
 def _compile_k2(
     dtype: torch.dtype,
     seqlen_dtype: torch.dtype,

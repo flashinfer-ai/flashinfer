@@ -88,6 +88,7 @@ Reproducing the results::
 """
 
 import argparse
+import os
 import weakref
 from dataclasses import dataclass
 from functools import lru_cache
@@ -95,6 +96,8 @@ from typing import Callable, Protocol, cast
 
 import torch
 import cuda.bindings.driver as cuda_driver
+from flashinfer.gdn_kernels.cute_dsl_cache_naming import make_kernel_name
+from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
 import cutlass
 import cutlass.experimental.cuda as cuda
@@ -10304,6 +10307,35 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
     return compiled_call
 
 
+def _unified_kernel_name(
+    dtype,
+    state_dtype,
+    gate_dtype,
+    safe_gate,
+    gate_lower_bound,
+    has_state_in,
+    has_state_out,
+    has_state_ckpt,
+    has_state_indices,
+    has_checkpoint_state_indices,
+    mode,
+) -> str:
+    return make_kernel_name(
+        "unified",
+        dtype,
+        state_dtype,
+        gate_dtype,
+        safe_gate,
+        gate_lower_bound,
+        has_state_in,
+        has_state_out,
+        has_state_ckpt,
+        has_state_indices,
+        has_checkpoint_state_indices,
+        mode,
+    )
+
+
 @lru_cache(maxsize=None)
 def compile(  # noqa: A001
     dtype: type = cutlass.BFloat16,
@@ -10358,25 +10390,46 @@ def compile(  # noqa: A001
         has_checkpoint_state_indices,
         gate_dtype,
     )
-    unified = cute.compile(
-        host_unified,
-        *fakes,
-        make_fake_stream(),
-        0,  # seq_route
-        0,  # sm_count
-        0,  # checkpoint_stride_chunks
-        0,  # prep_num_ctas
-        0,  # prep_cpc
-        DEFAULT_SCALE,
-        fckpt,
-        fcuk,
-        fcheckpoint_state_indices,
-        safe_gate,
-        gate_scale_log2,
-        THREADS_PER_CTA,
-        mode,  # MODE constexpr (route specialization)
-        gate_dtype,  # gate ABI dtype constexpr (32-bit vs 16-bit gate path)
-        options="--enable-tvm-ffi",
+
+    def compile_unified():
+        return cute.compile(
+            host_unified,
+            *fakes,
+            make_fake_stream(),
+            0,  # seq_route
+            0,  # sm_count
+            0,  # checkpoint_stride_chunks
+            0,  # prep_num_ctas
+            0,  # prep_cpc
+            DEFAULT_SCALE,
+            fckpt,
+            fcuk,
+            fcheckpoint_state_indices,
+            safe_gate,
+            gate_scale_log2,
+            THREADS_PER_CTA,
+            mode,  # MODE constexpr (route specialization)
+            gate_dtype,  # gate ABI dtype constexpr (32-bit vs 16-bit gate path)
+            options="--enable-tvm-ffi",
+        )
+
+    unified = build_and_load_cute_dsl_kernel(
+        "kda_chunked_bt16",
+        _unified_kernel_name(
+            dtype,
+            state_dtype,
+            gate_dtype,
+            safe_gate,
+            gate_lower_bound,
+            has_state_in,
+            has_state_out,
+            has_state_ckpt,
+            has_state_indices,
+            has_checkpoint_state_indices,
+            mode,
+        ),
+        compile_unified,
+        (os.path.realpath(__file__),),
     )
     fn = _make_call(
         unified,
