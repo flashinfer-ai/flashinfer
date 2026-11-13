@@ -172,19 +172,70 @@ def test_reject_independent_residue_scale():
         mm_nvfp4_residue(a, w, sa, ws, scale.repeat(2))
 
 
-@pytest.mark.parametrize("fp4_format", ["nvfp4", "mxfp4"])
-@pytest.mark.parametrize("mode", ["fold_tma", "fold_tma_mext", "fold_mext_direct"])
-def test_reject_unsupported_tile_width(fp4_format, mode):
-    from flashinfer.experimental.resserve_mext.host import _compile_fold_gemm
+def _launch_args(m2, n=128, k_packed=32):
+    activation = torch.zeros(m2, k_packed, device="cuda", dtype=torch.uint8)
+    weight = torch.zeros(n, k_packed, device="cuda", dtype=torch.uint8)
+    scale = torch.zeros(512, device="cuda", dtype=torch.uint8)
+    alpha = torch.ones(1, device="cuda")
+    return weight, activation, scale, scale, alpha
 
-    with pytest.raises(ValueError, match="Fold supports tile widths"):
-        _compile_fold_gemm(
-            (128, 32),
-            (1, 1),
-            torch.bfloat16,
-            mode=mode,
+
+@pytest.mark.parametrize("fp4_format", ["nvfp4", "mxfp4"])
+@pytest.mark.parametrize("store_mode", ["tma", "tma_mext", "direct_mext"])
+def test_reject_narrow_tile_spanning_rows(fp4_format, store_mode):
+    """80 activation rows span a second width-32 tile, which has no SFB addressing."""
+    from flashinfer.experimental.resserve_mext.host import mext_fold_gemm
+
+    with pytest.raises(ValueError, match="narrow tma tiles"):
+        mext_fold_gemm(
+            *_launch_args(80),
+            mma_tiler_mn=(128, 32),
+            store_mode=store_mode,
             fp4_format=fp4_format,
         )
+
+
+def test_narrow_tma_tile_matches_reference():
+    """Width 8 is legal for one token row and matches the decoded reference."""
+    from flashinfer.experimental.resserve_mext.host import mext_fold_gemm
+
+    torch.manual_seed(42)
+    m, k, n = 1, 64, 64
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    scales = torch.tensor([64.0], device="cuda")
+    packed, sf = nvfp4_quantize_residue(x, scales)
+    decoded = _decode(packed, sf) / scales
+    base, residue = decoded[0::2], decoded[1::2]
+    weight = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device="cuda")
+    weight_scale = (
+        (
+            torch.rand(((n + 127) // 128) * ((k + 63) // 64) * 512, device="cuda")
+            * 0.75
+            + 0.25
+        )
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+    )
+    result = mext_fold_gemm(
+        weight,
+        packed,
+        weight_scale,
+        sf,
+        scales.reciprocal(),
+        mma_tiler_mn=(128, 8),
+        cluster_shape_mn=(1, 1),
+    )
+    reference = (base + residue) @ _decode(weight, weight_scale).T
+    torch.testing.assert_close(result.float(), reference, atol=0.08, rtol=0.02)
+
+
+@pytest.mark.parametrize("store_mode", ["tma_mext", "direct_mext"])
+def test_reject_mfold_narrow_tile(store_mode):
+    from flashinfer.experimental.resserve_mext.host import mext_fold_gemm
+
+    # 16 physical rows fit in one width-32 tile, but M-fold keeps the addressed widths.
+    with pytest.raises(ValueError, match="narrow tma tiles"):
+        mext_fold_gemm(*_launch_args(16), mma_tiler_mn=(128, 32), store_mode=store_mode)
 
 
 @pytest.mark.parametrize("m,n", [(64, 32), (64, 160), (72, 160)])

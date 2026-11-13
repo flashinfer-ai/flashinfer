@@ -25,6 +25,26 @@ DEFAULT_MMA_TILER_MN = (128, 128)
 DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
 SF_VEC_SIZE = 16
 
+# Row-pair / tma candidates. Tile8 families are not part of this entry.
+# Entries that share a tile differ by the AB pipeline stage count.
+ROW_PAIR_TACTICS = (
+    ((128, 8), (1, 1), 5),
+    ((128, 16), (1, 1), 6),
+    ((128, 16), (1, 1), 5),
+    ((128, 24), (1, 1), None),
+    ((128, 32), (1, 1), 5),
+    ((128, 32), (1, 1), None),
+    ((128, 64), (1, 1), None),
+    ((128, 128), (1, 1), None),
+    ((256, 64), (2, 1), None),
+    ((256, 128), (2, 1), None),
+    ((256, 256), (2, 1), None),
+)
+# Widths with per-tile SFB selection and TMEM addressing.
+_ADDRESSED_WIDTHS = (64, 128, 192, 256)
+# Widths below 64 are valid only when every activation row fits in tile 0.
+_NARROW_TMA_WIDTHS = (8, 16, 24, 32)
+
 
 @functools.lru_cache(maxsize=1)
 def _cutlass_modules():
@@ -68,11 +88,6 @@ def _compile_fold_gemm(
         "kloop_tma",
         "plain_mn",
     ), mode
-    # SFB tile selection and TMEM addressing exist only for these tile widths.
-    if mma_tiler_mn[1] not in (64, 128, 192, 256):
-        raise ValueError(
-            f"Fold supports tile widths 64, 128, 192 and 256, got {mma_tiler_mn}"
-        )
     if kernel_arch != "sm100":
         raise ValueError("Fold supports SM100; SM103 Fold is not supported")
 
@@ -234,6 +249,40 @@ def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def select_row_pair_tactic(m_tok: int) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Return the static row-pair tile and cluster for a token count.
+
+    M at most 64 uses one SM. Larger M uses the 2-SM cluster. Both are the
+    default-stage entries of ``ROW_PAIR_TACTICS``.
+    """
+    wanted = (128, 64) if m_tok <= 64 else (256, 128)
+    cluster = (1, 1) if m_tok <= 64 else (2, 1)
+    for tiler, tactic_cluster, stages in ROW_PAIR_TACTICS:
+        if tiler == wanted and tactic_cluster == cluster and stages is None:
+            return tiler, tactic_cluster
+    raise RuntimeError(f"no static row-pair tactic for M={m_tok}")
+
+
+def _check_tile_width(mma_tiler_mn: tuple[int, int], store_mode: str, m_tok: int):
+    """Reject tiles whose SFB and TMEM addressing does not cover this launch.
+
+    Widths 64, 128, 192 and 256 have per-tile scale selection. A narrower tma
+    tile has none, so it is limited to launches where tile 0 holds every
+    activation row (``2 * m_tok <= width``). Tile 0 then uses the same scale
+    slice and TMEM offset as the addressed widths. M-fold modes stay on the
+    addressed widths.
+    """
+    width = mma_tiler_mn[1]
+    if width in _ADDRESSED_WIDTHS:
+        return
+    if store_mode == "tma" and width in _NARROW_TMA_WIDTHS and 2 * m_tok <= width:
+        return
+    raise ValueError(
+        f"Fold tile width {width} is unsupported for store_mode={store_mode!r} "
+        f"with {m_tok} token rows; narrow tma tiles require 2*M <= width"
+    )
+
+
 def mext_fold_gemm(
     weight_fp4: torch.Tensor,
     act_fp4_rowpair: torch.Tensor,
@@ -255,6 +304,7 @@ def mext_fold_gemm(
     assert m2 % 2 == 0, "activation must be row-pair interleaved (even rows)"
     m_tok = m2 // 2
     k = k_packed * 2
+    _check_tile_width(mma_tiler_mn, store_mode, m_tok)
 
     _w_ld = weight_fp4.stride(0)
     _strided_w = _w_ld != k_packed

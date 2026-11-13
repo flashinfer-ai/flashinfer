@@ -145,6 +145,8 @@ def mm_nvfp4_residue(
     Prepare this global multiplier before launch and keep it unchanged until
     the operation completes; asynchronous alpha production via PDL is unsupported.
     The output is ``[M, N]`` in FP16 or BF16. Weight quantization is external.
+    The Fold tile follows the row-pair table: M at most 64 uses ``(128, 64)``
+    on one SM, and larger M uses ``(256, 128)`` on a 2-SM cluster.
     Warm up outside CUDA graph capture to compile the selected kernel.
     """
     _check_sm100(act)
@@ -184,11 +186,22 @@ def mm_nvfp4_residue(
             raise ValueError(f"{name} must contain {expected} bytes")
     if alpha.numel() != 1 or out_dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("alpha must have one element; output must be FP16/BF16")
-    from .experimental.resserve_mext.host import mext_fold_gemm
+    from .experimental.resserve_mext.host import (
+        mext_fold_gemm,
+        select_row_pair_tactic,
+    )
 
     with torch.cuda.device(act.device):
+        tiler, cluster = select_row_pair_tactic(m2 // 2)
         return mext_fold_gemm(
-            weight, act, weight_scale, act_scale, alpha, out_dtype=out_dtype
+            weight,
+            act,
+            weight_scale,
+            act_scale,
+            alpha,
+            out_dtype=out_dtype,
+            mma_tiler_mn=tiler,
+            cluster_shape_mn=cluster,
         )
 
 
