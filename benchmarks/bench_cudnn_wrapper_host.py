@@ -20,6 +20,9 @@ Input pinning is outside the measured plan cost.
 Each result includes sampled independent math checks and one-ULP CUDA
 graph replay after poisoning the output. Host enqueue excludes synchronization,
 first-call compilation and output allocation; these are component measurements.
+All backends are prepared before sampling. Each metric alternates forward/reverse
+backend order per round; JSON records the actual order, including failed samples.
+Workspaces and graph buffers for all requested backends remain live together.
 """
 
 import argparse
@@ -59,6 +62,45 @@ def _source_revision():
     except (OSError, subprocess.CalledProcessError):
         pass
     return None
+
+
+def _interleave_measurements(measurements, executed_order):
+    """Advance every backend to a metric barrier, then alternate sample order."""
+    active = dict(measurements)
+    while active:
+        pending = {}
+        for name, measurement in list(active.items()):
+            try:
+                pending[name] = next(measurement)
+            except StopIteration:
+                del active[name]
+        if not pending:
+            break
+        phases = {(phase, count) for phase, count, _ in pending.values()}
+        if len(phases) != 1:
+            raise RuntimeError(f"Backend measurement phases differ: {phases}")
+        phase, count = phases.pop()
+        names = list(pending)
+        for index in range(count):
+            order = names if index % 2 == 0 else names[::-1]
+            executed = dict(phase=phase, round=index, backends=[])
+            executed_order.append(executed)
+            for name in order:
+                if name not in active:
+                    continue
+                executed["backends"].append(name)
+                try:
+                    pending[name][2]()
+                except Exception as exc:
+                    # Let the backend retain its traceback/error row, then stop
+                    # timing it. Successful backends still finish every sample.
+                    try:
+                        active[name].throw(exc)
+                    except StopIteration:
+                        pass
+                    else:
+                        raise RuntimeError("Failed backend did not stop") from exc
+                    del active[name]
 
 
 def main():
@@ -108,6 +150,8 @@ def main():
         )
     if a.expected_backend_version is not None:
         assert cudnn.backend_version() == a.expected_backend_version
+    if len(set(a.backends)) != len(a.backends):
+        p.error("--backends must not contain duplicates")
     torch.manual_seed(42)
     b, sq, sk, h, hk, d, page = (
         a.batch,
@@ -195,10 +239,14 @@ def main():
         fi_version=flashinfer.__version__,
         fi_source=_source_revision(),
         frost_env=os.getenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES"),
+        sampling_order=[],
+        sampling_policy="alternating_forward_reverse_per_metric_round",
+        workspace_bytes_per_backend=256 * 1024 * 1024,
         results=[],
     )
     outputs = {}
-    for backend in a.backends:
+
+    def measure_backend(backend):
         row = dict(backend=backend, status="fail")
         try:
             ws = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda")
@@ -292,16 +340,20 @@ def main():
                 run()
             torch.cuda.synchronize()
             host = []
-            for _ in range(100):
+
+            def sample_host():
                 torch.cuda.synchronize()
                 t0 = time.perf_counter_ns()
                 run()
                 host.append((time.perf_counter_ns() - t0) / 1e3)
+
+            yield "host_enqueue", 100, sample_host
             torch.cuda.synchronize()
             row["host_enqueue_us"] = statistics.median(host)
             row["host_enqueue_samples_us"] = host
             eager, submitted = [], []
-            for _ in range(20):
+
+            def sample_eager():
                 torch.cuda.synchronize()
                 begin = time.perf_counter_ns()
                 for _ in range(20):
@@ -311,13 +363,16 @@ def main():
                 drained = time.perf_counter_ns()
                 submitted.append((enqueued - begin) / 20 / 1000)
                 eager.append((drained - begin) / 20 / 1000)
+
+            yield "completed_eager", 20, sample_eager
             row["loop_submit_us"] = statistics.median(submitted)
             row["loop_submit_samples_us"] = submitted
             row["drained_eager_us"] = statistics.median(eager)
             row["drained_eager_samples_us"] = eager
             if a.replan:
                 after_plan, complete, plans = [], [], []
-                for _ in range(100):
+
+                def sample_replan():
                     torch.cuda.synchronize()
                     t0 = time.perf_counter_ns()
                     plan()
@@ -331,6 +386,8 @@ def main():
                     plan()
                     run()
                     complete.append((time.perf_counter_ns() - t0) / 1e3)
+
+                yield "replan", 100, sample_replan
                 torch.cuda.synchronize()
                 row["plan_host_us"] = statistics.median(plans)
                 row["plan_host_samples_us"] = plans
@@ -371,7 +428,8 @@ def main():
             for _ in range(5):
                 g.replay()
             ts = []
-            for _ in range(20):
+
+            def sample_graph():
                 start, end = (
                     torch.cuda.Event(enable_timing=True),
                     torch.cuda.Event(enable_timing=True),
@@ -381,6 +439,8 @@ def main():
                 end.record()
                 end.synchronize()
                 ts.append(start.elapsed_time(end) * 1000 / 20)
+
+            yield "graph_replay", 20, sample_graph
             # Replan can release storage still referenced by captured native
             # pointers. Allocations in the earlier checks may then recycle it:
             # validate the timed replays too, before accepting their timings.
@@ -404,6 +464,17 @@ def main():
         record["results"].append(row)
         print(json.dumps(row), flush=True)
         Path(a.output).write_text(json.dumps(record, indent=2) + "\n")
+
+    allocated_before = torch.cuda.memory_allocated()
+    _interleave_measurements(
+        [(backend, measure_backend(backend)) for backend in a.backends],
+        record["sampling_order"],
+    )
+    record["gpu_allocated_before_measurements_bytes"] = allocated_before
+    record["gpu_peak_allocated_bytes"] = torch.cuda.max_memory_allocated()
+    # Preserve CLI backend order even when a failed backend finishes early.
+    record["results"].sort(key=lambda row: a.backends.index(row["backend"]))
+    Path(a.output).write_text(json.dumps(record, indent=2) + "\n")
     if any(r["status"] != "pass" for r in record["results"]):
         raise SystemExit(1)
 
