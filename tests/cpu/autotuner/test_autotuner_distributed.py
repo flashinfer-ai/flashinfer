@@ -497,7 +497,7 @@ import torch
 import torch.distributed as dist
 from flashinfer.autotuner import AutoTuner, TunableRunner, TuningConfig, autotune, set_autotune_process_group
 from flashinfer.autotune_cache import autotune_v2, autotune_v2_reload, ManagedAutotuneCache
-from flashinfer.autotuner.autotuner import _all_ranks_hit_cache
+from flashinfer.autotuner.autotuner import _ProfilingCandidates, _all_ranks_hit_cache
 
 rank = int(os.environ["RANK"])
 case = os.environ["CACHE_CASE"]
@@ -518,6 +518,7 @@ class RunnerB(RunnerA):
 config = TuningConfig()
 inputs = [torch.zeros(8, 8)]
 runners = [RunnerA(), RunnerB()]
+candidates = _ProfilingCandidates.from_runners(runners, inputs)
 op = "test::distributed_cache_hit"
 tuner = AutoTuner.get()
 tuner.clear_cache()
@@ -549,21 +550,24 @@ try:
         if all_hit or (rank == 0 and case not in ("all_miss", "concurrent_publish")):
             if case == "partial_memory":
                 tuner._winner_cache()[key] = (0, None)
+                tuner._profiling_cache_candidates[(tuner._winner_cache_identity(), key)] = candidates
             elif case == "partial_file":
                 tuner._file_configs[key.file_key] = ("RunnerA", 0)
+                tuner._file_config_selections[key.file_key] = {"candidate_keys": candidates.file_keys}
             else:
                 if case == "all_hit_different_runners" and rank == 1:
                     key = tuner._get_cache_key(op, runners[1], (inputs[0].shape,), config,
                                               runners[1].get_cache_key_extras(inputs))
                 cached_tactic = rank if case == "all_hit_different_tactics" else 0
                 store.publish(key.file_key, key.runner_class_name, cached_tactic, key_fields=key.key_fields,
-                              profiling_policy=policy)
+                              profiling_policy=policy, candidate_keys=candidates.file_keys)
         dist.barrier()
         if case == "all_hit_stale_memory":
             # The shared artifact is identical, but process-local memoized
             # winners may still differ before the final managed-cache reload.
             tuner._winner_cache()[key] = (rank % 2, None)
             tuner._profiling_cache_policies[(tuner._winner_cache_identity(), key)] = policy
+            tuner._profiling_cache_candidates[(tuner._winner_cache_identity(), key)] = candidates
         search = tuner.search_cache
         first = True
         def ordered_search(*args, **kwargs):
@@ -585,7 +589,7 @@ try:
             # Model another deployment publishing between the two lookups.
             writer = ManagedAutotuneCache(store.manifest, root=store.root)
             writer.publish(key.file_key, "RunnerA", 0, key_fields=key.key_fields,
-                           profiling_policy=policy)
+                           profiling_policy=policy, candidate_keys=candidates.file_keys)
             result = search(*args, **kwargs)
             assert result[0]
             return result
@@ -732,6 +736,92 @@ finally:
 """
 
 
+_FINAL_SELECTION_WORKER_SRC = r"""
+import datetime, os
+from pathlib import Path
+import torch
+import torch.distributed as dist
+from flashinfer.autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig, autotune, set_autotune_process_group
+from flashinfer.utils import last_positive_power_of_2
+
+rank = int(os.environ["RANK"])
+case = os.environ["CACHE_CASE"]
+single_runner = case.startswith("final_single_runner_")
+different_valid_tactics = case == "final_single_runner_different_valid_tactics"
+complete = single_runner or case == "final_cached_disagreement"
+agreed = case in ("final_incomplete_agreement", "final_single_runner_agreement")
+root = Path(os.environ["CASE_ROOT"])
+
+class RunnerA(TunableRunner):
+    def get_valid_tactics(self, inputs, profile):
+        return [0]
+    def forward(self, inputs, tactic=-1):
+        return inputs[0]
+
+class RunnerB(RunnerA):
+    def get_valid_tactics(self, inputs, profile):
+        return [0, 1] if different_valid_tactics else super().get_valid_tactics(inputs, profile)
+    def validate_tactic_for_profile(self, inputs, tactic, profile):
+        return True
+    def validate_tactic(self, inputs, tactic):
+        return agreed or different_valid_tactics or rank == 0
+
+profiled = []
+
+def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+    profiled.append(runner)
+    if isinstance(runner, RunnerB):
+        best_tactic = 1 if different_valid_tactics and inputs[0].shape[0] == 8 else 0
+        elapsed = torch.tensor(1.0 if tactic == best_tactic else 2.0)
+    else:
+        elapsed = torch.tensor(2.0 if complete else float("inf"))
+    dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+    return elapsed.item()
+
+AutoTuner._profile_single_kernel = profile
+torch.cuda.is_current_stream_capturing = lambda: False
+dist.init_process_group("gloo", init_method="file://" + str(root / "rendezvous"),
+                        rank=rank, world_size=int(os.environ["WORLD_SIZE"]),
+                        timeout=datetime.timedelta(seconds=30))
+try:
+    set_autotune_process_group(dist.group.WORLD)
+    tuner = AutoTuner.get()
+    winner = RunnerB()
+    runners = [winner] if single_runner else [RunnerA(), winner]
+    inputs = [torch.zeros(8, 8)]
+    config = TuningConfig()
+    expected_profiled = runners
+    if different_valid_tactics:
+        # Agree on each bucket's winner before selecting with rank-local inputs.
+        inputs = [torch.zeros(4 if rank == 0 else 8, 8)]
+        config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    input_idx=(0,),
+                    dim_idx=(0,),
+                    gen_tuning_buckets=(4, 8),
+                    map_to_tuning_buckets=last_positive_power_of_2,
+                ),
+            ),
+        )
+        expected_profiled = [winner] * 4
+    expected = (winner, 0) if agreed else (runners[0], -1)
+    selections = []
+    with autotune(True):
+        for repeat in (False, True):
+            profiled.clear()
+            selections.append(tuner.choose_one("test::final_selection", runners, config, inputs))
+            assert profiled == ([] if repeat and complete else expected_profiled)
+    assert selections == [expected, expected], (
+        rank, case, [(type(runner).__name__, tactic) for runner, tactic in selections]
+    )
+    print("cache agreement OK", rank, case, flush=True)
+finally:
+    set_autotune_process_group(None)
+    dist.destroy_process_group()
+"""
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "case",
@@ -748,6 +838,12 @@ finally:
         "partial_managed",
         "concurrent_publish",
         "failed_profile",
+        "final_incomplete_disagreement",
+        "final_incomplete_agreement",
+        "final_cached_disagreement",
+        "final_single_runner_disagreement",
+        "final_single_runner_agreement",
+        "final_single_runner_different_valid_tactics",
         "rejected_legacy",
         "rejected_shortlist_v1",
         "rejected_shortlist_managed",
@@ -756,6 +852,12 @@ finally:
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_cache_hit_disagreement_reprofiles_together(tmp_path, case, world_size):
     """Group lookups converge despite partial, racing, or divergent caches."""
+    if case.startswith("final_"):
+        worker_src = _FINAL_SELECTION_WORKER_SRC
+    elif case.startswith("rejected_"):
+        worker_src = _REJECTED_CACHE_WORKER_SRC
+    else:
+        worker_src = _CACHE_HIT_WORKER_SRC
     processes = []
     deadline = time.monotonic() + 120
     try:
@@ -770,13 +872,7 @@ def test_cache_hit_disagreement_reprofiles_together(tmp_path, case, world_size):
             )
             processes.append(
                 subprocess.Popen(
-                    [
-                        sys.executable,
-                        "-c",
-                        _REJECTED_CACHE_WORKER_SRC
-                        if case.startswith("rejected_")
-                        else _CACHE_HIT_WORKER_SRC,
-                    ],
+                    [sys.executable, "-c", worker_src],
                     env=env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
