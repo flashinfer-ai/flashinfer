@@ -355,6 +355,37 @@ def test_aot_provider_discovery_ignores_mismatched_shim(monkeypatch, caplog):
 
 
 @pytest.mark.cpu_only
+def test_aot_provider_discovery_ignores_namespace_package(
+    monkeypatch, caplog, tmp_path
+):
+    """A flashinfer_jit_cache namespace package must not break the import (#8024)."""
+    (tmp_path / "flashinfer_jit_cache" / "providers").mkdir(parents=True)
+    monkeypatch.setattr(sys, "path", [str(tmp_path)])
+    # setitem() records the current entry, so teardown restores it and drops the
+    # module imported below; delitem() unloads it, so that import really runs.
+    monkeypatch.setitem(sys.modules, "flashinfer_jit_cache", None)
+    monkeypatch.delitem(sys.modules, "flashinfer_jit_cache")
+
+    assert jit_env._get_aot_providers() == ()
+    assert "Ignoring flashinfer_jit_cache" in caplog.text
+    assert str(tmp_path / "flashinfer_jit_cache") in caplog.text
+
+
+@pytest.mark.cpu_only
+def test_aot_provider_discovery_ignores_shim_without_provider_api(monkeypatch, caplog):
+    """A shim from before the provider split has no get_jit_cache_providers()."""
+    monkeypatch.setenv("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+    monkeypatch.setattr(jit_env, "has_flashinfer_jit_cache", lambda: True)
+    monkeypatch.setitem(
+        sys.modules, "flashinfer_jit_cache", SimpleNamespace(__version__="0.6.18+cu130")
+    )
+
+    assert jit_env._get_aot_providers() == ()
+    assert "Ignoring flashinfer_jit_cache" in caplog.text
+    assert "0.6.18+cu130" in caplog.text
+
+
+@pytest.mark.cpu_only
 def test_aot_provider_discovery_uses_mismatched_shim_when_check_disabled(
     monkeypatch, tmp_path
 ):

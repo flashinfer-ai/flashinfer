@@ -194,8 +194,23 @@ def _get_aot_providers() -> Tuple[AOTProvider, ...]:
 
     import flashinfer_jit_cache
 
-    # NOTE: like a mismatched flashinfer-cubin, a mismatched shim is ignored so
-    # that `flashinfer download-kernels` can still import FlashInfer to replace it.
+    # NOTE: like a mismatched flashinfer-cubin, an unusable or mismatched shim is
+    # ignored so that `flashinfer download-kernels` can still import FlashInfer to
+    # replace it. A provider-only install, or an uninstall that removed the shim
+    # first, leaves flashinfer_jit_cache/ as a namespace package; a shim older than
+    # the provider split has no get_jit_cache_providers().
+    if not hasattr(flashinfer_jit_cache, "__version__") or not callable(
+        getattr(flashinfer_jit_cache, "get_jit_cache_providers", None)
+    ):
+        logger.warning(
+            "Ignoring flashinfer_jit_cache %s at %s, which is incomplete or too old "
+            "(kernels will be JIT-compiled instead). Run `flashinfer download-kernels` "
+            "to install a matching flashinfer-jit-cache, or remove that directory if "
+            "an uninstall left it behind.",
+            getattr(flashinfer_jit_cache, "__version__", "(no __version__)"),
+            list(getattr(flashinfer_jit_cache, "__path__", [])),
+        )
+        return ()
     try:
         _check_jit_cache_version(
             "flashinfer-jit-cache", flashinfer_jit_cache.__version__
