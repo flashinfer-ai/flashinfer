@@ -1379,6 +1379,12 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
         row_output[pos] = static_cast<IdType>(original_idx) + offset;
       });
     }
+
+    // The next iteration's LoadToSharedOrdered overwrites shared_ordered, which
+    // every thread must finish reading in the collect pass above.
+    if constexpr (!DETERMINISTIC) {
+      __syncthreads();
+    }
   }
 
   // Reset group state for the next launch, from the last CTA to exit (only for multi-CTA).
