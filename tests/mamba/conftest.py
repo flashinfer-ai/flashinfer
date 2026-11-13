@@ -12,6 +12,7 @@ parallel across cores, and is a near-free no-op when the modules are already
 present in the JIT disk cache.
 """
 
+import pytest
 import torch
 
 # Every _CHECKPOINTING_SSU_VARIANT_FIELDS combination requested by
@@ -1054,10 +1055,12 @@ def _triton_supports_current_arch() -> bool:
         return True
 
 
+# trylast: count only the nodes that will run, after -k/-m and the sharding
+# plugin's --flashinfer-node-file have deselected the rest. A sharding batch of
+# a few checkpointing tests then skips the 57-module prewarm.
+@pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(config, items):
     if items and not _triton_supports_current_arch():
-        import pytest
-
         skip_triton = pytest.mark.skip(
             reason="installed Triton cannot target this GPU architecture "
             "(the mamba reference implementations are Triton kernels and "
