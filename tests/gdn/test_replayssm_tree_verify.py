@@ -197,7 +197,12 @@ def test_validation_flag_accepts_trees_and_rejects_a_forward_parent():
     assert bad.returncode != 0, combined
     assert any(
         marker in combined
-        for marker in ("device-side assert", "CUDA error", "_assert_async_cuda_kernel")
+        for marker in (
+            "device-side assert",
+            "CUDA error",
+            "CUDA Error Code",
+            "_assert_async_cuda_kernel",
+        )
     ), combined
 
 
