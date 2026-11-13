@@ -95,9 +95,9 @@ bundled package configs (level 4) are not scanned for it.  This covers runtime
 sizes above the tuned range.  Lookups below or between tuned buckets still use
 the fallback, and replay coverage reports still count such a lookup as a miss.
 
-Notably, user-loaded file configs (level 2) are
-**always consulted, even during tuning mode**, so that already-tuned shapes
-from a cache file are never re-profiled.
+User-loaded file configs (level 2) are also consulted during tuning. A
+multi-runner tune can re-profile a loaded winner whose recorded coverage omits
+a current candidate. See `Cache Hit Behavior During Tuning`_.
 
 Config Caching
 --------------
@@ -178,14 +178,41 @@ sizes or sequence lengths -- and accumulate all configs in a single file:
 Cache Hit Behavior During Tuning
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-When ``autotune(True, cache=path)`` is active and a matching config is found in
-the cache file, the autotuner uses it directly **without re-profiling**.  This
-means:
+During tuning, ``AutoTuner.choose_one()`` can reuse the first eligible cached
+winner for multiple runners if its record covers every candidate and the
+measurement policy matches. Reordering or reducing candidates can reuse that
+winner. If an earlier cached result would shadow it during inference, the
+tuner profiles the candidates again and replaces the old selection.
 
-- Shapes that were already tuned are skipped, saving time.
-- Only truly new shapes trigger profiling.
-- A log message is printed once per ``(operation, runner)`` pair when a cache
-  hit is detected.
+A comparison that leaves a runner unmeasured because of a retryable failure
+can serve the current call with the best available measurement and allows a
+subsequent tune to retry. In single-process tuning it also preserves the
+previous cached result.
+
+Both JSON and managed v2 caches record this coverage on new multi-runner
+results. Existing files remain usable for inference
+and single-runner tuning, subject to the usual environment, policy, and
+tactic checks. If a multi-runner tune encounters an older entry with no
+coverage information, it profiles the eligible runners and saves the
+result with coverage. The SM107 MXFP8 low-M CuTe-DSL runner uses a distinct
+entry from the regular CuTe-DSL runner, so its first tune can miss an older
+entry.
+
+A runner whose tactic pool can change without changing its identity may
+override ``TunableRunner.get_tactic_cache_key(inputs)``. Return a cheap,
+hashable, cross-process-stable tuple, such as a catalog revision. It must
+change when newly available tactics need comparison, and must be invariant
+under profiling-input synthesis. Computing it must not build plans, enumerate
+tactics, or invoke nested tuning.
+
+``choose_one()`` checks this signature only during tuning, including for a
+single runner. A changed or previously unrecorded signature triggers a new
+comparison; an unchanged signature permits warm reuse without enumeration or
+profiling. The signature is stored in the existing candidate-coverage metadata
+in both JSON and managed caches. Bare serving and capture remain lookup-only
+and can use an older valid winner until retuning. Runners returning ``None``
+(the default) retain their existing behavior; this does not detect undeclared
+tactic-pool changes or change ``rank_tactics(k > 1)`` shortlist reuse.
 
 Caching in the Benchmark Harness
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -284,9 +311,9 @@ stable across FlashInfer, CUDA, cuDNN, or cuBLAS versions.
 Auditing Tuned Configs
 ^^^^^^^^^^^^^^^^^^^^^^
 
-A cache file decides performance: the first process that tunes an entry picks the
-tactic that later processes loading the file use without re-measuring it, unless
-they tune under a different measurement policy.
+A cache file preserves the tactic chosen by the process that tunes an entry.
+Later tuning can measure again when the measurement policy differs or the
+recorded comparison lacks coverage for a current runner.
 Tuning again into a fresh file is a new measurement, not a check; when several
 tactics measure within timing noise of each other, separate runs can pick
 different ones.
@@ -310,8 +337,10 @@ candidate's, and ``candidates`` the number of tactics that measured successfully
 ``margin`` is ``runner_up_ms / time_ms - 1``; one within the run-to-run noise of the
 measurement, like the 0.08% above, marks a near-tie that another tuning run may
 resolve differently. ``runner_up_ms`` and ``margin`` are ``null`` when only one
-tactic measured. Lookups never read the record, and entries without it load as
-before.
+tactic measured. These timing fields are for auditing. Multi-runner tuning
+checks the optional ``candidate_keys`` field, which records the compared
+runners. Entries without that field can still serve inference and compatible
+single-runner tuning.
 
 To make near-tied picks more consistent across processes, set a tie tolerance:
 ``autotune(True, tie_tolerance=0.005)`` treats tactics measured within 0.5% of the
