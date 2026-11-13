@@ -10,9 +10,10 @@ from flashinfer.cudnn import prefill as cudnn_prefill
     not cudnn_prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support"
 )
 @pytest.mark.parametrize("dim", [256])
+@pytest.mark.parametrize("capacity", [128, 256])
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("dtype,backend", [(torch.bfloat16, "auto")])
-def test_paged_gqa_auto_retained_capture(dtype, backend, return_lse, dim):
+def test_paged_gqa_auto_retained_capture(dtype, backend, return_lse, dim, capacity):
     """Physical token origins and explicit masks work on 9.24 without mixed forms."""
     from packaging.version import Version
 
@@ -21,14 +22,14 @@ def test_paged_gqa_auto_retained_capture(dtype, backend, return_lse, dim):
         cudnn.backend_version() < 92400
         or Version(cudnn.__version__) < Version("1.33.0")
         or not cudnn_prefill._cudnn_supports_paged_gqa_auto(dim)
-        or torch.cuda.get_device_capability() != (10, 0)
+        or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
         or not cudnn_prefill.cudnn_frontend_frost_runtime_available()
     ):
         pytest.skip(
-            "requires B200, cuDNN 9.24+, FE 1.33+ matching native and its DSL runtime"
+            "requires B200/B300, cuDNN 9.24+, FE 1.33+ matching native and its DSL runtime"
         )
     torch.manual_seed(171)
-    batch, capacity, max_kv, hq, hk, page = 2, 128, 16384, 32, 8, 16
+    batch, max_kv, hq, hk, page = 2, 16384, 32, 8, 16
     pages = max_kv // page
     # T3HD Q storage must not be confused with the contiguous output stride.
     q_storage = torch.randn(batch * capacity, 3, hq, dim, device="cuda", dtype=dtype)
@@ -39,7 +40,7 @@ def test_paged_gqa_auto_retained_capture(dtype, backend, return_lse, dim):
     pageptr = torch.arange(batch + 1, dtype=torch.int32) * pages
     indices = torch.arange(batch * pages, device="cuda", dtype=torch.int32)
     table = indices.view(batch, pages).clone()
-    q_lengths = torch.tensor([96, 128], dtype=torch.int32)
+    q_lengths = torch.tensor([capacity - 32, capacity], dtype=torch.int32)
     kv_lengths = torch.tensor([16381, 8195], dtype=torch.int32)
     last = (kv_lengths - 1) % page + 1
     workspace = torch.empty(128 << 20, device="cuda", dtype=torch.uint8)
