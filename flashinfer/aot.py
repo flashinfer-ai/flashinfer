@@ -143,6 +143,7 @@ from .jit.gemm import (
     gen_gemm_sm103_module_cutlass_fp4,
     gen_gemm_sm120_module,
     gen_gemm_sm120_module_cutlass_fp4,
+    gen_gemm_sm100_module_cutlass_bf16,
     gen_mm_bf16_cublaslt_module,
     gen_gemm_sm120_module_cutlass_mxfp8,
     gen_tgv_gemm_sm10x_module,
@@ -224,6 +225,11 @@ from .jit.sampling import gen_sampling_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
 from .jit.hash_topk import gen_hash_topk_module
+from .jit.tinygemm2 import (
+    gen_tinygemm2_module,
+    gen_tinygemm2_sm100_module,
+    tinygemm2_sm100_has_targets,
+)
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
 from .jit.cake_sampling import gen_cake_sampling_module
@@ -1011,7 +1017,7 @@ def gen_all_modules(
             # These SM100-named modules also build for SM110, which loads them at runtime.
             jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
             jit_specs.append(gen_mxfp8_quantization_sm100_module())
-        if has_sm100f or has_sm103:
+        if has_sm100f or has_sm103 or has_sm107:
             # Add TGV GEMM modules compiled with SM100f flags for both bf16 and fp16
             jit_specs.append(
                 gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=True)
@@ -1019,8 +1025,6 @@ def gen_all_modules(
             jit_specs.append(gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=True))
         if has_sm100a_exact or has_sm103a_exact:
             jit_specs.append(gen_alphamoe_fused_router_module())
-        if has_sm100 or has_sm103:
-            jit_specs.append(gen_mm_bf16_cublaslt_module())
         jit_specs.extend(_gen_blackwell_bf16_bmm_aot_specs(sm_capabilities))
         jit_specs.extend(_gen_cake_grouped_fp8_gemm_aot_specs(sm_capabilities))
         jit_specs.extend(
@@ -1083,6 +1087,26 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_fmha_v2_sm120_module())
         if has_sm120f:
             jit_specs.append(gen_fp4_quantization_sm120f_module())
+
+    if (
+        has_sm90
+        or has_sm100
+        or has_sm103
+        or has_sm107
+        or has_sm110
+        or has_sm120
+        or has_sm121
+    ):
+        # mm_bf16(backend="tinygemm") and the router GEMM load this module on
+        # SM90+; without it they run nvcc on first use.
+        jit_specs.append(gen_tinygemm2_module())
+    if (has_sm100 or has_sm103 or has_sm107) and tinygemm2_sm100_has_targets():
+        # Generated SM100/SM103/SM107 variant, selected by the router GEMM bias path.
+        jit_specs.append(gen_tinygemm2_sm100_module())
+    if has_sm100 or has_sm103 or has_sm107:
+        # mm_bf16(backend="cutlass" / "cublaslt") load these without MoE.
+        jit_specs.append(gen_mm_bf16_cublaslt_module())
+        jit_specs.append(gen_gemm_sm100_module_cutlass_bf16())
 
     if add_comm:
         from .jit.comm import (
