@@ -46,16 +46,17 @@ Fc1EpilogueStoreTileN = 64
 SwapABTileMChoices = (128, 256)
 # 8 is experimental (wgmma m64n8k32; every n-derived count divides): see TUNING.md.
 SwapABTokenTileNChoices = (8, 16, 32, 64, 128)
-# Packed FP4 (fp8_scale_mode "mxfp4_hybrid") also takes N72/N80: one task holds
-# an expert's 65-80 rows where N64 needs a second, nearly empty tile. Its shim
-# pads the activation-SF pool to a multiple of N, which the SF TMA coordinate
-# (expert SF base + tile * N) // N needs; FP8 keeps 128-row SF padding.
-SwapABPackedFp4TokenTileNChoices = (8, 16, 32, 64, 72, 80, 128)
+# Packed FP4 (fp8_scale_mode "mxfp4_hybrid") and blockwise FP8 also take
+# N72/N80: one task holds an expert's 65-80 rows where N64 needs a second,
+# nearly empty tile (blockwise N128 spills). Their shims pad the activation-SF
+# pool to a multiple of N, which the SF TMA coordinate
+# (expert SF base + tile * N) // N needs; per-tensor FP8 keeps its list.
+SwapABTokenTileNChoicesN72N80 = (8, 16, 32, 64, 72, 80, 128)
 
 
 def swapab_token_tile_n_choices(fp8_scale_mode: str) -> tuple[int, ...]:
-    if fp8_scale_mode == "mxfp4_hybrid":
-        return SwapABPackedFp4TokenTileNChoices
+    if fp8_scale_mode in ("mxfp4_hybrid", "blockwise"):
+        return SwapABTokenTileNChoicesN72N80
     return SwapABTokenTileNChoices
 
 
@@ -2239,16 +2240,20 @@ class SwapABFp8GluEpilogue:
                     )
                     if cutlass.const_expr(
                         self._token_back_by_dispatch
-                        or self.fp8_scale_mode != "mxfp4_hybrid"
+                        or (
+                            self.fp8_scale_mode == "blockwise"
+                            and self._token_tile_n == 64
+                        )
                     ):
                         # Dispatch-side token-back (reuse / standalone warps)
                         # can give intermittent run-to-run output differences,
                         # and the shared runtime-half copy made them far more
                         # frequent. The cause is open (no register spills; reuse
                         # of the WGMMA A registers in flight is not ruled out),
-                        # so this layout keeps one copy per half, as before. So
-                        # do the FP8 scale modes (per-tensor, blockwise): only
-                        # the packed-FP4 mxfp4_hybrid path shares one copy.
+                        # so this layout keeps one copy per half, as before.
+                        # So does blockwise N64: it already runs near the
+                        # register limit, and the shared copy measured 2.5-4%
+                        # slower there (N16/N32/N72/N80 tie or gain).
                         if n_half == cutlass.Int32(0):
                             (
                                 ab_consumer_state,
@@ -2379,7 +2384,10 @@ class SwapABFp8GluEpilogue:
                     )
                     if cutlass.const_expr(
                         self._token_back_by_dispatch
-                        or self.fp8_scale_mode != "mxfp4_hybrid"
+                        or (
+                            self.fp8_scale_mode == "blockwise"
+                            and self._token_tile_n == 64
+                        )
                     ):
                         # Per-half copies as for FC1 above.
                         if n_half == cutlass.Int32(0):

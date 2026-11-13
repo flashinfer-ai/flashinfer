@@ -19,17 +19,6 @@
 #define CAKE_NEED_INT_WARP_UNIFORM
 #include "cake_stepfun_moe_device_common.cuh"
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_WARP_AGGREGATES_OFF 0
-#define SMEM_WARP_AGGREGATES_STAGE_BYTES 16
-#define SMEM_WARP_AGGREGATES_STRIDE 16
-#define SMEM_ROW_AMAX_SMEM_OFF 16
-#define SMEM_ROW_AMAX_SMEM_STAGE_BYTES 4
-#define SMEM_ROW_AMAX_SMEM_STRIDE 4
-#define SMEM_TOTAL 0
-#define THREADS 128
-
 
 __device__ __forceinline__ float mul_f32_rn_ftz(float a, float b) {
     float r;
@@ -53,7 +42,7 @@ kernel_cake_stepfun_moe_da3cce1da37ee8392722(__nv_bfloat16* __restrict__ input, 
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* warp_aggregates = reinterpret_cast<float*>(smem_static_raw + 0);
     const int warp_aggregates_addr = (int)(unsigned long long)__cvta_generic_to_shared(warp_aggregates);
     float* row_amax_smem = reinterpret_cast<float*>(smem_static_raw + 16);
@@ -73,7 +62,7 @@ kernel_cake_stepfun_moe_da3cce1da37ee8392722(__nv_bfloat16* __restrict__ input, 
                 unsigned int words[8];
                 {
                     asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                        : "=r"(words[0 + 0]), "=r"(words[0 + 1]), "=r"(words[0 + 2]), "=r"(words[0 + 3]), "=r"(words[0 + 4]), "=r"(words[0 + 5]), "=r"(words[0 + 6]), "=r"(words[0 + 7]) : "l"((const void*)((const char*)(input + (vec_offset * 16) + 0) + 0)) : "memory");
+                        : "=r"(words[0 + 0]), "=r"(words[0 + 1]), "=r"(words[0 + 2]), "=r"(words[0 + 3]), "=r"(words[0 + 4]), "=r"(words[0 + 5]), "=r"(words[0 + 6]), "=r"(words[0 + 7]) : "l"((const void*)((const char*)(input + vec_offset * 16ll + 0) + 0)) : "memory");
                 }
                 uint32_t _bf16x2_abs_0;
                 asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_0) : "r"(words[0]));
@@ -151,7 +140,7 @@ kernel_cake_stepfun_moe_da3cce1da37ee8392722(__nv_bfloat16* __restrict__ input, 
                 unsigned int words2[8];
                 {
                     asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                        : "=r"(words2[0 + 0]), "=r"(words2[0 + 1]), "=r"(words2[0 + 2]), "=r"(words2[0 + 3]), "=r"(words2[0 + 4]), "=r"(words2[0 + 5]), "=r"(words2[0 + 6]), "=r"(words2[0 + 7]) : "l"((const void*)((const char*)(input + ((unsigned long long)vec_offset2 * 16) + 0) + 0)) : "memory");
+                        : "=r"(words2[0 + 0]), "=r"(words2[0 + 1]), "=r"(words2[0 + 2]), "=r"(words2[0 + 3]), "=r"(words2[0 + 4]), "=r"(words2[0 + 5]), "=r"(words2[0 + 6]), "=r"(words2[0 + 7]) : "l"((const void*)((const char*)(input + (unsigned long long)vec_offset2 * 16ull + 0) + 0)) : "memory");
                 }
                 uint32_t _bf16x2_abs_2;
                 asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_2) : "r"(words2[0]));
@@ -204,20 +193,18 @@ kernel_cake_stepfun_moe_da3cce1da37ee8392722(__nv_bfloat16* __restrict__ input, 
                     values[2 * w3_1 + 1] = mul_f32_rn_ftz(__uint_as_float(word_1 & 4294901760u), output_scale);
                 }
                 asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed[1]) : "f"(values[0]), "f"(values[1]), "f"(values[2]), "f"(values[3]), "f"(values[4]), "f"(values[5]), "f"(values[6]), "f"(values[7]));
-                asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(out_fp4 + ((unsigned long long)vec_offset2 * 8) + (0)), "r"(packed[(0) + 0]), "r"(packed[(0) + 1]) : "memory");
+                reinterpret_cast<int2*>(out_fp4 + (unsigned long long)vec_offset2 * 8ull)[0] = reinterpret_cast<int2*>(packed)[0];
                 long long row64 = (long long)row_idx;
                 long long vec64 = (long long)vec_idx2;
-                long long num_k_tiles = ((long long)num_vecs_per_row + 3) / 4;
-                long long inner_k = vec64 % 4;
-                long long k_tile = vec64 / 4;
-                long long inner_m8 = row64 % 8;
-                long long m_tile8 = row64 / 8;
-                long long sf_offset = m_tile8 * (num_k_tiles * 32) + k_tile * 32 + inner_m8 * 4 + inner_k;
-                {
-                    unsigned short _sf_pair;
-                    asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_sf_pair) : "f"(sf_value));
-                    *(reinterpret_cast<unsigned char*>(out_sf + sf_offset) + (0)) = (unsigned char)(_sf_pair & 0x7F);
-                }
+                long long num_k_tiles = ((long long)num_vecs_per_row + 3ll) / 4ll;
+                long long inner_k = vec64 % 4ll;
+                long long k_tile = vec64 / 4ll;
+                long long inner_m8 = row64 % 8ll;
+                long long m_tile8 = row64 / 8ll;
+                long long sf_offset = m_tile8 * (num_k_tiles * 32ll) + k_tile * 32ll + inner_m8 * 4ll + inner_k;
+                uint16_t _cvt_satfinite_e4m3x2_f32_24;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_24) : "f"(0.0f), "f"(sf_value));
+                *reinterpret_cast<unsigned char*>(out_sf + sf_offset) = (unsigned char)((unsigned int)(unsigned char)(_cvt_satfinite_e4m3x2_f32_24 & 127));
             }
             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
         }
