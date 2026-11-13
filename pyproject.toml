@@ -22,7 +22,7 @@ authors = [{ name = "FlashInfer team" }]
 license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
-license-files = ["LICENSE", "NOTICE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda", "licenses/LICENSE.cudnn-frontend-MIT.txt", "licenses/LICENSE.batch-invariant-ops.txt"]
+license-files = ["LICENSE", "NOTICE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda", "licenses/LICENSE.cudnn-frontend-MIT.txt", "licenses/LICENSE.batch-invariant-ops.txt", "licenses/LICENSE.gc-moe.txt"]
 
 [project.optional-dependencies]
 b12x = ["torch>=2.12.0", "nvidia-cutlass-dsl[cu13]>=4.8.0", "rich>=13", "safetensors>=0.6"]
@@ -206,6 +206,13 @@ exclude = [
   "src/*.cu",
   "src/*.json",
 ]
+# CuTe DSL GC MoE drop (SM90/SM100/SM120): the vendored kernels are pure Python,
+# vendored from Bruce-Lee-LY/gc-moe with local patches in VENDOR.md. packages.find discovers
+# the drop's __init__-less directories as PEP 420 namespace subpackages, so the
+# modules ship as packages; package-data only adds the two provenance notes.
+"flashinfer.experimental.gc_moe.kernel_src.gc_moe" = [
+  "*.md",
+]
 "flashinfer.data" = ["csrc/**", "include/**"]
 "flashinfer.data.cutlass" = ["include/**", "tools/util/include/**"]
 "flashinfer.data.spdlog" = ["include/**"]
@@ -269,6 +276,8 @@ exclude = [
   "flashinfer/msa_ops/cute_dsl/sparse_decode_nvfp4_sm100.py",
   # The vendored cuDNN Frontend tree of the Qwen 3.5 gated attention block (see the ruff exclude note).
   "flashinfer/experimental/qwen_3_5_block/_cudnn_frost/",
+  # The GC MoE drop, vendored from Bruce-Lee-LY/gc-moe (local patches in its VENDOR.md).
+  "flashinfer/experimental/gc_moe/kernel_src/gc_moe/src/",
   "build/",
 ]
 
@@ -308,6 +317,9 @@ extend-exclude = [
   # cuDNN Frontend sources vendored byte-faithfully for the Qwen 3.5 gated attention block (re-vendored as a clean
   # drop; the digests in its VENDOR_MANIFEST.json cover the files as written). The adapter beside it stays linted.
   "flashinfer/experimental/qwen_3_5_block/_cudnn_frost/",
+  # GC MoE kernels vendored from Bruce-Lee-LY/gc-moe with the local patches recorded in the drop's VENDOR.md.
+  # The shim and the experimental adapters beside them stay linted.
+  "flashinfer/experimental/gc_moe/kernel_src/gc_moe/src/",
 ]
 force-exclude = true
 
