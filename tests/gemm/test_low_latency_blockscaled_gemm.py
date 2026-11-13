@@ -234,6 +234,47 @@ def test_low_latency_blockscaled_gemm_can_implement(
     )
 
 
+def test_low_latency_blockscaled_gemm_split_free_tactics():
+    """Split-K is the runner's only non-split-free tactic family: the untuned
+    default never splits K, and every tactic the mode accepts produces the
+    same bits as the default."""
+    _require_supported_gpu()
+    a_dtype, b_dtype, sf_dtype, sf_vec_size = _SUPPORTED_FORMATS[0]
+    runner = _make_runner()
+    workspace = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    mnkl = (129, 7, 256, 2)
+    a, b, sfa, sfb, out, _, _ = make_blockscaled_tensors(
+        mnkl,
+        a_dtype,
+        b_dtype,
+        sf_dtype,
+        sf_vec_size,
+        cutlass.BFloat16,
+    )
+    alpha = torch.tensor(0.125, dtype=torch.float32, device="cuda")
+    bias = torch.linspace(-0.5, 0.5, mnkl[0], dtype=torch.bfloat16, device="cuda")
+    inputs = [a, b, sfa, sfb, out, workspace, mnkl, alpha, bias]
+    tactics = runner.get_valid_tactics(inputs, None)
+
+    assert runner.is_split_free_tactic(-1)
+    assert runner.is_split_free_tactic(None)
+    for tactic in tactics:
+        expected = tactic[3] == 1
+        assert runner.is_split_free_tactic(tactic) is expected, tactic
+        assert runner.is_split_free_tactic(list(tactic)) is expected, tactic
+    assert any(tactic[3] > 1 for tactic in tactics)
+
+    out.zero_()
+    runner.forward(inputs, tactic=-1)
+    default = out.clone()
+    for tactic in tactics:
+        if tactic[3] != 1:
+            continue
+        out.zero_()
+        runner.forward(inputs, tactic=tactic)
+        assert torch.equal(out, default), tactic
+
+
 @pytest.mark.parametrize("fmt", _SUPPORTED_FORMATS)
 def test_low_latency_blockscaled_gemm_all_tactics_correctness(fmt):
     """Every generated tactic is correct, then exercise model and edge shapes."""
