@@ -46,3 +46,9 @@ and FlashInfer PR #4266 provenance. The fixed-order batched GEMM retains
 code derived from batch_invariant_ops, Copyright 2025 Thinking Machines Lab,
 under the MIT License (licenses/LICENSE.batch-invariant-ops.txt).
 Pinned sources and modifications: flashinfer/experimental/hc_sum_sm100/SOURCES.md.
+
+The GC MoE kernels (flashinfer/experimental/gc_moe/kernel_src/gc_moe/src/, SM90/SM100/SM120)
+are adapted from Bruce-Lee-LY/gc-moe, Copyright (c) 2026 Bruce-Lee-LY, under the MIT License
+(licenses/LICENSE.gc-moe.txt); upstream version 0.6.2 with the local patches
+recorded in VENDOR.md.
+Source: https://github.com/Bruce-Lee-LY/gc-moe/tree/7902831ec4a6691b6268b308bcff5ec0cb15ec86
