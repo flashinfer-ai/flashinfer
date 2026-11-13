@@ -36,16 +36,16 @@ is a shape class, not a layer: every MoE layer of a model shares one name and
 holds its own weights, so one state per key is one state per weight set, and
 the view of the same storage an engine passes call after call keys the same.
 Identity cannot see bytes change behind a stable address, so each entry also
-records the tensors' version counters (a tensor that tracks none — an
-inference-mode tensor — is keyed on identity alone), which torch bumps on
-every in-place operation through its dispatcher: a call whose setup inputs no longer match
-is prepared afresh under the same key, or refused with ``StaleSetupError``
-once a capture has frozen the binding (a captured graph replays against the
-prepared state's addresses). Re-preparing tears the old state down, so — as
+records the tensors' version counters, bumped by torch on every in-place
+operation through its dispatcher (an inference-mode tensor tracks none and is
+keyed on identity alone). A call whose setup inputs no longer match is
+prepared afresh under the same key, or refused with ``StaleSetupError`` once
+a capture has frozen the binding — a captured graph replays against the
+prepared state's addresses. Re-preparing tears the old state down, so — as
 with ``release()`` — a rewrite is the engine's to quiesce: a call in flight
-holds the state it was handed. A write that bypasses torch's dispatcher — a raw
-copy into the storage — moves no counter and stays invisible; an engine mode
-that rewrites weights that way is the consumer's to refuse.
+holds the state it was handed. A raw write bypassing the dispatcher moves no
+counter and stays invisible; an engine mode that rewrites weights that way is
+the consumer's to refuse.
 
 Refused, with ``SetupStateError`` (a ``RuntimeError``, never ``ImportError``):
 a weight set first seen inside CUDA-graph capture (setup allocates and
@@ -94,8 +94,8 @@ MAX_WEIGHT_SETS = 1024
 _StateKey = tuple[tuple[str, int, tuple[int, ...], tuple[int, ...], str, str], ...]
 
 #: One retained weight set: the state, the live tensors (kept so their storage
-#: cannot be recycled), their version counters at prepare time (None for a
-#: tensor that tracks none), and the allocator bytes the prepare added.
+#: cannot be recycled), their version counters at prepare time (None if
+#: untracked), and the allocator bytes the prepare added.
 _Entry = tuple[Any, tuple[Any, ...], tuple[int | None, ...], int]
 
 
@@ -109,10 +109,9 @@ class SetupStateError(RuntimeError):
 
 
 class StaleSetupError(SetupStateError):
-    """A setup input changed in place after its state was prepared, and the
-    binding is frozen: a CUDA-graph capture replays against the prepared
-    state's addresses, so the state cannot be replaced. A change seen before
-    any capture is instead re-prepared under the same key."""
+    """A setup input changed in place while the binding is frozen: a CUDA-graph
+    capture replays against the prepared state's addresses, so the state cannot
+    be replaced. A change seen before any capture is re-prepared instead."""
 
 
 def _is_capturing(device: Any) -> bool:
@@ -140,11 +139,8 @@ def _is_capturing(device: Any) -> bool:
 
 
 def _tensor_version(tensor: Any) -> int | None:
-    """The tensor's in-place-mutation counter; None when it tracks none.
-
-    An inference-mode tensor has no version counter; such an input is keyed on
-    identity alone, as before this check existed.
-    """
+    """The tensor's in-place-mutation counter; None for an inference-mode
+    tensor, which tracks none and is keyed on identity alone."""
     try:
         return tensor._version
     except RuntimeError:
@@ -339,14 +335,11 @@ class SetupBoundCallable:
         else:
             stale = self._stale_input(entry, tensors)
             if stale is not None:
-                if self._frozen or _is_capturing(device):
-                    raise self._stale_refusal(stale)
                 entry = self._reprepare(key, stale, entry, tensors, kwargs, device)
             elif not self._frozen and _is_capturing(device):
                 # The first capture freezes the key set: a weight set that appears
                 # later cannot have been prepared before the graphs were recorded.
-                # Under the lock, so a freeze cannot land inside a re-prepare's
-                # delete-and-teardown of the state a graph is recording.
+                # Under the lock, so no freeze lands inside a re-prepare's teardown.
                 with self._lock:
                     self._frozen = True
         kwargs[self.state_param] = entry[0]
@@ -370,11 +363,7 @@ class SetupBoundCallable:
 
     def _stale_input(self, entry: _Entry, tensors: tuple[Any, ...]) -> str | None:
         """The first setup input mutated in place since the state was prepared, if any.
-
-        Reads the tensor's version counter, which torch bumps on every in-place
-        operation through its dispatcher. A write that bypasses the dispatcher
-        (a raw copy into the storage) moves no counter and stays invisible.
-        """
+        A raw write bypassing torch's dispatcher moves no counter and stays invisible."""
         for name, tensor, version in zip(
             self.setup_inputs, tensors, entry[2], strict=True
         ):
@@ -383,16 +372,6 @@ class SetupBoundCallable:
             if _tensor_version(tensor) != version:
                 return name
         return None
-
-    def _stale_refusal(self, stale: str) -> StaleSetupError:
-        """The counted refusal of a re-prepare a capture forbids."""
-        self._stats["refused_stale"] += 1
-        return StaleSetupError(
-            f"{self.name}: setup input {stale!r} changed in place after its state "
-            "was prepared, and a CUDA-graph capture replays against that state's "
-            "addresses, so it cannot be replaced; rewrite weights out of place "
-            "(fresh storage keys as a new weight set), or before the first capture"
-        )
 
     def _reprepare(
         self,
@@ -403,32 +382,34 @@ class SetupBoundCallable:
         kwargs: Mapping[str, Any],
         device: Any,
     ) -> _Entry:
-        """Re-run setup for a weight set whose input changed in place, under the same key.
+        """Re-run setup under the same key for a weight set whose input changed in place.
 
-        The lock is held across the delete, the teardown and the new prepare, as
-        ``_prepare`` already holds it across setup: a racing call sees the state
-        before or after, never between, and a capture observed meanwhile keeps the
-        old state. A racing call's replacement is checked against this call's
-        tensors before it serves: a further rewrite may postdate it. A teardown
-        that raises leaves nothing prepared; the next call prepares afresh.
-        Like ``release()``, this assumes the engine quiesces calls around a weight
-        rewrite — which a rewrite already requires, since an in-place rewrite
-        during a call corrupts the computation the setup state serves.
+        The lock is held across the delete, the teardown and the new prepare: a
+        racing call sees the state before or after, never between, and its
+        replacement is re-validated against this call's tensors before it serves.
+        A teardown that raises leaves nothing prepared; the next call prepares
+        afresh. As with ``release()``, the engine quiesces calls around a rewrite.
         """
         with self._lock:
             current = self._states.get(key)
             if current is not old:
                 if current is None:
-                    # The racing call's teardown failed; nothing is prepared.
+                    # A racing teardown failed; nothing is prepared.
                     return self._prepare(key, tensors, kwargs, device)
                 again = self._stale_input(current, tensors)
                 if again is None:
                     return current  # a racing call re-prepared; the entry is current
-                # The replacement postdates a further rewrite: re-apply the rules
-                # to it (the lock is re-entrant).
+                # The replacement may postdate a further rewrite: re-check it.
                 return self._reprepare(key, again, current, tensors, kwargs, device)
             if self._frozen or _is_capturing(device):
-                raise self._stale_refusal(stale)
+                self._stats["refused_stale"] += 1
+                raise StaleSetupError(
+                    f"{self.name}: setup input {stale!r} changed in place after "
+                    "its state was prepared, and a CUDA-graph capture replays "
+                    "against that state's addresses, so it cannot be replaced; "
+                    "rewrite weights out of place (fresh storage keys as a new "
+                    "weight set), or before the first capture"
+                )
             del self._states[key]
             self._stats["weight_sets"] = len(self._states)
             self._stats["retained_bytes"] -= old[3]
@@ -510,8 +491,7 @@ class SetupBoundCallable:
             elapsed = time.monotonic() - started
             after = torch.cuda.memory_allocated(device) if cuda else 0
             # The tensors are kept beside the state so their storage cannot be
-            # recycled, and their addresses re-keyed, while the state lives; the
-            # version counters let a later call see an in-place rewrite.
+            # recycled, and their addresses re-keyed, while the state lives.
             versions = tuple(_tensor_version(tensor) for tensor in tensors)
             entry = self._states[key] = (
                 state,
