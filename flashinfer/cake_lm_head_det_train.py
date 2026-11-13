@@ -588,6 +588,31 @@ def cake_lm_head_det_train_logprob(
     ``ValueError`` instead.  Outputs are defined while
     ``|z / tau_t| < 3e38`` on every row.  ``memory_mode="keep_logits"``
     takes no temperature (``ValueError``).
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        BF16 ``[T, H]`` hidden states, with the layout rules of :func:`cake_lm_head_det_train_loss`.
+    W : torch.Tensor
+        Contiguous BF16 ``[V, H]`` output weight.
+    labels : torch.Tensor
+        int64 ``[T]`` selected token ids; ``-100`` marks an ignored row.
+    chunk_size : int, default=4096
+        Maximum token rows per logits chunk.
+    backend : str, default="cake"
+        Only ``"cake"`` is supported.
+    compact_rows, fuse_dw_cast, dx_finalize, dw_stream, hidden_count, gemm_tuning
+        Execution switches with the contracts and defaults of :func:`cake_lm_head_det_train_loss`.
+    memory_mode : str, optional
+        Backward memory policy described above; this entry also accepts ``"keep_logits"``.
+    num_valid_rows : int, optional
+        Caller-supplied host count of labels other than ``-100``.
+    check_num_valid_rows : bool, default=False
+        Read the valid-row count back and raise ``ValueError`` on a mismatch.
+    temperature : float or torch.Tensor, optional
+        Positive finite scalar or FP32 ``[T]`` temperature; ``None`` is equivalent to 1.0.
+    check_temperature : bool, default=False
+        Read tensor-temperature validation back and raise ``ValueError`` instead of a device assertion.
     """
     if temperature is not None:
         return _logprob_temperature(
@@ -675,6 +700,13 @@ def cake_lm_head_det_train_preload(
     :func:`cake_lm_head_det_train_logprob` temperature path and launches its PyTorch
     operators once; by default they are not loaded (callers that never pass
     a temperature build no temperature library).
+
+    Parameters
+    ----------
+    device : torch.device, int, str, optional
+        CUDA device whose libraries to load; ``None`` selects the current device.
+    temperature : bool, default=False
+        Also load the temperature-path libraries and warm up their PyTorch operators.
     """
     _cake_backend_opt_in().cake_lm_head_det_train_preload(
         device, temperature=temperature
@@ -723,6 +755,29 @@ def cake_lm_head_det_train_support_logprob(
     to ``X`` and ``W`` (BF16, FP32 accumulation, one cast each); outputs and gradients are bitwise
     reproducible run to run.  ``X [T, H]`` BF16 row-major (``H`` a multiple of 256), ``W [V, H]`` BF16
     contiguous (``V`` a multiple of 256, at most 1572864).
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        Row-major BF16 ``[T, H]`` hidden states, with ``H`` a multiple of 256.
+    W : torch.Tensor
+        Contiguous BF16 ``[V, H]`` output weight, with ``V`` a multiple of 256.
+    support_ids : torch.Tensor
+        Packed int32 or int64 candidate ids ``[M]``, unique within each row.
+    support_offsets : torch.Tensor
+        int32 or int64 ``[T + 1]`` row offsets, first 0 and last ``M``.
+    labels : torch.Tensor, optional
+        int64 ``[T]`` selected candidate ids (``-100`` ignores a row); ``None`` returns all candidate log-probabilities.
+    k_cap : int
+        Maximum candidates per row; rows exceeding it are rejected, not trimmed.
+    temperature : float or torch.Tensor, optional
+        Positive finite scalar or FP32 ``[T]`` per-row temperature; default 1.0.
+    chunk_size : int, optional
+        Token chunk size for the dense pass and large-support weight gradient; default 4096.
+    check_inputs : bool, default=False
+        Synchronize validation and raise ``ValueError`` on invalid input; otherwise use a device assertion.
+    backend : str, default="cake"
+        Only ``"cake"`` is supported.
     """
     if backend != "cake":
         raise ValueError(
@@ -766,6 +821,31 @@ def cake_lm_head_det_train_support_kl(
     none.  Returns the FP32 ``kl [T]``, or ``(kl, logp)`` with the differentiable packed student
     ``logp [M]`` when ``return_logprobs=True``.  Weighting, reduction and any ``tau ** 2`` factor
     belong to the caller.  Other arguments as in :func:`cake_lm_head_det_train_support_logprob`.
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        Row-major BF16 ``[T, H]`` hidden states, with ``H`` a multiple of 256.
+    W : torch.Tensor
+        Contiguous BF16 ``[V, H]`` output weight, with ``V`` a multiple of 256.
+    support_ids : torch.Tensor
+        Packed int32 or int64 candidate ids ``[M]``, unique within each row.
+    support_offsets : torch.Tensor
+        int32 or int64 ``[T + 1]`` row offsets, first 0 and last ``M``.
+    teacher_logprobs : torch.Tensor
+        Detached FP32 ``[M]`` teacher log-probabilities aligned with ``support_ids``.
+    return_logprobs : bool, default=False
+        Also return the differentiable packed student log-probabilities.
+    k_cap : int
+        Maximum candidates per row; rows exceeding it are rejected, not trimmed.
+    temperature : float or torch.Tensor, optional
+        Positive finite scalar or FP32 ``[T]`` per-row temperature; default 1.0.
+    chunk_size : int, optional
+        Token chunk size for the dense pass and large-support weight gradient; default 4096.
+    check_inputs : bool, default=False
+        Synchronize validation and raise ``ValueError`` on invalid input; otherwise use a device assertion.
+    backend : str, default="cake"
+        Only ``"cake"`` is supported.
     """
     if backend != "cake":
         raise ValueError(

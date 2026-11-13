@@ -62,6 +62,50 @@ _KEY_FIELDS = (
 )
 
 
+def _batch_invariant_version(
+    dtype: str, batch_invariant: bool, version: Optional[int]
+) -> Optional[int]:
+    if not batch_invariant:
+        return None
+    if dtype != "bf16":
+        raise ValueError("batch_invariant knob-cache entries require dtype='bf16'.")
+    if version is None:
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+            BF16_BATCH_INVARIANT_VERSION,
+        )
+
+        return BF16_BATCH_INVARIANT_VERSION
+    return version
+
+
+def _arithmetic_fingerprint(
+    *,
+    batch_invariant: bool,
+    hidden: int,
+    intermediate: int,
+    topk: int,
+    num_experts: int,
+    apply_routing_weights_before_fc2: bool,
+    gate_up_clamp: Optional[float],
+) -> Optional[str]:
+    if not batch_invariant:
+        return None
+    from flashinfer.moe_ep.batch_invariant.spec import spec_fingerprint
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+        bf16_batch_invariant_arch,
+    )
+
+    return spec_fingerprint(
+        hidden,
+        intermediate,
+        topk,
+        num_experts,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        gate_up_clamp=gate_up_clamp,
+        arch=bf16_batch_invariant_arch(),
+    )
+
+
 def _cache_path() -> Optional[str]:
     raw = os.environ.get("FLASHINFER_MOE_EP_KNOB_CACHE", "")
     if raw.strip().lower() in ("0", "off", "none", "disable", "disabled"):
@@ -153,12 +197,27 @@ def _matching_entries(
     enable_in_kernel_fc2_reduce: bool = False,
     apply_routing_weights_before_fc2: bool = False,
     use_custom_finalize: bool = False,
+    batch_invariant: bool = False,
+    batch_invariant_version: Optional[int] = None,
+    gate_up_clamp: Optional[float] = None,
     device: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return the cached knob dict for this session key, or ``None`` on miss.
 
     ``enable_in_kernel_fc2_reduce`` indicates whether the user has opted in to in_kernel_fc2_reduce.
     """
+    policy_version = _batch_invariant_version(
+        dtype, batch_invariant, batch_invariant_version
+    )
+    arithmetic_fingerprint = _arithmetic_fingerprint(
+        batch_invariant=batch_invariant,
+        hidden=hidden,
+        intermediate=intermediate,
+        topk=topk,
+        num_experts=num_experts,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        gate_up_clamp=gate_up_clamp,
+    )
     path = _cache_path()
     if path is None:
         return []
@@ -179,6 +238,12 @@ def _matching_entries(
         and e.get("apply_routing_weights_before_fc2")
         == apply_routing_weights_before_fc2
         and e.get("use_custom_finalize", False) == use_custom_finalize
+        and e.get("batch_invariant", False) == batch_invariant
+        and (not batch_invariant or e.get("batch_invariant_version") == policy_version)
+        and (
+            not batch_invariant
+            or e.get("batch_invariant_fingerprint") == arithmetic_fingerprint
+        )
         and e.get("profile") in (None, "live_tokens")
         and isinstance(e.get("knobs"), dict)
         and isinstance(e.get("max_tokens"), int)
@@ -215,6 +280,9 @@ def lookup_knobs(
     enable_in_kernel_fc2_reduce: bool = False,
     apply_routing_weights_before_fc2: bool = False,
     use_custom_finalize: bool = False,
+    batch_invariant: bool = False,
+    batch_invariant_version: Optional[int] = None,
+    gate_up_clamp: Optional[float] = None,
     device: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     from flashinfer.moe_ep.core.tuning import select_token_entries
@@ -231,6 +299,9 @@ def lookup_knobs(
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         use_custom_finalize=use_custom_finalize,
+        batch_invariant=batch_invariant,
+        batch_invariant_version=batch_invariant_version,
+        gate_up_clamp=gate_up_clamp,
         device=device,
     )
     matches = select_token_entries(matches, max_tokens, live_tokens)
@@ -269,6 +340,9 @@ def record_knobs(
     combine_dtype: str = "bf16",
     apply_routing_weights_before_fc2: bool = False,
     use_custom_finalize: bool = False,
+    batch_invariant: bool = False,
+    batch_invariant_version: Optional[int] = None,
+    gate_up_clamp: Optional[float] = None,
     device: Optional[str] = None,
     p50_us: Optional[float] = None,
     source: str = "autotune",
@@ -277,7 +351,8 @@ def record_knobs(
 
     Deterministic and ikr-tuned winners for the same geometry are separate
     entries (see :func:`_entry_needs_ikr`); FC1 and post-FC2 routing-weight
-    placement and reduced/deferred output also have separate winners. A
+    placement and reduced/deferred output also have separate winners. BF16
+    batch-invariant entries additionally isolate the numerical policy version. A
     ``--allow-nondeterministic`` sweep does not evict the deterministic winner
     a reproducible session needs, or vice versa.
 
@@ -287,6 +362,18 @@ def record_knobs(
     the write failed (recording is best-effort — a read-only home directory
     must not break tuning).
     """
+    policy_version = _batch_invariant_version(
+        dtype, batch_invariant, batch_invariant_version
+    )
+    arithmetic_fingerprint = _arithmetic_fingerprint(
+        batch_invariant=batch_invariant,
+        hidden=hidden,
+        intermediate=intermediate,
+        topk=topk,
+        num_experts=num_experts,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        gate_up_clamp=gate_up_clamp,
+    )
     if live_tokens is None:
         live_tokens = max_tokens
     if type(live_tokens) is not int or not 0 <= live_tokens <= max_tokens:
@@ -312,6 +399,12 @@ def record_knobs(
         source=source,
         tuned_at=datetime.datetime.now().isoformat(timespec="seconds"),
     )
+    if dtype == "bf16":
+        entry.update(
+            batch_invariant=batch_invariant,
+            batch_invariant_version=policy_version,
+            batch_invariant_fingerprint=arithmetic_fingerprint,
+        )
     try:
         entries = _load_entries(path)
         entries = [
@@ -324,6 +417,15 @@ def record_knobs(
                 and e.get("apply_routing_weights_before_fc2")
                 == apply_routing_weights_before_fc2
                 and e.get("use_custom_finalize", False) == use_custom_finalize
+                and e.get("batch_invariant", False) == batch_invariant
+                and (
+                    not batch_invariant
+                    or e.get("batch_invariant_version") == policy_version
+                )
+                and (
+                    not batch_invariant
+                    or e.get("batch_invariant_fingerprint") == arithmetic_fingerprint
+                )
                 and e.get("profile") in (None, "live_tokens")
                 and _entry_needs_ikr(e) == _entry_needs_ikr(entry)
             )
@@ -373,6 +475,9 @@ def resolve_knobs(
     enable_in_kernel_fc2_reduce: bool = False,
     apply_routing_weights_before_fc2: bool = False,
     use_custom_finalize: bool = False,
+    batch_invariant: bool = False,
+    batch_invariant_version: Optional[int] = None,
+    gate_up_clamp: Optional[float] = None,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else built-in heuristic.
 
@@ -401,6 +506,9 @@ def resolve_knobs(
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         use_custom_finalize=use_custom_finalize,
+        batch_invariant=batch_invariant,
+        batch_invariant_version=batch_invariant_version,
+        gate_up_clamp=gate_up_clamp,
     )
     if cached is not None:
         return cached, "cache"

@@ -107,6 +107,13 @@ operations, as keywords).
   `gemm2_output` `[max_padded, hidden_size]` bf16 and `output`
   `[num_tokens, hidden_size]` bf16, allocated once in `prepare_stepfun_moe`
   (`max_padded = max_num_ctas * tile`, the trtllm-gen row capacity).
+* FC1 / FC2 grids follow the unit's `grid_rule`: `tiles`, one CTA (cluster)
+  per output tile, `(grid_m, max_num_ctas, split_k)`; `resident`, one resident
+  CTA (cluster of `c`) per SM (`c` SMs) taking the tiles in turn,
+  `(c * min(SM count // c, grid_m // c * max_num_ctas), 1, 1)`. A resident
+  unit that takes `work_counter` claims tiles from a zeroed `int32[2]` that it
+  leaves zeroed: the backend keeps one per program, stage and stream, zeroed
+  once at allocation (outside stream capture) and never reset per launch.
 * Launch attributes (cluster, cooperative, PDL) are baked into every binding;
   `enable_pdl` is a per-launch argument of the bindings. The cooperative
   routing grid is `SM count - reserved_sms` (`reserved_sms` keyword, default 8;

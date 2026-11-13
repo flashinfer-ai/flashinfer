@@ -290,6 +290,59 @@ __device__ __forceinline__ void scale_store_partial_chunk(const DType* in_ptr, Q
   }
 }
 
+// Limits of the vector path (rotary size, 16-byte alignment, in-place warp span); by_lane has none.
+inline bool RopeVectorPathIsWrong(bool interleave, uint32_t rope_dim, uint32_t vec_size) {
+  return (interleave ? rope_dim : rope_dim / 2) % vec_size != 0;
+}
+
+template <typename T>
+inline bool RopeVectorsAligned(const T* ptr, size_t stride_n, size_t stride_h) {
+  return reinterpret_cast<uintptr_t>(ptr) % 16 == 0 && (stride_n * sizeof(T)) % 16 == 0 &&
+         (stride_h * sizeof(T)) % 16 == 0;
+}
+
+// blockDim.x threads of up to vec_size / 2 pairs each cover the rope_dim / 2 pairs. Dealing the
+// pairs out one thread at a time keeps a warp's elements next to each other, so its loads coalesce.
+template <bool interleave, uint32_t vec_size, typename DType, typename QuantType>
+__device__ __forceinline__ void rope_cos_sin_by_lane(const DType* x, QuantType* out,
+                                                     const float* cos_sin, uint32_t rope_dim,
+                                                     float scale) {
+  const uint32_t half_rope_dim = rope_dim / 2;
+#pragma unroll
+  for (uint32_t i = 0; i < vec_size / 2; ++i) {
+    const uint32_t pair = threadIdx.x + i * blockDim.x;
+    if (pair < half_rope_dim) {
+      const uint32_t first = interleave ? 2 * pair : pair;
+      const uint32_t second = interleave ? first + 1 : first + half_rope_dim;
+      vec_t<float, 1> a, b;
+      a.cast_load(x + first);
+      b.cast_load(x + second);
+      const float cos = cos_sin[pair];
+      const float sin = cos_sin[half_rope_dim + pair];
+      vec_t<float, 1> a_rope, b_rope;
+      a_rope[0] = (a[0] * cos - b[0] * sin) * scale;
+      b_rope[0] = (b[0] * cos + a[0] * sin) * scale;
+      a_rope.cast_store(out + first);
+      b_rope.cast_store(out + second);
+    }
+  }
+}
+
+template <uint32_t vec_size, typename DType, typename QuantType>
+__device__ __forceinline__ void scale_store_by_lane(const DType* in_ptr, QuantType* out_ptr,
+                                                    uint32_t chunk_valid, float scale) {
+#pragma unroll
+  for (uint32_t i = 0; i < vec_size; ++i) {
+    const uint32_t elem_idx = threadIdx.x + i * blockDim.x;
+    if (elem_idx < chunk_valid) {
+      vec_t<float, 1> tmp;
+      tmp.cast_load(in_ptr + elem_idx);
+      tmp[0] = tmp[0] * scale;
+      tmp.cast_store(out_ptr + elem_idx);
+    }
+  }
+}
+
 template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
           typename IdType>
 __global__ void BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel(
@@ -468,8 +521,8 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
   }
 }
 
-template <bool interleave, uint32_t vec_size, uint32_t bdx, typename DType, typename IdType,
-          typename QuantType>
+template <bool interleave, bool by_lane, uint32_t vec_size, uint32_t bdx, typename DType,
+          typename IdType, typename QuantType>
 __global__ void RopeQuantizeKernel(
     DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, QuantType* q_rope_out,
     QuantType* k_rope_out, QuantType* q_nope_out, QuantType* k_nope_out,
@@ -510,16 +563,18 @@ __global__ void RopeQuantizeKernel(
     // 2. if not interleave
     //  - cos = cos_cache[pos_id][(tx * vec_size) % (rot_dim // 2)]
     //  - sin = sin_cache[pos_id][(rot_dim // 2) + (tx * vec_size) % (rot_dim // 2)]
-    if ((tx * vec_size < rope_dim) && (by < k_rope_end)) {
-      int sin_offset = rope_dim / 2;
-      int vec_idx;
-      if constexpr (interleave) {
-        vec_idx = (tx * vec_size) / 2;  // Force integer division
-      } else {
-        vec_idx = (tx * vec_size) % half_rope_dim;  // Use half_rotary_dim
+    if constexpr (!by_lane) {
+      if ((tx * vec_size < rope_dim) && (by < k_rope_end)) {
+        int sin_offset = rope_dim / 2;
+        int vec_idx;
+        if constexpr (interleave) {
+          vec_idx = (tx * vec_size) / 2;  // Force integer division
+        } else {
+          vec_idx = (tx * vec_size) % half_rope_dim;  // Use half_rotary_dim
+        }
+        cos.load(cos_sin_cache + (pos * rope_dim) + vec_idx);
+        sin.load(cos_sin_cache + (pos * rope_dim) + (sin_offset + vec_idx));
       }
-      cos.load(cos_sin_cache + (pos * rope_dim) + vec_idx);
-      sin.load(cos_sin_cache + (pos * rope_dim) + (sin_offset + vec_idx));
     }
 
     if (by < q_rope_end) {
@@ -535,18 +590,25 @@ __global__ void RopeQuantizeKernel(
           q_rope_out + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_rope_out_stride_n,
                                             q_rope_out_stride_h);
 
-      vec_t<float, vec_size> q_rope_vec;
-      if constexpr (interleave) {
-        q_rope_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(
-            q_rope_in_ptr, cos, sin, rope_dim);
-      } else {
-        q_rope_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_rope_in_ptr, cos, sin, rope_dim);
-      }
+      if constexpr (by_lane) {
+        rope_cos_sin_by_lane<interleave, vec_size>(q_rope_in_ptr, q_rope_out_ptr,
+                                                   cos_sin_cache + (pos * rope_dim), rope_dim,
+                                                   quant_scale_q);
+      } else if (tx * vec_size < rope_dim) {
+        vec_t<float, vec_size> q_rope_vec;
+        if constexpr (interleave) {
+          q_rope_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(
+              q_rope_in_ptr, cos, sin, rope_dim);
+        } else {
+          q_rope_vec =
+              vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_rope_in_ptr, cos, sin, rope_dim);
+        }
 #pragma unroll
-      for (uint32_t i = 0; i < vec_size; ++i) {
-        q_rope_vec[i] = q_rope_vec[i] * quant_scale_q;
+        for (uint32_t i = 0; i < vec_size; ++i) {
+          q_rope_vec[i] = q_rope_vec[i] * quant_scale_q;
+        }
+        q_rope_vec.cast_store(q_rope_out_ptr + tx * vec_size);
       }
-      q_rope_vec.cast_store(q_rope_out_ptr + tx * vec_size);
 
     } else if (by < k_rope_end) {
       // K RoPE processing: num_kv_heads * rope_chunks blocks
@@ -560,18 +622,25 @@ __global__ void RopeQuantizeKernel(
           k_rope_out + get_elem_offset_impl(idx, k_head_idx, elem_offset, k_rope_out_stride,
                                             k_rope_out_stride_h);
 
-      vec_t<float, vec_size> k_rope_vec;
-      if constexpr (interleave) {
-        k_rope_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(
-            k_rope_in_ptr, cos, sin, rope_dim);
-      } else {
-        k_rope_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_rope_in_ptr, cos, sin, rope_dim);
-      }
+      if constexpr (by_lane) {
+        rope_cos_sin_by_lane<interleave, vec_size>(k_rope_in_ptr, k_rope_out_ptr,
+                                                   cos_sin_cache + (pos * rope_dim), rope_dim,
+                                                   quant_scale_kv);
+      } else if (tx * vec_size < rope_dim) {
+        vec_t<float, vec_size> k_rope_vec;
+        if constexpr (interleave) {
+          k_rope_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(
+              k_rope_in_ptr, cos, sin, rope_dim);
+        } else {
+          k_rope_vec =
+              vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_rope_in_ptr, cos, sin, rope_dim);
+        }
 #pragma unroll
-      for (uint32_t i = 0; i < vec_size; ++i) {
-        k_rope_vec[i] = k_rope_vec[i] * quant_scale_kv;
+        for (uint32_t i = 0; i < vec_size; ++i) {
+          k_rope_vec[i] = k_rope_vec[i] * quant_scale_kv;
+        }
+        k_rope_vec.cast_store(k_rope_out_ptr + tx * vec_size);
       }
-      k_rope_vec.cast_store(k_rope_out_ptr + tx * vec_size);
 
     } else if (by < k_nope_end) {
       // K Non-RoPE processing: num_kv_heads * no_rope_chunks blocks
@@ -588,9 +657,13 @@ __global__ void RopeQuantizeKernel(
       uint32_t chunk_valid =
           (elem_offset < no_rope_dim) ? min(rope_chunk_size, no_rope_dim - elem_offset) : 0u;
       uint32_t lane_elem_offset = tx * vec_size;
-      // Handle tail chunks where no_rope_dim is not a multiple of rope_dim.
-      scale_store_partial_chunk<DType, QuantType, vec_size>(
-          k_nope_in_ptr, k_nope_out_ptr, lane_elem_offset, chunk_valid, quant_scale_kv);
+      if constexpr (by_lane) {
+        scale_store_by_lane<vec_size>(k_nope_in_ptr, k_nope_out_ptr, chunk_valid, quant_scale_kv);
+      } else {
+        // Handle tail chunks where no_rope_dim is not a multiple of rope_dim.
+        scale_store_partial_chunk<DType, QuantType, vec_size>(
+            k_nope_in_ptr, k_nope_out_ptr, lane_elem_offset, chunk_valid, quant_scale_kv);
+      }
 
     } else {
       // Q Non-RoPE processing: num_qo_heads * no_rope_chunks blocks
@@ -608,9 +681,13 @@ __global__ void RopeQuantizeKernel(
       uint32_t chunk_valid =
           (elem_offset < no_rope_dim) ? min(rope_chunk_size, no_rope_dim - elem_offset) : 0u;
       uint32_t lane_elem_offset = tx * vec_size;
-      // Handle tail chunks where no_rope_dim is not a multiple of rope_dim.
-      scale_store_partial_chunk<DType, QuantType, vec_size>(
-          q_nope_in_ptr, q_nope_out_ptr, lane_elem_offset, chunk_valid, quant_scale_q);
+      if constexpr (by_lane) {
+        scale_store_by_lane<vec_size>(q_nope_in_ptr, q_nope_out_ptr, chunk_valid, quant_scale_q);
+      } else {
+        // Handle tail chunks where no_rope_dim is not a multiple of rope_dim.
+        scale_store_partial_chunk<DType, QuantType, vec_size>(
+            q_nope_in_ptr, q_nope_out_ptr, lane_elem_offset, chunk_valid, quant_scale_q);
+      }
     }
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -892,8 +969,8 @@ __global__ void BatchQKApplyRotaryKernel(
  * Templated on CacheT to support both GQA/MHA (paged_kv_t) and MLA (paged_kv_mla_t).
  * Cache-only behaviors are selected with constexpr on the CacheT.
  */
-template <bool interleave, uint32_t vec_size, uint32_t bdx, typename DType, typename RoPEIdType,
-          typename PagedKVIdType, typename QuantType, typename CacheT>
+template <bool interleave, bool by_lane, uint32_t vec_size, uint32_t bdx, typename DType,
+          typename RoPEIdType, typename PagedKVIdType, typename QuantType, typename CacheT>
 __global__ void RopeQuantizeAppendPagedKVCacheKernel(
     DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, DType* v_in,
     QuantType* q_rope_out, QuantType* q_nope_out, CacheT paged_kv_like,
@@ -958,16 +1035,18 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
 
       const int half_rope_dim = rope_dim / 2;
       // Load cos/sin for RoPE processing blocks only
-      if ((tx * vec_size < rope_dim) && (by < k_rope_end)) {
-        int sin_offset = rope_dim / 2;
-        int vec_idx;
-        if constexpr (interleave) {
-          vec_idx = (tx * vec_size) / 2;  // Force integer division
-        } else {
-          vec_idx = (tx * vec_size) % half_rope_dim;
+      if constexpr (!by_lane) {
+        if ((tx * vec_size < rope_dim) && (by < k_rope_end)) {
+          int sin_offset = rope_dim / 2;
+          int vec_idx;
+          if constexpr (interleave) {
+            vec_idx = (tx * vec_size) / 2;  // Force integer division
+          } else {
+            vec_idx = (tx * vec_size) % half_rope_dim;
+          }
+          cos.load(cos_sin_cache + (pos * rope_dim) + vec_idx);
+          sin.load(cos_sin_cache + (pos * rope_dim) + (sin_offset + vec_idx));
         }
-        cos.load(cos_sin_cache + (pos * rope_dim) + vec_idx);
-        sin.load(cos_sin_cache + (pos * rope_dim) + (sin_offset + vec_idx));
       }
 
       if (by < q_rope_end) {
@@ -983,19 +1062,25 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
             q_rope_out + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_rope_out_stride_n,
                                               q_rope_out_stride_h);
 
-        vec_t<float, vec_size> q_rope_vec;
-        if constexpr (interleave) {
-          q_rope_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(
-              q_rope_in_ptr, cos, sin, rope_dim);
+        if constexpr (by_lane) {
+          rope_cos_sin_by_lane<interleave, vec_size>(q_rope_in_ptr, q_rope_out_ptr,
+                                                     cos_sin_cache + (pos * rope_dim), rope_dim,
+                                                     quant_scale_q);
         } else {
-          q_rope_vec =
-              vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_rope_in_ptr, cos, sin, rope_dim);
-        }
+          vec_t<float, vec_size> q_rope_vec;
+          if constexpr (interleave) {
+            q_rope_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(
+                q_rope_in_ptr, cos, sin, rope_dim);
+          } else {
+            q_rope_vec =
+                vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_rope_in_ptr, cos, sin, rope_dim);
+          }
 #pragma unroll
-        for (uint32_t i = 0; i < vec_size; ++i) {
-          q_rope_vec[i] = q_rope_vec[i] * quant_scale_q;
+          for (uint32_t i = 0; i < vec_size; ++i) {
+            q_rope_vec[i] = q_rope_vec[i] * quant_scale_q;
+          }
+          q_rope_vec.cast_store(q_rope_out_ptr + tx * vec_size);
         }
-        q_rope_vec.cast_store(q_rope_out_ptr + tx * vec_size);
 
       } else if (by < k_rope_end) {
         // ============ K RoPE processing & Cache Append ============
@@ -1013,27 +1098,38 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
                                                            k_rope_in_stride, k_rope_in_stride_h);
         }
 
-        vec_t<float, vec_size> k_rope_vec;
-        if constexpr (interleave) {
-          k_rope_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(
-              k_rope_in_ptr, cos, sin, rope_dim);
+        if constexpr (by_lane) {
+          QuantType* k_out_ptr;
+          if constexpr (IS_MLA) {
+            k_out_ptr = paged_kv_like.get_kpe_ptr(page_iter, entry_idx, elem_offset);
+          } else {
+            k_out_ptr = paged_kv_like.get_k_ptr(page_iter, k_head_idx, entry_idx, 0);
+          }
+          rope_cos_sin_by_lane<interleave, vec_size>(
+              k_rope_in_ptr, k_out_ptr, cos_sin_cache + (pos * rope_dim), rope_dim, quant_scale_kv);
         } else {
-          k_rope_vec =
-              vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_rope_in_ptr, cos, sin, rope_dim);
-        }
+          vec_t<float, vec_size> k_rope_vec;
+          if constexpr (interleave) {
+            k_rope_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(
+                k_rope_in_ptr, cos, sin, rope_dim);
+          } else {
+            k_rope_vec =
+                vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_rope_in_ptr, cos, sin, rope_dim);
+          }
 #pragma unroll
-        for (uint32_t i = 0; i < vec_size; ++i) {
-          k_rope_vec[i] = k_rope_vec[i] * quant_scale_kv;
-        }
+          for (uint32_t i = 0; i < vec_size; ++i) {
+            k_rope_vec[i] = k_rope_vec[i] * quant_scale_kv;
+          }
 
-        if constexpr (IS_MLA) {
-          QuantType* kpe_ptr =
-              paged_kv_like.get_kpe_ptr(page_iter, entry_idx, elem_offset + tx * vec_size);
-          k_rope_vec.cast_store(kpe_ptr);
-        } else {
-          QuantType* k_ptr =
-              paged_kv_like.get_k_ptr(page_iter, k_head_idx, entry_idx, tx * vec_size);
-          k_rope_vec.cast_store(k_ptr);
+          if constexpr (IS_MLA) {
+            QuantType* kpe_ptr =
+                paged_kv_like.get_kpe_ptr(page_iter, entry_idx, elem_offset + tx * vec_size);
+            k_rope_vec.cast_store(kpe_ptr);
+          } else {
+            QuantType* k_ptr =
+                paged_kv_like.get_k_ptr(page_iter, k_head_idx, entry_idx, tx * vec_size);
+            k_rope_vec.cast_store(k_ptr);
+          }
         }
 
       } else if (by < k_nope_end) {
@@ -1284,6 +1380,12 @@ cudaError_t RopeQuantize(
     size_t k_nope_in_stride_h, size_t k_rope_out_stride, size_t k_rope_out_stride_h,
     size_t k_nope_out_stride, size_t k_nope_out_stride_h, float quant_scale_q, float quant_scale_kv,
     bool interleave, bool enable_pdl = false, cudaStream_t stream = nullptr) {
+  if (rope_dim == 0 || rope_dim % 2 != 0) {
+    std::ostringstream err_msg;
+    err_msg << "rope_dim (" << rope_dim << ") must be positive and even";
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
   int dev_id = 0;
   int num_sms = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
@@ -1294,6 +1396,13 @@ cudaError_t RopeQuantize(
     constexpr uint32_t vec_size = 32 / sizeof(DType);
     uint32_t bdx = (rope_dim + vec_size - 1) / vec_size;
     bdx = std::max(1u, bdx);
+    const bool in_place = static_cast<const void*>(q_rope_in) == q_rope_out ||
+                          static_cast<const void*>(k_rope_in) == k_rope_out;
+    if (!INTERLEAVE && in_place && bdx < 32) {
+      while (32 % bdx != 0) {
+        ++bdx;  // The spare threads skip the rope.
+      }
+    }
     uint32_t num_threads = std::max(128U, bdx);
     uint32_t bdy = std::max(1u, num_threads / bdx);
     uint32_t nblks_x = (nnz + bdy - 1) / bdy;
@@ -1335,7 +1444,28 @@ cudaError_t RopeQuantize(
                     (void*)&k_nope_out_stride_h,
                     (void*)&quant_scale_q,
                     (void*)&quant_scale_kv};
-    auto kernel = RopeQuantizeKernel<INTERLEAVE, vec_size, 1, DType, IdType, QuantType>;
+    // Strides of size-1 dims are unused, and with no_rope_dim 0 no block touches the nope tensors.
+    auto q_aligned = [&](const auto* ptr, size_t stride_n, size_t stride_h) {
+      return RopeVectorsAligned(ptr, nnz > 1 ? stride_n : 0, num_qo_heads > 1 ? stride_h : 0);
+    };
+    auto k_aligned = [&](const auto* ptr, size_t stride_n, size_t stride_h) {
+      return RopeVectorsAligned(ptr, nnz > 1 ? stride_n : 0, num_kv_heads > 1 ? stride_h : 0);
+    };
+    const bool nope_aligned =
+        no_rope_dim == 0 || (q_aligned(q_nope_in, q_nope_in_stride_n, q_nope_in_stride_h) &&
+                             k_aligned(k_nope_in, k_nope_in_stride, k_nope_in_stride_h) &&
+                             q_aligned(q_nope_out, q_nope_out_stride_n, q_nope_out_stride_h) &&
+                             k_aligned(k_nope_out, k_nope_out_stride, k_nope_out_stride_h));
+    const bool by_lane = RopeVectorPathIsWrong(INTERLEAVE, rope_dim, vec_size) ||
+                         !q_aligned(q_rope_in, q_rope_in_stride_n, q_rope_in_stride_h) ||
+                         !k_aligned(k_rope_in, k_rope_in_stride, k_rope_in_stride_h) ||
+                         !q_aligned(q_rope_out, q_rope_out_stride_n, q_rope_out_stride_h) ||
+                         !k_aligned(k_rope_out, k_rope_out_stride, k_rope_out_stride_h) ||
+                         !nope_aligned || !RopeVectorsAligned(cos_sin_cache, 0, 0) ||
+                         (!INTERLEAVE && in_place && bdx > 32);
+    auto kernel =
+        by_lane ? RopeQuantizeKernel<INTERLEAVE, true, vec_size, 1, DType, IdType, QuantType>
+                : RopeQuantizeKernel<INTERLEAVE, false, vec_size, 1, DType, IdType, QuantType>;
     dim3 nblks(nblks_x, total_blocks_y);
     dim3 nthrs(bdx, bdy);
 
@@ -1406,9 +1536,15 @@ cudaError_t RopeQuantizeAppendPagedKVCache(
     config.attrs = attribute;
     config.numAttrs = 1;
 
-    auto kernel = RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, vec_size, /*bdx=*/1, DType,
-                                                       RoPEIdType, PagedKVIdType, QuantType,
-                                                       paged_kv_t<QuantType, PagedKVIdType>>;
+    auto kernel =
+        (RopeVectorPathIsWrong(INTERLEAVE, rope_dim, vec_size) ||
+         !RopeVectorsAligned(cos_sin_cache, 0, 0))
+            ? RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, true, vec_size, /*bdx=*/1, DType,
+                                                   RoPEIdType, PagedKVIdType, QuantType,
+                                                   paged_kv_t<QuantType, PagedKVIdType>>
+            : RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, false, vec_size, /*bdx=*/1, DType,
+                                                   RoPEIdType, PagedKVIdType, QuantType,
+                                                   paged_kv_t<QuantType, PagedKVIdType>>;
     RopeQuantizeAppendPagedKVCacheParams params;
     params.nnz = nnz;
     params.num_qo_heads = num_qo_heads;
@@ -1481,9 +1617,15 @@ cudaError_t RopeQuantizeAppendPagedMLACache(
     config.attrs = attribute;
     config.numAttrs = 1;
 
-    auto kernel = RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, vec_size, /*bdx=*/1, DType,
-                                                       RoPEIdType, PagedKVIdType, QuantType,
-                                                       paged_kv_mla_t<QuantType, PagedKVIdType>>;
+    auto kernel =
+        (RopeVectorPathIsWrong(INTERLEAVE, rope_dim, vec_size) ||
+         !RopeVectorsAligned(cos_sin_cache, 0, 0))
+            ? RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, true, vec_size, /*bdx=*/1, DType,
+                                                   RoPEIdType, PagedKVIdType, QuantType,
+                                                   paged_kv_mla_t<QuantType, PagedKVIdType>>
+            : RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, false, vec_size, /*bdx=*/1, DType,
+                                                   RoPEIdType, PagedKVIdType, QuantType,
+                                                   paged_kv_mla_t<QuantType, PagedKVIdType>>;
     DType* v_in_nullptr = nullptr;
     uint32_t num_kv_heads_1 = 1;
     size_t k_rope_in_stride_h_dup = k_rope_in_stride;
@@ -1540,9 +1682,22 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
     err_msg << "head_dim (" << head_dim << ") must be >= rotary_dim (" << rotary_dim << ")";
     FLASHINFER_ERROR(err_msg.str());
   }
+  if (rotary_dim % 2 != 0) {
+    std::ostringstream err_msg;
+    err_msg << "rotary_dim (" << rotary_dim << ") must be even";
+    FLASHINFER_ERROR(err_msg.str());
+  }
 
-  // We have better performance with this kernel with these head_dim instead of RopeQuantize
-  if (head_dim == 64 || head_dim == 128 || head_dim == 256 || head_dim == 512) {
+  // We have better performance with this kernel with these head_dim instead of RopeQuantize. Its
+  // vectors have the same limits on rotary_dim and on tensor alignment.
+  if ((head_dim == 64 || head_dim == 128 || head_dim == 256 || head_dim == 512) &&
+      !RopeVectorPathIsWrong(interleave, rotary_dim,
+                             std::max<uint32_t>(16 / sizeof(DType), head_dim / 32)) &&
+      RopeVectorsAligned(q, q_stride_n, q_stride_h) &&
+      RopeVectorsAligned(k, k_stride_n, k_stride_h) &&
+      RopeVectorsAligned(q_rope, q_rope_stride_n, q_rope_stride_h) &&
+      RopeVectorsAligned(k_rope, k_rope_stride_n, k_rope_stride_h) &&
+      RopeVectorsAligned(cos_sin_cache, 0, 0)) {
     bool two_heads = false;
     FLASHINFER_CUDA_CALL(RopeUseTwoHeadsPerStep(two_heads));
 
@@ -1641,6 +1796,12 @@ cudaError_t BatchQKApplyRotaryPosIds(
     size_t q_stride_n, size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
     size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h,
     bool interleave, float rope_scale, float rope_theta, cudaStream_t stream = nullptr) {
+  if (head_dim < rotary_dim) {
+    std::ostringstream err_msg;
+    err_msg << "head_dim (" << head_dim << ") must be >= rotary_dim (" << rotary_dim << ")";
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = 0.f;
@@ -1723,6 +1884,12 @@ cudaError_t BatchQKApplyRotary(DType* q, DType* k, DType* q_rope, DType* k_rope,
                                size_t k_rope_stride_n, size_t k_rope_stride_h, bool interleave,
                                float rope_scale, float rope_theta, cudaStream_t stream = nullptr,
                                uint32_t nnz = 0) {
+  if (head_dim < rotary_dim) {
+    std::ostringstream err_msg;
+    err_msg << "head_dim (" << head_dim << ") must be >= rotary_dim (" << rotary_dim << ")";
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = 0.f;
@@ -1801,6 +1968,12 @@ cudaError_t BatchQKApplyLlama31Rotary(
     size_t k_rope_stride_h, bool interleave, float rope_scale, float rope_theta,
     float low_freq_factor, float high_freq_factor, float old_context_length,
     cudaStream_t stream = nullptr, uint32_t nnz = 0) {
+  if (head_dim < rotary_dim) {
+    std::ostringstream err_msg;
+    err_msg << "head_dim (" << head_dim << ") must be >= rotary_dim (" << rotary_dim << ")";
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = old_context_length / (2 * M_PI * high_freq_factor - 2 * M_PI * low_freq_factor);
@@ -1863,6 +2036,12 @@ cudaError_t BatchQKApplyLlama31RotaryPosIds(
     size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h,
     bool interleave, float rope_scale, float rope_theta, float low_freq_factor,
     float high_freq_factor, float old_context_length, cudaStream_t stream = nullptr) {
+  if (head_dim < rotary_dim) {
+    std::ostringstream err_msg;
+    err_msg << "head_dim (" << head_dim << ") must be >= rotary_dim (" << rotary_dim << ")";
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = old_context_length / (2 * M_PI * high_freq_factor - 2 * M_PI * low_freq_factor);
