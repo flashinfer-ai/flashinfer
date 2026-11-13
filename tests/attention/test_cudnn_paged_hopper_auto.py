@@ -23,6 +23,17 @@ import flashinfer
 import flashinfer.prefill as fp
 
 
+@pytest.fixture(
+    params=[(layout, page) for layout in ("HND", "NHD") for page in (16, 32, 64, 128)]
+)
+def storage(request):
+    return request.param
+
+
+def cache_layout(kv, layout):
+    return kv if layout == "HND" else kv.transpose(2, 3).contiguous()
+
+
 def require_h100():
     if not torch.cuda.is_available():
         pytest.skip("requires H100")
@@ -37,11 +48,14 @@ def require_h100():
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("caller_table", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_hopper_paged_auto_retained_capture(dtype, first, return_lse, caller_table):
+def test_hopper_paged_auto_retained_capture(
+    storage, dtype, first, return_lse, caller_table
+):
     require_h100()
+    layout, page = storage
     shapes = [[64, 64, 64, 64], [65, 63, 64, 64]]
     start = 0 if first == "fa2" else 1
-    b, hq, hk, d, page, nk = 4, 32, 4, 256, 16, 4096
+    b, hq, hk, d, nk = 4, 32, 4, 256, 4096
     pageptr = torch.arange(b + 1, dtype=torch.int32) * (nk // page)
     indices = torch.arange(b * nk // page, dtype=torch.int32, device="cuda")
     table = indices.reshape(b, nk // page).clone()
@@ -50,7 +64,7 @@ def test_hopper_paged_auto_retained_capture(dtype, first, return_lse, caller_tab
     qptr = torch.tensor([0, *accumulate(shapes[start])], dtype=torch.int32)
     w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         torch.empty(256 << 20, device="cuda", dtype=torch.uint8),
-        "HND",
+        layout,
         backend="auto",
         use_cuda_graph=True,
         qo_indptr_buf=qptr.cuda(),
@@ -60,12 +74,14 @@ def test_hopper_paged_auto_retained_capture(dtype, first, return_lse, caller_tab
     )
     q = torch.zeros(256, hq, d, dtype=dtype, device="cuda")
     kv = torch.zeros(b * nk // page, 2, hk, page, d, dtype=q.dtype, device=q.device)
+    kv = cache_layout(kv, layout)
     k, v = kv[:, 0], kv[:, 1]
+    v_hnd = v if layout == "HND" else v.transpose(1, 2)
     positions = torch.arange(nk, device=q.device).repeat(b).reshape(-1, page)
     source_weights = torch.arange(1, b + 1, device=q.device).repeat_interleave(
         nk // page
     )
-    v.copy_(
+    v_hnd.copy_(
         (positions >= nk - 64)[:, None, :, None]
         * (128 * source_weights[:, None, None, None])
     )
@@ -150,7 +166,7 @@ def test_hopper_paged_auto_retained_capture(dtype, first, return_lse, caller_tab
         # Both directions preserve total Q but move the causal boundary.
         for phase, index in enumerate([1 - start, start]):
             multiplier = phase + 2
-            v.copy_(
+            v_hnd.copy_(
                 (positions >= nk - 64)[:, None, :, None]
                 * (128 * multiplier * source_weights[:, None, None, None])
             )
@@ -181,17 +197,21 @@ def test_hopper_paged_auto_retained_capture(dtype, first, return_lse, caller_tab
 @pytest.mark.parametrize("nq", [64, 65, 129])
 @pytest.mark.parametrize("nk", [512, 16384])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_hopper_paged_auto_runtime_scales(dtype, nq, nk):
+def test_hopper_paged_auto_runtime_scales(storage, dtype, nq, nk):
     require_h100()
+    layout, page = storage
     torch.manual_seed(83)
-    hq, hk, d, page = 16, 4, 256, 16
+    hq, hk, d = 16, 4, 256
     q = torch.randn(nq, hq, d, device="cuda", dtype=dtype)
     kv = torch.randn(nk // page, 2, hk, page, d, device=q.device, dtype=q.dtype)
+    kv = cache_layout(kv, layout)
     k, v = kv[:, 0], kv[:, 1]
+    k_hnd = k if layout == "HND" else k.transpose(1, 2)
+    v_hnd = v if layout == "HND" else v.transpose(1, 2)
     ix = torch.randperm(nk // page, device=q.device, dtype=torch.int32)
     w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         torch.empty(128 << 20, device=q.device, dtype=torch.uint8),
-        "HND",
+        layout,
         backend="auto",
     )
     w.plan(
@@ -208,14 +228,14 @@ def test_hopper_paged_auto_runtime_scales(dtype, nq, nk):
     )
     assert w._backend == ("fa2" if nq <= 64 else "cudnn" if nk == 16384 else "fa3")
     keys = (
-        k[ix.long()]
+        k_hnd[ix.long()]
         .permute(0, 2, 1, 3)
         .reshape(nk, hk, d)
         .double()
         .repeat_interleave(hq // hk, 1)
     )
     values = (
-        v[ix.long()]
+        v_hnd[ix.long()]
         .permute(0, 2, 1, 3)
         .reshape(nk, hk, d)
         .double()
@@ -251,16 +271,17 @@ def test_hopper_paged_auto_runtime_scales(dtype, nq, nk):
 @pytest.mark.parametrize("first", ["fa3", "cudnn", "cudnn_grow"])
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_hopper_work_boundary_preserves_captures(dtype, first, return_lse):
+def test_hopper_work_boundary_preserves_captures(storage, dtype, first, return_lse):
     require_h100()
-    nq, hq, hk, d, page, capacity = 65, 32, 8, 256, 16, 8192
-    lengths = [8064, 8192]
+    layout, page = storage
+    nq, hq, hk, d, capacity = 65, 32, 8, 256, 8192
+    lengths = [8065, 8192]
     start = int(first != "fa3")
     qptr = torch.tensor([0, nq], dtype=torch.int32)
     indices = torch.arange(capacity // page, dtype=torch.int32, device="cuda")
     w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         torch.empty(128 << 20, dtype=torch.uint8, device="cuda"),
-        "HND",
+        layout,
         backend="auto",
         use_cuda_graph=True,
         qo_indptr_buf=qptr.cuda(),
@@ -274,17 +295,20 @@ def test_hopper_work_boundary_preserves_captures(dtype, first, return_lse):
     )
     q = torch.zeros(nq, hq, d, dtype=dtype, device="cuda")
     kv = torch.zeros(capacity // page, 2, hk, page, d, dtype=q.dtype, device=q.device)
+    kv = cache_layout(kv, layout)
     k, v = kv[:, 0], kv[:, 1]
+    v_hnd = v if layout == "HND" else v.transpose(1, 2)
     positions = torch.arange(capacity, device=q.device).reshape(-1, page)
     out = torch.empty_like(q)
     lse = torch.empty(nq, hq, dtype=torch.float32, device=q.device)
 
     def plan(nk):
+        num_pages = (nk + page - 1) // page
         w.plan(
             qptr,
-            torch.tensor([0, nk // page], dtype=torch.int32),
-            indices[: nk // page],
-            torch.tensor([page], dtype=torch.int32),
+            torch.tensor([0, num_pages], dtype=torch.int32),
+            indices[:num_pages],
+            torch.tensor([(nk - 1) % page + 1], dtype=torch.int32),
             hq,
             hk,
             d,
@@ -324,10 +348,10 @@ def test_hopper_work_boundary_preserves_captures(dtype, first, return_lse):
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream):
-        v.copy_((positions >= 8000)[:, None, :, None] * 8)
+        v_hnd.copy_((positions >= 8000)[:, None, :, None] * 8)
         if first == "cudnn_grow":
-            # Both plans select cuDNN. The first uses 507 of 512 reserved
-            # indices and must not prevent the later plan from using them all.
+            # Both plans select cuDNN. A partially filled final page must not
+            # prevent the later plan from using every reserved page and token.
             plan(8112)
             assert w._backend == "cudnn" and w._cudnn_paged_bounds is None
             table_ptr = w._cudnn_block_tables.data_ptr()
@@ -345,7 +369,7 @@ def test_hopper_work_boundary_preserves_captures(dtype, first, return_lse):
             run()
         for phase, nk in enumerate([lengths[1 - start], lengths[start]]):
             scale = 16 * (phase + 1)
-            v.copy_((positions >= 8000)[:, None, :, None] * scale)
+            v_hnd.copy_((positions >= 8000)[:, None, :, None] * scale)
             plan(nk)
             assert w._backend == "fa3"
             out.fill_(float("nan"))
