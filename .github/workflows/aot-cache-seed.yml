@@ -1,0 +1,174 @@
+# Seeds the PR AOT lanes' sccache S3 cache after merges to main.
+#
+# Pull requests from forks build the AOT lanes read-only: they get no AWS
+# credentials, so they cannot write the cache. Before this workflow, only the
+# scheduled PR Test runs on main (three a day, often hours late) and pull
+# requests from branches in this repository wrote it. After a merge that changes
+# a widely included header, every fork pull request paid a cold build (about
+# 1.75 h on x64, 2-3.5 h on arm64, instead of 13-19 min) until one of those
+# writers happened to run.
+#
+# This runs the same AOT build as the PR lane on main, with write access, right
+# after each merge that can change compile inputs. sccache uploads every object
+# as soon as it is compiled, so a seed that is still running already speeds up
+# the pull requests started after it. The concurrency group never cancels: one
+# seed runs, and only the newest pending one waits. A seed after a broad header
+# change can therefore delay the next one, but none of its work is thrown away,
+# unlike the per-merge PR Test runs #6968 removed (90% were cancelled).
+#
+# A seed builds and imports the provider wheels but tests nothing else, and a
+# failure opens no issue: the scheduled PR Test run on main reports build
+# breakage. It skips the provider spec lint, which the merged code already passed
+# on its pull request.
+name: AOT Cache Seed
+
+on:
+  push:
+    branches: [main]
+    # Anything that can change an AOT compile command, a compiled source or
+    # the build image. A false positive costs one warm run (13-19 min per lane).
+    paths:
+      - 'include/**'
+      - 'csrc/**'
+      - '3rdparty/**'
+      - '**/*.cu'
+      - '**/*.cuh'
+      - '**/*.h'
+      - '**/*.hpp'
+      - '**/*.cpp'
+      - '**/*.cc'
+      - '**/*.inc'
+      - '**/*.jinja'
+      - 'flashinfer/aot.py'
+      - 'flashinfer/compilation_context.py'
+      - 'flashinfer/jit/**'
+      - 'flashinfer/**/*jit*.py'
+      - 'flashinfer-jit-cache/**'
+      - 'ci/docker-tags.yml'
+      - 'ci/cuda-versions.json'
+      - 'scripts/jit_cache_build_common.sh'
+      - 'scripts/task_test_jit_cache_package_build_import.sh'
+      - '.github/workflows/aot-cache-seed.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: aot-cache-seed
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    name: Setup
+    # Forks have no cache credentials; a seed there would only build read-only.
+    if: github.repository == 'flashinfer-ai/flashinfer'
+    runs-on: ubuntu-latest
+    outputs:
+      docker_tag: ${{ steps.get-tag.outputs.tag }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Get Docker Tag
+        id: get-tag
+        run: |
+          TAG=$(grep 'flashinfer/flashinfer-ci-cu129:' ci/docker-tags.yml | cut -d':' -f2 | tr -d ' ')
+          if [ -z "$TAG" ]; then
+            echo "::error::Failed to extract Docker tag from ci/docker-tags.yml"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # Same lanes as the PR AOT matrix in pr-test.yml, so the seed writes the
+      # key prefixes those lanes read.
+      - name: Build seed matrix
+        id: matrix
+        run: |
+          MATRIX=$(
+            for arch in x64 arm64; do
+              for cuda in $(jq -r '.runtime[].label' ci/cuda-versions.json); do
+                if ! grep -q "^flashinfer/flashinfer-ci-${cuda}:" ci/docker-tags.yml; then
+                  echo "::notice title=AOT image not published::Skipping ${cuda}" >&2
+                  continue
+                fi
+                jq -nc --arg arch "$arch" --arg cuda "$cuda" \
+                  '{name: "AOT Cache Seed (\($arch), \($cuda))", arch: $arch, cuda: $cuda}'
+              done
+            done | jq -sc '{include: .}'
+          )
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "${MATRIX}" | jq .
+
+  seed:
+    name: ${{ matrix.name }}
+    needs: setup
+    runs-on: [self-hosted, linux, "${{ matrix.arch }}", cpu, on-demand]
+    timeout-minutes: 360
+    strategy:
+      # Lanes seed independent key prefixes; one failing must not stop the rest.
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    env:
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
+    steps:
+      - name: Cleanup
+        run: |
+          docker stop $(docker ps -q) 2>/dev/null || true
+          docker rm $(docker ps -aq) 2>/dev/null || true
+          sudo rm -rf ${{ github.workspace }}/* || true
+          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
+          rm -rf ~/.cache/flashinfer_jit || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
+
+      - uses: actions/checkout@v5
+        with:
+          # Self-hosted runners keep the workspace between jobs, so the token
+          # must not be left behind in .git/config.
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Seed AOT sccache
+        env:
+          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
+          SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
+          AOT_PROVIDER_CONCURRENCY: ${{ vars.AOT_PROVIDER_CONCURRENCY || '2' }}
+        run: |
+          if [ -z "${AWS_ACCESS_KEY_ID}" ] || [ -z "${AWS_SECRET_ACCESS_KEY}" ]; then
+            echo "::error::sccache credentials are missing; a read-only build would seed nothing"
+            exit 1
+          fi
+          mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
+          bash ci/bash.sh "${DOCKER_IMAGE}" \
+            -e SCCACHE_BUCKET "${SCCACHE_BUCKET}" \
+            -e SCCACHE_REGION "${SCCACHE_REGION}" \
+            -e AWS_ACCESS_KEY_ID \
+            -e AWS_SECRET_ACCESS_KEY \
+            -e SCCACHE_STATS_DIR /workspace/sccache-stats \
+            -e AOT_PROVIDER_CONCURRENCY "${AOT_PROVIDER_CONCURRENCY}" \
+            -e AOT_SKIP_SPEC_LINT 1 \
+            --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh
+
+      - name: Display sccache stats
+        if: always()
+        run: |
+          STATS_FILE="${GITHUB_WORKSPACE}/sccache-stats/sccache-stats.txt"
+          if [ -s "${STATS_FILE}" ]; then
+            cat "${STATS_FILE}"
+          else
+            echo "::warning::sccache stats were not produced"
+          fi
+
+      - name: Upload sccache stats
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sccache-stats-seed-${{ matrix.cuda }}-${{ matrix.arch }}
+          path: sccache-stats/
+          if-no-files-found: warn
+          retention-days: 14

@@ -193,12 +193,19 @@ echo "✓ Flashinfer package installed successfully"
 # verify_jit_cache_provider_architectures.py below); this finds them from the
 # generated specs alone, in minutes instead of after hours of compiling. One process
 # per provider: the target list is fixed when flashinfer is first imported.
-echo ""
-echo "========================================"
-echo "Linting provider spec CUDA targets"
-echo "========================================"
-: "${AOT_SPEC_LINT_CONCURRENCY:=3}"
-run_provider_spec_lint "${AOT_SPEC_LINT_CONCURRENCY}" "${PROVIDER_ARCHITECTURE_LIST[@]}" || exit 1
+# The post-merge cache seed (aot-cache-seed.yml) sets AOT_SKIP_SPEC_LINT=1: its
+# job is to fill the cache for code that already passed the lint on its PR, and a
+# lint failure would leave the cache cold until the next merge.
+if [ "${AOT_SKIP_SPEC_LINT:-0}" = "1" ]; then
+    echo "Skipping the provider spec lint (AOT_SKIP_SPEC_LINT=1)"
+else
+    echo ""
+    echo "========================================"
+    echo "Linting provider spec CUDA targets"
+    echo "========================================"
+    : "${AOT_SPEC_LINT_CONCURRENCY:=3}"
+    run_provider_spec_lint "${AOT_SPEC_LINT_CONCURRENCY}" "${PROVIDER_ARCHITECTURE_LIST[@]}" || exit 1
+fi
 
 # Set up sccache for compiler caching with S3 backend.
 # Uses read-write mode when AWS credentials are available (nightly/release builds),
