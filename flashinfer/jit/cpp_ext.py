@@ -108,6 +108,9 @@ def get_cuda_include_overlay(cuda_home: str) -> Optional[Path]:
         return None
 
     source_header = Path(cuda_home) / "include" / "cuda.h"
+    if not source_header.is_file():
+        # A CUDA home without headers (a placeholder path in unit tests): no overlay.
+        return None
     content = source_header.read_bytes()
     struct_start = content.find(b"typedef struct CUtensorMap_st {")
     struct_end = content.find(b"} CUtensorMap;", struct_start)
