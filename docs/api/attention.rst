@@ -260,7 +260,7 @@ PageAttention for MLA
 
 .. note::
 
-    Experimental ``SparseMLASm120Wrapper.run_mega`` for FP8 caches with ``backend="sparse"``
+    Experimental ``SparseMLASm120Wrapper.run_mega`` with ``backend="sparse"``
     fuses query RoPE, sparse attention, inverse output RoPE, and per-32-value
     FP8 E4M3 output quantization. Inputs are BF16 ``q[T,H,512]``, int32
     ``positions[T]``, and FP32 ``cos_sin[num_positions,64]``. Output buffers

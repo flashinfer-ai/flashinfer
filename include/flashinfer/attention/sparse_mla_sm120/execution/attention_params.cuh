@@ -63,6 +63,7 @@ struct Dsv4Nvfp4AttentionParams {
   int page_size;
   size_t page_stride_bytes;
   float lse_scale = 1.f;
+  SparseMlaMegaParams mega{};
 };
 
 }  // namespace flashinfer::sparse_mla_sm120::nvfp4

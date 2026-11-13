@@ -519,7 +519,12 @@ def wrapper_run(
     result_lse = out_lse[:t, :h] if out_lse is not None else current.lse
     if mega is not None:
         module = get_sparse_mla_sm120_module()
-        module.execute_attention_rope_fp8(
+        execute = (
+            module.dsv4_nvfp4_execute_attention_rope_fp8
+            if is_dsv4_nvfp4
+            else module.execute_attention_rope_fp8
+        )
+        execute(
             current.plan,
             q,
             cache,

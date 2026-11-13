@@ -484,7 +484,7 @@ def test_nvfp4_precision_cross_bucket_graphs(extra_pbs, tmp_path):
         kernels = [line for line in topology.splitlines() if "sparse_mla_" in line]
         if selected.inspect()["implementation"] == "dsv4_nvfp4_prefill":
             assert len(kernels) == 1
-            assert "sparse_mla_streaming_dsv4_nvfp4_kernel" in kernels[0]
+            assert "sparse_mla_prefill_dsv4_nvfp4_kernel" in kernels[0]
             assert "merge" not in topology
         else:
             assert selected.inspect()["implementation"] in (
