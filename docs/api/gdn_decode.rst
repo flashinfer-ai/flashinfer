@@ -16,6 +16,7 @@ recurrent gated delta-rule update for the current decode step.
     gated_delta_rule_decode_pretranspose
     gated_delta_rule_mtp
     gated_delta_rule_replayssm_commit
+    gated_delta_rule_replayssm_prefer_u
 
 Rubin T=1 bf16-state decode (SM107)
 -----------------------------------
@@ -61,26 +62,36 @@ state update is retained between rounds. Use identical Q/K normalization
 settings for verify and commit.
 
 Verify has a TF32 tensor-core specialization on each architecture. Both
-require T=4..8, B=1..256, BF16 output, int32 indices, contiguous FP32
+require T=4..16, B=1..256, BF16 output, int32 indices, contiguous FP32
 checkpoints and normalized Q/K; other supported inputs use the FP32 MTP
 fallback. TF32 contraction changes numerical reduction precision, so outputs
 need not be bitwise equal to the fallback. See the API docstrings for shape,
 index uniqueness, padding and optional tracked-checkpoint contracts.
 
-- SM100/SM103: the tcgen05 specialization uses TMA and tcgen05 MMA, and also
-  requires an even value-head/key-head ratio.
+- SM100/SM103: the tcgen05 specialization uses TMA and tcgen05 MMA. A CTA
+  shares Q/K between two value heads of one key head.
 - SM120 has no tcgen05. Its specialization uses warp-level ``mma.sync`` TF32
   MMA and splits each head's value rows across several CTAs. It is selected
   when ``B * HV <= 128`` or T>=7, where it is generally faster than the FP32
   fallback; larger batches at T<=6 keep the fallback.
 
 Commit defaults to ``backend="auto"``. On SM100/SM103, with normalized K and
-no tracking, T=8 uses tcgen05; T=6/7 uses tcgen05 when B>1 and
+no tracking, T=8..16 uses tcgen05; T=6/7 uses tcgen05 when B>1 and
 ``layers * B * HV >= 256``. Other cases, including every tracked commit, use
-SIMT. Explicit ``backend="tcgen05"`` supports T=4..8 and, with tracking, writes
+SIMT. Explicit ``backend="tcgen05"`` supports T=4..16 and, with tracking, writes
 the FP32 snapshots in a SIMT pass before the TF32 fold. The heuristic uses
 tensor metadata, not device-resident accepted lengths; short accepted prefixes
 may favor ``backend="simt"``. SIMT also retains FP32 contractions when
 checkpoint accuracy is preferred over tensor-core throughput. On SM120, commit
 always uses the FP32 SIMT kernel: ``auto`` resolves to ``simt`` and explicit
 ``backend="tcgen05"`` is rejected.
+
+u mode (SM100/SM103, T<=32): pass an FP32 ``replayssm_u`` window instead of
+the raw V and beta windows. Verify then stores the delta-rule corrections
+``u_t = beta_t (v_t - (g_t h_{t-1})^T k_t)`` computed from the frozen
+checkpoint, and the commit (``u_cache``) applies the accepted prefix as one
+decay plus a rank-``a`` update instead of a recurrence. Every SM100 verify
+path (tcgen05 and the FP32 fallback) produces ``u``.
+``gated_delta_rule_replayssm_prefer_u`` returns whether u mode should be used
+for a window length and device: on SM100/SM103 for windows of 3..32 tokens,
+and never on other architectures.

@@ -95,6 +95,7 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
     replayssm_rawk: cute.Tensor,
     replayssm_g: cute.Tensor,
     replayssm_beta: cute.Tensor,
+    replayssm_u: cute.Tensor,
     state_smem_layout: cute.ComposedLayout,
     operand_smem_layout: cute.ComposedLayout,
     scale: cutlass.Constexpr[float],
@@ -104,16 +105,29 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
     HV: cutlass.Constexpr[int],
     HEADS_PER_CTA: cutlass.Constexpr[int],
     HAS_PATHS: cutlass.Constexpr[bool],
+    WRITE_U: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     lane = tidx % 32
     block, _, _ = cute.arch.block_idx()
-    head_group = block % (HV // HEADS_PER_CTA)
-    i_n = block // (HV // HEADS_PER_CTA)
-    i_hv0 = head_group * HEADS_PER_CTA
+    # CTAs never span key heads: each key head's value heads are split into
+    # groups of HEADS_PER_CTA; with an odd HV/H the last group has one head.
+    group_size = HV // H
+    groups = (group_size + HEADS_PER_CTA - 1) // HEADS_PER_CTA
+    head_group = block % (H * groups)
+    i_n = block // (H * groups)
+    i_h = head_group // groups
+    i_hv0 = i_h * group_size + (head_group % groups) * HEADS_PER_CTA
     i_hv1 = i_hv0 + 1
-    i_h = i_hv0 // (HV // H)
+    partial_pairs = HEADS_PER_CTA == 2 and group_size % 2 == 1
+    has_pair = HEADS_PER_CTA == 2
+    live_heads = HEADS_PER_CTA
+    if cutlass.const_expr(partial_pairs):
+        has_pair = i_hv1 < (i_h + 1) * group_size
+        live_heads = cutlass.Int32(1)
+        if has_pair:
+            live_heads = cutlass.Int32(2)
     cache_idx = state_indices[i_n]
     valid = cache_idx >= 0
     safe_cache_idx = cache_idx
@@ -121,7 +135,7 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
         safe_cache_idx = 0
     state_flat0 = safe_cache_idx * HV + i_hv0
     state_flat1 = state_flat0
-    if cutlass.const_expr(HEADS_PER_CTA == 2):
+    if has_pair:
         state_flat1 = safe_cache_idx * HV + i_hv1
 
     smem = utils.SmemAllocator()
@@ -141,31 +155,38 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
     s_operand_logical = _semantic_mn(s_operand)
     s_values = smem.allocate_tensor(
         cutlass.BFloat16,
-        cute.make_layout((2, 8, _M), stride=(8 * _M, _M, 1)),
+        cute.make_layout((2, T, _M), stride=(T * _M, _M, 1)),
         16,
     )
     s_rawk = smem.allocate_tensor(
-        cutlass.BFloat16, cute.make_layout((8, 128), stride=(128, 1)), 16
+        cutlass.BFloat16, cute.make_layout((T, 128), stride=(128, 1)), 16
     )
-    s_decay = smem.allocate_tensor(_ACC, cute.make_layout((2, 8), stride=(8, 1)), 16)
+    s_decay = smem.allocate_tensor(_ACC, cute.make_layout((2, T), stride=(T, 1)), 16)
     s_log_decay = smem.allocate_tensor(
-        _ACC, cute.make_layout((2, 8), stride=(8, 1)), 16
+        _ACC, cute.make_layout((2, T), stride=(T, 1)), 16
     )
-    s_beta = smem.allocate_tensor(_ACC, cute.make_layout((2, 8), stride=(8, 1)), 16)
-    s_gram = smem.allocate_tensor(_ACC, cute.make_layout((16, 16), stride=(16, 1)), 16)
-    s_log_path = smem.allocate_tensor(_ACC, cute.make_layout((2, 8), stride=(8, 1)), 16)
+    s_beta = smem.allocate_tensor(_ACC, cute.make_layout((2, T), stride=(T, 1)), 16)
+    # Row j holds <k_j, x> for every operand column x (all K, then all Q).
+    s_gram = smem.allocate_tensor(_ACC, cute.make_layout((16, N), stride=(N, 1)), 16)
+    # Tree-verify tables; one element placeholders on the chain path.
+    TP = T if HAS_PATHS else 1
+    s_log_path = smem.allocate_tensor(
+        _ACC, cute.make_layout((2, TP), stride=(TP, 1)), 16
+    )
     s_path_decay = smem.allocate_tensor(
-        _ACC, cute.make_layout((2, 8), stride=(8, 1)), 16
+        _ACC, cute.make_layout((2, TP), stride=(TP, 1)), 16
     )
-    s_anc = smem.allocate_tensor(cutlass.Int32, cute.make_layout((8,)), 16)
-    s_w = smem.allocate_tensor(_ACC, cute.make_layout((2, 8, 8), stride=(64, 8, 1)), 16)
+    s_anc = smem.allocate_tensor(cutlass.Int32, cute.make_layout((TP,)), 16)
+    s_w = smem.allocate_tensor(
+        _ACC, cute.make_layout((2, TP, TP), stride=(TP * TP, TP, 1)), 16
+    )
 
     tmem_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=_THREADS)
     tmem = utils.TmemAllocator(
         storage.tmem_holding.ptr, barrier_for_retrieve=tmem_barrier
     )
-    # Two M128xN16 accumulators exactly fill the minimum 32-column allocation.
-    tmem.allocate(32)
+    # One M128xN accumulator per head; 32 columns is the minimum allocation.
+    tmem.allocate(max(32, 2 * N))
 
     if warp == 0:
         cpasync.prefetch_descriptor(tma_atom_state)
@@ -218,12 +239,16 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
     t_ct_acc0 = cute.make_tensor(tmem_ptr, t_ct_acc_fake.layout)
     t_ct_acc1 = cute.make_tensor(tmem_ptr + N, t_ct_acc_fake.layout)
 
-    # Load one padded operand tile per V row (x8 for T=4, x16 for T=5..8).
+    # Load one padded operand tile per V row (N columns, see _n_tile).
     if cutlass.const_expr(N == 8):
         tmem_atom = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x8), _ACC)
-    else:
+    elif cutlass.const_expr(N == 16):
         tmem_atom = cute.make_copy_atom(
             tcgen05.Ld32x32bOp(tcgen05.Repetition.x16), _ACC
+        )
+    else:
+        tmem_atom = cute.make_copy_atom(
+            tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), _ACC
         )
     tmem_copy = tcgen05.make_tmem_copy(tmem_atom, t_ct_acc0)
     epilogue_head = tidx // 128
@@ -253,77 +278,82 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
             )
 
     # Zero unused MMA columns for partial tiles without reading padded tokens.
-    if cutlass.const_expr(4 < T < 8):
+    if cutlass.const_expr(2 * T < N):
         if tidx < _M:
             for column in cutlass.range_constexpr(2 * T, N):
                 s_operand_logical[(column, tidx % _K_TILE, tidx // _K_TILE)] = 0.0
 
-    # Phase 1: one of the eight warps owns each timestep.  Q/K are shared by
-    # both adjacent HV heads; V and gate metadata remain head-specific.
+    # Phase 1: warp w owns timesteps w, w + 8, ...  Q/K are shared by both
+    # adjacent HV heads; V and gate metadata remain head-specific.
     q_reg_bf16 = cute.make_rmem_tensor(cute.make_layout((4,)), cutlass.BFloat16)
     k_reg_bf16 = cute.make_rmem_tensor(cute.make_layout((4,)), cutlass.BFloat16)
     q_reg = cute.make_rmem_tensor(cute.make_layout((4,)), _ACC)
     k_reg = cute.make_rmem_tensor(cute.make_layout((4,)), _ACC)
-    i_t = warp
-    if i_t < T:
-        q_tile = cute.local_tile(q, (1, 1, 1, 4), (i_n, i_t, i_h, lane))
-        k_tile = cute.local_tile(k, (1, 1, 1, 4), (i_n, i_t, i_h, lane))
-        cute.autovec_copy(q_tile[(0, 0, 0, None)], q_reg_bf16)
-        cute.autovec_copy(k_tile[(0, 0, 0, None)], k_reg_bf16)
-        sum_q = cutlass.Float32(0.0)
-        sum_k = cutlass.Float32(0.0)
-        for elem in cutlass.range_constexpr(4):
-            q_reg[elem] = cutlass.Float32(q_reg_bf16[elem])
-            k_reg[elem] = cutlass.Float32(k_reg_bf16[elem])
-            sum_q = sum_q + q_reg[elem] * q_reg[elem]
-            sum_k = sum_k + k_reg[elem] * k_reg[elem]
-        for offset in [16, 8, 4, 2, 1]:
-            sum_q = sum_q + cute.arch.shuffle_sync_bfly(
-                sum_q, offset=offset, mask=-1, mask_and_clamp=31
-            )
-            sum_k = sum_k + cute.arch.shuffle_sync_bfly(
-                sum_k, offset=offset, mask=-1, mask_and_clamp=31
-            )
-        q_norm = cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
-        k_norm = cute.rsqrt(sum_k + 1e-6, fastmath=True)
-        for elem in cutlass.range_constexpr(4):
-            k_global = lane * 4 + elem
-            stage = k_global // _K_TILE
-            k_local = k_global % _K_TILE
-            s_operand_logical[(i_t, k_local, stage)] = k_reg[elem] * k_norm
-            s_operand_logical[(T + i_t, k_local, stage)] = q_reg[elem] * q_norm
-            s_rawk[(i_t, k_global)] = k_reg_bf16[elem]
+    for t_round in cutlass.range_constexpr((T + 7) // 8):
+        i_t = warp + t_round * 8
+        if i_t < T:
+            q_tile = cute.local_tile(q, (1, 1, 1, 4), (i_n, i_t, i_h, lane))
+            k_tile = cute.local_tile(k, (1, 1, 1, 4), (i_n, i_t, i_h, lane))
+            cute.autovec_copy(q_tile[(0, 0, 0, None)], q_reg_bf16)
+            cute.autovec_copy(k_tile[(0, 0, 0, None)], k_reg_bf16)
+            sum_q = cutlass.Float32(0.0)
+            sum_k = cutlass.Float32(0.0)
+            for elem in cutlass.range_constexpr(4):
+                q_reg[elem] = cutlass.Float32(q_reg_bf16[elem])
+                k_reg[elem] = cutlass.Float32(k_reg_bf16[elem])
+                sum_q = sum_q + q_reg[elem] * q_reg[elem]
+                sum_k = sum_k + k_reg[elem] * k_reg[elem]
+            for offset in [16, 8, 4, 2, 1]:
+                sum_q = sum_q + cute.arch.shuffle_sync_bfly(
+                    sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                )
+                sum_k = sum_k + cute.arch.shuffle_sync_bfly(
+                    sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                )
+            q_norm = cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
+            k_norm = cute.rsqrt(sum_k + 1e-6, fastmath=True)
+            for elem in cutlass.range_constexpr(4):
+                k_global = lane * 4 + elem
+                stage = k_global // _K_TILE
+                k_local = k_global % _K_TILE
+                s_operand_logical[(i_t, k_local, stage)] = k_reg[elem] * k_norm
+                s_operand_logical[(T + i_t, k_local, stage)] = q_reg[elem] * q_norm
+                s_rawk[(i_t, k_global)] = k_reg_bf16[elem]
 
-        for v_chunk in cutlass.range_constexpr(4):
-            v_idx = v_chunk * 32 + lane
-            s_values[(0, i_t, v_idx)] = v[(i_n, i_t, i_hv0, v_idx)]
-            if cutlass.const_expr(HEADS_PER_CTA == 2):
-                s_values[(1, i_t, v_idx)] = v[(i_n, i_t, i_hv1, v_idx)]
+            for v_chunk in cutlass.range_constexpr(4):
+                v_idx = v_chunk * 32 + lane
+                s_values[(0, i_t, v_idx)] = v[(i_n, i_t, i_hv0, v_idx)]
+                if has_pair:
+                    s_values[(1, i_t, v_idx)] = v[(i_n, i_t, i_hv1, v_idx)]
 
-        if lane == 0:
-            for head in cutlass.range_constexpr(HEADS_PER_CTA):
-                i_hv = i_hv0 + head
-                x = cutlass.Float32(a[(i_n, i_t, i_hv)]) + cutlass.Float32(
-                    dt_bias[i_hv]
-                )
-                # The public call fixes beta=1 and threshold=20.  Preserve the
-                # threshold branch so large positive inputs never overflow exp.
-                softplus_x = x
-                if x <= 20.0:
-                    softplus_x = cute.log(
-                        cutlass.Float32(1.0) + cute.exp(x, fastmath=True),
-                        fastmath=True,
-                    )
-                log_decay = (
-                    -cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=True) * softplus_x
-                )
-                beta_value = cutlass.Float32(1.0) / (
-                    cutlass.Float32(1.0)
-                    + cute.exp(-cutlass.Float32(b[(i_n, i_t, i_hv)]), fastmath=True)
-                )
-                s_log_decay[(head, i_t)] = log_decay
-                s_decay[(head, i_t)] = cute.exp(log_decay, fastmath=True)
-                s_beta[(head, i_t)] = beta_value
+            if lane == 0:
+                for head in cutlass.range_constexpr(HEADS_PER_CTA):
+                    i_hv = i_hv0 + head
+                    if head == 0 or has_pair:
+                        x = cutlass.Float32(a[(i_n, i_t, i_hv)]) + cutlass.Float32(
+                            dt_bias[i_hv]
+                        )
+                        # The public call fixes beta=1 and threshold=20.  Preserve the
+                        # threshold branch so large positive inputs never overflow exp.
+                        softplus_x = x
+                        if x <= 20.0:
+                            softplus_x = cute.log(
+                                cutlass.Float32(1.0) + cute.exp(x, fastmath=True),
+                                fastmath=True,
+                            )
+                        log_decay = (
+                            -cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=True)
+                            * softplus_x
+                        )
+                        beta_value = cutlass.Float32(1.0) / (
+                            cutlass.Float32(1.0)
+                            + cute.exp(
+                                -cutlass.Float32(b[(i_n, i_t, i_hv)]), fastmath=True
+                            )
+                        )
+                        s_log_decay[(head, i_t)] = log_decay
+                        s_decay[(head, i_t)] = cute.exp(log_decay, fastmath=True)
+                        s_beta[(head, i_t)] = beta_value
 
     # Publish scalar SMEM stores to the asynchronous MMA proxy.
     cute.arch.fence_view_async_shared()
@@ -384,64 +414,58 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
         gram_thr_c = gram_copy_c.get_slice(lane)
 
         gram_a = cute.local_tile(operand_full, (16, 128), (0, 0))
-        gram_b0 = cute.local_tile(operand_full, (8, 128), (0, 0))
-        gram_b0_src = gram_thr_b.partition_S(gram_b0)
-        gram_b0_f32 = cute.make_rmem_tensor_like(
-            gram_mma.make_fragment_B(gram_thr_mma.partition_B(gram_b0)), _ACC
-        )
-        cute.copy(gram_copy_b, gram_b0_src, gram_thr_b.retile(gram_b0_f32))
-        gram_b0_tf32 = _to_tf32(gram_b0_f32)
-        gram_c0 = cute.local_tile(s_gram, (16, 8), (0, 0))
-        gram_c0_dst = gram_thr_c.partition_D(gram_c0)
-        gram_c0_acc = gram_mma.make_fragment_C(gram_mma.partition_shape_C((16, 8)))
-        gram_c0_acc.fill(0.0)
-
-        if cutlass.const_expr(N == 16):
-            gram_b1 = cute.local_tile(operand_full, (8, 128), (1, 0))
-            gram_b1_src = gram_thr_b.partition_S(gram_b1)
-            gram_b1_f32 = cute.make_rmem_tensor_like(
-                gram_mma.make_fragment_B(gram_thr_mma.partition_B(gram_b1)), _ACC
-            )
-            cute.copy(gram_copy_b, gram_b1_src, gram_thr_b.retile(gram_b1_f32))
-            gram_b1_tf32 = _to_tf32(gram_b1_f32)
-            gram_c1 = cute.local_tile(s_gram, (16, 8), (0, 1))
-            gram_c1_dst = gram_thr_c.partition_D(gram_c1)
-            gram_c1_acc = gram_mma.make_fragment_C(gram_mma.partition_shape_C((16, 8)))
-            gram_c1_acc.fill(0.0)
-
-        for k_group in cutlass.range_constexpr(2):
-            gram_a_group = cute.local_tile(gram_a, (16, 64), (0, k_group))
-            gram_a_src = gram_thr_a.partition_S(gram_a_group)
-            gram_a_f32 = cute.make_rmem_tensor_like(
-                gram_mma.make_fragment_A(gram_thr_mma.partition_A(gram_a_group)),
-                _ACC,
-            )
-            cute.copy(gram_copy_a, gram_a_src, gram_thr_a.retile(gram_a_f32))
-            gram_a_tf32 = _to_tf32(gram_a_f32)
-            for k_tile in cutlass.range_constexpr(8):
-                global_k_tile = k_group * 8 + k_tile
-                cute.gemm(
-                    gram_mma,
-                    gram_c0_acc,
-                    gram_a_tf32[None, None, k_tile],
-                    gram_b0_tf32[None, None, global_k_tile],
-                    gram_c0_acc,
+        # Rows cover all K vectors (T <= 16).  Columns are produced in passes of
+        # at most two 8-wide blocks to bound the B fragments held in registers.
+        num_blocks = N // 8
+        for block_pass in cutlass.range_constexpr((num_blocks + 1) // 2):
+            pass_blocks = min(2, num_blocks - 2 * block_pass)
+            gram_b_tf32 = []
+            gram_c_dst = []
+            gram_c_acc = []
+            for pass_block in cutlass.range_constexpr(pass_blocks):
+                column_block = 2 * block_pass + pass_block
+                gram_b = cute.local_tile(operand_full, (8, 128), (column_block, 0))
+                gram_b_src = gram_thr_b.partition_S(gram_b)
+                gram_b_f32 = cute.make_rmem_tensor_like(
+                    gram_mma.make_fragment_B(gram_thr_mma.partition_B(gram_b)), _ACC
                 )
-                if cutlass.const_expr(N == 16):
-                    cute.gemm(
-                        gram_mma,
-                        gram_c1_acc,
-                        gram_a_tf32[None, None, k_tile],
-                        gram_b1_tf32[None, None, global_k_tile],
-                        gram_c1_acc,
-                    )
-        cute.copy(gram_copy_c, gram_thr_c.retile(gram_c0_acc), gram_c0_dst)
-        if cutlass.const_expr(N == 16):
-            cute.copy(gram_copy_c, gram_thr_c.retile(gram_c1_acc), gram_c1_dst)
+                cute.copy(gram_copy_b, gram_b_src, gram_thr_b.retile(gram_b_f32))
+                gram_b_tf32.append(_to_tf32(gram_b_f32))
+                gram_c = cute.local_tile(s_gram, (16, 8), (0, column_block))
+                gram_c_dst.append(gram_thr_c.partition_D(gram_c))
+                acc = gram_mma.make_fragment_C(gram_mma.partition_shape_C((16, 8)))
+                acc.fill(0.0)
+                gram_c_acc.append(acc)
+
+            for k_group in cutlass.range_constexpr(2):
+                gram_a_group = cute.local_tile(gram_a, (16, 64), (0, k_group))
+                gram_a_src = gram_thr_a.partition_S(gram_a_group)
+                gram_a_f32 = cute.make_rmem_tensor_like(
+                    gram_mma.make_fragment_A(gram_thr_mma.partition_A(gram_a_group)),
+                    _ACC,
+                )
+                cute.copy(gram_copy_a, gram_a_src, gram_thr_a.retile(gram_a_f32))
+                gram_a_tf32 = _to_tf32(gram_a_f32)
+                for k_tile in cutlass.range_constexpr(8):
+                    global_k_tile = k_group * 8 + k_tile
+                    for pass_block in cutlass.range_constexpr(pass_blocks):
+                        cute.gemm(
+                            gram_mma,
+                            gram_c_acc[pass_block],
+                            gram_a_tf32[None, None, k_tile],
+                            gram_b_tf32[pass_block][None, None, global_k_tile],
+                            gram_c_acc[pass_block],
+                        )
+            for pass_block in cutlass.range_constexpr(pass_blocks):
+                cute.copy(
+                    gram_copy_c,
+                    gram_thr_c.retile(gram_c_acc[pass_block]),
+                    gram_c_dst[pass_block],
+                )
 
     # Refill the same two-stage state pipeline with the adjacent HV head while
     # the consumer drains head 0.  Q/K and the Gram matrix are reused.
-    if warp == 0 and cutlass.const_expr(HEADS_PER_CTA == 2):
+    if warp == 0 and has_pair:
         for k_idx in cutlass.range(num_k_tiles, unroll=1):
             empty = state_producer.acquire_and_advance()
             cute.copy(
@@ -456,29 +480,37 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
     if warp >= 3 and valid:
         replay_worker = tidx - 96
         if replay_worker < _M:
-            for head in cutlass.range_constexpr(HEADS_PER_CTA):
-                i_hv = i_hv0 + head
-                for i_t in cutlass.range_constexpr(T):
-                    replayssm_rawv[(safe_cache_idx, i_hv, i_t, replay_worker)] = (
-                        s_values[(head, i_t, replay_worker)]
-                    )
+            if cutlass.const_expr(not WRITE_U):
+                for head in cutlass.range_constexpr(HEADS_PER_CTA):
+                    i_hv = i_hv0 + head
+                    if head == 0 or has_pair:
+                        for i_t in cutlass.range_constexpr(T):
+                            replayssm_rawv[
+                                (safe_cache_idx, i_hv, i_t, replay_worker)
+                            ] = s_values[(head, i_t, replay_worker)]
             if i_hv0 % (HV // H) == 0:
                 for i_t in cutlass.range_constexpr(T):
                     replayssm_rawk[(safe_cache_idx, i_h, i_t, replay_worker)] = s_rawk[
                         (i_t, replay_worker)
                     ]
-        if replay_worker < HEADS_PER_CTA * T:
+        if replay_worker < live_heads * T:
             head = replay_worker // T
             i_t = replay_worker % T
             i_hv = i_hv0 + head
             replayssm_g[(safe_cache_idx, i_hv, i_t)] = s_log_decay[(head, i_t)]
-            replayssm_beta[(safe_cache_idx, i_hv, i_t)] = s_beta[(head, i_t)]
+            if cutlass.const_expr(not WRITE_U):
+                replayssm_beta[(safe_cache_idx, i_hv, i_t)] = s_beta[(head, i_t)]
 
     if warp == 1:
         acc_empty = acc_producer.acquire_and_advance()
         for head in cutlass.range_constexpr(HEADS_PER_CTA):
             tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-            for _ in cutlass.range(num_k_tiles, unroll=1):
+            head_tiles = num_k_tiles
+            if cutlass.const_expr(head == 1 and partial_pairs):
+                head_tiles = cutlass.Int32(num_k_tiles)
+                if not has_pair:
+                    head_tiles = cutlass.Int32(0)
+            for _ in cutlass.range(head_tiles, unroll=1):
                 full = state_consumer.wait_and_advance()
                 for k_block in cutlass.range_constexpr(cute.size(t_cr_state, mode=[2])):
                     coord = (None, None, k_block, full.index)
@@ -506,15 +538,15 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
     acc_consumer.wait_and_advance()
     if epilogue_head == 0:
         cute.copy(tmem_copy, t_rt_acc0, r_base)
-    elif cutlass.const_expr(HEADS_PER_CTA == 2):
+    elif has_pair:
         cute.copy(tmem_copy, t_rt_acc1, r_base)
     cute.arch.barrier()
 
     # Phase 3: one thread owns one V row.  The recurrence is only O(T^2)
     # scalars and executes while other CTAs are still streaming state.
-    if epilogue_head < HEADS_PER_CTA:
+    if epilogue_head == 0 or has_pair:
         m_idx = t_rc_c[0][0]
-        coeff = cute.make_rmem_tensor(cute.make_layout((8,)), _ACC)
+        coeff = cute.make_rmem_tensor(cute.make_layout((T,)), _ACC)
         coeff.fill(0.0)
         if cutlass.const_expr(HAS_PATHS):
             # Chain loop shape; W is zero off the ancestor set, so no branch.
@@ -552,6 +584,14 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
                     cutlass.Float32(s_values[(epilogue_head, i_t, m_idx)]) - prediction
                 ) * s_beta[(epilogue_head, i_t)]
                 coeff[i_t] = delta
+                if cutlass.const_expr(WRITE_U):
+                    # Undecayed u_t from the frozen checkpoint: valid for every
+                    # accepted prefix, since the unit-triangular chunk solve makes
+                    # u_t depend only on tokens 1..t.
+                    if valid:
+                        replayssm_u[
+                            (safe_cache_idx, i_hv0 + epilogue_head, i_t, m_idx)
+                        ] = delta
                 result = state_scale * r_base[T + i_t]
                 for j in cutlass.range_constexpr(i_t + 1):
                     result = result + coeff[j] * s_gram[(j, T + i_t)]
@@ -562,6 +602,13 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
 
     pipeline.sync(barrier_id=1)
     tmem.free(tmem_ptr)
+
+
+def _n_tile(T: int) -> int:
+    """MMA N width: the smallest supported tile holding T K and T Q columns."""
+    if T == 4:
+        return 8
+    return 16 if T <= 8 else 32
 
 
 @cute.jit
@@ -581,15 +628,17 @@ def _launch_tcgen(
     replayssm_rawk: cute.Tensor,
     replayssm_g: cute.Tensor,
     replayssm_beta: cute.Tensor,
+    replayssm_u: cute.Tensor,
     scale: cutlass.Constexpr[float],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     HV: cutlass.Constexpr[int],
     HEADS_PER_CTA: cutlass.Constexpr[int],
     HAS_PATHS: cutlass.Constexpr[bool],
+    WRITE_U: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    n_tile = 8 if cutlass.const_expr(T == 4) else 16
+    n_tile = _n_tile(T)
     op = tcgen05.MmaTF32Op(
         (_M, n_tile, 8),
         tcgen05.CtaGroup.ONE,
@@ -630,6 +679,7 @@ def _launch_tcgen(
         replayssm_rawk,
         replayssm_g,
         replayssm_beta,
+        replayssm_u,
         state_layout,
         operand_layout,
         scale,
@@ -639,8 +689,9 @@ def _launch_tcgen(
         HV,
         HEADS_PER_CTA,
         HAS_PATHS,
+        WRITE_U,
     ).launch(
-        grid=(q.shape[0] * (HV // HEADS_PER_CTA), 1, 1),
+        grid=(q.shape[0] * H * ((HV // H + HEADS_PER_CTA - 1) // HEADS_PER_CTA), 1, 1),
         block=(_THREADS, 1, 1),
         stream=stream,
     )
@@ -696,22 +747,39 @@ def run_gdn_verify_kernel_mtp_replayssm_tcgen(
     b: torch.Tensor,
     output: torch.Tensor,
     state_indices: torch.Tensor,
-    replayssm_rawv: torch.Tensor,
+    replayssm_rawv: torch.Tensor | None,
     replayssm_rawk: torch.Tensor,
     replayssm_g: torch.Tensor,
-    replayssm_beta: torch.Tensor,
+    replayssm_beta: torch.Tensor | None,
     T: int,
     H: int,
     HV: int,
     scale: float,
     verify_parents: Optional[torch.Tensor] = None,
+    replayssm_u: torch.Tensor | None = None,
 ) -> None:
+    """Run verify, caching either the raw (v, beta) window or ``u``.
+
+    With ``replayssm_u`` the kernel writes the FP32 delta-rule corrections
+    instead of raw V and beta; K and log-g are cached in both modes.
+    """
     target = gdn_device_target(state.device)
     if target.major != 10:
         raise ValueError("tcgen05 ReplaySSM verify requires SM100/SM103")
+    write_u = replayssm_u is not None
+    # The window not written by this mode is compile-time dead; bind existing
+    # tensors of the same rank and dtype so no placeholder is allocated.
+    if write_u:
+        replayssm_rawv = replayssm_rawk
+        replayssm_beta = replayssm_g
+    else:
+        replayssm_u = replayssm_g.unsqueeze(-1)
+    # A single request runs one head per CTA for more CTAs.
     heads_per_cta = 1 if q.shape[0] == 1 else 2
     has_paths = verify_parents is not None
     if has_paths:
+        if write_u:
+            raise ValueError("verify_parents is not supported with replayssm_u")
         if verify_parents.shape != (q.shape[0], T):
             raise ValueError("verify_parents must have shape [B, T]")
         if verify_parents.dtype != torch.int32:
@@ -739,6 +807,7 @@ def run_gdn_verify_kernel_mtp_replayssm_tcgen(
         heads_per_cta,
         has_paths,
         layout_key,
+        write_u,
     )
     cache = _CACHE.setdefault(key, {})
     stream = cuda.CUstream(torch.cuda.current_stream(device=state.device).cuda_stream)
@@ -769,12 +838,14 @@ def run_gdn_verify_kernel_mtp_replayssm_tcgen(
                 _slot_dynamic(replayssm_rawk),
                 _slot_dynamic(replayssm_g),
                 _slot_dynamic(replayssm_beta),
+                _slot_dynamic(replayssm_u),
                 scale=scale,
                 T=T,
                 H=H,
                 HV=HV,
                 HEADS_PER_CTA=heads_per_cta,
                 HAS_PATHS=has_paths,
+                WRITE_U=write_u,
                 stream=stream,
             ),
             extra_key_files=(__file__,),
@@ -796,5 +867,6 @@ def run_gdn_verify_kernel_mtp_replayssm_tcgen(
         replayssm_rawk,
         replayssm_g,
         replayssm_beta,
+        replayssm_u,
         stream,
     )

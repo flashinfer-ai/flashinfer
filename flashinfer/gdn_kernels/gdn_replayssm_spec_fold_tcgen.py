@@ -14,13 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""SM100 tcgen05 specialization for normalized ReplaySSM T=4..8 commit.
+"""SM100 tcgen05 specialization for normalized ReplaySSM T=4..16 commit.
 
 The checkpoint streams through two half-width shared-memory stages while
-tcgen05 computes all eight ``S0 @ k_t`` vectors.  One thread then owns each V
-row's low-rank recurrence, and the final update reloads the checkpoint from L2
-on its way back to global memory.  The smaller shared footprint raises CTA
-residency while the second logical state read remains an L2 hit.
+tcgen05 computes every ``S0 @ k_t`` vector in one N=8 or N=16 tile.  One
+thread then owns each V row's low-rank recurrence, and the final update
+reloads the checkpoint from L2 on its way back to global memory.  The smaller
+shared footprint raises CTA residency while the second logical state read
+remains an L2 hit.
 """
 
 import torch
@@ -41,7 +42,6 @@ import cuda.bindings.driver as cuda
 _F32 = cutlass.Float32
 _BF16 = cutlass.BFloat16
 _D = 128
-_T = 8
 _K_TILE = 32
 _THREADS = 256
 _STATE_STAGES = 2
@@ -77,6 +77,7 @@ def _store_rank_update(
     warp: cutlass.Int32,
     row_base: cutlass.Int32,
     lane: cutlass.Int32,
+    T: cutlass.Constexpr[int],
 ):
     result = cute.make_rmem_tensor(cute.make_layout((4,)), _F32)
     for row_iter in cutlass.range_constexpr(16):
@@ -84,7 +85,7 @@ def _store_rank_update(
         for col_group in cutlass.range_constexpr(4):
             col = lane + col_group * 32
             result[col_group] = s_state_scale[warp] * state_matrix[(row, col)]
-        for step in cutlass.range_constexpr(_T):
+        for step in cutlass.range_constexpr(T):
             coefficient = s_coeff[(row, step)]
             for col_group in cutlass.range_constexpr(4):
                 col = lane + col_group * 32
@@ -103,9 +104,10 @@ def _store_rank_update_packed(
     warp: cutlass.Int32,
     row_base: cutlass.Int32,
     lane: cutlass.Int32,
+    T: cutlass.Constexpr[int],
 ):
-    keys = cute.make_rmem_tensor(cute.make_layout((_T, 4), stride=(4, 1)), _F32)
-    for step in cutlass.range_constexpr(_T):
+    keys = cute.make_rmem_tensor(cute.make_layout((T, 4), stride=(4, 1)), _F32)
+    for step in cutlass.range_constexpr(T):
         for col_group in cutlass.range_constexpr(4):
             keys[(step, col_group)] = s_keys[(step, lane + col_group * 32)]
     result = cute.make_rmem_tensor(cute.make_layout((4,)), _F32)
@@ -121,7 +123,7 @@ def _store_rank_update_packed(
         result[2], result[3] = cute.arch.mul_packed_f32x2(
             (result[2], result[3]), scale_pair
         )
-        for step in cutlass.range_constexpr(_T):
+        for step in cutlass.range_constexpr(T):
             coefficient = s_coeff[(row, step)]
             coefficient_pair = (coefficient, coefficient)
             result[0], result[1] = cute.arch.fma_packed_f32x2(
@@ -160,6 +162,8 @@ def _gdn_replayssm_fold_tcgen_kernel(
     NULL_BLOCK_ID: cutlass.Constexpr[int],
     USE_PACKED: cutlass.Constexpr[bool],
     HAS_PATHS: cutlass.Constexpr[bool],
+    T: cutlass.Constexpr[int],
+    N: cutlass.Constexpr[int],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     layer_head, i_n, _ = cute.arch.block_idx()
@@ -194,11 +198,11 @@ def _gdn_replayssm_fold_tcgen_kernel(
         1024,
         swizzle=operand_smem_layout.inner,
     )
-    s_keys = smem.allocate_tensor(_F32, cute.make_layout((_T, _D), stride=(_D, 1)), 16)
-    s_coeff = smem.allocate_tensor(_F32, cute.make_layout((_D, _T), stride=(_T, 1)), 16)
-    s_gram = smem.allocate_tensor(_F32, cute.make_layout((_T, _T), stride=(_T, 1)), 16)
-    s_decay = smem.allocate_tensor(_F32, cute.make_layout((_T,), stride=(1,)), 16)
-    s_beta = smem.allocate_tensor(_F32, cute.make_layout((_T,), stride=(1,)), 16)
+    s_keys = smem.allocate_tensor(_F32, cute.make_layout((T, _D), stride=(_D, 1)), 16)
+    s_coeff = smem.allocate_tensor(_F32, cute.make_layout((_D, T), stride=(T, 1)), 16)
+    s_gram = smem.allocate_tensor(_F32, cute.make_layout((T, T), stride=(T, 1)), 16)
+    s_decay = smem.allocate_tensor(_F32, cute.make_layout((T,), stride=(1,)), 16)
+    s_beta = smem.allocate_tensor(_F32, cute.make_layout((T,), stride=(1,)), 16)
     s_state_scale = smem.allocate_tensor(_F32, cute.make_layout((8,), stride=(1,)), 16)
     s_operand_logical = _semantic_mn(s_operand)
 
@@ -228,7 +232,7 @@ def _gdn_replayssm_fold_tcgen_kernel(
         barrier_storage=storage.dot_mbar.data_ptr(),
     ).make_participants()
 
-    tiler = (_D, _T, _K_TILE)
+    tiler = (_D, N, _K_TILE)
     tma_state_matrix = tma_state_vdk[(None, None, state_flat)]
     state_matrix = state_vdk[(None, None, state_flat)]
     g_state = cute.local_tile(tma_state_matrix, tiler, (0, 0, None), proj=(1, None, 1))
@@ -246,7 +250,7 @@ def _gdn_replayssm_fold_tcgen_kernel(
 
     tmem.wait_for_alloc()
     tmem_ptr = tmem.retrieve_ptr(_F32)
-    t_ct_dot_fake = tiled_mma.make_fragment_C(tiled_mma.partition_shape_C((_D, _T)))
+    t_ct_dot_fake = tiled_mma.make_fragment_C(tiled_mma.partition_shape_C((_D, N)))
     t_ct_dot = cute.make_tensor(tmem_ptr, t_ct_dot_fake.layout)
 
     num_k_tiles = cute.size(g_state, mode=[2])
@@ -260,44 +264,42 @@ def _gdn_replayssm_fold_tcgen_kernel(
                 tma_bar_ptr=empty.barrier,
             )
 
-    # One warp prepares each normalized key while the checkpoint TMA runs.
+    # Each warp prepares one normalized key per round while the checkpoint
+    # TMA runs.  Rounds also cover the zero padding columns T..N-1 of the MMA
+    # operand tile.
     key = cute.make_rmem_tensor(cute.make_layout((4,)), _F32)
-    i_t = warp
-    cache_len = rawk.shape[2]
-    # Staged positions carry the recurrence; a tree accept only moves the row.
-    row_t = i_t
-    if cutlass.const_expr(HAS_PATHS):
-        row_t = cutlass.Int32(0)
-        if i_t < cache_len:
-            row_t = accept_paths[i_n * cache_len + i_t]
-            if row_t < 0:
-                row_t = cutlass.Int32(0)
-            if row_t >= cache_len:
-                row_t = cutlass.Int32(cache_len - 1)
-    if i_t < _T:
-        key_norm = _F32(0.0)
-        for elem in cutlass.range_constexpr(4):
-            k_idx = lane + elem * 32
-            # Rejected keys must not enter the rank update, even as 0 * NaN.
-            key[elem] = _F32(0.0)
-            if is_live and i_t < n_commit:
-                key[elem] = rawk[(flat_slot, i_h, row_t, k_idx)].to(_F32)
-            key_norm += key[elem] * key[elem]
-        key_norm = cute.arch.warp_reduction_sum(key_norm)
-        inv_norm = cute.rsqrt(key_norm + 1.0e-6)
-        for elem in cutlass.range_constexpr(4):
-            k_idx = lane + elem * 32
-            normalized = key[elem] * inv_norm
-            key[elem] = normalized
-            s_keys[(i_t, k_idx)] = normalized
-            stage = k_idx // _K_TILE
-            k_local = k_idx % _K_TILE
-            s_operand_logical[(i_t, k_local, stage)] = normalized
-        if lane == 0:
-            # The rank-eight MMA tile may be wider than the logical cache.
-            s_decay[i_t] = 1.0
-            s_beta[i_t] = 0.0
-            if i_t < cache_len:
+    for key_round in cutlass.range_constexpr((N + 7) // 8):
+        i_t = warp + key_round * 8
+        # Staged positions carry the recurrence; a tree accept only moves the row.
+        row_t = i_t
+        if cutlass.const_expr(HAS_PATHS):
+            row_t = cutlass.Int32(0)
+            if i_t < T:
+                row_t = accept_paths[i_n * T + i_t]
+                if row_t < 0:
+                    row_t = cutlass.Int32(0)
+                if row_t >= T:
+                    row_t = cutlass.Int32(T - 1)
+        if i_t < N:
+            key_norm = _F32(0.0)
+            for elem in cutlass.range_constexpr(4):
+                k_idx = lane + elem * 32
+                # Rejected keys must not enter the rank update, even as 0 * NaN.
+                key[elem] = _F32(0.0)
+                if is_live and i_t < n_commit:
+                    key[elem] = rawk[(flat_slot, i_h, row_t, k_idx)].to(_F32)
+                key_norm += key[elem] * key[elem]
+            key_norm = cute.arch.warp_reduction_sum(key_norm)
+            inv_norm = cute.rsqrt(key_norm + 1.0e-6)
+            for elem in cutlass.range_constexpr(4):
+                k_idx = lane + elem * 32
+                normalized = key[elem] * inv_norm
+                if i_t < T:
+                    s_keys[(i_t, k_idx)] = normalized
+                stage = k_idx // _K_TILE
+                k_local = k_idx % _K_TILE
+                s_operand_logical[(i_t, k_local, stage)] = normalized
+            if lane == 0 and i_t < T:
                 s_decay[i_t] = cute.exp(log_g[(flat_slot, i_hv, row_t)], fastmath=True)
                 s_beta[i_t] = beta[(flat_slot, i_hv, row_t)]
 
@@ -305,17 +307,21 @@ def _gdn_replayssm_fold_tcgen_kernel(
     cute.arch.fence_view_async_shared()
     cute.arch.barrier()
 
-    # The eight key-owning warps independently form the eight Gram rows.
-    if i_t < _T:
-        for j in cutlass.range_constexpr(_T):
-            if i_t < j:
-                dot = _F32(0.0)
-                for elem in cutlass.range_constexpr(4):
-                    k_idx = lane + elem * 32
-                    dot += key[elem] * s_keys[(j, k_idx)]
-                dot = cute.arch.warp_reduction_sum(dot)
-                if lane == 0:
-                    s_gram[(i_t, j)] = dot
+    # Key-owning warps independently form the strictly upper Gram rows.
+    for key_round in cutlass.range_constexpr((T + 7) // 8):
+        i_t = warp + key_round * 8
+        if i_t < T:
+            for elem in cutlass.range_constexpr(4):
+                key[elem] = s_keys[(i_t, lane + elem * 32)]
+            for j in cutlass.range_constexpr(T):
+                if i_t < j:
+                    dot = _F32(0.0)
+                    for elem in cutlass.range_constexpr(4):
+                        k_idx = lane + elem * 32
+                        dot += key[elem] * s_keys[(j, k_idx)]
+                    dot = cute.arch.warp_reduction_sum(dot)
+                    if lane == 0:
+                        s_gram[(i_t, j)] = dot
 
     if warp == 6:
         for k_idx in cutlass.range(_STATE_STAGES, num_k_tiles, 1, unroll=1):
@@ -344,12 +350,15 @@ def _gdn_replayssm_fold_tcgen_kernel(
             full.release()
         dot_empty.commit()
 
-    dot_load_atom = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x8), _F32)
+    dot_load_atom = cute.make_copy_atom(
+        tcgen05.Ld32x32bOp(tcgen05.Repetition.x8 if N == 8 else tcgen05.Repetition.x16),
+        _F32,
+    )
     dot_tmem_copy = tcgen05.make_tmem_copy(dot_load_atom, t_ct_dot)
     local_tidx = tidx % _D
     dot_thr_copy = dot_tmem_copy.get_slice(local_tidx)
     t_rt_dot_all = dot_thr_copy.partition_S(t_ct_dot)
-    dot_identity = cute.make_identity_tensor((_D, _T))
+    dot_identity = cute.make_identity_tensor((_D, N))
     t_cc_dot = thr_mma.partition_C(dot_identity)
     t_rc_dot_all = dot_thr_copy.partition_D(t_cc_dot)
     t_rt_dot = t_rt_dot_all[(None, 0, None, None)]
@@ -362,29 +371,29 @@ def _gdn_replayssm_fold_tcgen_kernel(
         source_lane += 16
         row_base = (warp - 4) * 32 + 16
     row = row_base + lane % 16
-    raw_values = cute.make_rmem_tensor(cute.make_layout((_T,)), _F32)
-    for step in cutlass.range_constexpr(_T):
+    raw_values = cute.make_rmem_tensor(cute.make_layout((T,)), _F32)
+    for step in cutlass.range_constexpr(T):
         if step < n_commit:
             row_step = step
-            if cutlass.const_expr(HAS_PATHS and step < cache_len):
-                row_step = accept_paths[i_n * cache_len + step]
+            if cutlass.const_expr(HAS_PATHS):
+                row_step = accept_paths[i_n * T + step]
                 if row_step < 0:
                     row_step = cutlass.Int32(0)
-                if row_step >= cache_len:
-                    row_step = cutlass.Int32(cache_len - 1)
+                if row_step >= T:
+                    row_step = cutlass.Int32(T - 1)
             raw_values[step] = rawv[(flat_slot, i_hv, row_step, row)].to(_F32)
 
     tmem.relinquish_alloc_permit()
     dot_consumer.wait_and_advance()
     cute.copy(dot_tmem_copy, t_rt_dot, r_base)
-    for step in cutlass.range_constexpr(_T):
+    for step in cutlass.range_constexpr(T):
         r_base[step] = cute.arch.shuffle_sync(r_base[step], source_lane)
     # Gram rows are produced independently by all eight warps.
     cute.arch.barrier()
-    coeff = cute.make_rmem_tensor(cute.make_layout((_T,)), _F32)
+    coeff = cute.make_rmem_tensor(cute.make_layout((T,)), _F32)
     coeff.fill(0.0)
     state_scale = _F32(1.0)
-    for step in cutlass.range_constexpr(_T):
+    for step in cutlass.range_constexpr(T):
         if step < n_commit:
             gate = s_decay[step]
             state_scale *= gate
@@ -394,7 +403,7 @@ def _gdn_replayssm_fold_tcgen_kernel(
                 prediction += coeff[j] * s_gram[(j, step)]
             coeff[step] = (raw_values[step] - prediction) * s_beta[step]
     if lane < 16:
-        for step in cutlass.range_constexpr(_T):
+        for step in cutlass.range_constexpr(T):
             s_coeff[(row, step)] = coeff[step]
         if lane == 0:
             s_state_scale[warp] = state_scale
@@ -414,6 +423,7 @@ def _gdn_replayssm_fold_tcgen_kernel(
                 warp,
                 row_base,
                 lane,
+                T,
             )
         else:
             _store_rank_update(
@@ -424,6 +434,7 @@ def _gdn_replayssm_fold_tcgen_kernel(
                 warp,
                 row_base,
                 lane,
+                T,
             )
 
     pipeline.sync(barrier_id=1)
@@ -446,17 +457,20 @@ def _launch_gdn_replayssm_fold_tcgen(
     NULL_BLOCK_ID: cutlass.Constexpr[int],
     USE_PACKED: cutlass.Constexpr[bool],
     HAS_PATHS: cutlass.Constexpr[bool],
+    T: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
+    # The smallest MMA N tile that holds all T key columns.
+    N = 8 if T <= 8 else 16
     op = tcgen05.MmaTF32Op(
-        (_D, _T, 8),
+        (_D, N, 8),
         tcgen05.CtaGroup.ONE,
         tcgen05.OperandSource.SMEM,
         OperandMajorMode.K,
         OperandMajorMode.K,
     )
     tiled_mma = cute.make_tiled_mma(op)
-    tiler = (_D, _T, _K_TILE)
+    tiler = (_D, N, _K_TILE)
     state_layout = sm100_utils.make_smem_layout_a(tiled_mma, tiler, _F32, _STATE_STAGES)
     operand_layout = sm100_utils.make_smem_layout_b(
         tiled_mma, tiler, _F32, _OPERAND_STAGES
@@ -498,6 +512,8 @@ def _launch_gdn_replayssm_fold_tcgen(
         NULL_BLOCK_ID,
         USE_PACKED,
         HAS_PATHS,
+        T,
+        N,
     ).launch(
         grid=(NUM_LAYERS * HV, state_indices.shape[0], 1),
         block=(_THREADS, 1, 1),
@@ -528,7 +544,7 @@ def run_replayssm_fold_tcgen(
     null_block_id: int = -1,
     accept_paths: torch.Tensor | None = None,
 ) -> None:
-    """Launch normalized T=4..8 commit after the common entry validates inputs.
+    """Launch normalized T=4..16 commit after the common entry validates inputs.
 
     ``accept_paths`` is a flat int32 ``[B * T]`` view of per-request cache rows.
     """
@@ -583,6 +599,7 @@ def run_replayssm_fold_tcgen(
                 NULL_BLOCK_ID=int(null_block_id),
                 USE_PACKED=use_packed,
                 HAS_PATHS=has_paths,
+                T=cache_len,
                 stream=stream,
             ),
             extra_key_files=(__file__,),

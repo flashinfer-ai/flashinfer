@@ -32,6 +32,10 @@ from cutlass.cute.runtime import from_dlpack
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .cute_dsl_cache_naming import make_kernel_name
 from .device_target import gdn_compile_options, gdn_device_target
+from .gdn_replayssm_u_commit import (
+    MAX_WINDOW as U_MAX_WINDOW,
+    commit_gdn_replayssm_u_all_layers,
+)
 import cuda.bindings.driver as cuda
 
 
@@ -80,6 +84,7 @@ def _gdn_replayssm_fold_kernel(
     HAS_TRACK: cutlass.Constexpr[bool],
     HAS_PATHS: cutlass.Constexpr[bool],
     TRACK_ONLY: cutlass.Constexpr[bool],
+    PREFETCH_NEXT_STEP: cutlass.Constexpr[bool],
 ):
     row_tile, i_n, layer_head = cute.arch.block_idx()
     lane = cute.arch.lane_idx()
@@ -135,20 +140,90 @@ def _gdn_replayssm_fold_kernel(
                 safe_track_slot = cutlass.Int32(0)
             flat_track_slot = cutlass.Int64(i_layer) * slots_per_layer + safe_track_slot
 
-        for t in cutlass.range(n_commit, unroll=1):
-            # A tree accept replays an ordered path; only the load row moves.
-            row = t
+        # The recurrence is serial, so each step's global loads for raw K, raw V
+        # and the gate scalars sit on its critical path.  On SM120 the next
+        # step's inputs are loaded while the current step computes, which hides
+        # that latency for long windows.  SM100/SM103 commits do not benefit
+        # (the extra live registers cost a few percent), so they load each
+        # step's inputs at the top of the step.  A tree accept replays an
+        # ordered path, so only the loaded row moves.
+        step_inputs = cute.make_rmem_tensor((3,), _F32)
+        if cutlass.const_expr(PREFETCH_NEXT_STEP):
+            next_key_bf16 = cute.make_rmem_tensor((_CHANNELS_PER_LANE,), _BF16)
+            next_step_inputs = cute.make_rmem_tensor((3,), _F32)
+            next_row = cutlass.Int32(0)
             if cutlass.const_expr(HAS_PATHS):
-                row = accept_paths[i_n * MAX_CACHE_LEN + t]
-                if row < 0:
-                    row = cutlass.Int32(0)
-                if row >= MAX_CACHE_LEN:
-                    row = cutlass.Int32(MAX_CACHE_LEN - 1)
+                next_row = accept_paths[i_n * MAX_CACHE_LEN]
+                if next_row < 0:
+                    next_row = cutlass.Int32(0)
+                if next_row >= MAX_CACHE_LEN:
+                    next_row = cutlass.Int32(MAX_CACHE_LEN - 1)
             cute.copy(
                 copy_bf16x4,
-                _aligned_tensor(rawk[(None, lane, row, i_h, flat_slot)], 8),
-                key_bf16,
+                _aligned_tensor(rawk[(None, lane, next_row, i_h, flat_slot)], 8),
+                next_key_bf16,
             )
+            next_step_inputs[0] = log_g[(next_row, i_hv, flat_slot)]
+            next_step_inputs[1] = beta[(next_row, i_hv, flat_slot)]
+            next_step_inputs[2] = _F32(0.0)
+            if lane < _ROWS_PER_WARP:
+                next_step_inputs[2] = rawv[
+                    (lane, warp, row_tile, next_row, i_hv, flat_slot)
+                ].to(_F32)
+
+        for t in cutlass.range(n_commit, unroll=1):
+            if cutlass.const_expr(PREFETCH_NEXT_STEP):
+                for channel in cutlass.range_constexpr(_CHANNELS_PER_LANE):
+                    key_bf16[channel] = next_key_bf16[channel]
+                for item in cutlass.range_constexpr(3):
+                    step_inputs[item] = next_step_inputs[item]
+                if t + 1 < n_commit:
+                    next_row = t + 1
+                    if cutlass.const_expr(HAS_PATHS):
+                        next_row = accept_paths[i_n * MAX_CACHE_LEN + t + 1]
+                        if next_row < 0:
+                            next_row = cutlass.Int32(0)
+                        if next_row >= MAX_CACHE_LEN:
+                            next_row = cutlass.Int32(MAX_CACHE_LEN - 1)
+                    cute.copy(
+                        copy_bf16x4,
+                        _aligned_tensor(
+                            rawk[(None, lane, next_row, i_h, flat_slot)], 8
+                        ),
+                        next_key_bf16,
+                    )
+                    next_step_inputs[0] = log_g[(next_row, i_hv, flat_slot)]
+                    next_step_inputs[1] = beta[(next_row, i_hv, flat_slot)]
+                    if lane < _ROWS_PER_WARP:
+                        next_step_inputs[2] = rawv[
+                            (lane, warp, row_tile, next_row, i_hv, flat_slot)
+                        ].to(_F32)
+            else:
+                row = t
+                if cutlass.const_expr(HAS_PATHS):
+                    row = accept_paths[i_n * MAX_CACHE_LEN + t]
+                    if row < 0:
+                        row = cutlass.Int32(0)
+                    if row >= MAX_CACHE_LEN:
+                        row = cutlass.Int32(MAX_CACHE_LEN - 1)
+                cute.copy(
+                    copy_bf16x4,
+                    _aligned_tensor(rawk[(None, lane, row, i_h, flat_slot)], 8),
+                    key_bf16,
+                )
+                log_decay = _F32(0.0)
+                beta_load = _F32(0.0)
+                if lane == 0:
+                    log_decay = log_g[(row, i_hv, flat_slot)]
+                    beta_load = beta[(row, i_hv, flat_slot)]
+                step_inputs[0] = cute.arch.shuffle_sync(log_decay, 0)
+                step_inputs[1] = cute.arch.shuffle_sync(beta_load, 0)
+                step_inputs[2] = _F32(0.0)
+                if lane < _ROWS_PER_WARP:
+                    step_inputs[2] = rawv[
+                        (lane, warp, row_tile, row, i_hv, flat_slot)
+                    ].to(_F32)
+
             key_norm = _F32(0.0)
             for channel in cutlass.range_constexpr(_CHANNELS_PER_LANE):
                 key[channel] = key_bf16[channel].to(_F32)
@@ -159,17 +234,9 @@ def _gdn_replayssm_fold_kernel(
                 for channel in cutlass.range_constexpr(_CHANNELS_PER_LANE):
                     key[channel] *= inv_key_norm
 
-            decay = _F32(0.0)
-            beta_value = _F32(0.0)
-            if lane == 0:
-                decay = cute.exp(log_g[(row, i_hv, flat_slot)], fastmath=True)
-                beta_value = beta[(row, i_hv, flat_slot)]
-            decay = cute.arch.shuffle_sync(decay, 0)
-            beta_value = cute.arch.shuffle_sync(beta_value, 0)
-
-            raw_value = _F32(0.0)
-            if lane < _ROWS_PER_WARP:
-                raw_value = rawv[(lane, warp, row_tile, row, i_hv, flat_slot)].to(_F32)
+            decay = cute.exp(step_inputs[0], fastmath=True)
+            beta_value = step_inputs[1]
+            raw_value = step_inputs[2]
 
             # Interleave four independent row reductions so the scheduler can
             # cover each SHFL/FADD dependency chain with useful work from the
@@ -263,6 +330,7 @@ def _launch_gdn_replayssm_fold(
     HAS_TRACK: cutlass.Constexpr[bool],
     HAS_PATHS: cutlass.Constexpr[bool],
     TRACK_ONLY: cutlass.Constexpr[bool],
+    PREFETCH_NEXT_STEP: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     rows_per_cta = WARPS_PER_CTA * _ROWS_PER_WARP
@@ -353,6 +421,7 @@ def _launch_gdn_replayssm_fold(
         HAS_TRACK,
         HAS_PATHS,
         TRACK_ONLY,
+        PREFETCH_NEXT_STEP,
     ).launch(
         grid=(row_tiles, state_indices.shape[0], NUM_LAYERS * HV),
         block=(WARPS_PER_CTA * 32, 1, 1),
@@ -373,10 +442,10 @@ def _mark_leading_dynamic(tensor: torch.Tensor) -> cute.Tensor:
 
 def commit_gdn_replayssm_fold_all_layers(
     checkpoint_state: torch.Tensor,
-    rawv_cache: torch.Tensor,
+    rawv_cache: torch.Tensor | None,
     rawk_cache: torch.Tensor,
     g_cache: torch.Tensor,
-    beta_cache: torch.Tensor,
+    beta_cache: torch.Tensor | None,
     ssm_state_indices: torch.Tensor,
     accept_lens: torch.Tensor,
     max_cache_len: int,
@@ -388,6 +457,7 @@ def commit_gdn_replayssm_fold_all_layers(
     accept_paths: torch.Tensor | None = None,
     *,
     backend: str = "auto",
+    u_cache: torch.Tensor | None = None,
 ) -> None:
     """Replay the accepted prefix into every layer's FP32 checkpoint.
 
@@ -415,6 +485,13 @@ def commit_gdn_replayssm_fold_all_layers(
     Use the same normalization setting in verify and commit. Index values and
     aliasing constraints are caller responsibilities (no device synchronization).
     Only FP32 checkpoints are supported.
+
+    With ``u_cache`` (FP32 ``[layers, slots, HV, T, 128]`` delta-rule
+    corrections written by the SM100 verify, T <= 32), ``rawv_cache`` and
+    ``beta_cache`` must be None and the accepted prefix is folded as one
+    scale plus rank-``a`` update with FP32 FMAs; see
+    ``gdn_replayssm_u_commit``. ``u`` embeds the checkpoint read by verify,
+    so each checkpoint must be unchanged between that verify and this commit.
     """
     if checkpoint_state.ndim != 5:
         raise ValueError("checkpoint_state must be [layers, slots, HV, V, K]")
@@ -440,14 +517,51 @@ def commit_gdn_replayssm_fold_all_layers(
     warps_per_cta = 4
     if backend not in ("auto", "simt", "tcgen05"):
         raise ValueError("backend must be auto, simt, or tcgen05")
+    u_mode = u_cache is not None
+    window: tuple[tuple[torch.Tensor | None, tuple[int, ...], torch.dtype, str], ...]
+    if u_mode:
+        if rawv_cache is not None or beta_cache is not None:
+            raise ValueError("u_cache replaces rawv_cache and beta_cache")
+        if backend != "auto":
+            raise ValueError("backend selection applies only to raw windows")
+        # The u fold replays rows 0..accept_lens-1 with no gather. Verify
+        # already refuses to emit u for a tree draft (verify_parents with
+        # replayssm_u), so a u window never describes one; reject the pair
+        # here too instead of silently committing the wrong rows.
+        if accept_paths is not None:
+            raise ValueError("accept_paths is not supported with u_cache")
+        if target.major != 10:
+            raise ValueError("u_cache commit requires SM100/SM103")
+        if max_cache_len > U_MAX_WINDOW:
+            raise ValueError(f"u_cache commit supports T <= {U_MAX_WINDOW}")
+        window = (
+            (
+                u_cache,
+                (num_layers, num_slots, HV, max_cache_len, V),
+                torch.float32,
+                "u_cache",
+            ),
+        )
+    else:
+        if rawv_cache is None or beta_cache is None:
+            raise ValueError("rawv_cache and beta_cache are required without u_cache")
+        window = (
+            (
+                rawv_cache,
+                (num_layers, num_slots, HV, max_cache_len, V),
+                torch.bfloat16,
+                "rawv_cache",
+            ),
+            (
+                beta_cache,
+                (num_layers, num_slots, HV, max_cache_len),
+                torch.float32,
+                "beta_cache",
+            ),
+        )
 
     expected = (
-        (
-            rawv_cache,
-            (num_layers, num_slots, HV, max_cache_len, V),
-            torch.bfloat16,
-            "rawv_cache",
-        ),
+        *window,
         (
             rawk_cache,
             (num_layers, num_slots, H, max_cache_len, K),
@@ -455,12 +569,6 @@ def commit_gdn_replayssm_fold_all_layers(
             "rawk_cache",
         ),
         (g_cache, (num_layers, num_slots, HV, max_cache_len), torch.float32, "g_cache"),
-        (
-            beta_cache,
-            (num_layers, num_slots, HV, max_cache_len),
-            torch.float32,
-            "beta_cache",
-        ),
     )
     if checkpoint_state.dtype != torch.float32:
         raise TypeError("checkpoint_state must be float32")
@@ -472,7 +580,7 @@ def commit_gdn_replayssm_fold_all_layers(
         if tensor.dtype != dtype:
             raise TypeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
 
-    tensors = (checkpoint_state, rawv_cache, rawk_cache, g_cache, beta_cache)
+    tensors = (checkpoint_state, rawk_cache, g_cache) + tuple(w[0] for w in window)
     if not all(t.is_contiguous() for t in tensors):
         raise ValueError("checkpoint and ReplaySSM cache tensors must be contiguous")
     if not all(t.device == checkpoint_state.device for t in tensors):
@@ -522,10 +630,9 @@ def commit_gdn_replayssm_fold_all_layers(
     # Compact strides preserve alignment only when the base is aligned too.
     for name, tensor in (
         ("checkpoint_state", checkpoint_state),
-        ("rawv_cache", rawv_cache),
+        *((w[3], w[0]) for w in window),
         ("rawk_cache", rawk_cache),
         ("g_cache", g_cache),
-        ("beta_cache", beta_cache),
         ("ssm_state_indices", ssm_state_indices),
         ("accept_lens", accept_lens),
         ("track_state_indices", track_indices),
@@ -535,18 +642,35 @@ def commit_gdn_replayssm_fold_all_layers(
         if tensor.data_ptr() % 16:
             raise ValueError(f"{name} must have a 16-byte aligned base address")
 
+    if u_mode:
+        if B == 0:
+            return
+        commit_gdn_replayssm_u_all_layers(
+            checkpoint_state,
+            u_cache,
+            rawk_cache,
+            g_cache,
+            ssm_state_indices,
+            accept_lens,
+            track_state_indices=track_state_indices if has_track else None,
+            track_steps=track_steps if has_track else None,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            null_block_id=null_block_id,
+        )
+        return
+
     if backend == "tcgen05" and target.major != 10:
         raise ValueError("tcgen05 commit requires SM100/SM103")
     supports_tcgen = (
-        target.major == 10 and 4 <= max_cache_len <= 8 and use_qk_l2norm_in_kernel
+        target.major == 10 and 4 <= max_cache_len <= 16 and use_qk_l2norm_in_kernel
     )
     if backend == "tcgen05" and not supports_tcgen:
-        raise ValueError("tcgen05 commit requires normalized T=4..8")
+        raise ValueError("tcgen05 commit requires normalized T=4..16")
     if B == 0:
         return
     # Short windows and small grids do not amortize the tensor-core setup.
     # Select from metadata only: accepted lengths stay device-resident.
-    prefer_tcgen = max_cache_len == 8 or (
+    prefer_tcgen = max_cache_len >= 8 or (
         max_cache_len in (6, 7) and B > 1 and num_layers * B * HV >= 256
     )
     # The tracked snapshot pass costs more than the fold saves at common shapes.
@@ -609,6 +733,7 @@ def commit_gdn_replayssm_fold_all_layers(
                     HAS_TRACK=bool(has_track),
                     HAS_PATHS=has_paths,
                     TRACK_ONLY=track_only,
+                    PREFETCH_NEXT_STEP=target.major == 12,
                     stream=stream,
                 ),
                 extra_key_files=(__file__,),
