@@ -28,19 +28,22 @@ per-row KV counts (``q2k_block_nums``, empty rows produce exact zeros), rank-1/2
 ``q_scale[B,H,Sq]``, ``k_scale[B,Hkv,ceil(Sk/16)]``, ``v_scale[Hkv,D]`` or
 ``v_scale[B,Hkv,D]`` (float32), BF16 BSHD output.
 
-:func:`sage_fp8_quantize_sm100` is the matching fused quantizer (two launches):
-per-token Q scales, per-16-token K scales and per-channel V scales, replacing
-the ~30-kernel torch recipe.
+:func:`sage_fp8_quantize_sm100` is the matching fused quantizer (one launch for
+small rows, two otherwise): per-token Q scales, per-16-token K scales and
+per-channel V scales, replacing the ~30-kernel torch recipe.
+:func:`bsa_attn_sm100_sage_quantize_fwd_cake` runs both from BF16 Q/K/V.
 """
 
 from flashinfer.cake_sage_block_sparse_attention_backend import (
     bsa_attn_sm100_sage_fwd_cake,
+    bsa_attn_sm100_sage_quantize_fwd_cake,
     is_cake_sage_sm100_supported,
     sage_fp8_quantize_sm100,
 )
 
 __all__ = [
     "bsa_attn_sm100_sage_fwd_cake",
+    "bsa_attn_sm100_sage_quantize_fwd_cake",
     "is_cake_sage_sm100_supported",
     "sage_fp8_quantize_sm100",
 ]

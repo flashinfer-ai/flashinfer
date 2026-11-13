@@ -138,7 +138,7 @@ def _reference(
 ):
     """Reference of the kernel's arithmetic over the selected tokens (per (b, h, q-block)).
 
-    FP32 scores of the dequantized operands in log2 units; the online softmax of the kernel's
+    FP32 log2 scores (E4M3 products, scaled after the sum); the online softmax of the kernel's
     two consumer groups (group ``g`` takes every other pair of selected blocks starting at pair
     ``g``; the 128 columns of a pair share one max update).  The row max follows the kernel's
     rule: a pair takes it when the row had none, and later only when the pair's max exceeds
@@ -195,7 +195,13 @@ def _reference(
                     )
                 if not any(len(tok) for tok in blocks):
                     continue
-                qq = q[b, h, q0:q1] * q_scale[b, h, q0:q1, None]
+                # The products take the E4M3 operands as they are (exact in FP32, TF32 and
+                # BF16 inputs) and apply the scales after the sum, as the kernel does; a
+                # product of dequantized FP32 operands would round them to TF32 wherever
+                # TF32 matmuls are on (TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1 in NGC-based
+                # images), which moves P by far more than _P_ROUNDING_SLACK.
+                qq = q[b, h, q0:q1]
+                q_log2 = q_scale[b, h, q0:q1, None] * (scale * _LOG2E)
                 rows = q1 - q0
                 merged = []  # (m, l, acc, bud) of the two consumer groups
                 for g in range(2):
@@ -207,9 +213,9 @@ def _reference(
                         tok = torch.cat(blocks[2 * pair : 2 * pair + 2])
                         if not len(tok):
                             continue
-                        kk = k[b, kh, tok] * k_tok_scale[b, kh, tok, None]
-                        vv = v[b, kh, tok] * v_scale[b, kh][None, :]
-                        s = (qq @ kk.T) * (scale * _LOG2E)
+                        kk = k[b, kh, tok]
+                        vv = v[b, kh, tok]
+                        s = (qq @ kk.T) * (q_log2 * k_tok_scale[b, kh, tok][None, :])
                         tile_max = s.amax(dim=-1)
                         fresh = torch.isinf(m)  # the row had no column yet
                         bump = ~fresh & (tile_max - m > _MAX_STEP_LOG2)
@@ -233,8 +239,9 @@ def _reference(
                     l_all = l_all + w * l_sum
                     acc_all = acc_all + w[:, None] * acc
                     bud_all = bud_all + w[:, None] * bud
-                out[b, h, q0:q1] = acc_all / l_all[:, None]
-                budget[b, h, q0:q1] = bud_all / l_all[:, None]
+                vs = v_scale[b, kh][None, :]
+                out[b, h, q0:q1] = acc_all * vs / l_all[:, None]
+                budget[b, h, q0:q1] = bud_all * vs / l_all[:, None]
                 lse[b, h, q0:q1] = (m_all + torch.log2(l_all) - _P_BIAS_LOG2) * _LN2
     return (
         out.transpose(1, 2).contiguous(),
@@ -403,12 +410,13 @@ def test_cake_sage_sm100_v_scale_without_batch_axis():
 @requires_sm100
 def test_cake_sage_sm100_launches_one_kernel_per_call():
     """The attention call is one kernel: the TMA descriptors travel by value in the
-    kernel parameters, so no upload kernel precedes the attention kernel.  The
-    quantizer is its two kernels behind the zero-fill of its V amax scratch
-    (``torch.zeros``: a torch fill kernel, or a memset on torch builds that zero
-    a fresh tensor that way).  The launch records come from
-    ``tests.cake.test_helpers.cake_profiler``, which retries a profiler session that
-    lost its CUDA records."""
+    kernel parameters, so no upload kernel precedes the attention kernel.  It is the
+    PDL build (``attention_pdl``) by default on SM100/SM103 and the plain one with
+    ``enable_pdl=False``.  The two-launch quantizer is its two kernels behind the
+    zero-fill of its V amax scratch (``zero_``: a torch fill kernel, or a memset on
+    torch builds that zero that way); the one-launch quantizer is one kernel.  The
+    launch records come from ``tests.cake.test_helpers.cake_profiler``, which
+    retries a profiler session that lost its CUDA records."""
     device = torch.device("cuda")
     c = _make_case(
         ("one_launch_b2_h4", 2, 4, 2, 257, 1000, 6, True, True, 2, 40, True, 1.0),
@@ -417,8 +425,9 @@ def test_cake_sage_sm100_launches_one_kernel_per_call():
     out = torch.empty_like(c["q8"], dtype=torch.bfloat16)
     lse = torch.empty(c["q_scale"].shape, dtype=torch.float32, device=device)
     names = cuda_kernel_names(lambda: _run(c, out=out, lse=lse))
-    symbol = loader.MODULES["attention"]["kernel_symbol"]
-    assert names == [symbol], names
+    assert names == [loader.MODULES["attention_pdl"]["kernel_symbol"]], names
+    names = cuda_kernel_names(lambda: _run(c, out=out, lse=lse, enable_pdl=False))
+    assert names == [loader.MODULES["attention"]["kernel_symbol"]], names
     g = torch.Generator(device=device).manual_seed(11)
     q, k, v = (
         torch.randn(s, device=device, generator=g).bfloat16()
@@ -429,12 +438,18 @@ def test_cake_sage_sm100_launches_one_kernel_per_call():
         )
     )
     names = cuda_kernel_names(
-        lambda: sage_fp8_quantize_sm100(q, k, v), exclude=("Memcpy",)
+        lambda: sage_fp8_quantize_sm100(q, k, v, impl="one_launch"),
+        exclude=("Memcpy",),
+    )
+    assert names == [loader.MODULES["quantize_qkv_c8w16"]["kernel_symbol"]], names
+    names = cuda_kernel_names(
+        lambda: sage_fp8_quantize_sm100(q, k, v, impl="two_launch"),
+        exclude=("Memcpy",),
     )
     kernels = [name for name in names if name.startswith("kernel_")]
     assert kernels == [
-        loader.MODULES["quantize_qk_vamax"]["kernel_symbol"],
-        loader.MODULES["quantize_v"]["kernel_symbol"],
+        loader.MODULES["quantize_qk_vamax_pdl"]["kernel_symbol"],
+        loader.MODULES["quantize_v_pdl"]["kernel_symbol"],
     ], names
     fills = [name for name in names if not name.startswith("kernel_")]
     assert fills == [names[0]] and (
@@ -609,7 +624,11 @@ def test_registry_records_reference_the_build_manifest() -> None:
         assert set(record["arches"]) <= set(manifest["arch_flags"]), name
         plan = [tuple(pair) for pair in record["arg_plan"]]
         assert plan[-3:] == [("grid", "grid_x"), ("grid", "grid_y"), ("grid", "grid_z")]
-        for kind, key in plan[:-3]:
+        # A PDL record takes the per-call ``enable_pdl`` argument right before the grid.
+        pdl = record["launch"]["use_pdl"] == "runtime"
+        assert record["launch"]["use_pdl"] in (False, "runtime"), name
+        assert (plan[-4] == ("launch", "enable_pdl")) == pdl, name
+        for kind, key in plan[: -4 if pdl else -3]:
             assert kind in ("buffer", "parameter"), (name, kind, key)
             assert record["logical"][key] in (
                 loader.LOGICAL_TENSORS + loader.LOGICAL_SCALARS
@@ -660,6 +679,16 @@ def test_registry_records_reference_the_build_manifest() -> None:
         == 20
     )
     assert all(loader.MODULES[name]["arches"] == ["sm_120a"] for name in sm120)
-    assert [
-        loader.MODULES[name]["arches"] for name in loader.records_of_role("attention")
-    ] == [["sm_100a", "sm_103a"]]
+    # The default attention build (and its PDL build) ships on both architectures; the
+    # second build of each architecture (split QK on SM100, per tile on SM103) on its own.
+    assert {
+        name: loader.MODULES[name]["arches"]
+        for name in loader.records_of_role("attention")
+    } == {
+        "attention": ["sm_100a", "sm_103a"],
+        "attention_pdl": ["sm_100a", "sm_103a"],
+        "attention_qs": ["sm_100a"],
+        "attention_qs_pdl": ["sm_100a"],
+        "attention_per_tile": ["sm_103a"],
+        "attention_per_tile_pdl": ["sm_103a"],
+    }

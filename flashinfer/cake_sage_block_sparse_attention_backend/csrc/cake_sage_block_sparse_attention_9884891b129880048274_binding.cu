@@ -55,6 +55,17 @@ void CheckUnitInnerStride(const TensorView& t, const char* name) {
       << KERNEL_NAME << ": '" << name << "' needs a unit innermost stride, got " << t.stride(-1);
 }
 
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
+}
+
+int64_t CheckedMul(int64_t a, int64_t b) {
+  int64_t product;
+  if (__builtin_mul_overflow(a, b, &product)) NoInt64(a, "*", b);
+  return product;
+}
+
 cuuint64_t Extent(int64_t value, const char* descriptor) {
   TVM_FFI_CHECK(value > 0, ValueError)
       << KERNEL_NAME << ": an extent of descriptor '" << descriptor << "' resolves to " << value;
@@ -75,12 +86,17 @@ CUtensorMap EncodeTma_q(const TensorView& t) {
   int64_t d2 = t.size(-2);
   int64_t d3 = t.size(-3);
   int64_t d4 = t.size(-4);
-  cuuint64_t global_dim[4] = {Extent(128, "q"), Extent(d2, "q"), Extent(d3, "q"), Extent(d4, "q")};
-  cuuint64_t global_strides[3] = {Stride(d1, "q"), Stride((d2 * d1), "q"), Stride(((d3 * d2) * d1), "q")};
+  cuuint64_t global_dim[4] = {Extent(128LL, "q"), Extent(d2, "q"), Extent(d3, "q"), Extent(d4, "q")};
+  cuuint64_t global_strides[3] = {Stride(d1, "q"), Stride(CheckedMul(d2, d1), "q"), Stride(CheckedMul(CheckedMul(d3, d2), d1), "q")};
   cuuint32_t box_dim[4] = {128u, 1u, 64u, 1u};
   cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[3] <= global_dim[3], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'q' exceeds its source extents";
+  const bool allow_oob_box[4] = {false, false, true, false};
+  for (int axis = 0; axis < 4; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'q' axis " << axis << " (0 is the innermost) has a TMA box of "
+        << box_dim[axis] << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a tile that may run past the end of the axis, a tail tile: a load fills the part past the extent with zeros (its bytes still count toward the barrier's transaction) and a store or reduce skips it, so that is safe when the kernel ignores or masks those rows and columns. If the box was meant to fit, box_dim or the extent is wrong: check box_dim, global_dim and the tensor's shape";
+  }
   TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0 && global_strides[2] % 16 == 0, ValueError)
       << KERNEL_NAME << ": the strides of descriptor 'q' must be multiples of 16 bytes";
   void* address = DataPtr(t);
@@ -102,12 +118,17 @@ CUtensorMap EncodeTma_k(const TensorView& t) {
   int64_t d2 = t.size(-2);
   int64_t d3 = t.size(-3);
   int64_t d4 = t.size(-4);
-  cuuint64_t global_dim[4] = {Extent(128, "k"), Extent(d3, "k"), Extent(d2, "k"), Extent(d4, "k")};
-  cuuint64_t global_strides[3] = {Stride((d2 * d1), "k"), Stride(d1, "k"), Stride(((d3 * d2) * d1), "k")};
+  cuuint64_t global_dim[4] = {Extent(128LL, "k"), Extent(d3, "k"), Extent(d2, "k"), Extent(d4, "k")};
+  cuuint64_t global_strides[3] = {Stride(CheckedMul(d2, d1), "k"), Stride(d1, "k"), Stride(CheckedMul(CheckedMul(d3, d2), d1), "k")};
   cuuint32_t box_dim[4] = {128u, 64u, 1u, 1u};
   cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'k' exceeds its source extents";
+  const bool allow_oob_box[4] = {false, true, false, false};
+  for (int axis = 0; axis < 4; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'k' axis " << axis << " (0 is the innermost) has a TMA box of "
+        << box_dim[axis] << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a tile that may run past the end of the axis, a tail tile: a load fills the part past the extent with zeros (its bytes still count toward the barrier's transaction) and a store or reduce skips it, so that is safe when the kernel ignores or masks those rows and columns. If the box was meant to fit, box_dim or the extent is wrong: check box_dim, global_dim and the tensor's shape";
+  }
   TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0 && global_strides[2] % 16 == 0, ValueError)
       << KERNEL_NAME << ": the strides of descriptor 'k' must be multiples of 16 bytes";
   void* address = DataPtr(t);
@@ -129,12 +150,17 @@ CUtensorMap EncodeTma_v(const TensorView& t) {
   int64_t d2 = t.size(-2);
   int64_t d3 = t.size(-3);
   int64_t d4 = t.size(-4);
-  cuuint64_t global_dim[4] = {Extent(128, "v"), Extent(d3, "v"), Extent(d2, "v"), Extent(d4, "v")};
-  cuuint64_t global_strides[3] = {Stride((d2 * d1), "v"), Stride(d1, "v"), Stride(((d3 * d2) * d1), "v")};
+  cuuint64_t global_dim[4] = {Extent(128LL, "v"), Extent(d3, "v"), Extent(d2, "v"), Extent(d4, "v")};
+  cuuint64_t global_strides[3] = {Stride(CheckedMul(d2, d1), "v"), Stride(d1, "v"), Stride(CheckedMul(CheckedMul(d3, d2), d1), "v")};
   cuuint32_t box_dim[4] = {128u, 64u, 1u, 1u};
   cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'v' exceeds its source extents";
+  const bool allow_oob_box[4] = {false, true, false, false};
+  for (int axis = 0; axis < 4; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'v' axis " << axis << " (0 is the innermost) has a TMA box of "
+        << box_dim[axis] << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a tile that may run past the end of the axis, a tail tile: a load fills the part past the extent with zeros (its bytes still count toward the barrier's transaction) and a store or reduce skips it, so that is safe when the kernel ignores or masks those rows and columns. If the box was meant to fit, box_dim or the extent is wrong: check box_dim, global_dim and the tensor's shape";
+  }
   TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0 && global_strides[2] % 16 == 0, ValueError)
       << KERNEL_NAME << ": the strides of descriptor 'v' must be multiples of 16 bytes";
   void* address = DataPtr(t);
@@ -247,7 +273,7 @@ void Run(TensorView a_q, TensorView a_k, TensorView a_v, TensorView a_out, Tenso
     const uint64_t device_bit = dev.device_id < 64 ? uint64_t{1} << dev.device_id : uint64_t{0};
     if (device_bit == 0 || (prepared_devices & device_bit) == 0) {
       CheckCuda(cudaSetDevice(dev.device_id), "cudaSetDevice");
-      CheckCuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_cake_sage_block_sparse_attention_9884891b129880048274), cudaFuncAttributeMaxDynamicSharedMemorySize, 120320), "cudaFuncSetAttribute");
+      CheckCuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_cake_sage_block_sparse_attention_9884891b129880048274), cudaFuncAttributeMaxDynamicSharedMemorySize, 121344), "cudaFuncSetAttribute");
       prepared_devices |= device_bit;
     }
   }
@@ -281,7 +307,7 @@ void Run(TensorView a_q, TensorView a_k, TensorView a_v, TensorView a_out, Tenso
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(512, 1, 1);
-  config.dynamicSmemBytes = 120320;
+  config.dynamicSmemBytes = 121344;
   config.stream = stream;
   CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_sage_block_sparse_attention_9884891b129880048274), kernel_args),
             "cudaLaunchKernelExC");
