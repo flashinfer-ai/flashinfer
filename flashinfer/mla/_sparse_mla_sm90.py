@@ -10,17 +10,40 @@ packed FP8/NVFP4 sparse-MLA family is a separate API.
 """
 
 import functools
+import json
 import math
 import os
+from typing import Dict, Optional, Tuple
 
 import torch
 import tvm_ffi
 
 from ..api_logging import flashinfer_api
+from ..jit.core import logger
 from ..jit.mla import gen_sparse_mla_sm90_module
 from ..utils import register_custom_op, register_fake_op
 
+# Kill switch shared by FlashInfer's specialized kernels (read at call time):
+# forces the composable torch "reference" backend.
+_SPECIALIZED_KERNEL_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
+# Deprecated alias (kept for one release): the per-kernel switch this op
+# first shipped with.
 _KILL_SWITCH_ENV = "FLASHINFER_DISABLE_SPARSE_MLA_SM90"
+
+# Backends behind the one public API, selected per call (#5667 pattern):
+#   "specialized": the agent-generated SM90 kernel
+#                  (csrc/sparse_mla_sm90.cu).
+#   "reference":   the composable torch path (gather + dequantise the
+#                  fp8_ds_mla rows + fp32 attend) — exact-math, slow; it
+#                  serves the kill switch and every call the specialized
+#                  kernel cannot.
+#   "auto":        "specialized" on the dispatch allowlist
+#                  (sparse_mla_sm90_dispatch.json) on a supported device,
+#                  "reference" otherwise. An explicitly selected backend is
+#                  never silently swapped: "reference" never runs the fused
+#                  kernel, and an unknown backend name raises.
+BACKENDS = ("auto", "specialized", "reference")
+_DISPATCH_FILE = "sparse_mla_sm90_dispatch.json"
 
 # Qualified contract constants (the kernel's own guard relations): 8 q-heads
 # per rank, 512+64 absorbed head dim, Page64 fp8_ds_mla 656-byte rows,
@@ -41,7 +64,166 @@ _MAX_NQ = 64
 
 
 def _disabled() -> bool:
-    return os.environ.get(_KILL_SWITCH_ENV, "0") not in ("", "0", "false", "False")
+    if os.environ.get(_SPECIALIZED_KERNEL_DISABLE_ENV, "0") not in (
+        "", "0", "false", "False",
+    ):
+        return True
+    if os.environ.get(_KILL_SWITCH_ENV, "0") not in ("", "0", "false", "False"):
+        logger.warning_once(
+            "%s is deprecated and will be removed in a future release; set "
+            "%s=1 instead (the kill switch shared by FlashInfer's "
+            "specialized kernels)",
+            _KILL_SWITCH_ENV,
+            _SPECIALIZED_KERNEL_DISABLE_ENV,
+        )
+        return True
+    return False
+
+
+# Per-backend dispatch census and fallback reasons (#5667-style introspection).
+_stats: Dict[str, object] = {
+    "calls": 0,
+    "backend_dispatches": {"specialized": 0, "reference": 0},
+    "fallback_reasons": {},
+}
+
+
+def _fallback(reason: str) -> None:
+    reasons = _stats["fallback_reasons"]
+    reasons[reason] = reasons.get(reason, 0) + 1
+
+
+def _sparse_mla_sm90_stats() -> dict:
+    """Diagnostics: per-backend dispatch counts, fallback reasons, backends."""
+    return {
+        "calls": _stats["calls"],
+        "backend_dispatches": dict(_stats["backend_dispatches"]),
+        "fallback_reasons": dict(_stats["fallback_reasons"]),
+        "backends": BACKENDS,
+        "dispatch_table_loaded": _dispatch_table() is not None,
+    }
+
+
+def _reset_sparse_mla_sm90_stats() -> None:
+    _stats["calls"] = 0
+    for k in _stats["backend_dispatches"]:
+        _stats["backend_dispatches"][k] = 0
+    _stats["fallback_reasons"].clear()
+
+
+@functools.cache
+def _dispatch_table() -> Optional[dict]:
+    """Load the dispatch surface (package data); ``None`` means
+    ``backend="auto"`` never routes to "specialized" (the compiled-in guards
+    below stay authoritative for eligibility)."""
+    try:
+        from importlib import resources
+
+        payload = json.loads(
+            resources.files("flashinfer").joinpath(_DISPATCH_FILE).read_text()
+        )
+        if not isinstance(payload, dict):
+            raise TypeError(f"expected a dict, got {type(payload).__name__}")
+        return payload
+    except Exception as exc:  # noqa: BLE001 - auto-routing is best-effort
+        logger.warning_once(
+            "sparse_mla_decode_sm90: dispatch allowlist %s unavailable "
+            "(%s: %s); backend='auto' will use the composable reference path",
+            _DISPATCH_FILE,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+
+def _auto_routes(query: torch.Tensor, nq: int) -> Tuple[bool, Optional[str]]:
+    """Shape-keyed auto-routing decision for ``backend="auto"``."""
+    table = _dispatch_table()
+    if table is None:
+        return False, "dispatch allowlist unavailable"
+    try:
+        op = table["ops"]["sparse_mla_decode"]
+        routed = (
+            tuple(query.shape[-2:]) == (int(op["num_heads"]), int(op["qk_dim"]))
+            and 1 <= nq <= int(op["envelope"]["max_token_rows"])
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        return False, f"dispatch allowlist invalid ({type(exc).__name__}: {exc})"
+    if not routed:
+        return False, "shape off the auto-routing allowlist"
+    if query.device.type != "cuda" or not _device_supported(query.device):
+        return False, "device unsupported (needs SM90 + 93568B smem opt-in)"
+    return True, None
+
+
+def _backend_order(requested: str, auto_routed: bool) -> Tuple[str, ...]:
+    """#5667-style backend order for one call. A caller who named a backend
+    is never silently swapped: explicit "reference" never sees the fused
+    kernel, explicit "specialized" falls back to the composable reference
+    only."""
+    if requested == "specialized":
+        return ("specialized", "reference")
+    if requested == "reference":
+        return ("reference",)
+    if requested == "auto":
+        return ("specialized", "reference") if auto_routed else ("reference",)
+    return ()
+
+
+def _composable_reference(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    out: torch.Tensor,
+    sm_scale: float,
+) -> torch.Tensor:
+    """The composable torch path: gather the indexed fp8_ds_mla rows,
+    dequantise (per-128-tile fp32 scales on the 512 NoPE dims, bf16 RoPE
+    tail), attend in fp32, write bf16. Exact math, no fused kernel — the
+    kill-switch / fallback semantics of this op, not a performance path."""
+    B, QL, H, D = query.shape
+    KPE = _KPE_DIM
+    CKV = D - KPE
+    TILE = 128
+    ntiles = CKV // TILE
+    num_pages, PAGE, BPT = kv_cache.shape
+    flat = kv_cache.reshape(num_pages * PAGE, BPT)
+    qf = query.to(torch.float32)
+    acc = torch.zeros((B, QL, H, CKV), dtype=torch.float32, device=query.device)
+    for b in range(B):
+        for j in range(QL):
+            idx = indices[b, j].to(torch.int64)
+            slots = idx[idx >= 0]
+            if slots.numel() == 0:
+                continue  # fully -1 row -> zero output
+            rows = flat[slots]
+            nope = (
+                rows[:, :CKV]
+                .contiguous()
+                .view(torch.float8_e4m3fn)
+                .to(torch.float32)
+                .reshape(-1, ntiles, TILE)
+            )
+            scales = (
+                rows[:, CKV : CKV + 4 * ntiles]
+                .contiguous()
+                .view(torch.float32)
+                .reshape(-1, ntiles, 1)
+            )
+            ckv = (nope * scales).reshape(-1, CKV)
+            kpe = (
+                rows[:, CKV + 4 * ntiles :]
+                .contiguous()
+                .view(torch.bfloat16)
+                .to(torch.float32)
+            )
+            qn = qf[b, j, :, :CKV]
+            qp = qf[b, j, :, CKV:]
+            sc = (qn @ ckv.T + qp @ kpe.T) * float(sm_scale)
+            pr = torch.softmax(sc, dim=-1)
+            acc[b, j] = pr @ ckv
+    out.copy_(acc.to(torch.bfloat16))
+    return out
 
 
 def _split_plan(nq: int):
@@ -120,7 +302,8 @@ def is_sparse_mla_sm90_supported(device: torch.device) -> bool:
 
     True only on compute capability 9.0 devices with at least 93568 bytes of
     opt-in dynamic shared memory per block, and only while the
-    ``FLASHINFER_DISABLE_SPARSE_MLA_SM90`` kill switch is unset. Calling this
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE`` kill switch (and its deprecated
+    alias ``FLASHINFER_DISABLE_SPARSE_MLA_SM90``) is unset. Calling this
     builds the JIT module, so call it (or the op) eagerly before any CUDA
     Graph capture.
     """
@@ -129,10 +312,12 @@ def is_sparse_mla_sm90_supported(device: torch.device) -> bool:
     return _device_supported(torch.device(device))
 
 
-def _validate(query, kv_cache, indices, seq_lens, workspace, out, sm_scale, backend):
-    if backend not in ("auto", "sm90"):
+def _validate(query, kv_cache, indices, seq_lens, workspace, out, sm_scale, backend,
+              fused=True):
+    if backend not in BACKENDS:
         raise NotImplementedError(
-            "sparse_mla_decode_sm90 supports backend='auto' or 'sm90' only"
+            f"sparse_mla_decode_sm90 supports backend in {BACKENDS}; an "
+            "explicitly selected backend is never silently swapped"
         )
     tensors = (query, kv_cache, indices, seq_lens, workspace, out)
     if any(not t.is_cuda or t.device != query.device for t in tensors):
@@ -149,7 +334,7 @@ def _validate(query, kv_cache, indices, seq_lens, workspace, out, sm_scale, back
         )
     b, sq = query.shape[:2]
     nq = b * sq
-    if nq < 1 or nq > _MAX_NQ:
+    if fused and (nq < 1 or nq > _MAX_NQ):
         raise NotImplementedError(
             f"qualified token-row envelope is 1 <= batch*q_len <= {_MAX_NQ}, got {nq}"
         )
@@ -182,8 +367,8 @@ def _validate(query, kv_cache, indices, seq_lens, workspace, out, sm_scale, back
         or not seq_lens.is_contiguous()
     ):
         raise ValueError("seq_lens must be contiguous CUDA int32 [B]")
-    required = get_sparse_mla_sm90_workspace_size_bytes(b, sq)
-    if (
+    required = get_sparse_mla_sm90_workspace_size_bytes(b, sq) if fused else 0
+    if fused and (
         workspace.dtype != torch.uint8
         or workspace.ndim != 1
         or not workspace.is_contiguous()
@@ -197,7 +382,7 @@ def _validate(query, kv_cache, indices, seq_lens, workspace, out, sm_scale, back
         raise ValueError(f"out must be contiguous [B, q_len, {_NUM_HEADS}, {_CKV_DIM}]")
     if not math.isfinite(sm_scale) or sm_scale <= 0:
         raise ValueError("sm_scale must be positive finite")
-    if any(t.data_ptr() % 16 for t in (query, kv_cache, workspace, out)):
+    if fused and any(t.data_ptr() % 16 for t in (query, kv_cache, workspace, out)):
         raise ValueError("query/kv_cache/workspace/out require 16-byte alignment")
 
     # Writable buffers must not alias any other tensor.
@@ -215,7 +400,7 @@ def _validate(query, kv_cache, indices, seq_lens, workspace, out, sm_scale, back
                 raise ValueError(
                     "Writable sparse-MLA buffers must not overlap any other tensor"
                 )
-    if not _device_supported(query.device):
+    if fused and not _device_supported(query.device):
         raise NotImplementedError(
             "sparse_mla_decode_sm90 requires an SM90 device with at least "
             "93568 bytes of opt-in shared memory"
@@ -322,10 +507,17 @@ def sparse_mla_decode_sm90(
         up-projection). Allocated when omitted; pass a persistent tensor and
         warm up eagerly before CUDA-graph capture.
     backend : str
-        ``"auto"`` or ``"sm90"``; both run the SM90 kernel. There is no
-        hidden fallback: on any other device, or outside the qualified shape
-        contract, this raises ``NotImplementedError`` instead of silently
-        dispatching a different operator.
+        One of ``BACKENDS = ("auto", "specialized", "reference")``.
+        ``"specialized"`` selects the SM90 fused kernel explicitly; a call it
+        cannot serve (unsupported device, token-row envelope) is served by
+        the composable ``"reference"`` path — never by another fused
+        backend — with the reason recorded in the dispatch stats.
+        ``"reference"`` selects the composable torch path explicitly (exact
+        math, slow) and never runs the fused kernel. ``"auto"`` routes to
+        ``"specialized"`` only on the dispatch allowlist
+        (``flashinfer/sparse_mla_sm90_dispatch.json``) on a supported
+        device, and to ``"reference"`` otherwise. Any other name raises:
+        an explicitly selected backend is never silently swapped.
 
     Returns
     -------
@@ -347,21 +539,89 @@ def sparse_mla_decode_sm90(
     ``workspace_buffer``/``out`` at stable addresses across replays (update
     cache contents and index values in place).
 
-    **Kill switch.** Set ``FLASHINFER_DISABLE_SPARSE_MLA_SM90=1`` to disable
-    the API cleanly (calls raise ``NotImplementedError`` and
-    :func:`is_sparse_mla_sm90_supported` returns ``False``).
+    **Kill switch.** Set ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (the
+    switch shared by FlashInfer's specialized kernels, read at call time) to
+    force the composable ``"reference"`` path;
+    :func:`is_sparse_mla_sm90_supported` then returns ``False``.
+    ``FLASHINFER_DISABLE_SPARSE_MLA_SM90=1`` is a deprecated alias kept for
+    one release.
+
+    **Dispatch stats.** ``flashinfer.mla._sparse_mla_sm90.
+    _sparse_mla_sm90_stats()`` reports per-backend dispatch counts
+    (``specialized`` / ``reference``) and a ``fallback_reasons`` census.
     """
-    if _disabled():
+    _stats["calls"] += 1
+    if backend not in BACKENDS:
         raise NotImplementedError(
-            f"sparse_mla_decode_sm90 is disabled via {_KILL_SWITCH_ENV}. "
-            "FlashInfer ships no other sparse-MLA path on SM90; dispatch to "
-            "an external sparse-MLA implementation instead."
+            f"sparse_mla_decode_sm90 supports backend in {BACKENDS}; an "
+            "explicitly selected backend is never silently swapped"
         )
     if out is None:
         out = torch.empty(
             (*query.shape[:-1], _CKV_DIM), device=query.device, dtype=query.dtype
         )
     scale = float(sm_scale)
+    nq = int(query.shape[0]) * int(query.shape[1]) if query.ndim == 4 else 0
+
+    # Backend resolution (#5667 order; GPU-free checks first).
+    chosen = None
+    if _disabled():
+        _fallback(f"{backend}: kill switch")
+        logger.info_once(
+            "sparse_mla_decode_sm90: disabled (%s, or its deprecated alias "
+            "%s); the composable reference path serves every call",
+            _SPECIALIZED_KERNEL_DISABLE_ENV,
+            _KILL_SWITCH_ENV,
+        )
+        chosen = "reference"
+    elif backend == "reference":
+        chosen = "reference"
+    elif backend == "specialized":
+        if (
+            query.ndim == 4
+            and 1 <= nq <= _MAX_NQ
+            and query.device.type == "cuda"
+            and _device_supported(query.device)
+        ):
+            chosen = "specialized"
+        else:
+            # explicit "specialized" that cannot serve this call: the
+            # composable path, never another fused backend
+            _fallback("specialized: device or token-row envelope")
+            logger.info_once(
+                "sparse_mla_decode_sm90: backend='specialized' cannot serve "
+                "this call (device or token-row envelope); the composable "
+                "reference path serves it"
+            )
+            chosen = "reference"
+    else:  # "auto"
+        routed, reason = _auto_routes(query, nq)
+        if routed:
+            chosen = "specialized"
+        else:
+            _fallback(f"auto: {reason}")
+            logger.info_once(
+                "sparse_mla_decode_sm90: backend='auto' does not route to "
+                "'specialized' (%s); the composable reference path serves it",
+                reason,
+            )
+            chosen = "reference"
+
+    if chosen == "specialized":
+        try:
+            _get_run_fn()
+        except Exception as exc:
+            if torch.cuda.is_current_stream_capturing():
+                raise  # the eager-warmup discipline stays loud under capture
+            _fallback(f"specialized: JIT build failed ({type(exc).__name__})")
+            logger.warning_once(
+                "sparse_mla_decode_sm90: JIT build failed (%s: %s); the "
+                "composable reference path serves this process",
+                type(exc).__name__,
+                str(exc)[:300],
+            )
+            chosen = "reference"
+
     signature = (
         query.shape,
         kv_cache.shape,
@@ -377,11 +637,25 @@ def sparse_mla_decode_sm90(
         out.dtype,
         query.device,
         backend,
+        chosen,
     )
     if signature not in _validated_signatures:
         _validate(
-            query, kv_cache, indices, seq_lens, workspace_buffer, out, scale, backend
+            query,
+            kv_cache,
+            indices,
+            seq_lens,
+            workspace_buffer,
+            out,
+            scale,
+            backend,
+            fused=(chosen == "specialized"),
         )
         _validated_signatures.add(signature)
-    _run(query, kv_cache, indices, seq_lens, workspace_buffer, out, scale)
+    if chosen == "specialized":
+        _run(query, kv_cache, indices, seq_lens, workspace_buffer, out, scale)
+        _stats["backend_dispatches"]["specialized"] += 1
+    else:
+        _composable_reference(query, kv_cache, indices, out, scale)
+        _stats["backend_dispatches"]["reference"] += 1
     return out

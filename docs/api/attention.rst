@@ -227,6 +227,19 @@ Sliding-window MLA (SM90)
 .. autofunction:: batch_decode_with_kv_cache_mla_swa
 .. autofunction:: get_mla_swa_workspace_size_bytes
 
+Sparse MLA decode with top-k indices (SM90)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Attends only the tokens named by a per-query top-k index list over an
+``fp8_ds_mla`` paged KV cache, through the ``"specialized"`` backend
+(``backend="auto"`` routes to it on its dispatch allowlist; the composable
+``"reference"`` torch path serves everything else, including under
+``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``).
+
+.. autofunction:: sparse_mla_decode_sm90
+.. autofunction:: get_sparse_mla_sm90_workspace_size_bytes
+.. autofunction:: is_sparse_mla_sm90_supported
+
 PageAttention for MLA
 ---------------------
 
