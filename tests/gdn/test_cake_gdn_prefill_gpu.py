@@ -737,6 +737,9 @@ def test_public_cake_gdn_prefill_short_tiles_initial_state_off_16_bytes_matches_
     # 16-byte aligned bulk prefetches.  An initial state 8 (FP32) or 4 (BF16)
     # bytes past a 16-byte boundary prefetches the aligned bytes inside it:
     # output and final state equal the aligned call's bit for bit.
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) != "sm_107a":
+        pytest.skip("sm_107a-only: other arches need a 16-byte aligned state")
     case = _make_case(
         seq_lens=(128,) * 32,
         state_dtype=state_dtype,
@@ -744,12 +747,10 @@ def test_public_cake_gdn_prefill_short_tiles_initial_state_off_16_bytes_matches_
         num_k_heads=4,
         num_v_heads=16,
     )
-    major, minor = torch.cuda.get_device_capability()
-    if cake_gdn.arch_for_compute_capability(major, minor) == "sm_107a":
-        route = _public_route(case)
-        assert "_gatestream_full_pf_sm107a_i64meta_" in route.variant_name, (
-            route.variant_name
-        )
+    route = _public_route(case)
+    assert "_gatestream_full_pf_sm107a_i64meta_" in route.variant_name, (
+        route.variant_name
+    )
     initial_state = case["initial_state"]
     aligned_out, aligned_state = _launch(case)
     aligned_out, aligned_state = aligned_out.clone(), aligned_state.clone()
