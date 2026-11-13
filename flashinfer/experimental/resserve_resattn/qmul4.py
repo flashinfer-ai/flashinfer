@@ -1,7 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Rong Shuo
 # SPDX-License-Identifier: Apache-2.0
-# Ported from ResInfer 51b906836a69fa43915040314df57bc9f23030ad.
-# Original source: csrc/resattn/qmul4.py
 """Packed QMUL4 conversion for the production LDSM-to-TMEM decode path."""
 
 from typing import Optional, Type

@@ -1,9 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Rong Shuo
 # SPDX-License-Identifier: Apache-2.0
-"""KEXT allocation and pack dispatch from public ResServe commit 51b9068.
-
-Sources: csrc/nvfp4/quant.py and csrc/nvfp4/cuda/nvfp4_quant_entry.cu.
-"""
+"""KEXT allocation and pack dispatch."""
 
 import functools
 

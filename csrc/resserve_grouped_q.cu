@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Rong Shuo
 // SPDX-License-Identifier: Apache-2.0
-// TVM-FFI adapter for ResInfer's grouped Q residue quantizer.
+// TVM-FFI adapter for ResServe's grouped Q residue quantizer.
 #include <climits>
 #include <flashinfer/experimental/resserve/grouped_q.cuh>
 

@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Rong Shuo
 // SPDX-License-Identifier: Apache-2.0
-// FlashInfer TVM-FFI binding for ResInfer's MEXT quantizer.
+// TVM-FFI adapter for ResServe's MEXT quantizer.
 #include <tvm/ffi/extra/cuda/device_guard.h>
 
 #include <climits>
@@ -32,7 +32,7 @@ void quantize(TensorView input, TensorView scales, TensorView output, TensorView
   int major, minor, sms;
   cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, input.device().device_id);
   cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, input.device().device_id);
-  TVM_FFI_ICHECK(major == 10 && minor == 0) << "ResInfer MEXT currently supports SM100";
+  TVM_FFI_ICHECK(major == 10 && minor == 0) << "ResServe MEXT currently supports SM100";
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, input.device().device_id);
   int groups = k / 16;
   int desired_y = std::min<int>((((m + 127) / 128) * 128 + m - 1) / m, groups);

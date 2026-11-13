@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Rong Shuo (modifications)
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-# Ported from ResServe, commit 51b906836a69fa43915040314df57bc9f23030ad.
-# Source: csrc/common/fold/sm10x/kernel_sm100_fold.py
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Adapted from FlashInfer gemm/kernels/dense_blockscaled_gemm_sm100.py
+# (NVIDIA BSD-3-Clause); local extensions add residue Fold.
 
 from typing import Optional, Tuple, Type, Union
 

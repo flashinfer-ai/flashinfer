@@ -15,8 +15,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-// Ported from ResInfer 51b906836a69fa43915040314df57bc9f23030ad, csrc/common/fp4/nvfp4_utils.cuh.
+// Based on the NVIDIA/vLLM FP4 quantization implementation.
 #pragma once
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

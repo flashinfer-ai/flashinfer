@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Rong Shuo
 // SPDX-License-Identifier: Apache-2.0
-// TVM-FFI adapter for ResInfer's selected-channel K-extension quantizer.
+// TVM-FFI adapter for ResServe's selected-channel K-extension quantizer.
 #include <tvm/ffi/extra/cuda/device_guard.h>
 
 #include <climits>
@@ -44,7 +44,7 @@ void quantize(TensorView input, TensorView scales, TensorView masks, TensorView 
   int major, minor, sms, max_threads;
   cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, input.device().device_id);
   cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, input.device().device_id);
-  TVM_FFI_ICHECK(major == 10 && minor == 0) << "ResInfer KEXT currently supports SM100";
+  TVM_FFI_ICHECK(major == 10 && minor == 0) << "ResServe KEXT currently supports SM100";
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, input.device().device_id);
   cudaDeviceGetAttribute(&max_threads, cudaDevAttrMaxThreadsPerMultiProcessor,
                          input.device().device_id);
@@ -71,7 +71,7 @@ void quantize(TensorView input, TensorView scales, TensorView masks, TensorView 
     auto mask = static_cast<const uint8_t*>(masks.data_ptr());
     auto out = static_cast<uint32_t*>(output.data_ptr());
     auto out_sf = static_cast<uint32_t*>(output_scales.data_ptr());
-    // Launch geometry and pack selection follow the public ResInfer producer.
+    // Launch geometry and pack selection follow the public ResServe producer.
     switch (residue_per_8) {
       case 1:
         LAUNCH(r0125);

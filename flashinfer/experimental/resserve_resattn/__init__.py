@@ -1,1 +1,1 @@
-"""ResInfer ResAttn experimental backend; imported only on explicit use."""
+"""ResServe ResAttn experimental backend; imported only on explicit use."""

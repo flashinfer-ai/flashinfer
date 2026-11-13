@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Rong Shuo
 # SPDX-License-Identifier: Apache-2.0
-"""ResInfer paged NVFP4 attention with grouped Q residue and BF16 output.
+"""ResServe paged NVFP4 attention with grouped Q residue and BF16 output.
 
 Run: python examples/resserve/resattn.py
 Requires SM100 and CUTLASS DSL 4.8 with its CUDA 13.4 PTX compiler.

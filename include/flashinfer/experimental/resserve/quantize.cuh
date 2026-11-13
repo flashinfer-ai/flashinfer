@@ -1,7 +1,5 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Rong Shuo (modifications)
 // SPDX-License-Identifier: Apache-2.0
-// Adapted from ResInfer 51b906836a69fa43915040314df57bc9f23030ad,
-// csrc/nvfp4/cuda/nvfp4_quant_kernels.cu (NVIDIA Apache-2.0 base).
 /*
  * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
  *
@@ -17,6 +15,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// Based on the NVIDIA/vLLM FP4 quantization implementation.
 #pragma once
 #include "quant_utils.cuh"
 

@@ -15,8 +15,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-// Source: ResInfer 51b906836a69fa43915040314df57bc9f23030ad
+// Based on the NVIDIA/vLLM FP4 quantization implementation.
 #pragma once
 #include "quant_utils.cuh"
 namespace flashinfer::resserve {

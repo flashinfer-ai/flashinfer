@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Rong Shuo
 # SPDX-License-Identifier: Apache-2.0
-"""ResInfer grouped residue attention against decoded FP32 attention."""
+"""ResServe grouped residue attention against decoded FP32 attention."""
 
 import pytest
 import torch
