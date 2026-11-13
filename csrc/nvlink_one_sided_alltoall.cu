@@ -20,8 +20,8 @@
 // barriers and the CFT logical-endpoint exchange) are driven from Python over
 // the EP group's communicator; these ops only touch local state. Dispatch and
 // combine run the fence kernels or the sentinel kernels
-// (flashinfer/comm/moe_alltoall_sentinel.cuh). Their CFT counted-write path is
-// not used by NVLinkOneSidedAlltoAll.
+// (flashinfer/comm/moe_alltoall_sentinel.cuh). The moe_a2a_cft_* ops bind CFT
+// logical endpoints to the workspace.
 
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/tuple.h>
@@ -182,14 +182,13 @@ int64_t sentinelBytesPerRow(int64_t topK, SentinelRowBytes const& row, int64_t h
 constexpr int64_t kSentinelSourceMaskOffset = kCachelineAlignment;
 
 // The layout of one rank's workspace slice. Fence regions come first, in the order of the
-// metainfo indices, with the CFT regions among them when canUseCft; the sentinel regions follow
-// when sentinelMaxNumTokens > 0, each on a kWorkspaceAlignment boundary. Payload capacities are
-// padded so the following regions stay aligned.
+// metainfo indices; the sentinel regions follow when sentinelMaxNumTokens > 0, each on a
+// kWorkspaceAlignment boundary. Payload capacities are padded so the following regions stay
+// aligned.
 meta::MoeA2AWorkspaceLayout calculateWorkspaceLayout(
     int64_t epSize, int64_t maxNumTokens, int64_t topK, int64_t dispatchBytes,
-    int64_t combineInputBytes, int64_t combineRecvBytes, int64_t eplbStatsNumExperts,
-    bool canUseCft, int64_t sentinelMaxNumTokens, int64_t sentinelPayloadFormat,
-    int64_t sentinelHiddenSize) {
+    int64_t combineInputBytes, int64_t eplbStatsNumExperts, int64_t sentinelMaxNumTokens,
+    int64_t sentinelPayloadFormat, int64_t sentinelHiddenSize) {
   using namespace meta;
   TVM_FFI_ICHECK(epSize > 0 && epSize <= tl::kMaxRanks) << "Invalid EP size: " << epSize;
   TVM_FFI_ICHECK(maxNumTokens > 0 && maxNumTokens <= std::numeric_limits<int32_t>::max())
@@ -200,8 +199,6 @@ meta::MoeA2AWorkspaceLayout calculateWorkspaceLayout(
       << "Invalid EPLB expert capacity: " << eplbStatsNumExperts;
   TVM_FFI_ICHECK(dispatchBytes > 0 && combineInputBytes > 0)
       << "Dispatch and combine input payload capacities must be positive";
-  TVM_FFI_ICHECK(canUseCft || combineRecvBytes == 0)
-      << "A combine receive payload requires CFT support";
   TVM_FFI_ICHECK(sentinelMaxNumTokens >= 0 && sentinelMaxNumTokens <= maxNumTokens)
       << "Sentinel token capacity must be in [0, max_num_tokens], got " << sentinelMaxNumTokens;
 
@@ -223,21 +220,14 @@ meta::MoeA2AWorkspaceLayout calculateWorkspaceLayout(
     offset += bytes;
   };
   int64_t const rankCountsBytes = epSize * sizeof(int32_t);
-  int64_t const combineSlots = epSize * maxNumTokens;
 
   // Fence protocol. Dispatch writes the counters and routes; combine reuses the completed routes
-  // and pulls from the peers' combine input. CFT counted writes count the bytes they receive and
-  // push the combine partials into a receive inbox instead.
+  // and pulls from the peers' combine input.
   reserve(FLAG_VAL_OFFSET_INDEX, sizeof(uint32_t));
   reserve(LOCAL_TOKEN_COUNTER_OFFSET_INDEX, sizeof(int32_t));
   reserve(SEND_COUNTERS_OFFSET_INDEX, rankCountsBytes);
   reserve(RECV_COUNTERS_OFFSET_INDEX, 2 * rankCountsBytes);
   reserve(DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX, rankCountsBytes, kCachelineAlignment);
-  if (canUseCft) {
-    reserve(DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX, epSize * tl::kCftCounterStride,
-            tl::kCftCounterStride);
-    reserve(DISPATCH_COUNTER_BASELINE_OFFSET_INDEX, epSize * sizeof(uint64_t), kCachelineAlignment);
-  }
   reserve(TOPK_TARGET_RANKS_OFFSET_INDEX, maxNumTokens * topK * sizeof(int32_t),
           kCachelineAlignment);
   reserve(TOPK_TARGET_INDICES_OFFSET_INDEX, maxNumTokens * topK * sizeof(int32_t),
@@ -247,18 +237,8 @@ meta::MoeA2AWorkspaceLayout calculateWorkspaceLayout(
   layout[DISPATCH_PAYLOAD_SIZE_INDEX] = aligned(dispatchBytes);
   reserve(DISPATCH_PAYLOAD_OFFSET_INDEX, layout[DISPATCH_PAYLOAD_SIZE_INDEX], kWorkspaceAlignment);
   reserve(COMBINE_COMPLETION_FLAGS_OFFSET_INDEX, rankCountsBytes, kCachelineAlignment);
-  if (canUseCft) {
-    reserve(COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX, combineSlots * tl::kCftCounterStride,
-            tl::kCftCounterStride);
-    reserve(COMBINE_COUNTER_BASELINE_OFFSET_INDEX, combineSlots * sizeof(uint64_t),
-            kCachelineAlignment);
-  }
   layout[COMBINE_INPUT_SIZE_INDEX] = aligned(combineInputBytes);
   reserve(COMBINE_INPUT_OFFSET_INDEX, layout[COMBINE_INPUT_SIZE_INDEX], kWorkspaceAlignment);
-  if (canUseCft) {
-    layout[COMBINE_RECV_SIZE_INDEX] = aligned(combineRecvBytes);
-    reserve(COMBINE_RECV_OFFSET_INDEX, layout[COMBINE_RECV_SIZE_INDEX], kWorkspaceAlignment);
-  }
 
   // Sentinel protocol: every row group holds sentinelMaxNumTokens * epSize rows (source rank,
   // token). The landing row groups follow one another from the payload rows to the combine rows;
@@ -296,7 +276,6 @@ meta::MoeA2AWorkspaceLayout calculateWorkspaceLayout(
   layout[MAX_NUM_TOKENS_INDEX] = maxNumTokens;
   layout[TOP_K_INDEX] = topK;
   layout[EPLB_STATS_NUM_EXPERTS_INDEX] = eplbStatsNumExperts;
-  layout[CFT_ENABLED_INDEX] = canUseCft;
   layout[WORKSPACE_SIZE_INDEX] = static_cast<int64_t>(alignOffset(offset, kWorkspaceAlignment));
   return layout;
 }
@@ -307,19 +286,16 @@ meta::MoeA2AWorkspaceLayout recalculateWorkspaceLayout(meta::MoeA2AWorkspaceLayo
   return calculateWorkspaceLayout(
       layout[EP_SIZE_INDEX], layout[MAX_NUM_TOKENS_INDEX], layout[TOP_K_INDEX],
       layout[DISPATCH_PAYLOAD_SIZE_INDEX], layout[COMBINE_INPUT_SIZE_INDEX],
-      layout[COMBINE_RECV_SIZE_INDEX], layout[EPLB_STATS_NUM_EXPERTS_INDEX],
-      layout[CFT_ENABLED_INDEX], layout[SENTINEL_MAX_NUM_TOKENS_INDEX],
+      layout[EPLB_STATS_NUM_EXPERTS_INDEX], layout[SENTINEL_MAX_NUM_TOKENS_INDEX],
       layout[SENTINEL_PAYLOAD_FORMAT_INDEX], layout[SENTINEL_HIDDEN_SIZE_INDEX]);
 }
 
-// Write the workspace layout into metainfo, a CPU int64 tensor of NUM_METAINFO_FIELDS: CFT
-// regions with a combineRecvBytes receive inbox when canUseCft, sentinel regions for steps of at
-// most sentinelMaxNumTokens tokens per rank (none when 0) in sentinelPayloadFormat
-// (moe_alltoall_sentinel::PayloadFormat) at sentinelHiddenSize.
+// Write the workspace layout into metainfo, a CPU int64 tensor of NUM_METAINFO_FIELDS: sentinel
+// regions for steps of at most sentinelMaxNumTokens tokens per rank (none when 0) in
+// sentinelPayloadFormat (moe_alltoall_sentinel::PayloadFormat) at sentinelHiddenSize.
 void moeA2AGetWorkspaceLayoutOp(int64_t epSize, int64_t maxNumTokens, int64_t topK,
                                 int64_t dispatchBytes, int64_t combineInputBytes,
-                                int64_t combineRecvBytes, int64_t eplbStatsNumExperts,
-                                bool canUseCft, int64_t sentinelMaxNumTokens,
+                                int64_t eplbStatsNumExperts, int64_t sentinelMaxNumTokens,
                                 int64_t sentinelPayloadFormat, int64_t sentinelHiddenSize,
                                 TensorView metainfo) {
   CHECK_CPU(metainfo);
@@ -327,10 +303,9 @@ void moeA2AGetWorkspaceLayoutOp(int64_t epSize, int64_t maxNumTokens, int64_t to
   CHECK_INPUT_TYPE(metainfo, dl_int64);
   TVM_FFI_ICHECK(metainfo.ndim() == 1 && metainfo.size(0) == meta::NUM_METAINFO_FIELDS)
       << "metainfo must have NUM_METAINFO_FIELDS elements";
-  auto const layout =
-      calculateWorkspaceLayout(epSize, maxNumTokens, topK, dispatchBytes, combineInputBytes,
-                               combineRecvBytes, eplbStatsNumExperts, canUseCft,
-                               sentinelMaxNumTokens, sentinelPayloadFormat, sentinelHiddenSize);
+  auto const layout = calculateWorkspaceLayout(
+      epSize, maxNumTokens, topK, dispatchBytes, combineInputBytes, eplbStatsNumExperts,
+      sentinelMaxNumTokens, sentinelPayloadFormat, sentinelHiddenSize);
   std::copy(layout.begin(), layout.end(), static_cast<int64_t*>(metainfo.data_ptr()));
 }
 
@@ -412,8 +387,6 @@ void moeA2AInitializeOp(TensorView workspace, TensorView metainfo, int64_t epRan
   TVM_FFI_ICHECK_EQ(layout[EP_SIZE_INDEX], epSize) << "Workspace layout EP size mismatch";
   TVM_FFI_ICHECK(layout == recalculateWorkspaceLayout(layout))
       << "metainfo must be a layout from moe_a2a_get_workspace_layout";
-  TVM_FFI_ICHECK(!layout[CFT_ENABLED_INDEX] || layout[COMBINE_RECV_SIZE_INDEX] > 0)
-      << "CFT requires a combine receive payload capacity";
   TVM_FFI_ICHECK(workspace.size(1) >= layout[WORKSPACE_SIZE_INDEX])
       << "Workspace needs " << layout[WORKSPACE_SIZE_INDEX] << " bytes per rank, got "
       << workspace.size(1);
@@ -436,7 +409,7 @@ void moeA2AInitializeOp(TensorView workspace, TensorView metainfo, int64_t epRan
 }
 
 // ============================================================================
-// CFT Handle-Based Counted Writes Initialization
+// CFT logical endpoints
 // ============================================================================
 
 // One CFT binding per process, released before its backing workspace is freed.
@@ -475,7 +448,7 @@ bool moeA2ACftCreateEndpointOp(TensorView workspace, int64_t workspaceMemHandle,
   if (g_cft_manager) {
     TVM_FFI_ICHECK(g_cft_manager->getLocalBackingPtr() == 0)
         << "CFT logical endpoints are already bound to a workspace. Only one workspace per "
-           "process may use CFT counted writes.";
+           "process may bind them.";
     manager = std::move(g_cft_manager);
   } else {
     manager = std::make_unique<tl::CftLeManager>();
@@ -551,9 +524,9 @@ void moeA2ACftReleaseEndpointsOp(TensorView workspace, int64_t epRank) {
   g_cft_manager->releaseEndpoints();
 }
 
-// Write the logical-endpoint ID that dispatch and combine use for each peer rank into
-// idsOut (CPU int64 [epSize]). Launches bake these IDs into their kernel parameters, so a
-// captured CUDA graph stays valid only while the IDs are unchanged.
+// Write the logical-endpoint ID of each rank's workspace slice into idsOut (CPU int64
+// [epSize]). Kernels that take these IDs as parameters bake them into captured CUDA graphs,
+// which stay valid only while the IDs are unchanged.
 void moeA2ACftEndpointIdsOp(TensorView workspace, int64_t epRank, TensorView idsOut) {
   CHECK_CPU(idsOut);
   CHECK_CONTIGUOUS(idsOut);
@@ -746,8 +719,9 @@ void sentinelCombine(TensorView payload, int64_t localNumTokens, TensorView work
 //   - workspace: [ep_size, size_per_rank] uint8 symmetric workspace
 //   - metainfo: CPU int64 workspace layout from moe_a2a_get_workspace_layout
 //   - runtimeMaxTokensPerRank: maximum local batch over the EP group for this round
-//   - expertIdPayloadIndex: index of the int32 expert-id payload whose padding rows the CFT
-//     and sentinel paths fill with invalidTokenExpertId, or -1 to leave sanitization to the caller
+//   - expertIdPayloadIndex: index of the int32 expert-id payload whose padding rows the sentinel
+//     path fills with invalidTokenExpertId, or -1; the fence path leaves sanitization to the
+//     caller (moe_a2a_sanitize_expert_ids)
 //   - useSentinel: run the sentinel protocol; the payloads must be the hidden states, their
 //     scales (quantized formats), the expert ids and optionally the weights, in the workspace's
 //     sentinel payload format. Received rows are then (source rank, token), not compacted, in
@@ -763,7 +737,7 @@ void sentinelCombine(TensorView payload, int64_t localNumTokens, TensorView work
 Tuple<Array<int64_t>, int64_t, int64_t> moeA2ADispatchOp(
     TensorView tokenSelectedExperts, Array<Tensor> inputPayloads, TensorView workspace,
     TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize,
-    int64_t topK, int64_t numExperts, Optional<TensorView> eplbLocalStats, bool useCftCountedWrites,
+    int64_t topK, int64_t numExperts, Optional<TensorView> eplbLocalStats,
     int64_t expertIdPayloadIndex, int64_t invalidTokenExpertId, bool useSentinel,
     bool enableRankMask, Optional<TensorView> activeRankMask, int64_t timeoutSec, bool enablePdl) {
   using namespace meta;
@@ -870,14 +844,11 @@ Tuple<Array<int64_t>, int64_t, int64_t> moeA2ADispatchOp(
       << "Local token count exceeds the runtime capacity";
   TVM_FFI_ICHECK(eplbStatsNumExperts <= offsets[EPLB_STATS_NUM_EXPERTS_INDEX])
       << "EPLB statistics exceed their workspace capacity";
-  TVM_FFI_ICHECK(!useCftCountedWrites || offsets[CFT_ENABLED_INDEX])
-      << "Workspace was allocated without CFT support";
   TVM_FFI_ICHECK(workspace.size(1) >= offsets[WORKSPACE_SIZE_INDEX])
       << "Workspace is smaller than its layout";
 
   if (useSentinel) {
-    TVM_FFI_ICHECK(!useCftCountedWrites && !enableEplb)
-        << "A sentinel dispatch uses neither CFT counted writes nor EPLB statistics";
+    TVM_FFI_ICHECK(!enableEplb) << "A sentinel dispatch takes no EPLB statistics";
     Array<int64_t> recvOffsets = sentinelDispatch(
         tokenSelectedExperts, inputPayloads, expertIdPayloadIndex, workspace, offsets,
         runtimeMaxTokensPerRank, epRank, epSize, topK, numExperts, invalidTokenExpertId,
@@ -934,8 +905,6 @@ Tuple<Array<int64_t>, int64_t, int64_t> moeA2ADispatchOp(
         reinterpret_cast<int*>(targetWorkSpacePtr + offsets[RECV_COUNTERS_OFFSET_INDEX]);
     params.completion_flags[targetRank] = reinterpret_cast<uint32_t*>(
         targetWorkSpacePtr + offsets[DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX]);
-    params.le_dispatch_counters[targetRank] = reinterpret_cast<uint64_t*>(
-        targetWorkSpacePtr + offsets[DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX]);
     params.eplb_gathered_stats[targetRank] =
         enableEplb
             ? reinterpret_cast<int*>(targetWorkSpacePtr + offsets[EPLB_GATHERED_STATS_OFFSET_INDEX])
@@ -950,51 +919,6 @@ Tuple<Array<int64_t>, int64_t, int64_t> moeA2ADispatchOp(
 
   params.eplb_local_stats =
       enableEplb ? static_cast<int32_t const*>(eplbLocalStats.value().data_ptr()) : nullptr;
-
-  // CFT requires all payloads to be 16B-aligned (fabric.try_put.counted operates on 16B chunks).
-  if (useCftCountedWrites) {
-    for (int i = 0; i < numPayloads; i++) {
-      int const bytesPerToken = payloadElementSizes[i] * payloadElementsPerToken[i];
-      TVM_FFI_ICHECK(bytesPerToken % 16 == 0)
-          << "CFT dispatch payload " << i << " has " << bytesPerToken
-          << " bytes per token; CFT counted writes require 16-byte alignment";
-    }
-  }
-  params.use_cft_counted_writes = useCftCountedWrites;
-  // Fused sanitization is a CFT dispatch optimisation; the fence path uses the standalone
-  // moe_a2a_sanitize_expert_ids op instead, so these options are ignored without CFT.
-  params.sanitize_expert_ids = useCftCountedWrites && sanitizeExpertIds;
-  params.expert_id_payload_index = static_cast<int>(expertIdPayloadIndex);
-  params.invalid_expert_id = static_cast<int32_t>(invalidTokenExpertId);
-
-  // CFT handle-based counted writes
-  if (useCftCountedWrites) {
-    TVM_FFI_ICHECK(g_cft_manager && g_cft_manager->isInitialized())
-        << "CFT counted writes requested but the CFT endpoints are not initialized";
-    TVM_FFI_ICHECK(g_cft_manager->getLocalBackingPtr() ==
-                   reinterpret_cast<CUdeviceptr>(rankWorkSpacePtr))
-        << "CFT endpoints are bound to a different workspace";
-
-    // Fill peer LE IDs
-    auto const* leIds = g_cft_manager->getAllLeIds();
-    for (int i = 0; i < static_cast<int>(epSize); i++) {
-      params.cft_peer_le_ids[i] = leIds[i];
-    }
-
-    // LE payload offsets = workspace payload offsets (LE IS the workspace).
-    // No separate LE layout — fabric.try_put.counted writes directly into workspace
-    // recv_buffers.
-    for (int i = 0; i < numPayloads; i++) {
-      params.cft_le_payload_offsets[i] = payloadRecvBufferOffsets[i];
-    }
-    params.cft_le_counter_base = offsets[DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX];
-
-    // recv_buffers and le_dispatch_counters already point to the workspace (set above).
-    // No override needed — workspace IS the LE backing store.
-
-    params.cft_dispatch_counter_baseline = reinterpret_cast<uint64_t*>(
-        rankWorkSpacePtr + offsets[DISPATCH_COUNTER_BASELINE_OFFSET_INDEX]);
-  }
 
   // Resolve the optional active-rank mask. Default (no mask) = all bits set, which
   // exactly reproduces the pre-fault-tolerance kernel behavior.
@@ -1045,16 +969,15 @@ tensorrt_llm::DataType toTllmDataType(DLDataType dtype) {
 // The payload may be external or a view of the combine input region. Recognize the input
 // region by its address; payloadInWorkspace=true additionally requires that zero-copy path.
 // Other sources, including dispatch payload views, are staged when needed.
-// Fence combine reads from 'combinePayloadOffset'. CFT combine stages the local slice and
-// receives peer slices in a dedicated counted-write region before reduction. A sentinel combine
-// (useSentinel, after a sentinel dispatch) reads the payload where it is and pushes it.
+// Fence combine reads from 'combinePayloadOffset'. A sentinel combine (useSentinel, after a
+// sentinel dispatch) reads the payload where it is and pushes it.
 // output: [local_num_tokens, elements_per_token] in the payload dtype.
 void moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView workspace,
                      TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
                      int64_t epSize, int64_t topK, int64_t combinePayloadOffset,
-                     bool payloadInWorkspace, bool useLowPrecision, bool useCftCountedWrites,
-                     bool enableRankMask, Optional<TensorView> activeRankMask, TensorView output,
-                     int64_t timeoutSec, bool enablePdl, bool useSentinel) {
+                     bool payloadInWorkspace, bool useLowPrecision, bool enableRankMask,
+                     Optional<TensorView> activeRankMask, TensorView output, int64_t timeoutSec,
+                     bool enablePdl, bool useSentinel) {
   using namespace meta;
 
   // Validate inputs
@@ -1102,16 +1025,13 @@ void moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView work
       << "Combine EP size/top_k differs from its workspace layout";
   TVM_FFI_ICHECK(sizePerRank >= offsets[WORKSPACE_SIZE_INDEX])
       << "Workspace is smaller than its layout";
-  TVM_FFI_ICHECK(!useCftCountedWrites || offsets[CFT_ENABLED_INDEX])
-      << "Workspace was allocated without CFT support";
   TVM_FFI_ICHECK(runtimeMaxTokensPerRank <= offsets[MAX_NUM_TOKENS_INDEX])
       << "runtimeMaxTokensPerRank exceeds the allocation-time token capacity";
   TVM_FFI_ICHECK(useSentinel == isSentinelRoundOpen(rankWorkSpacePtr))
       << (useSentinel ? "A sentinel combine needs a sentinel dispatch before it"
                       : "A sentinel dispatch must be followed by a sentinel combine");
   if (useSentinel) {
-    TVM_FFI_ICHECK(!useLowPrecision && !useCftCountedWrites)
-        << "A sentinel combine uses neither the FP8 wire format nor CFT counted writes";
+    TVM_FFI_ICHECK(!useLowPrecision) << "A sentinel combine does not use the FP8 wire format";
     sentinelCombine(payload, localNumTokens, workspace, offsets, runtimeMaxTokensPerRank, epRank,
                     epSize, topK, enableRankMask, activeRankMask, output, timeoutSec, enablePdl);
     setSentinelRoundOpen(rankWorkSpacePtr, false);
@@ -1165,44 +1085,6 @@ void moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView work
     params.combine_input_buffers[targetRank] = targetWorkspacePtr + combinePayloadOffset;
   }
 
-  // CFT requires the payload to be 16B-aligned (fabric.try_put.counted operates on 16B chunks).
-  if (useCftCountedWrites) {
-    TVM_FFI_ICHECK(params.wire_bytes_per_token % 16 == 0)
-        << "CFT combine payload has " << params.wire_bytes_per_token
-        << " bytes per token; CFT counted writes require 16-byte alignment";
-  }
-
-  // CFT receives peer pushes and the local contribution into a dedicated local inbox.
-  // Fence combine instead reads the peer combine input buffers directly.
-  params.use_cft_for_combine = useCftCountedWrites;
-  if (useCftCountedWrites) {
-    TVM_FFI_ICHECK(g_cft_manager && g_cft_manager->isInitialized())
-        << "CFT counted writes requested but the CFT endpoints are not initialized";
-    TVM_FFI_ICHECK(g_cft_manager->getLocalBackingPtr() ==
-                   reinterpret_cast<CUdeviceptr>(rankWorkSpacePtr))
-        << "CFT endpoints are bound to a different workspace";
-    auto const* leIds = g_cft_manager->getAllLeIds();
-    for (int i = 0; i < static_cast<int>(epSize); i++) {
-      params.cft_peer_le_ids[i] = leIds[i];
-    }
-
-    // Dedicated combine receive region: prepare writes the local slice and fabric pushes write
-    // peer slices.
-    int64_t const combineRecvRegionOffset = offsets[COMBINE_RECV_OFFSET_INDEX];
-    int64_t const receiveBytes = epSize * runtimeMaxTokensPerRank * params.wire_bytes_per_token;
-    TVM_FFI_ICHECK(receiveBytes <= offsets[COMBINE_RECV_SIZE_INDEX])
-        << "CFT combine receive payload exceeds its workspace capacity: need " << receiveBytes
-        << " bytes, capacity " << offsets[COMBINE_RECV_SIZE_INDEX];
-    params.cft_combine_recv_offset = static_cast<uint64_t>(combineRecvRegionOffset);
-    params.cft_le_combine_counter_base = offsets[COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX];
-    params.cft_le_combine_counters = reinterpret_cast<uint64_t*>(
-        rankWorkSpacePtr + offsets[COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX]);
-    params.cft_combine_recv_payload = rankWorkSpacePtr + combineRecvRegionOffset;
-    params.combine_counter_ep_stride = static_cast<int>(offsets[MAX_NUM_TOKENS_INDEX]);
-    params.cft_combine_counter_baseline = reinterpret_cast<uint64_t*>(
-        rankWorkSpacePtr + offsets[COMBINE_COUNTER_BASELINE_OFFSET_INDEX]);
-  }
-
   // Resolve the optional active-rank mask. Default (no mask) = all bits set.
   resolveRankMask(enableRankMask, activeRankMask, epRank, params.enable_rank_mask,
                   params.active_rank_mask);
@@ -1212,29 +1094,16 @@ void moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView work
   params.prepare_first_token = 0;
   if (params.use_low_precision) {
     params.prepare_num_tokens = params.ep_size * params.max_tokens_per_rank;
-  } else if (params.use_cft_for_combine) {
-    params.prepare_first_token = params.ep_rank * params.max_tokens_per_rank;
-    params.prepare_num_tokens = params.max_tokens_per_rank;
   } else {
     params.prepare_num_tokens = inputIsWorkspace ? 0 : params.ep_size * params.max_tokens_per_rank;
   }
-
-  params.cft_push_payload = params.use_low_precision ? combinePayloadPtr : params.source_payload;
-  params.cft_push_stride_per_token =
-      params.use_low_precision ? params.workspace_stride_per_token : params.source_stride_per_token;
-  params.reduce_stride_per_token =
-      params.use_cft_for_combine ? params.wire_bytes_per_token : params.workspace_stride_per_token;
+  params.reduce_stride_per_token = params.workspace_stride_per_token;
 
   params.stream = get_current_stream();
   params.timeout_cycles = timeoutCycles(timeoutSec);
   params.enable_pdl = enablePdl;
 
   tl::moe_a2a_prepare_combine_launch(params);
-
-  // CFT combine push: processing rank pushes results back to originating rank's LE.
-  if (params.use_cft_for_combine) {
-    tl::moe_a2a_cft_combine_push_launch(params);
-  }
 
   // Launch the combine kernel.
   tl::moe_a2a_combine_launch(params);

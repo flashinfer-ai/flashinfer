@@ -17,7 +17,7 @@
 #pragma once
 
 // CFT depends on CUDA 13.4+ Logical Endpoint headers and matching fabric PTX support.
-// Older CUDA toolchains are intentionally unsupported and compile only CFT stubs/traps.
+// Older CUDA toolchains are intentionally unsupported and compile only CFT stubs.
 #if defined(CUDART_VERSION)
 #define TLLM_CFT_HAS_CUDA_13_4_SUPPORT (CUDART_VERSION >= 13040)
 #elif defined(CUDA_VERSION)
