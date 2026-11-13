@@ -300,7 +300,9 @@ def main():
             # Keep asynchronous plan work out of the first execution timing.
             torch.cuda.synchronize()
             row["plan_completed_wall_us"] = (time.perf_counter_ns() - t0) / 1e3
-            row["actual_backend"] = getattr(w, "_backend", backend)
+            row["actual_backend"] = getattr(
+                w, "resolved_backend", getattr(w, "_backend", backend)
+            )
             if backend == "auto" and a.expect_auto_backend is not None:
                 assert row["actual_backend"] == a.expect_auto_backend, row
             out = torch.empty_like(q)
