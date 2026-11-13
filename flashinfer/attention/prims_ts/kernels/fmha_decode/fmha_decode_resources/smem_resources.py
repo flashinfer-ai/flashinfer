@@ -168,6 +168,37 @@ def _cp_async_bulk_tensor_4d_shared_cta_global_predicated(
 
 
 @cute.jit
+def _cp_async_bulk_tensor_4d_shared_cta_global_lane(
+    dst_mem: cutlass.Array,
+    tma_desc: cutlass.Pointer,
+    coordinates: tuple[Int32, Int32, Int32, Int32],
+    mbar: cutlass.Array,
+    issue: cutlass.Boolean,
+) -> None:
+    """Issue one 4-D TMA load from every lane whose ``issue`` is true.
+
+    Unlike ``_cp_async_bulk_tensor_4d_shared_cta_global_predicated``, each
+    issuing lane passes its own destination and coordinates, so one warp
+    instruction issues up to 32 independent copies.
+    """
+    c0, c1, c2, c3 = coordinates
+    cute.arch.inline_ptx(
+        "cp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
+        "[{$r0}], [{$r1}, {{$r3}, {$r4}, {$r5}, {$r6}}], [{$r2}];",
+        read_only_args=[
+            dst_mem.data_ptr().toint(cutlass.Int32),
+            tma_desc.toint(cutlass.Int64),
+            mbar.data_ptr().toint(cutlass.Int32),
+            c0,
+            c1,
+            c2,
+            c3,
+        ],
+        predicate=issue,
+    )
+
+
+@cute.jit
 def cp_async_bulk_tensor_2d_gather4(
     dst_mem: cutlass.Array,
     tma_desc: cutlass.Pointer,
@@ -1368,7 +1399,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
                             stage_info.barrier,
                         )
                         if cutlass.const_expr(cfg.use_nvfp4_kv):
-                            # SF TensorMaps fold multiple tokens into dim0.
+                            # One box per fragment (see sf_tma_reshape_factor).
                             prims.cp_async_bulk_tensor_shared_cta_global(
                                 sf_stage_base.subview(page_frag * sf_page_elems),
                                 sf_desc,
@@ -1649,14 +1680,20 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     def stages_flat_token_offsets(self) -> bool:
         """Whether staged entries are decoded flat token rows, not locators.
 
-        The uniform FP8 issuer reads them directly. An NVFP4 raw ring loaded
-        for that profile reads the same entries and must not decode again.
+        The uniform FP8 issuer reads them directly. A Keeps transform-KV
+        profile stages them as its FP8 operand profile would, and its raw
+        NVFP4 ring reads the same entries without decoding again.
         """
+        operand_cfg = (
+            self.cfg.keeps_transformed_kv_ring_cfg
+            if self.cfg.uses_keeps_transformed_kv
+            else self.cfg
+        )
         return (
             self.use_native_paged_kv
             and self.cfg.uses_q_token_kv_block_sparse_page_route
-            and self.cfg.use_fp8_qkv
-            and self.cfg.uses_2d_flat_kv_tma
+            and operand_cfg.use_fp8_qkv
+            and operand_cfg.uses_2d_flat_kv_tma
         )
 
     @property
@@ -3094,7 +3131,7 @@ class SmemKvResource(DecodeGenResourceBase):
         logical_h_k_idx, logical_b_idx = _logical_head_batch(
             stage_info, self.h_k_idx, self.b_idx
         )
-        head_dim_stage = cfg.head_dim_kv_stage
+        head_dim_stage = cfg.raw_kv_head_dim_stage
         head_dim_stage_offset = head_dim_stage_idx * head_dim_stage
 
         if cutlass.const_expr(cfg.tile_size_kv == 256):
@@ -3196,6 +3233,59 @@ class SmemKvResource(DecodeGenResourceBase):
                                 stage_info.barrier,
                             )
                 elif cutlass.const_expr(
+                    cfg.uses_keeps_transformed_kv
+                    and read_locators_from_smem
+                    and pages_per_warp <= 32
+                ):
+                    # The Keeps NVFP4 raw ring issues its fragments
+                    # lane-parallel: lane l of each active load warp copies
+                    # fragment l of the warp's share (payload, then scales),
+                    # so one pass issues every copy instead of a serial
+                    # locator-read-and-issue loop on one elected lane.
+                    lane = cute.arch.lane_idx()
+                    issue = lane < Int32(pages_per_warp)
+                    if cutlass.const_expr(active_load_warps < cfg.load_num_warps):
+                        issue = issue & (load_warp_rank < Int32(active_load_warps))
+                    page_frag = load_warp_rank * Int32(pages_per_warp) + (
+                        lane % Int32(pages_per_warp)
+                    )
+                    locator = self.page_offsets_kv.page_id(
+                        grouped_tile_idx, local_tile_idx, page_frag
+                    )
+                    token_offset, physical_page = _decode_native_page_locator(
+                        cfg, locator
+                    )
+                    if cutlass.const_expr(cfg.use_nvfp4_interleaved_kv):
+                        smem_page_offset = page_frag * Int32(
+                            cfg.nvfp4_interleaved_fragment_bytes
+                        )
+                        head_dim_coord = Int32(0)
+                    else:
+                        smem_page_offset = page_frag * Int32(
+                            cfg.num_tokens_per_page * (head_dim_stage // 2)
+                        )
+                        head_dim_coord = Int32(head_dim_stage_offset // 2)
+                    _cp_async_bulk_tensor_4d_shared_cta_global_lane(
+                        stage_base.subview(smem_page_offset),
+                        tma_desc,
+                        (head_dim_coord, token_offset, logical_h_k_idx, physical_page),
+                        stage_info.barrier,
+                        issue,
+                    )
+                    if cutlass.const_expr(cfg.uses_nvfp4_scale_tensors):
+                        _cp_async_bulk_tensor_4d_shared_cta_global_lane(
+                            sf_stage_base.subview(page_frag * sf_page_elems),
+                            sf_desc,
+                            (
+                                Int32(0),
+                                token_offset // Int32(cfg.sf_tma_reshape_factor),
+                                logical_h_k_idx,
+                                physical_page,
+                            ),
+                            stage_info.barrier,
+                            issue,
+                        )
+                elif cutlass.const_expr(
                     cfg.load_num_warps == 1
                 ) or load_warp_rank < Int32(active_load_warps):
                     for local_page_idx in cutlass.range_constexpr(pages_per_warp):
@@ -3248,8 +3338,8 @@ class SmemKvResource(DecodeGenResourceBase):
                             stage_info.barrier,
                         )
                         # Scale factors for the same page use the same transaction
-                        # barrier as the packed K/V payload. Their TensorMaps
-                        # fold multiple tokens into dim0.
+                        # barrier as the packed K/V payload, one box per fragment
+                        # (see FmhaDecodeConfig.sf_tma_reshape_factor).
                         if cutlass.const_expr(cfg.uses_nvfp4_scale_tensors):
                             _cp_async_bulk_tensor_4d_shared_cta_global_predicated(
                                 sf_stage_base.subview(page_frag * sf_page_elems),

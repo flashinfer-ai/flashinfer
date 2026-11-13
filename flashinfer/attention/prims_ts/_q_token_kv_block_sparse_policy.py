@@ -41,6 +41,26 @@ class SparseLaunch:
         return self.tile_size_q >= 64
 
 
+# Widest SwapsMmaAb Q tile: more Q rows per KV head need a KeepsMmaAb recipe.
+MAX_SWAPS_TILE_SIZE_Q = 32
+
+
+def prefers_nvfp4_keeps(q_dtype_key: str, group_size: int, heads_q_per_kv: int) -> bool:
+    """Whether NVFP4 K/V should take the KeepsMmaAb transform target.
+
+    ``group_size * heads_q_per_kv`` Q rows share one KV head. Wider groups than
+    the widest Swaps Q tile need Keeps for either Q dtype. BF16 Q always takes
+    it: its full-D256 BF16 stages measured faster than the TMEM-transformed
+    Swaps recipe on GB300. FP8 Q takes it from five grouped tokens, where its
+    per-Q-row softmax measured faster than the Swaps recipe's per-K-row
+    softmax over transformed NVFP4.
+    """
+    wide_group = group_size * heads_q_per_kv > MAX_SWAPS_TILE_SIZE_Q
+    if q_dtype_key == "float8_e4m3fn":
+        return group_size >= 5 or wide_group
+    return q_dtype_key == "bfloat16"
+
+
 def select_sparse_launch(
     *,
     group_size: int,
@@ -59,7 +79,7 @@ def select_sparse_launch(
     G is already fixed by the caller. This function never changes it, queries
     the device, reads tensors, or applies a batch/context tuning table.
     ``prefer_keeps_mma_ab`` takes the one-instance Keeps recipe for wide-head
-    FP8 groups even when the Swaps recipe would split KV.
+    groups even when the Swaps recipe would split KV.
     """
     from .kernels.fmha_decode.fmha_decode_config import (
         MIN_LOOP_ITERS_PER_SPLIT,
@@ -123,13 +143,13 @@ def select_sparse_launch(
     candidate = recipe(minimum_q)
     instances = 1 if head_dim > 128 and candidate.variant == "keeps_mma_ab" else 2
     splits = fanout(instances)
-    # Other wide-head FP8 groups may use Swaps only when split-KV is active,
-    # unless the caller prefers Keeps (the NVFP4-fed FP8 Keeps recipe).
+    # Other wide-head FP8 groups may use Swaps only when split-KV is active.
+    # A caller preferring Keeps (the NVFP4 Keeps transform target) takes it
+    # for either Q dtype.
     if (
         head_dim in (192, 256)
-        and q_dtype_key == "float8_e4m3fn"
-        and (splits == 1 or prefer_keeps_mma_ab)
         and candidate.tile_size_q < 64
+        and (prefer_keeps_mma_ab or (q_dtype_key == "float8_e4m3fn" and splits == 1))
     ):
         candidate = recipe(64)
         instances = 1

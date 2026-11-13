@@ -291,7 +291,11 @@ class TmemOResource(DecodeGenResourceBase):
                     # the next pair once the K steps have covered 64 tokens.
                     k_steps_per_block = 64 // mma_k_step
                     block_pair_desc_units = (
-                        2 * 64 * cfg.headdim * cfg.v_dtype_bytes // SMEM_DESC_UNIT_BYTES
+                        2
+                        * 64
+                        * cfg.headdim
+                        * cfg.pv_dtype_bytes
+                        // SMEM_DESC_UNIT_BYTES
                     )
                     iter_v_desc = v_desc + Int32(
                         (k_step // k_steps_per_block) * block_pair_desc_units

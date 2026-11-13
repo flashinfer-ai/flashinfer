@@ -39,6 +39,7 @@ from cutlass.experimental.task_scheduling.resources import (
 from ......cute_dsl.availability import is_rubin_cute_dsl_available
 from ...placeholder_helpers import _placeholder_local_array
 from ..fmha_decode_config import FmhaDecodeConfig
+from ..fmha_decode_constants import KV_KIND_V
 from .helpers_common import (
     _TASK_CACHE_TMEM_BASE_OFFSET,
     _TASK_CACHE_WARP_GRP_THREAD_IDX,
@@ -296,6 +297,16 @@ def byte_permute(a: Int32, b: Int32, selector: Constexpr[int]) -> Int32:
         f"prmt.b32 {{$w0}}, {{$r0}}, {{$r1}}, {selector:#x};",
         write_only_types=[Int32],
         read_only_args=[a, b],
+    )
+
+
+@cute.jit
+def byte_permute_runtime(a: Int32, b: Int32, selector: Int32) -> Int32:
+    """``byte_permute`` with a runtime ``selector``."""
+    return cute.arch.inline_ptx(
+        "prmt.b32 {$w0}, {$r0}, {$r1}, {$r2};",
+        write_only_types=[Int32],
+        read_only_args=[a, b, selector],
     )
 
 
@@ -1030,15 +1041,21 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
 
 @dataclass(kw_only=True)
 class SmemNvfp4RawKvResource(SmemKvResource):
-    """Raw interleaved-NVFP4 ring of the NVFP4-fed Keeps profiles.
+    """Raw NVFP4 ring of the Keeps profiles fed by the NVFP4 transform.
+
+    Each stage holds one KV128 tile of whole D256 rows: interleaved rows
+    (payload, then scales) in page-fragment slots, or 128-byte SW128 payload
+    rows whose scale rows sit in the ring's scale stage
+    (``FmhaDecodeConfig.uses_sw128_nvfp4_raw_payload``). ``payload_row``,
+    ``payload_chunk`` and ``scale_words`` address either layout.
 
     TransformKvTask converts each stage into the FP8 or BF16 K/V rings. With
     register capture (the BF16 single-raw-stage profile), it first copies its
     share of the tile into registers (``capture_tile``) and releases the
     stage before waiting for the BF16 destination, so the loader refills it
-    while the transform writes. Each thread then holds one (token,
-    64-channel slab) unit per D128 head-dim stage: eight payload words and
-    one word of four block scales.
+    while the transform writes. Each thread then holds its (token,
+    64-channel slab) units of the tile: eight payload words and one word of
+    four block scales each.
     """
 
     # FmhaDecodeConfig.uses_nvfp4_raw_register_capture of the profile; this
@@ -1049,9 +1066,9 @@ class SmemNvfp4RawKvResource(SmemKvResource):
 
     @property
     def captured_units(self) -> int:
-        """(token, slab) units per thread across the tile's head-dim stages."""
+        """(token, 64-channel slab) units per thread across the whole tile."""
         cfg = self.cfg
-        return (2 * cfg.tile_size_kv * cfg.num_head_dim_stages_kv) // (
+        return (cfg.headdim // 64 * cfg.tile_size_kv) // (
             cfg.transform_kv_num_warps * 32
         )
 
@@ -1079,44 +1096,164 @@ class SmemNvfp4RawKvResource(SmemKvResource):
             )
         return task_locals
 
+    @cute.jit
+    def payload_row(self, stage_idx: Int32, token: Int32) -> Int32:
+        """Shared address of tile token ``token``'s row in raw stage ``stage_idx``."""
+        cfg = self.cfg
+        stage_base = Int32(self._smem_base_kv.data_ptr().toint()) + (
+            stage_idx * Int32(cfg.smem_kv_tile_elements)
+        )
+        if cutlass.const_expr(cfg.use_nvfp4_interleaved_kv):
+            return stage_base + cfg.nvfp4_interleaved_row_offset(token)
+        return stage_base + token * Int32(cfg.headdim // 2)
+
+    @cute.jit
+    def payload_chunk(self, row: Int32, token: Int32, byte_offset: Int32) -> Int32:
+        """Address of the 16-byte payload chunk at ``byte_offset`` of a row.
+
+        ``row`` is ``payload_row`` of ``token``; ``byte_offset`` is a multiple
+        of 16 (32 E2M1 channels). A SW128 row stores its chunk ``c`` at chunk
+        ``c ^ (token % 8)``.
+        """
+        if cutlass.const_expr(self.cfg.uses_sw128_nvfp4_raw_payload):
+            return row + (((byte_offset >> Int32(4)) ^ (token & Int32(7))) << Int32(4))
+        return row + byte_offset
+
+    @cute.jit
+    def scale_words(
+        self,
+        stage_idx: Int32,
+        row: Int32,
+        token: Int32,
+        first_block: Int32,
+        num_words: Constexpr[int],
+        kv_kind: Constexpr[int],
+    ):
+        """Load ``num_words`` (1 or 2) words of ``token``'s E4M3 block scales.
+
+        Word ``j`` packs the scales of 16-channel blocks ``first_block + 4j``
+        to ``first_block + 4j + 3``, lowest byte first; ``first_block`` is a
+        multiple of 4 and ``row`` is ``payload_row`` of ``token``. Interleaved
+        rows hold the scales after the payload. The scale stage holds K rows
+        token-major and V rows in TRT-LLM's 4-token interleaved order (byte
+        ``4 * block + token % 4`` of each 4-token group, see
+        ``SmemTransformedKvResource._load_nvfp4_scale_byte``); one 16-byte
+        load and three byte permutes then gather a V word.
+        """
+        assert num_words in (1, 2)
+        cfg = self.cfg
+        if cutlass.const_expr(cfg.use_nvfp4_interleaved_kv):
+            addr = row + Int32(cfg.headdim // 2) + first_block
+        else:
+            sf_stage = Int32(self._smem_base_kv_sf.data_ptr().toint()) + (
+                stage_idx * Int32(cfg.smem_kv_sf_tile_bytes)
+            )
+            addr = sf_stage + cfg.smem_kv_sf_row_offset(token) + first_block
+            if cutlass.const_expr(kv_kind == KV_KIND_V):
+                group = sf_stage + cfg.smem_kv_sf_row_offset(token & Int32(-4))
+                # prmt selector picking byte token % 4 of each source word.
+                token_byte = token & Int32(3)
+                selector = token_byte * Int32(0x11) + Int32(0x40)
+                words = []
+                for word_idx in cutlass.range_constexpr(num_words):
+                    blocks = ld_shared_v4_b32(
+                        group + (first_block + Int32(4 * word_idx)) * Int32(4)
+                    )
+                    lo = byte_permute_runtime(blocks[0], blocks[1], selector)
+                    hi = byte_permute_runtime(blocks[2], blocks[3], selector)
+                    words.append(byte_permute(lo, hi, 0x5410))
+                return tuple(words)
+        if cutlass.const_expr(num_words == 1):
+            return (ld_shared_b32(addr),)
+        return ld_shared_v2_b32(addr)
+
+    @cute.jit
+    def bf16_unit(self, rep: Constexpr[int]):
+        """``(token, slab, half)`` of this thread's BF16 transform unit ``rep``.
+
+        A unit is one (token, 64-channel slab) row piece: 32 payload bytes and
+        one word of four block scales. Each thread converts the
+        ``captured_units`` units of one token. With separate scale tensors
+        (SW128 payload rows), lane pairs share a token and ``half`` = lane % 2
+        takes slabs ``2 * half + rep``; each eight-lane quarter warp then
+        covers one four-token scale fragment, and walking the two 16-byte
+        payload chunks in opposite orders per half (chunk ``c ^ half``) keeps
+        the payload loads, scale loads and SW128 stores free of bank
+        conflicts. Interleaved 144-byte rows keep 32 consecutive tokens per
+        warp and slab, whose row stride already spreads their payload loads.
+        """
+        cfg = self.cfg
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - Int32(
+            cfg.transform_kv_warp_idx
+        )
+        lane = cute.arch.lane_idx()
+        if cutlass.const_expr(cfg.uses_sw128_nvfp4_raw_payload):
+            assert cfg.transform_kv_num_warps * 16 == cfg.tile_size_kv
+            half = lane & Int32(1)
+            token = warp * Int32(16) + (lane >> Int32(1))
+            return token, half * Int32(2) + Int32(rep), half
+        unit = warp * Int32(32) + lane + Int32(rep * cfg.transform_kv_num_warps * 32)
+        return unit % Int32(cfg.tile_size_kv), unit // Int32(cfg.tile_size_kv), Int32(0)
+
+    @cute.jit
+    def bf16_unit_scale_words(
+        self, stage_idx: Int32, token: Int32, half: Int32, kv_kind: Constexpr[int]
+    ):
+        """Block-scale words of this thread's units, one per ``bf16_unit`` rep.
+
+        Separate K scales are token-major, so a token's two words (slabs
+        ``2 * half`` and ``2 * half + 1``) are one 8-byte load.
+        """
+        cfg = self.cfg
+        row = self.payload_row(stage_idx, token)
+        if cutlass.const_expr(
+            cfg.uses_sw128_nvfp4_raw_payload and kv_kind != KV_KIND_V
+        ):
+            sf_stage = Int32(self._smem_base_kv_sf.data_ptr().toint()) + (
+                stage_idx * Int32(cfg.smem_kv_sf_tile_bytes)
+            )
+            return ld_shared_v2_b32(
+                sf_stage + cfg.smem_kv_sf_row_offset(token) + half * Int32(8)
+            )
+        words = []
+        for rep in cutlass.range_constexpr(self.captured_units):
+            _, slab, _ = self.bf16_unit(rep)
+            words.append(
+                self.scale_words(stage_idx, row, token, slab * Int32(4), 1, kv_kind)[0]
+            )
+        return tuple(words)
+
     @consumer_work
     @cute.jit
-    def capture_tile(self, stage_info: StageInfo) -> None:
-        """Copy this thread's units of the raw tile into registers.
+    def capture_tile(self, stage_info: StageInfo, *, kv_kind: Constexpr[int]) -> None:
+        """Copy this thread's units of the raw ``kv_kind`` tile into registers.
 
         Every raw SMEM read finishes here, so the stage can be released
         before the transform waits for its destination; the registers stay
         owned by the transform until its last destination commit. Unit
-        ``idx`` covers head-dim stage ``idx * threads // (2 * tile_size_kv)``
-        in the order ``SmemKvFromNvfp4Resource.bf16_from_raw`` reads them.
+        ``idx`` is ``bf16_unit(idx)``, and capture slot ``c`` of a unit holds
+        the payload chunk ``SmemKvFromNvfp4Resource.bf16_from_raw`` converts
+        at its step ``c``.
         """
         assert self.uses_register_capture
-        cfg = self.cfg
-        num_threads = cfg.transform_kv_num_warps * 32
-        units_per_stage = 2 * cfg.tile_size_kv
-        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - Int32(
-            cfg.transform_kv_warp_idx
-        )
-        thread = warp * Int32(32) + cute.arch.lane_idx()
-        stage_base = Int32(self._smem_base_kv.data_ptr().toint()) + (
-            stage_info.stage_idx * Int32(cfg.smem_kv_tile_elements)
-        )
+        token, _, half = self.bf16_unit(0)
+        row = self.payload_row(stage_info.stage_idx, token)
+        scales = self.bf16_unit_scale_words(stage_info.stage_idx, token, half, kv_kind)
         for idx in cutlass.range_constexpr(self.captured_units):
-            head_dim_stage_idx = idx * num_threads // units_per_stage
-            unit = thread + Int32(idx * num_threads % units_per_stage)
-            token = unit % Int32(cfg.tile_size_kv)
-            slab = unit // Int32(cfg.tile_size_kv)
-            row = stage_base + cfg.nvfp4_interleaved_row_offset(token)
-            payload = row + Int32(64 * head_dim_stage_idx) + slab * Int32(32)
+            _, slab, _ = self.bf16_unit(idx)
             for chunk in cutlass.range_constexpr(2):
-                words = ld_shared_v4_b32(payload + Int32(chunk * 16))
+                words = ld_shared_v4_b32(
+                    self.payload_chunk(
+                        row,
+                        token,
+                        ((Int32(chunk) ^ half) << Int32(4)) + slab * Int32(32),
+                    )
+                )
                 for word_idx in cutlass.range_constexpr(4):
                     self.captured_words[8 * idx + 4 * chunk + word_idx] = words[
                         word_idx
                     ]
-            self.captured_scales[idx] = ld_shared_b32(
-                row + Int32(cfg.headdim // 2 + 8 * head_dim_stage_idx) + slab * Int32(4)
-            )
+            self.captured_scales[idx] = scales[idx]
 
 
 @dataclass(kw_only=True)
@@ -1126,10 +1263,10 @@ class SmemKvFromNvfp4Resource(SmemKvTileResource):
     MMA consumes it exactly like a TMA-loaded ``SmemKvTileResource`` of the
     matching KeepsMmaAb profile: 128-row slabs of 128-byte SW128 rows,
     token-major for both K (K-major B) and V (MN-major B), so neither operand
-    needs a transpose. An FP8 D256 stage holds two 128-channel slabs; a BF16
-    D128 head-dim stage holds two 64-channel slabs, so one raw tile fills two
-    BF16 stages. ``raw_src`` is the raw interleaved ring whose current
-    consumer stage the transform converts.
+    needs a transpose. A D256 stage holds two 128-channel FP8 slabs or four
+    64-channel BF16 slabs, so one raw tile fills one stage of either dtype.
+    ``raw_src`` is the raw NVFP4 ring whose current consumer stage the
+    transform converts.
     """
 
     raw_src: Constexpr[SmemKvResource | None] = None
@@ -1141,7 +1278,8 @@ class SmemKvFromNvfp4Resource(SmemKvTileResource):
     ) -> None:
         """Convert the raw ring's current tile into this ring's stage.
 
-        ``head_dim_stage_idx`` selects the BF16 D128 stage; FP8 has one.
+        ``head_dim_stage_idx`` selects a BF16 head-dim stage; the D256
+        Keeps profiles have one stage for either dtype.
         """
         if cutlass.const_expr(self.cfg.k_dtype_bytes == 2):
             self.bf16_from_raw(stage_info, head_dim_stage_idx)
@@ -1150,59 +1288,49 @@ class SmemKvFromNvfp4Resource(SmemKvTileResource):
             self.fp8_from_raw(stage_info)
 
     @cute.jit
-    def raw_row_addr(self, token: Int32) -> Int32:
-        """Shared address of ``token``'s interleaved row in the raw stage."""
-        raw_cfg = self.raw_src.cfg
-        src_stage = self.raw_src.state_src.consumer_work_stage
-        stage_base = Int32(self.raw_src._smem_base_kv.data_ptr().toint()) + (
-            src_stage * Int32(raw_cfg.smem_kv_tile_elements)
-        )
-        return stage_base + raw_cfg.nvfp4_interleaved_row_offset(token)
-
-    @cute.jit
     def bf16_from_raw(
         self, stage_info: StageInfo, head_dim_stage_idx: Constexpr[int]
     ) -> None:
-        """Convert one 128-channel slice of the raw tile into a BF16 stage.
+        """Convert the raw tile's D256 head-dim stage to BF16.
 
-        Each thread owns (token, 64-channel slab) rows: 32 payload bytes and
-        their four block scales become one 128-byte SW128 row. E2M1 x E4M3
+        Each thread owns the (token, 64-channel slab) units of
+        ``SmemNvfp4RawKvResource.bf16_unit``: 32 payload bytes and their four
+        block scales become one 128-byte SW128 row per unit. E2M1 x E4M3
         products are exact in BF16, so this matches the dequantized cache.
         With register capture the bytes come from ``raw_src``'s registers
         (see ``SmemNvfp4RawKvResource.capture_tile``) instead of its stage.
         """
         cfg = self.cfg
         assert cfg.k_dtype_bytes == 2 and cfg.v_dtype_bytes == 2
-        assert cfg.headdim == 256 and cfg.head_dim_kv_stage == 128
+        assert cfg.headdim == 256 and cfg.head_dim_kv_stage == 256
+        assert head_dim_stage_idx == 0
         assert cfg.tile_size_kv == 128
-        num_threads = cfg.transform_kv_num_warps * 32
-        units = 2 * cfg.tile_size_kv
-        assert units % num_threads == 0
-        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - Int32(
-            cfg.transform_kv_warp_idx
+        raw = self.raw_src
+        assert (
+            raw.captured_units * cfg.transform_kv_num_warps * 32 == 4 * cfg.tile_size_kv
         )
-        thread = warp * Int32(32) + cute.arch.lane_idx()
         dst_base = Int32(self._stage_base(stage_info).data_ptr().toint())
         slab_bytes = cfg.tile_size_kv * 128
-        captured = self.raw_src.uses_register_capture
-        for rep in cutlass.range_constexpr(units // num_threads):
-            unit = thread + Int32(rep * num_threads)
-            token = unit % Int32(cfg.tile_size_kv)
-            slab = unit // Int32(cfg.tile_size_kv)
-            # This unit's capture index (see capture_tile).
-            idx = (head_dim_stage_idx * units + rep * num_threads) // num_threads
+        src_stage = raw.state_src.consumer_work_stage
+        captured = raw.uses_register_capture
+        token, _, half = raw.bf16_unit(0)
+        if cutlass.const_expr(not captured):
+            row = raw.payload_row(src_stage, token)
+            sf_words = raw.bf16_unit_scale_words(src_stage, token, half, self.kv_kind)
+        # SW128: 16-byte segment s of row r lands at segment s ^ (r % 8).
+        swizzle = token % Int32(8)
+        # Step ``chunk`` converts payload chunk ``chunk ^ half`` (see
+        # bf16_unit); swapping the scale word's 16-bit halves for half 1
+        # pairs that chunk with its two block scales.
+        sf_selector = Int32(0x3210) ^ (half * Int32(0x2222))
+        for idx in cutlass.range_constexpr(raw.captured_units):
+            _, slab, _ = raw.bf16_unit(idx)
             if cutlass.const_expr(captured):
-                sf_word = self.raw_src.captured_scales[idx]
+                sf_word = raw.captured_scales[idx]
             else:
-                row = self.raw_row_addr(token)
-                # Channels 128 * stage + 64 * slab: 32 payload bytes, 4 scales.
-                payload = row + Int32(64 * head_dim_stage_idx) + slab * Int32(32)
-                sf_word = ld_shared_b32(
-                    row
-                    + Int32(cfg.headdim // 2 + 8 * head_dim_stage_idx)
-                    + slab * Int32(4)
-                )
-            # One BF16x2 pair per 16-channel scale block.
+                sf_word = sf_words[idx]
+            sf_word = byte_permute_runtime(sf_word, sf_word, sf_selector)
+            # One BF16x2 pair per 16-channel scale block, in step order.
             sf_pairs = (
                 e4m3x2_to_bf16x2(broadcast_byte_const(sf_word, 0)),
                 e4m3x2_to_bf16x2(broadcast_byte_const(sf_word, 1)),
@@ -1210,26 +1338,29 @@ class SmemKvFromNvfp4Resource(SmemKvTileResource):
                 e4m3x2_to_bf16x2(broadcast_byte_const(sf_word, 3)),
             )
             dst_row = dst_base + slab * Int32(slab_bytes) + token * Int32(128)
-            # SW128: 16-byte segment s of row r lands at segment s ^ (r % 8).
-            swizzle = token % Int32(8)
             for chunk in cutlass.range_constexpr(2):
+                chunk_idx = Int32(chunk) ^ half
                 if cutlass.const_expr(captured):
                     base = 8 * idx + 4 * chunk
                     words = (
-                        self.raw_src.captured_words[base],
-                        self.raw_src.captured_words[base + 1],
-                        self.raw_src.captured_words[base + 2],
-                        self.raw_src.captured_words[base + 3],
+                        raw.captured_words[base],
+                        raw.captured_words[base + 1],
+                        raw.captured_words[base + 2],
+                        raw.captured_words[base + 3],
                     )
                 else:
-                    words = ld_shared_v4_b32(payload + Int32(chunk * 16))
+                    words = ld_shared_v4_b32(
+                        raw.payload_chunk(
+                            row, token, (chunk_idx << Int32(4)) + slab * Int32(32)
+                        )
+                    )
                 for word_idx in cutlass.range_constexpr(4):
                     # Eight values per word, sixteen per scale block; each
                     # word becomes one 16-byte BF16 segment in natural order.
                     out = scale_e2m1x8_packed_to_bf16x2x4(
                         words[word_idx], sf_pairs[(4 * chunk + word_idx) // 2]
                     )
-                    seg_idx = Int32(4 * chunk + word_idx)
+                    seg_idx = (chunk_idx << Int32(2)) + Int32(word_idx)
                     st_shared_v4_b32(
                         dst_row + ((seg_idx ^ swizzle) << Int32(4)),
                         out[0],
@@ -1264,23 +1395,28 @@ class SmemKvFromNvfp4Resource(SmemKvTileResource):
         # One head-dim half: 128 values = 64 payload bytes and 8 scale bytes;
         # its FP8 slab holds tile_size_kv rows of 128 bytes.
         half_payload_bytes = cfg.headdim // 4
-        half_scale_bytes = cfg.headdim // 32
+        half_scale_blocks = cfg.headdim // 32
         slab_bytes = cfg.tile_size_kv * 128
+        raw = self.raw_src
+        src_stage = raw.state_src.consumer_work_stage
         for rep in cutlass.range_constexpr(units // num_threads):
             unit = thread + Int32(rep * num_threads)
             token = unit % Int32(cfg.tile_size_kv)
             half = unit // Int32(cfg.tile_size_kv)
-            row = self.raw_row_addr(token)
-            payload = row + half * Int32(half_payload_bytes)
-            sf_lo, sf_hi = ld_shared_v2_b32(
-                row + Int32(cfg.headdim // 2) + half * Int32(half_scale_bytes)
+            row = raw.payload_row(src_stage, token)
+            sf_lo, sf_hi = raw.scale_words(
+                src_stage, row, token, half * Int32(half_scale_blocks), 2, self.kv_kind
             )
             dst_row = dst_base + half * Int32(slab_bytes) + token * Int32(128)
             # SW128: 16-byte segment s of row r lands at segment s ^ (r % 8).
             swizzle = token % Int32(8)
             # Each 16-byte payload chunk holds 32 values: two scale blocks.
             for chunk in cutlass.range_constexpr(4):
-                words = ld_shared_v4_b32(payload + Int32(chunk * 16))
+                words = ld_shared_v4_b32(
+                    raw.payload_chunk(
+                        row, token, half * Int32(half_payload_bytes) + Int32(chunk * 16)
+                    )
+                )
                 sf_word = sf_lo if chunk < 2 else sf_hi
                 scales = (
                     broadcast_byte_const(sf_word, (2 * chunk) % 4),

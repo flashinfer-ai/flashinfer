@@ -2963,14 +2963,14 @@ def create_nvfp4_keeps_transform_task(
     task_class: type[DecodeGenTask] = DecodeGenTask,
     **kw: TaskKwarg,
 ) -> Task:
-    """Feed an FP8 or BF16 KeepsMmaAb pipeline from a raw interleaved NVFP4 ring.
+    """Feed an FP8 or BF16 KeepsMmaAb pipeline from a raw NVFP4 ring.
 
     The shared K/V load task fills ``smem_kv_raw`` in the order K(head),
     then K(i+1), V(i) per loop iteration, then V(tail); this task converts
     each raw stage, in the same order, into the matching K or V ring: one
     D256 stage for FP8, or one stage per D128 head-dim slice for BF16.
     """
-    assert cfg.use_nvfp4_kv_source and cfg.num_insts_kv == 1
+    assert cfg.uses_keeps_transformed_kv and cfg.num_insts_kv == 1
 
     def transform_body(
         smem_kv_raw: MemoryResource,
@@ -2981,8 +2981,8 @@ def create_nvfp4_keeps_transform_task(
         smem_k0.init_load_state()
         smem_v0.init_load_state()
 
-        def transform_one(dst: MemoryResource) -> None:
-            """Convert the next raw stage into ``dst``, then return the raw stage.
+        def transform_one(dst: MemoryResource, kv_kind: int) -> None:
+            """Convert the next raw ``kv_kind`` stage into ``dst``, then return it.
 
             ConsWait on the raw ring, ProdAcquire/Work/Commit on the K/V ring
             for each head-dim stage, and only then ConsRelease: the loader may
@@ -2993,7 +2993,7 @@ def create_nvfp4_keeps_transform_task(
             if cfg.uses_nvfp4_raw_register_capture:
                 # A single raw stage: read it into registers and return it
                 # first, so the loader refills it during the conversion.
-                smem_kv_raw.capture_tile()
+                smem_kv_raw.capture_tile(kv_kind=kv_kind)
                 smem_kv_raw.release()
             for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
                 dst.acquire()
@@ -3002,11 +3002,11 @@ def create_nvfp4_keeps_transform_task(
             if not cfg.uses_nvfp4_raw_register_capture:
                 smem_kv_raw.release()
 
-        transform_one(smem_k0)
+        transform_one(smem_k0, KV_KIND_K)
         with domain_loop(0, domain, 1, unroll=1):
-            transform_one(smem_k0)
-            transform_one(smem_v0)
-        transform_one(smem_v0)
+            transform_one(smem_k0, KV_KIND_K)
+            transform_one(smem_v0, KV_KIND_V)
+        transform_one(smem_v0, KV_KIND_V)
 
     @schedule
     def transform_schedule(
@@ -3344,21 +3344,10 @@ def _softmax_schedule_body(
         (True, True): smem_p.compute_sage_proxy_route_p_fragments,
     }[(cfg.use_block_sparse_proxy_routes, use_sage)]
 
-    # GMEM-resident grouped-Q page memberships are independent of S: load each
-    # tile's raw words one tile ahead so their L2 latency leaves the path
-    # between the score wait and the row max.
-    # Keeps lanes own sixteen pages (four words) of a page-major row; query-
-    # major bit-planes and streamed P fragments read their words elsewhere.
-    keeps_preload_layout = (
-        cfg.tile_size_q == 64
-        and cfg.tile_size_kv == 128
-        and cfg.num_tokens_per_page == 4
-        and not cfg.query_major_memberships
-        and not cfg.streams_tmem_p_fragments
-    )
+    # GMEM-resident grouped-Q page memberships are independent of S; see
+    # FmhaDecodeConfig.preloads_page_memberships.
     preloads_memberships = (
-        cfg.uses_q_token_kv_block_sparse_page_membership
-        and (not cfg.use_keeps_mma_ab or keeps_preload_layout)
+        cfg.preloads_page_memberships
         and not use_sparse
         and not use_sage
         and memberships_in_gmem

@@ -4109,6 +4109,11 @@ def dequantize_nvfp4_reference(
         (torch.bfloat16, True, "split", "flat", (16, 4)),
         (torch.bfloat16, True, "split", "flat", (16, 5)),
         (torch.bfloat16, True, "full-wave", "flat", (16, 8)),
+        (torch.float8_e4m3fn, False, "split", "flat", (16, 4)),
+        (torch.float8_e4m3fn, False, "full-wave", "flat", (16, 8)),
+        (torch.bfloat16, False, "split", "flat", (16, 4)),
+        (torch.bfloat16, False, "split", "nhd-view", (16, 5)),
+        (torch.float8_e4m3fn, True, "split", "nhd-view", (16, 5)),
     ),
     ids=(
         "bf16-rows",
@@ -4125,6 +4130,11 @@ def dequantize_nvfp4_reference(
         "bf16-rows-gqa16-g4",
         "bf16-rows-gqa16-g5",
         "bf16-rows-gqa16-g8-full-wave",
+        "fp8-scale-tensors-gqa16-g4",
+        "fp8-scale-tensors-gqa16-g8-full-wave",
+        "bf16-scale-tensors-gqa16-g4",
+        "bf16-scale-tensors-nhd-gqa16-g5",
+        "fp8-rows-nhd-gqa16-g5",
     ),
 )
 def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
@@ -4138,18 +4148,20 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
 
     BF16 Q runs the exact BF16 transform; FP8 Q rounds the transformed
     operands to E4M3. Rows either interleave each token's scales after its
-    payload or pass separate scale tensors. At four Q heads per KV head,
-    FP8-Q G5 launches with interleaved rows run the FP8 Keeps recipe fed by
-    the NVFP4 transform task, split along KV (``split``: two requests) or at
-    one wave (``full-wave``) of (request, KV head) tiles; BF16 Q and separate
-    scale tensors run the TMEM-transformed recipe.
+    payload or pass separate scale tensors (V scales in TRT-LLM's 4-token
+    interleaved order). At four Q heads per KV head, G5 launches run the
+    Keeps recipe fed by the NVFP4 transform task (FP8 tiles for FP8 Q, BF16
+    tiles for BF16 Q), split along KV (``split``: two requests) or at one
+    wave (``full-wave``) of (request, KV head) tiles.
 
-    The Keeps recipe loads four flat page-fragment rows per TMA gather4.
-    Caches without flat rows (``page4``: no storage subpages; ``kv-pair``:
-    K/V views of one ``[pages, 2, ...]`` tensor) or with fewer than four
-    fragments per KV tile (``block64``) or with fragments wider than one
-    gather4 box (``block8``: 8 x 144 bytes) must take the TMEM-transformed
-    recipe with paged copies instead.
+    The Keeps raw ring loads four flat page-fragment rows per TMA gather4.
+    Other caches take one tiled copy per fragment: without flat rows
+    (``page4``: no storage subpages; ``kv-pair``: K/V views of one
+    ``[pages, 2, ...]`` tensor; ``nhd-view``: two KV heads stored token-major
+    and passed, like their scale tensors, as transposed HND views), with
+    fewer than four fragments per KV tile (``block64``), or with fragments
+    wider than one gather4 box (``block8``: 8 x 144 bytes). Separate scale
+    tensors stage 128-byte SW128 payload rows and a separate scale stage.
 
     ``geometry`` is (Q heads per KV head, G). Sixteen Q heads per KV head
     give 64-128 Q rows per group, more than any Swaps Q tile holds, so G4
@@ -4162,10 +4174,13 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
     )
 
     head_dim = 256
-    num_qo_heads, group_size = geometry
+    heads_q_per_kv, group_size = geometry
+    num_kv_heads = 2 if cache_layout == "nhd-view" else 1
+    num_qo_heads = heads_q_per_kv * num_kv_heads
     block_size, block_topk, page_size = {
         "flat": (4, 64, 16),
         "kv-pair": (4, 64, 16),
+        "nhd-view": (4, 64, 16),
         "page4": (4, 64, 4),
         "block64": (64, 8, 128),
         "block8": (8, 32, 16),
@@ -4197,7 +4212,7 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
         .to(torch.int32)
         .repeat(num_requests, 1)
     )
-    shape = (num_pages, 1, page_size)
+    shape = (num_pages, num_kv_heads, page_size)
     payload = [
         torch.randint(
             0, 256, (*shape, head_dim // 2), generator=generator, device="cuda"
@@ -4218,18 +4233,30 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
         if cache_layout == "kv-pair":
             pair = torch.stack(caches, dim=1)
             caches = (pair[:, 0], pair[:, 1])
+        if cache_layout == "nhd-view":
+            caches = tuple(
+                cache.transpose(1, 2).contiguous().transpose(1, 2) for cache in caches
+            )
         kv_scale_factors = None
     else:
         caches = tuple(payload)
         # V scales use TRT-LLM's four-token interleaved order.
         v_scale = (
             scales[1]
-            .reshape(num_pages, 1, page_size // 4, 4, 4, head_dim // 64)
+            .reshape(num_pages, num_kv_heads, page_size // 4, 4, 4, head_dim // 64)
             .permute(0, 1, 2, 4, 5, 3)
             .reshape(scales[1].shape)
             .contiguous()
         )
         kv_scale_factors = (scales[0], v_scale)
+        if cache_layout == "nhd-view":
+            caches, kv_scale_factors = (
+                tuple(
+                    tensor.transpose(1, 2).contiguous().transpose(1, 2)
+                    for tensor in tensors
+                )
+                for tensors in (caches, kv_scale_factors)
+            )
     query = torch.randn(
         (num_requests, 1, group_size, num_qo_heads, head_dim),
         generator=generator,
@@ -4291,87 +4318,21 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
                 )
             pages = table[request, token_ids // page_size].long()
             slots = token_ids % page_size
-            scores = (
-                query[request, 0, group_idx].float() @ keys[pages, 0, slots].T
-            ) / head_dim**0.5
-            reference = torch.softmax(scores, dim=-1) @ values[pages, 0, slots]
-            torch.testing.assert_close(
-                output[request, 0, group_idx].float(),
-                reference,
-                rtol=tolerance,
-                atol=tolerance,
-            )
-
-
-@_REQUIRES_PRIMS_TS_ATTENTION
-@pytest.mark.parametrize(
-    "query_dtype", (torch.bfloat16, torch.float8_e4m3fn), ids=("bf16", "fp8")
-)
-def test_grouped_q_token_kv_block_sparse_nvfp4_kv_rejects_wide_group_without_keeps_source(
-    query_dtype: torch.dtype,
-) -> None:
-    """NVFP4 groups wider than 32 Q rows need the Keeps NVFP4 source.
-
-    Sixteen Q heads per KV head at G5 give 80 Q rows per KV head. Separate
-    scale tensors cannot feed the gather4 ring, so the launch rejects them.
-    """
-
-    head_dim, num_qo_heads, group_size = 256, 16, 5
-    block_size, block_topk, page_size, num_pages = 4, 8, 16, 8
-    table = torch.arange(num_pages, dtype=torch.int32, device="cuda")[None]
-    caches = tuple(
-        torch.zeros(
-            (num_pages, 1, page_size, head_dim // 2), dtype=torch.uint8, device="cuda"
-        )
-        for _ in range(2)
-    )
-    query = torch.zeros(
-        (1, 1, group_size, num_qo_heads, head_dim),
-        dtype=torch.bfloat16,
-        device="cuda",
-    ).to(query_dtype)
-    max_seq_len_kv = num_pages * page_size
-    workspace_args = dict(
-        block_topk=block_topk,
-        max_seq_len_kv=max_seq_len_kv,
-        out_dtype=torch.bfloat16,
-        group_size=group_size,
-        kv_block_size=block_size,
-    )
-    message = "80 Q rows per KV head"
-    workspace = torch.zeros(
-        get_q_token_kv_block_sparse_workspace_size(
-            query, caches[0], table, **workspace_args
-        ),
-        dtype=torch.uint8,
-        device="cuda",
-    )
-    scales = tuple(
-        torch.ones((num_pages, 1, page_size, head_dim // 16), device="cuda").to(
-            torch.float8_e4m3fn
-        )
-        for _ in range(2)
-    )
-    with pytest.raises(ValueError, match=message):
-        q_token_kv_block_sparse_attention_with_paged_kv_cache(
-            query,
-            caches,
-            table,
-            torch.zeros((group_size, block_topk), dtype=torch.int32, device="cuda"),
-            torch.zeros(group_size, dtype=torch.int32, device="cuda"),
-            torch.arange(
-                max_seq_len_kv - group_size,
-                max_seq_len_kv,
-                dtype=torch.int64,
-                device="cuda",
-            ),
-            workspace,
-            max_seq_len_kv=max_seq_len_kv,
-            group_size=group_size,
-            kv_block_size=block_size,
-            out=torch.empty(query.shape, dtype=torch.bfloat16, device="cuda"),
-            kv_scale_factors=scales,
-        )
+            for kv_head in range(num_kv_heads):
+                heads = slice(kv_head * heads_q_per_kv, (kv_head + 1) * heads_q_per_kv)
+                scores = (
+                    query[request, 0, group_idx, heads].float()
+                    @ keys[pages, kv_head, slots].T
+                ) / head_dim**0.5
+                reference = (
+                    torch.softmax(scores, dim=-1) @ values[pages, kv_head, slots]
+                )
+                torch.testing.assert_close(
+                    output[request, 0, group_idx, heads].float(),
+                    reference,
+                    rtol=tolerance,
+                    atol=tolerance,
+                )
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION

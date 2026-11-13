@@ -116,30 +116,39 @@ SPLIT_REDUCTION_VECTOR_BYTES_PER_THREAD = 16
 NVFP4_GATHER4_MAX_FRAGMENT_BYTES = 256 * 4
 
 
-def nvfp4_interleaved_kv_profile(
-    *, tile_size_q: int, q_dtype_bytes: int, keeps_source: bool
-) -> dict[str, int | bool]:
-    """Config overrides of the QToken recipes that read interleaved NVFP4 rows.
+# Both NVFP4 transform targets of the QToken recipes run two transform warp
+# groups (warps 16-23).
+_NVFP4_TRANSFORM_WARPS = dict(transform_kv_warp_idx=16, transform_kv_num_warps=8)
 
-    ``keeps_source`` selects the KeepsMmaAb recipe of Q's dtype
-    (``q_dtype_bytes``: 1 for FP8, 2 for BF16) fed by TransformKvTask;
-    otherwise the TMEM-transformed SwapsMmaAb recipe keeps its resolved stage
-    counts (a 32-fragment interleaved raw stage is exactly as large as the
-    separate payload plus scale stages). Both run two transform warp groups
-    (warps 16-23). Ring depths are in stages: ``transformed_kv_stages`` per
-    K/V operand ring (one D256 FP8 or one D128 BF16 slice), ``kv_stages`` of
-    the raw NVFP4 ring, both measured on GB300 at 16 Q heads per KV head.
+
+def nvfp4_interleaved_kv_profile() -> dict[str, int | bool]:
+    """Config overrides of the Swaps QToken recipe that reads interleaved NVFP4 rows.
+
+    The TMEM-transformed SwapsMmaAb recipe keeps its resolved stage counts (a
+    32-fragment interleaved raw stage is exactly as large as the separate
+    payload plus scale stages). Interleaved V has no cross-warp shuffles, so
+    the transform scales with a second warp group; the four loader warps
+    move to 4-7.
     """
-    transform = dict(transform_kv_warp_idx=16, transform_kv_num_warps=8)
-    if not keeps_source:
-        # Swaps: interleaved V has no cross-warp shuffles, so the transform
-        # scales with a second group; the four loader warps move to 4-7.
-        return dict(
-            use_nvfp4_interleaved_kv=True,
-            load_warp_idx=4,
-            clc_load_warp_idx=4,
-            **transform,
-        )
+    return dict(
+        use_nvfp4_interleaved_kv=True,
+        load_warp_idx=4,
+        clc_load_warp_idx=4,
+        **_NVFP4_TRANSFORM_WARPS,
+    )
+
+
+def nvfp4_keeps_kv_profile(*, tile_size_q: int, q_dtype_bytes: int) -> dict[str, int]:
+    """Config overrides of the Keeps QToken recipe fed by the NVFP4 transform.
+
+    TransformKvTask fills SMEM K/V rings in Q's dtype (``q_dtype_bytes``: 1
+    for FP8, 2 for BF16) from a raw NVFP4 ring of whole D256 rows, interleaved
+    or with separate scale tensors (the caller sets
+    ``use_nvfp4_interleaved_kv`` from the cache). Ring depths are in stages:
+    ``transformed_kv_stages`` per K/V operand ring (one whole D256 tile in FP8
+    or BF16), ``kv_stages`` of the raw NVFP4 ring, both measured on GB300 at
+    16 Q heads per KV head.
+    """
     if q_dtype_bytes == 1:
         # FP8 Q64: with every SM streaming, raw bytes in flight bound the load
         # rate; one 32 KB FP8 stage per operand suffices because converting a
@@ -149,14 +158,14 @@ def nvfp4_interleaved_kv_profile(
         # two FP8 and two raw stages.
         transformed_kv_stages, kv_stages = (2, 2) if tile_size_q == 128 else (1, 6)
     else:
-        # BF16 stages are D128 slices, two per tile. Q64 keeps a full tile per
-        # operand with three raw stages. Q128's 64 KB Q stage leaves room for
-        # a full tile per operand only with one raw stage, which the transform
-        # reads into registers and returns before converting
+        # One 64 KB D256 BF16 stage per operand. Q64 adds three raw stages.
+        # Q128's 64 KB Q stage leaves room for one raw stage, which the
+        # transform reads into registers and returns before converting
         # (FmhaDecodeConfig.uses_nvfp4_raw_register_capture).
-        transformed_kv_stages, kv_stages = (2, 1) if tile_size_q == 128 else (2, 3)
+        transformed_kv_stages, kv_stages = (1, 1) if tile_size_q == 128 else (1, 3)
     return dict(
-        use_nvfp4_kv_source=True,
+        # Whole D256 rows per K/V stage (FmhaDecodeConfig.uses_full_d256_keeps_stage).
+        head_dim_per_stage_kv=256,
         transformed_kv_stages=transformed_kv_stages,
         kv_stages=kv_stages,
         q_stages=1,
@@ -165,7 +174,7 @@ def nvfp4_interleaved_kv_profile(
         clc_load_warp_idx=8,
         load_num_warps=4,
         wg2_padding_num_warps=0,
-        **transform,
+        **_NVFP4_TRANSFORM_WARPS,
     )
 
 
@@ -267,6 +276,11 @@ _Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES.update(
 _Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES.update(
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, output, 256, 256, 1, 1)
     for output in (Float16, BFloat16)
+)
+# Full-D256 BF16 stages exist only as the NVFP4 Keeps transform target (see
+# FmhaDecodeConfig.uses_full_d256_keeps_stage).
+_Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES.add(
+    (BFloat16, BFloat16, BFloat16, BFloat16, 256, 256, 1, 1)
 )
 
 _KV_TILE_256_PHYSICAL_DEFAULTS: Mapping[str, ConfigValue] = {
@@ -817,24 +831,17 @@ class FmhaDecodeConfig:
     # into SmemKv, converted to the Q-side MMA input type, then consumed by MMA.
     # Zero selects the profile-derived stage count.
     transformed_kv_stages: int = 0
-    # Store the transformed NVFP4 K/V operand ring in TMEM. The supported
-    # FP8-Q Swaps profile defaults to this path; other mixed modes use SMEM.
+    # Store the transformed NVFP4 K/V operand ring in TMEM (SwapsMmaAb only,
+    # where K/V is operand A). The supported FP8-Q Swaps profile defaults to
+    # this path; other Swaps mixed modes use SMEM. KeepsMmaAb reads K/V as
+    # operand B from SMEM, so its transform always targets SMEM rings (see
+    # ``uses_keeps_transformed_kv``).
     store_transformed_kv_in_tmem: bool = False
     # Packed NVFP4 K/V rows interleave each token's E2M1 payload (D/2 bytes)
     # with its own E4M3 block scales (D/16 bytes) instead of separate scale
     # tensors. One TMA then stages a full-head-dim fragment with its scales,
     # and the transform reads packed bytes directly.
     use_nvfp4_interleaved_kv: bool = False
-    # An FP8 or BF16 Q/K/V KeepsMmaAb profile whose K/V are not loaded from a
-    # cache of that dtype: the loader stages interleaved NVFP4 rows (see
-    # ``use_nvfp4_interleaved_kv``) into a raw ring and TransformKvTask writes the
-    # E4M3 or exact BF16 tiles, in the TMA layout of that dtype, into the K/V
-    # rings MMA consumes. Here ``k_dtype``/``v_dtype`` name the ring operands;
-    # the NVFP4 storage precision, its TMA descriptors and raw allocations
-    # come from ``nvfp4_raw_cfg``.
-    # ``transformed_kv_stages`` sets that ring depth per operand (in head-dim
-    # stages) and ``kv_stages`` the raw ring depth.
-    use_nvfp4_kv_source: bool = False
 
     # ------------------------------------------------------------------
     # TMEM column counts
@@ -1024,6 +1031,41 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def selects_query_major_memberships(self) -> bool:
+        """Whether plans write query-major memberships for this CTA.
+
+        Measured on GB300, query-major planes win wherever they are supported
+        except on the NVFP4 Keeps Q64 target, whose page-major words loaded one
+        tile ahead (``preloads_page_memberships``) are faster.
+        """
+        return self.supports_query_major_memberships and not (
+            self.uses_keeps_transformed_kv and self.tile_size_q == 64
+        )
+
+    @property
+    def preloads_page_memberships(self) -> bool:
+        """Whether Softmax loads page-major GMEM membership words one tile ahead.
+
+        The load then overlaps P, the stats handoff and the next score wait.
+        Measured on GB300 it helps Keeps Q64 (whose lanes own sixteen pages,
+        four words, of a page-major row) and FP8 Swaps, and slows BF16 Swaps.
+        Query-major planes and streamed P fragments read their words elsewhere.
+        """
+        if (
+            not self.uses_q_token_kv_block_sparse_page_membership
+            or self.query_major_memberships
+        ):
+            return False
+        if self.use_keeps_mma_ab:
+            return (
+                self.tile_size_q == 64
+                and self.tile_size_kv == 128
+                and self.num_tokens_per_page == 4
+                and not self.streams_tmem_p_fragments
+            )
+        return self.use_fp8_qk
+
+    @property
     def uses_held_encoded_locator_window(self) -> bool:
         """Whether encoded paging keeps the complete CTA route in SMEM."""
 
@@ -1048,9 +1090,8 @@ class FmhaDecodeConfig:
         grant instead of an even split of the CTA pool across all warps.
         """
         if (
+            # Transform warps (Swaps or Keeps targets) need their own grant.
             self.use_transform_kv
-            # The NVFP4 source adds eight transform warps in every scheduler mode.
-            or self.use_nvfp4_kv_source
             or (self.use_keeps_mma_ab and self.tile_size_q == 128)
             # Persistent grouped masks keep additional routing/softmax state
             # live. Reuse the same CTA-pool budgets to give it register headroom.
@@ -1085,7 +1126,7 @@ class FmhaDecodeConfig:
         """
         if not self.uses_task_register_reallocation:
             return None
-        if self.use_transform_kv:
+        if self.uses_swaps_transformed_kv:
             preferred = 168 if self.headdim == 64 and self.num_insts_kv != 1 else 184
         else:
             # Full Q128 rows keep 128 scores live through masking and P
@@ -1110,9 +1151,11 @@ class FmhaDecodeConfig:
             - self.correction_num_warps * correction_regs
             - other_warps * producer_regs
         )
-        if self.use_transform_kv:
+        if self.uses_swaps_transformed_kv:
             # Transform warps can retain more registers than descriptor-only
             # producers; reserve their actual budget before growing Softmax.
+            # The Keeps target's 48-register grant is below the producer
+            # grant, so its warps are budgeted as producers.
             transform_regs = self.transform_kv_task_num_registers
             assert transform_regs is not None
             available -= self.transform_kv_num_warps * (transform_regs - producer_regs)
@@ -1130,7 +1173,7 @@ class FmhaDecodeConfig:
     def correction_task_num_registers(self) -> int | None:
         if not self.uses_task_register_reallocation:
             return None
-        if self.use_transform_kv:
+        if self.uses_swaps_transformed_kv:
             return 88
         # Runtime partition metadata extends the full score tile's live ranges.
         # Grant one eight-register quantum per Softmax thread from Correction;
@@ -1149,7 +1192,11 @@ class FmhaDecodeConfig:
     def mma_load_task_num_registers(self) -> int | None:
         if not self.uses_task_register_reallocation:
             return None
-        if self.use_transform_kv and self.headdim == 64 and self.num_insts_kv != 1:
+        if (
+            self.uses_swaps_transformed_kv
+            and self.headdim == 64
+            and self.num_insts_kv != 1
+        ):
             return 88
         return 56
 
@@ -1160,7 +1207,7 @@ class FmhaDecodeConfig:
         The grants must fit the CTA pool together with the other roles'
         grants; Softmax takes what remains (see ``softmax_task_num_registers``).
         """
-        if self.use_nvfp4_kv_source:
+        if self.uses_keeps_transformed_kv:
             # One (token, half) row at a time: four payload words, two scale
             # words and eight outputs (BF16: four scale pairs and four outputs
             # per word). BF16 register capture also holds 18 words per thread
@@ -1187,7 +1234,7 @@ class FmhaDecodeConfig:
         if not self.uses_task_register_reallocation:
             return None
         if (
-            not self.use_transform_kv
+            not self.uses_swaps_transformed_kv
             and self.tile_size_kv != 256
             and self.softmax_score_fragment_regs == 128
             and warp_idx % 4 == 0
@@ -1302,7 +1349,7 @@ class FmhaDecodeConfig:
         if self.use_nvfp4_interleaved_kv:
             return self.tile_size_kv * self.nvfp4_interleaved_row_bytes
         bits = 4 if self.k_dtype == Float4E2M1FN else self.k_dtype_bytes * 8
-        return self.tile_size_kv * self.head_dim_kv_stage * bits // 8
+        return self.tile_size_kv * self.raw_kv_head_dim_stage * bits // 8
 
     @property
     def smem_v_tile_bytes(self) -> int:
@@ -1310,7 +1357,7 @@ class FmhaDecodeConfig:
         if self.use_nvfp4_interleaved_kv:
             return self.tile_size_kv * self.nvfp4_interleaved_row_bytes
         bits = 4 if self.v_dtype == Float4E2M1FN else self.v_dtype_bytes * 8
-        return self.tile_size_kv * self.head_dim_kv_stage * bits // 8
+        return self.tile_size_kv * self.raw_kv_head_dim_stage * bits // 8
 
     @property
     def uses_nvfp4_scale_tensors(self) -> bool:
@@ -1323,31 +1370,55 @@ class FmhaDecodeConfig:
         return self.headdim // 2 + self.headdim // 16
 
     @property
+    def uses_swaps_transformed_kv(self) -> bool:
+        """Whether a SwapsMmaAb profile transforms raw K/V before MMA.
+
+        The transform targets TMEM (``store_transformed_kv_in_tmem``) or an
+        SMEM ring in the Swaps operand layout.
+        """
+        return self.use_transform_kv and not self.use_keeps_mma_ab
+
+    @property
+    def uses_keeps_transformed_kv(self) -> bool:
+        """Whether a KeepsMmaAb profile transforms raw K/V into SMEM K/V rings.
+
+        TransformKvTask converts each raw NVFP4 stage (interleaved rows, or
+        payload rows plus a scale ring) into K and V rings of Q's compute
+        dtype in the Keeps operand layout: one D256 stage per KV tile, FP8 or
+        BF16. ``transformed_kv_stages`` sets that ring depth per operand and
+        ``kv_stages`` the raw ring depth.
+        """
+        return self.use_transform_kv and self.use_keeps_mma_ab
+
+    @property
+    def keeps_transformed_kv_ring_cfg(self) -> "FmhaDecodeConfig":
+        """Geometry of the K/V rings a Keeps transform writes and MMA reads.
+
+        The rings hold K/V in Q's compute dtype with that dtype's TMA/SW128
+        layout, so their tile sizes and descriptors are those of a Keeps
+        profile whose K/V storage is Q's dtype. Only the ring resources use it;
+        the profile itself keeps the NVFP4 storage dtypes.
+        """
+        assert self.uses_keeps_transformed_kv
+        return replace(
+            self,
+            k_dtype=self.q_dtype,
+            v_dtype=self.q_dtype,
+            use_nvfp4_interleaved_kv=False,
+        )
+
+    @property
     def uses_nvfp4_raw_register_capture(self) -> bool:
-        """Whether the NVFP4-fed BF16 transform reads raw tiles via registers.
+        """Whether the Keeps BF16 NVFP4 transform reads raw tiles via registers.
 
         With a single raw stage, TransformKvTask copies its share of each raw
         tile into registers and releases the stage before waiting for its BF16
         destination, so loading the next tile overlaps the conversion.
         """
         return (
-            self.use_nvfp4_kv_source and self.k_dtype_bytes == 2 and self.kv_stages == 1
-        )
-
-    @property
-    def nvfp4_raw_cfg(self) -> "FmhaDecodeConfig":
-        """The raw-ring view of an ``use_nvfp4_kv_source`` profile.
-
-        Identical geometry, but NVFP4 interleaved K/V dtypes: the shared K/V
-        loader and its staging resource use it to stage NVFP4 rows.
-        """
-        assert self.use_nvfp4_kv_source
-        return replace(
-            self,
-            k_dtype=Float4E2M1FN,
-            v_dtype=Float4E2M1FN,
-            use_nvfp4_interleaved_kv=True,
-            use_nvfp4_kv_source=False,
+            self.uses_keeps_transformed_kv
+            and self.q_dtype_bytes == 2
+            and self.kv_stages == 1
         )
 
     @property
@@ -1389,14 +1460,40 @@ class FmhaDecodeConfig:
 
     @property
     def num_raw_kv_head_dim_stages(self) -> int:
-        """Raw K/V loads per tile; interleaved NVFP4 stages the whole row once.
+        """Raw K/V loads per tile.
 
-        The NVFP4-fed Keeps profile loads the same raw rows, whatever its
-        transformed head-dim staging (one D256 FP8 or two D128 BF16 stages).
+        Interleaved NVFP4 stages whole rows once, and so does a Keeps
+        transform target (see ``raw_kv_head_dim_stage``).
         """
-        if self.use_nvfp4_interleaved_kv or self.use_nvfp4_kv_source:
+        if self.use_nvfp4_interleaved_kv or self.uses_keeps_transformed_kv:
             return 1
         return self.num_head_dim_stages_kv
+
+    @property
+    def raw_kv_head_dim_stage(self) -> int:
+        """Head-dim channels of one raw K/V stage.
+
+        A Keeps transform target loads the whole D256 row once per tile
+        (with separate scale tensors: 128 payload bytes plus the 16-byte
+        scale row), like its one D256 transformed stage. Other profiles load
+        one ``head_dim_kv_stage`` slice per stage; interleaved rows ignore it.
+        """
+        if self.uses_keeps_transformed_kv:
+            return self.headdim
+        return self.head_dim_kv_stage
+
+    @property
+    def uses_sw128_nvfp4_raw_payload(self) -> bool:
+        """Whether raw NVFP4 payload rows land 128B-swizzled in SMEM.
+
+        A Keeps transform target with separate scale tensors stages each
+        token's 128 D256 payload bytes as one SW128 row: one TMA box spans the
+        row, and the transform threads, which read consecutive tokens, then
+        hit distinct banks (16-byte chunk ``c`` of token ``t`` sits at chunk
+        ``c ^ (t % 8)``). Interleaved 144-byte rows are already conflict-free
+        and stay unswizzled.
+        """
+        return self.uses_keeps_transformed_kv and self.uses_nvfp4_scale_tensors
 
     @property
     def smem_k_storage_tile_bytes(self) -> int:
@@ -1482,8 +1579,17 @@ class FmhaDecodeConfig:
 
     @property
     def sf_tma_reshape_factor(self) -> int:
-        """Token-fold factor that widens the NVFP4 SF TMA inner box to 128 B."""
+        """Token-fold factor of the NVFP4 scale-factor TensorMaps.
+
+        A token's D/16 E4M3 scales form one TMA box row. Rows below TMA's
+        16-byte minimum (D128: 8 bytes) fold contiguous tokens into one row
+        of up to 128 bytes within a page fragment, which needs token-contiguous
+        scale rows. Rows of at least 16 bytes copy one token per box row, so
+        their scale tensors may be strided views like the packed K/V.
+        """
         sf_per_token = self.headdim // 16
+        if sf_per_token >= 16:
+            return 1
         return min(max(1, 128 // sf_per_token), self.num_tokens_per_page)
 
     @property
@@ -1696,6 +1802,17 @@ class FmhaDecodeConfig:
     @property
     def use_fp8_qkv(self) -> bool:
         return self.q_dtype == self.k_dtype == self.v_dtype == Float8E4M3FN
+
+    @property
+    def uses_fp8_qkv_operands(self) -> bool:
+        """Whether Q, K and V all reach the MMAs as E4M3.
+
+        True for FP8 Q/K/V storage and for a Keeps transform that writes E4M3
+        K/V rings from another storage dtype (NVFP4) for FP8 Q.
+        """
+        return self.use_fp8_qkv or (
+            self.uses_keeps_transformed_kv and self.q_dtype == Float8E4M3FN
+        )
 
     @property
     def o_dtype_bytes(self) -> int:
@@ -2337,7 +2454,7 @@ class FmhaDecodeConfig:
         # Separate K/V rings each contain half of kv_stages slots. Their
         # average stage width accounts for the BF16-K/FP8-V profile exactly.
         kv_tile_bits = (self.smem_k_tile_bytes + self.smem_v_tile_bytes) * 4
-        if self.use_transform_kv:
+        if self.uses_swaps_transformed_kv:
             # Raw storage and converted operands coexist. When the converted
             # depth is still implicit, budget both rings per stage; otherwise
             # reserve the configured converted ring before sizing raw storage.
@@ -2711,11 +2828,20 @@ class FmhaDecodeConfig:
 
     @property
     def _grouped_keeps_profile_key(self) -> _GroupedKeepsProfileKey:
-        """Return the dtype, shape, and staging key used by Keeps recipe tables."""
+        """Return the dtype, shape, and staging key used by Keeps recipe tables.
+
+        A Keeps transform-KV profile is keyed by its K/V MMA operand dtype,
+        which is Q's dtype, rather than by the raw K/V storage dtype.
+        """
+        k_dtype, v_dtype = (
+            (self.q_dtype, self.q_dtype)
+            if self.uses_keeps_transformed_kv
+            else (self.k_dtype, self.v_dtype)
+        )
         return (
             self.q_dtype,
-            self.k_dtype,
-            self.v_dtype,
+            k_dtype,
+            v_dtype,
             self.out_dtype,
             self.headdim,
             self.head_dim_per_stage_kv,
@@ -2780,7 +2906,7 @@ class FmhaDecodeConfig:
         if (
             self.use_paged_kv
             and self.tile_size_kv == 128
-            and self.q_dtype == self.k_dtype == self.v_dtype == Float8E4M3FN
+            and profile[:3] == (Float8E4M3FN,) * 3
         ):
             # DSL 4.8 measurements also qualify D128 FP8 -> 16-bit fixed
             # multi-Q recipes. Let the existing cost model compare them;
@@ -2986,13 +3112,23 @@ class FmhaDecodeConfig:
                 or (self.headdim == 192 and self.head_dim_per_stage_kv == 192)
                 or (
                     self.head_dim_per_stage_kv == 256
-                    and self.use_fp8_qkv
+                    and self.uses_full_d256_keeps_stage
                     and self.uses_scattered_page_route
                 )
             )
             and self.num_insts_kv == 1
             and self.o_stages == 1
         )
+
+    @property
+    def uses_full_d256_keeps_stage(self) -> bool:
+        """Whether a sparse Keeps profile may stage whole D256 K/V tiles.
+
+        Qualified for FP8 operands, and for the FP8 or BF16 rings of the
+        NVFP4 Keeps transform target, where one stage per tile (64 KB in BF16)
+        halves the transform and MMA handoffs of two D128 stages.
+        """
+        return self.uses_fp8_qkv_operands or self.uses_keeps_transformed_kv
 
     @property
     def uses_two_inst_tmem_p(self) -> bool:
@@ -4104,7 +4240,7 @@ def _active_warp_roles(cfg: FmhaDecodeConfig) -> list[_WarpRole]:
                 cfg.softmax1_num_warps,
             )
         )
-    if cfg.use_transform_kv or cfg.use_nvfp4_kv_source:
+    if cfg.use_transform_kv:
         roles.append(
             _WarpRole(
                 "transform_kv",
@@ -5607,7 +5743,7 @@ def _validate_profile_support(
                 "ungrouped Keeps profile"
             )
     if cfg.use_variable_seqlens_q:
-        if cfg.use_transform_kv:
+        if cfg.uses_swaps_transformed_kv:
             raise ValueError(
                 "packed variable-Q does not support mixed Q/KV dtypes or "
                 "transformed K/V"
@@ -5636,7 +5772,7 @@ def _validate_profile_support(
         and cfg.num_tokens_per_page == 16
     ):
         raise ValueError("NVFP4 KV with head_dim=64 does not support page_size=16")
-    if cfg.use_transform_kv and not cfg.store_transformed_kv_in_tmem:
+    if cfg.uses_swaps_transformed_kv and not cfg.store_transformed_kv_in_tmem:
         # The SMEM transform assigns eight elements per thread per iteration.
         total_elems = cfg.tile_size_kv * cfg.head_dim_kv_stage
         elems_per_iteration = cfg.transform_kv_num_warps * 32 * 8
@@ -5666,8 +5802,21 @@ def _validate_profile_support(
             "and a TransformKvTask of one or two complete warp groups"
         )
     if use_keeps_mma_ab:
-        if cfg.use_transform_kv:
-            raise ValueError("transform-KV is not supported with KeepsMmaAb for now")
+        if cfg.use_transform_kv and not (
+            cfg.use_nvfp4_kv
+            and cfg.uses_q_token_kv_block_sparse_page_route
+            and cfg.num_insts_kv == 1
+            and cfg.tile_size_kv == 128
+            and cfg.headdim == 256
+            and cfg.head_dim_kv_stage == 256
+        ):
+            # The Keeps transform writes one D256 FP8 or BF16 stage per KV128
+            # tile of the one-instance recipe from one raw D256 row.
+            raise ValueError(
+                "transform-KV with KeepsMmaAb supports only NVFP4 K/V on the "
+                "QToken sparse route with one KV instance, KV128 tiles and "
+                "head_dim=256 in one D256 stage"
+            )
         if headdim not in (64, 128, 192, 256):
             raise ValueError(
                 "fmha_decode keepsMmaAb supports headdim=64, 128, 192, or 256"
@@ -5682,7 +5831,7 @@ def _validate_profile_support(
             or (headdim == 192 and effective_head_dim_stage == 192)
             or (
                 effective_head_dim_stage == 256
-                and cfg.use_fp8_qkv
+                and cfg.uses_full_d256_keeps_stage
                 and cfg.uses_q_token_kv_block_sparse_page_route
             )
         )
