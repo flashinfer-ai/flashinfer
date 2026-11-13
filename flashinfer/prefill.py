@@ -4662,15 +4662,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ):
             if self._backend == "cudnn" and (
                 pos_encoding_mode != "NONE"
-                or window_left != -1
                 or logits_soft_cap != 0
                 or packed_custom_mask is not None
                 or self._variant_owns_mask
                 or prefix_len_ptr is not None
             ):
                 raise NotImplementedError(
-                    "cuDNN paged prefill supports only causal or full attention without "
-                    "position encoding, window_left, logits_soft_cap or custom masks"
+                    "cuDNN paged prefill does not support position encoding, "
+                    "logits_soft_cap or custom masks"
                 )
             if self._qo_indptr_buf.dtype != torch.int32:
                 if self.is_cuda_graph_enabled:
@@ -4789,6 +4788,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         graph_kv,
                         causal,
                         True,
+                        window_left=window_left if window_left >= 0 else None,
                         o_data_type=o_data_type,
                         actual_seq_lens_q=self._seq_lens_q,
                         actual_seq_lens_kv=self._seq_lens_kv,
@@ -5321,6 +5321,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             and self._backend == "cudnn"
             and self._cudnn_plan is not None
             and self._cudnn_plan.metadata.causal == self._causal
+            and self._cudnn_plan.metadata.window_left
+            == (window_left if window_left >= 0 else None)
             # Head-major Stats places tokens through the ragged offset; a plan
             # that dropped it (single-token GQA on cuDNN < 9.27) stages NH.
             and self._cudnn_plan.metadata.batch_offsets_stats is not None
@@ -5479,6 +5481,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if (
                 plan is not None
                 and plan.metadata.causal == self._causal
+                and plan.metadata.window_left
+                == (window_left if window_left >= 0 else None)
                 and q_scale is None
                 and k_scale is None
                 and v_scale is None
@@ -5543,6 +5547,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     batch_offsets_q=self._qo_indptr_buf,
                     batch_offsets_stats=self._qo_indptr_buf if return_lse else None,
                     batch_offsets_units="tokens",
+                    window_left=window_left if window_left >= 0 else None,
                     out=out,
                     lse=lse,
                     o_data_type=out_dtype,
