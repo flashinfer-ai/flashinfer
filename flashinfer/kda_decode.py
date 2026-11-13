@@ -30,7 +30,7 @@ from typing import Literal, Optional
 
 import torch
 
-from .api_logging import flashinfer_api
+from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .trace.templates.kda import (
     packed_fused_kda_decode_trace,
     fused_kda_decode_trace,
@@ -1040,3 +1040,143 @@ def _run_frozen_recurrent_kda(
     if reshape_out is not None:
         out = out.reshape(reshape_out[0], reshape_out[1], out.shape[2], out.shape[3])
     return out, None
+
+
+@flashinfer_experimental_api(
+    feature="KDA ReplaySSM verify+flush decode (kda_delta_rule_mtp_ucache_flush)"
+)
+def kda_delta_rule_mtp_ucache_flush(
+    A_log: torch.Tensor,
+    g: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float = -5.0,
+    q: Optional[torch.Tensor] = None,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
+    b: Optional[torch.Tensor] = None,
+    initial_state_source: Optional[torch.Tensor] = None,
+    initial_state_indices: Optional[torch.Tensor] = None,
+    use_qk_l2norm_in_kernel: bool = True,
+    scale: Optional[float] = None,
+    output: Optional[torch.Tensor] = None,
+    k_cache: Optional[torch.Tensor] = None,
+    u_cache: Optional[torch.Tensor] = None,
+    g_cache: Optional[torch.Tensor] = None,
+    hist_len: Optional[torch.Tensor] = None,
+    cache_base: Optional[torch.Tensor] = None,
+    flush_min: Optional[int] = None,
+    restart_hist_on_flush: bool = True,
+    pdl_trigger: bool = False,
+    w_ring: int = 16,
+    tma_late: Optional[bool] = None,
+) -> torch.Tensor:
+    r"""KDA (Kimi K3) speculative-decode verify with a ReplaySSM history ring.
+
+    Instead of writing the recurrent state back after every verified draft
+    token, each call appends the T new (L2-normalized key, correction
+    ``u = beta * (v - S k)``, per-channel cumulative log-decay) entries to a
+    32-slot per-request ring and replays the live ring window on the fly.
+    Requests whose fill level ``hist_len[b]`` reaches ``flush_min`` also fold
+    their ring into the checkpoint state at ``initial_state_indices[b]``.
+
+    Experimental: SM90+ only, bf16 only (fp32 ``g_cache``, ``A_log`` and
+    ``dt_bias``), ``K == V == 128``, ``H == HV``, draft length ``T`` in
+    ``{4, 8}``, contiguous pools. The kernel is JIT-compiled with
+    ``cute.compile`` on first use per configuration (no on-disk cache).
+
+    Parameters
+    ----------
+    A_log : torch.Tensor
+        ``[H]`` per-head log-decay rate.
+    g : torch.Tensor
+        ``[B, T, H, 128]`` bf16 raw per-channel gate pre-activation; the
+        kernel applies ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``.
+    dt_bias : torch.Tensor
+        ``[H, 128]`` or ``[H * 128]`` gate bias.
+    lower_bound : float
+        Gate lower bound, in ``[-80 / T, 0)`` (Kimi K3 uses ``-5``).
+    q, k, v : torch.Tensor
+        ``[B, T, H, 128]`` bf16 draft queries / keys / values.
+    b : torch.Tensor
+        ``[B, T, H]`` bf16 beta logits (sigmoid applied in-kernel).
+    initial_state_source : torch.Tensor
+        ``[pool, H, 128, 128]`` bf16 checkpoint state pool (``[.., V, K]``);
+        written in place on a fold.
+    initial_state_indices : torch.Tensor, optional
+        ``[B]`` int32 pool slot per request; ``-1`` marks a padded row whose
+        output row is left untouched (pass a preallocated ``output``).
+        Non-negative slots must be unique across rows (rows sharing a slot
+        would race on the same pool and ring entries). Defaults to
+        ``arange(B)``.
+    use_qk_l2norm_in_kernel : bool
+        Must be ``True``.
+    scale : float, optional
+        Query scale; ``1 / sqrt(128)`` when ``None``.
+    output : torch.Tensor, optional
+        ``[B, T, H, 128]`` bf16 output buffer.
+    k_cache, u_cache : torch.Tensor
+        ``[pool, H, 32, 128]`` bf16 key / correction rings (zero-initialized
+        at allocation).
+    g_cache : torch.Tensor
+        ``[pool, H, 32, 128]`` fp32 per-channel cumulative log-decay ring.
+    hist_len, cache_base : torch.Tensor
+        ``[B]`` int32 ring fill level in ``[0, min(w_ring, 32 - T)]`` and
+        window origin in ``[0, 32)``.
+    flush_min : int, optional
+        Fold threshold; defaults to ``min(w_ring - T + 1, 33 - 2T)``.
+    restart_hist_on_flush : bool
+        ``True`` commits the ring cursors in place after the launch;
+        ``False`` leaves the commit to the caller (serving, where several
+        layers share one cursor set).
+    pdl_trigger : bool
+        Emit the programmatic-dependent-launch trigger.
+    w_ring : int
+        Logical history window, 16 (default) or 32 (requires
+        ``flush_min > 16``).
+    tma_late : bool, optional
+        Load-schedule override; ``None`` picks by batch size. Never changes
+        results.
+
+    Returns
+    -------
+    torch.Tensor
+        ``[B, T, H, 128]`` bf16 draft-token outputs.
+
+    Raises
+    ------
+    ValueError
+        On any shape / dtype / device / range violation. The device-value
+        checks (slot range and uniqueness, ``hist_len``, ``cache_base``) need
+        one host synchronization and are skipped during CUDA-graph capture.
+    NotImplementedError
+        For ``T`` outside ``{4, 8}`` or block-strided pools.
+    """
+    from .experimental.kda_ucache_flush import (
+        kda_delta_rule_mtp_ucache_flush as _run,
+    )
+
+    return _run(
+        A_log,
+        g,
+        dt_bias,
+        lower_bound=lower_bound,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        scale=scale,
+        output=output,
+        k_cache=k_cache,
+        u_cache=u_cache,
+        g_cache=g_cache,
+        hist_len=hist_len,
+        cache_base=cache_base,
+        flush_min=flush_min,
+        restart_hist_on_flush=restart_hist_on_flush,
+        pdl_trigger=pdl_trigger,
+        w_ring=w_ring,
+        tma_late=tma_late,
+    )
