@@ -5,7 +5,7 @@
 The package holds the engine of the batch-invariant kernels (the canonical reduction plan, the floating-point interface
 ``fp_interface`` in its symbolic and device backends, the term language and its fingerprints) and the Lean project that
 proves the engine's reduction orders; each kernel class lives next to its FlashInfer operator (``flashinfer/gemm/batch_invariant``) or, for the
-operators without a package of their own, in a subpackage here (``quantization``, ``sampling``). ``README.md``
+operators without a package of their own, in a subpackage here (``quantization``, ``sampling``, ``gdn``). ``README.md``
 next to this file is the contract: the guarantee (R1-R4), the flag semantics, the tests and how to check the proofs.
 """
 
@@ -360,6 +360,11 @@ def fingerprint(op: str, **dims) -> str:
     ``gemm.nvfp4.*`` otherwise), the chunk count, the chain's ``mul.rn`` by the caller's alpha and the conversion are
     the specification; the alpha's value and the block scales are inputs.
 
+    ``chunk_gated_delta_rule`` takes no dimension: the class ``gdn.bf16.c64`` is the native SM100 / SM103 / SM107 chunked GDN
+    prefill kernel without context parallelism (64-token chunks, fp32 state, log-domain gates and the Q / K l2-norm)
+    and the decode step kernel that computes its rows; the head counts, the batch, the slot and the position are not
+    dimensions of the per-head term, and the receipt digests the kernel sources that are the term.
+
     The attention wrappers take ``head_dim``: the tile and chunk grid, the online-softmax step and the chunk merge are
     functions of the head dim alone; the batch, the sequence lengths, the page size, the KV layout and the configuration
     do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``, ``BatchDecodeWithPagedKVCacheWrapper`` and
@@ -379,6 +384,8 @@ def fingerprint(op: str, **dims) -> str:
     'gemm-mxfp8-k64-kfold-...'
     >>> fingerprint("mm_fp4", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_100")  # doctest: +SKIP
     'gemm-nvfp4-kfold-...'
+    >>> fingerprint("chunk_gated_delta_rule")  # doctest: +SKIP
+    'gdn-bf16-c64-...'
     """
     info = CLASSES.get(op)
     if info is None:
@@ -419,9 +426,11 @@ __all__ = [
     "is_supported_device",
 ]
 
-# The quantization and sampling classes register themselves here (their modules keep the mode's registry generic).
+# The quantization, sampling and GDN classes register themselves here (their modules keep the mode's registry generic).
+from .gdn.classes import register as _register_gdn  # noqa: E402
 from .quantization.classes import register as _register_quantization  # noqa: E402
 from .sampling.classes import register as _register_sampling  # noqa: E402
 
 _register_quantization(CLASSES, ClassInfo)
 _register_sampling(CLASSES, ClassInfo)
+_register_gdn(CLASSES, ClassInfo)
