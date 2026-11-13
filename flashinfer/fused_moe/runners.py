@@ -7907,13 +7907,30 @@ class PrimsTsRunner(_TrtllmRunnerBase):
 
         routing_logits, routing_bias, topk_ids, expert_weights = self._pack_routing(act)
 
-        output = act.hidden_states_q.new_empty(
-            (
-                num_tokens,
-                hidden_size if self.config.finalize.do_finalize else 0,
-            ),
-            dtype=torch.bfloat16,
-        )
+        output = act.output if self.config.finalize.do_finalize else None
+        if output is None:
+            output = act.hidden_states_q.new_empty(
+                (
+                    num_tokens,
+                    hidden_size if self.config.finalize.do_finalize else 0,
+                ),
+                dtype=torch.bfloat16,
+            )
+        elif (
+            output.dtype != torch.bfloat16
+            or tuple(output.shape) != (num_tokens, hidden_size)
+            or not output.is_contiguous()
+            or output.device != act.hidden_states_q.device
+            # The finalize kernels store 16-byte vectors.
+            or output.data_ptr() % 16 != 0
+        ):
+            raise ValueError(
+                f"{type(self).__name__} output must be a contiguous, 16-byte "
+                f"aligned bfloat16 [{num_tokens}, {hidden_size}] tensor on "
+                f"{act.hidden_states_q.device}, got {output.dtype} "
+                f"{tuple(output.shape)} on {output.device} at "
+                f"{output.data_ptr():#x}."
+            )
         moe_inputs = MoeRunnerInputs(
             output=output,
             routing_logits=routing_logits,
@@ -7944,6 +7961,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             use_shuffled_weight=True,
             weight_layout=self._weight_layout(v),
             do_finalize=self.config.finalize.do_finalize,
+            zero_rows_without_local_expert=act.zero_rows_without_local_expert,
             enable_pdl=self._enable_pdl,
             activation_type=self._activation_type,
             norm_topk_prob=True,
