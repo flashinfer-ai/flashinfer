@@ -49,6 +49,7 @@ from .cudnn.prefill import (
     _cudnn_supports_paged_token_offsets,
     _cudnn_supports_paged_auto,
     _cudnn_supports_paged_gqa_auto,
+    _cudnn_supports_paged_full_prefill_auto,
     CudnnPrefillGraph,
     _PrefillMetadata,
     _CudnnPrefillPlan,
@@ -2689,6 +2690,71 @@ def _blackwell_paged_gqa_auto_cudnn(
     )
 
 
+def _blackwell_paged_full_prefill_auto_cudnn(
+    device,
+    layout,
+    q_dtype,
+    kv_dtype,
+    o_dtype,
+    head_dim_qk,
+    head_dim_vo,
+    batch,
+    hq,
+    hk,
+    max_q,
+    max_kv,
+    page_size,
+    total_q,
+    qo_indptr_host,
+    kv_lens,
+    seq_lens_q=None,
+):
+    """Additional full-prefill domains proven from existing CPU metadata."""
+    if not (
+        layout == "HND"
+        and q_dtype == kv_dtype == o_dtype == torch.bfloat16
+        and head_dim_qk == head_dim_vo
+        and 8 <= hq <= 64
+        and hk > 0
+        and hq % hk == 0
+        and (
+            (
+                head_dim_qk == 256
+                and (
+                    (hq == hk and 1 <= batch <= 8)
+                    or (hq // hk in (2, 4, 8, 16) and 1 <= batch <= 16)
+                )
+            )
+            or (head_dim_qk == 128 and hq // hk in (4, 8) and 1 <= batch <= 32)
+        )
+        and page_size in (16, 64)
+        and 512 <= max_q == max_kv <= 16384
+        and seq_lens_q is None
+        and qo_indptr_host.device.type == "cpu"
+        and kv_lens is not None
+        and kv_lens.device.type == "cpu"
+    ):
+        return False
+    bounds = qo_indptr_host.tolist()
+    queries = [end - start for start, end in zip(bounds, bounds[1:], strict=False)]
+    lengths = kv_lens.flatten().tolist()
+    if not (
+        len(queries) == len(lengths) == batch
+        and bounds[0] == 0
+        and bounds[-1] == total_q
+        and max(queries) == max_q
+        and all(q == kv and q > 0 for q, kv in zip(queries, lengths, strict=True))
+    ):
+        return False
+    # Keep the completed-eager work floor, including for small full prefills.
+    return (
+        hq * sum(q * kv for q, kv in zip(queries, lengths, strict=True))
+        >= 16 * 1024 * 1024
+        and get_compute_capability(device) in ((10, 0), (10, 3))
+        and _cudnn_supports_paged_full_prefill_auto(head_dim_qk)
+    )
+
+
 def _blackwell_paged_auto_cudnn(
     device,
     layout,
@@ -2709,6 +2775,26 @@ def _blackwell_paged_auto_cudnn(
     seq_lens_q=None,
 ):
     """Measured paged domains; use actual paired work when already on CPU."""
+    if max_q == max_kv and _blackwell_paged_full_prefill_auto_cudnn(
+        device,
+        layout,
+        q_dtype,
+        kv_dtype,
+        o_dtype,
+        head_dim_qk,
+        head_dim_vo,
+        batch,
+        hq,
+        hk,
+        max_q,
+        max_kv,
+        page_size,
+        total_q,
+        qo_indptr_host,
+        kv_lens,
+        seq_lens_q,
+    ):
+        return True
     if head_dim_qk == 256:
         return _blackwell_paged_gqa_auto_cudnn(
             device,

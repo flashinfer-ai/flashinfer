@@ -114,6 +114,21 @@ def _cudnn_supports_paged_gqa_auto(head_dim: int) -> bool:
         return False
 
 
+@functools.cache
+def _cudnn_supports_paged_full_prefill_auto(head_dim: int) -> bool:
+    """Full-prefill placement requires stable FE 1.33 and matching native support."""
+    if head_dim not in (128, 256) or not _cudnn_supports_paged_auto():
+        return False
+    try:
+        from packaging.version import Version
+
+        return Version(cudnn.__version__) >= Version("1.33.0") and (
+            head_dim == 128 or _cudnn_supports_paged_gqa_auto(head_dim)
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 # Execute-time shape override for the ragged (token-indptr) path. cuDNN
 # finalizes one execution plan per declared (batch, max_seq_len) -- 55-70 ms on
 # SM100, ~1 s when a kernel variant compiles -- and serving changes both every
