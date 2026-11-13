@@ -1167,6 +1167,13 @@ def gen_all_modules(
         # absent: Ulysses is JIT-only, and the PCIe module additionally links
         # -libverbs -lmlx5 -lcuda, which an AOT wheel builder cannot be assumed
         # to have.
+        # RDMA MoE AlltoAll also remains JIT-only. Its GIN module compiles
+        # against external NCCL device headers and links a matching libnccl;
+        # the verified SDK/library identity is part of its cache key. Generic
+        # AOT builders cannot assume that installation or reuse its binary
+        # safely with a different NCCL already loaded by the application.
+        # Both loaders in jit.rdma_moe_alltoall are intentionally unregistered;
+        # their sources ship through the standard csrc/include package data.
 
     if add_misc:
         jit_specs += [
