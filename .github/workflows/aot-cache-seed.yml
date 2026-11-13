@@ -40,6 +40,8 @@ on:
       - '**/*.inc'
       - '**/*.jinja'
       - 'flashinfer/aot.py'
+      # Pins the TRT-LLM manifests and export headers that kernels compile against.
+      - 'flashinfer/artifacts.py'
       - 'flashinfer/compilation_context.py'
       - 'flashinfer/jit/**'
       - 'flashinfer/**/*jit*.py'

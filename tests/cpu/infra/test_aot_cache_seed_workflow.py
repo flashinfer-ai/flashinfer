@@ -69,6 +69,7 @@ def _github_path_regex(pattern: str) -> "re.Pattern[str]":
         "3rdparty/cutlass",
         "flashinfer/jit/fused_moe.py",
         "flashinfer/aot.py",
+        "flashinfer/artifacts.py",
         "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_jit.py",
         "ci/docker-tags.yml",
         "ci/cuda-versions.json",
@@ -137,12 +138,14 @@ def test_seed_only_runs_in_the_upstream_repository():
 @pytest.mark.skipif(sys.platform == "win32", reason="runs a bash fragment")
 @pytest.mark.parametrize("skip, linted", [("", True), ("0", True), ("1", False)])
 def test_aot_script_lint_switch(skip, linted):
-    """AOT_SKIP_SPEC_LINT=1 skips only the lint; anything else still lints."""
+    """AOT_SKIP_SPEC_LINT=1 skips the lint but still prefetches its headers."""
     text = (REPO_ROOT / "scripts" / AOT_SCRIPT).read_text(encoding="utf-8")
     start = text.index('if [ "${AOT_SKIP_SPEC_LINT:-0}" = "1" ]; then')
     end = text.index("\nfi\n", start) + len("\nfi\n")
     fragment = (
         'run_provider_spec_lint() { echo "LINT $*"; }\n'
+        'python3() { echo "PYTHON $*"; }\n'
+        "SCRIPT_DIR=/scripts\n"
         "PROVIDER_ARCHITECTURE_LIST=(8.0 9.0a)\n" + text[start:end]
     )
     env = {"PATH": "/usr/bin:/bin"}
@@ -152,3 +155,6 @@ def test_aot_script_lint_switch(skip, linted):
         ["bash", "-c", fragment], capture_output=True, text=True, env=env, check=True
     )
     assert ("LINT 3 8.0 9.0a" in result.stdout) is linted
+    # The lint prefetches on its own; the skip path must do it explicitly.
+    prefetched = "PYTHON /scripts/prefetch_jit_spec_headers.py" in result.stdout
+    assert prefetched is not linted

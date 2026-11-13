@@ -198,6 +198,13 @@ echo "✓ Flashinfer package installed successfully"
 # lint failure would leave the cache cold until the next merge.
 if [ "${AOT_SKIP_SPEC_LINT:-0}" = "1" ]; then
     echo "Skipping the provider spec lint (AOT_SKIP_SPEC_LINT=1)"
+    # Still run the lint's header prefetch: provider builds overlap and would
+    # otherwise race on the same cold downloads, and a peer past the artifact
+    # lock timeout fails its build (see run_provider_spec_lint).
+    python3 "${SCRIPT_DIR}/prefetch_jit_spec_headers.py" || {
+        echo "ERROR: Failed to prefetch provider spec headers"
+        exit 1
+    }
 else
     echo ""
     echo "========================================"
