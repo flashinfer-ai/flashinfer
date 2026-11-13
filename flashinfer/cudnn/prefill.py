@@ -1028,6 +1028,13 @@ if CUDNN_AVAILABLE:
                 if actual_seq_lens_kv is not None:
                     tensors_to_return.append(cudnn_actual_seq_lens_kv)
 
+            if (
+                not use_cu_seq_lens
+                and (batch_offsets_q is not None or batch_offsets_k is not None)
+                and (actual_seq_lens_q is not None or actual_seq_lens_kv is not None)
+            ):
+                # SM120 prefill derives lengths from ragged offsets and ignores explicit ones.
+                g.deselect_engines(["sdpa_fwd_prefill_sm120"])
             if workspace_limit is not None:
                 # The same constraint applies to backend and Python engines.
                 # This graph has its own cache key; never filter a shared graph.
