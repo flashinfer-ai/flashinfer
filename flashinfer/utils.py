@@ -301,6 +301,22 @@ def _get_cache_buf(
     return buf
 
 
+def make_l2_flush(num_bytes: int, device) -> Callable[[], None]:
+    """Return a callable that evicts L2 by reading a ``num_bytes`` scratch buffer.
+
+    The buffer is only read, so L2 is left holding clean lines. A write-based
+    flush (``zero_()``) leaves L2 full of dirty lines, and the next kernel pays
+    for writing them back to DRAM (about 8 us for a memory-bound GEMM on B200).
+    """
+    buffer = torch.empty(num_bytes // 8, dtype=torch.int64, device=device)
+    out = torch.empty((), dtype=torch.int64, device=device)
+
+    def flush() -> None:
+        torch.sum(buffer, dim=0, out=out)
+
+    return flush
+
+
 _stream_cache_buf: Dict[Tuple[str, torch.device, int], torch.Tensor] = {}
 # Per-device private pools keep these long-lived buffers out of CUDA graph pools.
 _stream_cache_mem_pools: Dict[int, torch.cuda.MemPool] = {}
