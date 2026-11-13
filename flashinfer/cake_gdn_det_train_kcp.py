@@ -199,8 +199,9 @@ def cake_gdn_det_train_kcp_partition(
 
     Returns
     -------
-    ``CakeGDNDetKcpPartition``: per rank the fragment table ``(doc, off, length, prev, next)`` in document order; reused across
-    layers (metadata only).
+    CakeGDNDetKcpPartition
+        ``CakeGDNDetKcpPartition``: per rank the fragment table ``(doc, off, length, prev, next)`` in document order; reused across
+        layers (metadata only).
     """
     return _pkg().cake_gdn_det_train_kcp_partition(
         cu_seqlens_global_cpu, world_size, layout, fragments, cut_points=cut_points
@@ -296,7 +297,8 @@ def cake_gdn_det_train_kcp_forward(
 
     Returns
     -------
-    ``(out, saved)``: ``out`` BF16 like ``v`` (fresh); ``saved`` the saved set or ``None``.
+    tuple[torch.Tensor, Optional[Any]]
+        ``(out, saved)``: ``out`` BF16 like ``v`` (fresh); ``saved`` the saved set or ``None``.
     """
     return _pkg().cake_gdn_det_train_kcp_forward(
         q,
@@ -351,9 +353,10 @@ def cake_gdn_det_train_kcp_backward(
 
     Returns
     -------
-    ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v`` (the ``HV / H_qk`` value heads' contributions to
-    ``dq`` / ``dk`` reduced in FP32 and rounded once), FP32 gradients of ``beta`` and ``g``; fresh tensors, ranked
-    like the inputs.  Bitwise reproducible at the same topology; saved and replay modes agree bitwise.
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v`` (the ``HV / H_qk`` value heads' contributions to
+        ``dq`` / ``dk`` reduced in FP32 and rounded once), FP32 gradients of ``beta`` and ``g``; fresh tensors, ranked
+        like the inputs.  Bitwise reproducible at the same topology; saved and replay modes agree bitwise.
     """
     return _pkg().cake_gdn_det_train_kcp_backward(
         q,

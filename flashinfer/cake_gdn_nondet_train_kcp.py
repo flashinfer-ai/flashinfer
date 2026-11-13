@@ -211,8 +211,9 @@ def cake_gdn_nondet_train_kcp_partition(
 
     Returns
     -------
-    ``CakeGDNNondetKcpPartition``: per rank the fragment table
-    ``(doc, off, length, prev, next)`` in document order; reused across layers (metadata only).
+    CakeGDNNondetKcpPartition
+        ``CakeGDNNondetKcpPartition``: per rank the fragment table
+        ``(doc, off, length, prev, next)`` in document order; reused across layers (metadata only).
     """
     return _pkg().cake_gdn_nondet_train_kcp_partition(
         cu_seqlens_global_cpu, world_size, layout, fragments, cut_points=cut_points
@@ -320,8 +321,9 @@ def cake_gdn_nondet_train_kcp_forward(
 
     Returns
     -------
-    ``(out, saved)``: ``out`` BF16 like ``v`` (fresh); ``saved`` the saved set or ``None`` (readable by this
-    package's backward only).
+    tuple[torch.Tensor, Optional[Any]]
+        ``(out, saved)``: ``out`` BF16 like ``v`` (fresh); ``saved`` the saved set or ``None`` (readable by this
+        package's backward only).
     """
     return _pkg().cake_gdn_nondet_train_kcp_forward(
         q,
@@ -373,9 +375,10 @@ def cake_gdn_nondet_train_kcp_backward(
 
     Returns
     -------
-    ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v`` (the ``HV / H_qk`` value heads' contributions to
-    ``dq`` / ``dk`` reduced in FP32 and rounded once), FP32 gradients of ``beta`` and ``g``; fresh tensors, ranked
-    like the inputs; within the deterministic package's accuracy budgets, not bitwise equal to its results.
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v`` (the ``HV / H_qk`` value heads' contributions to
+        ``dq`` / ``dk`` reduced in FP32 and rounded once), FP32 gradients of ``beta`` and ``g``; fresh tensors, ranked
+        like the inputs; within the deterministic package's accuracy budgets, not bitwise equal to its results.
     """
     return _pkg().cake_gdn_nondet_train_kcp_backward(
         q,

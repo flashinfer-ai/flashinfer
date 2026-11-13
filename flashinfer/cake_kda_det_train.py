@@ -143,7 +143,8 @@ def cake_kda_det_train_forward(
 
     Returns
     -------
-    ``(out, saved)``: ``out`` BF16 like ``v``; ``saved`` a ``CakeKDADetChunkSaved`` (versioned) or ``None``.
+    tuple[torch.Tensor, Optional[Any]]
+        ``(out, saved)``: ``out`` BF16 like ``v``; ``saved`` a ``CakeKDADetChunkSaved`` (versioned) or ``None``.
     """
     from .experimental.cake.cake_kda_det_train import cake_backend
 

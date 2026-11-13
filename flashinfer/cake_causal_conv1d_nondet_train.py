@@ -385,9 +385,10 @@ def cake_causal_conv1d_nondet_train_backward(
 
     Returns
     -------
-    ``(dx, dweight)``, with a third element ``dbias`` only when ``bias`` is
-    given.  ``S == 0`` returns the empty ``dx`` and zero gradients without
-    launching.
+    tuple[torch.Tensor, ...]
+        ``(dx, dweight)``, with a third element ``dbias`` only when ``bias`` is
+        given.  ``S == 0`` returns the empty ``dx`` and zero gradients without
+        launching.
     """
 
     return _backend().cake_causal_conv1d_nondet_train_backward(

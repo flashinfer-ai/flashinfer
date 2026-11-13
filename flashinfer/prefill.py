@@ -8445,8 +8445,9 @@ def trtllm_sage_attention_quantize(
 
     Returns
     -------
-    (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale) or
-    (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, k_mean)
+    tuple of torch.Tensor
+        (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale) or
+        (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, k_mean)
         Quantized Q/K/V followed by their FP32 dequantization scales.
         When ``smooth_k=True``, the FP32 K mean is appended. The first six
         outputs can be passed directly to `trtllm_ragged_attention_deepseek`.
@@ -10286,8 +10287,10 @@ def trtllm_fmha_v2_prefill(
         Defaults to ``0`` (disabled).
     Returns
     -------
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         If :attr:`save_softmax_stats` is ``False``, the attention output tensor.
         If :attr:`save_softmax_stats` is ``True``, a tuple of two tensors:
+
         * The attention output tensor.
         * The softmax statistics tensor (LSE).
     """
