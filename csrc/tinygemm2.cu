@@ -278,6 +278,13 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(
   }
   // Compute threads
   else {
+    // The bias can be produced by the preceding kernel, so its read must follow
+    // the PDL wait.  The activation-loader warps only order the activation
+    // loads; their wait does not order global loads issued by these warps.
+    if constexpr (USE_PDL) {
+      cudaGridDependencySynchronize();
+    }
+
     // Sneak the bias load into the compute warps since they're just waiting
     if constexpr (HAS_BIAS) {
       if (threadIdx.x < TILE_M) sh_bias[threadIdx.x] = bias[mib + threadIdx.x];

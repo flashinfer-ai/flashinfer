@@ -606,6 +606,7 @@ kernel_cake_tinygemm2_tcgen05_0bb51b8202cba55024f1(const __grid_constant__ CUten
             int col_half = 0;
             int bm0_1_0 = m0_e + epi_tid % 32;
             int _min_0_2 = ((bm0_1_0) < (M - 1) ? (bm0_1_0) : (M - 1));
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             float bv0_1_0 = bias[_min_0_2];
             int bm0_1_1 = m0_e + (epi_tid + 128) % 32;
             int _min_1_2 = ((bm0_1_1) < (M - 1) ? (bm0_1_1) : (M - 1));

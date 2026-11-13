@@ -223,6 +223,11 @@ tinygemm2_kernel(__nv_bfloat16* __restrict__ output, __nv_bfloat16* __restrict__
             int k_loops_c = (K + 1024 - 1) / 1024;
             int mib_c = blockIdx.x * 16;
             int ni_c = blockIdx.y * 8;
+            // The bias can be produced by the preceding kernel.  The activation
+            // loader's wait only orders that thread's TMA operations.
+            if constexpr (USE_PDL) {
+                asm volatile("griddepcontrol.wait;" ::: "memory");
+            }
             if (tid < 16) {
                 smem_bias[tid] = bias[mib_c + tid];
             }
