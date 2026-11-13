@@ -16,6 +16,22 @@ Usage::
     # Every step: stage FP8 activations and routing, then run.
     buf.stage(x_fp8, x_sf, topk_idx, topk_weights)
     nvfp4_mega_moe(y, w1, w2, buf, l1_global_scales=g1, l2_global_scales=g2)
+
+MXFP4 with redundant expert slots (``MegaMoEExpertSlots``): the buffer is sized
+for the physical slots, the weights live in the slots' symmetric arena, the
+logical routing is remapped onto the slots before the kernel runs, and the
+kernel copies the slots whose expert changed from their resident ranks::
+
+    buf = MegaMoESymmBuffer(group, num_experts=256 + 8 * 4, ...)
+    slots = MegaMoEExpertSlots(buf, num_experts=256, num_redundant_slots=4)
+    slots.set_resident_weights(w1, w2, g1, g2)
+    slots.set_replica_plan(slot_expert, copies, expert_base)
+    buf.stage(x_fp8, x_sf, topk_idx, topk_weights)
+    slots.remap(num_tokens)
+    mxfp4_mega_moe(y, slots.l1_weights, slots.l2_weights, buf,
+                   l1_global_scales=slots.l1_global_scales,
+                   l2_global_scales=slots.l2_global_scales,
+                   expert_slots=slots)
 """
 
 import dataclasses
@@ -31,6 +47,8 @@ from ..jit.megamoe import (
     gen_megamoe_sm90_nvfp4_split_module,
     gen_megamoe_sm90_nvfp4_split_plan_module,
 )
+from ._jit import _get_jit_module
+from .eplb import MegaMoEExpertSlots
 from .heuristics import (
     CANDIDATE_BLOCK_M,
     FusedPlan,
@@ -47,6 +65,7 @@ from .weights import (
 
 __all__ = [
     "MegaMoESymmBuffer",
+    "MegaMoEExpertSlots",
     "nvfp4_mega_moe",
     "mxfp4_mega_moe",
     "transform_nvfp4_weights_for_mega_moe",
@@ -60,12 +79,8 @@ __all__ = [
 ]
 
 
-@functools.cache
-def _get_jit_module(factory, *args):
-    return factory(*args).build_and_load()
-
-
 def _jit_args(factory, plan, b):
+    """Positional JIT arguments for ``factory`` from ``plan`` and buffer ``b``, with the rank count where that factory expects it."""
     args = (plan, b.num_sms)
     # Keep the trailing fused rank argument compatible with existing JIT callers.
     if factory is not gen_megamoe_sm90_nvfp4_module:
@@ -84,8 +99,23 @@ def _jit_args(factory, plan, b):
     return args
 
 
-def _run_kernel(factory, entry, plan, y, w1, w2, b, m, stats, gs1, gs2):
-    module = _get_jit_module(factory, *_jit_args(factory, plan, b))
+def _run_kernel(
+    factory,
+    entry,
+    plan,
+    y,
+    w1,
+    w2,
+    b,
+    m,
+    stats,
+    gs1,
+    gs2,
+    extra_jit_args=(),
+    extra_kernel_args=(),
+):
+    """Launch ``entry`` of the module ``factory`` builds for ``plan`` and buffer ``b``."""
+    module = _get_jit_module(factory, *_jit_args(factory, plan, b), *extra_jit_args)
     getattr(module, entry)(
         y,
         b.buffer,
@@ -98,6 +128,7 @@ def _run_kernel(factory, entry, plan, y, w1, w2, b, m, stats, gs1, gs2):
         stats,
         gs1,
         gs2,
+        *extra_kernel_args,
     )
     return y
 
@@ -149,6 +180,7 @@ class MegaMoESymmBuffer:
         activation_clamp: float = 10.0,
         fast_math: bool = True,
     ) -> None:
+        """Validate the geometry, allocate the symmetric buffer and expose this rank's staging views."""
         import torch.distributed._symmetric_memory as symm_mem
 
         # Buffer geometry is format-independent; NVFP4 checks its narrower
@@ -223,6 +255,7 @@ class MegaMoESymmBuffer:
         )
 
     def _view(self, byte_offset: int, shape: Tuple[int, ...], dtype: torch.dtype):
+        """Typed view of ``shape`` into the symmetric buffer starting at ``byte_offset``."""
         itemsize = torch.empty((), dtype=dtype).element_size()
         numel = 1
         for s in shape:
@@ -483,6 +516,7 @@ def nvfp4_mega_moe(
 
 
 def _validate_call(y, w1, w2, b, m, weight_format, stats, gs1, gs2):
+    """Check ``y``, the expert weights and the optional per-expert tensors against the buffer geometry; raise ``ValueError`` on a mismatch."""
     if b.buffer is None:
         raise ValueError("symmetric buffer has been destroyed")
     if not 0 < m <= b.num_max_tokens_per_rank or m > getattr(b, "num_staged_tokens", 0):
@@ -544,6 +578,7 @@ def mxfp4_mega_moe(
     cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
     l1_global_scales: Optional[torch.Tensor] = None,
     l2_global_scales: Optional[torch.Tensor] = None,
+    expert_slots: Optional[MegaMoEExpertSlots] = None,
 ) -> torch.Tensor:
     """Run fused MXFP4 MegaMoE with chunk-major weights and FP8 activations.
 
@@ -565,7 +600,14 @@ def mxfp4_mega_moe(
         INT32 vector with one entry per local expert. Receive counts are
         accumulated in place; initialize the vector before first use.
     l1_global_scales, l2_global_scales : torch.Tensor, optional
-        FP32 vectors with one multiplier per local expert. Omitted scales use 1.
+        FP32 vectors with one multiplier per local expert. Omitted scales use 1,
+        or the slots' arena scales when ``expert_slots`` is given.
+    expert_slots : MegaMoEExpertSlots, optional
+        Redundant expert slots of this buffer. The kernel then copies the slots
+        listed in the slots' workspace (:meth:`MegaMoEExpertSlots.set_replica_plan`)
+        from their resident ranks while it computes, and the weights and global
+        scales must be the slots' arena views. The routing staged in the buffer
+        must already be physical (:meth:`MegaMoEExpertSlots.remap`).
 
     Returns
     -------
@@ -580,6 +622,13 @@ def mxfp4_mega_moe(
     """
     b = symm_buffer
     m = int(num_tokens if num_tokens is not None else y.shape[0])
+    if expert_slots is not None:
+        # The slots' arena carries the resident scales; an omitted argument
+        # must not silently run the kernel without them.
+        if l1_global_scales is None:
+            l1_global_scales = expert_slots.l1_global_scales
+        if l2_global_scales is None:
+            l2_global_scales = expert_slots.l2_global_scales
     _validate_call(
         y,
         l1_weights,
@@ -600,10 +649,21 @@ def mxfp4_mega_moe(
         b.intermediate_hidden,
         b.num_max_tokens_per_rank,
         m,
+        num_logical_experts=None if expert_slots is None else expert_slots.num_experts,
     )
+    entry = "megamoe_sm90_mxfp4_fused"
+    extra_jit_args: Tuple[Any, ...] = ()
+    extra_kernel_args: Tuple[Any, ...] = ()
+    if expert_slots is not None:
+        expert_slots._check_kernel_operands(
+            b, l1_weights, l2_weights, l1_global_scales, l2_global_scales
+        )
+        entry = "megamoe_sm90_mxfp4_fused_in_kernel_copy"
+        extra_jit_args = (True,)
+        extra_kernel_args = expert_slots._in_kernel_copy_args()
     return _run_kernel(
         gen_megamoe_sm90_mxfp4_module,
-        "megamoe_sm90_mxfp4_fused",
+        entry,
         plan,
         y,
         l1_weights,
@@ -613,6 +673,8 @@ def mxfp4_mega_moe(
         cumulative_local_expert_recv_stats,
         l1_global_scales,
         l2_global_scales,
+        extra_jit_args=extra_jit_args,
+        extra_kernel_args=extra_kernel_args,
     )
 
 
@@ -626,6 +688,8 @@ FAMILY_THRESHOLD = 256
 
 @dataclasses.dataclass(frozen=True)
 class SplitPlan:
+    """Compile-time configuration of the NVFP4 split kernel: L1/L2 pipeline depth and shared memory, wave width, pool sizes and dispatch policies."""
+
     l1_num_stages: int
     l1_smem_size: int
     l2_num_stages: int
@@ -700,6 +764,7 @@ def select_split_plan(
 
 
 def _run_split(y, l1_weights, l2_weights, b, m, stats, gs1, gs2):
+    """Select the split plan for ``m`` tokens and launch the NVFP4 split kernel on buffer ``b``."""
     plan = select_split_plan(
         b.num_sms,
         b.group.size(),

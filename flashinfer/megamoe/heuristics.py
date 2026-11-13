@@ -201,10 +201,14 @@ def select_mxfp4_fused_plan(
     intermediate_hidden: int,
     num_max_tokens_per_rank: int,
     num_tokens: int,
+    num_logical_experts: Optional[int] = None,
 ) -> FusedPlan:
     """Select MXFP4 tile geometry, pipeline depth and decode-warp partition.
 
     Chunk-major weight tiles are independent of the selected BLOCK_N.
+    ``num_logical_experts`` is the routed expert count when ``num_experts``
+    also counts redundant expert slots: the token block is sized by the rows
+    a routed expert receives, which the slots split but do not add to.
     """
     if num_sms <= 1:
         raise ValueError("num_sms must be greater than one")
@@ -226,9 +230,13 @@ def select_mxfp4_fused_plan(
     if not 0 < num_tokens <= num_max_tokens_per_rank:
         raise ValueError("num_tokens must be in (0, num_max_tokens_per_rank]")
     epr = num_experts // num_ranks
+    if num_logical_experts is None:
+        num_logical_experts = num_experts
+    elif not 0 < num_logical_experts <= num_experts:
+        raise ValueError("num_logical_experts must be in (0, num_experts]")
 
     def max_tokens(bm):
-        return bm * num_experts // (num_ranks * num_topk)
+        return bm * num_logical_experts // (num_ranks * num_topk)
 
     limit = max_tokens(24) * H20_NUM_SMS // num_sms
     bm = next((b for b in (8, 24, 32) if num_tokens <= max_tokens(b) * 7 // 10), 32)

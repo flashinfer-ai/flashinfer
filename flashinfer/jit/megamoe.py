@@ -16,6 +16,7 @@ from .core import JitSpec, gen_jit_spec, write_if_different
 
 
 def _csrc_dir() -> Path:
+    """Directory holding the MegaMoE CUDA sources, installed or in a source checkout."""
     installed = jit_env.FLASHINFER_CSRC_DIR / "megamoe"
     if installed.exists():
         return installed
@@ -70,6 +71,7 @@ def get_megamoe_sm90_nvfp4_uri(
     fast_math: bool,
     num_ranks: int = 8,
 ) -> str:
+    """Module key of the NVFP4 fused kernel: shape, rank width and every compile-time plan policy."""
     return (
         f"megamoe_sm90_nvfp4_r{num_ranks}_sm{num_sms}_e{num_experts}_k{num_topk}"
         f"_h{hidden}_i{intermediate_hidden}_cap{num_max_tokens_per_rank}"
@@ -99,6 +101,7 @@ def gen_megamoe_sm90_nvfp4_module(
     fast_math: bool,
     num_ranks: int = 8,
 ) -> JitSpec:
+    """Render the fused config for ``plan`` and return the JIT spec of the NVFP4 fused kernel module."""
     uri = get_megamoe_sm90_nvfp4_uri(
         plan,
         num_sms,
@@ -160,6 +163,7 @@ def _split_shape_uri(
     hidden,
     intermediate_hidden,
 ) -> str:
+    """Shape part shared by the split-family module keys."""
     return (
         f"sm{num_sms}_r{num_ranks}_e{num_experts}_k{num_topk}"
         f"_h{hidden}_i{intermediate_hidden}_cap{num_max_tokens_per_rank}"
@@ -218,6 +222,7 @@ def get_megamoe_sm90_nvfp4_split_uri(
     activation_clamp,
     fast_math,
 ) -> str:
+    """Module key of the NVFP4 split kernel: shape, pipeline depths and dispatch policies of ``plan``."""
     return (
         "megamoe_sm90_nvfp4_split_"
         + _split_shape_uri(
@@ -250,6 +255,10 @@ def gen_megamoe_sm90_nvfp4_split_module(
     activation_clamp,
     fast_math,
 ) -> JitSpec:
+    """Render the split config for ``plan`` and return the JIT spec of the NVFP4 split kernel module.
+
+    Compiler fast-math stays off here; ``fast_math`` only selects source intrinsics.
+    """
     uri = get_megamoe_sm90_nvfp4_split_uri(
         plan,
         num_sms,
@@ -292,6 +301,7 @@ def gen_megamoe_sm90_nvfp4_split_module(
 
 
 def gen_megamoe_sm90_layout_module() -> JitSpec:
+    """JIT spec of the helper that computes the symmetric buffer layout and byte offsets."""
     csrc = _csrc_dir()
     return gen_jit_spec(
         "megamoe_sm90_layout",
@@ -300,6 +310,36 @@ def gen_megamoe_sm90_layout_module() -> JitSpec:
         extra_cuda_cflags=["-std=c++20", "--expt-relaxed-constexpr"],
         extra_cflags=["-std=c++20"],
     )
+
+
+def get_megamoe_sm90_mxfp4_uri(
+    plan,
+    num_sms,
+    num_ranks,
+    num_max_tokens_per_rank,
+    num_experts,
+    num_topk,
+    hidden,
+    intermediate_hidden,
+    activation_clamp,
+    fast_math,
+    in_kernel_weight_copy: bool = False,
+) -> str:
+    """Module key of the MXFP4 fused kernel: every compile-time policy, the rank
+    width and whether the kernel copies the weights of a replica plan."""
+    uri = get_megamoe_sm90_nvfp4_uri(
+        plan,
+        num_sms,
+        num_max_tokens_per_rank,
+        num_experts,
+        num_topk,
+        hidden,
+        intermediate_hidden,
+        activation_clamp,
+        fast_math,
+        num_ranks=num_ranks,
+    ).replace("nvfp4", "mxfp4")
+    return uri + ("_eplbcopy" if in_kernel_weight_copy else "")
 
 
 def gen_megamoe_sm90_mxfp4_module(
@@ -313,11 +353,13 @@ def gen_megamoe_sm90_mxfp4_module(
     intermediate_hidden,
     activation_clamp,
     fast_math,
+    in_kernel_weight_copy: bool = False,
 ) -> JitSpec:
-    # Include every compile-time policy in the key, including rank width.
-    uri = get_megamoe_sm90_nvfp4_uri(
+    """JIT spec of the MXFP4 fused kernel, with or without the in-kernel weight copy."""
+    uri = get_megamoe_sm90_mxfp4_uri(
         plan,
         num_sms,
+        num_ranks,
         num_max_tokens_per_rank,
         num_experts,
         num_topk,
@@ -325,8 +367,8 @@ def gen_megamoe_sm90_mxfp4_module(
         intermediate_hidden,
         activation_clamp,
         fast_math,
-        num_ranks=num_ranks,
-    ).replace("nvfp4", "mxfp4")
+        in_kernel_weight_copy,
+    )
     return _gen_fp4_module(
         uri,
         "megamoe_sm90_mxfp4_config",
@@ -342,6 +384,31 @@ def gen_megamoe_sm90_mxfp4_module(
             intermediate_hidden=intermediate_hidden,
             activation_clamp=activation_clamp,
             fast_math=fast_math,
+            in_kernel_weight_copy=in_kernel_weight_copy,
         ),
         fast_math,
+    )
+
+
+def get_megamoe_sm90_eplb_uri(num_ranks, num_experts, num_redundant_slots) -> str:
+    """Module key of the replica-plan kernels, one per slot geometry."""
+    return f"megamoe_sm90_eplb_r{num_ranks}_e{num_experts}_s{num_redundant_slots}"
+
+
+def gen_megamoe_sm90_eplb_module(
+    num_ranks, num_experts, num_redundant_slots
+) -> JitSpec:
+    """Replica-plan kernels of the MXFP4 fused kernel: the logical-to-physical
+    remap of the top-k ids and the separate weight copy of the changed redundant
+    expert slots. One module per slot geometry."""
+    return _gen_fp4_module(
+        get_megamoe_sm90_eplb_uri(num_ranks, num_experts, num_redundant_slots),
+        "megamoe_sm90_eplb_config",
+        ("megamoe_sm90_eplb.cu",),
+        dict(
+            num_ranks=num_ranks,
+            num_experts=num_experts,
+            num_redundant_slots=num_redundant_slots,
+        ),
+        False,
     )
