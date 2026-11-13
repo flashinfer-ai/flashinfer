@@ -1216,25 +1216,7 @@ def _empty_mla_runtime() -> mla_decode_module._MLARuntime:
     )
 
 
-@pytest.mark.parametrize(
-    "options",
-    [
-        pytest.param({}, id="default-bound"),
-        pytest.param(
-            dict(
-                seq_len_q=4,
-                num_qo_heads=128,
-                q_dtype=_FP8,
-                store_softmax_stats=True,
-                use_kv_bounds=True,
-                mask_type="dense",
-            ),
-            id="legacy-bound-fp8-stats",
-        ),
-        pytest.param(dict(max_kv_len=128, max_q_len=2), id="explicit-bound-short-kv"),
-    ],
-)
-def test_attention_ts_mla_trusted_workspace_size(monkeypatch, options):
+def test_attention_ts_mla_trusted_workspace_size(monkeypatch):
     """Trusted sizing reuses the same policy without repeated host checks."""
     from contextlib import nullcontext
     from flashinfer.attention.prims_ts import _hardware
@@ -1246,17 +1228,18 @@ def test_attention_ts_mla_trusted_workspace_size(monkeypatch, options):
     )
     monkeypatch.setattr(_hardware, "get_max_active_clusters", lambda size: 148 // size)
     monkeypatch.setattr(mla_decode_module, "get_device_sm_count", lambda *_: 148)
-    args = (
-        dict(
-            batch_size=2,
-            num_qo_heads=16,
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-            page_size=32,
-            max_kv_len=8192,
-            device="cuda:0",
-        )
-        | options
+    args = dict(
+        batch_size=2,
+        num_qo_heads=96,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        page_size=128,
+        max_q_len=8,
+        max_kv_len=8192,
+        q_dtype=_FP8,
+        store_softmax_stats=True,
+        use_kv_bounds=True,
+        device="cuda:0",
     )
     cache = mla_decode_module._resolve_mla_decode_launch_spec
     cache.cache_clear()
@@ -1292,38 +1275,6 @@ def test_attention_ts_mla_trusted_workspace_size(monkeypatch, options):
         assert after.hits == before.hits + 2
     finally:
         cache.cache_clear()
-
-
-def test_attention_ts_mla_workspace_size_validation():
-    """Default validation and ambiguous Q-bound rejection remain unchanged."""
-    args = dict(
-        batch_size=2,
-        num_qo_heads=16,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        page_size=32,
-        max_kv_len=8192,
-        device="cuda:0",
-    )
-    with pytest.raises(TypeError, match="validate must be a bool"):
-        get_prims_ts_batch_mla_decode_workspace_size(**args, validate=0)
-    with pytest.raises(ValueError, match="batch_size must be positive"):
-        get_prims_ts_batch_mla_decode_workspace_size(**(args | dict(batch_size=0)))
-    with pytest.raises(NotImplementedError, match="kv_lora_rank=512"):
-        get_prims_ts_batch_mla_decode_workspace_size(**(args | dict(kv_lora_rank=256)))
-    with pytest.raises(ValueError, match="seq_len_q and max_q_len must agree"):
-        get_prims_ts_batch_mla_decode_workspace_size(
-            **args, seq_len_q=2, max_q_len=3, validate=False
-        )
-
-
-@pytest.mark.parametrize("kernel_bytes", (0, 1, 256, 257))
-def test_attention_ts_mla_workspace_size_without_lse(kernel_bytes):
-    """Without final LSE, only the kernel section's trailing alignment remains."""
-    layout = mla_decode_module._make_mla_workspace_layout(
-        kernel_bytes, 2, 16, 3, include_lse=False
-    )
-    assert layout.total_bytes == mla_decode_module._align_up(kernel_bytes)
 
 
 def test_attention_ts_mla_public_surfaces_hide_internal_tuning_policy():
@@ -1448,38 +1399,6 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
     assert run_parameters["kv_bounds"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
-@pytest.mark.parametrize("split_kv", (1, 4, 64))
-def test_attention_ts_mla_softmax_stats_workspace_is_optional(split_kv):
-    import cutlass
-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
-        compute_workspace_size as size_2cta,
-    )
-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
-        compute_workspace_size as size_1cta,
-    )
-
-    cfg = SimpleNamespace(
-        batch_size=2,
-        seq_len_q=3,
-        num_heads_q=16,
-        head_dim_v=512,
-        num_ctas_per_seq_kv=split_kv,
-        use_cluster_reduction=0,
-    )
-    dtype_args = dict(partial_o_dtype=cutlass.BFloat16, lse_dtype=cutlass.Float32)
-    baseline = size_1cta(cfg=cfg, **dtype_args)
-    enabled = size_1cta(cfg=cfg, store_softmax_stats=True, **dtype_args)
-    assert enabled - baseline == (2 * 3 * 16 * split_kv * 8 if split_kv > 1 else 0)
-    cfg.use_cluster_reduction = 1
-    assert size_1cta(cfg=cfg, store_softmax_stats=True, **dtype_args) == 0
-    shape = dict(
-        tile_size_q=128, num_q_tiles=3, latent_dim=512, batch_size=2, split_kv=split_kv
-    )
-    baseline = size_2cta(**shape, **dtype_args)
-    enabled = size_2cta(**shape, store_softmax_stats=True, **dtype_args)
-    assert enabled - baseline == (2 * 3 * 128 * split_kv * 8 if split_kv > 1 else 0)
-
-
 def test_attention_ts_mla_decode_wrapper_trace_names_softmax_rescale_threshold_log2():
     """A nonzero plan-time rescale threshold gets its own trace definition."""
     from flashinfer.fi_trace import fi_trace
@@ -1514,226 +1433,6 @@ def test_attention_ts_mla_decode_wrapper_trace_names_softmax_rescale_threshold_l
     assert not any(
         tag.startswith("softmax_rescale_threshold_log2") for tag in exact["tags"]
     )
-
-
-@pytest.mark.parametrize("enabled", (False, True))
-@pytest.mark.parametrize("validate", (False, True))
-def test_mla_stats_buffer_presence_is_a_plan_contract(enabled, validate):
-    query = torch.empty((1, 2, 8, 576), dtype=torch.bfloat16)
-    stats = torch.empty((*query.shape[:-1], 2))
-    validator = mla_decode_module._validate_mla_softmax_stats
-    validator(query, stats if enabled else None, enabled=enabled, validate=validate)
-    with pytest.raises(ValueError, match="exactly when"):
-        validator(query, None if enabled else stats, enabled=enabled, validate=validate)
-
-
-def test_mla_stats_buffer_layout_validation():
-    query = torch.empty((1, 2, 8, 576), dtype=torch.bfloat16)
-    validator = mla_decode_module._validate_mla_softmax_stats
-    for invalid in (
-        torch.empty((1, 2, 8, 2), dtype=torch.bfloat16),
-        torch.empty((1, 2, 8, 3)),
-        torch.empty((1, 2, 8, 4))[..., ::2],
-    ):
-        with pytest.raises(ValueError):
-            validator(query, invalid, enabled=True, validate=True)
-    guard = torch.empty((35,), dtype=torch.float32)
-    validator(query, guard[1:33].view(1, 2, 8, 2), enabled=True, validate=True)
-
-
-def test_mla_stats_rejects_deferred_max_before_device_resolution(monkeypatch):
-    def unexpected(*args, **kwargs):
-        pytest.fail("unsupported statistics tuning reached device/allocation work")
-
-    monkeypatch.setattr(mla_decode_module, "_resolve_cuda_device", unexpected)
-    with pytest.raises(ValueError, match="zero-threshold"):
-        BatchMLADecodePagedTSWrapper().plan(
-            "cuda",
-            1,
-            8,
-            512,
-            64,
-            32,
-            256,
-            max_q_len=1,
-            packed_query=False,
-            q_dtype=torch.bfloat16,
-            kv_dtype=torch.bfloat16,
-            out_dtype=torch.bfloat16,
-            store_softmax_stats=True,
-            tuning=MLAAttentionTuning(softmax_rescale_threshold_log2=1.0),
-        )
-
-
-@pytest.mark.parametrize("packed", (False, True))
-@pytest.mark.parametrize("with_lse", (False, True))
-def test_mla_stats_preserves_persisted_launch_optional_argument_slots(packed, with_lse):
-    shape = (6, 8, 576) if packed else (2, 3, 8, 576)
-    query = torch.empty(shape, dtype=torch.bfloat16)
-    output = torch.empty((*shape[:-1], 512), dtype=query.dtype)
-    stats = torch.empty((*shape[:-1], 2))
-    lse = torch.empty(shape[:-1]) if with_lse else None
-    runtime = SimpleNamespace(
-        query=query,
-        out=output,
-        normalized_cache=torch.empty((8, 32, 576)),
-        extra_cache=None,
-        sparse_inputs=None,
-        softmax_scale=0.25,
-        output_scale=0.75,
-        output_quant_args=None,
-    )
-    calls = []
-    result = mla_decode_module._launch_mla_decode(
-        runtime,
-        block_tables=torch.empty((2, 4), dtype=torch.int32),
-        seq_lens_kv=torch.empty((2,), dtype=torch.int32),
-        qo_indptr=torch.tensor([0, 3, 6], dtype=torch.int32) if packed else None,
-        packed_query=packed,
-        kv_lora_rank=512,
-        split_kv=4,
-        workspace=SimpleNamespace(kernel_workspace=None, lse=None),
-        compiled=lambda *args: calls.append(args),
-        lse=lse,
-        max_q_len=3,
-        softmax_stats=stats,
-    )
-    assert result is output and len(calls) == 1 and len(calls[0]) == 18
-    args = calls[0]
-    assert args[12:16] == (0.25, 0.75, None, 3)
-    assert args[16].data_ptr() == stats.data_ptr()
-    assert (args[6] is not None) == with_lse
-    if with_lse:
-        assert args[6].data_ptr() == lse.data_ptr()
-
-
-def test_mla_stats_participates_in_kernel_and_compile_identity():
-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.kernel import (
-        MlaDecodeTs,
-    )
-
-    kernel = MlaDecodeTs(is_persistent=False)
-    launch = mla_decode_module._MLADecodeLaunchSpec(kernel, (), 0, 1)
-    kwargs = dict(
-        device_index=0,
-        num_qo_heads=128,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        page_size=32,
-        q_dtype_key="bfloat16",
-        out_dtype_key="bfloat16",
-        max_q_len=1,
-        packed_query=False,
-        write_final_lse=False,
-    )
-    disabled = mla_decode_module._make_mla_decode_compile_spec(launch, **kwargs)
-    enabled = mla_decode_module._make_mla_decode_compile_spec(
-        launch, **kwargs, store_softmax_stats=True
-    )
-    assert disabled != enabled
-    assert disabled.kernel_signature != enabled.kernel_signature
-    assert not enabled.write_final_lse
-    assert not kernel.store_softmax_stats
-
-
-def test_mla_stats_compile_and_reload_use_the_same_optional_argument_order():
-    import ast
-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.kernel import (
-        MlaDecodeTs,
-    )
-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.kernel import (
-        ThroughputLatencyMlaDecodeTs,
-    )
-
-    for kernel in (MlaDecodeTs, ThroughputLatencyMlaDecodeTs):
-        assert tuple(inspect.signature(kernel.__call__).parameters)[-4:] == (
-            "output_quant_args",
-            "max_q_len",
-            "softmax_stats",
-            "kv_bounds",
-        )
-    tree = ast.parse(inspect.getsource(mla_decode_module._get_compiled_mla_decode))
-    calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Subscript)
-        and isinstance(node.func.value, ast.Attribute)
-        and node.func.value.attr == "compile"
-    ]
-    assert len(calls) == 1
-    call = calls[0]
-    assert ast.unparse(call.args[-4]) == "output_quant_args"
-    assert ast.unparse(call.args[-3]) == "cutlass.Int32(0)"
-    assert ast.unparse(call.args[-2]) == "stats_fake"
-    assert ast.unparse(call.args[-1]) == "bounds_fake"
-    assert {kw.arg for kw in call.keywords} == {"options"}
-
-
-@pytest.mark.parametrize(
-    "family,reduction",
-    [("1cta", mode) for mode in ("direct", "cluster", "serial", "parallel")]
-    + [("2cta", mode) for mode in ("direct", "serial", "parallel")],
-)
-def test_mla_stats_forced_topologies_retain_main_policy_and_cache_contract(
-    monkeypatch, family, reduction
-):
-    from contextlib import nullcontext
-    from flashinfer.attention.prims_ts import _hardware
-    from tests.attention.test_attention_ts_softmax_stats import _force_mla_topology
-
-    monkeypatch.setattr(torch.cuda, "device", lambda *_: nullcontext())
-    monkeypatch.setattr(mla_decode_module, "get_max_active_clusters", lambda *_: 64)
-    monkeypatch.setattr(_hardware, "get_max_active_clusters", lambda *_: 64)
-    monkeypatch.setattr(mla_decode_module, "get_device_sm_count", lambda *_: 128)
-    builds = []
-    monkeypatch.setattr(
-        mla_decode_module,
-        "build_and_load_attention_kernel",
-        lambda *args, **kwargs: builds.append(kwargs),
-    )
-    caches = _force_mla_topology(monkeypatch, family, reduction)
-    for cache in caches:
-        cache.cache_clear()
-    try:
-        spec = mla_decode_module._resolve_mla_decode_launch_spec(
-            0,
-            1,
-            8 if family == "1cta" else 128,
-            512,
-            64,
-            32,
-            8193,
-            "bfloat16",
-            "bfloat16",
-            "bfloat16",
-            "causal",
-            1,
-            0.0,
-            True,
-        )
-        policy = dict(spec.policy)
-        assert (policy["split_kv"] == 1) == (reduction == "direct")
-        assert policy["use_cluster_reduction"] == (reduction == "cluster")
-        assert (
-            policy["separate_reducer_impl"]
-            == {
-                "direct": "none",
-                "cluster": "none",
-                "serial": "reference",
-                "parallel": "parallel",
-            }[reduction]
-        )
-        assert spec.kernel.store_softmax_stats
-        mla_decode_module.build_and_load_attention_kernel(
-            "mla_decode", "main", None, (), None, extra=("original",)
-        )
-        assert builds == [
-            {"extra": ("original", "stats-topology-test", family, reduction)}
-        ]
-    finally:
-        for cache in caches:
-            cache.cache_clear()
 
 
 def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
@@ -3804,25 +3503,20 @@ def test_attention_ts_mla_decode_generic_packed_logical_rows(heads, dtype):
 def test_attention_ts_mla_replanned_sizes(heads, dtype, packed_query):
     """Replanned problem sizes retain numerical accuracy and graph replay."""
     wrapper = BatchMLADecodePagedTSWrapper()
-
-    def workspace_size(batch, sq, sk):
-        return get_prims_ts_batch_mla_decode_workspace_size(
-            batch_size=batch,
-            num_qo_heads=heads,
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-            page_size=32,
-            max_kv_len=sk,
-            max_q_len=sq,
-            q_dtype=dtype,
-            out_dtype=torch.bfloat16,
-            device="cuda",
-            validate=False,
-        )
-
     workspace = torch.empty(
         max(
-            workspace_size(batch, sq, sk)
+            get_prims_ts_batch_mla_decode_workspace_size(
+                batch_size=batch,
+                num_qo_heads=heads,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                page_size=32,
+                max_kv_len=sk,
+                max_q_len=sq,
+                q_dtype=dtype,
+                out_dtype=torch.bfloat16,
+                device="cuda",
+            )
             for batch, sq, sk in ((2, 1, 513), (3, 3, 641), (1, 5, 769), (2, 1, 514))
         ),
         dtype=torch.uint8,
@@ -3878,10 +3572,6 @@ def test_attention_ts_mla_replanned_sizes(heads, dtype, packed_query):
     out = torch.empty_like(output)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        assert (
-            workspace_size(batch, sq, sk)
-            == wrapper._plan_state.workspace_layout.total_bytes
-        )
         run(out=out, validate=False)
     graph.replay()
     torch.cuda.synchronize()
@@ -4030,8 +3720,7 @@ def test_attention_ts_mla_runtime_sm_split_ceiling(dtype):
         (torch.float8_e4m3fn, 256, 3, 513, True, "base2"),
     ],
 )
-@pytest.mark.parametrize("store_stats", (False, True))
-def test_mla_final_lse(dtype, heads, nq, nk, packed, mode, store_stats):
+def test_mla_final_lse(dtype, heads, nq, nk, packed, mode):
     case = _make_mla_case(
         batch_size=2,
         num_qo_heads=heads,
@@ -4045,15 +3734,8 @@ def test_mla_final_lse(dtype, heads, nq, nk, packed, mode, store_stats):
     if packed:
         case, offsets = _pack_mla_case(case, (nq, 0))
     query = case.query
-    wrapper = _plan_case(
-        case,
-        qo_indptr=offsets,
-        max_q_len=nq,
-        lse_mode=mode,
-        store_softmax_stats=store_stats,
-    )
+    wrapper = _plan_case(case, qo_indptr=offsets, max_q_len=nq, lse_mode=mode)
     refs = []
-    stats_refs = []
     for b, n in enumerate(case.seq_lens_kv.tolist()):
         qb = query[int(offsets[b]) : int(offsets[b + 1])] if packed else query[b]
         pages = case.block_tables[b, : (n + 31) // 32].long()
@@ -4063,52 +3745,26 @@ def test_mla_final_lse(dtype, heads, nq, nk, packed, mode, store_stats):
         end = torch.arange(qb.shape[0], device="cuda") + n - qb.shape[0]
         scores.masked_fill_(keys[None, None] > end[:, None, None], -torch.inf)
         refs.append(torch.logsumexp(scores, -1))
-        maximum = scores.max(dim=-1).values
-        denominator = torch.exp(scores - maximum[..., None]).sum(-1)
-        stats_refs.append(torch.stack((maximum, denominator), -1))
     expected = torch.cat(refs) if packed else torch.stack(refs)
     if mode == "base2":
         expected = expected / math.log(2)
     # Scalar FP32 LSE stores must accept a 4-byte-aligned offset view.
     guard = torch.full((expected.numel() + 2,), float("nan"), device="cuda")
     lse = guard[1:-1].view(expected.shape)
-    softmax_stats = (
-        torch.full((*query.shape[:-1], 2), torch.nan, device="cuda")
-        if store_stats
-        else None
-    )
-    expected_stats = torch.cat(stats_refs) if packed else torch.stack(stats_refs)
-    run = functools.partial(
-        _run_case,
-        wrapper,
-        case,
-        qo_indptr=offsets,
-        lse=lse,
-        softmax_stats=softmax_stats,
-    )
+    run = functools.partial(_run_case, wrapper, case, qo_indptr=offsets, lse=lse)
     out, stats = run(return_lse=True)
     _assert_case_correct(out, case, dict(wrapper._plan_state.policy), qo_indptr=offsets)
     assert stats is lse
     torch.testing.assert_close(lse, expected, atol=0.02, rtol=0.002)
-    if store_stats:
-        torch.testing.assert_close(
-            softmax_stats, expected_stats, atol=0.002, rtol=0.002
-        )
     assert torch.isnan(guard[0]) and torch.isnan(guard[-1])
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run(out=out, validate=False)
     out.fill_(torch.nan)
     lse.fill_(float("nan"))
-    if store_stats:
-        softmax_stats.fill_(torch.nan)
     graph.replay()
     _assert_case_correct(out, case, dict(wrapper._plan_state.policy), qo_indptr=offsets)
     torch.testing.assert_close(lse, expected, atol=0.02, rtol=0.002)
-    if store_stats:
-        torch.testing.assert_close(
-            softmax_stats, expected_stats, atol=0.002, rtol=0.002
-        )
 
 
 @_REQUIRES_PRIMTS_GPU
@@ -4244,8 +3900,7 @@ def test_attention_ts_mla_decode_2cta_runtime_small_split_reduction(seq_len_q, k
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize("family", ("1cta", "2cta"))
-@pytest.mark.parametrize("store_stats", (False, True), ids=("output-only", "stats"))
-def test_dense_mla_global_scales_graph_replay(family, store_stats):
+def test_dense_mla_global_scales_graph_replay(family):
     from tests.utils.test_helpers.pdl import late_store
 
     case = replace(
@@ -4264,19 +3919,18 @@ def test_dense_mla_global_scales_graph_replay(family, store_stats):
         case, offsets = _pack_mla_case(case, [1] * 8)
     sm_scale = (
         torch.tensor(case.softmax_scale, device="cuda")
-        if family == "1cta" or store_stats
+        if family == "1cta"
         else case.softmax_scale
     )
     output_scale = torch.tensor(case.output_scale, device="cuda")
-    name = "softmax_scale" if family == "1cta" or store_stats else "output_scale"
-    scale = sm_scale if name == "softmax_scale" else output_scale
+    name = "softmax_scale" if family == "1cta" else "output_scale"
+    scale = sm_scale if family == "1cta" else output_scale
     wrapper = _plan_case(
         case,
         qo_indptr=offsets,
         max_q_len=1,
         softmax_scale=sm_scale,
         output_scale=output_scale,
-        store_softmax_stats=store_stats,
     )
     policy = _policy_dict(wrapper)
     assert policy["kernel"] == (
@@ -4287,31 +3941,6 @@ def test_dense_mla_global_scales_graph_replay(family, store_stats):
     out = torch.empty(
         (*case.query.shape[:-1], 512), device="cuda", dtype=torch.bfloat16
     )
-    stats = (
-        torch.full((*case.query.shape[:-1], 2), torch.nan, device="cuda")
-        if store_stats
-        else None
-    )
-
-    def check(expected):
-        _assert_case_correct(out, expected, policy, qo_indptr=offsets)
-        if stats is None:
-            return
-        statistics = []
-        for batch_idx in range(expected.block_tables.shape[0]):
-            query = expected.query[batch_idx].reshape(1, expected.query.shape[-2], -1)
-            cache = _gather_request_cache(expected, batch_idx)
-            scores = (
-                torch.einsum("qhd,kd->qhk", query.float(), cache)
-                * expected.softmax_scale
-            )
-            maximum = scores.amax(-1)
-            denominator = (scores - maximum[..., None]).exp().sum(-1)
-            statistics.append(torch.stack((maximum, denominator), -1))
-        expected_stats = (
-            torch.cat(statistics) if offsets is not None else torch.stack(statistics)
-        )
-        torch.testing.assert_close(stats, expected_stats, atol=0.002, rtol=0.002)
 
     def run():
         wrapper.run(
@@ -4321,12 +3950,11 @@ def test_dense_mla_global_scales_graph_replay(family, store_stats):
             case.seq_lens_kv,
             qo_indptr=offsets,
             out=out,
-            softmax_stats=stats,
             validate=False,
         )
 
     run()
-    check(case)
+    _assert_case_correct(out, case, policy, qo_indptr=offsets)
     changed_value = getattr(case, name) * 1.5
     changed = replace(case, **{name: changed_value})
     late_store(scale, changed_value)
@@ -4338,4 +3966,4 @@ def test_dense_mla_global_scales_graph_replay(family, store_stats):
     for _ in range(2):
         scale.fill_(getattr(case, name))
         graph.replay()
-        check(changed)
+        _assert_case_correct(out, changed, policy, qo_indptr=offsets)

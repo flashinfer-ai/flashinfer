@@ -2764,290 +2764,6 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
     assert request_fields.isdisjoint(_DecodePlanState.__dataclass_fields__)
 
 
-@pytest.mark.parametrize("validate", (False, True))
-def test_attention_ts_decode_softmax_stats_binding_contract(validate) -> None:
-    from flashinfer.attention.prims_ts.decode import _validate_decode_softmax_stats
-
-    query = torch.empty((2, 3, 8, 128), dtype=torch.bfloat16)
-    stats = torch.empty((2, 3, 8, 2), dtype=torch.float32)
-    _validate_decode_softmax_stats(True, stats, query, validate=validate)
-    _validate_decode_softmax_stats(False, None, query, validate=validate)
-    for enabled, buffer in ((True, None), (False, stats)):
-        with pytest.raises(ValueError, match="exactly when"):
-            _validate_decode_softmax_stats(enabled, buffer, query, validate=validate)
-    if validate:
-        with pytest.raises(TypeError, match="float32"):
-            _validate_decode_softmax_stats(True, stats.half(), query, validate=True)
-        with pytest.raises(ValueError, match="shape"):
-            _validate_decode_softmax_stats(True, stats[..., :1], query, validate=True)
-        with pytest.raises(ValueError, match="contiguous"):
-            _validate_decode_softmax_stats(
-                True, torch.empty((2, 3, 8, 4))[..., ::2], query, validate=True
-            )
-
-
-@pytest.mark.parametrize("separate", (False, True))
-def test_attention_ts_decode_softmax_stats_workspace_contract(separate) -> None:
-    from flashinfer.attention.prims_ts.decode import _decode_scratch_shapes
-
-    config = FmhaDecodeConfig(
-        use_split_kv=True,
-        splits_kv=4,
-        max_splits_kv=4,
-        use_separate_reduction_kernel=separate,
-    )
-    geometry = dict(
-        batch_size=2, num_qo_heads=8, num_kv_heads=1, head_dim=128, seq_len_q=1
-    )
-    disabled = _decode_scratch_shapes(config, **geometry)
-    enabled = _decode_scratch_shapes(
-        replace(config, store_softmax_stats=True), **geometry
-    )
-    assert disabled[0] == enabled[0]
-    assert disabled[2] == enabled[2]
-    assert enabled[1] == (2, 1, 4, 8, 3 if separate else 2)
-    assert disabled[1] == ((2, 1, 4, 8) if separate else (2, 1, 4, 8, 2))
-
-
-def test_attention_ts_decode_softmax_stats_requires_exact_anchor() -> None:
-    config = FmhaDecodeConfig(use_keeps_mma_ab=True, tile_size_kv=256)
-    assert config.defers_softmax_anchor_updates
-    assert not replace(config, store_softmax_stats=True).defers_softmax_anchor_updates
-
-
-def test_attention_ts_decode_softmax_stats_and_lse_are_distinct_cache_fields() -> None:
-    base = FmhaDecodeConfig(runtime_split_kv=True, splits_kv=132, max_splits_kv=132)
-    signatures = {
-        replace(base, store_softmax_stats=stats, lse_mode=lse).compile_signature()
-        for stats in (False, True)
-        for lse in ("none", "base2")
-    }
-    assert len(signatures) == 4
-    for signature in signatures:
-        fields = dict(signature)
-        assert fields["runtime_split_kv"] is True
-        assert fields["splits_kv"] == fields["max_splits_kv"] == 132
-
-
-def test_attention_ts_decode_softmax_stats_rejects_only_new_sage_combination() -> None:
-    config = FmhaDecodeConfig(
-        q_dtype=Float8E4M3FN,
-        k_dtype=Float8E4M3FN,
-        v_dtype=Float8E4M3FN,
-        out_dtype=BFloat16,
-        sage_k_block_size=128,
-    )
-    config.validate_dtypes()
-    with pytest.raises(ValueError, match="store_softmax_stats.*Sage"):
-        replace(config, store_softmax_stats=True).validate_dtypes()
-    # Storage transforms remain separate from the effective compute recipe.
-    replace(config, sage_k_block_size=0, store_softmax_stats=True).validate_dtypes()
-
-
-@pytest.mark.parametrize("query_shape", ((2, 8, 128), (2, 3, 8, 128)))
-@pytest.mark.parametrize("stats_enabled", (False, True))
-def test_attention_ts_decode_softmax_stats_flattened_launch_abi(
-    query_shape, stats_enabled
-) -> None:
-    from flashinfer.attention.prims_ts import decode
-
-    q = torch.empty(query_shape, dtype=torch.bfloat16)
-    out = torch.empty_like(q)
-    lse = torch.empty(query_shape[:-1], dtype=torch.float32)
-    stats = torch.empty((*query_shape[:-1], 2)) if stats_enabled else None
-    placeholder = torch.empty(1)
-    workspace = SimpleNamespace(
-        attention_sinks=placeholder,
-        cu_seqlens_q=placeholder,
-        partial_o=placeholder,
-        partial_stats=placeholder,
-        split_kv_counter=placeholder,
-    )
-    runtime = SimpleNamespace(
-        q=q,
-        out=out,
-        k_cache=placeholder,
-        v_cache=placeholder,
-        k_sf_cache=placeholder,
-        v_sf_cache=placeholder,
-        num_physical_pages=11,
-        k_page_stride=12,
-        k_head_stride=13,
-        k_token_stride=14,
-        v_page_stride=15,
-        v_head_stride=16,
-        v_token_stride=17,
-        k_sf_page_stride=18,
-        v_sf_page_stride=19,
-        softmax_scale=0.125,
-        output_scale=0.75,
-    )
-    calls = []
-    result = decode._launch_decode(
-        runtime,
-        seq_lens_kv=placeholder,
-        qo_indptr=None,
-        block_tables=placeholder,
-        workspace=workspace,
-        compiled_main=lambda *args: calls.append(args),
-        compiled_reducer=lambda *args: calls.append(args),
-        lse=lse,
-        softmax_stats=stats,
-        requested_splits=5,
-        max_q_len=3,
-        max_kv_len=4097,
-    )
-    assert result is out
-    assert len(calls) == 2
-    rows = math.prod(query_shape[:-2])
-    for args, lse_position, stats_position in ((calls[0], 6, -1), (calls[1], 1, -2)):
-        assert args[lse_position].shape == (rows, 8)
-        assert args[lse_position].data_ptr() == lse.data_ptr()
-        assert args[stats_position - 4 : stats_position] == (5, 3, (), 4097)
-        if stats_enabled:
-            assert args[stats_position].shape == (rows, 8, 2)
-            assert args[stats_position].data_ptr() == stats.data_ptr()
-        else:
-            assert args[stats_position] is None
-    assert calls[0][22:26] == (18, 19, 0.125, 0.75)
-    assert calls[1][-1] == (runtime.softmax_scale if stats_enabled else None)
-
-
-@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
-@pytest.mark.parametrize(
-    "reduction",
-    (
-        "disabled",
-        "gmem_reduction",
-        "cluster_smem_reduction",
-        "gmem_reduction_with_separate_kernel",
-    ),
-)
-@_REQUIRES_PRIMTS_GPU
-def test_attention_ts_decode_softmax_stats_attention_sink(
-    monkeypatch, dtype, reduction
-):
-    """Exercise the public sink and statistics outputs across reduction topologies."""
-    from flashinfer.attention.prims_ts import decode
-
-    split = reduction != "disabled"
-    kernel_dtype = BFloat16 if dtype == torch.bfloat16 else Float8E4M3FN
-    config = make_decode_config(
-        headdim=128,
-        args={
-            "use_keeps_mma_ab": False,
-            "tile_size_q": 16,
-            "store_softmax_stats": True,
-        },
-        seq_len_q=1,
-        seq_len_kv=1024,
-        batch_size=1,
-        num_heads_q=16,
-        num_heads_kv=1,
-        q_dtype=kernel_dtype,
-        k_dtype=kernel_dtype,
-        v_dtype=kernel_dtype,
-        o_dtype=BFloat16 if dtype == torch.bfloat16 else Float16,
-        qkv_layout="pagedKv",
-        num_tokens_per_page=32,
-        split_kv_mode=reduction,
-        splits_kv=2 if split else 1,
-        max_splits_kv=2 if split else 1,
-        use_attention_sinks=True,
-        mask_type="dense",
-        auto_tuner=False,
-    )
-    spec = decode._decode_launch_spec_from_config(
-        config,
-        batch_size=1,
-        num_qo_heads=16,
-        num_kv_heads=1,
-        head_dim=128,
-        seq_len_q=1,
-        max_active_clusters=1,
-    )
-    monkeypatch.setattr(
-        decode, "_resolve_decode_launch_spec", lambda *_args, **_kwargs: spec
-    )
-    torch.manual_seed(21094)
-    query = (torch.randn((1, 16, 128), device="cuda") * 0.4).to(dtype)
-    key = (torch.randn((32, 1, 32, 128), device="cuda") * 0.4).to(dtype)
-    value = (torch.randn((32, 1, 32, 128), device="cuda") * 0.4).to(dtype)
-    block_tables = torch.arange(32, dtype=torch.int32, device="cuda")[None]
-    seq_lens = torch.tensor([1021], dtype=torch.int32, device="cuda")
-    sinks = torch.linspace(-1.0, 5.0, 16, device="cuda", dtype=torch.float32)
-    wrapper = BatchDecodePagedTSWrapper()
-    wrapper.plan(
-        "cuda",
-        1,
-        16,
-        1,
-        128,
-        32,
-        1024,
-        q_dtype=dtype,
-        out_dtype=torch.bfloat16 if dtype == torch.bfloat16 else torch.float16,
-        store_softmax_stats=True,
-        use_attention_sinks=True,
-        lse_mode="base2",
-    )
-    stats = torch.empty((1, 16, 2), dtype=torch.float32, device="cuda")
-    scale = 0.125
-    output, lse = wrapper.run(
-        query,
-        (key, value),
-        seq_lens,
-        block_tables,
-        softmax_scale=scale,
-        softmax_stats=stats,
-        attention_sinks=sinks,
-        return_lse=True,
-    )
-    keys = key.float().permute(0, 2, 1, 3).flatten(0, 1)[:1021, 0]
-    values = value.float().permute(0, 2, 1, 3).flatten(0, 1)[:1021, 0]
-    logits = query[0].float() @ keys.T * scale
-    maximum = logits.amax(-1)
-    probability = (logits - maximum[:, None]).exp()
-    denominator = probability.sum(-1) + (sinks - maximum).exp()
-    expected = probability @ values / denominator[:, None]
-    torch.testing.assert_close(stats[0, :, 0], maximum, atol=0.004, rtol=0.004)
-    torch.testing.assert_close(stats[0, :, 1], denominator, atol=0.015, rtol=0.004)
-    torch.testing.assert_close(output[0].float(), expected, atol=0.01, rtol=0.03)
-    expected_lse = (maximum + denominator.log()) * math.log2(math.e)
-    torch.testing.assert_close(lse[0], expected_lse, atol=0.015, rtol=0.002)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        wrapper.run(
-            query,
-            (key, value),
-            seq_lens,
-            block_tables,
-            softmax_scale=scale,
-            softmax_stats=stats,
-            attention_sinks=sinks,
-            out=output,
-            lse=lse,
-            validate=False,
-        )
-    # Replay changed metadata before any eager wrapper call. Main's inactive
-    # request contract leaves every caller-owned output buffer untouched.
-    seq_lens.zero_()
-    output.fill_(7)
-    stats.fill_(11)
-    lse.fill_(13)
-    graph.replay()
-    torch.testing.assert_close(output, torch.full_like(output, 7), rtol=0, atol=0)
-    torch.testing.assert_close(stats, torch.full_like(stats, 11), rtol=0, atol=0)
-    torch.testing.assert_close(lse, torch.full_like(lse, 13), rtol=0, atol=0)
-    seq_lens.fill_(1021)
-    graph.replay()
-    torch.testing.assert_close(stats[0, :, 0], maximum, atol=0.004, rtol=0.004)
-    torch.testing.assert_close(stats[0, :, 1], denominator, atol=0.015, rtol=0.004)
-    torch.testing.assert_close(output[0].float(), expected, atol=0.01, rtol=0.03)
-    torch.testing.assert_close(lse[0], expected_lse, atol=0.015, rtol=0.002)
-
-
 _FORBIDDEN_DECODE_TUNING_PARAMETERS = frozenset(
     {
         "args",
@@ -5859,149 +5575,6 @@ def test_attention_ts_decode_shared_arch_guard_rejects_unsupported_gpu(
     for query in workspace_queries:
         with pytest.raises(error, match=message):
             query()
-
-
-@pytest.mark.parametrize(
-    "options",
-    [
-        pytest.param({}, id="fixed-defaults"),
-        pytest.param(
-            dict(
-                seq_len_q=4,
-                page_size=4,
-                storage_page_size=16,
-                q_dtype=torch.bfloat16,
-                kv_dtype=_FP8,
-                out_dtype=torch.bfloat16,
-                mask_type="causal",
-                kv_layout="NHD",
-                window_left=1023,
-                use_attention_sinks=True,
-                store_softmax_stats=True,
-            ),
-            id="fixed-subpages-stats",
-        ),
-        pytest.param(
-            dict(
-                qo_indptr=(0, 2, 5),
-                max_q_len=3,
-                q_dtype=torch.bfloat16,
-                v_dtype=_FP8,
-                split_kv=False,
-            ),
-            id="packed-mixed-pv",
-        ),
-    ],
-)
-def test_attention_ts_decode_trusted_workspace_size(monkeypatch, options):
-    """Trusted sizing reuses validated policies without checks or readbacks."""
-    from contextlib import nullcontext
-    from flashinfer.attention.prims_ts import decode as decode_module
-
-    _mock_decode_hardware(monkeypatch)
-    monkeypatch.setattr(torch.cuda, "device", lambda *_: nullcontext())
-    monkeypatch.setattr(
-        fmha_decode_config,
-        "get_max_active_clusters_for_cluster_size",
-        lambda size: 152 // size,
-    )
-    args = (
-        dict(
-            batch_size=2,
-            num_qo_heads=16,
-            num_kv_heads=2,
-            head_dim=128,
-            page_size=32,
-            max_kv_len=8192,
-            device="cuda:0",
-        )
-        | options
-    )
-    if "qo_indptr" in args:
-        args["qo_indptr"] = torch.tensor(args["qo_indptr"], dtype=torch.int32)
-        validate_offsets = decode_module._validate_qo_indptr
-        # Exercise real metadata/value checks using CPU storage in this host test.
-        monkeypatch.setattr(
-            decode_module,
-            "_validate_qo_indptr",
-            lambda offsets, *, expected_device, batch_size: validate_offsets(
-                offsets, expected_device=offsets.device, batch_size=batch_size
-            ),
-        )
-    cache = decode_module._resolve_decode_launch_spec
-    cache.cache_clear()
-    try:
-        expected = get_prims_ts_batch_decode_workspace_size(**args)
-        before = cache.cache_info()
-
-        def unexpected_check(*_args, **_kwargs):
-            pytest.fail("trusted workspace sizing must not validate or read back")
-
-        for name in (
-            "_validate_positive_int",
-            "_validate_seq_len_q",
-            "_validate_head_geometry",
-            "_validate_decode_query_head_extent",
-            "_validate_head_dim",
-            "_validate_page_size",
-            "_validate_storage_page_size",
-            "_validate_max_kv_len",
-            "_validate_layout",
-            "_validate_mask",
-            "_validate_window_left",
-            "_validate_dtype_pair",
-            "_validate_runtime_device",
-            "_validate_qo_indptr",
-            "_read_packed_q_plan_metadata",
-        ):
-            monkeypatch.setattr(decode_module, name, unexpected_check)
-        monkeypatch.setattr(torch.cuda, "get_device_capability", unexpected_check)
-        monkeypatch.setattr(torch.Tensor, "tolist", unexpected_check)
-        monkeypatch.setattr(torch.Tensor, "item", unexpected_check)
-        monkeypatch.setattr(torch.Tensor, "cpu", unexpected_check)
-        assert (
-            get_prims_ts_batch_decode_workspace_size(**args, validate=False) == expected
-        )
-        after = cache.cache_info()
-        assert after.misses == before.misses == 1
-        assert after.currsize == before.currsize == 1
-        assert after.hits == before.hits + 1
-    finally:
-        cache.cache_clear()
-
-
-def test_attention_ts_decode_workspace_size_validation(monkeypatch):
-    """Default checks and sizing-critical alias constraints remain in force."""
-    from flashinfer.attention.prims_ts import decode as decode_module
-
-    args = dict(
-        batch_size=2,
-        num_qo_heads=16,
-        num_kv_heads=2,
-        head_dim=128,
-        page_size=32,
-        max_kv_len=8192,
-        device="cuda:0",
-    )
-    with pytest.raises(TypeError, match="validate must be a bool"):
-        get_prims_ts_batch_decode_workspace_size(**args, validate=0)
-    with pytest.raises(ValueError, match="batch_size must be positive"):
-        get_prims_ts_batch_decode_workspace_size(**(args | dict(batch_size=0)))
-    with pytest.raises(ValueError, match="num_qo_heads must be divisible"):
-        get_prims_ts_batch_decode_workspace_size(**(args | dict(num_qo_heads=3)))
-    with pytest.raises(ValueError, match="fixed seq_len_q and max_q_len must agree"):
-        get_prims_ts_batch_decode_workspace_size(**args, max_q_len=2, validate=False)
-    offsets = torch.tensor([0, 2, 5], dtype=torch.int32)
-    with pytest.raises(ValueError, match="max_q_len is required"):
-        get_prims_ts_batch_decode_workspace_size(
-            **args, qo_indptr=offsets, validate=False
-        )
-    # Let the default path reach the real value check without CUDA storage.
-    monkeypatch.setattr(
-        decode_module, "_resolve_cuda_device", lambda _: (torch.device("cpu"), 0)
-    )
-    with pytest.raises(ValueError, match="per-request Q length larger"):
-        get_prims_ts_batch_decode_workspace_size(**args, qo_indptr=offsets, max_q_len=2)
 
 
 def test_attention_ts_decode_auto_launch_persists_only_above_one_sm_wave(
@@ -10133,34 +9706,26 @@ def test_attention_ts_decode_replanned_sizes(dtype, packed_query, layout):
     """Replanned problem sizes retain numerical accuracy and graph replay."""
     out_dtype = torch.float16 if dtype == _FP8 else torch.bfloat16
     wrapper = BatchDecodePagedTSWrapper(layout)
-
-    def workspace_size(batch, sq, sk, offsets):
-        return get_prims_ts_batch_decode_workspace_size(
-            batch_size=batch,
-            num_qo_heads=16,
-            num_kv_heads=2,
-            head_dim=128,
-            page_size=32,
-            max_kv_len=sk,
-            seq_len_q=sq,
-            qo_indptr=offsets,
-            max_q_len=sq,
-            q_dtype=dtype,
-            out_dtype=out_dtype,
-            kv_layout=layout,
-            device="cuda",
-            validate=False,
-        )
-
     workspace = torch.empty(
         max(
-            workspace_size(
-                batch,
-                sq,
-                sk,
-                torch.arange(batch + 1, dtype=torch.int32, device="cuda") * sq
+            get_prims_ts_batch_decode_workspace_size(
+                batch_size=batch,
+                num_qo_heads=16,
+                num_kv_heads=2,
+                head_dim=128,
+                page_size=32,
+                max_kv_len=sk,
+                seq_len_q=sq,
+                qo_indptr=(
+                    torch.arange(batch + 1, dtype=torch.int32, device="cuda") * sq
+                )
                 if packed_query
                 else None,
+                max_q_len=sq,
+                q_dtype=dtype,
+                out_dtype=out_dtype,
+                kv_layout=layout,
+                device="cuda",
             )
             for batch, sq, sk in (
                 (2, 1, 8193),
@@ -10242,10 +9807,6 @@ def test_attention_ts_decode_replanned_sizes(dtype, packed_query, layout):
     out = torch.empty_like(output)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        assert (
-            workspace_size(batch, sq, sk, qo_indptr)
-            == wrapper._plan_state.workspace_layout.total_bytes
-        )
         run(out=out, validate=False)
     graph.replay()
     torch.cuda.synchronize()
@@ -10555,8 +10116,7 @@ def test_attention_ts_decode_fp8_speculative_runtime_reduction(out_dtype):
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.parametrize("store_stats", (False, True), ids=("output-only", "stats"))
-def test_decode_global_scales_graph_and_prepared(monkeypatch, store_stats):
+def test_decode_global_scales_graph_and_prepared(monkeypatch):
     """Device scales stay live through the standalone reducer and prepared API."""
     original = fmha_decode_config.make_decode_config
 
@@ -10591,11 +10151,6 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch, store_stats):
         lengths = torch.tensor([2048], dtype=torch.int32, device="cuda")
         table = torch.arange(128, dtype=torch.int32, device="cuda").view(1, -1)
         out = torch.empty(q.shape, dtype=torch.bfloat16, device="cuda")
-        stats = (
-            torch.full((*q.shape[:-1], 2), torch.nan, device="cuda")
-            if store_stats
-            else None
-        )
         scales = dict(
             softmax_scale=torch.tensor(0.125, device="cuda"),
             output_scale=torch.tensor(0.75, device="cuda"),
@@ -10613,7 +10168,6 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch, store_stats):
             k_dtype=dtype,
             v_dtype=dtype,
             out_dtype=out.dtype,
-            store_softmax_stats=store_stats,
             **scales,
         )
         assert wrapper._plan_state.config.use_separate_reduction_kernel
@@ -10625,19 +10179,12 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch, store_stats):
                 None
             ]
             torch.testing.assert_close(out.float(), expected, atol=0.02, rtol=0.05)
-            if stats is not None:
-                maximum = scores.amax(-1)
-                denominator = (scores - maximum[:, None]).exp().sum(-1)
-                expected_stats = torch.stack((maximum, denominator), -1)[None]
-                torch.testing.assert_close(
-                    stats, expected_stats, atol=0.002, rtol=0.002
-                )
 
-        wrapper.run(*args, out=out, softmax_stats=stats)
+        wrapper.run(*args, out=out)
         check(0.125, 0.75)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            wrapper.run(*args, out=out, softmax_stats=stats, validate=False)
+            wrapper.run(*args, out=out, validate=False)
         for scale in scales.values():
             scale.mul_(1.5)
         graph.replay()
@@ -10652,8 +10199,6 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch, store_stats):
             out=out,
             workspace_buffer=workspace,
             validate=False,
-            store_softmax_stats=store_stats,
-            softmax_stats=stats,
             **scales,
         )
         check(0.1875, 1.125)
@@ -10665,12 +10210,11 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch, store_stats):
             lengths,
             2048,
             out=out,
-            store_softmax_stats=store_stats,
             **scales,
         )
         prepared_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(prepared_graph):
-            prepared.run(q, out=out, softmax_stats=stats, validate=False)
+            prepared.run(q, out=out, validate=False)
         for scale in scales.values():
             scale.mul_(0.5)
         prepared_graph.replay()

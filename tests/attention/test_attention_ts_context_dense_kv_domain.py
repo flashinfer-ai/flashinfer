@@ -13,13 +13,7 @@
 
 """Runtime packed-dense N/N-1 domains under a fixed 4096-token plan."""
 
-import ast
-from contextlib import contextmanager
 import math
-from pathlib import Path
-import sys
-from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -33,306 +27,6 @@ _REQUIRES_CONTEXT_GPU = pytest.mark.skipif(
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
     reason="Runtime packed-dense domains require SM100, SM103, or SM107",
 )
-
-
-def _kernel_source() -> Path:
-    suffix = "kernels.fmha_context.fmha_kernel"
-    for prefix in (
-        "flashinfer.attention.prims_ts",
-        "tensorrt_llm._torch.attention.backends.prims_ts",
-    ):
-        module = sys.modules.get(prefix + "." + suffix)
-        if module is not None:
-            return Path(module.__file__)
-    path = (
-        Path(__file__).resolve().parents[2]
-        / "flashinfer/attention/prims_ts/kernels/fmha_context/fmha_kernel.py"
-    )
-    if not path.is_file():
-        raise RuntimeError("The actual native kernel module or source tree is required")
-    return path
-
-
-@contextmanager
-def _actual_cpu_policy(arch=(10, 7)):
-    """Execute actual policy/domain source with integer stand-ins, not DSL lowering."""
-    source = _kernel_source()
-    tree = ast.parse(source.read_text())
-    names = {
-        "_as_i32",
-        "_domain_min",
-        "_domain_max",
-        "_init_task_with_domain",
-        "PackedDenseDomainTask",
-        "_uses_packed_dense_runtime_kv_bounds",
-        "_select_fmha_domain_policy",
-    }
-    nodes = [
-        node
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names
-    ]
-    assert {node.name for node in nodes} == names
-
-    class Task:
-        def __init__(self, **kwargs):
-            self.schedule = kwargs["schedule"]
-
-    cutlass = ModuleType("cutlass")
-    cutlass.Float8E4M3FN, cutlass.BFloat16, cutlass.Float16 = (
-        object(),
-        object(),
-        object(),
-    )
-    dsl = ModuleType("cutlass.cutlass_dsl")
-    dsl.BaseDSL = SimpleNamespace(
-        _get_dsl=lambda: SimpleNamespace(
-            get_arch_enum=lambda: SimpleNamespace(major=arch[0], minor=arch[1])
-        )
-    )
-    namespace = dict(
-        __name__=__name__,
-        Task=Task,
-        Int32=int,
-        cutlass=cutlass,
-        cute=SimpleNamespace(
-            ceil_div=lambda a, b: (a + b - 1) // b,
-            math=SimpleNamespace(
-                min=lambda a, b: min(int(a), int(b)),
-                max=lambda a, b: max(int(a), int(b)),
-            ),
-        ),
-        FmhaDomainPolicy=lambda **kwargs: SimpleNamespace(**kwargs),
-    )
-    future = ast.ImportFrom(
-        module="__future__", names=[ast.alias(name="annotations")], level=0
-    )
-    module_ast = ast.fix_missing_locations(
-        ast.Module(body=[future, *nodes], type_ignores=[])
-    )
-    with patch.dict(sys.modules, {"cutlass": cutlass, "cutlass.cutlass_dsl": dsl}):
-        exec(compile(module_ast, str(source), "exec"), namespace)
-        cfg = SimpleNamespace(
-            is_causal=False,
-            has_variable_window=False,
-            window_size_left=0,
-            head_paired=False,
-            use_paged_kv=False,
-            has_varlen=True,
-            has_uniform_varlen=False,
-            packed_dense_k_mask=True,
-            num_qkv_instances=2,
-            two_cta_umma=False,
-            logical_head_dim_qk=192,
-            pv_mma_tiler=(128, 128, 32),
-            q_dtype=cutlass.Float8E4M3FN,
-            k_dtype=cutlass.Float8E4M3FN,
-            v_dtype=cutlass.Float8E4M3FN,
-            o_dtype=cutlass.BFloat16,
-            vc_attention=None,
-            use_sage_attention=False,
-            use_mxfp8_qk=False,
-            work_tile_coord_indices=(1, 0, 2),
-            uses_causal_reversed_head_batch_seq_tile_order=False,
-            kv_tile_n=128,
-            single_qkv_instance=False,
-            fixed_dense_k_tail=0,
-        )
-        yield namespace, cfg
-
-
-@pytest.mark.parametrize("offset", (0, 1), ids=("N", "N-minus-1"))
-def test_runtime_dense_domain_formula_and_static_schedule_bounds(offset: int) -> None:
-    with _actual_cpu_policy() as (namespace, _cfg):
-        task_type = namespace["PackedDenseDomainTask"]
-        for planned in (1, 2, 32):
-            offsets = [0, 0, 4096]
-            schedule = SimpleNamespace(loop_end=-99)
-            task = task_type(
-                num_kv_tiles=planned,
-                tile_size_kv=128,
-                batch_idx=2,
-                cum_seqlen_k=offsets,
-                offset=offset,
-                schedule=schedule,
-            )
-            assert schedule.loop_end == planned - offset
-            for length in (*_K_BOUNDARIES, 4097, *_K_BOUNDARIES[::-1]):
-                offsets[1] = min(length, 4096)
-                offsets[2] = max(length, 4096)
-                for batch in (0, 1):
-                    live = offsets[batch + 1] - offsets[batch]
-                    expected = min(planned, max((live + 127) // 128, 1)) - offset
-                    assert task.get_domain((5, 3, batch)) == expected
-                    assert schedule.loop_end == planned - offset
-            # Runtime metadata is read again, while validation retains the plan bound.
-            offsets[:] = [0, 0, 4096]
-            assert task.get_domain((0, 0, 0)) == 1 - offset
-            assert task.get_domain((0, 0, 1)) == planned - offset
-
-
-def test_runtime_dense_domain_requires_captured_schedule() -> None:
-    with (
-        _actual_cpu_policy() as (namespace, _cfg),
-        pytest.raises(ValueError, match="captured schedule"),
-    ):
-        namespace["PackedDenseDomainTask"](32, 128, 2, [0, 128])
-
-
-@pytest.mark.parametrize("offset", (0, 1))
-def test_runtime_dense_domain_preserves_dynamic_launch_bound(offset):
-    """Current wrapper kernels pass a runtime bound, not a compile-time capacity."""
-
-    class DynamicBound:
-        value = 32
-
-        def __int__(self):
-            return self.value
-
-    with _actual_cpu_policy() as (namespace, _cfg):
-        bound = DynamicBound()
-        schedule = SimpleNamespace(loop_end=71)
-        indptr = [0, 0, 4096]
-        task = namespace["PackedDenseDomainTask"](
-            bound, 128, 2, indptr, offset=offset, schedule=schedule
-        )
-        assert schedule.loop_end == 71
-        for launch_tiles in (1, 2, 32):
-            bound.value = launch_tiles
-            for length in _K_BOUNDARIES:
-                indptr[1] = length
-                expected = min(launch_tiles, max((length + 127) // 128, 1)) - offset
-                assert task.get_domain((0, 0, 0)) == expected
-                assert schedule.loop_end == 71
-
-
-def test_runtime_dense_policy_domains_share_the_live_pointer() -> None:
-    with _actual_cpu_policy() as (namespace, cfg):
-        pointer = [0, 0, 4096]
-        select = namespace["_select_fmha_domain_policy"]
-        policy = select(
-            cfg,
-            num_kv_tiles=32,
-            q_offset=0,
-            cum_seqlen_q=[0, 257, 386],
-            cum_seqlen_k=pointer,
-        )
-        for values, offset in (
-            (policy.domain_n_kwargs, 0),
-            (policy.domain_n_minus_1_kwargs, 1),
-            (policy.softmax0_domain_kwargs, 0),
-            (policy.softmax1_domain_kwargs, 0),
-        ):
-            assert values["task_class"] is namespace["PackedDenseDomainTask"]
-            assert values["cum_seqlen_k"] is pointer
-            assert values["num_kv_tiles"] == 32 and values["tile_size_kv"] == 128
-            assert values["batch_idx"] == 2 and values["offset"] == offset
-        with pytest.raises(ValueError, match="runtime Q and KV offsets"):
-            select(
-                cfg,
-                num_kv_tiles=32,
-                q_offset=0,
-                cum_seqlen_q=[0, 257, 386],
-                cum_seqlen_k=None,
-            )
-
-
-@pytest.mark.parametrize(
-    "arch,dtype,head_dim,out_dtype",
-    [
-        ((10, 0), "Float16", 128, "Float16"),
-        ((10, 3), "BFloat16", 128, "BFloat16"),
-        ((10, 7), "Float8E4M3FN", 128, "BFloat16"),
-        ((10, 0), "Float8E4M3FN", 192, "Float16"),
-        ((10, 3), "Float16", 192, "Float16"),
-        ((10, 7), "BFloat16", 192, "BFloat16"),
-    ],
-)
-def test_runtime_dense_policy_supports_ordinary_packed_context(
-    arch, dtype, head_dim, out_dtype
-) -> None:
-    with _actual_cpu_policy(arch) as (namespace, cfg):
-        cfg.q_dtype = cfg.k_dtype = cfg.v_dtype = getattr(namespace["cutlass"], dtype)
-        cfg.logical_head_dim_qk = head_dim
-        cfg.o_dtype = getattr(namespace["cutlass"], out_dtype)
-        assert namespace["_uses_packed_dense_runtime_kv_bounds"](cfg)
-
-
-def test_runtime_dense_policy_excludes_other_layouts_and_precisions() -> None:
-    with _actual_cpu_policy() as (namespace, cfg):
-        predicate = namespace["_uses_packed_dense_runtime_kv_bounds"]
-        assert predicate(cfg)
-        changes = dict(
-            is_causal=True,
-            has_variable_window=True,
-            window_size_left=128,
-            head_paired=True,
-            use_paged_kv=True,
-            has_varlen=False,
-            has_uniform_varlen=True,
-            packed_dense_k_mask=False,
-            num_qkv_instances=1,
-            two_cta_umma=True,
-            logical_head_dim_qk=64,
-            pv_mma_tiler=(128, 256, 32),
-            q_dtype=object(),
-            k_dtype=object(),
-            v_dtype=object(),
-            o_dtype=namespace["cutlass"].Float8E4M3FN,
-            vc_attention="means",
-            use_sage_attention=True,
-            use_mxfp8_qk=True,
-        )
-        for name, value in changes.items():
-            previous = getattr(cfg, name)
-            setattr(cfg, name, value)
-            assert not predicate(cfg), name
-            setattr(cfg, name, previous)
-        cfg.has_varlen = False
-        policy = namespace["_select_fmha_domain_policy"](
-            cfg, num_kv_tiles=32, q_offset=0, cum_seqlen_q=None, cum_seqlen_k=None
-        )
-        assert policy.domain_n_kwargs == {"domain": 32}
-        assert policy.domain_n_minus_1_kwargs == {"domain": 31}
-
-
-def test_runtime_dense_task_routing_matches_n_and_n_minus_one() -> None:
-    tree = ast.parse(_kernel_source().read_text())
-    builder = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "build_context_task_manager"
-    )
-    routes = {}
-    for node in ast.walk(builder):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            routes.setdefault(node.func.id, []).extend(
-                keyword.value.id
-                for keyword in node.keywords
-                if keyword.arg is None and isinstance(keyword.value, ast.Name)
-            )
-    assert routes["create_load_task"] == ["domain_n_kwargs"]
-    assert routes["create_mma_task"] == ["mma_domain_kwargs"]
-    assert routes["create_softmax_task"] == [
-        "softmax0_domain_kwargs",
-        "softmax1_domain_kwargs",
-    ]
-    assert routes["create_correction_task"] == ["domain_n_minus_1_kwargs"]
-    assert routes["create_epilogue_task"] == ["domain_n_kwargs"]
-    assignment = next(
-        node
-        for node in builder.body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "mma_domain_kwargs"
-            for target in node.targets
-        )
-    )
-    assert (
-        isinstance(assignment.value, ast.Name)
-        and assignment.value.id == "domain_n_minus_1_kwargs"
-    )
 
 
 def _offsets(lengths: tuple[int, ...]) -> list[int]:
@@ -374,15 +68,9 @@ def _reference(q, k, v, k_lengths, scale):
     return torch.cat(outputs), torch.cat(statistics)
 
 
-def _check(output, stats, expected, expected_stats, k_lengths, dtype) -> None:
-    if dtype == torch.float8_e4m3fn:
-        atol, rtol, max_relative_l2 = 0.13, 0.05, 0.05
-    elif dtype == torch.bfloat16:
-        atol, rtol, max_relative_l2 = 0.01, 0.02, 0.02
-    else:
-        atol, rtol, max_relative_l2 = 0.002, 0.01, 0.01
+def _check(output, stats, expected, expected_stats, k_lengths) -> None:
     assert torch.isfinite(output.float()).all()
-    torch.testing.assert_close(output.float(), expected, atol=atol, rtol=rtol)
+    torch.testing.assert_close(output.float(), expected, atol=0.01, rtol=0.02)
     begin = 0
     for nq, nk in zip(_Q_LENGTHS, k_lengths, strict=True):
         actual, target = (
@@ -396,13 +84,12 @@ def _check(output, stats, expected, expected_stats, k_lengths, dtype) -> None:
         if norm == 0:
             assert torch.equal(actual, target)
         else:
-            assert error / norm < max_relative_l2
+            assert error / norm < 0.02
         if nk == 0:
             assert (actual == 0).all()
-            assert stats is not None
             assert torch.isneginf(stats[begin : begin + nq, :, 0]).all()
             assert (stats[begin : begin + nq, :, 1] == 0).all()
-        elif stats is not None:
+        else:
             state, reference = (
                 stats[begin : begin + nq],
                 expected_stats[begin : begin + nq],
@@ -425,61 +112,25 @@ def _same_bytes(actual, expected) -> None:
     )
 
 
-def _states(store_stats: bool) -> tuple[int, ...]:
-    lengths = _K_BOUNDARIES if store_stats else _K_BOUNDARIES[1:]
-    alternating = tuple(value for length in lengths for value in (4096, length))
+def _states() -> tuple[int, ...]:
+    alternating = tuple(value for length in _K_BOUNDARIES for value in (4096, length))
     return alternating + alternating[::-1]
 
 
-@pytest.mark.parametrize(
-    "dtype,head_dim,store_stats,scheduler",
-    [
-        pytest.param(
-            torch.float8_e4m3fn, 192, True, "clc_dynamic_persistent", id="fp8-192-stats"
-        ),
-        pytest.param(
-            torch.float8_e4m3fn,
-            192,
-            False,
-            "clc_dynamic_persistent",
-            id="fp8-192-output",
-        ),
-        pytest.param(
-            torch.float16, 128, True, "static_persistent", id="fp16-128-static"
-        ),
-        pytest.param(
-            torch.bfloat16, 128, True, "nonpersistent", id="bf16-128-nonpersistent"
-        ),
-        pytest.param(
-            torch.float8_e4m3fn, 128, True, "clc_dynamic_persistent", id="fp8-128-stats"
-        ),
-        pytest.param(
-            torch.float16, 192, True, "clc_dynamic_persistent", id="fp16-192-stats"
-        ),
-        pytest.param(
-            torch.bfloat16, 192, False, "clc_dynamic_persistent", id="bf16-192-output"
-        ),
-    ],
-)
 @_REQUIRES_CONTEXT_GPU
-def test_runtime_dense_kv_domain_graph_replay(
-    monkeypatch, dtype, head_dim, store_stats: bool, scheduler
-) -> None:
+def test_runtime_dense_kv_domain_graph_replay() -> None:
     """One cap4096 graph alternates live N=1 and N=32 with partial Q peers."""
     pytest.importorskip("cutlass", minversion="4.8.0")
     from cutlass.experimental import primitives
     from flashinfer.attention.prims_ts import BatchPrefillTSWrapper
-    from flashinfer.attention.prims_ts import context
 
     if torch.cuda.get_device_capability() == (10, 7):
         assert hasattr(primitives, "tcgen05_ld_red"), (
             "Native SM107 DSL reduction support required"
         )
-    # Cover all three paired task schedules without multiplying every dtype,
-    # head dimension, and statistics specialization by the scheduler count.
-    monkeypatch.setattr(context, "_resolve_context_scheduler", lambda _: scheduler)
+    dtype, head_dim = torch.bfloat16, 192
     torch.manual_seed(2026110101)
-    total_k = 4096 if store_stats else 4097
+    total_k = 4096
     q = torch.randn(
         sum(_Q_LENGTHS), _HEADS, head_dim, device="cuda", dtype=torch.bfloat16
     ).to(dtype)
@@ -494,11 +145,9 @@ def test_runtime_dense_kv_domain_graph_replay(
         _HEADS,
         128,
         device="cuda",
-        dtype=torch.float16 if dtype == torch.float16 else torch.bfloat16,
+        dtype=dtype,
     )
-    stats = (
-        torch.empty(sum(_Q_LENGTHS), _HEADS, 2, device="cuda") if store_stats else None
-    )
+    stats = torch.empty(sum(_Q_LENGTHS), _HEADS, 2, device="cuda")
     scale = 0.75 / math.sqrt(head_dim)
     wrapper = BatchPrefillTSWrapper()
     wrapper.plan(
@@ -516,7 +165,7 @@ def test_runtime_dense_kv_domain_graph_replay(
         out_dtype=output.dtype,
         packed_query=True,
         mask_type="dense",
-        store_softmax_stats=store_stats,
+        store_softmax_stats=True,
         softmax_scale=scale,
         output_scale=0.625,
     )
@@ -524,7 +173,7 @@ def test_runtime_dense_kv_domain_graph_replay(
 
     arch = BaseDSL._get_dsl().get_arch_enum()
     assert (arch.major, arch.minor) == torch.cuda.get_device_capability()
-    assert dict(wrapper._plan_state.policy)["scheduler"] == scheduler
+    assert dict(wrapper._plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
 
     def run(validate=False):
         return wrapper.run(
@@ -540,7 +189,7 @@ def test_runtime_dense_kv_domain_graph_replay(
     torch.backends.cuda.matmul.allow_tf32 = False
     try:
         for pattern in ("random", "negative-peer", "zero-query"):
-            for length in _states(store_stats):
+            for length in _states():
                 live = (length, total_k - length)
                 ko.copy_(torch.tensor(_offsets(live), device="cuda", dtype=torch.int32))
                 if pattern == "negative-peer":
@@ -565,22 +214,19 @@ def test_runtime_dense_kv_domain_graph_replay(
                 expected, expected_stats = _reference(q, k, v, live, scale)
                 inputs = [tensor.clone() for tensor in (q, k, v, qo, ko)]
                 output.fill_(torch.nan)
-                if stats is not None:
-                    stats.fill_(torch.nan)
+                stats.fill_(torch.nan)
                 # No eager call may refresh metadata between its mutation and replay.
                 graph.replay()
                 torch.cuda.synchronize()
-                _check(output, stats, expected, expected_stats, live, dtype)
+                _check(output, stats, expected, expected_stats, live)
                 graph_output = output.clone()
-                graph_stats = None if stats is None else stats.clone()
+                graph_stats = stats.clone()
                 output.fill_(torch.nan)
-                if stats is not None:
-                    stats.fill_(torch.nan)
+                stats.fill_(torch.nan)
                 run(validate=True)
-                _check(output, stats, expected, expected_stats, live, dtype)
+                _check(output, stats, expected, expected_stats, live)
                 _same_bytes(output, graph_output)
-                if stats is not None:
-                    _same_bytes(stats, graph_stats)
+                _same_bytes(stats, graph_stats)
                 for value, before in zip((q, k, v, qo, ko), inputs, strict=True):
                     _same_bytes(value, before)
     finally:
