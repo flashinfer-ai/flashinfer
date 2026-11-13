@@ -56,6 +56,7 @@ from cutlass.pipeline import (
 from flashinfer.gemm.kernels.cute_dsl.low_latency_blockscaled_gemm import (
     LowLatencyBlockscaledGemmKernel as _Base,
     WorkTileInfo,
+    _tcgen05_fence,
 )
 
 
@@ -878,6 +879,13 @@ class RoutedBlockscaledGemm(_Base):
             tcgen05.commit(mma_epilog_full_bar, None, self.cta_group)
 
         # Release the tensor memory allocation
+        # The release arrival must land in phase 1. Made while phase 0 is still
+        # open (an epilogue or SFB warp has not arrived yet), it counts toward
+        # phase 0 and the parity-1 wait passes before their tcgen05.ld.
+        cute.arch.mbarrier_wait(tmem_alloc_result_bar, 0)
         cute.arch.mbarrier_arrive(tmem_alloc_result_bar)
         cute.arch.mbarrier_wait(tmem_alloc_result_bar, 1)
+        # tcgen05.fence::after_thread_sync orders the dealloc after the
+        # epilogue's and SFB warps' tcgen05 work handed off by the wait
+        _tcgen05_fence(before=False)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols)
