@@ -298,3 +298,67 @@ group_union_masks_trace = TraceTemplate(
     },
     description="Each token group's union of keys as cache slots, and each token's bitmask over it.",
 )
+gather_nvfp4_kv_cache_trace = TraceTemplate(
+    op_type="sdsa_gather_nvfp4_kv_cache",
+    axes={
+        "pages": Var(description="KV cache pages."),
+        "rows": Var(description="Query rows, each with K and V slot lists."),
+        "output_tokens": Var(description="Gathered tokens: rows * top_k."),
+        "heads": Const(value=1, description="KV heads; the cache is MQA."),
+        "one": Const(value=1, description="Unit axis of the attention workspace."),
+        "page_size": Const(abbrev="ps", description="Tokens per page."),
+        "packed_dim": Const(abbrev="pd", description="Packed NVFP4 bytes per token."),
+        "scale_dim": Const(abbrev="sd", description="E4M3 scales per token."),
+        "content_dim": Const(abbrev="cd", description="FP8 K then V values per token."),
+        "top_k": Const(abbrev="k", description="Selected tokens per row."),
+        "sides": Const(value=2, description="K and V."),
+    },
+    inputs={
+        "k": Tensor(
+            ["pages", "heads", "page_size", "packed_dim"],
+            param="paged_kv_cache",
+            tuple_idx=0,
+        ),
+        "v": Tensor(
+            ["pages", "heads", "page_size", "packed_dim"],
+            param="paged_kv_cache",
+            tuple_idx=1,
+        ),
+        "k_sf": Tensor(
+            ["pages", "heads", "page_size", "scale_dim"],
+            param="kv_cache_sf",
+            tuple_idx=0,
+        ),
+        "v_sf": Tensor(
+            ["pages", "heads", "page_size", "scale_dim"],
+            param="kv_cache_sf",
+            tuple_idx=1,
+        ),
+        "slots": Tensor(["rows", "sides", "top_k"]),
+        "seq_lens": Tensor(["rows"]),
+        "out": Tensor(["output_tokens", "one", "one", "content_dim"]),
+        "block_tables": Tensor(["rows", "sides", "top_k"]),
+        "v_sf_swizzled": Scalar(
+            "bool",
+            optional=True,
+            description="V scales use the four-token swizzle (default) rather than a linear layout.",
+        ),
+    },
+    outputs={
+        "out": Tensor(
+            ["output_tokens", "one", "one", "content_dim"],
+            param="out",
+            dtype_from="out",
+        ),
+        "block_tables": Tensor(
+            ["rows", "sides", "top_k"], param="block_tables", dtype="int32"
+        ),
+    },
+    constraints=[
+        "output_tokens == rows * top_k",
+        "content_dim == packed_dim * 4",
+        "scale_dim * 8 == packed_dim",
+    ],
+    description="Selected HND NVFP4 MQA tokens converted to normalized FP8 K/V and local sparse indices.",
+    tags=["arch:sm100", "arch:sm103"],
+)

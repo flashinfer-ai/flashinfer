@@ -435,3 +435,27 @@ and every replay.
     The replay uses new keys.
 - `tests/trace/test_trtllm_batch_decode_reference_correctness.py` compares the
   token-sparse trace reference with the kernel, for two shapes.
+
+### Packed NVFP4 storage with FP8 attention
+
+The token-sparse kernels can consume FP8 K/V converted from selected NVFP4
+tokens. `gather_nvfp4_kv_cache` takes HND MQA pages and physical token slots.
+Packed K/V data and FP8 block scales are separate tensor views. K scales are
+linear. V scales use the TRT-LLM four-token HND swizzle by default, as in caches
+written for trtllm-gen attention; `v_sf_swizzled=False` reads linear V scales,
+as written by `nvfp4_quantize_append_paged_kv_cache`. The helper writes
+contiguous FP8 `[rows * top_k, 1, 1, 2 * head_dim]` workspace and local K/V
+index lists. Entries outside each row's valid prefix produce zeros. A negative
+slot inside the prefix also produces a zero token, which attention still
+weights, so producers place selected tokens first and bound them with the
+lengths. Callers bound workspace by processing query rows in chunks; the
+persistent cache stays packed.
+
+NVFP4's normalized range reaches `6 * 448`. Conversion divides decoded values
+by six before rounding to E4M3. The rounding is lossy: E2M1-by-E4M3 products can
+need more mantissa bits than E4M3 has, and small scales can become subnormal or
+zero. Restore that factor with
+`bmm1_scale = softmax_scale * q_scale * (6 * k_scale)` and
+`bmm2_scale = 6 * v_scale` when the probability scale is one. Query scaling is
+independent: a caller can use `q_scale = k_scale`. Global calibration scales
+remain outside the gather operation.

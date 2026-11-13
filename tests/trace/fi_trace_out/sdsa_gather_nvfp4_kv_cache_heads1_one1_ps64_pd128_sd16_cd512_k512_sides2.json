@@ -1,0 +1,166 @@
+{
+  "name": "sdsa_gather_nvfp4_kv_cache_heads1_one1_ps64_pd128_sd16_cd512_k512_sides2",
+  "description": "Selected HND NVFP4 MQA tokens converted to normalized FP8 K/V and local sparse indices.",
+  "op_type": "sdsa_gather_nvfp4_kv_cache",
+  "tags": [
+    "fi_api:flashinfer.sdsa.token_sparse.gather_nvfp4_kv_cache",
+    "arch:sm100",
+    "arch:sm103"
+  ],
+  "axes": {
+    "pages": {
+      "type": "var",
+      "description": "KV cache pages."
+    },
+    "rows": {
+      "type": "var",
+      "description": "Query rows, each with K and V slot lists."
+    },
+    "output_tokens": {
+      "type": "var",
+      "description": "Gathered tokens: rows * top_k."
+    },
+    "heads": {
+      "type": "const",
+      "value": 1,
+      "description": "KV heads; the cache is MQA."
+    },
+    "one": {
+      "type": "const",
+      "value": 1,
+      "description": "Unit axis of the attention workspace."
+    },
+    "page_size": {
+      "type": "const",
+      "value": 64,
+      "description": "Tokens per page."
+    },
+    "packed_dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Packed NVFP4 bytes per token."
+    },
+    "scale_dim": {
+      "type": "const",
+      "value": 16,
+      "description": "E4M3 scales per token."
+    },
+    "content_dim": {
+      "type": "const",
+      "value": 512,
+      "description": "FP8 K then V values per token."
+    },
+    "top_k": {
+      "type": "const",
+      "value": 512,
+      "description": "Selected tokens per row."
+    },
+    "sides": {
+      "type": "const",
+      "value": 2,
+      "description": "K and V."
+    }
+  },
+  "constraints": [
+    "output_tokens == rows * top_k",
+    "content_dim == packed_dim * 4",
+    "scale_dim * 8 == packed_dim"
+  ],
+  "inputs": {
+    "k": {
+      "shape": [
+        "pages",
+        "heads",
+        "page_size",
+        "packed_dim"
+      ],
+      "dtype": "uint8"
+    },
+    "v": {
+      "shape": [
+        "pages",
+        "heads",
+        "page_size",
+        "packed_dim"
+      ],
+      "dtype": "uint8"
+    },
+    "k_sf": {
+      "shape": [
+        "pages",
+        "heads",
+        "page_size",
+        "scale_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "v_sf": {
+      "shape": [
+        "pages",
+        "heads",
+        "page_size",
+        "scale_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "slots": {
+      "shape": [
+        "rows",
+        "sides",
+        "top_k"
+      ],
+      "dtype": "int32"
+    },
+    "seq_lens": {
+      "shape": [
+        "rows"
+      ],
+      "dtype": "int32"
+    },
+    "out": {
+      "shape": [
+        "output_tokens",
+        "one",
+        "one",
+        "content_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "block_tables": {
+      "shape": [
+        "rows",
+        "sides",
+        "top_k"
+      ],
+      "dtype": "int32"
+    },
+    "v_sf_swizzled": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true,
+      "description": "V scales use the four-token swizzle (default) rather than a linear layout."
+    }
+  },
+  "outputs": {
+    "out": {
+      "shape": [
+        "output_tokens",
+        "one",
+        "one",
+        "content_dim"
+      ],
+      "dtype": "float8_e4m3fn",
+      "param": "out"
+    },
+    "block_tables": {
+      "shape": [
+        "rows",
+        "sides",
+        "top_k"
+      ],
+      "dtype": "int32",
+      "param": "block_tables"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

@@ -66,6 +66,7 @@ gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
 sdsa_gather_key_sample_page_size64_dim128.json
 sdsa_group_union_masks_top_k2048.json
+sdsa_gather_nvfp4_kv_cache_heads1_one1_ps64_pd128_sd16_cd512_k512_sides2.json
 recurrent_kda_q8_v16_d128.json
 packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
@@ -3850,4 +3851,20 @@ top_k_from_candidates.fi_trace(
     candidates=torch.empty(256, 4096, 2, dtype=torch.int32),
     ranges=torch.empty(2, 256, dtype=torch.int32),
     top_keys=torch.empty(256, 2048, dtype=torch.int32),
+)
+# Selected NVFP4 KV conversion for token-sparse FP8 attention.
+from flashinfer.sdsa.token_sparse import gather_nvfp4_kv_cache
+
+gather_nvfp4_kv_cache.fi_trace(
+    save_dir=SAVE_DIR,
+    paged_kv_cache=tuple(
+        torch.empty(4, 1, 64, 128, dtype=torch.uint8) for _ in range(2)
+    ),
+    kv_cache_sf=tuple(
+        torch.empty(4, 1, 64, 16, dtype=torch.float8_e4m3fn) for _ in range(2)
+    ),
+    slots=torch.empty(2, 2, 512, dtype=torch.int32),
+    seq_lens=torch.empty(2, dtype=torch.int32),
+    out=torch.empty(1024, 1, 1, 512, dtype=torch.float8_e4m3fn),
+    block_tables=torch.empty(2, 2, 512, dtype=torch.int32),
 )
