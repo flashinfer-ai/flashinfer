@@ -323,6 +323,32 @@ def _megamoe_mxfp4_fingerprint(
     )
 
 
+def _megamoe_mxfp8_fingerprint(
+    hidden,
+    intermediate,
+    top_k,
+    num_experts,
+    quant_kind="mxfp8_e4m3",
+    implementation="standard",
+    apply_routing_weights_before_fc2=True,
+    gate_up_clamp=None,
+    arch=None,
+):
+    from ..moe_ep.batch_invariant.mxfp8_spec import spec_fingerprint
+
+    return spec_fingerprint(
+        hidden,
+        intermediate,
+        top_k,
+        num_experts,
+        arch=_mx_family(arch, "megamoe_mxfp8"),
+        quant_kind=quant_kind,
+        implementation=implementation,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        gate_up_clamp=gate_up_clamp,
+    )
+
+
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
     # the unified MoE layer with `BatchInvariantBf16Config`: the routing method and the activation (gated SwiGLU / ungated
@@ -358,6 +384,18 @@ CLASSES: Dict[str, ClassInfo] = {
         "megamoe.mxfp4",
         ("hidden", "intermediate", "top_k", "num_experts"),
         _megamoe_mxfp4_fingerprint,
+        (
+            "quant_kind",
+            "implementation",
+            "apply_routing_weights_before_fc2",
+            "gate_up_clamp",
+            "arch",
+        ),
+    ),
+    "megamoe_mxfp8": ClassInfo(
+        "megamoe.mxfp8",
+        ("hidden", "intermediate", "top_k", "num_experts"),
+        _megamoe_mxfp8_fingerprint,
         (
             "quant_kind",
             "implementation",
@@ -441,6 +479,15 @@ def fingerprint(op: str, **dims) -> str:
     remain separate components. UE8M0 conversion uses RP rounding and the
     actual BF16 roundtrip; byte zero represents 2^-127. Packed/scaled operands
     are the main boundary, as for the NVFP4 class.
+
+    ``megamoe_mxfp8`` describes E4M3 or E5M2 operands with UE8M0 block32
+    scales. ``quant_kind`` selects ``mxfp8_e4m3`` or ``mxfp8_e5m2``;
+    implementation and architecture remain separate classes. Legacy supports
+    early routing weights and preserves its sigmoid-first association,
+    NaN-propagating amax and explicit normalization-by-one operations. Next
+    implementations use paired amax and the soft-mask recipe. All BI input
+    staging uses the normal-scale floor. Packed/scaled operands are the main
+    boundary; input staging is a separate component.
 
     ``mm_bf16`` takes the weight shape ``N, K``: the K steps of the fold and the chunk count (a function of the
     weight shape alone) are the specification; M, the configuration and the weight's layout do not enter it. The

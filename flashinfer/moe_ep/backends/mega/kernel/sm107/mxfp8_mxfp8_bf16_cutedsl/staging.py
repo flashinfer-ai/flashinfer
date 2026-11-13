@@ -56,8 +56,8 @@ def stage_mega_moe_inputs(
             require_batch_invariant_stage_layout,
         )
 
-        if kind not in ("mxfp4", "mxfp4_mxfp8"):
-            raise ValueError("batch_invariant MX staging requires MXFP4 weights")
+        if kind not in ("mxfp4", "mxfp4_mxfp8", "mxfp8_e4m3", "mxfp8_e5m2"):
+            raise ValueError("unsupported batch_invariant MX quantization kind")
         require_batch_invariant_stage_layout(hidden_states, topk_ids, topk_weights)
 
     fused_stage = (
@@ -118,11 +118,16 @@ def stage_mega_moe_inputs(
             != "0",
             zero_masked_scores=False,
             **({"batch_invariant": True} if batch_invariant else {}),
+            **(
+                {"batch_invariant_quant_kind": kind}
+                if batch_invariant and kind in ("mxfp8_e4m3", "mxfp8_e5m2")
+                else {}
+            ),
         )
         return num_tokens
 
     if batch_invariant:
-        raise ValueError("batch_invariant MXFP4 requires the fused staging layout")
+        raise ValueError("batch_invariant MX requires the fused staging layout")
 
     q, sf = (
         quantize_mxfp4_block32(hidden_states.to(torch.float32))

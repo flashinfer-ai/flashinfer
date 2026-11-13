@@ -34,6 +34,8 @@ from flashinfer.moe_ep.batch_invariant.mxfp4_spec import (
     half_amax as mx_half_amax,
     quantize_half_precast as mx_quantize_half_precast,
 )
+from flashinfer.moe_ep.batch_invariant.mxfp8_device import ScalarF32 as Mx8ScalarF32
+from flashinfer.moe_ep.batch_invariant.mxfp8_spec import quantize_half_precast as mx8_quantize_half_precast
 from flashinfer.moe_ep.batch_invariant.nvfp4_spec import (
     fc1_activation, fc2_output, quantize_block_precast,
 )
@@ -283,10 +285,16 @@ class QuantImpl:
                     low_amax = partner_amax[vec_block_idx]
                     high_amax = half_amax[vec_block_idx]
                 block = in_blocks[None, vec_block_idx]
-                scaled_values, scale_e8m0 = mx_quantize_half_precast(
-                    MxScalarF32, (block[0], block[1], block[2], block[3], block[4], block[5], block[6], block[7], block[8], block[9], block[10], block[11], block[12], block[13], block[14], block[15]), low_amax, high_amax,
-                    quant_kind=self.quant_kind.value,
-                )
+                if cutlass.const_expr(self.quant_kind in (QuantKind.mxfp8_e4m3, QuantKind.mxfp8_e5m2)):
+                    scaled_values, scale_e8m0 = mx8_quantize_half_precast(
+                        Mx8ScalarF32, (block[0], block[1], block[2], block[3], block[4], block[5], block[6], block[7], block[8], block[9], block[10], block[11], block[12], block[13], block[14], block[15]), low_amax, high_amax,
+                        quant_kind=self.quant_kind.value,
+                    )
+                else:
+                    scaled_values, scale_e8m0 = mx_quantize_half_precast(
+                        MxScalarF32, (block[0], block[1], block[2], block[3], block[4], block[5], block[6], block[7], block[8], block[9], block[10], block[11], block[12], block[13], block[14], block[15]), low_amax, high_amax,
+                        quant_kind=self.quant_kind.value,
+                    )
                 sf_values.append(scale_e8m0)
                 scaled = self._values_to_ssa(scaled_values, cutlass.Float32)
                 data_blocks.append(scaled.to(self.data_dtype))

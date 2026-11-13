@@ -46,6 +46,7 @@ from .tuner import (
     is_valid_bf16_mxfp8,
     is_valid_bf16_mxfp8_for_config,
     is_valid_nvfp4_for_config,
+    is_valid_mxfp8_for_config,
 )
 
 # Shared base of the sweep restriction (values that won every profile so far).
@@ -111,12 +112,24 @@ def nvfp4_candidates(
 def mxfp8_candidates(
     *,
     enable_in_kernel_fc2_reduce: bool = False,
+    batch_invariant: bool = False,
 ) -> List[Dict[str, Any]]:
     """Default MXFP8 candidate knob dicts (flag_batch x token-back x ikr).
 
     Four candidates, six with the ikr axis.  The MXFP8 kernel's tile is fixed
     at ``(256, 256)`` so there is no tile axis. ikr is not supported with reuse dispatch warps.
     """
+    if batch_invariant:
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp8_batch_invariant import (
+            mxfp8_batch_invariant_default_knobs,
+        )
+
+        base = mxfp8_batch_invariant_default_knobs("legacy")
+        return [
+            {**base, "load_balance_mode": schedule, "token_back_mode": carrier}
+            for schedule in ("static", "atomic_counter")
+            for carrier in ("epi_warps", "reuse_dispatch_warps")
+        ]
     out: List[Dict[str, Any]] = []
     for flag_batch in (4, 8):
         for token_back in ("epi_warps", "reuse_dispatch_warps"):
@@ -542,6 +555,7 @@ def autotune_mxfp8_mega_moe(
 ) -> Dict[str, Any]:
     """MXFP8 twin of :func:`autotune_nvfp4_mega_moe` (COLLECTIVE)."""
     from .mxfp8 import mxfp8_mega_moe
+    from .comm import resolve_gate_up_clamp
 
     def launch() -> None:
         # sync=True: the tune loop times launches with perf_counter, so the
@@ -557,10 +571,21 @@ def autotune_mxfp8_mega_moe(
             sync=True,
         )
 
-    cfg = symm_buffer._frontend.config
+    frontend = symm_buffer._frontend
+    clamp = resolve_gate_up_clamp(
+        gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
+    )
+    if clamp is not None:
+        frontend.set_gate_up_clamp(clamp)
+    cfg = frontend.config
     if candidates is None:
         candidates = mxfp8_candidates(
             enable_in_kernel_fc2_reduce=cfg.enable_in_kernel_fc2_reduce,
+            batch_invariant=getattr(cfg, "batch_invariant", False),
+        )
+    if getattr(cfg, "batch_invariant", False):
+        candidates = _session_candidates(
+            candidates, cfg, is_valid_mxfp8_for_config, what="MXFP8 MegaMoE"
         )
 
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
@@ -575,6 +600,8 @@ def autotune_mxfp8_mega_moe(
             record_knobs(
                 winner,
                 dtype=cfg.kind,
+                # Preserve the ordinary cache's historical key convention.
+                apply_routing_weights_before_fc2=getattr(cfg, "batch_invariant", False),
                 world_size=cfg.world_size,
                 hidden=cfg.hidden,
                 intermediate=cfg.intermediate,
@@ -584,6 +611,9 @@ def autotune_mxfp8_mega_moe(
                 live_tokens=live_tokens,
                 p50_us=p50_s * 1e6,
                 source="autotune",
+                batch_invariant=getattr(cfg, "batch_invariant", False),
+                gate_up_clamp=cfg.gate_up_clamp,
+                input_norm_const=getattr(cfg, "input_norm_const", 1.0),
             )
 
     return autotune_knobs(

@@ -28,6 +28,9 @@ lean_exe nvfp4megamoeconformance where
 lean_exe mxfp4megamoeconformance where
   root := `MXFP4MegaMoEMain
 
+lean_exe mxfp8megamoeconformance where
+  root := `MXFP8MegaMoEMain
+
 lean_exe axioms where
   root := `Axioms
   supportInterpreter := true

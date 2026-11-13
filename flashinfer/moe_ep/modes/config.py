@@ -82,6 +82,41 @@ def _batch_invariant_numerical_contract(config: MegaConfig | SplitConfig):
     from ..backends.mega.kernel.sm107.mxfp8_mxfp4_bf16_cutedsl.config import (
         Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
+    from ..backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl.config import (
+        Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+
+    mx8_types = (
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+        Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    if isinstance(kernel, mx8_types) and kernel.kind in ("mxfp8_e4m3", "mxfp8_e5m2"):
+        from ..backends.mega.kernel.sm100.common.mxfp8_batch_invariant import (
+            MXFP8_BATCH_INVARIANT_VERSION,
+            mxfp8_batch_invariant_implementation,
+            validate_mxfp8_batch_invariant,
+        )
+
+        if type(kernel) not in mx8_types:
+            raise ValueError("Unsupported batch-invariant MXFP8 configuration subclass")
+        arch = "sm_107" if type(kernel) is mx8_types[1] else "sm_100"
+        validate_mxfp8_batch_invariant(kernel, arch=arch)
+        clamp = (
+            kernel.gate_up_clamp
+            if kernel.gate_up_clamp is not None
+            else kernel.activation_clamp
+        )
+        return dict(
+            family=f"{arch}_{kernel.kind}_cutedsl_{mxfp8_batch_invariant_implementation(kernel)}",
+            version=MXFP8_BATCH_INVARIANT_VERSION,
+            intermediate=kernel.intermediate_size,
+            top_k=kernel.top_k,
+            activation="swiglu",
+            gate_up_clamp_bits=None if clamp is None else f32_bits(abs(clamp)),
+            scalar_presence=(False, False, False),
+            quantize_input=config.quantize_input,
+            apply_routing_weights_before_fc2=kernel.apply_routing_weights_before_fc2,
+        )
 
     mx_types = (
         Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,

@@ -30,6 +30,18 @@ replace its own device snapshot.
 
 ## Pending local diffs vs upstream
 
+- **MXFP8 batch-invariant arithmetic:** the MXFP8 frontend binds a fixed
+  M256/N256/K128 paired-CTA geometry and native K32 MMA fold, with routing
+  weights applied before FC2. `src/moe_mxfp8_glu/kernel_mxfp8_glu_fc12.py`
+  passes the opt-in arithmetic flag to `epilogue_mxfp8.py`, which interprets
+  the separate legacy MXFP8 activation and block32 UE8M0 requantization
+  chains, including explicit scale conversion and the existing packed
+  E4M3/E5M2 data conversion. Its FC2 BF16 conversion and launcher use the
+  pinned ordered masked top-k fold shared with NVFP4. The legacy multiplication
+  association and quantizer remain distinct from the next-generation providers.
+  Ordinary execution and the inherited BF16 epilogue retain their old branches.
+  Reapply these necessary local changes until upstream absorbs them.
+
 - **NVFP4 batch-invariant arithmetic:** the NVFP4 frontend binds a fixed
   M256/N128/K256 paired-CTA geometry, K64 MMA fold and full-N descriptor.
   `src/moe_nvfp4_swapab/kernel_fc12.py` omits dynamic short-N input shifts

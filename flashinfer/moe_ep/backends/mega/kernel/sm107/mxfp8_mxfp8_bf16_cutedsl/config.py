@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional, Tuple
 
 from flashinfer.moe_ep._compat import deprecated_aliases
@@ -24,6 +24,7 @@ class Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     top_k: int
     kernel_name: str = "sm107_mxfp8_mxfp8_bf16_cutedsl"
     kind: Sm107Mxfp8Kind = "mxfp8_e4m3"
+    batch_invariant: bool = field(default=False, kw_only=True)
     gate_up_clamp: Optional[float] = None
     activation_clamp: Optional[float] = None  # deprecated alias of gate_up_clamp
     fast_math: bool = True  # accepted for mega API parity; no kernel toggle
@@ -56,3 +57,13 @@ class Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     kernel_variant: Literal["inference", "genphase", "auto"] = "inference"
     # Quantizes the FC2 return payload; the operator still returns BF16.
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
+
+    def __post_init__(self):
+        from ...sm100.common.mxfp8_batch_invariant import validate_mxfp8_batch_invariant
+
+        if (
+            self.batch_invariant
+            and self.kernel_name != "sm107_mxfp8_mxfp8_bf16_cutedsl"
+        ):
+            raise ValueError("batch_invariant requires the SM107 MXFP8 backend")
+        validate_mxfp8_batch_invariant(self, arch="sm_107")

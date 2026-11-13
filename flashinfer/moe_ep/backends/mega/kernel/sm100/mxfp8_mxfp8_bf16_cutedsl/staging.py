@@ -40,7 +40,7 @@ def require_batch_invariant_stage_layout(hidden_states, topk_ids, topk_weights):
         or topk_weights.dtype not in (torch.float16, torch.bfloat16, torch.float32)
     ):
         raise ValueError(
-            "batch_invariant MXFP4 staging requires aligned contiguous CUDA BF16 "
+            "batch_invariant MX staging requires aligned contiguous CUDA BF16 "
             "activations, aligned contiguous routes, hidden divisible by 128 "
             "and top_k <= 32"
         )
@@ -90,8 +90,8 @@ def stage_mega_moe_inputs(
 
     mixed = kind == "mxfp4_mxfp8"
     if batch_invariant:
-        if not mixed:
-            raise ValueError("batch_invariant MX staging requires MXFP4 weights")
+        if kind not in ("mxfp4_mxfp8", "mxfp8_e4m3", "mxfp8_e5m2"):
+            raise ValueError("unsupported batch_invariant MX quantization kind")
         require_batch_invariant_stage_layout(hidden_states, topk_ids, topk_weights)
     mixed_layout_supported = not mixed or (
         hidden_states.is_cuda
@@ -109,7 +109,7 @@ def stage_mega_moe_inputs(
         and mixed_layout_supported
         and fused_quant_stage_supported(hidden_states, quant_type="mxfp8")
     ):
-        if mixed:
+        if mixed or batch_invariant:
             # Another staging path may have used this pooled workspace.
             note_staged_tokens(topk_idx_out, x_fp8.shape[0])
         fused_quant_stage(
@@ -121,13 +121,18 @@ def stage_mega_moe_inputs(
             topk_idx_out,
             topk_weights_out,
             quant_type="mxfp8_e4m3" if mixed else kind,
-            mxfp8_normal_scales=mixed,
+            mxfp8_normal_scales=mixed or batch_invariant,
             **({"batch_invariant": True} if batch_invariant else {}),
+            **(
+                {"batch_invariant_quant_kind": kind}
+                if batch_invariant and not mixed
+                else {}
+            ),
         )
         return
 
     if batch_invariant:
-        raise ValueError("batch_invariant MXFP4 requires the fused staging layout")
+        raise ValueError("batch_invariant MX requires the fused staging layout")
 
     data_dtype = _mxfp8_data_dtype(kind)
     activation_fp32 = hidden_states.to(torch.float32)

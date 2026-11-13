@@ -67,8 +67,14 @@ def _batch_invariant_version(
 ) -> Optional[int]:
     if not batch_invariant:
         return None
+    if dtype in ("mxfp8_e4m3", "mxfp8_e5m2"):
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp8_batch_invariant import (
+            MXFP8_BATCH_INVARIANT_VERSION,
+        )
+
+        return MXFP8_BATCH_INVARIANT_VERSION if version is None else version
     if dtype not in ("bf16", "nvfp4"):
-        raise ValueError("batch_invariant knob-cache entries require BF16 or NVFP4.")
+        raise ValueError("unsupported batch_invariant knob-cache dtype")
     if dtype == "nvfp4":
         from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
             NVFP4_BATCH_INVARIANT_VERSION,
@@ -98,6 +104,27 @@ def _arithmetic_fingerprint(
 ) -> Optional[str]:
     if not batch_invariant:
         return None
+    if dtype in ("mxfp8_e4m3", "mxfp8_e5m2"):
+        from flashinfer.moe_ep.batch_invariant.mxfp8_spec import (
+            spec_fingerprint as mxfp8_spec_fingerprint,
+        )
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_arch,
+        )
+
+        if isinstance(input_norm_const, bool) or input_norm_const != 1.0:
+            raise ValueError("batch_invariant MXFP8 requires input_norm_const=1.0")
+        return mxfp8_spec_fingerprint(
+            hidden=hidden,
+            intermediate=intermediate,
+            top_k=topk,
+            num_experts=num_experts,
+            arch=nvfp4_batch_invariant_arch(),
+            quant_kind=dtype,
+            implementation="legacy",
+            apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+            gate_up_clamp=gate_up_clamp,
+        )
     if dtype == "nvfp4":
         from flashinfer.moe_ep.batch_invariant.nvfp4_spec import (
             spec_fingerprint as nvfp4_spec_fingerprint,
@@ -220,6 +247,23 @@ def _nvfp4_bi_plan_valid(knobs):
     )
 
 
+def _mxfp8_bi_plan_valid(knobs, dtype):
+    from types import SimpleNamespace
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp8_batch_invariant import (
+        validate_mxfp8_batch_invariant,
+    )
+
+    try:
+        validate_mxfp8_batch_invariant(
+            SimpleNamespace(batch_invariant=True, kind=dtype),
+            _knobs_from_json(knobs),
+            implementation="legacy",
+        )
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 @deprecated_aliases(
     apply_topk_in_fc1="apply_routing_weights_before_fc2",
     defer_topk_reduce="use_custom_finalize",
@@ -291,6 +335,11 @@ def _matching_entries(
         and isinstance(e.get("knobs"), dict)
         and (
             not batch_invariant or dtype != "nvfp4" or _nvfp4_bi_plan_valid(e["knobs"])
+        )
+        and (
+            not batch_invariant
+            or dtype not in ("mxfp8_e4m3", "mxfp8_e5m2")
+            or _mxfp8_bi_plan_valid(e["knobs"], dtype)
         )
         and isinstance(e.get("max_tokens"), int)
         and (enable_in_kernel_fc2_reduce or not _entry_needs_ikr(e))
@@ -413,6 +462,12 @@ def record_knobs(
     """
     if batch_invariant and dtype == "nvfp4" and not _nvfp4_bi_plan_valid(knobs):
         raise ValueError("cannot record an inadmissible batch-invariant NVFP4 plan")
+    if (
+        batch_invariant
+        and dtype in ("mxfp8_e4m3", "mxfp8_e5m2")
+        and not _mxfp8_bi_plan_valid(knobs, dtype)
+    ):
+        raise ValueError("cannot record an inadmissible batch-invariant MXFP8 plan")
     policy_version = _batch_invariant_version(
         dtype, batch_invariant, batch_invariant_version
     )
@@ -452,7 +507,9 @@ def record_knobs(
         source=source,
         tuned_at=datetime.datetime.now().isoformat(timespec="seconds"),
     )
-    if dtype in ("bf16", "nvfp4"):
+    if dtype in ("bf16", "nvfp4") or (
+        batch_invariant and dtype in ("mxfp8_e4m3", "mxfp8_e5m2")
+    ):
         entry.update(
             batch_invariant=batch_invariant,
             batch_invariant_version=policy_version,
@@ -573,6 +630,14 @@ def resolve_knobs(
         )
 
         return nvfp4_batch_invariant_default_knobs("legacy"), "heuristic"
+    if batch_invariant and dtype in ("mxfp8_e4m3", "mxfp8_e5m2"):
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp8_batch_invariant import (
+            mxfp8_batch_invariant_default_knobs,
+        )
+
+        return mxfp8_batch_invariant_default_knobs(
+            "legacy", quant_kind=dtype
+        ), "heuristic"
     from .tuner import default_knobs
 
     # The cache keys on the precise element kind (``mxfp8_e4m3`` and

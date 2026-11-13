@@ -144,7 +144,8 @@ def sm107_candidates(
     """
     if batch_invariant:
         if (
-            quant_kind not in ("nvfp4", "mxfp4", "mxfp4_mxfp8")
+            quant_kind
+            not in ("nvfp4", "mxfp4", "mxfp4_mxfp8", "mxfp8_e4m3", "mxfp8_e5m2")
             or allow_in_kernel_fc2_reduce
         ):
             raise ValueError(

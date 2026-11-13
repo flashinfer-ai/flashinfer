@@ -575,6 +575,59 @@ plan/graph consistency and whole-operator numerical accuracy. As for NVFP4,
 keep weights, scales, routing, compiler/software versions, EP topology and
 expert placement fixed when comparing the same token across batches.
 
+### Batch-invariant MXFP8 MegaMoE
+
+W8A8 supports both `kind="mxfp8_e4m3"` and `kind="mxfp8_e5m2"`, with
+block-32 UE8M0 scales and BF16 output. Set `batch_invariant=True` on
+`Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig` or
+`Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig`. Blackwell's default provider
+is legacy; select `kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next"` for
+standard, or `kernel_variant="genphase"` for GenPhase. Rubin uses inference
+or GenPhase, with the existing explicit `(4, 1)` cluster and bulk FC2 settings
+for GenPhase.
+
+The initial allowlist requires hidden and post-activation intermediate widths
+divisible by 128, top-k in `[1, 32]`, standard SwiGLU, optional fixed clamp,
+and separate ordered BF16 finalization. It pins the following MMA geometry:
+
+| Architecture / provider | M / N / stage K | Native instruction K | Cluster |
+| --- | --- | --- | --- |
+| SM100/SM103 legacy | 256 / 256 / 128 | 32 | `(2, 1, 1)` |
+| SM100/SM103 standard / GenPhase | 256 / 128 / 128 | 32 | `(2, 1)` / `(4, 1)` |
+| SM107 standard / GenPhase | 256 / 128 / 128 | 64 | `(2, 1)` / `(4, 1)` |
+
+Legacy retains its early-routing-only interface. Next standard and GenPhase
+admit early and late routing. Legacy's FC1 activation association, operand
+orientation and block-32 quantization differ from next's paired-half recipe;
+they have separate receipts. Each receipt fixes MMA initialization, K order,
+full stage padding, activation/scale conversion and ascending top-k reduction.
+BF16 input staging always uses the specified fused normal-scale-floor recipe,
+including on Blackwell where ordinary W8A8 can use the full UE8M0 range.
+Prequantized inputs bypass this stager and retain the supplied bytes/scales.
+
+The admitted legacy plans vary static/atomic task assignment and epi/reuse
+carriers. Next standard admits grouped grid-stride, grouped atomic and
+phase-interleaved atomic assignment with three carriers. GenPhase keeps its
+existing admitted scheduling interface. None of these changes the receipt.
+Tile changes, mixed clusters, IKR, quantized combine, custom/CAKE finalization,
+SiTU, global normalization/alpha tensors, non-default flag batching and
+cross-variant auto selection are rejected. Blackwell legacy/standard retain
+their persistent live-count finalizer. Autotune, cache hits and heuristic
+fallbacks pass the same admission checks.
+
+Query `fingerprint("megamoe_mxfp8", hidden=, intermediate=, top_k=,
+num_experts=, arch=, quant_kind=, implementation=,
+apply_routing_weights_before_fc2=, gate_up_clamp=)` or read
+`layer.batch_invariant_fingerprint`. E4M3/E5M2, architecture, provider and
+routing placement define distinct numerical classes. Existing BF16, NVFP4 and
+MXFP4 receipts do not change.
+
+`mxfp8_spec.py` and its independent Lean model define ordered arithmetic
+components; their equality does not prove generated CUDA or communication.
+Native device tests separately check those components, whole-operator accuracy
+and bitwise batch/plan/graph consistency. Comparisons require fixed input,
+weights/scales, routing, software/compiler, EP topology and expert placement.
+
 ### Complete EP selection
 
 `AutoConfig` compares explicitly configured Mega and split candidates during an

@@ -232,6 +232,20 @@ and ordered masked reduction are reused. Ordinary execution and NVFP4
 branches remain unchanged. These are additional FlashInfer-owned exceptions
 to retain when regenerating the pinned export until upstreamed.
 
+## MXFP8 batch-invariant integration patch
+
+The E4M3/E5M2 W8A8 paths additionally use the opt-in batch-invariant problem
+field with a separate typed quantizer and arithmetic receipt. They retain
+native K64 MMA, fixed `(256, 128, 128)` tiles, cluster `(2, 1)` for standard
+inference or `(4, 1)` for GenPhase, and no per-expert alpha or normalization
+operands. The shared epilogue dispatches block32 requantization to the MXFP8
+specification with the data format's reciprocal limit. Its ordered block16
+amax folds, canonical half merge, explicit UE8M0 round-trip, capped/masked
+reciprocal and RN scaling retain the next-generation arithmetic chain.
+Existing fixed-N/Gather4 handling, SwiGLU, BF16 conversion and ordered masked
+finalization are reused. NVFP4, MXFP4 and ordinary branches keep their existing
+arithmetic. Retain this additional FlashInfer-owned exception until upstreamed.
+
 ## Related trees
 
 `sm100/cutedsl_megamoe` and the SM90 drop are separate snapshots. This Rubin

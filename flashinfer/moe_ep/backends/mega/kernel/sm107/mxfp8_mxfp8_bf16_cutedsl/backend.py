@@ -127,11 +127,11 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     ) -> None:
         validate_mega_arch_sm107()
         if getattr(self._kernel_config, "batch_invariant", False):
-            from ...sm100.common.mxfp4_batch_invariant import (
-                validate_mxfp4_batch_invariant,
+            from ...sm100.common.block_scaled_batch_invariant import (
+                validate_block_scaled_batch_invariant,
             )
 
-            validate_mxfp4_batch_invariant(self._kernel_config, arch="sm_107")
+            validate_block_scaled_batch_invariant(self._kernel_config, arch="sm_107")
         from ......kernel_src.sm107.next_cutedsl_megamoe import require_sm107_dsl
 
         self._ensure_ep_bootstrap(bootstrap)
@@ -221,11 +221,11 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     def batch_invariant_fingerprint(self, fleet_params):
         if not getattr(self._kernel_config, "batch_invariant", False):
             return None
-        from ...sm100.common.mxfp4_batch_invariant import (
-            mxfp4_batch_invariant_fingerprint,
+        from ...sm100.common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_fingerprint,
         )
 
-        return mxfp4_batch_invariant_fingerprint(
+        return block_scaled_batch_invariant_fingerprint(
             self._resolved_config(fleet_params), arch="sm_107"
         )
 
@@ -247,15 +247,14 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
 
         k = self._kernel_config
         if getattr(k, "batch_invariant", False):
-            from ...sm100.common.mxfp4_batch_invariant import (
-                mxfp4_batch_invariant_default_knobs,
-                mxfp4_batch_invariant_implementation,
-                validate_mxfp4_batch_invariant,
+            from ...sm100.common.block_scaled_batch_invariant import (
+                block_scaled_batch_invariant_default_knobs,
+                validate_block_scaled_batch_invariant,
             )
 
-            selected = mxfp4_batch_invariant_default_knobs(
-                mxfp4_batch_invariant_implementation(k),
-                quant_kind=k.kind,
+            selected = block_scaled_batch_invariant_default_knobs(
+                k,
+                "genphase" if k.kernel_variant == "genphase" else "standard",
                 arch="sm_107",
             )
             if isinstance(k.knobs, dict):
@@ -266,7 +265,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                 raise MoEEpConfigError(
                     "knobs must be None, 'cache', 'auto', or a dictionary"
                 )
-            validate_mxfp4_batch_invariant(k, selected, arch="sm_107")
+            validate_block_scaled_batch_invariant(k, selected, arch="sm_107")
             return selected
         if k.knobs is None:
             return {}

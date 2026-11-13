@@ -152,7 +152,7 @@ def test_unsupported_modes_fail_before_allocation(provider, overrides):
         _public(provider, **overrides)
 
 
-def test_w8a8_and_auto_variant_are_not_admitted():
+def test_unknown_kind_and_auto_variant_are_not_admitted():
     from types import SimpleNamespace
     from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
         validate_block_scaled_batch_invariant,
@@ -160,10 +160,6 @@ def test_w8a8_and_auto_variant_are_not_admitted():
 
     with pytest.raises(ValueError, match="unsupported"):
         validate_block_scaled_batch_invariant(SimpleNamespace(batch_invariant=True))
-    with pytest.raises(ValueError, match="MXFP4"):
-        moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
-            256, 3, batch_invariant=True
-        )
     with pytest.raises(ValueError, match="cross-variant"):
         _public("107-mixed-standard", kernel_variant="auto", knobs="auto")
     for provider in PROVIDERS:

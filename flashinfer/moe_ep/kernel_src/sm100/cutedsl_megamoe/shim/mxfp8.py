@@ -76,8 +76,19 @@ class MegaMoEMxfp8Config:
     token_back_by_dispatch: bool = False
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
+    batch_invariant: bool = dataclasses.field(default=False, kw_only=True)
+    input_norm_const: float = dataclasses.field(default=1.0, kw_only=True)
+    has_3_global_scales: bool = dataclasses.field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
+        if type(self.batch_invariant) is not bool:
+            raise ValueError("batch_invariant must be a bool")
+        if self.batch_invariant:
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp8_batch_invariant import (
+                validate_mxfp8_batch_invariant,
+            )
+
+            validate_mxfp8_batch_invariant(self, implementation="legacy")
         if self.kind not in _KIND_TO_TORCH_DTYPE:
             raise ValueError(
                 f"kind must be one of {sorted(_KIND_TO_TORCH_DTYPE)}, "
@@ -219,6 +230,14 @@ class MegaMoEMxfp8Frontend:
         return dataclasses.replace(self._config, gate_up_clamp=self._gate_up_clamp)
 
     def set_gate_up_clamp(self, clamp: Optional[float]) -> None:
+        if self._config.batch_invariant:
+            from flashinfer.moe_ep.batch_invariant.spec import f32_bits
+
+            def bits(value):
+                return None if value is None else f32_bits(abs(value))
+
+            if bits(clamp) != bits(self._config.gate_up_clamp):
+                raise ValueError("batch_invariant MXFP8 clamp is fixed at construction")
         if self._gate_up_clamp == clamp:
             return
         ensure_not_capturing("set_gate_up_clamp (clamp change)")
@@ -399,6 +418,16 @@ class MegaMoEMxfp8Frontend:
             torch.cuda.current_stream().cuda_stream,
         )
 
+    @property
+    def batch_invariant_fingerprint(self) -> Optional[str]:
+        if not self.config.batch_invariant:
+            return None
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp8_batch_invariant import (
+            mxfp8_batch_invariant_fingerprint,
+        )
+
+        return mxfp8_batch_invariant_fingerprint(self.config, implementation="legacy")
+
     def _mega_compile_key(self) -> tuple:
         c = self.config
         return (
@@ -426,6 +455,8 @@ class MegaMoEMxfp8Frontend:
             c.token_back_by_dispatch,
             self._gate_up_clamp,
             c.enable_iket,
+            c.batch_invariant,
+            self.batch_invariant_fingerprint,
         )
 
     def _ensure_mega_compiled(self, inputs: MegaMoEMxfp8Inputs) -> _CompiledMega:
@@ -441,6 +472,16 @@ class MegaMoEMxfp8Frontend:
         from moe_mxfp8_glu.megamoe_kernel_mxfp8 import Sm100MegaMoEMxfp8Kernel
 
         c = self.config
+        if c.batch_invariant:
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+                validate_bf16_batch_invariant_compile_target,
+            )
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp8_batch_invariant import (
+                validate_mxfp8_batch_invariant,
+            )
+
+            validate_mxfp8_batch_invariant(c, implementation="legacy")
+            validate_bf16_batch_invariant_compile_target()
         static_expert_shape = (
             c.num_experts_per_rank,
             c.fc1_out,
@@ -485,6 +526,7 @@ class MegaMoEMxfp8Frontend:
             flag_batch=c.flag_batch,
             gate_up_clamp=self._gate_up_clamp,
         )
+        kernel.batch_invariant = c.batch_invariant
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
         local_workspace = torch.zeros(
@@ -913,6 +955,9 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     use_custom_finalize: bool = False,
     num_valid_tokens_tensor: Optional[torch.Tensor] = None,
     knobs: Optional[dict] = None,
+    batch_invariant: bool = False,
+    input_norm_const: float = 1.0,
+    has_3_global_scales: bool = False,
 ) -> MegaMoEMxfp8SymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MXFP8 session.
 
@@ -960,9 +1005,15 @@ def get_symm_buffer_for_mxfp8_mega_moe(
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         use_persistent_finalize_kernel=use_persistent_finalize_kernel,
         use_custom_finalize=use_custom_finalize,
+        batch_invariant=batch_invariant,
+        input_norm_const=input_norm_const,
+        has_3_global_scales=has_3_global_scales,
     )
     from .knob_cache import resolve_knobs
     from .tuner import with_checked_knobs
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp8_batch_invariant import (
+        MXFP8_BATCH_INVARIANT_VERSION,
+    )
 
     # knobs=None -> pure lookup: offline-tuned cache entry for this session
     # key when present, else the measured MXFP8 heuristic (dtype="mxfp8"; no
@@ -979,6 +1030,13 @@ def get_symm_buffer_for_mxfp8_mega_moe(
             max_tokens=num_max_tokens,
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
             use_custom_finalize=use_custom_finalize,
+            batch_invariant=batch_invariant,
+            batch_invariant_version=(
+                MXFP8_BATCH_INVARIANT_VERSION if batch_invariant else None
+            ),
+            gate_up_clamp=clamp,
+            input_norm_const=input_norm_const,
+            apply_routing_weights_before_fc2=batch_invariant,
         )
     # TODO Add explicit validity checks
     cfg = with_checked_knobs(cfg, knobs)

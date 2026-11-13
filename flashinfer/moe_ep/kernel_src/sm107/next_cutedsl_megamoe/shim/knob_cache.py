@@ -98,6 +98,33 @@ def _bi_key(
                 gate_up_clamp=clamp,
             ),
         )
+    if dtype in ("mxfp8_e4m3", "mxfp8_e5m2"):
+        if isinstance(norm, bool) or norm != 1.0:
+            raise ValueError("batch_invariant MXFP8 requires input_norm_const=1.0")
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp8_batch_invariant import (
+            MXFP8_BATCH_INVARIANT_VERSION,
+        )
+        from flashinfer.moe_ep.batch_invariant.mxfp8_spec import (
+            spec_fingerprint as mxfp8_fingerprint,
+        )
+
+        return dict(
+            batch_invariant=True,
+            batch_invariant_version=MXFP8_BATCH_INVARIANT_VERSION
+            if version is None
+            else version,
+            batch_invariant_fingerprint=mxfp8_fingerprint(
+                hidden=hidden,
+                intermediate=intermediate,
+                top_k=topk,
+                num_experts=num_experts,
+                arch="sm_107",
+                quant_kind=dtype,
+                implementation="genphase" if variant == "genphase" else "standard",
+                apply_routing_weights_before_fc2=early,
+                gate_up_clamp=clamp,
+            ),
+        )
     if dtype != "nvfp4":
         raise ValueError("SM107 batch_invariant cache requires NVFP4 or MXFP4")
     from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
@@ -128,14 +155,14 @@ def _bi_key(
 
 
 def _bi_plan_valid(knobs, variant, dtype="nvfp4"):
-    if dtype in ("mxfp4", "mxfp4_mxfp8"):
+    if dtype in ("mxfp4", "mxfp4_mxfp8", "mxfp8_e4m3", "mxfp8_e5m2"):
         from types import SimpleNamespace
-        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp4_batch_invariant import (
-            validate_mxfp4_batch_invariant,
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+            validate_block_scaled_batch_invariant,
         )
 
         try:
-            validate_mxfp4_batch_invariant(
+            validate_block_scaled_batch_invariant(
                 SimpleNamespace(batch_invariant=True, quant_kind=dtype),
                 _knobs_from_json(knobs),
                 implementation="genphase" if variant == "genphase" else "standard",
