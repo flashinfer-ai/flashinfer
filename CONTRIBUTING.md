@@ -107,11 +107,12 @@ releases (see [Release Versioning](#release-versioning)). When changing one:
   behavior; a new top-level import alone does not preserve the old path.
 * **Keep old calls working.** Preserve parameter names, positional order,
   positional/keyword kinds, and defaults. Do not add a required parameter or
-  change a default. A new optional keyword-only parameter is normally safe if
-  omitting it keeps old behavior; with `**kwargs`, verify it does not intercept
-  a keyword previously forwarded elsewhere.
+  change a default. A new optional keyword-only parameter is acceptable only
+  if omitting it preserves old behavior; with `**kwargs`, verify it does not
+  intercept a keyword previously forwarded elsewhere.
 * **Keep the old result contract.** Preserve supported input shapes, dtypes,
-  devices, and layouts, plus the default return type, structure, and meaning.
+  devices, and layouts, default backend behavior, and the default return type,
+  structure, and meaning.
   For example, an API returning a tensor by default must not start returning a
   tuple; expose the tuple through an explicit opt-in instead.
 * **Check public classes as a whole.** Preserve construction, inherited and
@@ -120,7 +121,7 @@ releases (see [Release Versioning](#release-versioning)). When changing one:
 
 Use [`scripts/check_pr_api_diff.py`](scripts/check_pr_api_diff.py) to compare
 decorated functions/methods, exports, and module moves. Resolve its warnings
-against the actual old and new runtime behavior: a warning is a candidate break,
+against the actual old and new runtime behavior: a warning is a potential break,
 and a clean check cannot prove semantic compatibility. Add focused regression
 tests for representative old positional and keyword calls, omitted options,
 accepted inputs, and returns. Check trace and JIT/AOT registration where
