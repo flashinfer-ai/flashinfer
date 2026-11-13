@@ -1,0 +1,16 @@
+{
+  "nccl_version": "2.32.3",
+  "cuda_runtime_major": 13,
+  "device_bitcode_source": "ack_async: fused payload/strong VA signal, ACK-gated source reuse",
+  "files": {
+    "gin_host.so": "932325aeaad09468453cc76ba54d7b40861d280137117fb218872bb2576caa29",
+    "gin_device.bc": "b5d09690f3bad50c51be10c9ccfb95c898f4ba013c633d2f049627e537108a36",
+    "NCCL-License.txt": "0f0174a6b4e0b33ac26375bf729533075b32f4c51a5b6802a3d742d7dcdc9a76",
+    "gin_device.cu": "b442f275565929e0bfc7c58dae6ecac1d3808485d300d85d71efb03a9258b084",
+    "gin_host.cc": "e13fad34861f047c5d01cccb02289ac6bc49265e64d886a5025f3525c9395d87",
+    "gin_full_state_v3.h": "791354d740435f10671d2dbc51bad3a0a3dc9e6b3329d58c13d7b46ee3c93d11",
+    "RUNTIME_CONTRACT.json": "d2a87b29d5d0ced8b653829d352278b339977f0380fdaa8d0535bea30c1c4af2"
+  },
+  "nccl_library_sha256": "651cf05af28976ca8d996f4e2750e69db1fa427667ee3405b9e576e9d2960eaf",
+  "purpose": "NCCL-only LSA/GIN artifacts, reused unchanged by packed arena ABI2812"
+}

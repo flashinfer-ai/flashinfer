@@ -1,0 +1,64 @@
+{
+  "status": "adopted_qualified_52points_and_actual_production_import",
+  "scope": "EP8 network dispatch and return both GIN; same-NUMA P2P unchanged; EP4 localP2P unchanged",
+  "dependencies": "NVSHMEM3.8 remains for symmetric allocation and existing localP2P implementation; not a removal of NVSHMEM dependency",
+  "versions": {
+    "nccl": "2.32.3",
+    "nvshmem": "3.8.0",
+    "nvshmem4py": "0.4.1",
+    "cache_abi": 2744
+  },
+  "default_shapes": [
+    [
+      4096,
+      4096,
+      6,
+      256
+    ],
+    [
+      4096,
+      4096,
+      8,
+      288
+    ]
+  ],
+  "tokens": [
+    16,
+    32,
+    64,
+    128,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    12288,
+    16384,
+    20480,
+    24576
+  ],
+  "platform": "Validated NIC map is physical GPU0..7 on .16; MEGAMOE_GIN_HCA_MAP explicitly overrides",
+  "lifecycle": "One tester/session per isolated distributed worker process; no error-triggered backend fallback",
+  "startup": "Empty receiver epoch0, initialized epoch1, assert only ordinary count fields zero; signal polls use GIN API",
+  "protocol": "Fused return payload/strong commit; local GIN flush plus application receive/cyclic ACK/terminal credit joins; no remote marker/get",
+  "timing": "FullK3 output-ready latency; terminal credits are joined before next reset but may extend past timed end event",
+  "build": {
+    "host": "g++ -shared -fPIC -O2 -std=c++17 -I<NCCL2.32.3>/include -I<CUDA>/include gin_host.cc -L<CUDA>/lib64 -lcudart -ldl -o gin_host.so",
+    "device": "clang++ --cuda-device-only --cuda-gpu-arch=sm_90 -emit-llvm -O2 -std=gnu++17 with pinned CUDA12.8 headers and NCCL2.32.3; source and BC checksums pinned together"
+  },
+  "signal_consumers": "NIC VA signals use ncclGin waitSignal/readSignal acquire API, including owner counts/routes and packed return chunk index; ordinary P2P/ACK/data fields retain prior access methods",
+  "completion": "Local GIN flush only for source retirement; original application receive commit/ACK/terminal credit dependency proves remote consumption and reuse. Not a generic remote-quiet implementation.",
+  "host_progress": "Poll all dependent Green-context events before blocking end synchronization or native validation",
+  "ready_metadata": "Return probe acquires metadata epoch and reloads concurrent threshold with volatile/cache-volatile access every retry",
+  "evidence_root": "/lustre/raplab/client/hanyueh/workspace/log/sm120_gin_unified_m16_20261110",
+  "production_validation_cases": [
+    "ep8_dsv4_flash_t16_installed_production_smoke_a1",
+    "ep8_dsv4_flash_t4096_installed_production_smoke_a0",
+    "ep8_glm5.3_flash_t16_installed_production_smoke_a0",
+    "ep8_glm5.3_flash_t4096_installed_production_smoke_a0",
+    "ep4_dsv4_flash_t512_installed_production_smoke_a0",
+    "ep4_dsv4_flash_t1024_installed_production_smoke_a0",
+    "ep4_glm5.3_flash_t512_installed_production_smoke_a0",
+    "ep4_glm5.3_flash_t1024_installed_production_smoke_a0"
+  ]
+}

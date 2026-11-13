@@ -1,0 +1,398 @@
+"""Host-side contracts for the SM120 NVFP4 x NVFP4 MegaMoE backend."""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from flashinfer.moe_ep import BootstrapConfig, FleetParams
+from flashinfer.moe_ep.backends.mega.kernel.sm120.nvfp4_nvfp4_bf16_cutedsl import (
+    Sm120Nvfp4Nvfp4CutedslMegaKernelBackend,
+    Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+)
+from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+    bootstrap_paths,
+    select_graph_compile_bucket,
+)
+from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim.weights import (
+    interleave_gate_up_8,
+    interleave_gate_up_16,
+    scale_storage_size,
+)
+
+
+def test_config_uses_post_swiglu_intermediate() -> None:
+    config = Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=2048,
+        top_k=6,
+    )
+    assert config.intermediate_size == 2048
+    assert config.kernel_name == "sm120_nvfp4_nvfp4_bf16_cutedsl"
+
+
+def test_gate_up_interleave_is_grouped_in_eight_rows() -> None:
+    rows = torch.arange(32, dtype=torch.int64).view(1, 32, 1)
+    actual = interleave_gate_up_8(rows, full_width=32).flatten().tolist()
+    assert actual == list(range(0, 8)) + list(range(16, 24)) + list(
+        range(8, 16)
+    ) + list(range(24, 32))
+
+
+def test_legacy_gate_up_interleave_is_grouped_in_sixteen_rows() -> None:
+    rows = torch.arange(64, dtype=torch.int64).view(1, 64, 1)
+    actual = interleave_gate_up_16(rows, full_width=64).flatten().tolist()
+    assert actual == (
+        list(range(0, 16))
+        + list(range(32, 48))
+        + list(range(16, 32))
+        + list(range(48, 64))
+    )
+
+
+def test_scale_storage_uses_block16_and_atom_padding() -> None:
+    assert scale_storage_size(4096, 4096) == 4096 * 256
+    assert scale_storage_size(33, 65) == 128 * 8
+
+
+def test_decode_graph_compile_bucket_selection() -> None:
+    capacity = 8192
+    expected = {
+        1: 7,
+        7: 7,
+        8: 16,
+        16: 16,
+        17: 32,
+        127: 128,
+        129: 168,
+        168: 168,
+        169: 256,
+        256: 256,
+        257: 320,
+        320: 320,
+        321: 384,
+        384: 384,
+        385: capacity,
+    }
+    for requested, bucket in expected.items():
+        assert select_graph_compile_bucket(requested, capacity) == bucket
+
+
+def test_transport_requires_matching_token_back_mode() -> None:
+    bootstrap_paths()
+    from moe_sm120_nvfp4_split.heuristic import (
+        MegaMoEHeuristicInput,
+        MegaMoEHeuristicOverrides,
+        select_megamoe_config,
+    )
+
+    shape = MegaMoEHeuristicInput(
+        tokens_per_rank=8192,
+        hidden=4096,
+        intermediate=4096,
+        num_topk=6,
+        num_total_experts=256,
+        data_parallel_size=1,
+        tensor_parallel_size=1,
+        expert_parallel_size=8,
+        ep_same_numa_peer_count=3,
+        ep_cross_numa_peer_count=4,
+        num_sms=110,
+        sm_min_partition=8,
+        sm_partition_alignment=8,
+    )
+    valid_cases = (
+        ("p2p_direct", "epi_warps"),
+        ("gin_hybrid", "reuse_dispatch_warps"),
+    )
+    for backend, token_back_mode in valid_cases:
+        config = select_megamoe_config(
+            shape,
+            MegaMoEHeuristicOverrides(
+                comm_backend=backend,
+                token_back_mode=token_back_mode,
+            ),
+        )
+        assert config.token_back_mode == token_back_mode
+
+    invalid_cases = (
+        ("p2p_direct", "reuse_dispatch_warps"),
+        ("gin_hybrid", "epi_warps"),
+    )
+    for backend, token_back_mode in invalid_cases:
+        with pytest.raises(ValueError, match="requires token_back_mode"):
+            select_megamoe_config(
+                shape,
+                MegaMoEHeuristicOverrides(
+                    comm_backend=backend,
+                    token_back_mode=token_back_mode,
+                ),
+            )
+
+
+def test_workspace_pool_key_covers_nvfp4_contract(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    fleet = FleetParams(
+        num_experts=256,
+        max_tokens_per_rank=8192,
+        token_hidden_size=4096,
+    )
+
+    def key(*, norm_const: float = 1.0, gate_up_clamp: float | None = None):
+        backend = Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(
+            Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+                intermediate_size=4096,
+                top_k=6,
+                input_norm_const=norm_const,
+                gate_up_clamp=gate_up_clamp,
+            )
+        )
+        backend.bind_ep_bootstrap(
+            BootstrapConfig(world_size=4, rank=1, auto_bootstrap=False)
+        )
+        return backend._workspace_pool_key(fleet)
+
+    assert key() == key()
+    assert key(norm_const=2.0) == key()
+    assert key(gate_up_clamp=10.0) != key()
+
+
+def test_production_modules_do_not_import_mega_runner() -> None:
+    package = Path(__file__).parents[2] / "flashinfer" / "moe_ep"
+    roots = (
+        package / "backends" / "mega" / "kernel" / "sm120" / "nvfp4_nvfp4_bf16_cutedsl",
+        package / "kernel_src" / "sm120" / "nvfp4_split_cutedsl_megakernel" / "shim",
+    )
+    offenders: list[str] = []
+    for root in roots:
+        for source in root.rglob("*.py"):
+            tree = ast.parse(source.read_text())
+            for node in ast.walk(tree):
+                names: list[str] = []
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    names = [node.module]
+                if any("mega_runner" in name for name in names):
+                    offenders.append(str(source.relative_to(package)))
+    assert not offenders
+
+
+@pytest.mark.parametrize("tokens,enabled", ((2048, True), (4096, True), (8192, True)))
+def test_rank_local_combine_heuristic_and_override(tokens, enabled) -> None:
+    bootstrap_paths()
+    from moe_sm120_nvfp4_split.api import MegaMoEProblemSpec, select_compile_spec
+    from moe_sm120_nvfp4_split.heuristic import MegaMoEHeuristicOverrides
+
+    problem = MegaMoEProblemSpec(
+        tokens_per_rank=tokens,
+        num_topk=6,
+        num_total_experts=256,
+        hidden=4096,
+        intermediate=8192,
+        expert_parallel_size=4,
+        expert_parallel_rank=0,
+    )
+    args = dict(
+        problem=problem,
+        ep_same_numa_peer_count=3,
+        ep_cross_numa_peer_count=0,
+        num_sms=110,
+        sm_min_partition=8,
+        sm_partition_alignment=8,
+    )
+    auto = select_compile_spec(**args, numerical_contract="owner_bf16")
+    direct = select_compile_spec(
+        **args, overrides=MegaMoEHeuristicOverrides(rank_local_combine=False)
+    )
+    assert auto.kernel.dispatch_rank_cache
+    assert auto.kernel.rank_local_combine is enabled
+    assert not direct.kernel.rank_local_combine
+    if enabled:
+        assert auto.kernel.dispatch_warps == 1
+        assert auto.cache_key != direct.cache_key
+
+
+def test_caller_reset_advances_shared_epoch_without_clearing_ready_flags() -> None:
+    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim.runtime import (
+        MegaMoESm120Nvfp4Frontend,
+    )
+
+    names = (
+        "dispatch_rank_cache_state",
+        "rank_combine_tile_done",
+        "rank_combine_route_map",
+    )
+    kernel = SimpleNamespace(
+        _local_offsets={name: index * 16 for index, name in enumerate(names)},
+        _local_region_by_name={name: SimpleNamespace(nbytes=16) for name in names},
+    )
+    storage = SimpleNamespace(
+        bundle=SimpleNamespace(k1=kernel),
+        local_workspace=torch.ones(48, dtype=torch.uint8),
+        rank_combine_ready=torch.full((8, 4), 17, dtype=torch.int32),
+        green_trace=None,
+    )
+    first = object.__new__(MegaMoESm120Nvfp4Frontend)
+    second = object.__new__(MegaMoESm120Nvfp4Frontend)
+    first._reset_execution(storage)
+    second._reset_execution(storage)
+    assert torch.count_nonzero(storage.local_workspace[:32]) == 0
+    assert torch.all(storage.local_workspace[32:].view(torch.int32) == -1)
+    assert storage.rank_combine_ready[-1, 0].item() == 19
+    assert torch.all(storage.rank_combine_ready[:-1] == 17)
+
+
+@pytest.mark.parametrize("reuse_storage", (False, True))
+def test_execution_allocation_synchronizes_only_new_storage(
+    monkeypatch, reuse_storage
+) -> None:
+    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+        runtime,
+    )
+
+    events = []
+    tensor = torch.empty(4)
+    storage = runtime._ExecutionStorage(
+        local_workspace=tensor,
+        shared_workspace=tensor,
+        combine_output=tensor,
+        epilogue_args=(tensor, tensor, tensor),
+    )
+    workspace = SimpleNamespace(
+        _executions={},
+        _storages={32: storage} if reuse_storage else {},
+        _sym_roots=[],
+        _comm_session=None,
+        fc1_alpha=tensor,
+        fc2_alpha=tensor,
+        fc1_norm_const=tensor,
+    )
+    frontend = object.__new__(runtime.MegaMoESm120Nvfp4Frontend)
+    frontend.workspace = workspace
+    frontend.compile_bucket = 32
+    frontend.config = SimpleNamespace(num_topk=1, hidden=1, world_size=4)
+    spec = SimpleNamespace(kernel=SimpleNamespace(rank_local_combine=False))
+    bundle = SimpleNamespace(local_workspace_bytes=4, shared_workspace_bytes=4)
+    monkeypatch.setattr(frontend, "_ensure_plan", lambda bucket: (spec, bundle))
+    monkeypatch.setattr(runtime, "ensure_not_capturing", lambda op: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("sync"))
+    monkeypatch.setattr(torch, "zeros", lambda *a, **kw: tensor)
+
+    def allocate(*args, **kwargs):
+        events.append("allocate")
+        assert events[0] == "sync"
+        return tensor
+
+    monkeypatch.setattr(runtime, "sym_zeros", allocate)
+    monkeypatch.setattr(
+        runtime, "sym_byte_view", lambda *args, **kwargs: (tensor, tensor)
+    )
+    monkeypatch.delenv("MEGA_SPLIT_GLOBALTIMER", raising=False)
+    monkeypatch.delenv("MEGA_SPLIT_K2_TILE_TRACE", raising=False)
+    execution = frontend._ensure_execution()
+    assert events == ([] if reuse_storage else ["sync", "allocate"])
+    assert frontend._ensure_execution() is execution
+    assert events == ([] if reuse_storage else ["sync", "allocate"])
+
+
+def test_cold_execution_rejects_capture_before_synchronization(monkeypatch) -> None:
+    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+        runtime,
+    )
+
+    frontend = object.__new__(runtime.MegaMoESm120Nvfp4Frontend)
+    frontend.workspace = SimpleNamespace(_executions={})
+    frontend.compile_bucket = 32
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    def unexpected_sync():
+        pytest.fail("capture rejection must precede synchronization")
+
+    monkeypatch.setattr(torch.cuda, "synchronize", unexpected_sync)
+    with pytest.raises(RuntimeError, match="cannot run during CUDA Graph capture"):
+        frontend._ensure_execution()
+
+
+def test_numerical_contract_validation():
+    config = Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(2048, 6)
+    assert config.numerical_contract == "ordinary_topk"
+    with pytest.raises(ValueError, match="unknown NVFP4 numerical contract"):
+        Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            2048, 6, numerical_contract="unknown"
+        )
+    with pytest.raises(ValueError, match="owner_bf16"):
+        Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            2048, 6, knobs={"rank_local_combine": True}
+        )
+
+
+def test_pool_separates_numerical_contracts(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    fleet = FleetParams(
+        num_experts=256, max_tokens_per_rank=8192, token_hidden_size=4096
+    )
+
+    def key(contract):
+        backend = Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(
+            Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+                2048, 6, numerical_contract=contract
+            )
+        )
+        backend.bind_ep_bootstrap(
+            BootstrapConfig(world_size=4, rank=0, auto_bootstrap=False)
+        )
+        return backend._workspace_pool_key(fleet)
+
+    assert key("ordinary_topk") != key("owner_bf16")
+
+
+@pytest.mark.parametrize("contract", ["ordinary_topk", "owner_bf16"])
+def test_frontend_passes_contract_and_gate_up_width(monkeypatch, contract):
+    bootstrap_paths()
+    from moe_sm120_nvfp4_split import api
+    from moe_sm120_nvfp4_split.runtime import green_context
+    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+        runtime,
+    )
+    from dataclasses import dataclass
+
+    @dataclass
+    class Spec:
+        kernel: object
+        build: object = None
+
+    seen = {}
+
+    def select(**kwargs):
+        seen.update(kwargs)
+        return Spec(SimpleNamespace(k1_sms=80, k2_sms=30))
+
+    monkeypatch.setattr(api, "select_compile_spec", select)
+    monkeypatch.setattr(green_context, "query_sm_resource_info", lambda: (110, 8, 8))
+    monkeypatch.setattr(
+        green_context, "query_green_context_sm_counts", lambda **kw: (80, 30)
+    )
+    frontend = object.__new__(runtime.MegaMoESm120Nvfp4Frontend)
+    frontend.config = runtime.MegaMoESm120Nvfp4Config(
+        0, 4, 64, 6, 256, 4096, 2048, numerical_contract=contract
+    )
+    frontend._select_spec(64)
+    assert seen["numerical_contract"] == contract
+    assert seen["problem"].intermediate == 4096
+    assert seen["problem"].tokens_per_rank == 64
+
+
+@pytest.mark.parametrize("dtype", (torch.float4_e2m1fn_x2, torch.float8_e4m3fn))
+def test_low_precision_interleave_preserves_payload_bytes(dtype):
+    payload = torch.arange(256, dtype=torch.int32).to(torch.uint8).reshape(2, 32, 4)
+    expected = torch.cat(
+        (payload[:, :8], payload[:, 16:24], payload[:, 8:16], payload[:, 24:]), dim=1
+    )
+    actual = interleave_gate_up_8(payload.view(dtype), full_width=32)
+    assert actual.dtype == dtype
+    torch.testing.assert_close(actual.view(torch.uint8), expected, atol=0, rtol=0)

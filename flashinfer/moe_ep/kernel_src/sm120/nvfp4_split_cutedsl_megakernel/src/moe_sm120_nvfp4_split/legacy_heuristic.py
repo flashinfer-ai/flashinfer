@@ -1,0 +1,917 @@
+"""Deterministic launch heuristics for the SM120 MegaMoE kernel.
+
+This module is deliberately independent of torch, CUDA, NCCL, argparse,
+and process environment state.  The FlashInfer-facing call path can therefore
+select one JIT configuration with a small amount of integer arithmetic; the
+benchmark runner may apply explicit user overrides after selection.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from typing import Optional, Tuple
+
+
+Tile = Tuple[int, int, int]
+
+
+# Blocking IBGDA puts avoid a long late-combine quiet/drain for large payloads,
+# but make tiny transfers pay the blocking round trip for every chunk.  This
+# byte threshold came from the RTX Pro 5000 EP8 scan and is intentionally
+# expressed in transport work rather than model names or token-only bands.
+_COMBINE_BLOCKING_PUT_BYTES_PER_PEER = 3 * 1024 * 1024
+_COMBINE_BLOCKING_PUT_MAX_CHUNK_BYTES = 128 * 1024
+_DISPATCH_MAX_IBGDA_CHUNK_BYTES = 384 * 1024
+# EP4 DSV4-flash sweep: one active dispatch warp/CTA wins while the expected
+# remote pull work stays below about 384 KiB per K1 CTA.  At the next bucket
+# (1024 tokens/rank, about 590 KiB/CTA), four warps recover the lead.  Keep
+# this optimization inside the measured small-shape envelope: DSV4's wider
+# hidden dimension and larger expert table make route/expert control work
+# dominate some small-token buckets even when their byte estimate is low.
+# Two warps never won by enough to justify another production branch.
+_SINGLE_DISPATCH_WARP_MAX_REMOTE_BYTES_PER_K1_CTA = 384 * 1024
+_SINGLE_DISPATCH_WARP_MAX_HIDDEN = 4096
+_SINGLE_DISPATCH_WARP_MAX_EXPERTS = 256
+_SINGLE_DISPATCH_WARP_MAX_TOPK = 6
+
+# Same-NUMA EP4 dispatch caches one activation row per (source rank, token)
+# and reuses it when several top-k routes land on the same expert owner.  Use
+# a traffic-derived threshold so the selector is independent of model names.
+_DISPATCH_RANK_CACHE_MIN_SAVED_BYTES = 64 * 1024
+_DISPATCH_RANK_CACHE_MIN_SAVED_FRACTION = 0.20
+
+# Rank-local combine is robust across balanced, power-law and zero-owner EP4
+# routes once each local expert wave reaches roughly 256 rows.  Below this
+# boundary, fixed sideband/K3 costs and owner imbalance can erase the P2P
+# savings even when the theoretical byte reduction is large.
+_RANK_LOCAL_COMBINE_MIN_ROWS_PER_EXPERT = 256.0
+
+# RLC-40/41 candidate only: keep unmeasured devices, parallel decompositions
+# and GEMM shapes on the previous selector. Inside this qualification envelope
+# the decisions below depend on the resolved cache/overlap path and expert
+# wave size, not a caller-provided model name. Expanding the envelope requires
+# separate skew-route and dynamic replay validation.
+_RANK_CACHE_STREAMING_QUALIFIED_SHAPES = (
+    (4096, 4096, 6, 256),
+    (7168, 6144, 6, 384),
+)
+_VECTOR_RLC_MIN_ROWS_PER_EXPERT = 144.0
+
+# The measured RTX Pro 5000 presets remain the tuning anchors, but their SM
+# counts must scale to the physical device.  Green Context requires every
+# explicitly requested group except the final remainder to respect the
+# device's co-schedule alignment.
+_REFERENCE_SM_COUNT = 110
+_LOCAL_N64_SM_PARTITION = (80, 30)
+_LOCAL_DECODE_SM_PARTITION = (80, 30)
+_LOCAL_DEFAULT_SM_PARTITION = (72, 38)
+_HYBRID_SM_PARTITION = (48, 16, 16, 30)
+
+# RTX Pro 5000 EP4 NVFP4 sweep: DSV4-flash decode buckets through 128 tokens
+# (12 expected rows/expert) benefit from the N16 K2 worker and the 80/30 split.
+# The dual-N8 mapping is intentionally enabled only for the exact measured
+# model/parallel envelope below; other local shapes may still use single-N16.
+_LOCAL_DECODE_MAX_ROWS_PER_EXPERT = 12.0
+_DUAL_N8_DECODE_MAX_TOKENS_PER_RANK = 128
+_TAIL_RECLAIM_MIN_TOKENS_PER_RANK = 32
+
+
+def _is_validated_dual_n8_decode(shape: "MegaMoEHeuristicInput") -> bool:
+    return (
+        shape.ep_cross_numa_peer_count == 0
+        and shape.data_parallel_size == 1
+        and shape.tensor_parallel_size == 1
+        and shape.expert_parallel_size == 4
+        and shape.hidden == 4096
+        and shape.intermediate == 4096
+        and shape.num_topk == 6
+        and shape.num_total_experts == 256
+        and shape.tokens_per_rank <= _DUAL_N8_DECODE_MAX_TOKENS_PER_RANK
+    )
+
+
+def _scale_sm_partition(
+    *,
+    num_sms: int,
+    reference_counts: Tuple[int, ...],
+    min_partition: int,
+    alignment: int,
+) -> Tuple[int, ...]:
+    """Scale a 110-SM preset while preserving Green Context constraints."""
+
+    if sum(reference_counts) != _REFERENCE_SM_COUNT:
+        raise ValueError(
+            f"reference partition must cover {_REFERENCE_SM_COUNT} SMs, "
+            f"got {reference_counts}"
+        )
+    if num_sms < min_partition * len(reference_counts):
+        raise ValueError(
+            f"{num_sms} SMs cannot form {len(reference_counts)} partitions "
+            f"of at least {min_partition} SMs"
+        )
+
+    aligned_minimum = (
+        (min_partition + alignment - 1) // alignment * alignment
+    )
+    targets = tuple(
+        num_sms * count / _REFERENCE_SM_COUNT
+        for count in reference_counts
+    )
+    counts = []
+    for target in targets[:-1]:
+        units = int(target / alignment + 0.5)
+        counts.append(max(aligned_minimum, units * alignment))
+
+    remainder = num_sms - sum(counts)
+    while remainder < min_partition:
+        candidates = [
+            index
+            for index, count in enumerate(counts)
+            if count - alignment >= aligned_minimum
+        ]
+        if not candidates:
+            raise ValueError(
+                f"cannot align partition {reference_counts} to {num_sms} SMs"
+            )
+        # Choose the adjustment with the smallest increase in ratio error.
+        index = min(
+            candidates,
+            key=lambda candidate: (
+                abs(counts[candidate] - alignment - targets[candidate])
+                - abs(counts[candidate] - targets[candidate])
+            ),
+        )
+        counts[index] -= alignment
+        remainder += alignment
+
+    return (*counts, remainder)
+
+@dataclass(frozen=True)
+class MegaMoEHeuristicInput:
+    """Runtime shape, parallel decomposition, and EP-group topology."""
+
+    tokens_per_rank: int
+    hidden: int
+    intermediate: int
+    num_topk: int
+    num_total_experts: int
+    data_parallel_size: int
+    tensor_parallel_size: int
+    expert_parallel_size: int
+    ep_same_numa_peer_count: int
+    ep_cross_numa_peer_count: int
+    num_sms: int
+    sm_min_partition: int
+    sm_partition_alignment: int
+
+    @property
+    def expected_rows_per_expert(self) -> float:
+        return (
+            self.tokens_per_rank
+            * self.expert_parallel_size
+            * self.num_topk
+            / self.num_total_experts
+        )
+
+    @property
+    def expected_combine_bytes_per_peer(self) -> float:
+        """Uniform-route estimate of BF16 FC2 bytes returned to one peer."""
+
+        return (
+            self.tokens_per_rank
+            * self.num_topk
+            / self.expert_parallel_size
+            * self.hidden
+            * 2
+        )
+
+    @property
+    def probability_one_owner_is_untouched(self) -> float:
+        """Uniform-route probability that top-k selects no expert on one owner."""
+
+        experts_per_owner = self.num_total_experts // self.expert_parallel_size
+        experts_outside_owner = self.num_total_experts - experts_per_owner
+        if self.num_topk > experts_outside_owner:
+            return 0.0
+        probability = 1.0
+        for index in range(self.num_topk):
+            probability *= (experts_outside_owner - index) / (
+                self.num_total_experts - index
+            )
+        return probability
+
+    @property
+    def expected_remote_route_rows(self) -> float:
+        return (
+            self.tokens_per_rank
+            * self.num_topk
+            * (self.expert_parallel_size - 1)
+            / self.expert_parallel_size
+        )
+
+    @property
+    def expected_duplicate_remote_owner_rows(self) -> float:
+        unique_remote_owner_rows = (
+            self.tokens_per_rank
+            * (self.expert_parallel_size - 1)
+            * (1.0 - self.probability_one_owner_is_untouched)
+        )
+        return max(self.expected_remote_route_rows - unique_remote_owner_rows, 0.0)
+
+    @property
+    def expected_dispatch_rank_cache_saved_bytes(self) -> float:
+        activation_row_bytes = (self.hidden + 1) // 2
+        scale_row_bytes = (self.hidden + 15) // 16
+        return self.expected_duplicate_remote_owner_rows * (
+            activation_row_bytes + scale_row_bytes
+        )
+
+    @property
+    def expected_dispatch_rank_cache_saved_fraction(self) -> float:
+        if self.expected_remote_route_rows == 0:
+            return 0.0
+        return self.expected_duplicate_remote_owner_rows / self.expected_remote_route_rows
+
+    def validate(self) -> None:
+        positive = {
+            "tokens_per_rank": self.tokens_per_rank,
+            "hidden": self.hidden,
+            "intermediate": self.intermediate,
+            "num_topk": self.num_topk,
+            "num_total_experts": self.num_total_experts,
+            "data_parallel_size": self.data_parallel_size,
+            "tensor_parallel_size": self.tensor_parallel_size,
+            "expert_parallel_size": self.expert_parallel_size,
+            "num_sms": self.num_sms,
+            "sm_min_partition": self.sm_min_partition,
+            "sm_partition_alignment": self.sm_partition_alignment,
+        }
+        if any(type(value) is not int for value in positive.values()):
+            raise ValueError('Problem and topology dimensions must be integers')
+        invalid = {name: value for name, value in positive.items() if value <= 0}
+        if invalid:
+            raise ValueError(f"heuristic inputs must be positive, got {invalid}")
+        if self.num_total_experts % self.expert_parallel_size:
+            raise ValueError(
+                "num_total_experts must be divisible by expert_parallel_size"
+            )
+        if self.num_topk > self.num_total_experts:
+            raise ValueError("num_topk must not exceed num_total_experts")
+        if self.ep_same_numa_peer_count < 0 or self.ep_cross_numa_peer_count < 0:
+            raise ValueError("EP peer counts must be non-negative")
+        if (
+            self.ep_same_numa_peer_count
+            + self.ep_cross_numa_peer_count
+            != self.expert_parallel_size - 1
+        ):
+            raise ValueError(
+                "same-NUMA and cross-NUMA peers must describe the complete "
+                "remote EP group"
+            )
+        if self.num_sms < 2 * self.sm_min_partition:
+            raise ValueError(
+                f"{self.num_sms} SMs cannot form two Green Context "
+                f"partitions of at least {self.sm_min_partition} SMs"
+            )
+
+
+@dataclass(frozen=True)
+class MegaMoEHeuristicOverrides:
+    """Benchmark-only explicit overrides; ``None`` means use the heuristic."""
+
+    comm_backend: Optional[str] = None
+    token_back_mode: Optional[str] = None
+    k1_tile: Optional[Tile] = None
+    k2_tile: Optional[Tile] = None
+    k2_stages: Optional[int] = None
+    k2_warps: Optional[int] = None
+    k2_tail_reclaim: Optional[bool] = None
+    k1_sms: Optional[int] = None
+    k2_sms: Optional[int] = None
+    tx_sms: Optional[int] = None
+    rx_sms: Optional[int] = None
+    ready_queue_bundle: Optional[int] = None
+    dispatch_chunk_tokens: Optional[int] = None
+    combine_chunk_rows: Optional[int] = None
+    dispatch_channels: Optional[int] = None
+    combine_channels: Optional[int] = None
+    dispatch_slots: Optional[int] = None
+    combine_slots: Optional[int] = None
+    combine_blocking_put: Optional[bool] = None
+    dispatch_local_handoff_windows: Optional[int] = None
+    dispatch_remote_handoff_windows: Optional[int] = None
+    ibgda_rc_per_pe: Optional[int] = None
+    ibgda_rc_mapping: Optional[str] = None
+    tp_k3_chunks: Optional[int] = None
+    dispatch_warps: Optional[int] = None
+    dispatch_compute_overlap: Optional[bool] = None
+    dispatch_rank_cache: Optional[bool] = None
+    rank_local_combine: Optional[bool] = None
+
+
+@dataclass(frozen=True)
+class MegaMoEKernelConfig:
+    """One fully resolved JIT/launch/transport configuration."""
+
+    comm_backend: str
+    kernel_comm_backend: str
+    token_back_mode: str
+
+    k1_tile: Tile
+    k2_tile: Tile
+    k2_stages: int
+    k2_warps: int
+
+    k1_sms: int
+    k2_sms: int
+    tx_sms: int
+    rx_sms: int
+    sm_min_partition: int
+    sm_partition_alignment: int
+
+    dispatch_chunk_tokens: int
+    combine_chunk_rows: int
+    dispatch_channels: int
+    combine_channels: int
+    dispatch_slots: int
+    combine_slots: int
+    combine_blocking_put: bool
+    dispatch_local_handoff_windows: int
+    dispatch_remote_handoff_windows: int
+    ibgda_rc_per_pe: int
+    ibgda_rc_mapping: str
+    tp_k3_chunks: int
+
+    dispatch_warps: int
+    dispatch_compute_overlap: bool
+    dispatch_rank_cache: bool
+    rank_local_combine: bool
+    k1_ready_queue: bool
+    k1_ready_queue_m_rotation: int
+    k2_ready_queue: bool
+    ready_queue_bundle: int
+    k2_natural_regs: bool
+    k2_min_blocks_per_sm: int
+    k2_tail_reclaim: bool
+
+    expected_rows_per_expert: float
+
+    @property
+    def total_sms(self) -> int:
+        return self.k1_sms + self.k2_sms + self.tx_sms + self.rx_sms
+
+    def with_overrides(
+        self, overrides: MegaMoEHeuristicOverrides
+    ) -> "MegaMoEKernelConfig":
+        updates = {
+            name: value
+            for name, value in vars(overrides).items()
+            if value is not None
+        }
+        if not updates:
+            return self
+        if (
+            overrides.dispatch_warps is not None
+            and overrides.dispatch_warps not in (1, 2, 4)
+        ):
+            raise ValueError(
+                "dispatch_warps must be one of 1/2/4, got "
+                f"{overrides.dispatch_warps}"
+            )
+        sm_names = ("k1_sms", "k2_sms", "tx_sms", "rx_sms")
+        provided_sms = [name for name in sm_names if name in updates]
+        if provided_sms and len(provided_sms) != len(sm_names):
+            raise ValueError(
+                "K1/K2/TX/RX SM overrides form one transport preset; "
+                f"provide all four, got {provided_sms}"
+            )
+
+        deferred = {
+            "comm_backend",
+            "token_back_mode",
+            *sm_names,
+        }
+        config = replace(
+            self,
+            **{name: value for name, value in updates.items() if name not in deferred},
+        )
+        if overrides.k2_tile is not None:
+            token_n = config.k2_tile[1]
+            config = replace(
+                config,
+                k2_stages=(
+                    overrides.k2_stages
+                    if overrides.k2_stages is not None
+                    else (
+                        3
+                        if (
+                            token_n == 64
+                            or (
+                                token_n == 128
+                                and config.expected_rows_per_expert <= 512.0
+                            )
+                        )
+                        else 2
+                    )
+                ),
+                k2_natural_regs=(token_n == 32),
+                k2_min_blocks_per_sm=2 if token_n == 32 else 1,
+            )
+            if overrides.k2_warps is None:
+                config = replace(config, k2_warps=8)
+            if overrides.k2_tail_reclaim is None:
+                config = replace(config, k2_tail_reclaim=False)
+        if (
+            overrides.k2_warps is not None
+            and overrides.k2_warps != 12
+            and overrides.k2_tail_reclaim is None
+        ):
+            config = replace(config, k2_tail_reclaim=False)
+
+        backend = overrides.comm_backend or config.comm_backend
+        if backend == "p2p_direct":
+            reference = (
+                _LOCAL_DECODE_SM_PARTITION
+                if config.k2_tile[1] == 16
+                else (
+                    _LOCAL_N64_SM_PARTITION
+                    if config.k2_tile[1] == 64
+                    else _LOCAL_DEFAULT_SM_PARTITION
+                )
+            )
+            k1_sms, k2_sms = _scale_sm_partition(
+                num_sms=config.total_sms,
+                reference_counts=reference,
+                min_partition=config.sm_min_partition,
+                alignment=config.sm_partition_alignment,
+            )
+            config = replace(
+                config,
+                comm_backend=backend,
+                kernel_comm_backend="p2p_direct",
+                token_back_mode="epi_warps",
+                k1_sms=k1_sms,
+                k2_sms=k2_sms,
+                tx_sms=0,
+                rx_sms=0,
+            )
+        elif backend in ("gin_hybrid", "gin"):
+            k1_sms, tx_sms, rx_sms, k2_sms = _scale_sm_partition(
+                num_sms=config.total_sms,
+                reference_counts=_HYBRID_SM_PARTITION,
+                min_partition=config.sm_min_partition,
+                alignment=config.sm_partition_alignment,
+            )
+            config = replace(
+                config,
+                comm_backend=backend,
+                kernel_comm_backend="gin",
+                token_back_mode="reuse_dispatch_warps",
+                k1_sms=k1_sms,
+                k2_sms=k2_sms,
+                tx_sms=tx_sms,
+                rx_sms=rx_sms,
+            )
+        else:
+            raise ValueError(f"unsupported comm backend {backend!r}")
+
+        required_token_back = (
+            "epi_warps" if backend == "p2p_direct" else "reuse_dispatch_warps"
+        )
+        if (
+            overrides.token_back_mode is not None
+            and overrides.token_back_mode != required_token_back
+        ):
+            raise ValueError(
+                f"comm backend {backend!r} requires token_back_mode "
+                f"{required_token_back!r}, got {overrides.token_back_mode!r}"
+            )
+        if provided_sms:
+            config = replace(
+                config,
+                **{name: updates[name] for name in sm_names},
+            )
+        return config
+
+
+def select_megamoe_config(
+    shape: MegaMoEHeuristicInput,
+    overrides: Optional[MegaMoEHeuristicOverrides] = None,
+) -> MegaMoEKernelConfig:
+    """Select exactly one SM120 configuration without autotuning."""
+
+    shape.validate()
+    rows = shape.expected_rows_per_expert
+    # Offline RTX Pro 5000 scan: N32 wins through 28 rows/expert, N64
+    # wins from 30 through 63, and N128 wins at 64 and above.
+    if rows < 30.0:
+        k1_token_n = 32
+    elif rows < 64.0:
+        k1_token_n = 64
+    else:
+        k1_token_n = 128
+
+    cross_numa = shape.ep_cross_numa_peer_count > 0
+    # The measured DSV4 EP4 128-token point is 10% faster with N32 K2 and
+    # the balanced 72/38 partition than with the generic local-decode N16
+    # preset. Keep this narrow until neighboring wide-hidden buckets have
+    # their own controlled sweep.
+    dsv4_ep4_t128_n32 = (
+        not cross_numa
+        and shape.tokens_per_rank == 128
+        and shape.hidden == 7168
+        and shape.intermediate == 6144
+        and shape.num_topk == 6
+        and shape.num_total_experts == 384
+        and shape.data_parallel_size == 1
+        and shape.tensor_parallel_size == 1
+        and shape.expert_parallel_size == 4
+    )
+    local_decode = (
+        not cross_numa
+        and rows <= _LOCAL_DECODE_MAX_ROWS_PER_EXPERT
+        and not dsv4_ep4_t128_n32
+    )
+    # The dual-N8 path is enabled only for the exact four-rank DSV4-flash
+    # envelope covered by balanced, power-law, concentrated and empty-rank
+    # graph/eager replay tests. Other shapes retain the single-N16 path.
+    dual_n8_decode = _is_validated_dual_n8_decode(shape)
+    k2_token_n = 16 if local_decode else k1_token_n
+    k1_tile = (64, k1_token_n, 128)
+    k2_tile = (64, k2_token_n, 128)
+
+    if cross_numa:
+        # The RTX Pro 5000 cross-NUMA scan selected 48/16/16/30. Preserve
+        # those proportions on other SM120 devices and align explicit groups
+        # to the device's Green Context co-schedule granularity.
+        comm_backend = "gin_hybrid"
+        kernel_comm_backend = "gin"
+        k1_sms, tx_sms, rx_sms, k2_sms = _scale_sm_partition(
+            num_sms=shape.num_sms,
+            reference_counts=_HYBRID_SM_PARTITION,
+            min_partition=shape.sm_min_partition,
+            alignment=shape.sm_partition_alignment,
+        )
+    else:
+        comm_backend = "p2p_direct"
+        kernel_comm_backend = "p2p_direct"
+        # N64 needs more K1 waves on this kernel; N32/N128 are balanced by the
+        # measured 72/38 split.  This depends on the selected tile, not DP.
+        reference = (
+            _LOCAL_DECODE_SM_PARTITION
+            if local_decode
+            else (
+                _LOCAL_N64_SM_PARTITION
+                if k2_token_n == 64
+                else _LOCAL_DEFAULT_SM_PARTITION
+            )
+        )
+        k1_sms, k2_sms = _scale_sm_partition(
+            num_sms=shape.num_sms,
+            reference_counts=reference,
+            min_partition=shape.sm_min_partition,
+            alignment=shape.sm_partition_alignment,
+        )
+        tx_sms, rx_sms = 0, 0
+
+    # A dispatch row contains packed E2M1 activations, one E4M3 scale per 16
+    # elements, and FP32 top-k weights.  Keeping a cross-NUMA IBGDA operation
+    # below roughly 384 KiB avoids the wide-hidden head-of-line stalls seen on
+    # RTX Pro 5000.  The 512--1024-token band also benefits from a 32-row
+    # first handoff even when a 64-row payload fits the byte limit; above that
+    # band the extra operations outweigh the earlier first tile.
+    dispatch_bytes_per_token = (
+        (shape.hidden + 1) // 2
+        + (shape.hidden + 15) // 16
+        + shape.num_topk * 4
+    )
+    dispatch_chunk_tokens = (
+        32
+        if (
+            cross_numa
+            and (
+                512 <= shape.tokens_per_rank <= 1024
+                or (
+                    shape.tokens_per_rank >= 128
+                    and dispatch_bytes_per_token * 64
+                    > _DISPATCH_MAX_IBGDA_CHUNK_BYTES
+                )
+            )
+        )
+        else 64
+    )
+    dispatch_channels = 2
+    combine_channels = 2
+    dispatch_slots = 2
+    # The EP8 128-token shape produces roughly three combine chunks per
+    # peer/channel.  Keeping only two cyclic slots makes the producer wait for
+    # an in-epoch credit while its peer is still completing the reciprocal
+    # channel, which can form a cross-NUMA progress cycle.  Four slots cover
+    # the complete small-message window; terminal ACKs still retire the epoch
+    # before the next replay can reuse it.  Larger shapes stay on the measured
+    # two-slot fast path so their streaming reuse distance is unchanged.
+    combine_slots = (
+        4
+        if cross_numa and shape.tokens_per_rank <= 128
+        else 2
+    )
+    combine_chunk_rows = 16
+    combine_blocking_put = (
+        cross_numa
+        and shape.expected_combine_bytes_per_peer
+        >= _COMBINE_BLOCKING_PUT_BYTES_PER_PEER
+        and combine_chunk_rows * shape.hidden * 2
+        <= _COMBINE_BLOCKING_PUT_MAX_CHUNK_BYTES
+    )
+    remote_handoff_windows = 2 if cross_numa else 1
+
+    # Keep the four-warp physical group for setmaxnreg and kernel-tail
+    # rendezvous, but activate only one warp for small same-NUMA dispatches.
+    # Each routed row carries one packed NVFP4 activation, its per-16 scale,
+    # and one FP32 top-k weight.  Cross-NUMA transport continues to use all
+    # four warps because those warps are also reused by the combine sender.
+    dispatch_row_bytes = (
+        (shape.hidden + 1) // 2
+        + (shape.hidden + 15) // 16
+        + 4
+    )
+    expected_remote_dispatch_rows = (
+        shape.tokens_per_rank
+        * shape.num_topk
+        * shape.ep_same_numa_peer_count
+    )
+    remote_dispatch_bytes_per_k1_cta = (
+        expected_remote_dispatch_rows * dispatch_row_bytes / k1_sms
+    )
+    dispatch_warps = (
+        1
+        if (
+            not cross_numa
+            and shape.hidden <= _SINGLE_DISPATCH_WARP_MAX_HIDDEN
+            and shape.num_total_experts <= _SINGLE_DISPATCH_WARP_MAX_EXPERTS
+            and shape.num_topk <= _SINGLE_DISPATCH_WARP_MAX_TOPK
+            and remote_dispatch_bytes_per_k1_cta
+            <= _SINGLE_DISPATCH_WARP_MAX_REMOTE_BYTES_PER_K1_CTA
+        )
+        else 4
+    )
+
+    dispatch_rank_cache = (
+        not cross_numa
+        and shape.expert_parallel_size == 4
+        and shape.ep_same_numa_peer_count == 3
+        and shape.tensor_parallel_size == 1
+        and shape.expected_dispatch_rank_cache_saved_bytes
+        >= _DISPATCH_RANK_CACHE_MIN_SAVED_BYTES
+        and shape.expected_dispatch_rank_cache_saved_fraction
+        >= _DISPATCH_RANK_CACHE_MIN_SAVED_FRACTION
+    )
+
+    rank_local_combine = (
+        not cross_numa
+        and shape.expert_parallel_size == 4
+        and shape.ep_same_numa_peer_count == 3
+        and shape.tensor_parallel_size == 1
+        and shape.expert_parallel_size <= shape.num_topk
+        and dispatch_rank_cache
+        and rows >= _RANK_LOCAL_COMBINE_MIN_ROWS_PER_EXPERT
+    )
+
+    # Q8 is validated for large DSV4-flash EP4 on the 110-SM device only.
+    # It is the K2 hidden-tile work quantum, not K1 descriptor readiness or
+    # the number of token-back combine groups. Preserve all other presets.
+    flash_q8 = (
+        shape.tokens_per_rank >= 8192
+        and (shape.hidden, shape.intermediate, shape.num_topk,
+             shape.num_total_experts) == (4096, 4096, 6, 256)
+        and shape.data_parallel_size == 1
+        and shape.tensor_parallel_size == 1
+        and shape.expert_parallel_size == 4
+        and shape.ep_same_numa_peer_count == 3
+        and not cross_numa
+        and shape.num_sms == 110
+        and comm_backend == "p2p_direct"
+        and (overrides is None or overrides.comm_backend in (None, "p2p_direct"))
+    )
+
+    # Except for the bounded small-message window above, keep production on
+    # the shallow two-slot fast path. Fixed peer/channel CTA ownership and
+    # independent terminal credits provide forward progress without growing
+    # the reuse distance of wide DSV4 rows.
+
+    config = MegaMoEKernelConfig(
+        comm_backend=comm_backend,
+        kernel_comm_backend=kernel_comm_backend,
+        token_back_mode=(
+            "reuse_dispatch_warps" if cross_numa else "epi_warps"
+        ),
+        k1_tile=k1_tile,
+        k2_tile=k2_tile,
+        k2_stages=(
+            3
+            if k2_token_n == 64
+            or (k2_token_n == 128 and rows <= 512.0)
+            else 2
+        ),
+        k2_warps=12 if dual_n8_decode else 8,
+        k1_sms=k1_sms,
+        k2_sms=k2_sms,
+        tx_sms=tx_sms,
+        rx_sms=rx_sms,
+        sm_min_partition=shape.sm_min_partition,
+        sm_partition_alignment=shape.sm_partition_alignment,
+        dispatch_chunk_tokens=dispatch_chunk_tokens,
+        combine_chunk_rows=combine_chunk_rows,
+        dispatch_channels=dispatch_channels,
+        combine_channels=combine_channels,
+        dispatch_slots=dispatch_slots,
+        combine_slots=combine_slots,
+        combine_blocking_put=combine_blocking_put,
+        # Same-NUMA P2P hands off after one window; cross-NUMA IBGDA after
+        # two. This early epoch is independent of terminal slot ACK/credit.
+        dispatch_local_handoff_windows=1,
+        dispatch_remote_handoff_windows=remote_handoff_windows,
+        ibgda_rc_per_pe=1,
+        ibgda_rc_mapping="warp",
+        tp_k3_chunks=(
+            8
+            if shape.tensor_parallel_size == 2
+            and shape.tokens_per_rank >= 8192
+            else 1
+        ),
+        dispatch_warps=dispatch_warps,
+        dispatch_compute_overlap=shape.tokens_per_rank >= 1024,
+        dispatch_rank_cache=dispatch_rank_cache,
+        # This changes BF16 association order: contributions are first
+        # accumulated within each owner rank, rounded to BF16, and then
+        # reduced across owners. The conservative rows threshold keeps auto
+        # selection outside route-sensitive small-input buckets; callers can
+        # still force either semantic path through the explicit override.
+        rank_local_combine=rank_local_combine,
+        k1_ready_queue=True,
+        # Keep the production selector independent of DP layout.  The old
+        # DP-only queue rotation was an experiment, not a portable heuristic.
+        k1_ready_queue_m_rotation=0,
+        k2_ready_queue=True,
+        # Very short expert waves need finer-grained K2 distribution; larger
+        # waves amortize queue traffic with wider hidden-tile bundles.
+        ready_queue_bundle=(
+            8 if flash_q8 else 2
+            if local_decode
+            else 4 if rows <= 128.0 else 8 if rows <= 512.0 else 16
+        ),
+        k2_natural_regs=(k2_token_n == 32 or dual_n8_decode),
+        k2_min_blocks_per_sm=(
+            2 if k2_token_n == 32 or dual_n8_decode else 1
+        ),
+        # Reclaim is neutral for balanced/power-law routing but shortens the
+        # concentrated slow-rank tail. Bucket 7/16 avoid the extra launch.
+        k2_tail_reclaim=(
+            dual_n8_decode
+            and shape.tokens_per_rank >= _TAIL_RECLAIM_MIN_TOKENS_PER_RANK
+        ),
+        expected_rows_per_expert=rows,
+    )
+    if overrides is not None:
+        config = config.with_overrides(overrides)
+    # Measured balanced decode points on the 110-SM EP4 device only.
+    # Neighboring token counts and other shapes retain their existing rules.
+    measured_decode_sms = {64: 88, 16: 80, 32: 88, 128: 88}
+    if (
+        shape.tokens_per_rank in measured_decode_sms
+        and (shape.hidden, shape.intermediate, shape.num_topk,
+             shape.num_total_experts) == (4096, 4096, 6, 256)
+        and shape.data_parallel_size == 1
+        and shape.tensor_parallel_size == 1
+        and shape.expert_parallel_size == 4
+        and shape.ep_same_numa_peer_count == 3
+        and shape.ep_cross_numa_peer_count == 0
+        and shape.num_sms == 110
+        and shape.sm_min_partition == 8
+        and shape.sm_partition_alignment == 8
+        and (overrides is None or overrides.comm_backend in (None, "p2p_direct"))
+        and (overrides is None or all(
+            value is None for name, value in vars(overrides).items()
+            if name != "comm_backend"
+        ))
+    ):
+        decode_k1_sms = measured_decode_sms[shape.tokens_per_rank]
+        config = replace(
+            config,
+            k1_tile=(64, 32 if shape.tokens_per_rank == 128 else 16, 128),
+            k1_sms=decode_k1_sms,
+            k2_sms=110-decode_k1_sms,
+        )
+
+    if (
+        config.comm_backend != "p2p_direct"
+        and (overrides is None or overrides.rank_local_combine is None)
+    ):
+        # A transport override can move an otherwise eligible EP4 shape onto
+        # IBGDA. Auto mode follows the resolved backend; explicit ``on`` is
+        # intentionally rejected by the validation below.
+        config = replace(config, rank_local_combine=False)
+    explicit_dispatch_warps = (
+        overrides is not None and overrides.dispatch_warps is not None
+    )
+    explicit_k2_stages = (
+        overrides is not None and overrides.k2_stages is not None
+    )
+    qualified_cache_streaming = (
+        shape.data_parallel_size == 1
+        # Above the existing RLC threshold, auto already chooses dispatch1.
+        # Do not silently change dispatch selection for callers explicitly
+        # forcing RLC off in an unmeasured large-input configuration.
+        and rows < _RANK_LOCAL_COMBINE_MIN_ROWS_PER_EXPERT
+        and shape.tensor_parallel_size == 1
+        and shape.expert_parallel_size == 4
+        and shape.ep_same_numa_peer_count == 3
+        and not cross_numa
+        and shape.num_sms == _REFERENCE_SM_COUNT
+        and shape.tokens_per_rank >= 1024
+        and (shape.hidden, shape.intermediate, shape.num_topk,
+             shape.num_total_experts) in _RANK_CACHE_STREAMING_QUALIFIED_SHAPES
+        and config.comm_backend == "p2p_direct"
+        and config.token_back_mode == "epi_warps"
+        and config.dispatch_rank_cache
+        and config.dispatch_compute_overlap
+        and config.k1_tile == (64, 128, 128)
+        and config.k2_tile == (64, 128, 128)
+        and config.k2_warps == 8
+        and not config.k2_tail_reclaim
+        and (config.k1_sms, config.k2_sms) == (72, 38)
+    )
+    if qualified_cache_streaming:
+        # Rank caching removes duplicate activation pulls. With streaming
+        # dispatch enabled, the measured N128 path no longer needs four
+        # logical dispatchers even when token-back remains RLC-off.
+        if not explicit_dispatch_warps:
+            config = replace(config, dispatch_warps=1)
+        # Only the vectorized reducer crosses the measured break-even point
+        # at the smaller wave. H7168 still uses the fallback reducer and
+        # retains the existing 256-row threshold.
+        if (
+            (overrides is None or overrides.rank_local_combine is None)
+            and shape.hidden % 2048 == 0
+            and shape.num_topk <= 8
+            and rows >= _VECTOR_RLC_MIN_ROWS_PER_EXPERT
+        ):
+            config = replace(config, rank_local_combine=True)
+    if config.rank_local_combine:
+        # With token-back traffic grouped per owner, the measured critical
+        # path shifts back to K1/K2. One logical dispatcher is sufficient
+        # when rank caching is active, and N128 K2 benefits from stage3.
+        if (
+            not explicit_dispatch_warps
+            and config.dispatch_rank_cache
+            and config.comm_backend == "p2p_direct"
+        ):
+            config = replace(config, dispatch_warps=1)
+        if not explicit_k2_stages and config.k2_tile[1] == 128:
+            config = replace(config, k2_stages=3)
+    if config.total_sms != shape.num_sms:
+        raise ValueError(
+            "resolved SM partitions must cover all device SMs: "
+            f"K1={config.k1_sms}, K2={config.k2_sms}, "
+            f"TX={config.tx_sms}, RX={config.rx_sms}, "
+            f"total={config.total_sms}, expected={shape.num_sms}"
+        )
+    if config.tp_k3_chunks <= 0:
+        raise ValueError("tp_k3_chunks must be positive")
+    if config.dispatch_warps not in (1, 2, 4):
+        raise ValueError("dispatch_warps must be one of 1/2/4")
+    if config.comm_backend != "p2p_direct" and config.dispatch_warps != 4:
+        raise ValueError(
+            "reduced dispatch_warps is currently validated only for "
+            "same-NUMA p2p_direct"
+        )
+    if config.rank_local_combine:
+        if config.comm_backend != "p2p_direct":
+            raise ValueError("rank_local_combine requires p2p_direct")
+        if config.token_back_mode != "epi_warps":
+            raise ValueError("rank_local_combine requires epi_warps token-back")
+        if shape.expert_parallel_size > shape.num_topk:
+            raise ValueError(
+                "rank_local_combine requires expert_parallel_size <= num_topk"
+            )
+        if shape.tensor_parallel_size != 1:
+            raise ValueError("rank_local_combine is currently validated only for TP1")
+        if config.k2_tail_reclaim or config.k2_warps == 12:
+            raise ValueError(
+                "rank_local_combine is not compatible with experimental K2 tail paths"
+            )
+    if config.dispatch_local_handoff_windows <= 0:
+        raise ValueError("dispatch_local_handoff_windows must be positive")
+    if config.dispatch_remote_handoff_windows <= 0:
+        raise ValueError("dispatch_remote_handoff_windows must be positive")
+    if shape.tensor_parallel_size == 1 and config.tp_k3_chunks != 1:
+        raise ValueError("TP1 requires tp_k3_chunks=1")
+    return config
+
+
+__all__ = [
+    "MegaMoEHeuristicInput",
+    "MegaMoEHeuristicOverrides",
+    "MegaMoEKernelConfig",
+    "select_megamoe_config",
+]

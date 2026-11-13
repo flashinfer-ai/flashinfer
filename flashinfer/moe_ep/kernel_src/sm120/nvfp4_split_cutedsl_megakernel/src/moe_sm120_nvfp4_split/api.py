@@ -1,0 +1,468 @@
+"""Production construction API for SM120 Split-MegaMoE.
+
+This module intentionally does not import :mod:`mega_runner`.  Frameworks own
+input conversion, symmetric-buffer allocation, Green Context streams and graph
+capture; this API owns deterministic heuristic selection, CuTe kernel
+construction and the opaque workspace contract.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, replace
+from hashlib import sha256
+from functools import lru_cache
+import json
+from typing import Any, Dict, Optional, Tuple
+
+from .heuristic import (
+    MegaMoEHeuristicInput,
+    MegaMoEHeuristicOverrides,
+    MegaMoEKernelConfig,
+    select_megamoe_config,
+    select_compatibility_config,
+)
+from .jit_config import Sm120JitConfig
+
+
+# Bump when a generated-kernel ABI or opaque workspace layout changes. Version
+# 5 adds exact N16/N32 SFB fragment selection. Version 6 makes dual-N8 ready
+# ownership cover the complete N128 SFB TMA slab. Version 7 adds the shared
+# K2 main/drain queue and graph-ordered tail finalizer contract. Version 8
+# publishes K2 work only after every FC1 K bundle in the ready block completes.
+# Version 16 narrows rank-local queue/handoff publication to GPU scope and
+# removes reset/finalizer graph nodes from the ordinary tail-reclaim-off path.
+# Version 17 adds opt-in dispatch-rank cache storage. Version 18 adds the
+# explicit rank-local combine workspace and K3 publication contract. Version
+# 19 publishes each source epoch through the device-side dispatch sideband.
+# Version 20 adds the rank-local replay-entry ownership barrier before any
+# peer-written sideband state is published.
+# Rank-local combine now reserves a source-generated contributor-plan plane.
+# Version 22 refreshes generated code for whole-warp rank-local reduction;
+# the workspace layout and completion protocol are unchanged.
+KERNEL_CACHE_ABI = 2812
+
+
+@dataclass(frozen=True)
+class MegaMoEProblemSpec:
+    """Static problem dimensions consumed by one EP-rank kernel instance.
+
+    ``intermediate`` is the gate+up width stored by this rank.  For TP it is
+    the already-sharded local width, matching the local weight tensors.
+    """
+
+    tokens_per_rank: int
+    num_topk: int
+    num_total_experts: int
+    hidden: int
+    intermediate: int
+    expert_parallel_size: int
+    expert_parallel_rank: int
+    data_parallel_size: int = 1
+    tensor_parallel_size: int = 1
+    gate_up_clamp: Optional[float] = None
+
+    @property
+    def num_experts_per_rank(self) -> int:
+        return self.num_total_experts // self.expert_parallel_size
+
+    def validate(self) -> None:
+        positive = {
+            "tokens_per_rank": self.tokens_per_rank,
+            "num_topk": self.num_topk,
+            "num_total_experts": self.num_total_experts,
+            "hidden": self.hidden,
+            "intermediate": self.intermediate,
+            "expert_parallel_size": self.expert_parallel_size,
+            "data_parallel_size": self.data_parallel_size,
+            "tensor_parallel_size": self.tensor_parallel_size,
+        }
+        if any(type(value) is not int for value in positive.values()):
+            raise ValueError('Problem and topology dimensions must be integers')
+        invalid = {name: value for name, value in positive.items() if value <= 0}
+        if invalid:
+            raise ValueError(f"problem dimensions must be positive: {invalid}")
+        if self.num_total_experts % self.expert_parallel_size:
+            raise ValueError(
+                "num_total_experts must be divisible by expert_parallel_size"
+            )
+        if not 0 <= self.expert_parallel_rank < self.expert_parallel_size:
+            raise ValueError("expert_parallel_rank is outside the EP group")
+        if self.num_topk > self.num_total_experts:
+            raise ValueError("num_topk cannot exceed num_total_experts")
+        if self.hidden % 32 or self.intermediate % 64:
+            raise ValueError(
+                "SM120 NVFP4 requires hidden % 32 == 0 and "
+                "intermediate % 64 == 0"
+            )
+        if self.gate_up_clamp is not None and self.gate_up_clamp < 0:
+            raise ValueError("gate_up_clamp must be non-negative")
+
+
+@dataclass(frozen=True)
+class SplitKernelBuildOptions:
+    """Production host-side options shared by K1 and K2 construction."""
+
+    group_hint: Optional[int] = None
+    flag_batch: int = 4
+    epi_flag_batch: Optional[Tuple[int, int]] = (1, 1)
+    concurrent_k1_k2: bool = True
+    k1_active_clusters: Optional[int] = None
+    k2_active_clusters: Optional[int] = None
+
+    def validate(self) -> None:
+        if self.flag_batch <= 0:
+            raise ValueError("flag_batch must be positive")
+        for name, value in (
+            ("k1_active_clusters", self.k1_active_clusters),
+            ("k2_active_clusters", self.k2_active_clusters),
+        ):
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive")
+
+
+@dataclass(frozen=True)
+class MegaMoECompileSpec:
+    """Complete immutable specialization record for one compiled kernel set."""
+
+    problem: MegaMoEProblemSpec
+    kernel: MegaMoEKernelConfig
+    jit: Sm120JitConfig = Sm120JitConfig()
+    build: SplitKernelBuildOptions = SplitKernelBuildOptions()
+
+    def __post_init__(self) -> None:
+        self.problem.validate()
+        self.build.validate()
+        if self.kernel.k2_tail_reclaim and not self.build.concurrent_k1_k2:
+            raise ValueError("K2 tail reclaim requires concurrent green execution")
+        # Explicit JIT stage override wins and is reflected in the canonical
+        # specialization record, avoiding a hidden second stage selector.
+        if self.jit.num_ab_stages_override is not None:
+            object.__setattr__(self, "kernel", replace(
+                self.kernel, k1_stages=self.jit.num_ab_stages_override))
+        if self.kernel.total_sms <= 0:
+            raise ValueError("kernel SM partition must be non-empty")
+
+    def canonical_dict(self) -> Dict[str, Any]:
+        return {
+            "cache_abi": KERNEL_CACHE_ABI,
+            "architecture": "sm_120a",
+            "weight_dtype": "nvfp4_e2m1_block16_e4m3",
+            "activation_dtype": "nvfp4_e2m1_block16_e4m3",
+            "weight_layout": "packed_k_major_x2",
+            "problem": asdict(self.problem),
+            "kernel": asdict(self.kernel),
+            "jit": self.jit.canonical_dict(),
+            "build": asdict(self.build),
+        }
+
+    @property
+    def cache_key(self) -> str:
+        payload = json.dumps(
+            self.canonical_dict(),
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return (
+            f"sm120-nvfp4-split-v{KERNEL_CACHE_ABI}-"
+            f"{sha256(payload).hexdigest()}"
+        )
+
+
+@dataclass(frozen=True)
+class SplitKernelBundle:
+    """Constructed K1/K2 objects and their shared opaque-workspace contract."""
+
+    k1: Any
+    k2: Any
+    k2_drain: Optional[Any]
+    k2_finalizer: Optional[Any]
+    local_workspace_bytes: int
+    shared_workspace_bytes: int
+    cache_key: str
+
+
+def is_calibrated_execution(
+    *,
+    build: Optional[SplitKernelBuildOptions] = None,
+    jit: Optional[Sm120JitConfig] = None,
+    dual_k2_ctas_per_sm: int = 2,
+    complete_pipeline: bool = True,
+) -> bool:
+    """Whether the candidate cost model describes these execution options.
+
+    Nondefault options remain supported through the compatibility selector.
+    This is an evidence boundary, not a kernel legality restriction.
+    """
+    if type(dual_k2_ctas_per_sm) is not int or dual_k2_ctas_per_sm <= 0:
+        raise ValueError("dual K2 CTAs/SM must be a positive integer")
+    if type(complete_pipeline) is not bool:
+        raise ValueError("complete_pipeline must be bool")
+    if build is not None:
+        build.validate()
+    return (
+        dual_k2_ctas_per_sm == 2 and complete_pipeline
+        and
+        (build is None or build == SplitKernelBuildOptions())
+        and (jit is None or jit == Sm120JitConfig())
+    )
+
+
+@lru_cache(maxsize=256)
+def select_compile_spec(
+    *,
+    problem: MegaMoEProblemSpec,
+    ep_same_numa_peer_count: int,
+    ep_cross_numa_peer_count: int,
+    num_sms: int,
+    sm_min_partition: int,
+    sm_partition_alignment: int,
+    overrides: Optional[MegaMoEHeuristicOverrides] = None,
+    numerical_contract: str = "ordinary_topk",
+    host_expert_counts: Optional[Tuple[int, ...]] = None,
+    tuning_config=None,
+    hardware: Optional[str] = None,
+    jit: Optional[Sm120JitConfig] = None,
+    build: Optional[SplitKernelBuildOptions] = None,
+) -> MegaMoECompileSpec:
+    """Resolve and reuse an immutable compile spec (bounded process-local cache).
+
+    The key includes the EP rank, build/JIT options, numerical contract, already
+    host route counts and the content-identified offline tuning profile. No GPU
+    objects, tensor pointers or CUDA contexts are retained by this cache.
+    """
+
+    problem.validate()
+    heuristic_input = MegaMoEHeuristicInput(
+        tokens_per_rank=problem.tokens_per_rank,
+        hidden=problem.hidden,
+        intermediate=problem.intermediate,
+        num_topk=problem.num_topk,
+        num_total_experts=problem.num_total_experts,
+        data_parallel_size=problem.data_parallel_size,
+        tensor_parallel_size=problem.tensor_parallel_size,
+        expert_parallel_size=problem.expert_parallel_size,
+        ep_same_numa_peer_count=ep_same_numa_peer_count,
+        ep_cross_numa_peer_count=ep_cross_numa_peer_count,
+        num_sms=num_sms,
+        sm_min_partition=sm_min_partition,
+        sm_partition_alignment=sm_partition_alignment,
+    )
+    # Nondefault launch/JIT plumbing changes actual CTA/supply/resource features.
+    # Preserve it explicitly via compatibility fallback until separately calibrated.
+    selected = (
+        select_compatibility_config(heuristic_input, overrides,
+            numerical_contract=numerical_contract)
+        if not is_calibrated_execution(build=build, jit=jit) else
+        select_megamoe_config(heuristic_input, overrides,
+            numerical_contract=numerical_contract, host_expert_counts=host_expert_counts,
+            tuning_config=tuning_config, hardware=hardware)
+    )
+    return MegaMoECompileSpec(
+        problem=problem,
+        kernel=selected,
+        jit=jit or Sm120JitConfig(),
+        build=build or SplitKernelBuildOptions(),
+    )
+
+
+def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
+    """Construct K1/K2/K2-tail objects without benchmark-runner dependencies."""
+
+    import cutlass
+
+    from moe_sm120_nvfp4_split.support.common.megamoe_constants import SfPaddingBlock
+    from .kernel_dispatch_fc1 import build_sm120_dispatch_fc1_kernel
+    from .kernel_fc2_combine import Sm120Fc2CombineKernel
+    from .kernel_fc2_combine_n16_dual import (
+        Sm120Fc2CombineN16DualGroupKernel,
+    )
+    from .kernel_k2_finalizer import Sm120K2TailFinalizerKernel
+    from .sm120_mma import CTA_TOKEN_TILE
+
+    problem = spec.problem
+    config = spec.kernel
+    options = spec.build
+    cluster_size = 1
+    k1_clusters = options.k1_active_clusters or config.k1_sms // cluster_size
+    k2_clusters = options.k2_active_clusters or config.k2_sms // cluster_size
+    k2_ctas_per_sm = 2 if config.k2_warps == 12 else 1
+    k2_launch_clusters = k2_clusters * k2_ctas_per_sm
+    k1_group_hint = options.group_hint or k1_clusters
+    k2_group_hint = options.group_hint or k2_launch_clusters
+
+    k1_token_n = config.k1_tile[1]
+    k2_token_n = config.k2_tile[1]
+    ready_token_n = max(k1_token_n, k2_token_n)
+    if config.k2_warps == 12 and k2_token_n == 16:
+        # K2 stages one N128 SFB slab even though each consumer owns N16.
+        # Do not publish any child tile while K1 can still update sibling
+        # scale rows covered by the same TMA transaction.
+        ready_token_n = max(ready_token_n, 128)
+    token_padding_block = min(CTA_TOKEN_TILE, k1_token_n)
+    if (
+        ready_token_n % k1_token_n
+        or ready_token_n % k2_token_n
+        or k1_token_n % token_padding_block
+    ):
+        raise ValueError("K1/K2 token tiles do not share a valid ready block")
+
+    common_kwargs = dict(
+        cluster_shape_mnk=(1, 1, 1),
+        use_2cta_instrs=False,
+        token_padding_block=token_padding_block,
+        sf_padding_block=SfPaddingBlock,
+        fc1_ready_tile_tokens=k1_token_n,
+        fc1_producer_tile_tokens=k1_token_n,
+        k2_token_tile_tokens=k2_token_n,
+        k2_ready_tile_tokens=ready_token_n,
+        static_expert_shape=(
+            problem.num_experts_per_rank,
+            problem.intermediate,
+            problem.hidden,
+        ),
+        force_static_sched=True,
+        clc_bundle_size=None,
+        num_sched_stages=None,
+        world_size=problem.expert_parallel_size,
+        local_rank=problem.expert_parallel_rank,
+        num_topk=problem.num_topk,
+        max_tokens_per_rank=problem.tokens_per_rank,
+        hidden=problem.hidden,
+        comm_backend=config.kernel_comm_backend,
+        ibgda_dispatch_chunk_tokens=config.dispatch_chunk_tokens,
+        fc2_output_dtype=cutlass.BFloat16,
+        token_back_mode=config.token_back_mode,
+        apply_topk_in_fc1=False,
+        gate_up_clamp=problem.gate_up_clamp,
+        flag_batch=options.flag_batch,
+        epi_flag_batch=options.epi_flag_batch,
+        dispatch_warps=config.dispatch_warps,
+        dispatch_compute_overlap=config.dispatch_compute_overlap,
+        dispatch_rank_cache=config.dispatch_rank_cache,
+        rank_local_combine=config.rank_local_combine,
+        k1_ready_queue_workspace=config.k1_ready_queue,
+        k2_ready_queue=config.k2_ready_queue,
+        k2_ready_queue_bundle=config.ready_queue_bundle,
+        k2_natural_regs=config.k2_natural_regs,
+        k2_min_blocks_per_sm=config.k2_min_blocks_per_sm,
+        k1_ready_queue_m_rotation=config.k1_ready_queue_m_rotation,
+        jit_config=spec.jit,
+    )
+
+    k1 = build_sm120_dispatch_fc1_kernel(
+        group_hint=k1_group_hint,
+        num_ab_stages_override=config.k1_stages,
+        mma_tiler_mnk=config.k1_tile,
+        load_balance_mode="static",
+        k2_tail_reclaim=config.k2_tail_reclaim,
+        green_trace_role=0,
+        **common_kwargs,
+    )
+    k1.compact_token_rows = config.k1_compact_tokens
+    k2_load_balance = (
+        "atomic_counter" if config.k2_tail_reclaim else "static"
+    )
+    k2_common = dict(
+        group_hint=k2_group_hint,
+        mma_tiler_mnk=config.k2_tile,
+        num_ab_stages_override=config.k2_stages,
+        compact_k2=(config.k2_warps in (8, 12) or config.k2_tile[1] == 256),
+        load_balance_mode=k2_load_balance,
+        k2_tail_reclaim=config.k2_tail_reclaim,
+        skip_global_tail=(config.k2_tail_reclaim or config.k2_warps == 12),
+        producer_sm_count=(
+            k1_clusters * cluster_size if options.concurrent_k1_k2 else 0
+        ),
+        green_trace_role=1,
+    )
+    k2_kernel_cls = (
+        Sm120Fc2CombineN16DualGroupKernel
+        if config.k2_warps == 12
+        else Sm120Fc2CombineKernel
+    )
+    k2 = k2_kernel_cls(**k2_common, **common_kwargs)
+    k2.compact_token_rows = config.k2_compact_tokens
+
+    k2_drain = None
+    k2_finalizer = None
+    if config.k2_tail_reclaim:
+        drain_common = dict(k2_common)
+        drain_common.update(
+            group_hint=k2_group_hint,
+            load_balance_mode="atomic_counter",
+            k2_tail_reclaim=True,
+            producer_sm_count=0,
+            green_trace_role=2,
+        )
+        k2_drain = k2_kernel_cls(**drain_common, **common_kwargs)
+        k2_drain.compact_token_rows = config.k2_compact_tokens
+
+    if config.k2_tail_reclaim or config.k2_warps == 12:
+        finalizer_common = dict(k2_common)
+        finalizer_common.update(
+            group_hint=1,
+            load_balance_mode="static",
+            k2_tail_reclaim=config.k2_tail_reclaim,
+            producer_sm_count=0,
+            skip_global_tail=False,
+            green_trace_role=3,
+        )
+        k2_finalizer = Sm120K2TailFinalizerKernel(
+            **finalizer_common, **common_kwargs
+        )
+
+    expected_threads = 32 * (11 if config.k2_warps == 12 else config.k2_warps)
+    if k2.threads_per_cta != expected_threads:
+        raise RuntimeError(
+            f"K2 requested {expected_threads} threads, got {k2.threads_per_cta}"
+        )
+    workspace_sizes = k1.get_workspace_sizes()
+    peers = [k2]
+    if k2_drain is not None:
+        peers.append(k2_drain)
+    if k2_finalizer is not None:
+        peers.append(k2_finalizer)
+    if any(peer.get_workspace_sizes() != workspace_sizes for peer in peers):
+        raise RuntimeError("K1/K2 workspace layouts are not byte-identical")
+
+    return SplitKernelBundle(
+        k1=k1,
+        k2=k2,
+        k2_drain=k2_drain,
+        k2_finalizer=k2_finalizer,
+        local_workspace_bytes=workspace_sizes[0],
+        shared_workspace_bytes=workspace_sizes[1],
+        cache_key=spec.cache_key,
+    )
+
+
+def compile_combine_reduce(*args, **kwargs):
+    """Compile K3 lazily so importing the host API does not initialize CuTe."""
+
+    from .kernel_combine_reduce import compile_topk_reduce
+
+    return compile_topk_reduce(*args, **kwargs)
+
+
+def compile_rank_local_combine(*args, **kwargs):
+    """Compile the explicit owner-local BF16 K3 reduction lazily."""
+
+    from .kernel_rank_local_combine import compile_rank_local_combine as compile_k3
+
+    return compile_k3(*args, **kwargs)
+
+
+__all__ = [
+    "KERNEL_CACHE_ABI",
+    "MegaMoECompileSpec",
+    "MegaMoEProblemSpec",
+    "SplitKernelBuildOptions",
+    "SplitKernelBundle",
+    "Sm120JitConfig",
+    "build_split_kernels",
+    "compile_combine_reduce",
+    "compile_rank_local_combine",
+    "select_compile_spec",
+    "is_calibrated_execution",
+]
