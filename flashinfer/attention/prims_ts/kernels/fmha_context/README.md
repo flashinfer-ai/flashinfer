@@ -45,7 +45,7 @@ Batch is exact; fixed contiguous Q/KV extents are exact, while packed/paged
 request lengths stay within the provided Q/KV bounds. Every `run()` supplies
 current tensors/metadata and launches the prepared execution.
 
-The contiguous plan fixes `packed` (BSHD or THD); paged plans also fix page size
+The contiguous plan fixes `packed_query` (BSHD or THD); paged plans also fix page size
 and optional `uniform_packed_lengths`, `has_q_offset`, and zero-V-tail promises.
 Plans retain float or CUDA tensor defaults for each global scale independently.
 Variable-window plans allocate fallback CTA-minimum metadata; paged plans need
@@ -71,6 +71,7 @@ Validation can read metadata values on the host. Trusted/captured execution uses
 | Scheduling | Automatic nonpersistent, static-persistent, or CLC-persistent selection; no public tuning knob |
 | Accumulation | FP32 QK/PV and softmax state; INT8 Q/K accumulate INT32 scores that the softmax reads as FP32 |
 | Sage attention | Contiguous dense fixed-length plans with `head_dim=128`, `torch.float8_e4m3fn` or `torch.int8` (SM100a only) Q/K, `torch.float8_e4m3fn` V and a 16-bit output: `plan(sage=SageAttentionConfig(...))`, `run(sage=SageAttentionParams(...))`; see [Sage attention](../../README.md#sage-attention) |
+| Softmax statistics | Optional caller-owned FP32 maximum/denominator output for plain attention; not combined with Sage/VC, MXFP8 Q/K, or attention sinks |
 
 See the shared [validation scope](../../README.md#validation-scope) for the
 measured hardware and DSL versions, including SM103/GB300 coverage of the
@@ -90,8 +91,17 @@ or `total_q` and `total_k` for packed storage—must each be at most
 reserves 255 values for the padded tail of the largest supported 256-row query
 work tile.
 
-Q and `out`, and contiguous-path K/V, must be compact, 16-byte-aligned CUDA
-tensors on one device. Paged K/V accepts positive, non-overlapping page/head/token
+Q, K, V, and `out` must be 16-byte-aligned CUDA tensors on one device.
+Q, K, and `out` must be compact on the contiguous path. Contiguous-context V
+permits padding between token rows and batches: its head/feature strides must
+be `(Dv, 1)`, its token stride must be at least `Hkv * Dv`, and a fixed-batch
+stride must be at least `(Sk - 1) * token_stride + Hkv * Dv`. Token and batch
+strides must be multiples of 16 bytes. These strides are runtime values, so
+compact and padded V reuse the same plan and compiled kernel without a copy.
+This applies to every supported V dtype and head dimension, including MLA.
+Captured CUDA graphs retain the captured V address and strides; update its
+contents in place, or recapture to change the view.
+Paged K/V accepts positive, non-overlapping page/head/token
 strides aligned to 16 bytes and unit head-dimension stride. The strides are
 runtime TensorMap inputs, so interleaved K/V slices need no repacking.
 Cumulative offsets, sequence lengths, and variable-window metadata must
@@ -101,7 +111,39 @@ below. A caller-provided `out` must not overlap Q, K, V, any runtime metadata,
 or active wrapper-owned scratch. This is an unchecked caller
 precondition in both validation modes. The default API returns O; an enabled
 LSE plan can also return final FP32 LSE, as described below. Intermediate
-softmax state remains internal.
+softmax state remains internal unless explicitly requested.
+
+Set `plan(store_softmax_stats=True)` and supply `run(..., softmax_stats=stats)`
+to export compact FP32 `[*out.shape[:-1], 2]` statistics. The pair is the
+maximum scaled token logit `m` in natural-log units and
+`s = sum(exp(logit - m))`, with internal FP8 probability scaling removed.
+`output_scale` does not affect it. The buffer must be disjoint from inputs,
+outputs, LSE, metadata, and plan-owned storage. Its presence is checked even
+with `validate=False`; CUDA graphs retain the captured address. One-shot APIs
+accept the same flag and buffer, and the LSE API/return value remain unchanged.
+No additional statistics scratch is required for prefill.
+Statistics-enabled softmax centers raw scores before scaling and retains FP32
+probability sums instead of the optional packed-FP16 exponent/sum path. The
+statistics-disabled exponent policy is unchanged.
+Statistics retain the exact running maximum while skipping O rescaling only
+when the maximum is unchanged or there is no prior contribution. Low-level
+`FmhaTs` callers must select `corr_skip_threshold_log2=0` before exporting
+statistics; positive lazy-update thresholds are rejected. The independent
+`enable_skip_correction` switch does not change the statistics contract.
+
+Dense contiguous statistics retain valid-query empty-KV chunks and write zero
+output with `(-inf, 0)` statistics. Physical packed K/V storage must contain at
+least one token. Paged context statistics require positive per-request KV lengths.
+Statistics-disabled empty-request skipping is unchanged.
+
+Packed dense contiguous context uses each request's live KV extent for every
+task's loop domain, including during graph replay. This applies to homogeneous
+FP16, BF16, and E4M3 inputs with FP16/BF16 output and paired QK/V dimensions
+128/128 or 192/128 on supported architectures. Empty statistics rows retain
+one masked tile so the epilogue still writes zero O and `(-inf, 0)` statistics.
+Fixed/uniform-packed inputs, single-instance and two-CTA schedules, causal and
+windowed attention, paged KV, mixed-precision inputs, and VC/Sage/MXFP8 recipes
+retain their existing domain policies.
 
 ## Tensor and metadata layouts
 
@@ -113,7 +155,8 @@ Contiguous inputs:
   V: `[total_kv, Hkv, Dv]`; O: `[total_q, Hq, Dv]`.
 - Supported contiguous `(Dqk, Dv)` pairs: `(128, 128)`, `(192, 128)`,
   `(192, 192)`, and `(256, 256)`. The 192/128 path uses separate Q, K, and V tensors
-  with compact rows; callers do not pad the head dimension.
+  with compact heads/features; callers do not pad the head dimension. V may
+  have aligned token-row/batch padding as described above.
 - Packed metadata: compact CUDA `int32[B + 1]` `qo_indptr` and `kv_indptr`.
   Both start at zero, are nondecreasing, and end at the corresponding packed
   tensor extent.

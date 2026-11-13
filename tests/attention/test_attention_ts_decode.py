@@ -2688,6 +2688,8 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "workspace_buffer",
         "max_kv_len",
         "validate",
+        "store_softmax_stats",
+        "softmax_stats",
     )
     assert tuple(inspect.signature(BatchDecodePagedTSWrapper.__init__).parameters) == (
         "self",
@@ -2721,6 +2723,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "initialize_workspace",
         "softmax_scale",
         "output_scale",
+        "store_softmax_stats",
     )
     run_parameters = inspect.signature(BatchDecodePagedTSWrapper.run).parameters
     assert tuple(run_parameters) == (
@@ -2740,9 +2743,18 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "return_lse",
         "attention_sinks",
         "validate",
+        "softmax_stats",
     )
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
+    assert run_parameters["softmax_stats"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert run_parameters["softmax_stats"].default is None
+    assert (
+        inspect.signature(BatchDecodePagedTSWrapper.plan)
+        .parameters["store_softmax_stats"]
+        .default
+        is False
+    )
 
     assert _DecodePlanState.__dataclass_params__.frozen is True
     assert {"batch_size", "max_kv_len", "max_q_len", "seq_lens_kv"}.issubset(
@@ -5118,6 +5130,7 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
         (),
         {
             "device": torch.device("cpu"),
+            "config": FmhaDecodeConfig(),
             "out_dtype": torch.bfloat16,
             "lse_mode": "none",
             "use_attention_sinks": False,
@@ -5191,6 +5204,7 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
         "_DecodeQModePlanState",
         (),
         {
+            "config": FmhaDecodeConfig(),
             "packed_query": True,
             "device": torch.device("cuda:0"),
             "batch_size": 2,
@@ -5216,6 +5230,7 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
         "_DecodeQModePlanState",
         (),
         {
+            "config": FmhaDecodeConfig(),
             "packed_query": False,
             "device": torch.device("cuda:0"),
             "batch_size": 2,
