@@ -625,6 +625,10 @@ class PcieIpcAllReduceRunner(TunableRunner):
             getattr(ws, "slow_hops", 0),
         )
 
+    def release_buffers(self) -> None:
+        """Drop the profiling outputs; the next profiled shape allocates again."""
+        self._buf_cache.clear()
+
     def _output_for(self, inp: torch.Tensor) -> torch.Tensor:
         key = (tuple(inp.shape), inp.dtype)
         out = self._buf_cache.get(key)
