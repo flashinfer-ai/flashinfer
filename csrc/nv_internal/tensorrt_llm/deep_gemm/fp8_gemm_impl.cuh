@@ -363,6 +363,15 @@ __global__ void __launch_bounds__(
         }
       });
 
+      // Finite-sanitize the accumulator before the bf16 STSM write-back. Cross-boundary
+      // padding rows accumulate over in-bounds-but-stale fp8 input and can reach Inf/NaN;
+      // although that is clipped at the store, the bf16 NaN can bleed into a valid row
+      // through the reused shared-memory staging buffer (smem_d). Valid rows are always
+      // finite, so zeroing non-finite lanes leaves every real output element unchanged.
+#pragma unroll
+      for (int _q = 0; _q < WGMMA::kNumAccum; ++_q) {
+        if (!isfinite(final_accum[_q])) final_accum[_q] = 0.f;
+      }
       // Write back to shared memory using STSM
       DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
 #pragma unroll
@@ -738,6 +747,15 @@ __global__ void __launch_bounds__(
         }
       });
 
+      // Finite-sanitize the accumulator before the bf16 STSM write-back. Cross-boundary
+      // padding rows accumulate over in-bounds-but-stale fp8 input and can reach Inf/NaN;
+      // although that is clipped at the store, the bf16 NaN can bleed into a valid row
+      // through the reused shared-memory staging buffer (smem_d). Valid rows are always
+      // finite, so zeroing non-finite lanes leaves every real output element unchanged.
+#pragma unroll
+      for (int _q = 0; _q < WGMMA::kNumAccum; ++_q) {
+        if (!isfinite(final_accum[_q])) final_accum[_q] = 0.f;
+      }
       // Write back to shared memory using STSM
       DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
       int tid = 0;
