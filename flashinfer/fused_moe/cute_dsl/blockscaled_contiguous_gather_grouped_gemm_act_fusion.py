@@ -30,7 +30,7 @@ grouped GEMM kernel with fused gather and activation designed for MoE GEMM1 laye
 - Output C: activated outputs in permuted order
 
 Key features:
-- NVFP4 x NVFP4 and MXFP8 x MXFP4 grouped GEMM paths
+- NVFP4 x NVFP4, MXFP4 x MXFP4 and MXFP8 x MXFP4 grouped GEMM paths
 - Fused gather operation using LDGSTS instructions with token_id_mapping
 - Eliminates the need for a separate moe_permute kernel
 - Fused FC1 activation in the epilogue
@@ -554,9 +554,11 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             on the input device. With I = this shard's intermediate_size and
             M = permuted_m, their full-width shapes are (M, I) and
             (32, 4, M//128, 4, ceil(2*I/64), 1), respectively.
-        global_scale: Global scale factor for FP4 output quantization, shape
+        global_scale: Global scale factor for NVFP4 output quantization, shape
             (1,), float32. With ``routing_weights``, one value per expert,
-            shape (num_experts,).
+            shape (num_experts,). Must be None for MXFP4 output and is not
+            read for MXFP8 output: their E8M0 block scales carry the whole
+            scale.
         a_per_token_scale: Optional per-token row scale for operand A,
             shape (seq_len,), float32. Indexed by the original token ID and
             applied before the fused activation.
@@ -565,7 +567,10 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         b_dtype: Data type for the B matrix.
         sf_dtype: Data type for scale factors. Default: "float8_e4m3fn"
         c_dtype: Data type for output matrix. Default: "bfloat16"
-        sf_vec_size: Scale factor vector size. Use 16 for W4A4 or 32 for W4A8.
+        sf_vec_size: Scale factor vector size: 16 for NVFP4, 32 for MXFP4
+            and MXFP8. With quantize_output, the output uses the same format
+            as A: NVFP4 (E4M3 scales and global_scale), or E8M0 block-32
+            scales for MXFP4 (c_dtype float4_e2m1fn) and MXFP8.
         quantize_output: If True, quantize the epilogue output to a
             block-scaled format and generate out_scale. This is separate from
             c_dtype because float8_e4m3fn may also be used as a plain output
@@ -748,8 +753,19 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             raise ValueError(
                 f"Output scale generation is unsupported for c_dtype={c_dtype}"
             )
-        if c_dtype == "float4_e2m1fn" and global_scale is None:
-            raise ValueError("global_scale is required when c_dtype is 'float4_e2m1fn'")
+        # E8M0 block-32 scales select MX output (MXFP4 or MXFP8), which has
+        # no global scale; E4M3 scales select NVFP4, which requires one.
+        is_mx_output = sf_dtype == "float8_e8m0fnu" and sf_vec_size == 32
+        if c_dtype == "float4_e2m1fn" and not is_mx_output and global_scale is None:
+            raise ValueError(
+                "global_scale is required for NVFP4 output (c_dtype "
+                "'float4_e2m1fn' with E4M3 scale factors)"
+            )
+        if c_dtype == "float4_e2m1fn" and is_mx_output and global_scale is not None:
+            raise ValueError(
+                "global_scale must be None for MXFP4 output: the E8M0 block "
+                "scales carry the whole scale"
+            )
         # The output scale-factor tensor is laid out in whole 128-row MMA atoms.
         if permuted_m % 128 != 0:
             raise ValueError(
@@ -954,14 +970,15 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     )
 
     if generate_sfc:
-        # CuTeDSL supports FP32 -> E8M0 conversion, but the MXFP8 epilogue
-        # deliberately emits the exact UE8M0 codes used by mxfp8_quantize and
-        # scalar-stores them as bytes. This also avoids the unsupported
-        # vector<2xE8M0> conversion/store lowering; GEMM2 reinterprets the same
-        # bytes as Float8E8M0FNU scale factors.
+        # CuTeDSL supports FP32 -> E8M0 conversion, but the MXFP8/MXFP4
+        # epilogue deliberately emits the exact UE8M0 codes used by
+        # mxfp8_quantize / mxfp4_quantize and scalar-stores them as bytes. This
+        # also avoids the unsupported vector<2xE8M0> conversion/store lowering;
+        # GEMM2 reinterprets the same bytes as Float8E8M0FNU scale factors.
         c_sf_storage_dtype = (
             cutlass.Uint8
-            if c_dtype == "float8_e4m3fn" and sf_dtype == "float8_e8m0fnu"
+            if c_dtype in ("float8_e4m3fn", "float4_e2m1fn")
+            and sf_dtype == "float8_e8m0fnu"
             else sf_dtype_cutlass
         )
         c_sf_ptr = make_ptr(

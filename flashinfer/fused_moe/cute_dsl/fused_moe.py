@@ -280,6 +280,38 @@ def _validate_mxfp_weight_dtype(
         )
 
 
+def _check_mxfp4_config(
+    swap_ab: bool, output_dtype: torch.dtype, device: Union[str, torch.device]
+) -> None:
+    """Check the ``quant_mode="mxfp4"`` (MXFP4 x MXFP4) configuration."""
+    if swap_ab:
+        raise NotImplementedError("quant_mode='mxfp4' supports only swap_ab=False")
+    if output_dtype is not torch.bfloat16:
+        raise ValueError("quant_mode='mxfp4' supports only bfloat16 output")
+    device = torch.device(device)
+    if (
+        device.type == "cuda"
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability(device) == (10, 7)
+    ):
+        raise ValueError("quant_mode='mxfp4' is not supported on SM107")
+
+
+def _validate_mxfp4_inputs(
+    x: torch.Tensor,
+    w1_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    per_token_scale: Optional[torch.Tensor],
+) -> None:
+    """Check the ``quant_mode="mxfp4"`` tensor contract before any GPU work."""
+    if x.dtype is not torch.uint8:
+        raise TypeError("quant_mode='mxfp4' requires packed uint8 (E2M1) input")
+    if w1_weight.dtype is not torch.uint8 or w2_weight.dtype is not torch.uint8:
+        raise TypeError("quant_mode='mxfp4' requires packed uint8 (E2M1) weights")
+    if per_token_scale is not None:
+        raise ValueError("per_token_scale is not supported for quant_mode='mxfp4'")
+
+
 def validate_w4a8_inputs(
     x: torch.Tensor,
     x_sf: torch.Tensor,
@@ -289,26 +321,28 @@ def validate_w4a8_inputs(
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
     weight_elems_per_byte: int = 2,
+    activation_elems_per_byte: int = 1,
 ) -> None:
     """Validate mixed-format contracts not checked by the GEMM entry points.
 
-    ``weight_elems_per_byte`` is 2 for packed FP4 weights and 1 for 8-bit weights.
+    ``weight_elems_per_byte`` is 2 for packed FP4 weights and 1 for 8-bit weights;
+    ``activation_elems_per_byte`` is 1 for MXFP8 and 2 for packed MXFP4 input.
     """
-    expected_x_sf = (x.shape[0], x.shape[1] // 32)
+    expected_x_sf = (x.shape[0], x.shape[1] * activation_elems_per_byte // 32)
     if tuple(x_sf.shape) != expected_x_sf:
         raise ValueError(f"x_sf must have shape {expected_x_sf}")
     if x_sf.dtype is not torch.uint8:
         raise TypeError(
-            "W4A8 x_sf must have dtype torch.uint8; view e8m0 scales as uint8"
+            "MX x_sf must have dtype torch.uint8; view e8m0 scales as uint8"
         )
     if token_final_scales.dtype is not torch.float32:
-        raise TypeError("W4A8 token_final_scales must have dtype torch.float32")
+        raise TypeError("MX token_final_scales must have dtype torch.float32")
     for name, weight, scale in (
         ("w1_weight_sf", w1_weight, w1_weight_sf),
         ("w2_weight_sf", w2_weight, w2_weight_sf),
     ):
         if scale.dtype is not torch.uint8:
-            raise TypeError(f"W4A8 {name} must have dtype torch.uint8")
+            raise TypeError(f"MX {name} must have dtype torch.uint8")
         rows, columns = weight.shape[1], weight.shape[2] * weight_elems_per_byte
         m_tiles, k_tiles = (rows + 127) // 128, (columns + 127) // 128
         shape = (32, 4, m_tiles, 4, k_tiles, weight.shape[0])
@@ -390,13 +424,19 @@ def _moe_core_impl(
     gemm1_use_clc_scheduler: bool = True,
     gemm2_use_clc_scheduler: bool = False,
     swap_ab: bool = False,
+    quant_mode: Optional[str] = None,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
     ``weight_dtype`` is the element type of ``w1_weight``/``w2_weight``:
-    ``"float4_e2m1fn"`` (packed FP4, the W4A4/W4A8 modes) or ``"float8_e4m3fn"``
-    (the ``mxfp8`` mode; only valid with MXFP8 activations). When ``None`` it is
-    inferred from ``w1_weight.dtype`` (``float8_e4m3fn`` selects FP8 weights).
+    ``"float4_e2m1fn"`` (packed FP4, the W4A4/W4A8/MXFP4 modes) or
+    ``"float8_e4m3fn"`` (the ``mxfp8`` mode; only valid with MXFP8 activations).
+    When ``None`` it is inferred from ``w1_weight.dtype`` (``float8_e4m3fn``
+    selects FP8 weights).
+
+    ``quant_mode`` only matters for packed uint8 input, which is NVFP4 unless
+    it is ``"mxfp4"`` (MXFP4 activations with E8M0 block-32 scales). Other
+    modes are inferred from the tensor dtypes.
 
     This function handles:
     1. moe_sort: Token routing computation
@@ -481,6 +521,13 @@ def _moe_core_impl(
     """
     activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
     is_mxfp8 = x.dtype == torch.float8_e4m3fn
+    is_mxfp4 = quant_mode == "mxfp4"
+    # MX activations (MXFP8 or MXFP4) carry E8M0 block-32 scales; GEMM1 also
+    # quantizes the GEMM2 input with them, so they take no global scale.
+    is_mx = is_mxfp8 or is_mxfp4
+    if is_mxfp4:
+        _check_mxfp4_config(swap_ab, output_dtype, x.device)
+        _validate_mxfp4_inputs(x, w1_weight, w2_weight, per_token_scale)
     if weight_dtype is None:
         # The localized (W4A4-only) path passes w1_weight=None; its shards are FP4.
         weight_dtype = (
@@ -500,10 +547,10 @@ def _moe_core_impl(
         )
     if x_sf is None:
         raise ValueError("x_sf is required for block-scaled MoE")
-    if not is_mxfp8 and fc2_input_scale is None:
+    if not is_mx and fc2_input_scale is None:
         raise ValueError("fc2_input_scale is required when quant_mode='w4a4'")
-    if is_mxfp8 and fc2_input_scale is not None:
-        raise ValueError("fc2_input_scale must be None for MXFP8 activations")
+    if is_mx and fc2_input_scale is not None:
+        raise ValueError("fc2_input_scale must be None for MXFP8 or MXFP4 activations")
     if is_mxfp8 and per_token_scale is not None:
         raise ValueError("per_token_scale is not supported for MXFP8 activations")
     if is_mxfp8 and output_dtype is not torch.bfloat16:
@@ -519,7 +566,7 @@ def _moe_core_impl(
         activation, clamped_relu2_limit, x.device
     )
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
-    if is_mxfp8:
+    if is_mx:
         validate_w4a8_inputs(
             x,
             x_sf,
@@ -529,11 +576,12 @@ def _moe_core_impl(
             w2_weight,
             w2_weight_sf,
             weight_elems_per_byte=weight_elems_per_byte,
+            activation_elems_per_byte=2 if is_mxfp4 else 1,
         )
 
     validate_pre_fc2_routing(
         routing_weights_before_fc2,
-        "w4a8" if is_mxfp8 else "w4a4",
+        "mxfp4" if is_mxfp4 else "w4a8" if is_mxfp8 else "w4a4",
         activation,
         output_dtype,
         swap_ab,
@@ -603,7 +651,7 @@ def _moe_core_impl(
     # than silently diverging from them.
     use_localized_path = localized_weights is not None
     if use_localized_path:
-        if is_mxfp8:
+        if is_mx:
             raise NotImplementedError(
                 "locality-domain localization is implemented for W4A4 only"
             )
@@ -844,8 +892,10 @@ def _moe_core_impl(
 
     # Step 2: GEMM1 + activation
     a_dtype = "float8_e4m3fn" if is_mxfp8 else "float4_e2m1fn"
-    sf_dtype = "float8_e8m0fnu" if is_mxfp8 else "float8_e4m3fn"
-    sf_vec_size = 32 if is_mxfp8 else 16
+    sf_dtype = "float8_e8m0fnu" if is_mx else "float8_e4m3fn"
+    sf_vec_size = 32 if is_mx else 16
+    # MXFP4 keeps the float4_e2m1fn intermediate; with E8M0 block-32 scales
+    # the GEMM1 epilogue quantizes it as MXFP4 instead of NVFP4.
     c_dtype = (
         "float8_e4m3fn"
         if is_mxfp8
@@ -936,9 +986,7 @@ def _moe_core_impl(
             out=gemm1_out,
             out_scale=None if use_per_token_activation else gemm1_out_scale,
             global_scale=(
-                fc2_input_scale
-                if not is_mxfp8 and not use_per_token_activation
-                else None
+                fc2_input_scale if not is_mx and not use_per_token_activation else None
             ),
             a_per_token_scale=per_token_scale,
             c_dtype=c_dtype,
@@ -1116,7 +1164,7 @@ class CuteDslMoEWrapper:
     overlap during capture and replay. Auto-tuning is supported via the `tactic`
     parameter or `autotune()` context.
 
-    Supported architectures: SM100, SM103, and SM107. W4A8 and W8A8 are limited to
+    Supported architectures: SM100, SM103, and SM107. W4A8, W8A8 and MXFP4 are limited to
     SM100 and SM103.
 
     Attributes:
@@ -1128,7 +1176,7 @@ class CuteDslMoEWrapper:
             resources for CUDA graph capture.
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
-        quant_mode: Selected W4A4, W4A8, W8A8, or W4A16 compute mode.
+        quant_mode: Selected W4A4, W4A8, W8A8, MXFP4, or W4A16 compute mode.
         max_num_tokens: Deprecated; accepted for backwards compatibility
             but ignored.
 
@@ -1238,14 +1286,17 @@ class CuteDslMoEWrapper:
             Use atomic fused finalize; otherwise use the deterministic
             two-stage finalize. Defaults to ``True``.
         quant_mode : str
-            Compute mode: ``"w4a4"``, ``"w4a8"``, ``"w4a16"``, or ``"mxfp8"``.
-            Defaults to ``"w4a4"``. ``"nvfp4"`` is a deprecated alias for
+            Compute mode: ``"w4a4"``, ``"w4a8"``, ``"w4a16"``, ``"mxfp8"``, or
+            ``"mxfp4"``. Defaults to ``"w4a4"``. ``"nvfp4"`` is a deprecated alias for
             ``"w4a4"``. W4A8 uses packed MXFP4 weights and MXFP8 activations;
             W8A8 uses float8_e4m3fn weights and activations. Both use E8M0
             block-32 scales, BF16 output, and either finalize mode on Blackwell
             (SM100/SM103) with ``swap_ab=True``, including SiTU. The existing
             path requires fused finalize and does not support SiTU. Neither
-            mode supports Rubin or per-token scales.
+            mode supports Rubin or per-token scales. ``"mxfp4"`` runs MXFP4
+            activations against MXFP4 weights (E8M0 block-32 scales on both
+            operands, BF16 output) on SM100/SM103 with ``swap_ab=False``; see
+            :func:`cute_dsl_fused_moe` for the tensor layouts.
         swap_ab : bool
             Select the optimized SM100/SM103 implementation. Gated FC1 weights
             and scales must use up16/gate16 rows when True, or the existing
@@ -1333,6 +1384,8 @@ class CuteDslMoEWrapper:
                 and torch.cuda.get_device_capability(device_obj) == (10, 7)
             ):
                 raise ValueError(f"quant_mode={quant_mode!r} is not supported on SM107")
+        elif quant_mode == "mxfp4":
+            _check_mxfp4_config(swap_ab, output_dtype, device)
 
         # Persistent CUDA resources for async-memset / GEMM1 overlap. These
         # are created outside graph capture (so they can be reused inside it)
@@ -1345,7 +1398,7 @@ class CuteDslMoEWrapper:
         self._runner: Optional[CuteDslFusedMoERunner] = None
         self._per_token_runner: Optional[CuteDslFusedMoERunner] = None
         self._w4a16_runner: Optional[CuteDslFusedMoEW4A16Runner] = None
-        if quant_mode in ("w4a4", "w4a8", "mxfp8"):
+        if quant_mode in ("w4a4", "w4a8", "mxfp8", "mxfp4"):
             wrapper_ref = weakref.ref(self)
 
             def _forward_with_tactic_weak(*args, **kwargs):
@@ -1425,7 +1478,7 @@ class CuteDslMoEWrapper:
             )
         else:
             raise ValueError(
-                "quant_mode must be 'w4a4', 'w4a8', 'w4a16', or 'mxfp8' "
+                "quant_mode must be 'w4a4', 'w4a8', 'w4a16', 'mxfp8', or 'mxfp4' "
                 f"(got {quant_mode!r})."
             )
 
@@ -1466,6 +1519,7 @@ class CuteDslMoEWrapper:
         gemm2_k_steps: Optional[int] = None,
         gemm1_use_clc_scheduler: bool = True,
         gemm2_use_clc_scheduler: bool = False,
+        quant_mode: Optional[str] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward implementation called by auto-tuner."""
@@ -1520,6 +1574,7 @@ class CuteDslMoEWrapper:
             gemm1_use_clc_scheduler=gemm1_use_clc_scheduler,
             gemm2_use_clc_scheduler=gemm2_use_clc_scheduler,
             swap_ab=self.swap_ab,
+            quant_mode=self.quant_mode,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -1550,8 +1605,9 @@ class CuteDslMoEWrapper:
         Parameters
         ----------
         x : torch.Tensor
-            Packed NVFP4 input for ``quant_mode="w4a4"``, MXFP8 input for
-            ``quant_mode="w4a8"`` or ``"mxfp8"``, or BF16 input for ``quant_mode="w4a16"``.
+            Packed NVFP4 input for ``quant_mode="w4a4"``, packed MXFP4 input
+            for ``"mxfp4"``, MXFP8 input for ``quant_mode="w4a8"`` or
+            ``"mxfp8"``, or BF16 input for ``quant_mode="w4a16"``.
         x_sf : Optional[torch.Tensor]
             Scale factors for W4A4, W4A8, or W8A8;
             must be ``None`` for ``quant_mode="w4a16"``.
@@ -1568,7 +1624,7 @@ class CuteDslMoEWrapper:
             Per-expert global scale for GEMM1.
         fc2_input_scale : Optional[torch.Tensor]
             Global scale for W4A4 GEMM2 input quantization; must be ``None``
-            for W4A8, W8A8, and W4A16.
+            for W4A8, W8A8, MXFP4, and W4A16.
         w2_weight : torch.Tensor
             GEMM2 weights (down projection).
         w2_weight_sf : torch.Tensor
@@ -1607,6 +1663,8 @@ class CuteDslMoEWrapper:
                 )
         if self.quant_mode == "w4a4" and x.dtype is not torch.uint8:
             raise TypeError("quant_mode='w4a4' requires packed uint8 input")
+        if self.quant_mode == "mxfp4":
+            _validate_mxfp4_inputs(x, w1_weight, w2_weight, per_token_scale)
 
         moe_output = torch.empty(
             (num_tokens, self.hidden_size),
@@ -1618,7 +1676,7 @@ class CuteDslMoEWrapper:
         tuner = AutoTuner.get()
         runner: CuteDslFusedMoERunner | CuteDslFusedMoEW4A16Runner | None
 
-        if self.quant_mode in ("w4a4", "w4a8", "mxfp8"):
+        if self.quant_mode in ("w4a4", "w4a8", "mxfp8", "mxfp4"):
             use_per_token_activation = per_token_scale is not None
             runner = (
                 self._per_token_runner if use_per_token_activation else self._runner
@@ -1691,7 +1749,7 @@ class CuteDslMoEWrapper:
             inputs,
             **recipe_kwargs,
         )
-        if self.quant_mode in ("w4a4", "w4a8", "mxfp8"):
+        if self.quant_mode in ("w4a4", "w4a8", "mxfp8", "mxfp4"):
             # Timed tactic runs retain the default async path; only this
             # selected-tactic execution is single-stream while tuning.
             runner_kwargs = {"use_async_memset": not tuner.is_tuning_mode}
@@ -1709,7 +1767,7 @@ class CuteDslMoEWrapper:
             from .blackwell.moe_swap_ab_tuner import ALL_SWAP_AB_MOE_TACTICS
 
             return list(ALL_SWAP_AB_MOE_TACTICS)
-        if self.quant_mode in ("nvfp4", "w4a4"):
+        if self.quant_mode in ("nvfp4", "w4a4", "mxfp4"):
             # _get_arch_tactics() replaces main's ALL_MOE_TACTICS: the tactic
             # list is now architecture-dependent (Blackwell vs Rubin).
             return _get_arch_tactics()
@@ -1800,6 +1858,7 @@ def _cute_dsl_fused_moe_impl(
     gemm2_use_clc_scheduler: bool = False,
     swap_ab: bool = False,
     routing_weights_before_fc2: bool = False,
+    quant_mode: Optional[str] = None,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -1852,6 +1911,7 @@ def _cute_dsl_fused_moe_impl(
         gemm1_use_clc_scheduler=gemm1_use_clc_scheduler,
         gemm2_use_clc_scheduler=gemm2_use_clc_scheduler,
         swap_ab=swap_ab,
+        quant_mode=quant_mode,
     )
 
 
@@ -1903,7 +1963,7 @@ def cute_dsl_fused_moe(
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
-    Supported architectures: SM100, SM103, and SM107. W4A8 and W8A8 are limited to
+    Supported architectures: SM100, SM103, and SM107. W4A8, W8A8 and MXFP4 are limited to
     SM100 and SM103. This is the simple functional API; for CUDA-graph support
     use :class:`CuteDslMoEWrapper` instead.
 
@@ -1915,8 +1975,9 @@ def cute_dsl_fused_moe(
     Parameters
     ----------
     x : torch.Tensor
-        Packed NVFP4 input for ``quant_mode="w4a4"``, MXFP8 input for
-        ``quant_mode="w4a8"`` or ``"mxfp8"``, or BF16 input for ``quant_mode="w4a16"``.
+        Packed NVFP4 input for ``quant_mode="w4a4"``, packed MXFP4 input for
+        ``"mxfp4"``, MXFP8 input for ``quant_mode="w4a8"`` or ``"mxfp8"``, or
+        BF16 input for ``quant_mode="w4a16"``.
     x_sf : Optional[torch.Tensor]
         Scale factors for W4A4, W4A8, or W8A8;
         must be ``None`` for ``quant_mode="w4a16"``.
@@ -1933,7 +1994,7 @@ def cute_dsl_fused_moe(
         Per-expert global scale for GEMM1.
     fc2_input_scale : Optional[torch.Tensor]
         Global scale for W4A4 GEMM2 input quantization; must be ``None`` for
-        W4A8, W8A8, and W4A16.
+        W4A8, W8A8, MXFP4, and W4A16.
     w2_weight : torch.Tensor
         GEMM2 weights (down projection).
     w2_weight_sf : torch.Tensor
@@ -1971,8 +2032,8 @@ def cute_dsl_fused_moe(
     swiglu_alpha, swiglu_beta, swiglu_limit : float
         SwiGLU parameters.
     quant_mode : str
-        Compute mode: ``"w4a4"``, ``"w4a8"``, ``"w4a16"``, or ``"mxfp8"``.
-        Defaults to ``"w4a4"``. ``"nvfp4"`` is a deprecated alias for
+        Compute mode: ``"w4a4"``, ``"w4a8"``, ``"w4a16"``, ``"mxfp8"``, or
+        ``"mxfp4"``. Defaults to ``"w4a4"``. ``"nvfp4"`` is a deprecated alias for
         ``"w4a4"``. ``"mxfp8"`` runs MXFP8 weights (``float8_e4m3fn`` with E8M0
         block-32 scales in the MMA layout) against MXFP8 activations
         (``x`` is ``float8_e4m3fn`` and ``x_sf`` the row-major E8M0 scales as
@@ -1981,6 +2042,16 @@ def cute_dsl_fused_moe(
         (SM100/SM103) with ``swap_ab=True``. The existing path requires fused
         finalize and does not support SiTU. Neither mode supports Rubin or
         per-token scales.
+        ``"mxfp4"`` runs MXFP4 activations against MXFP4 weights (W4A4 with
+        E8M0 block-32 scales on both operands, as in the OCP MX format):
+        ``x`` is packed E2M1 ``uint8`` ``[num_tokens, hidden_size // 2]``,
+        ``x_sf`` the row-major E8M0 scales as ``uint8``
+        ``[num_tokens, hidden_size // 32]`` (``mxfp4_quantize`` with
+        ``SfLayout.layout_linear``), the weights are packed E2M1 with E8M0
+        scales in the MMA layout (as for W4A8), ``fc2_input_scale=None``, and
+        the output is BF16. GEMM1 quantizes its output to MXFP4 in the
+        epilogue. Supported on SM100/SM103 with ``swap_ab=False`` and either
+        finalize mode; no per-token scales.
     situ_beta : Optional[float]
         When set with ``ActivationType.Swiglu``, use the SiTU gate
         ``beta * tanh(gate / beta) * sigmoid(gate)``.
@@ -2125,6 +2196,9 @@ def cute_dsl_fused_moe(
             raise ValueError(f"quant_mode={quant_mode!r} is not supported on SM107")
     elif quant_mode == "w4a4" and x.dtype is not torch.uint8:
         raise TypeError("quant_mode='w4a4' requires packed uint8 input")
+    elif quant_mode == "mxfp4":
+        _check_mxfp4_config(swap_ab, output_dtype, x.device)
+        _validate_mxfp4_inputs(x, w1_weight, w2_weight, per_token_scale)
 
     if num_local_experts is None:
         num_local_experts = num_experts
@@ -2148,7 +2222,7 @@ def cute_dsl_fused_moe(
             f"only, got quant_mode={quant_mode!r}."
         )
 
-    if quant_mode in ("w4a4", "w4a8", "mxfp8"):
+    if quant_mode in ("w4a4", "w4a8", "mxfp8", "mxfp4"):
         use_per_token_activation = per_token_scale is not None
         if localized_weights is not None and use_per_token_activation:
             raise NotImplementedError(
@@ -2269,7 +2343,7 @@ def cute_dsl_fused_moe(
         op_name = f"CuteDslFusedMoE::run_moe_w4a16::{activation_name}"
     else:
         raise ValueError(
-            "quant_mode must be 'w4a4', 'w4a8', 'w4a16', or 'mxfp8' "
+            "quant_mode must be 'w4a4', 'w4a8', 'w4a16', 'mxfp8', or 'mxfp4' "
             f"(got {quant_mode!r})."
         )
 
