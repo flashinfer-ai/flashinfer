@@ -308,6 +308,33 @@ class Sm100MoscaMegaKernelBackend(MegaKernelBackend):
         self._agree(ws, "loading", lambda: [jit.kernel_module(p) for p in configs])
 
     @staticmethod
+    def _on_every_rank(world: int, device: torch.device, group: Any, step: Any) -> Any:
+        """Run the rank-local ``step``; if it raised on any EP rank, raise on every rank.
+
+        The rank where ``step`` failed re-raises its own exception; the other
+        ranks raise ``MoEEpConfigError``. Use it before a collective that would
+        otherwise wait for a rank that failed.
+        """
+        error: Exception | None = None
+        result = None
+        try:
+            result = step()
+        except Exception as exc:  # noqa: BLE001 - re-raised on every rank below
+            error = exc
+        if world > 1:
+            import torch.distributed as dist
+
+            ok = torch.tensor([0 if error else 1], dtype=torch.int32, device=device)
+            dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
+            if error is None and not bool(ok.item()):
+                raise MoEEpConfigError(
+                    f"{KERNEL_NAME}: workspace preparation failed on another EP rank"
+                )
+        if error is not None:
+            raise error
+        return result
+
+    @staticmethod
     def _agree(ws: "MoscaWorkspace", what: str, step: Any) -> None:
         """Run ``step`` on every rank; raise on every rank if it failed on any."""
         error: Exception | None = None
@@ -437,39 +464,49 @@ class Sm100MoscaMegaKernelBackend(MegaKernelBackend):
             )
         k = self._kernel_config
         device = torch.device("cuda", torch.cuda.current_device())
-        jit.require_supported_device(device)
         world, rank = self.ep_world_size, self.ep_rank
         group = self.ep_comm_group if world > 1 else None
-        host = jit.host_module()
-        alignment = int(host.token_alignment())
-        capacity = self._kernel_capacity(fleet_params, world)
-        aligned = -(-capacity // alignment) * alignment
-        if k.gathers_output and (
-            aligned > MAX_GATHER_TOKENS_PER_RANK or world * aligned >= 1 << 18
-        ):
-            raise MoEEpConfigError(
-                f"{KERNEL_NAME} replicated layout: the aligned per-rank capacity "
-                f"{aligned} (x{world} ranks) does not fit the gathered launch's "
-                "packed arguments (capacity < 2**14, ranks * capacity < 2**18)"
+
+        def prepare() -> tuple[int, int, int, tuple[int, ...]]:
+            jit.require_supported_device(device)
+            host = jit.host_module()
+            alignment = int(host.token_alignment())
+            capacity = self._kernel_capacity(fleet_params, world)
+            aligned = -(-capacity // alignment) * alignment
+            if k.gathers_output and (
+                aligned > MAX_GATHER_TOKENS_PER_RANK or world * aligned >= 1 << 18
+            ):
+                raise MoEEpConfigError(
+                    f"{KERNEL_NAME} replicated layout: the aligned per-rank capacity "
+                    f"{aligned} (x{world} ranks) does not fit the gathered launch's "
+                    "packed arguments (capacity < 2**14, ranks * capacity < 2**18)"
+                )
+            device_sms = torch.cuda.get_device_properties(device).multi_processor_count
+            num_sms = device_sms - device_sms % 2 if k.num_sms is None else k.num_sms
+            if num_sms > device_sms:
+                raise MoEEpConfigError(
+                    f"{KERNEL_NAME}: num_sms={num_sms} exceeds the device's {device_sms} SMs"
+                )
+            layout = tuple(
+                int(v)
+                for v in host.layout(
+                    world,
+                    fleet_params.num_experts,
+                    aligned,
+                    k.top_k,
+                    fleet_params.token_hidden_size,
+                    k.intermediate_size,
+                    num_sms,
+                    k.gathers_output,
+                )
             )
-        device_sms = torch.cuda.get_device_properties(device).multi_processor_count
-        num_sms = device_sms - device_sms % 2 if k.num_sms is None else k.num_sms
-        if num_sms > device_sms:
-            raise MoEEpConfigError(
-                f"{KERNEL_NAME}: num_sms={num_sms} exceeds the device's {device_sms} SMs"
-            )
-        layout = tuple(
-            int(v)
-            for v in host.layout(
-                world,
-                fleet_params.num_experts,
-                aligned,
-                k.top_k,
-                fleet_params.token_hidden_size,
-                k.intermediate_size,
-                num_sms,
-                k.gathers_output,
-            )
+            return capacity, aligned, num_sms, layout
+
+        # Every rank finishes its local preparation (planner build, buffer
+        # layout) before any rank enters the symmetric-memory rendezvous below:
+        # a rank that failed here would leave its peers waiting there.
+        capacity, aligned, num_sms, layout = self._on_every_rank(
+            world, device, group, prepare
         )
         total_bytes = layout[0]
         if world == 1:

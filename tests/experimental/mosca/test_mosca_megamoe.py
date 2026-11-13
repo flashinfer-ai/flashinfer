@@ -429,6 +429,16 @@ def test_transformed_scales_must_pack_expert_groups_back_to_back() -> None:
         validate_transformed_mega_weights(((l1, padded), (l2, l2_sf)), **kwargs)
 
 
+@pytest.mark.parametrize(
+    "hidden,inter", ((0, 3072), (-256, 3072), (7168, 0), (7168, -128))
+)
+def test_planner_rejects_non_positive_dimensions(host, hidden, inter) -> None:
+    # A zero or negative multiple passes the multiple checks; as uint32 it
+    # would wrap and size the buffer from a huge value.
+    with pytest.raises(Exception, match="must be positive"):
+        host.layout(8, 384, 1920, 6, hidden, inter, 148, False)
+
+
 def test_planner_rejects_a_rule_whose_combine_chunk_the_kernel_cannot_split(
     host,
 ) -> None:

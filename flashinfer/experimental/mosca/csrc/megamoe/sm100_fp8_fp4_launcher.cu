@@ -184,6 +184,14 @@ CUtensorMap make_tma_sf_desc(void* ptr, int shape_mn, int shape_k, int block_mn,
                           /*swizzle_mode=*/0);
 }
 
+// Tensor maps are encoded from raw pointers and the kernel runs on y's device,
+// so a tensor on another device would fault (or read peer memory) at launch.
+void check_same_device(const TensorView& t, const DLDevice& dev, const char* name) {
+  TVM_FFI_CHECK(t.device().device_type == dev.device_type && t.device().device_id == dev.device_id,
+                ValueError)
+      << name << " must be on the same device as y";
+}
+
 void check_weight(const TensorView& w, int64_t d1, int64_t d2, const char* name) {
   check_cuda_tensor(w, name);
   check_contiguous(w, name);
@@ -246,6 +254,11 @@ void Launch(TensorView y, TensorView l1_weights, TensorView l1_weights_sf, Tenso
   check_weight_sf(l2_weights_sf, kHidden, kIntermediateHidden, "l2_weights_sf");
   check_cuda_tensor(sym_buffer, "sym_buffer");
   check_contiguous(sym_buffer, "sym_buffer");
+  check_same_device(l1_weights, dev, "l1_weights");
+  check_same_device(l1_weights_sf, dev, "l1_weights_sf");
+  check_same_device(l2_weights, dev, "l2_weights");
+  check_same_device(l2_weights_sf, dev, "l2_weights_sf");
+  check_same_device(sym_buffer, dev, "sym_buffer");
   TVM_FFI_CHECK(static_cast<int64_t>(peer_buffers.size()) == kNumRanks, ValueError)
       << "peer_buffers must carry " << kNumRanks << " addresses, got " << peer_buffers.size();
   TVM_FFI_CHECK(rank_idx >= 0 && rank_idx < kNumRanks, ValueError)
