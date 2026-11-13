@@ -1,6 +1,6 @@
 """Prefill tests extracted from ``test_trtllm_gen_attention_decode.py``.
 
-Split out so the CI parallel runner (``scripts/task_run_unit_tests.sh``)
+Split out so the CI parallel runner (``scripts/infra/task_run_unit_tests.sh``)
 picks this up as a separate test file and schedules it on its own GPU in
 parallel with the decode shard.  All shared helpers still live in
 ``test_trtllm_gen_attention_decode`` and are imported below; only the

@@ -159,7 +159,7 @@ For an offline reproduction, save the PR and paginated files API responses as
 JSON and ensure the base and head histories are already in a local checkout:
 
 ```bash
-python scripts/pr_checks/replay_ai_scope.py \
+python scripts/infra/pr_checks/replay_ai_scope.py \
   --source-repo /path/to/flashinfer \
   --pr-json /tmp/pr.json --files-json /tmp/files.json \
   --base-sha <full-base-commit> \

@@ -117,7 +117,7 @@ Runner cache budgets use `CI_COMPILE_CACHE_MAX_MB` (default 40960) and
 ### CI wheel builds and test wrappers
 
 Release/nightly provider builds use server-side sccache and
-`scripts/build_jit_cache_wheel.py`. The script uses the container's torch-pinned
+`scripts/infra/build_jit_cache_wheel.py`. The script uses the container's torch-pinned
 interpreter: isolated-environment paths in TVM-FFI includes would change every
 sccache key. It also fixes installed-header mtimes. GCC's `#pragma once` can
 skip headers matching size, content, and mtime; byte-identical Torch
@@ -129,39 +129,39 @@ minutes, and exits 124. Compiler discovery scans the container, including
 sccache-owned processes outside the group. `docker run --rm` provides final
 cleanup.
 
-PR GPU lanes use `scripts/run_with_test_sccache.sh` with the release/nightly
+PR GPU lanes use `scripts/infra/run_with_test_sccache.sh` with the release/nightly
 AOT builds' S3 cache and prefix, publishing `sccache-stats-<kind>-<cuda>-<index>` artifacts. The
 repository variable `FLASHINFER_GPU_TEST_SCCACHE=0` disables it for comparisons;
 a failed sccache install falls back to an uncached lane. Server-owned compiles
 survive a unit's process-group kill; per-unit memory telemetry excludes nvcc. Locally, run
-`scripts/run_with_test_sccache.sh scripts/task_run_unit_tests.sh` (read-only
+`scripts/infra/run_with_test_sccache.sh scripts/infra/task_run_unit_tests.sh` (read-only
 without AWS credentials).
 
 ### Provider architecture checks
 
 PR `AOT Build Import` applies release architecture rules: a module emitting a
 foreign provider's CUDA target or PTX fails validation. Before compilation,
-`scripts/check_jit_spec_gencodes.py --provider <arch>` generates specs through
+`scripts/infra/check_jit_spec_gencodes.py --provider <arch>` generates specs through
 `flashinfer.aot.generate_jit_specs` and checks explicit `-gencode` flags with
 `provider_flag_issues` in `flashinfer/jit/_cuda_architecture.py`. This needs Torch
 and nvcc, not a GPU. Specs without explicit flags use the provider-filtered
 compilation context.
 
-`Provider Spec Lint (cuXXX)` runs `scripts/task_check_jit_spec_gencodes.sh` per
+`Provider Spec Lint (cuXXX)` runs `scripts/infra/task_check_jit_spec_gencodes.sh` per
 CUDA image before AOT builds and participates in `Test Results Summary`; AOT
 lanes repeat the check. After wheel builds,
-`scripts/verify_jit_cache_provider_architectures.py` performs the release
+`scripts/infra/verify_jit_cache_provider_architectures.py` performs the release
 `cuobjdump` inspection. Register multi-architecture sources only for targets in
 `current_compilation_context.TARGET_CUDA_ARCHS`; see `gen_ulysses_lowp_module`.
 
-Before parallel provider lint, `scripts/prefetch_jit_spec_headers.py` fills the
+Before parallel provider lint, `scripts/infra/prefetch_jit_spec_headers.py` fills the
 shared artifact cache with the pinned TRT-LLM manifests and export headers.
 A slow cold download must finish before another architecture starts waiting
 for its lock; otherwise that wait can time out and the fail-fast pool kills
 the downloader. Prefetch uses the generators' checksum validation and download
 limits, fetches no cubins, and stops the lint if a required header is missing.
 
-The PR AOT lane (`scripts/task_test_jit_cache_package_build_import.sh`) uses the
+The PR AOT lane (`scripts/infra/task_test_jit_cache_package_build_import.sh`) uses the
 pinned rapidsai/sccache fork for nvcc (`FLASHINFER_SCCACHE_NVCC_IMPL=rapids`, key
 prefix `<tag>-rapids`). Dependency-list hashing reduces recorded nvcc-hit host
 CPU cost from 7.4 to about 0.3 CPU-s. Host C++ stays uncached because the fork

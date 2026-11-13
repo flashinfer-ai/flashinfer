@@ -266,7 +266,7 @@ jobs:
           bash ci/bash.sh "${DOCKER_IMAGE}" \
             -e TEST_SHARD "${TEST_SHARD}" \
             -e FLASHINFER_JIT_CACHE_REPORT_FILE "${REPORT_FILE}" \
-            ./scripts/task_test_nightly_build.sh
+            ./scripts/infra/task_test_nightly_build.sh
 
       - name: Upload JIT cache report
         if: always()
@@ -305,7 +305,7 @@ jobs:
 
           # Print summary
           if [ -f merged-reports/all_reports.json ] && [ -s merged-reports/all_reports.json ]; then
-            python scripts/print_jit_cache_summary.py merged-reports/all_reports.json
+            python scripts/infra/print_jit_cache_summary.py merged-reports/all_reports.json
           else
             echo "✅ No missing JIT cache modules - all tests passed!"
           fi
@@ -359,7 +359,7 @@ jobs:
             echo "::warning::Nightly tests did not pass; publishing this build with its index entries marked untested."
             UNTESTED_ARGS=(--untested)
           fi
-          python3 scripts/update_whl_index.py \
+          python3 scripts/infra/update_whl_index.py \
             --dist-dir dist \
             --output-dir flashinfer-whl \
             --base-url "https://github.com/${NIGHTLY_RELEASE_REPOSITORY}/releases/download" \

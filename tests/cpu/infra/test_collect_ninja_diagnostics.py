@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[3]))
 
-from scripts.collect_ninja_diagnostics import (
+from scripts.infra.collect_ninja_diagnostics import (
     collect,
     latest_invocation,
     parse_ninja_log,

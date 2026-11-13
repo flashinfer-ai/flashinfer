@@ -35,7 +35,7 @@ request body. The body is the source of truth:
 - it is what the watcher reads, to decide what to ask CI for;
 - it survives independently of how many commands have been issued on the PR.
 
-The comment is transport, not the record. `scripts/pr_checks/experimental_test_scope.py`
+The comment is transport, not the record. `scripts/infra/pr_checks/experimental_test_scope.py`
 parses the block for the watcher and validates targets for the handler, so both entry points
 share one definition of a well-formed scope.
 

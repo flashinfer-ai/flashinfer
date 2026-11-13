@@ -24,7 +24,7 @@ CPU-only coordinator suite.
 
 The default is one worker per visible GPU. H100 PR CI uses
 `--workers-per-gpu 2` (eight workers on four GPUs); other lanes keep the default.
-Locally, use `scripts/task_run_unit_tests.sh --workers-per-gpu 2` for sharing or
+Locally, use `scripts/infra/task_run_unit_tests.sh --workers-per-gpu 2` for sharing or
 `--workers N` for a total count. Workers share the JIT compilation budget.
 The script prepares a CI container: it installs the Python requirements and the
 local package, and runs `apt-get` when `jq` is missing. Run it in a disposable
@@ -62,7 +62,7 @@ contention estimates as optimistic.
 Allocation telemetry defaults to a 5-second interval (`RESOURCE_MONITOR_INTERVAL`);
 per-batch sampling defaults to 2 seconds (`MEMORY_MONITOR_INTERVAL`).
 `resource_monitor.py` separates sampling, CSV persistence, and aggregation;
-allocation/batch monitors share `scripts/test_sharding/host_cpu.py` readers.
+allocation/batch monitors share `scripts/infra/test_sharding/host_cpu.py` readers.
 Unavailable per-process GPU memory stays unknown and marks source summaries
 partial; `memory_summary.csv` leaves maxima blank without valid observations.
 Host rows flush before GPU queries, whose costs appear in `sampler.csv`.

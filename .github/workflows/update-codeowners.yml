@@ -35,14 +35,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python scripts/codeowner_analyzer.py \
+          python scripts/infra/codeowner_analyzer.py \
             --output .github/CODEOWNERS \
             --depth ${{ env.DEPTH }} \
             --min-commits ${{ env.MIN_COMMITS }} \
             --days-back ${{ env.DAYS_BACK }} \
             --top-n ${{ env.TOP_N }} \
-            --allowed-users-file scripts/authorized_codeowner.txt \
-            --overrides-file scripts/codeowner_overrides.json
+            --allowed-users-file scripts/infra/authorized_codeowner.txt \
+            --overrides-file scripts/infra/codeowner_overrides.json
 
       - name: Check for changes
         id: check_changes
@@ -89,7 +89,7 @@ jobs:
               - Commit frequency
               - File coverage
               - Commit recency
-              - Manual overrides from `scripts/codeowner_overrides.json`
+              - Manual overrides from `scripts/infra/codeowner_overrides.json`
 
             ## How to Review
 

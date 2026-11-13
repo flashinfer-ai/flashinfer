@@ -78,6 +78,7 @@ def provider_validation_module():
     validation_path = (
         Path(__file__).resolve().parents[3]
         / "scripts"
+        / "infra"
         / "jit_cache_provider_validation.py"
     )
     module_name = "_test_jit_cache_provider_validation"
@@ -408,7 +409,10 @@ def test_aot_provider_discovery_skips_different_cuda_release(
 @pytest.mark.cpu_only
 def test_jit_cache_build_setup_preserves_indexes_and_cleans_constraint(tmp_path):
     common_script = (
-        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "infra"
+        / "jit_cache_build_common.sh"
     )
     fake_python = tmp_path / "python"
     fake_python.write_text(
@@ -445,7 +449,7 @@ test "${{PIP_BUILD_CONSTRAINT}}" = /tmp/original-build-constraint
 def _sccache_free_env():
     """Return os.environ without the sccache state of an enclosing CI lane.
 
-    The GPU lanes run pytest under scripts/run_with_test_sccache.sh, which
+    The GPU lanes run pytest under scripts/infra/run_with_test_sccache.sh, which
     exports the real cache prefix, stats directory, launchers and AWS keys.
     Shell tests that inherit them write into the lane's stats directory (and,
     with a real sccache on PATH, could reach its server).
@@ -464,7 +468,10 @@ def test_sccache_setup_uses_server_side_compilation(tmp_path, monkeypatch):
     lane_stats_dir = tmp_path / "lane-stats"
     monkeypatch.setenv("SCCACHE_STATS_DIR", str(lane_stats_dir))
     common_script = (
-        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "infra"
+        / "jit_cache_build_common.sh"
     )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -499,7 +506,10 @@ def test_sccache_setup_rapids_nvcc_impl(tmp_path):
     """FLASHINFER_SCCACHE_NVCC_IMPL=rapids runs the fork under its own key prefix,
     caches nvcc with it and leaves host C++ uncached."""
     common_script = (
-        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "infra"
+        / "jit_cache_build_common.sh"
     )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -553,7 +563,10 @@ collect_sccache_stats
 @pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
 def test_install_rapids_sccache_passes_pinned_checksum(arch):
     common_script = (
-        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "infra"
+        / "jit_cache_build_common.sh"
     )
     script = f"""
 set -euo pipefail
@@ -588,7 +601,10 @@ def _run_install_released_sccache(tmp_path, *, corrupt):
     """Install a fake fork release through install_released_sccache, serving the
     archive from a stubbed curl and pinning its real checksum."""
     common_script = (
-        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "infra"
+        / "jit_cache_build_common.sh"
     )
     package = "sccache-v0.18.0-rapids.8-x86_64-unknown-linux-musl"
     staging = tmp_path / "staging" / package
@@ -649,7 +665,10 @@ def test_install_released_sccache_stops_on_checksum_mismatch(tmp_path):
 @pytest.mark.cpu_only
 def test_sccache_setup_rejects_unknown_nvcc_impl(tmp_path):
     common_script = (
-        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "infra"
+        / "jit_cache_build_common.sh"
     )
     script = f"""
 source "{common_script}"
@@ -753,7 +772,10 @@ def _write_test_sccache_fakes(
 
 def _run_with_test_sccache(tmp_path, child, env):
     wrapper = (
-        Path(__file__).resolve().parents[3] / "scripts" / "run_with_test_sccache.sh"
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "infra"
+        / "run_with_test_sccache.sh"
     )
     return subprocess.run(
         ["bash", str(wrapper), str(child), "--workers-per-gpu", "2"],
@@ -889,7 +911,10 @@ def test_sccache_setup_failure_preserves_status_and_clears_state(
         stop_server_status=stop_server_status,
     )
     common_script = (
-        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "infra"
+        / "jit_cache_build_common.sh"
     )
     env["SCCACHE_BUCKET"] = "test-bucket"
     script = f"""
@@ -1388,7 +1413,10 @@ def _run_bounded_parallel(
 ):
     """Run the pool with a fake build that logs start/end and sleeps briefly."""
     common_script = (
-        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "infra"
+        / "jit_cache_build_common.sh"
     )
     log = tmp_path / "events.log"
     script = f"""
@@ -1488,6 +1516,7 @@ def test_aot_script_overlaps_providers_in_private_package_copies():
     text = (
         Path(__file__).resolve().parents[3]
         / "scripts"
+        / "infra"
         / "task_test_jit_cache_package_build_import.sh"
     ).read_text()
     subprocess.run(
@@ -1497,6 +1526,7 @@ def test_aot_script_overlaps_providers_in_private_package_copies():
             str(
                 Path(__file__).resolve().parents[3]
                 / "scripts"
+                / "infra"
                 / "task_test_jit_cache_package_build_import.sh"
             ),
         ],

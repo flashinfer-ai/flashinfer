@@ -310,7 +310,8 @@ def test_toolchain_labels():
 
 def _load_summarizer():
     spec = importlib.util.spec_from_file_location(
-        "summarize_jit_builds", REPO_ROOT / "scripts" / "summarize_jit_builds.py"
+        "summarize_jit_builds",
+        REPO_ROOT / "scripts" / "infra" / "summarize_jit_builds.py",
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

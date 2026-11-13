@@ -1209,7 +1209,7 @@ CUDA 13 host with at least four supported GPUs is still required to execute
 these regressions; ordinary pytest collection skips them without `torchrun`.
 
 ```bash
-NPROC=4 BACKEND=both bash scripts/task_test_moe_ep_smoke.sh
+NPROC=4 BACKEND=both bash scripts/infra/task_test_moe_ep_smoke.sh
 ```
 
 To run just the layer graph tests (`--backend=nixl_ep` selects NIXL instead):
