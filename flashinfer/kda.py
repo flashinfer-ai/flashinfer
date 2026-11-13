@@ -26,7 +26,7 @@ decode and speculative decode retain the backend exposed by
 
 import functools
 import math
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 
 import torch
 
@@ -205,6 +205,7 @@ def recurrent_kda(
         "small-bh",
         "cudnn",
     ] = "auto",
+    batch_invariant: Union[bool, str] = False,
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -458,6 +459,36 @@ def recurrent_kda(
             selected slots of ``initial_state`` in place. ``output_final_state``
             returns that pool, not a gathered per-sequence copy. State-pool calls
             are not automatically selected for cuDNN.
+        batch_invariant (bool or str):
+            Keyword-only. ``True`` (or the class name ``"kda.bf16.s16"``) runs the
+            batch-invariant class ``kda.bf16.s16`` (``flashinfer.batch_invariant``)
+            in place of the backends: one calculation for prefill, chunked prefill
+            and decode, so decode row ``p`` of a request is bit for bit the row a
+            prefill of the whole sequence gives at ``p``, whatever the batch, the
+            neighbours or the slot. The state is a bf16 pool ``initial_state``
+            ``[slots, HV, 128, 128]`` addressed by ``ssm_state_indices``
+            (``arange`` when omitted) and updated in place; a slot holds the
+            state at the sequence's last 16-token boundary, rounded to bf16 once
+            per 16 tokens, and the class keeps the open chunk next to the pool.
+            A call with one token per sequence is a decode step (one launch); a
+            prefill call is one launch that takes each slot's state as a chunk
+            boundary, so a chunked prefill through this form cuts at multiples
+            of 16 tokens except for its last piece (``recurrent_kda_class_s_extend``
+            of ``flashinfer.batch_invariant.kda_class_s.api`` continues an open
+            chunk at any token). A slot whose state changed in its first values
+            since the class last wrote it starts a new chunk; after any other
+            write to a slot's state (a reset to the same values, a restored
+            snapshot) the slot must be prefilled with more than one token or
+            reset with ``recurrent_kda_class_s_reset``. Requires ``backend="auto"``,
+            bf16 activations, head dim 128, ``HV == H``, ``A_log`` / ``dt_bias``
+            with ``use_gate_in_kernel``, ``use_qk_l2norm_in_kernel`` and
+            ``beta_is_logit``, ``-5 <= lower_bound < 0``; speculative decode,
+            checkpoints, ``initial_state_source``, ``seq_order``,
+            ``prefill_workspace`` and the frozen-verify arguments are not in
+            the class. Unsupported inputs raise
+            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+            instead of falling back. ``fingerprint("recurrent_kda")`` names the
+            class; see ``flashinfer/batch_invariant/README.md``.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -483,6 +514,49 @@ def recurrent_kda(
         raise ValueError(
             "backend must be 'auto', 'cute-dsl', 'cute-dsl-persistent', 'tirx', 'ptx', 'cake', 'small-bh', or 'cudnn', "
             f"got {backend!r}"
+        )
+    if batch_invariant:
+        from .batch_invariant.kda_class_s.api import recurrent_kda_class_s
+        from .batch_invariant.kda_class_s.spec import CLASS as _BI_CLASS
+
+        if batch_invariant is not True and batch_invariant != _BI_CLASS:
+            raise ValueError(
+                f"batch_invariant must be a bool or the class name {_BI_CLASS!r}, got {batch_invariant!r}"
+            )
+        return recurrent_kda_class_s(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            output=output,
+            beta_is_logit=beta_is_logit,
+            backend=backend,
+            refused=dict(
+                num_spec_tokens=num_spec_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                initial_state_source=initial_state_source,
+                initial_state_indices=initial_state_indices,
+                seq_order=seq_order,
+                prefill_workspace=prefill_workspace,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                checkpoint_state_indices=checkpoint_state_indices,
+                disable_state_update=disable_state_update,
+                correction_cache=correction_cache,
+                kg_cache=kg_cache,
+            ),
         )
     if backend == "cute-dsl-persistent":
         from .kda_prefill_persistent import _run_persistent_kda

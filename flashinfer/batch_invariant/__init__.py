@@ -5,7 +5,7 @@
 The package holds the engine of the batch-invariant kernels (the canonical reduction plan, the floating-point interface
 ``fp_interface`` in its symbolic and device backends, the term language and its fingerprints) and the Lean project that
 proves the engine's reduction orders; each kernel class lives next to its FlashInfer operator (``flashinfer/gemm/batch_invariant``) or, for the
-operators without a package of their own, in a subpackage here (``quantization``, ``sampling``). ``README.md``
+operators without a package of their own, in a subpackage here (``quantization``, ``sampling``, ``kda_class_s``). ``README.md``
 next to this file is the contract: the guarantee (R1-R4), the flag semantics, the tests and how to check the proofs.
 """
 
@@ -327,6 +327,12 @@ def fingerprint(op: str, **dims) -> str:
     fingerprint, the same inputs and the same environment are the same bits, whatever the batch, the configuration
     the dispatcher picked or the API path. A fingerprint change is a release-note item.
 
+    ``recurrent_kda`` takes no fixed dimension: the class ``kda.bf16.s16`` is one calculation for prefill, chunked
+    prefill and decode in 16-token chunks (bf16 boundary state, fp32 substitution, ``mma.sync`` dot folds, the gate
+    and the Q / K normalization in the kernels); the head count, the batch, the slot and the position are not
+    dimensions of the per-head term, and the receipt digests the kernel source that is the term. The optional
+    ``kda_class`` names the class.
+
     ``megamoe_bf16`` describes the SM100 / SM103 / SM107 BF16 MegaMoE chain with precomputed routing: two
     padded K16 MMA folds, NaN-propagating clamps, the pinned approximate SwiGLU, the BF16 handoff and
     combine wire, and the ordered slot fold. Its dimensions are ``hidden``, ``intermediate``, ``top_k``
@@ -419,9 +425,11 @@ __all__ = [
     "is_supported_device",
 ]
 
-# The quantization and sampling classes register themselves here (their modules keep the mode's registry generic).
+# The quantization, sampling and KDA classes register themselves here (their modules keep the mode's registry generic).
+from .kda_class_s.classes import register as _register_kda_class_s  # noqa: E402
 from .quantization.classes import register as _register_quantization  # noqa: E402
 from .sampling.classes import register as _register_sampling  # noqa: E402
 
 _register_quantization(CLASSES, ClassInfo)
 _register_sampling(CLASSES, ClassInfo)
+_register_kda_class_s(CLASSES, ClassInfo)
