@@ -216,6 +216,7 @@ def test_legacy_autotune_records_effective_clamp_and_filters_explicit_bad_plan(
 
     def tune(_frontend, _launch, candidates, **kwargs):
         assert candidates == [safe]
+        autotune._apply_config_overrides(_frontend, kwargs["config_overrides"])
         kwargs["on_winner"](safe, 1e-6)
         return safe
 

@@ -267,6 +267,7 @@ def ep_force_tune(backend, workspace, tensors, weights, output):
             candidates=sm107_candidates(
                 cfg.quant_kind,
                 kernel_variant=cfg.kernel_variant,
+                batch_invariant=getattr(cfg, "batch_invariant", False),
                 allow_in_kernel_fc2_reduce=backend._kernel_config.in_kernel_fc2_reduce
                 and cfg.combine_dtype == "bf16",
             ),

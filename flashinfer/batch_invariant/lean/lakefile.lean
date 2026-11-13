@@ -37,3 +37,9 @@ lean_exe axioms where
 
 lean_exe moeconformance where
   root := `MoEMain
+
+lean_exe numericalmegamoeconformance where
+  root := `NumericalMegaMoEMain
+
+lean_exe a16megamoeconformance where
+  root := `A16MegaMoEMain

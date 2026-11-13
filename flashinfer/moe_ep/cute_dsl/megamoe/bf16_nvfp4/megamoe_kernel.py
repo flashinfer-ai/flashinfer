@@ -159,7 +159,21 @@ class Sm100W4A16MegaMoEKernel:
         swiglu_beta=None,
         situ_beta=None,
         situ_linear_beta=None,
+        batch_invariant=False,
     ):
+        self.batch_invariant = batch_invariant
+        if batch_invariant:
+            from flashinfer.fused_moe.cute_dsl.blackwell import moe_w4a16_utils
+
+            if not moe_w4a16_utils._HAS_DIRECT_FP4_TO_BF16_CVT:
+                raise ValueError(
+                    "W4A16 batch_invariant requires the native BF16 weight decoder "
+                    "available with CUDA 13.2 or newer"
+                )
+        if batch_invariant and (
+            in_kernel_fc2_reduce or mma_tiler_mnk != (256, 128, 256)
+        ):
+            raise ValueError("W4A16 BI requires external reduction and M256/N128/K256")
         if not force_static_sched or scenario != "2Dx3D":
             raise ValueError("W4A16 requires forward 2Dx3D scheduler records.")
         if load_balance_mode not in ("static", "atomic_counter"):
@@ -235,7 +249,12 @@ class Sm100W4A16MegaMoEKernel:
         self.num_topk = num_topk
         self.max_tokens_per_rank = max_tokens_per_rank
         self.hidden = hidden
-        self.topk_reduce = Bf16TopkReduce(hidden, num_topk)
+        self.topk_reduce = Bf16TopkReduce(
+            hidden,
+            num_topk,
+            batch_invariant=batch_invariant,
+            num_experts=world_size * static_expert_shape[0],
+        )
         self.num_experts_per_rank = static_expert_shape[0]
         self.num_total_experts = world_size * self.num_experts_per_rank
         self.intermediate_gateup = gateup
@@ -783,6 +802,7 @@ class Sm100W4A16MegaMoEKernel:
             swiglu_beta=self.swiglu_beta,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
+            batch_invariant=self.batch_invariant,
         )
         assert self.epilogue.acc_tmem_cols * self.num_acc_stage == mix.num_acc_tmem_cols
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -995,7 +1015,7 @@ class Sm100W4A16MegaMoEKernel:
         # Match the existing swapped Mega dynamic-N split in both FC phases.
         # Only two-CTA MMA splits B at align16(valid)/2. One-CTA
         # MMA consumes the full routed-N tile, multicast across the cluster.
-        if cutlass.const_expr(self.use_2cta_instrs):
+        if cutlass.const_expr(self.use_2cta_instrs and not self.batch_invariant):
             if cute.arch.block_idx()[0] % 2 != 0:
                 shift = dynamic_mainloop.compute_non_leader_cta_load_shift(
                     valid_tokens_in_tile=work.valid_tokens_in_cta_tile,
@@ -1438,7 +1458,14 @@ class Sm100W4A16MegaMoEKernel:
                             a_frag_tile=a_frag[(None, None, None, a_state.index)],
                             b_frag_tile=b_frag[(None, None, None, b_state.index)],
                             k_tile_idx=k_tile,
-                            valid_tokens_in_tile=work.valid_tokens_in_cta_tile,
+                            # BI fixes the actual instruction N, not merely
+                            # the maximum allocation. The paired TMA split
+                            # above also stays at its canonical N/2 boundary.
+                            valid_tokens_in_tile=(
+                                cutlass.Int32(self.mma_tiler[1])
+                                if cutlass.const_expr(self.batch_invariant)
+                                else work.valid_tokens_in_cta_tile
+                            ),
                             mma_tiler_mnk=self.mma_tiler,
                         )
                         iket.range_pop()
@@ -1689,6 +1716,9 @@ class Sm100W4A16MegaMoEKernel:
                         token_idx,
                         hidden_tile_idx,
                         score_reg,
+                        token_comm_args.topk_idx
+                        if cutlass.const_expr(self.batch_invariant)
+                        else None,
                     )
                     iket.range_pop()
                     worker_idx += worker_stride

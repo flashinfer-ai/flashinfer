@@ -17,6 +17,7 @@ from ......core.validation.common import (
     validate_mega_fleet_params,
 )
 from ......weights import MoEWeightPack
+from ..ep_tuning import BlackwellEpTuningMixin
 from ..common.bf16_staging import validate_bf16_forward_inputs
 from .config import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 from .weights import (
@@ -38,7 +39,7 @@ def _resolve_gate_up_clamp(config):
 
 
 @register_mega_kernel("sm100_bf16_nvfp4_bf16_cutedsl")
-class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
+class Bf16Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
     @classmethod
     def kernel_name(cls) -> str:
         return "sm100_bf16_nvfp4_bf16_cutedsl"
@@ -57,9 +58,21 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     ) -> None:
         if torch.cuda.is_available():
             cc = torch.cuda.get_device_capability()
-            if cc not in ((10, 0), (10, 3)):
-                raise MoEEpArchError("W4A16 MegaMoE requires SM100 or SM103")
+            if cc not in (
+                ((10, 0), (10, 3), (10, 7))
+                if self._kernel_config.batch_invariant
+                else ((10, 0), (10, 3))
+            ):
+                raise MoEEpArchError("W4A16 MegaMoE architecture is unsupported")
         config = self._kernel_config
+        if config.batch_invariant:
+            from ..common.batch_invariant import (
+                bf16_batch_invariant_arch,
+                validate_bf16_batch_invariant_device,
+            )
+
+            validate_bf16_batch_invariant_device()
+            self._arithmetic_arch = bf16_batch_invariant_arch()
         validate_mega_fleet_params(
             fleet_params,
             bootstrap.world_size,
@@ -117,6 +130,27 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
+            batch_invariant=k.batch_invariant,
+            batch_invariant_version=(1 if k.batch_invariant else None),
+            gate_up_clamp=_resolve_gate_up_clamp(k),
+            activation=k.activation,
+            swiglu_alpha=k.swiglu_alpha,
+            swiglu_beta=k.swiglu_beta,
+            situ_beta=k.situ_beta,
+            situ_linear_beta=k.situ_linear_beta,
+            handoff_norm=k.fc1_norm_const is not None,
+        )
+
+    def batch_invariant_fingerprint(self, fleet_params: FleetParams) -> str | None:
+        if not self._kernel_config.batch_invariant:
+            return None
+        from ..common.a16_batch_invariant import a16_batch_invariant_fingerprint
+
+        return a16_batch_invariant_fingerprint(
+            self._kernel_config,
+            hidden=fleet_params.token_hidden_size,
+            num_experts=fleet_params.num_experts,
+            arch=self._arithmetic_arch,
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
@@ -147,6 +181,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             situ_beta=config.situ_beta,
             situ_linear_beta=config.situ_linear_beta,
             knobs=self._workspace_knobs(fleet_params),
+            batch_invariant=config.batch_invariant,
         )
         if config.finalize_mode is FinalizeMode.NONE:
             workspace._unfinalized_route_map = torch.arange(
@@ -159,6 +194,10 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 if config.apply_routing_weights_before_fc2
                 else workspace.topk_weights
             )
+            if config.batch_invariant:
+                workspace._unfinalized_weights = torch.empty_like(
+                    workspace.topk_weights
+                )
         return workspace
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
@@ -172,7 +211,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,
-            id(self.ep_comm_group),
+            id(self._ep_comm_group),
             fleet_params.num_experts,
             fleet_params.max_tokens_per_rank,
             fleet_params.token_hidden_size,
@@ -182,6 +221,8 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             config.apply_routing_weights_before_fc2,
             config.enable_in_kernel_fc2_reduce,
             config.finalize_mode,
+            config.batch_invariant,
+            self.batch_invariant_fingerprint(fleet_params),
             epilogue_pool_key(config.fc1_alpha),
             epilogue_pool_key(config.fc2_alpha),
             epilogue_pool_key(config.fc1_norm_const),
@@ -233,6 +274,14 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 raise MoEEpConfigError(
                     f"{name} must be FP32 [local_experts] on the activation device"
                 )
+        if (
+            self._kernel_config.batch_invariant
+            and t.fc1_norm_const is not None
+            and self._kernel_config.fc1_norm_const is None
+        ):
+            raise MoEEpConfigError(
+                "BI handoff normalization must be selected when constructing the layer"
+            )
 
     def validate_capture_ready(
         self, workspace: Any, transformed_weights: TransformedMegaWeights
@@ -386,6 +435,17 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             )
             workspace._frontend._warm_staging_variants()
             assert partials is not None
+            if self._kernel_config.batch_invariant:
+                ids = workspace.topk_idx[:num_tokens]
+                valid = (ids >= 0) & (ids < workspace.num_total_experts)
+                scores = (
+                    torch.ones_like(workspace.topk_weights[:num_tokens])
+                    if self._kernel_config.apply_routing_weights_before_fc2
+                    else workspace.topk_weights[:num_tokens]
+                )
+                workspace._unfinalized_weights[:num_tokens].copy_(
+                    torch.where(valid, scores, 0.0)
+                )
             return (
                 partials.view(num_tokens * self._kernel_config.top_k, workspace.hidden),
                 workspace._unfinalized_weights[:num_tokens],

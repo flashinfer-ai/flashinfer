@@ -113,7 +113,7 @@ The shim admits only the certified NVFP4 geometry and arithmetic modes.
 The mixed MXFP4-weight/MXFP8-E4M3-activation path additionally supports the
 opt-in batch-invariant problem field. The shim dispatches to its separate
 arithmetic policy and receipt; NVFP4 retains its existing policy and receipt.
-The mixed path uses native K32 MMA with a fixed `(256, 128, 128)` tile and
+The mixed path uses native K32 MMA with a canonical `(256, 128, 128)` tile and
 cluster `(2, 1)` for standard inference or `(4, 1)` for GenPhase. It has no
 per-expert alpha or normalization operands. Pure MXFP4 remains outside this
 Blackwell adapter's supported set.
@@ -126,6 +126,27 @@ interpret the shared MXFP4 specification. Existing fixed-N handling, SwiGLU,
 BF16 conversion and ordered masked reduction are reused. Ordinary execution
 and the NVFP4 branches remain unchanged. Retain these additional
 FlashInfer-owned exceptions when regenerating the export until upstreamed.
+
+Standard inference can regroup the unchanged native instruction sequence
+into a larger K stage: K256 for NVFP4, mixed MXFP4 and MXFP8. Admission requires
+the H and post-activation I padding extents to match the canonical stage
+exactly. M256, N128 and the two-CTA instruction remain fixed; GenPhase keeps
+its Gather4 stage. This changes host admission and lowering partitions, not
+the native arithmetic atom or canonical receipt.
+
+## Activation variant integration patch
+
+The standard FC2 epilogue also forwards its BI flag to the shared canonical
+BF16-to-quantized combine encoder. The shared reducer uses one zero-seeded,
+ordered masked slot fold for quantized BI wires, preserving the ordinary
+quantizer and reducer branches. Reapply until upstream absorbs this patch.
+
+The FC12 epilogue accepts an opt-in BI ordered activation recipe from
+`ProblemDesc.batch_invariant_activation`. A missing recipe keeps the existing
+default helper. The standard provider's BI per-token dequantization preserves
+the scratch token mapping and fixes token-scale times expert-alpha products
+to explicit RN multiply. Ordinary activation and scale products keep their
+original paths. Reapply until upstream absorbs these integration hooks.
 
 ## MXFP8 batch-invariant integration patch
 

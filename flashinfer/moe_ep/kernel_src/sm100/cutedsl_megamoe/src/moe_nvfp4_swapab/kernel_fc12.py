@@ -413,6 +413,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             situ_linear_beta=self.situ_linear_beta,
             batch_invariant_chain=self.batch_invariant_chain,
         )
+        self.epilogue.batch_invariant_activation = getattr(self, "batch_invariant_activation", None)
 
         if self.num_sched_stages is None:
             self.num_sched_stages = 2

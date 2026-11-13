@@ -32,6 +32,7 @@ from .mxfp4_spec import _COMPONENT_OPS as _MX_COMPONENT_OPS
 from .nvfp4_spec import fc1_activation as next_fc1_activation
 from .nvfp4_spec import fc2_output
 from .spec import f32_bits, finalizer_term
+from . import numerical_variants as _numerical
 
 SPEC_VERSION = 1
 KINDS = ("mxfp8_e4m3", "mxfp8_e5m2")
@@ -169,12 +170,16 @@ def mma_fold(
     quant_kind="mxfp8_e4m3",
     implementation="standard",
     blocked=False,
+    stage_k=None,
 ):
     if type(k) is not int or k < 0:
         raise ValueError("MMA dimension must be nonnegative")
     cls = numerical_class(arch, quant_kind, implementation)
-    stages = (k + cls.stage_k - 1) // cls.stage_k
-    per_stage = cls.stage_k // cls.instruction_k
+    stage_k = cls.stage_k if stage_k is None else stage_k
+    if type(stage_k) is not int or stage_k <= 0 or stage_k % cls.instruction_k:
+        raise ValueError("stage_k must be a positive multiple of the native MMA K")
+    stages = (k + stage_k - 1) // stage_k
+    per_stage = stage_k // cls.instruction_k
     indices = (
         (s * per_stage + inner for s in range(stages) for inner in range(per_stage))
         if blocked
@@ -261,6 +266,7 @@ def component_terms(
     blocked=False,
     valid_routes=None,
     fp=None,
+    **numerical_kwargs,
 ):
     _validate(
         hidden,
@@ -271,6 +277,22 @@ def component_terms(
         implementation,
     )
     numerical_class(arch, quant_kind, implementation)
+    if not _numerical.is_default(**numerical_kwargs):
+        return _numerical.component_terms(
+            "mxfp8",
+            (hidden, intermediate, top_k, num_experts),
+            dict(
+                arch=arch,
+                quant_kind=quant_kind,
+                implementation=implementation,
+                apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+                gate_up_clamp=gate_up_clamp,
+                blocked=blocked,
+                valid_routes=valid_routes,
+            ),
+            numerical_kwargs,
+            fp=fp,
+        )
     fp = fp or OrderedTermAlgebra()
     inputs = tuple(fp.widen(fp.op("input.bf16", "row.block32", i)) for i in range(32))
     input_amax = combine_half_amax(
@@ -319,6 +341,21 @@ def component_terms(
         valid_routes=valid_routes,
     )
     return terms
+
+
+def plan_component_terms(
+    hidden, intermediate, top_k, num_experts, *, stage_k, **kwargs
+):
+    """Lower an admitted K-stage plan to the unchanged canonical math trace."""
+    import sys
+    from .stage_partition import plan_component_terms as lower_plan
+
+    return lower_plan(
+        sys.modules[__name__],
+        (hidden, intermediate, top_k, num_experts),
+        stage_k,
+        kwargs,
+    )
 
 
 COMPOSITION = (
@@ -400,7 +437,21 @@ def specification(
     implementation="standard",
     apply_routing_weights_before_fc2=True,
     gate_up_clamp=None,
+    **numerical_kwargs,
 ):
+    if not _numerical.is_default(**numerical_kwargs):
+        return _numerical.specification(
+            "mxfp8",
+            (hidden, intermediate, top_k, num_experts),
+            dict(
+                arch=arch,
+                quant_kind=quant_kind,
+                implementation=implementation,
+                apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+                gate_up_clamp=gate_up_clamp,
+            ),
+            numerical_kwargs,
+        )
     cls = numerical_class(arch, quant_kind, implementation)
     terms = component_terms(
         hidden,
@@ -483,6 +534,7 @@ def spec_fingerprint(
     implementation="standard",
     apply_routing_weights_before_fc2=True,
     gate_up_clamp=None,
+    **numerical_kwargs,
 ):
     _validate(
         hidden,
@@ -492,6 +544,19 @@ def spec_fingerprint(
         apply_routing_weights_before_fc2,
         implementation,
     )
+    if not _numerical.is_default(**numerical_kwargs):
+        return _numerical.spec_fingerprint(
+            "mxfp8",
+            (hidden, intermediate, top_k, num_experts),
+            dict(
+                arch=arch,
+                quant_kind=quant_kind,
+                implementation=implementation,
+                apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+                gate_up_clamp=gate_up_clamp,
+            ),
+            numerical_kwargs,
+        )
     return _cached_spec_fingerprint(
         hidden,
         intermediate,

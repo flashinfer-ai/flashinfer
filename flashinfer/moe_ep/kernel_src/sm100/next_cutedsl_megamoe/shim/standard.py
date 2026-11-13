@@ -29,6 +29,7 @@ class Sm100BlockScaledMoeConfig(BlockScaledMoeConfig):
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
     use_custom_finalize: bool = False
+    batch_invariant_cake_finalize: bool = dataclasses.field(default=False, kw_only=True)
     use_persistent_finalize_kernel: bool = False
 
     @property

@@ -167,8 +167,13 @@ def sm107_candidates(
                 dict(base, work_id_mode=work)
                 for work in ("grid_stride", "atomic_counter")
             ]
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.quantized_batch_invariant_tiles import (
+            quantized_batch_invariant_tiles,
+        )
+
         return [
-            dict(base, token_back_mode=carrier, work_id_mode=work)
+            dict(base, mma_tiler_mnk=tile, token_back_mode=carrier, work_id_mode=work)
+            for tile in quantized_batch_invariant_tiles(quant_kind, arch="sm_107")
             for carrier in ("epi_warps", "standalone_warps", "reuse_dispatch_warps")
             for work in ("grid_stride", "atomic_counter")
         ]

@@ -495,6 +495,14 @@ def is_valid_bf16_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
 
 def is_valid_bf16_mxfp8_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
     """Validate mixed BF16/MXFP8 knobs against a session's IKR permission."""
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.a16_batch_invariant import (
+        validate_a16_batch_invariant,
+    )
+
+    try:
+        validate_a16_batch_invariant(config, knobs)
+    except (TypeError, ValueError):
+        return False
     return _ikr_knob_permitted(config, knobs) and is_valid_bf16_mxfp8(
         _effective_knobs(config, knobs)
     )
@@ -535,6 +543,14 @@ def is_valid_mxfp8_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
 
 def is_valid_bf16_nvfp4_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
     """Validate BF16/NVFP4 knobs against the session's reduction permission."""
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.a16_batch_invariant import (
+        validate_a16_batch_invariant,
+    )
+
+    try:
+        validate_a16_batch_invariant(config, knobs)
+    except (TypeError, ValueError):
+        return False
     effective = _effective_knobs(config, knobs)
     if "mma_tiler_mnk" in knobs and "use_2cta_instrs" not in knobs:
         effective["use_2cta_instrs"] = knobs["mma_tiler_mnk"][0] == 256
@@ -581,6 +597,15 @@ def with_knobs(config: Any, knobs: Optional[Dict[str, Any]]) -> Any:
     is_bf16 = type(config).__name__ == "MegaMoEBf16Config"
     if is_bf16:
         validate_bf16_batch_invariant(config, knobs)
+    elif getattr(config, "batch_invariant", False) and type(config).__name__ in (
+        "MegaMoEBf16Nvfp4Config",
+        "MegaMoEBf16Mxfp8Config",
+    ):
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.a16_batch_invariant import (
+            validate_a16_batch_invariant,
+        )
+
+        validate_a16_batch_invariant(config, knobs)
     elif getattr(config, "batch_invariant", False):
         if type(config).__name__ not in ("MegaMoENvfp4Config", "MegaMoEMxfp8Config"):
             raise ValueError("unsupported batch-invariant tuning configuration")

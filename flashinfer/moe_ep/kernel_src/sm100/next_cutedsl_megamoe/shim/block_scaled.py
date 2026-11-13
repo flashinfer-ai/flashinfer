@@ -126,6 +126,8 @@ class BlockScaledMoeConfig:
     activation: Literal["swiglu", "situ"] = "swiglu"
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
+    swiglu_alpha: Optional[float] = dataclasses.field(default=None, kw_only=True)
+    swiglu_beta: Optional[float] = dataclasses.field(default=None, kw_only=True)
 
     kernel_variant: Literal["inference", "genphase"] = "inference"
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
@@ -155,9 +157,15 @@ class BlockScaledMoeConfig:
             raise ValueError(
                 "NVFP4 combine bulk stores require a token-back data path."
             )
+        if (
+            not self.batch_invariant
+            and type(self).__name__ != "Sm100BlockScaledMoeConfig"
+            and (self.swiglu_alpha is not None or self.swiglu_beta is not None)
+        ):
+            raise ValueError("custom activation constants require batch_invariant=True")
         if self.activation not in ("swiglu", "situ"):
             raise ValueError("activation must be 'swiglu' or 'situ'.")
-        if self.activation == "situ":
+        if self.activation == "situ" and not self.batch_invariant:
             for name in ("situ_beta", "situ_linear_beta"):
                 value = getattr(self, name)
                 if name == "situ_linear_beta" and value is None:
@@ -166,7 +174,9 @@ class BlockScaledMoeConfig:
                     raise ValueError(f"SiTU requires positive, finite {name}.")
             if self.gate_up_clamp is not None:
                 raise ValueError("SiTU does not support gate_up_clamp.")
-        elif self.situ_beta is not None or self.situ_linear_beta is not None:
+        elif self.activation != "situ" and (
+            self.situ_beta is not None or self.situ_linear_beta is not None
+        ):
             raise ValueError("SiTU beta parameters require activation='situ'.")
         for name in (
             "num_total_experts",
@@ -235,7 +245,15 @@ class BlockScaledMoeConfig:
             raise ValueError(
                 f"block-scaled instruction N must be 64, 128, or 256, got {tiler[1]}."
             )
-        if tiler[2] not in (2 * instruction_k, 4 * instruction_k):
+        allowed_k: tuple[int, ...] = (2 * instruction_k, 4 * instruction_k)
+        if (
+            self.batch_invariant
+            and self.kernel_variant == "inference"
+            and self.quant_kind != "nvfp4"
+        ):
+            # Blackwell MX's canonical K128 stage may also group eight K32 atoms.
+            allowed_k += (256,)
+        if tiler[2] not in allowed_k:
             raise ValueError(
                 f"block-scaled {self.quant_kind} tile K must be {2 * instruction_k} or "
                 f"{4 * instruction_k}, got {tiler[2]}."
@@ -337,8 +355,10 @@ class BlockScaledMoeConfig:
             type(self.max_sm_count) is not int or self.max_sm_count < cm
         ):
             raise ValueError("max_sm_count must accommodate at least one cluster.")
-        if self.gate_up_clamp is not None and (
-            not math.isfinite(self.gate_up_clamp) or self.gate_up_clamp < 0
+        if (
+            not self.batch_invariant
+            and self.gate_up_clamp is not None
+            and (not math.isfinite(self.gate_up_clamp) or self.gate_up_clamp < 0)
         ):
             raise ValueError("gate_up_clamp must be finite and nonnegative.")
         if self.fc2_tma_stages is not None and not (
@@ -696,10 +716,24 @@ class BlockScaledSymmBuffer:
             fallback_count = remaining // split_factor * split_factor
             launch_clusters = preferred_count + fallback_count // split_factor
 
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+            batch_invariant_activation,
+        )
+
+        activation_variant = (
+            batch_invariant_activation(cfg, family="next100", nondefault_only=True)
+            if cfg.batch_invariant
+            else None
+        )
         problem_desc = ProblemDesc(
             {
                 "expert_count": cfg.num_total_experts,
                 "batch_invariant": cfg.batch_invariant,
+                **(
+                    {"batch_invariant_activation": activation_variant}
+                    if activation_variant is not None
+                    else {}
+                ),
                 "intermediate_gateup_size": 2 * cfg.intermediate,
                 "hidden_size": cfg.hidden,
                 "quant_kind": cfg.quant_kind,
@@ -712,9 +746,13 @@ class BlockScaledSymmBuffer:
                         "mxfp8": "32e4m3xe8m0",
                     }[cfg.combine_dtype]
                 ),
-                "gate_up_clamp": cfg.gate_up_clamp,
-                "situ_beta": cfg.situ_beta,
-                "situ_linear_beta": cfg.situ_linear_beta,
+                "gate_up_clamp": None
+                if activation_variant is not None
+                else cfg.gate_up_clamp,
+                "situ_beta": None if activation_variant is not None else cfg.situ_beta,
+                "situ_linear_beta": None
+                if activation_variant is not None
+                else cfg.situ_linear_beta,
                 "world_size": cfg.world_size,
                 "topk": cfg.num_topk,
                 "topk_index_dtype": cutlass.Int32,
@@ -755,8 +793,16 @@ class BlockScaledSymmBuffer:
             fields["fc1_activation_per_token_scale"] = getattr(
                 cfg, "enable_fc1_activation_per_token_scale", False
             )
-            fields["swiglu_alpha"] = getattr(cfg, "swiglu_alpha", None)
-            fields["swiglu_beta"] = getattr(cfg, "swiglu_beta", None)
+            fields["swiglu_alpha"] = (
+                None
+                if activation_variant is not None
+                else getattr(cfg, "swiglu_alpha", None)
+            )
+            fields["swiglu_beta"] = (
+                None
+                if activation_variant is not None
+                else getattr(cfg, "swiglu_beta", None)
+            )
             problem_desc = ProblemDesc(fields)
             impl_fields["skip_topk_reduce"] = getattr(cfg, "use_custom_finalize", False)
             impl_fields["topk_reduce_persistent"] = getattr(
@@ -858,6 +904,10 @@ class BlockScaledSymmBuffer:
         if torch.cuda.is_current_stream_capturing():
             self._tuning_state.graph_captured = True
         self.prepare(transformed_l1, transformed_l2)
+        if self.config.batch_invariant and getattr(
+            self.config, "use_custom_finalize", False
+        ):
+            self._pre_reduced_activation.zero_()
         if self.config.reduce_topk_in_kernel:
             # red.add accumulation base: zero the output every launch.
             self.output_activation.zero_()

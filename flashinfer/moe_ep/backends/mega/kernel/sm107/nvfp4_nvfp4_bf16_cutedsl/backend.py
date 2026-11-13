@@ -197,6 +197,8 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             combine_dtype=k.combine_dtype,
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
+            swiglu_alpha=getattr(k, "swiglu_alpha", None),
+            swiglu_beta=getattr(k, "swiglu_beta", None),
             gate_up_clamp=k.gate_up_clamp,
             batch_invariant=k.batch_invariant,
             batch_invariant_version=NVFP4_BATCH_INVARIANT_VERSION
@@ -243,6 +245,10 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             selected = nvfp4_batch_invariant_default_knobs(
                 nvfp4_batch_invariant_implementation(k), arch="sm_107"
             )
+            for name in selected:
+                configured = getattr(k, name, None)
+                if configured is not None:
+                    selected[name] = configured
             if isinstance(k.knobs, dict):
                 selected.update(k.knobs)
             elif k.knobs == "cache":

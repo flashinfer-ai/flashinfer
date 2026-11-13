@@ -117,11 +117,11 @@ def stage_mega_moe_inputs(
             fuse_tail_mask=os.environ.get("FLASHINFER_SM107_FUSED_TAIL_MASK", "1")
             != "0",
             zero_masked_scores=False,
-            **({"batch_invariant": True} if batch_invariant else {}),
-            **(
-                {"batch_invariant_quant_kind": kind}
+            batch_invariant=batch_invariant,
+            batch_invariant_quant_kind=(
+                kind
                 if batch_invariant and kind in ("mxfp8_e4m3", "mxfp8_e5m2")
-                else {}
+                else None
             ),
         )
         return num_tokens

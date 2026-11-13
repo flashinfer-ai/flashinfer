@@ -58,6 +58,7 @@ from flashinfer.moe_ep.batch_invariant.nvfp4_device import (
 from flashinfer.moe_ep.batch_invariant.nvfp4_spec import (
     fc1_activation as bi_fc1_activation, quantize_block_precast,
 )
+from flashinfer.moe_ep.batch_invariant.activation_variants import activation_accumulator
 
 @dataclasses.dataclass(frozen=True)
 class QuantImpl:
@@ -173,6 +174,15 @@ class QuantImpl:
             )
         if cutlass.const_expr(not self._is_combine):
             return self.nvfp4_quant_impl(prequant_reg, norm_const=norm_const)
+        if cutlass.const_expr(self.batch_invariant):
+            from flashinfer.moe_ep.batch_invariant.quantized_combine_device import quantize_combine_wire
+
+            return quantize_combine_wire(
+                prequant_reg,
+                combine_dtype="nvfp4" if self.data_dtype is cutlass.Float4E2M1FN else "mxfp8",
+                across_lanes=self.sf_vec_direction == "threads_with_the_same_reg",
+                lane_idx=self.lane_idx,
+            )
         if cutlass.const_expr(self.data_dtype is cutlass.Float4E2M1FN):
             if cutlass.const_expr(self.sf_vec_direction == "regs_in_thread"):
                 return self.nvfp4_combine_quant_regs_in_thread_impl(prequant_reg)
@@ -1632,17 +1642,37 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
     ) -> cute.Tensor:
         # ── Input contract checks (compile-time): fp32, 1D, even-count, rmem ──
         if cutlass.const_expr(self.batch_invariant_chain):
-            if cutlass.const_expr(activation_scale is not None):
-                raise ValueError("NVFP4 BI does not support per-token activation scales")
             out = cute.make_rmem_tensor((cute.size(gate_rmem),), cutlass.Float32)
             for i in cutlass.range_constexpr(0, cute.size(gate_rmem), 2):
-                result = bi_fc1_activation(
-                    BiPackedF32,
-                    (gate_rmem[i], gate_rmem[i + 1]),
-                    (up_rmem[i], up_rmem[i + 1]),
-                    alpha=(alpha_val, alpha_val) if alpha_val is not None else None,
-                    clamp=self.gate_up_clamp,
-                )
+                alpha_pair = None
+                if cutlass.const_expr(activation_scale is not None):
+                    if cutlass.const_expr(scale_is_pretranspose):
+                        lane_parity = (self.lane_idx // cutlass.Int32(2)) % cutlass.Int32(2)
+                        scale0 = cute.arch.shuffle_sync(activation_scale, cutlass.Int32(i * 2) + lane_parity)
+                        scale1 = cute.arch.shuffle_sync(activation_scale, cutlass.Int32((i + 1) * 2) + lane_parity)
+                        alpha_pair = (scale0, scale1)
+                    else:
+                        alpha_pair = (activation_scale, activation_scale)
+                    if cutlass.const_expr(alpha_val is not None):
+                        alpha_pair = BiPackedF32.mul(alpha_pair, (alpha_val, alpha_val))
+                elif cutlass.const_expr(alpha_val is not None):
+                    alpha_pair = (alpha_val, alpha_val)
+                if cutlass.const_expr(getattr(self, "batch_invariant_activation", None) is not None):
+                    result = activation_accumulator(
+                        BiPackedF32,
+                        (gate_rmem[i], gate_rmem[i + 1]),
+                        (up_rmem[i], up_rmem[i + 1]),
+                        variant=self.batch_invariant_activation,
+                        alpha=alpha_pair,
+                    )
+                else:
+                    result = bi_fc1_activation(
+                        BiPackedF32,
+                        (gate_rmem[i], gate_rmem[i + 1]),
+                        (up_rmem[i], up_rmem[i + 1]),
+                        alpha=alpha_pair,
+                        clamp=self.gate_up_clamp,
+                    )
                 out[i], out[i + 1] = result
             return out
         # Wrapped in const_expr so the DSL evaluates them at trace time and the
@@ -2280,7 +2310,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         casted = process_pipeline.f2fp(
             *loaded,
             alpha_val=alpha_val,
-            batch_invariant=self.batch_invariant_chain,
+            batch_invariant=getattr(self, "batch_invariant_chain", False),
         )
         # reorder returns a bare RMEM fragment in the store's expected pre-store
         # distribution; reorder + store are paired 1:1 inside the pipeline.
@@ -2820,7 +2850,7 @@ def fc2_stg_store_function(
     **_
 ):
     if cutlass.const_expr(epi.combine_format.is_quantized):
-        data_subtile, sf_regs = QuantImpl(epi.combine_format, "regs_in_thread")(subtile)
+        data_subtile, sf_regs = QuantImpl(epi.combine_format, "regs_in_thread", batch_invariant=getattr(epi, "batch_invariant_chain", False))(subtile)
     else:
         data_subtile = subtile
         sf_regs = None
@@ -2878,6 +2908,7 @@ def fc2_ublk_store_function_impl(
     if cutlass.const_expr(quantized):
         data_subtile, selected_sf = QuantImpl(
             epi.combine_format, "threads_with_the_same_reg", lane_idx=epi.lane_idx,
+            batch_invariant=getattr(epi, "batch_invariant_chain", False),
         )(subtile)
     else:
         data_subtile = subtile

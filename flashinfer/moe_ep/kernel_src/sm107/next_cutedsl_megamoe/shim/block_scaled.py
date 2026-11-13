@@ -160,6 +160,8 @@ class Sm107BlockScaledMoeConfig:
     activation: Literal["swiglu", "situ"] = "swiglu"
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
+    swiglu_alpha: Optional[float] = dataclasses.field(default=None, kw_only=True)
+    swiglu_beta: Optional[float] = dataclasses.field(default=None, kw_only=True)
 
     kernel_variant: Literal["inference", "genphase"] = "inference"
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
@@ -188,16 +190,24 @@ class Sm107BlockScaledMoeConfig:
             raise ValueError(
                 "NVFP4 combine bulk stores require a token-back data path."
             )
+        if (
+            not self.batch_invariant
+            and type(self).__name__ != "Sm100BlockScaledMoeConfig"
+            and (self.swiglu_alpha is not None or self.swiglu_beta is not None)
+        ):
+            raise ValueError("custom activation constants require batch_invariant=True")
         if self.activation not in ("swiglu", "situ"):
             raise ValueError("activation must be 'swiglu' or 'situ'.")
-        if self.activation == "situ":
+        if self.activation == "situ" and not self.batch_invariant:
             for name in ("situ_beta", "situ_linear_beta"):
                 value = getattr(self, name)
                 if value is None or not math.isfinite(value) or value <= 0:
                     raise ValueError(f"SiTU requires positive, finite {name}.")
             if self.gate_up_clamp is not None:
                 raise ValueError("SiTU does not support gate_up_clamp.")
-        elif self.situ_beta is not None or self.situ_linear_beta is not None:
+        elif self.activation != "situ" and (
+            self.situ_beta is not None or self.situ_linear_beta is not None
+        ):
             raise ValueError("SiTU beta parameters require activation='situ'.")
         for name in (
             "num_total_experts",
@@ -364,8 +374,10 @@ class Sm107BlockScaledMoeConfig:
             type(self.max_sm_count) is not int or self.max_sm_count < cm
         ):
             raise ValueError("max_sm_count must accommodate at least one cluster.")
-        if self.gate_up_clamp is not None and (
-            not math.isfinite(self.gate_up_clamp) or self.gate_up_clamp < 0
+        if (
+            not self.batch_invariant
+            and self.gate_up_clamp is not None
+            and (not math.isfinite(self.gate_up_clamp) or self.gate_up_clamp < 0)
         ):
             raise ValueError("gate_up_clamp must be finite and nonnegative.")
         if self.fc2_tma_stages is not None and not (
@@ -705,10 +717,24 @@ class Sm107BlockScaledSymmBuffer:
             fallback_count = remaining // split_factor * split_factor
             launch_clusters = preferred_count + fallback_count // split_factor
 
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+            batch_invariant_activation,
+        )
+
+        activation_variant = (
+            batch_invariant_activation(cfg, family="next107", nondefault_only=True)
+            if cfg.batch_invariant
+            else None
+        )
         problem_desc = ProblemDesc(
             {
                 "expert_count": cfg.num_total_experts,
                 "batch_invariant": cfg.batch_invariant,
+                **(
+                    {"batch_invariant_activation": activation_variant}
+                    if activation_variant is not None
+                    else {}
+                ),
                 "intermediate_gateup_size": 2 * cfg.intermediate,
                 "hidden_size": cfg.hidden,
                 "quant_kind": cfg.quant_kind,
@@ -721,9 +747,13 @@ class Sm107BlockScaledSymmBuffer:
                         "mxfp8": "32e4m3xe8m0",
                     }[cfg.combine_dtype]
                 ),
-                "gate_up_clamp": cfg.gate_up_clamp,
-                "situ_beta": cfg.situ_beta,
-                "situ_linear_beta": cfg.situ_linear_beta,
+                "gate_up_clamp": None
+                if activation_variant is not None
+                else cfg.gate_up_clamp,
+                "situ_beta": None if activation_variant is not None else cfg.situ_beta,
+                "situ_linear_beta": None
+                if activation_variant is not None
+                else cfg.situ_linear_beta,
                 "world_size": cfg.world_size,
                 "topk": cfg.num_topk,
                 "topk_index_dtype": cutlass.Int32,
@@ -1038,6 +1068,8 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     activation: Literal["swiglu", "situ"] = "swiglu",
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
     batch_invariant: bool = False,
     input_norm_const: float = 1.0,
     has_fc1_alpha: bool = True,
@@ -1085,6 +1117,8 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
         activation=activation,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
     return Sm107BlockScaledSymmBuffer(config)
 

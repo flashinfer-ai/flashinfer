@@ -9,7 +9,7 @@ and swizzles them. Pass pre-quantized MXFP8 weights via ``w13``/``w2`` plus
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
 
@@ -39,6 +39,12 @@ from .weights import (
     validate_transformed_mega_weights,
 )
 
+from ..common.activation_batch_invariant import batch_invariant_numerical_metadata
+
+from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+    batch_invariant_variant_kwargs,
+)
+
 if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
@@ -62,12 +68,11 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
         """Validate pipeline options and initialize deferred tuning state."""
         super().__init__(config)
         if (
-            config.activation != "swiglu"
-            or config.swiglu_alpha is not None
-            or (
-                config.kernel_variant != "genphase"
-                and not config.apply_routing_weights_before_fc2
-            )
+            not config.batch_invariant
+            and (config.activation != "swiglu" or config.swiglu_alpha is not None)
+        ) or (
+            config.kernel_variant != "genphase"
+            and not config.apply_routing_weights_before_fc2
         ):
             raise MoEEpConfigError(
                 "Activation controls and late routing weights require "
@@ -269,7 +274,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
 
     def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
         k = self._kernel_config
-        key = dict(
+        key: dict[str, Any] = dict(
             dtype=k.kind,
             world_size=self.ep_world_size,
             hidden=fleet_params.token_hidden_size,
@@ -279,6 +284,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
             max_tokens=fleet_params.max_tokens_per_rank,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
             use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
+            combine_dtype=k.combine_dtype,
         )
         if k.batch_invariant:
             from ..common.mxfp8_batch_invariant import MXFP8_BATCH_INVARIANT_VERSION
@@ -289,6 +295,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
                 apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
                 gate_up_clamp=_resolve_gate_up_clamp(k),
                 input_norm_const=1.0,
+                **(batch_invariant_variant_kwargs(k) if k.batch_invariant else {}),
             )
         return key
 
@@ -310,6 +317,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
                 hidden=fp.token_hidden_size,
                 intermediate=k.intermediate_size,
                 kind=k.kind,
+                combine_dtype=k.combine_dtype,
                 gate_up_clamp=_resolve_gate_up_clamp(k),
                 enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
                 use_persistent_finalize_kernel=k.resolved_finalize_mode
@@ -318,6 +326,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
                 batch_invariant=True,
                 input_norm_const=1.0,
                 has_3_global_scales=False,
+                **batch_invariant_numerical_metadata(k),
             ),
             self._workspace_knobs(fp),
         )
@@ -352,6 +361,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
             self.ep_rank,
             self.ep_world_size,
             kind=kind,
+            combine_dtype=cast(Literal["bf16", "mxfp8"], k.combine_dtype),
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
@@ -365,6 +375,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
                     batch_invariant=True,
                     input_norm_const=1.0,
                     has_3_global_scales=False,
+                    **batch_invariant_numerical_metadata(k),
                 )
                 if k.batch_invariant
                 else {}
@@ -598,6 +609,17 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
             sync=False,
         )
         partials, _root, _region = workspace._frontend.custom_finalize_workspace()
+        if self._kernel_config.batch_invariant:
+            weights = workspace._unfinalized_weights[:num_tokens]
+            if self._kernel_config.apply_routing_weights_before_fc2:
+                weights.fill_(1.0)
+            else:
+                weights.copy_(workspace.topk_weights[:num_tokens])
+            weights.masked_fill_(
+                (workspace.topk_idx[:num_tokens] < 0)
+                | (workspace.topk_idx[:num_tokens] >= workspace.num_total_experts),
+                0,
+            )
         return (
             partials[:num_tokens].view(
                 num_tokens * self._kernel_config.top_k, workspace.hidden
@@ -652,6 +674,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
             fp.token_hidden_size,
             k.intermediate_size,
             k.kind,
+            k.combine_dtype,
             _resolve_gate_up_clamp(k),
             k.enable_in_kernel_fc2_reduce,
             k.resolved_finalize_mode,

@@ -80,7 +80,7 @@ class Sm100GenphaseMoeConfig(BlockScaledMoeConfig):
             or geometry not in self.admitted_geometries
             or self.schedule_policy[0] != "grouped"
             or self.reduce_topk_in_kernel
-            or self.activation != "swiglu"
+            or (not self.batch_invariant and self.activation != "swiglu")
         ):
             raise ValueError(
                 "Blackwell GenPhase requires SwiGLU, N128/CGA4 or an admitted "

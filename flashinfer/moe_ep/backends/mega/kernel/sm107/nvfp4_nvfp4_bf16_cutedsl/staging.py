@@ -112,7 +112,7 @@ def stage_mega_moe_inputs(
             fuse_tail_mask=topk_idx_out.dtype == torch.int32
             and os.environ.get("FLASHINFER_SM107_FUSED_TAIL_MASK", "1") != "0",
             zero_masked_scores=False,
-            **({"batch_invariant": True} if batch_invariant else {}),
+            batch_invariant=batch_invariant,
         )
         return num_tokens
 

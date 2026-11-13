@@ -31,6 +31,7 @@ from typing import Any, Sequence
 from ...batch_invariant.fp_interface.term import Term
 from .spec import OrderedTermAlgebra as _Bf16TermAlgebra
 from .spec import f32_bits, finalizer_term
+from . import numerical_variants as _numerical
 
 SPEC_VERSION = 1
 SF_VEC = 16
@@ -207,14 +208,24 @@ def numerical_class(arch: str, implementation: str) -> NumericalClass:
 
 
 def mma_fold(
-    fp, k: int, operand: str, *, arch: str, implementation: str, blocked=False
+    fp,
+    k: int,
+    operand: str,
+    *,
+    arch: str,
+    implementation: str,
+    blocked=False,
+    stage_k=None,
 ):
     """A persistent block-scaled accumulator, including stage padding."""
     if type(k) is not int or k < 0:
         raise ValueError("MMA dimension must be a nonnegative integer")
     cls = numerical_class(arch, implementation)
-    stages = (k + cls.stage_k - 1) // cls.stage_k
-    per_stage = cls.stage_k // cls.instruction_k
+    stage_k = cls.stage_k if stage_k is None else stage_k
+    if type(stage_k) is not int or stage_k <= 0 or stage_k % cls.instruction_k:
+        raise ValueError("stage_k must be a positive multiple of the native MMA K")
+    stages = (k + stage_k - 1) // stage_k
+    per_stage = stage_k // cls.instruction_k
     indices = (
         (s * per_stage + inner for s in range(stages) for inner in range(per_stage))
         if blocked
@@ -290,6 +301,7 @@ def component_terms(
     valid_routes: Sequence[bool] | None = None,
     blocked: bool = False,
     fp: OrderedTermAlgebra | None = None,
+    **numerical_kwargs,
 ) -> dict[str, Term]:
     _validate(
         hidden,
@@ -300,6 +312,25 @@ def component_terms(
         (has_fc1_alpha, has_fc2_alpha, has_fc1_norm_const),
     )
     numerical_class(arch, implementation)
+    if not _numerical.is_default(**numerical_kwargs):
+        return _numerical.component_terms(
+            "nvfp4",
+            (hidden, intermediate, top_k, num_experts),
+            dict(
+                arch=arch,
+                implementation=implementation,
+                apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+                gate_up_clamp=gate_up_clamp,
+                input_norm_const=input_norm_const,
+                has_fc1_alpha=has_fc1_alpha,
+                has_fc2_alpha=has_fc2_alpha,
+                has_fc1_norm_const=has_fc1_norm_const,
+                blocked=blocked,
+                valid_routes=valid_routes,
+            ),
+            numerical_kwargs,
+            fp=fp,
+        )
     if not math.isfinite(input_norm_const) or input_norm_const <= 0:
         raise ValueError("input_norm_const must be positive and finite")
     fp = fp or OrderedTermAlgebra()
@@ -371,6 +402,21 @@ def component_terms(
         valid_routes=valid_routes,
     )
     return terms
+
+
+def plan_component_terms(
+    hidden, intermediate, top_k, num_experts, *, stage_k, **kwargs
+):
+    """Lower an admitted K-stage plan to the unchanged canonical math trace."""
+    import sys
+    from .stage_partition import plan_component_terms as lower_plan
+
+    return lower_plan(
+        sys.modules[__name__],
+        (hidden, intermediate, top_k, num_experts),
+        stage_k,
+        kwargs,
+    )
 
 
 COMPOSITION = (
@@ -455,6 +501,16 @@ def _fingerprint_component(term: Term) -> str:
 def specification(
     hidden, intermediate, top_k, num_experts, *, arch, implementation, **kwargs
 ):
+    numerical_kwargs = {
+        name: kwargs.pop(name) for name in _numerical.FIELDS if name in kwargs
+    }
+    if not _numerical.is_default(**numerical_kwargs):
+        return _numerical.specification(
+            "nvfp4",
+            (hidden, intermediate, top_k, num_experts),
+            dict(arch=arch, implementation=implementation, **kwargs),
+            numerical_kwargs,
+        )
     cls = numerical_class(arch, implementation)
     terms = component_terms(
         hidden,
@@ -550,6 +606,7 @@ def spec_fingerprint(
     has_fc1_alpha: bool = False,
     has_fc2_alpha: bool = False,
     has_fc1_norm_const: bool = False,
+    **numerical_kwargs,
 ) -> str:
     """One receipt per arithmetic class; batch, capacity and scheduling excluded."""
     _validate(
@@ -560,6 +617,22 @@ def spec_fingerprint(
         apply_routing_weights_before_fc2,
         (has_fc1_alpha, has_fc2_alpha, has_fc1_norm_const),
     )
+    if not _numerical.is_default(**numerical_kwargs):
+        return _numerical.spec_fingerprint(
+            "nvfp4",
+            (hidden, intermediate, top_k, num_experts),
+            dict(
+                arch=arch,
+                implementation=implementation,
+                apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+                gate_up_clamp=gate_up_clamp,
+                input_norm_const=input_norm_const,
+                has_fc1_alpha=has_fc1_alpha,
+                has_fc2_alpha=has_fc2_alpha,
+                has_fc1_norm_const=has_fc1_norm_const,
+            ),
+            numerical_kwargs,
+        )
     return _cached_spec_fingerprint(
         hidden,
         intermediate,

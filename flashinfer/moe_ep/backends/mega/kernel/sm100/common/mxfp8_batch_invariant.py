@@ -8,7 +8,7 @@ from typing import Any
 
 from .nvfp4_batch_invariant import _same, nvfp4_batch_invariant_arch
 
-MXFP8_BATCH_INVARIANT_VERSION = 1
+MXFP8_BATCH_INVARIANT_VERSION = 2
 MXFP8_KINDS = ("mxfp8_e4m3", "mxfp8_e5m2")
 
 
@@ -121,18 +121,19 @@ def validate_mxfp8_batch_invariant(
         )
     if implementation == "legacy" and not early:
         raise ValueError("legacy batch_invariant MXFP8 requires early routing weights")
+    from .activation_batch_invariant import (
+        batch_invariant_activation,
+        block_scaled_activation_family,
+    )
+
+    batch_invariant_activation(
+        config, family=block_scaled_activation_family(implementation, arch)
+    )
     fixed = dict(
-        activation="swiglu",
-        situ_beta=None,
-        situ_linear_beta=None,
-        swiglu_alpha=None,
-        swiglu_beta=None,
-        combine_dtype="bf16",
         enable_in_kernel_fc2_reduce=False,
         in_kernel_fc2_reduce=False,
         reduce_topk_in_kernel=False,
         enable_fc1_activation_per_token_scale=False,
-        use_custom_finalize=False,
         has_fc1_alpha=False,
         has_fc2_alpha=False,
         has_fc1_norm_const=False,
@@ -146,16 +147,11 @@ def validate_mxfp8_batch_invariant(
     for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
         if getattr(config, name, None) is not None:
             raise ValueError(f"batch_invariant MXFP8 does not accept {name}")
-    if hasattr(config, "finalize_mode"):
-        from flashinfer.moe_ep.config import FinalizeMode
+    from .activation_batch_invariant import validate_batch_invariant_output
 
-        allowed = (
-            (FinalizeMode.AUTO, FinalizeMode.DEFAULT)
-            if implementation == "genphase"
-            else (FinalizeMode.AUTO, FinalizeMode.DEFAULT, FinalizeMode.PERSISTENT)
-        )
-        if config.finalize_mode not in allowed:
-            raise ValueError("batch_invariant MXFP8 requires ordered finalization")
+    validate_batch_invariant_output(
+        config, implementation=implementation, arch=arch, kind=kind
+    )
     defaults = mxfp8_batch_invariant_default_knobs(
         implementation, quant_kind=kind, arch=arch
     )
@@ -189,6 +185,14 @@ def validate_mxfp8_batch_invariant(
             else dict(work_id_mode=("grid_stride", "atomic_counter"))
         )
     )
+    if implementation == "standard":
+        from .quantized_batch_invariant_tiles import (
+            validate_quantized_batch_invariant_tile,
+        )
+
+        validate_quantized_batch_invariant_tile(
+            config, kind=kind, arch=arch, knobs=supplied
+        )
     for name, expected in defaults.items():
         configured = getattr(config, name, expected)
         if implementation == "legacy" and name == "token_back_mode":
@@ -203,6 +207,8 @@ def validate_mxfp8_batch_invariant(
             "schedule_policy",
         ):
             value = expected
+        if implementation == "standard" and name == "mma_tiler_mnk":
+            continue
         if not any(_same(value, v) for v in scheduling.get(name, (expected,))):
             raise ValueError(
                 f"batch_invariant MXFP8 does not admit {name}={value!r} for {arch}/{kind}/{implementation}"
@@ -224,6 +230,8 @@ def validate_mxfp8_batch_invariant(
 def mxfp8_batch_invariant_fingerprint(
     config, *, hidden=None, num_experts=None, implementation=None, arch=None
 ):
+    from .activation_batch_invariant import batch_invariant_fingerprint_kwargs
+
     from flashinfer.moe_ep.batch_invariant.mxfp8_spec import spec_fingerprint
 
     arch = arch or nvfp4_batch_invariant_arch()
@@ -232,6 +240,20 @@ def mxfp8_batch_invariant_fingerprint(
     clamp = getattr(config, "gate_up_clamp", None)
     if clamp is None:
         clamp = getattr(config, "activation_clamp", None)
+    if implementation == "standard":
+        from .quantized_batch_invariant_tiles import (
+            validate_quantized_batch_invariant_tile,
+        )
+
+        validate_quantized_batch_invariant_tile(
+            config,
+            kind=mxfp8_quant_kind(config),
+            arch=arch,
+            knobs=getattr(config, "knobs", None)
+            if isinstance(getattr(config, "knobs", None), dict)
+            else None,
+            hidden=hidden,
+        )
     return spec_fingerprint(
         hidden=hidden if hidden is not None else config.hidden,
         intermediate=getattr(
@@ -248,4 +270,5 @@ def mxfp8_batch_invariant_fingerprint(
             config, "apply_routing_weights_before_fc2", True
         ),
         gate_up_clamp=clamp,
+        **batch_invariant_fingerprint_kwargs(config),
     )

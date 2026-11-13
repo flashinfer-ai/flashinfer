@@ -43,6 +43,7 @@ from common.moe_utils import fmin, fmax, swiglu_act, quant_sfd_row, cvt_f32x4_to
 from flashinfer.moe_ep.batch_invariant.mxfp8_device import PackedF32 as Mx8PackedF32, ScalarF32 as Mx8ScalarF32
 from flashinfer.moe_ep.batch_invariant.mxfp8_spec import legacy_fc1_activation, legacy_quantize_block_precast
 from flashinfer.moe_ep.batch_invariant.nvfp4_spec import fc2_output
+from flashinfer.moe_ep.batch_invariant.activation_variants import activation_accumulator
 from cutlass.cute.typing import Float32
 from moe_nvfp4_swapab.epilogue import (
     _TmemTranspose16x32Core,
@@ -691,13 +692,22 @@ class GluMxfp8Epilogue:
             if cutlass.const_expr(prob is not None):
                 weight = (prob, prob)
             for i in cutlass.range_constexpr(0, cute.size(t_swiglu), 2):
-                t_swiglu[i], t_swiglu[i + 1] = legacy_fc1_activation(
-                    Mx8PackedF32,
-                    (t_gate[i], t_gate[i + 1]),
-                    (t_up[i], t_up[i + 1]),
-                    weight=weight,
-                    clamp=self._batch_invariant_host_clamp,
-                )
+                if cutlass.const_expr(getattr(self, "batch_invariant_activation", None) is not None):
+                    t_swiglu[i], t_swiglu[i + 1] = activation_accumulator(
+                        Mx8PackedF32,
+                        (t_gate[i], t_gate[i + 1]),
+                        (t_up[i], t_up[i + 1]),
+                        variant=self.batch_invariant_activation,
+                        weight=weight,
+                    )
+                else:
+                    t_swiglu[i], t_swiglu[i + 1] = legacy_fc1_activation(
+                        Mx8PackedF32,
+                        (t_gate[i], t_gate[i + 1]),
+                        (t_up[i], t_up[i + 1]),
+                        weight=weight,
+                        clamp=self._batch_invariant_host_clamp,
+                    )
         else:
             swiglu_act(t_swiglu, t_up, t_gate, prob)
 
@@ -967,10 +977,7 @@ class GluMxfp8Epilogue:
                 # 3. Write E8M0 scale to local fc2_output_sf for token-back push.
                 fp8_dtype = self._combine_format.act_dtype
                 r_fp8 = cute.make_rmem_tensor(r_acc_layout.shape, fp8_dtype)
-                qpvscale = quant_sfd_row(
-                    r_acc, r_fp8, 1.0, EpilogueTileN,
-                    cutlass.Float8E8M0FNU, fp8_dtype,
-                )
+                qpvscale = self._quantize_fc2_combine(r_acc, r_fp8, fp8_dtype)
                 pool_token_global = (
                     work_tile_info.cumulative_data_physical_row
                     + work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m)
@@ -1017,10 +1024,7 @@ class GluMxfp8Epilogue:
                 )
                 fp8_dtype = self._combine_format.act_dtype
                 r_fp8 = cute.make_rmem_tensor(r_acc_layout.shape, fp8_dtype)
-                qpvscale = quant_sfd_row(
-                    r_acc, r_fp8, 1.0, EpilogueTileN,
-                    cutlass.Float8E8M0FNU, fp8_dtype,
-                )
+                qpvscale = self._quantize_fc2_combine(r_acc, r_fp8, fp8_dtype)
                 # Write 32 fp8 elements to local fc2_output_workspace pool.
                 fp8_byte_addr = (
                     token_comm_args.fc2_output_workspace.iterator.toint()
@@ -1123,6 +1127,25 @@ class GluMxfp8Epilogue:
 
         iket.range_pop()
 
+
+    @cute.jit
+    def _quantize_fc2_combine(self, r_acc, r_fp8, fp8_dtype):
+        if cutlass.const_expr(self.batch_invariant):
+            values = cute.coalesce(r_acc)
+            scaled, scale = legacy_quantize_block_precast(
+                Mx8ScalarF32,
+                tuple(values[i] for i in range(EpilogueTileN)),
+                quant_kind="mxfp8_e4m3",
+            )
+            scaled_regs = cute.make_rmem_tensor((EpilogueTileN,), cutlass.Float32)
+            for i in cutlass.range_constexpr(EpilogueTileN):
+                scaled_regs[i] = scaled[i]
+            cute.coalesce(r_fp8).store(scaled_regs.load().to(fp8_dtype))
+            return scale
+        return quant_sfd_row(
+            r_acc, r_fp8, 1.0, EpilogueTileN,
+            cutlass.Float8E8M0FNU, fp8_dtype,
+        )
 
     @cute.jit
     def _write_sf_fc2_buffer(self, rmem_sf_fc2, subtile_idx, qpvscale) -> None:

@@ -251,6 +251,7 @@ def _megamoe_bf16_fingerprint(
     apply_routing_weights_before_fc2: bool = True,
     gate_up_clamp: float | None = None,
     arch=None,
+    **numerical_kwargs,
 ) -> str:
     from ..moe_ep.batch_invariant.spec import spec_fingerprint
 
@@ -262,6 +263,7 @@ def _megamoe_bf16_fingerprint(
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         gate_up_clamp=gate_up_clamp,
         arch=_mx_family(arch, "megamoe_bf16"),
+        **numerical_kwargs,
     )
 
 
@@ -278,6 +280,7 @@ def _megamoe_nvfp4_fingerprint(
     has_fc2_alpha: bool = True,
     has_fc1_norm_const: bool = True,
     arch=None,
+    **numerical_kwargs,
 ) -> str:
     from ..moe_ep.batch_invariant.nvfp4_spec import spec_fingerprint
 
@@ -294,6 +297,7 @@ def _megamoe_nvfp4_fingerprint(
         has_fc1_alpha=has_fc1_alpha,
         has_fc2_alpha=has_fc2_alpha,
         has_fc1_norm_const=has_fc1_norm_const,
+        **numerical_kwargs,
     )
 
 
@@ -307,6 +311,7 @@ def _megamoe_mxfp4_fingerprint(
     apply_routing_weights_before_fc2: bool = True,
     gate_up_clamp: float | None = None,
     arch=None,
+    **numerical_kwargs,
 ) -> str:
     from ..moe_ep.batch_invariant.mxfp4_spec import spec_fingerprint
 
@@ -320,6 +325,7 @@ def _megamoe_mxfp4_fingerprint(
         implementation=implementation,
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         gate_up_clamp=gate_up_clamp,
+        **numerical_kwargs,
     )
 
 
@@ -333,6 +339,7 @@ def _megamoe_mxfp8_fingerprint(
     apply_routing_weights_before_fc2=True,
     gate_up_clamp=None,
     arch=None,
+    **numerical_kwargs,
 ):
     from ..moe_ep.batch_invariant.mxfp8_spec import spec_fingerprint
 
@@ -346,7 +353,61 @@ def _megamoe_mxfp8_fingerprint(
         implementation=implementation,
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         gate_up_clamp=gate_up_clamp,
+        **numerical_kwargs,
     )
+
+
+_MEGAMOE_NUMERICAL_DIMS = (
+    "activation",
+    "swiglu_alpha",
+    "swiglu_beta",
+    "situ_beta",
+    "situ_linear_beta",
+    "per_token_scale",
+    "combine_dtype",
+    "output_mode",
+)
+
+
+def _megamoe_a16_handler(kind):
+    def compute(
+        hidden,
+        intermediate,
+        top_k,
+        num_experts,
+        *,
+        apply_routing_weights_before_fc2=kind != "w4a16",
+        gate_up_clamp=None,
+        arch=None,
+        activation="swiglu",
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        situ_beta=None,
+        situ_linear_beta=None,
+        handoff_norm=False,
+        output_mode="finalized",
+    ):
+        from ..moe_ep.batch_invariant.a16_spec import spec_fingerprint
+
+        return spec_fingerprint(
+            hidden,
+            intermediate,
+            top_k,
+            num_experts,
+            kind=kind,
+            apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+            gate_up_clamp=gate_up_clamp,
+            arch=_mx_family(arch, "megamoe_" + kind),
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            handoff_norm=handoff_norm,
+            output_mode=output_mode,
+        )
+
+    return compute
 
 
 #: The FlashInfer APIs with a batch-invariant class, by API name.
@@ -363,7 +424,8 @@ CLASSES: Dict[str, ClassInfo] = {
         "megamoe.bf16",
         ("hidden", "intermediate", "top_k", "num_experts"),
         _megamoe_bf16_fingerprint,
-        ("apply_routing_weights_before_fc2", "gate_up_clamp", "arch"),
+        ("apply_routing_weights_before_fc2", "gate_up_clamp", "arch")
+        + _MEGAMOE_NUMERICAL_DIMS,
     ),
     "megamoe_nvfp4": ClassInfo(
         "megamoe.nvfp4",
@@ -378,7 +440,8 @@ CLASSES: Dict[str, ClassInfo] = {
             "has_fc2_alpha",
             "has_fc1_norm_const",
             "arch",
-        ),
+        )
+        + _MEGAMOE_NUMERICAL_DIMS,
     ),
     "megamoe_mxfp4": ClassInfo(
         "megamoe.mxfp4",
@@ -390,7 +453,8 @@ CLASSES: Dict[str, ClassInfo] = {
             "apply_routing_weights_before_fc2",
             "gate_up_clamp",
             "arch",
-        ),
+        )
+        + _MEGAMOE_NUMERICAL_DIMS,
     ),
     "megamoe_mxfp8": ClassInfo(
         "megamoe.mxfp8",
@@ -402,8 +466,29 @@ CLASSES: Dict[str, ClassInfo] = {
             "apply_routing_weights_before_fc2",
             "gate_up_clamp",
             "arch",
-        ),
+        )
+        + _MEGAMOE_NUMERICAL_DIMS,
     ),
+    **{
+        "megamoe_" + kind: ClassInfo(
+            "megamoe.a16",
+            ("hidden", "intermediate", "top_k", "num_experts"),
+            _megamoe_a16_handler(kind),
+            (
+                "apply_routing_weights_before_fc2",
+                "gate_up_clamp",
+                "arch",
+                "activation",
+                "swiglu_alpha",
+                "swiglu_beta",
+                "situ_beta",
+                "situ_linear_beta",
+                "handoff_norm",
+                "output_mode",
+            ),
+        )
+        for kind in ("w4a16", "w8a16_e4m3", "w8a16_e5m2")
+    },
     "mm_bf16": ClassInfo("gemm.bf16", ("N", "K"), _mm_bf16_fingerprint, ("bias",)),
     # the fp8 input dtype is a dimension: e4m3 and e5m2 are two classes (gemm.e4m3.*, gemm.e5m2.*) of one API; the output
     # dtype (bf16 / fp16) is the chain's conversion; the batch is not a dimension (every element is one launch of the class)

@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-NVFP4_BATCH_INVARIANT_VERSION = 1
+NVFP4_BATCH_INVARIANT_VERSION = 2
 
 
 def nvfp4_batch_invariant_metadata(config: Any) -> dict:
@@ -167,18 +167,27 @@ def validate_nvfp4_batch_invariant(
         raise ValueError(
             "batch_invariant NVFP4 apply_routing_weights_before_fc2 must be a bool"
         )
+    from .activation_batch_invariant import (
+        batch_invariant_activation,
+        batch_invariant_variant_kwargs,
+        block_scaled_activation_family,
+    )
+
+    batch_invariant_activation(
+        config, family=block_scaled_activation_family(implementation, arch, nvfp4=True)
+    )
+    variant = batch_invariant_variant_kwargs(config)
+    if variant.get("per_token_scale") and not (
+        implementation == "legacy"
+        or (implementation == "standard" and arch in ("sm_100", "sm_103"))
+    ):
+        raise ValueError(
+            "per-token FC1 scaling BI is only implemented by legacy and Blackwell standard NVFP4"
+        )
     fixed = {
-        "activation": "swiglu",
-        "situ_beta": None,
-        "situ_linear_beta": None,
-        "swiglu_alpha": None,
-        "swiglu_beta": None,
-        "combine_dtype": "bf16",
         "enable_in_kernel_fc2_reduce": False,
         "in_kernel_fc2_reduce": False,
         "reduce_topk_in_kernel": False,
-        "enable_fc1_activation_per_token_scale": False,
-        "use_custom_finalize": False,
     }
     for name, expected in fixed.items():
         if not _same(getattr(config, name, expected), expected):
@@ -188,18 +197,11 @@ def validate_nvfp4_batch_invariant(
             raise ValueError(
                 f"batch_invariant NVFP4 requires {name}=True (use explicit ones tensors)"
             )
-    finalize = getattr(config, "finalize_mode", None)
-    if finalize is not None:
-        from flashinfer.moe_ep.config import FinalizeMode
+    from .activation_batch_invariant import validate_batch_invariant_output
 
-        if finalize not in (
-            FinalizeMode.AUTO,
-            FinalizeMode.DEFAULT,
-            FinalizeMode.PERSISTENT,
-        ):
-            raise ValueError(
-                "batch_invariant NVFP4 requires ordered default or persistent finalization"
-            )
+    validate_batch_invariant_output(
+        config, implementation=implementation, arch=arch, kind="nvfp4"
+    )
     norm = getattr(config, "input_norm_const", 1.0)
     if (
         isinstance(norm, bool)
@@ -236,6 +238,14 @@ def validate_nvfp4_batch_invariant(
     }
     if implementation == "genphase":
         scheduling = {"work_id_mode": ("grid_stride", "atomic_counter")}
+    if implementation == "standard":
+        from .quantized_batch_invariant_tiles import (
+            validate_quantized_batch_invariant_tile,
+        )
+
+        validate_quantized_batch_invariant_tile(
+            config, kind="nvfp4", arch=arch, knobs=supplied
+        )
     for name, expected in defaults.items():
         value = supplied.get(name, getattr(config, name, expected))
         if value is None and name in (
@@ -244,10 +254,24 @@ def validate_nvfp4_batch_invariant(
             "schedule_policy",
         ):
             value = expected
+        if implementation == "standard" and name == "mma_tiler_mnk":
+            continue
         allowed = scheduling.get(name, (expected,))
         if not any(_same(value, item) for item in allowed):
             raise ValueError(
                 f"batch_invariant NVFP4 does not admit {name}={value!r} for {arch}/{implementation}"
+            )
+    if implementation == "standard":
+        schedule = supplied.get(
+            "schedule_policy",
+            getattr(config, "schedule_policy", defaults["schedule_policy"]),
+        )
+        work = supplied.get(
+            "work_id_mode", getattr(config, "work_id_mode", defaults["work_id_mode"])
+        )
+        if schedule == ("phase_interleave", None) and work != "atomic_counter":
+            raise ValueError(
+                "NVFP4 phase_interleave requires work_id_mode='atomic_counter'"
             )
 
 
@@ -261,6 +285,8 @@ def nvfp4_batch_invariant_fingerprint(
     public_inputs: bool = False,
 ) -> str:
     """Describe the actual provider chain; scale tensor payloads remain operator inputs."""
+    from .activation_batch_invariant import batch_invariant_fingerprint_kwargs
+
     from flashinfer.moe_ep.batch_invariant.nvfp4_spec import spec_fingerprint
 
     implementation = implementation or nvfp4_batch_invariant_implementation(config)
@@ -274,6 +300,20 @@ def nvfp4_batch_invariant_fingerprint(
     )
     if implementation == "legacy" and hasattr(config, "intermediate"):
         intermediate //= 2
+    if implementation == "standard":
+        from .quantized_batch_invariant_tiles import (
+            validate_quantized_batch_invariant_tile,
+        )
+
+        validate_quantized_batch_invariant_tile(
+            config,
+            kind="nvfp4",
+            arch=arch,
+            knobs=getattr(config, "knobs", None)
+            if isinstance(getattr(config, "knobs", None), dict)
+            else None,
+            hidden=hidden,
+        )
     return spec_fingerprint(
         hidden=hidden if hidden is not None else config.hidden,
         intermediate=intermediate,
@@ -291,4 +331,5 @@ def nvfp4_batch_invariant_fingerprint(
             or getattr(config, f"has_{name}", getattr(config, name, None) is not None)
             for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
         },
+        **batch_invariant_fingerprint_kwargs(config),
     )

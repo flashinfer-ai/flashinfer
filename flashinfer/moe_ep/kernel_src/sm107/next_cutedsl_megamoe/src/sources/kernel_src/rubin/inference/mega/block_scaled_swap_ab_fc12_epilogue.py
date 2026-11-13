@@ -29,6 +29,7 @@ from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDev
 from .....communication.token_protocol import TokenSrcMetadata
 from .....quant_def import CombineFormat, QuantKind
 from flashinfer.moe_ep.batch_invariant.nvfp4_device import PackedF32, ScalarF32
+from flashinfer.moe_ep.batch_invariant.activation_variants import activation_accumulator
 from flashinfer.moe_ep.batch_invariant.mxfp4_device import ScalarF32 as MxScalarF32
 from flashinfer.moe_ep.batch_invariant.mxfp4_spec import (
     half_amax as mx_half_amax,
@@ -172,6 +173,15 @@ class QuantImpl:
             if cutlass.const_expr(self.sf_vec_direction == "regs_in_pair_threads"):
                 return self.mx_quant_regs_in_pair_threads_impl(prequant_reg, smem_intermediate)
             return self.nvfp4_quant_impl(prequant_reg, norm_const=norm_const)
+        if cutlass.const_expr(self.batch_invariant):
+            from flashinfer.moe_ep.batch_invariant.quantized_combine_device import quantize_combine_wire
+
+            return quantize_combine_wire(
+                prequant_reg,
+                combine_dtype="nvfp4" if self.data_dtype is cutlass.Float4E2M1FN else "mxfp8",
+                across_lanes=self.sf_vec_direction == "threads_with_the_same_reg",
+                lane_idx=self.lane_idx,
+            )
         if cutlass.const_expr(self.data_dtype is cutlass.Float4E2M1FN):
             if cutlass.const_expr(self.sf_vec_direction == "regs_in_thread"):
                 return self.nvfp4_combine_quant_regs_in_thread_impl(prequant_reg)
@@ -992,6 +1002,7 @@ class SwapABGatedActEpilogue(KernelComponent):
 
         self.quant_kind = QuantKind(problem_desc["quant_kind"])
         self.batch_invariant = bool(problem_desc.get("batch_invariant", False))
+        self.batch_invariant_activation = problem_desc.get("batch_invariant_activation")
         self.acc_dtype = tcgen05_block_scaled_acc_dtype
         self.hidden_size = problem_desc["hidden_size"]
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
@@ -1663,13 +1674,22 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             if cutlass.const_expr(alpha_val is not None):
                 alpha_pair = (alpha_val, alpha_val)
             for i in cutlass.range_constexpr(0, cute.size(gate_rmem), 2):
-                result = fc1_activation(
-                    PackedF32,
-                    (gate_rmem[i], gate_rmem[i + 1]),
-                    (up_rmem[i], up_rmem[i + 1]),
-                    alpha=alpha_pair,
-                    clamp=self.gate_up_clamp,
-                )
+                if cutlass.const_expr(self.batch_invariant_activation is not None):
+                    result = activation_accumulator(
+                        PackedF32,
+                        (gate_rmem[i], gate_rmem[i + 1]),
+                        (up_rmem[i], up_rmem[i + 1]),
+                        variant=self.batch_invariant_activation,
+                        alpha=alpha_pair,
+                    )
+                else:
+                    result = fc1_activation(
+                        PackedF32,
+                        (gate_rmem[i], gate_rmem[i + 1]),
+                        (up_rmem[i], up_rmem[i + 1]),
+                        alpha=alpha_pair,
+                        clamp=self.gate_up_clamp,
+                    )
                 out[i], out[i + 1] = result
         else:
             out = self._alpha_swiglu_clamp_regular(gate_rmem, up_rmem, alpha_val)
@@ -2614,7 +2634,7 @@ def fc2_stg_store_function(
     **_,
 ):
     if cutlass.const_expr(epi.combine_format.is_quantized):
-        data_subtile, sf_regs = QuantImpl(epi.combine_format, "regs_in_thread")(subtile)
+        data_subtile, sf_regs = QuantImpl(epi.combine_format, "regs_in_thread", batch_invariant=epi.batch_invariant)(subtile)
     else:
         data_subtile = subtile
         sf_regs = None
@@ -2667,7 +2687,7 @@ def fc2_tma_store_function(
         raise ValueError("FC2 TMA store requires staged SMEM, a TMA atom, and a token-major output tensor.")
 
     if cutlass.const_expr(epi.combine_format.is_quantized):
-        data_subtile, sf_regs = QuantImpl(epi.combine_format, "regs_in_thread")(subtile)
+        data_subtile, sf_regs = QuantImpl(epi.combine_format, "regs_in_thread", batch_invariant=epi.batch_invariant)(subtile)
     else:
         data_subtile = subtile
         sf_regs = None
@@ -2743,7 +2763,7 @@ def fc2_ublk_store_function_impl(
         raise ValueError("fc2 UBLK store requires epi.smem_tensor.")
     quantized: cutlass.Constexpr[bool] = epi.combine_format.is_quantized
     if cutlass.const_expr(quantized):
-        data_subtile, sf_regs = QuantImpl(epi.combine_format, "regs_in_thread")(subtile)
+        data_subtile, sf_regs = QuantImpl(epi.combine_format, "regs_in_thread", batch_invariant=epi.batch_invariant)(subtile)
         sf_scales_per_stg: cutlass.Constexpr[int] = 32 // epi.combine_format.scale_block
         token_groups_per_subtile: cutlass.Constexpr[int] = epi._EpilogueTokenTileSize // 32
         for token_group in cutlass.range_constexpr(token_groups_per_subtile):

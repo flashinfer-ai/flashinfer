@@ -255,7 +255,11 @@ def write_record(entry):
                 e
                 for e in data["entries"]
                 if not isinstance(e, dict)
-                or not all(e.get(k) == entry[k] for k in identity)
+                or not (
+                    all(e.get(k) == entry[k] for k in identity)
+                    and e.get("timing_boundary", "kernel")
+                    == entry.get("timing_boundary", "kernel")
+                )
             ]
             data["entries"].append(entry)
             with tempfile.NamedTemporaryFile(

@@ -35,13 +35,23 @@ def _device(kind):
     return cc
 
 
-def _config(kind, provider, early, *, knobs=None, bi=True, persistent=False):
+def _config(
+    kind,
+    provider,
+    early,
+    *,
+    knobs=None,
+    bi=True,
+    persistent=False,
+    intermediate=INTERMEDIATE,
+    top_k=3,
+):
     import torch
     from flashinfer import moe_ep
 
     common = dict(
-        intermediate_size=INTERMEDIATE,
-        top_k=3,
+        intermediate_size=intermediate,
+        top_k=top_k,
         batch_invariant=bi,
         knobs=knobs,
         gate_up_clamp=2.5,
@@ -61,12 +71,14 @@ def _config(kind, provider, early, *, knobs=None, bi=True, persistent=False):
             fc2_use_bulk=provider == "genphase",
         )
     common.update(
-        finalize_mode=moe_ep.FinalizeMode.PERSISTENT
-        if persistent
-        else moe_ep.FinalizeMode.DEFAULT,
-        num_valid_tokens_tensor=torch.zeros(1, device="cuda", dtype=torch.int32)
-        if persistent
-        else None,
+        finalize_mode=(
+            moe_ep.FinalizeMode.PERSISTENT
+            if persistent
+            else moe_ep.FinalizeMode.DEFAULT
+        ),
+        num_valid_tokens_tensor=(
+            torch.zeros(1, device="cuda", dtype=torch.int32) if persistent else None
+        ),
     )
     if provider == "genphase":
         return moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
@@ -139,6 +151,19 @@ def _run(kind, provider, early, rank, world, full):
                                 anchor[order],
                                 f"{kind}/{provider}/{knobs}/T={n}",
                             )
+                if world > 1:
+                    for n in (
+                        0 if rank == 0 else 1,
+                        1 if rank == 0 else min(capacity, 129),
+                    ):
+                        order = torch.arange(n, device="cuda")
+                        _assert_bits(
+                            layer.forward(
+                                MoEEpTensors(x[order], ids[order], scores[order])
+                            ),
+                            anchor[order],
+                            f"{kind}/{provider}/{knobs}/uneven T={n}",
+                        )
                 if capacity >= 4:
                     order = torch.tensor([19, 20, 1, 53], device="cuda")
                     output = torch.empty_like(anchor[order])
@@ -161,6 +186,17 @@ def _run(kind, provider, early, rank, world, full):
                         ):
                             source_ids = alternate_ids if changed else ids
                             expected = alternate if changed else anchor
+                            # The masked slots must contain nonzero old results.
+                            # Their reference rows have zero scores, so merely
+                            # replaying those rows would not catch a stale read
+                            # in the early-routing path.
+                            prime = order.roll(2)
+                            inputs.hidden_states.copy_(x[prime])
+                            inputs.topk_ids.copy_(source_ids[prime])
+                            inputs.topk_weights.copy_(scores[prime])
+                            graph.replay()
+                            _assert_bits(output, expected[prime], "nonzero graph prime")
+                            inputs.hidden_states.copy_(x[order])
                             inputs.topk_ids.copy_(source_ids[order])
                             inputs.topk_weights.copy_(scores[order])
                             if masked:
@@ -175,6 +211,59 @@ def _run(kind, provider, early, rank, world, full):
                     finally:
                         graph.reset()
                 assert layer.batch_invariant_fingerprint == receipt
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("provider", PROVIDERS)
+@pytest.mark.parametrize("early", (False, True))
+def test_mxfp4_batch_invariant_autotune_disk_reload(
+    kind, provider, early, monkeypatch, tmp_path
+):
+    from ._megamoe_bi_helpers import autotune_disk_reload
+
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        pytest.skip("single-rank autotune test")
+    _device(kind)
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    x, scores, ids, weights = _problem(0, 1, HIDDEN, INTERMEDIATE)
+    autotune_disk_reload(
+        make_config=lambda knobs: _config(kind, provider, early, knobs=knobs),
+        weights=weights,
+        x=x,
+        ids=ids,
+        scores=scores,
+        layer_factory=_layer,
+        provider=provider,
+        directory=tmp_path,
+        monkeypatch=monkeypatch,
+    )
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("provider", PROVIDERS)
+@pytest.mark.parametrize("early", (False, True))
+@pytest.mark.parametrize(
+    "shape,top_k", (((2048, 2048), 3), ((128, 128), 1), ((128, 128), 32))
+)
+def test_mxfp4_batch_invariant_long_k_and_topk_boundaries(
+    kind, provider, early, shape, top_k, monkeypatch
+):
+    from ._megamoe_bi_helpers import boundary_batches
+
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        pytest.skip("single-rank boundary test")
+    cc = _device(kind)
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
+    x, scores, ids, weights = _problem(
+        0, 1, *shape, top_k=top_k, local_experts=max(4, top_k)
+    )
+    scores.mul_(max(1, top_k / 3))
+    scores[:, 0].neg_()
+    config = _config(kind, provider, early, intermediate=shape[1], top_k=top_k)
+    boundary_batches(
+        config, weights, x, ids, scores, _layer, ({}, _plans(provider, cc)[-1])
+    )
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -312,6 +401,48 @@ def _torch_reference(q, sf, ids, scores, packed, kind, early):
     return acc.bfloat16()
 
 
+def _distributed_oracle(kind, provider, early, rank, world):
+    from flashinfer.moe_ep import MoEWeightPack
+    from ._megamoe_bi_helpers import (
+        all_gather_rows,
+        distributed_reference,
+        remote_routes,
+    )
+
+    x, scores, ids, weights = _problem(rank, world, HIDDEN, INTERMEDIATE)
+    q1, sf1 = _quantize(weights.w13, kind, weight=True)
+    q2, sf2 = _quantize(weights.w2, kind, weight=True)
+    packed_weights = MoEWeightPack(w13=q1, w2=q2, w13_scale=sf1, w2_scale=sf2)
+    global_weights = MoEWeightPack(
+        w13=all_gather_rows(q1),
+        w2=all_gather_rows(q2),
+        w13_scale=all_gather_rows(sf1),
+        w2_scale=all_gather_rows(sf2),
+    )
+    q, sf = _quantize(x[:31], kind)
+    ids = remote_routes(ids[:31], rank, world, weights.w13.shape[0])
+
+    def reference(q, sf, route_ids, route_scores):
+        return _torch_reference(
+            q, sf, route_ids, route_scores, global_weights, kind, early
+        )
+
+    distributed_reference(
+        config=_config(kind, provider, early),
+        weights=packed_weights,
+        packed=q,
+        scales=sf,
+        ids=ids,
+        scores=scores[:31],
+        reference=reference,
+        layer_factory=_layer,
+        hidden=HIDDEN,
+        rank=rank,
+        world=world,
+        tolerance=0.06 if kind == "mxfp4" else 0.02,
+    )
+
+
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("provider", PROVIDERS)
 @pytest.mark.parametrize("early", (False, True))
@@ -357,7 +488,9 @@ def test_mxfp4_batch_invariant_independent_reference(
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("provider", PROVIDERS)
 @pytest.mark.parametrize("early", (False, True))
-def test_mxfp4_batch_invariant_expert_parallel(kind, provider, early, request):
+def test_mxfp4_batch_invariant_expert_parallel(
+    kind, provider, early, request, _ieee_matmul
+):
     from flashinfer import moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
@@ -375,6 +508,12 @@ def test_mxfp4_batch_invariant_expert_parallel(kind, provider, early, request):
         bootstrap, create_mega_kernel(config).runtime_requirements(bootstrap)
     )
     try:
+        _distributed_oracle(kind, provider, early, rank, world)
         _run(kind, provider, early, rank, world, request.config.getoption("--full"))
+    except BaseException as error:
+        from ._megamoe_bi_helpers import fail_stop_distributed
+
+        fail_stop_distributed(error, world)
+        raise
     finally:
         moe_ep.finalize_moe_ep_runtime(runtime)

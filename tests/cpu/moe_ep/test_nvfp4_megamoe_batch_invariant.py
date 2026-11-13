@@ -98,19 +98,19 @@ def test_public_receipt_matches_actual_workspace_arithmetic(provider, monkeypatc
     "kwargs",
     [
         {"enable_in_kernel_fc2_reduce": True},
-        {"combine_dtype": "nvfp4"},
+        {"combine_dtype": "fp32"},
         {"finalize_mode": FinalizeMode.CAKE},
-        {"finalize_mode": FinalizeMode.NONE},
-        {"activation": "situ", "situ_beta": 1.0},
-        {"swiglu_alpha": 1.702, "swiglu_beta": 1.0},
-        {"enable_fc1_activation_per_token_scale": True},
+        {"finalize_mode": FinalizeMode.NONE, "combine_dtype": "mxfp8"},
+        {"activation": "situ", "situ_beta": -1.0},
+        {"swiglu_alpha": 1.702},
+        {"enable_fc1_activation_per_token_scale": 1},
         {"knobs": {"unknown_future_knob": False}},
         {"knobs": {"mma_tiler_mnk": (256, 256, 256)}},
         {"knobs": {"in_kernel_fc2_reduce": True}},
     ],
 )
 def test_public_rejects_unsupported_arithmetic_before_allocation(kwargs):
-    with pytest.raises(ValueError, match="batch_invariant|NVFP4"):
+    with pytest.raises(ValueError):
         _public(**kwargs)
 
 

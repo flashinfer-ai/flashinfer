@@ -30,6 +30,33 @@ replace its own device snapshot.
 
 ## Pending local diffs vs upstream
 
+- **Opt-in quantized combine arithmetic:** the NVFP4 FC2 epilogue forwards
+  its BI flag to the shared canonical BF16-to-quantized wire encoder for
+  both register and across-lane layouts. Legacy MXFP8 instead preserves its
+  FP32-to-MXFP8 legacy quantizer through an explicit ordered helper. The
+  shared top-k reducer uses a zero-seeded ordered slot fold in BI mode,
+  masking payload, scale and score loads for invalid routes. Legacy launchers
+  pass route indices for this quantized BI branch. Ordinary quantization and
+  reduction retain their existing paths. Reapply until upstream absorbs this
+  integration patch.
+
+- **Opt-in activation variants:** the BF16, NVFP4 and MXFP8 FC12 setup forwards
+  an optional `batch_invariant_activation` recipe to its epilogue. Only the
+  enabled BI path interprets that recipe through the shared ordered activation
+  helper; a missing recipe keeps each provider's existing default helper.
+  The NVFP4 BI path also follows the existing per-token scale shuffle mapping,
+  folding token scale times expert alpha with an explicit RN multiply before
+  accumulator dequantization. Ordinary activation branches are unchanged.
+  Reapply until upstream absorbs these integration hooks.
+
+- **Shared FC2 epilogue compatibility:**
+  `src/moe_nvfp4_swapab/epilogue_refactor.py` defaults the optional
+  `batch_invariant_chain` flag to false when forwarding FC2 conversion. The
+  mixed MXFP8-weight/BF16-activation epilogue also uses this adapter and has no
+  NVFP4 arithmetic flag; its ordinary conversion must remain available.
+  An explicitly enabled NVFP4 batch-invariant flag is preserved. Reapply until
+  upstream absorbs the fix.
+
 - **MXFP8 batch-invariant arithmetic:** the MXFP8 frontend binds a fixed
   M256/N256/K128 paired-CTA geometry and native K32 MMA fold, with routing
   weights applied before FC2. `src/moe_mxfp8_glu/kernel_mxfp8_glu_fc12.py`
@@ -157,6 +184,18 @@ replace its own device snapshot.
   Upstream `main` has since moved this feature to the `next/` path (see the
   kernel repo's `docs/FC1_PER_TOKEN_SCALE_NEXT_DESIGN.md`); re-derive on the
   next re-sync.
+
+- **Opt-in W8A16 BI:** `src/moe_mxfp8_bf16_glu/epilogue_mxfp8_bf16.py`,
+  `kernel_mxfp8_bf16_glu_fc12.py` and `megamoe_kernel_mxfp8_bf16.py` carry the
+  BF16 handoff activation adapter and masked ordered finalizer. The BI path
+  fixes the dense M256/N128 two-CTA atom and rejects accumulator overlap and
+  floating atomics. Its weight-decode/BF16-MMA receipt is separate from native
+  block-scaled W8A8. The ordinary branch retains its original activation.
+- **Legacy W8A8 BI quantized combine:** the shim can select the existing
+  internal MXFP8 payload/SF planes. The wire always stores E4M3, including
+  E5M2 input sessions, and quantizes FC2 FP32 values directly. This has a
+  separate receipt from providers that first round FC2 to BF16. Public outputs
+  remain BF16; wire payloads and SFs stay inside the symmetric workspace.
 
 ## Related trees
 

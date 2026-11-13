@@ -364,6 +364,7 @@ class Sm100SwigluBf16Fc12Kernel:
         self.epilogue = GluBf16Epilogue(**_epi_common)
         if getattr(self, "batch_invariant_chain", False):
             self.epilogue.bind_batch_invariant_chain()
+            self.epilogue.batch_invariant_activation = getattr(self, "batch_invariant_activation", None)
 
         if self.num_sched_stages is None:
             self.num_sched_stages = 2

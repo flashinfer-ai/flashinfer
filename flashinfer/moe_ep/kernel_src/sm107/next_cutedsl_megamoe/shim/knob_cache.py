@@ -64,6 +64,14 @@ def _bi_key(
     norm,
     enabled,
     version,
+    *,
+    activation="swiglu",
+    swiglu_alpha=None,
+    swiglu_beta=None,
+    situ_beta=None,
+    situ_linear_beta=None,
+    per_token_scale=False,
+    combine_dtype="bf16",
 ):
     if not enabled:
         return dict(
@@ -71,6 +79,24 @@ def _bi_key(
             batch_invariant_version=None,
             batch_invariant_fingerprint=None,
         )
+    from types import SimpleNamespace
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+        batch_invariant_variant_kwargs,
+    )
+
+    if per_token_scale:
+        raise ValueError("per-token FC1 scaling is not implemented by SM107")
+    variants = batch_invariant_variant_kwargs(
+        SimpleNamespace(
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
+    )
+    if combine_dtype != "bf16":
+        variants["combine_dtype"] = combine_dtype
     if dtype in ("mxfp4", "mxfp4_mxfp8"):
         if isinstance(norm, bool) or norm != 1.0:
             raise ValueError("batch_invariant MXFP4 requires input_norm_const=1.0")
@@ -96,6 +122,7 @@ def _bi_key(
                 implementation="genphase" if variant == "genphase" else "standard",
                 apply_routing_weights_before_fc2=early,
                 gate_up_clamp=clamp,
+                **variants,
             ),
         )
     if dtype in ("mxfp8_e4m3", "mxfp8_e5m2"):
@@ -123,6 +150,7 @@ def _bi_key(
                 implementation="genphase" if variant == "genphase" else "standard",
                 apply_routing_weights_before_fc2=early,
                 gate_up_clamp=clamp,
+                **variants,
             ),
         )
     if dtype != "nvfp4":
@@ -150,36 +178,40 @@ def _bi_key(
             has_fc1_alpha=True,
             has_fc2_alpha=True,
             has_fc1_norm_const=True,
+            **variants,
         ),
     )
 
 
-def _bi_plan_valid(knobs, variant, dtype="nvfp4"):
-    if dtype in ("mxfp4", "mxfp4_mxfp8", "mxfp8_e4m3", "mxfp8_e5m2"):
-        from types import SimpleNamespace
-        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
-            validate_block_scaled_batch_invariant,
+def _bi_plan_valid(
+    knobs,
+    variant,
+    dtype="nvfp4",
+    *,
+    hidden=None,
+    intermediate=None,
+    combine_dtype="bf16",
+):
+    from types import SimpleNamespace
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+        validate_block_scaled_batch_invariant,
+    )
+
+    values = dict(batch_invariant=True, quant_kind=dtype, combine_dtype=combine_dtype)
+    if hidden is not None:
+        values["hidden"] = hidden
+    if intermediate is not None:
+        values["intermediate"] = intermediate
+    try:
+        validate_block_scaled_batch_invariant(
+            SimpleNamespace(**values),
+            _knobs_from_json(knobs),
+            implementation="genphase" if variant == "genphase" else "standard",
+            arch="sm_107",
         )
-
-        try:
-            validate_block_scaled_batch_invariant(
-                SimpleNamespace(batch_invariant=True, quant_kind=dtype),
-                _knobs_from_json(knobs),
-                implementation="genphase" if variant == "genphase" else "standard",
-                arch="sm_107",
-            )
-        except (TypeError, ValueError):
-            return False
-        return True
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
-        nvfp4_batch_invariant_knobs_valid,
-    )
-
-    return nvfp4_batch_invariant_knobs_valid(
-        _knobs_from_json(knobs),
-        implementation="genphase" if variant == "genphase" else "standard",
-        arch="sm_107",
-    )
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _cache_path() -> Optional[str]:
@@ -270,6 +302,9 @@ def _matching_entries(
     batch_invariant: bool = False,
     batch_invariant_version: Optional[int] = None,
     input_norm_const: float = 1.0,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    per_token_scale: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return records with a compatible numerical and execution contract."""
     if entries is None:
@@ -288,6 +323,13 @@ def _matching_entries(
             input_norm_const,
             batch_invariant,
             batch_invariant_version,
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            per_token_scale=per_token_scale,
+            combine_dtype=combine_dtype,
         ),
         backend_revision=BACKEND_REVISION,
         kernel_variant=kernel_variant,
@@ -314,7 +356,17 @@ def _matching_entries(
             for f in _KEY_FIELDS
         )
         and isinstance(e.get("knobs"), dict)
-        and (not batch_invariant or _bi_plan_valid(e["knobs"], kernel_variant, dtype))
+        and (
+            not batch_invariant
+            or _bi_plan_valid(
+                e["knobs"],
+                kernel_variant,
+                dtype,
+                hidden=hidden,
+                intermediate=intermediate,
+                combine_dtype=combine_dtype,
+            )
+        )
         and isinstance(e.get("max_tokens"), int)
         and (
             allow_nondeterministic or not e["knobs"].get("reduce_topk_in_kernel", False)
@@ -353,6 +405,9 @@ def lookup_record(
     batch_invariant: bool = False,
     batch_invariant_version: Optional[int] = None,
     input_norm_const: float = 1.0,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    per_token_scale: bool = False,
 ) -> Optional[Dict[str, Any]]:
     from flashinfer.moe_ep.core.tuning import select_token_entries
 
@@ -377,6 +432,9 @@ def lookup_record(
         batch_invariant=batch_invariant,
         batch_invariant_version=batch_invariant_version,
         input_norm_const=input_norm_const,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        per_token_scale=per_token_scale,
     )
     matches = select_token_entries(matches, max_tokens, live_tokens)
     if not matches:
@@ -421,9 +479,19 @@ def make_record(
     batch_invariant: bool = False,
     batch_invariant_version: Optional[int] = None,
     input_norm_const: float = 1.0,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    per_token_scale: bool = False,
 ) -> Dict[str, Any]:
     """Build a tuning record shared by FlashInfer and the MegaMoE file."""
-    if batch_invariant and not _bi_plan_valid(knobs, kernel_variant, dtype):
+    if batch_invariant and not _bi_plan_valid(
+        knobs,
+        kernel_variant,
+        dtype,
+        hidden=hidden,
+        intermediate=intermediate,
+        combine_dtype=combine_dtype,
+    ):
         raise ValueError("cannot record an inadmissible batch-invariant NVFP4 plan")
     if knobs.get("reduce_topk_in_kernel", False) and not allow_nondeterministic:
         raise ValueError(
@@ -446,6 +514,13 @@ def make_record(
             input_norm_const,
             batch_invariant,
             batch_invariant_version,
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            per_token_scale=per_token_scale,
+            combine_dtype=combine_dtype,
         ),
         backend_revision=BACKEND_REVISION,
         kernel_variant=kernel_variant,
@@ -600,6 +675,9 @@ def resolve_knobs(
     batch_invariant: bool = False,
     batch_invariant_version: Optional[int] = None,
     input_norm_const: float = 1.0,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    per_token_scale: bool = False,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else the built-in heuristic.
 
@@ -625,6 +703,9 @@ def resolve_knobs(
         batch_invariant=batch_invariant,
         batch_invariant_version=batch_invariant_version,
         input_norm_const=input_norm_const,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        per_token_scale=per_token_scale,
     )
     if cached is not None:
         return cached, "cache"

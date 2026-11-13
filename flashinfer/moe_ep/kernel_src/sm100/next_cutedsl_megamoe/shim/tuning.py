@@ -216,13 +216,20 @@ def sm100_standard_candidates(config, *, allow_nondeterministic=False):
     """
     base = {key: getattr(config, key) for key in STANDARD_KNOB_KEYS}
     if getattr(config, "batch_invariant", False):
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.quantized_batch_invariant_tiles import (
+            quantized_batch_invariant_tiles,
+        )
+
+        tiles = quantized_batch_invariant_tiles(config.quant_kind, arch="sm_100")
         proposed = [
             dict(
                 base,
+                mma_tiler_mnk=tile,
                 token_back_mode=carrier,
                 schedule_policy=schedule,
                 work_id_mode=work,
             )
+            for tile in tiles
             for carrier in ("epi_warps", "standalone_warps", "reuse_dispatch_warps")
             for schedule, work in (
                 (("grouped", None), "grid_stride"),

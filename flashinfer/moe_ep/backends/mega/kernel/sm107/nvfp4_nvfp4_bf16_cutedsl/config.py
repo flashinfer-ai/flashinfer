@@ -54,6 +54,8 @@ class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     activation: Literal["swiglu", "situ"] = "swiglu"
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
+    swiglu_alpha: Optional[float] = field(default=None, kw_only=True)
+    swiglu_beta: Optional[float] = field(default=None, kw_only=True)
     input_norm_const: float = 1.0
     fc1_alpha: Optional["torch.Tensor"] = None
     fc2_alpha: Optional["torch.Tensor"] = None
@@ -65,6 +67,12 @@ class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
 
     def __post_init__(self) -> None:
+        if not self.batch_invariant and (
+            self.swiglu_alpha is not None or self.swiglu_beta is not None
+        ):
+            raise ValueError(
+                "custom Rubin activation constants require batch_invariant=True"
+            )
         if type(self.batch_invariant) is not bool:
             raise ValueError("batch_invariant must be a bool.")
         if self.batch_invariant:

@@ -148,7 +148,9 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
                 raise ValueError(
                     "situ_linear_beta must be positive and finite when set."
                 )
-            if self.gate_up_clamp is not None or self.activation_clamp is not None:
+            if not self.batch_invariant and (
+                self.gate_up_clamp is not None or self.activation_clamp is not None
+            ):
                 raise ValueError("activation clamps are not supported with SiTU.")
         elif self.situ_beta is not None or self.situ_linear_beta is not None:
             raise ValueError("SiTU parameters require activation='situ'.")

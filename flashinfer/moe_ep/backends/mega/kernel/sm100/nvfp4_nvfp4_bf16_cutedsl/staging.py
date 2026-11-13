@@ -91,7 +91,7 @@ def stage_mega_moe_inputs(
             topk_weights_out,
             quant_type="nvfp4",
             norm_const=norm_const,
-            **({"batch_invariant": True} if batch_invariant else {}),
+            batch_invariant=batch_invariant,
         )
         return
 

@@ -23,6 +23,7 @@ from ......core.validation.common import (
     validate_mega_fleet_params,
 )
 from ......weights import MoEWeightPack
+from ..ep_tuning import BlackwellEpTuningMixin
 from .config import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 from .staging import (
     stage_mega_moe_inputs,
@@ -33,6 +34,10 @@ from .weights import (
     TransformedMegaWeights,
     preprocess_mega_weights,
     validate_transformed_mega_weights,
+)
+
+from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+    batch_invariant_variant_kwargs,
 )
 
 if TYPE_CHECKING:
@@ -64,7 +69,7 @@ def _cake_reducer_supported(k, fleet_params: FleetParams) -> bool:
 @register_mega_kernel(
     "sm100_nvfp4_nvfp4_bf16_cutedsl", deprecated_aliases=("nvfp4_cutedsl",)
 )
-class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
+class Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
     supports_output_view = True
 
     def __init__(self, config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
@@ -195,6 +200,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             else None,
             gate_up_clamp=_resolve_gate_up_clamp(k),
             input_norm_const=k.input_norm_const,
+            **(batch_invariant_variant_kwargs(k) if k.batch_invariant else {}),
         )
 
     def _workspace_knobs(self, fleet_params):
@@ -208,6 +214,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             return selected
         if selected is None:
             selected = nvfp4_batch_invariant_default_knobs("legacy")
+            if self._kernel_config.combine_dtype != "bf16":
+                selected["token_back_mode"] = "reuse_dispatch_warps"
         validate_nvfp4_batch_invariant(
             self._kernel_config,
             selected,
@@ -283,7 +291,11 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             workspace._unfinalized_weights = (
                 torch.ones_like(workspace.topk_weights)
                 if workspace._frontend.config.apply_routing_weights_before_fc2
-                else workspace.topk_weights
+                else (
+                    torch.empty_like(workspace.topk_weights)
+                    if k.batch_invariant
+                    else workspace.topk_weights
+                )
             )
         return workspace
 
@@ -301,7 +313,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         return self._finalize_mode(fleet_params) is FinalizeMode.CAKE
 
     def _cake_reducer_supported(self, fleet_params: FleetParams) -> bool:
-        return _cake_reducer_supported(self._kernel_config, fleet_params)
+        return not self._kernel_config.batch_invariant and _cake_reducer_supported(
+            self._kernel_config, fleet_params
+        )
 
     def validate_forward(
         self,
@@ -617,6 +631,17 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         gemm2_permuted = partials[:num_tokens].view(num_tokens * top_k, hidden)
         weights = workspace._unfinalized_weights[:num_tokens]
         expanded_idx_to_permuted_idx = workspace._unfinalized_route_map[:num_tokens]
+        if self._kernel_config.batch_invariant:
+            weights = workspace._unfinalized_weights[:num_tokens]
+            if self._kernel_config.apply_routing_weights_before_fc2:
+                weights.fill_(1.0)
+            else:
+                weights.copy_(workspace.topk_weights[:num_tokens])
+            weights.masked_fill_(
+                (workspace.topk_idx[:num_tokens] < 0)
+                | (workspace.topk_idx[:num_tokens] >= workspace.num_total_experts),
+                0,
+            )
         # The full-capacity communication launch is required even for T=0.
         thunk()
         return gemm2_permuted, weights, expanded_idx_to_permuted_idx

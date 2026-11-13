@@ -1585,7 +1585,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                     num_tokens_dev=num_valid_tokens,
                     topk_indices=(
                         topk_idx
-                        if cutlass.const_expr(not self.combine_format.is_quantized)
+                        if cutlass.const_expr(not self.combine_format.is_quantized or self.batch_invariant_chain)
                         else None
                     ),
                 )
@@ -1598,7 +1598,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                     stream,
                     topk_indices=(
                         topk_idx
-                        if cutlass.const_expr(not self.combine_format.is_quantized)
+                        if cutlass.const_expr(not self.combine_format.is_quantized or self.batch_invariant_chain)
                         else None
                     ),
                 )

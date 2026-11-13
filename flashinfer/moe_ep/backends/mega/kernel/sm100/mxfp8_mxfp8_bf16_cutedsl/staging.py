@@ -122,12 +122,8 @@ def stage_mega_moe_inputs(
             topk_weights_out,
             quant_type="mxfp8_e4m3" if mixed else kind,
             mxfp8_normal_scales=mixed or batch_invariant,
-            **({"batch_invariant": True} if batch_invariant else {}),
-            **(
-                {"batch_invariant_quant_kind": kind}
-                if batch_invariant and not mixed
-                else {}
-            ),
+            batch_invariant=batch_invariant,
+            batch_invariant_quant_kind=kind if batch_invariant and not mixed else None,
         )
         return
 

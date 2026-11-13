@@ -21,6 +21,8 @@ from .....core.validation.common import (
 from .....weights import PrequantizedMoEWeights
 from .genphase_config import GenphaseConfigMixin
 
+from .common.activation_batch_invariant import batch_invariant_numerical_metadata
+
 if TYPE_CHECKING:
     from .mxfp8_mxfp4_bf16_cutedsl.config import (
         Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
@@ -185,7 +187,13 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
                 apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
                 use_persistent_finalize_kernel=self._finalize_mode(fleet)
                 is FinalizeMode.PERSISTENT,
+                use_custom_finalize=self._finalize_mode(fleet)
+                in (FinalizeMode.NONE, FinalizeMode.CAKE),
+                batch_invariant_cake_finalize=self._finalize_mode(fleet)
+                is FinalizeMode.CAKE,
+                combine_dtype=getattr(k, "combine_dtype", "bf16"),
                 **block_scaled_batch_invariant_metadata(k),
+                **batch_invariant_numerical_metadata(k),
                 **knobs,
             )
         mode = self._finalize_mode(fleet)
@@ -614,7 +622,17 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         reducer = get_cake_megamoe_topk_reduce_module(workspace.device)
         stream = torch.cuda.current_stream().cuda_stream
         thunk()
-        reducer.run(partials, workspace.output_activation, n, stream)
+        if getattr(workspace.config, "batch_invariant", False):
+            reducer.run_batch_invariant(
+                partials,
+                workspace.topk_idx,
+                workspace.output_activation,
+                n,
+                workspace.config.num_total_experts,
+                stream,
+            )
+        else:
+            reducer.run(partials, workspace.output_activation, n, stream)
         if output is None:
             return workspace.output_activation[:n]
         output.copy_(workspace.output_activation[:n])
@@ -639,6 +657,16 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         partials = workspace.custom_finalize_workspace()
         rows = partials[:n].view(n * workspace.config.num_topk, workspace.config.hidden)
         weights = workspace._unfinalized_weights[:n]
+        if workspace.config.batch_invariant:
+            if workspace.config.apply_routing_weights_before_fc2:
+                weights.fill_(1.0)
+            else:
+                weights.copy_(workspace.topk_weights[:n])
+            weights.masked_fill_(
+                (workspace.topk_idx[:n] < 0)
+                | (workspace.topk_idx[:n] >= workspace.config.num_total_experts),
+                0,
+            )
         route_map = workspace._unfinalized_route_map[:n]
         thunk = sm100_block_scaled_mega_launch_thunk(*transformed_weights, workspace)
         thunk()

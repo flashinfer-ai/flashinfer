@@ -43,6 +43,35 @@ constexpr int32_t kTopK = 6;
 constexpr int32_t kHiddenSize = 4096;
 constexpr int32_t kRequiredAlignmentBytes = 128;
 
+// BI is a separate specialization: every ordered route contributes an RN
+// addition to +0, including masked slots. Never read stale masked payloads.
+template <typename Id>
+__global__ void BatchInvariantReduce(const __nv_bfloat16* __restrict__ partials,
+                                     const Id* __restrict__ ids, __nv_bfloat16* __restrict__ out,
+                                     int64_t hidden, int64_t top_k, int64_t num_experts) {
+  const int64_t pairs_per_token = hidden / 2;
+  const int64_t worker = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t token = worker / pairs_per_token;
+  const int64_t column = 2 * (worker % pairs_per_token);
+  float2 acc = make_float2(0.0f, 0.0f);
+  for (int64_t slot = 0; slot < top_k; ++slot) {
+    const Id expert = ids[token * top_k + slot];
+    float2 value = make_float2(0.0f, 0.0f);
+    if (expert >= 0 && expert < num_experts) {
+      const auto bits =
+          *reinterpret_cast<const uint32_t*>(partials + (token * top_k + slot) * hidden + column);
+      value.x = __uint_as_float(bits << 16);
+      value.y = __uint_as_float(bits & 0xffff0000u);
+    }
+    asm("add.rn.f32x2 %0, %1, %2;"
+        : "=l"(*reinterpret_cast<unsigned long long*>(&acc))
+        : "l"(*reinterpret_cast<unsigned long long*>(&acc)),
+          "l"(*reinterpret_cast<unsigned long long*>(&value)));
+  }
+  const __nv_bfloat162 packed = __float22bfloat162_rn(acc);
+  *reinterpret_cast<__nv_bfloat162*>(out + token * hidden + column) = packed;
+}
+
 // The generated source holds the reducer in seven CTA shapes.  Every thread runs
 // the same program (six loads, FP32 adds in increasing k, one RN rounding), so
 // all shapes write bit-identical rows; they differ in threads per CTA, BF16
@@ -207,7 +236,60 @@ void Run(TensorView partials, TensorView out, int64_t num_tokens, int64_t cuda_s
   CheckCuda(cudaGetLastError(), "MegaMoE TopK-reduce launch");
 }
 
+void RunBatchInvariant(TensorView partials, TensorView ids, TensorView out, int64_t num_tokens,
+                       int64_t num_experts, int64_t cuda_stream) {
+  CHECK_CUDA(partials);
+  ffi::CUDADeviceGuard device_guard(partials.device().device_id);
+  CHECK_CUDA(ids);
+  CHECK_CUDA(out);
+  CHECK_DEVICE(partials, ids);
+  CHECK_DEVICE(partials, out);
+  CHECK_INPUT_TYPE(partials, dl_bfloat16);
+  CHECK_INPUT_TYPE(out, dl_bfloat16);
+  CHECK_CONTIGUOUS(partials);
+  CHECK_CONTIGUOUS(ids);
+  CHECK_CONTIGUOUS(out);
+  TVM_FFI_ICHECK(partials.ndim() == 3) << "partials must have shape [capacity, top_k, hidden]";
+  const int64_t capacity = partials.size(0);
+  const int64_t top_k = partials.size(1);
+  const int64_t hidden = partials.size(2);
+  TVM_FFI_ICHECK(top_k >= 1 && top_k <= 32 && hidden > 0 && hidden % 512 == 0)
+      << "BI reducer requires top_k in [1,32] and positive hidden divisible by 512";
+  TVM_FFI_ICHECK(ids.ndim() == 2 && ids.size(0) == capacity && ids.size(1) == top_k)
+      << "ids must have shape [capacity, top_k]";
+  TVM_FFI_ICHECK(ids.dtype().code == kDLInt && ids.dtype().lanes == 1 &&
+                 (ids.dtype().bits == 32 || ids.dtype().bits == 64))
+      << "ids must be int32 or int64";
+  TVM_FFI_ICHECK(out.ndim() == 2 && out.size(0) == capacity && out.size(1) == hidden)
+      << "out must have shape [capacity, hidden]";
+  TVM_FFI_ICHECK(num_tokens >= 0 && num_tokens <= capacity && num_experts > 0 && cuda_stream >= 0)
+      << "invalid BI reducer token count, expert count or stream";
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(partials.data_ptr()) % 4 == 0 &&
+                 reinterpret_cast<uintptr_t>(out.data_ptr()) % 4 == 0)
+      << "BI payload and output require 4-byte alignment";
+  CheckNoOverlap(partials, "partials", out, "out");
+  CheckNoOverlap(ids, "ids", out, "out");
+  if (num_tokens == 0) return;
+  const int64_t blocks = num_tokens * (hidden / 512);
+  TVM_FFI_ICHECK(blocks <= std::numeric_limits<int32_t>::max()) << "BI grid is too large";
+  const auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const auto* payload = reinterpret_cast<const __nv_bfloat16*>(partials.data_ptr());
+  auto* output = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+  if (ids.dtype().bits == 32) {
+    BatchInvariantReduce<<<static_cast<uint32_t>(blocks), 256, 0, stream>>>(
+        payload, reinterpret_cast<const int32_t*>(ids.data_ptr()), output, hidden, top_k,
+        num_experts);
+  } else {
+    BatchInvariantReduce<<<static_cast<uint32_t>(blocks), 256, 0, stream>>>(
+        payload, reinterpret_cast<const int64_t*>(ids.data_ptr()), output, hidden, top_k,
+        num_experts);
+  }
+  CheckCuda(cudaGetLastError(), "BI MegaMoE TopK-reduce launch");
+}
+
 }  // namespace cake_megamoe_topk_reduce
 }  // namespace flashinfer
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::cake_megamoe_topk_reduce::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_batch_invariant,
+                              flashinfer::cake_megamoe_topk_reduce::RunBatchInvariant);

@@ -43,32 +43,42 @@ def _assert_bits(actual, expected, context):
     assert count.item() == 0, f"{context}: {count.item()} output representations differ"
 
 
-def _problem(rank, world, hidden=384, intermediate=192):
+def _problem(rank, world, hidden=384, intermediate=192, *, top_k=3, local_experts=4):
     import torch
     from flashinfer.moe_ep import MoEWeightPack
 
     gen = torch.Generator(device="cuda").manual_seed(732 + rank)
     x = torch.randn(257, hidden, device="cuda", dtype=torch.bfloat16, generator=gen)
-    scores = torch.rand(257, 3, device="cuda", generator=gen)
+    scores = torch.rand(257, top_k, device="cuda", generator=gen)
     scores /= scores.sum(-1, keepdim=True)
     scores[19].zero_()
-    scores[20, 1] = 0
+    if top_k > 1:
+        scores[20, 1] = 0
+    route = (
+        [local_experts * rank + i for i in range(top_k)]
+        if top_k != 3
+        else [
+            local_experts * rank,
+            local_experts * rank + 1,
+            (
+                local_experts * rank + 2
+                if world == 1
+                else local_experts * ((rank + 1) % world)
+            ),
+        ]
+    )
     ids = (
         torch.tensor(
-            [
-                4 * rank,
-                4 * rank + 1,
-                (4 * rank + 2) if world == 1 else 4 * ((rank + 1) % world),
-            ],
+            route,
             device="cuda",
             dtype=torch.int64,
         )
-        .expand(257, 3)
+        .expand(257, top_k)
         .contiguous()
     )
     w13 = (
         torch.randn(
-            4,
+            local_experts,
             2 * intermediate,
             hidden,
             device="cuda",
@@ -79,7 +89,12 @@ def _problem(rank, world, hidden=384, intermediate=192):
     )
     w2 = (
         torch.randn(
-            4, hidden, intermediate, device="cuda", dtype=torch.bfloat16, generator=gen
+            local_experts,
+            hidden,
+            intermediate,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=gen,
         )
         * 0.05
     )
@@ -95,21 +110,29 @@ def _config(
     persistent=False,
     batch_invariant=True,
     knobs=None,
+    top_k=3,
+    local_experts=4,
 ):
     import torch
     from flashinfer import moe_ep
 
     common = dict(
         intermediate_size=intermediate,
-        top_k=3,
+        top_k=top_k,
         batch_invariant=batch_invariant,
         knobs=knobs,
         gate_up_clamp=2.5,
         apply_routing_weights_before_fc2=early,
         input_norm_const=1.7,
-        fc1_alpha=torch.tensor([0.75, 1.0, 1.25, 2.0], device="cuda"),
-        fc2_alpha=torch.tensor([1.5, 0.75, 1.0, 1.25], device="cuda"),
-        fc1_norm_const=torch.tensor([1.0, 1.25, 0.75, 1.5], device="cuda"),
+        fc1_alpha=torch.tensor(
+            [0.75, 1.0, 1.25, 2.0] * ((local_experts + 3) // 4), device="cuda"
+        )[:local_experts],
+        fc2_alpha=torch.tensor(
+            [1.5, 0.75, 1.0, 1.25] * ((local_experts + 3) // 4), device="cuda"
+        )[:local_experts],
+        fc1_norm_const=torch.tensor(
+            [1.0, 1.25, 0.75, 1.5] * ((local_experts + 3) // 4), device="cuda"
+        )[:local_experts],
     )
     if torch.cuda.get_device_capability() == (10, 7):
         assert not persistent
@@ -124,12 +147,14 @@ def _config(
         kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl"
         + ("_next" if provider != "legacy" else ""),
         kernel_variant="genphase" if provider == "genphase" else "inference",
-        finalize_mode=moe_ep.FinalizeMode.PERSISTENT
-        if persistent
-        else moe_ep.FinalizeMode.DEFAULT,
-        num_valid_tokens_tensor=torch.zeros(1, device="cuda", dtype=torch.int32)
-        if persistent
-        else None,
+        finalize_mode=(
+            moe_ep.FinalizeMode.PERSISTENT
+            if persistent
+            else moe_ep.FinalizeMode.DEFAULT
+        ),
+        num_valid_tokens_tensor=(
+            torch.zeros(1, device="cuda", dtype=torch.int32) if persistent else None
+        ),
     )
 
 
@@ -142,7 +167,7 @@ def _layer(config, weights, rank, world, capacity, hidden, *, quantize=True):
             rank=rank, world_size=world, auto_bootstrap=False
         ),
         fleet_params=moe_ep.FleetParams(
-            num_experts=4 * world,
+            num_experts=weights.w13.shape[0] * world,
             max_tokens_per_rank=capacity,
             token_hidden_size=hidden,
         ),
@@ -151,6 +176,11 @@ def _layer(config, weights, rank, world, capacity, hidden, *, quantize=True):
     )
     try:
         yield layer
+    except BaseException as error:
+        from ._megamoe_bi_helpers import fail_stop_distributed
+
+        fail_stop_distributed(error, world)
+        raise
     finally:
         layer.destroy()
 
@@ -241,6 +271,19 @@ def _run(provider, early, rank, world, full):
                                     anchor[order],
                                     f"{provider}, {knobs}, T={n}",
                                 )
+                    if world > 1:
+                        for n in (
+                            0 if rank == 0 else 1,
+                            1 if rank == 0 else min(capacity, 129),
+                        ):
+                            order = torch.arange(n, device="cuda")
+                            _assert_bits(
+                                layer.forward(
+                                    MoEEpTensors(x[order], ids[order], scores[order])
+                                ),
+                                anchor[order],
+                                f"{provider}, {knobs}, uneven/empty rank T={n}",
+                            )
                     if capacity < 4:
                         continue
                     order = torch.tensor([19, 20, 1, 53], device="cuda")
@@ -273,6 +316,72 @@ def _run(provider, early, rank, world, full):
                         _assert_bits(output, anchor[order], "graph masked routing")
                     del graph
                     assert layer.batch_invariant_fingerprint == receipt
+
+
+@pytest.mark.parametrize("provider", ("legacy", "standard", "genphase"))
+@pytest.mark.parametrize("early", (False, True))
+def test_nvfp4_batch_invariant_autotune_disk_reload(
+    provider, early, monkeypatch, tmp_path
+):
+    from ._megamoe_bi_helpers import autotune_disk_reload
+
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        pytest.skip("single-rank autotune test")
+    _device(provider)
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    hidden, intermediate = 384, 192
+    x, scores, ids, weights = _problem(0, 1, hidden, intermediate)
+    autotune_disk_reload(
+        make_config=lambda knobs: _config(
+            provider, early, hidden, intermediate, knobs=knobs
+        ),
+        weights=weights,
+        x=x,
+        ids=ids,
+        scores=scores,
+        layer_factory=_layer,
+        provider=provider,
+        directory=tmp_path,
+        monkeypatch=monkeypatch,
+    )
+
+
+@pytest.mark.parametrize("provider", ("legacy", "standard", "genphase"))
+@pytest.mark.parametrize("early", (False, True))
+@pytest.mark.parametrize(
+    "shape,top_k", (((2048, 2048), 3), ((128, 128), 1), ((128, 128), 32))
+)
+def test_nvfp4_batch_invariant_long_k_and_topk_boundaries(
+    provider, early, shape, top_k, monkeypatch
+):
+    import torch
+    from ._megamoe_bi_helpers import boundary_batches
+
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        pytest.skip("single-rank boundary test")
+    _device(provider)
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
+    local_experts = max(4, top_k)
+    x, scores, ids, weights = _problem(
+        0, 1, *shape, top_k=top_k, local_experts=local_experts
+    )
+    scores.mul_(max(1, top_k / 3))
+    scores[:, 0].neg_()
+    config = _config(provider, early, *shape, top_k=top_k, local_experts=local_experts)
+    if provider == "legacy":
+        other = dict(
+            load_balance_mode="atomic_counter", token_back_mode="reuse_dispatch_warps"
+        )
+    elif provider == "standard":
+        other = dict(
+            work_id_mode="atomic_counter", token_back_mode="reuse_dispatch_warps"
+        )
+    elif torch.cuda.get_device_capability() == (10, 7):
+        other = dict(work_id_mode="atomic_counter")
+    else:
+        other = {}
+    boundary_batches(config, weights, x, ids, scores, _layer, ({}, other))
 
 
 @pytest.mark.parametrize("provider", ("legacy", "standard", "genphase"))
@@ -419,9 +528,10 @@ def _plain_quantized_weights(weights, intermediate):
         )
 
     q1, sf1, q2, sf2 = plain
-    return MoEWeightPack(
-        w13=canonical(q1), w2=q2, w13_scale=canonical(sf1), w2_scale=sf2
-    ), plain
+    return (
+        MoEWeightPack(w13=canonical(q1), w2=q2, w13_scale=canonical(sf1), w2_scale=sf2),
+        plain,
+    )
 
 
 def _torch_reference(
@@ -461,6 +571,63 @@ def _torch_reference(
         )
         acc = (acc.double() + term.double() * scores[:, slot, None].double()).float()
     return acc.bfloat16()
+
+
+def _distributed_oracle(provider, early, rank, world):
+    from types import SimpleNamespace
+
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+        nvfp4_quantize_per_block_16,
+    )
+    from ._megamoe_bi_helpers import (
+        all_gather_rows,
+        distributed_reference,
+        remote_routes,
+    )
+
+    hidden, intermediate = 384, 192
+    x, scores, ids, weights = _problem(rank, world, hidden, intermediate)
+    config = _config(provider, early, hidden, intermediate)
+    packed_weights, plain = _plain_quantized_weights(weights, intermediate)
+    global_plain = tuple(all_gather_rows(value) for value in plain)
+    reference_config = SimpleNamespace(
+        gate_up_clamp=config.gate_up_clamp,
+        fc1_alpha=all_gather_rows(config.fc1_alpha),
+        fc2_alpha=all_gather_rows(config.fc2_alpha),
+        fc1_norm_const=all_gather_rows(config.fc1_norm_const),
+    )
+    packed, scales = nvfp4_quantize_per_block_16(
+        x[:31].float(), config.input_norm_const
+    )
+    ids = remote_routes(ids[:31], rank, world, weights.w13.shape[0])
+
+    def reference(q, sf, route_ids, route_scores):
+        return _torch_reference(
+            q,
+            sf,
+            route_ids,
+            route_scores,
+            global_plain,
+            reference_config,
+            hidden,
+            intermediate,
+            early,
+        )
+
+    distributed_reference(
+        config=config,
+        weights=packed_weights,
+        packed=packed,
+        scales=scales,
+        ids=ids,
+        scores=scores[:31],
+        reference=reference,
+        layer_factory=_layer,
+        hidden=hidden,
+        rank=rank,
+        world=world,
+        tolerance=0.02,
+    )
 
 
 @pytest.fixture
@@ -545,7 +712,7 @@ def test_nvfp4_batch_invariant_independent_reference(
 @pytest.mark.gpu_2
 @pytest.mark.parametrize("provider", ("legacy", "standard", "genphase"))
 @pytest.mark.parametrize("early", (False, True))
-def test_nvfp4_batch_invariant_expert_parallel(provider, early, request):
+def test_nvfp4_batch_invariant_expert_parallel(provider, early, request, _ieee_matmul):
     from flashinfer import moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
@@ -563,6 +730,12 @@ def test_nvfp4_batch_invariant_expert_parallel(provider, early, request):
         bootstrap, create_mega_kernel(config).runtime_requirements(bootstrap)
     )
     try:
+        _distributed_oracle(provider, early, rank, world)
         _run(provider, early, rank, world, request.config.getoption("--full"))
+    except BaseException as error:
+        from ._megamoe_bi_helpers import fail_stop_distributed
+
+        fail_stop_distributed(error, world)
+        raise
     finally:
         moe_ep.finalize_moe_ep_runtime(runtime)

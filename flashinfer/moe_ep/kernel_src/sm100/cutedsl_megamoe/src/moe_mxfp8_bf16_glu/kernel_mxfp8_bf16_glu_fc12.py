@@ -503,6 +503,8 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
             in_kernel_fc2_reduce=self.fc2_in_kernel_topk_reduce,
             token_back_by_dispatch=self.token_back_by_dispatch,
             gate_up_clamp=self.gate_up_clamp,
+            batch_invariant=getattr(self, "batch_invariant", False),
+            batch_invariant_activation=getattr(self, "batch_invariant_activation", None),
             epi_flag_batch=self.epi_flag_batch,
             accumulator_overlap=self.overlapping_accum,
         )

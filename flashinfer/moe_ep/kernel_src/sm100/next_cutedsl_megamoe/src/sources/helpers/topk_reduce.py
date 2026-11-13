@@ -743,6 +743,18 @@ class TopkReduce:
                             else:
                                 # +0 seed: a -0.0 first term yields +0.0 (main's semantics).
                                 acc[i], acc[i + 1] = self._fma(value_pair, score, (Float32(0.0), Float32(0.0)))
+            elif cutlass.const_expr(self.batch_invariant):
+                from flashinfer.moe_ep.batch_invariant.quantized_combine_device import ordered_quantized_slot_fold
+
+                sf = cute.zipped_divide(combine_sf[token_idx, None, None], (num_topk, hidden_per_thread))[
+                    (None, None), (0, hidden_tile_idx)
+                ]
+                acc = ordered_quantized_slot_fold(
+                    codes, sf, topk_score, topk_indices, token_idx,
+                    num_experts=self.num_experts,
+                    hidden_per_thread=hidden_per_thread, num_topk=num_topk,
+                    act_dtype=fmt.act_dtype, decode_fp4=cvt_e2m1_to_fp32_cvt_ptx,
+                )
             else:
                 sf = cute.zipped_divide(combine_sf[token_idx, None, None], (num_topk, hidden_per_thread))[
                     (None, None), (0, hidden_tile_idx)

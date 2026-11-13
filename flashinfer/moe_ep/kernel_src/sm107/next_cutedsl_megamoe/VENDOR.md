@@ -218,8 +218,8 @@ Pure MXFP4 and mixed MXFP4-weight/MXFP8-E4M3-activation inference additionally
 support the opt-in batch-invariant problem field. Their shim dispatch uses
 a separate arithmetic policy and receipt; NVFP4 retains its existing identity.
 Both fix instruction N128 and use cluster `(2, 1)` for standard inference or
-`(4, 1)` for GenPhase. Mixed inference uses tile `(256, 128, 128)` and native
-K64 MMA; pure MXFP4 uses `(256, 128, 256)` and native K128 MMA. The latter's
+`(4, 1)` for GenPhase. Mixed inference uses canonical tile `(256, 128, 128)`
+and native K64 MMA; pure MXFP4 uses `(256, 128, 256)` and native K128 MMA. The latter's
 actual Rubin opcode is `kind::mxf4nvf4.block_scale.block32`. Neither MX format
 has per-expert alpha or normalization operands.
 
@@ -231,6 +231,25 @@ specification. The existing fixed-N/Gather4 mapping, SwiGLU, BF16 conversion
 and ordered masked reduction are reused. Ordinary execution and NVFP4
 branches remain unchanged. These are additional FlashInfer-owned exceptions
 to retain when regenerating the pinned export until upstreamed.
+
+Standard inference can regroup the unchanged native instruction sequence
+into a larger K stage: K512 for NVFP4/pure MXFP4 and K256 for mixed MXFP4/MXFP8.
+Admission requires the H and post-activation I padding extents to match the
+canonical stage exactly. M256, N128 and the two-CTA instruction remain fixed;
+GenPhase keeps its Gather4 stage. This changes host admission and lowering
+partitions, not the native arithmetic atom or canonical receipt.
+
+## Activation variant integration patch
+
+The standard FC2 epilogue also forwards its BI flag to the shared canonical
+BF16-to-quantized combine encoder. The reducer uses one zero-seeded, ordered
+masked slot fold for quantized BI wires, preserving the ordinary quantizer
+and reducer branches. Reapply until upstream absorbs this patch.
+
+The FC12 epilogue accepts an opt-in BI ordered activation recipe from
+`ProblemDesc.batch_invariant_activation`. A missing recipe keeps the existing
+default helper; ordinary execution retains its original activation branch.
+Reapply until upstream absorbs this integration hook.
 
 ## MXFP8 batch-invariant integration patch
 

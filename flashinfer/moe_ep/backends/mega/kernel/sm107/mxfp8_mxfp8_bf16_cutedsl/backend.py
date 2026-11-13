@@ -211,6 +211,8 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             combine_dtype=k.combine_dtype,
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
+            swiglu_alpha=getattr(k, "swiglu_alpha", None),
+            swiglu_beta=getattr(k, "swiglu_beta", None),
             gate_up_clamp=_resolve_gate_up_clamp(k),
             batch_invariant=getattr(k, "batch_invariant", False),
             batch_invariant_version=block_scaled_batch_invariant_version(k)
@@ -257,6 +259,10 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                 "genphase" if k.kernel_variant == "genphase" else "standard",
                 arch="sm_107",
             )
+            for name in selected:
+                configured = getattr(k, name, None)
+                if configured is not None:
+                    selected[name] = configured
             if isinstance(k.knobs, dict):
                 selected.update(k.knobs)
             elif k.knobs == "cache":
