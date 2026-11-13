@@ -256,7 +256,7 @@ def grouped_gemm_nt_masked(
             alpha_dtype=alpha_dtype,
         )
 
-    elif major >= 10:
+    elif (major, minor) in ((10, 0), (10, 3)):
         # ----------------------------------------------------------------
         # SM100/SM103 (Blackwell)
         # ----------------------------------------------------------------
@@ -286,7 +286,17 @@ def grouped_gemm_nt_masked(
         )
 
     else:
+        # The triple is the one this kernel already enforces two layers down
+        # (grouped_gemm_masked_blackwell asserts
+        # `sm_version in ["sm_100", "sm_103", "sm_107"]` on a value it builds as
+        # f"sm_{major}{minor}") and the one the suite skips on
+        # (tests/utils/test_fp8_quantize.py: "grouped_gemm_nt_masked MXFP8
+        # requires SM100/SM103/SM107"). Before this branch the two disagreed:
+        # `major >= 10` handed SM120/SM121 to the SM100 kernel, which then
+        # tripped its own assert from inside the class constructor.
         raise ValueError(
-            f"Masked grouped GEMM is only supported on SM100+ "
-            f"(Blackwell/Rubin), got SM{major}{minor}"
+            f"Masked grouped GEMM is only supported on SM100, SM103 and SM107 "
+            f"(the cute-dsl kernels import tcgen05/TMEM from cutlass.cute.nvgpu, "
+            f"which this file builds for SM100-family targets only), got "
+            f"SM{major}{minor}"
         )
