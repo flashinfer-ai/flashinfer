@@ -1130,6 +1130,10 @@ def replay_cmd(dump_dir):
                 click.secho(
                     f"❌ Execution failed: {result['execution_error']}", fg="red"
                 )
+            elif result.get("comparison_error"):
+                click.secho(
+                    f"⚠️  Replay unverified: {result['comparison_error']}", fg="yellow"
+                )
             else:
                 click.secho("⚠️  Replay finished but outputs did not match", fg="yellow")
         else:
@@ -1139,6 +1143,7 @@ def replay_cmd(dump_dir):
 
             passed = 0
             failed = 0
+            unverified = 0
 
             for i, res in enumerate(results):
                 dump_name = (
@@ -1159,12 +1164,19 @@ def replay_cmd(dump_dir):
                 elif res.get("comparison_match"):
                     click.secho(f"[{i + 1}] {dump_name}: ✅ Passed", fg="green")
                     passed += 1
+                elif res.get("comparison_error"):
+                    click.secho(
+                        f"[{i + 1}] {dump_name}: ⚠️  Unverified: {res['comparison_error']}",
+                        fg="yellow",
+                    )
+                    unverified += 1
                 else:
                     click.secho(f"[{i + 1}] {dump_name}: ⚠️  Mismatch", fg="yellow")
                     failed += 1
 
             click.secho(
-                f"\nSummary: {passed} passed, {failed} failed/mismatch", fg="white"
+                f"\nSummary: {passed} passed, {failed} failed/mismatch, {unverified} unverified",
+                fg="white",
             )
 
     except Exception as e:

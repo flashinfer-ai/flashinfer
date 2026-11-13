@@ -104,6 +104,7 @@ These complement `FLASHINFER_LOGLEVEL`/`FLASHINFER_LOGDEST` and are all read in 
 | `FLASHINFER_DUMP_MAX_COUNT` | `1000` | Hard cap on number of dumped events; once reached, further dumps are dropped with a warning. |
 | `FLASHINFER_DUMP_MAX_SIZE_GB` | `20` | Per-process tensor-size threshold in GiB (parsed as `float`). Before each dump, accumulated tensor bytes plus the new inputs are checked; new outputs and CUDA-graph replay snapshots are not bounded by this check. Actual disk usage can exceed the threshold; use disk quotas or monitoring when a hard limit is needed. |
 | `FLASHINFER_DUMP_SAFETENSORS` | `0` | `1` writes dumps as `.safetensors` (portable / Hugging Face-style); otherwise plain `.pt`. |
+| `FLASHINFER_DUMP_GRAPH_SNAPSHOTS` | `0` | `1` copies the arguments an API declares as mutated in place, their aliases, and the call's outputs at each dump, so a `FLASHINFER_LOGLEVEL=10` dump written after CUDA-graph replay can be replayed offline from its pre-call inputs instead of the replayed buffers. Snapshots are staged into dedicated buffers during capture and refreshed on each replay, keeping D2H copies out of the captured graph, and apply to eager dumps too. Adds memory and copy cost per dumped call; unset keeps the reference-only path with no extra copies. Only dense strided tensors whose views are provably non-overlapping are supported; on other layouts that call's dump is skipped with a logged error. |
 
 ## Trace capture
 
