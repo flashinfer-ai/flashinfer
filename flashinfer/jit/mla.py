@@ -89,6 +89,7 @@ def gen_sparse_mla_sm120_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/prefill_binding.cu",
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv32_decode_dispatch.cu",
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/decode_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/legacy_decode_dispatch.cu",
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/prefill_dispatch.cu",
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv41_fp4_cache_ops.cu",
             jit_env.FLASHINFER_CSRC_DIR

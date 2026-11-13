@@ -381,3 +381,75 @@ def assert_mega_outputs(actual, expected):
         out.float(), expected_out.float(), atol=2**-9, rtol=0.125
     )
     torch.testing.assert_close(scales, expected_scales, atol=0, rtol=0)
+
+
+def decode_fixture(requests=1, *, heads=64, history_tokens=32768, seed=42):
+    """Seven verification rows/request, shifted SWA and independent causal top-512.
+
+    Requests own disjoint cache pools. The compressed history uses ratio two.
+    Cache packing and index generation are outside the measured region.
+    """
+    primary_stride = 192  # 128-entry window plus six successive verification rows.
+    extra_stride = ((history_tokens + 7) // 2 + 63) // 64 * 64
+    f = fixture(
+        requests * 7,
+        heads,
+        "v41_fp8",
+        pool_tokens=requests * primary_stride,
+        extra_pool_tokens=requests * extra_stride,
+        seed=seed,
+    )
+    generator = torch.Generator(device="cpu").manual_seed(seed + 1)
+    primary = torch.empty(requests * 7, 128, dtype=torch.int32)
+    extra = torch.empty(requests * 7, 512, dtype=torch.int32)
+    positions = torch.empty(requests * 7, dtype=torch.int32)
+    for request in range(requests):
+        for row in range(7):
+            t = request * 7 + row
+            positions[t] = history_tokens + row
+            primary[t] = request * primary_stride + torch.arange(row, row + 128)
+            available = (history_tokens + row + 1) // 2
+            extra[t] = (
+                request * extra_stride
+                + torch.randperm(available, generator=generator)[:512]
+            )
+    f["positions"].copy_(positions)
+    f["indices"][0].copy_(primary)
+    f["indices"][1].copy_(extra)
+    return f
+
+
+def decode_call(f, impl, mega=True):
+    options = dict(
+        topk_length=f["lengths"][0],
+        attn_sink=f["sink"],
+        extra_kv_cache=f["caches"][1],
+        extra_indices=f["indices"][1],
+        extra_topk_length=f["lengths"][1],
+        return_lse=True,
+        lse_scale=math.log(2),
+        impl=impl,
+    )
+    if mega:
+        return f["wrapper"].run_mega(
+            f["q"],
+            f["caches"][0],
+            f["indices"][0],
+            f["out"],
+            512**-0.5,
+            positions=f["positions"],
+            cos_sin=f["cs"],
+            output_scales=f["scales"],
+            **options,
+        )
+    f["prologue"]()
+    lse = f["wrapper"].run(
+        f["rotated"],
+        f["caches"][0],
+        f["indices"][0],
+        f["context"],
+        512**-0.5,
+        **options,
+    )
+    epilogue(f["context"], f["positions"], f["cs"], f["out"], f["scales"])
+    return lse

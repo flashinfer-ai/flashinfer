@@ -238,7 +238,13 @@ def _check_default_mega(f, *, variant, implementation=None, large_merge=None):
     if implementation is not None:
         assert plan["implementation"] == implementation, plan
     if large_merge is not None:
-        assert (plan["scratch_split_stride"] > 32) == large_merge, plan
+        if plan["implementation"] == "dsv4_fp8_splitkv_decode":
+            # The new inline route merges up to eight cluster splits inside
+            # attention. Footer caches still exercise the legacy large merge.
+            assert plan["merge"] == "direct", plan
+            assert 1 <= plan["active_splits"] <= 8, plan
+        else:
+            assert (plan["scratch_split_stride"] > 32) == large_merge, plan
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         fused_call(f, out_lse=lse)

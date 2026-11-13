@@ -25,7 +25,8 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
     return launch(std::integral_constant<ModelType, ModelType::DSV4_1>{});
   }
   // CuTe supports footer pages and flat inline rows with FP8 QK arithmetic.
-  if (is_dsv41(mt) && !m.extra_fp4 && m.heads % 32 == 0 &&
+  if (is_dsv41(mt) && !m.extra_fp4 &&
+      (m.heads % 32 == 0 || plan.implementation == execution::Implementation::Dsv4Fp8Decode) &&
       plan.numeric == execution::NumericRoute::FP8 &&
       (mt == ModelType::DSV4_1 ||
        (m.page_stride_bytes == size_t(m.page_size) * m.row_stride_bytes &&
@@ -64,23 +65,28 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
     a.sm_scale = p.sm_scale;
     a.lse_stride = m.lse_stride;
     a.lse_scale = p.lse_scale;
-    auto launch = [&](auto fused, auto inline_scale) -> PrefillLaunchResult {
+    auto launch = [&](auto fused, auto inline_scale, auto full_head_tiles) -> PrefillLaunchResult {
       constexpr bool Mega = decltype(fused)::value;
       constexpr bool Inline = decltype(inline_scale)::value;
+      constexpr bool FullHeadTiles = decltype(full_head_tiles)::value;
       static bool configured[32] = {};
-      auto status = configure_dynamic_smem_per_device(prefill<Mega, 32, true, Inline>,
+      auto status = configure_dynamic_smem_per_device(prefill<Mega, 32, FullHeadTiles, Inline>,
                                                       sizeof(Shared), configured);
-      if (!status.supported || status.error != cudaSuccess) return status;
-      prefill<Mega, 32, true, Inline>
+      if (status != cudaSuccess) return {status, "configure_dynamic_smem_per_device"};
+      prefill<Mega, 32, FullHeadTiles, Inline>
           <<<m.tokens*((m.heads + 31) / 32), 384, sizeof(Shared), stream>>>(a);
       return {cudaGetLastError(), "CuTe sparse prefill"};
     };
-    // Serving retains full heads on each device. Narrow heads use the legacy route.
+    // Decode also supports H=8/16; retain head bounds for their partial tiles.
+    auto launch_heads = [&](auto fused, auto inline_scale) {
+      return m.heads % 32 == 0 ? launch(fused, inline_scale, std::true_type{})
+                               : launch(fused, inline_scale, std::false_type{});
+    };
     if (mt == ModelType::DSV4_1_INLINE)
-      return p.mega.output ? launch(std::true_type{}, std::true_type{})
-                           : launch(std::false_type{}, std::true_type{});
-    return p.mega.output ? launch(std::true_type{}, std::false_type{})
-                         : launch(std::false_type{}, std::false_type{});
+      return p.mega.output ? launch_heads(std::true_type{}, std::true_type{})
+                           : launch_heads(std::false_type{}, std::true_type{});
+    return p.mega.output ? launch_heads(std::true_type{}, std::false_type{})
+                         : launch_heads(std::false_type{}, std::false_type{});
   }
   PrefillColdParams cold{p.sm_scale,
                          m.tokens,
