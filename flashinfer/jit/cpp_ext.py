@@ -459,6 +459,11 @@ def build_cuda_cflags(
     return cuda_cflags
 
 
+def _ninja_windows_path(path) -> str:
+    # In a ninja build line, ":" ends the outputs and a space separates paths.
+    return str(path).replace("$", "$$").replace(" ", "$ ").replace(":\\", "$:\\")
+
+
 def generate_ninja_build_for_op(
     name: str,
     sources: List[Path],
@@ -595,7 +600,23 @@ def generate_ninja_build_for_op(
         "",
     ]
 
-    if embedded_cubins:
+    if embedded_cubins and is_windows:
+        # The MSVC toolchain has no GNU ld/objcopy: write each cubin as its own
+        # COFF object and link it next to the host objects.
+        coff_machine = (
+            "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
+        )
+        embed_script = Path(__file__).with_name("embed_cubin_coff.py")
+        lines.extend(
+            [
+                "rule embed_cubin",
+                f'  command = "{sys.executable}" "{embed_script}" '
+                f'--machine {coff_machine} --name $cubin_name --cubin "$in" '
+                '--output-obj "$out"',
+                "",
+            ]
+        )
+    elif embedded_cubins:
         lines.extend(
             [
                 "rule embed_cubin",
@@ -658,8 +679,21 @@ def generate_ninja_build_for_op(
         ):
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", cubin_name) is None:
                 raise ValueError(f"invalid embedded cubin identifier: {cubin_name!r}")
-            resolved_cubin = ninja_path(Path(cubin_path).resolve(strict=True))
-            embedded_obj = ninja_path(
+            resolved_cubin = Path(cubin_path).resolve(strict=True)
+            if is_windows:
+                cubin_obj = _ninja_windows_path(
+                    (output_dir / f"embedded_cubin_{cubin_name}.o").resolve()
+                )
+                lines.extend(
+                    [
+                        f"build {cubin_obj}: embed_cubin "
+                        f"{_ninja_windows_path(resolved_cubin)}",
+                        f"  cubin_name = {cubin_name}",
+                    ]
+                )
+                objects.append(cubin_obj)
+                continue
+            embedded_obj = str(
                 (output_dir / f"embedded_{index}_{Path(current_obj).name}").resolve()
             )
             lines.extend(

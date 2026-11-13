@@ -171,6 +171,18 @@ class MoEEpMegaLayer(nn.Module):
         elif backend.preprocess_weights:
             self._preprocess_weights()
 
+    @property
+    def batch_invariant_fingerprint(self) -> str | None:
+        """The arithmetic receipt of a batch-invariant layer; None in ordinary mode.
+
+        Its scope additionally fixes the architecture, compiler/software stack,
+        EP topology and expert placement. Batch and workspace capacity do not
+        enter it. Routing IDs and weights are supplied by the caller.
+        """
+        if not getattr(self._megakernel_config, "batch_invariant", False):
+            return None
+        return self._kernel.batch_invariant_fingerprint(self._fleet_params)
+
     def _preprocess_weights(self) -> None:
         if self._transformed is not None:
             return
