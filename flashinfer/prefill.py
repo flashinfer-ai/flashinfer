@@ -2608,7 +2608,7 @@ def _blackwell_paged_gqa_auto_cudnn(
     work_floor = 16 * 1024 * 1024
     return (
         hq * sum(q * kv for q, kv in zip(queries, lengths, strict=True)) >= work_floor
-        and get_compute_capability(device) == (10, 0)
+        and get_compute_capability(device) in ((10, 0), (10, 3))
         and _cudnn_supports_paged_gqa_auto(head_dim_qk)
     )
 

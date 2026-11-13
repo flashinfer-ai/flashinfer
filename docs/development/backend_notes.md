@@ -123,7 +123,7 @@ feature and runtime guards still apply. Short requests mixed with long ones
 do not qualify for this extension merely because their declaration is large.
 Independent Q overrides and device-only metadata keep the original policy.
 
-### SM100 D256 paged GQA admission
+### SM100/SM103 D256 paged GQA admission
 
 The BF16 HND/page-16 prefix extension requires cuDNN 9.24+, FE 1.33+,
 and native packed-split and physical-origin capability flags for the requested
