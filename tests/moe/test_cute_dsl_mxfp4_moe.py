@@ -20,7 +20,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+from flashinfer.cute_dsl.availability import is_cute_dsl_arch_supported
 from flashinfer.tllm_enums import ActivationType
 
 _requires_dsl_arch = pytest.mark.skipif(
@@ -493,6 +493,11 @@ def test_mxfp4_mode_rejects_invalid_inputs():
     with pytest.raises(ValueError, match="x_sf must have shape"):
         cute_dsl_fused_moe(
             **{**kwargs, "x_sf": x_sf[:, : hidden // 64].contiguous()},
+            tactic=_tactic(128),
+        )
+    with pytest.raises(ValueError, match="must be contiguous"):
+        cute_dsl_fused_moe(
+            **{**kwargs, "x_sf": torch.cat([x_sf, x_sf], dim=1)[:, : hidden // 32]},
             tactic=_tactic(128),
         )
     with pytest.raises(ValueError, match="bfloat16 output"):

@@ -328,6 +328,9 @@ def validate_w4a8_inputs(
     ``weight_elems_per_byte`` is 2 for packed FP4 weights and 1 for 8-bit weights;
     ``activation_elems_per_byte`` is 1 for MXFP8 and 2 for packed MXFP4 input.
     """
+    # GEMM1 builds dense layouts from the data pointers and ignores strides.
+    if not (x.is_contiguous() and x_sf.is_contiguous()):
+        raise ValueError("MX x and x_sf must be contiguous")
     expected_x_sf = (x.shape[0], x.shape[1] * activation_elems_per_byte // 32)
     if tuple(x_sf.shape) != expected_x_sf:
         raise ValueError(f"x_sf must have shape {expected_x_sf}")
