@@ -34,6 +34,15 @@ SVDQuant NVFP4 GEMM (SM100)
     nvfp4_quantize_smooth
     svdquant_linear
 
+SVDQuant with dynamic NVFP4 4over6 activations on SM12x: the activation scale is computed on the device every
+call, ``x`` is quantized with the 4over6 recipe (bit-identical to ``fp4_quantize``), and the LoRA-down is
+divided by the dynamic ``alpha`` so ``lora_up`` stays unchanged.
+
+.. autosummary::
+    :toctree: ../generated
+
+    nvfp4_4over6_svdquant_linear_sm120
+
 Quantized-base GEMM with runtime BF16 LoRA (SM90, SM100, SM103)
 ---------------------------------------------------------------
 
