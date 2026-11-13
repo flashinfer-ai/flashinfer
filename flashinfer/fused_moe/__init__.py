@@ -322,6 +322,13 @@ def __getattr__(name: str):
             stacklevel=2,
         )
         return CuteDslRunner
+    if name == "BGMVMoEBlackwellPlan":
+        warnings.warn(
+            "BGMVMoEBlackwellPlan is deprecated; use BGMVMoECakePlan instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return BGMVMoECakePlan
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -519,6 +526,7 @@ __all__ = [
     "cudnn_frost_grouped_gemm1_swiglu",
     "cudnn_frost_grouped_gemm1_swiglu_workspace_size",
     "bgmv_moe",
+    "BGMVMoEBlackwellPlan",
     "BGMVMoECakePlan",
     "BGMVMoEPortablePlan",
     "bgmv_moe_shrink",

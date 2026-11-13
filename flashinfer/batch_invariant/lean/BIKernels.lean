@@ -17,3 +17,5 @@ import BIKernels.SamplingCases
 import BIKernels.MoE
 import BIKernels.MoEFp8
 import BIKernels.MoECases
+import BIKernels.MegaMoE
+import BIKernels.MegaMoECases

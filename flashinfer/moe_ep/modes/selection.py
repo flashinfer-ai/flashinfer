@@ -12,7 +12,7 @@ from flashinfer.autotuner import TuningResult
 
 from ..core.selection import Collective, NoEligibleCandidate, plain, record_key, tuples
 from ..core.tuning_measurement import CaptureUnsupported
-from .config import MegaConfig, SplitConfig
+from .config import MegaConfig, SplitConfig, _batch_invariant_numerical_contract
 from .mega_layer import MoEEpMegaLayer
 from .split_layer import MoEEpSplitLayer
 
@@ -33,6 +33,9 @@ def numerical_contract(config, prototype, fleet):
             )
         contract = prototype._kernel.ep_tuning_contract(fleet).copy()
         contract.pop("revision")
+        batch_invariant = _batch_invariant_numerical_contract(config)
+        if batch_invariant is not None:
+            contract["batch_invariant"] = batch_invariant
         return contract
 
     from flashinfer.fused_moe.api import QuantFormat, SiTU, SwiGLU
@@ -159,9 +162,11 @@ class MegaPlan:
                 self.layer._ensure_workspace(),
                 tensors,
                 self.layer._get_transformed_weights(),
-                tensors.output
-                if tensors.output is not None
-                else self.output[: tensors.num_tokens],
+                (
+                    tensors.output
+                    if tensors.output is not None
+                    else self.output[: tensors.num_tokens]
+                ),
             )
         else:
             self.forward(tensors)
