@@ -206,6 +206,22 @@ def _freeze_smem_descriptor(desc):
 
 
 @cute.jit
+def _warp_uniform_smem_desc(desc):
+    """Mark both 32-bit halves of a 64-bit SMEM descriptor warp-uniform.
+
+    MMA warps derive descriptors from pipeline stage indices that the compiler
+    cannot prove uniform. The hint keeps per-K-step descriptor arithmetic on
+    the uniform datapath instead of moving every operand through R2UR.
+    """
+    raw = Int64(desc)
+    lo = cute.arch.make_warp_uniform(Int32(raw & Int64(0xFFFFFFFF)))
+    hi = cute.arch.make_warp_uniform(Int32(raw >> Int64(32)))
+    return prims.Tcgen05SmemDesc(
+        (Int64(hi) << Int64(32)) | (Int64(lo) & Int64(0xFFFFFFFF))
+    )
+
+
+@cute.jit
 def _wait_for_mbarrier_phase(barrier, phase: Int32) -> None:
     """Wait for one parity of a CTA-local reusable mbarrier."""
 

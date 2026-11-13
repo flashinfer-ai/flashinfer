@@ -3492,8 +3492,8 @@ class SmemKvResource(DecodeGenResourceBase):
         """Advance the shared K or V descriptor to the committed stage."""
         # Consumers see the same descriptor layout for every stage; only the
         # base address advances by the committed SMEM stage index.
-        stage_offset_bytes = stage_info.stage_idx * Int32(
-            self.cfg.smem_kv_storage_tile_bytes
+        stage_offset_bytes = cute.arch.make_warp_uniform(
+            stage_info.stage_idx * Int32(self.cfg.smem_kv_storage_tile_bytes)
         )
         return (
             self._v_desc_base.advance_start_address(stage_offset_bytes)

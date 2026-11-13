@@ -70,6 +70,7 @@ from .helpers_common import (
     _clamp_valid_tile_idx,
     _decode_gen_task_cache,
     _freeze_smem_descriptor,
+    _warp_uniform_smem_desc,
     _is_last_loop_iteration,
     _keeps_col_base,
     _keeps_row_idx,
@@ -754,7 +755,7 @@ class TmemSResource(DecodeGenResourceBase):
             k_desc = prims.make_tmem_ptr(kv_desc, Int32)
         else:
             k_desc = _freeze_smem_descriptor(kv_desc)
-        q_desc = _freeze_smem_descriptor(q_desc)
+        q_desc = _warp_uniform_smem_desc(_freeze_smem_descriptor(q_desc))
         q_desc, head_dim_stage_idx = self._q_desc_for_head_dim_stage(
             q_desc, head_dim_stage_idx
         )
@@ -1557,6 +1558,151 @@ class TmemSResource(DecodeGenResourceBase):
                     s_vals[s_idx] = _neg_max_f32()
 
     @cute.jit
+    def _load_swaps_scores(
+        self,
+        stage_info: StageInfo,
+        s_vals: cutlass.Array,
+        q_repeats: Constexpr[int],
+    ) -> None:
+        """Load the committed Swaps S tile from TMEM into ``s_vals``."""
+        # Two TMEM rows cover the two K subtiles.
+        base_addr = self._softmax_loop_score_tmem_addr(stage_info)
+        shape = "16x256b"
+        loaded0 = prims.tcgen05_ld(
+            shape,
+            prims.make_tmem_ptr(base_addr, Float32),
+            num=q_repeats,
+        )
+        loaded1 = prims.tcgen05_ld(
+            shape,
+            prims.make_tmem_ptr(base_addr + Int32(16 << 16), Float32),
+            num=q_repeats,
+        )
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+        for repeat_idx in cutlass.range_constexpr(q_repeats):
+            ld_base = repeat_idx * 4
+            s_vals[ld_base + 0] = loaded0[ld_base + 0]
+            s_vals[ld_base + 1] = loaded0[ld_base + 1]
+            s_vals[ld_base + 2] = loaded0[ld_base + 2]
+            s_vals[ld_base + 3] = loaded0[ld_base + 3]
+            s_vals[q_repeats * 4 + ld_base + 0] = loaded1[ld_base + 0]
+            s_vals[q_repeats * 4 + ld_base + 1] = loaded1[ld_base + 1]
+            s_vals[q_repeats * 4 + ld_base + 2] = loaded1[ld_base + 2]
+            s_vals[q_repeats * 4 + ld_base + 3] = loaded1[ld_base + 3]
+
+    @cute.jit
+    def _mask_inactive_swaps_rows(
+        self,
+        s_vals: cutlass.Array,
+        lane_idx: Int32,
+        logical_q_group_idx: Int32,
+        num_scale_groups: Constexpr[int],
+        q_repeats: Constexpr[int],
+    ) -> None:
+        """Mask Q rows outside the runtime Q length to -inf.
+
+        The Swaps TMEM layout assigns one logical Q row to each
+        (column-group, scale-group) pair.
+        """
+        cfg = self.cfg
+        col_group_idx = lane_idx & Int32(0x3)
+        for scale_idx in cutlass.range_constexpr(num_scale_groups):
+            repeat_idx = scale_idx // 2
+            pair_idx = scale_idx % 2
+            tile_row_idx = (
+                col_group_idx * Int32(2) + Int32(pair_idx) + Int32(repeat_idx * 8)
+            )
+            if not _q_row_is_valid_for_seq(
+                cfg,
+                self.h_r,
+                logical_q_group_idx,
+                tile_row_idx,
+                self.seq_len_q,
+            ):
+                s_base = repeat_idx * 4 + pair_idx
+                s_base_hi = q_repeats * 4 + s_base
+                s_vals[s_base + 0] = _neg_max_f32()
+                s_vals[s_base + 2] = _neg_max_f32()
+                s_vals[s_base_hi + 0] = _neg_max_f32()
+                s_vals[s_base_hi + 2] = _neg_max_f32()
+
+    @cute.jit
+    def _reduce_swaps_lane_max(
+        self,
+        s_vals: cutlass.Array,
+        old_max_vals: cutlass.Array,
+        local_max_vals: cutlass.Array,
+        lane_idx: Int32,
+        local_row_idx: Int32,
+        max_shift: Float32,
+        num_scale_groups: Constexpr[int],
+        q_repeats: Constexpr[int],
+        shifts_max: Constexpr[bool],
+    ) -> None:
+        """Reduce this lane's scores to per-scale-group maxima within the warp.
+
+        ``max_shift`` (applied when ``shifts_max``) is the proxy-route mass
+        that enters before the anchor.
+        """
+        for scale_idx in cutlass.range_constexpr(num_scale_groups):
+            # Reduce this lane's S registers to one candidate per scale group.
+            repeat_idx = scale_idx // 2
+            pair_idx = scale_idx % 2
+            s_base = repeat_idx * 4 + pair_idx
+            s_base_hi = q_repeats * 4 + s_base
+            local_max = cute.math.max(
+                cute.math.max(s_vals[s_base + 0], s_vals[s_base + 2], ftz=True),
+                cute.math.max(s_vals[s_base_hi + 0], s_vals[s_base_hi + 2], ftz=True),
+                ftz=True,
+            )
+            if cutlass.const_expr(shifts_max):
+                # The mass enters before the anchor, so the P range is unchanged.
+                local_max = local_max + max_shift
+            local_max = cute.math.max(local_max, old_max_vals[scale_idx], ftz=True)
+            local_max_vals[scale_idx] = local_max
+
+        if cutlass.const_expr(num_scale_groups > 2):
+            # Transpose each four-scale block across four strided warp rows.
+            # Every lane then owns one reduced scale group per block.
+            for scale_base in cutlass.range_constexpr(0, num_scale_groups, 4):
+                local_max_vals[scale_base] = _wspro_reduce_max4(
+                    local_max_vals[scale_base],
+                    local_max_vals[scale_base + 1],
+                    local_max_vals[scale_base + 2],
+                    local_max_vals[scale_base + 3],
+                    local_row_idx,
+                )
+        else:
+            # Two scale groups use the compact partial reduction.
+            for scale_idx in cutlass.range_constexpr(num_scale_groups):
+                local_max = cute.math.max(
+                    local_max_vals[scale_idx],
+                    Float32(
+                        prims.shfl_sync(
+                            thread_mask=0xFFFFFFFF,
+                            val=local_max_vals[scale_idx],
+                            offset=16,
+                            mask_and_clamp=0x1F,
+                            kind=prims.Shfl.BFLY,
+                        )
+                    ),
+                    ftz=True,
+                )
+                local_max_vals[scale_idx] = cute.math.max(
+                    local_max,
+                    Float32(
+                        prims.shfl_sync(
+                            thread_mask=0xFFFFFFFF,
+                            val=local_max,
+                            offset=8,
+                            mask_and_clamp=0x1F,
+                            kind=prims.Shfl.BFLY,
+                        )
+                    ),
+                    ftz=True,
+                )
+
+    @cute.jit
     def _compute_softmax_loop_swaps(
         self,
         stage_info: StageInfo,
@@ -1615,9 +1761,6 @@ class TmemSResource(DecodeGenResourceBase):
             sum_vals[idx] = sum_arr[idx]
             new_max_vals[idx] = new_max_arr[idx]
             local_max_vals[idx] = _neg_max_f32()
-        if cutlass.const_expr(not use_runtime_paged_dense_load):
-            for idx in cutlass.range_constexpr(cfg.num_s_regs_per_thread):
-                s_vals[idx] = _neg_max_f32()
         task_cache = _decode_gen_task_cache(stage_info)
         if cutlass.const_expr(self.seqlens_kv is None):
             seq_len_kv = Int32(self.max_seq_len_kv)
@@ -1716,398 +1859,393 @@ class TmemSResource(DecodeGenResourceBase):
             tile_offset_k = Int32(0)
             window_start_idx = Int32(0)
             is_masked_final_wave = cutlass.Boolean(False)
-        if should_load_s:
-            # ConsWork: load the S tile produced by BMM1 from TMEM into
-            # registers. Two TMEM rows cover the two K subtiles. Invalid
-            # odd-tail waves intentionally skip the load and leave S at
-            # -inf so the later P path contributes zero probability.
-            base_addr = self._softmax_loop_score_tmem_addr(stage_info)
-
-            shape = "16x256b"
-            loaded0 = prims.tcgen05_ld(
-                shape,
-                prims.make_tmem_ptr(base_addr, Float32),
-                num=q_repeats,
+        # Lane identities, also read after the score reduction below.
+        warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+        lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
+        local_row_idx = (lane_idx >> Int32(2)) & Int32(0x3)
+        # A dense tile inside every row's visible interval needs no score
+        # mask. It takes a separate copy of the load and lane reduction: as
+        # predicated code, the masks would issue on every interior tile even
+        # when they keep every score. The copy only pays where the masked path
+        # is expensive (per-row causal or inactive-row masks, or 32-row
+        # tiles); a full one-token Q8/Q16 tile's single tail mask is cheaper
+        # than the extra branch and code, and sliding-window CTAs see mostly
+        # boundary tiles. A persistent 32-row tile that still masks inactive
+        # rows keeps that mask on the copy too, so the copy saves little while
+        # its code spills the persistent kernel's instruction cache.
+        uses_clean_tile_path = (
+            not use_sparse
+            and not use_runtime_paged_dense_load
+            and not cfg.uses_q_token_kv_block_sparse_page_membership
+            and not cfg.use_sliding_window_causal
+            and (
+                cfg.tile_size_q >= 32
+                or cfg.uses_per_row_causal_mask
+                or cfg.q_score_rows_need_mask
             )
-            loaded1 = prims.tcgen05_ld(
-                shape,
-                prims.make_tmem_ptr(base_addr + Int32(16 << 16), Float32),
-                num=q_repeats,
+            and not (
+                cfg.use_persistent_scheduler
+                and cfg.tile_size_q >= 32
+                and cfg.q_score_rows_need_mask
             )
-            prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-            for repeat_idx in cutlass.range_constexpr(q_repeats):
-                ld_base = repeat_idx * 4
-                s_vals[ld_base + 0] = loaded0[ld_base + 0]
-                s_vals[ld_base + 1] = loaded0[ld_base + 1]
-                s_vals[ld_base + 2] = loaded0[ld_base + 2]
-                s_vals[ld_base + 3] = loaded0[ld_base + 3]
-                s_vals[q_repeats * 4 + ld_base + 0] = loaded1[ld_base + 0]
-                s_vals[q_repeats * 4 + ld_base + 1] = loaded1[ld_base + 1]
-                s_vals[q_repeats * 4 + ld_base + 2] = loaded1[ld_base + 2]
-                s_vals[q_repeats * 4 + ld_base + 3] = loaded1[ld_base + 3]
-
-        route_is_proxy = cutlass.Boolean(False)
-        if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
-            route_is_proxy = _route_is_proxy(sparse_route_flags.bitcast(Int32))
-        if cutlass.const_expr(use_sparse):
-            # Route, KV-tail, uniform-causal, and token validity depend only on
-            # K, so one predicate masks the adjacent pair of Q-row registers.
-            should_apply_sparse_mask = cutlass.Boolean(True)
-            if cutlass.const_expr(
-                _swaps_forwards_packed_route_full(cfg)
-                or _swaps_uses_origin0_k32_full_guard(cfg)
-            ):
-                if cutlass.const_expr(_swaps_forwards_packed_route_full(cfg)):
-                    # Prepare already proved structural fullness for the
-                    # complete KV128 route and staging replicated the summary
-                    # for this Softmax warp's logical K32 slice.
-                    k32_is_full = cute.arch.make_warp_uniform(
-                        cutlass.Boolean(
-                            (sparse_route_flags & Uint32(_PREPARED_ROUTE_IS_FULL_FLAG))
-                            != Uint32(0)
-                        )
-                    )
-                else:
-                    # One origin covers this warp's K32 slice, so it can
-                    # bypass all four lane-local K8 predicates. B16 stays on
-                    # the straight-line path: its two-origin guard is not
-                    # cheaper after code generation.
-                    k32_is_full = cute.arch.make_warp_uniform(
-                        cutlass.Boolean(
-                            sparse_origin0 >= Int32(0)
-                            and sparse_origin0 <= seq_len_kv - Int32(32)
-                        )
-                    )
-                should_apply_sparse_mask = cutlass.Boolean(not k32_is_full)
-            if should_apply_sparse_mask:
-                lane_k_offset = Int32(task_cache[_TASK_CACHE_LANE_IDX]) >> Int32(2)
-                token_word_covers_kv_tail = _swaps_token_word_covers_kv_tail(cfg)
-                for token_group_idx in cutlass.range_constexpr(4):
-                    atom_origin, logical_k = _swaps_routed_coordinate(
-                        cfg,
-                        lane_k_offset,
-                        sparse_origin0,
-                        sparse_origin1,
-                        sparse_origin2,
-                        sparse_origin3,
-                        token_group_idx=token_group_idx,
-                    )
-                    # Prepared words zero absent atoms and the logical KV
-                    # tail. Qualified profiles can therefore omit the local
-                    # atom-origin guard, independently of the K/V issuer warp.
-                    score_is_valid = cutlass.Boolean(True)
-                    if not route_is_proxy:
-                        if cutlass.const_expr(
-                            not _swaps_uses_token_only_score_validity(cfg)
-                        ):
-                            score_is_valid = cutlass.Boolean(atom_origin >= Int32(0))
-                        if cutlass.const_expr(not token_word_covers_kv_tail):
-                            score_is_valid = cutlass.Boolean(
-                                score_is_valid and logical_k < seq_len_kv
-                            )
-                        if cutlass.const_expr(cfg.uses_uniform_causal_mask):
-                            score_is_valid = cutlass.Boolean(
-                                score_is_valid and logical_k < element_mask_end_idx
-                            )
-                    if cutlass.const_expr(cfg.uses_prepared_score_keep_words):
-                        token_bit_idx = Int32(token_group_idx * 8) + lane_k_offset
-                        token_is_valid = (
-                            (sparse_token_word >> token_bit_idx) & Uint32(1)
-                        ) != Uint32(0)
-                        score_is_valid = cutlass.Boolean(
-                            score_is_valid and token_is_valid
-                        )
-                    if not score_is_valid:
-                        for repeat_idx in cutlass.range_constexpr(q_repeats):
-                            if cutlass.const_expr(token_group_idx < 2):
-                                s_base = repeat_idx * 4 + token_group_idx * 2
-                            else:
-                                s_base = (
-                                    q_repeats * 4
-                                    + repeat_idx * 4
-                                    + (token_group_idx - 2) * 2
-                                )
-                            s_vals[s_base + 0] = _neg_max_f32()
-                            s_vals[s_base + 1] = _neg_max_f32()
-
-        if cutlass.const_expr(use_runtime_paged_dense_load):
-            if not (
+        )
+        tile_is_clean = cutlass.Boolean(False)
+        if cutlass.const_expr(uses_clean_tile_path):
+            tile_is_clean = _kv_tile_is_fully_unmasked_for_q_group(
+                cfg,
+                tile_offset_k,
+                seq_len_kv,
+                self.seq_len_q,
+                q_token_base,
                 is_valid_effective_tile
                 and (tile_offset_k < seq_len_kv)
-                and not is_masked_final_wave
-            ):
-                for idx in cutlass.range_constexpr(cfg.num_s_regs_per_thread):
-                    s_vals[idx] = _neg_max_f32()
-
-        next_tile_offset_k = tile_offset_k + Int32(cfg.tile_size_kv)
-        # Determine whether this tile crosses the active right endpoint or the
-        # start of the causal sliding window. Dense full tiles skip per-element
-        # masking.
-        if cutlass.const_expr(use_sparse):
-            should_apply_dense_mask = False
-        elif cutlass.const_expr(
-            not use_runtime_kv_domain and not cfg.uses_uniform_causal_mask
-        ):
-            has_static_tail_mask = (cfg.static_seq_len_kv % cfg.tile_size_kv) != 0
-            has_static_window_prefix_mask = (
-                cfg.use_sliding_window_causal
-                and (cfg.static_window_start_idx % cfg.tile_size_kv) != 0
+                and not is_masked_final_wave,
             )
-            if cutlass.const_expr(
-                not has_static_tail_mask and not has_static_window_prefix_mask
-            ):
-                should_apply_dense_mask = False
-            else:
-                should_apply_dense_mask = next_tile_offset_k > seq_len_kv
-            if cutlass.const_expr(has_static_window_prefix_mask):
-                should_apply_dense_mask = should_apply_dense_mask or (
-                    (tile_offset_k <= window_start_idx)
-                    and (next_tile_offset_k > window_start_idx)
+        if tile_is_clean:
+            if cutlass.const_expr(uses_clean_tile_path):
+                self._load_swaps_scores(stage_info, s_vals, q_repeats)
+                if cutlass.const_expr(cfg.q_score_rows_need_mask):
+                    self._mask_inactive_swaps_rows(
+                        s_vals,
+                        lane_idx,
+                        logical_q_group_idx,
+                        num_scale_groups,
+                        q_repeats,
+                    )
+                self._reduce_swaps_lane_max(
+                    s_vals,
+                    old_max_vals,
+                    local_max_vals,
+                    lane_idx,
+                    local_row_idx,
+                    Float32(0.0),
+                    num_scale_groups,
+                    q_repeats,
+                    False,
                 )
         else:
-            # Runtime tails and the one-endpoint ungrouped causal path need
-            # element masking only on the tile that crosses the right bound.
-            should_apply_dense_mask = next_tile_offset_k > element_mask_end_idx
-            if cutlass.const_expr(cfg.use_sliding_window_causal):
-                window_start_remainder = window_start_idx % Int32(cfg.tile_size_kv)
-                should_apply_dense_mask = should_apply_dense_mask or (
-                    (window_start_remainder != Int32(0))
-                    and (tile_offset_k <= window_start_idx)
-                    and (next_tile_offset_k > window_start_idx)
-                )
-        if should_apply_dense_mask:
-            # Mask invalid S registers to -inf so they produce zero P and
-            # do not affect row max or row sum. This keeps the schedule
-            # shape fixed even when only part of the K/V tile is valid.
-            warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
-            lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
-            local_idx_k0 = warp_idx * Int32(32) + (lane_idx >> Int32(2))
-            for repeat_idx in cutlass.range_constexpr(q_repeats):
-                for token_group_idx in cutlass.range_constexpr(4):
-                    token_idx = (
-                        tile_offset_k + local_idx_k0 + Int32(token_group_idx * 8)
-                    )
-                    if cutlass.const_expr(token_group_idx < 2):
-                        s_base = repeat_idx * 4 + token_group_idx * 2
-                    else:
-                        s_base = (
-                            q_repeats * 4 + repeat_idx * 4 + (token_group_idx - 2) * 2
-                        )
-                    if token_idx >= element_mask_end_idx:
-                        s_vals[s_base + 0] = _neg_max_f32()
-                        s_vals[s_base + 1] = _neg_max_f32()
-                    if cutlass.const_expr(cfg.use_sliding_window_causal):
-                        if token_idx < window_start_idx:
-                            s_vals[s_base + 0] = _neg_max_f32()
-                            s_vals[s_base + 1] = _neg_max_f32()
+            if cutlass.const_expr(not use_runtime_paged_dense_load):
+                for idx in cutlass.range_constexpr(cfg.num_s_regs_per_thread):
+                    s_vals[idx] = _neg_max_f32()
+            if should_load_s:
+                # ConsWork: load the S tile produced by BMM1 from TMEM into
+                # registers. Two TMEM rows cover the two K subtiles. Invalid
+                # odd-tail waves intentionally skip the load and leave S at
+                # -inf so the later P path contributes zero probability.
+                self._load_swaps_scores(stage_info, s_vals, q_repeats)
 
-        if cutlass.const_expr(cfg.uses_q_token_kv_block_sparse_page_membership):
-            self._apply_q_token_kv_block_sparse_swaps_page_membership_mask(
-                stage_info,
-                s_vals,
-                task_cache,
-                logical_q_group_idx,
-                local_tile_idx,
-            )
-
-        if cutlass.const_expr(cfg.uses_per_row_causal_mask):
-            apply_per_row_causal_mask = cutlass.Boolean(True)
-            if cutlass.const_expr(not use_sparse):
-                tile_has_valid_scores = (
-                    is_valid_effective_tile
-                    and (tile_offset_k < seq_len_kv)
-                    and not is_masked_final_wave
-                )
-                apply_per_row_causal_mask = cutlass.Boolean(
-                    not _kv_tile_is_fully_unmasked_for_q_group(
-                        cfg,
-                        tile_offset_k,
-                        seq_len_kv,
-                        self.seq_len_q,
-                        q_token_base,
-                        tile_has_valid_scores,
-                    )
-                )
-            if apply_per_row_causal_mask:
-                # Grouped causal decode has a distinct causal/window bound for
-                # every Q token. Sparse routes always use their logical K;
-                # dense routes retain the boundary-tile fast path above.
-                causal_warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
-                causal_lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
-                causal_col_group_idx = causal_lane_idx & Int32(0x3)
-                causal_local_idx_k0 = causal_warp_idx * Int32(32) + (
-                    causal_lane_idx >> Int32(2)
-                )
-                for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                    repeat_idx = scale_idx // 2
-                    pair_idx = scale_idx % 2
-                    tile_row_idx = (
-                        Int32(repeat_idx * 8)
-                        + causal_col_group_idx * Int32(2)
-                        + Int32(pair_idx)
-                    )
-                    q_token_idx, _ = _q_row_token_and_local_head(
-                        cfg,
-                        self.h_r,
-                        logical_q_group_idx,
-                        tile_row_idx,
-                    )
-                    causal_end = seq_len_kv - self.seq_len_q + q_token_idx + Int32(1)
-                    causal_start = Int32(0)
-                    if cutlass.const_expr(cfg.use_sliding_window_causal):
-                        causal_start = cute.math.max(
-                            causal_end - Int32(cfg.attention_window_size), Int32(0)
-                        )
-                    for token_group_idx in cutlass.range_constexpr(4):
-                        token_idx = (
-                            tile_offset_k
-                            + causal_local_idx_k0
-                            + Int32(token_group_idx * 8)
-                        )
-                        if cutlass.const_expr(use_sparse):
-                            _, token_idx = _swaps_routed_coordinate(
-                                cfg,
-                                causal_lane_idx >> Int32(2),
-                                sparse_origin0,
-                                sparse_origin1,
-                                sparse_origin2,
-                                sparse_origin3,
-                                token_group_idx=token_group_idx,
-                            )
-                        s_idx = (
-                            repeat_idx * 4
-                            + pair_idx
-                            + (token_group_idx & 1) * 2
-                            + (token_group_idx >> 1) * q_repeats * 4
-                        )
-                        if token_idx < causal_start or token_idx >= causal_end:
-                            s_vals[s_idx] = _neg_max_f32()
-
-        warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
-        if cutlass.const_expr(cfg.q_score_rows_need_mask):
-            # Structural grouped padding and the final partial token/head band
-            # must not enter max/sum or P. The Swaps TMEM layout assigns one
-            # logical Q row to each (column-group, scale-group) pair.
-            lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
-            col_group_idx = lane_idx & Int32(0x3)
-            for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                repeat_idx = scale_idx // 2
-                pair_idx = scale_idx % 2
-                tile_row_idx = (
-                    col_group_idx * Int32(2) + Int32(pair_idx) + Int32(repeat_idx * 8)
-                )
-                if not _q_row_is_valid_for_seq(
-                    cfg,
-                    self.h_r,
-                    logical_q_group_idx,
-                    tile_row_idx,
-                    self.seq_len_q,
+            route_is_proxy = cutlass.Boolean(False)
+            if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
+                route_is_proxy = _route_is_proxy(sparse_route_flags.bitcast(Int32))
+            if cutlass.const_expr(use_sparse):
+                # Route, KV-tail, uniform-causal, and token validity depend only on
+                # K, so one predicate masks the adjacent pair of Q-row registers.
+                should_apply_sparse_mask = cutlass.Boolean(True)
+                if cutlass.const_expr(
+                    _swaps_forwards_packed_route_full(cfg)
+                    or _swaps_uses_origin0_k32_full_guard(cfg)
                 ):
-                    s_base = repeat_idx * 4 + pair_idx
-                    s_base_hi = q_repeats * 4 + s_base
-                    s_vals[s_base + 0] = _neg_max_f32()
-                    s_vals[s_base + 2] = _neg_max_f32()
-                    s_vals[s_base_hi + 0] = _neg_max_f32()
-                    s_vals[s_base_hi + 2] = _neg_max_f32()
-
-        lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
-        # Proxy mass (``_proxy_score_shifts``): the ragged final summary's
-        # scores shift before the reduction so the P pass sees its true mass.
-        proxy_max_shift = Float32(0.0)
-        if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
-            tail_summary_idx, tail_log2_delta = cfg.proxy_tail_summary
-            route_is_proxy_uniform = cute.arch.make_warp_uniform(route_is_proxy)
-            proxy_max_shift, tail_shift = self._proxy_score_shifts(
-                route_is_proxy_uniform
-            )
-            if cutlass.const_expr(not cfg.fixed_seqlen or tail_log2_delta != 0.0):
-                if route_is_proxy_uniform:
+                    if cutlass.const_expr(_swaps_forwards_packed_route_full(cfg)):
+                        # Prepare already proved structural fullness for the
+                        # complete KV128 route and staging replicated the summary
+                        # for this Softmax warp's logical K32 slice.
+                        k32_is_full = cute.arch.make_warp_uniform(
+                            cutlass.Boolean(
+                                (
+                                    sparse_route_flags
+                                    & Uint32(_PREPARED_ROUTE_IS_FULL_FLAG)
+                                )
+                                != Uint32(0)
+                            )
+                        )
+                    else:
+                        # One origin covers this warp's K32 slice, so it can
+                        # bypass all four lane-local K8 predicates. B16 stays on
+                        # the straight-line path: its two-origin guard is not
+                        # cheaper after code generation.
+                        k32_is_full = cute.arch.make_warp_uniform(
+                            cutlass.Boolean(
+                                sparse_origin0 >= Int32(0)
+                                and sparse_origin0 <= seq_len_kv - Int32(32)
+                            )
+                        )
+                    should_apply_sparse_mask = cutlass.Boolean(not k32_is_full)
+                if should_apply_sparse_mask:
+                    lane_k_offset = Int32(task_cache[_TASK_CACHE_LANE_IDX]) >> Int32(2)
+                    token_word_covers_kv_tail = _swaps_token_word_covers_kv_tail(cfg)
                     for token_group_idx in cutlass.range_constexpr(4):
-                        atom_origin, logical_summary = _swaps_routed_coordinate(
+                        atom_origin, logical_k = _swaps_routed_coordinate(
                             cfg,
-                            Int32(lane_idx) >> Int32(2),
+                            lane_k_offset,
                             sparse_origin0,
                             sparse_origin1,
                             sparse_origin2,
                             sparse_origin3,
                             token_group_idx=token_group_idx,
                         )
-                        # Invalid atoms never hold the tail.
-                        if atom_origin >= Int32(0) and logical_summary == Int32(
-                            tail_summary_idx
-                        ):
-                            for tail_repeat_idx in cutlass.range_constexpr(q_repeats):
-                                tail_s_base = tail_repeat_idx * 4 + token_group_idx * 2
-                                if cutlass.const_expr(token_group_idx >= 2):
-                                    tail_s_base = (
+                        # Prepared words zero absent atoms and the logical KV
+                        # tail. Qualified profiles can therefore omit the local
+                        # atom-origin guard, independently of the K/V issuer warp.
+                        score_is_valid = cutlass.Boolean(True)
+                        if not route_is_proxy:
+                            if cutlass.const_expr(
+                                not _swaps_uses_token_only_score_validity(cfg)
+                            ):
+                                score_is_valid = cutlass.Boolean(
+                                    atom_origin >= Int32(0)
+                                )
+                            if cutlass.const_expr(not token_word_covers_kv_tail):
+                                score_is_valid = cutlass.Boolean(
+                                    score_is_valid and logical_k < seq_len_kv
+                                )
+                            if cutlass.const_expr(cfg.uses_uniform_causal_mask):
+                                score_is_valid = cutlass.Boolean(
+                                    score_is_valid and logical_k < element_mask_end_idx
+                                )
+                        if cutlass.const_expr(cfg.uses_prepared_score_keep_words):
+                            token_bit_idx = Int32(token_group_idx * 8) + lane_k_offset
+                            token_is_valid = (
+                                (sparse_token_word >> token_bit_idx) & Uint32(1)
+                            ) != Uint32(0)
+                            score_is_valid = cutlass.Boolean(
+                                score_is_valid and token_is_valid
+                            )
+                        if not score_is_valid:
+                            for repeat_idx in cutlass.range_constexpr(q_repeats):
+                                if cutlass.const_expr(token_group_idx < 2):
+                                    s_base = repeat_idx * 4 + token_group_idx * 2
+                                else:
+                                    s_base = (
                                         q_repeats * 4
-                                        + tail_repeat_idx * 4
+                                        + repeat_idx * 4
                                         + (token_group_idx - 2) * 2
                                     )
-                                s_vals[tail_s_base + 0] = (
-                                    s_vals[tail_s_base + 0] + tail_shift
-                                )
-                                s_vals[tail_s_base + 1] = (
-                                    s_vals[tail_s_base + 1] + tail_shift
-                                )
-        for scale_idx in cutlass.range_constexpr(num_scale_groups):
-            # Reduce this lane's S registers to one candidate per scale group.
-            repeat_idx = scale_idx // 2
-            pair_idx = scale_idx % 2
-            s_base = repeat_idx * 4 + pair_idx
-            s_base_hi = q_repeats * 4 + s_base
-            local_max = cute.math.max(
-                cute.math.max(s_vals[s_base + 0], s_vals[s_base + 2], ftz=True),
-                cute.math.max(s_vals[s_base_hi + 0], s_vals[s_base_hi + 2], ftz=True),
-                ftz=True,
-            )
-            if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
-                # The mass enters before the anchor, so the P range is unchanged.
-                local_max = local_max + proxy_max_shift
-            local_max = cute.math.max(local_max, old_max_vals[scale_idx], ftz=True)
-            local_max_vals[scale_idx] = local_max
+                                s_vals[s_base + 0] = _neg_max_f32()
+                                s_vals[s_base + 1] = _neg_max_f32()
 
-        local_row_idx = (lane_idx >> Int32(2)) & Int32(0x3)
-        if cutlass.const_expr(num_scale_groups > 2):
-            # Transpose each four-scale block across four strided warp rows.
-            # Every lane then owns one reduced scale group per block.
-            for scale_base in cutlass.range_constexpr(0, num_scale_groups, 4):
-                local_max_vals[scale_base] = _wspro_reduce_max4(
-                    local_max_vals[scale_base],
-                    local_max_vals[scale_base + 1],
-                    local_max_vals[scale_base + 2],
-                    local_max_vals[scale_base + 3],
-                    local_row_idx,
+            if cutlass.const_expr(use_runtime_paged_dense_load):
+                if not (
+                    is_valid_effective_tile
+                    and (tile_offset_k < seq_len_kv)
+                    and not is_masked_final_wave
+                ):
+                    for idx in cutlass.range_constexpr(cfg.num_s_regs_per_thread):
+                        s_vals[idx] = _neg_max_f32()
+
+            next_tile_offset_k = tile_offset_k + Int32(cfg.tile_size_kv)
+            # Determine whether this tile crosses the active right endpoint or the
+            # start of the causal sliding window. Dense full tiles skip per-element
+            # masking.
+            if cutlass.const_expr(use_sparse):
+                should_apply_dense_mask = False
+            elif cutlass.const_expr(
+                not use_runtime_kv_domain and not cfg.uses_uniform_causal_mask
+            ):
+                has_static_tail_mask = (cfg.static_seq_len_kv % cfg.tile_size_kv) != 0
+                has_static_window_prefix_mask = (
+                    cfg.use_sliding_window_causal
+                    and (cfg.static_window_start_idx % cfg.tile_size_kv) != 0
                 )
-        else:
-            # Two scale groups use the compact partial reduction.
-            for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                local_max = cute.math.max(
-                    local_max_vals[scale_idx],
-                    Float32(
-                        prims.shfl_sync(
-                            thread_mask=0xFFFFFFFF,
-                            val=local_max_vals[scale_idx],
-                            offset=16,
-                            mask_and_clamp=0x1F,
-                            kind=prims.Shfl.BFLY,
+                if cutlass.const_expr(
+                    not has_static_tail_mask and not has_static_window_prefix_mask
+                ):
+                    should_apply_dense_mask = False
+                else:
+                    should_apply_dense_mask = next_tile_offset_k > seq_len_kv
+                if cutlass.const_expr(has_static_window_prefix_mask):
+                    should_apply_dense_mask = should_apply_dense_mask or (
+                        (tile_offset_k <= window_start_idx)
+                        and (next_tile_offset_k > window_start_idx)
+                    )
+            else:
+                # Runtime tails and the one-endpoint ungrouped causal path need
+                # element masking only on the tile that crosses the right bound.
+                should_apply_dense_mask = next_tile_offset_k > element_mask_end_idx
+                if cutlass.const_expr(cfg.use_sliding_window_causal):
+                    window_start_remainder = window_start_idx % Int32(cfg.tile_size_kv)
+                    should_apply_dense_mask = should_apply_dense_mask or (
+                        (window_start_remainder != Int32(0))
+                        and (tile_offset_k <= window_start_idx)
+                        and (next_tile_offset_k > window_start_idx)
+                    )
+            if cutlass.const_expr(cfg.uses_per_row_causal_mask and not use_sparse):
+                # Every grouped row's causal end is at most seq_len_kv and the
+                # per-row path below applies the window start too, so it masks a
+                # superset of this tail/window mask on every tile that needs it.
+                should_apply_dense_mask = False
+            if should_apply_dense_mask:
+                # Mask invalid S registers to -inf so they produce zero P and
+                # do not affect row max or row sum. This keeps the schedule
+                # shape fixed even when only part of the K/V tile is valid.
+                warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
+                lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
+                local_idx_k0 = warp_idx * Int32(32) + (lane_idx >> Int32(2))
+                for repeat_idx in cutlass.range_constexpr(q_repeats):
+                    for token_group_idx in cutlass.range_constexpr(4):
+                        token_idx = (
+                            tile_offset_k + local_idx_k0 + Int32(token_group_idx * 8)
                         )
-                    ),
-                    ftz=True,
+                        if cutlass.const_expr(token_group_idx < 2):
+                            s_base = repeat_idx * 4 + token_group_idx * 2
+                        else:
+                            s_base = (
+                                q_repeats * 4
+                                + repeat_idx * 4
+                                + (token_group_idx - 2) * 2
+                            )
+                        if token_idx >= element_mask_end_idx:
+                            s_vals[s_base + 0] = _neg_max_f32()
+                            s_vals[s_base + 1] = _neg_max_f32()
+                        if cutlass.const_expr(cfg.use_sliding_window_causal):
+                            if token_idx < window_start_idx:
+                                s_vals[s_base + 0] = _neg_max_f32()
+                                s_vals[s_base + 1] = _neg_max_f32()
+
+            if cutlass.const_expr(cfg.uses_q_token_kv_block_sparse_page_membership):
+                self._apply_q_token_kv_block_sparse_swaps_page_membership_mask(
+                    stage_info,
+                    s_vals,
+                    task_cache,
+                    logical_q_group_idx,
+                    local_tile_idx,
                 )
-                local_max_vals[scale_idx] = cute.math.max(
-                    local_max,
-                    Float32(
-                        prims.shfl_sync(
-                            thread_mask=0xFFFFFFFF,
-                            val=local_max,
-                            offset=8,
-                            mask_and_clamp=0x1F,
-                            kind=prims.Shfl.BFLY,
+
+            if cutlass.const_expr(cfg.uses_per_row_causal_mask):
+                apply_per_row_causal_mask = cutlass.Boolean(True)
+                if cutlass.const_expr(not use_sparse):
+                    tile_has_valid_scores = (
+                        is_valid_effective_tile
+                        and (tile_offset_k < seq_len_kv)
+                        and not is_masked_final_wave
+                    )
+                    apply_per_row_causal_mask = cutlass.Boolean(
+                        not _kv_tile_is_fully_unmasked_for_q_group(
+                            cfg,
+                            tile_offset_k,
+                            seq_len_kv,
+                            self.seq_len_q,
+                            q_token_base,
+                            tile_has_valid_scores,
                         )
-                    ),
-                    ftz=True,
+                    )
+                if apply_per_row_causal_mask:
+                    # Grouped causal decode has a distinct causal/window bound for
+                    # every Q token. Sparse routes always use their logical K;
+                    # dense routes retain the boundary-tile fast path above.
+                    causal_warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
+                    causal_lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
+                    causal_col_group_idx = causal_lane_idx & Int32(0x3)
+                    causal_local_idx_k0 = causal_warp_idx * Int32(32) + (
+                        causal_lane_idx >> Int32(2)
+                    )
+                    for scale_idx in cutlass.range_constexpr(num_scale_groups):
+                        repeat_idx = scale_idx // 2
+                        pair_idx = scale_idx % 2
+                        tile_row_idx = (
+                            Int32(repeat_idx * 8)
+                            + causal_col_group_idx * Int32(2)
+                            + Int32(pair_idx)
+                        )
+                        q_token_idx, _ = _q_row_token_and_local_head(
+                            cfg,
+                            self.h_r,
+                            logical_q_group_idx,
+                            tile_row_idx,
+                        )
+                        causal_end = (
+                            seq_len_kv - self.seq_len_q + q_token_idx + Int32(1)
+                        )
+                        causal_start = Int32(0)
+                        if cutlass.const_expr(cfg.use_sliding_window_causal):
+                            causal_start = cute.math.max(
+                                causal_end - Int32(cfg.attention_window_size), Int32(0)
+                            )
+                        for token_group_idx in cutlass.range_constexpr(4):
+                            token_idx = (
+                                tile_offset_k
+                                + causal_local_idx_k0
+                                + Int32(token_group_idx * 8)
+                            )
+                            if cutlass.const_expr(use_sparse):
+                                _, token_idx = _swaps_routed_coordinate(
+                                    cfg,
+                                    causal_lane_idx >> Int32(2),
+                                    sparse_origin0,
+                                    sparse_origin1,
+                                    sparse_origin2,
+                                    sparse_origin3,
+                                    token_group_idx=token_group_idx,
+                                )
+                            s_idx = (
+                                repeat_idx * 4
+                                + pair_idx
+                                + (token_group_idx & 1) * 2
+                                + (token_group_idx >> 1) * q_repeats * 4
+                            )
+                            if token_idx < causal_start or token_idx >= causal_end:
+                                s_vals[s_idx] = _neg_max_f32()
+
+            if cutlass.const_expr(cfg.q_score_rows_need_mask):
+                # Structural grouped padding and the final partial token/head band
+                # must not enter max/sum or P.
+                self._mask_inactive_swaps_rows(
+                    s_vals, lane_idx, logical_q_group_idx, num_scale_groups, q_repeats
                 )
+
+            # Proxy mass (``_proxy_score_shifts``): the ragged final summary's
+            # scores shift before the reduction so the P pass sees its true mass.
+            proxy_max_shift = Float32(0.0)
+            if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
+                tail_summary_idx, tail_log2_delta = cfg.proxy_tail_summary
+                route_is_proxy_uniform = cute.arch.make_warp_uniform(route_is_proxy)
+                proxy_max_shift, tail_shift = self._proxy_score_shifts(
+                    route_is_proxy_uniform
+                )
+                if cutlass.const_expr(not cfg.fixed_seqlen or tail_log2_delta != 0.0):
+                    if route_is_proxy_uniform:
+                        for token_group_idx in cutlass.range_constexpr(4):
+                            atom_origin, logical_summary = _swaps_routed_coordinate(
+                                cfg,
+                                Int32(lane_idx) >> Int32(2),
+                                sparse_origin0,
+                                sparse_origin1,
+                                sparse_origin2,
+                                sparse_origin3,
+                                token_group_idx=token_group_idx,
+                            )
+                            # Invalid atoms never hold the tail.
+                            if atom_origin >= Int32(0) and logical_summary == Int32(
+                                tail_summary_idx
+                            ):
+                                for tail_repeat_idx in cutlass.range_constexpr(
+                                    q_repeats
+                                ):
+                                    tail_s_base = (
+                                        tail_repeat_idx * 4 + token_group_idx * 2
+                                    )
+                                    if cutlass.const_expr(token_group_idx >= 2):
+                                        tail_s_base = (
+                                            q_repeats * 4
+                                            + tail_repeat_idx * 4
+                                            + (token_group_idx - 2) * 2
+                                        )
+                                    s_vals[tail_s_base + 0] = (
+                                        s_vals[tail_s_base + 0] + tail_shift
+                                    )
+                                    s_vals[tail_s_base + 1] = (
+                                        s_vals[tail_s_base + 1] + tail_shift
+                                    )
+            self._reduce_swaps_lane_max(
+                s_vals,
+                old_max_vals,
+                local_max_vals,
+                lane_idx,
+                local_row_idx,
+                proxy_max_shift,
+                num_scale_groups,
+                q_repeats,
+                use_sparse and cfg.use_block_sparse_proxy_routes,
+            )
 
         if stage_info.loop_offset == stage_info.loop_start:
             # Softmax consumes S in the loop stage. Persistent CTAs reuse this
