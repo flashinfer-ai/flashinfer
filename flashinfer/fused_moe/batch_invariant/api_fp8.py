@@ -67,6 +67,11 @@ def _scale_tensor(m, name: str, device: torch.device) -> torch.Tensor:
         raise ValueError(
             f"{CLASS}: {name} must be one fp32 value, got shape {tuple(t.shape)}"
         )
+    v = float(t.reshape(-1)[0])
+    if not (v > 0.0 and v != float("inf")):
+        raise ValueError(
+            f"{CLASS}: {name} must be a finite positive multiplier, got {v}"
+        )
     return t.reshape(1).contiguous()
 
 

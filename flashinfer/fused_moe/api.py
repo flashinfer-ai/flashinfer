@@ -3464,6 +3464,22 @@ class BatchInvariantFp8PerTensorConfig:
         from .batch_invariant.spec import activation_of
 
         chain = activation_of(activation if activation is not None else SwiGLU())
+        if w1_bf16.dim() != 3 or w2_bf16.dim() != 3:
+            raise TypeError(
+                "BatchInvariantFp8PerTensorConfig.prepare_weights takes w1 [E, N1, H] and w2 [E, H, I]"
+            )
+        E, N1, H = w1_bf16.shape
+        for name, given, actual in (
+            ("num_local_experts", num_local_experts, E),
+            ("hidden_size", hidden_size, H),
+            ("intermediate_size", intermediate_size, N1 // 2 if chain.gated else N1),
+        ):
+            if given is not None and int(given) != actual:
+                raise ValueError(
+                    f"BatchInvariantFp8PerTensorConfig.prepare_weights: {name} {given} does not match the weights' "
+                    f"{actual} (w1 {tuple(w1_bf16.shape)}, w2 {tuple(w2_bf16.shape)}, "
+                    f"{'gated' if chain.gated else 'ungated'} activation)"
+                )
         w1 = w1_bf16.to(device=device) if device is not None else w1_bf16
         w2 = w2_bf16.to(device=device) if device is not None else w2_bf16
         return MoEWeightsE4M3.prepare(
@@ -3488,6 +3504,11 @@ class BatchInvariantFp8PerTensorConfig:
         m = torch.as_tensor(
             hidden_states_scale_global, dtype=torch.float32, device=x.device
         )
+        if m.numel() != 1:
+            raise ValueError(
+                "BatchInvariantFp8PerTensorConfig.prepare_activations: hidden_states_scale_global must be one fp32 value, "
+                f"got shape {tuple(m.shape)}"
+            )
         return quantize_e4m3_static(x, m), None
 
     def __repr__(self) -> str:

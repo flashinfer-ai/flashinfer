@@ -42,7 +42,7 @@ ChainLike = Union[str, GroupedEpilogueBlock]
 def as_chain(chain: ChainLike, out_fmt: str = "bf16") -> GroupedEpilogueBlock:
     """The chain object of a bf16 legacy name (``plain`` / ``swiglu`` / ``relu2`` with ``out_fmt``) or the chain itself."""
     if isinstance(chain, str):
-        assert chain in CHAINS and (chain == "plain" or out_fmt == "bf16"), (
+        assert chain in CHAINS and (chain != "swiglu" or out_fmt == "bf16"), (
             chain,
             out_fmt,
         )

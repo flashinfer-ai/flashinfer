@@ -982,6 +982,69 @@ def test_layer_matches_the_class_composition(act):
         assert (im["a"].float().abs() == 448).any()
 
 
+def test_preparation_refuses_mismatched_geometry_and_bad_multipliers():
+    """The preparers refuse what the class cannot serve before any quantization: a requested geometry that disagrees with
+    the weights, a non-scalar activation multiplier, a zero / negative / infinite static multiplier; and the fingerprint
+    refuses H or I outside the class's e4m3 row alignment."""
+    E, H, I = 4, 64, 32
+    w1 = torch.randn(E, 2 * I, H, dtype=torch.bfloat16)
+    w2 = torch.randn(E, H, I, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="num_local_experts"):
+        BatchInvariantFp8PerTensorConfig.prepare_weights(
+            w1,
+            w2,
+            hidden_states_scale_global=1.0,
+            intermediate_scale_global=1.0,
+            num_local_experts=E + 1,
+        )
+    with pytest.raises(ValueError, match="intermediate_size"):
+        BatchInvariantFp8PerTensorConfig.prepare_weights(
+            w1,
+            w2,
+            hidden_states_scale_global=1.0,
+            intermediate_scale_global=1.0,
+            intermediate_size=I + 16,
+        )
+    with pytest.raises(TypeError):
+        BatchInvariantFp8PerTensorConfig.prepare_weights(
+            w1[0], w2, hidden_states_scale_global=1.0, intermediate_scale_global=1.0
+        )
+    for bad in (0.0, -1.0, float("inf")):
+        with pytest.raises(ValueError, match="finite positive"):
+            BatchInvariantFp8PerTensorConfig.prepare_weights(
+                w1, w2, hidden_states_scale_global=bad, intermediate_scale_global=1.0
+            )
+    with pytest.raises(ValueError, match="one fp32 value"):
+        BatchInvariantFp8PerTensorConfig.prepare_activations(
+            torch.randn(8, H, dtype=torch.bfloat16),
+            hidden_states_scale_global=torch.ones(H),
+        )
+    for bad_hi in ((24, 32), (64, 40), (0, 32)):
+        with pytest.raises(ValueError, match="positive multiple of 16"):
+            bi.fingerprint(
+                "fused_moe_fp8", H=bad_hi[0], I=bad_hi[1], top_k=2, num_experts=E
+            )
+    assert bi.fingerprint("fused_moe_fp8", H=H, I=I, top_k=2, num_experts=E)
+
+
+def test_grouped_output_buffer_must_be_aligned_and_legacy_chains_keep_their_formats():
+    """``_grouped_out`` refuses an output view whose base pointer is not 16-byte aligned even when its strides pass; the legacy
+    chain names keep the output formats their table serves (``relu2`` with f16 / f32, ``swiglu`` bf16 only)."""
+    from flashinfer.fused_moe.batch_invariant.api import _grouped_out
+    from flashinfer.fused_moe.batch_invariant.blocks.compile import as_chain
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GroupedChain
+
+    base = torch.empty(8, 72, dtype=torch.bfloat16)
+    _grouped_out("t", base[:, :64], 8, 64, torch.bfloat16, base.device)
+    with pytest.raises(ValueError, match="16-byte-aligned"):
+        _grouped_out("t", base[:, 1:65], 8, 64, torch.bfloat16, base.device)
+    assert as_chain("relu2", "f32") == GroupedChain.legacy("relu2", "f32")
+    assert as_chain("relu2", "f16") == GroupedChain.legacy("relu2", "f16")
+    assert as_chain("plain", "f32") == GroupedChain.legacy("plain", "f32")
+    with pytest.raises(AssertionError):
+        as_chain("swiglu", "f32")
+
+
 def test_weight_multipliers_stay_finite_for_tiny_experts():
     """An expert whose largest magnitude is below ``448 / FLT_MAX`` would take an infinite ``448 / amax``; the multiplier is
     clamped to the largest finite one, so the quantized bytes stay finite (an all-zero expert keeps the unit multiplier)."""

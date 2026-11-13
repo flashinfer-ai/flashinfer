@@ -255,6 +255,7 @@ def _grouped_out(
         or out.dtype != out_dtype
         or out.stride(1) != 1
         or out.stride(0) % oal
+        or out.data_ptr() % 16
     ):
         raise ValueError(
             f"{name}: out must be a 16-byte-aligned row-major [Tk, n_out] of the chain's dtype"

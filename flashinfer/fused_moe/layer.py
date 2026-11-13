@@ -135,6 +135,7 @@ from .utils import map_to_hybrid_bucket
 # Concrete host runners for configured candidates; device kernel loading stays deferred.
 _RunnerT = Union[
     BatchInvariantMoeRunner,
+    BatchInvariantFp8PerTensorRunner,
     FrostLowLatencyRunner,
     CakeStepFunRunner,
     CudnnFrostBf16MoeRunner,

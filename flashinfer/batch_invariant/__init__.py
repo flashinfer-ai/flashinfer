@@ -278,8 +278,15 @@ def _moe_fp8_fingerprint(
     """The fp8 per-tensor MoE classes behind ``MoELayer`` with ``BatchInvariantFp8PerTensorConfig``: the dimensions of
     :func:`_moe_class_terms` (the routing method with ``DeepSeekV3``'s groups, the activation with its scalars and gating)
     under the same bounds; the scales' values are inputs, not dimensions."""
+    from flashinfer.fused_moe.batch_invariant.api_fp8 import ALIGN_E4M3
     from flashinfer.fused_moe.batch_invariant.spec_fp8 import spec_fingerprint_fp8
 
+    for dim, value in (("H", H), ("I", I)):
+        if value <= 0 or value % ALIGN_E4M3:
+            raise ValueError(
+                f"fingerprint('fused_moe_fp8'): {dim} {value} must be a positive multiple of {ALIGN_E4M3} "
+                "(the class's e4m3 row alignment)"
+            )
     rm, name, params, gated = _moe_class_terms(
         "fused_moe_fp8",
         top_k,
