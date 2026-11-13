@@ -227,6 +227,14 @@ The provider runs registered `gen_*_module()` functions through
 dependencies, not binaries. Keep `FLASHINFER_LOCAL_VERSION` and
 `FLASHINFER_DEV_RELEASE_SUFFIX` identical across matching provider/shim wheels.
 
+On native Windows arm64, `scripts/build_windows_arm64_wheels.py` replaces the
+Linux bash flow (`scripts/jit_cache_build_common.sh` and its callers). It loads
+MSVC through vswhere/vcvarsall when `cl.exe` is not on PATH, pins torch with pip
+constraints, builds through `scripts/build_jit_cache_wheel.py`, and checks that
+every wheel is tagged `win_arm64` and every provider ships `<module>/module.dll`.
+It does not use sccache, because the Windows ninja rules do not use the compiler
+launchers. Provider builds need the Windows build port (MSVC host support).
+
 ## Build implementation
 
 `build_backend.py` is the PEP 517 backend; `version.txt` produces
