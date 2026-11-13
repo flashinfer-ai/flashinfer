@@ -77,6 +77,13 @@ void trtllm_gen_routing(TensorView routing_logits, Optional<TensorView> routing_
   TVM_FFI_ICHECK(num_tokens >= 1) << "num_tokens must be >= 1";
   TVM_FFI_ICHECK(top_k >= 1 && top_k <= num_experts) << "top_k must be between 1 and num_experts";
   TVM_FFI_ICHECK(num_fused_shared_experts >= 0) << "num_fused_shared_experts must be non-negative";
+  // Same guard as FusedMoeLauncher: shared ids follow the routed range, so they
+  // land on local rows only when every routed expert is local.
+  TVM_FFI_ICHECK(num_fused_shared_experts == 0 ||
+                 (local_expert_offset == 0 && local_num_experts == num_experts))
+      << "Fused shared experts (num_fused_shared_experts > 0) are currently only supported "
+         "without expert parallelism, i.e. local_expert_offset == 0 and "
+         "local_num_experts == num_experts.";
   TVM_FFI_ICHECK(local_num_experts >= 1 && local_num_experts <= num_experts)
       << "local_num_experts must be between 1 and num_experts";
   TVM_FFI_ICHECK(local_expert_offset >= 0 && local_expert_offset + local_num_experts <= num_experts)
