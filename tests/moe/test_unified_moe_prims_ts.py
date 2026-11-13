@@ -473,19 +473,29 @@ class TestPrimsTsUnifiedGpu:
         )(act, weights)
         _nvfp4_check(prims_out, trtllm_out.float(), "prims_ts nvfp4 geglu vs trtllm")
 
-    def test_bf16_layer_and_direct_runner_match_reference(self):
+    @pytest.mark.parametrize(
+        "num_tokens,hidden_size,intermediate_size,num_experts,top_k,activation",
+        [
+            pytest.param(16, 256, 256, 8, 2, SwiGLU(), id="swiglu"),
+            pytest.param(4096, 768, 2048, 512, 10, ReLU2(), id="nemotron"),
+        ],
+    )
+    def test_bf16_layer_and_direct_runner_match_reference(
+        self, num_tokens, hidden_size, intermediate_size, num_experts, top_k, activation
+    ):
         act, weights, config, tensors = _make_bf16_packs_and_config(
-            16,
-            hidden_size=256,
-            intermediate_size=256,
-            num_experts=8,
-            top_k=2,
-            max_tokens=16,
+            num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            activation=activation,
+            max_tokens=num_tokens,
         )
         act, weights, config = _with_prims_ts_backend(
             act, weights, config, "trtllm_bf16_routed"
         )
-        reference = _bf16_ref(act, tensors)
+        reference = _bf16_ref(act, tensors, activation=activation)
         layer_out = MoELayer(config)(act, weights)
         _bf16_check(layer_out, reference, "prims_ts bf16 layer")
 
