@@ -252,11 +252,16 @@ def _ceil_div(a: int, b: int) -> int:
 def select_row_pair_tactic(m_tok: int) -> tuple[tuple[int, int], tuple[int, int]]:
     """Return the static row-pair tile and cluster for a token count.
 
-    M at most 64 uses one SM. Larger M uses the 2-SM cluster. Both are the
-    default-stage entries of ``ROW_PAIR_TACTICS``.
+    Default pipeline stages. Tile8 is not in this table.
     """
-    wanted = (128, 64) if m_tok <= 64 else (256, 128)
-    cluster = (1, 1) if m_tok <= 64 else (2, 1)
+    if m_tok <= 8:
+        wanted, cluster = (128, 24), (1, 1)
+    elif m_tok <= 16:
+        wanted, cluster = (128, 32), (1, 1)
+    elif m_tok < 256:
+        wanted, cluster = (128, 64), (1, 1)
+    else:
+        wanted, cluster = (256, 128), (2, 1)
     for tiler, tactic_cluster, stages in ROW_PAIR_TACTICS:
         if tiler == wanted and tactic_cluster == cluster and stages is None:
             return tiler, tactic_cluster
