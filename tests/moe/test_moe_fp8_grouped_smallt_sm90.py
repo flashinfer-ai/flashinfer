@@ -19,12 +19,15 @@ import torch
 
 from flashinfer.fused_moe import cutlass_fused_moe
 from flashinfer.fused_moe.smallt_sm90 import (
+    CUTLASS_FUSED_MOE_BACKENDS,
+    _dispatch_table,
     _eligibility,
     _moe_smallt_sm90_stats,
     _reset_moe_smallt_sm90_stats,
 )
 
-DISABLE_ENV = "FLASHINFER_DISABLE_MOE_FP8_GROUPED_SMALLT_SM90"
+DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
+DISABLE_ENV_LEGACY = "FLASHINFER_DISABLE_MOE_FP8_GROUPED_SMALLT_SM90"
 E, K, H, I = 16, 9, 512, 256  # small test geometry (contract class, not size)
 # W8A8 fused-MoE kernels quantize activations internally, so elementwise
 # tolerance vs an fp32-dequant reference is noise-dominated; the class gate
@@ -36,6 +39,7 @@ TOKEN_SUM_REL, TOKEN_L2_REL = 0.15, 0.10
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     monkeypatch.delenv(DISABLE_ENV, raising=False)
+    monkeypatch.delenv(DISABLE_ENV_LEGACY, raising=False)
     _reset_moe_smallt_sm90_stats()
     yield
     _reset_moe_smallt_sm90_stats()
@@ -66,8 +70,12 @@ def _make(T, device, seed=0, e=E, k=K, h=H, i=I):
         torch.randint(0, 3, (e, (h + 127) // 128, (i + 127) // 128),
                       generator=g, device=device)
     ].float().contiguous()
-    ids = torch.randint(0, e, (T, k), generator=g, device=device,
-                        dtype=torch.int32)
+    # Distinct expert ids per token (as real top-k routing produces): the
+    # stock route's semantics for duplicate ids differ from an additive sum,
+    # so duplicates would compare arms on an off-contract input.
+    ids = torch.stack(
+        [torch.randperm(e, generator=g, device=device)[:k] for _ in range(T)]
+    ).to(torch.int32)
     tw = torch.rand((T, k), generator=g, device=device, dtype=torch.float32)
     tw = tw / tw.sum(-1, keepdim=True)
     x = torch.randn((T, h), generator=g, device=device,
@@ -109,7 +117,7 @@ def _gate(y, ref):
 
 
 def _call(b, **kw):
-    return cutlass_fused_moe(
+    r = cutlass_fused_moe(
         input=b["x"],
         token_selected_experts=b["ids"],
         token_final_scales=b["tw"],
@@ -120,6 +128,11 @@ def _call(b, **kw):
         use_deepseek_fp8_block_scale=True,
         **kw,
     )
+    # The stock cutlass route returns [output] (list); the specialized route
+    # returns the output tensor. Unwrap so arms compare uniformly.
+    if isinstance(r, (tuple, list)):
+        r = r[0]
+    return r
 
 
 # --------------------------------------------------------------------------
@@ -186,8 +199,41 @@ def test_allowlist_rejects_large_batches_and_flags():
 
 def test_stats_report_build_state_and_counters():
     stats = _moe_smallt_sm90_stats()
-    for key in ("calls_seen", "runs_dispatched", "module_loaded", "module_error"):
+    for key in ("calls_seen", "runs_dispatched", "module_loaded",
+                "module_error", "backends", "backend_dispatches",
+                "fallback_reasons", "dispatch_table_loaded"):
         assert key in stats
+    assert stats["backends"] == CUTLASS_FUSED_MOE_BACKENDS
+    assert set(stats["backend_dispatches"]) == {"specialized", "stock"}
+
+
+def test_backends_tuple_and_dispatch_table():
+    assert CUTLASS_FUSED_MOE_BACKENDS == ("auto", "specialized", "cutlass",
+                                          "cake")
+    table = _dispatch_table()
+    assert table is not None
+    assert table["kill_switch"] == DISABLE_ENV
+    op = table["ops"]["cutlass_fused_moe_dsfp8"]
+    assert op["token_bands"] == [[1, 16], [256, 4096]]
+    assert op["compute_capability"] == [9, 0]
+
+
+def test_unknown_backend_raises_gpu_free():
+    x = torch.zeros((1, H), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="never silently swapped"):
+        cutlass_fused_moe(
+            input=x,
+            token_selected_experts=torch.zeros((1, K), dtype=torch.int32),
+            token_final_scales=torch.zeros((1, K)),
+            fc1_expert_weights=torch.zeros((E, 2 * I, H),
+                                           dtype=torch.float8_e4m3fn),
+            fc2_expert_weights=torch.zeros((E, H, I),
+                                           dtype=torch.float8_e4m3fn),
+            output_dtype=torch.bfloat16,
+            quant_scales=[],
+            use_deepseek_fp8_block_scale=True,
+            backend="fa2",
+        )
 
 
 # --------------------------------------------------------------------------
@@ -202,9 +248,10 @@ def test_specialized_matches_reference_and_stock(T, monkeypatch):
     b = _make(T, device)
     ref = _reference(b)
 
-    out = _call(b)
+    out = _call(b)  # backend defaults to "auto" -> allowlisted -> dispatched
     stats = _moe_smallt_sm90_stats()
     assert stats["runs_dispatched"] == 1, stats
+    assert stats["backend_dispatches"]["specialized"] == 1, stats
     ts, l2 = _gate(out, ref)
     assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL, (ts, l2)
 
@@ -212,14 +259,29 @@ def test_specialized_matches_reference_and_stock(T, monkeypatch):
     out2 = _call(b)
     assert torch.equal(out, out2)
 
-    # kill-switch: the same call is served by the stock cutlass path
-    monkeypatch.setenv(DISABLE_ENV, "1")
-    out_stock = _call(b)
+    # NEVER-SWAPPED: explicit backend="cutlass" must not reach the kernel
+    out_pin = _call(b, backend="cutlass")
     stats = _moe_smallt_sm90_stats()
-    assert stats["calls_disabled"] == 1, stats
-    assert stats["runs_dispatched"] == 2  # unchanged by the disabled call
-    ts, l2 = _gate(out_stock, ref)
+    assert stats["runs_dispatched"] == 2, stats  # unchanged by the pinned call
+    ts, l2 = _gate(out_pin, ref)
     assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL, (ts, l2)
+
+    # explicit backend="specialized" dispatches
+    out_spec = _call(b, backend="specialized")
+    stats = _moe_smallt_sm90_stats()
+    assert stats["runs_dispatched"] == 3, stats
+    assert torch.equal(out_spec, out)
+
+    # kill switches (new + deprecated alias): the stock cutlass path serves
+    for env, nexpected in ((DISABLE_ENV, 1), (DISABLE_ENV_LEGACY, 2)):
+        monkeypatch.setenv(env, "1")
+        out_stock = _call(b)
+        monkeypatch.delenv(env)
+        stats = _moe_smallt_sm90_stats()
+        assert stats["calls_disabled"] == nexpected, stats
+        assert stats["runs_dispatched"] == 3  # unchanged by disabled calls
+        ts, l2 = _gate(out_stock, ref)
+        assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL, (ts, l2)
 
 
 def test_above_envelope_takes_the_stock_path():

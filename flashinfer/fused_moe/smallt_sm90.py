@@ -30,8 +30,18 @@ so batches above the bound keep the stock path by design, not by omission.
 The kernel consumes the cutlass_fused_moe fc1 stacking as-is (rows [0:I] =
 up, rows [I:2I] = gate).
 
-``FLASHINFER_DISABLE_MOE_FP8_GROUPED_SMALLT_SM90=1`` (read per call)
-disables the fast-path and restores the stock cutlass route bitwise.
+The fast-path is selected through ``cutlass_fused_moe``'s ``backend`` kwarg
+(#5667 pattern): ``backend="specialized"`` selects it explicitly (a call it
+cannot serve falls back to the stock cutlass route — this op's composable
+path — never another fused backend, reason recorded); ``backend="auto"``
+(the new default) routes to it only on the dispatch allowlist
+(``flashinfer/moe_fp8_grouped_smallt_sm90_dispatch.json``, which carries the
+measured won BANDS); an explicitly named backend (``"cutlass"``, ``"cake"``)
+is NEVER served by it. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per
+call; the kill switch shared by FlashInfer's specialized kernels) restores
+the stock cutlass route bitwise;
+``FLASHINFER_DISABLE_MOE_FP8_GROUPED_SMALLT_SM90=1`` is a deprecated alias
+kept for one release.
 
 The dispatch never allocates on the hot path except the output tensor when
 the caller did not pass one (the stock path allocates it in the same
@@ -48,7 +58,15 @@ import torch
 from ..jit.core import logger
 from ..utils import get_compute_capability
 
+# Kill switch shared by FlashInfer's specialized kernels (read per call).
+_SPECIALIZED_KERNEL_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
+# Deprecated alias (kept for one release).
 _DISABLE_ENV = "FLASHINFER_DISABLE_MOE_FP8_GROUPED_SMALLT_SM90"
+# Backends of cutlass_fused_moe, as plain strings (#5667): "specialized" is
+# the agent-generated small-T/banded fast path; "cutlass"/"cake" are the
+# existing routes. An explicitly selected backend is never silently swapped.
+CUTLASS_FUSED_MOE_BACKENDS = ("auto", "specialized", "cutlass", "cake")
+_DISPATCH_FILE = "moe_fp8_grouped_smallt_sm90_dispatch.json"
 _MAX_TOKENS = 16  # small-path band cap (measured won rows T=1/4/16)
 # Expansion (measured vs FI's own grouped-fp8 route at contract): the
 # candidate also wins the T=256/1024/4096 classes against the stock cutlass
@@ -60,6 +78,14 @@ _MAX_TOKENS = 16  # small-path band cap (measured won rows T=1/4/16)
 _BAND2_LO = 256
 _BAND2_HI = 4096
 _COMPUTE_CAPABILITY = (9, 0)
+
+_backend_dispatches: Dict[str, int] = {"specialized": 0, "stock": 0}
+_fallback_reasons: Dict[str, int] = {}
+
+
+def _fallback(reason: str) -> None:
+    _fallback_reasons[reason] = _fallback_reasons.get(reason, 0) + 1
+
 
 _counters: Dict[str, int] = {
     "calls_seen": 0,  # dsfp8 cutlass calls that reached the hook
@@ -78,7 +104,39 @@ _announced = False
 
 
 def _disabled() -> bool:
-    return os.environ.get(_DISABLE_ENV, "") not in ("", "0")
+    if os.environ.get(_SPECIALIZED_KERNEL_DISABLE_ENV, "") not in ("", "0"):
+        return True
+    if os.environ.get(_DISABLE_ENV, "") not in ("", "0"):
+        logger.warning_once(
+            "%s is deprecated and will be removed in a future release; set "
+            "%s=1 instead (the kill switch shared by FlashInfer's "
+            "specialized kernels)",
+            _DISABLE_ENV,
+            _SPECIALIZED_KERNEL_DISABLE_ENV,
+        )
+        return True
+    return False
+
+
+def _dispatch_table():
+    """Load the dispatch surface (package data) once; ``None`` means
+    ``backend="auto"`` never routes to "specialized"."""
+    global _DISPATCH_TABLE
+    try:
+        return _DISPATCH_TABLE
+    except NameError:
+        pass
+    try:
+        import json
+        from importlib import resources
+
+        payload = json.loads(
+            resources.files("flashinfer").joinpath(_DISPATCH_FILE).read_text()
+        )
+        _DISPATCH_TABLE = payload if isinstance(payload, dict) else None
+    except Exception:
+        _DISPATCH_TABLE = None
+    return _DISPATCH_TABLE
 
 
 def _moe_smallt_sm90_stats() -> Dict[str, Any]:
@@ -87,6 +145,10 @@ def _moe_smallt_sm90_stats() -> Dict[str, Any]:
     stats: Dict[str, Any] = dict(_counters)
     stats["module_loaded"] = _module is not None
     stats["module_error"] = _module_error
+    stats["backends"] = CUTLASS_FUSED_MOE_BACKENDS
+    stats["backend_dispatches"] = dict(_backend_dispatches)
+    stats["fallback_reasons"] = dict(_fallback_reasons)
+    stats["dispatch_table_loaded"] = _dispatch_table() is not None
     return stats
 
 
@@ -94,6 +156,9 @@ def _reset_moe_smallt_sm90_stats() -> None:
     global _announced
     for key in _counters:
         _counters[key] = 0
+    for key in _backend_dispatches:
+        _backend_dispatches[key] = 0
+    _fallback_reasons.clear()
     _announced = False
 
 
@@ -215,19 +280,28 @@ def _moe_smallt_sm90_try_dispatch(
     quant_scales: List[torch.Tensor],
     output: Optional[torch.Tensor],
     flags: Dict[str, Any],
+    requested: str = "auto",
 ) -> Optional[torch.Tensor]:
     """Serve the call with the specialized small-T kernel, or return None so
-    the stock cutlass path runs (nothing launched)."""
+    the stock cutlass path runs (nothing launched; this op's composable
+    route). ``requested`` is the public backend kwarg: only "auto" (on the
+    dispatch allowlist) and "specialized" reach the kernel."""
     global _announced
     _counters["calls_seen"] += 1
     if _disabled():
         _counters["calls_disabled"] += 1
+        _fallback(f"{requested}: kill switch")
+        _backend_dispatches["stock"] += 1
         logger.info_once(
-            "moe_fp8_grouped_smallt_sm90: disabled by %s=%s; the stock "
-            "cutlass path serves small-T dsfp8 calls",
+            "moe_fp8_grouped_smallt_sm90: disabled (%s, or its deprecated "
+            "alias %s); the stock cutlass path serves small-T dsfp8 calls",
+            _SPECIALIZED_KERNEL_DISABLE_ENV,
             _DISABLE_ENV,
-            os.environ.get(_DISABLE_ENV, ""),
         )
+        return None
+    if requested == "auto" and _dispatch_table() is None:
+        _fallback("auto: dispatch allowlist unavailable")
+        _backend_dispatches["stock"] += 1
         return None
     try:
         reason = _eligibility(
@@ -245,6 +319,8 @@ def _moe_smallt_sm90_try_dispatch(
         reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
     if reason is not None:
         _counters["calls_ineligible"] += 1
+        _fallback(f"{requested}: {reason}")
+        _backend_dispatches["stock"] += 1
         logger.info_once(
             "moe_fp8_grouped_smallt_sm90: not dispatched (%s); the stock "
             "cutlass path serves this call",
@@ -258,9 +334,13 @@ def _moe_smallt_sm90_try_dispatch(
     if capturing and _module is None:
         # never compile inside a capture; the stock path is baked
         _counters["runs_capture_unready"] += 1
+        _fallback(f"{requested}: uncompiled under capture")
+        _backend_dispatches["stock"] += 1
         return None
     module = _get_module()
     if module is None:
+        _fallback(f"{requested}: JIT build failed")
+        _backend_dispatches["stock"] += 1
         return None
 
     T = input.shape[0]
@@ -280,6 +360,8 @@ def _moe_smallt_sm90_try_dispatch(
         if capturing:
             # never allocate the cache inside a capture
             _counters["runs_capture_unready"] += 1
+            _fallback(f"{requested}: workspace alloc under capture")
+            _backend_dispatches["stock"] += 1
             return None
         ws = torch.empty(need, dtype=torch.uint8, device=input.device)
         _workspaces[dev_index] = ws
@@ -289,6 +371,8 @@ def _moe_smallt_sm90_try_dispatch(
     if ids.dtype != torch.int32:
         if capturing:
             _counters["runs_capture_unready"] += 1
+            _fallback(f"{requested}: int64 ids cast under capture")
+            _backend_dispatches["stock"] += 1
             return None
         ids = ids.to(torch.int32)
     out = output
@@ -308,6 +392,7 @@ def _moe_smallt_sm90_try_dispatch(
         ws,
     )
     _counters["runs_dispatched"] += 1
+    _backend_dispatches["specialized"] += 1
     if capturing:
         _counters["runs_dispatched_capturing"] += 1
     if not _announced:

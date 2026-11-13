@@ -1,0 +1,17 @@
+{
+  "comment": "Dispatch surface of the specialized SM90 small-T/banded dsfp8 fused-MoE fast path, behind cutlass_fused_moe's 'specialized' backend. 'backends' lists the backend strings; the op entry carries the auto-routing keys INCLUDING THE MEASURED WON BANDS backend='auto' admits (the compiled-in guards in flashinfer/fused_moe/smallt_sm90.py stay authoritative). The 17..255 gap — containing the measured T=64 class where the stock kernel held — stays on the stock route by design. FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 forces the stock route regardless of this file.",
+  "backends": ["auto", "specialized", "cutlass", "cake"],
+  "kill_switch": "FLASHINFER_SPECIALIZED_KERNEL_DISABLE",
+  "ops": {
+    "cutlass_fused_moe_dsfp8": {
+      "quant": "deepseek fp8 [128,128] block-scale (fc1/fc2 f32 scale grids)",
+      "activations": "bfloat16",
+      "output": "bfloat16",
+      "activation_fn": "gated SiLU (Swiglu)",
+      "compute_capability": [9, 0],
+      "token_bands": [[1, 16], [256, 4096]],
+      "band_note": "interior points admitted by band interpolation between measured classes; 17..255 (incl. the measured T=64 class, where the stock kernel held) stays stock",
+      "alignment": {"hidden_multiple_of": 128, "intermediate_multiple_of": 128}
+    }
+  }
+}

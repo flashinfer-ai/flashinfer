@@ -1576,7 +1576,7 @@ def cutlass_fused_moe(
     clamped_relu2_limit: Optional[torch.Tensor] = None,
     situ_beta: Optional[torch.Tensor] = None,
     situ_linear_beta: Optional[torch.Tensor] = None,
-    backend: str = "cutlass",
+    backend: str = "auto",
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
@@ -1772,9 +1772,23 @@ def cutlass_fused_moe(
         smaller counts on the same call.
 
     backend : str
-        ``"cutlass"`` preserves the existing backend. ``"cake"`` selects the
-        prepared TP8-local SiTU complete call; output and workspace are required.
-        See the Cake SiTU guide for its TRTLLM shuffled NVFP4 weight layout.
+        One of ``("auto", "specialized", "cutlass", "cake")``.
+        ``"auto"`` (the default) is the stock CUTLASS route, except that it
+        routes to ``"specialized"`` — the specialized SM90 small-T/banded
+        dsfp8 fast path — only on that kernel's dispatch allowlist
+        (``flashinfer/moe_fp8_grouped_smallt_sm90_dispatch.json``).
+        ``"specialized"`` selects that fast path explicitly; a call it cannot
+        serve falls back to the stock CUTLASS route (this op's composable
+        path) — never to another fused backend — with the reason recorded in
+        ``flashinfer.fused_moe.smallt_sm90._moe_smallt_sm90_stats()``.
+        ``"cutlass"`` pins the stock CUTLASS route: an explicitly selected
+        backend is never silently swapped. ``"cake"`` selects the prepared
+        TP8-local SiTU complete call; output and workspace are required (see
+        the Cake SiTU guide for its TRTLLM shuffled NVFP4 weight layout).
+        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) keeps
+        every call on the stock route;
+        ``FLASHINFER_DISABLE_MOE_FP8_GROUPED_SMALLT_SM90`` is a deprecated
+        alias kept for one release. Unknown names raise ``ValueError``.
 
     nvfp4_4over6 : NVFP44Over6Config or None
         NVFP4 4over6 recipe for the activation quantizations inside the MoE
@@ -1810,6 +1824,12 @@ def cutlass_fused_moe(
     """
     if use_fused_finalize is None:
         use_fused_finalize = not torch.are_deterministic_algorithms_enabled()
+    if backend not in ("auto", "specialized", "cutlass", "cake"):
+        raise ValueError(
+            "cutlass_fused_moe supports backend in ('auto', 'specialized', "
+            f"'cutlass', 'cake'), got {backend!r}; an explicitly selected "
+            "backend is never silently swapped"
+        )
     # moe_fp8_grouped_smallt_sm90: specialized SM90 fast-path for the
     # DeepSeek-style fp8 [128,128]-block-scale format on the measured won
     # bands — T <= 16 (beats the engines' dispatched triton fused-MoE) and
@@ -1821,9 +1841,13 @@ def cutlass_fused_moe(
     # FLASHINFER_DISABLE_MOE_FP8_GROUPED_SMALLT_SM90 kill-switch.
     if (
         use_deepseek_fp8_block_scale
-        and backend == "cutlass"
+        and backend in ("auto", "specialized")
         and input.dim() == 2
-        and (input.shape[0] <= 16 or 256 <= input.shape[0] <= 4096)
+        and (
+            backend == "specialized"
+            or input.shape[0] <= 16
+            or 256 <= input.shape[0] <= 4096
+        )
     ):
         from .smallt_sm90 import _moe_smallt_sm90_try_dispatch
 
@@ -1866,9 +1890,27 @@ def cutlass_fused_moe(
                 )
                 not in ("Swiglu", "SwiGLU", "Silu"),
             },
+            requested=backend,
         )
         if _smallt_res is not None:
-            return _smallt_res
+            # Match the stock route's return convention ([output]) so the
+            # backend taken is not observable in the return type.
+            return [_smallt_res]
+    if backend in ("auto", "specialized"):
+        # Not served by (or not eligible for) the specialized kernel: the
+        # stock CUTLASS route is this op's composable path for both "auto"
+        # and an explicit "specialized" that cannot be honored. try_dispatch
+        # records the reason for the calls it examined; a call it never saw
+        # (non-dsfp8 quant, non-2D input, or auto outside the allowlisted
+        # token bands) is recorded here for explicit "specialized" so an
+        # explicitly requested backend never falls back silently.
+        if backend == "specialized" and not (
+            use_deepseek_fp8_block_scale and input.dim() == 2
+        ):
+            from .smallt_sm90 import _fallback
+
+            _fallback("specialized: not a 2D dsfp8 call")
+        backend = "cutlass"
     # Reject an unhonorable pinned recipe before any device work. The NVFP4
     # test mirrors the binding's isNvfp4Quant() plus the W4A16 flag.
     is_nvfp4 = (
