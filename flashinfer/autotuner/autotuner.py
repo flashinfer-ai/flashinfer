@@ -51,6 +51,7 @@ from flashinfer.autotuner.protocol import (
     _protocol_cache_key,
     _tuning_scope,
 )
+from flashinfer.autotuner._resources import tuning_resources_scope
 
 # This version should be updated whenever the nvfp4_cutlass backend is changed,
 # such as when new kernels or configs are added. In such cases, the tuning configs
@@ -921,6 +922,10 @@ def autotune(
     for each operation.  When ``tune_mode=True``, uncovered shapes are profiled
     on the fly; when ``False``, only previously cached results are used.
 
+    Compile workers requested by an operation are created lazily and shared
+    across nested tuning contexts. They are released when the outermost
+    tuning-enabled context exits, including when tuning raises an exception.
+
     .. note::
         The ``cache`` parameter is **experimental**. Concurrent readers are
         supported. Namespaced product records use single-writer semantics and
@@ -1162,7 +1167,8 @@ def autotune(
         raise
 
     try:
-        yield
+        with tuning_resources_scope() if tune_mode else contextlib.nullcontext():
+            yield
     finally:
         _tuning_scope.reset(scope_token)
         with tuner._lock:
