@@ -10199,17 +10199,19 @@ def _heuristic_func_mm_fp4(
     major, minor = get_compute_capability(a.device)
     is_sm107 = major == 10 and minor == 7
     is_sm103 = major == 10 and minor == 3
-    is_sm120 = major == 12 and minor == 0
+    is_sm12x = major == 12
 
-    # SM120 prefers b12x from CUDA 12.9 for NVFP4 and CUDA 13 for MXFP4.
-    # SM121 (GB10) is intentionally excluded from automatic selection because
-    # cutlass/cudnn are faster in most cases; b12x remains explicitly selectable.
+    # SM12x (SM120 and SM121) prefers b12x from CUDA 12.9 for NVFP4 and CUDA 13
+    # for MXFP4. The b12x kernel uses dense block-scaled MMA atoms, a
+    # family-specific (120f) feature shared by the whole 12.x spec, so the
+    # heuristic dispatches b12x on SM121 too (#3170, action item 3). The b12x
+    # requirement itself is gated on compute capabilities [120, 121].
     b12x_cuda_supported = (
         cuda_version >= _MIN_B12X_CUDA_VERSION
         if use_nvfp4
         else cuda_version.major >= 13
     )
-    if is_sm120 and b12x_cuda_supported:
+    if is_sm12x and b12x_cuda_supported:
         return [c for c in ("b12x", "cutlass", "cudnn") if c in suitable_backends]
 
     candidate_backends: Tuple[str, ...]
@@ -10494,8 +10496,8 @@ def mm_fp4(
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
 
     backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "cutedsl_low_latency", "b12x", "cake", "auto"]
-        Backend to use, defaults to ``"auto"``. On SM120, ``"auto"`` prefers
-        ``"b12x"`` (NVFP4 only), then ``"cutlass"``, then ``"cudnn"``. On other
+        Backend to use, defaults to ``"auto"``. On SM120/SM121 (SM12x), ``"auto"``
+        prefers ``"b12x"`` (NVFP4 only), then ``"cutlass"``, then ``"cudnn"``. On other
         architectures, ``"auto"`` selects between ``"cudnn"`` and ``"cutlass"``
         based on the current CUDA and cuDNN versions. The ``"trtllm"`` and
         ``"cute-dsl"`` backends are never auto-selected because they require
