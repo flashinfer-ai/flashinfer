@@ -73,6 +73,7 @@ struct CollectiveMainloop {
       take<0, 2>(SmemLayoutV{}), select<2, 1>(TileShape_PDV{}), _1{}));  // no mcast
 
   static constexpr bool USE_TMA_LOAD_KV = true;
+  static constexpr bool ZERO_V_TAIL = false;  // rows past kv_len are buffer data or TMA zeros
   using MainloopPipeline = typename Ktraits::MainloopPipeline;
   using PipelineParams = typename MainloopPipeline::Params;
   using PipelineState = typename MainloopPipeline::PipelineState;
