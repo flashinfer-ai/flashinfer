@@ -27,7 +27,9 @@ plus a ``topology`` digest of the gathered LSA-reachability matrix and GIN
 availability, so they never match another backend's key and never leak to a host
 whose peer topology differs.  ``max_tokens`` is the workspace row capacity; lookup
 picks the exact bucket, else the smallest recorded bucket above it, else the largest
-below it.  Every other key field must match exactly.
+below it.  Every other key field must match exactly.  A non-default ``return_codec``
+is part of ``variant`` (``"noshared+int8"``), so bf16 entries stay valid and never
+serve an int8 build.
 """
 
 from __future__ import annotations
@@ -53,6 +55,12 @@ _KEY_FIELDS = (
     "topk",
     "topology",
 )
+
+
+def variant_key(variant: str, return_codec: str = "bf16") -> str:
+    """The ``variant`` key field: the shared-expert variant, plus a non-default return codec."""
+
+    return variant if return_codec == "bf16" else f"{variant}+{return_codec}"
 
 
 def knob_cache_path() -> Optional[str]:
