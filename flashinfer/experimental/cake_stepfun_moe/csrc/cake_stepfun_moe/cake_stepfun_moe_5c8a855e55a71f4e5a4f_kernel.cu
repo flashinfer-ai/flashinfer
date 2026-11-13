@@ -18,22 +18,6 @@
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_stepfun_moe_device_common.cuh"
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 16
-#define TMEM_ACCUM_OFFSET 0
-#define NUM_K_PIPE_STAGES 6
-#define NUM_OUT_PIPE_STAGES 1
-#define SMEM_SMEM_A_OFF 1024
-#define SMEM_SMEM_A_STAGE_BYTES 32768
-#define SMEM_SMEM_A_STRIDE 32768
-#define SMEM_SMEM_B_OFF 197632
-#define SMEM_SMEM_B_STAGE_BYTES 4096
-#define SMEM_SMEM_B_STRIDE 4096
-#define SMEM_EPI_STAGING_OFF 222208
-#define SMEM_EPI_STAGING_STAGE_BYTES 1024
-#define SMEM_EPI_STAGING_STRIDE 1024
-#define SMEM_TOTAL 223232
-#define THREADS 256
 #define BLOCK_N 16
 #define BLOCK_K 256
 #define LAUNCH_MIN_BLOCKS 1
@@ -74,19 +58,20 @@ kernel_cake_stepfun_moe_5c8a855e55a71f4e5a4f(const __grid_constant__ CUtensorMap
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_a_addr = smem + 1024;
     uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 197632);
     const int smem_b_addr = smem + 197632;
     uint16_t* epi_staging = reinterpret_cast<uint16_t*>(smem_raw + 222208);
     const int epi_staging_addr = smem + 222208;
+
+    // Kernel setup ops
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if (__syncthreads_and(((int)blockIdx.y >> 1) + ((int)blockIdx.y & 1) * (grid_n - 1 - 2 * ((int)blockIdx.y >> 1)) >= num_non_exiting_ctas[0])) return;
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
-    // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 19 barriers)
-    // Mbarriers at smem_raw[0..152)
+    // Mbarrier init (19 barriers at smem_raw[0..152))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -134,10 +119,8 @@ kernel_cake_stepfun_moe_5c8a855e55a71f4e5a4f(const __grid_constant__ CUtensorMap
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
 
     // ---- Role: epilogue ----
     if (warp <= 3) {
@@ -378,11 +361,10 @@ kernel_cake_stepfun_moe_5c8a855e55a71f4e5a4f(const __grid_constant__ CUtensorMap
         { // mma_main
             unsigned int stage_2 = 0;
             unsigned int _phase_a_full = 0;
-            unsigned int _phase_b_full = 0;
             #pragma unroll 1
             for (int iter_k_2 = 0; iter_k_2 < K_tiles; iter_k_2++) {
                 mbarrier_wait(a_full_addr + (stage_2) * 8, _phase_a_full);
-                mbarrier_wait(b_full_addr + (stage_2) * 8, _phase_b_full);
+                mbarrier_wait(b_full_addr + (stage_2) * 8, _phase_a_full);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int _mma_a_lo_0 = make_warp_uniform((((smem_a_addr) >> 4) & 0x3FFF) + (stage_2) * 2048);
                 int _mma_b_lo_0 = make_warp_uniform((((smem_b_addr) >> 4) & 0x3FFF) + (stage_2) * 256);
@@ -414,7 +396,7 @@ kernel_cake_stepfun_moe_5c8a855e55a71f4e5a4f(const __grid_constant__ CUtensorMap
                     elect_commit(k_done_addr + (stage_2) * 8);
                 }
                 stage_2 += 1;
-                if (stage_2 == 6) { stage_2 = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; }
+                if (stage_2 == 6) { stage_2 = 0; _phase_a_full ^= 1; }
             }
         }
     }

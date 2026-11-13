@@ -841,6 +841,11 @@ def get_batch_prefill_module(backend, *args):
         uses_spcompress: Optional[bool] = None,
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     ) -> None:
+        if sinks is not None and backend in ("fa2", "fa3"):
+            raise NotImplementedError(
+                f"The standard {backend} paged adapter does not support sinks. "
+                "Use a backend with attention-sink support or a custom sink JIT module."
+            )
         if backend == "trtllm-gen":
             assert num_qo_heads is not None
             assert num_kv_heads is not None

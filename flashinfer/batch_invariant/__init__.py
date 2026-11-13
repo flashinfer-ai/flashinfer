@@ -241,6 +241,28 @@ def _moe_bf16_fingerprint(
     )
 
 
+def _megamoe_bf16_fingerprint(
+    hidden: int,
+    intermediate: int,
+    top_k: int,
+    num_experts: int,
+    apply_routing_weights_before_fc2: bool = True,
+    gate_up_clamp: float | None = None,
+    arch=None,
+) -> str:
+    from ..moe_ep.batch_invariant.spec import spec_fingerprint
+
+    return spec_fingerprint(
+        hidden,
+        intermediate,
+        top_k,
+        num_experts,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        gate_up_clamp=gate_up_clamp,
+        arch=_mx_family(arch, "megamoe_bf16"),
+    )
+
+
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
     # the unified MoE layer with `BatchInvariantBf16Config`: the routing method and the activation (gated SwiGLU / ungated
@@ -250,6 +272,12 @@ CLASSES: Dict[str, ClassInfo] = {
         ("H", "I", "top_k", "num_experts"),
         _moe_bf16_fingerprint,
         ("method", "act", "params", "gated", "n_group", "topk_group"),
+    ),
+    "megamoe_bf16": ClassInfo(
+        "megamoe.bf16",
+        ("hidden", "intermediate", "top_k", "num_experts"),
+        _megamoe_bf16_fingerprint,
+        ("apply_routing_weights_before_fc2", "gate_up_clamp", "arch"),
     ),
     "mm_bf16": ClassInfo("gemm.bf16", ("N", "K"), _mm_bf16_fingerprint, ("bias",)),
     # the fp8 input dtype is a dimension: e4m3 and e5m2 are two classes (gemm.e4m3.*, gemm.e5m2.*) of one API; the output
@@ -298,6 +326,14 @@ def fingerprint(op: str, **dims) -> str:
     The guarantee is scoped to ``(fingerprint, FlashInfer version, architecture)``: two outputs with the same
     fingerprint, the same inputs and the same environment are the same bits, whatever the batch, the configuration
     the dispatcher picked or the API path. A fingerprint change is a release-note item.
+
+    ``megamoe_bf16`` describes the SM100 / SM103 / SM107 BF16 MegaMoE chain with precomputed routing: two
+    padded K16 MMA folds, NaN-propagating clamps, the pinned approximate SwiGLU, the BF16 handoff and
+    combine wire, and the ordered slot fold. Its dimensions are ``hidden``, ``intermediate``, ``top_k``
+    and ``num_experts``; routing-weight placement, the FP32 clamp and ``arch`` are optional. The batch,
+    capacity, packing and scheduling are not dimensions. The environment scope additionally fixes EP
+    topology, expert placement and the compiler stack. SM107 requires native ``sm_107a`` compilation
+    and has its own architecture receipt. This is distinct from the regular MoE class.
 
     ``mm_bf16`` takes the weight shape ``N, K``: the K steps of the fold and the chunk count (a function of the
     weight shape alone) are the specification; M, the configuration and the weight's layout do not enter it. The

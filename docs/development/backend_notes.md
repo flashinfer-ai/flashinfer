@@ -114,6 +114,12 @@ bindings and mask-representation transitions.
 
 ### FA2 scheduling and runtime scales
 
+Standard FA2/FA3 paged adapters reject `sinks` instead of silently dropping the
+tensor. This also applies to tensor-core decode when it uses the paged prefill
+adapter, including a fallback from another provider. Custom sink JIT modules
+retain their existing positional-argument interface; their generated kernel
+must actually include the sink variant.
+
 FA2 captures bind CPU-generated output/merge prefixes as well as indptr tensors.
 Updating indptrs after switching to cuDNN leaves schedules stale when requests
 exchange query rows. In graph mode, keep FA2 once planned; eager auto selection
