@@ -589,7 +589,9 @@ class FmhaConfig:
 
     @property
     def vc_qk8(self) -> bool:
-        """VC-Attention-QK8, the E4M3 Q/K recipe with per-block dequant scales."""
+        """VC-Attention-QK8, the E4M3 or INT8 Q/K recipe with per-block dequant
+        scales. INT8 scores arrive on the ``INT32_SCORE_BIAS`` float bias, which
+        the row max and the exp2 remove where they apply the tile scale."""
         return self.vc_attention is not None and self.q_dtype.width == 8
 
     @property
@@ -4284,6 +4286,8 @@ class TmemSPResource(MemoryResource):
             row_vector = cutlass.Vector.from_elements(row_values, self.cfg.qk_acc_dtype)
             tile_row_max = row_vector.reduce("max")
             if cutlass.const_expr(self.cfg.vc_attention):
+                if cutlass.const_expr(self.cfg.uses_int32_scores):
+                    tile_row_max = tile_row_max - Float32(INT32_SCORE_BIAS)
                 tile_row_max = tile_row_max * tile_scale
                 _tmem_sp_tile_scale[id(self)] = tile_scale
             if cutlass.const_expr(sage_q_scale is not None):
@@ -4332,6 +4336,8 @@ class TmemSPResource(MemoryResource):
             chunk_maxima, self.cfg.qk_acc_dtype
         ).reduce("max")
         if cutlass.const_expr(self.cfg.vc_attention):
+            if cutlass.const_expr(self.cfg.uses_int32_scores):
+                tile_max = tile_max - Float32(INT32_SCORE_BIAS)
             tile_max = tile_max * tile_scale
             _tmem_sp_tile_scale[id(self)] = tile_scale
         row_max = cute.math.max(row_max, tile_max)
@@ -4442,7 +4448,12 @@ class TmemSPResource(MemoryResource):
         if cutlass.const_expr(self.cfg.vc_attention):
             # The paper's 2^8 P scaling is part of VC_EXPCAST_CODE_BIAS, so
             # p_scale_log2 is not added here.
-            return self._exp2_p_store_expcast(scale, Float32(0.0) - row_max)
+            minus_row_max = Float32(0.0) - row_max
+            if cutlass.const_expr(self.cfg.uses_int32_scores):
+                # INT32 scores carry the float bias; fold its removal into the
+                # exp2 addend so the per-score FFMA stays one instruction.
+                minus_row_max = minus_row_max - Float32(INT32_SCORE_BIAS) * scale
+            return self._exp2_p_store_expcast(scale, minus_row_max)
         minus_row_max_scale = _softmax_exp2_bias(row_max, scale, p_scale_log2)
         # The exp2 addend of a score pair; a block-scaled INT32 plan folds
         # the score bias into it per block.
