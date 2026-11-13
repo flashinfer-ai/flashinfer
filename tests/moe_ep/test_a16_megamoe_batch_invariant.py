@@ -428,6 +428,10 @@ def test_a16_batch_invariant_deferred_partials(kind, early, monkeypatch):
                 assert_bits(
                     partials.view(17, 3, 384), anchor[selected], "A16 deferred graph"
                 )
+                assert torch.equal(
+                    wire_weights.view(torch.int32),
+                    anchor_weights[selected].view(torch.int32),
+                )
             inputs.topk_ids.fill_(-1)
             inputs.topk_weights.fill_(float("nan"))
             graph.replay()

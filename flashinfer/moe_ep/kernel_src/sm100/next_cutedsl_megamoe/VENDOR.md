@@ -161,3 +161,12 @@ reciprocal and RN scaling retain the next-generation arithmetic chain.
 Existing fixed-N handling, SwiGLU, BF16 conversion and ordered masked
 finalization are reused. NVFP4, MXFP4 and ordinary branches keep their existing
 arithmetic. Retain this additional FlashInfer-owned exception until upstreamed.
+
+## Batch-invariant compiled identity patch
+
+Both standard and GenPhase kernel `name()` methods append the BI mode and,
+when present, a hash of the ordered activation signature's effective FP32
+coefficient bits. Ordinary names remain byte-for-byte unchanged. This also
+separates the standard provider's name-derived AOT symbols. Reapply this host
+metadata patch together with the BI arithmetic hooks after regenerating the
+export until upstream absorbs it.

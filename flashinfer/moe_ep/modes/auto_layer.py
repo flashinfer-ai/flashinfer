@@ -130,6 +130,31 @@ def _candidate_plain(config):
     )
 
 
+def _copy_config_preserving_tensors(config):
+    """Copy configuration metadata while retaining borrowed runtime buffers."""
+    memo, seen = {}, set()
+
+    def preserve(value):
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        if isinstance(value, torch.Tensor):
+            memo[id(value)] = value
+        elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+            for field in dataclasses.fields(value):
+                preserve(getattr(value, field.name))
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                preserve(key)
+                preserve(item)
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                preserve(item)
+
+    preserve(config)
+    return copy.deepcopy(config, memo)
+
+
 def _identity(context):
     # Child skip policies affect which implementations the outer score represents.
     return context.cache_identity, tuple(sorted(context.tuner._effective_skip_ops))
@@ -257,7 +282,7 @@ class MoEEpAutoLayer(nn.Module):
             configs = c.prepare(
                 lambda: [_candidate_plain(v) for v in config.candidates]
             )
-            config = copy.deepcopy(config)
+            config = c.prepare(lambda: _copy_config_preserving_tensors(config))
             self._config = config
             self._config_contract = c.gather(configs)
             self._fleet_knobs = c.gather(c.prepare(lambda: plain(fleet_knobs)))

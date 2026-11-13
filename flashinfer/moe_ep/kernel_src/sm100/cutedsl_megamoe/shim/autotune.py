@@ -373,6 +373,9 @@ def autotune_knobs(
     on_winner: Optional[Callable[[Dict[str, Any], float], None]] = None,
     prepare_launch: Optional[Callable[[], Callable[[], None]]] = None,
     config_overrides: Optional[Dict[str, Any]] = None,
+    candidate_filter: Optional[
+        Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]
+    ] = None,
     process_group: Any = None,
     measure_launch: Optional[Callable[[Callable[[], None]], float]] = None,
 ) -> Dict[str, Any]:
@@ -383,6 +386,8 @@ def autotune_knobs(
     the caller's real staged inputs (e.g. a ``nvfp4_mega_moe(...)`` call).
     ``prepare_launch``, when supplied, builds that callable after each knob
     change, outside the timed interval.
+    ``candidate_filter`` runs after agreement on the unfiltered proposal;
+    filtering errors and the surviving candidate order are agreed collectively.
 
     ``on_winner`` (optional) is called once with ``(winner, p50_seconds)``
     after the winner is applied — used to persist the result in the knob
@@ -467,6 +472,7 @@ def autotune_knobs(
                 warmup_iters,
                 timed_iters,
                 config_overrides,
+                candidate_filter is not None,
                 config,
             )
         )
@@ -478,6 +484,21 @@ def autotune_knobs(
             )
     else:
         preflight()
+
+    if candidate_filter is not None:
+        if multi_rank:
+            candidates = phase(
+                "candidate filtering", lambda: candidate_filter(candidates)
+            )
+            admitted = _tuning_specification(candidates)
+            admitted_proposals = [None] * world_size
+            dist.all_gather_object(admitted_proposals, admitted, group=process_group)
+            if any(proposal != admitted for proposal in admitted_proposals):
+                raise ValueError(
+                    "all EP ranks must admit the same legacy autotune candidates"
+                )
+        else:
+            candidates = candidate_filter(candidates)
 
     def _barrier() -> None:
         if collective:
@@ -704,11 +725,6 @@ def autotune_nvfp4_mega_moe(
             ),
         )
 
-    if getattr(cfg, "batch_invariant", False):
-        candidates = _session_candidates(
-            candidates, cfg, is_valid_nvfp4_for_config, what="NVFP4 MegaMoE"
-        )
-
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
         # Persist for future pure-lookup engine starts; rank 0 writes (the
         # winner is identical on all ranks after the all_reduce).
@@ -750,6 +766,13 @@ def autotune_nvfp4_mega_moe(
         on_winner=_record,
         prepare_launch=prepare_launch,
         config_overrides=overrides,
+        candidate_filter=(
+            lambda proposed: _session_candidates(
+                proposed, cfg, is_valid_nvfp4_for_config, what="NVFP4 MegaMoE"
+            )
+        )
+        if getattr(cfg, "batch_invariant", False)
+        else None,
     )
 
 
@@ -801,10 +824,6 @@ def autotune_mxfp8_mega_moe(
             enable_in_kernel_fc2_reduce=cfg.enable_in_kernel_fc2_reduce,
             batch_invariant=getattr(cfg, "batch_invariant", False),
         )
-    if getattr(cfg, "batch_invariant", False):
-        candidates = _session_candidates(
-            candidates, cfg, is_valid_mxfp8_for_config, what="MXFP8 MegaMoE"
-        )
 
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
         # Persist for future pure-lookup engine starts; rank 0 writes (the
@@ -848,6 +867,13 @@ def autotune_mxfp8_mega_moe(
         on_winner=_record,
         prepare_launch=prepare_launch,
         config_overrides=overrides,
+        candidate_filter=(
+            lambda proposed: _session_candidates(
+                proposed, cfg, is_valid_mxfp8_for_config, what="MXFP8 MegaMoE"
+            )
+        )
+        if getattr(cfg, "batch_invariant", False)
+        else None,
     )
 
 
@@ -892,20 +918,23 @@ def autotune_bf16_mega_moe(
         return launch
 
     cfg = frontend.config
+    builtin_candidates = candidates is None
     if candidates is None:
         # Shape and SMEM filtering is expected for the built-in geometry
         # product. Warn only when a caller explicitly supplies an invalid plan.
-        candidates = [
-            knobs
-            for knobs in bf16_candidates(
-                enable_in_kernel_fc2_reduce=cfg.enable_in_kernel_fc2_reduce,
-                batch_invariant=cfg.batch_invariant,
-            )
-            if is_valid_bf16_for_config(cfg, knobs)
-        ]
-    candidates = _session_candidates(
-        candidates, cfg, is_valid_bf16_for_config, what="BF16 MegaMoE"
-    )
+        candidates = bf16_candidates(
+            enable_in_kernel_fc2_reduce=cfg.enable_in_kernel_fc2_reduce,
+            batch_invariant=cfg.batch_invariant,
+        )
+
+    def filter_candidates(proposed):
+        if builtin_candidates:
+            proposed = [
+                knobs for knobs in proposed if is_valid_bf16_for_config(cfg, knobs)
+            ]
+        return _session_candidates(
+            proposed, cfg, is_valid_bf16_for_config, what="BF16 MegaMoE"
+        )
 
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
         # Persist for future pure-lookup engine starts; rank 0 writes (the
@@ -948,6 +977,7 @@ def autotune_bf16_mega_moe(
         on_winner=_record,
         prepare_launch=prepare_launch,
         config_overrides=overrides,
+        candidate_filter=filter_candidates,
     )
 
 
@@ -991,12 +1021,6 @@ def autotune_bf16_mxfp8_mega_moe(
             enable_in_kernel_fc2_reduce=cfg.enable_in_kernel_fc2_reduce,
             batch_invariant=cfg.batch_invariant,
         )
-    candidates = _session_candidates(
-        candidates,
-        cfg,
-        is_valid_bf16_mxfp8_for_config,
-        what="mixed BF16/MXFP8 MegaMoE",
-    )
 
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
         # Persist for future pure-lookup engine starts; rank 0 writes (the
@@ -1037,6 +1061,12 @@ def autotune_bf16_mxfp8_mega_moe(
         on_winner=_record,
         prepare_launch=prepare_launch,
         config_overrides=overrides,
+        candidate_filter=lambda proposed: _session_candidates(
+            proposed,
+            cfg,
+            is_valid_bf16_mxfp8_for_config,
+            what="mixed BF16/MXFP8 MegaMoE",
+        ),
     )
 
 

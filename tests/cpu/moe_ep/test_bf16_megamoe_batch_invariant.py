@@ -257,7 +257,9 @@ def test_sm107_resource_filter_and_receipt_share_the_same_arch(monkeypatch):
     monkeypatch.setattr(
         autotune,
         "autotune_knobs",
-        lambda _frontend, _launch, candidates, **_: candidates,
+        lambda _frontend, _launch, candidates, **kwargs: kwargs["candidate_filter"](
+            candidates
+        ),
     )
     for current_arch, expected in (
         ("sm_100", False),
@@ -539,7 +541,9 @@ def test_autotune_filters_geometry_by_shape_and_keeps_k64_fallback(monkeypatch):
     monkeypatch.setattr(
         autotune,
         "autotune_knobs",
-        lambda _frontend, _launch, candidates, **_: candidates,
+        lambda _frontend, _launch, candidates, **kwargs: kwargs["candidate_filter"](
+            candidates
+        ),
     )
     for hidden, intermediate, expected_k in ((32, 64, {64}), (96, 128, {64, 128})):
         buffer = SimpleNamespace(
@@ -570,7 +574,9 @@ def test_default_plan_filter_is_quiet_but_explicit_invalid_plans_warn(
     monkeypatch.setattr(
         autotune,
         "autotune_knobs",
-        lambda _frontend, _launch, candidates, **_: candidates,
+        lambda _frontend, _launch, candidates, **kwargs: kwargs["candidate_filter"](
+            candidates
+        ),
     )
     buffer = SimpleNamespace(
         _frontend=MegaMoEBf16Frontend(_config(hidden=hidden, intermediate=intermediate))
@@ -998,7 +1004,9 @@ def test_autotune_only_receives_admitted_candidates(monkeypatch):
     monkeypatch.setattr(
         autotune,
         "autotune_knobs",
-        lambda _frontend, _launch, candidates, **_kwargs: candidates,
+        lambda _frontend, _launch, candidates, **kwargs: kwargs["candidate_filter"](
+            candidates
+        ),
     )
     buffer = SimpleNamespace(_frontend=MegaMoEBf16Frontend(_config()))
     with pytest.warns(RuntimeWarning):

@@ -197,6 +197,14 @@ replace its own device snapshot.
   separate receipt from providers that first round FC2 to BF16. Public outputs
   remain BF16; wire payloads and SFs stay inside the symmetric workspace.
 
+## Batch-invariant compiled identity patch
+
+The NVFP4 FC12/MegaMoE and W8A16 FC12 `name()` methods append the BI mode and,
+when present, a hash of the ordered activation signature's effective FP32
+coefficient bits. Their ordinary names remain byte-for-byte unchanged. Retain
+this host metadata exception alongside the BI lowering hooks until upstream
+absorbs it.
+
 ## Related trees
 
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` is a **separate snapshot**

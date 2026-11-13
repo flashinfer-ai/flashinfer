@@ -59,7 +59,7 @@ def require_lean():
         )
     pinned = (LEAN_DIR / "lean-toolchain").read_text().strip().rsplit(":v", 1)[-1]
     result = subprocess.run(
-        [lake, "--version"], capture_output=True, text=True, timeout=30
+        [lake, "--version"], cwd=LEAN_DIR, capture_output=True, text=True, timeout=30
     )
     if result.returncode or f"Lean version {pinned}" not in result.stdout:
         raise RuntimeError(

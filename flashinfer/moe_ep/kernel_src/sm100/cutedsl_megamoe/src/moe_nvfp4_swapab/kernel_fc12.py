@@ -227,6 +227,14 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         )
         # token-back is a token-communication concept -- it lives in the MegaMoE
         # subclass name(), not the lean base.
+        bi_enabled = bool(getattr(self, "batch_invariant_chain", False))
+        bi_variant = getattr(self, "batch_invariant_activation", None)
+        bi_suffix = f"_bi{int(bi_enabled)}" if bi_enabled or bi_variant is not None else ""
+        if bi_variant is not None:
+            import hashlib
+            bi_suffix += "_act" + hashlib.sha256(
+                repr(bi_variant.signature).encode()
+            ).hexdigest()[:16]
         return (
             "moe_fc12_fuse_nvfp4"
             f"_mmatiler_{m}x{n}x{k}_cluster_{cm}x{cn}_{cta}_sched_{self.load_balance_mode}"
@@ -238,6 +246,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             f"_swiglub{self.swiglu_beta}_clamp{self.gate_up_clamp}_epiflag{epiflag}"
             f"_situ{self.situ_beta}_linear{self.situ_linear_beta}"
             f"{act_scale}"
+            + bi_suffix
         )
 
     def _validate_mma_tiler_and_cluster_shape(self) -> None:

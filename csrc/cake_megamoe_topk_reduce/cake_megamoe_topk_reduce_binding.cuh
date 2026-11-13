@@ -34,6 +34,7 @@
 #include <limits>
 #include <utility>
 
+#include "flashinfer/megamoe/batch_invariant_topk_reduce.cuh"
 #include "tvm_ffi_utils.h"
 
 namespace flashinfer {
@@ -42,35 +43,6 @@ namespace cake_megamoe_topk_reduce {
 constexpr int32_t kTopK = 6;
 constexpr int32_t kHiddenSize = 4096;
 constexpr int32_t kRequiredAlignmentBytes = 128;
-
-// BI is a separate specialization: every ordered route contributes an RN
-// addition to +0, including masked slots. Never read stale masked payloads.
-template <typename Id>
-__global__ void BatchInvariantReduce(const __nv_bfloat16* __restrict__ partials,
-                                     const Id* __restrict__ ids, __nv_bfloat16* __restrict__ out,
-                                     int64_t hidden, int64_t top_k, int64_t num_experts) {
-  const int64_t pairs_per_token = hidden / 2;
-  const int64_t worker = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t token = worker / pairs_per_token;
-  const int64_t column = 2 * (worker % pairs_per_token);
-  float2 acc = make_float2(0.0f, 0.0f);
-  for (int64_t slot = 0; slot < top_k; ++slot) {
-    const Id expert = ids[token * top_k + slot];
-    float2 value = make_float2(0.0f, 0.0f);
-    if (expert >= 0 && expert < num_experts) {
-      const auto bits =
-          *reinterpret_cast<const uint32_t*>(partials + (token * top_k + slot) * hidden + column);
-      value.x = __uint_as_float(bits << 16);
-      value.y = __uint_as_float(bits & 0xffff0000u);
-    }
-    asm("add.rn.f32x2 %0, %1, %2;"
-        : "=l"(*reinterpret_cast<unsigned long long*>(&acc))
-        : "l"(*reinterpret_cast<unsigned long long*>(&acc)),
-          "l"(*reinterpret_cast<unsigned long long*>(&value)));
-  }
-  const __nv_bfloat162 packed = __float22bfloat162_rn(acc);
-  *reinterpret_cast<__nv_bfloat162*>(out + token * hidden + column) = packed;
-}
 
 // The generated source holds the reducer in seven CTA shapes.  Every thread runs
 // the same program (six loads, FP32 adds in increasing k, one RN rounding), so

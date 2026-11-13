@@ -32,15 +32,9 @@ def _device(provider):
 
 
 def _assert_bits(actual, expected, context):
-    import torch
-    import torch.distributed as dist
+    from ._megamoe_bi_helpers import assert_bits
 
-    count = (
-        actual.contiguous().view(torch.int16) != expected.contiguous().view(torch.int16)
-    ).sum()
-    if dist.is_initialized() and dist.get_world_size() > 1:
-        dist.all_reduce(count)
-    assert count.item() == 0, f"{context}: {count.item()} output representations differ"
+    assert_bits(actual, expected, context)
 
 
 def _problem(rank, world, hidden=384, intermediate=192, *, top_k=3, local_experts=4):

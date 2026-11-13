@@ -360,9 +360,14 @@ class MegaMoEBf16Frontend:
         p = self._compile_prepare
         if p is None:
             raise RuntimeError("missing local MegaMoE preparation")
-        p["local_workspace"] = torch.zeros(
-            p["local_bytes"], dtype=torch.uint8, device="cuda"
-        )
+        try:
+            p["local_workspace"] = torch.zeros(
+                p["local_bytes"], dtype=torch.uint8, device="cuda"
+            )
+        except Exception:
+            p.clear()
+            self._compile_prepare = None
+            raise
 
     def _prepare_compile_symmetric(self):
         p = self._compile_prepare

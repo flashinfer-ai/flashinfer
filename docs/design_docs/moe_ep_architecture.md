@@ -775,6 +775,9 @@ int32/int64 expert IDs and float32 weights. FC1 rows use the unified MoE API's
 Routing-weight placement, the NVFP4 activation recipe and the combine format
 must also agree. In particular, mixing a split candidate with Rubin Mega
 requires `apply_routing_weights_before_fc2=False` and `combine_dtype="bf16"`.
+Ordinary outer selection requires the default SwiGLU constants, matching the
+split-candidate contract. Direct Mega execution retains its custom constants;
+BI outer selection admits explicit activation recipes through their fingerprint.
 Candidate preparation converts native weight layouts before tuning. Mega
 candidates use the shared BF16/W4A16/W8A16 adapters and Blackwell/Rubin
 block-scaled adapters, including next standard/GenPhase quantized providers.

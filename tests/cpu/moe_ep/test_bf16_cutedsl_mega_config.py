@@ -203,7 +203,9 @@ def test_bf16_autotune_filters_unpermitted_ikr_candidates(monkeypatch):
     monkeypatch.setattr(
         autotune,
         "autotune_knobs",
-        lambda _frontend, _launch, candidates, **_kwargs: candidates,
+        lambda _frontend, _launch, candidates, **kwargs: kwargs["candidate_filter"](
+            candidates
+        ),
     )
     buffer = SimpleNamespace(_frontend=frontend)
     with pytest.warns(
@@ -240,7 +242,9 @@ def test_bf16_autotune_sweeps_the_ikr_axis_when_permitted(monkeypatch):
     monkeypatch.setattr(
         autotune,
         "autotune_knobs",
-        lambda _frontend, _launch, candidates, **_kwargs: candidates,
+        lambda _frontend, _launch, candidates, **kwargs: kwargs["candidate_filter"](
+            candidates
+        ),
     )
     candidates = autotune.autotune_bf16_mega_moe(
         None, None, None, SimpleNamespace(_frontend=frontend)

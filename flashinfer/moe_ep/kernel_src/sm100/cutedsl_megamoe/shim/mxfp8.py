@@ -634,21 +634,32 @@ class MegaMoEMxfp8Frontend:
         p = self._compile_prepare
         if p is None:
             raise RuntimeError("missing local MegaMoE preparation")
-        p["local_workspace"] = torch.zeros(
-            p["local_bytes"], dtype=torch.uint8, device="cuda"
-        )
-        from common.megamoe_constants import Mxfp8BlockSize
+        try:
+            p["local_workspace"] = torch.zeros(
+                p["local_bytes"], dtype=torch.uint8, device="cuda"
+            )
+            from common.megamoe_constants import Mxfp8BlockSize
 
-        p["col_quant_data"] = torch.zeros(
-            (p["kernel"].pool_token_capacity, self.config.hidden),
-            dtype=self.config.torch_ab_dtype,
-            device="cuda",
-        )
-        p["col_quant_sf"] = torch.zeros(
-            (self.config.hidden * p["kernel"].pool_token_capacity // Mxfp8BlockSize,),
-            dtype=torch.uint8,
-            device="cuda",
-        )
+            p["col_quant_data"] = torch.zeros(
+                (p["kernel"].pool_token_capacity, self.config.hidden),
+                dtype=self.config.torch_ab_dtype,
+                device="cuda",
+            )
+            p["col_quant_sf"] = torch.zeros(
+                (
+                    self.config.hidden
+                    * p["kernel"].pool_token_capacity
+                    // Mxfp8BlockSize,
+                ),
+                dtype=torch.uint8,
+                device="cuda",
+            )
+        except Exception:
+            # Do not retain partial scratch through the exception traceback or
+            # make a retry skip allocation. Symmetric storage stays owned by _mega.
+            p.clear()
+            self._compile_prepare = None
+            raise
 
     def _prepare_compile_symmetric(self):
         p = self._compile_prepare

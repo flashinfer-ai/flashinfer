@@ -34,8 +34,9 @@ jobs:
       QUALIFY_PYTHON: ${{ inputs.python }}
       BI_ARCH: ${{ inputs.arch }}
       EP_WORLD_SIZE: ${{ inputs.world_size }}
-      ELAN_HOME: ${{ runner.temp }}/flashinfer-bi-elan
     steps:
+      - name: Set the Lean installation directory
+        run: echo "ELAN_HOME=$RUNNER_TEMP/flashinfer-bi-elan" >> "$GITHUB_ENV"
       - uses: actions/checkout@v5
         with:
           submodules: recursive

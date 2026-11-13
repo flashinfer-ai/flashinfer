@@ -62,6 +62,14 @@ class BlackwellEpTuningMixin:
         cfg = self._config
         if batch_invariant_output_mode(cfg) != "finalized":
             raise NotImplementedError("EP selection requires finalized output")
+        if not getattr(cfg, "batch_invariant", False) and (
+            getattr(cfg, "swiglu_alpha", None) not in (None, 1.0)
+            or getattr(cfg, "swiglu_beta", None) not in (None, 0.0)
+        ):
+            raise NotImplementedError(
+                "EP selection requires standard SwiGLU constants unless "
+                "batch_invariant=True"
+            )
         kind = (
             self._kind()
             if callable(getattr(self, "_kind", None))
@@ -185,6 +193,9 @@ class BlackwellEpTuningMixin:
                 allow_nondeterministic=getattr(
                     self._config, "enable_in_kernel_fc2_reduce", False
                 ),
+                constraints=self._genphase_constraints()
+                if getattr(self._config, "kernel_variant", None) == "genphase"
+                else None,
                 make_trial=execution.make_trial,
                 execution_contract=execution.contract(),
             ),

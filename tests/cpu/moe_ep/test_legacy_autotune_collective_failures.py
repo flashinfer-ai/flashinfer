@@ -16,6 +16,7 @@ def _rank_worker(rank, directory):
     import torch.distributed as dist
 
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.autotune import (
+        _session_candidates,
         autotune_knobs,
     )
 
@@ -29,7 +30,7 @@ def _rank_worker(rank, directory):
     )
     results = []
     try:
-        for failure in ("local_prepare", "compile", None):
+        for failure in ("candidate_filter", "local_prepare", "compile", None):
             launches = 0
 
             class Frontend:
@@ -68,6 +69,15 @@ def _rank_worker(rank, directory):
                 return launch
 
             candidates = [{"plan": 0}, {"plan": 1}]
+
+            def filter_candidates(proposed):
+                return _session_candidates(
+                    [] if failure == "candidate_filter" and rank == 1 else proposed,
+                    None,
+                    lambda _config, _knobs: True,
+                    what="fault-injected MegaMoE",
+                )
+
             winner, error = None, None
             try:
                 winner = autotune_knobs(
@@ -78,6 +88,7 @@ def _rank_worker(rank, directory):
                     warmup_iters=1,
                     timed_iters=2,
                     prepare_launch=prepare_launch,
+                    candidate_filter=filter_candidates,
                 )
             except (RuntimeError, ValueError) as exc:
                 error = str(exc)
@@ -120,7 +131,7 @@ def test_two_rank_preparation_failures_do_not_enter_peer_launch(tmp_path):
     assert completed.returncode == 0, completed.stdout + completed.stderr
     for rank in (0, 1):
         results = json.loads((tmp_path / f"rank-{rank}.json").read_text())
-        assert len(results) == 3
+        assert len(results) == 4
 
 
 if __name__ == "__main__":

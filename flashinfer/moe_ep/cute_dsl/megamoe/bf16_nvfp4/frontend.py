@@ -352,9 +352,14 @@ class MegaMoEBf16Nvfp4Frontend:
         p = self._compile_prepare
         if p is None:
             raise RuntimeError("missing local W4A16 preparation")
-        p["local_workspace"] = torch.zeros(
-            p["local_bytes"], dtype=torch.uint8, device="cuda"
-        )
+        try:
+            p["local_workspace"] = torch.zeros(
+                p["local_bytes"], dtype=torch.uint8, device="cuda"
+            )
+        except Exception:
+            p.clear()
+            self._compile_prepare = None
+            raise
 
     def _prepare_compile_symmetric(self):
         p = self._compile_prepare
@@ -737,8 +742,12 @@ class MegaMoEBf16Nvfp4Frontend:
                 f"with shape ({num_tokens}, {c.hidden})."
             )
 
-    def reduce_topk(self, combined, scores, output):
+    def reduce_topk(self, combined, scores, output, topk_idx=None):
         """Combine BF16 FC2 partials in FP32, weighting if FC1 did not."""
+        if self.config.batch_invariant and topk_idx is None:
+            raise ValueError(
+                "batch_invariant top-k reduction requires current topk_idx"
+            )
         # Empty source ranks still execute the collective fused kernel, but
         # have no local rows to reduce and must not launch a zero-block grid.
         if output.shape[0] == 0:
@@ -777,15 +786,11 @@ class MegaMoEBf16Nvfp4Frontend:
             self._reduce = cute.compile(
                 reducer,
                 *args,
-                topk_indices=compact(self._launch_inputs.topk_idx)
-                if self.config.batch_invariant
-                else None,
+                topk_indices=compact(topk_idx) if self.config.batch_invariant else None,
             )
         self._reduce(
             *args,
-            topk_indices=compact(self._launch_inputs.topk_idx)
-            if self.config.batch_invariant
-            else None,
+            topk_indices=compact(topk_idx) if self.config.batch_invariant else None,
         )
 
 

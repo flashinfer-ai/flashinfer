@@ -285,6 +285,77 @@ def test_blackwell_batch_invariant_outer_forced_inner_search_blackwell_only(
     _run("nvfp4", 0, 1, monkeypatch, tmp_path, force_inner=True)
 
 
+def test_blackwell_batch_invariant_outer_caller_tensor_updates_blackwell_only(
+    monkeypatch,
+):
+    import torch
+    from flashinfer import autotune_v2
+    from flashinfer.autotune_cache import MeasurementPolicy, autotune_v2_reload
+    from flashinfer.moe_ep import FinalizeMode, MoEEpTensors
+
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        pytest.skip("single-rank caller-owned tensor regression")
+    _require()
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("Rubin block-scaled kernels do not expose persistent output")
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
+    count = torch.zeros(1, dtype=torch.int32, device="cuda")
+    alpha = torch.ones(4, dtype=torch.float32, device="cuda")
+    first, second = _configs("nvfp4")
+    first = replace(
+        first,
+        finalize_mode=FinalizeMode.PERSISTENT,
+        num_valid_tokens_tensor=count,
+        fc2_alpha=alpha,
+    )
+    configs = (first, replace(first, knobs=second.knobs))
+    x, scores, ids, weights = _problem(0, 1, 512, 512)
+    args = MoEEpTensors(x[:17], ids[:17], scores[:17], output=torch.empty_like(x[:17]))
+    direct_args = replace(args, output=torch.empty_like(args.output))
+    graph = torch.cuda.CUDAGraph()
+    autotune_v2_reload()
+    try:
+        with (
+            _layer(first, weights, 0, 1, 129, 512) as direct,
+            _outer(configs, weights, 0, 1) as layer,
+            autotune_v2(
+                persistent_cache=False,
+                cache_scope="context",
+                measurement_policy=MeasurementPolicy(
+                    execution_mode="eager", cold_l2=False
+                ),
+            ),
+        ):
+            try:
+                # Construction must borrow the original zero-valued live count.
+                # Updating it before warmup must affect the selected plan too.
+                count.fill_(17)
+                expected = direct.forward(direct_args).clone()
+                assert torch.count_nonzero(expected) > 0
+                args.output.fill_(-13)
+                layer.warmup(args)
+                assert_bits(
+                    layer(args), expected, "outer caller count after construction"
+                )
+                with torch.cuda.graph(graph):
+                    layer(args)
+                for live, scale in ((17, 0), (7, 1), (0, 1), (17, 1)):
+                    count.fill_(live)
+                    alpha.fill_(scale)
+                    direct_args.output.fill_(-13)
+                    expected = direct.forward(direct_args).clone()
+                    args.output.fill_(-13)
+                    graph.replay()
+                    assert_bits(
+                        args.output, expected, "outer caller tensors graph replay"
+                    )
+            finally:
+                graph.reset()
+    finally:
+        autotune_v2_reload()
+
+
 @contextmanager
 def _distributed(kind):
     from flashinfer import moe_ep

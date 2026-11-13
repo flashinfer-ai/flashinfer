@@ -329,6 +329,26 @@ class Sm100W4A16MegaMoEKernel:
     def name(self):
         m, n, k = self.mma_tiler
         cm, cn = self.cluster_shape_mn
+        bi_suffix = ""
+        if self.batch_invariant:
+            import hashlib
+            from flashinfer.moe_ep.batch_invariant.activation_variants import (
+                ActivationVariant,
+            )
+
+            variant = ActivationVariant(
+                "w4a16",
+                "situ" if self.situ_beta is not None else "swiglu",
+                self.swiglu_alpha,
+                self.swiglu_beta,
+                self.situ_beta,
+                self.situ_linear_beta,
+                self.gate_up_clamp,
+            )
+            bi_suffix = (
+                "_bi1_act"
+                + hashlib.sha256(repr(variant.signature).encode()).hexdigest()[:16]
+            )
         return (
             f"megamoe_w4a16_{m}x{n}x{k}_cluster{cm}x{cn}_{self.load_balance_mode}"
             f"_expert{self.static_expert_shape}_group{self.group_hint}"
@@ -344,6 +364,7 @@ class Sm100W4A16MegaMoEKernel:
                 if self.apply_routing_weights_before_fc2
                 else ""
             )
+            + bi_suffix
         )
 
     def _make_mixed(self, fragment_size, output_tensor, raw_stages, activation_stages):
