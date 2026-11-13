@@ -12,7 +12,9 @@ from jit_cache_provider_validation import (
     Wheel,
     canonicalize_distribution,
     inspect_cuda_architectures,
+    linux_library_name,
     validate_provider,
+    windows_library_name,
     write_validation_report,
 )
 
@@ -24,6 +26,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--version", required=True)
     parser.add_argument("--provider-platform-tag", required=True)
     parser.add_argument("--cuobjdump", type=Path, required=True)
+    parser.add_argument(
+        "--library-layout",
+        choices=("linux", "windows"),
+        default="linux",
+        help="Module library naming: <module>/<module>.so or <module>/module.dll",
+    )
     parser.add_argument(
         "--cuda-architecture-policy",
         choices=("strict", "report"),
@@ -45,6 +53,11 @@ def main() -> int:
         args.provider,
         args.version,
         args.provider_platform_tag,
+        library_name=(
+            windows_library_name
+            if args.library_layout == "windows"
+            else linux_library_name
+        ),
     )
     module_architectures, ptx_modules = inspect_cuda_architectures(
         wheel,
