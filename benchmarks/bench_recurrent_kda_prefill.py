@@ -48,11 +48,26 @@ every backend. The FlashKDA peer scopes keep the preallocated outputs
 while cuDNN allocates its final state and copies it back inside the timed scope.
 Metadata, sequence ordering, build/JIT, graph capture, and state-pool reset are
 outside the measured region.
+
+``--host-timing`` additionally measures eager host-call return latency and
+completed-call wall time. These measurements include Python dispatch and any
+internal synchronization, unlike CUPTI kernel time. They do not flush L2, and
+state-pool reset stays outside the timed region. Each case is measured twice:
+on an idle device, and with a sleep kernel queued ahead of every timed call
+(``--host-queued-sleep-cycles``). On an idle device a host read inside the call
+costs only a short device-to-host round trip; with work queued it waits for
+that work, as it would in a serving loop, so host return approaches the queued
+GPU time. ``--case-set host_read`` selects the H32 single-sequence packed shape
+from issue #7903, whose route rebuilds metadata on the host.
+Add ``--inference-mode`` to create and consume inference tensors as a serving
+loop would; tensors without version counters can take different metadata-cache
+paths from the default versioned tensors.
 """
 
 import argparse
 import json
 import subprocess
+import time
 from dataclasses import dataclass
 from importlib import import_module
 from importlib.metadata import version
@@ -74,6 +89,9 @@ DEFAULT_H12_STATE_ROTATIONS = 4096
 DEFAULT_PRODUCTION_STATE_BUDGET_BYTES = 8 * 1024**3
 STATE_DTYPE = torch.bfloat16
 _CUPTI_ESTIMATE_CALLS_PER_BLOCK = 1 + 5
+# About one millisecond on current devices; the measured duration is reported.
+DEFAULT_HOST_QUEUED_SLEEP_CYCLES = 1_000_000
+_QUEUED_WORK_CALIBRATION_ITERS = 5
 SUPPORTED_FLASH_KDA_ARCHS = {(10, 0): "sm100a", (10, 3): "sm103a"}
 BENCHMARKS_DIR = Path(__file__).resolve().parent
 H12_PRESET = BENCHMARKS_DIR / "presets" / "recurrent_kda_prefill_h12.json"
@@ -170,6 +188,10 @@ SMALL_BH_CASES = (
     Case("h1_fixed_1048576", 1, (1048576,), False, 11003),
 )
 CASES = LEGACY_CASES + H12_CASES + SMALL_BH_CASES
+# Issue #7903: one packed 16384-token sequence at H32. With inference tensors
+# this route re-reads ``cu_seqlens`` on the host every call. Kept out of the
+# default set so existing default runs are unchanged.
+HOST_READ_CASES = (Case("h32_packed_n1_16384", 32, (16384,), True, 12000),)
 
 # This public, executable inventory is intentionally expressed with tuple
 # multiplication for the large uniform packed cases. It preserves every shape
@@ -884,10 +906,90 @@ def _measure(
     return float(np.median(samples_ms)), samples_ms
 
 
+def _queue_gpu_work(cycles: int) -> None:
+    """Enqueue a spin kernel without waiting for it."""
+
+    torch.cuda._sleep(cycles)
+
+
+def _measure_host(
+    run: Callable[[], object],
+    *,
+    dry_run_iters: int,
+    repeat_iters: int,
+    queued_sleep_cycles: int = 0,
+) -> dict:
+    """Time eager calls on an idle device, or behind a queued sleep kernel.
+
+    Every sample starts after a synchronize, so with ``queued_sleep_cycles=0``
+    a host read inside ``run`` finds an idle device. A positive value enqueues
+    a sleep kernel right before the timed call; a call that reads from the
+    device then cannot return before that kernel finishes.
+    """
+
+    for _ in range(dry_run_iters):
+        run()
+    torch.cuda.synchronize()
+    queued = {}
+    if queued_sleep_cycles > 0:
+        queued_samples = []
+        for _ in range(_QUEUED_WORK_CALIBRATION_ITERS):
+            start = time.perf_counter_ns()
+            _queue_gpu_work(queued_sleep_cycles)
+            torch.cuda.synchronize()
+            queued_samples.append((time.perf_counter_ns() - start) / 1e6)
+        queued = {
+            "queued_sleep_cycles": queued_sleep_cycles,
+            "queued_work_median_ms": float(np.median(queued_samples)),
+        }
+    host_samples, completed_samples = [], []
+    for _ in range(repeat_iters):
+        if queued_sleep_cycles > 0:
+            _queue_gpu_work(queued_sleep_cycles)
+        start = time.perf_counter_ns()
+        run()
+        returned = time.perf_counter_ns()
+        torch.cuda.synchronize()
+        completed = time.perf_counter_ns()
+        host_samples.append((returned - start) / 1e6)
+        completed_samples.append((completed - start) / 1e6)
+    return {
+        "host_return_median_ms": float(np.median(host_samples)),
+        "host_return_samples_ms": host_samples,
+        "completed_call_median_ms": float(np.median(completed_samples)),
+        "completed_call_samples_ms": completed_samples,
+        "cold_l2": False,
+        "timing_scope": "eager_public_recurrent_kda_with_inplace_state_update",
+        "stateful_calls": dry_run_iters + repeat_iters,
+        **queued,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run-iters", type=int, default=20)
     parser.add_argument("--repeat-iters", type=int, default=100)
+    parser.add_argument(
+        "--host-timing",
+        action="store_true",
+        help="Also report eager candidate host-return and completed-call latency.",
+    )
+    parser.add_argument(
+        "--host-queued-sleep-cycles",
+        type=int,
+        default=DEFAULT_HOST_QUEUED_SLEEP_CYCLES,
+        help=(
+            "With --host-timing, repeat the measurement with a "
+            "torch.cuda._sleep kernel of this many cycles queued ahead of each "
+            "timed call. The measured duration of that kernel is reported. "
+            "Use 0 to skip the queued measurement."
+        ),
+    )
+    parser.add_argument(
+        "--inference-mode",
+        action="store_true",
+        help="Create inputs and run all measurements under torch.inference_mode.",
+    )
     parser.add_argument(
         "--cuda-graph",
         action="store_true",
@@ -895,12 +997,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--case-set",
-        choices=("all", "legacy", "h12", "small_bh", "production"),
+        choices=("all", "legacy", "h12", "small_bh", "production", "host_read"),
         default="all",
         help=(
             "Run all cases, the original H64/H96 cases, the Kimi-K3 TP8 H12 "
-            "cases, the fixed-layout small-BH cases, or the complete "
-            "29-shape production portfolio."
+            "cases, the fixed-layout small-BH cases, the complete "
+            "29-shape production portfolio, or the issue #7903 H32 packed "
+            "host-read shape (not part of 'all')."
         ),
     )
     parser.add_argument(
@@ -955,9 +1058,17 @@ def main() -> None:
         help="Optionally write the result list as JSON.",
     )
     args = parser.parse_args()
+    with torch.inference_mode(args.inference_mode):
+        _run(args, parser)
 
+
+def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.dry_run_iters <= 0 or args.repeat_iters <= 0:
         parser.error("--dry-run-iters and --repeat-iters must be positive")
+    if args.host_timing and args.cuda_graph:
+        parser.error("--host-timing measures eager calls; omit --cuda-graph")
+    if args.host_queued_sleep_cycles < 0:
+        parser.error("--host-queued-sleep-cycles must be non-negative")
     if args.state_rotations is not None and args.state_rotations <= 0:
         parser.error("--state-rotations must be positive")
     if args.flash_kda_peer != (args.flash_kda_source_dir is not None):
@@ -1007,6 +1118,7 @@ def main() -> None:
         "h12": H12_CASES,
         "small_bh": SMALL_BH_CASES,
         "production": PRODUCTION_CASES,
+        "host_read": HOST_READ_CASES,
     }[args.case_set]
     results = []
     if args.backend == "cudnn":
@@ -1182,6 +1294,7 @@ def main() -> None:
                 "timing_backend": "cupti",
                 "cold_l2": True,
                 "cuda_graph": args.cuda_graph,
+                "inference_mode": args.inference_mode,
                 "timing_scope": (
                     "cuda_graph_replay_with_inplace_state_update"
                     if args.cuda_graph
@@ -1192,6 +1305,42 @@ def main() -> None:
                 "timing_iteration_budget": timing_iteration_budget,
             }
         )
+        if args.host_timing:
+            prepared.reset_state_pools()
+            host_timing = _measure_host(
+                prepared.candidate_run,
+                dry_run_iters=dry_run_iters,
+                repeat_iters=repeat_iters,
+            )
+            if prepared.state_cursors["pr"][0] != host_timing["stateful_calls"]:
+                raise RuntimeError("Host timing exceeded its stateful call budget")
+            result["host_timing"] = host_timing
+            print(
+                f"{result['name']:<18} "
+                f"host return {host_timing['host_return_median_ms'] * 1000:.3f} us  "
+                f"completed {host_timing['completed_call_median_ms'] * 1000:.3f} us"
+            )
+            if args.host_queued_sleep_cycles > 0:
+                prepared.reset_state_pools()
+                queued_timing = _measure_host(
+                    prepared.candidate_run,
+                    dry_run_iters=dry_run_iters,
+                    repeat_iters=repeat_iters,
+                    queued_sleep_cycles=args.host_queued_sleep_cycles,
+                )
+                if prepared.state_cursors["pr"][0] != queued_timing["stateful_calls"]:
+                    raise RuntimeError(
+                        "Queued host timing exceeded its stateful call budget"
+                    )
+                result["host_timing_queued"] = queued_timing
+                print(
+                    f"{result['name']:<18} "
+                    f"queued {queued_timing['queued_work_median_ms'] * 1000:.3f} us  "
+                    f"host return "
+                    f"{queued_timing['host_return_median_ms'] * 1000:.3f} us  "
+                    f"completed "
+                    f"{queued_timing['completed_call_median_ms'] * 1000:.3f} us"
+                )
         results.append(result)
         if prepared.peer_raw_run is None:
             print(

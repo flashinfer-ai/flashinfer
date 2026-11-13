@@ -539,6 +539,37 @@ chunk-to-sequence tensor. Its workspace and launch use a graph-static chunk
 capacity derived from tensor shapes, while the GPU prefix supplies the actual
 chunk count on each replay.
 
+Measuring host overhead
+~~~~~~~~~~~~~~~~~~~~~~~
+
+On SM100/SM103, ``benchmarks/bench_recurrent_kda_prefill.py`` can report
+eager host-return and completed-call latency alongside its CUPTI GPU timings::
+
+    python benchmarks/bench_recurrent_kda_prefill.py \
+        --case-set host_read --backend auto --host-timing --inference-mode \
+        --json kda-inference.json
+
+``--case-set host_read`` runs H32 with one packed 16384-token sequence.
+``--inference-mode`` creates the inputs and runs the measurements inside
+``torch.inference_mode``. Without it, inputs are versioned tensors. Inference
+tensors have no version counter, so packed routes that rebuild their metadata
+on the host re-read ``cu_seqlens`` on every call. Only those routes are
+affected.
+
+Host-return time includes Python dispatch and any synchronization inside the
+call; completed-call time also waits for GPU completion. Each case is measured
+twice. The first pass runs on an idle device, where a host read costs only a
+short device-to-host round trip. The second pass queues a sleep kernel ahead
+of every timed call (``--host-queued-sleep-cycles``, ``0`` to skip) and reports
+that kernel's measured duration. A call that reads from the device cannot
+return before the queued work finishes, so its host return approaches the
+queued time, as it would behind other work in a serving loop.
+
+These additional measurements do not flush L2, exclude state-pool reset, and
+cover only the FlashInfer candidate. They are not directly comparable to the
+cold-L2 CUPTI kernel samples or end-to-end serving throughput.
+``--host-timing`` cannot be combined with ``--cuda-graph``.
+
 State and graph semantics
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
