@@ -533,7 +533,7 @@ def test_draw_ir_uses_only_declared_forms(
         f"get_compiled_kernel({dtype!r}, {N}, LSEConfig{cfg}, {from_logits}, {trow}, {idx}, {lp}, False)\n"
     )
     r = subprocess.run(
-        [sys.executable, "-c", code],
+        [sys.executable, "-c", _IR_DUMP_PRELUDE + code],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -592,17 +592,27 @@ def test_draw_ir_uses_only_declared_forms(
 # ----------------------------------------------------------------------------------------------- on the device
 
 
+# The IR / PTX dumps are requested on the DSL's option object inside this process, not through CUTE_DSL_KEEP* environment
+# variables: a CI that validates the compiler environment of every process against the one recorded at test start
+# counts those as compiler switches (the DSL resolves its options from the environment once, into plain attributes of
+# its singleton; the dumps are written before the cache is consulted, so they never affect what is compiled).
+_IR_DUMP_PRELUDE = (
+    "import os\n"
+    "from cutlass.cutlass_dsl.cutlass import CuTeDSL\n"
+    "_dsl = CuTeDSL()\n"
+    "_dsl.envar.keep_ir = True\n"  # the raw IR before any pass (what CUTE_DSL_KEEP=ir-debug requests)
+    "_dsl.envar.keep_ptx = True\n"  # the PTX (what CUTE_DSL_KEEP=ptx requests)
+    "_dsl.envar.dump_dir = os.getcwd()\n"
+)
+
+
 def _ir_compile_env():
-    """The environment of an IR pin's compile subprocess: this process's, plus the IR / PTX dumps and no cache. With a
-    device visible the compile targets it as this process would (a CI that validates the compiler environment of every
-    process sees the same ``CUTE_DSL_ARCH`` / ``FLASHINFER_CUDA_ARCH_LIST``); without one it is device-free and takes the
-    target from ``BI_TEST_ARCH`` (default ``sm_100a``)."""
-    env = dict(
-        os.environ,
-        CUTE_DSL_KEEP_IR="1",
-        CUTE_DSL_KEEP="ptx",
-        FLASHINFER_CUTE_DSL_DISABLE_CACHE="1",
-    )
+    """The environment of an IR pin's compile subprocess: this process's, plus FlashInfer's module cache off (so the DSL
+    compiles and the dumps exist; the dumps themselves are requested in-process, ``_IR_DUMP_PRELUDE``). With a device
+    visible the compile targets it as this process would (a CI that validates the compiler environment of every process
+    sees the same ``CUTE_DSL_ARCH`` / ``FLASHINFER_CUDA_ARCH_LIST`` and no ``CUTE_DSL_KEEP*``); without one it is
+    device-free and takes the target from ``BI_TEST_ARCH`` (default ``sm_100a``)."""
+    env = dict(os.environ, FLASHINFER_CUTE_DSL_DISABLE_CACHE="1")
     if not torch.cuda.is_available():
         env.update(
             CUDA_VISIBLE_DEVICES="",
