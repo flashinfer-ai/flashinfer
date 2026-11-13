@@ -83,7 +83,8 @@ inline auto PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
     uint32_t mid = (low + high) / 2;
     new_batch_size = 0;
     for (const IdType& elem : num_pages) {
-      new_batch_size += ceil_div(elem, mid);
+      // Empty requests still take one chunk (see the final count below).
+      new_batch_size += ceil_div(std::max(elem, 1), mid);
     }
     if (new_batch_size * gdy > max_grid_size) {
       low = mid + 1;
@@ -445,6 +446,8 @@ inline cudaError_t DecodePlanImpl(size_t& float_workspace_size_out, size_t& int_
   plan_info.padded_batch_size = padded_batch_size;
   auto [request_indices_vec, kv_tile_indices_vec, o_indptr_vec] =
       DecodeSplitKVIndptr(indptr_h, batch_size, kv_chunk_size_in_pages);
+  FLASHINFER_CHECK(request_indices_vec.size() <= padded_batch_size,
+                   "new batch size should not exceed padded batch size");
 
   AlignedAllocator int_allocator =
       MATERIALIZE ? AlignedAllocator(int_buffer, int_workspace_size_in_bytes) : AlignedAllocator();
