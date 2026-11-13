@@ -1578,12 +1578,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
-        self._pin_memory_int_workspace_buffer = torch.empty(
-            (8 * 1024 * 1024,),
-            dtype=torch.uint8,
-            pin_memory=True,
-            device="cpu",
-        )
+        self._reset_plan_workspace_buffers()
         self._kv_lens_buffer: Optional[torch.Tensor] = None
         if backend in ("trtllm-gen", "cute-dsl", "cudnn"):
             self._kv_lens_buffer = torch.empty(
@@ -1759,10 +1754,68 @@ class BatchDecodeWithPagedKVCacheWrapper:
     def is_cuda_graph_enabled(self) -> bool:
         return self._use_cuda_graph
 
+    def _reset_plan_workspace_buffers(self) -> None:
+        self._pin_memory_int_workspace_buffer = torch.empty(
+            self._int_workspace_buffer.shape,
+            dtype=self._int_workspace_buffer.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        # Graph buckets that are never replanned need only the first buffer.
+        self._pin_memory_int_workspace_buffers = [
+            self._pin_memory_int_workspace_buffer,
+            None,
+        ]
+        with torch.cuda.device(self.device):
+            self._pin_memory_copy_events = [
+                torch.cuda.Event(enable_timing=False) for _ in range(2)
+            ]
+        self._pin_buffer_idx = 0
+
+    def _wait_for_plan_copies(self) -> None:
+        for event in self._pin_memory_copy_events:
+            if not event.query():
+                event.synchronize()
+
+    def _get_plan_workspace(self) -> torch.Tensor:
+        """Do not overwrite a pinned source still read by a queued H2D copy."""
+        idx = self._pin_buffer_idx
+        event = self._pin_memory_copy_events[idx]
+        if not event.query():
+            event.synchronize()
+        buffer = self._pin_memory_int_workspace_buffers[idx]
+        if buffer is None:
+            buffer = torch.empty(
+                self._int_workspace_buffer.shape,
+                dtype=self._int_workspace_buffer.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            self._pin_memory_int_workspace_buffers[idx] = buffer
+        self._pin_memory_int_workspace_buffer = buffer
+        return buffer
+
+    def _record_plan_copy(self) -> None:
+        self._pin_memory_copy_events[self._pin_buffer_idx].record(
+            torch.cuda.current_stream(self.device)
+        )
+        self._pin_buffer_idx = (self._pin_buffer_idx + 1) % 2
+
+    def __del__(self) -> None:
+        try:
+            if hasattr(self, "_pin_memory_copy_events") and torch.cuda.is_initialized():
+                self._wait_for_plan_copies()
+        except Exception:
+            # CUDA may already be torn down when the interpreter exits.
+            pass
+
     def reset_workspace_buffer(
         self, float_workspace_buffer: torch.Tensor, int_workspace_buffer: torch.Tensor
     ) -> None:
         r"""Reset the workspace buffer.
+
+        Pending planner H2D copies are retired before their pinned host storage
+        is released. This does not synchronize all device work.
 
         Parameters
         ----------
@@ -1780,15 +1833,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         _check_workspace_buffer_alignment(int_workspace_buffer, "int_workspace_buffer")
         if self._batch_invariant is not None:
             self._batch_invariant.reset_workspace(float_workspace_buffer)
+        self._wait_for_plan_copies()
         self._cudnn_prepared = None
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
-        self._pin_memory_int_workspace_buffer = torch.empty(
-            self._int_workspace_buffer.shape,
-            dtype=self._int_workspace_buffer.dtype,
-            device="cpu",
-            pin_memory=True,
-        )
+        self._reset_plan_workspace_buffers()
 
     @flashinfer_api
     def workspace_size(
@@ -2243,6 +2292,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         The :meth:`plan` method should be called before any :meth:`run` or
         :meth:`run_return_lse` calls, auxiliary data structures will be created
         during this call and cached for multiple run calls.
+
+        Internal pinned planning storage is protected across queued calls to
+        :meth:`plan` and :func:`fast_decode_plan`. A call may wait for a staging
+        slot's previous H2D copy before reusing that slot. Callers must still
+        keep their own input tensors unchanged until the queued work completes.
 
         The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads``
         is not equal to ``num_kv_heads``, the function will use
@@ -2912,7 +2966,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
+                self._get_plan_workspace(),
                 qo_indptr_host,
                 indptr_host,
                 kv_lens_arr_host,
@@ -2936,6 +2990,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._plan_info = self._cached_module.plan(
                 *args,
             )
+            self._record_plan_copy()
         else:
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
@@ -2954,7 +3009,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
+                self._get_plan_workspace(),
                 indptr_host,
                 batch_size,
                 num_qo_heads,
@@ -2968,6 +3023,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 torch.empty(0, dtype=q_data_type),
                 torch.empty(0, dtype=kv_data_type),
             )
+            self._record_plan_copy()
 
         self._pos_encoding_mode = pos_encoding_mode
         self._window_left = window_left
@@ -5916,7 +5972,7 @@ def fast_decode_plan(
                 args = [
                     self._float_workspace_buffer,
                     self._int_workspace_buffer,
-                    self._pin_memory_int_workspace_buffer,
+                    self._get_plan_workspace(),
                     qo_indptr_host,
                     indptr_host,
                     kv_lens_arr_host,
@@ -5940,6 +5996,7 @@ def fast_decode_plan(
                 self._plan_info = self._cached_module.plan(
                     *args,
                 )
+                self._record_plan_copy()
             except Exception as e:
                 raise RuntimeError(f"Error in standard plan: {e}") from e
         else:
@@ -5948,7 +6005,7 @@ def fast_decode_plan(
                 self._plan_info = self._cached_module.plan(
                     self._float_workspace_buffer,
                     self._int_workspace_buffer,
-                    self._pin_memory_int_workspace_buffer,
+                    self._get_plan_workspace(),
                     indptr_host,
                     batch_size,
                     num_qo_heads,
@@ -5962,6 +6019,7 @@ def fast_decode_plan(
                     empty_q_data,
                     empty_kv_cache,
                 )
+                self._record_plan_copy()
             except Exception as e:
                 raise RuntimeError(f"Error in standard plan: {e}") from e
 
