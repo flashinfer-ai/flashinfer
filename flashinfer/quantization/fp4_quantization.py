@@ -627,9 +627,21 @@ def get_fp4_quantization_module(backend: str = "100"):
             if sf_layout != SfLayout.layout_linear.value
             else m
         )
-        output_scale = input.new_zeros(
-            (out_scale_rows, out_scale_cols), dtype=torch.uint8
-        )
+        # Every scale byte of the linear layout is written by the kernel (one
+        # per 16 values of each row), so it needs no zero fill. The swizzled
+        # layouts have padding that is read as zeros, and a permutation may
+        # leave rows unwritten.
+        if (
+            sf_layout == SfLayout.layout_linear.value
+            and expanded_idx_to_permuted_idx is None
+        ):
+            output_scale = input.new_empty(
+                (out_scale_rows, out_scale_cols), dtype=torch.uint8
+            )
+        else:
+            output_scale = input.new_zeros(
+                (out_scale_rows, out_scale_cols), dtype=torch.uint8
+            )
         output_per_token_scale = input.new_empty((m,), dtype=torch.float32)
         nvfp4_quant_and_per_token_scale_out_sm100(
             input,
