@@ -24,12 +24,11 @@ namespace flashinfer::resserve {
 // Production SM100 pack16 path, specialized to adjacent base/residue rows.
 template <typename T>
 __global__ void __launch_bounds__(512, 4)
-    QuantizeRowPairs(int rows, int cols, const T* input, const float* scales, int num_scales,
-                     uint32_t* output, uint8_t* output_scales) {
+    QuantizeRowPairs(int rows, int cols, const T* input, const float* scales, uint32_t* output,
+                     uint8_t* output_scales) {
   int group = blockIdx.y * blockDim.x + threadIdx.x;
   if (group >= cols / 16) return;
   float base_scale = scales[0];
-  float residue_scale = scales[num_scales == 2 ? 1 : 0];
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     PackedVec<T> lo, hi;
     load_packed_vec16(input + int64_t(row) * cols + group * 16, lo, hi);
@@ -37,8 +36,8 @@ __global__ void __launch_bounds__(512, 4)
     auto residue_sf = output_scales + compute_tiled_sf_offset<uint8_t>(2 * row + 1, group, cols);
     auto base_out = output + int64_t(2 * row) * (cols / 8) + group * 2;
     auto residue_out = base_out + cols / 8;
-    auto packed = cvt_warp_fp16_to_fp4_mext_r1_fast16<T, false>(lo, hi, base_scale, residue_scale,
-                                                                base_sf, residue_out, residue_sf);
+    auto packed = cvt_warp_fp16_to_fp4_mext_r1_fast16<T, false>(lo, hi, base_scale, base_sf,
+                                                                residue_out, residue_sf);
     *reinterpret_cast<uint2*>(base_out) = make_uint2(packed.lo, packed.hi);
   }
 }

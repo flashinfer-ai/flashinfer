@@ -55,7 +55,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         ab_stage_override: int | None = None,
         mext_direct_store: bool = False,
         pi_via_layout: bool = False,
-        dual_alpha: bool = False,
         k_loop: bool = False,
     ):
         """Configure the MMA tile, cluster and fold geometry."""
@@ -68,8 +67,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.fold_on_m = fold_on_m
 
         self.ab_stage_override = ab_stage_override
-
-        self.dual_alpha = dual_alpha
 
         assert not mext_direct_store or fold_on_m, (
             "mext_direct_store requires the M-ext fold path"
@@ -614,13 +611,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         GPU device kernel performing the Persistent batched GEMM computation.
         """
 
+        # As in upstream CuTe GEMM, the caller supplies a ready scalar alpha.
         alpha_value = cutlass.Float32(1.0)
         if cutlass.const_expr(alpha is not None):
             alpha_value = alpha[0].to(cutlass.Float32)
-        if cutlass.const_expr(self.dual_alpha):
-            alpha_res_value = alpha[1].to(cutlass.Float32)
-        else:
-            alpha_res_value = alpha_value
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -794,6 +788,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
 
         tCgC = thr_mma.partition_C(gC_mnl)
+        if cutlass.const_expr(self.mext_direct_store):
+            gCcC = cute.local_tile(
+                cute.make_identity_tensor(mC_fold_alias.shape),
+                cute.slice_(self.mma_tiler, (None, None, 0)),
+                (None, None, None),
+            )
+            tCcC = thr_mma.partition_C(gCcC)
 
         a_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
@@ -1218,6 +1219,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         tCgC[((None, None), 0, 0, None, None, None)], epi_tile
                     )
                     tTR_gC_part = _thr_t2r.partition_D(_gC_epi)
+                    _cC_epi = cute.flat_divide(
+                        tCcC[((None, None), 0, 0, None, None, None)], epi_tile
+                    )
+                    tTR_cC_part = _thr_t2r.partition_D(_cC_epi)
                     _sC_alias_layout = None
                 elif cutlass.const_expr(self.fold_on_m):
                     tTR_gC_part = None
@@ -1273,6 +1278,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         (None, None, None, None, None, *mma_tile_coord_mnl)
                     ]
                     tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
+                    tTR_cC = tTR_cC_part[
+                        (None, None, None, None, None, *mma_tile_coord_mnl)
+                    ]
+                    tTR_cC = cute.group_modes(tTR_cC, 3, cute.rank(tTR_cC))
                     bSG_gC = None
                 elif cutlass.const_expr(self.fold_pairs_tma):
                     _cta_m_coord = cur_tile_coord[0]
@@ -1342,53 +1351,27 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                     c_buffer = (num_prev_subtiles + subtile_idx) % self.num_c_stage
                     if cutlass.const_expr(self.fold_pairs_tma):
-                        if cutlass.const_expr(self.dual_alpha):
-                            folded_half = epilogue_op(
-                                (
-                                    alpha_value
-                                    * tTR_rAcc[_PAIR_EVEN].load().to(cutlass.Float32)
-                                    + alpha_res_value
-                                    * tTR_rAcc[_PAIR_ODD].load().to(cutlass.Float32)
-                                ).to(self.c_dtype)
-                            )
-                        else:
-                            _fold_sum = tTR_rAcc[_PAIR_EVEN].load().to(
-                                cutlass.Float32
-                            ) + tTR_rAcc[_PAIR_ODD].load().to(cutlass.Float32)
-                            folded_half = epilogue_op(
-                                (alpha_value * _fold_sum).to(self.c_dtype)
-                            )
+                        _fold_sum = tTR_rAcc[_PAIR_EVEN].load().to(
+                            cutlass.Float32
+                        ) + tTR_rAcc[_PAIR_ODD].load().to(cutlass.Float32)
+                        folded_half = epilogue_op(
+                            (alpha_value * _fold_sum).to(self.c_dtype)
+                        )
                         tTR_rC_half.store(folded_half)
                         if cutlass.const_expr(self.mext_direct_store):
                             tTR_gC_subtile = tTR_gC[
                                 (None, None, None, real_subtile_idx)
                             ]
                             _dst = tTR_gC_subtile[_PAIR_EVEN]
-                            _stg_atom = cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                self.c_dtype,
-                                num_bits_per_copy=128,
-                            )
-
-                            for _im in cutlass.range_constexpr(
-                                cute.size(_dst, mode=[3])
-                            ):
-                                for _in in cutlass.range_constexpr(
-                                    cute.size(_dst, mode=[4])
-                                ):
-                                    _d1 = _dst[(None, None, 0, _im, _in)]
-                                    _s1 = tTR_rC_half[(None, None, 0, _im, _in)]
-                                    cute.copy(
-                                        _stg_atom,
-                                        cute.make_tensor(
-                                            _s1.iterator,
-                                            cute.make_layout(cute.size(_s1)),
-                                        ),
-                                        cute.make_tensor(
-                                            _d1.iterator,
-                                            cute.make_layout(cute.size(_d1)),
-                                        ),
-                                    )
+                            _coords = tTR_cC[(None, None, None, real_subtile_idx)][
+                                _PAIR_EVEN
+                            ]
+                            _pred = cute.make_rmem_tensor(_dst.shape, cutlass.Boolean)
+                            for i in range(cute.size(_pred)):
+                                _pred[i] = cute.elem_less(
+                                    _coords[i], mC_fold_alias.shape
+                                )
+                            cute.basic_copy_if(_pred, tTR_rC_half, _dst)
                         elif cutlass.const_expr(self.fold_on_m):
                             sC_stage = sC[(None, None, c_buffer)]
                             sC_alias = cute.make_tensor(

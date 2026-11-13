@@ -99,7 +99,9 @@ def require_runtime():
         pytest.skip("ResAttn requires CUTLASS DSL 4.8 with CUDA 13.4 PTX compiler")
 
 
-@pytest.mark.parametrize("g,d", [(4, 128), (6, 128), (8, 128), (4, 256)])
+@pytest.mark.parametrize(
+    "g,d", [(4, 128), (6, 128), (8, 128), (4, 256), (6, 256), (8, 256)]
+)
 @pytest.mark.parametrize("splits", [1, 2])
 def test_decode(g, d, splits):
     args = inputs(g, d)
@@ -134,36 +136,34 @@ def test_single_tile_fp8_probability_reference(splits, length):
     torch.testing.assert_close(actual.float(), expected, atol=3e-4, rtol=0.004)
 
 
-def test_internal_gmem_workspace_validation(monkeypatch):
-    # Exercise only the retained internal host contract; no packed-output
-    # kernel is launched or numerically validated by this test.
-    from flashinfer.experimental.resserve_resattn import host
-    from flashinfer.experimental.resserve_resattn.kv_layout import NvFp4PagedKVPool
-
-    q, k, v, ks, vs, tables, lengths = inputs(4, 128)
-    vs = vs.view_as(ks)
-    pool = NvFp4PagedKVPool(k.shape[1], q.shape[-1], k, v, ks, vs)
-    calls = []
-    monkeypatch.setattr(
-        host, "compile_decode_variant", lambda spec: lambda *args: calls.append(args)
-    )
-    host.run_paged_fp4_decode_qmul4_tmem_nvfp4(
-        q,
-        pool,
-        v,
-        vs,
-        tables,
-        lengths,
-        q.shape[-1] ** -0.5,
-        torch.ones(1, device="cuda"),
-        plan=(4, "gmem_fused"),
-    )
-    assert len(calls) == 1
-    assert calls[0][13].shape == (q.shape[0] * k.shape[1] * 8,)
-
-
 def test_reject_linear_v_scale_layout():
     args = list(inputs(4, 128))
     args[4] = args[4].transpose(-1, -2).contiguous().view_as(args[3])
     with pytest.raises(ValueError, match="four-token interleaved"):
         paged_decode_residue(*args)
+
+
+@pytest.mark.parametrize("splits", [1, 2])
+@pytest.mark.parametrize("g,d", [(4, 128), (8, 256)])
+def test_changed_metadata_graph(g, d, splits):
+    """Replay one graph while metadata and cache contents cross tile boundaries."""
+    args = inputs(g, d)
+    q, k, v, ks, vs, tables, lengths = args
+    for _ in range(3):
+        paged_decode_residue(*args, num_splits=splits)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = paged_decode_residue(*args, num_splits=splits)
+    for length in [127, 128, 129, 255, 256, 257]:
+        q.normal_()
+        k.random_(0, 256)
+        v.random_(0, 256)
+        tables.copy_(torch.randperm(k.shape[0], device=q.device).reshape_as(tables))
+        lengths.copy_(
+            torch.tensor([length, length + 1], device=q.device, dtype=lengths.dtype)
+        )
+        graph.replay()
+        expected, bound = reference(args)
+        assert torch.all((out.float() - expected).abs() <= bound)
+        eager = paged_decode_residue(*args, num_splits=splits)
+        torch.testing.assert_close(out, eager, atol=0, rtol=0)

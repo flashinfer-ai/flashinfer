@@ -102,8 +102,8 @@ def nvfp4_quantize_residue(input: torch.Tensor, global_scale: torch.Tensor):
     """Quantize each activation row and its full-channel residue on SM100.
 
     ``input`` is contiguous FP16/BF16 ``[M, K]``, with positive M and K,
-    K divisible by 16. ``global_scale`` contains one or two positive finite
-    FP32 quantization multipliers on the same device: base, optionally residue.
+    K divisible by 16. ``global_scale`` contains one positive finite
+    FP32 quantization multiplier shared by the base and residue on the same device.
     Scale values and finite input values are caller preconditions (not checked
     with a synchronizing device-to-host copy).
 
@@ -117,8 +117,8 @@ def nvfp4_quantize_residue(input: torch.Tensor, global_scale: torch.Tensor):
     _check_tensor(global_scale, "global_scale", input.device, (torch.float32,), 4)
     if input.ndim != 2 or min(input.shape) <= 0 or input.shape[1] % 16:
         raise ValueError("input must be [M, K], M > 0, K > 0 and K divisible by 16")
-    if global_scale.numel() not in (1, 2):
-        raise ValueError("global_scale must contain one or two elements")
+    if global_scale.numel() != 1:
+        raise ValueError("global_scale must contain one element")
     from .experimental.resserve_mext.quantization import quantize
 
     with torch.cuda.device(input.device):
@@ -142,9 +142,11 @@ def mm_nvfp4_residue(
     is accepted; its scales must be separately packed for the base K.
     Both scale buffers use
     the 128-row, 4-scale swizzle (E4M3 bytes). K is divisible by 64, N by 8.
-    ``alpha`` is one or two FP32 reconstruction multipliers: reciprocals of
+    ``alpha`` is one FP32 reconstruction multiplier: the reciprocal of
     the product of activation and weight quantization global multipliers.
-    Two values apply independently to the base and residue accumulators.
+    It scales the sum of the base and residue accumulators.
+    Prepare this global multiplier before launch and keep it unchanged until
+    the operation completes; asynchronous alpha production via PDL is unsupported.
     The output is ``[M, N]`` in FP16 or BF16. Weight quantization is external.
     Warm up outside CUDA graph capture to compile the selected kernel.
     """
@@ -183,8 +185,8 @@ def mm_nvfp4_residue(
         expected = ((rows + 127) // 128) * ((2 * kp + 63) // 64) * 512
         if scale.numel() != expected:
             raise ValueError(f"{name} must contain {expected} bytes")
-    if alpha.numel() not in (1, 2) or out_dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("alpha must have one/two elements; output must be FP16/BF16")
+    if alpha.numel() != 1 or out_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("alpha must have one element; output must be FP16/BF16")
     from .experimental.resserve_mext.host import mext_fold_gemm
 
     with torch.cuda.device(act.device):
@@ -272,7 +274,7 @@ def paged_decode_residue(
         raise ValueError(
             "attention and cache reconstruction scales must be positive finite scalars"
         )
-    from .experimental.resserve_resattn.backend import decode
+    from .experimental.resserve_resattn.host import decode
 
     with torch.cuda.device(q.device):
         return decode(
