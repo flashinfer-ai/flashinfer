@@ -147,9 +147,9 @@ class JitSpecCuteDsl(JitSpec):
         if not enable_tvm_ffi:
             # The two export formats must never share a module directory.
             self.expected_meta["tvm_ffi"] = False
-        # Set by build(): the freshly compiled in-process kernel, returned by
-        # load() so a build is never followed by a redundant JITLink reload.
+        # Retain the compiled kernel for best-effort persistence failures.
         self._compiled_kernel: Optional[Any] = None
+        self._export_succeeded = False
 
     @property
     def lock_path(self) -> Path:
@@ -261,10 +261,12 @@ class JitSpecCuteDsl(JitSpec):
         reloaded artifact, so every second run was exercising that form
         anyway.  Miss and hit now hand back the same thing.
 
-        Falls back to the in-process object when no artifact exists -- export
-        is best-effort (``build()`` logs and continues on failure) and the
-        on-disk cache can be disabled outright.
+        Falls back to the in-process object when its export failed, even if
+        an older artifact remains, or when no artifact exists. Export is
+        best-effort and the on-disk cache can be disabled outright.
         """
+        if self._compiled_kernel is not None and not self._export_succeeded:
+            return self._compiled_kernel
         if self.object_path.exists():
             return self._load_from_disk()
         if self._compiled_kernel is not None:
@@ -291,6 +293,7 @@ class JitSpecCuteDsl(JitSpec):
         object_path.write_bytes(self._compiled_kernel.dump_to_object(self.symbol))
 
     def _export(self) -> None:
+        self._export_succeeded = False
         self.module_dir.mkdir(parents=True, exist_ok=True)
         tmp_object_path = self.object_path.with_suffix(f".o.tmp.{os.getpid()}")
         tmp_meta_path = self.meta_path.with_suffix(f".json.tmp.{os.getpid()}")
@@ -310,6 +313,7 @@ class JitSpecCuteDsl(JitSpec):
             for tmp in (tmp_object_path, tmp_meta_path):
                 if tmp.exists():
                     tmp.unlink()
+        self._export_succeeded = True
 
 
 def _read_meta(meta_path: Path) -> Any:
