@@ -162,6 +162,7 @@ from .jit.gemm.cake_grouped_fp8_fused_silu_quant import (
 from .jit.mamba import (
     gen_selective_state_update_module,
     gen_selective_state_update_sm90_module,
+    gen_selective_state_update_sm100_module,
 )
 from .jit.mamba.cake_selective_state_update import (
     gen_cake_selective_state_update_modules,
@@ -1287,6 +1288,33 @@ def gen_all_modules(
                 jit_specs.append(
                     # same false positive as above
                     gen_selective_state_update_sm90_module(  # type: ignore[call-arg]
+                        *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
+                    )
+                )
+        # SM100 variant: the runtime dispatches every SM major >= 10 here
+        # (see flashinfer/mamba/selective_state_update.py), and the generator
+        # targets majors 10, 11 and 12, so register it for all of them.
+        if (
+            has_sm100
+            or has_sm100f
+            or has_sm103
+            or has_sm107
+            or has_sm110
+            or has_sm120
+            or has_sm120f
+            or has_sm121
+        ):
+            for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
+                _ssu_dtype_combos,
+                _ssu_dims,
+                _ssu_dstates,
+                _ssu_ntokens,
+                _ssu_cu_seqlens_dtypes,
+                _ssu_num_accepted_dtypes,
+            ):
+                jit_specs.append(
+                    # same false positive as above
+                    gen_selective_state_update_sm100_module(  # type: ignore[call-arg]
                         *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
                     )
                 )
