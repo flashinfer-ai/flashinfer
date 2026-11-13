@@ -8706,6 +8706,165 @@ def _check_mm_fp4_problem_size(
     return True
 
 
+def _fp4_short_scale_problem(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    block_size: int,
+    a_is_128x4: bool = True,
+) -> Optional[str]:
+    """Return a message when a block-scale tensor cannot hold the layout a backend reads.
+
+    A 128x4 backend reads scale rows padded to a multiple of 128 and scale
+    columns padded to a multiple of 4, from the data pointer, whatever the
+    tensor's shape. TRT-LLM's 8x4 A scales pad rows to a multiple of 8 instead.
+    A tensor with fewer bytes behind its data pointer is read past its end. A
+    row-major tensor with fewer rows than the padded layout is read in the wrong
+    order. Both give wrong values with no error, so both are rejected. A view or
+    reshape that keeps all the buffer's rows and bytes behind the data pointer
+    passes.
+
+    Returns ``None`` when both scale tensors pass. Otherwise returns one message
+    per rejected tensor, joined with spaces.
+    """
+    sf_m, sf_n, sf_k = _calculate_block_scale_dims(
+        a.shape[0], b.shape[1], a.shape[1] * 2, block_size
+    )
+    if not a_is_128x4:
+        sf_m = (a.shape[0] + 7) // 8 * 8
+
+    def storage_bytes(t: torch.Tensor) -> int:
+        return t.untyped_storage().nbytes() - t.storage_offset() * t.element_size()
+
+    def too_short(name: str, t: torch.Tensor, rows: int, cols: int) -> Optional[str]:
+        have, need = storage_bytes(t), rows * cols * t.element_size()
+        if have >= need:
+            return None
+        eight_by_four = name == "a_descale" and not a_is_128x4
+        return (
+            f"{name} has {have} bytes of storage behind its data pointer, but the "
+            f"{'8x4' if eight_by_four else '128x4'} block-scale layout for this "
+            f"call reads {need} ({rows} padded rows of {cols} scales, in the "
+            f"quantizer's row-major orientation); the backend would read past the "
+            f"tensor's end. Quantize with that layout (fp4_quantize's "
+            f"{'is_sf_8x4_layout=True' if eight_by_four else 'default'}) rather "
+            f"than passing a linear "
+            f"({a.shape[0] if name == 'a_descale' else b.shape[1]}, "
+            f"{a.shape[1] * 2 // block_size}) array of scales."
+            + (
+                ""
+                if name == "a_descale"
+                else " Pass B's scales transposed, as the quantizer's output .T."
+            )
+        )
+
+    # The byte count alone misses some linear arrays (the plain row-major
+    # (m, k // block_size) output of SfLayout.layout_linear). nvfp4_quantize pads
+    # their storage to a multiple of 16 rows. At m = 120 and k = 512 the (120, 32)
+    # array therefore sits on 128 x 32 = 4096 bytes, as many as the 128x4 layout
+    # reads. The same happens for every m from 113 to 127 above a multiple of 128.
+    # Such an array has fewer rows than the padded layout. A row slice like
+    # a_descale[:-1] has the same shape, strides and storage, so both are rejected.
+    # The quantizers return 128x4 and 8x4 scales with all the padded rows.
+    def too_few_rows(name: str, t: torch.Tensor, rows: int, cols: int) -> Optional[str]:
+        # B's scales are passed transposed; look at them as the quantizer wrote them.
+        if t.dim() != 2:
+            return None
+        q = t if name == "a_descale" else t.T
+        row_major = q.shape[1] == cols and tuple(q.stride()) == (cols, 1)
+        if not row_major or q.shape[0] >= rows:
+            return None
+        eight_by_four = name == "a_descale" and not a_is_128x4
+        return (
+            f"{name} is a row-major tensor of {q.shape[0]} rows of {cols} scales, "
+            f"but the {'8x4' if eight_by_four else '128x4'} block-scale layout for "
+            f"this call has {rows} padded rows. A tensor with fewer rows than the "
+            f"padded layout is a linear array or a row slice, not the layout's "
+            f"output, so the backend would read scales in the wrong order. "
+            f"Quantize with that layout (fp4_quantize's "
+            f"{'is_sf_8x4_layout=True' if eight_by_four else 'default'}) and pass "
+            f"all of its rows."
+        )
+
+    problems = []
+    for name, t, rows in (
+        ("a_descale", a_descale, sf_m),
+        ("b_descale", b_descale, sf_n),
+    ):
+        short = too_short(name, t, rows, sf_k) or too_few_rows(name, t, rows, sf_k)
+        if short is not None:
+            problems.append(short)
+    return " ".join(problems) if problems else None
+
+
+def _fp4_scale_byte_order_problem(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    block_size: int,
+    a_is_128x4: bool = True,
+) -> Optional[str]:
+    """Describe a 128x4 block-scale tensor that is a transposed copy of the quantizer output.
+
+    The CUTLASS, b12x and TRT-LLM backends, and CuTe DSL on SM100 (its SM12x path
+    checks shape and stride itself), read the scale tensors' bytes from the data
+    pointer in the order fp4 quantization writes them; shape and strides do not
+    change what they read. So any tensor over the quantizer's bytes gives the
+    documented result: A's scales as returned, the transpose of B's, a view of
+    either, or a reshape to another shape. A copy that holds the same values in a
+    different byte order gives a wrong result. Shape and strides identify two such
+    copies of an ``(r, c)`` quantizer output when ``r != c``: a contiguous ``(c,
+    r)`` tensor (a contiguous copy of the transpose) and an ``(r, c)`` tensor with
+    transposed strides (that copy transposed back). The quantizer output reshaped to
+    ``(c, r)`` looks the same as the first copy and is rejected too. This check
+    looks only at 2-D shapes and strides; other layouts, 3-D tensors included,
+    are left to the backend. A's scales are checked only when ``a_is_128x4``;
+    TRT-LLM can take them in its 8x4 layout.
+
+    ``_fp4_short_scale_problem`` runs first. It rejects a scale tensor with fewer
+    bytes behind its data pointer than the backend reads, whatever its rank.
+    One limit remains: a tensor of the full size with its scales in a different
+    order looks the same in shape, strides and storage, so neither check can
+    see it.
+
+    Returns ``None`` when neither scale tensor is a transposed copy or too short,
+    else a message.
+    """
+    sf_m, sf_n, sf_k = _calculate_block_scale_dims(
+        a.shape[0], b.shape[1], a.shape[1] * 2, block_size
+    )
+
+    def transposed_copy(t: torch.Tensor, rows: int, cols: int) -> bool:
+        if t.dim() != 2 or rows == cols:
+            return False
+        if t.is_contiguous():
+            return tuple(t.shape) == (cols, rows)
+        return tuple(t.shape) == (rows, cols) and t.t().is_contiguous()
+
+    short = _fp4_short_scale_problem(a, b, a_descale, b_descale, block_size, a_is_128x4)
+    if short is not None:
+        return short
+    problems = []
+    if a_is_128x4 and transposed_copy(a_descale, sf_m, sf_k):
+        problems.append(
+            "a_descale must hold the block scales in the order fp4 quantization of A "
+            "writes them; pass them as returned. Got shape "
+            f"{tuple(a_descale.shape)} with stride {tuple(a_descale.stride())}, the "
+            "layout a transposed copy of the scales has."
+        )
+    if transposed_copy(b_descale, sf_n, sf_k):
+        problems.append(
+            "b_descale must hold the block scales in the order fp4 quantization of B "
+            "writes them; pass the transpose of the (n, k // block_size) quantizer "
+            "output as a view (that output's .T). Got shape "
+            f"{tuple(b_descale.shape)} with stride {tuple(b_descale.stride())}, the "
+            "layout a transposed copy of the scales has."
+        )
+    return " ".join(problems) if problems else None
+
+
 @supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cudnn_gemm_fp4_requirement(
     a: torch.Tensor,
@@ -8724,6 +8883,14 @@ def _cudnn_gemm_fp4_requirement(
     enable_pdl: bool = True,  # unused
     batch_invariant: bool = False,  # unused
 ):
+    """Return whether the cuDNN backend can run this ``mm_fp4`` call.
+
+    The 8x4 scale-factor layout raises for any backend. Otherwise, with
+    ``backend="cudnn"`` an unsupported call raises: the library's errors when
+    cuDNN or its FP4 support is missing, and ``ValueError`` when a 2-D
+    block-scale tensor does not match the 128x4 layout. With ``backend="auto"``
+    such a call returns False, so another backend is chosen.
+    """
     if use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
 
@@ -8746,23 +8913,87 @@ def _cudnn_gemm_fp4_requirement(
             return False
         raise LibraryError(CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR)
 
+    # cuDNN reads the scale bytes at the data pointer as a 128x4 layout. A linear
+    # 2-D array or a short 3-D tensor holds fewer bytes than that, so cuDNN reads
+    # past its end and gives wrong values with no error. cuDNN's 2-D shape check
+    # below cannot catch the 3-D case. The storage check _fp4_short_scale_problem
+    # runs before that shape check and catches both the linear 2-D array and the
+    # short 3-D tensor. With backend="cudnn" the call raises. In auto mode this
+    # requirement returns False instead, so cuDNN is skipped.
+    short = _fp4_short_scale_problem(a, b, a_descale, b_descale, block_size)
+    if short is not None:
+        if backend != "cudnn":
+            return False
+        raise ValueError(short)
+
+    # cuDNN builds its block-scale descriptors from the scale tensors' shapes and
+    # reads their bytes in the 128x4-swizzled order that fp4 quantization writes.
+    # A's scales must therefore be the quantizer's output as returned, and B's
+    # the transposed view of the quantizer's (n, k // block_size) output. The
+    # untransposed B tensor (wrong shape) and a re-laid-out copy of either
+    # (right shape, wrong byte order) are not rejected by cuDNN and give wrong
+    # results or fault the device. Each 2-D scale tensor is checked on its own.
+    if a.dim() == 2:
+        m, k, n = a.shape[0], a.shape[1] * 2, b.shape[1]
+        sf_m, sf_n, sf_k = _calculate_block_scale_dims(m, n, k, block_size)
+        a_bad_shape = a_descale.dim() == 2 and tuple(a_descale.shape) != (sf_m, sf_k)
+        a_bad_order = (
+            a_descale.dim() == 2
+            and not a_bad_shape
+            and tuple(a_descale.stride()) != (sf_k, 1)
+        )
+        b_bad_shape = b_descale.dim() == 2 and tuple(b_descale.shape) != (sf_k, sf_n)
+        b_bad_order = (
+            b_descale.dim() == 2
+            and not b_bad_shape
+            and tuple(b_descale.stride()) != (1, sf_k)
+        )
+        if a_bad_shape or a_bad_order or b_bad_shape or b_bad_order:
+            if backend != "cudnn":
+                return False
+            problems = []
+            if a_bad_shape or b_bad_shape:
+                problems.append(
+                    "cuDNN FP4 GEMM expects 128x4-layout block scales with a_descale "
+                    f"of shape {(sf_m, sf_k)} and b_descale of shape {(sf_k, sf_n)} "
+                    f"for m={m}, n={n}, k={k}, block_size={block_size}; got "
+                    f"{tuple(a_descale.shape)} and {tuple(b_descale.shape)}. If "
+                    "b_descale comes from fp4 quantization of B (n, k), pass its "
+                    "transpose."
+                )
+            if a_bad_order:
+                problems.append(
+                    "cuDNN FP4 GEMM reads a_descale in the byte order that fp4 "
+                    "quantization of A writes, so a_descale must be those scales "
+                    f"as returned, with stride {(sf_k, 1)}; got stride "
+                    f"{tuple(a_descale.stride())}. Pass the quantized scales "
+                    "unchanged, not a re-laid-out copy."
+                )
+            if b_bad_order:
+                problems.append(
+                    "cuDNN FP4 GEMM reads b_descale in the byte order that fp4 "
+                    "quantization of B (n, k) writes, so b_descale must be the "
+                    f"transposed view of those scales, with stride {(1, sf_k)}; got "
+                    f"stride {tuple(b_descale.stride())}. Pass the transpose of the "
+                    "quantizer output as a view (that output's .T)."
+                )
+            raise ValueError(" ".join(problems))
+
     return True
 
 
 @supported_compute_capability([100, 103, 107])
 def _trtllm_gemm_fp4_requirement(
-    a: torch.Tensor,  # unused
-    b: torch.Tensor,  # unused
-    a_descale: torch.Tensor,  # unused
-    b_descale: torch.Tensor,  # unused
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,  # unused
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,  # unused
-    block_size: int = 16,  # unused
-    use_8x4_sf_layout: bool = False,  # unused
-    backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
-    ] = "auto",  # unused
+    block_size: int = 16,
+    use_8x4_sf_layout: bool = False,
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
     batch_invariant: bool = False,  # unused
@@ -8774,23 +9005,34 @@ def _trtllm_gemm_fp4_requirement(
             f"Unsupported output dtype: {out_dtype}. "
             f"Only torch.bfloat16 is supported for TRTLLM FP4 GEMM operations."
         )
+    # B's scales are 128x4 in both modes; A's are 8x4 when use_8x4_sf_layout is set
+    problem = _fp4_scale_byte_order_problem(
+        a,
+        b,
+        a_descale,
+        b_descale,
+        block_size,
+        a_is_128x4=not use_8x4_sf_layout,
+    )
+    if problem is not None:
+        if backend != "trtllm":
+            return False
+        raise ValueError(f"TRTLLM FP4 GEMM: {problem}")
     return True
 
 
 @supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cutlass_gemm_fp4_requirement(
-    a: torch.Tensor,  # unused
-    b: torch.Tensor,  # unused
-    a_descale: torch.Tensor,  # unused
-    b_descale: torch.Tensor,  # unused
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,  # unused
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     out: Optional[torch.Tensor] = None,
-    block_size: int = 16,  # unused
+    block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
-    ] = "auto",  # unused
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
     batch_invariant: bool = False,  # unused
@@ -8803,6 +9045,11 @@ def _cutlass_gemm_fp4_requirement(
         raise ValueError(
             "The CUTLASS FP4 GEMM backend requires a contiguous output tensor."
         )
+    problem = _fp4_scale_byte_order_problem(a, b, a_descale, b_descale, block_size)
+    if problem is not None:
+        if backend != "cutlass":
+            return False
+        raise ValueError(f"CUTLASS FP4 GEMM: {problem}")
     return True
 
 
@@ -8810,12 +9057,12 @@ def _cutlass_gemm_fp4_requirement(
 def _cute_dsl_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
-    a_descale: torch.Tensor,  # unused
-    b_descale: torch.Tensor,  # unused
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     out: Optional[torch.Tensor] = None,  # unused
-    block_size: int = 16,  # unused
+    block_size: int = 16,
     use_8x4_sf_layout: bool = False,
     backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
@@ -8861,6 +9108,11 @@ def _cute_dsl_gemm_fp4_requirement(
                 "CuTe-DSL FP4 GEMM per-token alpha is implemented on SM100/SM103 "
                 f"only, got SM{major}{minor}."
             )
+    problem = _fp4_scale_byte_order_problem(a, b, a_descale, b_descale, block_size)
+    if problem is not None:
+        if backend != "cute-dsl":
+            return False
+        raise ValueError(f"CuTe-DSL FP4 GEMM: {problem}")
     _check_cute_dsl_availability()
     _check_cute_dsl_arch(a.device)
     return True
@@ -8875,7 +9127,7 @@ def _cutedsl_low_latency_gemm_fp4_requirement(
     alpha: Optional[torch.Tensor] = None,  # unused
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     out: Optional[torch.Tensor] = None,  # unused
-    block_size: int = 16,  # unused
+    block_size: int = 16,
     use_8x4_sf_layout: bool = False,
     backend: Literal["cutedsl_low_latency", "auto"] = "auto",
     use_nvfp4: bool = True,
@@ -8901,6 +9153,11 @@ def _cutedsl_low_latency_gemm_fp4_requirement(
         raise ValueError(
             f"cutedsl_low_latency FP4 GEMM requires M <= 8 and K divisible by {k_alignment}"
         )
+    problem = _fp4_scale_byte_order_problem(a, b, a_descale, b_descale, block_size)
+    if problem is not None:
+        if backend != "cutedsl_low_latency":
+            return False
+        raise ValueError(f"cutedsl_low_latency FP4 GEMM: {problem}")
     return True
 
 
@@ -8908,16 +9165,14 @@ def _cutedsl_low_latency_gemm_fp4_requirement(
 def _b12x_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
-    a_descale: torch.Tensor,  # unused
-    b_descale: torch.Tensor,  # unused
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,  # unused
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     out: Optional[torch.Tensor] = None,  # unused
-    block_size: int = 16,  # unused
+    block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
-    ] = "auto",  # unused
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
     batch_invariant: bool = False,  # unused
@@ -8942,6 +9197,11 @@ def _b12x_gemm_fp4_requirement(
             "b12x FP4 GEMM requires the contraction dim K to be a multiple of 32 "
             f"(TMA 16-byte alignment). Got K={real_k}."
         )
+    problem = _fp4_scale_byte_order_problem(a, b, a_descale, b_descale, block_size)
+    if problem is not None:
+        if backend != "b12x":
+            return False
+        raise ValueError(f"b12x FP4 GEMM: {problem}")
     _check_cute_dsl_availability()
     return True
 
@@ -10468,10 +10728,16 @@ def mm_fp4(
         Mat2 tensor, shape (k, n), should be column major, fp4 e2m1fn_x2 or uint8.
 
     a_descale: torch.Tensor
-        Block scale tensor for A, shape (m, k // block_size), float8_e4m3fn or uint8.
+        Block scale tensor for A, shape (m, k // block_size), float8_e4m3fn or uint8:
+        the scales that fp4 quantization of A returns, unchanged. With the 128x4
+        layout both dimensions are padded (m to a multiple of 128, k // block_size
+        to a multiple of 4).
 
     b_descale: torch.Tensor
-        Block scale tensor for B, shape (k, n // block_size), float8_e4m3fn or uint8.
+        Block scale tensor for B, shape (k // block_size, n), float8_e4m3fn or uint8:
+        the transpose of the (n, k // block_size) scales that fp4 quantization of B
+        returns. With the 128x4 layout both dimensions are padded (k // block_size to a
+        multiple of 4, n to a multiple of 128).
 
     alpha: Optional[torch.Tensor]
         Global scale tensor, float scalar, or a float32 tensor of ``m``
