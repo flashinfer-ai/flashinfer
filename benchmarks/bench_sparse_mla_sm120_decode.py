@@ -24,10 +24,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batches", nargs="+", type=int, default=list(range(1, 21)))
     parser.add_argument("--output", type=Path, default=Path("decode.json"))
+    parser.add_argument("--layout", choices=("inline", "footer"), default="inline")
     args = parser.parse_args()
     results = []
     for batch in args.batches:
-        f = decode_fixture(batch)
+        f = decode_fixture(batch, inline=args.layout == "inline")
         functions = {
             impl: lambda impl=impl: call(f, impl)
             for impl in ("auto", "decode-splitkv", "decode")
@@ -76,6 +77,7 @@ def main():
             for key, p in f["wrapper"]._prepared_calls.items()
         }
         row = dict(
+            layout=args.layout,
             batch=batch,
             tokens=batch * 7,
             metrics=metrics,

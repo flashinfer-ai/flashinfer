@@ -239,8 +239,8 @@ def _check_default_mega(f, *, variant, implementation=None, large_merge=None):
         assert plan["implementation"] == implementation, plan
     if large_merge is not None:
         if plan["implementation"] == "dsv4_fp8_splitkv_decode":
-            # The new inline route merges up to eight cluster splits inside
-            # attention. Footer caches still exercise the legacy large merge.
+            # Both scale placements merge up to eight cluster splits inside
+            # attention without a separate finalization kernel.
             assert plan["merge"] == "direct", plan
             assert 1 <= plan["active_splits"] <= 8, plan
         else:

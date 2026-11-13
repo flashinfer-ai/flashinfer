@@ -8,10 +8,7 @@
 #include <flashinfer/attention/sparse_mla_sm120/kernels/cute_prefill/common.cuh>
 namespace flashinfer::sparse_mla_sm120::dsv4_fp8_splitkv_decode {
 using namespace cute_prefill;
-struct Params : cute_prefill::Params {
-  bf16* bf16_output;
-  size_t lse_stride;
-  float lse_scale;
+struct Params : PagedParams {
   bf16* partial;
   float* partial_lse;
   int splits;
@@ -44,7 +41,7 @@ struct alignas(128) Shared {
 // Scratch belongs to the invocation; no initialization kernel/counter is needed.
 // Every warp executes QK -> online softmax -> PV. All warps share the sparse
 // gather, so there are no separate QK/PV roles or register handoff barriers.
-template <int Warps, bool Mega = true, int FixedSplits = 0>
+template <int Warps, bool Mega = true, int FixedSplits = 0, bool Inline = true>
 __global__ __launch_bounds__((Warps + 1) * 32, 1) void decode(Params p) {
   static_assert(Warps >= 1 && Warps <= 4);
   static_assert(FixedSplits == 0 || FixedSplits == 8);
@@ -76,22 +73,19 @@ __global__ __launch_bounds__((Warps + 1) * 32, 1) void decode(Params p) {
       int start = (extra ? tile - main_tiles : tile) * 32;
       int length = extra ? extra_len : main_len, width = extra ? p.extra_topk : p.topk;
       const int* ids = (extra ? p.extra_indices : p.indices) + size_t(token) * width;
-      const uint8_t* cache = extra ? p.extra_kv : p.kv;
-      int stride = extra ? p.extra_stride : p.kv_stride;
       sm.ids[slot][lane] = start + lane < length ? ids[start + lane] : -1;
       __syncwarp();
       for (int i = lane; i < 32 * 32; i += 32) {
         int n = i / 32, d = (i % 32) * 16, id = sm.ids[slot][n];
         auto* dst = reinterpret_cast<cute::uint128_t*>(sm.kv[slot] + KVLayout{}(n, d));
-        const uint8_t* src = cache + size_t(max(id, 0)) * stride + d;
+        const uint8_t* src = cache_row<Inline, false>(p, extra, id) + d;
         SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>::copy(
             *reinterpret_cast<const cute::uint128_t*>(src), *dst, id >= 0);
       }
       {
         int id = sm.ids[slot][lane];
-        uint4 sf = id >= 0
-                       ? *reinterpret_cast<const uint4*>(cache + size_t(max(id, 0)) * stride + 512)
-                       : uint4{};
+        uint4 sf = id >= 0 ? *reinterpret_cast<const uint4*>(cache_row<Inline, true>(p, extra, id))
+                           : uint4{};
         auto bytes =
             make_tensor(make_rmem_ptr(reinterpret_cast<const uint8_t*>(&sf)), Layout<_16>{});
 #pragma unroll

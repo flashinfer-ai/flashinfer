@@ -79,7 +79,8 @@ def test_public_prefill_specializations(heads, rank, inline):
 
 
 @pytest.mark.parametrize("impl", ["auto", "decode-splitkv", "decode"])
-def test_pitched_inline_rows_and_lse_stride(impl):
+@pytest.mark.parametrize("inline", [False, True])
+def test_pitched_cache_and_lse_stride(impl, inline):
     """Cache/LSE strides and graph replay must work for each scheduling choice."""
     f = prefill_fixture(
         1,
@@ -89,6 +90,7 @@ def test_pitched_inline_rows_and_lse_stride(impl):
         prefill_cp_size=4,
         prefill_cp_rank=3,
         history_tokens=128,
+        inline=inline,
     )
 
     def mega(out_lse=None):
@@ -118,12 +120,19 @@ def test_pitched_inline_rows_and_lse_stride(impl):
     expected = f["out"].float().clone(), f["scales"].clone(), lse.clone()
     backing = []
     for i, cache in enumerate(f["caches"]):
+        # Inline records can have a row pitch; footer payload/scale rows stay
+        # packed within each page, with padding between pages instead.
+        source = cache if inline else cache.reshape(cache.shape[0], -1)
+        width = source.shape[-1]
         padded = torch.full(
-            (*cache.shape[:-1], 544), 0xA5, device=cache.device, dtype=torch.uint8
+            (*source.shape[:-1], width + 16),
+            0xA5,
+            device=cache.device,
+            dtype=torch.uint8,
         )
-        view = padded[..., :528]
+        view = padded[..., :width].view_as(cache)
         view.copy_(cache)
-        backing.append(padded)
+        backing.append((padded, width))
         f["caches"][i] = view
     storage = torch.full((65, 24), 1234.0, device="cuda")
     lse = storage[:, :16]
@@ -138,8 +147,8 @@ def test_pitched_inline_rows_and_lse_stride(impl):
     ):
         torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
     assert (storage[:, 16:] == 1234.0).all()
-    for padded in backing:
-        assert (padded[..., 528:] == 0xA5).all()
+    for padded, width in backing:
+        assert (padded[..., width:] == 0xA5).all()
 
 
 @pytest.mark.parametrize("tokens", [1, 4, 16, 32, 64])
