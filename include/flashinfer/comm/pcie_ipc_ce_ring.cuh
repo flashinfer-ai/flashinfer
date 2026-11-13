@@ -31,6 +31,7 @@
 
 #include "pcie_ipc_all_reduce.cuh"
 #include "pcie_ipc_ce_memop.cuh"
+#include "pcie_ipc_spin_guard.cuh"
 
 // This file follows the surrounding style: plain cudaError_t returns, no
 // framework headers. Scoped to the file and undefined at the bottom.
@@ -94,7 +95,9 @@ __global__ void ce_publish_flag_kernel(int32_t* peer_flag, int32_t* send_counter
 __global__ void ce_wait_flag_kernel(int32_t* self_flag, int32_t* wait_counter) {
   const int32_t expected = load_volatile_i32(wait_counter) + 1;
   store_volatile_i32(wait_counter, expected);
+  SpinGuard spin_guard("ce_wait_flag_kernel::barrier");
   while (!generation_reached(load_acquire_i32(self_flag), expected)) {
+    spin_guard.tick(-1);
   }
 }
 
