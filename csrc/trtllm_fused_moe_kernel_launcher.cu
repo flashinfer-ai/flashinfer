@@ -16,19 +16,16 @@
 #include <flashinfer/exception.h>
 
 #include <algorithm>
-#include <cstdio>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <set>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 #include "flashinfer/fused_moe/da_moe.cuh"
@@ -1155,63 +1152,6 @@ std::pair<int64_t, int64_t> resolveMoeTileAndConfig(
   return {tile_N, config};
 }
 
-/**
- * Reports a tile_N fallback once per (device, tile) pair on stderr; token-by-token inference
- * would otherwise print the same line on every launch.
- *
- * @param device The device of the launch's tensors. It keys the report: the caller reports
- *        after the launcher's device guard has unwound, so the current device would be the
- *        caller's, not the one whose kernels failed to load.
- * @param tile_N The tile the heuristic chose, which has no kernel that loads on this driver.
- * @param chosen The next tile tried instead.
- */
-inline void reportTileFallbackOnce(int device, int64_t tile_N, int64_t chosen) {
-  static std::mutex reported_mutex;
-  static std::set<std::pair<int, int64_t>> reported;
-  {
-    std::lock_guard<std::mutex> lock(reported_mutex);
-    if (!reported.insert({device, tile_N}).second) {
-      return;
-    }
-  }
-  std::fprintf(stderr,
-               "[FlashInfer] tile_N %lld has no trtllm-gen kernel that loads on this driver; "
-               "trying tile_N %lld (GitHub #5322)\n",
-               static_cast<long long>(tile_N), static_cast<long long>(chosen));
-}
-
-/**
- * Tiles to try for a default-tactic launch, in order: the heuristic tile itself, then larger
- * tiles ascending (they hold the two-CTA kernels), then smaller tiles descending. A launch moves
- * to the next entry only when the batched-GEMM runner reports that none of the current tile's
- * kernels loads on this driver (NoLoadableKernelError, GitHub #5322); where every cubin loads
- * the first entry succeeds and the rest is never consulted.
- *
- * @param tile_N The tile resolved from the heuristic.
- * @param launchers The per-tile launchers of this MoE entry.
- * @return The tiles to try, starting with tile_N.
- */
-template <typename LauncherMap>
-std::vector<int64_t> tileFallbackOrder(int64_t tile_N, LauncherMap const& launchers) {
-  std::vector<int64_t> tiles;
-  for (auto const& entry : launchers) {
-    tiles.push_back(entry.first);
-  }
-  std::sort(tiles.begin(), tiles.end());
-  std::vector<int64_t> order{tile_N};
-  for (auto t : tiles) {
-    if (t > tile_N) {
-      order.push_back(t);
-    }
-  }
-  for (auto it = tiles.rbegin(); it != tiles.rend(); ++it) {
-    if (*it < tile_N) {
-      order.push_back(*it);
-    }
-  }
-  return order;
-}
-
 // Validate the FC1 bias tensor against the selected BiasType. Currently only
 // BiasType::None and BiasType::Mn are exercised from the flashinfer MoE path
 inline void check_gemm1_bias_mn(Optional<TensorView> const& gemm1_bias,
@@ -1698,8 +1638,6 @@ class FusedMoeLauncher {
   Tensor workspace_fc2;
   Optional<Tensor> output;
   int64_t moe_tactic{-1};
-  // SMs per locality domain when the GEMMs run localized across the GPU's domains; 0 otherwise.
-  int32_t localized_sm_count_{0};
   // Non-owning; points into the thread-local runner cache in prepare_moe_common().
   tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner* moe_runner{nullptr};
 
@@ -1769,26 +1707,6 @@ class FusedMoeLauncher {
     // Tactic validity is keyed on GEMM2's N, so this must be the same width the runner will
     // launch GEMM2 with, not the raw hidden_size_output. See gemm2_output_hidden_size().
     auto const hidden_size_output = gemm2_output_hidden_size();
-    if (localized_sm_count_ > 0) {
-      // A localized launch runs each GEMM at its per-domain half shape, so the tactic is chosen
-      // and checked against those shapes rather than the full ones.
-      if (moe_tactic == -1) {
-        auto const valid = moe_runner->getValidLocalizedConfigIndices(
-            effectiveTopK, args->hidden_size, args->intermediate_size, effectiveLocalExperts,
-            args->num_tokens, localized_sm_count_);
-        FLASHINFER_CHECK(!valid.empty(), "No MoE tactic for tile_N=", tile_tokens_dim,
-                         " can run localized on ", localized_sm_count_, " SMs per domain.");
-        moe_tactic = valid.front();
-      }
-      FLASHINFER_CHECK(moe_runner->isValidLocalizedConfigIndex(
-                           moe_tactic, effectiveTopK, args->hidden_size, args->intermediate_size,
-                           effectiveLocalExperts, args->num_tokens, localized_sm_count_),
-                       "MoE tactic ", moe_tactic, " for tile_N=", tile_tokens_dim,
-                       " cannot run localized. This often indicates a tactic tuned for the "
-                       "non-localized path.");
-      this->moe_tactic = moe_tactic;
-      return;
-    }
     if (moe_tactic == -1) {
       moe_tactic = moe_runner->getDefaultValidConfigIndex(
           effectiveTopK, args->hidden_size, args->intermediate_size, effectiveLocalExperts,
@@ -5568,99 +5486,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   /** Return the launcher-owned finalized output handle used by the existing DA result ABI. */
   Optional<Tensor> finalized_da_output() const { return output; }
 
-  /**
-   * Split both GEMMs across the GPU's two locality domains (uGPU localization). weights holds,
-   * per domain in order, the shuffled FC1 weights [E, I, H/2] and scales, then the FC2 weights
-   * [E, H/2, I/2] and scales; streams holds one stream handle per domain, each limited to that
-   * domain's sm_count SMs. The full-width weights stay bound for validation only.
-   */
-  void set_localized(Array<Tensor> const& weights, Array<int64_t> const& streams,
-                     int64_t sm_count) {
-    constexpr int kDomains = tensorrt_llm::kernels::trtllmgen_moe::MoE::LocalizedMoE::kNumDomains;
-    TVM_FFI_ICHECK_EQ(weights.size(), 4 * kDomains)
-        << "localized_weights must hold FC1 weights, FC1 scales, FC2 weights and FC2 scales for "
-           "each of the "
-        << kDomains << " locality domains.";
-    TVM_FFI_ICHECK_EQ(streams.size(), kDomains)
-        << "localized_streams must hold one stream per locality domain.";
-    TVM_FFI_ICHECK(sm_count > 0) << "localized_sm_count must be positive.";
-    localized_weights_ = weights;
-    localized_streams_ = streams;
-    localized_sm_count_ = static_cast<int32_t>(sm_count);
-  }
-
  private:
-  /** Check one domain's weight shard against the full-width layout it was cut from. */
-  void check_localized_shard(Tensor const& shard, DLDataType dtype, int64_t rows, int64_t numel,
-                             char const* name, int domain) const {
-    TVM_FFI_ICHECK(shard.dtype() == dtype)
-        << name << " shard " << domain << " has the wrong dtype.";
-    TVM_FFI_ICHECK(shard.IsContiguous()) << name << " shard " << domain << " must be contiguous.";
-    TVM_FFI_ICHECK(shard.device().device_type == kDLCUDA &&
-                   shard.device().device_id == hidden_states.device().device_id)
-        << name << " shard " << domain << " must be on the device of hidden_states.";
-    TVM_FFI_ICHECK_EQ(shard.ndim(), 3) << name << " shard " << domain << " must be 3D.";
-    TVM_FFI_ICHECK_EQ(shard.size(0), args->local_num_experts)
-        << name << " shard " << domain << " dim 0 must be local_num_experts.";
-    TVM_FFI_ICHECK_EQ(shard.size(1), rows) << name << " shard " << domain << " dim 1 must be "
-                                           << rows << " (half of the full-width rows).";
-    TVM_FFI_ICHECK_EQ(shard.numel(), numel)
-        << name << " shard " << domain << " must have " << numel << " elements.";
-  }
-
-  void run_localized(cudaStream_t stream, bool enable_pdl) {
-    using tensorrt_llm::kernels::trtllmgen_moe::MoE::LocalizedMoE;
-    constexpr int kDomains = LocalizedMoE::kNumDomains;
-    int64_t const experts = args->local_num_experts;
-    int64_t const hidden = args->hidden_size;
-    int64_t const inter = args->intermediate_size;
-
-    LocalizedMoE localized;
-    localized.smCount = localized_sm_count_;
-    // Domain 0 reuses the launch's BMM scratch; the other domains get their own of the same size.
-    std::array<Tensor, kDomains> scratch1;
-    std::array<Tensor, kDomains> scratch2;
-    for (int d = 0; d < kDomains; ++d) {
-      Tensor const& w1 = localized_weights_[4 * d + 0];
-      Tensor const& sf1 = localized_weights_[4 * d + 1];
-      Tensor const& w2 = localized_weights_[4 * d + 2];
-      Tensor const& sf2 = localized_weights_[4 * d + 3];
-      // NVFP4 packs two values per byte and carries one scale per 16 values along K.
-      check_localized_shard(w1, dl_uint8, inter, experts * inter * hidden / 2, "gemm1_weights", d);
-      check_localized_shard(sf1, dl_float8_e4m3fn, inter, experts * inter * hidden / 16,
-                            "gemm1_weights_scale", d);
-      check_localized_shard(w2, dl_uint8, hidden / kDomains,
-                            experts * (hidden / kDomains) * inter / 2, "gemm2_weights", d);
-      check_localized_shard(sf2, dl_float8_e4m3fn, hidden / kDomains,
-                            experts * (hidden / kDomains) * inter / 16, "gemm2_weights_scale", d);
-      localized.gemm1Weights[d] = w1.data_ptr();
-      localized.gemm1WeightsScale[d] = sf1.data_ptr();
-      localized.gemm2Weights[d] = w2.data_ptr();
-      localized.gemm2WeightsScale[d] = sf2.data_ptr();
-      localized.streams[d] = reinterpret_cast<cudaStream_t>(localized_streams_[d]);
-      if (d == 0) {
-        localized.bmm1Workspaces[d] = workspace.bmm1_workspace;
-        localized.bmm2Workspaces[d] = workspace.bmm2_workspace;
-      } else {
-        // A config without split-K needs no scratch, and its workspace stays empty.
-        if (workspace_fc1.size(0) > 0) {
-          scratch1[d] = _alloc_tensor({workspace_fc1.size(0)}, dl_int8, hidden_states.device());
-          localized.bmm1Workspaces[d] = scratch1[d].data_ptr();
-        }
-        if (workspace_fc2.size(0) > 0) {
-          scratch2[d] = _alloc_tensor({workspace_fc2.size(0)}, dl_int8, hidden_states.device());
-          localized.bmm2Workspaces[d] = scratch2[d].data_ptr();
-        }
-      }
-    }
-    // The caller's stream waits for both domains before this returns, so the scratch freed
-    // here is only reused by work ordered after them.
-    moe_runner->runLocalized(*args, workspace, localized, hidden_states.device().device_id, stream,
-                             moe_tactic, enable_pdl);
-  }
-
-  Array<Tensor> localized_weights_;
-  Array<int64_t> localized_streams_;
   Optional<TensorView> hidden_states_scale;
   TensorView gemm1_weights_scale;
   Optional<TensorView> gemm1_alpha;
@@ -5738,12 +5564,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     prepare_moe(moe_tactic);
 
     cudaStream_t moe_stream = get_stream(hidden_states.device());
-    if (localized_sm_count_ > 0) {
-      run_localized(moe_stream, enable_pdl);
-    } else {
-      moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
-                      enable_pdl);
-    }
+    moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
+                    enable_pdl);
 
     MoeRunResultBuffers result(args->do_finalize,
                                args->do_finalize ? output : Optional<Tensor>(gemm2_output));
@@ -5796,32 +5618,6 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       }
     }
 
-    return valid_configs;
-  }
-
-  /** Complete [tile_N, config] tactics that can run localized (see set_localized). */
-  static Array<Array<int64_t>> getValidLocalizedConfigs(int64_t top_k, int64_t hidden_size,
-                                                        int64_t intermediate_size,
-                                                        int64_t num_local_experts,
-                                                        int64_t num_experts, int64_t num_tokens,
-                                                        int64_t act_type, int64_t sm_count) {
-    Array<Array<int64_t>> valid_configs;
-    auto const gemm1_bias_type = batchedGemm::gemm::BiasType::None;
-    std::vector<int32_t> tile_sizes =
-        getSupportedTileNums(btg::Dtype::E2m1, btg::Dtype::E2m1, gemm1_bias_type);
-    std::set<int32_t> selected_tile_nums =
-        computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts, num_experts);
-    for (int32_t tile_N : selected_tile_nums) {
-      tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner moe_runner(
-          btg::Dtype::E2m1, btg::Dtype::E2m1, /*useDeepSeekFp8=*/false, tile_N,
-          static_cast<ActivationType>(act_type), /*useShuffledMatrix=*/true,
-          batchedGemm::gemm::MatrixLayout::MajorK, gemm1_bias_type);
-      for (auto cfg : moe_runner.getValidLocalizedConfigIndices(
-               top_k, hidden_size, intermediate_size, num_local_experts, num_tokens,
-               static_cast<int32_t>(sm_count))) {
-        valid_configs.push_back({tile_N, cfg});
-      }
-    }
     return valid_configs;
   }
 };
@@ -6507,8 +6303,7 @@ Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
     Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
     Array<Tensor> da_body_workspace, bool is_da_body_preparation,
     Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size,
-    Optional<TensorView> workspace_buffer, bool query_workspace_size, int64_t nvfp4_4over6_code,
-    Array<Tensor> localized_weights, Array<int64_t> localized_streams, int64_t localized_sm_count) {
+    Optional<TensorView> workspace_buffer, bool query_workspace_size, int64_t nvfp4_4over6_code) {
   auto const gemm1_bias_type_enum = gemm1_lora_delta.has_value()
                                         ? batchedGemm::gemm::BiasType::Mn
                                         : batchedGemm::gemm::BiasType::None;
@@ -6592,26 +6387,6 @@ Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
     }
   }
 
-  bool const localized = !localized_weights.empty();
-  if (localized) {
-    // uGPU localization covers the plain NVFP4 gated path; see MoE::Runner::runLocalized.
-    TVM_FFI_ICHECK(mDtypeAct == btg::Dtype::E2m1 && mDtypeWeights == btg::Dtype::E2m1)
-        << "Localized MoE supports NVFP4 activations and weights only.";
-    TVM_FFI_ICHECK(isGatedActivation(static_cast<ActivationType>(act_type)))
-        << "Localized MoE requires a gated activation.";
-    TVM_FFI_ICHECK(!per_token_scales.has_value() && !gemm1_lora_delta.has_value() &&
-                   !gemm1_bias.has_value() && !gemm2_bias.has_value())
-        << "Localized MoE supports neither per-token scales, LoRA deltas nor GEMM biases.";
-    TVM_FFI_ICHECK_EQ(nFusedShared, 0) << "Localized MoE does not support fused shared experts.";
-    TVM_FFI_ICHECK(!valid_hidden_size.has_value() && !valid_intermediate_size.has_value())
-        << "Localized MoE does not support padded (valid) dimensions.";
-    TVM_FFI_ICHECK(!workspace_buffer.has_value() && !query_workspace_size)
-        << "Localized MoE does not support workspace_buffer.";
-    TVM_FFI_ICHECK(da_routing_metadata.empty() && da_body_workspace.empty() &&
-                   !is_da_body_preparation)
-        << "Localized MoE does not support routing metadata.";
-  }
-
   // Determine supported tile sizes
   std::vector<int32_t> mSupportedTileN =
       FP4BlockScaleLauncher::getSupportedTileNums(mDtypeAct, mDtypeWeights, gemm1_bias_type_enum);
@@ -6665,97 +6440,46 @@ Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
     launchers_map[curr_tile_N] = std::move(launcher);
   }
 
-  auto [resolved_tile_N, config] = resolveMoeTileAndConfig(
-      config_index, mSupportedTileN, num_tokens, totalExpertsPerToken, totalLocalExperts);
-  bool const is_da_launch = is_da_body_preparation || !da_routing_metadata.empty();
-  if (localized && config_index[0] == -1) {
-    // The default tile may have no tactic that can run localized: take the default tile's first
-    // localized tactic when it has one, otherwise the first localized tactic of any tile.
-    auto const candidates = FP4BlockScaleLauncher::getValidLocalizedConfigs(
-        top_k, hidden_size, intermediate_size, local_num_experts, num_experts, num_tokens, act_type,
-        localized_sm_count);
-    TVM_FFI_ICHECK(!candidates.empty())
-        << "No MoE tactic can run localized for this problem shape.";
-    auto chosen = candidates[0];
-    for (auto const& candidate : candidates) {
-      if (candidate[0] == resolved_tile_N) {
-        chosen = candidate;
-        break;
-      }
-    }
-    resolved_tile_N = chosen[0];
-    config = chosen[1];
+  auto const [tile_N, config] = resolveMoeTileAndConfig(config_index, mSupportedTileN, num_tokens,
+                                                        totalExpertsPerToken, totalLocalExperts);
+
+  // Get the launcher for the selected tile_N
+  auto launcher_it = launchers_map.find(static_cast<int32_t>(tile_N));
+  FLASHINFER_CHECK(launcher_it != launchers_map.end(),
+                   "Internal error: missing FP4 block-scale MoE launcher for tile_N=", tile_N);
+  auto& selected_launcher = launcher_it->second;
+  if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
+                                           config, config_index[0] != -1, query_workspace_size,
+                                           is_da_body_preparation || !da_routing_metadata.empty());
+      size.has_value()) {
+    return size.value();
   }
-  // A default-tactic launch moves to another tile when none of its tile's kernels loads on this
-  // driver (GitHub #5322). An explicit tactic names its tile, also one whose config is the tile's
-  // default ([tile, -1]), and a DA launch's routing metadata was prepared for its tile, so both
-  // keep it. A localized launch has already resolved a config that belongs to its tile.
-  std::vector<int64_t> const tile_order = (config_index[0] == -1 && !is_da_launch && !localized)
-                                              ? tileFallbackOrder(resolved_tile_N, launchers_map)
-                                              : std::vector<int64_t>{resolved_tile_N};
-  for (size_t attempt = 0; attempt < tile_order.size(); ++attempt) {
-    int64_t const tile_N = tile_order[attempt];
 
-    // Get the launcher for the selected tile_N
-    auto launcher_it = launchers_map.find(static_cast<int32_t>(tile_N));
-    FLASHINFER_CHECK(launcher_it != launchers_map.end(),
-                     "Internal error: missing FP4 block-scale MoE launcher for tile_N=", tile_N);
-    auto& selected_launcher = launcher_it->second;
-    if (localized) {
-      selected_launcher->set_localized(localized_weights, localized_streams, localized_sm_count);
-    }
-    if (auto size =
-            apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer, config,
-                                     config_index[0] != -1, query_workspace_size, is_da_launch);
-        size.has_value()) {
-      return size.value();
-    }
-
-    if (is_da_body_preparation) {
-      TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
-          << "DA body preparation does not accept an existing body workspace.";
-      auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
-      auto tensors = selected_launcher->prepare_da_body(routing, config).to_ffi();
-      return Array<Optional<Tensor>>(tensors.begin(), tensors.end());
-    }
-    if (!da_routing_metadata.empty()) {
-      auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
-      auto const body = FP4DABodyBuffers::from_ffi(da_body_workspace);
-      selected_launcher->run_da_body(routing, body, config, enable_pdl);
-      if (do_finalize) {
-        return {selected_launcher->finalized_da_output()};
-      }
-      return {body.gemm2_output, routing.expert_weights, routing.expanded_idx_to_permuted_idx};
-    }
+  if (is_da_body_preparation) {
     TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
-        << "A DA body workspace requires routing metadata.";
-
-    // Run the launcher - it will create its own runner internally. The tactic is resolved after
-    // routing and before either GEMM, so a tile whose kernels do not load fails before the GEMMs
-    // and the next launcher reruns routing for its own tile.
-    try {
-      return selected_launcher
-          ->run(config, enable_pdl,
-                /*use_routing_scales_on_input=*/false,
-                /*use_deep_seek_fp8=*/false, gemm1_lora_delta.has_value())
-          .to_ffi();
-    } catch (tensorrt_llm::kernels::NoLoadableKernelError const&) {
-      if (attempt + 1 == tile_order.size()) {
-        throw;
-      }
-      reportTileFallbackOnce(hidden_states.device().device_id, resolved_tile_N,
-                             tile_order[attempt + 1]);
-    } catch (tensorrt_llm::kernels::NoValidConfigError const&) {
-      // No config of this tile fits the problem shape: try the next tile, as for unloadable cubins.
-      if (attempt + 1 == tile_order.size()) {
-        throw;
-      }
-      reportTileFallbackOnce(hidden_states.device().device_id, resolved_tile_N,
-                             tile_order[attempt + 1]);
-    }
+        << "DA body preparation does not accept an existing body workspace.";
+    auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
+    auto tensors = selected_launcher->prepare_da_body(routing, config).to_ffi();
+    return Array<Optional<Tensor>>(tensors.begin(), tensors.end());
   }
-  // Unreachable: the loop returns or rethrows. Added to suppress compiler warning.
-  return Array<Optional<Tensor>>();
+  if (!da_routing_metadata.empty()) {
+    auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
+    auto const body = FP4DABodyBuffers::from_ffi(da_body_workspace);
+    selected_launcher->run_da_body(routing, body, config, enable_pdl);
+    if (do_finalize) {
+      return {selected_launcher->finalized_da_output()};
+    }
+    return {body.gemm2_output, routing.expert_weights, routing.expanded_idx_to_permuted_idx};
+  }
+  TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
+      << "A DA body workspace requires routing metadata.";
+
+  // Run the launcher - it will create its own runner internally
+  return selected_launcher
+      ->run(config, enable_pdl,
+            /*use_routing_scales_on_input=*/false,
+            /*use_deep_seek_fp8=*/false, gemm1_lora_delta.has_value())
+      .to_ffi();
 }
 
 Array<Optional<Tensor>> trtllm_mxint4_block_scale_moe(
@@ -6979,21 +6703,6 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
   return Array<Array<int64_t>>();
 }
 
-/// Return the complete NVFP4 tactics that can run localized across two locality domains with
-/// sm_count SMs each (see trtllm_fp4_block_scale_moe's localized_* arguments).
-Array<Array<int64_t>> trtllm_get_valid_localized_moe_configs(
-    int64_t const top_k, int64_t const hidden_size, int64_t const intermediate_size,
-    int64_t const num_local_experts, int64_t const num_experts, int64_t const num_tokens,
-    int64_t const act_type, int64_t const sm_count) {
-  auto const activation_type = validateAndCastActivationType(act_type);
-  TVM_FFI_ICHECK(isGatedActivation(activation_type))
-      << "Localized MoE requires a gated activation.";
-  TVM_FFI_ICHECK(sm_count > 0) << "sm_count must be positive.";
-  return FP4BlockScaleLauncher::getValidLocalizedConfigs(top_k, hidden_size, intermediate_size,
-                                                         num_local_experts, num_experts, num_tokens,
-                                                         act_type, sm_count);
-}
-
 /// Return valid complete tactics decomposed into tile-N, FC1, FC2, and anchor coordinates.
 Array<Array<int64_t>> trtllm_get_valid_moe_factorizations(
     int64_t const dtype_act_, int64_t const dtype_weights_,
@@ -7048,20 +6757,9 @@ Array<Array<int64_t>> trtllm_get_valid_moe_factorizations(
       runnerIt = runners.emplace(tileN, std::move(runner)).first;
     }
     auto const components = runnerIt->second->getConfigComponents(configIndex);
-    int64_t anchorIndex = -1;
-    try {
-      anchorIndex = runnerIt->second->getDefaultValidConfigIndex(
-          top_k, hidden_size, intermediate_size, num_local_experts, num_tokens,
-          hidden_size_output > 0 ? hidden_size_output : hidden_size);
-    } catch (tensorrt_llm::kernels::NoLoadableKernelError const&) {
-      // No kernel of this tile loads on this driver (GitHub #5322): the tile has no anchor, so its
-      // rows are left out and the factorized tactic space never sees the tile; the launch falls
-      // back to another tile through tileFallbackOrder().
-      continue;
-    } catch (tensorrt_llm::kernels::NoValidConfigError const&) {
-      // No config of this tile fits the problem shape: the tile has no anchor either.
-      continue;
-    }
+    auto const anchorIndex = runnerIt->second->getDefaultValidConfigIndex(
+        top_k, hidden_size, intermediate_size, num_local_experts, num_tokens,
+        hidden_size_output > 0 ? hidden_size_output : hidden_size);
     result.push_back({tileN, configIndex, components.gemm1Config, components.gemm2Config,
                       configIndex == anchorIndex ? 1 : 0});
   }
@@ -7470,8 +7168,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp8_block_scale_moe, trtllm_fp8_block_scale
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp4_block_scale_moe, trtllm_fp4_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mxint4_block_scale_moe, trtllm_mxint4_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_moe_configs, trtllm_get_valid_moe_configs);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_localized_moe_configs,
-                              trtllm_get_valid_localized_moe_configs);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_moe_factorizations,
                               trtllm_get_valid_moe_factorizations);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_allocate_canonical_routing,

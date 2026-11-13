@@ -16,10 +16,6 @@
 #ifndef FLASHINFER_MATH_CUH_
 #define FLASHINFER_MATH_CUH_
 
-#ifdef _WIN32
-typedef unsigned short ushort;
-#endif
-
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 

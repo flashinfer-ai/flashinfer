@@ -63,23 +63,7 @@ using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 template <bool FLAG, class ReturnType, class... Args>
 std::decay_t<ReturnType> construct_if_true(Args&&... args) {
   if constexpr (FLAG) {
-    // 1. Try standard aggregate initialization first
-    if constexpr (std::is_constructible_v<ReturnType, Args...>) {
-      return ReturnType{std::forward<Args>(args)...};
-    }
-    // 2. Workaround for OSS CUTLASS 3 LinearCombination Arguments
-    // Explicitly route the expert_scales pointer array to the 5th field (alpha_ptr_array)
-    else if constexpr (sizeof...(Args) == 1) {
-      return ReturnType{/* alpha */ 1.0f,
-                        /* beta */ 0.0f,
-                        /* alpha_ptr */ nullptr,
-                        /* beta_ptr */ nullptr,
-                        /* alpha_ptr_array */ (std::forward<Args>(args), ...)};
-    }
-    // 3. Fallback (preserves original compiler behavior if arguments don't match)
-    else {
-      return ReturnType{std::forward<Args>(args)...};
-    }
+    return ReturnType{std::forward<Args>(args)...};
   } else {
     return ReturnType{};
   }
@@ -771,20 +755,6 @@ using namespace cutlass::epilogue;
       TLLM_CHECK_WITH_INFO(calculated_ws_size <= tma_ws_input.gemm_workspace_size,                                                                                                                                                                                                                                      \
                            "Workspace is size %zu but only %zu were allocated",                                                                                                                                                                                                                                         \
                            calculated_ws_size, tma_ws_input.gemm_workspace_size);                                                                                                                                                                                                                                       \
-                                                                                                                                                                                                                                                                                                                        \
-      /* The kernel's shared memory must fit the active device (99 KiB on SM120 / SM121). */                                                                                                                                                                                                                            \
-      {                                                                                                                                                                                                                                                                                                                 \
-        int smem_size = static_cast<int>(sizeof(typename GemmGrouped::GemmKernel::SharedStorage));                                                                                                                                                                                                                      \
-        int device_ = 0;                                                                                                                                                                                                                                                                                                \
-        tensorrt_llm::common::check_cuda_error(cudaGetDevice(&device_));                                                                                                                                                                                                                                                \
-        int maxSmem_ = 0;                                                                                                                                                                                                                                                                                               \
-        tensorrt_llm::common::check_cuda_error(                                                                                                                                                                                                                                                                         \
-            cudaDeviceGetAttribute(&maxSmem_, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_));                                                                                                                                                                                                                       \
-        TLLM_CHECK_WITH_INFO(                                                                                                                                                                                                                                                                                           \
-            smem_size <= maxSmem_,                                                                                                                                                                                                                                                                                      \
-            "MoE grouped GEMM requires %d bytes shared memory but device supports %d", smem_size,                                                                                                                                                                                                                       \
-            maxSmem_);                                                                                                                                                                                                                                                                                                  \
-      }                                                                                                                                                                                                                                                                                                                 \
                                                                                                                                                                                                                                                                                                                         \
       auto can_implement = gemm.can_implement(args);                                                                                                                                                                                                                                                                    \
       TLLM_CHECK_WITH_INFO(can_implement == cutlass::Status::kSuccess,                                                                                                                                                                                                                                                  \

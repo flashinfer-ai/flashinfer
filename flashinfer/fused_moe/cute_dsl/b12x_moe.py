@@ -110,6 +110,16 @@ def _prepare_ep_expert_map(
     return expert_map
 
 
+# Selectable backends of :func:`b12x_fused_moe`. "b12x" is the stock
+# micro/static/dynamic dispatch; "specialized" is the agent-generated
+# shape-specialized SM120 W4A16 backend (see
+# flashinfer.fused_moe.specialized_moe_nvfp4_w4a16_sm120); "auto" picks
+# "specialized" only on its allowlisted shapes/contract and the stock path
+# everywhere else. An explicitly selected backend is never silently
+# swapped.
+BACKENDS = ("auto", "specialized", "b12x")
+
+
 @supported_compute_capability([120, 121])
 @flashinfer_api(trace=b12x_fused_moe_trace)
 def b12x_fused_moe(
@@ -138,6 +148,7 @@ def b12x_fused_moe(
     activation_precision: str = "fp4",
     quant_mode: Optional[str] = None,
     source_format: str = "modelopt",
+    backend: str = "auto",
 ) -> torch.Tensor:
     r"""Run fused MoE on SM120/SM121 using b12x CuTe-DSL kernels.
 
@@ -216,6 +227,14 @@ def b12x_fused_moe(
     activation_precision : str
         Backward-compatible alias for ``quant_mode``.  ``"fp4"`` selects
         ``quant_mode="nvfp4"``; ``"bf16"`` selects ``quant_mode="w4a16"``.
+    backend : str
+        ``"auto"`` (default) routes to the ``"specialized"`` agent-generated
+        SM120 W4A16 backend only on its allowlisted shapes/contract and the
+        stock ``"b12x"`` dispatch everywhere else. ``"b12x"`` forces the
+        stock path. ``"specialized"`` raises when the call cannot be served
+        (an explicitly selected backend is never silently swapped).
+        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` disables the
+        specialized backend entirely.
     quant_mode : Optional[str]
         Quantization mode, ``"nvfp4"`` / ``"w4a4"``, ``"mxfp4"``, or
         ``"w4a16"``. When set, selects the backend and internal workspace
@@ -298,6 +317,40 @@ def b12x_fused_moe(
             dtype=output_dtype,
             device=x.device,
         )
+
+    if backend not in BACKENDS:
+        raise ValueError(
+            f"backend must be one of {BACKENDS}, got {backend!r}")
+    if backend in ("auto", "specialized"):
+        from .blackwell_sm12x.moe_dispatch import _normalize_quant_mode
+        from .. import specialized_moe_nvfp4_w4a16_sm120 as _spec
+
+        if num_local_experts == num_experts and expert_map is None:
+            ok, reasons = _spec.specialized_support_reasons(
+                x, w1_weight, w1_weight_sf, w2_weight, w2_weight_sf,
+                token_selected_experts, token_final_scales, num_experts,
+                top_k, activation=activation,
+                quant_mode=_normalize_quant_mode(quant_mode,
+                                                 activation_precision),
+                source_format=source_format,
+            )
+        else:
+            ok, reasons = False, ["expert_parallelism"]
+        if ok:
+            _spec.dispatch_stats["specialized"] += 1
+            return _spec.run_specialized_moe_nvfp4_w4a16(
+                x, w1_weight, w1_weight_sf, w1_alpha,
+                w2_weight, w2_weight_sf, w2_alpha,
+                token_selected_experts, token_final_scales, output,
+            )
+        _spec.fallback_reasons.append(tuple(reasons))
+        if backend == "specialized":
+            # never silently swapped to another fused backend; this module
+            # has no composable fallback of its own
+            raise ValueError(
+                "backend='specialized' cannot serve this call: "
+                + ", ".join(reasons))
+        _spec.dispatch_stats["b12x"] += 1
 
     from .blackwell_sm12x.moe_dispatch import launch_sm120_moe
 

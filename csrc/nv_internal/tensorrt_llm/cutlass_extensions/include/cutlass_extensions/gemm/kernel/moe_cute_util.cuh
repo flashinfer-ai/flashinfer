@@ -152,12 +152,9 @@ CUTE_DEVICE auto util_convert_type(cute::Tensor<Engine, Layout> const& tensor) {
   using From_type = typename Engine::value_type;
   constexpr int numel = decltype(cute::size(tensor))::value;
   cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
-  static_assert(cute::cosize_v<Layout> == numel, "util_convert_type requires a contiguous tensor");
+  // HACK: this requires tensor to be "contiguous"
   auto frag = convert_op(*reinterpret_cast<cutlass::Array<From_type, numel> const*>(tensor.data()));
-  // Copy into a tensor that owns its storage: a view over `frag` would dangle on return.
-  auto converted = cute::make_tensor<To_type>(tensor.layout());
-  cute::copy(cute::make_tensor(frag.data(), tensor.layout()), converted);
-  return converted;
+  return cute::make_tensor(cute::make_rmem_ptr<To_type>(&frag), tensor.layout());
 }
 
 template <typename TiledCopy, typename Engine0, typename Layout0, typename Engine1,

@@ -48,6 +48,7 @@ from .operands import (
     IN_DTYPE,
     Q_ROWS,
     REGS_OTHER,
+    REGS_SOFTMAX,
     TMEM_COLS,
     StaticPlan,
     TmaSetup,
@@ -162,7 +163,6 @@ class AttentionKernel:
             s_p: cute.struct.Align[
                 cute.struct.MemRange[Float32, self.n_wg * 3 * 32 * 16], 16
             ]
-            s_mx: cute.struct.MemRange[Float32, 2 * st.n_slices * Q_ROWS]
             sOm: cute.struct.Align[
                 cute.struct.MemRange[
                     Float32, st.n_q * Q_ROWS * st.D if st.om_smem else 4
@@ -367,9 +367,6 @@ class AttentionKernel:
         s_p_all = storage.s_p.get_tensor(
             cute.make_layout((st.n_wg, 3, 32, 16))
         )  # per warpgroup: the P slices of its warps 1..3
-        s_mx = storage.s_mx.get_tensor(
-            cute.make_layout((2, st.n_slices, Q_ROWS))
-        )  # the key slices' row-maximum partials, exchanged between the softmax warpgroups (two tile parities)
         qk_thr_mma = qk_tiled_mma.get_slice(0)
         qks_thr_mma = qks_tiled_mma.get_slice(0)
         pv_thr_mma = pv_tiled_mma.get_slice(0)
@@ -455,7 +452,7 @@ class AttentionKernel:
             tStS, tOtOc, tOtOm, tOrP = tmem_views(
                 st, qk_thr_mma, pv_thr_mma, p_tmem_layout, tmem_ptr
             )
-            # the S accumulator per ring slot of K: the whole S (one slot per tile; two 64-column halves with half-tile slots); stage 0
+            # the S accumulator per ring slot of K: the whole S (one slot per tile) or its two 64-column halves (half-tile slots); stage 0
             # (a tile's stage adds stage * tmem_s_stride columns: mma.py)
             ss_shape = qks_thr_mma.partition_shape_C((Q_ROWS, st.slot_keys))
             ss_layout = qks_thr_mma.make_fragment_C(ss_shape).layout
@@ -558,10 +555,7 @@ class AttentionKernel:
             warp_idx < R.correction_warps[0]
         ):  # the softmax warpgroups: one code copy, warpgroup k = key slice k (dynamic)
             k = cute.arch.make_warp_uniform(warp_idx // 4)
-            if cutlass.const_expr(R.regs_softmax > R.regs_launch):
-                cute.arch.setmaxregister_increase(R.regs_softmax)
-            else:
-                cute.arch.setmaxregister_decrease(R.regs_softmax)
+            cute.arch.setmaxregister_increase(REGS_SOFTMAX)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tStS, tOtOc, tOtOm, tOrP = tmem_views(
@@ -586,7 +580,6 @@ class AttentionKernel:
                         s_m,
                         s_r,
                         s_p_all,
-                        s_mx,
                         c,
                         nc,
                         window_left,
@@ -611,7 +604,6 @@ class AttentionKernel:
                         s_m,
                         s_r,
                         s_p_all,
-                        s_mx,
                         c,
                         nc,
                         window_left,

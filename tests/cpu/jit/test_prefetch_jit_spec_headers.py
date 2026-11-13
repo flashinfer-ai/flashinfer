@@ -18,8 +18,7 @@ pytestmark = pytest.mark.cpu_only
 @pytest.fixture
 def prefetch(monkeypatch):
     spec = importlib.util.spec_from_file_location(
-        "_test_prefetch_headers",
-        REPO_ROOT / "scripts/infra/prefetch_jit_spec_headers.py",
+        "_test_prefetch_headers", REPO_ROOT / "scripts/prefetch_jit_spec_headers.py"
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -123,7 +122,7 @@ run_provider_spec_lint "$@"
             "-c",
             script,
             "test",
-            str(REPO_ROOT / "scripts/infra/jit_cache_build_common.sh"),
+            str(REPO_ROOT / "scripts/jit_cache_build_common.sh"),
             str(concurrency),
             *providers,
         ],
