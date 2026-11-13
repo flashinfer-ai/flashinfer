@@ -32,6 +32,7 @@ def _module(
     heads_per_group: int,
     max_window: int,
     philox_rounds: int,
+    sr_rng: str,
 ):
     return gen_replayssm_materialize_module(
         state_dtype,
@@ -42,6 +43,7 @@ def _module(
         heads_per_group,
         max_window,
         philox_rounds,
+        sr_rng,
     ).build_and_load()
 
 
@@ -81,6 +83,7 @@ def _replayssm_materialize(
     pad_slot_id: int,
     rand_seed: Optional[torch.Tensor],
     philox_rounds: int,
+    sr_rng: str,
 ) -> None:
     """Internal torch.library wrapper for ReplaySSM materialization.
 
@@ -97,6 +100,7 @@ def _replayssm_materialize(
         heads_per_group,
         max_window,
         philox_rounds,
+        sr_rng,
     ).replayssm_materialize(
         state_ptrs,
         state_slot_strides,
@@ -155,6 +159,7 @@ def _replayssm_materialize_fake(
     pad_slot_id: int,
     rand_seed: Optional[torch.Tensor],
     philox_rounds: int,
+    sr_rng: str,
 ) -> None:
     """Fake implementation for torch.compile() metadata propagation."""
     pass
@@ -191,6 +196,7 @@ def replayssm_materialize(
     pad_slot_id: int = -1,
     rand_seed: Optional[torch.Tensor] = None,
     philox_rounds: int = 0,
+    sr_rng: str = "philox",
     dependency_inputs: Optional[list[torch.Tensor]] = None,
     dependency_outputs: Optional[list[torch.Tensor]] = None,
 ) -> None:
@@ -291,10 +297,22 @@ def replayssm_materialize(
         Slot sentinel to skip, matching :func:`flashinfer.mamba.checkpointing_ssu`.
         Defaults to ``-1``; zero is a valid slot unless passed here explicitly.
     rand_seed : Optional[torch.Tensor]
-        One-element CUDA int64 seed required when ``philox_rounds > 0``.
+        Contiguous 1D CUDA int64 seed tensor required for stochastic rounding.
+        Philox uses one base seed and derives an independent stream per layer.
+        Shared-seed mode requires one fresh seed per layer, shape ``(L,)``,
+        each with uniform low 32 bits.
     philox_rounds : int
-        JIT number of Philox stochastic-rounding rounds. Zero disables
-        stochastic rounding.
+        JIT number of Philox stochastic-rounding rounds (default 0). Zero
+        disables stochastic rounding under the default Philox policy.
+        Shared-seed mode does not run Philox: zero is normalized to 10,
+        positive counts are retained for JIT compatibility, and negative
+        values are rejected.
+    sr_rng : str
+        ``"philox"`` (default) or ``"shared_seed"``. Shared-seed mode requires
+        a seed per layer, supports FP16/FP8 E4M3/INT8 state, and deliberately
+        correlates rounding across a layer's elements. Model-quality
+        equivalence has not been validated. Caller policy is never selected
+        by a launch tuner.
     dependency_inputs : Optional[list[torch.Tensor]]
         Backing CUDA tensors read indirectly through pointer tables: typically
         the source state and scale storage selected by ``src_slots`` through
@@ -381,6 +399,27 @@ def replayssm_materialize(
         or active_request_indices.numel() != batch
     ):
         raise ValueError("slot and metadata shapes are inconsistent")
+    if sr_rng not in ("philox", "shared_seed"):
+        raise ValueError("sr_rng must be 'philox' or 'shared_seed'")
+    if sr_rng == "shared_seed":
+        if philox_rounds < 0:
+            raise ValueError("shared_seed requires nonnegative philox_rounds")
+        if state_dtype not in (torch.float16, torch.float8_e4m3fn, torch.int8):
+            raise ValueError("shared_seed requires FP16, FP8 E4M3 or INT8 state")
+        philox_rounds = philox_rounds or 10
+    if philox_rounds > 0:
+        seed_count = layers if sr_rng == "shared_seed" else 1
+        if (
+            not isinstance(rand_seed, torch.Tensor)
+            or rand_seed.dtype != torch.int64
+            or rand_seed.device != src_slots.device
+            or rand_seed.dim() != 1
+            or not rand_seed.is_contiguous()
+            or rand_seed.numel() != seed_count
+        ):
+            raise ValueError(
+                f"rand_seed must be a contiguous CUDA int64 tensor of shape ({seed_count},)"
+            )
     if dependency_inputs is not None and not all(
         isinstance(tensor, torch.Tensor) and tensor.is_cuda
         for tensor in dependency_inputs
@@ -413,4 +452,5 @@ def replayssm_materialize(
         pad_slot_id,
         rand_seed,
         philox_rounds,
+        sr_rng,
     )

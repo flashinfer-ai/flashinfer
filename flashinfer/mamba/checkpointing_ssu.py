@@ -70,6 +70,7 @@ def _get_module(
     num_groups: int,
     philox_rounds: int = 0,
     enable_pdl: bool = False,
+    sr_rng: str = "philox",
 ):
     return gen_checkpointing_ssu_module(
         state_dtype,
@@ -87,6 +88,7 @@ def _get_module(
         num_groups,
         philox_rounds,
         enable_pdl,
+        sr_rng=sr_rng,
     ).build_and_load()
 
 
@@ -475,6 +477,8 @@ class CheckpointingSSURunner(TunableRunner):
         inputs: list[Any],
         tactic: _CheckpointingSSUTactic | int = -1,
         do_preparation: bool = False,
+        main_pipeline_stages: int = 0,
+        main_ctas_per_sm: int = 0,
         **kwargs: Any,
     ) -> None:
         del kwargs
@@ -485,7 +489,6 @@ class CheckpointingSSURunner(TunableRunner):
         if tactic == -1:
             algorithm = self._resolve_fallback_algorithm(inputs)
             precompute_heads_per_cta = self._precompute_heads_per_cta
-            main_pipeline_stages = main_ctas_per_sm = 0
             d_split = self._resolve_d_split(inputs, algorithm)
         else:
             if not isinstance(tactic, tuple) or len(tactic) != 4:
@@ -610,6 +613,7 @@ def _checkpointing_ssu(
     max_window: int,
     heads_per_group: int,
     num_groups: int,
+    sr_rng: str = "philox",
 ) -> None:
     """Internal function registered with torch.library for torch.compile() support."""
     module_base_args = (
@@ -628,6 +632,7 @@ def _checkpointing_ssu(
         num_groups,
         philox_rounds,
         enable_pdl,
+        sr_rng,
     )
     inputs = [
         state,
@@ -692,7 +697,12 @@ def _checkpointing_ssu(
         )
         runner(inputs, tactic=tactic)
     else:
-        runner(inputs, tactic=-1)
+        runner(
+            inputs,
+            tactic=-1,
+            main_pipeline_stages=main_pipeline_stages,
+            main_ctas_per_sm=main_ctas_per_sm,
+        )
 
 
 @register_fake_op("flashinfer::checkpointing_ssu")
@@ -740,6 +750,7 @@ def _checkpointing_ssu_fake(
     max_window: int,
     heads_per_group: int,
     num_groups: int,
+    sr_rng: str = "philox",
 ) -> None:
     """Fake implementation for torch.compile() meta tensor propagation."""
     pass
@@ -777,6 +788,9 @@ def checkpointing_ssu(
     cb_old: Optional[torch.Tensor] = None,
     precompute_heads_per_cta: int = 0,
     algorithm: str = "auto",
+    sr_rng: str = "philox",
+    main_pipeline_stages: int = 0,
+    main_ctas_per_sm: int = 0,
 ) -> torch.Tensor:
     """Checkpointing SSU with MTP replay using matmul-based parallel token processing.
 
@@ -832,7 +846,18 @@ def checkpointing_ssu(
     rand_seed : Optional[torch.Tensor]
         Single-element int64 CUDA tensor for stochastic rounding seed.
     philox_rounds : int
-        Philox PRNG rounds for stochastic rounding (default 10).
+        Philox rounds for stochastic rounding (default 10). Under
+        sr_rng='philox', omitting rand_seed selects RN. Shared-seed mode does
+        not run Philox: zero is normalized to 10, positive counts are retained
+        for JIT compatibility, and negative values are rejected.
+    sr_rng : str
+        'philox' (default) preserves the original random sequence.
+        'shared_seed' reuses the low 32 seed bits for all checkpoint
+        conversions; the random words are correlated across elements. The low
+        32 bits must be uniform and fresh per invocation, with each layer using
+        its own seed. Requires a seed and FP16, FP8 E4M3 or INT8 state.
+        No Philox is run
+        in shared_seed mode.
     d_split : Optional[int]
         Per-head DIM split factor.  This is only exposed for benchmarking.
         Do not use it cause it will make things slow.
@@ -894,11 +919,30 @@ def checkpointing_ssu(
         A-fragment consumed on the no-write (replay) path, stored as
         [warp lane, register].  Must be provided iff ``cb_scaled`` is.
 
+    main_pipeline_stages : int
+        Two-kernel MAIN pipeline depth: 0 preserves the launcher heuristic;
+        1 or 2 explicitly selects the depth. A positive MAIN control forces
+        the two-kernel path, requires its scratch trio, and is incompatible
+        with ``algorithm="monolith"``.
+    main_ctas_per_sm : int
+        Two-kernel MAIN grid cap per SM: 0 preserves the launcher heuristic;
+        positive values up to 2147483647 select the cap. The grid is capped
+        at the total work. The autotuner currently searches values 1–32.
+
     Returns
     -------
     out : torch.Tensor
         Output tensor, shape (batch, T, nheads, dim).
     """
+    if type(main_pipeline_stages) is not int or main_pipeline_stages not in (0, 1, 2):
+        raise ValueError("main_pipeline_stages must be 0 (heuristic), 1, or 2")
+    if type(main_ctas_per_sm) is not int or not 0 <= main_ctas_per_sm <= 2147483647:
+        raise ValueError("main_ctas_per_sm must be an integer in [0, 2147483647]")
+    if main_pipeline_stages or main_ctas_per_sm:
+        if algorithm not in ("auto", "two-kernel"):
+            raise ValueError("positive MAIN controls require auto or two-kernel")
+        algorithm = "two-kernel"
+
     # Validate quantized state ↔ state_scale combo.
     # int8 and fp8_e4m3fn use a per-(cache, head, dim) decode-scale tensor
     # (QUANT_MAX = 127 and 448 respectively).  Non-quantized dtypes must NOT
@@ -936,6 +980,19 @@ def checkpointing_ssu(
             f"state_scale must be None for non-quantized state.dtype={state.dtype}"
             f" (allowed quantized dtypes: {_quantized_state_dtypes})"
         )
+
+    if sr_rng not in ("philox", "shared_seed"):
+        raise ValueError(f"sr_rng must be 'philox' or 'shared_seed', got {sr_rng!r}")
+    if sr_rng == "shared_seed":
+        if rand_seed is None:
+            raise ValueError("shared_seed requires rand_seed")
+        if philox_rounds < 0:
+            raise ValueError("shared_seed requires nonnegative philox_rounds")
+        if state.dtype not in (torch.float16, torch.float8_e4m3fn, torch.int8):
+            raise ValueError(
+                "shared_seed SR supports FP16, FP8 E4M3 and INT8 state only"
+            )
+        philox_rounds = philox_rounds or 10
 
     # Validate rand_seed / philox_rounds
     if rand_seed is not None:
@@ -1103,11 +1160,12 @@ def checkpointing_ssu(
         cumAdt_vec,
         cb_old,
         precompute_heads_per_cta,
-        0,
-        0,
+        main_pipeline_stages,
+        main_ctas_per_sm,
         algorithm_int,
         enable_pdl,
         philox_rounds=philox_rounds,
+        sr_rng=sr_rng,
         state_dtype=state.dtype,
         input_dtype=x.dtype,
         dt_dtype=dt.dtype,

@@ -560,7 +560,7 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
 // two-kernel main runs its own in-register recompute (warp_scan_old_cumAdt).
 __device__ __forceinline__ void load_old_dt_cumAdt(CheckpointingSsuParams const& params, int lane,
                                                    int64_t cache_slot, int ring_start, int head,
-                                                   int count, float A_val,
+                                                   int count, int live_count, float A_val,
                                                    float* __restrict__ dt_dst,
                                                    float* __restrict__ ca_dst) {
   auto const* __restrict__ dt_cache_ptr = reinterpret_cast<float const*>(params.dt_cache);
@@ -570,7 +570,7 @@ __device__ __forceinline__ void load_old_dt_cumAdt(CheckpointingSsuParams const&
       cache_slot * params.dt_cache_stride_seq + (int64_t)(head * (int)params.dt_cache_stride_head);
   int ring_row = ring_start + lane;
   if (ring_row >= params.ring_buffer_len) ring_row -= params.ring_buffer_len;
-  float dt_v = (lane < count) ? dt_cache_ptr[dt_base + ring_row] : 0.f;
+  float dt_v = (lane < count && lane < live_count) ? dt_cache_ptr[dt_base + ring_row] : 0.f;
   // Inclusive scan over the first 16 lanes (count ≤ MAX_WINDOW ≤ 16).
   float scan = dt_v;
 #pragma unroll
@@ -625,7 +625,7 @@ template <typename input_t, typename dt_t, typename state_t, int NPREDICTED, int
           int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_pre_pdl_wait_data(
     SmemT& smem, CheckpointingSsuParams const& params, int lane, int warp, int d_tile, int head,
-    int group_idx, int64_t cache_slot, int ring_start, float A_val, float dt_bias_val,
+    int group_idx, int64_t cache_slot, int ring_start, int prev_k, float A_val, float dt_bias_val,
     int64_t dt_seq_base, int64_t z_seq_base, int seq_len) {
   constexpr int INPUT_PACK = 16 / sizeof(input_t);  // 8 for bf16
   static_assert(DSTATE % INPUT_PACK == 0, "DSTATE must be divisible by input pack size");
@@ -677,13 +677,13 @@ __device__ __forceinline__ void load_pre_pdl_wait_data(
   // deterministic.  VALID_ROWS = MAX_WINDOW (cache rows). ──
   load_ring_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, old_B_ptr + oB_base,
                                               (int)params.B_cache_stride_pos, lane, ring_start,
-                                              params.ring_buffer_len);
+                                              params.ring_buffer_len, prev_k);
 
   // ── old_x: redundant on all 4 warps (small, simpler than partitioning).
   // VALID_ROWS = MAX_WINDOW (cache rows). ──
   load_ring_tile_async<OxShape, MAX_WINDOW>(smem.old_x, old_x_ptr + ox_base,
                                             (int)params.x_cache_stride_pos, lane, ring_start,
-                                            params.ring_buffer_len);
+                                            params.ring_buffer_len, prev_k);
 
   // ── z: W3 only (Phase-2 read, final __syncthreads makes it visible).
   // Sourced from in_proj — not from conv1d — so safe to issue pre-wait. ──
@@ -708,8 +708,8 @@ __device__ __forceinline__ void load_pre_pdl_wait_data(
   // dt_proc: load up to NPREDICTED lanes (new-token scalars from in_proj).
   // Synchronous LDG + plain smem stores — no cp.async.  Writes from 4
   // warps to the same slots are idempotent (same payloads). ──
-  load_old_dt_cumAdt(params, lane, cache_slot, ring_start, head, MAX_WINDOW, A_val, smem.old_dt,
-                     smem.old_cumAdt);
+  load_old_dt_cumAdt(params, lane, cache_slot, ring_start, head, MAX_WINDOW, prev_k, A_val,
+                     smem.old_dt, smem.old_cumAdt);
   // dt → softplus → smem.dt_proc.  Under varlen the active lane range is
   // `[0, seq_len)`; lanes `[seq_len, NPREDICTED)` are left uninitialized —
   // `compute_cumAdt` will scan over them and produce garbage in the
@@ -816,8 +816,9 @@ template <typename input_t, typename dt_t, typename state_t, int NPREDICTED, int
           int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams const& params,
                                           int lane, int warp, int d_tile, int head, int group_idx,
-                                          int64_t cache_slot, int ring_start, float A_val,
-                                          float dt_bias_val, int64_t outer, int seq_len) {
+                                          int64_t cache_slot, int ring_start, int prev_k,
+                                          float A_val, float dt_bias_val, int64_t outer,
+                                          int seq_len) {
   constexpr int INPUT_PACK = 16 / sizeof(input_t);  // 8 for bf16
   static_assert(DSTATE % INPUT_PACK == 0, "DSTATE must be divisible by input pack size");
   static_assert(D_PER_CTA % INPUT_PACK == 0, "D_PER_CTA must be divisible by input pack size");
@@ -872,10 +873,10 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
 
   load_ring_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, old_B_ptr + oB_base,
                                               (int)params.B_cache_stride_pos, lane, ring_start,
-                                              params.ring_buffer_len);
+                                              params.ring_buffer_len, prev_k);
   load_ring_tile_async<OxShape, MAX_WINDOW>(smem.old_x, old_x_ptr + ox_base,
                                             (int)params.x_cache_stride_pos, lane, ring_start,
-                                            params.ring_buffer_len);
+                                            params.ring_buffer_len, prev_k);
 
   if (warp == 2) {
     load_tile_async<XShape, NPREDICTED>(smem.x, x_ptr + x_base, params.x_stride_token, lane,
@@ -888,8 +889,8 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   }
 
   // ── Scalar loads (overlap with cp.async) + cumAdt cumsum ──
-  load_old_dt_cumAdt(params, lane, cache_slot, ring_start, head, MAX_WINDOW, A_val, smem.old_dt,
-                     smem.old_cumAdt);
+  load_old_dt_cumAdt(params, lane, cache_slot, ring_start, head, MAX_WINDOW, prev_k, A_val,
+                     smem.old_dt, smem.old_cumAdt);
   int64_t const dt_seq_base_local = outer * params.dt_stride_seq + head;
   if (lane < seq_len) {
     float dt_val = toFloat(dt_ptr[dt_seq_base_local + (int64_t)lane * params.dt_stride_token]);

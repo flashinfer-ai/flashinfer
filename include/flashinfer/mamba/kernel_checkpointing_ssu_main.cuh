@@ -140,7 +140,7 @@ __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams co
       if (warp == 1)
         load_ring_tile_async<OldBShape, MAX_WINDOW>(old_B_slot, old_B_ptr + oB_base,
                                                     (int)params.B_cache_stride_pos, lane,
-                                                    ring_start, params.ring_buffer_len);
+                                                    ring_start, params.ring_buffer_len, prev_k);
   }
   if ((must_checkpoint || prev_k > 0) && warp == 2 && lane < MAX_WINDOW) {
     // dt rows from the RING — previous-step rows only, so PDL-safe on the
@@ -153,7 +153,11 @@ __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams co
                             (int64_t)(head * (int)params.dt_cache_stride_head);
     int ring_row = ring_start + lane;
     if (ring_row >= params.ring_buffer_len) ring_row -= params.ring_buffer_len;
-    __pipeline_memcpy_async(&old_dt_slot[lane], &dtc_ptr[dt_base + ring_row], sizeof(float));
+    if (lane < prev_k) {
+      __pipeline_memcpy_async(&old_dt_slot[lane], &dtc_ptr[dt_base + ring_row], sizeof(float));
+    } else {
+      old_dt_slot[lane] = 0.f;
+    }
   }
   if (warp == 3 && z_ptr) {
     int64_t const z_base = outer * params.z_stride_seq + (int64_t)(head * DIM + d_tile_off);

@@ -88,7 +88,14 @@ def get_checkpointing_ssu_uri(
     num_groups: int,
     philox_rounds: int = 0,
     enable_pdl: bool = False,
+    sr_rng: str = "philox",
 ) -> str:
+    if sr_rng == "shared_seed":
+        if philox_rounds < 0:
+            raise ValueError("shared_seed requires nonnegative philox_rounds")
+        if state_dtype not in (torch.float16, torch.float8_e4m3fn, torch.int8):
+            raise ValueError("shared_seed requires FP16, FP8 E4M3 or INT8 state")
+        philox_rounds = philox_rounds or 10
     s = _filename_safe_dtype_map
     uri = (
         f"checkpointing_ssu_"
@@ -103,6 +110,10 @@ def get_checkpointing_ssu_uri(
         uri += f"_pr_{philox_rounds}"
     if enable_pdl:
         uri += "_pdl"
+    if sr_rng == "shared_seed":
+        uri += "_sr_shared_seed"
+    elif sr_rng != "philox":
+        raise ValueError(f"unknown SR random policy: {sr_rng!r}")
     return uri
 
 
@@ -123,7 +134,12 @@ def gen_checkpointing_ssu_module(
     philox_rounds: int = 0,
     enable_pdl: bool = False,
     extra_cuda_cflags: list = None,
+    sr_rng: str = "philox",
 ) -> JitSpec:
+    if sr_rng == "shared_seed":
+        if philox_rounds < 0:
+            raise ValueError("shared_seed requires nonnegative philox_rounds")
+        philox_rounds = philox_rounds or 10
     uri = get_checkpointing_ssu_uri(
         state_dtype,
         input_dtype,
@@ -140,6 +156,7 @@ def gen_checkpointing_ssu_module(
         num_groups,
         philox_rounds,
         enable_pdl,
+        sr_rng,
     )
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     os.makedirs(gen_directory, exist_ok=True)
@@ -189,5 +206,7 @@ def gen_checkpointing_ssu_module(
     return gen_jit_spec(
         uri,
         source_paths,
-        extra_cuda_cflags=_arch_flags() + (extra_cuda_cflags or []),
+        extra_cuda_cflags=_arch_flags()
+        + (extra_cuda_cflags or [])
+        + (["-DFLASHINFER_MAMBA_SR_SHARED_SEED=1"] if sr_rng == "shared_seed" else []),
     )
