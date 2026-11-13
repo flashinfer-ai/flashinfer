@@ -40,12 +40,13 @@ namespace flashinfer::trtllm {
 // cumSeqLens[b] / TokenPerScale + b + t / TokenPerScale. The b padding prevents a trailing
 // partial block from being shared with the next sequence.
 template <typename Element, typename ElementQuantized, int TokenPerScale, int HeadDim, bool SmoothK,
-          int VStage>
+          int VStage, bool StridedInput = false>
 __global__ void sageQuantQkvKernel(int sumSeqLensQk, int batchSize, int const* ptrCuSeqLensQk,
                                    void const* ptrQk, void* ptrQkQuant, float* ptrQkScale,
                                    void const* ptrKForMean, float* ptrKMean, int sumSeqLensV,
                                    int numHeadsV, void const* ptrV, void* ptrVQuant,
-                                   float* ptrVScale) {
+                                   float* ptrVScale, int64_t qkInputTokenStride,
+                                   int64_t vInputTokenStride) {
   using namespace cute;
   using namespace cutlass;
   static_assert(!SmoothK || VStage != 0, "K smoothing requires V staging");
@@ -89,8 +90,20 @@ __global__ void sageQuantQkvKernel(int sumSeqLensQk, int batchSize, int const* p
         static_cast<int64_t>(headIdx) * (ceil_div(sumSeqLensQk, TokenPerScale) + batchSize - 1);
     int const tokenStride = numHeads * HeadDim;
     int64_t const seqHeadOffset = static_cast<int64_t>(seqBegin) * tokenStride + headIdx * HeadDim;
-    Tensor gQkSeq = make_tensor(reinterpret_cast<Element const*>(ptrQk) + seqHeadOffset,
-                                make_shape(Int<HeadDim>{}, seqLen), make_stride(_1{}, tokenStride));
+    // Keep the original packed layout type/address arithmetic in the default
+    // specialization. Only the opt-in specialization reads a dynamic stride.
+    auto gQkSeq = [&] {
+      if constexpr (StridedInput) {
+        int64_t const inputOffset =
+            static_cast<int64_t>(seqBegin) * qkInputTokenStride + headIdx * HeadDim;
+        return make_tensor(reinterpret_cast<Element const*>(ptrQk) + inputOffset,
+                           make_shape(Int<HeadDim>{}, seqLen),
+                           make_stride(_1{}, qkInputTokenStride));
+      } else {
+        return make_tensor(reinterpret_cast<Element const*>(ptrQk) + seqHeadOffset,
+                           make_shape(Int<HeadDim>{}, seqLen), make_stride(_1{}, tokenStride));
+      }
+    }();
     Tensor gQkSeqQuant =
         make_tensor(reinterpret_cast<ElementQuantized*>(ptrQkQuant) + seqHeadOffset,
                     make_shape(Int<HeadDim>{}, seqLen), make_stride(_1{}, tokenStride));
@@ -200,8 +213,17 @@ __global__ void sageQuantQkvKernel(int sumSeqLensQk, int batchSize, int const* p
     constexpr int threadsPerHead = HeadDim / BestVL;
     static_assert(HeadDim % BestVL == 0, "VL must divide HeadDim");
     static_assert(threadsPerHead <= 32, "One token block should never exceed warp scope");
-    Tensor gV = make_tensor(reinterpret_cast<Element const*>(ptrV),
-                            make_shape(VL{}, Int<threadsPerHead>{}, numHeadsV, sumSeqLensV));
+    auto gV = [&] {
+      if constexpr (StridedInput) {
+        return make_tensor(
+            reinterpret_cast<Element const*>(ptrV),
+            make_shape(VL{}, Int<threadsPerHead>{}, numHeadsV, sumSeqLensV),
+            make_stride(_1{}, VL{}, Int<threadsPerHead>{} * VL{}, vInputTokenStride));
+      } else {
+        return make_tensor(reinterpret_cast<Element const*>(ptrV),
+                           make_shape(VL{}, Int<threadsPerHead>{}, numHeadsV, sumSeqLensV));
+      }
+    }();
     Tensor gVQuant = make_tensor(reinterpret_cast<ElementQuantizedV*>(ptrVQuant),
                                  make_shape(VL{}, Int<threadsPerHead>{}, numHeadsV, sumSeqLensV));
     Tensor gVScale = make_tensor(ptrVScale, make_shape(VL{}, Int<threadsPerHead>{}, numHeadsV));
@@ -329,7 +351,7 @@ __global__ void sageQuantQkvKernel(int sumSeqLensQk, int batchSize, int const* p
   }
 }
 
-template <typename Element>
+template <typename Element, bool StridedInput = false>
 void invokeSageQuantQkvImpl(SageQuantParams const& params) {
   using namespace cute;
   FLASHINFER_CHECK(params.sumSeqLensQk > 0 && params.batchSize > 0 &&
@@ -352,12 +374,21 @@ void invokeSageQuantQkvImpl(SageQuantParams const& params) {
     constexpr int HeadDim_ = headDimStatic;
     constexpr int TokenBlockSize_ = tokenBlockSizeStatic;
     SageQuantParams kernelParams = params;
-    void* kernelArgs[] = {
-        &kernelParams.sumSeqLensQk, &kernelParams.batchSize,  &kernelParams.ptrCuSeqLensQk,
-        &kernelParams.ptrQk,        &kernelParams.ptrQkQuant, &kernelParams.ptrQkScale,
-        &kernelParams.ptrKForMean,  &kernelParams.ptrKMean,   &kernelParams.sumSeqLensV,
-        &kernelParams.numHeadsV,    &kernelParams.ptrV,       &kernelParams.ptrVQuant,
-        &kernelParams.ptrVScale};
+    void* kernelArgs[] = {&kernelParams.sumSeqLensQk,
+                          &kernelParams.batchSize,
+                          &kernelParams.ptrCuSeqLensQk,
+                          &kernelParams.ptrQk,
+                          &kernelParams.ptrQkQuant,
+                          &kernelParams.ptrQkScale,
+                          &kernelParams.ptrKForMean,
+                          &kernelParams.ptrKMean,
+                          &kernelParams.sumSeqLensV,
+                          &kernelParams.numHeadsV,
+                          &kernelParams.ptrV,
+                          &kernelParams.ptrVQuant,
+                          &kernelParams.ptrVScale,
+                          &kernelParams.qkInputTokenStride,
+                          &kernelParams.vInputTokenStride};
 
     auto launchKernel = [&](auto smoothKStatic, auto vStageStatic) {
       constexpr bool SmoothK_ = decltype(smoothKStatic)::value;
@@ -366,10 +397,11 @@ void invokeSageQuantQkvImpl(SageQuantParams const& params) {
       if (params.quantType == DATA_TYPE_E4M3) {
         kernelFunc = reinterpret_cast<void const*>(
             sageQuantQkvKernel<Element, cutlass::float_e4m3_t, TokenBlockSize_, HeadDim_, SmoothK_,
-                               VStage_>);
+                               VStage_, StridedInput>);
       } else if (params.quantType == DATA_TYPE_INT8) {
         kernelFunc = reinterpret_cast<void const*>(
-            sageQuantQkvKernel<Element, std::int8_t, TokenBlockSize_, HeadDim_, SmoothK_, VStage_>);
+            sageQuantQkvKernel<Element, std::int8_t, TokenBlockSize_, HeadDim_, SmoothK_, VStage_,
+                               StridedInput>);
       } else {
         FLASHINFER_ERROR("SageQuant Q/K output must be INT8 or FP8 E4M3");
       }
@@ -434,6 +466,19 @@ void invokeSageQuantQkvImpl(SageQuantParams const& params) {
 }
 
 void invokeSageQuant(SageQuantParams const& params) {
+  if (params.stridedInput) {
+    FLASHINFER_CHECK(params.qkInputTokenStride > 0 && params.vInputTokenStride > 0,
+                     "Strided SageQuant requires positive input token strides");
+    if (params.inputType == DATA_TYPE_FP16) {
+      invokeSageQuantQkvImpl<cutlass::half_t, true>(params);
+      return;
+    }
+    if (params.inputType == DATA_TYPE_BF16) {
+      invokeSageQuantQkvImpl<cutlass::bfloat16_t, true>(params);
+      return;
+    }
+    FLASHINFER_ERROR("SageQuant input must be FP16 or BF16");
+  }
   if (params.inputType == DATA_TYPE_FP16) {
     invokeSageQuantQkvImpl<cutlass::half_t>(params);
     return;

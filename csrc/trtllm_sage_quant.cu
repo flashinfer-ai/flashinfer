@@ -25,6 +25,7 @@ using trtllm::invokeSageQuant;
 using trtllm::SageQuantParams;
 using tvm::ffi::Optional;
 
+template <bool StridedInput = false>
 void trtllm_sage_attention_quantize(TensorView q_quant, TensorView k_quant, TensorView v_quant,
                                     TensorView q_scale, TensorView k_scale, TensorView v_scale,
                                     TensorView query, TensorView key, TensorView value,
@@ -48,9 +49,23 @@ void trtllm_sage_attention_quantize(TensorView q_quant, TensorView k_quant, Tens
     return tensor.stride(2) == 1 && tensor.stride(1) == tensor.size(2) &&
            tensor.stride(0) == tensor.size(1) * tensor.size(2);
   };
-  TVM_FFI_ICHECK(is_contiguous_3d(query)) << "query must be contiguous";
-  TVM_FFI_ICHECK(is_contiguous_3d(key)) << "key must be contiguous";
-  TVM_FFI_ICHECK(is_contiguous_3d(value)) << "value must be contiguous";
+  if constexpr (StridedInput) {
+    auto const is_valid_input = [](TensorView tensor) {
+      return tensor.stride(2) == 1 && tensor.stride(1) == tensor.size(2) && tensor.stride(0) > 0 &&
+             tensor.stride(0) % 8 == 0 && reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0;
+    };
+    TVM_FFI_ICHECK(is_valid_input(query) && is_valid_input(key) && is_valid_input(value))
+        << "strided inputs require packed heads/channels, a positive token stride, and 16-byte "
+           "alignment";
+    // The smoothing mean pass still reads packed K; Python materializes K
+    // for this case even when strided inputs are enabled.
+    TVM_FFI_ICHECK(!smooth_k || is_contiguous_3d(key))
+        << "key must be contiguous when smooth_k is enabled";
+  } else {
+    TVM_FFI_ICHECK(is_contiguous_3d(query)) << "query must be contiguous";
+    TVM_FFI_ICHECK(is_contiguous_3d(key)) << "key must be contiguous";
+    TVM_FFI_ICHECK(is_contiguous_3d(value)) << "value must be contiguous";
+  }
 
   TVM_FFI_ICHECK_EQ(cum_seq_lens_q.ndim(), 1) << "cum_seq_lens_q must be 1D";
   TVM_FFI_ICHECK_EQ(cum_seq_lens_kv.ndim(), 1) << "cum_seq_lens_kv must be 1D";
@@ -118,6 +133,8 @@ void trtllm_sage_attention_quantize(TensorView q_quant, TensorView k_quant, Tens
   }
 
   SageQuantParams params{};
+  params.stridedInput = StridedInput;
+  params.vInputTokenStride = value.stride(0);
   params.headDim = query.size(2);
   params.inputType = query.dtype() == dl_float16 ? DATA_TYPE_FP16 : DATA_TYPE_BF16;
   params.quantType = q_quant.dtype() == dl_int8 ? DATA_TYPE_INT8 : DATA_TYPE_E4M3;
@@ -138,6 +155,7 @@ void trtllm_sage_attention_quantize(TensorView q_quant, TensorView k_quant, Tens
   params.numHeads = query.size(1);
   params.tokenBlockSize = q_block_size;
   params.ptrQk = query.data_ptr();
+  params.qkInputTokenStride = query.stride(0);
   params.ptrQkQuant = q_quant.data_ptr();
   params.ptrQkScale = static_cast<float*>(q_scale.data_ptr());
   params.vStage = 1;
@@ -148,12 +166,18 @@ void trtllm_sage_attention_quantize(TensorView q_quant, TensorView k_quant, Tens
   params.numHeads = key.size(1);
   params.tokenBlockSize = k_block_size;
   params.ptrQk = key.data_ptr();
+  params.qkInputTokenStride = key.stride(0);
   params.ptrQkQuant = k_quant.data_ptr();
   params.ptrQkScale = static_cast<float*>(k_scale.data_ptr());
   params.vStage = 2;
   invokeSageQuant(params);
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_sage_attention_quantize, trtllm_sage_attention_quantize);
+// Preserve the existing FFI entry and its argument count. Both entries share
+// the implementation; the new entry selects the strided kernel specialization.
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_sage_attention_quantize,
+                              trtllm_sage_attention_quantize<false>);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_sage_attention_quantize_strided,
+                              trtllm_sage_attention_quantize<true>);
 
 }  // namespace flashinfer
