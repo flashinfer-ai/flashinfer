@@ -206,9 +206,14 @@ def build_cuda_cflags(
 ) -> List[str]:
     """Build CUDA compilation flags."""
     cuda_cflags: List[str] = []
-    cc_env = os.environ.get("CC")
-    if cc_env is not None:
-        cuda_cflags += ["-ccbin", cc_env]
+    # Strip any quotes the user already supplied so the value is quoted once.
+    cc_env = os.environ.get("CC", "").strip().strip("\"'")
+    if cc_env:
+        # Quote a host-compiler path containing spaces (e.g. a Windows
+        # "C:\Program Files\...\cl.exe") so it survives tokenization of the
+        # generated ninja command. list2cmdline quotes only when needed and
+        # doubles a trailing backslash before the closing quote. See #3515.
+        cuda_cflags += ["-ccbin", subprocess.list2cmdline([cc_env])]
     cuda_cflags += [
         "$common_cflags",
         "--compiler-options=-fPIC",
