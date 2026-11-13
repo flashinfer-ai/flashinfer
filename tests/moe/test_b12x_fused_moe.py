@@ -3856,10 +3856,13 @@ def _find_borrowers():
     """All (file, class, borrowed methods, _dense_cls target) in fused_moe."""
     out = []
     for path in sorted(_FUSED_MOE_DIR.rglob("*.py")):
+        source = path.read_text()
+        # Every borrow site names `_dense_cls`; skipping files without it avoids
+        # parsing the whole fused_moe tree (~0.5M lines) at collection time.
+        if "_dense_cls" not in source:
+            continue
         classes = (
-            n
-            for n in ast.walk(ast.parse(path.read_text()))
-            if isinstance(n, ast.ClassDef)
+            n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.ClassDef)
         )
         for cls in classes:
             borrowed = {

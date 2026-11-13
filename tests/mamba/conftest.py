@@ -1067,6 +1067,11 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_triton)
         return
 
+    # --collect-only (including the sharding runner's planning pass) runs no
+    # tests, so compiling kernels for them is wasted work.
+    if config.getoption("--collect-only"):
+        return
+
     n_checkpointing = sum(
         1 for item in items if "test_checkpointing_ssu" in item.nodeid
     )

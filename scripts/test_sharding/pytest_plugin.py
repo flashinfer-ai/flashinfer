@@ -101,32 +101,44 @@ def _marker_name(item: pytest.Item) -> str | None:
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
+    # Resolve each source file once. A full suite has ~200k items but ~1k files,
+    # and on Lustre the per-item resolve() calls alone took ~40s.
+    resolved_paths: dict[str, Path] = {}
+
+    def resolved_path(item: pytest.Item) -> Path:
+        key = str(item.path)
+        path = resolved_paths.get(key)
+        if path is None:
+            path = resolved_paths[key] = Path(key).resolve()
+        return path
+
     node_exclusive_sources = {
-        Path(str(item.path)).resolve()
+        resolved_path(item)
         for item in items
         if item.get_closest_marker("node_exclusive") is not None
     }
     long_running_sources = {
-        Path(str(item.path)).resolve()
+        resolved_path(item)
         for item in items
         if item.get_closest_marker("long_running") is not None
     }
     gpu_exclusive_sources = {
-        Path(str(item.path)).resolve()
+        resolved_path(item)
         for item in items
         if item.get_closest_marker("gpu_exclusive") is not None
     }
     host_memory_heavy_sources = {
-        Path(str(item.path)).resolve()
+        resolved_path(item)
         for item in items
         if item.get_closest_marker("host_memory_heavy") is not None
     }
+    cwd = Path.cwd().resolve()
     collected = []
     for order, item in enumerate(items):
         node = CollectedNode.from_nodeid(item.nodeid, order, _marker_name(item))
-        item_path = Path(str(item.path)).resolve()
+        item_path = resolved_path(item)
         try:
-            source_file = item_path.relative_to(Path.cwd().resolve()).as_posix()
+            source_file = item_path.relative_to(cwd).as_posix()
         except ValueError:
             source_file = str(item_path)
         collected.append(

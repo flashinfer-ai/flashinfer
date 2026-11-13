@@ -370,6 +370,10 @@ def _collect_partition(
         "pytest",
         f"--rootdir={pytest_root}",
         "--collect-only",
+        # Collection never executes an assert; rewriting every test module's
+        # AST is about half of a cold full-suite collection. Workers still
+        # rewrite the files they run.
+        "--assert=plain",
         "-q",
         "-q",
         "--continue-on-collection-errors",
