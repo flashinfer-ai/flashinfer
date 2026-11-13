@@ -25,6 +25,7 @@ This package provides high-performance normalization kernels:
 """
 
 import functools
+import math
 import os
 import warnings
 from typing import Literal, Optional, Tuple, Union
@@ -1234,6 +1235,67 @@ def _rmsnorm_sigmoid_gate_fake(
     return None
 
 
+def _empty_norm_input(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    residual: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    quantized: bool = False,
+    layer_norm: bool = False,
+    allow_3d: bool = False,
+) -> bool:
+    """Validate zero-row calls before bypassing either backend's zero-grid launch."""
+    if input.ndim not in ((2, 3) if allow_3d else (2,)):
+        return False
+    if math.prod(input.shape[:-1]) != 0:
+        return False
+    hidden = input.shape[-1]
+    if hidden <= 0:
+        raise ValueError("hidden_size must be positive")
+    input_dtypes = (
+        (torch.bfloat16,)
+        if layer_norm
+        else (torch.float16, torch.bfloat16, torch.float32)
+    )
+    if not input.is_cuda or input.dtype not in input_dtypes or input.stride(-1) != 1:
+        raise ValueError(
+            "input must be a supported CUDA tensor with contiguous columns"
+        )
+    if input.dtype == torch.float32 and _use_cuda_norm(input.device):
+        raise ValueError("the CUDA normalization backend requires FP16 or BF16 input")
+    weight_dtype = torch.float32 if layer_norm else input.dtype
+    for tensor in (weight,) if bias is None else (weight, bias):
+        if (
+            tensor.shape != (hidden,)
+            or tensor.device != input.device
+            or tensor.dtype != weight_dtype
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(
+                "normalization weights must match the hidden size, dtype and device"
+            )
+    out_dtypes = (
+        (torch.float8_e4m3fn, torch.float8_e5m2) if quantized else (input.dtype,)
+    )
+    if (
+        out.shape != input.shape
+        or out.device != input.device
+        or out.dtype not in out_dtypes
+        or out.stride(-1) != 1
+    ):
+        raise ValueError("out must match input shape/device and the output dtype")
+    if residual is not None and (
+        residual.shape != input.shape
+        or residual.device != input.device
+        or residual.dtype != input.dtype
+        or residual.stride(-1) != 1
+    ):
+        raise ValueError("residual must match input shape, dtype and device")
+    return True
+
+
 @flashinfer_api(trace=rmsnorm_trace)
 def rmsnorm(
     input: torch.Tensor,
@@ -1279,6 +1341,8 @@ def _rmsnorm_impl(
     eps: float,
     enable_pdl: Optional[bool],
 ) -> None:
+    if _empty_norm_input(input, weight, out, allow_3d=True):
+        return
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _use_cuda_norm(input.device):
@@ -1338,6 +1402,8 @@ def rmsnorm_quant(
 
     """
     scale = _normalize_scale_tensor(scale, input)
+    if _empty_norm_input(input, weight, out, quantized=True):
+        return
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _use_cuda_norm(input.device):
@@ -1391,6 +1457,8 @@ def fused_add_rmsnorm(
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
     """
+    if _empty_norm_input(input, weight, input, residual=residual):
+        return
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _use_cuda_norm(input.device):
@@ -1453,6 +1521,8 @@ def fused_add_rmsnorm_quant(
         <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
     """
     scale = _normalize_scale_tensor(scale, input)
+    if _empty_norm_input(input, weight, out, residual=residual, quantized=True):
+        return
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _use_cuda_norm(input.device):
@@ -1600,6 +1670,8 @@ def _gemma_rmsnorm_impl(
     eps: float,
     enable_pdl: Optional[bool],
 ) -> None:
+    if _empty_norm_input(input, weight, out, allow_3d=True):
+        return
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _use_cuda_norm(input.device):
@@ -1659,6 +1731,8 @@ def gemma_fused_add_rmsnorm(
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
     """
+    if _empty_norm_input(input, weight, input, residual=residual):
+        return
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _use_cuda_norm(input.device):
@@ -1713,6 +1787,8 @@ def layernorm(
         Layer Normalized tensor, shape (batch_size, hidden_size). Same dtype as input.
     """
     out = torch.empty_like(input)
+    if _empty_norm_input(input, gemma, out, bias=beta, layer_norm=True):
+        return out
     if _use_cuda_norm(input.device):
         get_norm_module().layernorm(out, input, gemma, beta, eps)
     else:
@@ -1769,6 +1845,8 @@ def layernorm_quant(
         Only honored by the CuTe-DSL backend; the CUDA fallback ignores it.
     """
     scale = _normalize_scale_tensor(scale, input)
+    if _empty_norm_input(input, gemma, out, bias=beta, layer_norm=True, quantized=True):
+        return
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _use_cuda_norm(input.device):
