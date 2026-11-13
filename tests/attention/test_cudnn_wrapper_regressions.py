@@ -1215,9 +1215,7 @@ def test_decode_rebinds_sinks_without_repreparing(monkeypatch, strided):
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 @pytest.mark.parametrize(
     "kind,unsupported",
-    # Ragged cuDNN prefill supports windows; the paged wrapper still rejects them.
-    [("paged", dict(window_left=4))]
-    + [
+    [
         (kind, unsupported)
         for kind in ("paged", "ragged")
         for unsupported in (
@@ -1382,11 +1380,25 @@ def test_prefill_scales_capture_replay(paged, scale_type, dtype):
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 @pytest.mark.parametrize(
-    "q_lengths,kv_lengths",
-    [([128], [8192]), ([1024, 1536], [1024, 1536]), ([128, 1536], [1024, 1536])],
-    ids=["prefix", "full", "mixed_equal_maxima"],
+    "q_lengths,kv_lengths,expected_backend",
+    [
+        ([128], [8192], "cudnn"),
+        ([1024, 1536], [1024, 1536], "cudnn"),
+        ([128, 1536], [1024, 1536], "fa2"),
+        ([256] * 6, [4096] * 6, "cudnn"),
+        ([2048], [4096], "cudnn"),
+        ([1024] * 6, [1024] * 6, "cudnn"),
+    ],
+    ids=[
+        "prefix",
+        "full",
+        "mixed_equal_maxima",
+        "large_batch",
+        "long_query",
+        "large_full",
+    ],
 )
-def test_paged_auto_preserves_runtime_scales(q_lengths, kv_lengths):
+def test_paged_auto_preserves_runtime_scales(q_lengths, kv_lengths, expected_backend):
     if (
         torch.cuda.get_device_capability() != (10, 0)
         or not prefill._cudnn_supports_paged_auto()
@@ -1407,6 +1419,7 @@ def test_paged_auto_preserves_runtime_scales(q_lengths, kv_lengths):
         backend="auto",
     )
     wrapper.plan(qo, ip, ix, last, 16, 4, 128, 16, causal=True, q_data_type=q.dtype)
+    assert wrapper._backend == expected_backend
     # Float scales work across auto providers. The explicit cuDNN capture/replay
     # test above covers device scales; FA2 requires a host softmax scale.
     for values in ((0.5, 1.0, 1.0), (1.0, 0.25, 1.0), (1.0, 1.0, 0.75)):

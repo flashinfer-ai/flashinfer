@@ -1979,7 +1979,14 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         Dense query input ``[batch_size, q_len_per_request, num_heads, 512]``
         or varlen query input ``[sum_q, num_heads, 512]`` when
         ``cum_seq_lens_q`` is provided. SM100/SM103/SM107 accept BF16 or FP8
-        E4M3; SM120/SM121 accepts BF16.
+        E4M3; SM120/SM121 accepts BF16. With ``backend="cake"`` and
+        ``kv_cache_format="nvfp4"`` on SM100/SM103 the query is either BF16
+        (the NVFP4 decode family) or packed
+        NVFP4, uint8 with last dimension 384 (the cache's row format: codes,
+        then the 28 E4M3 scale factors), which runs the NVFP4 prefill bodies
+        at any row count; the call packs nothing.
+        :func:`flashinfer.mla.cake_dsv4_nvfp4_pack_query`
+        packs a BF16 query. The output is BF16 with last dimension 512.
     swa_kv_cache : torch.Tensor
         SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses an opaque
         packed uint8 record with last dimension 584 (FP8), 528 (DSV4.1 FP8) or
@@ -2482,7 +2489,10 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         else:
             raise ValueError(f"Expected query.ndim == 3 or 4, got {query.ndim}")
         if out is None:
-            out = torch.empty(query.shape, dtype=torch.bfloat16, device=query.device)
+            # A packed NVFP4 query has 384-byte rows; the output rows are 512 BF16.
+            out = torch.empty(
+                (*query.shape[:-1], 512), dtype=torch.bfloat16, device=query.device
+            )
         return run_cake_dsv4_nvfp4(
             query=query_flat,
             swa_kv_cache=swa_kv_cache,

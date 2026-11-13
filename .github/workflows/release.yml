@@ -22,6 +22,7 @@ on:
       - 'scripts/infra/build_flashinfer_jit_cache_artifact.sh'
       - 'scripts/infra/build_flashinfer_jit_cache_whl.sh'
       - 'scripts/infra/build_jit_cache_wheel.py'
+      - 'scripts/infra/build_jit_cache_shim_wheel.sh'
       - 'scripts/infra/collect_ninja_diagnostics.py'
       - 'scripts/infra/jit_cache_build_common.sh'
       - 'scripts/infra/run_with_output_watchdog.py'

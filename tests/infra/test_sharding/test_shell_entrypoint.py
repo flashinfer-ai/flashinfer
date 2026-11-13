@@ -353,12 +353,15 @@ def _stage_cuda13_entrypoint(
 
     Returns the entrypoint, its environment and the stub NCCL wheel lib dir.
     """
-    scripts = tmp_path / "scripts"
-    scripts.mkdir()
+    # setup_test_env.sh finds the repository root two levels above itself.
+    scripts = tmp_path / "scripts" / "infra"
+    scripts.mkdir(parents=True)
     entrypoint = scripts / "task_run_unit_tests.sh"
     _copy_entrypoint(entrypoint)
     (scripts / "test_utils.sh").write_text("install_and_verify() { :; }\n")
-    (scripts / "setup_test_env.sh").write_text("")
+    shutil.copy(REPO_ROOT / "scripts" / "infra" / "setup_test_env.sh", scripts)
+    (scripts / "install_cutlass_dsl.sh").write_text("exit 0\n")
+    (scripts / "check_requirements.py").write_text("raise SystemExit(0)\n")
     (scripts / "unit_test_runner.py").write_text(
         "import os, sys\n"
         "if sys.argv[1] == '__shell-settings':\n"
@@ -377,11 +380,15 @@ def _stage_cuda13_entrypoint(
     (modules / "nvshmem" / "core.py").write_text("")
     (modules / "torch.py").write_text(
         "from types import SimpleNamespace\nversion = SimpleNamespace(cuda='13.0')\n"
+        "cuda = SimpleNamespace(get_device_capability=lambda: (10, 7))\n"
     )
     env = os.environ.copy()
+    env.pop("TVM_FFI_REF", None)
+    env.pop("CUTLASS_DSL_VERSION", None)
     env.update(
         PYTHONPATH=str(modules),
         PATH=f"{Path(sys.executable).parent}{os.pathsep}{env['PATH']}",
+        PIP_CONSTRAINT=os.devnull,
     )
     return entrypoint, env, modules / "nvidia" / "nccl" / "lib"
 

@@ -151,6 +151,10 @@ class MegaKernelBackend(ABC):
         """Convert the selector's [up, gate] FC1 rows to the backend's input order."""
         return weights
 
+    def batch_invariant_fingerprint(self, fleet_params: FleetParams) -> str | None:
+        """Arithmetic receipt when the backend implements a specified BI class."""
+        return None
+
     def ep_selected_config(self, workspace):
         return self.get_tuned_config(workspace)
 

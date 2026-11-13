@@ -63,7 +63,7 @@ def inputs_and_config(bootstrap, *, forced=None, capacity=64):
             )
         ),
         moe_ep.SplitConfig(
-            comm=moe_ep.NVLinkOneSidedConfig(cft=False, lamport=False),
+            comm=moe_ep.NVLinkOneSidedConfig(sync_protocol="fence"),
             kernel=moe_ep.FusedMoeKernelConfig(cfg),
         ),
     )

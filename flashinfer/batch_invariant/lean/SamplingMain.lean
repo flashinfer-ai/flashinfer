@@ -1,9 +1,11 @@
 import BIKernels.QuantExport
 import BIKernels.Sampling
+import BIKernels.Stream
+import BIKernels.Draw
 import BIKernels.SamplingCases
-/-! `lake exe samplingconformance`: print the Lean model's terms for the generated sampling cases. The Python test
-(`tests/batch_invariant/test_sampling_lean.py`, the Lean tier) compares these strings with the Python spec's / engine's
-S-expressions. -/
+/-! `lake exe samplingconformance`: print the Lean model's terms for the generated sampling cases (the row class
+`lse.row`, the draw `sample.icdf.v1`, the stream's blocks). The Python test (`tests/batch_invariant/test_sampling_lean.py`,
+the Lean tier) compares these strings with the Python spec's / engine's S-expressions and words. -/
 open BIK
 
 def main : IO Unit := do
@@ -23,3 +25,12 @@ def main : IO Unit := do
     IO.println s!"lseout {N} {temp} probsL {osexpr (Sampling.specProb "bf16" N kb lseRow T (N - 1))}"
     IO.println s!"lseout {N} {temp} logp0 {osexpr (Sampling.specLogp "bf16" N kb lseRow T 0)}"
     IO.println s!"lseout {N} {temp} lse {osexpr (Sampling.specLse "bf16" N kb lseRow T)}"
+  -- the draw `sample.icdf.v1` (Draw.lean): the threshold and the inclusive prefixes of the probe elements of row 0
+  for (N, kb, probe) in drawCases do
+    IO.println s!"drawt {N} {osexpr (Draw.threshold N kb lseRow)}"
+    for i in probe do
+      IO.println s!"draw {N} {i} {osexpr (Draw.prefixIncl N kb lseRow i)}"
+  -- the stream (Stream.lean): the four words of the generated keys' blocks
+  for (s, o, n) in streamCases do
+    let b := Stream.block s o n
+    IO.println s!"stream {s} {o} {n} {b.c0} {b.c1} {b.c2} {b.c3}"
