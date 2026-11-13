@@ -223,6 +223,7 @@ def _get_compiled_finalize_kernel(
     enable_pdl: bool = True,
     use_a_per_token_scale: bool = False,
     use_fused_finalize: bool = True,
+    unit_token_scales: bool = False,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
@@ -260,6 +261,8 @@ def _get_compiled_finalize_kernel(
         enable_pdl,
         use_a_per_token_scale,
         use_fused_finalize,
+        # Constant router scale 1.0 (default False builds the unchanged kernel).
+        bool(unit_token_scales),
     )
 
     if cache_key not in _finalize_kernel_cache:
@@ -299,6 +302,7 @@ def _get_compiled_finalize_kernel(
                 enable_pdl=enable_pdl,
                 use_a_per_token_scale=use_a_per_token_scale,
                 use_fused_finalize=use_fused_finalize,
+                unit_token_scales=unit_token_scales,
             )
             wrapper_fn = gemm_bw.wrapper
 
@@ -376,6 +380,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     mma_inst_shape: Optional[Tuple[int, int, int]] = None,
     enable_pdl: bool = True,
     use_fused_finalize: bool = True,
+    unit_token_scales: bool = False,
 ) -> torch.Tensor:
     """Blockscaled contiguous grouped GEMM for MoE GEMM2 workloads.
 
@@ -416,6 +421,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
              a caller-provided output with twice the shard's output width.
         use_fused_finalize: Use atomic fused finalize; otherwise write expanded
              rows for deterministic reduction. Default: True.
+        unit_token_scales: All router scales are 1 (pre-FC2 routing): the
+             kernel uses the constant 1.0 and never reads
+             ``token_final_scales`` (any float32 tensor of the right shape may
+             be passed). Blackwell only. Default: False.
 
     Returns:
         out: Output tensor with dtype out_dtype. The shape is ``(seq_len, n)``
@@ -499,6 +508,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     # Check compute capability
     major, minor = get_compute_capability(a.device)
     is_rubin = mma_tiler is not None and mma_inst_shape is not None
+    if is_rubin and unit_token_scales:
+        raise NotImplementedError("unit_token_scales is Blackwell (SM100/SM103) only")
     if major != 10:
         raise ValueError(
             f"Blockscaled contiguous grouped GEMM with finalize fusion requires SM10x family. "
@@ -727,6 +738,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
         use_a_per_token_scale=use_a_per_token_scale,
+        unit_token_scales=unit_token_scales,
     )
 
     # Execute kernel with runtime parameters.

@@ -388,6 +388,23 @@ def _ld_shared_f32(addr, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _st_global_v4_zero(addr, *, loc=None, ip=None):
+    """Store 16 zero bytes to global memory."""
+    z = cutlass.Int32(0).ir_value(loc=loc, ip=ip)
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), z, z, z, z],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 # TODO: Remove this hook helper function after nvidia-cutlass-dsl 4.3.x is no longer supported.
 def hooked_PersistentTileSchedulerParams_init(
     self,
@@ -1057,8 +1074,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = _identity_epilogue,
+        zero_out: Optional[cute.Tensor] = None,
     ):
         """Execute the contiguous grouped GEMM with gather operation and SwiGLU fusion.
+
+        ``zero_out`` (optional, 1-CTA only): a tensor (byte size a multiple of
+        16, 16-byte aligned) that the otherwise idle warp 11 of every CTA sets
+        to zero after the grid-dependency wait. The pre-FC2 path passes the
+        atomically finalized MoE output here instead of launching a memset.
 
         This method performs FC1 layer computation:
         1. GEMM: acc = alpha * (SFA * A[token_ids]) * (SFB * B)
@@ -1494,6 +1517,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     f"and >= 8 KiB of sC (have {sc_bytes} B)"
                 )
 
+        if cutlass.const_expr(zero_out is not None and self.use_2cta_instrs):
+            raise ValueError("zero_out needs the idle warp 11 of the 1-CTA kernel")
+
         self.shared_storage = (
             SharedStorage2cta
             if cutlass.const_expr(self.use_2cta_instrs)
@@ -1537,6 +1563,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             self.tile_sched_params,
             epilogue_op,
             c if cutlass.const_expr(self.pre_fc2_routing) else None,
+            zero_out,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1627,6 +1654,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
         mC_gmem: Optional[cute.Tensor] = None,
+        zero_out: Optional[cute.Tensor] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -1938,6 +1966,28 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             self.cta_sync_barrier.arrive_and_wait()
 
         griddepcontrol_wait()
+
+        if cutlass.const_expr(zero_out is not None):
+            # Zero the output buffer with the idle warp 11 (1-CTA kernels
+            # only), after the wait: every earlier user of the buffer is done.
+            # The next kernel (GEMM2) reads it only after its own wait.
+            if warp_idx == self.sync_transform_warp_id:
+                zero_base = cutlass.Int64(zero_out.iterator.toint())
+                zero_n16 = cutlass.Int32(
+                    cute.size(zero_out) * zero_out.element_type.width // 128
+                )
+                # The persistent grid is (cluster_m, cluster_n, clusters):
+                # use the linear CTA index and count.
+                zgx, zgy, zgz = cute.arch.grid_dim()
+                zero_cta = bidx + bidy * zgx + bidz * zgx * zgy
+                zero_stride = zgx * zgy * zgz * self.threads_per_warp
+                for zi in cutlass.range(
+                    zero_cta * self.threads_per_warp + tidx % self.threads_per_warp,
+                    zero_n16,
+                    zero_stride,
+                    unroll=1,
+                ):
+                    _st_global_v4_zero(zero_base + cutlass.Int64(zi) * 16)
 
         #
         # Specialized Schedule Warp
@@ -4734,6 +4784,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = _identity_epilogue,
+        zero_out_ptr: Optional[cute.Pointer] = None,
     ):
         scale_k = k // scaling_vector_size
         interm_size = n // self.out_n_factor
@@ -4835,6 +4886,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             max_active_clusters=max_active_clusters,
             stream=stream,
             epilogue_op=epilogue_op,
+            # (orig_m, k) BF16: the pre-FC2 MoE output (tokens x hidden).
+            zero_out=(
+                cute.make_tensor(zero_out_ptr, layout=cute.make_layout((orig_m * k,)))
+                if cutlass.const_expr(zero_out_ptr is not None)
+                else None
+            ),
         )
 
 
