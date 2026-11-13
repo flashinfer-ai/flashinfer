@@ -198,6 +198,14 @@ run_provider_spec_lint() {
     return 1
   fi
   local started_at=${SECONDS}
+  # Cold metadata downloads can outlast a peer's artifact-lock timeout. Fill
+  # the shared header cache before the fail-fast pool starts any arch workers.
+  if (( concurrency > 1 && $# > 1 )); then
+    python3 "${_JIT_CACHE_COMMON_DIR}/prefetch_jit_spec_headers.py" || {
+      echo "ERROR: Failed to prefetch provider spec headers"
+      return 1
+    }
+  fi
   run_bounded_parallel "${concurrency}" lint_provider_specs "$@" || {
     echo "ERROR: A provider spec lists CUDA targets the provider cannot carry"
     return 1
