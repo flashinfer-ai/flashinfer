@@ -885,3 +885,33 @@ def test_pipelined_ring_is_offered_at_every_depth_from_its_chunk_floor(world_siz
                     numel,
                     2,
                 ), (numel, depth)
+
+
+def test_profiling_releases_its_outputs() -> None:
+    """Every profiling call frees the outputs it profiled into.
+
+    Lookups never write them, so kept they would hold one output per tuned shape
+    for the workspace's lifetime: 0.3 GiB at 115 batches of hidden 5120.
+    """
+    runner = tuning.PcieIpcAllReduceRunner(SimpleNamespace())
+    out = runner._output_for(torch.empty(4, 8))
+    assert runner._output_for(torch.empty(4, 8)) is out
+    runner.release_buffers()
+    assert not runner._buf_cache
+
+    # Both places that profile: tune() and a miss under an enclosing autotune(True).
+    for method in (
+        PcieIpcAllReduceWorkspace.tune,
+        PcieIpcAllReduceWorkspace._resolve_tuned,
+    ):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
+        guarded = [
+            t
+            for t in ast.walk(tree)
+            if isinstance(t, ast.Try)
+            and any("choose_one" in ast.unparse(s) for s in t.body)
+            and any(
+                "self._runner.release_buffers" in ast.unparse(s) for s in t.finalbody
+            )
+        ]
+        assert guarded, f"{method.__name__} keeps the outputs it profiled"
