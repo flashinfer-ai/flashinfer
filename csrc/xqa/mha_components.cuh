@@ -118,7 +118,9 @@ __device__ inline ThrdRegRowMaxT<tileM> computeRowSumF8(
                          reinterpret_cast<uint32_t const(&)[2][2]>(src(i, k * 2)), b);
     }
   }
-  QuadRegRowMaxT<tileM> rowSum;
+  // Zero-init: with tileM == 16 only half of the quad slots are written below, but
+  // dedupFromQuad reads all of them.
+  QuadRegRowMaxT<tileM> rowSum{};
   for (uint32_t i = 0; i < WarpAcc::rows; i++) {
     for (uint32_t m = 0; m < InstAcc::rows; m++) {
 #ifndef NDEBUG

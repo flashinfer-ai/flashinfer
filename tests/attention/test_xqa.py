@@ -484,6 +484,7 @@ def test_xqa(
 @pytest.mark.parametrize("seq_len", [2, 15, 256, 514, 2048])
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("tokens_per_page", [32, 64])
+@pytest.mark.parametrize("head_grp_size", [8, 16, 32, 64, 128])
 def test_xqa_mla(
     batch_size,
     seq_len,
@@ -491,12 +492,12 @@ def test_xqa_mla(
     kv_scale,
     q_scale,
     enable_pdl,
+    head_grp_size,
 ):
     set_random_seed(0)
 
     # MLA specific constants (fixed, not parameterized)
     nb_k_heads = 1  # MLA only supports 1 K head
-    head_grp_size = 128  # Fixed for MLA
     valid_elems_per_head_qk = 576  # Q and K dimension
     valid_elems_per_head_v = 512  # V dimension (output dimension)
 

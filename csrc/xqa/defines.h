@@ -33,7 +33,7 @@
 #define HEAD_GRP_SIZE 8
 #endif
 
-#define IS_MLA (HEAD_GRP_SIZE == 128 && HEAD_ELEMS == 576)
+#define IS_MLA ((HEAD_GRP_SIZE == 128 || HEAD_GRP_SIZE == 64) && HEAD_ELEMS == 576)
 
 #if IS_MLA
 #if defined(MLA_BF16) && MLA_BF16

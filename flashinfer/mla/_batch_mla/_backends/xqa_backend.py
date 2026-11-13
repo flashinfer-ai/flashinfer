@@ -15,6 +15,7 @@ from typing import ClassVar, Optional, Union
 import torch
 
 from flashinfer.autotuner import TunableRunner
+from flashinfer.jit.xqa import XQA_MLA_NUM_Q_HEADS, xqa_mla_head_group
 from flashinfer.utils import (
     _check_block_tables_shape,
     check_shape_dtype_device,
@@ -23,6 +24,7 @@ from flashinfer.utils import (
     get_device_sm_count,
     is_sm12x_supported,
 )
+from flashinfer.xqa import _pad_heads
 
 from ..._utils import _check_mla_dense_page_table_shape, _check_mla_query_kv_shape
 from .._contracts import _resolve_structural_mla_input
@@ -116,9 +118,10 @@ def _validate_xqa_plan_contract(args: _MLAPlanArguments) -> None:
             "XQA backend requires a packed KV-cache view; representative kv_cache "
             "is independent split-only."
         )
-    if args.num_heads != 128:
+    if args.num_heads not in XQA_MLA_NUM_Q_HEADS:
         raise _BackendPlanUnsupportedError(
-            f"XQA MLA only supports 128 query heads, got {args.num_heads}."
+            f"XQA MLA supports {list(XQA_MLA_NUM_Q_HEADS)} query heads, "
+            f"got {args.num_heads}."
         )
     if (args.head_dim_ckv, args.head_dim_kpe) not in _SUPPORTED_MLA_DIMENSIONS:
         raise _BackendPlanUnsupportedError(
@@ -321,7 +324,7 @@ class _BatchMLAPagedAttentionXqaBackend(TunableRunner):
             kv_data_type,
             page_size,
             head_dim_ckv + head_dim_kpe,
-            num_heads,
+            xqa_mla_head_group(num_heads),
             False,
         )
         semaphore = workspace_u8[:_XQA_SEMAPHORE_BYTES]
@@ -522,16 +525,15 @@ class _BatchMLAPagedAttentionXqaBackend(TunableRunner):
         _check_mla_dense_page_table_shape(
             block_tables, query.shape[0], page_size, True, True
         )
-        num_heads = query.shape[-2]
-        if num_heads != 128:
-            raise ValueError(
-                "XQA MLA only supports 128 query heads (head_group_ratio=128), "
-                f"got {num_heads} query heads"
-            )
         backend = cls(workspace_buffer)
         backend._is_planned = False
         backend._module = get_xqa_module_mla(
-            query.dtype, kv_cache.dtype, page_size, query.shape[-1], num_heads, False
+            query.dtype,
+            kv_cache.dtype,
+            page_size,
+            query.shape[-1],
+            xqa_mla_head_group(query.shape[-2]),
+            False,
         )
         # Rebuild the singleton KV head axis to preserve the native strides.
         backend._kv_cache = kv_cache.squeeze(1).unsqueeze(2)
@@ -554,11 +556,20 @@ class _BatchMLAPagedAttentionXqaBackend(TunableRunner):
     def _execute(
         self, query, kv_cache, block_tables, seq_lens, out, bmm1_scale, bmm2_scale
     ) -> torch.Tensor:
+        # query: [batch, 1, num_heads, head_dim]; out: [..., num_heads, kv_lora_rank].
+        num_heads = query.shape[-2]
+        head_group = xqa_mla_head_group(num_heads)
+        kernel_query, kernel_out = query, out
+        if head_group != num_heads:
+            # The 64-head kernel runs on zero-padded query heads; only the first
+            # num_heads output heads are kept.
+            kernel_query = _pad_heads(query, head_group)
+            kernel_out = out.new_empty(*out.shape[:-2], head_group, out.shape[-1])
         self._module.xqa_mla(
             self._sm_count,
             bmm1_scale,
-            out,
-            query,
+            kernel_out,
+            kernel_query,
             kv_cache,
             kv_cache,
             block_tables,
@@ -570,6 +581,8 @@ class _BatchMLAPagedAttentionXqaBackend(TunableRunner):
             self._scratch,
             self._enable_pdl,
         )
+        if kernel_out is not out:
+            out.copy_(kernel_out[..., :num_heads, :])
         return out
 
     # Autotuning support for functional execution and the current wrapper plan.

@@ -4,6 +4,14 @@
 #include "tma.h"
 #include "utils.cuh"
 
+// Row-wise vectors keep one row per lane (warp_size rows per register). A warp tile with fewer
+// rows than warp_size (16 rows for head group 64) owns only lanes [0, tileM): the other lanes
+// must not touch shared memory, as those rows belong to another warp or lie past the array.
+template <uint32_t tileM>
+__device__ inline constexpr bool laneOwnsRow(uint32_t lane) {
+  return tileM % warp_size == 0 || lane < tileM;
+}
+
 template <uint32_t tileM, uint32_t totalNbRows>
 __device__ inline ThrdRegRowMaxT<tileM> loadShmRowMax(Vec<float, totalNbRows> const& shm,
                                                       uint32_t tileBaseRow,
@@ -11,7 +19,13 @@ __device__ inline ThrdRegRowMaxT<tileM> loadShmRowMax(Vec<float, totalNbRows> co
   ThrdRegRowMaxT<tileM> result{};
 #pragma unroll
   for (uint32_t i = 0; i < result.size; i++) {
-    result[i] = shm[tileBaseRow + i * warp_size + lane];
+    if (laneOwnsRow<tileM>(lane)) {
+      result[i] = shm[tileBaseRow + i * warp_size + lane];
+    }
+    if constexpr (tileM % warp_size != 0) {
+      // lanes >= tileM get a copy of row (lane % tileM), so warp-wide votes stay exact.
+      result[i] = __shfl_sync(~0U, result[i], lane % tileM);
+    }
   }
   return result;
 }
@@ -21,7 +35,9 @@ __device__ inline void storeRowMax(Vec<float, totalNbRows>& shm, ThrdRegRowMaxT<
                                    uint32_t tileBaseRow, uint32_t lane = laneId()) {
 #pragma unroll
   for (uint32_t i = 0; i < src.size; i++) {
-    shm[tileBaseRow + i * warp_size + lane] = src[i];
+    if (laneOwnsRow<tileM>(lane)) {
+      shm[tileBaseRow + i * warp_size + lane] = src[i];
+    }
   }
 }
 
@@ -29,9 +45,12 @@ template <uint32_t tileM, uint32_t totalNbRows>
 __device__ inline void storeRowMaxAsync(CgaBarrier& bar, Vec<float, totalNbRows>& shm,
                                         ThrdRegRowMaxT<tileM> const& src, uint32_t tileBaseRow,
                                         uint32_t lane = laneId()) {
+  // The caller's expect_tx must count only the lanes that store (see laneOwnsRow).
 #pragma unroll
   for (uint32_t i = 0; i < src.size; i++) {
-    tma::storeAsync(&shm[tileBaseRow + i * warp_size + lane], src[i], bar);
+    if (laneOwnsRow<tileM>(lane)) {
+      tma::storeAsync(&shm[tileBaseRow + i * warp_size + lane], src[i], bar);
+    }
   }
 }
 
