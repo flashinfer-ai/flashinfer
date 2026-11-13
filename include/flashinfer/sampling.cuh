@@ -428,6 +428,13 @@ constexpr uint32_t kSoftmaxMaxSlices = 32;  // the reduce kernel merges partials
 // Finite seed for the running max: merging two empty states must not evaluate (-inf) - (-inf).
 constexpr float kSoftmaxMaxSeed = -FLT_MAX;
 
+// The split kernels work in the log2 domain: logits are scaled once by log2(e) / temperature, so
+// every exponent is a single ex2.approx, and maxima and partials are all kept in that frame.
+// Temperature 0 keeps the inv_temp = 0 convention of the fused kernel.
+__device__ __forceinline__ float SoftmaxLog2Scale(float temperature) {
+  return temperature == 0.f ? 0.f : math::log2e / temperature;
+}
+
 /// Merges per-lane (max, denominator) pairs across a full warp; every lane gets the result.
 __device__ __forceinline__ float2 WarpOnlineSoftmaxMerge(float m, float s) {
   float row_max = m;
@@ -436,7 +443,7 @@ __device__ __forceinline__ float2 WarpOnlineSoftmaxMerge(float m, float s) {
     row_max = fmaxf(row_max, __shfl_xor_sync(0xffffffff, row_max, offset));
   }
   // Skipping equal maxima keeps s exact and avoids inf - inf when the max is +inf.
-  if (m != row_max) s *= __expf(m - row_max);
+  if (m != row_max) s *= math::ptx_exp2(m - row_max);
 #pragma unroll
   for (uint32_t offset = 16; offset > 0; offset /= 2) {
     s += __shfl_xor_sync(0xffffffff, s, offset);
@@ -466,7 +473,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxMa
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
   float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
-  const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
+  const float log2_scale = SoftmaxLog2Scale(temperature);
 
   // Thread-local online softmax over this thread's vectors of the slice.
   float m = kSoftmaxMaxSeed;
@@ -479,16 +486,17 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxMa
     float vec_max = kSoftmaxMaxSeed;
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      // __fmul_rn, not *: it must not be contracted into an FMA.
-      // *= inv_temp can lead to probabilities exceeding 1 at low temperatures (see PR #5088).
-      x[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
+      // __fmul_rn, not *: the maximum is taken over rounded products, so the largest logit gets
+      // an exponent of exactly 0 in both kernels. An FMA would skip that rounding and can push
+      // probabilities above 1 at low temperatures (see PR #5088).
+      x[j] = __fmul_rn(static_cast<float>(logits_vec[j]), log2_scale);
       vec_max = fmaxf(vec_max, x[j]);
     }
     const float new_m = fmaxf(m, vec_max);
-    s *= __expf(m - new_m);
+    s *= math::ptx_exp2(m - new_m);
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      s += __expf(x[j] - new_m);
+      s += math::ptx_exp2(x[j] - new_m);
     }
     m = new_m;
   }
@@ -531,7 +539,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxRe
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
   float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
-  const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
+  const float log2_scale = SoftmaxLog2Scale(temperature);
 
   // Read this slice's copy of the row's partials; the barrier orders it before the stores below,
   // which overwrite that copy. No other CTA reads it.
@@ -546,6 +554,9 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxRe
     if (tx == 0) row_ms = ms;
   }
   __syncthreads();
+  // Multiply by 1 / denominator rather than folding log2(denominator) into the exponent: the
+  // rounded final_max + log2(denominator) would move the exponent off the frame the sum was
+  // accumulated in, which is far from negligible for large logits.
   const float final_max = row_ms.x;
   const float inv_denominator = 1.0f / row_ms.y;
 
@@ -555,10 +566,9 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxRe
     logits_vec.cast_load(slice_logits + i);
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      // __fmul_rn, not *: it must not be contracted into an FMA.
-      // *= inv_temp can lead to probabilities exceeding 1 at low temperatures (see PR #5088).
-      const float x = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
-      prob_vec[j] = static_cast<DType>(__expf(x - final_max) * inv_denominator);
+      // Same rounded product as in the map kernel (see there).
+      const float x = __fmul_rn(static_cast<float>(logits_vec[j]), log2_scale);
+      prob_vec[j] = static_cast<DType>(math::ptx_exp2(x - final_max) * inv_denominator);
     }
     prob_vec.cast_store(slice_output + i);
   }

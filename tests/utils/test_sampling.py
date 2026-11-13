@@ -1673,15 +1673,34 @@ def test_softmax_split_corner_cases(batch_size, vocab_size, mask, enable_pdl):
         torch.testing.assert_close(graph_probs, expected, atol=1e-5, rtol=1e-4)
 
 
+# Powers of two from 1 to 512 rows cross every slice count the heuristic picks, from 32
+# down to the fused kernel, on any GPU.
+@pytest.mark.parametrize("batch_size", [2**i for i in range(10)])
+@pytest.mark.parametrize("vocab_size", [24576, 32000, 64000, 128000, 256000])
+@pytest.mark.parametrize("temperature", [0.5, 1.0, 2.0])
+def test_softmax_split_slice_counts(batch_size, vocab_size, temperature):
+    if batch_size * vocab_size > 2**26:
+        pytest.skip("skip the largest shapes to keep the sweep quick")
+    torch.manual_seed(batch_size + vocab_size)
+    logits = torch.randn(batch_size, vocab_size, device="cuda")
+    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+    softmax = flashinfer.sampling.get_sampling_module().softmax
+    probs = softmax(workspace, logits, None, temperature, False)
+    expected = torch.softmax(logits / temperature, dim=-1)
+    torch.testing.assert_close(probs, expected, atol=1e-5, rtol=1e-4)
+
+
 @pytest.mark.parametrize("vocab_size", [24576, 151937])
 def test_softmax_split_extreme_logits(vocab_size):
     workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
     softmax = flashinfer.sampling.get_sampling_module().softmax
-    logits = torch.full((4, vocab_size), -20.0, device="cuda")
+    logits = torch.full((5, vocab_size), -20.0, device="cuda")
     logits[0, -1] = 42.0  # a single dominant token in the last slice
     logits[1] = float("-inf")  # an all -inf row is NaN, as in torch
     logits[2, 0] = float("inf")  # a +inf logit is NaN, as in torch
     logits[3] = torch.linspace(-3e38, 3e38, vocab_size, device="cuda")
+    # 1 ULP of a ~1e10 logit is a large exponent: the max element must still get exactly 0.
+    logits[4] = torch.randn(vocab_size, device="cuda") * 1e10
     for temperature in (1.0, 0.001):
         probs = softmax(workspace, logits, None, temperature, False)
         expected = torch.softmax(logits / temperature, dim=-1)
