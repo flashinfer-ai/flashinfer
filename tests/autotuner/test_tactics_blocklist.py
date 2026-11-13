@@ -4,11 +4,14 @@ No GPU is required — all tests use mock data and temporary files.
 """
 
 import json
+import logging
 import os
 import tempfile
 
 import pytest
 
+from flashinfer import ReplayCoverage
+from flashinfer.autotune_cache import autotune_v2
 from flashinfer.autotuner import (
     AutoTuner,
     TunableRunner,
@@ -648,6 +651,375 @@ class TestAutotunerIntegration:
 
         assert tactic2 == 2
         assert call_count[0] == first_call_count
+
+
+# ---------------------------------------------------------------------------
+# Tests: blocklist applied to autotune cache-file entries
+# ---------------------------------------------------------------------------
+
+
+class TestBlocklistCacheFiles:
+    """Entries loaded from a cache file obey the blocklist like fresh tuning.
+
+    A cache file tuned before a tactic was listed must not keep serving that
+    tactic: the entry becomes a cache miss (re-profiled without the listed
+    tactic inside a tuning context, the default tactic -1 otherwise),
+    whether the blocklist is loaded before or after the cache file.
+    """
+
+    OP = "cache_file_op"
+    OTHER_OP = "cache_file_other_op"
+    TIMES = {0: 5.0, 1: 1.0, 2: 3.0}  # tactic 1 wins when it is allowed
+
+    def setup_method(self):
+        AutoTuner._instance = None
+        self.tuner = AutoTuner.get()
+
+    def teardown_method(self):
+        AutoTuner._instance = None
+
+    def _patch_env(self, monkeypatch):
+        monkeypatch.setattr(
+            "flashinfer.tactics_blocklist._collect_metadata",
+            lambda: {"gpu": "TestGPU"},
+        )
+        monkeypatch.setattr(
+            "flashinfer.autotuner._collect_metadata",
+            lambda: {"gpu": "TestGPU"},
+        )
+        profiled = []
+
+        def fake_profile(self_at, runner, inputs, tactic, tuning_config=None, **kw):
+            profiled.append(tactic)
+            return self.TIMES.get(tactic, 10.0)
+
+        monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+        return profiled
+
+    def _write_cache(self, path, runner, inputs):
+        """Tune OP and OTHER_OP without a blocklist and save them to *path*."""
+        with autotune(tune_mode=True):
+            for op in (self.OP, self.OTHER_OP):
+                _, tactic = self.tuner.choose_one(op, [runner], TuningConfig(), inputs)
+                assert tactic == 1
+        self.tuner.save_configs(path)
+        # Fresh process.
+        AutoTuner._instance = None
+        self.tuner = AutoTuner.get()
+
+    def _blocklist_path(self, tmp_path):
+        bl_path = str(tmp_path / "blocklist.json")
+        TacticsBlocklist.save(
+            bl_path,
+            {f"{self.OP}::StubRunnerA": [1]},
+            metadata={"gpu": "TestGPU"},
+        )
+        return bl_path
+
+    def _lookup(self, op, runner, inputs):
+        return self.tuner.search_cache(
+            op, [runner], (tuple(inputs[0].shape),), TuningConfig(), inputs
+        )
+
+    @staticmethod
+    def _load_in_order(blocklist_first, load_blocklist, load_cache):
+        if blocklist_first:
+            load_blocklist()
+            load_cache()
+        else:
+            load_cache()
+            load_blocklist()
+
+    def test_is_blocked(self, monkeypatch):
+        monkeypatch.setattr(
+            "flashinfer.tactics_blocklist._collect_metadata",
+            lambda: {"gpu": "NVIDIA B200"},
+        )
+        path = _write_json(
+            _make_blocklist_json({"op::StubRunnerB": [[128, 0]]}, gpu="NVIDIA B200")
+        )
+        try:
+            bl = TacticsBlocklist()
+            assert bl.load(path) is True
+            assert bl.is_blocked("op", "StubRunnerB", [128, 0])
+            assert bl.is_blocked("op", "StubRunnerB", (128, 0))
+            assert not bl.is_blocked("op", "StubRunnerB", [64, 0])
+            assert not bl.is_blocked("op", "StubRunnerA", [128, 0])
+            assert not bl.is_blocked("other_op", "StubRunnerB", [128, 0])
+            assert not TacticsBlocklist().is_blocked("op", "StubRunnerB", [128, 0])
+        finally:
+            os.unlink(path)
+
+    def test_blocklist_loaded_before_cache_file(self, monkeypatch, tmp_path):
+        """Listed entries are dropped on load; the rest still hit."""
+        import torch
+
+        profiled = self._patch_env(monkeypatch)
+        runner = StubRunnerA(valid_tactics=[0, 1, 2])
+        inputs = [torch.empty((4, 8), dtype=torch.float32)]
+        cache_path = str(tmp_path / "cache.json")
+        self._write_cache(cache_path, runner, inputs)
+
+        self.tuner._blocklist.load(self._blocklist_path(tmp_path))
+        assert self.tuner.load_configs(cache_path)
+        assert len(self.tuner._file_configs) == 1
+
+        # Listed entry: miss -> default tactic outside a tuning context ...
+        assert self._lookup(self.OP, runner, inputs)[0] is False
+        assert self.tuner.choose_one(self.OP, [runner], TuningConfig(), inputs)[1] == -1
+        # ... and a re-profile without the listed tactic inside one.
+        profiled.clear()
+        with autotune(tune_mode=True):
+            _, tactic = self.tuner.choose_one(self.OP, [runner], TuningConfig(), inputs)
+        assert sorted(profiled) == [0, 2]
+        assert tactic == 2
+
+        # Unlisted entry (same runner and tactic, different op) still hits.
+        profiled.clear()
+        hit = self._lookup(self.OTHER_OP, runner, inputs)
+        assert hit[:3] == (True, 0, 1)
+        with autotune(tune_mode=True):
+            _, tactic = self.tuner.choose_one(
+                self.OTHER_OP, [runner], TuningConfig(), inputs
+            )
+        assert tactic == 1
+        assert profiled == []
+
+    def test_blocklist_loaded_after_cache_file(self, monkeypatch, tmp_path):
+        """A blocklist loaded later retires already-loaded listed entries."""
+        import torch
+
+        profiled = self._patch_env(monkeypatch)
+        runner = StubRunnerA(valid_tactics=[0, 1, 2])
+        inputs = [torch.empty((4, 8), dtype=torch.float32)]
+        cache_path = str(tmp_path / "cache.json")
+        self._write_cache(cache_path, runner, inputs)
+
+        assert self.tuner.load_configs(cache_path)
+        assert len(self.tuner._file_configs) == 2
+        assert self._lookup(self.OP, runner, inputs)[:3] == (True, 0, 1)
+
+        self.tuner._blocklist.load(self._blocklist_path(tmp_path))
+        assert self._lookup(self.OP, runner, inputs)[0] is False
+        assert len(self.tuner._file_configs) == 1
+        assert self.tuner.choose_one(self.OP, [runner], TuningConfig(), inputs)[1] == -1
+        profiled.clear()
+        with autotune(tune_mode=True):
+            _, tactic = self.tuner.choose_one(self.OP, [runner], TuningConfig(), inputs)
+        assert sorted(profiled) == [0, 2]
+        assert tactic == 2
+        assert self._lookup(self.OTHER_OP, runner, inputs)[:3] == (True, 0, 1)
+
+    def test_dropped_entry_is_not_revived_by_save(self, monkeypatch, tmp_path):
+        """save_configs merges the on-disk file but not the dropped entry."""
+        import torch
+
+        self._patch_env(monkeypatch)
+        runner = StubRunnerA(valid_tactics=[0, 1, 2])
+        inputs = [torch.empty((4, 8), dtype=torch.float32)]
+        cache_path = str(tmp_path / "cache.json")
+        self._write_cache(cache_path, runner, inputs)
+
+        self.tuner._blocklist.load(self._blocklist_path(tmp_path))
+        assert self.tuner.load_configs(cache_path)
+        self.tuner.save_configs(cache_path)
+
+        with open(cache_path) as f:
+            saved = json.load(f)
+        entries = {k: v for k, v in saved.items() if not k.startswith("_")}
+        assert len(entries) == 1
+        ((key, value),) = entries.items()
+        assert key.startswith(f"({self.OTHER_OP!r}, ")
+        assert value[:2] == ["StubRunnerA", 1]
+
+    def test_save_keeps_a_permitted_winner_written_by_another_writer(
+        self, monkeypatch, tmp_path
+    ):
+        """A dropped key that another writer re-tuned to an allowed tactic
+        survives this writer's later save_configs (even after it switched
+        cache paths in between)."""
+        import torch
+
+        self._patch_env(monkeypatch)
+        runner = StubRunnerA(valid_tactics=[0, 1, 2])
+        inputs = [torch.empty((4, 8), dtype=torch.float32)]
+        cache_path = str(tmp_path / "cache.json")
+        self._write_cache(cache_path, runner, inputs)
+        bl_path = self._blocklist_path(tmp_path)
+
+        # Writer A drops OP's entry (tactic 1 is blocklisted).
+        writer_a = self.tuner
+        writer_a._blocklist.load(bl_path)
+        assert writer_a.load_configs(cache_path)
+        assert len(writer_a._file_configs) == 1
+
+        # Writer B re-tunes OP under the same blocklist and saves the winner.
+        AutoTuner._instance = None
+        writer_b = AutoTuner.get()
+        writer_b._blocklist.load(bl_path)
+        assert writer_b.load_configs(cache_path)
+        with autotune(tune_mode=True):
+            _, tactic = writer_b.choose_one(self.OP, [runner], TuningConfig(), inputs)
+        assert tactic == 2
+        writer_b.save_configs(cache_path)
+
+        # Writer A exports later, after a context on another cache path.
+        AutoTuner._instance = writer_a
+        with autotune(False, cache=str(tmp_path / "other-cache.json")):
+            pass
+        writer_a.save_configs(cache_path)
+
+        with open(cache_path) as f:
+            saved = json.load(f)
+        entries = {k: v for k, v in saved.items() if not k.startswith("_")}
+        assert len(entries) == 2
+        by_op = {k.split(", ")[0]: v for k, v in entries.items()}
+        assert by_op[f"({self.OP!r}"][:2] == ["StubRunnerA", 2]
+        assert by_op[f"({self.OTHER_OP!r}"][:2] == ["StubRunnerA", 1]
+
+    @pytest.mark.parametrize("blocklist_first", [True, False])
+    def test_replay_reports_blocklisted_tactic_in_both_orderings(
+        self, monkeypatch, tmp_path, blocklist_first
+    ):
+        """The miss reason is blocklisted_tactic whichever file loads first."""
+        import torch
+
+        self._patch_env(monkeypatch)
+        runner = StubRunnerA(valid_tactics=[0, 1, 2])
+        inputs = [torch.empty((4, 8), dtype=torch.float32)]
+        cache_path = str(tmp_path / "cache.json")
+        self._write_cache(cache_path, runner, inputs)
+
+        self._load_in_order(
+            blocklist_first,
+            lambda: self.tuner._blocklist.load(self._blocklist_path(tmp_path)),
+            lambda: self.tuner.load_configs(cache_path),
+        )
+
+        report = ReplayCoverage()
+        with autotune_v2(mode="replay", persistent_cache=False, replay_report=report):
+            _, tactic = self.tuner.choose_one(self.OP, [runner], TuningConfig(), inputs)
+            assert tactic == -1
+            _, tactic = self.tuner.choose_one(
+                self.OTHER_OP, [runner], TuningConfig(), inputs
+            )
+            assert tactic == 1
+        assert report.misses == 1
+        assert report.hits == 1
+        miss, hit = report.records
+        assert miss["status"] == "miss"
+        assert miss["reasons"] == ("blocklisted_tactic",)
+        assert hit["status"] == "hit"
+        assert hit["source"] == "legacy"
+        # The dropped key stays retired: a second lookup reports the same.
+        report = ReplayCoverage()
+        with autotune_v2(mode="replay", persistent_cache=False, replay_report=report):
+            self.tuner.choose_one(self.OP, [runner], TuningConfig(), inputs)
+        assert report.records[0]["reasons"] == ("blocklisted_tactic",)
+
+    def test_load_count_covers_only_the_current_file(self, monkeypatch, tmp_path):
+        """A late blocklist does not charge earlier files' drops to this load."""
+        import torch
+
+        self._patch_env(monkeypatch)
+        runner = StubRunnerA(valid_tactics=[0, 1, 2])
+        inputs_a = [torch.empty((4, 8), dtype=torch.float32)]
+        inputs_b = [torch.empty((8, 8), dtype=torch.float32)]
+        path_a = str(tmp_path / "cache_a.json")
+        path_b = str(tmp_path / "cache_b.json")
+        self._write_cache(path_a, runner, inputs_a)
+        self._write_cache(path_b, runner, inputs_b)
+
+        records = []
+        handler = logging.Handler()
+        handler.emit = lambda record: records.append(
+            (record.levelno, record.getMessage())
+        )
+        from flashinfer.autotuner import autotuner as autotuner_module
+
+        autotuner_module.logger.addHandler(handler)
+        try:
+            assert self.tuner.load_configs(path_a)
+            assert len(self.tuner._file_configs) == 2
+            self.tuner._blocklist.load(self._blocklist_path(tmp_path))
+            records.clear()
+            assert self.tuner.load_configs(path_b)
+        finally:
+            autotuner_module.logger.removeHandler(handler)
+
+        # Only the two unlisted entries remain, one per file.
+        assert len(self.tuner._file_configs) == 2
+        assert all(
+            k.startswith(f"({self.OTHER_OP!r}, ") for k in self.tuner._file_configs
+        )
+        loaded = [m for lvl, m in records if m.startswith("[Autotuner]: Loaded ")]
+        assert loaded == [f"[Autotuner]: Loaded 1 configs from {path_b}"]
+        dropped = [
+            m
+            for lvl, m in records
+            if lvl == logging.WARNING and m.startswith("[Autotuner]: Dropped ")
+        ]
+        assert len(dropped) == 2
+        assert dropped[0].startswith(
+            f"[Autotuner]: Dropped 1 cached config(s) from {path_b} "
+        )
+        assert dropped[1].startswith(
+            "[Autotuner]: Dropped 1 cached config(s) from previously loaded cache files "
+        )
+        # Both dropped entries miss, and neither is revived by a save.
+        assert self._lookup(self.OP, runner, inputs_a)[0] is False
+        assert self._lookup(self.OP, runner, inputs_b)[0] is False
+        assert self._lookup(self.OTHER_OP, runner, inputs_a)[:3] == (True, 0, 1)
+        assert self._lookup(self.OTHER_OP, runner, inputs_b)[:3] == (True, 0, 1)
+        self.tuner.save_configs(path_a)
+        with open(path_a) as f:
+            saved = {k: v for k, v in json.load(f).items() if not k.startswith("_")}
+        assert len(saved) == 2
+        assert all(k.startswith(f"({self.OTHER_OP!r}, ") for k in saved)
+
+    @pytest.mark.parametrize("blocklist_first", [True, False])
+    def test_unhashable_tactic_in_cache_file_is_served(
+        self, monkeypatch, tmp_path, blocklist_first
+    ):
+        """A dict tactic cannot be listed: it neither breaks loading nor is dropped."""
+        import torch
+
+        self._patch_env(monkeypatch)
+        dict_tactic = {"tile": 128, "stages": 3}
+        runner = StubRunnerA(valid_tactics=[0, 1, 2])
+        inputs = [torch.empty((4, 8), dtype=torch.float32)]
+        cache_path = str(tmp_path / "cache.json")
+        self._write_cache(cache_path, runner, inputs)
+        with open(cache_path) as f:
+            saved = json.load(f)
+        (op_key,) = [k for k in saved if k.startswith(f"({self.OP!r}, ")]
+        saved[op_key][1] = dict_tactic
+        with open(cache_path, "w") as f:
+            json.dump(saved, f)
+
+        self._load_in_order(
+            blocklist_first,
+            lambda: self.tuner._blocklist.load(self._blocklist_path(tmp_path)),
+            lambda: self.tuner.load_configs(cache_path),
+        )
+        assert len(self.tuner._file_configs) == 2
+
+        blocklist = self.tuner._blocklist
+        assert not blocklist.is_blocked(self.OP, "StubRunnerA", dict_tactic)
+        assert not blocklist.is_blocked(self.OP, "StubRunnerA", (1, dict_tactic))
+        assert blocklist.is_blocked(self.OP, "StubRunnerA", 1)
+        assert blocklist.filter(self.OP, runner, [0, 1, dict_tactic]) == [
+            0,
+            dict_tactic,
+        ]
+
+        hit = self._lookup(self.OP, runner, inputs)
+        assert hit[:3] == (True, 0, dict_tactic)
+        assert self.tuner.choose_one(self.OP, [runner], TuningConfig(), inputs)[1] == (
+            dict_tactic
+        )
+        assert self._lookup(self.OTHER_OP, runner, inputs)[:3] == (True, 0, 1)
+        assert self.tuner._blocklisted_file_keys == set()
 
 
 # ---------------------------------------------------------------------------

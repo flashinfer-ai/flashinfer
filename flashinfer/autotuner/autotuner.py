@@ -23,6 +23,7 @@ from typing import (
     Callable,
     Iterable,
     List,
+    Mapping,
     Optional,
     Sequence,
     TypeAlias,
@@ -1091,6 +1092,7 @@ def autotune(
             tuner._file_configs.clear()
             tuner._file_config_policies.clear()
             tuner._file_config_selections.clear()
+            tuner._blocklisted_file_keys.clear()
             tuner._namespaced_records.clear()
             tuner._dirty_namespaces.clear()
             tuner._logged_file_hits.clear()
@@ -1884,6 +1886,10 @@ class AutoTuner:
         # Keep disk merges from reviving superseded runners, including when
         # exporting the same cache to more than one path. Reset by clear_cache.
         self._invalidated_file_keys: set[str] = set()
+        # Cache-file keys dropped because their tactic is blocklisted, so a
+        # lookup for one reports "blocklisted_tactic" rather than "not_found"
+        # whichever of the blocklist and the cache file was loaded first.
+        self._blocklisted_file_keys: set[str] = set()
         # Reject legacy entries within one managed/policy identity without
         # deleting the user's global v1 configs. Keep these across v2 reload.
         self._excluded_file_keys: dict[tuple, set[str]] = {}
@@ -2113,6 +2119,83 @@ class AutoTuner:
                     f"failed revalidation; treating as a cache miss."
                 )
         return ok
+
+    def _drop_blocklisted_file_configs(
+        self, source: str, keys: Iterable[str] | None = None
+    ) -> int:
+        """Forget loaded cache-file entries whose tactic is blocklisted.
+
+        A cache file tuned before a tactic was added to the tactics blocklist
+        still records that tactic as the winner.  Serving it would defeat the
+        blocklist, so such entries are dropped and become cache misses: they
+        are re-profiled (without the listed tactics) inside a tuning context
+        and fall back to the runner's default tactic otherwise.  The dropped
+        keys are remembered so a later lookup reports the miss as
+        ``blocklisted_tactic`` and so :meth:`save_configs` does not write the
+        on-disk entry back while its tactic is still blocklisted.  Returns the
+        number of entries dropped.
+
+        ``keys`` restricts the sweep to those cache-file keys (used by
+        :meth:`load_configs` to count and attribute only the entries one call
+        loaded); by default every loaded entry is checked.  ``source`` names
+        where the dropped entries came from in the warning.
+        """
+        blocklist = self._blocklist
+        if not blocklist.is_loaded:
+            return 0
+        dropped = 0
+        with self._lock:
+            if not self._file_configs:
+                return 0
+            candidates = self._file_configs if keys is None else keys
+            for file_key in self._blocklisted_keys_in(self._file_configs, candidates):
+                del self._file_configs[file_key]
+                self._file_config_policies.pop(file_key, None)
+                self._file_config_selections.pop(file_key, None)
+                self._blocklisted_file_keys.add(file_key)
+                dropped += 1
+        if dropped:
+            logger.warning(
+                f"[Autotuner]: Dropped {dropped} cached config(s) from {source} "
+                f"whose tactic is in the tactics blocklist "
+                f"({blocklist.loaded_path}). They will be re-tuned when "
+                "autotuning is enabled."
+            )
+        return dropped
+
+    def _blocklisted_keys_in(
+        self, entries: Mapping[str, tuple[str, Any]], keys: Iterable[str]
+    ) -> list[str]:
+        """Return the *keys* whose ``entries`` tactic is in the blocklist.
+
+        ``entries`` maps cache-file keys to ``(runner_name, tactic)``; keys
+        missing from it are ignored.  Does not take the lock.
+        """
+        blocklist = self._blocklist
+        if not blocklist.is_loaded:
+            return []
+        keys = list(keys)
+        hits: list[str] = []
+        for op_key in blocklist.summary():
+            # Blocklist keys are "custom_op::RunnerClass"; custom_op may
+            # itself contain "::" (e.g. "flashinfer::op"), the class name
+            # cannot.  file_key is str((custom_op, runner_class, ...)).
+            if "::" not in op_key:
+                continue
+            custom_op, runner_name = op_key.rsplit("::", 1)
+            prefix = f"({custom_op!r}, {runner_name!r}, "
+            for file_key in keys:
+                if not file_key.startswith(prefix):
+                    continue
+                entry = entries.get(file_key)
+                if entry is None:
+                    continue
+                stored_runner, tactic = entry
+                if stored_runner == runner_name and blocklist.is_blocked(
+                    custom_op, runner_name, tactic
+                ):
+                    hits.append(file_key)
+        return hits
 
     @property
     def _active_managed_store(self):
@@ -2462,7 +2545,9 @@ class AutoTuner:
             # 2. User-loaded configs (from load_configs or autotune(cache=...)).
             #    Skipped wholesale when nothing was loaded, so the common
             #    serving path never builds a file_key string here.
-            if self._file_configs and not self._isolate_legacy_configs:
+            if (
+                self._file_configs or self._blocklisted_file_keys
+            ) and not self._isolate_legacy_configs:
                 for r_id, cache_key in runner_keys:
                     file_key = cache_key.file_key
                     if file_key in excluded_file_keys:
@@ -2481,6 +2566,18 @@ class AutoTuner:
                                 and "runner_mismatch" not in rejections
                             ):
                                 rejections.append("runner_mismatch")
+                            continue
+                        if self._blocklist.is_blocked(custom_op, runner_name, tactic):
+                            # The blocklist was loaded after this cache file
+                            # (load_configs already drops listed entries).
+                            self._drop_blocklisted_file_configs(
+                                "previously loaded cache files"
+                            )
+                            if (
+                                rejections is not None
+                                and "blocklisted_tactic" not in rejections
+                            ):
+                                rejections.append("blocklisted_tactic")
                             continue
                         if not self._tactic_still_valid(
                             runners[r_id],
@@ -2516,6 +2613,15 @@ class AutoTuner:
                                 tactic=tactic,
                             )
                         return True, r_id, tactic, None
+                    elif file_key in self._blocklisted_file_keys:
+                        # Dropped by load_configs (blocklist loaded first):
+                        # report it like the late-blocklist drop above, not
+                        # as an entry that was never tuned.
+                        if (
+                            rejections is not None
+                            and "blocklisted_tactic" not in rejections
+                        ):
+                            rejections.append("blocklisted_tactic")
 
             # 2.5 Managed v2 per-entry store (the active context's store, or
             #     the ambient attached store outside any context); decoded
@@ -4863,6 +4969,7 @@ class AutoTuner:
             namespaced_records = copy.deepcopy(self._namespaced_records)
             dirty_namespaces = frozenset(self._dirty_namespaces)
             invalidated_file_keys = frozenset(self._invalidated_file_keys)
+            blocklisted_file_keys = frozenset(self._blocklisted_file_keys)
 
             # Include previously loaded file configs as a base
             for file_key, (runner_name, tactic) in self._file_configs.items():
@@ -4947,6 +5054,18 @@ class AutoTuner:
                 # Same environment: merge on-disk entries and preserve the
                 # original "created by" record.
                 for file_key in invalidated_file_keys:
+                    disk_configs.pop(file_key, None)
+                # An entry dropped at load time because its tactic is
+                # blocklisted is removed only while the on-disk tactic is
+                # still blocklisted: another writer may have re-tuned the
+                # key to a permitted tactic since, and that result must
+                # survive this save.
+                stale: dict[str, tuple[str, Any]] = {}
+                for file_key in blocklisted_file_keys:
+                    value = disk_configs.get(file_key)
+                    if isinstance(value, list) and len(value) >= 2:
+                        stale[file_key] = (value[0], _json_to_tactic(value[1]))
+                for file_key in self._blocklisted_keys_in(stale, stale):
                     disk_configs.pop(file_key, None)
                 disk_configs.update(configs)
                 configs = disk_configs
@@ -5132,6 +5251,7 @@ class AutoTuner:
                 return False
 
         skipped_legacy_cudnn_tactics = 0
+        loaded_keys: list[str] = []
         with self._lock:
             if not isinstance(namespaced_records, dict):
                 raise ValueError("Autotuner namespaced records must be a JSON object")
@@ -5148,6 +5268,10 @@ class AutoTuner:
                     skipped_legacy_cudnn_tactics += 1
                     continue
                 self._file_configs[key] = (runner_name, tactic)
+                loaded_keys.append(key)
+                # A reloaded entry is checked against the blocklist afresh
+                # below; it must not keep an earlier drop's miss reason.
+                self._blocklisted_file_keys.discard(key)
                 # Older records contain only runner and tactic. Do not inherit
                 # provenance from a previously loaded record for the same key.
                 self._file_config_policies.pop(key, None)
@@ -5157,6 +5281,7 @@ class AutoTuner:
                 # Kept only to be saved back; selection never reads it.
                 if len(value) > 3 and isinstance(value[3], dict):
                     self._file_config_selections[key] = dict(value[3])
+            earlier_keys = self._file_configs.keys() - set(loaded_keys)
 
         if skipped_legacy_cudnn_tactics:
             logger.warning(
@@ -5164,9 +5289,17 @@ class AutoTuner:
                 "cuDNN config(s) using integer plan-index tactics. They will "
                 "be re-tuned when autotuning is enabled."
             )
+        # Only this file's entries count against (and are attributed to) it.
+        dropped_blocklisted = self._drop_blocklisted_file_configs(path, loaded_keys)
+        # A blocklist loaded after an earlier cache file retires that file's
+        # listed entries here too, reported under their own source.
+        self._drop_blocklisted_file_configs(
+            "previously loaded cache files", earlier_keys
+        )
 
         logger.info(
-            f"[Autotuner]: Loaded {len(configs) - skipped_legacy_cudnn_tactics} "
+            f"[Autotuner]: Loaded "
+            f"{len(configs) - skipped_legacy_cudnn_tactics - dropped_blocklisted} "
             f"configs from {path}"
         )
         return True
@@ -5355,6 +5488,7 @@ class AutoTuner:
             self._file_config_policies.clear()
             self._file_config_selections.clear()
             self._invalidated_file_keys.clear()
+            self._blocklisted_file_keys.clear()
             self._excluded_file_keys.clear()
             self._namespaced_records.clear()
             self._dirty_namespaces.clear()
