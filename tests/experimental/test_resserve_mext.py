@@ -25,7 +25,7 @@ def _decode(packed, scales):
         + ((r % 128) // 32) * 4
         + c % 4
     )
-    sf = scales.view(torch.float8_e4m3fn).float()[offsets]
+    sf = scales.reshape(-1).view(torch.float8_e4m3fn).float()[offsets]
     return table[values] * sf.repeat_interleave(16, dim=1)
 
 
@@ -157,7 +157,7 @@ def test_partial_scale_tile(dtype, k):
     )
     padding = torch.ones(sf.numel(), device="cuda", dtype=torch.bool)
     padding[offsets.flatten()] = False
-    assert (sf[padding] == 0).all()
+    assert (sf.reshape(-1)[padding] == 0).all()
 
 
 def test_reject_independent_residue_scale():

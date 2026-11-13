@@ -30,6 +30,31 @@ def _check_tensor(tensor, name, device, dtype, alignment=16, *, contiguous=True)
         raise ValueError(f"{name} must be contiguous and {alignment}-byte aligned")
 
 
+def _swizzle_shape(rows: int, k: int) -> tuple[int, int]:
+    """128-row, 4-scale E4M3 swizzle viewed as ``(padded_rows, k_tiles * 4)``."""
+    return ((rows + 127) // 128) * 128, ((k + 63) // 64) * 4
+
+
+def _swizzle_view(scales: torch.Tensor, rows: int, k: int) -> torch.Tensor:
+    padded_rows, cols = _swizzle_shape(rows, k)
+    return scales.view(torch.float8_e4m3fn).view(padded_rows, cols)
+
+
+def _check_swizzle(scale, rows: int, k: int, name: str, device) -> None:
+    padded_rows, cols = _swizzle_shape(rows, k)
+    expected = padded_rows * cols
+    if scale.dtype not in (torch.uint8, torch.float8_e4m3fn):
+        raise ValueError(f"{name} must be uint8 or float8_e4m3fn")
+    if not scale.is_cuda or scale.device != device or not scale.is_contiguous():
+        raise ValueError(f"{name} must be a contiguous CUDA tensor on {device}")
+    if scale.data_ptr() % 16:
+        raise ValueError(f"{name} must be 16-byte aligned")
+    if scale.ndim == 2 and tuple(scale.shape) != (padded_rows, cols):
+        raise ValueError(f"{name} must have shape {(padded_rows, cols)}")
+    if scale.ndim not in (1, 2) or scale.numel() != expected:
+        raise ValueError(f"{name} must contain {expected} swizzle bytes")
+
+
 def _check_sm100(tensor):
     if not tensor.is_cuda:
         raise ValueError("ResServe requires CUDA tensors")
@@ -59,8 +84,9 @@ def nvfp4_quantize_kext(
     preconditions, not checked with a synchronizing device-to-host copy.
 
     Returns packed uint8 E2M1 ``[M, K_ext/2]`` (base then selected residue)
-    and flat uint8 E4M3 scales in the 128-row, 4-scale swizzle, with zero
-    padding. Extended weights must append the same selected columns in
+    and E4M3 scales in the 128-row, 4-scale swizzle, viewed as
+    ``(padded_M, K_ext_tiles * 4)``. Padding entries are zero.
+    Extended weights must append the same selected columns in
     ascending channel order *before* weight quantization. Use ordinary
     ``flashinfer.mm_fp4`` with reconstruction alpha equal to the reciprocal
     product of activation and weight global multipliers. Its backend-specific
@@ -89,9 +115,11 @@ def nvfp4_quantize_kext(
     from .experimental.resserve_kext.quantization import quantize
 
     with torch.cuda.device(input.device):
-        return quantize(
+        packed, scales = quantize(
             input, global_scale, channel_masks, residue_per_8, elts_per_thread
         )
+        ext = input.shape[1] + input.shape[1] // 8 * residue_per_8
+        return packed, _swizzle_view(scales, input.shape[0], ext)
 
 
 @flashinfer_experimental_api
@@ -105,8 +133,9 @@ def nvfp4_quantize_residue(input: torch.Tensor, global_scale: torch.Tensor):
     with a synchronizing device-to-host copy).
 
     Returns uint8 packed E2M1 ``[2*M, K/2]`` in adjacent base/residue row order
-    and a flat uint8 E4M3 scale buffer in the 128-row, 4-scale swizzle layout.
-    Padding scale entries are zero. The residue is computed from the quantized
+    and E4M3 scales in the 128-row, 4-scale swizzle, viewed as
+    ``(padded_rows, K_tiles * 4)``. Padding entries are zero.
+    The residue is computed from the quantized
     and reconstructed base, following ResServe's production pack16 algorithm.
     """
     _check_sm100(input)
@@ -119,7 +148,8 @@ def nvfp4_quantize_residue(input: torch.Tensor, global_scale: torch.Tensor):
     from .experimental.resserve_mext.quantization import quantize
 
     with torch.cuda.device(input.device):
-        return quantize(input, global_scale)
+        packed, scales = quantize(input, global_scale)
+        return packed, _swizzle_view(scales, 2 * input.shape[0], input.shape[1])
 
 
 @flashinfer_experimental_api
@@ -137,8 +167,9 @@ def mm_nvfp4_residue(
     ``weight`` is packed uint8 ``[N, K/2]`` with K-contiguous, nonoverlapping
     rows and a 32-byte-aligned row stride. A base-K view of extended weights
     is accepted; its scales must be separately packed for the base K.
-    Both scale buffers use
-    the 128-row, 4-scale swizzle (E4M3 bytes). K is divisible by 64, N by 8.
+    Both scale buffers are the 128-row, 4-scale E4M3 swizzle, as a
+    ``(padded_rows, K_tiles * 4)`` view (float8 or uint8) or the same bytes
+    flattened. K is divisible by 64, N by 8.
     ``alpha`` is one FP32 reconstruction multiplier: the reciprocal of
     the product of activation and weight quantization global multipliers.
     It scales the sum of the base and residue accumulators.
@@ -157,6 +188,8 @@ def mm_nvfp4_residue(
         (act_scale, "act_scale", 16),
         (weight_scale, "weight_scale", 16),
     ):
+        if name in ("act_scale", "weight_scale"):
+            continue
         _check_tensor(
             tensor,
             name,
@@ -178,13 +211,8 @@ def mm_nvfp4_residue(
         raise ValueError(
             "weight requires nonoverlapping K-contiguous rows with 32B-aligned stride"
         )
-    for scale, rows, name in (
-        (act_scale, m2, "act_scale"),
-        (weight_scale, n, "weight_scale"),
-    ):
-        expected = ((rows + 127) // 128) * ((2 * kp + 63) // 64) * 512
-        if scale.numel() != expected:
-            raise ValueError(f"{name} must contain {expected} bytes")
+    _check_swizzle(act_scale, m2, 2 * kp, "act_scale", act.device)
+    _check_swizzle(weight_scale, n, 2 * kp, "weight_scale", act.device)
     if alpha.numel() != 1 or out_dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("alpha must have one element; output must be FP16/BF16")
     from .experimental.resserve_mext.host import (

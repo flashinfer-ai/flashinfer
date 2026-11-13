@@ -16,8 +16,9 @@ reconstruction errors for selected channels after each base activation row.
   exactly that many set bits per byte; bit zero selects the first channel.
 - Inputs must be finite; the FP32 global multiplier must be positive and finite.
   Mask values and multiplier contents are caller preconditions.
-- Packed outputs are uint8 E2M1; E4M3 scales use the 128-row, 4-scale swizzle
-  with zero padding. See the API docstring for output sizes.
+- Packed outputs are uint8 E2M1. E4M3 scales use the 128-row, 4-scale swizzle
+  with zero padding, returned as a `(padded_rows, K_tiles * 4)` float8 view.
+  Pass that view to `mm_fp4`. See the API docstring for output sizes.
 - Before quantizing weights, append the same selected columns in ascending
   order. Use the extended tensors with upstream `mm_fp4`; downstream GEMM
   alignment still applies and may require extra padding.

@@ -82,7 +82,7 @@ def test_selected_residue(dtype, count, m, k):
         assert (residue - target).square().mean() < target.square().mean() * 0.1
         padding = torch.ones(sf.numel(), device="cuda", dtype=torch.bool)
         padding[offsets.flatten()] = False
-        assert (sf[padding] == 0).all()
+        assert (sf.reshape(-1)[padding] == 0).all()
         outputs.append(decoded)
     torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
     for output in outputs[2:]:
