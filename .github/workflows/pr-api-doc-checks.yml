@@ -28,12 +28,21 @@ jobs:
         continue-on-error: true
         run: python -m unittest discover -s scripts/tests -p 'test_check_pr_api_diff.py' -v
 
+      - name: Resolve PR comparison commits
+        id: comparison
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python scripts/pr_checks/git_compare.py \
+            --head "$PR_HEAD_SHA" \
+            --github-output "$GITHUB_OUTPUT"
+
       - name: Check public API signature and export changes
         id: public_api
         continue-on-error: true
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ steps.comparison.outputs.base }}
+          HEAD_SHA: ${{ steps.comparison.outputs.head }}
         run: |
           set -o pipefail
           if python scripts/check_pr_api_diff.py \
@@ -54,8 +63,8 @@ jobs:
         id: static_documentation
         continue-on-error: true
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ steps.comparison.outputs.base }}
+          HEAD_SHA: ${{ steps.comparison.outputs.head }}
         run: |
           set -o pipefail
           if python scripts/check_pr_document.py \
