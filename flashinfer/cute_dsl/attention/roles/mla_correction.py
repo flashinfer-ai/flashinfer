@@ -477,6 +477,9 @@ class MLACorrectionRole:
                     (tidx + 64) % (self.num_compute_warps * self.threads_per_warp)
                 ]
             )
+            # The partner thread must finish reading this slot before the
+            # next work unit's epilogue overwrites it (write-after-read).
+            self.epilogue_exchange_sync_bar.arrive_and_wait()
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
             self._epilogue_one_iter(
                 common_params,
@@ -590,6 +593,10 @@ class MLACorrectionRole:
                                         )
                                     ]
                                 )
+                                # The partner thread must finish reading this
+                                # slot before the next work unit's epilogue
+                                # overwrites it (write-after-read).
+                                self.epilogue_exchange_sync_bar.arrive_and_wait()
                             for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
                                 mma_o_handle = mma_o_consumer.wait_and_advance()
                                 self._epilogue_one_iter(
