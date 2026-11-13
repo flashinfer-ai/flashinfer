@@ -158,53 +158,108 @@ def _per_token_group_quant_8bit_cuda(
     return x_q, x_s
 
 
+SPECIALIZED_KERNEL_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
+# Deprecated alias, honored for one release; use the shared kill switch above.
 PER_TOKEN_GROUP_QUANT_CUTE_DSL_DISABLE_ENV = (
     "FLASHINFER_DISABLE_PER_TOKEN_GROUP_QUANT_CUTE_DSL"
 )
 
+PER_TOKEN_GROUP_QUANT_BACKENDS = ("auto", "specialized", "cutile", "cuda")
 
-def use_per_token_group_quant_cute_dsl(
+_ptgq_stats = {
+    "backend_dispatches": {"specialized": 0, "stock": 0},
+    "fallback_reasons": {},
+}
+
+
+def _reset_per_token_group_quant_stats() -> None:
+    _ptgq_stats["backend_dispatches"] = {"specialized": 0, "stock": 0}
+    _ptgq_stats["fallback_reasons"] = {}
+
+
+def _ptgq_record_fallback(reason: str) -> None:
+    fr = _ptgq_stats["fallback_reasons"]
+    fr[reason] = fr.get(reason, 0) + 1
+
+
+def _ptgq_specialized_disabled() -> bool:
+    for env in (
+        SPECIALIZED_KERNEL_DISABLE_ENV,
+        PER_TOKEN_GROUP_QUANT_CUTE_DSL_DISABLE_ENV,
+    ):
+        if os.environ.get(env, "0") not in ("", "0"):
+            return True
+    return False
+
+
+@functools.cache
+def _ptgq_specialized_dispatch_table() -> Optional[Dict]:
+    """The packaged allowlist that gates ``backend="auto"`` routing.
+
+    ``auto`` routes to the specialized kernel only when this file loads and
+    carries the expected keys; the compiled-in guards in
+    :func:`use_per_token_group_quant_specialized` stay authoritative."""
+    try:
+        import importlib.resources
+        import json
+
+        data = (
+            importlib.resources.files("flashinfer")
+            / "ptgq_fp8_g128_sm90_dispatch.json"
+        ).read_text()
+        table = json.loads(data)
+        if not isinstance(table.get("backends"), list):
+            return None
+        if "per_token_group_quant_8bit" not in table.get("ops", {}):
+            return None
+        return table
+    except Exception:
+        return None
+
+
+def use_per_token_group_quant_specialized(
     x: torch.Tensor,
     group_size: int,
     dst_dtype: torch.dtype,
     column_major_scales: bool,
     scale_tma_aligned: bool,
     scale_ue8m0: bool,
-) -> bool:
-    """Whether the CuTe-DSL sm90 fast path handles this call.
+) -> Tuple[bool, str]:
+    """Whether the specialized (agent-generated CuTe-DSL) sm90 kernel
+    handles this call; returns ``(eligible, reason)``.
 
-    The fast path covers exactly the default form of
+    The specialized kernel covers exactly the default form of
     :func:`per_token_group_quant_8bit` — 2D contiguous bf16 CUDA input,
     ``group_size=128``, ``float8_e4m3fn`` output, row-major fp32 scales —
     on sm90 devices with the optional ``nvidia-cutlass-dsl`` runtime
     installed. The option-bearing forms (``column_major_scales``,
     ``scale_tma_aligned``, ``scale_ue8m0``), other dtypes, group sizes and
-    architectures stay on the stock paths. Setting the environment variable
-    ``FLASHINFER_DISABLE_PER_TOKEN_GROUP_QUANT_CUTE_DSL`` to a non-empty
-    value other than ``0`` restores the stock cuTile path unconditionally
+    architectures stay on the stock paths. Setting
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE`` (or, for one release, the
+    deprecated ``FLASHINFER_DISABLE_PER_TOKEN_GROUP_QUANT_CUTE_DSL``) to a
+    non-empty value other than ``0`` keeps every call on the stock paths
     (checked per call, so it can be flipped at runtime).
     """
-    if os.environ.get(PER_TOKEN_GROUP_QUANT_CUTE_DSL_DISABLE_ENV, "0") not in (
-        "",
-        "0",
-    ):
-        return False
+    # GPU-free guards first, then layout, then device.
+    if _ptgq_specialized_disabled():
+        return False, "kill_switch"
     if column_major_scales or scale_tma_aligned or scale_ue8m0:
-        return False
+        return False, "option_form"
     if group_size != 128 or dst_dtype != torch.float8_e4m3fn:
-        return False
+        return False, "group_or_dtype"
     if (
         x.dim() != 2
         or x.dtype != torch.bfloat16
-        or not x.is_cuda
         or not x.is_contiguous()
         or x.numel() == 0
         or x.shape[-1] % 128 != 0
     ):
-        return False
-    if torch.cuda.get_device_capability(x.device)[0] != 9:
-        return False
-    return is_cute_dsl_available()
+        return False, "layout"
+    if not x.is_cuda or torch.cuda.get_device_capability(x.device)[0] != 9:
+        return False, "device"
+    if not is_cute_dsl_available():
+        return False, "runtime_unavailable"
+    return True, "ok"
 
 
 def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
@@ -1271,7 +1326,7 @@ def per_token_group_quant_8bit(
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
-    backend: Literal["cutile", "cuda"] = "cutile",
+    backend: Literal["auto", "specialized", "cutile", "cuda"] = "auto",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Per-token group 8-bit quantization (FP8 or INT8).
 
@@ -1300,17 +1355,28 @@ def per_token_group_quant_8bit(
     scale_ue8m0 : bool
         If ``True``, encode scales in the UE8M0 format (Blackwell / sm100+).
     backend : str
-        Implementation backend. ``"cutile"`` uses the cuda.tile Python
-        backend; on sm90, when the optional ``nvidia-cutlass-dsl`` runtime is
-        installed and the call is the default form (2D contiguous bf16 input,
+        Implementation backend, keyword ``"auto"`` by default. ``"auto"``
+        behaves exactly like the stock ``"cutile"`` route except that, on
+        sm90 with the optional ``nvidia-cutlass-dsl`` runtime installed and
+        the call in the default form (2D contiguous bf16 input,
         ``group_size=128``, ``float8_e4m3fn`` output, row-major scales), it
-        dispatches to a CuTe-DSL fast path with identical semantics (set
-        ``FLASHINFER_DISABLE_PER_TOKEN_GROUP_QUANT_CUTE_DSL=1`` to restore
-        the stock cuTile kernel; warm the op up once before CUDA graph
-        capture). ``"cuda"`` uses a register-resident native CUDA kernel and
-        currently supports ``group_size=128`` with FP16/BF16 input. Both
-        backends compute the scale with IEEE float32 division and, for
-        ``dst_dtype=torch.int8``, round half up (``floor(x + 0.5)``).
+        dispatches to a specialized agent-generated CuTe-DSL kernel with
+        identical semantics, gated by the packaged allowlist
+        ``ptgq_fp8_g128_sm90_dispatch.json`` (warm the op up once before CUDA
+        graph capture). ``"specialized"`` requests that kernel explicitly and
+        falls back to the ``"cutile"`` path, recorded in the module's
+        fallback stats, when the call is off-contract. ``"cutile"`` and
+        ``"cuda"`` are never rerouted: ``"cutile"`` always runs the stock
+        cuda.tile Python backend, and ``"cuda"`` always runs the stock
+        register-resident native CUDA kernel (``group_size=128`` with
+        FP16/BF16 input). Setting ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``
+        (or, deprecated for one release,
+        ``FLASHINFER_DISABLE_PER_TOKEN_GROUP_QUANT_CUTE_DSL=1``) keeps every
+        call on the stock paths. The stock backends compute the scale with
+        IEEE float32 division and, for ``dst_dtype=torch.int8``, round half
+        up (``floor(x + 0.5)``); the specialized kernel matches the
+        ``"cutile"`` outputs except one-ulp fp8 payload differences on a
+        vanishing fraction of elements (scales are bit-identical).
 
     Returns
     -------
@@ -1321,16 +1387,47 @@ def per_token_group_quant_8bit(
     if dst_dtype is None:
         dst_dtype = torch.float8_e4m3fn
 
+    if backend not in PER_TOKEN_GROUP_QUANT_BACKENDS:
+        raise ValueError(
+            f"Unknown backend {backend!r}; expected one of "
+            f"{PER_TOKEN_GROUP_QUANT_BACKENDS}"
+        )
+
+    if backend in ("auto", "specialized"):
+        eligible, reason = use_per_token_group_quant_specialized(
+            x,
+            group_size,
+            dst_dtype,
+            column_major_scales,
+            scale_tma_aligned,
+            scale_ue8m0,
+        )
+        if backend == "auto" and eligible:
+            if _ptgq_specialized_dispatch_table() is None:
+                eligible, reason = False, "no_dispatch_table"
+        if eligible:
+            try:
+                from .kernels.cute_dsl.per_token_group_quant_8bit_cute_dsl import (
+                    per_token_group_quant_fp8_g128_cute_dsl,
+                )
+
+                out = per_token_group_quant_fp8_g128_cute_dsl(x, eps)
+                _ptgq_stats["backend_dispatches"]["specialized"] += 1
+                return out
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "specialized per_token_group_quant_8bit kernel failed; "
+                    "falling back to the stock cutile backend",
+                    exc_info=True,
+                )
+                reason = "jit_or_launch_failure"
+        _ptgq_record_fallback(reason)
+        backend = "cutile"
+
+    _ptgq_stats["backend_dispatches"]["stock"] += 1
     if backend == "cutile":
-        if use_per_token_group_quant_cute_dsl(
-            x, group_size, dst_dtype, column_major_scales, scale_tma_aligned, scale_ue8m0
-        ):
-            from .kernels.cute_dsl.per_token_group_quant_8bit_cute_dsl import (
-                per_token_group_quant_fp8_g128_cute_dsl,
-            )
-
-            return per_token_group_quant_fp8_g128_cute_dsl(x, eps)
-
         from .kernels.cutile.per_token_group_quant_8bit_cutile import (
             per_token_group_quant_8bit_cutile,
         )

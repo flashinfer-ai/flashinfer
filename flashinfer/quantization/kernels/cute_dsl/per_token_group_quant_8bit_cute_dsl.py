@@ -359,9 +359,20 @@ def _compiled(lanes_per_group, threads, x, q_bytes, s):
                 "under capture. Call the op once eagerly on a representative "
                 "shape first."
             )
-        x_view = from_dlpack(x, enable_tvm_ffi=True).mark_layout_dynamic()
-        q_view = from_dlpack(q_bytes, enable_tvm_ffi=True).mark_layout_dynamic()
-        s_view = from_dlpack(s, enable_tvm_ffi=True).mark_layout_dynamic()
+        # The contract guarantees contiguous row-major tensors, so the
+        # leading (stride-1) dimension is always the last one. Passing it
+        # explicitly matters when the compile-triggering call has size-1
+        # dimensions (e.g. a (1, 128) input, whose (1, 1) scale tensor gives
+        # mark_layout_dynamic no stride to deduce the leading dim from).
+        x_view = from_dlpack(x, enable_tvm_ffi=True).mark_layout_dynamic(
+            leading_dim=x.dim() - 1
+        )
+        q_view = from_dlpack(q_bytes, enable_tvm_ffi=True).mark_layout_dynamic(
+            leading_dim=q_bytes.dim() - 1
+        )
+        s_view = from_dlpack(s, enable_tvm_ffi=True).mark_layout_dynamic(
+            leading_dim=s.dim() - 1
+        )
         fn = cute.compile(
             _build(lanes_per_group, threads),
             x_view,
@@ -388,7 +399,7 @@ def per_token_group_quant_fp8_g128_cute_dsl(
     ``x_q = float8_e4m3fn`` of ``x.shape`` and ``x_s = float32`` of shape
     ``(*x.shape[:-1], x.shape[-1] // 128)``. Callers are expected to have
     checked the contract via
-    :func:`flashinfer.quantization.fp8_quantization.use_per_token_group_quant_cute_dsl`.
+    :func:`flashinfer.quantization.fp8_quantization.use_per_token_group_quant_specialized`.
     """
     x_q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     x_s = torch.empty(
