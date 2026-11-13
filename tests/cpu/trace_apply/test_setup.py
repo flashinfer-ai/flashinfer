@@ -692,6 +692,28 @@ def test_a_racing_reprepare_is_validated_against_the_call():
     assert life.teardowns == [{"serial": 99}]
 
 
+def test_a_racing_reprepare_served_during_capture_freezes(monkeypatch):
+    """A replacement served to a capturing call freezes the binding, as a hit would."""
+    life = _Lifecycle()
+    wrapper = bind(life)
+    a, out = torch.ones(2), torch.empty(2)
+    wrapper(x=a, out=out)
+    key = next(iter(wrapper._states))
+    old = wrapper._states[key]
+    a.fill_(3.0)
+    # A racing call already re-prepared at the current contents; this call is
+    # capturing, so the state it serves must pin for the process's life.
+    fresh = tuple(su._tensor_version(tensor) for tensor in old[1])
+    wrapper._states[key] = ({"serial": 2}, old[1], fresh, old[3])
+    monkeypatch.setattr(su, "_is_capturing", lambda device: True)
+    entry = wrapper._reprepare(
+        key, "x", old, (a,), {"x": a, "out": out}, torch.device("cpu")
+    )
+    assert entry[0] == {"serial": 2} and wrapper.frozen
+    with pytest.raises(SetupStateError, match="kept for the life of the process"):
+        wrapper.release()
+
+
 def test_an_inference_tensor_is_served_with_identity_keying_only():
     """An inference-mode tensor tracks no version: no refusal, no re-prepare."""
     life = _Lifecycle()

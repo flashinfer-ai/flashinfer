@@ -398,6 +398,11 @@ class SetupBoundCallable:
                     return self._prepare(key, tensors, kwargs, device)
                 again = self._stale_input(current, tensors)
                 if again is None:
+                    # The replacement was prepared outside this call's capture;
+                    # its addresses are about to be recorded — freeze, as a plain
+                    # captured hit would.
+                    if not self._frozen and _is_capturing(device):
+                        self._frozen = True
                     return current  # a racing call re-prepared; the entry is current
                 # The replacement may postdate a further rewrite: re-check it.
                 return self._reprepare(key, again, current, tensors, kwargs, device)
