@@ -389,7 +389,15 @@ def assert_mega_outputs(actual, expected):
     torch.testing.assert_close(scales, expected_scales, atol=0, rtol=0)
 
 
-def decode_fixture(requests=1, *, heads=64, history_tokens=32768, seed=42, inline=True):
+def decode_fixture(
+    requests=1,
+    *,
+    heads=64,
+    history_tokens=32768,
+    seed=42,
+    cache_format="v41_fp8",
+    inline=True,
+):
     """Seven verification rows/request, shifted SWA and independent causal top-512.
 
     Requests own disjoint cache pools. The compressed history uses ratio two.
@@ -400,7 +408,7 @@ def decode_fixture(requests=1, *, heads=64, history_tokens=32768, seed=42, inlin
     f = fixture(
         requests * 7,
         heads,
-        "v41_fp8",
+        cache_format,
         pool_tokens=requests * primary_stride,
         extra_pool_tokens=requests * extra_stride,
         seed=seed,
@@ -462,7 +470,7 @@ def decode_call(f, impl, mega=True):
     return lse
 
 
-def native_prefill_calls(f, module=None):
+def native_prefill_calls(f, module=None, *, streaming_prefill=True, chunks_per_block=0):
     from flashinfer.jit.mla import gen_sparse_mla_sm120_module
 
     module = module or gen_sparse_mla_sm120_module().build_and_load()
@@ -477,17 +485,19 @@ def native_prefill_calls(f, module=None):
         caches[1].shape[1],
         caches[0].stride(0),
         caches[1].stride(0),
-        0,
+        chunks_per_block,
         device.multi_processor_count,
         device.shared_memory_per_block_optin,
-        True,
+        streaming_prefill,
         False,
         lengths[0] is not None,
         lengths[1] is not None,
         f["sink"] is not None,
     )
-    lse = torch.empty(q.shape[:2], device=q.device, dtype=torch.float32)
-    mid, mlse = f["context"], f["context"].view(torch.float32)
+    mid, mlse, lse = [
+        torch.empty(tuple(shape), dtype=getattr(torch, str(dtype)), device=q.device)
+        for shape, dtype, _, _ in plan.workspace()
+    ]
 
     def arguments(query):
         return (

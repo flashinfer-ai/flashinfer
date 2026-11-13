@@ -16,17 +16,12 @@
 
 #pragma once
 
-#include "../../arch/cp_async.cuh"
-#include "../../arch/matrix_memory.cuh"
-#include "../../arch/mma_sm120.cuh"
-#include "../../arch/mma_sm120_nvfp4.cuh"
 #include "../../common/lse.cuh"
 #include "../../common/zero_row.cuh"
 #include "../../compute/nvfp4_vt.cuh"
-#include "../../compute/warp_tiles.cuh"
-#include "../../pipeline/staged_pipeline.cuh"
-#include "gather.cuh"
-#include "q_stage.cuh"
+#include "../cute_prefill/nvfp4_gather.cuh"
+#include "../cute_prefill/nvfp4_mma.cuh"
+#include "../cute_prefill/nvfp4_q_stage.cuh"
 #include "resources.cuh"
 
 namespace flashinfer::sparse_mla_sm120::nvfp4 {
@@ -89,12 +84,18 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
   auto sm = StreamingNVFP4Smem::init(smem_raw);
   const int32_t* idx_base = indices + (size_t)token_idx * TOPK;
 
-  using RawRing = pipeline::AsyncRing<STREAMING_KV_BUF_COUNT, 1, STREAMING_MATH_THREADS>;
-  using VtRing = pipeline::AsyncRing<STREAMING_VT_PIPE_STAGES, STREAMING_IO_WARPS * 32,
-                                     STREAMING_MATH_THREADS>;
+  using Barrier = cutlass::arch::ClusterBarrier;
   if (threadIdx.x == 0) {
-    RawRing::init(sm.mbar_full(0), sm.mbar_empty(0));
-    VtRing::init(sm.mbar_vt_full(0), sm.mbar_vt_empty(0));
+#pragma unroll
+    for (int slot = 0; slot < STREAMING_KV_BUF_COUNT; ++slot) {
+      Barrier::init(sm.mbar_full(slot), 1);
+      Barrier::init(sm.mbar_empty(slot), STREAMING_MATH_THREADS);
+    }
+#pragma unroll
+    for (int slot = 0; slot < STREAMING_VT_PIPE_STAGES; ++slot) {
+      Barrier::init(sm.mbar_vt_full(slot), STREAMING_IO_WARPS * 32);
+      Barrier::init(sm.mbar_vt_empty(slot), STREAMING_MATH_THREADS);
+    }
   }
   __syncthreads();
 
@@ -131,7 +132,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
   }
 
   auto issue_gather = [&](int chunk, int buf) {
-    gather_tile<PAGE_BLOCK_SIZE, DUAL_CACHE, STREAMING_KV_SMEM_STRIDE, STREAMING_GATHER_WARPS * 32>(
+    cute_gather_tile<PAGE_BLOCK_SIZE, DUAL_CACHE, STREAMING_KV_SMEM_STRIDE,
+                     STREAMING_GATHER_WARPS * 32>(
         kv_cache, idx_base, chunk, topk_len, false, page_block_size, page_stride_bytes,
         (warp_id - STREAMING_N_WARPS) * 32 + lane, sm.kv_fp4(buf), sm.kv_rope(buf), sm.kv_sc(buf),
         sm.mbar_full(buf), num_main_chunks, extra_topk_len, extra_kv_cache,
@@ -151,17 +153,19 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
     int raw_slot = 0;
     for (int chunk = chunk_lo; chunk < chunk_hi; ++chunk) {
       const int buf = (chunk - chunk_lo) % STREAMING_KV_BUF_COUNT;
-      RawRing::Free::wait(sm.mbar_empty(raw_slot), raw_free_phase);
+      Barrier::wait(sm.mbar_empty(raw_slot), raw_free_phase);
       if (threadIdx.x < STREAMING_MATH_THREADS + STREAMING_GATHER_WARPS * 32)
         issue_gather(chunk, buf);
-      RawRing::Ready::wait(sm.mbar_full(raw_slot), raw_ready_phase);
+      Barrier::wait(sm.mbar_full(raw_slot), raw_ready_phase);
       const int vt_slot = chunk % STREAMING_VT_PIPE_STAGES;
-      VtRing::Free::wait(sm.mbar_vt_empty(vt_slot), vt_free_phase[vt_slot]);
+      Barrier::wait(sm.mbar_vt_empty(vt_slot), vt_free_phase[vt_slot]);
       prepare_nvfp4_vt_from_smem<STREAMING_IO_WARPS * 32, STREAMING_KV_SMEM_STRIDE,
                                  STREAMING_MATH_THREADS>(sm.kv_fp4(buf), sm.kv_sc(buf),
                                                          sm.vt_data(vt_slot), sm.vt_sc(vt_slot));
-      pipeline::RoleSync<Dsv4Nvfp4Sync::VT_PRODUCER, STREAMING_IO_WARPS * 32>::wait();
-      VtRing::Ready::publish(sm.mbar_vt_full(vt_slot));
+      cutlass::arch::NamedBarrier::sync(
+          STREAMING_IO_WARPS * 32,
+          static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::VT_PRODUCER));
+      Barrier::arrive(sm.mbar_vt_full(vt_slot));
       vt_free_phase[vt_slot] ^= 1;
       if (++raw_slot == STREAMING_KV_BUF_COUNT) {
         raw_slot = 0;
@@ -180,8 +184,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
   for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
     const bf16* q_base =
         q + (size_t)token_idx * NUM_HEADS * D_QK + (size_t)(h_start + group * HPB) * D_QK;
-    quantize_q_nvfp4_to_smem<STREAMING_MATH_THREADS, STREAMING_Q_FP4_STRIDE,
-                             STREAMING_Q_SCALE_STRIDE>(
+    cute_quantize_prefill_q_nvfp4_to_smem<STREAMING_MATH_THREADS, STREAMING_Q_FP4_STRIDE,
+                                          STREAMING_Q_SCALE_STRIDE>(
         sm.q_fp4(group), sm.q_sc(group), sm.q_rope(group), q_base, HPB, mega.row(token_idx));
   }
 
@@ -212,15 +216,15 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
     }
     const int chunk_start = section_chunk * STREAMING_CAND_WINDOW;
     const int chunk_end = min(chunk_start + STREAMING_CAND_WINDOW, section_len);
-    RawRing::Ready::wait(sm.mbar_full(raw_consumer_slot), raw_ready_phase);
+    Barrier::wait(sm.mbar_full(raw_consumer_slot), raw_ready_phase);
     uint8_t* sm_kv_fp4 = sm.kv_fp4(buf);
     uint8_t* sm_kv_sc = sm.kv_sc(buf);
     bf16* sm_kv_rope = sm.kv_rope(buf);
     const int warp_first_cand = warp_id * STREAMING_ENTRIES_PER_WARP;
 
     float qk[STREAMING_HEAD_GROUPS][STREAMING_QK_N_TILES][4] = {0};
-    qk_nvfp4_nope_16x8<VALID_HEAD_GROUPS, STREAMING_Q_FP4_STRIDE, STREAMING_Q_SCALE_STRIDE,
-                       STREAMING_KV_SMEM_STRIDE, STREAMING_SCALE_BYTES_PER_TOKEN, NUM_K64_TILES>(
+    cute_qk_nvfp4<VALID_HEAD_GROUPS, STREAMING_Q_FP4_STRIDE, STREAMING_Q_SCALE_STRIDE,
+                  STREAMING_KV_SMEM_STRIDE, STREAMING_SCALE_BYTES_PER_TOKEN, NUM_K64_TILES>(
         qk, sm.q_fp4(0), sm.q_sc(0), sm_kv_fp4, sm_kv_sc, warp_first_cand, lane);
 
 #pragma unroll
@@ -232,9 +236,11 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
 #pragma unroll
       for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
         uint32_t a0, a1, a2, a3;
-        ldmatrix_load_A_bf16(a0, a1, a2, a3, sm.q_rope(group) + ks * 16, D_ROPE, lane);
-        MmaBf16Result r = mma_bf16_m16n8k16(a0, a1, a2, a3, b0, b1, qk[group][0][0],
-                                            qk[group][0][1], qk[group][0][2], qk[group][0][3]);
+        const int row = (lane & 7) + ((lane >> 3) & 1) * 8;
+        const int col = ks * 16 + (lane >> 4) * 8;
+        cute_ldsm4(a0, a1, a2, a3, sm.q_rope(group) + CutePrefillQRopeLayout{}(row, col));
+        CuteMmaResult r = cute_mma_rope(a0, a1, a2, a3, b0, b1, qk[group][0][0], qk[group][0][1],
+                                        qk[group][0][2], qk[group][0][3]);
         qk[group][0][0] = r.d0;
         qk[group][0][1] = r.d1;
         qk[group][0][2] = r.d2;
@@ -288,7 +294,9 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
         sm.reduce_scratch()[base + gid + 8] = local_max[group][1];
       }
     }
-    bar_sync_t<Dsv4Nvfp4Sync::MATH, STREAMING_MATH_THREADS>();
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
     if (threadIdx.x < HEADS_PER_CTA) {
       const int group = threadIdx.x / HPB;
@@ -301,7 +309,9 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
       const int group_base = group * REDUCE_GROUP_STRIDE;
       sm.reduce_scratch()[group_base + head] = block_max;
     }
-    bar_sync_t<Dsv4Nvfp4Sync::MATH, STREAMING_MATH_THREADS>();
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
 #pragma unroll
     for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
@@ -311,7 +321,9 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
     }
     // All warps must retain block max in registers before warp 0's slots are
     // recycled for the rescaled local sums.
-    bar_sync_t<Dsv4Nvfp4Sync::MATH, STREAMING_MATH_THREADS>();
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
 #pragma unroll
     for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
@@ -323,7 +335,9 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
             local_sum[group][1] * exp2f(local_max[group][1] - block_max_value[group][1]);
       }
     }
-    bar_sync_t<Dsv4Nvfp4Sync::MATH, STREAMING_MATH_THREADS>();
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
     if (threadIdx.x < HEADS_PER_CTA) {
       const int group = threadIdx.x / HPB;
@@ -334,7 +348,9 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
         block_sum += sm.reduce_scratch()[(group * STREAMING_N_WARPS + w) * HPB + head];
       sm.reduce_scratch()[group * REDUCE_GROUP_STRIDE + head] = block_sum;
     }
-    bar_sync_t<Dsv4Nvfp4Sync::MATH, STREAMING_MATH_THREADS>();
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
 #pragma unroll
     for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
@@ -397,7 +413,9 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
 
     // P production is local to the math consumer.  In parallel the IO warps
     // transpose/requantize the gathered 64-candidate V tile in shared memory.
-    bar_sync_t<Dsv4Nvfp4Sync::MATH, STREAMING_MATH_THREADS>();
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
     for (int task = threadIdx.x; task < HEADS_PER_CTA * NVFP4_VT_SCALE_GROUPS;
          task += STREAMING_MATH_THREADS) {
@@ -411,15 +429,19 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
               cand_group * FP4_PACKED_PER_GROUP,
           sm.w_sc(group) + head_in_group * NVFP4_VT_SCALE_GROUPS + cand_group);
     }
-    bar_sync_t<Dsv4Nvfp4Sync::MATH, STREAMING_MATH_THREADS>();
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
     const int vt_slot = chunk % STREAMING_VT_PIPE_STAGES;
-    VtRing::Ready::wait(sm.mbar_vt_full(vt_slot), vt_ready_phase[vt_slot]);
+    Barrier::wait(sm.mbar_vt_full(vt_slot), vt_ready_phase[vt_slot]);
 
-    pv_nvfp4_vt_16x16<VALID_HEAD_GROUPS, STREAMING_W_PACKED_STRIDE, STREAMING_N_WARPS>(
+    cute_pv_nvfp4<VALID_HEAD_GROUPS, STREAMING_W_PACKED_STRIDE, STREAMING_N_WARPS>(
         acc_nope, sm.p_fp4(0), sm.w_sc(0), sm.vt_data(vt_slot), sm.vt_sc(vt_slot), warp_id, lane);
 
-    bar_sync_t<Dsv4Nvfp4Sync::MATH, STREAMING_MATH_THREADS>();
-    VtRing::Free::publish(sm.mbar_vt_empty(vt_slot));
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
+    Barrier::arrive(sm.mbar_vt_empty(vt_slot));
     vt_ready_phase[vt_slot] ^= 1;
 
     const int rope_dim_base = warp_id * ROPE_DIMS_PER_WARP;
@@ -429,8 +451,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
       uint32_t rope_a2[STREAMING_HEAD_GROUPS], rope_a3[STREAMING_HEAD_GROUPS];
 #pragma unroll
       for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
-        ldmatrix_load_A_bf16(rope_a0[group], rope_a1[group], rope_a2[group], rope_a3[group],
-                             sm.p_full(group) + ks * 16, STREAMING_P_STRIDE, lane);
+        cute_load_rope_a(rope_a0[group], rope_a1[group], rope_a2[group], rope_a3[group],
+                         sm.p_full(group) + ks * 16, STREAMING_P_STRIDE, lane);
       }
 #pragma unroll
       for (int nt = 0; nt < ROPE_N_TILES; ++nt) {
@@ -453,10 +475,10 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
         const uint32_t b1 = (uint32_t)v8 | ((uint32_t)v9 << 16);
 #pragma unroll
         for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
-          MmaBf16Result r =
-              mma_bf16_m16n8k16(rope_a0[group], rope_a1[group], rope_a2[group], rope_a3[group], b0,
-                                b1, acc_rope[group][nt][0], acc_rope[group][nt][1],
-                                acc_rope[group][nt][2], acc_rope[group][nt][3]);
+          CuteMmaResult r =
+              cute_mma_rope(rope_a0[group], rope_a1[group], rope_a2[group], rope_a3[group], b0, b1,
+                            acc_rope[group][nt][0], acc_rope[group][nt][1], acc_rope[group][nt][2],
+                            acc_rope[group][nt][3]);
           acc_rope[group][nt][0] = r.d0;
           acc_rope[group][nt][1] = r.d1;
           acc_rope[group][nt][2] = r.d2;
@@ -465,9 +487,14 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
       }
     }
 
-    bar_sync_t<Dsv4Nvfp4Sync::MATH, STREAMING_MATH_THREADS>();
-    RawRing::Free::publish(sm.mbar_empty(raw_consumer_slot));
-    RawRing::advance(raw_consumer_slot, raw_ready_phase);
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
+    Barrier::arrive(sm.mbar_empty(raw_consumer_slot));
+    if (++raw_consumer_slot == STREAMING_KV_BUF_COUNT) {
+      raw_consumer_slot = 0;
+      raw_ready_phase ^= 1;
+    }
   }
 
   float* final_output_scale = reinterpret_cast<float*>(sm.p_full(0));
@@ -510,7 +537,9 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
       }
     }
   }
-  bar_sync_t<Dsv4Nvfp4Sync::MATH, STREAMING_MATH_THREADS>();
+  cutlass::arch::NamedBarrier::sync(
+      STREAMING_MATH_THREADS,
+      static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
 #pragma unroll
   for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
@@ -557,13 +586,17 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
       *reinterpret_cast<__nv_bfloat162*>(&destination[(size_t)(gid + 8) * head_stride + d0]) = hi;
     }
     if (write_direct && mega.output) {
-      bar_sync_t<Dsv4Nvfp4Sync::Q_STAGE, STREAMING_MATH_THREADS>();
+      cutlass::arch::NamedBarrier::sync(
+          STREAMING_MATH_THREADS,
+          static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::Q_STAGE));
       for (int i = threadIdx.x; i < HPB * D_V / 8; i += STREAMING_MATH_THREADS) {
         mega_store8(*reinterpret_cast<const uint4*>(destination + i * 8),
                     ((size_t)token_idx * NUM_HEADS + group_h_start) * D_V + i * 8, token_idx, mega);
       }
       // Next head group reuses the same dead raw-KV storage.
-      bar_sync_t<Dsv4Nvfp4Sync::Q_STAGE, STREAMING_MATH_THREADS>();
+      cutlass::arch::NamedBarrier::sync(
+          STREAMING_MATH_THREADS,
+          static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::Q_STAGE));
     }
   }
 }
