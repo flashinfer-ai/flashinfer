@@ -46,8 +46,12 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         return "sm100_bf16_bf16_bf16_cutedsl"
 
     def __init__(self, config: Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig) -> None:
+        # Configs are mutable: also validate a caller-edited instance before
+        # any collective setup or workspace allocation.
+        config.__post_init__()
         super().__init__(config)
         self._kernel_config = config
+        self._arithmetic_arch: str | None = None
         self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
         self._autotune_pending = config.knobs == "auto"
 
@@ -57,6 +61,14 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
     def validate_init(
         self, bootstrap: BootstrapConfig, fleet_params: FleetParams
     ) -> None:
+        if self._kernel_config.batch_invariant:
+            from ..common.batch_invariant import (
+                bf16_batch_invariant_arch,
+                validate_bf16_batch_invariant_device,
+            )
+
+            validate_bf16_batch_invariant_device()
+            self._arithmetic_arch = bf16_batch_invariant_arch()
         validate_mega_arch()
         validate_mega_fleet_params(
             fleet_params,
@@ -103,6 +115,10 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
     )
 
     def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
+        from ..common.batch_invariant import (
+            BF16_BATCH_INVARIANT_VERSION,
+        )
+
         k = self._kernel_config
         return dict(
             dtype="bf16",
@@ -113,7 +129,26 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
+            apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
+            batch_invariant=k.batch_invariant,
+            batch_invariant_version=(
+                BF16_BATCH_INVARIANT_VERSION if k.batch_invariant else None
+            ),
+            gate_up_clamp=_clamp(k),
+        )
+
+    def batch_invariant_fingerprint(self, fleet_params: FleetParams) -> str | None:
+        """Return this layer's arithmetic receipt without creating a workspace."""
+        if not self._kernel_config.batch_invariant:
+            return None
+        from ..common.batch_invariant import bf16_batch_invariant_fingerprint
+
+        return bf16_batch_invariant_fingerprint(
+            self._kernel_config,
+            hidden=fleet_params.token_hidden_size,
+            num_experts=fleet_params.num_experts,
+            arch=self._arithmetic_arch,
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
@@ -134,6 +169,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             apply_routing_weights_before_fc2=config.apply_routing_weights_before_fc2,
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
             use_custom_finalize=config.finalize_mode is FinalizeMode.NONE,
+            batch_invariant=config.batch_invariant,
             knobs=self._workspace_knobs(fleet_params),
         )
         if config.finalize_mode is FinalizeMode.NONE:
@@ -292,6 +328,8 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             config.intermediate_size,
             _clamp(config),
             config.apply_routing_weights_before_fc2,
+            config.batch_invariant,
+            self.batch_invariant_fingerprint(fleet_params),
             config.enable_in_kernel_fc2_reduce,
             config.finalize_mode,
             knobs_pool_key(self._workspace_knobs(fleet_params)),

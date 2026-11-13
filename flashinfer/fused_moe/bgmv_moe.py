@@ -619,6 +619,17 @@ class BGMVMoEPortablePlan(_BGMVMoEGraphPlan):
 BGMVMoEPlan = Union[BGMVMoECakePlan, BGMVMoEPortablePlan]
 
 
+def __getattr__(name: str):
+    if name == "BGMVMoEBlackwellPlan":
+        warnings.warn(
+            "BGMVMoEBlackwellPlan is deprecated; use BGMVMoECakePlan instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return BGMVMoECakePlan
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 def _cake_unsupported_reason(
     *,
     capability: Optional[Tuple[int, int]],
@@ -683,8 +694,8 @@ def prepare_bgmv_moe(
     topk_weights: torch.Tensor,
     num_experts: int,
     *,
-    backend: Literal["cake"] = "cake",
-    fallback: bool = True,
+    backend: Literal["cake", "blackwell"] = "cake",
+    fallback: Optional[bool] = None,
     shrink_out: Optional[torch.Tensor] = None,
     y_accum: Optional[torch.Tensor] = None,
     grouped: Optional[bool] = None,
@@ -716,9 +727,9 @@ def prepare_bgmv_moe(
     Inputs outside that support set (other device capabilities, ranks, hidden
     sizes that are not multiples of 8, multiple slices) are served by a
     :class:`BGMVMoEPortablePlan` running the portable ``bgmv_moe_shrink`` +
-    ``bgmv_moe_expand`` kernels when ``fallback=True`` (default); one
-    ``RuntimeWarning`` is emitted per distinct reason per process. With
-    ``fallback=False`` such inputs raise ``ValueError`` as before. Invalid
+    ``bgmv_moe_expand`` kernels when ``fallback`` is true (the default for
+    ``backend="cake"``); one ``RuntimeWarning`` is emitted per distinct reason
+    per process. With ``fallback=False`` such inputs raise ``ValueError``. Invalid
     inputs (shape mismatches, wrong index dtypes, out-of-range routing indices,
     non-contiguous or CPU tensors) always raise.
 
@@ -733,10 +744,14 @@ def prepare_bgmv_moe(
         lora_indices: LoRA index for each input token.
         topk_weights: FP32 routing weight for each routed pair.
         num_experts: Number of experts in the LoRA tensors.
-        backend: Backend selector; only ``"cake"`` (the generated Cake
-            programs) is supported.
+        backend: Backend selector: ``"cake"`` (the generated Cake programs).
+            ``"blackwell"`` is a deprecated alias of ``"cake"`` that emits a
+            ``DeprecationWarning`` and defaults ``fallback`` to ``False``, so
+            unsupported inputs raise ``ValueError`` as they did when it was the
+            only backend.
         fallback: Serve unsupported inputs with the portable path instead of
-            raising.
+            raising. ``None`` (default) means ``True`` for ``"cake"`` and
+            ``False`` for ``"blackwell"``.
         grouped: Generic Cake variant only. ``None`` (default) lets the plan
             choose the pair-grouped pipeline when the routes clearly outnumber
             the ``num_loras * num_experts`` (LoRA, expert) pairs (each pair's
@@ -766,10 +781,22 @@ def prepare_bgmv_moe(
         ``"portable"``.
     """
 
-    if backend != "cake":
+    if backend == "blackwell":
+        warnings.warn(
+            'prepare_bgmv_moe: backend="blackwell" is a deprecated alias of '
+            '"cake"; pass backend="cake" (unsupported inputs then fall back to '
+            "the portable path unless fallback=False).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if fallback is None:
+            fallback = False
+    elif backend != "cake":
         raise ValueError(
             f"prepare_bgmv_moe only supports backend='cake', got {backend}"
         )
+    if fallback is None:
+        fallback = True
     from ..jit.cake_bgmv_moe import cake_bgmv_moe_arch_for_capability
 
     capability: Optional[Tuple[int, int]] = None

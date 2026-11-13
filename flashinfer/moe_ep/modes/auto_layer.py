@@ -44,7 +44,12 @@ from ..core.tuning_state import AutoTuningState, prepared_for_serving, record_pr
 from ..core.validation import validate_fleet_weights, validate_split_forward_inputs
 from ..core.validation.common import validate_ll_hidden_size
 from ..weights import UnquantizedMoEWeights
-from .config import AutoConfig, MegaConfig, SplitConfig
+from .config import (
+    AutoConfig,
+    MegaConfig,
+    SplitConfig,
+    _validate_batch_invariant_candidates,
+)
 from .mega_layer import MoEEpMegaLayer
 from .selection import (
     MegaPlan,
@@ -207,6 +212,7 @@ class MoEEpAutoLayer(nn.Module):
         self._destroyed = False
         c = self._collective
         try:
+            c.prepare(lambda: _validate_batch_invariant_candidates(config.candidates))
             c.agree((len(config.candidates), config.candidate), "candidate selection")
 
             def validate_weights():
