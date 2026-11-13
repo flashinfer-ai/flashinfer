@@ -139,3 +139,135 @@ def test_mm_mxfp8_sm120_rejects_linear_scales():
         mm_mxfp8(
             a_fp8, b_fp8.T, a_sf, b_sf, out_dtype=torch.bfloat16, backend="cutlass"
         )
+
+
+def _skip_if_not_b12x():
+    _skip_if_not_sm120()
+    from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_mxfp8_dsl_supported
+    from flashinfer.jit.cpp_ext import get_cuda_version
+
+    if get_cuda_version().major < 13 or not _b12x_mxfp8_dsl_supported():
+        pytest.skip("b12x MXFP8 requires CUDA 13+ and nvidia-cutlass-dsl >= 4.6.0")
+
+
+def _mxfp8_tail_operand(rows, k, *, guard=False):
+    x, sf = mxfp8_quantize(
+        torch.randn(rows, k, device="cuda", dtype=torch.bfloat16),
+        sf_swizzle_layout=SfLayout.layout_128x4,
+    )
+    padded_k = (k + 127) // 128 * 128
+    padded = torch.zeros(rows, padded_k, device="cuda", dtype=x.dtype)
+    padded.view(torch.uint8)[:, :k].copy_(x.view(torch.uint8))
+    padded_sf = sf.clone()
+    if k % 128:
+        # [row block, K tile, row % 32, row // 32 % 4, scale group].
+        # Poison nonexistent groups, including code 255 (UE8M0 NaN).
+        sf.view(-1, padded_k // 128, 32, 4, 4)[:, -1, :, :, k % 128 // 32 :] = 255
+        padded_sf.view(-1, padded_k // 128, 32, 4, 4)[:, -1, :, :, k % 128 // 32 :] = (
+            127
+        )
+    if guard:
+        # A contiguous logical tensor followed by FP8 NaNs; row strides and
+        # the TMA descriptor must still describe K, not padded_k.
+        storage = torch.full((rows * k + 128,), 127, device="cuda", dtype=torch.uint8)
+        storage[: rows * k].copy_(x.view(torch.uint8).flatten())
+        x = storage[: rows * k].view(x.dtype).view(rows, k)
+    return x, sf, padded, padded_sf
+
+
+@pytest.mark.parametrize("m", [1, 6, 512])
+@pytest.mark.parametrize("k", [128, 160, 192, 224, 256, 544, 576, 608, 640])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+def test_mm_mxfp8_b12x_tail_padding_parity(m, k, out_dtype):
+    _skip_if_not_b12x()
+    torch.manual_seed(5175)
+    a, sa, ap, sap = _mxfp8_tail_operand(m, k, guard=m == 6)
+    b, sb, bp, sbp = _mxfp8_tail_operand(5120, k, guard=m == 6)
+    reference = mm_mxfp8(ap, bp.T, sap, sbp, out_dtype=out_dtype, backend="b12x")
+    out = torch.full_like(reference, float("nan"))
+    result = mm_mxfp8(a, b.T, sa, sb, out=out, out_dtype=out_dtype, backend="b12x")
+    assert result.data_ptr() == out.data_ptr()
+    assert torch.isfinite(result).all()
+    # Both paths use the same quantized operands and group order. The padded
+    # reference adds only exact zeros; no quantization tolerance is needed.
+    torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("k", [544, 576, 608])
+def test_mm_mxfp8_b12x_tail_auto_graph(k, monkeypatch):
+    _skip_if_not_b12x()
+    from flashinfer.gemm import gemm_base
+
+    torch.manual_seed(5175)
+    a, sa, ap, sap = _mxfp8_tail_operand(6, k)
+    b, sb, bp, sbp = _mxfp8_tail_operand(5120, k)
+    reference = mm_mxfp8(ap, bp.T, sap, sbp, backend="b12x")
+    factory = gemm_base._b12x_gemm_mxfp8_runner
+    calls = []
+
+    def traced_factory(*args, **kwargs):
+        runner = factory(*args, **kwargs)
+        forward = runner.forward
+
+        def traced_forward(*args, **kwargs):
+            calls.append(True)
+            return forward(*args, **kwargs)
+
+        runner.forward = traced_forward
+        return runner
+
+    monkeypatch.setattr(gemm_base, "_b12x_gemm_mxfp8_runner", traced_factory)
+    out = torch.empty_like(reference)
+    # Warm both the compiled kernel and alpha cache before capture.
+    mm_mxfp8(a, b.T, sa, sb, out=out, backend="auto")
+    assert calls, "auto did not execute the b12x runner"
+    assert mm_mxfp8.suitable_auto_backends[0] == "b12x"
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mm_mxfp8(a, b.T, sa, sb, out=out, backend="auto")
+    for replay in range(6):
+        if replay == 3:
+            # Replay must read current input, not capture-time intermediates.
+            a.view(torch.uint8).bitwise_xor_(128)
+        out.fill_(float("nan"))
+        graph.replay()
+        expected = reference if replay < 3 else -reference
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("k", [544, 576, 608])
+@pytest.mark.parametrize("m,n", [(6, 5120), (129, 160)])
+def test_mm_mxfp8_b12x_tail_all_tactics(m, n, k):
+    _skip_if_not_b12x()
+    from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_gemm_mxfp8_runner
+
+    torch.manual_seed(5175)
+    a, sa, ap, sap = _mxfp8_tail_operand(m, k)
+    b, sb, bp, sbp = _mxfp8_tail_operand(n, k)
+    reference = mm_mxfp8(ap, bp.T, sap, sbp, backend="b12x")
+    out = torch.empty_like(reference)
+    major, minor = get_compute_capability(a.device)
+    runner = _b12x_gemm_mxfp8_runner(major, minor, True, out.dtype)
+    inputs = [a, b.T, sa, sb, out.dtype, out, None]
+    tactics = runner.get_valid_tactics(inputs, None)
+    assert tactics
+    for tactic in tactics:
+        out.fill_(float("nan"))
+        runner.forward(inputs, tactic=tactic)
+        torch.testing.assert_close(out, reference, rtol=0, atol=0, msg=str(tactic))
+
+
+@pytest.mark.parametrize("k", [528, 560, 592])
+def test_mm_mxfp8_b12x_tail_rejects_incomplete_scale_group(k):
+    _skip_if_not_b12x()
+    from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_gemm_mxfp8_requirement
+
+    a = torch.empty(6, k, device="cuda", dtype=torch.float8_e4m3fn)
+    b = torch.empty(5120, k, device="cuda", dtype=a.dtype)
+    sa = torch.empty(128 * ((k + 127) // 128 * 4), device="cuda", dtype=torch.uint8)
+    sb = torch.empty(5120 * ((k + 127) // 128 * 4), device="cuda", dtype=torch.uint8)
+    with pytest.raises(ValueError, match="multiple of 32"):
+        mm_mxfp8(a, b.T, sa, sb, backend="b12x")
+    assert not _b12x_gemm_mxfp8_requirement(
+        a, b.T, sa, sb, use_8x4_sf_layout=False, backend="auto"
+    )
