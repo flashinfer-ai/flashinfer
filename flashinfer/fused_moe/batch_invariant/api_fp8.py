@@ -264,7 +264,7 @@ def grouped_gemm_fp8(
     Tk: Optional[int] = None,
 ) -> torch.Tensor:
     """``out[p] = chain(a[p] @ w[e(p)].T, alpha = mul(s_a, s_w[e(p)]))`` for the expert segments ``counts``: ``a [R >= Tk, K]`` e4m3
-    row-major, ``w [E, N, K]`` e4m3 row-major, ``s_w [E]`` fp32, ``s_a [1]`` fp32 (the A operand's dequantization scale), ``inv [1]``
+    row-major, ``w [E, N, K]`` e4m3 row-major, ``s_w [E]`` fp32 (any strides), ``s_a [1]`` fp32 (the A operand's dequantization scale), ``inv [1]``
     fp32 (the intermediate multiplier of the e4m3 chains; ignored by the others). The e4m3 chains return ``float8_e4m3fn
     [Tk, N / 2]`` (gated) or ``[Tk, N]``; the plain chain bf16 / fp32 ``[Tk, N]``. The record selects the body: a dense record runs
     the grouped body, a swapped record (``config.swap_ab``: 128 or 64 weight rows x 16 / 32 tokens, the weights on the MMA's M
@@ -317,9 +317,11 @@ def grouped_gemm_fp8(
         w.permute(1, 2, 0),
         out_k,
         counts,
-        s_w.reshape(-1).to(torch.float32),
-        s_a.reshape(1).to(torch.float32),
-        inv.reshape(1).to(torch.float32),
+        s_w.reshape(-1)
+        .to(torch.float32)
+        .contiguous(),  # the kernel reads a unit-stride vector
+        s_a.reshape(1).to(torch.float32).contiguous(),
+        inv.reshape(1).to(torch.float32).contiguous(),
         launch_grid(a.device, config, Tk, E, N),
     )
     return out

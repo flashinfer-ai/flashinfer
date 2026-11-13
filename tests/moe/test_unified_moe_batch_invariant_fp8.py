@@ -1010,7 +1010,7 @@ def test_preparation_refuses_mismatched_geometry_and_bad_multipliers():
         BatchInvariantFp8PerTensorConfig.prepare_weights(
             w1[0], w2, hidden_states_scale_global=1.0, intermediate_scale_global=1.0
         )
-    for bad in (0.0, -1.0, float("inf"), float("nan"), 2.0**-140):
+    for bad in (0.0, -1.0, float("inf"), float("nan"), 1e-39, 2.0**-140):
         with pytest.raises(ValueError, match="finite positive"):
             BatchInvariantFp8PerTensorConfig.prepare_weights(
                 w1, w2, hidden_states_scale_global=bad, intermediate_scale_global=1.0
@@ -1032,6 +1032,11 @@ def test_preparation_refuses_mismatched_geometry_and_bad_multipliers():
             torch.randn(8, H, dtype=torch.bfloat16),
             hidden_states_scale_global=torch.ones(H),
         )
+    xq3, scale = BatchInvariantFp8PerTensorConfig.prepare_activations(
+        torch.randn(8, H, dtype=torch.bfloat16),
+        hidden_states_scale_global=torch.ones(1, 1, 1),
+    )  # a one-element multiplier of any rank: the activations keep theirs
+    assert scale is None and tuple(xq3.shape) == (8, H)
     for bad_hi in ((24, 32), (64, 40), (0, 32)):
         with pytest.raises(ValueError, match="positive multiple of 16"):
             bi.fingerprint(
@@ -1283,6 +1288,41 @@ def test_grouped_gemm1_is_the_dense_fp8_class_per_expert():
             assert torch.equal(
                 im["a"].view(torch.uint8).cpu(), a_ref.view(torch.uint8)
             ), (T, swap)
+
+
+@needs_device
+def test_strided_expert_scales_are_read_as_a_vector():
+    """The expert dequantization scales handed to the grouped fp8 GEMM may be a strided view (a column of a table): the entry
+    reads them as the unit-stride vector the kernel is compiled for, so the bits equal the contiguous call's, on the dense and
+    the swapped records."""
+    from flashinfer.fused_moe.batch_invariant.api import _part, permute_plan
+    from flashinfer.fused_moe.batch_invariant.api_fp8 import (
+        MoEWeightsE4M3,
+        grouped_gemm_fp8,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_fp8 import default_configs_fp8
+
+    T, k, H, I, E = 24, 2, 256, 128, 8
+    x, logits, w1, w2, m_x = _problem(T, k, H, I, E, seed=19, adversarial=True)
+    xq, W = _xq(x, m_x), _weights(w1, w2, m_x)
+    Wq = MoEWeightsE4M3.from_view(
+        W.get_view(BatchInvariantFp8PerTensorRunner.backend_key)
+    )
+    ids, _ = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    counts, _, src = permute_plan(ids.cuda(), E)
+    x_perm = xq[(src // k).long()].contiguous()
+    table = torch.stack([Wq.s_w1, torch.zeros_like(Wq.s_w1)], dim=1)
+    strided = table[:, 0]
+    assert strided.stride(0) == 2 and torch.equal(strided, Wq.s_w1)
+    for swap in (False, True):
+        c1, _ = default_configs_fp8(T, k, H, I, E, *_part(xq.device), swap=swap)
+        a_ref = grouped_gemm_fp8(
+            x_perm, Wq.w1q, Wq.s_w1, Wq.s_x, Wq.m_inter, counts, c1, Wq.chain1
+        )
+        a_str = grouped_gemm_fp8(
+            x_perm, Wq.w1q, strided, Wq.s_x, Wq.m_inter, counts, c1, Wq.chain1
+        )
+        assert torch.equal(a_str.view(torch.uint8), a_ref.view(torch.uint8)), swap
 
 
 @needs_device

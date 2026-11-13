@@ -3509,7 +3509,8 @@ class BatchInvariantFp8PerTensorConfig:
                 "BatchInvariantFp8PerTensorConfig.prepare_activations: hidden_states_scale_global must be one fp32 value, "
                 f"got shape {tuple(m.shape)}"
             )
-        return quantize_e4m3_static(x, m), None
+        # a 0-d multiplier: a one-element tensor of any rank must not broadcast the activations to its rank
+        return quantize_e4m3_static(x, m.reshape(())), None
 
     def __repr__(self) -> str:
         return "BatchInvariantFp8PerTensorConfig()"
