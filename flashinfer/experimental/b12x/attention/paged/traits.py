@@ -92,11 +92,19 @@ def _paged_is_invalid(
     num_mma_d_vo: int,
     num_warps_q: int,
     kv_dtype: torch.dtype,
+    allow_bf16_head64_decode: bool = False,
 ) -> bool:
     kv_is_fp8 = kv_dtype == _FP8_KV_DTYPE
     if num_mma_d_vo < 4:
         return True
-    if num_mma_d_vo == 4 and num_mma_kv % 2 == 1:
+    # Exact-plane BF16 decode supports one KV MMA tile with a 64-wide V head.
+    bf16_exact_plane_decode = (
+        allow_bf16_head64_decode
+        and kv_dtype == torch.bfloat16
+        and num_warps_q == 1
+        and num_mma_kv == 1
+    )
+    if num_mma_d_vo == 4 and num_mma_kv % 2 == 1 and not bf16_exact_plane_decode:
         return True
     if num_mma_q * (8 * num_mma_d_vo + 8 * num_mma_kv) >= 256:
         return True
@@ -274,6 +282,13 @@ def select_paged_forward_traits(
         if exact_num_mma_kv is not None
         else (1 if cta_tile_q == 16 else max_num_mma_kv_reg)
     )
+    # Match the exact-plane BF16 decode kernel's dtype, tile and head contract.
+    allow_bf16_head64_decode = (
+        q_dtype == kv_dtype == o_dtype == torch.bfloat16
+        and cta_tile_q == 16
+        and head_dim_qk in (64, 128, 192, 256)
+        and head_dim_vo == 64
+    )
     candidates: list[tuple[int, int, int, int, int]] = []
     for candidate_mma_kv in range(1, max_candidate_mma_kv + 1):
         if exact_num_mma_kv is not None and candidate_mma_kv != exact_num_mma_kv:
@@ -284,6 +299,7 @@ def select_paged_forward_traits(
             num_mma_d_vo=num_mma_d_vo,
             num_warps_q=num_warps_q,
             kv_dtype=kv_dtype,
+            allow_bf16_head64_decode=allow_bf16_head64_decode,
         ):
             continue
         candidate_cta_tile_kv = candidate_mma_kv * num_warps_kv * 16
