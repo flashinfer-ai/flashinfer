@@ -145,8 +145,9 @@ def mm_nvfp4_residue(
     Prepare this global multiplier before launch and keep it unchanged until
     the operation completes; asynchronous alpha production via PDL is unsupported.
     The output is ``[M, N]`` in FP16 or BF16. Weight quantization is external.
-    The Fold tile follows the row-pair table: M at most 64 uses ``(128, 64)``
-    on one SM, and larger M uses ``(256, 128)`` on a 2-SM cluster.
+    The Fold tile is a static row-pair choice: ``(128, 24)`` through M 8,
+    ``(128, 32)`` through M 16, ``(128, 64)`` below M 256, and ``(256, 128)``
+    on a 2-SM cluster from M 256.
     Warm up outside CUDA graph capture to compile the selected kernel.
     """
     _check_sm100(act)
