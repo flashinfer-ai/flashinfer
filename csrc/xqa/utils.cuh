@@ -42,8 +42,13 @@ inline constexpr float log2e = 1.4426950408889634;  // std::log2(M_E)
 */
 // But this optimization is not numerically stable when (x * log2e - bias) is computed with FMA and
 // x is too large. For this reason, don't set safeInitRowMax with a huge absolute value.
+#ifdef _MSC_VER
+#define kBAD_PAGE_INDEX 0xFFFFFFFF
+#define safeInitRowMax (-1e+5F)
+#else
 inline constexpr float safeInitRowMax = -1e+5F;
 inline constexpr int32_t kBAD_PAGE_INDEX = -1;
+#endif
 __constant__ constexpr float kE4M3_MAX = 448.F;
 
 #ifdef __CUDA_ARCH__

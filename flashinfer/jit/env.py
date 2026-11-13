@@ -18,10 +18,15 @@ limitations under the License.
 # Do "from .jit import env as jit_env" and use "jit_env.xxx" instead.
 # This helps AOT script to override envs.
 
+import base64
 import functools
+import getpass
+import hashlib
 import logging
 import os
 import pathlib
+import platform
+import re
 from dataclasses import dataclass
 from typing import Any, FrozenSet, Mapping, Optional, Tuple
 
@@ -67,7 +72,52 @@ FLASHINFER_BASE_DIR: pathlib.Path = pathlib.Path(
     os.getenv("FLASHINFER_WORKSPACE_BASE", pathlib.Path.home().as_posix())
 )
 
-FLASHINFER_CACHE_DIR: pathlib.Path = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
+# NOTE(Windows): On Windows the full output paths for JIT-compiled CUDA objects
+# can easily exceed the 260-char MAX_PATH limit: the longest module directory
+# names leave fewer than 20 characters for the cache root.
+# On Linux/macOS we keep the conventional layout: $HOME/.cache/flashinfer/...
+# On Windows the default is a short per-user root at the drive root,
+# %SYSTEMDRIVE%\_fij_<tag>: six characters derived from the account SID, so two
+# accounts get distinct roots; the user name stands in when the SID cannot be
+# read, and a root two accounts would share is refused by the owner-only check
+# below, never shared.
+FLASHINFER_CACHE_DIR: pathlib.Path
+
+
+def _windows_user_tag() -> str:
+    """Six characters that identify the account: a hash of its SID, else its name."""
+    from ._windows_acl import current_user_sid
+
+    sid = current_user_sid()
+    if sid:
+        digest = hashlib.sha256(sid.encode("ascii")).digest()
+        return base64.b32encode(digest)[:6].decode("ascii").lower()
+    try:
+        user = getpass.getuser()
+    except (ImportError, OSError, KeyError):
+        user = ""
+    # DOMAIN\user and user@domain forms carry the account name only.
+    user = user.rsplit("\\", 1)[-1].split("@", 1)[0]
+    return re.sub(r"[^a-z0-9]", "", user.lower())[:6] or "user"
+
+
+if os.name == "nt":
+    FLASHINFER_CACHE_DIR = pathlib.Path(
+        os.getenv(
+            "FLASHINFER_CACHE_DIR",
+            f"{os.getenv('SYSTEMDRIVE', 'C:')}/_fij_{_windows_user_tag()}",
+        )
+    )
+    # The default sits at the drive root, where any local account could create it
+    # first: make it owner-only here, before any subdirectory is created, and
+    # refuse one that another account owns. An explicit FLASHINFER_CACHE_DIR is
+    # the user's own choice and is left alone.
+    if os.getenv("FLASHINFER_CACHE_DIR") is None:
+        from ._windows_acl import ensure_private_dir
+
+        ensure_private_dir(FLASHINFER_CACHE_DIR)
+else:
+    FLASHINFER_CACHE_DIR = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
 _package_root: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
 
 _VERSION_MISMATCH_HINT = (
@@ -293,9 +343,14 @@ def _provider_target_compatibility_score(
     return max(scores) if scores else None
 
 
+def jit_library_name(module_name: str) -> str:
+    """File name of a module's shared library: module.dll on Windows (short paths), <name>.so elsewhere."""
+    return "module.dll" if platform.system() == "Windows" else f"{module_name}.so"
+
+
 def get_aot_artifacts(module_name: str) -> Tuple[AOTArtifact, ...]:
     """Resolve the best installed AOT artifact for each visible CUDA target."""
-    fallback_path = FLASHINFER_AOT_DIR / module_name / f"{module_name}.so"
+    fallback_path = FLASHINFER_AOT_DIR / module_name / jit_library_name(module_name)
     if fallback_path.exists():
         return (AOTArtifact("flashinfer-python", fallback_path, None),)
 
@@ -314,7 +369,9 @@ def get_aot_artifacts(module_name: str) -> Tuple[AOTArtifact, ...]:
             )
             if compatibility_score is None:
                 continue
-            provider_path = provider.jit_cache_dir / module_name / f"{module_name}.so"
+            provider_path = (
+                provider.jit_cache_dir / module_name / jit_library_name(module_name)
+            )
             if provider_path.exists():
                 artifact = AOTArtifact(
                     provider.provider_id,
@@ -330,7 +387,7 @@ def get_aot_artifacts(module_name: str) -> Tuple[AOTArtifact, ...]:
 
 def get_aot_path(module_name: str) -> pathlib.Path:
     """Return the primary path for an AOT module, or its stable fallback path."""
-    fallback_path = FLASHINFER_AOT_DIR / module_name / f"{module_name}.so"
+    fallback_path = FLASHINFER_AOT_DIR / module_name / jit_library_name(module_name)
     artifacts = get_aot_artifacts(module_name)
     return artifacts[0].path if artifacts else fallback_path
 

@@ -50,6 +50,8 @@ size_t dispatchMXFP8xMXFP8GemmCTAShapeSm120(T* D, void const* A, void const* B,
                                             const size_t workspaceBytes, cudaStream_t stream,
                                             int* occupancy = nullptr) {
   switch (gemmConfig.tile_config_sm120) {
+#if !defined(_WIN32)
+    // The two small tiles do not build with the Windows toolchain (fork of the port).
     case CutlassTileConfigSM120::CtaShape128x32x128B:
       return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<128>, cute::Int<32>, cute::Int<128>,
                                                  SwapAB>(D, A, B, input_sf, weight_sf, m, n, k,
@@ -60,6 +62,7 @@ size_t dispatchMXFP8xMXFP8GemmCTAShapeSm120(T* D, void const* A, void const* B,
                                                  SwapAB>(D, A, B, input_sf, weight_sf, m, n, k,
                                                          batch_count, gemmConfig, workspace,
                                                          workspaceBytes, stream, occupancy);
+#endif
     case CutlassTileConfigSM120::CtaShape128x128x128B:
       return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<128>, cute::Int<128>, cute::Int<128>,
                                                  SwapAB>(D, A, B, input_sf, weight_sf, m, n, k,
@@ -119,8 +122,10 @@ class CutlassMxfp8GemmRunnerSm120 : public virtual CutlassMxfp8GemmRunnerInterfa
   std::vector<CutlassGemmConfig> getConfigs() const override {
     // SM120 MXFP8 tile configs.  No cluster shape variants (always 1x1x1).
     static const std::vector<CutlassTileConfigSM120> tiles = {
+#if !defined(_WIN32)
         CutlassTileConfigSM120::CtaShape128x32x128B,
         CutlassTileConfigSM120::CtaShape128x64x128B,
+#endif
         CutlassTileConfigSM120::CtaShape128x128x128B,
     };
     std::vector<CutlassGemmConfig> configs;

@@ -843,6 +843,9 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
         [256, 128, 128],
         [128, 256, 128],
     ]
+    # The small-N SM120 grouped tiles do not build with the MSVC host compiler.
+    if os.name == "nt":
+        cta_shapes_mnk = [s for s in cta_shapes_mnk if s[1] not in (32, 64)]
 
     warp_shape = [0, 0, 0]  # ignored except for naming
     stages = 0  # auto

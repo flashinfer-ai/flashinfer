@@ -618,10 +618,14 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
                           EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
         CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
                           EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
+#if !defined(_WIN32)
         CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x32x128B, MainloopScheduleType::AUTO,
                           EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
         CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x64x128B, MainloopScheduleType::AUTO,
                           EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
+#else
+    };
+#endif
   } else {
     result = {
         CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x256B, MainloopScheduleType::AUTO,
@@ -643,8 +647,10 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
       CutlassTileConfigSM120::CtaShape128x128x128B, CutlassTileConfigSM120::CtaShape128x128x64B,
       CutlassTileConfigSM120::CtaShape256x128x64B,  CutlassTileConfigSM120::CtaShape128x256x64B,
       CutlassTileConfigSM120::CtaShape128x128x256B, CutlassTileConfigSM120::CtaShape256x128x128B,
+#if !defined(_WIN32)
       CutlassTileConfigSM120::CtaShape128x32x128B,  CutlassTileConfigSM120::CtaShape128x32x64B,
       CutlassTileConfigSM120::CtaShape128x64x128B,  CutlassTileConfigSM120::CtaShape128x64x64B,
+#endif
   };
   for (auto tile : all_tiles) {
     result.push_back(CutlassGemmConfig{tile, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,

@@ -95,8 +95,10 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
   bool const dt_softplus = params.dt_softplus;
 
   // State scale pointer (only used when scaleState == true)
-  [[maybe_unused]] auto* __restrict__ state_scale =
-      reinterpret_cast<state_scale_t*>(params.state_scale);
+  [[maybe_unused]] state_scale_t* __restrict__ state_scale = nullptr;
+  if constexpr (scaleState) {
+    state_scale = reinterpret_cast<state_scale_t*>(params.state_scale);
+  }
 
   // Load device-side Philox seed once into a register
   [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
@@ -130,10 +132,11 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
   if constexpr (scaleState) {
     state_scale += state_batch * params.state_scale_stride_batch + head * DIM;
   }
-  [[maybe_unused]] auto* __restrict__ dst_state_scale =
-      scaleState ? reinterpret_cast<state_scale_t*>(params.state_scale) +
-                       dst_state_batch * params.state_scale_stride_batch + head * DIM
-                 : nullptr;
+  [[maybe_unused]] state_scale_t* __restrict__ dst_state_scale = nullptr;
+  if constexpr (scaleState) {
+    dst_state_scale = reinterpret_cast<state_scale_t*>(params.state_scale) +
+                      dst_state_batch * params.state_scale_stride_batch + head * DIM;
+  }
 
   __shared__ SharedStorageSimple<input_t, state_scale_t, ROWS_PER_BLOCK, DSTATE> sram;
 
@@ -316,7 +319,8 @@ struct SharedStorageVertical {
   alignas(alignof(PackedAligned<input_t>)) input_t B[dstate];
   alignas(alignof(PackedAligned<input_t>)) input_t C[dstate];
   float out[dim];
-  alignas(128) std::conditional_t<scaleState, state_scale_t, char> state_scale[dim * scaleState];
+  alignas(
+      128) std::conditional_t<scaleState, state_scale_t, char> state_scale[scaleState ? dim : 1];
 
   using barrier_t = cuda::barrier<cuda::thread_scope_block>;
   barrier_t bar_empty[numStages];
@@ -650,8 +654,10 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
   auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
   auto const* __restrict__ state_batch_indices =
       reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
-  [[maybe_unused]] auto* __restrict__ state_scale =
-      reinterpret_cast<state_scale_t*>(params.state_scale);
+  [[maybe_unused]] state_scale_t* __restrict__ state_scale = nullptr;
+  if constexpr (scaleState) {
+    state_scale = reinterpret_cast<state_scale_t*>(params.state_scale);
+  }
 
   // Load device-side Philox seed once into a register
   [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
@@ -929,7 +935,8 @@ __device__ __forceinline__ void consumer_func_horizontal(
 
         auto const i = iBegin + ii;
 
-        auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
+        auto* sState_ptr =
+            reinterpret_cast<unsigned int*>(&sram.state[stage][d * colsPerStage + ii]);
         uint32_t rState = *sState_ptr;
         auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
 
@@ -980,7 +987,8 @@ __device__ __forceinline__ void consumer_func_horizontal(
             conflict_free_column<colsPerStage, stateValuesPerBank, numBanks>(group, baseCol);
         auto const i = iBegin + ii;
 
-        auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
+        auto* sState_ptr =
+            reinterpret_cast<unsigned int*>(&sram.state[stage][d * colsPerStage + ii]);
         uint32_t rState = *sState_ptr;
         auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
 
@@ -1295,11 +1303,11 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
     dim3 block(warpSize, numWarps);
     dim3 grid(params.batch, params.nheads);
 
-    auto state_tensor =
-        tma::buildNdDescriptor(typeid(state_t),
-                               /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
-                               /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
-                               /*tiles*/ {DSTATE, rowsPerStage, 1, 1}, params.state);
+    auto state_tensor = tma::buildNdDescriptor(
+        typeid(state_t),
+        /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
+        /*strides*/ {1, DSTATE, DSTATE * DIM, static_cast<uint64_t>(params.state_stride_batch)},
+        /*tiles*/ {DSTATE, rowsPerStage, 1, 1}, params.state);
 
     using sram_t = SharedStorageVertical<input_t, weight_t, matrixA_t, state_t, state_scale_t,
                                          rowsPerStage, DIM, DSTATE, numStages>;
@@ -1334,11 +1342,11 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
       dim3 block(warpSize, numWarps);
       dim3 grid(params.batch, params.nheads);
 
-      auto state_tensor =
-          tma::buildNdDescriptor(typeid(state_t),
-                                 /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
-                                 /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
-                                 /*tiles*/ {stageCols, DIM, 1, 1}, params.state);
+      auto state_tensor = tma::buildNdDescriptor(
+          typeid(state_t),
+          /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
+          /*strides*/ {1, DSTATE, DSTATE * DIM, static_cast<uint64_t>(params.state_stride_batch)},
+          /*tiles*/ {stageCols, DIM, 1, 1}, params.state);
       static_assert(DSTATE % stageCols == 0 && DSTATE >= stageCols);
 
       using sram_t = SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE,

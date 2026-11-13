@@ -136,55 +136,60 @@ struct AbsMaxOp<__nv_bfloat16> {
   __device__ static float to_float(Accum value) { return __bfloat162float(value); }
 };
 
+// Named template helpers instead of nested generic lambdas (the Windows port): the MSVC host
+// compiler fails on the original form; behaviour is identical.
+template <int E4M3_MAX, NVFP44Over6ErrMode ERR_MODE, bool ERR_USE_FAST_MATH, typename Fn>
+decltype(auto) dispatchNVFP44Over6DisableFastMath(bool disableFP4QuantFastMath, Fn& fn) {
+  if (disableFP4QuantFastMath) {
+    return fn(std::true_type{}, NVFP44Over6Config<E4M3_MAX, ERR_MODE, ERR_USE_FAST_MATH>{});
+  }
+  return fn(std::false_type{}, NVFP44Over6Config<E4M3_MAX, ERR_MODE, ERR_USE_FAST_MATH>{});
+}
+
+template <int E4M3_MAX, NVFP44Over6ErrMode ERR_MODE, typename Fn>
+decltype(auto) dispatchNVFP44Over6ErrFastMath(bool errUseFastMath, bool disableFP4QuantFastMath,
+                                              Fn& fn) {
+  if (errUseFastMath) {
+    return dispatchNVFP44Over6DisableFastMath<E4M3_MAX, ERR_MODE, true>(disableFP4QuantFastMath,
+                                                                        fn);
+  }
+  return dispatchNVFP44Over6DisableFastMath<E4M3_MAX, ERR_MODE, false>(disableFP4QuantFastMath, fn);
+}
+
+template <int E4M3_MAX, typename Fn>
+decltype(auto) dispatchNVFP44Over6ErrMode(NVFP44Over6ErrMode errMode, bool errUseFastMath,
+                                          bool disableFP4QuantFastMath, Fn& fn) {
+  switch (errMode) {
+    case NVFP44Over6ErrMode::MAE:
+      return dispatchNVFP44Over6ErrFastMath<E4M3_MAX, NVFP44Over6ErrMode::MAE>(
+          errUseFastMath, disableFP4QuantFastMath, fn);
+    case NVFP44Over6ErrMode::MSE:
+      return dispatchNVFP44Over6ErrFastMath<E4M3_MAX, NVFP44Over6ErrMode::MSE>(
+          errUseFastMath, disableFP4QuantFastMath, fn);
+    default:
+      TLLM_CHECK_WITH_INFO(false, "Unsupported NVFP4 4over6 error mode.");
+      return dispatchNVFP44Over6ErrFastMath<E4M3_MAX, NVFP44Over6ErrMode::MAE>(
+          errUseFastMath, disableFP4QuantFastMath, fn);
+  }
+}
+
 // Selects the compile-time NVFP4 quantizer variant from the recipe code
 // (resolveNVFP4Recipe(); the default code reads FLASHINFER_NVFP4_4OVER6*).
 // FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH stays a separate environment knob.
 template <typename Fn>
-auto dispatchNVFP44Over6Config(int64_t nvfp4_4over6_code, Fn&& fn) {
+decltype(auto) dispatchNVFP44Over6Config(int64_t nvfp4_4over6_code, Fn&& fn) {
   auto const recipe = tensorrt_llm::kernels::resolveNVFP4Recipe(nvfp4_4over6_code);
   bool const disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
-
-  auto dispatchDisableFastMath = [&](auto e4m3MaxTag, auto errModeTag, auto errUseFastMathTag) {
-    if (disableFP4QuantFastMath) {
-      return fn(std::true_type{},
-                NVFP44Over6Config<decltype(e4m3MaxTag)::value, decltype(errModeTag)::value,
-                                  decltype(errUseFastMathTag)::value>{});
-    }
-    return fn(std::false_type{},
-              NVFP44Over6Config<decltype(e4m3MaxTag)::value, decltype(errModeTag)::value,
-                                decltype(errUseFastMathTag)::value>{});
-  };
 
   if (recipe.use4Over6) {
     NVFP44Over6ErrMode const errMode = recipe.errMode;
     bool const errUseFastMath = recipe.errUseFastMath;
     int const e4m3Max = recipe.e4m3Max;
-
-    auto dispatchErrUseFastMath = [&](auto e4m3MaxTag, auto errModeTag) {
-      if (errUseFastMath) {
-        return dispatchDisableFastMath(e4m3MaxTag, errModeTag, std::true_type{});
-      }
-      return dispatchDisableFastMath(e4m3MaxTag, errModeTag, std::false_type{});
-    };
-    auto dispatchErrMode = [&](auto e4m3MaxTag) {
-      switch (errMode) {
-        case NVFP44Over6ErrMode::MAE:
-          return dispatchErrUseFastMath(
-              e4m3MaxTag, std::integral_constant<NVFP44Over6ErrMode, NVFP44Over6ErrMode::MAE>{});
-        case NVFP44Over6ErrMode::MSE:
-          return dispatchErrUseFastMath(
-              e4m3MaxTag, std::integral_constant<NVFP44Over6ErrMode, NVFP44Over6ErrMode::MSE>{});
-        default:
-          TLLM_CHECK_WITH_INFO(false, "Unsupported NVFP4 4over6 error mode.");
-          return dispatchErrUseFastMath(
-              e4m3MaxTag, std::integral_constant<NVFP44Over6ErrMode, NVFP44Over6ErrMode::MAE>{});
-      }
-    };
     if (e4m3Max == 256) {
-      return dispatchErrMode(std::integral_constant<int, 256>{});
+      return dispatchNVFP44Over6ErrMode<256>(errMode, errUseFastMath, disableFP4QuantFastMath, fn);
     }
     TLLM_CHECK_WITH_INFO(e4m3Max == 448, "Unsupported NVFP4 4over6 E4M3 max.");
-    return dispatchErrMode(std::integral_constant<int, 448>{});
+    return dispatchNVFP44Over6ErrMode<448>(errMode, errUseFastMath, disableFP4QuantFastMath, fn);
   }
 
   if (disableFP4QuantFastMath) {
@@ -1812,6 +1817,18 @@ __global__ void expandInputRowsKernel(
   // straddle the inter_size boundary within valid rows.
 }
 
+// Named functors instead of generic lambdas: the MSVC host compiler of the Windows port
+// fails on the nested generic lambdas of the original dispatch (Windows ARM64 port).
+template <class InputActivationsType, class ExpandedActivationsType>
+struct NVFP4ExpandInputRowsKernelSelector {
+  template <class DisableFP4QuantFastMathTag, class NVFP4ConfigTag>
+  auto operator()(DisableFP4QuantFastMathTag, NVFP4ConfigTag) const {
+    return &expandInputRowsKernel<InputActivationsType, ExpandedActivationsType,
+                                  TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4,
+                                  false, DisableFP4QuantFastMathTag::value, NVFP4ConfigTag>;
+  }
+};
+
 template <class InputActivationsType, class ExpandedActivationsType>
 void expandInputRowsKernelLauncher(
     InputActivationsType const* unpermuted_input, ExpandedActivationsType* permuted_output,
@@ -1892,12 +1909,7 @@ void expandInputRowsKernelLauncher(
       TLLM_CHECK_WITH_INFO(!prequant_scales, "NVFP4 is not supported for AWQ");
       return dispatchNVFP44Over6Config(
           quant_params.fp4.nvfp4_4over6_code,
-          [&](auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
-            return &expandInputRowsKernel<
-                InputActivationsType, ExpandedActivationsType,
-                TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4, false,
-                decltype(disableFP4QuantFastMathTag)::value, decltype(nvfp4_4over6_config_tag)>;
-          });
+          NVFP4ExpandInputRowsKernelSelector<InputActivationsType, ExpandedActivationsType>{});
     } else
 #endif
     {
@@ -2666,6 +2678,76 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
 }
 
 template <class T, class GemmOutputType, class ScaleBiasType>
+using ActivationKernelPtr =
+    decltype(&doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                                 IdentityAdaptor<cutlass::epilogue::thread::Identity>,
+                                 TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE,
+                                 false, std::false_type>);
+
+template <class T, class GemmOutputType, class ScaleBiasType,
+          TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType,
+          bool DisableFP4QuantFastMath, class NVFP4Config>
+ActivationKernelPtr<T, GemmOutputType, ScaleBiasType> selectActivationKernel(
+    ActivationType activation_type) {
+  using KernelPtr = ActivationKernelPtr<T, GemmOutputType, ScaleBiasType>;
+  static constexpr std::array<KernelPtr, 11> kernels = {
+      &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                          IdentityAdaptor<cutlass::epilogue::thread::GELU>, BlockScalingType,
+                          DisableFP4QuantFastMath, NVFP4Config>,  // Gelu
+      &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                          IdentityAdaptor<cutlass::epilogue::thread::ReLu>, BlockScalingType,
+                          DisableFP4QuantFastMath, NVFP4Config>,  // Relu
+      &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                          IdentityAdaptor<cutlass::epilogue::thread::SiLu>, BlockScalingType,
+                          DisableFP4QuantFastMath, NVFP4Config>,  // Silu
+      &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                          GLUAdaptor<cutlass::epilogue::thread::SiLu>, BlockScalingType,
+                          DisableFP4QuantFastMath, NVFP4Config>,  // Swiglu
+      &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                          GLUAdaptor<cutlass::epilogue::thread::GELU>, BlockScalingType,
+                          DisableFP4QuantFastMath, NVFP4Config>,  // Geglu
+      &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor, BlockScalingType,
+                          DisableFP4QuantFastMath, NVFP4Config>,  // SwigluBias
+      &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                          IdentityAdaptor<cutlass::epilogue::thread::Relu2>, BlockScalingType,
+                          DisableFP4QuantFastMath, NVFP4Config>,  // Relu2
+      &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluStepAdaptor, BlockScalingType,
+                          DisableFP4QuantFastMath, NVFP4Config>,  // SwigluStep
+      &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                          GLUAdaptor<cutlass::epilogue::thread::GELU_taylor>, BlockScalingType,
+                          DisableFP4QuantFastMath, NVFP4Config>,  // GegluTanh
+      &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                          IdentityAdaptor<cutlass::epilogue::thread::Identity>, BlockScalingType,
+                          DisableFP4QuantFastMath, NVFP4Config>,  // Identity
+      &doActivationKernel<T, GemmOutputType, ScaleBiasType, SituAdaptor, BlockScalingType,
+                          DisableFP4QuantFastMath, NVFP4Config>  // Situ
+  };
+  // PowLU is CUTLASS-only and numbered after InvalidType (like ClampedRelu2), so it is
+  // outside the dense enum-indexed range of kernels and dispatched here instead.
+  if (activation_type == ActivationType::PowLU) {
+    return &doActivationKernel<T, GemmOutputType, ScaleBiasType, PowLUAdaptor, BlockScalingType,
+                               DisableFP4QuantFastMath, NVFP4Config>;
+  }
+  auto const activation_index = static_cast<size_t>(activation_type);
+  TLLM_CHECK_WITH_INFO(activation_index < kernels.size(),
+                       "Unsupported activation type in doActivation");
+  return kernels[activation_index];
+}
+
+template <class T, class GemmOutputType, class ScaleBiasType>
+struct NVFP4ActivationKernelSelector {
+  ActivationType activation_type;
+
+  template <class DisableFP4QuantFastMathTag, class NVFP4ConfigTag>
+  auto operator()(DisableFP4QuantFastMathTag, NVFP4ConfigTag) const {
+    return selectActivationKernel<T, GemmOutputType, ScaleBiasType,
+                                  TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4,
+                                  DisableFP4QuantFastMathTag::value, NVFP4ConfigTag>(
+        activation_type);
+  }
+};
+
+template <class T, class GemmOutputType, class ScaleBiasType>
 void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8_quant,
                   ScaleBiasType const* bias, bool bias_is_broadcast,
                   int64_t const* expert_first_token_offset,
@@ -2721,97 +2803,30 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
   int64_t const blocks =
       std::min(smCount * blocks_per_sm, std::max(expanded_num_tokens, int64_t{1}));
 
-  auto fn = [&]() {
-    auto fn = [&](auto block_scaling_type, auto disableFP4QuantFastMathTag,
-                  auto nvfp4_4over6_config_tag) {
-      auto fn_list = std::array{
-          &doActivationKernel<
-              T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::GELU>,
-              decltype(block_scaling_type)::value, decltype(disableFP4QuantFastMathTag)::value,
-              decltype(nvfp4_4over6_config_tag)>,  // Gelu
-          &doActivationKernel<
-              T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::ReLu>,
-              decltype(block_scaling_type)::value, decltype(disableFP4QuantFastMathTag)::value,
-              decltype(nvfp4_4over6_config_tag)>,  // Relu
-          &doActivationKernel<
-              T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::SiLu>,
-              decltype(block_scaling_type)::value, decltype(disableFP4QuantFastMathTag)::value,
-              decltype(nvfp4_4over6_config_tag)>,  // Silu
-          &doActivationKernel<
-              T, GemmOutputType, ScaleBiasType, GLUAdaptor<cutlass::epilogue::thread::SiLu>,
-              decltype(block_scaling_type)::value, decltype(disableFP4QuantFastMathTag)::value,
-              decltype(nvfp4_4over6_config_tag)>,  // Swiglu
-          &doActivationKernel<
-              T, GemmOutputType, ScaleBiasType, GLUAdaptor<cutlass::epilogue::thread::GELU>,
-              decltype(block_scaling_type)::value, decltype(disableFP4QuantFastMathTag)::value,
-              decltype(nvfp4_4over6_config_tag)>,  // Geglu
-          &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor,
-                              decltype(block_scaling_type)::value,
-                              decltype(disableFP4QuantFastMathTag)::value,
-                              decltype(nvfp4_4over6_config_tag)>,  // SwigluBias
-          &doActivationKernel<
-              T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::Relu2>,
-              decltype(block_scaling_type)::value, decltype(disableFP4QuantFastMathTag)::value,
-              decltype(nvfp4_4over6_config_tag)>,  // Relu2
-          &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluStepAdaptor,
-                              decltype(block_scaling_type)::value,
-                              decltype(disableFP4QuantFastMathTag)::value,
-                              decltype(nvfp4_4over6_config_tag)>,  // SwigluStep
-          &doActivationKernel<
-              T, GemmOutputType, ScaleBiasType, GLUAdaptor<cutlass::epilogue::thread::GELU_taylor>,
-              decltype(block_scaling_type)::value, decltype(disableFP4QuantFastMathTag)::value,
-              decltype(nvfp4_4over6_config_tag)>,  // GegluTanh
-          &doActivationKernel<T, GemmOutputType, ScaleBiasType,
-                              IdentityAdaptor<cutlass::epilogue::thread::Identity>,
-                              decltype(block_scaling_type)::value,
-                              decltype(disableFP4QuantFastMathTag)::value,
-                              decltype(nvfp4_4over6_config_tag)>,  // Identity
-          &doActivationKernel<T, GemmOutputType, ScaleBiasType, SituAdaptor,
-                              decltype(block_scaling_type)::value,
-                              decltype(disableFP4QuantFastMathTag)::value,
-                              decltype(nvfp4_4over6_config_tag)>  // Situ
-      };
-      // PowLU is CUTLASS-only and numbered after InvalidType (like ClampedRelu2), so it is
-      // outside the dense enum-indexed range of fn_list and dispatched here instead.
-      if (activation_type.activation_type == ActivationType::PowLU) {
-        return &doActivationKernel<
-            T, GemmOutputType, ScaleBiasType, PowLUAdaptor, decltype(block_scaling_type)::value,
-            decltype(disableFP4QuantFastMathTag)::value, decltype(nvfp4_4over6_config_tag)>;
-      }
-      auto const activation_index = static_cast<size_t>(activation_type.activation_type);
-      TLLM_CHECK_WITH_INFO(activation_index < fn_list.size(),
-                           "Unsupported activation type in doActivation");
-      return fn_list[activation_index];
-    };
+  ActivationKernelPtr<T, GemmOutputType, ScaleBiasType> fn = nullptr;
 #ifdef ENABLE_FP4
-    auto NVFP4 = tensorrt_llm::common::ConstExprWrapper<
-        TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
-        TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4>{};
-    auto MXFPX = tensorrt_llm::common::ConstExprWrapper<
-        TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
-        TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX>{};
+  if constexpr (std::is_same_v<T, Fp4Type>) {
+    TLLM_CHECK_WITH_INFO(quant_params.fp4.fc2.weight_block_scale,
+                         "NVFP4 block scaling is expected for FP4xFP4");
+    fn = dispatchNVFP44Over6Config(quant_params.fp4.nvfp4_4over6_code,
+                                   NVFP4ActivationKernelSelector<T, GemmOutputType, ScaleBiasType>{
+                                       activation_type.activation_type});
+  } else if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
+    fn =
+        use_mxfp8_block_scaling
+            ? selectActivationKernel<T, GemmOutputType, ScaleBiasType,
+                                     TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
+                                     false, std::false_type>(activation_type.activation_type)
+            : selectActivationKernel<T, GemmOutputType, ScaleBiasType,
+                                     TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE,
+                                     false, std::false_type>(activation_type.activation_type);
+  } else
 #endif
-    auto NONE = tensorrt_llm::common::ConstExprWrapper<
-        TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
-        TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE>{};
-#ifdef ENABLE_FP4
-    if constexpr (std::is_same_v<T, Fp4Type>) {
-      TLLM_CHECK_WITH_INFO(quant_params.fp4.fc2.weight_block_scale,
-                           "NVFP4 block scaling is expected for FP4xFP4");
-      return dispatchNVFP44Over6Config(
-          quant_params.fp4.nvfp4_4over6_code,
-          [&](auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
-            return fn(NVFP4, disableFP4QuantFastMathTag, nvfp4_4over6_config_tag);
-          });
-    } else if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-      return use_mxfp8_block_scaling ? fn(MXFPX, std::false_type{}, std::false_type{})
-                                     : fn(NONE, std::false_type{}, std::false_type{});
-    } else
-#endif
-    {
-      return fn(NONE, std::false_type{}, std::false_type{});
-    }
-  }();
+  {
+    fn = selectActivationKernel<T, GemmOutputType, ScaleBiasType,
+                                TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE,
+                                false, std::false_type>(activation_type.activation_type);
+  }
 
   cudaLaunchConfig_t config;
   config.gridDim = blocks;
