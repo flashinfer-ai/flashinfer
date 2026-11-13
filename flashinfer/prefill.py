@@ -102,6 +102,7 @@ from .utils import (
     TensorLayout,
     _check_block_tables_shape,
     _check_cached_qkv_data_type,
+    _check_head_dim,
     _check_kv_layout,
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
@@ -842,6 +843,11 @@ def get_batch_prefill_module(backend, *args):
         uses_spcompress: Optional[bool] = None,
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     ) -> None:
+        if sinks is not None and backend in ("fa2", "fa3"):
+            raise NotImplementedError(
+                f"The standard {backend} paged adapter does not support sinks. "
+                "Use a backend with attention-sink support or a custom sink JIT module."
+            )
         if backend == "trtllm-gen":
             assert num_qo_heads is not None
             assert num_kv_heads is not None
@@ -1652,6 +1658,7 @@ def single_prefill_with_kv_cache(
             head_dim_qk=q.shape[-1],
             head_dim_vo=out_head_dim,
         )
+    _check_head_dim(q.shape[-1], out_head_dim, backend)
 
     # Unpack NVFP4 scale factors
     k_sf, v_sf = None, None
@@ -3758,6 +3765,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
+        _check_head_dim(head_dim_qk, head_dim_vo, self._backend)
         if fixed_split_size is None:
             fixed_split_size = -1
 
@@ -3821,6 +3829,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     head_dim_qk,
                     head_dim_vo,
                 )
+            # Re-check once "auto" has resolved to a concrete backend, before the
+            # module build.
+            _check_head_dim(head_dim_qk, head_dim_vo, backend)
             if backend == "cudnn":
                 raise NotImplementedError(
                     "workspace_size is not available for cudnn prefill backend"
@@ -4599,6 +4610,19 @@ class BatchPrefillWithPagedKVCacheWrapper:
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
+            if self._backend == "auto":
+                self._backend = determine_attention_backend(
+                    self.device,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    use_fp16_qk_reduction,
+                    self._custom_mask_buf is not None,  # use_custom_mask
+                    q_data_type,
+                    kv_data_type,
+                    head_dim_qk=head_dim_qk,
+                    head_dim_vo=head_dim_vo,
+                )
+            # Before the module build, which fails first for some invalid head dims.
+            _check_head_dim(head_dim_qk, head_dim_vo, self._backend)
             if self._backend != "cudnn":
                 get_module_args = (
                     q_data_type,
@@ -4620,6 +4644,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             else:
                 # A previous FA2 plan must not execute after auto selects cuDNN.
                 self._cached_module = None
+
+        _check_head_dim(head_dim_qk, head_dim_vo, self._backend)
 
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
@@ -4735,15 +4761,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ):
             if self._backend == "cudnn" and (
                 pos_encoding_mode != "NONE"
-                or window_left != -1
                 or logits_soft_cap != 0
                 or packed_custom_mask is not None
                 or self._variant_owns_mask
                 or prefix_len_ptr is not None
             ):
                 raise NotImplementedError(
-                    "cuDNN paged prefill supports only causal or full attention without "
-                    "position encoding, window_left, logits_soft_cap or custom masks"
+                    "cuDNN paged prefill does not support position encoding, "
+                    "logits_soft_cap or custom masks"
                 )
             if self._qo_indptr_buf.dtype != torch.int32:
                 if self.is_cuda_graph_enabled:
@@ -4862,6 +4887,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         graph_kv,
                         causal,
                         True,
+                        window_left=window_left if window_left >= 0 else None,
                         o_data_type=o_data_type,
                         actual_seq_lens_q=self._seq_lens_q,
                         actual_seq_lens_kv=self._seq_lens_kv,
@@ -5394,6 +5420,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             and self._backend == "cudnn"
             and self._cudnn_plan is not None
             and self._cudnn_plan.metadata.causal == self._causal
+            and self._cudnn_plan.metadata.window_left
+            == (window_left if window_left >= 0 else None)
             # Head-major Stats places tokens through the ragged offset; a plan
             # that dropped it (single-token GQA on cuDNN < 9.27) stages NH.
             and self._cudnn_plan.metadata.batch_offsets_stats is not None
@@ -5552,6 +5580,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if (
                 plan is not None
                 and plan.metadata.causal == self._causal
+                and plan.metadata.window_left
+                == (window_left if window_left >= 0 else None)
                 and q_scale is None
                 and k_scale is None
                 and v_scale is None
@@ -5616,6 +5646,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     batch_offsets_q=self._qo_indptr_buf,
                     batch_offsets_stats=self._qo_indptr_buf if return_lse else None,
                     batch_offsets_units="tokens",
+                    window_left=window_left if window_left >= 0 else None,
                     out=out,
                     lse=lse,
                     o_data_type=out_dtype,
@@ -7079,6 +7110,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     if upgraded is not None:
                         self._backend = upgraded
 
+            # Before the module build, which fails first for some invalid head dims.
+            _check_head_dim(head_dim_qk, head_dim_vo, self._backend)
             get_module_args = (
                 q_data_type,
                 kv_data_type,
@@ -7304,6 +7337,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._plan_info = self._cached_module.plan(
                 *args,
             )
+
+        _check_head_dim(head_dim_qk, head_dim_vo, self._backend)
 
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode

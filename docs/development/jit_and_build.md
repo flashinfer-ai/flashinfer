@@ -154,6 +154,13 @@ lanes repeat the check. After wheel builds,
 `cuobjdump` inspection. Register multi-architecture sources only for targets in
 `current_compilation_context.TARGET_CUDA_ARCHS`; see `gen_ulysses_lowp_module`.
 
+Before parallel provider lint, `scripts/prefetch_jit_spec_headers.py` fills the
+shared artifact cache with the pinned TRT-LLM manifests and export headers.
+A slow cold download must finish before another architecture starts waiting
+for its lock; otherwise that wait can time out and the fail-fast pool kills
+the downloader. Prefetch uses the generators' checksum validation and download
+limits, fetches no cubins, and stops the lint if a required header is missing.
+
 The PR AOT lane (`scripts/task_test_jit_cache_package_build_import.sh`) uses the
 pinned rapidsai/sccache fork for nvcc (`FLASHINFER_SCCACHE_NVCC_IMPL=rapids`, key
 prefix `<tag>-rapids`). Dependency-list hashing reduces recorded nvcc-hit host

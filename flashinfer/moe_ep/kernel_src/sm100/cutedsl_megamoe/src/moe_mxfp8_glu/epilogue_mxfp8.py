@@ -655,7 +655,7 @@ class GluMxfp8Epilogue:
             for idx in cutlass.range_constexpr(EpiWarpCount):
                 g_fc1_output_warp_view = cute.local_tile(
                     real_fc1_output,
-                    (EpilogueTileN, Fc1EpilogueOutputTileN, 1),
+                    (*self._epi_tile, 1),
                     (base_token_tile + idx, work_tile_info.tile_n_idx, 0),
                 )
                 GluMxfp8Epilogue.tma_store_fc1_output(

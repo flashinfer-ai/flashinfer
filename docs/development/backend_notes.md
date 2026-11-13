@@ -76,6 +76,17 @@ winners and timing thresholds.
 
 ### Ragged lengths and masks
 
+Explicit paged cuDNN plans pass `window_left` through the common graph contract.
+The prepared and scaled execution paths use the same window. A value of `-1`
+disables it. For a nonnegative W, let p = query_index + KV_length - Q_length
+denote the bottom-right aligned query position. With `causal=True`, eligible keys
+range from p-W through p. With `causal=False`, the window only excludes keys
+below p-W; keys above p remain eligible up to the valid KV length. Both cases
+also respect the valid sequence bounds. The low level converts W to cuDNN's W+1
+inclusive left bound.
+The window remains a plan-time attribute and cannot change in a retained capture.
+Paged automatic admission still excludes windows pending separate qualification.
+
 Valid attention lengths differ from physical ragged offsets: `seq_lens_q` can
 be shorter than its slot. Infer lengths from adjacent offsets only when omitted.
 Keep token-offset units consistent in graph descriptors and override shapes,
@@ -88,6 +99,12 @@ a compacted reference; checking only the latest eager call misses stale
 bindings and mask-representation transitions.
 
 ### FA2 scheduling and runtime scales
+
+Standard FA2/FA3 paged adapters reject `sinks` instead of silently dropping the
+tensor. This also applies to tensor-core decode when it uses the paged prefill
+adapter, including a fallback from another provider. Custom sink JIT modules
+retain their existing positional-argument interface; their generated kernel
+must actually include the sink variant.
 
 FA2 captures bind CPU-generated output/merge prefixes as well as indptr tensors.
 Updating indptrs after switching to cuDNN leaves schedules stale when requests
