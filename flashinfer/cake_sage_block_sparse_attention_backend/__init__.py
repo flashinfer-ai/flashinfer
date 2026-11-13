@@ -157,6 +157,27 @@ def _check_tensor(
         )
 
 
+#: Byte alignment of the BF16 Q/K/V the quantizers read with 32-byte vector loads.
+QUANTIZE_INPUT_ALIGNMENT = 32
+#: Byte alignment of the attention's FP8 Q/K/V (TMA bases), BF16 output (16-byte stores)
+#: and V scales (16-byte loads).
+ATTENTION_ALIGNMENT = 16
+
+
+def _check_aligned(name: str, tensor: torch.Tensor, alignment: int) -> None:
+    """Refuse a tensor whose data does not start on an ``alignment``-byte boundary.
+
+    A contiguous view with a storage offset (``x[1:]``, a slice of a larger buffer) can
+    start anywhere; the kernels' vector accesses need the boundary.
+    """
+    address = tensor.data_ptr()
+    if address % alignment:
+        raise ValueError(
+            f"{name} must start on a {alignment}-byte boundary, got address {address:#x} "
+            f"(storage offset {tensor.storage_offset()}); pass a copy, e.g. {name}.clone()"
+        )
+
+
 def _softmax_scale(softmax_scale: Optional[float], dim: int) -> float:
     if softmax_scale is None:
         softmax_scale = dim**-0.5
@@ -238,7 +259,7 @@ def _attention_role(arch: str, block_sparse_num: int) -> str:
     return "attention"
 
 
-def _attention_call(
+def _attention_operands(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -255,11 +276,15 @@ def _attention_call(
     lse: Optional[torch.Tensor],
     enable_pdl: Optional[bool],
     operands_checked: bool = False,
+    check_addresses: bool = True,
 ):
-    """Validate one attention call and return ``((run, args), out, lse)``; launches nothing.
+    """Validate one attention call and return ``(record, arch, args, out, lse)``.
 
-    ``operands_checked`` skips the checks of Q/K/V and their scales, which the quantizer of
-    :func:`bsa_attn_sm100_sage_quantize_fwd_cake` has just allocated in this layout.
+    Every refusal raises ``ValueError`` or ``TypeError`` before anything is allocated;
+    nothing is launched or loaded.  ``operands_checked`` skips the checks of Q/K/V and
+    their scales, which the quantizer of :func:`bsa_attn_sm100_sage_quantize_fwd_cake`
+    has just allocated in this layout.  ``check_addresses=False`` skips the alignment
+    checks (fake tensors have no data).
     """
     if not operands_checked:
         for name, t in (("q", q), ("k", k), ("v", v)):
@@ -298,6 +323,13 @@ def _attention_call(
             (batch, kv_heads, k_scale_groups),
         )
         _check_tensor("v_scale", v_scale, device, torch.float32)
+        if (
+            check_addresses
+            and (q.data_ptr() | k.data_ptr() | v.data_ptr() | v_scale.data_ptr())
+            % ATTENTION_ALIGNMENT
+        ):
+            for name, t in (("q", q), ("k", k), ("v", v), ("v_scale", v_scale)):
+                _check_aligned(name, t, ATTENTION_ALIGNMENT)
     if v_scale.dim() == 3 and tuple(v_scale.shape) == (batch, kv_heads, dim):
         v_scale_batch_stride = kv_heads * dim
     elif tuple(v_scale.shape) == (kv_heads, dim):
@@ -359,19 +391,21 @@ def _attention_call(
 
     scale = _softmax_scale(softmax_scale, dim)
 
+    if out is not None:
+        _check_tensor("out", out, device, torch.bfloat16, (batch, seqlen_q, heads, dim))
+        if check_addresses:
+            _check_aligned("out", out, ATTENTION_ALIGNMENT)
+    if return_lse and lse is not None:
+        _check_tensor("lse", lse, device, torch.float32, (batch, heads, seqlen_q))
     if out is None:
         out = torch.empty(
             (batch, seqlen_q, heads, dim), dtype=torch.bfloat16, device=device
         )
-    else:
-        _check_tensor("out", out, device, torch.bfloat16, (batch, seqlen_q, heads, dim))
     if return_lse:
         if lse is None:
             lse = torch.empty(
                 (batch, heads, seqlen_q), dtype=torch.float32, device=device
             )
-        else:
-            _check_tensor("lse", lse, device, torch.float32, (batch, heads, seqlen_q))
         lse_arg = lse
     else:
         lse_arg = q_scale
@@ -410,7 +444,13 @@ def _attention_call(
     )
     record, tail = _record(_attention_role(arch, int(block_sparse_num)), pdl)
     args += tail + (max(1, min(total_tiles, _loader.sm_count(device_index))), 1, 1)
-    return (_loader.entry(record, arch), args), out, (lse if return_lse else None)
+    return record, arch, args, out, (lse if return_lse else None)
+
+
+def _attention_call(*args, **kwargs):
+    """Validate one attention call and return ``((run, args), out, lse)``; launches nothing."""
+    record, arch, call_args, out, lse = _attention_operands(*args, **kwargs)
+    return (_loader.entry(record, arch), call_args), out, lse
 
 
 def bsa_attn_sm100_sage_fwd_cake(
@@ -436,6 +476,9 @@ def bsa_attn_sm100_sage_fwd_cake(
     Args:
         q: ``float8_e4m3fn`` ``(B, Sq, H, 128)`` contiguous.
         k, v: ``float8_e4m3fn`` ``(B, Sk, Hkv, 128)`` contiguous; ``H % Hkv == 0``.
+            Q, K, V, ``v_scale`` and ``out`` must start on a 16-byte boundary (a view
+            with a storage offset may not); every tensor holds at most ``2**31 - 1``
+            elements.
         q2k_block_index: int32 ``(B, H, ceil(Sq/64), capacity)`` selected 64-token KV blocks.
         block_sparse_num: uniform number of selected blocks per row (``<= capacity``);
             ignored when ``q2k_block_nums`` is given.
@@ -535,6 +578,9 @@ def _quantize_calls(
     _check_tensor("q", q, device, torch.bfloat16)
     _check_tensor("k", k, device, torch.bfloat16, (batch, seqlen_k, kv_heads, dim))
     _check_tensor("v", v, device, torch.bfloat16, (batch, seqlen_k, kv_heads, dim))
+    if (q.data_ptr() | k.data_ptr() | v.data_ptr()) % QUANTIZE_INPUT_ALIGNMENT:
+        for name, t in (("q", q), ("k", k), ("v", v)):
+            _check_aligned(name, t, QUANTIZE_INPUT_ALIGNMENT)
     groups = _ceil_div(seqlen_k, K_SCALE_GROUP)
     grid_heads = max(heads, kv_heads)
     pdl = _pdl_supported(device_index) if enable_pdl is None else bool(enable_pdl)
@@ -677,6 +723,9 @@ def sage_fp8_quantize_sm100(
     (and so each FP8 output) holds at most ``2**31 - 1`` elements: the kernels index them with
     32-bit offsets.
 
+    Q, K and V must start on a 32-byte boundary (the kernels read them with 32-byte vector
+    loads; a view with a storage offset may not).
+
     ``impl`` picks the program; every choice writes the same bits.  ``"two_launch"``: a Q/K
     kernel that also reduces the V absolute maximum with atomics, then a V kernel (two
     launches plus one ``zero_`` of the V amax scratch).  ``"one_launch"``: one launch, a
@@ -735,6 +784,68 @@ def bsa_attn_sm100_sage_quantize_fwd_cake(
         operands_checked=True,
     )
     _launch(*calls, attention)
+    return out, lse
+
+
+def sm100_sage_fwd_cake_dispatch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: int,
+    *,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    block_sizes: Optional[torch.Tensor] = None,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    return_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    fallback: bool = False,
+    fake: bool = False,
+) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    """:func:`bsa_attn_sm100_sage_fwd_cake` for a dispatcher (``bsa_attn_sm100_blk64_fwd``).
+
+    ``fallback=True``: a call that this backend refuses (device, head_dim, dtypes, shapes,
+    GQA ratio, layouts, alignment, the ``2**31 - 1``-element limit, ``block_sparse_num``,
+    ``softmax_scale``) returns ``None`` before anything is allocated or launched, so the
+    dispatcher can run another kernel; ``fallback=False`` raises like
+    :func:`bsa_attn_sm100_sage_fwd_cake`.  ``fake=True`` (torch fake mode) checks the call,
+    loads the kernel and returns the allocated outputs without launching it; the address
+    checks are skipped (fake tensors have no data).
+    """
+    if fallback and not (
+        isinstance(q, torch.Tensor) and is_cake_sage_sm100_supported(q.device)
+    ):
+        return None
+    try:
+        record, arch, args, out, lse = _attention_operands(
+            q,
+            k,
+            v,
+            q2k_block_index,
+            block_sparse_num,
+            q_scale,
+            k_scale,
+            v_scale,
+            block_sizes,
+            q2k_block_nums,
+            softmax_scale,
+            return_lse,
+            out,
+            lse,
+            None,
+            check_addresses=not fake,
+        )
+    except (ValueError, TypeError):
+        if fallback:
+            return None
+        raise
+    run = _loader.entry(record, arch)
+    if not fake:
+        _launch((run, args))
     return out, lse
 
 
@@ -934,4 +1045,5 @@ __all__ = [
     "is_cake_sage_sm100_supported",
     "is_cake_sage_sm120_supported",
     "sage_fp8_quantize_sm100",
+    "sm100_sage_fwd_cake_dispatch",
 ]

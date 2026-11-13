@@ -49,17 +49,6 @@ from .sm100_blk64.dispatch_helpers import (
 _sm100_blk64_compile_cache = get_jit_cache("bsa_fwd_blk64")
 
 
-def _cake_sage_accepts(*tensors: Optional[torch.Tensor]) -> bool:
-    """Whether the Cake Sage-FP8 backend serves this call: an SM100/SM103 device
-    and contiguous tensors (the Cake contract; the CuTe path also takes views)."""
-    from .bsa_sage_sm100_cake import is_cake_sage_sm100_supported
-
-    q = tensors[0]
-    if not (q.is_cuda and is_cake_sage_sm100_supported(q.device)):
-        return False
-    return all(t is None or t.is_contiguous() for t in tensors)
-
-
 @flashinfer_api
 def bsa_attn_sm100_blk64_fwd(
     q: torch.Tensor,
@@ -113,18 +102,25 @@ def bsa_attn_sm100_blk64_fwd(
             requires batch_size == 1, num_head in (4, 8), q2k_block_nums is
             None, and block_sizes is None (upstream kernel limits, not specific
             to this integration).
-        backend: ``"auto"`` (default) runs the Cake backend for the Sage FP8
-            path on SM100/SM103 when its contract holds (contiguous inputs and
-            outputs) and the call leaves ``kv_splits=1`` and ``use_clc=None``,
-            and the CuTe-DSL kernel otherwise (BF16, SM107, split-KV or
-            scheduler overrides).
-            ``"cute"`` runs the CuTe-DSL kernel. ``"cake"``
+        backend: ``"auto"`` (default; earlier releases defaulted to
+            ``"cute"``, which a caller can pass to keep that behavior) runs the Cake backend for a Sage FP8 call on
+            SM100/SM103 that leaves ``kv_splits=1`` and ``use_clc=None``, outside
+            torch fake mode, when the Cake backend accepts the call (its full
+            contract: head_dim 128, dtypes and shapes of every tensor, GQA ratio,
+            contiguous 16-byte-aligned tensors of at most ``2**31 - 1``
+            elements, ...).  Every other call, including one the Cake backend
+            refuses, runs the CuTe-DSL kernel exactly as ``"cute"`` does (BF16,
+            SM107, split-KV, scheduler overrides, strided or misaligned views,
+            larger tensors).
+            ``"cute"`` runs the CuTe-DSL kernel, unchanged. ``"cake"``
             runs the Cake-generated Sage-FP8 kernel
             (:func:`flashinfer.cute_dsl.sparse.bsa_sage_sm100_cake.bsa_attn_sm100_sage_fwd_cake`)
             which requires the FP8 path and lifts its limits: any batch size
             and head count, GQA, unaligned seqlen_q/seqlen_k, q2k_block_nums
-            (empty rows allowed) and block_sizes. ``kv_splits`` and
-            ``use_clc`` are ignored by the Cake backend.
+            (empty rows allowed) and block_sizes; it raises on a call outside
+            its contract.  ``kv_splits`` and ``use_clc`` are ignored by the
+            Cake backend.  Under torch fake mode it checks the call and returns
+            the allocated outputs without a launch, as the CuTe-DSL path does.
 
     Returns:
         (out, lse) where lse is None if return_lse is False.
@@ -139,37 +135,36 @@ def bsa_attn_sm100_blk64_fwd(
         raise ValueError(
             f"unsupported sm100_blk64 backend {backend!r}; expected 'auto', 'cute' or 'cake'"
         )
-    if backend == "auto":
-        # kv_splits other than 1 and use_clc are CuTe-DSL scheduling knobs the Cake
-        # kernel does not take: a call that sets them keeps the CuTe-DSL kernel.
-        backend = (
-            "cake"
-            if is_sage_fp8
-            and kv_splits == 1
-            and use_clc is None
-            and _cake_sage_accepts(
-                q,
-                k,
-                v,
-                q2k_block_index,
-                block_sizes,
-                q2k_block_nums,
-                q_scale,
-                k_scale,
-                v_scale,
-                out,
-                lse,
-            )
-            else "cute"
-        )
     if backend == "cake":
-        if not is_sage_fp8:
+        if q_scale is None or k_scale is None or v_scale is None:
             raise ValueError(
                 "backend='cake' requires the Sage FP8 path (q_scale/k_scale/v_scale)"
             )
-        from .bsa_sage_sm100_cake import bsa_attn_sm100_sage_fwd_cake
+        use_cake, fake = True, is_fake_mode()
+    else:
+        # "auto" tries the Cake kernel only where it can serve the call: kv_splits other
+        # than 1 and use_clc are CuTe-DSL scheduling knobs the Cake kernel does not take,
+        # and fake mode keeps the CuTe-DSL compile-only path.  A call the Cake checks
+        # refuse (device, head_dim, dtypes, shapes, layouts, alignment, tensor size, ...)
+        # returns None below and runs the CuTe-DSL kernel.
+        use_cake = (
+            backend == "auto"
+            and q_scale is not None
+            and k_scale is not None
+            and v_scale is not None
+            and kv_splits == 1
+            and use_clc is None
+            and not is_fake_mode()
+        )
+        fake = False
+    if use_cake:
+        from flashinfer.cake_sage_block_sparse_attention_backend import (
+            sm100_sage_fwd_cake_dispatch,
+        )
 
-        return bsa_attn_sm100_sage_fwd_cake(
+        # Narrowing for the type checker: use_cake implies all three scales.
+        assert q_scale is not None and k_scale is not None and v_scale is not None
+        result = sm100_sage_fwd_cake_dispatch(
             q,
             k,
             v,
@@ -184,7 +179,11 @@ def bsa_attn_sm100_blk64_fwd(
             return_lse=return_lse,
             out=out,
             lse=lse,
+            fallback=backend == "auto",
+            fake=fake,
         )
+        if result is not None:
+            return result
     if is_sage_fp8:
         assert k_scale is not None and v_scale is not None, "FP8 requires Q/K/V scales"
         assert q.dtype == torch.float8_e4m3fn, "FP8 inputs must use float8_e4m3fn"
