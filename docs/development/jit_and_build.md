@@ -168,6 +168,13 @@ CPU cost from 7.4 to about 0.3 CPU-s. Host C++ stays uncached because the fork
 fails on `g++ -MMD` for files including `<vector>`. Use
 `FLASHINFER_SCCACHE_NVCC_IMPL=upstream` for comparisons.
 
+PR runs skip the `AOT Build Import` lanes when `scripts/pr_checks/aot_scope.py`
+finds that no changed file can affect the provider wheels (docs, tests,
+benchmarks, and `flashinfer/**/*.py` that `flashinfer/aot.py` cannot import).
+Everything unclassified runs AOT, as do scheduled and manual runs. The rules and
+their limits are in that script's docstring; `tests/cpu/test_aot_scope.py` covers
+them.
+
 ## Adding a new operation
 
 For stable CUDA operations, use the
