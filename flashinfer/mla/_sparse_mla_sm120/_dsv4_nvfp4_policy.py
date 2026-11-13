@@ -75,7 +75,7 @@ _STATIC_FORMAT: _StaticFormat = {
     "chunk_width": 64,
     "page_size": 64,
     "heads": (8, 16, 32, 64, 128),
-    "topks": (128, 512),
+    "topks": (128, 256, 512),
     "extra_page_sizes": (2, 32, 64),
 }
 
