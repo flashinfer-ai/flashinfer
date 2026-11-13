@@ -140,6 +140,9 @@ void check_geometry(int64_t num_ranks, int64_t num_experts, int64_t num_max_toke
          std::to_string(layout::kLCMCandidateBlockM) + " (align it first)");
   if (num_topk < 1 || num_topk > 32 || num_topk > num_experts)
     fail("top_k must be in [1, min(32, num_experts)], got " + std::to_string(num_topk));
+  if (hidden <= 0 || intermediate_hidden <= 0)
+    fail("hidden and intermediate must be positive, got hidden=" + std::to_string(hidden) +
+         ", intermediate=" + std::to_string(intermediate_hidden));
   if (hidden % 256 != 0 || intermediate_hidden % 128 != 0 || (2 * intermediate_hidden) % 256 != 0)
     fail("hidden must be a multiple of 256 and intermediate a multiple of 128");
   if (num_sms < 2 || num_sms % 2 != 0)

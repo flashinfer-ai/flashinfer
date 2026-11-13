@@ -27,7 +27,6 @@ import hashlib
 import importlib.util
 import re
 import sys
-import tomllib
 from pathlib import Path
 
 import pytest
@@ -191,6 +190,10 @@ def _repo_file(rel: str) -> Path:
 
 
 def test_package_data_ships_sources_manifests_and_license() -> None:
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python < 3.11
+        tomllib = pytest.importorskip("tomli")
     data = tomllib.loads(_repo_file("pyproject.toml").read_text())
     globs = data["tool"]["setuptools"]["package-data"]["flashinfer.experimental.mosca"]
     for required in (
