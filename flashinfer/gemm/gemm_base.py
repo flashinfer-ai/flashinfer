@@ -684,6 +684,12 @@ def _cute_dsl_mm_bf16_requirement(
         # call still tunes the M <= 32 buckets; they offer no tactics above.
         return True
 
+    if a.shape[1] <= 0 or a.shape[1] % 128:
+        raise ValueError(
+            "The CuTeDSL low-M backend requires K to be a positive multiple of "
+            f"128 for M <= {_CUTE_DSL_BF16_MAX_M}, got K={a.shape[1]}."
+        )
+
     from .kernels.dense_bf16_gemm_sm100_splitk import default_tactic
 
     default_tactic(a.shape[0], b.shape[1], a.shape[1])
@@ -944,6 +950,7 @@ def mm_bf16(
         profiled only for M <= 3 or M * N <= 4096, and never with bias.
         Direct and warp Split-K reuse compiled kernels across M for matching
         tactics, while each M bucket still tunes independently.
+        M <= 32 requires K to be a positive multiple of 128.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     batch_invariant: bool

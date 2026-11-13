@@ -177,7 +177,9 @@ def validate_tactic(
         raise ValueError(f"this low-M policy requires 1 <= M <= {_MAX_M}, got {m}")
     if n <= 0:
         raise ValueError(f"N must be positive, got {n}")
-    if k <= 0 or k % _CTA_K or (k // _CTA_K) % tactic.split_k:
+    if k <= 0 or k % _CTA_K:
+        raise ValueError(f"K must be a positive multiple of CTA_K={_CTA_K}, got {k}")
+    if (k // _CTA_K) % tactic.split_k:
         raise ValueError(
             f"K={k} with CTA_K={_CTA_K} does not divide evenly across "
             f"split_k={tactic.split_k}"
