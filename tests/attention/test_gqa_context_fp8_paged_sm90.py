@@ -21,12 +21,17 @@ import torch
 
 import flashinfer
 from flashinfer.prefill import (
+    GQA_CTX_FP8Q_SM90_BACKENDS,
+    _gqa_ctx_fp8q_sm90_auto_routes,
+    _gqa_ctx_fp8q_sm90_backend_order,
     _gqa_ctx_fp8q_sm90_plan_eligibility,
     _gqa_ctx_fp8q_sm90_stats,
+    _gqa_fp8q_sm90_dispatch_table,
     _reset_gqa_ctx_fp8q_sm90_stats,
 )
 
-DISABLE_ENV = "FLASHINFER_DISABLE_GQA_CONTEXT_FP8_PAGED_SM90"
+DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
+DISABLE_ENV_LEGACY = "FLASHINFER_DISABLE_GQA_CONTEXT_FP8_PAGED_SM90"
 H_QO, H_KV, HEAD_DIM, PAGE = 8, 1, 128, 16
 RTOL, ATOL, MATCHED = 0.04, 0.02, 0.98
 
@@ -34,6 +39,7 @@ RTOL, ATOL, MATCHED = 0.04, 0.02, 0.98
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     monkeypatch.delenv(DISABLE_ENV, raising=False)
+    monkeypatch.delenv(DISABLE_ENV_LEGACY, raising=False)
     _reset_gqa_ctx_fp8q_sm90_stats()
     yield
     _reset_gqa_ctx_fp8q_sm90_stats()
@@ -111,8 +117,94 @@ def test_plan_guard_rejects_other_geometries(overrides):
 
 def test_stats_report_build_state_and_counters():
     stats = _gqa_ctx_fp8q_sm90_stats()
-    for key in ("plans_seen", "runs_dispatched", "module_loaded", "module_error"):
+    for key in (
+        "plans_seen",
+        "runs_dispatched",
+        "module_loaded",
+        "module_error",
+        "backends",
+        "backend_dispatches",
+        "fallback_reasons",
+        "dispatch_table_loaded",
+    ):
         assert key in stats
+    assert stats["backends"] == GQA_CTX_FP8Q_SM90_BACKENDS
+    assert set(stats["backend_dispatches"]) == {"specialized", "composable"}
+
+
+# --------------------------------------------------------------------------
+# Backend selection surface (#5667 pattern, GPU-free)
+# --------------------------------------------------------------------------
+
+
+def test_backends_tuple_is_plain_strings_with_specialized():
+    assert "specialized" in GQA_CTX_FP8Q_SM90_BACKENDS
+    assert "auto" in GQA_CTX_FP8Q_SM90_BACKENDS
+    assert all(isinstance(b, str) for b in GQA_CTX_FP8Q_SM90_BACKENDS)
+
+
+def test_dispatch_table_loads_and_matches_guard_constants():
+    table = _gqa_fp8q_sm90_dispatch_table()
+    assert table is not None
+    assert table["kill_switch"] == DISABLE_ENV
+    assert "specialized" in table["backends"]
+    op = table["ops"]["context"]
+    assert op["num_qo_heads"] == H_QO
+    assert op["num_kv_heads"] == H_KV
+    assert op["head_dim"] == HEAD_DIM
+    assert op["page_size"] == PAGE
+    assert op["kv_layout"] == "NHD"
+    assert op["causal"] is True
+    env = op["envelope"]
+    assert env["max_batch_size"] == 128
+    assert env["max_total_q"] == 32768
+    assert env["max_kv_len"] == 262144
+    assert env["max_referenced_pages"] == 131072
+
+
+def test_auto_routes_only_on_the_allowlist():
+    ok, reason = _gqa_ctx_fp8q_sm90_auto_routes(
+        H_QO, H_KV, HEAD_DIM, HEAD_DIM, PAGE, "NHD", True
+    )
+    assert ok and reason is None
+    for bad in (
+        dict(num_qo_heads=4),
+        dict(num_kv_heads=2),
+        dict(head_dim_qk=256),
+        dict(head_dim_vo=64),
+        dict(page_size=1),
+        dict(kv_layout="HND"),
+        dict(causal=False),
+    ):
+        kwargs = dict(
+            num_qo_heads=H_QO,
+            num_kv_heads=H_KV,
+            head_dim_qk=HEAD_DIM,
+            head_dim_vo=HEAD_DIM,
+            page_size=PAGE,
+            kv_layout="NHD",
+            causal=True,
+        )
+        kwargs.update(bad)
+        ok, reason = _gqa_ctx_fp8q_sm90_auto_routes(**kwargs)
+        assert not ok and reason, bad
+
+
+def test_backend_order_never_swaps_an_explicit_stock_backend():
+    # explicit "specialized": the composable path is the only fallback
+    assert _gqa_ctx_fp8q_sm90_backend_order("specialized", False) == (
+        "specialized",
+        "composable",
+    )
+    # auto: "specialized" only on the allowlist
+    assert _gqa_ctx_fp8q_sm90_backend_order("auto", True) == (
+        "specialized",
+        "composable",
+    )
+    assert _gqa_ctx_fp8q_sm90_backend_order("auto", False) == ("composable",)
+    # an explicitly named stock backend never sees "specialized"
+    for stock in ("fa2", "fa3", "cudnn", "trtllm-gen", "cute-dsl"):
+        assert "specialized" not in _gqa_ctx_fp8q_sm90_backend_order(stock, True)
 
 
 # --------------------------------------------------------------------------
@@ -165,8 +257,8 @@ def _reference(batch):
     r sees kv_len_r - q_len_r + pos + 1 keys)."""
     device = batch["q"].device
     q = batch["q"].float()
-    kf = batch["k_cache"].float().reshape(-1, HEAD_DIM)
-    vf = batch["v_cache"].float().reshape(-1, HEAD_DIM)
+    k_flat = batch["k_cache"].float().reshape(-1, HEAD_DIM)
+    v_flat = batch["v_cache"].float().reshape(-1, HEAD_DIM)
     cu = batch["qo_indptr"].tolist()
     kv_lens = batch["seq_lens"].tolist()
     bt = batch["block_table"]
@@ -181,8 +273,8 @@ def _reference(batch):
         kvl = kv_lens[r]
         npages = (kvl + PAGE - 1) // PAGE
         flat = (bt[r, :npages].long().unsqueeze(1) * PAGE + off).reshape(-1)[:kvl]
-        k = kf[flat]
-        v = vf[flat]
+        k = k_flat[flat]
+        v = v_flat[flat]
         sc = torch.einsum("nhd,ld->nhl", q[q0:q1], k) * scale
         vis = (kvl - ql) + torch.arange(ql, device=device) + 1
         mask = torch.arange(kvl, device=device).view(1, 1, kvl) >= vis.view(ql, 1, 1)
@@ -193,7 +285,14 @@ def _reference(batch):
     return out
 
 
-def _plan_wrapper(batch, device, use_cuda_graph=False):
+def _plan_wrapper(
+    batch,
+    device,
+    use_cuda_graph=False,
+    backend="specialized",
+    q_data_type=torch.float8_e4m3fn,
+    num_qo_heads=H_QO,
+):
     B = batch["seq_lens"].numel()
     ws = torch.empty(160 * 1024 * 1024, dtype=torch.uint8, device=device)
     kwargs = {}
@@ -206,19 +305,19 @@ def _plan_wrapper(batch, device, use_cuda_graph=False):
             paged_kv_last_page_len_buf=batch["last_page_len"],
         )
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        ws, kv_layout="NHD", backend="fa2", **kwargs
+        ws, kv_layout="NHD", backend=backend, **kwargs
     )
     wrapper.plan(
         batch["qo_indptr"],
         batch["kv_indptr"],
         batch["kv_indices"],
         batch["last_page_len"],
-        H_QO,
+        num_qo_heads,
         H_KV,
         HEAD_DIM,
         PAGE,
         causal=True,
-        q_data_type=torch.float8_e4m3fn,
+        q_data_type=q_data_type,
         kv_data_type=torch.float8_e4m3fn,
         o_data_type=torch.bfloat16,
     )
@@ -264,6 +363,76 @@ def test_specialized_matches_reference_and_stock(q_lens, kv_lens, monkeypatch):
     assert stats["runs_disabled"] == 1 and stats["runs_dequant_fallback"] == 1, stats
     assert _matched_ratio(out_stock, ref) >= MATCHED
     assert _matched_ratio(out, out_stock) >= MATCHED
+
+
+def test_legacy_kill_switch_alias_still_disables(monkeypatch):
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+    wrapper = _plan_wrapper(batch, device)
+    monkeypatch.setenv(DISABLE_ENV_LEGACY, "1")
+    out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["runs_disabled"] == 1 and stats["runs_dequant_fallback"] == 1, stats
+    assert stats["runs_dispatched"] == 0
+    assert _matched_ratio(out, _reference(batch)) >= MATCHED
+
+
+def test_explicit_specialized_raises_for_contracts_it_has_no_kernel_for():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    device = torch.device("cuda:0")
+    batch = _make_batch([5, 7], [584, 75], device)
+    with pytest.raises(ValueError, match="specialized"):
+        _plan_wrapper(batch, device, backend="specialized", q_data_type=torch.bfloat16)
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["plans_prepared"] == 0 and stats["runs_dispatched"] == 0
+
+
+def test_explicit_stock_backend_is_never_swapped():
+    """A caller who names a stock backend must never be served by the
+    specialized kernel — even on an allowlisted shape."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+    # fp8-Q with backend="fa2": stock behavior, whatever it is, is never this
+    # kernel (stock fa2 has no fp8-Q contract on SM90, so the plan or run is
+    # expected to fail loudly in stock code).
+    try:
+        wrapper = _plan_wrapper(batch, device, backend="fa2")
+        wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+    except Exception:
+        pass
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["plans_prepared"] == 0, stats
+    assert stats["runs_dispatched"] == 0, stats
+    assert stats["backend_dispatches"]["specialized"] == 0, stats
+
+
+def test_auto_routes_to_specialized_on_the_allowlist_only():
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+    wrapper = _plan_wrapper(batch, device, backend="auto")
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["plans_prepared"] == 1, stats
+    out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 1, stats
+    assert stats["backend_dispatches"]["specialized"] == 1, stats
+    assert _matched_ratio(out, _reference(batch)) >= MATCHED
+
+    # off-allowlist geometry: auto never routes to "specialized"
+    _reset_gqa_ctx_fp8q_sm90_stats()
+    batch4 = _make_batch([5, 7], [584, 75], device)
+    batch4["q"] = batch4["q"][:, :4, :].contiguous()
+    try:
+        _plan_wrapper(batch4, device, backend="auto", num_qo_heads=4)
+    except Exception:
+        pass  # stock auto may reject fp8-Q; it must simply never arm us
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["plans_prepared"] == 0, stats
+    assert any(r.startswith("auto:") for r in stats["fallback_reasons"]), stats
 
 
 def test_run_guard_falls_back_on_mismatched_arguments():
