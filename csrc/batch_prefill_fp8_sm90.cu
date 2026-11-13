@@ -246,6 +246,9 @@ void BatchPrefillWithPagedKVCacheSM90Run(
         params.num_kv_heads = num_kv_heads;
         params.group_size = params.num_qo_heads / num_kv_heads;
         params.page_size = page_size;
+        TVM_FFI_ICHECK_EQ(paged_k_cache.size(0), paged_v_cache.size(0))
+            << "K and V must have the same number of pages";
+        params.num_pages = paged_k_cache.size(0);
         params.window_left = window_left;
         params.causal = mask_mode_code == 1;
         params.qo_tile_indices =
