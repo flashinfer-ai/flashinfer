@@ -46,12 +46,6 @@ LEDGER = FuzzLedger(
         ),
         Finding(
             match=lambda phase: phase == "poisoned_padding",
-            backend="cutlass",
-            reason="#6860: CUTLASS MLA propagates NaNs from last-page tails and dense-table padding",
-            quarantine=True,
-        ),
-        Finding(
-            match=lambda phase: phase == "poisoned_padding",
             backend="cute-dsl-monolithic",
             reason="#6861: CuTe DSL monolithic MLA propagates padding NaNs into valid output",
             quarantine=True,
