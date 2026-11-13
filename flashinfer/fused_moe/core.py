@@ -59,7 +59,7 @@ from ..autotuner import (
 from ..jit import (
     setup_cubin_loader,
 )
-from ..jit.core import logger
+from ..jit.core import current_compilation_context, logger
 from ..jit.cpp_ext import is_cuda_version_at_least
 from ..jit.fused_moe import (
     gen_cutlass_fused_moe_sm89_module,
@@ -2120,6 +2120,34 @@ def _enabled_trtllm_da_config() -> Optional["TrtllmDaConfig"]:
 
 
 def get_trtllm_moe_sm100_module():
+    # Ask the build the same question. CompilationContext fills
+    # TARGET_CUDA_ARCHS from every device visible to the process, or from
+    # FLASHINFER_CUDA_ARCH_LIST, and jit/fused_moe.py filters that set by
+    # supported_major_versions=[10, 12] -- a module exists exactly when the
+    # filter keeps something. Keying this off the current device instead would
+    # refuse a process whose current device is SM90 while an SM100 is visible
+    # and holds the MoE tensors; that call builds and runs today.
+    if not any(
+        major >= 10 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
+    ):
+        # Every trtllm-gen MoE entry point comes through here, and
+        # is_trtllm_moe_supported answers False for arch[0] < 10 with nothing
+        # in the tree acting on it. Without an SM100-family target the request
+        # cannot be satisfied anyway -- the trtllm-gen cubin manifest carries no
+        # SM90 kernels, and nothing survives the [10, 12] filter. Which of the
+        # two it dies on depends on whether the manifest can be fetched:
+        # cubin_loader's retry exhaustion, or "No supported CUDA architectures
+        # found for major versions [10, 12]" from CompilationContext. Neither
+        # names this module, and both happen after the caller has already
+        # committed to the trtllm-gen path.
+        # SM120/SM121 do build here and fail for the manifest reason alone (see
+        # _TRTLLM_ROUTED_ARCHS above); this check says nothing about them.
+        raise ValueError(
+            f"trtllm-gen MoE needs an SM100-family CUDA target (SM100/SM103, plus "
+            f"SM107 on the Rubin cubin build); this process has none in "
+            f"{sorted(current_compilation_context.TARGET_CUDA_ARCHS)}. Use "
+            "cutlass_fused_moe for a MoE path built for this architecture."
+        )
     device = torch.device("cuda", torch.cuda.current_device())
     enable_rubin = get_compute_capability(device) == (10, 7)
     return _get_trtllm_moe_sm100_module_impl(enable_rubin)
