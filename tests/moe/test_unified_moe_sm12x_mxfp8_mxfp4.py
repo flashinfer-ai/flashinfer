@@ -1,5 +1,6 @@
 """SM12x MXFP8 x MXFP4 unified runner against a pure-Torch reference."""
 
+import importlib
 import math
 
 import pytest
@@ -95,7 +96,7 @@ def _reference(x, ids, route_weights, w1q, w1sf, w2q, w2sf, activation):
             hidden = _activation(
                 xdeq[token].float() @ w1[expert].t(), intermediate, activation
             )
-            hq, hsf = mxfp8_act_quantize(hidden[None])
+            hq, hsf = mxfp8_act_quantize(hidden[None].to(torch.bfloat16))
             hdeq = (hq.float().reshape(1, -1, 128) * hsf[:, :, None]).reshape(-1)
             out[token] += route_weights[token, slot] * (hdeq @ w2[expert].t())
     return out
@@ -104,11 +105,15 @@ def _reference(x, ids, route_weights, w1q, w1sf, w2q, w2sf, activation):
 @pytest.mark.parametrize(
     "activation", [SwiGLU(limit=0.25), SiTU(gate_scale=4.0, linear_scale=25.0)]
 )
-def test_sm12x_mxfp8_mxfp4_unified_runner_matches_reference(activation):
+@pytest.mark.parametrize("enable_pdl", [False, True, None])
+@pytest.mark.parametrize("tokens", [8, 80], ids=["decode", "prefill"])
+def test_sm12x_mxfp8_mxfp4_unified_runner_matches_reference(
+    activation, enable_pdl, tokens, monkeypatch
+):
     if not (torch.cuda.is_available() and is_sm120a_supported(torch.device("cuda"))):
         pytest.skip("requires an SM120a device")
     torch.manual_seed(7)
-    tokens, experts, top_k, hidden, intermediate = 8, 4, 2, 512, 512
+    experts, top_k, hidden, intermediate = 4, 2, 512, 512
     x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) / 10
     w1 = torch.randn(
         experts, 2 * intermediate, hidden, device="cuda", dtype=torch.bfloat16
@@ -144,11 +149,65 @@ def test_sm12x_mxfp8_mxfp4_unified_runner_matches_reference(activation):
         experts=ExpertConfig(intermediate_size=intermediate, local_num_experts=experts),
         activation=activation,
         backend=BackendOptions(candidates=(backend,)),
-        execution=ExecutionConfig(enable_pdl=False),
+        execution=ExecutionConfig(enable_pdl=enable_pdl),
     )
-    got = MoELayer(config, device=x.device)(act_pack, weight_pack)
+    route_module = importlib.import_module(
+        "flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_q0_route_triton"
+    )
+    original_route = route_module.mxfp8_q0_route_triton
+
+    def require_token_only(*args, **kwargs):
+        assert kwargs.get("token_only") is True
+        result = original_route(*args, **kwargs)
+        assert result[3].shape == x.shape
+        assert result[4].shape[1] == tokens
+        return result
+
+    monkeypatch.setattr(route_module, "mxfp8_q0_route_triton", require_token_only)
+    fc1 = importlib.import_module(
+        "flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_fc1_act_q1"
+    )
+    entered, original_split_k = [], fc1._run_split_k
+
+    def tracked_split_k(*args, **kwargs):
+        entered.append(True)
+        return original_split_k(*args, **kwargs)
+
+    monkeypatch.setattr(fc1, "_run_split_k", tracked_split_k)
+    layer = MoELayer(config, device=x.device)
+    got = layer(act_pack, weight_pack)
+    sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    tile = fc1.select_tile(
+        total_rows=tokens * top_k,
+        n=intermediate,
+        k=hidden,
+        num_experts=experts,
+        num_sms=sms,
+    )
+    selected = fc1.select_split_k(
+        tile=tile, total_rows=tokens * top_k, n=intermediate, k=hidden, num_sms=sms
+    )
+    assert bool(entered) == (enable_pdl is False and selected == 2)
     ref = _reference(x, ids, route_weights, w1q, w1sf, w2q, w2sf, activation)
     assert calc_diff(got.float(), ref) < 2e-2
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replay_out = layer(act_pack, weight_pack)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert calc_diff(replay_out.float(), ref) < 2e-2
+    saved_ids = ids.clone()
+    ids.fill_(-1)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(replay_out, torch.zeros_like(replay_out))
+    ids.copy_(saved_ids)
+    x.mul_(1.25)
+    graph.replay()
+    torch.cuda.synchronize()
+    ref = _reference(x, ids, route_weights, w1q, w1sf, w2q, w2sf, activation)
+    assert calc_diff(replay_out.float(), ref) < 2e-2
 
 
 def _mask_unrouted(ids, pattern):

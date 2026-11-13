@@ -41,7 +41,10 @@ REG_PROD_BY_TACTIC = {
 SCATTER_EPIS = (EpiMethod.WG_SCATTER,)
 
 
-def make_cfg(tile, ab_stage, epi=EpiMethod.WG_SCATTER, enable_pdl=False):
+def make_cfg(
+    tile, ab_stage, epi=EpiMethod.WG_SCATTER, enable_pdl=False, *, pingpong=False
+):
+    """``tile`` in is problem space; everything the builder sees below is kernel space, never mixed."""
     e4m3, fp4, f32, bf16, i8, ue8m0 = (
         cutlass.Float8E4M3FN,
         cutlass.Float4E2M1FN,
@@ -50,35 +53,46 @@ def make_cfg(tile, ab_stage, epi=EpiMethod.WG_SCATTER, enable_pdl=False):
         cutlass.Int8,
         cutlass.Float8E8M0FNU,
     )
-    num_math_warps = 8
+    num_math_groups = 2 if pingpong else 1
+    num_math_warps = 8 // num_math_groups
     bm, bn, bk = tile
     assert epi in SCATTER_EPIS, (
         f"{epi} is not implemented here; this epilogue scatters into rows"
     )
     assert bm >= ATOM_MNK[0], "the fused scatter reads sC, and a swapped tile has none"
-    union = EPI_CONFIGS[epi].DRAINS_SC_IN_WG
-    return Sm12xGemmConfig(
-        MmaConfig(
-            warp_mma.MmaMXF8F6F4Op(e4m3, fp4, f32, ue8m0), tile[:2], num_math_warps
-        ),
-        LoadABConfig(
-            tile,
-            ab_stage,
-            e4m3,
-            fp4,
-            b_smem_dtype=i8,
-            b_tma_internal=i8,
-            b_unpack_bits=4,
-        ),
-        Sm120SfConfigMxfp8Mxfp4(GRANK_A, GRANK_B),
-        EPI_CONFIGS[epi](bf16, num_math_warps * 32),
-        ab_stage,
-        tile,
-        epi_bar_id=3,
-        union_smem=union,
-        reg_prod=REG_PROD_BY_TACTIC[(bm, bn, epi)],
-        enable_pdl=enable_pdl,
+    assert not pingpong or tuple(tile) in ((32, 128, 128), (64, 128, 128))
+    epi_cfg = EPI_CONFIGS[epi](bf16, num_math_warps * 32)
+    epi_cfg.epi_stages = num_math_groups
+    op = warp_mma.MmaMXF8F6F4Op(e4m3, fp4, f32, ue8m0)
+    capacity = (
+        cutlass.utils.SmemAllocator.capacity_in_bytes() - Sm12xGemmConfig.MBAR_RESERVE
     )
+    for union in (False,) if pingpong else (False, True):
+        cfg = Sm12xGemmConfig(
+            MmaConfig(op, tile[:2], num_math_warps),
+            LoadABConfig(
+                tile,
+                ab_stage,
+                e4m3,
+                fp4,
+                b_smem_dtype=i8,
+                b_tma_internal=i8,
+                b_unpack_bits=4,
+            ),
+            Sm120SfConfigMxfp8Mxfp4(GRANK_A, GRANK_B),
+            epi_cfg,
+            ab_stage,
+            tile,
+            epi_bar_id=3,
+            union_smem=union,
+            reg_prod=REG_PROD_BY_TACTIC[(bm, bn, epi)],
+            enable_pdl=enable_pdl,
+            num_math_groups=num_math_groups,
+        )
+        if cfg.smem_bytes <= capacity:
+            break
+    cfg.pingpong = pingpong
+    return cfg
 
 
 @cute.jit
@@ -257,6 +271,7 @@ def mma(
     a_phase,
     b_phase,
 ):
+    """One tile's math; the A side owns the coarse SF cycle."""
     bm, bn = tile_mn
     thr = tiledmma.get_slice(tidx)
     tCrA = tiledmma.make_fragment_A(thr.partition_A(sA)[None, None, None, 0])
@@ -280,7 +295,10 @@ def mma(
     tCrSFB = sf_cfg.partition_fragment_SFB(
         cute.slice_(sSFB, (None, None, 0)), thr, tidx
     )
-    tCrSFB_frg = sf_cfg.make_sfb_ue8m0_view(tCrSFB, bk)
+    if cutlass.const_expr(mma_cfg.num_math_warps == 4):
+        tCrSFB_frg = sf_cfg.make_sfb_ue8m0_view_pingpong(tCrSFB)
+    else:
+        tCrSFB_frg = sf_cfg.make_sfb_ue8m0_view(tCrSFB, bk)
     k_blocks = cute.size(tCrA_v, mode=[2])
 
     acc.fill(0.0)
@@ -436,8 +454,11 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc2Finalize:
             sf_dtype, cute.slice_(sfb_smem, (None, None, 0))
         )
 
-        epi_empty_bars = cfg.epi.num_empty_barriers
-        epi_elems = cute.cosize(epi_smem) if cfg.owns_epi_smem else 0
+        # what the store method does not use is not allocated
+        epi_empty_bars = cfg.epi.num_empty_barriers if cfg.union_smem else 0
+        epi_aux_elems = cfg.epi.aux_smem_bytes(cfg.TILE) * 8 // cfg.epi.out_dtype.width
+        epi_elems = (cute.cosize(epi_smem) + epi_aux_elems) if cfg.owns_epi_smem else 0
+        order_bars = 4 if cfg.pingpong else 0
 
         @cute.struct
         class SharedStorage:
@@ -446,6 +467,7 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc2Finalize:
             b_full: cute.struct.MemRange[cfg.I64, cfg.ab_stage]
             b_empty: cute.struct.MemRange[cfg.I64, cfg.ab_stage]
             epi_empty: cute.struct.MemRange[cfg.I64, epi_empty_bars]
+            order: cute.struct.MemRange[cfg.I64, order_bars]
             sfull: cute.struct.MemRange[cfg.I64, cfg.sched_stages]
             sempty: cute.struct.MemRange[cfg.I64, cfg.sched_stages]
             work: cute.struct.MemRange[cfg.I32, cfg.sched_stages * cfg.fields]
@@ -465,6 +487,7 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc2Finalize:
                 cute.struct.MemRange[cfg.epi.out_dtype, epi_elems], 128
             ]
 
+        # keep the analytic cost model honest against the struct the kernel really allocates
         smem_size = SharedStorage.size_in_bytes()  # type: ignore[attr-defined]
         assert cfg.smem_bytes <= smem_size <= cfg.smem_bytes + cfg.MBAR_RESERVE, (
             f"smem model {cfg.smem_bytes} B vs allocated {smem_size} B"
@@ -525,9 +548,9 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc2Finalize:
         epi_smem,
     ):
         cfg = self.cfg
-        epi_empty_bars = cfg.epi.num_empty_barriers
+        epi_empty_bars = cfg.epi.num_empty_barriers if cfg.union_smem else 0
+        order_bars = 4 if cfg.pingpong else 0
         i32 = cutlass.Int32
-        tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
         bm, bn, bk = cfg.TILE[0], cfg.TILE[1], cfg.TILE[2]
@@ -539,6 +562,7 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc2Finalize:
         grank_c = self.sf.grank_a
         kt_per_pack_c = self.sf.k_tiles_per_pack_a(bk)
         sf_stages = self.sf.sfa_stages(cfg.ab_stage, bk)
+        # whole cycles only, so a short final one never leaves the consumer waiting
         num_sf_cycles = ceil_div(K, grank_c * self.sf.PACK_NSF * sf_stages)
 
         smem = cutlass.utils.SmemAllocator()
@@ -547,19 +571,10 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc2Finalize:
         sB = stg.sB.get_tensor(b_smem.outer, swizzle=b_smem.inner)
         sSFB = stg.sSFB.get_tensor(sfb_smem)
         sSFA = stg.sSFA.get_tensor(sfa_smem)
-        sC_stages = cute.make_tensor(
-            cute.recast_ptr(stg.sA.data_ptr(), dtype=cfg.epi.out_dtype), epi_smem
-        )
-        sC = cute.slice_(sC_stages, (None, None, 0))
-        sTok_ptr = cute.recast_ptr(
-            sC_stages.iterator + cute.cosize(epi_smem), dtype=cfg.I32
-        )
-        sTok = cute.make_tensor(sTok_ptr, cute.make_layout(bm))
-        sWt = cute.make_tensor(
-            cute.recast_ptr(sTok_ptr + bm, dtype=cutlass.Float32), cute.make_layout(bm)
-        )
         a_full, a_empty = stg.a_full.data_ptr(), stg.a_empty.data_ptr()
         b_full, b_empty = stg.b_full.data_ptr(), stg.b_empty.data_ptr()
+        order = stg.order.data_ptr() if cutlass.const_expr(order_bars > 0) else None
+        # a zero-length MemRange yields the next field's address, so an unused handle stays None
         epi_empty = (
             stg.epi_empty.data_ptr() if cutlass.const_expr(epi_empty_bars > 0) else None
         )
@@ -577,6 +592,8 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc2Finalize:
                     cute.arch.mbarrier_init(
                         epi_empty + s, cfg.epi.empty_barrier_arrivals
                     )
+                for s in cutlass.range_constexpr(order_bars):
+                    cute.arch.mbarrier_init(order + s, 128)
                 for s in cutlass.range_constexpr(cfg.sched_stages):
                     cute.arch.mbarrier_init(sfull + s, 1)
                     cute.arch.mbarrier_init(sempty + s, cfg.num_sched_consumers)
@@ -666,17 +683,210 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc2Finalize:
 
         else:
             cute.arch.setmaxregister_increase(cfg.reg_math)
-            thr_r2s = tiled_r2s.get_slice(tidx)
-            thr_s2r = tiled_s2r.get_slice(tidx)
-            a_dtype, b_dtype = cfg.load_ab.a_dtype, cfg.load_ab.b_smem_dtype
-            unpack_bits = cfg.load_ab.b_unpack_bits
             if cutlass.const_expr(cfg.enable_pdl):
                 cute.arch.griddepcontrol_wait()
-            a_phase, b_phase = i32(0), i32(0)
-            cons = moe_scheduler.MoeSchedConsumer.create(cfg.sched_stages)
+            if cutlass.const_expr(cfg.pingpong):
+                self.consume_pingpong(
+                    tiledmma,
+                    tiled_r2s,
+                    tiled_s2r,
+                    stg,
+                    sA,
+                    sB,
+                    sSFA,
+                    sSFB,
+                    epi_smem,
+                    gD,
+                    gTok,
+                    gWt,
+                    num_sf_cycles,
+                    sf_stages,
+                    kt_per_pack_c,
+                )
+            else:
+                self.consume_cooperative(
+                    tiledmma,
+                    tiled_r2s,
+                    tiled_s2r,
+                    stg,
+                    sA,
+                    sB,
+                    sSFA,
+                    sSFB,
+                    epi_smem,
+                    gD,
+                    gTok,
+                    gWt,
+                    num_sf_cycles,
+                    sf_stages,
+                    kt_per_pack_c,
+                )
+
+    @cute.jit
+    def consume_cooperative(
+        self,
+        tiledmma,
+        tiled_r2s,
+        tiled_s2r,
+        stg,
+        sA,
+        sB,
+        sSFA,
+        sSFB,
+        epi_smem,
+        gD,
+        gTok,
+        gWt,
+        num_sf_cycles,
+        sf_stages: cutlass.Constexpr,
+        kt_per_pack: cutlass.Constexpr,
+    ):
+        cfg = self.cfg
+        i32 = cutlass.Int32
+        tidx, _, _ = cute.arch.thread_idx()
+        bm, bn, bk = cfg.TILE
+        N = cute.size(gD, mode=[1])
+        a_dtype, b_dtype = cfg.load_ab.a_dtype, cfg.load_ab.b_smem_dtype
+        unpack_bits = cfg.load_ab.b_unpack_bits
+        a_full, a_empty = stg.a_full.data_ptr(), stg.a_empty.data_ptr()
+        b_full, b_empty = stg.b_full.data_ptr(), stg.b_empty.data_ptr()
+        epi_empty_bars = cfg.epi.num_empty_barriers if cfg.union_smem else 0
+        epi_empty = (
+            stg.epi_empty.data_ptr() if cutlass.const_expr(epi_empty_bars > 0) else None
+        )
+        sfull, sempty = stg.sfull.data_ptr(), stg.sempty.data_ptr()
+        sWork = stg.work.get_tensor(cute.make_layout((cfg.sched_stages, cfg.fields)))
+        cons = moe_scheduler.MoeSchedConsumer.create(cfg.sched_stages)
+        thr_r2s = tiled_r2s.get_slice(tidx)
+        thr_s2r = tiled_s2r.get_slice(tidx)
+        if cutlass.const_expr(cfg.union_smem):
+            sC_ptr = stg.sA.data_ptr()
+        else:
+            sC_ptr = stg.sC.data_ptr()
+        sC_stages = cute.make_tensor(
+            cute.recast_ptr(sC_ptr, dtype=cfg.epi.out_dtype), epi_smem
+        )
+        sC = cute.slice_(sC_stages, (None, None, 0))
+        sTok_ptr = cute.recast_ptr(
+            sC_stages.iterator + cute.cosize(epi_smem), dtype=cfg.I32
+        )
+        sTok = cute.make_tensor(sTok_ptr, cute.make_layout(bm))
+        sWt = cute.make_tensor(
+            cute.recast_ptr(sTok_ptr + bm, dtype=cutlass.Float32), cute.make_layout(bm)
+        )
+        a_phase, b_phase = i32(0), i32(0)
+        tile = cons.get_next_tile(sWork, sfull, sempty)
+        while tile.valid != i32(0):
+            acc, a_phase, b_phase = mma(
+                tiledmma,
+                self.mma,
+                self.sf,
+                sA,
+                sB,
+                sSFA,
+                sSFB,
+                (bm, bn),
+                bk,
+                cfg.ACC,
+                a_dtype,
+                b_dtype,
+                self.a_is_m_major,
+                unpack_bits,
+                tidx,
+                a_full,
+                a_empty,
+                b_full,
+                b_empty,
+                num_sf_cycles,
+                sf_stages,
+                kt_per_pack,
+                cfg.ab_stage,
+                a_phase,
+                b_phase,
+            )
+            moe_epilogue.store_wg_scatter(
+                acc,
+                thr_r2s,
+                thr_s2r,
+                sC,
+                sTok,
+                sWt,
+                gTok,
+                gWt,
+                gD,
+                tile,
+                (bm, bn),
+                N,
+                cfg.epi.out_dtype,
+                epi_empty,
+                cfg.epi_bar_id,
+                cfg.mma_threads,
+                tidx,
+            )
             tile = cons.get_next_tile(sWork, sfull, sempty)
-            while tile.valid != i32(0):
-                acc, a_phase, b_phase = mma(
+
+    @cute.jit
+    def consume_pingpong(
+        self,
+        tiledmma,
+        tiled_r2s,
+        tiled_s2r,
+        stg,
+        sA,
+        sB,
+        sSFA,
+        sSFB,
+        epi_smem,
+        gD,
+        gTok,
+        gWt,
+        num_sf_cycles,
+        sf_stages: cutlass.Constexpr,
+        kt_per_pack: cutlass.Constexpr,
+    ):
+        cfg = self.cfg
+        i32 = cutlass.Int32
+        tidx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        bm, bn, bk = cfg.TILE
+        N = cute.size(gD, mode=[1])
+        a_dtype, b_dtype = cfg.load_ab.a_dtype, cfg.load_ab.b_smem_dtype
+        unpack_bits = cfg.load_ab.b_unpack_bits
+        a_full, a_empty = stg.a_full.data_ptr(), stg.a_empty.data_ptr()
+        b_full, b_empty = stg.b_full.data_ptr(), stg.b_empty.data_ptr()
+        epi_empty_bars = cfg.epi.num_empty_barriers if cfg.union_smem else 0
+        epi_empty = (
+            stg.epi_empty.data_ptr() if cutlass.const_expr(epi_empty_bars > 0) else None
+        )
+        order = stg.order.data_ptr()
+        sfull, sempty = stg.sfull.data_ptr(), stg.sempty.data_ptr()
+        sWork = stg.work.get_tensor(cute.make_layout((cfg.sched_stages, cfg.fields)))
+        cons = moe_scheduler.MoeSchedConsumer.create(cfg.sched_stages)
+        math_wg = warp_idx >> 2
+        wg_tidx = tidx & i32(127)
+        thr_r2s = tiled_r2s.get_slice(wg_tidx)
+        thr_s2r = tiled_s2r.get_slice(wg_tidx)
+        sC_stages = cute.make_tensor(
+            cute.recast_ptr(stg.sC.data_ptr(), dtype=cfg.epi.out_dtype), epi_smem
+        )
+        sC = cute.slice_(sC_stages, (None, None, math_wg))
+        sTok_ptr = cute.recast_ptr(
+            sC_stages.iterator + cute.cosize(epi_smem), dtype=cfg.I32
+        ) + math_wg * (2 * bm)
+        sTok = cute.make_tensor(sTok_ptr, cute.make_layout(bm))
+        sWt = cute.make_tensor(
+            cute.recast_ptr(sTok_ptr + bm, dtype=cutlass.Float32), cute.make_layout(bm)
+        )
+        order_stage = i32(0)
+        order_phase = math_wg ^ i32(1)
+        task_ordinal = i32(0)
+        phase_flips = num_sf_cycles * ceil_div(sf_stages * kt_per_pack, cfg.ab_stage)
+        tile = cons.get_next_tile(sWork, sfull, sempty)
+        while tile.valid != i32(0):
+            if (task_ordinal & i32(1)) == math_wg:
+                cute.arch.mbarrier_wait(order + order_stage * 2 + math_wg, order_phase)
+                ab_phase = (task_ordinal * phase_flips) & i32(1)
+                acc, _, _ = mma(
                     tiledmma,
                     self.mma,
                     self.sf,
@@ -691,19 +901,24 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc2Finalize:
                     b_dtype,
                     self.a_is_m_major,
                     unpack_bits,
-                    tidx,
+                    wg_tidx,
                     a_full,
                     a_empty,
                     b_full,
                     b_empty,
                     num_sf_cycles,
                     sf_stages,
-                    kt_per_pack_c,
+                    kt_per_pack,
                     cfg.ab_stage,
-                    a_phase,
-                    b_phase,
+                    ab_phase,
+                    ab_phase,
                 )
-
+                cute.arch.mbarrier_arrive(
+                    order + order_stage * 2 + ((math_wg + i32(1)) & i32(1))
+                )
+                order_stage ^= i32(1)
+                order_phase ^= order_stage ^ i32(1)
+                cute.arch.mbarrier_wait(order + order_stage * 2 + math_wg, order_phase)
                 moe_epilogue.store_wg_scatter(
                     acc,
                     thr_r2s,
@@ -719,11 +934,17 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc2Finalize:
                     N,
                     cfg.epi.out_dtype,
                     epi_empty,
-                    cfg.epi_bar_id,
+                    cfg.epi_bar_id + math_wg,
                     cfg.mma_threads,
-                    tidx,
+                    wg_tidx,
                 )
-                tile = cons.get_next_tile(sWork, sfull, sempty)
+                cute.arch.mbarrier_arrive(
+                    order + order_stage * 2 + ((math_wg + i32(1)) & i32(1))
+                )
+                order_stage ^= i32(1)
+                order_phase ^= order_stage ^ i32(1)
+            task_ordinal += i32(1)
+            tile = cons.get_next_tile(sWork, sfull, sempty)
 
 
 def _stream():

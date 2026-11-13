@@ -490,6 +490,20 @@ class Sm120SfConfigMxfp8Mxfp4:
     def make_sfb_ue8m0_view(self, frg_int32, tile_k):
         return self.make_sf_ue8m0_view(frg_int32, self.grank_b, tile_k)
 
+    def make_sfb_ue8m0_view_pingpong(self, frg_int32):
+        """Preserve the four-warp MMA_N fragment order when unpacking int32 scales."""
+        base = self.make_sfb_ue8m0_view(frg_int32, 128)
+        layout = cute.make_layout(
+            (base.shape[0], frg_int32.shape[1], base.shape[2], base.shape[3]),
+            stride=(
+                base.stride[0],
+                cute.transform_leaf(lambda s: s * self.PACK_NSF, frg_int32.stride[1]),
+                base.stride[2],
+                base.stride[3],
+            ),
+        )
+        return cute.make_tensor(base.iterator, layout)
+
 
 class Sm120SfConfigFp8:
     NUM_SCALE_COPY_THREADS = 32
@@ -589,6 +603,35 @@ class Sm120SfConfigFp8:
         tCrSFA = cute.make_rmem_tensor_like(tCsSFA[None, None, None, 0])
         tCrSFB = cute.make_rmem_tensor_like(tCsSFB[None, None, None, 0])
         return tCsSFA, tCsSFB, tCrSFA, tCrSFB
+
+
+@cute.jit
+def gmem_to_smem_tokens(atom, gA, gMap, target, begin, rows, kt):
+    lane = cute.arch.lane_idx()
+    K = cute.size(gA, mode=[1])
+    k_tiles = ceil_div(K, 128)
+    source_kt = cutlass.Int32(0)
+    if kt < k_tiles:
+        source_kt = kt
+    source_layout = cute.make_layout(((16, 1),), stride=((1, 0),))
+    pred = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Boolean)
+    for part in cutlass.range_constexpr(cute.size(target, mode=[1])):
+        row = (lane >> 3) + part * 4
+        token = cutlass.Int32(0)
+        if row < rows:
+            token = gMap[begin + row]
+        address = (
+            gA.iterator + cutlass.Int64(token) * K + source_kt * 128 + (lane & 7) * 16
+        )
+        pointer = cute.make_ptr(
+            cutlass.Float8E4M3FN,
+            address.toint(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        source = cute.make_tensor(pointer, source_layout)
+        pred[0] = (row < rows) & (kt < k_tiles)
+        cute.copy(atom, source, target[None, part], pred=pred)
 
 
 @cute.jit

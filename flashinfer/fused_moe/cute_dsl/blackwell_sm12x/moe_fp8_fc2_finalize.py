@@ -63,6 +63,7 @@ class CuteDslSm120GroupedFp8Fc2FinalizeOp:
             epi,
             enable_pdl,
         )
+        self.use_cp_async = self.tile == (64, 128, 128) and k in (384, 512)
         self.ab_stage = resolve_stage(self.tile, epi)
         self.tactic = (self.tile[0], self.tile[1], epi)
         self.cfg = make_cfg(self.tile, self.ab_stage, epi=epi, enable_pdl=enable_pdl)
@@ -95,7 +96,7 @@ class CuteDslSm120GroupedFp8Fc2FinalizeOp:
         ) and cls.is_constructible(t, epi)
 
     def build(self, grid_x: int):
-        return CuteDslSm120MoeFp8Fc2Finalize(self.cfg, grid_x)
+        return CuteDslSm120MoeFp8Fc2Finalize(self.cfg, grid_x, self.use_cp_async)
 
 
 TACTICS = tuple(
@@ -121,7 +122,7 @@ def compiled_kernel(
     grid_x: int,
     sm_version: str,
 ):
-    key = (op.tactic, op.enable_pdl, grid_x, sm_version)
+    key = (op.tactic, op.enable_pdl, op.use_cp_async, grid_x, sm_version)
     hit = _COMPILED.get(key)
     if hit is None:
         hit = cute.compile(op.build(grid_x), *sample_args)

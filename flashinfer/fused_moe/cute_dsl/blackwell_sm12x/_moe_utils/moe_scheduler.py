@@ -326,10 +326,23 @@ class MoeSchedConsumer:
         cute.arch.mbarrier_wait(
             full + sched_stage, (self.sched_iter // self.stages) & 1
         )
-        tile = MoeWorkTile.load(work, sched_stage)
+        lane = cute.arch.lane_idx()
+        m, n, group = Int32(0), Int32(0), Int32(0)
+        begin, end, valid = Int32(0), Int32(0), Int32(0)
+        if lane == 0:
+            loaded = MoeWorkTile.load(work, sched_stage)
+            m, n, group = loaded.m_block, loaded.n_block, loaded.group
+            begin, end, valid = loaded.m_offset, loaded.m_boundary, loaded.valid
+        m = cute.arch.shuffle_sync(m, Int32(0))
+        n = cute.arch.shuffle_sync(n, Int32(0))
+        group = cute.arch.shuffle_sync(group, Int32(0))
+        begin = cute.arch.shuffle_sync(begin, Int32(0))
+        end = cute.arch.shuffle_sync(end, Int32(0))
+        valid = cute.arch.shuffle_sync(valid, Int32(0))
+        tile = MoeWorkTile(m, n, group, begin, end, valid)
         cute.arch.sync_warp()
         if tile.valid != Int32(0):
-            with cute.arch.elect_one():
+            if lane == 0:
                 cute.arch.mbarrier_arrive(empty + sched_stage)
             self.sched_iter = self.sched_iter + Int32(1)
         return tile

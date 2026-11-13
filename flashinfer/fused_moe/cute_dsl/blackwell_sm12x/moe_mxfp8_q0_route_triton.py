@@ -217,13 +217,14 @@ def _mxfp8_q0_route_direct_kernel(
     s_sok: tl.constexpr,
     use_gdc: tl.constexpr,
     launch_pdl: tl.constexpr,
+    token_only: tl.constexpr = False,
 ):
-    token_idx = tl.program_id(0)
+    token_idx = tl.program_id(0).to(tl.int64)
     k_block_1024 = tl.program_id(1)
     tile_ids = tl.arange(0, num_tile_per_pack_sf * 2)
     k_tile = tile_ids[:, None]
     k_lane = tl.arange(0, tile_k)[None, :]
-    cols = k_block_1024 * direct_block_k + k_tile * tile_k + k_lane
+    cols = (k_block_1024 * direct_block_k + k_tile * tile_k + k_lane).to(tl.int64)
     valid_cols = cols < hidden_size
     x_vals = tl.load(x + token_idx * s_xm + cols * s_xk, mask=valid_cols, other=0.0).to(
         tl.float32
@@ -242,31 +243,48 @@ def _mxfp8_q0_route_direct_kernel(
     packed_sf1 = tl.sum(
         tl.where(tile_ids >= num_tile_per_pack_sf, exp << bit_shift, 0), axis=0
     )
-    scale_block0 = k_block_1024 * 2
+    scale_block0 = k_block_1024.to(tl.int64) * 2
     scale_block1 = scale_block0 + 1
     if use_gdc:
         tl.extra.cuda.gdc_launch_dependents()
-    for slot_idx in tl.static_range(0, top_k):
-        pair_idx = token_idx * top_k + slot_idx
-        routed_row = tl.load(dst_rows + pair_idx)
-        scale_row = tl.load(scale_dst_rows + pair_idx)
-        # dst_rows is -1 for an unrouted (negative expert id) pair: no row to fill.
-        routed = routed_row >= 0
+    if token_only:
         tl.store(
-            q_out + routed_row * s_qom + cols * s_qok,
+            q_out + token_idx * s_qom + cols * s_qok,
             q_vals,
-            mask=valid_cols & routed,
+            mask=valid_cols,
         )
         tl.store(
-            scale_out + scale_block0 * s_som + scale_row * s_sok,
+            scale_out + scale_block0 * s_som + token_idx * s_sok,
             packed_sf0,
-            mask=(scale_block0 < num_scale_blocks) & routed,
+            mask=scale_block0 < num_scale_blocks,
         )
         tl.store(
-            scale_out + scale_block1 * s_som + scale_row * s_sok,
+            scale_out + scale_block1 * s_som + token_idx * s_sok,
             packed_sf1,
-            mask=(scale_block1 < num_scale_blocks) & routed,
+            mask=scale_block1 < num_scale_blocks,
         )
+    else:
+        for slot_idx in tl.static_range(0, top_k):
+            pair_idx = token_idx * top_k + slot_idx
+            routed_row = tl.load(dst_rows + pair_idx).to(tl.int64)
+            scale_row = tl.load(scale_dst_rows + pair_idx).to(tl.int64)
+            # Negative expert IDs have no routed row to fill.
+            routed = routed_row >= 0
+            tl.store(
+                q_out + routed_row * s_qom + cols * s_qok,
+                q_vals,
+                mask=valid_cols & routed,
+            )
+            tl.store(
+                scale_out + scale_block0 * s_som + scale_row * s_sok,
+                packed_sf0,
+                mask=(scale_block0 < num_scale_blocks) & routed,
+            )
+            tl.store(
+                scale_out + scale_block1 * s_som + scale_row * s_sok,
+                packed_sf1,
+                mask=(scale_block1 < num_scale_blocks) & routed,
+            )
 
 
 def _validate(
@@ -305,7 +323,14 @@ def mxfp8_q0_route_triton(
     workspace13: Optional[torch.Tensor] = None,
     workspace2: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
+    token_only: bool = False,
 ):
+    """Quantize BF16 activations and produce expert-grouped route metadata.
+
+    With ``token_only=True``, Q and packed int32 SF are stored once per token,
+    with shapes ``[T, H]`` and ``[ceil(H / 512), T]``. Routing metadata and
+    caller-owned workspace capacity remain unchanged.
+    """
     _validate(x, topk_ids, topk_weights, num_experts)
     topk_ids = topk_ids.contiguous()
     topk_weights = topk_weights.contiguous()
@@ -318,8 +343,12 @@ def mxfp8_q0_route_triton(
         workspace = make_mxfp8_q0_route_workspace(
             x, topk_ids, num_experts, workspace13=workspace13, workspace2=workspace2
         )
+    q, sf = workspace.q_out, workspace.scale_out
+    if token_only:
+        q = q.reshape(-1)[: num_tokens * hidden_size].view(num_tokens, hidden_size)
+        sf = sf.reshape(-1)[: num_k_blocks * num_tokens].view(num_k_blocks, num_tokens)
     if total_pairs <= DECODE_BLOCK_N:
-        total_scale = num_k_blocks * workspace.scale_out.shape[1]
+        total_scale = 0 if token_only else num_k_blocks * workspace.scale_out.shape[1]
         decode_grid = max(
             num_experts, total_pairs, ceil_div(total_scale, DECODE_BLOCK_N)
         )
@@ -346,8 +375,8 @@ def mxfp8_q0_route_triton(
             x,
             workspace.dst_rows,
             workspace.scale_dst_rows,
-            workspace.q_out,
-            workspace.scale_out,
+            q,
+            sf,
             hidden_size,
             top_k,
             TILE_K,
@@ -356,12 +385,13 @@ def mxfp8_q0_route_triton(
             num_k_blocks,
             x.stride(0),
             x.stride(1),
-            workspace.q_out.stride(0),
-            workspace.q_out.stride(1),
-            workspace.scale_out.stride(0),
-            workspace.scale_out.stride(1),
+            q.stride(0),
+            q.stride(1),
+            sf.stride(0),
+            sf.stride(1),
             use_gdc=enable_pdl,
             launch_pdl=False,
+            token_only=token_only,
             num_warps=4,
         )
         _record_workspace_stream(workspace)
@@ -369,11 +399,12 @@ def mxfp8_q0_route_triton(
             workspace.offsets,
             workspace.token_map,
             workspace.token_weights,
-            workspace.q_out,
-            workspace.scale_out,
+            q,
+            sf,
         )
     block_n = 256
-    workspace.scale_out.zero_()
+    if not token_only:
+        workspace.scale_out.zero_()
     if num_experts <= PREFILL_FUSED_PREFIX_MAX_EXPERTS:
         workspace.counts.zero_()
         _count_routes_kernel[(ceil_div(total_pairs, block_n),)](
@@ -412,8 +443,8 @@ def mxfp8_q0_route_triton(
         x,
         workspace.dst_rows,
         workspace.scale_dst_rows,
-        workspace.q_out,
-        workspace.scale_out,
+        q,
+        sf,
         hidden_size,
         top_k,
         TILE_K,
@@ -422,12 +453,13 @@ def mxfp8_q0_route_triton(
         num_k_blocks,
         x.stride(0),
         x.stride(1),
-        workspace.q_out.stride(0),
-        workspace.q_out.stride(1),
-        workspace.scale_out.stride(0),
-        workspace.scale_out.stride(1),
+        q.stride(0),
+        q.stride(1),
+        sf.stride(0),
+        sf.stride(1),
         use_gdc=enable_pdl,
         launch_pdl=False,
+        token_only=token_only,
         num_warps=4,
     )
     _record_workspace_stream(workspace)
@@ -435,8 +467,8 @@ def mxfp8_q0_route_triton(
         workspace.offsets,
         workspace.token_map,
         workspace.token_weights,
-        workspace.q_out,
-        workspace.scale_out,
+        q,
+        sf,
     )
 
 

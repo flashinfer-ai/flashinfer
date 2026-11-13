@@ -40,6 +40,7 @@ from ._moe_utils.sm12x_blockscaled_layout import (
     Sm120SfConfigFp8,
     compute_padded_offset,
     copy_scale_s2r,
+    gmem_to_smem_tokens,
     rescale,
 )
 
@@ -54,11 +55,16 @@ def is_swapab(tile):
 
 QUANT_EPIS = (EpiMethod.WG_S2R_QUANT, EpiMethod.WG_QUANT_R2S)
 REG_PROD_BY_TACTIC = {
-    (64, 128, EpiMethod.WG_S2R_QUANT): 40,
-    (64, 128, EpiMethod.WG_QUANT_R2S): 40,
-    (32, 128, EpiMethod.WG_S2R_QUANT): 40,
-    (32, 128, EpiMethod.WG_QUANT_R2S): 40,
-    (8, 128, EpiMethod.WG_QUANT_SWAP): 40,
+    (64, 128, EpiMethod.WG_S2R_QUANT, False): 40,
+    (64, 128, EpiMethod.WG_S2R_QUANT, True): 56,
+    (64, 128, EpiMethod.WG_QUANT_R2S, False): 40,
+    (64, 128, EpiMethod.WG_QUANT_R2S, True): 56,
+    (32, 128, EpiMethod.WG_S2R_QUANT, False): 40,
+    (32, 128, EpiMethod.WG_S2R_QUANT, True): 40,
+    (32, 128, EpiMethod.WG_QUANT_R2S, False): 40,
+    (32, 128, EpiMethod.WG_QUANT_R2S, True): 40,
+    (8, 128, EpiMethod.WG_QUANT_SWAP, False): 40,
+    (8, 128, EpiMethod.WG_QUANT_SWAP, True): 40,
 }
 
 
@@ -71,6 +77,7 @@ def make_cfg(
     fastmath=False,
     enable_pdl=False,
     swiglu_limit=None,
+    gather=False,
 ):
     e4m3, f32, bf16 = cutlass.Float8E4M3FN, cutlass.Float32, cutlass.BFloat16
     num_math_warps = 8
@@ -104,12 +111,213 @@ def make_cfg(
         tile,
         epi_bar_id=3,
         union_smem=not swap,
-        reg_prod=REG_PROD_BY_TACTIC[(*ptile, epi)],
+        reg_prod=REG_PROD_BY_TACTIC[(*ptile, epi, gather)],
         activation=moe_activation.make_gated_activation(
             activation, fastmath, swiglu_limit
         ),
         enable_pdl=enable_pdl,
     )
+
+
+@cute.jit
+def gmem_to_smem_token_scales(atom, gSF, gMap, target, begin, rows, kt, bm):
+    lane = cute.arch.lane_idx()
+    tokens = cute.size(gSF, mode=[1])
+    k_tiles = cute.size(gSF, mode=[0])
+    source_kt = cutlass.Int32(0)
+    if kt < k_tiles:
+        source_kt = kt
+    source_layout = cute.make_layout(((1, 1),), stride=((1, 0),))
+    pred = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Boolean)
+    for part in cutlass.range_constexpr(cute.size(target, mode=[1])):
+        row = lane + part * 32
+        if row < bm:
+            token = cutlass.Int32(0)
+            if row < rows:
+                token = gMap[begin + row]
+            address = gSF.iterator + cutlass.Int64(source_kt) * tokens + token
+            pointer = cute.make_ptr(
+                cutlass.Float32,
+                address.toint(),
+                cute.AddressSpace.gmem,
+                assumed_align=4,
+            )
+            source = cute.make_tensor(pointer, source_layout)
+            pred[0] = (row < rows) & (kt < k_tiles)
+            cute.copy(atom, source, target[None, part], pred=pred)
+
+
+@cute.jit
+def load_ab_gather(
+    tma_atom_w,
+    tma_tensor_w,
+    sW,
+    sWg,
+    sToken,
+    gToken,
+    gMap,
+    tile,
+    ab_full,
+    ab_empty,
+    weight_bytes,
+    k_tiles,
+    stages,
+    stage,
+    phase,
+    gate_offset,
+    pm,
+    swap,
+):
+    lane = cute.arch.lane_idx()
+    cluster = cute.make_layout(1)
+    gW = cute.local_tile(tma_tensor_w, (128, 128), (None, None, None))
+    tWsW, tWgW = cpasync.tma_partition(
+        tma_atom_w,
+        cutlass.Int32(0),
+        cluster,
+        cute.group_modes(sW, 0, 2),
+        cute.group_modes(gW, 0, 2),
+    )
+    gWg = cute.local_tile(
+        cute.domain_offset((gate_offset, 0, 0), tma_tensor_w),
+        (128, 128),
+        (None, None, None),
+    )
+    tGsWg, tGgWg = cpasync.tma_partition(
+        tma_atom_w,
+        cutlass.Int32(0),
+        cluster,
+        cute.group_modes(sWg, 0, 2),
+        cute.group_modes(gWg, 0, 2),
+    )
+    token_atom = cute.make_copy_atom(
+        cpasync.CopyG2SOp(),
+        cutlass.Float8E4M3FN,
+        num_bits_per_copy=128,
+    )
+    token_copy = cute.make_tiled_copy_tv(
+        token_atom,
+        cute.make_ordered_layout((4, 8), order=(1, 0)),
+        cute.make_layout((1, 16)),
+    )
+    tAsA = token_copy.get_slice(lane).partition_D(sToken)
+    token_block = tile.n_block if cutlass.const_expr(swap) else tile.m_block
+    weight_block = tile.m_block if cutlass.const_expr(swap) else tile.n_block
+    begin = tile.m_offset + token_block * pm
+    rows = max(cutlass.Int32(0), min(tile.m_boundary - begin, cutlass.Int32(pm)))
+    for kt in cutlass.range(0, k_tiles):
+        cute.arch.mbarrier_wait(ab_empty + stage, phase)
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(ab_full + stage, weight_bytes)
+        cute.copy(
+            tma_atom_w,
+            tWgW[None, weight_block, kt, tile.group],
+            tWsW[None, stage],
+            tma_bar_ptr=ab_full + stage,
+        )
+        cute.copy(
+            tma_atom_w,
+            tGgWg[None, weight_block, kt, tile.group],
+            tGsWg[None, stage],
+            tma_bar_ptr=ab_full + stage,
+        )
+        gmem_to_smem_tokens(
+            token_atom,
+            gToken,
+            gMap,
+            tAsA[None, None, 0, stage],
+            begin,
+            rows,
+            kt,
+        )
+        cute.arch.sync_warp()
+        cute.arch.cp_async_mbarrier_arrive_noinc(ab_full + stage)
+        stage += 1
+        if stage == stages:
+            stage = cutlass.Int32(0)
+            phase ^= 1
+    return stage, phase
+
+
+@cute.jit
+def load_sf_gather(
+    gTokenSF,
+    gMap,
+    gWeightSF,
+    sTokenSF,
+    sWeightSF,
+    sWeightSFg,
+    sf_atom,
+    tile,
+    sf_full,
+    sf_empty,
+    k_tiles,
+    stages,
+    stage,
+    phase,
+    out_n,
+    pm,
+    swap,
+):
+    lane = cute.arch.lane_idx()
+    sf_copy = cute.make_tiled_copy_tv(
+        sf_atom, cute.make_layout(32), cute.make_layout(1)
+    )
+    tAsSFA = sf_copy.get_slice(lane).partition_D(sTokenSF)
+    token_block = tile.n_block if cutlass.const_expr(swap) else tile.m_block
+    weight_block = tile.m_block if cutlass.const_expr(swap) else tile.n_block
+    begin = tile.m_offset + token_block * pm
+    rows = max(cutlass.Int32(0), min(tile.m_boundary - begin, cutlass.Int32(pm)))
+    scale_n = cute.size(gWeightSF, mode=[0])
+    weight_n = cute.size(sWeightSF, mode=[0])
+    gate_block = out_n >> 7
+    gWeight = cute.local_tile(gWeightSF, (weight_n,), (weight_block, None, tile.group))
+    cWeight = cute.local_tile(
+        cute.make_identity_tensor(gWeightSF.shape),
+        (weight_n,),
+        (weight_block, None, tile.group),
+    )
+    gGate = cute.local_tile(
+        gWeightSF,
+        (weight_n,),
+        (weight_block + gate_block, None, tile.group),
+    )
+    weight_thr = sf_copy.get_slice(lane)
+    tBgSFB, tBcSFB = weight_thr.partition_S(gWeight), weight_thr.partition_S(cWeight)
+    tGgSFG = weight_thr.partition_S(gGate)
+    tBsSFB, tGsSFG = (
+        weight_thr.partition_D(sWeightSF),
+        weight_thr.partition_D(sWeightSFg),
+    )
+    tBpSFB = cute.make_fragment_like(tBcSFB[None, None, 0], cutlass.Boolean)
+    for index in cutlass.range_constexpr(cute.size(tBpSFB)):
+        tBpSFB[index] = tBcSFB[index][0] < scale_n
+    for kt in cutlass.range(0, k_tiles):
+        cute.arch.mbarrier_wait(sf_empty + stage, phase)
+        gmem_to_smem_token_scales(
+            sf_atom,
+            gTokenSF,
+            gMap,
+            tAsSFA[None, None, stage],
+            begin,
+            rows,
+            kt,
+            pm,
+        )
+        if lane < weight_n:
+            cute.copy(
+                sf_copy, tBgSFB[None, None, kt], tBsSFB[None, None, stage], pred=tBpSFB
+            )
+            cute.copy(
+                sf_copy, tGgSFG[None, None, kt], tGsSFG[None, None, stage], pred=tBpSFB
+            )
+        cute.arch.sync_warp()
+        cute.arch.cp_async_mbarrier_arrive_noinc(sf_full + stage)
+        stage += 1
+        if stage == stages:
+            stage = cutlass.Int32(0)
+            phase ^= 1
+    return stage, phase
 
 
 @cute.jit
@@ -279,6 +487,7 @@ def load_sf_tma(
                 tGsSFG[None, None, sf_stage],
                 pred=tBpSFB,
             )
+        cute.arch.sync_warp()
         cute.arch.cp_async_mbarrier_arrive_noinc(sf_full + sf_stage)
         sf_stage += 1
         if sf_stage == sf_stages:
@@ -556,6 +765,7 @@ def load_sf_swap(
                 tBsSFB[None, None, sf_stage],
                 pred=tBpSFB,
             )
+        cute.arch.sync_warp()
         cute.arch.cp_async_mbarrier_arrive_noinc(sf_full + sf_stage)
         sf_stage += 1
         if sf_stage == sf_stages:
@@ -703,8 +913,10 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
         gSFQ: cute.Tensor,
         offsets: cute.Tensor,
         stream,
+        gMap=None,
     ):
         cfg = self.cfg
+        gather = gMap is not None
         tiledmma = cfg.mma.make_tiled_mma(cfg.TILE)
         tiled_r2s = cfg.epi.make_tiled_r2s(tiledmma)
         tiled_r2s_q = self.epi_q.make_tiled_r2s(tiledmma)
@@ -722,13 +934,21 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
             gSFA = cute.make_tensor(
                 gSFB_f32.iterator, cfg.load_sf.deduce_sfa_layout(N, K, E)
             )
-            gSFB = cute.make_tensor(
-                gSFA_f32.iterator, cfg.load_sf.deduce_sfb_layout(m_padded_sf, K, 1)
+            gSFB = (
+                gSFA_f32
+                if cutlass.const_expr(gather)
+                else cute.make_tensor(
+                    gSFA_f32.iterator, cfg.load_sf.deduce_sfb_layout(m_padded_sf, K, 1)
+                )
             )
         else:
             t_a, t_b = gA, gB
-            gSFA = cute.make_tensor(
-                gSFA_f32.iterator, cfg.load_sf.deduce_sfa_layout(m_padded_sf, K, 1)
+            gSFA = (
+                gSFA_f32
+                if cutlass.const_expr(gather)
+                else cute.make_tensor(
+                    gSFA_f32.iterator, cfg.load_sf.deduce_sfa_layout(m_padded_sf, K, 1)
+                )
             )
             gSFB = cute.make_tensor(
                 gSFB_f32.iterator, cfg.load_sf.deduce_sfb_layout(N, K, E)
@@ -748,10 +968,13 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
         self.a_is_m_major = a_layout.is_m_major_a()
         self.b_is_n_major = b_layout.is_n_major_b()
 
-        tma_atom_a, tma_tensor_a = cfg.load_ab.make_tma_atom_a(t_a, a_smem)
-        tma_atom_b, tma_tensor_b = cfg.load_ab.make_tma_atom_b(t_b, b_smem)
+        tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = None, None, None, None
+        if cutlass.const_expr(not gather or cfg.mma.swap_ab):
+            tma_atom_a, tma_tensor_a = cfg.load_ab.make_tma_atom_a(t_a, a_smem)
+        if cutlass.const_expr(not gather or not cfg.mma.swap_ab):
+            tma_atom_b, tma_tensor_b = cfg.load_ab.make_tma_atom_b(t_b, b_smem)
         tscale_m = cfg.TILE[0] // cfg.load_sf.gran_m
-        if cutlass.const_expr(cfg.mma.swap_ab):
+        if cutlass.const_expr(cfg.mma.swap_ab or gather):
             tma_atom_sfa, tma_tensor_sfa = None, None
         else:
             tma_atom_sfa, tma_tensor_sfa = cpasync.make_tiled_tma_atom(
@@ -761,8 +984,11 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
                 (tscale_m, 1),
                 num_multicast=1,
             )
-        self.ab_bytes = cfg.load_ab.tma_bytes_ab + (
+        weight_bytes = (
             cfg.load_ab.tma_bytes_a if cfg.mma.swap_ab else cfg.load_ab.tma_bytes_b
+        )
+        self.ab_bytes = (
+            2 * weight_bytes if gather else cfg.load_ab.tma_bytes_ab + weight_bytes
         )
         self.sfa_bytes = cute.size_in_bytes(
             cfg.load_sf.sf_dtype, cute.slice_(sfa_tma_smem, (None, None, 0))
@@ -812,7 +1038,7 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
                 cute.struct.MemRange[cfg.epi.out_dtype, epi_elems], 128
             ]
 
-        smem_size = SharedStorage.size_in_bytes()  # type: ignore[attr-defined]
+        smem_size = SharedStorage.size_in_bytes()
         assert cfg.smem_bytes <= smem_size <= cfg.smem_bytes + cfg.MBAR_RESERVE, (
             f"smem model {cfg.smem_bytes} B vs allocated {smem_size} B"
         )
@@ -840,6 +1066,9 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
             sfb_smem,
             epi_smem,
             epi_q_smem,
+            gA,
+            gSFA_f32,
+            gMap,
         ).launch(
             grid=[self.grid_x, 1, 1],
             block=[cfg.threads, 1, 1],
@@ -857,8 +1086,8 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
         tma_atom_a,
         tma_atom_b,
         tma_atom_sfa,
-        tma_tensor_a: cute.Tensor,
-        tma_tensor_b: cute.Tensor,
+        tma_tensor_a,
+        tma_tensor_b,
         tma_tensor_sfa,
         gSFA: cute.Tensor,
         gSFB: cute.Tensor,
@@ -872,8 +1101,12 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
         sfb_smem,
         epi_smem,
         epi_q_smem,
+        gTokenA: cute.Tensor,
+        gTokenSF: cute.Tensor,
+        gMap,
     ):
         cfg = self.cfg
+        gather = gMap is not None
         epi_empty_bars = cfg.epi.num_empty_barriers
         i32 = cutlass.Int32
         tidx, _, _ = cute.arch.thread_idx()
@@ -883,7 +1116,7 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
         bm, bn, bk = cfg.TILE[0], cfg.TILE[1], cfg.TILE[2]
         pm, pn = (bn, bm) if swap else (bm, bn)
         M, N = cute.size(gD, mode=[0]), cute.size(gD, mode=[1])
-        K = cute.size(tma_tensor_a, mode=[1])
+        K = cute.size(gTokenA, mode=[1])
         num_groups = cute.size(offsets, mode=[0]) - 1
         num_n_blocks = ceil_div(N, pn)
         k_tile_count = ceil_div(K, bk)
@@ -893,7 +1126,7 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
         sA = stg.sA.get_tensor(a_smem.outer, swizzle=a_smem.inner)
         sB = stg.sB.get_tensor(b_smem.outer, swizzle=b_smem.inner)
         sSFA = stg.sSFA.get_tensor(sfa_smem)
-        if cutlass.const_expr(not cfg.mma.swap_ab):
+        if cutlass.const_expr(not cfg.mma.swap_ab and not gather):
             sSFA_tma = cute.make_tensor(sSFA.iterator, sfa_tma_smem)
         sSFB = stg.sSFB.get_tensor(sfb_smem)
         gate_smem = a_smem if cutlass.const_expr(swap) else b_smem
@@ -927,11 +1160,15 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
         sfull, sempty = stg.sfull.data_ptr(), stg.sempty.data_ptr()
         sWork = stg.work.get_tensor(cute.make_layout((cfg.sched_stages, cfg.fields)))
 
-        sf_arrivals = cfg.load_sf.NUM_SCALE_COPY_THREADS + (0 if cfg.mma.swap_ab else 1)
+        sf_arrivals = cfg.load_sf.NUM_SCALE_COPY_THREADS + (
+            0 if cfg.mma.swap_ab or gather else 1
+        )
         if warp_idx == 0:
             with cute.arch.elect_one():
                 for s in cutlass.range_constexpr(cfg.ab_stage):
-                    cute.arch.mbarrier_init(ab_full + s, 1)
+                    cute.arch.mbarrier_init(
+                        ab_full + s, 33 if cutlass.const_expr(gather) else 1
+                    )
                     cute.arch.mbarrier_init(ab_empty + s, cfg.mma_threads)
                     cute.arch.mbarrier_init(sf_full + s, sf_arrivals)
                     cute.arch.mbarrier_init(sf_empty + s, cfg.mma_threads)
@@ -953,6 +1190,7 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
         quant_threads_n = self.epi_q.s2g_threads_n(cfg.TILE)
         tiled_s2r = cfg.epi.make_tiled_s2r(cfg.TILE)
         tiled_s2r_q = self.epi_q.make_tiled_s2r(cfg.TILE)
+        warp_m_shift = cfg.mma.num_warp_m.bit_length() - 1
 
         if cfg.is_prod_wg(warp_idx):
             cute.arch.setmaxregister_decrease(cfg.reg_prod)
@@ -985,7 +1223,50 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
                     if cutlass.const_expr(cfg.union_smem):
                         cute.arch.mbarrier_wait(epi_empty, epi_empty_phase)
                         epi_empty_phase ^= 1
-                    if cutlass.const_expr(swap):
+                    if cutlass.const_expr(gather):
+                        if cutlass.const_expr(swap):
+                            ab_stage, ab_phase = load_ab_gather(
+                                tma_atom_a,
+                                tma_tensor_a,
+                                sA,
+                                sBg,
+                                sB,
+                                gTokenA,
+                                gMap,
+                                tile,
+                                ab_full,
+                                ab_empty,
+                                self.ab_bytes,
+                                k_tile_count,
+                                cfg.ab_stage,
+                                ab_stage,
+                                ab_phase,
+                                N,
+                                pm,
+                                swap,
+                            )
+                        else:
+                            ab_stage, ab_phase = load_ab_gather(
+                                tma_atom_b,
+                                tma_tensor_b,
+                                sB,
+                                sBg,
+                                sA,
+                                gTokenA,
+                                gMap,
+                                tile,
+                                ab_full,
+                                ab_empty,
+                                self.ab_bytes,
+                                k_tile_count,
+                                cfg.ab_stage,
+                                ab_stage,
+                                ab_phase,
+                                N,
+                                pm,
+                                swap,
+                            )
+                    elif cutlass.const_expr(swap):
                         ab_stage, ab_phase = load_ab_swap(
                             tma_atom_a,
                             tma_atom_b,
@@ -1032,7 +1313,48 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
                 tile = cons.get_next_tile(sWork, sfull, sempty)
                 sf_stage, sf_phase = i32(0), i32(1)
                 while tile.valid != i32(0):
-                    if cutlass.const_expr(swap):
+                    if cutlass.const_expr(gather):
+                        if cutlass.const_expr(swap):
+                            sf_stage, sf_phase = load_sf_gather(
+                                gTokenSF,
+                                gMap,
+                                gSFA,
+                                sSFB,
+                                sSFA,
+                                sSFBg,
+                                sf_atom,
+                                tile,
+                                sf_full,
+                                sf_empty,
+                                k_tile_count,
+                                cfg.ab_stage,
+                                sf_stage,
+                                sf_phase,
+                                N,
+                                pm,
+                                swap,
+                            )
+                        else:
+                            sf_stage, sf_phase = load_sf_gather(
+                                gTokenSF,
+                                gMap,
+                                gSFB,
+                                sSFA,
+                                sSFB,
+                                sSFBg,
+                                sf_atom,
+                                tile,
+                                sf_full,
+                                sf_empty,
+                                k_tile_count,
+                                cfg.ab_stage,
+                                sf_stage,
+                                sf_phase,
+                                N,
+                                pm,
+                                swap,
+                            )
+                    elif cutlass.const_expr(swap):
                         sf_stage, sf_phase = load_sf_swap(
                             gSFA,
                             sSFA,
@@ -1082,7 +1404,7 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
             thr_r2s_q = tiled_r2s_q.get_slice(tidx)
             thr_s2r = tiled_s2r.get_slice(tidx)
             thr_s2r_q = tiled_s2r_q.get_slice(tidx)
-            warp_n = (tidx // 32) // cfg.mma.num_warp_m
+            warp_n = warp_idx >> warp_m_shift
             cons = moe_scheduler.MoeSchedConsumer.create(cfg.sched_stages)
             tile = cons.get_next_tile(sWork, sfull, sempty)
             read_stage, ab_phase = i32(0), i32(0)
@@ -1208,10 +1530,31 @@ def _stream():
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
-def make_args(a_q, a_scale, b_q, b_scale, out_q, out_sf, m_indptr, epi_cfg, tile):
-    sf = lambda t: from_dlpack(t.contiguous(), assumed_align=16).mark_layout_dynamic()
+def make_args(
+    a_q,
+    a_scale,
+    b_q,
+    b_scale,
+    out_q,
+    out_sf,
+    m_indptr,
+    epi_cfg,
+    tile,
+    *,
+    token_map=None,
+):
+    def sf(t):
+        t = t.contiguous()
+        return from_dlpack(t, assumed_align=16).mark_layout_dynamic(
+            leading_dim=next(
+                (axis for axis in reversed(range(t.ndim)) if t.stride(axis) == 1), None
+            )
+            if t.numel() == 1
+            else None
+        )
+
     epi_cfg.check_output(tile, out_q)
-    return (
+    args = (
         from_dlpack(a_q).mark_layout_dynamic(),
         from_dlpack(b_q).mark_layout_dynamic(),
         sf(a_scale),
@@ -1221,3 +1564,6 @@ def make_args(a_q, a_scale, b_q, b_scale, out_q, out_sf, m_indptr, epi_cfg, tile
         from_dlpack(m_indptr).mark_layout_dynamic(),
         _stream(),
     )
+    if token_map is not None:
+        args += (from_dlpack(token_map, assumed_align=4).mark_layout_dynamic(),)
+    return args
