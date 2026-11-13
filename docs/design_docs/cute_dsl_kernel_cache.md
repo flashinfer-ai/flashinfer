@@ -71,7 +71,8 @@ def _get_compiled_kernel(...):
 
 On a **hit**, the kernel is JITLinked from the cached `.o` (milliseconds).
 On a **miss**, `compile_fn` runs, the result is exported to the module
-directory, and the in-process compiled function is returned directly.
+directory, and the exported artifact is loaded. The in-process compiled
+function is retained as a fallback when no valid artifact is available.
 
 ### 2.2 Cache on disk layout
 
@@ -137,8 +138,10 @@ Hashing whole source files means any edit (even a docstring) invalidates. This i
 
 ### 2.4 Concurrency and crash safety
 
-- A per-module `FileLock` (same `cached_ops/tmp/` convention as `JitSpec`) makes each kernel compile **at most once across processes**: the cache is re-checked after acquisition, so a process that waited behind a builder loads the fresh artifact instead of recompiling. The lock is per-module rather than per-kernel — *different* kernels of one op family also serialize their builds — deliberately: `build()` may wipe the whole module directory and rewrite the module-level `meta.json`, which must not interleave with a sibling kernel's export. (Per-kernel compile locks with a module lock only around wipe/meta-commit would allow parallel cold starts; not worth the complexity today.)
-- Lock recovery: a crashed holder releases the `flock` automatically (kernel behavior), and a leftover lock *file* is harmless. If a lock is truly wedged (e.g. NFS lock-manager state after a node hang), deleting `cached_ops/tmp/<module>.lock` is safe — artifact commits are atomic and idempotent, so breaking the lock risks at most one duplicated compilation, never a corrupt artifact. `rm -rf ~/.cache/flashinfer/` remains the universal reset.
+- `JitSpecCuteDsl.lock_path` identifies a per-kernel `FileLock` in `cached_ops/tmp/`. The inherited `JitSpec.build_and_load()` rechecks the cache after acquiring it and holds it through building and loading, so waiting callers reuse a successfully published artifact. Different kernels can compile concurrently.
+- `module_lock_path` identifies a separate lock shared by an op family. `build()` compiles outside this lock, then acquires it for module invalidation and export. `try_load()` and `load()` hold it while validating metadata and loading an artifact, preventing an invalidation from racing the load. Locks remain outside the module directory so invalidation cannot remove them.
+- `compile_and_persist()` is an explicit, unconditional rebuild. It acquires the kernel lock and uses the same timed `build()` implementation without loading the result. It does not perform the cache-hit or disabled-JIT checks of `build_and_load()`.
+- Lock recovery: a crashed holder releases the `flock` automatically (kernel behavior), and a leftover lock *file* is harmless. Do not delete lock files while processes may still use the cache; stop those processes before clearing it.
 - `.o` files are written to a pid-suffixed temp name and committed with atomic `os.replace`, so an `.o` at its final path is always complete.
 - `meta.json` is written **after** the first successful export. A crash between the two leaves an `.o` without matching metadata, which reads as a miss and is recompiled/overwritten — never loaded.
 - Wiping a stale module while another process has its `.o` mapped is safe on POSIX (the inode survives the unlink).
@@ -171,11 +174,11 @@ The abstract methods, side by side:
 
 | Contract | `JitSpecNvcc` | `JitSpecCuteDsl` |
 |---|---|---|
-| one instance = | one **module** (many symbols in one `.so`) | one **kernel specialization** (`.o`; op family shares a module dir, `meta.json`, and lock) |
+| one instance = | one **module** (many symbols in one `.so`) | one **kernel specialization** with a build lock (`.o`; op family shares a module dir, `meta.json`, and publication lock) |
 | compilation input | `.cu`/`.cpp` paths + flags (pure data) | live kernel object in a `compile_fn` closure |
 | `try_load()` | AOT `.so` only — deliberately ignores the JIT-path `.so`, so `build()` always runs and **ninja judges freshness** | `.o` exists **and** `meta.json` matches → JITLink it; else `None` |
-| `build()` | `write_ninja()` + run ninja (no-op if up to date); needs only a host toolchain | wipe module if meta stale, `cute.compile()` (needs a GPU), `export_to_c()`; keeps the compiled kernel in memory |
-| `load()` | `dlopen` the `.so` via `tvm_ffi.load_module` | return the in-memory kernel from `build()`, else JITLink the `.o` |
+| `build()` | `write_ninja()` + run ninja (no-op if up to date); needs only a host toolchain | `cute.compile()`, then module-locked invalidation and export; retains the compiled kernel in memory |
+| `load()` | `dlopen` the `.so` via `tvm_ffi.load_module` | JITLink the valid `.o` under the module lock, falling back to the retained kernel if no valid artifact exists |
 | invalidation authority | ninja dependency scan, at build time | `meta.json` (DSL-stack fingerprint + source SHA-256), at load time |
 | `is_compiled` / `get_library_path()` | `.so` exists / `.so` path | `.o` + meta match / `.o` path |
 
