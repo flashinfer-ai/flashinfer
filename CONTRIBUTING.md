@@ -130,7 +130,10 @@ visibility even if the Python function still exists.
 Do not introduce stable API breaks in minor or patch releases. Explain any
 intentional break, affected old calls, migration path, and release/deprecation
 plan in the PR.
-Experimental APIs and backends follow the separate policy above.
+APIs marked `@flashinfer_experimental_api` and backends under
+`flashinfer/experimental/` have no backward-compatibility guarantee and may
+change or be removed without deprecation; see
+[Experimental APIs and Backends](#experimental-apis-and-backends).
 
 # Pull Request Guidelines
 
