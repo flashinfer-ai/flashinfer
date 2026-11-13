@@ -400,7 +400,11 @@ def testMxfp8Quantize(args):
         sf_layout_name = "128x4" if is_sf_swizzled_layout else "linear"
 
         def per_row(x_q, sf, num_rows):
-            return (x_q, _unswizzled_sf_rows(sf, num_rows, k, 32, sf_layout_name))
+            # The scale buffer has padded_k / 32 columns per row, not k / 32.
+            return (
+                x_q,
+                _unswizzled_sf_rows(sf, num_rows, padded_k, 32, sf_layout_name),
+            )
 
         def run_rows(rows):
             x_q, sf = run_backend("batch_invariant", input_tensor.index_select(0, rows))
