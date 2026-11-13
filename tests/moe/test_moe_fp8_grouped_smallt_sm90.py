@@ -329,3 +329,43 @@ def test_graph_capture_replays_bitwise_equal_to_eager():
     torch.cuda.synchronize()
     eager2 = _call(b)
     assert torch.equal(out, eager2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] != 9,
+    reason="needs an sm90 device",
+)
+def test_return_type_parity_across_backends(monkeypatch):
+    """The backend taken must not be observable in the return type:
+    cutlass_fused_moe returns [output] on the stock route, on the
+    specialized route, under auto, and with the kill switch forcing
+    stock."""
+    device = torch.device("cuda")
+    b = _make(4, device)
+
+    def raw(**kw):
+        return cutlass_fused_moe(
+            input=b["x"],
+            token_selected_experts=b["ids"],
+            token_final_scales=b["tw"],
+            fc1_expert_weights=b["w13"],
+            fc2_expert_weights=b["w2"],
+            output_dtype=torch.bfloat16,
+            quant_scales=[b["s13"], b["s2"]],
+            use_deepseek_fp8_block_scale=True,
+            **kw,
+        )
+
+    results = {"auto": raw(), "specialized": raw(backend="specialized"),
+               "cutlass": raw(backend="cutlass")}
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    results["auto+kill"] = raw()
+    monkeypatch.delenv(DISABLE_ENV)
+    # The stock route's own length varies by path (it may carry aux tensors
+    # after the output), so the stable cross-backend contract is: a list
+    # whose FIRST element is the output tensor.
+    for name, r in results.items():
+        assert isinstance(r, list) and len(r) >= 1, (name, type(r))
+        assert isinstance(r[0], torch.Tensor) and r[0].dtype == torch.bfloat16, name
+        assert r[0].shape == b["x"].shape, name
