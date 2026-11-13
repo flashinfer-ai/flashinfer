@@ -107,7 +107,7 @@ def test_hopper_batch_bucket_replan(monkeypatch, dtype, causal):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("scale_kind", ["scalar", "tensor"])
+@pytest.mark.parametrize("scale_kind", ["default", "scalar", "tensor"])
 @pytest.mark.parametrize("graph_mode", [False, True])
 def test_hopper_retained_batch_bound_graph(
     monkeypatch, dtype, causal, scale_kind, graph_mode
@@ -127,8 +127,12 @@ def test_hopper_retained_batch_bound_graph(
         kv_indptr_buf=torch.empty(4, device="cuda", dtype=torch.int32),
     )
     _plan(w, qs, ks, dtype, causal)
-    scales = (0.5, 0.75, 0.25)
-    kwargs = dict(zip(("q_scale", "k_scale", "v_scale"), scales, strict=True))
+    scales = (1.0, 1.0, 1.0) if scale_kind == "default" else (0.5, 0.75, 0.25)
+    kwargs = (
+        {}
+        if scale_kind == "default"
+        else dict(zip(("q_scale", "k_scale", "v_scale"), scales, strict=True))
+    )
     if scale_kind == "tensor":
         kwargs = {
             name: torch.full((1,), value, device="cuda", dtype=torch.float32)
@@ -142,7 +146,7 @@ def test_hopper_retained_batch_bound_graph(
 
     run()
     _check(out, lse, _reference(q, k, v, qs, ks, causal, scales), dtype)
-    original_graph = w._cudnn_plan.bound_graph.graph
+    original_graph = w._cudnn_plan.bound_graph
     capture = torch.cuda.CUDAGraph()
     try:
         with torch.cuda.graph(capture):
@@ -163,7 +167,8 @@ def test_hopper_retained_batch_bound_graph(
         capture.replay()
         _check(out, lse, reference, dtype)
         run()
-        assert w._cudnn_plan.bound_graph.graph is original_graph
+        if scale_kind == "default":
+            assert w._cudnn_plan.bound_graph.graph is original_graph.graph
         replacement = torch.empty_like(ws)
         w.reset_workspace_buffer(replacement, w._int_workspace_buffer)
         other, other_lse = torch.empty_like(out), torch.empty_like(lse)

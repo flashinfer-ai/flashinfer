@@ -54,7 +54,7 @@ both backend and FROST remain usable through the common graph contract.
 
 ### Hopper ragged declaration cache
 
-For direct cumulative-length BF16/FP16 D256 ragged attention on Hopper,
+For unscaled, direct cumulative-length BF16/FP16 D256 ragged attention on Hopper,
 cuDNN 9.24+ uses a power-of-two batch declaration bound instead of the general
 4096-batch cache. Q/KV sequence cache classes remain unchanged. This reduces
 work in the cuDNN SDPA kernel while retaining plan reuse within a batch bucket;
