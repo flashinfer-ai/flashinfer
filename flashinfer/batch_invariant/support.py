@@ -6,7 +6,7 @@ Light imports only: the operators import this module on every call with ``batch_
 from __future__ import annotations
 
 import functools
-from typing import Iterable, Tuple
+from typing import Dict, Iterable, Tuple
 
 import torch
 
@@ -18,9 +18,27 @@ class BatchInvariantUnsupportedError(ValueError):
     raises this error, whose message names the class and the limit."""
 
 
+#: Operators that run their batch-invariant class under both values of the flag (no other kernel takes the operand
+#: pair), by the class-name prefix their errors carry: the message of such a class names no fallback.
+_SELF_SERVED: Dict[str, str] = {}
+
+
+def register_self_served(class_prefix: str, operator: str) -> None:
+    """Declare ``operator`` as the only path of the classes named ``class_prefix`` (and its ``.``- / ``_``-suffixed
+    variants): their ``unsupported`` errors state the contract instead of advising the regular backends."""
+    _SELF_SERVED[class_prefix] = operator
+
+
 def unsupported(
     class_name: str, what: str, limit: str
 ) -> BatchInvariantUnsupportedError:
+    for prefix, operator in _SELF_SERVED.items():
+        if class_name == prefix or class_name.startswith((prefix + ".", prefix + "_")):
+            return BatchInvariantUnsupportedError(
+                f"the class `{class_name}` does not support {what}; the limit is {limit}. `{operator}` runs this class "
+                "under both values of batch_invariant (no other kernel takes the operand pair): the call must meet the "
+                "class's contract."
+            )
     return BatchInvariantUnsupportedError(
         f"batch_invariant=True: the class `{class_name}` does not support {what}; the limit is {limit}. "
         "The batch-invariant mode never falls back to another kernel; call without batch_invariant=True to use "

@@ -150,6 +150,31 @@ def _mm_fp4_fingerprint(
     )
 
 
+def _mm_mxfp4w8a_fingerprint(
+    N: int, K: int, out_dtype: Union[torch.dtype, str], arch=None
+) -> str:
+    from ..gemm.batch_invariant.schedule import chunks_for, mx_class_for
+    from ..gemm.batch_invariant.spec import k_granule, spec_fingerprint
+
+    fmt = mx_class_for("mxfp4w8a", _mx_family(arch, "mm_mxfp8_mxfp4"))
+    if N <= 0 or K <= 0:
+        raise ValueError(
+            f"fingerprint('mm_mxfp8_mxfp4'): N {N} and K {K} must be positive"
+        )
+    gran = k_granule(fmt)
+    if K % gran:  # the operator's contract: the class exists for these weights only
+        raise ValueError(
+            f"fingerprint('mm_mxfp8_mxfp4'): K {K} must be a multiple of {gran} for the {fmt} class"
+        )
+    if N % 8:
+        raise ValueError(
+            f"fingerprint('mm_mxfp8_mxfp4'): N {N} must be a multiple of 8"
+        )
+    return spec_fingerprint(
+        K, _out_fmt(out_dtype, "mm_mxfp8_mxfp4"), chunks_for(N, K, fmt), fmt
+    )
+
+
 def _moe_bf16_fingerprint(
     H: int,
     I: int,
@@ -305,6 +330,15 @@ CLASSES: Dict[str, ClassInfo] = {
         _mm_fp4_fingerprint,
         ("use_nvfp4", "arch"),
     ),
+    # the mixed MX classes (e2m1 weights x e4m3 activations, UE8M0 scales per 32 on both) behind `mm_mxfp8_mxfp4`, the
+    # pair's only dense kernel in FlashInfer (both values of its `batch_invariant` flag run the class); the architecture is
+    # a dimension as for mm_mxfp8 (gemm.mxfp4w8a.*64 on SM107, gemm.mxfp4w8a.* elsewhere)
+    "mm_mxfp8_mxfp4": ClassInfo(
+        "gemm.mxfp4w8a",
+        ("N", "K", "out_dtype"),
+        _mm_mxfp4w8a_fingerprint,
+        ("arch",),
+    ),
     # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
     # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
@@ -359,6 +393,11 @@ def fingerprint(op: str, **dims) -> str:
     (``gemm.mxfp4.*128`` on SM107; ``gemm.nvfp4.*128`` on SM107 for the weight shapes its chunk rule leaves unsplit,
     ``gemm.nvfp4.*`` otherwise), the chunk count, the chain's ``mul.rn`` by the caller's alpha and the conversion are
     the specification; the alpha's value and the block scales are inputs.
+    ``mm_mxfp8_mxfp4`` takes ``N, K`` and ``out_dtype``, and optionally ``arch`` as for ``mm_mxfp8``: the mixed-operand
+    block-scaled step of that architecture's instruction (e4m3 activations against e2m1 weights, 32 elements per step on
+    SM100 / SM103, 64 on SM107: ``gemm.mxfp4w8a.*`` and ``gemm.mxfp4w8a.*64``), the mixed classes' chunk count of the
+    weight shape, the chain's ``mul.rn`` by the caller's alpha and the conversion are the specification; the API's
+    ``batch_invariant`` flag does not enter it (both values run the class).
 
     The attention wrappers take ``head_dim``: the tile and chunk grid, the online-softmax step and the chunk merge are
     functions of the head dim alone; the batch, the sequence lengths, the page size, the KV layout and the configuration
@@ -400,7 +439,8 @@ def class_name(op: str) -> str:
     """The consistency class (family) name behind the API ``op`` (``"gemm.bf16"``; ``"gemm.fp8"`` for the two fp8 classes
     ``gemm.e4m3`` / ``gemm.e5m2`` behind ``bmm_fp8``; ``"gemm.e4m3.kblock128"`` behind ``gemm_fp8_nt_groupwise``;
     ``"gemm.mxfp8"`` for the two MXFP8 classes behind ``mm_mxfp8``;
-    ``"gemm.fp4"`` for the NVFP4 and MXFP4 classes behind ``mm_fp4``)."""
+    ``"gemm.fp4"`` for the NVFP4 and MXFP4 classes behind ``mm_fp4``; ``"gemm.mxfp4w8a"`` for the mixed MX classes behind
+    ``mm_mxfp8_mxfp4``)."""
     info = CLASSES.get(op)
     if info is None:
         raise ValueError(

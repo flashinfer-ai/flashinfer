@@ -365,7 +365,7 @@ def test_tactic_encoding_round_trips():
         for cfg in enumerate_space(M, N, K, chunks=C, b_major="k", in_fmt=fmt)[::41]:
             t = tuning.knobs_to_tactic(cfg)
             assert (
-                len(t) == 12
+                len(t) == 13
                 and tuning.knobs_from_tactic(t) == cfg
                 and tuning.knobs_from_tactic(list(t)) == cfg
             )

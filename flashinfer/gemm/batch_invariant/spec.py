@@ -54,6 +54,8 @@ IN_FMTS = (
     "nvfp4_k128",
     "mxfp4",
     "mxfp4_k128",
+    "mxfp4w8a",
+    "mxfp4w8a_k64",
     "e4m3_bs",
 )
 FP8_FMTS = ("e4m3", "e5m2")
@@ -72,16 +74,25 @@ SCALE_BLOCK_N = 128  # output columns per weight scale block
 #: sm_103 ``kind::mxf4nvf4`` instruction, 64 elements per step; ``nvfp4_k128`` on the sm_107 one, 128 per step) and MXFP4 with
 #: one UE8M0 scale per 32 elements (``mxfp4`` on ``kind::mxf4``, 64 per step; ``mxfp4_k128`` on the sm_107 instruction, 128
 #: per step). Their chain multiplies by the caller's scalar ``alpha`` (``mm_fp4``'s 1-element tensor) before the conversion.
+#: The mixed MX format pair: e2m1 weights (B) against e4m3 activations (A), each with one UE8M0 scale per 32 elements, folded
+#: by the mixed-operand ``kind::mxf8f6f4`` instruction (the kind admits any pair of its element formats): ``mxfp4w8a`` on the
+#: sm_100 / sm_103 instruction (32 elements per step, one scale per row per step; the e2m1 operand reaches the instruction
+#: through the TMA's unpacking format, so K is a whole number of 128-element runs) and ``mxfp4w8a_k64`` on the sm_107 one (64
+#: per step, the packed e2m1 operand). The step folds a 4-bit operand's products differently from an 8-bit operand's, so the
+#: classes are their own folds (distinct from the MXFP8 class on the e2m1 values re-coded to e4m3, which the tests pin as an
+#: observation); the element width differs per operand (``A_ELEM_BITS_OF`` / ``B_ELEM_BITS_OF``). The chain multiplies by
+#: the caller's ``alpha``, as the 4-bit classes do.
 NVFP4_FMTS = ("nvfp4", "nvfp4_k128")
 MXFP4_FMTS = ("mxfp4", "mxfp4_k128")
 MXFP8_FMTS = ("mxfp8", "mxfp8_k64")
-MX_FMTS = MXFP8_FMTS + MXFP4_FMTS  # the UE8M0 formats
+MX_MIXED_FMTS = ("mxfp4w8a", "mxfp4w8a_k64")
+MX_FMTS = MXFP8_FMTS + MXFP4_FMTS + MX_MIXED_FMTS  # the UE8M0 formats
 FP4_FMTS = NVFP4_FMTS + MXFP4_FMTS
 BLOCK_SCALED = frozenset(
     MX_FMTS + NVFP4_FMTS
 )  # formats whose step takes scale-factor operands (the leaf carries them)
 ALPHA_GIVEN = frozenset(
-    FP4_FMTS
+    FP4_FMTS + MX_MIXED_FMTS
 )  # formats whose chain scalar is the caller's alpha, not the product of two per-tensor scales
 MMA_K_OF = {
     "bf16": 16,
@@ -93,6 +104,8 @@ MMA_K_OF = {
     "nvfp4_k128": 128,
     "mxfp4": 64,
     "mxfp4_k128": 128,
+    "mxfp4w8a": 32,
+    "mxfp4w8a_k64": 64,
     "e4m3_bs": 32,
 }
 MMA_OP_OF = {
@@ -105,8 +118,11 @@ MMA_OP_OF = {
     "nvfp4_k128": "mma_nvfp4_k128",
     "mxfp4": "mma_mxfp4_k64",
     "mxfp4_k128": "mma_mxfp4_k128",
+    "mxfp4w8a": "mma_mxfp4w8a_k32",
+    "mxfp4w8a_k64": "mma_mxfp4w8a_k64",
     "e4m3_bs": "mma_fp8_k32",
 }
+#: The A operand's element width (= B's for every format but the mixed pair): the K tile of one 128-byte smem stage.
 ELEM_BITS_OF = {
     "bf16": 16,
     "e4m3": 8,
@@ -117,8 +133,14 @@ ELEM_BITS_OF = {
     "nvfp4_k128": 4,
     "mxfp4": 4,
     "mxfp4_k128": 4,
+    "mxfp4w8a": 8,
+    "mxfp4w8a_k64": 8,
     "e4m3_bs": 8,
 }
+#: Per-operand element widths: the mixed classes take 8-bit activations (A) against 4-bit weights (B); every other format
+#: is symmetric.
+A_ELEM_BITS_OF = dict(ELEM_BITS_OF)
+B_ELEM_BITS_OF = {**ELEM_BITS_OF, "mxfp4w8a": 4, "mxfp4w8a_k64": 4}
 #: Dense MMA throughput relative to bf16 (what the dispatcher's estimate uses): the 8-bit kinds run at twice the bf16 rate,
 #: the 4-bit ones at four times; a block-scaled step at the rate of the dense step of its width.
 MMA_RATE_OF = {
@@ -131,6 +153,8 @@ MMA_RATE_OF = {
     "nvfp4_k128": 4.0,
     "mxfp4": 4.0,
     "mxfp4_k128": 4.0,
+    "mxfp4w8a": 2.0,  # the mixed step runs on the ``kind::mxf8f6f4`` pipeline: the 8-bit kind's rate
+    "mxfp4w8a_k64": 2.0,
     "e4m3_bs": 2.0,
 }
 SF_VEC = {
@@ -140,6 +164,8 @@ SF_VEC = {
     "nvfp4_k128": 16,
     "mxfp4": 32,
     "mxfp4_k128": 32,
+    "mxfp4w8a": 32,
+    "mxfp4w8a_k64": 32,
 }  # elements per block scale
 SF_FMT = {
     "mxfp8": "e8m0",
@@ -148,6 +174,8 @@ SF_FMT = {
     "nvfp4_k128": "e4m3",
     "mxfp4": "e8m0",
     "mxfp4_k128": "e8m0",
+    "mxfp4w8a": "e8m0",
+    "mxfp4w8a_k64": "e8m0",
 }  # the block scale's format
 #: The 128x4 swizzled scale-factor layout (what ``mxfp8_quantize(..., is_sf_swizzled_layout=True)`` writes): atoms of 128
 #: rows x 4 blocks of ``SF_VEC`` elements (512 bytes), K-tiles consecutive, row-tiles strided by the K-tiles of the whole K.
@@ -168,6 +196,7 @@ CLASS_TAG = {
     "mxfp8_k64": ("mxfp8.kfold64", "mxfp8.kchunk64"),
     "nvfp4_k128": ("nvfp4.kfold128", "nvfp4.kchunk128"),
     "mxfp4_k128": ("mxfp4.kfold128", "mxfp4.kchunk128"),
+    "mxfp4w8a_k64": ("mxfp4w8a.kfold64", "mxfp4w8a.kchunk64"),
     "e4m3_bs": (
         "e4m3.kblock128",
         "e4m3.kblock128",
@@ -181,9 +210,25 @@ ELEM_BITS = ELEM_BITS_OF["bf16"]
 
 
 def is_scaled(in_fmt: str) -> bool:
-    """The fp8 classes carry the per-tensor scale chain and the 4-bit classes the caller's alpha; the bf16 and the MXFP8
-    classes do not (``mm_mxfp8`` has no alpha; the block scales are the instruction's operands, not a chain step)."""
+    """The fp8 classes carry the per-tensor scale chain, the 4-bit and the mixed classes the caller's alpha; the bf16 and
+    the MXFP8 classes do not (``mm_mxfp8`` has no alpha; the block scales are the instruction's operands, not a chain step)."""
     return in_fmt in FP8_FMTS or in_fmt in ALPHA_GIVEN
+
+
+def k_granule(in_fmt: str) -> int:
+    """The K granule of the body's operand rows: a whole number of block scales and of 16-byte TMA rows of the narrower
+    operand (32 elements for every block-scaled format), or 128 elements for the sm_100 mixed class, whose e2m1 weight the
+    TMA unpacks into the instruction's 8-bit container in 64-byte (128-element) runs of the global row: the K extent and
+    the row stride must be whole runs (``blocks/blockscaled_mx_mixed.py``)."""
+    import math
+
+    if in_fmt == "mxfp4w8a":
+        return 128
+    row = 128 // min(
+        A_ELEM_BITS_OF[in_fmt], B_ELEM_BITS_OF[in_fmt]
+    )  # elements per 16-byte row of the narrower operand
+    vec = SF_VEC.get(in_fmt, MMA_K_OF[in_fmt])
+    return vec * row // math.gcd(vec, row)
 
 
 def chunk_unit(in_fmt: str) -> int:

@@ -24,15 +24,12 @@ from flashinfer.cute_dsl.attention.fmha.helpers import (
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from ..generator import MMA_K_BLOCKS, Knobs  # noqa: F401  (MMA_K_BLOCKS re-exported: the mainloop's inner radix)
-from ..spec import BLOCK_K, BLOCK_SCALED, ELEM_BITS_OF, FP8_BLOCKSCALE_FMTS, SF_VEC
-
-
-def k_granule(in_fmt: str) -> int:
-    """K of a block-scaled operand is a whole number of block scales and of 16-byte rows: 32 elements for every format."""
-    import math
-
-    row = 128 // ELEM_BITS_OF[in_fmt]  # elements per 16-byte row
-    return SF_VEC[in_fmt] * row // math.gcd(SF_VEC[in_fmt], row)
+from ..spec import (  # noqa: F401  (k_granule re-exported: the body's K granule, also the API's)
+    BLOCK_K,
+    BLOCK_SCALED,
+    FP8_BLOCKSCALE_FMTS,
+    k_granule,
+)
 
 
 ACC_DTYPE = cutlass.Float32
@@ -46,6 +43,8 @@ IN_DT = {
     "nvfp4_k128": cutlass.Float4E2M1FN,
     "mxfp4": cutlass.Float4E2M1FN,
     "mxfp4_k128": cutlass.Float4E2M1FN,
+    "mxfp4w8a": cutlass.Float8E4M3FN,  # the mixed classes: the A (activation) operand's dtype; B is e2m1 (blocks/blockscaled_mx_mixed.py)
+    "mxfp4w8a_k64": cutlass.Float8E4M3FN,
     "e4m3_bs": cutlass.Float8E4M3FN,  # the block-scale fp8 class: e4m3 elements, fp32 block scales applied by the epilogue (blocks/blockscale_fp8.py)
 }
 OUT_DT = {
@@ -64,6 +63,8 @@ ALIGN = {
     "nvfp4_k128": 32,
     "mxfp4": 32,
     "mxfp4_k128": 32,
+    "mxfp4w8a": 32,  # the mixed classes: the 4-bit weight row's alignment, the stricter of the two operands'
+    "mxfp4w8a_k64": 32,
     "e4m3_bs": 16,
     "f32": 4,
 }  # elements per 16-byte TMA alignment
@@ -327,9 +328,10 @@ def can_implement(
     # the output is stored directly (no fp32 workspace) by the unsplit class and by the in-CTA chunk fold
     al_out = ALIGN["bf16"] if (chunks == 1 or knobs.cta_chunks) else ALIGN["f32"]
     if in_fmt in BLOCK_SCALED:
-        # the block-scaled instruction takes K-major A and B only; K is a whole number of scale blocks; a chunk is a whole
-        # number of steps AND of scale-factor atom columns (`spec.chunk_unit`: 128 elements for the MX classes)
-        from ..spec import chunk_unit
+        # the block-scaled instruction takes K-major A and B only; K is a whole number of scale blocks (whole 128-element
+        # runs for the sm_100 mixed class: `spec.k_granule`); a chunk is a whole number of steps AND of scale-factor atom
+        # columns (`spec.chunk_unit`: 128 elements for the MX classes)
+        from ..spec import MX_MIXED_FMTS, chunk_unit
 
         if (
             b_major != "k"
@@ -337,14 +339,22 @@ def can_implement(
             or (chunks > 1 and Kc % chunk_unit(in_fmt))
         ):
             return False
+        if chunks > 1 and knobs.k_block and Kc % knobs.k_block:
+            return False  # a chunk is whole k-tiles of the record's k-block
         if knobs.swap_ab:
             # the decode specialisation: the kernel's M is N (the weights), its N is M (the tokens), all tokens in one
-            # tile (the scale-factor atom read from its start); the M-major output needs N aligned
+            # tile (the scale-factor atom read from its start); the M-major output needs N aligned. The mixed classes'
+            # split classes take it too (one chunk's partial through the workspace like the dense record's; not the
+            # in-cluster / in-CTA folds); the other block-scaled classes keep their unsplit-only swapped records
+            split_ok = chunks == 1 or (
+                in_fmt in MX_MIXED_FMTS
+                and not (knobs.cluster_k > 1 or knobs.cta_chunks)
+            )
             return (
-                chunks == 1
+                split_ok
                 and knobs.tile_n >= M
                 and N % ALIGN["bf16"] == 0
-                and K % al_in == 0
+                and Kc % al_in == 0
             )
         if knobs.cluster_k > 1:
             # the in-cluster split computes exactly the class kchunk[cluster_k]: its chunks are whole k-tiles (one smem
@@ -353,7 +363,7 @@ def can_implement(
             # the record is not a placement of the shape and the workspace split (the same class) takes over
             from ..generator import MainloopBlock
 
-            k_tile = MainloopBlock(in_fmt).k_block
+            k_tile = MainloopBlock(in_fmt, k_block_override=knobs.k_block).k_block
             tiles = -(-M // knobs.tile_m) * -(-N // knobs.tile_n)
             return (
                 chunks == knobs.cluster_k

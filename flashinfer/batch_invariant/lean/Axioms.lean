@@ -38,6 +38,10 @@ def decidedTheorems : List Name :=
    ``BIK.gemm_mx4_space_decode_ok, ``BIK.gemm_mx4_space_c2_ok,
    ``BIK.gemm_mx4k128_space_ok, ``BIK.gemm_mx4k128_space_c4_ok, ``BIK.gemm_mx4k128_space_c4_cta_twins, ``BIK.gemm_mx4k128_dispatch_in_space,
    ``BIK.gemm_mx4k128_space_decode_ok, ``BIK.gemm_mx4k128_space_c2_ok,
+   ``BIK.gemm_mxw48_space_ok, ``BIK.gemm_mxw48_space_c4_ok, ``BIK.gemm_mxw48_space_c4_cta_twins, ``BIK.gemm_mxw48_dispatch_in_space,
+   ``BIK.gemm_mxw48_space_decode_ok, ``BIK.gemm_mxw48_space_c2_ok,
+   ``BIK.gemm_mxw48k64_space_ok, ``BIK.gemm_mxw48k64_space_c4_ok, ``BIK.gemm_mxw48k64_space_c4_cta_twins, ``BIK.gemm_mxw48k64_dispatch_in_space,
+   ``BIK.gemm_mxw48k64_space_decode_ok, ``BIK.gemm_mxw48k64_space_c2_ok,
    ``BIK.attn_a0_spec, ``BIK.attn_a1_spec, ``BIK.attn_a2_spec, ``BIK.attn_a3_spec, ``BIK.attn_a4_spec, ``BIK.attn_a5_spec, ``BIK.attn_a6_spec, ``BIK.attn_a7_spec, ``BIK.attn_a8_spec, ``BIK.attn_a9_spec, ``BIK.attn_space_d64_size, ``BIK.attn_space_d64_ok, ``BIK.attn_space_d128_size, ``BIK.attn_space_d128_ok, ``BIK.attn_space_d256_size, ``BIK.attn_space_d256_ok, ``BIK.Attn.output_depends_on_C, ``BIK.Attn.output_depends_on_D, ``BIK.Attn.output_depends_on_D_64]
 def moduleOf (env : Environment) (n : Name) : Option Name :=
   match env.getModuleIdxFor? n with

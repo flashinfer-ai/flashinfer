@@ -5,7 +5,7 @@
 For the GEMM classes (bf16 at the ``mma16`` step; e4m3 / e5m2 at the ``mma32`` step with the scaled chain; mxfp8 at the
 ``mma32mx`` step and mxfp8_k64 at the ``mma64mx8`` step, the block-scaled steps with the unscaled chain; nvfp4 / nvfp4_k128
 at ``mma64bs`` / ``mma128bs`` and mxfp4 / mxfp4_k128 at ``mma64mx`` / ``mma128mx4``, the 4-bit block-scaled steps with the
-alpha chain) the file carries
+alpha chain; the mixed pair mxfp4w8a / mxfp4w8a_k64 at ``mma32mxw48`` / ``mma64mxw48`` with the alpha chain) the file carries
 
 * the spec terms of both classes of each format at sampled (K, chunks): the *Python spec* (``gemm.spec.GemmSpec``)
   S-expression, with a Lean theorem that the Lean model (``BIK.GEMM.kfold`` / ``kchunk`` and their ``32`` / ``MX8`` /
@@ -57,6 +57,7 @@ from ..gemm.batch_invariant.spec import (
     BLOCK_K,
     MMA_K_OF,
     GemmSpec,
+    k_granule,
     reduction,
     reduction_blockscale,
 )
@@ -177,6 +178,12 @@ GEMM_FP4_CASES = [(256, 1), (512, 1), (1024, 2), (1024, 4)]
 GEMM_FP4_K128_CASES = [(512, 1), (1024, 1), (2048, 2), (2048, 4)]
 GEMM_FP4_OUT_CASES = [(256, "bf16"), (512, "f16"), (256, "f32")]
 GEMM_FP4_K128_OUT_CASES = [(512, "bf16"), (1024, "f16"), (512, "f32")]
+#: The mixed MX classes (e2m1 weights against e4m3 activations, UE8M0 scales per 32 on both; the caller's alpha): ``mxfp4w8a``
+#: at the sm_100 / sm_103 32-wide step (K in whole 128-element runs) and ``mxfp4w8a_k64`` at the sm_107 64-wide step.
+GEMM_MXW48_CASES = GEMM_MX_CASES
+GEMM_MXW48_K64_CASES = [(256, 1), (512, 1), (1024, 2), (1024, 4)]
+GEMM_MXW48_OUT_CASES = GEMM_MX_OUT_CASES
+GEMM_MXW48_K64_OUT_CASES = GEMM_FP4_OUT_CASES
 #: The block-scale fp8 class (``e4m3_bs``, ``gemm.e4m3.kblock128``): (K, out_fmt) at 1 .. 4 blocks of ``BLOCK_K`` elements; the
 #: block counts at which the kernel's promotion loop (Lean ``promoteLoop``) is conformed to the engine's per-block traces; the
 #: DeepSeek (N, K) grid and the M values over which the dispatcher's picks are shown to be members of the space.
@@ -240,7 +247,7 @@ class LeanFormat:
     def elem(self) -> str:
         """The Lean chain applied to a fold: ``outputElem false`` (bf16, the MXFP8 classes), ``outputElem true`` (the fp8
         classes) or ``outputElemAlpha`` (the 4-bit classes)."""
-        if self.p in ("BS", "BS128", "MX4", "MX4K128"):
+        if self.p in ("BS", "BS128", "MX4", "MX4K128", "MXW48", "MXW48K64"):
             return "outputElemAlpha"
         return f"outputElem {'true' if self.scaled else 'false'}"
 
@@ -277,8 +284,28 @@ STEP_OF_P = {
     "BS128": "mma128bs",
     "MX4": "mma64mx",
     "MX4K128": "mma128mx4",
+    "MXW48": "mma32mxw48",
+    "MXW48K64": "mma64mxw48",
 }
-CHUNK_SUFFIX = {"": "", "32": "_fp8", "MX8": "_mx", "BS": "_fp4", "BS128": "_fp4k128"}
+CHUNK_SUFFIX = {
+    "": "",
+    "32": "_fp8",
+    "MX8": "_mx",
+    "BS": "_fp4",
+    "BS128": "_fp4k128",
+    "MXW48": "_mxw48",
+}
+#: The mixed classes' lower bound's region and its edges (the rule's own table)
+MIXED_CHUNK_EXTRA = [
+    (256, 16384),
+    (512, 16384),
+    (1024, 16384),
+    (512, 32768),
+    (384, 65536),
+    (512, 16384 + 128 * 3),
+    (512, 15360),
+    (520, 16384),
+]
 
 _MX_EXTRA = (
     (
@@ -465,6 +492,48 @@ FORMATS: Tuple[LeanFormat, ...] = (
         tuple(MX_CHUNK_EXTRA),
         _MX_EXTRA,
     ),
+    LeanFormat(
+        "mxfp4w8a",
+        "MXW48",
+        "gemmmxw48",
+        "gemm_mxw48",
+        "gemmMxW48Space",
+        "gemmMxW48Dispatch",
+        "ConfigOKMxW48",
+        "gemmMainloopInnerMxW48",
+        "chunksForMxW48",
+        "chunkTableMxW48",
+        "chunksmxw48",
+        True,
+        ("k",),
+        ("sm_100", "sm_103"),
+        tuple(GEMM_MXW48_CASES),
+        tuple(GEMM_MX_LOOP_CASES),
+        tuple(GEMM_MXW48_OUT_CASES),
+        tuple(MX_CHUNK_EXTRA + MIXED_CHUNK_EXTRA),
+        _MX_EXTRA,
+    ),
+    LeanFormat(
+        "mxfp4w8a_k64",
+        "MXW48K64",
+        "gemmmxw48k64",
+        "gemm_mxw48k64",
+        "gemmMxW48K64Space",
+        "gemmMxW48K64Dispatch",
+        "ConfigOKMxW48K64",
+        "gemmMainloopInnerMxW48K64",
+        "chunksForMxW48",
+        None,
+        "chunksmxw48",
+        True,
+        ("k",),
+        ("sm_107",),
+        tuple(GEMM_MXW48_K64_CASES),
+        tuple(GEMM_MX_LOOP_CASES),
+        tuple(GEMM_MXW48_K64_OUT_CASES),
+        tuple(MX_CHUNK_EXTRA + MIXED_CHUNK_EXTRA),
+        _MX_EXTRA,
+    ),
 )
 BY_FMT: Dict[str, LeanFormat] = {F.in_fmt: F for F in FORMATS}
 #: The generated theorems closed by ``native_decide`` (the exhaustive checks over the configuration spaces); every
@@ -515,6 +584,37 @@ def loop_cases(in_fmt: str = "bf16") -> Tuple[int, List[Tuple[int, str]]]:
         )
         for nblk in BY_FMT[in_fmt].loop_cases
     ]
+
+
+def swap_loop_cases(in_fmt: str) -> Tuple[int, int, List[Tuple[int, str]]]:
+    """The lowering's trace at the k-block of the format's swapped decode records (`generator.SWAP_K_BLOCK`): the inner radix,
+    its ratio to the class's default radix and ``(nblk, sexpr)``; the trace at ``nblk`` blocks is the default radix's trace at
+    ``ratio * nblk`` blocks (one fold, two blockings), which the emitted theorem states without a new literal."""
+    from ..gemm.batch_invariant.generator import SWAP_K_BLOCK
+
+    low = MainloopBlock(in_fmt).lowering()
+    lowsw = MainloopBlock(in_fmt, k_block_override=SWAP_K_BLOCK[in_fmt]).lowering()
+    ratio = lowsw.inner // low.inner
+    assert ratio * low.inner == lowsw.inner, (in_fmt, lowsw.inner, low.inner)
+    alg = term.TermAlgebra()
+    out = []
+    for nblk in BY_FMT[in_fmt].loop_cases:
+        sx = term.sexpr(
+            lowsw.trace(
+                reduction(nblk * lowsw.inner * MMA_K_OF[in_fmt], 0, 0, in_fmt),
+                alg,
+                nblk,
+            )
+        )
+        assert sx == term.sexpr(
+            low.trace(
+                reduction(nblk * lowsw.inner * MMA_K_OF[in_fmt], 0, 0, in_fmt),
+                alg,
+                nblk * ratio,
+            )
+        ), (in_fmt, nblk)
+        out.append((nblk, sx))
+    return lowsw.inner, ratio, out
 
 
 def out_cases(in_fmt: str = "bf16") -> List[Tuple[int, str, str]]:
@@ -616,6 +716,8 @@ def dispatch_cases(in_fmt: str = "bf16") -> Dict[Knobs, Tuple[int, int, int]]:
     pairs += [(N, K) for K in DISPATCH_BIG for N in DISPATCH_NS[::3]]
     pairs += [(N, K) for N in DISPATCH_BIG for K in DISPATCH_NS[::3]]
     for N, K in pairs:
+        if K % k_granule(in_fmt):
+            continue  # a weight shape the class does not take (the sm_100 mixed class: K in whole 128-element runs)
         C = chunks_for(N, K, in_fmt)
         for M in DISPATCH_MS:
             for b_major in F.layouts:
@@ -735,6 +837,25 @@ def _render_format(L: List[str], F: LeanFormat) -> None:
         + ", ".join(str(n) for n in F.loop_cases)
         + "]"
     )
+    from ..gemm.batch_invariant.generator import SWAP_K_BLOCK
+
+    if SWAP_K_BLOCK.get(in_fmt):
+        # the swapped decode records of this class stage a wider k-block: the loop at that radix is the class's loop at
+        # ratio x the blocks (the same fold, another blocking), stated for every block count against the loop model
+        # itself through its fold equation (no new literal); the conformance executable prints its trace
+        inner_sw, ratio, _ = swap_loop_cases(in_fmt)
+        L.append(f"def {inner_name}Swap : Nat := {inner_sw}")
+        L.append(
+            f"theorem {tag}swap_mainloop_eq_kfold : ∀ (S nblk : Nat) (a : RowData) (b : ColData), "
+            f"{loop} a b {inner_name}Swap S .zero nblk = {kfold} a b (nblk * {inner_name}Swap) := "
+            f"fun S nblk a b => {loop}_eq_{kfold} a b {inner_name}Swap S nblk"
+        )
+        L.append(
+            f"theorem {tag}swap_loop_eq_loop : ∀ (S nblk : Nat) (a : RowData) (b : ColData), "
+            f"{loop} a b {inner_name}Swap S .zero nblk = {loop} a b {inner_name} S .zero (nblk * {ratio}) := "
+            f"fun S nblk a b => by rw [{loop}_eq_{kfold}, {loop}_eq_{kfold}]; "
+            f"exact congrArg ({kfold} a b) (by simp only [{inner_name}Swap, {inner_name}]; omega)"
+        )
     L.append("")
     L.append(
         f"/-! The {in_fmt} epilogue chain (`spec.output_elem`"

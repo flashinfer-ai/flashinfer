@@ -52,6 +52,11 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
     "batch_invariant_gemm_blockscaled": (
         "gemm/batch_invariant/blocks/compile_blockscaled.py",
     ),
+    # the mixed MX classes (e2m1 weights x e4m3 activations) on the same body: their own module, so an edit to the mixed
+    # plans leaves the one-format block-scaled module's objects valid (an edit to the shared body moves both)
+    "batch_invariant_gemm_blockscaled_mixed": (
+        "gemm/batch_invariant/blocks/compile_blockscaled_mixed.py",
+    ),
     # the block-scale fp8 kernels (the DeepSeek-style class behind gemm_fp8_nt_groupwise): their own module
     "batch_invariant_gemm_fp8_blockscale": (
         "gemm/batch_invariant/blocks/compile_fp8bs.py",
@@ -82,6 +87,9 @@ MODULE_EXTRA_SOURCES: Dict[str, Tuple[str, ...]] = {
     "batch_invariant_gemm_blockscaled": (
         "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
     ),
+    "batch_invariant_gemm_blockscaled_mixed": (
+        "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
+    ),
     "batch_invariant_gemm_fp8_blockscale": (
         "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
     ),
@@ -96,6 +104,10 @@ MODULE_NON_KERNEL_SOURCES: Dict[str, Tuple[str, ...]] = {
         "gemm/batch_invariant/heuristic.py",
     ),
     "batch_invariant_gemm_blockscaled": (
+        "gemm/batch_invariant/schedule.py",
+        "gemm/batch_invariant/heuristic.py",
+    ),
+    "batch_invariant_gemm_blockscaled_mixed": (
         "gemm/batch_invariant/schedule.py",
         "gemm/batch_invariant/heuristic.py",
     ),
