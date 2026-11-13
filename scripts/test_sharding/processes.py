@@ -7,9 +7,8 @@ Windows has no process-group signals that reach every descendant, so each child
 is started with ``CREATE_NEW_PROCESS_GROUP`` and assigned to its own Job Object.
 The job tracks descendants even after the leader exits. Termination sends
 CTRL_BREAK_EVENT to the console process group, waits for the grace period, then
-calls ``TerminateJobObject``. If a job cannot be created or assigned (for
-example, an enclosing job forbids nesting), ``taskkill /T /F`` kills the tree
-that is still reachable from the leader.
+calls ``TerminateJobObject``. If the job cannot be set up, the launch fails:
+without a job, descendants of an exited leader could not be found again.
 """
 
 from __future__ import annotations
@@ -110,24 +109,30 @@ if sys.platform == "win32":
         # long before they spawn descendants, so none escape in practice.
         job_handle = _kernel32.CreateJobObjectW(None, None)
         if not job_handle:
-            return
+            raise _win_error("CreateJobObjectW")
         job = _Job(job_handle)
         process_handle = _kernel32.OpenProcess(
             _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, process.pid
         )
         if not process_handle:
-            return
+            raise _win_error("OpenProcess")
         try:
-            if _kernel32.AssignProcessToJobObject(job_handle, process_handle):
-                _jobs[process] = job
+            if not _kernel32.AssignProcessToJobObject(job_handle, process_handle):
+                raise _win_error("AssignProcessToJobObject")
         finally:
             _kernel32.CloseHandle(process_handle)
+        _jobs[process] = job
+
+    def _job(process: subprocess.Popen[Any]) -> _Job:
+        try:
+            return _jobs[process]
+        except KeyError:
+            raise ValueError(
+                f"process {process.pid} was not started by start_process_group"
+            ) from None
 
     def _group_alive(process: subprocess.Popen[Any]) -> bool:
-        job = _jobs.get(process)
-        if job is None:
-            return process.poll() is None
-        return job.active_processes() > 0
+        return _job(process).active_processes() > 0
 
     def _request_graceful_exit(process: subprocess.Popen[Any]) -> bool:
         if not _group_alive(process):
@@ -139,21 +144,10 @@ if sys.platform == "win32":
         return True
 
     def _force_exit(process: subprocess.Popen[Any]) -> bool:
-        job = _jobs.get(process)
-        if job is not None:
-            if job.active_processes() == 0:
-                return False
-            job.terminate()
-            return True
-        if process.poll() is not None:
+        job = _job(process)
+        if job.active_processes() == 0:
             return False
-        subprocess.run(
-            ["taskkill", "/T", "/F", "/PID", str(process.pid)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        process.kill()
+        job.terminate()
         return True
 
 else:
@@ -191,7 +185,13 @@ def start_process_group(
             creationflags=flags | subprocess.CREATE_NEW_PROCESS_GROUP,
             **popen_kwargs,
         )
-        _assign_job(process)
+        try:
+            _assign_job(process)
+        except OSError:
+            # Refuse a group that could not be cleaned up once its leader exits.
+            process.kill()
+            process.wait()
+            raise
         return process
     return subprocess.Popen(command, start_new_session=True, **popen_kwargs)
 

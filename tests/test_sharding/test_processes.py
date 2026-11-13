@@ -7,6 +7,9 @@ import sys
 import time
 from contextlib import suppress
 
+import pytest
+
+from scripts.test_sharding import processes
 from scripts.test_sharding.processes import (
     FORCED_TERMINATION,
     start_process_group,
@@ -84,3 +87,24 @@ def test_termination_cleans_group_after_leader_already_exited() -> None:
         _kill_if_alive(child_pid)
 
     assert termination_signal == FORCED_TERMINATION
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object setup")
+def test_launch_fails_when_job_object_cannot_be_assigned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started: list[subprocess.Popen[str]] = []
+
+    def fail_assignment(process: subprocess.Popen[str]) -> None:
+        started.append(process)
+        raise OSError(5, "AssignProcessToJobObject failed: Access is denied.")
+
+    monkeypatch.setattr(processes, "_assign_job", fail_assignment)
+
+    with pytest.raises(OSError, match="AssignProcessToJobObject"):
+        start_process_group(
+            [sys.executable, "-c", "import time; time.sleep(30)"], text=True
+        )
+
+    assert len(started) == 1
+    assert started[0].returncode is not None
