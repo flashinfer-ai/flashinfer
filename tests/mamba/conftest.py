@@ -1060,7 +1060,6 @@ def _triton_supports_current_arch() -> bool:
 # a few checkpointing tests then skips the 57-module prewarm.
 @pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(config, items):
-    """Skip unsupported Triton tests and prewarm checkpointing SSU variants."""
     if items and not _triton_supports_current_arch():
         skip_triton = pytest.mark.skip(
             reason="installed Triton cannot target this GPU architecture "
@@ -1088,7 +1087,6 @@ def pytest_collection_modifyitems(config, items):
     import warnings
 
     from flashinfer.jit.mamba.checkpointing_ssu import gen_checkpointing_ssu_module
-    from flashinfer.utils import device_support_pdl
 
     # The prewarm is purely an optimization: any failure below degrades to
     # the normal serial first-touch JIT compile at test time (where a real
@@ -1100,10 +1098,7 @@ def pytest_collection_modifyitems(config, items):
             spec
             for spec in (
                 gen_checkpointing_ssu_module(
-                    **dict(
-                        zip(_CHECKPOINTING_SSU_VARIANT_FIELDS, variant, strict=True)
-                    ),
-                    enable_two_kernel=device_support_pdl(torch.device("cuda")),
+                    **dict(zip(_CHECKPOINTING_SSU_VARIANT_FIELDS, variant, strict=True))
                 )
                 for variant in _CHECKPOINTING_SSU_VARIANTS
             )

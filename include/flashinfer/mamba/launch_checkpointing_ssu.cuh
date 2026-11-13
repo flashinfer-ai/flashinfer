@@ -131,10 +131,7 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_h
   // precompute co-launches with a programmatic conv1d and gdc_waits for B/C.
   // The precompute fires cudaTriggerProgrammaticLaunchCompletion() at its TOP
   // (unconditional) so the main becomes eligible to launch immediately.
-  if constexpr (!ENABLE_TWO_KERNEL) {
-    FLASHINFER_CHECK(params.cb_scaled == nullptr,
-                     "two-kernel checkpointing SSU requires a PDL-capable (SM90+) device");
-  } else if (params.cb_scaled != nullptr) {
+  if (params.cb_scaled != nullptr) {
     if constexpr ((sizeof(state_t) == 2 || sizeof(state_t) == 4) && sizeof(input_t) == 2) {
       // Precompute: grid (batch, ngroups, ceil(HEADS_PER_GROUP/HEADS_PER_CTA)).
       // Heads are tiled across grid.z to fill the GPU at small batch (heuristic

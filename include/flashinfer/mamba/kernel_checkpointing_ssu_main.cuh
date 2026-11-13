@@ -954,7 +954,7 @@ __global__ __maxnreg__(main_maxnreg(NUM_STAGES)) void checkpointing_ssu_main_ker
   // (ALL work-units done; the per-head cache writes are next-step-only).  Gated by ENABLE_PDL.
   // (The internal precompute→main chain uses the one-shot gdc_wait on the first work-unit.) ──
   if constexpr (ENABLE_PDL) {
-    cudaTriggerProgrammaticLaunchCompletion();
+    ssu_grid_dependency_launch();
   }
 
   using SmemT = CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA,
@@ -1073,8 +1073,8 @@ __global__ __maxnreg__(main_maxnreg(NUM_STAGES)) void checkpointing_ssu_main_ker
   }
   __pipeline_commit();  // G_pre0 (empty if tile 0 is a pad)
 
-  cudaGridDependencySynchronize();  // gdc ONCE — precompute outputs (cb / cumAdt / x / C)
-                                    // now visible
+  ssu_grid_dependency_wait();  // gdc ONCE — precompute outputs (cb / cumAdt / x / C)
+                               // now visible
 
   if (valid0)
     prefetch_async_post_gdc<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE>(

@@ -70,7 +70,6 @@ def _get_module(
     num_groups: int,
     philox_rounds: int = 0,
     enable_pdl: bool = False,
-    enable_two_kernel: bool = True,
 ):
     """Return the cached JIT module for this checkpointing SSU specialization."""
     return gen_checkpointing_ssu_module(
@@ -89,7 +88,6 @@ def _get_module(
         num_groups,
         philox_rounds,
         enable_pdl,
-        enable_two_kernel,
     ).build_and_load()
 
 
@@ -488,10 +486,7 @@ class CheckpointingSSURunner(TunableRunner):
         """Prepare the JIT module or launch the selected checkpointing SSU tactic."""
         del kwargs
         if do_preparation:
-            _get_module(
-                *self._module_base_args,
-                enable_two_kernel=device_support_pdl(inputs[1].device),
-            )
+            _get_module(*self._module_base_args)
             return
 
         if tactic == -1:
@@ -521,10 +516,7 @@ class CheckpointingSSURunner(TunableRunner):
                 "two-kernel checkpointing SSU requires its scratch trio, "
                 "2-byte input, 2- or 4-byte state, and a PDL-capable (SM90+) device"
             )
-        module = _get_module(
-            *self._module_base_args,
-            enable_two_kernel=device_support_pdl(inputs[1].device),
-        )
+        module = _get_module(*self._module_base_args)
         module.checkpointing_ssu(
             *inputs[:15],  # state through dt_bias
             self._dt_softplus,

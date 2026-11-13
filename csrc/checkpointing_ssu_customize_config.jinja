@@ -38,7 +38,3 @@ constexpr int PHILOX_ROUNDS = {{ philox_rounds }};
 // and load order.  Stamped as a JIT URI key so each (enable_pdl) value
 // compiles its own .so; no runtime branch in the kernel binary.
 constexpr bool ENABLE_PDL = {{ enable_pdl }};
-// Whether this module instantiates the two-kernel precompute -> main split.
-// The split's internal PDL chain requires sm_90+, so sm_80/sm_89 builds set
-// this false and compile only the monolithic kernel.
-constexpr bool ENABLE_TWO_KERNEL = {{ enable_two_kernel }};
