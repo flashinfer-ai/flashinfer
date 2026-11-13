@@ -20,6 +20,7 @@ import struct
 import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.cute as cute
+import cutlass.experimental.primitives as prims
 import cutlass.utils as cu_utils
 import torch
 from cutlass import Float32, Int32, const_expr
@@ -66,6 +67,31 @@ def _store4_remote(ptr, mbar, peer, x0, x1, x2, x3):
 
 
 @cute.jit
+def _mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: Int32) -> None:
+    """``cute.arch.mbarrier_wait`` that acquires at cluster scope.
+
+    The peers' ``st.async`` complete-tx operations release at cluster scope; the
+    default ``.acquire.cta`` wait does not synchronize with other CTAs' threads.
+    ``cute.arch.mbarrier_wait`` has no scope argument, so this uses the
+    Primitives ``mbarrier_try_wait_parity`` at ``MBarrierScope.CLUSTER`` with a
+    relaxed order (``mbarrier.try_wait.parity.relaxed.cluster``) and follows it
+    with ``fence_sync_restrict(ACQUIRE)``
+    (``fence.acquire.sync_restrict::shared::cluster.cluster``). That is the PTX
+    acquire pattern (a strong read that observes the phase flip, then an acquire
+    fence), and restricting the fence to ``shared::cluster`` lets ptxas skip the
+    L1 invalidation it emits after a ``.acquire.cluster`` try_wait.
+    """
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr,
+        phase,
+        scope=prims.MBarrierScope.CLUSTER,
+        order=prims.MemOrder.RELAXED,
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
+
+
+@cute.jit
 def _warp_sum4(v0, v1, v2, v3):
     """Interleave four independent butterfly trees to expose shuffle ILP."""
     w0, w1, w2, w3 = v0, v1, v2, v3
@@ -87,7 +113,9 @@ def _row_sum4(v0, v1, v2, v3, buf, mbar, tidx, lane, warp, rank):
         if lane < CLUSTER_N:
             p = buf[(None, slot)].iterator
             _store4_remote(p, mbar, lane, w0, w1, w2, w3)
-        cute.arch.mbarrier_wait(mbar, 0)
+        # The peers' st.async complete-tx release at cluster scope: acquire at
+        # cluster scope before their slots are read.
+        _mbarrier_wait_acquire_cluster(mbar, Int32(0))
         f = cute.make_fragment_like(buf[(None, lane)])
         cute.autovec_copy(buf[(None, lane)], f)
         x = f.load()

@@ -38,6 +38,7 @@ import math
 from pathlib import Path
 
 import cutlass
+import cutlass.experimental.primitives as prims
 import cutlass.utils
 from cutlass import cute
 import cuda.bindings.driver as cuda
@@ -47,6 +48,34 @@ import tvm_ffi  # noqa: F401 -- TVM FFI supplies the active PyTorch stream
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from ..norm import utils as norm_utils
 from .fused_kda_decode import _device_index, _device_sm_count
+
+
+@cute.jit
+def _mbarrier_wait_acquire_cluster(
+    mbar_ptr: cute.Pointer, phase: cutlass.Int32
+) -> None:
+    """``cute.arch.mbarrier_wait`` that acquires at cluster scope.
+
+    The peers' ``st.async`` complete-tx operations release at cluster scope; the
+    default ``.acquire.cta`` wait does not synchronize with other CTAs' threads.
+    ``cute.arch.mbarrier_wait`` has no scope argument, so this uses the
+    Primitives ``mbarrier_try_wait_parity`` at ``MBarrierScope.CLUSTER`` with a
+    relaxed order (``mbarrier.try_wait.parity.relaxed.cluster``) and follows it
+    with ``fence_sync_restrict(ACQUIRE)``
+    (``fence.acquire.sync_restrict::shared::cluster.cluster``). That is the PTX
+    acquire pattern (a strong read that observes the phase flip, then an acquire
+    fence), and restricting the fence to ``shared::cluster`` lets ptxas skip the
+    L1 invalidation it emits after a ``.acquire.cluster`` try_wait.
+    """
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr,
+        phase,
+        scope=prims.MBarrierScope.CLUSTER,
+        order=prims.MemOrder.RELAXED,
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
+
 
 _D = 128
 _W = 4
@@ -577,9 +606,11 @@ def _kda_kernel(
             slot = mail_ptr + (rank * T + tid)
             for p in cutlass.range_constexpr(SPLIT):
                 norm_utils.store_shared_remote(tot, slot, mbar, cutlass.Int32(p))
-        cute.arch.fence_acq_rel_cta()
+        # The peer ranks' st.async complete-tx release at cluster scope: acquire
+        # at cluster scope before sMail is read (the wait carries the acquire,
+        # so no separate CTA-scope fence is needed here).
         if tid == 0:
-            cute.arch.mbarrier_wait(mbar, 0)
+            _mbarrier_wait_acquire_cluster(mbar, cutlass.Int32(0))
         cute.arch.barrier()
         if tid < T:
             tot = cutlass.Float32(0.0)
