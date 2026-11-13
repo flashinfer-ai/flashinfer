@@ -47,6 +47,8 @@ from ...._block_sparse.common import (
 from ..fmha_decode_config import FmhaDecodeConfig
 from ..direct_sparse_metadata import DirectSparseMetadataView
 from ..fmha_decode_constants import (
+    NVFP4_ROW_PACKED_WORDS,
+    NVFP4_ROW_PACKET_WORDS,
     KV_INST0,
     KV_INST1,
     KV_KIND_K,
@@ -63,6 +65,7 @@ from ...placeholder_helpers import (
     _placeholder_smem_array,
 )
 from .helpers_common import (
+    _TASK_CACHE_WARP_GRP_THREAD_IDX,
     _TASK_CACHE_KV_PAGE_IDX_UB,
     _TASK_CACHE_KV_RAW_TILE_BASE,
     _TASK_CACHE_KV_WINDOW_START,
@@ -78,6 +81,7 @@ from .helpers_common import (
     _major_k_stride_bytes,
     _q_group_token_base,
     _qkv_smem_swizzle,
+    load_nvfp4_row_scale_words,
 )
 from .helpers_kv_tile_idx import (
     _load_runtime_seq_len_kv,
@@ -732,6 +736,18 @@ class SmemKvTileResource(DecodeGenResourceBase):
     _desc_base: prims.Tcgen05SmemDesc = None
     kv_desc_slot: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     v_desc_slot: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    prefetched_nvfp4: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+
+    def __post_init__(self) -> None:
+        """Prepare the shape-stable raw-row payload before task dispatch."""
+        super().__post_init__()
+        self.prefetched_nvfp4 = TaskLocalVariable(
+            dtype=cutlass.Array,
+            default_factory=lambda: cutlass.Array(
+                Int32, NVFP4_ROW_PACKET_WORDS, space=cutlass.AddressSpace.rmem
+            ),
+            docs="Packed row retained after releasing raw SMEM.",
+        )
 
     def _init_placeholder_state(self) -> None:
         """Create placeholder split K/V SMEM and descriptor state."""
@@ -1511,6 +1527,66 @@ class SmemKvTileResource(DecodeGenResourceBase):
         stage_offset_bytes = stage_info.stage_idx * Int32(tile_bytes)
         return self._desc_base.advance_start_address(stage_offset_bytes)
 
+    @cute.jit
+    def load_nvfp4_row(
+        self, stage_info: StageInfo, *, head_dim_stage_idx: Int32 | int
+    ) -> cutlass.Array:
+        """Read a complete packed row and its scale factors before releasing SMEM."""
+        cfg = self.cfg
+        is_v = self.kv_kind == KV_KIND_V
+        row = _decode_gen_task_cache(stage_info)[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+        src_base = self._stage_base(stage_info)
+        src_sf_base = self._sf_stage_base(stage_info.stage_idx)
+        src_words = cutlass.Array(
+            src_base.data_ptr(),
+            dtype=Int32,
+            shape=(cfg.smem_kv_storage_tile_bytes // 4,),
+            addrspace=3,
+        )
+        scale_words = load_nvfp4_row_scale_words(
+            src_sf_base,
+            row,
+            head_dim_stage_idx,
+            sf_bytes_per_token=cfg.smem_kv_sf_bytes_per_token,
+            sf_tile_bytes=cfg.smem_kv_sf_tile_bytes,
+            is_v=is_v,
+        )
+        src_swizzle = (row >> Int32(1)) & Int32(3)
+        # Sixteen packed words and two four-scale words survive raw-slot release.
+        packet = cutlass.Array(
+            Int32, NVFP4_ROW_PACKET_WORDS, space=cutlass.AddressSpace.rmem
+        )
+        packet[NVFP4_ROW_PACKED_WORDS] = scale_words[0]
+        packet[NVFP4_ROW_PACKED_WORDS + 1] = scale_words[1]
+        for chunk in cutlass.range_constexpr(4):
+            words = (
+                src_words.data_ptr()
+                + row * Int32(16)
+                + ((Int32(chunk) ^ src_swizzle) << Int32(2))
+            ).load(count=4, alignment=16)
+            for word in cutlass.range_constexpr(4):
+                packet[chunk * 4 + word] = words[word]
+        return packet
+
+    @consumer_work(returns=prefetched_nvfp4)
+    @cute.jit
+    def prefetch_nvfp4_row(
+        self, stage_info: StageInfo, *, head_dim_stage_idx: Constexpr[int]
+    ) -> cutlass.Array:
+        """Read a HEAD/TAIL raw stage into registers for the converter."""
+        # ConsWork: finish every raw read before the schedule releases this slot.
+        return self.load_nvfp4_row(stage_info, head_dim_stage_idx=head_dim_stage_idx)
+
+    @consumer_work(returns=prefetched_nvfp4)
+    @cute.jit
+    def prefetch_nvfp4_loop_row(self, stage_info: StageInfo) -> cutlass.Array:
+        """Read one of the two D128 slices of a steady-state D256 tile."""
+        # ConsWork: one loop step consumes one raw FIFO stage; low bit selects its slice.
+        stage = (Int32(stage_info.loop_offset) - Int32(stage_info.loop_start)) & Int32(
+            1
+        )
+        return self.load_nvfp4_row(stage_info, head_dim_stage_idx=stage)
+
     @consumer_work(returns=kv_desc_slot)
     @cute.jit
     def kv_desc(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
@@ -1597,6 +1673,8 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             return self.encoded_locator_window_tiles * pages_per_tile
         if self.stages_encoded_locators_per_tile:
             return pages_per_tile
+        if self.cfg.runtime_page_window:
+            return self.cfg.runtime_page_window_pages
         return pages_per_tile if self.stage_page_ids_per_tile else 32
 
     @property
@@ -1761,14 +1839,12 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         """
         cfg = self.cfg
         pages_per_tile = cfg.tile_size_kv // cfg.num_tokens_per_page
-        if cutlass.const_expr(self.holds_encoded_locator_window):
+        if cutlass.const_expr(
+            self.holds_encoded_locator_window or cfg.runtime_page_window
+        ):
             offset = self.consumer_work_stage * Int32(
                 self.page_ids_per_stage
             ) + local_tile_idx * Int32(pages_per_tile)
-        elif cutlass.const_expr(cfg.runtime_page_window):
-            offset = self.consumer_work_stage * Int32(32) + local_tile_idx * Int32(
-                pages_per_tile
-            )
         elif cutlass.const_expr(
             self.stage_page_ids_per_tile or self.stages_encoded_locators_per_tile
         ):
@@ -1805,14 +1881,12 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         """Locate a staged ID independently of the K/V data-buffer stage."""
         cfg = self.cfg
         pages_per_tile = cfg.tile_size_kv // cfg.num_tokens_per_page
-        if cutlass.const_expr(self.holds_encoded_locator_window):
+        if cutlass.const_expr(
+            self.holds_encoded_locator_window or cfg.runtime_page_window
+        ):
             offset = self.consumer_work_stage * Int32(
                 self.page_ids_per_stage
             ) + local_tile_idx * Int32(pages_per_tile)
-        elif cutlass.const_expr(cfg.runtime_page_window):
-            offset = self.consumer_work_stage * Int32(32) + local_tile_idx * Int32(
-                pages_per_tile
-            )
         elif cutlass.const_expr(
             self.stage_page_ids_per_tile or self.stages_encoded_locators_per_tile
         ):
@@ -2527,21 +2601,29 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                     Int32(task_cache[_TASK_CACHE_KV_RAW_TILE_BASE]) * pages_per_tile
                 )
             if page_warp_rank == Int32(0):
-                grouped_logical_page_idx = cute.math.min(
-                    grouped_base_page_idx + lane_idx, page_idx_ub
-                )
-                grouped_smem_offset = stage_info.stage_idx * Int32(32) + lane_idx
-                # Evicted pages can be reused under a different storage dtype.
-                # TensorMap zero-fill keeps masked NaNs out of the PV MMA.
-                page_is_live = cutlass.Boolean(True)
-                if cutlass.const_expr(cfg.use_sliding_window_causal):
-                    page_is_live = grouped_logical_page_idx >= page_idx_lb
-                page_id = Int32(-1)
-                if page_is_live:
-                    page_id = Int32(
-                        page_idx_kv[page_table_offset + grouped_logical_page_idx]
+                for window_part in cutlass.range_constexpr(
+                    self.page_ids_per_stage // 32
+                ):
+                    grouped_logical_page_idx = cute.math.min(
+                        grouped_base_page_idx + lane_idx + Int32(window_part * 32),
+                        page_idx_ub,
                     )
-                smem_page_offsets[grouped_smem_offset] = page_id
+                    grouped_smem_offset = (
+                        stage_info.stage_idx * Int32(self.page_ids_per_stage)
+                        + lane_idx
+                        + Int32(window_part * 32)
+                    )
+                    # Evicted pages can be reused under a different storage dtype.
+                    # TensorMap zero-fill keeps masked NaNs out of the PV MMA.
+                    page_is_live = cutlass.Boolean(True)
+                    if cutlass.const_expr(cfg.use_sliding_window_causal):
+                        page_is_live = grouped_logical_page_idx >= page_idx_lb
+                    page_id = Int32(-1)
+                    if page_is_live:
+                        page_id = Int32(
+                            page_idx_kv[page_table_offset + grouped_logical_page_idx]
+                        )
+                    smem_page_offsets[grouped_smem_offset] = page_id
 
     @producer_work
     @cute.jit

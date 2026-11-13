@@ -28,6 +28,7 @@ import math
 import cutlass.utils as utils
 from cutlass import BFloat16, Float16, Float32, Float4E2M1FN, Float8E4M3FN, Int8
 
+from ..._hardware import is_sm107_compile_target
 from ...sage.config import SAGE_K_BLOCK_SIZES, is_power_of_two
 from ..._block_sparse.common import (
     _block_sparse_kv_atom_size,
@@ -59,6 +60,7 @@ from .fmha_decode_constants import (
     FP8_P_PACKED_REGS_PER_Q_REPEAT,
     FP16_OUTPUT_ELEMENTS_PER_REG_GROUP,
     FP16_P_PACKED_REGS_PER_Q_REPEAT,
+    FULL_GRID_SPLIT_MIN_TOKENS_PER_CTA,
     KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES,
     KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES,
     KV_TILE_256_SHARED_FIFO_STAGES,
@@ -284,6 +286,17 @@ _GROUPED_KEEPS_PAGED_FP8_PROFILES = {
     for output_dtype in (Float16, BFloat16, Float8E4M3FN)
 }
 
+# FP8-Q/NVFP4-KV Keeps Q64 converts K/V into FP8 SMEM tiles with one converter
+# warp group per KV instance at D128, or separate K and V groups at D256.
+_GROUPED_KEEPS_PAGED_NVFP4_PROFILES = {
+    profile
+    for output_dtype in (Float16, BFloat16)
+    for profile in (
+        (Float8E4M3FN, Float4E2M1FN, Float4E2M1FN, output_dtype, 128, 0, 2, 2),
+        (Float8E4M3FN, Float4E2M1FN, Float4E2M1FN, output_dtype, 256, 128, 1, 1),
+    )
+}
+
 # Automatic selection retains the established cost-model recipes. A working
 # output epilogue alone does not qualify another MMA layout for that model;
 # explicit kernel configurations can use the wider capability matrix above.
@@ -291,6 +304,8 @@ _AUTO_GROUPED_KEEPS_PAGED_FP8_PROFILES = {
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 64, 0, 2, 2),
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 128, 0, 2, 2),
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 256, 128, 1, 1),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float16, 128, 0, 2, 2),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, BFloat16, 128, 0, 2, 2),
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float16, 256, 128, 1, 1),
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, BFloat16, 256, 128, 1, 1),
 }
@@ -448,8 +463,11 @@ _GROUPED_Q_MMA_TILES = (
     ("swaps_mma_ab", 8),
     ("swaps_mma_ab", 16),
     ("swaps_mma_ab", 32),
+    ("swaps_mma_ab", 48),
     ("keeps_mma_ab", 64),
     ("keeps_mma_ab", 128),
+    ("swaps_mma_ab", 64),
+    ("swaps_mma_ab", 128),
 )
 
 # Empirical GQA-generation factors derived from matched reference measurements.
@@ -464,18 +482,36 @@ _GROUPED_Q_MMA_TILES = (
 # TileQ128 is scored against the Q64/KV256 CTA that the Q64 factor stands for
 # after the KV256 promotion rather than with the shared TileQ128 factor.
 _GROUPED_Q_MAINLOOP_COST = {
-    8: {8: 1.0, 16: 1.2, 32: 1.48, 64: 1.68, 128: 2.2},
-    16: {8: 1.0, 16: 1.2, 32: 1.48, 64: 1.68, 128: 3.2},
+    8: {8: 1.0, 16: 1.2, 32: 1.48, 48: 1.4, 64: 1.68, 128: 2.2},
+    16: {8: 1.0, 16: 1.2, 32: 1.48, 48: 1.4, 64: 1.68, 128: 3.2},
 }
 _GROUPED_Q_REDUCTION_COST = {
-    8: {8: 1.0, 16: 1.03, 32: 1.08, 64: 1.2, 128: 1.32},
-    16: {8: 1.0, 16: 1.03, 32: 1.08, 64: 1.2, 128: 1.32},
+    8: {8: 1.0, 16: 1.03, 32: 1.08, 48: 1.15, 64: 1.2, 128: 1.32},
+    16: {8: 1.0, 16: 1.03, 32: 1.08, 48: 1.15, 64: 1.2, 128: 1.32},
 }
 _GROUPED_Q_REDUCTION_SEQ_LEN_FACTOR = 128.0
 
+# GB300 NVFP4 measurements at B128/KV128K/Q4,Q6,Q8,Q12. Conversion and
+# softmax include the wide Swaps profiles; revalidate their costs after changes
+# to staging or register grants.
+# Keeps Q64 with SMEM-converted NVFP4 K/V measured 1.26-1.50x (D128) and
+# 1.05-1.10x (D256) faster than the transformed Swaps Q64 profile at 64
+# grouped rows on GB300.
+_GROUPED_Q_KEEPS_TRANSFORM_MAINLOOP_COST = {(128, 64): 1.65, (256, 64): 1.56}
+_GROUPED_Q_TRANSFORM_MAINLOOP_COST = {
+    (128, 48): 1.4,
+    (128, 64): 2.1,
+    (128, 128): 5.3,
+    (256, 128): 3.8,
+}
+
 
 def enumerate_grouped_q_mma_candidates(
-    *, heads_q_per_kv: int, seq_len_q: int, swaps_only: bool = False
+    *,
+    heads_q_per_kv: int,
+    seq_len_q: int,
+    swaps_only: bool = False,
+    include_nvfp4_tiles: bool = False,
 ) -> tuple[GroupedQMmaCandidate, ...]:
     """Return grouped-Q candidates without applying launch policy.
 
@@ -493,6 +529,8 @@ def enumerate_grouped_q_mma_candidates(
 
     candidates = []
     for variant, tile_size_q in _GROUPED_Q_MMA_TILES:
+        if tile_size_q == 48 and not include_nvfp4_tiles:
+            continue
         if swaps_only and variant != "swaps_mma_ab":
             continue
         if tile_size_q < heads_q_per_kv:
@@ -832,6 +870,15 @@ class FmhaDecodeConfig:
     # type. Finalization preserves its configured role order while compacting.
     transform_kv_warp_idx: int = 14
     transform_kv_num_warps: int = 2
+    # The dual K/V transform (uses_dual_kv_transform) converts V in its own
+    # warp group, after the K converter at transform_kv_warp_idx.
+    transform_v_warp_idx: int = 16
+    transform_v_num_warps: int = 4
+    # Keeps two-instance NVFP4 (uses_per_inst_smem_transform) converts KV
+    # instance 1 in its own warp group, after instance 0's at
+    # transform_kv_warp_idx.
+    transform_kv1_warp_idx: int = 20
+    transform_kv1_num_warps: int = 4
     # PaddingTask placement is derived after selecting the active task roles.
     # Each active warp group is compacted first, then its unused tail warps are
     # assigned to the corresponding padding task. Persistent layouts retain
@@ -871,6 +918,25 @@ class FmhaDecodeConfig:
     def uses_scattered_page_route(self) -> bool:
         """Whether a prepared sparse route supplies page-fragment locators."""
         return self.use_q_token_kv_block_sparse_route
+
+    @property
+    def uses_prefetched_smem_nvfp4_transform(self) -> bool:
+        """Whether dense SM107 D256 conversion releases raw rows before FP8 work."""
+        return (
+            is_sm107_compile_target()
+            and self.uses_dual_smem_transform
+            and self.headdim == 256
+            and self.num_tokens_per_page == self.tile_size_kv
+            and not self.use_block_sparse
+            and not self.uses_scattered_page_route
+        )
+
+    @property
+    def runtime_page_window_pages(self) -> int:
+        """Capacity of the existing CTA-relative runtime page-window profile."""
+        if self.uses_prefetched_smem_nvfp4_transform:
+            return 128
+        return 32
 
     @property
     def uses_page_offsets_task(self) -> bool:
@@ -969,9 +1035,54 @@ class FmhaDecodeConfig:
     # Select profiles whose task roles hand registers between producer and compute
     # warps.
     @property
+    def uses_x4_nvfp4_transform_loads(self) -> bool:
+        """Whether NVFP4 K/V conversion issues one x4 LDSM per 16 columns.
+
+        An x4 load covers a warp's 32 K rows or both 16-column V blocks.
+        Bounded converter grants use x4 to reduce address state; narrow
+        profiles retain x2 to keep more loads in flight.
+        """
+        transform_regs = self.transform_kv_task_num_registers
+        return (
+            self.store_transformed_kv_in_tmem
+            and transform_regs is not None
+            and transform_regs <= 128
+        )
+
+    @property
+    def uses_large_q_swaps_tile(self) -> bool:
+        """Whether this is a one-instance Swaps profile with tile_size_q >= 48.
+
+        These tiles keep the whole grouped Q band in one CTA. They share a
+        register plan, bounded P/O fragments, and a D128 output staging band.
+        """
+        return (
+            not self.use_keeps_mma_ab
+            and self.tile_size_q >= 48
+            and self.num_insts_kv == 1
+        )
+
+    @property
+    def skips_unchanged_max_work(self) -> bool:
+        """Whether Q48+ one-instance Swaps skips work when no row maximum rises.
+
+        Softmax omits a warp's max reductions and atomics when none of its
+        candidates exceeds the running maximum, and correction leaves O in
+        TMEM when every scale would be exactly one. Both are exact.
+        """
+        return self.uses_large_q_swaps_tile and not self.streams_scores_in_q32_bands
+
+    @property
+    def softmax_stats_payload_groups(self) -> int:
+        """Native TMEM vectors pad the twelve Q48 scale groups to sixteen."""
+        return 1 << (self.num_softmax_scale_groups - 1).bit_length()
+
+    @property
     def uses_task_register_reallocation(self) -> bool:
+        """Whether tasks redistribute the CTA register pool with setmaxnreg."""
         if (
             self.use_transform_kv
+            or self.uses_large_q_swaps_tile
             or (self.use_keeps_mma_ab and self.tile_size_q == 128)
             # Persistent grouped masks keep additional routing/softmax state
             # live. Reuse the same CTA-pool budgets to give it register headroom.
@@ -1006,7 +1117,9 @@ class FmhaDecodeConfig:
         """
         if not self.uses_task_register_reallocation:
             return None
-        if self.use_transform_kv:
+        if self.uses_large_q_swaps_tile:
+            preferred = 200
+        elif self.use_transform_kv:
             preferred = 168 if self.headdim == 64 and self.num_insts_kv != 1 else 184
         else:
             # Full Q128 rows keep 128 scores live through masking and P
@@ -1037,6 +1150,14 @@ class FmhaDecodeConfig:
             transform_regs = self.transform_kv_task_num_registers
             assert transform_regs is not None
             available -= self.transform_kv_num_warps * (transform_regs - producer_regs)
+            if self.uses_dual_kv_transform:
+                available -= self.transform_v_num_warps * (
+                    self.transform_v_task_num_registers - producer_regs
+                )
+            if self.uses_second_smem_converter:
+                available -= self.transform_kv1_num_warps * (
+                    transform_regs - producer_regs
+                )
         # Only whole padding warpgroups may donate independently. Padding
         # beside active tasks must execute the same setmaxnreg as its peers.
         for wg_idx in range(MAX_WARP_GROUPS):
@@ -1049,8 +1170,15 @@ class FmhaDecodeConfig:
 
     @property
     def correction_task_num_registers(self) -> int | None:
+        """Correction warps' setmaxnreg grant, or None without reallocation."""
         if not self.uses_task_register_reallocation:
             return None
+        if self.uses_dual_kv_transform:
+            return 112
+        if self.uses_large_q_swaps_tile:
+            # Q48+ stats plus streamed O need more than the Q32 88-register
+            # grant. Together with Softmax200/Transform128 this fits one CTA.
+            return 152
         if self.use_transform_kv:
             return 88
         # Runtime partition metadata extends the full score tile's live ranges.
@@ -1068,21 +1196,43 @@ class FmhaDecodeConfig:
 
     @property
     def mma_load_task_num_registers(self) -> int | None:
+        """MMA/load/page-offset warps' setmaxnreg grant, or None without reallocation."""
         if not self.uses_task_register_reallocation:
             return None
+        if self.uses_large_q_swaps_tile:
+            return 32
         if self.use_transform_kv and self.headdim == 64 and self.num_insts_kv != 1:
             return 88
         return 56
 
     @property
     def transform_kv_task_num_registers(self) -> int | None:
+        """K/V (or dual-transform K) converter grant, or None without a transform."""
         if not self.use_transform_kv:
             return None
+        if self.uses_fast_smem_nvfp4_transform:
+            # Early raw release keeps the packed row live across the output
+            # acquire. The larger grant still leaves Softmax its preferred budget.
+            return 72 if self.uses_prefetched_smem_nvfp4_transform else 56
+        if self.uses_dual_kv_transform:
+            return 80
+        if self.uses_large_q_swaps_tile:
+            return 128
         if self.num_insts_kv == 1 or self.store_transformed_kv_in_tmem:
             return 184
         if self.headdim == 64:
             return 88
         return 56
+
+    @property
+    def transform_kv1_task_num_registers(self) -> int | None:
+        """Register grant of the instance-1 converter warps."""
+        return self.transform_kv_task_num_registers
+
+    @property
+    def transform_v_task_num_registers(self) -> int:
+        """Register grant of the V converter warps in the dual K/V transform."""
+        return 80
 
     def padding_task_num_registers(self, warp_idx: int, num_warps: int) -> int | None:
         """Release unused registers only from complete padding warpgroups."""
@@ -1243,6 +1393,25 @@ class FmhaDecodeConfig:
         return self.tile_size_kv * self.smem_kv_sf_bytes_per_token
 
     @property
+    def swizzles_v_scale_factors(self) -> bool:
+        """Whether V scale factors are staged with the 128 B TMA swizzle.
+
+        The TMEM V converter reads one word per four-token group and lane
+        group. At D512 each folded group row is 128 B, so the four groups a
+        warp reads at once share one bank and the loads replay four times;
+        the swizzle moves each row's 16 B chunks to distinct banks. Every page
+        fragment must cover whole 1024 B swizzle atoms (pages of 32+ tokens).
+        GB300 B128/KV128K: sQ4 3.78 -> 3.36 ms, sQ8 3.90 -> 3.63 ms.
+        """
+        return (
+            self.use_nvfp4_kv
+            and self.store_transformed_kv_in_tmem
+            and self.headdim == 512
+            and self.headdim // 16 * self.sf_tma_reshape_factor == 128
+            and self.num_tokens_per_page * (self.headdim // 16) % 1024 == 0
+        )
+
+    @property
     def sf_tma_reshape_factor(self) -> int:
         """Token-fold factor that widens the NVFP4 SF TMA inner box to 128 B."""
         sf_per_token = self.headdim // 16
@@ -1378,7 +1547,9 @@ class FmhaDecodeConfig:
             )
         return (
             total_cols
-            + self.tmem_transformed_kv_stage_cols * self.transformed_kv_stages
+            + self.tmem_transformed_kv_stage_cols
+            * self.transformed_kv_stages
+            * (2 if self.uses_dual_kv_transform else 1)
         )
 
     @property
@@ -1777,6 +1948,91 @@ class FmhaDecodeConfig:
         return 32
 
     @property
+    def streams_scores_in_q32_bands(self) -> bool:
+        """Whether FP8 Q128 Swaps streams scores through TMEM in Q32 bands.
+
+        Softmax masks and reduces one Q32 band at a time and writes the masked
+        scores back; P reloads them, so the S stage stays held until P is done.
+        """
+        return (
+            not self.use_keeps_mma_ab
+            and self.tile_size_q == 128
+            and self.num_insts_kv == 1
+            and self.use_fp8_pv
+        )
+
+    @property
+    def uses_fast_smem_nvfp4_transform(self) -> bool:
+        """Whether NVFP4 K/V converts row-per-thread into FP8 SMEM tiles.
+
+        Each of 128 converter threads owns one KV row of a 128x128 stage. It
+        reads the dense packed row (64-byte rows, 64B TMA swizzle) with 16-byte
+        loads, scales each 16-column block, and writes 16-byte chunks of the
+        128B-swizzled K-major FP8 row read by the Keeps QK and PV descriptors.
+        Packed-multiply targets expand the nibbles to bytes; software
+        conversion retains dense pairs for f16x2 conversion.
+        """
+        return (
+            self.use_keeps_mma_ab
+            and self.use_transform_kv
+            and not self.store_transformed_kv_in_tmem
+            and self.use_nvfp4_kv
+            and self.use_fp8_qk
+            and self.head_dim_kv_stage == 128
+            and self.tile_size_kv == 128
+            and self.transform_kv_num_warps == 4
+        )
+
+    @property
+    def uses_per_inst_smem_transform(self) -> bool:
+        """Whether each Keeps KV instance has its own converter and FP8 ring.
+
+        Instance 0 (even KV tiles) converts in the transform_kv warp group and
+        instance 1 (odd tiles) in the transform_kv1 group. Each converter runs
+        a serial load-convert-store-fence chain per operand; two of them keep
+        the MMA fed. Each ring needs two slots, matching its K(i+2), V(i)
+        production order.
+        """
+        return self.uses_fast_smem_nvfp4_transform and self.num_insts_kv == 2
+
+    @property
+    def uses_dual_smem_transform(self) -> bool:
+        """Whether one-instance Keeps converts K and V in separate groups.
+
+        The staged D256 profile has one KV instance; its K converter
+        (transform_kv warps) and V converter (transform_kv1 warps) each fill
+        their own FP8 ring, replacing the raw K and V rings at the MMA.
+        """
+        return self.uses_fast_smem_nvfp4_transform and self.num_insts_kv == 1
+
+    @property
+    def uses_second_smem_converter(self) -> bool:
+        """Whether a second SMEM converter warp group (transform_kv1) runs."""
+        return self.uses_per_inst_smem_transform or self.uses_dual_smem_transform
+
+    @property
+    def uses_dual_kv_transform(self) -> bool:
+        """Whether K and V convert in separate warp groups and TMEM FIFOs.
+
+        The schedule itself is head-dimension generic. It is selected only at
+        D512, where four head-dimension stages per KV tile make conversion the
+        bottleneck; D128/D256 Q64/Q128 measured no gain on GB300.
+        """
+        return (
+            self.headdim == 512
+            and self.tile_size_q >= 64
+            and self.num_insts_kv == 1
+            and self.use_fp8_q
+            and self.use_nvfp4_kv
+            and self.store_transformed_kv_in_tmem
+            and not self.use_keeps_mma_ab
+            and self.groups_tokens_heads_q
+            and self.use_paged_kv
+            and not self.use_persistent_scheduler
+            and not self.use_fp8_output
+        )
+
+    @property
     def softmax_score_fragment_regs(self) -> int:
         """Return the maximum score fragment kept live in registers.
 
@@ -1789,6 +2045,9 @@ class FmhaDecodeConfig:
         """
         if self.streams_tmem_p_fragments:
             return self.keeps_score_chunk_regs
+        if self.streams_scores_in_q32_bands:
+            # Streamed Swaps keeps one Q32 band of scores live at a time.
+            return 32
         return self.num_s_regs_per_thread
 
     @property
@@ -2007,6 +2266,17 @@ class FmhaDecodeConfig:
         return self.num_head_dim_stages_kv * self.head_dim_kv_stage
 
     @property
+    def swaps_output_staging_head_dim(self) -> int:
+        """Head-dimension width of the final-O SMEM staging buffer.
+
+        Q48+ one-instance Swaps drains one D128 band of O before staging the
+        next, so its scratch covers at most 128 columns.
+        """
+        if self.uses_large_q_swaps_tile:
+            return min(self.swaps_output_head_dim, 128)
+        return self.swaps_output_head_dim
+
+    @property
     def num_fp16_output_regs(self) -> int:
         """Return packed 16-bit output registers owned by each correction lane."""
         return max(
@@ -2046,6 +2316,16 @@ class FmhaDecodeConfig:
     @property
     def inferred_kv_stages(self) -> int:
         """Return the deepest K/V ring that fits the shared-memory budget."""
+        return self.infer_kv_stages(cap_kv_staging=True)
+
+    def infer_kv_stages(self, *, cap_kv_staging: bool) -> int:
+        """Return the deepest K/V ring that fits the shared-memory budget.
+
+        ``cap_kv_staging`` also bounds the ring by ``MAX_KV_STAGE_SMEM_KIB``,
+        the conservative topology-independent K/V share; without it only the
+        complete ``TOTAL_SMEM_BUDGET_KIB`` budget minus the fixed buffers
+        applies.
+        """
         q_dtype_bits = self.q_dtype_bytes * BITS_PER_BYTE
         q_row_bytes = (
             (
@@ -2064,7 +2344,7 @@ class FmhaDecodeConfig:
         if not self.use_keeps_mma_ab:
             fixed_bytes += (
                 self.tile_size_q
-                * self.swaps_output_head_dim
+                * self.swaps_output_staging_head_dim
                 * max(self.o_dtype_bytes, 2)
             )
         if self.use_paged_kv:
@@ -2100,10 +2380,11 @@ class FmhaDecodeConfig:
 
         # Reserve common buffers for every profile, leaving hardware SMEM
         # above this budget for alignment, barriers, and scheduler state.
-        kv_budget_bytes = min(
-            MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB,
-            TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB - fixed_bytes,
-        )
+        kv_budget_bytes = TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB - fixed_bytes
+        if cap_kv_staging:
+            kv_budget_bytes = min(
+                MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB, kv_budget_bytes
+            )
         inferred_stages = max(1, kv_budget_bytes * BITS_PER_BYTE // kv_tile_bits)
         return inferred_stages
 
@@ -2516,6 +2797,11 @@ class FmhaDecodeConfig:
         """
         if not self.supports_grouped_keeps:
             return False
+        if self.uses_per_inst_smem_transform and not self.q_tiles_are_full:
+            # With inactive rows, D128 NVFP4 Keeps adds the row-mask path to
+            # two per-instance converters and overflows the instruction cache
+            # (GB300 B128/KV128K/sQ7: 1.48 ms vs 1.27 ms for Swaps Q64).
+            return False
         profile = self._grouped_keeps_profile_key
         if (
             self.use_paged_kv
@@ -2588,6 +2874,36 @@ class FmhaDecodeConfig:
             and profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES
             and self.supports_grouped_keeps
             and not (self.uses_staged_one_inst_tmem_p and self.tile_size_q == 64)
+        )
+
+    @property
+    def uses_guarded_grouped_swaps_output_rows(self) -> bool:
+        """Whether inactive transformed-NVFP4 Swaps rows skip score masking.
+
+        As with grouped Keeps, every SwapsMmaAb Q row is an independent score
+        column: its max/sum scratch slot, P column, O column and correction
+        scale belong to that row alone, and direct output, split scratch and
+        reduction publication already guard row validity. Inactive grouped
+        rows load zero-filled (or another request's finite) Q, so they cannot
+        perturb a valid row. Masking them cost 48 selects per score tile on
+        the D128 Q48 softmax, its bottleneck (GB300 B128/KV128K/sQ6: 1.18 ->
+        1.03 ms, bitwise-identical output). D512 keeps the mask: its
+        instruction-cache-bound Q64 schedule measured 1.5% slower without it.
+        """
+        return (
+            self.headdim <= 256
+            and not self.use_keeps_mma_ab
+            and self.use_transform_kv
+            and self.use_nvfp4_kv
+            and self.use_fp8_q
+            and self.use_paged_kv
+            and self.groups_tokens_heads_q
+            and (
+                not self.use_variable_seqlens_q
+                or (self.uniform_query_offsets and not self.use_sage_attention)
+            )
+            and not self.use_block_sparse
+            and not self.use_cluster_smem_reduction
         )
 
     @property
@@ -2691,6 +3007,7 @@ class FmhaDecodeConfig:
         return (
             self.q_tiles_need_row_mask
             and not self.uses_guarded_grouped_keeps_output_rows
+            and not self.uses_guarded_grouped_swaps_output_rows
         )
 
     @property
@@ -3300,6 +3617,27 @@ class FmhaDecodeConfig:
                 and not self.use_cluster_smem_reduction
             )
 
+        if profile in _GROUPED_KEEPS_PAGED_NVFP4_PROFILES:
+            # Fixed grouped paged Q, dense or causal, direct or GMEM split.
+            return (
+                self.use_paged_kv
+                and self.tile_size_q == 64
+                and self.uses_second_smem_converter
+                and (
+                    self.is_multi_token_q
+                    or (
+                        is_sm107_compile_target()
+                        and self.headdim == 256
+                        and self.out_dtype == BFloat16
+                    )
+                )
+                and not self.use_variable_seqlens_q
+                and not self.use_persistent_scheduler
+                and not self.use_sliding_window_causal
+                and not self.use_attention_sinks
+                and self.mask_type in (DENSE, CAUSAL)
+                and (direct or self.has_valid_split_kv_fanout)
+            )
         paged_16bit_q128 = (
             self.tile_size_q == 128
             and profile in _GROUPED_KEEPS_PAGED_16BIT_Q128_PROFILES
@@ -3574,9 +3912,41 @@ def _finalize_static_decode_config(
     if not use_keeps_mma_ab and cfg.headdim > 128:
         _set_if_implicit(cfg, "head_dim_per_stage_kv", 128, explicit_fields)
         _set_if_implicit(cfg, "num_insts_kv", 2, explicit_fields)
-    if cfg.use_transform_kv and cfg.use_paged_kv:
+    if not use_keeps_mma_ab and cfg.tile_size_q >= 48:
+        # Q48+ Swaps tiles share the TMEM budget with staged O and transformed
+        # K/V. One KV instance keeps the full Q group in one CTA.
+        _set_if_implicit(cfg, "num_insts_kv", 1, explicit_fields)
+        _set_if_implicit(cfg, "q_stages", 1, explicit_fields)
+        _set_if_implicit(
+            cfg, "tmem_stats_cols", max(32, cfg.tile_size_q // 2), explicit_fields
+        )
+    if cfg.use_transform_kv and cfg.use_paged_kv and not use_keeps_mma_ab:
         # Force using 1 instances kv to allow more warps for transform kv tasks.
         _set_if_implicit(cfg, "num_insts_kv", 1, explicit_fields)
+    if (
+        use_keeps_mma_ab
+        and cfg.use_transform_kv
+        and cfg.use_nvfp4_kv
+        and cfg.use_fp8_q
+        and cfg.headdim == 128
+    ):
+        # Two Keeps instances, each with a four-warp converter group after
+        # the four task warp groups (24 warps in total).
+        _set_if_implicit(cfg, "num_insts_kv", 2, explicit_fields)
+        _set_if_implicit(cfg, "transform_kv_warp_idx", 16, explicit_fields)
+        _set_if_implicit(cfg, "transform_kv_num_warps", 4, explicit_fields)
+    if (
+        use_keeps_mma_ab
+        and cfg.use_transform_kv
+        and cfg.use_nvfp4_kv
+        and cfg.use_fp8_q
+        and cfg.headdim == 256
+    ):
+        # One staged Keeps instance leaves warp group 3 free for the K
+        # converter; the V converter follows in warp group 4 (20 warps).
+        _set_if_implicit(cfg, "transform_kv_warp_idx", 12, explicit_fields)
+        _set_if_implicit(cfg, "transform_kv_num_warps", 4, explicit_fields)
+        _set_if_implicit(cfg, "transform_kv1_warp_idx", 16, explicit_fields)
 
     if use_keeps_mma_ab:
         tile_size_q = cfg.tile_size_q if "tile_size_q" in explicit_fields else 64
@@ -3638,7 +4008,10 @@ def _finalize_static_decode_config(
 
     # Derive transform placement after the profile has selected its KV
     # instance count: one-instance mixed decode reuses Softmax1's warp group.
-    uses_full_wg_transform = cfg.use_transform_kv and cfg.num_insts_kv == 1
+    # Keeps places its SMEM converters after the task warp groups instead.
+    uses_full_wg_transform = (
+        cfg.use_transform_kv and cfg.num_insts_kv == 1 and not cfg.use_keeps_mma_ab
+    )
     if uses_full_wg_transform:
         _set_if_implicit(cfg, "transform_kv_warp_idx", 4, explicit_fields)
         _set_if_implicit(cfg, "transform_kv_num_warps", 4, explicit_fields)
@@ -3665,15 +4038,69 @@ def _finalize_static_decode_config(
             "transformed_kv_stages" not in explicit_fields
             or cfg.transformed_kv_stages == 0
         ):
+            rings = 2 if cfg.uses_dual_kv_transform else 1
+            stage_cols = cfg.tmem_transformed_kv_stage_cols * rings
             cfg.transformed_kv_stages = (
                 TMEM_MAX_ALLOCATION_COLUMNS
                 - cfg.tmem_total_cols
-                + cfg.tmem_transformed_kv_stage_cols * cfg.transformed_kv_stages
+                + stage_cols * cfg.transformed_kv_stages
                 # tmem_total_cols already includes the tmem of transform kv task. drop it
-            ) // cfg.tmem_transformed_kv_stage_cols
+            ) // stage_cols
 
     if cfg.tile_size_kv != 256:
         _set_if_implicit(cfg, "kv_stages", cfg.inferred_kv_stages, explicit_fields)
+    if (
+        cfg.headdim == 512
+        and cfg.use_nvfp4_kv
+        and cfg.store_transformed_kv_in_tmem
+        and not cfg.uses_dual_kv_transform
+        and not cfg.use_keeps_mma_ab
+    ):
+        # One raw ring carries K then V for each of the four head-dimension
+        # stages. A depth of one whole K/V tile (eight stages) keeps the ring
+        # aligned with the converter's K/V order; otherwise use an even depth.
+        # Full rows of NVFP4 scales make the conservative K/V cap stop at
+        # seven. GB300 B128/KV128K: Q8 3.33 -> 3.11 ms, Q16 3.31 -> 3.15 ms
+        # with eight stages, Q32 4.09 -> 4.00 ms with six.
+        tile_stages = 2 * cfg.num_head_dim_stages_kv
+        fitting_stages = cfg.infer_kv_stages(cap_kv_staging=False)
+        _set_if_implicit(
+            cfg,
+            "kv_stages",
+            tile_stages
+            if fitting_stages >= tile_stages
+            else max(2, fitting_stages - fitting_stages % 2),
+            explicit_fields,
+        )
+    if cfg.uses_second_smem_converter:
+        # Keeps uses one Q stage and two FP8 slots per converter ring.
+        # Eight raw stages keep K/V loads ahead of conversion.
+        _set_if_implicit(cfg, "q_stages", 1, explicit_fields)
+        _set_if_implicit(cfg, "kv_stages", 8, explicit_fields)
+        if (
+            "transformed_kv_stages" not in explicit_fields
+            or cfg.transformed_kv_stages == 0
+        ):
+            cfg.transformed_kv_stages = 2
+    if cfg.uses_dual_kv_transform:
+        # Stage one complete KV tile per operand: every head-dimension stage
+        # of K and of V. Each converter then advances a whole tile without
+        # waiting for the other operand's ring (eight stages at D512).
+        _set_if_implicit(
+            cfg, "kv_stages", 2 * cfg.num_head_dim_stages_kv, explicit_fields
+        )
+    elif (
+        cfg.headdim == 256
+        and cfg.tile_size_q == 64
+        and cfg.use_fp8_q
+        and cfg.use_nvfp4_kv
+        and cfg.store_transformed_kv_in_tmem
+        and not cfg.use_keeps_mma_ab
+    ):
+        # Bound the operand FIFO instead of filling every remaining TMEM
+        # column. These depths avoid conversion backpressure on D256.
+        _set_if_implicit(cfg, "transformed_kv_stages", 4, explicit_fields)
+        _set_if_implicit(cfg, "kv_stages", 6, explicit_fields)
 
     if (
         cfg.use_transform_kv
@@ -3681,8 +4108,24 @@ def _finalize_static_decode_config(
         and cfg.transformed_kv_stages == 0
     ):
         # SMEM-backed mixed modes still need a real number of stages.
+        cfg.transformed_kv_stages = min(cfg.kv_stages, 4)
+
+    if (
+        is_sm107_compile_target()
+        and cfg.headdim == 256
+        and cfg.use_nvfp4_kv
+        and cfg.use_fp8_q
+        and cfg.num_insts_kv == 1
+        and (
+            (cfg.store_transformed_kv_in_tmem and cfg.tile_size_q <= 32)
+            or cfg.uses_dual_smem_transform
+        )
+    ):
+        # SM107's extra 100 KiB holds three complete raw K/V tiles. A
+        # whole-tile ring keeps the load lookahead aligned with the
+        # converter's alternating K/V order.
         _set_if_implicit(
-            cfg, "transformed_kv_stages", min(cfg.kv_stages, 4), explicit_fields
+            cfg, "kv_stages", 3 * 2 * cfg.num_head_dim_stages_kv, explicit_fields
         )
 
     # Split-KV mode forbids persistent scheduling. Canonicalize here so
@@ -3858,6 +4301,24 @@ def _active_warp_roles(cfg: FmhaDecodeConfig) -> list[_WarpRole]:
                 cfg.transform_kv_num_warps,
             )
         )
+        if cfg.uses_dual_kv_transform:
+            roles.append(
+                _WarpRole(
+                    "transform_v",
+                    "transform_v_warp_idx",
+                    cfg.transform_v_warp_idx,
+                    cfg.transform_v_num_warps,
+                )
+            )
+        if cfg.uses_second_smem_converter:
+            roles.append(
+                _WarpRole(
+                    "transform_kv1",
+                    "transform_kv1_warp_idx",
+                    cfg.transform_kv1_warp_idx,
+                    cfg.transform_kv1_num_warps,
+                )
+            )
 
     if cfg.use_persistent_scheduler:
         roles.extend(
@@ -4103,13 +4564,18 @@ def enumerate_auto_splits_kv(
     split_kv: bool = True,
     requested_splits_kv: int = -1,
     max_splits_kv: int | None = None,
+    service_waves: int = 1,
+    min_loop_iters_per_split: int = MIN_LOOP_ITERS_PER_SPLIT,
 ) -> tuple[int, ...]:
-    """Enumerate direct and useful split fanouts for an under-filled Q grid.
+    """Enumerate direct and useful split fanouts for the requested wave budget.
 
     All one-wave fanouts and the first capacity-crossing fanout participate in
     the empirical score. The latter is important when a partially filled wave
     cannot be completed by any uniform integer fanout.
     A positive requested fanout is pinned, subject to the same KV-work cap.
+    The default retains the one-wave policy. Q48+ transformed profiles can
+    compare several waves to avoid a mostly empty final wave of a full grid.
+    ``min_loop_iters_per_split`` caps the fanout by the KV work per split.
     """
     if not split_kv:
         return (1,)
@@ -4122,13 +4588,18 @@ def enumerate_auto_splits_kv(
         tile_size_kv=tile_size_kv,
         num_insts_kv=num_insts_kv,
         max_splits_kv=max_splits_kv,
+        min_loop_iters_per_split=min_loop_iters_per_split,
     )
     if requested_splits_kv > 0:
         return (max(1, min(requested_splits_kv, max_by_work)),)
     base_grid = max(1, batch_size * num_heads_kv * num_q_tiles)
-    if base_grid >= service_capacity or max_by_work <= 1:
+    if service_waves <= 0:
+        raise ValueError("service_waves must be positive")
+    if (base_grid >= service_capacity and service_waves == 1) or max_by_work <= 1:
         return (1,)
-    first_full_wave_fanout = (service_capacity + base_grid - 1) // base_grid
+    first_full_wave_fanout = (
+        service_capacity * service_waves + base_grid - 1
+    ) // base_grid
     max_considered = min(
         max_by_work,
         max(first_full_wave_fanout, 2),
@@ -4634,6 +5105,32 @@ def _resolve_grouped_q_launch_candidates(
     except ValueError:
         return ()
     cost_kv_width = _grouped_q_cost_kv_width(probe)
+    fills_wave = batch_size * num_heads_kv * candidate.q_tiles >= service_capacity
+    # A full grid can still waste a partial final wave, so these profiles
+    # also score multi-wave splits instead of forcing every full grid direct.
+    transformed_multi_wave = probe.use_nvfp4_kv and probe.use_fp8_pv
+    sm107_smem_transform = (
+        is_sm107_compile_target()
+        and probe.headdim == 256
+        and probe.out_dtype == BFloat16
+        and probe.uses_fast_smem_nvfp4_transform
+    )
+    multi_wave = (
+        transformed_multi_wave and (candidate.tile_size_q >= 48 or fills_wave)
+    ) or (probe.use_fp8_qkv and fills_wave)
+    min_loop_iters_per_split = MIN_LOOP_ITERS_PER_SPLIT
+    if transformed_multi_wave and candidate.tile_size_q < 48 and fills_wave:
+        # Narrow transformed tiles split a full grid only to trim its final
+        # wave; short splits cannot repay the extra waves.
+        min_loop_iters_per_split = -(
+            -FULL_GRID_SPLIT_MIN_TOKENS_PER_CTA
+            // (cost_tile_size_kv * cost_num_insts_kv)
+        )
+    if probe.use_keeps_mma_ab:
+        # A lone resident CTA cannot hide pipeline fills behind another CTA.
+        # Keep underfilled grids within one wave unless the native SM107
+        # BF16-output converter qualifies for long extra waves.
+        multi_wave = multi_wave and (fills_wave or sm107_smem_transform)
 
     split_candidates = (
         (cfg.splits_kv if cfg.use_split_kv else 1,)
@@ -4649,38 +5146,99 @@ def _resolve_grouped_q_launch_candidates(
             split_kv=split_kv,
             requested_splits_kv=splits_kv,
             max_splits_kv=max_splits_kv,
+            service_waves=8 if multi_wave else 1,
+            min_loop_iters_per_split=min_loop_iters_per_split,
         )
     )
     recipes = []
     for candidate_splits_kv in split_candidates:
+        if (
+            sm107_smem_transform
+            and splits_kv <= 0
+            and not (_LAUNCH_SELECTION_FIELDS & explicit_fields)
+            and not fills_wave
+            and batch_size * num_heads_kv * candidate.q_tiles * candidate_splits_kv
+            > service_capacity
+            and (seq_len_kv + candidate_splits_kv - 1) // candidate_splits_kv
+            < FULL_GRID_SPLIT_MIN_TOKENS_PER_CTA
+        ):
+            # Extra waves must retain enough KV work to amortize each
+            # converter's startup. Keep ordinary one-wave fanouts eligible.
+            continue
+        candidate_reduction_mode = "gmem_reduction"
         if candidate_splits_kv > 1:
             split_probe = deepcopy(probe)
             split_probe.use_split_kv = True
             split_probe.splits_kv = candidate_splits_kv
             split_probe.max_splits_kv = candidate_splits_kv
+            if (
+                not probe.use_q_token_kv_block_sparse_route
+                and batch_size * num_heads_kv * candidate.q_tiles > 2 * service_capacity
+            ):
+                # Sparse routes own their slice; shared-workspace fused
+                # counters reserve two device waves.
+                # Larger grids must qualify a counter-free reducer before
+                # their split recipe can participate in cost selection.
+                split_probe.use_separate_reduction_kernel = True
+                candidate_reduction_mode = "gmem_reduction_with_separate_kernel"
             try:
                 _validate_profile_support(
                     cfg=split_probe,
                     seq_len_q=seq_len_q,
                     num_heads_q=num_heads_q,
                     num_heads_kv=num_heads_kv,
-                    split_kv_mode="gmem_reduction",
+                    split_kv_mode=candidate_reduction_mode,
                 )
             except ValueError:
                 continue
-        recipes.append(
-            make_grouped_q_launch_candidate(
-                candidate,
-                splits_kv=candidate_splits_kv,
-                seq_len_kv=seq_len_kv,
-                tile_size_kv=cost_tile_size_kv,
-                num_insts_kv=cost_num_insts_kv,
-                batch_size=batch_size,
-                num_heads_kv=num_heads_kv,
-                service_capacity=service_capacity,
-                cost_kv_width=cost_kv_width,
-            )
+        recipe = make_grouped_q_launch_candidate(
+            candidate,
+            splits_kv=candidate_splits_kv,
+            seq_len_kv=seq_len_kv,
+            tile_size_kv=cost_tile_size_kv,
+            num_insts_kv=cost_num_insts_kv,
+            batch_size=batch_size,
+            num_heads_kv=num_heads_kv,
+            service_capacity=service_capacity,
+            cost_kv_width=cost_kv_width,
         )
+        if candidate_splits_kv > 1:
+            recipe = replace(recipe, split_kv_mode=candidate_reduction_mode)
+        profile_cost = (
+            _GROUPED_Q_TRANSFORM_MAINLOOP_COST
+            if candidate.variant == "swaps_mma_ab"
+            else _GROUPED_Q_KEEPS_TRANSFORM_MAINLOOP_COST
+        ).get((probe.headdim, candidate.tile_size_q))
+        if (
+            is_sm107_compile_target()
+            and probe.headdim == 256
+            and probe.use_fp8_q
+            and probe.use_nvfp4_kv
+            and candidate.variant == "swaps_mma_ab"
+        ):
+            # SM107 scales unpacked FP4 through f16x2 rather than QMUL4.
+            # The empirical D256 factor accounts for the TMEM converter's
+            # repacking and scaling instructions. Keeps consumes dense pairs
+            # with two converters, so it retains its own cost.
+            # The refreshed factor is qualified for BF16 publication;
+            # other output types retain their established policy calibration.
+            profile_cost = (2.0 if probe.out_dtype == BFloat16 else 1.8) * (
+                profile_cost
+                if profile_cost is not None
+                else _GROUPED_Q_MAINLOOP_COST[cost_kv_width][candidate.tile_size_q]
+            )
+        if profile_cost is not None and probe.use_fp8_q and probe.use_nvfp4_kv:
+            recipe = replace(
+                recipe,
+                modeled_time=recipe.modeled_time
+                + (
+                    profile_cost
+                    - _GROUPED_Q_MAINLOOP_COST[cost_kv_width][candidate.tile_size_q]
+                )
+                * recipe.seq_len_per_cta_kv
+                * recipe.waves,
+            )
+        recipes.append(recipe)
     return tuple(recipes)
 
 
@@ -4701,10 +5259,10 @@ def _apply_auto_grouped_q_mma_config(
 ) -> GroupedQLaunchCandidate | None:
     """Select a legal multi-Q MMA and KV-split recipe within caller constraints.
 
-    SQ1, packed sliding windows, explicit launch modes, and ungrouped layouts
-    retain the existing path. Explicit MMA fields filter candidates; explicit launch
-    fields and fanout controls constrain their launch recipes.
-    Mixed-precision candidates use SwapsMmaAb since Keeps is not supported yet.
+    Qualified transformed SQ1 grids share this search. Packed sliding windows,
+    explicit launch modes, and ungrouped layouts retain the existing path.
+    Explicit MMA fields filter candidates; launch fields constrain their recipes.
+    FP8 Q with NVFP4 K/V at D128/D256 may also compare SMEM-converted Keeps.
 
     Fanout arguments here are caller overrides, before automatic selection.
     Each Q candidate gets its own automatic split search; final KV/reduction
@@ -4712,10 +5270,30 @@ def _apply_auto_grouped_q_mma_config(
     """
     # TODO: Refine short-KV setup/epilogue costs. Wider dense Q tiles can
     # regress even when their current mainloop/reduction proxy scores lower.
+    # The SQ1 path never splits a grid that already fills a wave. Transformed
+    # NVFP4 K/V instead scores multi-wave splits that trim a partial final
+    # wave (D512 B128/Hkv2/KV128K: 3.83 -> 3.32 ms with four splits).
+    # SM107 D256 also compares underfilled Q1 grids for long KV scans.
+    # Below 32K tokens the converter startup can outweigh grouped-Q reuse;
+    # retain the existing single-token launch policy for those short grids.
+    single_token_transform = (
+        seq_len_q == 1
+        and cfg.use_nvfp4_kv
+        and cfg.use_fp8_pv
+        and (
+            batch_size * num_heads_kv >= get_max_active_clusters_for_cluster_size(1)
+            or (
+                is_sm107_compile_target()
+                and cfg.headdim == 256
+                and cfg.out_dtype == BFloat16
+                and seq_len_kv >= 32768
+            )
+        )
+    )
     if (
         not auto_tuner
         or split_kv_mode != "disabled"
-        or seq_len_q <= 1
+        or (seq_len_q <= 1 and not single_token_transform)
         or not cfg.groups_tokens_heads_q
         or not cfg.use_paged_kv
         or (cfg.use_variable_seqlens_q and cfg.use_sliding_window_causal)
@@ -4725,8 +5303,19 @@ def _apply_auto_grouped_q_mma_config(
     candidates = enumerate_grouped_q_mma_candidates(
         heads_q_per_kv=num_heads_q // num_heads_kv,
         seq_len_q=seq_len_q,
-        swaps_only=cfg.use_transform_kv,
+        # FP8-Q/NVFP4-KV D128 also has a Keeps Q64 recipe with SMEM converters.
+        swaps_only=cfg.use_transform_kv
+        and not (cfg.use_nvfp4_kv and cfg.use_fp8_q and cfg.headdim in (128, 256)),
+        include_nvfp4_tiles=cfg.use_nvfp4_kv and cfg.use_fp8_q,
     )
+    if not (cfg.use_transform_kv and cfg.use_fp8_pv):
+        # Preserve established homogeneous Keeps and BF16-compute policies;
+        # Q48+ Swaps costs are qualified for transformed FP8-compute K/V.
+        candidates = tuple(
+            candidate
+            for candidate in candidates
+            if candidate.variant != "swaps_mma_ab" or candidate.tile_size_q <= 32
+        )
     if not candidates:
         return None
     service_capacity = get_max_active_clusters_for_cluster_size(1)
@@ -4764,7 +5353,19 @@ def _apply_auto_grouped_q_mma_config(
         batch_size * num_heads_kv * recipe.mma.q_tiles < service_capacity
         for recipe in supported
     )
-    if has_underfilled_q_grid:
+    has_large_q_tile_transformed_recipe = (
+        cfg.use_nvfp4_kv
+        and cfg.use_fp8_pv
+        and any(recipe.mma.tile_size_q >= 48 for recipe in supported)
+    )
+    has_full_grid_fp8_split_recipe = cfg.use_fp8_qkv and any(
+        recipe.splits_kv > 1 for recipe in supported
+    )
+    if (
+        has_underfilled_q_grid
+        or has_large_q_tile_transformed_recipe
+        or has_full_grid_fp8_split_recipe
+    ):
         selected = select_grouped_q_launch_candidate(supported)
     else:
         # Every legal Q grid already fills the machine, so splitting cannot
@@ -5409,8 +6010,19 @@ def _validate_profile_support(
             "and a four-warp TransformKvTask"
         )
     if use_keeps_mma_ab:
-        if cfg.use_transform_kv:
-            raise ValueError("transform-KV is not supported with KeepsMmaAb for now")
+        if cfg.use_transform_kv and not (
+            cfg.uses_second_smem_converter
+            and cfg.transform_kv1_num_warps == 4
+            and tile_size_q == 64
+            and cfg.transformed_kv_stages > 0
+            and cfg.groups_tokens_heads_q
+        ):
+            # Only the grouped token/head layout has been validated; ungrouped
+            # wide-head groups keep the Swaps head bands.
+            raise ValueError(
+                "KeepsMmaAb transform-KV supports only FP8 Q with NVFP4 K/V at "
+                "grouped Q64 with four-warp D128 per-instance or D256 K/V SMEM converters"
+            )
         if headdim not in (64, 128, 192, 256):
             raise ValueError(
                 "fmha_decode keepsMmaAb supports headdim=64, 128, 192, or 256"
@@ -5572,7 +6184,7 @@ def _validate_profile_support(
         and cfg.supports_reduction_dtypes
         and (seq_len_q == 1 or cfg.use_variable_seqlens_q or use_groups_tokens_heads_q)
         and (
-            tile_size_q in (16, 32)
+            tile_size_q in (16, 32, 48, 64, 128)
             or qualified_fp8_q8_separate_reduction_supported
             # The sparse publisher and standalone reducer both index
             # actual logical rows, so a partial TileQ8 is also valid.
@@ -5583,13 +6195,69 @@ def _validate_profile_support(
     if use_separate_reduction_kernel and not separate_reduction_supported:
         raise ValueError(
             "separate reduction SwapsMmaAb profiles require fixed SQ=1, "
-            "fixed grouped Q, or packed variable Q; tile_size_q in {16,32}, "
+            "fixed grouped Q, or packed variable Q; tile_size_q in {16,32,48,64,128}, "
             "QToken-KvBlock-Sparse-Attention TileQ8, or a fixed FP8 Q8/HqPerKv8 profile "
             "(D128, plus grouped paged-KV D64 or D256 with "
             "FP16/BF16 output); valid reduction dtypes and static split-KV are required"
         )
-    if tile_size_q and tile_size_q not in (8, 16, 32):
-        raise ValueError("fmha_decode SwapsMmaAb supports tile_size_q in {8,16,32}")
+    if tile_size_q and tile_size_q not in (8, 16, 32, 48, 64, 128):
+        raise ValueError(
+            "fmha_decode SwapsMmaAb supports tile_size_q in {8,16,32,48,64,128}"
+        )
+    if tile_size_q == 48 and not (
+        cfg.headdim in (128, 256)
+        and cfg.use_nvfp4_kv
+        and cfg.use_fp8_q
+        and cfg.store_transformed_kv_in_tmem
+        and cfg.threads_per_cta == 512
+        and cfg.tmem_total_cols <= TMEM_MAX_ALLOCATION_COLUMNS
+    ):
+        raise ValueError(
+            "Q48 requires D128/D256 NVFP4 KV with FP8 Q, 512 threads, and a valid TMEM budget"
+        )
+    if tile_size_q >= 48 and (
+        cfg.tmem_o_cols_per_head_dim_stage * cfg.num_head_dim_stages_kv
+        > TMEM_COLUMNS_PER_ROW
+    ):
+        # Each staged PV MMA spans all 128 TMEM rows. Its destination cannot
+        # wrap to another row band: Q128/D512 would need 512 O columns before
+        # reserving scores, stats, or transformed K/V. Use Q64 for this profile.
+        raise ValueError(
+            "SwapsMmaAb tile_size_q >= 48 O stages cannot wrap TMEM rows; "
+            "headDim=512 requires tile_size_q <= 64"
+        )
+    if tile_size_q >= 48 and not (
+        cfg.headdim in (128, 256, 512)
+        and cfg.groups_tokens_heads_q
+        and cfg.use_paged_kv
+        and not cfg.use_variable_seqlens_q
+        and not cfg.use_persistent_scheduler
+        and not cfg.use_block_sparse
+        and not cfg.use_q_token_kv_block_sparse_route
+        and not cfg.use_cluster_smem_reduction
+        and not cfg.use_sliding_window_causal
+        and not cfg.use_attention_sinks
+        and cfg.num_insts_kv == 1
+        and not cfg.use_fp8_output
+        and cfg.tmem_stats_cols >= cfg.softmax_stats_payload_groups * 2
+        and cfg.tmem_total_cols <= TMEM_MAX_ALLOCATION_COLUMNS
+    ):
+        raise ValueError(
+            "SwapsMmaAb tile_size_q >= 48 requires fixed grouped dense paged Q, one KV "
+            "instance, static launch, 16-bit output, D128/D256/D512, and sufficient TMEM; "
+            "sparse routes, windows, sinks, "
+            "and cluster reduction are not supported"
+        )
+    if cfg.uses_dual_kv_transform and not (
+        cfg.transform_v_num_warps == 4
+        and cfg.transform_v_warp_idx == 16
+        and cfg.threads_per_cta == 640
+        and cfg.kv_stages >= 2
+    ):
+        raise ValueError(
+            "parallel K/V transform requires V warps 16-19, a 640-thread CTA, "
+            "and at least two raw stages"
+        )
     if headdim not in (64, 128, 192, 256, 512):
         raise ValueError(
             "fmha_decode SwapsMmaAb supports headDim in "
@@ -5716,8 +6384,9 @@ def make_decode_config(
        D128 launch from KV128 to KV256; every other automatic Q tile retains
        KV128. The final KV width re-derives launch policy instead of reusing a
        fanout scored for KV128. Explicit policies remain caller-controlled.
-       TileQ128 remains automatic over TileQ64 only for staged D256. SQ1 is
-       outside this cost model and remains KV128, but ratios above 32 select
+       TileQ128 remains automatic over TileQ64 only for staged D256. SQ1 NVFP4
+       searches full grids and qualified long-KV SM107 BF16-output grids;
+       other SQ1 launches retain KV128, while ratios above 32 select
        the smallest qualified Q64/Q128 Keeps tile. Other profile families use
        exact-width ungrouped Keeps or ungrouped Swaps head bands as a fallback.
     3. Shapes outside that qualified Q/launch selector retain the general launch
@@ -5987,6 +6656,28 @@ def make_decode_config(
             preserve_exact_cluster_fanout=(
                 _fanout_was_explicit or selected_grouped_q_recipe is not None
             ),
+        )
+
+    if (
+        selected_grouped_q_recipe is not None
+        and is_sm107_compile_target()
+        and cfg.headdim == 256
+        and cfg.out_dtype == BFloat16
+        and cfg.uses_fast_smem_nvfp4_transform
+        and (
+            selected_grouped_q_recipe.base_ctas
+            >= get_max_active_clusters_for_cluster_size(1)
+            or selected_grouped_q_recipe.waves > 1
+        )
+    ):
+        # Register-prefetched rows release raw slots before conversion, so
+        # three complete K/V tiles can hide TMA latency behind both converters.
+        # The existing stream keeps one raw tile for full launch grids.
+        _set_if_implicit(
+            cfg,
+            "kv_stages",
+            12 if cfg.uses_prefetched_smem_nvfp4_transform else 4,
+            explicit_fields,
         )
 
     _validate_mixed_kv_dtype_profile(cfg)

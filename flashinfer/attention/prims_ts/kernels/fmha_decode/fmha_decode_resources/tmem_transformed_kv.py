@@ -46,7 +46,7 @@ from .helpers_common import (
     ResourceVars,
     _decode_gen_task_cache,
 )
-from .smem_resources import SmemKvResource
+from .smem_resources import SmemKvResource, SmemKvTileResource
 
 
 def _has_packed_e4m3_e2m1_mul() -> bool:
@@ -76,22 +76,17 @@ def _mul_e2m1x4_e4m3x4(packed_fp4: Int32, packed_sf: Int32) -> Int32:
             read_only_args=[packed_fp4, packed_sf],
         )
     else:
+        # LDSM leaves one FP4 nibble per byte. OR with a four-bit shift
+        # packs adjacent values into bytes 0 and 2 without scalar extraction.
         return cute.arch.inline_ptx(
             """
             {
-                .reg .b8 fp4_01, fp4_23, unused0, unused1, unused2;
+                .reg .b8 fp4_01, fp4_23, unused0, unused1;
                 .reg .b16 sf_01, sf_23, e4m3_01, e4m3_23;
                 .reg .b32 tmp, h_01, h_23, sf_h_01, sf_h_23;
-                and.b32 tmp, {$r0}, 0x0000000f;
-                bfe.u32 h_01, {$r0}, 8, 4;
-                shl.b32 h_01, h_01, 4;
-                or.b32 h_01, h_01, tmp;
-                mov.b32 {fp4_01, unused0, unused1, unused2}, h_01;
-                bfe.u32 h_23, {$r0}, 16, 4;
-                bfe.u32 tmp, {$r0}, 24, 4;
-                shl.b32 tmp, tmp, 4;
-                or.b32 h_23, h_23, tmp;
-                mov.b32 {fp4_23, unused0, unused1, unused2}, h_23;
+                shr.u32 tmp, {$r0}, 4;
+                or.b32 tmp, tmp, {$r0};
+                mov.b32 {fp4_01, unused0, fp4_23, unused1}, tmp;
                 mov.b32 {sf_01, sf_23}, {$r1};
                 cvt.rn.f16x2.e2m1x2 h_01, fp4_01;
                 cvt.rn.f16x2.e2m1x2 h_23, fp4_23;
@@ -159,7 +154,7 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
         ),
     )
     cfg: Constexpr[FmhaDecodeConfig] = None
-    src_smem_kv: Constexpr[SmemKvResource] = None
+    src_smem_kv: Constexpr[SmemKvResource | SmemKvTileResource] = None
     _alloc: Constexpr[TmemAllocation | None] = None
     kv_desc_slot: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     v_desc_0_slot: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -244,9 +239,7 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
         )
 
     @cute.jit
-    def _store_k(
-        self, stage_info: StageInfo, head_dim_stage_idx: Constexpr[int]
-    ) -> None:
+    def _store_k(self, stage_info: StageInfo, head_dim_stage_idx: Int32 | int) -> None:
         """Dequantize K with unpacking LDSM and store token-major TMEM."""
         cfg = self.cfg
         task_cache = _decode_gen_task_cache(stage_info)
@@ -279,38 +272,65 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
         swizzle_mask = (thread_row & Int32(7)) * Int32(16)
         stage_addr = self._destination_stage_addr(stage_info)
         for col_stage in cutlass.range_constexpr(8):
-            dst_regs = []
-            for row_block in cutlass.range_constexpr(2):
-                local_offset = Int32(
-                    row_block * 16 * cfg.head_dim_kv_stage + col_stage * 16
-                )
+            if cutlass.const_expr(cfg.uses_x4_nvfp4_transform_loads):
+                # One x4 LDSM unpacks the four 8-row groups of this warp's 32
+                # K rows: lane L addresses row warp*32 + L, and matrix g holds
+                # row group g, matching the scale row in sf_rows[g].
                 src_ptr = src_bytes.data_ptr() + (
                     thread_row * Int32(cfg.head_dim_kv_stage)
-                    + (local_offset ^ swizzle_mask)
+                    + (Int32(col_stage * 16) ^ swizzle_mask)
                 )
                 unpacked = prims.ldmatrix(
                     src_ptr,
-                    2,
+                    4,
                     prims.MMALayout.ROW,
                     shape=prims.LoadShape.M8N16,
                     src_format=prims.LoadSrcFormat.B4X16_P64,
                 )
-                sf_word_idx = col_stage // 4
-                sf_byte_idx = col_stage % 4
-                dst_regs.append(
-                    _mul_e2m1x4_e4m3x4_bx(
-                        unpacked[0],
-                        sf_rows[row_block * 2][sf_word_idx],
-                        sf_byte_idx,
+                dst_regs = []
+                for group in cutlass.range_constexpr(4):
+                    dst_regs.append(
+                        _mul_e2m1x4_e4m3x4_bx(
+                            unpacked[group],
+                            sf_rows[group][col_stage // 4],
+                            col_stage % 4,
+                        )
                     )
-                )
-                dst_regs.append(
-                    _mul_e2m1x4_e4m3x4_bx(
-                        unpacked[1],
-                        sf_rows[row_block * 2 + 1][sf_word_idx],
-                        sf_byte_idx,
+
+            else:
+                # Two x2 loads: row block b covers K rows 16b..16b+15.
+                dst_regs = []
+                for row_block in cutlass.range_constexpr(2):
+                    local_offset = Int32(
+                        row_block * 16 * cfg.head_dim_kv_stage + col_stage * 16
                     )
-                )
+                    src_ptr = src_bytes.data_ptr() + (
+                        thread_row * Int32(cfg.head_dim_kv_stage)
+                        + (local_offset ^ swizzle_mask)
+                    )
+                    unpacked = prims.ldmatrix(
+                        src_ptr,
+                        2,
+                        prims.MMALayout.ROW,
+                        shape=prims.LoadShape.M8N16,
+                        src_format=prims.LoadSrcFormat.B4X16_P64,
+                    )
+                    sf_word_idx = col_stage // 4
+                    sf_byte_idx = col_stage % 4
+                    dst_regs.append(
+                        _mul_e2m1x4_e4m3x4_bx(
+                            unpacked[0],
+                            sf_rows[row_block * 2][sf_word_idx],
+                            sf_byte_idx,
+                        )
+                    )
+                    dst_regs.append(
+                        _mul_e2m1x4_e4m3x4_bx(
+                            unpacked[1],
+                            sf_rows[row_block * 2 + 1][sf_word_idx],
+                            sf_byte_idx,
+                        )
+                    )
 
             tmem_addr = stage_addr + Int32(col_stage * 4)
             prims.tcgen05_st(
@@ -326,9 +346,7 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
         cute.arch.fence_view_async_tmem_store()
 
     @cute.jit
-    def _store_v(
-        self, stage_info: StageInfo, head_dim_stage_idx: Constexpr[int]
-    ) -> None:
+    def _store_v(self, stage_info: StageInfo, head_dim_stage_idx: Int32 | int) -> None:
         """Dequantize and transpose V with LDSM into TMEM operand A."""
         cfg = self.cfg
         task_cache = _decode_gen_task_cache(stage_info)
@@ -358,29 +376,62 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
                 + Int32(sf_head_stage_offset * 4)
                 + warp_idx * Int32(8)
             )
+            if cutlass.const_expr(cfg.swizzles_v_scale_factors):
+                # 128 B swizzle: XOR the 16 B chunk with the row index mod 8.
+                # Both words share one chunk, so they stay adjacent.
+                sf_byte_offset = sf_byte_offset ^ (
+                    ((sf_byte_offset >> Int32(7)) & Int32(7)) << Int32(4)
+                )
             sf_word_idx = sf_byte_offset // Int32(4)
             sf_packed0 = src_sf_words[sf_word_idx]
             sf_packed1 = src_sf_words[sf_word_idx + Int32(1)]
 
-            dst_regs = []
-            for col_block in cutlass.range_constexpr(2):
-                local_offset = Int32(
-                    token_stage * 16 * cfg.head_dim_kv_stage + col_block * 16
-                ) + warp_idx * Int32(32)
+            if cutlass.const_expr(cfg.uses_x4_nvfp4_transform_loads):
+                # One transposing x4 LDSM covers this warp's two 16-column
+                # blocks (lanes 16-31 address the second). Matrices 0-1 use
+                # the first block's scales and matrices 2-3 the second's.
+                local_offset = (
+                    Int32(token_stage * 16 * cfg.head_dim_kv_stage)
+                    + warp_idx * Int32(32)
+                    + (lane_idx >> Int32(4)) * Int32(16)
+                )
+                row = lane_idx & Int32(15)
                 src_ptr = src_bytes.data_ptr() + (
-                    lane_idx * Int32(cfg.head_dim_kv_stage)
-                    + (local_offset ^ swizzle_mask)
+                    row * Int32(cfg.head_dim_kv_stage) + (local_offset ^ swizzle_mask)
                 )
                 unpacked = prims.ldmatrix(
                     src_ptr,
-                    2,
+                    4,
                     prims.MMALayout.COL,
                     shape=prims.LoadShape.M16N16,
                     src_format=prims.LoadSrcFormat.B4X16_P64,
                 )
-                packed_sf = sf_packed0 if col_block == 0 else sf_packed1
-                dst_regs.append(_mul_e2m1x4_e4m3x4(unpacked[0], packed_sf))
-                dst_regs.append(_mul_e2m1x4_e4m3x4(unpacked[1], packed_sf))
+                dst_regs = []
+                for group in cutlass.range_constexpr(4):
+                    packed_sf = sf_packed0 if group < 2 else sf_packed1
+                    dst_regs.append(_mul_e2m1x4_e4m3x4(unpacked[group], packed_sf))
+
+            else:
+                # Two x2 transposing loads, one per 16-column block.
+                dst_regs = []
+                for col_block in cutlass.range_constexpr(2):
+                    local_offset = Int32(
+                        token_stage * 16 * cfg.head_dim_kv_stage + col_block * 16
+                    ) + warp_idx * Int32(32)
+                    src_ptr = src_bytes.data_ptr() + (
+                        lane_idx * Int32(cfg.head_dim_kv_stage)
+                        + (local_offset ^ swizzle_mask)
+                    )
+                    unpacked = prims.ldmatrix(
+                        src_ptr,
+                        2,
+                        prims.MMALayout.COL,
+                        shape=prims.LoadShape.M16N16,
+                        src_format=prims.LoadSrcFormat.B4X16_P64,
+                    )
+                    packed_sf = sf_packed0 if col_block == 0 else sf_packed1
+                    dst_regs.append(_mul_e2m1x4_e4m3x4(unpacked[0], packed_sf))
+                    dst_regs.append(_mul_e2m1x4_e4m3x4(unpacked[1], packed_sf))
 
             tmem_addr = stage_addr + Int32(token_stage * 4)
             prims.tcgen05_st(
@@ -394,6 +445,52 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
                 cutlass.Vector.from_elements(tuple(dst_regs[2:]), dtype=Int32),
             )
         cute.arch.fence_view_async_tmem_store()
+
+    @producer_work
+    @cute.jit
+    def transform_kv_loop_stage(self, stage_info: StageInfo) -> None:
+        """Transform one raw stage of a steady-state K/V loop step.
+
+        Each one-instance loop step converts the next K tile and then the
+        current V tile, ``num_head_dim_stages_kv`` raw stages each, so loop
+        iteration ``n`` holds V when bit ``log2(stages)`` of ``n`` is set and
+        head-dimension stage ``n % stages``. Selecting both at run time keeps
+        one K and one V body in the hot loop.
+        """
+        stages = self.cfg.num_head_dim_stages_kv
+        assert stages & (stages - 1) == 0, "stage decoding uses bit masks"
+        item = Int32(stage_info.loop_offset) - Int32(stage_info.loop_start)
+        head_dim_stage_idx = item & Int32(stages - 1)
+        if (item & Int32(stages)) == Int32(0):
+            self._store_k(stage_info, head_dim_stage_idx)
+        else:
+            self._store_v(stage_info, head_dim_stage_idx)
+
+    @producer_work
+    @cute.jit
+    def transform_k0_loop_stage(self, stage_info: StageInfo) -> None:
+        """Transform head-dimension stage ``n % stages`` of a dual-ring K tile.
+
+        The dual K converter's steady state runs once per raw stage; loop
+        iteration ``n`` selects the stage at run time so one K body serves
+        every stage.
+        """
+        stages = self.cfg.num_head_dim_stages_kv
+        assert stages & (stages - 1) == 0, "stage decoding uses bit masks"
+        item = Int32(stage_info.loop_offset) - Int32(stage_info.loop_start)
+        self._store_k(stage_info, item & Int32(stages - 1))
+
+    @producer_work
+    @cute.jit
+    def transform_v0_loop_stage(self, stage_info: StageInfo) -> None:
+        """Transform head-dimension stage ``n % stages`` of a dual-ring V tile.
+
+        The V counterpart of :meth:`transform_k0_loop_stage`.
+        """
+        stages = self.cfg.num_head_dim_stages_kv
+        assert stages & (stages - 1) == 0, "stage decoding uses bit masks"
+        item = Int32(stage_info.loop_offset) - Int32(stage_info.loop_start)
+        self._store_v(stage_info, item & Int32(stages - 1))
 
     @producer_work
     @cute.jit
