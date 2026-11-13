@@ -1330,8 +1330,13 @@ void run(Data const& data, void* stream) {
       int const vecsPerStep = 32 * FINALIZE_WARP_VECS;
       int const numSteps =
           (data.hiddenDim / finalizeElemsPerVector + vecsPerStep - 1) / vecsPerStep;
-      int const numSlices =
+      // Each row splits into slices of stepsPerSlice steps, enough of them to reach
+      // FINALIZE_WARP_MIN_WARPS warps. Only slices that hold steps are launched, and the kernel
+      // derives the same stepsPerSlice from their number.
+      int const maxSlices =
           std::min(numSteps, (FINALIZE_WARP_MIN_WARPS + data.numTokens - 1) / data.numTokens);
+      int const stepsPerSlice = (numSteps + maxSlices - 1) / maxSlices;
+      int const numSlices = (numSteps + stepsPerSlice - 1) / stepsPerSlice;
       dim3 numBlocks((data.numTokens + warpsPerBlock - 1) / warpsPerBlock, numSlices);
       LAUNCH_EXPW(LAUNCH_FINALIZE_SINGLE_INPUT_PDL, data, finalizeKernelWarpPerToken, 1, numBlocks,
                   /*numThreads=*/FINALIZE_WARP_THREADS, 0, stream);
