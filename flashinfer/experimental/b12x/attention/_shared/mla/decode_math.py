@@ -3061,6 +3061,7 @@ def s7_epilogue(
     num_threads: cutlass.Constexpr = 0,
     barrier_id: cutlass.Constexpr = 0,
     coalesced_output: cutlass.Constexpr = False,
+    lse_natural: cutlass.Constexpr = False,
 ):
     """S7: normalized O + base-2 LSE epilogue. ``epilogue_mode`` (const_expr)
     selects the destination + normalizer convention; the (gid, d0) output-write
@@ -3087,7 +3088,8 @@ def s7_epilogue(
         lse = log2(l) + m ; lse += log2(1 + exp2(sink_log2 - lse))  (empty -> sink_log2)
     where sink_log2 = attn_sink[head] * LOG2E. This is algebraically the FlashMLA
     ``out *= sigmoid(lse_e - sink)`` + log-sum-exp LSE fold the prefill reference
-    cross-checks."""
+    cross-checks. ``lse_natural`` optionally converts the final stored LSE to
+    natural-log units; its default preserves all split/decode base-2 stores."""
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
 
@@ -3281,6 +3283,9 @@ def s7_epilogue(
                     )
                 else:
                     lse1 = sink1
+        if cutlass.const_expr(lse_natural):
+            lse0 = lse0 * Float32(0.6931471805599453)
+            lse1 = lse1 * Float32(0.6931471805599453)
         out_lse[gid] = lse0
         if cutlass.const_expr(valid_hpb > 8):
             out_lse[gid + Int32(8)] = lse1

@@ -152,8 +152,9 @@ def run_unified_prefill(
     traits_override: UnifiedMLATraits | None = None,
     prepared: object | None = None,
     mg_enabled: bool | None = None,
+    lse_scale: str = "base2",
 ):
-    """Unified SM120 sparse-MLA single-pass prefill -> BF16 O + base-2 LSE.
+    """Unified SM120 sparse-MLA single-pass prefill -> BF16 O + selected-base LSE.
 
     Pure DISPATCHER: validates the contract, infers traits, and routes to the
     FlashInfer-shaped multi-group (MG) prefill kernel (``run_unified_prefill_mg``).
@@ -182,7 +183,7 @@ def run_unified_prefill(
       attn_sink:    optional (heads,) fp32 per-head natural-log sink, folded into
                     the normalizer + base-2 LSE (FlashMLA V4).
       output:       optional pre-allocated (T, heads, D_V) bf16 output (else made).
-      lse_out:      optional pre-allocated (T, heads) f32 base-2 LSE (else made).
+      lse_out:      optional pre-allocated (T, heads) f32 LSE in ``lse_scale`` units (else made).
       stride_kv_block: per-block gmem byte stride for the MAIN cache. Derived from
                     page_block_size + model_type when omitted.
       extra_kv_cache / extra_indices / extra_topk_length / extra_page_block_size:
@@ -192,8 +193,13 @@ def run_unified_prefill(
       workspace:    unused (prefill is single-pass, no split/merge workspace);
                     accepted for launcher-signature symmetry.
 
-    Returns (O[T, heads, D_V=512] bf16, lse[T, heads] f32 base-2).
+    ``lse_scale`` selects "base2" (default) or "natural"; conversion is fused
+    into the final LSE store.
+
+    Returns (O[T, heads, D_V=512] bf16, lse[T, heads] f32 in selected units).
     """
+    if lse_scale not in ("base2", "natural"):
+        raise ValueError(f"invalid lse_scale: {lse_scale!r}")
     del workspace  # prefill is single-pass; no split/merge workspace needed.
 
     q_head_dim = int(q.shape[-1])
@@ -336,6 +342,7 @@ def run_unified_prefill(
                 attn_sink=attn_sink,
                 output=output,
                 lse_out=lse_out,
+                lse_scale=lse_scale,
                 stride_kv_block=stride_kv_block,
                 compute_mode=compute_mode,
                 mg_n_hg=mg_n_hg,
