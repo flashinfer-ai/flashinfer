@@ -360,7 +360,7 @@ def fingerprint(op: str, **dims) -> str:
     ``gemm.nvfp4.*`` otherwise), the chunk count, the chain's ``mul.rn`` by the caller's alpha and the conversion are
     the specification; the alpha's value and the block scales are inputs.
 
-    ``chunk_gated_delta_rule`` takes no dimension: the class ``gdn.bf16.c64`` is the native SM100 / SM103 chunked GDN
+    ``chunk_gated_delta_rule`` takes no dimension: the class ``gdn.bf16.c64`` is the native SM100 / SM103 / SM107 chunked GDN
     prefill kernel without context parallelism (64-token chunks, fp32 state, log-domain gates and the Q / K l2-norm)
     and the decode step kernel that computes its rows; the head counts, the batch, the slot and the position are not
     dimensions of the per-head term, and the receipt digests the kernel sources that are the term.
