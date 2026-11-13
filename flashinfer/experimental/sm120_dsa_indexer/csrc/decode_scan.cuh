@@ -41,9 +41,28 @@ struct ScanParams {
   float* logits;
   int64_t logits_stride;
   uint32_t* long_ws;  // kLong: [num_rows][kLongWords]
+  // Candidate mode (one-row units): row u scores only the blocks of
+  // 1 << cand_shift keys listed in cand[u * cand_stride ...], ascending and
+  // distinct (decode_candidates.cuh), as one virtual row of row_len[u] keys.
+  // Null: every row scores its keys [0, row_len) in order.
+  const int32_t* cand;
+  int cand_stride;
+  int cand_shift;
+  const uint8_t* kv_scales;  // page 0's scales; page p's at + p * page_stride
+  int64_t page_stride;
+  // Source mode (kBlk): row r's block scores, blk[r * blk_stride + b], the
+  // largest score of block b's visible keys (blocks of 1 << blk_shift keys, 8
+  // or 16), the newest block and NaN blocks +inf; blk_len[r] the row's
+  // blocks. Block rows longer than kRowSelKeys count their histogram into
+  // blk_long_ws as long key rows do into long_ws.
+  float* blk;
+  int64_t blk_stride;
+  int32_t* blk_len;
+  uint32_t* blk_long_ws;
+  int blk_shift;
 };
 
-template <int kNumHeads, bool kFp4, int kNextN, bool kLong = false>
+template <int kNumHeads, bool kFp4, int kNextN, bool kLong = false, bool kBlk = false>
 struct ScanSmem {
   static constexpr int kRow = Fmt<kFp4>::kRow;
   static constexpr int kQBytes = kNextN * kNumHeads * kRow;
@@ -67,9 +86,95 @@ struct ScanSmem {
     return (bars_off(stages) + 8 * (4 + 2 * stages) + 15) & ~15;
   }
   __host__ __device__ static int bytes(int stages) {
-    return hist_off(stages) + (kLong ? kNextN * 2048 * 4 + 16 : 0);
+    // kBlk: the block rows' histograms and parities follow, laid out alike.
+    return hist_off(stages) + (kLong ? (kBlk ? 2 : 1) * (kNextN * 2048 * 4 + 16) : 0);
   }
 };
+
+// The producer in candidate mode. A virtual tile of kBlockKV keys is
+// kBlockKV >> cand_shift candidate blocks, each one TMA box inside one page;
+// lane j issues box j's key and scale loads, so a tile's loads go out
+// together rather than one after another from one lane.
+template <int kNumHeads, bool kFp4, int kNextN, bool kLong, typename Piece>
+__device__ __forceinline__ void produce_candidates(
+    const ScanParams& p, uint8_t* smem, const CUtensorMap& tmap_q, const CUtensorMap& tmap_w,
+    const CUtensorMap& tmap_k, const CUtensorMap& tmap_qsf, uint64_t* full_q, uint64_t* empty_q,
+    uint64_t* full_k, uint64_t* empty_k, int rq_lo, int rq_hi, int upr, int uk, int stages,
+    int lane, Piece&& piece) {
+  static_assert(kNextN == 1, "candidate rows are one-row units");
+  using L = ScanSmem<kNumHeads, kFp4, kNextN, kLong>;
+  using F = Fmt<kFp4>;
+  const int shift = p.cand_shift, boxes_per_tile = kBlockKV >> shift;
+  const int page_shift = __ffs(p.page_rows) - 1, page_mask = p.page_rows - 1;
+  int st = 0, n = 0;
+  uint32_t parity = 0u;
+  for (int rq = rq_lo; rq < rq_hi; ++rq, ++n) {
+    const int u = rq * upr + uk;
+    int t0, t1, len[2];
+    const int kend = piece(rq, t0, t1, len);
+    const int qb = n & 1;
+    if (lane == 0) {
+      if (n >= 2) mbar_wait(empty_q + qb, static_cast<uint32_t>(((n - 2) >> 1) & 1));
+      mbar_expect_tx(full_q + qb, L::kQBytes + L::kWBytes + (kFp4 ? L::kWBytes : 0));
+      tma_load_2d(smem + L::q_off(qb), &tmap_q, full_q + qb, 0, u * kNumHeads);
+      tma_load_2d(smem + L::w_off(stages, qb), &tmap_w, full_q + qb, 0, u);
+      if constexpr (kFp4) tma_load_2d(smem + L::qsf_off(stages, qb), &tmap_qsf, full_q + qb, 0, u);
+    }
+    // A request's rows are consecutive units, whatever the split (upr is 1 on
+    // fewer CTAs than units_per_req).
+    const int bt_req = u / p.units_per_req;
+    const int64_t bt_row = static_cast<int64_t>(bt_req) * p.bt_stride;
+    const int32_t* blocks = p.cand + static_cast<int64_t>(u) * p.cand_stride;
+    const int box0 = t0 * boxes_per_tile, box1 = t1 * boxes_per_tile;
+    // Box b's page and in-page row. Boxes past the row load page 0, which the
+    // math warps mask by the row's length.
+    auto box_at = [&](int b, int& row) -> int {
+      if (b >= box1 || (b << shift) >= kend) {
+        row = 0;
+        return 0;
+      }
+      const int key = __ldg(blocks + b) << shift;
+      row = key & page_mask;
+      return __ldg(p.block_table + bt_row + (key >> page_shift));
+    };
+    // The lanes hold the next 64 boxes (two windows of 32).
+    int win = box0, cur_row, nxt_row;
+    int cur = box_at(win + lane, cur_row), nxt = box_at(win + 32 + lane, nxt_row);
+    for (int i = 0; i < t1 - t0; ++i) {
+      const int b0 = box0 + i * boxes_per_tile;
+      if (b0 - win >= 32) {
+        win += 32;
+        cur = nxt;
+        cur_row = nxt_row;
+        nxt = box_at(win + 32 + lane, nxt_row);
+      }
+      const int s = b0 - win + lane;
+      const int page_a = __shfl_sync(0xffffffffu, cur, s & 31);
+      const int page_b = __shfl_sync(0xffffffffu, nxt, s & 31);
+      const int row_a = __shfl_sync(0xffffffffu, cur_row, s & 31);
+      const int row_b = __shfl_sync(0xffffffffu, nxt_row, s & 31);
+      const int page = s < 32 ? page_a : page_b, row = s < 32 ? row_a : row_b;
+      if (lane == 0) {
+        mbar_wait(empty_k + st, parity ^ 1u);
+        mbar_expect_tx(full_k + st, L::kKBytes + kBlockKV * 4);
+      }
+      __syncwarp();
+      if (lane < boxes_per_tile) {
+        const int r = lane << shift;
+        tma_load_3d(smem + L::k_off(st) + r * F::kRow, &tmap_k, full_k + st, 0, row, page);
+        // A box's scales are 4 << shift bytes, too few for a tensor copy's
+        // 128-byte destination alignment.
+        bulk_load(smem + L::scale_off(stages, st) + r * 4,
+                  p.kv_scales + page * p.page_stride + row * 4, 4u << shift, full_k + st);
+      }
+      __syncwarp();
+      if (++st == stages) {
+        st = 0;
+        parity ^= 1u;
+      }
+    }
+  }
+}
 
 // One producer warp (TMA) and 256 math threads. setmaxnreg moves the
 // producer warpgroup's registers to the math warps (40 / 232 around the
@@ -80,7 +185,7 @@ struct ScanSmem {
 // over the logits. kKeep: the logits are stored with an L2 evict_last policy
 // and dropped by the selection after reading, so they are neither evicted by
 // the streamed keys nor written back.
-template <int kNumHeads, bool kFp4, int kNextN, bool kLong, bool kKeep = false>
+template <int kNumHeads, bool kFp4, int kNextN, bool kLong, bool kKeep = false, bool kBlk = false>
 __global__ void __launch_bounds__(kNumWsThreads, 1)
     logits_scan_kernel(const __grid_constant__ ScanParams p,
                        const __grid_constant__ CUtensorMap tmap_q,
@@ -88,7 +193,7 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
                        const __grid_constant__ CUtensorMap tmap_k,
                        const __grid_constant__ CUtensorMap tmap_ks,
                        const __grid_constant__ CUtensorMap tmap_qsf) {
-  using L = ScanSmem<kNumHeads, kFp4, kNextN, kLong>;
+  using L = ScanSmem<kNumHeads, kFp4, kNextN, kLong, kBlk>;
   using F = Fmt<kFp4>;
   constexpr int kKSteps = F::kKSteps;
   constexpr int kNTiles = kNumHeads / 8;
@@ -164,6 +269,14 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
     const int boxes_per_tile = kBlockKV >> box_shift;
     int st = 0, n = 0;
     uint32_t parity = 0u;
+    if constexpr (kNextN == 1 && !kLong && !kBlk) {
+      if (p.cand != nullptr) {
+        produce_candidates<kNumHeads, kFp4, kNextN, kLong>(
+            p, smem, tmap_q, tmap_w, tmap_k, tmap_qsf, full_q, empty_q, full_k, empty_k, rq_lo,
+            rq_hi, upr, uk, stages, lane, piece);
+        return;
+      }
+    }
     for (int rq = rq_lo; rq < rq_hi; ++rq, ++n) {
       const int u = rq * upr + uk;
       int t0, t1, len[2];
@@ -229,25 +342,31 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
   const int b_chunk_hi = (lane >> 3) & 1;
   uint32_t* shh = reinterpret_cast<uint32_t*>(smem + L::hist_off(stages));
   uint32_t* shpar = shh + kNextN * 2048;
+  uint32_t* shb = shpar + 4;  // kBlk: the block rows' histograms
+  uint32_t* shbpar = shb + kNextN * 2048;
   if constexpr (kLong) {
-    for (int w = tid; w < kNextN * 2048; w += kNumMathThreads) shh[w] = 0u;
+    for (int w = tid; w < (kBlk ? 2 : 1) * (kNextN * 2048 + 4); w += kNumMathThreads) shh[w] = 0u;
     math_barrier();
   }
-  // Adds the unit's counts to its long rows' histograms (fp32 counts: one
-  // v4 RED per four bins) and clears them.
-  auto flush = [&](int u) {
-    math_barrier();
+  // Adds the unit's counts in h to its long rows' histograms in ws (fp32
+  // counts: one v4 RED per four bins) and clears them.
+  auto flush_hist = [&](int u, uint32_t* h, const uint32_t* par, uint32_t* ws_rows) {
     for (int w = tid * 2; w < kNextN * 2048; w += kNumMathThreads * 2) {
-      const uint2 v = *reinterpret_cast<const uint2*>(shh + w);
+      const uint2 v = *reinterpret_cast<const uint2*>(h + w);
       if (v.x | v.y) {
         const int qi = w >> 11, b = (w & 2047) * 2;
-        uint32_t* ws = p.long_ws + static_cast<int64_t>(u * kNextN + qi) * kLongWords;
-        red_add_v4_f32_gpu(reinterpret_cast<float*>(ws + kLongHist0 + shpar[qi] * 4096 + b),
+        uint32_t* ws = ws_rows + static_cast<int64_t>(u * kNextN + qi) * kLongWords;
+        red_add_v4_f32_gpu(reinterpret_cast<float*>(ws + kLongHist0 + par[qi] * 4096 + b),
                            static_cast<float>(v.x & 0xffffu), static_cast<float>(v.x >> 16),
                            static_cast<float>(v.y & 0xffffu), static_cast<float>(v.y >> 16));
-        *reinterpret_cast<uint2*>(shh + w) = make_uint2(0u, 0u);
+        *reinterpret_cast<uint2*>(h + w) = make_uint2(0u, 0u);
       }
     }
+  };
+  auto flush = [&](int u) {
+    math_barrier();
+    flush_hist(u, shh, shpar, p.long_ws);
+    if constexpr (kBlk) flush_hist(u, shb, shbpar, p.blk_long_ws);
     math_barrier();
   };
   int st = 0, n = 0;
@@ -256,7 +375,7 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
     const int u = rq * upr + uk;
     int t0, t1, len[2];
     piece(rq, t0, t1, len);
-    bool lrow[2] = {false, false};
+    bool lrow[2] = {false, false}, brow[2] = {false, false};
     if constexpr (kLong) {
 #pragma unroll
       for (int qi = 0; qi < kNextN; ++qi) {
@@ -265,7 +384,19 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
           shpar[qi] = __ldcg(p.long_ws + static_cast<int64_t>(u * kNextN + qi) * kLongWords +
                              kLongCtr + kCtrEpoch) &
                       1u;
+        if constexpr (kBlk) {
+          brow[qi] = ((len[qi] + (1 << p.blk_shift) - 1) >> p.blk_shift) > kRowSelKeys;
+          if (tid == qi && brow[qi])
+            shbpar[qi] = __ldcg(p.blk_long_ws + static_cast<int64_t>(u * kNextN + qi) * kLongWords +
+                                kLongCtr + kCtrEpoch) &
+                         1u;
+        }
       }
+    }
+    if constexpr (kBlk) {
+      // Every CTA with a piece of the unit writes the same counts.
+      if (tid < kNextN)
+        p.blk_len[u * kNextN + tid] = (len[tid] + (1 << p.blk_shift) - 1) >> p.blk_shift;
     }
     const int qb = n & 1;
     mbar_wait(full_q + qb, static_cast<uint32_t>((n >> 1) & 1));
@@ -298,6 +429,8 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
     // Scalars: the arrays, captured by reference, would be in local memory.
     const int len0 = len[0], len1 = kNextN > 1 ? len[1] : 0;
     const bool lrow0 = lrow[0], lrow1 = kNextN > 1 && lrow[1];
+    const bool brow0 = brow[0], brow1 = kNextN > 1 && brow[1];
+    float* blk = kBlk ? p.blk + static_cast<int64_t>(u * kNextN) * p.blk_stride : nullptr;
     // kH: the variant that counts histograms, only for units with a long row,
     // so the plain loop keeps its code and registers.
     auto tiles = [&](auto hist_tag) {
@@ -367,6 +500,52 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
           vk[qi][0] = v_0;
           vk[qi][1] = v_1;
         }
+        if constexpr (kBlk) {
+          // A warp's 16 keys of the tile are blocks of 8 keys over g (lanes
+          // 4g..4g+3 hold key_0 = tile + 16 * warp + g, key_1 = key_0 + 8):
+          // each block's largest visible score is three shuffles away, and a
+          // block of 16 is the pair. Lane t4 of g = 0 writes as below.
+          const int shift = p.blk_shift;
+          float bmax[kNextN][2];
+#pragma unroll
+          for (int qi = 0; qi < kNextN; ++qi) {
+            const int lq = qi == 0 ? len0 : len1;
+            float m0 = key_0 < lq ? vk[qi][0] : -__int_as_float(0x7f800000);
+            float m1 = key_1 < lq ? vk[qi][1] : -__int_as_float(0x7f800000);
+            if (m0 != m0) m0 = __int_as_float(0x7f800000);
+            if (m1 != m1) m1 = __int_as_float(0x7f800000);
+#pragma unroll
+            for (int o = 4; o < 32; o <<= 1) {
+              m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, o));
+              m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, o));
+            }
+            if (shift == 4) m0 = m1 = fmaxf(m0, m1);
+            bmax[qi][0] = m0;
+            bmax[qi][1] = m1;
+          }
+          if (g == 0 && (kNextN == 2 || t4 < 2)) {
+            const int qi = kNextN == 2 ? t4 >> 1 : 0;
+            const bool k1 = t4 & 1;
+            const int key = k1 ? key_1 : key_0;
+            const int lq = qi == 0 ? len0 : len1;
+            if (key < lq && !(k1 && shift == 4)) {
+              float m;
+              if constexpr (kNextN == 2)
+                m = qi ? (k1 ? bmax[1][1] : bmax[1][0]) : (k1 ? bmax[0][1] : bmax[0][0]);
+              else
+                m = k1 ? bmax[0][1] : bmax[0][0];
+              const int b = key >> shift;
+              if (b == (lq - 1) >> shift) m = __int_as_float(0x7f800000);
+              blk[qi * p.blk_stride + b] = m;
+              if constexpr (kH) {
+                if (qi == 0 ? brow0 : brow1) {
+                  const uint32_t bin = rowsel_bin(m);
+                  atomicAdd(shb + qi * 2048 + (bin >> 1), 1u << ((bin & 1u) * 16));
+                }
+              }
+            }
+          }
+        }
         // Every lane of a quad holds its two keys' sums for each row: lane
         // t4 stores row t4 >> 1, key t4 & 1, so one store and one count serve
         // both rows.
@@ -379,6 +558,9 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
             v = qi ? (k1 ? vk[1][1] : vk[1][0]) : (k1 ? vk[0][1] : vk[0][0]);
           else
             v = k1 ? vk[0][1] : vk[0][0];
+          // A NaN score (only from non-finite inputs) ranks last, as -inf: the
+          // selection's bins and compares then agree on every key.
+          if (v != v) v = -__int_as_float(0x7f800000);
           if (key < (qi == 0 ? len0 : len1)) {
             if constexpr (kKeep)
               asm volatile("st.global.L2::cache_hint.f32 [%0], %1, %2;" ::"l"(
