@@ -32,7 +32,7 @@ The driver itself only orchestrates and imports nothing from ``flashinfer``.
 Example (from an "ARM64 Native Tools" prompt or any shell; vcvarsall is found
 with vswhere when ``cl.exe`` is not on PATH)::
 
-    python scripts/build_windows_arm64_wheels.py --cuda-label cu130 ^
+    python scripts/build_windows_arm64_wheels.py --cuda-label cu134 ^
         --target provider --target shim ^
         --provider-arch 10.3a --provider-arch 12.0f --output-dir wheelhouse
 """
@@ -61,6 +61,9 @@ WHEEL_PLATFORM_TAG = "win_arm64"
 # Provider and shim wheels carry the stable ABI tag on every platform.
 JIT_CACHE_WHEEL_TAGS = ("cp39", "abi3", WHEEL_PLATFORM_TAG)
 TARGETS = ("python", "provider", "shim")
+# CUDA 13.4 is the first toolkit with Windows on Arm support, so the older
+# jit_cache labels in ci/cuda-versions.json cannot produce win_arm64 wheels.
+WINDOWS_ARM64_CUDA_LABELS = ("cu134",)
 # Outside every directory a build cleans (dist/ and the package build dirs).
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "build" / "wheelhouse-win_arm64"
 
@@ -692,7 +695,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--cuda-label",
         default=os.environ.get("FLASHINFER_LOCAL_VERSION", ""),
-        help="jit_cache label in ci/cuda-versions.json, e.g. cu130 "
+        help="jit_cache label in ci/cuda-versions.json; only cu134 supports "
+        "Windows on Arm "
         "(default: $FLASHINFER_LOCAL_VERSION)",
     )
     parser.add_argument(
@@ -747,6 +751,12 @@ def main(
     args = parse_args(argv)
     if not args.skip_host_check:
         check_host()
+    if args.cuda_label not in WINDOWS_ARM64_CUDA_LABELS:
+        raise BuildError(
+            f"CUDA label {args.cuda_label!r} cannot target Windows arm64; CUDA 13.4 "
+            f"is the first toolkit with Windows on Arm support (supported: "
+            f"{', '.join(WINDOWS_ARM64_CUDA_LABELS)})"
+        )
     cuda = load_cuda_config(args.cuda_label, repo_root / "ci" / "cuda-versions.json")
     version = package_version(repo_root, args.dev_suffix, cuda.label)
     for architecture in args.provider_arch:

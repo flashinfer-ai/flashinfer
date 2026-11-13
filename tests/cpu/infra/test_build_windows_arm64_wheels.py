@@ -112,7 +112,7 @@ def make_shim_wheel(dist: Path, version: str, providers, platform_tag="win_arm64
 class FakeRunner:
     """Record commands; answer probes; drop a wheel where a build would."""
 
-    def __init__(self, *, nvcc="13.0", torch_cuda="13.0", platform_tag="win_arm64"):
+    def __init__(self, *, nvcc="13.4", torch_cuda="13.4", platform_tag="win_arm64"):
         self.calls = []
         self.nvcc = nvcc
         self.torch_cuda = torch_cuda
@@ -129,7 +129,7 @@ class FakeRunner:
             if self.torch_cuda != command[-1]:
                 raise subprocess.CalledProcessError(1, command)
         elif "-c" in command and "m.version" in joined:
-            stdout = "torch==2.9.0+cu130\n"
+            stdout = "torch==2.13.0.dev20261112+cu134\n"
         elif command[-1].endswith("build_jit_cache_wheel.py"):
             self._build_jit_cache_wheel(Path(cwd), env)
         elif command[1:3] == ["-m", "build"]:
@@ -351,12 +351,13 @@ echo "$MAX_JOBS $FLASHINFER_NVCC_THREADS $MEM_PER_JOB"
 @pytest.mark.cpu_only
 def test_build_environment_pins_preinstalled_torch(driver):
     runner = FakeRunner(torch_cuda="13.0")
+    # A stable (non-nightly) index; the driver itself only accepts cu134.
     cuda = driver.CudaConfig("cu130", "13.0", "cu130")
     outer = {"PIP_CONSTRAINT": "/outer", "PIP_EXTRA_INDEX_URL": "https://mirror"}
 
     with driver.python_build_environment(runner, "py", cuda, outer) as env:
         constraint = Path(env["PIP_CONSTRAINT"])
-        assert constraint.read_text().strip() == "torch==2.9.0+cu130"
+        assert constraint.read_text().strip() == "torch==2.13.0.dev20261112+cu134"
         assert env["PIP_BUILD_CONSTRAINT"] == env["PIP_CONSTRAINT"]
         assert env["PIP_EXTRA_INDEX_URL"] == (
             "https://mirror https://download.pytorch.org/whl/cu130"
@@ -516,10 +517,10 @@ def test_wheel_index_recognizes_windows_provider_names():
 # --------------------------------------------------------------------------- #
 
 
-def _run_main(driver, fake_repo, argv, runner, extra_env=None):
+def _run_main(driver, fake_repo, argv, runner, extra_env=None, cuda_label="cu134"):
     environ = {
         "PATH": "C:\\VS",
-        "_TEST_VERSION": "0.6.16.dev20261113+cu130",
+        "_TEST_VERSION": "0.6.16.dev20261113+cu134",
         "FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG": "manylinux_2_28_aarch64",
         "FLASHINFER_NVCC_LAUNCHER": "sccache",
         **(extra_env or {}),
@@ -528,7 +529,7 @@ def _run_main(driver, fake_repo, argv, runner, extra_env=None):
         [
             "--skip-host-check",
             "--cuda-label",
-            "cu130",
+            cuda_label,
             "--dev-suffix",
             "20261113",
             "--output-dir",
@@ -555,7 +556,7 @@ def test_main_builds_all_targets_into_output_dir(driver, fake_repo):
         runner,
     )
 
-    version = "0.6.16.dev20261113+cu130"
+    version = "0.6.16.dev20261113+cu134"
     assert summary["wheels"] == [
         "flashinfer_python-0.6.16-py3-none-any.whl",
         f"flashinfer_jit_cache_sm120f-{version}-cp39-abi3-win_arm64.whl",
@@ -578,7 +579,8 @@ def test_main_builds_all_targets_into_output_dir(driver, fake_repo):
     for call, arch in zip(provider_builds, ["12.0f", "10.3a"], strict=True):
         assert call["cwd"] == fake_repo / "flashinfer-jit-cache-provider"
         assert call["env"]["FLASHINFER_JIT_CACHE_PROVIDER_ARCH"] == arch
-        assert call["env"]["FLASHINFER_LOCAL_VERSION"] == "cu130"
+        assert call["env"]["FLASHINFER_LOCAL_VERSION"] == "cu134"
+        assert call["env"]["PIP_PRE"] == "1"
         assert call["env"]["FLASHINFER_DEV_RELEASE_SUFFIX"] == "20261113"
         assert Path(call["env"]["PIP_CONSTRAINT"]).name == "torch-constraint.txt"
         expected_jobs = driver.compute_parallelism(256, os.cpu_count() or 1, {})
@@ -618,3 +620,18 @@ def test_main_rejects_wrongly_tagged_provider(driver, fake_repo):
 def test_main_requires_provider_architectures(driver, fake_repo):
     with pytest.raises(SystemExit):
         _run_main(driver, fake_repo, ["--target", "provider"], FakeRunner())
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("label", ["cu129", "cu130"])
+def test_main_refuses_cuda_without_windows_on_arm(driver, fake_repo, label):
+    runner = FakeRunner()
+    with pytest.raises(driver.BuildError, match="CUDA 13.4 is the first toolkit"):
+        _run_main(
+            driver,
+            fake_repo,
+            ["--provider-arch", "12.0f"],
+            runner,
+            cuda_label=label,
+        )
+    assert runner.calls == []

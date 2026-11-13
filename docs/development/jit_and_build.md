@@ -233,7 +233,9 @@ MSVC through vswhere/vcvarsall when `cl.exe` is not on PATH, pins torch with pip
 constraints, builds through `scripts/build_jit_cache_wheel.py`, and checks that
 every wheel is tagged `win_arm64` and every provider ships `<module>/module.dll`.
 It does not use sccache, because the Windows ninja rules do not use the compiler
-launchers. Provider builds need the Windows build port (MSVC host support).
+launchers. Only the `cu134` label is accepted: CUDA 13.4 is the first toolkit
+with Windows on Arm support. Provider builds need the Windows build port (MSVC
+host support).
 
 ## Build implementation
 
