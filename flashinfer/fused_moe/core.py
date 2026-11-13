@@ -3819,7 +3819,7 @@ def _build_trtllm_moe_namespace(module):
 
     @register_custom_op(
         "flashinfer::trtllm_fp4_block_scale_moe",
-        mutates_args=("routing_replay_out", "workspace_buffer"),
+        mutates_args=("routing_replay_out", "workspace_buffer", "fc2_input_out"),
     )
     def trtllm_fp4_block_scale_moe_op(
         routing_input_mode: int,
@@ -3872,6 +3872,7 @@ def _build_trtllm_moe_namespace(module):
         nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
         routing_metadata: Optional[List[torch.Tensor]] = None,
         routing_metadata_tile_n: int = -1,
+        fc2_input_out: Optional[List[torch.Tensor]] = None,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -3896,10 +3897,11 @@ def _build_trtllm_moe_namespace(module):
             gemm1_lora_delta is not None
             or n_fused_shared
             or workspace_buffer is not None
+            or fc2_input_out is not None
         ):
             raise ValueError(
-                "routing_metadata supports neither gemm1_lora_delta, fused shared experts "
-                "nor workspace_buffer"
+                "routing_metadata supports neither gemm1_lora_delta, fused shared experts, "
+                "workspace_buffer nor fc2_input_out"
             )
         total_experts_per_token = top_k + n_fused_shared
         # GEMM2's N (what the FC2 weights are sized for) and the narrower
@@ -4112,6 +4114,7 @@ def _build_trtllm_moe_namespace(module):
                 workspace_buffer,
                 False,  # query_workspace_size
                 nvfp4_4over6_code,
+                [] if fc2_input_out is None else list(fc2_input_out),
             )
             # FP4 always borrows the caller's topk_weights buffer (the launcher has
             # no allocate branch), so it is always the source for expert_weights.
@@ -4139,6 +4142,7 @@ def _build_trtllm_moe_namespace(module):
             and do_finalize
             and gemm1_lora_delta is None
             and num_fused_shared_experts == 0
+            and fc2_input_out is None
             and 0 < num_experts <= DA_MAX_EXPERTS
         )
         if not da_eligible:
@@ -4226,11 +4230,12 @@ def _build_trtllm_moe_namespace(module):
         nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
         routing_metadata: Optional[List[torch.Tensor]] = None,
         routing_metadata_tile_n: int = -1,
+        fc2_input_out: Optional[List[torch.Tensor]] = None,
     ):
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
         _ = routing_replay_out, valid_intermediate_size
         _ = hidden_states_scale_layout, nvfp4_4over6_code
-        _ = routing_metadata, routing_metadata_tile_n
+        _ = routing_metadata, routing_metadata_tile_n, fc2_input_out
         # Derive the padded hidden size exactly as the eager op does (NVFP4
         # activations arrive uint8-packed, two values per byte); GEMM2 then computes
         # roundUp(valid_hidden_size, 128) columns while finalize hands back only the
@@ -6985,6 +6990,7 @@ def trtllm_fp4_block_scale_moe(
     hidden_states_scale_layout: Optional[SfLayout] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+    fc2_input_out: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE operation.
 
@@ -7192,6 +7198,28 @@ def trtllm_fp4_block_scale_moe(
           no other path has a 4over6 requantization, so a pinned recipe
           raises :class:`ValueError`.
 
+    fc2_input_out : Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+        Optional ``(codes, block_scales, token_scales)`` buffers that receive
+        a copy of the GEMM2 (FC2) input exactly as GEMM2 reads it, in
+        ``(token, top-k slot)`` order:
+
+        - ``codes``: ``uint8`` ``[num_tokens_or_larger, top_k, intermediate_size // 2]``,
+          packed E2M1 (element ``2i`` in the low nibble);
+        - ``block_scales``: ``float8_e4m3fn`` (or ``uint8``)
+          ``[num_tokens_or_larger, top_k, intermediate_size // 16]``, linear
+          (not swizzled), one scale per 16 elements;
+        - ``token_scales``: ``float32`` ``[num_tokens_or_larger, top_k]``, the
+          per-row decode scale; the row dequantizes as
+          ``e2m1(codes) * block_scales * token_scales``.
+
+        Only rows ``[0, num_tokens)`` are written, so a buffer allocated for
+        the largest batch can be reused under CUDA graphs. Slots routed to an
+        expert outside ``[local_expert_offset, local_expert_offset +
+        local_num_experts)`` are zero-filled. Requires ``per_token_scale``
+        (the per-token NvFP4 path, where the GEMM2 input is quantized by a
+        separate kernel); not supported with fused shared experts. Autotuning
+        profiles do not write it. Default ``None`` (no copy, no extra work).
+
     Returns
     -------
     List[torch.Tensor]
@@ -7262,6 +7290,7 @@ def trtllm_fp4_block_scale_moe(
         hidden_states_scale_layout,
         workspace_buffer=workspace_buffer,
         nvfp4_4over6_code=nvfp4_4over6_code_value,
+        fc2_input_out=fc2_input_out,
     )
 
 
@@ -7306,6 +7335,7 @@ def trtllm_fp4_block_scale_routed_moe(
     workspace_buffer: Optional[torch.Tensor] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     routing_metadata: Optional[TrtllmMoERoutingMetadataSlot] = None,
+    fc2_input_out: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation with pre-computed routing.
 
@@ -7509,6 +7539,28 @@ def trtllm_fp4_block_scale_routed_moe(
         fused shared experts or ``workspace_buffer`` (``ValueError``).
         Default ``None`` (route inside the call).
 
+    fc2_input_out : Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+        Optional ``(codes, block_scales, token_scales)`` buffers that receive
+        a copy of the GEMM2 (FC2) input exactly as GEMM2 reads it, in
+        ``(token, top-k slot)`` order:
+
+        - ``codes``: ``uint8`` ``[num_tokens_or_larger, top_k, intermediate_size // 2]``,
+          packed E2M1 (element ``2i`` in the low nibble);
+        - ``block_scales``: ``float8_e4m3fn`` (or ``uint8``)
+          ``[num_tokens_or_larger, top_k, intermediate_size // 16]``, linear
+          (not swizzled), one scale per 16 elements;
+        - ``token_scales``: ``float32`` ``[num_tokens_or_larger, top_k]``, the
+          per-row decode scale; the row dequantizes as
+          ``e2m1(codes) * block_scales * token_scales``.
+
+        Only rows ``[0, num_tokens)`` are written, so a buffer allocated for
+        the largest batch can be reused under CUDA graphs. Slots routed to an
+        expert outside ``[local_expert_offset, local_expert_offset +
+        local_num_experts)`` are zero-filled. Requires ``per_token_scale``
+        (the per-token NvFP4 path, where the GEMM2 input is quantized by a
+        separate kernel); not supported with fused shared experts. Autotuning
+        profiles do not write it. Default ``None`` (no copy, no extra work).
+
     Returns
     -------
     torch.Tensor or List[torch.Tensor]
@@ -7601,6 +7653,7 @@ def trtllm_fp4_block_scale_routed_moe(
         routing_metadata_tile_n=(
             -1 if routing_metadata is None else routing_metadata.tile_n
         ),
+        fc2_input_out=fc2_input_out,
     )
 
 
@@ -8387,9 +8440,11 @@ def _trtllm_fused_moe_workspace_size_impl(
             *ordinary, *valid,
         )  # fmt: skip
     # Every entry point ends with (workspace_buffer, query_workspace_size); the FP4
-    # entry additionally takes the 4over6 recipe code.
-    tail = (
-        (NVFP4_4OVER6_CODE_FROM_ENV,) if fn is moe_op.trtllm_fp4_block_scale_moe else ()
+    # entry additionally takes the 4over6 recipe code and fc2_input_out.
+    tail: Tuple[Any, ...] = (
+        (NVFP4_4OVER6_CODE_FROM_ENV, [])
+        if fn is moe_op.trtllm_fp4_block_scale_moe
+        else ()
     )
     result = fn(*args, None, True, *tail)
     return int(_torch_view_of_ffi_tensor(result[0]).item())

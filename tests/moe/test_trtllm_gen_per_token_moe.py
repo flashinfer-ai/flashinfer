@@ -81,10 +81,11 @@ def _per_token_routed_case(
 ):
     """Build per-token NVFP4 inputs for the routed flat APIs and the reference.
 
-    Returns ``(kwargs, reference)``; ``kwargs`` is the keyword form of the
-    ``trtllm_fp4_block_scale_routed_moe`` call. The activation is quantized
-    under the ambient 4over6 environment; the weights under
-    ``weights_use_4over6``.
+    Returns ``(kwargs, reference, parts)``; ``kwargs`` is the keyword form of
+    the ``trtllm_fp4_block_scale_routed_moe`` call and ``parts`` holds the
+    routing, the dequantized FC2 weights and the reference FC2 input. The
+    activation is quantized under the ambient 4over6 environment; the weights
+    under ``weights_use_4over6``.
     """
     enable_pdl = device_support_pdl(device)
 
@@ -229,6 +230,9 @@ def _per_token_routed_case(
     expert_out = torch.zeros(
         num_tokens * top_k, hidden_size, device=device, dtype=torch.bfloat16
     )
+    intermediate = torch.zeros(
+        num_tokens * top_k, intermediate_size, device=device, dtype=torch.bfloat16
+    )
     for e in range(num_experts):
         mask = flat_ids == e  # [num_tokens*top_k]
         e_hidden = flat_hidden[mask]  # [n_e, hidden_size]
@@ -238,6 +242,7 @@ def _per_token_routed_case(
             inter_e = F.silu(gate_e) * up_e  # [n_e, intermediate_size]
         else:
             inter_e = F.relu(up_gate_e) ** 2  # [n_e, intermediate_size]
+        intermediate[mask] = inter_e
         expert_out[mask] = inter_e @ w2_dequant[e].T  # [n_e, hidden_size]
     # Weighted sum back to [num_tokens, hidden_size]
     reference = (
@@ -353,7 +358,13 @@ def _per_token_routed_case(
         activation_type=activation_type.value,
         per_token_scale=per_token_scale_inv,
     )
-    return kwargs, reference
+    parts = dict(
+        topk_ids=topk_ids,
+        expert_weights=expert_weights,
+        w2_dequant=w2_dequant,
+        intermediate=intermediate.view(num_tokens, top_k, intermediate_size),
+    )
+    return kwargs, reference, parts
 
 
 @pytest.mark.parametrize("num_tokens", [1, 1024])
@@ -384,7 +395,7 @@ def test_routed_fused_moe(
 ):
     device = torch.device("cuda:0")
     _skip_unless_sm10x(device)
-    kwargs, reference = _per_token_routed_case(
+    kwargs, reference, _ = _per_token_routed_case(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -433,7 +444,7 @@ def test_pinned_recipe_matches_env(recipe: NVFP44Over6Config, use_4over6: bool):
     """
     device = torch.device("cuda:0")
     _skip_unless_sm10x(device)
-    kwargs, _reference = _per_token_routed_case(
+    kwargs, _reference, _ = _per_token_routed_case(
         num_tokens=64,
         hidden_size=1024,
         intermediate_size=2048,
@@ -464,3 +475,224 @@ def test_pinned_recipe_matches_env(recipe: NVFP44Over6Config, use_4over6: bool):
     assert not torch.equal(env_on, env_off)
     assert torch.equal(pinned_under_env_off, env_on)
     assert torch.equal(none_under_env_on, env_off)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 1024])
+@pytest.mark.parametrize("expert_parallel", [False, True])
+def test_fc2_input_out(num_tokens: int, expert_parallel: bool):
+    """``fc2_input_out`` receives exactly the GEMM2 input the kernel consumes.
+
+    One token runs a small tile (8x4 scale layout), 1024 tokens a large one
+    (128x4). Expert parallelism leaves the slots of non-local experts zeroed.
+    """
+    device = torch.device("cuda:0")
+    _skip_unless_sm10x(device)
+    hidden_size, intermediate_size, num_experts, top_k = 1024, 2048, 32, 4
+    kwargs, _reference, parts = _per_token_routed_case(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        use_4over6=False,
+        weights_use_4over6=False,
+        activation_type=ActivationType.Swiglu,
+        zero_rows=False,
+        device=device,
+    )
+    num_local = num_experts // 2 if expert_parallel else num_experts
+    for name in (
+        "gemm1_weights",
+        "gemm1_weights_scale",
+        "gemm2_weights",
+        "gemm2_weights_scale",
+        "output1_scale_scalar",
+        "output1_scale_gate_scalar",
+        "output2_scale_scalar",
+    ):
+        kwargs[name] = kwargs[name][:num_local].contiguous()
+    kwargs["local_num_experts"] = num_local
+
+    # Larger than the batch, as a CUDA-graph buffer would be; poisoned so that
+    # unwritten rows show.
+    rows = num_tokens + 3
+    codes = torch.full(
+        (rows, top_k, intermediate_size // 2), 0xFF, dtype=torch.uint8, device=device
+    )
+    scales = torch.full(
+        (rows, top_k, intermediate_size // 16), 0xFF, dtype=torch.uint8, device=device
+    ).view(torch.float8_e4m3fn)
+    token_scales = torch.full((rows, top_k), float("nan"), device=device)
+    fc2_input_out = (codes, scales, token_scales)
+    output = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+
+    def run(capture: bool) -> None:
+        with autotune(False):
+            trtllm_fp4_block_scale_routed_moe(
+                **kwargs,
+                output=output,
+                fc2_input_out=fc2_input_out if capture else None,
+            )
+
+    run(False)
+    plain = output.clone()
+    run(True)
+    torch.cuda.synchronize()
+    # The copy does not change the result.
+    assert torch.equal(output, plain)
+    assert (codes[num_tokens:] == 0xFF).all()
+    assert torch.isnan(token_scales[num_tokens:]).all()
+
+    local = parts["topk_ids"] < num_local  # [num_tokens, top_k]
+    codes_t = codes[:num_tokens]
+    scales_t = scales[:num_tokens].view(torch.uint8)
+    token_scales_t = token_scales[:num_tokens]
+    assert (codes_t[~local] == 0).all() and (scales_t[~local] == 0).all()
+    assert (token_scales_t[~local] == 0).all()
+    assert (token_scales_t[local] > 0).all()
+
+    fc2_input = e2m1_and_ufp8sf_scale_to_float(
+        codes_t.reshape(num_tokens * top_k, -1).cpu(),
+        scales_t.reshape(-1).cpu(),
+        torch.tensor([1.0], device="cpu"),
+        16,
+        1,
+        False,
+    ).to(device)
+    fc2_input = (fc2_input * token_scales_t.reshape(-1, 1)).view(
+        num_tokens, top_k, intermediate_size
+    )
+
+    # It is the activation, quantized to NvFP4 ...
+    if local.any():
+        ref = parts["intermediate"][local].float()
+        rel = (fc2_input[local] - ref).norm() / ref.norm()
+        assert rel < 0.15, rel
+
+    # ... and GEMM2 + finalize over it reproduce the kernel output.
+    recon = torch.zeros(num_tokens, hidden_size, device=device)
+    for e in range(num_local):
+        token, slot = (parts["topk_ids"] == e).nonzero(as_tuple=True)
+        weight = parts["expert_weights"][token, slot].float().unsqueeze(1)
+        out_e = fc2_input[token, slot] @ parts["w2_dequant"][e].float().T
+        recon.index_add_(0, token, weight * out_e)
+    if recon.norm() == 0:
+        assert (plain == 0).all()
+    else:
+        rel = (plain.float() - recon).norm() / recon.norm()
+        assert rel < 1e-2, rel
+
+    # CUDA-graph replay writes the same bytes.
+    eager = [t.view(torch.uint8).clone() for t in fc2_input_out]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(True)
+    for t in fc2_input_out:
+        t.view(torch.uint8).zero_()
+    output.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    for got, want in zip(fc2_input_out, eager, strict=True):
+        assert torch.equal(got.view(torch.uint8)[:num_tokens], want[:num_tokens])
+    assert torch.equal(output, plain)
+
+
+def test_fc2_input_out_requires_per_token_scale():
+    device = torch.device("cuda:0")
+    _skip_unless_sm10x(device)
+    kwargs, _reference, _ = _per_token_routed_case(
+        num_tokens=8,
+        hidden_size=1024,
+        intermediate_size=2048,
+        num_experts=32,
+        top_k=4,
+        use_4over6=False,
+        weights_use_4over6=False,
+        activation_type=ActivationType.Swiglu,
+        zero_rows=False,
+        device=device,
+    )
+    fc2_input_out = (
+        torch.empty(8, 4, 1024, dtype=torch.uint8, device=device),
+        torch.empty(8, 4, 128, dtype=torch.uint8, device=device),
+        torch.empty(8, 4, dtype=torch.float32, device=device),
+    )
+    kwargs["per_token_scale"] = None
+    with pytest.raises(Exception, match="per_token_scale"), autotune(False):
+        trtllm_fp4_block_scale_routed_moe(**kwargs, fc2_input_out=fc2_input_out)
+
+
+def test_fc2_input_out_bypasses_trace_apply():
+    """A registered Trace Apply solution replaces the plain call (the control) but
+    would not fill ``fc2_input_out``, so a call that asks for the copy runs the
+    kernel."""
+    import flashinfer.fused_moe as fused_moe
+    import flashinfer.trace_apply as ta
+    from flashinfer.trace_apply.apply import (
+        _registry_by_fi_api,
+        bind_namespace,
+        build_extractor_maps,
+        extract_axes,
+    )
+
+    device = torch.device("cuda:0")
+    _skip_unless_sm10x(device)
+    num_tokens, hidden_size, intermediate_size, top_k = 8, 1024, 2048, 4
+    kwargs, _reference, _ = _per_token_routed_case(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=32,
+        top_k=top_k,
+        use_4over6=False,
+        weights_use_4over6=False,
+        activation_type=ActivationType.Swiglu,
+        zero_rows=False,
+        device=device,
+    )
+    reg = _registry_by_fi_api()
+    key = next(k for k in reg if k.endswith(".trtllm_fp4_block_scale_routed_moe"))
+    original, templates = reg[key]
+    namespace = bind_namespace(original, (), kwargs)
+    name = templates[0].definition_name(
+        extract_axes(build_extractor_maps(templates), namespace)
+    )
+    calls: list = []
+
+    def solution(*args, **kw):
+        calls.append(1)
+        return [
+            torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+        ]
+
+    codes = torch.full(
+        (num_tokens, top_k, intermediate_size // 2),
+        0xFF,
+        dtype=torch.uint8,
+        device=device,
+    )
+    fc2_input_out = (
+        codes,
+        torch.empty(
+            num_tokens, top_k, intermediate_size // 16, dtype=torch.uint8, device=device
+        ),
+        torch.empty(num_tokens, top_k, dtype=torch.float32, device=device),
+    )
+    ta.enable_apply({name: solution})
+    try:
+        with autotune(False):
+            # Looked up at call time: Trace Apply patches the flashinfer modules.
+            fused_moe.trtllm_fp4_block_scale_routed_moe(**kwargs)
+            assert calls, (
+                f"the control: the solution replaces the plain call {ta.stats()}"
+            )
+            seen = len(calls)
+            fused_moe.trtllm_fp4_block_scale_routed_moe(
+                **kwargs, fc2_input_out=fc2_input_out
+            )
+        torch.cuda.synchronize()
+        assert len(calls) == seen, "the solution ran for a call with fc2_input_out"
+        assert not (codes == 0xFF).all(), "fc2_input_out was not written"
+        assert ta.stats().get(key, {}).get("fallback_fc2_input_out", 0) >= 1
+    finally:
+        ta.disable_apply()
