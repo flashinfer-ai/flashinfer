@@ -110,7 +110,6 @@ def test_cudnn_paged_prefill_cu_seqlens_direct_matches_legacy(
     common = dict(
         max_token_per_sequence=s_qo,
         max_sequence_kv=s_kv,
-        actual_seq_lens_q=inp["actual_seq_lens_q"],
         actual_seq_lens_kv=inp["actual_seq_lens_kv"],
         block_tables=inp["block_tables"],
         causal=causal,
