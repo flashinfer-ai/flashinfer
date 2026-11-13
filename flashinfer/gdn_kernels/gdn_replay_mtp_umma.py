@@ -695,7 +695,7 @@ class GdnReplayMtpUmma:
                 s_gram[(16 + grp) * 16 + gc + 1] = accx[1]
                 s_gram[(24 + grp) * 16 + gc] = accx[2]
                 s_gram[(24 + grp) * 16 + gc + 1] = accx[3]
-                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                U.bar_sync_ua(1, 128)
                 # X tile (fp16, SW128) and x_ready from these warps' own rows: they hold the
                 # same rows as the ring-row warps and have nothing in flight, so the readout
                 # can start once the X x X Gram is done instead of after the ring rows
@@ -784,7 +784,7 @@ class GdnReplayMtpUmma:
             else:
                 wr0 = wo  # ring rows grp / grp + 8, issued when the cursors landed
                 wr1 = wr1_e
-                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                U.bar_sync_ua(1, 128)
                 # norm of this lane's X row (for the k̂ ring append below)
                 rn_b = cute.math.rsqrt(s_gram[(16 + xr_b) * 16 + xr_b] + Float32(_EPS))
                 rn_b = _sel(xr_b >= T, rn_b * scale, rn_b, Float32)
@@ -836,7 +836,7 @@ class GdnReplayMtpUmma:
                                 kw4[2],
                                 kw4[3],
                             )
-            cute.arch.barrier(barrier_id=1, number_of_threads=128)
+            U.bar_sync_ua(1, 128)
 
             # -------- after the ring tiles: C tile (warps mt == 1), window weights, g-ring
             # appends, Kt (flush rows)
@@ -910,7 +910,7 @@ class GdnReplayMtpUmma:
                         if P > 0:
                             egp = cute.math.exp(gp_w, fastmath=True)
                         s_coef[wh * _COEF + _CO_EGP] = egp
-            cute.arch.barrier(barrier_id=1, number_of_threads=128)
+            U.bar_sync_ua(1, 128)
 
             tbase = tmem_addr[0]
             ctx = dict(
@@ -960,28 +960,25 @@ class GdnReplayMtpUmma:
         aq = q_g + Int64(cute.crd2idx((brow, t_q, kh, 0), q.layout)) * 2
         return _sel(is_q, aq, ak, Int64)
 
+    @cute.jit
     def _u_window_copy(self, u_cache, u_g, uw_addr, mbar, sidx, hv, base, buf):
         """Bulk-copy logical window slots j = 0..15 (physical (base + j) & 31) of one value
         head's u ring into SMEM buffer ``buf`` as [j][V]. Call under elect_one.
 
         The window's 16 ring slots wrap at most once: two contiguous copies instead of
         sixteen single-row ones (saves ~0.5 us of warp 0's serial issue per head pair).
-        Without a wrap the second copy re-copies row 15 (the same bytes), so the transaction
-        count stays expression-only."""
+        Without a wrap there is only the first copy, so no two copies write the same rows."""
         rowb = V_DIM * 2
         src_head = u_g + Int64(cute.crd2idx((sidx, hv, 0, 0), u_cache.layout)) * 2
         dst = uw_addr + buf * (W_RING * rowb)
         n1 = _sel(
             base + W_RING <= RING_SLOTS, Int32(W_RING), Int32(RING_SLOTS) - base, Int32
         )
-        n2 = _sel(n1 < W_RING, Int32(W_RING) - n1, Int32(1), Int32)
-        d2 = _sel(n1 < W_RING, n1, Int32(W_RING - 1), Int32)
-        s2 = _sel(n1 < W_RING, Int32(0), (base + Int32(W_RING - 1)) & RING_MASK, Int32)
+        n2 = Int32(W_RING) - n1
         cute.arch.mbarrier_arrive_and_expect_tx(mbar, (n1 + n2) * rowb)
         U.bulk_g2s(dst, src_head + Int64(base * rowb), n1 * rowb, mbar.toint())
-        U.bulk_g2s(
-            dst + d2 * rowb, src_head + Int64(s2 * rowb), n2 * rowb, mbar.toint()
-        )
+        if n2 > 0:
+            U.bulk_g2s(dst + n1 * rowb, src_head, n2 * rowb, mbar.toint())
 
     def _d_build(self, hh, dcol, ctx):
         """D row w_j u_j (j < P, fp16 pairs) of head hh into TMEM columns dcol..dcol+7;
@@ -1494,8 +1491,8 @@ def gated_delta_rule_mtp_ucache_flush_umma(
         raise NotImplementedError(
             "stochastic rounding needs cvt.rs (sm_100a / sm_103a / sm_107a)"
         )
-    if mode == "philox" and philox_rounds <= 0:
-        raise ValueError(f"philox_rounds must be > 0, got {philox_rounds}")
+    if mode == "philox" and philox_rounds < 2:
+        raise ValueError(f"philox_rounds must be >= 2, got {philox_rounds}")
     sr = {
         "none": "",
         "philox": "philox",

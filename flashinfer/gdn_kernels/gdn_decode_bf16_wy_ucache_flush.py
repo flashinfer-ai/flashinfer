@@ -157,6 +157,28 @@ except ImportError:
     except ImportError:
         _UMMA_RUBIN = None
 
+# Opt-in ring-depth UMMA variant (backend="umma_ring": 64-slot rings with a 32-row window, or 32-slot rings under the merged contract), imported on first use.
+_UMMA_RING64_SLOTS = 64
+_UMMA_RING64_WINDOW = 32  # rows of the ring-64 window (its W_RING)
+_UMMA_RING32_WINDOW = 16  # rows of the 32-slot window the ring-64 kernel serves
+_UMMA_RING_DEPTHS = (32, _UMMA_RING64_SLOTS)
+
+
+def _load_umma_ring():
+    """The ring-64 UMMA kernel function, or None when its module cannot be imported."""
+    try:
+        from .gdn_replay_mtp_umma_ring64 import (
+            gated_delta_rule_mtp_ucache_flush_umma_ring64 as fn,
+        )
+    except ImportError:
+        try:
+            from flashinfer.gdn_kernels.gdn_replay_mtp_umma_ring64 import (
+                gated_delta_rule_mtp_ucache_flush_umma_ring64 as fn,
+            )
+        except ImportError:
+            return None
+    return fn
+
 
 # Problem dimensions. One CTA processes a full V tile per (request, head).
 T = 16
@@ -3249,11 +3271,11 @@ def _cached_bf16(t):
 
 
 def _umma_unavailable_reason(
-    device, T, H, HK, HV, pools_contig, pdl_trigger
+    device, T, H, HK, HV, pools_contig, pdl_trigger, require_legacy=True
 ) -> Optional[str]:
     """None when the UMMA backend can serve this call, else why not (``backend="umma"``
     raises with it; ``"auto"`` falls back to the HMMA kernel)."""
-    if _UMMA is None:
+    if require_legacy and _UMMA is None:
         return "flashinfer.gdn_kernels.gdn_replay_mtp_umma could not be imported"
     if gdn_device_target(device).major != 10:
         return "needs an SM100-class GPU (tcgen05 / TMEM)"
@@ -3357,7 +3379,21 @@ def gated_delta_rule_mtp_ucache_flush(
     (``"umma"`` raises ``ValueError`` when unavailable). Both implement the
     same contract; they
     differ in rounding only (fp32 accumulation in both, different summation
-    orders). ``stochastic_rounding`` (``"philox"`` / ``"lcg"``, with
+    orders). ``"umma_ring"`` (never chosen by ``"auto"``) opts into the ring-depth UMMA
+    kernel ``gdn_replay_mtp_umma_ring64`` and accepts **64-slot** rings
+    (k [pool, H, 64, K], u [pool, HV, 64, V], g [pool, HV, 64]; +0.63 MiB per
+    request and layer) or **32-slot** rings (the ring depth is compile-time,
+    read from ``k_cache.shape[2]``; other depths raise ``ValueError``).
+    64 slots: a 32-row window; ``flush_min`` defaults to nu - T + 1
+    (T = 4: 29, T = 8: 25; 16 at T = 1), legal ``hist_len`` is
+    [0, min(nu, flush_min - 1 + T)] ([0, nu] at T = 1), ``cache_base`` [0, 64).
+    32 slots: the merged kernel's contract only, a 16-row window with
+    ``flush_min`` defaulting to (and at most) 17 - T, legal ``hist_len``
+    [0, min(16, flush_min - 1 + T)], ``cache_base`` [0, 32), bit-identical to
+    the ``"umma"`` backend on the same rings; a larger ``flush_min`` raises
+    ``ValueError`` (deeper windows need 64-slot rings). It takes a bf16 k ring and a bf16 or fp16 u ring (vLLM's u-cache dtype), and 4 value heads per key head.
+    The contents of a 32-slot ring are the ``"umma"`` backend's; those of a 64-slot ring are not interchangeable with either.
+    ``stochastic_rounding`` (``"philox"`` / ``"lcg"``, with
     ``rand_seed`` and ``philox_rounds``; off unless set) rounds the fp16
     state written by flush rows stochastically and is implemented by the
     UMMA backend only (see that function's docstring). ``rand_seed`` is
@@ -3471,15 +3507,59 @@ def gated_delta_rule_mtp_ucache_flush(
         # appends back into the live window — the write-after-read race the
         # ring exists to remove. The graph-captured serving path passes
         # restart_hist_on_flush=False and owns these invariants.
+        # backend="umma_ring" has its own limits: 32 or 64 slots and a window of
+        # min(nu, flush_min - 1 + T) rows (64 slots: nu = min(32, 64 - T), the full
+        # nu rows at T = 1, whose rings may come from larger-T steps; 32 slots: the
+        # merged kernel's 16-row window, nu = 16, flush_min <= 17 - T).
         if not torch.cuda.is_current_stream_capturing():
+            if (
+                backend != "umma_ring"
+                and k_cache is not None
+                and k_cache.shape[-2] == _UMMA_RING64_SLOTS
+            ):
+                raise ValueError(
+                    "gated_delta_rule_mtp_ucache_flush: 64-slot rings are served "
+                    f"by backend='umma_ring' only, got backend={backend!r}."
+                )
+            if backend == "umma_ring":
+                _slots = k_cache.shape[-2] if k_cache is not None else None
+                if _slots not in _UMMA_RING_DEPTHS:
+                    raise ValueError(
+                        "gated_delta_rule_mtp_ucache_flush: backend='umma_ring' needs "
+                        f"32- or {_UMMA_RING64_SLOTS}-slot rings; got k_cache "
+                        f"{None if k_cache is None else tuple(k_cache.shape)}."
+                    )
+                _win = (
+                    _UMMA_RING64_WINDOW
+                    if _slots == _UMMA_RING64_SLOTS
+                    else _UMMA_RING32_WINDOW
+                )
+                _nu = min(_win, _slots - T)
+                if (
+                    _slots != _UMMA_RING64_SLOTS
+                    and flush_min is not None
+                    and flush_min > _win + 1 - T
+                ):
+                    raise ValueError(
+                        f"gated_delta_rule_mtp_ucache_flush: flush_min={flush_min} > "
+                        f"{_win + 1 - T} (= {_win + 1} - T) is not supported on {_slots}-slot "
+                        f"rings (merged-kernel contract only); use {_UMMA_RING64_SLOTS}-slot rings."
+                    )
+                if T == 1:
+                    _hl_cap = _nu
+                else:
+                    _fm = _nu - T + 1 if flush_min is None else flush_min
+                    _hl_cap = min(_nu, _fm - 1 + T)
+            else:
+                _slots, _hl_cap = RING_SLOTS, W_RING
             _hl_min, _hl_max = (int(x.item()) for x in hist_len.aminmax())
-            assert _hl_min >= 0 and _hl_max <= W_RING, (
-                f"hist_len out of legal range [0, {W_RING}]: "
+            assert _hl_min >= 0 and _hl_max <= _hl_cap, (
+                f"hist_len out of legal range [0, {_hl_cap}]: "
                 f"min={_hl_min} max={_hl_max}"
             )
             _cb_min, _cb_max = (int(x.item()) for x in cache_base.aminmax())
-            assert _cb_min >= 0 and _cb_max < RING_SLOTS, (
-                f"cache_base out of legal range [0, {RING_SLOTS}): "
+            assert _cb_min >= 0 and _cb_max < _slots, (
+                f"cache_base out of legal range [0, {_slots}): "
                 f"min={_cb_min} max={_cb_max}"
             )
     if initial_state_source.dim() == 5:
@@ -3553,6 +3633,86 @@ def gated_delta_rule_mtp_ucache_flush(
 
     h0 = initial_state_source
 
+    if backend == "umma_ring":
+        # Opt-in variant with its own ring contract (64 slots, 32-row window): served before the
+        # 32-slot ring validation below, which would reject its rings.
+        assert (
+            k_cache is not None
+            and u_cache is not None
+            and g_cache is not None
+            and hist_len is not None
+        ), "gated_delta_rule_mtp_ucache: k_cache/u_cache/g_cache/hist_len are required."
+        _pc = _inner_dense(h0, "initial_state_source")
+        for _t, _n in (
+            (k_cache, "k_cache"),
+            (u_cache, "u_cache"),
+            (g_cache, "g_cache"),
+        ):
+            _pc &= _inner_dense(_t, _n)
+        _r64 = _load_umma_ring()
+        _why = (
+            "flashinfer.gdn_kernels.gdn_replay_mtp_umma_ring64 could not be imported"
+            if _r64 is None
+            else _umma_unavailable_reason(
+                device, T, H, HK, HV, _pc, pdl_trigger, require_legacy=False
+            )
+        )
+        if _why is None and (
+            k_cache.dtype != torch.bfloat16
+            or u_cache.dtype not in (torch.bfloat16, torch.float16)
+        ):
+            _why = "needs a bf16 k ring and a bf16 or fp16 u ring"
+        if _why is None and HV // H != 4:
+            _why = f"needs 4 value heads per key head (got HV / H = {HV}/{H})"
+        if _why is None and tuple(k_cache.shape)[2:3] not in tuple(
+            (d,) for d in _UMMA_RING_DEPTHS
+        ):
+            _why = (
+                f"needs 32- or {_UMMA_RING64_SLOTS}-slot rings (k_cache [pool, H, "
+                f"{{32, {_UMMA_RING64_SLOTS}}}, K]); got k_cache {tuple(k_cache.shape)}"
+            )
+        if _why is None and not (
+            k_cache.dim() == 4
+            and u_cache.dim() == 4
+            and g_cache.dim() == 3
+            and k_cache.shape[2] == u_cache.shape[2] == g_cache.shape[2]
+        ):
+            _why = (
+                "needs k, u and g rings of one depth, got k_cache "
+                f"{tuple(k_cache.shape)}, u_cache {tuple(u_cache.shape)}, "
+                f"g_cache {tuple(g_cache.shape)}"
+            )
+        if _why is not None:
+            raise ValueError(
+                f"gated_delta_rule_mtp_ucache_flush: backend='umma_ring' unavailable: {_why}."
+            )
+        return _r64(
+            A_log_in,
+            a,
+            dt_bias_in,
+            softplus_beta,
+            softplus_threshold,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=h0,
+            initial_state_indices=initial_state_indices,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            scale=scale,
+            output=output,
+            k_cache=k_cache,
+            u_cache=u_cache,
+            g_cache=g_cache,
+            hist_len=hist_len,
+            cache_base=cache_base,
+            flush_min=flush_min,
+            restart_hist_on_flush=restart_hist_on_flush,
+            stochastic_rounding=stochastic_rounding,
+            rand_seed=rand_seed,
+            philox_rounds=philox_rounds,
+        )
+
     # --- (u-cache) ring validation -----------------------------------------
     assert (
         k_cache is not None
@@ -3594,10 +3754,10 @@ def gated_delta_rule_mtp_ucache_flush(
     cache_base = cache_base.contiguous()
 
     # --- backend ---------------------------------------------------------------
-    if backend not in ("auto", "umma", "hmma"):
+    if backend not in ("auto", "umma", "umma_ring", "hmma"):
         raise ValueError(
             f"gated_delta_rule_mtp_ucache_flush: backend={backend!r}; use 'auto', "
-            "'umma' or 'hmma'."
+            "'umma', 'umma_ring' or 'hmma'."
         )
     _why = "backend='hmma' was requested"
     if backend != "hmma":
