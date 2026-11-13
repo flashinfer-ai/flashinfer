@@ -28,7 +28,7 @@ def test_genphase_repeated_launches(monkeypatch, kind, early, ikr):
 
 
 @pytest.mark.arch_rubin
-@pytest.mark.parametrize("kind", ["mxfp8_e4m3", "mxfp4_mxfp8"])
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp4_mxfp8"])
 @pytest.mark.parametrize("capacity", [1, 17, 65, 129])
 @pytest.mark.parametrize("tile_n", [64, 128])
 @pytest.mark.parametrize(
@@ -56,7 +56,7 @@ def test_genphase_live_rows_and_sf_tile_boundaries(
         8,
         dict(
             kernel_variant="genphase",
-            mma_tiler_mnk=(256, tile_n, 128),
+            mma_tiler_mnk=(256, tile_n, 256 if kind == "nvfp4" else 128),
             cluster_shape_mn=(4, 1),
             fc2_use_bulk=True,
             fc2_tma_stages=1,
@@ -64,4 +64,21 @@ def test_genphase_live_rows_and_sf_tile_boundaries(
             schedule_policy=schedule,
             work_id_mode=work_id,
         ),
+    )
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize("topk", [31, 32, 33])
+def test_genphase_large_topk(monkeypatch, topk):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Requires SM107")
+    from tests.moe_ep.test_sm107_kernel_boundaries import _run_case
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    _run_case(
+        "mxfp8_e4m3",
+        3,
+        topk,
+        dict(kernel_variant="genphase", cluster_shape_mn=(4, 1), fc2_use_bulk=True),
+        num_experts=64,
     )

@@ -51,6 +51,8 @@ def make_workspace_config(
             activation=k.activation,
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
+            use_tanh_sigmoid=k.use_tanh_sigmoid,
+            epilogue_warpgroups=k.epilogue_warpgroups,
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             max_sm_count=k.max_sm_count,
             **tuning,

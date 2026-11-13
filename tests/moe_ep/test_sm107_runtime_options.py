@@ -248,3 +248,30 @@ def test_cache_fallback_is_valid_for_each_runtime_option(kernel_variant, combine
         combine_dtype=combine_dtype,
     )
     _config(kernel_variant=kernel_variant, combine_dtype=combine_dtype, **knobs)
+
+
+@pytest.mark.parametrize("config_cls,backend_cls,name", _BACKENDS)
+def test_epilogue_options_use_distinct_workspaces(
+    config_cls, backend_cls, name, monkeypatch
+):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    fleet = FleetParams(num_experts=8, max_tokens_per_rank=128, token_hidden_size=384)
+    keys = []
+    for tanh, warpgroups in ((False, 1), (True, 1), (False, 2), (True, 2)):
+        backend = create_mega_kernel(
+            config_cls(
+                256,
+                3,
+                fc2_use_bulk=True,
+                use_tanh_sigmoid=tanh,
+                epilogue_warpgroups=warpgroups,
+            )
+        )
+        backend.bind_ep_bootstrap(BootstrapConfig(rank=0, world_size=1))
+        resolved = backend._resolved_config(fleet)
+        assert (resolved.use_tanh_sigmoid, resolved.epilogue_warpgroups) == (
+            tanh,
+            warpgroups,
+        )
+        keys.append(backend._workspace_pool_key(fleet))
+    assert len(set(keys)) == 4

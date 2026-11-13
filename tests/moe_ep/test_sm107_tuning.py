@@ -95,6 +95,89 @@ def test_latency_reports_primary_and_rank0_medians(benchmark_module):
     }
 
 
+@pytest.mark.parametrize(
+    "kind", ["nvfp4", "mxfp4", "mxfp4_mxfp8", "mxfp8_e4m3", "mxfp8_e5m2"]
+)
+def test_benchmark_default_config_preserves_standard_settings(
+    benchmark_module, monkeypatch, kind
+):
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    args, _, _, _ = benchmark_module._parse_args([])
+    cfg = benchmark_module._make_backend_config(args, None, kind)
+    assert cfg.kernel_variant == "inference"
+    assert cfg.activation == "swiglu" and cfg.gate_up_clamp is None
+    assert cfg.apply_routing_weights_before_fc2 is True
+    assert cfg.knobs is None and cfg.fc2_use_bulk is False
+    assert cfg.use_tanh_sigmoid is False and cfg.epilogue_warpgroups == 1
+
+
+def test_benchmark_selects_situ_epilogue_options(benchmark_module, monkeypatch):
+    from flashinfer.moe_ep import FleetParams
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.validation import (
+        make_workspace_config,
+    )
+
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    args, _, _, _ = benchmark_module._parse_args(
+        [
+            "--activation",
+            "situ",
+            "--situ-beta",
+            "4",
+            "--situ-linear-beta",
+            "25",
+            "--use-tanh-sigmoid",
+            "--epilogue-warpgroups",
+            "2",
+            "--routing-weight-position",
+            "late",
+        ]
+    )
+    knobs = {"fc2_use_bulk": True, "fc2_tma_stages": 1}
+    cfg = benchmark_module._make_backend_config(args, knobs, "nvfp4")
+    assert (cfg.activation, cfg.situ_beta, cfg.situ_linear_beta) == ("situ", 4.0, 25.0)
+    assert cfg.use_tanh_sigmoid is True and cfg.epilogue_warpgroups == 2
+    assert cfg.apply_routing_weights_before_fc2 is False
+    assert cfg.knobs == knobs
+    workspace_config = make_workspace_config(
+        cfg,
+        FleetParams(num_experts=8, max_tokens_per_rank=128, token_hidden_size=3584),
+        rank=0,
+        world_size=4,
+        quant_kind="nvfp4",
+        gate_up_clamp=cfg.gate_up_clamp,
+        overrides=cfg.knobs,
+    )
+    monkeypatch.setattr(block_scaled, "_max_active_clusters", lambda size: 128 // size)
+    kernel = block_scaled.Sm107BlockScaledSymmBuffer._build_kernel(workspace_config)
+    assert kernel.epilogue.use_tanh_sigmoid is True
+    assert kernel.epilogue.two_epilogue_warpgroups is True
+
+
+def test_benchmark_genphase_uses_admitted_launch_defaults(
+    benchmark_module, monkeypatch
+):
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    args, tokens, _, _ = benchmark_module._parse_args(
+        ["--kernel-variant", "genphase", "--knobs", "heuristic"]
+    )
+    cfg = benchmark_module._make_backend_config(args, None, "mxfp4_mxfp8")
+    assert cfg.kernel_variant == "genphase"
+    assert cfg.cluster_shape_mn == (4, 1) and cfg.fallback_cluster_shape_mn is None
+    assert cfg.fc2_use_bulk is True
+    assert max(tokens) <= 1024
+
+
+def test_benchmark_blackwell_input_profile_keeps_default_clamp(
+    benchmark_module, monkeypatch
+):
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    args, _, _, _ = benchmark_module._parse_args(["--input-profile", "blackwell"])
+    assert (
+        benchmark_module._make_backend_config(args, None, "nvfp4").gate_up_clamp == 10.0
+    )
+
+
 def test_gaussian_routing_keeps_selected_scores(benchmark_module, monkeypatch):
     """Historical routing uses raw scores, including negative selected values."""
     monkeypatch.setattr(benchmark_module, "SEED", 0)
@@ -138,7 +221,14 @@ def test_benchmark_reports_staging_and_capture_allocation(
     benchmark_module, mode, execution, no_flush, staging, ownership, allocation
 ):
     protocol = benchmark_module._timing_protocol(
-        SimpleNamespace(mode=mode, execution=execution, no_l2_flush=no_flush, warmup=20)
+        SimpleNamespace(
+            mode=mode,
+            execution=execution,
+            no_l2_flush=no_flush,
+            warmup=20,
+            prequantized=False,
+            eager_completed_wall=False,
+        )
     )
     assert protocol["input_staging_in_timed_span"] is staging
     assert protocol["output_ownership"] == ownership

@@ -6,7 +6,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Int32, Int64
 
 from .device_workspace import DeviceWorkspace
-from .ptx_helpers import red_add_relaxed_sys_s32
+from ...common.ptx_helpers import red_add_relaxed_sys_s32
 
 
 class SoftwareGridSync:
@@ -113,7 +113,9 @@ class NvlinkBarrier(SoftwareGridSync):
         workspace: DeviceWorkspace,
         peer_rank_ptr_mapper,
     ) -> None:
-        super().assign_device_members(workspace)
+        # Explicit base call: inside a @cute.jit method a zero-argument super() resolves from the
+        # runtime type, so a subclass of NvlinkBarrier would recurse into this method instead.
+        SoftwareGridSync.assign_device_members(self, workspace)
         self._phase_counter = workspace.ptr(self.phase_counter_region)
         self._signal = workspace.ptr(self.signal_region)
         self._peer_rank_ptr_mapper = peer_rank_ptr_mapper

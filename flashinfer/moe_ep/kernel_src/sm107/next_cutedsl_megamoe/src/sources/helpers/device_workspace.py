@@ -1,5 +1,6 @@
 """Declarative GMEM workspace shared by host layout and device access."""
 
+import copy
 import dataclasses
 from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
@@ -8,21 +9,25 @@ import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int32, Int64
 
+from ...common.utils import ceil_div, round_up
 from .utils import (
-    ceil_div,
     cosize_from_shape_stride_tuples,
     flatten_shape_stride,
     is_nested_shape,
     is_power_of_two,
     ordered_stride,
     row_major_stride,
-    round_up,
     validate_static_integer_tuple,
 )
 
 
 BufferResetAttr = Literal["data", "zero_on_first_allocate", "tail_reset"]
-BufferSpace = Literal["local", "shared"]
+# Regions register into "local" or "shared". "tmp" is never registered: a workspace built with
+# separate_tmp=True derives it at finalize() from the per-launch data of the local space.
+BufferSpace = Literal["local", "shared", "tmp"]
+
+_registration_spaces = ("local", "shared")
+_buffer_spaces = ("local", "shared", "tmp")
 
 _reset_order = {"tail_reset": 0, "zero_on_first_allocate": 1, "data": 2}
 
@@ -38,7 +43,7 @@ def _footprint_from_shape_stride(shape: Tuple, stride: Tuple) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class DeviceRegion:
-    """One typed region in a local or symmetric GMEM workspace."""
+    """One typed region in the local workspace, the shared (symmetric) workspace or the tmp buffer."""
 
     name: str
     dtype: Type[cutlass.Numeric]
@@ -52,7 +57,7 @@ class DeviceRegion:
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("A workspace region needs a non-empty name.")
-        if self.buffer_space not in ("local", "shared"):
+        if self.buffer_space not in _buffer_spaces:
             raise ValueError(f"Invalid buffer space {self.buffer_space!r}.")
         if self.reset not in _reset_order:
             raise ValueError(f"Invalid reset policy {self.reset!r}.")
@@ -80,21 +85,45 @@ class DeviceRegion:
             object.__setattr__(self, "stride", resolved_stride)
 
 
-class DeviceWorkspace:
-    """Single source of truth for GMEM region layout and device pointer derivation."""
+def _placed_in(region: DeviceRegion, buffer_space: BufferSpace) -> DeviceRegion:
+    """The same region in another buffer (dataclasses.replace would resolve its layout a second time)."""
+    placed = copy.copy(region)
+    object.__setattr__(placed, "buffer_space", buffer_space)
+    return placed
 
-    def __init__(self) -> None:
-        self._registered: Dict[BufferSpace, List[DeviceRegion]] = {"local": [], "shared": []}
+
+class DeviceWorkspace:
+    """Single source of truth for GMEM region layout and device pointer derivation.
+
+    Regions are registered into the local (rank-private) or the shared (symmetric) space. Inside a
+    space finalize() puts the kernel state first (tail_reset, then zero_on_first_allocate) and the
+    per-launch data behind it.
+
+    separate_tmp=True splits the local space at that boundary into two buffers:
+
+    local  kernel state only: persistent, zeroed once by the host, maintained by the kernel.
+    tmp    the per-launch data. No launch depends on what an earlier launch left there and
+           nothing in it has to survive the launch, so the caller owns the buffer, may fill it
+           with anything between launches and may pass a different one to every launch.
+
+    The split follows the reset class, so registration is the same in both modes. With
+    separate_tmp=False (the default) there is one local buffer, state first and data behind
+    it, and the tmp buffer is empty.
+    """
+
+    def __init__(self, separate_tmp: bool = False) -> None:
+        self._separate_tmp = bool(separate_tmp)
+        self._registered: Dict[BufferSpace, List[DeviceRegion]] = {"local": [], "shared": [], "tmp": []}
         self._region_by_name: Dict[str, DeviceRegion] = {}
         self._offset: Dict[str, int] = {}
         self._stride: Dict[str, Tuple] = {}
         self._cosize: Dict[str, int] = {}
         self._nbytes: Dict[str, int] = {}
         self._byte_alignment: Dict[str, int] = {}
-        self._total: Dict[BufferSpace, int] = {"local": 0, "shared": 0}
-        self._zero_leading: Dict[BufferSpace, int] = {"local": 0, "shared": 0}
-        self._tail_leading: Dict[BufferSpace, int] = {"local": 0, "shared": 0}
-        self._base: Dict[BufferSpace, Any] = {"local": None, "shared": None}
+        self._total: Dict[BufferSpace, int] = {"local": 0, "shared": 0, "tmp": 0}
+        self._zero_leading: Dict[BufferSpace, int] = {"local": 0, "shared": 0, "tmp": 0}
+        self._tail_leading: Dict[BufferSpace, int] = {"local": 0, "shared": 0, "tmp": 0}
+        self._base: Dict[BufferSpace, Any] = {"local": None, "shared": None, "tmp": None}
         self._finalized = False
 
     def __extract_mlir_values__(self) -> list:
@@ -106,6 +135,11 @@ class DeviceWorkspace:
     @property
     def finalized(self) -> bool:
         return self._finalized
+
+    @property
+    def separate_tmp(self) -> bool:
+        """True when the per-launch data of the local space lives in its own tmp buffer."""
+        return self._separate_tmp
 
     def register(
         self,
@@ -119,8 +153,20 @@ class DeviceWorkspace:
         byte_alignment: int = 16,
         reset: BufferResetAttr = "data",
     ) -> None:
+        """Add a region to the local or the shared space.
+
+        reset="data" is a statement about lifetime: no launch depends on what an earlier launch left in
+        the region. In a workspace built with separate_tmp=True such a local region lives in the
+        caller-owned tmp buffer, so it must tolerate arbitrary content at launch and a different buffer
+        on every launch, and it cannot carry anything from one launch to the next.
+        """
         if self._finalized:
             raise RuntimeError("Cannot register a region after finalize().")
+        if buffer_space not in _registration_spaces:
+            raise ValueError(
+                f"Region {name!r}: regions register into 'local' or 'shared', not {buffer_space!r}. "
+                "The tmp buffer is derived from the reset class of the local regions."
+            )
         if name in self._region_by_name or any(
             region.name == name for regions in self._registered.values() for region in regions
         ):
@@ -141,7 +187,16 @@ class DeviceWorkspace:
     def finalize(self) -> None:
         if self._finalized:
             raise RuntimeError("DeviceWorkspace.finalize() may only be called once.")
-        for buffer_space in ("local", "shared"):
+        if self._separate_tmp:
+            # Registration order is kept inside both halves and the tmp offsets restart at zero. Where
+            # the data of the single-buffer layout starts on a multiple of its largest alignment, the
+            # tmp buffer is exactly that data suffix.
+            local_regions = self._registered["local"]
+            self._registered["local"] = [region for region in local_regions if region.reset != "data"]
+            self._registered["tmp"] = [
+                _placed_in(region, "tmp") for region in local_regions if region.reset == "data"
+            ]
+        for buffer_space in _buffer_spaces:
             ordered = sorted(self._registered[buffer_space], key=lambda region: _reset_order[region.reset])
             cursor = 0
             for region_index, region in enumerate(ordered):
@@ -176,6 +231,11 @@ class DeviceWorkspace:
         self._finalized = True
 
     def regions(self, buffer_space: BufferSpace) -> Tuple[DeviceRegion, ...]:
+        """Regions of one space: as registered before finalize(), as placed afterwards.
+
+        With separate_tmp=True finalize() moves the local data regions to "tmp", so a placement read
+        before finalize() must not be kept.
+        """
         return tuple(self._registered[buffer_space])
 
     def region(self, name: str) -> DeviceRegion:
@@ -211,6 +271,17 @@ class DeviceWorkspace:
         self._require_finalized()
         return self._total["local"], self._total["shared"]
 
+    @property
+    def tmp_bytes(self) -> int:
+        """Size of the caller-owned tmp buffer; 0 unless the workspace separates it."""
+        self._require_finalized()
+        return self._total["tmp"]
+
+    def base_alignment(self, buffer_space: BufferSpace) -> int:
+        """Alignment the base pointer of a buffer needs: the largest one its regions assume."""
+        self._require_finalized()
+        return max((region.byte_alignment for region in self._registered[buffer_space]), default=1)
+
     def zero_on_allocate_bytes(self, buffer_space: BufferSpace) -> int:
         self._require_finalized()
         return self._zero_leading[buffer_space]
@@ -226,13 +297,19 @@ class DeviceWorkspace:
 
     @cute.jit
     def assign_device_members(
-        self, local_workspace: cute.Pointer, shared_workspace: Optional[cute.Pointer] = None
+        self,
+        local_workspace: cute.Pointer,
+        shared_workspace: Optional[cute.Pointer] = None,
+        tmp_buffer: Optional[cute.Pointer] = None,
     ) -> None:
+        # A buffer that stays None is unbound: ptr() of a region placed there fails at trace time
+        # instead of falling back to another base.
         self._base["local"] = local_workspace
         self._base["shared"] = shared_workspace
+        self._base["tmp"] = tmp_buffer
 
     def remove_device_members(self) -> None:
-        self._base = {"local": None, "shared": None}
+        self._base = {"local": None, "shared": None, "tmp": None}
 
     @cute.jit
     def ptr(self, name: str) -> cute.Pointer:

@@ -171,7 +171,7 @@ exclude = [
   "kimi-k3-megamoe/NOTICE",
 ]
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
-"flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
+"flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md", "export_manifest.json"]
 "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe" = ["*.md"]
 "flashinfer.prims_ts.moe" = [
   "prims_ts_moe_configs.json",

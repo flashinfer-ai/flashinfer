@@ -269,7 +269,7 @@ moe_ep/
     src/{a2a,fp8_gemm}/        ← VERBATIM drop from flashinfer PR #4069 (.cu/.cuh)
     shim/, __init__.py, VENDOR.md  ← shim is part of the upstream PR here (vendored with it)
   kernel_src/sm107/next_cutedsl_megamoe/  ← Rubin block-scaled inference
-    src/sources/               ← verbatim upstream exporter output; see VENDOR.md
+    src/{common,sources}/      ← upstream exporter output; see VENDOR.md
     shim/, __init__.py          ← FlashInfer adapters and public package API
     VENDOR.md, SKILL.md, TUNING.md  ← provenance, update procedure, and measurements
   modes/{split_layer,mega_layer,config}.py

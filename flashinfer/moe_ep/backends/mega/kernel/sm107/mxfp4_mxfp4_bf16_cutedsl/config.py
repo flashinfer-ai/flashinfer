@@ -50,3 +50,5 @@ class Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig:
     kernel_variant: Literal["inference", "genphase"] = "inference"
     # Quantizes the FC2 return payload; the operator still returns BF16.
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
+    use_tanh_sigmoid: bool = False
+    epilogue_warpgroups: int = 1

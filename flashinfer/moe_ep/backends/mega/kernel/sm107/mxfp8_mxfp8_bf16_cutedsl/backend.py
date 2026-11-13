@@ -200,6 +200,8 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             combine_dtype=k.combine_dtype,
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
+            use_tanh_sigmoid=k.use_tanh_sigmoid,
+            epilogue_warpgroups=k.epilogue_warpgroups,
             gate_up_clamp=_resolve_gate_up_clamp(k),
         )
 
@@ -402,6 +404,8 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             k.cluster_shape_mn,
             k.fallback_cluster_shape_mn,
             k.max_sm_count,
+            k.use_tanh_sigmoid,
+            k.epilogue_warpgroups,
             knobs_pool_key(self._knob_overrides(fleet_params)),
         )
 
