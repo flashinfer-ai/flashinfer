@@ -1130,7 +1130,12 @@ def pytest_collection_modifyitems(config, items):
     os.environ["MAX_JOBS"] = str(max(1, total_jobs // max_workers))
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(spec.build, verbose=False): spec for spec in specs}
+            # Take the per-module lock build_and_load() uses: parallel sharding
+            # workers can prewarm the same modules on a cold cache.
+            futures = {
+                pool.submit(spec.build, verbose=False, need_lock=True): spec
+                for spec in specs
+            }
             for fut in concurrent.futures.as_completed(futures):
                 try:
                     fut.result()
