@@ -4,10 +4,9 @@
 #include <cute/atom/mma_atom.hpp>
 #include <cute/atom/mma_traits_sm89.hpp>
 #include <cute/tensor.hpp>
+#include <flashinfer/fastdiv.cuh>
 
-#include "../../arch/barrier.cuh"
 #include "../../arch/common.cuh"
-#include "../../arch/cp_async.cuh"
 #include "../../compute/mega.cuh"
 #include "copy_atom.cuh"
 
@@ -35,14 +34,43 @@ struct Params {
   int kv_stride, extra_stride;
   float sm_scale;
 };
-__device__ float row_max4(float x) {
+
+struct PagedParams : Params {
+  bf16* bf16_output;
+  size_t lse_stride;
+  float lse_scale;
+  size_t page_stride, extra_page_stride;
+  int page_size, extra_page_size;
+  flashinfer::uint_fastdiv page_div, extra_page_div;
+};
+
+// Footer pages store all payload rows followed by all 16-byte scale rows.
+// Inline rows keep their original flat addressing specialization.
+template <bool Inline, bool Scale>
+__device__ __forceinline__ const uint8_t* cache_row(const PagedParams& p, bool extra, int id) {
+  const uint8_t* cache = extra ? p.extra_kv : p.kv;
+  if constexpr (Inline) {
+    return cache + size_t(max(id, 0)) * (extra ? p.extra_stride : p.kv_stride) + (Scale ? 512 : 0);
+  } else {
+    uint32_t page, row;
+    (extra ? p.extra_page_div : p.page_div).divmod(uint32_t(max(id, 0)), page, row);
+    const size_t page_stride = extra ? p.extra_page_stride : p.page_stride;
+    const int page_size = extra ? p.extra_page_size : p.page_size;
+    return cache + size_t(page) * page_stride +
+           (Scale ? size_t(page_size) * 512 + row * 16 : row * 512);
+  }
+}
+
+static __device__ __forceinline__ float row_max4(float x) {
   x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, 1));
   return fmaxf(x, __shfl_xor_sync(0xffffffff, x, 2));
 }
-__device__ float row_sum4(float x) {
+static __device__ __forceinline__ float row_sum4(float x) {
   x += __shfl_xor_sync(0xffffffff, x, 1);
   return x + __shfl_xor_sync(0xffffffff, x, 2);
 }
-__device__ float ue8(uint8_t x) { return __uint_as_float(uint32_t(x) << 23); }
+static __device__ __forceinline__ float ue8(uint8_t x) {
+  return __uint_as_float(uint32_t(x) << 23);
+}
 
 }  // namespace flashinfer::sparse_mla_sm120::cute_prefill

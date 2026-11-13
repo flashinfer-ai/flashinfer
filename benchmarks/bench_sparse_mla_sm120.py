@@ -29,10 +29,10 @@
 """Microbenchmark for sparse-MLA paged attention on SM120.
 
 ``--mega`` selects fused Q RoPE, attention, inverse RoPE and FP8 output for
-DSv4.1 prefill at every Q size. NaN marks rows outside this mode.
+DSv4.1 through public automatic dispatch. NaN marks rows outside this mode.
 ``--full-pipeline`` times the same work with separate transform kernels;
-otherwise timings cover attention alone. ``--force-prefill`` selects prefill
-for DSv4.1 non-mega measurements too. Compare checkout reports outside this script.
+otherwise timings cover attention alone. ``--force-prefill`` explicitly selects
+prefill for either mode, including small Q. Compare checkout reports outside this script.
 ``--cuda-graph`` uses warm-L2 replay; eager timing flushes L2.
 
 Sweeps representative shapes:
@@ -478,6 +478,7 @@ def bench_sparse_mla_sm120_dsv41(
     use_cuda_graph=False,
     full_pipeline=False,
     force_prefill=False,
+    report=None,
 ):
     """Returns (median_us, kv_bw_gbps) for DeepSeek-V4.1 on 64-token pages.
 
@@ -515,7 +516,7 @@ def bench_sparse_mla_sm120_dsv41(
         else None
     )
     wrapper = flashinfer.mla.SparseMLASm120Wrapper(
-        backend="sparse" if mega else "auto",
+        backend="sparse",
         kv_scale_format="ue8m0_g32_inline" if inline else "ue8m0_g32",
         extra_kv_fp4=extra_fp4,
         compute_precision=compute_precision,
@@ -532,7 +533,7 @@ def bench_sparse_mla_sm120_dsv41(
     scales = torch.empty(num_tokens, num_heads, 16, device=device, dtype=torch.uint8)
     rotated = torch.empty_like(q)
 
-    if mega or force_prefill:
+    if force_prefill:
         from flashinfer.mla._sparse_mla_sm120._execution import (
             resolve_attention,
             get_sparse_mla_sm120_module,
@@ -568,17 +569,20 @@ def bench_sparse_mla_sm120_dsv41(
             max_shared_bytes=props.shared_memory_per_block_optin,
         )
         module = get_sparse_mla_sm120_module()
-        lse = torch.empty(q.shape[:2], device=device, dtype=torch.float32)
+        mid_out, mid_lse, lse = [
+            torch.empty(tuple(shape), dtype=getattr(torch, str(dtype)), device=device)
+            for shape, dtype, _, _ in plan.workspace()
+        ]
 
-    def attention(query):
-        if mega or force_prefill:
+    def attention(query, fused=False):
+        if force_prefill:
             arguments = (
                 plan,
                 query,
                 main,
                 indices,
-                output,
-                lse,
+                mid_out,
+                mid_lse,
                 output,
                 lse,
                 512**-0.5,
@@ -589,14 +593,30 @@ def bench_sparse_mla_sm120_dsv41(
                 None,
                 1.0,
             )
-            if mega:
+            if fused:
                 module.execute_attention_rope_fp8(
                     *arguments, positions, cos_sin, quantized.view(torch.uint8), scales
                 )
             else:
                 module.execute_attention(*arguments)
+            return lse
+        elif fused:
+            return wrapper.run_mega(
+                query,
+                main,
+                indices,
+                quantized,
+                512**-0.5,
+                positions=positions,
+                cos_sin=cos_sin,
+                output_scales=scales,
+                extra_kv_cache=extra,
+                extra_indices=extra_indices,
+                prefill_impl=prefill_impl,
+                return_lse=True,
+            )
         else:
-            wrapper.run(
+            return wrapper.run(
                 query,
                 main,
                 indices,
@@ -605,6 +625,7 @@ def bench_sparse_mla_sm120_dsv41(
                 extra_kv_cache=extra,
                 extra_indices=extra_indices,
                 prefill_impl=prefill_impl,
+                return_lse=True,
             )
 
     if full_pipeline and not mega:
@@ -612,14 +633,49 @@ def bench_sparse_mla_sm120_dsv41(
 
         def fn():
             rope(q, positions, cos_sin, rotated)
-            attention(rotated)
+            result = attention(rotated)
             epilogue(output, positions, cos_sin, quantized, scales)
+            return result
     else:
 
         def fn():
-            attention(q)
+            return attention(q, fused=mega)
 
-    fn()
+    result = fn()
+    if mega:
+        from tests.attention.sparse_mla_prefill_utils import (
+            rope,
+            epilogue,
+            assert_mega_outputs,
+        )
+
+        expected = (quantized.clone(), scales.clone(), result.clone())
+        rope(q, positions, cos_sin, rotated)
+        separate_lse = attention(rotated)
+        epilogue(output, positions, cos_sin, quantized, scales)
+        assert_mega_outputs((quantized, scales, separate_lse), expected)
+        result = fn()
+    if report is not None:
+        import hashlib
+
+        digest = hashlib.sha256()
+        for tensor in (q, indices, extra_indices, positions, cos_sin):
+            if tensor is not None:
+                digest.update(
+                    tensor.contiguous().view(torch.uint8).cpu().numpy().tobytes()
+                )
+        report.update(
+            input_sha256=digest.hexdigest(),
+            dispatch="forced-prefill" if force_prefill else "public-auto",
+            plans=[dict(plan.inspect())]
+            if force_prefill
+            else [dict(p.plan.inspect()) for p in wrapper._prepared_calls.values()],
+            finite_output=bool(
+                torch.isfinite(
+                    quantized.float() if mega or full_pipeline else output
+                ).all()
+            ),
+        )
     torch.cuda.synchronize()
     measurements = bench_gpu_time(
         fn,
@@ -630,6 +686,8 @@ def bench_sparse_mla_sm120_dsv41(
         cold_l2_cache=not use_cuda_graph,
     )
     ms = float(np.median(measurements))
+    if report is not None:
+        report["samples_us"] = [float(t) * 1000 for t in measurements]
     extra_bpt = 288 if extra_fp4 else 528
     kv_bytes = num_tokens * (topk * 528 + extra_topk * extra_bpt)
     return ms * 1e3, kv_bytes * 1e-6 / ms
@@ -674,7 +732,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--mega", action="store_true", help="Select fused DSv4.1 prefill"
+        "--mega", action="store_true", help="Select public-auto fused DSv4.1 attention"
     )
     parser.add_argument(
         "--prefill-impl", choices=("auto", "mg", "swapab"), default="auto"
