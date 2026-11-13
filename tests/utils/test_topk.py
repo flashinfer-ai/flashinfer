@@ -535,6 +535,51 @@ def test_multi_cta_reuses_row_states_buffer_on_one_stream_across_regimes(
     torch.cuda.synchronize()
 
 
+def test_multi_cta_top_k_under_torch_compile_keeps_row_states_per_stream(
+    set_topk_algo,
+):
+    """``top_k`` traced by ``torch.compile(dynamic=True)`` runs, and its cached
+    ``row_states`` still follow the stream the compiled code runs on.
+
+    With dynamic shapes Dynamo may hand the stream-cache lookup a symbolic
+    device index, which raw CUDA bindings such as
+    ``torch._C._cuda_getCurrentRawStream`` reject while tracing.
+    """
+    set_topk_algo("multi_cta")
+    device = torch.device("cuda")
+    batch_size, k = 4, 512
+    logits = _build_strictly_descending_logits(batch_size, 131072, device)
+    expected_indices = (
+        torch.arange(k, device=device, dtype=torch.int64)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+    )
+
+    def fn(x):
+        values, indices = flashinfer.top_k(x, k, sorted=True)
+        return values * 2, indices
+
+    compiled = torch.compile(fn, dynamic=True, backend="eager")
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    try:
+        for stream in (stream_a, stream_b):
+            with torch.cuda.stream(stream):
+                values, indices = compiled(logits)
+                torch.testing.assert_close(values, logits[:, :k] * 2)
+                assert torch.equal(indices, expected_indices)
+        torch.cuda.synchronize()
+    finally:
+        torch._dynamo.reset()
+
+    with torch.cuda.stream(stream_a):
+        buf_a = _cached_row_states_buffer(logits.device)
+    with torch.cuda.stream(stream_b):
+        buf_b = _cached_row_states_buffer(logits.device)
+    assert buf_a is not None and buf_b is not None
+    assert buf_a is not buf_b
+
+
 def test_multi_cta_row_states_graph_replay_isolated_from_eager_stream(set_topk_algo):
     """Captured launches own their ``row_states``; eager launches on another stream own theirs."""
     set_topk_algo("multi_cta")
