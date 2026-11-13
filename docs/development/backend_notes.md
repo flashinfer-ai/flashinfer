@@ -207,7 +207,7 @@ specific wrapper.
 
 ### H100 D256 paged admission
 
-On H100 80GB HBM3 with 132 SMs, BF16 HND/page16 D256 auto may select cuDNN
+On H100 80GB HBM3 with 132 SMs, BF16 or FP16 HND/page16 D256 auto may select cuDNN
 when the native planner selects FA3. The existing short-query FA2 domain is
 retained. The domain covers batches 1–32, query heads 16–48, GQA groups 1/2/4/8/16,
 maximum Q 65–16384 and maximum KV at most 32768. Actual positive Q/KV lengths
@@ -218,7 +218,8 @@ least `2**24` actual causal query-key pairs across query heads:
 `Hq * sum(q_i * (2 * kv_i - q_i + 1) // 2)`. Small workloads retain their native
 FA2/FA3 provider. The calculation uses paired CPU lengths rather than declared
 maximum lengths and adds no device readback. Existing causal, mask, window,
-sinks, split-control, dtype and runtime guards remain in force.
+sinks, split-control and runtime guards remain in force. Q, K, V and output
+must have the same BF16 or FP16 dtype; mixed precision is not admitted.
 
 The cuDNN graph uses exact H100 declarations; Blackwell's cache buckets do not
 apply. Backend and FROST remain peers behind the same public graph contract.

@@ -2573,7 +2573,8 @@ def _hopper_paged_auto_cudnn(
     """H100 D256 admission after the native planner has selected FA3."""
     if not (
         layout == "HND"
-        and q_dtype == kv_dtype == o_dtype == torch.bfloat16
+        and q_dtype == kv_dtype == o_dtype
+        and q_dtype in (torch.float16, torch.bfloat16)
         and head_dim_qk == head_dim_vo == 256
         and 1 <= batch <= 32
         and 16 <= hq <= 48
