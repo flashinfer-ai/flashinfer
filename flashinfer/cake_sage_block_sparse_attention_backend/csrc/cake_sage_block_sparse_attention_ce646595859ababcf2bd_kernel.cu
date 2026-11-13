@@ -47,10 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 128
-
 #include <math_constants.h>
 
 
@@ -59,6 +55,11 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
     raw.x = static_cast<unsigned short>(v);
     raw.y = static_cast<unsigned short>(v >> 16);
     return __nv_bfloat162(raw);
+}
+
+__device__ __forceinline__ float2 cake_bf16x2_to_f32x2(__nv_bfloat162 v) {
+    const unsigned int w = *reinterpret_cast<const unsigned int*>(&v);
+    return make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u));
 }
 
 extern "C" {
@@ -76,7 +77,7 @@ kernel_cake_sage_block_sparse_attention_ce646595859ababcf2bd(__nv_bfloat16* __re
 
     const int cta_rank = 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int head = bid % num_heads;
     int batch_chunk = bid / num_heads;
     int chunk = batch_chunk % chunks_per_bh;
@@ -131,7 +132,7 @@ kernel_cake_sage_block_sparse_attention_ce646595859ababcf2bd(__nv_bfloat16* __re
         float values[16];
         #pragma unroll
         for (int j_3 = 0; j_3 < 8; j_3++) {
-            float2 _cvt_f32_0 = __bfloat1622float2(__as_bf16x2(vw[p_1 * 8 + j_3]));
+            float2 _cvt_f32_0 = cake_bf16x2_to_f32x2(__as_bf16x2(vw[p_1 * 8 + j_3]));
             values[2 * j_3] = _cvt_f32_0.x;
             values[2 * j_3 + 1] = _cvt_f32_0.y;
         }
@@ -140,38 +141,60 @@ kernel_cake_sage_block_sparse_attention_ce646595859ababcf2bd(__nv_bfloat16* __re
             values[j_4] = values[j_4] * inv[j_4];
         }
         if (v_ok[p_1] != 0) {
+            unsigned int _packed_0[4];
             {
-                unsigned int _fp8_pk[4];
-                asm("{\n\t"
-                    ".reg .b16 _lo, _hi;\n\t"
+                uint32_t _packed;
+                asm volatile("{\n\t"
+                    ".reg .b16 _lo;\n\t"
+                    ".reg .b16 _hi;\n\t"
                     "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                     "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                     "mov.b32 %0, {_lo, _hi};\n\t"
-                    "}\n"
-                    : "=r"(_fp8_pk[0]) : "f"(values[0 + 0]), "f"(values[0 + 1]), "f"(values[0 + 2]), "f"(values[0 + 3]));
-                asm("{\n\t"
-                    ".reg .b16 _lo, _hi;\n\t"
-                    "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                    "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                    "mov.b32 %0, {_lo, _hi};\n\t"
-                    "}\n"
-                    : "=r"(_fp8_pk[1]) : "f"(values[0 + 4]), "f"(values[0 + 5]), "f"(values[0 + 6]), "f"(values[0 + 7]));
-                asm("{\n\t"
-                    ".reg .b16 _lo, _hi;\n\t"
-                    "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                    "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                    "mov.b32 %0, {_lo, _hi};\n\t"
-                    "}\n"
-                    : "=r"(_fp8_pk[2]) : "f"(values[0 + 8]), "f"(values[0 + 9]), "f"(values[0 + 10]), "f"(values[0 + 11]));
-                asm("{\n\t"
-                    ".reg .b16 _lo, _hi;\n\t"
-                    "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                    "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                    "mov.b32 %0, {_lo, _hi};\n\t"
-                    "}\n"
-                    : "=r"(_fp8_pk[3]) : "f"(values[0 + 12]), "f"(values[0 + 13]), "f"(values[0 + 14]), "f"(values[0 + 15]));
-                *reinterpret_cast<uint4*>(reinterpret_cast<unsigned char*>(v_out + v_off[p_1]) + (0)) = *reinterpret_cast<uint4*>(_fp8_pk);
+                    "}"
+                    : "=r"(_packed) : "f"(values[0]), "f"(values[1]),
+                                       "f"(values[2]), "f"(values[3]));
+                _packed_0[0] = _packed;
             }
+            {
+                uint32_t _packed;
+                asm volatile("{\n\t"
+                    ".reg .b16 _lo;\n\t"
+                    ".reg .b16 _hi;\n\t"
+                    "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                    "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                    "mov.b32 %0, {_lo, _hi};\n\t"
+                    "}"
+                    : "=r"(_packed) : "f"(values[4]), "f"(values[5]),
+                                       "f"(values[6]), "f"(values[7]));
+                _packed_0[1] = _packed;
+            }
+            {
+                uint32_t _packed;
+                asm volatile("{\n\t"
+                    ".reg .b16 _lo;\n\t"
+                    ".reg .b16 _hi;\n\t"
+                    "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                    "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                    "mov.b32 %0, {_lo, _hi};\n\t"
+                    "}"
+                    : "=r"(_packed) : "f"(values[8]), "f"(values[9]),
+                                       "f"(values[10]), "f"(values[11]));
+                _packed_0[2] = _packed;
+            }
+            {
+                uint32_t _packed;
+                asm volatile("{\n\t"
+                    ".reg .b16 _lo;\n\t"
+                    ".reg .b16 _hi;\n\t"
+                    "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                    "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                    "mov.b32 %0, {_lo, _hi};\n\t"
+                    "}"
+                    : "=r"(_packed) : "f"(values[12]), "f"(values[13]),
+                                       "f"(values[14]), "f"(values[15]));
+                _packed_0[3] = _packed;
+            }
+            reinterpret_cast<int4*>(v_out + v_off[p_1])[0] = reinterpret_cast<int4*>(_packed_0)[0];
         }
     }
 }

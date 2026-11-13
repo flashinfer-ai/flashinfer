@@ -43,8 +43,9 @@ it captured.  The stable public entry points live in
 
 from __future__ import annotations
 
+import functools
 import math
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import tvm_ffi
@@ -97,7 +98,12 @@ def _capability(device: Optional[torch.device]) -> Optional[tuple[int, int]]:
     device = torch.device("cuda") if device is None else torch.device(device)
     if device.type != "cuda":
         return None
-    major, minor = torch.cuda.get_device_capability(device)
+    return _device_capability(_device_index(device))
+
+
+@functools.cache
+def _device_capability(device_index: int) -> tuple[int, int]:
+    major, minor = torch.cuda.get_device_capability(device_index)
     return (int(major), int(minor))
 
 
@@ -165,53 +171,100 @@ def _softmax_scale(softmax_scale: Optional[float], dim: int) -> float:
 # --------------------------------------------------------------------------- SM100 / SM103
 
 
-def bsa_attn_sm100_sage_fwd_cake(
+def _ffi_takes_torch_stream() -> bool:
+    """Whether tvm-ffi launches on torch's current stream without a stream context.
+
+    From apache-tvm-ffi 0.1.16 a call whose arguments include CUDA torch tensors exported
+    through torch's DLPack exchange API (``torch.Tensor.__c_dlpack_exchange_api__``) sets
+    the call's environment stream to the producer's current work stream, i.e. what
+    ``tvm_ffi.use_torch_stream()`` sets; the context costs a few microseconds of host
+    time per call, which the small Sage-FP8 rows pay end to end.
+    """
+    if getattr(torch.Tensor, "__c_dlpack_exchange_api__", None) is None:
+        return False
+    try:
+        version = tuple(int(x) for x in tvm_ffi.__version__.split(".")[:3])
+    except (AttributeError, ValueError):
+        return False
+    return version >= (0, 1, 16)
+
+
+_FFI_TAKES_TORCH_STREAM = _ffi_takes_torch_stream()
+
+
+def _launch(*calls) -> None:
+    """Launch ``(run, args)`` pairs in order on torch's current stream."""
+    if _FFI_TAKES_TORCH_STREAM:
+        for run, args in calls:
+            run(*args)
+        return
+    with tvm_ffi.use_torch_stream():
+        for run, args in calls:
+            run(*args)
+
+
+@functools.cache
+def _pdl_supported(device_index: int) -> bool:
+    return _loader.device_arch(device_index) in SM100_ARCHES
+
+
+def _record(role: str, pdl: bool) -> Tuple[str, Tuple[int, ...]]:
+    """The record of ``role`` and its launch-flag tail: the PDL build takes ``enable_pdl``."""
+    name = f"{role}_pdl"
+    if pdl and name in _loader.MODULES:
+        return name, (1,)
+    return role, ()
+
+
+#: The one-launch quantizer record: 8-CTA clusters of 16 warps; a PDL build.
+_ONE_LAUNCH_RECORD = "quantize_qkv_c8w16"
+#: Selected KV blocks per row from which each architecture runs its second attention
+#: build: on SM100 the build whose next QK^T starts as soon as S is loaded
+#: (``qk_split``), which pays off from about ten blocks a row; on SM103 the per-tile
+#: step schedule (``cross_tile=False``), which the cross-tile stream does not beat on
+#: long rows.  Below the threshold, and when the record is absent, the default build runs.
+_SECOND_ATTENTION = {
+    "sm_100a": ("attention_qs", 10),
+    "sm_103a": ("attention_per_tile", 192),
+}
+
+
+def _attention_role(arch: str, block_sparse_num: int) -> str:
+    """The attention record of a call with ``block_sparse_num`` selected blocks a row
+    (the index capacity with per-row counts)."""
+    role, min_sel = _SECOND_ATTENTION.get(arch, ("", 0))
+    if role and block_sparse_num >= min_sel and role in _loader.MODULES:
+        return role
+    return "attention"
+
+
+def _attention_call(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     q2k_block_index: torch.Tensor,
     block_sparse_num: int,
-    *,
     q_scale: torch.Tensor,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
-    block_sizes: Optional[torch.Tensor] = None,
-    q2k_block_nums: Optional[torch.Tensor] = None,
-    softmax_scale: Optional[float] = None,
-    return_lse: bool = False,
-    out: Optional[torch.Tensor] = None,
-    lse: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Sage-FP8 block-sparse attention forward on SM100/SM103 with the Cake kernel.
+    block_sizes: Optional[torch.Tensor],
+    q2k_block_nums: Optional[torch.Tensor],
+    softmax_scale: Optional[float],
+    return_lse: bool,
+    out: Optional[torch.Tensor],
+    lse: Optional[torch.Tensor],
+    enable_pdl: Optional[bool],
+    operands_checked: bool = False,
+):
+    """Validate one attention call and return ``((run, args), out, lse)``; launches nothing.
 
-    Args:
-        q: ``float8_e4m3fn`` ``(B, Sq, H, 128)`` contiguous.
-        k, v: ``float8_e4m3fn`` ``(B, Sk, Hkv, 128)`` contiguous; ``H % Hkv == 0``.
-        q2k_block_index: int32 ``(B, H, ceil(Sq/64), capacity)`` selected 64-token KV blocks.
-        block_sparse_num: uniform number of selected blocks per row (``<= capacity``);
-            ignored when ``q2k_block_nums`` is given.
-        q_scale: float32 ``(B, H, Sq)`` per-token Q scales.
-        k_scale: float32 ``(B, Hkv, ceil(Sk/16))`` per-16-token K scales.
-        v_scale: float32 ``(Hkv, 128)`` or ``(B, Hkv, 128)`` per-channel V scales.
-        block_sizes: optional int32 valid-token counts per KV block, shaped ``(Kb,)``,
-            ``(B, Kb)`` or ``(B, Hkv, Kb)`` with ``Kb = ceil(Sk/64)``.
-        q2k_block_nums: optional int32 ``(B, H, ceil(Sq/64))`` per-row selected counts
-            (rows with 0 blocks produce zeros and ``-inf`` LSE).
-        softmax_scale: defaults to ``1/sqrt(128)``.
-        return_lse: also return float32 ``(B, H, Sq)`` log-sum-exp (natural log).
-        out, lse: optional preallocated outputs (BF16 BSHD / float32 BHS).  With both
-            given the call allocates nothing.
-
-    Returns:
-        ``(out, lse)``; ``lse`` is ``None`` unless ``return_lse``.
-
-    One kernel launch per call; the three TMA descriptors travel by value in the
-    kernel parameters, so the call is CUDA-Graph capturable and shares no device
-    state between streams.
+    ``operands_checked`` skips the checks of Q/K/V and their scales, which the quantizer of
+    :func:`bsa_attn_sm100_sage_quantize_fwd_cake` has just allocated in this layout.
     """
-    for name, t in (("q", q), ("k", k), ("v", v)):
-        if not isinstance(t, torch.Tensor) or t.ndim != 4:
-            raise ValueError(f"{name} must be a rank-4 BSHD tensor")
+    if not operands_checked:
+        for name, t in (("q", q), ("k", k), ("v", v)):
+            if not isinstance(t, torch.Tensor) or t.ndim != 4:
+                raise ValueError(f"{name} must be a rank-4 BSHD tensor")
     device = q.device
     if device.type != "cuda":
         raise ValueError("q must be a CUDA tensor")
@@ -219,30 +272,41 @@ def bsa_attn_sm100_sage_fwd_cake(
     arch = _sm100_arch(device_index)
     batch, seqlen_q, heads, dim = (int(x) for x in q.shape)
     seqlen_k, kv_heads = int(k.shape[1]), int(k.shape[2])
-    if dim != HEAD_DIM:
-        raise ValueError(f"head_dim must be {HEAD_DIM}, got {dim}")
-    if kv_heads < 1 or heads % kv_heads != 0:
-        raise ValueError("num_heads must be a positive multiple of num_kv_heads")
-    _check_tensor("q", q, device, torch.float8_e4m3fn)
-    _check_tensor("k", k, device, torch.float8_e4m3fn, (batch, seqlen_k, kv_heads, dim))
-    _check_tensor("v", v, device, torch.float8_e4m3fn, (batch, seqlen_k, kv_heads, dim))
     q_blocks = _ceil_div(seqlen_q, BLOCK_M)
     k_blocks = _ceil_div(seqlen_k, KV_BLOCK)
     k_scale_groups = _ceil_div(seqlen_k, K_SCALE_GROUP)
-    _check_tensor("q_scale", q_scale, device, torch.float32, (batch, heads, seqlen_q))
-    _check_tensor(
-        "k_scale", k_scale, device, torch.float32, (batch, kv_heads, k_scale_groups)
-    )
-    if tuple(v_scale.shape) == (kv_heads, dim):
-        v_scale_batch_stride = 0
-    elif tuple(v_scale.shape) == (batch, kv_heads, dim):
+    if not operands_checked:
+        if dim != HEAD_DIM:
+            raise ValueError(f"head_dim must be {HEAD_DIM}, got {dim}")
+        if kv_heads < 1 or heads % kv_heads != 0:
+            raise ValueError("num_heads must be a positive multiple of num_kv_heads")
+        _check_tensor("q", q, device, torch.float8_e4m3fn)
+        _check_tensor(
+            "k", k, device, torch.float8_e4m3fn, (batch, seqlen_k, kv_heads, dim)
+        )
+        _check_tensor(
+            "v", v, device, torch.float8_e4m3fn, (batch, seqlen_k, kv_heads, dim)
+        )
+        _check_tensor(
+            "q_scale", q_scale, device, torch.float32, (batch, heads, seqlen_q)
+        )
+        _check_tensor(
+            "k_scale",
+            k_scale,
+            device,
+            torch.float32,
+            (batch, kv_heads, k_scale_groups),
+        )
+        _check_tensor("v_scale", v_scale, device, torch.float32)
+    if v_scale.dim() == 3 and tuple(v_scale.shape) == (batch, kv_heads, dim):
         v_scale_batch_stride = kv_heads * dim
+    elif tuple(v_scale.shape) == (kv_heads, dim):
+        v_scale_batch_stride = 0
     else:
         raise ValueError(
             f"v_scale must be [Hkv,128]={(kv_heads, dim)} or [B,Hkv,128]={(batch, kv_heads, dim)}, "
             f"got {tuple(v_scale.shape)}"
         )
-    _check_tensor("v_scale", v_scale, device, torch.float32)
     if q2k_block_index.ndim != 4 or tuple(q2k_block_index.shape[:3]) != (
         batch,
         heads,
@@ -313,68 +377,155 @@ def bsa_attn_sm100_sage_fwd_cake(
         lse_arg = q_scale
 
     total_tiles = batch * heads * q_blocks
-    run = _loader.entry("attention", arch)
-    # Positional binding in the record's ``arg_plan`` order (buffers, parameters, grid).
-    with tvm_ffi.use_torch_stream():
-        run(
-            q.view(torch.uint8),
-            k.view(torch.uint8),
-            v.view(torch.uint8),
-            out,
-            lse_arg,
-            q_scale,
-            k_scale,
-            v_scale,
-            q2k_block_index,
-            block_nums_arg,
-            block_sizes_arg,
-            seqlen_q,
-            seqlen_k,
-            heads,
-            kv_heads,
-            q_blocks,
-            k_blocks,
-            k_scale_groups,
-            capacity,
-            int(block_sparse_num),
-            int(has_block_nums),
-            block_sizes_mode,
-            v_scale_batch_stride,
-            total_tiles,
-            scale * _LOG2E,
-            int(return_lse),
-            max(1, min(total_tiles, _loader.sm_count(device_index))),
-            1,
-            1,
-        )
-    return out, (lse if return_lse else None)
+    pdl = _pdl_supported(device_index) if enable_pdl is None else bool(enable_pdl)
+    # Positional binding in the record's ``arg_plan`` order (buffers, parameters,
+    # the PDL launch flag, grid).
+    args: Tuple[Any, ...] = (
+        q.view(torch.uint8),
+        k.view(torch.uint8),
+        v.view(torch.uint8),
+        out,
+        lse_arg,
+        q_scale,
+        k_scale,
+        v_scale,
+        q2k_block_index,
+        block_nums_arg,
+        block_sizes_arg,
+        seqlen_q,
+        seqlen_k,
+        heads,
+        kv_heads,
+        q_blocks,
+        k_blocks,
+        k_scale_groups,
+        capacity,
+        int(block_sparse_num),
+        int(has_block_nums),
+        block_sizes_mode,
+        v_scale_batch_stride,
+        total_tiles,
+        scale * _LOG2E,
+        int(return_lse),
+    )
+    record, tail = _record(_attention_role(arch, int(block_sparse_num)), pdl)
+    args += tail + (max(1, min(total_tiles, _loader.sm_count(device_index))), 1, 1)
+    return (_loader.entry(record, arch), args), out, (lse if return_lse else None)
 
 
-def sage_fp8_quantize_sm100(
+def bsa_attn_sm100_sage_fwd_cake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-) -> Tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-]:
-    """Fused Sage-FP8 quantization of BF16 BSHD Q/K/V for :func:`bsa_attn_sm100_sage_fwd_cake`.
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: int,
+    *,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    block_sizes: Optional[torch.Tensor] = None,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    return_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Sage-FP8 block-sparse attention forward on SM100/SM103 with the Cake kernel.
 
-    Returns ``(q8, k8, v8, q_scale[B,H,Sq], k_scale[B,Hkv,ceil(Sk/16)], v_scale[B,Hkv,128])``
-    with symmetric E4M3 quantization: per-token Q scales (``amax/448``), per-16-token
-    K scales (shared by the 16 tokens and all 128 channels of a KV head) and per-channel V
-    scales over the whole sequence.  A scale is ``max(amax, 1e-6) / 448``: the kernels floor the
-    absolute maximum at ``1e-6`` (``fmaxf``) before the division, so the torch recipe
-    ``amax.clamp_min(1e-12) / 448`` matches bit for bit except where ``amax < 1e-6``.  Two kernel
-    launches plus one ``zero_`` on the V amax scratch.  Each input (and so each FP8 output) holds at
-    most ``2**31 - 1`` elements: the kernels index them with 32-bit offsets.
+    Args:
+        q: ``float8_e4m3fn`` ``(B, Sq, H, 128)`` contiguous.
+        k, v: ``float8_e4m3fn`` ``(B, Sk, Hkv, 128)`` contiguous; ``H % Hkv == 0``.
+        q2k_block_index: int32 ``(B, H, ceil(Sq/64), capacity)`` selected 64-token KV blocks.
+        block_sparse_num: uniform number of selected blocks per row (``<= capacity``);
+            ignored when ``q2k_block_nums`` is given.
+        q_scale: float32 ``(B, H, Sq)`` per-token Q scales.
+        k_scale: float32 ``(B, Hkv, ceil(Sk/16))`` per-16-token K scales.
+        v_scale: float32 ``(Hkv, 128)`` or ``(B, Hkv, 128)`` per-channel V scales.
+        block_sizes: optional int32 valid-token counts per KV block, shaped ``(Kb,)``,
+            ``(B, Kb)`` or ``(B, Hkv, Kb)`` with ``Kb = ceil(Sk/64)``.
+        q2k_block_nums: optional int32 ``(B, H, ceil(Sq/64))`` per-row selected counts
+            (rows with 0 blocks produce zeros and ``-inf`` LSE).
+        softmax_scale: defaults to ``1/sqrt(128)``.
+        return_lse: also return float32 ``(B, H, Sq)`` log-sum-exp (natural log).
+        out, lse: optional preallocated outputs (BF16 BSHD / float32 BHS).  With both
+            given the call allocates nothing.
+        enable_pdl: launch with programmatic dependent launch (default: on SM100/SM103).
+            The kernel's setup then overlaps the tail of the previous kernel on the
+            stream; it reads nothing before that kernel completes.
+
+    Returns:
+        ``(out, lse)``; ``lse`` is ``None`` unless ``return_lse``.
+
+    One kernel launch per call; the three TMA descriptors travel by value in the
+    kernel parameters, so the call is CUDA-Graph capturable and shares no device
+    state between streams.
     """
+    call, out, lse = _attention_call(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        block_sparse_num,
+        q_scale,
+        k_scale,
+        v_scale,
+        block_sizes,
+        q2k_block_nums,
+        softmax_scale,
+        return_lse,
+        out,
+        lse,
+        enable_pdl,
+    )
+    _launch(call)
+    return out, lse
+
+
+#: ``impl`` values of :func:`sage_fp8_quantize_sm100`.
+QUANTIZE_IMPLS = ("auto", "one_launch", "two_launch")
+#: Float32 elements per 256 bytes: the alignment of each view of the one scales buffer.
+_SCALE_ALIGN = 64
+#: CTAs per cluster and warps per CTA of the one-launch quantizer.
+_CLUSTER_CTAS, _CLUSTER_WARPS = 8, 16
+
+
+def _one_launch_fits(batch: int, grid_heads: int, seqlen: int, sms: int) -> bool:
+    """Whether the one-launch quantizer serves a shape faster than two launches.
+
+    It runs one cluster of 8 CTAs of 16 warps per (batch, head), 2048 tokens per pass.
+    It is chosen when its grid fits one wave of the device and each CTA makes at most two
+    passes, outside a CUDA-graph capture: on those small rows the eager two-launch form
+    spends most of its time in the ``zero_``, the second launch and the host between
+    them.  A captured graph replays the launches without host time, and there the two
+    launches take less GPU time.
+    """
+    tokens_per_pass = 16 * _CLUSTER_WARPS * _CLUSTER_CTAS
+    return (
+        batch * grid_heads * _CLUSTER_CTAS <= sms
+        and _ceil_div(seqlen, tokens_per_pass) <= 2
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
+def _quantize_calls(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    impl: str,
+    enable_pdl: Optional[bool],
+):
+    """Validate one quantizer call and return ``(calls, outputs)``; launches nothing."""
     for name, t in (("q", q), ("k", k), ("v", v)):
         if not isinstance(t, torch.Tensor) or t.ndim != 4:
             raise ValueError(f"{name} must be a rank-4 BSHD tensor")
+    if impl not in QUANTIZE_IMPLS:
+        raise ValueError(f"impl must be one of {QUANTIZE_IMPLS}, got {impl!r}")
     device = q.device
     if device.type != "cuda":
         raise ValueError("q must be a CUDA tensor")
-    arch = _sm100_arch(_device_index(device))
+    device_index = _device_index(device)
+    arch = _sm100_arch(device_index)
     batch, seqlen_q, heads, dim = (int(x) for x in q.shape)
     seqlen_k, kv_heads = int(k.shape[1]), int(k.shape[2])
     if dim != HEAD_DIM:
@@ -385,55 +536,206 @@ def sage_fp8_quantize_sm100(
     _check_tensor("k", k, device, torch.bfloat16, (batch, seqlen_k, kv_heads, dim))
     _check_tensor("v", v, device, torch.bfloat16, (batch, seqlen_k, kv_heads, dim))
     groups = _ceil_div(seqlen_k, K_SCALE_GROUP)
+    grid_heads = max(heads, kv_heads)
+    pdl = _pdl_supported(device_index) if enable_pdl is None else bool(enable_pdl)
     q8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
     k8 = torch.empty_like(k, dtype=torch.float8_e4m3fn)
     v8 = torch.empty_like(v, dtype=torch.float8_e4m3fn)
+    if impl == "auto":
+        if _ONE_LAUNCH_RECORD not in _loader.MODULES:
+            impl = "two_launch"
+    if impl == "auto":
+        impl = (
+            "one_launch"
+            if _one_launch_fits(
+                batch,
+                grid_heads,
+                max(seqlen_q, seqlen_k),
+                _loader.sm_count(device_index),
+            )
+            else "two_launch"
+        )
+    if impl == "one_launch":
+        # One buffer for the three scale tensors: one allocation on the host path.  Each
+        # view starts on a 256-byte boundary, as a tensor of its own would: the kernels
+        # read the scales with vector loads.
+        nq, nk = batch * heads * seqlen_q, batch * kv_heads * groups
+        k_at = _ceil_div(nq, _SCALE_ALIGN) * _SCALE_ALIGN
+        v_at = k_at + _ceil_div(nk, _SCALE_ALIGN) * _SCALE_ALIGN
+        scales = torch.empty(
+            v_at + batch * kv_heads * dim, dtype=torch.float32, device=device
+        )
+        q_scale = scales[:nq].view(batch, heads, seqlen_q)
+        k_scale = scales[k_at : k_at + nk].view(batch, kv_heads, groups)
+        v_scale = scales[v_at:].view(batch, kv_heads, dim)
+        passes = _ceil_div(max(seqlen_q, seqlen_k), 16 * _CLUSTER_WARPS * _CLUSTER_CTAS)
+        calls: Tuple[Tuple[Any, Tuple[Any, ...]], ...] = (
+            (
+                _loader.entry(_ONE_LAUNCH_RECORD, arch),
+                (
+                    q,
+                    k,
+                    v,
+                    q8,
+                    k8,
+                    v8,
+                    q_scale,
+                    k_scale,
+                    v_scale,
+                    seqlen_q,
+                    seqlen_k,
+                    heads,
+                    kv_heads,
+                    grid_heads,
+                    groups,
+                    passes,
+                    int(pdl),
+                    batch * grid_heads * _CLUSTER_CTAS,
+                    1,
+                    1,
+                ),
+            ),
+        )
+        return calls, (q8, k8, v8, q_scale, k_scale, v_scale)
     q_scale = torch.empty((batch, heads, seqlen_q), dtype=torch.float32, device=device)
     k_scale = torch.empty((batch, kv_heads, groups), dtype=torch.float32, device=device)
     v_scale = torch.empty((batch, kv_heads, dim), dtype=torch.float32, device=device)
-    v_amax = torch.zeros((batch, kv_heads, dim), dtype=torch.float32, device=device)
+    # Zeroed with the launches, not here: a combined call validates the attention after
+    # this and must not leave the zero_ waiting on the host ahead of the first kernel.
+    v_amax = torch.empty((batch, kv_heads, dim), dtype=torch.float32, device=device)
     q_chunks = _ceil_div(seqlen_q, TOKENS_PER_CTA)
     k_chunks = _ceil_div(seqlen_k, TOKENS_PER_CTA)
     chunks = max(q_chunks, k_chunks)
-    grid_heads = max(heads, kv_heads)
-    run_qk = _loader.entry("quantize_qk_vamax", arch)
-    run_v = _loader.entry("quantize_v", arch)
-    with tvm_ffi.use_torch_stream():
-        run_qk(
-            q,
-            k,
-            v,
-            q8,
-            k8,
-            q_scale,
-            k_scale,
-            v_amax,
-            seqlen_q,
-            seqlen_k,
-            heads,
-            kv_heads,
-            grid_heads,
-            groups,
-            chunks,
-            q_chunks,
-            k_chunks,
-            batch * grid_heads * chunks,
-            1,
-            1,
-        )
-        run_v(
-            v,
-            v8,
-            v_amax,
-            v_scale,
-            seqlen_k,
-            kv_heads,
-            k_chunks,
-            batch * kv_heads * k_chunks,
-            1,
-            1,
-        )
-    return q8, k8, v8, q_scale, k_scale, v_scale
+    qk_record, qk_tail = _record("quantize_qk_vamax", pdl)
+    v_record, v_tail = _record("quantize_v", pdl)
+    calls = (
+        (v_amax.zero_, ()),
+        (
+            _loader.entry(qk_record, arch),
+            (
+                q,
+                k,
+                v,
+                q8,
+                k8,
+                q_scale,
+                k_scale,
+                v_amax,
+                seqlen_q,
+                seqlen_k,
+                heads,
+                kv_heads,
+                grid_heads,
+                groups,
+                chunks,
+                q_chunks,
+                k_chunks,
+                *qk_tail,
+                batch * grid_heads * chunks,
+                1,
+                1,
+            ),
+        ),
+        (
+            _loader.entry(v_record, arch),
+            (
+                v,
+                v8,
+                v_amax,
+                v_scale,
+                seqlen_k,
+                kv_heads,
+                k_chunks,
+                *v_tail,
+                batch * kv_heads * k_chunks,
+                1,
+                1,
+            ),
+        ),
+    )
+    return calls, (q8, k8, v8, q_scale, k_scale, v_scale)
+
+
+def sage_fp8_quantize_sm100(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    impl: str = "auto",
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """Fused Sage-FP8 quantization of BF16 BSHD Q/K/V for :func:`bsa_attn_sm100_sage_fwd_cake`.
+
+    Returns ``(q8, k8, v8, q_scale[B,H,Sq], k_scale[B,Hkv,ceil(Sk/16)], v_scale[B,Hkv,128])``
+    with symmetric E4M3 quantization: per-token Q scales (``amax/448``), per-16-token
+    K scales (shared by the 16 tokens and all 128 channels of a KV head) and per-channel V
+    scales over the whole sequence.  A scale is ``max(amax, 1e-6) / 448``: the kernels floor the
+    absolute maximum at ``1e-6`` (``fmaxf``) before the division, so the torch recipe
+    ``amax.clamp_min(1e-12) / 448`` matches bit for bit except where ``amax < 1e-6``.  Each input
+    (and so each FP8 output) holds at most ``2**31 - 1`` elements: the kernels index them with
+    32-bit offsets.
+
+    ``impl`` picks the program; every choice writes the same bits.  ``"two_launch"``: a Q/K
+    kernel that also reduces the V absolute maximum with atomics, then a V kernel (two
+    launches plus one ``zero_`` of the V amax scratch).  ``"one_launch"``: one launch, a
+    thread-block cluster per (batch, head) that reduces the V maximum in distributed shared
+    memory (no scratch).  ``"auto"`` (default) takes one launch for the small rows it is
+    faster on (``B * max(H, Hkv) * 8`` CTAs within one wave of the device, sequences up to
+    4096 tokens, outside a CUDA-graph capture) and two launches otherwise.  ``enable_pdl`` (default: on SM100/SM103)
+    launches with programmatic dependent launch.
+    """
+    calls, outputs = _quantize_calls(q, k, v, impl, enable_pdl)
+    _launch(*calls)
+    return outputs
+
+
+def bsa_attn_sm100_sage_quantize_fwd_cake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: int,
+    *,
+    block_sizes: Optional[torch.Tensor] = None,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    return_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Sage-FP8 block-sparse attention of BF16 BSHD Q/K/V: :func:`sage_fp8_quantize_sm100`
+    then :func:`bsa_attn_sm100_sage_fwd_cake`, with the same arguments and bits.
+
+    Every check and allocation of both runs first and the launches go back to back, so the
+    host time of the attention call does not separate the quantizer from the attention
+    kernel on the device.
+    """
+    calls, (q8, k8, v8, q_scale, k_scale, v_scale) = _quantize_calls(
+        q, k, v, "auto", enable_pdl
+    )
+    attention, out, lse = _attention_call(
+        q8,
+        k8,
+        v8,
+        q2k_block_index,
+        block_sparse_num,
+        q_scale,
+        k_scale,
+        v_scale,
+        block_sizes,
+        q2k_block_nums,
+        softmax_scale,
+        return_lse,
+        out,
+        lse,
+        enable_pdl,
+        operands_checked=True,
+    )
+    _launch(*calls, attention)
+    return out, lse
 
 
 # --------------------------------------------------------------------------- SM120
@@ -627,6 +929,7 @@ __all__ = [
     "SM120_CAPABILITIES",
     "arch_for_capability",
     "bsa_attn_sm100_sage_fwd_cake",
+    "bsa_attn_sm100_sage_quantize_fwd_cake",
     "bsa_attn_sm120_blk64_sage_fwd_cake",
     "is_cake_sage_sm100_supported",
     "is_cake_sage_sm120_supported",
