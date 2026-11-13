@@ -358,6 +358,91 @@ small ``B * HV * T``. Requires SM90+ for the WY path and ``K = V = 128``;
     packed_kda_decode
     recurrent_kda
 
+.. _kda-indexed-single-token-decode:
+
+Indexed single-token decode
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For state-updating ``recurrent_kda`` calls with ``backend="cute-dsl"``, ``T=1``
+and ``ssm_state_indices``, the batched ``[B, 1, ...]`` form without ``cu_seqlens``
+gathers the selected state-pool rows into a temporary and scatters them back
+following decode. In-place updates therefore do not imply that the call avoids
+state copies. Each gather and scatter moves the full selected state: at
+``HV=64`` and ``K=V=128``, that is 2 MiB of BF16 state per sequence.
+
+Calls served by the ``T=1`` fast path are the exception. It is on by default
+(``FLASHINFER_KDA_T1_FAST_PATH=0`` disables it) and takes batched indexed calls
+with ``H=HV=12``, ``K=V=128`` on SM100, SM103 or SM107,
+``output_final_state=False``, no ``cu_seqlens`` and one of the two supported
+gate conventions (raw gates with ``use_gate_in_kernel=True``,
+``beta_is_logit=True`` and ``lower_bound=-5.0``, or precomputed log gates with
+sigmoid ``beta``); see ``_t1_fast_path_mode`` in
+``flashinfer/kda_kernels/recurrent_kda.py`` for the full conditions. The fast
+path indexes the pool inside the kernel, with no gather or scatter.
+
+Both cases also apply when ``auto`` resolves to the CuTe DSL backend: eligible
+calls take the fast path, other batched indexed calls gather and scatter. Cake
+paths that directly index the pool do not have this gather/scatter cost.
+
+Frozen decode (``disable_state_update=True``) is different: the batched indexed
+form reads the selected pool rows directly and writes no state back, so it
+needs no layout change. In frozen mode the packed ``cu_seqlens`` form below
+requires ``correction_cache`` and ``kg_cache`` and raises without them.
+
+For a serving pool whose calls would otherwise gather and scatter (for example
+``HV=64`` on the CuTe DSL backend), use the packed ``[1, B, ...]`` form with one
+token per sequence and ``cu_seqlens = [0, 1, ..., B]`` to let the decode kernel
+access the selected slots directly. Keep calls that already index the pool in
+the batched form. Passing ``cu_seqlens`` opts out of the fast path, and under
+``auto`` it also keeps a call on CuTe DSL that Cake would otherwise serve, so
+the packed form removes no copy there.
+
+When ``B * H >= 128`` the CuTe DSL kernel is compiled for 32-byte-aligned
+tensor data. Fresh CUDA allocations satisfy this; a view that starts at an
+offset into a larger buffer may not, even if it is contiguous.
+
+For example, given contiguous BF16 CUDA tensors
+``q, k, v, g`` of shape ``[B, 1, H, 128]``, ``beta`` of shape ``[B, 1, H]``,
+a contiguous BF16 ``state_pool`` of shape ``[num_slots, H, 128, 128]``, and
+contiguous CUDA int32 ``slots`` of shape ``[B]`` containing unique, in-range,
+nonnegative pool indices:
+
+.. code-block:: python
+
+    from flashinfer import recurrent_kda
+    import torch
+
+    # Prepare and reuse this metadata for a fixed batch size, outside timing
+    # and CUDA graph capture. Each sequence contributes exactly one token.
+    B = q.shape[0]
+    cu_seqlens = torch.arange(B + 1, dtype=torch.int32, device=q.device)
+
+    # g contains precomputed log gates; beta contains sigmoid probabilities.
+    # Swapping the batch and singleton token axes creates views, not copies.
+    output, _ = recurrent_kda(
+        q.transpose(0, 1),
+        k.transpose(0, 1),
+        v.transpose(0, 1),
+        g.transpose(0, 1),
+        beta.transpose(0, 1),
+        initial_state=state_pool,
+        ssm_state_indices=slots,
+        cu_seqlens=cu_seqlens,
+        backend="cute-dsl",
+    )
+    output = output.transpose(0, 1)  # [B, 1, H, 128]
+
+The selected slots of ``state_pool`` are updated in place. With
+``output_final_state=True``, the packed call returns the pool itself, whereas
+the batched indexed CuTe DSL path returns the gathered per-sequence state;
+use the caller-owned pool when converting a serving call between these forms.
+If each batch row already owns a contiguous state row, the batched form can
+instead pass that contiguous state tensor without ``ssm_state_indices``.
+
+Profile the complete public call, including state movement, rather than only
+the decode kernel. This layout change avoids the indexed state copies; it does
+not guarantee an allocation-free call or a fixed speedup.
+
 .. _apikda_prefill:
 
 flashinfer.kda_prefill
