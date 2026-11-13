@@ -55,8 +55,9 @@ def _div_rn(a: Float32, b: Float32):
 
 
 class _SafeE4M3Quantize:
-    def __init__(self, hidden: int):
+    def __init__(self, hidden: int, top_k: int = 0):
         self.hidden = hidden
+        self.top_k = top_k
 
     @cute.jit
     def __call__(
@@ -66,9 +67,19 @@ class _SafeE4M3Quantize:
         payload: cute.Tensor,
         scales: cute.Tensor,
         stream,
+        topk_ids=None,
+        topk_weights=None,
+        ids_out=None,
+        weights_out=None,
     ):
         elements = Int64(cute.size(x, mode=[0])) * Int64(self.hidden)
-        self.kernel(x, amax, payload, scales).launch(
+        if cutlass.const_expr(self.top_k > 0):
+            routes = Int64(cute.size(ids_out, mode=[0])) * Int64(self.top_k)
+            if routes > elements:
+                elements = routes
+        self.kernel(
+            x, amax, payload, scales, topk_ids, topk_weights, ids_out, weights_out
+        ).launch(
             grid=((elements + _THREADS - 1) // _THREADS, 1, 1),
             block=(_THREADS, 1, 1),
             stream=stream,
@@ -81,6 +92,10 @@ class _SafeE4M3Quantize:
         amax: cute.Tensor,
         payload: cute.Tensor,
         scales: cute.Tensor,
+        topk_ids=None,
+        topk_weights=None,
+        ids_out=None,
+        weights_out=None,
     ):
         tid, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
@@ -114,7 +129,24 @@ class _SafeE4M3Quantize:
 
             payload[row, col] = scaled.to(cutlass.Float8E4M3FN)
             if col == Int64(0):
-                scales[row, 0] = d
+                if cutlass.const_expr(self.top_k > 0):
+                    for wire_col in cutlass.range_constexpr(4):
+                        scales[row, wire_col] = d
+                else:
+                    scales[row, 0] = d
+
+        if cutlass.const_expr(self.top_k > 0):
+            routes = Int64(cute.size(ids_out, mode=[0])) * Int64(self.top_k)
+            if index < routes:
+                row = index // Int64(self.top_k)
+                col = index % Int64(self.top_k)
+                if row < Int64(cute.size(x, mode=[0])):
+                    ids_out[row, col] = topk_ids[row, col]
+                    weights_out[row, col] = topk_weights[row, col]
+                else:
+                    # Clear on every replay: the same workspace can be reused
+                    # by graphs with different live token counts.
+                    ids_out[row, col] = Int64(-1)
 
 
 @functools.cache
@@ -182,6 +214,48 @@ def quantize_from_amax(
         compiled = _compiled_quantizer(x.shape[1], x.device.index)
         compiled(x, amax, payload, scales)
     return payload, scales
+
+
+@functools.cache
+def _compiled_stager(hidden: int, top_k: int, device_index: int):
+    del device_index
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "safe E4M3 staging requires one eager warmup before CUDA Graph capture"
+        )
+    tokens, capacity = cute.sym_int(), cute.sym_int()
+
+    def tensor(dtype, shape, alignment):
+        return cute.runtime.make_fake_compact_tensor(
+            dtype, shape, stride_order=(1, 0), assumed_align=alignment
+        )
+
+    return cute.compile(
+        _SafeE4M3Quantize(hidden, top_k),
+        tensor(Float32, (tokens, hidden), 4),
+        tensor(Float32, (tokens, 1), 4),
+        tensor(cutlass.Float8E4M3FN, (capacity, hidden), 1),
+        tensor(Float32, (capacity, 4), 4),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        tensor(Int64, (tokens, top_k), 8),
+        tensor(Float32, (tokens, top_k), 4),
+        tensor(Int64, (capacity, top_k), 8),
+        tensor(Float32, (capacity, top_k), 4),
+        options="--enable-tvm-ffi",
+    )
+
+
+def quantize_and_stage_from_amax(
+    x, amax, payload, scales, topk_ids, topk_weights, ids_out, weights_out
+):
+    """Write quantized data and routing directly to validated contiguous buffers.
+
+    The staging caller validates the shapes, dtypes, device and capacity before
+    selecting this path. Arithmetic is shared with ``quantize_from_amax``.
+    """
+    with torch.cuda.device(x.device):
+        compiled = _compiled_stager(x.shape[1], topk_ids.shape[1], x.device.index)
+        compiled(x, amax, payload, scales, topk_ids, topk_weights, ids_out, weights_out)
 
 
 __all__ = ["quantize_from_amax"]
