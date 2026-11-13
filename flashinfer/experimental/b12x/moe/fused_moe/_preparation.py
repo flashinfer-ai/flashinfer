@@ -1098,6 +1098,8 @@ class _FusedMoeState:
         )
 
     def run_sparse(self, binding):
+        if binding.decode_config is not None and binding.decode_config != self.config:
+            raise ValueError("decode_config differs from the prepared plan's config")
         from ._impl import b12x_sparse_moe_fp4
 
         if binding.routing is None:
@@ -1115,7 +1117,9 @@ class _FusedMoeState:
             )()
             self._check_route(route)
         return b12x_sparse_moe_fp4(
-            binding=binding, route_topk_launcher=self.route_launcher
+            binding=binding,
+            route_topk_launcher=self.route_launcher,
+            decode_config=self.config,
         )
 
 

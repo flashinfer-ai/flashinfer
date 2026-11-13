@@ -6,6 +6,7 @@ import pytest
 import torch
 
 import b12x.moe.fused_moe._impl as tp_moe
+from b12x.moe.fused_moe._tuning import MoeDecodeConfig
 from b12x.moe.fused_moe._impl import (
     B12XFP4ExpertWeights,
     B12XTopKRouting,
@@ -80,6 +81,12 @@ def _make_experts(
     )
 
 
+def _make_decode_config() -> MoeDecodeConfig:
+    return MoeDecodeConfig(
+        backend="dynamic", route_planner="triton", max_active_clusters=None
+    )
+
+
 def _make_scratch():
     return tp_moe.TPMoEWorkspacePool()
 
@@ -138,6 +145,7 @@ def _make_sparse_binding(
     experts: B12XFP4ExpertWeights,
     **kwargs,
 ):
+    kwargs.setdefault("decode_config", _make_decode_config())
     return build_tp_moe_sparse_fp4_binding(
         scratch=_make_scratch(),
         hidden_states=hidden_states,
@@ -656,3 +664,227 @@ def test_sparse_moe_fp4_rejects_routing_batch_mismatch() -> None:
         assert "routing batch mismatch" in str(exc)
     else:
         raise AssertionError("expected routing batch validation to fire")
+
+
+class _BuilderCalled(Exception):
+    pass
+
+
+def test_sparse_moe_fp4_forwards_decode_config() -> None:
+    hidden_states = torch.randn(2, 4)
+    experts = _make_experts(hidden_size=4)
+    routing = B12XTopKRouting(
+        topk_weights=torch.ones(2, 1, dtype=torch.float32),
+        topk_ids=torch.zeros(2, 1, dtype=torch.int64),
+    )
+    bound_config = _make_decode_config()
+    override_config = MoeDecodeConfig(
+        backend="static", route_planner="triton", max_active_clusters=None
+    )
+    captured: list[object] = []
+
+    def fake_build_tp_moe_fp4_binding(**kwargs):
+        captured.append(kwargs["decode_config"])
+        raise _BuilderCalled
+
+    binding = tp_moe.TPMoESparseFP4Binding(
+        hidden_states=hidden_states,
+        experts=experts,
+        scratch=_make_scratch(),
+        routing=routing,
+        decode_config=bound_config,
+    )
+    with patch.object(
+        tp_moe, "build_tp_moe_fp4_binding", fake_build_tp_moe_fp4_binding
+    ):
+        with pytest.raises(_BuilderCalled):
+            b12x_sparse_moe_fp4(binding=binding)
+        with pytest.raises(_BuilderCalled):
+            b12x_sparse_moe_fp4(binding=binding, decode_config=override_config)
+
+    assert captured[0] is bound_config
+    assert captured[1] is override_config
+
+
+def test_sparse_moe_fp4_requires_decode_config() -> None:
+    hidden_states = torch.randn(2, 4)
+    experts = _make_experts(hidden_size=4)
+    routing = B12XTopKRouting(
+        topk_weights=torch.ones(2, 1, dtype=torch.float32),
+        topk_ids=torch.zeros(2, 1, dtype=torch.int64),
+    )
+    binding = _make_sparse_binding(
+        hidden_states, experts, routing=routing, decode_config=None
+    )
+    captured: list[object] = []
+
+    def fake_build_tp_moe_fp4_binding(**kwargs):
+        captured.append(kwargs)
+        raise _BuilderCalled
+
+    with patch.object(
+        tp_moe, "build_tp_moe_fp4_binding", fake_build_tp_moe_fp4_binding
+    ):
+        with pytest.raises(ValueError, match="decode_config"):
+            b12x_sparse_moe_fp4(binding=binding)
+
+    assert captured == []
+
+
+def test_prepared_sparse_run_matches_dense_run() -> None:
+    """A prepared plan's sparse run executes and equals its dense run."""
+    from b12x.moe import fused_moe as moe
+    from b12x.preparation import PreparationSession, PreparedCall
+
+    from ..conftest import require_b12x
+
+    device = require_b12x()
+    e, h, n, topk, tokens = 8, 512, 256, 2, 4
+    w13 = torch.randint(0, 256, (e, 2 * n, h // 2), dtype=torch.uint8, device=device)
+    w2 = torch.randint(0, 256, (e, h, n // 2), dtype=torch.uint8, device=device)
+    s13 = torch.randint(120, 126, (e, 2 * n, h // 32), dtype=torch.uint8, device=device)
+    s2 = torch.randint(120, 126, (e, h, n // 32), dtype=torch.uint8, device=device)
+    one = torch.ones(e, device=device)
+    weight_plan = moe.plan_weights(
+        source=moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
+        activation=moe.ActivationSpec(
+            mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16
+        ),
+        geometry=moe.MoEGeometry(num_experts=e, hidden_size=h, intermediate_size=n),
+    )
+    experts = moe.prepare_weights(
+        plan=weight_plan,
+        weights=moe.PackedWeights(
+            w13=w13,
+            w2=w2,
+            w13_block_scales=s13,
+            w2_block_scales=s2,
+            w13_global_scales=one,
+            w2_global_scales=one,
+        ),
+    )
+    plan = moe.plan_execution(
+        experts=experts,
+        capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=topk),
+        invocation={"fast_math": False},
+        routing=moe.RoutingSpec(deterministic_output=True),
+    )
+    source = torch.randn(tokens, h, dtype=torch.bfloat16, device=device) * 0.1
+    ids = torch.stack(
+        [torch.randperm(e, device=device)[:topk] for _ in range(tokens)]
+    ).to(torch.int32)
+    weights = torch.softmax(torch.randn(tokens, topk, device=device), -1)
+
+    def prepare(state):
+        buffers = tuple(
+            torch.empty(s.shape, dtype=s.dtype, device=device)
+            for s in state.scratch.scratch_specs()
+        )
+        output = torch.empty_like(source)
+        binding = state.bind(
+            a=source,
+            topk_ids=ids,
+            topk_weights=weights,
+            output=output,
+            scratch=buffers,
+            input_scales_static=True,
+        )
+        return PreparedCall(
+            run=lambda: state.run(binding), output=output, owners=(buffers, binding)
+        )
+
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare((plan.request(name="sparse-vs-dense", prepare_call=prepare),))
+
+        dense_output = torch.empty_like(source)
+        dense = moe.bind(
+            plan,
+            a=source,
+            topk_ids=ids,
+            topk_weights=weights,
+            output=dense_output,
+            scratch=tuple(
+                torch.empty(s.shape, dtype=s.dtype, device=device)
+                for s in plan.scratch_specs()
+            ),
+            input_scales_static=True,
+        )
+        moe.run(binding=dense)
+
+        sparse = moe.bind_sparse(
+            plan,
+            hidden_states=source,
+            scratch=tp_moe.TPMoEWorkspacePool(),
+            routing=B12XTopKRouting(topk_weights=weights, topk_ids=ids),
+            input_scales_static=True,
+            fast_math=False,
+        )
+        sparse_output = moe.run_sparse(plan, binding=sparse)
+        torch.cuda.synchronize()
+
+    assert torch.isfinite(dense_output).all() and torch.count_nonzero(dense_output)
+    assert torch.equal(dense_output, sparse_output)
+
+
+def _make_prepared_state(config: MoeDecodeConfig, sentinel: object):
+    from b12x.moe.fused_moe._preparation import (
+        _FusedMoeState,
+    )
+
+    return _FusedMoeState(
+        experts=object(),
+        scratch=object(),
+        config=config,
+        route_query=object(),
+        launchers=object(),
+        route_launcher=sentinel,
+    )
+
+
+def _make_precomputed_routing_binding(decode_config):
+    routing = B12XTopKRouting(
+        topk_weights=torch.ones(2, 1, dtype=torch.float32),
+        topk_ids=torch.zeros(2, 1, dtype=torch.int64),
+    )
+    return _make_sparse_binding(
+        torch.randn(2, 4),
+        _make_experts(hidden_size=4),
+        routing=routing,
+        decode_config=decode_config,
+    )
+
+
+def test_prepared_run_sparse_forwards_plan_config(monkeypatch) -> None:
+    sentinel = object()
+    state = _make_prepared_state(_make_decode_config(), sentinel)
+    binding = _make_precomputed_routing_binding(None)
+    calls: list[dict] = []
+
+    def fake_sparse(**kwargs):
+        calls.append(kwargs)
+        return "result"
+
+    monkeypatch.setattr(tp_moe, "b12x_sparse_moe_fp4", fake_sparse)
+
+    assert state.run_sparse(binding) == "result"
+    assert len(calls) == 1
+    assert calls[0]["binding"] is binding
+    assert calls[0]["decode_config"] is state.config
+    assert calls[0]["route_topk_launcher"] is sentinel
+
+
+def test_prepared_run_sparse_rejects_mismatched_decode_config(monkeypatch) -> None:
+    state = _make_prepared_state(_make_decode_config(), object())
+    other = MoeDecodeConfig(
+        backend="static", route_planner="triton", max_active_clusters=None
+    )
+    binding = _make_precomputed_routing_binding(other)
+    calls: list[dict] = []
+    monkeypatch.setattr(tp_moe, "b12x_sparse_moe_fp4", lambda **kw: calls.append(kw))
+
+    with pytest.raises(ValueError, match="prepared plan"):
+        state.run_sparse(binding)
+
+    assert calls == []
