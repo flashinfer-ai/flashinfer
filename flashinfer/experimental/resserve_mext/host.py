@@ -1,8 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 Rong Shuo
 # SPDX-License-Identifier: Apache-2.0
 """SM100 Fold kernel compilation and launch."""
-# Ported from ResServe, commit 51b906836a69fa43915040314df57bc9f23030ad.
-# Source: csrc/common/fold/sm10x/host.py
 
 from __future__ import annotations
 

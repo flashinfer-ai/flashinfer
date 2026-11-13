@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Rong Shuo
 # SPDX-License-Identifier: Apache-2.0
-"""FlashInfer JIT binding for the ResInfer grouped Q producer."""
+"""FlashInfer JIT binding for the ResServe grouped Q producer."""
 
 import functools
 

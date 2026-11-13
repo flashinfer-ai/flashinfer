@@ -2,9 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Experimental ResServe quantization, folded GEMM and paged decode APIs.
 
-Ported from https://github.com/ShawRong/resserve at
-51b906836a69fa43915040314df57bc9f23030ad. See the backend README for lineage.
-
 Import public entry points from this module. Each call explicitly opts into
 an experimental API and lazily imports its backend. Implementation modules
 under ``flashinfer.experimental.resserve_*`` are internal. These APIs remain

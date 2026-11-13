@@ -1,9 +1,9 @@
-# ResInfer ResAttn (experimental)
+# ResServe ResAttn (experimental)
 
 Owner: @ShawRong. [Tracking issue](https://github.com/flashinfer-ai/flashinfer/issues/6886).
-Source: **ResInfer**, public commit
+Source: **ResServe**, public commit
 [51b906836a69fa43915040314df57bc9f23030ad](https://github.com/ShawRong/resserve/commit/51b906836a69fa43915040314df57bc9f23030ad).
-This is a port of ResInfer's existing method and kernels, not an independent
+This is a port of ResServe's existing method and kernels, not an independent
 implementation.
 
 ## Original code and integration changes

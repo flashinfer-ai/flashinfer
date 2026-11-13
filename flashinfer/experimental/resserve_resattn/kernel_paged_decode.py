@@ -1,8 +1,6 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright (c) 2025 Rong Shuo (modifications)
-# Ported from ResInfer 51b906836a69fa43915040314df57bc9f23030ad.
-# Original source: csrc/resattn/kernel_paged_decode.py
 # SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Paged NVFP4 decode adapted from FlashInfer cute_dsl/attention/gqa_decode.py.
 NVIDIA BSD-3-Clause; local extensions add paging and residue heads.
 FP4 QK with Q residue and QMUL4 V conversion yields BF16 output."""

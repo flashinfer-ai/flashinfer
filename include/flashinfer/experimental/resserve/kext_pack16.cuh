@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION.
 // Based on the NVIDIA/vLLM FP4 quantization implementation.
-
-// Ported from ResInfer 51b906836a69fa43915040314df57bc9f23030ad,
-// csrc/nvfp4/cuda/nvfp4_residue_pack16.cu. See resserve_kext/README.md.
 #pragma once
 #include "kext_utils.cuh"
 namespace flashinfer::resserve {

@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Rong Shuo (modifications)
-// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION.
 // SPDX-License-Identifier: Apache-2.0
-// Ported from ResInfer 51b906836a69fa43915040314df57bc9f23030ad,
-// csrc/common/fp4/nvfp4_utils.cuh (NVIDIA/vLLM-derived helpers).
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION.
+// Based on the NVIDIA/vLLM FP4 quantization implementation.
 #pragma once
 #include "quant_utils.cuh"
 namespace flashinfer::resserve {
