@@ -200,6 +200,17 @@ exclude = [
 # Generated programs, hand-written bindings and manifest of the experimental
 # exact-SM103a W8A8 MXFP8 MegaMoE EP16 backend, compiled on demand.
 "flashinfer.experimental.cake_w8a8_megamoe_ep16" = ["csrc/**"]
+# Experimental MOSCA kernels: vendored upstream sources, the MOSCA kernel and
+# FlashInfer-side host code (csrc/, compiled on demand; dropped from PyPI release wheels by
+# build_backend.py), the vendoring manifests, docs and the upstream license.
+"flashinfer.experimental.mosca" = [
+  "csrc/**",
+  "vendor/*.json",
+  "README.md",
+  "VENDOR.md",
+  "LICENSE.DeepGEMM",
+]
+"flashinfer.experimental.mosca.megamoe" = ["README.md"]
 # Generated sources for the experimental exact-SM100a/SM103a/SM107a ragged BF16 MoE grouped GEMM backend.
 "flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train" = ["csrc/**", "build.json"]
 # Generated sources of its non-deterministic counterpart.
