@@ -1072,6 +1072,26 @@ def _check_relaunch_bitwise(launch, outputs, relaunches):
             assert diff == 0, f"{k}: {diff} elements differ across relaunches"
 
 
+def _all_ranks_ok(check):
+    """Run ``check`` on every rank and fail every rank if any rank failed."""
+    import torch
+    import torch.distributed as dist
+
+    err = None
+    try:
+        check()
+    except Exception as e:  # re-raised below, after the collective
+        err = e
+    failed = torch.tensor([0 if err is None else 1], dtype=torch.int32, device="cuda")
+    dist.all_reduce(failed)
+    if err is not None:
+        raise err
+    if failed.item():
+        raise AssertionError(
+            f"{failed.item()} other rank(s) failed this launch's check"
+        )
+
+
 def _check_generate_c_output(fc1_c, ref_map, idx_g, rank, num_local_experts):
     """generate_c: compare the kernel's fc1_c pool with the reference gate+up.
 
@@ -1109,7 +1129,10 @@ def _check_generate_c_output(fc1_c, ref_map, idx_g, rank, num_local_experts):
         f"{int((tail != 0).sum().item())} non-zero elements past the last "
         "live expert segment"
     )
-    assert checked > 0, "no local expert received tokens"
+    # A rank whose experts received no rows (a 1-token launch at 8 ranks routes
+    # every token to ranks 0-3) has only the tail check above: its whole pool
+    # must have been zeroed.
+    assert checked > 0 or sum(counts) == 0, "no local expert received tokens"
     return checked
 
 
@@ -1241,34 +1264,40 @@ def _run_mega_torch_oracle(
                     combine_ref, fc1_gateup_ref = combine_ref
                 y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)
 
-                assert torch.isfinite(y_kernel).all()
-                yk = y_kernel.to(torch.float32)
-                rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
-                print(
-                    f"[sm90 bf16 multirank oracle rank {rank} swap_ab={swap_ab} "
-                    f"{tag}] rel_l2={rel_l2.item():.4g} "
-                    f"max|d|={(yk - y_ref).abs().max().item():.4g} "
-                    f"amax(ref)={y_ref.abs().max().item():.4g}"
-                )
-                # Single-GPU oracle tolerances (drop mega_runner:
-                # atol=rtol=1e-2), valid because the problem is conditioned to
-                # O(1) outputs and kernel + reference share the same gathered
-                # bf16 operands.
-                torch.testing.assert_close(yk, y_ref, atol=1e-2, rtol=1e-2)
-                assert rel_l2.item() < 0.02
-                if generate_c:
-                    checked = _check_generate_c_output(
-                        symm_buffer.fc1_c,
-                        fc1_gateup_ref,
-                        idx_g,
-                        rank,
-                        problem["num_experts"] // world_size,
-                    )
+                def check():
+                    assert torch.isfinite(y_kernel).all()
+                    yk = y_kernel.to(torch.float32)
+                    rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
                     print(
-                        f"[sm90 bf16 generate_c rank {rank} swap_ab={swap_ab} "
-                        f"{tag}] fc1_c matches the reference gate+up for "
-                        f"{checked} local experts"
+                        f"[sm90 bf16 multirank oracle rank {rank} swap_ab={swap_ab} "
+                        f"{tag}] rel_l2={rel_l2.item():.4g} "
+                        f"max|d|={(yk - y_ref).abs().max().item():.4g} "
+                        f"amax(ref)={y_ref.abs().max().item():.4g}"
                     )
+                    # Single-GPU oracle tolerances (drop mega_runner:
+                    # atol=rtol=1e-2), valid because the problem is conditioned to
+                    # O(1) outputs and kernel + reference share the same gathered
+                    # bf16 operands.
+                    torch.testing.assert_close(yk, y_ref, atol=1e-2, rtol=1e-2)
+                    assert rel_l2.item() < 0.02
+                    if generate_c:
+                        checked = _check_generate_c_output(
+                            symm_buffer.fc1_c,
+                            fc1_gateup_ref,
+                            idx_g,
+                            rank,
+                            problem["num_experts"] // world_size,
+                        )
+                        print(
+                            f"[sm90 bf16 generate_c rank {rank} swap_ab={swap_ab} "
+                            f"{tag}] fc1_c matches the reference gate+up for "
+                            f"{checked} local experts"
+                        )
+
+                # Every rank leaves this launch together: a rank that raised alone
+                # would free its symmetric heap while its peers wait in the next
+                # launch (a hang instead of a failure).
+                _all_ranks_ok(check)
                 return y_kernel, idx_g, launch
 
             y0, idx0, launch0 = launch_and_check(
