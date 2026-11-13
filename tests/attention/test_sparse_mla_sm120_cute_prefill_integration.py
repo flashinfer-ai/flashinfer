@@ -78,7 +78,9 @@ def test_public_prefill_specializations(heads, rank, inline):
         assert_mega_outputs((f["out"], f["scales"], actual_lse), expected)
 
 
-def test_pitched_inline_rows_and_lse_stride():
+@pytest.mark.parametrize("impl", ["auto", "decode-splitkv", "decode"])
+def test_pitched_inline_rows_and_lse_stride(impl):
+    """Cache/LSE strides and graph replay must work for each scheduling choice."""
     f = prefill_fixture(
         1,
         "v41_fp8",
@@ -107,12 +109,12 @@ def test_pitched_inline_rows_and_lse_stride():
             return_lse=True,
             lse_scale=0.6931471805599453,
             out_lse=out_lse,
+            impl=impl,
         )
 
     lse = mega()
-    assert (
-        next(iter(f["wrapper"]._prepared_calls.values())).plan.inspect()["variant"] != 0
-    )
+    # Compare layouts within the same implementation; this is independent of
+    # which implementation the automatic scheduling policy selects.
     expected = f["out"].float().clone(), f["scales"].clone(), lse.clone()
     backing = []
     for i, cache in enumerate(f["caches"]):

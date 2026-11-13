@@ -109,7 +109,9 @@ enum class Implementation : int64_t {
   MG,
   FullTile,
   SwapAB,
-  Dsv4Nvfp4Prefill
+  Dsv4Nvfp4Prefill,
+  Dsv4Fp8SplitKVDecode,
+  Dsv4Fp8Decode
 };
 enum class Merge : int64_t { Direct, Merge2, General, Stage1 };
 

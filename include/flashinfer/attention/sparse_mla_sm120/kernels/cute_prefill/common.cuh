@@ -5,9 +5,7 @@
 #include <cute/atom/mma_traits_sm89.hpp>
 #include <cute/tensor.hpp>
 
-#include "../../arch/barrier.cuh"
 #include "../../arch/common.cuh"
-#include "../../arch/cp_async.cuh"
 #include "../../compute/mega.cuh"
 #include "copy_atom.cuh"
 
@@ -35,14 +33,16 @@ struct Params {
   int kv_stride, extra_stride;
   float sm_scale;
 };
-__device__ float row_max4(float x) {
+static __device__ __forceinline__ float row_max4(float x) {
   x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, 1));
   return fmaxf(x, __shfl_xor_sync(0xffffffff, x, 2));
 }
-__device__ float row_sum4(float x) {
+static __device__ __forceinline__ float row_sum4(float x) {
   x += __shfl_xor_sync(0xffffffff, x, 1);
   return x + __shfl_xor_sync(0xffffffff, x, 2);
 }
-__device__ float ue8(uint8_t x) { return __uint_as_float(uint32_t(x) << 23); }
+static __device__ __forceinline__ float ue8(uint8_t x) {
+  return __uint_as_float(uint32_t(x) << 23);
+}
 
 }  // namespace flashinfer::sparse_mla_sm120::cute_prefill

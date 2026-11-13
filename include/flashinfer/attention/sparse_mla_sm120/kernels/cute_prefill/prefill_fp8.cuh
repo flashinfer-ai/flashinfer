@@ -5,6 +5,7 @@
 #include <cutlass/pipeline/sm90_pipeline.hpp>
 #include <flashinfer/fastdiv.cuh>
 
+#include "../../arch/barrier.cuh"
 #include "common.cuh"
 namespace flashinfer::sparse_mla_sm120::cute_prefill::integrated {
 // CTA: one query token, up to 32 heads, 64 sparse candidates/tile, 512 features.

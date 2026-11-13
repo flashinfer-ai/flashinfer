@@ -89,8 +89,45 @@ def resolve_execution(
     is_dsv4_nvfp4: bool,
     preference: int,
     decode_only: bool = False,
+    impl: str = "auto",
 ) -> ExecutionPlan:
     m = metadata
+    selected = (
+        policy.profile_selection(m, device, precision)
+        if not is_dsv4_nvfp4 and preference == 0
+        else None
+    )
+    eligible = (
+        not is_dsv4_nvfp4
+        and m.model == 6
+        and not m.extra_fp4
+        and precision in ("default", "fp8")
+        and m.heads in (8, 16, 32, 64)
+        and m.page_stride_bytes == m.page_size * m.row_stride_bytes
+        and m.indices_stride == m.topk
+        and (
+            not m.extra_topk
+            or (
+                m.extra_page_stride_bytes
+                == m.extra_page_size * m.extra_row_stride_bytes
+                and m.extra_indices_stride == m.extra_topk
+            )
+        )
+    )
+    if impl != "auto" and not eligible:
+        raise ValueError(
+            "impl requires inline FP8 KV, FP8 compute, contiguous indices and H=8/16/32/64"
+        )
+    if (
+        eligible
+        and preference == 0
+        and not decode_only
+        and (impl != "auto" or selected is None)
+    ):
+        sm, shared = device_caps(device)
+        return get_sparse_mla_sm120_module().resolve_decode_attention(
+            m, {"auto": 0, "decode-splitkv": 1, "decode": 2}[impl], sm, shared
+        )
     if is_dsv4_nvfp4:
         from ._dsv4_nvfp4_policy import (
             plan_nvfp4_sparse_mla_sm120,
@@ -126,9 +163,6 @@ def resolve_execution(
             shared,
             False,
         )
-    selected = (
-        policy.profile_selection(m, device, precision) if preference == 0 else None
-    )
     if decode_only:
         cpb = (
             selected.cpb
@@ -261,9 +295,10 @@ def prepare(
     caller_lse=False,
     current=None,
     decode_only=False,
+    impl="auto",
 ):
     plan = resolve_execution(
-        metadata, device, precision, is_dsv4_nvfp4, preference, decode_only
+        metadata, device, precision, is_dsv4_nvfp4, preference, decode_only, impl
     )
     workspace = tuple(
         (tuple(shape), getattr(torch, str(dtype)), int(size), int(alignment))
@@ -364,10 +399,15 @@ def wrapper_run(
     return_lse=False,
     lse_scale=1.0,
     mega=None,
+    impl="auto",
 ):
     from ._execution import check_inline_scale_caches
     from ._execution import resolve_model_type as _resolve_model_type
 
+    if impl not in ("auto", "decode-splitkv", "decode"):
+        raise ValueError("impl must be auto, decode-splitkv, or decode")
+    if impl != "auto" and prefill_impl not in (None, "auto"):
+        raise ValueError("impl and prefill_impl cannot both override scheduling")
     is_dsv4_nvfp4 = wrapper._kv_cache_format == "nvfp4"
     if not is_dsv4_nvfp4:
         check_inline_scale_caches(
@@ -415,7 +455,7 @@ def wrapper_run(
         mid_out,
         mid_lse,
     )
-    key = (pref, tuple(tensor_signature(x) for x in tensors))
+    key = (pref, impl, tuple(tensor_signature(x) for x in tensors))
     capturing = torch.cuda.is_current_stream_capturing()
     if not capturing:
         calibration.refresh_store()
@@ -454,6 +494,7 @@ def wrapper_run(
             caller_mlse=mid_lse is not None,
             caller_lse=out_lse is not None,
             current=current,
+            impl=impl,
         )
         wrapper._prepared_calls[key] = current = updated
     mid_out, mid_lse = prefix_scratch(current, mid_out, mid_lse)

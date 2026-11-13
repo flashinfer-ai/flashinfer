@@ -1059,6 +1059,7 @@ class _SparseMLAPagedAttentionRunner:
         positions: torch.Tensor,
         cos_sin: torch.Tensor,
         output_scales: torch.Tensor,
+        impl: str = "auto",
         **kwargs,
     ) -> Optional[torch.Tensor]:
         """Experimental V4 sparse MLA with fused Q RoPE and FP8 output.
@@ -1074,7 +1075,19 @@ class _SparseMLAPagedAttentionRunner:
         Decode each scale as exp2(output_scales.float() - 127), repeat it
         over its 32 features, and multiply by output.float(). The context
         is rounded to BF16 before FP32 inverse RoPE and FP8 quantization.
-        The caller handles Q normalization and learned projections.
+        The attention-side fusion follows FlashMLA decode with
+        ``enable_q_norm=False``: Q RoPE -> BF16 -> sparse attention with sink
+        normalization -> BF16 context -> inverse RoPE -> FP8 cast. Q RMSNorm,
+        learned projections, KV cache construction and sparse-index selection
+        are caller operations. This API stores contiguous output and scale
+        tensors rather than FlashMLA's projection-grouped scale layout.
+
+        ``impl="decode-splitkv"`` divides selected KV across CTA clusters and
+        merges their partial contexts inside the attention launch. ``"decode"``
+        reuses the pipelined prefill backbone without splitting KV.
+        ``impl="auto"`` chooses by head-task parallelism and SM wave counts.
+        Explicit ``"decode-splitkv"`` and ``"decode"`` require inline
+        FP8 KV, FP8 compute, contiguous indices and H=8/16/32/64.
 
         Requires backend="sparse" and an FP8 cache; full-BF16 attention plans are unsupported.
         Other keyword arguments follow ``run``, including sinks, sparse
@@ -1103,6 +1116,7 @@ class _SparseMLAPagedAttentionRunner:
             q,
             sm_scale,
             mega=(positions, cos_sin, output.view(torch.uint8), output_scales),
+            impl=impl,
             **kwargs,
         )
 
@@ -1124,6 +1138,7 @@ class _SparseMLAPagedAttentionRunner:
         mid_out: Optional[torch.Tensor] = None,
         mid_lse: Optional[torch.Tensor] = None,
         prefill_impl: Optional[str] = None,
+        impl: str = "auto",
         return_lse: bool = False,
         lse_scale: float = 1.0,
     ) -> Optional[torch.Tensor]:
@@ -1153,6 +1168,14 @@ class _SparseMLAPagedAttentionRunner:
         via ``mid_out``/``mid_lse`` when given, otherwise buffers cached on
         the runner.
 
+        ``impl`` accepts ``"auto"`` (default), ``"decode-splitkv"`` or
+        ``"decode"``. For flat inline FP8 KV with H=8/16/32/64,
+        auto selects by query/head-task parallelism relative to SM count and
+        the number of resident CTA waves. ``"decode"`` uses the pipelined
+        backbone; ``"decode-splitkv"`` uses local KV chunks and an in-kernel
+        cluster merge. Explicit choices require this format and cannot be combined with a
+        ``prefill_impl`` override. Other formats retain their existing auto policy.
+
         ``prefill_impl`` (``None``/``"auto"``/``"swapab"``/``"mg"``) overrides
         the prefill-kernel selection for calls that dispatch to prefill;
         ``"swapab"`` raises ``ValueError`` when the actual metadata is outside
@@ -1165,6 +1188,10 @@ class _SparseMLAPagedAttentionRunner:
         ``[num_tokens, topk]`` or ``[num_tokens, 1, topk]``; the singleton
         query axis is normalized before planning and launch.
         """
+        if impl not in ("auto", "decode-splitkv", "decode"):
+            raise ValueError("impl must be auto, decode-splitkv, or decode")
+        if self._backend != "sparse" and impl != "auto":
+            raise ValueError("impl overrides require backend='sparse'")
         if self._backend == "cake" and self._kv_cache_format == "fp8":
             from .cake_dsv41_mixed import wrapper_run as cake_dsv41_wrapper_run
 
@@ -1228,6 +1255,7 @@ class _SparseMLAPagedAttentionRunner:
             mid_out=mid_out,
             mid_lse=mid_lse,
             prefill_impl=prefill_impl,
+            impl=impl,
             return_lse=return_lse,
             lse_scale=lse_scale,
         )
