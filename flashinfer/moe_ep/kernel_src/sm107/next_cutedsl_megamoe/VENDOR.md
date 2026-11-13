@@ -1,9 +1,7 @@
 # Rubin inference sources
 
 `src/` contains standard and GenPhase inference, with their dependencies in
-`src/common/` and `src/sources/`. The source revision is
-`70a6878de7852ed837d6a4dfc1572728226fbbc4`, with the shared-runtime changes from
-`1695115c1fb703f4f1d2ad9076944e4876a3ae01`.
+`src/common/` and `src/sources/`.
 
 ```text
 next_cutedsl_megamoe/
@@ -15,17 +13,64 @@ next_cutedsl_megamoe/
 └── export_manifest.json
 ```
 
-The selected entry points are `RubinInferenceMegaMoE` and
-`RubinInferenceGenphaseMegaMoE`. `export_manifest.json` records the exported
-file hashes and release-transform checksum. Source changes belong in the
-provider before regeneration; do not edit the installed export.
+## Source and export
 
-The provider's export and release tools are not included in this snapshot.
-The cleanup checksum identifies the release transformation. Rebuilding the drop
-requires the provider's release process, both entry points above and the shared
-modules used directly by the adapter. Verify every exported file against the
-manifest before replacing the package, then run the adapter, numerical and
-graph-replay tests.
+- Source revision: `70a6878de7852ed837d6a4dfc1572728226fbbc4`.
+- Shared-runtime revision: `1695115c1fb703f4f1d2ad9076944e4876a3ae01`.
+- Source with retained patches: `7a08e1825194461fd17a60adc2fb47ba26af7eb7`,
+  recorded as `patch_revision` in `export_manifest.json`.
+- Exporter: `export_src.py` at the shared-runtime revision above,
+  SHA-256 `3bda4e9bfd5184d9051f3eda17bbbdc0203675e9959459bbc9e2d2629b48d2af`.
+- Entry points: `RubinInferenceMegaMoE` and `RubinInferenceGenphaseMegaMoE`.
+- Exported Python files: 69, including 11 generated package initializers.
+
+From the provider checkout containing those revisions and patches, export with:
+
+```bash
+python export_src.py \
+    --kernels RubinInferenceMegaMoE RubinInferenceGenphaseMegaMoE \
+    --modules \
+        common.cute_ref_ops common.direct_meta common.dsl_helpers \
+        common.fc_tile_timeline_host common.host_utils common.inputs_process \
+        common.megamoe_constants common.moe_utils common.pipeline_timing \
+        common.pipeline_timing_host common.ptx_helpers common.route_reset \
+        common.token_segments common.utils \
+    --dst-dir "${FI_EXPORT_STAGE:?}/raw"
+```
+
+Set `FI_EXPORT_STAGE` to an existing staging directory outside the checkout.
+Its `raw/` destination must be absent or empty. The explicit `--modules` list
+preserves this drop's shared-runtime selection, including modules used directly
+by the FlashInfer shim.
+
+## Export transformations
+
+The exporter resolves dependencies, rewrites imports within the exported package
+and generates lazy root entry points. It materializes these source aliases;
+paths are relative to the provider checkout and exported `src/`, respectively:
+
+| Provider source | Exported file |
+| --- | --- |
+| `sources/kernel_src/blackwell/custom_mix_cga_helpers.py` | `sources/kernel_src/rubin/custom_mix_cga_helpers.py` |
+| `sources/kernel_src/rubin/inference/local_mega/tma_gather.py` | `sources/kernel_src/rubin/inference/mega/tma_gather.py` |
+
+Apply the release-preparation patch before installing the export. Its SHA-256
+must match `cleanup_patch_sha256` in `export_manifest.json`. With
+`FI_RELEASE_PATCH` set to that patch's absolute path:
+
+```bash
+patch --batch --forward --no-backup-if-mismatch -p1 \
+    -d "${FI_EXPORT_STAGE:?}/raw" -i "${FI_RELEASE_PATCH:?}"
+```
+
+The manifest hashes describe the files after release preparation. Verify every
+file and the complete file list before replacing `src/`. The exporter and
+release patch are maintained with the provider export records and are not
+included in this package. Keep the export log and file hashes with those records.
+Source changes belong in the provider before regeneration; do not edit or format
+the installed export. Run the affected adapter, numerical and graph-replay tests.
+
+## Retained changes and integration
 
 The drop retains FlashInfer's route-ID forwarding and invalid-route masking
 for separate reduction. GenPhase uses the provider's self-validating combine
