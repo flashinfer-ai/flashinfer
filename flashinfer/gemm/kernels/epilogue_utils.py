@@ -434,6 +434,10 @@ def epilogue_scaled(
             # Async arrive accumulator buffer empty
             # Release early for perf
             if subtile_idx == subtile_cnt - 1:
+                # The t2r load above is asynchronous: wait for its registers
+                # before handing the accumulator stage back to the MMA warp
+                # (as epilogue_with_alpha does).
+                cute.arch.fence_view_async_tmem_load()
                 with cute.arch.elect_one():
                     acc_pipeline.consumer_release(acc_consumer_state)
                 acc_consumer_state.advance()
@@ -679,6 +683,8 @@ def epilogue_with_alpha(
                 acc_consumer_state.advance()
         else:
             if subtile_idx == subtile_cnt - 1:
+                # Same asynchronous t2r load as above: wait before releasing.
+                cute.arch.fence_view_async_tmem_load()
                 with cute.arch.elect_one():
                     acc_pipeline.consumer_release(acc_consumer_state)
                 acc_consumer_state.advance()

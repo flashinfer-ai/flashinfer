@@ -2000,6 +2000,11 @@ class FP8PrefillMQALogitsKernel(_BaseKernel):
                     q_last_next = min(next_q_block_idx * 4 + 3, num_q_tokens - 1)
                     next_num_kv = (mCuSeqLenKEnd[q_last_next] + 127) // 128
                 has_work = next_q_block_idx < num_q_blocks
+            # Every math warp has waited for its own TMEM loads
+            # (fence_view_async_tmem_load after each tcgen05.ld); this barrier
+            # orders the other math warps' last loads before math warp 0 frees
+            # the columns, as the fp8 filter kernels in this directory do.
+            subset_barrier(barrier_id=15, number_of_threads=self.num_math_threads)
             if cutlass.const_expr(self.num_heads != 32):
                 tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
