@@ -21,6 +21,7 @@ from flashinfer.utils import (
     LibraryError,
 )
 from flashinfer.autotuner import AutoTuner
+from flashinfer.autotuner.initializers import autotuner_initializer_empty
 from flashinfer.gemm.gemm_base import (
     CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR,
     DEFAULT_WORKSPACE_SIZE,
@@ -195,6 +196,29 @@ def test_mm_fp4(
 
 
 @pytest.mark.parametrize("use_8x4_sf_layout", [False, True])
+def test_mm_fp4_autotune_profile_initializers(use_8x4_sf_layout):
+    """Verify FP4 autotune profiles use uninitialized output and workspace buffers."""
+    config = (
+        _MM_FP4_TUNING_CONFIG_8x4 if use_8x4_sf_layout else _MM_FP4_TUNING_CONFIG_128x4
+    )
+    inputs = [
+        torch.empty((1, 64), dtype=torch.uint8),
+        torch.empty((128, 64), dtype=torch.uint8).T,
+        torch.empty((128, 8), dtype=torch.uint8),
+        torch.empty((128, 8), dtype=torch.uint8).T,
+        torch.ones(()),
+        torch.bfloat16,
+        torch.empty((1, 128), dtype=torch.bfloat16),
+        16,
+        True,
+        torch.empty(1, dtype=torch.uint8),
+    ]
+    profile = AutoTuner.get()._generate_optimization_profiles(config, inputs)[0]
+    assert profile.tensor_initializers[6] is autotuner_initializer_empty
+    assert profile.tensor_initializers[9] is autotuner_initializer_empty
+
+
+@pytest.mark.parametrize("use_8x4_sf_layout", [False, True])
 def test_mm_fp4_autotune_profile_memory(use_8x4_sf_layout):
     """Reject large FP32 temporaries when preparing FP4 output and workspace."""
     config = (
@@ -214,6 +238,8 @@ def test_mm_fp4_autotune_profile_memory(use_8x4_sf_layout):
     ]
     tuner = AutoTuner.get()
     profile = tuner._generate_optimization_profiles(config, inputs)[0]
+    assert profile.tensor_initializers[6] is autotuner_initializer_empty
+    assert profile.tensor_initializers[9] is autotuner_initializer_empty
     torch.cuda.synchronize()
     before = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
