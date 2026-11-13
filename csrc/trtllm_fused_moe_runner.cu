@@ -520,6 +520,11 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
   activationData.gatedActClampLimitPtr = args.gemm1_clamp_limit;
   activationData.ctaIdxXyToBatchIdx = workspace.cta_idx_xy_to_batch_idx;
   activationData.tileTokensDim = workspace.ProjUpTileN;
+  // The persistent activation walks the permuted rows (local pairs plus tile padding) or the
+  // (token, slot) pairs, whichever list is shorter; it needs the row -> token map and the row
+  // count of the permuted buffers.
+  activationData.permutedIdxToTokenIdx = workspace.permuted_idx_to_token_idx;
+  activationData.totalMaxPaddedTokens = workspace.total_max_padded_tokens;
 
   // Setup finalize data
   if (args.do_finalize) {
