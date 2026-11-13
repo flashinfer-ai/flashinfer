@@ -35,16 +35,23 @@ cudaError_t dispatch_decode(const execution::AttentionParams& p,
   a.extra_topk = m.extra_topk;
   a.kv_stride = m.row_stride_bytes;
   a.extra_stride = m.extra_row_stride_bytes;
+  a.page_stride = m.page_stride_bytes;
+  a.extra_page_stride = m.extra_page_stride_bytes;
+  a.page_size = m.page_size;
+  a.extra_page_size = m.extra_page_size;
+  a.page_div = flashinfer::uint_fastdiv(uint32_t(m.page_size));
+  a.extra_page_div = flashinfer::uint_fastdiv(uint32_t(m.extra_topk ? m.extra_page_size : 1));
   a.sm_scale = p.sm_scale;
   a.lse_stride = m.lse_stride;
   a.lse_scale = p.lse_scale;
   a.partial = p.mid_out;
   a.partial_lse = p.mid_lse;
   a.splits = plan.active_splits;
-  auto launch = [&](auto warps, auto fused, auto split) {
+  auto launch = [&](auto warps, auto fused, auto split, auto inline_scale) {
     constexpr int W = decltype(warps)::value;
     constexpr bool Mega = decltype(fused)::value;
-    auto kernel = dsv4_fp8_splitkv_decode::decode<W, Mega, decltype(split)::value>;
+    auto kernel = dsv4_fp8_splitkv_decode::decode<W, Mega, decltype(split)::value,
+                                                  decltype(inline_scale)::value>;
     static thread_local bool configured[32] = {};
     auto status = configure_dynamic_smem_per_device(
         kernel, sizeof(dsv4_fp8_splitkv_decode::Shared<W>), configured);
@@ -73,16 +80,20 @@ cudaError_t dispatch_decode(const execution::AttentionParams& p,
     }
     return cudaLaunchKernelEx(&config, kernel, a);
   };
-  auto heads = [&](auto fused) {
-    if (m.heads == 8) return launch(cute::Int<1>{}, fused, cute::Int<0>{});
-    if (m.heads == 16) return launch(cute::Int<2>{}, fused, cute::Int<0>{});
+  auto heads = [&](auto fused, auto inline_scale) {
+    if (m.heads == 8) return launch(cute::Int<1>{}, fused, cute::Int<0>{}, inline_scale);
+    if (m.heads == 16) return launch(cute::Int<2>{}, fused, cute::Int<0>{}, inline_scale);
     if (m.heads == 64) {
-      return a.splits == 8 ? launch(cute::Int<3>{}, fused, cute::Int<8>{})
-                           : launch(cute::Int<3>{}, fused, cute::Int<0>{});
+      return a.splits == 8 ? launch(cute::Int<3>{}, fused, cute::Int<8>{}, inline_scale)
+                           : launch(cute::Int<3>{}, fused, cute::Int<0>{}, inline_scale);
     }
-    return launch(cute::Int<4>{}, fused, cute::Int<0>{});
+    return launch(cute::Int<4>{}, fused, cute::Int<0>{}, inline_scale);
   };
-  return p.mega.output ? heads(std::true_type{}) : heads(std::false_type{});
+  if (m.model == int(ModelType::DSV4_1_INLINE))
+    return p.mega.output ? heads(std::true_type{}, std::true_type{})
+                         : heads(std::false_type{}, std::true_type{});
+  return p.mega.output ? heads(std::true_type{}, std::false_type{})
+                       : heads(std::false_type{}, std::false_type{});
 }
 
 namespace execution {
@@ -132,14 +143,17 @@ ffi::Module resolve_descriptor(ffi::Array<int64_t> values, int64_t mode, int64_t
   TVM_FFI_ICHECK(mode >= 0 && mode <= 2 && sm_count > 0 && sm_count <= INT_MAX && max_shared > 0);
   m.variant = 0;
   auto p = resolve_attention(m, NumericRoute::FP8, 1, {int(sm_count), size_t(max_shared)});
-  TVM_FFI_ICHECK(m.model == int(ModelType::DSV4_1_INLINE) && !m.extra_fp4 &&
-                 (m.heads == 8 || m.heads == 16 || m.heads == 32 || m.heads == 64) &&
-                 m.page_stride_bytes == size_t(m.page_size) * m.row_stride_bytes &&
-                 m.indices_stride == size_t(m.topk) &&
-                 (!m.extra_topk || (m.extra_page_stride_bytes ==
-                                        size_t(m.extra_page_size) * m.extra_row_stride_bytes &&
-                                    m.extra_indices_stride == size_t(m.extra_topk))))
-      << "DSv4 FP8 decode requires flat inline FP8 KV, contiguous indices and H=8/16/32/64";
+  const bool footer = m.model == int(ModelType::DSV4_1);
+  TVM_FFI_ICHECK(
+      is_dsv41(static_cast<ModelType>(m.model)) && !m.extra_fp4 &&
+      (m.heads == 8 || m.heads == 16 || m.heads == 32 || m.heads == 64) &&
+      (footer || m.page_stride_bytes == size_t(m.page_size) * m.row_stride_bytes) &&
+      m.indices_stride == size_t(m.topk) &&
+      (!m.extra_topk || ((footer || m.extra_page_stride_bytes ==
+                                        size_t(m.extra_page_size) * m.extra_row_stride_bytes) &&
+                         m.extra_indices_stride == size_t(m.extra_topk))))
+      << "DSv4 FP8 decode requires footer pages or flat inline FP8 KV, contiguous indices and "
+         "H=8/16/32/64";
   p.implementation = get_implementation(m, mode, sm_count);
   p.scratch_heads = m.heads;
   p.merge = Merge::Direct;  // Neither implementation launches a separate merge.

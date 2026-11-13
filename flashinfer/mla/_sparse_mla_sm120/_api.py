@@ -1086,8 +1086,10 @@ class _SparseMLAPagedAttentionRunner:
         merges their partial contexts inside the attention launch. ``"decode"``
         reuses the pipelined prefill backbone without splitting KV.
         ``impl="auto"`` chooses by head-task parallelism and SM wave counts.
-        Explicit ``"decode-splitkv"`` and ``"decode"`` require inline
-        FP8 KV, FP8 compute, contiguous indices and H=8/16/32/64.
+        Very small footer workloads retain the legacy decode path.
+        Explicit ``"decode-splitkv"`` and ``"decode"`` support DSv4.1 footer
+        pages and flat inline FP8 KV, with FP8 compute, contiguous indices
+        and H=8/16/32/64.
 
         Requires backend="sparse" and an FP8 cache; full-BF16 attention plans are unsupported.
         Other keyword arguments follow ``run``, including sinks, sparse
@@ -1169,7 +1171,7 @@ class _SparseMLAPagedAttentionRunner:
         the runner.
 
         ``impl`` accepts ``"auto"`` (default), ``"decode-splitkv"`` or
-        ``"decode"``. For flat inline FP8 KV with H=8/16/32/64,
+        ``"decode"``. For DSv4.1 footer pages or flat inline FP8 KV with H=8/16/32/64,
         auto selects by query/head-task parallelism relative to SM count and
         the number of resident CTA waves. ``"decode"`` uses the pipelined
         backbone; ``"decode-splitkv"`` uses local KV chunks and an in-kernel

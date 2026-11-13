@@ -3,7 +3,6 @@
 #pragma once
 #include <cute/atom/copy_traits_sm75.hpp>
 #include <cutlass/pipeline/sm90_pipeline.hpp>
-#include <flashinfer/fastdiv.cuh>
 
 #include "../../arch/barrier.cuh"
 #include "common.cuh"
@@ -20,31 +19,7 @@ namespace flashinfer::sparse_mla_sm120::cute_prefill::integrated {
 // Mega specializes Q RoPE and inverse-output-RoPE/FP8 conversion at compile time.
 // Broadcast each warp-uniform arrival address to avoid the predicated/address-offset
 // code generation that produces async-copy racecheck reports.
-struct Params : cute_prefill::Params {
-  bf16* bf16_output;
-  size_t lse_stride;
-  float lse_scale;
-  size_t page_stride, extra_page_stride;
-  int page_size, extra_page_size;
-  flashinfer::uint_fastdiv page_div, extra_page_div;
-};
-
-// Footer pages store all payload rows followed by all 16-byte scale rows.
-// Inline rows keep their original flat addressing specialization.
-template <bool Inline, bool Scale>
-__device__ __forceinline__ const uint8_t* cache_row(const Params& p, bool extra, int id) {
-  const uint8_t* cache = extra ? p.extra_kv : p.kv;
-  if constexpr (Inline) {
-    return cache + size_t(max(id, 0)) * (extra ? p.extra_stride : p.kv_stride) + (Scale ? 512 : 0);
-  } else {
-    uint32_t page, row;
-    (extra ? p.extra_page_div : p.page_div).divmod(uint32_t(max(id, 0)), page, row);
-    const size_t page_stride = extra ? p.extra_page_stride : p.page_stride;
-    const int page_size = extra ? p.extra_page_size : p.page_size;
-    return cache + size_t(page) * page_stride +
-           (Scale ? size_t(page_size) * 512 + row * 16 : row * 512);
-  }
-}
+using Params = PagedParams;
 enum class Role { load_k, load_v, mma_qk, mma_pv };
 using Pipeline = cutlass::PipelineAsync<3>;
 struct alignas(128) Shared {

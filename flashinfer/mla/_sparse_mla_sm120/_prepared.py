@@ -99,24 +99,30 @@ def resolve_execution(
     )
     eligible = (
         not is_dsv4_nvfp4
-        and m.model == 6
+        and m.model in policy._DSV4_1_MODEL_TYPES
         and not m.extra_fp4
         and precision in ("default", "fp8")
         and m.heads in (8, 16, 32, 64)
-        and m.page_stride_bytes == m.page_size * m.row_stride_bytes
+        and (
+            m.model == policy._MODEL_TYPE_DSV4_1
+            or m.page_stride_bytes == m.page_size * m.row_stride_bytes
+        )
         and m.indices_stride == m.topk
         and (
             not m.extra_topk
             or (
-                m.extra_page_stride_bytes
-                == m.extra_page_size * m.extra_row_stride_bytes
+                (
+                    m.model == policy._MODEL_TYPE_DSV4_1
+                    or m.extra_page_stride_bytes
+                    == m.extra_page_size * m.extra_row_stride_bytes
+                )
                 and m.extra_indices_stride == m.extra_topk
             )
         )
     )
     if impl != "auto" and not eligible:
         raise ValueError(
-            "impl requires inline FP8 KV, FP8 compute, contiguous indices and H=8/16/32/64"
+            "impl requires DSv4.1 FP8 KV, FP8 compute, contiguous indices and H=8/16/32/64"
         )
     if (
         eligible
@@ -125,9 +131,17 @@ def resolve_execution(
         and (impl != "auto" or selected is None)
     ):
         sm, shared = device_caps(device)
-        return get_sparse_mla_sm120_module().resolve_decode_attention(
-            m, {"auto": 0, "decode-splitkv": 1, "decode": 2}[impl], sm, shared
-        )
+        # At fewer than two query-head rows per SM, footer gather and cluster
+        # finalization cost more than the legacy decode. Keep that automatic
+        # path while allowing either CuTe implementation to be requested.
+        if (
+            impl != "auto"
+            or m.model != policy._MODEL_TYPE_DSV4_1
+            or m.tokens * m.heads >= 2 * sm
+        ):
+            return get_sparse_mla_sm120_module().resolve_decode_attention(
+                m, {"auto": 0, "decode-splitkv": 1, "decode": 2}[impl], sm, shared
+            )
     if is_dsv4_nvfp4:
         from ._dsv4_nvfp4_policy import (
             plan_nvfp4_sparse_mla_sm120,

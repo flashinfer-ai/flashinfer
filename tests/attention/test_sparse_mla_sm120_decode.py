@@ -14,12 +14,13 @@ from tests.attention.sparse_mla_prefill_utils import (
 
 
 @pytest.mark.parametrize("impl", ["auto", "decode-splitkv", "decode"])
+@pytest.mark.parametrize("inline", [False, True])
 @pytest.mark.parametrize(
     "tokens,heads", [(1, 8), (7, 16), (7, 32), (7, 64), (28, 64), (98, 64)]
 )
 @pytest.mark.parametrize("ragged", [False, True])
-def test_decode_math_and_fusion(impl, tokens, heads, ragged):
-    f = fixture(tokens, heads, "v41_fp8", ragged=ragged)
+def test_decode_math_and_fusion(impl, tokens, heads, ragged, inline):
+    f = fixture(tokens, heads, "v41_fp8", ragged=ragged, inline=inline)
     lse = call(f, impl)
     metric = numerical_metrics(f, lse)
     assert metric["finite_output"] and metric["relative_l2"] < 0.07, metric
@@ -46,8 +47,9 @@ def test_decode_math_and_fusion(impl, tokens, heads, ragged):
 
 @pytest.mark.parametrize("impl", ["decode-splitkv", "decode", "auto"])
 @pytest.mark.parametrize("empty", ["lengths", "indices"])
-def test_decode_empty_and_mutable_graph(impl, empty):
-    f = fixture(7, 64, "v41_fp8", with_sink=False)
+@pytest.mark.parametrize("inline", [False, True])
+def test_decode_empty_and_mutable_graph(impl, empty, inline):
+    f = fixture(7, 64, "v41_fp8", with_sink=False, inline=inline)
     lse = call(f, impl)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -82,8 +84,9 @@ def test_decode_invalid_impl(bad):
         call(f, bad)
 
 
-def test_decode_explicit_selection():
-    f = fixture(7, 64, "v41_fp8")
+@pytest.mark.parametrize("inline", [False, True])
+def test_decode_explicit_selection(inline):
+    f = fixture(7, 64, "v41_fp8", inline=inline)
     for impl in ["decode-splitkv", "decode"]:
         call(f, impl)
         facts = [
@@ -96,6 +99,26 @@ def test_decode_explicit_selection():
         )
         if impl == "decode":
             assert facts[0]["partial_bytes"] == 0
+
+
+def test_footer_auto_keeps_small_workloads_on_legacy_decode():
+    f = fixture(1, 8, "v41_fp8", inline=False, extra_topk=0)
+    call(f, "auto")
+    plan = next(iter(f["wrapper"]._prepared_calls.values())).plan.inspect()
+    assert plan["implementation"] == "ordinary"
+    assert plan["variant"] == 0
+    # The automatic cutoff must not restrict either explicit implementation.
+    for impl, expected in (
+        ("decode-splitkv", "dsv4_fp8_splitkv_decode"),
+        ("decode", "dsv4_fp8_decode"),
+    ):
+        call(f, impl)
+        plan = next(
+            p.plan.inspect()
+            for key, p in f["wrapper"]._prepared_calls.items()
+            if key[1] == impl
+        )
+        assert plan["implementation"] == expected
 
 
 def fp8_query_lse_reference(f):
@@ -133,11 +156,69 @@ def fp8_query_lse_reference(f):
 
 
 @pytest.mark.parametrize("impl", ["auto", "decode-splitkv", "decode"])
-def test_decode_single_cache(impl):
-    f = fixture(7, 64, "v41_fp8", extra_topk=0)
+@pytest.mark.parametrize("inline", [False, True])
+def test_decode_single_cache(impl, inline):
+    f = fixture(7, 64, "v41_fp8", extra_topk=0, inline=inline)
     lse = call(f, impl)
     metric = numerical_metrics(f, lse)
     assert metric["relative_l2"] < 0.07 and metric["lse_max_abs"] < 0.06
+
+
+@pytest.mark.parametrize("impl", ["auto", "decode-splitkv", "decode"])
+@pytest.mark.parametrize("heads", [8, 16, 32, 64])
+@pytest.mark.parametrize("extra_page_size", [2, 3, 64])
+def test_decode_footer_page_addressing(impl, heads, extra_page_size):
+    """Gather across page boundaries with padded pages and a nonzero origin."""
+    f = fixture(
+        7,
+        heads,
+        "v41_fp8",
+        inline=False,
+        pool_tokens=4032,
+        extra_page_size=extra_page_size,
+        topk=65,
+        extra_topk=97,
+    )
+    # Include both sides of page boundaries, invalid indices, partial tiles,
+    # and an empty row. Main and extra caches have independent page geometry.
+    for ids, lengths, page in zip(
+        f["indices"], f["lengths"], (64, extra_page_size), strict=True
+    ):
+        ids[:, :4] = torch.tensor(
+            [page - 1, page, 2 * page - 1, 2 * page], device="cuda"
+        )
+        ids[:, 5::11] = -1
+        lengths[0] = 0
+        lengths[1] = 33
+    lse = call(f, impl)
+    torch.testing.assert_close(
+        lse.double(), fp8_query_lse_reference(f), atol=2e-5, rtol=0
+    )
+    expected = f["out"].float().clone(), f["scales"].clone(), lse.clone()
+    backing = []
+    for i, cache in enumerate(f["caches"]):
+        flat = cache.reshape(cache.shape[0], -1)
+        padded = torch.full(
+            (flat.shape[0], flat.shape[1] + 48), 0xA5, dtype=torch.uint8, device="cuda"
+        )
+        view = padded[:, 16:-32].view_as(cache)
+        view.copy_(cache)
+        f["caches"][i] = view
+        backing.append(padded)
+    call(f, impl)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual_lse = call(f, impl)
+    f["out"].fill_(float("nan"))
+    f["scales"].fill_(255)
+    actual_lse.fill_(float("nan"))
+    graph.replay()
+    for actual, wanted in zip(
+        (f["out"].float(), f["scales"], actual_lse), expected, strict=True
+    ):
+        torch.testing.assert_close(actual, wanted, atol=0, rtol=0)
+    for padded in backing:
+        assert (padded[:, :16] == 0xA5).all() and (padded[:, -32:] == 0xA5).all()
 
 
 def test_decode_parallelism_policy():
@@ -218,10 +299,11 @@ def test_decode_wave_policy(tokens, expected):
 
 
 @pytest.mark.parametrize("impl", ["decode-splitkv", "decode"])
-def test_decode_single_kernel_boundary(impl, tmp_path):
+@pytest.mark.parametrize("inline", [False, True])
+def test_decode_single_kernel_boundary(impl, tmp_path, inline):
     import re
 
-    f = fixture(7, 64, "v41_fp8")
+    f = fixture(7, 64, "v41_fp8", inline=inline)
     call(f, impl)
     graph = torch.cuda.CUDAGraph()
     graph.enable_debug_mode()
