@@ -29,8 +29,10 @@ __device__ __forceinline__ float mega_rotate(float x, float other, int d, const 
   if (d < 448) return x;
   const int r = (d - 448) / 2;
   const float sign = ((d & 1) != 0) != inverse ? 1.f : -1.f;
-  // Match the separate BF16 RoPE producer; do not contract its two products.
-  return __fadd_rn(__fmul_rn(x, __ldg(cs + r)), __fmul_rn(sign * other, __ldg(cs + 32 + r)));
+  // Match the unfused RoPE producer: round other*sin, then fuse x*cos + product.
+  // Keep this ordering explicit: choosing the other product for FMA can change
+  // the subsequent BF16/FP8 rounding. See tl.fma in sparse_mla_prefill_utils.py.
+  return __fmaf_rn(x, __ldg(cs + r), __fmul_rn(sign * other, __ldg(cs + 32 + r)));
 }
 
 template <bool CheckNull = true>

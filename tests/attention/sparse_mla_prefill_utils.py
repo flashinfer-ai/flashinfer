@@ -23,7 +23,10 @@ def _rope(X, Y, Positions, CS, H: tl.constexpr):
     r = (d - 448) // 2
     c = tl.load(CS + pos * 64 + r, d >= 448, other=1)
     s = tl.load(CS + pos * 64 + 32 + r, d >= 448, other=0)
-    y = x * c + tl.where(d % 2 == 0, -other, other) * s
+    # WARNING: match mega_rotate's explicit multiply-then-FMA order. CUDA 13.0
+    # can contract ordinary mul/add despite enable_fp_fusion=False; choosing
+    # a different product for FMA can change the subsequent BF16/FP8 rounding.
+    y = tl.fma(x, c, tl.where(d % 2 == 0, -other, other) * s)
     tl.store(Y + row * 512 + d, y)
 
 
@@ -37,7 +40,8 @@ def _epilogue(X, Y, SF, Positions, CS, H: tl.constexpr):
     r = (d - 448) // 2
     c = tl.load(CS + pos * 64 + r, d >= 448, other=1)
     s = tl.load(CS + pos * 64 + 32 + r, d >= 448, other=0)
-    y = x * c + tl.where(d % 2 == 0, other, -other) * s
+    # Preserve the same multiply-then-FMA order for inverse RoPE.
+    y = tl.fma(x, c, tl.where(d % 2 == 0, other, -other) * s)
     blocks = tl.reshape(y, (16, 32))
     amax = tl.maximum(tl.max(tl.abs(blocks), 1), 1.0e-4)
     # IEEE exponent rounding, also handles exact powers of two.
