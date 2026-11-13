@@ -2600,7 +2600,10 @@ def _shared_library(soname: str) -> Optional[ctypes.CDLL]:
     """The process's copy of shared library ``soname``: the one already mapped
     (the copy a JIT module linking ``soname`` binds to), else the one the
     dynamic linker finds (JIT modules loaded later bind to it), else ``None``."""
-    for mode in (os.RTLD_NOLOAD | os.RTLD_NOW, ctypes.DEFAULT_MODE):
+    # Windows has no RTLD_* flags (ctypes ignores ``mode`` there), so both
+    # attempts are plain loads; POSIX keeps the no-load probe first.
+    noload = getattr(os, "RTLD_NOLOAD", 0) | getattr(os, "RTLD_NOW", 0)
+    for mode in (noload, ctypes.DEFAULT_MODE):
         try:
             return ctypes.CDLL(soname, mode=mode)
         except OSError:
