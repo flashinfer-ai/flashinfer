@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -4105,6 +4107,9 @@ def test_k64_gate_probes_read_the_process_runtime_and_the_driver(monkeypatch):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="RTLD_NOLOAD has no Windows equivalent"
+)
 def test_shared_library_prefers_the_copy_already_in_the_process(monkeypatch):
     """A soname already mapped resolves without loading (the copy the JIT
     modules bind to); otherwise the dynamic linker loads it; a library that
