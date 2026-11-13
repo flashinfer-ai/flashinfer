@@ -1589,6 +1589,9 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                     f"Current version: {CUDNN_BACKEND_VERSION}. Skipping cudnn backend."
                 )
                 remove_cudnn = True
+        if is_nvfp4_kv:
+            print("[INFO] cudnn backend does not support NVFP4 KV. Skipping.")
+            remove_cudnn = True
         if remove_cudnn:
             backends.remove("cudnn")
 
@@ -2000,6 +2003,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 pos_encoding_mode="NONE",
                 causal=causal,
                 q_data_type=q_dtype,
+                kv_data_type=kv_dtype,
                 o_data_type=o_data_type,
                 seq_lens=actual_seq_lens_kv_device,
                 seq_lens_q=actual_seq_lens_q_device,
