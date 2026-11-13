@@ -46,6 +46,21 @@ from __future__ import annotations
 # is re-exported here so callers (e.g. core runtime) reach it through this
 # public boundary.
 from .shim import (
+    Int4WeightPack,
+    preprocess_int4_mega_weights,
+    MegaMoEHopperInt4Config,
+    MegaMoEHopperInt4Frontend,
+    MegaMoEHopperInt4Inputs,
+    MegaMoEHopperInt4SymmBuffer,
+    TransformedInt4Weights,
+    _get_symm_buffer_for_hopper_int4_mega_moe_from_resolved_config,
+    _resolve_hopper_int4_mega_moe_config,
+    get_symm_buffer_for_hopper_int4_mega_moe,
+    resolve_hopper_int4_knobs,
+    autotune_hopper_int4_mega_moe,
+    hopper_int4_candidates,
+    hopper_int4_mega_moe,
+    hopper_int4_mega_launch_thunk,
     MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE,
     MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE,
     MXFP4_TUNING_ROUTING_PROFILES,
@@ -174,6 +189,21 @@ def __getattr__(name):  # PEP 562
 
 
 __all__ = [
+    "Int4WeightPack",
+    "preprocess_int4_mega_weights",
+    "MegaMoEHopperInt4Config",
+    "MegaMoEHopperInt4Frontend",
+    "MegaMoEHopperInt4Inputs",
+    "MegaMoEHopperInt4SymmBuffer",
+    "TransformedInt4Weights",
+    "get_symm_buffer_for_hopper_int4_mega_moe",
+    "hopper_int4_mega_moe",
+    "hopper_int4_mega_launch_thunk",
+    "resolve_hopper_int4_knobs",
+    "autotune_hopper_int4_mega_moe",
+    "hopper_int4_candidates",
+    "_get_symm_buffer_for_hopper_int4_mega_moe_from_resolved_config",
+    "_resolve_hopper_int4_mega_moe_config",
     "MegaMoEHopperNvfp4Config",
     "MegaMoEHopperNvfp4Frontend",
     "MegaMoEHopperNvfp4Inputs",

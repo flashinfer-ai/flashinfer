@@ -145,6 +145,12 @@ not picked them up):
   and `_weight_sf_state` (default identity); the NV shim supplies only the
   delayed scale-producer loop and early-release policy. Preserve these hooks
   when reapplying the scale-ring extension.
+- WINT4 x AFP8 reuses the MXFP4 pipeline with K128 BF16 scales and
+  register lookup conversion in `shim/int4_{weights,conversion,kernels}.py`.
+  Keep the K256 calls routed through `_make_expanded_scale_view_k256` and
+  `_convert_packed_a_kblock`; their MX defaults are unchanged. The frontend
+  also parameterizes folded metadata columns and dtype. See
+  [INT4.md](INT4.md) for the prepared layout and explicit launch API.
 - Dispatch pull batch + rotation and the shared swap-AB epilogue copy
   (2026-10-26, measured on H200 MegaMoE shapes in October):
   `src/src/token_comm.py` ctor knobs

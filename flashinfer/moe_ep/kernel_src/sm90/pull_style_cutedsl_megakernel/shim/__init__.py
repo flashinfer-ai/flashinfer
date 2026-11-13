@@ -40,6 +40,8 @@ from .autotune import (
 from .mxfp4_optimization import hopper_mxfp4_candidates
 from .nvfp4_autotune import autotune_hopper_nvfp4_mega_moe
 from .nvfp4_tuner import hopper_nvfp4_candidates
+from .int4_autotune import autotune_hopper_int4_mega_moe
+from .int4_tuner import hopper_int4_candidates
 from .knob_cache import (
     knob_cache_path,
     lookup_knobs,
@@ -64,6 +66,20 @@ from .mxfp4_tuner import (
     normalize_hopper_mxfp4_routing_profile,
     require_hopper_mxfp4_fused_tuning_device,
     validate_hopper_mxfp4_tactic,
+)
+from .int4_weights import Int4WeightPack, preprocess_int4_mega_weights
+from .hopper_int4 import (
+    MegaMoEHopperInt4Config,
+    MegaMoEHopperInt4Frontend,
+    MegaMoEHopperInt4Inputs,
+    MegaMoEHopperInt4SymmBuffer,
+    TransformedInt4Weights,
+    _get_symm_buffer_for_hopper_int4_mega_moe_from_resolved_config,
+    _resolve_hopper_int4_mega_moe_config,
+    get_symm_buffer_for_hopper_int4_mega_moe,
+    resolve_hopper_int4_knobs,
+    hopper_int4_mega_moe,
+    hopper_int4_mega_launch_thunk,
 )
 from .hopper_fp8 import (
     MegaMoEHopperFp8Config,
@@ -131,6 +147,21 @@ from .hopper_nvfp4 import (
 )
 
 __all__ = [
+    "Int4WeightPack",
+    "preprocess_int4_mega_weights",
+    "MegaMoEHopperInt4Config",
+    "MegaMoEHopperInt4Frontend",
+    "MegaMoEHopperInt4Inputs",
+    "MegaMoEHopperInt4SymmBuffer",
+    "TransformedInt4Weights",
+    "get_symm_buffer_for_hopper_int4_mega_moe",
+    "hopper_int4_mega_moe",
+    "hopper_int4_mega_launch_thunk",
+    "resolve_hopper_int4_knobs",
+    "autotune_hopper_int4_mega_moe",
+    "hopper_int4_candidates",
+    "_get_symm_buffer_for_hopper_int4_mega_moe_from_resolved_config",
+    "_resolve_hopper_int4_mega_moe_config",
     "MegaMoEHopperNvfp4Config",
     "MegaMoEHopperNvfp4Frontend",
     "MegaMoEHopperNvfp4Inputs",

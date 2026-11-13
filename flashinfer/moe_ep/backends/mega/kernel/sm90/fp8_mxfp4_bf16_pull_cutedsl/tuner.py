@@ -138,6 +138,10 @@ def _create_canonical_inputs(
     max_tokens: int,
     live_tokens: int,
     initial_tactic: dict[str, Any],
+    *,
+    create_weights=None,
+    preprocess_weights=None,
+    allocate_workspace=None,
 ):
     """Build canonical raw weights, preprocess them, and stage live inputs."""
     import torch
@@ -155,7 +159,10 @@ def _create_canonical_inputs(
 
     device = torch.device("cuda", torch.cuda.current_device())
     local_experts = args.num_experts // world_size
-    raw = create_tuning_weights(
+    create_weights = create_weights or create_tuning_weights
+    preprocess_weights = preprocess_weights or preprocess_mega_weights
+    allocate_workspace = allocate_workspace or get_symm_buffer_for_hopper_mxfp4_mega_moe
+    raw = create_weights(
         local_experts=local_experts,
         hidden=args.hidden,
         intermediate=args.intermediate,
@@ -163,7 +170,7 @@ def _create_canonical_inputs(
         device=device,
         seed=args.seed,
     )
-    transformed_l1, transformed_l2 = preprocess_mega_weights(
+    transformed_l1, transformed_l2 = preprocess_weights(
         raw,
         intermediate_size=args.intermediate,
         hidden_size=args.hidden,
@@ -183,7 +190,7 @@ def _create_canonical_inputs(
             rank,
             world_size,
         )
-        symm_buffer = get_symm_buffer_for_hopper_mxfp4_mega_moe(
+        symm_buffer = allocate_workspace(
             *common,
             fp8_scale_mode=_MXFP4_SCALE_MODE,
             knobs=initial_tactic,
