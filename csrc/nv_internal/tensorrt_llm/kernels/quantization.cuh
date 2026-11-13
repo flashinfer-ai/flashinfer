@@ -465,12 +465,13 @@ quantize_with_block_size(
       }
     }
   }
-  // The dependent grid may launch once every CTA has triggered or exited, and one thread's trigger
-  // counts for its CTA. Make every thread's out / SFout stores device-visible and wait for the
-  // whole CTA before any thread triggers, or a consumer that reads out / SFout without
-  // griddepcontrol.wait (which would wait for this whole grid) sees partial output.
+#if QUANT_PDL_TRIGGER_CTA_FENCE
+  // One thread's trigger counts for its CTA, and the dependent grid launches once every CTA has
+  // triggered or exited: make every thread's out / SFout stores device-visible and wait for the
+  // whole CTA first (see QUANT_PDL_TRIGGER_CTA_FENCE for the consumer that needs this).
   __threadfence();
   __syncthreads();
+#endif
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
@@ -699,12 +700,13 @@ quantize_with_block_size_tma(
       }
     }
   }
-  // The dependent grid may launch once every CTA has triggered or exited, and one thread's trigger
-  // counts for its CTA. Make every thread's out / SFout stores device-visible and wait for the
-  // whole CTA before any thread triggers, or a consumer that reads out / SFout without
-  // griddepcontrol.wait (which would wait for this whole grid) sees partial output.
+#if QUANT_PDL_TRIGGER_CTA_FENCE
+  // One thread's trigger counts for its CTA, and the dependent grid launches once every CTA has
+  // triggered or exited: make every thread's out / SFout stores device-visible and wait for the
+  // whole CTA first (see QUANT_PDL_TRIGGER_CTA_FENCE for the consumer that needs this).
   __threadfence();
   __syncthreads();
+#endif
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }

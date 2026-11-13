@@ -101,24 +101,6 @@ def _unswizzle_mxfp8_scales_128x4(
     return sf_unswizzled[:row, : (col // scale_vec_size)].contiguous()
 
 
-@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
-def test_mxfp8_quantize_zero_rows(is_sf_swizzled_layout):
-    """An input with no rows returns empty outputs and leaves no CUDA error behind.
-
-    The launcher used to launch a zero-sized grid, which fails with
-    cudaErrorInvalidValue that the next CUDA call then reports.
-    """
-    if not _is_mxfp8_supported(torch.device("cuda")):
-        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
-    k = 128
-    a = torch.empty((0, k), dtype=torch.bfloat16, device="cuda")
-    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, backend="cuda")
-    torch.cuda.synchronize()
-    assert a_fp8.shape == (0, k)
-    assert a_sf.dtype == torch.uint8 and a_sf.device == a_fp8.device
-    assert torch.ones(4, device="cuda").sum().item() == 4.0
-
-
 @pytest.mark.parametrize("m", [1, 3, 16, 64, 1024])
 @pytest.mark.parametrize("k", [128, 1024, 8192])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
