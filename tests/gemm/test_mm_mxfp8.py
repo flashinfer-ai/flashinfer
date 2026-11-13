@@ -1100,3 +1100,45 @@ def test_trtllm_raises_for_linear_b_descale():
             a_descale,
             b_descale,
         )
+
+
+@pytest.mark.parametrize(
+    "cc, suitable, expected",
+    [
+        ((10, 7), ["cudnn", "cute-dsl", "cutlass"], ["cutlass", "cute-dsl", "cudnn"]),
+        ((10, 7), ["cutlass", "cute-dsl"], ["cutlass", "cute-dsl"]),
+        ((10, 7), ["cutlass", "cudnn"], ["cutlass", "cudnn"]),
+        ((10, 0), ["cutlass", "cute-dsl", "cudnn"], ["cutlass"]),
+        ((10, 3), ["cutlass", "cute-dsl", "cudnn"], ["cutlass"]),
+    ],
+)
+def test_mm_mxfp8_auto_ranks_cute_dsl_and_cudnn_after_cutlass_on_sm107(
+    monkeypatch, cc, suitable, expected
+):
+    """Untuned ``backend="auto"`` calls keep CUTLASS first; on SM107 the autotuner also ranks the suitable CuTe-DSL and cuDNN backends."""
+    monkeypatch.setattr(gemm_base, "get_compute_capability", lambda device: cc)
+    a = torch.zeros(4, 128).to(torch.float8_e4m3fn)
+    b = torch.zeros(128, 128).to(torch.float8_e4m3fn).t()
+    sf = torch.zeros(512, dtype=torch.uint8)
+    assert gemm_base._heuristic_func_mm_mxfp8(suitable, a, b, sf, sf) == expected
+
+
+@pytest.mark.parametrize("override_shape", [True, False])
+def test_mm_mxfp8_cudnn_runner_declined_graph_has_no_tactics(
+    monkeypatch, override_shape
+):
+    """A cuDNN graph the backend declines yields no tactics, so ``auto`` tuning keeps the other candidates."""
+    cudnn = pytest.importorskip("cudnn")
+    runner = gemm_base._cudnn_mm_mxfp8_runner()
+    monkeypatch.setattr(runner, "_use_override_shape", override_shape)
+
+    def decline(*args, **kwargs):
+        raise cudnn.cudnnGraphNotSupportedError("declined")
+
+    monkeypatch.setattr(runner, "_get_override_graph", decline)
+    monkeypatch.setattr(gemm_base, "build_cudnn_gemm_mxfp8_graph", decline)
+    a = torch.zeros(128, 128).to(torch.float8_e4m3fn)
+    b = torch.zeros(128, 128).to(torch.float8_e4m3fn).t()
+    out = torch.empty(128, 128, dtype=torch.bfloat16)
+    inputs = [a, b, None, None, torch.bfloat16, out, None]
+    assert runner.get_valid_tactics(inputs, None) == []

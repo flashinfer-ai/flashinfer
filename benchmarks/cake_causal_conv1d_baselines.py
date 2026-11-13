@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Non-Cake baselines ("arms") of the Cake causal conv1d + SiLU training benchmarks
-``bench_cake_causal_conv1d_train.py`` (single rank) and ``bench_cake_causal_conv1d_train_kcp.py`` (context parallel).
+``bench_cake_causal_conv1d_nondet_train.py`` (single rank) and ``bench_cake_causal_conv1d_nondet_train_kcp.py``
+(context parallel).
 
 Every arm is the public training entry point of another library, called through autograd on the benchmark's own
 tensors without a copy (``[S, C]`` maps to ``[1, S, C]`` or to its channel-last ``[1, C, S]`` view).  Index tensors
@@ -737,10 +738,13 @@ def format_sota(result: dict, head: str, phases: Sequence[str], kind: str) -> li
             for name, entry in arms.items()
         )
         best = result["best_sota"].get(key)
+        # No ratio when the non-deterministic mode has no time for the phase (it failed in a timing round).
+        ratio = result["speedup_vs_sota"].get(key)
         tail = (
             "best -"
             if best is None
-            else f"best {best['arm']} {best['us']:9.2f} -> sota/nondet {result['speedup_vs_sota'][key]:5.3f}x"
+            else f"best {best['arm']} {best['us']:9.2f} -> sota/nondet "
+            + ("-" if ratio is None else f"{ratio:5.3f}x")
         )
         lines.append(f"{head} {phase:4s} sota {kind} | {cells} | {tail}")
     lines.extend(f"{head} sota {describe(entry)}" for entry in arms.values())

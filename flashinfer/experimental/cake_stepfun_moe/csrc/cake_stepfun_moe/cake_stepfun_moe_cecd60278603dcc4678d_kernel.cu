@@ -19,23 +19,6 @@
 #define CAKE_NEED_INT_WARP_UNIFORM
 #include "cake_stepfun_moe_device_common.cuh"
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_SMEM_PACKED_OFF 0
-#define SMEM_SMEM_PACKED_STAGE_BYTES 2048
-#define SMEM_SMEM_PACKED_STRIDE 2048
-#define SMEM_SMEM_EXPERT_COUNT_OFF 2048
-#define SMEM_SMEM_EXPERT_COUNT_STAGE_BYTES 512
-#define SMEM_SMEM_EXPERT_COUNT_STRIDE 512
-#define SMEM_SMEM_EXPERT_OFFSET_OFF 2560
-#define SMEM_SMEM_EXPERT_OFFSET_STAGE_BYTES 512
-#define SMEM_SMEM_EXPERT_OFFSET_STRIDE 512
-#define SMEM_WARP_TOTALS_OFF 3072
-#define SMEM_WARP_TOTALS_STAGE_BYTES 128
-#define SMEM_WARP_TOTALS_STRIDE 128
-#define SMEM_TOTAL 3200
-#define THREADS 1024
-
 
 __device__ __forceinline__ unsigned int __as_u32(float v) {
     unsigned int u;
@@ -85,7 +68,7 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     unsigned int* smem_packed = reinterpret_cast<unsigned int*>(smem_raw + 0);
     const int smem_packed_addr = smem + 0;
     unsigned int* smem_expert_count = reinterpret_cast<unsigned int*>(smem_raw + 2048);
@@ -118,28 +101,28 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
             raw_bits = __as_u32(scores[warp_token * num_experts + expert_cand]);
         }
         tw_mask = (((raw_bits & 2147483648u) != 0) ? 4294967295u : 2147483648u);
-        keys[0] = (unsigned long long)(raw_bits ^ tw_mask) << 32 | (unsigned long long)((unsigned int)(65535 - expert_cand) & 65535);
+        keys[0] = (unsigned long long)(raw_bits ^ tw_mask) << 32ull | (unsigned long long)((unsigned int)(65535 - expert_cand) & 65535);
         expert_cand = 32 + lane_0;
         raw_bits = __as_u32(-CUDART_INF_F);
         if (expert_cand < num_experts) {
             raw_bits = __as_u32(scores[warp_token * num_experts + expert_cand]);
         }
         tw_mask = (((raw_bits & 2147483648u) != 0) ? 4294967295u : 2147483648u);
-        keys[1] = (unsigned long long)(raw_bits ^ tw_mask) << 32 | (unsigned long long)((unsigned int)(65535 - expert_cand) & 65535);
+        keys[1] = (unsigned long long)(raw_bits ^ tw_mask) << 32ull | (unsigned long long)((unsigned int)(65535 - expert_cand) & 65535);
         expert_cand = 64 + lane_0;
         raw_bits = __as_u32(-CUDART_INF_F);
         if (expert_cand < num_experts) {
             raw_bits = __as_u32(scores[warp_token * num_experts + expert_cand]);
         }
         tw_mask = (((raw_bits & 2147483648u) != 0) ? 4294967295u : 2147483648u);
-        keys[2] = (unsigned long long)(raw_bits ^ tw_mask) << 32 | (unsigned long long)((unsigned int)(65535 - expert_cand) & 65535);
+        keys[2] = (unsigned long long)(raw_bits ^ tw_mask) << 32ull | (unsigned long long)((unsigned int)(65535 - expert_cand) & 65535);
         expert_cand = 96 + lane_0;
         raw_bits = __as_u32(-CUDART_INF_F);
         if (expert_cand < num_experts) {
             raw_bits = __as_u32(scores[warp_token * num_experts + expert_cand]);
         }
         tw_mask = (((raw_bits & 2147483648u) != 0) ? 4294967295u : 2147483648u);
-        keys[3] = (unsigned long long)(raw_bits ^ tw_mask) << 32 | (unsigned long long)((unsigned int)(65535 - expert_cand) & 65535);
+        keys[3] = (unsigned long long)(raw_bits ^ tw_mask) << 32ull | (unsigned long long)((unsigned int)(65535 - expert_cand) & 65535);
         unsigned long long _min_0 = ((keys[0]) < (keys[2]) ? (keys[0]) : (keys[2]));
         unsigned long long _max_0 = ((keys[0]) > (keys[2]) ? (keys[0]) : (keys[2]));
         keys[0] = _max_0;
@@ -160,164 +143,164 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
         unsigned long long _max_4 = ((keys[1]) > (keys[2]) ? (keys[1]) : (keys[2]));
         keys[1] = _max_4;
         keys[2] = _min_4;
-        unsigned long long refill64 = 36028792723996672 | (unsigned long long)((unsigned int)(65535 - (96 + lane_0)) & 65535);
-        unsigned long long packed_max64 = 0;
+        unsigned long long refill = 36028792723996672ull | (unsigned long long)((unsigned int)(65535 - (96 + lane_0)) & 65535);
+        unsigned long long packed_max = 0ull;
         unsigned int hi0 = 0;
         unsigned int lo0 = 0;
         unsigned int max_hi = 0;
         unsigned int lo_contrib = 0;
         unsigned int max_lo = 0;
         if (top_k > 0) {
-            hi0 = (unsigned int)(keys[0] >> 32);
+            hi0 = (unsigned int)(keys[0] >> 32ull);
             lo0 = (unsigned int)keys[0];
             unsigned int _warp_redux_5;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_5) : "r"(hi0));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_5) : "r"(hi0));
             max_hi = _warp_redux_5;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
             unsigned int _warp_redux_6;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_6) : "r"(lo_contrib));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_6) : "r"(lo_contrib));
             max_lo = _warp_redux_6;
-            packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
+            packed_max = (unsigned long long)max_hi << 32ull | (unsigned long long)max_lo;
             out_idx[0] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
             out_bits[0] = max_hi ^ tw_mask;
         }
         if (top_k > 1) {
-            update = ((packed_max64 == keys[0]) ? 1 : 0);
+            update = ((packed_max == keys[0]) ? 1 : 0);
             keys[0] = ((update != 0) ? keys[1] : keys[0]);
             keys[1] = ((update != 0) ? keys[2] : keys[1]);
             keys[2] = ((update != 0) ? keys[3] : keys[2]);
-            keys[3] = ((update != 0) ? refill64 : keys[3]);
-            hi0 = (unsigned int)(keys[0] >> 32);
+            keys[3] = ((update != 0) ? refill : keys[3]);
+            hi0 = (unsigned int)(keys[0] >> 32ull);
             lo0 = (unsigned int)keys[0];
             unsigned int _warp_redux_7;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_7) : "r"(hi0));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_7) : "r"(hi0));
             max_hi = _warp_redux_7;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
             unsigned int _warp_redux_8;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_8) : "r"(lo_contrib));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_8) : "r"(lo_contrib));
             max_lo = _warp_redux_8;
-            packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
+            packed_max = (unsigned long long)max_hi << 32ull | (unsigned long long)max_lo;
             out_idx[1] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
             out_bits[1] = max_hi ^ tw_mask;
         }
         if (top_k > 2) {
-            update = ((packed_max64 == keys[0]) ? 1 : 0);
+            update = ((packed_max == keys[0]) ? 1 : 0);
             keys[0] = ((update != 0) ? keys[1] : keys[0]);
             keys[1] = ((update != 0) ? keys[2] : keys[1]);
             keys[2] = ((update != 0) ? keys[3] : keys[2]);
-            keys[3] = ((update != 0) ? refill64 : keys[3]);
-            hi0 = (unsigned int)(keys[0] >> 32);
+            keys[3] = ((update != 0) ? refill : keys[3]);
+            hi0 = (unsigned int)(keys[0] >> 32ull);
             lo0 = (unsigned int)keys[0];
             unsigned int _warp_redux_9;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_9) : "r"(hi0));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_9) : "r"(hi0));
             max_hi = _warp_redux_9;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
             unsigned int _warp_redux_10;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_10) : "r"(lo_contrib));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_10) : "r"(lo_contrib));
             max_lo = _warp_redux_10;
-            packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
+            packed_max = (unsigned long long)max_hi << 32ull | (unsigned long long)max_lo;
             out_idx[2] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
             out_bits[2] = max_hi ^ tw_mask;
         }
         if (top_k > 3) {
-            update = ((packed_max64 == keys[0]) ? 1 : 0);
+            update = ((packed_max == keys[0]) ? 1 : 0);
             keys[0] = ((update != 0) ? keys[1] : keys[0]);
             keys[1] = ((update != 0) ? keys[2] : keys[1]);
             keys[2] = ((update != 0) ? keys[3] : keys[2]);
-            keys[3] = ((update != 0) ? refill64 : keys[3]);
-            hi0 = (unsigned int)(keys[0] >> 32);
+            keys[3] = ((update != 0) ? refill : keys[3]);
+            hi0 = (unsigned int)(keys[0] >> 32ull);
             lo0 = (unsigned int)keys[0];
             unsigned int _warp_redux_11;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_11) : "r"(hi0));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_11) : "r"(hi0));
             max_hi = _warp_redux_11;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
             unsigned int _warp_redux_12;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_12) : "r"(lo_contrib));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_12) : "r"(lo_contrib));
             max_lo = _warp_redux_12;
-            packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
+            packed_max = (unsigned long long)max_hi << 32ull | (unsigned long long)max_lo;
             out_idx[3] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
             out_bits[3] = max_hi ^ tw_mask;
         }
         if (top_k > 4) {
-            update = ((packed_max64 == keys[0]) ? 1 : 0);
+            update = ((packed_max == keys[0]) ? 1 : 0);
             keys[0] = ((update != 0) ? keys[1] : keys[0]);
             keys[1] = ((update != 0) ? keys[2] : keys[1]);
             keys[2] = ((update != 0) ? keys[3] : keys[2]);
-            keys[3] = ((update != 0) ? refill64 : keys[3]);
-            hi0 = (unsigned int)(keys[0] >> 32);
+            keys[3] = ((update != 0) ? refill : keys[3]);
+            hi0 = (unsigned int)(keys[0] >> 32ull);
             lo0 = (unsigned int)keys[0];
             unsigned int _warp_redux_13;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_13) : "r"(hi0));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_13) : "r"(hi0));
             max_hi = _warp_redux_13;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
             unsigned int _warp_redux_14;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_14) : "r"(lo_contrib));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_14) : "r"(lo_contrib));
             max_lo = _warp_redux_14;
-            packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
+            packed_max = (unsigned long long)max_hi << 32ull | (unsigned long long)max_lo;
             out_idx[4] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
             out_bits[4] = max_hi ^ tw_mask;
         }
         if (top_k > 5) {
-            update = ((packed_max64 == keys[0]) ? 1 : 0);
+            update = ((packed_max == keys[0]) ? 1 : 0);
             keys[0] = ((update != 0) ? keys[1] : keys[0]);
             keys[1] = ((update != 0) ? keys[2] : keys[1]);
             keys[2] = ((update != 0) ? keys[3] : keys[2]);
-            keys[3] = ((update != 0) ? refill64 : keys[3]);
-            hi0 = (unsigned int)(keys[0] >> 32);
+            keys[3] = ((update != 0) ? refill : keys[3]);
+            hi0 = (unsigned int)(keys[0] >> 32ull);
             lo0 = (unsigned int)keys[0];
             unsigned int _warp_redux_15;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_15) : "r"(hi0));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_15) : "r"(hi0));
             max_hi = _warp_redux_15;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
             unsigned int _warp_redux_16;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_16) : "r"(lo_contrib));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_16) : "r"(lo_contrib));
             max_lo = _warp_redux_16;
-            packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
+            packed_max = (unsigned long long)max_hi << 32ull | (unsigned long long)max_lo;
             out_idx[5] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
             out_bits[5] = max_hi ^ tw_mask;
         }
         if (top_k > 6) {
-            update = ((packed_max64 == keys[0]) ? 1 : 0);
+            update = ((packed_max == keys[0]) ? 1 : 0);
             keys[0] = ((update != 0) ? keys[1] : keys[0]);
             keys[1] = ((update != 0) ? keys[2] : keys[1]);
             keys[2] = ((update != 0) ? keys[3] : keys[2]);
-            keys[3] = ((update != 0) ? refill64 : keys[3]);
-            hi0 = (unsigned int)(keys[0] >> 32);
+            keys[3] = ((update != 0) ? refill : keys[3]);
+            hi0 = (unsigned int)(keys[0] >> 32ull);
             lo0 = (unsigned int)keys[0];
             unsigned int _warp_redux_17;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_17) : "r"(hi0));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_17) : "r"(hi0));
             max_hi = _warp_redux_17;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
             unsigned int _warp_redux_18;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_18) : "r"(lo_contrib));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_18) : "r"(lo_contrib));
             max_lo = _warp_redux_18;
-            packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
+            packed_max = (unsigned long long)max_hi << 32ull | (unsigned long long)max_lo;
             out_idx[6] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
             out_bits[6] = max_hi ^ tw_mask;
         }
         if (top_k > 7) {
-            update = ((packed_max64 == keys[0]) ? 1 : 0);
+            update = ((packed_max == keys[0]) ? 1 : 0);
             keys[0] = ((update != 0) ? keys[1] : keys[0]);
             keys[1] = ((update != 0) ? keys[2] : keys[1]);
             keys[2] = ((update != 0) ? keys[3] : keys[2]);
-            keys[3] = ((update != 0) ? refill64 : keys[3]);
-            hi0 = (unsigned int)(keys[0] >> 32);
+            keys[3] = ((update != 0) ? refill : keys[3]);
+            hi0 = (unsigned int)(keys[0] >> 32ull);
             lo0 = (unsigned int)keys[0];
             unsigned int _warp_redux_19;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_19) : "r"(hi0));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_19) : "r"(hi0));
             max_hi = _warp_redux_19;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
             unsigned int _warp_redux_20;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_20) : "r"(lo_contrib));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_20) : "r"(lo_contrib));
             max_lo = _warp_redux_20;
-            packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
+            packed_max = (unsigned long long)max_hi << 32ull | (unsigned long long)max_lo;
             out_idx[7] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
             out_bits[7] = max_hi ^ tw_mask;
@@ -404,15 +387,15 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
             unsigned int word1 = 0;
             int src_rank = expanded / (32 * top_k);
             int src_slot = expanded % (32 * top_k);
-            uint32_t _mapa_0;
+            uint32_t mapa;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_0) : "r"(smem_packed_addr), "r"(src_rank));
+                : "=r"(mapa) : "r"(smem_packed_addr), "r"(src_rank));
             unsigned int cluster_word[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word[0])) : "r"(_mapa_0 + (unsigned int)(src_slot * 8)) : "memory");
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word[0])) : "r"(mapa + (unsigned int)(src_slot * 8)) : "memory");
             word0 = cluster_word[0];
             unsigned int cluster_word_0[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_0[0])) : "r"(_mapa_0 + (unsigned int)(src_slot * 8 + 4)) : "memory");
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_0[0])) : "r"(mapa + (unsigned int)(src_slot * 8 + 4)) : "memory");
             word1 = cluster_word_0[0];
             idx_ii = (int)(word1 << 16) >> 16;
             exp_idx[0] = idx_ii;
@@ -427,122 +410,122 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0);
             expanded = cluster_tid + 8192;
-            int idx_ii_1 = 0;
-            unsigned int word0_2 = 0;
-            unsigned int word1_3 = 0;
-            int src_rank_4 = expanded / (32 * top_k);
-            int src_slot_5 = expanded % (32 * top_k);
-            uint32_t _mapa_1;
+            int idx_ii_0 = 0;
+            unsigned int word0_0 = 0;
+            unsigned int word1_0 = 0;
+            int src_rank_0 = expanded / (32 * top_k);
+            int src_slot_0 = expanded % (32 * top_k);
+            uint32_t mapa_0;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_1) : "r"(smem_packed_addr), "r"(src_rank_4));
-            unsigned int cluster_word_6[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_6[0])) : "r"(_mapa_1 + (unsigned int)(src_slot_5 * 8)) : "memory");
-            word0_2 = cluster_word_6[0];
-            unsigned int cluster_word_7[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_7[0])) : "r"(_mapa_1 + (unsigned int)(src_slot_5 * 8 + 4)) : "memory");
-            word1_3 = cluster_word_7[0];
-            idx_ii_1 = (int)(word1_3 << 16) >> 16;
-            exp_idx[1] = idx_ii_1;
-            int local_idx_8 = idx_ii_1 - local_experts_start_idx;
-            int extent_9 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_10 = (1 << local_experts_stride_log2) - 1;
-            int is_local_11 = ((local_idx_8 >= 0 && local_idx_8 < extent_9 && (local_idx_8 & stride_mask_10) == 0) ? 1 : 0);
+                : "=r"(mapa_0) : "r"(smem_packed_addr), "r"(src_rank_0));
+            unsigned int cluster_word_2[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_2[0])) : "r"(mapa_0 + (unsigned int)(src_slot_0 * 8)) : "memory");
+            word0_0 = cluster_word_2[0];
+            unsigned int cluster_word_3[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_3[0])) : "r"(mapa_0 + (unsigned int)(src_slot_0 * 8 + 4)) : "memory");
+            word1_0 = cluster_word_3[0];
+            idx_ii_0 = (int)(word1_0 << 16) >> 16;
+            exp_idx[1] = idx_ii_0;
+            int local_idx_0 = idx_ii_0 - local_experts_start_idx;
+            int extent_0 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_0 = (1 << local_experts_stride_log2) - 1;
+            int is_local_0 = ((local_idx_0 >= 0 && local_idx_0 < extent_0 && (local_idx_0 & stride_mask_0) == 0) ? 1 : 0);
             exp_off[1] = 0;
-            if (is_local_11 != 0) {
-                unsigned int _atomic_fetch_add_38 = atomicAdd(&smem_expert_count[idx_ii_1], 1);
+            if (is_local_0 != 0) {
+                unsigned int _atomic_fetch_add_38 = atomicAdd(&smem_expert_count[idx_ii_0], 1);
                 exp_off[1] = (int)_atomic_fetch_add_38;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_0);
             expanded = cluster_tid + 16384;
-            int idx_ii_12 = 0;
-            unsigned int word0_13 = 0;
-            unsigned int word1_14 = 0;
-            int src_rank_15 = expanded / (32 * top_k);
-            int src_slot_16 = expanded % (32 * top_k);
-            uint32_t _mapa_2;
+            int idx_ii_1 = 0;
+            unsigned int word0_1 = 0;
+            unsigned int word1_1 = 0;
+            int src_rank_1 = expanded / (32 * top_k);
+            int src_slot_1 = expanded % (32 * top_k);
+            uint32_t mapa_1;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_2) : "r"(smem_packed_addr), "r"(src_rank_15));
-            unsigned int cluster_word_17[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_17[0])) : "r"(_mapa_2 + (unsigned int)(src_slot_16 * 8)) : "memory");
-            word0_13 = cluster_word_17[0];
-            unsigned int cluster_word_18[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_18[0])) : "r"(_mapa_2 + (unsigned int)(src_slot_16 * 8 + 4)) : "memory");
-            word1_14 = cluster_word_18[0];
-            idx_ii_12 = (int)(word1_14 << 16) >> 16;
-            exp_idx[2] = idx_ii_12;
-            int local_idx_19 = idx_ii_12 - local_experts_start_idx;
-            int extent_20 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_21 = (1 << local_experts_stride_log2) - 1;
-            int is_local_22 = ((local_idx_19 >= 0 && local_idx_19 < extent_20 && (local_idx_19 & stride_mask_21) == 0) ? 1 : 0);
+                : "=r"(mapa_1) : "r"(smem_packed_addr), "r"(src_rank_1));
+            unsigned int cluster_word_4[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_4[0])) : "r"(mapa_1 + (unsigned int)(src_slot_1 * 8)) : "memory");
+            word0_1 = cluster_word_4[0];
+            unsigned int cluster_word_5[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_5[0])) : "r"(mapa_1 + (unsigned int)(src_slot_1 * 8 + 4)) : "memory");
+            word1_1 = cluster_word_5[0];
+            idx_ii_1 = (int)(word1_1 << 16) >> 16;
+            exp_idx[2] = idx_ii_1;
+            int local_idx_1 = idx_ii_1 - local_experts_start_idx;
+            int extent_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_2 = ((local_idx_1 >= 0 && local_idx_1 < extent_1 && (local_idx_1 & stride_mask_1) == 0) ? 1 : 0);
             exp_off[2] = 0;
-            if (is_local_22 != 0) {
-                unsigned int _atomic_fetch_add_39 = atomicAdd(&smem_expert_count[idx_ii_12], 1);
+            if (is_local_2 != 0) {
+                unsigned int _atomic_fetch_add_39 = atomicAdd(&smem_expert_count[idx_ii_1], 1);
                 exp_off[2] = (int)_atomic_fetch_add_39;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_13);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_1);
             expanded = cluster_tid + 24576;
-            int idx_ii_23 = 0;
-            unsigned int word0_24 = 0;
-            unsigned int word1_25 = 0;
-            int src_rank_26 = expanded / (32 * top_k);
-            int src_slot_27 = expanded % (32 * top_k);
-            uint32_t _mapa_3;
+            int idx_ii_2 = 0;
+            unsigned int word0_2 = 0;
+            unsigned int word1_2 = 0;
+            int src_rank_2 = expanded / (32 * top_k);
+            int src_slot_2 = expanded % (32 * top_k);
+            uint32_t mapa_2;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_3) : "r"(smem_packed_addr), "r"(src_rank_26));
-            unsigned int cluster_word_28[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_28[0])) : "r"(_mapa_3 + (unsigned int)(src_slot_27 * 8)) : "memory");
-            word0_24 = cluster_word_28[0];
-            unsigned int cluster_word_29[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_29[0])) : "r"(_mapa_3 + (unsigned int)(src_slot_27 * 8 + 4)) : "memory");
-            word1_25 = cluster_word_29[0];
-            idx_ii_23 = (int)(word1_25 << 16) >> 16;
-            exp_idx[3] = idx_ii_23;
-            int local_idx_30 = idx_ii_23 - local_experts_start_idx;
-            int extent_31 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_32 = (1 << local_experts_stride_log2) - 1;
-            int is_local_33 = ((local_idx_30 >= 0 && local_idx_30 < extent_31 && (local_idx_30 & stride_mask_32) == 0) ? 1 : 0);
+                : "=r"(mapa_2) : "r"(smem_packed_addr), "r"(src_rank_2));
+            unsigned int cluster_word_6[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_6[0])) : "r"(mapa_2 + (unsigned int)(src_slot_2 * 8)) : "memory");
+            word0_2 = cluster_word_6[0];
+            unsigned int cluster_word_7[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_7[0])) : "r"(mapa_2 + (unsigned int)(src_slot_2 * 8 + 4)) : "memory");
+            word1_2 = cluster_word_7[0];
+            idx_ii_2 = (int)(word1_2 << 16) >> 16;
+            exp_idx[3] = idx_ii_2;
+            int local_idx_2 = idx_ii_2 - local_experts_start_idx;
+            int extent_2 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_2 = (1 << local_experts_stride_log2) - 1;
+            int is_local_3 = ((local_idx_2 >= 0 && local_idx_2 < extent_2 && (local_idx_2 & stride_mask_2) == 0) ? 1 : 0);
             exp_off[3] = 0;
-            if (is_local_33 != 0) {
-                unsigned int _atomic_fetch_add_40 = atomicAdd(&smem_expert_count[idx_ii_23], 1);
+            if (is_local_3 != 0) {
+                unsigned int _atomic_fetch_add_40 = atomicAdd(&smem_expert_count[idx_ii_2], 1);
                 exp_off[3] = (int)_atomic_fetch_add_40;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_24);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2);
         } else {
             if (done == 0) {
                 expanded = cluster_tid;
                 if (expanded >= expanded_size) {
                     done = 1;
                 } else {
-                    int idx_ii_2 = 0;
-                    unsigned int word0_1 = 0;
-                    unsigned int word1_1 = 0;
-                    int src_rank_1 = expanded / (32 * top_k);
-                    int src_slot_1 = expanded % (32 * top_k);
-                    uint32_t _mapa_4;
+                    int idx_ii_3 = 0;
+                    unsigned int word0_3 = 0;
+                    unsigned int word1_3 = 0;
+                    int src_rank_3 = expanded / (32 * top_k);
+                    int src_slot_3 = expanded % (32 * top_k);
+                    uint32_t mapa_3;
                     asm volatile(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(_mapa_4) : "r"(smem_packed_addr), "r"(src_rank_1));
+                        : "=r"(mapa_3) : "r"(smem_packed_addr), "r"(src_rank_3));
                     unsigned int cluster_word_1[1];
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_1[0])) : "r"(_mapa_4 + (unsigned int)(src_slot_1 * 8)) : "memory");
-                    word0_1 = cluster_word_1[0];
-                    unsigned int cluster_word_0_1[1];
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_0_1[0])) : "r"(_mapa_4 + (unsigned int)(src_slot_1 * 8 + 4)) : "memory");
-                    word1_1 = cluster_word_0_1[0];
-                    idx_ii_2 = (int)(word1_1 << 16) >> 16;
-                    exp_idx[0] = idx_ii_2;
-                    int local_idx_1 = idx_ii_2 - local_experts_start_idx;
-                    int extent_1 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_1 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_1 = ((local_idx_1 >= 0 && local_idx_1 < extent_1 && (local_idx_1 & stride_mask_1) == 0) ? 1 : 0);
+                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_1[0])) : "r"(mapa_3 + (unsigned int)(src_slot_3 * 8)) : "memory");
+                    word0_3 = cluster_word_1[0];
+                    unsigned int cluster_word_8[1];
+                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_8[0])) : "r"(mapa_3 + (unsigned int)(src_slot_3 * 8 + 4)) : "memory");
+                    word1_3 = cluster_word_8[0];
+                    idx_ii_3 = (int)(word1_3 << 16) >> 16;
+                    exp_idx[0] = idx_ii_3;
+                    int local_idx_3 = idx_ii_3 - local_experts_start_idx;
+                    int extent_3 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_3 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_1 = ((local_idx_3 >= 0 && local_idx_3 < extent_3 && (local_idx_3 & stride_mask_3) == 0) ? 1 : 0);
                     exp_off[0] = 0;
                     if (is_local_1 != 0) {
-                        unsigned int _atomic_fetch_add_41 = atomicAdd(&smem_expert_count[idx_ii_2], 1);
+                        unsigned int _atomic_fetch_add_41 = atomicAdd(&smem_expert_count[idx_ii_3], 1);
                         exp_off[0] = (int)_atomic_fetch_add_41;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_1);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_3);
                 }
             }
             if (done == 0) {
@@ -550,33 +533,33 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
                 if (expanded >= expanded_size) {
                     done = 1;
                 } else {
-                    int idx_ii_3 = 0;
-                    unsigned int word0_3 = 0;
-                    unsigned int word1_2 = 0;
-                    int src_rank_2 = expanded / (32 * top_k);
-                    int src_slot_2 = expanded % (32 * top_k);
-                    uint32_t _mapa_5;
+                    int idx_ii_4 = 0;
+                    unsigned int word0_4 = 0;
+                    unsigned int word1_4 = 0;
+                    int src_rank_4 = expanded / (32 * top_k);
+                    int src_slot_4 = expanded % (32 * top_k);
+                    uint32_t mapa_4;
                     asm volatile(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(_mapa_5) : "r"(smem_packed_addr), "r"(src_rank_2));
-                    unsigned int cluster_word_2[1];
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_2[0])) : "r"(_mapa_5 + (unsigned int)(src_slot_2 * 8)) : "memory");
-                    word0_3 = cluster_word_2[0];
-                    unsigned int cluster_word_0_2[1];
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_0_2[0])) : "r"(_mapa_5 + (unsigned int)(src_slot_2 * 8 + 4)) : "memory");
-                    word1_2 = cluster_word_0_2[0];
-                    idx_ii_3 = (int)(word1_2 << 16) >> 16;
-                    exp_idx[1] = idx_ii_3;
-                    int local_idx_2 = idx_ii_3 - local_experts_start_idx;
-                    int extent_2 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_2 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_2 = ((local_idx_2 >= 0 && local_idx_2 < extent_2 && (local_idx_2 & stride_mask_2) == 0) ? 1 : 0);
+                        : "=r"(mapa_4) : "r"(smem_packed_addr), "r"(src_rank_4));
+                    unsigned int cluster_word_9[1];
+                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_9[0])) : "r"(mapa_4 + (unsigned int)(src_slot_4 * 8)) : "memory");
+                    word0_4 = cluster_word_9[0];
+                    unsigned int cluster_word_9_1[1];
+                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_9_1[0])) : "r"(mapa_4 + (unsigned int)(src_slot_4 * 8 + 4)) : "memory");
+                    word1_4 = cluster_word_9_1[0];
+                    idx_ii_4 = (int)(word1_4 << 16) >> 16;
+                    exp_idx[1] = idx_ii_4;
+                    int local_idx_4 = idx_ii_4 - local_experts_start_idx;
+                    int extent_4 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_4 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_4 = ((local_idx_4 >= 0 && local_idx_4 < extent_4 && (local_idx_4 & stride_mask_4) == 0) ? 1 : 0);
                     exp_off[1] = 0;
-                    if (is_local_2 != 0) {
-                        unsigned int _atomic_fetch_add_42 = atomicAdd(&smem_expert_count[idx_ii_3], 1);
+                    if (is_local_4 != 0) {
+                        unsigned int _atomic_fetch_add_42 = atomicAdd(&smem_expert_count[idx_ii_4], 1);
                         exp_off[1] = (int)_atomic_fetch_add_42;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_3);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_4);
                 }
             }
             if (done == 0) {
@@ -584,33 +567,33 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
                 if (expanded >= expanded_size) {
                     done = 1;
                 } else {
-                    int idx_ii_4 = 0;
-                    unsigned int word0_4 = 0;
-                    unsigned int word1_4 = 0;
-                    int src_rank_3 = expanded / (32 * top_k);
-                    int src_slot_3 = expanded % (32 * top_k);
-                    uint32_t _mapa_6;
+                    int idx_ii_5 = 0;
+                    unsigned int word0_5 = 0;
+                    unsigned int word1_5 = 0;
+                    int src_rank_5 = expanded / (32 * top_k);
+                    int src_slot_5 = expanded % (32 * top_k);
+                    uint32_t mapa_5;
                     asm volatile(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(_mapa_6) : "r"(smem_packed_addr), "r"(src_rank_3));
-                    unsigned int cluster_word_3[1];
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_3[0])) : "r"(_mapa_6 + (unsigned int)(src_slot_3 * 8)) : "memory");
-                    word0_4 = cluster_word_3[0];
-                    unsigned int cluster_word_0_3[1];
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_0_3[0])) : "r"(_mapa_6 + (unsigned int)(src_slot_3 * 8 + 4)) : "memory");
-                    word1_4 = cluster_word_0_3[0];
-                    idx_ii_4 = (int)(word1_4 << 16) >> 16;
-                    exp_idx[2] = idx_ii_4;
-                    int local_idx_3 = idx_ii_4 - local_experts_start_idx;
-                    int extent_3 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_3 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_3 = ((local_idx_3 >= 0 && local_idx_3 < extent_3 && (local_idx_3 & stride_mask_3) == 0) ? 1 : 0);
+                        : "=r"(mapa_5) : "r"(smem_packed_addr), "r"(src_rank_5));
+                    unsigned int cluster_word_10[1];
+                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_10[0])) : "r"(mapa_5 + (unsigned int)(src_slot_5 * 8)) : "memory");
+                    word0_5 = cluster_word_10[0];
+                    unsigned int cluster_word_10_1[1];
+                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_10_1[0])) : "r"(mapa_5 + (unsigned int)(src_slot_5 * 8 + 4)) : "memory");
+                    word1_5 = cluster_word_10_1[0];
+                    idx_ii_5 = (int)(word1_5 << 16) >> 16;
+                    exp_idx[2] = idx_ii_5;
+                    int local_idx_5 = idx_ii_5 - local_experts_start_idx;
+                    int extent_5 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_5 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_5 = ((local_idx_5 >= 0 && local_idx_5 < extent_5 && (local_idx_5 & stride_mask_5) == 0) ? 1 : 0);
                     exp_off[2] = 0;
-                    if (is_local_3 != 0) {
-                        unsigned int _atomic_fetch_add_43 = atomicAdd(&smem_expert_count[idx_ii_4], 1);
+                    if (is_local_5 != 0) {
+                        unsigned int _atomic_fetch_add_43 = atomicAdd(&smem_expert_count[idx_ii_5], 1);
                         exp_off[2] = (int)_atomic_fetch_add_43;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_4);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_5);
                 }
             }
             if (done == 0) {
@@ -618,33 +601,33 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
                 if (expanded >= expanded_size) {
                     done = 1;
                 } else {
-                    int idx_ii_5 = 0;
-                    unsigned int word0_5 = 0;
-                    unsigned int word1_5 = 0;
-                    int src_rank_5 = expanded / (32 * top_k);
-                    int src_slot_4 = expanded % (32 * top_k);
-                    uint32_t _mapa_7;
+                    int idx_ii_6 = 0;
+                    unsigned int word0_6 = 0;
+                    unsigned int word1_6 = 0;
+                    int src_rank_6 = expanded / (32 * top_k);
+                    int src_slot_6 = expanded % (32 * top_k);
+                    uint32_t mapa_6;
                     asm volatile(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(_mapa_7) : "r"(smem_packed_addr), "r"(src_rank_5));
-                    unsigned int cluster_word_4[1];
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_4[0])) : "r"(_mapa_7 + (unsigned int)(src_slot_4 * 8)) : "memory");
-                    word0_5 = cluster_word_4[0];
-                    unsigned int cluster_word_0_4[1];
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_0_4[0])) : "r"(_mapa_7 + (unsigned int)(src_slot_4 * 8 + 4)) : "memory");
-                    word1_5 = cluster_word_0_4[0];
-                    idx_ii_5 = (int)(word1_5 << 16) >> 16;
-                    exp_idx[3] = idx_ii_5;
-                    int local_idx_4 = idx_ii_5 - local_experts_start_idx;
-                    int extent_4 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_4 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_4 = ((local_idx_4 >= 0 && local_idx_4 < extent_4 && (local_idx_4 & stride_mask_4) == 0) ? 1 : 0);
+                        : "=r"(mapa_6) : "r"(smem_packed_addr), "r"(src_rank_6));
+                    unsigned int cluster_word_11[1];
+                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_11[0])) : "r"(mapa_6 + (unsigned int)(src_slot_6 * 8)) : "memory");
+                    word0_6 = cluster_word_11[0];
+                    unsigned int cluster_word_11_1[1];
+                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_11_1[0])) : "r"(mapa_6 + (unsigned int)(src_slot_6 * 8 + 4)) : "memory");
+                    word1_6 = cluster_word_11_1[0];
+                    idx_ii_6 = (int)(word1_6 << 16) >> 16;
+                    exp_idx[3] = idx_ii_6;
+                    int local_idx_6 = idx_ii_6 - local_experts_start_idx;
+                    int extent_6 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_6 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_6 = ((local_idx_6 >= 0 && local_idx_6 < extent_6 && (local_idx_6 & stride_mask_6) == 0) ? 1 : 0);
                     exp_off[3] = 0;
-                    if (is_local_4 != 0) {
-                        unsigned int _atomic_fetch_add_44 = atomicAdd(&smem_expert_count[idx_ii_5], 1);
+                    if (is_local_6 != 0) {
+                        unsigned int _atomic_fetch_add_44 = atomicAdd(&smem_expert_count[idx_ii_6], 1);
                         exp_off[3] = (int)_atomic_fetch_add_44;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_5);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_6);
                 }
             }
         }
@@ -652,154 +635,120 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
     if (done == 0) {
         if (expanded_size >= 65536) {
             expanded = cluster_tid + 32768;
-            int idx_ii_6 = 0;
-            unsigned int word0_6 = 0;
-            unsigned int word1_6 = 0;
-            int src_rank_6 = expanded / (32 * top_k);
-            int src_slot_6 = expanded % (32 * top_k);
-            uint32_t _mapa_8;
+            int idx_ii_7 = 0;
+            unsigned int word0_7 = 0;
+            unsigned int word1_7 = 0;
+            int src_rank_7 = expanded / (32 * top_k);
+            int src_slot_7 = expanded % (32 * top_k);
+            uint32_t mapa_7;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_8) : "r"(smem_packed_addr), "r"(src_rank_6));
-            unsigned int cluster_word_5[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_5[0])) : "r"(_mapa_8 + (unsigned int)(src_slot_6 * 8)) : "memory");
-            word0_6 = cluster_word_5[0];
-            unsigned int cluster_word_0_5[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_0_5[0])) : "r"(_mapa_8 + (unsigned int)(src_slot_6 * 8 + 4)) : "memory");
-            word1_6 = cluster_word_0_5[0];
-            idx_ii_6 = (int)(word1_6 << 16) >> 16;
-            exp_idx[4] = idx_ii_6;
-            int local_idx_5 = idx_ii_6 - local_experts_start_idx;
-            int extent_5 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_5 = (1 << local_experts_stride_log2) - 1;
-            int is_local_5 = ((local_idx_5 >= 0 && local_idx_5 < extent_5 && (local_idx_5 & stride_mask_5) == 0) ? 1 : 0);
+                : "=r"(mapa_7) : "r"(smem_packed_addr), "r"(src_rank_7));
+            unsigned int cluster_word_12[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_12[0])) : "r"(mapa_7 + (unsigned int)(src_slot_7 * 8)) : "memory");
+            word0_7 = cluster_word_12[0];
+            unsigned int cluster_word_12_1[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_12_1[0])) : "r"(mapa_7 + (unsigned int)(src_slot_7 * 8 + 4)) : "memory");
+            word1_7 = cluster_word_12_1[0];
+            idx_ii_7 = (int)(word1_7 << 16) >> 16;
+            exp_idx[4] = idx_ii_7;
+            int local_idx_7 = idx_ii_7 - local_experts_start_idx;
+            int extent_7 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_7 = (1 << local_experts_stride_log2) - 1;
+            int is_local_7 = ((local_idx_7 >= 0 && local_idx_7 < extent_7 && (local_idx_7 & stride_mask_7) == 0) ? 1 : 0);
             exp_off[4] = 0;
-            if (is_local_5 != 0) {
-                unsigned int _atomic_fetch_add_45 = atomicAdd(&smem_expert_count[idx_ii_6], 1);
+            if (is_local_7 != 0) {
+                unsigned int _atomic_fetch_add_45 = atomicAdd(&smem_expert_count[idx_ii_7], 1);
                 exp_off[4] = (int)_atomic_fetch_add_45;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_6);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_7);
             expanded = cluster_tid + 40960;
-            int idx_ii_1_1 = 0;
-            unsigned int word0_2_1 = 0;
+            int idx_ii_3_1 = 0;
+            unsigned int word0_3_1 = 0;
             unsigned int word1_3_1 = 0;
-            int src_rank_4_1 = expanded / (32 * top_k);
-            int src_slot_5_1 = expanded % (32 * top_k);
-            uint32_t _mapa_9;
+            int src_rank_3_1 = expanded / (32 * top_k);
+            int src_slot_3_1 = expanded % (32 * top_k);
+            uint32_t mapa_3_1;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_9) : "r"(smem_packed_addr), "r"(src_rank_4_1));
-            unsigned int cluster_word_6_1[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_6_1[0])) : "r"(_mapa_9 + (unsigned int)(src_slot_5_1 * 8)) : "memory");
-            word0_2_1 = cluster_word_6_1[0];
-            unsigned int cluster_word_7_1[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_7_1[0])) : "r"(_mapa_9 + (unsigned int)(src_slot_5_1 * 8 + 4)) : "memory");
-            word1_3_1 = cluster_word_7_1[0];
-            idx_ii_1_1 = (int)(word1_3_1 << 16) >> 16;
-            exp_idx[5] = idx_ii_1_1;
-            int local_idx_8_1 = idx_ii_1_1 - local_experts_start_idx;
-            int extent_9_1 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_10_1 = (1 << local_experts_stride_log2) - 1;
-            int is_local_11_1 = ((local_idx_8_1 >= 0 && local_idx_8_1 < extent_9_1 && (local_idx_8_1 & stride_mask_10_1) == 0) ? 1 : 0);
+                : "=r"(mapa_3_1) : "r"(smem_packed_addr), "r"(src_rank_3_1));
+            unsigned int cluster_word_13[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_13[0])) : "r"(mapa_3_1 + (unsigned int)(src_slot_3_1 * 8)) : "memory");
+            word0_3_1 = cluster_word_13[0];
+            unsigned int cluster_word_14[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_14[0])) : "r"(mapa_3_1 + (unsigned int)(src_slot_3_1 * 8 + 4)) : "memory");
+            word1_3_1 = cluster_word_14[0];
+            idx_ii_3_1 = (int)(word1_3_1 << 16) >> 16;
+            exp_idx[5] = idx_ii_3_1;
+            int local_idx_3_1 = idx_ii_3_1 - local_experts_start_idx;
+            int extent_3_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_3_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_4_1 = ((local_idx_3_1 >= 0 && local_idx_3_1 < extent_3_1 && (local_idx_3_1 & stride_mask_3_1) == 0) ? 1 : 0);
             exp_off[5] = 0;
-            if (is_local_11_1 != 0) {
-                unsigned int _atomic_fetch_add_46 = atomicAdd(&smem_expert_count[idx_ii_1_1], 1);
+            if (is_local_4_1 != 0) {
+                unsigned int _atomic_fetch_add_46 = atomicAdd(&smem_expert_count[idx_ii_3_1], 1);
                 exp_off[5] = (int)_atomic_fetch_add_46;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_1);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_3_1);
             expanded = cluster_tid + 49152;
-            int idx_ii_12_1 = 0;
-            unsigned int word0_13_1 = 0;
-            unsigned int word1_14_1 = 0;
-            int src_rank_15_1 = expanded / (32 * top_k);
-            int src_slot_16_1 = expanded % (32 * top_k);
-            uint32_t _mapa_10;
+            int idx_ii_4_1 = 0;
+            unsigned int word0_4_1 = 0;
+            unsigned int word1_4_1 = 0;
+            int src_rank_4_1 = expanded / (32 * top_k);
+            int src_slot_4_1 = expanded % (32 * top_k);
+            uint32_t mapa_4_1;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_10) : "r"(smem_packed_addr), "r"(src_rank_15_1));
-            unsigned int cluster_word_17_1[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_17_1[0])) : "r"(_mapa_10 + (unsigned int)(src_slot_16_1 * 8)) : "memory");
-            word0_13_1 = cluster_word_17_1[0];
-            unsigned int cluster_word_18_1[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_18_1[0])) : "r"(_mapa_10 + (unsigned int)(src_slot_16_1 * 8 + 4)) : "memory");
-            word1_14_1 = cluster_word_18_1[0];
-            idx_ii_12_1 = (int)(word1_14_1 << 16) >> 16;
-            exp_idx[6] = idx_ii_12_1;
-            int local_idx_19_1 = idx_ii_12_1 - local_experts_start_idx;
-            int extent_20_1 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_21_1 = (1 << local_experts_stride_log2) - 1;
-            int is_local_22_1 = ((local_idx_19_1 >= 0 && local_idx_19_1 < extent_20_1 && (local_idx_19_1 & stride_mask_21_1) == 0) ? 1 : 0);
+                : "=r"(mapa_4_1) : "r"(smem_packed_addr), "r"(src_rank_4_1));
+            unsigned int cluster_word_15[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_15[0])) : "r"(mapa_4_1 + (unsigned int)(src_slot_4_1 * 8)) : "memory");
+            word0_4_1 = cluster_word_15[0];
+            unsigned int cluster_word_16[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_16[0])) : "r"(mapa_4_1 + (unsigned int)(src_slot_4_1 * 8 + 4)) : "memory");
+            word1_4_1 = cluster_word_16[0];
+            idx_ii_4_1 = (int)(word1_4_1 << 16) >> 16;
+            exp_idx[6] = idx_ii_4_1;
+            int local_idx_4_1 = idx_ii_4_1 - local_experts_start_idx;
+            int extent_4_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_4_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_5_1 = ((local_idx_4_1 >= 0 && local_idx_4_1 < extent_4_1 && (local_idx_4_1 & stride_mask_4_1) == 0) ? 1 : 0);
             exp_off[6] = 0;
-            if (is_local_22_1 != 0) {
-                unsigned int _atomic_fetch_add_47 = atomicAdd(&smem_expert_count[idx_ii_12_1], 1);
+            if (is_local_5_1 != 0) {
+                unsigned int _atomic_fetch_add_47 = atomicAdd(&smem_expert_count[idx_ii_4_1], 1);
                 exp_off[6] = (int)_atomic_fetch_add_47;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_13_1);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_4_1);
             expanded = cluster_tid + 57344;
-            int idx_ii_23_1 = 0;
-            unsigned int word0_24_1 = 0;
-            unsigned int word1_25_1 = 0;
-            int src_rank_26_1 = expanded / (32 * top_k);
-            int src_slot_27_1 = expanded % (32 * top_k);
-            uint32_t _mapa_11;
+            int idx_ii_5_1 = 0;
+            unsigned int word0_5_1 = 0;
+            unsigned int word1_5_1 = 0;
+            int src_rank_5_1 = expanded / (32 * top_k);
+            int src_slot_5_1 = expanded % (32 * top_k);
+            uint32_t mapa_5_1;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_11) : "r"(smem_packed_addr), "r"(src_rank_26_1));
-            unsigned int cluster_word_28_1[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_28_1[0])) : "r"(_mapa_11 + (unsigned int)(src_slot_27_1 * 8)) : "memory");
-            word0_24_1 = cluster_word_28_1[0];
-            unsigned int cluster_word_29_1[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_29_1[0])) : "r"(_mapa_11 + (unsigned int)(src_slot_27_1 * 8 + 4)) : "memory");
-            word1_25_1 = cluster_word_29_1[0];
-            idx_ii_23_1 = (int)(word1_25_1 << 16) >> 16;
-            exp_idx[7] = idx_ii_23_1;
-            int local_idx_30_1 = idx_ii_23_1 - local_experts_start_idx;
-            int extent_31_1 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_32_1 = (1 << local_experts_stride_log2) - 1;
-            int is_local_33_1 = ((local_idx_30_1 >= 0 && local_idx_30_1 < extent_31_1 && (local_idx_30_1 & stride_mask_32_1) == 0) ? 1 : 0);
+                : "=r"(mapa_5_1) : "r"(smem_packed_addr), "r"(src_rank_5_1));
+            unsigned int cluster_word_17[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_17[0])) : "r"(mapa_5_1 + (unsigned int)(src_slot_5_1 * 8)) : "memory");
+            word0_5_1 = cluster_word_17[0];
+            unsigned int cluster_word_18[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_18[0])) : "r"(mapa_5_1 + (unsigned int)(src_slot_5_1 * 8 + 4)) : "memory");
+            word1_5_1 = cluster_word_18[0];
+            idx_ii_5_1 = (int)(word1_5_1 << 16) >> 16;
+            exp_idx[7] = idx_ii_5_1;
+            int local_idx_5_1 = idx_ii_5_1 - local_experts_start_idx;
+            int extent_5_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_5_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_6_1 = ((local_idx_5_1 >= 0 && local_idx_5_1 < extent_5_1 && (local_idx_5_1 & stride_mask_5_1) == 0) ? 1 : 0);
             exp_off[7] = 0;
-            if (is_local_33_1 != 0) {
-                unsigned int _atomic_fetch_add_48 = atomicAdd(&smem_expert_count[idx_ii_23_1], 1);
+            if (is_local_6_1 != 0) {
+                unsigned int _atomic_fetch_add_48 = atomicAdd(&smem_expert_count[idx_ii_5_1], 1);
                 exp_off[7] = (int)_atomic_fetch_add_48;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_24_1);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_5_1);
         } else {
             if (done == 0) {
                 expanded = cluster_tid + 32768;
-                if (expanded >= expanded_size) {
-                    done = 1;
-                } else {
-                    int idx_ii_7 = 0;
-                    unsigned int word0_7 = 0;
-                    unsigned int word1_7 = 0;
-                    int src_rank_7 = expanded / (32 * top_k);
-                    int src_slot_7 = expanded % (32 * top_k);
-                    uint32_t _mapa_12;
-                    asm volatile(
-                        "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(_mapa_12) : "r"(smem_packed_addr), "r"(src_rank_7));
-                    unsigned int cluster_word_8[1];
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_8[0])) : "r"(_mapa_12 + (unsigned int)(src_slot_7 * 8)) : "memory");
-                    word0_7 = cluster_word_8[0];
-                    unsigned int cluster_word_0_6[1];
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_0_6[0])) : "r"(_mapa_12 + (unsigned int)(src_slot_7 * 8 + 4)) : "memory");
-                    word1_7 = cluster_word_0_6[0];
-                    idx_ii_7 = (int)(word1_7 << 16) >> 16;
-                    exp_idx[4] = idx_ii_7;
-                    int local_idx_6 = idx_ii_7 - local_experts_start_idx;
-                    int extent_6 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_6 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_6 = ((local_idx_6 >= 0 && local_idx_6 < extent_6 && (local_idx_6 & stride_mask_6) == 0) ? 1 : 0);
-                    exp_off[4] = 0;
-                    if (is_local_6 != 0) {
-                        unsigned int _atomic_fetch_add_49 = atomicAdd(&smem_expert_count[idx_ii_7], 1);
-                        exp_off[4] = (int)_atomic_fetch_add_49;
-                    }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_7);
-                }
-            }
-            if (done == 0) {
-                expanded = cluster_tid + 40960;
                 if (expanded >= expanded_size) {
                     done = 1;
                 } else {
@@ -808,32 +757,32 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
                     unsigned int word1_8 = 0;
                     int src_rank_8 = expanded / (32 * top_k);
                     int src_slot_8 = expanded % (32 * top_k);
-                    uint32_t _mapa_13;
+                    uint32_t mapa_8;
                     asm volatile(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(_mapa_13) : "r"(smem_packed_addr), "r"(src_rank_8));
-                    unsigned int cluster_word_9[1];
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_9[0])) : "r"(_mapa_13 + (unsigned int)(src_slot_8 * 8)) : "memory");
-                    word0_8 = cluster_word_9[0];
-                    unsigned int cluster_word_0_7[1];
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_0_7[0])) : "r"(_mapa_13 + (unsigned int)(src_slot_8 * 8 + 4)) : "memory");
-                    word1_8 = cluster_word_0_7[0];
+                        : "=r"(mapa_8) : "r"(smem_packed_addr), "r"(src_rank_8));
+                    unsigned int cluster_word_19[1];
+                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_19[0])) : "r"(mapa_8 + (unsigned int)(src_slot_8 * 8)) : "memory");
+                    word0_8 = cluster_word_19[0];
+                    unsigned int cluster_word_19_1[1];
+                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_19_1[0])) : "r"(mapa_8 + (unsigned int)(src_slot_8 * 8 + 4)) : "memory");
+                    word1_8 = cluster_word_19_1[0];
                     idx_ii_8 = (int)(word1_8 << 16) >> 16;
-                    exp_idx[5] = idx_ii_8;
-                    int local_idx_7 = idx_ii_8 - local_experts_start_idx;
-                    int extent_7 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_7 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_7 = ((local_idx_7 >= 0 && local_idx_7 < extent_7 && (local_idx_7 & stride_mask_7) == 0) ? 1 : 0);
-                    exp_off[5] = 0;
-                    if (is_local_7 != 0) {
-                        unsigned int _atomic_fetch_add_50 = atomicAdd(&smem_expert_count[idx_ii_8], 1);
-                        exp_off[5] = (int)_atomic_fetch_add_50;
+                    exp_idx[4] = idx_ii_8;
+                    int local_idx_8 = idx_ii_8 - local_experts_start_idx;
+                    int extent_8 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_8 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_8 = ((local_idx_8 >= 0 && local_idx_8 < extent_8 && (local_idx_8 & stride_mask_8) == 0) ? 1 : 0);
+                    exp_off[4] = 0;
+                    if (is_local_8 != 0) {
+                        unsigned int _atomic_fetch_add_49 = atomicAdd(&smem_expert_count[idx_ii_8], 1);
+                        exp_off[4] = (int)_atomic_fetch_add_49;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_8);
                 }
             }
             if (done == 0) {
-                expanded = cluster_tid + 49152;
+                expanded = cluster_tid + 40960;
                 if (expanded >= expanded_size) {
                     done = 1;
                 } else {
@@ -842,32 +791,32 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
                     unsigned int word1_9 = 0;
                     int src_rank_9 = expanded / (32 * top_k);
                     int src_slot_9 = expanded % (32 * top_k);
-                    uint32_t _mapa_14;
+                    uint32_t mapa_9;
                     asm volatile(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(_mapa_14) : "r"(smem_packed_addr), "r"(src_rank_9));
-                    unsigned int cluster_word_10[1];
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_10[0])) : "r"(_mapa_14 + (unsigned int)(src_slot_9 * 8)) : "memory");
-                    word0_9 = cluster_word_10[0];
-                    unsigned int cluster_word_0_8[1];
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_0_8[0])) : "r"(_mapa_14 + (unsigned int)(src_slot_9 * 8 + 4)) : "memory");
-                    word1_9 = cluster_word_0_8[0];
+                        : "=r"(mapa_9) : "r"(smem_packed_addr), "r"(src_rank_9));
+                    unsigned int cluster_word_20[1];
+                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_20[0])) : "r"(mapa_9 + (unsigned int)(src_slot_9 * 8)) : "memory");
+                    word0_9 = cluster_word_20[0];
+                    unsigned int cluster_word_20_1[1];
+                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_20_1[0])) : "r"(mapa_9 + (unsigned int)(src_slot_9 * 8 + 4)) : "memory");
+                    word1_9 = cluster_word_20_1[0];
                     idx_ii_9 = (int)(word1_9 << 16) >> 16;
-                    exp_idx[6] = idx_ii_9;
+                    exp_idx[5] = idx_ii_9;
                     int local_idx_9 = idx_ii_9 - local_experts_start_idx;
-                    int extent_8 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_8 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_8 = ((local_idx_9 >= 0 && local_idx_9 < extent_8 && (local_idx_9 & stride_mask_8) == 0) ? 1 : 0);
-                    exp_off[6] = 0;
-                    if (is_local_8 != 0) {
-                        unsigned int _atomic_fetch_add_51 = atomicAdd(&smem_expert_count[idx_ii_9], 1);
-                        exp_off[6] = (int)_atomic_fetch_add_51;
+                    int extent_9 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_9 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_9 = ((local_idx_9 >= 0 && local_idx_9 < extent_9 && (local_idx_9 & stride_mask_9) == 0) ? 1 : 0);
+                    exp_off[5] = 0;
+                    if (is_local_9 != 0) {
+                        unsigned int _atomic_fetch_add_50 = atomicAdd(&smem_expert_count[idx_ii_9], 1);
+                        exp_off[5] = (int)_atomic_fetch_add_50;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9);
                 }
             }
             if (done == 0) {
-                expanded = cluster_tid + 57344;
+                expanded = cluster_tid + 49152;
                 if (expanded >= expanded_size) {
                     done = 1;
                 } else {
@@ -876,28 +825,62 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
                     unsigned int word1_10 = 0;
                     int src_rank_10 = expanded / (32 * top_k);
                     int src_slot_10 = expanded % (32 * top_k);
-                    uint32_t _mapa_15;
+                    uint32_t mapa_10;
                     asm volatile(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(_mapa_15) : "r"(smem_packed_addr), "r"(src_rank_10));
-                    unsigned int cluster_word_11[1];
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_11[0])) : "r"(_mapa_15 + (unsigned int)(src_slot_10 * 8)) : "memory");
-                    word0_10 = cluster_word_11[0];
-                    unsigned int cluster_word_0_9[1];
-                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_0_9[0])) : "r"(_mapa_15 + (unsigned int)(src_slot_10 * 8 + 4)) : "memory");
-                    word1_10 = cluster_word_0_9[0];
+                        : "=r"(mapa_10) : "r"(smem_packed_addr), "r"(src_rank_10));
+                    unsigned int cluster_word_21[1];
+                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_21[0])) : "r"(mapa_10 + (unsigned int)(src_slot_10 * 8)) : "memory");
+                    word0_10 = cluster_word_21[0];
+                    unsigned int cluster_word_21_1[1];
+                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_21_1[0])) : "r"(mapa_10 + (unsigned int)(src_slot_10 * 8 + 4)) : "memory");
+                    word1_10 = cluster_word_21_1[0];
                     idx_ii_10 = (int)(word1_10 << 16) >> 16;
-                    exp_idx[7] = idx_ii_10;
+                    exp_idx[6] = idx_ii_10;
                     int local_idx_10 = idx_ii_10 - local_experts_start_idx;
                     int extent_10 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_9 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_9 = ((local_idx_10 >= 0 && local_idx_10 < extent_10 && (local_idx_10 & stride_mask_9) == 0) ? 1 : 0);
-                    exp_off[7] = 0;
-                    if (is_local_9 != 0) {
-                        unsigned int _atomic_fetch_add_52 = atomicAdd(&smem_expert_count[idx_ii_10], 1);
-                        exp_off[7] = (int)_atomic_fetch_add_52;
+                    int stride_mask_10 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_10 = ((local_idx_10 >= 0 && local_idx_10 < extent_10 && (local_idx_10 & stride_mask_10) == 0) ? 1 : 0);
+                    exp_off[6] = 0;
+                    if (is_local_10 != 0) {
+                        unsigned int _atomic_fetch_add_51 = atomicAdd(&smem_expert_count[idx_ii_10], 1);
+                        exp_off[6] = (int)_atomic_fetch_add_51;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_10);
+                }
+            }
+            if (done == 0) {
+                expanded = cluster_tid + 57344;
+                if (expanded >= expanded_size) {
+                    done = 1;
+                } else {
+                    int idx_ii_11 = 0;
+                    unsigned int word0_11 = 0;
+                    unsigned int word1_11 = 0;
+                    int src_rank_11 = expanded / (32 * top_k);
+                    int src_slot_11 = expanded % (32 * top_k);
+                    uint32_t mapa_11;
+                    asm volatile(
+                        "mapa.shared::cluster.u32 %0, %1, %2;"
+                        : "=r"(mapa_11) : "r"(smem_packed_addr), "r"(src_rank_11));
+                    unsigned int cluster_word_22[1];
+                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_22[0])) : "r"(mapa_11 + (unsigned int)(src_slot_11 * 8)) : "memory");
+                    word0_11 = cluster_word_22[0];
+                    unsigned int cluster_word_22_1[1];
+                    asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_22_1[0])) : "r"(mapa_11 + (unsigned int)(src_slot_11 * 8 + 4)) : "memory");
+                    word1_11 = cluster_word_22_1[0];
+                    idx_ii_11 = (int)(word1_11 << 16) >> 16;
+                    exp_idx[7] = idx_ii_11;
+                    int local_idx_11 = idx_ii_11 - local_experts_start_idx;
+                    int extent_11 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_11 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_11 = ((local_idx_11 >= 0 && local_idx_11 < extent_11 && (local_idx_11 & stride_mask_11) == 0) ? 1 : 0);
+                    exp_off[7] = 0;
+                    if (is_local_11 != 0) {
+                        unsigned int _atomic_fetch_add_52 = atomicAdd(&smem_expert_count[idx_ii_11], 1);
+                        exp_off[7] = (int)_atomic_fetch_add_52;
+                    }
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_11);
                 }
             }
         }
@@ -911,13 +894,13 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
     if (expert < num_experts) {
         peer_count = 0;
         if (num_tokens > 0) {
-            uint32_t _mapa_16;
+            uint32_t _mapa_0;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_16) : "r"(smem_expert_count_addr), "r"(0));
-            unsigned int cluster_word_12[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_12[0])) : "r"(_mapa_16 + (unsigned int)(expert * 4)) : "memory");
-            peer_count = (int)cluster_word_12[0];
+                : "=r"(_mapa_0) : "r"(smem_expert_count_addr), "r"(0));
+            unsigned int cluster_word_23[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_23[0])) : "r"(_mapa_0 + (unsigned int)(expert * 4)) : "memory");
+            peer_count = (int)cluster_word_23[0];
         }
         if (rank == 0) {
             block_expert_offset = count;
@@ -925,13 +908,13 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
         count = count + peer_count;
         peer_count = 0;
         if (num_tokens > 32) {
-            uint32_t _mapa_17;
+            uint32_t _mapa_1;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_17) : "r"(smem_expert_count_addr), "r"(1));
-            unsigned int cluster_word_13[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_13[0])) : "r"(_mapa_17 + (unsigned int)(expert * 4)) : "memory");
-            peer_count = (int)cluster_word_13[0];
+                : "=r"(_mapa_1) : "r"(smem_expert_count_addr), "r"(1));
+            unsigned int cluster_word_24[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_24[0])) : "r"(_mapa_1 + (unsigned int)(expert * 4)) : "memory");
+            peer_count = (int)cluster_word_24[0];
         }
         if (rank == 1) {
             block_expert_offset = count;
@@ -939,13 +922,13 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
         count = count + peer_count;
         peer_count = 0;
         if (num_tokens > 64) {
-            uint32_t _mapa_18;
+            uint32_t _mapa_2;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_18) : "r"(smem_expert_count_addr), "r"(2));
-            unsigned int cluster_word_14[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_14[0])) : "r"(_mapa_18 + (unsigned int)(expert * 4)) : "memory");
-            peer_count = (int)cluster_word_14[0];
+                : "=r"(_mapa_2) : "r"(smem_expert_count_addr), "r"(2));
+            unsigned int cluster_word_25[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_25[0])) : "r"(_mapa_2 + (unsigned int)(expert * 4)) : "memory");
+            peer_count = (int)cluster_word_25[0];
         }
         if (rank == 2) {
             block_expert_offset = count;
@@ -953,13 +936,13 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
         count = count + peer_count;
         peer_count = 0;
         if (num_tokens > 96) {
-            uint32_t _mapa_19;
+            uint32_t _mapa_3;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_19) : "r"(smem_expert_count_addr), "r"(3));
-            unsigned int cluster_word_15[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_15[0])) : "r"(_mapa_19 + (unsigned int)(expert * 4)) : "memory");
-            peer_count = (int)cluster_word_15[0];
+                : "=r"(_mapa_3) : "r"(smem_expert_count_addr), "r"(3));
+            unsigned int cluster_word_26[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_26[0])) : "r"(_mapa_3 + (unsigned int)(expert * 4)) : "memory");
+            peer_count = (int)cluster_word_26[0];
         }
         if (rank == 3) {
             block_expert_offset = count;
@@ -967,13 +950,13 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
         count = count + peer_count;
         peer_count = 0;
         if (num_tokens > 128) {
-            uint32_t _mapa_20;
+            uint32_t _mapa_4;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_20) : "r"(smem_expert_count_addr), "r"(4));
-            unsigned int cluster_word_16[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_16[0])) : "r"(_mapa_20 + (unsigned int)(expert * 4)) : "memory");
-            peer_count = (int)cluster_word_16[0];
+                : "=r"(_mapa_4) : "r"(smem_expert_count_addr), "r"(4));
+            unsigned int cluster_word_27[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_27[0])) : "r"(_mapa_4 + (unsigned int)(expert * 4)) : "memory");
+            peer_count = (int)cluster_word_27[0];
         }
         if (rank == 4) {
             block_expert_offset = count;
@@ -981,13 +964,13 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
         count = count + peer_count;
         peer_count = 0;
         if (num_tokens > 160) {
-            uint32_t _mapa_21;
+            uint32_t _mapa_5;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_21) : "r"(smem_expert_count_addr), "r"(5));
-            unsigned int cluster_word_19[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_19[0])) : "r"(_mapa_21 + (unsigned int)(expert * 4)) : "memory");
-            peer_count = (int)cluster_word_19[0];
+                : "=r"(_mapa_5) : "r"(smem_expert_count_addr), "r"(5));
+            unsigned int cluster_word_28[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_28[0])) : "r"(_mapa_5 + (unsigned int)(expert * 4)) : "memory");
+            peer_count = (int)cluster_word_28[0];
         }
         if (rank == 5) {
             block_expert_offset = count;
@@ -995,13 +978,13 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
         count = count + peer_count;
         peer_count = 0;
         if (num_tokens > 192) {
-            uint32_t _mapa_22;
+            uint32_t _mapa_6;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_22) : "r"(smem_expert_count_addr), "r"(6));
-            unsigned int cluster_word_20[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_20[0])) : "r"(_mapa_22 + (unsigned int)(expert * 4)) : "memory");
-            peer_count = (int)cluster_word_20[0];
+                : "=r"(_mapa_6) : "r"(smem_expert_count_addr), "r"(6));
+            unsigned int cluster_word_29[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_29[0])) : "r"(_mapa_6 + (unsigned int)(expert * 4)) : "memory");
+            peer_count = (int)cluster_word_29[0];
         }
         if (rank == 6) {
             block_expert_offset = count;
@@ -1009,13 +992,13 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
         count = count + peer_count;
         peer_count = 0;
         if (num_tokens > 224) {
-            uint32_t _mapa_23;
+            uint32_t _mapa_7;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_23) : "r"(smem_expert_count_addr), "r"(7));
-            unsigned int cluster_word_21[1];
-            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_21[0])) : "r"(_mapa_23 + (unsigned int)(expert * 4)) : "memory");
-            peer_count = (int)cluster_word_21[0];
+                : "=r"(_mapa_7) : "r"(smem_expert_count_addr), "r"(7));
+            unsigned int cluster_word_30[1];
+            asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_word_30[0])) : "r"(_mapa_7 + (unsigned int)(expert * 4)) : "memory");
+            peer_count = (int)cluster_word_30[0];
         }
         if (rank == 7) {
             block_expert_offset = count;
@@ -1028,212 +1011,201 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
         num_cta = count + (1 << padding_log2) - 1 >> padding_log2;
     }
     int inclusive = num_cta;
+    {
+        uint32_t inclusive_scan = (uint32_t)inclusive;
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_scan, 1, 32); if (lane >= 1) { inclusive_scan += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_scan, 2, 32); if (lane >= 2) { inclusive_scan += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_scan, 4, 32); if (lane >= 4) { inclusive_scan += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_scan, 8, 32); if (lane >= 8) { inclusive_scan += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_scan, 16, 32); if (lane >= 16) { inclusive_scan += peer; } }
+        inclusive = (int)inclusive_scan;
+    }
     int lane_s = (int)lane;
-    int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, inclusive, 1, 32);
-    if (lane_s >= 1) {
-        inclusive = inclusive + _shfl_up_0;
-    }
-    int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, inclusive, 2, 32);
-    if (lane_s >= 2) {
-        inclusive = inclusive + _shfl_up_1;
-    }
-    int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, inclusive, 4, 32);
-    if (lane_s >= 4) {
-        inclusive = inclusive + _shfl_up_2;
-    }
-    int _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, inclusive, 8, 32);
-    if (lane_s >= 8) {
-        inclusive = inclusive + _shfl_up_3;
-    }
-    int _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, inclusive, 16, 32);
-    if (lane_s >= 16) {
-        inclusive = inclusive + _shfl_up_4;
-    }
     if (lane_s == 31) {
         warp_totals[warp] = inclusive;
     }
     __syncthreads();
     int warp_prefix = 0;
     int block_total = 0;
-    int wt = warp_totals[0];
+    int wt_7_0 = warp_totals[0];
     if (warp > 0) {
-        warp_prefix = warp_prefix + wt;
+        warp_prefix = warp_prefix + wt_7_0;
     }
-    block_total = block_total + wt;
-    int wt_0 = warp_totals[1];
+    block_total = block_total + wt_7_0;
+    int wt_7_1 = warp_totals[1];
     if (warp > 1) {
-        warp_prefix = warp_prefix + wt_0;
+        warp_prefix = warp_prefix + wt_7_1;
     }
-    block_total = block_total + wt_0;
-    int wt_1 = warp_totals[2];
+    block_total = block_total + wt_7_1;
+    int wt_7_2 = warp_totals[2];
     if (warp > 2) {
-        warp_prefix = warp_prefix + wt_1;
+        warp_prefix = warp_prefix + wt_7_2;
     }
-    block_total = block_total + wt_1;
-    int wt_2 = warp_totals[3];
+    block_total = block_total + wt_7_2;
+    int wt_7_3 = warp_totals[3];
     if (warp > 3) {
-        warp_prefix = warp_prefix + wt_2;
+        warp_prefix = warp_prefix + wt_7_3;
     }
-    block_total = block_total + wt_2;
-    int wt_3 = warp_totals[4];
+    block_total = block_total + wt_7_3;
+    int wt_7_4 = warp_totals[4];
     if (warp > 4) {
-        warp_prefix = warp_prefix + wt_3;
+        warp_prefix = warp_prefix + wt_7_4;
     }
-    block_total = block_total + wt_3;
-    int wt_4 = warp_totals[5];
+    block_total = block_total + wt_7_4;
+    int wt_7_5 = warp_totals[5];
     if (warp > 5) {
-        warp_prefix = warp_prefix + wt_4;
+        warp_prefix = warp_prefix + wt_7_5;
     }
-    block_total = block_total + wt_4;
-    int wt_5 = warp_totals[6];
+    block_total = block_total + wt_7_5;
+    int wt_7_6 = warp_totals[6];
     if (warp > 6) {
-        warp_prefix = warp_prefix + wt_5;
+        warp_prefix = warp_prefix + wt_7_6;
     }
-    block_total = block_total + wt_5;
-    int wt_6 = warp_totals[7];
+    block_total = block_total + wt_7_6;
+    int wt_7_7 = warp_totals[7];
     if (warp > 7) {
-        warp_prefix = warp_prefix + wt_6;
+        warp_prefix = warp_prefix + wt_7_7;
     }
-    block_total = block_total + wt_6;
-    int wt_7 = warp_totals[8];
+    block_total = block_total + wt_7_7;
+    int wt_7_8 = warp_totals[8];
     if (warp > 8) {
-        warp_prefix = warp_prefix + wt_7;
+        warp_prefix = warp_prefix + wt_7_8;
     }
-    block_total = block_total + wt_7;
-    int wt_8 = warp_totals[9];
+    block_total = block_total + wt_7_8;
+    int wt_7_9 = warp_totals[9];
     if (warp > 9) {
-        warp_prefix = warp_prefix + wt_8;
+        warp_prefix = warp_prefix + wt_7_9;
     }
-    block_total = block_total + wt_8;
-    int wt_9 = warp_totals[10];
+    block_total = block_total + wt_7_9;
+    int wt_7_10 = warp_totals[10];
     if (warp > 10) {
-        warp_prefix = warp_prefix + wt_9;
+        warp_prefix = warp_prefix + wt_7_10;
     }
-    block_total = block_total + wt_9;
-    int wt_10 = warp_totals[11];
+    block_total = block_total + wt_7_10;
+    int wt_7_11 = warp_totals[11];
     if (warp > 11) {
-        warp_prefix = warp_prefix + wt_10;
+        warp_prefix = warp_prefix + wt_7_11;
     }
-    block_total = block_total + wt_10;
-    int wt_11 = warp_totals[12];
+    block_total = block_total + wt_7_11;
+    int wt_7_12 = warp_totals[12];
     if (warp > 12) {
-        warp_prefix = warp_prefix + wt_11;
+        warp_prefix = warp_prefix + wt_7_12;
     }
-    block_total = block_total + wt_11;
-    int wt_12 = warp_totals[13];
+    block_total = block_total + wt_7_12;
+    int wt_7_13 = warp_totals[13];
     if (warp > 13) {
-        warp_prefix = warp_prefix + wt_12;
+        warp_prefix = warp_prefix + wt_7_13;
     }
-    block_total = block_total + wt_12;
-    int wt_13 = warp_totals[14];
+    block_total = block_total + wt_7_13;
+    int wt_7_14 = warp_totals[14];
     if (warp > 14) {
-        warp_prefix = warp_prefix + wt_13;
+        warp_prefix = warp_prefix + wt_7_14;
     }
-    block_total = block_total + wt_13;
-    int wt_14 = warp_totals[15];
+    block_total = block_total + wt_7_14;
+    int wt_7_15 = warp_totals[15];
     if (warp > 15) {
-        warp_prefix = warp_prefix + wt_14;
+        warp_prefix = warp_prefix + wt_7_15;
     }
-    block_total = block_total + wt_14;
-    int wt_15 = warp_totals[16];
+    block_total = block_total + wt_7_15;
+    int wt_7_16 = warp_totals[16];
     if (warp > 16) {
-        warp_prefix = warp_prefix + wt_15;
+        warp_prefix = warp_prefix + wt_7_16;
     }
-    block_total = block_total + wt_15;
-    int wt_16 = warp_totals[17];
+    block_total = block_total + wt_7_16;
+    int wt_7_17 = warp_totals[17];
     if (warp > 17) {
-        warp_prefix = warp_prefix + wt_16;
+        warp_prefix = warp_prefix + wt_7_17;
     }
-    block_total = block_total + wt_16;
-    int wt_17 = warp_totals[18];
+    block_total = block_total + wt_7_17;
+    int wt_7_18 = warp_totals[18];
     if (warp > 18) {
-        warp_prefix = warp_prefix + wt_17;
+        warp_prefix = warp_prefix + wt_7_18;
     }
-    block_total = block_total + wt_17;
-    int wt_18 = warp_totals[19];
+    block_total = block_total + wt_7_18;
+    int wt_7_19 = warp_totals[19];
     if (warp > 19) {
-        warp_prefix = warp_prefix + wt_18;
+        warp_prefix = warp_prefix + wt_7_19;
     }
-    block_total = block_total + wt_18;
-    int wt_19 = warp_totals[20];
+    block_total = block_total + wt_7_19;
+    int wt_7_20 = warp_totals[20];
     if (warp > 20) {
-        warp_prefix = warp_prefix + wt_19;
+        warp_prefix = warp_prefix + wt_7_20;
     }
-    block_total = block_total + wt_19;
-    int wt_20 = warp_totals[21];
+    block_total = block_total + wt_7_20;
+    int wt_7_21 = warp_totals[21];
     if (warp > 21) {
-        warp_prefix = warp_prefix + wt_20;
+        warp_prefix = warp_prefix + wt_7_21;
     }
-    block_total = block_total + wt_20;
-    int wt_21 = warp_totals[22];
+    block_total = block_total + wt_7_21;
+    int wt_7_22 = warp_totals[22];
     if (warp > 22) {
-        warp_prefix = warp_prefix + wt_21;
+        warp_prefix = warp_prefix + wt_7_22;
     }
-    block_total = block_total + wt_21;
-    int wt_22 = warp_totals[23];
+    block_total = block_total + wt_7_22;
+    int wt_7_23 = warp_totals[23];
     if (warp > 23) {
-        warp_prefix = warp_prefix + wt_22;
+        warp_prefix = warp_prefix + wt_7_23;
     }
-    block_total = block_total + wt_22;
-    int wt_23 = warp_totals[24];
+    block_total = block_total + wt_7_23;
+    int wt_7_24 = warp_totals[24];
     if (warp > 24) {
-        warp_prefix = warp_prefix + wt_23;
+        warp_prefix = warp_prefix + wt_7_24;
     }
-    block_total = block_total + wt_23;
-    int wt_24 = warp_totals[25];
+    block_total = block_total + wt_7_24;
+    int wt_7_25 = warp_totals[25];
     if (warp > 25) {
-        warp_prefix = warp_prefix + wt_24;
+        warp_prefix = warp_prefix + wt_7_25;
     }
-    block_total = block_total + wt_24;
-    int wt_25 = warp_totals[26];
+    block_total = block_total + wt_7_25;
+    int wt_7_26 = warp_totals[26];
     if (warp > 26) {
-        warp_prefix = warp_prefix + wt_25;
+        warp_prefix = warp_prefix + wt_7_26;
     }
-    block_total = block_total + wt_25;
-    int wt_26 = warp_totals[27];
+    block_total = block_total + wt_7_26;
+    int wt_7_27 = warp_totals[27];
     if (warp > 27) {
-        warp_prefix = warp_prefix + wt_26;
+        warp_prefix = warp_prefix + wt_7_27;
     }
-    block_total = block_total + wt_26;
-    int wt_27 = warp_totals[28];
+    block_total = block_total + wt_7_27;
+    int wt_7_28 = warp_totals[28];
     if (warp > 28) {
-        warp_prefix = warp_prefix + wt_27;
+        warp_prefix = warp_prefix + wt_7_28;
     }
-    block_total = block_total + wt_27;
-    int wt_28 = warp_totals[29];
+    block_total = block_total + wt_7_28;
+    int wt_7_29 = warp_totals[29];
     if (warp > 29) {
-        warp_prefix = warp_prefix + wt_28;
+        warp_prefix = warp_prefix + wt_7_29;
     }
-    block_total = block_total + wt_28;
-    int wt_29 = warp_totals[30];
+    block_total = block_total + wt_7_29;
+    int wt_7_30 = warp_totals[30];
     if (warp > 30) {
-        warp_prefix = warp_prefix + wt_29;
+        warp_prefix = warp_prefix + wt_7_30;
     }
-    block_total = block_total + wt_29;
-    int wt_30 = warp_totals[31];
+    block_total = block_total + wt_7_30;
+    int wt_7_31 = warp_totals[31];
     if (warp > 31) {
-        warp_prefix = warp_prefix + wt_30;
+        warp_prefix = warp_prefix + wt_7_31;
     }
-    block_total = block_total + wt_30;
+    block_total = block_total + wt_7_31;
     int exclusive = inclusive - num_cta + warp_prefix;
     __syncthreads();
     if (expert < num_experts) {
-        int local_idx_11 = expert - local_experts_start_idx >> local_experts_stride_log2;
+        int local_idx_12 = expert - local_experts_start_idx >> local_experts_stride_log2;
         for (int cta = rank; cta < num_cta; cta += 8) {
-            cta_idx_xy_to_batch_idx[exclusive + cta] = local_idx_11;
+            cta_idx_xy_to_batch_idx[exclusive + cta] = local_idx_12;
             int scaled = (exclusive + cta + 1) * tile_tokens_dim;
             if (padding_log2 > 0) {
                 scaled = exclusive + cta + 1 << padding_log2;
             }
-            int scaled_0 = exclusive * tile_tokens_dim;
+            int scaled_1 = exclusive * tile_tokens_dim;
             if (padding_log2 > 0) {
-                scaled_0 = exclusive << padding_log2;
+                scaled_1 = exclusive << padding_log2;
             }
-            int mn_limit2 = scaled_0 + count;
-            int _min_5 = ((scaled) < (mn_limit2) ? (scaled) : (mn_limit2));
-            cta_idx_xy_to_mn_limit[exclusive + cta] = _min_5;
-            int head_end = ((scaled) < (_min_5 + (-_min_5 & 3)) ? (scaled) : (_min_5 + (-_min_5 & 3)));
-            for (int head = _min_5; head < head_end; head++) {
+            int mn_limit2 = scaled_1 + count;
+            int min_1 = ((scaled) < (mn_limit2) ? (scaled) : (mn_limit2));
+            cta_idx_xy_to_mn_limit[exclusive + cta] = min_1;
+            int head_end = ((scaled) < (min_1 + (-min_1 & 3)) ? (scaled) : (min_1 + (-min_1 & 3)));
+            for (int head = min_1; head < head_end; head++) {
                 permuted_idx_to_token_idx[head] = -1;
             }
             int body_len = ((scaled - head_end) > (0) ? (scaled - head_end) : (0));
@@ -1248,180 +1220,180 @@ kernel_cake_stepfun_moe_cecd60278603dcc4678d(float* __restrict__ scores, __nv_bf
                 permuted_idx_to_token_idx[tail] = -1;
             }
         }
-        int scaled_1 = exclusive * tile_tokens_dim;
+        int scaled_2 = exclusive * tile_tokens_dim;
         if (padding_log2 > 0) {
-            scaled_1 = exclusive << padding_log2;
+            scaled_2 = exclusive << padding_log2;
         }
-        smem_expert_offset[expert] = scaled_1 + block_expert_offset;
+        smem_expert_offset[expert] = scaled_2 + block_expert_offset;
     }
     if (rank == 0) {
         if (warp == 31) {
             if (elect_sync()) {
-                int scaled_2 = block_total * tile_tokens_dim;
+                int scaled_3 = block_total * tile_tokens_dim;
                 if (padding_log2 > 0) {
-                    scaled_2 = block_total << padding_log2;
+                    scaled_3 = block_total << padding_log2;
                 }
-                permuted_idx_size[0] = scaled_2;
+                permuted_idx_size[0] = scaled_3;
                 num_non_exiting_ctas[0] = block_total;
             }
         }
     }
     __syncthreads();
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-    int done_31 = 0;
+    int done_0 = 0;
     int expanded_j = 0;
     int idx_j = 0;
     int token_j = 0;
     int permuted_j = -1;
     int slot_base = 0;
-    if (done_31 == 0) {
+    if (done_0 == 0) {
         expanded_j = cluster_tid;
         if (expanded_j >= expanded_size) {
-            done_31 = 1;
+            done_0 = 1;
         } else {
             idx_j = exp_idx[0];
-            int local_idx_12 = idx_j - local_experts_start_idx;
-            int extent_11 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_11 = (1 << local_experts_stride_log2) - 1;
-            int is_local_10 = ((local_idx_12 >= 0 && local_idx_12 < extent_11 && (local_idx_12 & stride_mask_11) == 0) ? 1 : 0);
-            token_j = expanded_j / top_k;
-            slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_10 != 0) ? slot_base + exp_off[0] : -1);
-            expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_10 != 0) {
-                permuted_idx_to_token_idx[permuted_j] = token_j;
-            }
-        }
-    }
-    if (done_31 == 0) {
-        expanded_j = cluster_tid + 8192;
-        if (expanded_j >= expanded_size) {
-            done_31 = 1;
-        } else {
-            idx_j = exp_idx[1];
             int local_idx_13 = idx_j - local_experts_start_idx;
             int extent_12 = num_local_experts << local_experts_stride_log2;
             int stride_mask_12 = (1 << local_experts_stride_log2) - 1;
             int is_local_12 = ((local_idx_13 >= 0 && local_idx_13 < extent_12 && (local_idx_13 & stride_mask_12) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_12 != 0) ? slot_base + exp_off[1] : -1);
+            permuted_j = ((is_local_12 != 0) ? slot_base + exp_off[0] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
             if (is_local_12 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
     }
-    if (done_31 == 0) {
-        expanded_j = cluster_tid + 16384;
+    if (done_0 == 0) {
+        expanded_j = cluster_tid + 8192;
         if (expanded_j >= expanded_size) {
-            done_31 = 1;
+            done_0 = 1;
         } else {
-            idx_j = exp_idx[2];
+            idx_j = exp_idx[1];
             int local_idx_14 = idx_j - local_experts_start_idx;
             int extent_13 = num_local_experts << local_experts_stride_log2;
             int stride_mask_13 = (1 << local_experts_stride_log2) - 1;
             int is_local_13 = ((local_idx_14 >= 0 && local_idx_14 < extent_13 && (local_idx_14 & stride_mask_13) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_13 != 0) ? slot_base + exp_off[2] : -1);
+            permuted_j = ((is_local_13 != 0) ? slot_base + exp_off[1] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
             if (is_local_13 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
     }
-    if (done_31 == 0) {
-        expanded_j = cluster_tid + 24576;
+    if (done_0 == 0) {
+        expanded_j = cluster_tid + 16384;
         if (expanded_j >= expanded_size) {
-            done_31 = 1;
+            done_0 = 1;
         } else {
-            idx_j = exp_idx[3];
+            idx_j = exp_idx[2];
             int local_idx_15 = idx_j - local_experts_start_idx;
             int extent_14 = num_local_experts << local_experts_stride_log2;
             int stride_mask_14 = (1 << local_experts_stride_log2) - 1;
             int is_local_14 = ((local_idx_15 >= 0 && local_idx_15 < extent_14 && (local_idx_15 & stride_mask_14) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_14 != 0) ? slot_base + exp_off[3] : -1);
+            permuted_j = ((is_local_14 != 0) ? slot_base + exp_off[2] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
             if (is_local_14 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
     }
-    if (done_31 == 0) {
-        expanded_j = cluster_tid + 32768;
+    if (done_0 == 0) {
+        expanded_j = cluster_tid + 24576;
         if (expanded_j >= expanded_size) {
-            done_31 = 1;
+            done_0 = 1;
         } else {
-            idx_j = exp_idx[4];
+            idx_j = exp_idx[3];
             int local_idx_16 = idx_j - local_experts_start_idx;
             int extent_15 = num_local_experts << local_experts_stride_log2;
             int stride_mask_15 = (1 << local_experts_stride_log2) - 1;
             int is_local_15 = ((local_idx_16 >= 0 && local_idx_16 < extent_15 && (local_idx_16 & stride_mask_15) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_15 != 0) ? slot_base + exp_off[4] : -1);
+            permuted_j = ((is_local_15 != 0) ? slot_base + exp_off[3] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
             if (is_local_15 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
     }
-    if (done_31 == 0) {
-        expanded_j = cluster_tid + 40960;
+    if (done_0 == 0) {
+        expanded_j = cluster_tid + 32768;
         if (expanded_j >= expanded_size) {
-            done_31 = 1;
+            done_0 = 1;
         } else {
-            idx_j = exp_idx[5];
+            idx_j = exp_idx[4];
             int local_idx_17 = idx_j - local_experts_start_idx;
             int extent_16 = num_local_experts << local_experts_stride_log2;
             int stride_mask_16 = (1 << local_experts_stride_log2) - 1;
             int is_local_16 = ((local_idx_17 >= 0 && local_idx_17 < extent_16 && (local_idx_17 & stride_mask_16) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_16 != 0) ? slot_base + exp_off[5] : -1);
+            permuted_j = ((is_local_16 != 0) ? slot_base + exp_off[4] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
             if (is_local_16 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
     }
-    if (done_31 == 0) {
-        expanded_j = cluster_tid + 49152;
+    if (done_0 == 0) {
+        expanded_j = cluster_tid + 40960;
         if (expanded_j >= expanded_size) {
-            done_31 = 1;
+            done_0 = 1;
         } else {
-            idx_j = exp_idx[6];
+            idx_j = exp_idx[5];
             int local_idx_18 = idx_j - local_experts_start_idx;
             int extent_17 = num_local_experts << local_experts_stride_log2;
             int stride_mask_17 = (1 << local_experts_stride_log2) - 1;
             int is_local_17 = ((local_idx_18 >= 0 && local_idx_18 < extent_17 && (local_idx_18 & stride_mask_17) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_17 != 0) ? slot_base + exp_off[6] : -1);
+            permuted_j = ((is_local_17 != 0) ? slot_base + exp_off[5] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
             if (is_local_17 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
     }
-    if (done_31 == 0) {
+    if (done_0 == 0) {
+        expanded_j = cluster_tid + 49152;
+        if (expanded_j >= expanded_size) {
+            done_0 = 1;
+        } else {
+            idx_j = exp_idx[6];
+            int local_idx_19 = idx_j - local_experts_start_idx;
+            int extent_18 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_18 = (1 << local_experts_stride_log2) - 1;
+            int is_local_18 = ((local_idx_19 >= 0 && local_idx_19 < extent_18 && (local_idx_19 & stride_mask_18) == 0) ? 1 : 0);
+            token_j = expanded_j / top_k;
+            slot_base = smem_expert_offset[idx_j];
+            permuted_j = ((is_local_18 != 0) ? slot_base + exp_off[6] : -1);
+            expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
+            if (is_local_18 != 0) {
+                permuted_idx_to_token_idx[permuted_j] = token_j;
+            }
+        }
+    }
+    if (done_0 == 0) {
         expanded_j = cluster_tid + 57344;
         if (expanded_j >= expanded_size) {
-            done_31 = 1;
+            done_0 = 1;
         } else {
             idx_j = exp_idx[7];
             int local_idx_20 = idx_j - local_experts_start_idx;
-            int extent_18 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_18 = (1 << local_experts_stride_log2) - 1;
-            int is_local_18 = ((local_idx_20 >= 0 && local_idx_20 < extent_18 && (local_idx_20 & stride_mask_18) == 0) ? 1 : 0);
+            int extent_19 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_19 = (1 << local_experts_stride_log2) - 1;
+            int is_local_19 = ((local_idx_20 >= 0 && local_idx_20 < extent_19 && (local_idx_20 & stride_mask_19) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_18 != 0) ? slot_base + exp_off[7] : -1);
+            permuted_j = ((is_local_19 != 0) ? slot_base + exp_off[7] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_18 != 0) {
+            if (is_local_19 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }

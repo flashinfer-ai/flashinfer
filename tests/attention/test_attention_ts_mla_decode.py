@@ -24,7 +24,7 @@ from types import SimpleNamespace
 from typing import Sequence
 
 import pytest
-from tests.test_helpers.parametrize import parametrize_product
+from tests.infra.test_helpers.parametrize import parametrize_product
 import torch
 
 pytest.importorskip(
@@ -65,6 +65,9 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.query import (
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
     make_throughput_latency_mla_config,
+)
+from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.parallel_reduction import (
+    GMEM_REDUCTION_RUNTIME_SPLIT_WINDOWS,
 )
 from flashinfer.mla import (
     get_prims_ts_batch_mla_decode_workspace_size,
@@ -1266,6 +1269,8 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "kv_dtype",
         "out_dtype",
         "mask_type",
+        "softmax_scale",
+        "output_scale",
         "lse_mode",
         "workspace_buffer",
         "validate",
@@ -1511,6 +1516,8 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
         workspace_views=object(),
         compiled=object(),
         lse_mode="none",
+        softmax_scale=1.0,
+        output_scale=1.0,
     )
     runtime = _empty_mla_runtime()
     sentinel = torch.empty(1)
@@ -3661,6 +3668,7 @@ def test_mla_final_lse(dtype, heads, nq, nk, packed, mode):
     "heads,batch,kv",
     [
         (16, 3, 2304),  # Rounded capacity changes cluster residency.
+        (8, 1, 9216),  # Q8 runtime-split G1 parallel reducer.
         (64, 1, 8192),
         (64, 1, 19456),
         (128, 1, 8192),  # Balance a live prefix across the full Q128 cluster.
@@ -3683,8 +3691,15 @@ def test_mla_runtime_count_changes(dtype, heads, batch, kv):
     )
     lse = torch.empty(case.query.shape[:-1], device="cuda")
     # Reuse the same compiled callable/scratch for increasing and decreasing counts.
+    # Pin both sides of every runtime reducer window boundary: a window's last
+    # count and the next window's first (predicated) count, including the first
+    # count past the largest window, which takes the runtime chunk loop.
+    window_counts = sorted(
+        {1, 2, 3, 4}
+        | {n for w in GMEM_REDUCTION_RUNTIME_SPLIT_WINDOWS for n in (w, w + 1)}
+    )
     for count in (
-        *[n for n in (1, 2, 3, 4, 8, 9, 16, 17, 32) if n <= capacity],
+        *[n for n in window_counts if n <= capacity],
         capacity,
         2,
     ):
@@ -3776,3 +3791,74 @@ def test_attention_ts_mla_decode_2cta_runtime_small_split_reduction(seq_len_q, k
         _policy_dict(wrapper),
         exercise_all_paths=True,
     )
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("family", ("1cta", "2cta"))
+def test_dense_mla_global_scales_graph_replay(family):
+    from tests.utils.test_helpers.pdl import late_store
+
+    case = replace(
+        _make_mla_case(
+            batch_size=4 if family == "1cta" else 8,
+            num_qo_heads=16 if family == "1cta" else 128,
+            max_kv_len=4097 if family == "1cta" else 2048,
+            qkv_dtype=_FP8,
+            seq_len_q=1,
+            seed=32144,
+        ),
+        output_scale=0.75,
+    )
+    offsets = None
+    if family == "2cta":
+        case, offsets = _pack_mla_case(case, [1] * 8)
+    sm_scale = (
+        torch.tensor(case.softmax_scale, device="cuda")
+        if family == "1cta"
+        else case.softmax_scale
+    )
+    output_scale = torch.tensor(case.output_scale, device="cuda")
+    name = "softmax_scale" if family == "1cta" else "output_scale"
+    scale = sm_scale if family == "1cta" else output_scale
+    wrapper = _plan_case(
+        case,
+        qo_indptr=offsets,
+        max_q_len=1,
+        softmax_scale=sm_scale,
+        output_scale=output_scale,
+    )
+    policy = _policy_dict(wrapper)
+    assert policy["kernel"] == (
+        "throughput_latency_1cta" if family == "1cta" else "throughput_2cta"
+    )
+    assert int(policy["split_kv"]) > 1
+    assert not policy["use_persistent_scheduler"]
+    out = torch.empty(
+        (*case.query.shape[:-1], 512), device="cuda", dtype=torch.bfloat16
+    )
+
+    def run():
+        wrapper.run(
+            case.query,
+            case.kv_cache,
+            case.block_tables,
+            case.seq_lens_kv,
+            qo_indptr=offsets,
+            out=out,
+            validate=False,
+        )
+
+    run()
+    _assert_case_correct(out, case, policy, qo_indptr=offsets)
+    changed_value = getattr(case, name) * 1.5
+    changed = replace(case, **{name: changed_value})
+    late_store(scale, changed_value)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        late_store(scale, changed_value)
+        run()
+    for _ in range(2):
+        scale.fill_(getattr(case, name))
+        graph.replay()
+        _assert_case_correct(out, changed, policy, qo_indptr=offsets)

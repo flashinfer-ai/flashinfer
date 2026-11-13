@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -11,6 +10,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence, TypedDict
+
+import _flashinfer_filelock as filelock
 
 from .io import atomic_write_json
 from .models import ALGORITHM_VERSION, SCHEMA_VERSION, CollectedNode, Plan
@@ -62,7 +63,7 @@ def state_lock(junit_dir: Path) -> Iterator[None]:
             f"cannot open runner-owned lock path {lock_path}: {error}"
         ) from error
     with stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        filelock.lock(stream.fileno())
         try:
             stream.seek(0)
             marker = stream.read()
@@ -72,7 +73,7 @@ def state_lock(junit_dir: Path) -> Iterator[None]:
                 )
             yield
         finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            filelock.unlock(stream.fileno())
 
 
 def sha256_file(path: Path) -> str:

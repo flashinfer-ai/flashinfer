@@ -588,6 +588,7 @@ def compute_reference_moe_fp4(
     wrong_formula: bool = False,
     gemm1_alpha: torch.Tensor | None = None,
     gemm2_alpha: torch.Tensor | None = None,
+    clamped_relu2_limit: float | None = None,
 ) -> torch.Tensor:
     """Compute reference MoE output using PyTorch operations on GPU.
 
@@ -619,6 +620,9 @@ def compute_reference_moe_fp4(
         situ_linear_beta: Optional SiTU tanh clamp for the linear branch.
         gemm1_alpha: GEMM1 per-expert scalar scales [num_local_experts]
         gemm2_alpha: GEMM2 per-expert scalar scales [num_local_experts]
+        clamped_relu2_limit: Limit ``L`` of ActivationType.ClampedRelu2, which
+            maps the alpha-scaled GEMM1 output ``z`` to
+            ``relu(L * tanh(z / L)) ** 2``.
 
     Returns:
         Output tensor [num_tokens, hidden_size]
@@ -633,6 +637,10 @@ def compute_reference_moe_fp4(
         validate_cute_dsl_moe_situ_config(
             normalized_activation_type, situ_beta, situ_linear_beta
         )
+        if (normalized_activation_type == ActivationType.ClampedRelu2) != (
+            clamped_relu2_limit is not None
+        ):
+            raise ValueError("clamped_relu2_limit is required with ClampedRelu2 only")
         if situ_beta is not None:
             activation = "situ"
         elif normalized_activation_type == ActivationType.GegluTanh:
@@ -738,6 +746,10 @@ def compute_reference_moe_fp4(
                 # non-gated activation over identical weights. Used as a
                 # negative control to prove a tolerance can distinguish
                 # activation formulas rather than just output magnitude.
+                if clamped_relu2_limit is not None:
+                    gemm1_out = clamped_relu2_limit * torch.tanh(
+                        gemm1_out / clamped_relu2_limit
+                    )
                 act_out = (
                     torch.relu(gemm1_out)
                     if wrong_formula
@@ -816,6 +828,7 @@ def create_moe_tensors(
     interleave_gated_weights: bool = True,
     use_nontrivial_alphas: bool = True,
     vary_block_scales: bool = False,
+    swap_ab: bool = False,
 ):
     """Create properly quantized MoE tensors for testing.
 
@@ -910,11 +923,18 @@ def create_moe_tensors(
     if vary_block_scales:
         w1_bf16 = w1_bf16 * _block_scale_ramp(fc1_rows, 1, device)[None, :, None]
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    w1_for_quant = (
-        interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
-        if gated and interleave_gated_weights
-        else w1_bf16
-    )
+    if gated and interleave_gated_weights:
+        from flashinfer.fused_moe.prepare import _cute_dsl_gated_weight_group_size
+
+        w1_for_quant = interleave_linear_and_gate(
+            w1_bf16,
+            group_size=_cute_dsl_gated_weight_group_size(
+                w1_bf16.device, swap_ab=swap_ab
+            ),
+            dim=1,
+        )
+    else:
+        w1_for_quant = w1_bf16
     w1_q, w1_sf_flat = _fp4_quantize_per_expert(w1_for_quant, w1_gs, sf_vec_size)
     w1_weight_sf = convert_sf_to_mma_layout(
         w1_sf_flat,

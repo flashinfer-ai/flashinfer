@@ -23,9 +23,9 @@ scales ``w_scale_r`` (``[N]``); the scales are applied in fp32 before the
 cross-rank sum and every rank receives the full bfloat16 result ``[M, N]``.
 
 Backends:
-    - ``backend="cake"``: exact source-built SM100 implementation for four-rank
-      NCCL groups (one fused kernel per call; see
-      :mod:`.cake_fp8_rowwise_gemm_allreduce`).
+    - ``backend="cake"``: exact source-built implementation for the NCCL group
+      world sizes and architectures recorded in the loader's route tables (one
+      fused kernel per call; see :mod:`.cake_fp8_rowwise_gemm_allreduce`).
     - ``backend="auto"``: the Cake backend (the only implementation).
 """
 
@@ -51,9 +51,10 @@ def fp8_rowwise_gemm_allreduce(
 ) -> torch.Tensor:
     """Fused row-wise FP8 GEMM + all-reduce over ``group``.
 
-    ``backend="cake"`` selects the exact source-built SM100 fused kernel for
-    four-rank NCCL groups; ``backend="auto"`` selects the same route (no other
-    implementation exists). Unsupported inputs raise instead of falling back.
+    ``backend="cake"`` selects the exact source-built fused kernel delivered for
+    the device's architecture and the group's world size; ``backend="auto"``
+    selects the same route (no other implementation exists). Unsupported
+    inputs raise instead of falling back.
 
     Parameters
     ----------
@@ -68,7 +69,8 @@ def fp8_rowwise_gemm_allreduce(
     w_scale : torch.Tensor
         Contiguous FP32 column scales of shape ``[N]``.
     group : torch.distributed.ProcessGroup
-        Four-rank NCCL process group on one SM100 node.
+        NCCL process group on one node whose world size has a delivered
+        route on the device's architecture.
     backend : str, optional
         ``"auto"`` and ``"cake"`` both select the Cake backend.
     out : torch.Tensor, optional
@@ -116,10 +118,10 @@ def prepare_fp8_rowwise_gemm_allreduce(
     ``launcher(a, a_scale, w, w_scale, *, out=None)`` serves any
     operands of the bound ``N`` and ``K_l`` with at most ``max_rows`` rows
     without another collective and is CUDA-graph capturable. Both
-    ``backend="auto"`` and ``backend="cake"`` select the Cake route (SM100,
-    four-rank NCCL groups, torch's default CUDA or NVSHMEM symmetric-memory
-    backend). Unsupported inputs raise during preparation instead of falling
-    back to another implementation.
+    ``backend="auto"`` and ``backend="cake"`` select the Cake route (the
+    delivered architectures and NCCL group world sizes, torch's default CUDA
+    or NVSHMEM symmetric-memory backend). Unsupported inputs raise during
+    preparation instead of falling back to another implementation.
 
     Parameters
     ----------
@@ -134,7 +136,8 @@ def prepare_fp8_rowwise_gemm_allreduce(
     w_scale : torch.Tensor
         Sample contiguous FP32 column scales of shape ``[N]``.
     group : torch.distributed.ProcessGroup
-        Four-rank NCCL process group on one SM100 node.
+        NCCL process group on one node whose world size has a delivered
+        route on the device's architecture.
     backend : str, optional
         ``"auto"`` and ``"cake"`` both select the Cake backend.
     max_rows : int, optional

@@ -354,3 +354,23 @@ def test_auto_unfinalized(kind, early, monkeypatch):
             monkeypatch,
             autotune=True,
         )
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.gpu_2
+def test_auto_nvfp4_n64_persistence_and_capture(
+    blackwell_bootstrap, monkeypatch, tmp_path
+):
+    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+        tuning_protocol,
+    )
+
+    original = tuning_protocol.sm100_standard_candidates
+
+    def only_n64(config, **kwargs):
+        return [k for k in original(config, **kwargs) if k["mma_tiler_mnk"][1] == 64]
+
+    monkeypatch.setattr(tuning_protocol, "sm100_standard_candidates", only_n64)
+    test_auto_persistence_and_capture(
+        "nvfp4", "inference", "native", blackwell_bootstrap, monkeypatch, tmp_path
+    )

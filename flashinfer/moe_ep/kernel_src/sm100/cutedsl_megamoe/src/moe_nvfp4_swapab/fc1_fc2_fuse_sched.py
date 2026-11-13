@@ -810,18 +810,20 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                 self.params.cluster_shape_mn[0] * self.params.cluster_shape_mn[1]
             )
 
-            # Cluster-wide broadcast pipeline for the leader CTA's atom.add.
-            self._cluster_pipeline = pipeline.PipelineAsync.create(
-                num_stages=1,
-                producer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, 1
-                ),
-                consumer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, 32 * cluster_size
-                ),
-                barrier_storage=self._sched_storage.cluster_pipeline_mbar.data_ptr(),
-                defer_sync=True,
-            )
+            # A singleton cluster keeps the claim in scheduler-warp registers.
+            # Only multi-CTA clusters need the DSMEM broadcast pipeline.
+            if const_expr(cluster_size > 1):
+                self._cluster_pipeline = pipeline.PipelineAsync.create(
+                    num_stages=1,
+                    producer_group=pipeline.CooperativeGroup(
+                        pipeline.Agent.Thread, 1
+                    ),
+                    consumer_group=pipeline.CooperativeGroup(
+                        pipeline.Agent.Thread, 32 * cluster_size
+                    ),
+                    barrier_storage=self._sched_storage.cluster_pipeline_mbar.data_ptr(),
+                    defer_sync=True,
+                )
 
             # Pre-claim and broadcast first dynamic tile id.
             if warp_idx == sched_warp_id:
@@ -916,75 +918,98 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             lane 0 issues a fresh ``atom.global.add.s32`` and shuffles the
             result across the sched warp.
 
-        Cluster-internal protocol (DSMEM broadcast + cluster_pipeline mbar
-        wait) is identical between the two paths.  Mirrors
+        A singleton cluster uses the scheduler warp's register broadcast;
+        publish_work subsequently passes the decoded work to the other warps
+        through the ordinary CTA pipeline. Multi-CTA clusters retain the
+        DSMEM broadcast + cluster_pipeline mbar wait protocol. Mirrors
         ``cute_dsl_kernel_library/dsl_kernels/moe/moe_persistent_scheduler.py``
         ``_fetch_next_cluster_idx`` (lines 838-894).
         """
         ds = self._dynamic_state
-        cluster_pipeline = self._cluster_pipeline
-        broadcast_tensor = cute.make_tensor(
-            ds.broadcast_ptr, cute.make_layout((1,))
-        )
         cluster_size = (
             self.params.cluster_shape_mn[0] * self.params.cluster_shape_mn[1]
         )
-
-        # --- Producer side (leader CTA only) ---
-        if ds.is_leader_cta:
-            cluster_pipeline.producer_acquire(ds.producer_state)
-            full_barrier_ptr = cluster_pipeline.sync_object_full.get_barrier(
-                ds.producer_state.index, loc=loc, ip=ip
-            )
-            tidx, _, _ = cute.arch.thread_idx(loc=loc, ip=ip)
-            lane_idx = tidx % Int32(32)
-
+        if const_expr(cluster_size == 1):
+            # st.async.shared::cluster requires multiple CTAs even when its
+            # destination rank is zero. All callers are the scheduler warp;
+            # the cached first claim is already warp-uniform, and later
+            # claims need only a lane-0 atomic followed by register shuffle.
             if cutlass.const_expr(self._first_advance_pending):
-                # First-tile path: consume the cached atomic_res that
-                # internal_init shuffled across the sched warp.
-                atomic_idx = ds.atomic_res
+                cluster_idx = ds.atomic_res
             else:
-                # Vanilla path: lane 0 atom.add, shuffle to all lanes.
-                atomic_idx = Int32(0)
-                if lane_idx == Int32(0):
-                    atomic_idx = cute.arch.atomic_add(
+                tidx, _, _ = cute.arch.thread_idx(loc=loc, ip=ip)
+                cluster_idx = Int32(0)
+                if tidx % Int32(32) == Int32(0):
+                    cluster_idx = cute.arch.atomic_add(
                         ds.counter_ptr, Int32(1), loc=loc, ip=ip,
                     )
-                atomic_idx = cute.arch.shuffle_sync(
-                    atomic_idx,
+                cluster_idx = cute.arch.shuffle_sync(
+                    cluster_idx,
                     offset=0,
                     mask=0xFFFFFFFF,
                     mask_and_clamp=31,
                 )
+        else:
+            cluster_pipeline = self._cluster_pipeline
+            broadcast_tensor = cute.make_tensor(
+                ds.broadcast_ptr, cute.make_layout((1,))
+            )
 
-            # DSMEM fan-out: lanes [0, cluster_size) each write to one peer
-            # CTA.  Each lane targets a distinct peer (lane_idx == peer rank).
-            if lane_idx < Int32(cluster_size):
-                store_i32_to_peer_cluster_smem_async(
-                    ds.broadcast_ptr,
-                    atomic_idx,
-                    full_barrier_ptr,
-                    lane_idx,
-                    loc=loc, ip=ip,
+            # --- Producer side (leader CTA only) ---
+            if ds.is_leader_cta:
+                cluster_pipeline.producer_acquire(ds.producer_state)
+                full_barrier_ptr = cluster_pipeline.sync_object_full.get_barrier(
+                    ds.producer_state.index, loc=loc, ip=ip
                 )
-                # Set expect_tx on the peer mbarrier to match the 4-byte
-                # store above; pairs with the consumer_wait below.
-                mbarrier_arrive_expect_tx_on_peer(
-                    full_barrier_ptr,
-                    Int32(4),
-                    lane_idx,
-                    loc=loc, ip=ip,
-                )
-        ds.producer_state.advance()
+                tidx, _, _ = cute.arch.thread_idx(loc=loc, ip=ip)
+                lane_idx = tidx % Int32(32)
 
-        # --- Consumer side (all CTAs sched warp threads) ---
-        cluster_pipeline.consumer_wait(ds.consumer_state)
-        cluster_idx = broadcast_tensor[0]
-        cute.arch.fence_acq_rel_cta()
-        cluster_pipeline.sync_object_empty.arrive(
-            ds.consumer_state.index, Int32(0)
-        )
-        ds.consumer_state.advance()
+                if cutlass.const_expr(self._first_advance_pending):
+                    # First-tile path: consume the cached atomic_res that
+                    # internal_init shuffled across the sched warp.
+                    atomic_idx = ds.atomic_res
+                else:
+                    # Vanilla path: lane 0 atom.add, shuffle to all lanes.
+                    atomic_idx = Int32(0)
+                    if lane_idx == Int32(0):
+                        atomic_idx = cute.arch.atomic_add(
+                            ds.counter_ptr, Int32(1), loc=loc, ip=ip,
+                        )
+                    atomic_idx = cute.arch.shuffle_sync(
+                        atomic_idx,
+                        offset=0,
+                        mask=0xFFFFFFFF,
+                        mask_and_clamp=31,
+                    )
+
+                # DSMEM fan-out: lanes [0, cluster_size) each write to one peer
+                # CTA.  Each lane targets a distinct peer (lane_idx == peer rank).
+                if lane_idx < Int32(cluster_size):
+                    store_i32_to_peer_cluster_smem_async(
+                        ds.broadcast_ptr,
+                        atomic_idx,
+                        full_barrier_ptr,
+                        lane_idx,
+                        loc=loc, ip=ip,
+                    )
+                    # Set expect_tx on the peer mbarrier to match the 4-byte
+                    # store above; pairs with the consumer_wait below.
+                    mbarrier_arrive_expect_tx_on_peer(
+                        full_barrier_ptr,
+                        Int32(4),
+                        lane_idx,
+                        loc=loc, ip=ip,
+                    )
+            ds.producer_state.advance()
+
+            # --- Consumer side (all CTAs sched warp threads) ---
+            cluster_pipeline.consumer_wait(ds.consumer_state)
+            cluster_idx = broadcast_tensor[0]
+            cute.arch.fence_acq_rel_cta()
+            cluster_pipeline.sync_object_empty.arrive(
+                ds.consumer_state.index, Int32(0)
+            )
+            ds.consumer_state.advance()
 
         return cluster_idx
 

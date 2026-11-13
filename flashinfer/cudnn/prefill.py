@@ -3,7 +3,7 @@ import functools
 import os
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
@@ -43,60 +43,72 @@ _CUDNN_NATIVE_HN_SUPPORTED = bool(
 
 @functools.cache
 def _cudnn_supports_direct_seqlens(dtype: torch.dtype, *, mixed: bool = False) -> bool:
-    """True if cuDNN can consume token-unit indptr buffers directly for `dtype`.
+    """Whether the backend supports token-unit offsets for this graph.
 
-    Requires cu_seq_len_q/kv SDPA inputs and per-tensor ragged-offset
-    multipliers on the unified SDPA engine (forward only):
-    - fp16/bf16: cuDNN backend 9.24+ with cudnn-frontend 1.25+
-    - fp8 (e4m3/e5m2): cuDNN backend 9.25+ with cudnn-frontend 1.27+ (the first
-      release whose sdpa_fp8 python binding exposes cu_seq_len_q/kv)
-
-    `mixed=True` additionally requires *mixed-form* sequence lengths (cu_seq_len
-    on one side, per-batch on the other). This is the paged path, which pairs a
-    token-unit cu_seq_len_q with an actual-length seq_len_kv (KV addressed via
-    the page table). It needs cuDNN backend 9.25+ and a cudnn-frontend carrying
-    the per-side relaxation (frontend PR #430; released in 1.27+).
-
-    Note: this is a pure version compare against the runtime backend and the FE
-    package version (the practical proxy for the FE's compiled-against cuDNN).
-    The FE exposes no compiled/effective-version query, so a feature-probe with
-    NOT_SUPPORTED fallback is left as a follow-up.
+    FlashInfer's FE >=1.32 floor supplies the cumulative-length inputs and
+    ragged-offset multipliers. The backend still needs 9.24 for fp16/bf16,
+    or 9.25 for FP8 and mixed cumulative/per-batch mask lengths.
     """
     if not CUDNN_AVAILABLE:
         return False
-    if mixed or (dtype in (torch.float8_e4m3fn, torch.float8_e5m2)):
-        min_backend, min_frontend = 92500, (1, 27)
+    if mixed or dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        min_backend = 92500
     elif dtype in (torch.float16, torch.bfloat16):
-        min_backend, min_frontend = 92400, (1, 25)
+        min_backend = 92400
     else:
         return False
     try:
-        if cudnn.backend_version() < min_backend:
-            return False
-        major, minor = map(int, cudnn.__version__.split(".")[:2])
-        return (major, minor) >= min_frontend
+        return cudnn.backend_version() >= min_backend
     except Exception:
         return False
 
 
+def _cudnn_supports_paged_token_offsets(
+    dtype: torch.dtype, *, explicit_q: bool, explicit_kv: bool
+) -> bool:
+    """Paged plans with both explicit lengths need no mixed-form API.
+
+    The wrapper already stages per-request Q and KV lengths in plan(). On
+    cuDNN 9.24, their mask lengths can accompany token-unit physical origins
+    through ragged-offset multipliers. A cumulative/mixed mask still needs
+    9.25, as does FP8. This capability is shared by backend and FROST plans.
+    """
+    return _cudnn_supports_direct_seqlens(dtype, mixed=not (explicit_q and explicit_kv))
+
+
 @functools.cache
 def _cudnn_supports_paged_auto() -> bool:
-    """The qualified paged prefill selection requires FE 1.32 / cuDNN 9.27."""
+    """The qualified paged prefill selection requires FE 1.32 / cuDNN 9.24."""
     if not CUDNN_AVAILABLE:
+        return False
+    try:
+        binder = getattr(getattr(cudnn, "_pybind_module", None), "_SdpaThdBinder", None)
+        return (
+            cudnn_frontend_frost_runtime_available()
+            and cudnn.backend_version() >= 92400
+            and bool(getattr(binder, "supports_paged_packed_split", False))
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+@functools.cache
+def _cudnn_supports_paged_gqa_auto(head_dim: int) -> bool:
+    """D256 needs FE 1.33 placement and matching native split origins."""
+    if head_dim != 256 or not _cudnn_supports_paged_auto():
         return False
     try:
         from packaging.version import Version
 
-        # FE 1.31 still excludes shape overrides from paged split selection.
-        # The floor must include the bounded-paged selector fixes; native
-        # support alone is insufficient. Prereleases stay below that floor.
-        version = Version(cudnn.__version__)
         binder = getattr(getattr(cudnn, "_pybind_module", None), "_SdpaThdBinder", None)
         return (
-            version >= Version("1.32.0")
-            and cudnn_frontend_frost_runtime_available()
-            and cudnn.backend_version() >= 92700
-            and bool(getattr(binder, "supports_paged_packed_split", False))
+            Version(cudnn.__version__) >= Version("1.33.0")
+            and bool(getattr(binder, f"supports_paged_d{head_dim}_packed_split", False))
+            and bool(
+                getattr(
+                    binder, f"supports_paged_d{head_dim}_split_physical_origins", False
+                )
+            )
         )
     except (AttributeError, TypeError, ValueError):
         return False
@@ -134,15 +146,11 @@ def _cudnn_single_token_gqa_ragged_stats_broken() -> bool:
 
 @functools.cache
 def _cudnn_version_supports_shape_override() -> bool:
-    """SDPA shape override needs the unified engine's support (cuDNN 9.22+) and a
-    cudnn-frontend whose pygraph takes is_override_shape_enabled (1.29+)."""
+    """The supported FE supplies shape overrides; the backend needs 9.22+."""
     if not CUDNN_AVAILABLE:
         return False
     try:
-        if cudnn.backend_version() < 92200:
-            return False
-        major, minor = map(int, cudnn.__version__.split(".")[:2])
-        return (major, minor) >= (1, 29)
+        return cudnn.backend_version() >= 92200
     except Exception:
         return False
 
@@ -153,9 +161,8 @@ def _cudnn_supports_bounded_ragged(*, d128: bool = False) -> bool:
     if not CUDNN_AVAILABLE:
         return False
     try:
-        version = tuple(map(int, cudnn.__version__.split(".")[:2]))
         binder = getattr(getattr(cudnn, "_pybind_module", None), "_SdpaThdBinder", None)
-        return version >= (1, 31) and bool(
+        return bool(
             getattr(
                 binder,
                 "supports_nonpaged_d128_packed_split"
@@ -286,8 +293,27 @@ class UIDs(Enum):
     O_SCALE_UID = 155  # Output scale tensor
     ATTN_SCALE_UID = 156  # Runtime half-precision Q/K calibration
 
+    SINK_TOKEN_UID = 170  # Per-head attention sink logits
+
     S_AMAX_UID = 160  # Scale amax tensor
     O_AMAX_UID = 161  # Output amax tensor
+
+
+def _validate_prefill_sinks(q, sinks):
+    if sinks is None:
+        return
+    if (
+        sinks.dim() != 1
+        or sinks.shape[0] != q.shape[1]
+        or sinks.dtype != torch.float32
+        or sinks.device != q.device
+        or not sinks.is_contiguous()
+    ):
+        raise ValueError(
+            f"sinks must be a contiguous float32 tensor of shape (num_heads_qo,) = "
+            f"({q.shape[1]},) on {q.device}, got shape {tuple(sinks.shape)} "
+            f"with dtype {sinks.dtype}, device {sinks.device}, and stride {sinks.stride()}"
+        )
 
 
 def _prefill_runtime_key(q, k_cache, v_cache, scale, o_data_type):
@@ -333,6 +359,8 @@ def _prefill_descriptor_key(
     override_cache: Optional[tuple[int, int, int]] = None,
     max_total_num_rows: Optional[int] = None,
     token_offsets: bool = False,
+    window_left: Optional[int] = None,
+    sinks: Optional[torch.Tensor] = None,
 ):
     if actual_seq_lens_q is not None:
         graph_b = actual_seq_lens_q.shape[0]
@@ -368,6 +396,9 @@ def _prefill_descriptor_key(
             )
         ),
         token_offsets or cu_seq_lens_q is not None,
+        window_left,
+        # Validation fixes dtype/stride; Q's runtime key fixes the head count.
+        sinks is not None,
     )
     key = (core, (return_lse, layout(batch_offsets_stats) if return_lse else None))
     return (
@@ -393,7 +424,18 @@ def _prefill_graph_total_q(override_cache, max_total_num_rows):
 
 def _prefill_override_descriptor_key(key, override_cache):
     core, (return_lse, stats) = key
-    shape, causal, _, table, seq_q, seq_kv, offsets, token_offsets = core
+    (
+        shape,
+        causal,
+        _,
+        table,
+        seq_q,
+        seq_kv,
+        offsets,
+        token_offsets,
+        window_left,
+        has_sinks,
+    ) = core
     total_q = _prefill_graph_total_q(override_cache, shape[3])
 
     def indptr_layout(layout):
@@ -412,6 +454,8 @@ def _prefill_override_descriptor_key(key, override_cache):
             seq_kv,
             tuple(indptr_layout(t) for t in offsets),
             token_offsets,
+            window_left,
+            has_sinks,
         ),
         (return_lse, indptr_layout(stats)),
     )
@@ -486,6 +530,8 @@ if CUDNN_AVAILABLE:
         stats_use_log2: bool = False,
         workspace_limit: Optional[int] = None,
         token_offsets: bool = False,
+        window_left: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
         global _prefill_graph_builds
         _prefill_graph_builds += 1
@@ -761,11 +807,8 @@ if CUDNN_AVAILABLE:
                 cudnn_cu_seq_lens_q.set_uid(UIDs.ACTUAL_SEQ_LENS_Q_UID.value)
 
                 padding_mask = True
-                # These kwargs postdate cudnn-frontend 1.13 (cu_seq_len_*:
-                # 1.25+; implementation / attention_implementation: 1.14+). The
-                # declared >=1.30 floor covers both, but the runtime cuDNN
-                # backend version still gates this path, so they stay confined
-                # to it, which _cudnn_supports_direct_seqlens guards.
+                # The runtime backend gates cumulative masks even though
+                # every supported FE accepts these graph arguments.
                 seq_len_kwargs = {
                     "cu_seq_len_q": cudnn_cu_seq_lens_q,
                     # cu_seq_lens are unified-engine-only; pin the
@@ -821,6 +864,40 @@ if CUDNN_AVAILABLE:
                         cudnn.attention_implementation.UNIFIED
                     )
 
+            # Sliding window. The two libraries count the band differently and
+            # the conversion was measured, not assumed: FlashInfer's
+            # `window_left = W` admits keys in [p - W, p] for a query at
+            # absolute position p, i.e. W + 1 tokens including the diagonal,
+            # while cuDNN's `diagonal_band_left_bound = L` admits L tokens
+            # including the diagonal ([p - (L - 1), p]). Passing W through
+            # unchanged drops the oldest key of every window. `-1` (disabled)
+            # is normalised to None upstream.
+            mask_kwargs = {}
+            if window_left is not None:
+                # sdpa_fp8 exposes the same band as `left_bound`.
+                window_key = (
+                    "left_bound"
+                    if cudnn_q_data_type
+                    in (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
+                    else "diagonal_band_left_bound"
+                )
+                mask_kwargs[window_key] = window_left + 1
+                mask_kwargs["diagonal_alignment"] = (
+                    cudnn.diagonal_alignment.BOTTOM_RIGHT
+                )
+
+            # Attention sinks: one extra logit per head that joins the softmax
+            # denominator without contributing a value row.
+            if sinks is not None:
+                cudnn_sinks = g.tensor(
+                    name="sink_token",
+                    dim=(1, sinks.shape[0], 1, 1),
+                    stride=(sinks.shape[0], 1, 1, 1),
+                    data_type=cudnn.datatypes._torch_to_cudnn_data_type(sinks.dtype),
+                )
+                cudnn_sinks.set_uid(UIDs.SINK_TOKEN_UID.value)
+                mask_kwargs["sink_token"] = cudnn_sinks
+
             if (
                 cudnn_q_data_type == cudnn.data_type.BFLOAT16
                 or cudnn_q_data_type == cudnn.data_type.HALF
@@ -843,6 +920,7 @@ if CUDNN_AVAILABLE:
                     generate_stats=return_lse,
                     **({"stats_use_log2": True} if stats_use_log2 else {}),
                     use_causal_mask_bottom_right=bottom_right_causal_mask,
+                    **mask_kwargs,
                     paged_attention_k_table=(
                         cudnn_k_block_tables if block_tables is not None else None
                     ),
@@ -880,8 +958,7 @@ if CUDNN_AVAILABLE:
                     attn_scale=scale,
                     use_causal_mask_bottom_right=bottom_right_causal_mask,
                     use_padding_mask=padding_mask,
-                    # cu_seq_len kwargs (direct path) exist on sdpa_fp8 only in
-                    # cudnn-frontend 1.27+; the version gate guarantees that.
+                    **mask_kwargs,
                     **seq_len_kwargs,
                     paged_attention_k_table=(
                         cudnn_k_block_tables if block_tables is not None else None
@@ -1100,6 +1177,8 @@ class _PrefillMetadata:
     k_scale: Optional[torch.Tensor] = None
     v_scale: Optional[torch.Tensor] = None
     attn_scale: Optional[torch.Tensor] = None
+    window_left: Optional[int] = None
+    sinks: Optional[torch.Tensor] = None
 
     # Only a wrapper-enforced lifetime capacity is safe here. A live total is
     # insufficient: captured graphs can outlive later plan() calls.
@@ -1174,7 +1253,15 @@ class _PrefillMetadata:
             self.batch_offsets_v = self.batch_offsets_k
         paged = self.block_tables is not None
         direct = (
-            _cudnn_supports_direct_seqlens(q_dtype, mixed=paged)
+            (
+                _cudnn_supports_paged_token_offsets(
+                    q_dtype,
+                    explicit_q=self.actual_seq_lens_q is not None,
+                    explicit_kv=self.actual_seq_lens_kv is not None,
+                )
+                if paged
+                else _cudnn_supports_direct_seqlens(q_dtype)
+            )
             and self.batch_offsets_q is not None
             and (
                 self.actual_seq_lens_kv is not None
@@ -1358,12 +1445,16 @@ class _PrefillMetadata:
             batch_offsets_stats=self.batch_offsets_stats,
             o_data_type=self.o_data_type,
             token_offsets=self._token_offsets,
+            window_left=self.window_left,
+            sinks=self.sinks,
         )
 
 
 def _prefill_plan_bindings(metadata, dtype, device):
     """Bindings whose layout and ownership are fixed by a plan."""
     var_map = {}
+    if metadata.sinks is not None:
+        var_map[UIDs.SINK_TOKEN_UID.value] = metadata.sinks
     if metadata.attn_scale is not None:
         var_map[UIDs.ATTN_SCALE_UID.value] = metadata.attn_scale
     # The cumulative seq lens feed the padding mask via the seq-lens UID
@@ -1442,6 +1533,7 @@ class _CudnnPrefillPlan:
         "batch_offsets_k",
         "batch_offsets_v",
         "batch_offsets_stats",
+        "sinks",
     )
 
     @classmethod
@@ -1457,6 +1549,7 @@ class _CudnnPrefillPlan:
             and previous.metadata._bounded_ragged == metadata._bounded_ragged
             and previous.metadata._bounded_paged == metadata._bounded_paged
             and previous.metadata._token_offsets == metadata._token_offsets
+            and previous.metadata.window_left == metadata.window_left
             and previous.exact_keys[True][0][0][1:]
             == (
                 metadata.max_token_per_sequence,
@@ -1681,6 +1774,7 @@ class CudnnPrefillGraph:
     def run_planned(
         self, q, k_cache, v_cache, out, lse, workspace_buffer, *, plan, lse_base="log2"
     ):
+        _validate_prefill_sinks(q, plan.metadata.sinks)
         device = plan.device
         if any(
             t.device != device for t in (q, k_cache, v_cache, out, workspace_buffer)
@@ -1765,6 +1859,7 @@ class CudnnPrefillGraph:
         metadata: _PrefillMetadata,
         lse_base: str = "log2",
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        _validate_prefill_sinks(q, metadata.sinks)
         device = q.device
         var_map = _prefill_plan_bindings(metadata, q.dtype, device)
         var_map.update(
@@ -1908,6 +2003,7 @@ def prepare_cudnn_batch_prefill(
     The public low-level entry point instead calls :meth:`CudnnPrefillGraph.run`
     with metadata resolved for that call.
     """
+    _validate_prefill_sinks(q, metadata.sinks)
     override_cache = metadata.override_shape(q, k_cache)
     workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
 
@@ -2040,9 +2136,9 @@ def cudnn_batch_prefill_with_kv_cache(
     block_tables: Optional[torch.Tensor] = None,
     causal: bool,
     return_lse: bool,
-    q_scale: Optional[torch.Tensor] = None,
-    k_scale: Optional[torch.Tensor] = None,
-    v_scale: Optional[torch.Tensor] = None,
+    q_scale: Optional[Union[float, torch.Tensor]] = None,
+    k_scale: Optional[Union[float, torch.Tensor]] = None,
+    v_scale: Optional[Union[float, torch.Tensor]] = None,
     batch_offsets_q: Optional[torch.Tensor] = None,
     batch_offsets_o: Optional[torch.Tensor] = None,
     batch_offsets_k: Optional[torch.Tensor] = None,
@@ -2055,6 +2151,8 @@ def cudnn_batch_prefill_with_kv_cache(
     backend: Optional[str] = None,
     o_data_type: Optional[torch.dtype] = None,
     lse_base: str = "log2",
+    window_left: Optional[int] = None,
+    sinks: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Batched prefill attention with paged KV cache, backed by cuDNN SDPA.
 
@@ -2147,8 +2245,8 @@ def cudnn_batch_prefill_with_kv_cache(
         ``"tokens"``: offsets are plain token-unit prefix sums
         (``qo_indptr``/``kv_indptr`` style, the FlashInfer convention). For
         non-paged KV, token-unit indptrs are consumed directly by the kernel
-        with no conversion pre-pass on cuDNN backend 9.24+ with cudnn-frontend
-        1.25+ (fp16/bf16) or backend 9.25+ with cudnn-frontend 1.27+ (fp8);
+        with no conversion pre-pass on cuDNN backend 9.24+ (fp16/bf16)
+        or backend 9.25+ (fp8);
         otherwise FlashInfer scales them to element units internally.
     out : Optional[torch.Tensor]
         Pre-allocated contiguous output tensor on ``q``'s device, shape
@@ -2166,13 +2264,23 @@ def cudnn_batch_prefill_with_kv_cache(
         Whether to plan the operation in a CUDA-graph-capture-safe mode.
     backend : Optional[str]
         Optional cuDNN backend selector (e.g. ``"cubin"``).  When ``None``,
-        autodetects based on cuDNN availability.
+        autodetects based on cuDNN availability. Sliding windows and attention
+        sinks require the cuDNN graph backend; the cubin backend rejects them.
     o_data_type : Optional[torch.dtype]
         Optional output dtype; defaults to ``q.dtype``.
     lse_base : str
         ``"log2"`` (default): return the LSE in base 2 like every other FlashInfer
         backend. ``"ln"``: return cuDNN's native natural-log stats, skipping the
         conversion kernel.
+    window_left : Optional[int]
+        Left window size for the cuDNN graph path. Keys before ``p - window_left``
+        are masked, where ``p`` is the query's bottom-right-aligned position in
+        the KV sequence. Causality independently masks keys after ``p``.
+        ``None`` disables the left window.
+    sinks : Optional[torch.Tensor]
+        Per-query-head attention sink logits for the cuDNN graph path. Must be
+        a contiguous float32 tensor of shape ``(num_heads_qo,)`` on ``q``'s
+        device. Noncontiguous tensors are rejected without copying.
 
     Returns
     -------
@@ -2230,6 +2338,11 @@ def cudnn_batch_prefill_with_kv_cache(
         d_vo = v_cache.shape[3]
 
     use_cudnn_graph = CUDNN_AVAILABLE and backend != "cubin"
+    if not use_cudnn_graph and (window_left is not None or sinks is not None):
+        raise NotImplementedError(
+            "sliding windows and attention sinks require the cuDNN graph backend; "
+            "the cubin backend does not support them"
+        )
 
     # The LSE is packed (total_qo_tokens, h_qo) -- FlashInfer's convention, the
     # shape every other backend returns and the wrappers allocate -- unless the
@@ -2362,6 +2475,8 @@ def cudnn_batch_prefill_with_kv_cache(
             k_scale=k_scale,
             v_scale=v_scale,
             attn_scale=scale if isinstance(scale, torch.Tensor) else None,
+            window_left=window_left,
+            sinks=sinks,
             o_data_type=o_data_type,
             batch_offsets_q=batch_offsets_q,
             batch_offsets_o=batch_offsets_o,

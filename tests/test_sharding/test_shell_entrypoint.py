@@ -13,6 +13,14 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _copy_entrypoint(entrypoint: Path) -> None:
+    shutil.copy(REPO_ROOT / "scripts" / "task_run_unit_tests.sh", entrypoint)
+    # These fixtures isolate runner behavior from optional telemetry.
+    (entrypoint.parent / "test_resource_monitor.sh").write_text(
+        "start_resource_monitor() { :; }\nstop_resource_monitor() { :; }\n"
+    )
+
+
 def test_pytest_timeout_plugin_enforces_marked_deadline(tmp_path: Path) -> None:
     test_file = tmp_path / "test_timeout.py"
     test_file.write_text(
@@ -184,7 +192,7 @@ def test_shell_maps_runner_codes_and_leaves_summary_last(
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     entrypoint = scripts / "task_run_unit_tests.sh"
-    shutil.copy(REPO_ROOT / "scripts" / "task_run_unit_tests.sh", entrypoint)
+    _copy_entrypoint(entrypoint)
     (scripts / "test_utils.sh").write_text("", encoding="utf-8")
     (scripts / "unit_test_runner.py").write_text(
         """\
@@ -228,7 +236,7 @@ def test_shell_start_time_cannot_be_overridden_by_caller(tmp_path: Path) -> None
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     entrypoint = scripts / "task_run_unit_tests.sh"
-    shutil.copy(REPO_ROOT / "scripts" / "task_run_unit_tests.sh", entrypoint)
+    _copy_entrypoint(entrypoint)
     (scripts / "test_utils.sh").write_text("", encoding="utf-8")
     (scripts / "unit_test_runner.py").write_text(
         """\
@@ -274,7 +282,7 @@ def test_shell_prints_fallback_summary_for_argument_preflight_error(
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     entrypoint = scripts / "task_run_unit_tests.sh"
-    shutil.copy(REPO_ROOT / "scripts" / "task_run_unit_tests.sh", entrypoint)
+    _copy_entrypoint(entrypoint)
     (scripts / "test_utils.sh").write_text("", encoding="utf-8")
     (scripts / "unit_test_runner.py").write_text(
         "import sys\nprint('ERROR: bad option')\nraise SystemExit(3)\n",
@@ -306,7 +314,7 @@ def test_shell_prints_fallback_summary_for_dependency_setup_failure(
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     entrypoint = scripts / "task_run_unit_tests.sh"
-    shutil.copy(REPO_ROOT / "scripts" / "task_run_unit_tests.sh", entrypoint)
+    _copy_entrypoint(entrypoint)
     (scripts / "test_utils.sh").write_text(
         "install_and_verify() { return 17; }\n", encoding="utf-8"
     )
@@ -348,9 +356,11 @@ def _stage_cuda13_entrypoint(
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     entrypoint = scripts / "task_run_unit_tests.sh"
-    shutil.copy(REPO_ROOT / "scripts" / "task_run_unit_tests.sh", entrypoint)
+    _copy_entrypoint(entrypoint)
     (scripts / "test_utils.sh").write_text("install_and_verify() { :; }\n")
-    (scripts / "setup_test_env.sh").write_text("")
+    shutil.copy(REPO_ROOT / "scripts" / "setup_test_env.sh", scripts)
+    (scripts / "install_cutlass_dsl.sh").write_text("exit 0\n")
+    (scripts / "check_requirements.py").write_text("raise SystemExit(0)\n")
     (scripts / "unit_test_runner.py").write_text(
         "import os, sys\n"
         "if sys.argv[1] == '__shell-settings':\n"
@@ -369,11 +379,15 @@ def _stage_cuda13_entrypoint(
     (modules / "nvshmem" / "core.py").write_text("")
     (modules / "torch.py").write_text(
         "from types import SimpleNamespace\nversion = SimpleNamespace(cuda='13.0')\n"
+        "cuda = SimpleNamespace(get_device_capability=lambda: (10, 7))\n"
     )
     env = os.environ.copy()
+    env.pop("TVM_FFI_REF", None)
+    env.pop("CUTLASS_DSL_VERSION", None)
     env.update(
         PYTHONPATH=str(modules),
         PATH=f"{Path(sys.executable).parent}{os.pathsep}{env['PATH']}",
+        PIP_CONSTRAINT=os.devnull,
     )
     return entrypoint, env, modules / "nvidia" / "nccl" / "lib"
 
@@ -453,7 +467,7 @@ def test_shell_preserves_abnormal_runner_exit_and_prints_fallback_summary(
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     entrypoint = scripts / "task_run_unit_tests.sh"
-    shutil.copy(REPO_ROOT / "scripts" / "task_run_unit_tests.sh", entrypoint)
+    _copy_entrypoint(entrypoint)
     (scripts / "test_utils.sh").write_text("", encoding="utf-8")
     (scripts / "unit_test_runner.py").write_text(
         "import sys\n"
@@ -481,7 +495,7 @@ def test_shell_prints_fallback_summary_for_catchable_signal(tmp_path: Path) -> N
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     entrypoint = scripts / "task_run_unit_tests.sh"
-    shutil.copy(REPO_ROOT / "scripts" / "task_run_unit_tests.sh", entrypoint)
+    _copy_entrypoint(entrypoint)
     (scripts / "test_utils.sh").write_text("", encoding="utf-8")
     (scripts / "unit_test_runner.py").write_text(
         "import sys, time\n"

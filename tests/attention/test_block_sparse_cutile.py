@@ -7,7 +7,10 @@ import pytest
 
 from flashinfer.cutile.cutile_common import is_cuda_tile_available
 from tests.attention.test_block_sparse import _run_block_sparse_attention_case
-from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
+from tests.infra.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
 
 if not is_cuda_tile_available():
     pytest.skip("cuda.tile not available", allow_module_level=True)

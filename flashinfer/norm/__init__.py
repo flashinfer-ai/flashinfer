@@ -58,6 +58,12 @@ from ..utils import (
 # Always import gen_norm_module for JIT warmup and CUDA fallback
 from ..jit.norm import gen_norm_module
 
+# Import DSL arch probe for mixed-architecture compatibility check
+try:
+    from ..cute_dsl.availability import _dsl_captured_arch
+except ImportError:
+    _dsl_captured_arch = None
+
 # Use CUDA JIT implementation instead of CuTe DSL (for debugging/fallback)
 # Also fallback to CUDA JIT if nvidia-cutlass-dsl is not installed
 _USE_CUDA_NORM = os.environ.get("FLASHINFER_USE_CUDA_NORM", "0") == "1"
@@ -140,19 +146,125 @@ def _cute_dsl_supports_arch(major: int, minor: int) -> bool:
         return True
 
 
-def _use_cuda_norm(device: torch.device) -> bool:
-    """Return ``True`` when the CUDA JIT norm kernels should be used instead
-    of the CuTe DSL ones.
+def _is_arch_compatible(captured_arch: str, device_cap: tuple[int, int]) -> bool:
+    """Check if a captured CUDA architecture can run on a target device using
+    CUDA binary compatibility rules.
 
-    Besides the explicit ``FLASHINFER_USE_CUDA_NORM`` opt-in, this covers
-    devices whose architecture the installed CuTe DSL cannot target (e.g.
-    Rubin/sm_107 against a DSL without ``sm_107a``, unless
-    ``CUTE_DSL_ARCH=sm_100f`` was exported before the process started).
-    The CUDA JIT kernels are functionally equivalent, so norm falls back
-    instead of raising like the DSL-only kernels do."""
+    CUDA binary compatibility: a cubin compiled for sm_X.Y can run on sm_X.Z
+    when Z >= Y (forward compatibility within the same major architecture).
+    Architecture-specific ``a``-suffixed targets (e.g. ``sm_100a``, ``sm_103a``)
+    are the exception: CUDA ``a`` targets run only on their exact compute
+    capability, so a captured ``sm_100a`` cubin cannot run on an ``sm_103``
+    device. Forward compatibility (``>=``) applies only to plain and ``f``
+    (family-portable) targets.
+
+    Args:
+        captured_arch: DSL's compile target (e.g., "sm_100a", "sm_89")
+        device_cap: Target device's compute capability (major, minor)
+
+    Returns:
+        True if the captured arch can run on the target device.
+    """
+    # Parse captured arch (e.g., "sm_100a" -> (10, 0), "sm_89" -> (8, 9))
+    if not captured_arch or not captured_arch.startswith("sm_"):
+        return False
+
+    arch_str = captured_arch[3:]  # Remove "sm_" prefix
+    # Architecture-specific targets carry an 'a' suffix (e.g. sm_100a, sm_103a).
+    # CUDA 'a' cubins run only on their exact compute capability, so keep the
+    # flag before stripping variant suffixes below.
+    arch_specific = arch_str.endswith("a")
+    # Remove trailing 'a' or 'f' (architecture variants like sm_100a, sm_100f)
+    arch_str = arch_str.rstrip("af")
+
+    try:
+        if "_" in arch_str:
+            # Format like "100" or "12_0"
+            parts = arch_str.replace("_", " ").split()
+            captured_major = int(parts[0])
+            captured_minor = int(parts[1]) if len(parts) > 1 else 0
+        else:
+            # Format like "89" -> (8, 9)
+            captured_major = int(arch_str[:-1])
+            captured_minor = int(arch_str[-1])
+    except (ValueError, IndexError):
+        return False
+
+    device_major, device_minor = device_cap
+
+    # Same major architecture
+    if captured_major == device_major:
+        if arch_specific:
+            # 'a' targets require an exact minor-version match: sm_100a cubins
+            # do not run on sm_103, even within the same major architecture.
+            return device_minor == captured_minor
+        # Plain and 'f' targets keep forward compatibility (minor >= captured).
+        return device_minor >= captured_minor
+
+    # Different major architecture: incompatible
+    return False
+
+
+def _use_cuda_norm(device: torch.device) -> bool:
+    """Determine whether to use CUDA JIT norm kernels instead of CuTe DSL.
+
+    This function implements the dispatch logic for norm operations, deciding
+    between the CuTe DSL path (default) and the CUDA JIT fallback path.
+
+    The CUDA JIT path is selected when:
+    1. ``FLASHINFER_USE_CUDA_NORM=1`` is set (explicit opt-in for debugging)
+    2. The target device's architecture is not supported by the installed CuTe DSL
+       (e.g., Rubin/sm_107 against a DSL without ``sm_107a``, unless
+       ``CUTE_DSL_ARCH=sm_100f`` was exported before the process started)
+    3. Mixed-architecture hosts where the DSL's compile target (captured from
+       device 0 at import time) is not binary-compatible with the target device's
+       compute capability. This prevents ``cudaErrorNoKernelImageForDevice`` errors
+       when the DSL compiled for a different architecture than the target device.
+
+    CUDA binary compatibility rules: a cubin compiled for sm_X.Y can run on
+    sm_X.Z when Z >= Y (forward compatibility within the same major architecture).
+    For example, an sm_86 cubin runs on sm_89, but not vice versa.
+
+    The CUDA JIT kernels are functionally equivalent to the CuTe DSL ones, so
+    norm operations fall back to CUDA JIT instead of raising errors like the
+    DSL-only kernels do.
+
+    Args:
+        device: Target device for norm operation (e.g., ``torch.device("cuda:1")``)
+
+    Returns:
+        ``True`` if CUDA JIT kernels should be used, ``False`` for CuTe DSL path.
+
+    Examples:
+        >>> # Single-architecture host: use DSL path
+        >>> _use_cuda_norm(torch.device("cuda:0"))
+        False
+
+        >>> # Mixed-architecture host (device 0: sm_89, device 1: sm_86)
+        >>> # DSL compiled for sm_89, but launching on sm_86
+        >>> _use_cuda_norm(torch.device("cuda:1"))
+        True
+    """
     if _USE_CUDA_NORM:
         return True
-    return not _cute_dsl_supports_arch(*torch.cuda.get_device_capability(device))
+
+    device_cap = torch.cuda.get_device_capability(device)
+
+    # Check if DSL supports the device's architecture at all
+    if not _cute_dsl_supports_arch(*device_cap):
+        return True
+
+    # Check if DSL's captured compile target is compatible with this device
+    # (handles mixed-architecture hosts where device 0 != target device)
+    if _dsl_captured_arch is not None:
+        captured_arch = _dsl_captured_arch()
+        if captured_arch is not None and not _is_arch_compatible(
+            captured_arch, device_cap
+        ):
+            # DSL compiled for a different architecture; fall back to CUDA JIT
+            return True
+
+    return False
 
 
 @functools.cache
@@ -1584,6 +1696,10 @@ def layernorm(
     ----------
     input: torch.Tensor
         Input tensor, shape (batch_size, hidden_size). Need to be bfloat16.
+        The last dimension must be contiguous. The default CuTe DSL backend
+        requires a row stride that is a multiple of its vector width and a
+        16-byte-aligned data pointer; the CUDA backend (``FLASHINFER_USE_CUDA_NORM=1``,
+        or when the CuTe DSL is unavailable) accepts any row stride.
     gemma: torch.Tensor
         Gemma tensor, shape (hidden_size,). Need to be float32.
     beta: torch.Tensor

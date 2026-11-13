@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import functools
 import math
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -548,11 +549,79 @@ def _tensor(
     return value
 
 
-def _work_counter_dummy(device: torch.device) -> torch.Tensor:
-    """The one-element ``int32`` the host binds to a unit's unreferenced ``work_counter``
-    parameter (the exporter asserts that no delivered kernel reads it): uninitialised on
-    purpose, so that binding it launches no fill kernel."""
-    return torch.empty((1,), dtype=torch.int32, device=device)
+# A unit on the resident grid (``unit["grid_rule"] == "resident"``) that takes a
+# ``work_counter`` claims its tiles from a zeroed ``int32[2]`` and leaves it zeroed
+# when its last CTA retires, so a counter is zeroed once, at allocation, and never
+# reset per launch: no fill kernel in the forward or in a captured graph.  Launches
+# that may overlap need their own counter: one per program, per stage (FC1 and FC2
+# of one forward overlap under PDL) and per stream.  A captured graph keeps the
+# counter of the stream it was captured on, so graphs replayed concurrently are
+# captured on different streams.  Counters are slots of zeroed slabs allocated
+# outside stream capture; a capture takes a spare slot.
+_WORK_COUNTER_SLAB = 256
+_work_counter_lock = threading.Lock()
+_work_counters: dict[tuple[int, int, str, str], torch.Tensor] = {}
+_work_counter_spares: dict[int, list[torch.Tensor]] = {}
+
+
+def _work_counter(device: torch.device, stage: str, program: str) -> torch.Tensor:
+    """The persistent zeroed ``int32[2]`` work counter of ``program`` in ``stage`` on the
+    current stream of ``device`` (see above); the first counter of a device allocates
+    and zeroes a slab, which must happen outside stream capture."""
+    index = _device_index(device)
+    stream = int(torch.cuda.current_stream(index).cuda_stream)
+    key = (index, stream, stage, program)
+    with _work_counter_lock:
+        counter = _work_counters.get(key)
+        if counter is not None:
+            return counter
+        spares = _work_counter_spares.setdefault(index, [])
+        if not spares:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"{stage} {program}: the work counters of device {index} are "
+                    "allocated outside stream capture; run the forward once eagerly "
+                    "on this device before capturing it"
+                )
+            slab = torch.zeros(
+                (_WORK_COUNTER_SLAB, 2),
+                dtype=torch.int32,
+                device=torch.device("cuda", index),
+            )
+            # Every slot is zero before any stream launches on it.
+            torch.cuda.current_stream(index).synchronize()
+            spares.extend(reversed(slab.unbind(0)))
+        counter = spares.pop()
+        _work_counters[key] = counter
+        return counter
+
+
+def _gemm_grid(
+    program: str,
+    unit: dict[str, Any],
+    device: torch.device,
+    grid_m: int,
+    max_ctas: int,
+    split_k: int,
+) -> tuple[int, int, int]:
+    """The launch grid of an FC1 / FC2 unit by its ``grid_rule``: ``tiles``, one CTA
+    (cluster) per output tile, ``(grid_m, max_ctas, split_k)``; ``resident``, one
+    resident CTA (cluster of ``c``) per SM (``c`` SMs) taking the ``grid_m x
+    max_ctas`` tiles in turn, ``(c * min(SMs // c, grid_m // c * max_ctas), 1, 1)``."""
+    rule = unit["grid_rule"]
+    if rule == "tiles":
+        return (grid_m, max_ctas, split_k)
+    if rule != "resident":
+        raise ValueError(f"{unit['stage']} {program}: unknown grid rule {rule!r}")
+    width = int(_record(program)["launch"]["cluster"][0])
+    if split_k != 1 or grid_m % width:
+        raise ValueError(
+            f"{unit['stage']} {program}: a resident grid of {width}-CTA clusters takes "
+            f"split_k 1 and a feature-tile count divisible by {width}, got split_k "
+            f"{split_k}, {grid_m} feature tiles"
+        )
+    sms = sm_count(device)
+    return (width * min(sms // width, grid_m // width * max_ctas), 1, 1)
 
 
 def _optional(name: str, value: Any, required: bool, context: str) -> None:
@@ -968,6 +1037,7 @@ def _fc1_values(
         "tile_expert": operands["cta_idx_xy_to_batch_idx"],
         "tile_mn_limit": operands["cta_idx_xy_to_mn_limit"],
         "num_non_exiting_ctas": operands["num_non_exiting_ctas"],
+        "num_tiles": operands["num_non_exiting_ctas"],
         "total_tiles": operands["num_non_exiting_ctas"],
         "total_num_padded_tokens": operands.get("total_num_padded_tokens"),
         "clamp_limit": clamp,
@@ -976,6 +1046,7 @@ def _fc1_values(
         "K": H,
         "grid_m": I // rows,
         "grid_n": g.max_ctas,
+        "max_tiles": g.max_ctas,
         "K_tiles": H // block_k,
     }
     if needs["gemm1_weights_scale"]:
@@ -1040,7 +1111,7 @@ def _fc1_values(
     alias = values.get("scale_c", clamp)
     values["act_alpha"] = alias
     values["act_beta"] = alias
-    return values, (I // rows, g.max_ctas, 1)
+    return values, _gemm_grid(program, unit, device, I // rows, g.max_ctas, 1)
 
 
 def _fc2_values(
@@ -1093,6 +1164,7 @@ def _fc2_values(
         "tile_expert": operands["cta_idx_xy_to_batch_idx"],
         "tile_mn_limit": operands["cta_idx_xy_to_mn_limit"],
         "num_non_exiting_ctas": operands["num_non_exiting_ctas"],
+        "num_tiles": operands["num_non_exiting_ctas"],
         "total_tiles": operands["num_non_exiting_ctas"],
         "total_num_padded_tokens": operands.get("total_num_padded_tokens"),
         "work_counter": operands.get("work_counter"),
@@ -1100,6 +1172,7 @@ def _fc2_values(
         "K": I,
         "grid_m": H // rows,
         "grid_n": g.max_ctas,
+        "max_tiles": g.max_ctas,
         "K_tiles": I // block_k,
     }
     if needs["gemm2_weights_scale"] or needs["gemm2_input_scale"]:
@@ -1148,7 +1221,9 @@ def _fc2_values(
         )
         values["token_sf"] = token_sf
         values["per_token_scale"] = token_sf
-    return values, (H // rows, g.max_ctas, int(unit["split_k"]))
+    return values, _gemm_grid(
+        program, unit, device, H // rows, g.max_ctas, int(unit["split_k"])
+    )
 
 
 def _routing_input(
@@ -1670,11 +1745,12 @@ def prepare_stepfun_moe(
             (g.max_padded * I // block,), dtype=torch.uint8, device=device
         )
         buffers["gemm1_output_scale"] = gemm1_output_scale
-    if "work_counter" in fc1_keys or "work_counter" in fc2_keys:
-        # A one-element dummy: the units that declare ``work_counter`` never read it (the
-        # exporter asserts that), and a ``zeros`` here would put a fill kernel into every
-        # forward (and into every captured graph).
-        buffers["work_counter"] = _work_counter_dummy(device)
+    for stage, program, keys in (
+        ("fc1", resolved.fc1_program, fc1_keys),
+        ("fc2", resolved.fc2_program, fc2_keys),
+    ):
+        if "work_counter" in keys:
+            buffers[f"{stage}_work_counter"] = _work_counter(device, stage, program)
     buffers["gemm2_output"] = torch.empty(
         (g.max_padded, H), dtype=torch.bfloat16, device=device
     )
@@ -1721,7 +1797,7 @@ def prepare_stepfun_moe(
         total_num_padded_tokens=tables["total_num_padded_tokens"],
         gemm1_output=buffers["gemm1_output"],
         gemm1_output_scale=gemm1_output_scale,
-        work_counter=buffers.get("work_counter"),
+        work_counter=buffers.get("fc1_work_counter"),
     )
     values, grid = _fc1_values(resolved.fc1_program, family, g, fc1_operands)
     launches.append(
@@ -1792,7 +1868,7 @@ def prepare_stepfun_moe(
         num_non_exiting_ctas=tables["num_non_exiting_ctas"],
         total_num_padded_tokens=tables["total_num_padded_tokens"],
         gemm2_output=buffers["gemm2_output"],
-        work_counter=buffers.get("work_counter"),
+        work_counter=buffers.get("fc2_work_counter"),
     )
     values, grid = _fc2_values(resolved.fc2_program, family, g, fc2_operands)
     launches.append(
@@ -2003,7 +2079,9 @@ def prepare_fc1(
         tables, device=device, max_ctas=g.max_ctas, max_padded=g.max_padded
     )
     work_counter = (
-        _work_counter_dummy(device) if "work_counter" in _arg_keys(program) else None
+        _work_counter(device, "fc1", program)
+        if "work_counter" in _arg_keys(program)
+        else None
     )
     operands = dict(
         hidden_states=hidden_states,
@@ -2160,7 +2238,9 @@ def prepare_fc2(
         tables, device=device, max_ctas=max_ctas, max_padded=g.max_padded
     )
     work_counter = (
-        _work_counter_dummy(device) if "work_counter" in _arg_keys(program) else None
+        _work_counter(device, "fc2", program)
+        if "work_counter" in _arg_keys(program)
+        else None
     )
     operands = dict(
         gemm2_input=gemm2_input,

@@ -19,7 +19,7 @@ Expert-Parallel MoE with two execution modes:
 | **Split** | dispatch → inner kernel → combine | Pluggable comm + compute; NVLink one-/two-sided, NCCL-EP, NIXL-EP |
 | **Mega** | fused comm + MoE kernel | Single symmetric-memory kernel; no separate Fleet/Handle |
 
-Entry point: `MoEEpLayer(bootstrap, fleet_params, weights, fleet_knobs=(), backend=...)` → `MoEEpSplitLayer` or `MoEEpMegaLayer`.
+Entry point: `MoEEpLayer(bootstrap, fleet_params, weights, fleet_knobs=(), backend=...)` → `MoEEpSplitLayer`, `MoEEpMegaLayer`, or `MoEEpAutoLayer`.
 
 ## Available backends
 
@@ -98,7 +98,7 @@ kind, and both paths hand the inner kernel the same `SplitKernelContext`:
 
 | Backend | Config | Interface | Transport |
 |---|---|---|---|
-| `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back; optional CFT counted writes over the NVLink fabric (SM100+, CUDA 13.4+, driver 615+); a Lamport transport for small steps (SM100 / SM103, up to 64 ranks; `include/flashinfer/comm/moe_alltoall_lamport.cuh`); up to 256 ranks. Kernels follow TensorRT-LLM's (`kernels/moe/communication/`) |
+| `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back; up to 256 ranks. `sync_protocol` picks how receivers learn of arrivals: `fence` (completion flags behind a system-scope fence), `sentinel` (they poll a sentinel word that every pushed vector replaces; SM100 / SM103 / SM107, up to 64 ranks; `include/flashinfer/comm/moe_alltoall_sentinel.cuh`) or `auto` (default: `sentinel` for steps of at most 256 tokens per rank that it can carry, else `fence`). Every rank passes the same `sync_protocol`; if any rank cannot run `sentinel`, all of them use `fence`. Kernels follow TensorRT-LLM's (`kernels/moe/communication/`) |
 | `cake` | `CakeAlltoAllConfig` | `MoEEpCommunication` | One-sided put/get like `nvlink_one_sided`, running generated Cake kernels (`cake/kernels.py`, `csrc/cake_moe_alltoall*`); SM100/SM103 only |
 | `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`nvlink_two_sided/kernels.py`, `csrc/nvlink_two_sided_*`); `num_experts % 4 == 0` |
 | `nccl_ep` | `NcclEpConfig` | Fleet/Handle | see below |
@@ -301,6 +301,8 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 | `MoEEpMegaWorkspace` | Public, layer-bound capacity-profile handle returned by `MoEEpMegaLayer.create_workspace()`; do not construct directly |
 | `SplitConfig` | `comm` + `kernel` slots (default `NcclEpConfig` + `IdentityConfig`) |
 | `MegaConfig` | `megakernel`, `quantize_input`, `preprocess_weights`, optional `transformed_weights` |
+| `AutoConfig` | Explicit Mega/split candidates, with an optional candidate index to force one |
+| `MoEEpAutoWorkspace` | A prepared input profile, selected complete EP plan, and storage retained for its captures |
 | `FleetAlgoKnobFaultTolerance` | Opt-in rank masking (`enabled`, `timeout_ms`, reconcile budgets) — see **Fault tolerance** |
 
 **Split:** pass `SplitConfig(comm=..., kernel=...)` or a comm string/config (kernel defaults to `IdentityConfig`). `fleet_knobs` tune Fleet transports. The Fleet (or `MoEEpCommunication`) is lazy-created on first `forward()`; Fleet transports get a new Handle per forward. CUDA-graph capture goes through `create_graph_state()` for both kinds of comm backend; a `MoEEpCommunication` is already long-lived, so its graph state only pins the bound buffers, and `create_graph_state()` rejects backends with `supports_cuda_graph=False`. `MoEEpSplitLayer.enable_timing` optionally records per-stage GPU ms (`MoEEpSplitLayer.STAGES`: quantize, dispatch, compute, combine) in `last_timings_ms`; `stage_hook` brackets the same stages without synchronizing, for timing under CUDA graph capture.
@@ -311,6 +313,225 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 - LL **RANK_MAJOR** / **HT FLAT** — `[world, max_tokens_per_rank, hidden]` carrying received `topk_idx` / `topk_weights`; the runner uses the real `top_k` with non-local picks masked to weight 0, and combine just sums across ranks.
 
 BF16, W4A4, W4A8, and W4A16 are supported through the unified compute path (`MoEConfig.quant` weight/activation `QuantFormat` pair); quantized activations are prepared in the bridge, and W4A8 optionally packs its MXFP8 payload before dispatch (see **Available backends**).
+
+### Batch-invariant BF16 MegaMoE
+
+Batch-invariant execution supports the SM100/SM103/SM107 BF16 CuTeDSL
+MegaMoE backend, selected explicitly through `MegaConfig`. SM107 requires native
+`sm_107a` compilation and a CUDA/CuTe launcher with oversized shared-memory
+support; multi-GPU NVLink execution also needs a Rubin-aware NCCL.
+
+```python
+from flashinfer.moe_ep import (
+    MegaConfig,
+    Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
+)
+
+backend = MegaConfig(
+    megakernel=Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=intermediate_size,
+        top_k=top_k,
+        batch_invariant=True,
+        apply_routing_weights_before_fc2=True,
+    ),
+)
+```
+
+For fixed weights, per-token input values and precomputed routing IDs and
+weights, this mode preserves finalized output bits when the surrounding batch
+changes. The guarantee applies within the same GPU architecture, software and
+compiler versions, and EP topology and expert placement. Router computation is
+outside this API's guarantee. It does not promise bitwise agreement with regular
+MoE kernels, another backend, or another precision.
+Live routing IDs must name existing global experts or use `-1` for dropped
+slots. Dropped slots contribute zero, including when their unused routing
+weight is NaN; they do not read a prior invocation's combine cells.
+
+Batch-invariant mode disables in-kernel FC2 atomic reduction and uses an ordered
+finalizer. It requires finalized output; `FinalizeMode.NONE` is unsupported.
+Permitted tile geometries preserve the same ordered K16 accumulation,
+activation and routing-weight placement. In particular,
+`apply_routing_weights_before_fc2` selects a numerical calculation: keep its
+value fixed when comparing batches. Create a new layer to change numerical
+settings after construction; mutating a configuration does not update an
+existing layer's compiled plans or captured graphs. Autotune, cached knobs and
+heuristic fallbacks must all satisfy the batch-invariant configuration restrictions.
+Changing communication scheduling alone may remain eligible where it preserves
+that calculation.
+
+The tile family admits M128/M256, N128/N256 and K64/K128/K256. M128 uses one CTA
+with `cluster_shape_mnk=(1, 1, 1)`; M256 uses paired CTAs with
+`cluster_shape_mnk=(2, 1, 1)`. Tile K must divide both hidden and intermediate
+sizes after rounding each up to 64, preserving the original padded K16 trace.
+Every selected plan must fit at least one A/B pipeline stage in shared memory:
+232448 bytes per CTA on SM100/SM103 or 334848 bytes in SM107 oversized mode.
+`flag_batch=1`, `epi_flag_batch=(1, 1)` and `group_hint=None` remain fixed.
+Static and atomic-counter task assignment and the three token-back carriers
+remain eligible, giving up to 72 plans before shape and resource filtering.
+Integer task counters do not accumulate output values. An unrecognized knob or
+numerical implementation is rejected rather than silently admitted.
+
+Use this backend directly for the initial implementation. SM100 BF16 does not
+yet implement the outer `AutoConfig` complete-EP selection protocol. An
+`AutoConfig` containing a batch-invariant candidate rejects ordinary or
+unsupported candidates and candidates with different activation clamps,
+expert geometry or routing-weight placement, even with a pinned candidate
+index; it cannot silently fall back to an ordinary calculation.
+
+#### Arithmetic fingerprint and Lean model
+
+The arithmetic receipt is available as `layer.batch_invariant_fingerprint`
+(`None` in ordinary mode) and without constructing a layer:
+
+```python
+from flashinfer.batch_invariant import fingerprint
+
+receipt = fingerprint(
+    "megamoe_bf16",
+    hidden=hidden_size,
+    intermediate=intermediate_size,
+    top_k=top_k,
+    num_experts=num_experts,
+    apply_routing_weights_before_fc2=True,
+    gate_up_clamp=None,
+    arch="sm_100",  # sm_103 / sm_107 also supported; defaults to the active device
+)
+```
+
+`moe_ep/batch_invariant/spec.py` builds ordered terms for the actual computation:
+K64 stages containing four BF16 K16 MMA steps (including padded steps and a
+distinct first-step initializer), the FP32 activation and its NaN-propagating
+clamps, the BF16 handoff and FC2 wire, and the fixed slot-order FP32 sum or FMA.
+The BI activation runs this same chain through a device backend with pinned
+`ex2.approx.ftz.f32`, `rcp.approx.ftz.f32` and RN/no-FTZ ALU operations.
+As in ordinary MegaMoE, the effective clamp is `abs(gate_up_clamp)`, so opposite
+signs of the same clamp magnitude share a receipt. FP32 constants are identified
+by bits, including the negative-zero lower bound of a zero clamp.
+Early and late routing-weight placement have different fingerprints. All
+admitted tile/schedule/carrier plans of one calculation share one fingerprint. Batch,
+capacity, packing order and pointers are absent from the receipt; input and
+weight values and ordered routing slots remain runtime inputs.
+
+The digest binds component terms and their composition rather than expanding a
+full dense FFN expression. It is a specification identifier, not a source hash or
+a proof certificate. Admission-policy version 3 caches also match this arithmetic
+digest; older-policy entries and entries with a missing or mismatched digest
+are not reused. The arithmetic specification remains version 1.
+
+`batch_invariant/lean/BIKernels/MegaMoE.lean` proves the K64-to-K16 lowering,
+configuration agreement, token permutation/sub-batch invariance and logical
+placement preservation under an inverse address map, unique logical cells and
+correct publication of their values. Generated
+cases couple the Python and Lean S-expressions; the project axiom checker rejects
+`sorry` and any new axiom outside the existing policy. The model does not verify
+the internals of MMA or approximate instructions, compiler lowering, CUDA memory
+ordering, barriers or remote communication. Those remain hardware assumptions
+checked by independent device conformance and the cross-plan/batch GPU suite.
+NaN payloads are not interpreted by the exact CPU arithmetic model; device
+scalar/packed agreement checks their observed representations separately.
+
+From the repository root, regenerate and check the formal cases with:
+
+```bash
+python -m flashinfer.moe_ep.batch_invariant.lean_cases
+pytest tests/batch_invariant/test_megamoe_lean.py
+pytest tests/moe_ep/test_bf16_megamoe_spec.py
+pytest tests/moe_ep/test_bf16_megamoe_batch_invariant.py --full
+```
+
+The Lean build, conformance executable and axiom-policy checks run when the
+pinned Lean toolchain is installed; without it, the generated-file consistency
+test still runs. Keep a fingerprint with its FlashInfer/compiler versions,
+architecture, EP topology and expert placement when recording an output receipt.
+
+### Complete EP selection
+
+`AutoConfig` compares explicitly configured Mega and split candidates during an
+`autotune_v2()` warmup. Candidates must implement the same quantization,
+activation and expert geometry, using canonical BF16 weights and contiguous
+BF16 inputs with finalized BF16 output. Routing tensors are contiguous, with
+int32/int64 expert IDs and float32 weights. FC1 rows use the unified MoE API's
+`[up, gate]` order.
+Routing-weight placement, the NVFP4 activation recipe and the combine format
+must also agree. In particular, mixing a split candidate with Rubin Mega
+requires `apply_routing_weights_before_fc2=False` and `combine_dtype="bf16"`.
+Candidate preparation converts native weight layouts before tuning. Mega
+candidates currently use the Rubin block-scaled
+adapters. Split candidates use `FusedMoeKernelConfig` and its existing prepared
+weight views. The layer prepares and retains each candidate's weights once;
+workspaces share those views. Each split configuration pins its communication
+backend, including its default; the selector does not enumerate other transports.
+Raw allocator callbacks and CUDA stream handles carry process-local addresses
+and are not supported in automatic-selection cache contracts. The built-in
+`FleetAlgoKnobAllocator(torch_caching=True)` remains serializable.
+
+```python
+from flashinfer import autotune_v2
+from flashinfer.moe_ep import AutoConfig, MegaConfig, MoEEpLayer, SplitConfig
+
+layer = MoEEpLayer(
+    bootstrap, fleet_params, weights,
+    backend=AutoConfig(candidates=(
+        MegaConfig(megakernel=mega_config),
+        SplitConfig(comm=comm_config, kernel=split_kernel_config),
+    )),
+)
+with autotune_v2():
+    workspace = layer.create_workspace(tensors)
+    layer.warmup(tensors, workspace=workspace)
+output = layer.forward(tensors, workspace=workspace)
+selected = layer.get_selected_plan(workspace=workspace)
+```
+
+Set Rubin's `knobs="auto"` and `kernel_variant="auto"` to search its eligible
+variants and knobs. Explicit Mega variants or knob dictionaries retain their
+meaning. For each split configuration, the selector enumerates eligible
+compute backends and tactics without using MoELayer's compute-only winner.
+Every tactic is measured through input preparation, dispatch, compute, combine
+and output handling. The best backend/tactic competes with the Mega winner over
+that same boundary. Compilation, weight transformation and workspace allocation
+happen before measurement. All EP ranks use the median of the per-iteration
+maximum rank latency.
+
+The managed v2 store holds split backend winners and the overall plan in
+separate namespaces. Rubin keeps its existing variant and knob records. Outer
+records match the configured candidates, capacity, rank-local input shapes,
+numerical settings, environment and measurement policy. A replay context loads
+one complete plan without measuring; a miss prepares the first eligible
+candidate's fallback and leaves tuning pending. `candidate=i` in `AutoConfig`
+forces that candidate while allowing its inner tuning. `get_selected_plan()`
+returns its index and either a Mega variant/knob dictionary or a split backend
+position and tactic. The backend position indexes the configured `BackendOptions`.
+
+Prepare workspaces collectively with an agreed `runtime_max_tokens_per_rank`,
+or omit it to use the workspace capacity as the row bound. Live row counts may
+vary independently on each rank within that bound. NCCL-EP and NIXL-EP use
+fixed-row handles, so partial batches stage into bound-sized buffers with
+masked routing tails. A full-bound batch executes directly; NVLink one-sided
+keeps its variable-row path. Dtypes, strides, top-k, output layout and the
+runtime hint stay fixed. Prepare another workspace collectively to change them.
+
+Eager calls may use new input buffers with the same layout. Ordinary serving
+reuses the prepared plan without selector collectives; changed routing values
+do not trigger selection. An enabled tuning context selects for the actual
+rank-local live row counts, which remain distinct in the tuning cache even
+when workloads share a workspace bound. Warm up that workload before capture.
+The workspace owns the returned output and may overwrite it on its next call; pass
+`MoEEpTensors.output` to supply an output buffer. Output must not alias an input.
+Prepared fixed-row transports keep their eager stream binding; run eager
+forwards on the stream used to prepare the plan. Capture uses its capture stream.
+
+Prepared Mega plans own their symmetric scratch instead of using the process
+workspace pool. Scratch usage grows with the number of live layer/profile
+workspaces; transformed weights are shared. Independent storage prevents plans
+and older graph captures from overwriting one another.
+
+Warm up each profile before capture. Selection cannot run inside capture. Later
+warmup can replace a selected plan using fresh execution storage while retaining
+storage used by older graphs. Transformed weights remain shared. Retire all
+graphs using a handle before calling its collective `destroy()`. Separate handles
+let the engine release old profiles independently; layer destruction releases
+all remaining handles.
 
 **Mega:** pass `MegaConfig(megakernel=...)`. Weights required as the layer's `weights` argument. Workspace allocated on first forward. Output is bf16 `[num_tokens, token_hidden_size]` where `num_tokens = MoEEpTensors.num_tokens` (may be `< max_tokens_per_rank`). `fleet_knobs` are ignored. NIXL-EP split layers require `BootstrapConfig.tcp_store` at init.
 
@@ -329,7 +550,10 @@ GenPhase is excluded when its capacity or combine requirements are not met.
 Explicit inference or GenPhase with `knobs="auto"` uses the same complete-forward
 boundary, restricted to that variant. The Rubin offline CLI also measures staging,
 compute and writing an owned output, matching the default layer forward with
-BF16 inputs. Output copies are measured when the selected path requires them. Input generation, weight preparation, compilation and correctness
+BF16 inputs. Pass `--kernel-variant auto` to search both eligible variants and
+save their winners and the overall selection; explicit variants restrict the
+search. Offline searches bypass cached winners and do not install the result.
+Output copies are measured when the selected path requires them. Input generation, weight preparation, compilation and correctness
 checks are outside measurement. Match the deployment's input and output layouts
 when reusing automatic results; kernel-only records do not satisfy this objective.
 
@@ -337,14 +561,15 @@ Each variant's winning knobs are stored in its fixed-variant managed-cache
 records and the MegaMoE compatibility file when persistence is enabled. The
 overall selection has a separate managed entry containing the variant and knobs,
 matched to the workspace capacity, per-rank live-token counts, eligible variants
-and execution contract. On an overall miss, tuning reuses compatible fixed-variant
-records, including token-bucket fallbacks, and searches missing variants. Cached
-partial-batch records stay within their workspace capacity; full-capacity records
-can supply knobs for another capacity, following fixed-variant lookup. Cached
-knobs are checked and timed at the current workload before comparing variants;
-a rejected cached choice triggers a fresh search within that variant. Reused
-records retain their original workload and score. An explicit fresh search
-bypasses both levels. Skipping fixed-variant tuning compares heuristic knobs
+and execution contract. Enabled tuning reuses fixed-variant records only when
+their capacity and EP-wide live-token count match the requested workload;
+otherwise it searches that variant's knob grid. Replay retains token-bucket and
+capacity fallbacks for fixed variants. On an overall miss, cached winners are
+checked and timed before comparing variants; a rejected cached choice triggers
+a fresh search within that variant. Reused records retain their search score.
+Overall selections from the previous fallback-only search are invalidated.
+An explicit fresh search bypasses both levels. Skipping fixed-variant tuning
+compares heuristic knobs
 without publishing fixed-variant managed records. A variant-selection replay
 miss uses the inference heuristic and leaves selection pending. Low-level tuning
 of already-staged workspaces remains available for kernel measurements.
@@ -775,6 +1000,14 @@ masked out. See `core/comm/fault_tolerance.py` and the runbook for the protocol
 and the recovery state machine.
 
 ### Offline live-token tuning
+
+Rubin inference searches all 32 default candidates unless capped. GenPhase uses
+8 or 11, depending on the datatype. Both lists order choices for prefix-limited
+searches. `--max-candidates N`
+takes the first N unique choices from each eligible variant independently;
+shorter lists are used in full. The low-level Python tuner also accepts an
+ordered `candidates` list. Repeated choices are removed before measurement,
+with JSON lists and Python tuples treated alike. Custom order is preserved.
 
 CuTeDSL MegaMoE tuning records both workspace capacity (`max_tokens`) and
 benchmark workload (`live_tokens`) in each JSON entry. Different workloads at
