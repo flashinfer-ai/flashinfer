@@ -73,8 +73,13 @@ def _plan(w, qs, ks, dtype, causal):
         max_token_per_sequence=64,
         max_sequence_kv=512,
     )
-    assert w._cudnn_plan.metadata._bounded_batch
-    assert w._cudnn_plan.override == (1 << (len(qs) - 1).bit_length(), 128, 65536)
+    if w.is_cuda_graph_enabled:
+        # Graph mode already declares explicit lengths and exact bounds.
+        assert not w._cudnn_plan.metadata._bounded_batch
+        assert w._cudnn_plan.override is None
+    else:
+        assert w._cudnn_plan.metadata._bounded_batch
+        assert w._cudnn_plan.override == (1 << (len(qs) - 1).bit_length(), 128, 65536)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -103,7 +108,10 @@ def test_hopper_batch_bucket_replan(monkeypatch, dtype, causal):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("scale_kind", ["scalar", "tensor"])
-def test_hopper_retained_batch_bound_graph(monkeypatch, dtype, causal, scale_kind):
+@pytest.mark.parametrize("graph_mode", [False, True])
+def test_hopper_retained_batch_bound_graph(
+    monkeypatch, dtype, causal, scale_kind, graph_mode
+):
     _require_hopper(monkeypatch)
     torch.manual_seed(13577)
     qs, ks = [31, 33, 32], [257, 271, 263]
@@ -114,7 +122,7 @@ def test_hopper_retained_batch_bound_graph(monkeypatch, dtype, causal, scale_kin
     w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         ws,
         backend="cudnn",
-        use_cuda_graph=True,
+        use_cuda_graph=graph_mode,
         qo_indptr_buf=torch.empty(4, device="cuda", dtype=torch.int32),
         kv_indptr_buf=torch.empty(4, device="cuda", dtype=torch.int32),
     )

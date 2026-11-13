@@ -63,8 +63,10 @@ a packed-Q capacity. Existing FROST packed-capacity declarations are unchanged.
 
 This applies to unwindowed attention without sinks, explicit mask lengths or
 single-token queries, for MHA/GQA ratios 1, 2, 4, 8 and 16. It does not change
-ragged `auto` admission. Validate batch-boundary replans and fixed-batch retained
-captures with changed partitions, data, scales and workspaces.
+ragged `auto` admission. Graph-mode wrappers already use explicit lengths and
+exact declarations, so they keep that path. Validate batch-boundary replans and
+retained captures in both modes with changed partitions, data, scales and
+workspaces.
 
 ### Buffer ownership and graph bounds
 
