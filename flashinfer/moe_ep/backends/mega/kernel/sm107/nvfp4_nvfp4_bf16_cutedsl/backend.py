@@ -199,6 +199,8 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             situ_linear_beta=k.situ_linear_beta,
             swiglu_alpha=getattr(k, "swiglu_alpha", None),
             swiglu_beta=getattr(k, "swiglu_beta", None),
+            use_tanh_sigmoid=k.use_tanh_sigmoid,
+            epilogue_warpgroups=k.epilogue_warpgroups,
             gate_up_clamp=k.gate_up_clamp,
             batch_invariant=k.batch_invariant,
             batch_invariant_version=NVFP4_BATCH_INVARIANT_VERSION

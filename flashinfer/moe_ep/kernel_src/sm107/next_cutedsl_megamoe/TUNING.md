@@ -1,20 +1,23 @@
 # SM107 MegaMoE tuning and measurement
 
-The active generic kernel is the `1667b47a` upstream export; see
+The active kernels use the provider export in `src/{common,sources}/`; see
 [VENDOR.md](VENDOR.md) for the full pin and [SKILL.md](SKILL.md) for refreshes.
 Select GenPhase with `kernel_variant="genphase"` on a backend config or
-`--kernel-variant genphase` in the offline tuner. The generic inference kernel
+`--kernel-variant genphase` in the offline tuner or benchmark. The standard kernel
 also supports `combine_dtype="nvfp4"` and `combine_dtype="mxfp8"`.
 Historical `92dd334` knob profiles are candidate settings for this newer
 kernel, not new measurements; tuning caches from that drop are invalidated.
+
+Backend configs accept `use_tanh_sigmoid=False` and `epilogue_warpgroups=1`.
+Two epilogue warpgroups require standard inference with BF16 bulk combine and
+`token_back_mode="epi_warps"`. Both options stay fixed during tuning and have
+separate cache identities. To compare their combinations, tune a separate
+configuration for each combination and retain its best valid tactic.
 
 Qualify correctness first using the [Rubin runbook](../../../../../docs/design_docs/moe_ep_sm107_qualification.md).
 NVFP4, MXFP4, MXFP8 E4M3/E5M2, and MXFP4/MXFP8 require native SM107 and
 a compatible CuTe DSL build. Export `CUTE_DSL_ARCH=sm_107a` before Python
 starts. Record the compiler stack and absolute latency with each result.
-
-Single-GPU and EP4 correctness passed at FlashInfer `5bd5aeef`: 50 single-GPU
-cases and 16 EP4 cases per rank.
 
 Use `--dtype mxfp4_mxfp8 --arch sm107` for mixed-format offline tuning, or
 `--quant-kind mxfp4_mxfp8` in the benchmark below. The mixed format shares
@@ -73,8 +76,10 @@ value checks still apply.
 - `--execution eager|graph`: eager launches or replay of a warmed CUDA
   graph. These are separate series, not interchangeable measurements.
 
-CUDA events measure the GPU stream interval, not host wall-clock latency.
-Eager intervals can include device idle gaps while the host enqueues work.
+CUDA events measure the GPU stream interval. Eager intervals can include device
+idle gaps while the host enqueues work. `--eager-completed-wall` instead measures
+host dispatch through device completion for each eager call. `--prequantized`
+prepares activation bytes before the forward span.
 `compute` allocates its output once before warmup and graph capture. Eager
 `forward` allocates on each call; graph `forward` performs Python validation
 and output allocation during capture, outside replay timing. Graph capture
@@ -87,7 +92,9 @@ allocates and fills a fresh 300 MiB FP32 buffer before each start event,
 matching the historical Blackwell harness. The buffer stays alive through the
 launch; allocation and random writes are outside the event window.
 `--no-l2-flush` selects consecutive launches without those writes. Both series
-use a barrier before the timed batch and no inter-iteration barriers or host synchronization. A
+use a barrier before the timed batch and no inter-iteration barriers. CUDA-event
+timing has no per-call host synchronization; completed-wall timing synchronizes
+after each call. A
 barrier before every iteration would instead measure a different, from-idle
 protocol. Match that policy as well as the cache policy on both sides of a
 comparison. Flush memory is included in PyTorch allocator measurements.
@@ -123,13 +130,45 @@ The default geometry is H=7168, I=3072, E=384, top-k=6. Override it with
 `--hidden`, `--intermediate`, `--num-experts`, and `--topk`. `--tokens`
 controls live rows; `--capacity` fixes a larger workspace capacity.
 `--seed` controls weight and routing generation. `--quant-kind all`
-selects all three formats; `both` retains NVFP4 plus E4M3.
+selects all five formats; `both` retains NVFP4 plus E4M3.
 
 Defaults are 20 warmups and 50 timed iterations. Run three fresh processes
 with the same seed, labeling them `--repetition 1`, `2`, and `3`, to check
 repeatability. This flag labels a run; it does not launch repetitions. Change
 seeds in a separate routing-variation experiment, and increase iterations or
 repetitions if the variability does not resolve the claimed difference.
+
+## Comparing source revisions
+
+Report standard and GenPhase separately, keeping the workload, quantization,
+routing-weight position, reduction, graph capacity and measurement boundary
+matched. Use `--kernel-variant inference|genphase` to select the implementation.
+For default standard comparisons, use `--knobs default` on both revisions.
+GenPhase requires an admitted configuration: use `--knobs '{}'` for its native
+defaults with bulk stores and a four-CTA cluster, or `--knobs heuristic` for the
+decode heuristic. For tuned
+comparisons, search each revision's supported settings and confirm each winner
+in fresh processes. Record the search grid and winning settings; a result from
+an explicit grid does not establish that automatic selection finds it.
+
+The benchmark accepts `--activation situ --situ-beta 4 --situ-linear-beta 25`,
+`--gate-up-clamp`, and `--routing-weight-position early|late`. Standard inference
+also accepts `--use-tanh-sigmoid --epilogue-warpgroups 2` with a bulk-store
+tactic. The resolved configuration records these options. Compare the new
+options against the old revision's best supported configuration, and retain a
+default comparison so that tuning does not hide a regression.
+
+For example, this measures standard SiTU with default launch settings:
+
+```bash
+torchrun --standalone --nproc_per_node=4 \
+  benchmarks/moe_ep/backends/mega/kernel/sm107/bench_moe_ep_sm107_block_scaled_mega.py \
+  --kernel-variant inference --quant-kind nvfp4 \
+  --hidden 3584 --intermediate 3072 --num-experts 896 --topk 16 \
+  --tokens 128,2048,8192 --activation situ --situ-beta 4 --situ-linear-beta 25 \
+  --routing balanced --routing-weight-position late --variant bf16 \
+  --mode forward --execution graph --knobs default
+```
 
 ## Knob policies
 
@@ -271,9 +310,9 @@ Use `compute` / eager with per-iteration L2 flushing, 20 warmups / 50 samples,
 three independent process repetitions, and rank-zero median for the historical
 comparison. Kernel/forward characterization uses eager/graph without flushing;
 EP2/8 are scaling experiments, not matches to the historical EP4 table.
-DeepGEMM is excluded from this campaign. The benchmark CLI exposes BF16 combine
-and in-kernel reduction. Select GenPhase and quantized combine through the
-backend API or offline tuner.
+DeepGEMM is excluded from this campaign. The benchmark CLI exposes BF16 combine,
+in-kernel reduction and either kernel variant. Select quantized combine through
+the backend API or offline tuner.
 
 Example primary-series invocation (repeat for each geometry, variant and token
 count above, starting a fresh process for each point):
@@ -326,12 +365,12 @@ Report Torch staging cost separately when evaluating a fused staging implementat
 
 ## Offline tuning
 
-The regular inference grid has 32 candidates. It retains the original 16 in
-the same order, then adds N64 tiles at two K depths and uniform-cluster
-phase-interleaved launches for N128/N256. The added launches use cluster
-sizes two and four, epilogue flag batches `(2, 4)`, and FC2 bulk stores on/off.
-N64 bulk stores use one TMA stage; wider tiles use two. The GenPhase grid is
-unchanged. Layer warmup and the offline CLI use the same candidate generator.
+The regular inference grid has 32 structural candidates, or 64 when in-kernel
+reduction is allowed. It includes N64 tiles at two K depths, N128/N256 tiles,
+uniform and mixed clusters, and FC2 bulk stores on/off. Candidates are ordered
+for prefix-limited searches and deduplicated before applying a limit. N64 bulk
+stores use one TMA stage; wider-tile bulk candidates use two. GenPhase has its
+own grid. Layer warmup and the offline CLI use the same candidate generator.
 
 The CLI always searches afresh and leaves its input workspace unchanged. It
 writes each winner to the managed FlashInfer v2 store and the MegaMoE file on
@@ -403,6 +442,8 @@ Set `kernel_variant="genphase"`, `cluster_shape_mn=(4, 1)`, and
 `fc2_use_bulk=True` on a Rubin backend config. GenPhase accepts at most 1024
 tokens per rank and uses BF16 combine. It supports separate reduction with
 either routing-weight position; in-kernel reduction requires early weights.
+Separate reduction uses the self-validating BF16 plane for top-k up to 31 and
+the static reducer for larger top-k counts.
 Mixed clusters and token-back tuning do not apply to this composition.
 Tile K must be 256 for NVFP4 activations or 128 for MXFP8 activations so that
 each gathered row occupies one 128-byte swizzle atom.
@@ -410,13 +451,18 @@ each gathered row occupies one 128-byte swizzle atom.
 Use `--kernel-variant genphase` with the offline tuner. Its candidates and
 cache entries are separate from the generic inference kernel. A cache miss
 uses the fixed GenPhase cluster and bulk-store settings.
+The automatic N128/N256 bulk candidates use two FC2 TMA stages. To test one
+stage, supply `fc2_tma_stages=1` in explicit knobs, or use it in the base knobs
+for an offline schedule sweep.
 
 GenPhase also accepts `mma_tiler_mnk=(256, 64, 128)` for MXFP8 E4M3
 activations and weights, or mixed MXFP4 weights with MXFP8 activations.
 The default candidate menu includes this tile with cluster `(4, 1)` and
 one FC2 TMA stage. MXFP8 E4M3 also admits an explicitly selected `(2, 1)`
-cluster; mixed MXFP4/MXFP8 requires `(4, 1)`. NVFP4 activations do not
-support this N64 tile. N64 is a tile dimension, not the number of live tokens.
+cluster; mixed MXFP4/MXFP8 requires `(4, 1)`. NVFP4 accepts an explicitly
+selected `(256, 64, 256)` tile with cluster `(4, 1)` and one FC2 TMA stage;
+its default search menu retains N128/N256. N64 is a tile dimension, not
+the number of live tokens.
 Gather4 issuance follows the live rows in each tile, including partially
 filled tiles, while retaining matching barrier transaction counts.
 
@@ -434,6 +480,10 @@ Both families mask invalid route slots during separate BF16 top-k reduction,
 so their production launch can omit clearing the combine payload first.
 This internal optimization applies without a caller API change. Quantized
 combine and in-kernel top-k reduction retain their existing clearing paths.
+
+Standard inference owns a separate temporary buffer sized by the native
+kernel. The adapter retains it across graph replay and replaces it when
+rebuilding execution state. GenPhase keeps its existing workspace interface.
 
 ## Quantized combine selection
 

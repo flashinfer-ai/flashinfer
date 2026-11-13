@@ -800,3 +800,65 @@ def test_ikr_requires_early_weighting():
             reduce_topk_in_kernel=True,
             apply_routing_weights_before_fc2=False,
         )
+
+
+@pytest.mark.parametrize("tanh_sigmoid,warpgroups", [(False, 1), (True, 1), (True, 2)])
+def test_rubin_execution_options_reach_kernel(monkeypatch, tanh_sigmoid, warpgroups):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+        block_scaled,
+    )
+
+    monkeypatch.setattr(block_scaled, "_max_active_clusters", lambda size: 128 // size)
+    cfg = block_scaled.Sm107BlockScaledMoeConfig(
+        num_total_experts=8,
+        max_tokens_per_rank=65,
+        num_topk=3,
+        hidden=512,
+        intermediate=256,
+        rank=0,
+        world_size=1,
+        fc2_use_bulk=True,
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+        use_tanh_sigmoid=tanh_sigmoid,
+        epilogue_warpgroups=warpgroups,
+    )
+    kernel = block_scaled.Sm107BlockScaledSymmBuffer._build_kernel(cfg)
+    assert kernel.epilogue.use_tanh_sigmoid == tanh_sigmoid
+    assert kernel.epilogue.epilogue_warpgroups == warpgroups
+
+
+def test_execution_options_separate_cache_entries(tmp_path, monkeypatch):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
+
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
+    common = dict(
+        dtype="nvfp4",
+        world_size=4,
+        hidden=3584,
+        intermediate=3072,
+        num_experts=896,
+        topk=16,
+        max_tokens=64,
+        device="test-device",
+    )
+    for index, (tanh_sigmoid, warpgroups) in enumerate(
+        ((False, 1), (True, 1), (True, 2))
+    ):
+        entry = knob_cache.make_record(
+            {"marker": index},
+            **common,
+            use_tanh_sigmoid=tanh_sigmoid,
+            epilogue_warpgroups=warpgroups,
+        )
+        knob_cache.write_record(entry)
+    for index, (tanh_sigmoid, warpgroups) in enumerate(
+        ((False, 1), (True, 1), (True, 2))
+    ):
+        result = knob_cache.lookup_knobs(
+            **common,
+            use_tanh_sigmoid=tanh_sigmoid,
+            epilogue_warpgroups=warpgroups,
+        )
+        assert result == {"marker": index}

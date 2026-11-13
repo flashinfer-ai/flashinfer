@@ -16,7 +16,7 @@ workspace work, not an apples-to-apples kernel speedup.
 
 ``--baseline rubin-cutedsl-matched`` selects the vendored SM107 (Rubin) MegaMoE
 reducer at
-``flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/topk_reduce.py``
+``flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/helpers/topk_reduce.py``
 on the same live ``T x 6 x 4096`` elements, called without routing scores or
 indices (an unweighted sum in increasing K, rounded once, as the native
 reducer). It needs a CuTe DSL that targets sm_107a natively and
@@ -69,9 +69,9 @@ _CUTEDSL_SOURCE = "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nv
 _CUTEDSL_SOURCE_SHA256 = (
     "6b8f55a222511281daa7694779ee96c23276d31f39754552cec97c36dd7b0b95"
 )
-_RUBIN_CUTEDSL_SOURCE = "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/topk_reduce.py"
+_RUBIN_CUTEDSL_SOURCE = "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/helpers/topk_reduce.py"
 _RUBIN_CUTEDSL_SOURCE_SHA256 = (
-    "b38d2733da0ed35bd25cca88a589471806b7316b8fe91f8021618e3eacabb644"
+    "975b084372d490091e389ab664a0accf800d25d08d09989979b74a1ed820769a"
 )
 
 
@@ -266,13 +266,12 @@ def _make_rubin_cutedsl_runner(
         import cutlass.cute as cute
         import cutlass.torch as cutlass_torch
 
-        from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
-            bootstrap_paths,
+        from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.helpers.topk_reduce import (
+            TopkReduce,
         )
-
-        bootstrap_paths()
-        from sources.kernel_src.rubin.inference.mega.topk_reduce import TopkReduce
-        from sources.quant_def import CombineFormat
+        from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.quant_def import (
+            CombineFormat,
+        )
     except Exception as error:
         raise RuntimeError(
             f"vendored CuTeDSL baseline {_RUBIN_CUTEDSL_SOURCE} is unavailable; "

@@ -148,6 +148,8 @@ class RubinTuningProtocol:
             situ_linear_beta=cfg.situ_linear_beta,
             swiglu_alpha=getattr(cfg, "swiglu_alpha", None),
             swiglu_beta=getattr(cfg, "swiglu_beta", None),
+            use_tanh_sigmoid=cfg.use_tanh_sigmoid,
+            epilogue_warpgroups=cfg.epilogue_warpgroups,
             gate_up_clamp=cfg.gate_up_clamp,
             batch_invariant=getattr(cfg, "batch_invariant", False),
             input_norm_const=getattr(cfg, "input_norm_const", 1.0),

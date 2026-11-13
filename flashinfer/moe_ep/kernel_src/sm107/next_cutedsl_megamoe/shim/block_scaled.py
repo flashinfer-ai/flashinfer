@@ -171,6 +171,9 @@ class Sm107BlockScaledMoeConfig:
     has_fc2_alpha: bool = dataclasses.field(default=True, kw_only=True)
     has_fc1_norm_const: bool = dataclasses.field(default=True, kw_only=True)
 
+    use_tanh_sigmoid: bool = False
+    epilogue_warpgroups: int = 1
+
     def __post_init__(self) -> None:
         if self.quant_kind not in _KIND_TABLE:
             raise ValueError(f"unsupported quant_kind {self.quant_kind!r}.")
@@ -196,6 +199,21 @@ class Sm107BlockScaledMoeConfig:
             and (self.swiglu_alpha is not None or self.swiglu_beta is not None)
         ):
             raise ValueError("custom activation constants require batch_invariant=True")
+        if type(self.use_tanh_sigmoid) is not bool:
+            raise ValueError("use_tanh_sigmoid must be a bool.")
+        if type(
+            self.epilogue_warpgroups
+        ) is not int or self.epilogue_warpgroups not in (1, 2):
+            raise ValueError("epilogue_warpgroups must be 1 or 2.")
+        if self.epilogue_warpgroups == 2 and (
+            self.kernel_variant != "inference"
+            or self.combine_dtype != "bf16"
+            or not self.fc2_use_bulk
+            or self.token_back_mode != "epi_warps"
+        ):
+            raise ValueError(
+                "Two epilogue warpgroups require standard inference with BF16 bulk combine and epi_warps."
+            )
         if self.activation not in ("swiglu", "situ"):
             raise ValueError("activation must be 'swiglu' or 'situ'.")
         if self.activation == "situ" and not self.batch_invariant:
@@ -400,11 +418,11 @@ class Sm107BlockScaledMoeConfig:
                 raise ValueError("GenPhase supports at most 1024 tokens per rank.")
             n64_decode = (
                 self.cluster_shape_mn in ((2, 1), (4, 1))
-                and tiler == (256, 64, 128)
+                and tiler == (256, 64, 2 * instruction_k)
                 and (
                     self.quant_kind == "mxfp8_e4m3"
                     or (
-                        self.quant_kind == "mxfp4_mxfp8"
+                        self.quant_kind in ("mxfp4_mxfp8", "nvfp4")
                         and self.cluster_shape_mn == (4, 1)
                     )
                 )
@@ -622,6 +640,15 @@ class Sm107BlockScaledSymmBuffer:
             raise RuntimeError("SM107 mega workspaces must be 128-byte aligned.")
         return dict(
             local_workspace=local,
+            tmp_workspace=(
+                torch.empty(
+                    (max(int(kernel.get_tmp_buffer_bytes()), 1),),
+                    dtype=torch.uint8,
+                    device=local.device,
+                )
+                if cfg.kernel_variant == "inference"
+                else None
+            ),
             output_activation=(
                 None
                 if cfg.reduce_topk_in_kernel
@@ -662,6 +689,7 @@ class Sm107BlockScaledSymmBuffer:
         shared_bytes = int(workspace.total_bytes("shared"))
         # Allocated fully zeroed, which covers require_zero_workspace_leading_bytes.
         self.local_workspace = prepared["local_workspace"]
+        self.tmp_workspace = prepared["tmp_workspace"]
         self.shared_workspace = comm.sym_zeros((max(shared_bytes, 1),), torch.uint8)
         comm.prepare_local(
             self._bind_execution_state,
@@ -699,6 +727,10 @@ class Sm107BlockScaledSymmBuffer:
         if (
             self.local_workspace.data_ptr() % 128 != 0
             or self.shared_workspace.data_ptr() % 128 != 0
+            or (
+                self.tmp_workspace is not None
+                and self.tmp_workspace.data_ptr() % 128 != 0
+            )
         ):
             raise RuntimeError("SM107 mega workspaces must be 128-byte aligned.")
 
@@ -720,9 +752,12 @@ class Sm107BlockScaledSymmBuffer:
     def _build_kernel(cfg: Sm107BlockScaledMoeConfig):
         import cutlass
         from cutlass.cute.nvgpu import OperandMajorMode
-        from sources import RubinInferenceGenphaseMegaMoE, RubinInferenceMegaMoE
-        from sources.api import ImplDesc, ProblemDesc
-        from sources.quant_def import CombineFormat
+        from ..src import (
+            RubinInferenceGenphaseMegaMoE,
+            RubinInferenceMegaMoE,
+        )
+        from ..src.sources.api import ImplDesc, ProblemDesc
+        from ..src.sources.quant_def import CombineFormat
 
         from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
             validate_block_scaled_batch_invariant,
@@ -806,6 +841,7 @@ class Sm107BlockScaledSymmBuffer:
                 "situ_linear_beta": None
                 if activation_variant is not None
                 else cfg.situ_linear_beta,
+                "use_tanh_sigmoid": cfg.use_tanh_sigmoid,
                 "world_size": cfg.world_size,
                 "topk": cfg.num_topk,
                 "topk_index_dtype": cutlass.Int32,
@@ -830,6 +866,8 @@ class Sm107BlockScaledSymmBuffer:
             "token_back_mode": cfg.token_back_mode,
             "reduce_topk_in_kernel": cfg.reduce_topk_in_kernel,
         }
+        if cfg.kernel_variant == "inference":
+            impl_fields["epilogue_warpgroups"] = cfg.epilogue_warpgroups
         if cfg.fc2_tma_stages is not None:
             impl_fields["fc2_tma_stages"] = cfg.fc2_tma_stages
         if cfg.fallback_cluster_shape_mn is not None:
@@ -870,7 +908,7 @@ class Sm107BlockScaledSymmBuffer:
         return value if value is not None else getattr(self, name)
 
     def _peer_mapper(self):
-        from sources.communication.nvlink_domain.symmetric_buffer import (
+        from ..src.sources.communication.nvlink_domain.symmetric_buffer import (
             SymmetricBufferHost,
         )
 
@@ -912,6 +950,11 @@ class Sm107BlockScaledSymmBuffer:
             "output_activation": output_cute,
             "local_workspace": _to_cute_ptr(self.local_workspace),
             "shared_workspace": _to_cute_ptr(self.shared_workspace),
+            **(
+                {"tmp_buffer": _to_cute_ptr(self.tmp_workspace)}
+                if self.config.kernel_variant == "inference"
+                else {}
+            ),
             "peer_rank_ptr_mapper_host": self._peer_mapper(),
             "stream": _cu_stream(stream),
             **{
@@ -1035,6 +1078,7 @@ class Sm107BlockScaledSymmBuffer:
         self.output_activation = None
         self.shared_workspace = None
         self.local_workspace = None
+        self.tmp_workspace = None
 
     def install_tuned_knobs(
         self,
@@ -1148,6 +1192,8 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     has_fc2_alpha: bool = True,
     has_fc1_norm_const: bool = True,
     process_group=None,
+    use_tanh_sigmoid: bool = False,
+    epilogue_warpgroups: int = 1,
 ) -> Sm107BlockScaledSymmBuffer:
     """Allocate the SM107 block-scaled mega session workspace.
 
@@ -1192,6 +1238,8 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
         situ_linear_beta=situ_linear_beta,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        use_tanh_sigmoid=use_tanh_sigmoid,
+        epilogue_warpgroups=epilogue_warpgroups,
     )
     return Sm107BlockScaledSymmBuffer(config, process_group=process_group)
 

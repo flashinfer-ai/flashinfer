@@ -338,15 +338,25 @@ def test_foreign_records_are_filtered_before_kernel_validation(state, monkeypatc
     build.assert_called_once()
 
 
-def test_execution_storage_allocation_preserves_staged_state(state, monkeypatch):
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+def test_execution_storage_allocation_preserves_staged_state(
+    state, monkeypatch, variant
+):
     from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import comm
 
     workspace = object.__new__(block_scaled.Sm107BlockScaledSymmBuffer)
     workspace.config = dataclasses.replace(
-        state.workspace.config, reduce_topk_in_kernel=True
+        state.workspace.config,
+        reduce_topk_in_kernel=True,
+        kernel_variant=variant,
+        cluster_shape_mn=(4, 1),
+        fallback_cluster_shape_mn=None,
+        fc2_use_bulk=True,
     )
+    workspace.device = torch.device("cpu")
     workspace.kernel = SimpleNamespace(
-        _device_workspace=SimpleNamespace(total_bytes=lambda kind: 128)
+        _device_workspace=SimpleNamespace(total_bytes=lambda kind: 128),
+        get_tmp_buffer_bytes=Mock(return_value=512),
     )
     workspace._routing_checks = {"routing": object()}
     workspace.note_staged_tokens(4)
@@ -354,6 +364,10 @@ def test_execution_storage_allocation_preserves_staged_state(state, monkeypatch)
     workspace.bind_scalars({"fc1_alpha": scalar})
     storage = Mock()
     storage.data_ptr.return_value = 128
+    scratch = Mock()
+    scratch.data_ptr.return_value = 256
+    allocate_scratch = Mock(return_value=scratch)
+    monkeypatch.setattr(torch, "empty", allocate_scratch)
     monkeypatch.setattr(torch, "zeros", lambda *a, **k: storage)
     monkeypatch.setattr(comm, "sym_zeros", lambda *a, **k: storage)
     monkeypatch.setattr(comm, "compute_peer_offsets", lambda *a: (0, [0]))
@@ -361,6 +375,33 @@ def test_execution_storage_allocation_preserves_staged_state(state, monkeypatch)
     assert workspace._scalar_tensor("fc1_alpha") is scalar
     assert workspace._routing_checks
     assert workspace.staged_tokens() == 4
+    assert workspace.tmp_workspace is (scratch if variant == "inference" else None)
+    if variant == "inference":
+        allocate_scratch.assert_called_once_with(
+            (512,), dtype=torch.uint8, device=workspace.device
+        )
+    else:
+        allocate_scratch.assert_not_called()
+        workspace.kernel.get_tmp_buffer_bytes.assert_not_called()
+
+    monkeypatch.setattr(block_scaled, "_to_cute", lambda value, **kwargs: value)
+    monkeypatch.setattr(block_scaled, "_to_cute_ptr", lambda value: value)
+    monkeypatch.setattr(block_scaled, "_cu_stream", lambda value: value)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    workspace._peer_mapper = lambda: None
+    for name in ("x", "x_sf", "topk_idx", "topk_weights"):
+        setattr(workspace, name, storage)
+    weights = (storage, storage)
+    first = workspace._runtime_kwargs(weights, weights)
+    second = workspace._runtime_kwargs(weights, weights)
+    if variant == "inference":
+        assert first["tmp_buffer"] is second["tmp_buffer"] is scratch
+    else:
+        assert "tmp_buffer" not in first
+        assert "tmp_buffer" not in second
+    monkeypatch.setattr(comm, "free_sym_tensor", Mock())
+    workspace._release_execution_state()
+    assert workspace.tmp_workspace is None
 
 
 def test_cli_persists_managed_cache_by_default(state, monkeypatch, tmp_path):

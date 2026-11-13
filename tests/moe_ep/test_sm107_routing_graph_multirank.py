@@ -68,7 +68,16 @@ def test_sparse_to_dense_graph_multirank(
 
 
 def _check_sparse_to_dense_graph_multirank(
-    ep_runtime, family, kind, cluster, capacity, early, caller_output=False
+    ep_runtime,
+    family,
+    kind,
+    cluster,
+    capacity,
+    early,
+    caller_output=False,
+    *,
+    topk_override=None,
+    remote_experts_only=False,
 ):
     """Check graph replay against the oracle after poisoning combine and output.
 
@@ -80,6 +89,10 @@ def _check_sparse_to_dense_graph_multirank(
     # DATA CTA count depends on capacity * topk, not token capacity alone.
     # Exceed 16384 routes so the 2048-capacity case exercises two DATA CTAs.
     topk = 10 if capacity == 2048 else 4
+    if topk_override is not None:
+        topk = topk_override
+    if remote_experts_only:
+        experts = 128
     torch.manual_seed(16447)
     w1 = (
         torch.randn(experts, 2 * intermediate, hidden, device="cuda") / hidden**0.5
@@ -144,13 +157,7 @@ def _check_sparse_to_dense_graph_multirank(
                 2 if capacity == 2048 else 1
             )
         else:
-            reset_bytes = sum(
-                ws.kernel._device_workspace.tail_reset_bytes(space)
-                for space in ("local", "shared")
-            )
-            assert ws.kernel.tail_reset_single_cta is (
-                reset_bytes <= 16384 and os.environ.get("MEGA_USE_NCU", "0") != "1"
-            )
+            assert ws.kernel.tail.world_size == world
         torch.manual_seed(17000 + rank)
         x = torch.randn(capacity, hidden, device="cuda").bfloat16()
         qx, sx = pkg.quantize_mxfp8_block32(x, torch.float8_e4m3fn)
@@ -165,6 +172,13 @@ def _check_sparse_to_dense_graph_multirank(
             .add(rank * 3)
             .remainder(experts)
         )
+        if remote_experts_only:
+            base_ids = (
+                torch.arange(topk, device="cuda", dtype=torch.int32)
+                .add(experts // 2)
+                .expand(capacity, topk)
+                .contiguous()
+            )
         ws.topk_idx.copy_(base_ids)
         _barrier()
         for _ in range(3):
@@ -187,6 +201,8 @@ def _check_sparse_to_dense_graph_multirank(
             elif state == "holes":
                 ids.fill_(-1)
                 for pos in (0, 16, 63, 64, 127, 128, 255, 256, 1023):
+                    if pos >= capacity:
+                        continue
                     ids[pos, pos % topk] = (pos + rank) % experts
             elif state == "asymmetric":
                 valid_counts = (0, capacity) if world == 2 else (0, 1, 129, capacity)
@@ -204,7 +220,13 @@ def _check_sparse_to_dense_graph_multirank(
             )
             assert rows.numel() == capacity
             _barrier()
-            ws._pre_reduced_activation.view(torch.bfloat16).fill_(float("nan"))
+            combine = ws._pre_reduced_activation.view(torch.bfloat16)
+            combine.fill_(float("nan"))
+            if family == "genphase" and ws.kernel.epilogue.combine_ll_encoded:
+                # Zero means pending arrival in the encoded plane. Poison only
+                # inactive slots so active cells cannot falsely signal ready.
+                active = (ids >= 0) & (ids < experts)
+                combine.masked_fill_(active.unsqueeze(-1), 0)
             output.fill_(float("nan"))
             # Peers write the poisoned buffers. Finish poisoning on EVERY rank
             # before any peer starts, or the diagnostic itself introduces a race.
@@ -250,12 +272,38 @@ def test_sparse_to_dense_genphase_quiescence(ep_runtime, monkeypatch, early):
     """Stress empty-work reset with slower payload progress per pusher warp."""
     pkg.require_sm107_dsl()
     pkg.bootstrap_paths()
-    from sources import RubinInferenceGenphaseMegaMoE
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src import (
+        RubinInferenceGenphaseMegaMoE,
+    )
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.kernel_src.rubin.inference.mega.token_comm_gen_specialized import (
+        GenphaseTokenComm,
+    )
 
     # This private geometry changes relative producer/consumer progress without
     # changing the math. Empty work must drain both the router and all main
     # roles before clearing readiness flags; epilogue completion is insufficient.
-    monkeypatch.setattr(RubinInferenceGenphaseMegaMoE, "pusher_cta_count", 7)
+    monkeypatch.setattr(
+        RubinInferenceGenphaseMegaMoE,
+        "pusher_cta_count",
+        GenphaseTokenComm.sf_pusher_cta_count + 7,
+    )
     _check_sparse_to_dense_graph_multirank(
         ep_runtime, "genphase", "mxfp8_e4m3", 4, 1024, early
+    )
+
+
+@pytest.mark.parametrize("topk", [31, 32, 33])
+@pytest.mark.parametrize("early", [False, True])
+def test_genphase_large_topk_remote_graph(ep_runtime, topk, early):
+    # Ranks without expert work must wait for the remote FC2 stores before
+    # static reduction; the polled path waits on its encoded cells instead.
+    _check_sparse_to_dense_graph_multirank(
+        ep_runtime,
+        "genphase",
+        "mxfp8_e4m3",
+        4,
+        512,
+        early,
+        topk_override=topk,
+        remote_experts_only=True,
     )

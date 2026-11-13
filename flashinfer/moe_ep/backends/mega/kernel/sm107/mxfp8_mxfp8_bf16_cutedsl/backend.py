@@ -213,6 +213,8 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             situ_linear_beta=k.situ_linear_beta,
             swiglu_alpha=getattr(k, "swiglu_alpha", None),
             swiglu_beta=getattr(k, "swiglu_beta", None),
+            use_tanh_sigmoid=k.use_tanh_sigmoid,
+            epilogue_warpgroups=k.epilogue_warpgroups,
             gate_up_clamp=_resolve_gate_up_clamp(k),
             batch_invariant=getattr(k, "batch_invariant", False),
             batch_invariant_version=block_scaled_batch_invariant_version(k)
