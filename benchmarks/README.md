@@ -351,7 +351,7 @@ never on the batch size, the row's position in the batch or the kernel configura
 | `--routed_scaling_factor`| Scaling factor for routing. Default: 2.5                                                                   |
 | `--local_expert_offset`  | Offset of local experts in global expert space. Default: 0                                                 |
 | `--local_num_experts`    | Number of experts handled by this device. Default: equals num_experts                                      |                                                                    |
-| `--routing_method`       | Routing method: `renormalize`, `deepseek_v3`, `llama4`, `renormalize_naive`. Default: `deepseek_v3`.       |
+| `--routing_method`       | Routing method: `renormalize`, `deepseek_v3`, `llama4`, `renormalize_naive`, `topk`, `sigmoid_renorm`, `minimax2`, `sigmoid`, `topk_sigmoid`. Default: `deepseek_v3`. |
 | `--use_shuffled_weight`  | Whether to use shuffled weight layout                                                                      |
 | `--weight_layout`        | Weight layout: 0=MajorK, 1=MajorMn,  2=BlockMajorK. Default: 0                                             |
 | `--use_routing_bias`     | Whether to use routing bias                                                                                |
@@ -372,9 +372,12 @@ never on the batch size, the row's position in the batch or the kernel configura
 | Routing Method         | Requirements | Compatible MOE Types |
 |------------------------|--------------|---------------------|
 | **deepseek_v3**        | `top_k <= 8`, `topk_group <= 4`, requires `--n_group`, `--topk_group`, `--routed_scaling_factor`, `--use_routing_bias` | FP4, FP8 Block Scale |
+| **deepseek_v3** (ungrouped) | `--n_group 1 --topk_group 1` (GLM-5, Kimi-K2 style sigmoid + bias top-k), requires `--use_routing_bias` | FP4, FP8 Block Scale, FP8 Per-Tensor |
 | **renormalize**        | `top_k == 1` for FP8 Block Scale, `top_k <= 8` for FP4. Do NOT use `--n_group` or `--topk_group` | All MOE types |
 | **llama4**             | `top_k == 1`, requires `--routed_scaling_factor`, `--use_routing_bias`, `--use_routing_scales_on_input`. Do NOT use `--n_group` or `--topk_group` | FP8 Per-Tensor |
 | **renormalize_naive**  | `top_k == 1` for FP8 Block Scale, `top_k <= 8` for FP4. Do NOT use `--n_group` or `--topk_group` | FP4 primarily |
+| **minimax2**           | Sigmoid + bias -> top-k -> renormalize, requires `--use_routing_bias`. Do NOT use `--n_group` or `--topk_group` | FP4, FP8 Block Scale, FP8 Per-Tensor |
+| **sigmoid_renorm**, **sigmoid**, **topk_sigmoid** | `top_k <= 32`. Do NOT use `--n_group` or `--topk_group` | FP4, FP8 Block Scale, FP8 Per-Tensor |
 
 Notes:
 - Group parameters (`--n_group`, `--topk_group`) are ONLY used with DeepSeekV3 routing method. Using them with other routing methods will cause the error: "Routing kernel with groups implies DeepSeekV3 routing method."
