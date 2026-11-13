@@ -48,6 +48,7 @@ from .cudnn.prefill import (
     _cudnn_supports_direct_seqlens,
     _cudnn_supports_paged_token_offsets,
     _cudnn_supports_paged_auto,
+    _cudnn_supports_paged_fp16_auto,
     _cudnn_supports_paged_gqa_auto,
     _cudnn_supports_paged_full_prefill_auto,
     CudnnPrefillGraph,
@@ -2566,7 +2567,11 @@ def _blackwell_paged_gqa_auto_cudnn(
     """Measured D256 prefix domain using already available CPU lengths."""
     if not (
         layout == "HND"
-        and q_dtype == kv_dtype == o_dtype == torch.bfloat16
+        and q_dtype == kv_dtype == o_dtype
+        and (
+            q_dtype == torch.bfloat16
+            or (q_dtype == torch.float16 and _cudnn_supports_paged_fp16_auto())
+        )
         and head_dim_qk == head_dim_vo
         and head_dim_qk == 256
         and 1 <= batch <= 4
@@ -2635,7 +2640,11 @@ def _blackwell_paged_full_prefill_auto_cudnn(
     """Additional full-prefill domains proven from existing CPU metadata."""
     if not (
         layout == "HND"
-        and q_dtype == kv_dtype == o_dtype == torch.bfloat16
+        and q_dtype == kv_dtype == o_dtype
+        and (
+            q_dtype == torch.bfloat16
+            or (q_dtype == torch.float16 and _cudnn_supports_paged_fp16_auto())
+        )
         and head_dim_qk == head_dim_vo
         and 8 <= hq <= 64
         and hk > 0
@@ -2751,7 +2760,11 @@ def _blackwell_paged_auto_cudnn(
         return False
     if not (
         layout == "HND"
-        and q_dtype == kv_dtype == o_dtype == torch.bfloat16
+        and q_dtype == kv_dtype == o_dtype
+        and (
+            q_dtype == torch.bfloat16
+            or (q_dtype == torch.float16 and _cudnn_supports_paged_fp16_auto())
+        )
         and head_dim_qk == head_dim_vo == 128
         and batch > 0
         and 8 <= hq <= 64

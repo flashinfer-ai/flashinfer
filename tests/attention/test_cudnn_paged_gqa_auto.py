@@ -12,11 +12,15 @@ from flashinfer.cudnn import prefill as cudnn_prefill
 @pytest.mark.parametrize("dim", [256])
 @pytest.mark.parametrize("capacity", [128, 256])
 @pytest.mark.parametrize("return_lse", [False, True])
-@pytest.mark.parametrize("dtype,backend", [(torch.bfloat16, "auto")])
+@pytest.mark.parametrize(
+    "dtype,backend", [(torch.bfloat16, "auto"), (torch.float16, "auto")]
+)
 def test_paged_gqa_auto_retained_capture(dtype, backend, return_lse, dim, capacity):
     """Physical token origins and explicit masks work on 9.24 without mixed forms."""
     from packaging.version import Version
 
+    if dtype == torch.float16 and not cudnn_prefill._cudnn_supports_paged_fp16_auto():
+        pytest.skip("FP16 auto requires stable FE 1.33")
     cudnn = cudnn_prefill.cudnn
     if (
         cudnn.backend_version() < 92400

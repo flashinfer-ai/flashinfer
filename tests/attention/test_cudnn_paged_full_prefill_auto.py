@@ -8,12 +8,15 @@ import flashinfer
 from flashinfer.cudnn import prefill as cp
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "dim,group", [(128, 4), (256, 1), (256, 2), (256, 4), (256, 8), (256, 16)]
 )
 @pytest.mark.parametrize("page", [16, 64])
 @pytest.mark.parametrize("return_lse", [False, True])
-def test_full_prefill_auto_retained_capture(dim, group, page, return_lse):
+def test_full_prefill_auto_retained_capture(dtype, dim, group, page, return_lse):
+    if dtype == torch.float16 and not cp._cudnn_supports_paged_fp16_auto():
+        pytest.skip("FP16 auto requires stable FE 1.33")
     if torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
@@ -30,7 +33,7 @@ def test_full_prefill_auto_retained_capture(dim, group, page, return_lse):
     indices = torch.randperm(2 * per_row, device="cuda", dtype=torch.int32)
     table = indices.view(2, per_row).clone()
     last = (lengths - 1) % page + 1
-    q_storage = torch.randn(total, 3, hq, dim, device="cuda", dtype=torch.bfloat16)
+    q_storage = torch.randn(total, 3, hq, dim, device="cuda", dtype=dtype)
     q = q_storage[:, 0]
     kv = torch.randn(2 * per_row, 2, hk, page, dim, device="cuda", dtype=q.dtype)
     k, v = kv[:, 0], kv[:, 1]

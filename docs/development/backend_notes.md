@@ -161,6 +161,19 @@ its matching native packed-split/physical-origin checks. FE's full-prefill
 placement is a dependency; a source-build result is not released-wheel or
 serving/TTFT qualification. Neither FI admission nor execution forces an engine.
 
+### FP16 paged auto admission
+
+With stable FE 1.33+, matching FP16 Q/KV/output uses the same paged admission
+regions as BF16 described above. All architecture, layout, length, paired-work,
+metadata and native width guards still apply. Earlier FE versions retain the
+existing FP16 route; BF16 admission is unchanged. This dtype transfer depends on
+FE's FP16 graph-declaration placement rules and uses the common backend/FROST
+graph contract, without selecting a particular engine.
+
+The transfer changes admission only. Existing shape-override eligibility is
+unchanged. Test actual FP16 auto execution and retained captures; matching
+predicate decisions alone does not establish runtime or performance parity.
+
 ## Grouped FP8 GEMM
 
 `flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous` is the standalone
