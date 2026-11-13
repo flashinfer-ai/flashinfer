@@ -238,13 +238,13 @@ def test_hopper_paged_auto_runtime_scales(nq, nk):
         torch.testing.assert_close(lse, stats.float(), atol=0.003, rtol=0.003)
 
 
-@pytest.mark.parametrize("first", ["fa3", "cudnn"])
+@pytest.mark.parametrize("first", ["fa3", "cudnn", "cudnn_grow"])
 @pytest.mark.parametrize("return_lse", [False, True])
 def test_hopper_work_boundary_preserves_captures(first, return_lse):
     require_h100()
     nq, hq, hk, d, page, capacity = 65, 32, 8, 256, 16, 8192
     lengths = [8064, 8192]
-    start = int(first == "cudnn")
+    start = int(first != "fa3")
     qptr = torch.tensor([0, nq], dtype=torch.int32)
     indices = torch.arange(capacity // page, dtype=torch.int32, device="cuda")
     w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
@@ -311,11 +311,22 @@ def test_hopper_work_boundary_preserves_captures(first, return_lse):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream):
         v.copy_((positions >= 8000)[:, None, :, None] * 8)
+        if first == "cudnn_grow":
+            # Both plans select cuDNN. The first uses 507 of 512 reserved
+            # indices and must not prevent the later plan from using them all.
+            plan(8112)
+            assert w._backend == "cudnn" and w._cudnn_paged_bounds is None
+            table_ptr = w._cudnn_block_tables.data_ptr()
         plan(lengths[start])
-        assert w._backend == first
+        assert w._backend == ("cudnn" if first == "cudnn_grow" else first)
+        if first == "cudnn_grow":
+            assert w._cudnn_block_tables.data_ptr() == table_ptr
+            assert w._cudnn_block_tables.shape == (1, capacity // page)
         for _ in range(5):
             run()
         check(lengths[start], 8)
+        # Capture at the larger exact bound: retained replay is valid only
+        # within its declaration, even when the table reserves more storage.
         with torch.cuda.graph(graph, stream=stream):
             run()
         for phase, nk in enumerate([lengths[1 - start], lengths[start]]):

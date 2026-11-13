@@ -64,7 +64,12 @@ A reserved table can exceed a capture's KV range. Declare only that range,
 preserving its storage row stride and pointer. Intersect the explicit KV maximum
 with caller-table capacity; use the same bound for the attention attribute and
 table slice. Device lengths still mask live tokens without host readback.
-Capacity must cover initialized indices and rounded graph bounds.
+Capacity must cover reserved indices and rounded graph bounds. Reserve the
+owned table from graph-mode index capacity even when declarations are exact
+(for example on Hopper). Test a small first cuDNN plan followed by a larger
+page count within that reservation, then capture at the larger bound and
+validate retained replay through shorter and longer replans. Reserved storage
+does not extend the valid length range of an already captured graph.
 
 Test changed page IDs and lengths, replacement by a caller table of another
 width, and Q-partition changes after a caller-owned first plan. Shortening a KV
