@@ -109,31 +109,31 @@ kernel_cake_deepgemm_mixed_gemm_883f34018b1552e06e4b(const __grid_constant__ CUt
             // Stage-major initialization across barrier declarations.
             mbarrier_init(smem + 213504, 66);
             mbarrier_init(smem + 213560, 1);
-            mbarrier_init(smem + 213616, 1);
+            mbarrier_init(smem + 213616, 33);
             mbarrier_init(smem + 213672, 1);
             mbarrier_init(smem + 213688, 256);
             mbarrier_init(smem + 213704, 256);
             mbarrier_init(smem + 213512, 66);
             mbarrier_init(smem + 213568, 1);
-            mbarrier_init(smem + 213624, 1);
+            mbarrier_init(smem + 213624, 33);
             mbarrier_init(smem + 213680, 1);
             mbarrier_init(smem + 213696, 256);
             mbarrier_init(smem + 213712, 256);
             mbarrier_init(smem + 213520, 66);
             mbarrier_init(smem + 213576, 1);
-            mbarrier_init(smem + 213632, 1);
+            mbarrier_init(smem + 213632, 33);
             mbarrier_init(smem + 213528, 66);
             mbarrier_init(smem + 213584, 1);
-            mbarrier_init(smem + 213640, 1);
+            mbarrier_init(smem + 213640, 33);
             mbarrier_init(smem + 213536, 66);
             mbarrier_init(smem + 213592, 1);
-            mbarrier_init(smem + 213648, 1);
+            mbarrier_init(smem + 213648, 33);
             mbarrier_init(smem + 213544, 66);
             mbarrier_init(smem + 213600, 1);
-            mbarrier_init(smem + 213656, 1);
+            mbarrier_init(smem + 213656, 33);
             mbarrier_init(smem + 213552, 66);
             mbarrier_init(smem + 213608, 1);
-            mbarrier_init(smem + 213664, 1);
+            mbarrier_init(smem + 213664, 33);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -301,6 +301,9 @@ kernel_cake_deepgemm_mixed_gemm_883f34018b1552e06e4b(const __grid_constant__ CUt
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((full_addr + (stage_2) * 8) & 0xFEFFFFFF) : "memory");
+                    asm volatile(
+                        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+                        :: "r"(empty_addr + (stage_2) * 8) : "memory");
                     stage_2 += 1;
                     if (stage_2 == 7) { stage_2 = 0; _phase_sf_full ^= 1; }
                 }

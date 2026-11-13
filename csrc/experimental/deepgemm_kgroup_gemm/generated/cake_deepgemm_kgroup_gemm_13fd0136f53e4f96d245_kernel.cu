@@ -156,59 +156,59 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
 #if CAKE_KGROUP_OUT_MODE == 2
             mbarrier_init(smem + 144384, 130);
             mbarrier_init(smem + 144440, 1);
-            mbarrier_init(smem + 144496, 1);
+            mbarrier_init(smem + 144496, 65);
             mbarrier_init(smem + 144552, 1);
             mbarrier_init(smem + 144568, 256);
             mbarrier_init(smem + 144584, 256);
             mbarrier_init(smem + 144392, 130);
             mbarrier_init(smem + 144448, 1);
-            mbarrier_init(smem + 144504, 1);
+            mbarrier_init(smem + 144504, 65);
             mbarrier_init(smem + 144560, 1);
             mbarrier_init(smem + 144576, 256);
             mbarrier_init(smem + 144592, 256);
             mbarrier_init(smem + 144400, 130);
             mbarrier_init(smem + 144456, 1);
-            mbarrier_init(smem + 144512, 1);
+            mbarrier_init(smem + 144512, 65);
             mbarrier_init(smem + 144408, 130);
             mbarrier_init(smem + 144464, 1);
-            mbarrier_init(smem + 144520, 1);
+            mbarrier_init(smem + 144520, 65);
             mbarrier_init(smem + 144416, 130);
             mbarrier_init(smem + 144472, 1);
-            mbarrier_init(smem + 144528, 1);
+            mbarrier_init(smem + 144528, 65);
             mbarrier_init(smem + 144424, 130);
             mbarrier_init(smem + 144480, 1);
-            mbarrier_init(smem + 144536, 1);
+            mbarrier_init(smem + 144536, 65);
             mbarrier_init(smem + 144432, 130);
             mbarrier_init(smem + 144488, 1);
-            mbarrier_init(smem + 144544, 1);
+            mbarrier_init(smem + 144544, 65);
 #else
             mbarrier_init(smem + 152576, 130);
             mbarrier_init(smem + 152632, 1);
-            mbarrier_init(smem + 152688, 1);
+            mbarrier_init(smem + 152688, 65);
             mbarrier_init(smem + 152744, 1);
             mbarrier_init(smem + 152760, 256);
             mbarrier_init(smem + 152776, 256);
             mbarrier_init(smem + 152584, 130);
             mbarrier_init(smem + 152640, 1);
-            mbarrier_init(smem + 152696, 1);
+            mbarrier_init(smem + 152696, 65);
             mbarrier_init(smem + 152752, 1);
             mbarrier_init(smem + 152768, 256);
             mbarrier_init(smem + 152784, 256);
             mbarrier_init(smem + 152592, 130);
             mbarrier_init(smem + 152648, 1);
-            mbarrier_init(smem + 152704, 1);
+            mbarrier_init(smem + 152704, 65);
             mbarrier_init(smem + 152600, 130);
             mbarrier_init(smem + 152656, 1);
-            mbarrier_init(smem + 152712, 1);
+            mbarrier_init(smem + 152712, 65);
             mbarrier_init(smem + 152608, 130);
             mbarrier_init(smem + 152664, 1);
-            mbarrier_init(smem + 152720, 1);
+            mbarrier_init(smem + 152720, 65);
             mbarrier_init(smem + 152616, 130);
             mbarrier_init(smem + 152672, 1);
-            mbarrier_init(smem + 152728, 1);
+            mbarrier_init(smem + 152728, 65);
             mbarrier_init(smem + 152624, 130);
             mbarrier_init(smem + 152680, 1);
-            mbarrier_init(smem + 152736, 1);
+            mbarrier_init(smem + 152736, 65);
 #endif  // CAKE_KGROUP_OUT_MODE
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
@@ -458,6 +458,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((full_addr + (stage_2) * 8) & 0xFEFFFFFF) : "memory");
+                    asm volatile(
+                        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+                        :: "r"(empty_addr + (stage_2) * 8) : "memory");
                     stage_2 += 1;
                     if (stage_2 == 7) { stage_2 = 0; _phase_sf_full ^= 1; }
                 }
