@@ -224,6 +224,7 @@ class JitSpecCuteDsl(JitSpec):
     def compile_and_persist(self) -> None:
         """Compile unconditionally, then commit under the module lock.
 
+        Meant for parallel precompilation workers.
         Persistence is best-effort; on-demand callers can retain the compiled
         kernel in memory when exporting fails.
         """
