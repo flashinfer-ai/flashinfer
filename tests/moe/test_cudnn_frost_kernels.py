@@ -29,7 +29,11 @@ from flashinfer.fused_moe.backends.cudnn_frost.cache import (
 )
 from flashinfer.fused_moe.backends.cudnn_frost.activations import (
     ACTIVATIONS,
+    KNOWN_ACTIVATIONS,
     activation_name,
+    is_gated,
+    launch_scalars,
+    SWIGLU_PARAM_SCALARS,
 )
 from flashinfer.fused_moe.backends.cudnn_frost.mxfp8 import (
     runtime as mxfp8,
@@ -101,6 +105,10 @@ BF16_SHORTLIST_GEOMETRIES = {
 }
 
 
+# swiglu_param sources take alpha/beta/limit at launch (gpt-oss values).
+_PARAM_SWIGLU = SwiGLU(alpha=1.702, beta=1.0, limit=7.0)
+
+
 def _sm120():
     """SM120 kernels store through STG only: no TMA store, CTA pair or FMA."""
     return torch.cuda.get_device_capability() == (12, 0)
@@ -169,12 +177,16 @@ def _bf16_moe_reference(act, weights, activation=None):
 
 @graph_retention
 @frost_gpu
-@pytest.mark.parametrize("name", [name for name in ACTIVATIONS if name != "swiglu"])
+@pytest.mark.parametrize(
+    "name", [name for name in KNOWN_ACTIVATIONS if name != "swiglu"]
+)
 @pytest.mark.parametrize("tokens,topk", [(17, 1), (129, 4)])
 def test_bf16_extended_activations_graph_and_routing(name, tokens, topk, monkeypatch):
+    if name == "swiglu_param" and not _sm120():
+        pytest.skip("swiglu_param sources are packaged for SM120a")
     monkeypatch.setitem(sys.modules, "cudnn", None)
     torch.manual_seed(81)
-    activation = ACTIVATIONS[name]()
+    activation = _PARAM_SWIGLU if name == "swiglu_param" else ACTIVATIONS[name]()
     cfg = replace(bf16_config(topk), activation=activation)
     act, weights = bf16_packs(tokens=tokens, topk=topk)
     view = weights.get_view("cutlass_bf16")
@@ -216,10 +228,11 @@ def test_bf16_extended_activations_graph_and_routing(name, tokens, topk, monkeyp
         assert relative_l2 < 0.005
 
 
+# A non-default SwiGLU runs the swiglu_param sources, which read alpha, beta and
+# limit at launch (test_cudnn_frost_swiglu_param.py).
 @pytest.mark.parametrize(
     "activation",
     [
-        ACTIVATIONS["swiglu"](alpha=2),
         ACTIVATIONS["swiglu_step"](limit=4),
         ACTIVATIONS["situ"](gate_scale=2),
         ACTIVATIONS["situ"](linear_scale=None),
@@ -387,7 +400,7 @@ def test_bf16_model_geometry_artifacts_ragged_graph(
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"activation": SwiGLU(alpha=2.0)},
+        {"activation": ACTIVATIONS["swiglu_step"](limit=4.0)},
         {"finalize": MoEFinalizeConfig(do_finalize=False)},
         {"experts": ExpertConfig(intermediate_size=256, local_expert_offset=1)},
     ],
@@ -826,9 +839,7 @@ def test_sm120_sources_roundtrip_without_cudnn(dtype, monkeypatch):
         # of one topology share a template and differ only in exact fragments.
         assert record["id"].startswith(f"sm120_cudnn_frost_{record['op']}_{dtype}_")
         stage = "fc2" if record["op"].endswith("gemm2") else "fc1"
-        gated = (
-            stage == "fc1" and ACTIVATIONS[record["contract"]["activation"]]().is_gated
-        )
+        gated = stage == "fc1" and is_gated(record["contract"]["activation"])
         assert entry["path"] == (
             f"sources/sm120_{stage}_{'gated' if gated else 'non_gated'}"
             f"_{'swap' if swap else 'normal'}_{'quantized' if quantized else 'bf16'}_stg.py"
@@ -890,8 +901,9 @@ def test_sm120_sources_roundtrip_without_cudnn(dtype, monkeypatch):
         assert ast.dump(ast.parse(render_source(extracted, parameters))) == ast.dump(
             ast.parse(concrete)
         )
+    # SM120 also packages swiglu_param: SwiGLU with launch-time alpha/beta/limit.
     assert {op for op, _, _ in families} == {
-        *(f"{prefix}grouped_gemm1_{name}" for name in ACTIVATIONS),
+        *(f"{prefix}grouped_gemm1_{name}" for name in KNOWN_ACTIVATIONS),
         f"{prefix}grouped_gemm2",
     }
     assert {swap for _, _, swap in families} == {False, True}
@@ -1711,8 +1723,12 @@ def _assert_block_scale_geometry_roundtrip(
             tree
         )
     assert {r["op"] for r in records} == {
-        *(f"block_scale_grouped_gemm1_{name}" for name in ACTIVATIONS),
+        *(f"block_scale_grouped_gemm1_{name}" for name in KNOWN_ACTIVATIONS),
         "block_scale_grouped_gemm2",
+    }
+    # Launch-time SwiGLU parameters are packaged for SM120 only.
+    assert {r["arch"] for r in records if r["op"].endswith("_swiglu_param")} == {
+        "sm_120a"
     }
     # Offline selection may retain different numbers of geometries and ABI
     # families. Every geometry of one family shares one source;
@@ -2077,14 +2093,19 @@ def _assert_block_scale_launch_abi(runtime, *, packed, block, packed_weights=Non
         out = torch.empty(s, n, dtype=torch.bfloat16)
         workspace = torch.empty(kernel.workspace_bytes, dtype=torch.uint8)
         scale = torch.ones(1, 1, 1)
-        activation_scales = (
-            {
+        activation_scales = {}
+        if kernel.activation == "situ":
+            activation_scales = {
                 "gate_scale": torch.full((1, 1, 1), 4.0),
                 "linear_scale": torch.full((1, 1, 1), 25.0),
             }
-            if kernel.activation == "situ"
-            else {}
-        )
+        elif kernel.activation == "swiglu_param":
+            activation_scales = {
+                name: torch.full((1, 1, 1), value)
+                for name, value in zip(
+                    SWIGLU_PARAM_SCALARS, launch_scalars(_PARAM_SWIGLU), strict=True
+                )
+            }
         gemm_scales = tuple(torch.arange(groups, dtype=torch.float32) + 0.5 for _ in w)
         kwargs = {"gemm_scales": gemm_scales}
         args = runtime._launch_arguments(
@@ -2205,12 +2226,14 @@ def _assert_mxfp8_grouped_kernel_and_graph(runtime, kernel, monkeypatch, mixed=F
             (torch.randn(e, n, k, device="cuda") * 0.1).to(x.dtype)
             for _ in range(2 if kernel.gated else 1)
         )
-    if kernel.activation in ("situ", "swiglu_step"):
+    if kernel.activation in ("situ", "swiglu_step", "swiglu_param"):
         # Exercise saturation/clamps, rather than only their small-signal limits.
         x.copy_((x.float() * 16).to(x.dtype))
         if not mixed:
             for weight in w:
                 weight.copy_((weight.float() * 16).to(weight.dtype))
+    # swiglu_param kernels read alpha/beta/limit at launch.
+    param = kernel.activation == "swiglu_param"
     a_sf = torch.randint(125, 128, (s, k // 32), dtype=torch.uint8, device="cuda")
     b_sf = tuple(
         torch.randint(125, 128, (e, n, k // 32), dtype=torch.uint8, device="cuda")
@@ -2248,6 +2271,7 @@ def _assert_mxfp8_grouped_kernel_and_graph(runtime, kernel, monkeypatch, mixed=F
         out,
         scale=scale,
         gemm_scales=alphas,
+        **({"activation": _PARAM_SWIGLU} if param else {}),
     )
 
     def reference():
@@ -2278,7 +2302,7 @@ def _assert_mxfp8_grouped_kernel_and_graph(runtime, kernel, monkeypatch, mixed=F
                 values = (
                     compute_reference_activation(
                         values.float(),
-                        ACTIVATIONS[kernel.activation](),
+                        _PARAM_SWIGLU if param else ACTIVATIONS[kernel.activation](),
                         n,
                         out_dtype=torch.float32,
                     )
@@ -2964,7 +2988,7 @@ def _nvfp4_dequant(data, scales):
 
 
 @frost_gpu
-@pytest.mark.parametrize("name", [*ACTIVATIONS, "fc2"])
+@pytest.mark.parametrize("name", [*KNOWN_ACTIVATIONS, "fc2"])
 @pytest.mark.parametrize(
     "swap_ab,store", [(False, "stg"), (False, "tma"), (True, "stg"), (True, "tma")]
 )
@@ -3003,7 +3027,7 @@ def test_nvfp4_grouped_kernel_extremes_alpha_and_graph(
         [0x00, 0x88, 0x77, 0xFF, 0x7F, 0xF7], device="cuda", dtype=torch.uint8
     )
     sf_values = torch.tensor([0.03125, 0.0625, 0.125], device="cuda")
-    if name in ("situ", "swiglu_step"):
+    if name in ("situ", "swiglu_step", "swiglu_param"):
         sf_values *= 8
     a_sf = sf_values[torch.randint(3, (s, k // 16), device="cuda")].to(
         torch.float8_e4m3fn
@@ -3023,6 +3047,8 @@ def test_nvfp4_grouped_kernel_extremes_alpha_and_graph(
     scale = torch.full((1, 1, 1), 0.5, device="cuda") if kernel.fc1 else None
     packed_a = nvfp4.pack_token_scales(a_sf, offsets)
     out = torch.empty(s, n, dtype=torch.bfloat16, device="cuda")
+    # swiglu_param kernels read alpha/beta/limit at launch.
+    activation = _PARAM_SWIGLU if name == "swiglu_param" else None
     plan = nvfp4.PreparedNvfp4GroupedGemm(
         kernel,
         x,
@@ -3033,6 +3059,7 @@ def test_nvfp4_grouped_kernel_extremes_alpha_and_graph(
         out,
         scale=scale,
         gemm_scales=alphas,
+        **({"activation": activation} if activation else {}),
     )
 
     def reference():
@@ -3048,7 +3075,10 @@ def test_nvfp4_grouped_kernel_extremes_alpha_and_graph(
             if kernel.fc1:
                 values = (
                     compute_reference_activation(
-                        values, ACTIVATIONS[name](), n, out_dtype=torch.float32
+                        values,
+                        activation or ACTIVATIONS[name](),
+                        n,
+                        out_dtype=torch.float32,
                     )
                     * scale.flatten()[0]
                 )
@@ -3800,7 +3830,7 @@ def test_mxfp8_mxfp4_auto_admission_uses_logical_hidden_size(name):
 
 
 @frost_gpu
-@pytest.mark.parametrize("name", [*ACTIVATIONS, "fc2"])
+@pytest.mark.parametrize("name", [*KNOWN_ACTIVATIONS, "fc2"])
 @pytest.mark.parametrize(
     "swap_ab,store", [(False, "stg"), (False, "tma"), (True, "stg"), (True, "tma")]
 )

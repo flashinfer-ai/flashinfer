@@ -2950,16 +2950,43 @@ class CudnnFrostMxfp8Config:
 class CudnnFrostNvfp4Config:
     """Frost NVFP4 MoE on SM107 and SM120, with packed precomputed routing.
 
-    Register prepared weights under ``cudnn_frost_nvfp4``. The canonical
-    ``cutlass_nvfp4`` view is also accepted without conversion. H/I must be
-    multiples of 128. Pass the layer's quant config to prepare_activations.
+    Register prepared weights under ``cudnn_frost_nvfp4``. H/I must be
+    multiples of 128 on SM107 and of 64 on SM120 (e.g. gpt-oss, 2880). The
+    canonical ``cutlass_nvfp4`` view is also accepted without conversion,
+    except for a gated activation whose I is not a multiple of 128: its FC1
+    block scales must be split per branch, which ``prepare_weights`` does.
+    Pass the layer's quant config to prepare_activations.
     """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
         return arch in (107, 120)
 
-    prepare_weights = staticmethod(CutlassNvfp4Config.prepare_weights)
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Quantize canonical BF16 weights into the CUTLASS NVFP4 view, with
+        per-branch FC1 block scales where Frost needs them."""
+        from .prepare import prepare_cudnn_frost_nvfp4_weights
+
+        return prepare_cudnn_frost_nvfp4_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
     prepare_activations = staticmethod(CutlassNvfp4Config.prepare_activations)
 
 

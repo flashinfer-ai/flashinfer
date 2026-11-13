@@ -15,7 +15,12 @@ from typing import Any
 import torch
 
 from .....autotuner import OptimizationProfile, TunableRunner
-from ..activations import ACTIVATIONS, contract_activation, is_gated
+from ..activations import (
+    KNOWN_ACTIVATIONS,
+    SWIGLU_PARAM_SCALARS,
+    contract_activation,
+    is_gated,
+)
 
 from ..runtime import (
     _MANIFEST as _MANIFEST,
@@ -113,7 +118,7 @@ def _read_root(
         if not op.startswith("grouped_gemm1_"):
             continue
         activation = contract_activation(raw.get("contract", {}))
-        if activation not in ACTIVATIONS or op != f"grouped_gemm1_{activation}":
+        if activation not in KNOWN_ACTIVATIONS or op != f"grouped_gemm1_{activation}":
             raise RuntimeError(f"Invalid FC1 activation contract: {artifact_id}")
         if any(
             raw["contract"].get(key) != "bfloat16"
@@ -137,11 +142,11 @@ def _read_root(
                 "multiple of 128 bytes"
             )
         launch_tail = tuple(raw.get("launch", {}).get("tail", ()))
-        expected_tail = (
-            {"output", "scale", "gate_scale", "linear_scale"}
-            if activation == "situ"
-            else {"output", "scale"}
-        )
+        expected_tail = {"output", "scale"}
+        if activation == "situ":
+            expected_tail |= {"gate_scale", "linear_scale"}
+        elif activation == "swiglu_param":
+            expected_tail |= set(SWIGLU_PARAM_SCALARS)
         if set(launch_tail) != expected_tail or len(launch_tail) != len(expected_tail):
             raise RuntimeError(
                 f"{path}: kernel {artifact_id!r} has unsupported launch tail "
