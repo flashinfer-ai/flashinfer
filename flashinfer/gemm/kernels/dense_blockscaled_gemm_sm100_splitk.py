@@ -46,6 +46,7 @@ from cutlass import Float32, Int32
 from cutlass._mlir.dialects import llvm
 from .dense_blockscaled_gemm_sm100 import _per_token_fragment_plan
 from .dense_blockscaled_gemm_sm100_common import _Sm100BlockScaledGemmCommon
+from flashinfer.cute_dsl.utils import mbarrier_wait_acquire_cluster
 
 from cutlass.cutlass_dsl import (
     T,
@@ -1614,7 +1615,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                                     * (cute.size(epi_tile[0]) * cute.size(epi_tile[1]))
                                     * 4,
                                 )
-                        cute.arch.mbarrier_wait(reduce_mbar_ptr, phase=0)
+                        mbarrier_wait_acquire_cluster(reduce_mbar_ptr, Int32(0))
 
                         local_thread_base = (
                             subtile_mailbox_base + epi_tidx * values_per_thread

@@ -74,6 +74,8 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.utils.gemm.tensor_utils import decode_float4e2m1fn
+
+from flashinfer.cute_dsl.utils import mbarrier_wait_acquire_cluster
 from cutlass.pipeline import (
     PipelineAsync,
     PipelineAsyncUmma,
@@ -1838,7 +1840,7 @@ class LowLatencyBlockscaledGemmKernel:
                             cutlass.Int32(peer),
                         )
 
-            cute.arch.mbarrier_wait(mailbox_mbar, 0)
+            mbarrier_wait_acquire_cluster(mailbox_mbar, cutlass.Int32(0))
 
             my_shard_start = split_rank * shard_ept
             for s in range(self.split_k - 1):

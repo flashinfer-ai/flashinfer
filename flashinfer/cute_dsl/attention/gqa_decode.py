@@ -28,6 +28,7 @@ from cutlass.cute.typing import (
     Optional,
 )
 
+from flashinfer.cute_dsl.utils import mbarrier_wait_acquire_cluster
 from flashinfer.cute_dsl.attention.fusion.mask import (
     AttentionMask,
     DenseMask,
@@ -1816,8 +1817,7 @@ class GroupedQueryAttentionDecode:
                     cute.copy(
                         dsmem_store_atom_r, tRrM_final, tRsR_peer, mbar_ptr=peer_mbar
                     )
-                    cute.arch.fence_acq_rel_cta()  # dont reorder dsmem store after wait
-                    cute.arch.mbarrier_wait(local_mbar, phase=0)
+                    mbarrier_wait_acquire_cluster(local_mbar, Int32(0))
                     tRrR = tRsR_local.load()
                     for j in cutlass.range_constexpr(cute.size(tRrM_final)):
                         tRrM_final[j] = cute.arch.fmax(tRrM_final[j], tRrR[j])
@@ -1852,8 +1852,7 @@ class GroupedQueryAttentionDecode:
                     cute.copy(
                         dsmem_store_atom_r, tRrL_local, tRsR_peer, mbar_ptr=peer_mbar
                     )
-                    cute.arch.fence_acq_rel_cta()  # dont reorder dsmem store after wait
-                    cute.arch.mbarrier_wait(local_mbar, phase=0)
+                    mbarrier_wait_acquire_cluster(local_mbar, Int32(0))
                     colsum += tRsR_local.load()
 
             if cutlass.const_expr(sSink is not None):
