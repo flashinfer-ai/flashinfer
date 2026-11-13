@@ -296,6 +296,9 @@ __device__ DataType calcSoftmax(cg::thread_block_tile<WarpSize> const& warp, Dat
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // The NumBlocks CTAs of one cluster share the expanded indexes and exchange their histograms
 // through distributed shared memory. With NumBlocks == 1 a single CTA (no cluster) does all of it.
+// The CUDA headers declare the cluster intrinsics only for SM90+, so the statements using them are
+// compiled only there, also in branches that if constexpr discards. Below SM90 only the single-CTA
+// permutation of precomputed top-k ids compiles.
 template <typename KernelParams, typename BaseType, int NumThreads, int NumWarps,
           int MaxNumTopExperts, bool LoadExpertIdxFromGlobal = false,
           typename PrecomputedExpertId = int32_t, int NumBlocks = NumBlocksPerCluster>
@@ -305,6 +308,10 @@ __device__ void routingPermutation(KernelParams params,
                                    PrecomputedExpertId const* precomputedExpertIds = nullptr) {
   using OutputT = typename KernelParams::OutputT;
   using TypePacked = PackedScoreIdx<BaseType>;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 900))
+  static_assert(NumBlocks == 1 && LoadExpertIdxFromGlobal,
+                "Below SM90 only the single-CTA permutation of precomputed top-k ids compiles");
+#endif
 
   // When MaxNumExperts > NumThreads, each thread handles multiple experts. Use ceiling division
   // so non-divisible expert tiers (notably E=896 with 256- or 512-thread cluster blocks) are
@@ -369,9 +376,11 @@ __device__ void routingPermutation(KernelParams params,
                               static_cast<int16_t>(params.mPtrTopKPacked[expandedIdx].idx)};
       }
     } else {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
       TypePacked const* remoteSmem = cg::cluster_group::map_shared_rank(
           smemPackedScoreIdx, expandedIdx / (NumWarps * params.mTopK));
       scoreIdx = remoteSmem[expandedIdx % (NumWarps * params.mTopK)];
+#endif
     }
 
     expertIndexes[ii] = scoreIdx.idx;
@@ -417,8 +426,10 @@ __device__ void routingPermutation(KernelParams params,
   }
   // Make local histogram (token counts per expert) available to all threads in the cluster.
   if constexpr (NumBlocks > 1) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     __cluster_barrier_arrive();
     __cluster_barrier_wait();
+#endif
   } else {
     __syncthreads();
   }
@@ -442,6 +453,7 @@ __device__ void routingPermutation(KernelParams params,
       if constexpr (NumBlocks == 1) {
         count[e] = smemExpertCount[expert];
       } else {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         // Get the histogram bin from each rank for this expert.
         int32_t expertCounts[NumBlocks];
 #pragma unroll
@@ -458,13 +470,16 @@ __device__ void routingPermutation(KernelParams params,
           }
           count[e] += expertCounts[rank];
         }
+#endif
       }
     }
   }
 
   // Arrive: we do not access distributed shared memory after this point.
   if constexpr (NumBlocks > 1) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     __cluster_barrier_arrive();
+#endif
   }
 
   // Compute the runtime config for projections
@@ -544,7 +559,9 @@ __device__ void routingPermutation(KernelParams params,
   // Note: I observed a perf benefit to doing this before the final loop so the compiler can
   // implement break with EXIT.
   if constexpr (NumBlocks > 1) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     __cluster_barrier_wait();
+#endif
   }
 
   // each thread has the same "expanded indexes" assigned to it as above
