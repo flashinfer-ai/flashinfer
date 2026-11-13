@@ -43,7 +43,7 @@ __global__ void QuantizeGroupedQ(const __nv_bfloat16* __restrict__ q, uint8_t* _
     uint8_t* residue_scale =
         q_sf + scale_base + compute_tiled_sf_offset<uint8_t>(base_rows + row, column, head_dim);
     const u32x2 packed = cvt_warp_fp16_to_fp4_mext_r1_fast16<__nv_bfloat16, false>(
-        lo, hi, 1.0f, 1.0f, base_scale, reinterpret_cast<uint32_t*>(residue_data), residue_scale);
+        lo, hi, 1.0f, base_scale, reinterpret_cast<uint32_t*>(residue_data), residue_scale);
     *reinterpret_cast<uint2*>(base_data) = make_uint2(packed.lo, packed.hi);
   }
 }

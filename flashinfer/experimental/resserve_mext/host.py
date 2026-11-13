@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
+
 import functools
 
 import torch
@@ -54,7 +57,6 @@ def _compile_fold_gemm(
     mode: str = "fold_tma",
     kernel_arch: str = "sm100",
     ab_stage_override: int | None = None,
-    dual_alpha: bool = False,
     pi_via_layout: bool = False,
     strided_weight: bool = False,
     fp4_format: str = "nvfp4",
@@ -68,16 +70,18 @@ def _compile_fold_gemm(
         "kloop_tma",
         "plain_mn",
     ), mode
+    # SFB tile selection and TMEM addressing exist only for these tile widths.
+    if mma_tiler_mn[1] not in (64, 128, 192, 256):
+        raise ValueError(
+            f"Fold supports tile widths 64, 128, 192 and 256, got {mma_tiler_mn}"
+        )
     if kernel_arch != "sm100":
         raise ValueError("Fold supports SM100; SM103 Fold is not supported")
 
-    assert mode != "kloop_tma" or (
-        kernel_arch == "sm100" and not dual_alpha and not strided_weight
-    ), "kloop_tma: sm100, single-alpha"
-
-    assert not dual_alpha or mode not in ("plain_mn",), (
-        "dual_alpha requires a fold mode"
+    assert mode != "kloop_tma" or (kernel_arch == "sm100" and not strided_weight), (
+        "kloop_tma: sm100, single-alpha"
     )
+
     if fp4_format not in ("nvfp4", "mxfp4"):
         raise ValueError(f"unknown FP4 format: {fp4_format}")
     sf_vec_size = 32 if fp4_format == "mxfp4" else SF_VEC_SIZE
@@ -90,7 +94,6 @@ def _compile_fold_gemm(
         mode,
         kernel_arch,
         ab_stage_override,
-        dual_alpha,
         pi_via_layout,
         strided_weight,
     )
@@ -117,12 +120,11 @@ def _compile_fold_gemm(
         mext_direct_store=(mode == "fold_mext_direct"),
         pi_via_layout=pi_via_layout,
         ab_stage_override=ab_stage_override,
-        dual_alpha=dual_alpha,
         k_loop=(mode == "kloop_tma"),
     )
 
     _a6 = mode == "fold_mext_direct"
-    sym_m = cute.sym_int(divisibility=32 if _a6 else 1)
+    sym_m = cute.sym_int(divisibility=16 if _a6 else 1)
     sym_n = cute.sym_int(divisibility=16 if _a6 else 1)
     sym_k = cute.sym_int()
     sym_mtok = cute.sym_int(divisibility=8 if _a6 else 1)
@@ -184,7 +186,7 @@ def _compile_fold_gemm(
         None
         if fp4_format == "mxfp4" and kernel_arch == "sm100"
         else cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32, (2,) if dual_alpha else (1,), assumed_align=4
+            cutlass.Float32, (1,), assumed_align=4
         )
     )
     max_active_clusters = get_max_active_clusters(
@@ -192,23 +194,39 @@ def _compile_fold_gemm(
     )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    compiled = cute.compile(
-        gemm.wrapper,
-        a_fake,
-        b_fake,
-        c_fake,
-        1,
-        1,
-        1,
-        1,
-        a_sf_ptr,
-        b_sf_ptr,
-        alpha_fake,
-        max_active_clusters,
-        stream_fake,
-        False,
-        lambda x: x,
-        options="--opt-level 2 --enable-tvm-ffi",
+    from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
+    def compile_kernel():
+        return cute.compile(
+            gemm.wrapper,
+            a_fake,
+            b_fake,
+            c_fake,
+            1,
+            1,
+            1,
+            1,
+            a_sf_ptr,
+            b_sf_ptr,
+            alpha_fake,
+            max_active_clusters,
+            stream_fake,
+            False,
+            lambda x: x,
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+
+    specialization = (key[1:], max_active_clusters)
+    kernel_name = "kernel_" + hashlib.sha256(repr(specialization).encode()).hexdigest()
+    compiled = build_and_load_cute_dsl_kernel(
+        "resserve_mext",
+        kernel_name,
+        compile_kernel,
+        extra_key_files=[
+            __file__,
+            str(Path(__file__).with_name("kernel_sm100_fold.py")),
+            str(Path(__file__).parents[2] / "cute_dsl" / "utils.py"),
+        ],
     )
     _KERNEL_CACHE[key] = compiled
     return compiled
@@ -231,7 +249,6 @@ def mext_fold_gemm(
     kernel_arch: str = "sm100",
     ab_stage_override: int | None = None,
     pi_via_layout: bool = False,
-    alpha_res: torch.Tensor | None = None,
     fp4_format: str = "nvfp4",
 ) -> torch.Tensor:
     """Compute GEMM with full-channel residue compensation."""
@@ -262,12 +279,16 @@ def mext_fold_gemm(
             f"{act_fp4_rowpair.stride()}"
         )
 
+    if store_mode in ("tma_mext", "direct_mext") and m_tok % 8:
+        raise ValueError(
+            "M-fold requires tile8 activations padded to a multiple of 8 rows"
+        )
+
     _mode = STORE_MODE_TO_MODE[store_mode]
 
     no_alpha = fp4_format == "mxfp4" and kernel_arch == "sm100"
-    if no_alpha and alpha_res is not None:
-        raise ValueError("MXFP4 has no global residue scale")
-    _dual = not no_alpha and (alpha_res is not None or alpha.numel() == 2)
+    if not no_alpha and alpha.numel() != 1:
+        raise ValueError("alpha must contain one element")
 
     compiled = _compile_fold_gemm(
         mma_tiler_mn,
@@ -277,17 +298,12 @@ def mext_fold_gemm(
         kernel_arch=kernel_arch,
         ab_stage_override=ab_stage_override,
         pi_via_layout=pi_via_layout,
-        dual_alpha=_dual,
         strided_weight=_strided_w,
         fp4_format=fp4_format,
     )
 
     if no_alpha:
         alpha_t = None
-    elif alpha_res is not None:
-        alpha_t = torch.cat([alpha.reshape(1), alpha_res.reshape(1)]).to(torch.float32)
-    elif _dual:
-        alpha_t = alpha.reshape(2).to(torch.float32)
     else:
         alpha_t = alpha.reshape(1).to(torch.float32)
     sf_m = _ceil_div(n_w, 128)

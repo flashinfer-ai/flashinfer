@@ -56,10 +56,18 @@ def main():
     outputs = {name: fn() for name, fn in paths.items()}
     for y in outputs.values():
         assert torch.isfinite(y).all()
-    raw = {
-        name: bench_gpu_time(fn, dry_run_iters=10, repeat_iters=30)
-        for name, fn in paths.items()
-    }
+    raw = {name: [] for name in paths}
+    execution_order = []
+    # Interleave individual samples to balance drift across paths.
+    for sample in range(30):
+        order = list(paths)
+        if sample % 2:
+            order.reverse()
+        execution_order.append(order)
+        for name in order:
+            raw[name].extend(
+                bench_gpu_time(paths[name], dry_run_iters=10, repeat_iters=1)
+            )
     print(
         json.dumps(
             {
@@ -67,6 +75,7 @@ def main():
                 "torch": torch.__version__,
                 "shape": vars(args),
                 "milliseconds": raw,
+                "execution_order": execution_order,
                 "median_ms": {name: statistics.median(v) for name, v in raw.items()},
                 "fold_vs_baseline_max_abs": float(
                     (

@@ -4,8 +4,8 @@
 # Original source: csrc/resattn/kernel_paged_decode.py
 # SPDX-License-Identifier: BSD-3-Clause
 """Paged NVFP4 decode adapted from FlashInfer cute_dsl/attention/gqa_decode.py.
-NVIDIA BSD-3-Clause; local extensions add paging, residue heads and fused reducers.
-FP4 QK with Q residue and QMUL4 V conversion yields BF16 or packed NVFP4 output."""
+NVIDIA BSD-3-Clause; local extensions add paging and residue heads.
+FP4 QK with Q residue and QMUL4 V conversion yields BF16 output."""
 
 import math
 from typing import Literal, Type, Tuple
@@ -34,7 +34,6 @@ from cutlass.cute.typing import (
     Optional,
 )
 
-from .output import quantize_nvfp4_block16, output_scale_offset
 from .qmul4 import (
     dequantize_nvfp4x8_ldsm,
 )
@@ -62,8 +61,6 @@ cpy_dice = (None,) + mma_dice
 warp_threads = 32
 warpgroup_warps = 4
 warpgroup_threads = 128
-max_reduction_iters = 4
-max_reduction_splits = 1 << max_reduction_iters
 
 log2_e = math.log2(math.e)
 exp2 = partial(cute.math.exp2, fastmath=True)
@@ -76,62 +73,39 @@ class GroupedQueryAttentionDecodePagedFp4:
 
     def __init__(
         self,
-        headdim,
-        grouped_head_tile,
-        prediction_tile=1,
-        sequence_tile=256,
-        reduction_mode: Literal[
-            "kernel", "gmem_fused", "cga_sharded", "none"
-        ] = "kernel",
-        *,
-        page_size=128,
-        logical_grouped_heads: int | None = None,
-        single_softmax_wg: bool = False,
-        smem_correction_broadcast: bool = False,
+        headdim: int,
+        grouped_head_tile: int,
+        logical_grouped_heads: int,
+        reduction_mode: Literal["kernel", "none"],
     ):
-        """Configure attention tiles and split-K reduction."""
-        if (
-            grouped_head_tile not in (8, 16)
-            or prediction_tile != 1
-            or headdim not in (128, 256)
-        ):
-            raise NotImplementedError(
-                "production ResAttn requires residue Q8/Q16, D128/D256, decode"
-            )
-        if reduction_mode not in ("none", "kernel", "gmem_fused", "cga_sharded"):
-            raise ValueError(f"unsupported production reducer: {reduction_mode}")
-        if headdim == 256 and reduction_mode not in ("none", "kernel"):
-            raise NotImplementedError("D256 supports BF16 none/kernel reduction only")
+        """Configure attention tiles and split-K reduction.
+
+        ``grouped_head_tile`` is the padded base+residue Q rows per KV head and
+        ``logical_grouped_heads`` the query heads per KV head that are written.
+        """
+        if grouped_head_tile not in (8, 16) or headdim not in (128, 256):
+            raise NotImplementedError("ResAttn requires residue Q8/Q16 and D128/D256")
+        if reduction_mode not in ("none", "kernel"):
+            raise ValueError(f"unsupported reducer: {reduction_mode}")
+        assert 0 < logical_grouped_heads <= grouped_head_tile
         self.headdim = headdim
         self.grouped_head_tile = grouped_head_tile
-        self.prediction_tile = prediction_tile
-        self.sequence_tile = sequence_tile
-        self.do_kernel_red = reduction_mode == "kernel"
-
-        self.do_gmem_fused_red = reduction_mode == "gmem_fused"
-        self.do_partial_red = self.do_kernel_red or self.do_gmem_fused_red
-        self.do_cga_red = reduction_mode == "cga_sharded"
-        self.do_none_red = reduction_mode == "none"
-
         self.logical_grouped_heads = logical_grouped_heads
-
-        self.single_softmax_wg = single_softmax_wg
-
-        self.smem_correction_broadcast = smem_correction_broadcast
-
+        self.do_kernel_red = reduction_mode == "kernel"
+        self.do_none_red = reduction_mode == "none"
         self.is_q8 = grouped_head_tile == 8
 
-        self.threads_per_cta = (4 if single_softmax_wg else 5) * warpgroup_threads
-        self.page_size = page_size
+        # Single-token decode over 256-token tiles. Pages hold 128 tokens so
+        # that one page aligns with the scale-factor atoms.
+        self.prediction_tile = 1
+        self.sequence_tile = 256
+        self.page_size = 128
 
-        assert page_size == 128, (
-            "page_size must be 128 to align scale-factor atoms; page_size=64 is unsupported"
-        )
-        assert sequence_tile > 0 and sequence_tile % 128 == 0
-        if logical_grouped_heads is not None:
-            assert 0 < logical_grouped_heads <= grouped_head_tile
-        if smem_correction_broadcast:
-            assert single_softmax_wg
+        # The unsplit path runs one softmax warpgroup and broadcasts its
+        # correction through shared memory; split-K keeps two.
+        self.single_softmax_wg = self.do_none_red
+        self.smem_correction_broadcast = self.do_none_red
+        self.threads_per_cta = (4 if self.single_softmax_wg else 5) * warpgroup_threads
 
     @staticmethod
     def gqa_pack(t_bshd: cute.Tensor, h_k: int):
@@ -193,12 +167,9 @@ class GroupedQueryAttentionDecodePagedFp4:
         k_sf: cute.Tensor,
         v_sf: cute.Tensor,
         o_bshd: cute.Tensor,
-        o_block_scale: Optional[cute.Tensor],
-        o_global_scale: Optional[cute.Tensor],
         o_partial_bshd: Optional[cute.Tensor],
         l_partial_bsh: Optional[cute.Tensor],
         m_partial_bsh: Optional[cute.Tensor],
-        completion_counter: Optional[cute.Tensor],
         scale_s: Float32,
         scale_o: Float32,
         seq_lens: cute.Tensor,
@@ -211,25 +182,7 @@ class GroupedQueryAttentionDecodePagedFp4:
         assert q_bshd.dtype == cutlass.Float4E2M1FN
         assert q_bshd.shape[1] == 1, "production decode requires one Q token"
         assert q_sf is not None and k_sf is not None
-        quantize_o = cutlass.const_expr(o_bshd.dtype == cutlass.Float4E2M1FN)
-        if cutlass.const_expr(quantize_o):
-            assert self.headdim == 128, "D256 NVFP4 output is not supported"
-            assert self.do_none_red or self.do_kernel_red or self.do_gmem_fused_red, (
-                "fused NVFP4 output requires no reduction, the deterministic "
-                "kernel reducer, or the fused last-CTA reducer"
-            )
-            assert o_block_scale is not None and o_global_scale is not None
-            assert o_block_scale.dtype == cutlass.Float8E4M3FN
-            assert o_global_scale.dtype == Float32
-            assert self.prediction_tile == 1
-            if cutlass.const_expr(self.do_gmem_fused_red):
-                assert completion_counter is not None
-                assert completion_counter.dtype == Int32
-        else:
-            assert o_block_scale is None and o_global_scale is None
-            assert not self.do_gmem_fused_red, (
-                "gmem_fused V0 is restricted to direct NVFP4 output"
-            )
+        assert o_bshd.dtype == BFloat16, "ResAttn produces BF16 output"
         kq_dtype = q_bshd.dtype
         v_cache_dtype = v_bshd.dtype
 
@@ -342,15 +295,9 @@ class GroupedQueryAttentionDecodePagedFp4:
         )
 
         smem_alloc_bits += Int32.width
-        if cutlass.const_expr(self.do_gmem_fused_red):
-            smem_alloc_bits += Int32.width
 
         smem_alloc_bits += blk_tile_n * acc_dtype.width
         smem_alloc_bits += blk_tile_n * warpgroup_warps * acc_dtype.width
-        if cutlass.const_expr(self.do_cga_red):
-            smem_alloc_bits += blk_tile_n * blk_tile_d * acc_dtype.width
-            smem_alloc_bits += max_reduction_splits * warp_threads * 2 * acc_dtype.width
-            smem_alloc_bits += mbarrier_bits
 
         sfv_stage_bits = (mma_tile_m_vp // sf_vec_size) * mma_tile_k_vp * sf_dtype.width
 
@@ -384,13 +331,11 @@ class GroupedQueryAttentionDecodePagedFp4:
             kv_stages = min(kv_stages, 7)
 
         h_k = k_bshd.shape[2]
-        o_bshd_ = o_partial_bshd if self.do_partial_red else o_bshd
+        o_bshd_ = o_partial_bshd if self.do_kernel_red else o_bshd
 
         mQ_nkl = self.gemm_view(self.gqa_pack(q_bshd, h_k), True)
         mK_mkl = self.gemm_view(k_bshd, True)
         mV_mkl = self.gemm_view(v_bshd, False)
-
-        mO_final_mnl = self.gemm_view(self.gqa_pack(o_bshd, h_k), False)
 
         mO_mnl = self.gemm_view(self.gqa_pack(o_bshd_, h_k), False)
 
@@ -430,8 +375,7 @@ class GroupedQueryAttentionDecodePagedFp4:
             tiles_dk,
         )
 
-        quantize_o_main = cutlass.const_expr(quantize_o and self.do_none_red)
-        o_smem_dtype = Float32 if quantize_o_main else mO_mnl.dtype
+        o_smem_dtype = mO_mnl.dtype
         smem_layout_atom_o = tcgen05.make_smem_layout_atom(
             tcgen05.mma.SmemLayoutAtomKind.MN_SW128, o_smem_dtype
         )
@@ -524,19 +468,17 @@ class GroupedQueryAttentionDecodePagedFp4:
             internal_type=cutlass.Int16,
         )
 
-        tma_atom_o = tma_tensor_o = None
-        if cutlass.const_expr(not quantize_o_main and not self.do_cga_red):
-            tma_atom_o, tma_tensor_o = cute.nvgpu.cpasync.make_tiled_tma_atom(
-                tma_store_op,
-                mO_mnl,
-                cute.select(smem_layout_o, mode=[0, 1]),
-                tma_tile_mnk[:2],
-            )
+        tma_atom_o, tma_tensor_o = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            tma_store_op,
+            mO_mnl,
+            cute.select(smem_layout_o, mode=[0, 1]),
+            tma_tile_mnk[:2],
+        )
 
         mM_partial_nl = mL_partial_nl = None
-        if cutlass.const_expr(self.do_partial_red):
+        if cutlass.const_expr(self.do_kernel_red):
             assert m_partial_bsh.dtype == l_partial_bsh.dtype == acc_dtype
-            assert o_partial_bshd.dtype in (acc_dtype, BFloat16)
+            assert o_partial_bshd.dtype == acc_dtype
 
             mM_partial_nl = self.gemm_view_bsh(m_partial_bsh, h_k)
             mL_partial_nl = self.gemm_view_bsh(l_partial_bsh, h_k)
@@ -548,7 +490,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         grid_z = cute.size(mQ_nkl.shape[2])
         grid_x = 1 if self.do_none_red else kv_splits
         grid = (grid_x, grid_y, grid_z)
-        cluster_x = kv_splits if (self.do_cga_red) else 1
 
         self.decode(
             blk_tile_shpd,
@@ -582,14 +523,9 @@ class GroupedQueryAttentionDecodePagedFp4:
             tma_tensor_v_sf_d,
             smem_layout_o,
             tma_atom_o,
-            mO_mnl if quantize_o_main or self.do_cga_red else tma_tensor_o,
-            mO_mnl if self.do_gmem_fused_red else None,
-            (o_block_scale if quantize_o_main or self.do_gmem_fused_red else None),
-            (o_global_scale if quantize_o_main or self.do_gmem_fused_red else None),
-            (mO_final_mnl if self.do_cga_red or self.do_gmem_fused_red else None),
+            tma_tensor_o,
             mL_partial_nl,
             mM_partial_nl,
-            completion_counter,
             scale_s_log2_e,
             scale_o,
             seq_lens,
@@ -597,7 +533,7 @@ class GroupedQueryAttentionDecodePagedFp4:
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
-            cluster=[cluster_x, 1, 1],
+            cluster=[1, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
             use_pdl=enable_pdl,
@@ -611,14 +547,8 @@ class GroupedQueryAttentionDecodePagedFp4:
                 l_partial_bsh,
                 m_partial_bsh,
                 scale_o,
-                o_block_scale,
-                o_global_scale,
                 self.grouped_head_tile,
-                (
-                    self.logical_grouped_heads
-                    if self.logical_grouped_heads is not None
-                    else self.grouped_head_tile
-                ),
+                self.logical_grouped_heads,
                 stream,
                 enable_pdl,
             )
@@ -715,15 +645,10 @@ class GroupedQueryAttentionDecodePagedFp4:
         tma_atom_v_sf_d: cute.CopyAtom,
         mVSF_d: cute.Tensor,
         smem_layout_o: cute.ComposedLayout,
-        tma_atom_o: Optional[cute.CopyAtom],
+        tma_atom_o: cute.CopyAtom,
         mO: cute.Tensor,
-        mOPartialGlobal: Optional[cute.Tensor],
-        mOSF: Optional[cute.Tensor],
-        mOGlobalScale: Optional[cute.Tensor],
-        mOFinal: Optional[cute.Tensor],
         mL_partial: Optional[cute.Tensor],
         mM_partial: Optional[cute.Tensor],
-        mCompletion: Optional[cute.Tensor],
         scale_s_log2_e: Float32,
         scale_o: Float32,
         mSeqLens: cute.Tensor,
@@ -742,10 +667,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         sf_dtype = cutlass.Float8E4M3FN
         o_dtype = out_dtype
         acc_dtype = Float32
-        quantize_o = cutlass.const_expr(mO.dtype == cutlass.Float4E2M1FN)
-        if cutlass.const_expr(quantize_o):
-            assert mOSF is not None and mOGlobalScale is not None
-            assert tma_atom_o is None
 
         blk_tile_s, blk_tile_h, blk_tile_p, blk_tile_d = blk_tile_shpd
         blk_tile_hp = (blk_tile_h, blk_tile_p)
@@ -758,9 +679,7 @@ class GroupedQueryAttentionDecodePagedFp4:
         tiles_dm = cute.ceil_div(blk_tile_d, mma_tile_m_vp)
         tiles_dk = cute.ceil_div(blk_tile_d, mma_tile_k)
 
-        do_gmem_fused_red = self.do_gmem_fused_red
-        do_partial_red = self.do_partial_red
-        do_cga_red = self.do_cga_red
+        do_kernel_red = self.do_kernel_red
         do_none_red = self.do_none_red
 
         warpgroup_id = 0
@@ -807,10 +726,8 @@ class GroupedQueryAttentionDecodePagedFp4:
             + correction_regs
         ) <= role_reg_budget
 
-        kv_splits, grid_tiles_hp, tiles_hb = cute.arch.grid_dim()
+        kv_splits, _, _ = cute.arch.grid_dim()
         kv_split_idx, coord_hp, coord_hb = cute.arch.block_idx()
-        coord_hp_linear = coord_hp
-        coord_hb_linear = coord_hb
         if cutlass.const_expr(do_none_red):
             kv_splits, kv_split_idx = (1, 0)
         tidx, _, _ = cute.arch.thread_idx()
@@ -822,11 +739,11 @@ class GroupedQueryAttentionDecodePagedFp4:
         init_warp = 1
 
         grouped_heads, prediction = mQ.shape[0]
-        heads_k, batches = tiles_hb = mQ.shape[2]
+        _, batches = tiles_hb = mQ.shape[2]
         tiles_hp = cute.ceil_div(mQ.shape[0], blk_tile_hp)
         coord_hb = cute.idx2crd(coord_hb, tiles_hb)
         coord_hp = cute.idx2crd(coord_hp, tiles_hp)
-        coord_hg, coord_p = coord_hp
+        _, coord_p = coord_hp
         coord_hk, coord_b = coord_hb
 
         seqlen = mSeqLens[coord_b]
@@ -845,8 +762,7 @@ class GroupedQueryAttentionDecodePagedFp4:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_k)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v_sf_d)
-            if cutlass.const_expr(not quantize_o and not do_cga_red):
-                cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_o)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_o)
         init_warp += 1
 
         tmem_alloc_cols = self.tmem_alloc_cols
@@ -871,10 +787,6 @@ class GroupedQueryAttentionDecodePagedFp4:
 
         o_init_nbar = nbar(14, correction_threads + warp_threads)
 
-        cga_stats_ready_nbar = nbar(15, correction_threads + reduction_threads)
-
-        gmem_completion_nbar = nbar(15, warpgroup_threads + correction_threads)
-
         def with_phase(nbar_, phase):
             return nbar(nbar_.barrier_id + phase, nbar_.num_threads)
 
@@ -885,24 +797,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         tma_group = elect_one_cooperative
         softmax_group = warpgroup_cooperative
         correction_group = warpgroup_cooperative
-
-        cga_partial_mbar = None
-        if cutlass.const_expr(do_cga_red):
-            cga_partial_mbar = smem.allocate_array(Int64, 1)
-            if warp_idx == init_warp:
-                with cute.arch.elect_one():
-                    partial_o_bytes = blk_tile_n * blk_tile_d * acc_dtype.width // 8
-                    partial_stats_bytes = (
-                        kv_splits * warp_threads * 2 * acc_dtype.width // 8
-                    )
-                    cute.arch.mbarrier_init(cga_partial_mbar, 1)
-                    cute.arch.mbarrier_init_fence()
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        cga_partial_mbar,
-                        Int32(partial_o_bytes + partial_stats_bytes),
-                    )
-            init_warp += 1
-            cute.arch.cluster_arrive_relaxed()
 
         q_load_mbar = smem.allocate_array(Int64, 1)
         sfq_mbar = smem.allocate_array(Int64, 1)
@@ -1090,32 +984,8 @@ class GroupedQueryAttentionDecodePagedFp4:
                     sL[i + lane_idx] = Float32(0)
         init_warp += 1
 
-        sGmemLast = None
-        if cutlass.const_expr(do_gmem_fused_red):
-            sGmemLast = smem.allocate_tensor(Int32, cute.make_layout(1), svector_align)
-
         tCtL_shape = tiled_mma_kq.partition_shape_C((mma_tile_m, mma_tile_n, o_stages))
         tCtL = thrblk_mma_kq.make_fragment_C(tCtL_shape)
-
-        sCgaO = None
-        sCgaStats = None
-        if cutlass.const_expr(do_cga_red):
-            sCgaO = smem.allocate_tensor(
-                acc_dtype,
-                cute.make_layout((blk_tile_d * blk_tile_n,)),
-                svector_align,
-            )
-            sCgaStats = smem.allocate_tensor(
-                acc_dtype,
-                cute.make_layout(
-                    (max_reduction_splits, warp_threads, 2),
-                    stride=(warp_threads * 2, 2, 1),
-                ),
-                svector_align,
-            )
-
-        if cutlass.const_expr(do_cga_red):
-            cute.arch.cluster_wait()
 
         cute.arch.sync_threads()
         assert init_warp < (self.threads_per_cta // warp_threads), (
@@ -1173,40 +1043,10 @@ class GroupedQueryAttentionDecodePagedFp4:
             f"\t{tmem_offset} tmem cols used, {tmem_alloc_cols} tmem cols allocated"
         )
 
-        partial_o = None
-        if cutlass.const_expr(do_cga_red):
-            partial_o = cute.make_rmem_tensor((blk_tile_n,), acc_dtype)
-            partial_o.fill(0)
-
         if exit_early:
             if warpgroup_idx == correction_warpgroup_id:
                 sM_final_nbar.arrive()
                 sL_final_nbar.arrive()
-            if cutlass.const_expr(quantize_o):
-                if warp_idx == tma_kv_warp_id:
-                    mO_bytes = cute.recast_tensor(mO, cutlass.Uint8)
-                    logical_heads = self.logical_grouped_heads
-                    if cutlass.const_expr(logical_heads is None):
-                        logical_heads = grouped_heads
-                    d_blocks = blk_tile_d // 16
-                    hidden = heads_k * logical_heads * blk_tile_d
-                    for block in cutlass.range(
-                        lane_idx, blk_tile_h * d_blocks, warp_threads
-                    ):
-                        group_head = coord_hg * blk_tile_h + block // d_blocks
-                        d_block = block % d_blocks
-                        if group_head < logical_heads:
-                            for byte in cutlass.range_constexpr(8):
-                                mO_bytes[
-                                    d_block * 8 + byte,
-                                    (group_head, 0),
-                                    (coord_hk, coord_b),
-                                ] = cutlass.Uint8(0)
-                            k_idx = (
-                                coord_hk * logical_heads + group_head
-                            ) * d_blocks + d_block
-                            sf_offset = output_scale_offset(coord_b, k_idx, hidden)
-                            mOSF[sf_offset] = sf_dtype(0)
 
         elif warp_idx == tma_kv_warp_id:
             gK = cute.local_tile(
@@ -1371,83 +1211,26 @@ class GroupedQueryAttentionDecodePagedFp4:
             )
 
             coord_b_partial = (
-                kv_split_idx * batches + coord_b if do_partial_red else coord_b
+                kv_split_idx * batches + coord_b if do_kernel_red else coord_b
             )
-            gO = None
-            if cutlass.const_expr(not quantize_o and not do_cga_red):
-                gO = cute.local_tile(
-                    mO,
-                    tiler=(blk_tile_d, blk_tile_hp),
-                    coord=(0, coord_hp, (coord_hk, coord_b_partial)),
-                )
-            sO_tma = gO_tma = None
-            if cutlass.const_expr(not quantize_o and not do_cga_red):
-                gO_mma = cute.flat_divide(gO, (mma_tile_m, mma_tile_n))
-                gO_mma = gO_mma[None, None, None, 0]
+            gO = cute.local_tile(
+                mO,
+                tiler=(blk_tile_d, blk_tile_hp),
+                coord=(0, coord_hp, (coord_hk, coord_b_partial)),
+            )
+            gO_mma = cute.flat_divide(gO, (mma_tile_m, mma_tile_n))
+            gO_mma = gO_mma[None, None, None, 0]
 
-                sO_tma, gO_tma = cute.nvgpu.cpasync.tma_partition(
-                    tma_atom_o,
-                    mcast_coord,
-                    mcast_layout,
-                    smem_tensor=cute.group_modes(sO_mma, 0, 2),
-                    gmem_tensor=cute.group_modes(gO_mma, 0, 2),
-                )
+            sO_tma, gO_tma = cute.nvgpu.cpasync.tma_partition(
+                tma_atom_o,
+                mcast_coord,
+                mcast_layout,
+                smem_tensor=cute.group_modes(sO_mma, 0, 2),
+                gmem_tensor=cute.group_modes(gO_mma, 0, 2),
+            )
 
-            if cutlass.const_expr(do_cga_red):
-                pass
-            elif cutlass.const_expr(quantize_o):
-                sO_final_nbar.arrive_and_wait()
-
-                assert blk_tile_p == 1 and blk_tile_d % 16 == 0
-                d_scale_blocks = blk_tile_d // 16
-                scale_blocks = blk_tile_h * d_scale_blocks
-                mO_bytes = cute.recast_tensor(mO, cutlass.Uint8)
-                global_scale = Float32(mOGlobalScale[0])
-                logical_grouped_heads = self.logical_grouped_heads
-                if cutlass.const_expr(logical_grouped_heads is None):
-                    logical_grouped_heads = grouped_heads
-                hidden = heads_k * logical_grouped_heads * blk_tile_d
-                row_idx = coord_b
-
-                for block_idx in cutlass.range(lane_idx, scale_blocks, warp_threads):
-                    local_head = block_idx // d_scale_blocks
-                    d_block = block_idx % d_scale_blocks
-                    group_head = coord_hg * blk_tile_h + local_head
-                    if group_head < logical_grouped_heads:
-                        values = cute.make_rmem_tensor((16,), Float32)
-                        for value_idx in cutlass.range_constexpr(16):
-                            value = Float32(
-                                sO_mma[
-                                    d_block * 16 + value_idx,
-                                    local_head,
-                                    0,
-                                ]
-                            )
-                            values[value_idx] = value
-                        packed_values, sf_value = quantize_nvfp4_block16(
-                            values.load(), global_scale
-                        )
-
-                        packed_fp4 = cute.make_rmem_tensor((16,), cutlass.Float4E2M1FN)
-                        packed_fp4.store(packed_values)
-                        packed_bytes = cute.recast_tensor(packed_fp4, cutlass.Uint8)
-                        for byte_idx in cutlass.range_constexpr(8):
-                            mO_bytes[
-                                d_block * 8 + byte_idx,
-                                (group_head, 0),
-                                (coord_hk, coord_b),
-                            ] = packed_bytes[byte_idx]
-
-                        global_head = coord_hk * logical_grouped_heads + group_head
-                        k_idx = global_head * d_scale_blocks + d_block
-                        sf_offset = output_scale_offset(row_idx, k_idx, hidden)
-                        mOSF[sf_offset] = sf_value
-            else:
-                sO_final_nbar.arrive_and_wait()
-                cute.copy(tma_atom_o, sO_tma, gO_tma)
-                if cutlass.const_expr(do_gmem_fused_red):
-                    cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0, read=False)
+            sO_final_nbar.arrive_and_wait()
+            cute.copy(tma_atom_o, sO_tma, gO_tma)
 
         elif warpgroup_idx == conversion_warpgroup_id:
             mma_k_bits = mma_tile_k_vp * vp_dtype.width
@@ -2083,134 +1866,17 @@ class GroupedQueryAttentionDecodePagedFp4:
             output_final = tOrO_final.reshape((blk_tile_n, tiles_dm))
             output_final += correction.reshape((blk_tile_n, 1)) * output_prev
 
-            if cutlass.const_expr(do_cga_red):
-                partial_o.store(output_final.reshape((blk_tile_n,)))
-            else:
-                if cutlass.const_expr(do_none_red):
-                    sM_final_nbar.arrive_and_wait()
-                    normalization = sM.load()
-                    output_final *= normalization.reshape((blk_tile_n, 1))
+            if cutlass.const_expr(do_none_red):
+                sM_final_nbar.arrive_and_wait()
+                normalization = sM.load()
+                output_final *= normalization.reshape((blk_tile_n, 1))
 
-                tOsO.store(output_final.to(o_dtype).reshape(tOsO.shape))
-                cute.arch.fence_view_async_shared()
-                sO_final_nbar.arrive()
-
-        if cutlass.const_expr(do_cga_red):
-            if warpgroup_idx == correction_warpgroup_id:
-                cga_stats_ready_nbar.arrive_and_wait()
-
-                dsmem_o_atom = cute.make_copy_atom(
-                    cute.nvgpu.cpasync.CopyDsmemStoreOp(),
-                    acc_dtype,
-                    num_bits_per_copy=128,
-                )
-                dsmem_stats_atom = cute.make_copy_atom(
-                    cute.nvgpu.cpasync.CopyDsmemStoreOp(),
-                    acc_dtype,
-                )
-
-                owner_cta = warpgroup_tidx % kv_splits
-                owner_thread = warpgroup_tidx // kv_splits
-                owner_threads = warpgroup_threads // kv_splits
-
-                partial_o_offset = (
-                    kv_split_idx * owner_threads + owner_thread
-                ) * blk_tile_n
-                remote_partial_mbar = cute.arch.map_dsmem_ptr(
-                    cga_partial_mbar, owner_cta
-                )
-                remote_o = cute.make_tensor(
-                    cute.arch.map_dsmem_ptr(
-                        sCgaO.iterator + partial_o_offset, owner_cta
-                    ).align(16),
-                    cute.make_layout((blk_tile_n,)),
-                )
-                cute.copy(
-                    dsmem_o_atom,
-                    partial_o,
-                    remote_o,
-                    mbar_ptr=remote_partial_mbar,
-                )
-
-                if warpgroup_widx == 0:
-                    local_stat = cute.make_rmem_tensor(cute.make_layout(1), acc_dtype)
-                    for target in cutlass.range(kv_splits):
-                        stats_offset = (kv_split_idx * warp_threads + lane_idx) * 2
-                        remote_stats_mbar = cute.arch.map_dsmem_ptr(
-                            cga_partial_mbar, target
-                        )
-
-                        for stat in cutlass.range_constexpr(2):
-                            if lane_idx < blk_tile_n:
-                                if stat == 0:
-                                    local_stat[0] = sM[lane_idx]
-                                else:
-                                    local_stat[0] = sL[lane_idx, 0]
-                            else:
-                                local_stat[0] = (
-                                    -Float32.inf if stat == 0 else Float32(0)
-                                )
-                            remote_stat_ptr = cute.arch.map_dsmem_ptr(
-                                sCgaStats.iterator + stats_offset + stat,
-                                target,
-                            )
-                            cute.copy(
-                                dsmem_stats_atom,
-                                local_stat,
-                                cute.make_tensor(remote_stat_ptr, cute.make_layout(1)),
-                                mbar_ptr=remote_stats_mbar,
-                            )
-
-                cute.arch.fence_acq_rel_cta()
-                cute.arch.mbarrier_wait(cga_partial_mbar, phase=0)
-
-                if owner_cta == kv_split_idx:
-                    final_o = cute.make_rmem_tensor((blk_tile_n,), o_dtype)
-                    for head in cutlass.range_constexpr(blk_tile_n):
-                        reduced_max = sCgaStats[0, head, 0]
-                        reduced_sum = sCgaStats[0, head, 1]
-                        reduced_o = Float32(sCgaO[owner_thread * blk_tile_n + head])
-
-                        for source in cutlass.range(1, kv_splits):
-                            local_max = sCgaStats[source, head, 0]
-                            next_max = cute.arch.fmax(reduced_max, local_max)
-                            corr_old = Float32(0)
-                            corr_new = Float32(0)
-                            if reduced_sum > 0:
-                                corr_old = exp2(reduced_max - next_max)
-                            if sCgaStats[source, head, 1] > 0:
-                                corr_new = exp2(local_max - next_max)
-                            local_o = Float32(
-                                sCgaO[
-                                    (source * owner_threads + owner_thread) * blk_tile_n
-                                    + head
-                                ]
-                            )
-                            reduced_sum = (
-                                reduced_sum * corr_old
-                                + sCgaStats[source, head, 1] * corr_new
-                            )
-                            reduced_o = reduced_o * corr_old + local_o * corr_new
-                            reduced_max = next_max
-
-                        value = Float32(0)
-                        if reduced_sum > 0:
-                            value = (
-                                reduced_o * cute.arch.rcp_approx(reduced_sum) * scale_o
-                            )
-                        final_o[head] = o_dtype(value)
-
-                    for head in cutlass.range_constexpr(blk_tile_n):
-                        group_head = coord_hg * blk_tile_h + head
-                        if group_head < mOFinal.shape[1][0]:
-                            mOFinal[
-                                warpgroup_tidx,
-                                (group_head, 0),
-                                (coord_hk, coord_b),
-                            ] = final_o[head]
+            tOsO.store(output_final.to(o_dtype).reshape(tOsO.shape))
+            cute.arch.fence_view_async_shared()
+            sO_final_nbar.arrive()
 
         if warp_idx == reduction_warp_id:
-            if cutlass.const_expr(do_partial_red):
+            if cutlass.const_expr(do_kernel_red):
                 self.reduction_epilogue(
                     blk_tile_hp,
                     coord_hp,
@@ -2224,16 +1890,7 @@ class GroupedQueryAttentionDecodePagedFp4:
                     mM_partial,
                     mL_partial,
                 )
-            elif cutlass.const_expr(do_cga_red):
-                self.reduction_cga_local_stats(
-                    blk_tile_n,
-                    lane_idx,
-                    sM_final_nbar,
-                    sL_final_nbar,
-                    cga_stats_ready_nbar,
-                    sL,
-                )
-            elif cutlass.const_expr(do_none_red):
+            else:
                 self.reduction_none(
                     lane_store_max,
                     lane_idx,
@@ -2245,224 +1902,7 @@ class GroupedQueryAttentionDecodePagedFp4:
                 )
             cute.arch.griddepcontrol_launch_dependents()
 
-        if cutlass.const_expr(do_gmem_fused_red):
-            if warpgroup_idx == 0 or warpgroup_idx == correction_warpgroup_id:
-                gmem_completion_nbar.arrive_and_wait()
-
-                completion_idx = coord_hb_linear * grid_tiles_hp + coord_hp_linear
-                last_reducer_ctas = cutlass.const_expr(
-                    1 if self.grouped_head_tile == 8 else 4
-                )
-                if tidx == 0:
-                    cute.arch.fence_acq_rel_gpu()
-                    old_count = cute.arch.atomic_add(
-                        mCompletion.iterator + completion_idx,
-                        Int32(1),
-                        sem="acq_rel",
-                        scope="gpu",
-                    )
-                    sGmemLast[0] = Int32(0)
-                    if old_count >= kv_splits - Int32(last_reducer_ctas):
-                        sGmemLast[0] = kv_splits - old_count
-
-                    if old_count == kv_splits - Int32(1):
-                        cute.arch.atomic_exch(
-                            mCompletion.iterator + completion_idx,
-                            Int32(0),
-                            sem="release",
-                            scope="gpu",
-                        )
-                    elif old_count >= kv_splits - Int32(last_reducer_ctas):
-                        counter_value = Int32(-1)
-                        while counter_value != Int32(0):
-                            counter_value = cute.arch.atomic_add(
-                                mCompletion.iterator + completion_idx,
-                                Int32(0),
-                                sem="acquire",
-                                scope="gpu",
-                            )
-
-                gmem_completion_nbar.arrive_and_wait()
-
-                if warpgroup_idx == correction_warpgroup_id and sGmemLast[0] != Int32(
-                    0
-                ):
-                    self.reduction_gmem_fused_nvfp4(
-                        blk_tile_shpd,
-                        coord_hg,
-                        coord_p,
-                        coord_hk,
-                        coord_b,
-                        heads_k,
-                        batches,
-                        kv_splits,
-                        warpgroup_tidx,
-                        sGmemLast[0] - Int32(1),
-                        mOPartialGlobal,
-                        mOFinal,
-                        mOSF,
-                        mOGlobalScale,
-                        mL_partial,
-                        mM_partial,
-                        scale_o,
-                    )
-
         return
-
-    @staticmethod
-    @cute.jit
-    def reduction_gmem_fused_nvfp4(
-        blk_tile_shpd: cute.Tile,
-        coord_hg: Int32,
-        coord_p: Int32,
-        coord_hk: Int32,
-        coord_b: Int32,
-        heads_k: int,
-        batches: int,
-        kv_splits: Int32,
-        warpgroup_tidx: Int32,
-        reducer_rank: Int32,
-        mO_partial: cute.Tensor,
-        mO_final: cute.Tensor,
-        mOSF: cute.Tensor,
-        mOGlobalScale: cute.Tensor,
-        mL_partial: cute.Tensor,
-        mM_partial: cute.Tensor,
-        scale_o: Float32,
-    ):
-        """Merge split partials and quantize the attention output."""
-        blk_tile_s, blk_tile_h, blk_tile_p, blk_tile_d = blk_tile_shpd
-        assert blk_tile_p == 1 and blk_tile_d % 16 == 0
-        assert mO_final.dtype == cutlass.Float4E2M1FN
-        assert mOSF is not None and mOGlobalScale is not None
-
-        d_scale_blocks = blk_tile_d // 16
-        local_head = warpgroup_tidx // d_scale_blocks
-        d_block = warpgroup_tidx % d_scale_blocks
-        group_head = coord_hg * blk_tile_h + local_head
-        logical_grouped_heads, prediction = mO_final.shape[1]
-
-        partial_vector_elems = 128 // mO_partial.dtype.width
-        assert 16 % partial_vector_elems == 0
-        partial_o_vector_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            mO_partial.dtype,
-            num_bits_per_copy=128,
-        )
-
-        reducer_warp = warpgroup_tidx // 32
-        if reducer_warp == reducer_rank and group_head < logical_grouped_heads:
-            max_final = -Float32.inf
-            for source in cutlass.range(kv_splits, unroll=4):
-                max_final = cute.arch.fmax(
-                    max_final,
-                    mM_partial[
-                        (group_head, coord_p),
-                        (coord_hk, coord_b),
-                        source,
-                    ],
-                )
-
-            final_values = cute.make_rmem_tensor((16,), Float32)
-            final_values.fill(Float32(0))
-            sum_final = Float32(0)
-            if max_final > -Float32.inf:
-                for source in cutlass.range(kv_splits, unroll=4):
-                    max_partial = mM_partial[
-                        (group_head, coord_p),
-                        (coord_hk, coord_b),
-                        source,
-                    ]
-                    if max_partial > -Float32.inf:
-                        correction = exp2(max_partial - max_final)
-                        sum_final += (
-                            correction
-                            * mL_partial[
-                                (group_head, coord_p),
-                                (coord_hk, coord_b),
-                                source,
-                            ]
-                        )
-                        coord_b_partial = source * batches + coord_b
-                        partial_o_head = mO_partial[
-                            None,
-                            (group_head, coord_p),
-                            (coord_hk, coord_b_partial),
-                        ]
-                        for vector_idx in cutlass.range_constexpr(
-                            16 // partial_vector_elems
-                        ):
-                            partial_o_vector = cute.local_tile(
-                                partial_o_head,
-                                (partial_vector_elems,),
-                                (d_block * (16 // partial_vector_elems) + vector_idx,),
-                            )
-                            partial_values = cute.make_rmem_tensor(
-                                (partial_vector_elems,), mO_partial.dtype
-                            )
-                            cute.copy(
-                                partial_o_vector_atom,
-                                partial_o_vector,
-                                partial_values,
-                            )
-                            partial_values_f32 = partial_values.load().to(Float32)
-                            for value_in_vector in cutlass.range_constexpr(
-                                partial_vector_elems
-                            ):
-                                value_idx = (
-                                    vector_idx * partial_vector_elems + value_in_vector
-                                )
-                                final_values[value_idx] += (
-                                    correction * partial_values_f32[value_in_vector]
-                                )
-
-            if sum_final != Float32(0):
-                final_values.store(
-                    final_values.load() * (cute.arch.rcp_approx(sum_final) * scale_o)
-                )
-
-            packed_values, sf_value = quantize_nvfp4_block16(
-                final_values.load(), Float32(mOGlobalScale[0])
-            )
-
-            packed_fp4 = cute.make_rmem_tensor((16,), cutlass.Float4E2M1FN)
-            packed_fp4.store(packed_values)
-            packed_bytes = cute.recast_tensor(packed_fp4, cutlass.Uint8)
-            mO_bytes = cute.recast_tensor(mO_final, cutlass.Uint8)
-            for byte_idx in cutlass.range_constexpr(8):
-                mO_bytes[
-                    d_block * 8 + byte_idx,
-                    (group_head, coord_p),
-                    (coord_hk, coord_b),
-                ] = packed_bytes[byte_idx]
-
-            global_head = coord_hk * logical_grouped_heads + group_head
-            k_idx = global_head * d_scale_blocks + d_block
-            hidden = heads_k * logical_grouped_heads * blk_tile_d
-            row_idx = coord_b * prediction + coord_p
-            sf_offset = output_scale_offset(row_idx, k_idx, hidden)
-            mOSF[sf_offset] = sf_value
-
-    @staticmethod
-    @cute.jit
-    def reduction_cga_local_stats(
-        blk_tile_n: int,
-        lane_idx: Int32,
-        sM_final_nbar: nbar,
-        sL_final_nbar: nbar,
-        cga_stats_ready_nbar: nbar,
-        sL: cute.Tensor,
-    ):
-        """Collapse one CTA's four softmax-warp sums for CGA exchange."""
-        sM_final_nbar.arrive_and_wait()
-        sL_final_nbar.arrive_and_wait()
-        if lane_idx < blk_tile_n:
-            local_sum = sL[lane_idx, 0]
-            for warp in cutlass.range_constexpr(1, warpgroup_warps):
-                local_sum += sL[lane_idx, warp]
-            sL[lane_idx, 0] = local_sum
-        cute.arch.fence_view_async_shared()
-        cga_stats_ready_nbar.arrive()
 
     @staticmethod
     @cute.jit
@@ -2536,8 +1976,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         l_partial_bsh: cute.Tensor,
         m_partial_bsh: cute.Tensor,
         scale_o: Float32,
-        o_block_scale: Optional[cute.Tensor],
-        o_global_scale: Optional[cute.Tensor],
         padded_grouped_heads: int,
         logical_grouped_heads: int,
         stream: cuda.CUstream,
@@ -2545,13 +1983,6 @@ class GroupedQueryAttentionDecodePagedFp4:
     ):
         splits, b, s_q, h_q_partial, d = o_partial_bshd.shape
         h_q = o_bshd.shape[2]
-        quantize_o = cutlass.const_expr(o_bshd.dtype == cutlass.Float4E2M1FN)
-        if cutlass.const_expr(quantize_o):
-            assert o_block_scale is not None and o_global_scale is not None
-            assert d_per_blk % 16 == 0
-            assert h_q_partial * logical_grouped_heads == (h_q * padded_grouped_heads)
-        else:
-            assert o_block_scale is None and o_global_scale is None
 
         def reverse(t: cute.Tensor):
             modes = tuple(reversed(range(cute.rank(t))))
@@ -2563,7 +1994,7 @@ class GroupedQueryAttentionDecodePagedFp4:
         l_partial_hsb = reverse(l_partial_bsh)
         m_partial_hsb = reverse(m_partial_bsh)
 
-        d_per_thr = 16 if quantize_o else 32 // o_bshd.dtype.width
+        d_per_thr = 32 // o_bshd.dtype.width
         thr_per_blk = d_per_blk // d_per_thr
         d_blks = cute.ceil_div(d, d_per_blk)
         smem_bytes = splits * 2 * Float32.width // 8
@@ -2575,8 +2006,6 @@ class GroupedQueryAttentionDecodePagedFp4:
             l_partial_hsb,
             m_partial_hsb,
             scale_o,
-            o_block_scale,
-            o_global_scale,
             padded_grouped_heads,
             logical_grouped_heads,
         ).launch(
@@ -2598,8 +2027,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         l_partial_hsb: cute.Tensor,
         m_partial_hsb: cute.Tensor,
         scale_o: Float32,
-        o_block_scale: Optional[cute.Tensor],
-        o_global_scale: Optional[cute.Tensor],
         padded_grouped_heads: int,
         logical_grouped_heads: int,
     ):
@@ -2694,23 +2121,7 @@ class GroupedQueryAttentionDecodePagedFp4:
 
         cute.arch.griddepcontrol_launch_dependents()
 
-        quantize_o = cutlass.const_expr(o_dhsb.dtype == cutlass.Float4E2M1FN)
         if not_oob_d:
-            if cutlass.const_expr(quantize_o):
-                assert o_block_scale is not None and o_global_scale is not None
-                packed_values, sf_value = quantize_nvfp4_block16(
-                    tCrO_final, Float32(o_global_scale[0])
-                )
-                tCgO.store(packed_values)
-
-                d_block = (d_blk_idx * d_per_blk + tidx * d_per_thr) // 16
-                d_scale_blocks = d // 16
-                k_idx = coord_h * d_scale_blocks + d_block
-                hidden = h_q * d
-                row_idx = coord_b * s_q + coord_s
-                sf_offset = output_scale_offset(row_idx, k_idx, hidden)
-                o_block_scale[sf_offset] = sf_value
-            else:
-                tCgO.store(tCrO_final.to(o_dhsb.dtype))
+            tCgO.store(tCrO_final.to(o_dhsb.dtype))
 
         return

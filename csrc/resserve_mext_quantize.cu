@@ -23,7 +23,7 @@ void quantize(TensorView input, TensorView scales, TensorView output, TensorView
   check_dtype(output_scales, dl_uint8, "output_scales");
   auto m = input.size(0), k = input.size(1);
   TVM_FFI_ICHECK(m > 0 && m <= INT_MAX / 2 && k > 0 && k <= INT_MAX && k % 16 == 0);
-  TVM_FFI_ICHECK(scales.numel() == 1 || scales.numel() == 2);
+  TVM_FFI_ICHECK(scales.numel() == 1);
   TVM_FFI_ICHECK(output.size(0) == 2 * m && output.size(1) == k / 2);
   TVM_FFI_ICHECK_EQ(output_scales.numel(), ((2 * m + 127) / 128) * ((k + 63) / 64) * 512);
   TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(input.data_ptr()) % 32, 0);
@@ -42,8 +42,7 @@ void quantize(TensorView input, TensorView scales, TensorView output, TensorView
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), T, [&] {
     flashinfer::resserve::QuantizeRowPairs<T><<<grid, block, 0, stream>>>(
         m, k, static_cast<const T*>(input.data_ptr()), static_cast<const float*>(scales.data_ptr()),
-        scales.numel(), static_cast<uint32_t*>(output.data_ptr()),
-        static_cast<uint8_t*>(output_scales.data_ptr()));
+        static_cast<uint32_t*>(output.data_ptr()), static_cast<uint8_t*>(output_scales.data_ptr()));
     return true;
   });
   auto status = cudaGetLastError();

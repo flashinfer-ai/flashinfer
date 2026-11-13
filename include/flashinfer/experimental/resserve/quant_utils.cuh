@@ -208,8 +208,8 @@ __device__ __forceinline__ void load_packed_vec16(Type const* ptr, PackedVec<Typ
 
 template <class Type, bool UE8M0_SF = false>
 __device__ __forceinline__ u32x2 cvt_warp_fp16_to_fp4_mext_r1_fast16(
-    PackedVec<Type>& loVec, PackedVec<Type>& hiVec, float SFScaleVal, float SFScaleResVal,
-    uint8_t* SFout, uint32_t* residueDataOut, uint8_t* residueSFOut) {
+    PackedVec<Type>& loVec, PackedVec<Type>& hiVec, float SFScaleVal, uint8_t* SFout,
+    uint32_t* residueDataOut, uint8_t* residueSFOut) {
   static_assert(CVT_FP4_ELTS_PER_THREAD == 8,
                 "pack16 transitional path assumes 8-element base helper.");
 
@@ -270,9 +270,9 @@ __device__ __forceinline__ u32x2 cvt_warp_fp16_to_fp4_mext_r1_fast16(
     localMaxResidue = fmaxf(localMaxResidue, fmaxf(fabsf(hiResidue[i].x), fabsf(hiResidue[i].y)));
   }
 
-  float residueSFValue = compute_sf_from_max(localMaxResidue, SFScaleResVal);
+  float residueSFValue = compute_sf_from_max(localMaxResidue, SFScaleVal);
   residueSFValue = encode_sf_to_fp8<UE8M0_SF>(residueSFValue, residueSFOut);
-  float residueOutputScale = compute_output_scale_precise(residueSFValue, SFScaleResVal);
+  float residueOutputScale = compute_output_scale_precise(residueSFValue, SFScaleVal);
 
   float2 loResidueScaled[CVT_FP4_ELTS_PER_THREAD / 2];
   float2 hiResidueScaled[CVT_FP4_ELTS_PER_THREAD / 2];

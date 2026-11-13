@@ -8,9 +8,11 @@ implementation.
 
 ## Original code and integration changes
 
-- `csrc/resattn/{host,kernel_paged_decode,plan,kv_layout,qmul4,output}.py`:
-  grouped Q residue, pre-softmax QK folding, paged decode, QMUL4 V conversion,
-  output and split/reduction paths.
+- `csrc/resattn/{host,kernel_paged_decode,qmul4}.py`: grouped Q residue,
+  pre-softmax QK folding, paged decode, QMUL4 V conversion, and the
+  split/reduction path. The donor's `plan`, `kv_layout` and `output` modules
+  are not carried over: this port fixes the configuration to what the public
+  API exposes.
 - `csrc/nvfp4/cuda/nvfp4_quant_kernels.cu`: grouped Q producer.
 - `csrc/common/fp4/nvfp4_utils.cuh`: production pack16 residue arithmetic,
   shared with this fork's MEXT branch.
@@ -42,8 +44,10 @@ prequantized NVFP4 K/V pages and E4M3 block scales. K scales are linear
 `[page, head, token//4, channel//16, token%4]`. It supports SM100,
 page size 128, GQA4/6/8, head dimension 128/256, BF16 output, and split counts
 1 or 2 (deterministic FP32-partial reducer for split2). The donor's packed
-output and other reducer implementations remain internal and are not exposed
-through this initial API. No serving-framework monkeypatches are included.
+NVFP4 output path, its fused last-CTA and cluster reducers, the automatic
+split selection and the caller-owned reduction workspace are not ported in
+this PR; the kernel emits BF16 only. No serving-framework monkeypatches are
+included.
 
 Requires `nvidia-cutlass-dsl[cu13]==4.8.0` and its CUDA 13.4 PTX compiler;
 install the compiler dependencies in your development environment.
