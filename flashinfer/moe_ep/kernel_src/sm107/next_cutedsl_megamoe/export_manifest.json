@@ -13,7 +13,7 @@
     "common/dsl_helpers.py": "5c2ddc27170a1d7820ef41c6e34da3a27db2cf8ccd827cc4f19c6e3b93b950d8",
     "common/fc_tile_timeline_host.py": "9cb98ec32e076e71ed8d619f186be3239aa73ed4336dd540abbc72a64e7e3b70",
     "common/host_utils.py": "53508fcf80e997fdde46609a6455fef7ed4864fcc67efd09118b5de1df401b37",
-    "common/inputs_process.py": "f34ff959b44e40b3746f783bf46f0cdd432802379479cf7cc6e45554a1acf28e",
+    "common/inputs_process.py": "24383c444118b1dac758efbc73896f12375d81df009d0aa91378d2a7adb0e0e5",
     "common/megamoe_constants.py": "4776d0aa2330b5bcbed96a6552bb58a19efda9e214302d4aba8a9801641b7c78",
     "common/moe_utils.py": "037b215e90800cffd17c4477744b296797b571997b469f2a658099c306c1dd35",
     "common/pipeline_timing.py": "ee7adb97edce4d17feaa410b7b8ca467bf1247060a9b8a8b9fc02d7a5ceb098a",
@@ -56,15 +56,15 @@
     "sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py": "0c9ea8eaad3258b5f887abed28181abfb4601b32cbc7fbcc059560dd8b1e4980",
     "sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py": "0ebbbf4cea5b2354774ce1f28f2f433d8542a942b90202e36e671f9cd2800859",
     "sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py": "6035ab282d206c9db8b1152baa63bcce21a549ab60e0272feceda3d1d36bf11e",
-    "sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py": "1e6dd2c04a8e750bbbf6752da4c3e02d900982df324c251b98810de84ca5b375",
-    "sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py": "f88845b7cc5be1b9a10cf46dd5853bab40c0734b4b50a5929306361060a79a98",
+    "sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py": "54ac81eae40f8f0602671ed17d69ab1866fc4efc5618893ca233574c6c1cdc45",
+    "sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py": "cf066f833c0780cff24ae6efd64b0ad6e8a7f871def3fd51d52073a52092feea",
     "sources/kernel_src/rubin/inference/mega/dynamic_mainloop.py": "d85b41f1f605c8ce4ae97696e4c8aad5f02eb95412eb42e20d0cfca2dcc4e54a",
     "sources/kernel_src/rubin/inference/mega/genphase_tail.py": "c3eeb377f0fa7ba6d58c66727f2689637296a38861a7eb193baf3b7219ed092c",
     "sources/kernel_src/rubin/inference/mega/shared_expert_helper.py": "38d99c2a7ee5493a6728f5574840c636d4159e5287a13e668c142507e15f64d3",
     "sources/kernel_src/rubin/inference/mega/shared_expert_mainloop.py": "a0701d4fc05f1507ef39a4bc07f1dda3bdab28dde6673a0db9cc733df8f55bc7",
     "sources/kernel_src/rubin/inference/mega/tma_gather.py": "0fbc10e05282241250de08ccfaebd533076f29abdd3bb949c063cf80daf54496",
     "sources/kernel_src/rubin/inference/mega/token_comm_gen_specialized.py": "665bcfbefd632d76a8e25f3cfa86f74409a9eb847c03d0835831a53f7b7c9efb",
-    "sources/kernel_src/rubin/inference/mega/topk_reduce_dedup.py": "9807caecfc697418c339d02b3437a915b47ca2687c2df9187101613c6fd01eb4",
+    "sources/kernel_src/rubin/inference/mega/topk_reduce_dedup.py": "f9806b864242da9aab196950464f5918cdef1f3e9b088210fc5464303d8a8124",
     "sources/kernel_src/rubin/inference/mega/weight_prefetch.py": "44ba70254c86ad0faae3bcacdbf6a6d966d2658681aaf0e1a63fc3a1541611e5",
     "sources/kernel_src/schedulers/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "sources/kernel_src/schedulers/base.py": "22a68aede7b609cd7f770954d428098207bcb504c12cb71b0bb2198ca339cc04",
@@ -76,5 +76,6 @@
     "sources/kernel_src/schedulers/work_id_claim.py": "b1e734756023740b3c4ca4a488697a196b7edf43e0668d324bb2fc19f7140618",
     "sources/quant_def.py": "020da2ed98414726f992553c2d9a0c5a1e151864322617a68c850ce9d0783afd"
   },
-  "cleanup_patch_sha256": "610b475ad3dd741903715606a055bae0e82eadbdcc93b0bf1fb16b2bb74059ff"
+  "cleanup_patch_sha256": "610b475ad3dd741903715606a055bae0e82eadbdcc93b0bf1fb16b2bb74059ff",
+  "patch_revision": "7a08e1825194461fd17a60adc2fb47ba26af7eb7"
 }

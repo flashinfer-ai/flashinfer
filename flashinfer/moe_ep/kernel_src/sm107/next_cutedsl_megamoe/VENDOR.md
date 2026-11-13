@@ -20,6 +20,13 @@ The selected entry points are `RubinInferenceMegaMoE` and
 file hashes and release-transform checksum. Source changes belong in the
 provider before regeneration; do not edit the installed export.
 
+The provider's export and release tools are not included in this snapshot.
+The cleanup checksum identifies the release transformation. Rebuilding the drop
+requires the provider's release process, both entry points above and the shared
+modules used directly by the adapter. Verify every exported file against the
+manifest before replacing the package, then run the adapter, numerical and
+graph-replay tests.
+
 The drop retains FlashInfer's route-ID forwarding and invalid-route masking
 for separate reduction. GenPhase uses the provider's self-validating combine
 and tail protocol, masking invalid scores before reduction. Top-k counts above
@@ -55,3 +62,10 @@ kernel; FlashInfer does not expose shared-expert parameters in this drop.
 Local corrections initialize FC1 scale padding through the last valid writer
 and retain 16-byte routed-output alignment. Optional shared-term loads still
 require 32 bytes.
+
+`patch_revision` records the source with the review corrections: communication
+settings have distinct compiled names, split-CTA FC1 scores follow the selected
+routing-weight position, and deduplicated reduction uses 128-bit output stores.
+Inference rejects CLC work IDs because its communication and reset protocol
+requires a fixed persistent CTA set. The default kernel names are unchanged;
+deduplicated reduction has a new output-store cache suffix.

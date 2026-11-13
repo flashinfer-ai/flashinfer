@@ -176,6 +176,8 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         self.token_padding_block = impl_desc["token_padding_block"]
         self.sf_padding_block = impl_desc["sf_padding_block"]
         self.work_id_mode: WorkIdAcquisitionMode = impl_desc["work_id_mode"]
+        if self.work_id_mode not in ("grid_stride", "atomic_counter"):
+            raise ValueError("Rubin MegaMoE inference requires grid_stride or atomic_counter work IDs.")
         self.fc2_use_bulk = impl_desc["fc2_use_bulk"]
         self.epi_flag_batches = impl_desc["epi_flag_batches"]
         self.launch_cluster_count = impl_desc["launch_cluster_count"]
@@ -829,6 +831,24 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             + ("_epiwarpgroups2" if self.two_epilogue_warpgroups else "")
             + ("_tanhsigmoid" if self.epilogue.use_tanh_sigmoid else "")
             + ("_diagskiptb" if self._diag_skip_token_back else "")
+            + (
+                f"_comm{self.comm_clusters}_tbcompute{int(self.token_back_on_compute_ctas)}"
+                f"_commwarps{'x'.join(str(w) for w in self.comm_warps)}"
+                f"_commstages{'x'.join(str(d) for d in self.comm_stage_depths)}"
+                if self.comm_clusters > 0 else ""
+            )
+            + (
+                f"_tbchunk{self.token_back_chunk_bytes}"
+                if self.token_back_chunk_bytes != TokenCommNonDeterministic.standalone_chunk_bytes else ""
+            )
+            + (f"_sfgroup{self.dispatch_sf_group}" if self.dispatch_sf_group != 1 else "")
+            + (
+                f"_tbsched{self.token_back_schedule_mode}"
+                if self.comm_clusters > 0 or self.token_back_schedule_mode != (
+                    "atomic_counter" if self.work_id_mode == "atomic_counter" else "static"
+                ) else ""
+            )
+            + ("_dedupout128" if self.combine_dedup else "")
             + self._shared_name_suffix()
             # The tmp buffer is a third pointer operand, an ABI change: it keys the compiled kernel and its AOT symbol.
             + ("_tmpbuf_v1" if self.separate_tmp_buffer else "")
@@ -1922,7 +1942,10 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
                 fc1_ready_counter_pointer=self.token_comm.fc1_ready_counter_pointer(self._device_workspace),
             )
             optional_epilogue_args = GatedActEpilogueArgs(
-                fc1_alpha=fc1_alpha, fc2_alpha=fc2_alpha, fc1_norm_const=fc1_norm_const, topk_scores=pool_topk_scores
+                fc1_alpha=fc1_alpha,
+                fc2_alpha=fc2_alpha,
+                fc1_norm_const=fc1_norm_const,
+                topk_scores=pool_topk_scores if cutlass.const_expr(self.apply_topk_at_fc1) else None,
             )
 
             pipeline_init_arrive_mixed_cga(

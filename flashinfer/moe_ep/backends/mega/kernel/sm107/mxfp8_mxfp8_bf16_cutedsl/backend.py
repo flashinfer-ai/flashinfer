@@ -404,6 +404,8 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             k.cluster_shape_mn,
             k.fallback_cluster_shape_mn,
             k.max_sm_count,
+            k.use_tanh_sigmoid,
+            k.epilogue_warpgroups,
             knobs_pool_key(self._knob_overrides(fleet_params)),
         )
 

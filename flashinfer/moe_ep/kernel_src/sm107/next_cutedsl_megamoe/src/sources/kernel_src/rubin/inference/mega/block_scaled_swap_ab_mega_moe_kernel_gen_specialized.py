@@ -26,12 +26,10 @@ claim counters and the fc1_done slots among them), signals the peers
 call's communication kernel reads. That kernel waits at entry until the epoch
 shows the previous call's tail complete (a standalone top-k reduce may end before
 the tail, and the next launch may start right after the reduce). The tail has no
-grid sync, so under the decode scheduler the scheduler warp drains the cluster
-claim channel and every CTA leaves through a cluster barrier (peers' remote
-arrives land before a CTA exits). The grouped and phase_interleave builds exit
-without the drain or the barrier: their atomic_counter builds share the same
-in-flight-arrive hazard (grid_stride has no claim channel, so only the barrier
-part applies), which a separate change addresses for every schedule.
+grid sync. Every schedule joins its warp roles and synchronizes the cluster
+before entering the global-memory tail, keeping peer shared memory alive until
+all users finish. Decode also drains the claim channel and synchronizes the
+cluster again after the tail.
 
 Residency: the communication kernel fires ``launch_dependents`` at entry, and a
 programmatic dependent is only released once every primary CTA has done so, so

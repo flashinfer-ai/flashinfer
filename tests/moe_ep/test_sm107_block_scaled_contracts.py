@@ -862,3 +862,64 @@ def test_execution_options_separate_cache_entries(tmp_path, monkeypatch):
             epilogue_warpgroups=warpgroups,
         )
         assert result == {"marker": index}
+
+
+def _native_inference_kernel(monkeypatch, **overrides):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import src
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.api import (
+        ImplDesc,
+    )
+
+    monkeypatch.setattr(block_scaled, "_max_active_clusters", lambda size: 128 // size)
+    cls = src.RubinInferenceMegaMoE
+    initialize = cls.__init__
+
+    def build(instance, problem, implementation):
+        initialize(instance, problem, ImplDesc(dict(implementation) | overrides))
+
+    cfg = _config(
+        hidden=384, intermediate=256, quant_kind="mxfp8_e4m3", fc2_use_bulk=True
+    )
+    with mock.patch.object(cls, "__init__", build):
+        return block_scaled.Sm107BlockScaledSymmBuffer._build_kernel(cfg)
+
+
+def test_native_communication_settings_have_distinct_compiled_names(monkeypatch):
+    base = dict(
+        comm_clusters=1,
+        comm_warps=(4, 4),
+        token_back_mode="standalone_warps",
+        work_id_mode="atomic_counter",
+    )
+    kernel = _native_inference_kernel(monkeypatch, **base)
+    changes = [
+        {},
+        dict(comm_clusters=2),
+        dict(token_back_on_compute_ctas=True),
+        dict(comm_warps=(5, 4)),
+        dict(comm_stage_depths=(1, 2)),
+        dict(token_back_chunk_bytes=kernel.token_back_chunk_bytes * 2),
+        dict(dispatch_sf_group=4),
+        dict(token_back_schedule_mode="atomic_counter"),
+    ]
+    kernels = [
+        _native_inference_kernel(monkeypatch, **(base | change)) for change in changes
+    ]
+    assert len({kernel.name() for kernel in kernels}) == len(changes)
+    assert len({kernel._aot_symbol_name() for kernel in kernels}) == len(changes)
+
+
+def test_native_fused_token_back_schedule_has_distinct_compiled_name(monkeypatch):
+    base = dict(work_id_mode="atomic_counter", token_back_mode="standalone_warps")
+    default = _native_inference_kernel(monkeypatch, **base)
+    static = _native_inference_kernel(
+        monkeypatch, **base, token_back_schedule_mode="static"
+    )
+    assert default.name() != static.name()
+
+
+def test_native_inference_rejects_clc_before_launch(monkeypatch):
+    with pytest.raises(
+        ValueError, match="inference requires grid_stride or atomic_counter"
+    ):
+        _native_inference_kernel(monkeypatch, work_id_mode="cluster_launch_control")

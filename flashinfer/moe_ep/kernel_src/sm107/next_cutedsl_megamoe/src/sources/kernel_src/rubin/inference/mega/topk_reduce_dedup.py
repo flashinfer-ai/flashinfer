@@ -19,7 +19,7 @@ from .....quant_def import CombineFormat
 
 class TopkReduceDedup:
     _threads: ClassVar[int] = 128
-    _hidden_per_thread: ClassVar[int] = 16  # one 32 B (ld/st.256) access of bf16 per slot
+    _hidden_per_thread: ClassVar[int] = 16  # one 32-byte BF16 load per rank slot
 
     def __init__(self, hidden: int, world_size: int, combine_format: CombineFormat) -> None:
         if combine_format.is_quantized or combine_format.act_dtype is not cutlass.BFloat16:
@@ -121,9 +121,9 @@ class TopkReduceDedup:
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))
             cute.copy(
-                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=hidden_per_thread * out_dtype.width),
+                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=128),
                 out,
-                mark_alignment(dst, hidden_per_thread * out_dtype.width // 8),
+                mark_alignment(dst, 16),
             )
 
 

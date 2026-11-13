@@ -120,9 +120,9 @@ class DataPreprocess:
         topk_weights_output: cute.Tensor,  # (token, topk)
         cuda_stream: cuda.CUstream,
         # nvfp4 only: exactly one of the two is valid (see class docstring).
-        #   online:  (1,) output buffer -- caller does NOT zero it; staging zeros
-        #            it, reduces the activation amax into it, and leaves the
-        #            derived scale for the caller to fold into fc1_alpha.
+        #   online:  (1,) output buffer; staging seeds it with Fp32Max and
+        #            min-reduces _nvfp4_norm_numer / token_amax into norm_const
+        #            for the quantization launch.
         #   offline: runtime f32 scalar, read-only calibrated scale.
         online_norm_const: Optional[cute.Tensor] = None,
         offline_norm_const: Optional[cutlass.Float32] = None,
@@ -179,8 +179,8 @@ class DataPreprocess:
             ).launch(grid=grid, block=block, stream=cuda_stream, min_blocks_per_mp=1)
             return
 
-        # nvfp4: online derives the per-tensor scale in-band (zero -> amax ->
-        # quant, three launches so kernel boundaries stand in for a grid barrier
+        # nvfp4: online derives norm_const in-band (seed -> reduce -> quant,
+        # three launches so kernel boundaries stand in for a grid barrier
         # with no extra workspace); offline reads the caller's constant in one
         # launch. Perf-critical callers should calibrate offline.
         if cutlass.const_expr(online_norm_const is not None):

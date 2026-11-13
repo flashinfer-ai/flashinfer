@@ -158,3 +158,69 @@ def test_polled_combine_masks_scores(hidden, topk):
             assert torch.isnan(terms[~valid]).all()
     finally:
         graph.reset()
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize("tokens,hidden,world", [(1, 32, 1), (3, 128, 4), (17, 384, 8)])
+@pytest.mark.parametrize("with_shared", [False, True])
+def test_dedup_reduce_graph_with_16_byte_output(tokens, hidden, world, with_shared):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Requires SM107")
+    import cutlass.cute as cute
+    from cuda.bindings import driver as cuda
+    from cutlass.cute.runtime import from_dlpack
+
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.kernel_src.rubin.inference.mega.topk_reduce_dedup import (
+        TopkReduceDedup,
+    )
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.quant_def import (
+        CombineFormat,
+    )
+
+    slots = torch.randn(tokens, world, hidden, device="cuda", dtype=torch.bfloat16)
+    mask = torch.zeros(tokens, device="cuda", dtype=torch.int32)
+    storage = torch.full(
+        (tokens * hidden + 16,), 7, device="cuda", dtype=torch.bfloat16
+    )
+    output = storage[8:-8].view(tokens, hidden)
+    assert output.data_ptr() % 32 == 16
+    shared = (
+        torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+        if with_shared
+        else None
+    )
+    args = dict(
+        rank_slots=from_dlpack(slots, assumed_align=32),
+        valid_rank_mask=from_dlpack(mask, assumed_align=4),
+        reduced_output=from_dlpack(output, assumed_align=16),
+        shared_term=from_dlpack(shared, assumed_align=32)
+        if shared is not None
+        else None,
+        stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    executable = cute.compile(
+        TopkReduceDedup(hidden, world, CombineFormat.parse("bf16")), **args
+    )
+    executable(**args)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            args["stream"] = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+            executable(**args)
+        for state in (0, (1 << world) - 1, 0x55 & ((1 << world) - 1)):
+            slots.normal_()
+            mask.fill_(state)
+            output.fill_(float("nan"))
+            expected = torch.zeros(tokens, hidden, device="cuda", dtype=torch.float32)
+            for rank in range(world):
+                if state & (1 << rank):
+                    expected.add_(slots[:, rank].float())
+            if shared is not None:
+                expected.add_(shared.float())
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(output, expected.bfloat16(), rtol=0, atol=0)
+            assert (storage[:8] == 7).all() and (storage[-8:] == 7).all()
+    finally:
+        graph.reset()
