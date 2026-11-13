@@ -6,7 +6,18 @@ import functools
 
 import torch
 
-from ...jit.resserve import gen_resserve_kext_quantize_module
+from ...jit import env as jit_env
+from ...jit.core import current_compilation_context, gen_jit_spec
+
+
+def gen_resserve_kext_quantize_module():
+    return gen_jit_spec(
+        "resserve_kext_quantize",
+        [jit_env.FLASHINFER_CSRC_DIR / "resserve_kext_quantize.cu"],
+        extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(
+            supported_major_versions=[10]
+        ),
+    )
 
 
 @functools.cache
