@@ -67,10 +67,24 @@ def get_seed_and_offset(
     """
     if generator is None:
         generator = get_default_generators(device)
-    # Serialize FlashInfer reservations: get_state/set_state alone do not
+    # Serialize FlashInfer reservations: the generator accessors alone do not
     # make the read-modify-write atomic. A shared lock avoids retaining
     # caller-owned generators in a per-generator lock cache.
     with _rng_state_lock:
+        # Scalar access avoids allocating and unpacking CPU state tensors, but
+        # PyTorch disallows get_offset/set_offset during CUDA graph capture.
+        if not torch.cuda.is_current_stream_capturing():
+            offset = generator.get_offset()
+            next_offset = offset + (increment + 3) // 4 * 4
+            # Keep the state-tensor path's signed-offset/overflow behavior at
+            # the int64 boundaries, including leaving state intact on overflow.
+            if offset < 1 << 63 and 0 <= next_offset < 1 << 63:
+                seed = generator.initial_seed()
+                # Match the state tensor's signed int64 representation.
+                if seed >= 1 << 63:
+                    seed -= 1 << 64
+                generator.set_offset(next_offset)
+                return seed, offset
         state = generator.get_state()
         seed, offset = map(int, state.view(torch.int64))
         # Reserve this call's range, leaving the generator at the next unused offset.
