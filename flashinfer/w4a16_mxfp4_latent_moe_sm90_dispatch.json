@@ -1,0 +1,18 @@
+{
+  "comment": "Dispatch surface of the specialized SM90 W4A16 latent-MoE routed-expert kernel (w4a16_mxfp4_latent_routed_moe). 'backends' lists the backend strings; the op entry carries the fixed geometry backend='auto' matches a call against (the compiled-in guards stay authoritative). FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 forces the composable 'reference' path regardless of this file.",
+  "backends": ["auto", "specialized", "reference"],
+  "kill_switch": "FLASHINFER_SPECIALIZED_KERNEL_DISABLE",
+  "ops": {
+    "w4a16_mxfp4_latent_routed_moe": {
+      "E_local": 56,
+      "top_k": 16,
+      "L": 3584,
+      "I": 3072,
+      "scale_group": 32,
+      "weights": "mxfp4 e2m1 packed uint8 (low nibble = even K) + ue8m0 group-32 scales",
+      "activations": "bfloat16",
+      "compute_capability": [9, 0],
+      "envelope": {"max_tokens": 8192}
+    }
+  }
+}
