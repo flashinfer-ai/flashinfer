@@ -192,6 +192,15 @@ For SM90 NVFP4 fused/split and MXFP4 fused MegaMoE, use
 timing and [test_megamoe_fp4_sm90.py](../../tests/moe/test_megamoe_fp4_sm90.py)
 for correctness checks.
 
+For the `moe_ep` SM120 MXFP4 x MXFP8 MegaMoE backends (`--backend cutedsl` /
+`cake`, or `nosync`: the `--fallback` backend with
+`MoEEpLayer(..., nosync=NosyncOptions())`, on the same weights and routes), use
+[bench_megamoe_mxfp4_sm120.py](../../benchmarks/bench_megamoe_mxfp4_sm120.py); the
+nosync option's correctness checks are in
+[test_moe_ep_sm120_w4a8_nosync_mega.py](../../tests/moe_ep/test_moe_ep_sm120_w4a8_nosync_mega.py). Its
+design, transports and host-topology caveats are in
+[moe_ep_sm120_nosync.md](../design_docs/moe_ep_sm120_nosync.md).
+
 ## Prims-TS decode dtypes
 
 Keep storage (`q_dtype`, `k_dtype`, `v_dtype`) separate from MMA precision

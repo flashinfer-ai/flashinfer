@@ -1,4 +1,5 @@
-"""JIT module generation for the three SM90 FP4 MegaMoE paths.
+"""JIT module generation for the SM90 FP4 MegaMoE paths and the SM120 MXFP4 x MXFP8 nosync MegaMoE
+(the ``flashinfer.moe_ep`` backend ``sm120_mxfp4_mxfp8_bf16_nosync``).
 
 The kernel resolves its shared-memory layout, task schedule and dispatch
 protocol at compile time, so one module is built per (shape, plan) pair. The
@@ -12,7 +13,7 @@ from pathlib import Path
 import jinja2
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, write_if_different
+from .core import JitSpec, gen_jit_spec, sm120a_nvcc_flags, write_if_different
 
 
 def _csrc_dir() -> Path:
@@ -344,4 +345,76 @@ def gen_megamoe_sm90_mxfp4_module(
             fast_math=fast_math,
         ),
         fast_math,
+    )
+
+
+def _sm120_nccl():
+    # NCCL 2.30.7 headers + library (the Device API GIN), located as for the moe_ep cake backend
+    from ..moe_ep.kernel_src.sm120.cake_mxfp4_megamoe.shim.cake_jit import (
+        nccl_installation,
+    )
+
+    return nccl_installation()
+
+
+def gen_megamoe_sm120_mxfp4_module(
+    fast_math: bool, gin_type: int | None = None
+) -> JitSpec:
+    """SM120 MXFP4 nosync MegaMoE. Shapes are runtime arguments: one module per fast-math policy,
+    P2P only (``gin_type`` None) or with NIC (GIN) pairs built for one NCCL GIN backend, so that
+    the kernel inlines only that backend's put / signal code."""
+    csrc = _csrc_dir()
+    uri = "megamoe_sm120_mxfp4"
+    cflags = ["-std=c++17"]
+    ldflags: list[str] = []
+    includes = [csrc, jit_env.FLASHINFER_CSRC_DIR]
+    if gin_type is not None:
+        from ..moe_ep.kernel_src.sm120.cake_mxfp4_megamoe.shim.cake_jit import (
+            GIN_BACKENDS,
+        )
+
+        names = {t: (name, flags) for name, (t, flags) in GIN_BACKENDS.items()}
+        if gin_type not in names:
+            raise ValueError(f"unsupported NCCL GIN type {gin_type}")
+        backend, backend_flags = names[gin_type]
+        include, library = _sm120_nccl()
+        uri += f"_gin_{backend}"
+        cflags += [
+            "-DFLASHINFER_MEGAMOE_SM120_GIN=1",
+            "-D_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE",
+            *backend_flags,
+        ]
+        ldflags = [str(library), f"-Wl,-rpath,{library.parent}"]
+        includes.append(include)
+    uri += "_fm" if fast_math else ""
+    directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    directory.mkdir(parents=True, exist_ok=True)
+    source = directory / "megamoe_sm120_mxfp4.cu"
+    write_if_different(source, (csrc / "megamoe_sm120_mxfp4.cu").read_text())
+    return gen_jit_spec(
+        uri,
+        [source],
+        extra_cuda_cflags=[*cflags, *sm120a_nvcc_flags],
+        extra_ldflags=ldflags or None,
+        extra_include_paths=includes,
+        use_fast_math=fast_math,
+    )
+
+
+def gen_megamoe_sm120_gin_session_module() -> JitSpec:
+    """SM120 MegaMoE NIC transport session: NCCL window, LSA peer pointers, device communicator."""
+    include, library = _sm120_nccl()
+    uri = "megamoe_sm120_gin_session"
+    directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    directory.mkdir(parents=True, exist_ok=True)
+    source = directory / "megamoe_sm120_gin_session.cu"
+    write_if_different(
+        source, (_csrc_dir() / "megamoe_sm120_gin_session.cu").read_text()
+    )
+    return gen_jit_spec(
+        uri,
+        [source],
+        extra_cuda_cflags=["-std=c++17", *sm120a_nvcc_flags],
+        extra_ldflags=[str(library), f"-Wl,-rpath,{library.parent}"],
+        extra_include_paths=[include, jit_env.FLASHINFER_CSRC_DIR],
     )
