@@ -128,5 +128,26 @@ def test_act_and_mul_cuda_graph():
     torch.testing.assert_close(y2, y2_ref, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("shape", [(0, 2048), (2, 0, 2048)])
+@pytest.mark.parametrize("use_out", [False, True])
+def test_silu_and_mul_zero_tokens(shape, use_out):
+    x = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+    expected_shape = shape[:-1] + (shape[-1] // 2,)
+
+    out = (
+        torch.empty(expected_shape, device=x.device, dtype=x.dtype) if use_out else None
+    )
+
+    y = flashinfer.activation.silu_and_mul(x, out=out)
+
+    assert y.shape == expected_shape
+    assert y.numel() == 0
+    assert y.dtype == x.dtype
+    assert y.device == x.device
+
+    if use_out:
+        assert y is out
+
+
 if __name__ == "__main__":
     test_fused_silu_mul(128, 1, 1, True)

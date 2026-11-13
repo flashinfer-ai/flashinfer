@@ -123,6 +123,9 @@ def silu_and_mul(
             device=input.device,
             dtype=input.dtype,
         )
+    if input.numel() == 0:
+        return out
+
     get_act_and_mul_module("silu").silu_and_mul(
         out,
         input,
