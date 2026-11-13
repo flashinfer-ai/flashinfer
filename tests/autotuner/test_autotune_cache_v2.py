@@ -839,6 +839,83 @@ class DummyRunnerB(DummyRunner):
     pass
 
 
+class DummyRunnerWithExtras(DummyRunner):
+    def __init__(self, extras, valid_tactics=(0, 1, 2)):
+        super().__init__(valid_tactics)
+        self._extras = extras
+
+    def get_cache_key_extras(self, inputs):
+        return self._extras
+
+
+@pytest.mark.parametrize("storage", ["legacy", "managed"])
+def test_persisted_winner_requires_candidate_coverage_for_tuning(
+    cache_root, monkeypatch, storage
+):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner._collect_metadata",
+        lambda: {"gpu": "test GPU"},
+    )
+    path = cache_root / "legacy.json"
+    first = DummyRunnerWithExtras(("layout_a",), (0,))
+    second = DummyRunnerWithExtras(("layout_b",), (1,))
+    third = DummyRunnerWithExtras(("layout_c",), (2,))
+    inputs = [torch.zeros(8, 16)]
+    calls = _install_fake_profile(monkeypatch, {-1: 3.0, 0: 2.0, 1: 1.0, 2: 0.5})
+
+    def context(tune_mode):
+        if storage == "legacy":
+            return autotune(tune_mode=tune_mode, cache=str(path))
+        return autotune_v2(mode="tune" if tune_mode else "replay")
+
+    with context(True):
+        assert AutoTuner.get().choose_one(_OP, [first], _CONFIG, inputs) == (first, 0)
+    if storage == "legacy":
+        # Legacy two-field JSON entries predate policy and coverage metadata.
+        data = json.loads(path.read_text())
+        (key,) = (key for key in data if key.startswith(f"('{_OP}', "))
+        data[key] = data[key][:2]
+        path.write_text(json.dumps(data))
+
+    tuner = _fresh_process()
+    calls.clear()
+    with context(False):
+        assert tuner.choose_one(_OP, [first, second], _CONFIG, inputs) == (first, 0)
+    with context(True):
+        assert tuner.choose_one(_OP, [first], _CONFIG, inputs) == (first, 0)
+        assert calls == []
+        winner = tuner.choose_one(_OP, [first, second], _CONFIG, inputs)
+        assert [tactic for tactic in calls if tactic != -1] == [0, 1]
+        assert winner == (second, 1)
+
+    tuner = _fresh_process()
+    calls.clear()
+    with context(False):
+        assert tuner.choose_one(_OP, [first, second], _CONFIG, inputs) == (second, 1)
+    with context(True):
+        assert tuner.choose_one(_OP, [second, first], _CONFIG, inputs) == (second, 1)
+    assert calls == []
+
+    with context(True):
+        assert tuner.choose_one(_OP, [first], _CONFIG, inputs) == (first, 0)
+        calls.clear()
+        assert tuner.choose_one(_OP, [first, second], _CONFIG, inputs) == (second, 1)
+        assert [tactic for tactic in calls if tactic != -1] == [0, 1]
+
+    tuner = _fresh_process()
+    calls.clear()
+    with context(False):
+        assert tuner.choose_one(_OP, [first, second], _CONFIG, inputs) == (second, 1)
+    assert calls == []
+    with context(True):
+        assert tuner.choose_one(_OP, [first, second, third], _CONFIG, inputs) == (
+            third,
+            2,
+        )
+        assert [tactic for tactic in calls if tactic != -1] == [0, 1, 2]
+
+
 def test_runner_reorder_replays_correct_runner(cache_root, monkeypatch):
     """Persisted entries key on the runner class, so reordering the runner
     list across processes replays the winner on the RIGHT runner."""
@@ -859,15 +936,6 @@ def test_runner_reorder_replays_correct_runner(cache_root, monkeypatch):
         )
     assert isinstance(runner, DummyRunnerB) and tactic == 1
     assert calls == []
-
-
-class DummyRunnerWithExtras(DummyRunner):
-    def __init__(self, extras, valid_tactics=(0, 1, 2)):
-        super().__init__(valid_tactics)
-        self._extras = extras
-
-    def get_cache_key_extras(self, inputs):
-        return self._extras
 
 
 def test_extras_distinguish_entries(cache_root, monkeypatch):

@@ -30,7 +30,7 @@ from typing import (
 
 import torch
 
-from flashinfer.autotune_cache import ManagedCacheEntry
+from flashinfer.autotune_cache import _ManagedCacheRecord
 from flashinfer.tllm_utils import delay_kernel, get_trtllm_utils_module
 from flashinfer.utils import (
     next_positive_power_of_2,
@@ -804,6 +804,9 @@ class OptimizationProfile:
 
 
 class TunableRunner(ABC):
+    # Some runners signal retryable discovery failures with an empty list.
+    _retry_empty_tactics = False
+
     @abstractmethod
     def get_valid_tactics(
         self, inputs: list[torch.Tensor], profile: OptimizationProfile
@@ -1253,7 +1256,8 @@ def set_autotune_process_group(
     skip decisions, profile count, measurement policy and ordered candidates.
     Rank-local shapes and cache roots may differ. A mismatch raises on every
     participating rank before tactic measurement. Cached selections must agree;
-    any miss or disagreement makes every rank re-profile.
+    any miss or disagreement makes every rank re-profile. At the final
+    selection in ``choose_one``, the group uses the fallback if ranks disagree.
 
     Input/candidate/runner preparation OOMs keep coordinated fallback. Other
     caught Python preparation errors raise across the group. Matching nested
@@ -1373,8 +1377,10 @@ def _sync_oom_across_tune_group(
     return False
 
 
-def _all_ranks_hit_cache(local_hit: bool, selection: Any = None) -> bool:
-    """Reuse cached results only when every rank has the same selection."""
+def _all_ranks_hit_cache(
+    local_hit: bool, selection: Any = None, *, phase="cache"
+) -> bool:
+    """Require the same usable selection on every rank."""
     if _tune_process_group is None:
         return local_hit
     if local_hit:
@@ -1384,7 +1390,7 @@ def _all_ranks_hit_cache(local_hit: bool, selection: Any = None) -> bool:
         except Exception:
             local_hit = False
     status, agreed = _tuning_group_agreement(
-        "cache", selection if local_hit else None, int(not local_hit)
+        phase, selection if local_hit else None, int(not local_hit)
     )
     return not status and agreed
 
@@ -1453,6 +1459,41 @@ class ProfilingCacheKey:
     def file_key(self) -> str:
         """Stable string key suitable for on-disk serialisation."""
         return str(self.key_fields)
+
+
+@dataclass(frozen=True)
+class _ProfilingCandidates:
+    runtime_keys: frozenset[tuple[str, int, tuple[Any, ...]]] | None
+    file_keys: tuple[str, ...] | None
+
+    @classmethod
+    def from_runners(
+        cls, runners: list[TunableRunner], inputs: list[torch.Tensor]
+    ) -> "_ProfilingCandidates | None":
+        if len(runners) == 1:
+            return None
+        runtime_keys = frozenset(
+            (type(r).__name__, hash(r), r.get_cache_key_extras(inputs)) for r in runners
+        )
+        file_keys = {str((name, extras)) for name, _, extras in runtime_keys}
+        # Persisted keys omit runtime hashes, so collisions make coverage ambiguous.
+        return cls(
+            runtime_keys,
+            tuple(sorted(file_keys)) if len(file_keys) == len(runtime_keys) else None,
+        )
+
+    def covered_by_file(self, saved_keys: Any) -> bool:
+        return (
+            self.file_keys is not None
+            and isinstance(saved_keys, (tuple, list))
+            and all(key in saved_keys for key in self.file_keys)
+        )
+
+    def covers(self, requested: "_ProfilingCandidates") -> bool:
+        if self.runtime_keys is None:
+            return requested.covered_by_file(self.file_keys)
+        assert requested.runtime_keys is not None
+        return requested.runtime_keys.issubset(self.runtime_keys)
 
 
 def _is_profile(profile: Any) -> bool:
@@ -1846,6 +1887,7 @@ class AutoTuner:
         self._profiling_cache_policies: dict[tuple, tuple | None] = {}
         # How each profiled winner was chosen, keyed and saved like its policy.
         self._profiling_cache_selections: dict[tuple, dict[str, Any]] = {}
+        self._profiling_cache_candidates: dict[tuple, _ProfilingCandidates] = {}
         self.is_tuning_mode = False
         self._active_tuning_contexts = 0
         # Set after a CUPTI infrastructure failure (e.g. another profiler
@@ -1912,7 +1954,7 @@ class AutoTuner:
         # free ProfilingCacheKey tuple (not the str() file_key), so the warm
         # path builds no string.  Entries decoded from one store identity are
         # never served under another's.
-        self._managed_decoded: dict[tuple[str, str, tuple], ManagedCacheEntry] = {}
+        self._managed_decoded: dict[tuple[str, str, tuple], _ManagedCacheRecord] = {}
         # Store identities already bulk-read into _managed_decoded, so a
         # re-attach of the same store does not re-scan the entries directory.
         self._preloaded_stores: set[tuple[str, str]] = set()
@@ -2285,6 +2327,7 @@ class AutoTuner:
         inputs: list[torch.Tensor] | None = None,
         *,
         require_profiling_policy: bool = False,
+        profiling_candidates: _ProfilingCandidates | None = None,
         validation_profile: OptimizationProfile | None = None,
     ) -> tuple[bool, int, Any, OptimizationProfile | None]:
         """Search for cached profiling results matching the current configuration.
@@ -2310,6 +2353,7 @@ class AutoTuner:
                 when choose_one can profile and when selecting its resulting winner.
                 Lookup-only callers leave this False, even inside tuning contexts.
                 Legacy v1 policy checks are unchanged.
+            profiling_candidates: Require coverage of these runners during tuning.
             validation_profile: Bucket being reused during profiling. Enables
                 an optional profile-aware validator without synthesizing tensors;
                 runtime lookups leave this unset.
@@ -2333,6 +2377,7 @@ class AutoTuner:
                 tuning_config,
                 inputs,
                 require_profiling_policy=require_profiling_policy,
+                profiling_candidates=profiling_candidates,
                 validation_profile=validation_profile,
             )
             # In tuning mode a miss means "profile this bucket", so only
@@ -2342,6 +2387,7 @@ class AutoTuner:
                 result[0]
                 or self.is_tuning_mode
                 or require_profiling_policy
+                or profiling_candidates is not None
                 or self._v2_local.replay_report is not None
                 or self._v2_local.strict_replay
             ):
@@ -2384,13 +2430,17 @@ class AutoTuner:
         inputs: list[torch.Tensor] | None = None,
         *,
         require_profiling_policy: bool = False,
+        profiling_candidates: _ProfilingCandidates | None = None,
         nearest_profile: tuple[tuple[int, ...], ...] | None = None,
         validation_profile: OptimizationProfile | None = None,
     ) -> tuple[bool, int, Any, OptimizationProfile | None]:
         """Search sources 1-4 of :meth:`search_cache` for one profile.
 
         ``nearest_profile``, when given, is used as the cache-key profile
-        instead of the bucket-mapped ``input_shapes``.
+        instead of the bucket-mapped ``input_shapes``. A multi-runner tuning
+        lookup also requires the winner at the existing lookup precedence to
+        cover every candidate. A later hit would leave replay using the earlier
+        winner, so treat an uncovered winner as a miss.
         """
         with self._lock:
             report = self._v2_local.replay_report
@@ -2422,6 +2472,8 @@ class AutoTuner:
                         default_policy if winner_identity is None else None,
                     )
                     if check_memory_policy and cached_policy != requested_policy:
+                        if profiling_candidates is not None:
+                            return False, 0, -1, None
                         if (
                             rejections is not None
                             and "policy_mismatch" not in rejections
@@ -2445,6 +2497,12 @@ class AutoTuner:
                         # Fall through: another runner, a disk source, or
                         # (in tuning mode) a re-profile may still serve.
                         continue
+                    if profiling_candidates is not None:
+                        covered = self._profiling_cache_candidates.get(
+                            (winner_identity, cache_key)
+                        )
+                        if covered is None or not covered.covers(profiling_candidates):
+                            return False, 0, -1, None
                     if report is not None:
                         report._record(
                             custom_op,
@@ -2473,6 +2531,8 @@ class AutoTuner:
                             and self._file_config_policies.get(file_key, default_policy)
                             != requested_policy
                         ):
+                            if profiling_candidates is not None:
+                                return False, 0, -1, None
                             continue
                         runner_name, tactic = self._file_configs[file_key]
                         if runner_name != runners[r_id].__class__.__name__:
@@ -2496,6 +2556,15 @@ class AutoTuner:
                             ):
                                 rejections.append("invalid_tactic")
                             continue
+                        if (
+                            profiling_candidates is not None
+                            and not profiling_candidates.covered_by_file(
+                                self._file_config_selections.get(file_key, {}).get(
+                                    "candidate_keys"
+                                )
+                            )
+                        ):
+                            return False, 0, -1, None
                         log_key = (custom_op, runner_name)
                         if log_key not in self._logged_file_hits:
                             self._logged_file_hits.add(log_key)
@@ -2535,7 +2604,7 @@ class AutoTuner:
                     memo_key = (*store_id, cache_key.key_fields)
                     hit = self._managed_decoded.get(memo_key)
                     if hit is None:
-                        entry = managed_store.lookup(cache_key.file_key)
+                        entry = managed_store._lookup_record(cache_key.file_key)
                         if entry is not None:
                             hit = entry._replace(tactic=_json_to_tactic(entry.tactic))
                             self._managed_decoded[memo_key] = hit
@@ -2545,6 +2614,8 @@ class AutoTuner:
                         require_profiling_policy
                         and hit.profiling_policy != requested_policy
                     ):
+                        if profiling_candidates is not None:
+                            return False, 0, -1, None
                         if (
                             rejections is not None
                             and "policy_mismatch" not in rejections
@@ -2573,6 +2644,11 @@ class AutoTuner:
                         ):
                             rejections.append("invalid_tactic")
                         continue
+                    if (
+                        profiling_candidates is not None
+                        and not profiling_candidates.covered_by_file(hit.candidate_keys)
+                    ):
+                        return False, 0, -1, None
                     log_key = (custom_op, runner_name)
                     if log_key not in self._logged_file_hits:
                         self._logged_file_hits.add(log_key)
@@ -2586,6 +2662,14 @@ class AutoTuner:
                     self._profiling_cache_policies[(winner_identity, cache_key)] = (
                         hit.profiling_policy
                     )
+                    if hit.candidate_keys is not None:
+                        self._profiling_cache_candidates[
+                            (winner_identity, cache_key)
+                        ] = _ProfilingCandidates(None, hit.candidate_keys)
+                    else:
+                        self._profiling_cache_candidates.pop(
+                            (winner_identity, cache_key), None
+                        )
                     if report is not None:
                         report._record(
                             custom_op,
@@ -3136,8 +3220,12 @@ class AutoTuner:
 
             plan_error = None
             profiles = []
+            profiling_candidates = None
             try:
                 profiles = self._generate_optimization_profiles(tuning_config, inputs)
+                profiling_candidates = _ProfilingCandidates.from_runners(
+                    runners, inputs
+                )
             except (_TuningGroupError, _StickyCudaError):
                 raise
             except Exception as exc:
@@ -3152,13 +3240,10 @@ class AutoTuner:
             # Record the total configs to try
             self.stats.tuned_op_total_configs[custom_op] = len(profiles)
 
-            # Pre-compute runner arg names to avoid calling inspect.signature in the loop
-            runner_arg_names_map = {}
-            for r in runners:
-                runner_arg_names_map[r] = {
-                    param.name
-                    for param in inspect.signature(r.forward).parameters.values()
-                }
+            # Preparation can change a runner's hash, so keep parameters in runner order.
+            runner_parameters = [
+                inspect.signature(r.forward).parameters for r in runners
+            ]
 
             # Default-candidate coverage (autotune_v2 contexts): the default
             # path (runners[0], tactic=-1) always races as a candidate, so a
@@ -3170,6 +3255,7 @@ class AutoTuner:
             # Scoped to v2 so plain autotune() selection is byte-identical.
             race_default = self._in_v2_context
 
+            incomplete_winner: tuple[int, Any] | None = None
             pbar = None
             for _step, p in enumerate(profiles):
                 tensors = None
@@ -3200,6 +3286,7 @@ class AutoTuner:
                         tuning_config,
                         inputs=inputs,
                         require_profiling_policy=True,
+                        profiling_candidates=profiling_candidates,
                         validation_profile=p,
                     )
                     selection = (
@@ -3289,12 +3376,19 @@ class AutoTuner:
                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
                         runner_id, tactic = None, None
                         skipped_count = 0
+                        comparison_complete = True
                         for r_id, r in enumerate(runners):
                             runner_preparation_oom = False
                             runner_error = None
                             valid_tactics = []
+                            retry_tactics = False
                             try:
                                 valid_tactics = r.get_valid_tactics(tensors, p)
+                                retry_tactics = (
+                                    profiling_candidates is not None
+                                    and r._retry_empty_tactics
+                                    and not valid_tactics
+                                )
                                 valid_tactics = self._blocklist.filter(
                                     custom_op, r, valid_tactics
                                 )
@@ -3320,7 +3414,7 @@ class AutoTuner:
                             if _sync_oom_across_tune_group(
                                 runner_preparation_oom,
                                 phase=("candidates", custom_op, _step, r_id),
-                                selection=valid_tactics,
+                                selection=(valid_tactics, retry_tactics),
                                 error=runner_error,
                             ):
                                 tensors = None
@@ -3332,9 +3426,8 @@ class AutoTuner:
                                 return runners[0], -1
 
                             try:
-                                runner_arg_names = runner_arg_names_map[r]
                                 if (
-                                    "do_preparation" in runner_arg_names
+                                    "do_preparation" in runner_parameters[r_id]
                                     and valid_tactics
                                 ):
                                     handled = r.precompile_tactics(
@@ -3373,6 +3466,7 @@ class AutoTuner:
                                 )
                                 return runners[0], -1
 
+                            runner_compared = not valid_tactics
                             for tac in valid_tactics:
                                 try:
                                     time_measured = self._profile_single_kernel(
@@ -3443,9 +3537,11 @@ class AutoTuner:
                                     # or some runtime error occurs during profiling.
                                     time_measured = float("inf")
                                 measured.append((time_measured, r_id, tac))
+                                runner_compared |= time_measured < float("inf")
                                 if time_measured < min_time:
                                     min_time = time_measured
                                     runner_id, tactic = r_id, tac
+                            comparison_complete &= runner_compared and not retry_tactics
 
                         if skipped_count > 0:
                             logger.info(
@@ -3468,6 +3564,10 @@ class AutoTuner:
                                 self._tie_tolerance,
                             )
                             _, runner_id, tactic = measured[winner]
+                            # Publish and look up coverage using the prepared runners.
+                            profiling_candidates = _ProfilingCandidates.from_runners(
+                                runners, inputs
+                            )
                             cache_key = self._get_cache_key(
                                 custom_op,
                                 runners[runner_id],
@@ -3475,6 +3575,22 @@ class AutoTuner:
                                 tuning_config,
                                 runners[runner_id].get_cache_key_extras(tensors),
                             )
+                            if (
+                                profiling_candidates is not None
+                                and not comparison_complete
+                            ):
+                                # Leave the comparison eligible for a later retry.
+                                runner = runners[runner_id]
+                                if cache_key == self._get_cache_key(
+                                    custom_op,
+                                    runner,
+                                    input_shapes,
+                                    tuning_config,
+                                    runner.get_cache_key_extras(inputs),
+                                ):
+                                    incomplete_winner = (runner_id, tactic)
+                                pbar.update(1)
+                                continue
                             if _tune_process_group is None:
                                 self._discard_profile_cache(
                                     custom_op,
@@ -3493,6 +3609,7 @@ class AutoTuner:
                                 self._selection_record(
                                     [t for t, _, _ in measured], winner
                                 ),
+                                profiling_candidates=profiling_candidates,
                             )
                             self.stats.tuned_op_successful_configs[custom_op] = (
                                 self.stats.tuned_op_successful_configs.get(custom_op, 0)
@@ -3517,15 +3634,34 @@ class AutoTuner:
 
             # Get the best runner and tactic from cache
             # If no valid tactic is found, the fallback runner and tactic will be used
-            _, runner_id, tactic, _ = self.search_cache(
+            has_selection, runner_id, tactic, _ = self.search_cache(
                 custom_op,
                 runners,
                 input_shapes,
                 tuning_config,
                 inputs=inputs,
                 require_profiling_policy=True,
+                profiling_candidates=profiling_candidates,
             )
 
+            if not has_selection and incomplete_winner is not None:
+                measured_runner_id, measured_tactic = incomplete_winner
+                if self._tactic_still_valid(
+                    runners[measured_runner_id],
+                    inputs,
+                    measured_tactic,
+                    custom_op,
+                    "profiling",
+                ):
+                    has_selection = True
+                    runner_id, tactic = incomplete_winner
+            if _tune_process_group is not None:
+                # Rank-local inputs can reject a winner after profile agreement.
+                selection = (runner_id, type(runners[runner_id]).__name__, tactic)
+                if not _all_ranks_hit_cache(
+                    has_selection, selection, phase=("final_selection", custom_op)
+                ):
+                    return runners[0], -1
             return runners[runner_id], tactic
 
     def _discard_profile_cache(
@@ -3567,6 +3703,7 @@ class AutoTuner:
                 ranked.pop(key, None)
                 self._profiling_cache_policies.pop((identity, key), None)
                 self._profiling_cache_selections.pop((identity, key), None)
+                self._profiling_cache_candidates.pop((identity, key), None)
                 if identity is None:
                     self._file_configs.pop(key.file_key, None)
                     self._file_config_policies.pop(key.file_key, None)
@@ -3681,13 +3818,26 @@ class AutoTuner:
             return float("inf")
 
     def _cache_profile_result(
-        self, key: ProfilingCacheKey, profile, tuning_config, tactic, selection
+        self,
+        key: ProfilingCacheKey,
+        profile,
+        tuning_config,
+        tactic,
+        selection,
+        *,
+        profiling_candidates: _ProfilingCandidates | None = None,
     ) -> None:
         """Publish a winner and its provenance through one ownership path."""
         policy = self._profiling_policy(tuning_config)
         identity = self._winner_cache_identity()
         self._winner_cache()[key] = (tactic, profile)
         self._profiling_cache_policies[(identity, key)] = policy
+        candidate_keys = None
+        if profiling_candidates is not None:
+            self._profiling_cache_candidates[(identity, key)] = profiling_candidates
+            candidate_keys = profiling_candidates.file_keys
+            if candidate_keys is not None:
+                selection["candidate_keys"] = candidate_keys
         self._profiling_cache_selections[(identity, key)] = selection
         self._dirty = True
         self._dirty_seq += 1
@@ -3699,9 +3849,12 @@ class AutoTuner:
                 _tactic_to_json(tactic),
                 key_fields=key.key_fields,
                 profiling_policy=policy,
+                candidate_keys=candidate_keys,
             )
             self._managed_decoded[(str(store.root), store.env_hash, key.key_fields)] = (
-                ManagedCacheEntry(key.runner_class_name, tactic, policy)
+                _ManagedCacheRecord(
+                    key.runner_class_name, tactic, policy, candidate_keys
+                )
             )
 
     def rank_tactics(
@@ -5154,7 +5307,6 @@ class AutoTuner:
                 self._file_config_selections.pop(key, None)
                 if len(value) > 2:
                     self._file_config_policies[key] = tuple(value[2])
-                # Kept only to be saved back; selection never reads it.
                 if len(value) > 3 and isinstance(value[3], dict):
                     self._file_config_selections[key] = dict(value[3])
 
@@ -5351,6 +5503,7 @@ class AutoTuner:
             self._ranked_tactics_partitions.clear()
             self._profiling_cache_policies.clear()
             self._profiling_cache_selections.clear()
+            self._profiling_cache_candidates.clear()
             self._file_configs.clear()
             self._file_config_policies.clear()
             self._file_config_selections.clear()
