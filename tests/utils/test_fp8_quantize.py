@@ -139,6 +139,55 @@ def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device, backen
         torch.cuda.synchronize()
 
 
+@pytest.mark.parametrize("m", [1, 3, 127, 1024, 8192])
+@pytest.mark.parametrize(
+    "k,alignment",
+    [(2880, 128), (2880, 256), (96, 128), (32, 256), (1056, 1024), (4064, 4096)],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_mxfp8_quantize_cute_dsl_linear_pads_in_kernel(
+    m, k, alignment, dtype, enable_pdl
+):
+    """The linear layout zero-fills the padded columns and scales in the kernel.
+
+    The result must equal quantizing an explicitly zero-padded input, byte for byte,
+    including the padding. The output buffers are allocated uninitialized, so the
+    allocator is first handed a block full of 0xFF of the same size: padding that
+    the kernel does not write shows up as nonzero bytes.
+    """
+    device = torch.device("cuda")
+    if not _is_mxfp8_supported(device):
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    padded_k = (k + alignment - 1) // alignment * alignment
+    a = 16 * torch.randn([m, k], dtype=dtype, device=device)
+    a_padded = torch.nn.functional.pad(a, (0, padded_k - k))
+
+    want_fp8, want_sf = mxfp8_quantize(
+        a_padded, False, alignment=32, enable_pdl=enable_pdl, backend="cute-dsl"
+    )
+
+    poison = torch.full((m, padded_k), 0xFF, dtype=torch.uint8, device=device)
+    poison_sf = torch.full(
+        (m * padded_k // 32,), 0xFF, dtype=torch.uint8, device=device
+    )
+    del poison, poison_sf
+    got_fp8, got_sf = mxfp8_quantize(
+        a, False, alignment=alignment, enable_pdl=enable_pdl, backend="cute-dsl"
+    )
+    torch.cuda.synchronize()
+
+    assert got_fp8.shape == (m, padded_k)
+    assert got_sf.shape == want_sf.shape
+    assert torch.equal(got_fp8.view(torch.uint8), want_fp8.view(torch.uint8))
+    assert torch.equal(got_sf, want_sf)
+    assert not got_fp8[:, k:].view(torch.uint8).any()
+    assert not got_sf.view(m, -1)[:, k // 32 :].any()
+
+
 @pytest.mark.parametrize("sf_layout", [SfLayout.layout_linear, SfLayout.layout_128x4])
 def test_mxfp8_quantize_empty(sf_layout):
     if not torch.cuda.is_available() or not _is_mxfp8_supported(torch.device("cuda")):
