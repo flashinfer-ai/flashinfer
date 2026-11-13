@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 """CuTe DSL cache lifecycle and real file-lock concurrency without a GPU."""
 
 from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
 from threading import Barrier, Event
 
@@ -70,6 +71,14 @@ def test_build_load_cache_hits_and_invalidation(
         )
 
     assert load() == b"kernel"
+    original = cache.JitSpecCuteDsl(
+        "test",
+        "variant",
+        compile_kernel,
+        cache._hash_source_files(()),
+        enable_tvm_ffi=enable_tvm_ffi,
+    )
+    assert original.try_load() == b"kernel"
     monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
     assert load() == b"kernel"
     assert len(builds) == 1
@@ -80,10 +89,12 @@ def test_build_load_cache_hits_and_invalidation(
     monkeypatch.delenv("FLASHINFER_DISABLE_JIT")
     assert load() == b"kernel"
     assert len(builds) == 2
+    with pytest.raises(RuntimeError, match="No valid cached"):
+        original.load()
 
 
 def test_different_kernels_compile_concurrently(disk_cache):
-    compiling = Barrier(2, timeout=5)
+    compiling = Barrier(3, timeout=5)
 
     def compile_kernel():
         compiling.wait()
@@ -91,12 +102,17 @@ def test_different_kernels_compile_concurrently(disk_cache):
 
     specs = [
         cache.JitSpecCuteDsl("shared", name, compile_kernel, "source")
-        for name in ("a", "b")
+        for name in ("a", "b", "c")
     ]
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(spec.build_and_load) for spec in specs]
-        assert [f.result(timeout=10) for f in futures] == [b"kernel", b"kernel"]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [
+            pool.submit(specs[0].build_and_load),
+            pool.submit(specs[1].build_and_load),
+            pool.submit(specs[2].compile_and_persist),
+        ]
+        assert [f.result(timeout=10) for f in futures] == [b"kernel", b"kernel", None]
     assert all(spec.is_compiled for spec in specs)
+    assert specs[2].load() == b"kernel"
 
 
 def test_same_kernel_lock_is_held_until_publication(disk_cache, monkeypatch):
@@ -123,7 +139,7 @@ def test_same_kernel_lock_is_held_until_publication(disk_cache, monkeypatch):
         first = pool.submit(first_spec.build_and_load)
         try:
             assert exporting.wait(timeout=5)
-            with pytest.raises(Timeout), FileLock(spec().kernel_lock_path, timeout=0):
+            with pytest.raises(Timeout), FileLock(spec().lock_path, timeout=0):
                 pytest.fail("the publishing worker must still hold the kernel lock")
             second = pool.submit(spec().build_and_load)
         finally:
@@ -133,8 +149,10 @@ def test_same_kernel_lock_is_held_until_publication(disk_cache, monkeypatch):
 
 
 def test_bad_artifact_recovers_and_export_failure_keeps_memory_kernel(
-    disk_cache, monkeypatch
+    disk_cache, monkeypatch, tmp_path
 ):
+    build_log = tmp_path / "build.jsonl"
+    monkeypatch.setenv("FLASHINFER_JIT_BUILD_LOG", str(build_log))
     builds = []
 
     def compile_kernel():
@@ -156,8 +174,22 @@ def test_bad_artifact_recovers_and_export_failure_keeps_memory_kernel(
     # Existing callers can explicitly rebuild after a failed cache load.
     spec.compile_and_persist()
     assert len(builds) == 3
+    assert len([json.loads(line) for line in build_log.read_text().splitlines()]) == 3
 
     fresh = cache.JitSpecCuteDsl("test", "no_disk", compile_kernel, "source")
+
+    def fail_compile():
+        raise RuntimeError("compilation failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(fresh, "compile_fn", fail_compile)
+        with pytest.raises(RuntimeError, match="compilation failed"):
+            fresh.build_and_load()
+    with (
+        FileLock(fresh.lock_path, timeout=0),
+        FileLock(fresh.module_lock_path, timeout=0),
+    ):
+        pass
 
     def fail_export(path):
         raise OSError("disk full")
@@ -166,7 +198,7 @@ def test_bad_artifact_recovers_and_export_failure_keeps_memory_kernel(
         patch.setattr(fresh, "_export_object", fail_export)
         assert isinstance(fresh.build_and_load(), _Kernel)
     assert not fresh.is_compiled
-    with FileLock(fresh.kernel_lock_path, timeout=0):
+    with FileLock(fresh.lock_path, timeout=0):
         pass
     assert fresh.build_and_load() == b"kernel"
 
