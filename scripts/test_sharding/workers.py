@@ -683,6 +683,34 @@ def _resource_csv(samples: tuple[_ResourceSample, ...]) -> str:
     return resource_stream.getvalue()
 
 
+_LOG_TAIL_LINES = 40
+_LOG_TAIL_BYTES = 16384
+
+
+def _print_log_tail(request: BatchExecutionRequest, artifacts: _BatchArtifacts) -> None:
+    """Print the end of a batch log so the job trace holds the failure cause.
+
+    The batch log lives in the job's JUnit directory, which is not always
+    retained; the console line is.
+    """
+    try:
+        with artifacts.log.open("rb") as log:
+            log.seek(0, os.SEEK_END)
+            log.seek(max(0, log.tell() - _LOG_TAIL_BYTES))
+            tail = log.read().decode("utf-8", errors="replace")
+    except OSError as error:
+        write_console(
+            f"PYTEST LOG TAIL worker={request.worker_index} batch={request.batch.id} "
+            f"unavailable: {type(error).__name__}: {error}"
+        )
+        return
+    lines = tail.splitlines()[-_LOG_TAIL_LINES:]
+    write_console(
+        f"PYTEST LOG TAIL worker={request.worker_index} batch={request.batch.id} "
+        f"source={request.batch.source_file} lines={len(lines)}\n" + "\n".join(lines)
+    )
+
+
 def _timeout_result(
     request: BatchExecutionRequest,
     artifacts: _BatchArtifacts,
@@ -779,16 +807,24 @@ def execute_batch(request: BatchExecutionRequest) -> BatchExecution:
         return _timeout_result(request, artifacts, outcome)
     if outcome.returncode not in {0, 1}:
         _discard_temporary_artifacts(*artifacts.temporary)
+        _print_log_tail(request, artifacts)
         return BatchExecution(
             "infrastructure",
             f"pytest exited with infrastructure exit code {outcome.returncode}; "
             f"log={artifacts.log}",
         )
     if not artifacts.temporary_xml.exists():
+        # pytest writes JUnit XML at session end, so a process that exits 0 or 1
+        # without it ended before then: a native library called exit(), or
+        # os._exit() ran. Report the exit code and the last node that started,
+        # and print the log tail, which carries the native error message.
+        active_nodeid, _, _ = outcome.progress.current()
         _discard_temporary_artifacts(*artifacts.temporary)
+        _print_log_tail(request, artifacts)
         return BatchExecution(
             "infrastructure",
-            f"pytest did not produce JUnit XML; log={artifacts.log}",
+            f"pytest did not produce JUnit XML (exit code {outcome.returncode}; "
+            f"last started node={active_nodeid or 'unknown'}); log={artifacts.log}",
         )
     validation = validate_batch_xml(artifacts.temporary_xml, request.batch.nodeids)
     if not validation.valid:
