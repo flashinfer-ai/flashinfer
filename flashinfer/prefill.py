@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import json
 import logging
 import math
 import os
@@ -2487,14 +2488,29 @@ def _eagle_verify_fp8kv_sm90_dispatch(
 # (csrc/gqa_decode_fp8_paged_sm90.cu, flashinfer/jit/gqa_decode_fp8_paged_sm90.py).
 #
 # The stock fa2 paged modules have no fp8-Q contract on SM90 (fp8 Q is a
-# SM120-only fa2 form). ``plan(..., q_data_type=float8_e4m3fn,
-# kv_data_type=float8_e4m3fn, o_data_type=bfloat16)`` with ``backend="fa2"``
-# on an SM90 device therefore plans the underlying stock path for the exact
-# bf16-dequantised query (bf16 holds every e4m3 value exactly) and, when the
-# plan matches the geometry below, prepares this kernel. ``run()`` then
-# dispatches it; every other fp8-Q call — and every call while
-# ``FLASHINFER_DISABLE_GQA_DECODE_FP8_PAGED_SM90=1`` (read at plan and run
-# time) — dequantises Q and takes the stock fa2 path untouched.
+# SM120-only fa2 form). The kernel lives behind the ``"specialized"`` backend
+# (the agent-generated kernels' backend), never behind a stock backend name:
+#
+# - ``backend="specialized"`` with ``plan(..., q_data_type=float8_e4m3fn,
+#   kv_data_type=float8_e4m3fn, o_data_type=bfloat16)`` on an SM90 device
+#   selects it explicitly; a call it cannot serve falls back to the
+#   COMPOSABLE path — exact dequantisation (bf16 holds every e4m3 value
+#   exactly) into the stock fa2 plan — never to another fused backend.
+# - ``backend="auto"`` routes to ``"specialized"`` only on the dispatch
+#   allowlist (``gqa_fp8q_sm90_dispatch.json``, op key ``"decode"``); off the
+#   allowlist, auto keeps its stock resolution untouched.
+# - A caller who names a stock backend (``fa2``/``fa3``/``cudnn``/...) is
+#   NEVER served by this kernel: an explicitly selected backend is never
+#   silently swapped.
+#
+# The underlying plan of an armed wrapper is always made for the exact
+# bf16-dequantised query on the stock fa2 route; ``run()`` dispatches the
+# specialized verify-decode kernel at the supported contract and otherwise
+# serves the call on that composable route.
+# ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at plan and run time; the
+# kill switch shared by FlashInfer's specialized kernels) forces the
+# composable route; ``FLASHINFER_DISABLE_GQA_DECODE_FP8_PAGED_SM90=1``
+# remains a deprecated alias for one release.
 #
 # Supported contract (fails closed to the dequant + stock path otherwise):
 # 8 query heads / 1 KV head / head_dim 128 per rank, page size 16, NHD,
@@ -2516,7 +2532,23 @@ def _eagle_verify_fp8kv_sm90_dispatch(
 # capture; run() only launches on the current stream (re-queried per call),
 # so plan/capture/replay works like any other fa2 plan.
 # ---------------------------------------------------------------------------
+# Kill switch shared by FlashInfer's specialized kernels (read at plan and
+# run time): forces the composable path (exact dequant + stock kernel).
+_SPECIALIZED_KERNEL_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
+# Deprecated alias (kept for one release): the per-kernel switch this kernel
+# first shipped with.
 _GQA_DEC_FP8Q_SM90_DISABLE_ENV = "FLASHINFER_DISABLE_GQA_DECODE_FP8_PAGED_SM90"
+# Backends of the SM90 fp8-Q paged verify-decode contract, as plain strings:
+# "specialized" is the agent-generated kernel, "fa2" names the stock route
+# the composable fallback plans on. An explicitly selected stock backend is
+# never swapped for "specialized".
+GQA_DEC_FP8Q_SM90_BACKENDS = ("auto", "specialized", "fa2")
+# Dispatch surface (package data): {"backends": [...], "ops": {"decode":
+# {auto-routing keys + measured envelope}}}. Consulted by backend="auto"
+# only; the compiled-in guard constants below stay authoritative for
+# eligibility. The file is shared with the sibling fp8-Q context fast-path
+# (disjoint op keys, one kill switch).
+_GQA_FP8Q_SM90_DISPATCH_FILE = "gqa_fp8q_sm90_dispatch.json"
 _GQA_DEC_FP8Q_SM90_NUM_QO_HEADS = 8
 _GQA_DEC_FP8Q_SM90_NUM_KV_HEADS = 1
 _GQA_DEC_FP8Q_SM90_HEAD_DIM = 128
@@ -2544,13 +2576,114 @@ _gqa_dec_fp8q_sm90_counters: Dict[str, int] = {
     "runs_capture_unready": 0,  # capturing without a loaded module: fallback
     "runs_dequant_fallback": 0,  # fp8-Q call served by dequant + stock fa2
 }
+# Per-backend dispatch census and fallback reasons (#5667-style introspection):
+# "specialized" = the fused kernel; "composable" = exact dequant + stock fa2.
+_gqa_dec_fp8q_sm90_backend_dispatches: Dict[str, int] = {
+    "specialized": 0,
+    "composable": 0,
+}
+_gqa_dec_fp8q_sm90_fallback_reasons: Dict[str, int] = {}
 _gqa_dec_fp8q_sm90_module: Any = None
 _gqa_dec_fp8q_sm90_module_error: Optional[str] = None
 _gqa_dec_fp8q_sm90_announced = False
 
 
 def _gqa_dec_fp8q_sm90_disabled() -> bool:
-    return os.environ.get(_GQA_DEC_FP8Q_SM90_DISABLE_ENV, "") not in ("", "0")
+    if os.environ.get(_SPECIALIZED_KERNEL_DISABLE_ENV, "") not in ("", "0"):
+        return True
+    if os.environ.get(_GQA_DEC_FP8Q_SM90_DISABLE_ENV, "") not in ("", "0"):
+        logger.warning_once(
+            "%s is deprecated and will be removed in a future release; set "
+            "%s=1 instead (the kill switch shared by FlashInfer's specialized "
+            "kernels)",
+            _GQA_DEC_FP8Q_SM90_DISABLE_ENV,
+            _SPECIALIZED_KERNEL_DISABLE_ENV,
+        )
+        return True
+    return False
+
+
+def _gqa_dec_fp8q_sm90_fallback(reason: str) -> None:
+    """Record why a plan/run was not served by the specialized backend."""
+    _gqa_dec_fp8q_sm90_fallback_reasons[reason] = (
+        _gqa_dec_fp8q_sm90_fallback_reasons.get(reason, 0) + 1
+    )
+
+
+@functools.cache
+def _gqa_fp8q_sm90_dispatch_table() -> Optional[dict]:
+    """Load the SM90 fp8-Q dispatch surface (package data); ``None`` means
+    ``backend="auto"`` never routes to "specialized" (explicit
+    ``backend="specialized"`` stays governed by the compiled-in guards)."""
+    try:
+        from importlib import resources
+
+        payload = json.loads(
+            resources.files("flashinfer")
+            .joinpath(_GQA_FP8Q_SM90_DISPATCH_FILE)
+            .read_text()
+        )
+        if not isinstance(payload, dict):
+            raise TypeError(f"expected a dict, got {type(payload).__name__}")
+        return payload
+    except Exception as exc:  # noqa: BLE001 - auto-routing is best-effort
+        logger.warning_once(
+            "gqa_decode_fp8_paged_sm90: dispatch allowlist %s unavailable "
+            "(%s: %s); backend='auto' will not route to 'specialized'",
+            _GQA_FP8Q_SM90_DISPATCH_FILE,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+
+def _gqa_dec_fp8q_sm90_auto_routes(
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    page_size: int,
+    kv_layout: str,
+    causal: bool,
+) -> Tuple[bool, Optional[str]]:
+    """Shape-keyed auto-routing decision for ``backend="auto"``: route to
+    "specialized" only when the plan geometry matches the allowlist's
+    "decode" auto-routing keys (the uniform q_len==6 verify-width check stays
+    in the prepare-time guards). Returns (routed, reason-if-not)."""
+    table = _gqa_fp8q_sm90_dispatch_table()
+    if table is None:
+        return False, "dispatch allowlist unavailable"
+    try:
+        op = table["ops"]["decode"]
+        routed = (
+            kv_layout == str(op["kv_layout"])
+            and bool(causal) == bool(op["causal"])
+            and num_qo_heads == int(op["num_qo_heads"])
+            and num_kv_heads == int(op["num_kv_heads"])
+            and head_dim_qk == int(op["head_dim"])
+            and head_dim_vo == int(op["head_dim"])
+            and page_size == int(op["page_size"])
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        return False, f"dispatch allowlist invalid ({type(exc).__name__}: {exc})"
+    if not routed:
+        return False, "plan geometry off the auto-routing allowlist"
+    return True, None
+
+
+def _gqa_dec_fp8q_sm90_backend_order(
+    requested: str, auto_routed: bool
+) -> Tuple[str, ...]:
+    """#5667-style backend order for one fp8-Q verify-decode plan.
+    "composable" is the exact-dequant stock route; a caller who named a stock
+    backend never sees "specialized" here (an explicit backend is never
+    silently swapped), and explicit "specialized" falls back to the
+    composable path only."""
+    if requested == "specialized":
+        return ("specialized", "composable")
+    if requested == "auto":
+        return ("specialized", "composable") if auto_routed else ("composable",)
+    return ()
 
 
 def _gqa_dec_fp8q_sm90_stats() -> Dict[str, Any]:
@@ -2560,6 +2693,10 @@ def _gqa_dec_fp8q_sm90_stats() -> Dict[str, Any]:
     stats: Dict[str, Any] = dict(_gqa_dec_fp8q_sm90_counters)
     stats["module_loaded"] = _gqa_dec_fp8q_sm90_module is not None
     stats["module_error"] = _gqa_dec_fp8q_sm90_module_error
+    stats["backends"] = GQA_DEC_FP8Q_SM90_BACKENDS
+    stats["backend_dispatches"] = dict(_gqa_dec_fp8q_sm90_backend_dispatches)
+    stats["fallback_reasons"] = dict(_gqa_dec_fp8q_sm90_fallback_reasons)
+    stats["dispatch_table_loaded"] = _gqa_fp8q_sm90_dispatch_table() is not None
     return stats
 
 
@@ -2567,6 +2704,9 @@ def _reset_gqa_dec_fp8q_sm90_stats() -> None:
     global _gqa_dec_fp8q_sm90_announced
     for key in _gqa_dec_fp8q_sm90_counters:
         _gqa_dec_fp8q_sm90_counters[key] = 0
+    for key in _gqa_dec_fp8q_sm90_backend_dispatches:
+        _gqa_dec_fp8q_sm90_backend_dispatches[key] = 0
+    _gqa_dec_fp8q_sm90_fallback_reasons.clear()
     _gqa_dec_fp8q_sm90_announced = False
 
 
@@ -2689,11 +2829,13 @@ def _gqa_dec_fp8q_sm90_prepare(
     counters["plans_seen"] += 1
     if _gqa_dec_fp8q_sm90_disabled():
         counters["plans_disabled"] += 1
+        _gqa_dec_fp8q_sm90_fallback("plan: kill switch")
         logger.info_once(
-            "gqa_decode_fp8_paged_sm90: disabled by %s=%s; fp8-Q calls are "
-            "served by exact dequantisation into the stock fa2 kernel",
+            "gqa_decode_fp8_paged_sm90: disabled (%s, or its deprecated "
+            "alias %s); fp8-Q calls are served by the composable path (exact "
+            "dequantisation into the stock fa2 kernel)",
+            _SPECIALIZED_KERNEL_DISABLE_ENV,
             _GQA_DEC_FP8Q_SM90_DISABLE_ENV,
-            os.environ.get(_GQA_DEC_FP8Q_SM90_DISABLE_ENV, ""),
         )
         return
     try:
@@ -2744,6 +2886,7 @@ def _gqa_dec_fp8q_sm90_prepare(
         reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
     if reason is not None:
         counters["plans_ineligible"] += 1
+        _gqa_dec_fp8q_sm90_fallback(f"plan: {reason}")
         logger.info_once(
             "gqa_decode_fp8_paged_sm90: not dispatched for this plan (%s); "
             "fp8-Q calls are served by exact dequantisation into the stock "
@@ -2967,11 +3110,13 @@ def _gqa_dec_fp8q_sm90_dispatch(
     counters = _gqa_dec_fp8q_sm90_counters
     if _gqa_dec_fp8q_sm90_disabled():
         counters["runs_disabled"] += 1
+        _gqa_dec_fp8q_sm90_fallback("run: kill switch")
         logger.info_once(
-            "gqa_decode_fp8_paged_sm90: disabled by %s=%s; fp8-Q calls are "
-            "served by exact dequantisation into the stock fa2 kernel",
+            "gqa_decode_fp8_paged_sm90: disabled (%s, or its deprecated "
+            "alias %s); fp8-Q calls are served by the composable path (exact "
+            "dequantisation into the stock fa2 kernel)",
+            _SPECIALIZED_KERNEL_DISABLE_ENV,
             _GQA_DEC_FP8Q_SM90_DISABLE_ENV,
-            os.environ.get(_GQA_DEC_FP8Q_SM90_DISABLE_ENV, ""),
         )
         return None
     try:
@@ -2980,6 +3125,7 @@ def _gqa_dec_fp8q_sm90_dispatch(
         if is_in_profile_measurement():
             # never shadow a tactic the autotuner is timing
             counters["runs_autotune_bail"] += 1
+            _gqa_dec_fp8q_sm90_fallback("run: autotuner measurement window")
             return None
     except Exception:
         pass
@@ -3008,6 +3154,7 @@ def _gqa_dec_fp8q_sm90_dispatch(
         reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
     if reason is not None:
         counters["runs_ineligible"] += 1
+        _gqa_dec_fp8q_sm90_fallback(f"run: {reason}")
         logger.info_once(
             "gqa_decode_fp8_paged_sm90: not dispatched for this call (%s); "
             "the dequant + stock fa2 path serves it",
@@ -3023,6 +3170,7 @@ def _gqa_dec_fp8q_sm90_dispatch(
         # prepare() loads the module before it sets the state; this only
         # happens if the module was dropped behind our back
         counters["runs_capture_unready" if capturing else "runs_ineligible"] += 1
+        _gqa_dec_fp8q_sm90_fallback("run: module unavailable")
         return None
     if out is None:
         out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
@@ -3039,6 +3187,7 @@ def _gqa_dec_fp8q_sm90_dispatch(
         state.workspace,
     )
     counters["runs_dispatched"] += 1
+    _gqa_dec_fp8q_sm90_backend_dispatches["specialized"] += 1
     if capturing:
         counters["runs_dispatched_capturing"] += 1
     if not _gqa_dec_fp8q_sm90_announced:
@@ -3063,6 +3212,7 @@ def _gqa_dec_fp8q_sm90_dequant_q(
     stock path to fold into sm_scale; a per-sequence descale tensor is applied
     here (via the plan-time row->request map) and consumed."""
     _gqa_dec_fp8q_sm90_counters["runs_dequant_fallback"] += 1
+    _gqa_dec_fp8q_sm90_backend_dispatches["composable"] += 1
     if isinstance(q_scale, torch.Tensor):
         row_seq = getattr(wrapper, "_gqa_dec_fp8q_sm90_row_seq", None)
         if row_seq is None or row_seq.numel() != q.shape[0]:
@@ -3823,14 +3973,23 @@ class BatchPrefillWithPagedKVCacheWrapper:
             mask will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``trtllm-gen``
-            ``cute-dsl``/``cute-dsl-prims``.
+            The implementation backend, could be ``auto``/``specialized``/``fa2``/``fa3``/
+            ``cudnn``/``trtllm-gen``/``cute-dsl``/``cute-dsl-prims``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
             In CUDA-graph mode, once FA2 has been planned, later plans keep FA2 so
             its captured scheduling metadata is refreshed. Use a separate wrapper
             to select cuDNN for a new graph after planning FA2.
+            The ``specialized`` backend selects the specialized SM90 fp8-Q paged
+            verify-decode kernel explicitly (``plan()`` raises for contracts it
+            has no kernel for); ``auto`` routes to it only on its dispatch
+            allowlist, and an explicitly named stock backend is never served by
+            it. A call the specialized kernel cannot serve falls back to the
+            composable path (exact dequantisation into the stock fa2 kernel),
+            never to another fused backend.
+            ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` forces the composable
+            path.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
             ``cute-dsl-prims`` backend is a SM120-only FP8 attention backend implemented using
             CUTLASS primitives.
@@ -4570,6 +4729,24 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The theta used in RoPE, if not provided, will be set to ``1e4``.
         q_data_type : Union[str, torch.dtype]
             The data type of the query tensor, defaults torch.float16.
+
+            ``torch.float8_e4m3fn`` with ``kv_data_type=torch.float8_e4m3fn``
+            and ``o_data_type=torch.bfloat16`` is supported on SM90 devices
+            through the ``"specialized"`` backend: ``backend="specialized"``
+            selects the specialized verify-decode kernel explicitly, and
+            ``backend="auto"`` routes to it only on the dispatch allowlist
+            (8 query heads / 1 KV head / head_dim 128, page size 16, NHD,
+            causal, uniform q_len == 6 per request, per-sequence float32
+            descales, batch <= 128, kv_len <= 262144). A call the specialized
+            kernel cannot serve falls back to the composable path — exact
+            dequantisation (bf16 holds every e4m3 value exactly) into the
+            stock fa2 kernel — never to another fused backend, and a caller
+            who names a stock backend (``fa2``, ``fa3``, ...) is never served
+            by the specialized kernel.
+            ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at plan and run
+            time) forces the composable path;
+            ``FLASHINFER_DISABLE_GQA_DECODE_FP8_PAGED_SM90=1`` is a
+            deprecated alias kept for one release.
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         o_data_type : Optional[Union[str, torch.dtype]]
@@ -4656,28 +4833,66 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
-        # gqa_decode_fp8_paged_sm90: fp8 Q on the SM90 fa2 paged route. The
-        # stock fa2 modules have no fp8-Q contract on SM90, so the underlying
-        # plan is made for the exact bf16-dequantised query (bf16 holds every
-        # e4m3 value exactly); run() dispatches the specialized verify-decode
-        # kernel at the supported contract and otherwise dequantises Q into
-        # this stock plan (see the dispatcher section above
-        # _build_block_tables_from_paged_kv_indices).
+        # gqa_decode_fp8_paged_sm90: fp8 Q on the SM90 paged route, behind
+        # the "specialized" backend (see the dispatcher section above
+        # _build_block_tables_from_paged_kv_indices). Explicit
+        # backend="specialized" selects it (and otherwise raises — never a
+        # silent swap); backend="auto" routes to it only on the dispatch
+        # allowlist's auto-routing keys; an explicitly named stock backend
+        # (fa2/fa3/cudnn/...) is NEVER served by it. An armed plan is made
+        # for the exact bf16-dequantised query (bf16 holds every e4m3 value
+        # exactly) on the stock fa2 route — the composable path run() falls
+        # back to.
         self._gqa_dec_fp8q_sm90_requested = False
-        if (
+        _gqa_fp8q_contract_ok = (
             q_data_type == torch.float8_e4m3fn
             and kv_data_type == torch.float8_e4m3fn
             and o_data_type == torch.bfloat16
-            and self._requested_backend == "fa2"
             and self._jit_module is None
             and self._batch_invariant is None
             and not use_token_head_sf
             and self.device.type == "cuda"
             and tuple(get_compute_capability(self.device))
             == _GQA_DEC_FP8Q_SM90_COMPUTE_CAPABILITY
-        ):
+        )
+        if self._requested_backend == "specialized":
+            if not _gqa_fp8q_contract_ok:
+                raise ValueError(
+                    "backend='specialized' on BatchPrefillWithPagedKVCacheWrapper "
+                    "selects the specialized SM90 fp8-Q paged verify-decode "
+                    "kernel and requires q_data_type=kv_data_type="
+                    "torch.float8_e4m3fn and o_data_type=torch.bfloat16 on an "
+                    "SM90 CUDA device (without a custom JIT module, "
+                    "batch_invariant or use_token_head_sf). Supported backends: "
+                    f"{GQA_DEC_FP8Q_SM90_BACKENDS}; use backend='auto' or a "
+                    "stock backend for other contracts."
+                )
             self._gqa_dec_fp8q_sm90_requested = True
             q_data_type = torch.bfloat16
+            # the composable fallback is planned on the stock fa2 route
+            self._backend = "fa2"
+        elif self._requested_backend == "auto" and _gqa_fp8q_contract_ok:
+            _auto_routed, _auto_reason = _gqa_dec_fp8q_sm90_auto_routes(
+                num_qo_heads,
+                num_kv_heads,
+                head_dim_qk,
+                head_dim_vo if head_dim_vo is not None else head_dim_qk,
+                page_size,
+                self._kv_layout,
+                causal,
+            )
+            if _auto_routed:
+                self._gqa_dec_fp8q_sm90_requested = True
+                q_data_type = torch.bfloat16
+                self._backend = "fa2"
+            else:
+                _gqa_dec_fp8q_sm90_fallback(f"auto: {_auto_reason}")
+                logger.info_once(
+                    "gqa_decode_fp8_paged_sm90: backend='auto' does not "
+                    "route to 'specialized' for this plan (%s); the stock "
+                    "auto resolution serves it",
+                    _auto_reason,
+                )
         if self._batch_invariant is not None:
             self._batch_invariant.refuse(
                 prefix_len_ptr=prefix_len_ptr,
@@ -4749,7 +4964,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         qo_indptr = qo_indptr.contiguous()
         qo_indptr_host = qo_indptr.to("cpu")
         auto_backend = None
-        if self._requested_backend == "auto":
+        # an armed specialized fp8-Q plan already fixed the stock fa2 route
+        # for its composable fallback; auto resolution must not override it
+        if self._requested_backend == "auto" and not self._gqa_dec_fp8q_sm90_requested:
             if use_token_head_sf:
                 if self._cuda_graph_backend == "fa3":
                     raise ValueError(
@@ -5855,10 +6072,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 uses_spcompress=uses_spcompress,
             )
         if getattr(self, "_gqa_dec_fp8q_sm90_requested", False) and is_float8(q):
-            # fp8 Q on the SM90 fa2 paged route: the specialized verify-decode
-            # kernel at the supported contract, exact dequantisation into the
-            # stock fa2 plan otherwise (including under
-            # FLASHINFER_DISABLE_GQA_DECODE_FP8_PAGED_SM90). The specialized
+            # fp8 Q on the SM90 paged route, armed by backend="specialized"
+            # or an allowlisted backend="auto" plan: the specialized
+            # verify-decode kernel at the supported contract, the composable
+            # path (exact dequantisation into the stock fa2 plan) otherwise —
+            # including under FLASHINFER_SPECIALIZED_KERNEL_DISABLE (or its
+            # deprecated per-kernel alias). The specialized
             # kernel accumulates P.V in fp16 on power-of-two prescaled e4m3
             # operands (exact per element, range-bounded by the split tiling);
             # see the dispatcher section's precision note.
@@ -5888,9 +6107,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 raise NotImplementedError(
                     "per-sequence k_scale/v_scale tensors are only served by "
                     "the specialized SM90 fp8-Q verify-decode kernel; this "
-                    "call fell back to the stock fa2 path (disabled via "
-                    f"{_GQA_DEC_FP8Q_SM90_DISABLE_ENV} or outside its "
-                    "allowlist), which takes scalar or None k_scale/v_scale. "
+                    "call fell back to the composable dequant + stock fa2 "
+                    f"path (disabled via {_SPECIALIZED_KERNEL_DISABLE_ENV} — "
+                    f"or its deprecated alias {_GQA_DEC_FP8Q_SM90_DISABLE_ENV} "
+                    "— or outside the allowlist), which takes scalar or None "
+                    "k_scale/v_scale. "
                     "Pass scalars (unit descales may simply be omitted) or "
                     "re-enable the specialized kernel."
                 )

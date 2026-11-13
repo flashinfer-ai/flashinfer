@@ -1,0 +1,24 @@
+{
+  "comment": "Dispatch surface of the specialized SM90 fp8-Q paged attention kernels. 'backends' lists the backend strings of this contract; each op entry carries the auto-routing keys backend='auto' matches a plan against (the compiled-in guards in flashinfer/prefill.py stay authoritative for eligibility) plus the measured envelope the kernel was validated on. The sibling fp8-Q context fast-path shares this file under its own op key; the allowlists are disjoint. FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 forces the composable path regardless of this file.",
+  "backends": ["auto", "specialized", "fa2"],
+  "kill_switch": "FLASHINFER_SPECIALIZED_KERNEL_DISABLE",
+  "ops": {
+    "decode": {
+      "kv_layout": "NHD",
+      "causal": true,
+      "num_qo_heads": 8,
+      "num_kv_heads": 1,
+      "head_dim": 128,
+      "page_size": 16,
+      "uniform_q_len": 6,
+      "q_dtype": "float8_e4m3fn",
+      "kv_dtype": "float8_e4m3fn",
+      "o_dtype": "bfloat16",
+      "compute_capability": [9, 0],
+      "envelope": {
+        "max_batch_size": 128,
+        "max_kv_len": 262144
+      }
+    }
+  }
+}
