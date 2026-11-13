@@ -1784,6 +1784,43 @@ def gen_customize_single_decode_module(
     )
 
 
+def check_fa2_prefill_head_dim(
+    head_dim_qk: int, head_dim_vo: int, dtype_kv: torch.dtype
+) -> None:
+    """Reject a head_dim the FA2 prefill kernels (also used by tensor-core decode)
+    cannot load.
+
+    With the 128B swizzle, ``include/flashinfer/attention/prefill.cuh`` copies a
+    row of Q / K / V in ``head_dim / 16 / (8 / sizeof(DType))`` 128-bit chunks per
+    thread group, i.e. in whole 64-element (16-bit) or 128-element (8-bit)
+    column blocks. A head_dim that is not a multiple of that block leaves part
+    of the row unloaded and the kernel reads shared memory it never wrote:
+    illegal addresses or NaN for head_dim 80 / 96, and wrong output for head_dim
+    192 with an FP8 KV cache. FP8 KV with head_dim_vo == 64 uses the 64B swizzle
+    instead, whose K and V rows must both be exactly 64 elements.
+    """
+    if dtype_kv in (torch.float8_e4m3fn, torch.float8_e5m2):
+        if head_dim_vo == 64:
+            if head_dim_qk != 64:
+                raise ValueError(
+                    f"head_dim_qk={head_dim_qk} is not supported by the FA2 prefill "
+                    f"kernels with a {dtype_kv} KV cache and head_dim_vo=64: the 64B "
+                    "swizzle used for head_dim_vo=64 needs head_dim_qk=64."
+                )
+            return
+        block = 128
+    elif dtype_kv in (torch.float16, torch.bfloat16):
+        block = 64
+    else:
+        return  # packed FP4 KV (uint8) follows its own layout rules
+    for name, head_dim in (("head_dim_qk", head_dim_qk), ("head_dim_vo", head_dim_vo)):
+        if head_dim % block:
+            raise ValueError(
+                f"{name}={head_dim} is not supported by the FA2 prefill kernels "
+                f"with a {dtype_kv} KV cache: it must be a multiple of {block}."
+            )
+
+
 def gen_customize_single_prefill_module(
     backend: str,
     uri: str,
@@ -1822,6 +1859,7 @@ def gen_customize_single_prefill_module(
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
     elif backend == "fa2":
+        check_fa2_prefill_head_dim(head_dim_qk, head_dim_vo, dtype_kv)
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
         additional_params_decl, additional_func_params, additional_params_setter = (
             generate_additional_params(
@@ -2117,6 +2155,7 @@ def gen_customize_batch_prefill_module(
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
     elif backend == "fa2":
+        check_fa2_prefill_head_dim(head_dim_qk, head_dim_vo, dtype_kv)
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
         (additional_params_decl, additional_func_params, additional_params_setter) = (
             generate_additional_params(
