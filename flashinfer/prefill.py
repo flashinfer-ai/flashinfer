@@ -122,6 +122,7 @@ from .utils import (
     get_alibi_slopes,
     get_compute_capability,
     get_device_sm_count,
+    get_device_name,
     is_float8,
     is_sm12x_supported,
     is_sm100a_supported,
@@ -2552,6 +2553,75 @@ def _validate_paged_query_lengths(backend, seq_lens_q, qo_indptr_host):
     )
 
 
+def _hopper_paged_auto_cudnn(
+    device,
+    layout,
+    q_dtype,
+    kv_dtype,
+    o_dtype,
+    head_dim_qk,
+    head_dim_vo,
+    batch,
+    hq,
+    hk,
+    max_q,
+    max_kv,
+    page_size,
+    total_q,
+    qo_indptr_host,
+    kv_lens,
+    seq_lens_q=None,
+):
+    """H100 D256 admission after the native planner has selected FA3."""
+    if not (
+        layout == "HND"
+        and q_dtype == kv_dtype == o_dtype
+        and q_dtype in (torch.float16, torch.bfloat16)
+        and head_dim_qk == head_dim_vo == 256
+        and 1 <= batch <= 32
+        and 16 <= hq <= 48
+        and hk > 0
+        and hq % hk == 0
+        and hq // hk in (1, 2, 4, 8, 16)
+        and page_size == 16
+        and 65 <= max_q <= 16384
+        and max_q <= max_kv <= 32768
+        and qo_indptr_host.device.type == "cpu"
+        and kv_lens is not None
+        and kv_lens.device.type == "cpu"
+        and (seq_lens_q is None or seq_lens_q.device.type == "cpu")
+    ):
+        return False
+    bounds = qo_indptr_host.tolist()
+    queries = [end - start for start, end in zip(bounds, bounds[1:], strict=False)]
+    lengths = kv_lens.flatten().tolist()
+    if not (
+        len(queries) == len(lengths) == batch
+        and bounds[0] == 0
+        and bounds[-1] == total_q
+        and max(queries) == max_q
+        and max(lengths) == max_kv
+        and all(0 < q <= kv for q, kv in zip(queries, lengths, strict=True))
+        and (seq_lens_q is None or seq_lens_q.flatten().tolist() == queries)
+    ):
+        return False
+    # Amortize the cuDNN path using actual causal work, including mixed rows.
+    # A product of declared maxima would admit nearly empty ragged batches.
+    paired_work = hq * sum(
+        q * (2 * kv - q + 1) // 2 for q, kv in zip(queries, lengths, strict=True)
+    )
+    if paired_work < 1 << 24:
+        return False
+    # The short-query FA2 domain is deliberately retained. Do not transfer
+    # H100 measurements to H20, PCIe H100, or other Hopper devices.
+    return (
+        get_compute_capability(device) == (9, 0)
+        and get_device_sm_count(device) == 132
+        and get_device_name(device) == "NVIDIA H100 80GB HBM3"
+        and _cudnn_supports_paged_auto()
+    )
+
+
 def _blackwell_paged_gqa_auto_cudnn(
     device,
     layout,
@@ -4204,11 +4274,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # Per-token/head scales pin FA2; resolve auto without modifying plan state.
         if auto_backend is not None:
             planned_backend = auto_backend
+            cudnn_admission = (
+                _blackwell_paged_auto_cudnn
+                if planned_backend == "fa2"
+                else _hopper_paged_auto_cudnn
+            )
             if (
-                planned_backend == "fa2"
-                # A retained FA2 capture also needs its CPU-generated schedule
+                planned_backend in ("fa2", "fa3")
+                # A retained native capture also needs its generated schedule
                 # refreshed, not just the raw page and length buffers. Keep
-                # planning FA2 instead of maintaining a second planner for it.
+                # planning its provider instead of maintaining a second planner.
                 and (not self.is_cuda_graph_enabled or self._plan_info is None)
                 and causal
                 and pos_encoding_mode == "NONE"
@@ -4229,7 +4304,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     not self.is_cuda_graph_enabled
                     or self._qo_indptr_buf.dtype == torch.int32
                 )
-                and _blackwell_paged_auto_cudnn(
+                and cudnn_admission(
                     self.device,
                     self._kv_layout,
                     q_data_type,
@@ -4355,9 +4430,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._backend = planned_backend
 
         self._cudnn_paged_bounds = None
-        if self._requested_backend == "auto" and self._backend == "cudnn":
+        if (
+            self._requested_backend == "auto"
+            and self._backend == "cudnn"
+            and get_compute_capability(self.device) in ((10, 0), (10, 3))
+        ):
             # Actual per-request lengths still drive masking and addressing.
             # Stable declared bounds and table capacity avoid a graph per step.
+            # These buckets are qualified for Blackwell; Hopper keeps the exact
+            # declarations used by its explicit cuDNN plans.
             # Above the short-Q class, preserve both packed and unpacked tile counts.
             # Rounding whole powers of two can hide an underfilled grid.
             q_tile = 128 // (num_qo_heads // num_kv_heads)
@@ -4829,15 +4910,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
                 if self._cudnn_paged_bounds is not None:
                     max_pages = max(max_pages, self._cudnn_paged_bounds[1] // page_size)
-                    if self.is_cuda_graph_enabled:
-                        # Any request may later own all initialized indices,
-                        # even after auto selects FA2 for a longer prefix. Also
-                        # reserve padding for the largest admitted KV bucket.
-                        index_capacity = self._paged_kv_indices_buf.numel()
+                if self.is_cuda_graph_enabled:
+                    # Any request may later own all reserved indices. Capacity
+                    # is independent of the exact or bucketed graph declaration.
+                    index_capacity = self._paged_kv_indices_buf.numel()
+                    max_pages = max(max_pages, index_capacity)
+                    if self._cudnn_paged_bounds is not None:
+                        # Blackwell buckets can additionally require padding.
                         admitted_pages = min(index_capacity, 32768 // page_size)
                         max_pages = max(
                             max_pages,
-                            index_capacity,
                             1 << (admitted_pages - 1).bit_length(),
                         )
                 old_table = self._cudnn_block_tables
