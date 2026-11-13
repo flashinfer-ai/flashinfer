@@ -1264,7 +1264,7 @@ __device__ inline void Consumer::compute() {
 #pragma unroll
         for (uint32_t idxVPart = 0; idxVPart < nbVPartsPerWarp; idxVPart++) {
           auto const& vPartBuf = smem.v(idxVBuf)[tileIdx.x * nbVPartsPerWarp + idxVPart];
-#pragma unroll 1
+#pragma unroll
           for (uint32_t idxGrain = 0; idxGrain < grainsPerVPart; idxGrain++) {
             auto const vData = ldmatrix<true, 2>(&vPartBuf.template at<true>(rB_v, idxGrain + cB));
             AtomB const v = {vData[0], vData[1]};
