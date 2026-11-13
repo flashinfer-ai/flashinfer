@@ -253,6 +253,14 @@ _MLIR_VALUE_FIELDS = (
     "gin_seg1_done",
     "gin_seg1_flag",
     "gin_ret_chunk_done",
+    # Node dedup (``node_dedup``) only.
+    "gin_send_topk_idx",
+    "gin_send_topk_weights",
+    "gin_send_token",
+    "gin_send_sf",
+    "gin_dd_count",
+    "gin_dd_row",
+    "gin_dd_mode",
 )
 
 # ncclGinSignalOp_t (nccl_device/gin/gin_device_host_common.h): Inc = 0, Add = 1.
@@ -334,6 +342,13 @@ class TokenCommArgs:
         gin_seg1_done: cute.Tensor = None,
         gin_seg1_flag: cute.Tensor = None,
         gin_ret_chunk_done: cute.Tensor = None,
+        gin_send_topk_idx: cute.Tensor = None,
+        gin_send_topk_weights: cute.Tensor = None,
+        gin_send_token: cute.Tensor = None,
+        gin_send_sf: cute.Tensor = None,
+        gin_dd_count: cute.Tensor = None,
+        gin_dd_row: cute.Tensor = None,
+        gin_dd_mode: cute.Tensor = None,
         # (max_ctas, num_total_experts) Int32 per-CTA routing histogram; only
         # bound when the dispatch runs with ``deterministic_slots``.
         cta_expert_hist: cute.Tensor = None,
@@ -354,6 +369,13 @@ class TokenCommArgs:
         self.gin_seg1_done = gin_seg1_done
         self.gin_seg1_flag = gin_seg1_flag
         self.gin_ret_chunk_done = gin_ret_chunk_done
+        self.gin_send_topk_idx = gin_send_topk_idx
+        self.gin_send_topk_weights = gin_send_topk_weights
+        self.gin_send_token = gin_send_token
+        self.gin_send_sf = gin_send_sf
+        self.gin_dd_count = gin_dd_count
+        self.gin_dd_row = gin_dd_row
+        self.gin_dd_mode = gin_dd_mode
         self.input_token_buffer = input_token_buffer
         self.input_sf_buffer = input_sf_buffer
         self.topk_idx = topk_idx
@@ -521,6 +543,11 @@ class TokenInPullTokenBackPush:
         # origin's even tokens are computed, reduced and returned while its
         # odd tokens are still computed.  1 = one phase.
         ret_phases: int = 1,
+        # Internode node dedup (``_gin_dd_*``): per remote node, ship only
+        # the tokens that hit it, compacted.  "off" = the zero-copy full
+        # prefix; "on" = always compact; "auto" = compact a launch's node
+        # when at most ``gin_dd_auto_ratio`` of the valid tokens hit it.
+        node_dedup: str = "off",
     ) -> None:
         self.world_size = world_size
         self.num_tail_reduce_warps = int(num_tail_reduce_warps)
@@ -539,6 +566,17 @@ class TokenInPullTokenBackPush:
             num_experts_per_rank=num_experts_per_rank,
             num_topk=num_topk,
         )
+        if node_dedup not in ("off", "on", "auto"):
+            raise ValueError(
+                f"node_dedup must be 'off', 'on' or 'auto', got {node_dedup!r}."
+            )
+        # Single node: nothing crosses a node boundary, so it is always off.
+        self.node_dedup = node_dedup if self.enable_nccl_gin else "off"
+        self.gin_node_dedup = self.node_dedup != "off"
+        # "auto" compacts a node's tokens when n_hit * den <= n_valid * num.
+        self.gin_dd_auto_ratio = (7, 8)
+        # Rows of the per-(slot, CTA) hit counts (the kernel's CTA bound).
+        self.gin_dd_max_ctas = 1024
         self.num_topk = num_topk
         self.num_experts_per_rank = num_experts_per_rank
         self.num_total_experts = num_total_experts
@@ -1914,7 +1952,7 @@ class TokenInPullTokenBackPush:
         )
 
     @cute.jit
-    def _gin_stage1_put(self, token_comm_args, slot, kind, n_tokens):
+    def _gin_stage1_put(self, token_comm_args, slot, kind, n_tokens, compact=None):
         """Stage 1: one of the four puts that ship this rank's routing and tokens.
 
         Zero-copy: the puts read the symmetric input buffers directly.  One
@@ -1927,6 +1965,10 @@ class TokenInPullTokenBackPush:
           the ``n_tokens`` valid rows, +1 each on the PAY signal.  Without a
           valid token, kind 1 raises PAY by 3 instead, so the receiver's
           per-launch increment stays constant.
+
+        With node dedup, ``compact`` != 0 ships slot ``slot``'s compacted send
+        planes instead (``n_tokens`` = its row count; the routing plane still
+        covers all ``t_max`` rows, padded with -1).
         """
         from nccl.core.device import cute as nccl_cute
 
@@ -1967,6 +2009,24 @@ class TokenInPullTokenBackPush:
             nbytes = n_tokens * Int32(tok_row_bytes)
         if kind != Int32(0):
             signal_id = Int32(self.gin_pay_signal_base) + Int32(my_slot64)
+        if cutlass.const_expr(compact is not None):
+            if compact != Int32(0):
+                slot64 = Int64(slot)
+                src_addr = args.gin_send_topk_idx.iterator.toint() + slot64 * Int64(
+                    meta_bytes
+                )
+                if kind == Int32(1):
+                    src_addr = args.gin_send_topk_weights.iterator.toint() + slot64 * Int64(
+                        t_max * w_row_bytes
+                    )
+                if kind == Int32(2):
+                    src_addr = args.gin_send_sf.iterator.toint() + slot64 * Int64(
+                        t_max * sf_row_bytes
+                    )
+                if kind == Int32(3):
+                    src_addr = args.gin_send_token.iterator.toint() + slot64 * Int64(
+                        t_max * tok_row_bytes
+                    )
 
         if nbytes > Int32(0):
             gin.put(
@@ -2052,6 +2112,255 @@ class TokenInPullTokenBackPush:
                 )
                 red_add_relaxed_sys_u64_raw(ercs_peer_addr, status_u64)
 
+    # ------------------------------------------------------------------
+    # Internode node dedup (``node_dedup``): ship each remote node only the
+    # tokens that hit it, compacted.
+    #
+    # Own tokens are split into one contiguous block per CTA.  Before D2 each
+    # CTA counts, per remote slot, its block's tokens that hit the slot's
+    # node (``gin_dd_count``).  After D2 every CTA derives the node's hit
+    # total and its block's prefix; a compacted slot gets, per hitting token
+    # ``t`` in ascending order, row ``c(t)`` of the send planes (routing,
+    # weights, scales, then the token row), and ``gin_dd_row[s][t] = c(t)``
+    # for the internode TopkReduce.  The rail peer receives the compacted
+    # planes in place of the full prefix and treats row ``c`` as a token:
+    # its proxy prep, pull, node reduce and return work unchanged, so the
+    # return carries only the hitting tokens as well.  ``gin_dd_mode[s]`` is
+    # the slot's row count when compacted, -1 when it ships the full prefix.
+    # ------------------------------------------------------------------
+
+    @cute.jit
+    def _gin_dd_block(self, args, cta):
+        """Token range ``[lo, hi)`` of CTA ``cta``'s own-token block."""
+        t_max: cutlass.Constexpr[int] = self.max_tokens_per_rank
+        blk: cutlass.Constexpr[int] = (t_max + args.sm_count - 1) // args.sm_count
+        lo = cta * Int32(blk)
+        hi = lo + Int32(blk)
+        if hi > Int32(t_max):
+            hi = Int32(t_max)
+        return lo, hi
+
+    @cute.jit
+    def _gin_dd_hit_bits(self, args, t):
+        """Remote slots whose node own token ``t`` hits (bit ``s`` = slot ``s``)."""
+        bits = Int32(0)
+        for k in cutlass.range_constexpr(self.num_topk):
+            e = Int32(args.topk_idx[t, k])
+            if e >= Int32(0):
+                node = e // Int32(self.node_expert_count)
+                if node != Int32(self.my_node):
+                    slot = node
+                    if node > Int32(self.my_node):
+                        slot = node - Int32(1)
+                    bits = bits | (Int32(1) << slot)
+        return bits
+
+    @cute.jit
+    def _gin_dd_count_blocks(self, args, cta, warp_idx, lane_idx):
+        """Before D2: this CTA's per-slot hit counts (dispatch warp 0)."""
+        num_slots: cutlass.Constexpr[int] = self.num_remote_slots
+        if warp_idx == Int32(0):
+            lo, hi = self._gin_dd_block(args, cta)
+            base = lo
+            while base < hi:
+                t = base + lane_idx
+                bits = Int32(0)
+                if t < hi:
+                    bits = self._gin_dd_hit_bits(args, t)
+                for s in cutlass.range_constexpr(num_slots):
+                    ballot = Int32(
+                        cute.arch.vote_ballot_sync(
+                            ((bits >> Int32(s)) & Int32(1)) != Int32(0)
+                        )
+                    )
+                    if lane_idx == Int32(0) and ballot != Int32(0):
+                        cute.arch.atomic_add(
+                            args.gin_dd_count.iterator
+                            + (Int32(s * self.gin_dd_max_ctas) + cta),
+                            Int32(cute.arch.popc(ballot)),
+                            sem="relaxed",
+                            scope="gpu",
+                        )
+                base = base + Int32(self.warp_threads)
+
+    @cute.jit
+    def _gin_dd_compact_meta(self, args, cta, warp_idx, lane_idx):
+        """After D2: per slot, decide compaction and write this CTA's share of
+        the small send planes (routing, weights, scales; dispatch warp 0).
+
+        Returns the bit set of compacted slots (identical on every CTA: the
+        decision depends only on the grid-visible counts).
+        """
+        num_slots: cutlass.Constexpr[int] = self.num_remote_slots
+        t_max: cutlass.Constexpr[int] = self.max_tokens_per_rank
+        num_topk: cutlass.Constexpr[int] = self.num_topk
+        sfu: cutlass.Constexpr[int] = self.sf_uint32_per_token
+        sm_count: cutlass.Constexpr[int] = args.sm_count
+        count_passes: cutlass.Constexpr[int] = (sm_count + 31) // 32
+        ratio_num, ratio_den = self.gin_dd_auto_ratio
+        n_valid = Int32(
+            cute.arch.load(args.gin_token_count.iterator, Int32, sem="relaxed", scope="gpu")
+        )
+        lo, hi = self._gin_dd_block(args, cta)
+        compact_bits = Int32(0)
+        for s in cutlass.range_constexpr(num_slots):
+            total = Int32(0)
+            before = Int32(0)
+            for j in cutlass.range_constexpr(count_passes):
+                idx = Int32(j * 32) + lane_idx
+                v = Int32(0)
+                if idx < Int32(sm_count):
+                    v = Int32(
+                        cute.arch.load(
+                            args.gin_dd_count.iterator
+                            + (Int32(s * self.gin_dd_max_ctas) + idx),
+                            Int32, sem="relaxed", scope="gpu",
+                        )
+                    )
+                v_before = Int32(0)
+                if idx < cta:
+                    v_before = v
+                total = total + Int32(cute.arch.warp_redux_sync(v, "add"))
+                before = before + Int32(cute.arch.warp_redux_sync(v_before, "add"))
+            compact = Int32(1)
+            if cutlass.const_expr(self.node_dedup == "auto"):
+                if total * Int32(ratio_den) > n_valid * Int32(ratio_num):
+                    compact = Int32(0)
+            compact_bits = compact_bits | (compact << Int32(s))
+            if cta == Int32(0) and warp_idx == Int32(0) and lane_idx == Int32(0):
+                mode = Int32(-1)
+                if compact != Int32(0):
+                    mode = total
+                cute.arch.store(
+                    args.gin_dd_mode.iterator + s, mode, sem="relaxed", scope="gpu"
+                )
+            # CTA0's D3 lanes read the mode lane 0 stored.
+            cute.arch.sync_warp()
+            if compact != Int32(0) and warp_idx == Int32(0):
+                w_src = args.input_topk_weights_buffer.iterator.toint()
+                w_dst = args.gin_send_topk_weights.iterator.toint() + Int64(
+                    s * t_max * num_topk * 4
+                )
+                sf_src = args.input_sf_buffer.iterator.toint()
+                sf_dst = args.gin_send_sf.iterator.toint() + Int64(s * t_max * sfu * 4)
+                run = before
+                base = lo
+                while base < hi:
+                    t = base + lane_idx
+                    hit = Int32(0)
+                    if t < hi:
+                        hit = (self._gin_dd_hit_bits(args, t) >> Int32(s)) & Int32(1)
+                    ballot = Int32(cute.arch.vote_ballot_sync(hit != Int32(0)))
+                    if hit != Int32(0):
+                        c = run + Int32(
+                            cute.arch.popc(ballot & Int32(cute.arch.lanemask_lt()))
+                        )
+                        args.gin_dd_row[s, t] = c
+                        for k in cutlass.range_constexpr(num_topk):
+                            args.gin_send_topk_idx[s, c, k] = args.topk_idx[t, k]
+                            stg_b32_raw(
+                                w_dst + Int64(c * Int32(num_topk) + Int32(k)) * Int64(4),
+                                ldg_b32_raw(
+                                    w_src + Int64(t * Int32(num_topk) + Int32(k)) * Int64(4)
+                                ),
+                            )
+                        if cutlass.const_expr(sfu % 4 == 0):
+                            for q in cutlass.range_constexpr(sfu // 4):
+                                w = ldg_b128_raw(
+                                    sf_src + Int64(t) * Int64(sfu * 4) + Int64(q * 16)
+                                )
+                                stg_b128_raw(
+                                    sf_dst + Int64(c) * Int64(sfu * 4) + Int64(q * 16),
+                                    w[0], w[1], w[2], w[3],
+                                )
+                        else:
+                            for q in cutlass.range_constexpr(sfu):
+                                stg_b32_raw(
+                                    sf_dst + Int64(c) * Int64(sfu * 4) + Int64(q * 4),
+                                    ldg_b32_raw(
+                                        sf_src + Int64(t) * Int64(sfu * 4) + Int64(q * 4)
+                                    ),
+                                )
+                    run = run + Int32(cute.arch.popc(ballot))
+                    base = base + Int32(self.warp_threads)
+                # Routing rows past the node's last hit read -1 at the rail
+                # peer (its proxy prep scans all t_max rows).
+                pad = (Int32(t_max) - total) * Int32(num_topk)
+                i = cta * Int32(self.warp_threads) + lane_idx
+                pad_base = args.gin_send_topk_idx.iterator + (
+                    Int32(s * t_max * num_topk) + total * Int32(num_topk)
+                )
+                while i < pad:
+                    (pad_base + i).store(Int64(-1))
+                    i = i + Int32(sm_count * self.warp_threads)
+        return compact_bits
+
+    @cute.jit
+    def _gin_dd_copy_rows(
+        self, token_comm_storage, args, cta, warp_idx, lane_idx, compact_bits,
+        phase_bit,
+    ):
+        """Between D3 and D6: bulk-copy this CTA's hitting token rows of every
+        compacted slot into its send plane (dispatch warp 0, through the
+        warp's pull-buffer row).  Returns the pull mbarrier's next parity."""
+        num_slots: cutlass.Constexpr[int] = self.num_remote_slots
+        t_max: cutlass.Constexpr[int] = self.max_tokens_per_rank
+        hb: cutlass.Constexpr[int] = self.hidden_bytes
+        if warp_idx == Int32(0):
+            mbar = token_comm_storage.pull_mbar.data_ptr()
+            buf = token_comm_storage.pull_buffer.data_ptr()
+            src_base = args.input_token_buffer.iterator.toint()
+            lo, hi = self._gin_dd_block(args, cta)
+            for s in cutlass.range_constexpr(num_slots):
+                if ((compact_bits >> Int32(s)) & Int32(1)) != Int32(0):
+                    dst_base = args.gin_send_token.iterator.toint() + Int64(s * t_max * hb)
+                    base = lo
+                    while base < hi:
+                        t = base + lane_idx
+                        hit = Int32(0)
+                        if t < hi:
+                            hit = (self._gin_dd_hit_bits(args, t) >> Int32(s)) & Int32(1)
+                        c = Int32(0)
+                        if hit != Int32(0):
+                            c = Int32(args.gin_dd_row[s, t])
+                        pending = Int32(cute.arch.vote_ballot_sync(hit != Int32(0)))
+                        while pending != Int32(0):
+                            src_lane = Int32(cute.arch.clz(cute.arch.brev(pending)))
+                            row = Int32(cute.arch.shuffle_sync(c, src_lane))
+                            with cute.arch.elect_one():
+                                tma_load_1d_raw(
+                                    buf,
+                                    src_base + Int64(base + src_lane) * Int64(hb),
+                                    mbar,
+                                    Int32(hb),
+                                )
+                                cute.arch.mbarrier_arrive_and_expect_tx(mbar, Int32(hb))
+                                cute.arch.mbarrier_wait(mbar, phase_bit)
+                                tma_store_1d(
+                                    cute.make_ptr(
+                                        Uint8,
+                                        dst_base + Int64(row) * Int64(hb),
+                                        AddressSpace.gmem,
+                                        assumed_align=16,
+                                    ),
+                                    buf,
+                                    Int32(hb),
+                                )
+                                cute.arch.cp_async_bulk_commit_group()
+                                # The next row reuses the buffer.
+                                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                            cute.arch.sync_warp()
+                            phase_bit = phase_bit ^ Int32(1)
+                            pending = pending & (pending - Int32(1))
+                        base = base + Int32(self.warp_threads)
+            with cute.arch.elect_one():
+                cute.arch.cp_async_bulk_wait_group(0)
+            cute.arch.sync_warp()
+        # The rows are read by the NIC (the token put after D6).
+        cute.arch.fence_proxy("async.global")
+        cute.arch.fence_acq_rel_sys()
+        return phase_bit
+
     @cute.jit
     def dispatch_barrier_gin(
         self,
@@ -2062,6 +2371,7 @@ class TokenInPullTokenBackPush:
         lane_idx,
         *,
         num_sms,
+        pull_phase=None,
     ):
         """Internode dispatch barrier (design D2-D10).
 
@@ -2070,6 +2380,9 @@ class TokenInPullTokenBackPush:
         received remote ``topk_idx`` as proxy prep (source id = the remote
         origin's global rank), CTA0 publishes those counts, and the node
         NVLink barrier makes all counts visible before the scheduler starts.
+
+        ``pull_phase`` (node dedup): parity of the warp's pull mbarrier, which
+        the row compaction uses before the pull; returned updated.
         """
         args = token_comm_args
         tid_in_group = warp_idx * Int32(self.warp_threads) + lane_idx
@@ -2077,10 +2390,25 @@ class TokenInPullTokenBackPush:
         t_max: cutlass.Constexpr[int] = self.max_tokens_per_rank
 
         self._dbg(sm_idx, 1, warp_idx, lane_idx)
+        dd: cutlass.Constexpr[bool] = self.gin_node_dedup
+        if cutlass.const_expr(dd):
+            # Node dedup: per-CTA hit counts, published by D2.
+            self._gin_dd_count_blocks(args, sm_idx, warp_idx, lane_idx)
         # D2: own prep (slots, counts, token count) is grid-visible.
         software_grid_sync(args.grid_sync_counter, sm_idx, num_sms, tid_in_group,
                            num_threads=self.active_dispatch_threads)
         self._dbg(sm_idx, 2, warp_idx, lane_idx)
+        compact_bits = Int32(0)
+        if cutlass.const_expr(dd):
+            compact_bits = self._gin_dd_compact_meta(args, sm_idx, warp_idx, lane_idx)
+            if compact_bits != Int32(0):
+                # The compacted routing / weight / scale planes are complete
+                # before CTA0 ships them (every CTA took this branch).
+                cute.arch.fence_acq_rel_sys()
+                software_grid_sync(
+                    args.grid_sync_counter, sm_idx, num_sms, tid_in_group,
+                    num_threads=self.active_dispatch_threads,
+                )
 
         if sm_idx == 0:
             if warp_idx == 0:
@@ -2093,9 +2421,29 @@ class TokenInPullTokenBackPush:
                 )
                 # Lane 4*s + kind posts put ``kind`` to remote slot ``s``.
                 if lane_idx < Int32(4 * num_slots):
-                    self._gin_stage1_put(
-                        args, lane_idx // Int32(4), lane_idx % Int32(4), n_own,
-                    )
+                    if cutlass.const_expr(dd):
+                        put_slot = lane_idx // Int32(4)
+                        put_kind = lane_idx % Int32(4)
+                        mode = Int32(
+                            cute.arch.load(
+                                args.gin_dd_mode.iterator + put_slot, Int32,
+                                sem="relaxed", scope="gpu",
+                            )
+                        )
+                        put_compact = Int32(0)
+                        put_rows = n_own
+                        if mode >= Int32(0):
+                            put_compact = Int32(1)
+                            put_rows = mode
+                        # A compacted slot's token rows leave after D6.
+                        if put_compact == Int32(0) or put_kind != Int32(3):
+                            self._gin_stage1_put(
+                                args, put_slot, put_kind, put_rows, put_compact,
+                            )
+                    else:
+                        self._gin_stage1_put(
+                            args, lane_idx // Int32(4), lane_idx % Int32(4), n_own,
+                        )
                 cute.arch.sync_warp()
                 self._dbg(sm_idx, 3, warp_idx, lane_idx)
             # D4: own counts to this node's owners.
@@ -2110,6 +2458,13 @@ class TokenInPullTokenBackPush:
                 src_index=Int32(self.global_rank),
             )
             cute.arch.fence_acq_rel_sys()
+        if cutlass.const_expr(dd):
+            if compact_bits != Int32(0):
+                pull_phase = self._gin_dd_copy_rows(
+                    token_comm_storage, args, sm_idx, warp_idx, lane_idx,
+                    compact_bits, pull_phase,
+                )
+        if sm_idx == 0:
             # D5: wait for every rail peer's routing (META).
             if warp_idx == 0:
                 if lane_idx == 0:
@@ -2122,6 +2477,21 @@ class TokenInPullTokenBackPush:
         software_grid_sync(args.grid_sync_counter, sm_idx, num_sms, tid_in_group,
                            num_threads=self.active_dispatch_threads)
         self._dbg(sm_idx, 5, warp_idx, lane_idx)
+        if cutlass.const_expr(dd):
+            # Compacted slots: every CTA's token rows are in the send plane.
+            if sm_idx == 0 and warp_idx == 0:
+                if lane_idx < Int32(num_slots):
+                    mode = Int32(
+                        cute.arch.load(
+                            args.gin_dd_mode.iterator + lane_idx, Int32,
+                            sem="relaxed", scope="gpu",
+                        )
+                    )
+                    if mode >= Int32(0):
+                        self._gin_stage1_put(
+                            args, lane_idx, Int32(3), mode, Int32(1),
+                        )
+                cute.arch.sync_warp()
 
         # D7: proxy prep of every remote origin whose rail peer is this rank.
         for s in cutlass.range_constexpr(num_slots):
@@ -2196,6 +2566,7 @@ class TokenInPullTokenBackPush:
             sync_threads=self.active_dispatch_threads,
         )
         self._dbg(sm_idx, 8, warp_idx, lane_idx)
+        return pull_phase
 
     @cute.jit
     def dispatch_barrier(
@@ -2355,6 +2726,7 @@ class TokenInPullTokenBackPush:
         *,
         num_sms,
         gin_args=None,
+        pull_phase=None,
     ):
         """Pull every routed (token, topk) row into the FC1 pool.
 
@@ -2372,11 +2744,15 @@ class TokenInPullTokenBackPush:
         # MemRange does not support dynamic indexing here; use raw pointers.
         pull_mbar_ptr = token_comm_storage.pull_mbar.data_ptr()
         pull_buffer_ptr = token_comm_storage.pull_buffer.data_ptr()
-        if lane_idx == Int32(0):
-            cute.arch.mbarrier_init(pull_mbar_ptr + warp_idx, 1)
-        cute.arch.sync_warp()
-
-        phase_bit = Int32(0)
+        if cutlass.const_expr(pull_phase is None):
+            if lane_idx == Int32(0):
+                cute.arch.mbarrier_init(pull_mbar_ptr + warp_idx, 1)
+            cute.arch.sync_warp()
+            phase_bit = Int32(0)
+        else:
+            # Initialized at the dispatch entry (node dedup's row compaction
+            # used it first).
+            phase_bit = pull_phase
 
         # ── Release-flag batching ────────────────────────────────────────
         # Delay fc1-ready counter publication with the same rotating-lane
@@ -3677,6 +4053,18 @@ class TokenInPullTokenBackPush:
         if iket_active:
             _iket.range_push("Dispatch_Prep")
 
+        pull_phase = None
+        if cutlass.const_expr(self.gin_node_dedup):
+            # The node dedup's row compaction (before the pull) bulk-copies
+            # through the warp's pull buffer: initialize its mbarrier here.
+            if lane_idx == Int32(0):
+                cute.arch.mbarrier_init(
+                    token_comm_storage.pull_mbar.data_ptr() + local_warp_idx, 1
+                )
+            cute.arch.mbarrier_init_fence()
+            cute.arch.sync_warp()
+            pull_phase = Int32(0)
+
         if cutlass.const_expr(self.enable_nccl_gin):
             # Source id = this rank's GLOBAL id; owners are node-local.
             self.dispatch_prep_gin(
@@ -3717,13 +4105,14 @@ class TokenInPullTokenBackPush:
             _iket.range_push("Dispatch_Barrier")
 
         if cutlass.const_expr(self.enable_nccl_gin):
-            self.dispatch_barrier_gin(
+            pull_phase = self.dispatch_barrier_gin(
                 token_comm_storage,
                 token_comm_args,
                 cta_linear_id,
                 local_warp_idx,
                 lane_idx,
                 num_sms=token_comm_args.sm_count,
+                pull_phase=pull_phase,
             )
         else:
             self.dispatch_barrier(
@@ -3774,6 +4163,7 @@ class TokenInPullTokenBackPush:
             lane_idx,
             num_sms=token_comm_args.sm_count,
             gin_args=(token_comm_args if self.enable_nccl_gin else None),
+            pull_phase=pull_phase,
         )
 
         if iket_active:

@@ -69,6 +69,14 @@ def _args():
         "heuristic, every field given, e.g. "
         "swap=1,pp=0,tile=128x32x128,cga=1x2x1,tb=epi_warps,gh=264,ts=0",
     )
+    p.add_argument(
+        "--route-nodes",
+        type=int,
+        default=0,
+        help="node-limited routing (DeepSeek style): every token picks its "
+        "top-k experts among the experts of this many nodes (chosen by the best "
+        "expert score per node; node = LOCAL_WORLD_SIZE ranks); 0 = unrestricted",
+    )
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--output-csv", default=None)
@@ -167,12 +175,24 @@ def _weights(rank, experts, hidden, intermediate, scale_mode):
     return out, act_scale
 
 
-def _inputs(rank, tokens, hidden, experts_total, topk):
+def _inputs(rank, tokens, hidden, experts_total, topk, route_nodes=0):
     g = torch.Generator(device="cuda").manual_seed(7 + rank)
     hs = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda", generator=g)
     scores = torch.randn(
         tokens, experts_total, dtype=torch.float32, device="cuda", generator=g
     )
+    if route_nodes > 0:
+        # Node-limited routing: keep the experts of the route_nodes nodes with
+        # the best expert score, then the usual top-k among them.
+        world = dist.get_world_size()
+        per_node = int(os.environ.get("LOCAL_WORLD_SIZE", world))
+        num_nodes = world // per_node
+        if route_nodes < num_nodes:
+            by_node = scores.view(tokens, num_nodes, -1)
+            keep = by_node.amax(dim=-1).topk(route_nodes, dim=-1).indices
+            mask = torch.full_like(by_node[..., 0], float("-inf"))
+            mask.scatter_(1, keep, 0.0)
+            scores = (by_node + mask[..., None]).view(tokens, experts_total)
     w, ids = torch.topk(scores, topk, dim=-1)
     return hs, torch.softmax(w, dim=-1).float(), ids.to(torch.int64)
 
@@ -1034,7 +1054,9 @@ def _run_baselines(args, rank, world, per_node):
     mode = args.mode if not cutlass_gemm else f"{args.mode}+cutlass"
     rows = []
     for tokens in [int(t) for t in args.tokens.split(",")]:
-        hs, w, idx = _inputs(rank, tokens, args.hidden, args.num_experts, args.top_k)
+        hs, w, idx = _inputs(
+            rank, tokens, args.hidden, args.num_experts, args.top_k, args.route_nodes
+        )
         # The E4M3 rows (and block scales) the mega kernel stages, up front.
         if args.scale_mode == "blockwise":
             x, sf = quantize_fp8_per_token_block(
@@ -1204,7 +1226,9 @@ def main():
             **_geom_kwargs(args.geom),
         )
         cfg = symm._frontend.config
-        hs, tw, ti = _inputs(rank, tokens, args.hidden, args.num_experts, args.top_k)
+        hs, tw, ti = _inputs(
+            rank, tokens, args.hidden, args.num_experts, args.top_k, args.route_nodes
+        )
         stage_mega_moe_inputs(
             hs,
             tw,

@@ -829,6 +829,61 @@ Internode levers left:
    132, 198, 264, two rounds): the one-wave group of the EP8 row stays best
    (1985-1991 / 5830-5836 µs against 1996-2121 / 5868-6170).
 
+### Cross-node token dedup (2026-11-13, dlcluster 2 x 8 H100)
+
+`gin_node_dedup` / `FLASHINFER_MOE_EP_GIN_NODE_DEDUP` (`off` / `on` /
+`auto`).  Before, an origin put its whole token prefix (META, weights, SF,
+rows) to every remote node's rail peer, zero-copy from the input buffers,
+and the combine returned all of those rows.  With dedup the origin sends a
+remote node only the tokens that route there:
+
+* before D2, warp 0 of every CTA counts per remote slot the tokens of its
+  block that hit the slot's node (`gin_dd_count[slot, cta]`);
+* after D2 every CTA prefix-sums the counts, decides per slot (`on`: always;
+  `auto`: when `hits * 8 <= valid * 7`), writes topk / weights / SF of its
+  hitting tokens to per-slot send planes at the compacted index (token
+  order), records the index in `gin_dd_row[slot, t]` and pads the META rows
+  past the hit count with -1; CTA 0 stores `gin_dd_mode[slot]` (hit count,
+  or -1 for the full prefix);
+* the D3 puts read the send planes for compacted slots; the rows are bulk
+  copied through the pull buffer after D4 and their put is posted after a
+  grid sync at the end of dispatch;
+* the rail peer is unchanged: it treats the compacted index as the token,
+  so proxy prep, the pull, FC2 rows, the node reduce and the return all
+  shrink to the hitting tokens; `InternodeTopkReduce` maps a token to its
+  return row through `gin_dd_row` when `gin_dd_mode >= 0`.
+
+EP16 FP8 blockwise, two interleaved rounds, max-rank median µs, change
+against `off` (node-limited = `--route-nodes 1`, each token's top-6 on one
+node; uniform routing hits the other node with ~98% of the tokens):
+
+| tokens | uniform auto | uniform on | node-lim. auto (no gate) | node-lim. on |
+|--------|--------------|------------|--------------------------|--------------|
+| 8-64   | +0..+2%      | +2.4..+4%  | +0.6..+3.0%              | +2.2..+2.8%  |
+| 128    | +0.2%        | +2.4%      | 0.0%                     | -0.3%        |
+| 256    | -0.1%        | +1.9%      | -2.5%                    | -3.4%        |
+| 512    | +1.3%        | +1.9%      | -5.4%                    | -5.3%        |
+| 1024   | +0.1%        | +1.1%      | -9.4%                    | -9.1%        |
+| 2048   | +0.4%        | +0.1%      | -4.7%                    | -4.8%        |
+| 4096   | +0.1%        | +1.6%      | -2.0%                    | -2.0%        |
+| 8192   | +0.2%        | 0.0%       | -0.9%                    | -2.5%        |
+| 16384  | +0.4%        | +0.4%      | -1.3%                    | -1.2%        |
+
+Below 256 tokens the launch is latency bound: the count pass, the extra
+grid sync and the per-row copies cost more than the saved bytes, so `auto`
+is built in only from 256 tokens per rank (`off` below; default `auto`).
+Final build, auto / off: uniform within run-to-run noise (-1.5..+1.4%);
+node-limited 256 855 / 879 (-2.8%), 512 1140 / 1212 (-5.9%), 1024 1709 /
+1877 (-8.9%), 2048 2791 / 2929 (-4.7%), 4096 4688 / 4775 (-1.8%), 8192 /
+16384 -0.8 / -0.7%.  The split baselines re-run with the same routing gain
+too (DeepEP and NCCL-EP HT send each token once per node): best baseline /
+mega auto 1.14x (8) .. 1.26x (256), 1.19x (1024), 1.35x (4096), 1.55x
+(16384).  Tests: the 8 `node_dedup` cases (forced compaction under uniform
+and node-limited routing, early return with one and two phases, `auto`,
+`off`) match the I11 sum tree bitwise; data in
+`benchmark_data/20261103_ep16_internode_vs_baselines/node_dedup_ab.csv`
+(local).
+
 ### Top-k dedup at large tokens (2026-11-03, dlcluster, one node of H100)
 
 `dedup_dispatch` and `grouped_token_back` came back with the kernel-repo sync

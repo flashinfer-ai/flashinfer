@@ -54,6 +54,7 @@ codegen-time quantities.
 # (PEP 563 string-ifies class-body annotations, which breaks ``@cute.struct``
 # element-type introspection).  See moe_nvfp4_swapab/megamoe_kernel.py.
 
+import os
 from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union
 
 import cutlass
@@ -181,6 +182,10 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         # ranks per NVLink domain; None = one domain spanning the world.
         ranks_per_node: Optional[int] = None,
         enable_nccl_gin: bool = False,
+        # Internode node dedup ("off" / "on" / "auto", see
+        # TokenInPullTokenBackPush ``node_dedup``); None reads
+        # FLASHINFER_MOE_EP_GIN_NODE_DEDUP (default "auto").
+        gin_node_dedup: Optional[str] = None,
         # Bitwise-reproducible launches: launch-order-independent dispatch
         # slots + the separate TopkReduce (see the module docstring).
         deterministic: bool = False,
@@ -351,6 +356,15 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         self.num_nodes = world_size // self.ranks_per_node
         # Remote node slots: landing / receive planes are indexed by them.
         self.num_remote_slots = self.num_nodes - 1 if self.enable_nccl_gin else 0
+        if gin_node_dedup is None:
+            gin_node_dedup = os.environ.get("FLASHINFER_MOE_EP_GIN_NODE_DEDUP", "auto")
+        # "auto" is built in only from 256 tokens per rank: below that the
+        # launch is latency bound and the hit count pass plus the compaction's
+        # grid sync cost more than the saved bytes (EP16 2x8 H100, node-limited
+        # routing: T64 +3%, T256 -2.5%, T1024 -9%).
+        if gin_node_dedup == "auto" and self.max_tokens_per_rank < 256:
+            gin_node_dedup = "off"
+        self.gin_node_dedup = gin_node_dedup if self.enable_nccl_gin else "off"
 
         # static_expert_shape = (num_experts_per_rank, intermediate_gateup, hidden).
         self.num_experts_per_rank = static_expert_shape[0]
@@ -515,6 +529,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             early_return=early_return,
             num_seg1_signal_warps=len(self.epilogue_warp_id) if early_return else 0,
             ret_phases=ret_phases,
+            node_dedup=self.gin_node_dedup,
         )
         self.dedup_dispatch = dedup_dispatch
         if self.enable_nccl_gin:
@@ -738,6 +753,17 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                     16,
                 )
             )
+            if self.token_comm.gin_node_dedup:
+                # Node dedup: per (remote slot, CTA) own tokens hitting the
+                # slot's node (atomics; reset with the prefix).
+                counter_specs.append(
+                    _RegionSpec(
+                        "gin_dd_count",
+                        cutlass.Int32,
+                        (self.num_remote_slots * self.token_comm.gin_dd_max_ctas,),
+                        16,
+                    )
+                )
             if self.token_comm.early_return:
                 # Epilogue warps done with the earlier segments (one 16-bit
                 # count per return phase), and per (slot, token chunk) the
@@ -824,6 +850,20 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 (2,),
                 16,
             ),
+        ]
+        if self.enable_nccl_gin and self.token_comm.gin_node_dedup:
+            # Node dedup, read by the internode TopkReduce after the kernel
+            # (outside the reset prefix): per slot the compacted row count or
+            # -1, and per (slot, own token) its compacted row (hitting tokens
+            # of compacted slots only).
+            specs += [
+                _RegionSpec("gin_dd_mode", cutlass.Int32, (self.num_remote_slots,), 16),
+                _RegionSpec(
+                    "gin_dd_row", cutlass.Int32,
+                    (self.num_remote_slots, self.max_tokens_per_rank), 16,
+                ),
+            ]
+        specs += [
             _RegionSpec(
                 "l1_sf_buffer",
                 cutlass.Int32,
@@ -1023,6 +1063,28 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                     (slots, max_tokens_per_rank, hidden), 128,
                 ),
             ]
+            if self.token_comm.gin_node_dedup:
+                # Node dedup send planes (Stage 1 put sources): per remote
+                # slot the compacted routing (padded with -1), weights, scale
+                # words and token rows of the tokens hitting its node.
+                specs += [
+                    _RegionSpec(
+                        "gin_send_topk_idx", cutlass.Int64,
+                        (slots, max_tokens_per_rank, num_topk), 128,
+                    ),
+                    _RegionSpec(
+                        "gin_send_topk_weights", cutlass.Float32,
+                        (slots, max_tokens_per_rank, num_topk), 128,
+                    ),
+                    _RegionSpec(
+                        "gin_send_token", cutlass.Uint8,
+                        (slots, max_tokens_per_rank, self.hidden_bytes), 128,
+                    ),
+                    _RegionSpec(
+                        "gin_send_sf", cutlass.Int32,
+                        (slots, max_tokens_per_rank, self.sf_uint32_per_token), 128,
+                    ),
+                ]
 
         # The per-topk FC2 plane is an implementation workspace, not public IO.
         # It is the cross-rank STG/TMA target and therefore belongs in the shared
@@ -1469,6 +1531,25 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 gin_token_count=self._view_local(local_workspace, "gin_token_count"),
                 gin_epoch=self._view_local(local_workspace, "gin_epoch"),
             )
+            if cutlass.const_expr(self.token_comm.gin_node_dedup):
+                if cutlass.const_expr(sm_count > self.token_comm.gin_dd_max_ctas):
+                    raise ValueError(
+                        f"node dedup counts at most {self.token_comm.gin_dd_max_ctas} "
+                        f"CTAs, got sm_count={sm_count}."
+                    )
+                gin_views.update(
+                    gin_send_topk_idx=self._view_shared(
+                        shared_workspace, "gin_send_topk_idx",
+                    ),
+                    gin_send_topk_weights=self._view_shared(
+                        shared_workspace, "gin_send_topk_weights",
+                    ),
+                    gin_send_token=self._view_shared(shared_workspace, "gin_send_token"),
+                    gin_send_sf=self._view_shared(shared_workspace, "gin_send_sf"),
+                    gin_dd_count=self._view_local(local_workspace, "gin_dd_count"),
+                    gin_dd_row=self._view_local(local_workspace, "gin_dd_row"),
+                    gin_dd_mode=self._view_local(local_workspace, "gin_dd_mode"),
+                )
             if cutlass.const_expr(self.token_comm.early_return):
                 gin_views.update(
                     gin_seg1_done=self._view_local(local_workspace, "gin_seg1_done"),
@@ -1570,12 +1651,15 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 my_node=self.local_rank // self.ranks_per_node,
                 max_tokens_per_rank=self.max_tokens_per_rank,
                 ret_phases=self.token_comm.ret_phases,
+                node_dedup=self.token_comm.gin_node_dedup,
             )(
                 combine_target,
                 topk_idx,
                 self._view_shared(shared_workspace, "gin_remote_partial"),
                 output_activation,
                 stream,
+                dd_mode=gin_views.get("gin_dd_mode"),
+                dd_row=gin_views.get("gin_dd_row"),
             )
         elif cutlass.const_expr(not self.fc2_in_kernel_topk_reduce):
             score = (

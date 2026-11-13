@@ -11,6 +11,9 @@ Runs after the fused kernel on the same stream.  For every token of this rank:
   the token hits; with two return phases the even tokens' partials fill the
   first ``ceil(T/2)`` rows and the odd ones the rest
   (``row(t) = (t % 2) * ceil(T/2) + t // 2``), otherwise ``row(t) = t``;
+  with node dedup a compacted node returns one row per hitting token, in
+  token order: ``t`` is replaced by its compacted index ``dd_row[slot][t]``
+  when ``dd_mode[slot] >= 0``;
 * the FP32 accumulator is rounded to BF16 once.
 
 This is the fixed reduction tree of the internode design (invariant I11): with
@@ -45,6 +48,7 @@ class InternodeTopkReduce:
         my_node: int,
         max_tokens_per_rank: int,
         ret_phases: int = 1,
+        node_dedup: bool = False,
     ) -> None:
         self.hidden = int(hidden)
         self.num_topk = int(num_topk)
@@ -59,6 +63,7 @@ class InternodeTopkReduce:
             raise ValueError(f"ret_phases must be 1 or 2, got {ret_phases}.")
         self.ret_phases = int(ret_phases)
         self.phase_rows = (self.max_tokens_per_rank + self.ret_phases - 1) // self.ret_phases
+        self.node_dedup = bool(node_dedup)
 
     @cute.jit
     def __call__(
@@ -68,6 +73,8 @@ class InternodeTopkReduce:
         remote_partial: cute.Tensor,  # (S, T, hidden) bf16
         reduced_output: cute.Tensor,  # (T, hidden) bf16
         stream: cuda.CUstream,
+        dd_mode: cute.Tensor = None,  # (S,) Int32, node dedup only
+        dd_row: cute.Tensor = None,   # (S, T) Int32, node dedup only
     ):
         threads = self._threads
         total_workers = self.max_tokens_per_rank * self.hidden_tiles
@@ -80,7 +87,13 @@ class InternodeTopkReduce:
                 stride=reduced_output.stride,
             ),
         )
-        self._kernel(combine, topk_idx, remote_partial, reduced_output).launch(
+        if cutlass.const_expr(not self.node_dedup):
+            # Unread placeholders (the dedup branch is compiled out).
+            dd_mode = topk_idx
+            dd_row = topk_idx
+        self._kernel(
+            combine, topk_idx, remote_partial, reduced_output, dd_mode, dd_row,
+        ).launch(
             grid=grid, block=block, stream=stream,
         )
 
@@ -99,6 +112,8 @@ class InternodeTopkReduce:
         topk_idx: cute.Tensor,
         remote_partial: cute.Tensor,
         reduced_output: cute.Tensor,
+        dd_mode: cute.Tensor,
+        dd_row: cute.Tensor,
     ):
         threads = self._threads
         hpt: cutlass.Constexpr[int] = self._hidden_per_thread
@@ -141,9 +156,6 @@ class InternodeTopkReduce:
                         acc[i] = acc[i] + Float32(term[i])
 
             # One partial per remote node, ascending node order.
-            ret_row = token_idx
-            if cutlass.const_expr(self.ret_phases == 2):
-                ret_row = (token_idx % Int32(2)) * Int32(self.phase_rows) + token_idx // Int32(2)
             for node in cutlass.range_constexpr(num_nodes):
                 if cutlass.const_expr(node != my_node):
                     slot: cutlass.Constexpr[int] = node if node < my_node else node - 1
@@ -152,6 +164,15 @@ class InternodeTopkReduce:
                         if slot_node[k] == Int32(node):
                             hits = hits + Int32(1)
                     if hits > Int32(0):
+                        ret_idx = token_idx
+                        if cutlass.const_expr(self.node_dedup):
+                            if dd_mode[slot] >= Int32(0):
+                                ret_idx = dd_row[slot, token_idx]
+                        ret_row = ret_idx
+                        if cutlass.const_expr(self.ret_phases == 2):
+                            ret_row = (ret_idx % Int32(2)) * Int32(
+                                self.phase_rows
+                            ) + ret_idx // Int32(2)
                         src = cute.zipped_divide(
                             remote_partial[slot, ret_row, None], (hpt,),
                         )[(None,), (hidden_tile_idx,)]

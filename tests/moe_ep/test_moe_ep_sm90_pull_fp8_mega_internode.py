@@ -172,10 +172,55 @@ def _unreduced_plane(symm_buffer):
     )
 
 
+def _dd_mode(symm_buffer):
+    """This rank's node dedup decision per remote slot (compacted row count,
+    or -1 for the full prefix); None when the kernel has no node dedup."""
+    import torch
+
+    frontend = symm_buffer._frontend
+    mega = frontend._mega
+    kernel = mega.kernel
+    if "gin_dd_mode" not in kernel._local_region_by_name:
+        return None
+    spec = kernel._local_region_by_name["gin_dd_mode"]
+    off = int(kernel._local_offsets["gin_dd_mode"])
+    return mega.local_workspace[off : off + int(spec.nbytes)].view(torch.int32).tolist()
+
+
+def _node_limited_routing(ti, *, seed, num_nodes, node_experts):
+    """Each token (but the forced token 0) routes all of its top-k slots to
+    experts of one random node (node-limited routing, one node per token):
+    about (num_nodes - 1) / num_nodes of the tokens never reach a given remote
+    node, so the node dedup compacts with gaps."""
+    import torch
+
+    n, topk = ti.shape
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    nodes = torch.randint(num_nodes, (n,), generator=g, device="cuda")
+    local = torch.rand(n, node_experts, generator=g, device="cuda").argsort(dim=1)
+    ids = nodes[:, None] * node_experts + local[:, :topk]
+    out = ti.clone()
+    out[1:] = ids[1:].to(ti.dtype)
+    return out
+
+
 def _i11_reference(
-    rank, world, per_node, *, n, t_max, topk_ids, planes, experts_per_rank
+    rank,
+    world,
+    per_node,
+    *,
+    n,
+    t_max,
+    topk_ids,
+    planes,
+    experts_per_rank,
+    dd_mode=None,
 ):
-    """Rebuild this rank's output with the internode reduction tree (bitwise)."""
+    """Rebuild this rank's output with the internode reduction tree (bitwise).
+
+    ``dd_mode`` (node dedup): per remote slot of this origin, the compacted
+    row count or -1; a compacted node holds token ``t``'s landing row at its
+    rank among the tokens hitting that node."""
     import torch
 
     my_node = rank // per_node
@@ -184,6 +229,7 @@ def _i11_reference(
     num_nodes = world // per_node
     hidden = planes.shape[-1]
     out = torch.zeros(n, hidden, dtype=torch.bfloat16, device=planes.device)
+    hits_before = [0] * num_nodes  # per node: earlier tokens hitting it
     for t in range(n):
         ids = topk_ids[t].tolist()
         nodes = [e // node_experts if e >= 0 else -1 for e in ids]
@@ -196,13 +242,29 @@ def _i11_reference(
                 continue
             rail_peer = d * per_node + local
             slot = my_node if my_node < d else my_node - 1
-            row = t_max + slot * t_max + t
+            my_slot = d if d < my_node else d - 1
+            row_idx = t
+            if dd_mode is not None and dd_mode[my_slot] >= 0:
+                row_idx = hits_before[d]
+            row = t_max + slot * t_max + row_idx
             part = torch.zeros(hidden, dtype=torch.float32, device=planes.device)
             for k, dk in enumerate(nodes):
                 if dk == d:
                     part = part + planes[rail_peer, row, k].float()
             acc = acc + part.to(torch.bfloat16).float()
         out[t] = acc.to(torch.bfloat16)
+        for d in set(nodes):
+            if d >= 0 and d != my_node:
+                hits_before[d] += 1
+    if dd_mode is not None:
+        # A compacted slot's row count is its number of hitting tokens.
+        for d in range(num_nodes):
+            if d != my_node:
+                m = dd_mode[d if d < my_node else d - 1]
+                assert m in (-1, hits_before[d]), (
+                    f"rank {rank} node {d}: dd_mode {m} != hitting tokens "
+                    f"{hits_before[d]}"
+                )
     return out
 
 
@@ -274,6 +336,8 @@ def _run_internode(
     experts_per_rank: int = 4,
     topk: int = 4,
     hidden: int = 2048,
+    node_dedup: str | None = None,
+    routing: str = "uniform",
 ):
     import torch
     import torch.distributed as dist
@@ -289,6 +353,9 @@ def _run_internode(
     rank, world, local, per_node = _require_internode()
     _init_dist(local)
     dbg = _debug_buffer()
+    if node_dedup is not None:
+        # Read when the kernel is built (session creation and recompiles).
+        os.environ["FLASHINFER_MOE_EP_GIN_NODE_DEDUP"] = node_dedup
     num_experts = experts_per_rank * world
     intermediate = 1024
     gate_up_clamp = 10.0
@@ -341,6 +408,13 @@ def _run_internode(
                 num_experts=num_experts,
                 topk=topk,
             )
+            if routing == "node_limited":
+                ti = _node_limited_routing(
+                    ti,
+                    seed=11 + rank + 1000 * launch,
+                    num_nodes=world // per_node,
+                    node_experts=per_node * experts_per_rank,
+                )
             stage_mega_moe_inputs(
                 hs,
                 tw,
@@ -381,6 +455,7 @@ def _run_internode(
                 topk_ids=ti,
                 planes=planes,
                 experts_per_rank=experts_per_rank,
+                dd_mode=_dd_mode(symm),
             )
             diff = (y.view(torch.int16) != y_tree.view(torch.int16)).sum().item()
             remote_hits = sum(
@@ -390,7 +465,8 @@ def _run_internode(
             )
             print(
                 f"[internode rank {rank} launch {launch} n={n} {fp8_scale_mode} "
-                f"swap_ab={swap_ab} tb={token_back_mode}] remote (token,k) hits="
+                f"swap_ab={swap_ab} tb={token_back_mode} dedup={node_dedup} "
+                f"routing={routing} dd_mode={_dd_mode(symm)}] remote (token,k) hits="
                 f"{remote_hits}, bitwise mismatches vs I11 tree={diff}",
                 flush=True,
             )
@@ -444,6 +520,8 @@ def _run_internode(
         torch.cuda.synchronize()
         dist.barrier()
         symm.destroy()
+        if node_dedup is not None:
+            os.environ.pop("FLASHINFER_MOE_EP_GIN_NODE_DEDUP", None)
 
 
 @pytest.mark.parametrize(
@@ -472,6 +550,40 @@ def test_moe_ep_sm90_pull_fp8_mega_internode(
         token_back_mode=token_back_mode,
         max_tokens=max_tokens,
         token_counts=(max_tokens, 16, 1, max_tokens * 3 // 4 - 1),
+    )
+
+
+@pytest.mark.parametrize(
+    "fp8_scale_mode,swap_ab,token_back_mode,max_tokens,node_dedup,routing",
+    [
+        # Forced compaction: uniform routing (few gaps) and node-limited
+        # routing (about half the tokens skip the remote node).
+        ("per_tensor", True, None, 64, "on", "uniform"),
+        ("per_tensor", False, None, 64, "on", "node_limited"),
+        ("blockwise", False, "reuse_dispatch_warps", 64, "on", "node_limited"),
+        # Early return, one and two return phases (compacted rows split by
+        # parity of their compacted index).
+        ("blockwise", False, "epi_warps", 1024, "on", "node_limited"),
+        ("blockwise", False, "epi_warps", 2048, "on", "node_limited"),
+        # "auto" (built in from 256 tokens per rank): node-limited routing
+        # compacts, uniform routing mostly ships the full prefix; "off": the
+        # zero-copy path with node-limited routing.
+        ("blockwise", False, "epi_warps", 2048, "auto", "node_limited"),
+        ("blockwise", False, "epi_warps", 256, "auto", "uniform"),
+        ("blockwise", False, "epi_warps", 2048, "off", "node_limited"),
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_internode_node_dedup(
+    fp8_scale_mode, swap_ab, token_back_mode, max_tokens, node_dedup, routing
+):
+    _run_internode(
+        fp8_scale_mode=fp8_scale_mode,
+        swap_ab=swap_ab,
+        token_back_mode=token_back_mode,
+        max_tokens=max_tokens,
+        token_counts=(max_tokens, 16, 1, max_tokens * 3 // 4 - 1),
+        node_dedup=node_dedup,
+        routing=routing,
     )
 
 
