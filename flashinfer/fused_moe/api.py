@@ -3411,6 +3411,111 @@ class BatchInvariantBf16Config:
         return "BatchInvariantBf16Config()"
 
 
+# Design notes: the kernels of this backend took optimisation ideas from the package's other MoE backends: the swapped-AB
+# decode records as ranked members of the dispatcher's space follow Prims-TS (the open counterpart of TRTLLM-Gen's MoE
+# GEMMs: its swap-AB low-latency templates and tile-N ladder) and TRTLLM-Gen's fp8 per-tensor decode tactics; the fused
+# activation and e4m3 requantisation at the static per-tensor multiplier in GEMM1's epilogue follows Prims-TS's fused
+# activation and TRTLLM-Gen's fp8 per-tensor contract, whose surface this backend mirrors; the PDL wait / trigger
+# placement and the launch's tile bound on the persistent grid follow Prims-TS and TRTLLM-Gen; the routing, permutation,
+# combine and the ranking contract are the bf16 backend's. Each is a placement of the class's dataflow: the same bits,
+# placed as those kernels place theirs.
+@dataclass(frozen=True)
+class BatchInvariantFp8PerTensorConfig:
+    """The batch-invariant fp8 per-tensor MoE backend: the W8A8 classes ``moe.e4m3.<act>`` of the mode documented in
+    ``flashinfer/batch_invariant/README.md`` (one class per typed activation and parameter set, as the bf16 backend), on
+    SM100 / SM103 / SM107.
+
+    The surface is :class:`TrtllmFp8PerTensorConfig`'s: ``QuantConfig(weight=QuantFormat.FP8PerTensor,
+    activation=QuantFormat.FP8PerTensor)``, ``prepare_weights`` from the bf16 experts with the two calibrated E4M3
+    multipliers (``hidden_states_scale_global``, ``intermediate_scale_global``: ``q = x * s``), ``prepare_activations``
+    quantizing the bf16 activations with the input multiplier (an e4m3 ``[num_tokens, H]`` and no scale tensor), all three
+    routing input modes. The class declares every rounding: the experts quantized with one multiplier per expert and GEMM
+    (``448 / amax``), the dequantization scales the correctly rounded reciprocals of the multipliers, GEMM1's activation on
+    the alpha-scaled fp32 accumulators followed by the ``mul.rn`` by the intermediate multiplier and one saturating RNE
+    conversion to e4m3, GEMM2's ``cvt_bf16(mul(acc, alpha2))``, the slot-order fp32 combine. Every output bit is a function of
+    the token's own e4m3 row, its ``top_k`` experts and routing weights, the expert bytes and the scales; ``do_finalize=True``
+    only (the unfinalized triple is refused) and the dense expert set only (an expert-parallel shard,
+    ``local_expert_offset`` / ``local_num_experts``, is refused); unsupported inputs raise
+    :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; never a default candidate (name it in
+    ``BackendOptions``). ``H`` and ``I`` are multiples of 16 (16-byte e4m3 rows).
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103, 107)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16: torch.Tensor,
+        w2_bf16: torch.Tensor,
+        *,
+        hidden_states_scale_global,
+        intermediate_scale_global,
+        num_local_experts: Optional[int] = None,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+        activation: Optional["ActivationConfig"] = None,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Any]:
+        """The backend's weight view: the experts quantized to e4m3 per expert, the gate / up rows interleaved for a gated
+        activation, the dequantization scales of the two multipliers and of the experts, the activation's chain
+        (``activation`` defaults to ``SwiGLU()``)."""
+        from .batch_invariant.api_fp8 import MoEWeightsE4M3
+        from .batch_invariant.spec import activation_of
+
+        chain = activation_of(activation if activation is not None else SwiGLU())
+        if w1_bf16.dim() != 3 or w2_bf16.dim() != 3:
+            raise TypeError(
+                "BatchInvariantFp8PerTensorConfig.prepare_weights takes w1 [E, N1, H] and w2 [E, H, I]"
+            )
+        E, N1, H = w1_bf16.shape
+        for name, given, actual in (
+            ("num_local_experts", num_local_experts, E),
+            ("hidden_size", hidden_size, H),
+            ("intermediate_size", intermediate_size, N1 // 2 if chain.gated else N1),
+        ):
+            if given is not None and int(given) != actual:
+                raise ValueError(
+                    f"BatchInvariantFp8PerTensorConfig.prepare_weights: {name} {given} does not match the weights' "
+                    f"{actual} (w1 {tuple(w1_bf16.shape)}, w2 {tuple(w2_bf16.shape)}, "
+                    f"{'gated' if chain.gated else 'ungated'} activation)"
+                )
+        w1 = w1_bf16.to(device=device) if device is not None else w1_bf16
+        w2 = w2_bf16.to(device=device) if device is not None else w2_bf16
+        return MoEWeightsE4M3.prepare(
+            w1.to(torch.bfloat16),
+            w2.to(torch.bfloat16),
+            hidden_states_scale_global,
+            intermediate_scale_global,
+            gated=chain.gated,
+            act=chain.act,
+            params=chain.params,
+        ).view()
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16: torch.Tensor, *, hidden_states_scale_global
+    ) -> Tuple[torch.Tensor, None]:
+        """The static input quantization ``cvt.rn.satfinite.e4m3(mul(x, hidden_states_scale_global))`` (the class's declared
+        chain as torch ops; graph-capturable with a device scale)."""
+        from .batch_invariant.reference_fp8 import quantize_e4m3_static
+
+        x = hidden_states_bf16.to(torch.bfloat16).contiguous()
+        m = torch.as_tensor(
+            hidden_states_scale_global, dtype=torch.float32, device=x.device
+        )
+        if m.numel() != 1:
+            raise ValueError(
+                "BatchInvariantFp8PerTensorConfig.prepare_activations: hidden_states_scale_global must be one fp32 value, "
+                f"got shape {tuple(m.shape)}"
+            )
+        # a 0-d multiplier: a one-element tensor of any rank must not broadcast the activations to its rank
+        return quantize_e4m3_static(x, m.reshape(())), None
+
+    def __repr__(self) -> str:
+        return "BatchInvariantFp8PerTensorConfig()"
+
+
 # Union type for backend config
 BackendConfigType = Union[
     BatchInvariantBf16Config,
@@ -3456,6 +3561,7 @@ BackendConfigType = Union[
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    BatchInvariantFp8PerTensorConfig,
 ]
 
 ALL_BACKEND_CONFIGS = (
@@ -3502,6 +3608,7 @@ ALL_BACKEND_CONFIGS = (
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    BatchInvariantFp8PerTensorConfig,
 )
 
 

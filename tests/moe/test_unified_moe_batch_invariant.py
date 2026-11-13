@@ -882,7 +882,7 @@ def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch
     wait) -- and its builder asserts the shipped placement is one of them, so a placement outside the rule cannot build the
     box form; the gather form, which waits before its tables, builds under any."""
     from flashinfer.fused_moe.batch_invariant import pdl
-    from flashinfer.fused_moe.batch_invariant.blocks.swap_bf16 import SwappedGroupedGemm
+    from flashinfer.fused_moe.batch_invariant.blocks.swap import SwappedGroupedGemm
     from flashinfer.fused_moe.batch_invariant.schedule import swapped_knobs
 
     cfg = swapped_knobs()[0]
@@ -1530,6 +1530,20 @@ def test_layer_matches_the_class_composition(act):
     ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
     ref = _reference_ffn(x, ids.cuda(), weights.cuda(), w1, w2, chain)
     assert torch.equal(bits(out.cpu()), bits(ref))
+
+
+def test_reference_max_takes_the_non_nan_operand():
+    """``TorchF32.fmaxc`` is the device's ``max.f32``: the non-NaN operand when one operand is NaN, ``+0`` on a zero tie with a
+    ``+0``, ``-0`` only for two ``-0``."""
+    from flashinfer.fused_moe.batch_invariant.reference import TorchF32
+
+    nan = float("nan")
+    r = TorchF32.fmaxc(
+        torch.tensor([nan, 1.0, -0.0, -0.0]), torch.tensor([0.0, nan, 0.0, -0.0])
+    )
+    assert r[0] == 0.0 and r[1] == 1.0
+    assert r[2] == 0.0 and not torch.signbit(r[2])
+    assert r[3] == 0.0 and torch.signbit(r[3])
 
 
 @needs_device

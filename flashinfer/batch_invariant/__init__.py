@@ -150,26 +150,26 @@ def _mm_fp4_fingerprint(
     )
 
 
-def _moe_bf16_fingerprint(
-    H: int,
-    I: int,
+def _moe_class_terms(
+    op: str,
     top_k: int,
     num_experts: int,
-    method: object = "Renormalize",
-    act: object = "swiglu",
-    params: Sequence[Optional[float]] = (),
-    gated: Optional[bool] = None,
-    n_group: Optional[int] = None,
-    topk_group: Optional[int] = None,
-) -> str:
-    """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantBf16Config``: ``method`` is a
-    :class:`flashinfer.RoutingMethodType` (or its name) among the ones the class implements, with ``n_group`` /
-    ``topk_group`` for ``DeepSeekV3``'s group-limited selection (``RoutingConfig``'s values; the groups are a parameter of
-    the routing term), or the class's own method name (``spec.METHODS``; a grouped one as ``<method>_g<n>x<t>``, the same
-    class as the enum form with the groups) or a ``spec.RoutingMethod``; ``act`` an ``ActivationConfig`` of the layer (its
-    scalars are the class's parameters), ``"swiglu"`` / ``"relu2"`` (the default gated / ungated chains), or a chain name of
-    ``spec.ACTS`` / ``spec.UNGATED_ACTS`` with ``params`` (and ``gated`` for the names in both tables). The receipt names
-    a class some layer can build: the runner's bounds and group rule apply here as ``ValueError``."""
+    method: object,
+    act: object,
+    params: Sequence[Optional[float]],
+    gated: Optional[bool],
+    n_group: Optional[int],
+    topk_group: Optional[int],
+):
+    """The MoE classes' shared dimensions resolved to the specification's terms: ``(routing method, chain name, parameters,
+    gating)`` for the bf16 and the fp8 per-tensor fingerprints. ``method`` is a :class:`flashinfer.RoutingMethodType` (or
+    its name) among the ones the classes implement, with ``n_group`` / ``topk_group`` for ``DeepSeekV3``'s group-limited
+    selection (``RoutingConfig``'s values; the groups are a parameter of the routing term), or the classes' own method name
+    (``spec.METHODS``; a grouped one as ``<method>_g<n>x<t>``, the same class as the enum form with the groups) or a
+    ``spec.RoutingMethod``; ``act`` an ``ActivationConfig`` of the layer (its scalars are the class's parameters),
+    ``"swiglu"`` / ``"relu2"`` (the default gated / ungated chains), or a chain name of ``spec.ACTS`` / ``spec.UNGATED_ACTS``
+    with ``params`` (and ``gated`` for the names in both tables). The receipt names a class some layer can build: the
+    runners' bounds and group rule apply here as ``ValueError``."""
     # absolute on purpose: the JIT cache keys follow relative imports, and the MoE specification is not part of the GEMM
     # modules' closures
     from flashinfer.fused_moe.batch_invariant import spec
@@ -178,11 +178,11 @@ def _moe_bf16_fingerprint(
 
     if not 1 <= num_experts <= MAX_E:
         raise ValueError(
-            f"fingerprint('fused_moe'): num_experts {num_experts} must lie in [1, {MAX_E}]"
+            f"fingerprint({op!r}): num_experts {num_experts} must lie in [1, {MAX_E}]"
         )
     if not 1 <= top_k <= min(num_experts, spec.MAX_TOP_K):
         raise ValueError(
-            f"fingerprint('fused_moe'): top_k {top_k} must lie in [1, min(num_experts, {spec.MAX_TOP_K})]"
+            f"fingerprint({op!r}): top_k {top_k} must lie in [1, min(num_experts, {spec.MAX_TOP_K})]"
         )
     if isinstance(method, str) and method in RoutingMethodType.__members__:
         method = RoutingMethodType[method]
@@ -236,9 +236,69 @@ def _moe_bf16_fingerprint(
             gated = act in spec.ACTS
     else:
         raise ValueError(f"no MoE chain named {act!r}")
+    return rm, name, params, gated
+
+
+def _moe_bf16_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+) -> str:
+    """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantBf16Config``: the dimensions of
+    :func:`_moe_class_terms` (the routing method with ``DeepSeekV3``'s groups, the activation with its scalars and gating)."""
+    from flashinfer.fused_moe.batch_invariant import spec
+
+    rm, name, params, gated = _moe_class_terms(
+        "fused_moe", top_k, num_experts, method, act, params, gated, n_group, topk_group
+    )
     return spec.spec_fingerprint(
         H, I, top_k, num_experts, rm, "bf16", name, params, gated
     )
+
+
+def _moe_fp8_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+) -> str:
+    """The fp8 per-tensor MoE classes behind ``MoELayer`` with ``BatchInvariantFp8PerTensorConfig``: the dimensions of
+    :func:`_moe_class_terms` (the routing method with ``DeepSeekV3``'s groups, the activation with its scalars and gating)
+    under the same bounds; the scales' values are inputs, not dimensions."""
+    from flashinfer.fused_moe.batch_invariant.api_fp8 import ALIGN_E4M3
+    from flashinfer.fused_moe.batch_invariant.spec_fp8 import spec_fingerprint_fp8
+
+    for dim, value in (("H", H), ("I", I)):
+        if value <= 0 or value % ALIGN_E4M3:
+            raise ValueError(
+                f"fingerprint('fused_moe_fp8'): {dim} {value} must be a positive multiple of {ALIGN_E4M3} "
+                "(the class's e4m3 row alignment)"
+            )
+    rm, name, params, gated = _moe_class_terms(
+        "fused_moe_fp8",
+        top_k,
+        num_experts,
+        method,
+        act,
+        params,
+        gated,
+        n_group,
+        topk_group,
+    )
+    return spec_fingerprint_fp8(H, I, top_k, num_experts, rm, name, params, gated)
 
 
 def _megamoe_bf16_fingerprint(
@@ -316,6 +376,14 @@ CLASSES: Dict[str, ClassInfo] = {
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
         "attention.bf16", ("head_dim",), _attention_fingerprint
     ),
+    # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
+    # scales are inputs of the class (their values never enter the identifier)
+    "fused_moe_fp8": ClassInfo(
+        "moe.e4m3",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_fp8_fingerprint,
+        ("method", "act", "params", "gated", "n_group", "topk_group"),
+    ),
 }
 
 
@@ -379,6 +447,13 @@ def fingerprint(op: str, **dims) -> str:
     'gemm-mxfp8-k64-kfold-...'
     >>> fingerprint("mm_fp4", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_100")  # doctest: +SKIP
     'gemm-nvfp4-kfold-...'
+    >>> fingerprint("fused_moe_fp8", H=2048, I=768, top_k=8, num_experts=128)  # doctest: +SKIP
+    'moe-...'
+
+    ``fused_moe_fp8`` takes the dimensions of ``fused_moe`` for the fp8 per-tensor classes ``moe.e4m3.<act>`` behind
+    ``BatchInvariantFp8PerTensorConfig``: the fp8 GEMM folds at ``K = H`` and ``K = I``, the fused e4m3 quantization of the
+    activation on the alpha-scaled accumulators and GEMM2's scaled chain are the specification; the static per-tensor
+    scales, like the operands, are inputs.
     """
     info = CLASSES.get(op)
     if info is None:
