@@ -83,13 +83,16 @@ if not _USE_CUDA_NORM:
         # nvidia-cutlass-dsl not installed or incompatible version
         _USE_CUDA_NORM = True
 
-# SM90 serve-shape RMSNorm fast path (guard + kernels); None disables it.
+# SM90 serve-shape RMSNorm fast path, behind the "specialized" backend of
+# rmsnorm() (guard + kernels); None disables it.
 try:
     from .kernels.rmsnorm_serve_sm90 import (
+        RMSNORM_BACKENDS,
         try_rmsnorm_serve_sm90 as _try_rmsnorm_serve_sm90,
     )
 except (ImportError, AttributeError):
     _try_rmsnorm_serve_sm90 = None
+    RMSNORM_BACKENDS = ("auto", "specialized", "stock")
 
 try:
     from .kernels.gated_residual_rmsnorm import (
@@ -1249,6 +1252,8 @@ def rmsnorm(
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
+    *,
+    backend: str = "auto",
 ) -> torch.Tensor:
     r"""Root mean square normalization.
 
@@ -1267,15 +1272,35 @@ def rmsnorm(
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
+    backend: str
+        One of ``("auto", "specialized", "stock")``. ``"specialized"``
+        selects the specialized SM90 serve-shape kernels explicitly (a call
+        they cannot serve falls back to the stock dispatch — this op's
+        composable path — never to another fused backend, with the reason
+        recorded in the dispatch stats); ``"auto"`` (default) routes to
+        ``"specialized"`` only on its dispatch allowlist
+        (``flashinfer/rmsnorm_serve_sm90_dispatch.json``); ``"stock"`` pins
+        the stock dispatch — an explicitly selected backend is never
+        silently swapped, and unknown names raise.
+        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) forces
+        the stock path; ``FLASHINFER_SM90_SERVE_RMSNORM=0`` is a deprecated
+        kill alias kept for one release (its ``=cuda`` value still selects
+        the CUDA kernel variant behind ``"specialized"``).
 
     Returns
     -------
     output: torch.Tensor
         Normalized tensor, 2D shape (batch_size, hidden_size) or 3D shape (batch_size, num_heads, hidden_size).
     """
+    if backend not in RMSNORM_BACKENDS:
+        raise ValueError(
+            f"rmsnorm supports backend in {RMSNORM_BACKENDS}, got "
+            f"{backend!r}; an explicitly selected backend is never silently "
+            "swapped"
+        )
     if out is None:
         out = torch.empty_like(input)
-    _rmsnorm_impl(out, input, weight, eps, enable_pdl)
+    _rmsnorm_impl(out, input, weight, eps, enable_pdl, backend)
     return out
 
 
@@ -1286,15 +1311,18 @@ def _rmsnorm_impl(
     weight: torch.Tensor,
     eps: float,
     enable_pdl: Optional[bool],
+    backend: str = "auto",
 ) -> None:
-    # SM90 serve-shape fast path: 2D bf16 at the measured decode-serve
-    # envelope (see kernels/rmsnorm_serve_sm90.py for the guard).  A False
-    # return falls through to the stock dispatch unchanged;
-    # FLASHINFER_SM90_SERVE_RMSNORM=0 is the kill switch.
+    # SM90 serve-shape "specialized" backend: 2D bf16 at the measured
+    # decode-serve envelope (see kernels/rmsnorm_serve_sm90.py for the guard
+    # and the #5667 semantics).  A False return falls through to the stock
+    # dispatch unchanged (the composable path; backend="stock" pins it);
+    # FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 is the kill switch
+    # (FLASHINFER_SM90_SERVE_RMSNORM=0 a deprecated alias).
     if (
         _try_rmsnorm_serve_sm90 is not None
         and input.dim() == 2
-        and _try_rmsnorm_serve_sm90(out, input, weight, eps)
+        and _try_rmsnorm_serve_sm90(out, input, weight, eps, backend)
     ):
         return
     if enable_pdl is None or enable_pdl:
@@ -1319,6 +1347,7 @@ def _rmsnorm_impl_fake(
     weight: torch.Tensor,
     eps: float,
     enable_pdl: Optional[bool],
+    backend: str = "auto",
 ) -> None:
     pass
 

@@ -17,24 +17,37 @@ SM90 serve-shape RMSNorm fast path (H100/H200 decode-serve envelope)
 ====================================================================
 
 An alternative 2D bf16 RMSNorm implementation for the launch-bound
-decode-serve envelope on SM90: small-to-mid token counts at serve hidden
-sizes.  Two backends:
+decode-serve envelope on SM90, served through the ``"specialized"`` backend
+of :func:`flashinfer.norm.rmsnorm` (#5667 pattern):
 
-- ``cutedsl`` (default): a CuTe DSL kernel whose per-H plan (``_plan``) picks
-  vector width, thread count and values-per-thread from H itself.  It is
-  generic over 16-byte-vectorizable H; dispatch admits the measured band
-  (H a multiple of 8 in [512, 6144]).
-- ``cuda`` (opt-in via ``FLASHINFER_SM90_SERVE_RMSNORM=cuda``): a CUDA C++
-  specialist (csrc/norm_serve_sm90.cu, JIT module ``norm_serve_sm90``) with
-  shape-specialized kernels for H in exactly {512, 2048, 6144}; dispatch
-  admits only that exact allowlist (its generic fallback is correct but
-  slower than the stock path off-list).
+- ``backend="specialized"`` selects it explicitly; a call it cannot serve
+  falls back to the stock rmsnorm dispatch (this op's composable path) —
+  never to another fused backend — with the reason recorded in the dispatch
+  stats.
+- ``backend="auto"`` (the default) routes to ``"specialized"`` only on the
+  dispatch allowlist (``flashinfer/rmsnorm_serve_sm90_dispatch.json``).
+- ``backend="stock"`` pins the stock dispatch; an explicitly selected
+  backend is never silently swapped, and unknown names raise.
 
-Kill switch: ``FLASHINFER_SM90_SERVE_RMSNORM=0`` (checked per call) disables
-the fast path entirely and every call runs the stock FlashInfer rmsnorm
-dispatch unchanged.  Any call outside the guard (shape, dtype, layout,
-architecture, token count, CUDA-graph or autotune constraints below) also
-falls back to the stock path.
+Behind ``"specialized"`` sit TWO agent-generated kernel variants (one
+backend string, per #5667, which also shipped multiple sources):
+
+- ``cutedsl`` (default variant): a CuTe DSL kernel whose per-H plan
+  (``_plan``) picks vector width, thread count and values-per-thread from H
+  itself.  It is generic over 16-byte-vectorizable H; dispatch admits the
+  measured band (H a multiple of 8 in [512, 6144]).
+- ``cuda`` (variant opt-in via ``FLASHINFER_SM90_SERVE_RMSNORM=cuda``): a
+  CUDA C++ specialist (csrc/norm_serve_sm90.cu, JIT module
+  ``norm_serve_sm90``) with shape-specialized kernels for H in exactly
+  {512, 2048, 6144}; dispatch admits only that exact allowlist (its generic
+  fallback is correct but slower than the stock path off-list).
+
+Kill switch: ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (checked per call;
+shared by FlashInfer's specialized kernels) forces the stock path.
+``FLASHINFER_SM90_SERVE_RMSNORM=0`` remains a deprecated kill alias for one
+release.  Any call outside the guard (shape, dtype, layout, architecture,
+token count, CUDA-graph or autotune constraints below) also falls back to
+the stock path.
 
 CUDA-graph rules: the compiled kernels take their stream from the caller's
 current stream on every call (TVM-FFI env stream / per-call stream query), so
@@ -57,6 +70,67 @@ _GENERIC_H_MAX = 6144
 _MAX_TOKENS = 8192
 
 _ENV_VAR = "FLASHINFER_SM90_SERVE_RMSNORM"
+# Kill switch shared by FlashInfer's specialized kernels (read per call).
+_SPECIALIZED_KERNEL_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
+# Backends of flashinfer.norm.rmsnorm, as plain strings (#5667): "specialized"
+# is the agent-generated fast path (both variants), "stock" the existing
+# dispatch. An explicitly selected backend is never silently swapped.
+RMSNORM_BACKENDS = ("auto", "specialized", "stock")
+_DISPATCH_FILE = "rmsnorm_serve_sm90_dispatch.json"
+
+# Per-backend dispatch census and fallback reasons (#5667-style).
+_stats = {
+    "calls": 0,
+    "backend_dispatches": {"specialized": 0, "stock": 0},
+    "variant_dispatches": {"cutedsl": 0, "cuda": 0},
+    "fallback_reasons": {},
+}
+
+
+def _fallback(reason):
+    _stats["fallback_reasons"][reason] = (
+        _stats["fallback_reasons"].get(reason, 0) + 1
+    )
+
+
+def _rmsnorm_serve_sm90_stats() -> dict:
+    return {
+        "calls": _stats["calls"],
+        "backend_dispatches": dict(_stats["backend_dispatches"]),
+        "variant_dispatches": dict(_stats["variant_dispatches"]),
+        "fallback_reasons": dict(_stats["fallback_reasons"]),
+        "backends": RMSNORM_BACKENDS,
+        "dispatch_table_loaded": _dispatch_table() is not None,
+    }
+
+
+def _reset_rmsnorm_serve_sm90_stats() -> None:
+    _stats["calls"] = 0
+    for d in (_stats["backend_dispatches"], _stats["variant_dispatches"]):
+        for k in d:
+            d[k] = 0
+    _stats["fallback_reasons"].clear()
+
+
+def _dispatch_table():
+    """Load the dispatch surface (package data) once; ``None`` means
+    ``backend="auto"`` never routes to "specialized"."""
+    global _DISPATCH_TABLE
+    try:
+        return _DISPATCH_TABLE
+    except NameError:
+        pass
+    try:
+        import json as _json
+        from importlib import resources
+
+        payload = _json.loads(
+            resources.files("flashinfer").joinpath(_DISPATCH_FILE).read_text()
+        )
+        _DISPATCH_TABLE = payload if isinstance(payload, dict) else None
+    except Exception:
+        _DISPATCH_TABLE = None
+    return _DISPATCH_TABLE
 
 try:
     import math
@@ -282,13 +356,24 @@ def _get_cuda_module():
 # ---------------------------------------------------------------------------
 
 
-def _backend():
-    """Requested backend: ``"cutedsl"`` (default), ``"cuda"``, or ``None``
-    (kill switch).  Read per call so the kill switch works at runtime."""
+def _disabled() -> bool:
+    if os.environ.get(_SPECIALIZED_KERNEL_DISABLE_ENV, "").strip() not in (
+        "", "0",
+    ):
+        return True
     value = os.environ.get(_ENV_VAR, "").strip().lower()
     if value in ("0", "off", "false", "disable", "disabled"):
-        return None
-    if value == "cuda":
+        # deprecated kill alias (one release); the variant selector role of
+        # this env ("cuda") is unaffected
+        return True
+    return False
+
+
+def _variant():
+    """Kernel variant behind the "specialized" backend: ``"cutedsl"``
+    (default) or ``"cuda"`` (opt-in via FLASHINFER_SM90_SERVE_RMSNORM=cuda).
+    Read per call."""
+    if os.environ.get(_ENV_VAR, "").strip().lower() == "cuda":
         return "cuda"
     return "cutedsl"
 
@@ -318,16 +403,30 @@ def try_rmsnorm_serve_sm90(
     input: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
+    requested: str = "auto",
 ) -> bool:
     """Run the SM90 serve-shape RMSNorm when the call is inside the measured
     envelope.  Returns ``True`` when the output has been produced; ``False``
-    means the caller must run the stock path (guard miss, kill switch,
+    means the caller must run the stock path (this op's composable path:
+    guard miss, kill switch, backend="stock", off the auto allowlist,
     missing runtime, uncompiled variant under CUDA-graph capture, or
-    autotune tuning mode)."""
-    backend = _backend()
-    if backend is None:
+    autotune tuning mode).  ``requested`` is the public backend kwarg:
+    "stock" never reaches these kernels; "specialized" is explicit (guards
+    still apply, with the miss reason recorded); "auto" additionally
+    requires the dispatch allowlist to be loaded."""
+    _stats["calls"] += 1
+    if requested == "stock":
+        _stats["backend_dispatches"]["stock"] += 1
         return False
+    if _disabled():
+        _fallback(f"{requested}: kill switch")
+        return False
+    if requested == "auto" and _dispatch_table() is None:
+        _fallback("auto: dispatch allowlist unavailable")
+        return False
+    backend = _variant()
     if input.dim() != 2:
+        _fallback(f"{requested}: input dim {input.dim()}")
         return False
     tokens, hidden = input.shape
     if (
@@ -335,12 +434,16 @@ def try_rmsnorm_serve_sm90(
         or weight.dtype is not torch.bfloat16
         or out.dtype is not torch.bfloat16
     ):
+        _fallback(f"{requested}: non-bf16 dtypes")
         return False
     if not 0 < tokens <= _MAX_TOKENS:
+        _fallback(f"{requested}: tokens {tokens} outside envelope")
         return False
     if not _h_in_envelope(hidden, backend):
+        _fallback(f"{requested}: H {hidden} off the allowlist")
         return False
     if input.device.type != "cuda":
+        _fallback(f"{requested}: non-CUDA device")
         return False
     if weight.shape != (hidden,) or out.shape != input.shape:
         return False
@@ -353,38 +456,49 @@ def try_rmsnorm_serve_sm90(
     if (input.data_ptr() | out.data_ptr() | weight.data_ptr()) % 16 != 0:
         return False
     if torch.cuda.get_device_capability(input.device) != (9, 0):
+        _fallback(f"{requested}: not SM90")
         return False
     if _autotune_active():
+        _fallback(f"{requested}: autotuner measurement window")
         return False
 
     if backend == "cuda":
         if _cuda_module is None and torch.cuda.is_current_stream_capturing():
             # Never JIT-build the module under CUDA-graph capture.
+            _fallback(f"{requested}: cuda variant uncompiled under capture")
             return False
         try:
             module = _get_cuda_module()
         except Exception:
+            _fallback(f"{requested}: cuda variant JIT build failed")
             return False
         module.rmsnorm_serve_sm90(out, input, weight, float(eps))
+        _stats["backend_dispatches"]["specialized"] += 1
+        _stats["variant_dispatches"]["cuda"] += 1
         return True
 
     if not _HAS_CUTE_DSL:
+        _fallback(f"{requested}: CuTe DSL runtime unavailable")
         return False
     key = (hidden, input.dtype)
     fn = _COMPILED.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
             # Never JIT-compile a new (H, dtype) variant under capture.
+            _fallback(f"{requested}: cutedsl variant uncompiled under capture")
             return False
         try:
             fn = _build(hidden, input.dtype)
         except Exception:
+            _fallback(f"{requested}: cutedsl variant JIT build failed")
             return False
         _COMPILED[key] = fn
     # The compiled kernel takes the TVM-FFI env stream, i.e. the caller's
     # current torch stream re-queried on every call (CUDA-graph safe).
     fn(input, weight, out, float(eps))
+    _stats["backend_dispatches"]["specialized"] += 1
+    _stats["variant_dispatches"]["cutedsl"] += 1
     return True
 
 
-__all__ = ["try_rmsnorm_serve_sm90"]
+__all__ = ["RMSNORM_BACKENDS", "try_rmsnorm_serve_sm90"]
