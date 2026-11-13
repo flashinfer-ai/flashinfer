@@ -60,7 +60,7 @@ from flashinfer.fused_moe.api import (
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.prims_ts.utils import is_prims_ts_available
-from flashinfer.tllm_enums import RoutingMethodType
+from flashinfer.tllm_enums import RoutingMethodType, WeightLayout
 from flashinfer.utils import get_compute_capability
 from tests.moe.test_unified_moe import (
     SMALL,
@@ -604,6 +604,243 @@ class TestPrimsTsUnifiedGpu:
         for key, tensor in prims_bf16.items():
             torch.testing.assert_close(tensor, trtllm_bf16[key])
 
+        mxfp4 = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+        mx_w1 = torch.randn(4, 512, 256, device=device, dtype=torch.bfloat16)
+        mx_w2 = torch.randn(4, 256, 256, device=device, dtype=torch.bfloat16)
+        mx_kwargs = dict(
+            quant=mxfp4,
+            num_local_experts=4,
+            hidden_size=256,
+            intermediate_size=256,
+            activation=SwiGLU(),
+            device=device,
+        )
+        prims_mx = PrimsTsConfig.prepare_weights(mx_w1, mx_w2, **mx_kwargs)
+        trtllm_mx = TrtllmFp4Config.prepare_weights(mx_w1, mx_w2, **mx_kwargs)
+        assert prims_mx.keys() == trtllm_mx.keys()
+        for key in ("gemm1_weights", "gemm2_weights"):
+            # BlockMajorK [experts, K_bytes / 64, Mn, 64] of the MajorK weights.
+            num_experts, mn, k_bytes = trtllm_mx[key].shape
+            assert prims_mx[key].shape == (num_experts, k_bytes // 64, mn, 64)
+
+    @pytest.mark.parametrize("num_tokens", [6, 300])
+    def test_mxfp4_mxfp8_local_expert_subset_matches_trtllm(
+        self, num_tokens, monkeypatch
+    ):
+        """Tokens with no, one and two local experts.
+
+        Two of sixteen experts per token over four local experts average under
+        one local expert per token, so the FC2 epilogue stores the
+        single-expert tokens and the finalize zeroes and reduces the rest.
+        """
+        from flashinfer.prims_ts.moe import runner as prims_runner
+
+        fused = []
+        apply_fused_finalize = prims_runner.apply_fused_finalize
+
+        def recording_apply(pair, **kwargs):
+            pair = apply_fused_finalize(pair, **kwargs)
+            fused.append(pair.fc2.cfg.build().fused_finalize_top_k)
+            return pair
+
+        monkeypatch.setattr(prims_runner, "apply_fused_finalize", recording_apply)
+
+        torch.manual_seed(0)
+        device = torch.device("cuda", torch.cuda.current_device())
+        num_experts, local, offset, top_k = 16, 4, 4, 2
+        hidden, intermediate = 256, 256
+        quant = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+        x = torch.randn(num_tokens, hidden, device=device, dtype=torch.bfloat16)
+        w1 = torch.randn(
+            local, intermediate * 2, hidden, device=device, dtype=torch.bfloat16
+        )
+        w2 = torch.randn(
+            local, hidden, intermediate, device=device, dtype=torch.bfloat16
+        )
+        topk_ids = torch.stack(
+            [
+                torch.randperm(num_experts, device=device)[:top_k]
+                for _ in range(num_tokens)
+            ]
+        ).to(torch.int32)
+        # Local experts are 4..7: no, one and two local experts.
+        topk_ids[:3] = torch.tensor(
+            [[0, 9], [5, 12], [4, 7]], device=device, dtype=torch.int32
+        )
+        routing_weights = torch.softmax(
+            torch.randn(num_tokens, top_k, device=device), dim=-1
+        ).to(torch.bfloat16)
+
+        x_q, x_scale = PrimsTsConfig.prepare_activations(x, quant=quant)
+        view_kwargs = dict(
+            quant=quant,
+            num_local_experts=local,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            activation=SwiGLU(),
+            device=device,
+        )
+        prims_weights = MoEWeightPack()
+        prims_weights.prepare_for(
+            "prims_ts",
+            PrimsTsConfig.prepare_weights(w1.clone(), w2.clone(), **view_kwargs),
+        )
+        trtllm_weights = MoEWeightPack()
+        trtllm_weights.prepare_for(
+            "trtllm_fp4_routed",
+            TrtllmFp4Config.prepare_weights(w1.clone(), w2.clone(), **view_kwargs),
+        )
+        act = MoEActivationPack(
+            x_q,
+            x_scale,
+            topk_ids,
+            routing_weights,
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        )
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+            quant=quant,
+            experts=ExpertConfig(
+                intermediate_size=intermediate,
+                local_expert_offset=offset,
+                local_num_experts=local,
+            ),
+            activation=SwiGLU(),
+            execution=ExecutionConfig(tune_max_num_tokens=num_tokens),
+        )
+        prims_layer = MoELayer(
+            dataclasses.replace(config, backend=BackendOptions((PrimsTsConfig(),)))
+        )
+        prims_out = prims_layer(act, prims_weights)
+        trtllm_out = MoELayer(
+            dataclasses.replace(config, backend=BackendOptions((TrtllmFp4Config(),)))
+        )(act, trtllm_weights)
+
+        assert fused and all(k == top_k for k in fused)
+        _nvfp4_check(prims_out, trtllm_out.float(), "prims_ts local expert subset")
+        is_local = (topk_ids >= offset) & (topk_ids < offset + local)
+        no_local = ~is_local.any(dim=1)
+        assert torch.equal(prims_out[no_local], torch.zeros_like(prims_out[no_local]))
+
+        # The same routing weights in FP32, through the same layer and tactics.
+        fp32_out = prims_layer(
+            dataclasses.replace(act, topk_weights=routing_weights.float()),
+            prims_weights,
+        )
+        assert torch.equal(fp32_out, prims_out)
+
+    def test_mxfp4_mxfp8_fused_finalize_two_cta_fc2_past_hidden(self, monkeypatch):
+        """A two-CTA FC2 tile that ends past the hidden size.
+
+        Hidden size 384 is three 128-row tiles, so the second CTA of the last
+        two-CTA tile covers rows 384..511. The fused epilogue stores only the
+        rows below the hidden size; with unit routing weights it matches the
+        unfused finalize bit for bit. The tactic is pinned because the
+        autotuner need not pick a two-CTA FC2 tile.
+        """
+        from flashinfer.prims_ts.moe import runner as prims_runner
+        from flashinfer.prims_ts.moe.config_mapper import (
+            map_trtllm_mxfp4_mxfp8_moe_tactic,
+            valid_prims_ts_mxfp4_mxfp8_moe_tactics,
+        )
+
+        torch.manual_seed(0)
+        device = torch.device("cuda", torch.cuda.current_device())
+        num_tokens, num_experts, local, offset, top_k = 300, 16, 4, 4, 2
+        hidden, intermediate = 384, 256
+        quant = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+        x = torch.randn(num_tokens, hidden, device=device, dtype=torch.bfloat16)
+        w1 = torch.randn(
+            local, intermediate * 2, hidden, device=device, dtype=torch.bfloat16
+        )
+        w2 = torch.randn(
+            local, hidden, intermediate, device=device, dtype=torch.bfloat16
+        )
+        topk_ids = torch.stack(
+            [
+                torch.randperm(num_experts, device=device)[:top_k]
+                for _ in range(num_tokens)
+            ]
+        ).to(torch.int32)
+
+        x_q, x_scale = PrimsTsConfig.prepare_activations(x, quant=quant)
+        weights = MoEWeightPack()
+        weights.prepare_for(
+            "prims_ts",
+            PrimsTsConfig.prepare_weights(
+                w1,
+                w2,
+                quant=quant,
+                num_local_experts=local,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                activation=SwiGLU(),
+                device=device,
+            ),
+        )
+        act = MoEActivationPack(
+            x_q,
+            x_scale,
+            topk_ids,
+            torch.ones(num_tokens, top_k, device=device, dtype=torch.bfloat16),
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        )
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+            quant=quant,
+            experts=ExpertConfig(
+                intermediate_size=intermediate,
+                local_expert_offset=offset,
+                local_num_experts=local,
+            ),
+            activation=SwiGLU(),
+            execution=ExecutionConfig(tune_max_num_tokens=num_tokens),
+            backend=BackendOptions((PrimsTsConfig(),)),
+        )
+        runner = _build_direct_runner(PrimsTsRunner, config, device)
+        inputs = runner.pack_inputs(act, weights)
+
+        major, minor = get_compute_capability(device)
+        tactic_kwargs = dict(
+            sm_arch=major * 10 + minor,
+            num_tokens=num_tokens,
+            top_k=top_k,
+            num_local_experts=local,
+            num_experts=num_experts,
+            weight_layout=int(WeightLayout.BlockMajorK),
+        )
+        two_cta = [
+            tactic
+            for tactic in valid_prims_ts_mxfp4_mxfp8_moe_tactics(**tactic_kwargs)
+            if int(
+                map_trtllm_mxfp4_mxfp8_moe_tactic(
+                    tactic, **tactic_kwargs
+                ).fc2.cfg.kwargs.get("umma_cta_count", 1)
+            )
+            == 2
+        ]
+        assert two_cta
+
+        fused = []
+        apply_fused_finalize = prims_runner.apply_fused_finalize
+
+        def recording_apply(pair, **kwargs):
+            pair = apply_fused_finalize(pair, **kwargs)
+            fused.append(pair.fc2.cfg.build().fused_finalize_top_k)
+            return pair
+
+        def forward(apply):
+            with monkeypatch.context() as patch:
+                patch.setattr(prims_runner, "apply_fused_finalize", apply)
+                return runner.forward(
+                    inputs, tactic=two_cta[0], **runner.launch_kwargs_for(inputs)
+                ).clone()
+
+        fused_out = forward(recording_apply)
+        plain_out = forward(lambda pair, **kwargs: pair)
+        assert fused and all(k == top_k for k in fused)
+        assert torch.equal(fused_out, plain_out)
+
     @pytest.mark.parametrize(
         "quant",
         (
@@ -831,6 +1068,9 @@ class TestPrimsTsUnifiedGpu:
             assert prims_view.keys() == trtllm_view.keys()
             for key, tensor in prims_view.items():
                 other = trtllm_view[key]
+                if tensor.ndim == 4 and other.ndim == 3:
+                    # BlockMajorK MXFP4 weights, [experts, K_bytes / block, Mn, block].
+                    tensor = tensor.permute(0, 2, 1, 3).reshape(other.shape)
                 assert tensor.dtype == other.dtype and tensor.shape == other.shape
                 # MXFP4 stores UE8M0 bytes in float8_e4m3fn. assert_close
                 # rejects those encodings even when the bytes match. 0-dim
@@ -869,3 +1109,11 @@ class TestPrimsTsUnifiedGpu:
             dataclasses.replace(config, backend=BackendOptions((trtllm_config,)))
         )(act, trtllm_weights)
         _nvfp4_check(prims_out, trtllm_out.float(), f"prims_ts {quant.pair} vs trtllm")
+        if quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
+            # Prims-TS also takes the MajorK weights of the TRT-LLM view.
+            major_k_weights = MoEWeightPack()
+            major_k_weights.prepare_for("prims_ts", trtllm_view)
+            major_k_out = MoELayer(
+                dataclasses.replace(config, backend=BackendOptions((PrimsTsConfig(),)))
+            )(act, major_k_weights)
+            assert torch.equal(major_k_out, prims_out)

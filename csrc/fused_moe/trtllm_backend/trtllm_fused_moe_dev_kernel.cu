@@ -1019,10 +1019,14 @@ constexpr int FINALIZE_WARP_THREADS = 256;
 constexpr int FINALIZE_WARP_VECS = 4;
 // Row slices are added until the launch has at least this many warps.
 constexpr int FINALIZE_WARP_MIN_WARPS = 2048;
+// A prime, so coprime to every token count it does not divide.
+constexpr int64_t FINALIZE_TOKEN_SPREAD_STRIDE = 1000003;
 
-template <typename KernelParams>
-__global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
-    finalizeKernelWarpPerToken(KernelParams params) {
+// With SingleExpertTokensDone, the GEMM producing the input already wrote every token that has
+// exactly one local expert to the output (see finalizeKernelMultiExpertTokens): such tokens are
+// skipped, and tokens without a local expert only get their zero row.
+template <typename KernelParams, bool SingleExpertTokensDone>
+__device__ __forceinline__ void finalizeWarpPerToken(KernelParams const& params) {
   using Type = typename KernelParams::Type;
   using TypeExpW = typename KernelParams::TypeExpW;
   constexpr int ElemPerVec = 128 / cutlass::sizeof_bits<Type>::value;
@@ -1032,9 +1036,16 @@ __global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
   constexpr unsigned FullMask = 0xffffffffu;
 
   int const lane = threadIdx.x % 32;
-  int64_t const tokenIdx = static_cast<int64_t>(blockIdx.x) * WarpsPerBlock + threadIdx.x / 32;
+  int64_t tokenIdx = static_cast<int64_t>(blockIdx.x) * WarpsPerBlock + threadIdx.x / 32;
   if (tokenIdx >= params.numTokens) {
     return;
+  }
+  if constexpr (SingleExpertTokensDone) {
+    // The tokens left are typically consecutive (rows without a local expert are packed at the
+    // end of each source rank's block); a stride coprime to numTokens spreads them over the CTAs.
+    if (params.numTokens % FINALIZE_TOKEN_SPREAD_STRIDE != 0) {
+      tokenIdx = tokenIdx * FINALIZE_TOKEN_SPREAD_STRIDE % params.numTokens;
+    }
   }
   int64_t const numVecs = params.hiddenDim / ElemPerVec;
   int64_t const numVecsPadded = params.hiddenDimPadded / ElemPerVec;
@@ -1063,6 +1074,20 @@ __global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
   }
   unsigned const localMask = __ballot_sync(FullMask, permutedIdx != -1);
   auto* outVecPtr = reinterpret_cast<VecElem*>(params.outPtr + tokenIdx * params.hiddenDim);
+  if constexpr (SingleExpertTokensDone) {
+    int const numLocal = __popc(localMask);
+    if (numLocal == 0) {
+      VecElem zero;
+      zero.fill(Type(0.f));
+      for (int64_t vec = vecBegin + lane; vec < vecEnd; vec += 32) {
+        outVecPtr[vec] = zero;
+      }
+    }
+    if (numLocal <= 1) {
+      return;
+    }
+  }
+
   // Warp-uniform bound: every lane takes part in the shuffles below, and the lanes past the end of
   // the slice skip their loads and stores.
   for (int64_t stepBegin = vecBegin; stepBegin < vecEnd; stepBegin += vecsPerStep) {
@@ -1099,6 +1124,21 @@ __global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
       }
     }
   }
+}
+
+template <typename KernelParams>
+__global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
+    finalizeKernelWarpPerToken(KernelParams params) {
+  finalizeWarpPerToken<KernelParams, /*SingleExpertTokensDone=*/false>(params);
+}
+
+// Finalize after a GEMM whose epilogue stored each token with exactly one local expert straight
+// into the output, scaled by its expert weight: writes the zero rows of tokens without a local
+// expert and reduces the tokens with several.
+template <typename KernelParams>
+__global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
+    finalizeKernelMultiExpertTokens(KernelParams params) {
+  finalizeWarpPerToken<KernelParams, /*SingleExpertTokensDone=*/true>(params);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1280,7 +1320,35 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Grid of the warp-per-token kernels: one warp per token, and row slices over blockIdx.y. Each row
+// splits into slices of stepsPerSlice steps, enough of them to reach FINALIZE_WARP_MIN_WARPS warps.
+// Only slices that hold steps are launched, and the kernel derives the same stepsPerSlice from
+// their number.
+dim3 warpPerTokenGrid(Data const& data, int elemPerVec) {
+  int const warpsPerBlock = FINALIZE_WARP_THREADS / 32;
+  int const vecsPerStep = 32 * FINALIZE_WARP_VECS;
+  int const numSteps = (data.hiddenDim / elemPerVec + vecsPerStep - 1) / vecsPerStep;
+  int const maxSlices =
+      std::min(numSteps, (FINALIZE_WARP_MIN_WARPS + data.numTokens - 1) / data.numTokens);
+  int const stepsPerSlice = (numSteps + maxSlices - 1) / maxSlices;
+  int const numSlices = (numSteps + stepsPerSlice - 1) / stepsPerSlice;
+  return dim3((data.numTokens + warpsPerBlock - 1) / warpsPerBlock, numSlices);
+}
+
 void run(Data const& data, void* stream) {
+  if (data.mSingleExpertTokensDone) {
+    int const elemPerVec = data.mDtypeElt == tg::Dtype::E4m3 ? 16 : 8;
+    FLASHINFER_CHECK(!data.mUseDeepSeekFp8 && data.inPtr2 == nullptr &&
+                         data.hiddenDim % elemPerVec == 0 &&
+                         data.hiddenDimPadded % elemPerVec == 0 && data.topK <= 32,
+                     "Finalize of multi-expert tokens needs one input, 128-bit aligned rows "
+                     "and topK <= 32");
+    LAUNCH_EXPW(LAUNCH_FINALIZE_SINGLE_INPUT_PDL, data, finalizeKernelMultiExpertTokens, 1,
+                warpPerTokenGrid(data, elemPerVec),
+                /*numThreads=*/FINALIZE_WARP_THREADS, 0, stream);
+    return;
+  }
   if (data.mUseDeepSeekFp8) {
     FLASHINFER_CHECK(data.inPtr2 == nullptr,
                      "DeepSeek FP8 finalize does not support a second input");
@@ -1326,19 +1394,8 @@ void run(Data const& data, void* stream) {
       dim3 numBlocks(numBlocksX, numBlocksY);
       LAUNCH_TOPK_EXPW(data, finalizeKernel, numBlocks, numThreads, 0, stream);
     } else if (vectorWidthAligned && data.topK <= 32 && data.inPtr2 == nullptr) {
-      int const warpsPerBlock = FINALIZE_WARP_THREADS / 32;
-      int const vecsPerStep = 32 * FINALIZE_WARP_VECS;
-      int const numSteps =
-          (data.hiddenDim / finalizeElemsPerVector + vecsPerStep - 1) / vecsPerStep;
-      // Each row splits into slices of stepsPerSlice steps, enough of them to reach
-      // FINALIZE_WARP_MIN_WARPS warps. Only slices that hold steps are launched, and the kernel
-      // derives the same stepsPerSlice from their number.
-      int const maxSlices =
-          std::min(numSteps, (FINALIZE_WARP_MIN_WARPS + data.numTokens - 1) / data.numTokens);
-      int const stepsPerSlice = (numSteps + maxSlices - 1) / maxSlices;
-      int const numSlices = (numSteps + stepsPerSlice - 1) / stepsPerSlice;
-      dim3 numBlocks((data.numTokens + warpsPerBlock - 1) / warpsPerBlock, numSlices);
-      LAUNCH_EXPW(LAUNCH_FINALIZE_SINGLE_INPUT_PDL, data, finalizeKernelWarpPerToken, 1, numBlocks,
+      LAUNCH_EXPW(LAUNCH_FINALIZE_SINGLE_INPUT_PDL, data, finalizeKernelWarpPerToken, 1,
+                  warpPerTokenGrid(data, finalizeElemsPerVector),
                   /*numThreads=*/FINALIZE_WARP_THREADS, 0, stream);
     } else {
       FLASHINFER_CHECK(

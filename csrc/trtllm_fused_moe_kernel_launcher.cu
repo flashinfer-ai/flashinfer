@@ -2941,19 +2941,18 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
 
 namespace {
 
-void run_staged_moe_finalize(btg::Dtype dtype_elt, btg::Dtype dtype_exp_w, bool use_deep_seek_fp8,
-                             TensorView gemm2_output, TensorView output,
-                             Optional<TensorView> const& expert_weights,
-                             TensorView expanded_idx_to_permuted_idx,
-                             TensorView total_num_padded_tokens, int64_t num_tokens,
-                             int64_t num_experts, int64_t top_k, bool enable_pdl,
-                             bool use_routing_scales_on_input,
-                             Optional<TensorView> const& gemm2_output2) {
+void run_staged_moe_finalize(
+    btg::Dtype dtype_elt, btg::Dtype dtype_exp_w, bool use_deep_seek_fp8, TensorView gemm2_output,
+    TensorView output, Optional<TensorView> const& expert_weights,
+    TensorView expanded_idx_to_permuted_idx, TensorView total_num_padded_tokens, int64_t num_tokens,
+    int64_t num_experts, int64_t top_k, bool enable_pdl, bool use_routing_scales_on_input,
+    Optional<TensorView> const& gemm2_output2, bool single_expert_tokens_done = false) {
   moe::dev::finalize::Data finalizeData;
   finalizeData.mDtypeElt = dtype_elt;
   finalizeData.mDtypeExpW = dtype_exp_w;
   finalizeData.mUsePdl = enable_pdl;
   finalizeData.mUseDeepSeekFp8 = use_deep_seek_fp8;
+  finalizeData.mSingleExpertTokensDone = single_expert_tokens_done;
   finalizeData.inPtr = const_cast<void*>(gemm2_output.data_ptr());
   finalizeData.inPtr2 =
       gemm2_output2.has_value() ? const_cast<void*>(gemm2_output2.value().data_ptr()) : nullptr;
@@ -3307,13 +3306,14 @@ Array<Optional<Tensor>> trtllm_moe_run_routing(
   return launcher->collect_routing_outputs();
 }
 
-void trtllm_moe_run_finalize(TensorView gemm2_output, TensorView output,
-                             Optional<TensorView> const& expert_weights,
-                             TensorView expanded_idx_to_permuted_idx,
-                             TensorView total_num_padded_tokens, int64_t num_tokens,
-                             int64_t num_experts, int64_t top_k, int64_t hidden_size,
-                             bool enable_pdl, bool use_routing_scales_on_input,
-                             Optional<TensorView> const& gemm2_output2) {
+// Checks the tensors and extents of a BF16 staged finalize; false when there is no token to
+// finalize.
+static bool check_staged_moe_finalize_args(TensorView gemm2_output, TensorView output,
+                                           Optional<TensorView> const& expert_weights,
+                                           TensorView expanded_idx_to_permuted_idx,
+                                           TensorView total_num_padded_tokens, int64_t num_tokens,
+                                           int64_t num_experts, int64_t top_k, int64_t hidden_size,
+                                           Optional<TensorView> const& gemm2_output2) {
   TVM_FFI_ICHECK_GE(num_tokens, 0) << "Staged MoE finalize: num_tokens must be non-negative.";
   TVM_FFI_ICHECK_GT(num_experts, 0) << "Staged MoE finalize: num_experts must be positive.";
   TVM_FFI_ICHECK_GT(top_k, 0) << "Staged MoE finalize: top_k must be positive.";
@@ -3371,7 +3371,7 @@ void trtllm_moe_run_finalize(TensorView gemm2_output, TensorView output,
         << "Staged MoE finalize: both inputs must have the same padded hidden size.";
   }
   if (num_tokens == 0) {
-    return;
+    return false;
   }
 
   TVM_FFI_ICHECK_EQ(expanded_idx_to_permuted_idx.dtype(), dl_int32)
@@ -3405,12 +3405,48 @@ void trtllm_moe_run_finalize(TensorView gemm2_output, TensorView output,
     TVM_FFI_ICHECK_EQ(weights.numel(), expanded_count)
         << "Staged MoE finalize: expert_weights must have num_tokens * top_k entries.";
   }
+  return true;
+}
 
+void trtllm_moe_run_finalize(TensorView gemm2_output, TensorView output,
+                             Optional<TensorView> const& expert_weights,
+                             TensorView expanded_idx_to_permuted_idx,
+                             TensorView total_num_padded_tokens, int64_t num_tokens,
+                             int64_t num_experts, int64_t top_k, int64_t hidden_size,
+                             bool enable_pdl, bool use_routing_scales_on_input,
+                             Optional<TensorView> const& gemm2_output2) {
+  if (!check_staged_moe_finalize_args(gemm2_output, output, expert_weights,
+                                      expanded_idx_to_permuted_idx, total_num_padded_tokens,
+                                      num_tokens, num_experts, top_k, hidden_size, gemm2_output2)) {
+    return;
+  }
   run_staged_moe_finalize(btg::Dtype::Bfloat16, expert_weights_dtype(expert_weights),
                           /*use_deep_seek_fp8=*/false, gemm2_output, output, expert_weights,
                           expanded_idx_to_permuted_idx, total_num_padded_tokens, num_tokens,
                           num_experts, top_k, enable_pdl, use_routing_scales_on_input,
                           gemm2_output2);
+}
+
+// Finalize after an FC2 whose epilogue already stored each token with exactly one local expert
+// in `output`, scaled by its expert weight: zero rows for tokens without a local expert and the
+// weighted sum of `gemm2_output` rows for tokens with several.
+void trtllm_moe_run_finalize_multi_expert_tokens(
+    TensorView gemm2_output, TensorView output, TensorView expert_weights,
+    TensorView expanded_idx_to_permuted_idx, TensorView total_num_padded_tokens, int64_t num_tokens,
+    int64_t num_experts, int64_t top_k, int64_t hidden_size, bool enable_pdl) {
+  if (!check_staged_moe_finalize_args(gemm2_output, output, expert_weights,
+                                      expanded_idx_to_permuted_idx, total_num_padded_tokens,
+                                      num_tokens, num_experts, top_k, hidden_size,
+                                      /*gemm2_output2=*/Optional<TensorView>())) {
+    return;
+  }
+  run_staged_moe_finalize(btg::Dtype::Bfloat16, expert_weights_dtype(expert_weights),
+                          /*use_deep_seek_fp8=*/false, gemm2_output, output, expert_weights,
+                          expanded_idx_to_permuted_idx, total_num_padded_tokens, num_tokens,
+                          num_experts, top_k, enable_pdl,
+                          /*use_routing_scales_on_input=*/false,
+                          /*gemm2_output2=*/Optional<TensorView>(),
+                          /*single_expert_tokens_done=*/true);
 }
 
 void trtllm_moe_run_deepseek_fp8_activation(
@@ -7160,6 +7196,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_run_routing_fp8_block_scale,
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_run_deepseek_fp8_activation,
                               trtllm_moe_run_deepseek_fp8_activation);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_run_finalize, trtllm_moe_run_finalize);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_run_finalize_multi_expert_tokens,
+                              trtllm_moe_run_finalize_multi_expert_tokens);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp8_per_tensor_scale_moe, trtllm_fp8_per_tensor_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp8_per_tensor_scale_routed_moe,
                               trtllm_fp8_per_tensor_scale_routed_moe);
