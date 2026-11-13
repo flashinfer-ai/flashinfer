@@ -23,32 +23,35 @@
 #include <climits>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <vector>
 
 #include "scheduler.cuh"
 
-// Helper function to check NVRTC errors
-#define CHECK_NVRTC(call)                                                       \
-  do {                                                                          \
-    nvrtcResult result = call;                                                  \
-    if (result != NVRTC_SUCCESS) {                                              \
-      std::cerr << "NVRTC error: " << nvrtcGetErrorString(result) << std::endl; \
-      exit(1);                                                                  \
-    }                                                                           \
+// Report NVRTC and CUDA driver errors as C++ exceptions. These used to call
+// exit(1), which ended the Python process without unwinding: pytest exited 1
+// without writing its JUnit XML and the failing test was never reported. TVM-FFI
+// turns the exception into a Python RuntimeError on the calling test instead.
+#define CHECK_NVRTC(call)                                                                   \
+  do {                                                                                      \
+    nvrtcResult result = call;                                                              \
+    if (result != NVRTC_SUCCESS) {                                                          \
+      throw std::runtime_error(std::string("NVRTC error: ") + nvrtcGetErrorString(result) + \
+                               " (" #call ") at " __FILE__ ":" + std::to_string(__LINE__)); \
+    }                                                                                       \
   } while (0)
 
-// Helper function to check CUDA driver errors
-#define CHECK_CUDA(call)                                        \
-  do {                                                          \
-    CUresult result = call;                                     \
-    if (result != CUDA_SUCCESS) {                               \
-      const char* error_string;                                 \
-      cuGetErrorString(result, &error_string);                  \
-      std::cerr << "CUDA error: " << error_string << std::endl; \
-      exit(1);                                                  \
-    }                                                           \
+#define CHECK_CUDA(call)                                                                    \
+  do {                                                                                      \
+    CUresult result = call;                                                                 \
+    if (result != CUDA_SUCCESS) {                                                           \
+      const char* error_string = "unknown CUDA driver error";                               \
+      cuGetErrorString(result, &error_string);                                              \
+      throw std::runtime_error(std::string("CUDA driver error: ") + error_string +          \
+                               " (" #call ") at " __FILE__ ":" + std::to_string(__LINE__)); \
+    }                                                                                       \
   } while (0)
 
 namespace deep_gemm::jit {

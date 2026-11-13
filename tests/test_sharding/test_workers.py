@@ -350,3 +350,42 @@ xml_path.write_text(
 
     assert result.status == "infrastructure"
     assert "pytest output reader failed" in result.diagnostic
+
+
+def test_exit_without_junit_reports_exit_code_node_and_log_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A native library that calls exit(1) mid-test ends pytest with its
+    # ordinary failure code before it writes JUnit XML.
+    _install_fake_pytest(
+        tmp_path,
+        monkeypatch,
+        """\
+import json
+import os
+import sys
+from pathlib import Path
+
+arguments = sys.argv[1:]
+selection = next(value.split("=", 1)[1] for value in arguments if value.startswith("--flashinfer-node-file="))
+nodeid = json.loads(Path(selection).read_text(encoding="utf-8"))[0]
+print(
+    '@@flashinfer-pytest-event@@ ' + json.dumps(
+        {"event": "start", "nodeid": nodeid, "started_at": 0.0}
+    ),
+    flush=True,
+)
+print("CUDA error: native failure from the kernel library", flush=True)
+os._exit(1)
+""",
+    )
+
+    result = execute_batch(_fake_batch_request(tmp_path))
+
+    assert result.status == "infrastructure"
+    assert "pytest did not produce JUnit XML (exit code 1;" in result.diagnostic
+    assert "last started node=tests/test_sample.py::test_case" in result.diagnostic
+    console = capsys.readouterr().out
+    assert "PYTEST LOG TAIL worker=0 batch=batch-1" in console
+    assert "CUDA error: native failure from the kernel library" in console
+    assert not list((tmp_path / "junit").glob("shards/*/units/*/batches/*.xml"))
