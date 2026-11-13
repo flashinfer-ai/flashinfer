@@ -249,4 +249,8 @@ Like the vLLM scheme, this versioning scheme is similar to [SemVer](https://semv
 
 To reduce disruption during deprecation and removal, we prefer "keyword only" (after an `*`, see [PEP-3102](https://peps.python.org/pep-3102/)) for parameters that are likely to come and go (e.g. perf parameters).
 
+## Public API compatibility check
+
+The **Public API compatibility** check (`.github/workflows/pr-api-compat-gate.yml`) runs `scripts/check_pr_api_diff.py --strict` on every PR to `main` and fails when a PR removes a stable public API (a function decorated with `@flashinfer_api`, outside `flashinfer/experimental/`) or its export, or changes its signature incompatibly. It also fails when the checker cannot complete. To pass, restore compatibility, or keep the old signature working through a deprecation period. When a break is intended and has a deprecation or migration path, a maintainer can apply the `api-break-approved` label; the check re-runs and passes. Documentation findings from the same checker family stay advisory and appear in the PR Documentation Summary comment.
+
 [^1]: We have not followed this strictly through v0.4.0. But after v0.4.0, the versioning should follow this "right-shifted" versioning scheme.
