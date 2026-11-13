@@ -850,7 +850,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void combine_kernel(
 
 // ---------------------------------------------------------------------------
 // Host side. The launch heuristic below is carried verbatim from the measured
-// kernel (campaign terminal winner, H200 study re-time job 777319); only the
+// kernel (the measured agent-generated kernel's same-SKU re-time); only the
 // workspace ownership moved out of the launcher (plan-time allocation by the
 // Python dispatcher) so that `run` is CUDA-graph capturable.
 // ---------------------------------------------------------------------------
