@@ -5146,6 +5146,78 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     f"where total_tokens = qo_indptr[-1]."
                 )
 
+        if (
+            self._backend == "cudnn"
+            and not return_lse
+            and out is not None
+            and not args
+            and q_scale is None
+            and k_scale is None
+            and v_scale is None
+            and sinks is None
+            and kv_cache_sf is None
+            and skip_softmax_threshold_scale_factor is None
+            and not use_fp16_softmax
+            and not uses_spcompress
+            and not getattr(self, "_use_token_head_sf", False)
+            and self._eagle_verify_fp8kv_sm90_state is None
+            and q.dtype in (torch.float16, torch.bfloat16)
+            and k_cache.dtype == q.dtype
+            and v_cache.dtype == q.dtype
+            and out.dtype == self._cached_o_data_type
+            and self._cudnn_plan is not None
+            and self._cudnn_prepared is not None
+        ):
+            # A warm O-only call needs the same current-buffer validation and
+            # runtime graph key, but none of the generic provider/Stats setup.
+            # A cache miss or other option continues through the full path.
+            plan = self._cudnn_plan
+            actual_window = self._window_left if window_left is None else window_left
+            if (
+                actual_window == self._window_left
+                and plan.metadata.causal == self._causal
+                and plan.metadata.window_left
+                == (actual_window if actual_window >= 0 else None)
+            ):
+                check_shape_dtype_device(
+                    out,
+                    q.shape[:-1] + (v_cache.shape[-1],),
+                    self._cached_o_data_type,
+                    q.device,
+                    "out",
+                )
+                if not out.is_contiguous():
+                    raise ValueError("out must be contiguous for the cuDNN backend")
+                key, value = k_cache, v_cache
+                if self._kv_layout == "NHD":
+                    key, value = key.transpose(-3, -2), value.transpose(-3, -2)
+                scale = self._sm_scale
+                if scale is None:
+                    scale = 1.0 / math.sqrt(q.size(-1))
+                prepared = self._cudnn_prepared
+                if prepared.matches_plan(
+                    q, key, value, scale, plan, False, lse_base=lse_base
+                ):
+                    if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
+                        self._seq_lens_q = self._seq_lens_q.reshape(
+                            self._batch_size, 1, 1, 1
+                        )
+                    if self._seq_lens_kv is not None and self._seq_lens_kv.dim() == 1:
+                        self._seq_lens_kv = self._seq_lens_kv.reshape(
+                            self._batch_size, 1, 1, 1
+                        )
+                    prepared.run_planned(
+                        q,
+                        key,
+                        value,
+                        out,
+                        None,
+                        self._float_workspace_buffer,
+                        plan=plan,
+                        lse_base=lse_base,
+                    )
+                    return out
+
         if self._backend == "cute-dsl":
             if q_scale is not None or k_scale is not None or v_scale is not None:
                 raise NotImplementedError(

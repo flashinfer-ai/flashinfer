@@ -74,6 +74,20 @@ backend rejects. Provider controls need an isolated real graph cache and a
 selected-engine check. Keep lifetime/numerical tests independent of heuristic
 winners and timing thresholds.
 
+### Warm paged cuDNN calls
+
+A prepared, output-only half/BF16 call with a supplied output may skip generic
+provider and Stats setup. It still checks the current tensor metadata, output,
+window and plan key, then binds current buffers, workspace and stream through
+the same backend/FROST execution contract. Tensor identity is not a metadata
+cache key. Scales, Stats, cache misses and unsupported options keep the full path.
+
+`benchmarks/bench_cudnn_paged_warm_run.py --parent-source /tmp/parent.py`
+compares the public parent and candidate methods in one process. Export the
+trusted parent with `git show BASE:flashinfer/prefill.py > /tmp/parent.py`.
+It reports warm submission-loop and completed eager time separately, excludes
+planning/JIT and checks outputs against FA2; it is not a serving TTFT benchmark.
+
 ### Ragged lengths and masks
 
 Explicit paged cuDNN plans pass `window_left` through the common graph contract.
