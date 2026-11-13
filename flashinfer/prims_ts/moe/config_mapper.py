@@ -1652,8 +1652,20 @@ def _required_json_moe_config_pair(
                 prefer_persistent_scheduler=prefer_persistent,
                 **kwargs,
             )
-            if pair is not None:
-                break
+            if pair is None:
+                continue
+            try:
+                _ensure_pair_buildable(
+                    pair,
+                    dtype_label=dtype_label,
+                    num_tokens=num_tokens,
+                    top_k=top_k,
+                    num_experts=num_experts,
+                )
+            except ValueError:
+                pair = None
+                continue
+            return pair
     else:
         pair = _make_json_moe_config_pair(
             sm_arch=sm_arch,
