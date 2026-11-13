@@ -71,11 +71,7 @@ def make_kernel_name(*parts) -> str:
 def persist_cute_dsl_compile(
     module_name: str, key_files: Sequence[str]
 ) -> Callable[[Callable], Callable]:
-    """Persist a TVM-FFI ``cute.compile`` factory in the CuTe-DSL disk cache.
-
-    The kernel name is the function name plus every argument, so each argument
-    must be a codegen parameter that :func:`format_name_part` accepts.
-    """
+    """Persist a TVM-FFI ``cute.compile`` factory in the disk cache, keyed by every argument."""
 
     def decorator(fn: Callable) -> Callable:
         sig = inspect.signature(fn)

@@ -1,5 +1,6 @@
 """Linear-attention CuTe-DSL kernels persist through the CuTe-DSL disk cache."""
 
+import inspect
 import os
 import subprocess
 import sys
@@ -41,6 +42,48 @@ def test_persist_names_kernel_by_every_argument(monkeypatch):
         ("mod", "get_thing_16_0_bfloat16", ("a.py",)),
         ("mod", "get_thing_16_1_float32", ("a.py",)),
     ]
+
+
+_BT16_BASELINE = dict(
+    dtype=cutlass.BFloat16,
+    state_dtype=cutlass.Float32,
+    gate_dtype=cutlass.BFloat16,
+    safe_gate=True,
+    gate_lower_bound=-5.0,
+    has_state_in=True,
+    has_state_out=True,
+    has_state_ckpt=False,
+    has_state_indices=False,
+    has_checkpoint_state_indices=False,
+    mode=None,
+)
+_BT16_ALTERNATES = dict(
+    dtype=cutlass.Float16,
+    state_dtype=cutlass.BFloat16,
+    gate_dtype=cutlass.Float32,
+    safe_gate=False,
+    gate_lower_bound=-3.0,
+    has_state_in=False,
+    has_state_out=False,
+    has_state_ckpt=True,
+    has_state_indices=True,
+    has_checkpoint_state_indices=True,
+    mode="engine",
+)
+
+
+def test_chunked_bt16_name_covers_every_compile_parameter():
+    """Every ``compile`` parameter is encoded in the kernel name, and each changes it."""
+    pytest.importorskip("cutlass.experimental.cuda")
+    from flashinfer.kda_kernels import kda_chunked_bt16 as bt16
+
+    compile_params = set(inspect.signature(bt16.compile.__wrapped__).parameters)
+    name_params = set(inspect.signature(bt16._unified_kernel_name).parameters)
+    assert compile_params == name_params == set(_BT16_BASELINE)
+    baseline = bt16._unified_kernel_name(**_BT16_BASELINE)
+    for param, alternate in _BT16_ALTERNATES.items():
+        changed = bt16._unified_kernel_name(**{**_BT16_BASELINE, param: alternate})
+        assert changed != baseline, param
 
 
 _RECURRENT_KDA_SCRIPT = textwrap.dedent(

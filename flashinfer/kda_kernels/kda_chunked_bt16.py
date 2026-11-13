@@ -10307,6 +10307,35 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
     return compiled_call
 
 
+def _unified_kernel_name(
+    dtype,
+    state_dtype,
+    gate_dtype,
+    safe_gate,
+    gate_lower_bound,
+    has_state_in,
+    has_state_out,
+    has_state_ckpt,
+    has_state_indices,
+    has_checkpoint_state_indices,
+    mode,
+) -> str:
+    return make_kernel_name(
+        "unified",
+        dtype,
+        state_dtype,
+        gate_dtype,
+        safe_gate,
+        gate_lower_bound,
+        has_state_in,
+        has_state_out,
+        has_state_ckpt,
+        has_state_indices,
+        has_checkpoint_state_indices,
+        mode,
+    )
+
+
 @lru_cache(maxsize=None)
 def compile(  # noqa: A001
     dtype: type = cutlass.BFloat16,
@@ -10386,8 +10415,7 @@ def compile(  # noqa: A001
 
     unified = build_and_load_cute_dsl_kernel(
         "kda_chunked_bt16",
-        make_kernel_name(
-            "unified",
+        _unified_kernel_name(
             dtype,
             state_dtype,
             gate_dtype,
