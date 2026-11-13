@@ -71,8 +71,35 @@ def _bi_key(
             batch_invariant_version=None,
             batch_invariant_fingerprint=None,
         )
+    if dtype in ("mxfp4", "mxfp4_mxfp8"):
+        if isinstance(norm, bool) or norm != 1.0:
+            raise ValueError("batch_invariant MXFP4 requires input_norm_const=1.0")
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp4_batch_invariant import (
+            MXFP4_BATCH_INVARIANT_VERSION,
+        )
+        from flashinfer.moe_ep.batch_invariant.mxfp4_spec import (
+            spec_fingerprint as mxfp4_fingerprint,
+        )
+
+        return dict(
+            batch_invariant=True,
+            batch_invariant_version=MXFP4_BATCH_INVARIANT_VERSION
+            if version is None
+            else version,
+            batch_invariant_fingerprint=mxfp4_fingerprint(
+                hidden=hidden,
+                intermediate=intermediate,
+                top_k=topk,
+                num_experts=num_experts,
+                arch="sm_107",
+                quant_kind=dtype,
+                implementation="genphase" if variant == "genphase" else "standard",
+                apply_routing_weights_before_fc2=early,
+                gate_up_clamp=clamp,
+            ),
+        )
     if dtype != "nvfp4":
-        raise ValueError("SM107 batch_invariant cache only supports NVFP4")
+        raise ValueError("SM107 batch_invariant cache requires NVFP4 or MXFP4")
     from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
         NVFP4_BATCH_INVARIANT_VERSION,
     )
@@ -100,7 +127,23 @@ def _bi_key(
     )
 
 
-def _bi_plan_valid(knobs, variant):
+def _bi_plan_valid(knobs, variant, dtype="nvfp4"):
+    if dtype in ("mxfp4", "mxfp4_mxfp8"):
+        from types import SimpleNamespace
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp4_batch_invariant import (
+            validate_mxfp4_batch_invariant,
+        )
+
+        try:
+            validate_mxfp4_batch_invariant(
+                SimpleNamespace(batch_invariant=True, quant_kind=dtype),
+                _knobs_from_json(knobs),
+                implementation="genphase" if variant == "genphase" else "standard",
+                arch="sm_107",
+            )
+        except (TypeError, ValueError):
+            return False
+        return True
     from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
         nvfp4_batch_invariant_knobs_valid,
     )
@@ -244,7 +287,7 @@ def _matching_entries(
             for f in _KEY_FIELDS
         )
         and isinstance(e.get("knobs"), dict)
-        and (not batch_invariant or _bi_plan_valid(e["knobs"], kernel_variant))
+        and (not batch_invariant or _bi_plan_valid(e["knobs"], kernel_variant, dtype))
         and isinstance(e.get("max_tokens"), int)
         and (
             allow_nondeterministic or not e["knobs"].get("reduce_topk_in_kernel", False)
@@ -353,7 +396,7 @@ def make_record(
     input_norm_const: float = 1.0,
 ) -> Dict[str, Any]:
     """Build a tuning record shared by FlashInfer and the MegaMoE file."""
-    if batch_invariant and not _bi_plan_valid(knobs, kernel_variant):
+    if batch_invariant and not _bi_plan_valid(knobs, kernel_variant, dtype):
         raise ValueError("cannot record an inadmissible batch-invariant NVFP4 plan")
     if knobs.get("reduce_topk_in_kernel", False) and not allow_nondeterministic:
         raise ValueError(
@@ -559,12 +602,15 @@ def resolve_knobs(
     if cached is not None:
         return cached, "cache"
     if batch_invariant:
-        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
-            nvfp4_batch_invariant_default_knobs,
+        from types import SimpleNamespace
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_default_knobs,
         )
 
-        return nvfp4_batch_invariant_default_knobs(
-            "genphase" if kernel_variant == "genphase" else "standard", arch="sm_107"
+        return block_scaled_batch_invariant_default_knobs(
+            SimpleNamespace(quant_kind=dtype),
+            "genphase" if kernel_variant == "genphase" else "standard",
+            arch="sm_107",
         ), "heuristic"
     return default_knobs(
         max_tokens,

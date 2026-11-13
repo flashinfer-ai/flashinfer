@@ -74,6 +74,10 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
                 "kernel_name='sm100_mxfp8_mxfp8_bf16_cutedsl_next'."
             )
         self._kernel_config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig = config
+        if config.batch_invariant:
+            from ..common.nvfp4_batch_invariant import nvfp4_batch_invariant_arch
+
+            self._arithmetic_arch = nvfp4_batch_invariant_arch()
         if config.kernel_variant not in ("inference", "genphase"):
             raise MoEEpConfigError(
                 f"unsupported kernel_variant {config.kernel_variant!r}"
@@ -172,6 +176,16 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
         fleet_params: FleetParams,
     ) -> None:
         validate_mega_arch()
+        if self._kernel_config.batch_invariant:
+            from ..common.mxfp4_batch_invariant import validate_mxfp4_batch_invariant
+
+            if self._kernel_config.kernel_variant != "genphase":
+                raise MoEEpConfigError(
+                    "MXFP4 BI inference requires the standard provider selector"
+                )
+            validate_mxfp4_batch_invariant(
+                self._kernel_config, arch=self._arithmetic_arch
+            )
         validate_mega_fleet_params(
             fleet_params,
             bootstrap.world_size,
@@ -528,6 +542,15 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
             ),
             workspace._unfinalized_weights[:num_tokens],
             workspace._unfinalized_route_map[:num_tokens],
+        )
+
+    def batch_invariant_fingerprint(self, fleet_params):
+        if not self._kernel_config.batch_invariant:
+            return None
+        from ..common.mxfp4_batch_invariant import mxfp4_batch_invariant_fingerprint
+
+        return mxfp4_batch_invariant_fingerprint(
+            self._genphase_config(fleet_params), arch=self._arithmetic_arch
         )
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:

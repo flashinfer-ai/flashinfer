@@ -107,3 +107,22 @@ positive zero, retains every top-k slot in order and masks both operands of
 invalid routes. These branches leave ordinary execution unchanged and must
 be retained when regenerating the provider export until incorporated upstream.
 The shim admits only the certified NVFP4 geometry and arithmetic modes.
+
+## MXFP4 batch-invariant integration patch
+
+The mixed MXFP4-weight/MXFP8-E4M3-activation path additionally supports the
+opt-in batch-invariant problem field. The shim dispatches to its separate
+arithmetic policy and receipt; NVFP4 retains its existing policy and receipt.
+The mixed path uses native K32 MMA with a fixed `(256, 128, 128)` tile and
+cluster `(2, 1)` for standard inference or `(4, 1)` for GenPhase. It has no
+per-expert alpha or normalization operands. Pure MXFP4 remains outside this
+Blackwell adapter's supported set.
+
+The shared FC1 epilogue's additional integration patch fixes each block32
+amax as two ordered block16 folds, merged with the logical low half first
+on both participating warps. Explicit UE8M0 RP conversion and round-trip,
+the existing capped/masked approximate reciprocal recipe, and RN data scaling
+interpret the shared MXFP4 specification. Existing fixed-N handling, SwiGLU,
+BF16 conversion and ordered masked reduction are reused. Ordinary execution
+and the NVFP4 branches remain unchanged. Retain these additional
+FlashInfer-owned exceptions when regenerating the export until upstreamed.

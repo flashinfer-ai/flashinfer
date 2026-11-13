@@ -518,6 +518,63 @@ across batches, plans and graph replays within each class; numerical oracles
 check accuracy separately. Keep software/compiler versions and the fixed EP
 topology/expert placement with every receipt.
 
+### Batch-invariant MXFP4 MegaMoE
+
+Set `batch_invariant=True` on the existing MXFP4-weight configs. Blackwell
+SM100/SM103 supports MXFP8 E4M3 activations with MXFP4 weights
+(`quant_kind="mxfp4_mxfp8"`); Rubin SM107 additionally supports MXFP4 activations
+(`quant_kind="mxfp4"`). Both standard and GenPhase reuse their existing kernel
+folders. Blackwell mixed GenPhase uses
+`Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(kind="mxfp4_mxfp8", kernel_variant="genphase", batch_invariant=True)`;
+the dedicated `Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig` selects standard.
+Rubin uses `Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig` or
+`Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig`. Rubin GenPhase retains its
+explicit cluster `(4, 1)` and bulk FC2 requirements.
+
+The first allowlist fixes M256/N128, one paired-CTA instruction group, and
+hidden/post-activation intermediate widths divisible by 128:
+
+| Architecture | Quantization kind | Instruction K | Stage K | Standard / GenPhase cluster |
+| --- | --- | --- | --- | --- |
+| SM100/SM103 | MXFP4 weights / MXFP8 E4M3 activations | 32 | 128 | `(2, 1)` / `(4, 1)` |
+| SM107 | MXFP4 weights / MXFP8 E4M3 activations | 64 | 128 | `(2, 1)` / `(4, 1)` |
+| SM107 | MXFP4 weights / MXFP4 activations | 128 | 256 | `(2, 1)` / `(4, 1)` |
+
+Each native MMA fold keeps its initialization instruction, K order and full
+stage padding. FC1 quantization uses UE8M0 scales per 32 values, with a fixed
+logical low-half/high-half amax order, explicit round-up scale conversion,
+BF16 scale round-trip, approximate reciprocal and soft mask. BF16 input
+staging has its own specified normal-scale floor and omits that soft mask.
+BI always uses the pinned fused stager for aligned contiguous inputs; a
+prequantized caller supplies the packed data and scales directly. Hardware
+E2M1 conversion preserves negative zero, including when a negative value rounds
+to zero; a Torch numerical quantizer may encode that zero with the other sign.
+
+Only standard SwiGLU, optional clamp, early/late routing weights and separate
+BF16 ordered finalization are admitted. MX classes do not accept NVFP4's
+global normalization or per-expert alpha/norm tensors. IKR, quantized combine,
+deferred/CAKE finalization, SiTU, automatic cross-variant selection, N64/N256,
+mixed-CGA launches and non-default flag batching are rejected. Integer task
+assignment and admitted carriers may change. Blackwell standard also admits
+its existing persistent live-count finalizer; GenPhase and Rubin retain their
+existing finalization interfaces.
+
+`layer.batch_invariant_fingerprint` returns the actual receipt. The public
+query uses `fingerprint("megamoe_mxfp4", hidden=, intermediate=, top_k=,
+num_experts=, arch=, quant_kind=, implementation=,
+apply_routing_weights_before_fc2=, gate_up_clamp=)`. Quantization kind,
+architecture, implementation and routing-weight placement define distinct
+classes. Batch size, capacity and eligible scheduling choices are excluded.
+Autotune, native/managed caches and pooled workspaces keep this numerical
+identity; existing NVFP4/BF16 receipts remain unchanged.
+
+`moe_ep/batch_invariant/mxfp4_spec.py` and its independent Lean model describe
+15 ordered components. Their equality does not prove generated CUDA or remote
+publication. Device tests separately check component semantics, bitwise batch/
+plan/graph consistency and whole-operator numerical accuracy. As for NVFP4,
+keep weights, scales, routing, compiler/software versions, EP topology and
+expert placement fixed when comparing the same token across batches.
+
 ### Complete EP selection
 
 `AutoConfig` compares explicitly configured Mega and split candidates during an

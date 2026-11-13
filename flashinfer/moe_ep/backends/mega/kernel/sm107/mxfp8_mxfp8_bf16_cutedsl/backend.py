@@ -68,6 +68,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     ) -> None:
         super().__init__(config)
         self._kernel_config = config
+        self._arithmetic_arch = "sm_107"
 
     def ep_weight_pack(self, weights):
         from ..automatic import ep_weight_pack
@@ -125,6 +126,12 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         self, bootstrap: BootstrapConfig, fleet_params: FleetParams
     ) -> None:
         validate_mega_arch_sm107()
+        if getattr(self._kernel_config, "batch_invariant", False):
+            from ...sm100.common.mxfp4_batch_invariant import (
+                validate_mxfp4_batch_invariant,
+            )
+
+            validate_mxfp4_batch_invariant(self._kernel_config, arch="sm_107")
         from ......kernel_src.sm107.next_cutedsl_megamoe import require_sm107_dsl
 
         self._ensure_ep_bootstrap(bootstrap)
@@ -185,6 +192,10 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
 
     def _tuning_key(self, fleet_params: FleetParams) -> dict:
         k = self._kernel_config
+        from ...sm100.common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_version,
+        )
+
         return dict(
             dtype=k.kind,
             world_size=self.ep_world_size,
@@ -201,6 +212,21 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
             gate_up_clamp=_resolve_gate_up_clamp(k),
+            batch_invariant=getattr(k, "batch_invariant", False),
+            batch_invariant_version=block_scaled_batch_invariant_version(k)
+            if getattr(k, "batch_invariant", False)
+            else None,
+        )
+
+    def batch_invariant_fingerprint(self, fleet_params):
+        if not getattr(self._kernel_config, "batch_invariant", False):
+            return None
+        from ...sm100.common.mxfp4_batch_invariant import (
+            mxfp4_batch_invariant_fingerprint,
+        )
+
+        return mxfp4_batch_invariant_fingerprint(
+            self._resolved_config(fleet_params), arch="sm_107"
         )
 
     def live_token_buckets(self, fleet_params: FleetParams) -> list[int]:
@@ -220,6 +246,28 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         from ......kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
 
         k = self._kernel_config
+        if getattr(k, "batch_invariant", False):
+            from ...sm100.common.mxfp4_batch_invariant import (
+                mxfp4_batch_invariant_default_knobs,
+                mxfp4_batch_invariant_implementation,
+                validate_mxfp4_batch_invariant,
+            )
+
+            selected = mxfp4_batch_invariant_default_knobs(
+                mxfp4_batch_invariant_implementation(k),
+                quant_kind=k.kind,
+                arch="sm_107",
+            )
+            if isinstance(k.knobs, dict):
+                selected.update(k.knobs)
+            elif k.knobs == "cache":
+                selected.update(self._workspace_knobs(fleet_params))
+            elif k.knobs not in (None, "auto"):
+                raise MoEEpConfigError(
+                    "knobs must be None, 'cache', 'auto', or a dictionary"
+                )
+            validate_mxfp4_batch_invariant(k, selected, arch="sm_107")
+            return selected
         if k.knobs is None:
             return {}
         if isinstance(k.knobs, dict):
@@ -294,6 +342,11 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                 kind=self._kernel_config.kind,
                 num_experts=workspace.config.num_total_experts,
                 workspace=workspace,
+                **(
+                    {"batch_invariant": True}
+                    if getattr(self._kernel_config, "batch_invariant", False)
+                    else {}
+                ),
             )
             workspace.note_staged_tokens(staged)
             return
@@ -373,6 +426,8 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         fp = fleet_params
         return (
             self.kernel_name(),
+            getattr(k, "batch_invariant", False),
+            self.batch_invariant_fingerprint(fleet_params),
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,

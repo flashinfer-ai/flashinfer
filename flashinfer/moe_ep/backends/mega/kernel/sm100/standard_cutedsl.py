@@ -107,13 +107,16 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
     def validate_init(self, bootstrap, fleet_params):
         validate_mega_arch()
         if getattr(self._config, "batch_invariant", False):
-            from .common.nvfp4_batch_invariant import (
-                nvfp4_batch_invariant_arch,
-                validate_nvfp4_batch_invariant,
+            from .common.block_scaled_batch_invariant import (
+                validate_block_scaled_batch_invariant,
             )
 
+            from .common.nvfp4_batch_invariant import nvfp4_batch_invariant_arch
+
             self._arithmetic_arch = nvfp4_batch_invariant_arch()
-            validate_nvfp4_batch_invariant(self._config, arch=self._arithmetic_arch)
+            validate_block_scaled_batch_invariant(
+                self._config, arch=self._arithmetic_arch
+            )
         self._ensure_ep_bootstrap(bootstrap)
         validate_mega_fleet_params(
             fleet_params,
@@ -127,12 +130,12 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
     def _default_knobs(self, fleet):
         """Return the inherited block-scaled profile for this buffer capacity."""
         if getattr(self._config, "batch_invariant", False):
-            from .common.nvfp4_batch_invariant import (
-                nvfp4_batch_invariant_default_knobs,
+            from .common.block_scaled_batch_invariant import (
+                block_scaled_batch_invariant_default_knobs,
             )
 
-            return nvfp4_batch_invariant_default_knobs(
-                "standard", arch=self._arithmetic_arch
+            return block_scaled_batch_invariant_default_knobs(
+                self._config, "standard", arch=self._arithmetic_arch
             )
         from .....kernel_src.sm100.cutedsl_megamoe import default_knobs
 
@@ -153,18 +156,18 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
 
         k = self._config
         if getattr(k, "batch_invariant", False):
-            from .common.nvfp4_batch_invariant import (
-                nvfp4_batch_invariant_default_knobs,
-                nvfp4_batch_invariant_metadata,
-                validate_nvfp4_batch_invariant,
+            from .common.block_scaled_batch_invariant import (
+                block_scaled_batch_invariant_default_knobs,
+                block_scaled_batch_invariant_metadata,
+                validate_block_scaled_batch_invariant,
             )
 
-            knobs = nvfp4_batch_invariant_default_knobs(
-                "standard", arch=self._arithmetic_arch
+            knobs = block_scaled_batch_invariant_default_knobs(
+                self._config, "standard", arch=self._arithmetic_arch
             )
             if isinstance(k.knobs, dict):
                 knobs.update(k.knobs)
-            validate_nvfp4_batch_invariant(
+            validate_block_scaled_batch_invariant(
                 k, knobs, implementation="standard", arch=self._arithmetic_arch
             )
             return Sm100BlockScaledMoeConfig(
@@ -175,14 +178,14 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
                 intermediate=k.intermediate_size,
                 rank=self.ep_rank,
                 world_size=self.ep_world_size,
-                quant_kind="nvfp4",
+                quant_kind=self._kind(),
                 gate_up_clamp=k.gate_up_clamp
                 if k.gate_up_clamp is not None
                 else k.activation_clamp,
                 apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
                 use_persistent_finalize_kernel=self._finalize_mode(fleet)
                 is FinalizeMode.PERSISTENT,
-                **nvfp4_batch_invariant_metadata(k),
+                **block_scaled_batch_invariant_metadata(k),
                 **knobs,
             )
         mode = self._finalize_mode(fleet)
@@ -413,11 +416,13 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
     def batch_invariant_fingerprint(self, fleet_params):
         if not getattr(self._config, "batch_invariant", False):
             return None
-        from .common.nvfp4_batch_invariant import nvfp4_batch_invariant_fingerprint
+        from .common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_fingerprint,
+        )
 
         # Resolve and validate the actual pinned/cached plan before issuing a receipt.
         cfg = self._workspace_config(fleet_params)
-        return nvfp4_batch_invariant_fingerprint(cfg, arch=self._arithmetic_arch)
+        return block_scaled_batch_invariant_fingerprint(cfg, arch=self._arithmetic_arch)
 
     def _legacy_backend(self):
         from . import mxfp8_mxfp8_bf16_cutedsl, nvfp4_nvfp4_bf16_cutedsl
@@ -486,7 +491,14 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
                     batch_invariant=self._config.batch_invariant,
                 )
                 if self._kind() == "nvfp4"
-                else dict(kind=self._kind())
+                else dict(
+                    kind=self._kind(),
+                    **(
+                        {"batch_invariant": True}
+                        if getattr(self._config, "batch_invariant", False)
+                        else {}
+                    ),
+                )
             )
             # The shared stager rounds scale columns to four; the native
             # workspace keeps a wider row stride for its TMA alignment.
@@ -739,6 +751,8 @@ class StandardMxfp8Mxfp4Backend(_StandardBlockScaledBackend):
 
     def _default_knobs(self, fleet):
         """Choose MXFP4 defaults by expert fill and FC1 work per cluster."""
+        if getattr(self._config, "batch_invariant", False):
+            return super()._default_knobs(fleet)
         # Deliberately retain the validated epi flag batches (2, 4) and
         # the token-back switch at capacity 2048 from the MXFP8 profile.
         knobs = super()._default_knobs(fleet)

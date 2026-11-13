@@ -297,6 +297,32 @@ def _megamoe_nvfp4_fingerprint(
     )
 
 
+def _megamoe_mxfp4_fingerprint(
+    hidden: int,
+    intermediate: int,
+    top_k: int,
+    num_experts: int,
+    quant_kind: str = "mxfp4_mxfp8",
+    implementation: str = "standard",
+    apply_routing_weights_before_fc2: bool = True,
+    gate_up_clamp: float | None = None,
+    arch=None,
+) -> str:
+    from ..moe_ep.batch_invariant.mxfp4_spec import spec_fingerprint
+
+    return spec_fingerprint(
+        hidden,
+        intermediate,
+        top_k,
+        num_experts,
+        arch=_mx_family(arch, "megamoe_mxfp4"),
+        quant_kind=quant_kind,
+        implementation=implementation,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        gate_up_clamp=gate_up_clamp,
+    )
+
+
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
     # the unified MoE layer with `BatchInvariantBf16Config`: the routing method and the activation (gated SwiGLU / ungated
@@ -325,6 +351,18 @@ CLASSES: Dict[str, ClassInfo] = {
             "has_fc1_alpha",
             "has_fc2_alpha",
             "has_fc1_norm_const",
+            "arch",
+        ),
+    ),
+    "megamoe_mxfp4": ClassInfo(
+        "megamoe.mxfp4",
+        ("hidden", "intermediate", "top_k", "num_experts"),
+        _megamoe_mxfp4_fingerprint,
+        (
+            "quant_kind",
+            "implementation",
+            "apply_routing_weights_before_fc2",
+            "gate_up_clamp",
             "arch",
         ),
     ),
@@ -394,6 +432,15 @@ def fingerprint(op: str, **dims) -> str:
     defaults to True here. Scale values remain runtime inputs. The receipt's
     main boundary is packed NVFP4 plus scales; separate components describe
     the BF16 staging recipe. Prequantized calls supply that boundary directly.
+
+    ``megamoe_mxfp4`` uses UE8M0 block32 scales and takes ``quant_kind``
+    (``mxfp4_mxfp8`` for E2M1 weights/E4M3 activations, or Rubin-only ``mxfp4``
+    for E2M1 operands), ``implementation`` (``standard`` or ``genphase``),
+    routing-weight placement, clamp and architecture. Global scales are absent.
+    Input staging's normal-scale floor and FC1's paired amax/soft-mask recipe
+    remain separate components. UE8M0 conversion uses RP rounding and the
+    actual BF16 roundtrip; byte zero represents 2^-127. Packed/scaled operands
+    are the main boundary, as for the NVFP4 class.
 
     ``mm_bf16`` takes the weight shape ``N, K``: the K steps of the fold and the chunk count (a function of the
     weight shape alone) are the specification; M, the configuration and the weight's layout do not enter it. The

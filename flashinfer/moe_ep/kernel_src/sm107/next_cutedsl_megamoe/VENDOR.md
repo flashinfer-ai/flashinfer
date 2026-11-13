@@ -212,6 +212,26 @@ ordinary execution unchanged. They are additional FlashInfer-owned exceptions
 to the pinned export and must be retained on regeneration until upstreamed.
 The shim admits only the certified NVFP4 geometry and arithmetic modes.
 
+## MXFP4 batch-invariant integration patch
+
+Pure MXFP4 and mixed MXFP4-weight/MXFP8-E4M3-activation inference additionally
+support the opt-in batch-invariant problem field. Their shim dispatch uses
+a separate arithmetic policy and receipt; NVFP4 retains its existing identity.
+Both fix instruction N128 and use cluster `(2, 1)` for standard inference or
+`(4, 1)` for GenPhase. Mixed inference uses tile `(256, 128, 128)` and native
+K64 MMA; pure MXFP4 uses `(256, 128, 256)` and native K128 MMA. The latter's
+actual Rubin opcode is `kind::mxf4nvf4.block_scale.block32`. Neither MX format
+has per-expert alpha or normalization operands.
+
+The additional shared-epilogue patch fixes block32 amax as ordered block16
+folds and a logical low-half-first merge on both participating warps. Explicit
+UE8M0 RP conversion and round-trip, the existing capped/masked approximate
+reciprocal recipe, and RN data scaling interpret the shared MXFP4
+specification. The existing fixed-N/Gather4 mapping, SwiGLU, BF16 conversion
+and ordered masked reduction are reused. Ordinary execution and NVFP4
+branches remain unchanged. These are additional FlashInfer-owned exceptions
+to retain when regenerating the pinned export until upstreamed.
+
 ## Related trees
 
 `sm100/cutedsl_megamoe` and the SM90 drop are separate snapshots. This Rubin

@@ -72,13 +72,15 @@ def _key(config, device: str | None = None) -> dict:
     for name in ("rank", *knob_keys(config)):
         spec.pop(name)
     if getattr(config, "batch_invariant", False):
-        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
-            NVFP4_BATCH_INVARIANT_VERSION,
-            nvfp4_batch_invariant_fingerprint,
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_version,
+            block_scaled_batch_invariant_fingerprint,
         )
 
-        spec["batch_invariant_version"] = NVFP4_BATCH_INVARIANT_VERSION
-        spec["batch_invariant_fingerprint"] = nvfp4_batch_invariant_fingerprint(config)
+        spec["batch_invariant_version"] = block_scaled_batch_invariant_version(config)
+        spec["batch_invariant_fingerprint"] = block_scaled_batch_invariant_fingerprint(
+            config
+        )
     else:
         for name in (
             "batch_invariant",

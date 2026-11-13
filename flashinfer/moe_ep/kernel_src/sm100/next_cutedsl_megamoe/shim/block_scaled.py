@@ -406,17 +406,21 @@ class BlockScaledMoeConfig:
                     "GenPhase does not use token-back or token-in flag knobs."
                 )
 
-        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
-            validate_nvfp4_batch_invariant,
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+            validate_block_scaled_batch_invariant,
         )
 
         if type(self.batch_invariant) is not bool:
             raise ValueError("batch_invariant must be a bool.")
         if self.batch_invariant:
+            # NVFP4 binds three expert scalars; MX modes have no such operands.
+            expected_scalars = self.quant_kind == "nvfp4"
             for name in ("has_fc1_alpha", "has_fc2_alpha", "has_fc1_norm_const"):
-                if getattr(self, name) is not True:
-                    raise ValueError(f"batch_invariant workspace requires {name}=True.")
-        validate_nvfp4_batch_invariant(self)
+                if getattr(self, name) is not expected_scalars:
+                    raise ValueError(
+                        f"batch_invariant workspace requires {name}={expected_scalars}."
+                    )
+        validate_block_scaled_batch_invariant(self)
 
     @property
     def experts_per_rank(self) -> int:
@@ -580,12 +584,12 @@ class BlockScaledSymmBuffer:
     def batch_invariant_fingerprint(self) -> Optional[str]:
         if not self.config.batch_invariant:
             return None
-        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
-            nvfp4_batch_invariant_fingerprint,
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_fingerprint,
         )
 
         self._validate_batch_invariant_scalars()
-        return nvfp4_batch_invariant_fingerprint(self.config)
+        return block_scaled_batch_invariant_fingerprint(self.config)
 
     def _allocate_kernel_workspace(self, kernel) -> None:
         """Allocate kernel-owned storage; staging and output pointers stay stable."""
@@ -647,11 +651,11 @@ class BlockScaledSymmBuffer:
         from ..src.sources.api import ImplDesc, ProblemDesc
         from ..src.sources.quant_def import CombineFormat
 
-        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
-            validate_nvfp4_batch_invariant,
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+            validate_block_scaled_batch_invariant,
         )
 
-        validate_nvfp4_batch_invariant(cfg)
+        validate_block_scaled_batch_invariant(cfg)
         tiler = cfg.resolved_mma_tiler_mnk
         cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
         preferred_count: Optional[int] = None

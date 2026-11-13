@@ -70,6 +70,60 @@ def _batch_invariant_numerical_contract(config: MegaConfig | SplitConfig):
     from ..batch_invariant.spec import f32_bits
 
     kernel = config.megakernel
+    from ..backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.config import (
+        Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from ..backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.config import (
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from ..backends.mega.kernel.sm107.mxfp4_mxfp4_bf16_cutedsl.config import (
+        Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from ..backends.mega.kernel.sm107.mxfp8_mxfp4_bf16_cutedsl.config import (
+        Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+
+    mx_types = (
+        Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+        Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    if isinstance(kernel, mx_types):
+        from ..backends.mega.kernel.sm100.common.mxfp4_batch_invariant import (
+            MXFP4_BATCH_INVARIANT_VERSION,
+            mxfp4_batch_invariant_implementation,
+            validate_mxfp4_batch_invariant,
+        )
+
+        if type(kernel) not in mx_types:
+            raise ValueError("Unsupported batch-invariant MXFP4 configuration subclass")
+        arch = (
+            "sm_107"
+            if type(kernel)
+            in (
+                Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+                Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+            )
+            else "sm_100"
+        )
+        validate_mxfp4_batch_invariant(kernel, arch=arch)
+        clamp = (
+            kernel.gate_up_clamp
+            if kernel.gate_up_clamp is not None
+            else kernel.activation_clamp
+        )
+        return dict(
+            family=f"{arch}_{kernel.kind}_cutedsl_{mxfp4_batch_invariant_implementation(kernel)}",
+            version=MXFP4_BATCH_INVARIANT_VERSION,
+            intermediate=kernel.intermediate_size,
+            top_k=kernel.top_k,
+            activation="swiglu",
+            gate_up_clamp_bits=None if clamp is None else f32_bits(abs(clamp)),
+            scalar_presence=(False, False, False),
+            quantize_input=config.quantize_input,
+            apply_routing_weights_before_fc2=kernel.apply_routing_weights_before_fc2,
+        )
     from ..backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.config import (
         Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )

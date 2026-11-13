@@ -23,6 +23,29 @@ def _mxfp8_data_dtype(kind: str) -> torch.dtype:
     return kind_data_dtype("mxfp8_e4m3" if kind == "mxfp4_mxfp8" else kind)
 
 
+def require_batch_invariant_stage_layout(hidden_states, topk_ids, topk_weights):
+    """Admit the specified MX block32 input recipe without a Torch fallback."""
+    if (
+        not hidden_states.is_cuda
+        or hidden_states.dtype != torch.bfloat16
+        or not hidden_states.is_contiguous()
+        or hidden_states.data_ptr() % 16
+        or hidden_states.shape[1] % 128
+        or topk_ids.shape[1] > 32
+        or topk_ids.dtype not in (torch.int32, torch.int64)
+        or any(
+            not t.is_cuda or not t.is_contiguous() or t.data_ptr() % 16
+            for t in (topk_ids, topk_weights)
+        )
+        or topk_weights.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+    ):
+        raise ValueError(
+            "batch_invariant MXFP4 staging requires aligned contiguous CUDA BF16 "
+            "activations, aligned contiguous routes, hidden divisible by 128 "
+            "and top_k <= 32"
+        )
+
+
 def stage_mega_moe_inputs(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -33,6 +56,7 @@ def stage_mega_moe_inputs(
     topk_weights_out: torch.Tensor,
     *,
     kind: str = "mxfp8_e4m3",
+    batch_invariant: bool = False,
 ) -> None:
     """bf16 ``hidden_states`` → MXFP8 activation + E8M0 block scales.
 
@@ -65,6 +89,10 @@ def stage_mega_moe_inputs(
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
     mixed = kind == "mxfp4_mxfp8"
+    if batch_invariant:
+        if not mixed:
+            raise ValueError("batch_invariant MX staging requires MXFP4 weights")
+        require_batch_invariant_stage_layout(hidden_states, topk_ids, topk_weights)
     mixed_layout_supported = not mixed or (
         hidden_states.is_cuda
         and hidden_states.dtype == torch.bfloat16
@@ -77,7 +105,7 @@ def stage_mega_moe_inputs(
         and topk_weights.dtype in (torch.float16, torch.bfloat16, torch.float32)
     )
     if (
-        _use_fused_stage()
+        (batch_invariant or _use_fused_stage())
         and mixed_layout_supported
         and fused_quant_stage_supported(hidden_states, quant_type="mxfp8")
     ):
@@ -89,13 +117,17 @@ def stage_mega_moe_inputs(
             topk_ids,
             topk_weights,
             x_fp8,
-            x_sf,
+            x_sf[:, : hidden // Mxfp8BlockSize] if batch_invariant else x_sf,
             topk_idx_out,
             topk_weights_out,
             quant_type="mxfp8_e4m3" if mixed else kind,
             mxfp8_normal_scales=mixed,
+            **({"batch_invariant": True} if batch_invariant else {}),
         )
         return
+
+    if batch_invariant:
+        raise ValueError("batch_invariant MXFP4 requires the fused staging layout")
 
     data_dtype = _mxfp8_data_dtype(kind)
     activation_fp32 = hidden_states.to(torch.float32)
@@ -257,6 +289,11 @@ def stage_genphase_inputs(t, workspace, *, quantize_input: bool) -> None:
             workspace.topk_idx,
             workspace.topk_weights,
             kind=workspace.config.quant_kind,
+            **(
+                {"batch_invariant": True}
+                if getattr(workspace.config, "batch_invariant", False)
+                else {}
+            ),
         )
     else:
         from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens

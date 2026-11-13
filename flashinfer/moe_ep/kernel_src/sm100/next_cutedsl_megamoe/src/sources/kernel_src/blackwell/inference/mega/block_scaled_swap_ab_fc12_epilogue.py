@@ -29,6 +29,11 @@ from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDev
 from .....communication.token_protocol import TokenSrcMetadata
 from .....quant_def import CombineFormat, QuantKind
 from flashinfer.moe_ep.batch_invariant.nvfp4_device import PackedF32, ScalarF32
+from flashinfer.moe_ep.batch_invariant.mxfp4_device import ScalarF32 as MxScalarF32
+from flashinfer.moe_ep.batch_invariant.mxfp4_spec import (
+    half_amax as mx_half_amax,
+    quantize_half_precast as mx_quantize_half_precast,
+)
 from flashinfer.moe_ep.batch_invariant.nvfp4_spec import (
     fc1_activation, fc2_output, quantize_block_precast,
 )
@@ -254,7 +259,11 @@ class QuantImpl:
 
         half_amax = cute.make_rmem_tensor((n_blocks,), cutlass.Float32)
         for vec_block_idx in cutlass.range_constexpr(n_blocks):
-            half_amax[vec_block_idx] = self._amax_thread_fp32(in_blocks[None, vec_block_idx])
+            if cutlass.const_expr(self.batch_invariant):
+                block = in_blocks[None, vec_block_idx]
+                half_amax[vec_block_idx] = mx_half_amax(MxScalarF32, (block[0], block[1], block[2], block[3], block[4], block[5], block[6], block[7], block[8], block[9], block[10], block[11], block[12], block[13], block[14], block[15]))
+            else:
+                half_amax[vec_block_idx] = self._amax_thread_fp32(in_blocks[None, vec_block_idx])
         cute.copy(exchange_atom, cute.coalesce(half_amax), cute.coalesce(smem_intermediate[None, own_thread]))
 
         self.pair_exchange_barrier.arrive_and_wait()
@@ -265,10 +274,27 @@ class QuantImpl:
         data_blocks = []
         sf_values = []
         for vec_block_idx in cutlass.range_constexpr(n_blocks):
-            block_amax = cute.arch.fmax(half_amax[vec_block_idx], partner_amax[vec_block_idx])
-            scale_e8m0, scale_f32 = self._e8m0(block_amax)
-            sf_values.append(scale_e8m0)
-            data_blocks.append(self._scale_to_data_ssa(in_blocks[None, vec_block_idx], self._enc_mxfp8(scale_f32)))
+            if cutlass.const_expr(self.batch_invariant):
+                # Adjacent warps own the logical low/high sixteen channels.
+                # Both must use that operand order, including NaN behavior.
+                low_amax = half_amax[vec_block_idx]
+                high_amax = partner_amax[vec_block_idx]
+                if self.warp_idx % cutlass.Int32(2) != cutlass.Int32(0):
+                    low_amax = partner_amax[vec_block_idx]
+                    high_amax = half_amax[vec_block_idx]
+                block = in_blocks[None, vec_block_idx]
+                scaled_values, scale_e8m0 = mx_quantize_half_precast(
+                    MxScalarF32, (block[0], block[1], block[2], block[3], block[4], block[5], block[6], block[7], block[8], block[9], block[10], block[11], block[12], block[13], block[14], block[15]), low_amax, high_amax,
+                    quant_kind=self.quant_kind.value,
+                )
+                sf_values.append(scale_e8m0)
+                scaled = self._values_to_ssa(scaled_values, cutlass.Float32)
+                data_blocks.append(scaled.to(self.data_dtype))
+            else:
+                block_amax = cute.arch.fmax(half_amax[vec_block_idx], partner_amax[vec_block_idx])
+                scale_e8m0, scale_f32 = self._e8m0(block_amax)
+                sf_values.append(scale_e8m0)
+                data_blocks.append(self._scale_to_data_ssa(in_blocks[None, vec_block_idx], self._enc_mxfp8(scale_f32)))
         self._store_packed_blocks(data, data_blocks)
         sf.store(self._values_to_ssa(sf_values, self.scale_dtype))
         return data, sf
@@ -2291,6 +2317,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 lane_idx=self.lane_idx,
                 warp_idx=self.warp_idx,
                 pair_exchange_barrier=SwapABGatedActEpilogue.epilogue_sync_barrier(),
+                batch_invariant=self.batch_invariant,
             )
         else:
             amax_exchange = None

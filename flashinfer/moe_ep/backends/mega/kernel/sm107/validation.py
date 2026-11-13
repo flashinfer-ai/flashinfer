@@ -36,7 +36,9 @@ def make_workspace_config(
         if tuning.get(name) is None:
             tuning.pop(name, None)
     try:
-        from ..sm100.common.nvfp4_batch_invariant import nvfp4_batch_invariant_metadata
+        from ..sm100.common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_metadata,
+        )
 
         return Sm107BlockScaledMoeConfig(
             num_total_experts=fleet_params.num_experts,
@@ -55,7 +57,7 @@ def make_workspace_config(
             situ_linear_beta=k.situ_linear_beta,
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             max_sm_count=k.max_sm_count,
-            **nvfp4_batch_invariant_metadata(k),
+            **block_scaled_batch_invariant_metadata(k),
             **tuning,
         )
     except (TypeError, ValueError) as exc:

@@ -159,14 +159,16 @@ class RubinTuningProtocol:
         for key in (*KNOB_KEYS, "rank", "max_tokens_per_rank"):
             config.pop(key, None)
         if getattr(self.cfg, "batch_invariant", False):
-            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
-                NVFP4_BATCH_INVARIANT_VERSION,
-                nvfp4_batch_invariant_fingerprint,
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+                block_scaled_batch_invariant_version,
+                block_scaled_batch_invariant_fingerprint,
             )
 
-            config["batch_invariant_version"] = NVFP4_BATCH_INVARIANT_VERSION
-            config["batch_invariant_fingerprint"] = nvfp4_batch_invariant_fingerprint(
-                self.cfg, arch="sm_107"
+            config["batch_invariant_version"] = block_scaled_batch_invariant_version(
+                self.cfg
+            )
+            config["batch_invariant_fingerprint"] = (
+                block_scaled_batch_invariant_fingerprint(self.cfg, arch="sm_107")
             )
         device = None
         if torch.cuda.is_available():

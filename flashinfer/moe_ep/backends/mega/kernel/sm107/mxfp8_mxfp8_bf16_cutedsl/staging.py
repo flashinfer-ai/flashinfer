@@ -27,6 +27,7 @@ def stage_mega_moe_inputs(
     topk_weights_out: torch.Tensor,
     *,
     kind: str = "mxfp8_e4m3",
+    batch_invariant: bool = False,
     num_experts: int | None = None,
     workspace=None,
 ) -> int:
@@ -50,13 +51,26 @@ def stage_mega_moe_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
+    if batch_invariant:
+        from ...sm100.mxfp8_mxfp8_bf16_cutedsl.staging import (
+            require_batch_invariant_stage_layout,
+        )
+
+        if kind not in ("mxfp4", "mxfp4_mxfp8"):
+            raise ValueError("batch_invariant MX staging requires MXFP4 weights")
+        require_batch_invariant_stage_layout(hidden_states, topk_ids, topk_weights)
+
     fused_stage = (
-        os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0"
+        (batch_invariant or os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0")
         and hidden_states.is_cuda
         and hidden_states.is_contiguous()
         and hidden_states.data_ptr() % 16 == 0
         and hidden % 128 == 0
-        and x_sf.shape[1] == hidden // 32
+        and (
+            x_sf.shape[1] >= hidden // 32
+            if batch_invariant
+            else x_sf.shape[1] == hidden // 32
+        )
         and topk_ids.shape[1] <= 128
         and topk_ids.is_contiguous()
         and topk_weights.is_contiguous()
@@ -94,7 +108,7 @@ def stage_mega_moe_inputs(
             topk_ids,
             topk_weights,
             x_fp8,
-            x_sf,
+            x_sf[:, : hidden // Mxfp8BlockSize] if batch_invariant else x_sf,
             topk_idx_out,
             topk_weights_out,
             quant_type="mxfp8_e4m3" if kind == "mxfp4_mxfp8" else kind,
@@ -103,8 +117,12 @@ def stage_mega_moe_inputs(
             fuse_tail_mask=os.environ.get("FLASHINFER_SM107_FUSED_TAIL_MASK", "1")
             != "0",
             zero_masked_scores=False,
+            **({"batch_invariant": True} if batch_invariant else {}),
         )
         return num_tokens
+
+    if batch_invariant:
+        raise ValueError("batch_invariant MXFP4 requires the fused staging layout")
 
     q, sf = (
         quantize_mxfp4_block32(hidden_states.to(torch.float32))

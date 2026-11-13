@@ -48,11 +48,13 @@ def is_valid_sm100_genphase_knobs(knobs: dict[str, Any], config: Any) -> bool:
             return False
     try:
         if getattr(config, "batch_invariant", False):
-            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
-                validate_nvfp4_batch_invariant,
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+                validate_block_scaled_batch_invariant,
             )
 
-            validate_nvfp4_batch_invariant(config, knobs, implementation="genphase")
+            validate_block_scaled_batch_invariant(
+                config, knobs, implementation="genphase"
+            )
         dataclasses.replace(config, **knobs)
     except (TypeError, ValueError):
         return False
@@ -73,7 +75,7 @@ def default_sm100_genphase_knobs(
         _effective_sms(config, sm_count)
         _live_tokens(config, live_tokens)
         return dict(
-            mma_tiler_mnk=(256, 128, 256),
+            mma_tiler_mnk=config.resolved_mma_tiler_mnk,
             cluster_shape_mn=(4, 1),
             schedule_policy=("grouped", None),
         )
@@ -193,11 +195,13 @@ def is_valid_sm100_knobs(knobs, config):
         raise ValueError(f"unknown Blackwell standard knob keys: {sorted(unknown)}")
     try:
         if getattr(config, "batch_invariant", False):
-            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
-                validate_nvfp4_batch_invariant,
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+                validate_block_scaled_batch_invariant,
             )
 
-            validate_nvfp4_batch_invariant(config, knobs, implementation="standard")
+            validate_block_scaled_batch_invariant(
+                config, knobs, implementation="standard"
+            )
         dataclasses.replace(config, **knobs)
     except (TypeError, ValueError):
         return False

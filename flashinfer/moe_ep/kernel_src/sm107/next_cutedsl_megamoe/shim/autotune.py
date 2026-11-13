@@ -100,11 +100,11 @@ def is_valid_sm107(knobs: Dict[str, Any], base_config: Any) -> bool:
         raise ValueError(f"unknown SM107 knob keys: {sorted(unknown)}")
     try:
         if getattr(base_config, "batch_invariant", False):
-            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
-                validate_nvfp4_batch_invariant,
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+                validate_block_scaled_batch_invariant,
             )
 
-            validate_nvfp4_batch_invariant(base_config, knobs, arch="sm_107")
+            validate_block_scaled_batch_invariant(base_config, knobs, arch="sm_107")
         dataclasses.replace(base_config, **knobs)
     except (ValueError, TypeError):
         return False
@@ -143,16 +143,23 @@ def sm107_candidates(
     makes the output accumulation order nondeterministic; it stays opt-in.
     """
     if batch_invariant:
-        if quant_kind != "nvfp4" or allow_in_kernel_fc2_reduce:
+        if (
+            quant_kind not in ("nvfp4", "mxfp4", "mxfp4_mxfp8")
+            or allow_in_kernel_fc2_reduce
+        ):
             raise ValueError(
-                "batch_invariant SM107 candidates require NVFP4 without in-kernel reduction"
+                "batch_invariant SM107 candidates require an admitted block-scaled kind without in-kernel reduction"
             )
-        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
-            nvfp4_batch_invariant_default_knobs,
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_default_knobs,
         )
 
-        base = nvfp4_batch_invariant_default_knobs(
-            "genphase" if kernel_variant == "genphase" else "standard", arch="sm_107"
+        from types import SimpleNamespace
+
+        base = block_scaled_batch_invariant_default_knobs(
+            SimpleNamespace(quant_kind=quant_kind),
+            "genphase" if kernel_variant == "genphase" else "standard",
+            arch="sm_107",
         )
         if kernel_variant == "genphase":
             return [

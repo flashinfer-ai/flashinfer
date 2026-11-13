@@ -22,3 +22,5 @@ import BIKernels.MegaMoE
 import BIKernels.MegaMoECases
 import BIKernels.NVFP4MegaMoE
 import BIKernels.NVFP4MegaMoECases
+import BIKernels.MXFP4MegaMoE
+import BIKernels.MXFP4MegaMoECases
