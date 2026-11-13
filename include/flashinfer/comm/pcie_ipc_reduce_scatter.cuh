@@ -41,6 +41,7 @@
 #include <limits>
 
 #include "flashinfer/comm/pcie_ipc_common.cuh"
+#include "pcie_ipc_spin_guard.cuh"
 
 namespace flashinfer {
 namespace comm {
@@ -322,7 +323,9 @@ __device__ __forceinline__ void block_mask_barrier(const KernelParams& params,
           value);
       const uint32_t* self_flag =
           self + params.flag_base_word + barrier_record(params, flag_slot, blockIdx.x, peer);
+      SpinGuard spin_guard("block_mask_barrier::wait");
       while (ipc::generation_pending(ipc::load_acquire_system_u32(self_flag), value)) {
+        spin_guard.tick(peer);
       }
     }
   }
