@@ -931,7 +931,9 @@ def autotune(
         tune_mode: If ``True``, profile uncovered shapes during execution.
             If ``False``, only use cached/loaded configs (no profiling).
         cache: Optional path to a JSON config file.
-            On entry, configs are loaded from this file (if it exists).
+            On entry, configs are loaded from this file (if it exists) and
+            added to those already loaded in this process; for a key
+            present in several files, the file loaded last wins.
             On exit, configs are saved back to this file (only when
             ``tune_mode=True``).
         tuning_buckets: Optional sequence of integer measurement points.
@@ -1082,15 +1084,19 @@ def autotune(
     if tie_tolerance is not None and not 0 <= tie_tolerance < 1:
         raise ValueError("tie_tolerance must be at least 0 and less than 1")
 
-    # Load configs from cache file on entry (if it exists).  A file with
-    # mismatched metadata is ignored here; whether it may be overwritten on
-    # exit is decided by save_configs at save time (it re-reads the file,
-    # so a heal or replacement by another process is re-evaluated).
+    # Load configs from cache file on entry (if it exists).  The file's
+    # entries are added to any configs loaded earlier in this process (for
+    # a key present in several files the file loaded last wins), so a
+    # process that keeps one cache file per model, e.g. a serving engine
+    # tuning a target model and its speculative draft model, keeps serving
+    # every model's configs.  Namespaced product records are single-writer
+    # per cache path, so they are reset and then re-read from this file.
+    # A file with mismatched metadata is ignored here; whether it may be
+    # overwritten on exit is decided by save_configs at save time (it
+    # re-reads the file, so a heal or replacement by another process is
+    # re-evaluated).
     if cache is not None:
         with tuner._lock:
-            tuner._file_configs.clear()
-            tuner._file_config_policies.clear()
-            tuner._file_config_selections.clear()
             tuner._namespaced_records.clear()
             tuner._dirty_namespaces.clear()
             tuner._logged_file_hits.clear()
