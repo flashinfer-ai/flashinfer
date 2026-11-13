@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import signal
+import sys
 import time
 from contextlib import suppress
 from dataclasses import replace
@@ -264,6 +265,10 @@ def _install_fake_pytest(
     )
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="the Windows job object ends every descendant; none can escape the group",
+)
 def test_inherited_stdout_cannot_block_batch_completion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

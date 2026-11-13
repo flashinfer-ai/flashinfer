@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-import select
+import queue
 import shlex
 import subprocess
 import sys
@@ -22,6 +22,7 @@ from scripts.test_sharding.models import (
     PlanningOptions,
     Unit,
 )
+from scripts.test_sharding.processes import FORCED_TERMINATION
 from scripts.test_sharding.state import AttemptSettings
 from scripts.test_sharding.workers import BatchExecution
 
@@ -196,8 +197,9 @@ def test_help_reports_effective_argument_defaults(
     assert "--timing-profile" not in help_text
     assert "--unknown-case-seconds" not in help_text
     assert "exit codes: 0=complete without failures;" in help_text
-    assert "(default: /tmp/durations.csv.gz)" in help_text
-    assert "(default: /tmp/overheads.csv)" in help_text
+    # argparse renders the Path default, which uses native separators.
+    assert f"(default: {Path('/tmp/durations.csv.gz')})" in help_text
+    assert f"(default: {Path('/tmp/overheads.csv')})" in help_text
 
 
 def test_pytest_command_prefix_wraps_batches_and_is_frozen_in_manifest(
@@ -212,13 +214,15 @@ def test_pytest_command_prefix_wraps_batches_and_is_frozen_in_manifest(
         """\
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 Path(os.environ["PREFIX_RECORD"]).write_text(
     json.dumps(sys.argv[1:]), encoding="utf-8"
 )
-os.execv(sys.argv[1], sys.argv[1:])
+# Not os.execv: on Windows it starts a new process and exits the wrapper.
+sys.exit(subprocess.call(sys.argv[1:]))
 """,
         encoding="utf-8",
     )
@@ -433,20 +437,32 @@ def test_run_streams_current_pytest_node_before_it_finishes(tmp_path: Path) -> N
         stderr=subprocess.STDOUT,
     )
     assert process.stdout is not None
+    stdout = process.stdout
+    # A reader thread instead of select(), which only accepts sockets on Windows.
+    lines: queue.Queue[str] = queue.Queue()
+
+    def pump() -> None:
+        for line in stdout:
+            lines.put(line)
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
     captured: list[str] = []
     saw_running_node = False
     read_deadline = time.monotonic() + 15
     while process.poll() is None and time.monotonic() < read_deadline:
-        readable, _, _ = select.select([process.stdout], [], [], 0.1)
-        if not readable:
+        try:
+            line = lines.get(timeout=0.1)
+        except queue.Empty:
             continue
-        line = process.stdout.readline()
         captured.append(line)
         if "PYTEST START" in line and "test_slow.py::test_slow" in line:
             saw_running_node = process.poll() is None
             break
-    remainder, _ = process.communicate(timeout=120)
-    captured.append(remainder)
+    process.wait(timeout=120)
+    reader.join(timeout=120)
+    while not lines.empty():
+        captured.append(lines.get_nowait())
 
     assert process.returncode == 0, "".join(captured)
     assert saw_running_node, "".join(captured)
@@ -1088,7 +1104,7 @@ def test_collection_deadline_reports_that_pytest_was_killed(tmp_path: Path) -> N
     combined = result.stdout + result.stderr
     assert "PYTEST KILLED phase=collection reason=attempt-deadline" in combined
     assert "RUNNER STATUS: state=killed phase=collection" in combined
-    assert "signal=SIGKILL" in combined
+    assert f"signal={FORCED_TERMINATION}" in combined
     assert "deadline_elapsed=" in combined
     assert "deadline=1s" in combined
     assert len(list((tmp_path / "junit").glob("collection-*/*.log"))) == 1
@@ -1400,14 +1416,26 @@ def test_gpu_sharing_respects_gpu_host_and_runner_exclusivity(tmp_path: Path) ->
     state = tmp_path / "gpu-state"
     state.mkdir()
     source = """\
-import fcntl
 import json
 import os
+import sys
 import time
 from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
+
+if sys.platform == "win32":
+    import portalocker
+
+    LOCK_EX, LOCK_SH, LOCK_NB = (
+        portalocker.LOCK_EX, portalocker.LOCK_SH, portalocker.LOCK_NB
+    )
+
+    def flock(file, flags):
+        portalocker.lock(file, flags)
+else:
+    from fcntl import LOCK_EX, LOCK_NB, LOCK_SH, flock
 
 MODE = {mode!r}
 if MODE == "both":
@@ -1421,14 +1449,14 @@ def reserve_memory():
     device = os.environ["CUDA_VISIBLE_DEVICES"]
     with ExitStack() as stack:
         host_lock = stack.enter_context((state / "runner.lock").open("a"))
-        host_mode = fcntl.LOCK_EX if MODE == "node_exclusive" else fcntl.LOCK_SH
-        fcntl.flock(host_lock, host_mode | fcntl.LOCK_NB)
+        host_mode = LOCK_EX if MODE == "node_exclusive" else LOCK_SH
+        flock(host_lock, host_mode | LOCK_NB)
         if MODE in ("host_memory_heavy", "both"):
             heavy_lock = stack.enter_context((state / "host-heavy.lock").open("a"))
-            fcntl.flock(heavy_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            flock(heavy_lock, LOCK_EX | LOCK_NB)
         with (state / (device + ".lock")).open("a") as gpu_lock:
-            gpu_mode = fcntl.LOCK_EX if MODE in ("node_exclusive", "gpu_exclusive", "both") else fcntl.LOCK_SH
-            fcntl.flock(gpu_lock, gpu_mode | fcntl.LOCK_NB)
+            gpu_mode = LOCK_EX if MODE in ("node_exclusive", "gpu_exclusive", "both") else LOCK_SH
+            flock(gpu_lock, gpu_mode | LOCK_NB)
             start = time.time()
             if MODE == "shared":
                 (state / "light-seen").touch()
@@ -1553,6 +1581,9 @@ def test_worker_port():
         ("65535", (), 4),
         ("65535", ("--dist_init_method=tcp://localhost:41000",), 0),
     ],
+)
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="tests/comm conftest requires POSIX multi-GPU stack"
 )
 def test_comm_conftest_validates_sibling_master_port(
     master_port: str, extra: tuple[str, ...], expected_returncode: int

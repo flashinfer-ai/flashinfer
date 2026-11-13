@@ -24,7 +24,7 @@ from .junit import (
 )
 from .models import RUNTIME_TIMING_PROFILE, CollectedNode, Plan, PlanningOptions, Unit
 from .planner import build_plan, capacity_metrics, source_affine_unit_bins
-from .processes import terminate_process_group
+from .processes import start_process_group, terminate_process_group
 from .scheduling import ResourceQueue
 from .state import (
     AttemptRecord,
@@ -380,13 +380,12 @@ def _collect_partition(
         *(str(path) for path in targets),
     ]
     with log_path.open("wb") as log:
-        process = subprocess.Popen(
+        process = start_process_group(
             command,
             cwd=repo_root,
             env=env,
             stdout=log,
             stderr=subprocess.STDOUT,
-            start_new_session=True,
         )
         _wait_for_collection(
             process,

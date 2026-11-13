@@ -7,19 +7,29 @@ import sys
 import time
 from contextlib import suppress
 
-from scripts.test_sharding.processes import terminate_process_group
+from scripts.test_sharding.processes import (
+    FORCED_TERMINATION,
+    start_process_group,
+    terminate_process_group,
+)
+
+# The graceful request is SIGTERM on POSIX and CTRL_BREAK_EVENT (SIGBREAK) on
+# Windows. The leader exits on it; its child ignores it so only the forced
+# group kill can end the child.
+_GRACEFUL_SIGNAL = "SIGBREAK" if sys.platform == "win32" else "SIGTERM"
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
 def _spawn_process_group() -> subprocess.Popen[str]:
-    return subprocess.Popen(
+    return start_process_group(
         [
             sys.executable,
             "-c",
             (
                 "import os, signal, subprocess, sys, time; "
-                "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); "
+                f"signal.signal(signal.{_GRACEFUL_SIGNAL}, lambda *_: sys.exit(0)); "
                 "child = subprocess.Popen([sys.executable, '-c', "
-                "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                f"'import signal,time; signal.signal(signal.{_GRACEFUL_SIGNAL}, signal.SIG_IGN); "
                 'print("ready", flush=True); time.sleep(30)\'], '
                 "stdout=subprocess.PIPE, text=True); "
                 "child.stdout.readline(); "
@@ -29,7 +39,6 @@ def _spawn_process_group() -> subprocess.Popen[str]:
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        start_new_session=True,
         text=True,
     )
 
@@ -40,8 +49,9 @@ def _child_pid(process: subprocess.Popen[str]) -> int:
 
 
 def _kill_if_alive(pid: int) -> None:
-    with suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGKILL)
+    # Windows raises a generic OSError for a process that already exited.
+    with suppress(OSError):
+        os.kill(pid, _SIGKILL)
 
 
 def test_termination_grace_applies_to_descendants_after_leader_exits() -> None:
@@ -58,12 +68,14 @@ def test_termination_grace_applies_to_descendants_after_leader_exits() -> None:
     elapsed = time.monotonic() - started
     assert elapsed >= 0.20
     assert elapsed < 2
-    assert termination_signal == "SIGKILL"
+    assert termination_signal == FORCED_TERMINATION
 
 
 def test_termination_cleans_group_after_leader_already_exited() -> None:
     process = _spawn_process_group()
     child_pid = _child_pid(process)
+    # On Windows this is TerminateProcess on the leader alone; the child stays
+    # in the leader's job, which is what the group cleanup must still reach.
     os.kill(process.pid, signal.SIGTERM)
     process.wait(timeout=5)
     try:
@@ -71,4 +83,4 @@ def test_termination_cleans_group_after_leader_already_exited() -> None:
     finally:
         _kill_if_alive(child_pid)
 
-    assert termination_signal == "SIGKILL"
+    assert termination_signal == FORCED_TERMINATION
