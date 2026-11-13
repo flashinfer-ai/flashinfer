@@ -182,5 +182,50 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
     assert cos_sim > 0.99
 
 
+@pytest.mark.parametrize(
+    "b, m, n, k, layout",
+    [
+        (1, 1, 10304, 2688, "tma"),  # decode M, N not a multiple of 128
+        (2, 300, 4096, 1024, "tma"),  # prefill M, batched
+        (1, 4, 2048, 1000, "fallback"),  # K % 16 != 0
+        (1, 4, 2044, 1024, "fallback"),  # N % 8 != 0
+    ],
+)
+def test_bmm_fp8_cutlass_sm120_tactics(b, m, n, k, layout):
+    # Regression anchor for the SM120 CUTLASS runner: every tactic of the per-tensor
+    # kernel, and the groupwise fallback for inputs that kernel cannot take. The
+    # fuzzer only runs the default tactic and the autotune winner.
+    if get_compute_capability(torch.device("cuda"))[0] != 12:
+        pytest.skip("SM120/SM121 only")
+    from flashinfer.gemm.gemm_base import (
+        DEFAULT_WORKSPACE_SIZE,
+        _get_cache_buf,
+        _sm120_fp8_gemm_tma_path_supported,
+        get_gemm_sm120_module_cutlass_fp8,
+    )
+
+    torch.manual_seed(0)
+    input = torch.randn([b, m, k], device="cuda", dtype=torch.bfloat16)
+    input_fp8, input_inv_s = to_float8(input, dtype=torch.float8_e4m3fn)
+    mat2 = torch.randn([b, n, k], device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
+    mat2_fp8, mat2_inv_s = to_float8(mat2, dtype=torch.float8_e4m3fn)
+    reference = torch.bmm(
+        input_fp8.to(torch.bfloat16), mat2_fp8.to(torch.bfloat16)
+    ).float() * (input_inv_s * mat2_inv_s)
+
+    res = torch.empty([b, m, n], device="cuda", dtype=torch.bfloat16)
+    workspace = _get_cache_buf("bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, res.device)
+    inputs = [input_fp8, mat2_fp8, input_inv_s, mat2_inv_s, res, workspace]
+    assert _sm120_fp8_gemm_tma_path_supported(*inputs[:5]) == (layout == "tma")
+
+    runner = get_gemm_sm120_module_cutlass_fp8().cutlass_fp8_gemm_runner()
+    tactics = runner.get_valid_tactics(inputs, None)
+    assert len(tactics) > 1 if layout == "tma" else tactics == [-1]
+    for tactic in [-1] + tactics:
+        res.fill_(float("nan"))
+        runner.forward(inputs, tactic=tactic)
+        torch.testing.assert_close(res.float(), reference, rtol=2e-2, atol=2e-2)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
