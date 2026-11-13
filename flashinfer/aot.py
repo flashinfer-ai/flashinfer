@@ -103,6 +103,7 @@ from .jit.cake_megamoe_topk_reduce import gen_cake_megamoe_topk_reduce_module
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.cudnn_frost import FROST_DTYPES, gen_cudnn_frost_moe_module
+from .jit.fused_qk_norm_rope import gen_fused_qk_norm_rope_module
 from .jit.fused_moe import (
     gen_alphamoe_fused_router_module,
     gen_alphamoe_sm100_module,
@@ -1173,6 +1174,7 @@ def gen_all_modules(
             gen_api_log_stats_module(),
             gen_cascade_module(),
             gen_mhc_module(),
+            gen_fused_qk_norm_rope_module(),
             gen_norm_module(),
             gen_page_module(),
             gen_quantization_module(),
