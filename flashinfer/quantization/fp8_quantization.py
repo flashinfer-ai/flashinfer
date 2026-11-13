@@ -1010,7 +1010,10 @@ def mxfp8_grouped_quantize(
         aligned. A failed launch is not retried on another backend.
 
         Outputs match across backends for finite inputs, including bfloat16
-        subnormals. A zero UE8M0 scale byte produces signed-zero payloads.
+        subnormals, except in blocks whose UE8M0 scale byte is 0 (a bfloat16
+        block amax of at most ``448 * 2**-127``): ``"cake"`` quantizes those
+        with the reciprocal ``2**127``, while ``"cutile"`` and ``"cuda"``
+        write signed-zero payloads.
         ``"cuda"`` quantizes NaN and infinities to 448, as
         :func:`mxfp8_quantize` does; blocks that hold them can differ.
 

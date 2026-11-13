@@ -151,6 +151,10 @@ class MegaKernelBackend(ABC):
         """Convert the selector's [up, gate] FC1 rows to the backend's input order."""
         return weights
 
+    def batch_invariant_fingerprint(self, fleet_params: FleetParams) -> str | None:
+        """Arithmetic receipt when the backend implements a specified BI class."""
+        return None
+
     def ep_selected_config(self, workspace):
         return self.get_tuned_config(workspace)
 
@@ -448,6 +452,20 @@ class MegaKernelBackend(ABC):
         """Run the fused kernel. ``output=None`` (cutedsl backends) returns a
         zero-copy view of the workspace output, valid under stream ordering
         until the next launch on this session's buffers."""
+
+    def _compute_prepared(
+        self,
+        workspace: Any,
+        transformed_weights: Any,
+        *,
+        output: "torch.Tensor | None",
+    ) -> "torch.Tensor":
+        """Execute immediately after the layer validates and stages a forward.
+
+        Backends may omit checks already covered by that path. Public staged
+        execution continues through ``compute``.
+        """
+        return self.compute(workspace, transformed_weights, output=output)
 
     def compute_unfinalized(
         self,
