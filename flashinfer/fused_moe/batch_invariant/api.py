@@ -22,7 +22,7 @@ import torch
 from ...gemm.batch_invariant.api import persistent_clusters, sm_count_of
 from ...gemm.batch_invariant.generator import Knobs
 from . import spec as S
-from .blocks.epilogue import GroupedChain
+from .blocks.epilogue import GroupedChain, GroupedEpilogueBlock
 from .blocks.scheduler import MAX_E
 
 _CONST: Dict[Tuple[int, int, float], torch.Tensor] = {}
@@ -203,7 +203,8 @@ def _check_grouped_operands(
     kind: str,
 ) -> Tuple[int, int, int, int, int]:
     """The grouped GEMM entries' shared operand rules (``(R, K, E, N, Tk)``): ``a [R, K]`` and ``w [E, N, K]`` of the
-    class's operand ``dtype``, K-contiguous and 16-byte-aligned (``align`` elements), one K, at most ``MAX_E`` experts,
+    class's operand ``dtype``, K-contiguous and 16-byte-aligned (``align`` elements; N and K multiples of it), one K, at
+    most ``MAX_E`` experts,
     ``Tk`` in ``[0, R]`` (the rows of ``out`` by default, else of ``a``), ``counts`` a contiguous int32 ``[E]``."""
     if a.dtype != dtype or w.dtype != dtype or a.dim() != 2 or w.dim() != 3:
         raise TypeError(f"{name} takes {kind} a [Tk, K] and w [E, N, K]")
@@ -223,9 +224,10 @@ def _check_grouped_operands(
         or a.stride(0) % align
         or w.stride(0) % align
         or K % align
+        or N % align
     ):
         raise ValueError(
-            f"{name}: K-contiguous, 16-byte-aligned operands of one K "
+            f"{name}: K-contiguous, 16-byte-aligned operands of one K (N and K multiples of {align}) "
             f"(a {tuple(a.shape)} strides {tuple(a.stride())}, w {tuple(w.shape)} strides {tuple(w.stride())})"
         )
     if (
@@ -235,6 +237,28 @@ def _check_grouped_operands(
     ):
         raise ValueError(f"{name}: counts must be a contiguous int32 [E]")
     return R, K, E, N, Tk
+
+
+def _check_grouped_chain(name: str, N: int, chain: GroupedEpilogueBlock) -> int:
+    """The chain's shape rules on ``w [E, N, K]``, as host errors before any record is consulted: a paired (gate / up) chain
+    takes whole column pairs (N a multiple of ``2 x GROUP``), and the output width (N, or N / 2 for a paired chain) is a
+    multiple of the output format's 16-byte row alignment. Returns the output width."""
+    from .blocks.compile import OUT_ALIGN_OF
+    from .blocks.epilogue import GROUP
+
+    if chain.pair and N % (2 * GROUP):
+        raise ValueError(
+            f"{name}: the paired chain {chain.describe()} takes whole gate / up column pairs; "
+            f"N = {N} is not a multiple of {2 * GROUP}"
+        )
+    n_out = N // 2 if chain.pair else N
+    oal = OUT_ALIGN_OF[chain.out_fmt]
+    if n_out % oal:
+        raise ValueError(
+            f"{name}: an output width of {n_out} {chain.out_fmt} columns is not a multiple of {oal} "
+            f"(16-byte rows); N = {N}"
+        )
+    return n_out
 
 
 def _grouped_out(
@@ -322,7 +346,7 @@ def grouped_gemm(
         if chain not in ("plain", "swiglu", "relu2"):
             raise ValueError(f"unknown chain {chain!r}")
         chain = GroupedChain.legacy(chain, _OUT[out_dtype])
-    n_out = N // 2 if chain.pair else N
+    n_out = _check_grouped_chain("grouped_gemm", N, chain)
     # the chain's output format (the gated chains convert once, to bf16)
     out = _grouped_out(
         "grouped_gemm", out, Tk, n_out, _DTYPE_OF[chain.out_fmt], a.device

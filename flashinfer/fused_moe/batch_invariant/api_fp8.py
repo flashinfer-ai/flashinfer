@@ -28,6 +28,7 @@ from ...gemm.batch_invariant.generator import Knobs
 from . import spec as S
 from .api import (
     _check_fused_inputs,
+    _check_grouped_chain,
     _check_grouped_operands,
     _grouped_out,
     combine_rows,
@@ -61,16 +62,19 @@ def weight_multipliers(w: torch.Tensor) -> torch.Tensor:
 
 
 def _scale_tensor(m, name: str, device: torch.device) -> torch.Tensor:
-    """A per-tensor multiplier as a 1-element fp32 tensor on ``device``."""
+    """A per-tensor multiplier as a 1-element fp32 tensor on ``device``: one finite, positive, normal value (its reciprocal is a
+    dequantization scale of the class, so a zero, subnormal, infinite or NaN multiplier is refused here instead of reaching the
+    kernels as an infinite or NaN scale)."""
     t = torch.as_tensor(m, dtype=torch.float32, device=device)
     if t.numel() != 1:
         raise ValueError(
             f"{CLASS}: {name} must be one fp32 value, got shape {tuple(t.shape)}"
         )
     v = float(t.reshape(-1)[0])
-    if not (v > 0.0 and v != float("inf")):
+    tiny = torch.finfo(torch.float32).tiny
+    if not (v >= tiny and v != float("inf")):
         raise ValueError(
-            f"{CLASS}: {name} must be a finite positive multiplier, got {v}"
+            f"{CLASS}: {name} must be a finite positive normal fp32 multiplier (at least {tiny:.4g}), got {v}"
         )
     return t.reshape(1).contiguous()
 
@@ -287,11 +291,12 @@ def grouped_gemm_fp8(
         or inv.numel() != 1
     ):
         raise ValueError("grouped_gemm_fp8: s_w [E] fp32, s_a and inv 1-element fp32")
+    n_out = _check_grouped_chain("grouped_gemm_fp8", N, chain)
     if not _accepted(config, N, K, E, chain):
         raise ValueError(
-            f"grouped_gemm_fp8: {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()})"
+            f"grouped_gemm_fp8: the record {config.describe()} does not implement (N={N}, K={K}, E={E}, "
+            f"{chain.describe()}); the shape's records are `all_valid_configs_fp8` / `all_valid_configs_swapped_fp8`"
         )
-    n_out = N // 2 if chain.pair else N
     out = _grouped_out(
         "grouped_gemm_fp8", out, Tk, n_out, _OUT_DTYPE[chain.out_fmt], a.device
     )

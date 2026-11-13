@@ -51,8 +51,15 @@ class BatchInvariantFp8PerTensorRunner(BatchInvariantMoeRunnerBase):
     )
     TACTIC_TAG = "moe.e4m3-v2"  # v2: the tactic carries the swapped flag
     N_WEIGHT_TENSORS = 7
+    # The class's EP form is not part of this backend: the layer's shard hint lists the runners by this flag, the shared
+    # assertion refuses a shard, and ``_check_experts`` states the refusal in the class's terms first.
+    supports_expert_parallelism = False
 
     # ---- support ---------------------------------------------------------------------------------------------------
+    def _check_support(self) -> None:
+        self._check_experts()
+        super()._check_support()
+
     def _check_experts(self) -> None:
         experts, routing = self.config.experts, self.config.routing
         if experts.local_expert_offset or (
