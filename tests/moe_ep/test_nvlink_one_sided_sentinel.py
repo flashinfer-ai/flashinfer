@@ -173,15 +173,20 @@ _DEFECTS = {
         "      atomicAdd(p.round_state + kEpoch, 1);\n",
         "",
     ),
-    8: (  # no D5 re-arm: received payload and scale vectors stay in their rows
+    8: (  # no D5 reset: received payload and scale vectors stay in their rows
         _HEADER,
         "      store_volatile(address(j), splat(kDataSentinel));\n",
         "",
     ),
-    9: (  # no C3 re-arm: received partials stay in their combine rows
+    9: (  # no C3 reset: received partials stay in their combine rows
         _HEADER,
         "if ((polled >> j) & 1u) store_volatile(address(j), splat(kDataSentinel));",
         "(void)polled;",
+    ),
+    10: (  # no D6 reset: received weights vectors stay in their rows
+        _HEADER,
+        "      store_volatile(address(kWeights), splat(kDataSentinel));\n",
+        "",
     ),
 }
 
@@ -1130,7 +1135,7 @@ def _landing_rows(comm) -> list:
     index, meta = comm._index, comm.metainfo
     bounds = [
         int(meta[getattr(index, f"SENTINEL_{name}_OFFSET_INDEX")])
-        for name in ("LANDING", "COMBINE_LANDING", "RECV")
+        for name in ("PAYLOAD_ROWS", "COMBINE_ROWS", "RECV_PAYLOAD")
     ]
     return [comm._rank_bytes[a:b] for a, b in zip(bounds[:-1], bounds[1:], strict=True)]
 
@@ -1151,7 +1156,7 @@ def _rounds_under_skew(fmt) -> list:
         auto_sentinel_max_tokens=_SKEW_LIMIT,
         timeout_sec=_SKEW_TIMEOUT_SEC,
     )
-    armed = [rows.clone() for rows in _landing_rows(sentinel)]
+    initial = [rows.clone() for rows in _landing_rows(sentinel)]
     # Every rank holds its copy before a peer's first dispatch writes into
     # these rows.
     torch.cuda.synchronize()
@@ -1183,9 +1188,9 @@ def _rounds_under_skew(fmt) -> list:
     def check(sources, static, steps, label):
         torch.cuda.synchronize()
         failures = [
-            f"{label}: {n} bytes of the {name} landing rows not re-armed"
+            f"{label}: {n} bytes of the {name} landing rows not reset"
             for name, rows, ref in zip(
-                ("dispatch", "combine"), _landing_rows(sentinel), armed, strict=True
+                ("dispatch", "combine"), _landing_rows(sentinel), initial, strict=True
             )
             if (n := (rows != ref).sum().item())
         ]
@@ -1305,10 +1310,10 @@ def test_rounds_under_rank_skew(group):
     synchronization or fence step in between, while one rank spins before its
     dispatch and one before its combine: fast ranks start round n + 1 while
     peers are still in round n (what the two sets of ids rows, the single
-    landing rows of the payload and the order of the re-arms are for). T and
+    landing rows of the payload and the order of the resets are for). T and
     routing change every round (self-routed tokens and ranks without tokens
     included), and the last rounds cross the sentinel limit. Afterwards every
-    round against the fence instance, and every landing row re-armed. In a
+    round against the fence instance, and every landing row reset. In a
     child process with a short timeout_sec, since a deadlock traps."""
     return _in_child_process(_rounds_under_skew, "bf16")
 
@@ -1510,7 +1515,7 @@ def _params(**overrides):
 _LAYOUT = SimpleNamespace(
     SENTINEL_MAX_RANKS=64,
     SENTINEL_MAX_TOP_K=22,
-    SENTINEL_IDS_SENTINEL=_IDS_SENTINEL,
+    SENTINEL_ID_ROW_SENTINEL=_IDS_SENTINEL,
     SENTINEL_FORMAT_BF16=0,
     SENTINEL_FORMAT_MXFP8=1,
     SENTINEL_FORMAT_FP8_BLOCK128=2,
