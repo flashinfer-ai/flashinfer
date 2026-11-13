@@ -120,7 +120,9 @@ releases (see [Release Versioning](#release-versioning)). When changing one:
   methods that the API diff checker does not inspect.
 
 Use [`scripts/check_pr_api_diff.py`](scripts/check_pr_api_diff.py) to compare
-decorated functions/methods, exports, and module moves. Resolve its warnings
+decorated functions/methods, exports in `flashinfer/__init__.py`, and module
+moves. It may miss removed submodule re-exports, so check old direct submodule
+imports explicitly. Resolve its warnings
 against the actual old and new runtime behavior: a warning is a potential break,
 and a clean check cannot prove semantic compatibility. Add focused regression
 tests for representative old positional and keyword calls, omitted options,
