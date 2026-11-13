@@ -42,6 +42,7 @@ class MoeRunnerInputs:
     hidden_states_scale: Optional[torch.Tensor]
     gemm1_lora_delta: Optional[torch.Tensor]
     per_token_scale: Optional[torch.Tensor]
+    token_mask: Optional[torch.Tensor] = None
 
     _FIELDS = (
         "output",
@@ -52,6 +53,7 @@ class MoeRunnerInputs:
         "hidden_states_scale",
         "gemm1_lora_delta",
         "per_token_scale",
+        "token_mask",
     )
 
     # Index of the dynamic dimension for each field.
@@ -66,6 +68,7 @@ class MoeRunnerInputs:
         "hidden_states": 0,
         "gemm1_lora_delta": 0,
         "per_token_scale": 0,
+        "token_mask": 0,
     }
 
     def to_list(self) -> List[Optional[torch.Tensor]]:
@@ -73,7 +76,9 @@ class MoeRunnerInputs:
 
     @classmethod
     def from_list(cls, lst: List) -> "MoeRunnerInputs":
-        return cls(**{name: lst[i] for i, name in enumerate(cls._FIELDS)})
+        # Older callers may still supply the original eight fields. Appended
+        # optional inputs keep their dataclass defaults when absent.
+        return cls(**dict(zip(cls._FIELDS, lst, strict=False)))
 
     @classmethod
     def idx(cls, name: str) -> int:

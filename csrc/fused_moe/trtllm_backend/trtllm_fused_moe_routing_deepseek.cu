@@ -181,6 +181,33 @@ __global__ void routingMainKernel(KernelParams params) {
   }
 #endif
 
+  // One block owns one token. Exclude both routed and fused shared slots
+  // before selecting groups; keep histogram initialization and PDL ordering.
+  if (params.mPtrTokenMask != nullptr && params.mPtrTokenMask[blockIdx.x]) {
+    if (threadIdx.x < params.mTotalExpertsPerToken) {
+      auto const expandedIdx = blockIdx.x * params.mTotalExpertsPerToken + threadIdx.x;
+      if (params.mPtrTopKPacked != nullptr) {
+        params.mPtrTopKPacked[expandedIdx] = PackedScoreIdx<OutputT>{OutputT{0.f}, -1};
+      }
+      if (params.mPtrTopKWeights != nullptr) {
+        params.mPtrTopKWeights[expandedIdx] = OutputT{0.f};
+      }
+      if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
+        params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = -1;
+      }
+    }
+    // Replay has only routed slots, unlike the expanded buffers above.
+    if (threadIdx.x < params.mTopK && params.mPtrRoutingReplayOut != nullptr) {
+      params.mPtrRoutingReplayOut[blockIdx.x * params.mTopK + threadIdx.x] = -1;
+    }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    if (params.mUsePdl) {
+      cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
+    return;
+  }
+
   if (params.mPtrScores != nullptr) {
     // get our assigned thread score; each warp represents one expert group
     float score =

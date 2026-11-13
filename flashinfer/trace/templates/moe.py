@@ -195,12 +195,15 @@ def _fp8_moe_run_experts(
     activation_type=3,
     fp8_quantization_type=1,
     use_shuffled_weight=False,
+    token_mask=None,
 ):
     """FP8 block-scale dequantization + SwiGLU + GEMM for all routing types.
 
     ``weights``   : [T, TOP_K] float32 — per-token expert weights (already normalised)
     ``topk_idx``  : [T, TOP_K] int64   — selected global expert indices
     """
+    if token_mask is not None:
+        topk_idx = topk_idx.masked_fill(token_mask[:, None], -1)
     T, H = hidden_states.shape
     E_local, gemm1_out_size, _ = gemm1_weights.shape
     I = gemm1_out_size // 2
@@ -300,6 +303,13 @@ def _fp8_moe_run_experts(
         w_e = (w_tok * match).sum(dim=1)
         output.index_add_(0, token_idx, O * w_e.unsqueeze(1))
 
+    real_output = output if token_mask is None else output[~token_mask]
+    if not torch.isfinite(real_output).all():
+        raise ValueError("MoE reference produced non-finite output for a real token")
+    # NaN marks undefined padding output so the trace checker can ignore only
+    # those rows while still validating every real token.
+    if token_mask is not None:
+        output = output.masked_fill(token_mask[:, None], float("nan"))
     return output.to(torch.bfloat16)
 
 
@@ -415,6 +425,7 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
         activation_type=activation_type,
         fp8_quantization_type=fp8_quantization_type,
         use_shuffled_weight=_unused.get("use_shuffled_weight", False),
+        token_mask=_unused.get("token_mask"),
     )
 
 
@@ -471,6 +482,7 @@ def _trtllm_fp8_block_scale_moe_default_routing_reference(
         activation_type=activation_type,
         fp8_quantization_type=fp8_quantization_type,
         use_shuffled_weight=_unused.get("use_shuffled_weight", False),
+        token_mask=_unused.get("token_mask"),
     )
 
 
@@ -528,6 +540,7 @@ def _trtllm_fp8_block_scale_moe_renormalize_routing_reference(
         activation_type=activation_type,
         fp8_quantization_type=fp8_quantization_type,
         use_shuffled_weight=_unused.get("use_shuffled_weight", False),
+        token_mask=_unused.get("token_mask"),
     )
 
 
@@ -585,6 +598,7 @@ def _trtllm_fp8_block_scale_moe_llama4_routing_reference(
         activation_type=activation_type,
         fp8_quantization_type=fp8_quantization_type,
         use_shuffled_weight=_unused.get("use_shuffled_weight", False),
+        token_mask=_unused.get("token_mask"),
     )
 
 
@@ -643,6 +657,7 @@ def _trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference(
         activation_type=activation_type,
         fp8_quantization_type=fp8_quantization_type,
         use_shuffled_weight=_unused.get("use_shuffled_weight", False),
+        token_mask=_unused.get("token_mask"),
     )
 
 
@@ -704,6 +719,7 @@ def _trtllm_fp8_block_scale_moe_topk_routing_reference(
         activation_type=activation_type,
         fp8_quantization_type=fp8_quantization_type,
         use_shuffled_weight=_unused.get("use_shuffled_weight", False),
+        token_mask=_unused.get("token_mask"),
     )
 
 
@@ -1515,6 +1531,7 @@ def _fp4_moe_run_experts(
     output1_scale_gate_scalar=None,
     output2_scale_scalar=None,
     per_token_scale=None,
+    token_mask=None,
     **_unused,
 ):
     """FP4 dequantize + gated activation + GEMM for all routing types.
@@ -1527,6 +1544,8 @@ def _fp4_moe_run_experts(
     the ratio of unpacked K to scale K.
     """
     is_mxfp4 = gemm1_weights_scale.dtype == torch.uint8
+    if token_mask is not None:
+        topk_idx = topk_idx.masked_fill(token_mask[:, None], -1)
     device = gemm1_weights.device
 
     if int(activation_type) == 7:
@@ -1667,6 +1686,11 @@ def _fp4_moe_run_experts(
         w_e = (w_tok * match).sum(dim=1)
         output.index_add_(0, token_idx, O * w_e.unsqueeze(1))
 
+    real_output = output if token_mask is None else output[~token_mask]
+    if not torch.isfinite(real_output).all():
+        raise ValueError("MoE reference produced non-finite output for a real token")
+    if token_mask is not None:
+        output = output.masked_fill(token_mask[:, None], float("nan"))
     return output.to(torch.bfloat16)
 
 
@@ -2657,8 +2681,11 @@ def _moe_bf16_run_experts(
     situ_linear_beta=None,
     clamped_relu2_limit=None,
     use_shuffled_weight=True,
+    token_mask=None,
 ):
     """Un-quantized (bf16) MoE expert computation."""
+    if token_mask is not None:
+        topk_idx = topk_idx.masked_fill(token_mask[:, None], -1)
     # Keep enum values local so the serialized reference needs only PyTorch.
     swiglu, swiglu_step, geglu_tanh, relu2, clamped_relu2 = 3, 7, 8, 6, 12
     activation_type = int(activation_type)
@@ -2752,6 +2779,11 @@ def _moe_bf16_run_experts(
         match = (topk_idx.index_select(0, token_idx) == ge).float()
         w_e = (w_tok * match).sum(dim=1)
         output.index_add_(0, token_idx, expert_out * w_e.unsqueeze(1))
+    real_output = output if token_mask is None else output[~token_mask]
+    if not torch.isfinite(real_output).all():
+        raise ValueError("MoE reference produced non-finite output for a real token")
+    if token_mask is not None:
+        output = output.masked_fill(token_mask[:, None], float("nan"))
     return output.to(torch.bfloat16)
 
 
@@ -2821,6 +2853,7 @@ def _trtllm_bf16_moe_reference(
         gemm1_clamp_limit=gemm1_clamp_limit,
         activation_type=activation_type,
         use_shuffled_weight=_unused.get("use_shuffled_weight", True),
+        token_mask=_unused.get("token_mask"),
     )
 
 
@@ -4023,6 +4056,44 @@ trtllm_fp8_block_scale_moe_trace_dispatch.templates += [  # type: ignore[attr-de
     *_STEP_MXFP8_TRACE_BY_ROUTING_TYPE.values(),
     trtllm_mxfp8_step_shared_experts_trace,
 ]
+
+
+def _masked_fp8_moe_trace_check(reference_outputs, actual_outputs, **thresholds):
+    """Check real rows; references mark undefined padding rows with NaNs."""
+    from flashinfer.trace import default_check
+
+    reference = (
+        reference_outputs[0]
+        if isinstance(reference_outputs, (tuple, list))
+        else reference_outputs
+    )
+    actual = (
+        actual_outputs[0]
+        if isinstance(actual_outputs, (tuple, list))
+        else actual_outputs
+    )
+    real = ~torch.isnan(reference).all(dim=-1)
+    if (
+        not torch.isfinite(reference[real]).all()
+        or not torch.isfinite(actual[real]).all()
+    ):
+        return False
+    return default_check(reference[real], actual[real], **thresholds)
+
+
+for _fp8_logits_trace in (
+    *trtllm_fp8_block_scale_moe_trace_dispatch.templates,  # type: ignore[attr-defined]
+    *trtllm_fp4_block_scale_moe_trace_dispatch.templates,  # type: ignore[attr-defined]
+    *trtllm_bf16_moe_trace_dispatch.templates,  # type: ignore[attr-defined]
+):
+    _fp8_logits_trace.inputs["token_mask"] = Tensor(
+        ["seq_len"],
+        dtype="bool",
+        optional=True,
+        description="True marks padding rows excluded from all expert work; output is undefined.",
+    )
+    _fp8_logits_trace.check = _masked_fp8_moe_trace_check
+
 
 for _fp8_reference in (
     _trtllm_fp8_block_scale_moe_ds_routing_reference,

@@ -37,6 +37,33 @@
 namespace moe::dev::routing {
 namespace routingCustom {
 
+// Called only after the producer dependency wait. Each lane owns one top-k slot.
+// Masked rows still participate in all block/cluster barriers; their assignments
+// use the existing -1 sentinel understood by every permutation implementation.
+template <typename KernelParams>
+__device__ __forceinline__ bool excludeMaskedToken(KernelParams const& params, int tokenIdx,
+                                                   int laneIdx) {
+  if (params.mPtrTokenMask == nullptr || !params.mPtrTokenMask[tokenIdx]) {
+    return false;
+  }
+  if (laneIdx < params.mTopK) {
+    int const expandedIdx = tokenIdx * params.mTopK + laneIdx;
+    if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
+      params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = -1;
+    }
+    if (params.mPtrTopKWeights != nullptr) {
+      params.mPtrTopKWeights[expandedIdx] = typename KernelParams::OutputT{0.f};
+    }
+    if (params.mPtrTopKPacked != nullptr) {
+      params.mPtrTopKPacked[expandedIdx] = {typename KernelParams::OutputT{0.f}, int16_t{-1}};
+    }
+    if (params.mPtrRoutingReplayOut != nullptr) {
+      params.mPtrRoutingReplayOut[expandedIdx] = -1;
+    }
+  }
+  return true;
+}
+
 #if (defined(FLASHINFER_ROUTING_CUSTOM_BLOCK_GROUP) +   \
      defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL) + \
      defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE) + \
@@ -118,6 +145,10 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     cudaTriggerProgrammaticLaunchCompletion();
   }
 #endif
+
+  if (validToken && excludeMaskedToken(params, warpIdx, laneIdx)) {
+    validToken = false;
+  }
 
   if (params.mPtrTopKIds != nullptr) {
     if (validToken) {
@@ -447,6 +478,9 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
 
   // Phase 1: TopK — one warp per token (loop when numTokens > numWarps)
   for (int tokenIdx = warpIdx; tokenIdx < params.mNumTokens; tokenIdx += numWarps) {
+    if (excludeMaskedToken(params, tokenIdx, laneIdx)) {
+      continue;
+    }
     if (params.mPtrTopKIds != nullptr) {
       if (laneIdx < params.mTopK) {
         auto const expandedIdx = tokenIdx * params.mTopK + laneIdx;
@@ -742,6 +776,13 @@ __device__ __forceinline__ void routingIndicesClusterKernelBody(
     cudaGridDependencySynchronize();
   }
 
+  if (validToken && excludeMaskedToken(params, warpTokenIdx, laneIdx)) {
+    if (laneIdx < params.mTopK) {
+      smemPackedScoreIdx[warpIdx * params.mTopK + laneIdx] = TypePacked{BaseType{0.f}, -1};
+    }
+    validToken = false;
+  }
+
   if (params.mPtrScores != nullptr) {
     BaseType warpTopKScore[KernelParams::MaxNumTopExperts];
     int32_t warpTopKExpertIdx[KernelParams::MaxNumTopExperts];
@@ -1030,6 +1071,9 @@ __global__ void __launch_bounds__(
   // in this case, each warp represents a token, and we use a grid-stride loop
   // over all warps/tokens
   for (int tokenIdx = globalWarpIdx; tokenIdx < params.mNumTokens; tokenIdx += globalWarpStride) {
+    if (excludeMaskedToken(params, tokenIdx, laneIdx)) {
+      continue;
+    }
     auto scoreOffset = tokenIdx * params.mNumExperts;
 
     BaseType laneTopKScore;
@@ -1234,6 +1278,18 @@ __global__ void __launch_bounds__(kBlockScoresKernelBlockDim)
       for (int i = threadIdx.x; i < expertCountsNum; i += blockDim.x) {
         params.mPtrExpertCounts[i] = 0;
       }
+    }
+
+    if (params.mPtrTokenMask != nullptr && params.mPtrTokenMask[tokenIdx]) {
+      if (warpIdx == 0) {
+        excludeMaskedToken(params, tokenIdx, laneIdx);
+      }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+      if (params.mUsePdl) {
+        cudaTriggerProgrammaticLaunchCompletion();
+      }
+#endif
+      return;
     }
 
     // Phase 1: block-parallel preprocess.  Dispatches on PreProc so the kernel
