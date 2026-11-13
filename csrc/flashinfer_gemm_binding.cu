@@ -17,15 +17,16 @@
 #include "tvm_ffi_utils.h"
 
 void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, TensorView B_scale,
-             TensorView workspace_buffer);
+             TensorView workspace_buffer, ffi::Optional<TensorView> bias);
 
 int64_t bmm_fp8_get_algos(TensorView A, TensorView B, TensorView D, TensorView A_scale,
                           TensorView B_scale, TensorView workspace_buffer, TensorView algo_buffer,
-                          int64_t algo_m);
+                          int64_t algo_m, ffi::Optional<TensorView> bias);
 
 int64_t bmm_fp8_run_with_descriptor(TensorView A, TensorView B, TensorView D, TensorView A_scale,
                                     TensorView B_scale, TensorView workspace_buffer,
-                                    ffi::Optional<TensorView> algo_desc);
+                                    ffi::Optional<TensorView> algo_desc,
+                                    ffi::Optional<TensorView> bias);
 
 void CutlassSegmentGEMM(TensorView workspace_buffer, TensorView all_problems, TensorView x_ptr,
                         TensorView w_ptr, TensorView y_ptr, TensorView x_ld, TensorView w_ld,

@@ -19,6 +19,7 @@
 #include <cublasLt.h>
 #include <cuda_fp8.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -268,7 +269,7 @@ struct Fp8GemmDescriptors {
   CuBlasLtMatrixLayout d_layout;
 
   Fp8GemmDescriptors(int batch_size, int m, int n, int k, const float* A_scale,
-                     const float* B_scale)
+                     const float* B_scale, const DT* bias)
       : matmul_desc(CUBLAS_COMPUTE_32F, CUDA_R_32F),
         a_layout(get_cuda_data_type<AT>(), m, k, k, true),
         b_layout(get_cuda_data_type<BT>(), k, n, k),
@@ -285,6 +286,13 @@ struct Fp8GemmDescriptors {
 
     if constexpr (std::is_same_v<AT, __nv_fp8_e5m2> && std::is_same_v<BT, __nv_fp8_e5m2>) {
       FLASHINFER_ERROR("Unsupported combination: both A and B are e5m2");
+    }
+
+    if (bias != nullptr) {
+      // One value per row of the column-major D, shared by all batches.
+      matmul_desc.setAttribute(CUBLASLT_MATMUL_DESC_EPILOGUE, CUBLASLT_EPILOGUE_BIAS);
+      matmul_desc.setAttribute(CUBLASLT_MATMUL_DESC_BIAS_POINTER, static_cast<const void*>(bias));
+      matmul_desc.setAttribute(CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, get_cuda_data_type<DT>());
     }
 
     if (batch_size > 1) {
@@ -306,9 +314,9 @@ struct Fp8GemmDescriptors {
  */
 template <typename AT, typename BT, typename DT>
 int get_fp8_algorithms(int batch_size, int m, int n, int k, const float* A_scale,
-                       const float* B_scale, size_t workspace_size_in_bytes,
+                       const float* B_scale, const DT* bias, size_t workspace_size_in_bytes,
                        cublasLtHandle_t lt_handle, void* algo_buf, int max_algos) {
-  Fp8GemmDescriptors<AT, BT, DT> desc(batch_size, m, n, k, A_scale, B_scale);
+  Fp8GemmDescriptors<AT, BT, DT> desc(batch_size, m, n, k, A_scale, B_scale, bias);
 
   CuBlasLtMatmulPreference preference;
   preference.setAttribute(CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, workspace_size_in_bytes);
@@ -339,14 +347,18 @@ template <typename AT, typename BT, typename DT>
 cublasStatus_t bmm_fp8_run_with_descriptor(void* workspace, size_t workspace_size_in_bytes,
                                            const AT* A, const BT* B, DT* D, int batch_size, int m,
                                            int n, int k, const float* A_scale, const float* B_scale,
-                                           cublasLtHandle_t lt_handle, cudaStream_t stream,
-                                           int device_id, const void* algo_desc,
-                                           bool* used_descriptor) {
-  Fp8GemmDescriptors<AT, BT, DT> desc(batch_size, m, n, k, A_scale, B_scale);
+                                           const DT* bias, cublasLtHandle_t lt_handle,
+                                           cudaStream_t stream, int device_id,
+                                           const void* algo_desc, bool* used_descriptor) {
+  Fp8GemmDescriptors<AT, BT, DT> desc(batch_size, m, n, k, A_scale, B_scale, bias);
 
+  // The bias epilogue and the bias pointer's alignment both affect which algorithms apply.
+  const auto bias_address = reinterpret_cast<uintptr_t>(bias);
+  const int64_t bias_alignment =
+      bias_address == 0 ? 0 : std::min<uintptr_t>(bias_address & -bias_address, 256);
   const std::string key = ResolvedAlgoCache::make_key(
       algo_desc, {kFp8ProblemTag, device_id, batch_size, m, n, k, get_cuda_data_type<AT>(),
-                  get_cuda_data_type<BT>(), get_cuda_data_type<DT>(),
+                  get_cuda_data_type<BT>(), get_cuda_data_type<DT>(), bias_alignment,
                   static_cast<int64_t>(workspace_size_in_bytes)});
   ResolvedAlgo resolved;
   FLASHINFER_CUBLAS_CALL(resolved_algo_cache().resolve(
@@ -368,59 +380,29 @@ template <typename AT, typename BT, typename DT>
 cublasStatus_t bmm_fp8_internal_cublaslt(void* workspace, size_t workspace_size_in_bytes,
                                          const AT* A, const BT* B, DT* D, int batch_size, int m,
                                          int n, int k, const float* A_scale, const float* B_scale,
-                                         cublasLtHandle_t lt_handle, cudaStream_t stream) {
-  const void* A_scale_ptr = static_cast<const void*>(A_scale);
-  const void* B_scale_ptr = static_cast<const void*>(B_scale);
-  auto matmul_desp = CuBlasLtMatmulDescriptor(CUBLAS_COMPUTE_32F, CUDA_R_32F);
-  matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_TRANSA, CUBLAS_OP_T);
-  matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_TRANSB, CUBLAS_OP_N);
-  int8_t fast_accum = 1;
-  matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_FAST_ACCUM, fast_accum);
-
-  matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, A_scale_ptr);
-  matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, B_scale_ptr);
-
-  cudaDataType_t a_type = get_cuda_data_type<AT>();
-  cudaDataType_t b_type = get_cuda_data_type<BT>();
-  cudaDataType_t d_type = get_cuda_data_type<DT>();
-  if (std::is_same_v<AT, __nv_fp8_e5m2> && std::is_same_v<BT, __nv_fp8_e5m2>) {
-    FLASHINFER_ERROR("Unsupported combination: both A and B are e5m2");
-  }
-
-  auto a_desp = CuBlasLtMatrixLayout(a_type, m, k, k, true);
-  auto b_desp = CuBlasLtMatrixLayout(b_type, k, n, k);
-  auto d_desp = CuBlasLtMatrixLayout(d_type, m, n, m);
-
-  if (batch_size > 1) {
-    int64_t stride_a = m * k;
-    int64_t stride_b = k * n;
-    int64_t stride_d = m * n;
-    a_desp.setAttribute(CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, batch_size);
-    a_desp.setAttribute(CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, stride_a);
-    b_desp.setAttribute(CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, batch_size);
-    b_desp.setAttribute(CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, stride_b);
-    d_desp.setAttribute(CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, batch_size);
-    d_desp.setAttribute(CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, stride_d);
-  }
+                                         const DT* bias, cublasLtHandle_t lt_handle,
+                                         cudaStream_t stream) {
+  Fp8GemmDescriptors<AT, BT, DT> desc(batch_size, m, n, k, A_scale, B_scale, bias);
 
   CuBlasLtMatmulPreference preference;
   preference.setAttribute(CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, workspace_size_in_bytes);
   cublasLtMatmulHeuristicResult_t heuristic_result = {};
   int returned_result = 0;
   FLASHINFER_CUBLAS_CALL(cublasLtMatmulAlgoGetHeuristic(
-      lt_handle, matmul_desp.descriptor(), a_desp.descriptor(), b_desp.descriptor(),
-      d_desp.descriptor(), d_desp.descriptor(), preference.descriptor(), 1, &heuristic_result,
-      &returned_result));
+      lt_handle, desc.matmul_desc.descriptor(), desc.a_layout.descriptor(),
+      desc.b_layout.descriptor(), desc.d_layout.descriptor(), desc.d_layout.descriptor(),
+      preference.descriptor(), 1, &heuristic_result, &returned_result));
   if (returned_result == 0) {
     return CUBLAS_STATUS_NOT_SUPPORTED;
   }
 
   const float alpha = 1.0f;
   const float beta = 0.0f;
-  FLASHINFER_CUBLAS_CALL(cublasLtMatmul(
-      lt_handle, matmul_desp.descriptor(), &alpha, A, a_desp.descriptor(), B, b_desp.descriptor(),
-      &beta, nullptr, d_desp.descriptor(), D, d_desp.descriptor(), &heuristic_result.algo,
-      workspace, workspace_size_in_bytes, stream));
+  FLASHINFER_CUBLAS_CALL(cublasLtMatmul(lt_handle, desc.matmul_desc.descriptor(), &alpha, A,
+                                        desc.a_layout.descriptor(), B, desc.b_layout.descriptor(),
+                                        &beta, nullptr, desc.d_layout.descriptor(), D,
+                                        desc.d_layout.descriptor(), &heuristic_result.algo,
+                                        workspace, workspace_size_in_bytes, stream));
   return CUBLAS_STATUS_SUCCESS;
 }
 
