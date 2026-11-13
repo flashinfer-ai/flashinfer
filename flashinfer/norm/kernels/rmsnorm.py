@@ -28,20 +28,21 @@ import math
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32
+from cutlass import Float32, Int32, Int64
 
 from ..utils import (
-    FLOAT8_E4M3_MAX,
     COPY_BITS,
+    get_fp8_max,
     rcp_approx_ftz,
-    cvt_and_store_f32_to_e4m3_hw,
-    cvt_and_store_f32_to_e4m3_sw,
-    cvt_and_store_8xf32_to_e4m3_hw,
-    cvt_and_store_4xf32_to_e4m3_hw,
-    cvt_and_store_2xf32_to_e4m3_hw,
+    cvt_and_store_f32_to_fp8_hw,
+    cvt_and_store_f32_to_fp8_sw,
+    cvt_and_store_8xf32_to_fp8_hw,
+    cvt_and_store_4xf32_to_fp8_hw,
+    cvt_and_store_2xf32_to_fp8_hw,
     has_hw_fp8_cvt,
     get_ptr_as_int64,
     get_sm_version,
+    max_cluster_n,
     row_reduce_sum_multirow,
     predicate_k,
     make_tv_layout,
@@ -105,22 +106,34 @@ class RMSNormKernel:
 
     @staticmethod
     def _compute_cluster_n(H: int, dtype: cutlass.Numeric, sm_version: int) -> int:
-        """Compute optimal cluster size based on H and device shared memory."""
+        """Compute optimal cluster size based on H and device shared memory.
+
+        The budget is the half-limit that gates ``use_async_copy``, so a cluster
+        size that fits here also fits the cp.async budget.
+        """
         if sm_version < 90:
             return 1
 
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         max_smem_bytes = props.shared_memory_per_block_optin
+        occupancy_target = max_smem_bytes // 2
         elem_size = dtype.width // 8
+        max_cluster = max_cluster_n(sm_version)
 
+        best_fit = 1
         for cluster_n in [1, 2, 4, 8, 16]:
+            if cluster_n > max_cluster:
+                break
             if H % cluster_n != 0:
                 continue
             smem_needed = RMSNormKernel._estimate_smem_bytes(H, cluster_n, elem_size)
-            if smem_needed <= max_smem_bytes:
+            if smem_needed <= occupancy_target:
                 return cluster_n
+            if smem_needed <= max_smem_bytes and best_fit == 1:
+                best_fit = cluster_n
 
-        return 16
+        # Widest split, but only when it divides H; otherwise the best divisor.
+        return max_cluster if H % max_cluster == 0 else best_fit
 
     @staticmethod
     def _estimate_smem_bytes(H: int, cluster_n: int, elem_size: int) -> int:
@@ -206,7 +219,7 @@ class RMSNormKernel:
         mX: cute.Tensor,
         mW: cute.Tensor,
         mY: cute.Tensor,
-        M: Int32,
+        M: Int64,
         eps: Float32,
         enable_pdl: cutlass.Constexpr[bool],
         stream,
@@ -237,7 +250,7 @@ class RMSNormKernel:
         mX: cute.Tensor,
         mW: cute.Tensor,
         mY: cute.Tensor,
-        M: Int32,
+        M: Int64,
         eps: Float32,
         enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
@@ -419,6 +432,11 @@ class RMSNormKernel:
 # =============================================================================
 
 
+# Architectures where the norm kernels are bound by bytes in flight per SM;
+# the tiling adjustments below apply only to these.
+_LATENCY_BOUND_SMS = (100, 103, 107)
+
+
 class QKRMSNormKernel:
     """
     QK RMSNorm Kernel using CuTe-DSL for 3D tensors [batch, heads, head_dim].
@@ -437,10 +455,12 @@ class QKRMSNormKernel:
         dtype: cutlass.Numeric,
         head_dim: int,
         weight_bias: float = 0.0,
+        sm_version: int | None = None,
     ):
         self.dtype = dtype
         self.head_dim = head_dim
         self.weight_bias = weight_bias
+        self.sm_version = sm_version if sm_version is not None else get_sm_version()
 
         elem_bytes = dtype.width // 8
         max_vec_size = COPY_BITS // 8 // elem_bytes
@@ -449,7 +469,7 @@ class QKRMSNormKernel:
         self.vec_size = min(h_align, max_vec_size)
         self.copy_bits = self.vec_size * dtype.width
 
-        self.threads_per_row = RMSNormKernel._compute_threads_per_row(head_dim)
+        self.threads_per_row = self._compute_threads_per_row(head_dim, self.sm_version)
         self.num_threads = RMSNormKernel._compute_num_threads(head_dim)
         self.rows_per_block = self.num_threads // self.threads_per_row
         self.warps_per_row = max(self.threads_per_row // 32, 1)
@@ -468,6 +488,21 @@ class QKRMSNormKernel:
         else:
             self.use_async_copy = False
 
+    @staticmethod
+    def _compute_threads_per_row(head_dim: int, sm_version: int) -> int:
+        """Threads cooperating on one (batch, head) row.
+
+        The shared RMSNorm table leaves each thread with a single 16-byte vector
+        for small head_dim, which is too little in flight per SM on Blackwell and
+        Rubin. There, use fewer threads per row so each thread owns ~32 elements.
+        """
+        default = RMSNormKernel._compute_threads_per_row(head_dim)
+        if sm_version not in _LATENCY_BOUND_SMS:
+            return default
+        target = max(head_dim // 32, 1)
+        target = 1 << (target.bit_length() - 1)  # power of two for warp shuffles
+        return min(default, max(4, target))
+
     def _smem_size_in_bytes(self) -> int:
         if self.use_async_copy:
             tile_bytes = (
@@ -484,8 +519,8 @@ class QKRMSNormKernel:
         mX: cute.Tensor,
         mW: cute.Tensor,
         mY: cute.Tensor,
-        B: Int32,
-        N: Int32,
+        B: Int64,
+        N: Int64,
         eps: Float32,
         enable_pdl: cutlass.Constexpr[bool],
         stream,
@@ -512,8 +547,8 @@ class QKRMSNormKernel:
         mX: cute.Tensor,
         mW: cute.Tensor,
         mY: cute.Tensor,
-        N: Int32,
-        M: Int32,
+        N: Int64,
+        M: Int64,
         eps: Float32,
         enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
@@ -685,8 +720,8 @@ class RMSNormQuantKernel:
     """
     RMSNorm + FP8 Quantization Kernel using CuTe-DSL.
 
-    Computes: output = clamp(input / sqrt(mean(input^2) + eps) * weight / scale, -448, 448)
-    Then quantizes to FP8 E4M3.
+    Computes: output = input / sqrt(mean(input^2) + eps) * weight / scale,
+    clamped to the finite range of the FP8 output dtype (E4M3 or E5M2).
     """
 
     def __init__(
@@ -758,7 +793,7 @@ class RMSNormQuantKernel:
         mX: cute.Tensor,
         mW: cute.Tensor,
         mY: cute.Tensor,
-        M: Int32,
+        M: Int64,
         mS: cute.Tensor,
         eps: Float32,
         enable_pdl: cutlass.Constexpr[bool],
@@ -790,7 +825,7 @@ class RMSNormQuantKernel:
         mX: cute.Tensor,
         mW: cute.Tensor,
         mY: cute.Tensor,
-        M: Int32,
+        M: Int64,
         mS: cute.Tensor,
         eps: Float32,
         enable_pdl: cutlass.Constexpr[bool],
@@ -957,8 +992,12 @@ class RMSNormQuantKernel:
 
         lane_in_row = tidx % threads_per_row
         row_in_block = tidx // threads_per_row
-        actual_row = bidx * rows_per_block + row_in_block
+        # Compute actual_row in int64 so that, with M now widened to Int64,
+        # bidx * rows_per_block does not overflow int32 before being compared
+        # against M or used in the address arithmetic below.
+        actual_row = Int64(bidx) * rows_per_block + row_in_block
         col_offset = lane_in_row * vec_size
+        fp8_max = get_fp8_max(mY.element_type)
 
         if cutlass.const_expr(self.use_hw_fp8 and vec_size == 8):
             for v in cutlass.range_constexpr(num_vec_blocks):
@@ -966,7 +1005,7 @@ class RMSNormQuantKernel:
                 abs_col = cluster_y * cols_per_tile + local_col
                 if abs_col + 8 <= H and actual_row < M:
                     base = v * 8
-                    cvt_and_store_8xf32_to_e4m3_hw(
+                    cvt_and_store_8xf32_to_fp8_hw(
                         tYrY_f32[base],
                         tYrY_f32[base + 1],
                         tYrY_f32[base + 2],
@@ -978,26 +1017,28 @@ class RMSNormQuantKernel:
                         get_ptr_as_int64(
                             mY,
                             cute.crd2idx(
-                                (Int32(actual_row), Int32(abs_col)), mY.layout
+                                (Int64(actual_row), Int32(abs_col)), mY.layout
                             ),
                         ),
+                        mY.element_type,
                     )
                 else:
                     for e in cutlass.range_constexpr(vec_size):
                         abs_col_e = cluster_y * cols_per_tile + local_col + e
                         if abs_col_e < H and actual_row < M:
                             flat_idx = v * vec_size + e
-                            clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
-                            clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
-                            cvt_and_store_f32_to_e4m3_hw(
+                            clamped = max(tYrY_f32[flat_idx], Float32(-fp8_max))
+                            clamped = min(clamped, Float32(fp8_max))
+                            cvt_and_store_f32_to_fp8_hw(
                                 clamped,
                                 get_ptr_as_int64(
                                     mY,
                                     cute.crd2idx(
-                                        (Int32(actual_row), Int32(abs_col_e)),
+                                        (Int64(actual_row), Int32(abs_col_e)),
                                         mY.layout,
                                     ),
                                 ),
+                                mY.element_type,
                             )
         elif cutlass.const_expr(self.use_hw_fp8 and vec_size == 4):
             for v in cutlass.range_constexpr(num_vec_blocks):
@@ -1005,7 +1046,7 @@ class RMSNormQuantKernel:
                 abs_col = cluster_y * cols_per_tile + local_col
                 if abs_col + 4 <= H and actual_row < M:
                     base = v * 4
-                    cvt_and_store_4xf32_to_e4m3_hw(
+                    cvt_and_store_4xf32_to_fp8_hw(
                         tYrY_f32[base],
                         tYrY_f32[base + 1],
                         tYrY_f32[base + 2],
@@ -1013,26 +1054,28 @@ class RMSNormQuantKernel:
                         get_ptr_as_int64(
                             mY,
                             cute.crd2idx(
-                                (Int32(actual_row), Int32(abs_col)), mY.layout
+                                (Int64(actual_row), Int32(abs_col)), mY.layout
                             ),
                         ),
+                        mY.element_type,
                     )
                 else:
                     for e in cutlass.range_constexpr(vec_size):
                         abs_col_e = cluster_y * cols_per_tile + local_col + e
                         if abs_col_e < H and actual_row < M:
                             flat_idx = v * vec_size + e
-                            clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
-                            clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
-                            cvt_and_store_f32_to_e4m3_hw(
+                            clamped = max(tYrY_f32[flat_idx], Float32(-fp8_max))
+                            clamped = min(clamped, Float32(fp8_max))
+                            cvt_and_store_f32_to_fp8_hw(
                                 clamped,
                                 get_ptr_as_int64(
                                     mY,
                                     cute.crd2idx(
-                                        (Int32(actual_row), Int32(abs_col_e)),
+                                        (Int64(actual_row), Int32(abs_col_e)),
                                         mY.layout,
                                     ),
                                 ),
+                                mY.element_type,
                             )
         elif cutlass.const_expr(self.use_hw_fp8 and vec_size == 2):
             for v in cutlass.range_constexpr(num_vec_blocks):
@@ -1040,32 +1083,34 @@ class RMSNormQuantKernel:
                 abs_col = cluster_y * cols_per_tile + local_col
                 if abs_col + 2 <= H and actual_row < M:
                     base = v * 2
-                    cvt_and_store_2xf32_to_e4m3_hw(
+                    cvt_and_store_2xf32_to_fp8_hw(
                         tYrY_f32[base],
                         tYrY_f32[base + 1],
                         get_ptr_as_int64(
                             mY,
                             cute.crd2idx(
-                                (Int32(actual_row), Int32(abs_col)), mY.layout
+                                (Int64(actual_row), Int32(abs_col)), mY.layout
                             ),
                         ),
+                        mY.element_type,
                     )
                 else:
                     for e in cutlass.range_constexpr(vec_size):
                         abs_col_e = cluster_y * cols_per_tile + local_col + e
                         if abs_col_e < H and actual_row < M:
                             flat_idx = v * vec_size + e
-                            clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
-                            clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
-                            cvt_and_store_f32_to_e4m3_hw(
+                            clamped = max(tYrY_f32[flat_idx], Float32(-fp8_max))
+                            clamped = min(clamped, Float32(fp8_max))
+                            cvt_and_store_f32_to_fp8_hw(
                                 clamped,
                                 get_ptr_as_int64(
                                     mY,
                                     cute.crd2idx(
-                                        (Int32(actual_row), Int32(abs_col_e)),
+                                        (Int64(actual_row), Int32(abs_col_e)),
                                         mY.layout,
                                     ),
                                 ),
+                                mY.element_type,
                             )
         else:
             for v in cutlass.range_constexpr(num_vec_blocks):
@@ -1074,18 +1119,22 @@ class RMSNormQuantKernel:
                     abs_col = cluster_y * cols_per_tile + local_col
                     if abs_col < H and actual_row < M:
                         flat_idx = v * vec_size + e
-                        clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
-                        clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
+                        clamped = max(tYrY_f32[flat_idx], Float32(-fp8_max))
+                        clamped = min(clamped, Float32(fp8_max))
                         out_ptr = get_ptr_as_int64(
                             mY,
                             cute.crd2idx(
-                                (Int32(actual_row), Int32(abs_col)), mY.layout
+                                (Int64(actual_row), Int32(abs_col)), mY.layout
                             ),
                         )
                         if self.use_hw_fp8:
-                            cvt_and_store_f32_to_e4m3_hw(clamped, out_ptr)
+                            cvt_and_store_f32_to_fp8_hw(
+                                clamped, out_ptr, mY.element_type
+                            )
                         else:
-                            cvt_and_store_f32_to_e4m3_sw(clamped, out_ptr)
+                            cvt_and_store_f32_to_fp8_sw(
+                                clamped, out_ptr, mY.element_type
+                            )
 
         # PDL: Signal dependent kernels (SM90+ only)
         if enable_pdl:
@@ -1115,7 +1164,9 @@ def _get_compiled_rmsnorm_kernel(
     dtype = get_cutlass_dtype(dtype_str)
     kernel_obj = RMSNormKernel(dtype, H, weight_bias, sm_version=sm_version)
 
-    sym_m = cute.sym_int()
+    # 64-bit M so row-index arithmetic (row * H) does not overflow when
+    # M * H exceeds INT32_MAX.
+    sym_m = cute.sym_int(64)
 
     if contiguous:
         elem_bytes = dtype.width // 8
@@ -1127,8 +1178,8 @@ def _get_compiled_rmsnorm_kernel(
             dtype, (sym_m, H), stride_order=(1, 0), assumed_align=tensor_align
         )
     else:
-        sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
-        sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
+        sym_row_stride_x = cute.sym_int64(divisibility=kernel_obj.vec_size)
+        sym_row_stride_y = cute.sym_int64(divisibility=kernel_obj.vec_size)
         x_fake = cute.runtime.make_fake_tensor(
             dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
         )
@@ -1145,7 +1196,7 @@ def _get_compiled_rmsnorm_kernel(
         x_fake,
         w_fake,
         y_fake,
-        Int32(1),
+        Int64(1),
         Float32(1e-6),
         enable_pdl,
         stream_fake,
@@ -1157,21 +1208,26 @@ def _get_compiled_rmsnorm_kernel(
 
 @functools.cache
 def _get_compiled_qk_rmsnorm_kernel(
-    dtype_str: str, head_dim: int, weight_bias: float, enable_pdl: bool
+    dtype_str: str,
+    head_dim: int,
+    weight_bias: float,
+    enable_pdl: bool,
+    sm_version: int,
 ):
     """Get a compiled QKRMSNorm kernel for 3D tensors with arbitrary stride."""
     dtype = get_cutlass_dtype(dtype_str)
-    kernel_obj = QKRMSNormKernel(dtype, head_dim, weight_bias)
+    kernel_obj = QKRMSNormKernel(dtype, head_dim, weight_bias, sm_version=sm_version)
 
-    sym_b = cute.sym_int()
-    sym_n = cute.sym_int()
+    # 64-bit B and N so the flattened row index B*N is not truncated.
+    sym_b = cute.sym_int(64)
+    sym_n = cute.sym_int(64)
 
     # Stride divisibility = vec_size guarantees each row start is aligned
     # for the chosen copy_bits (e.g. vec_size=8 for fp16 → 16-byte aligned).
-    sym_batch_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
-    sym_head_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
-    sym_batch_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
-    sym_head_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
+    sym_batch_stride_x = cute.sym_int64(divisibility=kernel_obj.vec_size)
+    sym_head_stride_x = cute.sym_int64(divisibility=kernel_obj.vec_size)
+    sym_batch_stride_y = cute.sym_int64(divisibility=kernel_obj.vec_size)
+    sym_head_stride_y = cute.sym_int64(divisibility=kernel_obj.vec_size)
 
     x_fake = cute.runtime.make_fake_tensor(
         dtype,
@@ -1194,8 +1250,8 @@ def _get_compiled_qk_rmsnorm_kernel(
         x_fake,
         w_fake,
         y_fake,
-        Int32(1),  # Dummy B
-        Int32(1),  # Dummy N
+        Int64(1),  # Dummy B
+        Int64(1),  # Dummy N
         Float32(1e-6),  # Dummy eps
         enable_pdl,
         stream_fake,
@@ -1226,7 +1282,8 @@ def _get_compiled_rmsnorm_quant_kernel(
         dtype, H, weight_bias, use_hw_fp8=use_hw_fp8, sm_version=sm_version
     )
 
-    sym_m = cute.sym_int()
+    # 64-bit M so row-index arithmetic (row * H) does not overflow.
+    sym_m = cute.sym_int(64)
 
     if contiguous:
         in_align = math.gcd(128, H * (dtype.width // 8))
@@ -1238,8 +1295,8 @@ def _get_compiled_rmsnorm_quant_kernel(
             out_dtype, (sym_m, H), stride_order=(1, 0), assumed_align=out_align
         )
     else:
-        sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
-        sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
+        sym_row_stride_x = cute.sym_int64(divisibility=kernel_obj.vec_size)
+        sym_row_stride_y = cute.sym_int64(divisibility=kernel_obj.vec_size)
         x_fake = cute.runtime.make_fake_tensor(
             dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
         )
@@ -1257,7 +1314,7 @@ def _get_compiled_rmsnorm_quant_kernel(
         x_fake,
         w_fake,
         y_fake,
-        Int32(1),
+        Int64(1),
         s_fake,
         Float32(1e-6),
         enable_pdl,
@@ -1299,6 +1356,12 @@ def rmsnorm_cute(
         out_2d = out
 
     is_contiguous = input_2d.is_contiguous() and out_2d.is_contiguous()
+    # When M*H exceeds INT32_MAX, use the strided compile path: its row stride
+    # is a dynamic int64 so the offset arithmetic widens to int64. The compact
+    # path bakes the row stride in as a constexpr int and computes row*H in
+    # int32, which overflows.
+    if is_contiguous and M * H > 2**31 - 1:
+        is_contiguous = False
     kernel = _get_compiled_rmsnorm_kernel(
         _torch_dtype_to_str(input.dtype),
         H,
@@ -1331,7 +1394,7 @@ def qk_rmsnorm_cute(
 
     dtype_str = _torch_dtype_to_str(input.dtype)
     kernel = _get_compiled_qk_rmsnorm_kernel(
-        dtype_str, head_dim, weight_bias, enable_pdl
+        dtype_str, head_dim, weight_bias, enable_pdl, get_sm_version(input.device)
     )
 
     kernel(input, weight, output, batch_size, num_heads, eps)
@@ -1356,6 +1419,10 @@ def rmsnorm_quant_cute(
     M = shape[0]
 
     is_contiguous = input.is_contiguous() and out.is_contiguous()
+    # When M*H exceeds INT32_MAX, fall back to the strided path so its dynamic
+    # int64 row stride widens the offset arithmetic to int64.
+    if is_contiguous and M * H > 2**31 - 1:
+        is_contiguous = False
     dtype_str = _torch_dtype_to_str(input.dtype)
     out_dtype_str = _torch_dtype_to_str(out.dtype)
     kernel = _get_compiled_rmsnorm_quant_kernel(

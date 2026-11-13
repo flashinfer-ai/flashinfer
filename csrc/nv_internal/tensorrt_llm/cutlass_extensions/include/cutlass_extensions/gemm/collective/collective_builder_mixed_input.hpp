@@ -26,7 +26,8 @@ namespace cutlass::gemm::collective {
 template <class ArchTag, class OpClass, class ElementA, class GmemLayoutA, int AlignmentA,
           class ElementB, class GmemLayoutB, int AlignmentB, class ElementAccumulator,
           class TileShape_MNK, class ClusterShape_MNK, class StageCountType,
-          class KernelScheduleType, class Enable = void>
+          class KernelScheduleType, MixedInputScaleMode ScaleMode = MixedInputScaleMode::kPostMma,
+          class Enable = void>
 struct CollectiveBuilderMixedInput {
   static_assert(sizeof(ElementA) == 0, "Could not build a collective for given parameters.");
 };

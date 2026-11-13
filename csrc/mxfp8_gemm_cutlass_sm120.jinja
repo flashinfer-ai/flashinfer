@@ -19,6 +19,7 @@
 namespace flashinfer {
 namespace gemm {
 // SM120 always uses ClusterShape 1x1x1 — no CGA/multi-SM parameters.
-INSTANTIATE_MXFP8_GEMM_KERNEL_LAUNCHER_SM120({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ cta_k }})
+INSTANTIATE_MXFP8_GEMM_KERNEL_LAUNCHER_SM120({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ cta_k }}, true)
+INSTANTIATE_MXFP8_GEMM_KERNEL_LAUNCHER_SM120({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ cta_k }}, false)
 }  // namespace gemm
 }  // namespace flashinfer

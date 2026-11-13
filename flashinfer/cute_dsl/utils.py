@@ -14,28 +14,37 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import ctypes
 import functools
-import importlib.util
-from typing import Union, Tuple
+import warnings
+from typing import Tuple, Union
 
 import cutlass
 import cutlass._mlir.dialects.cute as _cute_ir
+import cutlass.cute as cute
 import torch
 from cutlass._mlir import ir
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
+
+from .availability import (  # noqa: F401
+    cute_dsl_compile_arch,
+    is_cute_dsl_arch_supported,
+    is_cute_dsl_available,
+    is_cute_dsl_experimental_available,
+    is_rubin_cute_dsl_available,
+    require_cute_dsl_arch,
+)
+
+if not hasattr(cute.nvgpu, "OperandMajorMode"):
+    with contextlib.suppress(AttributeError):
+        cute.nvgpu.OperandMajorMode = cute.nvgpu.tcgen05.OperandMajorMode
 
 
 def ceil_div(a: int, b: int) -> int:
     """Ceiling division."""
     return (a + b - 1) // b
-
-
-def is_cute_dsl_available() -> bool:
-    return (
-        importlib.util.find_spec("cutlass") is not None
-        and importlib.util.find_spec("cutlass.cute") is not None
-    )
 
 
 def get_cutlass_dtype(dtype: str) -> cutlass.dtype:
@@ -65,6 +74,21 @@ def torch_to_cutlass_dtype(dtype: torch.dtype) -> cutlass.dtype:
     return dtype_map[dtype]
 
 
+def _as_cute_dsl_workspace_i8(
+    workspace_buffer: torch.Tensor,
+    *,
+    name: str = "workspace_buffer",
+) -> torch.Tensor:
+    if workspace_buffer.dtype not in (torch.int8, torch.uint8):
+        raise ValueError(
+            f"{name} must be a torch.int8 or torch.uint8 byte tensor, "
+            f"got {workspace_buffer.dtype}"
+        )
+    if not workspace_buffer.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    return workspace_buffer.view(-1).view(torch.int8)
+
+
 def cutlass_to_torch_dtype(cutlass_dtype):
     """
     Return the corresponding torch.dtype per the given DSL type
@@ -89,10 +113,58 @@ def cutlass_to_torch_dtype(cutlass_dtype):
     return torch_dtype
 
 
+def torch_dtype_to_cutlass(dtype: torch.dtype):
+    """Convert torch.dtype to corresponding cutlass dtype.
+
+    :param dtype: PyTorch data type
+    :type dtype: torch.dtype
+    :return: Corresponding CUTLASS data type
+    :rtype: cutlass.dtype
+    :raises TypeError: If the dtype is not supported
+    """
+    torch_to_cutlass_map = {
+        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+        torch.float8_e5m2: cutlass.Float8E5M2,
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }
+    if dtype not in torch_to_cutlass_map:
+        raise TypeError(f"Unsupported torch dtype: {dtype}")
+    return torch_to_cutlass_map[dtype]
+
+
 @functools.cache
 def get_num_sm(device: torch.device) -> int:
     # get the compute capability of the device, which would be cached
     return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _current_cuda_stream_impl():
+    """Return the current Torch CUDA stream as a CUDA driver stream handle."""
+    import cuda.bindings.driver as cuda
+
+    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+
+def current_cuda_stream():  # noqa: F811
+    """Lazy wrapper that applies torch._dynamo.disable on first call to avoid
+    importing torch._dynamo at module load time (which fails in containers
+    running as unmapped UIDs without /etc/passwd entries)."""
+    global current_cuda_stream
+    _ensure_user_env()
+    current_cuda_stream = torch._dynamo.disable(_current_cuda_stream_impl)
+    return current_cuda_stream()
+
+
+def _ensure_user_env():
+    """Ensure a USER env var exists so that torch._dynamo initialization
+    (which calls getpass.getuser()) doesn't crash in containers running
+    as UIDs without /etc/passwd entries."""
+    import os
+
+    if not any(os.environ.get(v) for v in ("LOGNAME", "USER", "LNAME", "USERNAME")):
+        os.environ["USER"] = str(os.getuid())
 
 
 # Cache for HardwareInfo - it's expensive to create on every call
@@ -121,7 +193,27 @@ def get_max_active_clusters(cluster_size: int) -> int:
     Returns:
         Maximum number of active clusters supported by hardware.
     """
-    return get_hardware_info().get_max_active_clusters(cluster_size)
+    try:
+        return get_hardware_info().get_max_active_clusters(cluster_size)
+    except Exception as exc:
+        # nvidia_cutlass_dsl's hardware probe (cuKernelGetFunction) can fail
+        # in spawned subprocesses (e.g. vLLM EngineCore) when the CUDA driver
+        # API context is not current at first use, even if the PyTorch CUDA
+        # runtime is initialised. Fall back to the GPU's physical SM count,
+        # which is a safe upper bound: callers that clamp to sm_count (such
+        # as the SM120 MoE dispatch's ``min(get_max_active_clusters(1),
+        # sm_count)``) are unaffected; other callers under-parallelize
+        # slightly when per-CTA resources allow more than one cluster per
+        # SM, but never over-request (which could deadlock a resident grid).
+        warnings.warn(
+            f"cutlass.get_max_active_clusters failed "
+            f"({type(exc).__name__}: {exc}); falling back to sm_count. "
+            f"This can happen in spawned subprocesses where the CUDA driver "
+            f"API context is not current.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return get_num_sm(torch.device("cuda"))
 
 
 # WAR for CuTeDSL make_ptr implementation for flashinfer
@@ -348,6 +440,47 @@ def convert_sf_to_mma_layout(
     return sf_6d  # Return strided view, NOT contiguous
 
 
+def convert_row_major_sf_to_mma_layout(
+    sf: torch.Tensor,
+    m: int,
+    k: int,
+    num_groups: int = 1,
+    sf_vec_size: int = 32,
+) -> torch.Tensor:
+    """Convert row-major (unswizzled) block scales to the 6D MMA layout.
+
+    Checkpoints store block scales row-major, one ``uint8`` (E8M0) per
+    ``sf_vec_size`` elements along K, e.g. ``[num_groups, m, k // sf_vec_size]`` for
+    stacked expert weights. This swizzles them (``block_scale_interleave``) and
+    returns the same view as :func:`convert_sf_to_mma_layout`, so it matches
+    ``mxfp8_quantize(..., is_sf_swizzled_layout=True)`` followed by that function.
+
+    Args:
+        sf: ``uint8`` (or ``float8_e8m0fnu``) scales of shape
+            ``(num_groups, m, ceil(k / sf_vec_size))``, or ``(m, ceil(k / sf_vec_size))``
+            when ``num_groups == 1``.
+        m: Rows of the quantized matrix.
+        k: Columns (the quantized dimension) of the matrix before block scaling.
+        num_groups: Number of stacked matrices (e.g. experts).
+        sf_vec_size: Elements per scale (32 for MXFP8).
+
+    Returns:
+        Scales in the 6D MMA layout ``(32, 4, m_tiles, 4, k_tiles, num_groups)``.
+    """
+    from ..quantization.fp4_quantization import block_scale_interleave
+
+    sf_k = ceil_div(k, sf_vec_size)
+    if sf.dtype != torch.uint8:
+        sf = sf.view(torch.uint8)
+    if tuple(sf.shape) not in ((num_groups, m, sf_k), (m, sf_k)):
+        raise ValueError(
+            f"Row-major scales must have shape ({num_groups}, {m}, {sf_k}), "
+            f"got {tuple(sf.shape)}"
+        )
+    swizzled = block_scale_interleave(sf.reshape(num_groups, m, sf_k).contiguous())
+    return convert_sf_to_mma_layout(swizzled, m, k, num_groups, sf_vec_size)
+
+
 def convert_sf_from_mma_layout(
     sf_6d: torch.Tensor,
     m: int,
@@ -408,3 +541,172 @@ def get_mma_sf_shape(
     m_tiles = ceil_div(m, 128)
     k_tiles = ceil_div(sf_k, 4)
     return (32, 4, m_tiles, 4, k_tiles, num_groups)
+
+
+@dsl_user_op
+def sm120_make_smem_layout_sfa(
+    tiled_mma: cute.TiledMma,
+    tile_shape_mnk: cute.Tile,
+    sf_vec_size: int,
+    num_stages: int,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.Layout:
+    """Make shared memory layout for scale factors A on SM120.
+
+    Constructs the SMEM layout for SFA based on BlockScaledBasicChunk,
+    MMA tiler shape, scale factor vector size, and number of pipeline stages.
+
+    Args:
+        tiled_mma: The tiled MMA operation.
+        tile_shape_mnk: The tile shape (M, N, K).
+        sf_vec_size: Scale factor vector size (16 or 32).
+        num_stages: Number of pipeline stages.
+
+    Returns:
+        Staged shared memory layout for SFA.
+    """
+    assert sf_vec_size == 16 or sf_vec_size == 32, "sf_vec_size must be 16 or 32"
+
+    blk_mn = 128
+    blk_sf = 4
+    blk_elems = blk_mn * blk_sf
+    mma_nsf = tiled_mma.shape_mnk[2] // sf_vec_size
+
+    mn_basic_block_shape = (32, 4)
+    mn_basic_block_stride = (16, 4)
+    k_basic_block_shape = (sf_vec_size, mma_nsf)
+    k_basic_block_stride = (0, 1)
+
+    # Sub-64-row M tiles appear only in the b12x dense GEMM path, whose SF
+    # fragment layouts handle them.
+    assert tile_shape_mnk[0] % (blk_mn // 8) == 0, (
+        "tile_shape_mnk[0] must be divisible by 16"
+    )
+
+    # Scale-factor tiles are quantized in 128-row blocks, so narrower MMA
+    # tiles still allocate one full SF block and consume only the live subset.
+    sfa_tile_m = max(blk_mn, ceil_div(tile_shape_mnk[0], blk_mn) * blk_mn)
+
+    sSFA_shapeM = (mn_basic_block_shape, sfa_tile_m // blk_mn)
+    sSF_strideM = (mn_basic_block_stride, blk_elems)
+
+    assert tile_shape_mnk[2] % (blk_sf * mma_nsf) == 0, (
+        "tile_shape_mnk[2] must be divisible by blk_sf * mma_nsf"
+    )
+    assert tile_shape_mnk[2] % (sf_vec_size * blk_sf) == 0, (
+        "tile_shape_mnk[2] must be divisible by sf_vec_size * blk_sf"
+    )
+    assert blk_sf % mma_nsf == 0, "blk_sf must be divisible by mma_nsf"
+
+    sSFA_shapeK = (
+        k_basic_block_shape,
+        blk_sf // mma_nsf,
+        tile_shape_mnk[2] // sf_vec_size // blk_sf,
+    )
+    sSF_strideK = (
+        k_basic_block_stride,
+        mma_nsf,
+        sfa_tile_m // blk_mn * blk_elems,
+    )
+
+    sSFA_shape = (sSFA_shapeM, sSFA_shapeK)
+    sSFA_stride = (sSF_strideM, sSF_strideK)
+
+    smem_layout = cute.make_layout(sSFA_shape, stride=sSFA_stride)
+
+    sfa_smem_layout_staged = cute.append(
+        smem_layout,
+        cute.make_layout(
+            num_stages, stride=cute.cosize(cute.filter_zeros(smem_layout))
+        ),
+    )
+
+    return sfa_smem_layout_staged
+
+
+@dsl_user_op
+def sm120_make_smem_layout_sfb(
+    tiled_mma: cute.TiledMma,
+    tile_shape_mnk: cute.Tile,
+    sf_vec_size: int,
+    num_stages: int,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.Layout:
+    """Make shared memory layout for scale factors B on SM120.
+
+    Constructs the SMEM layout for SFB based on BlockScaledBasicChunk,
+    MMA tiler shape, scale factor vector size, and number of pipeline stages.
+
+    Args:
+        tiled_mma: The tiled MMA operation.
+        tile_shape_mnk: The tile shape (M, N, K).
+        sf_vec_size: Scale factor vector size (16 or 32).
+        num_stages: Number of pipeline stages.
+
+    Returns:
+        Staged shared memory layout for SFB.
+    """
+    blk_mn = 128
+    blk_sf = 4
+    blk_elems = blk_mn * blk_sf
+
+    assert sf_vec_size == 16 or sf_vec_size == 32, "sf_vec_size must be 16 or 32"
+
+    assert tile_shape_mnk[1] % (blk_mn // 8) == 0, (
+        "tile_shape_mnk[1] must be divisible by 16"
+    )
+
+    assert tile_shape_mnk[2] % sf_vec_size == 0, (
+        "tile_shape_mnk[2] must be divisible by sf_vec_size"
+    )
+
+    mma_nsf = tiled_mma.shape_mnk[2] // sf_vec_size
+
+    mn_basic_block_shape = (32, 4)
+    mn_basic_block_stride = (16, 4)
+    k_basic_block_shape = (sf_vec_size, mma_nsf)
+    k_basic_block_stride = (0, 1)
+
+    # Scale-factor tiles are quantized in 128-column blocks, so narrower MMA
+    # tiles still allocate one full SF block and consume only the live subset.
+    sfb_tile_n = max(blk_mn, ceil_div(tile_shape_mnk[1], blk_mn) * blk_mn)
+
+    sSFB_shapeN = (mn_basic_block_shape, sfb_tile_n // blk_mn)
+    sSF_strideN = (mn_basic_block_stride, blk_elems)
+
+    assert tile_shape_mnk[2] % (blk_sf * mma_nsf) == 0, (
+        "tile_shape_mnk[2] must be divisible by blk_sf * mma_nsf"
+    )
+    assert tile_shape_mnk[2] % (sf_vec_size * blk_sf) == 0, (
+        "tile_shape_mnk[2] must be divisible by sf_vec_size * blk_sf"
+    )
+    assert blk_sf % mma_nsf == 0, "blk_sf must be divisible by mma_nsf"
+
+    sSFB_shapeK = (
+        k_basic_block_shape,
+        blk_sf // mma_nsf,
+        tile_shape_mnk[2] // sf_vec_size // blk_sf,
+    )
+    sSF_strideK = (
+        k_basic_block_stride,
+        mma_nsf,
+        sfb_tile_n // blk_mn * blk_elems,
+    )
+
+    sSFB_shape = (sSFB_shapeN, sSFB_shapeK)
+    sSFB_stride = (sSF_strideN, sSF_strideK)
+
+    smem_layout = cute.make_layout(sSFB_shape, stride=sSFB_stride)
+
+    sfb_smem_layout_staged = cute.append(
+        smem_layout,
+        cute.make_layout(
+            num_stages, stride=cute.cosize(cute.filter_zeros(smem_layout))
+        ),
+    )
+
+    return sfb_smem_layout_staged

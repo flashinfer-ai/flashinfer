@@ -34,14 +34,69 @@ namespace cutlass::gemm::collective {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+namespace detail {
+
+template <int capacity_bytes, class ElementA, class ElementB, class ElementScale, class ElementZero,
+          class TileShapeMNK, int alignment = 128, int stages>
+constexpr int compute_stage_count_or_override_folded_weight_scale(cute::Int<stages> stage_count) {
+  return stages;
+}
+
+template <int capacity_bytes, class ElementA, class ElementB, class ElementScale, class ElementZero,
+          class TileShapeMNK, int alignment = 128, int stages>
+constexpr int compute_stage_count_or_override_folded_weight_scale(StageCount<stages> stage_count) {
+  return stages;
+}
+
+template <int capacity_bytes_, class ElementA, class ElementB, class ElementScale,
+          class ElementZero, class TileShapeMNK, int alignment = 128, int carveout_bytes_>
+constexpr int compute_stage_count_or_override_folded_weight_scale(
+    StageCountAutoCarveout<carveout_bytes_> stage_count) {
+  constexpr auto mainloop_pipeline_bytes =
+      sizeof(typename cutlass::PipelineTmaAsync<1>::SharedStorage);
+  constexpr auto a_bits = cute::sizeof_bits_v<ElementA>;
+  constexpr auto b_bits = cute::sizeof_bits_v<ElementB>;
+  constexpr auto s_bits = cute::sizeof_bits_v<ElementScale>;
+  constexpr auto z_bits = get_bits_for_possibly_void_element<ElementZero>();
+  constexpr int scale_group_size = DefaultWeightScaleGroupSize<ElementA>::value;
+
+  static_assert((size<2>(TileShapeMNK{}) % scale_group_size) == 0,
+                "Folded weight-scale storage requires TileK to cover complete scale groups.");
+
+  constexpr auto scale_bytes = cutlass::bits_to_bytes(s_bits * size<0>(TileShapeMNK{}) *
+                                                      size<2>(TileShapeMNK{}) / scale_group_size);
+  constexpr auto zero_bytes = cutlass::bits_to_bytes(z_bits * size<0>(TileShapeMNK{}));
+  static_assert(scale_bytes % 16 == 0,
+                "Folded weight-scale bulk copy must be at least 16B aligned.");
+  static_assert(zero_bytes % 128 == 0, "Zero bytes must be a multiple of 128");
+
+  constexpr int stage_bytes_ =
+      cutlass::bits_to_bytes(a_bits * size<0>(TileShapeMNK{}) * size<2>(TileShapeMNK{})) +
+      cutlass::bits_to_bytes(b_bits * size<1>(TileShapeMNK{}) * size<2>(TileShapeMNK{})) +
+      scale_bytes + zero_bytes;
+
+  constexpr int stage_bytes =
+      cutlass::round_up(stage_bytes_, alignment) + static_cast<int>(mainloop_pipeline_bytes);
+  constexpr int carveout_bytes = cutlass::round_up(carveout_bytes_, alignment);
+  constexpr int capacity_bytes = capacity_bytes_ / alignment * alignment;
+
+  constexpr int computed_stage_count = (capacity_bytes - carveout_bytes) / stage_bytes;
+  return computed_stage_count < 2 ? 2 : computed_stage_count;
+}
+
+}  // namespace detail
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
 // GMMA_TMA_WS_RS
 template <class ElementA_, class GmemLayoutATag_, int AlignmentA, class ElementB_,
           class GmemLayoutBTag_, int AlignmentB, class ElementAccumulator, class TileShape_MNK,
-          class ClusterShape_MNK, class StageCountType, class KernelScheduleType>
+          class ClusterShape_MNK, class StageCountType, class KernelScheduleType,
+          MixedInputScaleMode ScaleMode>
 struct CollectiveBuilderMixedInput<
     arch::Sm90, arch::OpClassTensorOp, ElementA_, GmemLayoutATag_, AlignmentA, ElementB_,
     GmemLayoutBTag_, AlignmentB, ElementAccumulator, TileShape_MNK, ClusterShape_MNK,
-    StageCountType, KernelScheduleType,
+    StageCountType, KernelScheduleType, ScaleMode,
     cute::enable_if_t<
         (cute::is_same_v<KernelScheduleType, KernelTmaWarpSpecialized> ||
          cute::is_same_v<KernelScheduleType, KernelTmaWarpSpecializedPingpong> ||
@@ -49,7 +104,7 @@ struct CollectiveBuilderMixedInput<
          cute::is_same_v<KernelScheduleType, KernelPtrArrayTmaWarpSpecializedCooperative> ||
          cute::is_same_v<KernelScheduleType, KernelPtrArrayTmaWarpSpecializedPingpong>) &&
         (detail::is_use_rmem_A<ElementA_, GmemLayoutATag_, ElementB_, GmemLayoutBTag_>() ||
-         // ConvertAndScale and ConvertAndScaleWithZero
+         // ConvertAndScale
          cute::is_tuple<ElementA_>::value || cute::is_tuple<ElementB_>::value ||
          // DirectConvert
          sizeof_bits<ElementA_>::value != sizeof_bits<ElementB_>::value)>> {
@@ -106,7 +161,6 @@ struct CollectiveBuilderMixedInput<
   static constexpr bool IsATransformed = cute::is_tuple<ElementPairA>::value;
   using ElementScale = cute::conditional_t<IsATransformed, ScaleA, ScaleB>;
   using ElementZero = cute::conditional_t<IsATransformed, ZeroA, ZeroB>;
-
   static_assert(is_static<TileShape_MNK>::value);
   static_assert(is_static<ClusterShape_MNK>::value);
   static_assert(
@@ -177,8 +231,8 @@ struct CollectiveBuilderMixedInput<
       cutlass::detail::alignment_for_swizzle(SmemLayoutAtomB{});
   static constexpr int SmemAlignment = static_cast<int>(cute::max(SmemAlignmentA, SmemAlignmentB));
 
-  // Handle mixed dtype array GEMM's size of tensor map storage.
-  static constexpr size_t TensorMapStorage = sizeof(cute::TmaDescriptor) * size_t(IsMixedInput) * 4;
+  // Array mixed-input GEMM keeps only A/B TMA descriptors; folded scales are loaded by bulk copy.
+  static constexpr size_t TensorMapStorage = sizeof(cute::TmaDescriptor) * size_t(IsMixedInput) * 2;
   static constexpr int KernelSmemCarveout = static_cast<int>(TensorMapStorage);
   static constexpr int Sm90ReducedSmemCapacityBytes =
       detail::sm90_smem_capacity_bytes - KernelSmemCarveout;
@@ -186,21 +240,33 @@ struct CollectiveBuilderMixedInput<
   static constexpr int PipelineStages =
       IsMixedInput
           ? (IsArrayOfPointersGemm
-                 ? detail::compute_stage_count_or_override_single_affine_transformed_input<
+                 ? detail::compute_stage_count_or_override_folded_weight_scale<
                        Sm90ReducedSmemCapacityBytes, RealElementA, RealElementB, ElementScale,
                        ElementZero, TileShape_MNK, SmemAlignment>(StageCountType{})
-                 : detail::compute_stage_count_or_override_single_affine_transformed_input<
+                 : detail::compute_stage_count_or_override_folded_weight_scale<
                        detail::sm90_smem_capacity_bytes, RealElementA, RealElementB, ElementScale,
                        ElementZero, TileShape_MNK, SmemAlignment>(StageCountType{}))
           : detail::compute_stage_count_or_override<detail::sm90_smem_capacity_bytes, ElementAMma,
                                                     ElementBMma, TileShape_MNK, SmemAlignment>(
                 StageCountType{});
 
+  static constexpr bool UseFusedE8M0PreMmaScale = ScaleMode == MixedInputScaleMode::kPreMmaE8M0;
+  static_assert(
+      !UseFusedE8M0PreMmaScale || (IsArrayOfPointersGemm && IsATransformed &&
+                                   cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
+                                   cute::is_same_v<ElementB, cutlass::float_e4m3_t>),
+      "Pre-MMA E8M0 scale mode is only implemented for grouped MXFP4 weight x FP8 activation.");
+
+  using ArrayMixedInputDispatchPolicy =
+      cute::conditional_t<UseFusedE8M0PreMmaScale,
+                          MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInputPreScale<
+                              PipelineStages, ClusterShape_MNK, KernelScheduleType>,
+                          MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInput<
+                              PipelineStages, ClusterShape_MNK, KernelScheduleType>>;
+
   using DispatchPolicy = cute::conditional_t<
       IsMixedInput,
-      cute::conditional_t<IsArrayOfPointersGemm,
-                          MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInput<
-                              PipelineStages, ClusterShape_MNK, KernelScheduleType>,
+      cute::conditional_t<IsArrayOfPointersGemm, ArrayMixedInputDispatchPolicy,
                           MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInput<
                               PipelineStages, ClusterShape_MNK, KernelScheduleType>>,
       MainloopSm90TmaGmmaRmemAWarpSpecialized<PipelineStages, ClusterShape_MNK,

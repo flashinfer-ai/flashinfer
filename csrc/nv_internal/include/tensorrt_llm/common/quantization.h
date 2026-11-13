@@ -19,9 +19,32 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <type_traits>
 
 namespace tensorrt_llm {
 namespace common {
+
+enum class NVFP44Over6ErrMode : std::uint8_t {
+  MAE = 0,
+  MSE = 1,
+};
+
+template <int E4M3_MAX = 448, NVFP44Over6ErrMode ERR_MODE = NVFP44Over6ErrMode::MAE,
+          bool ERR_USE_FAST_MATH = false>
+struct NVFP44Over6Config {
+  static_assert(E4M3_MAX == 448 || E4M3_MAX == 256, "Unsupported NVFP4 E4M3 max.");
+
+  static constexpr int e4m3Max = E4M3_MAX;
+  static constexpr NVFP44Over6ErrMode errMode = ERR_MODE;
+  static constexpr bool errUseFastMath = ERR_USE_FAST_MATH;
+};
+
+template <typename T>
+struct IsNVFP44Over6Config : std::false_type {};
+
+template <int E4M3_MAX, NVFP44Over6ErrMode ERR_MODE, bool ERR_USE_FAST_MATH>
+struct IsNVFP44Over6Config<NVFP44Over6Config<E4M3_MAX, ERR_MODE, ERR_USE_FAST_MATH>>
+    : std::true_type {};
 
 class QuantMode {
   // [WARNING] KEEP BELOW DEFINITION IN SYNC WITH tensorrt_llm/quantization/mode.py

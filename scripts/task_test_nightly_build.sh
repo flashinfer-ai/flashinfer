@@ -15,6 +15,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
 : ${DIST_JIT_CACHE_DIR:=dist-jit-cache}
 : ${DIST_PYTHON_DIR:=dist-python}
 
+SOURCE_WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
+cd "${SOURCE_WORKSPACE}"
+TEST_RUN_DIR="$(mktemp -d /tmp/flashinfer-nightly-tests.XXXXXX)"
+trap 'rm -rf "${TEST_RUN_DIR}"' EXIT
+
 # Clean Python bytecode cache to avoid stale imports (e.g., after module refactoring)
 echo "Cleaning Python bytecode cache..."
 find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
@@ -26,12 +31,14 @@ echo ""
 echo "=== GPU Information ==="
 nvidia-smi
 
-# Install flashinfer packages
+# setup_test_env.sh has already verified the image's direct requirements. Keep
+# its validated CUDA stack intact instead of asking pip to resolve the packaged
+# requirements (which include torch's older exact cuDNN dependency).
 echo "Installing flashinfer-cubin from ${DIST_CUBIN_DIR}..."
-pip install ${DIST_CUBIN_DIR}/*.whl
+pip install --no-deps "${DIST_CUBIN_DIR}"/*.whl
 
 echo "Installing flashinfer-jit-cache from ${DIST_JIT_CACHE_DIR}..."
-pip install ${DIST_JIT_CACHE_DIR}/*.whl
+pip install --no-deps "${DIST_JIT_CACHE_DIR}"/*.whl
 
 # Disable JIT to verify that jit-cache package contains all necessary
 # precompiled modules for the test suite to pass without compilation
@@ -39,20 +46,34 @@ echo "Disabling JIT compilation to test with precompiled cache only..."
 export FLASHINFER_DISABLE_JIT=1
 
 echo "Installing flashinfer-python from ${DIST_PYTHON_DIR}..."
-pip install ${DIST_PYTHON_DIR}/*.tar.gz
+pip install --no-deps "${DIST_PYTHON_DIR}"/*.tar.gz
 
 # Verify installation
 echo "Verifying installation..."
 # Run from /tmp to avoid importing local flashinfer/ source directory
+(cd /tmp && python "${SOURCE_WORKSPACE}/scripts/validate_nightly_packages.py")
 (cd /tmp && python -m flashinfer show-config)
+
+# Copy test sources and their benchmark fixtures into an isolated directory so
+# package tests exercise the installed distribution instead of /workspace.
+cp -a "${SOURCE_WORKSPACE}/tests" "${TEST_RUN_DIR}/"
+cp -a "${SOURCE_WORKSPACE}/benchmarks" "${TEST_RUN_DIR}/"
+cp -a "${SOURCE_WORKSPACE}/pytest.ini" "${TEST_RUN_DIR}/"
+mkdir -p "${TEST_RUN_DIR}/scripts"
+cp -a "${SOURCE_WORKSPACE}/scripts/__init__.py" "${TEST_RUN_DIR}/scripts/"
+cp -a "${SOURCE_WORKSPACE}/scripts/test_sharding" \
+  "${TEST_RUN_DIR}/scripts/"
 
 # Run test shard
 echo "Running test shard ${TEST_SHARD}..."
 export SKIP_INSTALL=1
+# Converted parameter matrices select representative cases by default. Nightly
+# package validation exercises their complete Cartesian products.
+export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+${PYTEST_ADDOPTS} }--full"
 
 # Pass through JIT cache report file if set
 if [ -n "${FLASHINFER_JIT_CACHE_REPORT_FILE}" ]; then
   export FLASHINFER_JIT_CACHE_REPORT_FILE
 fi
 
-bash scripts/task_jit_run_tests_part${TEST_SHARD}.sh
+(cd "${TEST_RUN_DIR}" && bash "${SOURCE_WORKSPACE}/scripts/task_jit_run_tests_part${TEST_SHARD}.sh")

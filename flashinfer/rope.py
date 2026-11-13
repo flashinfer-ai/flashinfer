@@ -20,13 +20,43 @@ from typing import Optional, Tuple
 import torch
 
 from .api_logging import flashinfer_api
+from .trace.templates.rope import (
+    apply_llama31_rope_inplace_trace,
+    apply_llama31_rope_pos_ids_inplace_trace,
+    apply_llama31_rope_pos_ids_trace,
+    apply_llama31_rope_trace,
+    apply_rope_inplace_trace,
+    apply_rope_pos_ids_inplace_trace,
+    apply_rope_pos_ids_trace,
+    apply_rope_trace,
+    apply_rope_with_cos_sin_cache_inplace_trace,
+    apply_rope_with_cos_sin_cache_trace,
+    mla_rope_quantize_fp8_trace,
+    rope_quantize_fp8_append_paged_kv_cache_trace,
+    rope_quantize_fp8_trace,
+)
 from .jit.rope import gen_rope_module
-from .utils import register_custom_op, register_fake_op
+from .utils import get_compute_capability, register_custom_op, register_fake_op
 
 
 @functools.cache
 def get_rope_module():
     return gen_rope_module().build_and_load()
+
+
+def _set_rope_launch_override(
+    two_heads: Optional[bool] = None, split: Optional[int] = None
+) -> None:
+    """Test-only: force the token-parallel RoPE launch schedule.
+
+    ``two_heads`` picks the one- or two-heads-per-step kernel (``None``: automatic,
+    which is two heads only on SM107). ``split`` forces ``gridDim.y`` and the
+    token-parallel kernel (``None``: automatic). The setting is process-wide;
+    call with no arguments to restore the automatic schedule.
+    """
+    get_rope_module().rope_set_launch_override(
+        -1 if two_heads is None else int(two_heads), 0 if split is None else split
+    )
 
 
 @register_custom_op("flashinfer::apply_rope", mutates_args=("q_rope", "k_rope"))
@@ -414,7 +444,15 @@ def _fake_apply_llama31_rope_pos_ids(
     pass
 
 
-@flashinfer_api
+def _check_rotary_dim(rotary_dim: int, q: torch.Tensor, k: torch.Tensor) -> None:
+    """Reject a ``rotary_dim`` that would read past a q/k head into the next one."""
+    if rotary_dim > min(q.size(-1), k.size(-1)):
+        raise ValueError(
+            f"head_dim (q={q.size(-1)}, k={k.size(-1)}) must be >= rotary_dim ({rotary_dim})"
+        )
+
+
+@flashinfer_api(trace=apply_rope_inplace_trace)
 def apply_rope_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -425,12 +463,12 @@ def apply_rope_inplace(
     rope_scale: float = 1,
     rope_theta: float = 1e4,
 ) -> None:
-    r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) inplace.
+    r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) in place.
     cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
+    We use :attr:`indptr` to denote the start pointer of each segment in the batch. The query
+    of the i-th segment is ``q[indptr[i]:indptr[i+1]]``, and its key is
+    ``k[indptr[i]:indptr[i+1]]``. The first element of :attr:`indptr` is always
     0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
@@ -438,18 +476,18 @@ def apply_rope_inplace(
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     indptr : torch.Tensor
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
         The relative position offsets of each query in the batch, shape: ``(batch_size)``.
     rotary_dim : Optional[int]
-        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
-        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        The dimensions to which to apply RoPE. If ``None``, RoPE is applied to the entire head dimension,
+        otherwise it is applied to the first ``rotary_dim`` dimensions. Default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -497,12 +535,13 @@ def apply_rope_inplace(
     """
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
     _apply_rope(
         q, k, q, k, indptr, offsets, rotary_dim, interleave, rope_scale, rope_theta
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_rope_pos_ids_inplace_trace)
 def apply_rope_pos_ids_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -512,29 +551,26 @@ def apply_rope_pos_ids_inplace(
     rope_scale: float = 1,
     rope_theta: float = 1e4,
 ) -> None:
-    r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) inplace.
+    r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) in place.
     cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
-    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
+    Each element of :attr:`pos_ids` gives the position of the corresponding query/key row.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
 
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     pos_ids : torch.Tensor
         Position indices, shape: ``(nnz)``.
     rotary_dim : Optional[int]
-        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
-        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        The dimensions to which to apply RoPE. If ``None``, RoPE is applied to the entire head dimension,
+        otherwise it is applied to the first ``rotary_dim`` dimensions. Default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -556,12 +592,13 @@ def apply_rope_pos_ids_inplace(
     """
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
     _apply_rope_pos_ids(
         q, k, q, k, pos_ids, rotary_dim, interleave, rope_scale, rope_theta
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_llama31_rope_inplace_trace)
 def apply_llama31_rope_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -575,12 +612,12 @@ def apply_llama31_rope_inplace(
     high_freq_factor: float = 4,
     old_context_len: int = 8192,
 ) -> None:
-    r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
-    RaggedTensor) inplace. cos/sin values are computed on the fly inside the kernel.
+    r"""Apply Llama 3.1-style rotary embedding to a batch of queries/keys (stored as
+    RaggedTensor) in place. cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
+    We use :attr:`indptr` to denote the start pointer of each segment in the batch. The query
+    of the i-th segment is ``q[indptr[i]:indptr[i+1]]``, and its key is
+    ``k[indptr[i]:indptr[i+1]]``. The first element of :attr:`indptr` is always
     0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
@@ -588,18 +625,18 @@ def apply_llama31_rope_inplace(
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     indptr : torch.Tensor
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
         The relative position offsets of each query in the batch, shape: ``(batch_size)``.
     rotary_dim : Optional[int]
-        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
-        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        The dimensions to which to apply RoPE. If ``None``, RoPE is applied to the entire head dimension,
+        otherwise it is applied to the first ``rotary_dim`` dimensions. Default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -653,6 +690,7 @@ def apply_llama31_rope_inplace(
     """
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
     _apply_llama31_rope(
         q,
         k,
@@ -670,7 +708,7 @@ def apply_llama31_rope_inplace(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_llama31_rope_pos_ids_inplace_trace)
 def apply_llama31_rope_pos_ids_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -683,29 +721,26 @@ def apply_llama31_rope_pos_ids_inplace(
     high_freq_factor: float = 4,
     old_context_len: int = 8192,
 ) -> None:
-    r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
-    RaggedTensor) inplace. cos/sin values are computed on the fly inside the kernel.
+    r"""Apply Llama 3.1-style rotary embedding to a batch of queries/keys (stored as
+    RaggedTensor) in place. cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
-    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
+    Each element of :attr:`pos_ids` gives the position of the corresponding query/key row.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
 
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     pos_ids : torch.Tensor
         Position indices, shape: ``(nnz)``.
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -733,6 +768,7 @@ def apply_llama31_rope_pos_ids_inplace(
     """
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
     _apply_llama31_rope_pos_ids(
         q,
         k,
@@ -749,7 +785,7 @@ def apply_llama31_rope_pos_ids_inplace(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_rope_trace)
 def apply_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -763,9 +799,9 @@ def apply_rope(
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor).
     cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
+    We use :attr:`indptr` to denote the start pointer of each segment in the batch. The query
+    of the i-th segment is ``q[indptr[i]:indptr[i+1]]``, and its key is
+    ``k[indptr[i]:indptr[i+1]]``. The first element of :attr:`indptr` is always
     0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
@@ -773,11 +809,10 @@ def apply_rope(
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     indptr : torch.Tensor
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
@@ -785,6 +820,7 @@ def apply_rope(
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -841,10 +877,11 @@ def apply_rope(
     --------
     apply_rope_inplace
     """
-    q_rope = torch.empty_like(q)
-    k_rope = torch.empty_like(k)
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
+    q_rope = torch.empty_like(q)
+    k_rope = torch.empty_like(k)
     _apply_rope(
         q,
         k,
@@ -860,7 +897,7 @@ def apply_rope(
     return q_rope, k_rope
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_rope_pos_ids_trace)
 def apply_rope_pos_ids(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -873,26 +910,23 @@ def apply_rope_pos_ids(
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor).
     cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
-    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
+    Each element of :attr:`pos_ids` gives the position of the corresponding query/key row.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
 
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     pos_ids : torch.Tensor
-        Position indices, shape: ``(batch_size + 1)``.
+        Position indices, shape: ``(nnz)``.
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -919,17 +953,18 @@ def apply_rope_pos_ids(
     --------
     apply_rope_inplace
     """
-    q_rope = torch.empty_like(q)
-    k_rope = torch.empty_like(k)
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
+    q_rope = torch.empty_like(q)
+    k_rope = torch.empty_like(k)
     _apply_rope_pos_ids(
         q, k, q_rope, k_rope, pos_ids, rotary_dim, interleave, rope_scale, rope_theta
     )
     return q_rope, k_rope
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_llama31_rope_trace)
 def apply_llama31_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -943,12 +978,12 @@ def apply_llama31_rope(
     high_freq_factor: float = 4,
     old_context_len: int = 8192,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
+    r"""Apply Llama 3.1-style rotary embedding to a batch of queries/keys (stored as
     RaggedTensor). cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
+    We use :attr:`indptr` to denote the start pointer of each segment in the batch. The query
+    of the i-th segment is ``q[indptr[i]:indptr[i+1]]``, and its key is
+    ``k[indptr[i]:indptr[i+1]]``. The first element of :attr:`indptr` is always
     0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
@@ -956,11 +991,10 @@ def apply_llama31_rope(
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     indptr : torch.Tensor
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
@@ -968,6 +1002,7 @@ def apply_llama31_rope(
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -1030,10 +1065,11 @@ def apply_llama31_rope(
     --------
     apply_llama31_rope_inplace
     """
-    q_rope = torch.empty_like(q)
-    k_rope = torch.empty_like(k)
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
+    q_rope = torch.empty_like(q)
+    k_rope = torch.empty_like(k)
     _apply_llama31_rope(
         q,
         k,
@@ -1052,7 +1088,7 @@ def apply_llama31_rope(
     return q_rope, k_rope
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_llama31_rope_pos_ids_trace)
 def apply_llama31_rope_pos_ids(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1065,29 +1101,26 @@ def apply_llama31_rope_pos_ids(
     high_freq_factor: float = 4,
     old_context_len: int = 8192,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
+    r"""Apply Llama 3.1-style rotary embedding to a batch of queries/keys (stored as
     RaggedTensor). cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
-    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
+    Each element of :attr:`pos_ids` gives the position of the corresponding query/key row.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
 
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     pos_ids : torch.Tensor
         Position indices, shape: ``(nnz)``.
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -1119,10 +1152,11 @@ def apply_llama31_rope_pos_ids(
     --------
     apply_llama31_rope_pos_ids_inplace
     """
-    q_rope = torch.empty_like(q)
-    k_rope = torch.empty_like(k)
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
+    q_rope = torch.empty_like(q)
+    k_rope = torch.empty_like(k)
     _apply_llama31_rope_pos_ids(
         q,
         k,
@@ -1140,7 +1174,7 @@ def apply_llama31_rope_pos_ids(
     return q_rope, k_rope
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_rope_with_cos_sin_cache_trace)
 def apply_rope_with_cos_sin_cache(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -1161,6 +1195,11 @@ def apply_rope_with_cos_sin_cache(
         Query tensor, shape: ``(nnz, num_q_heads * head_size)``.
     key : torch.Tensor
         Key tensor, shape: ``(nnz, num_k_heads * head_size)``.
+    head_size : int
+        Per-head feature dimension. ``query`` and ``key`` are reshaped to
+        ``(nnz, num_q_heads, head_size)`` and ``(nnz, num_k_heads, head_size)``
+        respectively before applying RoPE. Must divide the trailing dimension
+        of ``query`` and ``key``.
     cos_sin_cache : torch.Tensor
         Cosine and Sine cache tensor, shape: ``(max_seq_len, rotary_dim)``.
         Cosine is the first half and Sine is the second half on rotary_dim.
@@ -1168,7 +1207,7 @@ def apply_rope_with_cos_sin_cache(
         Whether to use Neox style RoPE, default: ``True``.
 
         * If ``True``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``.
 
         * If ``False``, the last dimension of the query/key tensor is interleaved, i.e.,
@@ -1204,7 +1243,7 @@ def apply_rope_with_cos_sin_cache(
     return query_out, key_out
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_rope_with_cos_sin_cache_inplace_trace)
 def apply_rope_with_cos_sin_cache_inplace(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -1216,7 +1255,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     r"""
     Apply rotary embedding to keys and queries with precomputed cos/sin values.
     This is designed to be compatible with the SGL/vLLM implementation.
-    The result is inplace applied to the input tensors.
+    The result is applied in place to the input tensors.
 
     Parameters
     ----------
@@ -1226,6 +1265,11 @@ def apply_rope_with_cos_sin_cache_inplace(
         Query tensor, shape: ``(nnz, num_q_heads * head_size)``.
     key : torch.Tensor
         Key tensor, shape: ``(nnz, num_k_heads * head_size)``.
+    head_size : int
+        Per-head feature dimension. ``query`` and ``key`` are reshaped to
+        ``(nnz, num_q_heads, head_size)`` and ``(nnz, num_k_heads, head_size)``
+        respectively before applying RoPE. Must divide the trailing dimension
+        of ``query`` and ``key``.
     cos_sin_cache : torch.Tensor
         Cosine and Sine cache tensor, shape: ``(max_seq_len, rotary_dim)``.
         Cosine is the first half and Sine is the second half on rotary_dim.
@@ -1233,7 +1277,7 @@ def apply_rope_with_cos_sin_cache_inplace(
         Whether to use Neox style RoPE, default: ``True``.
 
         * If ``True``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``.
 
         * If ``False``, the last dimension of the query/key tensor is interleaved, i.e.,
@@ -1257,7 +1301,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=mla_rope_quantize_fp8_trace)
 def mla_rope_quantize_fp8(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
@@ -1275,6 +1319,47 @@ def mla_rope_quantize_fp8(
     k_nope_out: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Apply RoPE and quantize to FP8 for MLA attention.
+
+    Thin wrapper that forwards to :func:`rope_quantize_fp8` with the MLA
+    tensor layout: ``k_rope`` / ``k_nope`` are 2-D (no KV-head axis).  All
+    other parameters and behavior match :func:`rope_quantize_fp8`; see that
+    function for full parameter documentation.
+
+    Parameters
+    ----------
+    q_rope : torch.Tensor
+        Query rotary portion, ``(nnz, num_qo_heads, rope_dim)``, fp16/bf16.
+    k_rope : torch.Tensor
+        Key rotary portion in MLA layout, ``(nnz, rope_dim)``, fp16/bf16.
+    q_nope : torch.Tensor
+        Query non-rotary portion, ``(nnz, num_qo_heads, no_rope_dim)``.
+    k_nope : torch.Tensor
+        Key non-rotary portion in MLA layout, ``(nnz, no_rope_dim)``.
+    cos_sin_cache : torch.Tensor
+        ``(max_seq_len, rope_dim)`` precomputed cos/sin cache (fp32).
+    pos_ids : torch.Tensor
+        Per-token position indices, ``(nnz,)``.
+    is_neox : bool
+        ``True`` for NeoX (split-half) layout, ``False`` for interleaved.
+    quantize_dtype : torch.dtype, optional
+        Target quantization dtype (``float8_e4m3fn`` or ``float8_e5m2``).
+        Inferred from ``*_out`` tensors when ``None``.
+    quant_scale_q : float
+        Quantization scale applied to queries.
+    quant_scale_kv : float
+        Quantization scale applied to keys.
+    q_rope_out, k_rope_out, q_nope_out, k_nope_out : torch.Tensor, optional
+        Pre-allocated output tensors.  Allocated automatically when
+        ``None``.
+    enable_pdl : bool
+        Whether to enable Programmatic Dependent Launch.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ``(q_rope_out, k_rope_out, q_nope_out, k_nope_out)``.
+    """
     return rope_quantize_fp8(
         q_rope,
         k_rope,
@@ -1294,7 +1379,7 @@ def mla_rope_quantize_fp8(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=rope_quantize_fp8_trace)
 def rope_quantize_fp8(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
@@ -1311,6 +1396,7 @@ def rope_quantize_fp8(
     q_nope_out: Optional[torch.Tensor] = None,
     k_nope_out: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
+    backend: str = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Apply RoPE (Rotary Positional Embeddings) and quantize to FP8 format.
 
@@ -1357,12 +1443,68 @@ def rope_quantize_fp8(
         Pre-allocated output tensor for quantized key (non-rotary). If ``None``, allocated automatically.
     enable_pdl : bool
         Whether to enable PDL (Programmatic Dependent Launch). Default: ``False``.
+    backend : str
+        Implementation backend. ``"cuda"`` (default) uses the fused CUDA kernel;
+        ``"cutile"`` uses the cuda.tile Python kernel and requires SM90 or newer.
 
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         Quantized tensors: (q_rope_out, k_rope_out, q_nope_out, k_nope_out).
     """
+    if backend not in ("cuda", "cutile"):
+        raise ValueError(
+            f"Unsupported backend for rope_quantize_fp8: {backend!r}; "
+            "expected 'cuda' or 'cutile'."
+        )
+    if backend == "cutile":
+        if is_neox:
+            # The cuTile kernel implements only the interleaved (GPT-J) rotary
+            # layout. is_neox defaults to True, so surface a clear error instead
+            # of the kernel's bare AssertionError (which -O would also strip).
+            raise NotImplementedError(
+                "backend='cutile' supports is_neox=False (interleaved/GPT-J "
+                "rotary) only; got is_neox=True."
+            )
+        if k_rope.ndim != 2:
+            # The kernel addresses the key as 2D [tokens, rope_dim] (single
+            # shared latent K head, the MLA use case). A 3D GQA/MHA key would
+            # fail deep in autotune with an opaque TileTypeError.
+            raise NotImplementedError(
+                "backend='cutile' rope_quantize_fp8 supports MLA-style 2D key "
+                f"tensors (single shared K head) only; got {k_rope.ndim}D key "
+                "(GQA/MHA multi-head K is not supported)."
+            )
+        if cos_sin_cache.dtype != torch.float32:
+            raise ValueError("cos_sin_cache should be float32")
+        capability = get_compute_capability(q_rope.device)
+        # cuda.tile (tileiras) has no FP8 lowering for sm_89 despite Ada hardware support.
+        if capability < (9, 0):
+            raise NotImplementedError(
+                "backend='cutile' rope_quantize_fp8 requires SM90 or newer "
+                f"for FP8 output; got SM{capability[0]}{capability[1]}."
+            )
+        from .quantization.kernels.cutile.rope_quantize_fp8_cutile import (
+            rope_quantize_fp8_cutile,
+        )
+
+        return rope_quantize_fp8_cutile(
+            q_rope,
+            k_rope,
+            q_nope,
+            k_nope,
+            cos_sin_cache,
+            pos_ids,
+            is_neox=is_neox,
+            quantize_dtype=quantize_dtype,
+            quant_scale_q=quant_scale_q,
+            quant_scale_kv=quant_scale_kv,
+            q_rope_out=q_rope_out,
+            k_rope_out=k_rope_out,
+            q_nope_out=q_nope_out,
+            k_nope_out=k_nope_out,
+        )
+
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 
@@ -1434,7 +1576,7 @@ def rope_quantize_fp8(
     return q_rope_out, k_rope_out, q_nope_out, k_nope_out
 
 
-@flashinfer_api
+@flashinfer_api(trace=rope_quantize_fp8_append_paged_kv_cache_trace)
 def rope_quantize_fp8_append_paged_kv_cache(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
@@ -1494,7 +1636,9 @@ def rope_quantize_fp8_append_paged_kv_cache(
         For GQA/MHA: ``(k_cache, v_cache)`` where:
             - k_cache: ``(max_pages, page_size, num_kv_heads, head_dim)`` or
               ``(max_pages, num_kv_heads, page_size, head_dim)`` depending on layout, in FP8
-            - v_cache: same shape as k_cache, in FP8
+            - v_cache: same page size, head count and head dim as k_cache, in FP8; its
+              strides may differ from k_cache's, e.g. padded rows. Both caches are indexed
+              with the same ``kv_indices``, so each must hold every page listed there.
     kv_indices : torch.Tensor
         Page indices mapping, shape: ``(total_pages,)``. Typically ``torch.arange(total_pages)``.
     kv_indptr : torch.Tensor
@@ -1540,6 +1684,9 @@ def rope_quantize_fp8_append_paged_kv_cache(
     - The ``batch_indices`` and ``positions`` tensors are typically obtained from
       ``flashinfer.get_batch_indices_positions()``.
     - Cache tensors must already be allocated in the target FP8 dtype.
+    - ``rope_dim`` and ``no_rope_dim`` must be multiples of 16, and the rows of every input,
+      Q output and cache tensor must start on 16-byte boundaries (strides that are multiples
+      of 16 bytes); otherwise a ``ValueError`` is raised.
     """
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")

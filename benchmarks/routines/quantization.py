@@ -15,20 +15,67 @@ limitations under the License.
 """
 
 from collections import defaultdict
+import os
 
 import numpy as np
 import torch
 
 import flashinfer
+from flashinfer.quantization.fp4_quantization import NVFP4_QUANT_ENV_VARS
+from flashinfer.quantization.nvfp4_quantization_utils import (
+    current_nvfp4_4over6_config,
+    env_flag_enabled as _env_flag_enabled,
+    make_nvfp4_global_scale,
+    nvfp4_e4m3_max,
+)
 from flashinfer.testing.utils import bench_gpu_time
 
 from .flashinfer_benchmark_utils import (
+    check_batch_invariance,
     dtype_str_to_torch_dtype,
     get_device,
     print_perf_metrics,
     is_close_stats,
+    probe_backends,
     filter_backends_by_compute_capability,
+    warn_if_pdl_unsupported,
 )
+
+
+def _unswizzled_sf_rows(sf, num_rows, k, block, layout):
+    """The scale-factor buffer as its ``(num_rows, k / block)`` logical bytes, whatever the store layout.
+
+    The swizzled layouts (128x4, 8x4) pad and interleave rows, so a row's scales are not a slice of the
+    buffer; the batch-invariance check compares rows through this view.
+    """
+    from flashinfer.batch_invariant.quantization.layout import unswizzle_sf
+
+    return unswizzle_sf(sf.contiguous().view(torch.uint8), num_rows, k, block, layout)
+
+
+def _assert_nvfp4_refcheck_tensor_equal(
+    name: str,
+    backend: str,
+    ref_backend: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+):
+    if actual.shape != expected.shape:
+        raise AssertionError(
+            f"[nvfp4_quantize] {name} shape mismatch: "
+            f"{backend}={actual.shape}, {ref_backend}={expected.shape}"
+        )
+    if actual.dtype != expected.dtype:
+        raise AssertionError(
+            f"[nvfp4_quantize] {name} dtype mismatch: "
+            f"{backend}={actual.dtype}, {ref_backend}={expected.dtype}"
+        )
+    if not torch.equal(actual, expected):
+        mismatch_pct = (actual != expected).float().mean().item() * 100
+        raise AssertionError(
+            f"[nvfp4_quantize] {name} value mismatch: "
+            f"{backend} vs {ref_backend}, mismatch={mismatch_pct:.4f}%"
+        )
 
 
 def run_quantization_test(args):
@@ -81,8 +128,9 @@ def parse_quantization_args(line, parser):
         type=str,
         required=False,
         default="bfloat16",
-        choices=["bfloat16", "float16"],
-        help="Data type of the input tensor.",
+        choices=["bfloat16", "float16", "float32"],
+        help="Data type of the input tensor. float32 is supported by "
+        "mxfp8_quantize with the cute-dsl backend only.",
     )
     parser.add_argument(
         "--is_sf_swizzled_layout",
@@ -105,19 +153,17 @@ def parse_quantization_args(line, parser):
         help="sfVecSize for quantization. Default: 32",
     )
     parser.add_argument(
-        "--enable_pdl",
-        action="store_true",
-        default=False,
-        help="Enable programmatic dependent launch.",
-    )
-    parser.add_argument(
         "--backends",
         type=str,
         required=False,
         nargs="+",
         default=["cuda"],
-        choices=["cuda", "cute-dsl"],
-        help="Backend to test. Default: cuda",
+        choices=["cuda", "cute-dsl", "batch_invariant"],
+        help=(
+            "Backend to test. Default: cuda. `batch_invariant` (mxfp8_quantize, mxfp4_quantize, nvfp4_quantize) "
+            "runs the operator with batch_invariant=True. With --refcheck its codes and scales are also "
+            "checked bit for bit against the same rows quantized alone, in a sub-batch and under a permutation."
+        ),
     )
     # FP4 quantization specific arguments
     parser.add_argument(
@@ -140,7 +186,7 @@ def parse_quantization_args(line, parser):
         required=False,
         default="128x4",
         choices=["128x4", "8x4", "linear"],
-        help="Scale factor layout for NVFP4 quantization. Default: 128x4",
+        help="Scale factor layout for FP4 quantization. Default: 128x4",
     )
     parser.add_argument(
         "--do_shuffle",
@@ -154,6 +200,12 @@ def parse_quantization_args(line, parser):
         required=False,
         default=16,
         help="Scale factor vector size for NVFP4 quantization. Default: 16",
+    )
+    parser.add_argument(
+        "--per_token_activation",
+        action="store_true",
+        default=False,
+        help="Benchmark NVFP4 per-token activation quantization.",
     )
 
     args = parser.parse_args(line)
@@ -213,10 +265,17 @@ def testMxfp8Quantize(args):
         return res
 
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
-    if input_dtype not in [torch.bfloat16, torch.float16]:
+    if input_dtype not in [torch.bfloat16, torch.float16, torch.float32]:
         raise ValueError(
-            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are bfloat16, float16."
+            f"Unsupported input dtype: {args.input_dtype}. "
+            "Supported dtypes are bfloat16, float16, float32."
         )
+    if input_dtype == torch.float32 and "cuda" in backends:
+        print("[INFO] cuda backend does not support float32 input for mxfp8_quantize")
+        backends = [b for b in backends if b != "cuda"]
+        if len(backends) == 0:
+            print("[ERROR] No backends to test. Exiting.")
+            return res
     ## Done parsing input arguments
 
     ## Prepare input tensors
@@ -231,6 +290,15 @@ def testMxfp8Quantize(args):
         print(f"[VVERBOSE] {enable_pdl = }")
 
     def run_backend(backend, input_tensor):
+        if backend == "batch_invariant":
+            return flashinfer.mxfp8_quantize(
+                input_tensor,
+                is_sf_swizzled_layout=is_sf_swizzled_layout,
+                alignment=alignment,
+                enable_pdl=enable_pdl,
+                backend="auto",
+                batch_invariant=True,
+            )
         return flashinfer.mxfp8_quantize(
             input_tensor,
             is_sf_swizzled_layout=is_sf_swizzled_layout,
@@ -238,6 +306,13 @@ def testMxfp8Quantize(args):
             enable_pdl=enable_pdl,
             backend=backend,
         )
+
+    backends = probe_backends(
+        backends, run_backend, input_tensor, only=("batch_invariant",)
+    )
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
 
     # Reference check via dequantize round-trip
     has_reference_output = False
@@ -316,6 +391,25 @@ def testMxfp8Quantize(args):
                     if not args.allow_output_mismatch:
                         raise
 
+    if run_refcheck and "batch_invariant" in outputs:
+        # Bitwise: the codes and the (unswizzled) scales of the same rows alone / in a sub-batch / permuted.
+        sf_layout_name = "128x4" if is_sf_swizzled_layout else "linear"
+
+        def per_row(x_q, sf, num_rows):
+            return (x_q, _unswizzled_sf_rows(sf, num_rows, k, 32, sf_layout_name))
+
+        def run_rows(rows):
+            x_q, sf = run_backend("batch_invariant", input_tensor.index_select(0, rows))
+            return per_row(x_q, sf, rows.numel())
+
+        check_batch_invariance(
+            "mxfp8_quantize/batch_invariant",
+            run_rows,
+            m,
+            per_row(*outputs["batch_invariant"], m),
+            verbose=args.verbose,
+        )
+
     for backend in backends:
         if len(backend_times[backend]) > 0:
             median_time = np.median(backend_times[backend])
@@ -389,10 +483,20 @@ def testMxfp4Quantize(args):
     backends = args.backends[:]  # Make a copy to avoid modifying the original
     m = args.m
     k = args.k
+    sf_layout_str = args.sf_layout
     enable_pdl = args.enable_pdl
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
     res = []
+
+    from flashinfer import SfLayout
+
+    sf_layout_map = {
+        "128x4": SfLayout.layout_128x4,
+        "8x4": SfLayout.layout_8x4,
+        "linear": SfLayout.layout_linear,
+    }
+    sf_layout = sf_layout_map[sf_layout_str]
 
     # mxfp4 uses sf_vec_size=32 (hardcoded in the API)
     sf_vec_size = 32
@@ -420,14 +524,31 @@ def testMxfp4Quantize(args):
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_tensor.shape = }")
         print(f"[VVERBOSE] {input_tensor.dtype = }")
+        print(f"[VVERBOSE] {sf_layout_str = }")
         print(f"[VVERBOSE] {enable_pdl = }")
 
     def run_backend(backend, input_tensor):
+        if backend == "batch_invariant":
+            return flashinfer.mxfp4_quantize(
+                input_tensor,
+                backend="auto",
+                enable_pdl=enable_pdl,
+                sfLayout=sf_layout,
+                batch_invariant=True,
+            )
         return flashinfer.mxfp4_quantize(
             input_tensor,
             backend=backend,
             enable_pdl=enable_pdl,
+            sfLayout=sf_layout,
         )
+
+    backends = probe_backends(
+        backends, run_backend, input_tensor, only=("batch_invariant",)
+    )
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
 
     # Reference check via dequantize round-trip
     has_reference_output = False
@@ -461,11 +582,13 @@ def testMxfp4Quantize(args):
                         f"x_q.shape = {x_q.shape}, x_q.dtype = {x_q.dtype}, "
                         f"sf.shape = {sf.shape}, sf.dtype = {sf.dtype}"
                     )
-                # Dequantize and compare with original
+                # Dequantize and compare with original.
                 try:
-                    dequantized = flashinfer.mxfp4_dequantize(x_q, sf)
-                    # Move back to GPU for comparison
-                    dequantized = dequantized.to(input_tensor.device)
+                    dequantized = flashinfer.mxfp4_dequantize(
+                        x_q,
+                        sf,
+                        sfLayout=sf_layout,
+                    ).to(input_tensor.device)
                     # Compare with original input (allowing for quantization error)
                     (
                         num_different_elements,
@@ -497,6 +620,23 @@ def testMxfp4Quantize(args):
                         )
                     if not args.allow_output_mismatch:
                         raise
+
+    if run_refcheck and "batch_invariant" in outputs:
+
+        def per_row(x_q, sf, num_rows):
+            return (x_q, _unswizzled_sf_rows(sf, num_rows, k, 32, sf_layout_str))
+
+        def run_rows(rows):
+            x_q, sf = run_backend("batch_invariant", input_tensor.index_select(0, rows))
+            return per_row(x_q, sf, rows.numel())
+
+        check_batch_invariance(
+            "mxfp4_quantize/batch_invariant",
+            run_rows,
+            m,
+            per_row(*outputs["batch_invariant"], m),
+            verbose=args.verbose,
+        )
 
     for backend in backends:
         if len(backend_times[backend]) > 0:
@@ -530,6 +670,7 @@ def testMxfp4Quantize(args):
                 cur_res["m"] = m
                 cur_res["k"] = k
                 cur_res["input_dtype"] = str(input_dtype)
+                cur_res["sf_layout"] = sf_layout_str
                 cur_res["enable_pdl"] = enable_pdl
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
@@ -576,6 +717,8 @@ def testNvfp4Quantize(args):
     do_shuffle = args.do_shuffle
     sf_vec_size = args.sf_vec_size
     enable_pdl = args.enable_pdl
+    per_token_activation = args.per_token_activation
+    nvfp4_4over6_config = current_nvfp4_4over6_config()
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
     res = []
@@ -600,6 +743,8 @@ def testNvfp4Quantize(args):
         raise ValueError(
             f"k ({k}) must be divisible by sf_vec_size ({sf_vec_size}) for nvfp4_quantize"
         )
+    if per_token_activation and sf_vec_size != 16:
+        raise ValueError("Per-token NVFP4 quantization only supports sf_vec_size=16")
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     if len(backends) == 0:
@@ -616,7 +761,12 @@ def testNvfp4Quantize(args):
     ## Prepare input tensors
     input_shape = (m, k)
     input_tensor = torch.randn(input_shape, dtype=input_dtype, device=device)
-    global_sf_tensor = torch.tensor([global_scale], dtype=torch.float32, device=device)
+    global_sf_tensor = make_nvfp4_global_scale(
+        input_tensor,
+        per_token_activation=per_token_activation,
+        global_scale=global_scale,
+        nvfp4_4over6_config=nvfp4_4over6_config,
+    )
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_tensor.shape = }")
@@ -626,8 +776,24 @@ def testNvfp4Quantize(args):
         print(f"[VVERBOSE] {do_shuffle = }")
         print(f"[VVERBOSE] {sf_vec_size = }")
         print(f"[VVERBOSE] {enable_pdl = }")
+        print(f"[VVERBOSE] {per_token_activation = }")
+        for name in NVFP4_QUANT_ENV_VARS:
+            print(f"[VVERBOSE] {name} = {os.environ.get(name, '<unset>')}")
+        print(f"[VVERBOSE] nvfp4_e4m3_max = {nvfp4_e4m3_max(nvfp4_4over6_config):.0f}")
 
     def run_backend(backend, input_tensor, global_sf_tensor):
+        if backend == "batch_invariant":
+            return flashinfer.nvfp4_quantize(
+                input_tensor,
+                global_sf_tensor,
+                sfLayout=sf_layout,
+                do_shuffle=do_shuffle,
+                sf_vec_size=sf_vec_size,
+                enable_pdl=enable_pdl,
+                backend="auto",
+                per_token_activation=per_token_activation,
+                batch_invariant=True,
+            )
         return flashinfer.nvfp4_quantize(
             input_tensor,
             global_sf_tensor,
@@ -636,6 +802,31 @@ def testNvfp4Quantize(args):
             sf_vec_size=sf_vec_size,
             enable_pdl=enable_pdl,
             backend=backend,
+            per_token_activation=per_token_activation,
+        )
+
+    backends = probe_backends(
+        backends,
+        run_backend,
+        input_tensor,
+        global_sf_tensor,
+        only=("batch_invariant",),
+    )
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    if (
+        run_refcheck
+        and "batch_invariant" in backends
+        and len(backends) > 1
+        and not _env_flag_enabled("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH")
+    ):
+        print(
+            "[INFO] The refcheck compares the backends' codes and scales bit for bit. The batch_invariant "
+            "backend computes FlashInfer's exact (correctly rounded) path; set "
+            "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH=1 for the cuda / cute-dsl backends to take that path too, "
+            "otherwise their fast-math scales may differ from it in the last place."
         )
 
     # Storage for timing results and outputs
@@ -643,8 +834,17 @@ def testNvfp4Quantize(args):
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
-            x_q, sf = run_backend(cur_backend, input_tensor, global_sf_tensor)
-            outputs[cur_backend] = (x_q.detach().clone(), sf.detach().clone())
+            result = run_backend(cur_backend, input_tensor, global_sf_tensor)
+            if per_token_activation:
+                x_q, sf, per_token_scale = result
+                outputs[cur_backend] = (
+                    x_q.detach().clone(),
+                    sf.detach().clone(),
+                    per_token_scale.detach().clone(),
+                )
+            else:
+                x_q, sf = result
+                outputs[cur_backend] = (x_q.detach().clone(), sf.detach().clone())
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -657,20 +857,81 @@ def testNvfp4Quantize(args):
     tested_backends = list(outputs.keys())
     if len(tested_backends) > 0:
         if run_refcheck:
+            ref_backend = tested_backends[0]
+            ref_output = outputs[ref_backend]
             for i in range(len(tested_backends)):
-                x_q, sf = outputs[tested_backends[i]]
+                cur_backend = tested_backends[i]
+                if per_token_activation:
+                    x_q, sf, per_token_scale = outputs[cur_backend]
+                else:
+                    x_q, sf = outputs[cur_backend]
+                    per_token_scale = None
                 if args.verbose >= 2:
                     print(
-                        f"[VVERBOSE] Backend {tested_backends[i]}: "
+                        f"[VVERBOSE] Backend {cur_backend}: "
                         f"x_q.shape = {x_q.shape}, x_q.dtype = {x_q.dtype}, "
                         f"sf.shape = {sf.shape}, sf.dtype = {sf.dtype}"
                     )
+                    if per_token_scale is not None:
+                        print(
+                            f"[VVERBOSE] Backend {cur_backend}: "
+                            f"per_token_scale.shape = {per_token_scale.shape}, "
+                            f"per_token_scale.dtype = {per_token_scale.dtype}"
+                        )
                 # Verify output shape (M, K/2) for FP4
                 expected_shape = (m, k // 2)
                 if x_q.shape != expected_shape:
                     print(
                         f"[WARNING] Unexpected output shape: {x_q.shape}, expected {expected_shape}"
                     )
+                if cur_backend != ref_backend:
+                    ref_x_q, ref_sf = ref_output[:2]
+                    _assert_nvfp4_refcheck_tensor_equal(
+                        "x_q", cur_backend, ref_backend, x_q, ref_x_q
+                    )
+                    _assert_nvfp4_refcheck_tensor_equal(
+                        "sf", cur_backend, ref_backend, sf, ref_sf
+                    )
+                    if per_token_activation:
+                        _assert_nvfp4_refcheck_tensor_equal(
+                            "per_token_scale",
+                            cur_backend,
+                            ref_backend,
+                            per_token_scale,
+                            ref_output[2],
+                        )
+
+    if run_refcheck and "batch_invariant" in outputs:
+        if do_shuffle:
+            print(
+                "[INFO] batch-invariance check: the shuffled scale factors are compared through the codes "
+                "and per-token scales only (the shuffle interleaves rows across the batch)."
+            )
+
+        def per_row(result, num_rows):
+            x_q, sf = result[0], result[1]
+            views = [x_q]
+            if not do_shuffle:
+                views.append(
+                    _unswizzled_sf_rows(sf, num_rows, k, sf_vec_size, sf_layout_str)
+                )
+            if per_token_activation:
+                views.append(result[2])
+            return tuple(views)
+
+        def run_rows(rows):
+            result = run_backend(
+                "batch_invariant", input_tensor.index_select(0, rows), global_sf_tensor
+            )
+            return per_row(result, rows.numel())
+
+        check_batch_invariance(
+            "nvfp4_quantize/batch_invariant",
+            run_rows,
+            m,
+            per_row(outputs["batch_invariant"], m),
+            verbose=args.verbose,
+        )
 
     for backend in backends:
         if len(backend_times[backend]) > 0:
@@ -688,6 +949,8 @@ def testNvfp4Quantize(args):
                 + num_elements // 2  # quantized output write (fp4 = 0.5 byte)
                 + num_scale_factors * 1  # scale factors write (1 byte each, e4m3)
             )
+            if per_token_activation:
+                problem_bytes += m * 4  # per-token fp32 scale writes
             problem_flops = num_elements * 3  # rough estimate
             tflops = problem_flops / (10**9 * median_time)
             tb_per_sec = problem_bytes / (10**9 * median_time)
@@ -709,6 +972,17 @@ def testNvfp4Quantize(args):
                 cur_res["do_shuffle"] = do_shuffle
                 cur_res["sf_vec_size"] = sf_vec_size
                 cur_res["enable_pdl"] = enable_pdl
+                cur_res["per_token_activation"] = per_token_activation
+                cur_res["use_4over6"] = nvfp4_4over6_config is not None
+                cur_res["disable_quant_fast_math"] = _env_flag_enabled(
+                    "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
+                )
+                if nvfp4_4over6_config is not None:
+                    cur_res["nvfp4_4over6_err_mode"] = nvfp4_4over6_config.err_mode_name
+                    cur_res["nvfp4_4over6_err_use_fast_math"] = (
+                        nvfp4_4over6_config.err_use_fast_math
+                    )
+                    cur_res["nvfp4_4over6_e4m3_max"] = nvfp4_4over6_config.e4m3_max
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
@@ -733,6 +1007,7 @@ def testNvfp4BatchedQuantize(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testNvfp4BatchedQuantize")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")

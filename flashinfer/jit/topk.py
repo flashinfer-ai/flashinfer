@@ -23,6 +23,9 @@ def gen_topk_module() -> JitSpec:
         "topk",
         [
             jit_env.FLASHINFER_CSRC_DIR / "topk.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "cub_topk.cu",
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_topk_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_fast_topk_clusters_binding.cu",
         ],
+        extra_cuda_cflags=["-lineinfo"],
     )

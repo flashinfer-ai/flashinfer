@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,10 +14,12 @@
  * limitations under the License.
  */
 
+#include <cuda_fp8.h>
 #include <cuda_runtime_api.h>
 #include <float.h>
 
 #include "flashinfer/exception.h"
+#include "flashinfer/math.cuh"
 #include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
 #include "flashinfer/trtllm/common/cudaUtils.h"
 #include "flashinfer/trtllm/fmha/fmhaReduction.h"
@@ -31,11 +33,57 @@ namespace kernels {
 
 #define NumThreadsPerCta 512
 
-template <int32_t TileSizePerCtaQ, int32_t HeadDim, int32_t HeadDimPerCta, bool IsE4m3Bmm,
-          typename DtypeO, typename DtypePartialO>
+// DSv4 output epilogue: inverse RoPE, UE8M0 block scales, and E4M3 values. This matches the
+// fused-cubin output contract when a BF16 split-KV kernel needs a separate reduction.
+namespace dsv4 {
+
+constexpr int kHeadDim = 512;
+constexpr int kRopeDim = 64;
+constexpr int kQuantBlock = 128;
+constexpr int kHeadsPerGroup = 8;
+constexpr float kE4m3Max = 448.f;
+constexpr float kAmaxFloor = 1e-10f;
+
+__device__ __forceinline__ void inverseRopePair(float& even, float& odd, float cosVal,
+                                                float sinVal) {
+  float const e = even;
+  float const o = odd;
+  even = e * cosVal + o * sinVal;
+  odd = o * cosVal - e * sinVal;
+}
+
+__device__ __forceinline__ int32_t ue8m0ExponentFromAmax(float amax) {
+  amax = fmaxf(amax, kAmaxFloor);
+  int32_t exponent = ilogbf(amax) - 8;
+  if (ldexpf(kE4m3Max, exponent) < amax) {
+    ++exponent;
+  }
+  return min(max(exponent + 127, 0), 255);
+}
+
+__device__ __forceinline__ int64_t valueOffset(int32_t group, int32_t token, int32_t headInGroup,
+                                               int32_t dim, int32_t numTokens) {
+  return (((static_cast<int64_t>(group) * numTokens + token) * kHeadsPerGroup) + headInGroup) *
+             kHeadDim +
+         dim;
+}
+
+__device__ __forceinline__ int64_t scaleByteOffset(int32_t group, int32_t headInGroup,
+                                                   int32_t token, int32_t block,
+                                                   int64_t scaleBufM) {
+  return ((static_cast<int64_t>(group) * kHeadsPerGroup + headInGroup) * scaleBufM + token) *
+             sizeof(int32_t) +
+         block;
+}
+
+}  // namespace dsv4
+
+template <int32_t TileSizePerCtaQ, int32_t HeadDimPerCta, bool IsE4m3Bmm, typename DtypeO,
+          typename DtypePartialO, bool Dsv4OutputEpilogue = false>
 __global__ void __launch_bounds__(NumThreadsPerCta, 2)
-    fmhaReductionKernel(KernelParams const params, bool sparseMla, int32_t numCtasForReduction,
-                        int32_t numCtasForAllHeads, int32_t numHeadDimCtasV) {
+    fmhaReductionKernel(KernelParams const params, bool isTokenSparse, bool groupsTokensHeadsQ,
+                        bool supportsVarSparseMlaTopKLens, int32_t numCtasForReduction,
+                        int32_t numCtasForAllHeads, int32_t headDimV, int32_t numHeadDimCtasV) {
   // clang-format off
   // The shape of partialO buffer: [batchSize, numHeadCtas, numCtasQ, numCtasKv, TileSizePerCtaQ, headDimPerCta].
   // The shape of final O buffer: [batchSize, numCtasQ, numHeadsQ, headDim].
@@ -57,31 +105,52 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
   int32_t const ctaIdxQ{static_cast<int32_t>(blockIdx.x % params.mMaxNumCtasQ)};
   // The ctaIdx for the reduction work.
   int32_t const ctaIdxForReduction{static_cast<int32_t>(blockIdx.x / params.mMaxNumCtasQ)};
+  // The numHeadsQPerKvCta.
+  int32_t const numHeadsQPerKvCta{min(params.mNumHeadsQPerKv, TileSizePerCtaQ)};
   // The headIdxO.
-  int32_t const headIdxO{headGrpIdxO * TileSizePerCtaQ};
+  int32_t const headIdxO{headGrpIdxO * numHeadsQPerKvCta};
   // The warpGrpThreadIdx.
   int32_t const warpGrpThreadIdx{static_cast<int32_t>(threadIdx.x)};
 
-  // The number of validRows.
-  int32_t const numValidRows{TileSizePerCtaQ};
-  // The seqOffsetQ.
+  // The seqOffsetQ in token units (cumSeqLensQ is already token-relative).
+  // Fixed-Q batches are packed by mMaxSeqLenQ; grouped CTA coverage can include padded rows.
   int32_t const seqOffsetQ{params.ptrCumSeqLensQ == nullptr ? batchIdx * params.mMaxSeqLenQ
                                                             : params.ptrCumSeqLensQ[batchIdx]};
   // The seqLenQ.
   int32_t const seqLenQ{params.ptrCumSeqLensQ == nullptr
                             ? params.mMaxSeqLenQ
                             : (params.ptrCumSeqLensQ[batchIdx + 1] - seqOffsetQ)};
-  // Early exit if ctaIdxQ >= seqLenQ, where each CTA processes one tokenQ.
-  if (ctaIdxQ >= seqLenQ) {
+  // The number of validTokens.
+  int32_t const numValidTokens{
+      min(seqLenQ - ctaIdxQ * params.mNumTokensPerCtaQ, params.mNumTokensPerCtaQ)};
+  // The number of validRows.
+  int32_t const numValidRows{numValidTokens * numHeadsQPerKvCta};
+  // Early exit if there are no valid tokens.
+  if (numValidTokens <= 0) {
     return;
   }
-  // The actual number of seqLenKv.
-  int32_t seqLenKv{params.ptrSeqLensKv[batchIdx]};
-  // Consider the causal-mask speculative decoding.
-  seqLenKv = seqLenKv - ((params.mMaxSeqLenQ - 1) - ctaIdxQ);
-  // Consider sparseMlaTopK.
-  if (sparseMla) {
-    seqLenKv = min(seqLenKv, params.mSparseMlaTopK);
+
+  // The last tokenQ index (relative to the request) processed by this CTA.
+  int32_t const lastTokenIdxQ{ctaIdxQ * params.mNumTokensPerCtaQ + numValidTokens - 1};
+
+  // The actual number of seqLenKv. Block-sparse attention uses per-KV-head sequence lengths
+  // laid out as [numHeadsKv, batchSize].
+  int32_t seqLenKv;
+  if (params.mUseBlockSparseAttention) {
+    int32_t const headIdxKv{headIdxO / params.mNumHeadsQPerKv};
+    seqLenKv = params.ptrSeqLensKv[headIdxKv * params.mBatchSize + batchIdx];
+  } else {
+    seqLenKv = params.ptrSeqLensKv[batchIdx];
+  }
+  // Consider the causal-mask speculative decoding. Use the per-batch seqLenQ (not mMaxSeqLenQ)
+  // so variable-length batches get the correct KV extent; these agree when seqLenQ ==
+  // mMaxSeqLenQ.
+  seqLenKv = max(seqLenKv - seqLenQ + lastTokenIdxQ + 1, 0);
+  // Consider sparseAttnTopK and variable sparse MLA topK lengths.
+  if (supportsVarSparseMlaTopKLens) {
+    seqLenKv = params.ptrSparseMlaTopKLens[seqOffsetQ + ctaIdxQ * params.mNumTokensPerCtaQ];
+  } else if (isTokenSparse) {
+    seqLenKv = min(seqLenKv, params.mSparseAttnTopK);
   }
   // The actual number of CtasKv (TileSizeKv is always 128 for now).
   int32_t numCtasKv{min((seqLenKv + 127) / 128, params.mMaxNumCtasKv)};
@@ -96,10 +165,10 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
   int64_t const partialOOffset{partialStatsOffset * HeadDimPerCta};
   // The offset of the softmaxStats buffer.
   int64_t const softmaxStatsOffset{
-      ((batchIdx * params.mMaxNumCtasQ + ctaIdxQ) * numCtasForAllHeads + headGrpIdxO) *
-      TileSizePerCtaQ};
+      ((seqOffsetQ + ctaIdxQ * params.mNumTokensPerCtaQ) * numCtasForAllHeads + headGrpIdxO) *
+      numHeadsQPerKvCta};
   // The offset of the O buffer.
-  int64_t const oOffset{softmaxStatsOffset * HeadDim + headDimCtaIdxV * HeadDimPerCta};
+  int64_t const oOffset{softmaxStatsOffset * headDimV + headDimCtaIdxV * HeadDimPerCta};
 
   // The partialStats pointer.
   float2* partialStatsPtr = reinterpret_cast<float2*>(params.ptrPartialStats) + partialStatsOffset;
@@ -111,13 +180,15 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
   // The O pointer.
   DtypeO* oPtr = reinterpret_cast<DtypeO*>(params.ptrO) + oOffset;
   // The attentionSinks pointer.
-  float const* attentionSinksPtr = params.ptrAttentionSinks + headIdxO;
+  float const* attentionSinksPtr =
+      params.ptrAttentionSinks == nullptr ? nullptr : params.ptrAttentionSinks + headIdxO;
 
   // Whether to store the softmax stats.
   bool const storesSoftmaxStats{params.ptrSoftmaxStats != nullptr};
 
-  // The softmaxScaleLog2.
-  float const softmaxScaleLog2 = params.mScaleSoftmaxLog2;
+  // The softmaxScaleLog2. Prefer the device-side scale when supplied.
+  float const softmaxScaleLog2 = params.ptrScaleSoftmaxLog2 != nullptr ? *params.ptrScaleSoftmaxLog2
+                                                                       : params.mScaleSoftmaxLog2;
 
   int32_t constexpr NumBytesPerPartialElt{sizeof(DtypePartialO)};
   static_assert(NumBytesPerPartialElt == 2,
@@ -165,9 +236,19 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
     // The memory load offset.
     int64_t const destMemOffset{loadRowIdx * HeadDimPerCta + headDimIdx};
     // The memory store offset.
-    int64_t gmemStoreOffset{validRowIdx * HeadDim + headDimIdx};
+    int64_t gmemStoreOffset{validRowIdx * headDimV + headDimIdx};
     // The local headIdxO.
     int32_t localHeadIdxO{validRowIdx};
+    // The rowIdx of softmaxStats.
+    int32_t softmaxStatsRowIdx{validRowIdx};
+    // If grouping both tokens and headsQ, map validRowIdx into tokenIdx and headIdxInGrp.
+    if (groupsTokensHeadsQ) {
+      int32_t tokenIdx{validRowIdx / params.mNumHeadsQPerKv};
+      int32_t headIdxInGrp{validRowIdx % params.mNumHeadsQPerKv};
+      localHeadIdxO = headIdxInGrp;
+      softmaxStatsRowIdx = tokenIdx * params.mNumHeadsQ + headIdxInGrp;
+      gmemStoreOffset = int64_t(softmaxStatsRowIdx) * headDimV + headDimIdx;
+    }
 
 // Wait for the primary kernel to complete.
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -218,8 +299,8 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
 
     // Update the sums with the attention sink value.
     if (attentionSinksPtr != nullptr) {
-      float attentionSinkVal =
-          exp2f(attentionSinksPtr[localHeadIdxO] * M_LOG2E - maxVal * softmaxScaleLog2);
+      float attentionSinkVal = exp2f(attentionSinksPtr[localHeadIdxO] * flashinfer::math::log2e_d -
+                                     maxVal * softmaxScaleLog2);
       // Multiply the attention sink value by 448.f if the MMA data type is e4m3 as the sum value
       // has also included the 448.f quantization scale.
       sumVal += IsE4m3Bmm ? attentionSinkVal * 448.f : attentionSinkVal;
@@ -229,13 +310,13 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
     // splits seqLenKv across GPUs).
     if (storesSoftmaxStats && isValidRow && headDimIdx == 0) {
       // The softmaxScale.
-      float softmaxScale = (softmaxScaleLog2 * (1.f / M_LOG2E));
+      float softmaxScale = (softmaxScaleLog2 * (1.f / flashinfer::math::log2e_d));
       // The sumScale to unscale the 448.f quantization scale from P.
       float sumScale = IsE4m3Bmm ? (1.f / 448.f) : 1.f;
       // The final max and sum values.
       float2 stats{maxVal * softmaxScale, sumVal * sumScale};
       // Store the final max and sum values to global memory.
-      reinterpret_cast<float2*>(softmaxStatsPtr)[validRowIdx] = stats;
+      reinterpret_cast<float2*>(softmaxStatsPtr)[softmaxStatsRowIdx] = stats;
     }
 
     // The final normalized scale.
@@ -248,6 +329,65 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
     for (int ii = 0; ii < NumEltsPer16BVec / 2; ++ii) {
       float2& f2 = reinterpret_cast<float2*>(outputVals)[ii];
       mul(f2, f2, normalizedScale2);
+    }
+
+    if constexpr (Dsv4OutputEpilogue) {
+      static_assert(
+          HeadDimPerCta % dsv4::kQuantBlock == 0 && dsv4::kQuantBlock % NumEltsPer16BVec == 0,
+          "A quant block must be owned by whole lanes of one CTA");
+      static_assert(NumEltsPer16BVec * sizeof(__nv_fp8_e4m3) == sizeof(uint2),
+                    "The E4M3 vector store assumes 8 elements");
+
+      int64_t const absRowIdx{softmaxStatsOffset + softmaxStatsRowIdx};
+      int32_t const tokenIdx{static_cast<int32_t>(absRowIdx / params.mNumHeadsQ)};
+      int32_t const headIdx{static_cast<int32_t>(absRowIdx % params.mNumHeadsQ)};
+      int32_t const dimIdx{headDimCtaIdxV * HeadDimPerCta + headDimIdx};
+
+      int32_t constexpr RopeStart{dsv4::kHeadDim - dsv4::kRopeDim};
+      if (dimIdx >= RopeStart) {
+        int32_t const position{params.ptrSeqLensKv[batchIdx] - seqLenQ + tokenIdx - seqOffsetQ};
+        float const* cosSin{params.ptrDsv4InvRopeCosSinCache +
+                            static_cast<int64_t>(position) * dsv4::kRopeDim};
+#pragma unroll
+        for (int32_t ii = 0; ii < NumEltsPer16BVec; ii += 2) {
+          int32_t const pairIdx{(dimIdx + ii - RopeStart) >> 1};
+          dsv4::inverseRopePair(outputVals[ii], outputVals[ii + 1], cosSin[pairIdx],
+                                cosSin[dsv4::kRopeDim / 2 + pairIdx]);
+        }
+      }
+
+      float amax{0.f};
+#pragma unroll
+      for (int32_t ii = 0; ii < NumEltsPer16BVec; ++ii) {
+        amax = fmaxf(amax, fabsf(outputVals[ii]));
+      }
+#pragma unroll
+      for (int32_t offset = 1; offset < dsv4::kQuantBlock / NumEltsPer16BVec; offset <<= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset));
+      }
+      int32_t const biasedExp{dsv4::ue8m0ExponentFromAmax(amax)};
+
+      if (isValidRow) {
+        int32_t const group{headIdx / dsv4::kHeadsPerGroup};
+        int32_t const headInGroup{headIdx % dsv4::kHeadsPerGroup};
+        float const invScale{__frcp_rn(__int_as_float(biasedExp << 23))};
+        __nv_fp8_e4m3 quantized[NumEltsPer16BVec];
+#pragma unroll
+        for (int32_t ii = 0; ii < NumEltsPer16BVec; ++ii) {
+          quantized[ii] = static_cast<__nv_fp8_e4m3>(
+              fminf(fmaxf(outputVals[ii] * invScale, -dsv4::kE4m3Max), dsv4::kE4m3Max));
+        }
+        *reinterpret_cast<uint2*>(
+            reinterpret_cast<__nv_fp8_e4m3*>(params.ptrO) +
+            dsv4::valueOffset(group, tokenIdx, headInGroup, dimIdx, params.mSumOfSeqLensQ)) =
+            *reinterpret_cast<uint2 const*>(quantized);
+        if (dimIdx % dsv4::kQuantBlock == 0) {
+          reinterpret_cast<uint8_t*>(params.ptrDsv4OScale)[dsv4::scaleByteOffset(
+              group, headInGroup, tokenIdx, dimIdx / dsv4::kQuantBlock, params.mDsv4ScaleBufM)] =
+              static_cast<uint8_t>(biasedExp);
+        }
+      }
+      continue;
     }
 
     // Convert the float values to DtypeO, and Store it to global memory.
@@ -264,26 +404,37 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#define SELECT_FMHA_REDUCTION_KERNEL(HeadDimPerCta)                                               \
-  if (kernelMeta.mDataTypeQ == DATA_TYPE_E4M3) {                                                  \
-    if (kernelMeta.mDataTypeO == DATA_TYPE_E4M3) {                                                \
-      kernel = &fmhaReductionKernel<64, 512, HeadDimPerCta, true, __nv_fp8_e4m3, half>;           \
-    } else if (kernelMeta.mDataTypeO == DATA_TYPE_FP16) {                                         \
-      kernel = &fmhaReductionKernel<64, 512, HeadDimPerCta, true, half, half>;                    \
-    } else if (kernelMeta.mDataTypeO == DATA_TYPE_BF16) {                                         \
-      kernel = &fmhaReductionKernel<64, 512, HeadDimPerCta, true, __nv_bfloat16, __nv_bfloat16>;  \
-    } else {                                                                                      \
-      FLASHINFER_CHECK(false, "Not implemented");                                                 \
-    }                                                                                             \
-  } else {                                                                                        \
-    FLASHINFER_CHECK(kernelMeta.mDataTypeQ == kernelMeta.mDataTypeO, "Not implemented");          \
-    if (kernelMeta.mDataTypeQ == DATA_TYPE_FP16) {                                                \
-      kernel = &fmhaReductionKernel<64, 512, HeadDimPerCta, false, half, half>;                   \
-    } else if (kernelMeta.mDataTypeQ == DATA_TYPE_BF16) {                                         \
-      kernel = &fmhaReductionKernel<64, 512, HeadDimPerCta, false, __nv_bfloat16, __nv_bfloat16>; \
-    } else {                                                                                      \
-      FLASHINFER_CHECK(false, "Not implemented");                                                 \
-    }                                                                                             \
+#define SELECT_FMHA_REDUCTION_KERNEL(TileSizePerCtaQ, HeadDimPerCta)                            \
+  if (kernelMeta.mDataTypeQ == DATA_TYPE_E4M3) {                                                \
+    if (kernelMeta.mDataTypeO == DATA_TYPE_E4M3) {                                              \
+      kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, true, __nv_fp8_e4m3, half>; \
+    } else if (kernelMeta.mDataTypeO == DATA_TYPE_FP16) {                                       \
+      kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, true, half, half>;          \
+    } else if (kernelMeta.mDataTypeO == DATA_TYPE_BF16) {                                       \
+      kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, true, __nv_bfloat16,        \
+                                    __nv_bfloat16>;                                             \
+    } else {                                                                                    \
+      FLASHINFER_CHECK(false, "Not implemented");                                               \
+    }                                                                                           \
+  } else {                                                                                      \
+    FLASHINFER_CHECK(kernelMeta.mDataTypeQ == kernelMeta.mDataTypeO, "Not implemented");        \
+    if (kernelMeta.mDataTypeQ == DATA_TYPE_FP16) {                                              \
+      kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, false, half, half>;         \
+    } else if (kernelMeta.mDataTypeQ == DATA_TYPE_BF16) {                                       \
+      kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, false, __nv_bfloat16,       \
+                                    __nv_bfloat16>;                                             \
+    } else {                                                                                    \
+      FLASHINFER_CHECK(false, "Not implemented");                                               \
+    }                                                                                           \
+  }
+
+#define SELECT_FMHA_REDUCTION_KERNEL_WITH_HEAD_DIM_PER_CTA(HeadDimPerCta) \
+  if (kernelMeta.mTileSizeQ == 64) {                                      \
+    SELECT_FMHA_REDUCTION_KERNEL(64, HeadDimPerCta);                      \
+  } else if (kernelMeta.mTileSizeQ == 128) {                              \
+    SELECT_FMHA_REDUCTION_KERNEL(128, HeadDimPerCta);                     \
+  } else {                                                                \
+    FLASHINFER_CHECK(false, "Not implemented");                           \
   }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -296,26 +447,34 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
     return;
   }
 
-  // This should only be enabled when the keepsMmaAbForGeneration MLA kernel (either 1-CTA or 2-CTA)
-  // is used.
+  bool const dsv4OutputEpilogue = params.ptrDsv4OScale != nullptr;
+
+  // This should only be enabled when using keepsMmaAbForGeneration kernel.
   FLASHINFER_CHECK(
-      kernelMeta.mHeadDimQk == 576 && kernelMeta.mHeadDimV == 512 &&
-          isKeepsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelMeta.mKernelType)),
+      isKeepsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelMeta.mKernelType)),
       "Not implemented");
-  // The tileSizeQ and tileSizeKv should be 64 and 128 for those kernels.
-  FLASHINFER_CHECK(kernelMeta.mTileSizeQ == 64 && kernelMeta.mTileSizeKv == 128, "Not implemented");
+  // The tileSizeQ should be 64 or 128 and tileSizeKv should be 128 for those kernels.
+  FLASHINFER_CHECK((kernelMeta.mTileSizeQ == 64 || kernelMeta.mTileSizeQ == 128) &&
+                       kernelMeta.mTileSizeKv == 128,
+                   "Not implemented");
 
   // The headDimPerCtaV.
   int32_t const headDimPerCtaV =
       kernelMeta.m2CtaMma ? kernelMeta.mHeadDimPerCtaV * 2 : kernelMeta.mHeadDimPerCtaV;
-  FLASHINFER_CHECK(headDimPerCtaV == 128 || headDimPerCtaV == 256 || headDimPerCtaV == 512,
+  FLASHINFER_CHECK(headDimPerCtaV == 64 || headDimPerCtaV == 128 || headDimPerCtaV == 256 ||
+                       headDimPerCtaV == 512,
                    "Not implemented");
 
   // The number of slices for the reduction work.
   int32_t const numSlices = (headDimPerCtaV * /* bytesPerPartialElt */ 2 * kernelMeta.mTileSizeQ) /
                             (NumThreadsPerCta * 16);
+  // The number of heads computed by a single CTA.
+  int numHeadsPerCta{1};
+  if (kernelMeta.mGroupsHeadsQ) {
+    numHeadsPerCta = std::min(params.mNumHeadsQPerKv, kernelMeta.mTileSizeQ);
+  }
   // The number of Ctas for all heads.
-  int32_t const numCtasForAllHeads{params.mNumHeadsQ / kernelMeta.mTileSizeQ};
+  int32_t const numCtasForAllHeads{params.mNumHeadsQ / numHeadsPerCta};
   // The number of Ctas for headDim.
   int32_t const numHeadDimCtasV{kernelMeta.mHeadDimV / headDimPerCtaV};
 
@@ -351,18 +510,42 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
   config.numAttrs = 1;
 
   // Select the kernel function pointer.
-  void (*kernel)(KernelParams const, bool, int32_t, int32_t, int32_t) = nullptr;
-  if (headDimPerCtaV == 128) {
-    SELECT_FMHA_REDUCTION_KERNEL(128);
+  void (*kernel)(KernelParams const, bool, bool, bool, int32_t, int32_t, int32_t, int32_t) =
+      nullptr;
+  if (dsv4OutputEpilogue) {
+    FLASHINFER_CHECK(kernelMeta.mGroupsHeadsQ && !kernelMeta.mGroupsTokensHeadsQ &&
+                         kernelMeta.mTileSizeQ == 64 && headDimPerCtaV >= 128 &&
+                         params.mNumHeadsQ % numHeadsPerCta == 0,
+                     "Not implemented");
+    if (headDimPerCtaV == 128) {
+      kernel = &fmhaReductionKernel<64, 128, true, __nv_bfloat16, __nv_bfloat16, true>;
+    } else if (headDimPerCtaV == 256) {
+      kernel = &fmhaReductionKernel<64, 256, true, __nv_bfloat16, __nv_bfloat16, true>;
+    } else {
+      kernel = &fmhaReductionKernel<64, 512, true, __nv_bfloat16, __nv_bfloat16, true>;
+    }
+  } else if (headDimPerCtaV == 64) {
+    SELECT_FMHA_REDUCTION_KERNEL_WITH_HEAD_DIM_PER_CTA(64);
+  } else if (headDimPerCtaV == 128) {
+    SELECT_FMHA_REDUCTION_KERNEL_WITH_HEAD_DIM_PER_CTA(128);
   } else if (headDimPerCtaV == 256) {
-    SELECT_FMHA_REDUCTION_KERNEL(256);
+    SELECT_FMHA_REDUCTION_KERNEL_WITH_HEAD_DIM_PER_CTA(256);
   } else if (headDimPerCtaV == 512) {
-    SELECT_FMHA_REDUCTION_KERNEL(512);
+    SELECT_FMHA_REDUCTION_KERNEL_WITH_HEAD_DIM_PER_CTA(512);
   }
 
   // Launch the kernel.
-  cudaLaunchKernelEx(&config, kernel, params, kernelMeta.mSparseMla, numCtasForReduction,
-                     numCtasForAllHeads, numHeadDimCtasV);
+  bool const supportsVarSparseMlaTopKLens =
+      isDynamicTokenSparseMla(static_cast<TrtllmGenSparseMlaType>(kernelMeta.mSparseAttn)) &&
+      kernelMeta.mHeadDimQk == 512 && kernelMeta.mHeadDimV == 512;
+  if (supportsVarSparseMlaTopKLens) {
+    FLASHINFER_CHECK(params.ptrSparseMlaTopKLens != nullptr,
+                     "Dynamic sparse MLA reduction requires sparseMlaTopkLengths.");
+  }
+  cudaLaunchKernelEx(&config, kernel, params, kernelMeta.mSparseAttn != 0,
+                     kernelMeta.mGroupsTokensHeadsQ, supportsVarSparseMlaTopKLens,
+                     numCtasForReduction, numCtasForAllHeads, kernelMeta.mHeadDimV,
+                     numHeadDimCtasV);
   cudaError_t err = cudaGetLastError();
   FLASHINFER_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
 }

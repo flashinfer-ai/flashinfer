@@ -139,8 +139,9 @@ struct Kernel_traits {
                              std::is_same<Element_data_type, fmha::e5m2_t>::value)
   };
 
-  // The number of smem scratch buffer for staging V transpose for Hopper QGMMA
-  enum { V_SCRATCH_BUFFERS = DMA_GROUP_TRANSPOSE_V ? 1 : 0 };
+  // Reuse the KV double-buffer depth for fp8 V transpose scratch so the DMA producer/consumer do
+  // not immediately wrap the same slot on every iteration.
+  enum { V_SCRATCH_BUFFERS = DMA_GROUP_TRANSPOSE_V ? KV_BUFFERS : 0 };
 
   // The number of compute warpgroups (128 threads per warpgroup).
   enum { NUM_COMPUTE_GROUPS = NUM_COMPUTE_GROUPS_ };

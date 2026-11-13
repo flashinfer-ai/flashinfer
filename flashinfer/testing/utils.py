@@ -17,7 +17,7 @@ limitations under the License.
 import math
 import random
 import time
-from typing import Tuple, Any, List, Optional
+from typing import Tuple, Any, List, Optional, Callable
 
 import os
 import sys
@@ -416,6 +416,22 @@ def dequantize_fp8(x, x_scale, scale_major_mode):
     return out
 
 
+def is_compute_sanitizer_active() -> bool:
+    """Detect whether the process runs under compute-sanitizer.
+
+    The tool injects itself through environment variables that child processes
+    inherit, so this also holds inside a subprocess a test spawns. CUDA 13.x
+    uses the NV_SANITIZER_INJECTION_* set; older toolkits use
+    CUDA_INJECTION64_PATH, which Nsight tools set too, hence the value check.
+    """
+    if any(name.startswith("NV_SANITIZER_INJECTION_") for name in os.environ):
+        return True
+    return any(
+        "sanitizer" in os.environ.get(name, "").lower()
+        for name in ("CUDA_INJECTION64_PATH", "NVTX_INJECTION64_PATH")
+    )
+
+
 def set_seed(random_seed):
     """
     Set random seed for reproducibility during testing.
@@ -472,7 +488,7 @@ def attention_flops(
         head_dim_qk (int): Head dimension of the query and key.
         head_dim_vo (int): Head dimension of the value.
         num_qo_heads (int): Number of query heads.
-        causal (bool): Whether to use causal masking. FLOPs is halved for causal masking.
+        causal (bool): Whether to use causal masking. FLOPs are halved for causal masking.
 
     Returns:
         total_flops (int): Total FLOPs for the layer.
@@ -664,11 +680,12 @@ def attention_tb_per_sec(
     num_kv_heads,
     time,
     q_dtype=torch.bfloat16,
-    kv_dtype=torch.bfloat16,
+    k_dtype=torch.bfloat16,
+    v_dtype=torch.bfloat16,
     o_dtype=torch.bfloat16,
 ):
     """
-    Calculate TB per second perf achieved for a given attention layer. Assumes all sequence lengths are the same within the batch.
+    Calculate the TB-per-second performance achieved for a given attention layer. Assumes all sequence lengths are the same within the batch.
 
     Args:
         batch_size (int): Batch size.
@@ -680,15 +697,16 @@ def attention_tb_per_sec(
         num_kv_heads (int): Number of key and value heads.
         time (float): Execution time in milliseconds.
         q_dtype (torch.dtype): Data type of the query.
-        kv_dtype (torch.dtype): Data type of the key and value.
+        k_dtype (torch.dtype): Data type of the key.
+        v_dtype (torch.dtype): Data type of the value.
         o_dtype (torch.dtype): Data type of the output.
 
     Returns:
         tb_per_sec (float): TB per second for the layer.
     """
     q_bytes = batch_size * qo_seqlen * num_qo_heads * head_dim_qk * q_dtype.itemsize
-    k_bytes = batch_size * kv_seqlen * num_kv_heads * head_dim_qk * kv_dtype.itemsize
-    v_bytes = batch_size * kv_seqlen * num_kv_heads * head_dim_vo * kv_dtype.itemsize
+    k_bytes = batch_size * kv_seqlen * num_kv_heads * head_dim_qk * k_dtype.itemsize
+    v_bytes = batch_size * kv_seqlen * num_kv_heads * head_dim_vo * v_dtype.itemsize
     o_bytes = batch_size * qo_seqlen * num_qo_heads * head_dim_vo * o_dtype.itemsize
     total_bytes = q_bytes + k_bytes + v_bytes + o_bytes
 
@@ -706,11 +724,12 @@ def attention_tb_per_sec_with_actual_seq_lens(
     num_kv_heads,
     time,
     q_dtype=torch.bfloat16,
-    kv_dtype=torch.bfloat16,
+    k_dtype=torch.bfloat16,
+    v_dtype=torch.bfloat16,
     o_dtype=torch.bfloat16,
 ):
     """
-    Calculate TB per second perf achieved for a given attention layer with actual sequence lengths.
+    Calculate the TB-per-second performance achieved for a given attention layer with actual sequence lengths.
     Does not assume all sequence lengths are the same within the batch.
 
     Args:
@@ -722,7 +741,8 @@ def attention_tb_per_sec_with_actual_seq_lens(
         num_kv_heads (int): Number of key and value heads.
         time (float): Execution time in milliseconds.
         q_dtype (torch.dtype): Data type of the query.
-        kv_dtype (torch.dtype): Data type of the key and value.
+        k_dtype (torch.dtype): Data type of the key.
+        v_dtype (torch.dtype): Data type of the value.
         o_dtype (torch.dtype): Data type of the output.
 
     Returns:
@@ -732,10 +752,10 @@ def attention_tb_per_sec_with_actual_seq_lens(
         torch.sum(actual_seq_lens_q) * num_qo_heads * head_dim_qk * q_dtype.itemsize
     )
     k_bytes = (
-        torch.sum(actual_seq_lens_kv) * num_kv_heads * head_dim_qk * kv_dtype.itemsize
+        torch.sum(actual_seq_lens_kv) * num_kv_heads * head_dim_qk * k_dtype.itemsize
     )
     v_bytes = (
-        torch.sum(actual_seq_lens_kv) * num_kv_heads * head_dim_vo * kv_dtype.itemsize
+        torch.sum(actual_seq_lens_kv) * num_kv_heads * head_dim_vo * v_dtype.itemsize
     )
     o_bytes = (
         torch.sum(actual_seq_lens_q) * num_qo_heads * head_dim_vo * o_dtype.itemsize
@@ -746,6 +766,29 @@ def attention_tb_per_sec_with_actual_seq_lens(
     time_in_sec = time / 1e3
     bytes_in_tb = total_bytes / 1e12  # TB not TiB
     return bytes_in_tb / time_in_sec if not math.isnan(time) else 0.0
+
+
+def aggregate_gpu_time_across_ranks(x, op):
+    """
+    Aggregate GPU time across ranks.
+
+    Args:
+        x (int | float | List[int] | List[float]): GPU time to aggregate.
+        op (Callable): Operation to perform across ranks.
+
+    Returns:
+        int | float | List[int] | List[float]: Aggregated GPU time.
+    """
+    if torch.distributed.is_initialized():
+        world_size = torch.distributed.get_world_size()
+        if world_size > 1:
+            x_all = [None] * world_size
+            torch.distributed.all_gather_object(x_all, x)
+            if isinstance(x, list):
+                x = [op(val) for val in zip(*x_all, strict=True)]
+            else:
+                x = op(x_all)
+    return x
 
 
 def bench_gpu_time_with_cuda_event(
@@ -761,6 +804,7 @@ def bench_gpu_time_with_cuda_event(
     input_args: Tuple = (),
     input_kwargs: Optional[dict] = None,
     cold_l2_cache: bool = True,
+    aggregate_op: Callable = max,
 ):
     """
     Benchmark kernel execution time using CUDA events (no CUDA graphs).
@@ -791,6 +835,7 @@ def bench_gpu_time_with_cuda_event(
         input_kwargs (dict, optional): Keyword arguments to pass to fn.
         cold_l2_cache (bool): If True, flush L2 cache before each iteration to
             ensure cold-cache performance measurements (default: True).
+        aggregate_op (Callable): Aggregate operation to perform across ranks (default: max).
 
     Returns:
         List[float]: Per-iteration execution times in milliseconds.
@@ -813,7 +858,7 @@ def bench_gpu_time_with_cuda_event(
         launch overhead. For microbenchmarking where launch latency matters,
         consider using ``bench_gpu_time_with_cudagraph`` instead.
 
-    .. deprecated::
+    .. deprecated:: 0.6.0
         The ``l2_flush``, ``l2_flush_size_mb``, and ``l2_flush_device`` parameters
         are deprecated. Use ``cold_l2_cache`` instead.
     """
@@ -867,8 +912,9 @@ def bench_gpu_time_with_cuda_event(
         call_fn()
     end_event.record()
     torch.cuda.synchronize()
-    estimated_kernel_execution_time = (
-        start_event.elapsed_time(end_event) / measurement_iters
+    estimated_kernel_execution_time = aggregate_gpu_time_across_ranks(
+        start_event.elapsed_time(end_event) / measurement_iters,
+        aggregate_op,
     )
 
     ## Set dry run and repeat iterations
@@ -904,6 +950,7 @@ def bench_gpu_time_with_cuda_event(
     measured_times = []
     for iter_idx in range(repeat_iters):
         measured_times.append(start_events[iter_idx].elapsed_time(end_events[iter_idx]))
+    measured_times = aggregate_gpu_time_across_ranks(measured_times, aggregate_op)
     return measured_times
 
 
@@ -921,6 +968,7 @@ def bench_gpu_time_with_cupti(
     input_args: Tuple = (),
     input_kwargs: Optional[dict] = None,
     cold_l2_cache: bool = True,
+    aggregate_op: Callable = max,
 ):
     """
     Benchmark GPU time using CUPTI activity tracing for precise kernel timing.
@@ -956,6 +1004,7 @@ def bench_gpu_time_with_cupti(
         input_kwargs (dict, optional): Keyword arguments to pass to fn.
         cold_l2_cache (bool): If True, flush L2 cache before each iteration to
             ensure cold-cache performance measurements (default: True).
+        aggregate_op (Callable): Aggregate operation to perform across ranks (default: max).
 
     Returns:
         List[float]: Per-iteration GPU kernel execution times in milliseconds.
@@ -980,7 +1029,7 @@ def bench_gpu_time_with_cupti(
         If CUPTI is not available, a warning is issued and the function
         automatically falls back to CUDA event or CUDA graph timing.
 
-    .. deprecated::
+    .. deprecated:: 0.6.0
         The ``l2_flush``, ``l2_flush_size_mb``, and ``l2_flush_device`` parameters
         are deprecated. Use ``cold_l2_cache`` instead.
     """
@@ -1043,6 +1092,7 @@ def bench_gpu_time_with_cupti(
                 input_args=input_args,
                 input_kwargs=input_kwargs,
                 cold_l2_cache=cold_l2_cache,
+                aggregate_op=aggregate_op,
             )
         else:
             # Non-graph fallback uses L2 flush for cold L2
@@ -1056,6 +1106,7 @@ def bench_gpu_time_with_cupti(
                 input_args=input_args,
                 input_kwargs=input_kwargs,
                 cold_l2_cache=cold_l2_cache,
+                aggregate_op=aggregate_op,
             )
 
     # CUPTI buffer callbacks
@@ -1177,8 +1228,9 @@ def bench_gpu_time_with_cupti(
         runner()
     end_event.record()
     torch.cuda.synchronize()
-    estimated_kernel_execution_time = (
-        start_event.elapsed_time(end_event) / measurement_iters
+    estimated_kernel_execution_time = aggregate_gpu_time_across_ranks(
+        start_event.elapsed_time(end_event) / measurement_iters,
+        aggregate_op,
     )
 
     ## Set dry run and repeat iterations
@@ -1210,6 +1262,7 @@ def bench_gpu_time_with_cupti(
     for _ in range(repeat_iters):
         if _do_l2_flush:
             buffer.zero_()
+        torch.cuda.synchronize()
         start_cpu = cupti.get_timestamp()
         runner()
         end_cpu = cupti.get_timestamp()
@@ -1277,6 +1330,7 @@ def bench_gpu_time_with_cupti(
         max_end = max(k[2] for k in iter_kernels)
         span_ms = (max_end - min_start) / 1e6  # ns to ms
         measured_times.append(span_ms)
+    measured_times = aggregate_gpu_time_across_ranks(measured_times, aggregate_op)
     return measured_times
 
 
@@ -1294,6 +1348,7 @@ def bench_gpu_time_with_cudagraph(
     input_args: Tuple = (),
     input_kwargs: Optional[dict] = None,
     cold_l2_cache: bool = True,
+    aggregate_op: Callable = max,
 ):
     """
     Benchmark GPU time using CUDA graphs with amortized kernel launch overhead.
@@ -1329,6 +1384,7 @@ def bench_gpu_time_with_cudagraph(
             in this structure will be cloned when ``cold_l2_cache=True``.
         cold_l2_cache (bool): If True, use rotating buffers to ensure cold L2 cache
             for each kernel invocation within the graph (default: True).
+        aggregate_op (Callable): Aggregate operation to perform across ranks (default: max).
 
     Returns:
         List[float]: Per-iteration execution times in milliseconds. Each time is
@@ -1368,7 +1424,7 @@ def bench_gpu_time_with_cudagraph(
     See Also:
         - ``calculate_rotation_count``: Computes required buffer copies for cold-L2.
 
-    .. deprecated::
+    .. deprecated:: 0.6.0
         The ``l2_flush``, ``l2_flush_size_mb``, and ``l2_flush_device`` parameters
         are deprecated. Use ``cold_l2_cache`` instead.
     """
@@ -1466,8 +1522,9 @@ def bench_gpu_time_with_cudagraph(
         g.replay()
     end_event.record()
     torch.cuda.synchronize()
-    estimated_kernel_execution_time = (
-        start_event.elapsed_time(end_event) / measurement_iters
+    estimated_kernel_execution_time = aggregate_gpu_time_across_ranks(
+        start_event.elapsed_time(end_event) / measurement_iters,
+        aggregate_op,
     )
 
     ## Set dry run and repeat iterations
@@ -1502,6 +1559,7 @@ def bench_gpu_time_with_cudagraph(
             start_events[iter_idx].elapsed_time(end_events[iter_idx])
             / num_iters_within_graph
         )
+    measured_times = aggregate_gpu_time_across_ranks(measured_times, aggregate_op)
     return measured_times
 
 
@@ -1521,6 +1579,7 @@ def bench_gpu_time(
     input_args: Tuple = (),
     input_kwargs: Optional[dict] = None,
     cold_l2_cache: bool = True,
+    aggregate_op: Callable = max,
 ):
     """
     Unified GPU benchmarking interface with configurable timing backends.
@@ -1564,6 +1623,7 @@ def bench_gpu_time(
         cold_l2_cache (bool): If True, ensure cold L2 cache for each iteration
             (default: True). The strategy is automatically selected based on timing
             backend.
+        aggregate_op (Callable): Aggregate operation to perform across ranks (default: max).
 
     Returns:
         List[float]: Per-iteration execution times in milliseconds.
@@ -1599,7 +1659,7 @@ def bench_gpu_time(
         - ``bench_gpu_time_with_cudagraph``: Direct CUDA graph timing.
         - ``bench_gpu_time_with_cupti``: Direct CUPTI timing.
 
-    .. deprecated::
+    .. deprecated:: 0.6.0
         The ``l2_flush``, ``l2_flush_size_mb``, and ``l2_flush_device``
         parameters are deprecated. Use ``cold_l2_cache`` instead.
     """
@@ -1628,6 +1688,7 @@ def bench_gpu_time(
             input_args=input_args,
             input_kwargs=input_kwargs,
             cold_l2_cache=_cold_l2_cache,
+            aggregate_op=aggregate_op,
         )
     if use_cuda_graph:
         return bench_gpu_time_with_cudagraph(
@@ -1641,6 +1702,7 @@ def bench_gpu_time(
             input_args=input_args,
             input_kwargs=input_kwargs,
             cold_l2_cache=_cold_l2_cache,
+            aggregate_op=aggregate_op,
         )
     return bench_gpu_time_with_cuda_event(
         fn=fn,
@@ -1652,6 +1714,7 @@ def bench_gpu_time(
         input_args=input_args,
         input_kwargs=input_kwargs,
         cold_l2_cache=_cold_l2_cache,
+        aggregate_op=aggregate_op,
     )
 
 

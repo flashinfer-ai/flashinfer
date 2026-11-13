@@ -16,12 +16,14 @@
 #ifndef FLASHINFER_SAMPLING_CUH_
 #define FLASHINFER_SAMPLING_CUH_
 
+#include <cooperative_groups.h>
 #include <cuda.h>
 #include <curand.h>
 #include <curand_kernel.h>
 #include <curand_philox4x32_x.h>
 
 #include <cfloat>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <cub/cub.cuh>
@@ -38,15 +40,8 @@
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
-// Define reduction operators based on CUDA version
-// CUDA 13 (12.9+) deprecated cub::Max/Min in favor of cuda::maximum/minimum
-#if CUDA_VERSION >= 12090
 using MaxReduceOp = cuda::maximum<>;
 using MinReduceOp = cuda::minimum<>;
-#else
-using MaxReduceOp = cub::Max;
-using MinReduceOp = cub::Min;
-#endif
 
 namespace flashinfer {
 
@@ -72,55 +67,6 @@ __device__ __forceinline__ float ieee_div(float a, float b) {
   float r;
   asm("div.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
   return r;
-}
-
-// ============================================================================
-// Online softmax merge primitives (warp-level and CTA-level)
-// ============================================================================
-
-/// Warp-level online softmax merge across all 32 lanes using butterfly reduction.
-/// Each lane holds a partial (max, sum) pair; after return all lanes see the merged result.
-__device__ __forceinline__ float2 WarpOnlineSoftmaxMerge(float m, float s) {
-  // reduce to get max first
-  const float old_m = m;
-#pragma unroll
-  for (int offset = 16; offset > 0; offset /= 2) {
-    m = max(m, __shfl_xor_sync(0xffffffff, m, offset));
-  }
-
-  // then reduce to get sum, using the max for numerical stability
-  if (m != old_m) s *= __expf(old_m - m);
-#pragma unroll
-  for (int offset = 16; offset > 0; offset /= 2) {
-    s = s + __shfl_xor_sync(0xffffffff, s, offset);
-  }
-  return make_float2(m, s);
-}
-
-/// CTA-level online softmax merge.  smem_ms must have >= 32 float2 entries.
-/// After return, all threads see the final (max, sum).
-template <uint32_t BLOCK_THREADS>
-__device__ __forceinline__ float2 CTAOnlineSoftmaxMerge(float m, float s, float2* smem_ms) {
-  constexpr uint32_t kWarpSize = 32;
-  constexpr uint32_t kNumWarps = BLOCK_THREADS / kWarpSize;
-  const uint32_t warp_id = threadIdx.x / kWarpSize;
-  const uint32_t lane_id = threadIdx.x % kWarpSize;
-
-  float2 warp_result = WarpOnlineSoftmaxMerge(m, s);
-  if (lane_id == 0) {
-    smem_ms[warp_id] = warp_result;
-  }
-  __syncthreads();
-
-  if (warp_id == 0) {
-    float2 ms = (lane_id < kNumWarps) ? smem_ms[lane_id] : make_float2(-FLT_MAX, 0.0f);
-    float2 result = WarpOnlineSoftmaxMerge(ms.x, ms.y);
-    if (lane_id == 0) {
-      smem_ms[0] = result;
-    }
-  }
-  __syncthreads();
-  return smem_ms[0];
 }
 
 #define DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, ...) \
@@ -153,8 +99,17 @@ __device__ __forceinline__ float2 CTAOnlineSoftmaxMerge(float m, float s, float2
 constexpr BlockScanAlgorithm SCAN_ALGO = BLOCK_SCAN_WARP_SCANS;
 constexpr BlockReduceAlgorithm REDUCE_ALGO = BLOCK_REDUCE_WARP_REDUCTIONS;
 
-#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120100)
-#define FLASHINFER_CUB_SUBTRACTLEFT_DEFINED
+// On SM107 (Rubin), ptxas can allocate >64 regs/thread for these 1024-thread
+// sampling kernels, which exceeds the 65536-register SM budget and fails with
+// "too many resources requested for launch".
+// Gate __launch_bounds__ to native sm_107* compiles only so other arches keep
+// unconstrained register allocation (avoids a B300/H100 register-spill
+// regression). When SM107 is mapped to sm_100f at JIT time, this gate is
+// inactive; that path inherits sm_100 register counts which already fit.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1070)
+#define FLASHINFER_SAMPLING_LAUNCH_BOUNDS(block_threads) __launch_bounds__(block_threads)
+#else
+#define FLASHINFER_SAMPLING_LAUNCH_BOUNDS(block_threads)
 #endif
 
 template <typename T>
@@ -175,17 +130,6 @@ struct ValueCount {
 struct BoolDiffOp {
   __device__ __forceinline__ bool operator()(const bool& lhs, const bool& rhs) const {
     return lhs != rhs;
-  }
-};
-
-struct Float2SoftmaxReduceOp {
-  __device__ __forceinline__ float2 operator()(const float2& a, const float2& b) const {
-    if (isinf(a.x)) return b;
-    if (isinf(b.x)) return a;
-
-    float new_max = max(a.x, b.x);
-    float new_denom = a.y * __expf(a.x - new_max) + b.y * __expf(b.x - new_max);
-    return make_float2(new_max, new_denom);
   }
 };
 
@@ -216,7 +160,6 @@ template <uint32_t BLOCK_THREADS>
 struct OnlineSoftmaxTempStorage {
   union {
     typename cub::BlockReduce<float, BLOCK_THREADS>::TempStorage reduce;
-    typename cub::BlockReduce<float2, BLOCK_THREADS>::TempStorage reduce_pair;
   } block_prim;
 
   struct {
@@ -347,11 +290,9 @@ __device__ __forceinline__ float GetMaxValue(float* in_data, uint32_t row_idx, u
 }
 
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType, bool CACHE_INPUT>
-__global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* temperature_arr,
-                                         DType temperature_val, uint32_t d) {
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxFusedKernel(
+    DType* logits, DType* output, DType* temperature_arr, DType temperature_val, uint32_t d) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
-  float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
-  const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
   using TempStorage = OnlineSoftmaxTempStorage<BLOCK_THREADS>;
   extern __shared__ __align__(alignof(TempStorage)) uint8_t smem[];
@@ -371,8 +312,10 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
   float threadlocal_running_denominator = 0.0f;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
+  float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
+  const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
   // Pass 1: Compute running max and denominator
 #pragma unroll 2
@@ -383,7 +326,9 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
 
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        logits_vec[j] *= inv_temp;
+        // __fmul_rn, not *: it must not be contracted into an FMA.
+        // *= inv_temp can lead to probabilities exceeding 1 at low temperatures (see PR #5088).
+        logits_vec[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
       }
 
       if constexpr (CACHE_INPUT) {
@@ -443,7 +388,9 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
 
 #pragma unroll
         for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-          logits_vec[j] *= inv_temp;
+          // __fmul_rn, not *: it must not be contracted into an FMA.
+          // *= inv_temp can lead to probabilities exceeding 1 at low temperatures (see PR #5088).
+          logits_vec[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
         }
       }
     }
@@ -463,142 +410,157 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
 #endif
 }
 
+// ============================================================================
+// Split-vocabulary softmax (small batch, large vocabulary)
+// ============================================================================
+// Each row is cut into `num_slices` contiguous slices of `slice_stride` elements (the last one may
+// be shorter). CTA (row, slice) owns the same slice in both kernels: the map kernel reduces it to a
+// partial (max, denominator) and the reduce kernel merges the row's partials and normalizes it.
+//
+// Partials live in the output row rather than in the shared workspace, so calls on different
+// streams never alias scratch (#4692). With one reduce CTA per slice, a single copy of the partials
+// would be overwritten by whichever CTA owns it while the others still read it. Instead, the map
+// kernel writes a copy of the row's partials at the start of every slice, and each reduce CTA reads
+// only the copy inside the slice it later overwrites.
+
+constexpr uint32_t kSoftmaxMaxSlices = 32;  // the reduce kernel merges partials in one warp
+
+// Finite seed for the running max: merging two empty states must not evaluate (-inf) - (-inf).
+constexpr float kSoftmaxMaxSeed = -FLT_MAX;
+
+/// Merges per-lane (max, denominator) pairs across a full warp; every lane gets the result.
+__device__ __forceinline__ float2 WarpOnlineSoftmaxMerge(float m, float s) {
+  float row_max = m;
+#pragma unroll
+  for (uint32_t offset = 16; offset > 0; offset /= 2) {
+    row_max = fmaxf(row_max, __shfl_xor_sync(0xffffffff, row_max, offset));
+  }
+  // Skipping equal maxima keeps s exact and avoids inf - inf when the max is +inf.
+  if (m != row_max) s *= __expf(m - row_max);
+#pragma unroll
+  for (uint32_t offset = 16; offset > 0; offset /= 2) {
+    s += __shfl_xor_sync(0xffffffff, s, offset);
+  }
+  return make_float2(row_max, s);
+}
+
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
-__global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* partial_results,
-                                       DType* temperature_arr, float temperature_val, uint32_t d,
-                                       uint32_t num_slices) {
-  const uint32_t bx = blockIdx.x;
-  const uint32_t by = blockIdx.y;  // slice index
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxMapKernel(
+    DType* logits, DType* output, DType* temperature_arr, float temperature_val, uint32_t d,
+    uint32_t slice_stride, uint32_t num_slices) {
+  static_assert(BLOCK_THREADS % 32 == 0 && BLOCK_THREADS / 32 <= 32);
+  constexpr uint32_t kNumWarps = BLOCK_THREADS / 32;
+  const uint32_t bx = blockIdx.x;  // row
+  const uint32_t by = blockIdx.y;  // slice
   const uint32_t tx = threadIdx.x;
+  const uint32_t lane = tx % 32, warp = tx / 32;
+
+  const uint32_t slice_start = by * slice_stride;
+  const uint32_t slice_size = min(slice_stride, d - slice_start);
+  const DType* slice_logits = logits + static_cast<size_t>(bx) * d + slice_start;
+  DType* row_output = output + static_cast<size_t>(bx) * d;
+
+  __shared__ float2 warp_partials[kNumWarps];
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
   float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
   const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
-  const uint32_t vec_alignment_elems = alignof(vec_t<DType, VEC_SIZE>) / sizeof(DType);
-  const uint32_t slice_stride = round_up(ceil_div(d, num_slices), vec_alignment_elems);
-  const uint32_t slice_start = by * slice_stride;
-  const uint32_t slice_size = min((by + 1) * slice_stride, d) - slice_start;
-
-  if (slice_start >= d) {
-    // Write safe identity for empty slices so the merge kernel sees valid data
-    if (tx == 0) {
-      partial_results[bx * num_slices + by] = {-FLT_MAX, 0.0f};
-    }
-    return;
-  }
-
-  __shared__ float2 smem_ms[32];
-
-  const uint32_t slice_vecs = slice_size / VEC_SIZE;
-  DType* slice_ptr = logits + static_cast<uint64_t>(bx) * d + slice_start;
-
-  // Thread-local online softmax state
-  float m = -FLT_MAX;
+  // Thread-local online softmax over this thread's vectors of the slice.
+  float m = kSoftmaxMaxSeed;
   float s = 0.0f;
-
-#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
-#endif
-
 #pragma unroll 2
-  for (uint32_t idx = tx; idx < slice_vecs; idx += BLOCK_THREADS) {
+  for (uint32_t i = tx * VEC_SIZE; i < slice_size; i += BLOCK_THREADS * VEC_SIZE) {
     vec_t<DType, VEC_SIZE> logits_vec;
-    logits_vec.cast_load(slice_ptr + idx * VEC_SIZE);
-
-    float vec_max = -FLT_MAX;
-    float cache[VEC_SIZE];
+    logits_vec.cast_load(slice_logits + i);
+    float x[VEC_SIZE];
+    float vec_max = kSoftmaxMaxSeed;
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      cache[j] = static_cast<float>(logits_vec[j]) * inv_temp;
-      vec_max = max(vec_max, cache[j]);
+      // __fmul_rn, not *: it must not be contracted into an FMA.
+      // *= inv_temp can lead to probabilities exceeding 1 at low temperatures (see PR #5088).
+      x[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
+      vec_max = fmaxf(vec_max, x[j]);
     }
-    float old_m = m;
-    m = max(m, vec_max);
-    s *= __expf(old_m - m);
+    const float new_m = fmaxf(m, vec_max);
+    s *= __expf(m - new_m);
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      s += __expf(cache[j] - m);
+      s += __expf(x[j] - new_m);
     }
+    m = new_m;
   }
 
+  // The reduce kernel's griddepcontrol.wait still waits for this whole grid to finish.
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
-  // CTA-level merge to get slice-level (max, sum)
-  float2 slice_ms = CTAOnlineSoftmaxMerge<BLOCK_THREADS>(m, s, smem_ms);
 
-  if (tx == 0) {
-    partial_results[bx * num_slices + by] = {slice_ms.x, slice_ms.y};
+  float2 ms = WarpOnlineSoftmaxMerge(m, s);
+  if (lane == 0) warp_partials[warp] = ms;
+  __syncthreads();
+  if (warp == 0) {
+    ms = lane < kNumWarps ? warp_partials[lane] : make_float2(kSoftmaxMaxSeed, 0.0f);
+    ms = WarpOnlineSoftmaxMerge(ms.x, ms.y);
+    // Lane k stores this slice's partial into the copy held by slice k (num_slices <= 32).
+    if (lane < num_slices) {
+      auto partials = reinterpret_cast<PartialSoftmaxResult*>(row_output + lane * slice_stride);
+      partials[by] = {ms.x, ms.y};
+    }
   }
 }
 
-// ============================================================================
-// Split merge + correction kernel (multi-CTA per row)
-// ============================================================================
-// Grid: (batch_size, num_slices).  Each CTA corrects one slice.
-// Warp 0 in every CTA redundantly merges all partial (max, sum) pairs (cheap
-// since num_slices <= 32).  Then all threads normalize their slice.
-
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
-__global__ void OnlineSoftmaxReduceKernel(DType* logits, DType* output,
-                                          PartialSoftmaxResult* partial_results,
-                                          DType* temperature_arr, float temperature_val, uint32_t d,
-                                          uint32_t num_slices) {
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxReduceKernel(
+    DType* logits, DType* output, DType* temperature_arr, float temperature_val, uint32_t d,
+    uint32_t slice_stride, uint32_t num_slices) {
   const uint32_t bx = blockIdx.x;  // row
-  const uint32_t by = blockIdx.y;  // slice index
+  const uint32_t by = blockIdx.y;  // slice
   const uint32_t tx = threadIdx.x;
+
+  const uint32_t slice_start = by * slice_stride;
+  const uint32_t slice_size = min(slice_stride, d - slice_start);
+  const DType* slice_logits = logits + static_cast<size_t>(bx) * d + slice_start;
+  DType* slice_output = output + static_cast<size_t>(bx) * d + slice_start;
+
+  __shared__ float2 row_ms;
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
   float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
   const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
-  // Compute this CTA's slice range (same formula as map kernel)
-  const uint32_t vec_alignment_elems = alignof(vec_t<DType, VEC_SIZE>) / sizeof(DType);
-  const uint32_t slice_stride = round_up(ceil_div(d, num_slices), vec_alignment_elems);
-  const uint32_t slice_start = by * slice_stride;
-  const uint32_t slice_size = min((by + 1) * slice_stride, d) - slice_start;
-  if (slice_start >= d) return;
-
-  const uint32_t lane = tx % 32;
-  const uint32_t warp_id = tx / 32;
-
-#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
-#endif
-
-  // Warp 0: merge all partial (max, sum) -> global (max, sum) for this row
-  __shared__ float2 shared_result;
-  if (warp_id == 0) {
-    float pm = -FLT_MAX;
-    float ps = 0.0f;
-    if (lane < num_slices) {
-      PartialSoftmaxResult partial = partial_results[bx * num_slices + lane];
-      pm = partial.max_val;
-      ps = partial.denominator;
+  // Read this slice's copy of the row's partials; the barrier orders it before the stores below,
+  // which overwrite that copy. No other CTA reads it.
+  if (tx < 32) {
+    float2 ms = make_float2(kSoftmaxMaxSeed, 0.0f);
+    if (tx < num_slices) {
+      const PartialSoftmaxResult partial =
+          reinterpret_cast<const PartialSoftmaxResult*>(slice_output)[tx];
+      ms = make_float2(partial.max_val, partial.denominator);
     }
-    float2 result = WarpOnlineSoftmaxMerge(pm, ps);
-    if (lane == 0) {
-      shared_result = result;
-    }
+    ms = WarpOnlineSoftmaxMerge(ms.x, ms.y);
+    if (tx == 0) row_ms = ms;
   }
   __syncthreads();
-  const float final_max = shared_result.x;
-  const float inv_denominator = 1.0f / shared_result.y;
+  const float final_max = row_ms.x;
+  const float inv_denominator = 1.0f / row_ms.y;
 
-  // All threads: normalize this slice
-  const uint32_t slice_vecs = slice_size / VEC_SIZE;
-  DType* slice_in = logits + static_cast<uint64_t>(bx) * d + slice_start;
-  DType* slice_out = output + static_cast<uint64_t>(bx) * d + slice_start;
-
-  for (uint32_t idx = tx; idx < slice_vecs; idx += BLOCK_THREADS) {
+  for (uint32_t i = tx * VEC_SIZE; i < slice_size; i += BLOCK_THREADS * VEC_SIZE) {
     vec_t<DType, VEC_SIZE> logits_vec;
-    logits_vec.cast_load(slice_in + idx * VEC_SIZE);
-
     vec_t<DType, VEC_SIZE> prob_vec;
+    logits_vec.cast_load(slice_logits + i);
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      float val = static_cast<float>(logits_vec[j]) * inv_temp;
-      prob_vec[j] = static_cast<DType>(__expf(val - final_max) * inv_denominator);
+      // __fmul_rn, not *: it must not be contracted into an FMA.
+      // *= inv_temp can lead to probabilities exceeding 1 at low temperatures (see PR #5088).
+      const float x = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
+      prob_vec[j] = static_cast<DType>(__expf(x - final_max) * inv_denominator);
     }
-
-    prob_vec.cast_store(slice_out + idx * VEC_SIZE);
+    prob_vec.cast_store(slice_output + i);
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
@@ -609,7 +571,7 @@ template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALG
           BlockReduceAlgorithm REDUCE_ALGORITHM, bool DETERMINISTIC, typename Predicate>
 __device__ __forceinline__ void DeviceSamplingFromProb(
     uint32_t i, uint32_t d, Predicate pred, float u, vec_t<float, VEC_SIZE> prob_vec,
-    float& aggregate,
+    float& aggregate, int& last_valid_index,
     SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>* temp_storage) {
   const uint32_t tx = threadIdx.x;
   float prob_greater_than_threshold[VEC_SIZE];
@@ -646,13 +608,8 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
     }
 
     bool greater_than_u_diff[VEC_SIZE];
-#ifdef FLASHINFER_CUB_SUBTRACTLEFT_DEFINED
     BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
-        .SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u_diff, BoolDiffOp());
-#else
-    BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
-        .template FlagHeads<VEC_SIZE>(greater_than_u_diff, greater_than_u, BoolDiffOp(), 0);
-#endif
+        .template SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u_diff, BoolDiffOp());
     __syncthreads();
 
 #pragma unroll
@@ -664,24 +621,24 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
     __syncthreads();
   }
 
-  // update the last valid index
-  int valid_index[VEC_SIZE];
+  // Keep fallback candidates local until the scan ends without selecting a token.
 #pragma unroll
   for (uint32_t j = 0; j < VEC_SIZE; ++j) {
     if (valid[j]) {
-      valid_index[j] = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
-    } else {
-      valid_index[j] = -1;
+      last_valid_index = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
     }
   }
-  int max_valid_index =
-      BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce_int)
-          .Reduce(valid_index, MaxReduceOp{});
-  if (tx == 0 && max_valid_index != -1 && max_valid_index < (int)d) {
-    temp_storage->last_valid_id = max_valid_index;
+  aggregate += aggregate_local;
+  if (temp_storage->sampled_id == d &&
+      (aggregate > u || i + 1 == ceil_div(d, BLOCK_THREADS * VEC_SIZE))) {
+    int max_valid_index =
+        BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce_int)
+            .Reduce(last_valid_index, MaxReduceOp{});
+    if (tx == 0) {
+      temp_storage->last_valid_id = max_valid_index;
+    }
   }
   __syncthreads();
-  aggregate += aggregate_local;
 }
 
 template <typename DType, typename IdType>
@@ -761,26 +718,40 @@ __device__ __forceinline__ vec_t<DType, VEC_SIZE> GenerateGumbelNoise(uint64_t p
   }
 }
 
+// Equal values resolve to the larger position, as they did when each vocabulary tile was
+// reduced separately: CUB folds left to right, DataAndIndex::operator+ keeps the right
+// operand on a tie, and later tiles replaced earlier ones. Deciding ties by position makes
+// the result independent of reduction order, so each thread keeps a single candidate.
+struct LogitsArgMaxOp {
+  template <typename T>
+  __device__ __forceinline__ T operator()(const T& a, const T& b) const {
+    return (a.data > b.data || (a.data == b.data && a.index > b.index)) ? a : b;
+  }
+};
+
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* indices, uint32_t d,
-                                         uint64_t* seed_arr, uint64_t seed_val,
-                                         uint64_t* offset_arr, uint64_t offset_val) {
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void SamplingFromLogitsKernel(
+    DType* logits, IdType* output, IdType* indices, uint32_t d, uint64_t* seed_arr,
+    uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val, uint32_t seed_stride,
+    uint32_t offset_stride) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
-  using SharedMem = typename BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS,
-                                         REDUCE_ALGORITHM>::TempStorage;
+  // Positions are 32-bit whatever IdType is. Slots past d keep their position, so a row
+  // that is -inf everywhere still resolves to the last slot; the output maps a padded slot to 0.
+  using Candidate = DataAndIndex<DType, uint32_t>;
+  using SharedMem = typename BlockReduce<Candidate, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage;
   extern __shared__ __align__(alignof(SharedMem)) uint8_t smem_sampling_logit[];
   auto& temp_storage = reinterpret_cast<SharedMem&>(smem_sampling_logit);
 
   vec_t<DType, VEC_SIZE> logits_vec;
-  DataAndIndex<DType, IdType> max_data = {-cuda::std::numeric_limits<DType>::infinity(), 0};
+  Candidate max_data = {-cuda::std::numeric_limits<DType>::infinity(), 0};
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     logits_vec.fill(-cuda::std::numeric_limits<DType>::infinity());
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
@@ -790,36 +761,34 @@ __global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* 
     vec_t<DType, VEC_SIZE> gumbel_noise = GenerateGumbelNoise<DType, VEC_SIZE>(
         philox_seed, philox_offset,
         static_cast<uint64_t>(bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE));
-    DataAndIndex<DType, IdType> cur_data[VEC_SIZE];
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      cur_data[j].data = (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d
-                             ? logits_vec[j] + gumbel_noise[j]
-                             : -cuda::std::numeric_limits<DType>::infinity();
-      cur_data[j].index = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
+      const uint32_t token_idx = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
+      const DType value = token_idx < d ? logits_vec[j] + gumbel_noise[j]
+                                        : -cuda::std::numeric_limits<DType>::infinity();
+      max_data = LogitsArgMaxOp()(max_data, Candidate{value, token_idx});
     }
-
-    max_data +=
-        BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage)
-            .template Sum<VEC_SIZE>(cur_data);
   }
+  max_data = BlockReduce<Candidate, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage)
+                 .Reduce(max_data, LogitsArgMaxOp());
   if (tx == 0) {
-    output[bx] = max_data.index;
+    output[bx] = max_data.index < d ? max_data.index : 0;
   }
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void SamplingFromProbKernel(DType* probs, IdType* output, bool* valid, IdType* indices,
-                                       uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
-                                       uint64_t* offset_arr, uint64_t offset_val) {
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void SamplingFromProbKernel(
+    DType* probs, IdType* output, bool* valid, IdType* indices, uint32_t d, uint64_t* seed_arr,
+    uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val, uint32_t seed_stride,
+    uint32_t offset_stride) {
   curandStatePhilox4_32_10_t state;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   curand_init(philox_seed, bx, philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
@@ -832,6 +801,7 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, bool* valid
           smem_sampling);
   temp_storage.sampled_id = d;
   temp_storage.last_valid_id = -1;
+  int last_valid_index = -1;
   __syncthreads();
 
   vec_t<float, VEC_SIZE> probs_vec;
@@ -847,7 +817,8 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, bool* valid
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                            DETERMINISTIC>(
-        i, d, [](float x) { return x > 0; }, u, probs_vec, aggregate, &temp_storage);
+        i, d, [](float x) { return x > 0; }, u, probs_vec, aggregate, last_valid_index,
+        &temp_storage);
     if (float(aggregate) > u) {
       break;
     }
@@ -875,21 +846,22 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, bool* valid
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, bool* valid,
-                                           IdType* indices, IdType* top_k_arr, uint32_t top_k_val,
-                                           uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
-                                           uint64_t* offset_arr, uint64_t offset_val) {
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKSamplingFromProbKernel(
+    DType* probs, IdType* output, bool* valid, IdType* indices, IdType* top_k_arr,
+    uint32_t top_k_val, uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
+    uint64_t offset_val, uint32_t seed_stride, uint32_t offset_stride) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
-  const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
+  // One entry per probs row: index by row_idx, not bx (#5340).
+  const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
 
   extern __shared__ __align__(
       alignof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>))
@@ -908,6 +880,7 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, bool* v
     round += 1;
     temp_storage.sampled_id = d;
     temp_storage.last_valid_id = -1;
+    int last_valid_index = -1;
     __syncthreads();
     float u = curand_uniform(&state) * q;
     aggregate = 0;
@@ -920,7 +893,8 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, bool* v
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                              DETERMINISTIC>(
-          i, d, [&](float x) { return x > low; }, u, probs_vec, aggregate, &temp_storage);
+          i, d, [&](float x) { return x > low; }, u, probs_vec, aggregate, last_valid_index,
+          &temp_storage);
       if (aggregate > u) {
         break;
       }
@@ -1008,16 +982,16 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, bool* v
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, bool* valid,
-                                           IdType* indices, float* top_p_arr, float top_p_val,
-                                           uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
-                                           uint64_t* offset_arr, uint64_t offset_val) {
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopPSamplingFromProbKernel(
+    DType* probs, IdType* output, bool* valid, IdType* indices, float* top_p_arr, float top_p_val,
+    uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val,
+    uint32_t seed_stride, uint32_t offset_stride) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
@@ -1039,6 +1013,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, bool* v
   do {
     temp_storage.sampled_id = d;
     temp_storage.last_valid_id = -1;
+    int last_valid_index = -1;
     __syncthreads();
     float u = curand_uniform(&state) * q;
     aggregate = 0;
@@ -1051,7 +1026,8 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, bool* v
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                              DETERMINISTIC>(
-          i, d, [&](float x) { return x > low; }, u, probs_vec, aggregate, &temp_storage);
+          i, d, [&](float x) { return x > low; }, u, probs_vec, aggregate, last_valid_index,
+          &temp_storage);
       if (aggregate > u) {
         break;
       }
@@ -1135,20 +1111,21 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, bool* v
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdType* output,
-                                           bool* valid, IdType* indices, float min_p_val,
-                                           uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
-                                           uint64_t* offset_arr, uint64_t offset_val) {
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void MinPSamplingFromProbKernel(
+    DType* probs, float* min_p_arr, IdType* output, bool* valid, IdType* indices, float min_p_val,
+    uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val,
+    uint32_t seed_stride, uint32_t offset_stride) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
-  float p = (min_p_arr == nullptr) ? min_p_val : min_p_arr[bx];
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
+  // One entry per probs row: index by row_idx, not bx (#5340).
+  float p = (min_p_arr == nullptr) ? min_p_val : min_p_arr[row_idx];
 
   extern __shared__ __align__(
       alignof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>))
@@ -1193,6 +1170,7 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
   int sampled_id;
   temp_storage.sampled_id = d;
   temp_storage.last_valid_id = -1;
+  int last_valid_index = -1;
   __syncthreads();
   float u = curand_uniform(&state) * q;
 #pragma unroll 2
@@ -1204,7 +1182,8 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                            DETERMINISTIC>(
-        i, d, [&](float x) { return x >= pivot; }, u, probs_vec, aggregate, &temp_storage);
+        i, d, [&](float x) { return x >= pivot; }, u, probs_vec, aggregate, last_valid_index,
+        &temp_storage);
     if (aggregate > u) {
       break;
     }
@@ -1230,17 +1209,16 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, float* top_p_arr,
-                                               IdType* output, bool* valid, IdType* indices,
-                                               IdType top_k_val, float top_p_val, uint32_t d,
-                                               uint64_t* seed_arr, uint64_t seed_val,
-                                               uint64_t* offset_arr, uint64_t offset_val) {
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKTopPSamplingFromProbKernel(
+    DType* probs, IdType* top_k_arr, float* top_p_arr, IdType* output, bool* valid, IdType* indices,
+    IdType top_k_val, float top_p_val, uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
+    uint64_t* offset_arr, uint64_t offset_val, uint32_t seed_stride, uint32_t offset_stride) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
@@ -1263,6 +1241,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
   do {
     temp_storage.sampled_id = d;
     temp_storage.last_valid_id = -1;
+    int last_valid_index = -1;
     __syncthreads();
     float u = curand_uniform(&state) * q;
     aggregate = 0;
@@ -1275,7 +1254,8 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                              DETERMINISTIC>(
-          i, d, [&](float x) { return x > low; }, u, probs_vec, aggregate, &temp_storage);
+          i, d, [&](float x) { return x > low; }, u, probs_vec, aggregate, last_valid_index,
+          &temp_storage);
       if (aggregate > u) {
         break;
       }
@@ -1361,101 +1341,479 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
   }
 }
 
+// ==================== Split-row rejection sampling (thread block clusters) ====================
+//
+// The kernels above run one CTA per row, so a small batch occupies only batch_size SMs, and every
+// rejection round streams the whole row from global memory at least once. On SM90 the variant
+// below splits each row across a thread block cluster instead: every CTA stages its chunk of the
+// row in shared memory once, and each round exchanges per-warp partial sums through distributed
+// shared memory. The rounds, the Philox draws, the pivots and the accept/reject rules are the same
+// as in the single-CTA kernels; only the floating-point summation order differs.
+//
+// Warp w of a CTA covers the contiguous segment [w * seg, (w + 1) * seg) of the CTA's chunk, so
+// the inverse-CDF search walks rank -> warp -> thread -> element prefix sums in index order.
+
+enum class SplitRowSamplingMode { kTopP, kTopK, kTopKTopP };
+
+constexpr uint32_t SPLIT_ROW_SAMPLING_THREADS = 256;
+constexpr uint32_t SPLIT_ROW_SAMPLING_MAX_CLUSTER = 8;
+
+template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM>
+struct SplitRowSamplingTempStorage {
+  static constexpr uint32_t NUM_WARPS = BLOCK_THREADS / 32;
+  // Per-warp mass/count above the two thresholds of the last pass, gathered from every rank:
+  // part[threshold][rank * NUM_WARPS + warp].
+  ValueCount<float> part[2][SPLIT_ROW_SAMPLING_MAX_CLUSTER * NUM_WARPS];
+  // (sampled index, bits of its probability), written by the rank that owns the sampled token.
+  int2 sample;
+  int32_t sel_thread;
+  union {
+    typename BlockScan<float, BLOCK_THREADS, SCAN_ALGORITHM>::TempStorage scan;
+    typename BlockReduce<int, BLOCK_THREADS>::TempStorage reduce_int;
+  } block_prim;
+};
+
+__device__ __forceinline__ ValueCount<float> WarpReduceValueCount(ValueCount<float> v) {
+#pragma unroll
+  for (uint32_t offset = 16; offset >= 1; offset /= 2) {
+    v.value += __shfl_xor_sync(0xffffffff, v.value, offset);
+    v.count += __shfl_xor_sync(0xffffffff, v.count, offset);
+  }
+  return v;
+}
+
+/*!
+ * \brief Inverse-CDF search over the 32 lane masses of a warp. Returns the first lane whose
+ *   inclusive prefix exceeds u, or the last lane with mass when rounding leaves u above the
+ *   total, or -1 when no lane has mass; prefix_excl receives that lane's exclusive prefix.
+ */
+__device__ __forceinline__ int WarpSelectLane(float lane_mass, float u, float& prefix_excl) {
+  const uint32_t lane = threadIdx.x % 32;
+  float incl = lane_mass;
+#pragma unroll
+  for (uint32_t offset = 1; offset < 32; offset *= 2) {
+    const float t = __shfl_up_sync(0xffffffff, incl, offset);
+    if (lane >= offset) incl += t;
+  }
+  const uint32_t hit = __ballot_sync(0xffffffff, incl > u && lane_mass > 0.f);
+  const uint32_t nonzero = __ballot_sync(0xffffffff, lane_mass > 0.f);
+  if (nonzero == 0) return -1;
+  const int sel = hit != 0 ? __ffs(hit) - 1 : 31 - __clz(nonzero);
+  prefix_excl = __shfl_sync(0xffffffff, incl - lane_mass, sel);
+  return sel;
+}
+
+template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM, uint32_t VEC_SIZE,
+          SplitRowSamplingMode MODE, typename DType, typename IdType>
+__global__ void __launch_bounds__(BLOCK_THREADS)
+    SplitRowRejectionSamplingFromProbKernel(DType* probs, IdType* output, bool* valid,
+                                            IdType* indices, IdType* top_k_arr, float* top_p_arr,
+                                            IdType top_k_val, float top_p_val, uint32_t d,
+                                            uint32_t chunk_size, uint64_t* seed_arr,
+                                            uint64_t seed_val, uint64_t* offset_arr,
+                                            uint64_t offset_val, uint32_t seed_stride,
+                                            uint32_t offset_stride) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  using TempStorage = SplitRowSamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM>;
+  constexpr uint32_t NUM_WARPS = TempStorage::NUM_WARPS;
+  cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
+  const uint32_t cluster_size = cluster.num_blocks();
+  const uint32_t rank = cluster.block_rank();
+  const uint32_t bx = blockIdx.x / cluster_size, tx = threadIdx.x;
+  const uint32_t warp_id = tx / 32, lane = tx % 32;
+
+  extern __shared__ __align__(16) uint8_t smem_split_row[];
+  auto& temp_storage = *reinterpret_cast<TempStorage*>(smem_split_row);
+  float* chunk = reinterpret_cast<float*>(smem_split_row + round_up(sizeof(TempStorage), 16));
+
+  const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
+  const uint32_t chunk_start = min(rank * chunk_size, d);
+  const uint32_t chunk_len = min(chunk_size, d - chunk_start);
+
+  // Stage this CTA's chunk of the row in shared memory.
+  constexpr bool ASYNC_COPY = VEC_SIZE == 4 && std::is_same_v<DType, float>;
+  const DType* row_ptr = probs + static_cast<size_t>(row_idx) * d + chunk_start;
+  if constexpr (ASYNC_COPY) {
+    for (uint32_t i = tx * 4; i < chunk_len; i += BLOCK_THREADS * 4) {
+      const uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(chunk + i));
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_addr),
+                   "l"(row_ptr + i));
+    }
+    asm volatile("cp.async.commit_group;\n" ::);
+  } else {
+    for (uint32_t i = tx; i < chunk_len; i += BLOCK_THREADS) {
+      chunk[i] = static_cast<float>(row_ptr[i]);
+    }
+  }
+  // Zero-pad to a multiple of 4 elements so that float4 reads of the last segment are defined.
+  if (tx < 4 && chunk_len + tx < round_up(chunk_len, 4u)) chunk[chunk_len + tx] = 0.f;
+
+  uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
+  curandStatePhilox4_32_10_t state;
+  curand_init(philox_seed, bx, philox_offset, &state);
+  const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
+  const float p = top_p_arr == nullptr ? top_p_val : top_p_arr[row_idx];
+
+  // Warp segments are multiples of 4 elements so that lanes can read float4.
+  const uint32_t seg = round_up(ceil_div(chunk_len, NUM_WARPS), 4u);
+  const uint32_t warp_begin = min(warp_id * seg, chunk_len);
+  const uint32_t warp_end = min(warp_begin + seg, chunk_len);
+
+  // Distributed shared memory may only be accessed once every CTA of the cluster is running.
+  cluster.sync();
+  if constexpr (ASYNC_COPY) {
+    asm volatile("cp.async.wait_all;\n" ::);
+  }
+  __syncthreads();
+
+  // One pass over the chunk: per-warp mass (and count) above thr0 and thr1, gathered into
+  // temp_storage.part of every rank. Thresholds are never negative, so the zero padding is never
+  // counted. Four independent accumulators per lane keep the dependency chains short.
+  auto threshold_pass = [&](float thr0, float thr1) {
+    float s0[4] = {0.f, 0.f, 0.f, 0.f}, s1[4] = {0.f, 0.f, 0.f, 0.f};
+    int c0[4] = {0, 0, 0, 0}, c1[4] = {0, 0, 0, 0};
+#pragma unroll 2
+    for (uint32_t i = warp_begin + lane * 4; i < warp_end; i += 128) {
+      const float4 v4 = *reinterpret_cast<const float4*>(chunk + i);
+      const float v[4] = {v4.x, v4.y, v4.z, v4.w};
+#pragma unroll
+      for (uint32_t j = 0; j < 4; ++j) {
+        s0[j] += v[j] > thr0 ? v[j] : 0.f;
+        s1[j] += v[j] > thr1 ? v[j] : 0.f;
+        if constexpr (MODE != SplitRowSamplingMode::kTopP) {
+          c0[j] += v[j] > thr0;
+          c1[j] += v[j] > thr1;
+        }
+      }
+    }
+    ValueCount<float> t0{(s0[0] + s0[1]) + (s0[2] + s0[3]), (c0[0] + c0[1]) + (c0[2] + c0[3])};
+    ValueCount<float> t1{(s1[0] + s1[1]) + (s1[2] + s1[3]), (c1[0] + c1[1]) + (c1[2] + c1[3])};
+    t0 = WarpReduceValueCount(t0);
+    t1 = WarpReduceValueCount(t1);
+    if (lane < cluster_size) {
+      *cluster.map_shared_rank(&temp_storage.part[0][rank * NUM_WARPS + warp_id], lane) = t0;
+      *cluster.map_shared_rank(&temp_storage.part[1][rank * NUM_WARPS + warp_id], lane) = t1;
+    }
+    cluster.sync();
+  };
+
+  // Mass above low = 0 (threshold slot 0).
+  threshold_pass(0.f, 0.f);
+  int slot = 0;
+
+  float q = 1;
+  float low = 0, high = 1.f;
+  int sampled_id = 0;
+  bool is_valid = true;
+  do {
+    const float u = curand_uniform(&state) * q;
+    // Every warp of every rank selects the owner rank from the same data in the same order.
+    float rank_mass = 0.f;
+    if (lane < cluster_size) {
+#pragma unroll
+      for (uint32_t w = 0; w < NUM_WARPS; ++w) {
+        rank_mass += temp_storage.part[slot][lane * NUM_WARPS + w].value;
+      }
+    }
+    float u_rem = u, excl = 0.f;
+    const int owner = WarpSelectLane(rank_mass, u, excl);
+    u_rem -= excl;
+    if (owner < 0) {
+      // No mass above low anywhere in the row.
+      if (rank == 0 && tx < cluster_size) {
+        *cluster.map_shared_rank(&temp_storage.sample, tx) = make_int2(-1, 0);
+      }
+    } else if (rank == (uint32_t)owner) {
+      const int sel_warp = WarpSelectLane(
+          lane < NUM_WARPS ? temp_storage.part[slot][rank * NUM_WARPS + lane].value : 0.f, u_rem,
+          excl);
+      u_rem -= excl;
+      // Contiguous per-thread pieces of the selected warp segment; an odd length keeps the
+      // sequential per-thread reads free of bank conflicts.
+      const uint32_t seg_begin = min(sel_warp * seg, chunk_len);
+      const uint32_t seg_end = min(seg_begin + seg, chunk_len);
+      uint32_t sub = ceil_div(seg_end - seg_begin, BLOCK_THREADS);
+      sub += (sub % 2 == 0) ? 1 : 0;
+      const uint32_t t_begin = min(seg_begin + tx * sub, seg_end);
+      const uint32_t t_end = min(t_begin + sub, seg_end);
+      float mass = 0.f;
+      for (uint32_t i = t_begin; i < t_end; ++i) {
+        mass += chunk[i] > low ? chunk[i] : 0.f;
+      }
+      float incl;
+      BlockScan<float, BLOCK_THREADS, SCAN_ALGORITHM>(temp_storage.block_prim.scan)
+          .InclusiveSum(mass, incl);
+      if (tx == 0) temp_storage.sel_thread = BLOCK_THREADS;
+      __syncthreads();
+      if (mass > 0.f && incl > u_rem) atomicMin(&temp_storage.sel_thread, (int)tx);
+      __syncthreads();
+      int sel = temp_storage.sel_thread;
+      if (sel == (int)BLOCK_THREADS) {
+        // Rounding left u above the segment total: take the last thread with mass.
+        sel = BlockReduce<int, BLOCK_THREADS>(temp_storage.block_prim.reduce_int)
+                  .Reduce(mass > 0.f ? (int)tx : -1, MaxReduceOp{});
+        if (tx == 0) temp_storage.sel_thread = sel;
+        __syncthreads();
+        sel = temp_storage.sel_thread;
+      }
+      if ((int)tx == sel) {
+        float cdf = incl - mass;
+        int local_id = t_begin;
+        for (uint32_t i = t_begin; i < t_end; ++i) {
+          if (chunk[i] > low) {
+            local_id = i;
+            cdf += chunk[i];
+            if (cdf > u_rem) break;
+          }
+        }
+        const int2 sample = make_int2(chunk_start + local_id, __float_as_int(chunk[local_id]));
+        for (uint32_t r = 0; r < cluster_size; ++r) {
+          *cluster.map_shared_rank(&temp_storage.sample, r) = sample;
+        }
+      }
+    }
+    cluster.sync();
+    sampled_id = temp_storage.sample.x;
+    if (sampled_id < 0) {
+      is_valid = false;
+      break;
+    }
+    // IEEE-754 arithmetic (no FTZ) for pivot computation.  See #769 / #774.
+    const float pivot_0 = __int_as_float(temp_storage.sample.y);
+    const float pivot_1 = ieee_mul(ieee_add(pivot_0, high), 0.5f);
+
+    threshold_pass(pivot_0, pivot_1);
+    // Row totals: lane r sums rank r over its warps, then one fixed shuffle tree over ranks.
+    ValueCount<float> r0{0.f, 0}, r1{0.f, 0};
+    if (lane < cluster_size) {
+#pragma unroll
+      for (uint32_t w = 0; w < NUM_WARPS; ++w) {
+        r0 += temp_storage.part[0][lane * NUM_WARPS + w];
+        r1 += temp_storage.part[1][lane * NUM_WARPS + w];
+      }
+    }
+    const ValueCount<float> agg0 = WarpReduceValueCount(r0);
+    const ValueCount<float> agg1 = WarpReduceValueCount(r1);
+    bool accept_0, accept_1;
+    if constexpr (MODE == SplitRowSamplingMode::kTopP) {
+      accept_0 = agg0.value < p;
+      accept_1 = agg1.value < p;
+    } else if constexpr (MODE == SplitRowSamplingMode::kTopK) {
+      accept_0 = agg0.count < k;
+      accept_1 = agg1.count < k;
+    } else {
+      accept_0 = agg0.count < k && agg0.value < p;
+      accept_1 = agg1.count < k && agg1.value < p;
+    }
+    if (accept_0) {
+      // case 1: pivot_0 accepted
+      break;
+    }
+    if (accept_1) {
+      // case 2: pivot_0 rejected, pivot_1 accepted
+      low = pivot_0;
+      high = pivot_1;
+      q = agg0.value;
+      slot = 0;
+    } else {
+      // case 3: pivot_0 rejected, pivot_1 rejected
+      low = pivot_1;
+      q = agg1.value;
+      slot = 1;
+    }
+    // part and sample are next written after the owner-search cluster.sync() of the next round,
+    // which every CTA reaches only after its last read of them.
+  } while (low < high);
+
+  // No distributed shared memory access follows the last cluster.sync(), so CTAs may exit.
+  if (rank == 0 && tx == 0) {
+    output[bx] = is_valid ? sampled_id : 0;
+    valid[bx] = is_valid;
+  }
+#endif
+}
+
+/*!
+ * \brief Cluster size for split-row rejection sampling, or 0 to use the single-CTA kernels.
+ * \note Chunks of at most 26K floats let two CTAs share an SM; small vocabularies grow the
+ *   cluster while the grid still fills less than half of the SMs. Tuned on GH200 (132 SMs);
+ *   other architectures keep the single-CTA kernels until they are measured.
+ */
+template <SplitRowSamplingMode MODE>
+inline uint32_t GetSplitRowSamplingClusterSize(uint32_t batch_size, uint32_t d) {
+  constexpr uint32_t kTargetChunk = 26624, kMinChunk = 4096;
+  int device, major = 0, num_sms = 0, max_smem = 0;
+  if (cudaGetDevice(&device) != cudaSuccess) return 0;
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
+  cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+  if (major != 9 || ceil_div(d, 2u) < kMinChunk) return 0;
+  using TempStorage = SplitRowSamplingTempStorage<SPLIT_ROW_SAMPLING_THREADS, SCAN_ALGO>;
+  auto fits = [&](uint32_t c) {
+    return round_up(sizeof(TempStorage), 16) + (round_up(ceil_div(d, c), 4u) + 4) * sizeof(float) <=
+           static_cast<size_t>(max_smem);
+  };
+  uint32_t c = 2;
+  while (c < SPLIT_ROW_SAMPLING_MAX_CLUSTER && (ceil_div(d, c) > kTargetChunk || !fits(c))) c *= 2;
+  if (!fits(c)) return 0;
+  // With 8-CTA clusters the single-CTA kernels catch up on large grids. Measured crossovers:
+  // about 24 CTAs per SM for chunks above the target (one resident CTA per SM) and about 64 for
+  // chunks above 16K floats. Top-p falls behind sooner on H100, so it leaves at 16 and 32.
+  // 2- and 4-CTA clusters stayed ahead up to batch 8192.
+  if (c == SPLIT_ROW_SAMPLING_MAX_CLUSTER) {
+    constexpr bool kTopP = MODE == SplitRowSamplingMode::kTopP;
+    const uint32_t num_ctas = batch_size * c;
+    if (ceil_div(d, c) > kTargetChunk && num_ctas >= (kTopP ? 16u : 24u) * num_sms) return 0;
+    if (ceil_div(d, c) > 16384 && num_ctas >= (kTopP ? 32u : 64u) * num_sms) return 0;
+  }
+  while (c < SPLIT_ROW_SAMPLING_MAX_CLUSTER &&
+         batch_size * c * 2 <= static_cast<uint32_t>(num_sms) && ceil_div(d, c * 2) >= kMinChunk) {
+    c *= 2;
+  }
+  return c;
+}
+
+/*!
+ * \brief Launches split-row rejection sampling. Returns cudaErrorNotSupported, without launching,
+ *   when the kernel was not compiled for SM90+ (its body is then empty) so that the caller can
+ *   fall back to the single-CTA kernel.
+ */
+template <SplitRowSamplingMode MODE, typename T, typename IdType>
+cudaError_t SplitRowRejectionSamplingFromProb(uint32_t cluster_size, T* probs, IdType* output,
+                                              bool* valid, IdType* indices, IdType* top_k_arr,
+                                              float* top_p_arr, IdType top_k_val, float top_p_val,
+                                              uint32_t batch_size, uint32_t d, uint64_t* seed_arr,
+                                              uint64_t seed_val, uint64_t* offset_arr,
+                                              uint64_t offset_val, cudaStream_t stream,
+                                              uint32_t seed_stride, uint32_t offset_stride) {
+  constexpr uint32_t BLOCK_THREADS = SPLIT_ROW_SAMPLING_THREADS;
+  using TempStorage = SplitRowSamplingTempStorage<BLOCK_THREADS, SCAN_ALGO>;
+  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  const uint32_t chunk_size = round_up(ceil_div(d, cluster_size), 4u);
+  const size_t smem_size = round_up(sizeof(TempStorage), 16) + (chunk_size + 4) * sizeof(float);
+
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    auto kernel = SplitRowRejectionSamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, VEC_SIZE, MODE,
+                                                          T, IdType>;
+    cudaFuncAttributes attr;
+    FLASHINFER_CUDA_CALL(cudaFuncGetAttributes(&attr, kernel));
+    if (attr.ptxVersion < 90) return cudaErrorNotSupported;
+    // The limit is per kernel, so a concurrent launch with a smaller chunk must not lower it.
+    int device, max_smem;
+    FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+    FLASHINFER_CUDA_CALL(
+        cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                              max_smem - static_cast<int>(attr.sharedSizeBytes)));
+    cudaLaunchAttribute attribute[1];
+    attribute[0].id = cudaLaunchAttributeClusterDimension;
+    attribute[0].val.clusterDim.x = cluster_size;
+    attribute[0].val.clusterDim.y = 1;
+    attribute[0].val.clusterDim.z = 1;
+    cudaLaunchConfig_t config;
+    config.gridDim = batch_size * cluster_size;
+    config.blockDim = BLOCK_THREADS;
+    config.dynamicSmemBytes = smem_size;
+    config.stream = stream;
+    config.attrs = attribute;
+    config.numAttrs = 1;
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+        &config, kernel, probs, output, valid, indices, top_k_arr, top_p_arr, top_k_val, top_p_val,
+        d, chunk_size, seed_arr, seed_val, offset_arr, offset_val, seed_stride, offset_stride));
+  });
+  return cudaSuccess;
+}
+
 template <typename DType>
 cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uint32_t d,
                           DType* temperature_arr, DType temperature_val, void* workspace_buffer,
                           size_t workspace_buffer_size_in_bytes, bool enable_pdl,
                           cudaStream_t stream = 0) {
+  constexpr uint32_t LARGE_VOCAB_THRESHOLD = 24576;
+
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
   auto compute_capacity = GetCudaComputeCapability();
 
   DISPATCH_COMPUTE_CAP_NUM_THREADS(
       compute_capacity, BLOCK_THREADS, {DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-        // Auto-tune num_slices based on SM count to maximize GPU occupancy.
-        // Only split for large vocab sizes where multi-CTA parallelism helps.
-        constexpr uint32_t LARGE_VOCAB_THRESHOLD = 24576;
+        // Split rows across CTAs only when one CTA per row would leave SMs idle: pick the largest
+        // power-of-two slice count with at most two CTAs per SM. The 256-CTA floor keeps batches of
+        // up to 128 rows split on small GPUs, as before this heuristic.
         uint32_t num_slices = 1;
-        if (d >= LARGE_VOCAB_THRESHOLD) {
-          // Find max power-of-2 slices (up to 32) such that batch_size * slices <= 2 * num_SMs.
-          const int num_sm = GetCudaMultiProcessorCount();
-          for (uint32_t s = 32; s > 1; s /= 2) {
-            if (batch_size * s <= static_cast<uint32_t>(2 * num_sm)) {
+        uint32_t slice_stride = d;
+        const bool partials_aligned =
+            (reinterpret_cast<std::uintptr_t>(output) | (size_t(d) * sizeof(DType))) %
+                alignof(PartialSoftmaxResult) ==
+            0;
+        if (d >= LARGE_VOCAB_THRESHOLD && partials_aligned) {
+          const uint64_t max_ctas =
+              std::max<uint64_t>(2 * static_cast<uint64_t>(GetCudaMultiProcessorCount()), 256);
+          for (uint32_t s = kSoftmaxMaxSlices; s > 1; s /= 2) {
+            if (uint64_t(batch_size) * s <= max_ctas) {
               num_slices = s;
               break;
+            }
+          }
+          if (num_slices > 1) {
+            constexpr uint32_t partial_align_elems =
+                ceil_div(alignof(PartialSoftmaxResult), sizeof(DType));
+            // Both are powers of two, so the larger is a multiple of the smaller.
+            const uint32_t stride_align = std::max<uint32_t>(VEC_SIZE, partial_align_elems);
+            slice_stride = round_up(ceil_div(d, num_slices), stride_align);
+            num_slices = ceil_div(d, slice_stride);  // rounding may leave trailing slices empty
+            // Every slice, including the shorter last one, holds a copy of all the row's partials.
+            const size_t last_slice_bytes =
+                size_t(d - (num_slices - 1) * slice_stride) * sizeof(DType);
+            if (last_slice_bytes < num_slices * sizeof(PartialSoftmaxResult)) {
+              num_slices = 1;
+              slice_stride = d;
             }
           }
         }
 
         if (num_slices > 1) {
-          // Path A: Multi-CTA split strategy
-          const size_t partial_buffer_size = batch_size * num_slices * sizeof(PartialSoftmaxResult);
-          if (workspace_buffer_size_in_bytes < partial_buffer_size) {
+          // Path A: Vocab-Splitting Strategy for small-batch & large-vocab
+          // Phase 1 stores partials in the output rows while other CTAs still read logits.
+          const auto in = reinterpret_cast<std::uintptr_t>(logits);
+          const auto out = reinterpret_cast<std::uintptr_t>(output);
+          const auto distance = out > in ? out - in : in - out;
+          if (distance < size_t(batch_size) * d * sizeof(DType)) {
             return cudaErrorInvalidValue;
           }
 
-          AlignedAllocator allocator(workspace_buffer, workspace_buffer_size_in_bytes);
-          auto partial_results = allocator.aligned_alloc<PartialSoftmaxResult>(
-              partial_buffer_size, alignof(PartialSoftmaxResult), "softmax_workspace");
+          dim3 nblks(batch_size, num_slices);
+          dim3 nthrs(BLOCK_THREADS);
+          float temperature = static_cast<float>(temperature_val);  // kernels take a float
+          void* args[] = {&logits, &output,       &temperature_arr, &temperature,
+                          &d,      &slice_stride, &num_slices};
 
-          // Phase 1: Each CTA computes partial (max, sum) for one slice
-          dim3 phase1_nblks(batch_size, num_slices);
-          dim3 phase1_nthrs(BLOCK_THREADS);
-
+          // Phase 1: each CTA reduces its slice to a partial (max, denominator).
+          // Phase 2: each CTA merges the row's partials and normalizes its slice.
           auto phase1_kernel = OnlineSoftmaxMapKernel<BLOCK_THREADS, VEC_SIZE, DType>;
-          void* phase1_args[] = {&logits, &partial_results, &temperature_arr, &temperature_val,
-                                 &d,      &num_slices};
-
-          if (enable_pdl) {
-            cudaLaunchAttribute attribute[1];
-            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-            attribute[0].val.programmaticStreamSerializationAllowed = 1;
-
-            cudaLaunchConfig_t config;
-            config.gridDim = phase1_nblks;
-            config.blockDim = phase1_nthrs;
-            config.dynamicSmemBytes = 0;
-            config.stream = stream;
-            config.attrs = attribute;
-            config.numAttrs = 1;
-
-            FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, phase1_kernel, logits, partial_results,
-                                                    temperature_arr, temperature_val, d,
-                                                    num_slices));
-          } else {
-            FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)phase1_kernel, phase1_nblks, phase1_nthrs,
-                                                  phase1_args, 0, stream));
-          }
-
-          // Phase 2: Each CTA merges all partial results and normalizes its slice
-          dim3 phase2_nblks(batch_size, num_slices);
-          dim3 phase2_nthrs(BLOCK_THREADS);
-
           auto phase2_kernel = OnlineSoftmaxReduceKernel<BLOCK_THREADS, VEC_SIZE, DType>;
-          void* phase2_args[] = {&logits,          &output, &partial_results, &temperature_arr,
-                                 &temperature_val, &d,      &num_slices};
+          for (void* kernel : {(void*)phase1_kernel, (void*)phase2_kernel}) {
+            if (enable_pdl) {
+              cudaLaunchAttribute attribute[1];
+              attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+              attribute[0].val.programmaticStreamSerializationAllowed = 1;
 
-          if (enable_pdl) {
-            cudaLaunchAttribute attribute[1];
-            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-            attribute[0].val.programmaticStreamSerializationAllowed = 1;
+              cudaLaunchConfig_t config;
+              config.gridDim = nblks;
+              config.blockDim = nthrs;
+              config.dynamicSmemBytes = 0;
+              config.stream = stream;
+              config.attrs = attribute;
+              config.numAttrs = 1;
 
-            cudaLaunchConfig_t config;
-            config.gridDim = phase2_nblks;
-            config.blockDim = phase2_nthrs;
-            config.dynamicSmemBytes = 0;
-            config.stream = stream;
-            config.attrs = attribute;
-            config.numAttrs = 1;
-
-            FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, phase2_kernel, logits, output,
-                                                    partial_results, temperature_arr,
-                                                    temperature_val, d, num_slices));
-          } else {
-            FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)phase2_kernel, phase2_nblks, phase2_nthrs,
-                                                  phase2_args, 0, stream));
+              FLASHINFER_CUDA_CALL(cudaLaunchKernelExC(&config, kernel, args));
+            } else {
+              FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, 0, stream));
+            }
           }
         } else {
-          // Path B: Single-CTA fused strategy
+          // Path B: Single-Block Strategy
+          // Switch input cache
           uint32_t cache_threshold;
           if (batch_size <= 16) {
             cache_threshold = 4096;
@@ -1505,20 +1863,24 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
   return cudaSuccess;
 }
 
+// RNG strides are 0 for broadcast tensors and 1 for per-output-row tensors.
+// Default to broadcast to preserve existing C++ callers.
 template <typename T, typename IdType>
 cudaError_t SamplingFromLogits(T* logits, IdType* output, IdType* indices, uint32_t batch_size,
                                uint32_t d, bool deterministic, uint64_t* seed_arr,
                                uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val,
-                               cudaStream_t stream = 0) {
+                               cudaStream_t stream = 0, uint32_t seed_stride = 0,
+                               uint32_t offset_stride = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&logits, &output, &indices, &d, &seed_arr, &seed_val, &offset_arr, &offset_val};
+    void* args[] = {&logits,   &output,     &indices,    &d,           &seed_arr,
+                    &seed_val, &offset_arr, &offset_val, &seed_stride, &offset_stride};
     const uint32_t smem_size = sizeof(
-        typename BlockReduce<DataAndIndex<T, IdType>, BLOCK_THREADS, REDUCE_ALGO>::TempStorage);
+        typename BlockReduce<DataAndIndex<T, uint32_t>, BLOCK_THREADS, REDUCE_ALGO>::TempStorage);
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1535,15 +1897,16 @@ template <typename T, typename IdType>
 cudaError_t SamplingFromProb(T* probs, IdType* output, bool* valid, IdType* indices,
                              uint32_t batch_size, uint32_t d, bool deterministic,
                              uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
-                             uint64_t offset_val, cudaStream_t stream = 0) {
+                             uint64_t offset_val, cudaStream_t stream = 0, uint32_t seed_stride = 0,
+                             uint32_t offset_stride = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs,    &output,   &valid,      &indices,   &d,
-                    &seed_arr, &seed_val, &offset_arr, &offset_val};
+    void* args[] = {&probs,      &output,     &valid,       &indices,      &d, &seed_arr, &seed_val,
+                    &offset_arr, &offset_val, &seed_stride, &offset_stride};
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
 
     DISPATCH_ALIGNED_VEC_SIZE(
@@ -1561,8 +1924,18 @@ template <typename T, typename IdType>
 cudaError_t TopKSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* indices,
                                  T* top_k_arr, uint32_t batch_size, uint32_t top_k_val, uint32_t d,
                                  bool deterministic, uint64_t* seed_arr, uint64_t seed_val,
-                                 uint64_t* offset_arr, uint64_t offset_val,
-                                 cudaStream_t stream = 0) {
+                                 uint64_t* offset_arr, uint64_t offset_val, cudaStream_t stream = 0,
+                                 uint32_t seed_stride = 0, uint32_t offset_stride = 0) {
+  if (const uint32_t cluster_size =
+          GetSplitRowSamplingClusterSize<SplitRowSamplingMode::kTopK>(batch_size, d);
+      cluster_size > 1) {
+    const cudaError_t status =
+        SplitRowRejectionSamplingFromProb<SplitRowSamplingMode::kTopK, T, IdType>(
+            cluster_size, probs, output, valid, indices, reinterpret_cast<IdType*>(top_k_arr),
+            nullptr, static_cast<IdType>(top_k_val), 1.f, batch_size, d, seed_arr, seed_val,
+            offset_arr, offset_val, stream, seed_stride, offset_stride);
+    if (status != cudaErrorNotSupported) return status;
+  }
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
@@ -1570,8 +1943,8 @@ cudaError_t TopKSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* 
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &output,   &valid,    &indices,    &top_k_arr, &top_k_val,
-                    &d,     &seed_arr, &seed_val, &offset_arr, &offset_val};
+    void* args[] = {&probs,    &output,   &valid,      &indices,    &top_k_arr,   &top_k_val,    &d,
+                    &seed_arr, &seed_val, &offset_arr, &offset_val, &seed_stride, &offset_stride};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1590,8 +1963,19 @@ template <typename T, typename IdType>
 cudaError_t TopPSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* indices,
                                  T* top_p_arr, uint32_t batch_size, T top_p_val, uint32_t d,
                                  bool deterministic, uint64_t* seed_arr, uint64_t seed_val,
-                                 uint64_t* offset_arr, uint64_t offset_val,
-                                 cudaStream_t stream = 0) {
+                                 uint64_t* offset_arr, uint64_t offset_val, cudaStream_t stream = 0,
+                                 uint32_t seed_stride = 0, uint32_t offset_stride = 0) {
+  if (const uint32_t cluster_size =
+          GetSplitRowSamplingClusterSize<SplitRowSamplingMode::kTopP>(batch_size, d);
+      cluster_size > 1) {
+    const cudaError_t status =
+        SplitRowRejectionSamplingFromProb<SplitRowSamplingMode::kTopP, T, IdType>(
+            cluster_size, probs, output, valid, indices, nullptr,
+            reinterpret_cast<float*>(top_p_arr), IdType(0), static_cast<float>(top_p_val),
+            batch_size, d, seed_arr, seed_val, offset_arr, offset_val, stream, seed_stride,
+            offset_stride);
+    if (status != cudaErrorNotSupported) return status;
+  }
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
@@ -1599,8 +1983,8 @@ cudaError_t TopPSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* 
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &output,   &valid,    &indices,    &top_p_arr, &top_p_val,
-                    &d,     &seed_arr, &seed_val, &offset_arr, &offset_val};
+    void* args[] = {&probs,    &output,   &valid,      &indices,    &top_p_arr,   &top_p_val,    &d,
+                    &seed_arr, &seed_val, &offset_arr, &offset_val, &seed_stride, &offset_stride};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1619,8 +2003,8 @@ template <typename T, typename IdType>
 cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, bool* valid,
                                  IdType* indices, uint32_t batch_size, float min_p_val, uint32_t d,
                                  bool deterministic, uint64_t* seed_arr, uint64_t seed_val,
-                                 uint64_t* offset_arr, uint64_t offset_val,
-                                 cudaStream_t stream = 0) {
+                                 uint64_t* offset_arr, uint64_t offset_val, cudaStream_t stream = 0,
+                                 uint32_t seed_stride = 0, uint32_t offset_stride = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
@@ -1628,8 +2012,9 @@ cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, bool* v
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &min_p_arr, &output,   &valid,      &indices,   &min_p_val,
-                    &d,     &seed_arr,  &seed_val, &offset_arr, &offset_val};
+    void* args[] = {&probs,      &min_p_arr,   &output,       &valid,    &indices,
+                    &min_p_val,  &d,           &seed_arr,     &seed_val, &offset_arr,
+                    &offset_val, &seed_stride, &offset_stride};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1649,7 +2034,19 @@ cudaError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, 
                                      bool* valid, IdType* indices, uint32_t batch_size,
                                      IdType top_k_val, T top_p_val, uint32_t d, bool deterministic,
                                      uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
-                                     uint64_t offset_val, cudaStream_t stream = 0) {
+                                     uint64_t offset_val, cudaStream_t stream = 0,
+                                     uint32_t seed_stride = 0, uint32_t offset_stride = 0) {
+  if (const uint32_t cluster_size =
+          GetSplitRowSamplingClusterSize<SplitRowSamplingMode::kTopKTopP>(batch_size, d);
+      cluster_size > 1) {
+    const cudaError_t status =
+        SplitRowRejectionSamplingFromProb<SplitRowSamplingMode::kTopKTopP, T, IdType>(
+            cluster_size, probs, output, valid, indices, top_k_arr,
+            reinterpret_cast<float*>(top_p_arr), top_k_val, static_cast<float>(top_p_val),
+            batch_size, d, seed_arr, seed_val, offset_arr, offset_val, stream, seed_stride,
+            offset_stride);
+    if (status != cudaErrorNotSupported) return status;
+  }
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
@@ -1657,9 +2054,9 @@ cudaError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, 
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs,    &top_k_arr,  &top_p_arr, &output, &valid,
-                    &indices,  &top_k_val,  &top_p_val, &d,      &seed_arr,
-                    &seed_val, &offset_arr, &offset_val};
+    void* args[] = {&probs,    &top_k_arr,  &top_p_arr,  &output,      &valid,
+                    &indices,  &top_k_val,  &top_p_val,  &d,           &seed_arr,
+                    &seed_val, &offset_arr, &offset_val, &seed_stride, &offset_stride};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1702,8 +2099,8 @@ struct RenormTempStorage {
 
 template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE,
           typename DType>
-__global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* top_p_arr,
-                                     float top_p_val, uint32_t d) {
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopPRenormProbKernel(
+    DType* probs, DType* renormed_prob, float* top_p_arr, float top_p_val, uint32_t d) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
   float p = top_p_arr == nullptr ? top_p_val : top_p_arr[bx];
@@ -1852,7 +2249,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
     } else {
       high = min(pivot_0, max_le_high);
     }
-  } while (min_gt_low != max_le_high);
+  } while (min_gt_low < max_le_high && nextafterf(min_gt_low, max_le_high) < max_le_high);
 
   float normalizer = math::ptx_rcp(max(sum_low, 1e-8));
 
@@ -1899,19 +2296,17 @@ cudaError_t TopPRenormProb(DType* probs, DType* renormed_prob, float* top_p_arr,
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token_ids,
-                                         DType* target_probs, IdType* output_token_ids,
-                                         IdType* output_accepted_token_num,
-                                         IdType* output_emitted_draft_token_num,
-                                         uint32_t num_speculative_tokens, uint32_t d,
-                                         uint64_t* seed_arr, uint64_t seed_val,
-                                         uint64_t* offset_arr, uint64_t offset_val) {
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativeSampling(
+    DType* draft_probs, IdType* draft_token_ids, DType* target_probs, IdType* output_token_ids,
+    IdType* output_accepted_token_num, IdType* output_emitted_draft_token_num,
+    uint32_t num_speculative_tokens, uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
+    uint64_t* offset_arr, uint64_t offset_val, uint32_t seed_stride, uint32_t offset_stride) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   curandStatePhilox4_32_10_t curand_state;
   curand_init(philox_seed, bx, philox_offset, &curand_state);
@@ -1945,7 +2340,9 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
     float q = target_probs[(row_idx * (num_speculative_tokens + 1) + i) * d + draft_id],
           p = draft_probs[(row_idx * num_speculative_tokens + i) * d + draft_id];
     float u = curand_uniform(&curand_state);
-    if (u * p < q) {
+    // The first rejected position was already sampled by the prefix loop. Consume this
+    // draw to preserve the correction-sampling RNG sequence, but do not count it twice.
+    if (i != pos && u * p < q) {
       ++accepted_token_num;
     }
   }
@@ -1959,6 +2356,9 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
   float sum_relu_q_minus_p = 0;
   vec_t<float, VEC_SIZE> q_vec, p_vec;
   float relu_q_minus_p[VEC_SIZE];
+  // Accumulate per thread across tiles and reduce once, as MinPSamplingFromProbKernel does.
+  // Nothing in the loop reads the running total, so the per-tile reduction is not needed.
+  float threadlocal_sum_relu_q_minus_p = 0;
 #pragma unroll 2
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     q_vec.fill(0);
@@ -1975,12 +2375,12 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
       relu_q_minus_p[j] = max(q_vec[j] - p_vec[j], 0.0f);
+      threadlocal_sum_relu_q_minus_p += relu_q_minus_p[j];
     }
-    sum_relu_q_minus_p +=
-        BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-            .Sum<VEC_SIZE>(relu_q_minus_p);
-    __syncthreads();
   }
+  sum_relu_q_minus_p =
+      BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
+          .Sum(threadlocal_sum_relu_q_minus_p);
   if (tx == 0) {
     temp_storage.block_aggregate.value = sum_relu_q_minus_p;
   }
@@ -1991,6 +2391,7 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
   float u = curand_uniform(&curand_state) * sum_relu_q_minus_p;
 
   float aggregate_relu_q_minus_p(0);
+  int last_valid_index = -1;
 #pragma unroll 2
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     q_vec.fill(0);
@@ -2014,7 +2415,7 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                            DETERMINISTIC>(
         i, d, [&](float x) { return x > 0; }, u, relu_q_minus_p_vec, aggregate_relu_q_minus_p,
-        &temp_storage);
+        last_valid_index, &temp_storage);
     if (aggregate_relu_q_minus_p > u) {
       break;
     }
@@ -2043,7 +2444,8 @@ cudaError_t ChainSpeculativeSampling(
     DType* draft_probs, IdType* draft_token_ids, DType* target_probs, IdType* output_token_ids,
     IdType* output_accepted_token_num, IdType* output_emitted_draft_token_num, uint32_t batch_size,
     uint32_t num_speculative_tokens, uint32_t d, bool deterministic, uint64_t* seed_arr,
-    uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val, cudaStream_t stream = 0) {
+    uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val, cudaStream_t stream = 0,
+    uint32_t seed_stride = 0, uint32_t offset_stride = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
 
   auto compute_capacity = GetCudaComputeCapability();
@@ -2062,7 +2464,9 @@ cudaError_t ChainSpeculativeSampling(
                     &seed_arr,
                     &seed_val,
                     &offset_arr,
-                    &offset_val};
+                    &offset_val,
+                    &seed_stride,
+                    &offset_stride};
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
           auto kernel = ChainSpeculativeSampling<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE,

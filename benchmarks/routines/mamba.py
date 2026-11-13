@@ -38,6 +38,7 @@ from .flashinfer_benchmark_utils import (
     is_close_stats,
     print_perf_metrics,
     filter_backends_by_compute_capability,
+    warn_if_pdl_unsupported,
 )
 
 from triton_reference.selective_state_update import (
@@ -63,6 +64,10 @@ def run_mamba_test(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    if args.routine in ("causal_conv1d_fn", "causal_conv1d_update"):
+        from .causal_conv1d import run_causal_conv1d_test
+
+        return run_causal_conv1d_test(args)
     if args.routine == "selective_state_update":
         return testSelectiveStateUpdate(args)
     else:
@@ -80,6 +85,11 @@ def parse_mamba_args(line, parser):
     Returns:
         Parsed argument namespace
     """
+    known, _ = parser.parse_known_args(line)
+    if known.routine in ("causal_conv1d_fn", "causal_conv1d_update"):
+        from .causal_conv1d import parse_causal_conv1d_args
+
+        return parse_causal_conv1d_args(line, parser)
     parser.add_argument(
         "--batch_size",
         type=int,
@@ -253,6 +263,7 @@ def testSelectiveStateUpdate(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testSelectiveStateUpdate")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")

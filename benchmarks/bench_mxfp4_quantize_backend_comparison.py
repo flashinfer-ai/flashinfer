@@ -16,10 +16,10 @@ limitations under the License.
 Benchmark: MXFP4 Quantization Backend Comparison (CUDA vs CuTe-DSL)
 
 Compares the performance of CUDA and CuTe-DSL backends for MXFP4 quantization
-across different M and K dimensions. Supports both swizzled 128x4 and linear
-scale factor layouts. Each configuration is verified for correctness before
-timing. Generates heatmaps showing relative performance (speedup of CuTe-DSL
-over CUDA).
+across different M and K dimensions. Supports swizzled 128x4, swizzled 8x4,
+and linear scale factor layouts. Each configuration is verified for
+correctness before timing. Generates heatmaps showing relative performance
+(speedup of CuTe-DSL over CUDA).
 
 Can also measure achieved memory bandwidth in TB/s for the CuTe-DSL backend.
 
@@ -29,6 +29,9 @@ Usage:
 
     # Bandwidth measurement mode (cute-dsl only)
     python bench_mxfp4_quantize_backend_comparison.py --bandwidth
+
+    # Run only a subset of layouts (comma-separated)
+    python bench_mxfp4_quantize_backend_comparison.py --layouts swizzled_128x4,swizzled_8x4
 
 Requirements:
     - Blackwell GPU (SM100+) for CuTe-DSL backend
@@ -40,10 +43,26 @@ import numpy as np
 import torch
 from typing import Dict, List, Tuple
 
+from flashinfer import SfLayout
 from flashinfer.testing.utils import bench_gpu_time
 
 # Constants for bandwidth calculation
 SF_VEC_SIZE = 32  # Scale factor vector size for MXFP4
+
+# Mapping from CLI layout name to SfLayout enum
+LAYOUTS_BY_NAME = {
+    "swizzled_128x4": SfLayout.layout_128x4,
+    "swizzled_8x4": SfLayout.layout_8x4,
+    "linear": SfLayout.layout_linear,
+}
+
+
+def _sf_layout_flags(sf_layout: SfLayout) -> Tuple[bool, bool]:
+    """Translate SfLayout into the flags used by fp4_quantize."""
+    return (
+        sf_layout != SfLayout.layout_linear,
+        sf_layout == SfLayout.layout_8x4,
+    )
 
 
 def get_cc():
@@ -56,59 +75,32 @@ def verify_mxfp4_correctness(
     m: int,
     k: int,
     dtype: torch.dtype,
-    is_sf_swizzled_layout: bool,
+    sf_layout: SfLayout,
 ) -> Tuple[bool, str, float, float]:
     """
-    Verify that both backends produce correct outputs via roundtrip test.
+    Verify that both backends produce correct outputs.
+
+    A dequantization roundtrip is checked for every scale-factor layout.
 
     Returns:
         Tuple of (success, message, quant_match_pct, scale_match_pct)
         On failure, quant_match_pct and scale_match_pct are 0.0
     """
     from flashinfer.quantization.fp4_quantization import (
-        e2m1_and_ufp8sf_scale_to_float,
-        fp4_quantize,
+        mxfp4_dequantize,
+        mxfp4_quantize,
     )
 
     torch.manual_seed(42)
     x = torch.randn(m, k, device="cuda", dtype=dtype)
-    global_sf = ((448 * 6) / x.float().abs().nan_to_num().max()).cuda()
 
     try:
         # Test CUDA backend
-        quant_cuda, scale_cuda = fp4_quantize(
-            x,
-            global_sf,
-            sf_vec_size=32,
-            sf_use_ue8m0=True,
-            is_sf_swizzled_layout=is_sf_swizzled_layout,
-            backend="cuda",
-        )
-        dq_cuda = e2m1_and_ufp8sf_scale_to_float(
-            quant_cuda.cpu().view(torch.uint8),
-            scale_cuda.cpu().view(torch.uint8).reshape(-1),
-            torch.tensor([1.0]),
-            32,
-            0,
-            is_sf_swizzled_layout,
-        )
+        quant_cuda, scale_cuda = mxfp4_quantize(x, backend="cuda", sfLayout=sf_layout)
 
         # Test CuTe-DSL backend
-        quant_cute, scale_cute = fp4_quantize(
-            x,
-            global_sf,
-            sf_vec_size=32,
-            sf_use_ue8m0=True,
-            is_sf_swizzled_layout=is_sf_swizzled_layout,
-            backend="cute-dsl",
-        )
-        dq_cute = e2m1_and_ufp8sf_scale_to_float(
-            quant_cute.cpu().view(torch.uint8),
-            scale_cute.cpu().view(torch.uint8).reshape(-1),
-            torch.tensor([1.0]),
-            32,
-            0,
-            is_sf_swizzled_layout,
+        quant_cute, scale_cute = mxfp4_quantize(
+            x, backend="cute-dsl", sfLayout=sf_layout
         )
 
         # Check shapes match
@@ -127,7 +119,13 @@ def verify_mxfp4_correctness(
                 0.0,
             )
 
-        # Check roundtrip quality for both backends (cosine similarity)
+        # Check backend agreement
+        quant_match_pct = (quant_cuda == quant_cute).float().mean().item() * 100
+        scale_match_pct = (scale_cuda == scale_cute).float().mean().item() * 100
+
+        dq_cuda = mxfp4_dequantize(quant_cuda, scale_cuda, sfLayout=sf_layout)
+        dq_cute = mxfp4_dequantize(quant_cute, scale_cute, sfLayout=sf_layout)
+
         x_f32 = x.cpu().to(torch.float32).view(1, -1)
         dq_cuda_f32 = dq_cuda.cpu().to(torch.float32).view(1, -1)
         dq_cute_f32 = dq_cute.cpu().to(torch.float32).view(1, -1)
@@ -135,11 +133,6 @@ def verify_mxfp4_correctness(
         cos_sim_cuda = torch.nn.functional.cosine_similarity(x_f32, dq_cuda_f32).item()
         cos_sim_cute = torch.nn.functional.cosine_similarity(x_f32, dq_cute_f32).item()
 
-        # Check backend agreement
-        quant_match_pct = (quant_cuda == quant_cute).float().mean().item() * 100
-        scale_match_pct = (scale_cuda == scale_cute).float().mean().item() * 100
-
-        # FP4 quantization should have cosine similarity > 0.9
         if cos_sim_cuda < 0.9:
             return (
                 False,
@@ -165,7 +158,7 @@ def bench_mxfp4_quantize(
     m: int,
     k: int,
     dtype: torch.dtype,
-    is_sf_swizzled_layout: bool,
+    sf_layout: SfLayout,
     backend: str,
 ) -> float:
     """
@@ -175,7 +168,7 @@ def bench_mxfp4_quantize(
         m: Number of rows
         k: Number of columns
         dtype: Input dtype (torch.float16 or torch.bfloat16)
-        is_sf_swizzled_layout: Whether to use swizzled scale factor layout
+        sf_layout: SfLayout enum (layout_128x4, layout_8x4, or layout_linear)
         backend: "cuda" or "cute-dsl"
 
     Returns:
@@ -183,17 +176,19 @@ def bench_mxfp4_quantize(
     """
     from flashinfer.quantization.fp4_quantization import fp4_quantize
 
+    is_sf_swizzled_layout, is_sf_8x4_layout = _sf_layout_flags(sf_layout)
+
     # Create input tensor
     x = torch.randn(m, k, device="cuda", dtype=dtype)
-    global_sf = ((448 * 6) / x.float().abs().nan_to_num().max()).cuda()
 
     # Warmup
     _ = fp4_quantize(
         x,
-        global_sf,
-        sf_vec_size=32,
+        global_scale=None,
+        sf_vec_size=SF_VEC_SIZE,
         sf_use_ue8m0=True,
         is_sf_swizzled_layout=is_sf_swizzled_layout,
+        is_sf_8x4_layout=is_sf_8x4_layout,
         backend=backend,
     )
 
@@ -201,10 +196,11 @@ def bench_mxfp4_quantize(
     def run_kernel():
         fp4_quantize(
             x,
-            global_sf,
-            sf_vec_size=32,
+            global_scale=None,
+            sf_vec_size=SF_VEC_SIZE,
             sf_use_ue8m0=True,
             is_sf_swizzled_layout=is_sf_swizzled_layout,
+            is_sf_8x4_layout=is_sf_8x4_layout,
             backend=backend,
         )
 
@@ -261,7 +257,8 @@ def run_bandwidth_sweep(
     m_values: List[int],
     k_values: List[int],
     dtype: torch.dtype,
-    is_sf_swizzled_layout: bool,
+    sf_layout: SfLayout,
+    layout_label: str,
 ) -> Dict[Tuple[int, int], float]:
     """
     Run bandwidth benchmark sweep for CuTe-DSL backend only.
@@ -274,9 +271,8 @@ def run_bandwidth_sweep(
     total = len(m_values) * len(k_values)
     current = 0
 
-    layout_str = "swizzled" if is_sf_swizzled_layout else "linear"
     print(
-        f"\nBenchmarking MXFP4 {layout_str} layout, dtype={dtype} (CuTe-DSL bandwidth)"
+        f"\nBenchmarking MXFP4 {layout_label} layout, dtype={dtype} (CuTe-DSL bandwidth)"
     )
     print("=" * 60)
 
@@ -286,9 +282,7 @@ def run_bandwidth_sweep(
             print(f"[{current}/{total}] M={m:5d}, K={k:5d} ... ", end="", flush=True)
 
             # Benchmark CuTe-DSL backend only
-            time_ms = bench_mxfp4_quantize(
-                m, k, dtype, is_sf_swizzled_layout, backend="cute-dsl"
-            )
+            time_ms = bench_mxfp4_quantize(m, k, dtype, sf_layout, backend="cute-dsl")
 
             # Compute bandwidth
             bandwidth = compute_bandwidth_tb_per_sec(m, k, dtype, time_ms)
@@ -303,7 +297,8 @@ def run_benchmark_sweep(
     m_values: List[int],
     k_values: List[int],
     dtype: torch.dtype,
-    is_sf_swizzled_layout: bool,
+    sf_layout: SfLayout,
+    layout_label: str,
 ) -> Tuple[Dict[Tuple[int, int], float], Dict[Tuple[int, int], float]]:
     """
     Run benchmark sweep for both backends with inline correctness verification.
@@ -312,7 +307,8 @@ def run_benchmark_sweep(
         m_values: List of M dimensions to benchmark
         k_values: List of K dimensions to benchmark
         dtype: Input dtype
-        is_sf_swizzled_layout: Whether to use swizzled scale factor layout
+        sf_layout: SfLayout enum (layout_128x4, layout_8x4, or layout_linear)
+        layout_label: Human-readable label used in progress headers
 
     Returns:
         Tuple of (cuda_times, cute_dsl_times) dictionaries
@@ -324,8 +320,7 @@ def run_benchmark_sweep(
     total = len(m_values) * len(k_values)
     current = 0
 
-    layout_str = "swizzled" if is_sf_swizzled_layout else "linear"
-    print(f"\nBenchmarking MXFP4 {layout_str} layout, dtype={dtype}")
+    print(f"\nBenchmarking MXFP4 {layout_label} layout, dtype={dtype}")
     print("=" * 95)
     print(
         f"{'Progress':<12} {'M':>5}  {'K':>5}  | "
@@ -345,7 +340,7 @@ def run_benchmark_sweep(
 
             # Verify correctness first
             success, verify_msg, quant_match, scale_match = verify_mxfp4_correctness(
-                m, k, dtype, is_sf_swizzled_layout
+                m, k, dtype, sf_layout
             )
             if not success:
                 failures.append((m, k, verify_msg))
@@ -353,14 +348,12 @@ def run_benchmark_sweep(
                 continue
 
             # Benchmark CUDA backend
-            cuda_time = bench_mxfp4_quantize(
-                m, k, dtype, is_sf_swizzled_layout, backend="cuda"
-            )
+            cuda_time = bench_mxfp4_quantize(m, k, dtype, sf_layout, backend="cuda")
             cuda_times[(m, k)] = cuda_time
 
             # Benchmark CuTe-DSL backend
             cute_dsl_time = bench_mxfp4_quantize(
-                m, k, dtype, is_sf_swizzled_layout, backend="cute-dsl"
+                m, k, dtype, sf_layout, backend="cute-dsl"
             )
             cute_dsl_times[(m, k)] = cute_dsl_time
 
@@ -669,7 +662,32 @@ def main():
         default="mxfp4_quantize_backend",
         help="Output file prefix for heatmaps",
     )
+    parser.add_argument(
+        "--layouts",
+        type=str,
+        default=",".join(LAYOUTS_BY_NAME.keys()),
+        help=(
+            "Comma-separated subset of layouts to benchmark "
+            "(swizzled_128x4, swizzled_8x4, linear). Default: all three."
+        ),
+    )
     args = parser.parse_args()
+
+    selected_layouts: List[str] = []
+    for name in args.layouts.split(","):
+        name = name.strip()
+        if not name:
+            continue
+        if name not in LAYOUTS_BY_NAME:
+            print(
+                f"ERROR: unknown layout '{name}'. "
+                f"Valid choices: {list(LAYOUTS_BY_NAME.keys())}"
+            )
+            return
+        selected_layouts.append(name)
+    if not selected_layouts:
+        print("ERROR: --layouts produced an empty selection")
+        return
 
     # Check compute capability
     cc = get_cc()
@@ -740,99 +758,58 @@ def main():
         print("\n" + "=" * 80)
         print("BANDWIDTH MEASUREMENT MODE (CuTe-DSL only)")
         print("=" * 80)
+        print(f"Layouts: {selected_layouts}")
 
-        # Benchmark linear layout
-        print("\n" + "=" * 80)
-        print("BENCHMARKING LINEAR (NON-SWIZZLED) LAYOUT - BANDWIDTH")
-        print("=" * 80)
+        for layout_name in selected_layouts:
+            sf_layout = LAYOUTS_BY_NAME[layout_name]
+            print("\n" + "=" * 80)
+            print(f"BENCHMARKING {layout_name.upper()} LAYOUT - BANDWIDTH")
+            print("=" * 80)
 
-        bandwidth_linear = run_bandwidth_sweep(
-            m_values, k_values, dtype, is_sf_swizzled_layout=False
-        )
-        print_bandwidth_summary_table(
-            m_values, k_values, bandwidth_linear, "Linear Layout"
-        )
-        create_bandwidth_heatmap(
-            m_values,
-            k_values,
-            bandwidth_linear,
-            f"MXFP4 Quantization Bandwidth (CuTe-DSL) - Linear Layout - {args.dtype}",
-            f"{args.output_prefix}_bandwidth_linear_{args.dtype}.png",
-        )
-
-        # Benchmark swizzled layout
-        print("\n" + "=" * 80)
-        print("BENCHMARKING SWIZZLED LAYOUT - BANDWIDTH")
-        print("=" * 80)
-
-        bandwidth_swizzled = run_bandwidth_sweep(
-            m_values, k_values, dtype, is_sf_swizzled_layout=True
-        )
-        print_bandwidth_summary_table(
-            m_values, k_values, bandwidth_swizzled, "Swizzled Layout"
-        )
-        create_bandwidth_heatmap(
-            m_values,
-            k_values,
-            bandwidth_swizzled,
-            f"MXFP4 Quantization Bandwidth (CuTe-DSL) - Swizzled Layout - {args.dtype}",
-            f"{args.output_prefix}_bandwidth_swizzled_{args.dtype}.png",
-        )
+            bandwidth = run_bandwidth_sweep(
+                m_values, k_values, dtype, sf_layout, layout_name
+            )
+            print_bandwidth_summary_table(
+                m_values, k_values, bandwidth, f"{layout_name} layout"
+            )
+            create_bandwidth_heatmap(
+                m_values,
+                k_values,
+                bandwidth,
+                f"MXFP4 Quantization Bandwidth (CuTe-DSL) - {layout_name} - {args.dtype}",
+                f"{args.output_prefix}_bandwidth_{layout_name}_{args.dtype}.png",
+            )
     else:
         # Speedup comparison mode: CUDA vs CuTe-DSL
-        # Benchmark linear layout (non-swizzled)
-        print("\n" + "=" * 80)
-        print("BENCHMARKING LINEAR (NON-SWIZZLED) LAYOUT")
-        print("=" * 80)
+        print(f"Layouts: {selected_layouts}")
+        for layout_name in selected_layouts:
+            sf_layout = LAYOUTS_BY_NAME[layout_name]
+            print("\n" + "=" * 80)
+            print(f"BENCHMARKING {layout_name.upper()} LAYOUT")
+            print("=" * 80)
 
-        cuda_times_linear, cute_dsl_times_linear = run_benchmark_sweep(
-            m_values,
-            k_values,
-            dtype,
-            is_sf_swizzled_layout=False,
-        )
-        print_summary_table(
-            m_values,
-            k_values,
-            cuda_times_linear,
-            cute_dsl_times_linear,
-            "Linear Layout",
-        )
-        create_heatmap(
-            m_values,
-            k_values,
-            cuda_times_linear,
-            cute_dsl_times_linear,
-            f"MXFP4 Quantization Speedup (CuTe-DSL vs CUDA) - Linear Layout - {args.dtype}",
-            f"{args.output_prefix}_comparison_linear_{args.dtype}.png",
-        )
-
-        # Benchmark swizzled layout
-        print("\n" + "=" * 80)
-        print("BENCHMARKING SWIZZLED LAYOUT")
-        print("=" * 80)
-
-        cuda_times_swizzled, cute_dsl_times_swizzled = run_benchmark_sweep(
-            m_values,
-            k_values,
-            dtype,
-            is_sf_swizzled_layout=True,
-        )
-        print_summary_table(
-            m_values,
-            k_values,
-            cuda_times_swizzled,
-            cute_dsl_times_swizzled,
-            "Swizzled Layout",
-        )
-        create_heatmap(
-            m_values,
-            k_values,
-            cuda_times_swizzled,
-            cute_dsl_times_swizzled,
-            f"MXFP4 Quantization Speedup (CuTe-DSL vs CUDA) - Swizzled Layout - {args.dtype}",
-            f"{args.output_prefix}_comparison_swizzled_{args.dtype}.png",
-        )
+            cuda_times, cute_dsl_times = run_benchmark_sweep(
+                m_values,
+                k_values,
+                dtype,
+                sf_layout,
+                layout_name,
+            )
+            print_summary_table(
+                m_values,
+                k_values,
+                cuda_times,
+                cute_dsl_times,
+                f"{layout_name} layout",
+            )
+            create_heatmap(
+                m_values,
+                k_values,
+                cuda_times,
+                cute_dsl_times,
+                f"MXFP4 Quantization Speedup (CuTe-DSL vs CUDA) - {layout_name} - {args.dtype}",
+                f"{args.output_prefix}_comparison_{layout_name}_{args.dtype}.png",
+            )
 
     print("\n" + "=" * 80)
     print("BENCHMARK COMPLETE")

@@ -33,6 +33,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <set>
 #include <vector>
 
@@ -203,10 +204,21 @@ std::vector<CutlassTileConfigSM90> get_candidate_tiles_sm90(
   if (config & CutlassGemmConfig::GROUPED_GEMM) {
     if (config & CutlassGemmConfig::WEIGHT_ONLY) {
       return {
-          CutlassTileConfigSM90::CtaShape64x16x128B,  CutlassTileConfigSM90::CtaShape64x32x128B,
-          CutlassTileConfigSM90::CtaShape64x64x128B,  CutlassTileConfigSM90::CtaShape64x128x128B,
-          CutlassTileConfigSM90::CtaShape128x16x128B, CutlassTileConfigSM90::CtaShape128x32x128B,
-          CutlassTileConfigSM90::CtaShape128x64x128B, CutlassTileConfigSM90::CtaShape128x128x128B};
+          CutlassTileConfigSM90::CtaShape64x16x128B,   CutlassTileConfigSM90::CtaShape64x16x256B,
+          CutlassTileConfigSM90::CtaShape64x16x512B,   CutlassTileConfigSM90::CtaShape64x32x128B,
+          CutlassTileConfigSM90::CtaShape64x32x256B,   CutlassTileConfigSM90::CtaShape64x32x512B,
+          CutlassTileConfigSM90::CtaShape64x64x128B,   CutlassTileConfigSM90::CtaShape64x64x256B,
+          CutlassTileConfigSM90::CtaShape64x64x512B,   CutlassTileConfigSM90::CtaShape64x128x128B,
+          CutlassTileConfigSM90::CtaShape64x128x256B,  CutlassTileConfigSM90::CtaShape64x128x512B,
+          CutlassTileConfigSM90::CtaShape128x16x128B,  CutlassTileConfigSM90::CtaShape128x16x256B,
+          CutlassTileConfigSM90::CtaShape128x16x512B,  CutlassTileConfigSM90::CtaShape128x32x128B,
+          CutlassTileConfigSM90::CtaShape128x32x256B,  CutlassTileConfigSM90::CtaShape128x32x512B,
+          CutlassTileConfigSM90::CtaShape128x64x128B,  CutlassTileConfigSM90::CtaShape128x64x256B,
+          CutlassTileConfigSM90::CtaShape128x64x512B,  CutlassTileConfigSM90::CtaShape128x128x128B,
+          CutlassTileConfigSM90::CtaShape128x128x256B, CutlassTileConfigSM90::CtaShape128x128x512B,
+          CutlassTileConfigSM90::CtaShape128x256x128B, CutlassTileConfigSM90::CtaShape128x256x256B,
+          CutlassTileConfigSM90::CtaShape256x128x128B, CutlassTileConfigSM90::CtaShape256x128x256B,
+          CutlassTileConfigSM90::CtaShape256x256x128B};
     } else {
       return {
           CutlassTileConfigSM90::CtaShape128x16x128B,  CutlassTileConfigSM90::CtaShape128x32x128B,
@@ -228,12 +240,20 @@ bool sm90_supports_coop(CutlassTileConfigSM90 const tile) {
 #ifdef FAST_BUILD
   return false;
 #else
-  std::set<CutlassTileConfigSM90> valid_tiles{
-      CutlassTileConfigSM90::CtaShape128x16x128B,  CutlassTileConfigSM90::CtaShape128x32x128B,
-      CutlassTileConfigSM90::CtaShape128x64x128B,  CutlassTileConfigSM90::CtaShape128x128x128B,
-      CutlassTileConfigSM90::CtaShape128x256x128B, CutlassTileConfigSM90::CtaShape256x128x128B,
-      CutlassTileConfigSM90::CtaShape256x256x128B};
-  return valid_tiles.count(tile) == 1;
+  auto const [tile_m, tile_n, tile_k] = enum_to_shape_tuple(tile);
+  if (tile_m == 128 && (tile_n == 16 || tile_n == 32 || tile_n == 64)) {
+    return tile_k == 128 || tile_k == 256 || tile_k == 512;
+  }
+  if (tile_m == 128 && (tile_n == 128 || tile_n == 256)) {
+    return tile_k == 128 || tile_k == 256;
+  }
+  if (tile_m == 256 && tile_n == 128) {
+    return tile_k == 128 || tile_k == 256;
+  }
+  if (tile_m == 256 && tile_n == 256) {
+    return tile_k == 128;
+  }
+  return false;
 #endif
 }
 
@@ -243,11 +263,12 @@ bool sm90_supports_mcast_along_m(CutlassTileConfigSM90 const tile) {
 #ifdef FAST_BUILD
   return false;
 #else
-  std::set<CutlassTileConfigSM90> valid_tiles{
-      CutlassTileConfigSM90::CtaShape128x16x128B,  CutlassTileConfigSM90::CtaShape128x32x128B,
-      CutlassTileConfigSM90::CtaShape128x64x128B,  CutlassTileConfigSM90::CtaShape128x128x128B,
-      CutlassTileConfigSM90::CtaShape128x256x128B, CutlassTileConfigSM90::CtaShape256x128x128B};
-  return valid_tiles.count(tile) == 1;
+  auto const [tile_m, tile_n, tile_k] = enum_to_shape_tuple(tile);
+  bool const supported_k = tile_k == 128 || tile_k == 256 || tile_k == 512;
+  bool const supported_mn = (tile_m == 128 && (tile_n == 16 || tile_n == 32 || tile_n == 64 ||
+                                               tile_n == 128 || tile_n == 256)) ||
+                            (tile_m == 256 && tile_n == 128);
+  return supported_mn && supported_k;
 #endif
 }
 
@@ -257,11 +278,11 @@ bool sm90_supports_mcast_along_n(CutlassTileConfigSM90 const tile) {
 #ifdef FAST_BUILD
   return false;
 #else
-  std::set<CutlassTileConfigSM90> valid_tiles{
-      CutlassTileConfigSM90::CtaShape64x128x128B, CutlassTileConfigSM90::CtaShape64x256x128B,
-      CutlassTileConfigSM90::CtaShape128x128x128B, CutlassTileConfigSM90::CtaShape128x256x128B,
-      CutlassTileConfigSM90::CtaShape256x128x128B};
-  return valid_tiles.count(tile) == 1;
+  auto const [tile_m, tile_n, tile_k] = enum_to_shape_tuple(tile);
+  bool const supported_k = tile_k == 128 || tile_k == 256 || tile_k == 512;
+  bool const supported_mn = ((tile_m == 64 || tile_m == 128) && (tile_n == 128 || tile_n == 256)) ||
+                            (tile_m == 256 && tile_n == 128);
+  return supported_mn && supported_k;
 #endif
 }
 
@@ -389,9 +410,11 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm90(
         (config & CutlassGemmConfig::WEIGHT_ONLY) && (config & CutlassGemmConfig::GROUPED_GEMM);
     if (has_w4afp8) {
       bool const has_coop_supported = sm90_supports_coop(tile_config);
-      std::set<MainloopScheduleType> mainloop_schedules{MainloopScheduleType::PINGPONG};
+      std::set<MainloopScheduleType> mainloop_schedules;
       if (has_coop_supported) {
         mainloop_schedules.insert(MainloopScheduleType::COOPERATIVE);
+      } else {
+        mainloop_schedules.insert(MainloopScheduleType::PINGPONG);
       }
       auto const epilogue_schedule = EpilogueScheduleType::AUTO;
       for (auto const& mainloop_schedule : mainloop_schedules) {
@@ -587,9 +610,25 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm110(
 
 std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
     CutlassGemmConfig::CandidateConfigTypeParam const config) {
+  std::vector<CutlassGemmConfig> result;
 #ifdef FAST_BUILD
-  return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
-                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
+  if (config & CutlassGemmConfig::GROUPED_GEMM) {
+    result = {
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x32x128B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x64x128B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
+  } else {
+    result = {
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x256B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
+  }
 #else
   if ((config & CutlassGemmConfig::FP4_ONLY) == 0) {
     if (config & CutlassGemmConfig::GROUPED_GEMM) {
@@ -597,20 +636,43 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
     }
     TLLM_THROW("Not Implemented: SM120 GEMM only supports nvfp4.");
   }
-  // {tile_enum, M, N}
-  static constexpr std::pair<CutlassTileConfigSM120, std::array<int, 2>> all_tiles[] = {
-      {CutlassTileConfigSM120::CtaShape128x256x64B, {128, 256}},
-      {CutlassTileConfigSM120::CtaShape128x128x256B, {128, 128}},
-      {CutlassTileConfigSM120::CtaShape256x128x128B, {256, 128}},
+  // All candidate tiles for SM120 FP4. Tiles that can never dispatch are pruned
+  // below; anything else invalid is still skipped gracefully by the try-catch in
+  // calcMaxWorkspaceSize.
+  static constexpr CutlassTileConfigSM120 all_tiles[] = {
+      CutlassTileConfigSM120::CtaShape128x128x128B, CutlassTileConfigSM120::CtaShape128x128x64B,
+      CutlassTileConfigSM120::CtaShape256x128x64B,  CutlassTileConfigSM120::CtaShape128x256x64B,
+      CutlassTileConfigSM120::CtaShape128x128x256B, CutlassTileConfigSM120::CtaShape256x128x128B,
+      CutlassTileConfigSM120::CtaShape128x32x128B,  CutlassTileConfigSM120::CtaShape128x32x64B,
+      CutlassTileConfigSM120::CtaShape128x64x128B,  CutlassTileConfigSM120::CtaShape128x64x64B,
   };
-  std::vector<CutlassGemmConfig> result;
-  for (auto const& [tile_enum, mn] : all_tiles) {
-    result.push_back(CutlassGemmConfig{tile_enum, MainloopScheduleType::AUTO,
-                                       EpilogueScheduleType::AUTO,
+  for (auto tile : all_tiles) {
+    result.push_back(CutlassGemmConfig{tile, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
                                        ClusterShape::ClusterShape_1x1x1});
   }
-  return result;
 #endif
+  // 128x128x256B / 256x128x128B have no grouped dispatch case, and the ...x64B
+  // tiles only work with FP4 activations (FP8 breaks the TMA K alignment).
+  if (config & CutlassGemmConfig::GROUPED_GEMM) {
+    bool const fp8_act = config & CutlassGemmConfig::FP8FP4_MIXED;
+    auto never_dispatches = [fp8_act](CutlassGemmConfig const& c) {
+      switch (c.tile_config_sm120) {
+        case CutlassTileConfigSM120::CtaShape128x128x256B:
+        case CutlassTileConfigSM120::CtaShape256x128x128B:
+          return true;
+        case CutlassTileConfigSM120::CtaShape128x128x64B:
+        case CutlassTileConfigSM120::CtaShape256x128x64B:
+        case CutlassTileConfigSM120::CtaShape128x256x64B:
+        case CutlassTileConfigSM120::CtaShape128x32x64B:
+        case CutlassTileConfigSM120::CtaShape128x64x64B:
+          return fp8_act;
+        default:
+          return false;
+      }
+    };
+    result.erase(std::remove_if(result.begin(), result.end(), never_dispatches), result.end());
+  }
+  return result;
 }
 
 std::vector<CutlassGemmConfig> get_candidate_configs(

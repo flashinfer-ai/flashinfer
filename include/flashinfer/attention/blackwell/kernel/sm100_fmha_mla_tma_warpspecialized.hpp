@@ -31,6 +31,8 @@
 
 #pragma once
 
+#include <flashinfer/math.cuh>
+
 #include "../common/pow_2.hpp"
 #include "cute/arch/simd_sm100.hpp"
 #include "cute/tensor.hpp"
@@ -1577,7 +1579,8 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
 
 #ifndef B2B
     // find correction factor
-    ElementAcc softmax_scale_log2 = mainloop_args.softmax_scale * static_cast<ElementAcc>(M_LOG2E);
+    ElementAcc softmax_scale_log2 =
+        mainloop_args.softmax_scale * static_cast<ElementAcc>(flashinfer::math::log2e_f);
     correction_factor = ::exp2f(softmax_scale_log2 * (row_max - row_max_new));
     row_max = row_max_new;
 

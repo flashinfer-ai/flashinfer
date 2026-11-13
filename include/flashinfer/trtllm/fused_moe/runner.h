@@ -29,6 +29,10 @@ namespace tensorrt_llm {
 namespace kernels {
 namespace trtllmgen_moe {
 
+namespace MoE {
+class Runner;
+}  // namespace MoE
+
 namespace Routing {
 
 // The type of method in top-K routing, for use in torch custom op
@@ -52,8 +56,12 @@ enum class RoutingMethodType : int64_t {
   SigmoidRenorm = 6,
   // MiniMax2: Sigmoid + Bias -> TopK -> ScaledSumNormalize (routeScale=1.0, epsilon=1e-20)
   MiniMax2 = 7,
+  // Sigmoid: Sigmoid -> TopK (no renormalization)
+  Sigmoid = 8,
+  // TopKSigmoid: TopK -> Sigmoid (no renormalization)
+  TopKSigmoid = 9,
   // Unspecified
-  Unspecified = 8,
+  Unspecified = 10,
 };
 
 inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize,
@@ -81,6 +89,10 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
       return "SigmoidRenorm";
     case RoutingMethodType::MiniMax2:
       return "MiniMax2";
+    case RoutingMethodType::Sigmoid:
+      return "Sigmoid";
+    case RoutingMethodType::TopKSigmoid:
+      return "TopKSigmoid";
     default:
       return "InvalidRountingMethod";  // TODO throw error
   };
@@ -125,23 +137,24 @@ class Runner {
  public:
   explicit Runner();
 
-  explicit Runner(int32_t tileTokensDim, int32_t clusterSizeInBatchDim = 1);
+  explicit Runner(int32_t tileTokensDim);
 
   void run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts,
-           int32_t topK, int32_t nGroups, int32_t topkGroups, int32_t localExpertOffset,
-           int32_t localNumExperts, float routedScalingFactor, int32_t* routingExpertIndexes,
-           int32_t* expertCountHistogram, int32_t* permutedIdxSize,
+           int32_t topK, int32_t numFusedSharedExpert, int32_t nGroups, int32_t topkGroups,
+           int32_t localExpertOffset, int32_t localNumExperts, float routedScalingFactor,
+           int32_t* routingExpertIndexes, int32_t* expertCountHistogram, int32_t* permutedIdxSize,
            int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
-           int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* numTokensPerExpert,
-           int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas,
-           batchedGemm::trtllm::gen::Dtype dtypeElt, batchedGemm::trtllm::gen::Dtype dtypeBias,
-           bool useRoutingScalesOnInput, bool useDeepSeekFp8, RoutingMethodType routingMethodType,
-           cudaStream_t stream, batchedGemm::trtllm::gen::Dtype dtypeLogits,
-           bool normTopkProb = true);
+           int32_t* permutedIdxToTokenIdx, int32_t* expertIds, void* expertWeights,
+           int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
+           int32_t* numNonExitingCtas, batchedGemm::trtllm::gen::Dtype dtypeElt,
+           batchedGemm::trtllm::gen::Dtype dtypeBias, bool useRoutingScalesOnInput,
+           bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream,
+           batchedGemm::trtllm::gen::Dtype dtypeLogits, bool normTopkProb = true,
+           int16_t* routing_replay_out = nullptr, bool enable_pdl = true);
 
  private:
+  friend class MoE::Runner;
   int32_t mTileTokensDim{8};
-  int32_t mClusterSizeInBatchDim{1};
 };
 }  // namespace Routing
 
@@ -156,8 +169,15 @@ enum class ActivationType : int64_t {
   Geglu = 4,
   SwigluBias = 5,
   Relu2 = 6,
-  Identity = 7,
-  InvalidType = 8,  // Must be last
+  SwigluStep = 7,
+  GegluTanh = 8,
+  Identity = 9,
+  Situ = 10,
+  InvalidType = 11,  // Must be last among the normally-sequential members
+  // CUTLASS-backend only. Keep these after InvalidType so the existing values
+  // consumed by the TRT-LLM backend remain stable.
+  ClampedRelu2 = 12,
+  PowLU = 13,
 };
 
 inline std::string serializeActivationType(ActivationType activationType) {
@@ -178,6 +198,16 @@ inline std::string serializeActivationType(ActivationType activationType) {
       return "Relu2";
     case ActivationType::Identity:
       return "Identity";
+    case ActivationType::SwigluStep:
+      return "SwigluStep";
+    case ActivationType::GegluTanh:
+      return "GegluTanh";
+    case ActivationType::Situ:
+      return "Situ";
+    case ActivationType::ClampedRelu2:
+      return "ClampedRelu2";
+    case ActivationType::PowLU:
+      return "PowLU";
     default:
       return "InvalidActivationType";  // TODO throw error
   };
@@ -185,7 +215,10 @@ inline std::string serializeActivationType(ActivationType activationType) {
 
 inline bool isGatedActivation(ActivationType activationType) {
   return activationType == ActivationType::Swiglu || activationType == ActivationType::Geglu ||
-         activationType == ActivationType::SwigluBias;
+         activationType == ActivationType::SwigluBias ||
+         activationType == ActivationType::SwigluStep ||
+         activationType == ActivationType::GegluTanh || activationType == ActivationType::Situ ||
+         activationType == ActivationType::PowLU;
 }
 
 }  // namespace MoE
@@ -194,9 +227,12 @@ namespace PermuteGemm1 {
 class Runner {
  public:
   explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct,
-                  batchedGemm::trtllm::gen::Dtype dtypeWeights, bool useDeepSeekFp8,
+                  batchedGemm::trtllm::gen::Dtype dtypeWeights,
+                  batchedGemm::trtllm::gen::Dtype dtypeOutput, bool useDeepSeekFp8,
                   int tileTokensDim, MoE::ActivationType activationType, bool useShuffledMatrix,
-                  batchedGemm::gemm::MatrixLayout weight_layout);
+                  batchedGemm::gemm::MatrixLayout weight_layout,
+                  batchedGemm::gemm::BiasType biasType, bool usePerTokenScaling,
+                  bool usePerChannelScaling);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
                                  int32_t numExperts, int32_t numTokens, int32_t configIndex) const;
@@ -211,22 +247,31 @@ class Runner {
 
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
+  // GEMM1: [numTokens, hiddenSize] @ [hiddenSize, 2*intermediateSize] -> [numTokens,
+  // 2*intermediateSize] validHiddenSize: valid K dimension (unpadded). If negative, uses
+  // hiddenSize. validIntermediateSize: valid N/2 dimension (unpadded). If negative, uses
+  // intermediateSize.
   void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale,
-           void* expertWeights, float* outputScalesScalar, float* outputScalesGateScalar,
-           float* ptrBias, float* ptrGatedActAlpha, float* ptrGatedActBeta, float* ptrClampLimit,
+           void* perTokenScales, void* perChannelScales, float* outputScalesScalar,
+           float* outputScalesGateScalar, void* ptrBias, float* ptrGatedActAlpha,
+           float* ptrGatedActBeta, float* ptrClampLimit, int32_t* permutedIdxToBiasRowIdx,
            void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
            int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
            int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
            int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
            int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
-           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl);
+           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
+           int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1);
 
  private:
+  friend class MoE::Runner;
   batchedGemm::trtllm::gen::Dtype mDtypeAct;
   batchedGemm::trtllm::gen::Dtype mDtypeWeights;
+  batchedGemm::trtllm::gen::Dtype mDtypeOutput;
   int32_t mTileTokensDim;
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
   tensorrt_llm::kernels::trtllmgen_moe::MoE::ActivationType mActType;
+  batchedGemm::gemm::BiasType mBiasType{batchedGemm::gemm::BiasType::None};
 };
 }  // namespace PermuteGemm1
 
@@ -237,7 +282,8 @@ class Runner {
                   batchedGemm::trtllm::gen::Dtype dtypeWeights,
                   batchedGemm::trtllm::gen::Dtype outputDtype, bool useDeepSeekFp8,
                   int tileTokensDim, bool useShuffledMatrix,
-                  batchedGemm::gemm::MatrixLayout weight_layout);
+                  batchedGemm::gemm::MatrixLayout weight_layout, bool usePerTokenScaling,
+                  bool usePerChannelScaling);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
                                  int32_t numExperts, int32_t numTokens, int32_t configIndex) const;
@@ -252,15 +298,20 @@ class Runner {
 
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
+  // GEMM2: [numTokens, intermediateSize] @ [intermediateSize, hiddenSize] -> [numTokens,
+  // hiddenSize] validIntermediateSize: valid K dimension (unpadded). If negative, uses
+  // intermediateSize. validHiddenSize: valid N dimension (unpadded). If negative, uses hiddenSize.
   void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight,
-           void* weightScale, float* outputScalesScalar, float* ptrBias, void* output,
-           void* outputScale, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
-           int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
-           int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
-           int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace, int device, cudaStream_t stream,
-           int32_t configIndex, bool enable_pdl);
+           void* weightScale, void* perTokenScales, void* perChannelScales,
+           float* outputScalesScalar, float* ptrBias, void* output, void* outputScale, int32_t topK,
+           int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
+           int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
+           int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace,
+           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
+           int32_t validIntermediateSize = -1, int32_t validHiddenSize = -1);
 
  private:
+  friend class MoE::Runner;
   batchedGemm::trtllm::gen::Dtype mDtypeAct;
   batchedGemm::trtllm::gen::Dtype mDtypeWeights;
   batchedGemm::trtllm::gen::Dtype mDtypeOut;
@@ -277,8 +328,9 @@ struct MoERunnerArgs {
                                    // gemm(hidden_state, routing_weights)
   void* routing_bias = nullptr;    // [num_experts] in bfloat16 for now = mDtypeExpW
   void* hidden_states = nullptr;   // [num_tokens, hidden_size] in fp8 = mDtypeElt
-  // [hidden_size/128, num_tokens] in float for e4m3 DS recipe
-  // and [num_tokens, hidden_size/16] in float for e2m1
+  // [hidden_size/128, num_tokens] in float for e4m3 DS recipe,
+  // [num_tokens, hidden_size/16] in float for e2m1, and [num_tokens, 1]
+  // in float for FP8 per-token/per-channel.
   void* hidden_states_scale = nullptr;
 
   // Gemm input:
@@ -287,7 +339,8 @@ struct MoERunnerArgs {
   void* gemm2_weights = nullptr;
   void* gemm2_weights_scale = nullptr;
 
-  float* gemm1_bias = nullptr;
+  void* gemm1_bias = nullptr;
+  batchedGemm::gemm::BiasType gemm1_bias_type{batchedGemm::gemm::BiasType::None};
   float* gemm1_alpha = nullptr;
   float* gemm1_beta = nullptr;
   float* gemm1_clamp_limit = nullptr;
@@ -297,10 +350,23 @@ struct MoERunnerArgs {
 
   int32_t num_tokens{0};
   int32_t num_experts{0};
+  int32_t num_fused_shared_experts{0};
   // Hidden dimension input of MoE block. It might be padded.
   int32_t hidden_size{0};
-  // Hidden dimension output of MoE block. It is not padded.
-  // If not provided it is the same as hidden_size.
+  // Hidden dimension output of MoE block, i.e. GEMM2's N dimension and the row stride of the
+  // gemm2_output workspace. If not provided, it is the same as hidden_size.
+  //
+  // Once valid dims are in play there are three distinct hidden widths (GPT-OSS values in
+  // brackets), so do not conflate them:
+  //   - hidden_size [3072]: the padded *input* row width, i.e. GEMM1's K.
+  //   - hidden_size_output [2944]: GEMM2's N. With valid dims the caller must set it to
+  //     roundUp(valid_hidden_size, 128) -- the width the FC2 weights and biases are laid out for
+  //     (TRT-LLM's args.output_hidden_size). Without valid dims GEMM2 keeps the full hidden_size N
+  //     and hidden_size_output is instead the width finalize truncates its output rows to.
+  //     See getGemm2OutputHiddenSize() in csrc/trtllm_fused_moe_runner.cu.
+  //   - the `output` row width [2880]: valid_hidden_size when supplied, else hidden_size_output.
+  //     Only finalize sees it; it writes exactly that many of GEMM2's columns, so the caller never
+  //     receives uninitialized columns.
   std::optional<int32_t> hidden_size_output;
   // TODO: only compiled routing kernel supports top_k = 8
   int32_t top_k{0};
@@ -309,6 +375,15 @@ struct MoERunnerArgs {
   int32_t topk_group{0};
   float routed_scaling_factor{0.0f};
   int32_t intermediate_size{0};
+
+  // Valid (unpadded) dimensions for GEMM computation.
+  // These allow tensor dimensions to be padded for alignment while computing only the valid region.
+  // If not provided, they default to the corresponding padded dimensions.
+  // - valid_hidden_size: Valid K dimension for GEMM1, valid N dimension for GEMM2
+  // - valid_intermediate_size: Valid N/2 dimension for GEMM1, valid K dimension for GEMM2
+  std::optional<int32_t> valid_hidden_size;
+  std::optional<int32_t> valid_intermediate_size;
+
   int32_t local_expert_offset{0};
   int32_t local_num_experts{0};
   // TODO: support other types
@@ -323,12 +398,21 @@ struct MoERunnerArgs {
   float* output1_scales_gate_scalar = nullptr;
   float* output2_scales_scalar = nullptr;
 
+  // Gated GEMM1 scales follow the shuffled, interleaved weight rows.
+  float* gemm1_per_channel_weight_scale = nullptr;  // [local_num_experts, M]
+  float* gemm2_per_channel_weight_scale = nullptr;  // [local_num_experts, hidden_size]
+
   // Output:
   void* output = nullptr;
   float* output_scale = nullptr;
 
   // finalize
   bool do_finalize{true};
+
+  // 4over6 recipe for the per-token GEMM2-input requantization, as the code
+  // decoded by resolveNVFP4Recipe() (nvfp4Recipe.h). The default
+  // (kNVFP44Over6FromEnv) reads FLASHINFER_NVFP4_4OVER6* on every launch.
+  int64_t nvfp4_4over6_code{-1};
 };
 
 struct MoEWorkspace {
@@ -346,6 +430,8 @@ struct MoEWorkspace {
   void* expert_weights = nullptr;  // [num_tokens, top_k] in bfloat16 = mDtypeExpW
   // consumed by permuteGemm1 kernel
   void* token_scales = nullptr;
+  // consumed by Gemm2 kernel
+  void* token_scales_fc2 = nullptr;
 
   int32_t* cta_idx_xy_to_batch_idx = nullptr;
   int32_t* cta_idx_xy_to_mn_limit = nullptr;
@@ -387,16 +473,24 @@ struct MoEConfig {
   int64_t gemm2Config;
 };
 
+// GEMM1 / GEMM2 stages of the fused-MoE runner (trtllm-gen batched GEMM).
+using Gemm1Runner = PermuteGemm1::Runner;
+using Gemm2Runner = Gemm2::Runner;
+
 class Runner {
  public:
   // FIXME: tileTokensDim is hardcoded for now
   Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
-         bool useDeepSeekFp8, int tileTokensDim = 8,
-         ActivationType activationType = ActivationType::Swiglu, bool useShuffledMatrix = false,
-         batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK);
+         bool useDeepSeekFp8, int tileTokensDim, ActivationType activationType,
+         bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weight_layout,
+         batchedGemm::gemm::BiasType gemm1BiasType, bool usePerTokenScalingGemm1 = false,
+         bool usePerTokenScalingGemm2 = false, bool usePerChannelScalingGemm1 = false,
+         bool usePerChannelScalingGemm2 = false);
   Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8,
          bool useShuffledMatrix = false,
-         batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK);
+         batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK,
+         bool usePerTokenScalingGemm1 = false, bool usePerTokenScalingGemm2 = false,
+         bool usePerChannelScalingGemm1 = false, bool usePerChannelScalingGemm2 = false);
 
   void run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
            cudaStream_t stream, int64_t configIndex, bool enable_pdl);
@@ -407,22 +501,33 @@ class Runner {
   [[nodiscard]] std::vector<int64_t> getValidConfigIndices(int32_t topK, int32_t hiddenSize,
                                                            int32_t intermediateSize,
                                                            int32_t numLocalExperts,
-                                                           int32_t numTokens) const;
+                                                           int32_t numTokens,
+                                                           int32_t hiddenSizeOutput = -1) const;
+
+  [[nodiscard]] MoEConfig getConfigComponents(int64_t configIndex) const;
+
+  [[nodiscard]] bool isValidConfigIndex(int64_t configIndex, int32_t topK, int32_t hiddenSize,
+                                        int32_t intermediateSize, int32_t numLocalExperts,
+                                        int32_t numTokens, int32_t hiddenSizeOutput = -1) const;
 
   [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
                                                    int32_t intermediateSize,
-                                                   int32_t numLocalExperts,
-                                                   int32_t numTokens) const;
+                                                   int32_t numLocalExperts, int32_t numTokens,
+                                                   int32_t hiddenSizeOutput = -1) const;
 
  private:
-  void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,
+  void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace, bool const enablePdl,
                   moe::dev::convertsf::Data& convertSfData,
                   moe::dev::activation::Data& activationData,
                   moe::dev::finalize::Data& finalizeData);
 
  private:
-  PermuteGemm1::Runner mPermuteGemm1;
-  Gemm2::Runner mGemm2;
+  bool mUsePerTokenScalingGemm1;
+  bool mUsePerTokenScalingGemm2;
+  bool mUsePerChannelScalingGemm1;
+  bool mUsePerChannelScalingGemm2;
+  Gemm1Runner mPermuteGemm1;
+  Gemm2Runner mGemm2;
 
   // This will be the cartesian product of the passing configs for gemm1 and gemm2
   // This allows us to autotune the MoE as one operation instead of tuning gemm1 and gemm2

@@ -21,6 +21,8 @@
 #include <tvm/ffi/extra/cuda/device_guard.h>
 #include <tvm/ffi/function.h>
 
+#include <flashinfer/layout.cuh>
+
 #include "dlpack/dlpack.h"
 
 using tvm::ffi::Tensor;
@@ -166,6 +168,20 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
     }                                                                                    \
   }()
 
+#define DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16_FP8(dlpack_dtype, c_type, ...)               \
+  [&]() -> bool {                                                                        \
+    switch (encode_dlpack_dtype(dlpack_dtype)) {                                         \
+      _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                            \
+      _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
+      _DISPATCH_CASE_FP8_E4M3(c_type, __VA_ARGS__)                                       \
+      _DISPATCH_CASE_FP8_E5M2(c_type, __VA_ARGS__)                                       \
+      default:                                                                           \
+        TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__ << " failed to dispatch data type " \
+                              << (dlpack_dtype).code << " " << (dlpack_dtype).bits;      \
+        return false;                                                                    \
+    }                                                                                    \
+  }()
+
 #ifdef FLASHINFER_ENABLE_F32
 #define _DISPATCH_CASE_F32(c_type, ...) \
   case float32_code: {                  \
@@ -281,6 +297,67 @@ inline void check_shape(const tvm::ffi::TensorView& a, const tvm::ffi::TensorVie
   }
 }
 
+// Named tensor-argument checks. Each check names the offending argument in its
+// error so a caller can act on the message without reading the binding.
+inline void check_cuda_tensor(const TensorView& t, const char* name) {
+  TVM_FFI_CHECK(t.device().device_type == kDLCUDA, ValueError)
+      << name
+      << " must be a CUDA tensor, got device_type=" << static_cast<int>(t.device().device_type);
+}
+
+inline void check_dtype(const TensorView& t, DLDataType expected, const char* name) {
+  DLDataType d = t.dtype();
+  TVM_FFI_CHECK(d.code == expected.code && d.bits == expected.bits && d.lanes == expected.lanes,
+                TypeError)
+      << name << " dtype mismatch: expected DLDataType(code=" << static_cast<int>(expected.code)
+      << ", bits=" << static_cast<int>(expected.bits)
+      << ", lanes=" << static_cast<int>(expected.lanes)
+      << "), got (code=" << static_cast<int>(d.code) << ", bits=" << static_cast<int>(d.bits)
+      << ", lanes=" << static_cast<int>(d.lanes) << ")";
+}
+
+inline void check_contiguous(const TensorView& t, const char* name) {
+  TVM_FFI_CHECK(t.IsContiguous(), ValueError) << name << " must be contiguous";
+}
+
+inline void check_same_device(const TensorView& t, const TensorView& reference, const char* name,
+                              const char* reference_name) {
+  TVM_FFI_CHECK(t.device().device_type == reference.device().device_type &&
+                    t.device().device_id == reference.device().device_id,
+                ValueError)
+      << name << " must be on the same device as " << reference_name
+      << ": got device_type=" << static_cast<int>(t.device().device_type)
+      << " id=" << t.device().device_id
+      << " versus device_type=" << static_cast<int>(reference.device().device_type)
+      << " id=" << reference.device().device_id;
+}
+
+// Require the dimensions above the last `trailing` dimensions to form one dense
+// row-major chain, so they can be folded into a single logical dimension whose
+// step is stride(-(trailing + 1)). Shape products are stride-independent, so
+// this verifies the physical layout instead of inventing a folded stride.
+inline void check_dense_leading_dims(const TensorView& t, int trailing, const char* name) {
+  TVM_FFI_CHECK(trailing > 0 && t.ndim() >= trailing, ValueError)
+      << name << " cannot fold leading dimensions above " << trailing
+      << " trailing dims from ndim=" << t.ndim();
+  int outer_last = t.ndim() - trailing - 1;
+  if (outer_last <= 0) {
+    return;
+  }
+  int64_t step = t.stride(outer_last);
+  TVM_FFI_CHECK(step > 0, ValueError) << name << " physical strides must be positive";
+  int64_t expected = step;
+  for (int axis = outer_last - 1; axis >= 0; --axis) {
+    expected *= t.size(axis + 1);
+    if (t.size(axis) > 1) {
+      TVM_FFI_CHECK(t.stride(axis) == expected, ValueError)
+          << name << " leading dims are not physically foldable above " << trailing
+          << " trailing dims: stride(" << axis << ")=" << t.stride(axis) << ", expected "
+          << expected;
+    }
+  }
+}
+
 #define CHECK_CUDA(x) \
   TVM_FFI_ICHECK_EQ(x.device().device_type, kDLCUDA) << #x " must be a CUDA tensor";
 #define CHECK_CPU(x) \
@@ -337,6 +414,67 @@ inline int64_t get_element_size(ffi::Tensor x) { return (x.dtype().bits * x.dtyp
 
 inline int64_t get_element_size(ffi::TensorView x) {
   return (x.dtype().bits * x.dtype().lanes) / 8;
+}
+
+struct FP4ScaleStrides {
+  uint32_t stride_page;
+  uint32_t stride_n;
+  uint32_t stride_h;
+};
+
+inline FP4ScaleStrides GetFP4ScaleStrides(const TensorView& sf, flashinfer::QKVLayout kv_layout) {
+  TVM_FFI_ICHECK(sf.ndim() == 3 || sf.ndim() == 4)
+      << "NVFP4 scale tensor must be 3D or 4D, got " << sf.ndim() << "D";
+  TVM_FFI_ICHECK(sf.stride(sf.ndim() - 1) == 1)
+      << "NVFP4 scale tensor innermost stride must be 1, got " << sf.stride(sf.ndim() - 1);
+  FP4ScaleStrides strides{0, 0, 0};
+  if (sf.ndim() == 4) {
+    strides.stride_page = static_cast<uint32_t>(sf.stride(0));
+    if (kv_layout == flashinfer::QKVLayout::kHND) {
+      strides.stride_h = static_cast<uint32_t>(sf.stride(1));
+      strides.stride_n = static_cast<uint32_t>(sf.stride(2));
+    } else {
+      strides.stride_n = static_cast<uint32_t>(sf.stride(1));
+      strides.stride_h = static_cast<uint32_t>(sf.stride(2));
+    }
+  } else if (kv_layout == flashinfer::QKVLayout::kHND) {
+    strides.stride_h = static_cast<uint32_t>(sf.stride(0));
+    strides.stride_n = static_cast<uint32_t>(sf.stride(1));
+  } else {
+    strides.stride_n = static_cast<uint32_t>(sf.stride(0));
+    strides.stride_h = static_cast<uint32_t>(sf.stride(1));
+  }
+  return strides;
+}
+
+// Strides for the FP8 per-(token, head) float32 scale tensor. Unlike the NVFP4 scale (whose
+// innermost dim is packed and always contiguous), this tensor may be a non-contiguous view of an
+// inline slot (head-dim stride = slot size), so no innermost-stride check is applied.
+//   2D: ragged/single, NHD [total_tokens, num_kv_heads] / HND [num_kv_heads, total_tokens]
+//   3D: paged, NHD [num_pages, page_size, num_kv_heads] / HND [num_pages, num_kv_heads, page_size]
+inline FP4ScaleStrides GetFP8ScaleStrides(const TensorView& sf, flashinfer::QKVLayout kv_layout) {
+  TVM_FFI_ICHECK(sf.ndim() == 2 || sf.ndim() == 3)
+      << "FP8 scale tensor must be 2D or 3D, got " << sf.ndim() << "D";
+  TVM_FFI_ICHECK(sf.dtype().code == kDLFloat && sf.dtype().bits == 32)
+      << "FP8 scale tensor must be float32, got " << sf.dtype();
+  FP4ScaleStrides strides{0, 0, 0};
+  if (sf.ndim() == 3) {
+    strides.stride_page = static_cast<uint32_t>(sf.stride(0));
+    if (kv_layout == flashinfer::QKVLayout::kHND) {
+      strides.stride_h = static_cast<uint32_t>(sf.stride(1));
+      strides.stride_n = static_cast<uint32_t>(sf.stride(2));
+    } else {
+      strides.stride_n = static_cast<uint32_t>(sf.stride(1));
+      strides.stride_h = static_cast<uint32_t>(sf.stride(2));
+    }
+  } else if (kv_layout == flashinfer::QKVLayout::kHND) {
+    strides.stride_h = static_cast<uint32_t>(sf.stride(0));
+    strides.stride_n = static_cast<uint32_t>(sf.stride(1));
+  } else {
+    strides.stride_n = static_cast<uint32_t>(sf.stride(0));
+    strides.stride_h = static_cast<uint32_t>(sf.stride(1));
+  }
+  return strides;
 }
 
 inline ffi::Tensor alloc_tensor(tvm::ffi::Shape shape, DLDataType dtype, DLDevice device) {

@@ -1,0 +1,153 @@
+/*
+ * Copyright (c) 2026 by FlashInfer team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <cuda_bf16.h>
+#include <driver_types.h>
+
+#include <flashinfer/gemm/mm_bf16_cublaslt.cuh>
+
+#include "tvm_ffi_utils.h"
+
+namespace {
+
+cudaDataType_t get_d_type(DLDataType dtype) {
+  switch (encode_dlpack_dtype(dtype)) {
+    case bfloat16_code:
+      return CUDA_R_16BF;
+    case float16_code:
+      return CUDA_R_16F;
+    case float32_code:
+      return CUDA_R_32F;
+    default:
+      TVM_FFI_LOG_AND_THROW(NotImplementedError) << "out_dtype must be one of bf16/fp16/fp32.";
+      return CUDA_R_16BF;
+  }
+}
+
+const __nv_bfloat16* get_bias_ptr(const ffi::Optional<TensorView>& bias, int64_t n) {
+  if (!bias.has_value()) {
+    return nullptr;
+  }
+  const auto& tensor = bias.value();
+  CHECK_CUDA(tensor);
+  CHECK_INPUT_AND_TYPE(tensor, dl_bfloat16);
+  CHECK_DIM(1, tensor);
+  TVM_FFI_ICHECK_EQ(tensor.size(0), n) << "bias N dimension mismatch";
+  return static_cast<const __nv_bfloat16*>(tensor.data_ptr());
+}
+
+}  // namespace
+
+// Serialize the heuristic algorithms for the problem with mat1's N, K and bias, but
+// algo_m rows, into a CPU uint8 tensor.
+// algo_buffer: CPU uint8 tensor of size >= kMaxAlgorithms * kAlgoBytes.
+// Returns number of algorithms written.
+int64_t mm_bf16_cublaslt_get_algos(TensorView mat1, TensorView mat2, ffi::Optional<TensorView> bias,
+                                   TensorView out, TensorView workspace_buffer,
+                                   int64_t cublas_handle, TensorView algo_buffer, int64_t algo_m) {
+  CHECK_CUDA(mat1);
+  CHECK_CUDA(mat2);
+  CHECK_CUDA(out);
+  CHECK_INPUT_AND_TYPE(mat1, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(mat2, dl_bfloat16);
+  CHECK_DIM(2, mat1);
+  CHECK_DIM(2, mat2);
+  CHECK_DIM(2, out);
+  CHECK_CPU(algo_buffer);
+  CHECK_CONTIGUOUS(algo_buffer);
+  CHECK_CUDA(workspace_buffer);
+
+  int64_t m = mat1.size(0);
+  int64_t k = mat1.size(1);
+  int64_t n = mat2.size(0);
+
+  TVM_FFI_ICHECK_EQ(mat2.size(1), k)
+      << "mat2 K dimension mismatch: expected " << k << ", got " << mat2.size(1);
+  TVM_FFI_ICHECK_EQ(out.size(0), m) << "out M dimension mismatch";
+  TVM_FFI_ICHECK_EQ(out.size(1), n) << "out N dimension mismatch";
+  TVM_FFI_ICHECK_GT(algo_m, 0) << "algo_m must be positive";
+  cudaDataType_t d_type = get_d_type(out.dtype());
+  const auto* bias_ptr = get_bias_ptr(bias, n);
+
+  ffi::CUDADeviceGuard device_guard(mat1.device().device_id);
+  auto lt_handle = reinterpret_cast<cublasLtHandle_t>(cublas_handle);
+  int max_algos = static_cast<int>(algo_buffer.numel() * get_element_size(algo_buffer) /
+                                   flashinfer::mm_bf16_cublaslt::kAlgoBytes);
+  return static_cast<int64_t>(flashinfer::mm_bf16_cublaslt::get_algorithms(
+      static_cast<int>(algo_m), static_cast<int>(n), static_cast<int>(k), d_type, bias_ptr,
+      workspace_buffer.numel() * get_element_size(workspace_buffer), lt_handle,
+      algo_buffer.data_ptr(), max_algos));
+}
+
+// Run the matmul with algo_desc, a CPU uint8 tensor of kAlgoBytes holding a serialized
+// cublasLtMatmulAlgo_t, or with the heuristic default when algo_desc is None or does not
+// apply to this problem. Returns 1 if algo_desc ran, 0 if the heuristic default ran.
+int64_t mm_bf16_cublaslt_run_with_descriptor(TensorView mat1, TensorView mat2,
+                                             ffi::Optional<TensorView> bias, TensorView out,
+                                             TensorView workspace_buffer, int64_t cublas_handle,
+                                             ffi::Optional<TensorView> algo_desc) {
+  CHECK_CUDA(mat1);
+  CHECK_CUDA(mat2);
+  CHECK_CUDA(out);
+  CHECK_INPUT_AND_TYPE(mat1, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(mat2, dl_bfloat16);
+  CHECK_DIM(2, mat1);
+  CHECK_DIM(2, mat2);
+  CHECK_DIM(2, out);
+  CHECK_CUDA(workspace_buffer);
+
+  int64_t m = mat1.size(0);
+  int64_t k = mat1.size(1);
+  int64_t n = mat2.size(0);
+
+  TVM_FFI_ICHECK_EQ(mat2.size(1), k)
+      << "mat2 K dimension mismatch: expected " << k << ", got " << mat2.size(1);
+  TVM_FFI_ICHECK_EQ(out.size(0), m) << "out M dimension mismatch";
+  TVM_FFI_ICHECK_EQ(out.size(1), n) << "out N dimension mismatch";
+
+  const void* algo_desc_ptr = nullptr;
+  if (algo_desc.has_value()) {
+    const auto& desc = algo_desc.value();
+    CHECK_CPU(desc);
+    CHECK_CONTIGUOUS(desc);
+    TVM_FFI_ICHECK_EQ(desc.numel() * get_element_size(desc),
+                      static_cast<int64_t>(flashinfer::mm_bf16_cublaslt::kAlgoBytes))
+        << "algo_desc must hold one serialized cublasLtMatmulAlgo_t";
+    algo_desc_ptr = desc.data_ptr();
+  }
+
+  auto lt_handle = reinterpret_cast<cublasLtHandle_t>(cublas_handle);
+  ffi::CUDADeviceGuard device_guard(mat1.device().device_id);
+  auto stream = get_stream(mat1.device());
+  cudaDataType_t d_type = get_d_type(out.dtype());
+  const auto* bias_ptr = get_bias_ptr(bias, n);
+
+  bool used_descriptor = false;
+  auto status = flashinfer::mm_bf16_cublaslt::run_with_descriptor(
+      static_cast<__nv_bfloat16*>(mat1.data_ptr()), static_cast<__nv_bfloat16*>(mat2.data_ptr()),
+      out.data_ptr(), bias_ptr, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+      d_type, workspace_buffer.data_ptr(),
+      workspace_buffer.numel() * get_element_size(workspace_buffer), lt_handle, stream,
+      mat1.device().device_id, algo_desc_ptr, &used_descriptor);
+  TVM_FFI_ICHECK(status == CUBLAS_STATUS_SUCCESS)
+      << "mm_bf16_cublaslt_run_with_descriptor failed for M=" << m << ", N=" << n << ", K=" << k
+      << ": " << cublasGetStatusString(status);
+  return used_descriptor ? 1 : 0;
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt_get_algos, mm_bf16_cublaslt_get_algos);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt_run_with_descriptor,
+                              mm_bf16_cublaslt_run_with_descriptor);

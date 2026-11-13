@@ -34,6 +34,12 @@ using namespace flashinfer;
     if (tile_n == 128) {                           \
       constexpr int TILE_N = 128;                  \
       return __VA_ARGS__();                        \
+    } else if (tile_n == 64) {                     \
+      constexpr int TILE_N = 64;                   \
+      return __VA_ARGS__();                        \
+    } else if (tile_n == 32) {                     \
+      constexpr int TILE_N = 32;                   \
+      return __VA_ARGS__();                        \
     }                                              \
     TVM_FFI_ICHECK(false) << "Unsupported TILE N"; \
     return false;                                  \
@@ -51,6 +57,19 @@ using namespace flashinfer;
     }                                              \
     TVM_FFI_ICHECK(false) << "Unsupported TILE K"; \
     return false;                                  \
+  }()
+
+#define DISPATCH_SWAP_AB(swap_ab, SWAP_AB, ...)     \
+  [&]() -> bool {                                   \
+    if (swap_ab == true) {                          \
+      constexpr bool SWAP_AB = true;                \
+      return __VA_ARGS__();                         \
+    } else if (swap_ab == false) {                  \
+      constexpr bool SWAP_AB = false;               \
+      return __VA_ARGS__();                         \
+    }                                               \
+    TVM_FFI_ICHECK(false) << "Unsupported SWAP AB"; \
+    return false;                                   \
   }()
 
 #define DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(input_a_dtype, input_b_dtype, sf_a_dtype, sf_b_dtype, \
@@ -82,8 +101,8 @@ constexpr bool is_valid_config() {
 namespace flashinfer {
 namespace group_gemm {
 
-template <int TileM, int TileN, int TileK, typename DTypeInA, typename DTypeInB, typename DTypeSFA,
-          typename DTypeSFB, typename DTypeOut>
+template <int TileM, int TileN, int TileK, bool SwapAB, typename DTypeInA, typename DTypeInB,
+          typename DTypeSFA, typename DTypeSFB, typename DTypeOut>
 cudaError_t CutlassNVFP4GroupwiseScaledGroupGEMMSM120(
     void* int_buffer, size_t int_buffer_size_in_bytes, void* float_buffer,
     size_t float_buffer_size_in_bytes, DTypeInA* A, DTypeInB* B, DTypeSFA* SFA, DTypeSFB* SFB,
@@ -98,7 +117,7 @@ void CutlassGroupGemmNVFP4GroupwiseScaledSM120(TensorView int_workspace_buffer,
                                                TensorView B, TensorView SFA, TensorView SFB,
                                                TensorView D, TensorView alpha, TensorView m_indptr,
                                                int64_t n, int64_t k, int64_t tile_m, int64_t tile_n,
-                                               int64_t tile_k) {
+                                               int64_t tile_k, bool swap_ab) {
   int device_id = float_workspace_buffer.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
   auto stream = get_stream(float_workspace_buffer.device());
@@ -112,31 +131,33 @@ void CutlassGroupGemmNVFP4GroupwiseScaledSM120(TensorView int_workspace_buffer,
         return DISPATCH_TILE_M(tile_m, TILE_M, [&] {
           return DISPATCH_TILE_N(tile_n, TILE_N, [&] {
             return DISPATCH_TILE_K(tile_k, TILE_K, [&] {
-              if constexpr (is_valid_config<c_type_in_a, c_type_in_b, c_type_sf_a, c_type_sf_b,
-                                            c_type_out>()) {
-                using cutlass_t_in_a = cutlass_dtype_t<c_type_in_a>;
-                using cutlass_t_in_b = cutlass_dtype_t<c_type_in_b>;
-                using cutlass_t_sf_a = cutlass::float_ue4m3_t;
-                using cutlass_t_sf_b = cutlass::float_ue4m3_t;
-                using cutlass_t_out = cutlass_dtype_t<c_type_out>;
-                auto status = flashinfer::group_gemm::CutlassNVFP4GroupwiseScaledGroupGEMMSM120<
-                    TILE_M, TILE_N, TILE_K>(
-                    static_cast<int*>(int_workspace_buffer.data_ptr()),
-                    get_element_size(int_workspace_buffer) * int_workspace_buffer.size(0),
-                    static_cast<float*>(float_workspace_buffer.data_ptr()),
-                    get_element_size(float_workspace_buffer) * float_workspace_buffer.size(0),
-                    static_cast<cutlass_t_in_a*>(A.data_ptr()),
-                    static_cast<cutlass_t_in_b*>(B.data_ptr()),
-                    static_cast<cutlass_t_sf_a*>(SFA.data_ptr()),
-                    static_cast<cutlass_t_sf_b*>(SFB.data_ptr()),
-                    static_cast<cutlass_t_out*>(D.data_ptr()),
-                    alpha.numel() == 0 ? nullptr : static_cast<float*>(alpha.data_ptr()),
-                    static_cast<int*>(m_indptr.data_ptr()), n, k, num_groups, stream, device_id);
-                return status == cudaSuccess;
-              } else {
-                TVM_FFI_ICHECK(false) << "Unsupported input data type";
-                return false;
-              }
+              return DISPATCH_SWAP_AB(swap_ab, SWAP_AB, [&] {
+                if constexpr (is_valid_config<c_type_in_a, c_type_in_b, c_type_sf_a, c_type_sf_b,
+                                              c_type_out>()) {
+                  using cutlass_t_in_a = cutlass_dtype_t<c_type_in_a>;
+                  using cutlass_t_in_b = cutlass_dtype_t<c_type_in_b>;
+                  using cutlass_t_sf_a = cutlass::float_ue4m3_t;
+                  using cutlass_t_sf_b = cutlass::float_ue4m3_t;
+                  using cutlass_t_out = cutlass_dtype_t<c_type_out>;
+                  auto status = flashinfer::group_gemm::CutlassNVFP4GroupwiseScaledGroupGEMMSM120<
+                      TILE_M, TILE_N, TILE_K, SWAP_AB>(
+                      static_cast<int*>(int_workspace_buffer.data_ptr()),
+                      get_element_size(int_workspace_buffer) * int_workspace_buffer.size(0),
+                      static_cast<float*>(float_workspace_buffer.data_ptr()),
+                      get_element_size(float_workspace_buffer) * float_workspace_buffer.size(0),
+                      static_cast<cutlass_t_in_a*>(A.data_ptr()),
+                      static_cast<cutlass_t_in_b*>(B.data_ptr()),
+                      static_cast<cutlass_t_sf_a*>(SFA.data_ptr()),
+                      static_cast<cutlass_t_sf_b*>(SFB.data_ptr()),
+                      static_cast<cutlass_t_out*>(D.data_ptr()),
+                      alpha.numel() == 0 ? nullptr : static_cast<float*>(alpha.data_ptr()),
+                      static_cast<int*>(m_indptr.data_ptr()), n, k, num_groups, stream, device_id);
+                  return status == cudaSuccess;
+                } else {
+                  TVM_FFI_ICHECK(false) << "Unsupported input data type";
+                  return false;
+                }
+              });
             });
           });
         });

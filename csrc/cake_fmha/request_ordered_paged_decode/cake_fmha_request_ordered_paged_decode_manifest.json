@@ -1,0 +1,714 @@
+{
+  "contract": {
+    "head_dim": 256,
+    "kv_dtype": "float8_e4m3fn",
+    "num_kv_heads": 1,
+    "num_q_heads": 8,
+    "page_size": 64,
+    "q_len": [
+      1,
+      6
+    ],
+    "query_output_dtype": "bfloat16",
+    "request_order": "optional_device_int32",
+    "softmax_accumulation_dtype": "float32"
+  },
+  "exact_routes": [
+    {
+      "grid": [
+        1,
+        4,
+        8
+      ],
+      "kv_lens": {
+        "count": 8,
+        "period": [
+          897,
+          1025,
+          1153,
+          1281,
+          1409,
+          1537,
+          1665,
+          1793
+        ]
+      },
+      "module": "cake_fmha_request_ordered_paged_decode_9baf89b875984fa7e528",
+      "q_len": 1,
+      "real_batch_size": 8,
+      "request_order_case": "random",
+      "shape": "correctness_split4_reducer_separate_q1",
+      "total_tiles": 32,
+      "workspace_parts": 4,
+      "write_lse": true
+    },
+    {
+      "grid": [
+        6,
+        2,
+        4
+      ],
+      "kv_lens": {
+        "count": 4,
+        "period": [
+          390,
+          454,
+          518,
+          582
+        ]
+      },
+      "module": "cake_fmha_request_ordered_paged_decode_f2cb676bd2e1c46f3227",
+      "q_len": 6,
+      "real_batch_size": 4,
+      "request_order_case": "reverse",
+      "shape": "correctness_split2_reducer_shared_q6",
+      "total_tiles": 48,
+      "workspace_parts": 2,
+      "write_lse": true
+    },
+    {
+      "grid": [
+        4,
+        1,
+        32
+      ],
+      "kv_lens": {
+        "count": 32,
+        "period": [
+          8193,
+          57345,
+          73729,
+          81921,
+          98305,
+          106497,
+          114689,
+          131073,
+          139265,
+          147457,
+          163841,
+          180225,
+          196609,
+          212993,
+          229377,
+          237569,
+          8193,
+          73729,
+          81921,
+          106497,
+          114689,
+          139265,
+          147457,
+          180225,
+          196609,
+          212993,
+          237569,
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      },
+      "module": "cake_fmha_request_ordered_paged_decode_ee84fbc48f3343169da8",
+      "q_len": 1,
+      "real_batch_size": 27,
+      "request_order_case": "length_desc",
+      "shape": "perf_ragged_b27_q1",
+      "total_tiles": 1,
+      "workspace_parts": 1,
+      "write_lse": false
+    },
+    {
+      "grid": [
+        4,
+        1,
+        32
+      ],
+      "kv_lens": {
+        "count": 32,
+        "period": [
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          136193,
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      },
+      "module": "cake_fmha_request_ordered_paged_decode_ee84fbc48f3343169da8",
+      "q_len": 1,
+      "real_batch_size": 27,
+      "request_order_case": "identity",
+      "shape": "perf_uniform_b27_q1",
+      "total_tiles": 1,
+      "workspace_parts": 1,
+      "write_lse": false
+    },
+    {
+      "grid": [
+        4,
+        1,
+        32
+      ],
+      "kv_lens": {
+        "count": 32,
+        "period": [
+          8193,
+          57345,
+          73729,
+          81921,
+          98305,
+          106497,
+          114689,
+          131073,
+          139265,
+          147457,
+          163841,
+          180225,
+          196609,
+          212993,
+          229377,
+          237569
+        ]
+      },
+      "module": "cake_fmha_request_ordered_paged_decode_ee84fbc48f3343169da8",
+      "q_len": 1,
+      "real_batch_size": 32,
+      "request_order_case": "length_desc",
+      "shape": "perf_ragged_b32_q1",
+      "total_tiles": 1,
+      "workspace_parts": 1,
+      "write_lse": false
+    },
+    {
+      "grid": [
+        4,
+        1,
+        32
+      ],
+      "kv_lens": {
+        "count": 32,
+        "period": [
+          136193
+        ]
+      },
+      "module": "cake_fmha_request_ordered_paged_decode_ee84fbc48f3343169da8",
+      "q_len": 1,
+      "real_batch_size": 32,
+      "request_order_case": "identity",
+      "shape": "perf_uniform_b32_q1",
+      "total_tiles": 1,
+      "workspace_parts": 1,
+      "write_lse": false
+    },
+    {
+      "grid": [
+        2,
+        1,
+        64
+      ],
+      "kv_lens": {
+        "count": 64,
+        "period": [
+          8193,
+          57345,
+          73729,
+          81921,
+          98305,
+          106497,
+          114689,
+          131073,
+          139265,
+          147457,
+          163841,
+          180225,
+          196609,
+          212993,
+          229377,
+          237569
+        ]
+      },
+      "module": "cake_fmha_request_ordered_paged_decode_104bb89fe1bc7e36bb0d",
+      "q_len": 1,
+      "real_batch_size": 64,
+      "request_order_case": "length_desc",
+      "shape": "perf_ragged_b64_q1",
+      "total_tiles": 1,
+      "workspace_parts": 1,
+      "write_lse": false
+    },
+    {
+      "grid": [
+        2,
+        1,
+        64
+      ],
+      "kv_lens": {
+        "count": 64,
+        "period": [
+          136193
+        ]
+      },
+      "module": "cake_fmha_request_ordered_paged_decode_104bb89fe1bc7e36bb0d",
+      "q_len": 1,
+      "real_batch_size": 64,
+      "request_order_case": "identity",
+      "shape": "perf_uniform_b64_q1",
+      "total_tiles": 1,
+      "workspace_parts": 1,
+      "write_lse": false
+    },
+    {
+      "grid": [
+        1,
+        1,
+        160
+      ],
+      "kv_lens": {
+        "count": 160,
+        "period": [
+          8193,
+          57345,
+          73729,
+          81921,
+          98305,
+          106497,
+          114689,
+          131073,
+          139265,
+          147457,
+          163841,
+          180225,
+          196609,
+          212993,
+          229377,
+          237569
+        ]
+      },
+      "module": "cake_fmha_request_ordered_paged_decode_1c19b4be7cbb9ff51e92",
+      "q_len": 1,
+      "real_batch_size": 160,
+      "request_order_case": "length_desc",
+      "shape": "perf_ragged_b160_q1",
+      "total_tiles": 304,
+      "workspace_parts": 16,
+      "write_lse": false
+    },
+    {
+      "grid": [
+        6,
+        1,
+        160
+      ],
+      "kv_lens": {
+        "count": 160,
+        "period": [
+          8193,
+          57345,
+          73729,
+          81921,
+          98305,
+          106497,
+          114689,
+          131073,
+          139265,
+          147457,
+          163841,
+          180225,
+          196609,
+          212993,
+          229377,
+          237569
+        ]
+      },
+      "module": "cake_fmha_request_ordered_paged_decode_4383dbfd21846d617689",
+      "q_len": 6,
+      "real_batch_size": 160,
+      "request_order_case": "length_desc",
+      "shape": "perf_ragged_b160_q6",
+      "total_tiles": 1068,
+      "workspace_parts": 16,
+      "write_lse": false
+    },
+    {
+      "grid": [
+        1,
+        1,
+        192
+      ],
+      "kv_lens": {
+        "count": 192,
+        "period": [
+          8193,
+          57345,
+          73729,
+          81921,
+          98305,
+          106497,
+          114689,
+          131073,
+          139265,
+          147457,
+          163841,
+          180225,
+          196609,
+          212993,
+          229377,
+          237569
+        ]
+      },
+      "module": "cake_fmha_request_ordered_paged_decode_1c19b4be7cbb9ff51e92",
+      "q_len": 1,
+      "real_batch_size": 192,
+      "request_order_case": "length_desc",
+      "shape": "perf_ragged_b192_q1",
+      "total_tiles": 304,
+      "workspace_parts": 16,
+      "write_lse": false
+    },
+    {
+      "grid": [
+        6,
+        1,
+        192
+      ],
+      "kv_lens": {
+        "count": 192,
+        "period": [
+          8193,
+          57345,
+          73729,
+          81921,
+          98305,
+          106497,
+          114689,
+          131073,
+          139265,
+          147457,
+          163841,
+          180225,
+          196609,
+          212993,
+          229377,
+          237569
+        ]
+      },
+      "module": "cake_fmha_request_ordered_paged_decode_4383dbfd21846d617689",
+      "q_len": 6,
+      "real_batch_size": 192,
+      "request_order_case": "length_desc",
+      "shape": "perf_ragged_b192_q6",
+      "total_tiles": 1218,
+      "workspace_parts": 16,
+      "write_lse": false
+    },
+    {
+      "grid": [
+        1,
+        1,
+        224
+      ],
+      "kv_lens": {
+        "count": 224,
+        "period": [
+          8193,
+          57345,
+          73729,
+          81921,
+          98305,
+          106497,
+          114689,
+          131073,
+          139265,
+          147457,
+          163841,
+          180225,
+          196609,
+          212993,
+          229377,
+          237569
+        ]
+      },
+      "module": "cake_fmha_request_ordered_paged_decode_1c19b4be7cbb9ff51e92",
+      "q_len": 1,
+      "real_batch_size": 224,
+      "request_order_case": "length_desc",
+      "shape": "perf_ragged_b224_q1",
+      "total_tiles": 304,
+      "workspace_parts": 16,
+      "write_lse": false
+    },
+    {
+      "grid": [
+        6,
+        1,
+        224
+      ],
+      "kv_lens": {
+        "count": 224,
+        "period": [
+          8193,
+          57345,
+          73729,
+          81921,
+          98305,
+          106497,
+          114689,
+          131073,
+          139265,
+          147457,
+          163841,
+          180225,
+          196609,
+          212993,
+          229377,
+          237569
+        ]
+      },
+      "module": "cake_fmha_request_ordered_paged_decode_4383dbfd21846d617689",
+      "q_len": 6,
+      "real_batch_size": 224,
+      "request_order_case": "length_desc",
+      "shape": "perf_ragged_b224_q6",
+      "total_tiles": 1368,
+      "workspace_parts": 16,
+      "write_lse": false
+    }
+  ],
+  "modules": [
+    {
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_104bb89fe1bc7e36bb0d_binding.cpp",
+      "cluster_ctas": 2,
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "defines": {},
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_104bb89fe1bc7e36bb0d_kernel.cu",
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_104bb89fe1bc7e36bb0d",
+      "kind": "low_q1_cga",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_104bb89fe1bc7e36bb0d_sm_103a",
+      "name": "cake_fmha_request_ordered_paged_decode_104bb89fe1bc7e36bb0d",
+      "num_split": 1,
+      "q_len": 1,
+      "route_slug": "low_q1_c2",
+      "tma_workspace_bytes": 384,
+      "write_lse": false
+    },
+    {
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_1c19b4be7cbb9ff51e92_binding.cpp",
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "defines": {},
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_1c19b4be7cbb9ff51e92_kernel.cu",
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_1c19b4be7cbb9ff51e92",
+      "kind": "two_wave",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_1c19b4be7cbb9ff51e92_sm_103a",
+      "name": "cake_fmha_request_ordered_paged_decode_1c19b4be7cbb9ff51e92",
+      "num_split": 2,
+      "q_len": 1,
+      "route_slug": "two_wave_q1",
+      "tma_workspace_bytes": 384,
+      "write_lse": false
+    },
+    {
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_4383dbfd21846d617689_binding.cpp",
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "defines": {},
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_4383dbfd21846d617689_kernel.cu",
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_4383dbfd21846d617689",
+      "kind": "two_wave",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_4383dbfd21846d617689_sm_103a",
+      "name": "cake_fmha_request_ordered_paged_decode_4383dbfd21846d617689",
+      "num_split": 2,
+      "q_len": 6,
+      "route_slug": "two_wave_q6",
+      "tma_workspace_bytes": 384,
+      "write_lse": false
+    },
+    {
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fallback_binding.cpp",
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "defines": {
+        "NUM_SPLIT": 1,
+        "Q_LEN": 6,
+        "WRITE_LSE": 0
+      },
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fallback_kernel.cu",
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_fallback",
+      "kind": "persistent",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_52a95bea12fdd04c9c0e_sm_103a",
+      "name": "cake_fmha_request_ordered_paged_decode_52a95bea12fdd04c9c0e",
+      "num_split": 1,
+      "q_len": 6,
+      "route_slug": "fallback_q6",
+      "tma_workspace_bytes": 384,
+      "write_lse": false
+    },
+    {
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fallback_binding.cpp",
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "defines": {
+        "NUM_SPLIT": 1,
+        "Q_LEN": 6,
+        "WRITE_LSE": 1
+      },
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fallback_kernel.cu",
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_fallback",
+      "kind": "persistent",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_827d15cce46c00f6c8c3_sm_103a",
+      "name": "cake_fmha_request_ordered_paged_decode_827d15cce46c00f6c8c3",
+      "num_split": 1,
+      "q_len": 6,
+      "route_slug": "fallback_q6_ordered_s1_lse",
+      "tma_workspace_bytes": 384,
+      "write_lse": true
+    },
+    {
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fallback_binding.cpp",
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "defines": {
+        "NUM_SPLIT": 1,
+        "Q_LEN": 1,
+        "WRITE_LSE": 1
+      },
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fallback_kernel.cu",
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_fallback",
+      "kind": "persistent",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_8fba1d3aed7bf0c967aa_sm_103a",
+      "name": "cake_fmha_request_ordered_paged_decode_8fba1d3aed7bf0c967aa",
+      "num_split": 1,
+      "q_len": 1,
+      "route_slug": "fallback_q1_ordered_s1_lse",
+      "tma_workspace_bytes": 384,
+      "write_lse": true
+    },
+    {
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fallback_binding.cpp",
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "defines": {
+        "NUM_SPLIT": 4,
+        "Q_LEN": 1,
+        "WRITE_LSE": 1
+      },
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fallback_kernel.cu",
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_fallback",
+      "kind": "persistent",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_9baf89b875984fa7e528_sm_103a",
+      "name": "cake_fmha_request_ordered_paged_decode_9baf89b875984fa7e528",
+      "num_split": 4,
+      "q_len": 1,
+      "route_slug": "fallback_q1_ordered_s4_lse",
+      "tma_workspace_bytes": 384,
+      "write_lse": true
+    },
+    {
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fallback_binding.cpp",
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "defines": {
+        "NUM_SPLIT": 1,
+        "Q_LEN": 1,
+        "WRITE_LSE": 0
+      },
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fallback_kernel.cu",
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_fallback",
+      "kind": "persistent",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_d14d1b1672e0080133c5_sm_103a",
+      "name": "cake_fmha_request_ordered_paged_decode_d14d1b1672e0080133c5",
+      "num_split": 1,
+      "q_len": 1,
+      "route_slug": "fallback_q1",
+      "tma_workspace_bytes": 384,
+      "write_lse": false
+    },
+    {
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_ee84fbc48f3343169da8_binding.cpp",
+      "cluster_ctas": 4,
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "defines": {},
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_ee84fbc48f3343169da8_kernel.cu",
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_ee84fbc48f3343169da8",
+      "kind": "low_q1_cga",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_ee84fbc48f3343169da8_sm_103a",
+      "name": "cake_fmha_request_ordered_paged_decode_ee84fbc48f3343169da8",
+      "num_split": 1,
+      "q_len": 1,
+      "route_slug": "low_q1_c4",
+      "tma_workspace_bytes": 384,
+      "write_lse": false
+    },
+    {
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fallback_binding.cpp",
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "defines": {
+        "NUM_SPLIT": 2,
+        "Q_LEN": 6,
+        "WRITE_LSE": 1
+      },
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fallback_kernel.cu",
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_fallback",
+      "kind": "persistent",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_f2cb676bd2e1c46f3227_sm_103a",
+      "name": "cake_fmha_request_ordered_paged_decode_f2cb676bd2e1c46f3227",
+      "num_split": 2,
+      "q_len": 6,
+      "route_slug": "fallback_q6_ordered_s2_lse",
+      "tma_workspace_bytes": 384,
+      "write_lse": true
+    }
+  ],
+  "schema": "flashinfer.cake_fmha_request_ordered_paged_decode.v2",
+  "target": "sm_103a"
+}

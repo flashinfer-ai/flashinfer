@@ -132,6 +132,9 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
         if (params.mPtrTopKWeights != nullptr) {
           params.mPtrTopKWeights[tokenIdx] = finalScore;
         }
+        if (params.mPtrRoutingReplayOut != nullptr) {
+          params.mPtrRoutingReplayOut[tokenIdx] = static_cast<int16_t>(warpMaxExpertIdx[0]);
+        }
       }
     }
   } else {
@@ -162,6 +165,9 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     setBits</* IsZero= */ true>(expertTokenCount, 1, scoreIdx.idx % ExpertsPerThread);
     if (threadIdx.x < params.mNumTokens) {
       smemExpertTokenCountFull[threadIdx.x][scoreIdx.idx / ExpertsPerThread] = expertTokenCount;
+      if (params.mPtrRoutingReplayOut != nullptr) {
+        params.mPtrRoutingReplayOut[threadIdx.x] = scoreIdx.idx;
+      }
     }
   }
 
@@ -198,8 +204,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     }
     numCta += num;
   }
-  // Expand from CGA count to CTA count to keep the semantic stable with downstream kernels
-  numCta *= params.mClusterSizeInBatchDim;
+
   // second, we perform the exclusive sum across the warp
   int32_t ctaOffset;
   int32_t numNonExitingCtas;
@@ -217,8 +222,12 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     } else {
       finalNumCta = divUpTileN<int32_t>(count, params.mTileTokensDim);
     }
-    finalNumCta *= params.mClusterSizeInBatchDim;
+
     auto expertIdx = threadIdx.x * ExpertsPerThread + ii;
+    auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
+    auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
+    auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
+                         (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
     // during the scan for expert offsets, we can already write out
     // both `mPtrCtaIdxXyToBatchIdx` and `mPtrCtaIdxXyToMnLimit`
     for (int cta = 0; cta < finalNumCta; ++cta) {
@@ -227,15 +236,17 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
       int32_t mnLimit1;
       int32_t mnLimit2;
       if (params.mIsPow2) {
-        int32_t ctaPaddingLog2 = params.mPaddingLog2 - params.mClusterSizeLog2;
-        mnLimit1 = mulLog2<int32_t>(ctaOffsetExp + cta + 1, ctaPaddingLog2);
-        mnLimit2 = mulLog2<int32_t>(ctaOffsetExp, ctaPaddingLog2) + count;
+        mnLimit1 = mulLog2<int32_t>(ctaOffsetExp + cta + 1, params.mPaddingLog2);
+        mnLimit2 = mulLog2<int32_t>(ctaOffsetExp, params.mPaddingLog2) + count;
       } else {
-        int32_t ctaTile = params.mTileTokensDim / params.mClusterSizeInBatchDim;
-        mnLimit1 = (ctaOffsetExp + cta + 1) * ctaTile;
-        mnLimit2 = ctaOffsetExp * ctaTile + count;
+        mnLimit1 = mulTileN<int32_t>(ctaOffsetExp + cta + 1, params.mTileTokensDim);
+        mnLimit2 = mulTileN<int32_t>(ctaOffsetExp, params.mTileTokensDim) + count;
       }
       params.mPtrCtaIdxXyToMnLimit[ctaOffsetExp + cta] = min(mnLimit1, mnLimit2);
+      // This warp path reserves remote-expert tiles but writes no live rows to them.
+      int32_t paddingBegin =
+          isLocalExpert ? min(mnLimit1, mnLimit2) : mnLimit1 - params.mTileTokensDim;
+      initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, paddingBegin, mnLimit1);
     }
     ctaOffsetExp += finalNumCta;
   }
@@ -244,10 +255,9 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
   if (cute::elect_one_sync()) {
     int32_t permutedIdxSize;
     if (params.mIsPow2) {
-      permutedIdxSize =
-          mulLog2<int32_t>(numNonExitingCtas >> params.mClusterSizeLog2, params.mPaddingLog2);
+      permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
     } else {
-      permutedIdxSize = (numNonExitingCtas / params.mClusterSizeInBatchDim) * params.mTileTokensDim;
+      permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
     }
 
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
@@ -263,10 +273,9 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
   // Convert CTA-level ctaOffset back to token-space (CGA granularity)
   int32_t finalExpertOffset[ExpertsPerThread];
   if (params.mIsPow2) {
-    finalExpertOffset[0] =
-        mulLog2<int32_t>(ctaOffset >> params.mClusterSizeLog2, params.mPaddingLog2);
+    finalExpertOffset[0] = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
   } else {
-    finalExpertOffset[0] = (ctaOffset / params.mClusterSizeInBatchDim) * params.mTileTokensDim;
+    finalExpertOffset[0] = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim);
   }
 #pragma unroll
   for (int ii = 1; ii < ExpertsPerThread; ++ii) {
@@ -386,6 +395,11 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
   __cluster_barrier_arrive();
   __cluster_barrier_wait();
 
+  // Publish the same top-1 expert selected by the permutation path for FromLogits replay.
+  if (laneIdx == 0 && validToken && params.mPtrRoutingReplayOut != nullptr) {
+    params.mPtrRoutingReplayOut[warpTokenIdx] = smemPackedScoreIdx[warpIdx].idx;
+  }
+
   if (params.mPtrTopKIds != nullptr || params.mPtrScores != nullptr) {
     routingPermutation<KernelParams, OutputT, NumThreads, NumWarps, MaxNumTopExperts,
                        /*LoadExpertIdxFromGlobal=*/false>(params, smemPackedScoreIdx, warpIdx,
@@ -464,6 +478,9 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
       auto finalScore = OutputT{sigmoid_accurate(float{warpMaxScore[0]})};
       TypePacked packedScore{finalScore, static_cast<int16_t>(warpMaxExpertIdx[0])};
       params.mPtrTopKPacked[tokenIdx] = packedScore;
+      if (params.mPtrRoutingReplayOut != nullptr) {
+        params.mPtrRoutingReplayOut[tokenIdx] = static_cast<int16_t>(warpMaxExpertIdx[0]);
+      }
     }
   }
 
@@ -506,8 +523,7 @@ void run(Data const& data, void* stream) {
           "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for Llama4 "
           "routing.");
     }
-    int const numThreadsHist = routingCustom::getMaxNumExperts(data.mNumExperts);
-    runPostTopKPipeline(data, numThreadsHist, stream);
+    runPostTopKPipeline(data, stream);
     return;
   }
   FLASHINFER_CHECK(
@@ -520,8 +536,6 @@ void run(Data const& data, void* stream) {
   FLASHINFER_CHECK(data.mNumExperts <= MaxSupportedExperts,
                    "Routing kernel expects #experts %d to be no more than %d", data.mNumExperts,
                    MaxSupportedExperts);
-  FLASHINFER_CHECK(data.mNumExperts % 4 == 0,
-                   "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
 
   // After this point, mPtrTopKIds is guaranteed to be nullptr.
   // Input is either mPtrScores (raw logits) or mPtrTopKPacked (topK already computed, needs

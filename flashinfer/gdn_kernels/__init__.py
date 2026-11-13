@@ -16,6 +16,12 @@ Exported Kernels:
 - run_nontranspose_decode: Nontranspose (K-major) decode kernel
 - run_mtp_decode: Multi-token processing decode kernel
 - get_mtp_config, get_tile_v_mtp, get_vec_size_mtp: MTP hyperparameter helpers
+- gated_delta_rule_mtp_ucache: u/d-cache spec-decode verify kernel (ring append,
+  read-only state; legacy 16-deep flat ring)
+- gated_delta_rule_mtp_ucache_flush: fused verify+flush ucache kernel (32-slot
+  rotating ring; folds the window into the checkpoint state)
+- gated_delta_rule_mtp_ucache_flush_umma_rubin: Rubin (sm_107a) build of the UMMA
+  backend of the flush kernel (also sm_100a), with an opt-in persistent kernel
 """
 
 try:
@@ -27,21 +33,76 @@ try:
     )
 
     _has_cute_dsl = True
-except ImportError:
+except (ImportError, RuntimeError):
     _has_cute_dsl = False
     gated_delta_rule = None  # type: ignore
     gated_delta_rule_mtp = None  # type: ignore
     gated_delta_rule_bf16state_cooprow = None  # type: ignore
     gated_delta_rule_bf16state_cooprow_mtp = None  # type: ignore
 
+# Bank-conflict-eliminated, no-prepack, OUTPUT-ONLY BF16-state MTP decode (v18).
+# Alternative implementation of the bf16_state MTP kernel for the output-only
+# (frozen-state) case; consumes H0 in its natural (pool, HV, V, K) bf16 layout.
+try:
+    from .gdn_decode_bf16_wy_output_only import (
+        gated_delta_rule_mtp as gated_delta_rule_mtp_wy_output_only,
+    )
+
+    _GDN_DECODE_BF16_WY_OUTPUT_ONLY_AVAILABLE = True
+except (ImportError, RuntimeError):
+    _GDN_DECODE_BF16_WY_OUTPUT_ONLY_AVAILABLE = False
+    gated_delta_rule_mtp_wy_output_only = None  # type: ignore
+
+# ReplaySSM u/d-cache spec-decode kernels. NOTE: the two ring formats are NOT
+# compatible — verify-only uses the legacy 16-deep flat ring (no cache_base),
+# the flush kernel a 32-slot rotating ring. Storage dtypes for the flush kernel
+# are chosen at import time via GDN_UCACHE_{IO,STATE,RING}_DTYPE.
+try:
+    from .gdn_decode_bf16_wy_ucache import gated_delta_rule_mtp_ucache
+except (ImportError, RuntimeError):
+    gated_delta_rule_mtp_ucache = None  # type: ignore
+
+try:
+    from .gdn_decode_bf16_wy_ucache_flush import gated_delta_rule_mtp_ucache_flush
+except (ImportError, RuntimeError):
+    gated_delta_rule_mtp_ucache_flush = None  # type: ignore
+
+# UMMA (tcgen05 / TMEM) backend of the flush kernel for SM100 (fp16-state arm); reached
+# through gated_delta_rule_mtp_ucache_flush(backend="auto") or called directly.
+try:
+    from .gdn_replay_mtp_umma import (
+        flush_first_row_order,
+        gated_delta_rule_mtp_ucache_flush_umma,
+    )
+except (ImportError, RuntimeError):
+    gated_delta_rule_mtp_ucache_flush_umma = None  # type: ignore
+    flush_first_row_order = None  # type: ignore
+
+# Rubin (sm_107a) build of the UMMA kernel: same contract and results, Rubin tunings, a
+# persistent kernel for die-localized launches and uGPU buffers (ugpu_ucache_buffers: one launch
+# per die); also runs on sm_100a.
+try:
+    from .gdn_replay_mtp_umma_rubin import (
+        gated_delta_rule_mtp_ucache_flush_umma_rubin,
+        ugpu_ucache_buffers,
+    )
+except (ImportError, RuntimeError):
+    gated_delta_rule_mtp_ucache_flush_umma_rubin = None  # type: ignore
+    ugpu_ucache_buffers = None  # type: ignore
+
+try:
+    from .gdn_prefix_materialize import gdn_prefix_materialize
+except (ImportError, RuntimeError):
+    gdn_prefix_materialize = None  # type: ignore
+
 try:
     from .gdn_decode_pretranspose import run_pretranspose_decode
-except ImportError:
+except (ImportError, RuntimeError):
     run_pretranspose_decode = None  # type: ignore
 
 try:
     from .gdn_decode_nontranspose import run_nontranspose_decode
-except ImportError:
+except (ImportError, RuntimeError):
     run_nontranspose_decode = None  # type: ignore
 
 try:
@@ -51,15 +112,51 @@ try:
         get_vec_size_mtp,
         get_mtp_config,
     )
-except ImportError:
+except (ImportError, RuntimeError):
     run_mtp_decode = None  # type: ignore
     get_tile_v_mtp = None  # type: ignore
     get_vec_size_mtp = None  # type: ignore
     get_mtp_config = None  # type: ignore
 
+try:
+    from .blackwell import (
+        _chunk_gated_delta_rule_gdn_cp_sm100,
+        chunk_gated_delta_rule_sm100,
+        cp_delta_rule_dsl_sm100,
+    )
+except (ImportError, RuntimeError):
+    _chunk_gated_delta_rule_gdn_cp_sm100 = None  # type: ignore
+    chunk_gated_delta_rule_sm100 = None  # type: ignore
+    cp_delta_rule_dsl_sm100 = None  # type: ignore
+
+try:
+    from .delta_rule_dsl import (
+        chunk_gated_delta_rule_sm80,
+        chunk_gated_delta_rule_sm90,
+        chunk_gated_delta_rule_sm120,
+        cp_delta_rule_dsl_sm80,
+        cp_delta_rule_dsl_sm90,
+        cp_delta_rule_dsl_sm120,
+    )
+except (ImportError, RuntimeError):
+    chunk_gated_delta_rule_sm80 = None  # type: ignore
+    chunk_gated_delta_rule_sm90 = None  # type: ignore
+    chunk_gated_delta_rule_sm120 = None  # type: ignore
+    cp_delta_rule_dsl_sm80 = None  # type: ignore
+    cp_delta_rule_dsl_sm90 = None  # type: ignore
+    cp_delta_rule_dsl_sm120 = None  # type: ignore
+
 __all__ = [
     "gated_delta_rule",
     "gated_delta_rule_mtp",
+    "gated_delta_rule_mtp_ucache",
+    "gated_delta_rule_mtp_ucache_flush",
+    "gated_delta_rule_mtp_ucache_flush_umma",
+    "gated_delta_rule_mtp_ucache_flush_umma_rubin",
+    "ugpu_ucache_buffers",
+    "flush_first_row_order",
+    "gdn_prefix_materialize",
+    "gated_delta_rule_mtp_wy_output_only",
     "gated_delta_rule_bf16state_cooprow",
     "gated_delta_rule_bf16state_cooprow_mtp",
     "run_pretranspose_decode",
@@ -68,4 +165,12 @@ __all__ = [
     "get_tile_v_mtp",
     "get_vec_size_mtp",
     "get_mtp_config",
+    "chunk_gated_delta_rule_sm80",
+    "chunk_gated_delta_rule_sm90",
+    "chunk_gated_delta_rule_sm100",
+    "chunk_gated_delta_rule_sm120",
+    "cp_delta_rule_dsl_sm80",
+    "cp_delta_rule_dsl_sm90",
+    "cp_delta_rule_dsl_sm100",
+    "cp_delta_rule_dsl_sm120",
 ]

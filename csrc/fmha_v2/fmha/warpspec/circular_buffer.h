@@ -126,24 +126,30 @@ class CircularBufferReader {
   }
 
   /* Peek at the head */
-  inline __device__ int peek() {
-    return _entryProducedBarriers.bar_peek(_rptr, (_phase >> _rptr) & 1);
+  inline __device__ int peek(int ptr) {
+    return _entryProducedBarriers.bar_peek(ptr, (_phase >> ptr) & 1);
   }
+
+  inline __device__ int peek() { return peek(_rptr); }
 
   /* Wait for the head to be ready */
-  inline __device__ int wait() {
-    _entryProducedBarriers.bar_wait(_rptr, (_phase >> _rptr) & 1);
-    return _rptr;
+  inline __device__ int wait(int ptr) {
+    _entryProducedBarriers.bar_wait(ptr, (_phase >> ptr) & 1);
+    return ptr;
   }
 
+  inline __device__ int wait() { return wait(_rptr); }
+
   /* Advance the head pointer */
-  inline __device__ void advance() {
-    _phase ^= (1 << _rptr);
-    _rptr += 1;
+  inline __device__ void advance(int ptr) {
+    _phase ^= (1 << ptr);
+    _rptr = ptr + 1;
     if (_rptr >= DEPTH) {
       _rptr = 0;
     }
   }
+
+  inline __device__ void advance() { advance(_rptr); }
 
   inline __device__ int ptr() { return _rptr; }
 
@@ -165,10 +171,12 @@ class CircularBufferReader {
   /* Simplification of complete and advance for cases
      where they don't need to be reordered/separated for performance
   */
-  inline __device__ void pop(int tid0) {
-    complete(tid0, _rptr);
-    advance();
+  inline __device__ void pop(int tid0, int ptr) {
+    complete(tid0, ptr);
+    advance(ptr);
   }
+
+  inline __device__ void pop(int tid0) { pop(tid0, _rptr); }
 
   /* Overrides for pointer and phase.  Used for shared buffers */
   inline __device__ void setPtr(int ptr) { _rptr = ptr; }

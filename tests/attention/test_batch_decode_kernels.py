@@ -14,15 +14,47 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
+
 import pytest
 import torch
-from tests.test_helpers.jit_utils import (
+from tests.jit.test_helpers.jit_utils import (
     gen_decode_attention_modules,
     gen_prefill_attention_modules,
 )
+from tests.quantization.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
+from tests.infra.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
 from functools import partial
 import flashinfer
-from flashinfer.utils import has_flashinfer_jit_cache
+import flashinfer.cudnn.decode as cudnn_decode
+from flashinfer.cudnn.utils import cudnn_frontend_serves_frost_decode
+from flashinfer.cutile.cutile_common import is_cuda_tile_available
+from flashinfer.decode import _DECODE_AUTO_CUDNN_ENV
+from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
+
+
+# H100 CI peak GPU memory: 62.6 GiB.
+pytestmark = pytest.mark.gpu_exclusive
+
+
+def head_dim_512_supported() -> bool:
+    # 16-bit FA2 head_dim > 256 uses the Ampere+ large-head path.
+    return get_compute_capability(torch.device("cuda:0"))[0] >= 8
+
+
+def skip_if_head_dim_unsupported(head_dim: int):
+    if head_dim > 256 and not head_dim_512_supported():
+        pytest.skip("16-bit FA2 head_dim > 256 is only supported on SM80 or newer")
+
+
+def skip_if_nvfp4_large_head_decode_unsupported(head_dim: int):
+    if head_dim > 256 and get_compute_capability(torch.device("cuda:0"))[0] < 10:
+        pytest.skip(
+            "head_dim > 256 with NVFP4 KV decode is only validated on SM100 or newer"
+        )
 
 
 @pytest.fixture(
@@ -59,20 +91,9 @@ def warmup_jit():
     yield
 
 
-@pytest.mark.parametrize("batch_size", [12, 17, 128])
-@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048, 16384])
-@pytest.mark.parametrize("page_size", [1, 8, 16])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("kv_layout", ["NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
-@pytest.mark.parametrize("logits_soft_cap", [0.0])
-@pytest.mark.parametrize("return_lse", [True])
-@pytest.mark.parametrize("q_dtype", [torch.float16])
-@pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("contiguous_kv", [True])
-def test_batch_decode_with_paged_kv_cache(
+# Shared with test_batch_decode_cutile.py so both backends use the same oracle.
+def _run_batch_decode_with_paged_kv_cache_case(
+    backend,
     batch_size,
     kv_len,
     page_size,
@@ -87,6 +108,23 @@ def test_batch_decode_with_paged_kv_cache(
     kv_dtype,
     contiguous_kv,
 ):
+    """Run one paged-decode backend case against the single-decode reference."""
+    # cuTile decode backend capability bounds (mirror the NotImplemented guards
+    # in BatchDecodeWithPagedKVCacheWrapper.run for backend=="cutile").
+    if backend == "cutile":
+        if not is_cuda_tile_available():
+            pytest.skip("cuda-tile / tileiras compiler not available")
+        if kv_layout != "NHD":
+            pytest.skip("cuTile decode requires kv_layout='NHD'.")
+        if pos_encoding_mode != "NONE":
+            pytest.skip(
+                "cuTile decode does not apply RoPE (pos_encoding_mode must be NONE)."
+            )
+        if kv_dtype == torch.float8_e4m3fn:
+            pytest.skip("cuTile decode fp8 KV not covered yet.")
+        if head_dim > 256:
+            pytest.skip("cuTile decode head_dim>256 not covered yet.")
+    skip_if_head_dim_unsupported(head_dim)
     q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=q_dtype)
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
@@ -123,7 +161,7 @@ def test_batch_decode_with_paged_kv_cache(
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout
+        workspace_buffer, kv_layout, backend=backend
     )
     wrapper.plan(
         kv_indptr,
@@ -138,7 +176,10 @@ def test_batch_decode_with_paged_kv_cache(
         data_type=kv_dtype,
         q_data_type=q_dtype,
     )
-    if return_lse:
+    # cuTile decode backend does not support return_lse; the reference
+    # comparison below only checks `o`, so drop the LSE request for it.
+    want_lse = return_lse and backend != "cutile"
+    if want_lse:
         o, _ = wrapper.run(q, kv_data, return_lse=True)
     else:
         o = wrapper.run(q, kv_data)
@@ -190,6 +231,58 @@ def test_batch_decode_with_paged_kv_cache(
     o_buffer = torch.empty_like(o)
     wrapper.run(q, kv_data, out=o_buffer)
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("head_dim", [128, 256, 512])
+@pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
+@parametrize_product(
+    {
+        "batch_size": [12, 17, 128],
+        "kv_len": [54, 97, 512, 2048, 16384],
+        "page_size": [1, 8, 16],
+        "num_kv_heads": [4],
+        "num_qo_heads": [4, 32],
+        "kv_layout": ["NHD"],
+        "pos_encoding_mode": ["NONE", "ROPE_LLAMA"],
+        "logits_soft_cap": [0.0],
+        "return_lse": [True],
+        "q_dtype": [torch.float16],
+        "contiguous_kv": [True],
+    },
+    regular=pairwise_product_cases,
+)
+def test_batch_decode_with_paged_kv_cache(
+    batch_size,
+    kv_len,
+    page_size,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    kv_layout,
+    pos_encoding_mode,
+    logits_soft_cap,
+    return_lse,
+    q_dtype,
+    kv_dtype,
+    contiguous_kv,
+):
+    """Paged FA2 decode must match the single-decode reference."""
+    _run_batch_decode_with_paged_kv_cache_case(
+        "fa2",
+        batch_size,
+        kv_len,
+        page_size,
+        num_kv_heads,
+        num_qo_heads,
+        head_dim,
+        kv_layout,
+        pos_encoding_mode,
+        logits_soft_cap,
+        return_lse,
+        q_dtype,
+        kv_dtype,
+        contiguous_kv,
+    )
 
 
 global_override_indptr_cpu = None
@@ -680,6 +773,266 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
         torch.testing.assert_close(o[i], o_ref_i, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("batch_size", [12, 17, 128])
+@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048])
+@pytest.mark.parametrize("page_size", [1, 8, 16])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+def test_batch_decode_with_paged_kv_cache_nvfp4(
+    batch_size,
+    kv_len,
+    page_size,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    q_dtype,
+):
+    """Test BatchDecodeWithPagedKVCacheWrapper with NVFP4 KV cache.
+
+    KV cache layout (NHD):
+      kv_cache:    [num_pages, 2, page_size, num_kv_heads, head_dim//2]   uint8 (packed FP4x2)
+      kv_cache_sf: [num_pages, 2, page_size, num_kv_heads, head_dim//16]  uint8 (FP8 SFs)
+
+    Reference is computed by dequantizing the packed KV back to q_dtype and running
+    single_decode_with_kv_cache per batch item.
+    """
+    kv_layout = "NHD"
+    torch.manual_seed(42)
+
+    # --- query: one token per request ---
+    q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=q_dtype)
+
+    # --- paged KV metadata ---
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
+    kv_last_page_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
+
+    # --- create NVFP4 KV pages directly (NHD: [num_pages, page_size, num_kv_heads, head_dim//2]) ---
+    kv_shape = (total_num_pages, page_size, num_kv_heads, head_dim // 2)
+    k_packed, k_sf, k_global_scale = create_nvfp4_kv(kv_shape, "cuda:0")
+    v_packed, v_sf, v_global_scale = create_nvfp4_kv(kv_shape, "cuda:0")
+
+    # Dequantize for reference attention
+    k_dq = nvfp4_to_float(k_packed, k_sf, k_global_scale).to(q_dtype)
+    v_dq = nvfp4_to_float(v_packed, v_sf, v_global_scale).to(q_dtype)
+
+    # Pack into combined tensors:
+    #   kv_cache:    [num_pages, 2, page_size, num_kv_heads, head_dim//2]
+    #   kv_cache_sf: [num_pages, 2, page_size, num_kv_heads, head_dim//16]
+    kv_cache = torch.stack([k_packed, v_packed], dim=1)  # [P, 2, S, H, D//2]
+    kv_cache_sf = torch.stack([k_sf, v_sf], dim=1)  # [P, 2, S, H, D//16]
+
+    # --- run BatchDecodeWithPagedKVCacheWrapper ---
+    # NVFP4 KV is only supported via the tensor-cores path (FA2 prefill kernel),
+    # not the legacy FA2 decode kernel.
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+
+    # This actually initialize the smem buffers to 0x7F (NaN as FP8), to trigger the SF addressing issue.
+    workspace_buffer.fill_(0x7F)
+
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout, use_tensor_cores=True
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode="NONE",
+        logits_soft_cap=0.0,
+        kv_data_type=torch.uint8,
+        q_data_type=q_dtype,
+    )
+    o = wrapper.run(
+        q,
+        kv_cache,
+        k_scale=k_global_scale.item(),
+        v_scale=v_global_scale.item(),
+        kv_cache_sf=kv_cache_sf,
+    )
+
+    # --- reference: single_decode_with_kv_cache per batch item using dequantized KV ---
+    kv_indptr_cpu = kv_indptr.cpu()
+    kv_last_page_len_cpu = kv_last_page_len.cpu()
+    for i in range(batch_size):
+        qi = q[i]
+
+        # Gather full (non-padded) KV for sequence i from pages
+        full_pages_k = k_dq[
+            kv_indptr_cpu[i] : kv_indptr_cpu[i + 1] - 1
+        ]  # [p-1, S, H, D]
+        last_page_k = k_dq[
+            kv_indptr_cpu[i + 1] - 1, : kv_last_page_len_cpu[i]
+        ]  # [l, H, D]
+        ki = torch.cat(
+            [
+                full_pages_k.reshape(-1, num_kv_heads, head_dim),
+                last_page_k.reshape(-1, num_kv_heads, head_dim),
+            ],
+            dim=0,
+        )
+
+        full_pages_v = v_dq[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1] - 1]
+        last_page_v = v_dq[kv_indptr_cpu[i + 1] - 1, : kv_last_page_len_cpu[i]]
+        vi = torch.cat(
+            [
+                full_pages_v.reshape(-1, num_kv_heads, head_dim),
+                last_page_v.reshape(-1, num_kv_heads, head_dim),
+            ],
+            dim=0,
+        )
+
+        o_ref_i = flashinfer.decode.single_decode_with_kv_cache(
+            qi, ki, vi, pos_encoding_mode="NONE", logits_soft_cap=0.0
+        )
+
+        # NVFP4 is 4-bit; use relaxed tolerance
+        torch.testing.assert_close(o[i], o_ref_i, rtol=1e-1, atol=1e-1)
+
+
+def test_batch_decode_with_paged_kv_cache_nvfp4_large_head():
+    skip_if_nvfp4_large_head_decode_unsupported(512)
+    test_batch_decode_with_paged_kv_cache_nvfp4(
+        batch_size=4,
+        kv_len=128,
+        page_size=16,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=512,
+        q_dtype=torch.float16,
+    )
+
+
+def test_batch_decode_rejects_unequal_kv_strides_nvfp4_contract():
+    """The FA2 CUDA-core decode kernel addresses both K and V through a single
+    set of (K) strides, so ``BatchDecodeWithPagedKVCacheRun`` must reject K/V
+    pools whose stride families differ instead of silently misaddressing V.
+    This is the "reject explicitly" half of the NVFP4 unequal-stride contract:
+    every entry point that cannot consume independently-strided K/V pools (the
+    layout NVFP4/asymmetric caches produce) must fail loudly.
+
+    NVFP4 packed (uint8) KV itself cannot reach this guard — its half-width
+    packed head dim trips the equal-head-dim ICHECK first, and NVFP4 decode
+    routes through the tensor-core prefill path — so the unequal-stride
+    construction uses fp16: two separately allocated pools whose padding
+    differs, giving identical shapes but different stride families.
+
+    A positive control with identically padded (equal-stride, non-contiguous)
+    pools must run and match the reference, proving the negative case fails
+    because of the stride inequality and not the padded allocation.
+    """
+    torch.manual_seed(42)
+    batch_size = 4
+    kv_len = 54
+    page_size = 8
+    num_kv_heads = 4
+    num_qo_heads = 4
+    head_dim = 128
+    dtype = torch.float16
+
+    q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=dtype)
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
+    kv_last_page_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
+
+    def padded_pool(num_padding_heads):
+        parent = torch.randn(
+            total_num_pages,
+            page_size,
+            num_kv_heads + num_padding_heads,
+            head_dim,
+            device="cuda:0",
+            dtype=dtype,
+        )
+        return parent[:, :, :num_kv_heads, :]
+
+    # Positive control: separately allocated K/V pools with IDENTICAL padding.
+    k_equal = padded_pool(1)
+    v_equal = padded_pool(1)
+    assert not k_equal.is_contiguous()
+    assert k_equal.stride() == v_equal.stride()
+
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD"
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode="NONE",
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    # The guard under test lives in the CUDA-core decode entry point
+    # (csrc/batch_decode.cu), not the tensor-core prefill path.
+    assert not wrapper.use_tensor_cores
+    o = wrapper.run(q, (k_equal, v_equal))
+
+    kv_indptr_cpu = kv_indptr.cpu()
+    kv_last_page_len_cpu = kv_last_page_len.cpu()
+    for i in range(batch_size):
+        ki = torch.cat(
+            [
+                k_equal[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1] - 1].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+                k_equal[kv_indptr_cpu[i + 1] - 1, : kv_last_page_len_cpu[i]].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+            ],
+            dim=0,
+        )
+        vi = torch.cat(
+            [
+                v_equal[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1] - 1].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+                v_equal[kv_indptr_cpu[i + 1] - 1, : kv_last_page_len_cpu[i]].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+            ],
+            dim=0,
+        )
+        o_ref_i = flashinfer.decode.single_decode_with_kv_cache(
+            q[i], ki, vi, pos_encoding_mode="NONE", logits_soft_cap=0.0
+        )
+        torch.testing.assert_close(o[i], o_ref_i, rtol=1e-3, atol=1e-3)
+
+    # Negative case: V pool with different padding — identical shape, unequal
+    # stride family. The kernel would otherwise walk V through K's strides;
+    # the ICHECK must reject the call loudly and name the stride limitation.
+    v_unequal = padded_pool(2)
+    v_unequal.copy_(v_equal)
+    assert v_unequal.shape == k_equal.shape
+    assert v_unequal.stride() != k_equal.stride()
+    with pytest.raises(Exception, match="must have identical strides"):
+        wrapper.run(q, (k_equal, v_unequal))
+
+
 if __name__ == "__main__":
     test_batch_decode_with_paged_kv_cache(
         256,
@@ -765,3 +1118,544 @@ if __name__ == "__main__":
     test_cuda_graph_batch_decode_with_paged_kv_cache(
         12, 54, 8, 8, 8, 128, "HND", "NONE", torch.float16, torch.float8_e5m2, True
     )
+    test_batch_decode_with_paged_kv_cache_nvfp4(4, 128, 64, 1, 1, 128, torch.float16)
+
+
+def test_single_decode_torch_compile_cuda_graph():
+    """Issue #541: single_decode_with_kv_cache with torch.compile(mode='reduce-overhead')
+    should not raise RuntimeError about unaccounted cudagraph pool pointers.
+
+    Runs as a subprocess because torch.library registration must happen at module
+    level for torch.compile compatibility -- registering inside a pytest function
+    causes dynamo tracing errors.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent("""\
+        import torch
+        from flashinfer import single_decode_with_kv_cache
+
+        torch.library.define(
+            "test541d::op", "(Tensor q, Tensor k, Tensor v) -> Tensor")
+
+        @torch.library.impl("test541d::op", "cuda")
+        def _impl(q, k, v):
+            return single_decode_with_kv_cache(q, k, v)
+
+        @torch.library.register_fake("test541d::op")
+        def _fake(q, k, v):
+            return torch.empty_like(q)
+
+        compiled_fn = torch.compile(
+            lambda q, k, v: torch.ops.test541d.op(q, k, v),
+            mode="reduce-overhead", fullgraph=True)
+
+        KV_LEN, QH, KH, D = 256, 8, 8, 128
+        for i in range(3):
+            q = torch.randn(QH, D, device="cuda", dtype=torch.float16)
+            k = torch.randn(KV_LEN, KH, D, device="cuda", dtype=torch.float16)
+            v = torch.randn(KV_LEN, KH, D, device="cuda", dtype=torch.float16)
+            o = compiled_fn(q, k, v)
+            assert o.shape == (QH, D)
+        torch.cuda.synchronize()
+        print("PASS")
+    """)
+    import gc
+    import os
+
+    # torch.compile's inductor calls getpass.getuser() for cache dir, which fails
+    # in CI containers where the uid has no /etc/passwd entry. Setting USER avoids this.
+    env = os.environ.copy()
+    env.setdefault("USER", "ci")
+
+    # Preflight in-process so a module missing from the jit-cache skips via
+    # conftest's MissingJITCacheError handler instead of failing in the
+    # subprocess; also keeps JIT compilation out of the subprocess timeout.
+    KV_LEN, QH, KH, D = 256, 8, 8, 128
+    flashinfer.single_decode_with_kv_cache(
+        torch.randn(QH, D, device="cuda", dtype=torch.float16),
+        torch.randn(KV_LEN, KH, D, device="cuda", dtype=torch.float16),
+        torch.randn(KV_LEN, KH, D, device="cuda", dtype=torch.float16),
+    )
+
+    # The parent pytest process has already run thousands of decode cases in this
+    # file. Release its cached blocks before the subprocess initializes
+    # torch.compile/cudagraph state on memory-constrained A10G runners.
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=env,
+    )
+    assert result.returncode == 0 and "PASS" in result.stdout, (
+        f"Test failed:\nstdout: {result.stdout[-500:]}\nstderr: {result.stderr[-500:]}"
+    )
+
+
+@pytest.mark.parametrize("batch_size", [4, 8, 64])
+@pytest.mark.parametrize("q_len_per_req", [1, 2, 3])
+@pytest.mark.parametrize("num_kv_heads", [2, 8])
+@pytest.mark.parametrize("gqa_group_size", [4, 8])
+def test_cuda_graph_uniform_multi_token_decode_with_paged_kv_cache(
+    batch_size,
+    q_len_per_req,
+    num_kv_heads,
+    gqa_group_size,
+):
+    # Spec-decode verify shape: every request carries q_len_per_req tokens.
+    # The tensor-core decode path must produce prefill-wrapper-identical
+    # results eagerly, and stay correct when the plan is refreshed with
+    # different kv lengths between CUDA graph replays.
+    page_size = 16
+    head_dim = 128
+    dtype = torch.bfloat16
+    num_qo_heads = num_kv_heads * gqa_group_size
+    capture_kv_lens = [129] * batch_size
+    # tightest legal kv under the plan contract kv_len >= q_len_per_req
+    replay_kv_lens_sets = [
+        [[33, 17, 65, 129][i % 4] for i in range(batch_size)],
+        [[q_len_per_req, 128, 64, 100][i % 4] for i in range(batch_size)],
+    ]
+
+    def build_kv_layout(kv_lens):
+        pages_per = [(length + page_size - 1) // page_size for length in kv_lens]
+        indptr = torch.tensor(
+            [0] + list(torch.cumsum(torch.tensor(pages_per), 0)),
+            dtype=torch.int32,
+            device="cuda:0",
+        )
+        indices = torch.arange(int(indptr[-1]), dtype=torch.int32, device="cuda:0")
+        last_len = torch.tensor(
+            [(length - 1) % page_size + 1 for length in kv_lens],
+            dtype=torch.int32,
+            device="cuda:0",
+        )
+        return indptr, indices, last_len
+
+    indptr, indices, last_len = build_kv_layout(capture_kv_lens)
+    total_pages = int(indptr[-1])
+    kv_data = torch.randn(
+        total_pages, 2, page_size, num_kv_heads, head_dim, dtype=dtype, device="cuda:0"
+    )
+    q = torch.randn(
+        batch_size * q_len_per_req, num_qo_heads, head_dim, dtype=dtype, device="cuda:0"
+    )
+
+    def reference(ref_indptr, ref_indices, ref_last_len):
+        ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+        prefill = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD")
+        qo_indptr = (
+            torch.arange(0, batch_size + 1, dtype=torch.int32, device="cuda:0")
+            * q_len_per_req
+        )
+        prefill.plan(
+            qo_indptr,
+            ref_indptr,
+            ref_indices,
+            ref_last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=True,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+        )
+        return prefill.run(q, kv_data)
+
+    workspace_buffer = torch.empty(
+        128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0"
+    )
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer,
+        "NHD",
+        use_cuda_graph=True,
+        use_tensor_cores=True,
+        paged_kv_indptr_buffer=torch.empty(
+            batch_size + 1, dtype=torch.int32, device="cuda:0"
+        ),
+        paged_kv_indices_buffer=torch.empty(
+            total_pages, dtype=torch.int32, device="cuda:0"
+        ),
+        paged_kv_last_page_len_buffer=torch.empty(
+            batch_size, dtype=torch.int32, device="cuda:0"
+        ),
+    )
+
+    def plan(plan_indptr, plan_indices, plan_last_len):
+        wrapper.plan(
+            plan_indptr,
+            plan_indices,
+            plan_last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            q_len_per_req=q_len_per_req,
+        )
+
+    plan(indptr, indices, last_len)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            o = wrapper.run(q, kv_data)
+    torch.cuda.current_stream().wait_stream(s)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        o = wrapper.run(q, kv_data, out=o)
+
+    g.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        o, reference(indptr, indices, last_len), rtol=1e-2, atol=1e-2
+    )
+
+    for kv_lens in replay_kv_lens_sets:
+        new_indptr, new_indices, new_last_len = build_kv_layout(kv_lens)
+        plan(new_indptr, new_indices, new_last_len)
+        torch.cuda.synchronize()
+        g.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            o, reference(new_indptr, new_indices, new_last_len), rtol=1e-2, atol=1e-2
+        )
+
+
+@pytest.mark.parametrize("group_size", [1, 2, 4, 8])
+def test_tensor_core_decode_fp8_query(group_size):
+    if get_compute_capability(torch.device("cuda:0")) != (12, 0):
+        pytest.skip("The e4m3-query tensor-core decode runs on SM120 only.")
+    batch_size, kv_len, page_size, num_kv_heads, head_dim = 7, 300, 16, 8, 256
+    num_qo_heads, q_scale = num_kv_heads * group_size, 0.5
+    pages = (kv_len + page_size - 1) // page_size
+    indptr = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda:0") * pages
+    indices = torch.arange(batch_size * pages, dtype=torch.int32, device="cuda:0")
+    last_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
+    kv = torch.randn(
+        batch_size * pages, 2, page_size, num_kv_heads, head_dim, device="cuda:0"
+    )
+    kv = kv.to(torch.float8_e4m3fn)
+    q8 = (
+        torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0") / q_scale
+    ).to(torch.float8_e4m3fn)
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    outs = []
+    # The bf16 query holds the same values (q_scale is a power of two).
+    for q, scale in ((q8.to(torch.bfloat16) * q_scale, None), (q8, q_scale)):
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            ws, "NHD", use_tensor_cores=True
+        )
+        wrapper.plan(
+            indptr,
+            indices,
+            last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=q.dtype,
+            kv_data_type=kv.dtype,
+            o_data_type=torch.bfloat16,
+        )
+        outs.append(wrapper.run(q, kv, q_scale=scale))
+    torch.testing.assert_close(outs[1], outs[0], rtol=1e-2, atol=3e-2)
+
+
+def test_tensor_core_decode_rejects_mismatched_q_len(monkeypatch):
+    batch_size = 4
+    page_size = 16
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+    dtype = torch.bfloat16
+    indptr = torch.arange(0, batch_size + 1, dtype=torch.int32, device="cuda:0")
+    indices = torch.arange(batch_size, dtype=torch.int32, device="cuda:0")
+    last_len = torch.full((batch_size,), page_size, dtype=torch.int32, device="cuda:0")
+    kv_data = torch.randn(
+        batch_size, 2, page_size, num_kv_heads, head_dim, dtype=dtype, device="cuda:0"
+    )
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, "NHD", use_tensor_cores=True
+    )
+    wrapper.plan(
+        indptr,
+        indices,
+        last_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        q_len_per_req=2,
+    )
+    q = torch.randn(
+        batch_size * 3, num_qo_heads, head_dim, dtype=dtype, device="cuda:0"
+    )
+    with pytest.raises(ValueError, match="q_len_per_req"):
+        wrapper.run(q, kv_data)
+
+    def plan_cuda_core_multi_token(**wrapper_kwargs):
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            ws, "NHD", use_tensor_cores=False, **wrapper_kwargs
+        )
+        wrapper.plan(
+            indptr,
+            indices,
+            last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            q_len_per_req=2,
+        )
+        return wrapper
+
+    with pytest.raises(ValueError, match="use_tensor_cores"):
+        plan_cuda_core_multi_token(backend="fa2")
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "0")
+    with pytest.raises(ValueError, match="use_tensor_cores"):
+        plan_cuda_core_multi_token()
+    monkeypatch.delenv(_DECODE_AUTO_CUDNN_ENV)
+    # backend="auto" hands multi-token CUDA-core decode to cuDNN where it can (#5508).
+    cc = get_compute_capability(torch.device("cuda:0"))
+    if cudnn_decode.CUDNN_AVAILABLE and cudnn_frontend_serves_frost_decode(cc):
+        assert plan_cuda_core_multi_token().resolved_backend == "cudnn"
+    else:
+        with pytest.raises(ValueError, match="use_tensor_cores"):
+            plan_cuda_core_multi_token()
+
+    fa3_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, "NHD", use_tensor_cores=True, backend="fa3"
+    )
+    with pytest.raises(NotImplementedError, match="fa2"):
+        fa3_wrapper.plan(
+            indptr,
+            indices,
+            last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            q_len_per_req=2,
+        )
+
+    short_kv_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, "NHD", use_tensor_cores=True
+    )
+    short_last_len = torch.ones(batch_size, dtype=torch.int32, device="cuda:0")
+    with pytest.raises(ValueError, match="empty KV range"):
+        short_kv_wrapper.plan(
+            indptr,
+            indices,
+            short_last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            q_len_per_req=2,
+        )
+
+    graph_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws,
+        "NHD",
+        use_cuda_graph=True,
+        use_tensor_cores=True,
+        paged_kv_indptr_buffer=torch.empty(
+            batch_size + 1, dtype=torch.int32, device="cuda:0"
+        ),
+        paged_kv_indices_buffer=torch.empty(
+            batch_size, dtype=torch.int32, device="cuda:0"
+        ),
+        paged_kv_last_page_len_buffer=torch.empty(
+            batch_size, dtype=torch.int32, device="cuda:0"
+        ),
+    )
+
+    def plan_graph(q_len):
+        graph_wrapper.plan(
+            indptr,
+            indices,
+            last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            q_len_per_req=q_len,
+        )
+
+    plan_graph(2)
+    plan_graph(2)  # same value re-plans fine
+    with pytest.raises(ValueError, match="frozen"):
+        plan_graph(3)
+
+    unplanned = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, "NHD", use_tensor_cores=True
+    )
+    with pytest.raises(ValueError, match="prior plan"):
+        flashinfer.decode.fast_decode_plan(
+            unplanned,
+            indptr,
+            indices,
+            last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            q_len_per_req=2,
+        )
+
+
+# Regression tests for the finite mask sentinel bugs #4267/#4450/#4451/#4452:
+# masked logits are IEEE -inf, so any finite logit must win over masked positions
+# and fully masked rows must yield zero output with LSE = -inf.
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_paged_decode_extreme_negative_logits(dtype):
+    # Deterministic #4450 fixture: classic (non-tensor-core) decode with two
+    # valid keys whose raw scores (-524288) sit far below the historical -5e4
+    # sentinel.
+    num_qo_heads, num_kv_heads, head_dim = 32, 4, 128
+    page_size, num_pages = 1, 17
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    q = torch.full((1, num_qo_heads, head_dim), 64.0, dtype=dtype, device="cuda")
+    k_cache = torch.full(
+        (num_pages, page_size, num_kv_heads, head_dim),
+        -64.0,
+        dtype=dtype,
+        device="cuda",
+    )
+    v_cache = torch.ones_like(k_cache)
+
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, kv_layout="NHD", use_tensor_cores=False
+    )
+    wrapper.plan(
+        indptr=torch.tensor([0, 2], dtype=torch.int32, device="cuda"),
+        indices=torch.tensor([15, 16], dtype=torch.int32, device="cuda"),
+        last_page_len=torch.tensor([1], dtype=torch.int32, device="cuda"),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        pos_encoding_mode="NONE",
+        sm_scale=sm_scale,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    o, lse = wrapper.run(q, (k_cache, v_cache), return_lse=True)
+
+    k_gqa = k_cache[[15, 16], 0].repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+    logits = torch.einsum("hd,khd->hk", q[0].float(), k_gqa.float()) * sm_scale
+    ref_lse = (torch.logsumexp(logits, dim=-1) / math.log(2.0)).unsqueeze(0)
+    assert not o.isnan().any() and not lse.isnan().any()
+    torch.testing.assert_close(o, torch.ones_like(o), rtol=0, atol=0)
+    torch.testing.assert_close(lse, ref_lse, rtol=1e-5, atol=1e-3)
+
+
+def test_tensor_core_decode_cuda_graph_padding_without_split_kv():
+    """Tensor-core decode plans through the batch prefill scheduler. With CUDA
+    graphs on and split-KV disabled (as SGLang's deterministic inference mode
+    does), the kernel is launched over padded_batch_size CTAs while the plan
+    writes indices only for the real ones, so the padding CTAs must be masked
+    off. The pinned int workspace is poisoned before the plan to stand in for a
+    buffer reused from an earlier plan."""
+    batch_size, page_size = 16, 1
+    num_qo_heads, num_kv_heads, head_dim = 32, 8, 128
+    dtype = torch.float16
+    torch.manual_seed(0)
+    kv_lens = torch.randint(64, 2049, (batch_size,)).tolist()
+    indptr = torch.tensor([0] + kv_lens).cumsum(0).int().to(0)
+    indices = torch.arange(sum(kv_lens)).int().to(0)
+    last_page_len = torch.ones(batch_size, dtype=torch.int32, device="cuda:0")
+    q = torch.randn(batch_size, num_qo_heads, head_dim, dtype=dtype, device="cuda:0")
+    kv_data = torch.randn(
+        sum(kv_lens),
+        2,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+        device="cuda:0",
+    )
+
+    def workspace():
+        return torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+
+    def plan(wrapper):
+        wrapper.plan(
+            indptr,
+            indices,
+            last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            disable_split_kv=True,
+        )
+
+    ref_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(), "NHD", use_tensor_cores=True
+    )
+    plan(ref_wrapper)
+    o_ref = ref_wrapper.run(q, kv_data)
+
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(),
+        "NHD",
+        use_cuda_graph=True,
+        use_tensor_cores=True,
+        paged_kv_indptr_buffer=indptr.clone(),
+        paged_kv_indices_buffer=indices.clone(),
+        paged_kv_last_page_len_buffer=last_page_len.clone(),
+    )
+    wrapper._pin_memory_int_workspace_buffer.fill_(0x7F)
+    plan(wrapper)
+
+    # Fields are positional, in PrefillPlanInfo::ToVector order (scheduler.cuh).
+    info = wrapper._plan_info
+    padded_batch_size = info[0]
+    block_valid_mask_offset = info[12]
+    enable_cuda_graph, split_kv = info[13], info[14]
+    assert enable_cuda_graph and not split_kv
+    mask = wrapper._int_workspace_buffer[
+        block_valid_mask_offset : block_valid_mask_offset + padded_batch_size
+    ].bool()
+    # The plan without CUDA graphs has no padding: its batch is the real CTA count.
+    num_real = ref_wrapper._plan_info[0]
+    if padded_batch_size == num_real:
+        pytest.skip(
+            f"plan did not pad on this device (padded_batch_size={padded_batch_size})"
+        )
+    # Check the mask itself, so a plan that leaves it unwritten fails instead of skipping.
+    expected_mask = torch.arange(padded_batch_size, device="cuda:0") < num_real
+    torch.testing.assert_close(mask, expected_mask)
+
+    o = wrapper.run(q, kv_data)
+    torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)

@@ -6,13 +6,20 @@ import torch
 
 from flashinfer import autotune, RoutingMethodType
 from flashinfer.autotuner import AutoTuner
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import (
+    get_compute_capability,
+    next_positive_power_of_2,
+    last_positive_power_of_2,
+)
+from flashinfer.fused_moe.utils import make_random_topk_ids
 from .utils import reset_autotuner
 
 TUNE_MAX = 8192
 
 
-def _prepare_bf16_moe_weights(num_experts, intermediate_size, hidden_size, device):
+def _prepare_bf16_moe_weights(
+    num_experts: int, intermediate_size: int, hidden_size: int, device: torch.device
+):
     """Prepare shuffled BF16 weights in BlockMajorK layout."""
     from flashinfer import shuffle_matrix_a
     from flashinfer.fused_moe import convert_to_block_layout
@@ -49,23 +56,23 @@ def _overwrite_cached_tactic_for_op(custom_op: str, new_tactic):
     """Overwrite cached tactics for one op key."""
     tuner = AutoTuner.get()
     updated = 0
-    for key, (runner_id, _tactic, profile) in list(tuner.profiling_cache.items()):
-        if key[0] == custom_op:
-            tuner.profiling_cache[key] = (runner_id, new_tactic, profile)
+    for key, (_tactic, profile) in list(tuner.profiling_cache.items()):
+        if key.custom_op == custom_op:
+            tuner.profiling_cache[key] = (new_tactic, profile)
             updated += 1
     assert updated > 0, f"No autotuner cache entries found for {custom_op}"
 
 
 def _tune_bf16_moe_once(
     *,
-    device,
+    device: torch.device,
     tune_num_tokens: int,
     num_experts: int,
     top_k: int,
     hidden_size: int,
     intermediate_size: int,
-    gemm1_weights,
-    gemm2_weights,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
     tune_max: int,
 ):
     from flashinfer.fused_moe import trtllm_bf16_moe, WeightLayout
@@ -100,14 +107,14 @@ def _tune_bf16_moe_once(
 
 def _run_bf16_moe_infer(
     *,
-    device,
+    device: torch.device,
     infer_num_tokens: int,
     num_experts: int,
     top_k: int,
     hidden_size: int,
     intermediate_size: int,
-    gemm1_weights,
-    gemm2_weights,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
     tune_max: int,
 ):
     from flashinfer.fused_moe import trtllm_bf16_moe, WeightLayout
@@ -145,7 +152,6 @@ def _compute_selected_tile_n_base_element(
     num_tokens: int, top_k: int, num_experts: int
 ) -> int:
     """Compute the base element used by computeSelectedTileN(num_tokens) to filter tile_N candidates."""
-    from flashinfer.fused_moe.utils import next_positive_power_of_2
 
     return min(next_positive_power_of_2(int(num_tokens * top_k / num_experts)), 256)
 
@@ -193,7 +199,6 @@ def test_bf16_moe_all_supported_tile_n_inference_succeed(
     """SM100 BF16 integration: Test that MoE works when given any supported tileN value,
     including values filtered out by computeSelectedTileN for the given inference num tokens.
     """
-    from flashinfer.fused_moe.utils import last_positive_power_of_2
 
     _require_sm100()
     torch.manual_seed(42)
@@ -253,33 +258,31 @@ def test_bf16_moe_all_supported_tile_n_inference_succeed(
         )
 
 
+@pytest.mark.parametrize("routed", [True, False])
 @pytest.mark.parametrize("num_tokens", [1, 16])
 @pytest.mark.parametrize("num_experts", [16])
 @pytest.mark.parametrize("top_k", [4])
-def test_fp4_routed_moe_autotune_no_crash(
+def test_fp4_moe_autotune(
+    routed: bool,
     num_tokens: int,
     num_experts: int,
     top_k: int,
 ):
-    """Regression test: trtllm_fp4_block_scale_routed_moe must not crash during
-    autotuning.  Before the fix, the autotuner received a meta-device placeholder
-    for routing_logits and passed it to the C++ kernel via TVM FFI, which raised
-    'Cannot pack tensors on meta'.
+    """Smoke test: trtllm_fp4_block_scale_moe (routing_logits path) and
+    trtllm_fp4_block_scale_routed_moe (pre-computed topk_ids path) must not crash
+    during autotuning.
     """
     _require_sm100()
     reset_autotuner()
     device = torch.device("cuda:0")
 
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+    from flashinfer.fused_moe import (
+        trtllm_fp4_block_scale_moe,
+        trtllm_fp4_block_scale_routed_moe,
+    )
 
     hidden_size = 3072
     intermediate_size = 3072
-
-    topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), device=device)
-    topk_weights = torch.randn(num_tokens, top_k, dtype=torch.bfloat16, device=device)
-    packed_topk_ids = (topk_ids.to(torch.int32) << 16) | topk_weights.view(
-        torch.int16
-    ).to(torch.int32)
 
     hidden_states = torch.randn(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=device
@@ -314,36 +317,247 @@ def test_fp4_routed_moe_autotune_no_crash(
     )
     output = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
 
+    common_kwargs = dict(
+        routing_bias=None,
+        hidden_states=hidden_states,
+        hidden_states_scale=None,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
+        gemm2_bias=None,
+        output1_scale_scalar=None,
+        output1_scale_gate_scalar=None,
+        output2_scale_scalar=None,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=RoutingMethodType.Renormalize.value,
+        do_finalize=True,
+        output=output,
+        tune_max_num_tokens=1,
+    )
+
     with autotune(tune_mode=True):
-        trtllm_fp4_block_scale_routed_moe(
-            topk_ids=packed_topk_ids,
-            routing_bias=None,
+        if routed:
+            topk_ids = make_random_topk_ids(num_experts, num_tokens, top_k, device)
+            topk_weights = torch.ones(
+                num_tokens, top_k, dtype=torch.bfloat16, device=device
+            )
+            packed_topk_ids = (topk_ids.to(torch.int32) << 16) | topk_weights.view(
+                torch.int16
+            ).to(torch.int32)
+            trtllm_fp4_block_scale_routed_moe(
+                topk_ids=packed_topk_ids,
+                **common_kwargs,
+            )
+        else:
+            routing_logits = torch.rand(
+                num_tokens, num_experts, dtype=torch.bfloat16, device=device
+            )
+            trtllm_fp4_block_scale_moe(
+                routing_logits=routing_logits,
+                **common_kwargs,
+            )
+
+
+@pytest.mark.parametrize("routed", [True, False])
+@pytest.mark.parametrize("num_tokens", [1, 16])
+@pytest.mark.parametrize("num_experts", [16])
+@pytest.mark.parametrize("top_k", [4])
+def test_fp8_moe_autotune(
+    routed: bool,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+):
+    """Smoke test: trtllm_fp8_block_scale_moe (routing_logits path) and
+    trtllm_fp8_block_scale_routed_moe (pre-computed topk_ids path) must not crash
+    during autotuning.
+    """
+    _require_sm100()
+    reset_autotuner()
+    device = torch.device("cuda:0")
+
+    from flashinfer.fused_moe import (
+        trtllm_fp8_block_scale_moe,
+        trtllm_fp8_block_scale_routed_moe,
+    )
+
+    hidden_size = 512
+    intermediate_size = 512
+
+    hidden_states = (
+        torch.randn(num_tokens, hidden_size, device=device)
+        .clamp(-1, 1)
+        .to(torch.float8_e4m3fn)
+    )
+    hidden_states_scale = torch.ones(
+        hidden_size // 128, num_tokens, dtype=torch.float32, device=device
+    )
+    gemm1_weights = (
+        torch.randn(num_experts, 2 * intermediate_size, hidden_size, device=device)
+        .clamp(-1, 1)
+        .to(torch.float8_e4m3fn)
+    )
+    gemm1_weights_scale = torch.ones(
+        num_experts,
+        2 * intermediate_size // 128,
+        hidden_size // 128,
+        dtype=torch.float32,
+        device=device,
+    )
+    gemm2_weights = (
+        torch.randn(num_experts, hidden_size, intermediate_size, device=device)
+        .clamp(-1, 1)
+        .to(torch.float8_e4m3fn)
+    )
+    gemm2_weights_scale = torch.ones(
+        num_experts,
+        hidden_size // 128,
+        intermediate_size // 128,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    common_kwargs = dict(
+        routing_bias=None,
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=RoutingMethodType.Renormalize.value,
+        do_finalize=True,
+        tune_max_num_tokens=1,
+    )
+
+    with autotune(tune_mode=True):
+        if routed:
+            topk_ids = make_random_topk_ids(num_experts, num_tokens, top_k, device)
+            topk_weights = torch.ones(
+                num_tokens, top_k, dtype=torch.bfloat16, device=device
+            )
+            packed_topk_ids = (topk_ids.to(torch.int32) << 16) | topk_weights.view(
+                torch.int16
+            ).to(torch.int32)
+            trtllm_fp8_block_scale_routed_moe(
+                topk_ids=packed_topk_ids,
+                **common_kwargs,
+            )
+        else:
+            routing_logits = torch.rand(
+                num_tokens, num_experts, dtype=torch.bfloat16, device=device
+            )
+            trtllm_fp8_block_scale_moe(
+                routing_logits=routing_logits,
+                **common_kwargs,
+            )
+
+
+@pytest.mark.parametrize("num_fused_shared_experts", [1, 2])
+def test_fp8_block_scale_moe_fused_shared_experts_autotune(num_fused_shared_experts):
+    """Fused shared experts must agree with the autotuner on the fused dimensions.
+
+    Regression guard for the valid-tactic enumeration path: ``get_valid_tactics``
+    must query ``trtllm_get_valid_moe_configs`` with the fused (routed + shared)
+    ``top_k`` / ``local_num_experts`` so the chosen tactic passes
+    ``prepare_moe()``'s ``effectiveTopK`` / ``effectiveLocalExperts`` validation.
+    Shared experts only flow through the DeepSeekV3 routing path. Smoke test:
+    must not crash during autotuning.
+    """
+    _require_sm100()
+    reset_autotuner()
+    device = torch.device("cuda:0")
+
+    from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+
+    num_experts = 256  # routed experts
+    top_k = 8
+    n_group = 8
+    topk_group = 4
+    hidden_size = 1024
+    intermediate_size = 512
+    num_tokens = 8
+    # Weight tensors carry the routed + fused shared experts in the expert dim.
+    total_experts = num_experts + num_fused_shared_experts
+
+    routing_logits = torch.rand(
+        num_tokens, num_experts, dtype=torch.float32, device=device
+    )
+    routing_bias = torch.randn(num_experts, dtype=torch.bfloat16, device=device)
+    hidden_states = (
+        torch.randn(num_tokens, hidden_size, device=device)
+        .clamp(-1, 1)
+        .to(torch.float8_e4m3fn)
+    )
+    hidden_states_scale = torch.ones(
+        hidden_size // 128, num_tokens, dtype=torch.float32, device=device
+    )
+    gemm1_weights = (
+        torch.randn(total_experts, 2 * intermediate_size, hidden_size, device=device)
+        .clamp(-1, 1)
+        .to(torch.float8_e4m3fn)
+    )
+    gemm1_weights_scale = torch.ones(
+        total_experts,
+        2 * intermediate_size // 128,
+        hidden_size // 128,
+        dtype=torch.float32,
+        device=device,
+    )
+    gemm2_weights = (
+        torch.randn(total_experts, hidden_size, intermediate_size, device=device)
+        .clamp(-1, 1)
+        .to(torch.float8_e4m3fn)
+    )
+    gemm2_weights_scale = torch.ones(
+        total_experts,
+        hidden_size // 128,
+        intermediate_size // 128,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    with autotune(tune_mode=True):
+        trtllm_fp8_block_scale_moe(
+            routing_logits=routing_logits,
+            routing_bias=routing_bias,
             hidden_states=hidden_states,
-            hidden_states_scale=None,
+            hidden_states_scale=hidden_states_scale,
             gemm1_weights=gemm1_weights,
             gemm1_weights_scale=gemm1_weights_scale,
-            gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
             gemm2_weights=gemm2_weights,
             gemm2_weights_scale=gemm2_weights_scale,
-            gemm2_bias=None,
-            output1_scale_scalar=None,
-            output1_scale_gate_scalar=None,
-            output2_scale_scalar=None,
             num_experts=num_experts,
             top_k=top_k,
-            n_group=None,
-            topk_group=None,
+            n_group=n_group,
+            topk_group=topk_group,
             intermediate_size=intermediate_size,
             local_expert_offset=0,
             local_num_experts=num_experts,
-            routed_scaling_factor=None,
-            routing_method_type=1,
-            do_finalize=True,
-            output=output,
-            tune_max_num_tokens=1,
+            routed_scaling_factor=2.5,
+            routing_method_type=RoutingMethodType.DeepSeekV3.value,
+            num_fused_shared_experts=num_fused_shared_experts,
+            tune_max_num_tokens=8,
         )
 
 

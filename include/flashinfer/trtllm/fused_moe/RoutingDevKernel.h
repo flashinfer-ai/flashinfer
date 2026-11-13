@@ -38,13 +38,7 @@
                                                                                              \
     cudaLaunchAttribute attributes[2] = {};                                                  \
     attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                   \
-    /* mUsePdl controls in-kernel sync/trigger; mPdlOverlapWithNext controls whether    */   \
-    /* the NEXT kernel in the stream is allowed to start before this one finishes.      */   \
-    /* Both must be true for overlap: mUsePdl ensures PDL is globally enabled,          */   \
-    /* mPdlOverlapWithNext is false for the last routing kernel so the consumer GEMM    */   \
-    /* (which may lack cudaGridDependencySynchronize) can't read stale routing data.    */   \
-    attributes[0].val.programmaticStreamSerializationAllowed =                               \
-        int(data.mUsePdl && data.mPdlOverlapWithNext);                                       \
+    attributes[0].val.programmaticStreamSerializationAllowed = int(data.mUsePdl);            \
     attributes[1].id = cudaLaunchAttributeCooperative;                                       \
     attributes[1].val.cooperative = int(coopLaunch);                                         \
     config.attrs = attributes;                                                               \

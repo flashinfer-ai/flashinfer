@@ -1,0 +1,360 @@
+from __future__ import annotations
+
+import ast
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+
+import pytest
+
+from scripts.test_run_status import local_worker_identity
+
+
+ROOT = Path(__file__).resolve().parents[2]
+HELPER = ROOT / "scripts/test_run_status.py"
+
+
+@pytest.mark.parametrize(
+    "count_name,rank_name",
+    [
+        ("LOCAL_WORLD_SIZE", "LOCAL_RANK"),
+        ("OMPI_COMM_WORLD_LOCAL_SIZE", "OMPI_COMM_WORLD_LOCAL_RANK"),
+        ("MPI_LOCALNRANKS", "MPI_LOCALRANKID"),
+    ],
+)
+def test_worker_identity_supports_ci_mpi_launchers(monkeypatch, count_name, rank_name):
+    for name in [
+        "LOCAL_WORLD_SIZE",
+        "OMPI_COMM_WORLD_LOCAL_SIZE",
+        "MPI_LOCALNRANKS",
+        "PMI_SIZE",
+    ]:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(count_name, "4")
+    for rank in range(4):
+        monkeypatch.setenv(rank_name, str(rank))
+        assert local_worker_identity() == (4, rank)
+
+
+def test_global_pmi_size_does_not_count_other_containers(monkeypatch):
+    for name in ["LOCAL_WORLD_SIZE", "OMPI_COMM_WORLD_LOCAL_SIZE", "MPI_LOCALNRANKS"]:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("PMI_SIZE", "4")
+    monkeypatch.setenv("PMI_RANK", "3")
+    assert local_worker_identity() == (1, 0)
+
+
+def command(directory: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(HELPER), "--directory", str(directory), *args],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+
+def test_worker_missing_before_python_starts_prevents_publication(
+    tmp_path: Path,
+) -> None:
+    command(tmp_path, "begin")
+    receipt = command(tmp_path, "start").stdout.strip()
+    workers = tmp_path / Path(receipt).stem
+    workers.mkdir()
+    (workers / "worker-one.json").write_text(
+        json.dumps(
+            {
+                "complete": True,
+                "exit_code": 1,
+                "infrastructure_errors": [],
+                "worker_count": 2,
+                "worker_rank": 0,
+                "tests_executed": 1,
+            }
+        )
+    )
+    command(tmp_path, "finish", "--receipt", receipt, "--status", "1")
+    command(tmp_path, "complete", "--status", "1")
+    report = json.loads((tmp_path / "script-result.json").read_text())
+    assert report["complete"] is False
+    assert report["infrastructure_errors"]
+
+
+# Cover assertion failures on all three launch routes, then put each additional
+# outcome where it exercises distinct behavior rather than crossing every pair.
+@pytest.mark.parametrize(
+    "route,outcome",
+    [
+        ("torchrun", "passed"),
+        ("mega", "passed"),
+        ("mega", "assertion"),
+        ("mega", "oom"),
+        ("mega", "missing_jit_cache"),
+        ("torchrun", "oom"),
+        ("torchrun", "missing_jit_cache"),
+        ("torchrun", "assertion"),
+        ("torchrun", "internal"),
+        ("torchrun", "crash"),
+        ("torchrun", "skip"),
+        ("mpi", "assertion"),
+        ("multi_node", "passed"),
+        ("multi_node", "assertion"),
+        ("multi_node", "collection"),
+        ("multi_node", "crash"),
+    ],
+)
+def test_communication_wrappers_report_execution_outcomes(
+    tmp_path: Path, route: str, outcome: str
+) -> None:
+    wrapper, test_path = {
+        "mega": (
+            "task_test_multi_gpu_comm_kernels.sh",
+            "tests/moe_ep/test_sm107_auto_multirank.py",
+        ),
+        "torchrun": (
+            "task_test_multi_gpu_comm_kernels.sh",
+            "tests/attention/test_parallel_attention.py",
+        ),
+        "mpi": (
+            "task_test_multi_gpu_comm_kernels.sh",
+            "tests/comm/test_allreduce_unified_api.py",
+        ),
+        "multi_node": (
+            "task_test_multi_node_comm_kernels.sh",
+            "tests/comm/test_mnnvl_memory.py",
+        ),
+    }[route]
+    # Run the production wrappers and shared launcher, replacing only GPU setup
+    # and distributed executables. The fake launchers run real pytest workers
+    # and normalize all worker failures to 1, as torchrun does.
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    for name in [
+        wrapper,
+        "test_utils.sh",
+        "test_path_scope.sh",
+        "test_run_status.sh",
+        "test_run_status.py",
+    ]:
+        shutil.copy(ROOT / "scripts" / name, scripts / name)
+    (scripts / "setup_test_env.sh").write_text(
+        "install_and_verify() { :; }\nsetup_moe_ep_test_env() { :; }\n"
+    )
+    test_file = tmp_path / test_path
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    if outcome == "collection":
+        test_file.write_text("import nonexistent_cache_contract_module\n")
+    elif outcome == "crash":
+        test_file.write_text("import os\ndef test_crash():\n    os._exit(139)\n")
+    elif outcome == "skip":
+        test_file.write_text(
+            'import pytest\n@pytest.mark.skip(reason="unsupported")\ndef test_skip():\n    pass\n'
+        )
+    elif outcome == "passed":
+        test_file.write_text("def test_success():\n    pass\n")
+    elif outcome in ("oom", "missing_jit_cache"):
+        # Load the real exception hook without importing GPU package setup.
+        hook_names = {
+            "is_cuda_oom_error_str",
+            "_release_cuda_oom",
+            "pytest_runtest_call",
+        }
+        hook_source = "\n\n".join(
+            ast.unparse(node)
+            for node in ast.parse((ROOT / "tests/conftest.py").read_text()).body
+            if isinstance(node, ast.FunctionDef) and node.name in hook_names
+        )
+        error_class = next(
+            node
+            for node in ast.parse((ROOT / "flashinfer/jit/core.py").read_text()).body
+            if isinstance(node, ast.ClassDef) and node.name == "MissingJITCacheError"
+        )
+        (tmp_path / "conftest.py").write_text(
+            "from __future__ import annotations\n"
+            "import os, traceback, pytest, torch\n"
+            "_MISSING_JIT_CACHE_MODULES = set()\n"
+            + ast.unparse(error_class)
+            + "\n\n"
+            + hook_source
+        )
+        error = (
+            'torch.cuda.OutOfMemoryError("CUDA out of memory")'
+            if outcome == "oom"
+            else 'MissingJITCacheError("missing test kernel")'
+        )
+        test_file.write_text(
+            "from pathlib import Path\nimport torch\n"
+            "from conftest import MissingJITCacheError\n"
+            "def test_runtime_error():\n"
+            '    Path("runtime-error-reached").touch()\n'
+            f"    raise {error}\n"
+        )
+    else:
+        test_file.write_text("def test_failure():\n    assert False\n")
+    if outcome == "internal":
+        (tmp_path / "conftest.py").write_text(
+            'def pytest_sessionstart(session):\n    raise RuntimeError("internal error")\n'
+        )
+    if route == "mega" or outcome in ("oom", "missing_jit_cache"):
+        (tmp_path / "torch.py").write_text(
+            "from types import SimpleNamespace\n"
+            "class OutOfMemoryError(RuntimeError):\n    pass\n"
+            "version = SimpleNamespace(cuda='13.4')\n"
+            "cuda = SimpleNamespace(is_available=lambda: True, "
+            "get_device_capability=lambda: (10, 7), "
+            "OutOfMemoryError=OutOfMemoryError)\n"
+        )
+    if route == "mega":
+        with test_file.open("a") as stream:
+            stream.write(
+                '\nimport os\nassert os.environ["FAIL_ON_DISTRIBUTED_SKIP"] == "1"\n'
+                'assert os.environ["CUTE_DSL_ARCH"] == "sm_107a"\n'
+            )
+    elif route == "torchrun" and outcome == "passed":
+        with test_file.open("a") as stream:
+            stream.write(
+                '\nimport os\nassert "FAIL_ON_DISTRIBUTED_SKIP" not in os.environ\n'
+            )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for name in ["mpirun", "torchrun"]:
+        executable = fake_bin / name
+        executable.write_text(
+            "#!/bin/sh\n"
+            + ('shift\npython "$@"\n' if name == "torchrun" else 'shift 2\n"$@"\n')
+            + 'status=$?\n[ "$status" -eq 0 ] && exit 0\nexit 1\n'
+        )
+        executable.chmod(0o755)
+    env = dict(os.environ)
+    env.pop("FAIL_ON_DISTRIBUTED_SKIP", None)
+    env.pop("FLASHINFER_STRICT_MOE_EP_TESTS", None)
+    env.update(
+        PATH=f"{fake_bin}:{env['PATH']}",
+        PIP_CONSTRAINT=os.devnull,
+        MAX_JOBS="1",
+        MONITOR_TEST_MEMORY="false",
+        PARALLEL_TESTS="false",
+        JUNIT_DIR=str(tmp_path / "junit"),
+        UNIT_TEST_RUN_STATUS_DIR=str(tmp_path / "status"),
+        TEST_PATH=test_path,
+        PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
+        PYTEST_ADDOPTS="",
+    )
+    result = subprocess.run(
+        ["bash", str(scripts / wrapper)],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    assert result.returncode in (0, 1), result.stdout + result.stderr
+    report = json.loads((tmp_path / "status/script-result.json").read_text())
+    assert report["exit_code"] == result.returncode
+    if outcome in ("passed", "assertion"):
+        assert report["complete"] is True
+        assert report["infrastructure_errors"] == []
+        assert result.returncode == (1 if outcome == "assertion" else 0)
+        assert report["tests_executed"] == 1
+    elif outcome == "skip":
+        assert report["complete"] is True
+        assert report["tests_executed"] == 0
+    elif outcome in ("oom", "missing_jit_cache"):
+        assert (tmp_path / "runtime-error-reached").exists()
+        assert report["complete"] is True
+        assert report["infrastructure_errors"] == []
+        strict = route == "mega"
+        assert result.returncode == int(strict), result.stdout + result.stderr
+        assert report["tests_executed"] == int(strict)
+        [junit] = (tmp_path / "junit").glob("*.xml")
+        [case] = ET.parse(junit).iter("testcase")
+        assert case.find("failure" if strict else "skipped") is not None
+    else:
+        assert report["infrastructure_errors"]
+        assert result.returncode == 1
+        if outcome == "crash":
+            assert report["complete"] is False
+
+
+@pytest.mark.parametrize(
+    "mode,outcome",
+    [("full", "crash"), ("sanity", "crash"), ("full", "timeout")],
+)
+def test_missing_results_fail_without_completion_reporting(
+    tmp_path: Path, mode: str, outcome: str
+) -> None:
+    test_file = tmp_path / "test_worker.py"
+    test_file.write_text(
+        "import os\ndef test_worker():\n    os._exit(139)\n"
+        if outcome == "crash"
+        else "import time\ndef test_worker():\n    time.sleep(30)\n"
+    )
+    env = dict(os.environ)
+    env.pop("UNIT_TEST_RUN_STATUS_DIR", None)
+    env.update(
+        PIP_CONSTRAINT=os.devnull,
+        MAX_JOBS="1",
+        MONITOR_TEST_MEMORY="false",
+        JUNIT_DIR=str(tmp_path / "junit"),
+        SAMPLE_RATE="1",
+        PYTEST_FILE_TIMEOUT_SECONDS="1" if outcome == "timeout" else "10",
+        PYTEST_FILE_TIMEOUT_KILL_AFTER_SECONDS="1",
+        PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
+        PYTEST_ADDOPTS="",
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'set -eo pipefail; source "$1"; '
+            '"run_${3}_test_file" "$2" 1; '
+            'print_execution_summary; exit "$EXIT_CODE"',
+            "test-utils",
+            str(ROOT / "scripts/test_utils.sh"),
+            str(test_file),
+            mode,
+        ],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    assert "NO RESULT:" in result.stdout, result.stdout + result.stderr
+    assert result.returncode == 1, result.stdout + result.stderr
+
+
+def test_setup_failure_leaves_wrapper_report_incomplete(tmp_path: Path) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    for name in [
+        "task_test_multi_node_comm_kernels.sh",
+        "test_utils.sh",
+        "test_path_scope.sh",
+        "test_run_status.sh",
+        "test_run_status.py",
+    ]:
+        shutil.copy(ROOT / "scripts" / name, scripts / name)
+    (scripts / "setup_test_env.sh").write_text("exit 1\n")
+    env = dict(os.environ)
+    env.update(
+        PIP_CONSTRAINT=os.devnull,
+        MAX_JOBS="1",
+        JUNIT_DIR=str(tmp_path / "junit"),
+        UNIT_TEST_RUN_STATUS_DIR=str(tmp_path / "status"),
+        TEST_PATH="",
+    )
+    result = subprocess.run(
+        ["bash", str(scripts / "task_test_multi_node_comm_kernels.sh")],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    report = json.loads((tmp_path / "status/script-result.json").read_text())
+    assert report["complete"] is False

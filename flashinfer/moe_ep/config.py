@@ -1,0 +1,321 @@
+"""Config dataclasses + I/O envelopes for moe_ep.
+
+Frozen dataclasses for `BootstrapConfig` (the inputs each backend needs at
+construction), `FleetParams` (EP sizing; split transport fields
+have defaults mega ignores), `HandleParams`
+(per-iteration topk_ids), and the four envelope types
+:class:`DispatchInputParams` / :class:`DispatchOutput` /
+:class:`CombineInputParams` / :class:`CombineOutput` that the Handle
+interface passes around.
+
+Backend-specific constraints live in
+:mod:`flashinfer.moe_ep.core.validation` and run inside each
+backend's Fleet __init__.
+"""
+
+from __future__ import annotations
+
+import enum
+import warnings
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, Union
+
+if TYPE_CHECKING:
+    import torch
+    import torch.distributed
+
+
+class EpAlgorithm(enum.Enum):
+    LOW_LATENCY = 0
+    HIGH_THROUGHPUT = 1
+
+
+class FinalizeMode(enum.Enum):
+    """How a MegaMoE kernel reduces the per-route GEMM2 rows over top-k.
+
+    * ``AUTO`` — ``CAKE`` if the backend's Cake reducer supports the
+      problem, else ``PERSISTENT`` if ``num_valid_tokens_tensor`` is set, else
+      ``DEFAULT``.
+    * ``DEFAULT`` — non-persistent finalize kernel.
+    * ``PERSISTENT`` — persistent finalize kernel that reads
+      ``num_valid_tokens_tensor``.
+    * ``CAKE`` — frozen Cake top-k reducer.
+    * ``NONE`` — no finalize: ``MoEEpMegaLayer.forward_unfinalized`` returns
+      ``(rows, weights, route_map)`` for caller finalization.
+
+    Each backend accepts the subset it implements.
+
+    The former ``do_finalize`` option remains an alias on configs that exposed
+    it: ``True`` maps to ``AUTO`` and ``False`` to ``NONE``. Reading the alias
+    returns whether finalization is enabled. Use ``finalize_mode`` in new code.
+    """
+
+    AUTO = 0
+    DEFAULT = 1
+    PERSISTENT = 2
+    CAKE = 3
+    NONE = 4
+
+
+def validate_finalize_mode(
+    mode: FinalizeMode,
+    supported: Sequence[FinalizeMode],
+    num_valid_tokens_tensor: Optional["torch.Tensor"] = None,
+) -> None:
+    if not isinstance(mode, FinalizeMode):
+        raise TypeError(f"finalize_mode must be a FinalizeMode, got {mode!r}.")
+    if mode not in supported:
+        names = ", ".join(m.name for m in supported)
+        raise ValueError(
+            f"finalize_mode={mode.name} is unsupported; use one of {names}."
+        )
+    if mode is FinalizeMode.PERSISTENT and num_valid_tokens_tensor is None:
+        raise ValueError(
+            "finalize_mode=PERSISTENT requires num_valid_tokens_tensor: a "
+            "caller-owned CUDA int32 tensor of shape (1,) holding the live "
+            "token count."
+        )
+
+
+def warn_deprecated_config_field(old: str, new: str) -> None:
+    # stacklevel targets the caller of the dataclass __init__.
+    warnings.warn(
+        f"{old} is deprecated and will be removed in a future release; use {new}.",
+        DeprecationWarning,
+        stacklevel=4,
+    )
+
+
+class EpLayout(enum.Enum):
+    """LL receive-buffer layout, mirroring ``nccl.ep.Layout`` for the LL paths.
+
+    * ``EXPERT_MAJOR`` — recv buffer ``[num_local_experts, max_tokens_per_rank *
+      world, hidden]``; each padded row is pre-assigned to one local expert and
+      combine reweights per-token on receive.
+    * ``RANK_MAJOR`` — recv buffer ``[world, max_tokens_per_rank, hidden]``;
+      tokens grouped by source rank (received once each, carrying their
+      ``topk_idx`` / ``topk_weights``). The caller pre-reduces across local
+      experts before combine; combine then just sums across ranks.
+
+    HT always uses the library's ``FLAT`` layout regardless of this field; it is
+    only consulted on the LL path.
+    """
+
+    EXPERT_MAJOR = 1
+    RANK_MAJOR = 2
+
+
+class QuantType(enum.Enum):
+    """Quantization variants surfaced via FleetAlgoKnobQuantization."""
+
+    FP8E4M3 = "fp8e4m3"
+    FP8E5M2 = "fp8e5m2"
+    NVFP8 = "nvfp8"
+    UE8M0 = "ue8m0"
+
+
+@dataclass(frozen=True)
+class BootstrapConfig:
+    """Inputs each backend needs to construct a Fleet.
+
+    Backends consume only the fields they care about (NCCL-EP uses
+    ``nccl_comm`` / ``process_group`` + ``stream``; NIXL-EP uses
+    ``tcp_store``). Carrying all of them here lets a single bootstrap config
+    drive either backend.
+
+    ``world_size`` and ``rank`` describe the EP comm domain. When the host
+    framework uses a non-WORLD process group (e.g. vLLM expert parallel within
+    a PP stage), pass that group via ``process_group``; mega kernels then use
+    it for symmetric-memory setup and collectives instead of WORLD.
+
+    Communicator resolution (NCCL-EP), in priority order:
+
+    * ``nccl_comm`` — an existing ``ncclComm_t`` (as an int). The Fleet
+      *adopts* it (wraps without taking ownership; it is never destroyed or
+      aborted by the Fleet), so a host — e.g. vLLM — can share the exact
+      communicator its process group already owns.
+    * ``process_group`` — a torch ``ProcessGroup`` to mirror. The Fleet
+      creates a *fresh* NCCL communicator over that group's membership (the
+      torch-version-robust pattern), letting the caller target a specific EP
+      subgroup rather than the default ``WORLD`` group.
+    * neither set — mirror the default process group.
+    """
+
+    world_size: int
+    rank: int
+    stream: int = 0  # int representation of a cudaStream_t; 0 = default stream
+    auto_bootstrap: bool = True
+    # CUDA device ordinal to bind for this rank. None = derive from the
+    # LOCAL_RANK env var, falling back to ``rank`` (torchrun convention).
+    # Host frameworks that already bound their worker's device (possibly
+    # under a remapped CUDA_VISIBLE_DEVICES, where the derived ordinal would
+    # point at the wrong or a nonexistent GPU) should pass
+    # ``torch.cuda.current_device()``. Keyword-only so it does not shift the
+    # positional binding of the pre-existing fields below.
+    device: Optional[int] = field(default=None, kw_only=True)
+    nccl_comm: Optional[int] = (
+        None  # int representation of ncclComm_t; None = derive from PG
+    )
+    # Torch process group to mirror when nccl_comm is not supplied. None =
+    # default group. Adopting an existing nccl_comm takes precedence.
+    process_group: Optional["torch.distributed.ProcessGroup"] = field(
+        default=None,
+        compare=False,
+        hash=False,
+    )
+    tcp_store: Optional["torch.distributed.TCPStore"] = None
+
+    def __post_init__(self) -> None:
+        if self.world_size <= 0:
+            raise ValueError(f"world_size must be positive, got {self.world_size}")
+        if not (0 <= self.rank < self.world_size):
+            raise ValueError(f"rank {self.rank} not in [0, {self.world_size})")
+        if self.device is not None and self.device < 0:
+            raise ValueError(f"device must be non-negative, got {self.device}")
+
+
+@dataclass(frozen=True)
+class FleetParams:
+    """EP sizing and split-path transport defaults.
+
+    Canonical expert weights are NOT carried here; pass the
+    :class:`~flashinfer.moe_ep.weights.MoEWeightPack` as the ``weights``
+    argument at layer construction (:func:`~flashinfer.moe_ep.layer.MoEEpLayer`).
+
+    ``num_channels``, ``num_qp_per_rank``, ``rdma_buffer_size`` are exposed as
+    :mod:`flashinfer.moe_ep.algo_knobs` Fleet-level knobs rather than top-level
+    fields. Split-only fields ``dtype_bytes``, ``algorithm``, and ``layout`` are
+    ignored by the mega path.
+
+    ``tuning_live_tokens`` selects an offline workload bucket for backends
+    supporting live-token tuning; it never changes the workspace capacity.
+    """
+
+    num_experts: int
+    max_tokens_per_rank: int
+    token_hidden_size: int
+    dtype_bytes: int = 2  # bf16 default; FP8 path overrides
+    algorithm: EpAlgorithm = EpAlgorithm.LOW_LATENCY
+    layout: EpLayout = EpLayout.EXPERT_MAJOR
+    # Optional offline-tuning workload bucket; capacity remains unchanged.
+    tuning_live_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.tuning_live_tokens is not None and (
+            type(self.tuning_live_tokens) is not int
+            or not 0 <= self.tuning_live_tokens <= self.max_tokens_per_rank
+        ):
+            raise ValueError(
+                "tuning_live_tokens must be an int between zero and capacity"
+            )
+        for name in (
+            "num_experts",
+            "max_tokens_per_rank",
+            "token_hidden_size",
+            "dtype_bytes",
+        ):
+            v = getattr(self, name)
+            if v <= 0:
+                raise ValueError(f"FleetParams.{name} must be positive, got {v}")
+        if (
+            self.layout is EpLayout.RANK_MAJOR
+            and self.algorithm is not EpAlgorithm.LOW_LATENCY
+        ):
+            raise ValueError(
+                "FleetParams.layout=RANK_MAJOR is only valid with "
+                "algorithm=LOW_LATENCY (HT uses the FLAT layout)."
+            )
+
+
+@dataclass(frozen=True)
+class HandleParams:
+    """Per-iteration handle inputs.
+
+    ``topk_ids`` is the routing decision for the iteration; combine reweights
+    by the matching ``topk_weights`` carried as a
+    :class:`HandleAlgoKnobTopKWeights` knob (not a field here, so optional
+    backends can elide it).
+    """
+
+    topk_ids: "torch.Tensor"
+
+
+@dataclass(frozen=True)
+class DispatchInputParams:
+    """Inputs to :meth:`Handle.dispatch`. ``x`` is a list so backends can
+    dispatch multiple tagged tensors in one call (tokens + scales)."""
+
+    x: Sequence["torch.Tensor"]
+
+
+@dataclass(frozen=True)
+class DispatchOutput:
+    """Outputs from :meth:`Handle.dispatch`.
+
+    ``expert_tensors`` is the dispatched token tensor on the local rank.
+    ``num_tokens`` is the actual receive count (= ``max_tokens_per_rank`` in
+    fixed-size LL mode; queried via ``ncclEpHandleGetNumRecvTokens`` otherwise).
+
+    ``recv_topk_idx`` / ``recv_topk_weights`` are the per-received-token routing
+    returned by the LL RANK_MAJOR (and HT) layouts — ``[num_recv_tokens, top_k]``
+    int64 / fp32. They are ``None`` for the LL EXPERT_MAJOR layout (whose rows are
+    pre-assigned to experts by position, so no per-token routing is returned).
+
+    ``expert_counts`` is the per-shard received-token count written by the library
+    during dispatch — ``[num_local_experts]`` int32 for LL EXPERT_MAJOR (per-expert)
+    or ``[world_size]`` int32 for LL RANK_MAJOR (per-source-rank). ``None`` when the
+    layout does not expose it. It is a device tensor; reading it host-side forces a
+    sync, so consumers that don't need it can ignore it at no cost.
+
+    ``recv_total_counter`` is a scalar ``[1]`` int32/int64 device tensor holding the
+    *actual* total received-token count for HT FLAT. It is populated only when the
+    caller opts in via :class:`HandleAlgoKnobNumReceivedTokens` (which binds the
+    counter at handle-create time so the HT metadata step fills it); otherwise
+    ``None``. It lets an HT consumer trim its compute to ``recv_x[:actual_recv]``
+    (the received tokens are front-packed) while the transport buffer stays sized to
+    the static ``max_recv_tokens_per_rank`` budget (nccl-ep v0.1 does not resize the
+    buffer itself). ``None`` → the consumer must fall back to the full static buffer.
+
+    ``expert_scales`` carries the per-block dequantization scales when the
+    transport quantized the tokens in-flight (``FleetAlgoKnobQuantization``
+    with an FP8 type on nixl_ep — the library returns ``(fp8_data, scales)``
+    and both are surfaced). ``None`` when dispatch was not quantized or the
+    backend does not produce scales.
+    """
+
+    expert_tensors: "torch.Tensor"
+    num_tokens: Union[int, Callable[[], int]]
+    recv_topk_idx: Optional["torch.Tensor"] = None
+    recv_topk_weights: Optional["torch.Tensor"] = None
+    expert_counts: Optional["torch.Tensor"] = None
+    recv_total_counter: Optional["torch.Tensor"] = None
+    expert_scales: Optional["torch.Tensor"] = None
+
+    def get_num_tokens(self) -> int:
+        """Resolve ``num_tokens`` to an int, evaluating a deferred thunk if present."""
+        nt = self.num_tokens
+        return nt() if callable(nt) else nt
+
+
+@dataclass(frozen=True)
+class CombineInputParams:
+    """Inputs to :meth:`Handle.combine`. ``out`` is an optional preallocated
+    output buffer; backends MAY fill it in place to avoid an allocation."""
+
+    x: Sequence["torch.Tensor"]
+    out: Optional["torch.Tensor"] = None
+    # Whether ``out`` keeps its address across calls. Only the caller knows: a
+    # graph state reuses one buffer, while the default forward allocates a
+    # fresh one per call. Backends that cache per-address FFI state must not
+    # cache a churning buffer -- doing so pins it, prevents the allocator
+    # reusing that address, and leaks one output per call. Defaults to False so
+    # a caller that says nothing is never cached.
+    out_is_stable: bool = False
+
+
+@dataclass(frozen=True)
+class CombineOutput:
+    """Output of :meth:`Handle.combine`. The same tensor as
+    ``CombineInputParams.out`` when it was provided."""
+
+    x: "torch.Tensor"

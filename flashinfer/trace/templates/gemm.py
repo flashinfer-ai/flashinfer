@@ -1,0 +1,3031 @@
+# Copyright (c) 2025 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""TraceTemplates for GEMM operations."""
+
+import functools
+import math
+from typing import Any, cast
+
+import torch
+
+from ..template import Const, Scalar, Tensor, TraceTemplate, Var
+from ._init_helpers import (
+    fp8_block_quant_1d,
+    fp8_block_quant_2d,
+    per_tensor_fp8_quantize,
+)
+
+
+def _gemm_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=100.0,
+    min_cos_sim=0.99,
+):
+    from flashinfer.trace import default_check
+
+    # Matches tests/gemm/test_mm_bf16.py, test_mm_fp8.py, test_bmm_bf16.py,
+    # and test_bmm_fp8.py, which gate these kernels by cosine similarity.
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
+def _mxfp8_gemm_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=100.0,
+    min_cos_sim=0.98,
+):
+    from flashinfer.trace import default_check
+
+    # Matches tests/gemm/test_mm_mxfp8.py (swizzled scales, quantization-limited accuracy).
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
+def _fp4_gemm_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=100.0,
+    min_cos_sim=0.97,
+):
+    from flashinfer.trace import default_check
+
+    # Matches tests/gemm/test_mm_fp4.py.
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
+def _bmm_mxfp8_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=100.0,
+    min_cos_sim=0.99,
+):
+    from flashinfer.trace import default_check
+
+    # Matches tests/gemm/test_bmm_mxfp8.py.
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
+def _mm_reference(A, B):
+    # B is physically [K, N] (column-major weight), so C = A @ B.
+    return torch.matmul(A, B)
+
+
+def _mm_fp8_reference(A, B):
+    """Dequantize FP8 block-scale inputs and compute C = A @ B.
+
+    B is in TRT-LLM block layout [K//block_size, N, block_size] and is
+    reshaped to [K, N] before the matmul.
+    """
+    K_div_bs, N, block_size = B.shape
+    B_fp32 = B.reshape(K_div_bs * block_size, N).to(torch.float32)
+    A_fp32 = A.to(torch.float32)
+    return torch.matmul(A_fp32, B_fp32).to(torch.bfloat16)
+
+
+def _e8m0_to_float(sf: torch.Tensor) -> torch.Tensor:
+    """Decode uint8 E8M0 scale bytes to float32 (value = 2**(byte - 127))."""
+    return torch.pow(2.0, sf.to(torch.float32) - 127.0)
+
+
+def _unswizzle_batched_sf_128x4(
+    sf: torch.Tensor, batch: int, rows: int, cols: int
+) -> torch.Tensor:
+    """Recover batched linear scale grids from concatenated 128x4 buffers."""
+    padded_rows = (rows + 127) // 128 * 128
+    padded_cols = (cols + 3) // 4 * 4
+    v = sf.reshape(
+        batch,
+        padded_rows // 128,
+        padded_cols // 4,
+        32,
+        4,
+        4,
+    )
+    return v.permute(0, 1, 4, 3, 2, 5).reshape(batch, padded_rows, padded_cols)[
+        :, :rows, :cols
+    ]
+
+
+def _unswizzle_sf_128x4(sf: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    """Recover the linear [rows, cols] grid from a 1D 128x4-swizzled buffer."""
+    return _unswizzle_batched_sf_128x4(sf, 1, rows, cols)[0]
+
+
+def _mm_mxfp8_reference(A, B, a_descale, b_descale):
+    """Dequantize MXFP8 inputs (block size 32) and compute C = A @ B.
+
+    a_descale / b_descale are the 1D 128x4-swizzled E8M0 buffers produced by
+    ``mxfp8_quantize(..., is_sf_swizzled_layout=True)`` for A [M, K] and for
+    the [N, K] weight whose transpose is B [K, N].
+    """
+    M, K = A.shape
+    N = B.shape[1]
+    block_size = 32
+    a_scale = _e8m0_to_float(_unswizzle_sf_128x4(a_descale, M, K // block_size))
+    b_scale = _e8m0_to_float(_unswizzle_sf_128x4(b_descale, N, K // block_size))
+    # Apply per-block scales along the K dimension.
+    A_scaled = A.to(torch.float32) * a_scale.repeat_interleave(block_size, dim=1)
+    B_scaled = B.to(torch.float32) * b_scale.repeat_interleave(block_size, dim=1).T
+    return torch.matmul(A_scaled, B_scaled).to(torch.bfloat16)
+
+
+cast(Any, _mm_mxfp8_reference)._trace_reference_dependencies = (
+    _e8m0_to_float,
+    _unswizzle_batched_sf_128x4,
+    _unswizzle_sf_128x4,
+)
+
+
+def _mm_fp4_reference(A, B, a_descale, b_descale, block_size=16):
+    """Dequantize FP4 inputs and compute C = A @ B."""
+
+    def _unpack_fp4(packed, rows, cols):
+        lo = (packed & 0x0F).to(torch.float32)
+        hi = ((packed >> 4) & 0x0F).to(torch.float32)
+        out = torch.stack([lo, hi], dim=-1).reshape(rows, cols)
+        return out
+
+    M, K_packed = A.shape
+    K = K_packed * 2
+    _, N_packed = B.shape
+    N = N_packed * 2
+
+    A_fp32 = _unpack_fp4(A, M, K)
+    B_fp32 = _unpack_fp4(B, K, N)
+
+    # Apply per-block scales.
+    a_scale = a_descale.to(torch.float32).repeat_interleave(block_size, dim=1)  # [M, K]
+    b_scale = b_descale.to(torch.float32).repeat_interleave(block_size, dim=1)  # [K, N]
+    A_scaled = A_fp32 * a_scale
+    B_scaled = B_fp32 * b_scale
+    return torch.matmul(A_scaled, B_scaled).to(torch.bfloat16)
+
+
+def _mm_bf16_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_bf16``.
+
+    ``B`` is constructed as ``randn(N, K).T`` to get column-major [K, N]
+    matching the example call.
+    """
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    b = torch.randn(N, K, dtype=torch.bfloat16, device=device).T  # [K, N] col-major
+    return {"a": a, "b": b}
+
+
+mm_bf16_trace = TraceTemplate(
+    op_type="gemm_bf16",
+    description="General matrix multiply (GEMM) C = A @ B (B is column-major [K, N]).",
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+    },
+    inputs={
+        "A": Tensor(["M", "K"], param="a"),
+        "B": Tensor(
+            ["K", "N"],
+            param="b",
+            description="Weight matrix in column-major layout (physical shape [K, N]).",
+        ),
+    },
+    outputs={
+        "C": Tensor(["M", "N"], dtype_from="a"),
+    },
+    tags=["status:verified"],
+    reference=_mm_reference,
+    check=_gemm_check,
+    init=_mm_bf16_init,
+)
+
+
+def _mm_fp8_init(
+    *,
+    M: int,
+    N: int = 1536,
+    K: int = 7168,
+    K_div_block_size: int = 0,  # derived
+    block_size: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_fp8`` (TRT-LLM low-latency layout).
+
+    Sourced from ``tests/gemm/test_mm_fp8.py``: ``input`` and ``mat2`` are
+    sampled from ``randn`` (bf16) then per-tensor-quantized to FP8 via
+    ``to_float8`` (mirrored as ``per_tensor_fp8_quantize``). ``alpha`` is
+    the product of the two dequant scales. The kernel consumes ``b`` in
+    a TRT-LLM permuted layout produced by
+    ``flashinfer.prepare_low_latency_gemm_weights``; we call that here
+    so the init's outputs are numerically usable, not just shape-correct.
+    """
+    del K_div_block_size, block_size
+    from flashinfer import prepare_low_latency_gemm_weights  # noqa: PLC0415
+
+    torch.manual_seed(seed)
+    input_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    mat2_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    a, a_inv_s = per_tensor_fp8_quantize(input_bf16)
+    mat2_fp8, mat2_inv_s = per_tensor_fp8_quantize(mat2_bf16)
+    # `_cache_permute_indices` is a fresh dict here — the test caches
+    # cross-call but a one-shot init can rebuild it.
+    _cache_permute_indices: dict = {}
+    b = prepare_low_latency_gemm_weights(mat2_fp8, _cache_permute_indices)
+    alpha = (a_inv_s * mat2_inv_s).reshape(())
+    return {"a": a, "b": b, "alpha": alpha}
+
+
+mm_fp8_trace = TraceTemplate(
+    op_type="gemm_fp8",
+    description=(
+        "FP8 block-scale GEMM C = A @ B (TRT-LLM layout). "
+        "A is [M, K] float8_e4m3fn; B is [K//block_size, N, block_size] float8_e4m3fn."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+    },
+    inputs={
+        "A": Tensor(["M", "K"], param="a"),
+        "B": Tensor(
+            ["K_div_block_size", "N", "block_size"],
+            param="b",
+            description="FP8 weight in TRT-LLM block layout [K//block_size, N, block_size].",
+        ),
+    },
+    outputs={
+        "C": Tensor(["M", "N"], dtype="bfloat16"),
+    },
+    tags=["status:verified", "quantization:float8_e4m3fn"],
+    reference=_mm_fp8_reference,
+    check=_gemm_check,
+    init=_mm_fp8_init,
+)
+
+# ── MXFP8 GEMM ───────────────────────────────────────────────────────────────
+
+
+def _mm_mxfp8_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    A_scale_size: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_mxfp8``. Block size = 32.
+
+    Sourced from ``tests/gemm/test_mm_mxfp8_sm120.py``: ``a`` and ``b``
+    are ``randn`` bf16 passed through ``flashinfer.mxfp8_quantize`` (or
+    the test's ``_prepare_mxfp8`` helper which is equivalent for
+    swizzled layout). The trace declares ``b`` as ``[K, N]`` and the
+    descales as uint8 block scales.
+    """
+    del A_scale_size
+    from flashinfer import mxfp8_quantize  # noqa: PLC0415
+
+    torch.manual_seed(seed)
+    a_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    b_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    a, a_descale = mxfp8_quantize(a_bf16)
+    b_fp8, b_descale = mxfp8_quantize(b_bf16)
+    # b must stay the transposed [K, N] view: CUTLASS needs the [N, K] storage contiguous.
+    b = b_fp8.T
+    return {"a": a, "b": b, "a_descale": a_descale, "b_descale": b_descale}
+
+
+mm_mxfp8_trace = TraceTemplate(
+    op_type="gemm_mxfp8",
+    description=(
+        "MXFP8 GEMM C = A @ B (MX block size 32). "
+        "A and B are float8_e4m3fn; scale tensors use block size 32."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+        "A_scale_size": Var(description="Padded 128x4 scale-buffer length for A."),
+        "B_scale_size": Const(
+            abbrev="",
+            description="Padded 128x4 scale-buffer length for B.",
+        ),
+    },
+    inputs={
+        "A": Tensor(
+            ["M", "K"],
+            param="a",
+            description="Input A tensor, float8_e4m3fn.",
+        ),
+        "B": Tensor(
+            ["K", "N"],
+            param="b",
+            description="Input B tensor, float8_e4m3fn, column-major.",
+        ),
+        "a_descale": Tensor(
+            ["A_scale_size"],
+            description="Physical 1D 128x4-swizzled E8M0 scale buffer for A.",
+        ),
+        "b_descale": Tensor(
+            ["B_scale_size"],
+            description=("Physical 1D 128x4-swizzled E8M0 scale buffer for B."),
+        ),
+    },
+    outputs={
+        "C": Tensor(["M", "N"], dtype="bfloat16"),
+    },
+    tags=["status:verified", "quantization:mxfp8"],
+    reference=_mm_mxfp8_reference,
+    check=_mxfp8_gemm_check,
+    init=_mm_mxfp8_init,
+)
+
+# ── FP4 GEMM ─────────────────────────────────────────────────────────────────
+
+
+def _mm_fp4_init(
+    *,
+    M: int,
+    N: int = 2048,
+    K: int = 7168,
+    block_size: int = 16,
+    K_div_block_size: int = 0,  # derived
+    N_div_block_size: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_fp4``. NvFP4 uses block_size=16.
+
+    Sourced from ``tests/gemm/test_mm_fp4.py::_test_mm_fp4`` (nvfp4
+    branch): ``input`` and ``mat2`` are ``randn`` bf16, quantized via
+    ``flashinfer.nvfp4_quantize`` with ``global_sf = (448 * 6) / amax``.
+    Requires SM100+ at runtime; CPU smoke tests skip.
+    """
+    del K_div_block_size, N_div_block_size
+    from flashinfer import nvfp4_quantize  # noqa: PLC0415
+    from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
+
+    torch.manual_seed(seed)
+    input_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    mat2_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    global_sf_input = (
+        torch.tensor([448.0 * 6.0], device=device)
+        / input_bf16.float().abs().nan_to_num().max()
+    )
+    global_sf_mat2 = (
+        torch.tensor([448.0 * 6.0], device=device)
+        / mat2_bf16.float().abs().nan_to_num().max()
+    )
+    a, a_descale = nvfp4_quantize(
+        input_bf16, global_sf_input, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+    )
+    mat2_fp4, mat2_descale = nvfp4_quantize(
+        mat2_bf16, global_sf_mat2, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+    )
+    return {
+        "a": a,
+        "b": mat2_fp4.T.contiguous(),
+        "a_descale": a_descale,
+        "b_descale": mat2_descale.T.contiguous(),
+        "block_size": int(block_size),
+    }
+
+
+mm_fp4_trace = TraceTemplate(
+    op_type="gemm_fp4",
+    description=(
+        "FP4 GEMM C = A @ B. "
+        "A and B are fp4 (e2m1fn_x2 packed as uint8); scale tensors use block_size."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+        "block_size": Const(
+            description="FP4 quantization block size (16 for nvfp4, 32 for mxfp4)."
+        ),
+    },
+    inputs={
+        "A": Tensor(
+            ["M", "K"],
+            param="a",
+            description="Input A tensor, fp4 e2m1fn_x2 packed as uint8.",
+        ),
+        "B": Tensor(
+            ["K", "N"],
+            param="b",
+            description="Input B tensor, fp4 e2m1fn_x2 packed as uint8, column-major.",
+        ),
+        "a_descale": Tensor(
+            ["M", "K_div_block_size"],
+            description="Block scale for A, shape [M, K//block_size], float8_e4m3fn or uint8.",
+        ),
+        "b_descale": Tensor(
+            ["K", "N_div_block_size"],
+            description="Block scale for B, shape [K, N//block_size], float8_e4m3fn or uint8.",
+        ),
+        "block_size": Scalar(
+            "int32",
+            description="FP4 quantization block size (16 for nvfp4, 32 for mxfp4).",
+        ),
+    },
+    outputs={
+        "C": Tensor(["M", "N"], dtype="bfloat16"),
+    },
+    tags=["status:verified", "quantization:fp4"],
+    reference=_mm_fp4_reference,
+    check=_fp4_gemm_check,
+    init=_mm_fp4_init,
+)
+
+
+# ── BF16 x FP4 GEMM (mm_bf16_fp4, weight-only) ──────────────────────────────
+#
+# ``mm_bf16_fp4`` consumes *prepared* weights whose layout is
+# backend-specific (see ``flashinfer.prepare_bf16_fp4_weights``), so each
+# backend gets its own template and ``mm_fp4``'s ``trace=`` is a dispatch
+# callable (same pattern as the trtllm MoE routing templates).
+
+# E2M1 value table (low 3 bits magnitude, bit 3 sign).
+_E2M1_VALUES = (
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+)  # fmt: skip
+
+
+def _bf16_fp4_matmul(a, weight_kn, alpha):
+    """Final fp32 matmul shared by both bf16 x fp4 references.
+
+    ``weight_kn`` is the dequantized fp32 weight in (K, N) layout.
+    """
+    if alpha is not None:
+        weight_kn = weight_kn * alpha.to(torch.float32)
+    return (a.to(torch.float32) @ weight_kn).to(a.dtype)
+
+
+def _mm_bf16_fp4_cudnn_reference(a, b, b_descale, alpha=None, block_size=16):
+    """Reference for the cuDNN-prepared layout.
+
+    b: [N, K//2] uint8, two FP4 codes per byte.
+    b_descale: [N, K//block_size] float8_e4m3fn per-block scales (linear).
+    """
+    n, k_half = b.shape
+    k = k_half * 2
+    lut = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=b.device)
+    b_int = b.to(torch.int64)
+    codes = torch.stack([b_int & 0xF, (b_int >> 4) & 0xF], dim=-1).reshape(n, k)
+    sf = b_descale.to(torch.float32).repeat_interleave(block_size, dim=1)
+    return _bf16_fp4_matmul(a, (lut[codes] * sf).T, alpha)
+
+
+def _mm_bf16_fp4_cute_dsl_reference(a, b, b_descale, alpha=None, block_size=16):
+    """Reference for the cute-DSL-prepared layout.
+
+    b: [K//16, N*2] int32 -- FP4 bytes permuted into (16K x 64N) MMA tiles
+    of 128 int32 each (inverts
+    ``flashinfer.gemm.gemm_bf16_fp4_cute_dsl._cute_dsl_pack_fp4_weight``).
+    b_descale: [K//block_size, N] uint8 -- S0E5M3 per-block scales
+    (fp16 value = byte << 7 reinterpreted as fp16 bits).
+    """
+    device = b.device
+    k_sf, n = b_descale.shape
+    k = k_sf * block_size
+    k_tiles, n_tiles = k // 16, n // 64
+
+    # Rebuild the within-tile byte permutation of _cute_dsl_pack_fp4_weight.
+    u32_pos = torch.arange(128, device=device, dtype=torch.long)
+    lane = (u32_pos // 2) % 32
+    base_n = (u32_pos // 64) * 8 + lane // 4
+    k_half_in_tile = (lane % 4)[:, None] + torch.tensor(
+        [0, 4, 0, 4], device=device, dtype=torch.long
+    )
+    n_in_tile = (
+        base_n[:, None]
+        + torch.tensor(
+            [[0, 0, 16, 16], [32, 32, 48, 48]], device=device, dtype=torch.long
+        )[u32_pos % 2]
+    )
+    within_idx = (k_half_in_tile * 64 + n_in_tile).reshape(-1)  # (512,) permutation
+
+    # Invert: scatter each tile's 512 gathered bytes back to row-major (8, 64).
+    gathered = (
+        b.reshape(k_tiles, n_tiles, 128, 1)
+        .view(torch.uint8)
+        .reshape(k_tiles, n_tiles, 512)
+    )
+    tile_bytes = torch.empty_like(gathered)
+    tile_bytes[:, :, within_idx] = gathered
+    b_kn = (
+        tile_bytes.reshape(k_tiles, n_tiles, 8, 64)
+        .permute(0, 2, 1, 3)
+        .reshape(k // 2, n)
+    )
+
+    lut = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=device)
+    b_int = b_kn.to(torch.int64)
+    codes = torch.stack([b_int & 0xF, (b_int >> 4) & 0xF], dim=1).reshape(k, n)
+    # S0E5M3 -> fp16: the byte is the top 8 bits of the fp16 bit pattern.
+    sf = (
+        (b_descale.to(torch.int16) << 7)
+        .view(torch.float16)
+        .to(torch.float32)
+        .repeat_interleave(block_size, dim=0)
+    )
+    return _bf16_fp4_matmul(a, lut[codes] * sf, alpha)
+
+
+def _mm_bf16_fp4_cute_dsl_sm100_reference(a, b, b_descale, alpha=None, block_size=16):
+    """Reference for the SM100/103 cute-DSL-prepared layout.
+
+    b: [N, K//2] uint8 -- the canonical nvfp4 weight, passed through unchanged.
+    b_descale: (32, 4, N//128, 4, K_sf//4, 1) uint8 -- the strided view
+    ``convert_sf_to_mma_layout`` builds over the canonical 128x4-swizzled
+    FP8-E4M3 buffer, whose physical order is (groups, n_tiles, k_tiles, 32, 4,
+    4); permuting back to that order recovers the buffer to unswizzle.
+    """
+    n, k_half = b.shape
+    k = k_half * 2
+    sf_buffer = b_descale.permute(5, 2, 4, 0, 1, 3).reshape(-1)
+    sf_bytes = _unswizzle_sf_128x4(sf_buffer, n, k // block_size).contiguous()
+    sf = sf_bytes.view(torch.float8_e4m3fn).to(torch.float32)
+    lut = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=b.device)
+    b_int = b.to(torch.int64)
+    codes = torch.stack([b_int & 0xF, (b_int >> 4) & 0xF], dim=-1).reshape(n, k)
+    sf = sf.repeat_interleave(block_size, dim=1)
+    return _bf16_fp4_matmul(a, (lut[codes] * sf).T, alpha)
+
+
+cast(Any, _mm_bf16_fp4_cute_dsl_sm100_reference)._trace_reference_dependencies = (
+    _bf16_fp4_matmul,
+    _unswizzle_batched_sf_128x4,
+    _unswizzle_sf_128x4,
+)
+
+
+def _mm_bf16_fp4_cudnn_init(
+    *,
+    M: int,
+    N: int = 2048,
+    K: int = 7168,
+    block_size: int = 16,
+    K_div_2: int = 0,  # derived
+    K_div_block_size: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_bf16_fp4`` (cuDNN backend).
+
+    Sourced from ``tests/gemm/test_mm_bf16_fp4.py``: quantize a randn
+    bf16 weight via ``flashinfer.nvfp4_quantize`` (layout_128x4), then
+    repack with ``prepare_bf16_fp4_weights``.  Requires SM100+ at
+    runtime; CPU smoke tests skip.
+    """
+    del K_div_2, K_div_block_size
+    from flashinfer import (  # noqa: PLC0415
+        mm_bf16_fp4,
+        nvfp4_quantize,
+        prepare_bf16_fp4_weights,
+    )
+    from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
+
+    if not torch.cuda.is_available() or torch.device(device).type != "cuda":
+        raise NotImplementedError("mm_bf16_fp4 init requires a CUDA device")
+    major, minor = torch.cuda.get_device_capability(torch.device(device))
+    if not mm_bf16_fp4.is_backend_supported("cudnn", major * 10 + minor):
+        raise NotImplementedError(f"mm_bf16_fp4 is not supported on SM{major}{minor}")
+
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    g_w = (448.0 * 6.0) / w.float().abs().nan_to_num().max()
+    b_fp4, b_sf = nvfp4_quantize(
+        w, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False, backend="cute-dsl"
+    )
+    alpha = torch.tensor([1.0 / g_w.item()], dtype=torch.float32, device=device)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
+        b_fp4, b_sf, alpha, backend="cudnn", block_size=block_size
+    )
+    return {
+        "a": a,
+        "b": b_p,
+        "b_descale": sf_p,
+        "alpha": alpha_p,
+        "backend": "cudnn",
+        "block_size": int(block_size),
+    }
+
+
+def _mm_bf16_fp4_cute_dsl_init(
+    *,
+    M: int,
+    N: int = 2048,
+    K: int = 7168,
+    block_size: int = 16,
+    K_div_16: int = 0,  # derived
+    K_div_block_size: int = 0,  # derived
+    N_mul_2: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_bf16_fp4`` (cute-DSL backend, SM12x).
+
+    Sourced from ``tests/gemm/test_mm_bf16_fp4.py``: quantize a randn
+    bf16 weight via ``flashinfer.nvfp4_quantize`` (layout_128x4), then
+    repack with ``prepare_bf16_fp4_weights``.  Requires SM100+ at
+    runtime; CPU smoke tests skip.
+    """
+    del K_div_16, K_div_block_size, N_mul_2
+    from flashinfer import (  # noqa: PLC0415
+        mm_bf16_fp4,
+        nvfp4_quantize,
+        prepare_bf16_fp4_weights,
+    )
+    from flashinfer.gemm.gemm_bf16_fp4 import _cute_dsl_uses_sm100_layout  # noqa: PLC0415
+    from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
+
+    if not torch.cuda.is_available() or torch.device(device).type != "cuda":
+        raise NotImplementedError("mm_bf16_fp4 init requires a CUDA device")
+    major, minor = torch.cuda.get_device_capability(torch.device(device))
+    if not mm_bf16_fp4.is_backend_supported("cute-dsl", major * 10 + minor):
+        raise NotImplementedError(f"mm_bf16_fp4 is not supported on SM{major}{minor}")
+    if _cute_dsl_uses_sm100_layout(major, minor):
+        raise NotImplementedError(
+            f"SM{major}{minor} prepares a different cute-dsl layout; use "
+            "mm_bf16_fp4_cute_dsl_sm100_trace"
+        )
+
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    g_w = (448.0 * 6.0) / w.float().abs().nan_to_num().max()
+    b_fp4, b_sf = nvfp4_quantize(
+        w, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False, backend="cute-dsl"
+    )
+    alpha = torch.tensor([1.0 / g_w.item()], dtype=torch.float32, device=device)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
+        b_fp4, b_sf, alpha, backend="cute-dsl", block_size=block_size
+    )
+    return {
+        "a": a,
+        "b": b_p,
+        "b_descale": sf_p,
+        "alpha": alpha_p,
+        "backend": "cute-dsl",
+        "block_size": int(block_size),
+    }
+
+
+def _mm_bf16_fp4_cute_dsl_sm100_init(
+    *,
+    M: int,
+    N: int = 2048,
+    K: int = 7168,
+    block_size: int = 16,
+    K_div_2: int = 0,  # derived
+    N_div_128: int = 0,  # derived
+    K_sf_div_4: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_bf16_fp4`` (cute-DSL backend, SM100/103).
+
+    Same quantization as the SM12x init, but ``prepare_bf16_fp4_weights``
+    keeps the weight in its canonical ``(N, K//2)`` layout and returns the
+    scales as the 6-D strided MMA view the SM100 TMA descriptor consumes.
+    """
+    del K_div_2, N_div_128, K_sf_div_4
+    from flashinfer import (  # noqa: PLC0415
+        nvfp4_quantize,
+        prepare_bf16_fp4_weights,
+    )
+    from flashinfer.gemm.gemm_bf16_fp4 import _cute_dsl_uses_sm100_layout  # noqa: PLC0415
+    from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
+
+    if not torch.cuda.is_available() or torch.device(device).type != "cuda":
+        raise NotImplementedError("mm_bf16_fp4 init requires a CUDA device")
+    major, minor = torch.cuda.get_device_capability(torch.device(device))
+    if not _cute_dsl_uses_sm100_layout(major, minor):
+        raise NotImplementedError(
+            f"this template describes the SM100/103 cute-dsl layout; got "
+            f"SM{major}{minor}"
+        )
+
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    g_w = (448.0 * 6.0) / w.float().abs().nan_to_num().max()
+    b_fp4, b_sf = nvfp4_quantize(
+        w, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False, backend="cute-dsl"
+    )
+    alpha = torch.tensor([1.0 / g_w.item()], dtype=torch.float32, device=device)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
+        b_fp4, b_sf, alpha, backend="cute-dsl", block_size=block_size
+    )
+    return {
+        "a": a,
+        "b": b_p,
+        "b_descale": sf_p,
+        "alpha": alpha_p,
+        "backend": "cute-dsl",
+        "block_size": int(block_size),
+    }
+
+
+mm_bf16_fp4_cudnn_trace = TraceTemplate(
+    op_type="gemm_bf16_fp4",
+    name_prefix="mm_bf16_fp4_cudnn",
+    description=(
+        "bf16 x fp4 GEMM C = (A @ dequant(B).T) * alpha, cuDNN-prepared weights. "
+        "A is bf16; B is fp4 (e2m1fn_x2 packed as uint8) with fp8-e4m3 "
+        "per-block scales in linear [N, K//block_size] layout."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+        "block_size": Const(description="FP4 quantization block size (16 for nvfp4)."),
+    },
+    inputs={
+        "A": Tensor(["M", "K"], param="a", description="Activation, bfloat16."),
+        "B": Tensor(
+            ["N", "K_div_2"],
+            param="b",
+            description="Weight, fp4 e2m1fn_x2 packed as uint8, [N, K//2].",
+        ),
+        "b_descale": Tensor(
+            ["N", "K_div_block_size"],
+            description="Per-block scales, float8_e4m3fn, [N, K//block_size].",
+        ),
+        "alpha": Tensor(
+            ["1"],
+            optional=True,
+            description="Optional global scale, float32, shape (1,).",
+        ),
+        "block_size": Scalar("int32", description="FP4 block size (always 16)."),
+    },
+    outputs={
+        "C": Tensor(["M", "N"], dtype_from="a"),
+    },
+    tags=["status:verified", "quantization:fp4"],
+    reference=_mm_bf16_fp4_cudnn_reference,
+    check=_fp4_gemm_check,
+    init=_mm_bf16_fp4_cudnn_init,
+)
+
+mm_bf16_fp4_cute_dsl_trace = TraceTemplate(
+    op_type="gemm_bf16_fp4",
+    name_prefix="mm_bf16_fp4_cute_dsl",
+    description=(
+        "bf16 x fp4 GEMM C = (A @ dequant(B).T) * alpha, cute-DSL-prepared weights. "
+        "A is bf16; B is fp4 repacked into (16K x 64N) MMA tiles as int32 "
+        "[K//16, N*2] with S0E5M3 per-block scales [K//block_size, N]."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+        "block_size": Const(description="FP4 quantization block size (16 for nvfp4)."),
+    },
+    inputs={
+        "A": Tensor(["M", "K"], param="a", description="Activation, bfloat16."),
+        "B": Tensor(
+            ["K_div_16", "N_mul_2"],
+            param="b",
+            description="Weight, fp4 tile-packed as int32, [K//16, N*2].",
+        ),
+        "b_descale": Tensor(
+            ["K_div_block_size", "N"],
+            description="Per-block scales, S0E5M3 as uint8, [K//block_size, N].",
+        ),
+        "alpha": Tensor(
+            ["1"],
+            optional=True,
+            description="Optional global scale, float32, shape (1,).",
+        ),
+        "block_size": Scalar("int32", description="FP4 block size (always 16)."),
+    },
+    outputs={
+        "C": Tensor(["M", "N"], dtype_from="a"),
+    },
+    tags=["status:verified", "quantization:fp4"],
+    reference=_mm_bf16_fp4_cute_dsl_reference,
+    check=_fp4_gemm_check,
+    init=_mm_bf16_fp4_cute_dsl_init,
+)
+
+mm_bf16_fp4_cute_dsl_sm100_trace = TraceTemplate(
+    op_type="gemm_bf16_fp4",
+    name_prefix="mm_bf16_fp4_cute_dsl_sm100",
+    description=(
+        "bf16 x fp4 GEMM C = (A @ dequant(B).T) * alpha, cute-DSL-prepared weights "
+        "for SM100/103.  A is bf16; B is the canonical fp4 (e2m1fn_x2 packed as "
+        "uint8) [N, K//2] weight with fp8-e4m3 per-block scales kept in the "
+        "128x4-swizzled layout, viewed as the 6-D MMA layout the TMA descriptor "
+        "consumes."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+        "block_size": Const(description="FP4 quantization block size (16 for nvfp4)."),
+    },
+    inputs={
+        "A": Tensor(["M", "K"], param="a", description="Activation, bfloat16."),
+        "B": Tensor(
+            ["N", "K_div_2"],
+            param="b",
+            description="Weight, fp4 e2m1fn_x2 packed as uint8, [N, K//2].",
+        ),
+        "b_descale": Tensor(
+            ["32", "4", "N_div_128", "4", "K_sf_div_4", "num_groups"],
+            description=(
+                "Per-block scales, fp8-e4m3 bytes as uint8, as the 6-D strided "
+                "view (32, 4, N//128, 4, K//block_size//4, 1) over the canonical "
+                "128x4-swizzled buffer."
+            ),
+        ),
+        "alpha": Tensor(
+            ["1"],
+            optional=True,
+            description="Optional global scale, float32, shape (1,).",
+        ),
+        "block_size": Scalar("int32", description="FP4 block size (always 16)."),
+    },
+    outputs={
+        "C": Tensor(["M", "N"], dtype_from="a"),
+    },
+    tags=["status:verified", "quantization:fp4"],
+    reference=_mm_bf16_fp4_cute_dsl_sm100_reference,
+    check=_fp4_gemm_check,
+    init=_mm_bf16_fp4_cute_dsl_sm100_init,
+)
+
+
+def _mm_bf16_fp4_native_reference(
+    a, b, b_descale, alpha=None, block_size=16, out_dtype=None, out=None
+):
+    """Decode canonical NVFP4 bytes and padded 128x4 E4M3 block scales."""
+    n, k_half = b.shape
+    k = k_half * 2
+    sf_bytes = _unswizzle_sf_128x4(
+        b_descale.view(torch.uint8).reshape(-1), n, k // block_size
+    ).contiguous()
+    sf = sf_bytes.view(torch.float8_e4m3fn).float().repeat_interleave(block_size, 1)
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float32,
+        device=b.device,
+    )
+    codes = torch.stack((b & 15, b >> 4), dim=-1).long().reshape(n, k)
+    weight = lut[codes] * sf
+    if alpha is not None:
+        weight = weight * alpha.float()
+    result_dtype = out.dtype if out is not None else (out_dtype or a.dtype)
+    result = (a.float() @ weight.T).to(result_dtype)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+cast(Any, _mm_bf16_fp4_native_reference)._trace_reference_dependencies = (
+    _unswizzle_batched_sf_128x4,
+    _unswizzle_sf_128x4,
+)
+
+
+def _mm_bf16_fp4_native_init(
+    *,
+    M: int,
+    N: int = 2048,
+    K: int = 7168,
+    block_size: int = 16,
+    K_packed: int = 0,  # derived
+    SF_dim_0: int = 0,  # derived from N/K padding
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build canonical weights without creating an alternate representation."""
+    del SF_dim_0, K_packed
+    from flashinfer import nvfp4_quantize  # noqa: PLC0415
+    from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
+
+    if not torch.cuda.is_available() or torch.device(device).type != "cuda":
+        raise NotImplementedError("native mm_bf16_fp4 init requires CUDA")
+    if torch.cuda.get_device_capability(torch.device(device)) not in ((12, 0), (12, 1)):
+        raise NotImplementedError("native mm_bf16_fp4 requires SM120/121")
+    if M < 1 or block_size != 16:
+        raise NotImplementedError("native mm_bf16_fp4 requires M>=1 and block_size=16")
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    g_w = 2688.0 / w.float().abs().max()
+    b, sf = nvfp4_quantize(
+        w, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False, backend="cute-dsl"
+    )
+    return dict(
+        a=a,
+        b=b,
+        b_descale=sf.reshape(-1),
+        alpha=g_w.reciprocal().reshape(1),
+        backend="cute-dsl-native",
+        block_size=block_size,
+    )
+
+
+@functools.cache
+def _mm_bf16_fp4_native_trace(scale_ndim):
+    """Preserve the caller's view of the contiguous canonical scale buffer."""
+    return TraceTemplate(
+        op_type="gemm_bf16_fp4",
+        name_prefix=f"mm_bf16_fp4_cute_dsl_native_sf{scale_ndim}d",
+        description=(
+            "BF16 x NVFP4 GEMM with canonical uint8 weights and padded 128x4-swizzled "
+            "E4M3 block scales on SM120/121. No alternate weight preparation; M>=1."
+        ),
+        axes={
+            "M": Var(),
+            "N": Const(),
+            "K": Const(),
+            "K_packed": Const(),
+            "block_size": Const(),
+            **{f"SF_dim_{i}": Const() for i in range(scale_ndim)},
+        },
+        inputs={
+            "A": Tensor(["M", "K"], param="a"),
+            "B": Tensor(["N", "K_packed"], param="b"),
+            "b_descale": Tensor(
+                [f"SF_dim_{i}" for i in range(scale_ndim)],
+                description="Contiguous 128x4-swizzled E4M3 buffer, including N/K padding.",
+            ),
+            "alpha": Tensor(["1"], optional=True),
+            "block_size": Scalar("int32"),
+            "out_dtype": Scalar("dtype", optional=True),
+            "out": Tensor(["M", "N"], optional=True),
+        },
+        outputs={
+            "C": Tensor(
+                ["M", "N"],
+                dtype="bfloat16",
+                dtype_from="out",
+                dtype_from_scalar="out_dtype",
+            )
+        },
+        constraints=["K == K_packed * 2", "block_size == 16", "M >= 1"],
+        tags=["status:verified", "quantization:fp4"],
+        reference=_mm_bf16_fp4_native_reference,
+        check=_fp4_gemm_check,
+        init=_mm_bf16_fp4_native_init if scale_ndim == 1 else None,
+    )
+
+
+mm_bf16_fp4_native_trace = _mm_bf16_fp4_native_trace(1)
+
+
+def mm_bf16_fp4_trace_dispatch(**kwargs):
+    """Return the TraceTemplate for an ``mm_bf16_fp4`` call by backend.
+
+    ``prepare_bf16_fp4_weights`` produces three distinct layouts: cute-dsl on
+    SM12x tile-packs the weight into int32, cute-dsl on SM100/103 keeps the
+    canonical uint8 weight but hands back a 6-D scale view, and cudnn keeps the
+    canonical weight with linear 2-D scales. The explicit cute-dsl-native
+    backend consumes the contiguous canonical 128x4 scale buffer directly. Pass as
+    ``trace=mm_bf16_fp4_trace_dispatch`` to ``@flashinfer_api``.
+    """
+    if kwargs.get("backend") == "cute-dsl-native":
+        sf = kwargs.get("b_descale")
+        return _mm_bf16_fp4_native_trace(sf.ndim if sf is not None else 1)
+    b = kwargs.get("b")
+    if b is not None and b.dtype == torch.int32:
+        return mm_bf16_fp4_cute_dsl_trace
+    b_descale = kwargs.get("b_descale")
+    if b_descale is not None and b_descale.dim() == 6:
+        return mm_bf16_fp4_cute_dsl_sm100_trace
+    return mm_bf16_fp4_cudnn_trace
+
+
+# Expose the templates so _attach_fi_trace auto-registers them for the
+# consistency tests (same pattern as the MoE routing dispatchers).
+mm_bf16_fp4_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    mm_bf16_fp4_native_trace,
+    _mm_bf16_fp4_native_trace(2),
+    mm_bf16_fp4_cudnn_trace,
+    mm_bf16_fp4_cute_dsl_trace,
+    mm_bf16_fp4_cute_dsl_sm100_trace,
+]
+
+
+# ── Batched matmuls (BMM) ────────────────────────────────────────────────────
+
+
+def _bmm_reference(A, B):
+    """Batched matmul C[b] = A[b] @ B[b]."""
+    return torch.matmul(A.to(torch.float32), B.to(torch.float32)).to(A.dtype)
+
+
+def _bmm_fp8_reference(A, B, A_scale, B_scale, dtype):
+    """Reference per-tensor FP8 BMM: dequantize then matmul."""
+    A_f = A.to(torch.float32) * A_scale.to(torch.float32)
+    B_f = B.to(torch.float32) * B_scale.to(torch.float32)
+    return torch.matmul(A_f, B_f).to(dtype)
+
+
+def _bmm_mxfp8_reference(A, B, A_scale, B_scale, dtype):
+    """Reference MXFP8 BMM (block size 32, 1D 128x4-swizzled E8M0 scales)."""
+    block = 32
+    batch, m, k = A.shape
+    n = B.shape[-1]
+    a_scale = _e8m0_to_float(
+        _unswizzle_batched_sf_128x4(A_scale, batch, m, k // block)
+    ).repeat_interleave(block, dim=-1)
+    b_scale = _e8m0_to_float(
+        _unswizzle_batched_sf_128x4(B_scale, batch, n, k // block)
+    ).repeat_interleave(block, dim=-1)
+    A_deq = A.to(torch.float32) * a_scale
+    B_deq = B.to(torch.float32).transpose(-2, -1) * b_scale  # [batch, n, k]
+    return torch.matmul(A_deq, B_deq.transpose(-2, -1)).to(dtype)
+
+
+cast(Any, _bmm_mxfp8_reference)._trace_reference_dependencies = (
+    _e8m0_to_float,
+    _unswizzle_batched_sf_128x4,
+)
+
+
+def _bmm_bf16_init(
+    *,
+    batch_size: int,
+    M: int = 64,
+    N: int = 64,
+    K: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for batched ``bmm`` (bf16)."""
+    torch.manual_seed(seed)
+    A = torch.randn(batch_size, M, K, dtype=torch.bfloat16, device=device)
+    B = torch.randn(batch_size, K, N, dtype=torch.bfloat16, device=device)
+    return {"A": A, "B": B}
+
+
+bmm_bf16_trace = TraceTemplate(
+    op_type="bmm_bf16",
+    description="Batched matrix multiply C[b] = A[b] @ B[b] (bf16/fp16).",
+    axes={
+        "batch_size": Var(),
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+    },
+    inputs={
+        "A": Tensor(["batch_size", "M", "K"]),
+        "B": Tensor(["batch_size", "K", "N"]),
+    },
+    outputs={
+        "C": Tensor(["batch_size", "M", "N"], dtype_from="A"),
+    },
+    tags=["status:verified"],
+    reference=_bmm_reference,
+    check=_gemm_check,
+    init=_bmm_bf16_init,
+)
+
+
+def _bmm_fp8_init(
+    *,
+    batch_size: int,
+    M: int = 64,
+    N: int = 64,
+    K: int = 128,
+    scalar: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``bmm_fp8`` (per-tensor scale).
+
+    Sourced from ``tests/gemm/test_bmm_fp8.py``: ``input`` and ``mat2``
+    are ``randn`` bf16, per-tensor-quantized via ``to_float8``
+    (mirrored as ``per_tensor_fp8_quantize``); the scales are scalar
+    fp32 reciprocals.
+    """
+    del scalar
+    torch.manual_seed(seed)
+    input_bf16 = torch.randn(batch_size, M, K, dtype=torch.bfloat16, device=device)
+    mat2_bf16 = torch.randn(batch_size, K, N, dtype=torch.bfloat16, device=device)
+    A, A_inv_s = per_tensor_fp8_quantize(input_bf16)
+    B, B_inv_s = per_tensor_fp8_quantize(mat2_bf16)
+    return {
+        "A": A,
+        "B": B,
+        "A_scale": A_inv_s.reshape(1),
+        "B_scale": B_inv_s.reshape(1),
+        "dtype": 1,
+    }
+
+
+bmm_fp8_trace = TraceTemplate(
+    op_type="bmm_fp8",
+    description=(
+        "Per-tensor FP8 batched matmul. A and B are float8_e4m3fn; "
+        "A_scale/B_scale are scalar tensors holding the dequant scales."
+    ),
+    axes={
+        "batch_size": Var(),
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+    },
+    inputs={
+        "A": Tensor(["batch_size", "M", "K"]),
+        "B": Tensor(["batch_size", "K", "N"]),
+        "A_scale": Tensor(
+            ["scalar"], dtype="float32", description="Per-tensor dequant scale for A."
+        ),
+        "B_scale": Tensor(
+            ["scalar"], dtype="float32", description="Per-tensor dequant scale for B."
+        ),
+        "dtype": Scalar("int32", description="Output dtype enum."),
+    },
+    outputs={
+        "C": Tensor(["batch_size", "M", "N"], dtype="bfloat16"),
+    },
+    tags=["status:verified", "quantization:float8_e4m3fn"],
+    reference=_bmm_fp8_reference,
+    check=_gemm_check,
+    init=_bmm_fp8_init,
+)
+bmm_fp8_trace.axes["scalar"] = Var(description="A/B scale tensor length (typically 1).")
+
+
+def _bmm_mxfp8_init(
+    *,
+    batch_size: int,
+    M: int = 64,
+    N: int = 64,
+    K: int = 128,
+    A_scale_size: int = 0,  # derived
+    B_scale_size: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``bmm_mxfp8`` (block size 32).
+
+    Sourced from ``tests/gemm/test_bmm_mxfp8.py``: ``input`` and
+    ``mat2`` are ``randn`` bf16 passed through
+    ``flashinfer.mxfp8_quantize`` to produce float8_e4m3fn data and
+    uint8 block scales.
+    """
+    del A_scale_size, B_scale_size
+    from flashinfer import mxfp8_quantize  # noqa: PLC0415
+
+    torch.manual_seed(seed)
+    a_bf16 = torch.randn(batch_size, M, K, dtype=torch.bfloat16, device=device)
+    b_bf16 = torch.randn(batch_size, N, K, dtype=torch.bfloat16, device=device)
+    a_quantized = tuple(
+        mxfp8_quantize(batch_tensor, is_sf_swizzled_layout=True)
+        for batch_tensor in a_bf16.unbind()
+    )
+    b_quantized = tuple(
+        mxfp8_quantize(batch_tensor, is_sf_swizzled_layout=True)
+        for batch_tensor in b_bf16.unbind()
+    )
+    A = torch.stack(tuple(value for value, _ in a_quantized))
+    A_scale = torch.cat(tuple(scale for _, scale in a_quantized))
+    B = torch.stack(tuple(value for value, _ in b_quantized))
+    B_scale = torch.cat(tuple(scale for _, scale in b_quantized))
+    return {
+        "A": A,
+        "B": B.transpose(-2, -1),
+        "A_scale": A_scale,
+        "B_scale": B_scale,
+        "dtype": torch.bfloat16,
+    }
+
+
+bmm_mxfp8_trace = TraceTemplate(
+    op_type="bmm_mxfp8",
+    description=(
+        "MXFP8 batched matmul (MX block size 32). A, B are float8_e4m3fn; "
+        "A_scale/B_scale are uint8 block scales (block size 32 along K)."
+    ),
+    axes={
+        "batch_size": Var(),
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+        "A_scale_size": Var(
+            description="Batched padded 128x4 scale-buffer length for A."
+        ),
+        "B_scale_size": Var(
+            description="Batched padded 128x4 scale-buffer length for B."
+        ),
+    },
+    inputs={
+        "A": Tensor(["batch_size", "M", "K"]),
+        "B": Tensor(["batch_size", "K", "N"]),
+        "A_scale": Tensor(
+            ["A_scale_size"],
+            description="Batched 1D 128x4-swizzled E8M0 scale buffers for A.",
+        ),
+        "B_scale": Tensor(
+            ["B_scale_size"],
+            description=("Batched 1D 128x4-swizzled E8M0 scale buffers for B."),
+        ),
+        "dtype": Scalar("int32", description="Output dtype enum."),
+    },
+    outputs={
+        "C": Tensor(["batch_size", "M", "N"], dtype="bfloat16"),
+    },
+    tags=["status:verified", "quantization:mxfp8"],
+    reference=_bmm_mxfp8_reference,
+    check=_bmm_mxfp8_check,
+    init=_bmm_mxfp8_init,
+)
+
+
+def bmm_mxfp8_trace_dispatch(**kwargs):
+    """Return the TraceTemplate for a ``bmm_mxfp8`` call. MXFP8 output (``out_scale``) has
+    no template yet, so it resolves to None: tracing records nothing and Trace Apply keeps
+    the original call, since a registered solution cannot fill ``out_scale``."""
+    if kwargs.get("out_scale") is not None:
+        return None
+    return bmm_mxfp8_trace
+
+
+bmm_mxfp8_trace_dispatch.templates = [bmm_mxfp8_trace]  # type: ignore[attr-defined]
+
+
+# ── tinygemm_bf16 (small bf16 GEMM with bias) ────────────────────────────────
+
+
+@torch.no_grad()
+def _tinygemm_bf16_reference(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    bias=None,
+    use_pdl: bool = False,
+    **_unused,
+) -> None:
+    """Reference for tinygemm_bf16: out = input @ weight.T (+ bias). In-place."""
+    a = input.to(torch.float32)
+    w = weight.to(torch.float32)
+    res = a @ w.T
+    if bias is not None:
+        res = res + bias.to(torch.float32).unsqueeze(0)
+    out.copy_(res.to(out.dtype))
+
+
+def _tinygemm_bf16_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``tinygemm_bf16``: ``out = input @ weight.T + bias``."""
+    torch.manual_seed(seed)
+    inp = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    out = torch.empty(M, N, dtype=torch.bfloat16, device=device)
+    bias = torch.randn(N, dtype=torch.bfloat16, device=device)
+    return {"input": inp, "weight": w, "out": out, "bias": bias}
+
+
+tinygemm_bf16_trace = TraceTemplate(
+    op_type="gemm_bf16",
+    name_prefix="tinygemm_bf16",
+    description=(
+        "SM90+ small-batch bf16 GEMM (F.linear-equivalent): "
+        "out = input @ weight.T + bias. Optimized for tiny M (1-8 rows). "
+        "Mutates ``out`` in place."
+    ),
+    axes={
+        "M": Var(description="Number of rows in input (small)."),
+        "N": Const(abbrev="n"),
+        "K": Const(abbrev="k"),
+    },
+    inputs={
+        "input": Tensor(["M", "K"]),
+        "weight": Tensor(["N", "K"]),
+        "out": Tensor(["M", "N"], description="In-place output buffer."),
+        "bias": Tensor(["N"], optional=True),
+        "use_pdl": Scalar("int32", optional=True),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype_from="input"),
+    },
+    tags=["status:verified"],
+    reference=_tinygemm_bf16_reference,
+    init=_tinygemm_bf16_init,
+)
+
+
+# ── fmha_v2_prefill_deepseek (separate Q/K/V variant of FMHA v2 prefill) ─────
+
+
+@torch.no_grad()
+def _fmha_v2_prefill_deepseek_reference(
+    query,
+    key,
+    value,
+    out,
+    num_heads,
+    head_dim,
+    seq_len,
+    scale_softmax,
+    scale_bmm1=None,
+    scale_bmm2=None,
+    return_lse: bool = False,
+    lse=None,
+    scale_bmm1_d=None,
+    scale_bmm2_d=None,
+    **_unused,
+) -> torch.Tensor:
+    """Reference for fmha_v2_prefill_deepseek: per-batch causal SDPA on
+    separate Q/K/V tensors, fixed seq_len, GQA-MHA with num_heads heads.
+    Mutates ``out`` in-place; returns it.
+    """
+    B, S, H, D = query.shape
+    if scale_bmm1_d is not None:
+        scale_bmm1 = scale_bmm1_d.item()
+    if scale_bmm2_d is not None:
+        scale_bmm2 = scale_bmm2_d.item()
+    s = float(scale_bmm1) if scale_bmm1 is not None else 1.0
+    b2 = float(scale_bmm2) if scale_bmm2 is not None else 1.0
+    q = query.to(torch.float32)
+    k = key.to(torch.float32)
+    v = value.to(torch.float32)
+    heads_per_kv = H // key.shape[2]
+    # Per head, per batch: causal attention.
+    for batch in range(B):
+        for h in range(H):
+            kv_h = h // heads_per_kv
+            logits = q[batch, :, h] @ k[batch, :, kv_h].T * s
+            mask = torch.triu(torch.ones_like(logits) * float("-inf"), diagonal=1)
+            logits = logits + mask
+            attn = torch.softmax(logits, dim=-1)
+            out[batch, :, h] = (attn @ v[batch, :, kv_h] * b2).to(out.dtype)
+    return out
+
+
+@torch.no_grad()
+def _fmha_v2_prefill_sm120_reference(
+    query,
+    key,
+    value,
+    out,
+    num_heads,
+    head_dim,
+    seq_len,
+    scale_softmax,
+    scale_bmm1=None,
+    scale_bmm2=None,
+    causal: bool = True,
+    return_lse: bool = False,
+    lse=None,
+    scale_bmm1_d=None,
+    scale_bmm2_d=None,
+    **_unused,
+) -> torch.Tensor:
+    """Reference for FP8 SM120 FMHA v2 MHA/GQA self-attention."""
+    B, S, H, D = query.shape
+    if scale_bmm1_d is not None:
+        scale_bmm1 = scale_bmm1_d.item()
+    if scale_bmm2_d is not None:
+        scale_bmm2 = scale_bmm2_d.item()
+    s = float(scale_bmm1) if scale_bmm1 is not None else 1.0
+    b2 = float(scale_bmm2) if scale_bmm2 is not None else 1.0
+    q = query.to(torch.float32)
+    k = key.to(torch.float32)
+    v = value.to(torch.float32)
+    heads_per_kv = H // key.shape[2]
+    for batch in range(B):
+        for h in range(H):
+            kv_h = h // heads_per_kv
+            logits = q[batch, :, h] @ k[batch, :, kv_h].T * s
+            if causal:
+                mask = torch.triu(torch.ones_like(logits) * float("-inf"), diagonal=1)
+                logits = logits + mask
+            attn = torch.softmax(logits, dim=-1)
+            out[batch, :, h] = (attn @ v[batch, :, kv_h] * b2).to(out.dtype)
+    return out
+
+
+def _fmha_v2_prefill_deepseek_init(
+    *,
+    batch_size: int,
+    seq_len: int = 128,
+    scale_size: int = 1,
+    num_heads: int = 32,
+    head_dim: int = 192,
+    head_dim_vo: int = 128,
+    num_kv_heads: int | None = None,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``fmha_v2_prefill_deepseek``."""
+    if head_dim in (128, 256):
+        inputs = _fmha_v2_prefill_sm120_init(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            scale_size=scale_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_kv_heads=num_kv_heads,
+            device=device,
+            seed=seed,
+        )
+        inputs.pop("causal")
+        return inputs
+    del scale_size
+    torch.manual_seed(seed)
+    num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+    q = torch.randn(
+        batch_size, seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k = torch.randn(
+        batch_size, seq_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v = torch.randn(
+        batch_size,
+        seq_len,
+        num_kv_heads,
+        head_dim_vo,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    out = torch.empty(
+        batch_size, seq_len, num_heads, head_dim_vo, dtype=torch.bfloat16, device=device
+    )
+    return {
+        "query": q,
+        "key": k,
+        "value": v,
+        "out": out,
+        "num_heads": int(num_heads),
+        "head_dim": int(head_dim),
+        "seq_len": int(seq_len),
+        "scale_softmax": 0.0,
+        "scale_bmm1": 1.0 / math.sqrt(head_dim),
+    }
+
+
+def _fmha_v2_prefill_sm120_init(
+    *,
+    batch_size: int,
+    seq_len: int = 128,
+    scale_size: int = 1,
+    num_heads: int = 32,
+    head_dim: int = 128,
+    num_kv_heads: int | None = None,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build independently scaled E4M3 inputs for ``fmha_v2_prefill_sm120``."""
+    torch.manual_seed(seed)
+
+    def quantize(x):
+        fp8_dtype = torch.float8_e4m3fn
+        finfo = torch.finfo(fp8_dtype)
+        scale = (x.abs().amax().float() / finfo.max).clamp(min=1.0e-12)
+        quantized = (x / scale).clamp(min=finfo.min, max=finfo.max).to(fp8_dtype)
+        return quantized, scale.item()
+
+    shape = (batch_size, seq_len, num_heads, head_dim)
+    num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+    kv_shape = (batch_size, seq_len, num_kv_heads, head_dim)
+    q, q_scale = quantize(torch.randn(shape, dtype=torch.bfloat16, device=device))
+    k, k_scale = quantize(torch.randn(kv_shape, dtype=torch.bfloat16, device=device))
+    v, v_scale = quantize(torch.randn(kv_shape, dtype=torch.bfloat16, device=device))
+    out = torch.empty(shape, dtype=torch.bfloat16, device=device)
+    return {
+        "query": q,
+        "key": k,
+        "value": v,
+        "out": out,
+        "num_heads": int(num_heads),
+        "head_dim": int(head_dim),
+        "seq_len": int(seq_len),
+        "scale_softmax": 1.0,
+        "scale_bmm1": q_scale * k_scale / math.sqrt(head_dim),
+        "scale_bmm2": v_scale,
+        "scale_bmm1_d": torch.tensor(
+            [q_scale * k_scale / math.sqrt(head_dim)] * scale_size,
+            dtype=torch.float32,
+            device=device,
+        ),
+        "scale_bmm2_d": torch.tensor(
+            [v_scale] * scale_size, dtype=torch.float32, device=device
+        ),
+        "causal": True,
+    }
+
+
+_fmha_v2_prefill_deepseek_init._trace_init_dependencies = (  # type: ignore[attr-defined]
+    _fmha_v2_prefill_sm120_init,
+)
+
+
+fmha_v2_prefill_deepseek_trace = TraceTemplate(
+    op_type="trtllm_paged",
+    name_prefix="fmha_v2_prefill_deepseek",
+    description=(
+        "DeepSeek MLA, GLM-4.7-Flash 256-dimension MLA context, and 128-dimension GQA "
+        "FMHA v2 prefill: separate Q/K/V tensors, "
+        "fixed seq_len, causal SDPA per batch. Mutates ``out`` in-place."
+    ),
+    axes={
+        "batch_size": Var(),
+        "seq_len": Var(),
+        "num_heads": Const(abbrev="h"),
+        "head_dim": Const(abbrev="d"),
+        "head_dim_vo": Var(),
+        "num_kv_heads": Var(),
+        "scale_size": Var(),
+    },
+    inputs={
+        "query": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
+        "key": Tensor(["batch_size", "seq_len", "num_kv_heads", "head_dim"]),
+        "value": Tensor(["batch_size", "seq_len", "num_kv_heads", "head_dim_vo"]),
+        "out": Tensor(
+            ["batch_size", "seq_len", "num_heads", "head_dim_vo"],
+            description="In-place output buffer.",
+        ),
+        "num_heads": Scalar("int32"),
+        "head_dim": Scalar("int32"),
+        "seq_len": Scalar("int32"),
+        "scale_softmax": Scalar("float32"),
+        "scale_bmm1": Scalar("float32", optional=True),
+        "scale_bmm2": Scalar("float32", optional=True),
+        "scale_bmm1_d": Tensor(
+            ["scale_size"],
+            optional=True,
+            description="Persistent FP32 CUDA QK-scale model weight.",
+        ),
+        "scale_bmm2_d": Tensor(
+            ["scale_size"],
+            optional=True,
+            description="Persistent FP32 CUDA V dequantization model weight.",
+        ),
+    },
+    outputs={
+        "out": Tensor(
+            ["batch_size", "seq_len", "num_heads", "head_dim_vo"], dtype_from="out"
+        ),
+    },
+    tags=["status:verified", "stage:prefill", "backend:trtllm"],
+    reference=_fmha_v2_prefill_deepseek_reference,
+    init=_fmha_v2_prefill_deepseek_init,
+)
+
+fmha_v2_prefill_sm120_trace = TraceTemplate(
+    op_type="trtllm_paged",
+    name_prefix="fmha_v2_prefill_sm120",
+    description=(
+        "SM120 FMHA v2 prefill with separate Q/K/V tensors, fixed seq_len, "
+        "and causal or dense SDPA per batch. Mutates ``out`` in-place."
+    ),
+    axes={
+        "batch_size": Var(),
+        "seq_len": Var(),
+        "num_heads": Const(abbrev="h"),
+        "head_dim": Const(abbrev="d"),
+        "num_kv_heads": Var(),
+        "scale_size": Var(),
+    },
+    inputs={
+        "query": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
+        "key": Tensor(["batch_size", "seq_len", "num_kv_heads", "head_dim"]),
+        "value": Tensor(["batch_size", "seq_len", "num_kv_heads", "head_dim"]),
+        "out": Tensor(
+            ["batch_size", "seq_len", "num_heads", "head_dim"],
+            description="In-place output buffer.",
+        ),
+        "num_heads": Scalar("int32"),
+        "head_dim": Scalar("int32"),
+        "seq_len": Scalar("int32"),
+        "scale_softmax": Scalar("float32"),
+        "scale_bmm1": Scalar("float32", optional=True),
+        "scale_bmm2": Scalar("float32", optional=True),
+        "scale_bmm1_d": Tensor(
+            ["scale_size"],
+            optional=True,
+            description=(
+                "Persistent FP32 CUDA model weight containing the full fused "
+                "q_scale * k_scale / sqrt(head_dim) value."
+            ),
+        ),
+        "scale_bmm2_d": Tensor(
+            ["scale_size"],
+            optional=True,
+            description="Persistent FP32 CUDA V dequantization model weight.",
+        ),
+        "causal": Scalar("bool"),
+    },
+    outputs={
+        "out": Tensor(
+            ["batch_size", "seq_len", "num_heads", "head_dim"], dtype_from="out"
+        ),
+    },
+    tags=["status:verified", "stage:prefill", "backend:trtllm"],
+    reference=_fmha_v2_prefill_sm120_reference,
+    init=_fmha_v2_prefill_sm120_init,
+)
+
+
+# ── fp8_blockscale_gemm_sm90 (FP8 block-scale GEMM with auto swapAB) ─────────
+
+
+@torch.no_grad()
+def _fp8_blockscale_gemm_sm90_reference(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale=None,
+    weight_scale=None,
+    out=None,
+    out_dtype=None,
+    **_unused,
+) -> torch.Tensor:
+    """Reference for FP8 block-scale GEMM (SM90). Dequantizes via per-block
+    scales (block size 128 along K, 128x128 for the weight) then matmul."""
+    a = input.to(torch.float32)
+    w = weight.to(torch.float32)
+    if input_scale is not None:
+        # input_scale: [M, K//128] — broadcast to [M, K].
+        a_scale = input_scale.to(torch.float32).repeat_interleave(128, dim=-1)
+        a = a * a_scale[..., : a.shape[-1]]
+    if weight_scale is not None:
+        # weight_scale: [N//128, K//128] — broadcast.
+        w_scale = (
+            weight_scale.to(torch.float32)
+            .repeat_interleave(128, dim=0)
+            .repeat_interleave(128, dim=1)
+        )
+        w = w * w_scale[: w.shape[0], : w.shape[1]]
+    res = a @ w.T
+    out_dtype = out_dtype or torch.bfloat16
+    return res.to(out_dtype)
+
+
+def _fp8_blockscale_gemm_sm90_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    K_div_128: int = 0,  # derived
+    N_div_128: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for SM90 FP8 block-scale GEMM.
+
+    Sourced from ``tests/gemm/test_fp8_blockscale_gemm.py`` /
+    ``tests/gemm/test_groupwise_scaled_gemm_fp8.py``: ``input`` and
+    ``weight`` are ``randn`` bf16 passed through the same
+    ``fp8_block_quant_*`` helpers as MoE (1×128 input scale, 128×128
+    weight scale).
+    """
+    del K_div_128, N_div_128
+    torch.manual_seed(seed)
+    inp_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    weight_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    inp, input_scale = fp8_block_quant_1d(inp_bf16, block=128)
+    weight, weight_scale = fp8_block_quant_2d(weight_bf16, block=128)
+    return {
+        "input": inp,
+        "weight": weight,
+        "input_scale": input_scale,
+        "weight_scale": weight_scale,
+    }
+
+
+fp8_blockscale_gemm_sm90_trace = TraceTemplate(
+    op_type="gemm_fp8",
+    name_prefix="fp8_blockscale_gemm_sm90",
+    description=(
+        "SM90 FP8 block-scale GEMM with automatic swapAB (uses swapAB "
+        "kernel for small M < 32). Block scales are 1x128 for input and "
+        "128x128 for weight."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(abbrev="n"),
+        "K": Const(abbrev="k"),
+        "K_div_128": Var(description="K // 128 (input block scale dim)."),
+        "N_div_128": Var(description="N // 128."),
+    },
+    inputs={
+        "input": Tensor(["M", "K"]),
+        "weight": Tensor(["N", "K"]),
+        "input_scale": Tensor(
+            ["M", "K_div_128"],
+            dtype="float32",
+            optional=True,
+        ),
+        "weight_scale": Tensor(
+            ["N_div_128", "K_div_128"],
+            dtype="float32",
+            optional=True,
+        ),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype="bfloat16"),
+    },
+    tags=["status:verified", "quantization:float8_e4m3fn"],
+    reference=_fp8_blockscale_gemm_sm90_reference,
+    init=_fp8_blockscale_gemm_sm90_init,
+)
+
+
+# ── gemm_fp8_nt_groupwise (FP8 group-wise GEMM, cutlass + trtllm) ────────────
+
+
+@torch.no_grad()
+def _gemm_fp8_nt_groupwise_reference(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    scale_major_mode=None,
+    out=None,
+    out_dtype=None,
+    **_unused,
+) -> torch.Tensor:
+    """Reference for the trtllm-backend canonical layout: ``a_scale`` is
+    ``[M, K//bk]`` and ``b_scale`` is ``[N//bk, K//bk]``. Block size is
+    inferred from ``K // a_scale.shape[1]``. Dequantizes per-block then
+    does ``a @ b.T``.
+
+    Note on layout: flashinfer's docstring at ``gemm_base.py:5681-5683``
+    describes b_scale as ``(k // block_size, n // block_size)`` for the
+    trtllm path, but the kernel actually expects the transposed form —
+    this matches ``tests/gemm/test_groupwise_scaled_gemm_fp8.py:128-129``
+    which does ``b_scale.t().contiguous()`` before calling with
+    ``backend="trtllm"``. sglang's
+    ``layers/quantization/fp8_utils.py`` produces the same transposed
+    layout. The cutlass paths use different shapes; their calls won't
+    axis-match this template and will be skipped by the auto-dump.
+    """
+    af = a.to(torch.float32)
+    bf = b.to(torch.float32)
+    M, K = af.shape
+    N, _ = bf.shape
+    bk = K // a_scale.shape[1]
+    # b_scale is [N//bk, K//bk] (trtllm canonical) — broadcast to [N, K]
+    # then transpose for the C = A @ B.T contraction.
+    a_s = a_scale.to(torch.float32).repeat_interleave(bk, dim=1)[:, :K]
+    b_s = (
+        b_scale.to(torch.float32)
+        .repeat_interleave(bk, dim=0)[:N]
+        .repeat_interleave(bk, dim=1)[:, :K]
+    )
+    af = af * a_s
+    bf = bf * b_s  # both [N, K]; element-wise scale
+    res = af @ bf.T
+    od = out_dtype or torch.bfloat16
+    return res.to(od)
+
+
+def _gemm_fp8_nt_groupwise_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    K_div_block: int = 0,
+    N_div_block: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for TRTLLM-layout FP8 group-wise GEMM.
+
+    Matches the template's canonical layout:
+    ``a_scale=[M, K//128]`` and ``b_scale=[N//128, K//128]``.
+    """
+    del K_div_block, N_div_block
+    torch.manual_seed(seed)
+    a_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    b_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=device) / math.sqrt(K)
+    a, a_scale = fp8_block_quant_1d(a_bf16, block=128)
+    b = torch.empty(N, K, dtype=torch.float8_e4m3fn, device=device)
+    b_scale = torch.empty(
+        (N + 127) // 128, K // 128, dtype=torch.float32, device=device
+    )
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    for row_block in range((N + 127) // 128):
+        row_slice = slice(row_block * 128, min((row_block + 1) * 128, N))
+        for col_block in range(K // 128):
+            col_slice = slice(col_block * 128, (col_block + 1) * 128)
+            block = b_bf16[row_slice, col_slice].to(torch.float32)
+            amax = block.abs().amax()
+            scale = torch.where(amax > 0, amax / finfo.max, torch.ones_like(amax))
+            b[row_slice, col_slice] = (block / scale).to(torch.float8_e4m3fn)
+            b_scale[row_block, col_block] = scale
+    return {
+        "a": a,
+        "b": b,
+        "a_scale": a_scale,
+        "b_scale": b_scale,
+        "scale_major_mode": None,
+        "scale_granularity_mnk": (1, 128, 128),
+        "out_dtype": torch.bfloat16,
+        "backend": "trtllm",
+    }
+
+
+gemm_fp8_nt_groupwise_trace = TraceTemplate(
+    op_type="gemm_fp8",
+    name_prefix="gemm_fp8_nt_groupwise",
+    description=(
+        "FP8 group-wise GEMM C = A @ B.T with per-block scales. Backends: "
+        "``cutlass`` (SM100/SM120) and ``trtllm`` (SM90+/SM100). Block "
+        "granularity defaults to (1, 128, 128). Template captures the "
+        "trtllm canonical layout: ``a_scale=[M, K//bk]``, "
+        "``b_scale=[N//bk, K//bk]`` (note: this is the transposed form "
+        "of the layout described in flashinfer's gemm_base.py docstring; "
+        "the kernel actually expects the transpose, matching "
+        "tests/gemm/test_groupwise_scaled_gemm_fp8.py:128-129 which "
+        "does ``b_scale.t().contiguous()`` for the trtllm path). The "
+        "cutlass scale layouts differ; their calls won't axis-match "
+        "this template and will be skipped by the auto-dump."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(abbrev="n"),
+        "K": Const(abbrev="k"),
+        "K_div_block": Var(description="K // scale_block_size_k."),
+        "N_div_block": Var(description="N // scale_block_size_n."),
+    },
+    inputs={
+        "a": Tensor(["M", "K"]),
+        "b": Tensor(["N", "K"]),
+        "a_scale": Tensor(["M", "K_div_block"], dtype="float32"),
+        "b_scale": Tensor(["N_div_block", "K_div_block"], dtype="float32"),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype="bfloat16"),
+    },
+    tags=["status:verified", "quantization:float8_e4m3fn"],
+    reference=_gemm_fp8_nt_groupwise_reference,
+    init=_gemm_fp8_nt_groupwise_init,
+)
+
+
+# ── grouped_gemm_nt_masked (Blackwell grouped GEMM with masked-M) ────────────
+
+
+@torch.no_grad()
+def _grouped_gemm_nt_masked_reference(
+    lhs,
+    rhs,
+    out,
+    masked_m,
+    ab_dtype: str = "fp8",
+    sf_dtype: str = "ue4m3",
+    c_dtype: str = "bf16",
+    sf_vec_size: int = 128,
+    **_unused,
+):
+    """Reference for grouped_gemm_nt_masked: per-group masked GEMM where
+    only the first ``masked_m[g]`` rows of group g participate. Mutates
+    ``out`` in-place; returns it.
+
+    The kernel internally dequantizes via fp8/mxfp4 block scales — this
+    reference performs a straight bf16 matmul of dequantized inputs and
+    is intended for shape/finite validation. For numerics use the
+    kernel's own unit test suite under ``tests/gemm/``.
+    """
+    lhs_data, _lhs_sf = lhs
+    rhs_data, _rhs_sf = rhs
+    G = lhs_data.shape[0]
+    for g in range(G):
+        m = int(masked_m[g].item())
+        if m <= 0:
+            continue
+        a = lhs_data[g, :m].to(torch.float32)
+        b = rhs_data[g].to(torch.float32)
+        out[g, :m] = (a @ b.T).to(out.dtype)
+    return out
+
+
+def _grouped_gemm_nt_masked_init(
+    *,
+    num_groups: int,
+    max_m: int = 64,
+    N: int = 4096,
+    K: int = 4096,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``grouped_gemm_nt_masked`` (Blackwell MoE FC2).
+
+    Sourced from ``tests/gemm/test_groupwise_scaled_gemm_fp8.py``:
+    per-group ``randn`` bf16 lhs/rhs quantized via the same
+    1×128 / 128×128 block scheme as ``fp8_blockscale_gemm_sm90``.
+    """
+    torch.manual_seed(seed)
+    lhs_bf16 = torch.randn(num_groups, max_m, K, dtype=torch.bfloat16, device=device)
+    rhs_bf16 = torch.randn(num_groups, N, K, dtype=torch.bfloat16, device=device)
+    # Per-group 1D / 2D block quantization.
+    lhs_data = torch.empty(
+        num_groups, max_m, K, dtype=torch.float8_e4m3fn, device=device
+    )
+    lhs_sf = torch.empty(
+        num_groups, max_m, K // 128, dtype=torch.float32, device=device
+    )
+    for g in range(num_groups):
+        q, s = fp8_block_quant_1d(lhs_bf16[g], block=128)
+        lhs_data[g] = q
+        lhs_sf[g] = s
+    rhs_data, rhs_sf = fp8_block_quant_2d(rhs_bf16, block=128)
+    out = torch.empty(num_groups, max_m, N, dtype=torch.bfloat16, device=device)
+    masked_m = torch.full((num_groups,), max_m, dtype=torch.int32, device=device)
+    return {
+        "lhs": (lhs_data, lhs_sf),
+        "rhs": (rhs_data, rhs_sf),
+        "out": out,
+        "masked_m": masked_m,
+        "ab_dtype": 0,
+        "sf_dtype": 0,
+        "c_dtype": 0,
+        "sf_vec_size": 128,
+    }
+
+
+grouped_gemm_nt_masked_trace = TraceTemplate(
+    op_type="gemm_fp8",
+    name_prefix="grouped_gemm_nt_masked",
+    description=(
+        "Blackwell grouped GEMM with masked-M per group. Each group "
+        "computes ``out[g, :masked_m[g]] = lhs[g, :masked_m[g]] @ "
+        "rhs[g].T`` with FP8 / MXFP4 block-scale dequant. Used in "
+        "MoE expert FC2 path."
+    ),
+    axes={
+        "num_groups": Var(description="Number of expert groups."),
+        "max_m": Var(description="Max rows per group (padded)."),
+        "N": Const(abbrev="n"),
+        "K": Const(abbrev="k"),
+    },
+    inputs={
+        "lhs": Tensor(
+            ["num_groups", "max_m", "K"],
+            description="Tuple (lhs_data, lhs_sf): quantized A tensor + scales.",
+        ),
+        "rhs": Tensor(
+            ["num_groups", "N", "K"],
+            description="Tuple (rhs_data, rhs_sf): quantized B tensor + scales.",
+        ),
+        "out": Tensor(
+            ["num_groups", "max_m", "N"],
+            description="In-place output buffer.",
+        ),
+        "masked_m": Tensor(
+            ["num_groups"],
+            dtype="int32",
+            description="Per-group valid row count.",
+        ),
+        "ab_dtype": Scalar("int32"),
+        "sf_dtype": Scalar("int32"),
+        "c_dtype": Scalar("int32"),
+        "sf_vec_size": Scalar("int32"),
+    },
+    outputs={
+        "out": Tensor(["num_groups", "max_m", "N"], dtype_from="out"),
+    },
+    tags=["status:verified", "moe", "quantization:fp8"],
+    reference=_grouped_gemm_nt_masked_reference,
+    init=_grouped_gemm_nt_masked_init,
+)
+
+
+@torch.no_grad()
+def _group_gemm_fp8_nt_groupwise_contiguous_reference(
+    a, b, a_scale, b_scale, m_indices, **_unused
+):
+    """Dequantize the row/block scales and multiply each expert's rows."""
+    af = a.float() * a_scale.float().repeat_interleave(128, dim=1)
+    bf = b.float() * b_scale.float().repeat_interleave(128, dim=1).repeat_interleave(
+        128, dim=2
+    )
+    out = torch.empty(a.shape[0], b.shape[1], dtype=torch.bfloat16, device=a.device)
+    for group in range(b.shape[0]):
+        rows = m_indices == group
+        out[rows] = (af[rows] @ bf[group].T).bfloat16()
+    return out
+
+
+def _group_gemm_fp8_nt_groupwise_contiguous_init(
+    *,
+    M: int,
+    num_groups: int = 2,
+    N: int = 128,
+    K: int = 128,
+    K_div_128: int = 0,
+    N_div_128: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Generate sorted, tile-aligned expert rows with a possible partial tail."""
+    del K_div_128, N_div_128
+    torch.manual_seed(seed)
+    a, a_scale = fp8_block_quant_1d(torch.randn(M, K, device=device), block=128)
+    b, b_scale = fp8_block_quant_2d(
+        torch.randn(num_groups, N, K, device=device), block=128
+    )
+    rows_per_group = max(128, (M // num_groups // 128) * 128)
+    indices = (
+        torch.arange(M, device=device, dtype=torch.int32) // rows_per_group
+    ).clamp(max=num_groups - 1)
+    return dict(a=a, b=b, a_scale=a_scale, b_scale=b_scale, m_indices=indices)
+
+
+group_gemm_fp8_nt_groupwise_contiguous_trace = TraceTemplate(
+    op_type="gemm_fp8",
+    name_prefix="group_gemm_fp8_nt_groupwise_contiguous",
+    description=(
+        "Contiguous grouped FP8 E4M3 GEMM with per-row 128-element A scales "
+        "and 128x128 B scales. Expert indices must be sorted, in range, and "
+        "constant within each 128-row tile; the final tile may be partial. "
+        "Output is bfloat16."
+    ),
+    axes={
+        "M": Var(),
+        "num_groups": Const(abbrev="g"),
+        "N": Const(abbrev="n"),
+        "K": Const(abbrev="k"),
+        "K_div_128": Var(description="K // 128."),
+        "N_div_128": Var(description="N // 128."),
+    },
+    inputs={
+        "a": Tensor(["M", "K"], dtype="float8_e4m3fn"),
+        "b": Tensor(["num_groups", "N", "K"], dtype="float8_e4m3fn"),
+        "a_scale": Tensor(["M", "K_div_128"], dtype="float32"),
+        "b_scale": Tensor(["num_groups", "N_div_128", "K_div_128"], dtype="float32"),
+        "m_indices": Tensor(["M"], dtype="int32"),
+    },
+    outputs={"out": Tensor(["M", "N"], dtype="bfloat16")},
+    constraints=["K_div_128 == K // 128", "N_div_128 == N // 128"],
+    tags=["status:verified", "quantization:float8_e4m3fn"],
+    reference=_group_gemm_fp8_nt_groupwise_contiguous_reference,
+    init=_group_gemm_fp8_nt_groupwise_contiguous_init,
+)
+
+
+# ── batch_deepgemm_fp8_nt_groupwise (batched FP8 group-wise GEMM) ────────────
+
+
+@torch.no_grad()
+def _batch_deepgemm_fp8_nt_groupwise_reference(
+    a, b, a_scale, b_scale, masked_m, expected_m, **_unused
+):
+    """Reference for batch_deepgemm_fp8_nt_groupwise. Per-batch FP8 GEMM
+    with 1x128 input scales and 128x128 weight scales, masked-M variant.
+    """
+    B = a.shape[0]
+    M_max = a.shape[1]
+    N = b.shape[1]
+    out = torch.zeros(B, M_max, N, dtype=torch.bfloat16, device=a.device)
+    for g in range(B):
+        m = int(masked_m[g].item())
+        if m <= 0:
+            continue
+        af = a[g, :m].to(torch.float32)
+        bf = b[g].to(torch.float32)
+        if a_scale is not None:
+            sa = a_scale[g, :m].to(torch.float32).repeat_interleave(128, dim=-1)
+            af = af * sa[:, : af.shape[-1]]
+        if b_scale is not None:
+            sb = (
+                b_scale[g]
+                .to(torch.float32)
+                .repeat_interleave(128, dim=0)
+                .repeat_interleave(128, dim=1)
+            )
+            bf = bf * sb[: bf.shape[0], : bf.shape[1]]
+        out[g, :m] = (af @ bf.T).to(torch.bfloat16)
+    return out
+
+
+def _batch_deepgemm_fp8_nt_groupwise_init(
+    *,
+    batch_size: int,
+    M_max: int = 128,
+    N: int = 4096,
+    K: int = 4096,
+    K_div_128: int = 0,
+    N_div_128: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for batched DeepGEMM FP8 group-wise GEMM.
+
+    Sourced from ``tests/gemm/test_groupwise_scaled_gemm_fp8.py`` (DeepGEMM
+    backend): per-batch ``randn`` bf16 a/b passed through the 1×128 / 128×128
+    block-quantization helpers (same scheme as MoE / SM90 block-scale).
+    """
+    del K_div_128, N_div_128
+    torch.manual_seed(seed)
+    a_bf16 = torch.randn(batch_size, M_max, K, dtype=torch.bfloat16, device=device)
+    b_bf16 = torch.randn(batch_size, N, K, dtype=torch.bfloat16, device=device)
+    a = torch.empty(batch_size, M_max, K, dtype=torch.float8_e4m3fn, device=device)
+    a_scale = torch.empty(
+        batch_size, M_max, K // 128, dtype=torch.float32, device=device
+    )
+    for g in range(batch_size):
+        q, s = fp8_block_quant_1d(a_bf16[g], block=128)
+        a[g] = q
+        a_scale[g] = s
+    b, b_scale = fp8_block_quant_2d(b_bf16, block=128)
+    masked_m = torch.full((batch_size,), M_max, dtype=torch.int32, device=device)
+    return {
+        "a": a,
+        "b": b,
+        "a_scale": a_scale,
+        "b_scale": b_scale,
+        "masked_m": masked_m,
+        "expected_m": int(M_max),
+    }
+
+
+batch_deepgemm_fp8_nt_groupwise_trace = TraceTemplate(
+    op_type="gemm_fp8",
+    name_prefix="batch_deepgemm_fp8_nt_groupwise",
+    description=(
+        "Batched FP8 group-wise GEMM (DeepGEMM backend). 1x128 scale "
+        "granularity along K for input; 128x128 for weight. Mask-M "
+        "variant — only the first ``masked_m[g]`` rows of group g "
+        "participate."
+    ),
+    axes={
+        "batch_size": Var(),
+        "M_max": Var(),
+        "N": Const(abbrev="n"),
+        "K": Const(abbrev="k"),
+        "K_div_128": Var(description="K // 128 (input block scale dim)."),
+        "N_div_128": Var(description="N // 128."),
+    },
+    inputs={
+        "a": Tensor(["batch_size", "M_max", "K"]),
+        "b": Tensor(["batch_size", "N", "K"]),
+        "a_scale": Tensor(
+            ["batch_size", "M_max", "K_div_128"],
+            dtype="float32",
+        ),
+        "b_scale": Tensor(
+            ["batch_size", "N_div_128", "K_div_128"],
+            dtype="float32",
+        ),
+        "masked_m": Tensor(["batch_size"], dtype="int32"),
+        "expected_m": Scalar("int32"),
+    },
+    outputs={
+        "out": Tensor(["batch_size", "M_max", "N"], dtype="bfloat16"),
+    },
+    tags=["status:verified", "quantization:float8_e4m3fn"],
+    reference=_batch_deepgemm_fp8_nt_groupwise_reference,
+    init=_batch_deepgemm_fp8_nt_groupwise_init,
+)
+
+
+# ── mm_M1_16_K7168_N256 (DeepSeek-V3 router GEMM, fixed shape) ───────────────
+
+
+@torch.no_grad()
+def _mm_M1_16_K7168_N256_reference(
+    mat_a, mat_b, out, launch_with_pdl: bool = False, **_unused
+):
+    """Reference for the DeepSeek-V3 router GEMM (M=1..16, K=7168, N=256).
+    Mutates ``out`` in-place; returns it.
+    """
+    a = mat_a.to(torch.float32)
+    b = mat_b.to(torch.float32)
+    out.copy_((a @ b).to(out.dtype))
+    return out
+
+
+def _mm_M1_16_K7168_N256_init(
+    *,
+    M: int,
+    K: int = 7168,
+    N: int = 256,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for the DeepSeek-V3 router GEMM. Mutates ``out``."""
+    torch.manual_seed(seed)
+    M = int(M)
+    if not 1 <= M <= 16:
+        raise ValueError(f"M must be in [1, 16], got {M}")
+    mat_a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    mat_b = torch.randn(K, N, dtype=torch.bfloat16, device=device)
+    out = torch.empty(M, N, dtype=torch.bfloat16, device=device)
+    return {"mat_a": mat_a, "mat_b": mat_b, "out": out}
+
+
+mm_M1_16_K7168_N256_trace = TraceTemplate(
+    op_type="gemm_bf16",
+    name_prefix="mm_M1_16_K7168_N256",
+    description=(
+        "DeepSeek-V3 router-GEMM specialization: out = mat_a @ mat_b for "
+        "M in [1, 16], K=7168, N=256. Mutates ``out`` in-place."
+    ),
+    axes={
+        "M": Var(description="Number of tokens (1-16)."),
+        "K": Const(description="DeepSeek-V3 hidden dim (7168).", abbrev="k"),
+        "N": Const(description="Number of experts (256).", abbrev="n"),
+    },
+    inputs={
+        "mat_a": Tensor(["M", "K"]),
+        "mat_b": Tensor(["K", "N"]),
+        "out": Tensor(["M", "N"], description="In-place output."),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype_from="mat_a"),
+    },
+    tags=["status:verified", "moe"],
+    reference=_mm_M1_16_K7168_N256_reference,
+    init=_mm_M1_16_K7168_N256_init,
+)
+
+
+# ── mm_M1_16_K6144_N256 (GLM-MoE-DSA router GEMM, fixed shape) ───────────────
+
+
+@torch.no_grad()
+def _mm_M1_16_K6144_N256_reference(
+    mat_a, mat_b, out, launch_with_pdl: bool = False, **_unused
+):
+    """Reference for the GLM-MoE-DSA router GEMM (M=1..16, K=6144, N=256).
+    Mutates ``out`` in-place; returns it.
+    """
+    a = mat_a.to(torch.float32)
+    b = mat_b.to(torch.float32)
+    out.copy_((a @ b).to(out.dtype))
+    return out
+
+
+mm_M1_16_K6144_N256_trace = TraceTemplate(
+    op_type="gemm_bf16",
+    name_prefix="mm_M1_16_K6144_N256",
+    description=(
+        "GLM-MoE-DSA router-GEMM specialization: out = mat_a @ mat_b for "
+        "M in [1, 16], K=6144, N=256. Mutates ``out`` in-place."
+    ),
+    axes={
+        "M": Var(description="Number of tokens (1-16)."),
+        "K": Const(description="GLM-MoE-DSA hidden dim (6144).", abbrev="k"),
+        "N": Const(description="Number of experts (256).", abbrev="n"),
+    },
+    inputs={
+        "mat_a": Tensor(["M", "K"]),
+        "mat_b": Tensor(["K", "N"]),
+        "out": Tensor(["M", "N"], description="In-place output."),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype_from="mat_a"),
+    },
+    tags=["status:verified", "moe"],
+    reference=_mm_M1_16_K6144_N256_reference,
+)
+
+
+# ── trtllm_ragged_attention_deepseek (DeepSeek ragged prefill) ───────────────
+
+
+@torch.no_grad()
+def _trtllm_ragged_attention_deepseek_reference(
+    query,
+    key,
+    value,
+    workspace_buffer,
+    seq_lens,
+    max_q_len,
+    max_kv_len,
+    bmm1_scale,
+    bmm2_scale,
+    o_sf_scale,
+    batch_size,
+    window_left,
+    cum_seq_lens_q,
+    cum_seq_lens_kv,
+    enable_pdl,
+    is_causal,
+    return_lse,
+    **_unused,
+):
+    """Reference for DeepSeek ragged prefill: variable-length per-batch
+    SDPA on ragged Q/K/V with optional causal mask and sliding window.
+    Mutates / returns the output tensor.
+    """
+    s = (
+        float(bmm1_scale)
+        if not isinstance(bmm1_scale, torch.Tensor)
+        else float(bmm1_scale.item())
+    )
+    s2 = (
+        float(bmm2_scale)
+        if not isinstance(bmm2_scale, torch.Tensor)
+        else float(bmm2_scale.item())
+    )
+    H = query.shape[-2]
+    out = torch.zeros_like(query, dtype=torch.float32)
+    for b in range(int(batch_size)):
+        q_start = int(cum_seq_lens_q[b].item())
+        q_end = int(cum_seq_lens_q[b + 1].item())
+        kv_start = int(cum_seq_lens_kv[b].item())
+        kv_end = int(cum_seq_lens_kv[b + 1].item())
+        if q_end <= q_start or kv_end <= kv_start:
+            continue
+        q_b = query[q_start:q_end].to(torch.float32)
+        k_b = key[kv_start:kv_end].to(torch.float32)
+        v_b = value[kv_start:kv_end].to(torch.float32)
+        qi = q_end - q_start
+        kv_len = kv_end - kv_start
+        delta = kv_len - qi
+        for h in range(H):
+            logits = (q_b[:, h] @ k_b[:, h].T) * s
+            if is_causal:
+                mask = torch.full_like(logits, float("-inf"))
+                for i in range(qi):
+                    lo = max(0, i + 1 + delta - max(0, int(window_left)))
+                    hi = i + 1 + max(0, delta)
+                    mask[i, lo:hi] = 0.0
+                logits = logits + mask
+            attn = torch.softmax(logits, dim=-1)
+            out[q_start:q_end, h] = (attn @ v_b[:, h]) * s2
+    return out.to(query.dtype)
+
+
+def _trtllm_ragged_attention_deepseek_init(
+    *,
+    num_q_tokens: int,
+    num_kv_tokens: int = 256,
+    batch_size: int = 4,
+    batch_size_plus_1: int = 0,
+    num_heads: int = 32,
+    head_dim_qk: int = 192,
+    head_dim_v: int = 128,
+    head_dim: int = 0,
+    workspace_size: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``trtllm_ragged_attention_deepseek``.
+
+    Distributes ``num_q_tokens`` / ``num_kv_tokens`` across
+    ``batch_size`` so the cumulative-length tails equal the totals
+    exactly (the previous integer-division version dropped the
+    remainder when totals weren't multiples of ``batch_size``).
+    """
+    del batch_size_plus_1
+    if head_dim:
+        head_dim_qk = head_dim
+        head_dim_v = head_dim
+    if workspace_size <= 0:
+        workspace_size = num_q_tokens
+    torch.manual_seed(seed)
+    q = torch.randn(
+        num_q_tokens, num_heads, head_dim_qk, dtype=torch.bfloat16, device=device
+    )
+    k = torch.randn(
+        num_kv_tokens, num_heads, head_dim_qk, dtype=torch.bfloat16, device=device
+    )
+    v = torch.randn(
+        num_kv_tokens, num_heads, head_dim_v, dtype=torch.bfloat16, device=device
+    )
+    workspace_buffer = torch.empty(workspace_size, dtype=torch.uint8, device=device)
+
+    def _split_into_indptr(total: int) -> torch.Tensor:
+        base = total // max(1, batch_size)
+        rem = total % max(1, batch_size)
+        cum = [0]
+        for i in range(batch_size):
+            cum.append(cum[-1] + base + (1 if i < rem else 0))
+        return torch.tensor(cum, dtype=torch.int32, device=device)
+
+    cum_q = _split_into_indptr(num_q_tokens)
+    cum_kv = _split_into_indptr(num_kv_tokens)
+    seq_lens = (cum_kv[1:] - cum_kv[:-1]).to(torch.int32)
+    max_q_len = int((cum_q[1:] - cum_q[:-1]).max().item()) if batch_size else 0
+    max_kv_len = int(seq_lens.max().item()) if batch_size else 0
+    return {
+        "query": q,
+        "key": k,
+        "value": v,
+        "workspace_buffer": workspace_buffer,
+        "seq_lens": seq_lens,
+        "max_q_len": max_q_len,
+        "max_kv_len": max_kv_len,
+        "bmm1_scale": 1.0 / math.sqrt(head_dim_qk),
+        "bmm2_scale": 1.0,
+        "o_sf_scale": 1.0,
+        "batch_size": int(batch_size),
+        "window_left": -1,
+        "cum_seq_lens_q": cum_q,
+        "cum_seq_lens_kv": cum_kv,
+        "is_causal": 1,
+        "return_lse": 0,
+    }
+
+
+trtllm_ragged_attention_deepseek_trace = TraceTemplate(
+    op_type="trtllm_paged",
+    name_prefix="trtllm_ragged_attention_deepseek",
+    description=(
+        "DeepSeek-specific TRT-LLM ragged-batch attention. Variable-length "
+        "Q and KV tensors (cum_seq_lens_q / cum_seq_lens_kv), optional "
+        "causal + sliding-window masks. Used in DeepSeek-V3 prefill."
+    ),
+    axes={
+        "num_q_tokens": Var(),
+        "num_kv_tokens": Var(),
+        "num_heads": Const(abbrev="h"),
+        # DeepSeek MLA splits Q/K's head_dim (qk_nope + qk_rope = 192) from V's
+        # head_dim (qk_nope = 128). Keeping them as separate const axes lets the
+        # template match the actual call.
+        "head_dim_qk": Const(abbrev="d_qk"),
+        "head_dim_v": Const(abbrev="d_v"),
+        "batch_size": Var(),
+        "batch_size_plus_1": Var(description="batch_size + 1."),
+        "workspace_size": Var(description="Workspace buffer length in bytes."),
+    },
+    inputs={
+        "query": Tensor(["num_q_tokens", "num_heads", "head_dim_qk"]),
+        "key": Tensor(["num_kv_tokens", "num_heads", "head_dim_qk"]),
+        "value": Tensor(["num_kv_tokens", "num_heads", "head_dim_v"]),
+        "workspace_buffer": Tensor(
+            ["workspace_size"],
+            dtype="uint8",
+            description="Workspace scratch (flat byte buffer).",
+        ),
+        "seq_lens": Tensor(["batch_size"], dtype="int32"),
+        "max_q_len": Scalar("int32"),
+        "max_kv_len": Scalar("int32"),
+        "bmm1_scale": Scalar("float32"),
+        "bmm2_scale": Scalar("float32"),
+        "o_sf_scale": Scalar("float32"),
+        "batch_size": Scalar("int32"),
+        "window_left": Scalar("int32"),
+        "cum_seq_lens_q": Tensor(["batch_size_plus_1"], dtype="int32"),
+        "cum_seq_lens_kv": Tensor(["batch_size_plus_1"], dtype="int32"),
+        "is_causal": Scalar("bool"),
+        "return_lse": Scalar("bool"),
+        "enable_pdl": Scalar("bool", optional=True),
+        "skip_softmax_threshold_scale_factor": Scalar("float32", optional=True),
+        "skip_all_rows_active_check": Scalar(
+            "bool",
+            optional=True,
+            description=(
+                "Defaults to True for the all-rows-active fast path; paired CPU "
+                "length mirrors take precedence, and False without mirrors "
+                "requests device-derived row checking."
+            ),
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_q_tokens", "num_heads", "head_dim_v"], dtype_from="query"
+        ),
+    },
+    tags=["status:verified", "stage:prefill", "backend:trtllm"],
+    reference=_trtllm_ragged_attention_deepseek_reference,
+    init=_trtllm_ragged_attention_deepseek_init,
+)
+
+
+# ── SVDQuant fused NVFP4 GEMM (SM100 and SM120) ──────────────────────────────
+
+
+def _mm_nvfp4_svdquant_init(
+    *,
+    M: int,
+    N: int = 3072,
+    K: int = 3072,
+    SF_A: int = 0,
+    SF_B: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_nvfp4_svdquant``.
+
+    Mirrors the SVDQuant linear decomposition W ~= R + L1 @ L2 at Qwen-Image
+    shapes: the residual weight is NVFP4-quantized (via ``nvfp4_quantize_smooth``
+    with a unit smoothing scale, which is byte-identical to the stock NVFP4
+    quantizer), the activation is smooth-quantized, and the rank-32 LoRA factors
+    follow the host-side folding contract (``d = x_hat @ L2ᵀ``, ``l1 = L1 / alpha``).
+    """
+    from flashinfer import nvfp4_quantize_smooth  # noqa: PLC0415
+
+    del SF_A, SF_B  # derived axes
+
+    torch.manual_seed(seed)
+    rank = 32
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device) / math.sqrt(K)
+    pqs = torch.rand(K, dtype=torch.bfloat16, device=device) + 0.5
+    l1 = torch.randn(N, rank, dtype=torch.bfloat16, device=device) / math.sqrt(rank)
+    l2 = torch.randn(rank, K, dtype=torch.bfloat16, device=device) / math.sqrt(K)
+
+    x_hat = (x.float() * pqs.float()).to(torch.bfloat16)
+    x_gs = (
+        ((448 * 6) / x_hat.float().abs().nan_to_num().max())
+        .to(torch.float32)
+        .reshape(1)
+    )
+    w_gs = ((448 * 6) / w.float().abs().nan_to_num().max()).to(torch.float32).reshape(1)
+    ones = torch.ones(K, dtype=torch.bfloat16, device=device)
+
+    a, a_sf = nvfp4_quantize_smooth(x, pqs, x_gs)
+    b, b_sf = nvfp4_quantize_smooth(w, ones, w_gs)
+    alpha = (1.0 / (x_gs * w_gs)).to(torch.float32).reshape(1)
+    d = torch.mm(x_hat, l2.t().contiguous().to(torch.bfloat16))
+    l1_scaled = (l1.float() / alpha.item()).to(torch.bfloat16)
+    return {
+        "a": a,
+        "b": b,
+        "a_sf": a_sf,
+        "b_sf": b_sf,
+        "alpha": alpha,
+        "d": d,
+        "l1": l1_scaled,
+    }
+
+
+mm_nvfp4_svdquant_trace = TraceTemplate(
+    op_type="gemm_nvfp4_svdquant",
+    description=(
+        "SVDQuant NVFP4 GEMM: out = alpha * (a @ bᵀ + d @ l1ᵀ). "
+        "SM100/SM103 use fused CUTLASS; SM120/SM121 use fused CuTe DSL, with "
+        "an explicit cute-dsl-unfused oracle. 1/alpha is "
+        "pre-folded into l1."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K_packed": Const(description="K / 2 (two e2m1 values per byte)."),
+        "SF_A": Var(
+            description="128x4-swizzled activation scale buffer size derived from M and K."
+        ),
+        "SF_B": Var(
+            description="128x4-swizzled weight scale buffer size derived from N and K."
+        ),
+        "rank": Const(description="LoRA rank, a positive multiple of 32."),
+    },
+    inputs={
+        "a": Tensor(
+            ["M", "K_packed"],
+            param="a",
+            description="Smooth-quantized activation, packed e2m1 as uint8.",
+        ),
+        "b": Tensor(
+            ["N", "K_packed"],
+            param="b",
+            description="NVFP4 residual weight, packed e2m1 as uint8, row-major.",
+        ),
+        "a_sf": Tensor(
+            ["SF_A"],
+            param="a_sf",
+            description="Activation block scales, ue4m3 as uint8, 128x4 swizzled.",
+        ),
+        "b_sf": Tensor(
+            ["SF_B"],
+            param="b_sf",
+            description="Weight block scales, ue4m3 as uint8, 128x4 swizzled.",
+        ),
+        "alpha": Tensor(
+            ["1"],
+            param="alpha",
+            description="Per-tensor residual dequant scale, float32 device scalar.",
+        ),
+        "d": Tensor(
+            ["M", "rank"],
+            param="d",
+            description="LoRA-down output x_hat @ L2ᵀ, bf16.",
+        ),
+        "l1": Tensor(
+            ["N", "rank"],
+            param="l1",
+            description="LoRA-up weight pre-divided by alpha, bf16.",
+        ),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype="bfloat16"),
+    },
+    constraints=[
+        "SF_A == ((M + 127) // 128) * 128 * (((K_packed * 2 // 16) + 3) // 4) * 4",
+        "SF_B == ((N + 127) // 128) * 128 * (((K_packed * 2 // 16) + 3) // 4) * 4",
+    ],
+    tags=["quantization:fp4"],
+    init=_mm_nvfp4_svdquant_init,
+)
+
+
+def _nvfp4_quantize_smooth_init(
+    *,
+    M: int,
+    N: int = 3072,
+    N_half: int = 0,
+    SF: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.nvfp4_quantize_smooth``."""
+    del N_half, SF  # output-only / derived axes
+    torch.manual_seed(seed)
+    x = torch.randn(M, N, dtype=torch.bfloat16, device=device)
+    pqs = torch.rand(N, dtype=torch.bfloat16, device=device) + 0.5
+    x_hat = (x.float() * pqs.float()).to(torch.bfloat16)
+    gs = (
+        ((448 * 6) / x_hat.float().abs().nan_to_num().max())
+        .to(torch.float32)
+        .reshape(1)
+    )
+    return {"x": x, "pre_quant_scale": pqs, "global_scale": gs}
+
+
+nvfp4_quantize_smooth_trace = TraceTemplate(
+    op_type="quantize_nvfp4_smooth",
+    description=(
+        "Smooth + NVFP4 quantization: (xq, sf) = nvfp4-quantize(x * pre_quant_scale). "
+        "SM100/SM103 and SM120/SM121 fuse smoothing into quantization; the "
+        "SM120/SM121 path uses CuTe DSL. Both use ue4m3 block "
+        "scales, 128x4 swizzled layout, and SF vector size 16."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "N_half": Var(description="N / 2 (two e2m1 values per byte)."),
+        "SF": Var(description="128x4-swizzled scale buffer size derived from M and N."),
+    },
+    inputs={
+        "x": Tensor(["M", "N"], param="x", description="Input activation, bf16."),
+        "pre_quant_scale": Tensor(
+            ["N"],
+            param="pre_quant_scale",
+            description="Per-input-channel smoothing scale, bf16.",
+        ),
+        "global_scale": Tensor(
+            ["1"],
+            param="global_scale",
+            description="Global scale, float32 device scalar.",
+        ),
+    },
+    outputs={
+        "xq": Tensor(["M", "N_half"], dtype="uint8"),
+        "sf": Tensor(["SF"], dtype="uint8"),
+    },
+    constraints=[
+        "N_half == N // 2",
+        "SF == ((M + 127) // 128) * 128 * ((N // 16 + 3) // 4) * 4",
+    ],
+    tags=["quantization:fp4"],
+    init=_nvfp4_quantize_smooth_init,
+)
+
+
+def _svdquant_linear_init(
+    *,
+    M: int,
+    SF_B: int = 0,
+    N: int = 3072,
+    K: int = 3072,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.svdquant_linear`` (full SVDQuant linear chain)."""
+    from flashinfer import nvfp4_quantize_smooth  # noqa: PLC0415
+
+    del SF_B  # derived axis
+    torch.manual_seed(seed)
+    rank = 32
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device) / math.sqrt(K)
+    pqs = torch.rand(K, dtype=torch.bfloat16, device=device) + 0.5
+    l1 = torch.randn(N, rank, dtype=torch.bfloat16, device=device) / math.sqrt(rank)
+    l2 = torch.randn(rank, K, dtype=torch.bfloat16, device=device) / math.sqrt(K)
+
+    x_hat = (x.float() * pqs.float()).to(torch.bfloat16)
+    x_gs = (
+        ((448 * 6) / x_hat.float().abs().nan_to_num().max())
+        .to(torch.float32)
+        .reshape(1)
+    )
+    w_gs = ((448 * 6) / w.float().abs().nan_to_num().max()).to(torch.float32).reshape(1)
+    ones = torch.ones(K, dtype=torch.bfloat16, device=device)
+
+    weight_fp4, weight_sf = nvfp4_quantize_smooth(w, ones, w_gs)
+    alpha = (1.0 / (x_gs * w_gs)).to(torch.float32).reshape(1)
+    l2t_smoothed = (pqs.float()[:, None] * l2.float().t()).to(torch.bfloat16)
+    l1_scaled = (l1.float() / alpha.item()).to(torch.bfloat16)
+    return {
+        "x": x,
+        "weight_fp4": weight_fp4,
+        "weight_sf": weight_sf,
+        "alpha": alpha,
+        "pre_quant_scale": pqs,
+        "l2t_smoothed": l2t_smoothed,
+        "l1_scaled": l1_scaled,
+        "global_scale": x_gs,
+    }
+
+
+svdquant_linear_trace = TraceTemplate(
+    op_type="linear_nvfp4_svdquant",
+    description=(
+        "Full SVDQuant linear: y = (x * pre_quant_scale) @ (R + L1 @ L2)ᵀ where R is the "
+        "NVFP4-quantized residual weight — smooth-quantize, BF16 rank-r down-projection, "
+        "and the architecture-selected NVFP4 residual + LoRA-up GEMM."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+        "K_packed": Const(description="K / 2 (two e2m1 values per byte)."),
+        "SF_B": Var(
+            description="128x4-swizzled weight scale buffer size derived from N and K."
+        ),
+        "rank": Const(description="LoRA rank, a positive multiple of 32."),
+    },
+    inputs={
+        "x": Tensor(["M", "K"], param="x", description="Input activation, bf16."),
+        "weight_fp4": Tensor(
+            ["N", "K_packed"],
+            param="weight_fp4",
+            description="NVFP4 residual weight, packed e2m1 as uint8.",
+        ),
+        "weight_sf": Tensor(
+            ["SF_B"],
+            param="weight_sf",
+            description="Weight block scales, ue4m3 as uint8, 128x4 swizzled.",
+        ),
+        "alpha": Tensor(
+            ["1"],
+            param="alpha",
+            description="Per-tensor residual dequant scale, float32 device scalar.",
+        ),
+        "pre_quant_scale": Tensor(
+            ["K"],
+            param="pre_quant_scale",
+            description="Per-input-channel smoothing scale, bf16.",
+        ),
+        "l2t_smoothed": Tensor(
+            ["K", "rank"],
+            param="l2t_smoothed",
+            description="pre_quant_scale[:, None] * L2ᵀ, bf16.",
+        ),
+        "l1_scaled": Tensor(
+            ["N", "rank"],
+            param="l1_scaled",
+            description="L1 / alpha, bf16.",
+        ),
+        "global_scale": Tensor(
+            ["1"],
+            param="global_scale",
+            description="Activation global scale, float32 device scalar.",
+        ),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype="bfloat16"),
+    },
+    constraints=[
+        "SF_B == ((N + 127) // 128) * 128 * (((K // 16) + 3) // 4) * 4",
+    ],
+    tags=["quantization:fp4"],
+    init=_svdquant_linear_init,
+)
+
+
+# ── mm_bf16_fp8 / mm_fp16_fp8 (16-bit activation, FP8 e4m3 weight, per-tensor scale) ─
+
+
+@torch.no_grad()
+def _mm_16bit_fp8_reference(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    alpha: torch.Tensor,
+    bias=None,
+    **_unused,
+) -> torch.Tensor:
+    """``a @ (b.float() * alpha).T + bias`` with the e4m3 weight dequantized
+    exactly in fp32 and one rounding into ``a``'s dtype.  ``a`` is ``(..., K)``;
+    its leading dimensions are kept."""
+    a32 = a.to(torch.float32)
+    w = b.to(torch.float32) * alpha.to(torch.float32).reshape(())
+    res = a32 @ w.T
+    if bias is not None:
+        res = res + bias.to(torch.float32)
+    return res.to(a.dtype)
+
+
+def _mm_bf16_fp8_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    scalar: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gemm.mm_bf16_fp8`` (2-D activation).
+
+    Sourced from ``tests/gemm/test_mm_bf16_fp8.py``: a ``randn`` bf16
+    activation and a ``randn`` weight quantized per tensor to e4m3 (mirrored
+    as ``per_tensor_fp8_quantize``); ``alpha`` is the dequant multiplier.
+    """
+    del scalar
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    b_16 = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    b, inv_scale = per_tensor_fp8_quantize(b_16)
+    return {"a": a, "b": b, "alpha": inv_scale.reshape(1)}
+
+
+def _mm_fp16_fp8_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    scalar: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gemm.mm_fp16_fp8`` (2-D activation): as
+    ``_mm_bf16_fp8_init`` with a float16 activation."""
+    del scalar
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.float16, device=device)
+    b_16 = torch.randn(N, K, dtype=torch.float16, device=device)
+    b, inv_scale = per_tensor_fp8_quantize(b_16)
+    return {"a": a, "b": b, "alpha": inv_scale.reshape(1)}
+
+
+_MM_16BIT_FP8_INITS = {
+    torch.bfloat16: _mm_bf16_fp8_init,
+    torch.float16: _mm_fp16_fp8_init,
+}
+
+
+def _mm_16bit_fp8_a_dims(a_ndim: int):
+    """Leading dimension names of an ``(..., K)`` activation of ``a_ndim``
+    dimensions: none for a vector, ``M`` for a matrix, ``batch`` / ``seq_len``
+    for the usual 3-D hidden state, ``lead<i>`` beyond that."""
+    if a_ndim <= 1:
+        return []
+    if a_ndim == 2:
+        return ["M"]
+    if a_ndim == 3:
+        return ["batch", "seq_len"]
+    return [f"lead{i}" for i in range(a_ndim - 1)]
+
+
+_MM_16BIT_FP8_NAMES = {torch.bfloat16: "mm_bf16_fp8", torch.float16: "mm_fp16_fp8"}
+
+
+@functools.lru_cache(maxsize=None)
+def _mm_16bit_fp8_trace(
+    a_dtype: torch.dtype, a_ndim: int, scale_ndim: int
+) -> TraceTemplate:
+    """The template of ``mm_bf16_fp8`` / ``mm_fp16_fp8`` (by ``a_dtype``) for an
+    ``a`` of ``a_ndim`` dimensions and an ``alpha`` of ``scale_ndim`` (0 or 1)
+    dimensions: the API accepts any leading shape on ``a`` and a ``()`` or
+    ``(1,)`` scale, and the trace names the ranks it actually saw.  ``K`` is
+    read off ``a``'s last dimension."""
+    name = _MM_16BIT_FP8_NAMES[a_dtype]
+    dtype_name = str(a_dtype).removeprefix("torch.")
+    short = name.split("_")[1]  # bf16 / fp16
+    lead = _mm_16bit_fp8_a_dims(a_ndim)
+    axes: "dict[str, Var | Const]" = {dim: Var() for dim in lead}
+    axes["N"] = Const()
+    axes["K"] = Const(extract=lambda kw: int(kw["a"].shape[-1]))
+    scale_dims = []
+    scale_desc = "Per-tensor dequant scale of b, a 0-d fp32 tensor."
+    if scale_ndim == 1:
+        axes["scalar"] = Var(description="alpha tensor length (1).")
+        scale_dims = ["scalar"]
+        scale_desc = "Per-tensor dequant scale of b, shape (1,)."
+    common = a_ndim == 2 and scale_ndim == 1
+    name_prefix = name
+    if not common:
+        name_prefix += f"_a{a_ndim}d" + ("_alpha0d" if scale_ndim == 0 else "")
+    return TraceTemplate(
+        op_type=f"gemm_{short}_fp8",
+        name_prefix=name_prefix,
+        description=(
+            f"W8A16 GEMM: out = a @ (b * alpha).T + bias. a is {dtype_name} "
+            "(..., K); b is float8_e4m3fn [N, K] with one per-tensor fp32 "
+            "scale alpha, dequantized inside the kernel."
+        ),
+        axes=axes,
+        inputs={
+            "a": Tensor(lead + ["K"], dtype=dtype_name),
+            "b": Tensor(
+                ["N", "K"],
+                dtype="float8_e4m3fn",
+                description="FP8 e4m3 weight in torch.nn.Linear layout [N, K].",
+            ),
+            "alpha": Tensor(scale_dims, dtype="float32", description=scale_desc),
+            "bias": Tensor(
+                ["N"], dtype=dtype_name, optional=True, description="Bias in a's dtype."
+            ),
+        },
+        outputs={
+            "out": Tensor(lead + ["N"], dtype=dtype_name),
+        },
+        tags=["status:verified", "quantization:float8_e4m3fn"],
+        reference=_mm_16bit_fp8_reference,
+        check=_gemm_check,
+        init=_MM_16BIT_FP8_INITS[a_dtype] if common else None,
+    )
+
+
+mm_bf16_fp8_trace = _mm_16bit_fp8_trace(torch.bfloat16, 2, 1)
+mm_fp16_fp8_trace = _mm_16bit_fp8_trace(torch.float16, 2, 1)
+
+
+def _mm_16bit_fp8_dispatch(a_dtype: torch.dtype):
+    def dispatch(**kwargs):
+        a = kwargs.get("a")
+        alpha = kwargs.get("alpha")
+        a_ndim = a.ndim if a is not None else 2
+        scale_ndim = min(alpha.ndim, 1) if alpha is not None else 1
+        return _mm_16bit_fp8_trace(a_dtype, a_ndim, scale_ndim)
+
+    dispatch.__doc__ = (
+        f"Return the ``{_MM_16BIT_FP8_NAMES[a_dtype]}`` TraceTemplate matching the "
+        "call's ranks.  Passed as ``trace=`` to ``@flashinfer_api``."
+    )
+    # Registered for the consistency tests (the generic sample builder cannot
+    # form a 0-d input, so the alpha0d variants are covered by
+    # tests/trace/test_mm_bf16_fp8_trace.py).
+    dispatch.templates = [  # type: ignore[attr-defined]
+        _mm_16bit_fp8_trace(a_dtype, 2, 1),
+        _mm_16bit_fp8_trace(a_dtype, 1, 1),
+        _mm_16bit_fp8_trace(a_dtype, 3, 1),
+    ]
+    return dispatch
+
+
+mm_bf16_fp8_trace_dispatch = _mm_16bit_fp8_dispatch(torch.bfloat16)
+mm_fp16_fp8_trace_dispatch = _mm_16bit_fp8_dispatch(torch.float16)

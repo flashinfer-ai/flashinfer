@@ -32,6 +32,9 @@ import torch
 from cutlass import Float32, Int32, Uint8
 
 from ..api_logging import flashinfer_api
+from .utils import require_cute_dsl_arch as _require_cute_dsl_arch_for
+from ..trace.templates.norm import rmsnorm_fp4quant_trace
+from ..utils import device_support_pdl
 from .fp4_common import (
     # Constants
     FLOAT4_E2M1_MAX,
@@ -44,10 +47,9 @@ from .fp4_common import (
     get_ptr_as_int64,
     rcp_approx_ftz,
     fmin_f32,
+    fmax_f32,
     hmax2,
     hmax_to_f32,
-    bfloat2_hmax2,
-    bfloat2_hmax_to_f32,
     cvt_f32_to_e4m3,
     fp8_e4m3_to_f32_and_rcp,
     cvt_f32_to_ue8m0,
@@ -55,14 +57,14 @@ from .fp4_common import (
     # Helper functions for block processing
     load_8_half2,
     half2_mul_8,
-    bfloat2_mul_8,
     half2_max_abs_8,
-    bfloat2_max_abs_8,
     half2_to_float16,
     bfloat2_to_float16,
     quantize_and_pack_16,
+    compute_y_and_max_abs_f32,
     # Reduction utilities
     row_reduce,
+    zero_swizzled_sf_padding,
     # Predicate utility
     predicate_k,
 )
@@ -265,6 +267,7 @@ class RMSNormFP4QuantKernel:
         mGlobalScale: cute.Tensor,
         M: Int32,
         eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
         stream,
     ):
         """Host function to launch the kernel.
@@ -288,14 +291,26 @@ class RMSNormFP4QuantKernel:
         tiler_mn = (self.rows_per_block, self.cols_per_tile)
 
         # Launch with cluster support
-        self.kernel(mX, mW, mY, mS, mGlobalScale, M, eps, tv_layout, tiler_mn).launch(
-            grid=[cute.ceil_div(M, self.rows_per_block), self.cluster_n, 1],
+        self.kernel(
+            mX, mW, mY, mS, mGlobalScale, M, eps, enable_pdl, tv_layout, tiler_mn
+        ).launch(
+            grid=[
+                cute.ceil_div(
+                    # A swizzled scale buffer is padded to 128 rows; the CTAs past M
+                    # only zero their rows of that padding (zero_swizzled_sf_padding).
+                    (M + 127) // 128 * 128 if self.output_swizzled else M,
+                    self.rows_per_block,
+                ),
+                self.cluster_n,
+                1,
+            ],
             block=[self.num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1]
             if cutlass.const_expr(self.cluster_n > 1)
             else None,
             smem=self._smem_size_in_bytes(),
             stream=stream,
+            use_pdl=enable_pdl,
         )
 
     @cute.kernel
@@ -308,6 +323,7 @@ class RMSNormFP4QuantKernel:
         mGlobalScale: cute.Tensor,
         M: Int32,
         eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
@@ -319,6 +335,9 @@ class RMSNormFP4QuantKernel:
         """
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
+
+        if enable_pdl:
+            cute.arch.griddepcontrol_wait()
 
         H = self.H
         block_size = self.block_size
@@ -505,13 +524,13 @@ class RMSNormFP4QuantKernel:
                             max_xw_h2 = half2_max_abs_8(xw_h2)
                             max_xw = hmax_to_f32(max_xw_h2)
                             y_f32 = half2_to_float16(xw_h2, rstd)
+                            max_abs = max_xw * rstd
                         else:
-                            xw_h2 = bfloat2_mul_8(x_h2, w_h2)
-                            max_xw_h2 = bfloat2_max_abs_8(xw_h2)
-                            max_xw = bfloat2_hmax_to_f32(max_xw_h2)
-                            y_f32 = bfloat2_to_float16(xw_h2, rstd)
-
-                        max_abs = max_xw * rstd
+                            y_f32, max_abs = compute_y_and_max_abs_f32(
+                                bfloat2_to_float16(x_h2, Float32(1.0)),
+                                bfloat2_to_float16(w_h2, Float32(1.0)),
+                                rstd,
+                            )
 
                         # Compute scale factor (FP8 E4M3) - Branchless clamping
                         scale_float = global_scale_val * max_abs * fp4_max_rcp
@@ -575,17 +594,21 @@ class RMSNormFP4QuantKernel:
                             max_xw = hmax_to_f32(max_xw_h2)
                             y_f32_c0 = half2_to_float16(xw_h2_c0, rstd)
                             y_f32_c1 = half2_to_float16(xw_h2_c1, rstd)
+                            max_abs = max_xw * rstd
                         else:
-                            xw_h2_c0 = bfloat2_mul_8(x_h2_c0, w_h2_c0)
-                            xw_h2_c1 = bfloat2_mul_8(x_h2_c1, w_h2_c1)
-                            max_c0_h2 = bfloat2_max_abs_8(xw_h2_c0)
-                            max_c1_h2 = bfloat2_max_abs_8(xw_h2_c1)
-                            max_xw_h2 = bfloat2_hmax2(max_c0_h2, max_c1_h2)
-                            max_xw = bfloat2_hmax_to_f32(max_xw_h2)
-                            y_f32_c0 = bfloat2_to_float16(xw_h2_c0, rstd)
-                            y_f32_c1 = bfloat2_to_float16(xw_h2_c1, rstd)
-
-                        max_abs = max_xw * rstd
+                            # Rounding x * weight to BF16 before normalization
+                            # can move a value across an FP4 rounding midpoint.
+                            y_f32_c0, max_abs_c0 = compute_y_and_max_abs_f32(
+                                bfloat2_to_float16(x_h2_c0, Float32(1.0)),
+                                bfloat2_to_float16(w_h2_c0, Float32(1.0)),
+                                rstd,
+                            )
+                            y_f32_c1, max_abs_c1 = compute_y_and_max_abs_f32(
+                                bfloat2_to_float16(x_h2_c1, Float32(1.0)),
+                                bfloat2_to_float16(w_h2_c1, Float32(1.0)),
+                                rstd,
+                            )
+                            max_abs = fmax_f32(max_abs_c0, max_abs_c1)
 
                         # Compute scale factor (E4M3 or UE8M0 based on scale_format)
                         if cutlass.const_expr(self.scale_format == "ue8m0"):
@@ -641,6 +664,20 @@ class RMSNormFP4QuantKernel:
                         )
                         st_global_u64(out_ptr, packed64_c1)
 
+        if cutlass.const_expr(self.output_swizzled):
+            zero_swizzled_sf_padding(
+                mS,
+                M,
+                actual_row_idx,
+                lane_in_row,
+                num_sf_blocks_per_row,
+                self.num_k_tiles,
+                self.threads_per_row,
+            )
+
+        if enable_pdl:
+            cute.arch.griddepcontrol_launch_dependents()
+
 
 # =============================================================================
 # PyTorch API Functions - Streamlined with Pointer-based Compilation
@@ -655,6 +692,7 @@ def _get_compiled_kernel(
     sm_version: int,
     scale_format: str,
     is_sf_swizzled_layout: bool,
+    enable_pdl: bool = False,
 ) -> Callable:
     """
     Get a compiled kernel closure that takes torch.Tensor directly.
@@ -725,6 +763,7 @@ def _get_compiled_kernel(
         global_scale_fake,
         Int32(1),  # Dummy M
         Float32(1e-6),  # Dummy eps
+        enable_pdl,
         stream_fake,
         options="--enable-tvm-ffi",
     )
@@ -757,7 +796,7 @@ def _get_compiled_kernel(
     return tensor_api
 
 
-@flashinfer_api
+@flashinfer_api(trace=rmsnorm_fp4quant_trace)
 def rmsnorm_fp4quant(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -768,6 +807,7 @@ def rmsnorm_fp4quant(
     block_size: int = 16,
     scale_format: str | None = None,
     is_sf_swizzled_layout: bool = False,
+    enable_pdl: bool | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Fused RMS normalization with FP4 quantization using CuTe-DSL.
@@ -823,6 +863,12 @@ def rmsnorm_fp4quant(
         ``[m_tile_idx * k_tiles * 512 + k_tile_idx * 512 + outer_m * 16 + inner_m * 4 + inner_k]``
         where ``outer_m = row % 32``, ``inner_m = (row % 128) // 32``, etc.
         Default is ``False`` (row-major layout).
+    enable_pdl : bool, optional
+        Whether to launch with Programmatic Dependent Launch (PDL). When
+        ``None`` (default) or ``True``, PDL is enabled only if the current
+        device supports it (probed via :func:`device_support_pdl`). Pass
+        ``False`` to force-disable. See
+        https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
 
     Returns
     -------
@@ -839,6 +885,7 @@ def rmsnorm_fp4quant(
     - For block_size=32 (MXFP4): uses UE8M0 scale factors (power-of-2 scales).
     - FP4 E2M1 format has a max representable value of 6.0.
     """
+    _require_cute_dsl_arch_for(input.device)
     # Handle 2D vs 3D input
     is_3d = input.dim() == 3
     if is_3d:
@@ -860,6 +907,16 @@ def rmsnorm_fp4quant(
         scale_format if scale_format else ("ue8m0" if block_size == 32 else "e4m3")
     )
     sm_version = get_sm_version(input.device)
+
+    if enable_pdl is None or enable_pdl:
+        enable_pdl = device_support_pdl(input.device)
+
+    # Caller-provided outputs are written in place with row-major addressing; a
+    # strided view would be written through a temporary copy and left unchanged.
+    if y_fp4 is not None:
+        assert y_fp4.is_contiguous(), "y_fp4 must be contiguous"
+    if block_scale is not None:
+        assert block_scale.is_contiguous(), "block_scale must be contiguous"
 
     # Allocate output tensors if not provided
     if y_fp4 is None:
@@ -928,6 +985,7 @@ def rmsnorm_fp4quant(
         sm_version,
         actual_scale_format,
         is_sf_swizzled_layout,
+        enable_pdl,
     )
     tensor_api(
         input_2d.contiguous(),

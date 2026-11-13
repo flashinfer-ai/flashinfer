@@ -94,12 +94,38 @@ def get_vllm_comm_module():
 def init_custom_ar(
     ipc_tensors: List[int], rank_data: torch.Tensor, rank: int, full_nvlink: bool
 ) -> int:
+    r"""Initialize the vLLM custom all-reduce backend.
+
+    Parameters
+    ----------
+    ipc_tensors : list[int]
+        IPC pointers to the per-rank communication buffers.
+    rank_data : torch.Tensor
+        Scratch tensor (one per rank) used for metadata exchange.
+    rank : int
+        Current rank within the all-reduce world.
+    full_nvlink : bool
+        ``True`` when every pair of ranks is connected via NVLink (enables
+        the fully-NVLink-optimized kernel path).
+
+    Returns
+    -------
+    int
+        Opaque handle (``fa``) to be passed to subsequent ``vllm_ar`` calls.
+    """
     return get_vllm_comm_module().init_custom_ar(
         ipc_tensors, rank_data, rank, full_nvlink
     )
 
 
 def dispose(fa: int) -> None:
+    r"""Release the resources held by a vLLM custom all-reduce handle.
+
+    Parameters
+    ----------
+    fa : int
+        Handle returned by :func:`init_custom_ar`.
+    """
     get_vllm_comm_module().dispose(fa)
 
 
@@ -111,35 +137,76 @@ def all_reduce(
     reg_buffer_sz_bytes: int,
     num_ctas: int,
 ) -> None:
-    """Performs an out-of-place all reduce.
+    r"""Perform an out-of-place all-reduce via the vLLM custom kernel.
 
-    Args:
-        fa: The handle to the custom all reduce.
-        inp: The input tensor to all reduce.
-        out: The output tensor to all reduce.
-        reg_buffer: The register buffer to all reduce.
-        reg_buffer_sz_bytes: The size of the register buffer.
-        num_ctas: The number of CTAs to use for the all reduce.
-        CTA upper bounds: 36. Generally, we can saturate the bandwidth even with small amount the SMs.
+    Parameters
+    ----------
+    fa : int
+        Handle returned by :func:`init_custom_ar`.
+    inp : torch.Tensor
+        Input tensor (rank-local contribution).
+    out : torch.Tensor
+        Pre-allocated output tensor (receives the reduced result).
+    reg_buffer : int
+        Device pointer to the registered buffer used by the kernel.
+    reg_buffer_sz_bytes : int
+        Size of ``reg_buffer`` in bytes.
+    num_ctas : int
+        Number of CTAs to launch.  Upper bound is 36; small values are
+        usually enough to saturate NVLink bandwidth.
     """
     get_vllm_comm_module().all_reduce(
         fa, inp, out, reg_buffer, reg_buffer_sz_bytes, num_ctas
     )
 
 
-def get_graph_buffer_ipc_meta(fa) -> Tuple[List[int], List[int]]:
+def get_graph_buffer_ipc_meta(fa: int) -> Tuple[List[int], List[int]]:
+    r"""Return IPC metadata for graph-capture buffers.
+
+    Parameters
+    ----------
+    fa : int
+        Handle returned by :func:`init_custom_ar`.
+
+    Returns
+    -------
+    Tuple[list[int], list[int]]
+        ``(output_bytes, output_offsets)`` describing the registered
+        graph-capture buffers.  Used to publish IPC handles to peer ranks.
+    """
     return get_vllm_comm_module().get_graph_buffer_ipc_meta(fa)
 
 
 def register_buffer(fa: int, fake_ipc_ptrs: List[int]) -> None:
+    r"""Register a peer's IPC-shared buffer with the local all-reduce handle.
+
+    Parameters
+    ----------
+    fa : int
+        Handle returned by :func:`init_custom_ar`.
+    fake_ipc_ptrs : list[int]
+        Per-rank IPC pointers obtained from each peer.
+    """
     return get_vllm_comm_module().register_buffer(fa, fake_ipc_ptrs)
 
 
 def register_graph_buffers(
     fa: int, handles: List[List[int]], offsets: List[List[int]]
 ) -> None:
+    r"""Register graph-capture buffers across the all-reduce world.
+
+    Parameters
+    ----------
+    fa : int
+        Handle returned by :func:`init_custom_ar`.
+    handles : list[list[int]]
+        Per-rank IPC handles published via :func:`get_graph_buffer_ipc_meta`.
+    offsets : list[list[int]]
+        Per-rank offsets matching ``handles``.
+    """
     get_vllm_comm_module().register_graph_buffers(fa, handles, offsets)
 
 
 def meta_size() -> int:
+    r"""Return the size of the vLLM all-reduce metadata structure in bytes."""
     return get_vllm_comm_module().meta_size()

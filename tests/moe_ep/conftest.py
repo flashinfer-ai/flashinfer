@@ -1,0 +1,156 @@
+"""Shared fixtures for moe_ep multirank tests."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+import tempfile
+
+import pytest
+
+# When pytest is launched under torchrun, avoid shadowing the native
+# ``nccl_ep`` / ``nixl_ep`` extension modules with the mock test subpackages
+# under ``tests/moe_ep/{nccl,nixl}_ep/``.
+_MOE_EP_TEST_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path[:] = [
+    p for p in sys.path if os.path.abspath(p or os.getcwd()) != _MOE_EP_TEST_ROOT
+]
+
+
+def pytest_make_parametrize_id(config, val, argname):
+    from tests.moe.utils import parametrize_id
+
+    return parametrize_id(val)
+
+
+@pytest.fixture
+def dist_not_initialized():
+    """Hide a prior torch.distributed init from bootstrap validation.
+
+    Earlier unit tests may leave a world_size=1 process group active via
+    ``auto_bootstrap=True`` layer construction; init tests that assert on
+    config fields other than bootstrap sizing need an isolated view of dist.
+    """
+    from unittest import mock
+
+    with mock.patch("torch.distributed.is_initialized", return_value=False):
+        yield
+
+
+@pytest.fixture(scope="session")
+def isolated_deep_gemm_cache():
+    """Provide one session cache when the caller did not configure DeepGEMM."""
+    configured_cache = os.environ.get("TRTLLM_DG_CACHE_DIR")
+    if configured_cache is not None:
+        yield configured_cache
+        return
+
+    cache_dir = tempfile.mkdtemp(prefix="flashinfer-deep-gemm-test-")
+    os.environ["TRTLLM_DG_CACHE_DIR"] = cache_dir
+    try:
+        yield cache_dir
+    finally:
+        if os.environ.get("TRTLLM_DG_CACHE_DIR") == cache_dir:
+            os.environ.pop("TRTLLM_DG_CACHE_DIR")
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+# NOTE: ``pytest_addoption`` (--backend), ``pytest_configure`` (nvep/gpu_*/
+# arch_blackwell markers), and ``pytest_collection_modifyitems`` (env/GPU/arch
+# auto-skips) are intentionally defined ONLY in the root ``tests/conftest.py``.
+# Re-declaring them here triggers a duplicate-option error
+# ("option names {'--backend'} already added") because pytest loads both the
+# parent and child conftests. Keep the shared fixtures below in this file.
+
+
+@pytest.fixture
+def require_split_backend(request):
+    """Gate split regressions before their first collective.
+
+    The graph tests parametrize ``backend``; unparametrized guard and memo
+    regressions exercise nccl_ep only.
+    """
+    from flashinfer.moe_ep import available_backends
+
+    callspec = getattr(request.node, "callspec", None)
+    backend = callspec.params.get("backend", "nccl_ep") if callspec else "nccl_ep"
+    selected = request.config.getoption("--backend")
+    if selected not in (None, "both", backend):
+        pytest.skip(f"requires {backend}; --backend={selected}")
+    if backend not in available_backends():
+        pytest.skip(f"{backend} backend is not available")
+
+
+@pytest.fixture
+def stubbed_fleet_registry():
+    """Inject a stub Fleet class that records dispatch/combine/destroy calls."""
+    from unittest import mock
+
+    from flashinfer.moe_ep.core.comm.fleet import _FLEET_REGISTRY
+
+    log: list[str] = []
+
+    class _StubHandle:
+        def dispatch(self, params):
+            log.append("dispatch")
+            from flashinfer.moe_ep import DispatchOutput
+
+            return DispatchOutput(
+                expert_tensors=params.x[0], num_tokens=params.x[0].size(0)
+            )
+
+        def combine(self, params):
+            log.append("combine")
+            from flashinfer.moe_ep import CombineOutput
+
+            return CombineOutput(x=params.x[0] if params.out is None else params.out)
+
+        def complete(self):
+            log.append("complete")
+
+        def destroy(self):
+            pass
+
+    class _StubFleet:
+        def __init__(self, bootstrap, params, algo_knobs):
+            log.append("fleet_init")
+            self.params = params
+
+        def create_handle(self, params, algo_knobs=()):
+            log.append("create_handle")
+            return _StubHandle()
+
+        def update_topology(self, bootstrap, algo_knobs=()):
+            pass
+
+        def destroy(self):
+            log.append("destroy")
+
+    saved_nccl = _FLEET_REGISTRY.get("nccl_ep")
+    saved_nixl = _FLEET_REGISTRY.get("nixl_ep")
+    _FLEET_REGISTRY["nccl_ep"] = _StubFleet
+    _FLEET_REGISTRY["nixl_ep"] = _StubFleet
+    with mock.patch("flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"):
+        yield log
+    if saved_nccl is not None:
+        _FLEET_REGISTRY["nccl_ep"] = saved_nccl
+    else:
+        _FLEET_REGISTRY.pop("nccl_ep", None)
+    if saved_nixl is not None:
+        _FLEET_REGISTRY["nixl_ep"] = saved_nixl
+    else:
+        _FLEET_REGISTRY.pop("nixl_ep", None)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Tear down torch.distributed once per torchrun session.
+
+    NCCL cannot be re-initialized after destroy_process_group() within the
+    same torchrun worker processes, so we must not destroy the process group
+    between individual tests (e.g. mega multirank runs two gpu_4 tests).
+    """
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        dist.destroy_process_group()

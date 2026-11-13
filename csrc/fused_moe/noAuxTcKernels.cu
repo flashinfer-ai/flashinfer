@@ -9,6 +9,15 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tvm_ffi_utils.h"
 
+#ifdef FLASHINFER_CAKE_BACKEND
+#include "cake_deepseek_fused_routing/cake_deepseek_fused_routing_kernels.cu"
+#include "cake_deepseek_fused_routing/cake_deepseek_fused_routing_kernels_sm107a_mt.cu"
+#include "cake_deepseek_fused_routing/cake_deepseek_fused_routing_kernels_sm107a_single.cu"
+#include "cake_deepseek_fused_routing_launch.cuh"
+#endif
+
+using tvm::ffi::Optional;
+
 namespace cg = cooperative_groups;
 using namespace tensorrt_llm::common;
 
@@ -21,7 +30,10 @@ static constexpr int NumTopGroupScores = 2;
 static constexpr int MaxNumTopExperts = 8;
 static constexpr int MaxNumTopGroups = 4;
 
-static __device__ inline float sigmoid_accurate(float x) { return 0.5f * tanhf(0.5f * x) + 0.5f; }
+static __device__ inline float sigmoid_accurate(float x) {
+  // Avoid cancellation when the sigmoid is close to zero.
+  return 1.0f / (1.0f + expf(-x));
+}
 
 template <typename InputT, typename BiasT, typename OutputT, typename IdxT, int MaxNumExperts,
           bool UseGroups>
@@ -30,9 +42,12 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
                                         int64_t const numGroup, int64_t const topkGroup,
                                         int64_t const topk, int64_t const numExperts,
                                         int64_t const numExpertsPerGroup,
-                                        double const routedScalingFactor) {
+                                        double const routedScalingFactor,
+                                        int16_t* routingReplayOut) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  // cudaGridDependencySynchronize() is griddepcontrol.wait plus a compiler memory barrier. Without
+  // the barrier the scores / bias loads could be hoisted above the wait.
+  cudaGridDependencySynchronize();
 #endif
 
   // declare shared memory structure
@@ -165,11 +180,16 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
       if (laneIdx < topk) {
         smemInterTopScores[warpIdx * MaxNumTopExperts + laneIdx] = topScores[laneIdx];
         smemInterTopExperts[warpIdx * MaxNumTopExperts + laneIdx] = topExperts[laneIdx];
+      } else if (laneIdx < MaxNumTopExperts) {
+        // warp 0 reduces all MaxNumTopExperts slots of every warp: the slots past topk must not
+        // be whatever the previous kernel left in shared memory
+        smemInterTopScores[warpIdx * MaxNumTopExperts + laneIdx] = invalidScoreFloat;
+        smemInterTopExperts[warpIdx * MaxNumTopExperts + laneIdx] = MaxNumExperts - 1;
       }
     }
     __syncthreads();
     if (warpIdx == 0) {
-      int constexpr NumInterTopKPerThread = (NumInterTopK * NumExpertWarps - 1) / WARP_SIZE + 1;
+      int constexpr NumInterTopKPerThread = (NumInterTopK - 1) / WARP_SIZE + 1;
       float intermidiateScore[NumInterTopKPerThread];
       int32_t intermidiateExpert[NumInterTopKPerThread];
       for (int i = laneIdx; i < NumInterTopKPerThread * WARP_SIZE; i += WARP_SIZE) {
@@ -212,11 +232,15 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
     if (laneIdx < topk) {
       topkValues[laneIdx] = static_cast<OutputT>(finalScore);
       topkIndices[laneIdx] = expertIdx;
+      // Routing replay: record selected expert IDs per token
+      if (routingReplayOut != nullptr) {
+        routingReplayOut[blockIdx.x * topk + laneIdx] = static_cast<int16_t>(expertIdx);
+      }
     }
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -224,7 +248,31 @@ template <typename InputT, typename BiasT, typename OutputT, typename IdxT>
 void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk_indices,
                    int64_t const num_tokens, int64_t const num_experts, int64_t const n_group,
                    int64_t const topk_group, int64_t const topk, double const routed_scaling_factor,
-                   bool const launch_with_pdl, cudaStream_t const stream) {
+                   bool const launch_with_pdl, cudaStream_t const stream,
+                   int16_t* routing_replay_out) {
+#ifdef FLASHINFER_CAKE_BACKEND
+  bool const cake_common = num_tokens > 0 && num_experts > 0 && n_group > 0 &&
+                           num_experts % n_group == 0 && topk > 0 && topk <= 8 &&
+                           topk <= num_experts && topk_group > 0 && topk_group <= n_group &&
+                           topk_group * n_group >= topk;
+  bool const cake_single_group = cake_common && (n_group == 1) && (num_experts <= NumKimiK2Experts);
+  int64_t const cake_experts_per_group = n_group > 0 ? num_experts / n_group : 0;
+  bool const cake_multi_group = cake_common && (n_group >= 2) && (n_group <= 8) &&
+                                (topk_group <= 4) && (num_experts <= NumDeepseekExperts) &&
+                                (cake_experts_per_group >= 2) &&
+                                (cake_experts_per_group <= WARP_SIZE) &&
+                                (cake_experts_per_group * topk_group <= MaxNumExpertsUnit);
+  TLLM_CHECK_WITH_INFO(cake_single_group || cake_multi_group,
+                       "invokeNoAuxTc: unsupported configuration (n_group=%ld, num_experts=%ld, "
+                       "topk_group=%ld). Please use original pytorch implementation.",
+                       n_group, num_experts, topk_group);
+  auto const status = flashinfer::cake_deepseek_fused_routing::launch<InputT, BiasT>(
+      scores, bias, topk_values, topk_indices, routing_replay_out, num_tokens, num_experts, n_group,
+      topk_group, topk, routed_scaling_factor, launch_with_pdl, stream);
+  TLLM_CHECK_WITH_INFO(status == cudaSuccess, "Cake fused routing launch failed: %s",
+                       cudaGetErrorString(status));
+  sync_check_cuda_error(stream);
+#else
   // Check if we can use the optimized deepseek_v3_topk_kernel
   bool const is_single_group = (n_group == 1) && (num_experts <= NumKimiK2Experts);
 
@@ -234,6 +282,9 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
                               (experts_per_group * topk_group <= MaxNumExpertsUnit);
 
   if (is_single_group || is_multi_group) {
+    if (num_tokens == 0) {
+      return;  // a zero-sized grid is a launch error, not an empty launch
+    }
     cudaLaunchConfig_t config;
     auto* kernel_instance =
         &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, NumDeepseekExperts, true>;
@@ -260,9 +311,10 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
     config.numAttrs = 1;
     config.attrs = attrs;
 
-    cudaLaunchKernelEx(&config, kernel_instance, scores, topk_values, topk_indices, bias,
-                       num_tokens, n_group, topk_group, topk, num_experts, num_experts / n_group,
-                       routed_scaling_factor);
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel_instance, scores, topk_values, topk_indices,
+                                       bias, num_tokens, n_group, topk_group, topk, num_experts,
+                                       num_experts / n_group, routed_scaling_factor,
+                                       routing_replay_out));
     sync_check_cuda_error(stream);
   } else {
     // TODO: call the generic path (previous implementation) or signal unsupported config.
@@ -272,6 +324,7 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
                          "original pytorch implementation.",
                          n_group, num_experts, topk_group);
   }
+#endif
 }
 
 #define INSTANTIATE_NOAUX_TC(InputT, BiasT, OutputT, IdxT)                              \
@@ -279,7 +332,7 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
       InputT * scores, BiasT * bias, OutputT * topk_values, IdxT * topk_indices,        \
       int64_t const num_tokens, int64_t const num_experts, int64_t const n_group,       \
       int64_t const topk_group, int64_t const topk, double const routed_scaling_factor, \
-      bool const launch_with_pdl, cudaStream_t const stream);
+      bool const launch_with_pdl, cudaStream_t const stream, int16_t* routing_replay_out);
 
 INSTANTIATE_NOAUX_TC(float, float, float, int32_t);
 INSTANTIATE_NOAUX_TC(float, half, float, int32_t);
@@ -305,7 +358,7 @@ namespace flashinfer::trtllm_dsv3_fused_routing {
 
 void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_group, int64_t topk,
              double routed_scaling_factor, TensorView topk_values, TensorView topk_indices,
-             bool launch_with_pdl) {
+             bool launch_with_pdl, Optional<TensorView> routing_replay_out) {
   auto data_type = scores.dtype();
   auto bias_type = bias.dtype();
 
@@ -318,6 +371,12 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
       << "scores and bias must be CUDA tensors";
   TVM_FFI_ICHECK(scores.device().device_id == bias.device().device_id)
       << "scores and bias must be on the same device";
+  // Both kernels address scores as a dense [num_tokens, num_experts] row-major matrix and write
+  // dense [num_tokens, topk] outputs; strided views are rejected instead of silently misread.
+  CHECK_CONTIGUOUS(scores);
+  CHECK_CONTIGUOUS(bias);
+  CHECK_CONTIGUOUS(topk_values);
+  CHECK_CONTIGUOUS(topk_indices);
   TVM_FFI_ICHECK(bias.dim() == 1 && bias.numel() == num_experts)
       << "bias must be 1D with length == number of experts (%ld)";
   TVM_FFI_ICHECK(num_experts % n_group == 0) << "num_experts should be divisible by n_group";
@@ -340,7 +399,28 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
   TVM_FFI_ICHECK(topk_values.dtype() == data_type)
       << "topk_values must have the same dtype as scores";
   TVM_FFI_ICHECK(encode_dlpack_dtype(topk_indices.dtype()) == int32_code)
-      << "topk_indices must have the same dtype as scores";
+      << "topk_indices must be int32 dtype";
+
+  // Validate and extract routing_replay_out
+  // NOTE: dim0 >= num_tokens is intentionally NOT checked — with CUDA graphs the buffer
+  // is pre-allocated at maximum batch size and reused across steps with varying num_tokens.
+  // The kernel only writes to indices [0, num_tokens), so a larger buffer is safe.
+  constexpr int64_t int16_code_val = encode_dlpack_dtype(DLDataType{kDLInt, 16, 1});
+  int16_t* replay_ptr = nullptr;
+  if (routing_replay_out.has_value()) {
+    auto replay = routing_replay_out.value();
+    TVM_FFI_ICHECK(replay.device().device_type == kDLCUDA)
+        << "routing_replay_out must be a CUDA tensor";
+    TVM_FFI_ICHECK(replay.device().device_id == scores.device().device_id)
+        << "routing_replay_out must be on the same device as scores";
+    TVM_FFI_ICHECK(replay.ndim() == 2)
+        << "routing_replay_out must be a 2D Tensor [num_tokens, topk]";
+    TVM_FFI_ICHECK(replay.sizes()[1] == topk) << "routing_replay_out dim1 must equal topk";
+    TVM_FFI_ICHECK(encode_dlpack_dtype(replay.dtype()) == int16_code_val)
+        << "routing_replay_out must be int16 dtype";
+    CHECK_CONTIGUOUS(replay);
+    replay_ptr = reinterpret_cast<int16_t*>(replay.data_ptr());
+  }
 
   auto stream = get_stream(scores.device());
   using namespace tensorrt_llm::kernels;
@@ -353,14 +433,14 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
               reinterpret_cast<half*>(scores.data_ptr()), reinterpret_cast<half*>(bias.data_ptr()),
               reinterpret_cast<half*>(topk_values.data_ptr()),
               reinterpret_cast<int32_t*>(topk_indices.data_ptr()), num_tokens, num_experts, n_group,
-              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream);
+              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream, replay_ptr);
           break;
         case float32_code:
           invokeNoAuxTc<half, float, half, int32_t>(
               reinterpret_cast<half*>(scores.data_ptr()), reinterpret_cast<float*>(bias.data_ptr()),
               reinterpret_cast<half*>(topk_values.data_ptr()),
               reinterpret_cast<int32_t*>(topk_indices.data_ptr()), num_tokens, num_experts, n_group,
-              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream);
+              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream, replay_ptr);
           break;
         case bfloat16_code:
           invokeNoAuxTc<half, __nv_bfloat16, half, int32_t>(
@@ -368,7 +448,7 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
               reinterpret_cast<__nv_bfloat16*>(bias.data_ptr()),
               reinterpret_cast<half*>(topk_values.data_ptr()),
               reinterpret_cast<int32_t*>(topk_indices.data_ptr()), num_tokens, num_experts, n_group,
-              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream);
+              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream, replay_ptr);
           break;
         default:
           throw std::invalid_argument(
@@ -384,14 +464,14 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
               reinterpret_cast<float*>(bias.data_ptr()),
               reinterpret_cast<float*>(topk_values.data_ptr()),
               reinterpret_cast<int32_t*>(topk_indices.data_ptr()), num_tokens, num_experts, n_group,
-              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream);
+              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream, replay_ptr);
           break;
         case float16_code:
           invokeNoAuxTc<float, half, float, int32_t>(
               reinterpret_cast<float*>(scores.data_ptr()), reinterpret_cast<half*>(bias.data_ptr()),
               reinterpret_cast<float*>(topk_values.data_ptr()),
               reinterpret_cast<int32_t*>(topk_indices.data_ptr()), num_tokens, num_experts, n_group,
-              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream);
+              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream, replay_ptr);
           break;
         case bfloat16_code:
           invokeNoAuxTc<float, __nv_bfloat16, float, int32_t>(
@@ -399,7 +479,7 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
               reinterpret_cast<__nv_bfloat16*>(bias.data_ptr()),
               reinterpret_cast<float*>(topk_values.data_ptr()),
               reinterpret_cast<int32_t*>(topk_indices.data_ptr()), num_tokens, num_experts, n_group,
-              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream);
+              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream, replay_ptr);
           break;
         default:
           throw std::invalid_argument(
@@ -416,7 +496,7 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
               reinterpret_cast<__nv_bfloat16*>(bias.data_ptr()),
               reinterpret_cast<__nv_bfloat16*>(topk_values.data_ptr()),
               reinterpret_cast<int32_t*>(topk_indices.data_ptr()), num_tokens, num_experts, n_group,
-              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream);
+              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream, replay_ptr);
           break;
         case float16_code:
           invokeNoAuxTc<__nv_bfloat16, half, __nv_bfloat16, int32_t>(
@@ -424,7 +504,7 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
               reinterpret_cast<half*>(bias.data_ptr()),
               reinterpret_cast<__nv_bfloat16*>(topk_values.data_ptr()),
               reinterpret_cast<int32_t*>(topk_indices.data_ptr()), num_tokens, num_experts, n_group,
-              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream);
+              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream, replay_ptr);
           break;
         case float32_code:
           invokeNoAuxTc<__nv_bfloat16, float, __nv_bfloat16, int32_t>(
@@ -432,7 +512,7 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
               reinterpret_cast<float*>(bias.data_ptr()),
               reinterpret_cast<__nv_bfloat16*>(topk_values.data_ptr()),
               reinterpret_cast<int32_t*>(topk_indices.data_ptr()), num_tokens, num_experts, n_group,
-              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream);
+              topk_group, topk, routed_scaling_factor, launch_with_pdl, stream, replay_ptr);
           break;
         default:
           throw std::invalid_argument(

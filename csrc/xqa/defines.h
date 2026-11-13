@@ -36,8 +36,13 @@
 #define IS_MLA (HEAD_GRP_SIZE == 128 && HEAD_ELEMS == 576)
 
 #if IS_MLA
+#if defined(MLA_BF16) && MLA_BF16
+#define INPUT_ELEM __nv_bfloat16
+#define INPUT_ELEM2 __nv_bfloat162
+#else
 #define INPUT_ELEM __nv_fp8_e4m3
 #define INPUT_ELEM2 __nv_fp8x2_e4m3
+#endif
 #define HEAD_ELEMS_V 512
 #else
 // 1 means fp16 and 0 means bf16 input/output
@@ -166,7 +171,9 @@ static_assert(CACHE_ELEM_ENUM != 0);
 #endif
 
 // true should be better if warpTile.x * cacheElemSize < 128. otherwise use false.
-#define GRP_LOAD_V (CACHE_ELEM_ENUM != 0) || (HEAD_ELEMS == 256 && BEAM_WIDTH > 1)
+// HEAD_ELEMS > 256 requires the group-shared full-head V buffer (see nbHeadSplits in mha.cu).
+#define GRP_LOAD_V \
+  (CACHE_ELEM_ENUM != 0) || (HEAD_ELEMS == 256 && BEAM_WIDTH > 1) || (HEAD_ELEMS > 256)
 
 // use custom barrier for NVRTC to avoid pulling in many headers
 #ifndef USE_CUSTOM_BARRIER

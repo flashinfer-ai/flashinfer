@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include <cuda/functional>  // cuda::maximum<> used by SoftmaxPreprocess::applyToSmem
+
 #include "RoutingKernel.cuh"
 
 namespace moe::dev::routing {
@@ -30,11 +32,29 @@ namespace moe::dev::routing {
 //       Empty for policies that don't need extra data (zero register cost).
 //   - template <typename DataType, int VecSize, typename ParamsT>
 //     static void apply(warp, score[VecSize], idx[VecSize], numExperts, params)
-//       Transforms scores in-place before topK selection.
+//       Warp-per-token interface.  Transforms per-lane register scores in-place
+//       before topK selection.  Used by the fused cluster / coop / dyn-block
+//       kernels, where 32 lanes collectively process one token's experts.
+//
+// A policy MAY additionally provide the block-per-token interface used by
+// routingIndicesBlockScoresKernel.  Opting in requires:
+//   - static constexpr bool kSupportsBlockPerToken = true;
+//   - template <typename SmemT, typename InputT, typename ParamsT>
+//     static void applyToSmem(block, ptrScores, numExperts, smemBiased, smemAux, params)
+//       Reads a token's raw scores from global memory, writes the per-expert
+//       "biased" (topK key) and "aux" (postprocess input) values into smem.
+//       `smemBiased` and `smemAux` may alias — callers that don't need aux
+//       data pass the same pointer for both.
+// The block-per-token kernel is enabled only for (pre, post) pairs where
+// *both* policies set kSupportsBlockPerToken = true; see
+// PolicyPairSupportsBlockPerToken below.
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// No-op: scores are passed through unchanged.
 struct NoOpPreprocess {
+  /// Opts into the block-per-token kernel (provides applyToSmem below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
   /// BaseType: when no preprocess is applied, use the input type directly.
   template <typename InputT>
   using BaseType = InputT;
@@ -49,10 +69,25 @@ struct NoOpPreprocess {
                                                DataType (& /*score*/)[VecSize],
                                                int32_t const (& /*idx*/)[VecSize],
                                                int32_t /*numExperts*/, ParamsT const& /*params*/) {}
+
+  /// Block-per-token interface: copy raw scores into smem.  smemAux aliases
+  /// smemBiased because no postprocess needs separate aux data.
+  template <typename SmemT, typename InputT, typename ParamsT>
+  __forceinline__ __device__ static void applyToSmem(cg::thread_block const& block,
+                                                     InputT const* ptrScores, int32_t numExperts,
+                                                     SmemT* smemBiased, SmemT* /*smemAux*/,
+                                                     ParamsT const& /*params*/) {
+    for (int e = block.thread_rank(); e < numExperts; e += block.size()) {
+      smemBiased[e] = static_cast<SmemT>(ptrScores[e]);
+    }
+  }
 };
 
 /// Softmax: applies softmax over all expert scores before topK selection.
 struct SoftmaxPreprocess {
+  /// Opts into the block-per-token kernel (provides applyToSmem below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
   /// BaseType: softmax is always computed in float for numerical stability.
   template <typename InputT>
   using BaseType = float;
@@ -69,10 +104,65 @@ struct SoftmaxPreprocess {
                                                int32_t /*numExperts*/, ParamsT const& /*params*/) {
     calcSoftmax(warp, score);
   }
+
+  /// Block-per-token interface: three-pass softmax over all experts.
+  ///   Pass 1: find block-wide max and stash raw scores in smemBiased.
+  ///   Pass 2: compute exp(score - max) into smemBiased and reduce block sum.
+  ///   Pass 3: normalize by the reduced sum.
+  /// smemAux aliases smemBiased (postprocess doesn't need pre-softmax scores).
+  /// Preconditions:
+  ///   - kBlockDim must match the kernel's blockDim.x so BlockReduce uses the
+  ///     correct temp storage layout.
+  ///   - The caller must launch enough threads to cover expert slots; work is
+  ///     striped across experts via e += block.size().
+  template <int kBlockDim, typename SmemT, typename InputT, typename ParamsT>
+  __forceinline__ __device__ static void applyToSmem(cg::thread_block const& block,
+                                                     InputT const* ptrScores, int32_t numExperts,
+                                                     SmemT* smemBiased, SmemT* /*smemAux*/,
+                                                     ParamsT const& /*params*/) {
+    using BlockReduce = cub::BlockReduce<float, kBlockDim>;
+    __shared__ typename BlockReduce::TempStorage reduceStorage;
+    __shared__ float smemBlockMax;
+    __shared__ float smemBlockSum;
+
+    // Pass 1: block-wide max.  `fmaxf` / `cuda::maximum<>` map to hardware
+    // `MAX.F32` and follow IEEE 754 NaN handling — both are used elsewhere in
+    // trtllm_backend (e.g. trtllm_fused_moe_dev_kernel.cu).
+    float localMax = -INFINITY;
+    for (int e = block.thread_rank(); e < numExperts; e += block.size()) {
+      float s = static_cast<float>(ptrScores[e]);
+      smemBiased[e] = static_cast<SmemT>(s);  // stash raw score for pass 2
+      localMax = fmaxf(s, localMax);
+    }
+    float blockMax = BlockReduce(reduceStorage).Reduce(localMax, cuda::maximum<>{});
+    if (block.thread_rank() == 0) smemBlockMax = blockMax;
+    __syncthreads();
+    float const mx = smemBlockMax;
+
+    // Pass 2: compute exp(score - max) into smemBiased, accumulate sum.
+    float localSum = 0.f;
+    for (int e = block.thread_rank(); e < numExperts; e += block.size()) {
+      float v = expf(static_cast<float>(smemBiased[e]) - mx);
+      smemBiased[e] = static_cast<SmemT>(v);
+      localSum += v;
+    }
+    float blockSum = BlockReduce(reduceStorage).Sum(localSum);
+    if (block.thread_rank() == 0) smemBlockSum = blockSum;
+    __syncthreads();
+    float const invSum = 1.f / smemBlockSum;
+
+    // Pass 3: normalize.
+    for (int e = block.thread_rank(); e < numExperts; e += block.size()) {
+      smemBiased[e] = static_cast<SmemT>(static_cast<float>(smemBiased[e]) * invSum);
+    }
+  }
 };
 
 /// Sigmoid: applies sigmoid(score) for topK selection (no bias).
 struct SigmoidPreprocess {
+  /// Opts into the block-per-token kernel (provides applyToSmem below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
   /// BaseType: sigmoid is computed in float for numerical stability.
   template <typename InputT>
   using BaseType = float;
@@ -93,11 +183,28 @@ struct SigmoidPreprocess {
       score[i] = idx[i] < numExperts ? static_cast<DataType>(s) : DataType{-INFINITY};
     }
   }
+
+  /// Block-per-token interface: compute sigmoid per expert and write to smem.
+  /// smemAux aliases smemBiased (SumNormalize postprocess only uses the
+  /// biased top-K values, so no separate aux data is needed).
+  template <typename SmemT, typename InputT, typename ParamsT>
+  __forceinline__ __device__ static void applyToSmem(cg::thread_block const& block,
+                                                     InputT const* ptrScores, int32_t numExperts,
+                                                     SmemT* smemBiased, SmemT* /*smemAux*/,
+                                                     ParamsT const& /*params*/) {
+    for (int e = block.thread_rank(); e < numExperts; e += block.size()) {
+      float s = sigmoid_accurate(static_cast<float>(ptrScores[e]));
+      smemBiased[e] = static_cast<SmemT>(s);
+    }
+  }
 };
 
 /// SigmoidBias: applies sigmoid(score) + bias[expertIdx] for topK selection.
 /// Used by DeepSeek-style routing where expert selection is based on biased sigmoid scores.
 struct SigmoidBiasPreprocess {
+  /// Opts into the block-per-token kernel (provides applyToSmem below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
   /// BaseType: sigmoid is computed in float for numerical stability.
   template <typename InputT>
   using BaseType = float;
@@ -127,6 +234,23 @@ struct SigmoidBiasPreprocess {
       score[i] = static_cast<DataType>(s + bias);
     }
   }
+
+  /// Block-per-token interface: compute (sigmoid, sigmoid+bias) per expert.
+  /// `smemAux[e] = sigmoid(score[e])`         — read by ScaledSumNormalizePostprocess
+  /// `smemBiased[e] = sigmoid(score[e]) + bias[e]` — used as the topK selection key
+  /// The two arrays must be distinct (cannot alias).
+  template <typename SmemT, typename InputT, typename ParamsT>
+  __forceinline__ __device__ static void applyToSmem(cg::thread_block const& block,
+                                                     InputT const* ptrScores, int32_t numExperts,
+                                                     SmemT* smemBiased, SmemT* smemAux,
+                                                     ParamsT const& params) {
+    for (int e = block.thread_rank(); e < numExperts; e += block.size()) {
+      float s = sigmoid_accurate(static_cast<float>(ptrScores[e]));
+      float bias = loadScalar(params.ptrRoutingBias, e, params.dtypeBias);
+      smemAux[e] = static_cast<SmemT>(s);
+      smemBiased[e] = static_cast<SmemT>(s + bias);
+    }
+  }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -137,11 +261,32 @@ struct SigmoidBiasPreprocess {
 //       Policy-specific runtime data. Empty when not needed.
 //   - template <typename DataType, int K, typename ParamsT>
 //     static void apply(warp, warpTopKScore[K], warpTopKExpertIdx[K], laneIdx, topK, params)
-//       Transforms top-K scores in-place after topK selection.
+//       Transforms top-K scores in-place after topK selection.  Used by the
+//       warp-per-token kernels.
+//
+// A policy MAY additionally provide the block-per-token interface used by
+// routingIndicesBlockScoresKernel.  Opting in requires:
+//   - static constexpr bool kSupportsBlockPerToken = true;
+//   - template <typename DataType, int K, typename SmemT, typename ParamsT>
+//     static void applyWithAux(warp, warpTopKScore[K], warpTopKExpertIdx[K], laneIdx, topK,
+//                               smemAux, params)
+//       Same as `apply` but additionally receives `smemAux` — the per-expert
+//       auxiliary data written by the preprocess policy.  Policies that do
+//       not need aux data can default-forward to `apply(...)`; policies that
+//       do (e.g. ScaledSumNormalize needs un-biased sigmoid) read from
+//       smemAux[warpTopKExpertIdx[laneIdx]].
+// Postprocess policies that read per-expert aux data must additionally set
+//   - static constexpr bool kNeedsAux = true;
+// so the block-per-token kernel allocates a separate smemAux array instead
+// of aliasing it to smemBiased.  Default: false (smemAux aliases smemBiased,
+// saving MaxNumExperts × 4B of smem).
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// No-op: top-K scores are left unchanged.
 struct NoOpPostprocess {
+  /// Opts into the block-per-token kernel (provides applyWithAux below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
   template <typename OutputT>
   struct Params {
     void set(routingCustom::Data const& /*data*/) {}
@@ -153,10 +298,23 @@ struct NoOpPostprocess {
                                                int32_t const (& /*warpTopKExpertIdx*/)[K],
                                                int32_t /*laneIdx*/, int32_t /*topK*/,
                                                ParamsT const& /*params*/) {}
+
+  template <typename DataType, int K, typename SmemT, typename ParamsT>
+  __forceinline__ __device__ static void applyWithAux(cg::thread_block_tile<WarpSize> const& warp,
+                                                      DataType (&warpTopKScore)[K],
+                                                      int32_t const (&warpTopKExpertIdx)[K],
+                                                      int32_t laneIdx, int32_t topK,
+                                                      SmemT const* /*smemAux*/,
+                                                      ParamsT const& params) {
+    apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK, params);
+  }
 };
 
 /// Softmax: applies softmax over the top-K scores.
 struct SoftmaxPostprocess {
+  /// Opts into the block-per-token kernel (provides applyWithAux below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
   template <typename OutputT>
   struct Params {
     void set(routingCustom::Data const& /*data*/) {}
@@ -175,11 +333,24 @@ struct SoftmaxPostprocess {
       warpTopKScore[laneIdx] = softmaxScore;
     }
   }
+
+  template <typename DataType, int K, typename SmemT, typename ParamsT>
+  __forceinline__ __device__ static void applyWithAux(cg::thread_block_tile<WarpSize> const& warp,
+                                                      DataType (&warpTopKScore)[K],
+                                                      int32_t const (&warpTopKExpertIdx)[K],
+                                                      int32_t laneIdx, int32_t topK,
+                                                      SmemT const* /*smemAux*/,
+                                                      ParamsT const& params) {
+    apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK, params);
+  }
 };
 
 /// SumNormalize: divides each top-K score by the sum of all top-K scores.
 /// Used when softmax has already been applied before topK selection.
 struct SumNormalizePostprocess {
+  /// Opts into the block-per-token kernel (provides applyWithAux below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
   template <typename OutputT>
   struct Params {
     bool normTopkProb = true;
@@ -203,41 +374,153 @@ struct SumNormalizePostprocess {
       warpTopKScore[laneIdx] = warpTopKScore[laneIdx] / denom;
     }
   }
+
+  template <typename DataType, int K, typename SmemT, typename ParamsT>
+  __forceinline__ __device__ static void applyWithAux(cg::thread_block_tile<WarpSize> const& warp,
+                                                      DataType (&warpTopKScore)[K],
+                                                      int32_t const (&warpTopKExpertIdx)[K],
+                                                      int32_t laneIdx, int32_t topK,
+                                                      SmemT const* /*smemAux*/,
+                                                      ParamsT const& params) {
+    apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK, params);
+  }
 };
 
-/// ScaledSumNormalize: recovers un-biased sigmoid scores by subtracting per-expert bias from the
-/// selection scores (sigmoid + bias), then normalizes by sum and applies routeScale.
-/// Used by DeepSeek-style routing: final_weight = sigmoid(raw) * routeScale / (sum + epsilon).
-/// DeepSeek uses epsilon=0 (no guard); MiniMax2 uses epsilon=1e-20 to prevent division by zero.
-struct ScaledSumNormalizePostprocess {
+/// Sigmoid: applies sigmoid to the top-K scores selected from the raw logits.
+/// Paired with NoOpPreprocess this implements TopK -> Sigmoid, where expert
+/// selection ranks the raw logits and only the K survivors are passed through
+/// sigmoid.  Because sigmoid is strictly monotonic this selects the same
+/// experts as SigmoidPreprocess + TopK for all inputs except logits large
+/// enough that sigmoid saturates to exactly 1.0f (|x| above ~17), where
+/// selecting on the saturated scores would instead tie-break by expert index.
+struct SigmoidPostprocess {
+  /// Opts into the block-per-token kernel (provides applyWithAux below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
   template <typename OutputT>
   struct Params {
-    // Store as void const* to support any bias dtype (float, bfloat16, etc.) without conversion.
-    void const* ptrRoutingBias = nullptr;
-    batchedGemm::trtllm::gen::Dtype dtypeBias = batchedGemm::trtllm::gen::Dtype::Bfloat16;
+    void set(routingCustom::Data const& /*data*/) {}
+  };
+
+  template <typename DataType, int K, typename ParamsT>
+  __forceinline__ __device__ static void apply(cg::thread_block_tile<WarpSize> const& /*warp*/,
+                                               DataType (&warpTopKScore)[K],
+                                               int32_t const (& /*warpTopKExpertIdx*/)[K],
+                                               int32_t laneIdx, int32_t topK,
+                                               ParamsT const& /*params*/) {
+    if (laneIdx < topK) {
+      warpTopKScore[laneIdx] =
+          static_cast<DataType>(sigmoid_accurate(static_cast<float>(warpTopKScore[laneIdx])));
+    }
+  }
+
+  template <typename DataType, int K, typename SmemT, typename ParamsT>
+  __forceinline__ __device__ static void applyWithAux(cg::thread_block_tile<WarpSize> const& warp,
+                                                      DataType (&warpTopKScore)[K],
+                                                      int32_t const (&warpTopKExpertIdx)[K],
+                                                      int32_t laneIdx, int32_t topK,
+                                                      SmemT const* /*smemAux*/,
+                                                      ParamsT const& params) {
+    apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK, params);
+  }
+};
+
+/// ScaledSumNormalize: normalizes un-biased sigmoid scores by sum and applies
+/// routeScale. SigmoidBias selection uses sigmoid(raw) + bias as the top-K key,
+/// but final weights must use sigmoid(raw). Warp-per-token routing recomputes
+/// selected sigmoid(raw) from raw logits to avoid cancellation when a tiny
+/// sigmoid is rounded away by a large bias; block-per-token routing reads the
+/// same un-biased sigmoid from smemAux.
+/// Used by DeepSeek-style routing: final_weight = sigmoid(raw) * routeScale / (sum + epsilon).
+/// The DeepSeek and MiniMax2 runners use epsilon=1e-20 to prevent division by zero.
+struct ScaledSumNormalizePostprocess {
+  /// Opts into the block-per-token kernel (provides applyWithAux below).
+  static constexpr bool kSupportsBlockPerToken = true;
+  static constexpr bool kSupportsLaneOwnedTopK = true;
+  static constexpr bool kNeedsRawScores = true;
+
+  /// Needs per-expert aux data (un-biased sigmoid) in the block-per-token
+  /// kernel — paired with SigmoidBiasPreprocess, which writes the un-biased
+  /// sigmoid to smemAux[e].  The kernel allocates a distinct smemAux array
+  /// instead of aliasing it to smemBiased.
+  static constexpr bool kNeedsAux = true;
+
+  template <typename OutputT>
+  struct Params {
     float routeScale = 1.0f;
     float sumEpsilon = 0.0f;
 
     void set(routingCustom::Data const& data) {
-      ptrRoutingBias = data.mPtrRoutingBias;
-      dtypeBias = data.mDtypeBias;
       routeScale = data.mRouteScale;
       sumEpsilon = data.mSumEpsilon;
     }
   };
 
-  template <typename DataType, int K, typename ParamsT>
-  __forceinline__ __device__ static void apply(cg::thread_block_tile<WarpSize> const& warp,
-                                               DataType (&warpTopKScore)[K],
-                                               int32_t const (&warpTopKExpertIdx)[K],
-                                               int32_t laneIdx, int32_t topK,
-                                               ParamsT const& params) {
-    // Recover sigmoid score: selection_score = sigmoid(raw) + bias, so sigmoid = score - bias
-    float biasVal = laneIdx < topK ? loadScalar(params.ptrRoutingBias, warpTopKExpertIdx[laneIdx],
-                                                params.dtypeBias)
-                                   : 0.f;
+  /// Warp-per-token variant with access to the original raw scores. SigmoidBias
+  /// selection uses sigmoid(raw) + bias as the topK key, but final weights must
+  /// be normalized from the un-biased sigmoid(raw). Recomputing sigmoid(raw)
+  /// avoids lossy recovery when a tiny sigmoid is rounded away by a large bias.
+  template <typename DataType, typename InputType, int K, typename ParamsT>
+  __forceinline__ __device__ static void applyWithScores(
+      cg::thread_block_tile<WarpSize> const& warp, DataType (&warpTopKScore)[K],
+      int32_t const (&warpTopKExpertIdx)[K], int32_t laneIdx, int32_t topK,
+      InputType const* ptrScores, ParamsT const& params) {
+    float sigmoidScore = 0.f;
+    if (laneIdx < topK) {
+      int32_t const expertIdx = warpTopKExpertIdx[laneIdx];
+      sigmoidScore = sigmoid_accurate(static_cast<float>(ptrScores[expertIdx]));
+    }
+
+    float sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
+    if (laneIdx < topK) {
+      warpTopKScore[laneIdx] =
+          static_cast<DataType>(sigmoidScore * params.routeScale / (sum + params.sumEpsilon));
+    }
+  }
+
+  /// Lane-owned warp-per-token variant with access to the original raw scores.
+  /// This is the scalar counterpart to applyWithScores.
+  template <typename DataType, typename InputType, typename ParamsT>
+  __forceinline__ __device__ static void applyForLaneWithScores(
+      cg::thread_block_tile<WarpSize> const& warp, DataType& laneTopKScore,
+      int32_t laneTopKExpertIdx, int32_t laneIdx, int32_t topK, InputType const* ptrScores,
+      ParamsT const& params) {
+    float const sigmoidScore =
+        laneIdx < topK ? sigmoid_accurate(static_cast<float>(ptrScores[laneTopKExpertIdx])) : 0.f;
+    float const sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
+    if (laneIdx < topK) {
+      laneTopKScore =
+          static_cast<DataType>(sigmoidScore * params.routeScale / (sum + params.sumEpsilon));
+    }
+  }
+
+  /// Lane-owned block-per-token variant. Reads the un-biased sigmoid from
+  /// smemAux just like applyWithAux, but consumes scalar TopK state.
+  template <typename DataType, typename SmemT, typename ParamsT>
+  __forceinline__ __device__ static void applyForLaneWithAux(
+      cg::thread_block_tile<WarpSize> const& warp, DataType& laneTopKScore,
+      int32_t laneTopKExpertIdx, int32_t laneIdx, int32_t topK, SmemT const* smemAux,
+      ParamsT const& params) {
+    float const sigmoidScore =
+        laneIdx < topK ? static_cast<float>(smemAux[laneTopKExpertIdx]) : 0.f;
+    float const sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
+    if (laneIdx < topK) {
+      laneTopKScore =
+          static_cast<DataType>(sigmoidScore * params.routeScale / (sum + params.sumEpsilon));
+    }
+  }
+
+  /// Block-per-token variant: read un-biased sigmoid directly from smemAux
+  /// (written by SigmoidBiasPreprocess::applyToSmem) instead of reloading bias
+  /// and subtracting.  Saves one global memory read + one FMA per top-K lane.
+  template <typename DataType, int K, typename SmemT, typename ParamsT>
+  __forceinline__ __device__ static void applyWithAux(cg::thread_block_tile<WarpSize> const& warp,
+                                                      DataType (&warpTopKScore)[K],
+                                                      int32_t const (&warpTopKExpertIdx)[K],
+                                                      int32_t laneIdx, int32_t topK,
+                                                      SmemT const* smemAux, ParamsT const& params) {
     float sigmoidScore =
-        laneIdx < topK ? (static_cast<float>(warpTopKScore[laneIdx]) - biasVal) : 0.f;
+        laneIdx < topK ? static_cast<float>(smemAux[warpTopKExpertIdx[laneIdx]]) : 0.f;
     float sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
     if (laneIdx < topK) {
       warpTopKScore[laneIdx] =
@@ -265,10 +548,77 @@ struct ScaledSumNormalizePostprocess {
 // pattern (e.g., lookup-table-based expert selection).
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+/// Trait: does a (pre, post) policy pair need a separate `smemAux` array in
+/// the block-per-token kernel?  This is purely a postprocess-side property:
+/// true iff the postprocess policy reads per-expert auxiliary data that
+/// differs from the topK selection key (via its `kNeedsAux` member).  Today
+/// only `ScaledSumNormalize` sets `kNeedsAux = true`.  For every other
+/// postprocess, `smemAux` aliases `smemBiased` and no extra smem is
+/// allocated. Postprocess policies that don't declare `kNeedsAux` are treated
+/// as not needing it (safe default).
+template <typename PostprocessPolicy_, typename = void>
+struct PostprocessNeedsAux : std::false_type {};
+
+template <typename PostprocessPolicy_>
+struct PostprocessNeedsAux<PostprocessPolicy_, std::void_t<decltype(PostprocessPolicy_::kNeedsAux)>>
+    : std::bool_constant<PostprocessPolicy_::kNeedsAux> {};
+
+template <typename PreprocessPolicy_, typename PostprocessPolicy_>
+struct PolicyPairNeedsAux : PostprocessNeedsAux<PostprocessPolicy_> {};
+
+/// Does a postprocess policy need the original raw scores after TopK?
+/// This is intentionally opt-in so generic routing policies do not acquire a
+/// raw-score dependency unless they implement the corresponding overloads.
+template <typename PostprocessPolicy_, typename = void>
+struct PostprocessNeedsRawScores : std::false_type {};
+
+template <typename PostprocessPolicy_>
+struct PostprocessNeedsRawScores<PostprocessPolicy_,
+                                 std::void_t<decltype(PostprocessPolicy_::kNeedsRawScores)>>
+    : std::bool_constant<PostprocessPolicy_::kNeedsRawScores> {};
+
+/// Does a postprocess policy implement the scalar lane-owned TopK interface?
+/// This is intentionally opt-in: adding a new policy cannot silently select a
+/// specialization whose numerical semantics it has not implemented.
+template <typename PostprocessPolicy_, typename = void>
+struct PostprocessSupportsLaneOwnedTopK : std::false_type {};
+
+template <typename PostprocessPolicy_>
+struct PostprocessSupportsLaneOwnedTopK<
+    PostprocessPolicy_, std::void_t<decltype(PostprocessPolicy_::kSupportsLaneOwnedTopK)>>
+    : std::bool_constant<PostprocessPolicy_::kSupportsLaneOwnedTopK> {};
+
+/// Trait: does a (pre, post) policy pair implement the block-per-token
+/// interface (`PreProc::applyToSmem` + `PostProc::applyWithAux`) and
+/// therefore opt in to `routingIndicesBlockScoresKernel`?  A pair opts in
+/// iff *both* policies declare `kSupportsBlockPerToken = true`.
+///
+/// To opt a new policy in:
+///   1. Implement the block-per-token method on the policy itself
+///      (`applyToSmem` for preprocess, `applyWithAux` for postprocess) —
+///      see the "Policy Interfaces" doc at the top of this file.
+///   2. Add `static constexpr bool kSupportsBlockPerToken = true;` to the
+///      policy struct.
+/// Once both members of a pair opt in, every (this_policy, other_policy)
+/// combination works with the block-per-token kernel automatically — no
+/// per-pair trait specialisation needed.  Every preprocess / postprocess
+/// policy defined above must declare `kSupportsBlockPerToken` (true or
+/// false); missing it is a compile error, which intentionally forces new
+/// policies to make an explicit choice.
+template <typename PreprocessPolicy_, typename PostprocessPolicy_>
+struct PolicyPairSupportsBlockPerToken
+    : std::bool_constant<PreprocessPolicy_::kSupportsBlockPerToken &&
+                         PostprocessPolicy_::kSupportsBlockPerToken> {};
+
 /// Default ExpertSelectPolicy: preprocess + topK reduction + postprocess.
 /// Wraps existing PreprocessPolicy and PostprocessPolicy as internal composition.
 template <typename PreprocessPolicy_, typename PostprocessPolicy_>
 struct TopKExpertSelect {
+  /// Expose component policies so the block-per-token kernel can dispatch
+  /// directly on preprocess / postprocess without going through `apply()`.
+  using PreprocessPolicy = PreprocessPolicy_;
+  using PostprocessPolicy = PostprocessPolicy_;
+
   /// BaseType: delegated to the preprocess policy.
   template <typename InputT>
   using BaseType = typename PreprocessPolicy_::template BaseType<InputT>;
@@ -313,8 +663,49 @@ struct TopKExpertSelect {
     topk::reduceTopK(warp, warpTopKScore, warpTopKExpertIdx, score, idx, minScore, topK);
 
     // Apply postprocess (e.g. renormalize, softmax over top-K, scaled renormalize, ...)
-    PostprocessPolicy_::apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK,
-                              params.mExpertSelectParams.mPostprocessParams);
+    if constexpr (PostprocessNeedsRawScores<PostprocessPolicy_>::value) {
+      PostprocessPolicy_::template applyWithScores<DataType, InputType, K>(
+          warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK, ptrScores,
+          params.mExpertSelectParams.mPostprocessParams);
+    } else {
+      PostprocessPolicy_::apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK,
+                                params.mExpertSelectParams.mPostprocessParams);
+    }
+  }
+
+  /// Lane-owned TopK variant. It shares the generic preprocess and exact
+  /// comparison/tie-breaking logic, but returns only the result consumed by
+  /// laneIdx. Callers gate this method with PostprocessSupportsLaneOwnedTopK.
+  template <typename DataType, typename InputType, int VecSize, int K, typename KP>
+  __forceinline__ __device__ static void applyForLane(cg::thread_block_tile<WarpSize> const& warp,
+                                                      DataType& laneTopKScore,
+                                                      int32_t& laneTopKExpertIdx, int32_t laneIdx,
+                                                      int32_t numExperts, int32_t topK,
+                                                      InputType const* ptrScores,
+                                                      KP const& params) {
+    DataType const minScore = DataType{-INFINITY};
+    DataType score[VecSize];
+    int32_t idx[VecSize];
+
+#pragma unroll
+    for (int i = 0; i < VecSize; ++i) {
+      int32_t const expertIdx = i * WarpSize + laneIdx;
+      score[i] = expertIdx < numExperts ? static_cast<DataType>(ptrScores[expertIdx]) : minScore;
+      idx[i] = expertIdx;
+    }
+
+    PreprocessPolicy_::apply(warp, score, idx, numExperts,
+                             params.mExpertSelectParams.mPreprocessParams);
+    topk::reduceTopKForLane<K>(warp, laneTopKScore, laneTopKExpertIdx, score, idx, minScore,
+                               laneIdx);
+    if constexpr (PostprocessNeedsRawScores<PostprocessPolicy_>::value) {
+      PostprocessPolicy_::template applyForLaneWithScores<DataType, InputType>(
+          warp, laneTopKScore, laneTopKExpertIdx, laneIdx, topK, ptrScores,
+          params.mExpertSelectParams.mPostprocessParams);
+    } else {
+      PostprocessPolicy_::applyForLane(warp, laneTopKScore, laneTopKExpertIdx, laneIdx, topK,
+                                       params.mExpertSelectParams.mPostprocessParams);
+    }
   }
 };
 
@@ -331,6 +722,7 @@ static constexpr int NumExperts256Experts = 256;
 static constexpr int NumExperts384Experts = 384;
 static constexpr int NumExperts512Experts = 512;
 static constexpr int NumExperts576Experts = 576;
+static constexpr int NumExperts896Experts = 896;
 static constexpr int NumExperts1024Experts = 1024;
 static constexpr int MaxSupportedExperts = 2048;
 
@@ -348,6 +740,8 @@ static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThread
 static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * NumWarps;
 
 static constexpr int BlockKernelMaxNumTokens = 4;
+static constexpr int DynBlockKernelMaxNumTokens = 16;
+static constexpr int DynBlockKernelMaxNumExperts = 512;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -364,6 +758,8 @@ inline int32_t getMaxNumExperts(int32_t numExperts) {
     return NumExperts512Experts;
   } else if (numExperts <= NumExperts576Experts) {
     return NumExperts576Experts;
+  } else if (numExperts <= NumExperts896Experts) {
+    return NumExperts896Experts;
   } else if (numExperts <= NumExperts1024Experts) {
     return NumExperts1024Experts;
   } else if (numExperts <= MaxSupportedExperts) {
@@ -431,6 +827,7 @@ struct PolicyTraits {
 };
 
 /// Softmax + None (Default: Softmax -> TopK).
+/// NOTE: Currently only covers ≤256 experts. If a model requires more, add a larger Tier here.
 template <>
 struct PolicyTraits<SoftmaxPreprocess, NoOpPostprocess> {
   using Pairs = TierList<Tier<128, 8>,  // Small expert counts (≤128 experts)
@@ -441,21 +838,27 @@ struct PolicyTraits<SoftmaxPreprocess, NoOpPostprocess> {
 /// None + Softmax (Renormalize): many model configs.
 template <>
 struct PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> {
-  using Pairs = TierList<Tier<128, 4>,   // Mixtral 8x7B (topK=2), Qwen2-MoE (topK=4), Arctic
-                                         // (topK=2), DBRX (topK=4), GPT-OSS
-                         Tier<128, 8>,   // DeepSeek-V2-Lite (topK=6), Mixtral 8x22B (topK=2)
-                         Tier<160, 8>,   // Qwen3-Coder-480B
-                         Tier<256, 8>,   // Mistral Large 3 (topK=8)
-                         Tier<256, 16>,  // Models with 256 experts and topK 9..16
-                         Tier<512, 8>,   // Various 512-expert models
-                         Tier<512, 16>,  // Various 512-expert models with high topK
-                         Tier<512, 22>,  // Nemotron Super V3 (512 experts, topK=22)
-                         Tier<576, 8>,   // Customized model with 576 experts
-                         Tier<2048, 32>  // Large-expert fallback
+  using Pairs = TierList<Tier<128, 4>,    // Mixtral 8x7B (topK=2), Qwen2-MoE (topK=4), Arctic
+                                          // (topK=2), DBRX (topK=4), GPT-OSS
+                         Tier<128, 8>,    // DeepSeek-V2-Lite (topK=6), Mixtral 8x22B (topK=2)
+                         Tier<160, 8>,    // Qwen3-Coder-480B
+                         Tier<256, 8>,    // Mistral Large 3 (topK=8)
+                         Tier<256, 16>,   // Models with 256 experts and topK 9..16
+                         Tier<512, 8>,    // Various 512-expert models
+                         Tier<512, 16>,   // Various 512-expert models with high topK
+                         Tier<512, 22>,   // Nemotron Super V3 (512 experts, topK=22)
+                         Tier<512, 32>,   // 512-expert models with topK 23..32
+                         Tier<576, 8>,    // Customized model with 576 experts
+                         Tier<768, 32>,   // 576..768 experts with high topK
+                         Tier<896, 16>,   // 769..896 experts with topK <=16
+                         Tier<1024, 32>,  // 896..1024 experts with high topK
+                         Tier<2048, 32>   // Large-expert fallback
                          >;
 };
 
-/// Sigmoid + SumNormalize (SigmoidRenorm: Sigmoid -> TopK -> Renormalize).
+/// Sigmoid + SumNormalize (SigmoidRenorm: Sigmoid -> TopK -> Renormalize,
+///                          Sigmoid: Sigmoid -> TopK with normTopkProb=false).
+/// NOTE: Currently only covers ≤256 experts. If a model requires more, add a larger Tier here.
 template <>
 struct PolicyTraits<SigmoidPreprocess, SumNormalizePostprocess> {
   using Pairs = TierList<Tier<128, 8>,  // Small expert counts (≤128 experts)
@@ -470,11 +873,25 @@ struct PolicyTraits<SigmoidBiasPreprocess, ScaledSumNormalizePostprocess> {
                          Tier<256, 8>,  // MiniMax M2 (256 experts, topK=6)
                          Tier<384, 8>,  // Kimi K2 (384 experts)
                          Tier<512, 8>,  // DeepSeek nGroup≤1 (256 experts → E512 fallback)
-                         Tier<512, 22>  // Nemotron Super V3 (512 experts, topK=22, nGroup≤1)
+                         Tier<512, 22>,  // Nemotron Super V3 (512 experts, topK=22, nGroup≤1)
+                         Tier<896, 16>,  // 513..896 experts with topK <=16
+                         Tier<1024, 32>  // Default fallback (expert count may grow beyond 896)
+                         >;
+};
+
+/// None + Sigmoid (TopKSigmoid: TopK -> Sigmoid).
+/// Mirrors the tiers of Sigmoid + SumNormalize, the policy pair it is the
+/// selection-order counterpart of.
+/// NOTE: Currently only covers ≤256 experts. If a model requires more, add a larger Tier here.
+template <>
+struct PolicyTraits<NoOpPreprocess, SigmoidPostprocess> {
+  using Pairs = TierList<Tier<128, 8>,  // Small expert counts (≤128 experts)
+                         Tier<256, 8>   // Medium expert counts (≤256 experts)
                          >;
 };
 
 /// None + None (TopK only: no softmax or renormalize).
+/// NOTE: Currently only covers ≤256 experts. If a model requires more, add a larger Tier here.
 template <>
 struct PolicyTraits<NoOpPreprocess, NoOpPostprocess> {
   using Pairs = TierList<Tier<128, 8>,  // Small expert counts (≤128 experts)
@@ -492,24 +909,51 @@ struct PolicyTraits<NoOpPreprocess, NoOpPostprocess> {
 // Generic per-policy dispatch.  Iterates PolicyTraits<PreProc, PostProc>::Pairs,
 // picking the first (expert, topK) pair that covers the runtime values.
 //
-// IMPORTANT: numThreads is clamped to at least min(MaxNumExperts, 1024) from the dispatched tier.
-#define LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,   \
-                                  stream, PreProc, PostProc)                                   \
-  [&](auto pt_tag_) {                                                                          \
-    using Pairs_ = typename decltype(pt_tag_)::Pairs;                                          \
-    bool dispatched_ =                                                                         \
-        dispatchTierPairs(static_cast<Pairs_*>(nullptr), data, [&](auto eTag_, auto kTag_) {   \
-          constexpr int tierMaxExp_ = decltype(eTag_)::value;                                  \
-          constexpr int tierThreads_ = tierMaxExp_ <= 1024 ? tierMaxExp_ : 1024;               \
-          int const effectiveThreads_ = std::max(static_cast<int>(numThreads), tierThreads_);  \
-          LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, numBlocks, effectiveThreads_, \
-                                       smemSize, stream, PreProc, PostProc,                    \
-                                       decltype(eTag_)::value, decltype(kTag_)::value);        \
-        });                                                                                    \
-    if (!dispatched_) {                                                                        \
-      FLASHINFER_WARN("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);   \
-    }                                                                                          \
+// THREAD-COUNT SAFETY: the default launch config clamps the launch thread count to at
+// least min(MaxNumExperts, 1024) from the dispatched tier. This prevents mismatches
+// when a policy's smallest tier is larger than getMaxNumExperts() returns for the
+// same numExperts. Kernels with a different internal block size can pass a custom
+// LaunchConfig through the WITH_CONFIG variants and must keep their own launch
+// bounds, blockDim, and gridDim consistent.
+template <int MaxNumExperts, int MaxNumTopExperts>
+struct DefaultRoutingLaunchConfig {
+  static constexpr int BlockDim = MaxNumExperts <= 1024 ? MaxNumExperts : 1024;
+
+  static int blockDim(Data const& /*data*/, int numThreads) {
+    return std::max(numThreads, BlockDim);
+  }
+
+  static int gridDim(Data const& /*data*/, int numBlocks, int /*blockDim*/) { return numBlocks; }
+};
+
+#define LAUNCH_ROUTING_FOR_POLICY_WITH_CONFIG(data, coopLaunch, kernel, numBlocks, numThreads,   \
+                                              smemSize, stream, PreProc, PostProc, LaunchConfig) \
+  [&](auto pt_tag_) {                                                                            \
+    using Pairs_ = typename decltype(pt_tag_)::Pairs;                                            \
+    bool dispatched_ =                                                                           \
+        dispatchTierPairs(static_cast<Pairs_*>(nullptr), data, [&](auto eTag_, auto kTag_) {     \
+          using LaunchConfig_ = LaunchConfig<decltype(eTag_)::value, decltype(kTag_)::value>;    \
+          int const effectiveThreads_ =                                                          \
+              LaunchConfig_::blockDim(data, static_cast<int>(numThreads));                       \
+          int const effectiveBlocks_ =                                                           \
+              LaunchConfig_::gridDim(data, static_cast<int>(numBlocks), effectiveThreads_);      \
+          LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, effectiveBlocks_,               \
+                                       effectiveThreads_, smemSize, stream, PreProc, PostProc,   \
+                                       decltype(eTag_)::value, decltype(kTag_)::value);          \
+        });                                                                                      \
+    if (!dispatched_) {                                                                          \
+      FLASHINFER_WARN(                                                                           \
+          "No compiled tier covers numExperts=%d topK=%d for policy %s+%s. "                     \
+          "Add a Tier<%d, %d> to the corresponding PolicyTraits in RoutingCustomPolicy.cuh.",    \
+          data.mNumExperts, data.mTopK, #PreProc, #PostProc, getMaxNumExperts(data.mNumExperts), \
+          data.mTopK);                                                                           \
+    }                                                                                            \
   }(PolicyTraits<PreProc, PostProc>{})
+
+#define LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,       \
+                                  stream, PreProc, PostProc)                                       \
+  LAUNCH_ROUTING_FOR_POLICY_WITH_CONFIG(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, \
+                                        stream, PreProc, PostProc, DefaultRoutingLaunchConfig)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // CUSTOM EXPERT SELECT DISPATCH
@@ -531,7 +975,11 @@ struct PolicyTraits<NoOpPreprocess, NoOpPostprocess> {
                                             decltype(eTag_)::value, decltype(kTag_)::value);   \
         });                                                                                    \
     if (!dispatched_) {                                                                        \
-      FLASHINFER_WARN("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);   \
+      FLASHINFER_WARN(                                                                         \
+          "No compiled tier covers numExperts=%d topK=%d for ExpertSelect policy %s. "         \
+          "Add a Tier<%d, %d> to PolicyTraits<%s, void> in RoutingCustomPolicy.cuh.",          \
+          data.mNumExperts, data.mTopK, #ExpertSelect, getMaxNumExperts(data.mNumExperts),     \
+          data.mTopK, #ExpertSelect);                                                          \
     }                                                                                          \
   }(PolicyTraits<ExpertSelect, void>{})
 
@@ -570,6 +1018,10 @@ struct PolicyTraits<NoOpPreprocess, NoOpPostprocess> {
     LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,        \
                                  stream, NoOpPreprocess, NoOpPostprocess, NumExperts576Experts,    \
                                  NumTop8Experts);                                                  \
+  } else if (data.mNumExperts <= NumExperts896Experts) {                                           \
+    LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,        \
+                                 stream, NoOpPreprocess, NoOpPostprocess, NumExperts896Experts,    \
+                                 NumTop8Experts);                                                  \
   } else if (data.mNumExperts <= NumExperts1024Experts) {                                          \
     LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,        \
                                  stream, NoOpPreprocess, NoOpPostprocess, NumExperts1024Experts,   \
@@ -582,31 +1034,104 @@ struct PolicyTraits<NoOpPreprocess, NoOpPostprocess> {
     FLASHINFER_WARN("Unsupported numExperts");                                                     \
   }
 
+// Single source of truth for runtime → compile-time policy dispatch.
+// Maps (mPreprocessType, mPostprocessType) to compile-time (PreProc, PostProc) policy types.
+// LAUNCH_ROUTING_CUSTOM, queryDispatchedMaxExperts, and queryPolicySupportsBlockPerToken use this
+// function, so they are always in sync.
+// The callback receives (PreProc{}, PostProc{}, policyName) where policyName is a human-readable
+// string for diagnostics.
+template <typename Fn>
+inline void dispatchRoutingPolicy(Data const& data, Fn&& fn) {
+  if (data.mPreprocessType == RoutingPreprocessType::SigmoidBias)
+    fn(SigmoidBiasPreprocess{}, ScaledSumNormalizePostprocess{},
+       "SigmoidBiasPreprocess+ScaledSumNormalizePostprocess");
+  else if (data.mPreprocessType == RoutingPreprocessType::Sigmoid)
+    fn(SigmoidPreprocess{}, SumNormalizePostprocess{}, "SigmoidPreprocess+SumNormalizePostprocess");
+  else if (data.mPreprocessType == RoutingPreprocessType::Softmax &&
+           data.mPostprocessType == RoutingPostprocessType::None)
+    fn(SoftmaxPreprocess{}, NoOpPostprocess{}, "SoftmaxPreprocess+NoOpPostprocess");
+  else if (data.mPreprocessType == RoutingPreprocessType::Softmax)
+    fn(SoftmaxPreprocess{}, SumNormalizePostprocess{}, "SoftmaxPreprocess+SumNormalizePostprocess");
+  else if (data.mPostprocessType == RoutingPostprocessType::Softmax)
+    fn(NoOpPreprocess{}, SoftmaxPostprocess{}, "NoOpPreprocess+SoftmaxPostprocess");
+  else if (data.mPostprocessType == RoutingPostprocessType::Sigmoid)
+    fn(NoOpPreprocess{}, SigmoidPostprocess{}, "NoOpPreprocess+SigmoidPostprocess");
+  else
+    fn(NoOpPreprocess{}, NoOpPostprocess{}, "NoOpPreprocess+NoOpPostprocess");
+}
+
+// Query the MaxNumExperts that the policy tier dispatch would select for the given data.
+inline int32_t queryDispatchedMaxExperts(Data const& data) {
+  int32_t result = getMaxNumExperts(data.mNumExperts);
+  dispatchRoutingPolicy(data, [&](auto preProc, auto postProc, char const* /*policyName*/) {
+    using Pairs = typename PolicyTraits<decltype(preProc), decltype(postProc)>::Pairs;
+    dispatchTierPairs(static_cast<Pairs*>(nullptr), data,
+                      [&](auto eTag, auto /*kTag*/) { result = decltype(eTag)::value; });
+  });
+  return result;
+}
+
+// Whether the dispatched (pre, post) policy pair implements the block-per-token kernel interface
+// (both policies opt in; see PolicyPairSupportsBlockPerToken).
+inline bool queryPolicySupportsBlockPerToken(Data const& data) {
+  bool supports = false;
+  dispatchRoutingPolicy(data, [&](auto preProc_, auto postProc_, char const* /*policyName*/) {
+    using PreProc_ = decltype(preProc_);
+    using PostProc_ = decltype(postProc_);
+    supports = PolicyPairSupportsBlockPerToken<PreProc_, PostProc_>::value;
+  });
+  return supports;
+}
+
+// Whether the active (pre, post) policy has a compiled tier covering the runtime
+// (numExperts, topK) under the standard PolicyTraits dispatch — i.e. the tier list
+// LAUNCH_ROUTING_CUSTOM uses (block / dyn-block kernels and the cluster fallback).
+// Mirrors the dispatch predicate exactly (same policy resolution, same tier list,
+// same runtime comparison), so it reports precisely whether that launch would find
+// a tier. Lets host-side launchers surface an uncovered config as a loud error
+// instead of silently skipping the launch and leaving routing outputs uninitialized.
+inline bool queryPolicyHasCompiledTier(Data const& data) {
+  bool covered = false;
+  dispatchRoutingPolicy(data, [&](auto preProc_, auto postProc_, char const* /*policyName*/) {
+    using Pairs_ = typename PolicyTraits<decltype(preProc_), decltype(postProc_)>::Pairs;
+    covered = dispatchTierPairs(static_cast<Pairs_*>(nullptr), data, [](auto, auto) {});
+  });
+  return covered;
+}
+
 // Top-level dispatch: maps runtime preprocess/postprocess enums to compile-time policy types,
-// then delegates to LAUNCH_ROUTING_FOR_POLICY which reads PolicyTraits for tier support.
-// Use this ONLY for kernels that call ExpertSelectPolicy::apply (block, cluster, histogramScores).
+// then delegates to the policy tier list using the supplied launch config.
+#define LAUNCH_ROUTING_CUSTOM_WITH_CONFIG(data, coopLaunch, kernel, numBlocks, numThreads,       \
+                                          smemSize, stream, LaunchConfig)                        \
+  dispatchRoutingPolicy(data, [&](auto preProc_, auto postProc_, char const* policyName_) {      \
+    using PreProc_ = decltype(preProc_);                                                         \
+    using PostProc_ = decltype(postProc_);                                                       \
+    using Pairs_ = typename PolicyTraits<PreProc_, PostProc_>::Pairs;                            \
+    bool dispatched_ =                                                                           \
+        dispatchTierPairs(static_cast<Pairs_*>(nullptr), data, [&](auto eTag_, auto kTag_) {     \
+          using LaunchConfig_ = LaunchConfig<decltype(eTag_)::value, decltype(kTag_)::value>;    \
+          int const effectiveThreads_ =                                                          \
+              LaunchConfig_::blockDim(data, static_cast<int>(numThreads));                       \
+          int const effectiveBlocks_ =                                                           \
+              LaunchConfig_::gridDim(data, static_cast<int>(numBlocks), effectiveThreads_);      \
+          LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, effectiveBlocks_,               \
+                                       effectiveThreads_, smemSize, stream, PreProc_, PostProc_, \
+                                       decltype(eTag_)::value, decltype(kTag_)::value);          \
+        });                                                                                      \
+    if (!dispatched_) {                                                                          \
+      FLASHINFER_WARN(                                                                           \
+          "No compiled tier covers numExperts=%d topK=%d for policy %s. "                        \
+          "Add a Tier<%d, %d> to the corresponding PolicyTraits in RoutingCustomPolicy.cuh.",    \
+          data.mNumExperts, data.mTopK, policyName_, getMaxNumExperts(data.mNumExperts),         \
+          data.mTopK);                                                                           \
+    }                                                                                            \
+  })
+
 #define LAUNCH_ROUTING_CUSTOM(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream) \
-  if (data.mPreprocessType == RoutingPreprocessType::SigmoidBias) {                              \
-    LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, \
-                              SigmoidBiasPreprocess, ScaledSumNormalizePostprocess);             \
-  } else if (data.mPreprocessType == RoutingPreprocessType::Sigmoid) {                           \
-    LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, \
-                              SigmoidPreprocess, SumNormalizePostprocess);                       \
-  } else if (data.mPreprocessType == RoutingPreprocessType::Softmax &&                           \
-             data.mPostprocessType == RoutingPostprocessType::None) {                            \
-    LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, \
-                              SoftmaxPreprocess, NoOpPostprocess);                               \
-  } else if (data.mPreprocessType == RoutingPreprocessType::Softmax) {                           \
-    LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, \
-                              SoftmaxPreprocess, SumNormalizePostprocess);                       \
-  } else if (data.mPostprocessType == RoutingPostprocessType::Softmax) {                         \
-    LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, \
-                              NoOpPreprocess, SoftmaxPostprocess);                               \
-  } else {                                                                                       \
-    LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, \
-                              NoOpPreprocess, NoOpPostprocess);                                  \
-  }                                                                                              \
-  ////////////////////////////////////////////////////////////////////////////////////////////////////
+  LAUNCH_ROUTING_CUSTOM_WITH_CONFIG(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,   \
+                                    stream, DefaultRoutingLaunchConfig)
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace routingCustom
 }  // namespace moe::dev::routing

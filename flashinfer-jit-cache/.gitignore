@@ -7,3 +7,5 @@ build/
 dist/
 flashinfer_jit_cache/jit_cache/
 _build_meta.py
+flashinfer_jit_cache/_build_meta.py
+flashinfer_jit_cache/_provider_requirements.txt

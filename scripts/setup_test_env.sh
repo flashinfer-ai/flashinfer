@@ -9,6 +9,83 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# Pin the preinstalled CUDA torch for every job-time pip install (same guard as
+# test_utils.sh; idempotent — whichever is sourced first wins). Branch
+# requirement synchronization below uses --no-deps to preserve the image's
+# validated cuda-python and cuDNN packages. Pinning those packages would contradict
+# torch's own exact dependency metadata. The +cuXXX local tag is stripped so
+# PEP-517 build environments can resolve the constraint from PyPI.
+if [ -z "${PIP_CONSTRAINT:-}" ]; then
+  if ! _torch_pin=$(python -c \
+    'import torch; print("torch==" + torch.__version__.split("+")[0])'); then
+    echo "ERROR: failed to inspect the image torch; refusing unpinned pip installs" >&2
+    return 1
+  fi
+  if [ -n "${_torch_pin}" ]; then
+    _constraint_file=$(mktemp /tmp/ci-torch-constraint.XXXXXX.txt)
+    printf '%s\n' "${_torch_pin}" > "${_constraint_file}"
+    export PIP_CONSTRAINT="${_constraint_file}"
+    echo "Pinning image torch for job-time pip installs: ${_torch_pin}"
+    unset _constraint_file
+  else
+    echo "ERROR: image torch inspection returned no package constraint" >&2
+    return 1
+  fi
+  unset _torch_pin
+fi
+
+# Resolve the DSL and its libraries together before metadata-only installs.
+# Otherwise its new .pth can run before the matching library wheel is present.
+bash "${SCRIPT_DIR}/install_cutlass_dsl.sh" || return 1
+
+# Install only what this branch moved past the image. Installing the full file
+# instead lets one drifted floor re-resolve every other requirement, which is how
+# torch has twice been swapped for a build that does not match the image.
+_reqs_output=$(python "${SCRIPT_DIR}/check_requirements.py" \
+  "${REPO_ROOT}/requirements.txt") && _reqs_status=0 || _reqs_status=$?
+case "${_reqs_status}" in
+  0)
+    echo "Requirements are satisfied by the image; nothing to install."
+    ;;
+  1)
+    echo "Installing requirements this branch changed: ${_reqs_output//$'\n'/ }"
+    _reqs_list=()
+    while IFS= read -r _req; do
+      [ -n "${_req}" ] && _reqs_list+=("${_req}")
+    done <<< "${_reqs_output}"
+    pip install --no-deps "${_reqs_list[@]}"
+    unset _reqs_list _req
+    ;;
+  *)
+    echo "WARNING: requirement check failed; syncing the full requirements" >&2
+    pip install --no-deps -r "${REPO_ROOT}/requirements.txt"
+    ;;
+esac
+unset _reqs_output _reqs_status
+
+# Install using only what the image carries; the check above covered the rest.
+# FLASHINFER_BUILD_NO_PIP keeps dropping isolation from activating the build
+# hooks' own downloads, which isolation has always swallowed here.
+install_flashinfer_editable() {
+  FLASHINFER_BUILD_NO_PIP=1 \
+    pip install --no-build-isolation --no-deps -e "${1:-.}" -v
+}
+
+setup_moe_ep_test_env() {
+  local test_paths="${1:-${TEST_PATH:-}}"
+  [[ " ${test_paths} " == *[[:space:]/]tests/moe_ep[[:space:]/]* ]] || return 0
+  local cuda_major nccl_wheel_lib
+  cuda_major=$(python -c \
+    'import torch; v=torch.version.cuda; print(v.split(".")[0] if v else "0")' \
+    2>/dev/null || echo 0)
+  [ "${cuda_major}" -ge 13 ] || return 0
+  FI_SRC="${REPO_ROOT}" bash "${REPO_ROOT}/docker/install/build_flashinfer_ep_pytorch.sh"
+  # The installer runs in a child shell; export its NCCL choice here too.
+  nccl_wheel_lib=$(python -c \
+    'import nvidia.nccl, os; print(os.path.join(list(nvidia.nccl.__path__)[0], "lib"))')
+  export LD_LIBRARY_PATH="${nccl_wheel_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+}
+
 # Source the environment override file if it exists
 if [ -f "${REPO_ROOT}/ci/setup_python.env" ]; then
   source "${REPO_ROOT}/ci/setup_python.env"
@@ -21,6 +98,35 @@ if [ -n "${TVM_FFI_REF:-}" ]; then
   echo "========================================"
   pip install --force-reinstall "git+https://github.com/apache/tvm-ffi.git@${TVM_FFI_REF}"
   echo "TVM-FFI override complete."
+  echo ""
+fi
+
+# Install quack-kernels for the VSA blk128 backend tests.
+# quack-kernels is NOT a runtime requirement of flashinfer — only users of the
+# blk128 VSA backend need it, so it is intentionally kept out of requirements.txt
+# and installed here for CI only. The blk128 backend supports SM100/SM103, so we
+# install quack-kernels only when such a GPU is present to avoid slowing unrelated CI jobs.
+# The correct PyPI distribution name is quack-kernels (top-level package: quack).
+# quack-kernels 0.6.5 supports the current DSL instead of pinning 4.6.2.
+# Keep --no-deps to preserve the image's CUDA-enabled torch; the remaining
+# dependencies are installed above or listed alongside quack here.
+#
+# Match on the full capability, not just the major version: SM107 (Rubin) is
+# also major 10, but the blk128 backend is SM100/SM103 only (see
+# flashinfer/cute_dsl/sparse/sm100_blk128/, and the (10,0)/(10,3) allowlist in
+# tests/attention/test_vsa_block_sparse.py), so those tests skip on Rubin and
+# the install is pure cost there.  --no-deps already prevents the DSL downgrade;
+# skipping the install altogether also avoids perturbing a Rubin environment
+# that nothing in this package needs.
+SM_CAP=$(python -c "import torch; print('%d.%d' % torch.cuda.get_device_capability())" 2>/dev/null || echo "")
+if [ "${SM_CAP}" = "10.0" ] || [ "${SM_CAP}" = "10.3" ]; then
+  echo "========================================"
+  echo "Detected SM${SM_CAP} (SM100/SM103); installing quack-kernels for VSA blk128 tests"
+  echo "========================================"
+  pip install --no-deps "quack-kernels==0.6.5" "torch-c-dlpack-ext==0.1.5"
+  # Fail here rather than as a confusing test error if --no-deps left a gap.
+  python -c "import quack"
+  echo "quack-kernels install complete."
   echo ""
 fi
 
@@ -37,7 +143,7 @@ if [ -n "${CUTLASS_DSL_VERSION:-}" ]; then
   echo "Overriding nvidia-cutlass-dsl with: ${CUTLASS_DSL_PKG}"
   echo "========================================"
   # Clean uninstall old packages first (recommended by NVIDIA docs)
-  pip uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 -y 2>/dev/null || true
+  pip uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 -y 2>/dev/null || true
   pip install "${CUTLASS_DSL_PKG}"
   echo "nvidia-cutlass-dsl override complete."
   echo ""

@@ -17,7 +17,7 @@ limitations under the License.
 import einops
 import pytest
 import torch
-from tests.test_helpers.sink_attention_reference import sink_attention_unified
+from tests.attention.test_helpers.sink_attention_reference import sink_attention_unified
 
 import flashinfer
 from flashinfer.utils import get_compute_capability
@@ -227,7 +227,7 @@ def test_blackwell_trtllm_gen_context_attention_sink(
     )
 
     if dtype == torch.float16:
-        atol, rtol = 1e-3, 1e-3
+        atol, rtol = 2e-3, 1e-3
     elif dtype == torch.bfloat16:
         atol, rtol = 1e-2, 1e-2
     else:

@@ -157,6 +157,26 @@ using Kernel_traits_nl_causal = fmha::{{ kernel_traits }}<
 static_assert(Kernel_traits_nl_causal::CTAS_PER_HEAD == 1, "");
 static_assert(Kernel_traits_nl_causal::MASK_VERSION == 3, "");
 
+{% if sliding_or_chunked_causal_mask == "1" %}
+// MASK_VERSION 4 = sliding-or-chunked causal. Shared by the non-tiled (_nl) and
+// non-reload tiled (_nl_tiled else-branch) launchers; without it both route
+// SLIDING_OR_CHUNKED_CAUSAL to the maskless (dense) kernel.
+using Kernel_traits_nl_sliding_or_chunked = fmha::{{ kernel_traits }}<
+    fmha::{{ instruction_traits }},
+    {{ kv_loop_step }},
+    {{ head_size }},
+    {{ head_size_v }},
+    {{ noloop_step }},
+    1,
+    {{ warps_m }} * {{ warps_n }},
+    {{ ctas_per_head }},
+    {{ kernel_flags }} | 0x200 /* no_loop flag */,
+    /*sliding-or-chunked-causal mask*/ 4>;
+
+static_assert(Kernel_traits_nl_sliding_or_chunked::CTAS_PER_HEAD == 1, "");
+static_assert(Kernel_traits_nl_sliding_or_chunked::MASK_VERSION == 4, "");
+{% endif %}
+
 extern "C"
 __global__
 void {{ kernel_name }}_nl({{ params_type }} params){
@@ -177,6 +197,18 @@ void {{ causal_kernel_name }}_nl({{ params_type }} params){
 {% endif %}
 }
 
+{% if sliding_or_chunked_causal_mask == "1" %}
+extern "C"
+__global__
+void {{ sliding_or_chunked_causal_kernel_name }}_nl({{ params_type }} params){
+{% if kernel_variant == "flash_attention" %}
+  fused_multihead_attention::device_flash_attention_nl<Kernel_traits_nl_sliding_or_chunked>(params);
+{% else %}
+  fused_multihead_attention::device_1xN_nl<Kernel_traits_nl_sliding_or_chunked>(params);
+{% endif %}
+}
+{% endif %}
+
 void {{ launcher_name }}_nl(
     const {{ params_type }} &params,
     const Launch_params &launch_params,
@@ -193,6 +225,16 @@ void {{ launcher_name }}_nl(
                                             smem_size));
     }
     {{ causal_kernel_name }}_nl<<<grid, Kernel_traits_nl_causal::THREADS, Kernel_traits_nl_causal::BYTES_PER_SMEM, stream>>>(params);
+{% if sliding_or_chunked_causal_mask == "1" %}
+  } else if( launch_params.attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL ) {
+    constexpr int smem_size = Kernel_traits_nl_sliding_or_chunked::BYTES_PER_SMEM;
+    if( smem_size >= 48*1024 ) {
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ sliding_or_chunked_causal_kernel_name }}_nl,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem_size));
+    }
+    {{ sliding_or_chunked_causal_kernel_name }}_nl<<<grid, Kernel_traits_nl_sliding_or_chunked::THREADS, Kernel_traits_nl_sliding_or_chunked::BYTES_PER_SMEM, stream>>>(params);
+{% endif %}
   } else {
     constexpr int smem_size = Kernel_traits_nl::BYTES_PER_SMEM;
     if( smem_size >= 48*1024 ) {
@@ -241,6 +283,26 @@ using Kernel_traits_nl_tiled_causal = fmha::{{ kernel_traits }}<
 static_assert(Kernel_traits_nl_tiled_causal::CTAS_PER_HEAD == 1, "");
 static_assert(Kernel_traits_nl_tiled_causal::MASK_VERSION == 3, "");
 
+{% if sliding_or_chunked_causal_mask == "1" %}
+// MASK_VERSION 4 = sliding-or-chunked causal (CAUSAL_MASK && SLIDING_WINDOW_ATTENTION).
+// Without this variant the tiled-noloop launcher routes SLIDING_OR_CHUNKED_CAUSAL
+// requests to the maskless (dense) kernel, silently producing bidirectional output.
+using Kernel_traits_nl_tiled_sliding_or_chunked = fmha::{{ kernel_traits }}<
+    fmha::{{ instruction_traits }},
+    {{ kv_loop_step }},
+    {{ head_size }},
+    {{ head_size_v }},
+    {{ noloop_step }},
+    {{ warps_m }},
+    {{ warps_n }},
+    {{ ctas_per_head }},
+    {{ kernel_flags }} | 0x200 /* no_loop flag */,
+    /*sliding-or-chunked-causal mask*/ 4>;
+
+static_assert(Kernel_traits_nl_tiled_sliding_or_chunked::CTAS_PER_HEAD == 1, "");
+static_assert(Kernel_traits_nl_tiled_sliding_or_chunked::MASK_VERSION == 4, "");
+{% endif %}
+
 {% else %} // !reload_q
 // Tiled (granular) variant: uses the same Kernel_traits_nl with USE_GRANULAR_TILING
 // in the flags for correct tile decomposition (CTA_O_TILE_K computed from K_PER_MMA
@@ -276,6 +338,18 @@ void {{ causal_kernel_name }}_nl_tiled({{ params_type }} params){
 {% endif %}
 }
 
+{% if kernel_variant == "flash_attention" and sliding_or_chunked_causal_mask == "1" %}
+extern "C"
+__global__
+void {{ sliding_or_chunked_causal_kernel_name }}_nl_tiled({{ params_type }} params){
+{% if reload_q %}
+  fused_multihead_attention::device_flash_attention_nl_tiled<Kernel_traits_nl_tiled_sliding_or_chunked>(params);
+{% else %}
+  fused_multihead_attention::device_flash_attention_nl<Kernel_traits_nl_sliding_or_chunked>(params);
+{% endif %}
+}
+{% endif %}
+
 void {{ launcher_name }}_nl_tiled(
     const {{ params_type }} &params,
     const Launch_params &launch_params,
@@ -283,7 +357,22 @@ void {{ launcher_name }}_nl_tiled(
 
   // Runtime loop_iters: flash attention supports variable sequence lengths.
   int loop_iters = ( params.s + {{ noloop_step }} - 1 )  / {{ noloop_step }};
-  dim3 grid(loop_iters, params.h, params.b); // better locality
+  // When the V/output head dim exceeds the per-CTA output tile (CTA_O_TILE_N, capped at
+  // 256 for granular tiling), the kernel splits the output feature dimension across
+  // ctas_per_o_row CTAs (kernel: q_loop = blockIdx.x / ctas_per_o_row,
+  // o_part = blockIdx.x % ctas_per_o_row). Each CTA recomputes BMM1+softmax and writes a
+  // disjoint slice of O (no cross-CTA reduction), so grid.x must include this factor.
+  // For head dims <= 256 this is 1, leaving existing kernels unchanged.
+{% if reload_q %}
+  constexpr int ctas_per_o_row =
+      ( (int)Kernel_traits_nl_tiled::Cta_tile_o::VALID_N + (int)Kernel_traits_nl_tiled::Cta_tile_o::N - 1 )
+      / (int)Kernel_traits_nl_tiled::Cta_tile_o::N;
+{% else %}
+  constexpr int ctas_per_o_row =
+      ( (int)Kernel_traits_nl::Cta_tile_o::VALID_N + (int)Kernel_traits_nl::Cta_tile_o::N - 1 )
+      / (int)Kernel_traits_nl::Cta_tile_o::N;
+{% endif %}
+  dim3 grid(loop_iters * ctas_per_o_row, params.h, params.b); // better locality
 {% if reload_q %}
   if( launch_params.attention_mask_type == Attention_mask_type::CAUSAL ) {
     constexpr int smem_size = Kernel_traits_nl_tiled_causal::BYTES_PER_SMEM;
@@ -293,6 +382,16 @@ void {{ launcher_name }}_nl_tiled(
                                             smem_size));
     }
     {{ causal_kernel_name }}_nl_tiled<<<grid, Kernel_traits_nl_tiled_causal::THREADS, Kernel_traits_nl_tiled_causal::BYTES_PER_SMEM, stream>>>(params);
+{% if sliding_or_chunked_causal_mask == "1" %}
+  } else if( launch_params.attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL ) {
+    constexpr int smem_size = Kernel_traits_nl_tiled_sliding_or_chunked::BYTES_PER_SMEM;
+    if( smem_size >= 48*1024 ) {
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ sliding_or_chunked_causal_kernel_name }}_nl_tiled,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem_size));
+    }
+    {{ sliding_or_chunked_causal_kernel_name }}_nl_tiled<<<grid, Kernel_traits_nl_tiled_sliding_or_chunked::THREADS, Kernel_traits_nl_tiled_sliding_or_chunked::BYTES_PER_SMEM, stream>>>(params);
+{% endif %}
   } else {
     constexpr int smem_size = Kernel_traits_nl_tiled::BYTES_PER_SMEM;
     if( smem_size >= 48*1024 ) {
@@ -311,6 +410,16 @@ void {{ launcher_name }}_nl_tiled(
                                             smem_size));
     }
     {{ causal_kernel_name }}_nl_tiled<<<grid, Kernel_traits_nl_causal::THREADS, Kernel_traits_nl_causal::BYTES_PER_SMEM, stream>>>(params);
+{% if sliding_or_chunked_causal_mask == "1" %}
+  } else if( launch_params.attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL ) {
+    constexpr int smem_size = Kernel_traits_nl_sliding_or_chunked::BYTES_PER_SMEM;
+    if( smem_size >= 48*1024 ) {
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ sliding_or_chunked_causal_kernel_name }}_nl_tiled,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem_size));
+    }
+    {{ sliding_or_chunked_causal_kernel_name }}_nl_tiled<<<grid, Kernel_traits_nl_sliding_or_chunked::THREADS, Kernel_traits_nl_sliding_or_chunked::BYTES_PER_SMEM, stream>>>(params);
+{% endif %}
   } else {
     constexpr int smem_size = Kernel_traits_nl::BYTES_PER_SMEM;
     if( smem_size >= 48*1024 ) {

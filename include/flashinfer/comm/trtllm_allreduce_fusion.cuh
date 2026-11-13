@@ -7,6 +7,7 @@
 #include <cuda_fp4.h>
 #endif
 
+#include <cuda/std/limits>
 #include <cuda/std/optional>
 #include <tuple>
 #include <type_traits>
@@ -30,6 +31,14 @@ static constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 static constexpr int kBytesPerAccess = 16;
 static constexpr int kOneShotMaxToken = 128;
 static constexpr int kBarrierFlagCount = 256;
+static constexpr float kFP8E4M3Max = 448.0f;
+// E4M3FN's smallest positive subnormal is 2^-9. Clamp dynamic
+// scales to min_subnormal / max_finite so zero/tiny rows do not
+// produce a zero scale.
+static constexpr float kFP8E4M3MinSubnormal = 1.0f / 512.0f;
+static constexpr float kDynamicFP8MinScale = kFP8E4M3MinSubnormal / kFP8E4M3Max;
+// MXFP8: 32 consecutive elements share one UE8M0 scale.
+static constexpr int kMXFP8SFVecSize = 32;
 
 }  // namespace details
 
@@ -383,7 +392,8 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
 
 namespace utils {
 
-#define FINAL_MASK 0xffffffff
+static constexpr int kWarpSize = 32;
+static constexpr unsigned int kFullWarpMask = 0xffffffffU;
 
 template <typename T, int NUM>
 __inline__ __device__ T warpReduceSumV2(T* val) {
@@ -391,7 +401,24 @@ __inline__ __device__ T warpReduceSumV2(T* val) {
   for (int i = 0; i < NUM; i++) {
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1)
-      val[i] += __shfl_xor_sync(FINAL_MASK, val[i], mask, 32);
+      val[i] += __shfl_xor_sync(kFullWarpMask, val[i], mask, kWarpSize);
+  }
+  return (T)(0.0f);
+}
+
+template <typename T, int NUM>
+__inline__ __device__ T warpReduceSumPartialV2(T* val, int active_lanes) {
+  int lane = threadIdx.x & (kWarpSize - 1);
+  unsigned int active_mask = active_lanes == kWarpSize ? kFullWarpMask : (1U << active_lanes) - 1;
+#pragma unroll
+  for (int i = 0; i < NUM; i++) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+      T other = __shfl_xor_sync(active_mask, val[i], mask, kWarpSize);
+      if ((lane ^ mask) < active_lanes) {
+        val[i] += other;
+      }
+    }
   }
   return (T)(0.0f);
 }
@@ -401,8 +428,15 @@ __inline__ __device__ T blockReduceSumV2(T* val) {
   static __shared__ T shared[NUM][33];
   int lane = threadIdx.x & 0x1f;
   int wid = threadIdx.x >> 5;
+  int warp_count = ceil_div(blockDim.x, kWarpSize);
+  int tail_lanes = blockDim.x & (kWarpSize - 1);
+  bool is_partial_warp = tail_lanes != 0 && wid == warp_count - 1;
 
-  warpReduceSumV2<T, NUM>(val);
+  if (is_partial_warp) {
+    warpReduceSumPartialV2<T, NUM>(val, tail_lanes);
+  } else {
+    warpReduceSumV2<T, NUM>(val);
+  }
 
   if (lane == 0) {
 #pragma unroll
@@ -413,12 +447,83 @@ __inline__ __device__ T blockReduceSumV2(T* val) {
 
   __syncthreads();
 
-  bool is_mask = threadIdx.x < (blockDim.x / 32.f);
+  bool is_mask = threadIdx.x < warp_count;
 #pragma unroll
   for (int i = 0; i < NUM; i++) {
     val[i] = is_mask ? shared[i][lane] : (T)(0.0f);
   }
-  warpReduceSumV2<T, NUM>(val);
+  if (is_partial_warp) {
+    warpReduceSumPartialV2<T, NUM>(val, tail_lanes);
+  } else {
+    warpReduceSumV2<T, NUM>(val);
+  }
+  return (T)0.0f;
+}
+
+template <typename T, int NUM>
+__inline__ __device__ T warpReduceMaxV2(T* val) {
+#pragma unroll
+  for (int i = 0; i < NUM; i++) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+      val[i] = fmaxf(val[i], __shfl_xor_sync(kFullWarpMask, val[i], mask, kWarpSize));
+    }
+  }
+  return (T)(0.0f);
+}
+
+template <typename T, int NUM>
+__inline__ __device__ T warpReduceMaxPartialV2(T* val, int active_lanes) {
+  int lane = threadIdx.x & (kWarpSize - 1);
+  unsigned int active_mask = active_lanes == kWarpSize ? kFullWarpMask : (1U << active_lanes) - 1;
+#pragma unroll
+  for (int i = 0; i < NUM; i++) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+      T other = __shfl_xor_sync(active_mask, val[i], mask, kWarpSize);
+      if ((lane ^ mask) < active_lanes) {
+        val[i] = fmaxf(val[i], other);
+      }
+    }
+  }
+  return (T)(0.0f);
+}
+
+template <typename T, int NUM>
+__inline__ __device__ T blockReduceMaxV2(T* val) {
+  static __shared__ T shared[NUM][33];
+  int lane = threadIdx.x & 0x1f;
+  int wid = threadIdx.x >> 5;
+  int warp_count = ceil_div(blockDim.x, kWarpSize);
+  int tail_lanes = blockDim.x & (kWarpSize - 1);
+  bool is_partial_warp = tail_lanes != 0 && wid == warp_count - 1;
+
+  if (is_partial_warp) {
+    warpReduceMaxPartialV2<T, NUM>(val, tail_lanes);
+  } else {
+    warpReduceMaxV2<T, NUM>(val);
+  }
+
+  if (lane == 0) {
+#pragma unroll
+    for (int i = 0; i < NUM; i++) {
+      shared[i][wid] = val[i];
+    }
+  }
+
+  __syncthreads();
+
+  bool is_mask = threadIdx.x < warp_count;
+#pragma unroll
+  for (int i = 0; i < NUM; i++) {
+    val[i] = is_mask ? shared[i][lane]
+                     : maths::cuda_cast<T>(-cuda::std::numeric_limits<float>::infinity());
+  }
+  if (is_partial_warp) {
+    warpReduceMaxPartialV2<T, NUM>(val, tail_lanes);
+  } else {
+    warpReduceMaxV2<T, NUM>(val);
+  }
   return (T)0.0f;
 }
 
@@ -443,8 +548,9 @@ inline int getSMRegisters() {
   return regs_per_block;
 }
 
-inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, int mIdx, int kIdx,
-                                                  std::optional<int> numRows, int numCols) {
+inline __device__ int64_t get_sf_out_offset_128x4(cuda::std::optional<int> batchIdx, int mIdx,
+                                                  int kIdx, cuda::std::optional<int> numRows,
+                                                  int numCols) {
   // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
   // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
 
@@ -484,8 +590,9 @@ inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, i
 }
 
 template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
-__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx,
-                                                       int colIdx, std::optional<int> numRows,
+__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(cuda::std::optional<int> batchIdx,
+                                                       int rowIdx, int colIdx,
+                                                       cuda::std::optional<int> numRows,
                                                        int numCols, SFType* SFout,
                                                        QuantizationSFLayout layout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -702,6 +809,112 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
 
 #endif
 
+// UE8M0 biased exponent of ceil_pow2(value), saturated to [0, 254]. Bit-exact with
+// __nv_cvt_float_to_e8m0(value, __NV_SATFINITE, cudaRoundPosInf) and with FlashInfer's
+// CuTe-DSL mxfp8_quantize (float_to_ue8m0_fast).
+__device__ __forceinline__ uint32_t float_to_ue8m0_ceil(float value) {
+  if (value <= 0.f) {
+    return 0u;
+  }
+  uint32_t bits = __float_as_uint(value);
+  uint32_t exp_biased = (bits >> 23) & 0xffu;
+  uint32_t mantissa = bits & 0x7fffffu;
+  uint32_t bump = mantissa != 0u ? 1u : 0u;
+  if (exp_biased == 0u && mantissa <= 0x400000u) {
+    bump = 0u;
+  }
+  uint32_t result = exp_biased + bump;
+  return result > 254u ? 254u : result;
+}
+
+// Byte offset of MXFP8 scale factor (row, sf_col) in the LINEAR or SWIZZLED_128x4 layout.
+__device__ __forceinline__ int64_t mxfp8_sf_offset(int row, int sf_col, int num_sf_cols,
+                                                   QuantizationSFLayout layout) {
+  if (layout == QuantizationSFLayout::LINEAR) {
+    return static_cast<int64_t>(row) * num_sf_cols + sf_col;
+  }
+  // SWIZZLED_128x4: [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4 (kTile)]
+  int num_k_tiles = (num_sf_cols + 3) / 4;
+  return static_cast<int64_t>(row / 128) * num_k_tiles * 512 +
+         static_cast<int64_t>(sf_col / 4) * 512 + (row % 32) * 16 + ((row % 128) / 32) * 4 +
+         (sf_col % 4);
+}
+
+// MXFP8 quantization (E4M3 data, one UE8M0 scale per 32 elements) of one thread's VEC_SIZE
+// consecutive elements vals = x[row, col : col + VEC_SIZE), shared by the allreduce fusion kernels.
+//
+// The kMXFP8SFVecSize / VEC_SIZE threads holding one 32-element scale group must be consecutive,
+// lane-aligned lanes of one warp (col / VEC_SIZE == lane modulo the group size) and must call this
+// together; they reduce the group's amax with warp shuffles. Numerics match FlashInfer's
+// mxfp8_quantize (backend="cute-dsl") applied to the same bf16/fp16 values:
+// scale = ue8m0_ceil(amax * (1 / 448)), q = satfinite_rn(clamp(x * 2^-scale)).
+//
+// quant_out is [rows, hidden_dim] E4M3. scale_out holds the scales of every row; for the swizzled
+// layout the group leader of the last group also zeroes its row's column padding. Padding rows
+// [rows, round_up(rows, 128)) are left unwritten: a GEMM row only reads its own scales, so they
+// reach only output rows that are never stored.
+template <typename T, int VEC_SIZE>
+__device__ __forceinline__ void mxfp8_quantize_store(T const* vals, int row, int col,
+                                                     int hidden_dim, QuantizationSFLayout layout,
+                                                     void* quant_out, void* scale_out) {
+  constexpr int kSfVec = details::kMXFP8SFVecSize;
+  constexpr int kThreadsPerSf = kSfVec / VEC_SIZE;
+  static_assert(kSfVec % VEC_SIZE == 0 && kThreadsPerSf <= 32, "Invalid MXFP8 vector size");
+  static_assert(VEC_SIZE % 2 == 0, "MXFP8 packing converts element pairs");
+
+  float amax = 0.f;
+#pragma unroll
+  for (int i = 0; i < VEC_SIZE; ++i) {
+    amax = fmaxf(amax, fabsf(static_cast<float>(vals[i])));
+  }
+  constexpr unsigned int kGroupLanes =
+      kThreadsPerSf >= 32 ? 0xffffffffu : ((1u << kThreadsPerSf) - 1u);
+  unsigned int const mask = kGroupLanes << ((threadIdx.x & 31) & ~(kThreadsPerSf - 1));
+#pragma unroll
+  for (int offset = 1; offset < kThreadsPerSf; offset *= 2) {
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, offset));
+  }
+
+  constexpr float kInvE4M3Max = 1.0f / details::kFP8E4M3Max;
+  uint32_t sf = float_to_ue8m0_ceil(amax * kInvE4M3Max);
+  // 2^(127 - sf): exact inverse of the UE8M0 scale; 0 for sf == 0.
+  float inv_scale =
+      sf == 0u ? 0.f
+               : __uint_as_float(static_cast<uint32_t>(max(254 - static_cast<int>(sf), 0)) << 23);
+
+  using PackedQuantizedType = std::conditional_t<VEC_SIZE == 4, float, float2>;
+  static_assert(sizeof(PackedQuantizedType) == VEC_SIZE, "Unsupported MXFP8 vector size");
+  PackedQuantizedType ret;
+#pragma unroll
+  for (int i = 0; i < VEC_SIZE; i += 2) {
+    float2 f;
+    f.x = static_cast<float>(vals[i]) * inv_scale;
+    f.y = static_cast<float>(vals[i + 1]) * inv_scale;
+    f.x = fmaxf(fminf(f.x, details::kFP8E4M3Max), -details::kFP8E4M3Max);
+    f.y = fmaxf(fminf(f.y, details::kFP8E4M3Max), -details::kFP8E4M3Max);
+    reinterpret_cast<__nv_fp8x2_storage_t*>(&ret)[i / 2] =
+        __nv_cvt_float2_to_fp8x2(f, __NV_SATFINITE, __NV_E4M3);
+  }
+  int64_t const elem_offset = static_cast<int64_t>(row) * hidden_dim + col;
+  *reinterpret_cast<PackedQuantizedType*>(reinterpret_cast<uint8_t*>(quant_out) + elem_offset) =
+      ret;
+
+  if ((col / VEC_SIZE) % kThreadsPerSf != 0) {
+    return;
+  }
+  uint8_t* sf_out = reinterpret_cast<uint8_t*>(scale_out);
+  int const num_sf_cols = hidden_dim / kSfVec;
+  int const sf_col = col / kSfVec;
+  sf_out[mxfp8_sf_offset(row, sf_col, num_sf_cols, layout)] = static_cast<uint8_t>(sf);
+  if (layout != QuantizationSFLayout::SWIZZLED_128x4 || sf_col != num_sf_cols - 1) {
+    return;
+  }
+  int const padded_cols = (num_sf_cols + 3) / 4 * 4;
+  for (int c = num_sf_cols; c < padded_cols; ++c) {
+    sf_out[mxfp8_sf_offset(row, c, num_sf_cols, layout)] = 0;
+  }
+}
+
 }  // namespace utils
 
 template <typename T, uint32_t VEC_SIZE>
@@ -723,13 +936,28 @@ enum class AllReduceFusionPattern : int {
   // The difference between these two and the standard version is that the NormOut version outputs
   // the result of the norm.
   kARResidualRMSNormOutFP8Quant = 4,
-  kARResidualRMSNormOutFP4Quant = 5
+  kARResidualRMSNormOutFP4Quant = 5,
+  // Per-token-group FP8 quantization with UE8M0 packed scales
+  kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8,
+  // Same as above but also outputs the norm result
+  kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9,
+  kARResidualRMSNormDynamicFP8Quant = 10,
+  kARResidualRMSNormOutDynamicFP8Quant = 11,
+  // 12 is kMoEFinalizeARResidualRMSNormFP8Quant (MNNVL CuTe DSL only, Python side).
+  // MXFP8 quantization (E4M3 data, one UE8M0 scale per 32 elements) with the
+  // scale factors written in the SWIZZLED_128x4 (or LINEAR) layout.
+  kARResidualRMSNormMXFP8Quant = 13,
+  // Same as above but also outputs the norm result
+  kARResidualRMSNormOutMXFP8Quant = 14,
 };
 
 enum class QuantType : int {
   kNone = 0,
   kFP8 = 1,
   kFP4 = 2,
+  kPerTokenGroupFP8Packed = 3,  // Per-token-group FP8 with dynamic UE8M0 scales
+  kDynamicFP8 = 4,
+  kMXFP8 = 5,
 };
 
 template <AllReduceFusionPattern Pattern>
@@ -759,6 +987,19 @@ DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormOutFP8Qua
                              true, true, true, QuantType::kFP8);
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, false, true,
                              true, true, true, QuantType::kFP4);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormPerTokenGroupFP8PackedQuant,
+                             false, true, true, true, false, QuantType::kPerTokenGroupFP8Packed);
+DEFINE_FUSION_PATTERN_TRAITS(
+    AllReduceFusionPattern::kARResidualRMSNormOutPerTokenGroupFP8PackedQuant, false, true, true,
+    true, true, QuantType::kPerTokenGroupFP8Packed);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormDynamicFP8Quant, false, true,
+                             true, true, false, QuantType::kDynamicFP8);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormOutDynamicFP8Quant, false,
+                             true, true, true, true, QuantType::kDynamicFP8);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormMXFP8Quant, false, true,
+                             true, true, false, QuantType::kMXFP8);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant, false, true,
+                             true, true, true, QuantType::kMXFP8);
 #undef DEFINE_FUSION_PATTERN_TRAITS
 
 template <AllReduceFusionPattern Pattern>
@@ -790,12 +1031,17 @@ struct AllReduceFusionParams {
   void* scale_out;
   void* rms_gamma;
   float rms_eps;
+  // 0 for standard RMSNorm (out = gamma * x * rsqrt(...)),
+  // 1 for Gemma / Qwen3.5 (out = (1 + gamma) * x * rsqrt(...)).
+  float weight_bias = 0.f;
   float* scale_factor;
   bool use_oneshot;
   QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED_128x4;
   cudaStream_t stream;
   AllReduceFusionPattern pattern;
   bool trigger_completion_at_end = true;
+  int block_quant_group_size = 0;
+  int tma_aligned_mn = 0;
 };
 
 template <int NRanks>
@@ -891,10 +1137,23 @@ class Barrier {
       m_flag_value = next_flag(m_flag_value);
       // To avoid the ABA problem, we need to synchronize the correct flag value to all
       // barrier_flags, even if the corresponding CTA has not been launched.
-      for (int flag_idx = blockIdx.x; flag_idx < details::kBarrierFlagCount;
+      // The slot of this block is written last: the peer only waits on that slot, so its
+      // release store must order the stores to the slots of CTAs that are not launched now.
+      // Otherwise a later launch with a larger grid can see a slot still holding the flag
+      // from two barriers ago, which also differs from prev_flag, and pass early.
+      //
+      // The other slots can be relaxed. In a later launch, CTA j waits on slot j until it
+      // differs from prev_flag. Within a launch, slot j is written only by the peer's CTA j
+      // as its own slot, with a release store, so the store that ends the wait always pairs
+      // with the acquire load. The relaxed value backfilled into slot j by an earlier launch
+      // is ordered before that launch's own-slot release, which this rank acquired, and that
+      // launch completes before the later one starts; so the wait cannot observe the older
+      // flag from before the backfill.
+      for (int flag_idx = blockIdx.x + gridDim.x; flag_idx < details::kBarrierFlagCount;
            flag_idx += gridDim.x) {
-        st_flag(m_target_flag + flag_idx * NRanks, m_flag_value);
+        st_flag_relaxed(m_target_flag + flag_idx * NRanks, m_flag_value);
       }
+      st_flag(m_target_flag + blockIdx.x * NRanks, m_flag_value);
       while (ld_flag(m_current_flag) == prev_flag(m_flag_value)) {
       }
     }
@@ -904,6 +1163,10 @@ class Barrier {
  protected:
   __device__ __forceinline__ void st_flag(int* addr, int flag) {
     asm volatile("st.global.release.sys.b32 [%1], %0;" ::"r"(flag), "l"(addr));
+  }
+
+  __device__ __forceinline__ void st_flag_relaxed(int* addr, int flag) {
+    asm volatile("st.global.relaxed.sys.b32 [%1], %0;" ::"r"(flag), "l"(addr));
   }
 
   __device__ __forceinline__ int ld_flag(int* addr) {
@@ -942,6 +1205,8 @@ class FusedOp {
       m_scale_factor = 1.f / *(params.scale_factor);
     } else if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
       m_scale_factor = *(params.scale_factor);
+    } else if constexpr (GetQuantType<Pattern> == QuantType::kDynamicFP8) {
+      m_scale_factor = 0.f;
     }
   }
 
@@ -977,8 +1242,9 @@ class FusedOp {
     if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
       // NOTE(Yingyi): might update later
       auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
-          std::nullopt /* batchIdx */, token_id, m_access_id_in_token, std::nullopt /* numRows */,
-          m_params.hidden_dim, reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
+          cuda::std::nullopt /* batchIdx */, token_id, m_access_id_in_token,
+          cuda::std::nullopt /* numRows */, m_params.hidden_dim,
+          reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
       reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id] =
           utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(val, m_scale_factor, sf_out);
     } else
@@ -992,12 +1258,163 @@ class FusedOp {
             static_cast<float>(reinterpret_cast<T*>(&val)[i]) * m_scale_factor);
       }
       reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
+    } else if constexpr (GetQuantType<Pattern> == QuantType::kPerTokenGroupFP8Packed) {
+      // Per-token-group FP8 quantization with UE8M0 packed scales.
+      constexpr float FP8_E4M3_MAX = 448.0f;
+      int group_size = m_params.block_quant_group_size;
+      int groups_in_block = blockDim.x * VEC_SIZE / group_size;
+      int block_elem_start = threadIdx.x * VEC_SIZE;
+
+      // --- Group absmax reduction ---
+      // use warp-shuffle reduce when group fits cleanly in a warp
+      // (group_size divisible by VEC_SIZE, group_size_in_vecs is power of 2 and <= 32).
+      // otherwise use shared-memory atomicMax
+      int group_size_in_vecs = group_size / VEC_SIZE;
+      bool use_warp_shuffle = (group_size % VEC_SIZE == 0) && (group_size_in_vecs <= 32) &&
+                              (group_size_in_vecs & (group_size_in_vecs - 1)) == 0;
+
+      // per-element group absmax
+      float elem_group_absmax[VEC_SIZE];
+      extern __shared__ unsigned int smem_group_absmax[];
+
+      if (use_warp_shuffle) {
+        float local_absmax = 0.0f;
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+          float v = fabsf(static_cast<float>(reinterpret_cast<T*>(&val)[i]));
+          local_absmax = fmaxf(local_absmax, v);
+        }
+        // Butterfly all-reduce within the quantization group using warp shuffles.
+        for (int offset = group_size_in_vecs / 2; offset > 0; offset /= 2) {
+          local_absmax = fmaxf(local_absmax, __shfl_xor_sync(0xffffffff, local_absmax, offset));
+        }
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+          elem_group_absmax[i] = local_absmax;
+        }
+      } else {
+        // use shared-memory atomicMax for group max reduction
+        for (int g = threadIdx.x; g < groups_in_block; g += blockDim.x) {
+          smem_group_absmax[g] = 0;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+          int local_group = (block_elem_start + i) / group_size;
+          float absval = fabsf(static_cast<float>(reinterpret_cast<T*>(&val)[i]));
+          atomicMax(&smem_group_absmax[local_group], __float_as_uint(absval));
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+          int local_group = (block_elem_start + i) / group_size;
+          elem_group_absmax[i] = __uint_as_float(smem_group_absmax[local_group]);
+        }
+      }
+
+      // compute UE8M0 scale and quantize to FP8
+      auto compute_ue8m0_scale = [](float group_absmax) -> float {
+        float y_s = fmaxf(group_absmax / FP8_E4M3_MAX, 1e-10f);
+        unsigned int y_s_bits = __float_as_uint(y_s);
+        if (y_s_bits & 0x7fffff) {
+          y_s_bits = (y_s_bits + 0x800000) & 0x7f800000;
+        }
+        return __uint_as_float(y_s_bits);
+      };
+
+      using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
+      PackedQuantizedType ret;
+#pragma unroll
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        float y_s = compute_ue8m0_scale(elem_group_absmax[i]);
+        float q = static_cast<float>(reinterpret_cast<T*>(&val)[i]) / y_s;
+        q = fminf(fmaxf(q, -FP8_E4M3_MAX), FP8_E4M3_MAX);
+        reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(q);
+      }
+      reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
+
+      // write packed UE8M0 scales
+      // For warp-shuffle path: one thread per group (first thread in each group).
+      // For smem path: one thread per group in the block (threadIdx.x < groups_in_block).
+      int block_first_elem = (m_access_id_in_token - threadIdx.x) * VEC_SIZE;
+      auto write_group_scale = [&](int group_idx_in_row, float group_absmax) {
+        float y_s = compute_ue8m0_scale(group_absmax);
+        int groups_per_row = m_params.hidden_dim / group_size;
+        int k_num_packed = (groups_per_row + 3) / 4;
+        int token_num = m_params.size / m_params.hidden_dim;
+        int pack_idx = group_idx_in_row / 4;
+        int pos = group_idx_in_row % 4;
+        int elem_idx = pack_idx * m_params.tma_aligned_mn + token_id;
+
+        // Write valid exponent
+        unsigned int bits = __float_as_uint(y_s);
+        uint8_t exponent = static_cast<uint8_t>((bits >> 23u) & 0xffu);
+        reinterpret_cast<uint8_t*>(m_params.scale_out)[elem_idx * 4 + pos] = exponent;
+
+        // K-padding: last valid group zeros trailing bytes in its pack
+        if (group_idx_in_row == groups_per_row - 1) {
+          for (int p = pos + 1; p < 4; p++) {
+            reinterpret_cast<uint8_t*>(m_params.scale_out)[elem_idx * 4 + p] = 0;
+          }
+        }
+
+        // MN-padding: on last valid token, first group zeros all packs
+        // for padding tokens (token_num .. tma_aligned_mn - 1).
+        // Skip the last packed column (pk = k_num_packed - 1) because
+        // scale_out storage is (token_num + (k_num_packed-1)*tma_aligned_mn)
+        // elements — the last column only has token_num rows allocated.
+        if (token_id == token_num - 1 && group_idx_in_row == 0) {
+          for (int pad_t = token_num; pad_t < m_params.tma_aligned_mn; pad_t++) {
+            for (int pk = 0; pk < k_num_packed - 1; pk++) {
+              int pad_elem = pk * m_params.tma_aligned_mn + pad_t;
+              reinterpret_cast<uint32_t*>(m_params.scale_out)[pad_elem] = 0;
+            }
+          }
+        }
+      };
+
+      if (use_warp_shuffle) {
+        int lane_in_group = m_access_id_in_token % group_size_in_vecs;
+        if (lane_in_group == 0) {
+          int group_idx_in_row = m_access_id_in_token / group_size_in_vecs;
+          write_group_scale(group_idx_in_row, elem_group_absmax[0]);
+        }
+      } else {
+        // Loop: groups_in_block may exceed blockDim.x when group_size < VEC_SIZE
+        for (int local_group = threadIdx.x; local_group < groups_in_block;
+             local_group += blockDim.x) {
+          float group_absmax = __uint_as_float(smem_group_absmax[local_group]);
+          int group_idx_in_row = block_first_elem / group_size + local_group;
+          write_group_scale(group_idx_in_row, group_absmax);
+        }
+      }
+    } else if constexpr (GetQuantType<Pattern> == QuantType::kMXFP8) {
+      mxfp8_quant(val, token_id);
+    } else if constexpr (GetQuantType<Pattern> == QuantType::kDynamicFP8) {
+      float token_scale = dynamic_token_fp8_scale(val, token_id);
+      using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
+      PackedQuantizedType ret;
+#pragma unroll
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        float q = static_cast<float>(reinterpret_cast<T*>(&val)[i]) / token_scale;
+        q = fminf(fmaxf(q, -details::kFP8E4M3Max), details::kFP8E4M3Max);
+        reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(q);
+      }
+      reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
     } else {
       static_assert(GetQuantType<Pattern> == QuantType::kNone, "Invalid quant type");
     }
   }
 
  protected:
+  __device__ __forceinline__ void mxfp8_quant(vec_t<T, VEC_SIZE> const& val, int token_id) {
+    utils::mxfp8_quantize_store<T, VEC_SIZE>(
+        reinterpret_cast<T const*>(&val), token_id, m_access_id_in_token * VEC_SIZE,
+        m_params.hidden_dim, m_params.layout, m_params.quant_out, m_params.scale_out);
+  }
+
   __device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(vec_t<T, VEC_SIZE> const& residual,
                                                          vec_t<T, VEC_SIZE> const& gamma) {
     __shared__ float s_val;
@@ -1032,11 +1449,46 @@ class FusedOp {
     __syncthreads();
 #pragma unroll
     for (int i = 0; i < VEC_SIZE; ++i) {
-      reinterpret_cast<T*>(&norm_out)[i] =
-          static_cast<T>(static_cast<float>(reinterpret_cast<T const*>(&residual)[i]) * s_val *
-                         static_cast<float>(reinterpret_cast<T const*>(&gamma)[i]));
+      reinterpret_cast<T*>(&norm_out)[i] = static_cast<T>(
+          static_cast<float>(reinterpret_cast<T const*>(&residual)[i]) * s_val *
+          (m_params.weight_bias + static_cast<float>(reinterpret_cast<T const*>(&gamma)[i])));
     }
     return norm_out;
+  }
+
+  __device__ __forceinline__ float dynamic_token_fp8_scale(vec_t<T, VEC_SIZE> const& val,
+                                                           int token_id) {
+    __shared__ float s_val;
+    float acc = 0.f;
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      float v = static_cast<float>(reinterpret_cast<T const*>(&val)[i]);
+      acc = fmaxf(acc, fabsf(v));
+    }
+    utils::blockReduceMaxV2<float, 1>(&acc);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    namespace cg = cooperative_groups;
+    cg::cluster_group cluster = cg::this_cluster();
+    if (cluster.num_blocks() > 1) {
+      if (threadIdx.x == 0) {
+        s_val = acc;
+        acc = 0.f;
+      }
+      cluster.sync();
+      if (threadIdx.x == 0) {
+        for (int i = 0; i < cluster.num_blocks(); ++i) {
+          acc = fmaxf(acc, *cluster.map_shared_rank(&s_val, i));
+        }
+      }
+      cluster.sync();
+    }
+#endif
+    if (threadIdx.x == 0) {
+      s_val = fmaxf(acc / details::kFP8E4M3Max, details::kDynamicFP8MinScale);
+      reinterpret_cast<float*>(m_params.scale_out)[token_id] = s_val;
+    }
+    __syncthreads();
+    return s_val;
   }
 
  private:
@@ -1199,7 +1651,6 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
   int tot_access = index_helper.tot_access;
   vec_t<T, VEC_SIZE> clear_vec;
   clear_vec.fill(neg_zero_v<T>);
-  FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
@@ -1207,6 +1658,10 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
     cudaTriggerProgrammaticLaunchCompletion();
   }
 #endif
+  // Constructed after the grid dependency sync: the constructor loads rms_gamma and
+  // residual_in, and under PDL this kernel can start before the producer that writes
+  // residual_in has completed.
+  FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
   LamportComm<NRanks> comm(params.workspace, params.rank);
   int clear_access = comm.clear_size / VEC_SIZE;
 
@@ -1267,10 +1722,12 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> pa
   int access_id = index_helper.access_id;
   int access_stride = index_helper.access_stride;
   int tot_access = index_helper.tot_access;
-  FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
+  // Constructed after the grid dependency sync, for the same reason as the one-shot
+  // kernel above.
+  FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
   SyncComm<NRanks> comm(params.workspace);
 #pragma unroll
   for (int r = 0; r < NRanks; ++r) {
@@ -1395,12 +1852,12 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
     }
   }
   int threads_per_token = params.hidden_dim / VEC_SIZE;
-  int cluster_size;
-  if (SM >= 90) {
-    cluster_size = 8;
-  } else {
-    cluster_size = 1;
-  }
+  // Clamp to the largest cluster the device can launch.
+  static const int max_cluster_size =
+      GetMaxClusterSize(reinterpret_cast<void const*>(
+                            allreduce_fusion_kernel_oneshot_lamport<Pattern, T, NRanks, Fp32Acc>),
+                        128);
+  int cluster_size = std::min(8, max_cluster_size);
   while (threads_per_token % cluster_size != 0 && cluster_size > 1) {
     cluster_size /= 2;
   }
@@ -1482,6 +1939,44 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
                    "oneshot launch config mismatch: threads_per_block * cluster_size != "
                    "threads_per_token");
 
+  if constexpr (GetQuantType<Pattern> == QuantType::kPerTokenGroupFP8Packed) {
+    FLASHINFER_CHECK(params.block_quant_group_size > 0,
+                     "block_quant_group_size must be > 0 for per-token-group FP8 quant");
+    FLASHINFER_CHECK(params.hidden_dim % params.block_quant_group_size == 0,
+                     "hidden_dim must be divisible by block_quant_group_size");
+    // Adjust cluster_size so that each block handles a whole number of groups.
+    // This ensures no quantization group spans two thread blocks, which is
+    // required because the shared-memory absmax reduction is block-local.
+    while (cluster_size > 1 &&
+           (threads_per_block * VEC_SIZE) % params.block_quant_group_size != 0) {
+      threads_per_block *= 2;
+      cluster_size /= 2;
+    }
+    block_size = threads_per_block;
+    FLASHINFER_CHECK((block_size * VEC_SIZE) % params.block_quant_group_size == 0,
+                     "Cannot satisfy group alignment: block elements must be "
+                     "a multiple of block_quant_group_size");
+  }
+
+  if constexpr (GetQuantType<Pattern> == QuantType::kMXFP8) {
+    FLASHINFER_CHECK(params.hidden_dim % details::kMXFP8SFVecSize == 0,
+                     "hidden_dim must be divisible by 32 for MXFP8 quant");
+    FLASHINFER_CHECK(params.scale_out != nullptr && params.quant_out != nullptr,
+                     "quant_out and scale_out are required for MXFP8 quant");
+    FLASHINFER_CHECK(params.layout == QuantizationSFLayout::SWIZZLED_128x4 ||
+                         params.layout == QuantizationSFLayout::LINEAR,
+                     "MXFP8 quant supports the SWIZZLED_128x4 and LINEAR scale layouts");
+    // A 32-element scale group spans kMXFP8SFVecSize / VEC_SIZE consecutive threads; keep
+    // every group inside one block (and therefore inside one warp) by widening the block.
+    while (cluster_size > 1 && (threads_per_block * VEC_SIZE) % details::kMXFP8SFVecSize != 0) {
+      threads_per_block *= 2;
+      cluster_size /= 2;
+    }
+    block_size = threads_per_block;
+    FLASHINFER_CHECK((block_size * VEC_SIZE) % details::kMXFP8SFVecSize == 0,
+                     "block elements must be a multiple of 32 for MXFP8 quant");
+  }
+
   // Check conditions using the final block_size (not threads_per_block)
   FLASHINFER_CHECK(oneshot || block_size >= params.nranks, "not oneshot, or block_size < nranks");
   FLASHINFER_CHECK(block_size <= 1024 && cluster_size > 0,
@@ -1493,6 +1988,10 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
   cfg.gridDim = grid_size;
   cfg.blockDim = block_size;
   cfg.dynamicSmemBytes = 0;
+  if constexpr (GetQuantType<Pattern> == QuantType::kPerTokenGroupFP8Packed) {
+    int groups_in_block = block_size * VEC_SIZE / params.block_quant_group_size;
+    cfg.dynamicSmemBytes = groups_in_block * sizeof(unsigned int);
+  }
   cfg.stream = params.stream;
   attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attribute[0].val.programmaticStreamSerializationAllowed = launch_with_pdl ? 1 : 0;
@@ -1532,38 +2031,58 @@ cudaError_t allreduce_fusion_op(AllReduceFusionParams<T> const& params, bool lau
     }                                                                                              \
   }
 
-#define DISPATCH_PATTERN(T, NRanks)                                                          \
-  switch (params.pattern) {                                                                  \
-    case AllReduceFusionPattern::kAllReduce:                                                 \
-      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kAllReduce, NRanks);                      \
-      break;                                                                                 \
-    case AllReduceFusionPattern::kARResidualRMSNorm:                                         \
-      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNorm, NRanks);              \
-      break;                                                                                 \
-    case AllReduceFusionPattern::kARResidualRMSNormFP8Quant:                                 \
-      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormFP8Quant, NRanks);      \
-      break;                                                                                 \
-    case AllReduceFusionPattern::kARResidualRMSNormFP4Quant:                                 \
-      if constexpr (!std::is_same_v<T, float> && CUDA_VERSION >= 12080) {                    \
-        DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormFP4Quant, NRanks);    \
-      } else {                                                                               \
-        FLASHINFER_CHECK(CUDA_VERSION >= 12080, "FP4Quant requires CUDA 12.8 or higher");    \
-        FLASHINFER_CHECK(false, "FP4Quant pattern cannot work with DType=float");            \
-      }                                                                                      \
-      break;                                                                                 \
-    case AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant:                              \
-      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant, NRanks);   \
-      break;                                                                                 \
-    case AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant:                              \
-      if constexpr (!std::is_same_v<T, float> && CUDA_VERSION >= 12080) {                    \
-        DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, NRanks); \
-      } else {                                                                               \
-        FLASHINFER_CHECK(CUDA_VERSION >= 12080, "OutFP4Quant requires CUDA 12.8 or higher"); \
-        FLASHINFER_CHECK(false, "OutFP4Quant pattern cannot work with DType=float");         \
-      }                                                                                      \
-      break;                                                                                 \
-    default:                                                                                 \
-      FLASHINFER_CHECK(false, "Unsupported allreduce fusion pattern");                       \
+#define DISPATCH_PATTERN(T, NRanks)                                                               \
+  switch (params.pattern) {                                                                       \
+    case AllReduceFusionPattern::kAllReduce:                                                      \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kAllReduce, NRanks);                           \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNorm:                                              \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNorm, NRanks);                   \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormFP8Quant:                                      \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormFP8Quant, NRanks);           \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormFP4Quant:                                      \
+      if constexpr (!std::is_same_v<T, float> && CUDA_VERSION >= 12080) {                         \
+        DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormFP4Quant, NRanks);         \
+      } else {                                                                                    \
+        FLASHINFER_CHECK(CUDA_VERSION >= 12080, "FP4Quant requires CUDA 12.8 or higher");         \
+        FLASHINFER_CHECK(false, "FP4Quant pattern cannot work with DType=float");                 \
+      }                                                                                           \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant:                                   \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant, NRanks);        \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant:                                   \
+      if constexpr (!std::is_same_v<T, float> && CUDA_VERSION >= 12080) {                         \
+        DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, NRanks);      \
+      } else {                                                                                    \
+        FLASHINFER_CHECK(CUDA_VERSION >= 12080, "OutFP4Quant requires CUDA 12.8 or higher");      \
+        FLASHINFER_CHECK(false, "OutFP4Quant pattern cannot work with DType=float");              \
+      }                                                                                           \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormPerTokenGroupFP8PackedQuant:                   \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormPerTokenGroupFP8PackedQuant, \
+                        NRanks);                                                                  \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormOutPerTokenGroupFP8PackedQuant:                \
+      DISPATCH_ACC_TYPE(                                                                          \
+          T, AllReduceFusionPattern::kARResidualRMSNormOutPerTokenGroupFP8PackedQuant, NRanks);   \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormDynamicFP8Quant:                               \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormDynamicFP8Quant, NRanks);    \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormOutDynamicFP8Quant:                            \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutDynamicFP8Quant, NRanks); \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormMXFP8Quant:                                    \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormMXFP8Quant, NRanks);         \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant:                                 \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant, NRanks);      \
+      break;                                                                                      \
+    default:                                                                                      \
+      FLASHINFER_CHECK(false, "Unsupported allreduce fusion pattern");                            \
   }
 
   switch (params.nranks) {

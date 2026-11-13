@@ -3,13 +3,14 @@
 import functools
 import logging
 import os
+import platform
 import re
 import subprocess
 import sys
 import sysconfig
 from packaging.version import Version
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Mapping, Optional
 
 import tvm_ffi
 import torch
@@ -17,6 +18,7 @@ import torch
 from . import env as jit_env
 from ..compilation_context import CompilationContext
 
+is_windows = platform.system() == "Windows"
 logger = logging.getLogger(__name__)
 
 
@@ -91,8 +93,46 @@ def is_cuda_version_at_least(version_str: str) -> bool:
     return get_cuda_version() >= Version(version_str)
 
 
+def get_nvcc_parallelism_flags() -> List[str]:
+    """Build nvcc flags controlled by FlashInfer parallelism environment variables."""
+    env_var_name = "FLASHINFER_NVCC_THREADS"
+    default = 1
+    value = os.environ.get(env_var_name, str(default))
+
+    try:
+        threads = int(value)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid %s=%r; using %s.", env_var_name, value, default
+        )
+        threads = default
+
+    if threads < 1:
+        logger.warning("Ignoring %s=%r; value must be >= 1.", env_var_name, value)
+        threads = default
+
+    return [f"--threads={threads}"]
+
+
+@functools.lru_cache(maxsize=1)
+def host_compiler_is_gcc() -> bool:
+    """Whether the compiler nvcc forwards -Xcompiler flags to is GCC.
+
+    Cached because the underlying torch helper shells out to the compiler.
+    """
+    from torch.utils.cpp_extension import check_compiler_is_gcc, get_cxx_compiler
+
+    host_compiler = os.environ.get("CC", get_cxx_compiler())
+    return check_compiler_is_gcc(host_compiler)
+
+
 def join_multiline(vs: List[str]) -> str:
     return " $\n    ".join(vs)
+
+
+def get_cccl_includes() -> List:
+    """Get vendored CCCL include directories (added with -I for CTK override precedence)."""
+    return [p.resolve() for p in jit_env.CCCL_INCLUDE_DIRS]
 
 
 def get_system_includes(cuda_home: str) -> List:
@@ -100,7 +140,6 @@ def get_system_includes(cuda_home: str) -> List:
     system_includes = [
         sysconfig.get_path("include"),
         "$cuda_home/include",
-        "$cuda_home/include/cccl",
         tvm_ffi.libinfo.find_include_path(),
         tvm_ffi.libinfo.find_dlpack_include_path(),
         jit_env.FLASHINFER_INCLUDE_DIR.resolve(),
@@ -121,6 +160,7 @@ def build_common_cflags(
     extra_include_dirs: Optional[List[Path]] = None,
 ) -> List[str]:
     """Build common compilation flags."""
+    cccl_includes = get_cccl_includes()
     system_includes = get_system_includes(cuda_home)
 
     common_cflags = []
@@ -130,6 +170,11 @@ def build_common_cflags(
     if extra_include_dirs is not None:
         for extra_dir in extra_include_dirs:
             common_cflags.append(f"-I{extra_dir.resolve()}")
+    # Vendored CCCL headers use -I (not -isystem) so they take precedence
+    # over the CTK-bundled copy. CCCL headers use #pragma system_header
+    # internally to suppress warnings. See https://github.com/NVIDIA/cccl/issues/527
+    for cccl_dir in cccl_includes:
+        common_cflags.append(f"-I{cccl_dir}")
     for sys_dir in system_includes:
         common_cflags.append(f"-isystem {sys_dir}")
 
@@ -177,7 +222,9 @@ def build_cuda_cflags(
         ]
 
     cpp_ext_initial_compilation_context = CompilationContext()
-    global_flags = cpp_ext_initial_compilation_context.get_nvcc_flags_list()
+    global_flags = cpp_ext_initial_compilation_context.get_nvcc_flags_list(
+        map_sm107_to_100f=True
+    )
     if extra_cuda_cflags is not None:
         # Check if module provides architecture flags
         module_has_gencode = any(
@@ -204,6 +251,11 @@ def build_cuda_cflags(
     return cuda_cflags
 
 
+def _ninja_windows_path(path) -> str:
+    # In a ninja build line, ":" ends the outputs and a space separates paths.
+    return str(path).replace("$", "$$").replace(" ", "$ ").replace(":\\", "$:\\")
+
+
 def generate_ninja_build_for_op(
     name: str,
     sources: List[Path],
@@ -212,11 +264,18 @@ def generate_ninja_build_for_op(
     extra_ldflags: Optional[List[str]],
     extra_include_dirs: Optional[List[Path]],
     needs_device_linking: bool = False,
+    embedded_cubins: Optional[Mapping[str, Path]] = None,
+    extra_cuda_cflags_by_source: Optional[Mapping[Path, List[str]]] = None,
 ) -> str:
     cuda_home = get_cuda_path()
     common_cflags = build_common_cflags(cuda_home, extra_include_dirs)
     cflags = build_cflags(common_cflags, extra_cflags)
     cuda_cflags = build_cuda_cflags(common_cflags, extra_cuda_cflags)
+    cuda_arch_flags = [flag for flag in cuda_cflags if flag.startswith("-gencode=")]
+    cuda_cflags_by_source = {
+        Path(source).resolve(): build_cuda_cflags(common_cflags, flags)
+        for source, flags in (extra_cuda_cflags_by_source or {}).items()
+    }
 
     ldflags = [
         "-shared",
@@ -235,6 +294,9 @@ def generate_ninja_build_for_op(
 
     cxx = os.environ.get("CXX", "c++")
     nvcc = os.environ.get("FLASHINFER_NVCC", "$cuda_home/bin/nvcc")
+    # Compiler launchers (e.g., sccache, ccache) — empty string when unset
+    cxx_launcher = os.environ.get("FLASHINFER_CXX_LAUNCHER", "")
+    nvcc_launcher = os.environ.get("FLASHINFER_NVCC_LAUNCHER", "")
 
     lines = [
         "ninja_required_version = 1.3",
@@ -242,32 +304,61 @@ def generate_ninja_build_for_op(
         f"cuda_home = {cuda_home}",
         f"cxx = {cxx}",
         f"nvcc = {nvcc}",
+        f"cxx_launcher = {cxx_launcher}",
+        f"nvcc_launcher = {nvcc_launcher}",
         "",
         "common_cflags = " + join_multiline(common_cflags),
         "cflags = " + join_multiline(cflags),
         "post_cflags =",
         "cuda_cflags = " + join_multiline(cuda_cflags),
         "cuda_post_cflags =",
+        "cuda_arch_flags = " + join_multiline(cuda_arch_flags),
         "ldflags = " + join_multiline(ldflags),
         "",
         "rule compile",
-        "  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags",
+        "  command = $cxx_launcher $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags",
         "  depfile = $out.d",
         "  deps = gcc",
         "",
         "rule cuda_compile",
-        "  command = $nvcc --generate-dependencies-with-compile --dependency-output $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags",
+        "  command = $nvcc_launcher $nvcc --generate-dependencies-with-compile -MF $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags",
         "  depfile = $out.d",
         "  deps = gcc",
         "",
     ]
+
+    if embedded_cubins and is_windows:
+        # The MSVC toolchain has no GNU ld/objcopy: write each cubin as its own
+        # COFF object and link it next to the host objects.
+        coff_machine = (
+            "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
+        )
+        embed_script = Path(__file__).with_name("embed_cubin_coff.py")
+        lines.extend(
+            [
+                "rule embed_cubin",
+                f'  command = "{sys.executable}" "{embed_script}" '
+                f'--machine {coff_machine} --name $cubin_name --cubin "$in" '
+                '--output-obj "$out"',
+                "",
+            ]
+        )
+    elif embedded_cubins:
+        lines.extend(
+            [
+                "rule embed_cubin",
+                f"  command = {sys.executable} -m tvm_ffi.utils.embed_cubin "
+                "--output-obj $out --input-obj $in --cubin $cubin --name $cubin_name",
+                "",
+            ]
+        )
 
     # Add nvcc linking rule for device code
     if needs_device_linking:
         lines.extend(
             [
                 "rule nvcc_link",
-                "  command = $nvcc -shared $in $ldflags -o $out",
+                "  command = $nvcc -shared $cuda_arch_flags $in $ldflags -o $out",
                 "",
             ]
         )
@@ -294,6 +385,47 @@ def generate_ninja_build_for_op(
         obj = str((output_dir / obj_name).resolve())
         objects.append(obj)
         lines.append(f"build {obj}: {cmd} {source.resolve()}")
+        if source.resolve() in cuda_cflags_by_source:
+            lines.append(
+                "  cuda_cflags = "
+                + join_multiline(cuda_cflags_by_source[source.resolve()])
+            )
+
+    if embedded_cubins:
+        if not objects:
+            raise ValueError("embedded cubins require at least one host object")
+        current_obj = objects[0]
+        for index, (cubin_name, cubin_path) in enumerate(
+            sorted(embedded_cubins.items())
+        ):
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", cubin_name) is None:
+                raise ValueError(f"invalid embedded cubin identifier: {cubin_name!r}")
+            resolved_cubin = Path(cubin_path).resolve(strict=True)
+            if is_windows:
+                cubin_obj = _ninja_windows_path(
+                    (output_dir / f"embedded_cubin_{cubin_name}.o").resolve()
+                )
+                lines.extend(
+                    [
+                        f"build {cubin_obj}: embed_cubin "
+                        f"{_ninja_windows_path(resolved_cubin)}",
+                        f"  cubin_name = {cubin_name}",
+                    ]
+                )
+                objects.append(cubin_obj)
+                continue
+            embedded_obj = str(
+                (output_dir / f"embedded_{index}_{Path(current_obj).name}").resolve()
+            )
+            lines.extend(
+                [
+                    f"build {embedded_obj}: embed_cubin {current_obj} | {resolved_cubin}",
+                    f"  cubin = {resolved_cubin}",
+                    f"  cubin_name = {cubin_name}",
+                ]
+            )
+            current_obj = embedded_obj
+        objects[0] = current_obj
 
     lines.append("")
     link_rule = "nvcc_link" if needs_device_linking else "link"
@@ -312,7 +444,12 @@ def _get_num_workers() -> Optional[int]:
     return None
 
 
-def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
+def run_ninja(
+    workdir: Path,
+    ninja_file: Path,
+    verbose: bool,
+    max_jobs: Optional[int] = None,
+) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     command = [
         "ninja",
@@ -322,7 +459,7 @@ def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
         "-f",
         str(ninja_file.resolve()),
     ]
-    num_workers = _get_num_workers()
+    num_workers = max_jobs if max_jobs is not None else _get_num_workers()
     if num_workers is not None:
         command += ["-j", str(num_workers)]
 

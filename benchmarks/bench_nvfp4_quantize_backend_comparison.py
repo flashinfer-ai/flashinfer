@@ -16,10 +16,10 @@ limitations under the License.
 Benchmark: NVFP4 Quantization Backend Comparison (CUDA vs CuTe-DSL)
 
 Compares the performance of CUDA and CuTe-DSL backends for NVFP4 quantization
-across different M and K dimensions. Supports both swizzled 128x4 and linear
-scale factor layouts. Each configuration is verified for correctness before
-timing. Generates heatmaps showing relative performance (speedup of CuTe-DSL
-over CUDA).
+across different M and K dimensions. Supports swizzled 128x4, swizzled 8x4,
+and linear scale factor layouts. Each configuration is verified for
+correctness before timing. Generates heatmaps showing relative performance
+(speedup of CuTe-DSL over CUDA).
 
 Can also measure achieved memory bandwidth in TB/s for the CuTe-DSL backend.
 
@@ -30,22 +30,66 @@ Usage:
     # Bandwidth measurement mode (cute-dsl only)
     python bench_nvfp4_quantize_backend_comparison.py --bandwidth
 
+    # Run only a subset of layouts (comma-separated)
+    python bench_nvfp4_quantize_backend_comparison.py --layouts swizzled_128x4,swizzled_8x4
+
+    # Repeat one shape with CUDA graphs and export every timing sample in ms
+    python bench_nvfp4_quantize_backend_comparison.py \
+        --m-values 1024 --k-values 7168 --layouts swizzled_128x4 \
+        --num-iters 1000 --dry-run-iters 100 --cuda-graph --seed 42 \
+        --csv-output nvfp4_timings.csv --no-heatmap
+
+    # Compare per-token MSE 4over6 with quantizer fast math disabled
+    FLASHINFER_NVFP4_4OVER6=1 \
+    FLASHINFER_NVFP4_4OVER6_ERR_MODE=MSE \
+    FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH=0 \
+    FLASHINFER_NVFP4_4OVER6_E4M3_USE_256=0 \
+    FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH=1 \
+    python bench_nvfp4_quantize_backend_comparison.py \
+        --layouts swizzled_128x4 --per-token-activation
+
 Requirements:
     - Blackwell GPU (SM100+) for CuTe-DSL backend
     - matplotlib for visualization
 """
 
 import argparse
+import csv
 import numpy as np
+import os
 import torch
+import warnings
+from pathlib import Path
 from typing import Dict, List, Tuple
 
+from flashinfer import SfLayout
+from flashinfer.quantization.fp4_quantization import NVFP4_QUANT_ENV_VARS
+from flashinfer.quantization.nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    current_nvfp4_4over6_config,
+    make_nvfp4_global_scale,
+    nvfp4_4over6_mode_label,
+    nvfp4_e4m3_max,
+)
 from flashinfer.testing.utils import bench_gpu_time
+
+# Mapping from CLI layout name to SfLayout enum
+LAYOUTS_BY_NAME = {
+    "swizzled_128x4": SfLayout.layout_128x4,
+    "swizzled_8x4": SfLayout.layout_8x4,
+    "linear": SfLayout.layout_linear,
+}
+
+
+def _sf_layout_flags(sf_layout: SfLayout) -> Tuple[bool, bool]:
+    """Translate SfLayout enum to (is_sf_swizzled_layout, is_sf_8x4_layout)."""
+    is_swizzled = sf_layout != SfLayout.layout_linear
+    is_8x4 = sf_layout == SfLayout.layout_8x4
+    return is_swizzled, is_8x4
+
 
 # Constants for NVFP4
 NVFP4_SF_VEC_SIZE = 16
-FLOAT4_E2M1_MAX = 6.0
-FLOAT8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 
 
 def get_cc():
@@ -54,64 +98,74 @@ def get_cc():
     return major * 10 + minor
 
 
+def _run_nvfp4_quantize(
+    x: torch.Tensor,
+    global_sf: torch.Tensor | float,
+    sf_layout: SfLayout,
+    backend: str,
+    per_token_activation: bool,
+):
+    from flashinfer.quantization.fp4_quantization import nvfp4_quantize
+
+    return nvfp4_quantize(
+        x,
+        global_sf,
+        sfLayout=sf_layout,
+        per_token_activation=per_token_activation,
+        backend=backend,
+    )
+
+
+def _split_quantize_result(result, per_token_activation: bool):
+    if per_token_activation:
+        quant, scale, per_token_scale = result
+        return quant, scale, per_token_scale
+    quant, scale = result
+    return quant, scale, None
+
+
 def verify_nvfp4_correctness(
     m: int,
     k: int,
     dtype: torch.dtype,
-    is_sf_swizzled_layout: bool,
+    sf_layout: SfLayout,
+    per_token_activation: bool,
+    nvfp4_4over6_config: NVFP44Over6Config | None,
+    seed: int = 42,
 ) -> Tuple[bool, str, float, float]:
     """
-    Verify that both backends produce correct outputs via roundtrip test.
+    Verify that both backends produce correct outputs.
+
+    For 128x4 and linear layouts a dequant roundtrip is also checked. The
+    e2m1_and_ufp8sf_scale_to_float helper does not support 8x4, so for that
+    layout only the backend-vs-backend quant + scale match is verified.
 
     Returns:
         Tuple of (success, message, quant_match_pct, scale_match_pct)
         On failure, quant_match_pct and scale_match_pct are 0.0
     """
-    from flashinfer.quantization.fp4_quantization import (
-        e2m1_and_ufp8sf_scale_to_float,
-        fp4_quantize,
+    from flashinfer.quantization.fp4_quantization import e2m1_and_ufp8sf_scale_to_float
+
+    is_sf_swizzled_layout, is_sf_8x4_layout = _sf_layout_flags(sf_layout)
+
+    torch.manual_seed(seed)
+    x = torch.randn(m, k, device="cuda", dtype=dtype)
+    global_sf = make_nvfp4_global_scale(
+        x,
+        per_token_activation=per_token_activation,
+        nvfp4_4over6_config=nvfp4_4over6_config,
     )
 
-    torch.manual_seed(42)
-    x = torch.randn(m, k, device="cuda", dtype=dtype)
-    amax = x.abs().max().to(torch.float32)
-    global_sf = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / amax).cuda()
-
     try:
-        # Test CUDA backend
-        quant_cuda, scale_cuda = fp4_quantize(
-            x,
-            global_sf,
-            sf_vec_size=16,
-            sf_use_ue8m0=False,
-            is_sf_swizzled_layout=is_sf_swizzled_layout,
-            backend="cuda",
+        quant_cuda, scale_cuda, per_token_scale_cuda = _split_quantize_result(
+            _run_nvfp4_quantize(x, global_sf, sf_layout, "cuda", per_token_activation),
+            per_token_activation,
         )
-        dq_cuda = e2m1_and_ufp8sf_scale_to_float(
-            quant_cuda.cpu().view(torch.uint8),
-            scale_cuda.cpu().view(torch.uint8).reshape(-1),
-            torch.tensor([1.0]),
-            16,
-            1,
-            is_sf_swizzled_layout,
-        )
-
-        # Test CuTe-DSL backend
-        quant_cute, scale_cute = fp4_quantize(
-            x,
-            global_sf,
-            sf_vec_size=16,
-            sf_use_ue8m0=False,
-            is_sf_swizzled_layout=is_sf_swizzled_layout,
-            backend="cute-dsl",
-        )
-        dq_cute = e2m1_and_ufp8sf_scale_to_float(
-            quant_cute.cpu().view(torch.uint8),
-            scale_cute.cpu().view(torch.uint8).reshape(-1),
-            torch.tensor([1.0]),
-            16,
-            1,
-            is_sf_swizzled_layout,
+        quant_cute, scale_cute, per_token_scale_cute = _split_quantize_result(
+            _run_nvfp4_quantize(
+                x, global_sf, sf_layout, "cute-dsl", per_token_activation
+            ),
+            per_token_activation,
         )
 
         # Check shapes match
@@ -130,33 +184,81 @@ def verify_nvfp4_correctness(
                 0.0,
             )
 
-        # Check roundtrip quality for both backends (cosine similarity)
-        x_f32 = x.cpu().to(torch.float32).view(1, -1)
-        dq_cuda_f32 = dq_cuda.cpu().to(torch.float32).view(1, -1)
-        dq_cute_f32 = dq_cute.cpu().to(torch.float32).view(1, -1)
-
-        cos_sim_cuda = torch.nn.functional.cosine_similarity(x_f32, dq_cuda_f32).item()
-        cos_sim_cute = torch.nn.functional.cosine_similarity(x_f32, dq_cute_f32).item()
+        if per_token_activation:
+            if per_token_scale_cuda.shape != per_token_scale_cute.shape:
+                return (
+                    False,
+                    "Per-token scale shape mismatch: "
+                    f"CUDA={per_token_scale_cuda.shape}, "
+                    f"CuTe={per_token_scale_cute.shape}",
+                    0.0,
+                    0.0,
+                )
+            per_token_scale_match_pct = (
+                per_token_scale_cuda == per_token_scale_cute
+            ).float().mean().item() * 100
+            if per_token_scale_match_pct < 100.0:
+                return (
+                    False,
+                    "Per-token scale mismatch: "
+                    f"match={per_token_scale_match_pct:.1f}%, "
+                    f"CUDA={per_token_scale_cuda.shape}, "
+                    f"CuTe={per_token_scale_cute.shape}",
+                    0.0,
+                    0.0,
+                )
 
         # Check backend agreement
         quant_match_pct = (quant_cuda == quant_cute).float().mean().item() * 100
         scale_match_pct = (scale_cuda == scale_cute).float().mean().item() * 100
+        if per_token_activation:
+            scale_match_pct = min(scale_match_pct, per_token_scale_match_pct)
 
-        # FP4 quantization should have cosine similarity > 0.9
-        if cos_sim_cuda < 0.9:
-            return (
-                False,
-                f"CUDA roundtrip quality too low: cos_sim={cos_sim_cuda:.4f}",
-                quant_match_pct,
-                scale_match_pct,
+        # The dequant helper only supports 128x4 swizzled and linear layouts.
+        # Skip roundtrip for 8x4 and rely on the backend agreement check above.
+        if not is_sf_8x4_layout and not per_token_activation:
+            dq_cuda = e2m1_and_ufp8sf_scale_to_float(
+                quant_cuda.cpu().view(torch.uint8),
+                scale_cuda.cpu().view(torch.uint8).reshape(-1),
+                torch.tensor([1.0]),
+                16,
+                1,
+                is_sf_swizzled_layout,
             )
-        if cos_sim_cute < 0.9:
-            return (
-                False,
-                f"CuTe-DSL roundtrip quality too low: cos_sim={cos_sim_cute:.4f}",
-                quant_match_pct,
-                scale_match_pct,
+            dq_cute = e2m1_and_ufp8sf_scale_to_float(
+                quant_cute.cpu().view(torch.uint8),
+                scale_cute.cpu().view(torch.uint8).reshape(-1),
+                torch.tensor([1.0]),
+                16,
+                1,
+                is_sf_swizzled_layout,
             )
+
+            x_f32 = x.cpu().to(torch.float32).view(1, -1)
+            dq_cuda_f32 = dq_cuda.cpu().to(torch.float32).view(1, -1)
+            dq_cute_f32 = dq_cute.cpu().to(torch.float32).view(1, -1)
+
+            cos_sim_cuda = torch.nn.functional.cosine_similarity(
+                x_f32, dq_cuda_f32
+            ).item()
+            cos_sim_cute = torch.nn.functional.cosine_similarity(
+                x_f32, dq_cute_f32
+            ).item()
+
+            if cos_sim_cuda < 0.9:
+                return (
+                    False,
+                    f"CUDA roundtrip quality too low: cos_sim={cos_sim_cuda:.4f}",
+                    quant_match_pct,
+                    scale_match_pct,
+                )
+            if cos_sim_cute < 0.9:
+                return (
+                    False,
+                    f"CuTe-DSL roundtrip quality too low: cos_sim={cos_sim_cute:.4f}",
+                    quant_match_pct,
+                    scale_match_pct,
+                )
 
         return True, "OK", quant_match_pct, scale_match_pct
 
@@ -168,8 +270,15 @@ def bench_nvfp4_quantize(
     m: int,
     k: int,
     dtype: torch.dtype,
-    is_sf_swizzled_layout: bool,
+    sf_layout: SfLayout,
     backend: str,
+    per_token_activation: bool,
+    nvfp4_4over6_config: NVFP44Over6Config | None,
+    dry_run_iters: int = 5,
+    repeat_iters: int = 30,
+    use_cuda_graph: bool = False,
+    seed: int = 42,
+    csv_output: str | None = None,
 ) -> float:
     """
     Benchmark NVFP4 quantization for a specific configuration.
@@ -177,46 +286,77 @@ def bench_nvfp4_quantize(
     Returns:
         Median execution time in milliseconds
     """
-    from flashinfer.quantization.fp4_quantization import fp4_quantize
-
+    # Give each backend identical inputs, independent of sweep/backend order.
+    torch.manual_seed(seed)
     x = torch.randn(m, k, device="cuda", dtype=dtype)
-    amax = x.abs().max().to(torch.float32)
-    global_sf = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / amax).cuda()
-
-    # Warmup
-    _ = fp4_quantize(
+    global_sf = make_nvfp4_global_scale(
         x,
-        global_sf,
-        sf_vec_size=16,
-        sf_use_ue8m0=False,
-        is_sf_swizzled_layout=is_sf_swizzled_layout,
-        backend=backend,
+        per_token_activation=per_token_activation,
+        nvfp4_4over6_config=nvfp4_4over6_config,
     )
+    if per_token_activation and backend == "cuda":
+        # This API takes a host scalar; avoid a device .item() during capture.
+        global_sf = float(global_sf.item())
 
     def run_kernel():
-        fp4_quantize(
-            x,
-            global_sf,
-            sf_vec_size=16,
-            sf_use_ue8m0=False,
-            is_sf_swizzled_layout=is_sf_swizzled_layout,
-            backend=backend,
+        _run_nvfp4_quantize(x, global_sf, sf_layout, backend, per_token_activation)
+
+    # Warmup, including any JIT compilation before timing starts.
+    run_kernel()
+
+    with warnings.catch_warnings():
+        if use_cuda_graph:
+            # The event fallback cannot flush L2 between replays of this closure.
+            warnings.filterwarnings(
+                "error",
+                message=r"(?s).*Falling back to CUDA events for benchmarking\.",
+                category=UserWarning,
+            )
+        times = bench_gpu_time(
+            fn=run_kernel,
+            enable_cupti=True,
+            dry_run_iters=dry_run_iters,
+            repeat_iters=repeat_iters,
+            cold_l2_cache=True,
+            use_cuda_graph=use_cuda_graph,
         )
 
-    times = bench_gpu_time(
-        fn=run_kernel,
-        enable_cupti=True,
-        dry_run_iters=5,
-        repeat_iters=30,
-        cold_l2_cache=True,
-        use_cuda_graph=False,
-    )
+    if csv_output is not None:
+        metadata = {
+            "m": m,
+            "k": k,
+            "dtype": str(dtype),
+            "layout": next(
+                name for name, layout in LAYOUTS_BY_NAME.items() if layout == sf_layout
+            ),
+            "backend": backend,
+            "mode": mode_label(per_token_activation, nvfp4_4over6_config),
+            "seed": seed,
+            "dry_run_iters": dry_run_iters,
+            "num_iters": repeat_iters,
+            "use_cuda_graph": use_cuda_graph,
+            "cold_l2_cache": True,
+            # Eager timing can fall back to events, which also flush L2.
+            "requested_timer": "cupti",
+        }
+        for name in (*NVFP4_QUANT_ENV_VARS, "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"):
+            metadata[name] = os.environ.get(name, "<unset>")
+        with open(csv_output, "a", newline="") as output:
+            writer = csv.DictWriter(
+                output, fieldnames=(*metadata, "sample_index", "time_ms")
+            )
+            if output.tell() == 0:
+                writer.writeheader()
+            writer.writerows(
+                dict(metadata, sample_index=index, time_ms=float(time_ms))
+                for index, time_ms in enumerate(times, start=1)
+            )
 
     return np.median(times)
 
 
 def compute_bandwidth_tb_per_sec(
-    m: int, k: int, dtype: torch.dtype, time_ms: float
+    m: int, k: int, dtype: torch.dtype, time_ms: float, per_token_activation: bool
 ) -> float:
     """
     Compute achieved memory bandwidth in TB/s.
@@ -236,16 +376,28 @@ def compute_bandwidth_tb_per_sec(
         + num_elements // 2  # fp4 output write
         + num_scale_factors * 1  # scale factors write
     )
+    if per_token_activation:
+        problem_bytes += m * 4  # per-token fp32 scale writes
 
     tb_per_sec = problem_bytes / (1e9 * time_ms)
     return tb_per_sec
+
+
+def mode_label(
+    per_token_activation: bool, nvfp4_4over6_config: NVFP44Over6Config | None
+) -> str:
+    return nvfp4_4over6_mode_label(per_token_activation, nvfp4_4over6_config)
 
 
 def run_bandwidth_sweep(
     m_values: List[int],
     k_values: List[int],
     dtype: torch.dtype,
-    is_sf_swizzled_layout: bool,
+    sf_layout: SfLayout,
+    layout_label: str,
+    per_token_activation: bool,
+    nvfp4_4over6_config: NVFP44Over6Config | None,
+    **benchmark_options,
 ) -> Dict[Tuple[int, int], float]:
     """Run bandwidth benchmark sweep for CuTe-DSL backend only."""
     bandwidth_results = {}
@@ -253,9 +405,8 @@ def run_bandwidth_sweep(
     total = len(m_values) * len(k_values)
     current = 0
 
-    layout_str = "swizzled" if is_sf_swizzled_layout else "linear"
     print(
-        f"\nBenchmarking NVFP4 {layout_str} layout, dtype={dtype} (CuTe-DSL bandwidth)"
+        f"\nBenchmarking NVFP4 {layout_label} layout, dtype={dtype} (CuTe-DSL bandwidth)"
     )
     print("=" * 60)
 
@@ -265,10 +416,19 @@ def run_bandwidth_sweep(
             print(f"[{current}/{total}] M={m:5d}, K={k:5d} ... ", end="", flush=True)
 
             time_ms = bench_nvfp4_quantize(
-                m, k, dtype, is_sf_swizzled_layout, backend="cute-dsl"
+                m,
+                k,
+                dtype,
+                sf_layout,
+                backend="cute-dsl",
+                per_token_activation=per_token_activation,
+                nvfp4_4over6_config=nvfp4_4over6_config,
+                **benchmark_options,
             )
 
-            bandwidth = compute_bandwidth_tb_per_sec(m, k, dtype, time_ms)
+            bandwidth = compute_bandwidth_tb_per_sec(
+                m, k, dtype, time_ms, per_token_activation
+            )
             bandwidth_results[(m, k)] = bandwidth
 
             print(f"time={time_ms:.3f}ms, bandwidth={bandwidth:.2f} TB/s")
@@ -280,7 +440,11 @@ def run_benchmark_sweep(
     m_values: List[int],
     k_values: List[int],
     dtype: torch.dtype,
-    is_sf_swizzled_layout: bool,
+    sf_layout: SfLayout,
+    layout_label: str,
+    per_token_activation: bool,
+    nvfp4_4over6_config: NVFP44Over6Config | None,
+    **benchmark_options,
 ) -> Tuple[Dict[Tuple[int, int], float], Dict[Tuple[int, int], float]]:
     """Run benchmark sweep for both backends with inline correctness verification."""
     cuda_times = {}
@@ -290,8 +454,7 @@ def run_benchmark_sweep(
     total = len(m_values) * len(k_values)
     current = 0
 
-    layout_str = "swizzled" if is_sf_swizzled_layout else "linear"
-    print(f"\nBenchmarking NVFP4 {layout_str} layout, dtype={dtype}")
+    print(f"\nBenchmarking NVFP4 {layout_label} layout, dtype={dtype}")
     print("=" * 95)
     print(
         f"{'Progress':<12} {'M':>5}  {'K':>5}  | "
@@ -311,7 +474,13 @@ def run_benchmark_sweep(
 
             # Verify correctness first
             success, verify_msg, quant_match, scale_match = verify_nvfp4_correctness(
-                m, k, dtype, is_sf_swizzled_layout
+                m,
+                k,
+                dtype,
+                sf_layout,
+                per_token_activation=per_token_activation,
+                nvfp4_4over6_config=nvfp4_4over6_config,
+                seed=benchmark_options.get("seed", 42),
             )
             if not success:
                 failures.append((m, k, verify_msg))
@@ -320,13 +489,27 @@ def run_benchmark_sweep(
 
             # Benchmark CUDA backend
             cuda_time = bench_nvfp4_quantize(
-                m, k, dtype, is_sf_swizzled_layout, backend="cuda"
+                m,
+                k,
+                dtype,
+                sf_layout,
+                backend="cuda",
+                per_token_activation=per_token_activation,
+                nvfp4_4over6_config=nvfp4_4over6_config,
+                **benchmark_options,
             )
             cuda_times[(m, k)] = cuda_time
 
             # Benchmark CuTe-DSL backend
             cute_dsl_time = bench_nvfp4_quantize(
-                m, k, dtype, is_sf_swizzled_layout, backend="cute-dsl"
+                m,
+                k,
+                dtype,
+                sf_layout,
+                backend="cute-dsl",
+                per_token_activation=per_token_activation,
+                nvfp4_4over6_config=nvfp4_4over6_config,
+                **benchmark_options,
             )
             cute_dsl_times[(m, k)] = cute_dsl_time
 
@@ -587,7 +770,82 @@ def main():
         default="nvfp4_quantize_backend",
         help="Output file prefix for heatmaps",
     )
+    parser.add_argument(
+        "--layouts",
+        type=str,
+        default=",".join(LAYOUTS_BY_NAME.keys()),
+        help=(
+            "Comma-separated subset of layouts to benchmark "
+            "(swizzled_128x4, swizzled_8x4, linear). Default: all three."
+        ),
+    )
+    parser.add_argument(
+        "--per-token-activation",
+        action="store_true",
+        help="Benchmark NVFP4 per-token activation quantization.",
+    )
+    parser.add_argument(
+        "--m-values", type=int, nargs="+", help="Row counts (default: built-in sweep)."
+    )
+    parser.add_argument(
+        "--k-values",
+        type=int,
+        nargs="+",
+        help="Column counts (default: built-in sweep).",
+    )
+    parser.add_argument(
+        "--num-iters", type=int, default=30, help="Measured iterations (default: 30)."
+    )
+    parser.add_argument(
+        "--dry-run-iters", type=int, default=5, help="Warmup iterations (default: 5)."
+    )
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="Capture and replay each call in a CUDA graph (requires CUPTI >= 13).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Input seed, reset for each backend (default: 42).",
+    )
+    parser.add_argument(
+        "--csv-output",
+        help="Write every timing sample and configuration to this CSV file.",
+    )
+    parser.add_argument(
+        "--no-heatmap", action="store_true", help="Skip heatmap generation."
+    )
     args = parser.parse_args()
+    if args.num_iters <= 0 or args.dry_run_iters < 0:
+        parser.error(
+            "--num-iters must be positive and --dry-run-iters must be nonnegative"
+        )
+    if any(value <= 0 for value in (args.m_values or []) + (args.k_values or [])):
+        parser.error("--m-values and --k-values must contain positive integers")
+    nvfp4_4over6_config = current_nvfp4_4over6_config()
+
+    selected_layouts: List[str] = []
+    for name in args.layouts.split(","):
+        name = name.strip()
+        if not name:
+            continue
+        if name not in LAYOUTS_BY_NAME:
+            print(
+                f"ERROR: unknown layout '{name}'. "
+                f"Valid choices: {list(LAYOUTS_BY_NAME.keys())}"
+            )
+            return
+        selected_layouts.append(name)
+    if not selected_layouts:
+        print("ERROR: --layouts produced an empty selection")
+        return
+    k_alignment = 64 if any(name != "linear" for name in selected_layouts) else 16
+    if any(value % k_alignment for value in args.k_values or []):
+        parser.error(
+            f"--k-values must be divisible by {k_alignment} for the selected layouts"
+        )
 
     # Check compute capability
     cc = get_cc()
@@ -607,7 +865,7 @@ def main():
     # - Swizzled layout: K must be a multiple of 64 because K/16 (SF blocks
     #   per row) must be a multiple of 4 for the swizzled padding
     # We use K values that satisfy both constraints (multiples of 64)
-    m_values = [
+    m_values = args.m_values or [
         1,
         2,
         4,
@@ -631,7 +889,7 @@ def main():
         16384,
         32768,
     ]
-    k_values = [
+    k_values = args.k_values or [
         128,
         256,
         384,
@@ -651,104 +909,125 @@ def main():
 
     print(f"\nM values: {m_values}")
     print(f"K values: {k_values}")
+    print(
+        f"Timing: CUPTI requested, CUDA graph={args.cuda_graph}, cold L2=True, "
+        f"warmup={args.dry_run_iters}, iterations={args.num_iters}, seed={args.seed}"
+    )
+    benchmark_options = {
+        "dry_run_iters": args.dry_run_iters,
+        "repeat_iters": args.num_iters,
+        "use_cuda_graph": args.cuda_graph,
+        "seed": args.seed,
+        "csv_output": args.csv_output,
+    }
+    if args.csv_output is not None:
+        Path(args.csv_output).write_text("")
+    print(
+        "Mode: "
+        + mode_label(
+            per_token_activation=args.per_token_activation,
+            nvfp4_4over6_config=nvfp4_4over6_config,
+        )
+    )
+    print("NVFP4 quantization environment:")
+    for name in NVFP4_QUANT_ENV_VARS:
+        print(f"  {name}={os.environ.get(name, '<unset>')}")
+    print(f"4over6 E4M3 max: {nvfp4_e4m3_max(nvfp4_4over6_config):.0f}")
 
     if args.bandwidth:
         print("\n" + "=" * 80)
         print("BANDWIDTH MEASUREMENT MODE (CuTe-DSL only)")
         print("=" * 80)
+        print(f"Layouts: {selected_layouts}")
 
-        # Benchmark linear layout
-        print("\n" + "=" * 80)
-        print("BENCHMARKING LINEAR (NON-SWIZZLED) LAYOUT - BANDWIDTH")
-        print("=" * 80)
+        for layout_name in selected_layouts:
+            sf_layout = LAYOUTS_BY_NAME[layout_name]
+            print("\n" + "=" * 80)
+            print(f"BENCHMARKING {layout_name.upper()} LAYOUT - BANDWIDTH")
+            print("=" * 80)
 
-        bandwidth_linear = run_bandwidth_sweep(
-            m_values, k_values, dtype, is_sf_swizzled_layout=False
-        )
-        print_bandwidth_summary_table(
-            m_values, k_values, bandwidth_linear, "Linear Layout"
-        )
-        create_bandwidth_heatmap(
-            m_values,
-            k_values,
-            bandwidth_linear,
-            f"NVFP4 Quantization Bandwidth (CuTe-DSL) - Linear Layout - {args.dtype}",
-            f"{args.output_prefix}_bandwidth_linear_{args.dtype}.png",
-        )
-
-        # Benchmark swizzled layout
-        print("\n" + "=" * 80)
-        print("BENCHMARKING SWIZZLED LAYOUT - BANDWIDTH")
-        print("=" * 80)
-
-        bandwidth_swizzled = run_bandwidth_sweep(
-            m_values, k_values, dtype, is_sf_swizzled_layout=True
-        )
-        print_bandwidth_summary_table(
-            m_values, k_values, bandwidth_swizzled, "Swizzled Layout"
-        )
-        create_bandwidth_heatmap(
-            m_values,
-            k_values,
-            bandwidth_swizzled,
-            f"NVFP4 Quantization Bandwidth (CuTe-DSL) - Swizzled Layout - {args.dtype}",
-            f"{args.output_prefix}_bandwidth_swizzled_{args.dtype}.png",
-        )
+            bandwidth = run_bandwidth_sweep(
+                m_values,
+                k_values,
+                dtype,
+                sf_layout,
+                layout_name,
+                per_token_activation=args.per_token_activation,
+                nvfp4_4over6_config=nvfp4_4over6_config,
+                **benchmark_options,
+            )
+            print_bandwidth_summary_table(
+                m_values, k_values, bandwidth, f"{layout_name} layout"
+            )
+            if args.no_heatmap:
+                continue
+            create_bandwidth_heatmap(
+                m_values,
+                k_values,
+                bandwidth,
+                "NVFP4 Quantization Bandwidth (CuTe-DSL) - "
+                f"{layout_name} - {args.dtype} - "
+                + mode_label(
+                    per_token_activation=args.per_token_activation,
+                    nvfp4_4over6_config=nvfp4_4over6_config,
+                ),
+                f"{args.output_prefix}_bandwidth_{layout_name}_{args.dtype}_"
+                + mode_label(
+                    per_token_activation=args.per_token_activation,
+                    nvfp4_4over6_config=nvfp4_4over6_config,
+                )
+                .replace(", ", "_")
+                .replace("-", "_")
+                + ".png",
+            )
     else:
         # Speedup comparison mode: CUDA vs CuTe-DSL
-        # Benchmark linear layout
-        print("\n" + "=" * 80)
-        print("BENCHMARKING LINEAR (NON-SWIZZLED) LAYOUT")
-        print("=" * 80)
+        print(f"Layouts: {selected_layouts}")
+        for layout_name in selected_layouts:
+            sf_layout = LAYOUTS_BY_NAME[layout_name]
+            print("\n" + "=" * 80)
+            print(f"BENCHMARKING {layout_name.upper()} LAYOUT")
+            print("=" * 80)
 
-        cuda_times_linear, cute_dsl_times_linear = run_benchmark_sweep(
-            m_values,
-            k_values,
-            dtype,
-            is_sf_swizzled_layout=False,
-        )
-        print_summary_table(
-            m_values,
-            k_values,
-            cuda_times_linear,
-            cute_dsl_times_linear,
-            "Linear Layout",
-        )
-        create_heatmap(
-            m_values,
-            k_values,
-            cuda_times_linear,
-            cute_dsl_times_linear,
-            f"NVFP4 Quantization Speedup (CuTe-DSL vs CUDA) - Linear Layout - {args.dtype}",
-            f"{args.output_prefix}_comparison_linear_{args.dtype}.png",
-        )
-
-        # Benchmark swizzled layout
-        print("\n" + "=" * 80)
-        print("BENCHMARKING SWIZZLED LAYOUT")
-        print("=" * 80)
-
-        cuda_times_swizzled, cute_dsl_times_swizzled = run_benchmark_sweep(
-            m_values,
-            k_values,
-            dtype,
-            is_sf_swizzled_layout=True,
-        )
-        print_summary_table(
-            m_values,
-            k_values,
-            cuda_times_swizzled,
-            cute_dsl_times_swizzled,
-            "Swizzled Layout",
-        )
-        create_heatmap(
-            m_values,
-            k_values,
-            cuda_times_swizzled,
-            cute_dsl_times_swizzled,
-            f"NVFP4 Quantization Speedup (CuTe-DSL vs CUDA) - Swizzled Layout - {args.dtype}",
-            f"{args.output_prefix}_comparison_swizzled_{args.dtype}.png",
-        )
+            cuda_times, cute_dsl_times = run_benchmark_sweep(
+                m_values,
+                k_values,
+                dtype,
+                sf_layout,
+                layout_name,
+                per_token_activation=args.per_token_activation,
+                nvfp4_4over6_config=nvfp4_4over6_config,
+                **benchmark_options,
+            )
+            print_summary_table(
+                m_values,
+                k_values,
+                cuda_times,
+                cute_dsl_times,
+                f"{layout_name} layout",
+            )
+            if args.no_heatmap:
+                continue
+            create_heatmap(
+                m_values,
+                k_values,
+                cuda_times,
+                cute_dsl_times,
+                "NVFP4 Quantization Speedup (CuTe-DSL vs CUDA) - "
+                f"{layout_name} - {args.dtype} - "
+                + mode_label(
+                    per_token_activation=args.per_token_activation,
+                    nvfp4_4over6_config=nvfp4_4over6_config,
+                ),
+                f"{args.output_prefix}_comparison_{layout_name}_{args.dtype}_"
+                + mode_label(
+                    per_token_activation=args.per_token_activation,
+                    nvfp4_4over6_config=nvfp4_4over6_config,
+                )
+                .replace(", ", "_")
+                .replace("-", "_")
+                + ".png",
+            )
 
     print("\n" + "=" * 80)
     print("BENCHMARK COMPLETE")

@@ -88,9 +88,10 @@ class TestSelectiveStateUpdateDstIndices:
     NGROUPS = 8
     STATE_CACHE_SIZE = 256
 
+    @pytest.mark.parametrize("algorithm", ["simple"])
     @pytest.mark.parametrize("batch", [1, 4, 32, 64])
-    def test_dst_different_from_src(self, batch):
-        """State is read from src slots and written to disjoint dst slots."""
+    def test_dst_different_from_src(self, batch, algorithm):
+        """State is read from src slots and written to disjoint dst slots (STP path only)."""
         torch.manual_seed(42)
         tensors = _make_base_tensors(
             batch,
@@ -145,6 +146,7 @@ class TestSelectiveStateUpdateDstIndices:
             dst_state_batch_indices=dst_2d,
             pad_slot_id=PAD_SLOT_ID,
             out=out_test,
+            algorithm=algorithm,
         )
 
         _assert_match(out_ref, out_test, "output", self.ATOL, self.RTOL)
@@ -172,9 +174,10 @@ class TestSelectiveStateUpdateDstIndices2D:
     NGROUPS = 8
     STATE_CACHE_SIZE = 256
 
+    @pytest.mark.parametrize("algorithm", ["simple"])
     @pytest.mark.parametrize("batch", [1, 16, 64])
-    def test_2d_indices_seqlen1(self, batch):
-        """2D indices with max_seqlen=1 should behave identically to STP."""
+    def test_2d_indices_seqlen1(self, batch, algorithm):
+        """2D indices with max_seqlen=1 should behave identically to STP (STP path only)."""
         torch.manual_seed(42)
         tensors = _make_base_tensors(
             batch,
@@ -226,6 +229,7 @@ class TestSelectiveStateUpdateDstIndices2D:
             dst_state_batch_indices=dst_indices,
             pad_slot_id=PAD_SLOT_ID,
             out=out_test,
+            algorithm=algorithm,
         )
 
         _assert_match(out_ref, out_test, "output", self.ATOL, self.RTOL)
@@ -251,6 +255,7 @@ class TestSelectiveStateUpdateVarlen:
     NGROUPS = 8
     STATE_CACHE_SIZE = 512
 
+    @pytest.mark.parametrize("algorithm", ["simple"])
     @pytest.mark.parametrize(
         "n_seqs,max_seqlen",
         [
@@ -263,7 +268,7 @@ class TestSelectiveStateUpdateVarlen:
             (16, 4),
         ],
     )
-    def test_varlen_uniform(self, n_seqs, max_seqlen):
+    def test_varlen_uniform(self, n_seqs, max_seqlen, algorithm):
         """All sequences have the same length."""
         torch.manual_seed(42)
         total_tokens = n_seqs * max_seqlen
@@ -334,6 +339,7 @@ class TestSelectiveStateUpdateVarlen:
             num_accepted_tokens=num_accepted,
             cu_seqlens=cu_seqlens,
             cache_steps=max_seqlen,
+            algorithm=algorithm,
         )
 
         _assert_match(out_ref, out_test, "output", self.ATOL, self.RTOL)
@@ -349,8 +355,9 @@ class TestSelectiveStateUpdateVarlen:
                     self.RTOL,
                 )
 
+    @pytest.mark.parametrize("algorithm", ["simple"])
     @pytest.mark.parametrize("n_seqs", [4, 8])
-    def test_varlen_variable_lengths(self, n_seqs):
+    def test_varlen_variable_lengths(self, n_seqs, algorithm):
         """Sequences have different lengths (padded with PAD_SLOT_ID)."""
         max_seqlen = 6
         torch.manual_seed(42)
@@ -431,6 +438,7 @@ class TestSelectiveStateUpdateVarlen:
             num_accepted_tokens=num_accepted,
             cu_seqlens=cu_seqlens,
             cache_steps=max_seqlen,
+            algorithm=algorithm,
         )
 
         _assert_match(out_ref, out_test, "output", self.ATOL, self.RTOL)
@@ -447,9 +455,12 @@ class TestSelectiveStateUpdateNumAcceptedTokens:
     NGROUPS = 8
     STATE_CACHE_SIZE = 512
 
+    @pytest.mark.parametrize("algorithm", ["simple"])
     @pytest.mark.parametrize("n_seqs", [4, 8, 16])
     @pytest.mark.parametrize("num_accepted_dtype", [torch.int32, torch.int64])
-    def test_num_accepted_selects_initial_state(self, n_seqs, num_accepted_dtype):
+    def test_num_accepted_selects_initial_state(
+        self, n_seqs, num_accepted_dtype, algorithm
+    ):
         """num_accepted_tokens controls which state slot to read as initial."""
         max_seqlen = 4
         total_tokens = n_seqs * max_seqlen
@@ -521,6 +532,7 @@ class TestSelectiveStateUpdateNumAcceptedTokens:
             num_accepted_tokens=num_accepted,
             cu_seqlens=cu_seqlens,
             cache_steps=max_seqlen,
+            algorithm=algorithm,
         )
 
         _assert_match(out_ref, out_test, "output", self.ATOL, self.RTOL)

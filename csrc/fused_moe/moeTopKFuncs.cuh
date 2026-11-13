@@ -73,11 +73,25 @@ struct TopKRedType {
   __host__ __device__ operator TypeCmp() const noexcept { return compValIdx; }
 
   __device__ inline TypeCmp reduce(cg::thread_block_tile<kWARP_SIZE> const& warp) {
-    if constexpr (!kTLLM_GEN_HAS_FAST_REDUX || sizeof(TypeCmp) == 8) {
+    // 32-bit keys (bf16/fp16) reduce with redux.sync.max.u32 directly. 64-bit keys
+    // (float/int) split into hi=value / lo=idx-complement and take two
+    // redux.sync.max.u32 (masking non-winning lanes' lo to 0), re-packed to the
+    // lexicographic 64-bit max -- bit-identical to cg::reduce, used as the fallback
+    // when fast redux is unavailable.
+    if constexpr (!kTLLM_GEN_HAS_FAST_REDUX) {
       return cg::reduce(warp, compValIdx, cg::greater<TypeCmp>{});
+    } else if constexpr (sizeof(TypeCmp) == 8) {
+      uint32_t hi = static_cast<uint32_t>(compValIdx >> 32);
+      uint32_t lo = static_cast<uint32_t>(compValIdx & 0xffffffffu);
+      uint32_t maxHi;
+      asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(maxHi) : "r"(hi));
+      uint32_t loContrib = (hi == maxHi) ? lo : 0u;
+      uint32_t maxLo;
+      asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(maxLo) : "r"(loContrib));
+      return (static_cast<TypeCmp>(maxHi) << 32) | static_cast<TypeCmp>(maxLo);
     } else {
       TypeCmp result;
-      asm("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(result) : "r"(compValIdx));
+      asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(result) : "r"(compValIdx));
       return result;
     }
   }

@@ -1,0 +1,4 @@
+# Generated Cake device/binding sources: byte-faithful exports whose SHA-256
+# is part of the JIT registry identity (cake_jit.py). Never reformat them.
+DisableFormat: true
+SortIncludes: Never

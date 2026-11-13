@@ -1,0 +1,466 @@
+# NOTE for future contributors (incl. AI agents): keep this file lean. Randomized
+# breadth (shapes, token counts) belongs in tests/moe/test_unified_moe_fuzz.py --
+# extend its axes/adapters. This file exists for the quant x routing x layout
+# kernel-selection matrix and for paths the fuzzer cannot express; add cases only
+# as deliberate regression anchors.
+
+"""
+Copyright (c) 2025 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+from typing import Dict
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from flashinfer import (
+    RoutingMethodType,
+    ActivationType,
+    SfLayout,
+    nvfp4_quantize,
+)
+from flashinfer.fused_moe import (
+    trtllm_fp4_block_scale_routed_moe,
+)
+from flashinfer.autotuner import autotune
+from flashinfer.fp4_quantization import (
+    block_scale_interleave,
+    e2m1_and_ufp8sf_scale_to_float,
+)
+from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
+from flashinfer.fused_moe.core import (
+    get_w2_permute_indices_with_cache,
+    _maybe_get_cached_w3_w1_permute_indices,
+)
+from flashinfer.utils import device_support_pdl, get_compute_capability
+from tests.quantization.test_helpers.utils_fp4 import nvfp4_global_decode_scale_te
+from . import utils as moe_utils
+from .trtllm_gen_fused_moe_utils import (
+    check_accuracy,
+    routing_reference_topk,
+)
+
+set_nvfp4_4over6_env = moe_utils.set_nvfp4_4over6_env
+
+torch.manual_seed(42)
+cache_permute_indices: Dict[tuple, torch.Tensor] = {}
+
+
+# The 4-over-6 x per-token-scaling matrix is the coverage here (only file exercising
+# it); shape fan-out kept to boundary corners.
+def _skip_unless_sm10x(device: torch.device) -> None:
+    if get_compute_capability(device)[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+
+def _per_token_routed_case(
+    *,
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    top_k: int,
+    use_4over6: bool,
+    weights_use_4over6: bool,
+    activation_type: ActivationType,
+    zero_rows: bool,
+    device: torch.device,
+):
+    """Build per-token NVFP4 inputs for the routed flat APIs and the reference.
+
+    Returns ``(kwargs, reference)``; ``kwargs`` is the keyword form of the
+    ``trtllm_fp4_block_scale_routed_moe`` call. The activation is quantized
+    under the ambient 4over6 environment; the weights under
+    ``weights_use_4over6``.
+    """
+    enable_pdl = device_support_pdl(device)
+
+    is_gated = activation_type.is_gated
+    fc1_out_size = intermediate_size * (2 if is_gated else 1)
+
+    # ======== Input Tensors ========
+    hidden_states_bf16 = torch.randn(
+        num_tokens,
+        hidden_size,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    w13_bf16 = (
+        torch.randn(
+            num_experts,
+            fc1_out_size,
+            hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+    )
+    if zero_rows:
+        if is_gated:
+            pytest.skip("zero_rows targets non-gated activations")
+        hidden_states_bf16 = hidden_states_bf16.abs() + 0.1
+        hidden_states_bf16[0] = 0  # all-zero input row for the input quant
+        w13_bf16 = -(w13_bf16.abs() + 0.01)
+    w2_bf16 = (
+        torch.randn(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+    )
+
+    # ======== Routing ========
+    routing_logits = torch.rand(num_tokens, num_experts, device=device).to(
+        torch.bfloat16
+    )
+    permute_info, expert_weights = routing_reference_topk(
+        routing_logits, top_k, num_experts, 8
+    )
+    topk_ids = permute_info["topKIndices"].to(torch.int32)
+    expert_weights = expert_weights.view(num_tokens, num_experts)[
+        torch.arange(num_tokens).unsqueeze(1), topk_ids
+    ].to(torch.bfloat16)
+
+    # ======== Quantize =======
+    nvfp4_4over6_config = NVFP44Over6Config() if use_4over6 else None
+    weights_nvfp4_4over6_config = NVFP44Over6Config() if weights_use_4over6 else None
+    hidden_states_global_scale_inv = nvfp4_global_decode_scale_te(
+        torch.ones((), dtype=torch.float32, device=device),
+        nvfp4_4over6_config,
+    )
+    hidden_states, hidden_states_scale, per_token_scale_inv = nvfp4_quantize(
+        hidden_states_bf16,
+        hidden_states_global_scale_inv,
+        sfLayout=SfLayout.layout_linear,
+        per_token_activation=True,
+    )
+    hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
+        num_tokens, -1
+    )
+
+    w13_global_amax = w13_bf16.abs().amax().to(torch.float32)
+    w2_global_amax = w2_bf16.abs().amax().to(torch.float32)
+    w13_global_scale_inv = nvfp4_global_decode_scale_te(
+        w13_global_amax, weights_nvfp4_4over6_config
+    )
+    w2_global_scale_inv = nvfp4_global_decode_scale_te(
+        w2_global_amax, weights_nvfp4_4over6_config
+    )
+    with moe_utils.nvfp4_4over6_env(weights_use_4over6):
+        w13, w13_scale = nvfp4_quantize(
+            w13_bf16,
+            1.0 / w13_global_scale_inv,
+            sfLayout=SfLayout.layout_linear,
+        )
+        w2, w2_scale = nvfp4_quantize(
+            w2_bf16,
+            1.0 / w2_global_scale_inv,
+            sfLayout=SfLayout.layout_linear,
+        )
+    w13_scale = w13_scale.view(torch.float8_e4m3fn).reshape(
+        num_experts, fc1_out_size, -1
+    )
+    w2_scale = w2_scale.view(torch.float8_e4m3fn).reshape(num_experts, hidden_size, -1)
+
+    # ======== Dequantize ========
+    # Use dquantized input for more accurate comparison
+
+    hidden_states_dequant = e2m1_and_ufp8sf_scale_to_float(
+        hidden_states.cpu(),
+        hidden_states_scale.cpu().view(torch.uint8).reshape(-1),
+        torch.tensor([1.0], device="cpu"),
+        16,
+        1,
+        False,
+    ).to(device)
+    hidden_states_dequant *= per_token_scale_inv.unsqueeze(1)
+    hidden_states_dequant = hidden_states_dequant.to(torch.bfloat16)
+
+    w13_dequant = torch.empty_like(w13_bf16)
+    w2_dequant = torch.empty_like(w2_bf16)
+    for i in range(num_experts):
+        w13_dequant_ = e2m1_and_ufp8sf_scale_to_float(
+            w13[i].cpu(),
+            w13_scale[i].cpu().view(torch.uint8).reshape(-1),
+            w13_global_scale_inv.cpu(),
+            16,
+            1,
+            False,
+        ).to(device)
+        w13_dequant[i] = w13_dequant_.to(torch.bfloat16)
+
+        w2_dequant_ = e2m1_and_ufp8sf_scale_to_float(
+            w2[i].cpu(),
+            w2_scale[i].cpu().view(torch.uint8).reshape(-1),
+            w2_global_scale_inv.cpu(),
+            16,
+            1,
+            False,
+        ).to(device)
+        w2_dequant[i] = w2_dequant_.to(torch.bfloat16)
+
+    # ======== Reference Result ========
+    # Flatten token/top_k dims: [num_tokens*top_k]
+    flat_ids = topk_ids.reshape(-1)  # [num_tokens*top_k]
+    flat_weights = expert_weights.reshape(-1)  # [num_tokens*top_k]
+    # Gather hidden states for each (token, expert) pair: [num_tokens*top_k, hidden_size]
+    flat_hidden = (
+        hidden_states_dequant.unsqueeze(1)
+        .expand(-1, top_k, -1)
+        .reshape(-1, hidden_size)
+    )
+    # Iterate over experts to avoid materializing huge gathered weight tensors
+    expert_out = torch.zeros(
+        num_tokens * top_k, hidden_size, device=device, dtype=torch.bfloat16
+    )
+    for e in range(num_experts):
+        mask = flat_ids == e  # [num_tokens*top_k]
+        e_hidden = flat_hidden[mask]  # [n_e, hidden_size]
+        up_gate_e = e_hidden @ w13_dequant[e].T  # [n_e, fc1_out_size]
+        if is_gated:
+            up_e, gate_e = up_gate_e.chunk(2, dim=-1)
+            inter_e = F.silu(gate_e) * up_e  # [n_e, intermediate_size]
+        else:
+            inter_e = F.relu(up_gate_e) ** 2  # [n_e, intermediate_size]
+        expert_out[mask] = inter_e @ w2_dequant[e].T  # [n_e, hidden_size]
+    # Weighted sum back to [num_tokens, hidden_size]
+    reference = (
+        (flat_weights.unsqueeze(-1) * expert_out)
+        .reshape(num_tokens, top_k, hidden_size)
+        .sum(dim=1)
+    )
+
+    # ======== Prepare MoE ========
+
+    epilogue_tile_m = 128
+    w13_shuffled = []
+    w13_scale_shuffled = []
+    w2_shuffled = []
+    w2_scale_shuffled = []
+    for i in range(num_experts):
+        permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+            cache_permute_indices,
+            w13[i].view(torch.uint8),
+            epilogue_tile_m,
+            is_gated_act_gemm=is_gated,
+        )
+        w13_shuffled.append(
+            w13[i].view(torch.uint8)[permute_indices.to(device)].contiguous()
+        )
+        permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
+            cache_permute_indices,
+            w13_scale[i].view(torch.uint8),
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+            is_gated_act_gemm=is_gated,
+        )
+        w13_scale_shuffled.append(
+            block_scale_interleave(
+                w13_scale.reshape(num_experts, fc1_out_size, -1)[i]
+                .view(torch.uint8)[permute_sf_indices.to(device)]
+                .contiguous()
+            )
+        )
+        permute_indices = get_w2_permute_indices_with_cache(
+            cache_permute_indices,
+            w2[i].view(torch.uint8),
+            epilogue_tile_m,
+            is_gated_act_gemm=is_gated,
+        )
+        w2_shuffled.append(
+            w2[i].view(torch.uint8)[permute_indices.to(device)].contiguous()
+        )
+        permute_sf_indices = get_w2_permute_indices_with_cache(
+            cache_permute_indices,
+            w2_scale[i].view(torch.uint8),
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+            is_gated_act_gemm=is_gated,
+        )
+        w2_scale_shuffled.append(
+            block_scale_interleave(
+                w2_scale.reshape(num_experts, hidden_size, -1)[i]
+                .view(torch.uint8)[permute_sf_indices.to(device)]
+                .contiguous()
+            )
+        )
+    w13_shuffled = torch.stack(w13_shuffled)
+    w13_scale_shuffled = torch.stack(w13_scale_shuffled).view(torch.float8_e4m3fn)
+    w2_shuffled = torch.stack(w2_shuffled)
+    w2_scale_shuffled = torch.stack(w2_scale_shuffled).view(torch.float8_e4m3fn)
+
+    # For a non-linear elementwise activation (Relu2) the kernel applies the gate scalar
+    # *before* the activation and the c scalar *after*, so the dequantization factor must
+    # ride on the gate scalar only -- s * relu(x)^2 != relu(s * x)^2.  The c scalar then
+    # carries just the output quantization factor, which is 1 here because FC1 emits bf16
+    # under per-token scaling.  Gated activations take the dequant on both.
+    # Mirrors scale_c_fc1 / scale_gate_fc1 in tests/moe/trtllm_gen_fused_moe_utils.py.
+    output1_scale_scalar = torch.stack(
+        [w13_global_scale_inv if is_gated else torch.ones_like(w13_global_scale_inv)]
+        * num_experts
+    )
+    output1_scale_gate_scalar = torch.stack([w13_global_scale_inv] * num_experts)
+    output2_scale_scalar = torch.stack([w2_global_scale_inv] * num_experts)
+
+    packed_tensor = (topk_ids.to(torch.int32) << 16) | expert_weights.to(
+        torch.bfloat16
+    ).view(torch.int16)
+
+    kwargs = dict(
+        topk_ids=packed_tensor,
+        routing_bias=None,
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        gemm1_weights=w13_shuffled,
+        gemm1_weights_scale=w13_scale_shuffled,
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=w2_shuffled,
+        gemm2_weights_scale=w2_scale_shuffled,
+        gemm2_bias=None,
+        output1_scale_scalar=output1_scale_scalar,
+        output1_scale_gate_scalar=output1_scale_gate_scalar,
+        output2_scale_scalar=output2_scale_scalar,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=RoutingMethodType.TopK.value,
+        do_finalize=True,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type.value,
+        per_token_scale=per_token_scale_inv,
+    )
+    return kwargs, reference
+
+
+@pytest.mark.parametrize("num_tokens", [1, 1024])
+@pytest.mark.parametrize("hidden_size", [1024, 4096])
+@pytest.mark.parametrize("intermediate_size", [2048])
+@pytest.mark.parametrize("num_experts", [32])
+@pytest.mark.parametrize("top_k", [4])
+@pytest.mark.parametrize("use_4over6", [False, True])
+@pytest.mark.parametrize("weights_use_4over6", [False, True])
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        pytest.param(ActivationType.Swiglu, id="Swiglu"),
+        pytest.param(ActivationType.Relu2, id="Relu2"),
+    ],
+)
+@pytest.mark.parametrize("zero_rows", [False, True])
+def test_routed_fused_moe(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    top_k: int,
+    use_4over6: bool,
+    weights_use_4over6: bool,
+    activation_type: ActivationType,
+    zero_rows: bool,
+):
+    device = torch.device("cuda:0")
+    _skip_unless_sm10x(device)
+    kwargs, reference = _per_token_routed_case(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        use_4over6=use_4over6,
+        weights_use_4over6=weights_use_4over6,
+        activation_type=activation_type,
+        zero_rows=zero_rows,
+        device=device,
+    )
+
+    with autotune(False):
+        result = trtllm_fp4_block_scale_routed_moe(**kwargs)[0]
+
+    torch.cuda.synchronize()
+
+    if zero_rows:
+        assert torch.all(reference == 0)
+        assert torch.isfinite(result).all(), "NaN/inf from all-zero per-token rows"
+        assert torch.all(result == 0)
+        return
+    check_accuracy(reference, result, atol=0.1, rtol=0.85, percent=0.9)
+
+
+# The autouse fixture keys on the ``use_4over6`` parameter: it pins every
+# FLASHINFER_NVFP4_4OVER6* variable, so the environment legs below differ only
+# in the on/off switch and ``NVFP44Over6Config()`` names the same recipe.
+@pytest.mark.parametrize("use_4over6", [True])
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        pytest.param(NVFP44Over6Config(), id="e4m3_max448"),
+        pytest.param(NVFP44Over6Config(e4m3_max=256), id="e4m3_max256"),
+    ],
+)
+def test_pinned_recipe_matches_env(recipe: NVFP44Over6Config, use_4over6: bool):
+    """``nvfp4_4over6=`` must select exactly the kernel the environment selects.
+
+    Per-token GEMM2-input requantization is the only place the fused MoE reads
+    the recipe, so this is where an explicit recipe must be bit-identical to
+    the environment it replaces, and ``None`` must ignore an environment that
+    turns 4over6 on. The default recipe exercises the candidate search; the
+    ``e4m3_max=256`` recipe also moves the per-token global scale
+    (``globalScaleInv``) from ``1/(448*6)`` to ``1/(256*6)``.
+    """
+    device = torch.device("cuda:0")
+    _skip_unless_sm10x(device)
+    kwargs, _reference = _per_token_routed_case(
+        num_tokens=64,
+        hidden_size=1024,
+        intermediate_size=2048,
+        num_experts=32,
+        top_k=4,
+        use_4over6=True,
+        weights_use_4over6=False,
+        activation_type=ActivationType.Swiglu,
+        zero_rows=False,
+        device=device,
+    )
+
+    def run(**recipe):
+        with autotune(False):
+            out = trtllm_fp4_block_scale_routed_moe(**kwargs, **recipe)[0]
+        torch.cuda.synchronize()
+        return out.clone()
+
+    e4m3_use_256 = "1" if recipe.e4m3_max == 256 else "0"
+    with moe_utils.env_var("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", e4m3_use_256):
+        env_on = run()
+        none_under_env_on = run(nvfp4_4over6=None)
+    with moe_utils.nvfp4_4over6_env(False):
+        env_off = run()
+        pinned_under_env_off = run(nvfp4_4over6=recipe)
+
+    # The recipe must change the output, or the equalities below are vacuous.
+    assert not torch.equal(env_on, env_off)
+    assert torch.equal(pinned_under_env_off, env_on)
+    assert torch.equal(none_under_env_on, env_off)

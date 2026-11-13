@@ -22,6 +22,10 @@ from typing import Any, List, Optional, Tuple, Union
 import torch
 
 from .api_logging import flashinfer_api
+from .trace.templates.attention import (
+    batch_pod_with_paged_kv_cache_run_trace,
+    pod_with_paged_kv_cache_run_trace,
+)
 from .jit import gen_pod_module, gen_batch_pod_module
 from .page import get_seq_lens
 from .prefill import get_batch_prefill_module
@@ -56,7 +60,7 @@ def get_batch_pod_module(*args):
 
 class PODWithPagedKVCacheWrapper:
     r"""Wrapper class for POD-Attention with paged kv-cache (first proposed in
-    `<https://arxiv.org/abs/2410.18038>`_) for batch of requests.
+    `<https://arxiv.org/abs/2410.18038>`_) for a batch of requests.
 
     Check :ref:`our tutorial<kv-layout>` for page table layout.
 
@@ -115,7 +119,7 @@ class PODWithPagedKVCacheWrapper:
     Note
     ----
     To accelerate computation, FlashInfer's POD-Attention creates some
-    auxiliary data structures, these data structures can be reused across multiple
+    auxiliary data structures that can be reused across multiple
     batch decode attention calls (e.g. different Transformer layers). This wrapper class
     manages the lifecycle of these data structures.
     """
@@ -136,7 +140,7 @@ class PODWithPagedKVCacheWrapper:
         Parameters
         ----------
         float_workspace_buffer : torch.Tensor
-            The user reserved float workspace buffer used to store intermediate attention results
+            The user-reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
 
@@ -148,18 +152,18 @@ class PODWithPagedKVCacheWrapper:
             auxiliary data structures will be stored as the provided buffers. The ``batch_size``
             cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
 
-        indptr_buffer : Optional[torch.Tensor]
+        paged_kv_indptr_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the indptr of the paged kv cache, the size
             of the buffer should be ``[batch_size + 1]``.
             Only needed when ``use_cuda_graph`` is ``True``.
 
-        indices_buffer : Optional[torch.Tensor]
+        paged_kv_indices_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the page indices of the paged kv cache,
             should be large enough to store the maximum number of page indices
             (``max_num_pages``) during the lifecycle of this wrapper.
             Only needed when ``use_cuda_graph`` is ``True``.
 
-        last_page_len_buffer : Optional[torch.Tensor]
+        paged_kv_last_page_len_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the number of entries in the last page, the
             size of the buffer should be ``[batch_size]``.
             Only needed when ``use_cuda_graph`` is ``True``.
@@ -281,14 +285,14 @@ class PODWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         non_blocking: bool = True,
     ) -> None:
-        r"""Plan POD's batch decode for given problem specification.
+        r"""Plan POD's batch decode for a given problem specification.
 
         Parameters
         ----------
         indptr : torch.Tensor
             The indptr of the paged kv cache, shape: ``[batch_size + 1]``
         indices : torch.Tensor
-            The page indices of the paged kv cache, shape: ``[qo_indptr[-1]]``
+            The page indices of the paged kv cache, shape: ``[indptr[-1]]``
         last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged kv
             cache, shape: ``[batch_size]``
@@ -310,11 +314,20 @@ class PODWithPagedKVCacheWrapper:
         q_data_type : Optional[Union[str, torch.dtype]]
             The data type of the query tensor, defaults torch.float16.
         kv_data_type : Optional[Union[str, torch.dtype]]
-            The data type of the key/value tensor. If None, will be set to
+            The data type of the key/value tensor. If None, it will be set to
             ``q_data_type``. Defaults to ``None``.
         data_type: Optional[Union[str, torch.dtype]]
             The data type of both the query and key/value tensors. Defaults to torch.float16.
             data_type is deprecated, please use q_data_type and kv_data_type instead.
+        sm_scale : Optional[float]
+            Softmax scale.  If ``None``, defaults to ``1 / sqrt(head_dim)``.  Cached on
+            the wrapper and reused at :meth:`run` time.
+        rope_scale : Optional[float]
+            Scale factor applied during RoPE interpolation.  Only consulted when
+            ``pos_encoding_mode != "NONE"``.  Defaults to ``1.0`` when ``None``.
+        rope_theta : Optional[float]
+            Base value for the RoPE frequencies.  Only consulted when
+            ``pos_encoding_mode != "NONE"``.  Defaults to ``1e4`` when ``None``.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
 
@@ -423,6 +436,8 @@ class PODWithPagedKVCacheWrapper:
             -1,  # fixed_split_size
             False,  # disable_split_kv
             0,  # num_colocated_ctas
+            0,  # uniform_q_len
+            False,  # fixed_uniform_q_len
         )
 
         self._indptr_type = indptr.dtype
@@ -435,7 +450,7 @@ class PODWithPagedKVCacheWrapper:
 
     begin_forward = plan
 
-    @flashinfer_api
+    @flashinfer_api(trace=pod_with_paged_kv_cache_run_trace)
     def run(
         self,
         # Main params (prefill and decode)
@@ -473,7 +488,99 @@ class PODWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         *args,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        r"""Compute POD-attention for a batch of requests."""
+        r"""Compute POD (Prefill-On-Decode) fused attention for a batch of requests.
+
+        Single-shot fused attention that simultaneously runs single-request
+        prefill (``q_p`` against ``k_p``/``v_p``) and batch-decode
+        (``q_d`` against ``paged_kv_cache_d``) so prefill and decode tokens of a
+        chunked-prefill / continuous-batching iteration share kernel launch and
+        scheduling resources.
+
+        Parameters
+        ----------
+        q_p : torch.Tensor
+            Prefill query tensor, shape ``[qo_len, num_qo_heads, head_dim]``.
+        k_p : torch.Tensor
+            Prefill key tensor.  Layout matches ``kv_layout_p``.
+        v_p : torch.Tensor
+            Prefill value tensor.  Layout matches ``kv_layout_p``.
+        q_d : torch.Tensor
+            Decode query tensor, shape ``[batch_size, num_qo_heads, head_dim]``.
+        paged_kv_cache_d : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+            Paged KV cache for the decode requests.  Layout matches the wrapper's
+            ``kv_layout`` set in :meth:`__init__`.
+        custom_mask_p, packed_custom_mask_p : Optional[torch.Tensor]
+            Optional dense / bit-packed custom mask for the prefill side.  See
+            :func:`flashinfer.single_prefill_with_kv_cache` for the layout.
+        causal_p : bool
+            Whether to apply a causal mask to the prefill side.  Defaults to
+            ``False``.
+        kv_layout_p : str
+            Layout of ``k_p`` and ``v_p``, either ``"NHD"`` or ``"HND"``.
+        pos_encoding_mode_p : str
+            Position-encoding mode for the prefill side.  Defaults to ``"NONE"``.
+        sm_scale_p : Optional[float]
+            Softmax scale for the prefill side.  Defaults to
+            ``1 / sqrt(head_dim)``.
+        window_left_p : int
+            Left window size for sliding-window prefill; ``-1`` disables it.
+        rope_scale_p, rope_theta_p : Optional[float]
+            RoPE scale / theta for the prefill side.  Defaults to ``1.0`` / ``1e4``.
+        return_lse_p : bool
+            If ``True``, allocate an LSE buffer for the prefill kernel to write
+            into.  Defaults to ``False``.  **Note: the buffer is allocated and
+            filled by the kernel but is not currently returned to the caller**
+            -- ``run`` always returns just ``(out_p, out_d)``.  This is a known
+            limitation of the current POD wrapper (kernel API exists, Python
+            wrapper does not yet plumb LSE through the return value).
+        custom_mask_d, packed_custom_mask_d : Optional[torch.Tensor]
+            Optional dense / bit-packed custom mask for the decode side.
+        causal_d : bool
+            Whether to apply a causal mask to the decode side.  Defaults to
+            ``False``.
+        kv_layout_d : str
+            **Currently ignored**: the decode KV layout is always taken from
+            the wrapper's ``kv_layout`` (set in :meth:`__init__`); this
+            argument is accepted for signature symmetry with ``kv_layout_p``
+            but the value is not consulted by the kernel.
+        pos_encoding_mode_d : str
+            **Currently ignored**: overridden by ``self._pos_encoding_mode``
+            from :meth:`plan`.
+        sm_scale_d : Optional[float]
+            **Currently ignored**: overridden by ``self._sm_scale`` from
+            :meth:`plan` (which itself defaults to ``1 / sqrt(head_dim)``).
+        window_left_d : int
+            **Currently ignored**: overridden by ``self._window_left`` from
+            :meth:`plan`.
+        rope_scale_d, rope_theta_d : Optional[float]
+            **Currently ignored**: overridden by ``self._rope_scale`` /
+            ``self._rope_theta`` from :meth:`plan`.
+        q_scale, k_scale, v_scale : Optional[float]
+            FP8 calibration scales applied to the decode side.  Folded into the
+            decode ``sm_scale`` (``q_scale``, ``k_scale``) or the kernel output
+            (``v_scale``).
+        return_lse_d : bool
+            If ``True``, allocate an LSE buffer for the decode kernel to write
+            into.  Defaults to ``False``.  See ``return_lse_p`` -- same
+            caveat: allocated but not returned.
+        use_fp16_qk_reduction : bool
+            Whether to accumulate ``QK`` in FP16 (lower precision, higher
+            throughput).  Defaults to ``False``.
+        enable_pdl : Optional[bool]
+            Programmatic Dependent Launch toggle.  When ``None`` (default), the
+            wrapper auto-detects support from the query device.
+        *args
+            Reserved for forward-compat with future kernel parameters.
+
+        Returns
+        -------
+        Tuple[torch.Tensor, torch.Tensor]
+            ``(out_p, out_d)``: the prefill output (shape
+            ``[qo_len, num_qo_heads, head_dim]``) and the decode output (shape
+            ``[batch_size, num_qo_heads, head_dim]``).  LSE tensors are
+            **not** part of the return value even when ``return_lse_p`` /
+            ``return_lse_d`` is ``True`` (see those parameter notes).
+        """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q_p.device)
 
@@ -618,14 +725,10 @@ class PODWithPagedKVCacheWrapper:
 
         return (out_p, out_d)
 
-    def end_forward(self) -> None:
-        r"""Warning: this function is deprecated and has no effect."""
-        pass
-
 
 class BatchPODWithPagedKVCacheWrapper:
     r"""Wrapper class for POD-Attention with paged kv-cache (first proposed in
-    `<https://arxiv.org/abs/2410.18038>`_) for batch of requests.
+    `<https://arxiv.org/abs/2410.18038>`_) for a batch of requests.
 
     Check :ref:`our tutorial<kv-layout>` for page table layout.
 
@@ -723,7 +826,7 @@ class BatchPODWithPagedKVCacheWrapper:
     Note
     ----
     To accelerate computation, FlashInfer's POD-Attention creates some
-    auxiliary data structures, these data structures can be reused across multiple
+    auxiliary data structures that can be reused across multiple
     batch decode attention calls (e.g. different Transformer layers). This wrapper class
     manages the lifecycle of these data structures.
     """
@@ -739,7 +842,7 @@ class BatchPODWithPagedKVCacheWrapper:
         Parameters
         ----------
         float_workspace_buffer : torch.Tensor
-            The user reserved float workspace buffer used to store intermediate attention results
+            The user-reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
 
@@ -830,7 +933,7 @@ class BatchPODWithPagedKVCacheWrapper:
         kv_indptr_p : torch.Tensor
             The prefill indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
         kv_indices_p : torch.Tensor
-            The prefill page indices of the paged kv-cache, shape: ``[kv_indptr[-1]]``.
+            The prefill page indices of the paged kv-cache, shape: ``[kv_indptr_p[-1]]``.
         last_page_len_p : torch.Tensor
             The number of entries in the last page of each prefill request in the paged
             kv-cache, shape: ``[batch_size]``.
@@ -839,7 +942,7 @@ class BatchPODWithPagedKVCacheWrapper:
         kv_indptr_d : torch.Tensor
             The decode indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
         kv_indices_d : torch.Tensor
-            The decode page indices of the paged kv-cache, shape: ``[kv_indptr[-1]]``.
+            The decode page indices of the paged kv-cache, shape: ``[kv_indptr_d[-1]]``.
         last_page_len_d : torch.Tensor
             The number of entries in the last page of each decode request in the paged
             kv-cache, shape: ``[batch_size]``.
@@ -861,7 +964,7 @@ class BatchPODWithPagedKVCacheWrapper:
         q_data_type : Optional[Union[str, torch.dtype]]
             The data type of the query tensor, defaults torch.float16.
         kv_data_type : Optional[Union[str, torch.dtype]]
-            The data type of the key/value tensor. If None, will be set to
+            The data type of the key/value tensor. If None, it will be set to
             ``q_data_type``. Defaults to ``None``.
         data_type: Optional[Union[str, torch.dtype]]
             The data type of both the query and key/value tensors. Defaults to torch.float16.
@@ -978,6 +1081,8 @@ class BatchPODWithPagedKVCacheWrapper:
             -1,  # fixed_split_size
             False,  # disable_split_kv
             0,  # num_colocated_ctas
+            0,  # uniform_q_len
+            False,  # fixed_uniform_q_len
         )
 
         num_colocated_ctas = self._plan_info_d[0]
@@ -1004,6 +1109,8 @@ class BatchPODWithPagedKVCacheWrapper:
             -1,  # fixed_split_size
             False,  # disable_split_kv
             num_colocated_ctas,
+            0,  # uniform_q_len
+            False,  # fixed_uniform_q_len
         )
         self._indptr_type = kv_indptr_p.dtype
         self._pos_encoding_mode = pos_encoding_mode
@@ -1015,7 +1122,7 @@ class BatchPODWithPagedKVCacheWrapper:
 
     begin_forward = plan
 
-    @flashinfer_api
+    @flashinfer_api(trace=batch_pod_with_paged_kv_cache_run_trace)
     def run(
         self,
         # Main params (prefill and decode)
@@ -1039,7 +1146,56 @@ class BatchPODWithPagedKVCacheWrapper:
         Tuple[torch.Tensor, torch.Tensor],
         Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]],
     ]:
-        r"""Compute POD-attention for a batch of requests."""
+        r"""Compute batched POD (Prefill-On-Decode) fused attention.
+
+        Fused single-shot attention that runs batched paged prefill (``q_p`` against
+        ``paged_kv_cache_p``) and batched paged decode (``q_d`` against
+        ``paged_kv_cache_d``) in the same kernel launch, sharing scheduling and
+        execution resources. Shape and shared attention settings come from
+        :meth:`plan`; prefill masking, ``use_fp16_qk_reduction``, and decode
+        scale parameters are supplied to this method.
+
+        Parameters
+        ----------
+        q_p : torch.Tensor
+            Prefill query tensor, shape ``[qo_indptr_p[-1], num_qo_heads, head_dim]``.
+        paged_kv_cache_p : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+            Paged KV cache for the prefill requests.  Layout matches
+            ``kv_layout`` set in :meth:`__init__`.
+        q_d : torch.Tensor
+            Decode query tensor, shape ``[batch_size_d, num_qo_heads, head_dim]``.
+        paged_kv_cache_d : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+            Paged KV cache for the decode requests.  Layout matches
+            ``kv_layout`` set in :meth:`__init__`.
+        custom_mask_p : Optional[torch.Tensor]
+            Optional dense custom mask for the prefill side (auto-packed when
+            ``packed_custom_mask_p`` is ``None``).
+        packed_custom_mask_p : Optional[torch.Tensor]
+            Optional bit-packed custom mask for the prefill side.
+        causal_p : bool
+            Whether to apply a causal mask to the prefill side.  Defaults to
+            ``False``.
+        q_scale, k_scale, v_scale : Optional[float]
+            FP8 calibration scales applied to the decode side.  Folded into the
+            decode ``sm_scale`` (``q_scale``, ``k_scale``) or the kernel output
+            (``v_scale``).
+        return_lse : bool
+            Whether to return the LSE tensors for both prefill and decode.
+            Defaults to ``False``.
+        use_fp16_qk_reduction : bool
+            Whether to accumulate ``QK`` in FP16 (lower precision, higher
+            throughput).  Defaults to ``False``.
+        enable_pdl : Optional[bool]
+            Programmatic Dependent Launch toggle.  When ``None`` (default), the
+            wrapper auto-detects support from the query device.
+
+        Returns
+        -------
+        Union[Tuple[torch.Tensor, torch.Tensor], Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]]
+            By default ``(out_p, out_d)``: the prefill output and the decode
+            output.  When ``return_lse`` is ``True`` the return becomes
+            ``((out_p, lse_p), (out_d, lse_d))``.
+        """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q_p.device)
 
@@ -1195,7 +1351,3 @@ class BatchPODWithPagedKVCacheWrapper:
             out_d *= v_scale
 
         return ((out_p, out_d), (lse_p, lse_d)) if return_lse else (out_p, out_d)
-
-    def end_forward(self) -> None:
-        r"""Warning: this function is deprecated and has no effect."""
-        pass

@@ -937,7 +937,7 @@ class SSDKernel:
         if warp_idx == self.epilog_warp_id[0]:
             cute.arch.alloc_tmem(
                 self.num_tmem_cols_total,
-                smem_storage.tmem_holding_buf,
+                smem_storage.tmem_holding_buf.ptr,
                 is_two_cta=self.use_2cta_instrs,
             )
 
@@ -948,7 +948,7 @@ class SSDKernel:
         tmem_ptr_base = cute.arch.retrieve_tmem_ptr(
             self.acc_dtype,
             alignment=16,
-            ptr_to_buffer_holding_addr=smem_storage.tmem_holding_buf,
+            ptr_to_buffer_holding_addr=smem_storage.tmem_holding_buf.ptr,
         )
 
         # Specialized TMA load Delta/CumsumDelta/X/States warp
@@ -2718,6 +2718,7 @@ class SSDKernel:
             cluster_layout_vmnk,
             mma_tile_coord_v,
             block_in_cluster_coord_vmnk,
+            tile=self.tile_shape_mnk_intra2[1:],  # NK = (D, L)
         )
 
         # ((ATOM_V, REST_V), INPUT_STAGE)
@@ -2972,6 +2973,7 @@ class SSDKernel:
             cluster_layout_vmnk,
             mma_tile_coord_v,
             block_in_cluster_coord_vmnk,
+            tile=self.tile_shape_mnk_intra1[1:],  # NK = (L, N)
         )
 
         # ((ATOM_V, REST_V), INPUT_STAGE)
@@ -3362,8 +3364,8 @@ class SSDKernel:
     ):
         tiled_mma_intra1 = sm100_utils.make_trivial_tiled_mma(
             io_dtype,
-            tcgen05.OperandMajorMode("k"),  # A operand (C) is K-major (N-contiguous)
-            tcgen05.OperandMajorMode("k"),  # B operand (B) is K-major (N-contiguous)
+            cute.nvgpu.OperandMajorMode("k"),  # A operand (C) is K-major (N-contiguous)
+            cute.nvgpu.OperandMajorMode("k"),  # B operand (B) is K-major (N-contiguous)
             acc_dtype,
             cta_group,
             tile_shape_mnk_intra1[:2],
@@ -3371,8 +3373,10 @@ class SSDKernel:
         )
         tiled_mma_intra2 = sm100_utils.make_trivial_tiled_mma(
             io_dtype,
-            tcgen05.OperandMajorMode("k"),
-            tcgen05.OperandMajorMode("mn"),  # B operand (x) is N-major (D-contiguous)
+            cute.nvgpu.OperandMajorMode("k"),
+            cute.nvgpu.OperandMajorMode(
+                "mn"
+            ),  # B operand (x) is N-major (D-contiguous)
             acc_dtype,
             cta_group,
             tile_shape_mnk_intra2[:2],
@@ -3380,8 +3384,10 @@ class SSDKernel:
         )
         tiled_mma_inter1 = sm100_utils.make_trivial_tiled_mma(
             io_dtype,
-            tcgen05.OperandMajorMode("k"),
-            tcgen05.OperandMajorMode("mn"),  # B operand (x) is N-major (D-contiguous)
+            cute.nvgpu.OperandMajorMode("k"),
+            cute.nvgpu.OperandMajorMode(
+                "mn"
+            ),  # B operand (x) is N-major (D-contiguous)
             acc_dtype,
             cta_group,
             tile_shape_mnk_inter1[:2],
@@ -3389,8 +3395,8 @@ class SSDKernel:
         )
         tiled_mma_inter2 = sm100_utils.make_trivial_tiled_mma(
             io_dtype,
-            tcgen05.OperandMajorMode("k"),  # A operand (C) is K-major (N-contiguous)
-            tcgen05.OperandMajorMode("k"),
+            cute.nvgpu.OperandMajorMode("k"),  # A operand (C) is K-major (N-contiguous)
+            cute.nvgpu.OperandMajorMode("k"),
             acc_dtype,
             cta_group,
             tile_shape_mnk_inter2[:2],
@@ -3630,12 +3636,13 @@ class SSDKernel:
         cluster_layout_vmnk,
         mma_tile_coord_v,
         block_in_cluster_coord_vmnk,
+        tile,
     ):
         # Local_tile partition global tensors
         # (D, L, 1, 1, C, EH, B)
         gX = cute.local_tile(
             tma_tensor_x,
-            self.tile_shape_mnk_intra2[1:],  # mnk = (L, D, L)
+            tile,
             (None, None, None, None, None),
         )
         # Partition global tensor with regard to TiledMMA

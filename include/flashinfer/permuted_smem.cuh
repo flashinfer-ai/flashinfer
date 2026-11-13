@@ -173,6 +173,13 @@ struct smem_t {
                                                            reinterpret_cast<const b128_t*>(gptr));
   }
 
+  template <cp_async::SharedMemFillMode fill_mode, typename T>
+  __device__ __forceinline__ void load_64b_async(uint32_t offset, const T* gptr, bool predicate) {
+    b128_t* smem_ptr = base + offset;
+    cp_async::pred_load_128b_from_64b<cp_async::PrefetchMode::kPrefetch, fill_mode>(
+        smem_ptr, reinterpret_cast<const b128_t*>(gptr), predicate);
+  }
+
   template <typename T>
   __device__ __forceinline__ void store_128b(uint32_t offset, T* gptr) {
     *reinterpret_cast<b128_t*>(gptr) = *(base + offset);

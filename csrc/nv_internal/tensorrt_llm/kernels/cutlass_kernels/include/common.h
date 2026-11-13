@@ -27,8 +27,15 @@ enum class ActivationType {
   Geglu,
   SwigluBias,
   Relu2,
+  SwigluStep,
+  GegluTanh,
   Identity,
-  InvalidType
+  Situ,
+  InvalidType,
+  // CUTLASS-backend only (see cutlass_fused_moe_kernels.cuh). Keep existing
+  // activation values stable for the TRT-LLM backend.
+  ClampedRelu2 = 12,
+  PowLU = 13
 };
 
 }  // namespace tensorrt_llm::kernels::cutlass_kernels

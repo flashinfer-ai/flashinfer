@@ -237,6 +237,13 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
   int64_t q_stride_in_bytes;
   int64_t k_stride_in_bytes;
   int64_t v_stride_in_bytes;
+  // Paged KV uses 4D tensor, the tensor size is:
+  //   HND = [num_pages, H, page_size, D] or NHD = [num_pages, page_size, H, D]
+  // so need another pair of stride.
+  // x_stride_in_bytes means the stride of tensor_size[1]
+  // x_stride_in_bytes_2 means the stride of tensor_size[2]
+  int64_t k_stride_in_bytes_2;
+  int64_t v_stride_in_bytes_2;
 
   // Paged KV load.
   int blocks_per_tma_load;
@@ -247,6 +254,12 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
   uint32_t num_tiles;
   uint32_t num_tiles_per_head;
   bool use_balanced_scheduling;
+  // If all Q sequence lengths in the batch are equal, enables O(1) tile-id decode.
+  bool is_uniform_q = false;
+  // Under balanced scheduling, emit the heaviest q tile of EVERY batch/head before any
+  // lighter one (globally reverse-Q, head-fastest). Set by host only when entire KV fits in L2,
+  // because this order interleaves many heads' KV streams across concurrent CTAs.
+  bool use_head_first_scheduling = false;
 
   // In multi-query or grouped-query attention (MQA/GQA), several Q heads are associated with one KV
   // head

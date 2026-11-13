@@ -16,15 +16,20 @@ limitations under the License.
 
 import ctypes
 import hashlib
+import logging
 import os
 import pathlib
+import random
 from urllib.parse import urljoin
 import shutil
 import time
-from typing import Union
+from typing import TYPE_CHECKING, Union
 import uuid
 
 import filelock
+
+if TYPE_CHECKING:
+    import requests  # type: ignore[import-untyped]
 
 from .core import logger
 from .env import FLASHINFER_CUBIN_DIR
@@ -44,6 +49,28 @@ def safe_urljoin(base, path):
     return urljoin(base, path)
 
 
+def _log_error_response(response) -> None:
+    """Log an HTTP error response's headers and body at DEBUG level.
+
+    edge.urm.nvidia.com sits behind Akamai, which can reject a request (e.g. on
+    a rate or bot rule) before it reaches Artifactory. Its error page carries a
+    "Reference #" that the edge team needs to find the rule that fired, and the
+    response is gone once the retry loop moves on. This stays at DEBUG so it is
+    kept out of normal client logs; CI runs set FLASHINFER_LOGGING_LEVEL=DEBUG
+    and archive flashinfer_jit.log to retain it.
+    """
+    if response is None or not logger.isEnabledFor(logging.DEBUG):
+        return
+    headers = "".join(f"\n  {k}: {v}" for k, v in response.headers.items())
+    logger.debug(
+        "HTTP %d response from %s\nheaders:%s\nbody:\n%s",
+        response.status_code,
+        response.url,
+        headers,
+        response.text,
+    )
+
+
 def download_file(
     source: str,
     destination: str,
@@ -51,8 +78,10 @@ def download_file(
     delay: int = 5,
     timeout: int = 10,
     lock_timeout: int = 30,
-    session=None,
-):
+    session: "requests.Session | None" = None,
+    *,
+    expected_sha256: str | None = None,
+) -> bool | None:
     """
     Downloads a file from a URL or copies from a local path to a destination.
     If the filesystem supports atomic file rename operations, the destination file is
@@ -65,6 +94,8 @@ def download_file(
     - delay (int): Initial delay in seconds for exponential backoff (default: 5).
     - timeout (int): Timeout for the HTTP request in seconds (default: 10).
     - lock_timeout (int): Timeout in seconds for the file lock (default: 30).
+    - expected_sha256 (str | None): Reuse a matching cached file after acquiring
+      the lock. None preserves unconditional download/copy behavior.
 
     Returns:
     - bool: True if download or copy is successful, False otherwise.
@@ -81,6 +112,14 @@ def download_file(
     try:
         with lock:
             logger.info(f"Acquired lock for {destination}")
+
+            # Another worker may have populated the cache while we waited.
+            # Preserve that file's identity for readers such as the compiler.
+            if (
+                expected_sha256 is not None
+                and load_cubin(destination, expected_sha256) is not None
+            ):
+                return True
 
             temp_path = f"{destination}.{uuid.uuid4().hex}.tmp"
 
@@ -99,7 +138,7 @@ def download_file(
                         os.remove(temp_path)
 
             # Handle URL downloads with exponential backoff
-            for attempt in range(1, retries + 1):
+            for attempt in range(retries):
                 try:
                     response = session.get(source, timeout=timeout)
                     response.raise_for_status()
@@ -117,12 +156,19 @@ def download_file(
 
                 except requests.exceptions.RequestException as e:
                     logger.warning(
-                        f"Downloading {source}: attempt {attempt} failed: {e}"
+                        f"Downloading {source}: attempt {attempt + 1} failed: {e}"
                     )
+                    _log_error_response(e.response)
 
-                    if attempt < retries:
-                        backoff_delay = delay * (2 ** (attempt - 1))
-                        logger.info(f"Retrying in {backoff_delay} seconds...")
+                    if attempt < retries - 1:
+                        # Equal jitter: uniform[cap, 2*cap] with cap=base*2^attempt.
+                        # Preserves an exponentially-growing lower bound on the delay
+                        # so retries adapt to sustained congestion, while still
+                        # decorrelating the 4 parallel download threads (and many CI
+                        # runners) hitting the same CDN edge.
+                        backoff_cap = delay * (2**attempt)
+                        backoff_delay = backoff_cap + random.uniform(0, backoff_cap)  # noqa: S311
+                        logger.info(f"Retrying in {backoff_delay:.2f} seconds...")
                         time.sleep(backoff_delay)
                     else:
                         logger.error("Max retries reached. Download failed.")
@@ -136,6 +182,8 @@ def download_file(
             f"Failed to acquire lock for {destination} within {lock_timeout} seconds."
         )
         return False
+
+    return None
 
 
 def get_meta_hash(
@@ -171,12 +219,12 @@ def verify_cubin(cubin_path: str, expected_sha256: str) -> bool:
     return True
 
 
-def load_cubin(cubin_path: str, sha256: str) -> bytes:
+def load_cubin(cubin_path: str, sha256: str) -> bytes | None:
     """
-    Load a cubin from the provide local path and
+    Load a cubin from the provided local path and
     ensure that the sha256 signature matches.
 
-    Return None on failure.
+    Return its bytes (which may be empty) on success, or None on failure.
     """
     logger.debug(f"Loading from {cubin_path}")
     try:
@@ -194,10 +242,12 @@ def load_cubin(cubin_path: str, sha256: str) -> bytes:
             )
     except Exception:
         pass
-    return b""
+    return None
 
 
-def get_artifact(file_name: str, sha256: str, session=None) -> bytes:
+def get_artifact(
+    file_name: str, sha256: str, session: "requests.Session | None" = None
+) -> bytes:
     """Load an artifact (cubin, header, checksum, etc.) from the local cache.
 
     Checks ``FLASHINFER_CUBIN_DIR / file_name`` first.  If the file is missing
@@ -208,7 +258,7 @@ def get_artifact(file_name: str, sha256: str, session=None) -> bytes:
     """
     local_path = str(FLASHINFER_CUBIN_DIR / file_name)
     data = load_cubin(local_path, sha256)
-    if data:
+    if data is not None:
         return data
 
     if os.getenv("FLASHINFER_NO_DOWNLOAD"):
@@ -222,8 +272,8 @@ def get_artifact(file_name: str, sha256: str, session=None) -> bytes:
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
     uri = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, file_name)
     logger.info(f"Fetching {file_name} from {uri}")
-    download_file(uri, local_path, session=session)
-    return load_cubin(local_path, sha256)
+    download_file(uri, local_path, session=session, expected_sha256=sha256)
+    return load_cubin(local_path, sha256) or b""
 
 
 # Backward-compatible alias
@@ -236,7 +286,7 @@ def ensure_symlink(
     """Create or update a symlink, removing any stale file/directory at *link*.
 
     This is used to map C++ include paths (e.g.
-    ``CUBIN_DIR/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export``) to the
+    ``GEN_SRC_DIR/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export``) to the
     canonical artifact directory where ``get_artifact()`` stores downloaded files.
     """
     link = pathlib.Path(link)

@@ -22,6 +22,12 @@ import torch
 
 from .api_logging import flashinfer_api
 from .jit import gen_act_and_mul_module
+from .trace.templates.activation import (
+    gelu_and_mul_trace,
+    gelu_tanh_and_mul_trace,
+    silu_and_mul_scaled_nvfp4_experts_quantize_trace,
+    silu_and_mul_trace,
+)
 from .utils import (
     device_support_pdl,
     register_custom_op,
@@ -29,6 +35,12 @@ from .utils import (
     get_compute_capability,
 )
 from .quantization.fp4_quantization import get_fp4_quantization_module
+from .quantization.nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    _UNSET,
+    nvfp4_4over6_code,
+    resolve_nvfp4_4over6,
+)
 
 
 @functools.cache
@@ -57,6 +69,14 @@ def get_act_and_mul_module(act_func_name: str):
     return SimpleNamespace(**{fname: _act_and_mul})
 
 
+def _check_act_and_mul_input(input: torch.Tensor) -> None:
+    # The kernel picks a vector width that divides hidden_size, so any even
+    # last dimension (2 * hidden_size) is supported; it no longer has to be a
+    # multiple of 16 bytes.
+    if input.shape[-1] % 2 != 0:
+        raise ValueError("The last dimension must be even (2 * hidden_size).")
+
+
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
     assert input.shape[:-1] == output.shape[:-1], (
@@ -67,7 +87,7 @@ def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=silu_and_mul_trace)
 def silu_and_mul(
     input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None
 ) -> torch.Tensor:
@@ -81,11 +101,11 @@ def silu_and_mul(
         Input tensor, shape (..., 2 * hidden_size).
 
     out: Optional[torch.Tensor]
-        The output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor in place.
 
-    enable_pdl: bool
+    enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     Returns
     -------
@@ -94,8 +114,7 @@ def silu_and_mul(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
-        raise ValueError("The pointers must be multiple of 16 bytes.")
+    _check_act_and_mul_input(input)
     if out is not None:
         _check_shape(input, out)
     else:
@@ -112,7 +131,7 @@ def silu_and_mul(
     return out
 
 
-@flashinfer_api
+@flashinfer_api(trace=gelu_tanh_and_mul_trace)
 def gelu_tanh_and_mul(
     input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None
 ) -> torch.Tensor:
@@ -126,11 +145,11 @@ def gelu_tanh_and_mul(
         Input tensor, shape (..., 2 * hidden_size).
 
     out: Optional[torch.Tensor]
-        The output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor in place.
 
-    enable_pdl: bool
+    enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     Returns
     -------
@@ -139,8 +158,7 @@ def gelu_tanh_and_mul(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
-        raise ValueError("The pointers must be multiple of 16 bytes.")
+    _check_act_and_mul_input(input)
     if out is not None:
         _check_shape(input, out)
     else:
@@ -153,7 +171,7 @@ def gelu_tanh_and_mul(
     return out
 
 
-@flashinfer_api
+@flashinfer_api(trace=gelu_and_mul_trace)
 def gelu_and_mul(
     input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None
 ) -> torch.Tensor:
@@ -167,11 +185,11 @@ def gelu_and_mul(
         Input tensor, shape (..., 2 * hidden_size).
 
     out: Optional[torch.Tensor]
-        The output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor in place.
 
-    enable_pdl: bool
+    enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     Returns
     -------
@@ -180,8 +198,7 @@ def gelu_and_mul(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
-        raise ValueError("The pointers must be multiple of 16 bytes.")
+    _check_act_and_mul_input(input)
     if out is not None:
         _check_shape(input, out)
     else:
@@ -194,24 +211,56 @@ def gelu_and_mul(
     return out
 
 
-@flashinfer_api
+@flashinfer_api(trace=silu_and_mul_scaled_nvfp4_experts_quantize_trace)
 def silu_and_mul_scaled_nvfp4_experts_quantize(
     a,
     mask,
     a_global_sf,
+    # Appended last so existing positional construction keeps working.
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ):
+    r"""Fused SiLU + mul + per-expert NVFP4 quantization with a per-row mask.
+
+    Used by mixture-of-experts pipelines to fuse the SiLU-gated activation
+    of each expert with NVFP4 quantization, applying ``mask`` to skip rows
+    that do not belong to the current expert.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Input tensor of shape ``[B, M, 2 * K]`` with dtype fp16/bf16: the
+        gate half followed by the up half along the last dimension. The
+        output covers ``K`` columns, ``silu(gate) * up``.
+    mask : torch.Tensor
+        Valid row count per expert, shape ``[B]``, dtype ``int32``. Only the
+        first ``mask[b]`` rows of expert ``b`` are quantized; the entries of
+        ``x_q`` and ``sf`` for the remaining rows are unspecified.
+    a_global_sf : torch.Tensor
+        Global scale factor, one per expert: shape ``[B]``, dtype ``float32``.
+    nvfp4_4over6 : NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search. Requires fp16 / bf16 input.
+
+        - omitted (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables.
+        - ``None``: 4over6 off. The environment is ignored.
+        - :class:`NVFP44Over6Config`: on with exactly that recipe. The
+          environment is ignored.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(x_q, sf)`` where ``x_q`` has logical shape ``[M, K/2, B]``
+        with dtype ``FLOAT4_E2M1X2`` (the implementation permutes the
+        ``[B, M, K/2]`` physical layout so that the batch dim is last,
+        matching the grouped-GEMM expectation) and ``sf`` is the 6D
+        swizzled scale-factor tensor of logical shape
+        ``[32, 4, padded_M // 128, 4, padded_K // 64, B]`` viewed as
+        ``float8_e4m3fn``.  ``padded_M`` rounds ``M`` up to a multiple
+        of 128 and ``padded_K`` rounds ``K // sf_vec_size`` up to a
+        multiple of 4.  Here ``sf_vec_size`` is fixed at ``16`` (NVFP4),
+        matching :func:`flashinfer.quantization.nvfp4_quantize`.
     """
-    Silu and multiply and quantize batched input tensor to NVFP4 format with mask.
-    Parameters:
-        a (torch.Tensor): Input tensor of shape [B, M, K] with dtype fp16/bf16.
-        a_global_sf (torch.Tensor): Global scale factor of shape [1] with dtype float32.
-        mask (torch.Tensor): Mask tensor to apply before quantization.
-        sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-            - Quantized tensor of shape [B, M, K/2] with dtype FLOAT4_E2M1X2
-            - Scale factors tensor with shape determined by layout and sf_vec_size
-    """
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     major, minor = get_compute_capability(a.device)
     device_arch = f"{major * 10 + minor}"
     a_fp4, a_sf = get_fp4_quantization_module(
@@ -220,5 +269,6 @@ def silu_and_mul_scaled_nvfp4_experts_quantize(
         a,
         mask,
         a_global_sf,
+        nvfp4_4over6_code(nvfp4_4over6_config),
     )
     return a_fp4, a_sf

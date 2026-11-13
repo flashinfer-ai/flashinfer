@@ -162,10 +162,14 @@ __global__ void routingMainKernel(KernelParams params) {
                      : (expertSelected ? OutputT{0} : invalidScore);
 
   // initialize the mPtrExpertCounts
+  // Include the fused shared experts so the histogram/offset slots for the
+  // appended shared-expert ids (>= mNumExperts) are zeroed too. The permutation
+  // pipeline runs after run() bumps mNumExperts by mNumFusedSharedExperts, so it
+  // indexes counts over the full (routed + shared) expert range.
   if (params.mPtrExpertCounts) {
     int32_t globalThreadIdx = blockIdx.x * blockDim.x + threadIdx.x;
     int32_t globalThreadStride = gridDim.x * blockDim.x;
-    int32_t expertCountsNum = 2 * params.mNumExperts;
+    int32_t expertCountsNum = 2 * (params.mNumExperts + params.mNumFusedSharedExperts);
     initArr(globalThreadIdx, expertCountsNum, globalThreadStride, params.mPtrExpertCounts, 0);
   }
 
@@ -331,19 +335,37 @@ __global__ void routingMainKernel(KernelParams params) {
 
       float scoreNorm = laneIdx < params.mTopK ? smemScoreSigmoid[expertIdx] : 0.F;
       auto redNorm = cg::reduce(warp, scoreNorm, cg::plus<float>{});
-      auto finalScore = OutputT{scoreNorm * params.mRouteScale / redNorm};
+      auto finalScore = OutputT{scoreNorm * params.mRouteScale / (redNorm + params.mSumEpsilon)};
 
       // write expert idx out already
-      auto idxTopK = blockIdx.x * params.mTopK + laneIdx;
+      auto idxTopK = blockIdx.x * params.mTotalExpertsPerToken + laneIdx;
+      auto idxShared = blockIdx.x * params.mTotalExpertsPerToken + params.mTopK + laneIdx;
       if (laneIdx < params.mTopK && params.mPtrTopKPacked != nullptr) {
         PackedScoreIdx<OutputT> packedScore{static_cast<OutputT>(finalScore),
                                             static_cast<int16_t>(expertIdx)};
         params.mPtrTopKPacked[idxTopK] = packedScore;
       }
 
+      if (laneIdx < params.mNumFusedSharedExperts && params.mPtrTopKPacked != nullptr) {
+        PackedScoreIdx<OutputT> packedScore{static_cast<OutputT>(1.0F),
+                                            static_cast<int16_t>(params.mNumExperts + laneIdx)};
+        params.mPtrTopKPacked[idxShared] = packedScore;
+      }
+
       if (laneIdx < params.mTopK && params.mPtrTopKWeights != nullptr &&
           params.mPtrTopKIds == nullptr) {
         params.mPtrTopKWeights[idxTopK] = finalScore;
+      }
+
+      if (laneIdx < params.mNumFusedSharedExperts && params.mPtrTopKWeights != nullptr) {
+        params.mPtrTopKWeights[idxShared] = static_cast<OutputT>(1.0F);
+      }
+
+      // Routing replay is routed-only: [num_tokens, topK] with stride topK.
+      // Packed ids/weights use mTotalExpertsPerToken (= topK + fused shared).
+      auto idxReplay = blockIdx.x * params.mTopK + laneIdx;
+      if (params.mPtrRoutingReplayOut != nullptr && laneIdx < params.mTopK) {
+        params.mPtrRoutingReplayOut[idxReplay] = static_cast<int16_t>(expertIdx);
       }
     }
   }
@@ -401,6 +423,8 @@ __global__ void routingIndicesClusterKernel(KernelParams params) {
   assert(false && "routingIndicesClusterKernel is only supported on SM90+ architectures");
 }
 #endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static void launchClusterKernel(Data& data, int numThreadsHist, void* stream) {
   LAUNCH_ROUTING_DEEPSEEK(data,
@@ -477,8 +501,7 @@ void run(Data& data, void* stream) {
                        "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for "
                        "DeepSeek routing.");
     }
-    int const numThreadsHist = routingCustom::getMaxNumExperts(data.mNumExperts);
-    runPostTopKPipeline(data, numThreadsHist, stream);
+    runPostTopKPipeline(data, stream);
     return;
   }
 
@@ -521,67 +544,88 @@ void run(Data& data, void* stream) {
                      data.mNumLimitedGroups, data.mNumExpertGroups);
     FLASHINFER_CHECK(data.mNumExperts % 4 == 0,
                      "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
+
+    FLASHINFER_CHECK(data.mNumFusedSharedExperts <= WarpSize,
+                     "Number of fused shared experts (%d) must be less than warp size.",
+                     data.mNumFusedSharedExperts);
   }
 
+  int const numExperts = data.mNumExperts + data.mNumFusedSharedExperts;
+  // Bound the fused expert total so getMaxNumExperts() below cannot return 0
+  // (which would launch the histogram kernels with 0 threads). NumNemotronExperts
+  // is the largest tier getMaxNumExperts() supports.
+  FLASHINFER_CHECK(numExperts <= NumNemotronExperts,
+                   "Routing kernel expects total experts (routed + fused shared) <= %d, got %d "
+                   "(num_experts=%d, num_fused_shared_experts=%d)",
+                   NumNemotronExperts, numExperts, data.mNumExperts, data.mNumFusedSharedExperts);
+  int const topK = data.mTopK + data.mNumFusedSharedExperts;
+  int const numThreadsHist = getMaxNumExperts(numExperts);
+
+  FLASHINFER_CHECK(topK <= MaxSupportedTopExperts,
+                   "Routing kernel expects topK experts <= %d, got %d", MaxSupportedTopExperts,
+                   topK);
+
   int const numBlocks = data.mNumTokens;
-  int const numThreadsHist = getMaxNumExperts(data.mNumExperts);
-  bool const pdl = data.mUsePdl;
 
   // Step 1: Run DeepSeek-specific topK computation (writes to mPtrTopKPacked)
   int const numThreadsMain =
       std::max(data.mNumExpertGroups * WarpSize, getMaxNumExperts(data.mNumExperts));
-  data.mPdlOverlapWithNext = pdl;  // Intermediate — allow permutation pipeline to overlap
   launchMainKernel(data, numBlocks, numThreadsMain, stream);
+
+  // After main kernel: bump expert/topK counts to include shared experts
+  // so the permutation pipeline sees the full expanded expert set.
+  if (data.mNumFusedSharedExperts > 0) {
+    data.mNumExperts += data.mNumFusedSharedExperts;
+    data.mTopK += data.mNumFusedSharedExperts;
+    data.mNumLocalExperts += data.mNumFusedSharedExperts;
+  }
 
   // Step 2: Permutation pipeline (reads from mPtrTopKPacked written by step 1)
   if (data.mPtrPermutedIdxSize != nullptr) {
-    bool const useSingleCluster = data.mNumTokens <= 1024;
+    int numThreadsPerCluster = numThreadsHist * NumBlocksPerCluster;
+    bool const useSingleCluster =
+        data.mNumTokens <= 1024 && data.mNumTokens * topK <= numThreadsPerCluster;
     if (!useSingleCluster) {
       FLASHINFER_CHECK(data.mPtrExpertCounts != nullptr,
                        "When #tokens is large, `mPtrExpertCounts` is a required input.");
     } else {
-      data.mPtrExpertCounts =
-          nullptr;  // Set it to nullptr for single-cluster code path, as it won't be used
+      data.mPtrExpertCounts = nullptr;
     }
 
-    // Number of blocks we can use in the cooperative kernel
-    static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
-    // WAR: Reserve 8 SMs for overlapping kernels.
-    int const numBlocksCoop = smCount - 8;
-    // Maximum number of tokens supported by the kernel using a cooperative launch.
-    int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;
-
     if (useSingleCluster) {
-      data.mPdlOverlapWithNext = false;  // Last kernel
       launchClusterKernel(data, numThreadsHist, stream);
-    } else if (data.mNumTokens <= maxTokensCoop) {
-      data.mPdlOverlapWithNext = false;  // Last kernel
-      launchCoopKernel(data, numBlocksCoop, numThreadsHist, stream);
     } else {
-      const int32_t expandedIdxSize = data.mNumTokens * data.mTopK;
-      const int32_t histogramEltsPerBlock = 8 * numThreadsHist;
-      const int32_t offsetEltsPerBlock = NumEltsPerOffsetTilePerThread * numThreadsHist;
+      static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+      CoopLaunchSMCounts const coopLaunchSMCounts = getCoopLaunchSMCounts(smCount);
+      int const numBlocksCoop = coopLaunchSMCounts.moeSms;
+      int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;
 
-      // Limit grid size (both kernels use a grid-stride loop).
-      const int32_t maxNumBlocks = 1024;
+      if (data.mNumTokens <= maxTokensCoop) {
+        logCoopLaunchSMCounts(coopLaunchSMCounts);
+        launchCoopKernel(data, numBlocksCoop, numThreadsHist, stream);
+      } else {
+        const int32_t expandedIdxSize = data.mNumTokens * data.mTopK;
+        const int32_t histogramEltsPerBlock = 8 * numThreadsHist;
+        const int32_t offsetEltsPerBlock = NumEltsPerOffsetTilePerThread * numThreadsHist;
+        const int32_t maxNumBlocks = 1024;
 
-      int const numBlocksHistogram = std::min(
-          (expandedIdxSize + histogramEltsPerBlock - 1) / histogramEltsPerBlock, maxNumBlocks);
-      int const numBlocksOffsets =
-          std::min((expandedIdxSize + offsetEltsPerBlock - 1) / offsetEltsPerBlock, maxNumBlocks);
+        int const numBlocksHistogram = std::min(
+            (expandedIdxSize + histogramEltsPerBlock - 1) / histogramEltsPerBlock, maxNumBlocks);
+        int const numBlocksOffsets =
+            std::min((expandedIdxSize + offsetEltsPerBlock - 1) / offsetEltsPerBlock, maxNumBlocks);
 
-      data.mPdlOverlapWithNext = pdl;  // Intermediate
-      launchHistogramKernel(data, numBlocksHistogram, numThreadsHist, stream);
-      data.mPdlOverlapWithNext = false;  // Last kernel
-      launchOffsetsKernel(data, numBlocksOffsets, numThreadsHist, stream);
+        launchHistogramKernel(data, numBlocksHistogram, numThreadsHist, stream);
+        launchOffsetsKernel(data, numBlocksOffsets, numThreadsHist, stream);
+      }
     }
   }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+}  // namespace routingDeepSeek
+
 #undef LAUNCH_DEEPSEEK_WITH_TOPK
 #undef LAUNCH_ROUTING_DEEPSEEK
 
-}  // namespace routingDeepSeek
 }  // namespace moe::dev::routing
