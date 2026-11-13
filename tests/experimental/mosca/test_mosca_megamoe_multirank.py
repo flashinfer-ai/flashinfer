@@ -448,7 +448,9 @@ def _replays_match_eager(ctx, layer, rows, seed_of, warm_rows) -> bool:
         graph.replay()
         torch.cuda.synchronize()
         dist.barrier(group=ctx["group"])
-        ok = ok and torch.equal(out, _fwd(layer, *fresh))
+        # Every rank runs every eager forward (a collective), whatever ``ok``.
+        eager = _fwd(layer, *fresh)
+        ok = torch.equal(out, eager) and ok
     del graph
     return ok
 
@@ -494,6 +496,39 @@ def test_precompile_off_is_refused_with_more_than_one_rank(ctx) -> None:
         pytest.skip("allowed with one rank")
     with pytest.raises(MoEEpConfigError, match="precompile=False"):
         ctx["mosca"](small_t=True, precompile=False)
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_blackwell
+def test_a_preparation_failure_on_one_rank_raises_on_every_rank(
+    ctx, monkeypatch
+) -> None:
+    # A rank whose planner build fails must not leave its peers waiting in the
+    # symmetric-memory rendezvous: every rank raises before allocating.
+    from flashinfer.experimental.mosca.megamoe import jit
+    from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
+
+    if ctx["world"] == 1:
+        pytest.skip("needs more than one rank")
+    # A num_sms no other layer uses, so the workspace pool has nothing to reuse.
+    layer = ctx["mosca"](small_t=True, num_sms=96)
+    if ctx["rank"] == 1:
+
+        def broken():
+            raise RuntimeError("injected planner build failure")
+
+        monkeypatch.setattr(jit, "host_module", broken)
+    expected, match = (
+        (RuntimeError, "injected")
+        if ctx["rank"] == 1
+        else (MoEEpConfigError, "failed on another EP rank")
+    )
+    try:
+        with pytest.raises(expected, match=match):
+            _fwd(layer, *_inputs(ctx, 1, 51))
+    finally:
+        monkeypatch.undo()
+        layer.destroy()
 
 
 @pytest.mark.gpu_2

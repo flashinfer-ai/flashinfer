@@ -275,14 +275,25 @@ def main() -> None:
                 for c in slices
             ]
             full = torch.empty(count, HIDDEN, device=device, dtype=torch.bfloat16)
+            ref = torch.empty_like(full)
+
+            def all_gather_rows(ref=ref, gathered=gathered, part=part, slices=slices):
+                # The post-MoE all-gather of a framework: every rank ends with
+                # the contiguous [count, hidden] batch, as the MOSCA arm's output.
+                if len(set(slices)) == 1:
+                    dist.all_gather_into_tensor(ref, part, group=group)
+                else:
+                    dist.all_gather(gathered, part, group=group)
+                    torch.cat(gathered, out=ref)
+
             arms = {
                 "mosca_replicated": lambda i: _forward(mosca[i % L], x, ids, w, full),
-                "nccl_ag_only": lambda i: dist.all_gather(gathered, part, group=group),
+                "nccl_ag_only": lambda i: all_gather_rows(),
             }
             if deepgemm:
                 arms["deepgemm+nccl_ag"] = lambda i: (
                     _forward(deepgemm[i % L], xs, ids_s, ws, part),
-                    dist.all_gather(gathered, part, group=group),
+                    all_gather_rows(),
                 )
                 arms["deepgemm_only"] = lambda i: _forward(
                     deepgemm[i % L], xs, ids_s, ws, part
