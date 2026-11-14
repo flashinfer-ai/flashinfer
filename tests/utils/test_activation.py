@@ -128,17 +128,38 @@ def test_act_and_mul_cuda_graph():
     torch.testing.assert_close(y2, y2_ref, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("shape", [(0, 2048), (2, 0, 2048)])
+@pytest.mark.parametrize("act", ["silu", "gelu", "gelu_tanh"])
+@pytest.mark.parametrize("shape", [(0, 2048), (2, 0, 2048), (4, 0)])
+def test_act_and_mul_jit_zero_tokens(act, shape):
+    x = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+    expected_shape = shape[:-1] + (shape[-1] // 2,)
+    out = torch.empty(expected_shape, device=x.device, dtype=x.dtype)
+
+    # Directly invoke the generated JIT FFI function.
+    module = flashinfer.activation.gen_act_and_mul_module(act).build_and_load()
+    fn = getattr(module, f"{act}_and_mul")
+    fn(out, x, False)
+
+    assert out.shape == expected_shape
+    assert out.numel() == 0
+
+@pytest.mark.parametrize(
+    "op", ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul"]
+)
+@pytest.mark.parametrize("shape", [(0, 2048), (2, 0, 2048), (4, 0)])
 @pytest.mark.parametrize("use_out", [False, True])
-def test_silu_and_mul_zero_tokens(shape, use_out):
+def test_act_and_mul_zero_tokens(op, shape, use_out):
     x = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
     expected_shape = shape[:-1] + (shape[-1] // 2,)
 
     out = (
-        torch.empty(expected_shape, device=x.device, dtype=x.dtype) if use_out else None
+        torch.empty(expected_shape, device=x.device, dtype=x.dtype)
+        if use_out
+        else None
     )
 
-    y = flashinfer.activation.silu_and_mul(x, out=out)
+    fn = getattr(flashinfer.activation, op)
+    y = fn(x, out=out)
 
     assert y.shape == expected_shape
     assert y.numel() == 0
@@ -147,7 +168,6 @@ def test_silu_and_mul_zero_tokens(shape, use_out):
 
     if use_out:
         assert y is out
-
 
 if __name__ == "__main__":
     test_fused_silu_mul(128, 1, 1, True)

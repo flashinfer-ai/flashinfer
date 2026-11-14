@@ -170,6 +170,8 @@ def gelu_tanh_and_mul(
             device=input.device,
             dtype=input.dtype,
         )
+    if input.numel() == 0:
+        return out
     get_act_and_mul_module("gelu_tanh").gelu_tanh_and_mul(out, input, enable_pdl)
     return out
 
@@ -210,6 +212,8 @@ def gelu_and_mul(
             device=input.device,
             dtype=input.dtype,
         )
+    if input.numel() == 0:
+        return out
     get_act_and_mul_module("gelu").gelu_and_mul(out, input, enable_pdl)
     return out
 
