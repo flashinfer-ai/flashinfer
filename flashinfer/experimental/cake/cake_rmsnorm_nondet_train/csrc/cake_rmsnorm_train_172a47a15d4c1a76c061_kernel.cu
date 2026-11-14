@@ -449,7 +449,7 @@ kernel_cake_rmsnorm_train_172a47a15d4c1a76c061(__nv_bfloat16* __restrict__ g, __
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_0[_lp*2 + 0], out_0[_lp*2+1 + 0]));
                         packed_0[_lp] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int4*>(dx + ((unsigned long long)(row_begin + it0 * 8 + rg) * 256 + (unsigned long long)(tir * 8)))[0] = reinterpret_cast<int4*>(packed_0)[0];
+                    reinterpret_cast<int4*>(dx + ((unsigned long long)(row_begin + it0 * 8 + rg) * 256ull + (unsigned long long)(tir * 8)))[0] = reinterpret_cast<int4*>(packed_0)[0];
                 }
             }
             if (n_iters > it0 + 1) {
@@ -609,7 +609,7 @@ kernel_cake_rmsnorm_train_172a47a15d4c1a76c061(__nv_bfloat16* __restrict__ g, __
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_1[_lp*2 + 0], out_1[_lp*2+1 + 0]));
                         packed_1[_lp] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int4*>(dx + ((unsigned long long)(row_begin + (it0 + 1) * 8 + rg) * 256 + (unsigned long long)(tir * 8)))[0] = reinterpret_cast<int4*>(packed_1)[0];
+                    reinterpret_cast<int4*>(dx + ((unsigned long long)(row_begin + (it0 + 1) * 8 + rg) * 256ull + (unsigned long long)(tir * 8)))[0] = reinterpret_cast<int4*>(packed_1)[0];
                 }
             }
         }

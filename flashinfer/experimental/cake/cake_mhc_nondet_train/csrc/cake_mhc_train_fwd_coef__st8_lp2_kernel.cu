@@ -112,11 +112,11 @@ kernel_cake_mhc_train_fwd_coef__st8_lp2(float* __restrict__ spart, float* __rest
     float qvl[2];
     int g0 = (int)bid;
     if (p_k <= 8) {
-        long long sl_row_a = (long long)g0 * 8;
+        long long sl_row_a = (long long)g0 * 8ll;
         int sl_i_a0 = ((nf4 > tid_2) ? tid_2 : nf4 - 1);
         int sl_plane_a0 = sl_i_a0 / 48;
         int sl_within_a0 = sl_i_a0 - sl_plane_a0 * 48;
-        long long sl_src_a0 = ((long long)sl_plane_a0 * tp64 + sl_row_a) * 24 + (long long)(sl_within_a0 * 4);
+        long long sl_src_a0 = ((long long)sl_plane_a0 * tp64 + sl_row_a) * 24ll + (long long)(sl_within_a0 * 4);
         {
             float4 _v4 = *reinterpret_cast<const float4*>(spart + sl_src_a0 + 0);
             vbuf[0 + 0] = _v4.x;
@@ -127,7 +127,7 @@ kernel_cake_mhc_train_fwd_coef__st8_lp2(float* __restrict__ spart, float* __rest
         int sl_i_a1 = ((nf4 > tid_2 + 128) ? tid_2 + 128 : nf4 - 1);
         int sl_plane_a1 = sl_i_a1 / 48;
         int sl_within_a1 = sl_i_a1 - sl_plane_a1 * 48;
-        long long sl_src_a1 = ((long long)sl_plane_a1 * tp64 + sl_row_a) * 24 + (long long)(sl_within_a1 * 4);
+        long long sl_src_a1 = ((long long)sl_plane_a1 * tp64 + sl_row_a) * 24ll + (long long)(sl_within_a1 * 4);
         {
             float4 _v4 = *reinterpret_cast<const float4*>(spart + sl_src_a1 + 0);
             vbuf[4 + 0] = _v4.x;
@@ -138,7 +138,7 @@ kernel_cake_mhc_train_fwd_coef__st8_lp2(float* __restrict__ spart, float* __rest
         int sl_i_a2 = ((nf4 > tid_2 + 256) ? tid_2 + 256 : nf4 - 1);
         int sl_plane_a2 = sl_i_a2 / 48;
         int sl_within_a2 = sl_i_a2 - sl_plane_a2 * 48;
-        long long sl_src_a2 = ((long long)sl_plane_a2 * tp64 + sl_row_a) * 24 + (long long)(sl_within_a2 * 4);
+        long long sl_src_a2 = ((long long)sl_plane_a2 * tp64 + sl_row_a) * 24ll + (long long)(sl_within_a2 * 4);
         {
             float4 _v4 = *reinterpret_cast<const float4*>(spart + sl_src_a2 + 0);
             vbuf[8 + 0] = _v4.x;
@@ -203,10 +203,10 @@ kernel_cake_mhc_train_fwd_coef__st8_lp2(float* __restrict__ spart, float* __rest
                 long long k64 = (long long)k_1 * tp64;
                 long long plane = k64 + tcr[0];
                 float _add_5;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_5) : "f"(s_acc[0]), "f"(spart[plane * 24 + n64]));
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_5) : "f"(s_acc[0]), "f"(spart[plane * 24ll + n64]));
                 s_acc[0] = _add_5;
                 float _add_6;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_6) : "f"(s_acc[1]), "f"(spart[plane * 24 + (24 + n64)]));
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_6) : "f"(s_acc[1]), "f"(spart[plane * 24ll + (24ll + n64)]));
                 s_acc[1] = _add_6;
             }
             #pragma unroll
@@ -646,16 +646,16 @@ kernel_cake_mhc_train_fwd_coef__st8_lp2(float* __restrict__ spart, float* __rest
             int tok = tokr[j_5];
             long long tc64 = tcr[j_5];
             if (tok < T) {
-                long long row = tc64 * 64;
+                long long row = tc64 * 64ll;
                 if (lane_0 == 0) {
                     *(reinterpret_cast<float*>(stats + row) + (0)) = rr[j_5];
                 }
                 if (lane_0 < 24) {
-                    *(reinterpret_cast<float*>(stats + (row + 1 + lane64)) + (0)) = zz[j_5];
-                    *(reinterpret_cast<float*>(stats + (row + 25 + lane64)) + (0)) = cc[j_5];
+                    *(reinterpret_cast<float*>(stats + (row + 1ll + lane64)) + (0)) = zz[j_5];
+                    *(reinterpret_cast<float*>(stats + (row + 25ll + lane64)) + (0)) = cc[j_5];
                 }
                 if (lane_0 < 15) {
-                    *(reinterpret_cast<float*>(stats + (row + 49 + lane64)) + (0)) = 0.0f;
+                    *(reinterpret_cast<float*>(stats + (row + 49ll + lane64)) + (0)) = 0.0f;
                 }
             }
         }

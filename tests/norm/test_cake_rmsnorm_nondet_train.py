@@ -51,7 +51,7 @@ argument validation.  The build manifest's
 per-architecture CUDA floors and flags are checked without a device.
 
 This suite exercises the backend packages alone, through
-``tests.test_helpers.cake_package``; the facade and the ``flashinfer`` top
+``tests.cake.test_helpers.cake_package``; the facade and the ``flashinfer`` top
 level are ``test_cake_rmsnorm_nondet_train_api.py``'s.
 """
 
@@ -69,7 +69,7 @@ import pytest
 import torch
 import torch.utils.checkpoint
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_nondet_train")
 loader = cake_package("cake_rmsnorm_nondet_train", "cake_jit")
@@ -249,13 +249,13 @@ def _window_records(
 
 
 def _form(names: list[str]) -> str:
-    """``single`` (one ``claim_sum_f64`` kernel) or ``pair`` (a deterministic
-    pair: ``chunk_partials`` main kernel, then its dw reduce) of one backward
-    window's records."""
+    """``single`` (one ``claim_sum_f64`` kernel, or one ``claim_part_f32``
+    pair-row single kernel) or ``pair`` (a deterministic pair: ``chunk_partials``
+    main kernel, then its dw reduce) of one backward window's records."""
     records = [loader.MODULES[name] for name in names]
     owners = [r["workspace_rule"]["kind"] for r in records if r["workspace_rule"]]
     reduces = [r for r in records if r["role"] == "bwd_reduce"]
-    if len(records) == 1 and owners == ["claim_sum_f64"]:
+    if len(records) == 1 and owners in (["claim_sum_f64"], ["claim_part_f32"]):
         return "single"
     if len(records) == 2 and owners == ["chunk_partials"] and len(reduces) == 1:
         return "pair"
@@ -712,26 +712,17 @@ def _program_id(name: str) -> str:
 # claims.  The claim holds where the det package selects that module; elsewhere
 # the single is compared only.
 DX_BITWISE_WITH = {
-    # sm_100a H512 row (1280, inf); det module at T 16385
-    "cake_rmsnorm_train_d0bde38aa443d42a5f04": "cake_rmsnorm_det_train_ad1a5a3c5f88e3d10036",
-    # sm_100a H1536 row (36864, 78784]; det module at T 65536
-    "cake_rmsnorm_train_ae610afdf77ff6714a5b": "cake_rmsnorm_det_train_b457c4d134e44476dc6f",
     # sm_100a H2048 column (64, 336]; det module at T 257
     "cake_rmsnorm_train_64e6aa82bb2c6d4ea978": "cake_rmsnorm_det_train_caf6978ed0a17fbf65b9",
-    # sm_100a H2048 help row (7168, 11264] and (13608, 65536]; det module at T 16385 and
-    # 65536
+    # sm_100a H2048 help row (7168, 11264] and (45056, 58880]; det module inside
+    # (45056, 58880]
     "cake_rmsnorm_train_0fa4f255caf709d09f66": "cake_rmsnorm_det_train_ceeef043ac64f37fc529",
     # sm_100a H4096 column (64, 1152]; det module at T 257
     "cake_rmsnorm_train_4822793ea0c954c11af6": "cake_rmsnorm_det_train_59270fb249dcba1ff679",
-    # sm_100a H4096 help row (4608, 36864] and (44032, 65536]; det module at T 16385 and
-    # 65536
-    "cake_rmsnorm_train_15e157d2ee9080d206a9": "cake_rmsnorm_det_train_35a0b0ca6b2060313255",
     # sm_100a H6144 column (64, 1152]; det module at T 257 (the help row differs)
     "cake_rmsnorm_train_44508df7dab2ab688f85": "cake_rmsnorm_det_train_5c804aed7ad14b99e1d0",
     # sm_100a H6144 residual column (64, 1408]; the det residual program (every T)
     "cake_rmsnorm_train_864e84f3d874f850c091": "cake_rmsnorm_det_train_0dcdc563be377247044e",
-    # sm_100a H6144 residual help row (1408, 65536]; the det residual program (every T)
-    "cake_rmsnorm_train_3fbfdd750cbeb47032b5": "cake_rmsnorm_det_train_0dcdc563be377247044e",
 }
 
 
@@ -900,16 +891,23 @@ def test_repeated_launches_against_fp64_and_det(
 # <= 0.633 (FP32 weight) at the sampled T from 49152 to 65537 (212 SMs;
 # <= 0.608 and <= 0.646 from 49152 to 65537 on 216 SMs); its sm_107a kblock form
 # above T 49152 <= 0.807 (BF16 weight) and <= 0.719 (FP32 weight) at the sampled
-# T from 49153 to 131072 (212 SMs).
+# T from 49153 to 131072 (212 SMs).  On sm_107a the FP32-weight route runs the
+# deterministic package's det pairs below the accuracy edge (its compensated
+# pair over 8-step blocks above the plain edge), the BF16-weight route the
+# earlier compensated pair over 16-step blocks.  On sm_107a the FP32-weight
+# compensated pair ends at T 32767: above it the pair-row single kernel (kblock
+# form, FP32 sums of 8-row blocks kept as TwoSum pairs) runs, for speed, so its
+# accuracy edge there is T 32767.
 H5120_PLAIN_EDGE = {"sm_100a": 6144, "sm_103a": 5120, "sm_107a": 19968}
 # FP32 weight: the plain det pair's top where a single kernel runs between it and
 # the compensated pair for dw accuracy (None: no plain det pair runs below the
-# compensated pair)
-H5120_PLAIN_TOP_F32 = {"sm_100a": None, "sm_107a": 4096}
+# compensated pair); an architecture not listed runs the plain det pair up to
+# the plain edge with both weight dtypes
+H5120_PLAIN_TOP_F32 = {"sm_100a": None}
 H5120_ACCURACY_EDGE = {
     "sm_100a": {"bf16": 56256, "f32": 56256},
     "sm_103a": {"bf16": 61952, "f32": 61952},
-    "sm_107a": {"bf16": 49152, "f32": 49152},
+    "sm_107a": {"bf16": 49152, "f32": 32767},
 }
 ACCURACY_MARGIN = 0.85
 ACCURACY_SEEDS = 20

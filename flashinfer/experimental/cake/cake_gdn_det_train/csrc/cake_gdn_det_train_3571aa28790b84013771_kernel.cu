@@ -97,8 +97,8 @@ kernel_cake_gdn_det_train_3571aa28790b84013771(__nv_bfloat16* __restrict__ qn, _
             }
             long long tok_a = (long long)(tok0 + row_a);
             long long tok_b = (long long)(tok0 + row_b_src);
-            long long qbase_a = (tok_a * (long long)num_heads + (long long)hq) * 128 + (long long)(lane_0 * 4);
-            long long qbase_b = (tok_b * (long long)num_heads + (long long)hq) * 128 + (long long)(lane_0 * 4);
+            long long qbase_a = (tok_a * (long long)num_heads + (long long)hq) * 128ll + (long long)(lane_0 * 4);
+            long long qbase_b = (tok_b * (long long)num_heads + (long long)hq) * 128ll + (long long)(lane_0 * 4);
             {
                 uint2 _vld_0;
                 _vld_0 = *reinterpret_cast<const uint2*>(qn + qbase_a);
@@ -159,12 +159,12 @@ kernel_cake_gdn_det_train_3571aa28790b84013771(__nv_bfloat16* __restrict__ qn, _
             dk_b[1] = 0.0f;
             dk_b[2] = 0.0f;
             dk_b[3] = 0.0f;
-            long long vbase_a = (tok_a * (long long)num_v_heads + (long long)hv0) * 128 + (long long)(lane_0 * 4);
-            long long vbase_b = (tok_b * (long long)num_v_heads + (long long)hv0) * 128 + (long long)(lane_0 * 4);
+            long long vbase_a = (tok_a * (long long)num_v_heads + (long long)hv0) * 128ll + (long long)(lane_0 * 4);
+            long long vbase_b = (tok_b * (long long)num_v_heads + (long long)hv0) * 128ll + (long long)(lane_0 * 4);
             #pragma unroll 1
             for (int gi = 0; gi < group; gi++) {
-                long long va = vbase_a + (long long)gi * 128;
-                long long vb = vbase_b + (long long)gi * 128;
+                long long va = vbase_a + (long long)gi * 128ll;
+                long long vb = vbase_b + (long long)gi * 128ll;
                 {
                     uint2 _vld_4;
                     _vld_4 = *reinterpret_cast<const uint2*>(dq_hv + va);

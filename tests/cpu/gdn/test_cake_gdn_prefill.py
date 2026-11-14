@@ -948,7 +948,9 @@ def test_ragged_dvsplit_route_is_the_twin_of_the_resolved_record(monkeypatch) ->
             assert got is None
         elif contract:
             assert base.route_id == "flashinfer.gdn_prefill.noncp.full_dv"
-            assert got == routes[base.variant_name]
+            # Without the map a batch of at most 2048 tokens per sequence runs the key's
+            # vec2-full twin; the map is keyed by the shared record it replaces.
+            assert got == routes[_vec2full_shared_name(base.variant_name)]
             routed += 1
             routed_contracts.add(key)
         else:
@@ -1058,3 +1060,318 @@ def test_ragged_dvsplit_rule_limits_follow_the_position_of_the_longest_sequence(
     lens = (64,) * 30 + (32768,) + (64,) * 30  # Hq2/Hv4
     assert _ragged_dvsplit_load_fits(4, lens) and lens[0] != max(lens)
     assert _sm107a_fp32_state_route((2, 4), lens).one_cta_per_tile is True
+
+
+# The sm_107a vec2-full twins of the three shared full-DV records (``_VEC2FULL_SHARED_SCHEDULES``):
+# contract overrides (on the BF16-I/O FP32-state kwargs) -> its twin head geometries.
+_VEC2FULL_CONTRACTS = {
+    "bf16_state": (
+        {"state_dtype": "bfloat16"},
+        ((2, 8), (4, 8), (4, 16), (8, 16), (8, 32), (16, 32)),
+    ),
+    "no_initial_state": ({"use_initial_state": False}, ((16, 32), (16, 64))),
+    "f16_io_no_initial_state": (
+        {"io_dtype": "float16", "use_initial_state": False},
+        ((16, 32), (16, 64)),
+    ),
+}
+_VEC2FULL_CASES = tuple(
+    pytest.param(overrides, heads, id=f"{contract}-hq{heads[0]}-hv{heads[1]}")
+    for contract, (overrides, geometries) in _VEC2FULL_CONTRACTS.items()
+    for heads in geometries
+)
+
+
+def _vec2full_shared_name(name):
+    """The shared record a vec2-full twin record name stands beside (other names unchanged)."""
+
+    return name.replace("_sm107a_vec2full_i64meta_", "_sm107a_i64meta_")
+
+
+def _vec2full_twin_name(name):
+    return name.replace("_sm107a_i64meta_", "_sm107a_vec2full_i64meta_")
+
+
+def _full_dv_seqs(heads):
+    """A sequence count over the DV-split tile budget (``2 * n * max(Hq, Hv) > 212``)."""
+
+    return 212 // (2 * max(heads)) + 1
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("overrides", "heads"), _VEC2FULL_CASES)
+def test_vec2full_twin_follows_the_longest_sequence(overrides, heads) -> None:
+    """A full-DV batch of the three contracts runs the key's vec2-full twin when its longest
+    sequence spans at most 32 chunks (2048 tokens) and the shared record above that, with or
+    without the host lengths (equal lengths never take the ragged DV-split route)."""
+
+    num_seqs = _full_dv_seqs(heads)
+    for length, twin in (
+        (2048, True),
+        (1985, True),
+        (1, True),
+        (2049, False),
+        (4096, False),
+        (8192, False),
+    ):
+        lens = (length,) * num_seqs
+        for host in (True, False):
+            route = _sm107a_fp32_state_route(heads, lens, host=host, **overrides)
+            assert route.route_id == "flashinfer.gdn_prefill.noncp.full_dv", route
+            assert route.one_cta_per_tile is False and route.metadata_i64 is True
+            assert ("_sm107a_vec2full_i64meta_" in route.variant_name) is twin, (
+                length,
+                route,
+            )
+            record = cake_gdn._kernel_record(route.variant_name)
+            schedule = record["source_schedule"].rsplit(":", 1)[-1]
+            if twin:
+                schedule = _vec2full_shared_name(route.variant_name)
+                schedule = cake_gdn._kernel_record(schedule)["source_schedule"]
+                schedule = schedule.rsplit(":", 1)[-1]
+            assert schedule in cake_gdn._VEC2FULL_SHARED_SCHEDULES, route
+    assert cake_gdn._prefill_tile_chunks(2048) == cake_gdn._VEC2FULL_MAX_TILE_CHUNKS
+    assert cake_gdn._prefill_tile_chunks(2049) > cake_gdn._VEC2FULL_MAX_TILE_CHUNKS
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("overrides", "heads"), _VEC2FULL_CASES)
+def test_vec2full_twin_needs_a_bound_of_at_most_2048_tokens(overrides, heads) -> None:
+    """``max_seq_len`` is an upper bound: with the packed length as the bound (no host lengths,
+    no hint) the batch keeps the shared record; with an exact hint it runs the twin."""
+
+    lens = (1500,) * _full_dv_seqs(heads)  # the packed length is above 2048 tokens
+    exact = _sm107a_fp32_state_route(heads, lens, host=False, **overrides)
+    loose = _sm107a_fp32_state_route(
+        heads, lens, host=False, max_seq_len=sum(lens), **overrides
+    )
+    assert "_sm107a_vec2full_i64meta_" in exact.variant_name, exact
+    assert loose.variant_name == _vec2full_shared_name(exact.variant_name), loose
+    assert loose.route_id == exact.route_id == "flashinfer.gdn_prefill.noncp.full_dv"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("overrides", "heads", "lens"),
+    (
+        ({"state_dtype": "bfloat16"}, (8, 32), (2048,) + (64,) * 3),
+        ({"use_initial_state": False}, (16, 32), (2048,) + (64,) * 7),
+        (
+            {"io_dtype": "float16", "use_initial_state": False},
+            (16, 64),
+            (2048, 1),
+        ),
+    ),
+    ids=("bf16_state", "no_initial_state", "f16_io_no_initial_state"),
+)
+def test_vec2full_twin_leaves_the_ragged_dvsplit_route_first(
+    monkeypatch, overrides, heads, lens
+) -> None:
+    """A ragged batch of at most 2048 tokens per sequence that the ragged DV-split rule routes
+    runs the DV-split record; without the host lengths (or without the route) it runs the
+    vec2-full twin of the full-DV key the route would have replaced."""
+
+    assert _ragged_dvsplit_load_fits(max(heads), lens)
+    routed = _sm107a_fp32_state_route(heads, lens, **overrides)
+    assert routed.route_id == "flashinfer.gdn_prefill.noncp.dvsplit"
+    assert routed.one_cta_per_tile is True
+    twin = _sm107a_fp32_state_route(heads, lens, host=False, **overrides)
+    assert "_sm107a_vec2full_i64meta_" in twin.variant_name, twin
+    assert (
+        cake_gdn._ragged_dvsplit_routes()[_vec2full_shared_name(twin.variant_name)]
+        == routed
+    )
+    monkeypatch.setattr(cake_gdn, "_ragged_dvsplit_routes", lambda: {})
+    resolve = cake_gdn.select_cake_gdn_prefill_variant.__wrapped__
+    assert resolve(**_sm107a_fp32_state_kwargs(heads, lens, **overrides)) == twin
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("heads", "lens", "overrides"),
+    (
+        # the gate-stream twin (and its prefetch twin) of the BF16-state contract
+        ((8, 32), (256,) * 64, {"state_dtype": "bfloat16"}),
+        ((2, 8), (256,) * 64, {"state_dtype": "bfloat16"}),
+        # the indexed BF16-state record of the same contract
+        (
+            (32, 32),
+            (256,) * 4,
+            {"state_dtype": "bfloat16", "use_state_indices": True},
+        ),
+        # the FP16-I/O FP32-state checkpoint route without an initial state
+        (
+            (16, 64),
+            (256,) * 2,
+            {
+                "io_dtype": "float16",
+                "use_initial_state": False,
+                "checkpoint_every_n_tokens": 64,
+            },
+        ),
+        # the stateless bodies and the other contracts' full-DV records
+        ((16, 64), (64,) * 2, {"use_initial_state": False, "store_final_state": False}),
+        ((8, 32), (1024,) * 8, {}),
+        ((8, 32), (1024,) * 8, {"io_dtype": "float16"}),
+        # DV-split keys
+        ((8, 32), (1024,) * 2, {"state_dtype": "bfloat16"}),
+        ((16, 32), (1024,) * 2, {"use_initial_state": False}),
+        # the other architectures
+        ((8, 32), (1024,) * 8, {"state_dtype": "bfloat16", "arch": "sm_100a"}),
+        ((8, 32), (1024,) * 8, {"state_dtype": "bfloat16", "arch": "sm_103a"}),
+        ((16, 32), (1024,) * 8, {"use_initial_state": False, "arch": "sm_100a"}),
+        ((16, 32), (1024,) * 8, {"use_initial_state": False, "arch": "sm_103a"}),
+    ),
+)
+def test_vec2full_twin_leaves_every_other_route_unchanged(
+    monkeypatch, heads, lens, overrides
+) -> None:
+    """Keys outside the three shared full-DV records resolve as they do with the twin rule off
+    (or fail closed the same way), whatever the bound."""
+
+    resolve = cake_gdn.select_cake_gdn_prefill_variant.__wrapped__
+
+    def outcome(limit):
+        monkeypatch.setattr(cake_gdn, "_VEC2FULL_MAX_TILE_CHUNKS", limit)
+        try:
+            return resolve(**_sm107a_fp32_state_kwargs(heads, lens, **overrides))
+        except cake_gdn.CakeGDNUnsupportedError as error:
+            return str(error)
+
+    on, off = outcome(1 << 20), outcome(-1)
+    assert on == off
+    assert "_vec2full_" not in getattr(on, "variant_name", "")
+
+
+@pytest.mark.cpu_only
+def test_vec2full_twin_records_pair_the_shared_records() -> None:
+    """Every vec2-full twin record stands beside the shared full-DV record of its key: the same
+    specializations, metadata and launch, its own kernel symbol (``_vec2full`` suffixed) and
+    unit.  Each shared record of the three schedules that stores a final state without state
+    indices has exactly one twin (BF16 state 6, FP32 state without an initial state 2 + 2)."""
+
+    records = {r["name"]: r for r in cake_gdn._manifest()["variants"]}
+    twins = {n: r for n, r in records.items() if "_sm107a_vec2full_i64meta_" in n}
+    counts = {}
+    for name, twin in twins.items():
+        shared = records[_vec2full_shared_name(name)]
+        schedule = shared["source_schedule"].rsplit(":", 1)[-1]
+        assert schedule in cake_gdn._VEC2FULL_SHARED_SCHEDULES
+        assert twin["source_schedule"].rsplit(":", 1)[-1] == (
+            cake_gdn._vec2full_twin_schedule(schedule)
+        )
+        counts[schedule] = counts.get(schedule, 0) + 1
+        assert twin["architectures"] == shared["architectures"] == ["sm_107a"]
+        for field in ("specializations", "metadata_i64", "tma_abi", "domain"):
+            assert twin[field] == shared[field], (name, field)
+        for field in ("params", "template"):
+            assert twin["host_binding"][field] == shared["host_binding"][field]
+        assert (
+            twin["host_binding"]["cuda_symbol"]
+            == shared["host_binding"]["cuda_symbol"] + "_vec2full"
+        )
+        assert "defines" not in twin and twin["outputs"] != shared["outputs"]
+        assert (
+            twin["specializations"]["STORE_FINAL_STATE"],
+            twin["specializations"]["USE_STATE_INDICES"],
+        ) == (1, 0)
+    for name, record in records.items():
+        schedule = record["source_schedule"].rsplit(":", 1)[-1]
+        specs = record["specializations"]
+        if schedule in cake_gdn._VEC2FULL_SHARED_SCHEDULES and (
+            specs["STORE_FINAL_STATE"],
+            specs["USE_STATE_INDICES"],
+        ) == (1, 0):
+            assert _vec2full_twin_name(name) in twins, name
+    stem = "flashinfer_blackwell_gdn_prefill"
+    assert counts == {
+        f"{stem}_initial_bf16state_sm107a_i64meta": 6,
+        f"{stem}_sm107a_i64meta": 2,
+        f"{stem}_f16io_sm107a_i64meta": 2,
+    }
+
+
+@pytest.mark.cpu_only
+def test_vec2full_twin_is_the_only_change_of_the_rule_on_random_keys(
+    monkeypatch,
+) -> None:
+    """On random keys (head geometries, dtypes, with or without an initial state, indexed state,
+    architectures, with and without the host lengths, exact or loose bounds) the resolver returns
+    the route it returns with the twin rule off, except an sm_107a full-DV batch whose resolved
+    record is one of the three shared full-DV records and whose bound spans at most 32 chunks:
+    that batch runs the key's vec2-full twin (the same route otherwise)."""
+
+    rng = random.Random(20261107)
+    resolve = cake_gdn.select_cake_gdn_prefill_variant.__wrapped__
+    heads_pairs = _RAGGED_DVSPLIT_GEOMETRIES + ((16, 16), (32, 32), (2, 6), (32, 16))
+    keys = []
+    for _ in range(1_500):
+        heads = rng.choice(heads_pairs)
+        num_seqs = rng.randint(1, 48)
+        top = rng.choice((1024, 2048, 2048, 2112, 8192))
+        lens = tuple(rng.randint(1, top) for _ in range(num_seqs))
+        if rng.random() < 0.3:
+            lens = (rng.choice((1984, 2048, 2049, 2176)),) * num_seqs
+        overrides = dict(
+            io_dtype=rng.choice(("bfloat16", "float16")),
+            state_dtype=rng.choice(("float32", "float32", "bfloat16")),
+            use_initial_state=rng.random() < 0.6,
+            arch=rng.choice(("sm_107a",) * 6 + ("sm_100a", "sm_103a")),
+        )
+        if overrides["state_dtype"] == "bfloat16":
+            overrides["use_initial_state"] = True
+            overrides["io_dtype"] = "bfloat16"
+            overrides["use_state_indices"] = rng.random() < 0.2
+        if rng.random() < 0.2:
+            overrides["max_seq_len"] = sum(lens)
+        keys.append((heads, lens, overrides, rng.random() < 0.7))
+
+    def resolve_all(limit):
+        monkeypatch.setattr(cake_gdn, "_VEC2FULL_MAX_TILE_CHUNKS", limit)
+        out = []
+        for heads, lens, overrides, host in keys:
+            try:
+                out.append(
+                    resolve(
+                        **_sm107a_fp32_state_kwargs(heads, lens, host=host, **overrides)
+                    )
+                )
+            except cake_gdn.CakeGDNUnsupportedError:
+                out.append(None)
+        return out
+
+    with_rule = resolve_all(32)
+    without_rule = resolve_all(-1)
+    twins = set()
+    for (heads, lens, overrides, _host), got, base in zip(
+        keys, with_rule, without_rule, strict=True
+    ):
+        if base is None:
+            assert got is None
+            continue
+        record = cake_gdn._kernel_record(base.variant_name)
+        bound = overrides.get("max_seq_len", max(lens))
+        eligible = (
+            overrides["arch"] == "sm_107a"
+            and base.route_id == "flashinfer.gdn_prefill.noncp.full_dv"
+            and record["source_schedule"].rsplit(":", 1)[-1]
+            in cake_gdn._VEC2FULL_SHARED_SCHEDULES
+            and not overrides.get("use_state_indices", False)
+            and cake_gdn._prefill_tile_chunks(bound) <= 32
+            and _vec2full_twin_name(base.variant_name) in _manifest_names()
+        )
+        if eligible:
+            assert got == cake_gdn.CakeGDNRoute(
+                base.route_id,
+                _vec2full_twin_name(base.variant_name),
+                True,
+                False,
+            ), (heads, lens, overrides)
+            twins.add(record["source_schedule"])
+        else:
+            assert got == base, (heads, lens, overrides)
+    assert len(twins) == 3, twins
+
+
+def _manifest_names():
+    return {r["name"] for r in cake_gdn._manifest()["variants"]}

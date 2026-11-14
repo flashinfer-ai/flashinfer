@@ -69,7 +69,7 @@ def _few_cpu_threads():
 def _mod(sub: str | None = None):
     """The package (or one of its modules) through the test-helper registry when it lists the package, else directly."""
     try:
-        from tests.test_helpers.cake_package import cake_package
+        from tests.cake.test_helpers.cake_package import cake_package
 
         return cake_package("cake_gdn_nondet_train_kcp", sub)
     except (ImportError, KeyError):
@@ -88,7 +88,9 @@ def test_options_defaults_are_the_shipped_behaviour() -> None:
     o = make_options()
     assert o.exchange == "a2a"
     assert o.save_transfer is True
+    # without the in-kernel norm; with it the default is "light_akk"
     assert o.save_mode == "light"
+    assert make_options(use_qk_l2norm_in_kernel=True).save_mode == "light_akk"
     assert o.boundary_mode == "saved"
     assert o.precision_mode == 0
     assert o.transfer_walk == "tf32_hilo"
@@ -198,6 +200,10 @@ def test_enumerated_fields(field, values) -> None:
     for v in values:
         assert getattr(make_options(**{field: v}), field) == v
     for bad in ("tape", "auto", "", None, 1):
+        # None = unset: the default ("light" without the norm)
+        if field == "save_mode" and bad is None:
+            assert make_options(save_mode=None).save_mode == "light"
+            continue
         with pytest.raises((ValueError, TypeError)):
             make_options(**{field: bad})
 
@@ -587,7 +593,8 @@ def test_entry_points_take_every_knob_keyword_only() -> None:
         for p in _after(sig, anchor):
             assert p.kind is p.KEYWORD_ONLY, (fn.__name__, p.name)
     sig = inspect.signature(kcp.cake_gdn_nondet_kcp)
-    assert sig.parameters["save_mode"].default == "light"
+    # unset: "light_akk" with use_qk_l2norm_in_kernel=True, "light" without it (CakeGDNNondetKcpOptions)
+    assert sig.parameters["save_mode"].default is None
     assert sig.parameters["boundary_mode"].default == "saved"
     assert sig.parameters["graph"].default == "off"
     assert sig.parameters["scale"].default is None
@@ -627,7 +634,7 @@ PACKAGE_NAMES = (set(FACADE_FUNCTIONS) - {"is_cake_gdn_nondet_train_kcp_supporte
 def _det(sub: str | None = None):
     """The deterministic package (or one of its modules) through the test-helper registry: a stale entry fails here
     and never skips."""
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     return cake_package("cake_gdn_det_train_kcp", sub)
 
@@ -1781,8 +1788,9 @@ def test_facade_runs_the_norm() -> None:
 
 def test_facade_byte_queries_take_the_option() -> None:
     """The facade's byte queries forward ``use_qk_l2norm_in_kernel`` to this package; its norm terms equal those of the
-    deterministic facade's own queries (``flashinfer.cake_gdn_det_train_kcp``; same plan inputs, same formulas), and
-    the saved set grows by the FP32 ``r`` of q and k (``8 T_r H_qk`` bytes)."""
+    deterministic facade's own queries (``flashinfer.cake_gdn_det_train_kcp``; same plan inputs, same formulas) at
+    ``save_mode="light"``, and the saved set grows by the FP32 ``r`` of q and k (``8 T_r H_qk`` bytes).  With the norm
+    the default save mode is ``"light_akk"``: the default saved set also holds the ``Akk`` tape (``128 R HV`` bytes)."""
     facade = importlib.import_module(FACADE)
     det_facade = importlib.import_module(DET_FACADE)
     gbytes = _mod("cake_bytes")
@@ -1791,21 +1799,31 @@ def test_facade_byte_queries_take_the_option() -> None:
     for query in ("saved_bytes", "workspace_bytes"):
         q = getattr(facade, f"cake_gdn_nondet_train_kcp_{query}")
         det_q = getattr(det_facade, f"cake_gdn_det_train_kcp_{query}")
-        on = q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True)
+        on = q(ctx, H_qk=H_qk, HV=HV, save_mode="light", use_qk_l2norm_in_kernel=True)
         off = q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=False)
         det_on = det_q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True)
         det_off = det_q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=False)
         assert on > off and det_on > det_off, query
         assert on - off == det_on - det_off, query
         assert on == getattr(gbytes, f"cake_gdn_nondet_train_kcp_{query}")(
-            ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True
+            ctx, H_qk=H_qk, HV=HV, save_mode="light", use_qk_l2norm_in_kernel=True
         ), query
+        assert q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True) == q(
+            ctx, H_qk=H_qk, HV=HV, save_mode="light_akk", use_qk_l2norm_in_kernel=True
+        ), query
+    light = facade.cake_gdn_nondet_train_kcp_saved_bytes(
+        ctx, H_qk=H_qk, HV=HV, save_mode="light", use_qk_l2norm_in_kernel=True
+    )
+    assert (
+        light - facade.cake_gdn_nondet_train_kcp_saved_bytes(ctx, H_qk=H_qk, HV=HV)
+        == 8 * int(ctx.T_r) * H_qk
+    )
     assert (
         facade.cake_gdn_nondet_train_kcp_saved_bytes(
             ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True
         )
-        - facade.cake_gdn_nondet_train_kcp_saved_bytes(ctx, H_qk=H_qk, HV=HV)
-        == 8 * int(ctx.T_r) * H_qk
+        - light
+        == 128 * int(ctx.R) * HV
     )
 
 
@@ -2258,6 +2276,7 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "bwd_prep",
         "kcp_dhu_offset",
         "kcp_dhu_tape",
+        "kcp_dhu_cut_start",
         "bwd_dqkg",
         "gate_epilogue",
         "fwd_prep_l2n",
@@ -2295,6 +2314,8 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "kcp_fwdh_out",
         "kcp_fwdh_out_tape",
         "fwd_prep_replay_l2n",
+        "kcp_dhu_offset",  # the cut walk (gdn_chunk_dhu_cut_v1_kcp)
+        "kcp_dhu_cut_start",
     )
     for name, module in kcp.TART_MODULE_OF.items():
         if name not in own:

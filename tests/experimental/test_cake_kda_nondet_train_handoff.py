@@ -41,8 +41,8 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers.cake_kda_det_train_reference import make_inputs
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers.cake_kda_det_train_reference import make_inputs
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake.cake_kda_nondet_train", "cake_backend")
 cake_build = cake_package("cake.cake_kda_nondet_train", "cake_build")
@@ -51,7 +51,8 @@ PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 CakeKDANondetWorkspace = cake_backend.CakeKDANondetWorkspace
 D, SCALE = cake_backend.D, cake_backend.SCALE
 ARCHES = tuple(cake_jit.ARCHES)
-ENV = cake_backend.HANDOFF_ENV
+# the environment override the package no longer has: setting it changes nothing
+ENV = "CAKE_KDA_CKPT_HANDOFF"
 
 LEAVES = ("q", "k", "v", "g", "beta")
 # the gradient of each leaf, in LEAVES order
@@ -1474,14 +1475,16 @@ def test_a_row_record_falls_back_to_a_tape_record_where_the_rule_refuses_it(
     _check_grads(on, off, case)
 
 
-def test_the_environment_override_end_to_end(device, manifest, monkeypatch) -> None:
-    """Through ``cake_kda_nondet``, with ``"auto"`` engaging nowhere (an empty verified set): ``CAKE_KDA_CKPT_HANDOFF=off``
-    turns ``"on"`` off and ``=on`` turns ``"auto"`` into ``"on"``; the gradients agree bitwise.  The host tests
-    cover the other combinations."""
+def test_the_environment_changes_nothing_end_to_end(
+    device, manifest, monkeypatch
+) -> None:
+    """Through ``cake_kda_nondet``, with ``"auto"`` engaging nowhere (an empty verified set): the keyword alone
+    decides; ``CAKE_KDA_CKPT_HANDOFF=off`` leaves ``"on"`` on and ``=on`` leaves ``"auto"`` off.  The gradients agree
+    bitwise.  The host tests cover the other combinations."""
     monkeypatch.setattr(cake_backend, "HANDOFF_VERIFIED", frozenset())
     inputs = make_inputs((63, 1, 65), 2, device)
     grads = []
-    for env, keyword, published in (("off", "on", 0), ("on", "auto", 1)):
+    for env, keyword, published in (("off", "on", 1), ("on", "auto", 0)):
         cake_backend._handoff_reset()
         monkeypatch.setenv(ENV, env)
         grads.append(_checkpointed_step(inputs, reentrant=False, handoff=keyword)[1])
@@ -1724,37 +1727,25 @@ def test_a_full_window_of_misses_and_hits_turns_the_handoff_off(monkeypatch) -> 
     assert s["hits"] == 2 and s["misses"] == 2 and s["disabled"], s
 
 
-def test_handoff_mode_reads_the_environment_at_each_call(monkeypatch) -> None:
-    """Host only: the keyword under each value of the variable (case and spaces ignored; unset, empty or ``auto``:
-    no override; an explicit ``"off"`` stays off) and the refusals of either."""
-    want = {
-        None: ("auto", "on", "off"),
-        "": ("auto", "on", "off"),
-        "auto": ("auto", "on", "off"),
-        " Off ": ("off", "off", "off"),
-        "OFF": ("off", "off", "off"),
-        "on": ("on", "on", "off"),
-        " On ": ("on", "on", "off"),
-    }
-    for env, modes in want.items():
+def test_handoff_mode_reads_no_environment(monkeypatch) -> None:
+    """Host only: the mode is the keyword under every value of the removed variable (no override, no refusal of
+    the variable), and the keyword's refusals."""
+    assert not hasattr(cake_backend, "HANDOFF_ENV")
+    for env in (None, "", "auto", "off", " Off ", "on", "1"):
         if env is None:
             monkeypatch.delenv(ENV, raising=False)
         else:
             monkeypatch.setenv(ENV, env)
         got = tuple(cake_backend._handoff_mode(m) for m in ("auto", "on", "off"))
-        assert got == modes, env
-    monkeypatch.setenv(ENV, "1")
-    with pytest.raises(ValueError, match=ENV):
-        cake_backend._handoff_mode("auto")
-    monkeypatch.delenv(ENV)
+        assert got == ("auto", "on", "off"), env
     for bad in ("ON", "force", None, True, 1):
         with pytest.raises(ValueError, match="checkpoint_handoff"):
             cake_backend._handoff_mode(bad)
 
 
 def test_cake_kda_nondet_passes_the_mode_to_the_node(monkeypatch) -> None:
-    """Host only: ``cake_kda_nondet`` hands ``CakeKDANondetFunction`` the mode after the environment override, and ``"off"``
-    under ``no_grad`` (no node is recorded: no backward would take a record) whatever the variable says."""
+    """Host only: ``cake_kda_nondet`` hands ``CakeKDANondetFunction`` the keyword's mode (the removed variable changes
+    nothing), and ``"off"`` under ``no_grad`` (no node is recorded: no backward would take a record)."""
     seen: list = []
 
     class Spy:
@@ -1768,7 +1759,7 @@ def test_cake_kda_nondet_passes_the_mode_to_the_node(monkeypatch) -> None:
     cake_backend.cake_kda_nondet(*ops)
     with torch.no_grad():
         cake_backend.cake_kda_nondet(*ops, checkpoint_handoff="on")
-    assert seen == ["on", "off"], seen
+    assert seen == ["auto", "off"], seen
 
 
 def test_the_apply_slot_refusals() -> None:

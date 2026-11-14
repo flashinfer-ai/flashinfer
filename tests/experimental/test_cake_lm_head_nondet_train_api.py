@@ -25,6 +25,7 @@ the device tests compare the bits of real calls.
 
 import importlib
 import inspect
+import itertools
 import json
 import subprocess
 import sys
@@ -37,7 +38,12 @@ import torch.utils.checkpoint
 
 import flashinfer.cake_lm_head_det_train as det_public
 import flashinfer.cake_lm_head_nondet_train as public
-from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
+from tests.experimental.test_helpers.cake_lm_head_loss_reference import (
+    error_report,
+    make_inputs,
+    reference_fp64,
+    reference_unchunked,
+)
 
 SEED = 20261031
 H_HOST, V_HOST = 256, 512
@@ -495,6 +501,12 @@ def _bits(t):
     return t.view({torch.bfloat16: torch.int16, torch.float32: torch.int32}[t.dtype])
 
 
+# test_cake_lm_head_nondet_train's accuracy gate, unchanged: an error at most GATE_MARGIN times the unchunked path's
+# error against the FP64 oracle plus GATE_TINY
+_GATE_MARGIN = 1.05
+_GATE_TINY = dict(dX_rel_l2=1e-3, dW_rel_l2=1e-3)
+
+
 def _logprob_step(fn, inp, **kw):
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
@@ -613,13 +625,55 @@ def test_keep_logits_mode_reaches_the_opt_in_route(recorders):
     assert len(calls) == 2 and calls[1][1]["memory_mode"] == "keep_logits"
 
 
+def test_keep_logits_mode_leaves_the_hidden_count_to_the_kept_form(
+    recorders, monkeypatch
+):
+    """With ``memory_mode="keep_logits"`` a ``hidden_count`` left at ``None`` reaches the opt-in module as ``None`` (the
+    backend's kept-logits form decides) -- ``False`` when ``FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT`` is ``"0"`` -- and
+    an explicit value as given; every other call resolves it from the variable as before (on unless ``"0"``)."""
+    fake = recorders
+    X, W, labels = _host_call()
+    logprob = "cake_lm_head_nondet_train_logprob"
+
+    def last_hidden_count(module, **kw):
+        public.cake_lm_head_nondet_train_logprob(X, W, labels, chunk_size=16, **kw)
+        return fake[module].recorders[logprob].calls[-1][1]["hidden_count"]
+
+    assert last_hidden_count("opt_in", memory_mode="keep_logits") is None
+    for value in (True, False):
+        got = last_hidden_count("opt_in", memory_mode="keep_logits", hidden_count=value)
+        assert got is value
+    assert last_hidden_count("opt_in", memory_mode="fast") is True
+    assert last_hidden_count("backend") is True
+    monkeypatch.setenv("FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT", "0")
+    assert last_hidden_count("opt_in", memory_mode="keep_logits") is False
+    assert last_hidden_count("opt_in", memory_mode="fast") is False
+    assert last_hidden_count("backend") is False
+    monkeypatch.setenv("FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT", "1")
+    assert last_hidden_count("opt_in", memory_mode="keep_logits") is None
+    assert (
+        last_hidden_count("opt_in", memory_mode="keep_logits", hidden_count=True)
+        is True
+    )
+
+
 def test_device_keep_logits_on_both_routes_is_the_plain_call(monkeypatch):
     """``cake_lm_head_det_train_logprob`` and ``cake_lm_head_nondet_train_logprob`` both accept
     ``memory_mode="keep_logits"`` and run their package's kept entry (``cake_lm_head_det_train_logprob_keep`` /
-    ``cake_lm_head_nondet_train_logprob_keep``, counted); each gives its plain call's ``logp`` / ``dW`` bits and the bits of
-    the loss ``sum(dlogp * logp)`` -- and ``dX``: the deterministic route's always, the non-deterministic route's
-    with one dX slice pinned (its plain store; the default slice rule's reduction adds the same products in an
-    unordered order)."""
+    ``cake_lm_head_nondet_train_logprob_keep``, counted); each gives its plain call's ``logp`` bits and the bits of
+    the loss ``sum(dlogp * logp)``, and ``dW`` / ``dX`` bits where both calls run the chunk loop: the deterministic
+    route's always, the non-deterministic route's with one dX slice pinned (an explicit ``gemm_tuning``: its plain
+    store) -- the non-deterministic route under its chunked kept form (``set_kept_logits_form(tail_fold=False,
+    one_pass=False)``).  The non-deterministic plain call of more than one chunk otherwise runs the vocabulary-major
+    backward and the kept call its own chunk loop (another summation order): the kept ``dX`` / ``dW`` meet the suite's
+    unchanged gates against the FP64 oracle (``test_cake_lm_head_nondet_train``: ``GATE_MARGIN`` times the
+    unchunked path's error plus ``GATE_TINY``).  On a three-chunk call the non-deterministic public route keeps one
+    contiguous buffer -- with ``hidden_count=False`` (the valid rows counted on the host) on the default plan's chunks
+    (``loop_chunks``: no fold at three chunks of ``T``), with ``hidden_count`` left at ``None`` (the kept form's
+    default: the hidden count where eligible) on the shipped chunks -- and gives the plain call's ``logp`` and loss
+    bits, its ``dX`` bits with one dX slice pinned (dX runs in the forward's chunks), and a ``dW`` (one GEMM over the
+    kept rows) that repeats bit for bit; on a call of fewer than three chunks the default keeps one buffer on the
+    folded chunks."""
     _require_device()
     nd_backend = importlib.import_module(
         "flashinfer.experimental.cake.cake_lm_head_nondet_train.cake_backend"
@@ -661,11 +715,22 @@ def test_device_keep_logits_on_both_routes_is_the_plain_call(monkeypatch):
             kw = dict(chunk_size=4096, gemm_tuning=tuning)
             plain = _logprob_step(fn, inp, **kw)
             before = dict(counts)
-            kept = _logprob_step(fn, inp, memory_mode="keep_logits", **kw)
+            # the chunked kept form: the plain call's dW bits
+            previous = nd_backend.set_kept_logits_form(tail_fold=False, one_pass=False)
+            try:
+                kept = _logprob_step(fn, inp, memory_mode="keep_logits", **kw)
+            finally:
+                nd_backend.set_kept_logits_form(**previous)
             other = "det" if route == "nd" else "nd"
             assert counts[route] == before[route] + 1, (route, counts)
             assert counts[other] == before[other], (route, counts)
-            keys = ["logp", "dW"] + (["dX"] if route == "det" or tuning else [])
+            # the non-deterministic plain call of three chunks without a tuning runs the vocabulary-major backward
+            vm = route == "nd" and tuning is None
+            keys = (
+                ["logp"]
+                + ([] if vm else ["dW"])
+                + (["dX"] if route == "det" or tuning else [])
+            )
             for key in keys:
                 assert torch.equal(_bits(kept[key]), _bits(plain[key])), (
                     route,
@@ -677,6 +742,64 @@ def test_device_keep_logits_on_both_routes_is_the_plain_call(monkeypatch):
             ), (route, tuning)
             assert bool(torch.isfinite(kept["dX"].float()).all())
             assert torch.all(kept["dX"][~inp.valid] == 0)
+            if vm:
+                oracle = reference_fp64(inp, entry="logprob")
+                b0 = error_report(
+                    reference_unchunked(inp, entry="logprob"), oracle, inp.labels
+                )
+                errors = error_report(kept, oracle, inp.labels)
+                for key in ("dX_rel_l2", "dW_rel_l2"):
+                    assert errors[key] <= _GATE_MARGIN * b0[key] + _GATE_TINY[key], (
+                        key,
+                        errors[key],
+                        b0[key],
+                    )
+        # the kept form through the public route on a three-chunk call: the host count (hidden_count=False, the chunks
+        # of the default plan's fold rule, ``loop_chunks``: the shipped chunks at three chunks of T) and the default
+        # (hidden_count left at None: the hidden count, the shipped chunks)
+        fn = public.cake_lm_head_nondet_train_logprob
+        T_v = int(inp.valid.sum())
+        shipped = nd_backend.plan_chunks(T_v, 4096)
+        assert len(shipped) >= nd_backend.HIDDEN_COUNT_MIN_CHUNKS
+        folded = tuple(r for _, r in nd_backend.loop_chunks(8700, T_v, 4096))
+        for hidden_count, tuning in itertools.product(
+            (False, None), (None, {"dx": {"k_slices": 1}})
+        ):
+            kw = dict(chunk_size=4096, gemm_tuning=tuning, hidden_count=hidden_count)
+            plain = _logprob_step(fn, inp, chunk_size=4096, gemm_tuning=tuning)
+            X = inp.X.detach().requires_grad_(True)
+            W = inp.W.detach().requires_grad_(True)
+            logp = fn(X, W, inp.labels, memory_mode="keep_logits", **kw)
+            assert logp.grad_fn.kept_chunks == (
+                folded if hidden_count is False else tuple(r for _, r in shipped)
+            ), (hidden_count, tuning)
+            logp.backward(inp.dlogp)
+            kept = dict(logp=logp.detach(), dX=X.grad, dW=W.grad)
+            del logp, X, W
+            again = _logprob_step(fn, inp, memory_mode="keep_logits", **kw)
+            assert torch.equal(_bits(kept["logp"]), _bits(plain["logp"])), tuning
+            assert torch.equal(
+                _bits(loss_of(kept).float()), _bits(loss_of(plain).float())
+            ), tuning
+            assert torch.equal(_bits(again["dW"]), _bits(kept["dW"])), tuning
+            if tuning:
+                assert torch.equal(_bits(kept["dX"]), _bits(plain["dX"]))
+                assert torch.equal(_bits(again["dX"]), _bits(kept["dX"]))
+            assert bool(torch.isfinite(kept["dW"].float()).all())
+            assert bool(torch.isfinite(kept["dX"].float()).all())
+            assert torch.all(kept["dX"][~inp.valid] == 0)
+        # below three chunks the hidden count is not eligible: the default keeps one buffer on the folded chunks
+        small = make_inputs(
+            4600, seed=SEED + 4601, device=torch.device("cuda"), ignore_frac=0.05
+        )
+        T_s = int(small.valid.sum())
+        X = small.X.detach().requires_grad_(True)
+        W = small.W.detach().requires_grad_(True)
+        logp = fn(X, W, small.labels, chunk_size=4096, memory_mode="keep_logits")
+        assert logp.grad_fn.kept_chunks == tuple(
+            r for _, r in nd_backend.loop_chunks(4600, T_s, 4096)
+        )
+        assert len(logp.grad_fn.kept_chunks) == 1
 
 
 # ---------------------------------------------------------------------------

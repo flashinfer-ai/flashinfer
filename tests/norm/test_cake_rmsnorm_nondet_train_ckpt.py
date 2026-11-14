@@ -38,7 +38,7 @@ beyond its outputs (measured with ``torch.cuda.memory_allocated``; the plain
 forward also keeps the FP32 ``rstd``), while the backward leaves only the
 gradients.
 
-This suite imports only this package (through ``tests.test_helpers.cake_package``);
+This suite imports only this package (through ``tests.cake.test_helpers.cake_package``);
 it runs unchanged against a vendored copy with or without the deterministic
 sibling.
 """
@@ -49,8 +49,8 @@ import pytest
 import torch
 import torch.utils.checkpoint
 
-from tests.test_helpers import cake_rmsnorm_train_reference as ref
-from tests.test_helpers.cake_package import cake_package
+from tests.norm.test_helpers import cake_rmsnorm_train_reference as ref
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_nondet_train")
 loader = cake_package("cake_rmsnorm_nondet_train", "cake_jit")

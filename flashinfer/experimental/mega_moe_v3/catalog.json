@@ -821,7 +821,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1_sm103a_binding.cu"
    ],
-   "closure_sha256": "862d16bdc53433a39b513e18075b2b1892905653a2e25e41bfe49f8f1c34e6c3",
+   "closure_sha256": "a41f266d1db446857fcf83342e9d45b60678522d59a83c50d19d695ab43f2835",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1_sm103a",
@@ -1079,7 +1079,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1_sm103a_binding.cu"
    ],
-   "closure_sha256": "d4afb996e4fd6476b0a26dbf982dfc8f8e1ccaa6564a18fd8cc680e02f3a9ada",
+   "closure_sha256": "28372a7928ab6f9561bda0efea34fbc1d44d0dcd3ca81f4b6eec2091ebd61ffd",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4_sm103a",
@@ -1324,10 +1324,7 @@
      "grid_z"
     ]
    ],
-   "tma_workspace_bytes": 0,
-   "definitions": [
-    "NUM_CTAS"
-   ]
+   "tma_workspace_bytes": 0
   },
   "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t16_sm103a": {
    "arches": [
@@ -1337,7 +1334,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t16_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a_binding.cu"
    ],
-   "closure_sha256": "202e8119280af54264b9a8a3f2718922eab38b437b71c04dd82cc289838d8591",
+   "closure_sha256": "8b112525b9331fa22449577a232d4d43d6fa04919922c354ae33f7ae419ef0b3",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t16_sm103a",
@@ -1592,7 +1589,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t32_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t32_sm103a_binding.cu"
    ],
-   "closure_sha256": "c4fb93a3ddef63f0935f835a471ded7ecfa8bdd40f98abfe160ab6fab4da4424",
+   "closure_sha256": "7d4452d7f35066ad207aa90e94c2cfec26615a0a28e7ef789788212d91c905dc",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -1845,7 +1842,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t128_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t128_sm103a_binding.cu"
    ],
-   "closure_sha256": "0043972b79a64e5e00c4dc6e60b3c0ef46b81e0488ef216de8e7a9df6db5a09f",
+   "closure_sha256": "95f9753979e6b9127ace2b32cb5358e9682018ff11d99ea36ad68391d55f6816",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -2098,7 +2095,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t512_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t128_sm103a_binding.cu"
    ],
-   "closure_sha256": "ef7a911fc353f37988ef509205488f41e96f2633180d618defa769c5abfea4af",
+   "closure_sha256": "3f0406ce1bd01c505c1c24277fb4f6dac79b7d243a3b5c65e85a7614e9d92351",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t512_sm103a",
@@ -2353,7 +2350,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a_binding.cu"
    ],
-   "closure_sha256": "c55326891d45f074981f0f7f4d66cbb531f5b5dbb31241474412b23f5776d707",
+   "closure_sha256": "81c2c6f3c22bcab235cd7bd623846c3a6c85570412ab75e5582fe0e2b30127fa",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -2606,7 +2603,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a_binding.cu"
    ],
-   "closure_sha256": "8c772d7659d208e615b91fe60dc4539b46173e50d88c97d1e7f7c896579645fb",
+   "closure_sha256": "ea6ce5083cac7bc94e74508550668383ab8b38abe2dfacddeb01992637998edc",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -2859,7 +2856,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1_sm103a_binding.cu"
    ],
-   "closure_sha256": "def16209a261d51f9c6d2e5f9d0ae96368c4c9888e502d665b06fb8d14201212",
+   "closure_sha256": "c54f6abfed0993ea3eec1663958a3a04dc85c4a9dfa52d3c84933ef25b4c2029",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -3115,7 +3112,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1_sm103a_binding.cu"
    ],
-   "closure_sha256": "5f52ae822a1d2ae4c9689b1411bd6b2ffba1c0963173c887b18ac37dee9cb832",
+   "closure_sha256": "0c08e83457a374277936448a8f014fe2464612e9131f37c8e6f6144efd8b29cf",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a",
@@ -3360,10 +3357,7 @@
      "grid_z"
     ]
    ],
-   "tma_workspace_bytes": 0,
-   "definitions": [
-    "NUM_CTAS"
-   ]
+   "tma_workspace_bytes": 0
   },
   "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a": {
    "arches": [
@@ -3373,7 +3367,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a_binding.cu"
    ],
-   "closure_sha256": "1dbf35afa9af0f518120a3481f7103ccf22cb60b9ba5d3333de9ed2bb7a287ae",
+   "closure_sha256": "e8f97cb37a8e7e0c292b3c62fdf90ff747f2734642bc6d21d7bafcf03786d091",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -3626,7 +3620,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t32_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t32_sm103a_binding.cu"
    ],
-   "closure_sha256": "bc84727a75aa3182c12ba9deac8714f13fcac147e6b39654d396b6ed65898700",
+   "closure_sha256": "6c62d729407badd654d9c636bf127ab387de849ad1af4c8779006356541af08b",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -3879,7 +3873,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t128_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t128_sm103a_binding.cu"
    ],
-   "closure_sha256": "ab214a443c83fe2068e396d26b91b2aeb836b280a1a2d90cb1b059684d1cbca4",
+   "closure_sha256": "fc4d57d54c2c6a978916394d8397cd0e714959abc49c970fafd198cde5903d02",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -4132,7 +4126,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t512_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t128_sm103a_binding.cu"
    ],
-   "closure_sha256": "178cb3e91090307545b1514ba95518e82de95a10ba535badf10723a49abcd2e1",
+   "closure_sha256": "b30c8e98bcdd531f6d9bd0ef51d8c28cb143b48c3f29313915bb1d599571b47d",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t512_sm103a",
@@ -4387,7 +4381,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a_binding.cu"
    ],
-   "closure_sha256": "64b8ccd505e01a8d53bd2c4fa90613b34cce52c83fbb3d24305d1400f102ad93",
+   "closure_sha256": "78051e8ff6e536c788e6c76c75bfc4bf273de3e41b20f2efd717e3d245a60313",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -4640,7 +4634,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4096_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4096_sm103a_binding.cu"
    ],
-   "closure_sha256": "4fb1155b8af23608c4c275fdf86769f4e37a479642a99eb102ed90b8646aa513",
+   "closure_sha256": "cc422744c3de7f6c25e268ccb0dc14ae1ebd934a0ada2d7e25334ac757fa4ac7",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -4893,7 +4887,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1_sm103a_binding.cu"
    ],
-   "closure_sha256": "6f9e57f3d9b81d5f36572c6271990472c524e9380be03c7d3add777fcb33202c",
+   "closure_sha256": "1de7c7f49ba0fcb91a30e96170740a72ef9e17b15a349591c1fd7534e107d3d6",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1_sm103a",
@@ -5151,7 +5145,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1_sm103a_binding.cu"
    ],
-   "closure_sha256": "504b60b54057ff39a5b61e935a41b94a37a3da9556e6d41e69d51d3717659a6b",
+   "closure_sha256": "4a60be442a834f35078d3af6a481d8719d8f05ed291b2aa57d875b6c07d65b92",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a",
@@ -5409,7 +5403,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1_sm103a_binding.cu"
    ],
-   "closure_sha256": "db0a55a1e5324fc0d203ea74a404ea06d705b9c3674b59131cfe895d1340fb0f",
+   "closure_sha256": "3277f91f6bb6cafff0ac9abf5790e1134da2d26183885954c4514502f07e3e33",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a",
@@ -5667,7 +5661,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t32_sm103a_binding.cu"
    ],
-   "closure_sha256": "7eb92d660ba5cd2e1c4a3e1c27cbf96c334b8bcc9e2db5ead0d3aa9b1952447e",
+   "closure_sha256": "fffbc12e5d84351a8edac05c02fc401ae981f06f7a62cea115887bc15f0797a9",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a",
@@ -5922,7 +5916,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t128_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t128_sm103a_binding.cu"
    ],
-   "closure_sha256": "4a14035aed906e21b4adb3a1e2eaf1dbcaa77ee16f4a0efea4912db07d849a3d",
+   "closure_sha256": "3ce81a6da2ddee03ff38f69b86ffeefd6e1065ec24b58dcf0be5bd98d52b875d",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -6175,7 +6169,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t512_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t512_sm103a_binding.cu"
    ],
-   "closure_sha256": "dc1b5ab8b983af5a4561be3ad189953f093413e3f6534ac4b649359f45b32d45",
+   "closure_sha256": "189bbd2c9086f4babdc38826429821174551ba5ad3244ebacc6d642c7d29239c",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -6428,7 +6422,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1024_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a_binding.cu"
    ],
-   "closure_sha256": "fd62a797d042019c6182385458c4b1913a17dce630e9661d14d16cc38701aea4",
+   "closure_sha256": "1f11af174b6b560eb846116bb9481c5c2fdabeddf528a54c9448644ddc11faea",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1024_sm103a",
@@ -6683,7 +6677,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4096_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4096_sm103a_binding.cu"
    ],
-   "closure_sha256": "30b59bfc5a5a53d96256d448633b4429f9cb909d0ab0d039a53a62ec91ce59c8",
+   "closure_sha256": "3bc566f5dbb1fb05f7d3419dd28de769d8a6a0b6548df60f55c631e440a262d2",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4096_sm103a",
@@ -6938,7 +6932,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1_sm103a_binding.cu"
    ],
-   "closure_sha256": "4386b204a0e782f642eb0b63292cb712fd73d9d7bbf8f2af105ac1404d8c3473",
+   "closure_sha256": "f36372b09407696a9839dd9a6352cc96e34d04b841babe2342a03d686d140602",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -7194,7 +7188,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1_sm103a_binding.cu"
    ],
-   "closure_sha256": "2c86e908f8e80dab48ba2b210014f98e9aeb119c5a81f1fb32d1ad40b29e507c",
+   "closure_sha256": "02430009acbdd48af0564377d98971f48df2a9bd9e2e77e687110409a17021f6",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4_sm103a",
@@ -7439,10 +7433,7 @@
      "grid_z"
     ]
    ],
-   "tma_workspace_bytes": 0,
-   "definitions": [
-    "NUM_CTAS"
-   ]
+   "tma_workspace_bytes": 0
   },
   "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a": {
    "arches": [
@@ -7452,7 +7443,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a_binding.cu"
    ],
-   "closure_sha256": "554abd3c4ffea4eca75ca2d511393d36116cde529e9a3c166a58971f47818d41",
+   "closure_sha256": "396a822234e4600edbbe95a08ba5bd416892c208ca9c27ae4aec2e7b15e5a2b9",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -7705,7 +7696,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t32_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t32_sm103a_binding.cu"
    ],
-   "closure_sha256": "aecdc0f72814466c611976dfca9821c9ea05eace5028d682f8c999794df52af8",
+   "closure_sha256": "b83651970bb2a82e614f0c8f4ba053c5be052c4d4bad952275f8adb80ceb6cd9",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -7958,7 +7949,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t128_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t128_sm103a_binding.cu"
    ],
-   "closure_sha256": "2975ee0d64a25e52924f33b2418507901876360fbd1600844e696d38551d57f1",
+   "closure_sha256": "1bda92bb55ee243327363bdca170d545104008932284bea7f9b76809423e2eae",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -8211,7 +8202,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t512_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a_binding.cu"
    ],
-   "closure_sha256": "85c7fe8cc069f3747195efc9767086ecba5845600d3f4faaf5c978354bf5def1",
+   "closure_sha256": "3ed45f3c301c5a92e5766b10067fc235f8bff89324d8f45c9549dbebe1969c61",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t512_sm103a",
@@ -8466,7 +8457,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a_binding.cu"
    ],
-   "closure_sha256": "8b184c3c5f9ce5c3d7affdde859a1e95865b484acaee6beec492ceb8dbd340df",
+   "closure_sha256": "27af11e969ce8ec94b44748b40969355f3650f5f22614b68a30d6e0273ec2bc3",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -8719,7 +8710,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4096_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4096_sm103a_binding.cu"
    ],
-   "closure_sha256": "52718d89678430e8e3d47e722dacb9cd3ebd71ed59df9e308ffa2c8b568fd50a",
+   "closure_sha256": "10c59402ecae00a3c0a8414e97650b2fd0e132ed7a0e80738eb3fcff2df6c329",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -9861,7 +9852,7 @@
     },
     "grid": {
      "sm_103a": [
-      152,
+      148,
       1,
       1
      ]
@@ -9875,6 +9866,7 @@
      "local_expert_filter": true,
      "w1_expert_map": true,
      "a_source": "x",
+     "num_ctas": 148,
      "kernel_intermediate": 640,
      "args": {
       "num_experts": 384,
@@ -10489,7 +10481,7 @@
     },
     "grid": {
      "sm_103a": [
-      152,
+      148,
       1,
       1
      ]
@@ -10503,6 +10495,7 @@
      "local_expert_filter": true,
      "w1_expert_map": false,
      "a_source": "x",
+     "num_ctas": 148,
      "kernel_intermediate": 2304,
      "args": {
       "num_experts": 96,
@@ -10793,7 +10786,7 @@
     },
     "grid": {
      "sm_103a": [
-      152,
+      148,
       1,
       1
      ]
@@ -10807,6 +10800,7 @@
      "local_expert_filter": true,
      "w1_expert_map": false,
      "a_source": "x",
+     "num_ctas": 148,
      "kernel_intermediate": 2304,
      "args": {
       "num_experts": 48,

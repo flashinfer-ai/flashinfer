@@ -484,8 +484,8 @@ kernel_cake_lm_head_loss_f926c93e1045aea7d54d(const __grid_constant__ CUtensorMa
                 int key[4];
                 int vid[4];
                 int row[4];
-                long long pair_0 = (long long)tile_2 * 128 + (long long)lane;
-                long long _min_0 = ((pair_0) < ((long long)M - 1) ? (pair_0) : ((long long)M - 1));
+                long long pair_0 = (long long)tile_2 * 128ll + (long long)lane;
+                long long _min_0 = ((pair_0) < ((long long)M - 1ll) ? (pair_0) : ((long long)M - 1ll));
                 key[0] = (int)_min_0;
                 int _max_2 = ((ids[key[0]]) > (0) ? (ids[key[0]]) : (0));
                 int _min_1 = ((_max_2) < (V - 1) ? (_max_2) : (V - 1));
@@ -502,8 +502,8 @@ kernel_cake_lm_head_loss_f926c93e1045aea7d54d(const __grid_constant__ CUtensorMa
                     }
                 }
                 row[0] = _table_search_3;
-                long long pair_1 = (long long)tile_2 * 128 + (long long)(32 + lane);
-                long long _min_4 = ((pair_1) < ((long long)M - 1) ? (pair_1) : ((long long)M - 1));
+                long long pair_1 = (long long)tile_2 * 128ll + (long long)(32 + lane);
+                long long _min_4 = ((pair_1) < ((long long)M - 1ll) ? (pair_1) : ((long long)M - 1ll));
                 key[1] = (int)_min_4;
                 int _max_6 = ((ids[key[1]]) > (0) ? (ids[key[1]]) : (0));
                 int _min_5 = ((_max_6) < (V - 1) ? (_max_6) : (V - 1));
@@ -520,8 +520,8 @@ kernel_cake_lm_head_loss_f926c93e1045aea7d54d(const __grid_constant__ CUtensorMa
                     }
                 }
                 row[1] = _table_search_7;
-                long long pair_2 = (long long)tile_2 * 128 + (long long)(64 + lane);
-                long long _min_8 = ((pair_2) < ((long long)M - 1) ? (pair_2) : ((long long)M - 1));
+                long long pair_2 = (long long)tile_2 * 128ll + (long long)(64 + lane);
+                long long _min_8 = ((pair_2) < ((long long)M - 1ll) ? (pair_2) : ((long long)M - 1ll));
                 key[2] = (int)_min_8;
                 int _max_10 = ((ids[key[2]]) > (0) ? (ids[key[2]]) : (0));
                 int _min_9 = ((_max_10) < (V - 1) ? (_max_10) : (V - 1));
@@ -538,8 +538,8 @@ kernel_cake_lm_head_loss_f926c93e1045aea7d54d(const __grid_constant__ CUtensorMa
                     }
                 }
                 row[2] = _table_search_11;
-                long long pair_3 = (long long)tile_2 * 128 + (long long)(96 + lane);
-                long long _min_12 = ((pair_3) < ((long long)M - 1) ? (pair_3) : ((long long)M - 1));
+                long long pair_3 = (long long)tile_2 * 128ll + (long long)(96 + lane);
+                long long _min_12 = ((pair_3) < ((long long)M - 1ll) ? (pair_3) : ((long long)M - 1ll));
                 key[3] = (int)_min_12;
                 int _max_14 = ((ids[key[3]]) > (0) ? (ids[key[3]]) : (0));
                 int _min_13 = ((_max_14) < (V - 1) ? (_max_14) : (V - 1));
@@ -825,7 +825,7 @@ kernel_cake_lm_head_loss_f926c93e1045aea7d54d(const __grid_constant__ CUtensorMa
                 }
                 acc_1 += 1;
                 if (acc_1 == 2) { acc_1 = 0; _phase_acc_full ^= 1; }
-                long long pair = (long long)tile_3 * 128 + (long long)lane_row;
+                long long pair = (long long)tile_3 * 128ll + (long long)lane_row;
                 if (pair < (long long)M) {
                     z[pair] = (__nv_bfloat16)zv;
                 }

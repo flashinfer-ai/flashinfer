@@ -324,6 +324,27 @@ def stream_context(stream: tuple[int, int]) -> Any:
     return tvm_ffi.use_raw_stream(_ffi_device(index), raw)
 
 
+# The shipped records' launch entries per ``(record, device index)``: the argument plan and the FFI function of the
+# library loaded for the device's architecture.  Every part is fixed per process (:func:`_argument_plan`, :func:`load`
+# and :func:`device_arch` are cached, the registry is data), so a launch reads one dict entry instead of the record, the
+# architecture, the library and the function by name.
+_ENTRIES: dict[tuple[str, int], tuple[tuple[tuple[str | None, int], ...], Any]] = {}
+
+
+def _entry(
+    name: str, device_index: int, module: Any | None
+) -> tuple[tuple[tuple[str | None, int], ...], Any]:
+    """``(argument plan, FFI function)`` of record ``name`` on device ``device_index`` (``module``: a test-only build,
+    resolved per launch and never kept)."""
+    found = record(name)
+    plan = _argument_plan(name)
+    if module is not None:
+        return plan, getattr(module, found["ffi_entry"])
+    entry = (plan, getattr(load(name, device_arch(device_index)), found["ffi_entry"]))
+    _ENTRIES[(name, device_index)] = entry
+    return entry
+
+
 def run_module(
     name: str,
     values: Mapping[str, Any],
@@ -340,9 +361,12 @@ def run_module(
     by default the shipped record's library of the device's architecture runs.  The kernel runs on the current
     torch stream (:func:`stream_context` of :func:`_current_stream`).
     """
-    found = record(name)
+    entry = _ENTRIES.get((name, device_index)) if module is None else None
+    if entry is None:
+        entry = _entry(name, device_index, module)
+    plan, function = entry
     args: list[Any] = []
-    for logical_name, axis in _argument_plan(name):
+    for logical_name, axis in plan:
         if logical_name is None:
             args.append(int(grid[axis]))
         else:
@@ -352,7 +376,5 @@ def run_module(
                 raise ValueError(
                     f"record {name} needs logical argument {logical_name!r}"
                 ) from None
-    if module is None:
-        module = load(name, device_arch(device_index))
     with stream_context(_current_stream()):
-        getattr(module, found["ffi_entry"])(*args)
+        function(*args)

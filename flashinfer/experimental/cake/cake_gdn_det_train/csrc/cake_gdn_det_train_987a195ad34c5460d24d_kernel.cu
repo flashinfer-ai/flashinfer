@@ -351,175 +351,175 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                     src_kind = 1;
                 }
             }
-            long long seg_base = ((long long)seg * (long long)num_v_heads + (long long)hv) * 16384;
+            long long seg_base = ((long long)seg * (long long)num_v_heads + (long long)hv) * 16384ll;
             int _max_0 = ((seq) > (0) ? (seq) : (0));
-            long long seq_base = ((long long)_max_0 * (long long)num_v_heads + (long long)hv) * 16384;
+            long long seq_base = ((long long)_max_0 * (long long)num_v_heads + (long long)hv) * 16384ll;
             if (src_kind == 2) {
                 float blk_0[16];
-                blk_0[0] = seg_start[seg_base + (long long)cq * 128 + (long long)va0];
-                blk_0[1] = seg_start[seg_base + (long long)(cq + 1) * 128 + (long long)va0];
-                blk_0[2] = seg_start[seg_base + (long long)cq * 128 + (long long)(va0 + 8)];
-                blk_0[3] = seg_start[seg_base + (long long)(cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_0[4] = seg_start[seg_base + (long long)(8 + cq) * 128 + (long long)va0];
-                blk_0[5] = seg_start[seg_base + (long long)(8 + cq + 1) * 128 + (long long)va0];
-                blk_0[6] = seg_start[seg_base + (long long)(8 + cq) * 128 + (long long)(va0 + 8)];
-                blk_0[7] = seg_start[seg_base + (long long)(8 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_0[8] = seg_start[seg_base + (long long)(16 + cq) * 128 + (long long)va0];
-                blk_0[9] = seg_start[seg_base + (long long)(16 + cq + 1) * 128 + (long long)va0];
-                blk_0[10] = seg_start[seg_base + (long long)(16 + cq) * 128 + (long long)(va0 + 8)];
-                blk_0[11] = seg_start[seg_base + (long long)(16 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_0[12] = seg_start[seg_base + (long long)(24 + cq) * 128 + (long long)va0];
-                blk_0[13] = seg_start[seg_base + (long long)(24 + cq + 1) * 128 + (long long)va0];
-                blk_0[14] = seg_start[seg_base + (long long)(24 + cq) * 128 + (long long)(va0 + 8)];
-                blk_0[15] = seg_start[seg_base + (long long)(24 + cq + 1) * 128 + (long long)(va0 + 8)];
+                blk_0[0] = seg_start[seg_base + (long long)cq * 128ll + (long long)va0];
+                blk_0[1] = seg_start[seg_base + (long long)(cq + 1) * 128ll + (long long)va0];
+                blk_0[2] = seg_start[seg_base + (long long)cq * 128ll + (long long)(va0 + 8)];
+                blk_0[3] = seg_start[seg_base + (long long)(cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_0[4] = seg_start[seg_base + (long long)(8 + cq) * 128ll + (long long)va0];
+                blk_0[5] = seg_start[seg_base + (long long)(8 + cq + 1) * 128ll + (long long)va0];
+                blk_0[6] = seg_start[seg_base + (long long)(8 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_0[7] = seg_start[seg_base + (long long)(8 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_0[8] = seg_start[seg_base + (long long)(16 + cq) * 128ll + (long long)va0];
+                blk_0[9] = seg_start[seg_base + (long long)(16 + cq + 1) * 128ll + (long long)va0];
+                blk_0[10] = seg_start[seg_base + (long long)(16 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_0[11] = seg_start[seg_base + (long long)(16 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_0[12] = seg_start[seg_base + (long long)(24 + cq) * 128ll + (long long)va0];
+                blk_0[13] = seg_start[seg_base + (long long)(24 + cq + 1) * 128ll + (long long)va0];
+                blk_0[14] = seg_start[seg_base + (long long)(24 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_0[15] = seg_start[seg_base + (long long)(24 + cq + 1) * 128ll + (long long)(va0 + 8)];
                 asm volatile(
                     "tcgen05.st.sync.aligned.16x256b.x4.b32"
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
                     :: "r"(t_lo), "r"(*reinterpret_cast<const uint32_t*>(&blk_0[0])), "r"(*reinterpret_cast<const uint32_t*>(&blk_0[1])), "r"(*reinterpret_cast<const uint32_t*>(&blk_0[2])), "r"(*reinterpret_cast<const uint32_t*>(&blk_0[3])), "r"(*reinterpret_cast<const uint32_t*>(&blk_0[4])), "r"(*reinterpret_cast<const uint32_t*>(&blk_0[5])), "r"(*reinterpret_cast<const uint32_t*>(&blk_0[6])), "r"(*reinterpret_cast<const uint32_t*>(&blk_0[7])), "r"(*reinterpret_cast<const uint32_t*>(&blk_0[8])), "r"(*reinterpret_cast<const uint32_t*>(&blk_0[9])), "r"(*reinterpret_cast<const uint32_t*>(&blk_0[10])), "r"(*reinterpret_cast<const uint32_t*>(&blk_0[11])), "r"(*reinterpret_cast<const uint32_t*>(&blk_0[12])), "r"(*reinterpret_cast<const uint32_t*>(&blk_0[13])), "r"(*reinterpret_cast<const uint32_t*>(&blk_0[14])), "r"(*reinterpret_cast<const uint32_t*>(&blk_0[15])));
                 float blk_1[16];
-                blk_1[0] = seg_start[seg_base + (long long)(32 + cq) * 128 + (long long)va0];
-                blk_1[1] = seg_start[seg_base + (long long)(32 + cq + 1) * 128 + (long long)va0];
-                blk_1[2] = seg_start[seg_base + (long long)(32 + cq) * 128 + (long long)(va0 + 8)];
-                blk_1[3] = seg_start[seg_base + (long long)(32 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_1[4] = seg_start[seg_base + (long long)(40 + cq) * 128 + (long long)va0];
-                blk_1[5] = seg_start[seg_base + (long long)(40 + cq + 1) * 128 + (long long)va0];
-                blk_1[6] = seg_start[seg_base + (long long)(40 + cq) * 128 + (long long)(va0 + 8)];
-                blk_1[7] = seg_start[seg_base + (long long)(40 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_1[8] = seg_start[seg_base + (long long)(48 + cq) * 128 + (long long)va0];
-                blk_1[9] = seg_start[seg_base + (long long)(48 + cq + 1) * 128 + (long long)va0];
-                blk_1[10] = seg_start[seg_base + (long long)(48 + cq) * 128 + (long long)(va0 + 8)];
-                blk_1[11] = seg_start[seg_base + (long long)(48 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_1[12] = seg_start[seg_base + (long long)(56 + cq) * 128 + (long long)va0];
-                blk_1[13] = seg_start[seg_base + (long long)(56 + cq + 1) * 128 + (long long)va0];
-                blk_1[14] = seg_start[seg_base + (long long)(56 + cq) * 128 + (long long)(va0 + 8)];
-                blk_1[15] = seg_start[seg_base + (long long)(56 + cq + 1) * 128 + (long long)(va0 + 8)];
+                blk_1[0] = seg_start[seg_base + (long long)(32 + cq) * 128ll + (long long)va0];
+                blk_1[1] = seg_start[seg_base + (long long)(32 + cq + 1) * 128ll + (long long)va0];
+                blk_1[2] = seg_start[seg_base + (long long)(32 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_1[3] = seg_start[seg_base + (long long)(32 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_1[4] = seg_start[seg_base + (long long)(40 + cq) * 128ll + (long long)va0];
+                blk_1[5] = seg_start[seg_base + (long long)(40 + cq + 1) * 128ll + (long long)va0];
+                blk_1[6] = seg_start[seg_base + (long long)(40 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_1[7] = seg_start[seg_base + (long long)(40 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_1[8] = seg_start[seg_base + (long long)(48 + cq) * 128ll + (long long)va0];
+                blk_1[9] = seg_start[seg_base + (long long)(48 + cq + 1) * 128ll + (long long)va0];
+                blk_1[10] = seg_start[seg_base + (long long)(48 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_1[11] = seg_start[seg_base + (long long)(48 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_1[12] = seg_start[seg_base + (long long)(56 + cq) * 128ll + (long long)va0];
+                blk_1[13] = seg_start[seg_base + (long long)(56 + cq + 1) * 128ll + (long long)va0];
+                blk_1[14] = seg_start[seg_base + (long long)(56 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_1[15] = seg_start[seg_base + (long long)(56 + cq + 1) * 128ll + (long long)(va0 + 8)];
                 asm volatile(
                     "tcgen05.st.sync.aligned.16x256b.x4.b32"
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
                     :: "r"(t_lo + 32), "r"(*reinterpret_cast<const uint32_t*>(&blk_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&blk_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&blk_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&blk_1[3])), "r"(*reinterpret_cast<const uint32_t*>(&blk_1[4])), "r"(*reinterpret_cast<const uint32_t*>(&blk_1[5])), "r"(*reinterpret_cast<const uint32_t*>(&blk_1[6])), "r"(*reinterpret_cast<const uint32_t*>(&blk_1[7])), "r"(*reinterpret_cast<const uint32_t*>(&blk_1[8])), "r"(*reinterpret_cast<const uint32_t*>(&blk_1[9])), "r"(*reinterpret_cast<const uint32_t*>(&blk_1[10])), "r"(*reinterpret_cast<const uint32_t*>(&blk_1[11])), "r"(*reinterpret_cast<const uint32_t*>(&blk_1[12])), "r"(*reinterpret_cast<const uint32_t*>(&blk_1[13])), "r"(*reinterpret_cast<const uint32_t*>(&blk_1[14])), "r"(*reinterpret_cast<const uint32_t*>(&blk_1[15])));
                 float blk_2[16];
-                blk_2[0] = seg_start[seg_base + (long long)(64 + cq) * 128 + (long long)va0];
-                blk_2[1] = seg_start[seg_base + (long long)(64 + cq + 1) * 128 + (long long)va0];
-                blk_2[2] = seg_start[seg_base + (long long)(64 + cq) * 128 + (long long)(va0 + 8)];
-                blk_2[3] = seg_start[seg_base + (long long)(64 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_2[4] = seg_start[seg_base + (long long)(72 + cq) * 128 + (long long)va0];
-                blk_2[5] = seg_start[seg_base + (long long)(72 + cq + 1) * 128 + (long long)va0];
-                blk_2[6] = seg_start[seg_base + (long long)(72 + cq) * 128 + (long long)(va0 + 8)];
-                blk_2[7] = seg_start[seg_base + (long long)(72 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_2[8] = seg_start[seg_base + (long long)(80 + cq) * 128 + (long long)va0];
-                blk_2[9] = seg_start[seg_base + (long long)(80 + cq + 1) * 128 + (long long)va0];
-                blk_2[10] = seg_start[seg_base + (long long)(80 + cq) * 128 + (long long)(va0 + 8)];
-                blk_2[11] = seg_start[seg_base + (long long)(80 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_2[12] = seg_start[seg_base + (long long)(88 + cq) * 128 + (long long)va0];
-                blk_2[13] = seg_start[seg_base + (long long)(88 + cq + 1) * 128 + (long long)va0];
-                blk_2[14] = seg_start[seg_base + (long long)(88 + cq) * 128 + (long long)(va0 + 8)];
-                blk_2[15] = seg_start[seg_base + (long long)(88 + cq + 1) * 128 + (long long)(va0 + 8)];
+                blk_2[0] = seg_start[seg_base + (long long)(64 + cq) * 128ll + (long long)va0];
+                blk_2[1] = seg_start[seg_base + (long long)(64 + cq + 1) * 128ll + (long long)va0];
+                blk_2[2] = seg_start[seg_base + (long long)(64 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_2[3] = seg_start[seg_base + (long long)(64 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_2[4] = seg_start[seg_base + (long long)(72 + cq) * 128ll + (long long)va0];
+                blk_2[5] = seg_start[seg_base + (long long)(72 + cq + 1) * 128ll + (long long)va0];
+                blk_2[6] = seg_start[seg_base + (long long)(72 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_2[7] = seg_start[seg_base + (long long)(72 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_2[8] = seg_start[seg_base + (long long)(80 + cq) * 128ll + (long long)va0];
+                blk_2[9] = seg_start[seg_base + (long long)(80 + cq + 1) * 128ll + (long long)va0];
+                blk_2[10] = seg_start[seg_base + (long long)(80 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_2[11] = seg_start[seg_base + (long long)(80 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_2[12] = seg_start[seg_base + (long long)(88 + cq) * 128ll + (long long)va0];
+                blk_2[13] = seg_start[seg_base + (long long)(88 + cq + 1) * 128ll + (long long)va0];
+                blk_2[14] = seg_start[seg_base + (long long)(88 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_2[15] = seg_start[seg_base + (long long)(88 + cq + 1) * 128ll + (long long)(va0 + 8)];
                 asm volatile(
                     "tcgen05.st.sync.aligned.16x256b.x4.b32"
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
                     :: "r"(t_lo + 64), "r"(*reinterpret_cast<const uint32_t*>(&blk_2[0])), "r"(*reinterpret_cast<const uint32_t*>(&blk_2[1])), "r"(*reinterpret_cast<const uint32_t*>(&blk_2[2])), "r"(*reinterpret_cast<const uint32_t*>(&blk_2[3])), "r"(*reinterpret_cast<const uint32_t*>(&blk_2[4])), "r"(*reinterpret_cast<const uint32_t*>(&blk_2[5])), "r"(*reinterpret_cast<const uint32_t*>(&blk_2[6])), "r"(*reinterpret_cast<const uint32_t*>(&blk_2[7])), "r"(*reinterpret_cast<const uint32_t*>(&blk_2[8])), "r"(*reinterpret_cast<const uint32_t*>(&blk_2[9])), "r"(*reinterpret_cast<const uint32_t*>(&blk_2[10])), "r"(*reinterpret_cast<const uint32_t*>(&blk_2[11])), "r"(*reinterpret_cast<const uint32_t*>(&blk_2[12])), "r"(*reinterpret_cast<const uint32_t*>(&blk_2[13])), "r"(*reinterpret_cast<const uint32_t*>(&blk_2[14])), "r"(*reinterpret_cast<const uint32_t*>(&blk_2[15])));
                 float blk_3[16];
-                blk_3[0] = seg_start[seg_base + (long long)(96 + cq) * 128 + (long long)va0];
-                blk_3[1] = seg_start[seg_base + (long long)(96 + cq + 1) * 128 + (long long)va0];
-                blk_3[2] = seg_start[seg_base + (long long)(96 + cq) * 128 + (long long)(va0 + 8)];
-                blk_3[3] = seg_start[seg_base + (long long)(96 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_3[4] = seg_start[seg_base + (long long)(104 + cq) * 128 + (long long)va0];
-                blk_3[5] = seg_start[seg_base + (long long)(104 + cq + 1) * 128 + (long long)va0];
-                blk_3[6] = seg_start[seg_base + (long long)(104 + cq) * 128 + (long long)(va0 + 8)];
-                blk_3[7] = seg_start[seg_base + (long long)(104 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_3[8] = seg_start[seg_base + (long long)(112 + cq) * 128 + (long long)va0];
-                blk_3[9] = seg_start[seg_base + (long long)(112 + cq + 1) * 128 + (long long)va0];
-                blk_3[10] = seg_start[seg_base + (long long)(112 + cq) * 128 + (long long)(va0 + 8)];
-                blk_3[11] = seg_start[seg_base + (long long)(112 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_3[12] = seg_start[seg_base + (long long)(120 + cq) * 128 + (long long)va0];
-                blk_3[13] = seg_start[seg_base + (long long)(120 + cq + 1) * 128 + (long long)va0];
-                blk_3[14] = seg_start[seg_base + (long long)(120 + cq) * 128 + (long long)(va0 + 8)];
-                blk_3[15] = seg_start[seg_base + (long long)(120 + cq + 1) * 128 + (long long)(va0 + 8)];
+                blk_3[0] = seg_start[seg_base + (long long)(96 + cq) * 128ll + (long long)va0];
+                blk_3[1] = seg_start[seg_base + (long long)(96 + cq + 1) * 128ll + (long long)va0];
+                blk_3[2] = seg_start[seg_base + (long long)(96 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_3[3] = seg_start[seg_base + (long long)(96 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_3[4] = seg_start[seg_base + (long long)(104 + cq) * 128ll + (long long)va0];
+                blk_3[5] = seg_start[seg_base + (long long)(104 + cq + 1) * 128ll + (long long)va0];
+                blk_3[6] = seg_start[seg_base + (long long)(104 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_3[7] = seg_start[seg_base + (long long)(104 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_3[8] = seg_start[seg_base + (long long)(112 + cq) * 128ll + (long long)va0];
+                blk_3[9] = seg_start[seg_base + (long long)(112 + cq + 1) * 128ll + (long long)va0];
+                blk_3[10] = seg_start[seg_base + (long long)(112 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_3[11] = seg_start[seg_base + (long long)(112 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_3[12] = seg_start[seg_base + (long long)(120 + cq) * 128ll + (long long)va0];
+                blk_3[13] = seg_start[seg_base + (long long)(120 + cq + 1) * 128ll + (long long)va0];
+                blk_3[14] = seg_start[seg_base + (long long)(120 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_3[15] = seg_start[seg_base + (long long)(120 + cq + 1) * 128ll + (long long)(va0 + 8)];
                 asm volatile(
                     "tcgen05.st.sync.aligned.16x256b.x4.b32"
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
                     :: "r"(t_lo + 96), "r"(*reinterpret_cast<const uint32_t*>(&blk_3[0])), "r"(*reinterpret_cast<const uint32_t*>(&blk_3[1])), "r"(*reinterpret_cast<const uint32_t*>(&blk_3[2])), "r"(*reinterpret_cast<const uint32_t*>(&blk_3[3])), "r"(*reinterpret_cast<const uint32_t*>(&blk_3[4])), "r"(*reinterpret_cast<const uint32_t*>(&blk_3[5])), "r"(*reinterpret_cast<const uint32_t*>(&blk_3[6])), "r"(*reinterpret_cast<const uint32_t*>(&blk_3[7])), "r"(*reinterpret_cast<const uint32_t*>(&blk_3[8])), "r"(*reinterpret_cast<const uint32_t*>(&blk_3[9])), "r"(*reinterpret_cast<const uint32_t*>(&blk_3[10])), "r"(*reinterpret_cast<const uint32_t*>(&blk_3[11])), "r"(*reinterpret_cast<const uint32_t*>(&blk_3[12])), "r"(*reinterpret_cast<const uint32_t*>(&blk_3[13])), "r"(*reinterpret_cast<const uint32_t*>(&blk_3[14])), "r"(*reinterpret_cast<const uint32_t*>(&blk_3[15])));
             } else if (src_kind == 1) {
                 float blk_4[16];
-                blk_4[0] = h0[seq_base + (long long)cq * 128 + (long long)va0];
-                blk_4[1] = h0[seq_base + (long long)(cq + 1) * 128 + (long long)va0];
-                blk_4[2] = h0[seq_base + (long long)cq * 128 + (long long)(va0 + 8)];
-                blk_4[3] = h0[seq_base + (long long)(cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_4[4] = h0[seq_base + (long long)(8 + cq) * 128 + (long long)va0];
-                blk_4[5] = h0[seq_base + (long long)(8 + cq + 1) * 128 + (long long)va0];
-                blk_4[6] = h0[seq_base + (long long)(8 + cq) * 128 + (long long)(va0 + 8)];
-                blk_4[7] = h0[seq_base + (long long)(8 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_4[8] = h0[seq_base + (long long)(16 + cq) * 128 + (long long)va0];
-                blk_4[9] = h0[seq_base + (long long)(16 + cq + 1) * 128 + (long long)va0];
-                blk_4[10] = h0[seq_base + (long long)(16 + cq) * 128 + (long long)(va0 + 8)];
-                blk_4[11] = h0[seq_base + (long long)(16 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_4[12] = h0[seq_base + (long long)(24 + cq) * 128 + (long long)va0];
-                blk_4[13] = h0[seq_base + (long long)(24 + cq + 1) * 128 + (long long)va0];
-                blk_4[14] = h0[seq_base + (long long)(24 + cq) * 128 + (long long)(va0 + 8)];
-                blk_4[15] = h0[seq_base + (long long)(24 + cq + 1) * 128 + (long long)(va0 + 8)];
+                blk_4[0] = h0[seq_base + (long long)cq * 128ll + (long long)va0];
+                blk_4[1] = h0[seq_base + (long long)(cq + 1) * 128ll + (long long)va0];
+                blk_4[2] = h0[seq_base + (long long)cq * 128ll + (long long)(va0 + 8)];
+                blk_4[3] = h0[seq_base + (long long)(cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_4[4] = h0[seq_base + (long long)(8 + cq) * 128ll + (long long)va0];
+                blk_4[5] = h0[seq_base + (long long)(8 + cq + 1) * 128ll + (long long)va0];
+                blk_4[6] = h0[seq_base + (long long)(8 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_4[7] = h0[seq_base + (long long)(8 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_4[8] = h0[seq_base + (long long)(16 + cq) * 128ll + (long long)va0];
+                blk_4[9] = h0[seq_base + (long long)(16 + cq + 1) * 128ll + (long long)va0];
+                blk_4[10] = h0[seq_base + (long long)(16 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_4[11] = h0[seq_base + (long long)(16 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_4[12] = h0[seq_base + (long long)(24 + cq) * 128ll + (long long)va0];
+                blk_4[13] = h0[seq_base + (long long)(24 + cq + 1) * 128ll + (long long)va0];
+                blk_4[14] = h0[seq_base + (long long)(24 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_4[15] = h0[seq_base + (long long)(24 + cq + 1) * 128ll + (long long)(va0 + 8)];
                 asm volatile(
                     "tcgen05.st.sync.aligned.16x256b.x4.b32"
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
                     :: "r"(t_lo), "r"(*reinterpret_cast<const uint32_t*>(&blk_4[0])), "r"(*reinterpret_cast<const uint32_t*>(&blk_4[1])), "r"(*reinterpret_cast<const uint32_t*>(&blk_4[2])), "r"(*reinterpret_cast<const uint32_t*>(&blk_4[3])), "r"(*reinterpret_cast<const uint32_t*>(&blk_4[4])), "r"(*reinterpret_cast<const uint32_t*>(&blk_4[5])), "r"(*reinterpret_cast<const uint32_t*>(&blk_4[6])), "r"(*reinterpret_cast<const uint32_t*>(&blk_4[7])), "r"(*reinterpret_cast<const uint32_t*>(&blk_4[8])), "r"(*reinterpret_cast<const uint32_t*>(&blk_4[9])), "r"(*reinterpret_cast<const uint32_t*>(&blk_4[10])), "r"(*reinterpret_cast<const uint32_t*>(&blk_4[11])), "r"(*reinterpret_cast<const uint32_t*>(&blk_4[12])), "r"(*reinterpret_cast<const uint32_t*>(&blk_4[13])), "r"(*reinterpret_cast<const uint32_t*>(&blk_4[14])), "r"(*reinterpret_cast<const uint32_t*>(&blk_4[15])));
                 float blk_5[16];
-                blk_5[0] = h0[seq_base + (long long)(32 + cq) * 128 + (long long)va0];
-                blk_5[1] = h0[seq_base + (long long)(32 + cq + 1) * 128 + (long long)va0];
-                blk_5[2] = h0[seq_base + (long long)(32 + cq) * 128 + (long long)(va0 + 8)];
-                blk_5[3] = h0[seq_base + (long long)(32 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_5[4] = h0[seq_base + (long long)(40 + cq) * 128 + (long long)va0];
-                blk_5[5] = h0[seq_base + (long long)(40 + cq + 1) * 128 + (long long)va0];
-                blk_5[6] = h0[seq_base + (long long)(40 + cq) * 128 + (long long)(va0 + 8)];
-                blk_5[7] = h0[seq_base + (long long)(40 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_5[8] = h0[seq_base + (long long)(48 + cq) * 128 + (long long)va0];
-                blk_5[9] = h0[seq_base + (long long)(48 + cq + 1) * 128 + (long long)va0];
-                blk_5[10] = h0[seq_base + (long long)(48 + cq) * 128 + (long long)(va0 + 8)];
-                blk_5[11] = h0[seq_base + (long long)(48 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_5[12] = h0[seq_base + (long long)(56 + cq) * 128 + (long long)va0];
-                blk_5[13] = h0[seq_base + (long long)(56 + cq + 1) * 128 + (long long)va0];
-                blk_5[14] = h0[seq_base + (long long)(56 + cq) * 128 + (long long)(va0 + 8)];
-                blk_5[15] = h0[seq_base + (long long)(56 + cq + 1) * 128 + (long long)(va0 + 8)];
+                blk_5[0] = h0[seq_base + (long long)(32 + cq) * 128ll + (long long)va0];
+                blk_5[1] = h0[seq_base + (long long)(32 + cq + 1) * 128ll + (long long)va0];
+                blk_5[2] = h0[seq_base + (long long)(32 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_5[3] = h0[seq_base + (long long)(32 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_5[4] = h0[seq_base + (long long)(40 + cq) * 128ll + (long long)va0];
+                blk_5[5] = h0[seq_base + (long long)(40 + cq + 1) * 128ll + (long long)va0];
+                blk_5[6] = h0[seq_base + (long long)(40 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_5[7] = h0[seq_base + (long long)(40 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_5[8] = h0[seq_base + (long long)(48 + cq) * 128ll + (long long)va0];
+                blk_5[9] = h0[seq_base + (long long)(48 + cq + 1) * 128ll + (long long)va0];
+                blk_5[10] = h0[seq_base + (long long)(48 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_5[11] = h0[seq_base + (long long)(48 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_5[12] = h0[seq_base + (long long)(56 + cq) * 128ll + (long long)va0];
+                blk_5[13] = h0[seq_base + (long long)(56 + cq + 1) * 128ll + (long long)va0];
+                blk_5[14] = h0[seq_base + (long long)(56 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_5[15] = h0[seq_base + (long long)(56 + cq + 1) * 128ll + (long long)(va0 + 8)];
                 asm volatile(
                     "tcgen05.st.sync.aligned.16x256b.x4.b32"
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
                     :: "r"(t_lo + 32), "r"(*reinterpret_cast<const uint32_t*>(&blk_5[0])), "r"(*reinterpret_cast<const uint32_t*>(&blk_5[1])), "r"(*reinterpret_cast<const uint32_t*>(&blk_5[2])), "r"(*reinterpret_cast<const uint32_t*>(&blk_5[3])), "r"(*reinterpret_cast<const uint32_t*>(&blk_5[4])), "r"(*reinterpret_cast<const uint32_t*>(&blk_5[5])), "r"(*reinterpret_cast<const uint32_t*>(&blk_5[6])), "r"(*reinterpret_cast<const uint32_t*>(&blk_5[7])), "r"(*reinterpret_cast<const uint32_t*>(&blk_5[8])), "r"(*reinterpret_cast<const uint32_t*>(&blk_5[9])), "r"(*reinterpret_cast<const uint32_t*>(&blk_5[10])), "r"(*reinterpret_cast<const uint32_t*>(&blk_5[11])), "r"(*reinterpret_cast<const uint32_t*>(&blk_5[12])), "r"(*reinterpret_cast<const uint32_t*>(&blk_5[13])), "r"(*reinterpret_cast<const uint32_t*>(&blk_5[14])), "r"(*reinterpret_cast<const uint32_t*>(&blk_5[15])));
                 float blk_6[16];
-                blk_6[0] = h0[seq_base + (long long)(64 + cq) * 128 + (long long)va0];
-                blk_6[1] = h0[seq_base + (long long)(64 + cq + 1) * 128 + (long long)va0];
-                blk_6[2] = h0[seq_base + (long long)(64 + cq) * 128 + (long long)(va0 + 8)];
-                blk_6[3] = h0[seq_base + (long long)(64 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_6[4] = h0[seq_base + (long long)(72 + cq) * 128 + (long long)va0];
-                blk_6[5] = h0[seq_base + (long long)(72 + cq + 1) * 128 + (long long)va0];
-                blk_6[6] = h0[seq_base + (long long)(72 + cq) * 128 + (long long)(va0 + 8)];
-                blk_6[7] = h0[seq_base + (long long)(72 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_6[8] = h0[seq_base + (long long)(80 + cq) * 128 + (long long)va0];
-                blk_6[9] = h0[seq_base + (long long)(80 + cq + 1) * 128 + (long long)va0];
-                blk_6[10] = h0[seq_base + (long long)(80 + cq) * 128 + (long long)(va0 + 8)];
-                blk_6[11] = h0[seq_base + (long long)(80 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_6[12] = h0[seq_base + (long long)(88 + cq) * 128 + (long long)va0];
-                blk_6[13] = h0[seq_base + (long long)(88 + cq + 1) * 128 + (long long)va0];
-                blk_6[14] = h0[seq_base + (long long)(88 + cq) * 128 + (long long)(va0 + 8)];
-                blk_6[15] = h0[seq_base + (long long)(88 + cq + 1) * 128 + (long long)(va0 + 8)];
+                blk_6[0] = h0[seq_base + (long long)(64 + cq) * 128ll + (long long)va0];
+                blk_6[1] = h0[seq_base + (long long)(64 + cq + 1) * 128ll + (long long)va0];
+                blk_6[2] = h0[seq_base + (long long)(64 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_6[3] = h0[seq_base + (long long)(64 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_6[4] = h0[seq_base + (long long)(72 + cq) * 128ll + (long long)va0];
+                blk_6[5] = h0[seq_base + (long long)(72 + cq + 1) * 128ll + (long long)va0];
+                blk_6[6] = h0[seq_base + (long long)(72 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_6[7] = h0[seq_base + (long long)(72 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_6[8] = h0[seq_base + (long long)(80 + cq) * 128ll + (long long)va0];
+                blk_6[9] = h0[seq_base + (long long)(80 + cq + 1) * 128ll + (long long)va0];
+                blk_6[10] = h0[seq_base + (long long)(80 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_6[11] = h0[seq_base + (long long)(80 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_6[12] = h0[seq_base + (long long)(88 + cq) * 128ll + (long long)va0];
+                blk_6[13] = h0[seq_base + (long long)(88 + cq + 1) * 128ll + (long long)va0];
+                blk_6[14] = h0[seq_base + (long long)(88 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_6[15] = h0[seq_base + (long long)(88 + cq + 1) * 128ll + (long long)(va0 + 8)];
                 asm volatile(
                     "tcgen05.st.sync.aligned.16x256b.x4.b32"
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
                     :: "r"(t_lo + 64), "r"(*reinterpret_cast<const uint32_t*>(&blk_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&blk_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&blk_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&blk_6[3])), "r"(*reinterpret_cast<const uint32_t*>(&blk_6[4])), "r"(*reinterpret_cast<const uint32_t*>(&blk_6[5])), "r"(*reinterpret_cast<const uint32_t*>(&blk_6[6])), "r"(*reinterpret_cast<const uint32_t*>(&blk_6[7])), "r"(*reinterpret_cast<const uint32_t*>(&blk_6[8])), "r"(*reinterpret_cast<const uint32_t*>(&blk_6[9])), "r"(*reinterpret_cast<const uint32_t*>(&blk_6[10])), "r"(*reinterpret_cast<const uint32_t*>(&blk_6[11])), "r"(*reinterpret_cast<const uint32_t*>(&blk_6[12])), "r"(*reinterpret_cast<const uint32_t*>(&blk_6[13])), "r"(*reinterpret_cast<const uint32_t*>(&blk_6[14])), "r"(*reinterpret_cast<const uint32_t*>(&blk_6[15])));
                 float blk_7[16];
-                blk_7[0] = h0[seq_base + (long long)(96 + cq) * 128 + (long long)va0];
-                blk_7[1] = h0[seq_base + (long long)(96 + cq + 1) * 128 + (long long)va0];
-                blk_7[2] = h0[seq_base + (long long)(96 + cq) * 128 + (long long)(va0 + 8)];
-                blk_7[3] = h0[seq_base + (long long)(96 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_7[4] = h0[seq_base + (long long)(104 + cq) * 128 + (long long)va0];
-                blk_7[5] = h0[seq_base + (long long)(104 + cq + 1) * 128 + (long long)va0];
-                blk_7[6] = h0[seq_base + (long long)(104 + cq) * 128 + (long long)(va0 + 8)];
-                blk_7[7] = h0[seq_base + (long long)(104 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_7[8] = h0[seq_base + (long long)(112 + cq) * 128 + (long long)va0];
-                blk_7[9] = h0[seq_base + (long long)(112 + cq + 1) * 128 + (long long)va0];
-                blk_7[10] = h0[seq_base + (long long)(112 + cq) * 128 + (long long)(va0 + 8)];
-                blk_7[11] = h0[seq_base + (long long)(112 + cq + 1) * 128 + (long long)(va0 + 8)];
-                blk_7[12] = h0[seq_base + (long long)(120 + cq) * 128 + (long long)va0];
-                blk_7[13] = h0[seq_base + (long long)(120 + cq + 1) * 128 + (long long)va0];
-                blk_7[14] = h0[seq_base + (long long)(120 + cq) * 128 + (long long)(va0 + 8)];
-                blk_7[15] = h0[seq_base + (long long)(120 + cq + 1) * 128 + (long long)(va0 + 8)];
+                blk_7[0] = h0[seq_base + (long long)(96 + cq) * 128ll + (long long)va0];
+                blk_7[1] = h0[seq_base + (long long)(96 + cq + 1) * 128ll + (long long)va0];
+                blk_7[2] = h0[seq_base + (long long)(96 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_7[3] = h0[seq_base + (long long)(96 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_7[4] = h0[seq_base + (long long)(104 + cq) * 128ll + (long long)va0];
+                blk_7[5] = h0[seq_base + (long long)(104 + cq + 1) * 128ll + (long long)va0];
+                blk_7[6] = h0[seq_base + (long long)(104 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_7[7] = h0[seq_base + (long long)(104 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_7[8] = h0[seq_base + (long long)(112 + cq) * 128ll + (long long)va0];
+                blk_7[9] = h0[seq_base + (long long)(112 + cq + 1) * 128ll + (long long)va0];
+                blk_7[10] = h0[seq_base + (long long)(112 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_7[11] = h0[seq_base + (long long)(112 + cq + 1) * 128ll + (long long)(va0 + 8)];
+                blk_7[12] = h0[seq_base + (long long)(120 + cq) * 128ll + (long long)va0];
+                blk_7[13] = h0[seq_base + (long long)(120 + cq + 1) * 128ll + (long long)va0];
+                blk_7[14] = h0[seq_base + (long long)(120 + cq) * 128ll + (long long)(va0 + 8)];
+                blk_7[15] = h0[seq_base + (long long)(120 + cq + 1) * 128ll + (long long)(va0 + 8)];
                 asm volatile(
                     "tcgen05.st.sync.aligned.16x256b.x4.b32"
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
@@ -782,22 +782,22 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                         : "=r"(*reinterpret_cast<uint32_t*>(&blk_12[0])), "=r"(*reinterpret_cast<uint32_t*>(&blk_12[1])), "=r"(*reinterpret_cast<uint32_t*>(&blk_12[2])), "=r"(*reinterpret_cast<uint32_t*>(&blk_12[3])), "=r"(*reinterpret_cast<uint32_t*>(&blk_12[4])), "=r"(*reinterpret_cast<uint32_t*>(&blk_12[5])), "=r"(*reinterpret_cast<uint32_t*>(&blk_12[6])), "=r"(*reinterpret_cast<uint32_t*>(&blk_12[7])), "=r"(*reinterpret_cast<uint32_t*>(&blk_12[8])), "=r"(*reinterpret_cast<uint32_t*>(&blk_12[9])), "=r"(*reinterpret_cast<uint32_t*>(&blk_12[10])), "=r"(*reinterpret_cast<uint32_t*>(&blk_12[11])), "=r"(*reinterpret_cast<uint32_t*>(&blk_12[12])), "=r"(*reinterpret_cast<uint32_t*>(&blk_12[13])), "=r"(*reinterpret_cast<uint32_t*>(&blk_12[14])), "=r"(*reinterpret_cast<uint32_t*>(&blk_12[15]))
                         : "r"(t_lo));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
-                    final_state[seq_base + (long long)cq * 128 + (long long)va0] = blk_12[0];
-                    final_state[seq_base + (long long)(cq + 1) * 128 + (long long)va0] = blk_12[1];
-                    final_state[seq_base + (long long)cq * 128 + (long long)(va0 + 8)] = blk_12[2];
-                    final_state[seq_base + (long long)(cq + 1) * 128 + (long long)(va0 + 8)] = blk_12[3];
-                    final_state[seq_base + (long long)(8 + cq) * 128 + (long long)va0] = blk_12[4];
-                    final_state[seq_base + (long long)(8 + cq + 1) * 128 + (long long)va0] = blk_12[5];
-                    final_state[seq_base + (long long)(8 + cq) * 128 + (long long)(va0 + 8)] = blk_12[6];
-                    final_state[seq_base + (long long)(8 + cq + 1) * 128 + (long long)(va0 + 8)] = blk_12[7];
-                    final_state[seq_base + (long long)(16 + cq) * 128 + (long long)va0] = blk_12[8];
-                    final_state[seq_base + (long long)(16 + cq + 1) * 128 + (long long)va0] = blk_12[9];
-                    final_state[seq_base + (long long)(16 + cq) * 128 + (long long)(va0 + 8)] = blk_12[10];
-                    final_state[seq_base + (long long)(16 + cq + 1) * 128 + (long long)(va0 + 8)] = blk_12[11];
-                    final_state[seq_base + (long long)(24 + cq) * 128 + (long long)va0] = blk_12[12];
-                    final_state[seq_base + (long long)(24 + cq + 1) * 128 + (long long)va0] = blk_12[13];
-                    final_state[seq_base + (long long)(24 + cq) * 128 + (long long)(va0 + 8)] = blk_12[14];
-                    final_state[seq_base + (long long)(24 + cq + 1) * 128 + (long long)(va0 + 8)] = blk_12[15];
+                    final_state[seq_base + (long long)cq * 128ll + (long long)va0] = blk_12[0];
+                    final_state[seq_base + (long long)(cq + 1) * 128ll + (long long)va0] = blk_12[1];
+                    final_state[seq_base + (long long)cq * 128ll + (long long)(va0 + 8)] = blk_12[2];
+                    final_state[seq_base + (long long)(cq + 1) * 128ll + (long long)(va0 + 8)] = blk_12[3];
+                    final_state[seq_base + (long long)(8 + cq) * 128ll + (long long)va0] = blk_12[4];
+                    final_state[seq_base + (long long)(8 + cq + 1) * 128ll + (long long)va0] = blk_12[5];
+                    final_state[seq_base + (long long)(8 + cq) * 128ll + (long long)(va0 + 8)] = blk_12[6];
+                    final_state[seq_base + (long long)(8 + cq + 1) * 128ll + (long long)(va0 + 8)] = blk_12[7];
+                    final_state[seq_base + (long long)(16 + cq) * 128ll + (long long)va0] = blk_12[8];
+                    final_state[seq_base + (long long)(16 + cq + 1) * 128ll + (long long)va0] = blk_12[9];
+                    final_state[seq_base + (long long)(16 + cq) * 128ll + (long long)(va0 + 8)] = blk_12[10];
+                    final_state[seq_base + (long long)(16 + cq + 1) * 128ll + (long long)(va0 + 8)] = blk_12[11];
+                    final_state[seq_base + (long long)(24 + cq) * 128ll + (long long)va0] = blk_12[12];
+                    final_state[seq_base + (long long)(24 + cq + 1) * 128ll + (long long)va0] = blk_12[13];
+                    final_state[seq_base + (long long)(24 + cq) * 128ll + (long long)(va0 + 8)] = blk_12[14];
+                    final_state[seq_base + (long long)(24 + cq + 1) * 128ll + (long long)(va0 + 8)] = blk_12[15];
                     float blk_13[16];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -805,22 +805,22 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                         : "=r"(*reinterpret_cast<uint32_t*>(&blk_13[0])), "=r"(*reinterpret_cast<uint32_t*>(&blk_13[1])), "=r"(*reinterpret_cast<uint32_t*>(&blk_13[2])), "=r"(*reinterpret_cast<uint32_t*>(&blk_13[3])), "=r"(*reinterpret_cast<uint32_t*>(&blk_13[4])), "=r"(*reinterpret_cast<uint32_t*>(&blk_13[5])), "=r"(*reinterpret_cast<uint32_t*>(&blk_13[6])), "=r"(*reinterpret_cast<uint32_t*>(&blk_13[7])), "=r"(*reinterpret_cast<uint32_t*>(&blk_13[8])), "=r"(*reinterpret_cast<uint32_t*>(&blk_13[9])), "=r"(*reinterpret_cast<uint32_t*>(&blk_13[10])), "=r"(*reinterpret_cast<uint32_t*>(&blk_13[11])), "=r"(*reinterpret_cast<uint32_t*>(&blk_13[12])), "=r"(*reinterpret_cast<uint32_t*>(&blk_13[13])), "=r"(*reinterpret_cast<uint32_t*>(&blk_13[14])), "=r"(*reinterpret_cast<uint32_t*>(&blk_13[15]))
                         : "r"(t_lo + 32));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
-                    final_state[seq_base + (long long)(32 + cq) * 128 + (long long)va0] = blk_13[0];
-                    final_state[seq_base + (long long)(32 + cq + 1) * 128 + (long long)va0] = blk_13[1];
-                    final_state[seq_base + (long long)(32 + cq) * 128 + (long long)(va0 + 8)] = blk_13[2];
-                    final_state[seq_base + (long long)(32 + cq + 1) * 128 + (long long)(va0 + 8)] = blk_13[3];
-                    final_state[seq_base + (long long)(40 + cq) * 128 + (long long)va0] = blk_13[4];
-                    final_state[seq_base + (long long)(40 + cq + 1) * 128 + (long long)va0] = blk_13[5];
-                    final_state[seq_base + (long long)(40 + cq) * 128 + (long long)(va0 + 8)] = blk_13[6];
-                    final_state[seq_base + (long long)(40 + cq + 1) * 128 + (long long)(va0 + 8)] = blk_13[7];
-                    final_state[seq_base + (long long)(48 + cq) * 128 + (long long)va0] = blk_13[8];
-                    final_state[seq_base + (long long)(48 + cq + 1) * 128 + (long long)va0] = blk_13[9];
-                    final_state[seq_base + (long long)(48 + cq) * 128 + (long long)(va0 + 8)] = blk_13[10];
-                    final_state[seq_base + (long long)(48 + cq + 1) * 128 + (long long)(va0 + 8)] = blk_13[11];
-                    final_state[seq_base + (long long)(56 + cq) * 128 + (long long)va0] = blk_13[12];
-                    final_state[seq_base + (long long)(56 + cq + 1) * 128 + (long long)va0] = blk_13[13];
-                    final_state[seq_base + (long long)(56 + cq) * 128 + (long long)(va0 + 8)] = blk_13[14];
-                    final_state[seq_base + (long long)(56 + cq + 1) * 128 + (long long)(va0 + 8)] = blk_13[15];
+                    final_state[seq_base + (long long)(32 + cq) * 128ll + (long long)va0] = blk_13[0];
+                    final_state[seq_base + (long long)(32 + cq + 1) * 128ll + (long long)va0] = blk_13[1];
+                    final_state[seq_base + (long long)(32 + cq) * 128ll + (long long)(va0 + 8)] = blk_13[2];
+                    final_state[seq_base + (long long)(32 + cq + 1) * 128ll + (long long)(va0 + 8)] = blk_13[3];
+                    final_state[seq_base + (long long)(40 + cq) * 128ll + (long long)va0] = blk_13[4];
+                    final_state[seq_base + (long long)(40 + cq + 1) * 128ll + (long long)va0] = blk_13[5];
+                    final_state[seq_base + (long long)(40 + cq) * 128ll + (long long)(va0 + 8)] = blk_13[6];
+                    final_state[seq_base + (long long)(40 + cq + 1) * 128ll + (long long)(va0 + 8)] = blk_13[7];
+                    final_state[seq_base + (long long)(48 + cq) * 128ll + (long long)va0] = blk_13[8];
+                    final_state[seq_base + (long long)(48 + cq + 1) * 128ll + (long long)va0] = blk_13[9];
+                    final_state[seq_base + (long long)(48 + cq) * 128ll + (long long)(va0 + 8)] = blk_13[10];
+                    final_state[seq_base + (long long)(48 + cq + 1) * 128ll + (long long)(va0 + 8)] = blk_13[11];
+                    final_state[seq_base + (long long)(56 + cq) * 128ll + (long long)va0] = blk_13[12];
+                    final_state[seq_base + (long long)(56 + cq + 1) * 128ll + (long long)va0] = blk_13[13];
+                    final_state[seq_base + (long long)(56 + cq) * 128ll + (long long)(va0 + 8)] = blk_13[14];
+                    final_state[seq_base + (long long)(56 + cq + 1) * 128ll + (long long)(va0 + 8)] = blk_13[15];
                     float blk_14[16];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -828,22 +828,22 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                         : "=r"(*reinterpret_cast<uint32_t*>(&blk_14[0])), "=r"(*reinterpret_cast<uint32_t*>(&blk_14[1])), "=r"(*reinterpret_cast<uint32_t*>(&blk_14[2])), "=r"(*reinterpret_cast<uint32_t*>(&blk_14[3])), "=r"(*reinterpret_cast<uint32_t*>(&blk_14[4])), "=r"(*reinterpret_cast<uint32_t*>(&blk_14[5])), "=r"(*reinterpret_cast<uint32_t*>(&blk_14[6])), "=r"(*reinterpret_cast<uint32_t*>(&blk_14[7])), "=r"(*reinterpret_cast<uint32_t*>(&blk_14[8])), "=r"(*reinterpret_cast<uint32_t*>(&blk_14[9])), "=r"(*reinterpret_cast<uint32_t*>(&blk_14[10])), "=r"(*reinterpret_cast<uint32_t*>(&blk_14[11])), "=r"(*reinterpret_cast<uint32_t*>(&blk_14[12])), "=r"(*reinterpret_cast<uint32_t*>(&blk_14[13])), "=r"(*reinterpret_cast<uint32_t*>(&blk_14[14])), "=r"(*reinterpret_cast<uint32_t*>(&blk_14[15]))
                         : "r"(t_lo + 64));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
-                    final_state[seq_base + (long long)(64 + cq) * 128 + (long long)va0] = blk_14[0];
-                    final_state[seq_base + (long long)(64 + cq + 1) * 128 + (long long)va0] = blk_14[1];
-                    final_state[seq_base + (long long)(64 + cq) * 128 + (long long)(va0 + 8)] = blk_14[2];
-                    final_state[seq_base + (long long)(64 + cq + 1) * 128 + (long long)(va0 + 8)] = blk_14[3];
-                    final_state[seq_base + (long long)(72 + cq) * 128 + (long long)va0] = blk_14[4];
-                    final_state[seq_base + (long long)(72 + cq + 1) * 128 + (long long)va0] = blk_14[5];
-                    final_state[seq_base + (long long)(72 + cq) * 128 + (long long)(va0 + 8)] = blk_14[6];
-                    final_state[seq_base + (long long)(72 + cq + 1) * 128 + (long long)(va0 + 8)] = blk_14[7];
-                    final_state[seq_base + (long long)(80 + cq) * 128 + (long long)va0] = blk_14[8];
-                    final_state[seq_base + (long long)(80 + cq + 1) * 128 + (long long)va0] = blk_14[9];
-                    final_state[seq_base + (long long)(80 + cq) * 128 + (long long)(va0 + 8)] = blk_14[10];
-                    final_state[seq_base + (long long)(80 + cq + 1) * 128 + (long long)(va0 + 8)] = blk_14[11];
-                    final_state[seq_base + (long long)(88 + cq) * 128 + (long long)va0] = blk_14[12];
-                    final_state[seq_base + (long long)(88 + cq + 1) * 128 + (long long)va0] = blk_14[13];
-                    final_state[seq_base + (long long)(88 + cq) * 128 + (long long)(va0 + 8)] = blk_14[14];
-                    final_state[seq_base + (long long)(88 + cq + 1) * 128 + (long long)(va0 + 8)] = blk_14[15];
+                    final_state[seq_base + (long long)(64 + cq) * 128ll + (long long)va0] = blk_14[0];
+                    final_state[seq_base + (long long)(64 + cq + 1) * 128ll + (long long)va0] = blk_14[1];
+                    final_state[seq_base + (long long)(64 + cq) * 128ll + (long long)(va0 + 8)] = blk_14[2];
+                    final_state[seq_base + (long long)(64 + cq + 1) * 128ll + (long long)(va0 + 8)] = blk_14[3];
+                    final_state[seq_base + (long long)(72 + cq) * 128ll + (long long)va0] = blk_14[4];
+                    final_state[seq_base + (long long)(72 + cq + 1) * 128ll + (long long)va0] = blk_14[5];
+                    final_state[seq_base + (long long)(72 + cq) * 128ll + (long long)(va0 + 8)] = blk_14[6];
+                    final_state[seq_base + (long long)(72 + cq + 1) * 128ll + (long long)(va0 + 8)] = blk_14[7];
+                    final_state[seq_base + (long long)(80 + cq) * 128ll + (long long)va0] = blk_14[8];
+                    final_state[seq_base + (long long)(80 + cq + 1) * 128ll + (long long)va0] = blk_14[9];
+                    final_state[seq_base + (long long)(80 + cq) * 128ll + (long long)(va0 + 8)] = blk_14[10];
+                    final_state[seq_base + (long long)(80 + cq + 1) * 128ll + (long long)(va0 + 8)] = blk_14[11];
+                    final_state[seq_base + (long long)(88 + cq) * 128ll + (long long)va0] = blk_14[12];
+                    final_state[seq_base + (long long)(88 + cq + 1) * 128ll + (long long)va0] = blk_14[13];
+                    final_state[seq_base + (long long)(88 + cq) * 128ll + (long long)(va0 + 8)] = blk_14[14];
+                    final_state[seq_base + (long long)(88 + cq + 1) * 128ll + (long long)(va0 + 8)] = blk_14[15];
                     float blk_15[16];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -851,22 +851,22 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                         : "=r"(*reinterpret_cast<uint32_t*>(&blk_15[0])), "=r"(*reinterpret_cast<uint32_t*>(&blk_15[1])), "=r"(*reinterpret_cast<uint32_t*>(&blk_15[2])), "=r"(*reinterpret_cast<uint32_t*>(&blk_15[3])), "=r"(*reinterpret_cast<uint32_t*>(&blk_15[4])), "=r"(*reinterpret_cast<uint32_t*>(&blk_15[5])), "=r"(*reinterpret_cast<uint32_t*>(&blk_15[6])), "=r"(*reinterpret_cast<uint32_t*>(&blk_15[7])), "=r"(*reinterpret_cast<uint32_t*>(&blk_15[8])), "=r"(*reinterpret_cast<uint32_t*>(&blk_15[9])), "=r"(*reinterpret_cast<uint32_t*>(&blk_15[10])), "=r"(*reinterpret_cast<uint32_t*>(&blk_15[11])), "=r"(*reinterpret_cast<uint32_t*>(&blk_15[12])), "=r"(*reinterpret_cast<uint32_t*>(&blk_15[13])), "=r"(*reinterpret_cast<uint32_t*>(&blk_15[14])), "=r"(*reinterpret_cast<uint32_t*>(&blk_15[15]))
                         : "r"(t_lo + 96));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
-                    final_state[seq_base + (long long)(96 + cq) * 128 + (long long)va0] = blk_15[0];
-                    final_state[seq_base + (long long)(96 + cq + 1) * 128 + (long long)va0] = blk_15[1];
-                    final_state[seq_base + (long long)(96 + cq) * 128 + (long long)(va0 + 8)] = blk_15[2];
-                    final_state[seq_base + (long long)(96 + cq + 1) * 128 + (long long)(va0 + 8)] = blk_15[3];
-                    final_state[seq_base + (long long)(104 + cq) * 128 + (long long)va0] = blk_15[4];
-                    final_state[seq_base + (long long)(104 + cq + 1) * 128 + (long long)va0] = blk_15[5];
-                    final_state[seq_base + (long long)(104 + cq) * 128 + (long long)(va0 + 8)] = blk_15[6];
-                    final_state[seq_base + (long long)(104 + cq + 1) * 128 + (long long)(va0 + 8)] = blk_15[7];
-                    final_state[seq_base + (long long)(112 + cq) * 128 + (long long)va0] = blk_15[8];
-                    final_state[seq_base + (long long)(112 + cq + 1) * 128 + (long long)va0] = blk_15[9];
-                    final_state[seq_base + (long long)(112 + cq) * 128 + (long long)(va0 + 8)] = blk_15[10];
-                    final_state[seq_base + (long long)(112 + cq + 1) * 128 + (long long)(va0 + 8)] = blk_15[11];
-                    final_state[seq_base + (long long)(120 + cq) * 128 + (long long)va0] = blk_15[12];
-                    final_state[seq_base + (long long)(120 + cq + 1) * 128 + (long long)va0] = blk_15[13];
-                    final_state[seq_base + (long long)(120 + cq) * 128 + (long long)(va0 + 8)] = blk_15[14];
-                    final_state[seq_base + (long long)(120 + cq + 1) * 128 + (long long)(va0 + 8)] = blk_15[15];
+                    final_state[seq_base + (long long)(96 + cq) * 128ll + (long long)va0] = blk_15[0];
+                    final_state[seq_base + (long long)(96 + cq + 1) * 128ll + (long long)va0] = blk_15[1];
+                    final_state[seq_base + (long long)(96 + cq) * 128ll + (long long)(va0 + 8)] = blk_15[2];
+                    final_state[seq_base + (long long)(96 + cq + 1) * 128ll + (long long)(va0 + 8)] = blk_15[3];
+                    final_state[seq_base + (long long)(104 + cq) * 128ll + (long long)va0] = blk_15[4];
+                    final_state[seq_base + (long long)(104 + cq + 1) * 128ll + (long long)va0] = blk_15[5];
+                    final_state[seq_base + (long long)(104 + cq) * 128ll + (long long)(va0 + 8)] = blk_15[6];
+                    final_state[seq_base + (long long)(104 + cq + 1) * 128ll + (long long)(va0 + 8)] = blk_15[7];
+                    final_state[seq_base + (long long)(112 + cq) * 128ll + (long long)va0] = blk_15[8];
+                    final_state[seq_base + (long long)(112 + cq + 1) * 128ll + (long long)va0] = blk_15[9];
+                    final_state[seq_base + (long long)(112 + cq) * 128ll + (long long)(va0 + 8)] = blk_15[10];
+                    final_state[seq_base + (long long)(112 + cq + 1) * 128ll + (long long)(va0 + 8)] = blk_15[11];
+                    final_state[seq_base + (long long)(120 + cq) * 128ll + (long long)va0] = blk_15[12];
+                    final_state[seq_base + (long long)(120 + cq + 1) * 128ll + (long long)va0] = blk_15[13];
+                    final_state[seq_base + (long long)(120 + cq) * 128ll + (long long)(va0 + 8)] = blk_15[14];
+                    final_state[seq_base + (long long)(120 + cq + 1) * 128ll + (long long)(va0 + 8)] = blk_15[15];
                 }
             }
         }
@@ -1172,7 +1172,7 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&words[0])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 3]))
                                 : "r"(s_vn_addr + (unsigned int)(vrow * 128 + vch * 16 ^ (vrow & 7) << 4)));
-                            reinterpret_cast<int4*>(v_new + (((long long)(tok0 + vrow) * (long long)num_v_heads + (long long)hv_1) * 128 + (long long)(64 * vh_1 + vch * 8)))[0] = reinterpret_cast<int4*>(words)[0];
+                            reinterpret_cast<int4*>(v_new + (((long long)(tok0 + vrow) * (long long)num_v_heads + (long long)hv_1) * 128ll + (long long)(64 * vh_1 + vch * 8)))[0] = reinterpret_cast<int4*>(words)[0];
                         }
                     }
                     asm volatile("barrier.sync 1, 128;" ::: "memory");
@@ -1631,8 +1631,8 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                 mbarrier_arrive(pv_ready_addr);
                 mbarrier_wait(o_full_addr + (of_c) * 8, _phase_o_full);
                 asm volatile("tcgen05.fence::after_thread_sync;");
-                long long out_a = ((long long)(tok0_1 + row_a) * (long long)num_v_heads + (long long)hv_2) * 128 + (long long)(64 * vh_2 + cq_2);
-                long long out_b = ((long long)(tok0_1 + row_b) * (long long)num_v_heads + (long long)hv_2) * 128 + (long long)(64 * vh_2 + cq_2);
+                long long out_a = ((long long)(tok0_1 + row_a) * (long long)num_v_heads + (long long)hv_2) * 128ll + (long long)(64 * vh_2 + cq_2);
+                long long out_b = ((long long)(tok0_1 + row_b) * (long long)num_v_heads + (long long)hv_2) * 128ll + (long long)(64 * vh_2 + cq_2);
                 if (n_1 == 64) {
                     if (tid == 256) {
                         asm volatile("cp.async.bulk.wait_group.read 0;");
@@ -1701,7 +1701,7 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((oa + 0)[_lp*2 + 0], (oa + 0)[_lp*2+1 + 0]));
                             wa_0[_lp] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<unsigned*>(o_out + (out_a + 0))[0] = reinterpret_cast<unsigned*>(wa_0)[0];
+                        reinterpret_cast<unsigned*>(o_out + (out_a + 0ll))[0] = reinterpret_cast<unsigned*>(wa_0)[0];
                     }
                     if (row_b < n_1) {
                         unsigned int wb_0[1];
@@ -1710,7 +1710,7 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((oa + 2)[_lp*2 + 0], (oa + 2)[_lp*2+1 + 0]));
                             wb_0[_lp] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<unsigned*>(o_out + (out_b + 0))[0] = reinterpret_cast<unsigned*>(wb_0)[0];
+                        reinterpret_cast<unsigned*>(o_out + (out_b + 0ll))[0] = reinterpret_cast<unsigned*>(wb_0)[0];
                     }
                     if (row_a < n_1) {
                         unsigned int wa_1[1];
@@ -1719,7 +1719,7 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((oa + 4)[_lp*2 + 0], (oa + 4)[_lp*2+1 + 0]));
                             wa_1[_lp] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<unsigned*>(o_out + (out_a + 8))[0] = reinterpret_cast<unsigned*>(wa_1)[0];
+                        reinterpret_cast<unsigned*>(o_out + (out_a + 8ll))[0] = reinterpret_cast<unsigned*>(wa_1)[0];
                     }
                     if (row_b < n_1) {
                         unsigned int wb_1[1];
@@ -1728,7 +1728,7 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((oa + 6)[_lp*2 + 0], (oa + 6)[_lp*2+1 + 0]));
                             wb_1[_lp] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<unsigned*>(o_out + (out_b + 8))[0] = reinterpret_cast<unsigned*>(wb_1)[0];
+                        reinterpret_cast<unsigned*>(o_out + (out_b + 8ll))[0] = reinterpret_cast<unsigned*>(wb_1)[0];
                     }
                     if (row_a < n_1) {
                         unsigned int wa_2[1];
@@ -1737,7 +1737,7 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((oa + 8)[_lp*2 + 0], (oa + 8)[_lp*2+1 + 0]));
                             wa_2[_lp] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<unsigned*>(o_out + (out_a + 16))[0] = reinterpret_cast<unsigned*>(wa_2)[0];
+                        reinterpret_cast<unsigned*>(o_out + (out_a + 16ll))[0] = reinterpret_cast<unsigned*>(wa_2)[0];
                     }
                     if (row_b < n_1) {
                         unsigned int wb_2[1];
@@ -1746,7 +1746,7 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((oa + 10)[_lp*2 + 0], (oa + 10)[_lp*2+1 + 0]));
                             wb_2[_lp] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<unsigned*>(o_out + (out_b + 16))[0] = reinterpret_cast<unsigned*>(wb_2)[0];
+                        reinterpret_cast<unsigned*>(o_out + (out_b + 16ll))[0] = reinterpret_cast<unsigned*>(wb_2)[0];
                     }
                     if (row_a < n_1) {
                         unsigned int wa_3[1];
@@ -1755,7 +1755,7 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((oa + 12)[_lp*2 + 0], (oa + 12)[_lp*2+1 + 0]));
                             wa_3[_lp] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<unsigned*>(o_out + (out_a + 24))[0] = reinterpret_cast<unsigned*>(wa_3)[0];
+                        reinterpret_cast<unsigned*>(o_out + (out_a + 24ll))[0] = reinterpret_cast<unsigned*>(wa_3)[0];
                     }
                     if (row_b < n_1) {
                         unsigned int wb_3[1];
@@ -1764,7 +1764,7 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((oa + 14)[_lp*2 + 0], (oa + 14)[_lp*2+1 + 0]));
                             wb_3[_lp] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<unsigned*>(o_out + (out_b + 24))[0] = reinterpret_cast<unsigned*>(wb_3)[0];
+                        reinterpret_cast<unsigned*>(o_out + (out_b + 24ll))[0] = reinterpret_cast<unsigned*>(wb_3)[0];
                     }
                     if (row_a < n_1) {
                         unsigned int wa_4[1];
@@ -1773,7 +1773,7 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((ob + 0)[_lp*2 + 0], (ob + 0)[_lp*2+1 + 0]));
                             wa_4[_lp] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<unsigned*>(o_out + (out_a + 32))[0] = reinterpret_cast<unsigned*>(wa_4)[0];
+                        reinterpret_cast<unsigned*>(o_out + (out_a + 32ll))[0] = reinterpret_cast<unsigned*>(wa_4)[0];
                     }
                     if (row_b < n_1) {
                         unsigned int wb_4[1];
@@ -1782,7 +1782,7 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((ob + 2)[_lp*2 + 0], (ob + 2)[_lp*2+1 + 0]));
                             wb_4[_lp] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<unsigned*>(o_out + (out_b + 32))[0] = reinterpret_cast<unsigned*>(wb_4)[0];
+                        reinterpret_cast<unsigned*>(o_out + (out_b + 32ll))[0] = reinterpret_cast<unsigned*>(wb_4)[0];
                     }
                     if (row_a < n_1) {
                         unsigned int wa_5[1];
@@ -1791,7 +1791,7 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((ob + 4)[_lp*2 + 0], (ob + 4)[_lp*2+1 + 0]));
                             wa_5[_lp] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<unsigned*>(o_out + (out_a + 40))[0] = reinterpret_cast<unsigned*>(wa_5)[0];
+                        reinterpret_cast<unsigned*>(o_out + (out_a + 40ll))[0] = reinterpret_cast<unsigned*>(wa_5)[0];
                     }
                     if (row_b < n_1) {
                         unsigned int wb_5[1];
@@ -1800,7 +1800,7 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((ob + 6)[_lp*2 + 0], (ob + 6)[_lp*2+1 + 0]));
                             wb_5[_lp] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<unsigned*>(o_out + (out_b + 40))[0] = reinterpret_cast<unsigned*>(wb_5)[0];
+                        reinterpret_cast<unsigned*>(o_out + (out_b + 40ll))[0] = reinterpret_cast<unsigned*>(wb_5)[0];
                     }
                     if (row_a < n_1) {
                         unsigned int wa_6[1];
@@ -1809,7 +1809,7 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((ob + 8)[_lp*2 + 0], (ob + 8)[_lp*2+1 + 0]));
                             wa_6[_lp] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<unsigned*>(o_out + (out_a + 48))[0] = reinterpret_cast<unsigned*>(wa_6)[0];
+                        reinterpret_cast<unsigned*>(o_out + (out_a + 48ll))[0] = reinterpret_cast<unsigned*>(wa_6)[0];
                     }
                     if (row_b < n_1) {
                         unsigned int wb_6[1];
@@ -1818,7 +1818,7 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((ob + 10)[_lp*2 + 0], (ob + 10)[_lp*2+1 + 0]));
                             wb_6[_lp] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<unsigned*>(o_out + (out_b + 48))[0] = reinterpret_cast<unsigned*>(wb_6)[0];
+                        reinterpret_cast<unsigned*>(o_out + (out_b + 48ll))[0] = reinterpret_cast<unsigned*>(wb_6)[0];
                     }
                     if (row_a < n_1) {
                         unsigned int wa_7[1];
@@ -1827,7 +1827,7 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((ob + 12)[_lp*2 + 0], (ob + 12)[_lp*2+1 + 0]));
                             wa_7[_lp] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<unsigned*>(o_out + (out_a + 56))[0] = reinterpret_cast<unsigned*>(wa_7)[0];
+                        reinterpret_cast<unsigned*>(o_out + (out_a + 56ll))[0] = reinterpret_cast<unsigned*>(wa_7)[0];
                     }
                     if (row_b < n_1) {
                         unsigned int wb_7[1];
@@ -1836,7 +1836,7 @@ kernel_cake_gdn_det_train_987a195ad34c5460d24d(const __grid_constant__ CUtensorM
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((ob + 14)[_lp*2 + 0], (ob + 14)[_lp*2+1 + 0]));
                             wb_7[_lp] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<unsigned*>(o_out + (out_b + 56))[0] = reinterpret_cast<unsigned*>(wb_7)[0];
+                        reinterpret_cast<unsigned*>(o_out + (out_b + 56ll))[0] = reinterpret_cast<unsigned*>(wb_7)[0];
                     }
                 }
                 of_c += 1;

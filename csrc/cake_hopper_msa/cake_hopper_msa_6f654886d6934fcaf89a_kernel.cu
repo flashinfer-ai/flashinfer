@@ -102,59 +102,59 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
     }
     cb[2] = 4286578688u;
     if (lim_full > t0 + 2) {
-        cb[2] = S[p + 2 * nq64];
+        cb[2] = S[p + 2ll * nq64];
     }
     cb[3] = 4286578688u;
     if (lim_full > t0 + 3) {
-        cb[3] = S[p + 3 * nq64];
+        cb[3] = S[p + 3ll * nq64];
     }
     cb[4] = 4286578688u;
     if (lim_full > t0 + 4) {
-        cb[4] = S[p + 4 * nq64];
+        cb[4] = S[p + 4ll * nq64];
     }
     cb[5] = 4286578688u;
     if (lim_full > t0 + 5) {
-        cb[5] = S[p + 5 * nq64];
+        cb[5] = S[p + 5ll * nq64];
     }
     cb[6] = 4286578688u;
     if (lim_full > t0 + 6) {
-        cb[6] = S[p + 6 * nq64];
+        cb[6] = S[p + 6ll * nq64];
     }
     cb[7] = 4286578688u;
     if (lim_full > t0 + 7) {
-        cb[7] = S[p + 7 * nq64];
+        cb[7] = S[p + 7ll * nq64];
     }
     cb[8] = 4286578688u;
     if (lim_full > t0 + 8) {
-        cb[8] = S[p + 8 * nq64];
+        cb[8] = S[p + 8ll * nq64];
     }
     cb[9] = 4286578688u;
     if (lim_full > t0 + 9) {
-        cb[9] = S[p + 9 * nq64];
+        cb[9] = S[p + 9ll * nq64];
     }
     cb[10] = 4286578688u;
     if (lim_full > t0 + 10) {
-        cb[10] = S[p + 10 * nq64];
+        cb[10] = S[p + 10ll * nq64];
     }
     cb[11] = 4286578688u;
     if (lim_full > t0 + 11) {
-        cb[11] = S[p + 11 * nq64];
+        cb[11] = S[p + 11ll * nq64];
     }
     cb[12] = 4286578688u;
     if (lim_full > t0 + 12) {
-        cb[12] = S[p + 12 * nq64];
+        cb[12] = S[p + 12ll * nq64];
     }
     cb[13] = 4286578688u;
     if (lim_full > t0 + 13) {
-        cb[13] = S[p + 13 * nq64];
+        cb[13] = S[p + 13ll * nq64];
     }
     cb[14] = 4286578688u;
     if (lim_full > t0 + 14) {
-        cb[14] = S[p + 14 * nq64];
+        cb[14] = S[p + 14ll * nq64];
     }
     cb[15] = 4286578688u;
     if (lim_full > t0 + 15) {
-        cb[15] = S[p + 15 * nq64];
+        cb[15] = S[p + 15ll * nq64];
     }
     asm volatile("" ::: "memory");
     int t0_1 = w * 16;
@@ -221,141 +221,205 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         }
         nb[2] = 4286578688u;
         if (lim > t0_2 + 2) {
-            nb[2] = S[p_0 + 2 * nq64];
+            nb[2] = S[p_0 + 2ll * nq64];
         }
         nb[3] = 4286578688u;
         if (lim > t0_2 + 3) {
-            nb[3] = S[p_0 + 3 * nq64];
+            nb[3] = S[p_0 + 3ll * nq64];
         }
         nb[4] = 4286578688u;
         if (lim > t0_2 + 4) {
-            nb[4] = S[p_0 + 4 * nq64];
+            nb[4] = S[p_0 + 4ll * nq64];
         }
         nb[5] = 4286578688u;
         if (lim > t0_2 + 5) {
-            nb[5] = S[p_0 + 5 * nq64];
+            nb[5] = S[p_0 + 5ll * nq64];
         }
         nb[6] = 4286578688u;
         if (lim > t0_2 + 6) {
-            nb[6] = S[p_0 + 6 * nq64];
+            nb[6] = S[p_0 + 6ll * nq64];
         }
         nb[7] = 4286578688u;
         if (lim > t0_2 + 7) {
-            nb[7] = S[p_0 + 7 * nq64];
+            nb[7] = S[p_0 + 7ll * nq64];
         }
         nb[8] = 4286578688u;
         if (lim > t0_2 + 8) {
-            nb[8] = S[p_0 + 8 * nq64];
+            nb[8] = S[p_0 + 8ll * nq64];
         }
         nb[9] = 4286578688u;
         if (lim > t0_2 + 9) {
-            nb[9] = S[p_0 + 9 * nq64];
+            nb[9] = S[p_0 + 9ll * nq64];
         }
         nb[10] = 4286578688u;
         if (lim > t0_2 + 10) {
-            nb[10] = S[p_0 + 10 * nq64];
+            nb[10] = S[p_0 + 10ll * nq64];
         }
         nb[11] = 4286578688u;
         if (lim > t0_2 + 11) {
-            nb[11] = S[p_0 + 11 * nq64];
+            nb[11] = S[p_0 + 11ll * nq64];
         }
         nb[12] = 4286578688u;
         if (lim > t0_2 + 12) {
-            nb[12] = S[p_0 + 12 * nq64];
+            nb[12] = S[p_0 + 12ll * nq64];
         }
         nb[13] = 4286578688u;
         if (lim > t0_2 + 13) {
-            nb[13] = S[p_0 + 13 * nq64];
+            nb[13] = S[p_0 + 13ll * nq64];
         }
         nb[14] = 4286578688u;
         if (lim > t0_2 + 14) {
-            nb[14] = S[p_0 + 14 * nq64];
+            nb[14] = S[p_0 + 14ll * nq64];
         }
         nb[15] = 4286578688u;
         if (lim > t0_2 + 15) {
-            nb[15] = S[p_0 + 15 * nq64];
+            nb[15] = S[p_0 + 15ll * nq64];
         }
         asm volatile("" ::: "memory");
         int t0_3 = (j + w) * 16;
         float sc = __uint_as_float(cb[0]);
         sc = fmaxf(sc, -1.7014118e+38f);
         sc = fminf(sc, 1.7014118e+38f);
-        unsigned int key_1_0 = __as_u32(sc) & 4294967294u | (unsigned int)t0_3;
+        unsigned int kbits = __as_u32(sc);
+        if (cb[0] == 4286578688u) {
+            kbits = 4282384384u;
+        }
+        unsigned int key_1_0 = kbits & 4294967294u | (unsigned int)t0_3;
         kb[0] = __uint_as_float(key_1_0);
         float sc_0 = __uint_as_float(cb[1]);
         sc_0 = fmaxf(sc_0, -1.7014118e+38f);
         sc_0 = fminf(sc_0, 1.7014118e+38f);
-        unsigned int key_1_1 = __as_u32(sc_0) & 4294967294u | (unsigned int)(t0_3 + 1);
+        unsigned int kbits_0 = __as_u32(sc_0);
+        if (cb[1] == 4286578688u) {
+            kbits_0 = 4282384384u;
+        }
+        unsigned int key_1_1 = kbits_0 & 4294967294u | (unsigned int)(t0_3 + 1);
         kb[1] = __uint_as_float(key_1_1);
         float sc_1 = __uint_as_float(cb[2]);
         sc_1 = fmaxf(sc_1, -1.7014118e+38f);
         sc_1 = fminf(sc_1, 1.7014118e+38f);
-        unsigned int key_1_2 = __as_u32(sc_1) & 4294967294u | (unsigned int)(t0_3 + 2);
+        unsigned int kbits_1 = __as_u32(sc_1);
+        if (cb[2] == 4286578688u) {
+            kbits_1 = 4282384384u;
+        }
+        unsigned int key_1_2 = kbits_1 & 4294967294u | (unsigned int)(t0_3 + 2);
         kb[2] = __uint_as_float(key_1_2);
         float sc_2 = __uint_as_float(cb[3]);
         sc_2 = fmaxf(sc_2, -1.7014118e+38f);
         sc_2 = fminf(sc_2, 1.7014118e+38f);
-        unsigned int key_1_3 = __as_u32(sc_2) & 4294967294u | (unsigned int)(t0_3 + 3);
+        unsigned int kbits_2 = __as_u32(sc_2);
+        if (cb[3] == 4286578688u) {
+            kbits_2 = 4282384384u;
+        }
+        unsigned int key_1_3 = kbits_2 & 4294967294u | (unsigned int)(t0_3 + 3);
         kb[3] = __uint_as_float(key_1_3);
         float sc_3 = __uint_as_float(cb[4]);
         sc_3 = fmaxf(sc_3, -1.7014118e+38f);
         sc_3 = fminf(sc_3, 1.7014118e+38f);
-        unsigned int key_1_4 = __as_u32(sc_3) & 4294967294u | (unsigned int)(t0_3 + 4);
+        unsigned int kbits_3 = __as_u32(sc_3);
+        if (cb[4] == 4286578688u) {
+            kbits_3 = 4282384384u;
+        }
+        unsigned int key_1_4 = kbits_3 & 4294967294u | (unsigned int)(t0_3 + 4);
         kb[4] = __uint_as_float(key_1_4);
         float sc_4 = __uint_as_float(cb[5]);
         sc_4 = fmaxf(sc_4, -1.7014118e+38f);
         sc_4 = fminf(sc_4, 1.7014118e+38f);
-        unsigned int key_1_5 = __as_u32(sc_4) & 4294967294u | (unsigned int)(t0_3 + 5);
+        unsigned int kbits_4 = __as_u32(sc_4);
+        if (cb[5] == 4286578688u) {
+            kbits_4 = 4282384384u;
+        }
+        unsigned int key_1_5 = kbits_4 & 4294967294u | (unsigned int)(t0_3 + 5);
         kb[5] = __uint_as_float(key_1_5);
         float sc_5 = __uint_as_float(cb[6]);
         sc_5 = fmaxf(sc_5, -1.7014118e+38f);
         sc_5 = fminf(sc_5, 1.7014118e+38f);
-        unsigned int key_1_6 = __as_u32(sc_5) & 4294967294u | (unsigned int)(t0_3 + 6);
+        unsigned int kbits_5 = __as_u32(sc_5);
+        if (cb[6] == 4286578688u) {
+            kbits_5 = 4282384384u;
+        }
+        unsigned int key_1_6 = kbits_5 & 4294967294u | (unsigned int)(t0_3 + 6);
         kb[6] = __uint_as_float(key_1_6);
         float sc_6 = __uint_as_float(cb[7]);
         sc_6 = fmaxf(sc_6, -1.7014118e+38f);
         sc_6 = fminf(sc_6, 1.7014118e+38f);
-        unsigned int key_1_7 = __as_u32(sc_6) & 4294967294u | (unsigned int)(t0_3 + 7);
+        unsigned int kbits_6 = __as_u32(sc_6);
+        if (cb[7] == 4286578688u) {
+            kbits_6 = 4282384384u;
+        }
+        unsigned int key_1_7 = kbits_6 & 4294967294u | (unsigned int)(t0_3 + 7);
         kb[7] = __uint_as_float(key_1_7);
         float sc_7 = __uint_as_float(cb[8]);
         sc_7 = fmaxf(sc_7, -1.7014118e+38f);
         sc_7 = fminf(sc_7, 1.7014118e+38f);
-        unsigned int key_1_8 = __as_u32(sc_7) & 4294967294u | (unsigned int)(t0_3 + 8);
+        unsigned int kbits_7 = __as_u32(sc_7);
+        if (cb[8] == 4286578688u) {
+            kbits_7 = 4282384384u;
+        }
+        unsigned int key_1_8 = kbits_7 & 4294967294u | (unsigned int)(t0_3 + 8);
         kb[8] = __uint_as_float(key_1_8);
         float sc_8 = __uint_as_float(cb[9]);
         sc_8 = fmaxf(sc_8, -1.7014118e+38f);
         sc_8 = fminf(sc_8, 1.7014118e+38f);
-        unsigned int key_1_9 = __as_u32(sc_8) & 4294967294u | (unsigned int)(t0_3 + 9);
+        unsigned int kbits_8 = __as_u32(sc_8);
+        if (cb[9] == 4286578688u) {
+            kbits_8 = 4282384384u;
+        }
+        unsigned int key_1_9 = kbits_8 & 4294967294u | (unsigned int)(t0_3 + 9);
         kb[9] = __uint_as_float(key_1_9);
         float sc_9 = __uint_as_float(cb[10]);
         sc_9 = fmaxf(sc_9, -1.7014118e+38f);
         sc_9 = fminf(sc_9, 1.7014118e+38f);
-        unsigned int key_1_10 = __as_u32(sc_9) & 4294967294u | (unsigned int)(t0_3 + 10);
+        unsigned int kbits_9 = __as_u32(sc_9);
+        if (cb[10] == 4286578688u) {
+            kbits_9 = 4282384384u;
+        }
+        unsigned int key_1_10 = kbits_9 & 4294967294u | (unsigned int)(t0_3 + 10);
         kb[10] = __uint_as_float(key_1_10);
         float sc_10 = __uint_as_float(cb[11]);
         sc_10 = fmaxf(sc_10, -1.7014118e+38f);
         sc_10 = fminf(sc_10, 1.7014118e+38f);
-        unsigned int key_1_11 = __as_u32(sc_10) & 4294967294u | (unsigned int)(t0_3 + 11);
+        unsigned int kbits_10 = __as_u32(sc_10);
+        if (cb[11] == 4286578688u) {
+            kbits_10 = 4282384384u;
+        }
+        unsigned int key_1_11 = kbits_10 & 4294967294u | (unsigned int)(t0_3 + 11);
         kb[11] = __uint_as_float(key_1_11);
         float sc_11 = __uint_as_float(cb[12]);
         sc_11 = fmaxf(sc_11, -1.7014118e+38f);
         sc_11 = fminf(sc_11, 1.7014118e+38f);
-        unsigned int key_1_12 = __as_u32(sc_11) & 4294967294u | (unsigned int)(t0_3 + 12);
+        unsigned int kbits_11 = __as_u32(sc_11);
+        if (cb[12] == 4286578688u) {
+            kbits_11 = 4282384384u;
+        }
+        unsigned int key_1_12 = kbits_11 & 4294967294u | (unsigned int)(t0_3 + 12);
         kb[12] = __uint_as_float(key_1_12);
         float sc_12 = __uint_as_float(cb[13]);
         sc_12 = fmaxf(sc_12, -1.7014118e+38f);
         sc_12 = fminf(sc_12, 1.7014118e+38f);
-        unsigned int key_1_13 = __as_u32(sc_12) & 4294967294u | (unsigned int)(t0_3 + 13);
+        unsigned int kbits_12 = __as_u32(sc_12);
+        if (cb[13] == 4286578688u) {
+            kbits_12 = 4282384384u;
+        }
+        unsigned int key_1_13 = kbits_12 & 4294967294u | (unsigned int)(t0_3 + 13);
         kb[13] = __uint_as_float(key_1_13);
         float sc_13 = __uint_as_float(cb[14]);
         sc_13 = fmaxf(sc_13, -1.7014118e+38f);
         sc_13 = fminf(sc_13, 1.7014118e+38f);
-        unsigned int key_1_14 = __as_u32(sc_13) & 4294967294u | (unsigned int)(t0_3 + 14);
+        unsigned int kbits_13 = __as_u32(sc_13);
+        if (cb[14] == 4286578688u) {
+            kbits_13 = 4282384384u;
+        }
+        unsigned int key_1_14 = kbits_13 & 4294967294u | (unsigned int)(t0_3 + 14);
         kb[14] = __uint_as_float(key_1_14);
         float sc_14 = __uint_as_float(cb[15]);
         sc_14 = fmaxf(sc_14, -1.7014118e+38f);
         sc_14 = fminf(sc_14, 1.7014118e+38f);
-        unsigned int key_1_15 = __as_u32(sc_14) & 4294967294u | (unsigned int)(t0_3 + 15);
+        unsigned int kbits_14 = __as_u32(sc_14);
+        if (cb[15] == 4286578688u) {
+            kbits_14 = 4282384384u;
+        }
+        unsigned int key_1_15 = kbits_14 & 4294967294u | (unsigned int)(t0_3 + 15);
         kb[15] = __uint_as_float(key_1_15);
         int f = 0;
         if ((t0_3 < fb || t0_3 + 16 > lim - fe) && t0_3 < lim) {
@@ -983,59 +1047,59 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
             }
             cb2[2] = 4286578688u;
             if (lim2 > t0_4 + 2) {
-                cb2[2] = S[p_1 + 2 * nq64];
+                cb2[2] = S[p_1 + 2ll * nq64];
             }
             cb2[3] = 4286578688u;
             if (lim2 > t0_4 + 3) {
-                cb2[3] = S[p_1 + 3 * nq64];
+                cb2[3] = S[p_1 + 3ll * nq64];
             }
             cb2[4] = 4286578688u;
             if (lim2 > t0_4 + 4) {
-                cb2[4] = S[p_1 + 4 * nq64];
+                cb2[4] = S[p_1 + 4ll * nq64];
             }
             cb2[5] = 4286578688u;
             if (lim2 > t0_4 + 5) {
-                cb2[5] = S[p_1 + 5 * nq64];
+                cb2[5] = S[p_1 + 5ll * nq64];
             }
             cb2[6] = 4286578688u;
             if (lim2 > t0_4 + 6) {
-                cb2[6] = S[p_1 + 6 * nq64];
+                cb2[6] = S[p_1 + 6ll * nq64];
             }
             cb2[7] = 4286578688u;
             if (lim2 > t0_4 + 7) {
-                cb2[7] = S[p_1 + 7 * nq64];
+                cb2[7] = S[p_1 + 7ll * nq64];
             }
             cb2[8] = 4286578688u;
             if (lim2 > t0_4 + 8) {
-                cb2[8] = S[p_1 + 8 * nq64];
+                cb2[8] = S[p_1 + 8ll * nq64];
             }
             cb2[9] = 4286578688u;
             if (lim2 > t0_4 + 9) {
-                cb2[9] = S[p_1 + 9 * nq64];
+                cb2[9] = S[p_1 + 9ll * nq64];
             }
             cb2[10] = 4286578688u;
             if (lim2 > t0_4 + 10) {
-                cb2[10] = S[p_1 + 10 * nq64];
+                cb2[10] = S[p_1 + 10ll * nq64];
             }
             cb2[11] = 4286578688u;
             if (lim2 > t0_4 + 11) {
-                cb2[11] = S[p_1 + 11 * nq64];
+                cb2[11] = S[p_1 + 11ll * nq64];
             }
             cb2[12] = 4286578688u;
             if (lim2 > t0_4 + 12) {
-                cb2[12] = S[p_1 + 12 * nq64];
+                cb2[12] = S[p_1 + 12ll * nq64];
             }
             cb2[13] = 4286578688u;
             if (lim2 > t0_4 + 13) {
-                cb2[13] = S[p_1 + 13 * nq64];
+                cb2[13] = S[p_1 + 13ll * nq64];
             }
             cb2[14] = 4286578688u;
             if (lim2 > t0_4 + 14) {
-                cb2[14] = S[p_1 + 14 * nq64];
+                cb2[14] = S[p_1 + 14ll * nq64];
             }
             cb2[15] = 4286578688u;
             if (lim2 > t0_4 + 15) {
-                cb2[15] = S[p_1 + 15 * nq64];
+                cb2[15] = S[p_1 + 15ll * nq64];
             }
             asm volatile("" ::: "memory");
             #pragma unroll 1
@@ -1052,59 +1116,59 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
                 }
                 nb2[2] = 4286578688u;
                 if (lim2 > t0_5 + 2) {
-                    nb2[2] = S[p_2 + 2 * nq64];
+                    nb2[2] = S[p_2 + 2ll * nq64];
                 }
                 nb2[3] = 4286578688u;
                 if (lim2 > t0_5 + 3) {
-                    nb2[3] = S[p_2 + 3 * nq64];
+                    nb2[3] = S[p_2 + 3ll * nq64];
                 }
                 nb2[4] = 4286578688u;
                 if (lim2 > t0_5 + 4) {
-                    nb2[4] = S[p_2 + 4 * nq64];
+                    nb2[4] = S[p_2 + 4ll * nq64];
                 }
                 nb2[5] = 4286578688u;
                 if (lim2 > t0_5 + 5) {
-                    nb2[5] = S[p_2 + 5 * nq64];
+                    nb2[5] = S[p_2 + 5ll * nq64];
                 }
                 nb2[6] = 4286578688u;
                 if (lim2 > t0_5 + 6) {
-                    nb2[6] = S[p_2 + 6 * nq64];
+                    nb2[6] = S[p_2 + 6ll * nq64];
                 }
                 nb2[7] = 4286578688u;
                 if (lim2 > t0_5 + 7) {
-                    nb2[7] = S[p_2 + 7 * nq64];
+                    nb2[7] = S[p_2 + 7ll * nq64];
                 }
                 nb2[8] = 4286578688u;
                 if (lim2 > t0_5 + 8) {
-                    nb2[8] = S[p_2 + 8 * nq64];
+                    nb2[8] = S[p_2 + 8ll * nq64];
                 }
                 nb2[9] = 4286578688u;
                 if (lim2 > t0_5 + 9) {
-                    nb2[9] = S[p_2 + 9 * nq64];
+                    nb2[9] = S[p_2 + 9ll * nq64];
                 }
                 nb2[10] = 4286578688u;
                 if (lim2 > t0_5 + 10) {
-                    nb2[10] = S[p_2 + 10 * nq64];
+                    nb2[10] = S[p_2 + 10ll * nq64];
                 }
                 nb2[11] = 4286578688u;
                 if (lim2 > t0_5 + 11) {
-                    nb2[11] = S[p_2 + 11 * nq64];
+                    nb2[11] = S[p_2 + 11ll * nq64];
                 }
                 nb2[12] = 4286578688u;
                 if (lim2 > t0_5 + 12) {
-                    nb2[12] = S[p_2 + 12 * nq64];
+                    nb2[12] = S[p_2 + 12ll * nq64];
                 }
                 nb2[13] = 4286578688u;
                 if (lim2 > t0_5 + 13) {
-                    nb2[13] = S[p_2 + 13 * nq64];
+                    nb2[13] = S[p_2 + 13ll * nq64];
                 }
                 nb2[14] = 4286578688u;
                 if (lim2 > t0_5 + 14) {
-                    nb2[14] = S[p_2 + 14 * nq64];
+                    nb2[14] = S[p_2 + 14ll * nq64];
                 }
                 nb2[15] = 4286578688u;
                 if (lim2 > t0_5 + 15) {
-                    nb2[15] = S[p_2 + 15 * nq64];
+                    nb2[15] = S[p_2 + 15ll * nq64];
                 }
                 asm volatile("" ::: "memory");
                 int t0_6 = (j_1 + w) * 16;
@@ -1888,7 +1952,7 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         unsigned int o[16];
         unsigned int k1_1_0 = __as_u32(a[0]);
         unsigned int idx_2_0 = 4294967295u;
-        if (k1_1_0 < 4278190080u) {
+        if (k1_1_0 < 4282384384u) {
             idx_2_0 = k1_1_0 & 1;
         }
         if (flagged != 0) {
@@ -1901,7 +1965,7 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         o[0] = idx_2_0;
         unsigned int k1_1_1 = __as_u32(a[1]);
         unsigned int idx_2_1 = 4294967295u;
-        if (k1_1_1 < 4278190080u) {
+        if (k1_1_1 < 4282384384u) {
             idx_2_1 = k1_1_1 & 1;
         }
         if (flagged != 0) {
@@ -1914,7 +1978,7 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         o[1] = idx_2_1;
         unsigned int k1_1_2 = __as_u32(a[2]);
         unsigned int idx_2_2 = 4294967295u;
-        if (k1_1_2 < 4278190080u) {
+        if (k1_1_2 < 4282384384u) {
             idx_2_2 = k1_1_2 & 1;
         }
         if (flagged != 0) {
@@ -1927,7 +1991,7 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         o[2] = idx_2_2;
         unsigned int k1_1_3 = __as_u32(a[3]);
         unsigned int idx_2_3 = 4294967295u;
-        if (k1_1_3 < 4278190080u) {
+        if (k1_1_3 < 4282384384u) {
             idx_2_3 = k1_1_3 & 1;
         }
         if (flagged != 0) {
@@ -1940,7 +2004,7 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         o[3] = idx_2_3;
         unsigned int k1_1_4 = __as_u32(a[4]);
         unsigned int idx_2_4 = 4294967295u;
-        if (k1_1_4 < 4278190080u) {
+        if (k1_1_4 < 4282384384u) {
             idx_2_4 = k1_1_4 & 1;
         }
         if (flagged != 0) {
@@ -1953,7 +2017,7 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         o[4] = idx_2_4;
         unsigned int k1_1_5 = __as_u32(a[5]);
         unsigned int idx_2_5 = 4294967295u;
-        if (k1_1_5 < 4278190080u) {
+        if (k1_1_5 < 4282384384u) {
             idx_2_5 = k1_1_5 & 1;
         }
         if (flagged != 0) {
@@ -1966,7 +2030,7 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         o[5] = idx_2_5;
         unsigned int k1_1_6 = __as_u32(a[6]);
         unsigned int idx_2_6 = 4294967295u;
-        if (k1_1_6 < 4278190080u) {
+        if (k1_1_6 < 4282384384u) {
             idx_2_6 = k1_1_6 & 1;
         }
         if (flagged != 0) {
@@ -1979,7 +2043,7 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         o[6] = idx_2_6;
         unsigned int k1_1_7 = __as_u32(a[7]);
         unsigned int idx_2_7 = 4294967295u;
-        if (k1_1_7 < 4278190080u) {
+        if (k1_1_7 < 4282384384u) {
             idx_2_7 = k1_1_7 & 1;
         }
         if (flagged != 0) {
@@ -1992,7 +2056,7 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         o[7] = idx_2_7;
         unsigned int k1_1_8 = __as_u32(a[8]);
         unsigned int idx_2_8 = 4294967295u;
-        if (k1_1_8 < 4278190080u) {
+        if (k1_1_8 < 4282384384u) {
             idx_2_8 = k1_1_8 & 1;
         }
         if (flagged != 0) {
@@ -2005,7 +2069,7 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         o[8] = idx_2_8;
         unsigned int k1_1_9 = __as_u32(a[9]);
         unsigned int idx_2_9 = 4294967295u;
-        if (k1_1_9 < 4278190080u) {
+        if (k1_1_9 < 4282384384u) {
             idx_2_9 = k1_1_9 & 1;
         }
         if (flagged != 0) {
@@ -2018,7 +2082,7 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         o[9] = idx_2_9;
         unsigned int k1_1_10 = __as_u32(a[10]);
         unsigned int idx_2_10 = 4294967295u;
-        if (k1_1_10 < 4278190080u) {
+        if (k1_1_10 < 4282384384u) {
             idx_2_10 = k1_1_10 & 1;
         }
         if (flagged != 0) {
@@ -2031,7 +2095,7 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         o[10] = idx_2_10;
         unsigned int k1_1_11 = __as_u32(a[11]);
         unsigned int idx_2_11 = 4294967295u;
-        if (k1_1_11 < 4278190080u) {
+        if (k1_1_11 < 4282384384u) {
             idx_2_11 = k1_1_11 & 1;
         }
         if (flagged != 0) {
@@ -2044,7 +2108,7 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         o[11] = idx_2_11;
         unsigned int k1_1_12 = __as_u32(a[12]);
         unsigned int idx_2_12 = 4294967295u;
-        if (k1_1_12 < 4278190080u) {
+        if (k1_1_12 < 4282384384u) {
             idx_2_12 = k1_1_12 & 1;
         }
         if (flagged != 0) {
@@ -2057,7 +2121,7 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         o[12] = idx_2_12;
         unsigned int k1_1_13 = __as_u32(a[13]);
         unsigned int idx_2_13 = 4294967295u;
-        if (k1_1_13 < 4278190080u) {
+        if (k1_1_13 < 4282384384u) {
             idx_2_13 = k1_1_13 & 1;
         }
         if (flagged != 0) {
@@ -2070,7 +2134,7 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         o[13] = idx_2_13;
         unsigned int k1_1_14 = __as_u32(a[14]);
         unsigned int idx_2_14 = 4294967295u;
-        if (k1_1_14 < 4278190080u) {
+        if (k1_1_14 < 4282384384u) {
             idx_2_14 = k1_1_14 & 1;
         }
         if (flagged != 0) {
@@ -2083,7 +2147,7 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         o[14] = idx_2_14;
         unsigned int k1_1_15 = __as_u32(a[15]);
         unsigned int idx_2_15 = 4294967295u;
-        if (k1_1_15 < 4278190080u) {
+        if (k1_1_15 < 4282384384u) {
             idx_2_15 = k1_1_15 & 1;
         }
         if (flagged != 0) {
@@ -2351,22 +2415,22 @@ kernel_cake_hopper_msa_6f654886d6934fcaf89a(unsigned int* __restrict__ S, int* _
         oi[13] = (int)o[13];
         oi[14] = (int)o[14];
         oi[15] = (int)o[15];
-        long long obase = ((long long)col * (long long)num_heads + (long long)head) * 16;
+        long long obase = ((long long)col * (long long)num_heads + (long long)head) * 16ll;
         {
             int4 _iv4 = make_int4(oi[0 + 0], oi[0 + 1], oi[0 + 2], oi[0 + 3]);
             *reinterpret_cast<int4*>(out + obase) = _iv4;
         }
         {
             int4 _iv4 = make_int4(oi[4 + 0], oi[4 + 1], oi[4 + 2], oi[4 + 3]);
-            *reinterpret_cast<int4*>(out + obase + 4) = _iv4;
+            *reinterpret_cast<int4*>(out + obase + 4ll) = _iv4;
         }
         {
             int4 _iv4 = make_int4(oi[8 + 0], oi[8 + 1], oi[8 + 2], oi[8 + 3]);
-            *reinterpret_cast<int4*>(out + obase + 8) = _iv4;
+            *reinterpret_cast<int4*>(out + obase + 8ll) = _iv4;
         }
         {
             int4 _iv4 = make_int4(oi[12 + 0], oi[12 + 1], oi[12 + 2], oi[12 + 3]);
-            *reinterpret_cast<int4*>(out + obase + 12) = _iv4;
+            *reinterpret_cast<int4*>(out + obase + 12ll) = _iv4;
         }
     }
 }

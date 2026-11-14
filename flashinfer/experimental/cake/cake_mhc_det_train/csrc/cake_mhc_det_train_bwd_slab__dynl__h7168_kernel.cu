@@ -630,8 +630,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                             mbarrier_wait(fn_full_addr, _phase_fn_full);
                         }
                         asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_0 = make_warp_uniform((((dz0_addr_t_0) >> 4) & 0x7FFF) + (mm_stage) * 5376);
+                        int _mma_b_lo_0 = make_warp_uniform(((fnw0_addr_1_2) >> 4) & 0x7FFF);
+#else
                         int _mma_a_lo_0 = make_warp_uniform((((dz0_addr_t_0) >> 4) & 0x3FFF) + (mm_stage) * 5376);
                         int _mma_b_lo_0 = make_warp_uniform(((fnw0_addr_1_2) >> 4) & 0x3FFF);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -656,8 +661,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_accw + (acc_mm * 128))), "r"(0) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_1 = make_warp_uniform((((dz0_addr_t_2) >> 4) & 0x7FFF) + (mm_stage) * 5376);
+                        int _mma_b_lo_1 = make_warp_uniform(((fnw0_addr_1_0) >> 4) & 0x7FFF);
+#else
                         int _mma_a_lo_1 = make_warp_uniform((((dz0_addr_t_2) >> 4) & 0x3FFF) + (mm_stage) * 5376);
                         int _mma_b_lo_1 = make_warp_uniform(((fnw0_addr_1_0) >> 4) & 0x3FFF);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -682,8 +692,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_2 = make_warp_uniform((((dz0_addr_t_1) >> 4) & 0x7FFF) + (mm_stage) * 5376);
+                        int _mma_b_lo_2 = make_warp_uniform(((fnw0_addr_1_1) >> 4) & 0x7FFF);
+#else
                         int _mma_a_lo_2 = make_warp_uniform((((dz0_addr_t_1) >> 4) & 0x3FFF) + (mm_stage) * 5376);
                         int _mma_b_lo_2 = make_warp_uniform(((fnw0_addr_1_1) >> 4) & 0x3FFF);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -708,7 +723,11 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_3 = make_warp_uniform((((dz0_addr_t_0) >> 4) & 0x7FFF) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_3 = make_warp_uniform((((dz0_addr_t_0) >> 4) & 0x3FFF) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -733,7 +752,11 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_3), "r"(_mma_b_lo_2), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_4 = make_warp_uniform((((dz0_addr_t_1) >> 4) & 0x7FFF) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_4 = make_warp_uniform((((dz0_addr_t_1) >> 4) & 0x3FFF) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -758,7 +781,11 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_4), "r"(_mma_b_lo_1), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_5 = make_warp_uniform((((dz0_addr_t_0) >> 4) & 0x7FFF) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_5 = make_warp_uniform((((dz0_addr_t_0) >> 4) & 0x3FFF) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -792,8 +819,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                         int in_grp = tile_1 % 16;
                         int small_init = ((in_grp == 0) ? 1 : 0);
                         unsigned int sbuf = grp_mm % 2;
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_6 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_3 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_6 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_3 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -828,8 +860,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_6), "r"(_mma_b_lo_3), "r"((tmem_dfb0 + (acc_mm * 32))), "r"(0) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_7 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_4 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_7 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_4 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -864,8 +901,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_7), "r"(_mma_b_lo_4), "r"((tmem_dfs0 + (sbuf * 32))), "r"(((small_init) ? 0 : 1)) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_8 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_5 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_8 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_5 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -900,8 +942,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_8), "r"(_mma_b_lo_5), "r"((tmem_dfs0 + (sbuf * 32))), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_9 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_6 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_9 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_6 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -936,8 +983,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_9), "r"(_mma_b_lo_6), "r"((tmem_dfb1 + (acc_mm * 32))), "r"(0) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_10 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_7 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_10 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_7 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -972,8 +1024,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_10), "r"(_mma_b_lo_7), "r"((tmem_dfs1 + (sbuf * 32))), "r"(((small_init) ? 0 : 1)) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_11 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_8 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_11 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_8 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1163,7 +1220,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                                     "setp.ne.b32 p, %0, 0;\n\t"
                                     "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
                                     "}"
-                                    :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq * 24));
+                                    :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq * 24ull));
                                 #pragma unroll
                                 for (int kq_2 = 0; kq_2 < 2; kq_2++) {
                                     int rowa = t0_1 + tokbase + wq_r4[kq_2];
@@ -1171,7 +1228,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                                         rowa = T - 1;
                                     }
                                     asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
-                                        :: "r"(wtab + (unsigned int)(wq_r4[kq_2] * 48 + 16 + 8 * wq_b4[kq_2])), "l"(tokp + ((unsigned long long)rowa * 24 + (unsigned long long)(6 + 2 * wq_b4[kq_2]))));
+                                        :: "r"(wtab + (unsigned int)(wq_r4[kq_2] * 48 + 16 + 8 * wq_b4[kq_2])), "l"(tokp + ((unsigned long long)rowa * 24ull + (unsigned long long)(6 + 2 * wq_b4[kq_2]))));
                                 }
                             } else {
                                 asm volatile(
@@ -1180,7 +1237,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                                     "setp.ne.b32 p, %0, 0;\n\t"
                                     "@p cp.async.ca.shared::cta.global [%1], [%2], 4;\n\t"
                                     "}"
-                                    :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48 + 4)), "l"(tokp + ((unsigned long long)rowq * 24 + 1)));
+                                    :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48 + 4)), "l"(tokp + ((unsigned long long)rowq * 24ull + 1ull)));
                                 #pragma unroll
                                 for (int kq_3 = 0; kq_3 < 3; kq_3++) {
                                     int rowa_1 = t0_1 + tokbase + wq_r5[kq_3];
@@ -1194,10 +1251,10 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                                             "setp.ne.b32 p, %0, 0;\n\t"
                                             "@p cp.async.ca.shared::cta.global [%1], [%2], 8;\n\t"
                                             "}"
-                                            :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_3] * 48 + 8 + 8 * wq_b5[kq_3])), "l"(tokp + ((unsigned long long)rowa_1 * 24 + (unsigned long long)wq_w5[kq_3])));
+                                            :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_3] * 48 + 8 + 8 * wq_b5[kq_3])), "l"(tokp + ((unsigned long long)rowa_1 * 24ull + (unsigned long long)wq_w5[kq_3])));
                                     } else {
                                         asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
-                                            :: "r"(wtab + (unsigned int)(wq_r5[kq_3] * 48 + 8 + 8 * wq_b5[kq_3])), "l"(tokp + ((unsigned long long)rowa_1 * 24 + (unsigned long long)wq_w5[kq_3])));
+                                            :: "r"(wtab + (unsigned int)(wq_r5[kq_3] * 48 + 8 + 8 * wq_b5[kq_3])), "l"(tokp + ((unsigned long long)rowa_1 * 24ull + (unsigned long long)wq_w5[kq_3])));
                                     }
                                 }
                             }
@@ -2639,7 +2696,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                                 "setp.ne.b32 p, %0, 0;\n\t"
                                 "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
                                 "}"
-                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq_1 * 24));
+                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq_1 * 24ull));
                             #pragma unroll
                             for (int kq_4 = 0; kq_4 < 2; kq_4++) {
                                 int rowa_2 = t0_1 + 64 + tokbase + wq_r4[kq_4];
@@ -2647,7 +2704,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                                     rowa_2 = T - 1;
                                 }
                                 asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
-                                    :: "r"(wtab + (unsigned int)(wq_r4[kq_4] * 48 + 16 + 8 * wq_b4[kq_4])), "l"(tokp + ((unsigned long long)rowa_2 * 24 + (unsigned long long)(6 + 2 * wq_b4[kq_4]))));
+                                    :: "r"(wtab + (unsigned int)(wq_r4[kq_4] * 48 + 16 + 8 * wq_b4[kq_4])), "l"(tokp + ((unsigned long long)rowa_2 * 24ull + (unsigned long long)(6 + 2 * wq_b4[kq_4]))));
                             }
                         } else {
                             asm volatile(
@@ -2656,7 +2713,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                                 "setp.ne.b32 p, %0, 0;\n\t"
                                 "@p cp.async.ca.shared::cta.global [%1], [%2], 4;\n\t"
                                 "}"
-                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48 + 4)), "l"(tokp + ((unsigned long long)rowq_1 * 24 + 1)));
+                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48 + 4)), "l"(tokp + ((unsigned long long)rowq_1 * 24ull + 1ull)));
                             #pragma unroll
                             for (int kq_5 = 0; kq_5 < 3; kq_5++) {
                                 int rowa_3 = t0_1 + 64 + tokbase + wq_r5[kq_5];
@@ -2670,10 +2727,10 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                                         "setp.ne.b32 p, %0, 0;\n\t"
                                         "@p cp.async.ca.shared::cta.global [%1], [%2], 8;\n\t"
                                         "}"
-                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_5] * 48 + 8 + 8 * wq_b5[kq_5])), "l"(tokp + ((unsigned long long)rowa_3 * 24 + (unsigned long long)wq_w5[kq_5])));
+                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_5] * 48 + 8 + 8 * wq_b5[kq_5])), "l"(tokp + ((unsigned long long)rowa_3 * 24ull + (unsigned long long)wq_w5[kq_5])));
                                 } else {
                                     asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
-                                        :: "r"(wtab + (unsigned int)(wq_r5[kq_5] * 48 + 8 + 8 * wq_b5[kq_5])), "l"(tokp + ((unsigned long long)rowa_3 * 24 + (unsigned long long)wq_w5[kq_5])));
+                                        :: "r"(wtab + (unsigned int)(wq_r5[kq_5] * 48 + 8 + 8 * wq_b5[kq_5])), "l"(tokp + ((unsigned long long)rowa_3 * 24ull + (unsigned long long)wq_w5[kq_5])));
                                 }
                             }
                         }
@@ -2711,7 +2768,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                                         "setp.ne.b32 p, %0, 0;\n\t"
                                         "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
                                         "}"
-                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq_2 * 24));
+                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq_2 * 24ull));
                                     #pragma unroll
                                     for (int kq_6 = 0; kq_6 < 2; kq_6++) {
                                         int rowa_4 = row0_1_1 + tokbase + wq_r4[kq_6];
@@ -2719,7 +2776,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                                             rowa_4 = T - 1;
                                         }
                                         asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
-                                            :: "r"(wtab + (unsigned int)(wq_r4[kq_6] * 48 + 16 + 8 * wq_b4[kq_6])), "l"(tokp + ((unsigned long long)rowa_4 * 24 + (unsigned long long)(6 + 2 * wq_b4[kq_6]))));
+                                            :: "r"(wtab + (unsigned int)(wq_r4[kq_6] * 48 + 16 + 8 * wq_b4[kq_6])), "l"(tokp + ((unsigned long long)rowa_4 * 24ull + (unsigned long long)(6 + 2 * wq_b4[kq_6]))));
                                     }
                                 } else {
                                     asm volatile(
@@ -2728,7 +2785,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                                         "setp.ne.b32 p, %0, 0;\n\t"
                                         "@p cp.async.ca.shared::cta.global [%1], [%2], 4;\n\t"
                                         "}"
-                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48 + 4)), "l"(tokp + ((unsigned long long)rowq_2 * 24 + 1)));
+                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48 + 4)), "l"(tokp + ((unsigned long long)rowq_2 * 24ull + 1ull)));
                                     #pragma unroll
                                     for (int kq_7 = 0; kq_7 < 3; kq_7++) {
                                         int rowa_5 = row0_1_1 + tokbase + wq_r5[kq_7];
@@ -2742,10 +2799,10 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                                                 "setp.ne.b32 p, %0, 0;\n\t"
                                                 "@p cp.async.ca.shared::cta.global [%1], [%2], 8;\n\t"
                                                 "}"
-                                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_7] * 48 + 8 + 8 * wq_b5[kq_7])), "l"(tokp + ((unsigned long long)rowa_5 * 24 + (unsigned long long)wq_w5[kq_7])));
+                                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_7] * 48 + 8 + 8 * wq_b5[kq_7])), "l"(tokp + ((unsigned long long)rowa_5 * 24ull + (unsigned long long)wq_w5[kq_7])));
                                         } else {
                                             asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
-                                                :: "r"(wtab + (unsigned int)(wq_r5[kq_7] * 48 + 8 + 8 * wq_b5[kq_7])), "l"(tokp + ((unsigned long long)rowa_5 * 24 + (unsigned long long)wq_w5[kq_7])));
+                                                :: "r"(wtab + (unsigned int)(wq_r5[kq_7] * 48 + 8 + 8 * wq_b5[kq_7])), "l"(tokp + ((unsigned long long)rowa_5 * 24ull + (unsigned long long)wq_w5[kq_7])));
                                         }
                                     }
                                 }
@@ -2833,7 +2890,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     if (ep_stage == 2) { ep_stage = 0; _phase_stage_full_x ^= 1; }
                 }
                 unsigned long long kcol = (unsigned long long)(i_str * 7168 + s_2 * 64 + dl);
-                unsigned long long pbase = (unsigned long long)p_2 * 688128;
+                unsigned long long pbase = (unsigned long long)p_2 * 688128ull;
                 #pragma unroll
                 for (int n_3 = 0; n_3 < 24; n_3++) {
                     float _sub_4;

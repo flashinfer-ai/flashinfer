@@ -73,14 +73,16 @@ Saved set (``boundary_mode="saved"``): ``S_in`` (fresh), the owner's c1
 receive tensor (``save_transfer=True``), ``M_seg`` (``P > 1``, with
 ``save_transfer`` or ``save_mode="full"``) and, with
 ``save_mode="full"``, the forward tapes (``h``, ``v_new``, ``w``, ``u``,
-``Aqk``, ``Akk``, the gate rows); ``save_mode="light"`` (default) keeps the
-boundary tensors only and the backward re-runs #1 and the #2 tape walk from
-the saved ``S_in`` -- no exchange, no transfer walk, no merge, no #5.
+``Aqk``, ``Akk``, the gate rows); ``save_mode="light"`` (the default without
+the in-kernel norm) keeps the boundary tensors only and the backward re-runs
+#1 and the #2 tape walk from the saved ``S_in`` -- no exchange, no transfer
+walk, no merge, no #5.
 ``boundary_mode="replay"`` keeps nothing and the backward re-runs the whole
 forward exchange.  Every saved tensor travels through
 ``ctx.save_for_backward`` only, so ``torch.utils.checkpoint(use_reentrant=False)``
-retains nothing after a checkpointed forward (#7039).  The opt-in
-``save_mode="light_akk"`` (``use_qk_l2norm_in_kernel`` only) is ``"light"``
+retains nothing after a checkpointed forward (#7039).
+``save_mode="light_akk"`` (``use_qk_l2norm_in_kernel`` only; the default
+there: a call that leaves ``save_mode`` unset runs it) is ``"light"``
 plus #1's BF16 ``Akk`` tape: its light replay runs ``fwd_prep_replay_l2n``,
 #1_l2n reading that tape instead of forming it (no ``K K^T`` Gram, no block
 inverse), every other output bit for bit #1_l2n's.  Under
@@ -185,8 +187,9 @@ PROGRAMS = (
     "kcp_affine_merge",  # #4: exact FP32 affine chains (state / map / transposed modes), reused from the KDA package
     "fwd_o",  # #5: o = scale e^G q h_c + (Aqk o mask) v_new
     "bwd_prep",  # #6: do_g, dv_intra
-    "kcp_dhu_offset",  # #7 program=offset: reverse walk from zero, final adjoint -> compact tiles (d_f / d_seg)
+    "kcp_dhu_offset",  # #7 cut walk: reverse walk from zero over chunks c_start .. 0, final adjoint -> d_f / d_seg
     "kcp_dhu_tape",  # #7 program=tape: reverse walk from an indexed final adjoint, dh / dv_new tapes
+    "kcp_dhu_cut_start",  # #7 cut table: c_start of each walked (segment, value head) (exact-zero rule)
     "bwd_dqkg",  # #8: dq, dk (grouped FP32 reduction), dv, dbeta, dg partials
     "gate_epilogue",  # #9: dg from the partials (reverse cumsum + chunk term), dbeta pass-through
     "fwd_prep_l2n",  # #1 with the in-kernel Q / K L2 norm: qn / kn / rstd first, then #1's body on qn / kn
@@ -218,6 +221,7 @@ WALK_PROGRAMS = (
     "kcp_transfer_walk",
     "kcp_dhu_offset",
     "kcp_dhu_tape",
+    "kcp_dhu_cut_start",
 )
 TART_MODULE_OF = {
     "fwd_prep": "gdn_chunk_det_train_fwd_prep_v1",
@@ -229,8 +233,9 @@ TART_MODULE_OF = {
     "kcp_affine_merge": "kda_chunk_kcp_affine_merge_fp32_v1",
     "fwd_o": "gdn_chunk_det_train_fwd_o_v1",
     "bwd_prep": "gdn_chunk_det_train_bwd_prep_v1",
-    "kcp_dhu_offset": "gdn_chunk_det_dhu_v1_kcp",
+    "kcp_dhu_offset": "gdn_chunk_dhu_cut_v1_kcp",  # the cut walk: non-deterministic only, no det twin ships it
     "kcp_dhu_tape": "gdn_chunk_det_dhu_v1_kcp",
+    "kcp_dhu_cut_start": "gdn_chunk_dhu_cut_v1_kcp",  # the cut walk's table program (same module)
     "bwd_dqkg": "gdn_chunk_det_train_bwd_dqkg_v1",
     "gate_epilogue": "gdn_chunk_det_train_gate_epilogue_v1",
     "fwd_prep_l2n": "gdn_chunk_det_train_fwd_prep_l2n_v1",
@@ -393,6 +398,7 @@ PROGRAM_ARGS: dict[str, tuple[str, ...]] = {
         "tile_stride",
         "dh_tape",
         "dv_new",
+        "c_start",
     ),
     # #8 read set (the registry record's logical names)
     "bwd_dqkg": (
@@ -463,7 +469,19 @@ PROGRAM_ARGS["kcp_fwdh_out"] = (
 )
 # the tape-and-output walk: the output walk's arguments and the tape walk's h / v_new tapes
 PROGRAM_ARGS["kcp_fwdh_out_tape"] = PROGRAM_ARGS["kcp_fwdh_out"] + ("h_tape", "v_new")
-PROGRAM_ARGS["kcp_dhu_tape"] = PROGRAM_ARGS["kcp_dhu_offset"]
+# the tape walk reads no cut table (it walks every chunk); the cut table program reads three of the walk's tapes
+PROGRAM_ARGS["kcp_dhu_tape"] = PROGRAM_ARGS["kcp_dhu_offset"][:-1]
+PROGRAM_ARGS["kcp_dhu_cut_start"] = (
+    "gamma",
+    "rowscale",
+    "w",
+    "chunk_len",
+    "num_heads",
+    "seg_chunk_start",
+    "num_seqs",
+    "walk_seg",
+    "c_start",
+)
 # The in-kernel Q / K L2 norm: the extra logical names of the two siblings over #1 / #8 and the arguments of
 # ``qk_apply``.  #1_l2n reads the RAW ``q`` / ``k`` (TMA, as #1) and writes ``qn`` / ``kn`` (contiguous
 # ``[T_r, H_qk, 128]``) and ``q_rstd`` / ``k_rstd`` (the two planes of ``qk_rstd``, token stride ``rstd_tstride =
@@ -3005,6 +3023,41 @@ def _call_tickets(
     return hit
 
 
+def _cut_table(ctx: Any, n: int, device: torch.device) -> torch.Tensor:
+    """The int32 cut table ``c_start`` of the #7 offset walk (``kcp_dhu_cut_start`` writes the entries of the walked
+    (segment, value head) pairs, the walk then reads them; no other entry is read, none is zeroed, the host reads
+    none): one buffer per ``(context, device, launch stream)`` in the context's cache, grown to the largest ``n`` asked
+    and shared by the calls on that stream.  A start launch and its walk are issued back to back by
+    :meth:`CakeGDNNondetKcpCall.walk` (deferred together on one side stream, if ever), so a later launch never meets an
+    entry in use.  Fresh per call under a CUDA stream capture (a captured graph keeps the address it baked) or
+    without a context cache, as :func:`_call_tickets`."""
+    n = max(int(n), 1)
+    caches = getattr(ctx, "_caches", None)
+    if not isinstance(caches, dict):
+        return _alloc((n,), torch.int32, device)
+    if device.type == "cuda":
+        capturing = (
+            _IS_CAPTURING()
+            if _IS_CAPTURING is not None
+            else torch.cuda.is_current_stream_capturing()
+        )
+        if capturing:
+            return _alloc((n,), torch.int32, device)
+        index = torch.cuda.current_device()
+        stream = (
+            int(_RAW_STREAM(index))
+            if _RAW_STREAM is not None
+            else int(torch.cuda.current_stream(index).cuda_stream)
+        )
+    else:
+        index, stream = -1, 0  # the host: one ordered queue
+    key = ("kcp_cut_table", str(device), index, stream)
+    table = caches.get(key)
+    if table is None or table.numel() < n:
+        table = caches[key] = _alloc((n,), torch.int32, device)
+    return table if table.numel() == n else table[:n]
+
+
 def _chunk_tokens(ctx: Any, chunk_len: Sequence[int]) -> int:
     """The tokens the context's chunk table ``chunk_len`` covers (its sum; the in-kernel L2 norm's coverage check).
     A context's table is an immutable tuple: its sum is derived once and kept in the context's cache with the table
@@ -3759,6 +3812,26 @@ class CakeGDNNondetKcpCall:
                 else self.tape(DHU_OFFSET_TAPE_STANDIN),
                 dv_new=self.tape("dv_new"),
             )
+            if not tape:
+                # The cut table of this walk: ``kcp_dhu_cut_start`` writes ``c_start`` of every listed (segment, value
+                # head) from the tapes the walk reads, then the walk covers chunks ``c_start .. 0`` of each chain (the
+                # full walk's final state, up to the sign of a zero).  Same stream, same walk list, no host read.
+                c_start = _cut_table(self.ctx, int(self.tb.NSEG) * self.HV, self.device)
+                self.kernel(
+                    "kcp_dhu_cut_start",
+                    n_walk * self.HV,
+                    _grid_args={"n_walk": n_walk, "num_heads": self.HV},
+                    gamma=args["gamma"],
+                    rowscale=args["rowscale"],
+                    w=args["w"],
+                    chunk_len=args["chunk_len"],
+                    num_heads=self.HV,
+                    seg_chunk_start=args["seg_chunk_start"],
+                    num_seqs=args["num_seqs"],
+                    walk_seg=args["walk_seg"],
+                    c_start=c_start,
+                )
+                args["c_start"] = c_start
         else:
             raise ValueError(f"{name} is not a walk program")
         sm_count = int(getattr(self.ctx, "sm_count", 0) or 0)
@@ -6324,6 +6397,12 @@ def _check_saved(saved: CakeGDNNondetKcpSaved, call: CakeGDNNondetKcpCall) -> No
         raise ValueError(
             f"saved: scale {saved.scale} differs from the call's {call.scale}"
         )
+    # the norm flag first: a call that leaves save_mode unset takes its default from it ("light_akk" with the norm,
+    # "light" without), so a flag that differs from the forward's also changes that default
+    if bool(saved.qk_l2norm) != call.l2n:
+        raise ValueError(
+            f"saved: use_qk_l2norm_in_kernel={call.l2n} differs from the forward's ({bool(saved.qk_l2norm)})"
+        )
     if (
         saved.save_transfer != opts.save_transfer
         or saved.exchange != call.exchange
@@ -6337,10 +6416,6 @@ def _check_saved(saved: CakeGDNNondetKcpSaved, call: CakeGDNNondetKcpCall) -> No
             "the forward's"
         )
     _check(saved.S_in, "saved.S_in", (tb.sizes["S_in"],), call.state_dtype, call.device)
-    if bool(saved.qk_l2norm) != call.l2n:
-        raise ValueError(
-            f"saved: use_qk_l2norm_in_kernel={call.l2n} differs from the forward's ({bool(saved.qk_l2norm)})"
-        )
     if call.l2n:
         if saved.qk_rstd is None:
             raise ValueError(
@@ -7097,7 +7172,7 @@ def cake_gdn_nondet_kcp(
     ctx: Any,
     *,
     scale: float | None = None,
-    save_mode: str = _opt.SAVE_MODE_DEFAULT,
+    save_mode: str | None = None,
     boundary_mode: str = _opt.BOUNDARY_MODE_DEFAULT,
     workspace: CakeGDNNondetKcpWorkspace | None = None,
     graph: str = _opt.GRAPH_DEFAULT,
@@ -7109,7 +7184,10 @@ def cake_gdn_nondet_kcp(
     """The differentiable KCP forward: ``out`` like ``v``; gradients for ``q, k, v, g, beta``
     in the backward's order ``(dq, dk, dv, dbeta, dg)``.  With an ``options`` instance, the four literal keywords
     (``save_mode``, ``boundary_mode``, ``graph``, ``use_qk_l2norm_in_kernel``) override it only when they differ from
-    their documented defaults.  ``use_qk_l2norm_in_kernel=True``: the in-kernel per-head L2 norm of q / k (the
+    their documented defaults.  ``save_mode`` left unset (``None``) runs ``"light_akk"`` with
+    ``use_qk_l2norm_in_kernel=True`` and ``"light"`` without it (:class:`CakeGDNNondetKcpOptions`; under
+    ``torch.utils.checkpoint(use_reentrant=False)`` ``"light_akk"`` saves as ``"light"``).
+    ``use_qk_l2norm_in_kernel=True``: the in-kernel per-head L2 norm of q / k (the
     gradient is the exact derivative of ``bf16(q * r)``'s FP32 form at the stored point; module docstring).  ``recompute_handle``
     (:class:`CakeGDNNondetKcpRecomputeHandle`): the checkpoint recompute of this forward exchanges nothing -- it reads the
     incoming states the original forward stored in the handle; needs ``boundary_mode="saved"`` and ``graph="off"``,
@@ -7124,7 +7202,7 @@ def cake_gdn_nondet_kcp(
     (7-8 %) on R200, with the in-kernel norm off or on (README, "Packed Q/K/V")."""
     over = _literal_overrides(
         options,
-        ("save_mode", save_mode, _opt.SAVE_MODE_DEFAULT),
+        ("save_mode", save_mode, None),
         ("boundary_mode", boundary_mode, _opt.BOUNDARY_MODE_DEFAULT),
         ("graph", graph, _opt.GRAPH_DEFAULT),
         (

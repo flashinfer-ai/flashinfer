@@ -132,11 +132,11 @@ kernel_cake_mhc_train_fwd_coef__st8_lp2_as_el_qd__h7168(float* __restrict__ spar
             qdc[j_2] = qpart[(long long)kq * tp64 + tcr[j_2]];
         }
         if (p_k <= 8) {
-            long long sa_row = (long long)g * 8;
+            long long sa_row = (long long)g * 8ll;
             int sa_i0_1 = tid_2;
             int sa_plane0_1 = sa_i0_1 / 48;
             int sa_within0_1 = sa_i0_1 - sa_plane0_1 * 48;
-            long long sa_src0_1 = ((long long)sa_plane0_1 * tp64 + sa_row) * 24 + (long long)(sa_within0_1 * 4);
+            long long sa_src0_1 = ((long long)sa_plane0_1 * tp64 + sa_row) * 24ll + (long long)(sa_within0_1 * 4);
             asm volatile(
                 "{\n\t"
                 ".reg .pred p;\n\t"
@@ -147,7 +147,7 @@ kernel_cake_mhc_train_fwd_coef__st8_lp2_as_el_qd__h7168(float* __restrict__ spar
             int sa_i0_1_0 = tid_2 + 128;
             int sa_plane0_1_0 = sa_i0_1_0 / 48;
             int sa_within0_1_0 = sa_i0_1_0 - sa_plane0_1_0 * 48;
-            long long sa_src0_1_0 = ((long long)sa_plane0_1_0 * tp64 + sa_row) * 24 + (long long)(sa_within0_1_0 * 4);
+            long long sa_src0_1_0 = ((long long)sa_plane0_1_0 * tp64 + sa_row) * 24ll + (long long)(sa_within0_1_0 * 4);
             asm volatile(
                 "{\n\t"
                 ".reg .pred p;\n\t"
@@ -158,7 +158,7 @@ kernel_cake_mhc_train_fwd_coef__st8_lp2_as_el_qd__h7168(float* __restrict__ spar
             int sa_i0_1_1 = tid_2 + 256;
             int sa_plane0_1_1 = sa_i0_1_1 / 48;
             int sa_within0_1_1 = sa_i0_1_1 - sa_plane0_1_1 * 48;
-            long long sa_src0_1_1 = ((long long)sa_plane0_1_1 * tp64 + sa_row) * 24 + (long long)(sa_within0_1_1 * 4);
+            long long sa_src0_1_1 = ((long long)sa_plane0_1_1 * tp64 + sa_row) * 24ll + (long long)(sa_within0_1_1 * 4);
             asm volatile(
                 "{\n\t"
                 ".reg .pred p;\n\t"
@@ -200,10 +200,10 @@ kernel_cake_mhc_train_fwd_coef__st8_lp2_as_el_qd__h7168(float* __restrict__ spar
                 long long k64 = (long long)k_1 * tp64;
                 long long plane = k64 + tcr[0];
                 float _add_4;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_4) : "f"(s_acc[0]), "f"(spart[plane * 24 + n64]));
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_4) : "f"(s_acc[0]), "f"(spart[plane * 24ll + n64]));
                 s_acc[0] = _add_4;
                 float _add_5;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_5) : "f"(s_acc[1]), "f"(spart[plane * 24 + (24 + n64)]));
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_5) : "f"(s_acc[1]), "f"(spart[plane * 24ll + (24ll + n64)]));
                 s_acc[1] = _add_5;
             }
             #pragma unroll
@@ -633,16 +633,16 @@ kernel_cake_mhc_train_fwd_coef__st8_lp2_as_el_qd__h7168(float* __restrict__ spar
             int tok = tokr[j_7];
             long long tc64 = tcr[j_7];
             if (tok < T) {
-                long long row = tc64 * 64;
+                long long row = tc64 * 64ll;
                 if (lane_0 == 0) {
                     *(reinterpret_cast<float*>(stats + row) + (0)) = rr[j_7];
                 }
                 if (lane_0 < 24) {
-                    *(reinterpret_cast<float*>(stats + (row + 1 + lane64)) + (0)) = zz[j_7];
-                    *(reinterpret_cast<float*>(stats + (row + 25 + lane64)) + (0)) = cc[j_7];
+                    *(reinterpret_cast<float*>(stats + (row + 1ll + lane64)) + (0)) = zz[j_7];
+                    *(reinterpret_cast<float*>(stats + (row + 25ll + lane64)) + (0)) = cc[j_7];
                 }
                 if (lane_0 < 15) {
-                    *(reinterpret_cast<float*>(stats + (row + 49 + lane64)) + (0)) = 0.0f;
+                    *(reinterpret_cast<float*>(stats + (row + 49ll + lane64)) + (0)) = 0.0f;
                 }
             }
         }

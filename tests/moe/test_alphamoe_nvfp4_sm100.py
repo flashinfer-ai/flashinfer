@@ -1,5 +1,7 @@
 """Correctness and contract tests for the frozen AlphaMoE NVFP4 kernel."""
 
+import threading
+
 import pytest
 import torch
 from flashinfer.fused_moe.alphamoe_nvfp4_sm100 import prepare_nvfp4_w2_data
@@ -688,6 +690,14 @@ def _initial_output(case: dict, seed: int, scale: float = 4.0) -> torch.Tensor:
     ).to(torch.bfloat16)
 
 
+_NEGATIVE_ZERO_BITS = -(2**31)  # FP32 -0 viewed as int32
+
+
+def _is_negative_zero(buffer: torch.Tensor) -> bool:
+    """Every element of the FP32 ``buffer`` is -0 (a +0 element fails)."""
+    return bool(torch.all(buffer.view(torch.int32) == _NEGATIVE_ZERO_BITS))
+
+
 def test_alphamoe_nvfp4_aligned_adds_the_output_last_in_fp32():
     """The aligned entry adds the caller's output once, after every route:
     out = bf16(accumulator + float32(out)), round to nearest even, bit exact."""
@@ -715,7 +725,7 @@ def test_alphamoe_nvfp4_aligned_adds_the_output_last_in_fp32():
 
 def test_alphamoe_nvfp4_aligned_accumulator_is_zero_between_calls():
     """Consecutive calls on a stream reuse one FP32 accumulator, which each call
-    leaves at +0: the second call matches the first one's contract, and a call
+    leaves at -0: the second call matches the first one's contract, and a call
     over an empty plan returns its output unchanged. Another stream uses its
     own accumulator."""
     _skip_if_not_supported()
@@ -734,7 +744,7 @@ def test_alphamoe_nvfp4_aligned_accumulator_is_zero_between_calls():
     key = (torch.cuda.current_device(), torch.cuda.current_stream().cuda_stream)
     cached = entry._ALIGNED_ACCUMULATORS[key]
     assert cached.dtype == torch.float32 and cached.numel() >= m * k
-    assert torch.count_nonzero(cached) == 0, "the accumulator is not +0 after a call"
+    assert _is_negative_zero(cached), "the accumulator is not -0 after a call"
 
     zero_extent = torch.zeros((1,), dtype=torch.int32, device="cuda")
     unchanged = _launch(case, out=initial.clone(), num_tokens_post_padded=zero_extent)
@@ -752,14 +762,14 @@ def test_alphamoe_nvfp4_aligned_accumulator_is_zero_between_calls():
     _assert_nvfp4_close(on_side, expected, "call on another stream")
     side_key = (torch.cuda.current_device(), side.cuda_stream)
     assert entry._ALIGNED_ACCUMULATORS[side_key] is not cached
-    assert torch.count_nonzero(entry._ALIGNED_ACCUMULATORS[side_key]) == 0
+    assert _is_negative_zero(entry._ALIGNED_ACCUMULATORS[side_key])
     assert entry._ALIGNED_ACCUMULATORS[key] is cached
 
 
 def test_alphamoe_nvfp4_aligned_cuda_graph_replays_add_into_their_output():
     """A captured call takes its own zero-filled accumulator from the graph's
     pool: each replay adds the routes into the output it finds, and eager calls
-    before and after the replays keep their own accumulator at +0."""
+    before and after the replays keep their own accumulator at -0."""
     _skip_if_not_supported()
     from flashinfer.fused_moe import alphamoe_nvfp4_sm100 as entry
 
@@ -795,9 +805,198 @@ def test_alphamoe_nvfp4_aligned_cuda_graph_replays_add_into_their_output():
         eager, _reference(case, out_init=initial), "eager after replays"
     )
     assert all(
-        torch.count_nonzero(buffer) == 0
-        for buffer in entry._ALIGNED_ACCUMULATORS.values()
+        _is_negative_zero(buffer) for buffer in entry._ALIGNED_ACCUMULATORS.values()
     )
+
+
+def test_alphamoe_nvfp4_aligned_keeps_negative_zero_without_contributions():
+    """An element no route reaches keeps its exact BF16 bits, including -0:
+    the accumulator rests at -0, the additive identity, in the cached buffer
+    and in the temporary of a captured call."""
+    _skip_if_not_supported()
+    from flashinfer.fused_moe import alphamoe_nvfp4_sm100 as entry
+
+    case = _make_case(17, 256, 512, 8, 3, 8, 0.8, 2.5, 28103)
+    m, top_k, block_m = case["M"], case["top_k"], case["block_m"]
+    neg_zero = torch.full((m, case["K"]), -0.0, dtype=torch.bfloat16, device="cuda")
+    assert torch.all(neg_zero.view(torch.int16) == -(2**15))
+    # Warm the cached accumulator of this stream, so the calls below drain it.
+    _launch(case, out=torch.zeros_like(case["out"]))
+    torch.cuda.synchronize()
+    key = (torch.cuda.current_device(), torch.cuda.current_stream().cuda_stream)
+    assert torch.all(
+        entry._ALIGNED_ACCUMULATORS[key].view(torch.int32) == _NEGATIVE_ZERO_BITS
+    ), "the cached accumulator does not rest at -0"
+
+    empty = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    out = _launch(case, out=neg_zero.clone(), num_tokens_post_padded=empty)
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int16), neg_zero.view(torch.int16)), (
+        "an empty plan turned -0 into +0"
+    )
+
+    # A non-empty plan: rows that no active plan entry covers keep their -0.
+    extent = torch.tensor([block_m], dtype=torch.int32, device="cuda")
+    active = case["sorted_token_ids"][:block_m].cpu().tolist()
+    covered = {pair // top_k for pair in active if pair < m * top_k}
+    rows = torch.tensor([row for row in range(m) if row not in covered], device="cuda")
+    assert rows.numel() > 0
+    out = _launch(case, out=neg_zero.clone(), num_tokens_post_padded=extent)
+    torch.cuda.synchronize()
+    assert torch.equal(out[rows].view(torch.int16), neg_zero[rows].view(torch.int16)), (
+        "rows no route reaches turned -0 into +0"
+    )
+    _assert_nvfp4_close(
+        out,
+        _reference(case, out_init=neg_zero, plan_extent=block_m),
+        "truncated plan over a -0 output",
+    )
+
+    # A captured call takes a temporary accumulator, filled by each replay.
+    static_out = neg_zero.clone()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        _launch(case, out=static_out, num_tokens_post_padded=empty)
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _launch(case, out=static_out, num_tokens_post_padded=empty)
+    static_out.copy_(neg_zero)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(static_out.view(torch.int16), neg_zero.view(torch.int16)), (
+        "a captured empty plan turned -0 into +0"
+    )
+
+
+def test_alphamoe_nvfp4_aligned_accumulator_cache_is_bounded():
+    """Calls on many streams keep accumulators for at most
+    ``_ALIGNED_ACCUMULATOR_STREAMS`` streams per device; a stream whose buffer
+    was released takes a fresh one and returns the contract result."""
+    _skip_if_not_supported()
+    from flashinfer.fused_moe import alphamoe_nvfp4_sm100 as entry
+
+    limit = getattr(entry, "_ALIGNED_ACCUMULATOR_STREAMS", 32)
+    case = _make_case(*_FUSED_BATCH_CASE)
+    initial = _initial_output(case, 28156)
+    expected = _reference(case, out_init=initial)
+    zero_extent = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    device = torch.cuda.current_device()
+    # The pool hands out 32 streams per priority, in turn: two priorities give
+    # more distinct streams than the limit.
+    streams, handles = [], set()
+    for priority in (0, -1):
+        for _ in range(32):
+            stream = torch.cuda.Stream(priority=priority)
+            if stream.cuda_stream not in handles:
+                handles.add(stream.cuda_stream)
+                streams.append(stream)
+    streams = streams[: limit + 8]
+    assert len(streams) > limit
+    _launch(case, out=initial.clone())
+    torch.cuda.synchronize()
+    base = torch.cuda.memory_allocated()
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            out = _launch(case, out=initial.clone(), num_tokens_post_padded=zero_extent)
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.int16), initial.view(torch.int16))
+        del out
+    held = [key for key in entry._ALIGNED_ACCUMULATORS if key[0] == device]
+    assert len(held) <= limit, f"{len(held)} cached accumulators on one device"
+    nbytes = 4 * case["M"] * case["K"]
+    assert torch.cuda.memory_allocated() - base <= limit * nbytes + (1 << 20)
+
+    first = streams[0]
+    assert (device, first.cuda_stream) not in entry._ALIGNED_ACCUMULATORS
+    first.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(first):
+        again = _launch(case, out=initial.clone())
+    torch.cuda.current_stream().wait_stream(first)
+    torch.cuda.synchronize()
+    _assert_nvfp4_close(again, expected, "call on a released stream")
+    assert all(
+        _is_negative_zero(buffer) for buffer in entry._ALIGNED_ACCUMULATORS.values()
+    )
+
+
+def _on_per_thread_stream(device: int, body, errors: list) -> None:
+    """Run ``body`` on this host thread with cudaStreamPerThread current."""
+    from flashinfer.fused_moe import alphamoe_nvfp4_sm100 as entry
+
+    try:
+        per_thread = torch.cuda.ExternalStream(
+            entry._CUDA_STREAM_PER_THREAD, device=device
+        )
+        with torch.cuda.device(device), torch.cuda.stream(per_thread):
+            body()
+    except BaseException as error:  # reported by the main thread
+        errors.append(error)
+
+
+def test_alphamoe_nvfp4_aligned_per_thread_stream_keeps_no_accumulator():
+    """cudaStreamPerThread names a different queue on each host thread, so a
+    call on it takes a per-call accumulator and leaves no cache entry."""
+    _skip_if_not_supported()
+    from flashinfer.fused_moe import alphamoe_nvfp4_sm100 as entry
+
+    device = torch.cuda.current_device()
+    case = _make_case(*_FUSED_BATCH_CASE)
+    initial = _initial_output(case, 28157)
+    expected = _reference(case, out_init=initial)
+    out = initial.clone()
+    torch.cuda.synchronize()
+    entry._ALIGNED_ACCUMULATORS.pop((device, entry._CUDA_STREAM_PER_THREAD), None)
+    errors: list = []
+
+    def body() -> None:
+        _launch(case, out=out)
+        torch.cuda.current_stream().synchronize()
+
+    worker = threading.Thread(target=_on_per_thread_stream, args=(device, body, errors))
+    worker.start()
+    worker.join()
+    if errors:
+        raise errors[0]
+    torch.cuda.synchronize()
+    assert (device, entry._CUDA_STREAM_PER_THREAD) not in entry._ALIGNED_ACCUMULATORS
+    _assert_nvfp4_close(out, expected, "call on the per-thread stream")
+
+
+def test_alphamoe_nvfp4_drain_accumulator_rejects_overlapping_tensors():
+    """The raw drain op refuses an accumulator that overlaps ``out``; disjoint
+    tensors drain to out = bf16(accumulator + float32(out)) and leave the
+    accumulator at -0."""
+    _skip_if_not_supported()
+    from flashinfer.fused_moe.alphamoe_nvfp4_sm100 import (
+        get_alphamoe_nvfp4_sm100_module,
+    )
+
+    drain = get_alphamoe_nvfp4_sm100_module().nvfp4_drain_accumulator_op
+    m, k = 16, 256
+    storage = torch.zeros(4 * m * k, dtype=torch.uint8, device="cuda")
+    aliased_accumulator = storage.view(torch.float32).view(m, k)
+    aliased_out = storage[: 2 * m * k].view(torch.bfloat16).view(m, k)
+    with pytest.raises(RuntimeError, match="accumulator must not overlap out"):
+        drain(aliased_accumulator, aliased_out)
+    torch.cuda.synchronize()
+
+    generator = torch.Generator(device="cuda").manual_seed(28159)
+    accumulator = torch.randn(
+        (m, k), dtype=torch.float32, device="cuda", generator=generator
+    )
+    out = torch.randn(
+        (m, k), dtype=torch.float32, device="cuda", generator=generator
+    ).to(torch.bfloat16)
+    expected = (accumulator + out.float()).to(torch.bfloat16)
+    drain(accumulator, out)
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+    assert torch.all(accumulator.view(torch.int32) == _NEGATIVE_ZERO_BITS)
 
 
 # ---------------------------------------------------------------------------

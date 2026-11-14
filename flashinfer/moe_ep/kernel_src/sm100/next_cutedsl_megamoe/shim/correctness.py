@@ -13,7 +13,9 @@ from .kernel_helpers import compute_megamoe_reference_block_scaled
 def sampled_reference(
     symm_buffer, l1, l2, num_tokens: int, *, process_group=None, sample_size=64
 ):
-    """Reference evenly spaced rows including both ends, using actual staged bytes.
+    """Reference evenly spaced rows using actual staged bytes.
+
+    Samples of two or more rows include both endpoints; a one-row sample uses row 0.
 
     Each rank evaluates its local experts for one source rank at a time.
     Communication and FP32 expert scratch are bounded by ``sample_size`` and
@@ -21,7 +23,11 @@ def sampled_reference(
     """
     cfg = symm_buffer.config
     count = min(sample_size, num_tokens)
-    indices = torch.linspace(0, max(num_tokens - 1, 0), count, device="cuda").long()
+    indices = (
+        torch.arange(count, device="cuda", dtype=torch.int64)
+        * max(num_tokens - 1, 0)
+        // max(count - 1, 1)
+    )
     sources = [
         symm_buffer.x,
         symm_buffer.x_sf,
@@ -70,7 +76,11 @@ def sampled_reference(
             quant_kind=cfg.quant_kind,
             combine_dtype=cfg.combine_dtype,
             local_expert_offset=cfg.rank * cfg.experts_per_rank,
-            gate_up_clamp=cfg.gate_up_clamp,
+            gate_up_clamp=(
+                abs(cfg.gate_up_clamp)
+                if cfg.batch_invariant and cfg.gate_up_clamp is not None
+                else cfg.gate_up_clamp
+            ),
             apply_routing_weights_before_fc2=cfg.apply_routing_weights_before_fc2,
             weight_scales_are_swizzled=True,
             return_fp32=True,

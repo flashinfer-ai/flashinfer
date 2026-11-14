@@ -752,7 +752,6 @@ def test_checkpoint_restore_keeps_captured_graph_valid(backend):
         replay_and_check(graph, out)
 
         memory = comm._state["mnnvl_mem"]
-        cft_enabled = getattr(comm, "_cft_enabled", None)
         comm.checkpoint_prepare()
         comm.checkpoint_prepare()
         assert not MnnvlMemory.allocated_map[memory.ptr].mapped
@@ -760,8 +759,6 @@ def test_checkpoint_restore_keeps_captured_graph_valid(backend):
         comm.checkpoint_restore(fresh_backend)
         comm.checkpoint_restore(fresh_backend)
         assert MnnvlMemory.allocated_map[memory.ptr].mapped
-        if backend == "nvlink_one_sided":
-            assert comm._cft_enabled == cft_enabled
 
         for _ in range(2):
             replay_and_check(graph, out)

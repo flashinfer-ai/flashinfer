@@ -145,6 +145,7 @@ PROGRAMS = (
     "bwd_prep",
     "kcp_dhu_offset",
     "kcp_dhu_tape",
+    "kcp_dhu_cut_start",
     "bwd_dqkg",
     "gate_epilogue",
     "fwd_prep_l2n",
@@ -162,6 +163,7 @@ WALK_PROGRAMS = (
     "kcp_transfer_walk",
     "kcp_dhu_offset",
     "kcp_dhu_tape",
+    "kcp_dhu_cut_start",
 )
 LOCAL_PROGRAMS = (
     "fwd_prep",
@@ -193,6 +195,9 @@ LOCAL_PROGRAMS = (
 # contiguous (the normalized rows; #1_l2n's outputs, #8_l2n's TMA operands ``q`` / ``k``), ``q_rstd`` / ``k_rstd`` f32
 # ``[T, H_qk]`` with token stride ``rstd_tstride``, ``q_raw`` / ``k_raw`` the raw bf16 rows (global loads with token
 # strides ``q_raw_tstride`` / ``k_raw_tstride`` in elements).
+# The cut adjoint offset walk: ``c_start`` int32 ``[NSEG x HV]``, the first local chunk of each (segment, value head)
+# chain the ``kcp_dhu_offset`` walk reads (it walks chunks ``c_start .. 0``; ``None`` walks every chunk), written
+# by ``kcp_dhu_cut_start`` before each offset walk on the same stream and never read by the host.
 LOGICAL_TENSORS = (
     "q",
     "k",
@@ -236,6 +241,7 @@ LOGICAL_TENSORS = (
     "dht_index",
     "out",
     "out_index",
+    "c_start",
     "m",
     "c",
     "x0",
@@ -925,6 +931,48 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {"kind": "columns", "ncols": 128},
         "variant": "c8",
     },
+    "kcp_dhu_cut_start": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "gamma"],
+            ["buffer", "rowscale"],
+            ["buffer", "w"],
+            ["buffer", "chunk_len"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["buffer", "walk_seg"],
+            ["buffer", "c_start"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "kcp_segments_heads"},
+        "kernel_symbol": "kernel_cake_gdn_train_07964d5676edd91bb80d_kcp",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_train_07964d5676edd91bb80d_kcp",
+        "logical": {
+            "c_start": "c_start",
+            "chunk_len": "chunk_len",
+            "gamma": "gamma",
+            "num_heads": "num_heads",
+            "num_seqs": "num_seqs",
+            "rowscale": "rowscale",
+            "seq_chunk_start": "seg_chunk_start",
+            "w": "w",
+            "walk_seg": "walk_seg",
+        },
+        "program": "kcp_dhu_cut_start",
+        "select_rule": {"kind": "always"},
+        "variant": None,
+    },
     "kcp_dhu_offset": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
@@ -953,13 +1001,14 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "tile_stride"],
             ["buffer", "dh_tape"],
             ["buffer", "dv_new"],
+            ["buffer", "c_start"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
         "grid_rule": {"ctas_per_head": 1, "kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_gdn_train_665649ff924fda17ec3f_kcp",
+        "kernel_symbol": "kernel_cake_gdn_train_99ac580e589bb83c39a2_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -967,8 +1016,9 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 116736,
             "use_pdl": False,
         },
-        "library": "cake_gdn_train_665649ff924fda17ec3f_kcp",
+        "library": "cake_gdn_train_99ac580e589bb83c39a2_kcp",
         "logical": {
+            "c_start": "c_start",
             "chunk_bos": "chunk_bos",
             "chunk_len": "chunk_len",
             "dh_tape": "dh_tape",
@@ -1027,13 +1077,14 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "tile_stride"],
             ["buffer", "dh_tape"],
             ["buffer", "dv_new"],
+            ["buffer", "c_start"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
         "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp",
+        "kernel_symbol": "kernel_cake_gdn_train_7d371710b93ceb8a842a_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -1041,8 +1092,9 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 83968,
             "use_pdl": False,
         },
-        "library": "cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp",
+        "library": "cake_gdn_train_7d371710b93ceb8a842a_kcp",
         "logical": {
+            "c_start": "c_start",
             "chunk_bos": "chunk_bos",
             "chunk_len": "chunk_len",
             "dh_tape": "dh_tape",

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.test_helpers import prims_ts_attention_prebuild as prebuild
+from tests.attention.test_helpers import prims_ts_attention_prebuild as prebuild
 
 
 def test_prebuild_selection_preserves_pytest_skip_and_fixture_ownership():

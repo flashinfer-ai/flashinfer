@@ -380,6 +380,9 @@ def test_compute_releases_staged_tensors(protocol, monkeypatch, phase):
 def test_prepared_eager_execution_does_not_poll_cache_or_peers(
     protocol, monkeypatch, winner
 ):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+        autotune as native,
+    )
     from tests.moe_ep.sm107_test_utils import unrelated_autotune_contexts
 
     protocol, _ = protocol
@@ -396,6 +399,7 @@ def test_prepared_eager_execution_does_not_poll_cache_or_peers(
     with monkeypatch.context() as patch:
         patch.setattr(backend, "_gather", unexpected)
         patch.setattr(selection, "_cache_identity", unexpected)
+        patch.setattr(native, "_unique_candidates", unexpected)
         # Rank-local invalidation is reconciled in an explicit context.
         AutoTuner.get().clear_cache()
         with unrelated_autotune_contexts():
@@ -694,6 +698,7 @@ def test_offline_variants_search_afresh_and_publish_without_installing(
     )
 
     state = forward_sweep
+    state.grid.append({"epi_flag_batches": [1, 4]})
     protocol = state.protocol
     args = tune._parse_args(
         [

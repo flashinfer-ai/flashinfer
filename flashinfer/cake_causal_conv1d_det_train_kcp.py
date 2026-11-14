@@ -95,20 +95,25 @@ def cake_causal_conv1d_det_kcp(
         that needs it is pending.
     cooperative : bool, optional
         Keyword-only, default ``None`` (the package default,
-        ``flashinfer.experimental.cake.cake_causal_conv1d_det_train.kcp.COOPERATIVE_DEFAULT``, currently ``True``).  The launch
-        form of the backward's main kernel; the forward is the same either way.  ``True``: one cooperative launch,
+        ``flashinfer.experimental.cake.cake_causal_conv1d_det_train.kcp.COOPERATIVE_DEFAULT``, ``False``).  The launch
+        form of the backward's main kernel; the forward is the same either way.  ``False``: an ordinary launch one
+        SM short of the co-resident CTA count, then a fixed-order reduce kernel on the same stream; it starts beside
+        a small kernel of another stream (for example a communication kernel).  ``True``: one cooperative launch,
         which starts only when all its CTAs fit on the GPU at once, so it waits for any kernel of another stream
-        (for example a communication kernel) that occupies an SM.  ``False``: an ordinary launch one SM short of the
-        co-resident CTA count, then a fixed-order reduce kernel on the same stream; it starts beside a small kernel
-        of another stream.  ``dx`` is bitwise the same in both forms.  ``dweight`` is reproducible and within the
+        that occupies an SM.  ``dx`` is bitwise the same in both forms.  ``dweight`` is reproducible and within the
         same FP64-oracle bound in each form, but its bits differ between the forms, so keep one form for runs whose
-        ``dweight`` bits must match.  Each rank may choose its form independently (no collective depends on it).
+        ``dweight`` bits must match.  Every rank of ``ctx.group`` passes the same value: no collective depends on
+        the form, but the ranks' ``dweight`` partials would otherwise mix two reduction orders.
 
     Returns
     -------
     torch.Tensor
         BF16 ``y`` of ``x_local``'s shape.  The backward runs the head program, the backward halo exchange and the
-        fused ``dx`` + deterministic FP32 ``dweight`` kernel of this rank's fragments.
+        main ``dx`` + deterministic FP32 ``dweight`` program of this rank's fragments: with ``cooperative=False``
+        (the default) an ordinary launch followed by a fixed-order reduce program on the same stream, with
+        ``True`` one cooperative kernel.  With ``cooperative=False`` at more than one rank the main program runs
+        while the exchange is in flight and a tail-row program writes the last rows of the fragments that receive
+        rows after the wait (``dx`` and ``dweight`` keep the bits of the waiting launch).
     """
 
     return _kcp().cake_causal_conv1d_det_kcp(
@@ -157,8 +162,8 @@ def cake_causal_conv1d_det_kcp_multi(
         checkpoint region; every rank passes one or none).  The same handle may carry the layer's ``"kda"`` entry;
         its ``"conv"`` entry serves one multi call or one single call, never both.
     cooperative : bool, optional
-        As in :func:`cake_causal_conv1d_det_kcp`, one form for every tensor of the call; the result is bitwise the
-        single calls with the same ``cooperative``.
+        As in :func:`cake_causal_conv1d_det_kcp` (default ``False``, the same value on every rank), one form for
+        every tensor of the call; the result is bitwise the single calls with the same ``cooperative``.
 
     Returns
     -------

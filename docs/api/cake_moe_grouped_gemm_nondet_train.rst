@@ -1,7 +1,7 @@
 .. _apicake_moe_grouped_gemm_nondet_train:
 
-Cake ragged BF16 grouped GEMM, non-deterministic weight gradient
-================================================================
+Cake ragged BF16 grouped GEMM, one-launch weight-gradient tail
+==============================================================
 
 .. currentmodule:: flashinfer.cake_moe_grouped_gemm_nondet_train
 
@@ -9,7 +9,9 @@ The module :mod:`flashinfer.cake_moe_grouped_gemm_nondet_train` computes the rag
 grouped GEMM of :ref:`apicake_moe_grouped_gemm_det_train` -- the forward projection, the
 data gradient and the weight gradient of the expert projections of Mixture-of-Experts
 layers on SM100 (B200 / GB200), SM103 (B300 / GB300) and SM107 (R200) -- with a weight
-gradient whose 512-wide k tile adds its split tail with unordered fp32 reductions.  Its
+gradient whose 512-wide k tile finishes its split tail in the same launch, in a fixed
+order (the deterministic module adds a second tail-reduce launch).  Every output repeats
+bit for bit for the same inputs, shapes, device SM count and configuration.  Its
 functions are stable FlashInfer APIs: each one hands off to the function of the same
 name in the backend package
 :mod:`flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train`.  Importing the
@@ -19,8 +21,8 @@ first access, not its names: they are reached through the module only.
 Mode rules
 ----------
 
-The module is the mode: every entry below is non-deterministic, and every public name
-carries ``nondet``.  The deterministic mode is the separate module
+The module is the mode: every entry below runs the non-deterministic package, and every
+public name carries ``nondet``.  The deterministic mode is the separate module
 :mod:`flashinfer.cake_moe_grouped_gemm_det_train`, whose entries have the same shapes.
 
 - No entry takes a ``deterministic`` argument: passing one (``True`` or ``False``)
@@ -28,21 +30,19 @@ carries ``nondet``.  The deterministic mode is the separate module
   ``CakeMoEGroupedGemmNondetFunction.apply(x, w, offs)`` other than ``None`` (the fifth
   argument is ``fuse_wgrad_accumulation``).  Nothing here routes to the deterministic
   module, also not as a fallback.
-- Under ``torch.use_deterministic_algorithms(True)`` PyTorch's non-determinism alert is
-  raised immediately before an order-varying launch only: the weight gradient whose
-  512-wide k tile splits its tail (``plan["unordered_tail"]`` and
-  ``plan["tail_splits"] > 1``; ``CakeMoEGroupedGemmNondetLaunch.order_varying``), in
-  overwrite or accumulate mode -- ``cake_moe_grouped_gemm_nondet_train_wgrad``, a
-  prepared launch's ``launch()`` (also when the mode was switched on after the
-  preparation; under CUDA graph capture, when the launch is captured) and the backward
-  of ``CakeMoEGroupedGemmNondetFunction`` when it computes ``dW``.  The alert names the
-  counterpart in :mod:`flashinfer.cake_moe_grouped_gemm_det_train`; it is a
+- Every launch of this release runs in a fixed order, so under
+  ``torch.use_deterministic_algorithms(True)`` no launch raises PyTorch's
+  non-determinism alert, and the bits are those of a run with the mode off
+  (``CakeMoEGroupedGemmNondetLaunch.order_varying`` is ``False`` for every launch).
+  The alert stays for an order-varying launch: a weight gradient planned with
+  ``plan["unordered_tail"]`` and a split tail, which only an architecture listed in the
+  package's ``unordered_tail_archs`` (empty) plans.  Such a launch would raise the
+  alert immediately before it runs -- in ``cake_moe_grouped_gemm_nondet_train_wgrad``,
+  a prepared launch's ``launch()`` (under CUDA graph capture, when the launch is
+  captured) and the backward of ``CakeMoEGroupedGemmNondetFunction`` -- as a
   ``RuntimeError`` (nothing launches), or with ``warn_only=True`` a ``UserWarning``,
-  after which the non-deterministic launch runs (it names the caller's line for a direct
-  call of ``cake_moe_grouped_gemm_nondet_train_wgrad`` or ``launch()``, a frame of
-  PyTorch's autograd for the backward).  The preparation, the forward, the data
-  gradient, the 256-wide k tile's weight gradient (ordered tail reduce) and an unsplit
-  tail have a fixed order and never alert.
+  after which the launch runs.  The alert names the counterpart in
+  :mod:`flashinfer.cake_moe_grouped_gemm_det_train`.  The preparation never alerts.
 - No tape, saved tensor or workspace crosses between the two modes: each autograd
   function's backward reads only its own saved tensors.
 
@@ -52,25 +52,31 @@ the same forward, bitwise.
 Numerical contract
 ------------------
 
-Only the run-to-run bitwise reproducibility of the weight gradient ``dW`` is relaxed.  The
-forward ``Y`` and the data gradient ``dX`` are bitwise the deterministic module's (copies
-of the same programs; on sm_100a the data gradient's L2 evict-first twin is the package's
-own build of the deterministic wide program, whose cache policy changes no arithmetic), and
-so is ``dW`` wherever the 256-wide k tile runs.  With the
-512-wide k tile, the tiles of the last partial wave are split into k-step units over the
-clusters; each unit adds its fp32 accumulator into the tile's fp32 sum with unordered
-reductions, and the last unit to arrive rounds the sum once and stores it, in the same
-launch (the deterministic module writes fp32 partials and sums them in a fixed order in
-a second launch).  With the slack tail placement, a launch whose tail tiles all fit in
-the room the full waves leave on the least-loaded clusters runs each tail tile whole on
-one cluster instead and touches no sum or ticket; otherwise its tail splits as above.
-Every whole tile is reduced by one CTA pair over the group's rows in a fixed order.  The
-operands (bf16), the accumulation (fp32), the one round-to-nearest
+Every output (``Y``, ``dX``, ``dW`` in bf16 or fp32, and the accumulated ``out`` or
+``w.main_grad``) repeats bit for bit for the same inputs, shapes, device SM count and
+configuration.  The forward ``Y`` and the data gradient ``dX`` are bitwise the
+deterministic module's (copies of the same programs), and so is ``dW`` wherever the
+256-wide k tile runs or the 512-wide k tile does not split its tail.  With the 512-wide
+k tile, the tiles of the last partial wave are split into ``tail_splits`` k-step units
+over the clusters.
+Unit ``s`` of split tail tile ``j`` stores its fp32 partial to slot
+``j * tail_splits + s`` of the fp32 slots (``tail_sums``), and the tile's last unit to
+arrive sums the tile's slots from 0.0 in slot order, rounds the sum once and stores it,
+in the same launch (the deterministic module sums the partials in a second launch).
+With the slack tail placement, a launch whose tail tiles all fit in the room the full
+waves leave on the least-loaded clusters runs each tail tile whole on one cluster
+instead and touches no slot or ticket; otherwise its tail splits as above.  Every whole
+tile is reduced by one CTA pair over the group's rows in a fixed order.  The bits of the
+512-wide k tile's ``dW`` depend on the SM count and on ``tail_splits``; they can differ
+from the deterministic module's bits, whose tail plan and group order differ, within its
+error budgets.  The operands (bf16), the accumulation (fp32), the one round-to-nearest
 rounding to bf16 (or the fp32 store), the layouts, the device-resident group offsets (no
 host synchronisation, no caller padding), the exact zeros of empty groups and the error
-budgets are those of the deterministic module.  The split tail's fp32 sums and tickets
-are workspaces kept per device and CUDA stream at zero (every launch leaves them zero);
-a CUDA graph capture takes zeroed buffers of its own.
+budgets are those of the deterministic module.  The slot sum uses fp32 adds without
+flush to zero.  The split tail's slots and tickets are workspaces kept per device and
+CUDA stream.  Only the tickets rest at zero (every launch leaves them zero); the slots
+need no value between launches and are allocated with ``torch.empty``.  A CUDA graph
+capture takes buffers of its own.
 
 The operator is local: on a context-parallel rank it runs on the rank's local rows, adds
 no collective, and leaves the reduction of a parameter gradient across ranks to the
@@ -91,9 +97,9 @@ overwrite of ``out``'s dtype and records the route in ``plan["accumulate"]``:
 ============== ======================================================================== =========================================================
 route          when                                                                     what runs
 ============== ======================================================================== =========================================================
-``"fused"``    512-wide k tile with its unordered split tail, the selected stage has an  one launch whose epilogue adds the tile into ``out``
-               accumulate build on the architecture whose library can load, ``out``
-               32-byte aligned
+``"fused"``    512-wide k tile with its ordered one-launch split tail, the selected     one launch whose epilogue adds the tile into ``out``
+               stage has an accumulate build on the architecture whose library can
+               load, ``out`` 32-byte aligned
 ``"composed"`` otherwise (``plan["accumulate_reason"]``, the first that fails:          the overwrite into a scratch of ``out``'s dtype, then
                ``"tile_k"``, ``"tail"``, ``"stage"`` -- every bf16 ``out`` --,          ``out.add_``
                ``"min_cuda"``, ``"alignment"``; the last two warn once per process)
@@ -106,11 +112,11 @@ call composes instead of failing.  ``out`` must not overlap itself, ``g``, ``x``
 (``ValueError`` on both routes, before anything runs).  Every launch and every CUDA graph
 replay adds again.  Numerical contract: the fused route adds the tile's fp32 sum into the
 fp32 ``out`` with one round-to-nearest add that keeps subnormals (bitwise
-``out0.add_(dW32)`` on every whole tile); a split tail tile adds its unordered sum ``S``
-once (``S`` is the overwrite's partial sum, whose unit reductions flush subnormals; the
-nondeterminism scope is unchanged); the composed route is ``out.add_`` of the overwrite in
-``out``'s dtype; an empty group is not touched by the fused route, while the composed
-route has ``out.add_``'s semantics (values kept, ``-0.0`` may become ``+0.0``).  The
+``out0.add_(dW32)`` on every whole tile); a split tail tile adds its slot sum ``S`` once
+(``S`` is the value the fp32 overwrite of the same plan stores, so the tile is also
+``out0.add_(dW32)`` and repeats bit for bit); the composed route is ``out.add_`` of the
+overwrite in ``out``'s dtype; an empty group is not touched by the fused route, while the
+composed route has ``out.add_``'s semantics (values kept, ``-0.0`` may become ``+0.0``).  The
 composed scratch (the size of the weight gradient) is owned by the prepared launch: keep
 the launch alive while a CUDA graph that captured it may replay.  The autograd flag returns
 a placeholder gradient for ``w`` when ``w`` has ``grad_added_to_main_grad``
@@ -121,8 +127,8 @@ and a ``create_graph`` backward.
 
 The module hands ``accumulate`` and ``fuse_wgrad_accumulation`` to the package; it has
 no deterministic route.  The deterministic module takes the same two switches and always
-composes (its deterministic overwrite into a scratch, then ``out.add_``), bitwise
-reproducible run to run: see :ref:`apicake_moe_grouped_gemm_det_train`.
+composes (its deterministic overwrite into a scratch, then ``out.add_``): see
+:ref:`apicake_moe_grouped_gemm_det_train`.
 
 One-shot functions
 ------------------
@@ -170,8 +176,18 @@ Prepared launches
     cake_moe_grouped_gemm_nondet_train_prepare_wgrad
 
 Each one returns a ``CakeMoEGroupedGemmNondetLaunch`` (also importable from the module)
-whose ``plan`` records, for the weight gradient, ``unordered_tail``, ``tail_splits`` and
-the sizes of the tail sums and tickets.
+whose ``plan`` records, for the weight gradient, ``ordered_tail`` (``True`` on the
+512-wide k tile), ``unordered_tail`` (``False``), ``tail_splits`` and the sizes of the
+tail slots and tickets (``tail_sum_elems``, ``tail_ticket_words``).
+
+The slot buffer holds ``tail_splits`` slots per tail tile, so it is ``tail_splits`` times
+larger than one fp32 sum per tile.  For each stream, the package keeps the largest buffer
+that a launch needed, for the life of the process.  ``tail_sum_elems`` is at most
+``(clusters - 1) * 16 * 256 * 512`` floats (at most 16 units per tail tile): about
+600 MiB per stream at 76 clusters (GB300) and about 840 MiB at 106 clusters (R200, 212
+SMs).  For example, the gate/up projection with one group of 112,576 rows on GB300 splits
+40 tail tiles into 9 units each and takes about 180 MiB (about 20 MiB with one sum per
+tile).
 
 Support query
 -------------
@@ -252,35 +268,36 @@ name (see its table); on ``main`` only ``deterministic=False`` ran.
       - the module of the mode: ``cake_moe_grouped_gemm_det_train`` or
         ``cake_moe_grouped_gemm_nondet_train``; passing the argument raises ``TypeError``
 
-Under ``torch.use_deterministic_algorithms(True)`` this module raises PyTorch's
-non-determinism alert (``RuntimeError``) right before an order-varying weight
-gradient launch.  With ``warn_only=True`` it warns (``UserWarning``) and runs the
-non-deterministic launch.  It never falls back to the deterministic module: use
-:mod:`flashinfer.cake_moe_grouped_gemm_det_train` where the deterministic mode must
-hold.  This differs from v0.7.4rc1, where a call of
+Under ``torch.use_deterministic_algorithms(True)`` this module runs the same launches as
+without the mode and gives the same bits: no launch of this release alerts.  It never
+falls back to the deterministic module: use
+:mod:`flashinfer.cake_moe_grouped_gemm_det_train` where the deterministic module's bits
+are required.  This differs from v0.7.4rc1, where a call of
 ``flashinfer.experimental.cake.grouped_mm`` with ``deterministic=False`` ran the
 deterministic package with a one-time ``UserWarning``, and the package
 ``flashinfer.experimental.cake.cake_moe_grouped_gemm`` alerted at every weight
-gradient call, its preparation included.  On ``main`` after v0.7.4rc1 both already
-behaved as this module does.
+gradient call, its preparation included.  On ``main`` after v0.7.4rc1 both alerted
+only right before an order-varying weight gradient launch, as this module did before
+its split tail became ordered.
 
 Features by architecture
 ------------------------
 
-=============================================== =============== =============== ===============
-feature                                         sm_100a         sm_103a         sm_107a
-=============================================== =============== =============== ===============
-``fwd`` / ``dgrad`` 256- and 512-column tiles   domain schedule domain schedule static schedule
-``fwd`` evict-first / 3-3 head-tail twin        -- / --         -- / yes        yes / --
-``dgrad`` evict-first / 3-3 head-tail twin      yes / --        -- / yes        yes / --
-``dgrad`` probed queue split                    yes             yes             --
-``wgrad`` 256-wide k tile, ordered tail reduce  yes             yes             yes
-``wgrad`` 512-wide k tile, unordered split tail yes             yes             yes
-``wgrad`` 512 wave-synchronised builds          yes             yes             --
-``wgrad`` 512 half-release builds               planned, slack  planned, slack  planned, slack
-``wgrad`` 512 k256-tail twin                    --              --              slack tail
-``wgrad`` output dtypes                         bf16, fp32      bf16, fp32      bf16, fp32
-``wgrad`` accumulate, fused, fp32 ``out``       planned, wave   planned, wave   planned, k256t
-CUDA toolkit floor                              12.8            12.9            13.4
-CUDA toolkit floor, fp32 accumulate builds      13.4            13.4            13.4
-=============================================== =============== =============== ===============
+================================================== ====================== ====================== ======================
+feature                                            sm_100a                sm_103a                sm_107a
+================================================== ====================== ====================== ======================
+``fwd`` / ``dgrad`` 256- and 512-column tiles      domain schedule        domain schedule        static schedule
+``fwd`` evict-first / 3-3 head-tail twin           yes / --               yes / yes              yes / --
+``dgrad`` evict-first / 3-3 head-tail twin         yes / --               -- / yes               yes / --
+``dgrad`` probed queue split                       yes                    yes                    --
+``wgrad`` 256-wide k tile, two-launch tail reduce  yes                    yes                    yes
+``wgrad`` 512-wide k tile, ordered one-launch tail yes                    yes                    yes
+``wgrad`` 512 wave-synchronised builds             yes                    yes                    --
+``wgrad`` 512 half-release builds                  planned, slack         planned, slack         planned, slack
+``wgrad`` 512 k256-tail twin                       --                     --                     slack tail
+``wgrad`` 512 queue-walk builds                    planned tail           planned tail           --
+``wgrad`` output dtypes                            bf16, fp32             bf16, fp32             bf16, fp32
+``wgrad`` accumulate, fused, fp32 ``out``          planned, wave, queue   planned, wave, queue   planned, k256t
+CUDA toolkit floor                                 12.8                   12.9                   13.4
+CUDA toolkit floor, fp32 accumulate builds         13.4                   13.4                   13.4
+================================================== ====================== ====================== ======================

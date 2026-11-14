@@ -70,11 +70,11 @@ kernel_cake_lm_head_loss_faa8f4d9322bc102406b(int* __restrict__ x, int* __restri
     int t_last = T - 1;
     int gstride = gridDim.x;
     unsigned long long ldw64 = (unsigned long long)ld_x_words;
-    unsigned long long vecs64 = (unsigned long long)row_vecs * 4;
+    unsigned long long vecs64 = (unsigned long long)row_vecs * 4ull;
     for (int r = bid; r < num_rows; r += gstride) {
         int _vec_load_0[1];
         {
-            _vec_load_0[0] = *reinterpret_cast<const int*>(idx_lo + (unsigned long long)r * 2 + 0);
+            _vec_load_0[0] = *reinterpret_cast<const int*>(idx_lo + (unsigned long long)r * 2ull + 0);
         }
         int src_u = _vec_load_0[0];
         int src = ((src_u < t_last) ? src_u : t_last);
@@ -82,7 +82,7 @@ kernel_cake_lm_head_loss_faa8f4d9322bc102406b(int* __restrict__ x, int* __restri
         unsigned long long row_out = (unsigned long long)r * vecs64;
         #pragma unroll 2
         for (int c = tid; c < row_vecs; c += 256) {
-            unsigned long long off = (unsigned long long)c * 4;
+            unsigned long long off = (unsigned long long)c * 4ull;
             int _vec_load_1[4];
             {
                 const int4* _ivptr_0 = reinterpret_cast<const int4*>(x + (row_in + off) + 0);

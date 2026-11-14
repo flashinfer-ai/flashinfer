@@ -44,18 +44,20 @@ waves. The map is sized by model context, never global cache capacity. Plain
 Int32 locators and packed membership words remain separate outputs; membership
 bits are never fused into a locator.
 
-Compatible FP8 G2–G8/page-4 Keeps plans instead use eight query words per
+Compatible G2–G8/page-4 Keeps plans instead use eight query words per
 32-fragment tile, emitted directly into the same workspace with unused slots
 and tail bits zero. The public
 standalone metadata format remains page-byte masks. Sparse FP8 D256 Keeps
 loads a full head stage as two SW128 planes and uses compact single-head
 TensorMaps when cache strides permit; other cache layouts retain their descriptors.
 
-Attention caches a grouped membership row in SMEM only when the complete
-resource layout, including barriers, fits the compilation budget. Larger rows
-stay in the existing immutable metadata buffer; Softmax reads packed words for
-the current KV tile directly from GMEM. This does not change query grouping or
-the caller's split-KV permission.
+Attention caches grouped memberships in SMEM only when the complete resource
+layout, including barriers, fits the compilation budget. Runtime query-oriented
+routes stage a bounded prefix with aligned asynchronous copies: 1 KiB for split
+CTAs and 4 KiB for nonsplit CTAs. Inactive tiles are zero-filled; longer routes
+read the remaining words from the immutable GMEM table. Fixed-length plans can
+retain the complete row. The cache does not specialize runtime lengths or change
+query grouping and the caller's split-KV permission.
 
 Packed QToken-KvBlock-Sparse-Attention uses an ordinary rank-3 Q TensorMap
 over `[D, Hq, total_q_tokens]`. A grouped box loads the configured query group,

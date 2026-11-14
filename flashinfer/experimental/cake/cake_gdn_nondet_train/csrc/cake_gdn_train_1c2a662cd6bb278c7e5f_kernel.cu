@@ -79,7 +79,7 @@ kernel_cake_gdn_train_1c2a662cd6bb278c7e5f(__nv_bfloat16* __restrict__ q, __nv_b
     for (int step = 0; step < 16; step++) {
         int row = sub * 4 + warp + 4 * group * step;
         if (row < n_valid) {
-            long long base = ((long long)(tok0 + row) * (long long)num_heads + (long long)hq) * 128 + (long long)(lane_0 * 4);
+            long long base = ((long long)(tok0 + row) * (long long)num_heads + (long long)hq) * 128ll + (long long)(lane_0 * 4);
             {
                 uint2 _vld_0;
                 _vld_0 = *reinterpret_cast<const uint2*>(q + base);

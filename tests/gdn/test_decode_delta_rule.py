@@ -45,7 +45,7 @@ from flashinfer.gdn_decode import (
     gated_delta_rule_mtp,
 )
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.parametrize import (
+from tests.infra.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )

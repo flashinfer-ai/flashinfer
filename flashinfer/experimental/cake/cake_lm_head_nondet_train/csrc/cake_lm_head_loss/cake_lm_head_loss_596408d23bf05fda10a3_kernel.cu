@@ -76,10 +76,10 @@ kernel_cake_lm_head_loss_596408d23bf05fda10a3(long long* __restrict__ keys, floa
             int pos_l = base + lane;
             int first_l = 0;
             if (pos_l < hi) {
-                int row_l = (int)(keys[pos_l] >> 32);
+                int row_l = (int)(keys[pos_l] >> 32ll);
                 if (row_l >= 0 && row_l < V && pos_l < n_keys - split) {
-                    if (pos_l == 0 || (int)(keys[pos_l - 1] >> 32) != row_l) {
-                        if ((int)(keys[pos_l + split] >> 32) == row_l) {
+                    if (pos_l == 0 || (int)(keys[pos_l - 1] >> 32ll) != row_l) {
+                        if ((int)(keys[pos_l + split] >> 32ll) == row_l) {
                             first_l = 1;
                         }
                     }
@@ -93,11 +93,11 @@ kernel_cake_lm_head_loss_596408d23bf05fda10a3(long long* __restrict__ keys, floa
                 int lane_s = _find_first_set_1 - 1;
                 starts = starts & starts - 1;
                 int seg = base + lane_s;
-                int row = (int)(keys[seg] >> 32);
+                int row = (int)(keys[seg] >> 32ll);
                 int parts = 2;
                 #pragma unroll 1
                 for (int q = 2; q < (n_keys - seg - 1) / split + 1; q++) {
-                    if ((int)(keys[seg + q * split] >> 32) != row) {
+                    if ((int)(keys[seg + q * split] >> 32ll) != row) {
                         break;
                     }
                     parts = q + 1;
@@ -154,7 +154,7 @@ kernel_cake_lm_head_loss_596408d23bf05fda10a3(long long* __restrict__ keys, floa
                         old[0 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)row * (unsigned long long)H + (unsigned long long)col + 4);
+                        float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)row * (unsigned long long)H + (unsigned long long)col + 4ull);
                         old[4 + 0] = _v4.x;
                         old[4 + 1] = _v4.y;
                         old[4 + 2] = _v4.z;
@@ -174,7 +174,7 @@ kernel_cake_lm_head_loss_596408d23bf05fda10a3(long long* __restrict__ keys, floa
                     }
                     {
                         float4 _v4 = make_float4(old[4 + 0], old[4 + 1], old[4 + 2], old[4 + 3]);
-                        *reinterpret_cast<float4*>((out + ((unsigned long long)row * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                        *reinterpret_cast<float4*>((out + ((unsigned long long)row * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                     }
                 }
             }

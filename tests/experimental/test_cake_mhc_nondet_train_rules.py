@@ -14,78 +14,86 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Host-plan, packaging and mode-policy tests of the Cake four-stream mHC training
-package with the non-deterministic backward
-(``flashinfer.experimental.cake.cake_mhc_nondet_train``; FlashInfer issue
-#8068; no GPU needed, nothing is built or launched).
+package ``flashinfer.experimental.cake.cake_mhc_nondet_train`` (FlashInfer
+issue #8068; no GPU needed, nothing is built or launched).
 
 The package is a standalone copy of the deterministic package
 (``flashinfer.experimental.cake.cake_mhc_det_train``) under the ``cake_mhc_train_``
-prefix at its hidden sizes (4096 on every architecture, 5120 and 7168 on
-sm_100a / sm_103a), except the ``bwd_finish`` routes.  This module checks the
-registry ``cake_jit.py`` against the deterministic registry's records, routes
-and record scalars of every hidden size on its boards of record
+prefix at its own hidden sizes (4096 on every architecture, 5120 and 7168 on
+sm_100a / sm_103a: ``ND_HIDDEN_SIZES``), except the ``bwd_finish`` routes.  The
+deterministic package also exports 5120 and 7168 on sm_107a, which this package
+does not copy.  This module checks the registry ``cake_jit.py`` against the
+deterministic registry's records, routes and record scalars of this package's
+(architecture, hidden size) pairs on its boards of record
 (``RULES_BOARDS``) and token counts of record (``RULES_T_VALUES``):
 
 * the program set is the deterministic set without its column-slab
-  (``bwd_slab__*``) and final-reduction (``bwd_reduce__*``) records, its
-  token owner's group-row forms and its activation-checkpoint carry (role
-  ``fn_split_carry``), renamed and otherwise equal field for field
-  (a per-CTA token owner may select by the ``R`` regimes of its program where
-  the deterministic record names that program), plus the programs of this
-  package: at hidden 4096 ``cake_mhc_train_fn_split_atomic__tv128_dep`` on
-  sm_100a / sm_103a, ``cake_mhc_train_fn_split_atomic__tv128_t128_dep`` on
-  sm_107a, ``cake_mhc_train_bwd_slab_atomic__dynr`` and
-  ``cake_mhc_train_bwd_slab_atomic__lpt`` on all three and their slab-fastest
-  copies ``cake_mhc_train_bwd_slab_atomic__dynr_os`` /
-  ``cake_mhc_train_bwd_slab_atomic__lpt_os`` on all three too; at 5120
+  (``bwd_slab__*``) and final-reduction (``bwd_reduce__*``) records and its
+  activation-checkpoint carry (role ``fn_split_carry``), renamed and otherwise
+  equal field for field (the token owner's group-row forms ``_trows_dyn``
+  included), plus the programs of this package: at hidden 4096
+  ``cake_mhc_train_fn_split_atomic__tv128_dep`` on sm_100a / sm_103a,
+  ``cake_mhc_train_fn_split_atomic__tv128_t128_dep1`` on sm_107a (its last CTA
+  alone waits for the token-owner pass: ``SPLIT_CHAIN``),
+  ``cake_mhc_train_bwd_slab_fold__dynr`` and its slab-fastest copy
+  ``cake_mhc_train_bwd_slab_fold__dynr_os`` on all three; at 5120
   and 7168 ``cake_mhc_train_fn_split_atomic__tv128_dep__h<H>``,
-  ``cake_mhc_train_bwd_slab_atomic__dynr__h<H>`` and
-  ``cake_mhc_train_bwd_slab_atomic__dynr_os__h<H>`` on sm_100a / sm_103a and
-  ``cake_mhc_train_bwd_slab_atomic__lpt__h<H>`` /
-  ``cake_mhc_train_bwd_slab_atomic__lpt_os__h<H>`` on sm_100a.  Their
+  ``cake_mhc_train_bwd_slab_fold__dynr__h<H>`` and
+  ``cake_mhc_train_bwd_slab_fold__dynr_os__h<H>`` on sm_100a / sm_103a (no
+  two-size record, ``lpt`` / ``lpt_os``: no two-size calibration of record).  Their
   records keep the launch, grid and roles of the deterministic records they
   replace (the fn splits with the static PDL attribute: they follow the
-  token-owner pass), and each ``_os`` record is its base record of the same
-  size under its own name and program, on the architectures of its base record
-  whose ``BWD_SLAB_ORDER`` of the size, or a board cell of
+  token-owner pass; the column slab with its fold arguments ``dfn_slot``,
+  ``slab_cnt`` and ``prow``), and each ``_os`` record is its base record of the
+  same size under its own name and program, on the architectures of its base
+  record whose ``BWD_SLAB_ORDER`` of the size, or a board cell of
   ``BWD_SLAB_ORDER_OVERRIDES`` at the size, has a ``"slab"`` band (on sm_107a
   the cell of the 212-SM board alone);
 * no record, route, record scalar or PDL edge names a deterministic library;
 * every route and the selection on every route equal the deterministic ones,
-  except ``bwd_finish``: the deterministic token-owner records, the atomic fn
-  split of the architecture and size, the column slab's forms (one per call by
-  ``bwd_slab_atomic_program``: ``dynr``, ``lpt``, ``dynr_os`` and ``lpt_os`` at
-  hidden 4096 on every architecture and at 5120 and 7168 on sm_100a; on
-  sm_103a at 5120 and 7168 ``dynr`` and ``dynr_os``), no reduction; every
-  program the column slab's tables and board cells can name has a record on
-  the route, and every ``_os`` record a band of them that names it;
+  except ``bwd_finish``: the deterministic token-owner records (the group-row
+  forms inside ``BWD_ROW_BANDS``, the run-time-count record at another Sinkhorn
+  count), the atomic fn split of the architecture and size, the column slab's
+  forms (one per call by ``bwd_slab_atomic_program``: ``dynr`` and
+  ``dynr_os`` at hidden 4096 on every architecture and at 5120 and 7168 on
+  sm_100a and sm_103a), no
+  reduction; every program the column slab's tables and board cells can name
+  has a record on the route, and every ``_os`` record a band of them that names
+  it; the route plans bind the column slab's parameter rows (``prow`` and
+  ``param_rows``: the group rows where the token owner writes them, else the
+  per-CTA rows);
 * the PDL bands without an SM count are the deterministic ones, but on sm_107a,
   whose column slab keeps the attribute on at hidden 4096 (a cell without a
   band); this package's own bands (``PDL_BAND_OVERRIDES``: B200 with 148 SMs,
   GB200 and GB300 with 152) replace them on their board alone, the most
   specific key first (the order of the keys under a test table), and the route
   plan passes the device's SM count;
-* the workspaces: ``fwd`` the deterministic one, ``bwd`` the deterministic
-  regions at the same offsets without the trailing ``dfn_part``, at every
-  hidden size;
+* the workspaces: ``fwd`` the deterministic one; ``bwd`` the ticket region and
+  the column slab's arrival counts ``slab_cnt`` first (a zero prefix of
+  ``ZERO_PREFIX_BYTES`` at every token count and hidden size), then the
+  deterministic regions without the trailing ``dfn_part`` (the parameter region
+  the deterministic one: the group rows inside ``BWD_ROW_BANDS``), then the
+  column slab's per-chunk ``dfn`` slots ``dfn_slot``; larger than the
+  deterministic workspace at every token count;
 * the host rules are copies (equal outputs, not the deterministic objects;
-  the per-size tables the deterministic ones without the column-slab,
-  reduction and group-row tables), but this package's own column-slab rule
-  (``BWD_SLAB_LPT``, ``BWD_SLAB_LPT_HIDDEN``, ``BWD_SLAB_ORDER``,
-  ``BWD_SLAB_ORDER_OVERRIDES``, ``BWD_SLAB_LPT_OVERRIDES``, ``lpt_chunks``,
-  ``bwd_slab_order``, ``bwd_slab_atomic_program``, ``slab_plan``;
-  ``host_plan`` itself is the deterministic one without its group-row keys):
-  its geometries, its token-count bands (the unit order of record, and the
-  banded calibration form under a test table), its board cells (those of
-  record: sm_107a with 212 SMs at 4096, and the order cell of sm_103a with 152
-  SMs at 7168, whose ``"slab"`` bands below 63092 hold column-slab chunk counts
-  of at least 19; the exact key ``(arch, SM count, hidden)`` under a test
-  table; every other board, the 212-SM board to 1876 tokens and the 152-SM
-  board outside those ``"slab"`` bands, selecting and planning as without
-  them, also in the route plans) and
-  its selection at every hidden size (where the size's table calibrates the
-  architecture: every architecture at 4096, sm_100a at 5120 and 7168; elsewhere
-  the one-size chunks of ``k7_chunks`` without running the screen), its
+  the per-size tables the deterministic ones without the column-slab and
+  reduction tables; ``host_plan`` the deterministic one plus the column slab's
+  ``prow``, ``param_rows`` and ``slot_parts``), but this package's own
+  column-slab rule (``BWD_SLAB_LPT``, ``BWD_SLAB_LPT_HIDDEN``,
+  ``BWD_SLAB_ORDER``, ``BWD_SLAB_ORDER_OVERRIDES``, ``BWD_SLAB_LPT_OVERRIDES``,
+  ``lpt_chunks``, ``bwd_slab_order``, ``bwd_slab_atomic_program``,
+  ``slab_plan``): its geometries, its token-count bands (the unit order of
+  record, and the banded calibration form under a test table), its board cells
+  (those of record: the order cells of sm_107a with 212 SMs at 4096 and of sm_103a
+  with 152 SMs at 7168, whose ``"slab"`` bands below 63092 hold column-slab
+  chunk counts of at least 19; the exact key ``(arch, SM count, hidden)`` under
+  a test table; every other board, the 212-SM board to 1876 tokens and the
+  152-SM board outside those ``"slab"`` bands, selecting and planning as
+  without them, also in the route plans) and
+  its selection at every hidden size (no table of record calibrates an
+  architecture, so every call runs the one-size chunks of ``k7_chunks``, the
+  deterministic column slab's; the rule under the former calibrations and the
+  kernel test's screen), its
   call-time lookup and a workspace envelope that never runs its screen;
 * the package is standalone: no source file imports another flashinfer package
   (the shared ``cake_build.py`` JIT fallback aside, inside a function), and a
@@ -95,24 +103,17 @@ and record scalars of every hidden size on its boards of record
   public callable has a ``deterministic`` parameter (the autograd
   ``Function.forward`` included) and a ``deterministic`` keyword is the
   interpreter's ``TypeError`` before any operand check; every entry point has
-  the deterministic package's counterpart of the same verb; only
-  ``backward_finish`` raises PyTorch's alert under
-  ``torch.use_deterministic_algorithms(True)``, after its operands pass and
-  right before its launch, and the alert's wording;
+  the deterministic package's counterpart of the same verb; every output of
+  the package repeats bit for bit on one device, so no call of the package
+  raises PyTorch's alert of a non-deterministic operation, and under
+  ``torch.use_deterministic_algorithms(True)`` (strict and ``warn_only``) every
+  entry point refuses CPU operands with its operand error and no alert;
 * the top-level module ``flashinfer.cake_mhc_nondet_train`` (read as source):
   every entry point forwards to this package's function of the same name with
   this package's parameters, the package is imported only on first use, and
   nothing is imported from the deterministic package;
 * the wiring: the test-helper key, the package data, the build-manifest
   checker's row and ``build.json``.
-
-The deterministic group-row forms (``BWD_ROW_BANDS``: the token owner's
-``_trows_dyn`` and the reduction's ``_trows`` programs, the group-row parameter
-region and the host plan's ``groups`` / ``group_rows`` / ``param_dim0`` /
-``param_dim1``) have no copy: the column slab folds the token owner's per-CTA
-partials.  The comparisons above read the deterministic rules with those forms
-off (``bwd_group_rows`` False: its per-CTA rules), and the calls where the two
-packages diverge are checked as such.
 """
 
 from __future__ import annotations
@@ -133,7 +134,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import PACKAGES, cake_package
+from tests.cake.test_helpers.cake_package import PACKAGES, cake_package
 
 KEY = "cake.cake_mhc_nondet_train"
 PACKAGE_NAME = "flashinfer.experimental.cake.cake_mhc_nondet_train"
@@ -151,50 +152,77 @@ det_build = cake_package("cake.cake_mhc_det_train", "cake_build")
 PACKAGE_DIR = Path(nd.__file__).resolve().parent
 REPO = Path(__file__).resolve().parents[2]
 HIDDEN = 4096
-# The package's hidden sizes (the deterministic package's): 4096 on every architecture, 5120 and 7168 on the
-# architectures of NEW_HIDDEN_ARCHES.
+# The package's hidden sizes: 4096 on every architecture, 5120 and 7168 on the architectures of NEW_HIDDEN_ARCHES
+# (the deterministic package also exports 5120 and 7168 on sm_107a; this package does not).
 HIDDEN_SIZES = (4096, 5120, 7168)
 NEW_HIDDEN_SIZES = HIDDEN_SIZES[1:]
 NEW_HIDDEN_ARCHES = ("sm_100a", "sm_103a")
-# The architectures of the two-size column slab's records at 5120 and 7168 (the sizes' lpt calibrations).
-NEW_HIDDEN_LPT_ARCHES = ("sm_100a",)
+# The hidden sizes this package exports per architecture: the (architecture, hidden size) pairs on which it is
+# compared with the deterministic records, routes and record scalars (test_exported_hidden_sizes_per_architecture).
+ND_HIDDEN_SIZES = {
+    arch: HIDDEN_SIZES if arch in NEW_HIDDEN_ARCHES else (HIDDEN,)
+    for arch in det.ARCHES
+}
 ND_PREFIX, DET_PREFIX = "cake_mhc_train_", "cake_mhc_det_train_"
 # The programs of this package and their architectures (the library suffix ``__h<H>`` names a size other than 4096).
-ATOMIC = {
+OWN = {
     "cake_mhc_train_fn_split_atomic__tv128_dep": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_fn_split_atomic__tv128_t128_dep": ("sm_107a",),
-    "cake_mhc_train_bwd_slab_atomic__dynr": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_bwd_slab_atomic__lpt": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_train_fn_split_atomic__tv128_t128_dep1": ("sm_107a",),
+    "cake_mhc_train_bwd_slab_fold__dynr": ("sm_100a", "sm_103a", "sm_107a"),
     **{
         f"cake_mhc_train_{program}__h{hidden}": NEW_HIDDEN_ARCHES
         for hidden in NEW_HIDDEN_SIZES
-        for program in ("fn_split_atomic__tv128_dep", "bwd_slab_atomic__dynr")
+        for program in ("fn_split_atomic__tv128_dep", "bwd_slab_fold__dynr")
     },
-    **{
-        f"cake_mhc_train_bwd_slab_atomic__lpt__h{hidden}": NEW_HIDDEN_LPT_ARCHES
-        for hidden in NEW_HIDDEN_SIZES
-    },
-    # The slab-fastest copies, on the architectures whose BWD_SLAB_ORDER bands of the size, or a board cell of
-    # BWD_SLAB_ORDER_OVERRIDES at the size (sm_107a: the 212-SM board's), hold a "slab" band (lpt_os where the size's
-    # two-size calibration of the architecture is not None too).
-    "cake_mhc_train_bwd_slab_atomic__dynr_os": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_bwd_slab_atomic__lpt_os": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_bwd_slab_atomic__dynr_os__h5120": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_bwd_slab_atomic__lpt_os__h5120": ("sm_100a",),
-    "cake_mhc_train_bwd_slab_atomic__dynr_os__h7168": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_bwd_slab_atomic__lpt_os__h7168": ("sm_100a",),
+    # The slab-fastest copies of dynr, on the architectures whose BWD_SLAB_ORDER bands of the size, or a board cell of
+    # BWD_SLAB_ORDER_OVERRIDES at the size (sm_107a: the 212-SM board's), hold a "slab" band. No two-size record
+    # (lpt, lpt_os) ships: no two-size calibration of record is other than None (LPT_OF_RECORD), so no table can name
+    # one.
+    "cake_mhc_train_bwd_slab_fold__dynr_os": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_train_bwd_slab_fold__dynr_os__h5120": ("sm_100a", "sm_103a"),
+    "cake_mhc_train_bwd_slab_fold__dynr_os__h7168": ("sm_100a", "sm_103a"),
 }
-SLAB = "cake_mhc_train_bwd_slab_atomic__dynr"
-LPT = "cake_mhc_train_bwd_slab_atomic__lpt"
-# The slab-fastest copies of the column slab's two forms (the units drawn slab-fastest; program key ``<form>_os``).
-SLAB_OS = "cake_mhc_train_bwd_slab_atomic__dynr_os"
-LPT_OS = "cake_mhc_train_bwd_slab_atomic__lpt_os"
+# The (architecture, hidden size) pairs whose atomic fn split is the "dep1" form (only the last CTA waits for the
+# token-owner pass); the "dep" form elsewhere.
+SPLIT_CHAIN = {("sm_107a", HIDDEN): "dep1"}
+SLAB = "cake_mhc_train_bwd_slab_fold__dynr"
+LPT = "cake_mhc_train_bwd_slab_fold__lpt"
+# The slab-fastest copies of the column slab's two forms (the units drawn slab-fastest; program key ``<form>_os``); the
+# two-size names (LPT, LPT_OS) name no record of record.
+SLAB_OS = "cake_mhc_train_bwd_slab_fold__dynr_os"
+LPT_OS = "cake_mhc_train_bwd_slab_fold__lpt_os"
 DET_DYNR = "cake_mhc_det_train_bwd_slab__dynr"
+# The column slab's arguments beyond the deterministic dynr record's (which binds ``dfn_part`` instead), kernel
+# parameter -> logical name: the outputs and the parameter rows it folds (``chunks``: the rows of ``param_partial``,
+# bound to ``param_rows``), ``accumulate``, the per-chunk ``dfn`` slots, the arrival counts and the row layout.
+FOLD_ARGS = {
+    "dfn": "dfn",
+    "param_partial": "param_partial",
+    "dscale": "dscale",
+    "dbase": "dbase",
+    "chunks": "param_rows",
+    "accumulate": "accumulate",
+    "dfn_slot": "dfn_slot",
+    "slab_cnt": "slab_cnt",
+    "prow": "prow",
+}
+# The fold's arguments after the ticket (dynr) or after the lpt record's p_big / rpc_small, in kernel-parameter order.
+FOLD_TAIL = [["buffer", "dfn_slot"], ["buffer", "slab_cnt"], ["parameter", "prow"]]
+# The column slab's host-plan values beyond the deterministic plan's: the parameter rows it folds (``prow`` 1: the
+# group rows [56, groups] of the ``_trows_dyn`` token owner, 0: the per-CTA rows [G6, 32]; ``param_rows`` their
+# count) and the ``dfn`` slots of the workspace (``slot_parts = min(32, ceil(T / 64))``).
+FOLD_KEYS = ("prow", "param_rows", "slot_parts")
+# The column slab's arrival counts (one uint32 per column slab, at most H / 64 = 112) and the workspace prefix every
+# call must find zero and leaves zero: the ticket region (256 bytes) and the arrival counts (512 bytes).
+SLAB_CNT_WORDS = 128
+ZERO_PREFIX_BYTES = 768
 # The column slab's tables of record: the unit order per hidden size and architecture (BWD_SLAB_ORDER: on sm_100a
 # "chunk" to 2047 / 5108 tokens at hidden 4096 / 7168 and "slab" above, "slab" at every token count at 5120; on
 # sm_103a "chunk" to 13278 / 28825 / 63091 tokens at hidden 4096 / 5120 / 7168 and "slab" above; "chunk" at every size
 # on sm_107a, which routes neither 5120 nor 7168) and the two-size calibration at hidden 4096 (BWD_SLAB_LPT: one
-# (o_tiles, keep) per architecture); the board cells of record replace both on their board alone (below).
+# (o_tiles, keep) or None per architecture: None on every one, so every call runs the deterministic one-size chunks of
+# k7_chunks and dfn's per-chunk sums are the deterministic column slab's); the board cells of record replace both on
+# their board alone (below).
 ORDER = {
     4096: {
         "sm_100a": ((2047, "chunk"), (None, "slab")),
@@ -212,10 +240,10 @@ ORDER = {
         "sm_107a": ((None, "chunk"),),
     },
 }
-LPT_OF_RECORD = {"sm_100a": (0.5, 0.99), "sm_103a": (0.5, 0.98), "sm_107a": (0.5, 0.97)}
+LPT_OF_RECORD = {"sm_100a": None, "sm_103a": None, "sm_107a": None}
 # The board cells of record (BWD_SLAB_ORDER_OVERRIDES / BWD_SLAB_LPT_OVERRIDES, keyed (arch, SM count, hidden)): R200
-# with 212 SMs at hidden 4096 keeps the chunk order and (0.5, 0.97) to 1876 tokens, then runs the slab order with (0.5,
-# 0.985) to 33600 tokens, (0.5, 0.98) to 34368 and (0.5, 0.97) above; GB300 (sm_103a with 152 SMs) at hidden 7168 has an
+# with 212 SMs at hidden 4096 keeps the chunk order to 1876 tokens, then runs the slab order (no calibration cell: the
+# two-size schedule is calibrated nowhere); GB300 (sm_103a with 152 SMs) at hidden 7168 has an
 # order cell alone (no lpt record of the size there): the chunk order to 33792 tokens, then the slab order on 47 of the
 # 48 token-count segments in 33793..63091 whose column-slab chunk count is at least 19 (GB300_CELL_MIN_P; GB300_CELL_TIE
 # keeps the chunk order), its last band from 62465 running into the table's slab band from 63092.
@@ -284,14 +312,7 @@ ORDER_OVERRIDES = {
         (None, "slab"),
     ),
 }
-LPT_OVERRIDES = {
-    ("sm_107a", 212, 4096): (
-        (1876, (0.5, 0.97)),
-        (33600, (0.5, 0.985)),
-        (34368, (0.5, 0.98)),
-        (None, (0.5, 0.97)),
-    ),
-}
+LPT_OVERRIDES: dict = {}
 # The GB300 order cell and the token counts it changes: BWD_SLAB_ORDER of sm_103a at 7168 runs the chunk order to
 # 63091 tokens and the slab order above, so the cell differs from it in its "slab" bands in GB300_CELL_SPAN alone, at
 # GB300_CELL_SLAB_T token counts, each with a column-slab chunk count (k7_chunks at 152 SMs and hidden 7168) of at
@@ -334,36 +355,33 @@ LPT_SWEEP = tuple(
 )
 # The kernel test's screen calibration (o_tiles, keep), the working value the rule is exercised at on every board.
 LPT_SCREEN = (1.0, 0.99)
-# The 19 benchmark token counts of the BWD_SLAB_LPT calibration, and per board the geometries the tables of record pick
-# there (on sm_100a / sm_103a the token counts the comment of BWD_SLAB_LPT names; on sm_107a with 212 SMs, under its
-# board cell, those of (0.5, 0.97), which the cell keeps to 1876 tokens (1024; 1536 fires under neither) and whose
-# geometries its band (0.5, 0.985) keeps at 2048 / 2560 / 3072 / 3584 (the screen's best geometry does not depend on
-# keep), and 15566 / 15590 / 16263 / 32768, which that band adds; every other one keeps the one-size form: dynr, or
-# dynr_os where the board's unit-order band is "slab").
+# The 19 benchmark token counts of the former BWD_SLAB_LPT calibration, and per board the geometries the tables of
+# record pick there: none (every one keeps the one-size form: dynr, or dynr_os where the board's unit-order band is
+# "slab"). LPT_FORMER_FIRES: the geometries the screen picks there under the former calibrations (sm_100a (0.5, 0.99),
+# sm_103a (0.5, 0.98); on sm_107a with 212 SMs (0.5, 0.985), the band of the board's former cell over 1877..33600):
+# the rule itself is unchanged, only no table of record calibrates it.
 BENCH_T = (1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096, 8192, 14928, 15288, 15566, 15590, 16114, 16132, 16164,
            16263, 32768, 65536)  # fmt: skip
-LPT_FIRES = (
-    ("sm_100a", 148, {1536: (3, 704, 2, 128), 2048: (3, 960, 2, 128), 2560: (3, 1152, 2, 256), 3584: (4, 1600, 2, 192),
-                      14928: (12, 1536, 9, 384), 15566: (12, 1600, 9, 448), 15590: (12, 1600, 9, 448),
-                      16114: (12, 1664, 9, 384)}),
-    ("sm_103a", 152, {1024: (3, 448, 2, 128), 1536: (3, 704, 2, 128), 2048: (9, 256, 7, 128), 8192: (10, 1088, 7, 192),
-                      14928: (8, 2112, 7, 192), 15288: (10, 2048, 7, 320), 16132: (10, 2176, 7, 320),
-                      16164: (10, 2176, 7, 320), 16263: (8, 2304, 7, 192)}),
-    ("sm_107a", 212, {1024: (4, 320, 3, 64), 2048: (4, 640, 3, 128), 2560: (4, 832, 3, 64), 3072: (4, 960, 3, 192),
-                      3584: (4, 1152, 3, 128), 15566: (18, 1152, 13, 128), 15590: (18, 1152, 13, 128),
-                      16263: (17, 1216, 13, 128), 32768: (14, 2496, 13, 320)}),
+LPT_FIRES = (("sm_100a", 148, {}), ("sm_103a", 152, {}), ("sm_107a", 212, {}))
+LPT_FORMER_FIRES = (
+    ("sm_100a", 148, (0.5, 0.99), {14928: (12, 1536, 9, 384), 15566: (12, 1600, 9, 448), 16114: (12, 1664, 9, 384)}),
+    ("sm_103a", 152, (0.5, 0.98), {14928: (8, 2112, 7, 192), 15288: (10, 2048, 7, 320), 16263: (8, 2304, 7, 192)}),
+    ("sm_107a", 212, (0.5, 0.985), {15566: (18, 1152, 13, 128), 16263: (17, 1216, 13, 128),
+                                    32768: (14, 2496, 13, 320)}),
 )  # fmt: skip
 # At hidden 5120 and 7168, the token counts the two-size rule of the size is pinned at (the benchmark token counts and
-# 24576), and per board and size the geometries the table of record (BWD_SLAB_LPT_HIDDEN) picks there: on B200 the
-# token counts its comment names (H 5120 1024 / 8192 / 15566 / 15590 / 16263 / 32768; H 7168 1024 / 2048 / 3072 /
-# 15288 / 24576); nowhere on the boards without a calibration of the size (sm_103a, sm_107a).
+# 24576), and per board and size the geometries the table of record (BWD_SLAB_LPT_HIDDEN) picks there: none.
+# LPT_SCREEN_FIRES_HIDDEN: on B200 the geometries the kernel test's screen (1.0, 0.99) picks at token counts where the
+# former calibrations of these sizes fired (H 5120 (1.0, 0.99), H 7168 (1.0, 0.98)).
 LPT_HIDDEN_T = tuple(sorted({*BENCH_T, 24576}))
-LPT_FIRES_HIDDEN = (
-    ("sm_100a", 148, 5120, {1024: (9, 128, 7, 64), 8192: (13, 704, 11, 256), 15566: (13, 1408, 11, 64),
-                            15590: (13, 1408, 11, 64), 16263: (13, 1472, 11, 64), 32768: (13, 2816, 11, 896)}),
-    ("sm_100a", 148, 7168, {1024: (2, 896, 1, 128), 2048: (7, 384, 5, 64), 3072: (7, 576, 5, 128),
-                            15288: (10, 1664, 9, 320), 24576: (11, 2560, 9, 768)}),
-    *((arch, sm, hidden, {}) for arch, sm in det.RULES_BOARDS if arch != "sm_100a" for hidden in NEW_HIDDEN_SIZES),
+LPT_FIRES_HIDDEN = tuple(
+    (arch, sm, hidden, {})
+    for arch, sm in det.RULES_BOARDS
+    for hidden in NEW_HIDDEN_SIZES
+)
+LPT_SCREEN_FIRES_HIDDEN = (
+    ("sm_100a", 148, 5120, {15566: (13, 1408, 11, 64), 16263: (13, 1472, 11, 64), 32768: (13, 2816, 11, 896)}),
+    ("sm_100a", 148, 7168, {2048: (7, 384, 5, 64), 15288: (10, 1664, 9, 320), 24576: (11, 2560, 9, 768)}),
 )  # fmt: skip
 # The deterministic programs this package does not copy: the column slab and the final reduction (the backward fn
 # splits, whose libraries the forward does not share, have no copy either).
@@ -373,30 +391,37 @@ DROPPED_ROLES = ("bwd_slab", "bwd_reduce")
 # keeps its atomic fn split): the role of the dual-layout fn split the carry launches, and the carry's table and rules.
 CARRY_ROLES = ("fn_split_carry",)
 CARRY_RULES = ("FN_SPLIT_CARRY", "fn_split_carry", "carried_modules")
-# The deterministic group-row forms, which this package does not copy either (its column slab folds the token owner's
-# per-CTA partials): the token-owner records whose program ends in GROUP_ROWS (the reduction's "_trows" forms go with
-# the dropped reduction), the per-size table and rule that select them (BWD_ROW_BANDS, bwd_group_rows) and the host-plan
-# keys of the group-row parameter region; PER_CTA_DIMS: the per-CTA value of each dimension of that region ([G6, 32],
-# this package's ["chunks", 32]).  The mirror checks read the deterministic rules with bwd_group_rows off
-# (_det_per_cta).
+# The deterministic group-row forms, which this package copies (its column slab folds the group rows where the token
+# owner writes them): the token-owner records whose program ends in GROUP_ROWS (the reduction's "_trows" forms go with
+# the dropped reduction), the per-size table and rule that select them (BWD_ROW_BANDS, bwd_group_rows), the constants
+# of the group-row parameter region and the host-plan keys of that region.
 GROUP_ROWS = "_trows_dyn"
 DET_GROUP_ROWS = frozenset(
     name
     for name, record in det.MODULES.items()
     if (record["select_rule"] or {}).get("program", "").endswith(GROUP_ROWS)
 )
-GROUP_ROW_RULES = ("BWD_ROW_BANDS", "bwd_group_rows")
+GROUP_ROW_RULES = ("BWD_ROW_BANDS", "bwd_group_rows", "PARAM_ROW_COLS", "TOKEN_GROUP")
 GROUP_ROW_KEYS = ("groups", "group_rows", "param_dim0", "param_dim1")
-PER_CTA_DIMS = {"param_dim0": "chunks", "param_dim1": det.PARAM_COLS}
 # Sinkhorn counts other than the count of record: the token-owner pass runs its run-time-count record.
 RUN_TIME_ITERS = (1, 7, 64)
 T_VALUES = tuple(T for T in det.RULES_T_VALUES if T > 0)
-# The deterministic records, routes and record scalars of this package's hidden sizes (every size the deterministic
-# package exports: this package copies each of them).
+# The deterministic records, routes and record scalars of this package's (architecture, hidden size) pairs
+# (ND_HIDDEN_SIZES): a record keeps the architectures that export its hidden size here; a record left with none (the
+# deterministic sm_107a records at 5120 and 7168) has no copy in this package.
 DET_MODULES = {
-    name: record
+    name: {
+        **record,
+        "arches": [
+            arch
+            for arch in record["arches"]
+            if record["hidden"] in ND_HIDDEN_SIZES.get(arch, ())
+        ],
+    }
     for name, record in det.MODULES.items()
-    if record["hidden"] in HIDDEN_SIZES
+    if any(
+        record["hidden"] in ND_HIDDEN_SIZES.get(arch, ()) for arch in record["arches"]
+    )
 }
 DET_ROUTES = {
     arch: {
@@ -404,7 +429,9 @@ DET_ROUTES = {
         for key, route in routes.items()
         if key
         in {
-            det.route_key(hidden, kind) for hidden in HIDDEN_SIZES for kind in det.KINDS
+            det.route_key(hidden, kind)
+            for hidden in ND_HIDDEN_SIZES.get(arch, ())
+            for kind in det.KINDS
         }
     }
     for arch, routes in det.ROUTES.items()
@@ -438,6 +465,7 @@ FACADE = "flashinfer/cake_mhc_nondet_train.py"
 FACADE_ENTRIES = ("is_cake_mhc_nondet_train_supported", *ENTRIES)
 # The prefixes of the public entry points of the two modes (the same verbs follow).
 NONDET_API, DET_API = "cake_mhc_nondet_train", "cake_mhc_det_train"
+# PyTorch's wording of the alert of a non-deterministic operation (no call of this package raises it).
 _ALERT = "does not have a deterministic implementation"
 # The interpreter's refusal of a ``deterministic`` keyword: no entry point has that parameter.
 _NO_MODE_KEYWORD = "unexpected keyword argument 'deterministic'"
@@ -499,9 +527,11 @@ def _suffix(hidden: int) -> str:
 
 def _atomic_split(arch: str, hidden: int = HIDDEN) -> str:
     """The atomic fn split of ``arch`` at ``hidden``: the form of the deterministic backward split
-    (``fn_split_program(arch, 1, hidden)``), launched as the token-owner pass's programmatic dependent (``_dep``)."""
+    (``fn_split_program(arch, 1, hidden)``), launched as the token-owner pass's programmatic dependent (``_dep``; on
+    the (architecture, hidden size) pairs of ``SPLIT_CHAIN`` its ``_dep1`` form, whose last CTA alone waits)."""
     return (
-        f"{ND_PREFIX}fn_split_atomic__{det.fn_split_program(arch, 1, hidden)}_dep"
+        f"{ND_PREFIX}fn_split_atomic__{det.fn_split_program(arch, 1, hidden)}_"
+        + SPLIT_CHAIN.get((arch, hidden), "dep")
         + _suffix(hidden)
     )
 
@@ -533,7 +563,7 @@ def _slabs(arch: str, hidden: int = HIDDEN) -> list[str]:
     return [
         name
         for name in (_slab(hidden), _lpt(hidden), _slab_os(hidden), _lpt_os(hidden))
-        if arch in ATOMIC.get(name, ())
+        if arch in OWN.get(name, ())
     ]
 
 
@@ -603,68 +633,28 @@ def _route_hidden(key: str) -> int:
 
 
 def _arch_sizes(arch: str) -> tuple[int, ...]:
-    """The hidden sizes of ``arch``: the deterministic package's (this package routes every size it does)."""
-    return tuple(det.supported_hidden_sizes(arch))
+    """The hidden sizes this package exports on ``arch`` (:data:`ND_HIDDEN_SIZES`; none on another architecture)."""
+    return ND_HIDDEN_SIZES.get(arch, ())
 
 
 def _det_role(name: str) -> str:
     return det.MODULES[name]["role"]
 
 
-def _det_program(name: str) -> str:
-    return det.MODULES[name]["select_rule"]["program"]
-
-
-@contextlib.contextmanager
-def _det_per_cta():
-    """The deterministic rules with their group-row forms off (``bwd_group_rows`` False at every call): the per-CTA
-    token owner and parameter region this package copies, and the per-CTA reduction whose ``dscale`` / ``dbase`` its
-    column slab reproduces.  The deterministic host plans and workspace envelopes cached under either setting are
-    dropped on entry and on exit, also when the body fails."""
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(det, "bwd_group_rows", lambda *_args, **_kwargs: False)
-        det.host_plan.cache_clear()
-        det.workspace_bytes_upto.cache_clear()
-        try:
-            yield
-        finally:
-            patch.undo()
-            det.host_plan.cache_clear()
-            det.workspace_bytes_upto.cache_clear()
-
-
-@pytest.fixture
-def det_per_cta():
-    """:func:`_det_per_cta` for the whole test."""
-    with _det_per_cta():
-        yield
-
-
-def _per_cta_plan(plan: dict) -> dict:
-    """A deterministic host plan under :func:`_det_per_cta` without its group-row keys (this package's plan holds none
-    of them), after checking that its parameter region is the per-CTA one (:data:`PER_CTA_DIMS`)."""
-    assert not plan["group_rows"], plan
-    for dim, per_cta in PER_CTA_DIMS.items():
-        want = plan[per_cta] if isinstance(per_cta, str) else per_cta
-        assert plan[dim] == want, (dim, plan)
-    return {key: value for key, value in plan.items() if key not in GROUP_ROW_KEYS}
-
-
-def _regime_ranges(program: str, arch: str, hidden: int) -> list:
-    """The ``R`` ranges ``[lo, hi]`` (``hi`` None: unbounded) on which the deterministic ``bwd_token_program`` of
-    ``arch`` at ``hidden`` names ``program`` outside its token-count bands and its group-row bands: the
-    ``BWD_TOKEN_REGIMES`` entries of ``program`` and, for the architecture's ``BWD_TOKEN_PROGRAM``, every gap between
-    the regimes (the rule in ``chunk_rows_band`` form)."""
-    regimes = det._tab("BWD_TOKEN_REGIMES", hidden)[arch]
-    ranges = [[lo, hi] for name, lo, hi in regimes if name == program]
-    if program == det._tab("BWD_TOKEN_PROGRAM", hidden)[arch]:
-        start = 0
-        for _name, lo, hi in sorted(regimes, key=lambda regime: regime[1]):
-            if lo > start:
-                ranges.append([start, lo - 1])
-            start = hi + 1
-        ranges.append([start, None])
-    return sorted(ranges, key=lambda bounds: bounds[0])
+def _fold_plan(plan: dict) -> dict:
+    """A deterministic host plan with the column slab's values (:data:`FOLD_KEYS`): ``prow`` 1 and ``param_rows`` the
+    group count where the plan lays out the group rows (``group_rows``), else ``prow`` 0 and ``param_rows`` the
+    token owner's CTA count ``G6`` (``chunks``); ``slot_parts = min(32, ceil(T / 64))``, at least the chunk count of
+    the plan (``parts``) and of every two-size geometry."""
+    group_rows = bool(plan["group_rows"])
+    slot_parts = min(32, -(-plan["rows"] // det.SLAB_TILE_T))
+    assert slot_parts >= plan["parts"], plan
+    return {
+        **plan,
+        "prow": int(group_rows),
+        "param_rows": plan["groups"] if group_rows else plan["chunks"],
+        "slot_parts": slot_parts,
+    }
 
 
 @contextlib.contextmanager
@@ -688,19 +678,24 @@ def _torch_deterministic(mode: bool, *, warn_only: bool = False):
 def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_split() -> (
     None
 ):
-    """``MODULES`` = every deterministic record of every hidden size but ``bwd_slab__*`` / ``bwd_reduce__*``, the
-    backward fn splits, the checkpoint carry's records (``CARRY_ROLES``) and the token owner's group-row forms
-    (``DET_GROUP_ROWS``) under the ``cake_mhc_train_`` prefix
+    """``MODULES`` = every deterministic record of this package's (architecture, hidden size) pairs (``DET_MODULES``)
+    but ``bwd_slab__*`` / ``bwd_reduce__*``, the backward fn splits and the checkpoint carry's records
+    (``CARRY_ROLES``) under the ``cake_mhc_train_`` prefix
     (the record equal field for field after the rename: arches, hidden size, build knobs, launch, arguments, rules;
-    a token-owner record whose deterministic rule names its program through ``bwd_token_program`` may select by the
-    ``R`` regimes of that program instead, ``chunk_rows_band``: the same calls on its architectures, which have no
-    token-count band, outside the group-row bands) plus the programs of this package (``ATOMIC``); the dropped records
-    are exactly the deterministic column-slab and reduction roles, and the backward fn splits, the carry records and
-    the group-row token owners are the only other records without a copy (no record of this package names a
-    group-row program or has a carry role, and the carry's table and rules, ``CARRY_RULES``, have no copy)."""
+    the token owner's group-row forms ``DET_GROUP_ROWS`` included, and every token owner selects by the
+    deterministic rule, so none by its ``R`` regimes alone) plus the programs of this package (``OWN``); the dropped
+    records are exactly the deterministic column-slab and reduction roles, and the backward fn splits and the carry
+    records are the only other records without a copy (no record of this package has a carry role, and the carry's
+    table and rules, ``CARRY_RULES``, have no copy)."""
     assert tuple(det.HIDDEN_SIZES) == HIDDEN_SIZES
+    assert {record["hidden"] for record in det.MODULES.values()} == set(HIDDEN_SIZES)
     assert {record["hidden"] for record in DET_MODULES.values()} == set(HIDDEN_SIZES)
-    assert DET_MODULES == det.MODULES
+    # every deterministic record at the architectures that export its size in this package; a record with none of
+    # them (sm_107a at 5120 and 7168) has no copy
+    for name, record in det.MODULES.items():
+        arches = [a for a in record["arches"] if record["hidden"] in _arch_sizes(a)]
+        want = {**record, "arches": arches} if arches else None
+        assert DET_MODULES.get(name) == want, name
     dropped = {name for name in DET_MODULES if _dropped(name)}
     assert dropped and {_det_role(name) for name in dropped} == set(DROPPED_ROLES)
     assert not [
@@ -714,41 +709,31 @@ def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_s
     assert backward_splits and not backward_splits & dropped
     carries = {name for name in DET_MODULES if _det_role(name) in CARRY_ROLES}
     assert carries and not carries & dropped
-    assert {_det_role(name) for name in DET_GROUP_ROWS} <= {"bwd_token"}
+    assert DET_GROUP_ROWS and {_det_role(name) for name in DET_GROUP_ROWS} == {
+        "bwd_token"
+    }
     copied = {
         _renamed(name): name
         for name in DET_MODULES
-        if name not in dropped
-        and name not in backward_splits
-        and name not in carries
-        and name not in DET_GROUP_ROWS
+        if name not in dropped and name not in backward_splits and name not in carries
     }
+    assert {_renamed(name) for name in DET_GROUP_ROWS} <= set(copied)
     assert all(name.startswith(ND_PREFIX) for name in copied)
-    assert not set(copied) & set(ATOMIC)
-    expected = set(copied) | set(ATOMIC)
+    assert not set(copied) & set(OWN)
+    expected = set(copied) | set(OWN)
     assert set(nd.MODULES) == expected, sorted(set(nd.MODULES) ^ expected)
-    assert not [name for name in nd.MODULES if GROUP_ROWS in name]
     assert not [
         name for name, record in nd.MODULES.items() if record["role"] in CARRY_ROLES
+    ]
+    assert not [
+        name
+        for name, record in nd.MODULES.items()
+        if (record["select_rule"] or {}).get("kind") == "chunk_rows_band"
     ]
     for name in CARRY_RULES:
         assert hasattr(det, name) and not hasattr(nd, name), name
     for name, det_name in copied.items():
-        record, reference = nd.MODULES[name], _renamed(det.MODULES[det_name])
-        rule = reference["select_rule"]
-        if record["select_rule"] != rule:
-            # the per-CTA rule in chunk_rows_band form: the R regimes of the program the deterministic rule names
-            assert (rule or {}).get("kind") == "program", name
-            assert rule["rule"] == "bwd_token_program", name
-            hidden = record["hidden"]
-            for arch in record["arches"]:
-                assert not det._tab("BWD_TOKEN_BANDS", hidden)[arch], (name, arch)
-                assert record["select_rule"] == {
-                    "kind": "chunk_rows_band",
-                    "ranges": _regime_ranges(rule["program"], arch, hidden),
-                }, (name, arch)
-            reference = {**reference, "select_rule": record["select_rule"]}
-        assert record == reference, name
+        assert nd.MODULES[name] == _renamed(DET_MODULES[det_name]), name
     for name, record in nd.MODULES.items():
         assert record["kernel_symbol"] == f"kernel_{record['kernel']}", name
         assert record["library"] == record["kernel"], name
@@ -757,26 +742,28 @@ def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_s
 
 
 @pytest.mark.cpu_only
-def test_atomic_records_keep_the_deterministic_launch() -> None:
+def test_own_records_keep_the_deterministic_launch() -> None:
     """The programs of this package, at every hidden size: named after their library and kernel symbol (``__h<H>``
     at 5120 and 7168); the fn splits keep the launch and fixed grid of the deterministic transposed-layout split of
     their form and size but for the static PDL attribute (``use_pdl`` True: they follow the token-owner pass and wait
     for it) and bind ``fn``, ``fnTp``, ``dfn`` and ``accumulate`` (no ``fnp``, no ``want_t``); the column slab keeps
     the launch and grid rule of the deterministic ``dynr`` record of its size (``slabs`` = H / 64), binds its
-    arguments without ``dfn_part`` and adds ``dfn``, ``param_partial``, ``dscale``, ``dbase``, ``chunks`` and
-    ``accumulate``.  At every hidden size the column slab's records select by ``bwd_slab_atomic_program`` (programs
-    ``dynr`` / ``lpt`` / ``dynr_os`` / ``lpt_os``: the last ``__`` part of the name without the size suffix; on
-    sm_103a at 5120 and 7168, whose route holds the ``dynr`` and ``dynr_os`` records, the rule names one of these at
-    every token count, and on sm_107a the ``_os`` ones only on the board of its cell of ``BWD_SLAB_ORDER_OVERRIDES``);
-    the ``lpt`` record of a size is its ``dynr`` record with the ``lpt_chunks`` chunk rule, its chunk scalars ``P`` /
-    ``rpc`` bound to the ``lpt_*`` host values and ``p_big`` / ``rpc_small`` after the ticket, on the architectures
-    the size's table calibrates (``BWD_SLAB_LPT`` at 4096, ``BWD_SLAB_LPT_HIDDEN`` at 5120 and 7168: a calibration
-    without the record would select no column slab, a record without one would never run); the ``dynr_os`` /
-    ``lpt_os`` record of a size, where the size has one, is its ``dynr`` / ``lpt`` record (the slab-fastest build has
-    the same kernel parameters, launch and chunk rule) under its own name and program key, on the architectures of
-    that record whose ``BWD_SLAB_ORDER`` of the size, or a board cell of ``BWD_SLAB_ORDER_OVERRIDES`` at the size,
-    has a ``"slab"`` band."""
-    for name, arches in ATOMIC.items():
+    arguments without ``dfn_part`` and adds :data:`FOLD_ARGS` (``dfn``, ``param_partial``, ``dscale``, ``dbase``, the
+    parameter row count ``chunks`` bound to ``param_rows``, ``accumulate`` and, right after the ticket, the per-chunk
+    ``dfn`` slots ``dfn_slot``, the arrival counts ``slab_cnt`` and the row layout ``prow``).  At every hidden size
+    the column slab's records select by ``bwd_slab_atomic_program`` (programs ``dynr`` / ``lpt`` / ``dynr_os`` /
+    ``lpt_os``: the last ``__`` part of the name without the size suffix; on sm_103a at 5120 and 7168, whose route
+    holds the ``dynr`` and ``dynr_os`` records, the rule names one of these at every token count, and on sm_107a the
+    ``_os`` ones only on the board of its cell of ``BWD_SLAB_ORDER_OVERRIDES``); the ``lpt`` record of a size is its
+    ``dynr`` record with the ``lpt_chunks`` chunk rule, its chunk scalars ``P`` / ``rpc`` bound to the ``lpt_*`` host
+    values and ``p_big`` / ``rpc_small`` between the ticket and ``dfn_slot``, on the architectures the size's table
+    calibrates (``BWD_SLAB_LPT`` at 4096, ``BWD_SLAB_LPT_HIDDEN`` at 5120 and 7168: a calibration without the record
+    would select no column slab, a record without one would never run); the ``dynr_os`` / ``lpt_os`` record of a
+    size, where the size has one, is its ``dynr`` / ``lpt`` record (the slab-fastest build has the same kernel
+    parameters, launch and chunk rule) under its own name and program key, on the architectures of that record whose
+    ``BWD_SLAB_ORDER`` of the size, or a board cell of ``BWD_SLAB_ORDER_OVERRIDES`` at the size, has a ``"slab"``
+    band."""
+    for name, arches in OWN.items():
         record = nd.MODULES[name]
         hidden = record["hidden"]
         assert tuple(record["arches"]) == arches, name
@@ -816,7 +803,6 @@ def test_atomic_records_keep_the_deterministic_launch() -> None:
             }, what
             assert set(split["logical"].values()) == {"fn", "fnTp", "dfn", "accumulate"}
             assert [kind for kind, _ in split["arg_plan"]][-3:] == ["grid"] * 3
-    added = {"dfn", "param_partial", "dscale", "dbase", "chunks", "accumulate"}
     for hidden in HIDDEN_SIZES:
         slab, dynr = nd.MODULES[_slab(hidden)], det.MODULES[DET_DYNR + _suffix(hidden)]
         assert slab["role"] == "bwd_slab" and slab["hidden"] == hidden, hidden
@@ -829,29 +815,40 @@ def test_atomic_records_keep_the_deterministic_launch() -> None:
             "slabs": hidden // det.SLAB_D,
             "chunks_rule": "k7_chunks",
         }, hidden
-        assert (
-            set(slab["logical"].values())
-            == (set(dynr["logical"].values()) - {"dfn_part"}) | added
+        assert "dfn_part" in dynr["logical"] and not set(FOLD_ARGS) & set(
+            dynr["logical"]
         ), hidden
+        assert slab["logical"] == {
+            **{k: v for k, v in dynr["logical"].items() if k != "dfn_part"},
+            **FOLD_ARGS,
+        }, hidden
         kept = [entry for entry in dynr["arg_plan"] if entry != ["buffer", "dfn_part"]]
-        assert [entry for entry in slab["arg_plan"] if entry[1] not in added] == kept
+        assert [
+            entry for entry in slab["arg_plan"] if entry[1] not in FOLD_ARGS
+        ] == kept
+        assert slab["arg_plan"][-8] == ["buffer", "ticket"], hidden
+        assert slab["arg_plan"][-7:-4] == FOLD_TAIL, hidden
     for hidden in HIDDEN_SIZES:
+        table = _lpt_table(hidden)
+        assert set(table) == set(det.ARCHES), hidden
+        calibrated = {
+            arch for arch, calibration in table.items() if calibration is not None
+        }
+        if _lpt(hidden) not in nd.MODULES:
+            assert not calibrated and _lpt(hidden) not in OWN, hidden
+            continue
         slab, lpt = nd.MODULES[_slab(hidden)], nd.MODULES[_lpt(hidden)]
         assert lpt["role"] == "bwd_slab" and lpt["hidden"] == hidden, hidden
         assert set(lpt["arches"]) <= set(slab["arches"]), hidden
-        table = _lpt_table(hidden)
-        assert set(table) == set(det.ARCHES), hidden
-        assert set(lpt["arches"]) == {
-            arch for arch, calibration in table.items() if calibration is not None
-        }, hidden
+        assert set(lpt["arches"]) == calibrated, hidden
         assert lpt["launch"] == slab["launch"], hidden
         assert lpt["grid_rule"] == {**slab["grid_rule"], "chunks_rule": "lpt_chunks"}
-        assert lpt["arg_plan"][:-4] == slab["arg_plan"][:-4] + [
+        assert lpt["arg_plan"] == [
+            *slab["arg_plan"][:-7],
             ["parameter", "p_big"],
             ["parameter", "rpc_small"],
+            *slab["arg_plan"][-7:],
         ], hidden
-        assert slab["arg_plan"][-5] == ["buffer", "ticket"], hidden
-        assert lpt["arg_plan"][-4:] == slab["arg_plan"][-4:], hidden
         assert lpt["logical"] == {
             **slab["logical"],
             "P": "lpt_parts",
@@ -864,7 +861,7 @@ def test_atomic_records_keep_the_deterministic_launch() -> None:
             (_slab(hidden), _slab_os(hidden)),
             (_lpt(hidden), _lpt_os(hidden)),
         ):
-            if name not in ATOMIC:
+            if name not in OWN:
                 assert name not in nd.MODULES, name
                 continue
             record, reference = nd.MODULES[name], nd.MODULES[base]
@@ -898,20 +895,28 @@ def test_no_record_references_a_deterministic_library() -> None:
 @pytest.mark.cpu_only
 def test_records_speak_the_vocabulary() -> None:
     """Every record binds logical names of this package's vocabulary (``LOGICAL_TENSORS`` = the deterministic one
-    without ``dfn_part``; ``LOGICAL_SCALARS`` = the deterministic one without its group-row scalars, ``groups``, and
-    with the lpt record's chunk scalars; tensors as buffers, scalars as parameters), one logical name per kernel
-    parameter, the per-call PDL argument exactly when ``use_pdl`` is ``"runtime"`` (just before the grid).  The host
-    binds every
+    without ``dfn_part``, then the column slab's workspace regions ``dfn_slot`` and ``slab_cnt``; ``LOGICAL_SCALARS``
+    = the deterministic one, then the lpt record's chunk scalars and the column slab's ``param_rows`` and ``prow``;
+    tensors as buffers, scalars as parameters), one logical name per kernel parameter, the per-call PDL argument
+    exactly when ``use_pdl`` is ``"runtime"`` (just before the grid).  The host binds every
     argument of every routed record: each logical name is a call value, a workspace region, a host-plan scalar of
     the route's fast plan or a scalar the record fixes (the run-time-count records also take ``sinkhorn_iters``,
     which the full path passes), and every workspace value names a region of the route's workspace."""
     assert list(nd.LOGICAL_TENSORS) == [
-        t for t in det.LOGICAL_TENSORS if t != "dfn_part"
+        *(t for t in det.LOGICAL_TENSORS if t != "dfn_part"),
+        "dfn_slot",
+        "slab_cnt",
     ]
     assert "dfn_part" in det.LOGICAL_TENSORS
-    kept = tuple(name for name in det.LOGICAL_SCALARS if name not in GROUP_ROW_KEYS)
-    assert kept + LPT_HOST_KEYS == nd.LOGICAL_SCALARS
-    assert set(pkg._HOST_VALUES["bwd_finish"]) >= set(LPT_HOST_KEYS)
+    assert set(GROUP_ROW_KEYS) & set(det.LOGICAL_SCALARS) == {"groups"}
+    assert (
+        tuple(det.LOGICAL_SCALARS) + LPT_HOST_KEYS + ("param_rows", "prow")
+        == nd.LOGICAL_SCALARS
+    )
+    assert set(pkg._HOST_VALUES["bwd_finish"]) >= {*LPT_HOST_KEYS, "param_rows", "prow"}
+    assert {"dfn_slot", "slab_cnt"} <= {
+        value for value, _ in pkg._WORKSPACE_VALUES["bwd_finish"]
+    }
     tensors, scalars = set(nd.LOGICAL_TENSORS), set(nd.LOGICAL_SCALARS)
     for name, record in nd.MODULES.items():
         plan, logical = record["arg_plan"], record["logical"]
@@ -971,9 +976,10 @@ def test_records_speak_the_vocabulary() -> None:
 def test_routes_are_the_deterministic_routes_but_bwd_finish() -> None:
     """``ROUTES``: the deterministic architectures and route keys of every hidden size (5120 and 7168 on sm_100a /
     sm_103a only); every route the renamed deterministic route except ``bwd_finish``, which is the deterministic
-    token-owner records but the group-row forms (renamed, in route order), the atomic fn split of the architecture
-    and size and the column slab's forms of the size (``dynr``, ``lpt``, ``dynr_os``, ``lpt_os``; on sm_103a at 5120
-    and 7168 ``dynr`` and ``dynr_os``).  Every record is routed, on exactly its architectures."""
+    token-owner records (renamed, in route order: the group-row forms ``_trows_dyn`` where the deterministic route
+    holds them), the atomic fn split of the architecture and size and the column slab's forms of the size (``dynr``,
+    ``lpt``, ``dynr_os``, ``lpt_os``; on sm_103a at 5120 and 7168 ``dynr`` and ``dynr_os``).  Every record is routed,
+    on exactly its architectures."""
     assert set(nd.ROUTES) == set(det.ROUTES) == set(det.ARCHES)
     routed: dict[str, set] = {}
     for arch in det.ARCHES:
@@ -995,11 +1001,7 @@ def test_routes_are_the_deterministic_routes_but_bwd_finish() -> None:
                 assert route == _renamed(det_route), (arch, key)
                 continue
             hidden = _route_hidden(key)
-            tokens = [
-                _renamed(n)
-                for n in det_route
-                if _det_role(n) == "bwd_token" and n not in DET_GROUP_ROWS
-            ]
+            tokens = [_renamed(n) for n in det_route if _det_role(n) == "bwd_token"]
             assert tokens, (arch, key)
             slabs = _slabs(arch, hidden)
             assert route == [*tokens, _atomic_split(arch, hidden), *slabs], (arch, key)
@@ -1020,21 +1022,20 @@ def test_selection_is_the_deterministic_selection_but_bwd_finish(
     arch: str, sm: int
 ) -> None:
     """At every hidden size of the board's architecture, on every token count of record at the count of record and at
-    run-time counts: every kind selects the renamed deterministic records of the per-CTA rules (:func:`_det_per_cta`),
-    except ``bwd_finish``: (the deterministic token-owner record(s) of the call renamed, the atomic fn split of the
-    size, the column slab's form of the call -- the size's ``lpt`` record where ``lpt_chunks`` gives a geometry of the
-    size under the table of record, else its ``dynr`` record, as its ``_os`` copy where the board's unit-order band
-    is ``"slab"``: :func:`_program_at`) -- one fn split, one column slab, no reduction.  The deterministic selection
-    of record holds the group-row form (``GROUP_ROWS``) of that token owner's program where ``bwd_group_rows`` holds
-    at the count of record, that token owner itself everywhere else."""
+    run-time counts: every kind selects the renamed deterministic records, except ``bwd_finish``: (the deterministic
+    token-owner record(s) of the call renamed, the atomic fn split of the size, the column slab's form of the call --
+    the size's ``lpt`` record where ``lpt_chunks`` gives a geometry of the size under the table of record, else its
+    ``dynr`` record, as its ``_os`` copy where the board's unit-order band is ``"slab"``: :func:`_program_at`) -- one
+    fn split, one column slab, no reduction.  The token owner is the group-row form (``GROUP_ROWS``) of its program
+    where ``bwd_group_rows`` holds at the count of record, the run-time-count record at another count, the per-CTA
+    form elsewhere."""
     for hidden, T in ((h, T) for h in _arch_sizes(arch) for T in T_VALUES):
         for iters in (det.SINKHORN_ITERS, *RUN_TIME_ITERS):
             for kind in det.KINDS:
                 what = (arch, sm, hidden, T, iters, kind)
-                with _det_per_cta():
-                    det_names = det.selected_modules(
-                        arch, hidden, kind, rows=T, sm_count=sm, sinkhorn_iters=iters
-                    )
+                det_names = det.selected_modules(
+                    arch, hidden, kind, rows=T, sm_count=sm, sinkhorn_iters=iters
+                )
                 names = nd.selected_modules(
                     arch, hidden, kind, rows=T, sm_count=sm, sinkhorn_iters=iters
                 )
@@ -1052,27 +1053,18 @@ def test_selection_is_the_deterministic_selection_but_bwd_finish(
                     what,
                     names,
                 )
-                run_time = (nd.MODULES[tokens[0]]["select_rule"] or {}).get("kind")
-                assert (run_time == "run_time_iters") == (
+                rule = nd.MODULES[tokens[0]]["select_rule"] or {}
+                assert (rule.get("kind") == "run_time_iters") == (
                     iters != det.SINKHORN_ITERS
                 ), what
-                per_cta = [n for n in det_names if _det_role(n) == "bwd_token"]
-                shipped = [
-                    n
-                    for n in det.selected_modules(
-                        arch, hidden, kind, rows=T, sm_count=sm, sinkhorn_iters=iters
-                    )
-                    if _det_role(n) == "bwd_token"
-                ]
-                if (
+                group_rows = (
                     det.bwd_group_rows(T, sm, arch, hidden)
                     and iters == det.SINKHORN_ITERS
-                ):
-                    assert [_det_program(n) for n in shipped] == [
-                        _det_program(n) + GROUP_ROWS for n in per_cta
-                    ], (what, shipped)
-                else:
-                    assert shipped == per_cta, (what, shipped)
+                )
+                assert rule.get("program", "").endswith(GROUP_ROWS) == group_rows, (
+                    what,
+                    tokens,
+                )
 
 
 @pytest.mark.cpu_only
@@ -1208,8 +1200,9 @@ def test_selection_refuses_a_column_slab_the_route_lacks(monkeypatch) -> None:
 @pytest.mark.parametrize(("arch", "sm"), det.RULES_BOARDS)
 def test_pdl_follows_the_deterministic_edges(arch: str, sm: int) -> None:
     """``PDL_EDGES`` = the deterministic edges without ``K7->K8``, the column slab's stem
-    ``cake_mhc_train_bwd_slab_atomic`` on ``K6->K7`` (every form and size); ``PDL_OFF_BANDS`` = the deterministic
-    bands without ``K7->K8`` (one table for every hidden size, as in the deterministic package).  On every path and
+    ``cake_mhc_train_bwd_slab_fold`` on ``K6->K7`` (every form and size); ``PDL_OFF_BANDS`` = the deterministic
+    bands of every hidden size without ``K7->K8`` (one table: the deterministic package's per-size tables differ only
+    in their K7->K8 cells; test_host_rules_are_copies_of_the_deterministic_ones).  On every path and
     token count (the counts of record and every band boundary) the ``enable_pdl`` without an SM count of the
     column-slab records of each hidden size reads the bands of :func:`_pdl_cell` without an SM count: every
     deterministic column-slab record's value of the route of that size where no ``(arch, None, hidden)`` cell holds
@@ -1221,7 +1214,7 @@ def test_pdl_follows_the_deterministic_edges(arch: str, sm: int) -> None:
         for stem, edge in det.PDL_EDGES.items()
         if edge != "K7->K8" and not stem.endswith("bwd_slab")
     }
-    expected_edges[ND_PREFIX + "bwd_slab_atomic"] = "K6->K7"
+    expected_edges[ND_PREFIX + "bwd_slab_fold"] = "K6->K7"
     assert expected_edges == nd.PDL_EDGES
     assert "K7->K8" in set(det.PDL_EDGES.values())
     assert {
@@ -1256,9 +1249,7 @@ def test_pdl_follows_the_deterministic_edges(arch: str, sm: int) -> None:
         n
         for route in DET_ROUTES[arch].values()
         for n in route
-        if not _dropped(n)
-        and _det_role(n) != "fn_split_bwd"
-        and n not in DET_GROUP_ROWS
+        if not _dropped(n) and _det_role(n) != "fn_split_bwd"
     ]
     for T in sorted(set(T_VALUES) | {t for t in boundaries if t > 0}):
         for path in det.PDL_PATHS:
@@ -1701,24 +1692,35 @@ def _round256(n: int) -> int:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.usefixtures("det_per_cta")
 @pytest.mark.parametrize(("arch", "sm"), det.RULES_BOARDS)
-def test_workspace_is_the_deterministic_layout_without_the_partials(
+def test_workspace_holds_the_deterministic_regions_and_the_fold_regions(
     arch: str, sm: int
 ) -> None:
-    """At every hidden size of the board's architecture: ``fwd`` is the deterministic forward workspace; the ``bwd``
-    regions are the deterministic per-CTA ``bwd`` regions (:func:`_det_per_cta`; the parameter region the per-CTA
-    partials ``[chunks, 32]`` at every token count, the group rows of ``BWD_ROW_BANDS`` nowhere) but the last
-    (``dfn_part``, ``P x 24 x 4H`` FP32) at identical offsets, sizes, dtypes and shapes, the ticket region first; the
-    total is the deterministic total less the rounded ``dfn_part`` bytes; ``T == 0`` has no regions."""
+    """At every hidden size of the board's architecture: ``fwd`` is the deterministic forward workspace; ``bwd`` is the
+    ticket region (offset 0), the column slab's arrival counts ``slab_cnt`` (``SLAB_CNT_WORDS`` uint32 at offset 256:
+    with the ticket region the zero prefix of ``ZERO_PREFIX_BYTES`` at every token count and hidden size), the
+    deterministic regions but the per-chunk partials ``dfn_part`` -- ``fnTp``, ``dzp``, ``tokp`` and the parameter
+    region (the per-CTA partials ``[G6, 32]``, the group rows ``[56, ceil(T / 8)]`` inside ``BWD_ROW_BANDS``) -- with
+    their deterministic sizes, dtypes and shapes, each ``ZERO_PREFIX_BYTES - 256`` bytes past its deterministic offset,
+    and last the per-chunk ``dfn`` slot pairs ``dfn_slot`` (``2 x min(32, ceil(T / 64)) x 24 x 4H`` FP32, two planes of
+    at least the deterministic ``P x 24 x 4H`` partials); the total is the deterministic total less the rounded
+    ``dfn_part`` bytes plus the two regions, above the deterministic total at every token count; ``T == 0`` has no
+    regions."""
     assert set(nd.WORKSPACE_REGIONS) == set(det.WORKSPACE_REGIONS) == {"fwd", "bwd"}
     assert nd.WORKSPACE_REGIONS["fwd"] == det.WORKSPACE_REGIONS["fwd"]
-    assert det.WORKSPACE_REGIONS["bwd"][-1]["name"] == "dfn_part"
+    det_bwd = det.WORKSPACE_REGIONS["bwd"]
+    assert det_bwd[0]["name"] == "ticket" and det_bwd[-1]["name"] == "dfn_part"
+    assert nd.SLAB_CNT_WORDS == SLAB_CNT_WORDS
+    assert 4 * det.TICKET_WORDS + 4 * SLAB_CNT_WORDS == ZERO_PREFIX_BYTES
+    assert max(hidden // det.SLAB_D for hidden in HIDDEN_SIZES) <= SLAB_CNT_WORDS
     assert nd.WORKSPACE_REGIONS["bwd"] == [
-        {**region, "shape": [PER_CTA_DIMS.get(dim, dim) for dim in region["shape"]]}
-        for region in det.WORKSPACE_REGIONS["bwd"][:-1]
+        det_bwd[0],
+        {"dtype": "uint32", "name": "slab_cnt", "shape": [SLAB_CNT_WORDS]},
+        *det_bwd[1:-1],
+        {"dtype": "float32", "name": "dfn_slot", "shape": ["slot_parts", 24, "n"]},
     ]
     assert nd.WORKSPACE_OF_KIND == det.WORKSPACE_OF_KIND
+    shift = ZERO_PREFIX_BYTES - 4 * det.TICKET_WORDS
     for hidden, T in ((h, T) for h in _arch_sizes(arch) for T in det.RULES_T_VALUES):
         what = (hidden, T)
         assert nd.workspace_regions(
@@ -1733,22 +1735,51 @@ def test_workspace_is_the_deterministic_layout_without_the_partials(
             assert layout == {"regions": {}, "total_bytes": 0}
             continue
         names = list(reference["regions"])
-        assert names[-1] == "dfn_part" and list(layout["regions"]) == names[:-1], what
-        for name, region in layout["regions"].items():
-            assert region == reference["regions"][name], (what, name)
+        assert names[-1] == "dfn_part", what
+        assert list(layout["regions"]) == [
+            names[0],
+            "slab_cnt",
+            *names[1:-1],
+            "dfn_slot",
+        ], what
+        assert layout["regions"]["ticket"] == reference["regions"]["ticket"], what
         assert layout["regions"]["ticket"]["offset"] == 0
         assert layout["regions"]["ticket"]["bytes"] == 4 * det.TICKET_WORDS
+        assert layout["regions"]["slab_cnt"] == {
+            "offset": 4 * det.TICKET_WORDS,
+            "bytes": 4 * SLAB_CNT_WORDS,
+            "dtype": "uint32",
+            "shape": (SLAB_CNT_WORDS,),
+        }, what
+        for name in names[1:-1]:
+            region = reference["regions"][name]
+            assert layout["regions"][name] == {
+                **region,
+                "offset": region["offset"] + shift,
+            }, (what, name)
+        plan = det.host_plan(T, sm, arch, hidden)
         assert layout["regions"]["param_partial"]["shape"] == (
-            nd.host_plan(T, sm, arch, hidden)["chunks"],
-            det.PARAM_COLS,
+            (det.PARAM_ROW_COLS, plan["groups"])
+            if plan["group_rows"]
+            else (plan["chunks"], det.PARAM_COLS)
         ), what
         part = reference["regions"]["dfn_part"]
         parts = det.k7_chunks(T, sm, hidden=hidden)[0]
         assert part["shape"] == (parts, 24, 4 * hidden), what
-        assert part["bytes"] == parts * 24 * 4 * hidden * 4, what
-        assert layout["total_bytes"] == reference["total_bytes"] - _round256(
-            part["bytes"]
+        slots = layout["regions"]["dfn_slot"]
+        slot_parts = min(32, -(-T // det.SLAB_TILE_T))
+        assert slot_parts >= parts, what
+        assert slots["offset"] == part["offset"] + shift, what
+        assert slots["dtype"] == "float32", what
+        assert slots["shape"] == (slot_parts, 24, 4 * hidden), what
+        assert slots["bytes"] == slot_parts * 24 * 4 * hidden * 4, what
+        assert layout["total_bytes"] == (
+            reference["total_bytes"]
+            - _round256(part["bytes"])
+            + shift
+            + _round256(slots["bytes"])
         ), what
+        assert layout["total_bytes"] > reference["total_bytes"], what
         assert layout["total_bytes"] % 256 == 0, what
     with pytest.raises(ValueError):
         nd.workspace_regions("bwd", -1, sm, arch)
@@ -1764,27 +1795,25 @@ def test_workspace_envelope_covers_every_smaller_token_count(
     arch: str, sm: int
 ) -> None:
     """At every hidden size of the board's architecture: ``workspace_bytes_upto("bwd", T)`` is non-decreasing, at
-    least the exact size of every token count up to ``T`` and at most the deterministic envelope (a buffer of the
-    deterministic sizing serves this package); 0 at ``T == 0``; the forward envelope is the deterministic one.  Every
-    token count below 4200 at hidden 4096, every seventh at 5120 and 7168."""
+    least the exact size of every token count up to ``T`` and above the deterministic envelope (a buffer of the
+    deterministic sizing does not hold this package's layout); 0 at ``T == 0``; the forward envelope is the
+    deterministic one.  Every token count below 4200 at hidden 4096, every seventh at 5120 and 7168."""
     for hidden in _arch_sizes(arch):
         previous = 0
-        for T in range(0, 4200, 1 if hidden == HIDDEN else 7):
+        for T in range(1, 4200, 1 if hidden == HIDDEN else 7):
             what = (hidden, T)
             envelope = nd.workspace_bytes_upto("bwd", T, sm, arch, hidden)
             assert envelope >= previous, what
             assert envelope >= nd.workspace_bytes("bwd", T, sm, arch, hidden), what
-            assert envelope <= det.workspace_bytes_upto("bwd", T, sm, arch, hidden), (
-                what
-            )
+            assert envelope > det.workspace_bytes_upto("bwd", T, sm, arch, hidden), what
             previous = envelope
         assert nd.workspace_bytes_upto("bwd", 0, sm, arch, hidden) == 0
         for rows in (64, 65, 1000, 2049, 8192, 16263, 20001, 65536):
             what = (hidden, rows)
             envelope = nd.workspace_bytes_upto("bwd", rows, sm, arch, hidden)
-            assert envelope <= det.workspace_bytes_upto(
-                "bwd", rows, sm, arch, hidden
-            ), what
+            assert envelope > det.workspace_bytes_upto("bwd", rows, sm, arch, hidden), (
+                what
+            )
             assert nd.workspace_bytes_upto(
                 "fwd", rows, sm, arch, hidden
             ) == det.workspace_bytes_upto("fwd", rows, sm, arch, hidden), what
@@ -1806,12 +1835,13 @@ def test_workspace_envelope_covers_every_smaller_token_count(
 _SHARED_TABLES = (
     "ARCHES", "ARCH_BY_CAPABILITY", "KINDS", "STREAMS", "HIDDEN", "HIDDEN_TOTAL", "MAPPING_ROWS", "N_PAD", "PIECES",
     "SLAB_D", "TILE_T", "SLAB_TILE_T", "RMS_EPS", "HC_EPS", "SINKHORN_ITERS", "SINKHORN_ITERS_MAX", "STATS_COLS",
-    "GSTATS_COLS", "TOKP_COLS", "DZP_COLS", "PARAM_COLS", "TICKET_WORDS", "STATS_LAYOUT", "GSTATS_LAYOUT",
-    "TOKP_LAYOUT", "PARAM_LAYOUT", "RULES_SM_COUNTS", "RULES_BOARDS", "RULES_T_VALUES", "PK_BANDS",
-    "FN_SPLIT_PROGRAM", "FN_SPLIT_GRID", "FWD_MAP_PRODUCTION", "FWD_MAP_BANDS", "FWD_MAP_FIT", "FWD_MAP_CLAIM",
-    "FWD_MAP_XNRM", "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM", "BWD_TOKEN_REGIMES", "BWD_TOKEN_BANDS", "K5_GRID_BANDS",
-    "K5_FORM_BANDS", "K5_FORM_ROWS", "FWD_FINISH_PROGRAM", "FWD_FINISH_ROWS", "FWD_FINISH_COL_SPLIT", "K3_TILING",
-    "K6_CTAS_PER_SM", "PDL_PATHS", "SELECT_RULE_KINDS", "RUN_TIME_ITERS_ROLES",
+    "GSTATS_COLS", "TOKP_COLS", "DZP_COLS", "PARAM_COLS", "PARAM_ROW_COLS", "TOKEN_GROUP", "TICKET_WORDS",
+    "STATS_LAYOUT", "GSTATS_LAYOUT", "TOKP_LAYOUT", "PARAM_LAYOUT", "RULES_SM_COUNTS", "RULES_BOARDS",
+    "RULES_T_VALUES", "PK_BANDS", "FN_SPLIT_PROGRAM", "FN_SPLIT_GRID", "FWD_MAP_PRODUCTION", "FWD_MAP_BANDS",
+    "FWD_MAP_FIT", "FWD_MAP_CLAIM", "FWD_MAP_XNRM", "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM", "BWD_TOKEN_REGIMES",
+    "BWD_TOKEN_BANDS", "BWD_ROW_BANDS", "K5_GRID_BANDS", "K5_FORM_BANDS", "K5_FORM_ROWS", "FWD_FINISH_PROGRAM",
+    "FWD_FINISH_ROWS", "FWD_FINISH_COL_SPLIT", "K3_TILING", "K6_CTAS_PER_SM", "PDL_PATHS", "SELECT_RULE_KINDS",
+    "RUN_TIME_ITERS_ROLES",
 )  # fmt: skip
 # The deterministic column-slab and reduction rules, absent here (BWD_DPL_BANDS / BWD_DPL_SLABS: the bands and the
 # column-slab programs of their L2-hint forms).
@@ -1835,36 +1865,44 @@ _OWN_RULES = (
 
 
 @pytest.mark.cpu_only
-@pytest.mark.usefixtures("det_per_cta")
 @pytest.mark.parametrize(("arch", "sm"), det.RULES_BOARDS)
 def test_host_rules_are_copies_of_the_deterministic_ones(arch: str, sm: int) -> None:
-    """The constants and tables of the host rules equal the deterministic ones; the rule functions are this
-    package's own objects with the deterministic per-CTA outputs (:func:`_det_per_cta`; the host plan without its
-    group-row keys) on every token count of record; the deterministic column-slab, reduction and group-row rules
-    (``GROUP_ROW_RULES``) are absent and ``PROGRAM_RULES`` drops the first two for this package's column-slab rule
-    (``bwd_slab_atomic_program``, with ``BWD_SLAB_LPT``, ``BWD_SLAB_LPT_HIDDEN``, ``BWD_SLAB_ORDER``,
-    ``BWD_SLAB_ORDER_OVERRIDES``, ``BWD_SLAB_LPT_OVERRIDES``, ``lpt_chunks``, ``bwd_slab_order`` and ``slab_plan``:
-    none of them in the deterministic registry); a rules row is the deterministic row without its column-slab and
-    reduction program columns, with this package's backward workspace bytes."""
+    """The constants and tables of the host rules equal the deterministic ones (the group-row table and constants,
+    ``GROUP_ROW_RULES``, included); the rule functions are this package's own objects with the deterministic outputs
+    on every token count of record (the host plan with the column slab's :data:`FOLD_KEYS` added:
+    :func:`_fold_plan`); the deterministic column-slab and reduction rules are absent and ``PROGRAM_RULES`` drops
+    them for this package's column-slab rule (``bwd_slab_atomic_program``, with ``BWD_SLAB_LPT``,
+    ``BWD_SLAB_LPT_HIDDEN``, ``BWD_SLAB_ORDER``, ``BWD_SLAB_ORDER_OVERRIDES``, ``BWD_SLAB_LPT_OVERRIDES``,
+    ``lpt_chunks``, ``bwd_slab_order`` and ``slab_plan``: none of them in the deterministic registry); a rules row is
+    the deterministic row without its column-slab and reduction program columns, with this package's backward
+    workspace bytes."""
     for name in _SHARED_TABLES:
         assert getattr(nd, name) == getattr(det, name), name
     # The hidden sizes: the deterministic ones; the per-size table names are the deterministic ones without the
-    # column-slab, reduction and group-row tables, and the tables of each size other than 4096 the deterministic tables
-    # of those names (the tables of record above are the H 4096 ones).
+    # column-slab and reduction tables (BWD_ROW_BANDS kept) and without PDL_OFF_BANDS, and the tables of each size
+    # other than 4096 the deterministic tables of those names (the tables of record above are the H 4096 ones).
+    # The deterministic PDL_OFF_BANDS of every size (4096 included) is this package's one table plus the K7->K8
+    # cells, an edge this package does not have.
     assert tuple(nd.HIDDEN_SIZES) == tuple(det.HIDDEN_SIZES) == HIDDEN_SIZES
-    kept = tuple(
-        name
-        for name in det.H_TABLE_NAMES
-        if name not in _DROPPED_RULES and name not in GROUP_ROW_RULES
-    )
+    dropped = (*_DROPPED_RULES, "PDL_OFF_BANDS")
+    kept = tuple(name for name in det.H_TABLE_NAMES if name not in dropped)
+    for hidden in HIDDEN_SIZES:
+        without_k7_k8 = {
+            a: {edge: bands for edge, bands in edges.items() if edge != "K7->K8"}
+            for a, edges in det._tab("PDL_OFF_BANDS", hidden).items()
+        }
+        assert without_k7_k8 == nd.PDL_OFF_BANDS, hidden
+    assert "BWD_ROW_BANDS" in kept
     assert kept == nd.H_TABLE_NAMES
     assert HIDDEN not in det.H_TABLES and set(det.H_TABLES) == set(NEW_HIDDEN_SIZES)
     assert {
         hidden: {name: det.H_TABLES[hidden][name] for name in nd.H_TABLE_NAMES}
         for hidden in NEW_HIDDEN_SIZES
     } == nd.H_TABLES
-    for name in (*_DROPPED_RULES, *GROUP_ROW_RULES):
+    for name in _DROPPED_RULES:
         assert hasattr(det, name) and not hasattr(nd, name), name
+    for name in GROUP_ROW_RULES:
+        assert hasattr(det, name) and hasattr(nd, name), name
     for name in _OWN_RULES:
         assert hasattr(nd, name) and not hasattr(det, name), name
     own_rules = (
@@ -1878,6 +1916,8 @@ def test_host_rules_are_copies_of_the_deterministic_ones(arch: str, sm: int) -> 
         "k7_chunks",
         "k6_grid",
         "t_pad",
+        "bwd_group_rows",
+        "bwd_token_program",
         "selected_modules",
         "enable_pdl",
     ):
@@ -1895,10 +1935,11 @@ def test_host_rules_are_copies_of_the_deterministic_ones(arch: str, sm: int) -> 
         assert row == expected, T
         if T == 0:
             continue
-        assert nd.host_plan(T, sm, arch) == _per_cta_plan(det.host_plan(T, sm, arch)), T
+        assert nd.host_plan(T, sm, arch) == _fold_plan(det.host_plan(T, sm, arch)), T
         for rule in (
             "fwd_map_program",
             "fwd_coef_program",
+            "bwd_group_rows",
             "bwd_token_program",
             "k5_program",
             "k5_grid",
@@ -1912,13 +1953,12 @@ def test_host_rules_are_copies_of_the_deterministic_ones(arch: str, sm: int) -> 
 
 
 @pytest.mark.cpu_only
-@pytest.mark.usefixtures("det_per_cta")
 @pytest.mark.parametrize(("arch", "sm"), det.RULES_BOARDS)
 def test_host_rules_at_the_new_hidden_sizes(arch: str, sm: int) -> None:
     """At hidden 5120 and 7168 on every board (the rules are functions of the size's tables; sm_107a routes neither
     size): a rules row is the deterministic row without its column-slab and reduction program columns, with this
     package's backward workspace bytes, on every token count of record; the host plan and every copied rule give the
-    deterministic per-CTA outputs (:func:`_det_per_cta`; the host plan without its group-row keys); the per-size
+    deterministic outputs (the host plan with the column slab's :data:`FOLD_KEYS`: :func:`_fold_plan`); the per-size
     tables are read through ``_tab`` (a size it does not spell is a ``KeyError``, never the H 4096 value; the column
     slab's ``BWD_SLAB_LPT`` / ``BWD_SLAB_LPT_HIDDEN`` / ``BWD_SLAB_ORDER`` and its board cells
     ``BWD_SLAB_ORDER_OVERRIDES`` / ``BWD_SLAB_LPT_OVERRIDES`` are no per-size tables of ``_tab``).
@@ -1948,12 +1988,13 @@ def test_host_rules_at_the_new_hidden_sizes(arch: str, sm: int) -> None:
             assert row == expected, what
             if T == 0:
                 continue
-            assert nd.host_plan(T, sm, arch, hidden) == _per_cta_plan(
+            assert nd.host_plan(T, sm, arch, hidden) == _fold_plan(
                 det.host_plan(T, sm, arch, hidden)
             ), what
             for rule in (
                 "fwd_map_program",
                 "fwd_coef_program",
+                "bwd_group_rows",
                 "bwd_token_program",
                 "k5_program",
                 "k5_grid",
@@ -2092,9 +2133,9 @@ _TWO_SIZE_CASES = [
         arch, sm, hidden, calibration, id=f"{arch}-{sm}-H{hidden}-{calibration}"
     )
     for arch, sm in det.RULES_BOARDS
-    for hidden in det.supported_hidden_sizes(arch)
+    for hidden in _arch_sizes(arch)
     for calibration in (
-        ("record", "screen") if arch in ATOMIC[_lpt(hidden)] else ("record",)
+        ("record", "screen") if arch in OWN.get(_lpt(hidden), ()) else ("record",)
     )
 ]
 
@@ -2104,8 +2145,10 @@ _TWO_SIZE_CASES = [
 def test_two_size_rule(arch: str, sm: int, hidden: int, calibration: str) -> None:
     """At every token count of record and of ``LPT_SWEEP``, at every hidden size of the board's architecture, under
     the size's table of record (``BWD_SLAB_LPT`` at 4096, ``BWD_SLAB_LPT_HIDDEN`` at 5120 and 7168) and under the
-    kernel test's screen ``(1.0, 0.99)`` where the architecture has the size's ``lpt`` record: ``None`` never fires;
-    ``bwd_slab_atomic_program`` is ``lpt`` exactly where ``lpt_chunks`` gives a geometry, else ``dynr``, with ``_os``
+    kernel test's screen ``(1.0, 0.99)`` where the architecture has the size's ``lpt`` record (with the size's unit
+    order set to ``"chunk"`` at every token count and no board cell: no two-size record of the slab order ships):
+    ``None`` never fires; ``bwd_slab_atomic_program`` is ``lpt`` exactly where ``lpt_chunks`` gives a geometry, else
+    ``dynr``, with ``_os``
     where the board's unit-order band (:func:`_order_cell`: the size's ``BWD_SLAB_ORDER``, or the board's cell) is
     ``"slab"``, and the selection holds that one column-slab record of the size; ``slab_plan`` is the geometry, else
     the one-size chunks of ``host_plan``.  A geometry is 64-token multiples, ``1 <= p_big <= P <= 32``, big chunks
@@ -2118,6 +2161,9 @@ def test_two_size_rule(arch: str, sm: int, hidden: int, calibration: str) -> Non
     fired, counted = [], 0
     with pytest.MonkeyPatch.context() as patch:
         patch.setitem(table, arch, value)
+        if calibration == "screen":
+            patch.setitem(nd.BWD_SLAB_ORDER[hidden], arch, ((None, "chunk"),))
+            patch.setattr(nd, "BWD_SLAB_ORDER_OVERRIDES", {})
         _clear_plans()
         try:
             for T in sorted(set(T_VALUES) | set(LPT_SWEEP)):
@@ -2182,11 +2228,11 @@ def test_two_size_rule(arch: str, sm: int, hidden: int, calibration: str) -> Non
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(("arch", "sm", "fires"), LPT_FIRES)
 def test_two_size_rule_fires_where_calibrated(arch: str, sm: int, fires: dict) -> None:
-    """Under the tables of record (the board's cells where it has them) the two-size schedule runs exactly at the
-    benchmark token counts of ``LPT_FIRES``, with these geometries: a table that stops firing would ship dynr alone
-    without a failing test.  The program is ``lpt`` or ``lpt_os`` there (``dynr`` / ``dynr_os`` elsewhere), ``_os``
-    exactly where the board's unit-order band (:func:`_order_cell`) is ``"slab"``: on sm_107a with 212 SMs the
-    chunk-order programs at 1024 and 1536, the ``_os`` ones from 2048."""
+    """Under the tables of record (the board's cells where it has them) the two-size schedule runs at none of the
+    benchmark token counts (``LPT_FIRES``): a table that starts firing would sum other token ranges per chunk than
+    the deterministic column slab without a failing test.  The program is ``dynr`` / ``dynr_os``, ``_os`` exactly
+    where the board's unit-order band (:func:`_order_cell`) is ``"slab"``: on sm_107a with 212 SMs ``dynr`` at 1024
+    and 1536, ``dynr_os`` from 2048."""
     _clear_plans()
     try:
         got = {T: nd.lpt_chunks(T, sm, arch) for T in BENCH_T}
@@ -2203,15 +2249,41 @@ def test_two_size_rule_fires_where_calibrated(arch: str, sm: int, fires: dict) -
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(("arch", "sm", "calibration", "fires"), LPT_FORMER_FIRES)
+def test_two_size_rule_under_the_former_calibrations(
+    arch: str, sm: int, calibration: tuple, fires: dict, monkeypatch
+) -> None:
+    """The rule is unchanged: with the board's former calibration written into ``BWD_SLAB_LPT`` (no board cells)
+    ``lpt_chunks`` gives the geometries of ``LPT_FORMER_FIRES`` at their token counts, ``slab_plan`` binds them, and
+    ``bwd_slab_atomic_program`` names ``lpt`` there (``lpt_os`` in a ``"slab"`` band of the table's unit order)."""
+    monkeypatch.setitem(nd.BWD_SLAB_LPT, arch, calibration)
+    monkeypatch.setattr(nd, "BWD_SLAB_LPT_OVERRIDES", {})
+    monkeypatch.setattr(nd, "BWD_SLAB_ORDER_OVERRIDES", {})
+    _clear_plans()
+    try:
+        for T, geometry in fires.items():
+            assert tuple(nd.lpt_chunks(T, sm, arch)) == geometry, T
+            assert nd.slab_plan(T, sm, arch) == dict(
+                zip(LPT_HOST_KEYS, geometry, strict=True)
+            ), T
+            slab_order = _band_at(T, nd.BWD_SLAB_ORDER[HIDDEN][arch]) == "slab"
+            assert nd.bwd_slab_atomic_program(T, sm, arch) == "lpt" + (
+                "_os" if slab_order else ""
+            ), T
+    finally:
+        _clear_plans()
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(("arch", "sm", "hidden", "fires"), LPT_FIRES_HIDDEN)
 def test_two_size_rule_fires_where_calibrated_at_the_new_hidden_sizes(
     arch: str, sm: int, hidden: int, fires: dict
 ) -> None:
-    """At hidden 5120 and 7168 under the table of record (``BWD_SLAB_LPT_HIDDEN``) the two-size schedule runs exactly
-    at the token counts of ``LPT_FIRES_HIDDEN`` with these geometries, ``slab_plan`` the geometry there (on B200 the
-    token counts the table's comment names; nowhere on the boards the size's table does not calibrate, which have no
-    ``lpt`` record of the size).  The screen's plans are cached per hidden size: after the H 4096 plan of the same
-    token count, SM count and ``o_tiles``, the size's plan is its own."""
+    """At hidden 5120 and 7168 under the table of record (``BWD_SLAB_LPT_HIDDEN``) the two-size schedule runs at none
+    of the token counts of ``LPT_HIDDEN_T`` (``LPT_FIRES_HIDDEN``).  Under the kernel test's screen on B200, whose
+    routes hold the ``lpt`` record of these sizes, it gives the geometries of ``LPT_SCREEN_FIRES_HIDDEN``, ``slab_plan``
+    the geometry there, and the screen's plans are cached per hidden size: after the H 4096 plan of the same token
+    count, SM count and ``o_tiles``, the size's plan is its own."""
     _clear_plans()
     try:
         got = {T: nd.lpt_chunks(T, sm, arch, hidden=hidden) for T in LPT_HIDDEN_T}
@@ -2227,15 +2299,24 @@ def test_two_size_rule_fires_where_calibrated_at_the_new_hidden_sizes(
     for T, program in programs.items():
         slab_order = _band_at(T, _order_cell(arch, sm, hidden)) == "slab"
         assert program.endswith("_os") == slab_order, (T, program)
-    assert bool(fires) == (arch in ATOMIC[_lpt(hidden)]), (arch, hidden)
-    for T, geometry in fires.items():
-        assert nd.slab_plan(T, sm, arch, hidden) == dict(
-            zip(LPT_HOST_KEYS, geometry, strict=True)
-        ), T
-        o_tiles = float(_calibration_at(_lpt_table(hidden)[arch], T)[0])
-        at_4096 = nd._lpt_plan(T, sm, o_tiles)
-        plan = nd._lpt_plan(T, sm, o_tiles, hidden=hidden)
-        assert plan[2] == geometry and plan != at_4096, (T, plan, at_4096)
+    assert not fires, (arch, hidden)
+    screened = [
+        f for a, s, h, f in LPT_SCREEN_FIRES_HIDDEN if (a, s, h) == (arch, sm, hidden)
+    ]
+    assert bool(screened) == ((arch, sm) == ("sm_100a", 148)), (arch, sm)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(_lpt_table(hidden), arch, LPT_SCREEN)
+        _clear_plans()
+        try:
+            for T, geometry in (screened[0] if screened else {}).items():
+                assert nd.slab_plan(T, sm, arch, hidden) == dict(
+                    zip(LPT_HOST_KEYS, geometry, strict=True)
+                ), T
+                at_4096 = nd._lpt_plan(T, sm, LPT_SCREEN[0])
+                plan = nd._lpt_plan(T, sm, LPT_SCREEN[0], hidden=hidden)
+                assert plan[2] == geometry and plan != at_4096, (T, plan, at_4096)
+        finally:
+            _clear_plans()
 
 
 def _heap_makespan(units: list[int], sm: int, o_tiles: float) -> float:
@@ -2298,29 +2379,20 @@ def test_two_size_makespan_runs_are_the_unit_by_unit_schedule() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("order", ("chunk", "slab"))
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES, ids=lambda h: f"H{h}")
-def test_forced_geometry_is_read_at_call_time(
-    monkeypatch, hidden: int, order: str
-) -> None:
-    """``lpt_chunks`` and ``BWD_SLAB_ORDER`` are module globals read at call time, at every hidden size (on B200, whose
-    routes hold the ``lpt`` record of each size, and its ``lpt_os`` copy where B200's ``BWD_SLAB_ORDER`` of the size
-    has a ``"slab"`` band -- a size without one skips the ``"slab"`` case; the size's order set to ``order`` for every
-    token count): a replacement that forces a geometry at one token count moves ``slab_plan``,
-    ``bwd_slab_atomic_program``, the selection and the size's ``lpt`` (``lpt_os``) record's launch grid (``min(SMs, H
-    / 64 x P)``) there, never the ``dynr`` (``dynr_os``) record's; a forced geometry that does not cover the tokens is
-    a ``ValueError``; without the replacement the size's table decides (``None``: ``dynr`` / ``dynr_os`` and the
-    one-size chunks).  Each of these asks the rule at the size (the replacement records the hidden size it is asked
-    at): at 80 / 112 slabs both forced grids are the SM count, so only that record shows that ``launch_grid`` reads
-    the record's hidden size."""
+def test_forced_geometry_is_read_at_call_time(monkeypatch, hidden: int) -> None:
+    """``lpt_chunks`` is a module global read at call time, at every hidden size (on B200, the size's order set to
+    ``"chunk"`` for every token count): a replacement that forces a geometry at one token count moves ``slab_plan``
+    and ``bwd_slab_atomic_program`` (``lpt``) there, and since no two-size record ships, the ``bwd_finish`` selection
+    refuses the call (a ``ValueError``, never a backward without the column slab); the ``dynr`` record's launch grid
+    (``min(SMs, H / 64 x P)`` over the one-size chunks) never moves.  A forced geometry that does not cover the tokens
+    is a ``ValueError``; without the replacement the size's table decides (``None``: ``dynr`` and the one-size chunks,
+    the selection's one column slab).  Each of these asks the rule at the size (the replacement records the hidden
+    size it is asked at)."""
     arch, sm, T = "sm_100a", 148, 2049
-    if order == "slab" and arch not in ATOMIC.get(_lpt_os(hidden), ()):
-        pytest.skip(
-            f'{arch} holds no {_lpt_os(hidden)}: no "slab" band of hidden {hidden}'
-        )
     monkeypatch.setattr(nd, "sm_count", lambda _index: sm)
     monkeypatch.setattr(nd, "device_arch", lambda _index: arch)
-    monkeypatch.setitem(nd.BWD_SLAB_ORDER[hidden], arch, ((None, order),))
+    monkeypatch.setitem(nd.BWD_SLAB_ORDER[hidden], arch, ((None, "chunk"),))
     rule, forced, seen = nd.lpt_chunks, {}, []
 
     def forcing(t, s, a, hidden=HIDDEN):
@@ -2328,8 +2400,8 @@ def test_forced_geometry_is_read_at_call_time(
         return forced[t] if t in forced else rule(t, s, a, hidden=hidden)
 
     monkeypatch.setattr(nd, "lpt_chunks", forcing)
-    suffix = "_os" if order == "slab" else ""
-    slab, lpt = _record_of("dynr" + suffix, hidden), _record_of("lpt" + suffix, hidden)
+    slab = _record_of("dynr", hidden)
+    assert _lpt(hidden) not in nd.MODULES, hidden
     slabs = hidden // det.SLAB_D
     plan = nd.host_plan(T, sm, arch, hidden)
     one = (plan["parts"], plan["rows_per_chunk"], plan["parts"], plan["rows_per_chunk"])
@@ -2341,17 +2413,10 @@ def test_forced_geometry_is_read_at_call_time(
         assert nd.slab_plan(T, sm, arch, hidden) == dict(
             zip(LPT_HOST_KEYS, geometry, strict=True)
         )
-        assert nd.bwd_slab_atomic_program(T, sm, arch, hidden) == "lpt" + suffix
-        names = nd.selected_modules(arch, hidden, "bwd_finish", rows=T, sm_count=sm)
-        assert names[-1] == lpt and slab not in names, names
+        assert nd.bwd_slab_atomic_program(T, sm, arch, hidden) == "lpt"
+        with pytest.raises(ValueError, match="selects 0 column-slab records"):
+            nd.selected_modules(arch, hidden, "bwd_finish", rows=T, sm_count=sm)
         assert seen and set(seen) == {hidden}, seen
-        seen.clear()
-        assert nd.launch_grid(nd.MODULES[lpt], T, device_index=0) == (
-            min(sm, slabs * geometry[0]),
-            1,
-            1,
-        )
-        assert seen == [hidden], seen
         assert nd.launch_grid(nd.MODULES[slab], T, device_index=0) == dynr_grid
         assert nd.slab_plan(T + 64, sm, arch, hidden) != dict(
             zip(LPT_HOST_KEYS, geometry, strict=True)
@@ -2359,27 +2424,22 @@ def test_forced_geometry_is_read_at_call_time(
     forced[T] = (2, 512, 1, 64)  # 576 tokens: not a partition of 2049
     with pytest.raises(ValueError, match="not a two-size geometry"):
         nd.slab_plan(T, sm, arch, hidden)
-    with pytest.raises(ValueError, match="not a two-size geometry"):
-        nd.launch_grid(nd.MODULES[lpt], T, device_index=0)
     del forced[T]
-    assert (
-        nd.bwd_slab_atomic_program(T, sm, arch, hidden)
-        == ("lpt" if rule(T, sm, arch, hidden=hidden) else "dynr") + suffix
-    )
-    monkeypatch.setitem(_lpt_table(hidden), arch, None)
-    assert nd.bwd_slab_atomic_program(T, sm, arch, hidden) == "dynr" + suffix
+    assert _lpt_table(hidden)[arch] is None, hidden
+    assert nd.bwd_slab_atomic_program(T, sm, arch, hidden) == "dynr"
     names = nd.selected_modules(arch, hidden, "bwd_finish", rows=T, sm_count=sm)
-    assert names[-1] == slab and lpt not in names, names
+    assert names[-1] == slab, names
     assert nd.slab_plan(T, sm, arch, hidden) == dict(
         zip(LPT_HOST_KEYS, one, strict=True)
     )
-    assert nd.launch_grid(nd.MODULES[lpt], T, device_index=0) == dynr_grid
+    assert nd.launch_grid(nd.MODULES[slab], T, device_index=0) == dynr_grid
 
 
 @pytest.mark.cpu_only
 def test_workspace_envelope_never_runs_the_screen(monkeypatch) -> None:
     """The workspace sizes and the rules rows never run the column slab's screen: ``host_plan``, which the envelope
-    reads at every 64-token tile, carries no ``lpt`` value.  With ``lpt_chunks``, ``_lpt_plan`` and
+    reads at every 64-token tile, carries no ``lpt`` value (its ``dfn`` slot count ``slot_parts`` is a function of
+    the token count alone).  With ``lpt_chunks``, ``_lpt_plan`` and
     ``bwd_slab_order`` replaced by functions that raise and the ``host_plan`` / envelope caches cleared, the backward
     envelope of 16384 tokens on B200 and the rules rows of record, at every hidden size, are their unpatched
     values."""
@@ -2416,7 +2476,7 @@ _ONE_SIZE_CASES = [
     pytest.param(arch, sm, hidden, id=f"{arch}-{sm}-H{hidden}")
     for arch, sm in det.RULES_BOARDS
     for hidden in NEW_HIDDEN_SIZES
-    if arch not in ATOMIC[_lpt(hidden)]
+    if arch not in OWN.get(_lpt(hidden), ())
 ]
 
 
@@ -2594,7 +2654,7 @@ def test_slab_order_bands(arch: str, sm: int) -> None:
                     geometry = nd.lpt_chunks(T, sm, arch, hidden=hidden)
                     program = nd.bwd_slab_atomic_program(T, sm, arch, hidden)
                     assert program == ("lpt" if geometry else "dynr") + suffix, what
-                    if arch not in ATOMIC.get(_record_of(program, hidden), ()):
+                    if arch not in OWN.get(_record_of(program, hidden), ()):
                         assert suffix, what
                         with pytest.raises(
                             ValueError, match="selects 0 column-slab records"
@@ -2632,7 +2692,8 @@ def test_slab_overrides_of_record() -> None:
     SM count that is a positive int (never ``None``: the table itself is the cell of every SM count) and a hidden size
     the architecture routes (an int, never ``None``: a cell of every size would apply a 4096 calibration at 5120 and
     7168); an order cell is token-count bands of ``"chunk"`` / ``"slab"``, a calibration cell ``None``, one
-    ``(o_tiles, keep)`` or bands of such values.  On each board with a cell, on both sides of every band edge of its
+    ``(o_tiles, keep)`` or bands of such values (no calibration cell is of record).  On each board with a cell, on
+    both sides of every band edge of its
     two cells: every program they can name has its record on the ``bwd_finish`` route of the size (a ``"slab"`` band
     the ``dynr_os`` record, and ``lpt_os`` where the calibration is not ``None``); ``bwd_slab_order`` and
     ``_lpt_calibration`` read the cells with the board's SM count and the tables without one.  Below the order cell's
@@ -2648,7 +2709,7 @@ def test_slab_overrides_of_record() -> None:
         ),
         (nd.BWD_SLAB_LPT_OVERRIDES, _valid_lpt_cell),
     ):
-        assert cells
+        assert cells or cells is nd.BWD_SLAB_LPT_OVERRIDES
         for key, cell in cells.items():
             arch, sm, hidden = key
             assert arch in nd.ARCHES, key
@@ -2929,15 +2990,13 @@ def test_slab_overrides_change_only_their_board(
         }, changed
 
 
-def _route_plan_slabs(
+def _route_plan_launches(
     monkeypatch, arch: str, hidden: int, sm: int, token_counts: tuple
 ) -> dict:
-    """The backward's column-slab launch in the route plans of a device of ``arch`` with ``sm`` SMs at ``hidden``, per
-    token count of ``token_counts``: ``(record, lpt)`` (the device's SM count, architecture and module loader
-    replaced: nothing is built or launched; both plan caches emptied first, since they are keyed by the device index,
-    not its SM count).  Each plan holds one column-slab launch, the record ``bwd_slab_atomic_program`` names with the
-    device's SM count; ``lpt`` is the ``lpt_*`` values an ``lpt`` / ``lpt_os`` launch binds, those of ``slab_plan``
-    (``None`` for another record, which binds none of them)."""
+    """The backward's launches in the route plans of a device of ``arch`` with ``sm`` SMs at ``hidden``, per token
+    count of ``token_counts``: ``[(record, {logical name: bound scalar})]`` in launch order (the device's SM count,
+    architecture and module loader replaced: nothing is built or launched; both plan caches emptied first, since
+    they are keyed by the device index, not its SM count)."""
     path = "backward"
     values = (
         *pkg._CALL_VALUES["bwd_finish"],
@@ -2959,25 +3018,43 @@ def _route_plan_slabs(
     monkeypatch.setattr(pkg, "_FAST_ROUTES", {})
     found = {}
     for T in token_counts:
-        what = (sm, T)
         route = pkg._fast_route(arch, "bwd_finish", T, hidden, 0, path)
-        launches = [
-            (run, arguments)
-            for run, arguments in route.launches
-            if nd.MODULES[run[0]]["role"] == "bwd_slab"
+        launches = []
+        for (name, _entry), arguments in route.launches:
+            record = nd.MODULES[name]
+            bound = {
+                record["logical"][key]: value
+                for (kind, key), value in zip(
+                    record["arg_plan"],
+                    arguments(placeholders + route.statics),
+                    strict=True,
+                )
+                if kind == "parameter"
+            }
+            launches.append((name, bound))
+        found[T] = launches
+    return found
+
+
+def _route_plan_slabs(
+    monkeypatch, arch: str, hidden: int, sm: int, token_counts: tuple
+) -> dict:
+    """The backward's column-slab launch in the route plans of :func:`_route_plan_launches`, per token count of
+    ``token_counts``: ``(record, lpt)``.  Each plan holds one column-slab launch, the record
+    ``bwd_slab_atomic_program`` names with the device's SM count; ``lpt`` is the ``lpt_*`` values an ``lpt`` /
+    ``lpt_os`` launch binds, those of ``slab_plan`` (``None`` for another record, which binds none of them)."""
+    found = {}
+    for T, launches in _route_plan_launches(
+        monkeypatch, arch, hidden, sm, token_counts
+    ).items():
+        what = (sm, T)
+        slabs = [
+            (name, bound)
+            for name, bound in launches
+            if nd.MODULES[name]["role"] == "bwd_slab"
         ]
-        assert len(launches) == 1, (what, [run for run, _ in route.launches])
-        ((name, _entry), arguments) = launches[0]
-        record = nd.MODULES[name]
-        bound = {
-            record["logical"][key]: value
-            for (kind, key), value in zip(
-                record["arg_plan"],
-                arguments(placeholders + route.statics),
-                strict=True,
-            )
-            if kind == "parameter"
-        }
+        assert len(slabs) == 1, (what, [name for name, _ in launches])
+        ((name, bound),) = slabs
         program = nd.bwd_slab_atomic_program(T, sm, arch, hidden)
         assert name == _record_of(program, hidden), (what, name, program)
         lpt = None
@@ -2992,15 +3069,57 @@ def _route_plan_slabs(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(("arch", "sm"), det.RULES_BOARDS)
+def test_route_plan_binds_the_parameter_rows(monkeypatch, arch: str, sm: int) -> None:
+    """The route plans (the count of record) bind the parameter rows the column slab folds to the rows the token
+    owner of the plan writes: at every hidden size of the board's architecture, on both sides of every
+    ``BWD_ROW_BANDS`` edge of the size and at 1, 2049 and 65536 tokens, the plan launches the token owner of the
+    selection -- its group-row form ``_trows_dyn`` exactly where ``bwd_group_rows`` holds -- and the column slab
+    binds ``prow`` 1 and ``param_rows`` = the group count ``ceil(T / 8)`` there, ``prow`` 0 and ``param_rows`` = the
+    token owner's CTA count ``G6`` elsewhere (:func:`_fold_plan`)."""
+    checked = set()
+    for hidden in _arch_sizes(arch):
+        edges = {
+            t + side
+            for above, at_most in nd._tab("BWD_ROW_BANDS", hidden)[arch]
+            for t in (above, at_most)
+            if t is not None
+            for side in (0, 1)
+        }
+        token_counts = tuple(sorted(edges | {1, 2049, 65536}))
+        launches = _route_plan_launches(monkeypatch, arch, hidden, sm, token_counts)
+        for T, plan in launches.items():
+            what = (hidden, T)
+            group_rows = nd.bwd_group_rows(T, sm, arch, hidden)
+            selection = nd.selected_modules(
+                arch, hidden, "bwd_finish", rows=T, sm_count=sm
+            )
+            assert [name for name, _ in plan] == list(selection), (what, plan)
+            (token,) = [n for n in selection if nd.MODULES[n]["role"] == "bwd_token"]
+            stem = token.removesuffix(f"__h{hidden}")
+            assert stem.endswith(GROUP_ROWS) == group_rows, (what, token)
+            (bound,) = [b for n, b in plan if nd.MODULES[n]["role"] == "bwd_slab"]
+            want = _fold_plan(det.host_plan(T, sm, arch, hidden))
+            assert bound["prow"] == want["prow"] == int(group_rows), (what, bound)
+            assert bound["param_rows"] == want["param_rows"], (what, bound)
+            assert bound["param_rows"] == (
+                -(-T // det.TOKEN_GROUP)
+                if group_rows
+                else det.k6_grid(T, sm, hidden)[0]
+            ), (what, bound)
+            checked.add(group_rows)
+    assert checked == ({False, True} if arch in NEW_HIDDEN_ARCHES else {False}), checked
+
+
+@pytest.mark.cpu_only
 def test_route_plan_binds_the_board_cells(monkeypatch) -> None:
     """The route plans bind the column slab of the device's board: on sm_107a with 208, 212 and 216 SMs (the device's
     SM count, architecture and module loader replaced: nothing is built or launched; both plan caches emptied for
     every board and table state, since they are keyed by the device index, not its SM count), at 1876, 1877, 4096 and
     15566 tokens, the backward's one column-slab launch is the record ``bwd_slab_atomic_program`` names with the
-    device's SM count, and an ``lpt`` / ``lpt_os`` launch binds the ``lpt_*`` values of ``slab_plan``.  Against the
-    plans with both tables of board cells emptied, only the 212-SM board's differ, and only from 1877 tokens:
-    ``dynr_os`` at 1877 and 4096 where the tables run ``dynr``, and at 15566 ``lpt_os`` with the geometry of
-    :data:`LPT_FIRES` where the tables run ``dynr``."""
+    device's SM count, and no launch binds the ``lpt_*`` values (no table of record picks the two-size schedule).
+    Against the plans with both tables of board cells emptied, only the 212-SM board's differ, and only from 1877
+    tokens: ``dynr_os`` at 1877, 4096 and 15566 where the tables run ``dynr``."""
     arch, hidden = "sm_107a", HIDDEN
     boards, token_counts = (208, 212, 216), (1876, 1877, 4096, 15566)
     shipped = {
@@ -3016,7 +3135,6 @@ def test_route_plan_binds_the_board_cells(monkeypatch) -> None:
     for sm in boards:
         if sm != 212:
             assert shipped[sm] == tables[sm], (sm, shipped[sm], tables[sm])
-    fires = next(f for a, s, f in LPT_FIRES if (a, s) == (arch, 212))
     assert shipped[212][1876] == tables[212][1876], shipped[212][1876]
     assert {T: tables[212][T] for T in token_counts[1:]} == {
         1877: (SLAB, None),
@@ -3026,7 +3144,7 @@ def test_route_plan_binds_the_board_cells(monkeypatch) -> None:
     assert {T: shipped[212][T] for T in token_counts[1:]} == {
         1877: (SLAB_OS, None),
         4096: (SLAB_OS, None),
-        15566: (LPT_OS, fires[15566]),
+        15566: (SLAB_OS, None),
     }, shipped[212]
 
 
@@ -3070,10 +3188,26 @@ def test_route_plan_binds_the_gb300_cell(monkeypatch) -> None:
 
 
 @pytest.mark.cpu_only
+def test_exported_hidden_sizes_per_architecture() -> None:
+    """The (architecture, hidden size) pairs this package exports, on which the tests of this module compare it with
+    the deterministic records and routes: 4096, 5120 and 7168 on sm_100a / sm_103a, 4096 alone on sm_107a.  The
+    deterministic package exports each of them (and 5120 and 7168 on sm_107a too, which have no copy here)."""
+    assert ND_HIDDEN_SIZES == {
+        "sm_100a": (4096, 5120, 7168),
+        "sm_103a": (4096, 5120, 7168),
+        "sm_107a": (4096,),
+    }
+    for arch in det.ARCHES:
+        assert tuple(nd.supported_hidden_sizes(arch)) == ND_HIDDEN_SIZES[arch], arch
+        assert set(ND_HIDDEN_SIZES[arch]) <= set(det.supported_hidden_sizes(arch)), arch
+
+
+@pytest.mark.cpu_only
 def test_route_glue_and_supported_hidden_sizes() -> None:
-    """The hidden sizes of each architecture are the deterministic package's: 4096, 5120 and 7168 on sm_100a /
-    sm_103a, 4096 on sm_107a, none on another architecture; a route applies exactly where the deterministic one
-    does; a size or architecture without a route is a ``ValueError`` of the selection, and a size the package does
+    """The hidden sizes of each architecture are this package's (``ND_HIDDEN_SIZES``): 4096, 5120 and 7168 on
+    sm_100a / sm_103a, 4096 on sm_107a, none on another architecture; a route applies exactly where the
+    deterministic one does at those sizes (the deterministic package also routes 5120 and 7168 on sm_107a); a size
+    or architecture without a route is a ``ValueError`` of the selection, and a size the package does
     not list one of the column slab's rules (``lpt_chunks``, ``bwd_slab_order``, ``bwd_slab_atomic_program``,
     ``slab_plan``; as in ``host_plan``)."""
     for arch in det.ARCHES:
@@ -3103,9 +3237,14 @@ def test_route_glue_and_supported_hidden_sizes() -> None:
                 applies = nd.route_applies(
                     device_capability=capability, hidden=hidden, kind=kind
                 )
-                assert applies == det.route_applies(
+                det_applies = det.route_applies(
                     device_capability=capability, hidden=hidden, kind=kind
-                ), (capability, hidden, kind)
+                )
+                assert applies == (det_applies and hidden in _arch_sizes(arch)), (
+                    capability,
+                    hidden,
+                    kind,
+                )
                 assert applies == (hidden in _arch_sizes(arch)), (capability, hidden)
         for capability in ((9, 0), (12, 0), (10, 1)):
             for hidden in HIDDEN_SIZES:
@@ -3505,48 +3644,50 @@ def test_every_entry_point_has_a_deterministic_counterpart() -> None:
         ), entry
 
 
-def _expected_alert(entry: str, warn_only: bool) -> str:
-    if warn_only:
-        return (
-            f"{entry} {_ALERT}, but you set 'torch.use_deterministic_algorithms(True, warn_only=True)'; "
-            "flashinfer.cake_mhc_det_train is the deterministic package"
-        )
-    return (
-        f"{entry} {_ALERT}, but you set 'torch.use_deterministic_algorithms(True)'; "
-        "flashinfer.cake_mhc_det_train is the deterministic package, or use the 'warn_only=True' option if that is "
-        "acceptable for your application"
+def _called_names(path: Path) -> list[tuple[int, str]]:
+    """``(line, name)`` of every call in ``path``: the called function's name, or the attribute of a called method."""
+    tree = ast.parse(path.read_text(), filename=str(path))
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                found.append((node.lineno, func.id))
+            elif isinstance(func, ast.Attribute):
+                found.append((node.lineno, func.attr))
+    return found
+
+
+@pytest.mark.cpu_only
+def test_no_call_raises_the_determinism_alert() -> None:
+    """Every output of the package repeats bit for bit on one device, so nothing alerts under PyTorch's deterministic
+    algorithms: no source file of the package (nor the top-level module, where it is beside this test) calls an
+    alert (a function or method whose name holds ``alert``, as PyTorch's ``_alert_not_deterministic`` and a package
+    helper around it would) or reads the mode (``are_deterministic_algorithms_enabled``,
+    ``is_deterministic_algorithms_warn_only_enabled``)."""
+    paths = sorted(PACKAGE_DIR.glob("*.py"))
+    assert PACKAGE_DIR / "__init__.py" in paths
+    if (REPO / FACADE).is_file():
+        paths.append(REPO / FACADE)
+    reads = (
+        "are_deterministic_algorithms_enabled",
+        "is_deterministic_algorithms_warn_only_enabled",
     )
+    for path in paths:
+        calls = _called_names(path)
+        assert not [(line, name) for line, name in calls if "alert" in name.lower()], (
+            path
+        )
+        assert not [(line, name) for line, name in calls if name in reads], path
 
 
 @pytest.mark.cpu_only
-def test_alert_wording_in_both_torch_modes() -> None:
-    """The package's alert (no private PyTorch hook): silent with PyTorch's deterministic algorithms off, a
-    ``RuntimeError`` with the shared wording when on, a ``UserWarning`` with it under ``warn_only=True``."""
-    with _torch_deterministic(False), warnings.catch_warnings():
-        warnings.simplefilter("error")
-        pkg._alert_nondeterministic("probe_entry")
-    with _torch_deterministic(True):
-        with pytest.raises(RuntimeError) as info:
-            pkg._alert_nondeterministic("probe_entry")
-        assert str(info.value) == _expected_alert("probe_entry", False)
-    with _torch_deterministic(True, warn_only=True):
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            pkg._alert_nondeterministic("probe_entry")
-        assert [(w.category, str(w.message)) for w in caught] == [
-            (UserWarning, _expected_alert("probe_entry", True))
-        ]
-    assert "_alert_not_deterministic" not in Path(pkg.__file__).read_text()
-
-
-@pytest.mark.cpu_only
-def test_no_entry_alerts_before_its_operands_pass(monkeypatch) -> None:
-    """Under PyTorch's deterministic algorithms (strict and ``warn_only=True``): the alert
-    belongs to the unordered ``dfn`` reduction, so it is raised right before the launches of ``backward_finish``
-    (validated operands, ``T > 0``; the GPU suite checks it there and that ``T == 0`` does not alert).  On the CPU
-    operands here every entry point, ``backward_finish`` included, refuses its operands with no alert and launches
-    nothing (warnings are errors); ``cake_mhc_nondet_train_finish`` refuses the handle its prepare did not make with a
-    ``TypeError`` that names the deterministic finish."""
+def test_no_entry_alerts_under_deterministic_algorithms(monkeypatch) -> None:
+    """Under PyTorch's deterministic algorithms (strict and ``warn_only=True``, warnings are errors) every entry
+    point, ``backward_finish`` included, refuses the CPU operands here with its operand error, no alert, and
+    launches nothing (the GPU suite checks that every entry point runs and gives the bits it gives with the mode off);
+    ``cake_mhc_nondet_train_finish`` refuses the handle its prepare did not make with a ``TypeError`` that names the
+    deterministic finish."""
     launched = []
     monkeypatch.setattr(pkg, "_launch_route", lambda *a, **k: launched.append(a))
     monkeypatch.setattr(pkg, "_run_route", lambda *a, **k: launched.append(a))

@@ -100,10 +100,16 @@ from .api_logging import flashinfer_api
 DEFAULT_SCALE = 128**-0.5
 
 
-def _pkg():
-    from .experimental.cake import cake_gdn_det_train_kcp  # noqa: PLC0415 - the backend package, imported on first use
+_PACKAGE: Any = None  # the backend package once imported (every facade call reads it)
 
-    return cake_gdn_det_train_kcp
+
+def _pkg():
+    global _PACKAGE
+    if _PACKAGE is None:
+        from .experimental.cake import cake_gdn_det_train_kcp  # noqa: PLC0415 - the backend package, imported on first use
+
+        _PACKAGE = cake_gdn_det_train_kcp
+    return _PACKAGE
 
 
 class _PackageKeywordsSignature(inspect.Signature):
@@ -216,6 +222,21 @@ def cake_gdn_det_train_kcp_build_context(
     ``conv_kernel_size - 1`` history rows per continuing fragment) and the segment plan.  ``group`` is the caller's
     ``torch.distributed`` process group (every collective of the route runs on it); CPU metadata plus small int32
     device tables built once; no tensor contents are read.
+
+    Parameters
+    ----------
+    part
+        Partition returned by :func:`cake_gdn_det_train_kcp_partition`.
+    group
+        Caller-owned ``torch.distributed`` process group for all collectives.
+    rank : int
+        This rank's index within ``group``.
+    device
+        CUDA device on which to build this rank's tables.
+    conv_kernel_size : int, default=4
+        Convolution width used to plan the history-row halo exchange.
+    sm_count : int, optional
+        SM count to use when building the segment plan.
     """
     return _pkg().cake_gdn_det_train_kcp_build_context(
         part, group, rank, device, conv_kernel_size, sm_count=sm_count
@@ -259,7 +280,7 @@ def cake_gdn_det_train_kcp_forward(
         Keep the saved set (``boundary_mode="saved"``); ``False`` or ``boundary_mode="replay"`` returns ``None``.
     workspace : CakeGDNDetKcpWorkspace, optional
         A reused caller-held workspace (``cake_gdn_det_train_kcp_workspace_bytes``); without one the call allocates its own.
-    options, **knobs
+    options
         Keyword-only options (``save_mode`` ``"light"`` | ``"full"``, ``boundary_mode`` ``"saved"`` | ``"replay"``,
         ``exchange`` ``"a2a"`` | ``"ring"``, ``save_transfer``, ``offset_class`` ``"fla"`` | ``"fp32"``, ``layout`` ``"tma"`` |
         ``"copy"``, ``group_reduce`` ``"fused"`` | ``"host"``, ``graph`` ``"off"`` | ``"replay"``,
@@ -267,6 +288,8 @@ def cake_gdn_det_train_kcp_forward(
         :func:`cake_gdn_det_kcp`),
         ``recompute_output`` ``"auto"`` | ``"always"`` (an autograd-node switch; this forward-only entry never skips a
         launch), ...).
+    **knobs
+        Keyword overrides for the backend options described above.
     use_qk_l2norm_in_kernel : bool
         Normalize ``q`` / ``k`` per token and head inside the programs (module docstring); the saved set then
         carries the FP32 ``r`` of q and k.  With an ``options`` instance it overrides only when ``True``.
@@ -320,9 +343,11 @@ def cake_gdn_det_train_kcp_backward(
     saved : optional
         The forward's saved set; ``None`` recomputes it from the inputs (checkpoint replay: the summaries and the
         exchange are re-run).
-    scale, workspace, options, use_qk_l2norm_in_kernel, **knobs
+    scale, workspace, options, use_qk_l2norm_in_kernel
         As in :func:`cake_gdn_det_train_kcp_forward` (the same options as the forward's; a saved set of the other
         ``use_qk_l2norm_in_kernel`` value is refused).
+    **knobs
+        Additional backend options, as in :func:`cake_gdn_det_train_kcp_forward`.
 
     Returns
     -------
@@ -471,6 +496,15 @@ def cake_gdn_det_train_kcp_packed_qkv_views(
 
         q, k, v = cake_gdn_det_train_kcp_packed_qkv_views(conv_out, H_qk=16, HV=48)        # conv_out: [T, 10240]
         out = cake_gdn_det_kcp(q, k, v, g, beta, ctx)
+
+    Parameters
+    ----------
+    qkv : torch.Tensor
+        Packed projection rows ``[..., T, (2 * H_qk + HV) * 128]`` with unit channel stride.
+    H_qk : int
+        Number of query and key heads, each with 128 channels.
+    HV : int
+        Number of value heads, each with 128 channels.
     """
     return _pkg().cake_gdn_det_train_kcp_packed_qkv_views(qkv, H_qk=H_qk, HV=HV)
 
@@ -484,7 +518,19 @@ def cake_gdn_det_train_kcp_workspace_bytes(
     the workspace binds in the forward or the backward of the given options (``reuse_recompute_tapes`` as a keyword;
     the per-phase terms are ``cake_gdn_det_train_kcp_workspace_layout`` of the package).  ``use_qk_l2norm_in_kernel=True`` adds the
     transient normalized rows ``qn`` / ``kn`` (``2 x 256 T_r H_qk`` bytes) to the forward and every backward phase,
-    and the ``8 T_r H_qk``-byte FP32 ``r`` where the backward re-runs the prep program."""
+    and the ``8 T_r H_qk``-byte FP32 ``r`` where the backward re-runs the prep program.
+
+    Parameters
+    ----------
+    ctx
+        This rank's context from :func:`cake_gdn_det_train_kcp_build_context`.
+    H_qk : int
+        Number of query and key heads.
+    HV : int
+        Number of value heads.
+    **kw
+        Backend options for this query, including the call's save and boundary settings.
+    """
     return _pkg().cake_gdn_det_train_kcp_workspace_bytes(ctx, H_qk=H_qk, HV=HV, **kw)
 
 
@@ -495,7 +541,19 @@ def cake_gdn_det_train_kcp_saved_bytes(
 ) -> int:
     r"""Saved-set bytes of one layer on this rank (``save_mode``, ``save_transfer`` as keywords), counted per
     crossing fragment; ``use_qk_l2norm_in_kernel=True`` adds the FP32 ``r`` of q and k, ``8 T_r H_qk`` bytes
-    (``boundary_mode="saved"``)."""
+    (``boundary_mode="saved"``).
+
+    Parameters
+    ----------
+    ctx
+        This rank's context from :func:`cake_gdn_det_train_kcp_build_context`.
+    H_qk : int
+        Number of query and key heads.
+    HV : int
+        Number of value heads.
+    **kw
+        Backend options for this query, including the call's save and boundary settings.
+    """
     return _pkg().cake_gdn_det_train_kcp_saved_bytes(ctx, H_qk=H_qk, HV=HV, **kw)
 
 
@@ -505,7 +563,21 @@ def cake_gdn_det_train_kcp_comm_bytes(
     ctx: Any, *, H_qk: int, HV: int, C: int = 10240, **kw: Any
 ) -> dict:
     r"""Bytes this rank moves per collective (``c1``, ``c2``, ``b1``, ``b2``, ``halo_fwd``, ``halo_bwd``) and per
-    boundary, counted per crossing fragment; ``C`` is the convolution channel count of the halo rows."""
+    boundary, counted per crossing fragment; ``C`` is the convolution channel count of the halo rows.
+
+    Parameters
+    ----------
+    ctx
+        This rank's context from :func:`cake_gdn_det_train_kcp_build_context`.
+    H_qk : int
+        Number of query and key heads.
+    HV : int
+        Number of value heads.
+    C : int, default=10240
+        Convolution channel count used to size halo traffic.
+    **kw
+        Backend options for this query: ``save_transfer`` and ``boundary_mode``.
+    """
     return _pkg().cake_gdn_det_train_kcp_comm_bytes(ctx, H_qk=H_qk, HV=HV, C=C, **kw)
 
 
@@ -513,7 +585,13 @@ def cake_gdn_det_train_kcp_comm_bytes(
 def is_cake_gdn_det_train_kcp_supported(
     device: torch.device | str | int | None = None,
 ) -> bool:
-    r"""``True`` when ``device`` (default: the current CUDA device) is an exported target of the package."""
+    r"""``True`` when ``device`` (default: the current CUDA device) is an exported target of the package.
+
+    Parameters
+    ----------
+    device : torch.device, str, int, optional
+        Device to query; ``None`` selects the current CUDA device.
+    """
     if not torch.cuda.is_available():
         return False
     try:

@@ -103,7 +103,7 @@ kernel_cake_mhc_train_fwd_coef__pfl2_qmt(float* __restrict__ spart, float* __res
         #pragma unroll
         for (int j_2 = 0; j_2 < 2; j_2++) {
             long long plane = k64 + tcr[j_2];
-            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(spart + (plane * 24 + n64))));
+            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(spart + (plane * 24ll + n64))));
         }
     }
     #pragma unroll 8
@@ -111,10 +111,10 @@ kernel_cake_mhc_train_fwd_coef__pfl2_qmt(float* __restrict__ spart, float* __res
         long long k64_1 = (long long)k_1 * tp64;
         long long plane_1 = k64_1 + tcr[0];
         float _add_0;
-        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_0) : "f"(s_acc[0]), "f"(spart[plane_1 * 24 + n64]));
+        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_0) : "f"(s_acc[0]), "f"(spart[plane_1 * 24ll + n64]));
         s_acc[0] = _add_0;
         float _add_1;
-        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_1) : "f"(s_acc[1]), "f"(spart[plane_1 * 24 + (24 + n64)]));
+        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_1) : "f"(s_acc[1]), "f"(spart[plane_1 * 24ll + (24ll + n64)]));
         s_acc[1] = _add_1;
     }
     float qv_load0 = qe[0];
@@ -672,16 +672,16 @@ kernel_cake_mhc_train_fwd_coef__pfl2_qmt(float* __restrict__ spart, float* __res
         int tok = tokr[j_3];
         long long tc64 = tcr[j_3];
         if (tok < T) {
-            long long row = tc64 * 64;
+            long long row = tc64 * 64ll;
             if (lane_0 == 0) {
                 *(reinterpret_cast<float*>(stats + row) + (0)) = rr[j_3];
             }
             if (lane_0 < 24) {
-                *(reinterpret_cast<float*>(stats + (row + 1 + lane64)) + (0)) = zz[j_3];
-                *(reinterpret_cast<float*>(stats + (row + 25 + lane64)) + (0)) = cc[j_3];
+                *(reinterpret_cast<float*>(stats + (row + 1ll + lane64)) + (0)) = zz[j_3];
+                *(reinterpret_cast<float*>(stats + (row + 25ll + lane64)) + (0)) = cc[j_3];
             }
             if (lane_0 < 15) {
-                *(reinterpret_cast<float*>(stats + (row + 49 + lane64)) + (0)) = 0.0f;
+                *(reinterpret_cast<float*>(stats + (row + 49ll + lane64)) + (0)) = 0.0f;
             }
         }
     }

@@ -14,10 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 CUDA-graph capture of the entry points of the Cake four-stream mHC training
-package with the non-deterministic backward
-(``flashinfer.experimental.cake.cake_mhc_nondet_train``; hidden 4096, 5120 and
-7168, 4 streams; SM100 / SM103 at the three hidden sizes, SM107 at 4096;
-FlashInfer issue #8068), in the
+package ``flashinfer.experimental.cake.cake_mhc_nondet_train`` (hidden 4096,
+5120 and 7168, 4 streams; SM100 / SM103 at the three hidden sizes, SM107 at
+4096; FlashInfer issue #8068), in the
 form of ``test_cake_mhc_det_train_graphs.py``.  Every case runs at each hidden
 size ``H`` the device's architecture routes (``W`` is ``[H, H]``, the
 workspaces are sized with ``hidden=H``); a size it does not route is skipped.
@@ -39,34 +38,33 @@ the per-device default workspaces exist before the capture), in three forms:
 and the autograd / checkpointed layer through
 ``torch.cuda.make_graphed_callables``.  The captured forms run with the
 default workspaces and with caller-owned workspaces of the package (the
-backward workspace of the non-deterministic sizing; its bytes past the ticket
-region overwritten with 0xFF before every replay, its ticket region zero after
-every replay).  Three replays, each after the static outputs and gradients were
-overwritten with 0xFF bytes, are compared with the eager non-deterministic
-iteration and the eager iteration of the deterministic package
-(``flashinfer.experimental.cake.cake_mhc_det_train``) on the same inputs: every output and
-gradient but ``dfn`` bitwise; ``dfn`` within ``2 P u (sum_t |dz'_t| |x_t|)``
-per element (``P`` the chunk count of the column-slab pass, ``u = 2^-24``,
-``dz'`` the FP64 reference's).  The graphed callables get new input values on
-each of three calls, each compared the same way with eager calls on the same
-values.  A captured ``backward_finish`` on a caller workspace sized for a
-larger token count, replayed with new inputs copied in place between eager
-calls at the larger count, closes the module.  Where the deterministic
-``backward_finish`` runs its group-row forms (``BWD_ROW_BANDS``, which this
-package does not copy), its ``dscale`` / ``dbase`` reference is its per-CTA
-reduction's (:func:`_det_backward`).
+backward workspace of this package's sizing; its bytes past the zero prefix --
+the ticket region and the column slab's arrival counts -- overwritten with 0xFF
+before every replay, its zero prefix zero after every replay).  Three replays,
+each after the static outputs and gradients were overwritten with 0xFF bytes,
+are compared with the eager iteration of this package (every output and
+gradient bitwise, ``dfn`` included) and the eager iteration of the
+deterministic package (``flashinfer.experimental.cake.cake_mhc_det_train``) on
+the same inputs (every output and gradient but ``dfn`` bitwise; ``dfn`` within
+``F u (sum_t |dz'_t| |x_t|)`` per element, ``F`` =
+``test_cake_mhc_nondet_train.py``'s ``_dfn_factor``: ``2 P`` with ``P`` the
+chunk count of the column-slab pass, ``u = 2^-24``, ``dz'`` the FP64
+reference's).  The graphed callables get new input values on each of three
+calls, each compared the same way with eager calls on the same values.  A
+captured ``backward_finish`` on a caller workspace sized for a larger token
+count, replayed with new inputs copied in place between eager calls at the
+larger count, closes the module.
 """
 
 from __future__ import annotations
 
-import contextlib
 import gc
 
 import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 KEY = "cake.cake_mhc_nondet_train"
 pkg = cake_package(KEY)
@@ -84,13 +82,16 @@ SEED = 2032
 REPLAYS = 3
 FP32_UNIT_ROUNDOFF = 2.0**-24
 ABS_SLACK = 1.02
-TICKET_BYTES = (
-    256  # the ticket region: first in the backward workspace for every token count
-)
+# The backward workspace's zero prefix: the ticket region (256 bytes) and the column slab's arrival counts (512 bytes),
+# first for every token count and hidden size; every call finds it zero and leaves it zero.
+ZERO_PREFIX_BYTES = 768
 BF16, F32, F64 = torch.bfloat16, torch.float32, torch.float64
 _OUTPUTS = ("dX", "dfn", "dscale", "dbase")
 _EXACT = ("dX", "dscale", "dbase")
-_FN_KEYS = ("dfn", "grad_fn")  # the outputs summed with atomic reductions
+_FN_KEYS = (
+    "dfn",
+    "grad_fn",
+)  # the outputs within the dfn bound of the deterministic package's
 
 
 def _device() -> torch.device:
@@ -159,7 +160,7 @@ def hidden(request) -> int:
 
 
 def _parts(T: int, hidden: int = HIDDEN) -> int:
-    """``P``: the chunk count of the column-slab pass, the number of partials each ``dfn`` element sums."""
+    """``P``: the chunk count of the column-slab pass, the number of partials each ``dfn`` element folds."""
     parts = loader.host_plan(T, _sm_count(), _arch(), hidden)["parts"]
     assert 1 <= parts <= 32, (T, hidden, parts)
     return parts
@@ -184,7 +185,7 @@ def _slab_parts(T: int, hidden: int = HIDDEN) -> int:
 
 def _dfn_factor(T: int, hidden: int = HIDDEN) -> float:
     """F of the dfn bound F u (|carried| + ABS_SLACK sum_t |dz'_t| |x_t|) at T (``test_cake_mhc_nondet_train.py``'s
-    ``_dfn_factor``, which derives it): 2 P where the column slab runs dynr or dynr_os (both sides sum the same
+    ``_dfn_factor``, which derives it): 2 P where the column slab runs dynr or dynr_os (both sides fold the same
     per-chunk partials), 2 max(P, P_k7) + 10 where it runs lpt or lpt_os (the partials are another partition's)."""
     if not _lpt_runs(T, hidden):
         return 2.0 * _parts(T, hidden)
@@ -245,7 +246,7 @@ def _dzp(i: dict) -> torch.Tensor:
 
 
 def _dfn_bound(i: dict) -> torch.Tensor:
-    """Per-element bound of ``|dfn_a - dfn_b|`` for two sums of per-chunk partials in two orders:
+    """Per-element bound of ``|dfn_a - dfn_b|`` for two folds of per-chunk partials:
     ``F u * 1.02 sum_t |dz'_t| |x_t|`` with ``F`` = :func:`_dfn_factor` (``test_cake_mhc_nondet_train.py``'s
     ``_dfn_bound``)."""
     T, hidden = i["X"].shape[0], i["X"].shape[2]
@@ -427,14 +428,17 @@ def _poisoned_outputs(T: int, hidden: int = HIDDEN) -> dict:
 
 
 def _poison_workspace(ws: torch.Tensor) -> None:
-    """Every byte but the ticket region (first for every token count) set to 0xFF."""
-    ws[TICKET_BYTES:].fill_(0xFF)
+    """Every byte past the zero prefix (the ticket region and the arrival counts, first for every token count) set
+    to 0xFF."""
+    ws[ZERO_PREFIX_BYTES:].fill_(0xFF)
 
 
-def _assert_ticket_zero(ws: torch.Tensor, what: str) -> None:
+def _assert_zero_prefix(ws: torch.Tensor, what: str) -> None:
     torch.cuda.synchronize()
-    nonzero = int(torch.count_nonzero(ws[:TICKET_BYTES]))
-    assert nonzero == 0, f"{what}: {nonzero} non-zero bytes in the ticket region"
+    nonzero = int(torch.count_nonzero(ws[:ZERO_PREFIX_BYTES]))
+    assert nonzero == 0, (
+        f"{what}: {nonzero} non-zero bytes in the ticket region and the arrival counts"
+    )
 
 
 def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -461,7 +465,8 @@ def _assert_dfn_within(
 
 
 def _assert_matches(ref: dict, got: dict, bound: torch.Tensor, what: str) -> None:
-    """Every output and gradient but ``dfn`` bitwise ``ref``'s; ``dfn`` within the bound."""
+    """Every output and gradient but ``dfn`` bitwise ``ref``'s (the deterministic package's); ``dfn`` within the
+    bound."""
     for k, v in ref.items():
         if k in _FN_KEYS:
             _assert_dfn_within(got[k], v, bound, f"{what}: {k}")
@@ -469,6 +474,12 @@ def _assert_matches(ref: dict, got: dict, bound: torch.Tensor, what: str) -> Non
             assert _same_bits(v, got[k]), (
                 f"{what}: {k} differs from the eager iteration"
             )
+
+
+def _assert_same_call(ref: dict, got: dict, what: str) -> None:
+    """Every output and gradient, ``dfn`` included, bitwise ``ref``'s (the same iteration of this package)."""
+    for k, v in ref.items():
+        assert _same_bits(v, got[k]), f"{what}: {k} differs from the eager iteration"
 
 
 def _eager(make) -> dict:
@@ -479,7 +490,7 @@ def _eager(make) -> dict:
 
 def _capture_and_replay(make, ws=None, what: str = "") -> list:
     """``REPLAYS`` replays of the captured iteration, each after its static outputs (and the bytes of ``ws`` past the
-    ticket region) were overwritten with 0xFF; ``ws``'s ticket region is zero after every replay."""
+    zero prefix) were overwritten with 0xFF; ``ws``'s zero prefix is zero after every replay."""
     step, leaves = make()
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
@@ -501,7 +512,7 @@ def _capture_and_replay(make, ws=None, what: str = "") -> list:
         graph.replay()
         torch.cuda.synchronize()
         if ws is not None:
-            _assert_ticket_zero(ws, f"{what} replay {r}")
+            _assert_zero_prefix(ws, f"{what} replay {r}")
         replays.append(_snapshot(out))
     return replays
 
@@ -521,7 +532,7 @@ def test_direct_entry_points_capture(T: int, caller_owned: bool, hidden: int) ->
     what = f"direct T={T} H={hidden} caller_owned={caller_owned}"
     replays = _capture_and_replay(lambda: _direct_step(i, wsf, wsb), wsb, what)
     for r, got in enumerate(replays):
-        _assert_matches(eager, got, bound, f"{what} replay {r} vs eager")
+        _assert_same_call(eager, got, f"{what} replay {r} vs eager")
         _assert_matches(eager_det, got, bound, f"{what} replay {r} vs deterministic")
 
 
@@ -547,7 +558,7 @@ def test_autograd_iteration_capture(
     eager_det = _eager(lambda: make(det_package=True))
     what = f"autograd ckpt={ckpt} save_stats={save_stats} caller_owned={caller_owned} T={T} H={hidden}"
     for r, got in enumerate(_capture_and_replay(make, wsb, what)):
-        _assert_matches(eager, got, bound, f"{what} replay {r} vs eager")
+        _assert_same_call(eager, got, f"{what} replay {r} vs eager")
         _assert_matches(eager_det, got, bound, f"{what} replay {r} vs deterministic")
 
 
@@ -589,7 +600,7 @@ def test_make_graphed_callables(
         ref, ref_det = run(fwd, ir), run(fwd_det, ir)
         got = run(graphed, ir)
         what = f"make_graphed_callables ckpt={ckpt} save_stats={save_stats} T={T} H={hidden} call {r}"
-        _assert_matches(ref, got, bound, f"{what} vs eager")
+        _assert_same_call(ref, got, f"{what} vs eager")
         _assert_matches(ref_det, got, bound, f"{what} vs deterministic")
 
 
@@ -614,45 +625,9 @@ def _nd_backward(i: dict, prep: dict, **kwargs) -> dict:
     return _backward(pkg.cake_mhc_nondet_train_backward_finish, i, prep, **kwargs)
 
 
-def _clear_det_caches() -> None:
-    """Drop the deterministic package's cached host plans, workspace envelopes, layouts and route plans (each binds
-    the token-owner and reduction forms and the parameter region of its token count)."""
-    det_loader.host_plan.cache_clear()
-    det_loader.workspace_bytes_upto.cache_clear()
-    det._LAYOUTS.clear()
-    det._PLANS.clear()
-    det._FAST_ROUTES.clear()
-
-
-@contextlib.contextmanager
-def _det_per_cta():
-    """The deterministic package with its group-row forms off (``cake_jit.bwd_group_rows`` False at every call): the
-    per-CTA token owner and reduction whose ``dscale`` / ``dbase`` this package's column slab reproduces.  Its caches
-    are dropped on entry and on exit, also when the body fails (:func:`_clear_det_caches`)."""
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(det_loader, "bwd_group_rows", lambda *_args, **_kwargs: False)
-        _clear_det_caches()
-        try:
-            yield
-        finally:
-            patch.undo()
-            _clear_det_caches()
-
-
 def _det_backward(i: dict, prep: dict) -> dict:
-    """The deterministic backward (``test_cake_mhc_nondet_train.py``'s ``_det_backward``): where it runs its group-row forms
-    (``cake_jit.bwd_group_rows``), ``dscale`` and ``dbase`` are those of its per-CTA run (:func:`_det_per_cta`) on a
-    workspace of the per-CTA sizing; ``dX`` and ``dfn`` stay the shipped backward's."""
-    T, hidden = i["X"].shape[0], i["X"].shape[2]
-    out = _backward(det.cake_mhc_det_train_backward_finish, i, prep)
-    if det_loader.bwd_group_rows(T, _sm_count(), _arch(), hidden):
-        with _det_per_cta():
-            ws = det.cake_mhc_det_train_backward_workspace(T, _device(), hidden=hidden)
-            per_cta = _backward(
-                det.cake_mhc_det_train_backward_finish, i, prep, workspace=ws
-            )
-        out.update(dscale=per_cta["dscale"], dbase=per_cta["dbase"])
-    return out
+    """The deterministic backward of a case (its group-row forms inside ``BWD_ROW_BANDS``, as this package's)."""
+    return _backward(det.cake_mhc_det_train_backward_finish, i, prep)
 
 
 def _assert_exact_outputs(got: dict, want: dict, label: str) -> None:
@@ -664,11 +639,12 @@ def _assert_exact_outputs(got: dict, want: dict, label: str) -> None:
     ("T", "t_ws"), ((129, 129), (2049, 2049), (2049, 16263), (1, 4096))
 )
 def test_cuda_graph_capture_and_replay(T: int, t_ws: int, hidden: int) -> None:
-    """A non-deterministic ``backward_finish`` with a caller workspace (sized for ``t_ws >= T``) and caller
-    outputs, captured in a ``torch.cuda.CUDAGraph`` after a warm-up on a side stream, then replayed with new inputs
-    copied in place (and, on a larger buffer, an eager call at ``t_ws`` on the same workspace before each replay):
-    every replay leaves the ticket region zero and matches the eager deterministic and non-deterministic calls on the
-    same inputs (``dX``, ``dscale``, ``dbase`` bitwise; ``dfn`` within the bound)."""
+    """This package's ``backward_finish`` with a caller workspace (sized for ``t_ws >= T``) and caller outputs,
+    captured in a ``torch.cuda.CUDAGraph`` after a warm-up on a side stream, then replayed with new inputs copied in
+    place (and, on a larger buffer, an eager call at ``t_ws`` on the same workspace before each replay): every replay
+    leaves the zero prefix zero, gives every output of this package's eager call on the same inputs bitwise (``dfn``
+    included) and matches the eager deterministic call (``dX``, ``dscale``, ``dbase`` bitwise; ``dfn`` within the
+    bound)."""
     dev = _device()
     ws = pkg.cake_mhc_nondet_train_backward_workspace(t_ws, dev, hidden=hidden)
     static = _inputs(T, seed=SEED + 600, hidden=hidden)
@@ -716,7 +692,7 @@ def test_cuda_graph_capture_and_replay(T: int, t_ws: int, hidden: int) -> None:
         if big is not None:
             _poison_workspace(ws)
             got_big = _snapshot(_nd_backward(big["i"], big["prep"], workspace=ws))
-            _assert_ticket_zero(ws, f"eager T={t_ws} before {what}")
+            _assert_zero_prefix(ws, f"eager T={t_ws} before {what}")
             _assert_exact_outputs(got_big, big["want"], f"eager T={t_ws} before {what}")
             _assert_dfn_within(
                 got_big["dfn"],
@@ -728,14 +704,11 @@ def test_cuda_graph_capture_and_replay(T: int, t_ws: int, hidden: int) -> None:
         for v in outs.values():
             v.fill_(float("nan"))
         graph.replay()
-        _assert_ticket_zero(ws, what)
+        _assert_zero_prefix(ws, what)
         got = _snapshot(outs)
         _assert_exact_outputs(got, want, what + " vs eager deterministic")
-        _assert_exact_outputs(got, eager, what + " vs eager non-deterministic")
+        _assert_same_call(eager, got, what + " vs the eager call")
         _assert_dfn_within(
             got["dfn"], want["dfn"], bound, f"dfn {what} vs eager deterministic"
-        )
-        _assert_dfn_within(
-            got["dfn"], eager["dfn"], bound, f"dfn {what} vs eager non-deterministic"
         )
     del graph

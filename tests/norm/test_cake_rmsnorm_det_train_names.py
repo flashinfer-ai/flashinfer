@@ -730,9 +730,9 @@ def test_nondet_package_is_self_contained() -> None:
     # (the kernel library names keep their internal prefix)
     modules = backend.cake_jit.MODULES
     assert modules and all(name.startswith("cake_rmsnorm_train_") for name in modules)
+    kinds = ("claim_sum_f64", "chunk_partials", "claim_part_f32")
     assert all(
-        record["workspace_rule"] is None
-        or record["workspace_rule"]["kind"] in ("claim_sum_f64", "chunk_partials")
+        record["workspace_rule"] is None or record["workspace_rule"]["kind"] in kinds
         for record in modules.values()
     )
     files = {

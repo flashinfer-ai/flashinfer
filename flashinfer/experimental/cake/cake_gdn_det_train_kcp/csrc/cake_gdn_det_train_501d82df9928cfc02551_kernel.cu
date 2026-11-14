@@ -1867,7 +1867,7 @@ kernel_cake_gdn_det_train_501d82df9928cfc02551(const __grid_constant__ CUtensorM
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&q0_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_1[(0) + 3]))
                             : "r"(stage_dv_addr + (unsigned int)(t * 256 + (chunk_1 << 4))));
-                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + (base + 64)))[0] = reinterpret_cast<int4*>(q0_1_1)[0];
+                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + (base + 64ll)))[0] = reinterpret_cast<int4*>(q0_1_1)[0];
                     }
                     if (t1 < clen) {
                         long long base1 = (long long)(trow + t1) * (long long)dv_tstride + (long long)(hv * 128 + c0 * 8);
@@ -1882,7 +1882,7 @@ kernel_cake_gdn_det_train_501d82df9928cfc02551(const __grid_constant__ CUtensorM
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&q2_3_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_1[(0) + 3]))
                             : "r"(stage_dv_addr + (unsigned int)(t1 * 256 + (chunk1_1 << 4))));
-                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + (base1 + 64)))[0] = reinterpret_cast<int4*>(q2_3_1)[0];
+                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + (base1 + 64ll)))[0] = reinterpret_cast<int4*>(q2_3_1)[0];
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(dv_stored_addr);
@@ -2154,7 +2154,7 @@ kernel_cake_gdn_det_train_501d82df9928cfc02551(const __grid_constant__ CUtensorM
                             tmem_st_x32_f32(taddr + (unsigned int)row_base + (unsigned int)(ch * 32), _tmem_load_12);
                         }
                     } else {
-                        long long pbase = ((long long)trow * nh64 + hv64) * 128 + (long long)d_row;
+                        long long pbase = ((long long)trow * nh64 + hv64) * 128ll + (long long)d_row;
                         if (clen > t0) {
                             *(reinterpret_cast<float*>(dq_part + (pbase + (long long)(t0 * num_heads * 128))) + (0)) = _tmem_load_11[0];
                         }
@@ -2586,7 +2586,7 @@ kernel_cake_gdn_det_train_501d82df9928cfc02551(const __grid_constant__ CUtensorM
                             tmem_st_x32_f32(taddr + 64 + (unsigned int)row_base + (unsigned int)(ch * 32), _tmem_load_16);
                         }
                     } else {
-                        long long kbase = ((long long)trow * nh64 + hv64) * 128 + (long long)d_row;
+                        long long kbase = ((long long)trow * nh64 + hv64) * 128ll + (long long)d_row;
                         if (clen > t0) {
                             *(reinterpret_cast<float*>(dk_part + (kbase + (long long)(t0 * num_heads * 128))) + (0)) = _tmem_load_15[0];
                         }
@@ -3150,7 +3150,7 @@ kernel_cake_gdn_det_train_501d82df9928cfc02551(const __grid_constant__ CUtensorM
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&q0_1_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_3[(0) + 3]))
                                     : "r"(stage_dq_addr + (unsigned int)(t_0 * 256 + (chunk_3 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + (base_1 + 64)))[0] = reinterpret_cast<int4*>(q0_1_3)[0];
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + (base_1 + 64ll)))[0] = reinterpret_cast<int4*>(q0_1_3)[0];
                             }
                             if (t1_0 < clen) {
                                 long long base1_1 = (long long)(trow + t1_0) * (long long)dqk_tstride + (long long)(hq * 128 + c0_0 * 8);
@@ -3165,7 +3165,7 @@ kernel_cake_gdn_det_train_501d82df9928cfc02551(const __grid_constant__ CUtensorM
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&q2_3_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_3[(0) + 3]))
                                     : "r"(stage_dq_addr + (unsigned int)(t1_0 * 256 + (chunk1_3 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + (base1_1 + 64)))[0] = reinterpret_cast<int4*>(q2_3_3)[0];
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + (base1_1 + 64ll)))[0] = reinterpret_cast<int4*>(q2_3_3)[0];
                             }
                             int t_1 = tid_1 >> 3;
                             int t1_1 = t_1 + 32;
@@ -3183,7 +3183,7 @@ kernel_cake_gdn_det_train_501d82df9928cfc02551(const __grid_constant__ CUtensorM
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&q0_1_5[0])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_5[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_5[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_5[(0) + 3]))
                                     : "r"(stage_dk_addr + (unsigned int)(t_1 * 256 + (chunk_5 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + (base_2 + 64)))[0] = reinterpret_cast<int4*>(q0_1_5)[0];
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + (base_2 + 64ll)))[0] = reinterpret_cast<int4*>(q0_1_5)[0];
                             }
                             if (t1_1 < clen) {
                                 long long base1_2 = (long long)(trow + t1_1) * (long long)dqk_tstride + (long long)(hq * 128 + c0_1 * 8);
@@ -3198,7 +3198,7 @@ kernel_cake_gdn_det_train_501d82df9928cfc02551(const __grid_constant__ CUtensorM
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&q2_3_5[0])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_5[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_5[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_5[(0) + 3]))
                                     : "r"(stage_dk_addr + (unsigned int)(t1_1 * 256 + (chunk1_5 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + (base1_2 + 64)))[0] = reinterpret_cast<int4*>(q2_3_5)[0];
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + (base1_2 + 64ll)))[0] = reinterpret_cast<int4*>(q2_3_5)[0];
                             }
                         }
                     }

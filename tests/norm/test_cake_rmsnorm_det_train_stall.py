@@ -56,7 +56,7 @@ import statistics
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_det_train")
 loader = cake_package("cake_rmsnorm_det_train", "cake_jit")
@@ -287,14 +287,11 @@ MIN_WAIT_MS = 0.5 * ALL_SM_SPIN_MS
 CARVEOUT_MAX_SHARED = 100
 # The calls that need a whole SM, with BF16 and FP32 weights alike (the facade's
 # per-architecture list): arch -> (kind, hidden, residual, above), every window
-# of the route above ``above`` tokens.  The residual route's column-task
-# window (at most 32 tokens on sm_100a / sm_103a, at most 960 on sm_107a)
-# starts beside the side CTA.
+# of the route above ``above`` tokens (none on sm_100a / sm_103a).
 WHOLE_SM = {
-    "sm_100a": (("bwd", 6144, True, 32),),
-    "sm_103a": (("bwd", 6144, True, 32),),
+    "sm_100a": (),
+    "sm_103a": (),
     "sm_107a": (
-        ("bwd", 6144, True, 960),
         ("bwd", 1536, False, 1024),
         ("bwd", 2048, False, 256),
         ("bwd", 4096, False, 1024),

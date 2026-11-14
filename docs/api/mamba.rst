@@ -225,9 +225,10 @@ here runs the deterministic package.
   and ``CakeCausalConv1dNondetKcpRecomputeHandle``, with the deterministic KCP
   entry points' parameters and the keyword-only ``bwd_reserve_sms`` (SMs the
   main backward leaves free; ``bwd_reserve_sms >= 1`` raises ``ValueError`` on
-  SM107).  ``cooperative=True`` raises ``ValueError``: it applies to the
-  deterministic KCP package only, and the non-deterministic main backward is
-  one ordinary launch.
+  SM107 and, elsewhere, runs the one-program backward after the halo exchange
+  instead of the overlapped backward).  ``cooperative=True`` raises
+  ``ValueError``: it applies to the deterministic KCP package only, and the
+  non-deterministic backward launches no cooperative grid.
 
 .. currentmodule:: flashinfer.cake_causal_conv1d_nondet_train
 
@@ -286,8 +287,15 @@ deterministic backward's, and the CTAs add their ``dweight`` / ``dbias`` rows
 into zeroed accumulators with unordered global reductions (FP32, or FP64 under
 ``silu_grad_preactivation="fp32"``), rounded once into the requested dtype.
 ``dweight`` / ``dbias`` stay within the deterministic error budget but are not
-bitwise reproducible from run to run.  The KCP backward returns the rank-local
-FP32 ``dweight`` partial with the same property.
+bitwise reproducible from run to run.  The KCP backward overlaps the halo
+exchange: its main program runs before the exchange is waited, as if no
+fragment had tail rows, with CTAs that claim their tokens at run time (Cluster
+Launch Control), so a kernel resident on another stream slows it about in
+proportion to the SMs it holds; a tail-row program then writes ``dx`` of the
+last three rows of each fragment that receives tail rows.  ``dx`` is bitwise
+the deterministic KCP backward's; the rank-local FP32 ``dweight`` partial is
+summed into four FP32 accumulator copies in the order the CTAs end their runs,
+so it is not bitwise reproducible from run to run.
 
 Under ``torch.use_deterministic_algorithms(True)`` the forward and the
 checkpoint recompute run (they are fixed-order).  The entry points that launch

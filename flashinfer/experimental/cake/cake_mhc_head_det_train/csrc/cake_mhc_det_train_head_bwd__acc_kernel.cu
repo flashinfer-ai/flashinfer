@@ -50,9 +50,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define THREADS 256
-
 #include <math_constants.h>
 
 extern "C" {
@@ -72,14 +69,17 @@ kernel_cake_mhc_det_train_head_bwd__acc(__nv_bfloat16* __restrict__ dy, __nv_bfl
 
     // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    unsigned int vectors = (unsigned int)T * ((uint32_t)(hv.divisor));
-    unsigned int v = (unsigned int)bid * 256 + (unsigned int)tid;
-    if (v < vectors) {
-        uint32_t token = (hv.divisor != 1) ? (__umulhi((uint32_t)(v), hv.multiplier) >> hv.shift_right) : (uint32_t)(v);
-        uint32_t col = (uint32_t)(v) - token * (uint32_t)(hv.divisor);
-        long long row = (long long)((uint32_t)(hv.divisor)) * 16;
-        long long xbase = (long long)token * (row * 4) + (long long)col * 16;
+    uint32_t cta_q = (hv.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)bid), hv.multiplier) >> hv.shift_right) : (uint32_t)((unsigned int)bid);
+    uint32_t cta_r = (uint32_t)((unsigned int)bid) - cta_q * (uint32_t)(hv.divisor);
+    unsigned int within = cta_r * 256 + (unsigned int)tid;
+    uint32_t sub = (hv.divisor != 1) ? (__umulhi((uint32_t)(within), hv.multiplier) >> hv.shift_right) : (uint32_t)(within);
+    uint32_t col = (uint32_t)(within) - sub * (uint32_t)(hv.divisor);
+    unsigned int token = cta_q * 256 + sub;
+    if (token < (unsigned int)T) {
+        long long row = (long long)((uint32_t)(hv.divisor)) * 16ll;
+        long long xbase = (long long)token * (row * 4ll) + (long long)col * 16ll;
         unsigned int grad[8];
+        long long gbase = (long long)token * row + (long long)col * 16ll;
         {
             uint32_t _iv_0_0;
             uint32_t _iv_0_1;
@@ -90,7 +90,7 @@ kernel_cake_mhc_det_train_head_bwd__acc(__nv_bfloat16* __restrict__ dy, __nv_bfl
             uint32_t _iv_0_6;
             uint32_t _iv_0_7;
             asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
-                : "=r"(_iv_0_0), "=r"(_iv_0_1), "=r"(_iv_0_2), "=r"(_iv_0_3), "=r"(_iv_0_4), "=r"(_iv_0_5), "=r"(_iv_0_6), "=r"(_iv_0_7) : "l"((const void*)(reinterpret_cast<unsigned int*>(dy + ((long long)v * 16)) + (0))), "l"(0x12F0000000000000ULL) : "memory");
+                : "=r"(_iv_0_0), "=r"(_iv_0_1), "=r"(_iv_0_2), "=r"(_iv_0_3), "=r"(_iv_0_4), "=r"(_iv_0_5), "=r"(_iv_0_6), "=r"(_iv_0_7) : "l"((const void*)(reinterpret_cast<unsigned int*>(dy + gbase) + (0))), "l"(0x12F0000000000000ULL) : "memory");
             grad[0 + 0] = (uint32_t)_iv_0_0;
             grad[0 + 1] = (uint32_t)_iv_0_1;
             grad[0 + 2] = (uint32_t)_iv_0_2;
@@ -151,7 +151,7 @@ kernel_cake_mhc_det_train_head_bwd__acc(__nv_bfloat16* __restrict__ dy, __nv_bfl
             uint32_t _iv_3_6;
             uint32_t _iv_3_7;
             asm volatile("ld.global.L1::no_allocate.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                : "=r"(_iv_3_0), "=r"(_iv_3_1), "=r"(_iv_3_2), "=r"(_iv_3_3), "=r"(_iv_3_4), "=r"(_iv_3_5), "=r"(_iv_3_6), "=r"(_iv_3_7) : "l"((const void*)(reinterpret_cast<unsigned int*>(dx + (xbase + row * 2)) + (0))) : "memory");
+                : "=r"(_iv_3_0), "=r"(_iv_3_1), "=r"(_iv_3_2), "=r"(_iv_3_3), "=r"(_iv_3_4), "=r"(_iv_3_5), "=r"(_iv_3_6), "=r"(_iv_3_7) : "l"((const void*)(reinterpret_cast<unsigned int*>(dx + (xbase + row * 2ll)) + (0))) : "memory");
             old[16 + 0] = (uint32_t)_iv_3_0;
             old[16 + 1] = (uint32_t)_iv_3_1;
             old[16 + 2] = (uint32_t)_iv_3_2;
@@ -171,7 +171,7 @@ kernel_cake_mhc_det_train_head_bwd__acc(__nv_bfloat16* __restrict__ dy, __nv_bfl
             uint32_t _iv_4_6;
             uint32_t _iv_4_7;
             asm volatile("ld.global.L1::no_allocate.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                : "=r"(_iv_4_0), "=r"(_iv_4_1), "=r"(_iv_4_2), "=r"(_iv_4_3), "=r"(_iv_4_4), "=r"(_iv_4_5), "=r"(_iv_4_6), "=r"(_iv_4_7) : "l"((const void*)(reinterpret_cast<unsigned int*>(dx + (xbase + row * 3)) + (0))) : "memory");
+                : "=r"(_iv_4_0), "=r"(_iv_4_1), "=r"(_iv_4_2), "=r"(_iv_4_3), "=r"(_iv_4_4), "=r"(_iv_4_5), "=r"(_iv_4_6), "=r"(_iv_4_7) : "l"((const void*)(reinterpret_cast<unsigned int*>(dx + (xbase + row * 3ll)) + (0))) : "memory");
             old[24 + 0] = (uint32_t)_iv_4_0;
             old[24 + 1] = (uint32_t)_iv_4_1;
             old[24 + 2] = (uint32_t)_iv_4_2;
@@ -297,7 +297,7 @@ kernel_cake_mhc_det_train_head_bwd__acc(__nv_bfloat16* __restrict__ dy, __nv_bfl
             const unsigned* _raw_stv8_7 = reinterpret_cast<const unsigned*>(total_2);
             asm volatile(
                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                :: "l"((void*)(reinterpret_cast<unsigned int*>(dx + (xbase + row * 2)))), "r"(_raw_stv8_7[0]), "r"(_raw_stv8_7[1]), "r"(_raw_stv8_7[2]), "r"(_raw_stv8_7[3]), "r"(_raw_stv8_7[4]), "r"(_raw_stv8_7[5]), "r"(_raw_stv8_7[6]), "r"(_raw_stv8_7[7]) : "memory");
+                :: "l"((void*)(reinterpret_cast<unsigned int*>(dx + (xbase + row * 2ll)))), "r"(_raw_stv8_7[0]), "r"(_raw_stv8_7[1]), "r"(_raw_stv8_7[2]), "r"(_raw_stv8_7[3]), "r"(_raw_stv8_7[4]), "r"(_raw_stv8_7[5]), "r"(_raw_stv8_7[6]), "r"(_raw_stv8_7[7]) : "memory");
         }
         unsigned int total_3[8];
         uint32_t summed_24;
@@ -328,7 +328,7 @@ kernel_cake_mhc_det_train_head_bwd__acc(__nv_bfloat16* __restrict__ dy, __nv_bfl
             const unsigned* _raw_stv8_8 = reinterpret_cast<const unsigned*>(total_3);
             asm volatile(
                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                :: "l"((void*)(reinterpret_cast<unsigned int*>(dx + (xbase + row * 3)))), "r"(_raw_stv8_8[0]), "r"(_raw_stv8_8[1]), "r"(_raw_stv8_8[2]), "r"(_raw_stv8_8[3]), "r"(_raw_stv8_8[4]), "r"(_raw_stv8_8[5]), "r"(_raw_stv8_8[6]), "r"(_raw_stv8_8[7]) : "memory");
+                :: "l"((void*)(reinterpret_cast<unsigned int*>(dx + (xbase + row * 3ll)))), "r"(_raw_stv8_8[0]), "r"(_raw_stv8_8[1]), "r"(_raw_stv8_8[2]), "r"(_raw_stv8_8[3]), "r"(_raw_stv8_8[4]), "r"(_raw_stv8_8[5]), "r"(_raw_stv8_8[6]), "r"(_raw_stv8_8[7]) : "memory");
         }
     }
 }

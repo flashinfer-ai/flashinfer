@@ -254,7 +254,7 @@ kernel_cake_rmsnorm_train_3d619cd1e3ae638cce3d(__nv_bfloat16* __restrict__ x, __
             if (gtid == 0) {
                 r[row] = rstd;
             }
-            long long obase = (long long)row * 6144;
+            long long obase = (long long)row * 6144ll;
             #pragma unroll
 #if __CUDA_ARCH__ == 1070
             for (int v_3 = 0; v_3 < 3; v_3++) {

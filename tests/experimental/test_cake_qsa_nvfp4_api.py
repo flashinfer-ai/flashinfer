@@ -48,7 +48,7 @@ import flashinfer.experimental.qsa_nvfp4.backend as existing_backend
 import flashinfer.sparse as public_api
 from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.experimental.cake_qsa_nvfp4 import cake_backend, cake_jit
-from tests.test_helpers.cake_qsa_nvfp4_reference import write_slots
+from tests.experimental.test_helpers.cake_qsa_nvfp4_reference import write_slots
 
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 HEAD_DIM = 256

@@ -75,7 +75,7 @@ kernel_cake_lm_head_loss_23560b287fedb0fe4daa(__nv_bfloat16* __restrict__ z, lon
     unsigned long long row_base = (unsigned long long)r * (unsigned long long)V;
     int num_vecs = V / 8;
     int vi0 = blockIdx.x * 1024 + tid;
-    if (lbl < 0) {
+    if (lbl < 0ll) {
         float zero_out[8];
         #pragma unroll
         for (int j = 0; j < 8; j++) {
@@ -106,7 +106,7 @@ kernel_cake_lm_head_loss_23560b287fedb0fe4daa(__nv_bfloat16* __restrict__ z, lon
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero_out[_lp*2 + 6], zero_out[_lp*2+1 + 6]));
                     _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<int4*>(z + (row_base + (unsigned long long)vi_z * 8))[0] = reinterpret_cast<int4*>(_packed_0)[0];
+                reinterpret_cast<int4*>(z + (row_base + (unsigned long long)vi_z * 8ull))[0] = reinterpret_cast<int4*>(_packed_0)[0];
             }
         }
     } else {
@@ -121,7 +121,7 @@ kernel_cake_lm_head_loss_23560b287fedb0fe4daa(__nv_bfloat16* __restrict__ z, lon
             int vi_l = vi0 + kl * 128;
             if (vi_l < num_vecs) {
                 {
-                    uint4 _uv4_0 = *reinterpret_cast<const uint4*>(z + (row_base + (unsigned long long)vi_l * 8) + 0);
+                    uint4 _uv4_0 = *reinterpret_cast<const uint4*>(z + (row_base + (unsigned long long)vi_l * 8ull) + 0);
                     zw[kl * 4 + 0] = _uv4_0.x;
                     zw[kl * 4 + 1] = _uv4_0.y;
                     zw[kl * 4 + 2] = _uv4_0.z;
@@ -184,7 +184,7 @@ kernel_cake_lm_head_loss_23560b287fedb0fe4daa(__nv_bfloat16* __restrict__ z, lon
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out[_lp*2 + 6], out[_lp*2+1 + 6]));
                     _packed_1[_lp + 3] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<int4*>(z + (row_base + (unsigned long long)vi * 8))[0] = reinterpret_cast<int4*>(_packed_1)[0];
+                reinterpret_cast<int4*>(z + (row_base + (unsigned long long)vi * 8ull))[0] = reinterpret_cast<int4*>(_packed_1)[0];
             }
         }
     }

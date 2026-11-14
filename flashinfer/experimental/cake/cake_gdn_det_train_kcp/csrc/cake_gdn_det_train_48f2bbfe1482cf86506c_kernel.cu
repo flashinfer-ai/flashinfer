@@ -306,7 +306,7 @@ kernel_cake_gdn_det_train_48f2bbfe1482cf86506c(const __grid_constant__ CUtensorM
                         int head = t_i - t_i / num_heads * num_heads;
                         int ext0 = chunk_bos[chunk];
                         int clen = chunk_len[chunk];
-                        long long obase = ((long long)(ext0 + t_row) * (long long)num_heads + (long long)head) * 128;
+                        long long obase = ((long long)(ext0 + t_row) * (long long)num_heads + (long long)head) * 128ll;
                         float qs = qscale[(long long)(chunk * 64 + t_row) * (long long)num_heads + (long long)head];
                         int buf_col = (int)epi_buf * 128;
                         mbarrier_wait(acc_full_addr + (epi_buf) * 8, _phase_acc_full);
@@ -597,7 +597,7 @@ kernel_cake_gdn_det_train_48f2bbfe1482cf86506c(const __grid_constant__ CUtensorM
                     int head_1 = t_i_1 - t_i_1 / num_heads * num_heads;
                     int ext0_1 = chunk_bos[chunk_1];
                     int clen_1 = chunk_len[chunk_1];
-                    long long obase_1 = ((long long)(ext0_1 + t_row) * (long long)num_heads + (long long)head_1) * 128;
+                    long long obase_1 = ((long long)(ext0_1 + t_row) * (long long)num_heads + (long long)head_1) * 128ll;
                     float qs_1 = qscale[(long long)(chunk_1 * 64 + t_row) * (long long)num_heads + (long long)head_1];
                     int buf_col_1 = (int)epi_buf * 128;
                     mbarrier_wait(acc_full_addr + (epi_buf) * 8, _phase_acc_full);

@@ -453,7 +453,7 @@ kernel_cake_rmsnorm_det_train_19e18371f9243bd1a91a(__nv_bfloat16* __restrict__ g
     float out[16];
     if (cb >= ce) {
         if (c0 < n_chunks) {
-            unsigned long long pbase0 = (unsigned long long)c0 * 6144;
+            unsigned long long pbase0 = (unsigned long long)c0 * 6144ull;
             #pragma unroll
             for (int v0 = 0; v0 < 2; v0++) {
                 int pcolv0 = (v0 * 384 + tir) * 8;
@@ -566,7 +566,7 @@ kernel_cake_rmsnorm_det_train_19e18371f9243bd1a91a(__nv_bfloat16* __restrict__ g
                 float kx = rq * rq * rq * cq;
                 float nkx = -kx;
                 if (row < ce) {
-                    unsigned long long dx_base = (unsigned long long)row * 6144;
+                    unsigned long long dx_base = (unsigned long long)row * 6144ull;
                     #pragma unroll
                     for (int v_3 = 0; v_3 < 2; v_3++) {
                         #pragma unroll
@@ -800,7 +800,7 @@ kernel_cake_rmsnorm_det_train_19e18371f9243bd1a91a(__nv_bfloat16* __restrict__ g
             float kx_1 = rq_1 * rq_1 * rq_1 * cq_1;
             float nkx_1 = -kx_1;
             if (row_1 < ce) {
-                unsigned long long dx_base_1 = (unsigned long long)row_1 * 6144;
+                unsigned long long dx_base_1 = (unsigned long long)row_1 * 6144ull;
                 #pragma unroll
                 for (int v_6 = 0; v_6 < 2; v_6++) {
                     #pragma unroll
@@ -886,7 +886,7 @@ kernel_cake_rmsnorm_det_train_19e18371f9243bd1a91a(__nv_bfloat16* __restrict__ g
         asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_30) : "r"(w2_1));
         nd[2] = _warp_redux_30;
         int cid_f = nd[0];
-        unsigned long long pbase = (unsigned long long)cid_f * 6144;
+        unsigned long long pbase = (unsigned long long)cid_f * 6144ull;
         #pragma unroll
         for (int jx = 0; jx < 16; jx++) {
             int sx = jx * 384 + tir;

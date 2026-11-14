@@ -39,7 +39,7 @@ top-level names are rows of the lazy-export table ``flashinfer._LAZY_EXPORTS``
 (bound on first access): each mode's facade module, its functional, forward,
 backward, workspace size and autograd class, all with a mode word (checked in
 this process and in fresh interpreters).  The shared checks of the
-mode-in-name rule (``tests/test_helpers/cake_mode_names.py``) run over all four
+mode-in-name rule (``tests/cake/test_helpers/cake_mode_names.py``) run over all four
 namespaces; the checks here add what is particular to this family.  The JIT
 library names of the backends (``cake_rmsnorm_silu_gate_train_<hash>`` and
 ``cake_rmsnorm_silu_gate_det_train_<hash>``) are build identities, not Python
@@ -63,7 +63,7 @@ import flashinfer.cake_rmsnorm_silu_gate_det_train as det_facade
 import flashinfer.cake_rmsnorm_silu_gate_nondet_train as nd_facade
 import flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train as det_backend
 import flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train as nd_backend
-from tests.test_helpers.cake_mode_names import assert_cake_mode_module
+from tests.cake.test_helpers.cake_mode_names import assert_cake_mode_module
 
 pytestmark = pytest.mark.cpu_only
 
@@ -92,7 +92,7 @@ CLASS = {
 
 def _public_names(mode: str) -> set:
     module = f"{OP}_{mode}_train"
-    names = {
+    return {
         f"{OP}_{mode}",
         CLASS[mode],
         f"is_{module}_supported",
@@ -100,10 +100,8 @@ def _public_names(mode: str) -> set:
         f"{module}_backward",
         f"{module}_backward_workspace",
         f"{module}_backward_workspace_bytes",
+        f"{module}_reset_workspace",
     }
-    if mode == "nondet":
-        names.add(f"{module}_reset_workspace")
-    return names
 
 
 PUBLIC = {mode: _public_names(mode) for mode in MODES}
@@ -369,15 +367,34 @@ def test_the_two_modes_are_separate_modules() -> None:
         name.startswith("cake_rmsnorm_silu_gate_det_train_")
         for name in det_backend.cake_jit.MODULES
     )
+    # the non-deterministic package routes its call roles, the roles its
+    # forward and backward bands name and backward roles of a BF16 weight
+    # gradient that no band runs
     loader = nd_backend.cake_jit
     roles = {record["role"] for record in loader.MODULES.values()}
-    assert roles == (
-        set(loader.ROLES)
-        | set(loader.XLONG_ROLES)
-        | set(loader.LONG_ROLES)
-        | set(loader.MID_ROLES)
-        | set(loader.SHORT_ROLES)
+    banded = {
+        role
+        for table in (loader.FORWARD_BANDS, loader.STRIDED_FORWARD_BANDS)
+        for bands in table.values()
+        for _, role in bands
+    } | {
+        role
+        for by_role in loader.BACKWARD_BANDS.values()
+        for bands in by_role.values()
+        for _, role in bands
+    }
+    assert set(loader.ROLES) | banded <= roles
+    assert all(
+        role.startswith("bwd_bf16_") for role in roles - set(loader.ROLES) - banded
     )
+    # the deterministic package routes its call roles, the long modules of its
+    # backward roles and, on some architectures, a forward of packed rows
+    det_loader = det_backend.cake_jit
+    roles = {record["role"] for record in det_loader.MODULES.values()}
+    routed = {*det_loader.ROLES, *det_loader.LONG_ROLES}
+    assert routed <= roles <= routed | set(det_loader.PACKED_ROLES)
+    for routes in det_loader.ROUTES.values():
+        assert routed <= set(routes) <= roles
 
 
 def test_facade_objects() -> None:

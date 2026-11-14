@@ -21,8 +21,11 @@ constants carries the mode token ``det`` (``Det`` in a class name), no public
 callable takes a ``deterministic`` keyword (the ``forward`` / ``backward`` of
 the autograd ``Function`` classes included), the former modules and names are
 gone (no module, no alias, no top-level name), the module imports its backend
-on first use only, and the package is wired at its path (test-helper key,
-package data, ignored ``aot/``, pre-commit exclude, manifest checker row).
+on first use only, the registry routes each architecture and hidden size to its
+own libraries (``ROUTES[arch][role][hidden]``, the small-problem libraries of
+``SMALL_ROUTES``; ``build.json`` builds exactly the records' architectures),
+and the package is wired at its path (test-helper key, package data,
+pre-commit exclude, manifest checker row).
 """
 
 import importlib
@@ -65,6 +68,105 @@ REMOVED_PREFIXES = (
     "is_cake_mhc_det_train_head",
 )
 REMOVED_NAMES = ("route_key", "route_modules")
+# The registry's records: library -> (role, architectures, CTA threads, BF16 values per vector, the hidden size the
+# build is for, 0 for any).  On sm_100a and sm_103a a 64-bit library per hidden size: the forward in 256-thread CTAs
+# on sm_100a and 128-thread CTAs on sm_103a, the backward in 512-thread CTAs (384 on sm_100a at
+# 4096, 256 on sm_100a at 5120 and 7168), the accumulating backward in 768-thread CTAs.  On sm_107a the hidden-4096
+# forward and writing backward move 256-bit vectors in 128-thread CTAs and the accumulating backward is the L2
+# bulk-reduce library (128-bit vectors, 256-thread CTAs).  The unsuffixed libraries take any hidden size: 128-bit
+# forward and 256-bit backward vectors in 256-thread CTAs, for a small problem on sm_107a (and the backward on
+# sm_100a / sm_103a).
+_LW64 = ("sm_100a", "sm_103a")
+RECORDS = {
+    "cake_mhc_det_train_head_fwd": ("head_fwd", ("sm_107a",), 256, 8, 0),
+    **{
+        f"cake_mhc_det_train_head_fwd__lw64_t128_h{h}": (
+            "head_fwd",
+            ("sm_103a",),
+            128,
+            4,
+            h,
+        )
+        for h in (4096, 5120, 7168)
+    },
+    **{
+        f"cake_mhc_det_train_head_fwd__lw64_t256_h{h}": (
+            "head_fwd",
+            ("sm_100a",),
+            256,
+            4,
+            h,
+        )
+        for h in (4096, 5120, 7168)
+    },
+    "cake_mhc_det_train_head_fwd__lw256_t128_h4096": (
+        "head_fwd",
+        ("sm_107a",),
+        128,
+        16,
+        4096,
+    ),
+    "cake_mhc_det_train_head_bwd": ("head_bwd", (*_LW64, "sm_107a"), 256, 16, 0),
+    "cake_mhc_det_train_head_bwd__lw64_t384_h4096": (
+        "head_bwd",
+        ("sm_100a",),
+        384,
+        4,
+        4096,
+    ),
+    **{
+        f"cake_mhc_det_train_head_bwd__lw64_t512_h{h}": (
+            "head_bwd",
+            ("sm_103a",),
+            512,
+            4,
+            h,
+        )
+        for h in (4096, 5120, 7168)
+    },
+    "cake_mhc_det_train_head_bwd__lw64_t256_h5120": (
+        "head_bwd",
+        ("sm_100a",),
+        256,
+        4,
+        5120,
+    ),
+    "cake_mhc_det_train_head_bwd__lw64_t256_h7168": (
+        "head_bwd",
+        ("sm_100a",),
+        256,
+        4,
+        7168,
+    ),
+    "cake_mhc_det_train_head_bwd__lw256_t128_h4096": (
+        "head_bwd",
+        ("sm_107a",),
+        128,
+        16,
+        4096,
+    ),
+    "cake_mhc_det_train_head_bwd__acc": ("head_bwd_acc", ("sm_107a",), 256, 16, 0),
+    **{
+        f"cake_mhc_det_train_head_bwd__acc_lw64_t768_h{h}": (
+            "head_bwd_acc",
+            _LW64,
+            768,
+            4,
+            h,
+        )
+        for h in (4096, 5120, 7168)
+    },
+    "cake_mhc_det_train_head_bwd__acc_l2red_lw128_t256_h4096": (
+        "head_bwd_acc",
+        ("sm_107a",),
+        256,
+        8,
+        4096,
+    ),
+}
+# The dynamic shared memory of a record's launch: the L2 bulk-reduce backward's segment of 256 16-byte vectors.
+SMEM = {"cake_mhc_det_train_head_bwd__acc_l2red_lw128_t256_h4096": 4096}
+ROLES = ("head_fwd", "head_bwd", "head_bwd_acc")
 
 _CHILD = r"""
 import importlib, json, sys
@@ -183,11 +285,106 @@ def test_the_backend_is_imported_on_first_use() -> None:
 
 
 @pytest.mark.cpu_only
+def test_the_registry_routes_each_architecture_and_hidden_size_to_its_library() -> None:
+    """The records are the libraries of :data:`RECORDS` (role, architectures, hidden size, a ``vectors`` grid rule
+    whose thread count is the CTA's, ``kernel`` / ``library`` the record name, ``kernel_symbol``
+    ``kernel_<library>``).  ``ROUTES[arch][role]`` maps every hidden size the architecture serves to the record of
+    the role delivered for the architecture and built for that hidden size, or built for any where none is;
+    ``SMALL_ROUTES`` sends a call of at most ``small_elements(arch, role)`` values per stream (``SMALL_ELEMENTS``,
+    T 7168 at hidden 4096 for the sm_107a forward) to the unsuffixed library of its role (the writing backward on
+    sm_100a and sm_103a, every role on sm_107a); :func:`route_module` follows both and refuses any other call, and a
+    record refuses a hidden size it is not built for.  Every route stays inside the kernels' ``hv <= MAX_VECTORS``
+    and its largest grid inside 31 bits."""
+    loader = importlib.import_module(f"{BACKEND}.cake_jit")
+    assert set(loader.MODULES) == set(RECORDS)
+    for name, (role, arches, threads, elems, hidden) in RECORDS.items():
+        record = loader.MODULES[name]
+        assert record["role"] == role and tuple(record["arches"]) == arches, name
+        assert record["hidden"] == hidden, name
+        assert record["grid_rule"] == {
+            "kind": "vectors",
+            "threads": threads,
+            "vector_elems": elems,
+        }, name
+        assert tuple(record["launch"]["block"]) == (threads, 1, 1), name
+        assert record["launch"]["dynamic_smem_bytes"] == SMEM.get(name, 0), name
+        assert record["kernel"] == record["library"] == name
+        assert record["kernel_symbol"] == f"kernel_{name}"
+
+    def built(arch: str, role: str, hidden: int) -> str:
+        names = [
+            name
+            for name, (r, arches, _t, _e, h) in RECORDS.items()
+            if r == role and arch in arches and h == hidden
+        ]
+        assert len(names) <= 1, names
+        return names[0] if names else built(arch, role, 0)
+
+    assert loader.HIDDEN_SIZES == {
+        "sm_100a": (4096, 5120, 7168),
+        "sm_103a": (4096, 5120, 7168),
+        "sm_107a": (4096,),
+    }
+    routes, small_routes = loader.ROUTES, loader.SMALL_ROUTES
+    assert routes == {
+        arch: {
+            role: {
+                hidden: built(arch, role, hidden)
+                for hidden in loader.supported_hidden_sizes(arch)
+            }
+            for role in ROLES
+        }
+        for arch in loader.ARCHES
+    }
+    small = "cake_mhc_det_train_head_bwd"
+    assert small_routes == {
+        "sm_100a": {"head_bwd": small},
+        "sm_103a": {"head_bwd": small},
+        "sm_107a": {
+            "head_fwd": "cake_mhc_det_train_head_fwd",
+            "head_bwd": small,
+            "head_bwd_acc": "cake_mhc_det_train_head_bwd__acc",
+        },
+    }
+    assert loader.SMALL_ELEMENTS == 2048 * 4096
+    assert loader.SMALL_ELEMENTS_BY_ROUTE == {"sm_107a": {"head_fwd": 7168 * 4096}}
+    for arch in loader.ARCHES:
+        for role in ROLES:
+            for hidden in loader.supported_hidden_sizes(arch):
+                largest = loader.small_elements(arch, role) // hidden
+                routed = loader.ROUTES[arch][role][hidden]
+                to_small = loader.SMALL_ROUTES.get(arch, {}).get(role, routed)
+                assert loader.route_module(arch, role, hidden, largest + 1) == routed
+                assert loader.route_module(arch, role, hidden, largest) == to_small
+                assert loader.route_module(arch, role, hidden, 1) == to_small
+                for name in {routed, to_small}:
+                    record = loader.MODULES[name]
+                    hv = loader.vectors_per_token(record, hidden)
+                    assert 1 <= hv <= loader.MAX_VECTORS, (arch, role, hidden, hv)
+                    (grid_x, _, _) = loader.launch_grid(
+                        record, loader.MAX_TOKENS, hidden
+                    )
+                    assert grid_x < 2**31, (arch, role, hidden, grid_x)
+    for arch, role, hidden in (
+        ("sm_90a", "head_fwd", 4096),
+        ("sm_100a", "head_mean", 4096),
+        ("sm_100a", "head_fwd", 8192),
+        ("sm_107a", "head_bwd", 5120),
+    ):
+        with pytest.raises(ValueError, match="no exported"):
+            loader.route_module(arch, role, hidden, 16384)
+    with pytest.raises(ValueError, match="is built for hidden 4096, got 5120"):
+        loader.vectors_per_token(
+            loader.MODULES["cake_mhc_det_train_head_bwd__lw64_t384_h4096"], 5120
+        )
+
+
+@pytest.mark.cpu_only
 def test_package_wiring() -> None:
-    """The test-helper key, the build manifest's package, the package data, the ignored ``aot/`` directory, the
-    pre-commit exclude of the generated sources and the manifest checker's row name the package at its path; no
-    key, package data, exclude, checker row or module file is left at the former path."""
-    from tests.test_helpers.cake_package import PACKAGES
+    """The test-helper key, the build manifest's package and libraries, the package data,
+    the pre-commit exclude of the generated sources and the manifest checker's row name the package at
+    its path; no key, package data, exclude, checker row or module file is left at the former path."""
+    from tests.cake.test_helpers.cake_package import PACKAGES
 
     backend = importlib.import_module(BACKEND)
     directory = Path(backend.__file__).resolve().parent
@@ -197,6 +394,12 @@ def test_package_wiring() -> None:
     assert PACKAGES[KEY] == BACKEND and former not in PACKAGES.values()
     manifest = json.loads((directory / "build.json").read_text())
     assert manifest["package"] == BACKEND
+    loader = importlib.import_module(f"{BACKEND}.cake_jit")
+    assert {entry["name"] for entry in manifest["libraries"]} == {
+        loader.library_name(name, arch)
+        for name, record in loader.MODULES.items()
+        for arch in record["arches"]
+    }
     try:
         import tomllib
     except ModuleNotFoundError:  # Python < 3.11
@@ -205,7 +408,6 @@ def test_package_wiring() -> None:
     package_data = data["tool"]["setuptools"]["package-data"]
     assert package_data[BACKEND] == ["csrc/**", "build.json"]
     assert former not in package_data
-    assert "aot/" in (directory / ".gitignore").read_text().split()
     pre_commit = (REPO / ".pre-commit-config.yaml").read_text()
     # pre-commit skips every generated source of the package (a per-package entry or the generic #8928 rule), still
     # checks its Python modules; the former tree holds no sources (the shared exclude may still list its path)

@@ -13,9 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Non-deterministic backend of the Cake four-stream mHC training forward /
+Fused-reduction backend of the Cake four-stream mHC training forward /
 backward (hidden sizes 4096, 5120 and 7168 per call, from ``X``; 4 streams;
-SM100 / SM103, and hidden 4096 on SM107), one self-contained
+SM100 / SM103, and hidden 4096 on SM107; the backward's column-slab pass folds
+``dfn``, ``dscale`` and ``dbase`` itself), one self-contained
 package (host API bodies, the ``cake_jit`` registry, the ``cake_build`` loader
 and the generated CUDA sources under ``csrc/``).  It imports nothing from other
 flashinfer packages and ships its own copy of every program it launches.  The
@@ -23,39 +24,36 @@ user-facing module and documentation are
 :mod:`flashinfer.cake_mhc_nondet_train`, which forwards every entry point
 here.
 
-Numerical contract against the deterministic package: the forward, the
-statistics replay, the residual mixing and ``backward_prepare`` run copies of
-the deterministic programs (the same bits).  ``backward_finish`` runs the
-deterministic token-owner pass, the atomic fn split (beside the token-owner
-pass, as its programmatic dependent) and the atomic column slab (see
-:mod:`.cake_jit`; its dynamic-schedule form, or at the token counts and devices
-the host rule picks, the two-size tail schedule over other chunk sizes): the
-column slab adds the ``dfn`` sum of every (column slab, token chunk) unit into
-``dfn`` with FP32 reductions, so only the summation order of ``dfn`` varies
-from run to run: each element adds its ``P <= 32`` per-chunk partials onto its
-starting value -- zero, or the caller's ``dfn`` under ``accumulate=True`` --
-with at most ``P`` FP32 additions, so it differs from the exact sum of those
-terms by at most about ``P u (|start| + sum |partial|)`` (``u = 2^-24``) and
-two runs by at most twice that (under cancellation, many ulps of the result);
-the FP32 reduction flushes subnormal addends and results to zero.  ``dX`` is
-the deterministic package's
-bits; ``dscale`` and ``dbase`` are the bits of its per-CTA reduction (see
-:mod:`.cake_jit` for the group-row band where they can differ).  There is no
-final reduction kernel, and the backward workspace has no per-chunk ``dfn``
-partial region.
+Numerical contract: every output repeats bit for bit from run to run on one
+device (each sum runs in an order fixed by the token count and the device).
+Against the deterministic package: the forward, the statistics replay, the
+residual mixing and ``backward_prepare`` run copies of the deterministic
+programs (the same bits).  ``backward_finish`` runs the deterministic
+token-owner pass, the atomic fn split (beside the token-owner pass, as its
+programmatic dependent) and the column slab (see :mod:`.cake_jit`; its
+dynamic-schedule form over the deterministic package's token chunks: the
+host rule's two-size tail schedule is calibrated for no device) and no final
+reduction kernel.  ``dX`` is the deterministic package's bits, and so are
+``dscale`` and ``dbase``: the column slab folds the token-owner pass's
+parameter rows in the deterministic reduction's order.  The column slab stores
+the compensated ``dfn`` sum of every (column slab, token chunk) unit, the
+deterministic package's FP32 partial of that unit bit for bit, in its chunk's
+slots of the backward workspace, and once every unit has stored its sums the
+grid folds each element's ``P <= 32`` partials ``x_p`` into ``dfn`` in
+ascending chunk order as a compensated FP32 sum, the caller's ``dfn`` last
+under ``accumulate=True``, with one rounding: within one FP32 rounding of the
+exact sum plus ``O(P^2 u^2) (|start| + sum |x_p|)`` (``u = 2^-24``), no
+addition flushing a subnormal.  The deterministic package sums the same
+partials in FP64 and rounds once, so ``dfn`` is the deterministic package's
+``dfn`` except where the exact sum lies within that last term of an FP32
+rounding boundary.
 
-Mode: the mode is part of the names (``cake_mhc_nondet_train_*``,
-``CakeMHCNondet*Function``); no entry point takes a ``deterministic`` keyword,
-this package has no deterministic path and nothing falls back to one (the
-deterministic package is ``flashinfer.cake_mhc_det_train``).  With
-``torch.use_deterministic_algorithms(True)`` the paths that launch the
-unordered reduction -- :func:`cake_mhc_nondet_train_backward_finish` and the
-backward of the prepare node (:func:`cake_mhc_nondet_train_prepare`) -- raise
-PyTorch's alert for an operation without a deterministic implementation (a
-``RuntimeError``, or a ``UserWarning`` under ``warn_only=True``) right before
-that launch, after their operands pass and only for ``T > 0``, and never fall
-back.  The forward, statistics, ``backward_prepare`` and workspace entry points
-do not alert.
+Mode: the names keep the package's own prefix (``cake_mhc_nondet_train_*``,
+``CakeMHCNondet*Function``); no entry point takes a ``deterministic`` keyword
+and nothing falls back to the deterministic package
+(``flashinfer.cake_mhc_det_train``).  Every entry point runs under
+``torch.use_deterministic_algorithms(True)`` without an alert: no launch adds
+in a run-dependent order.
 """
 
 from __future__ import annotations
@@ -63,7 +61,6 @@ from __future__ import annotations
 import functools
 import math
 import operator
-import warnings
 import weakref
 from typing import Any, Optional
 
@@ -132,30 +129,6 @@ def _require_hidden(hidden: Any, entry: str) -> None:
             f"{entry} supports hidden sizes {HIDDEN_SIZES} (got {hidden!r}); "
             "each architecture's sizes are cake_jit.supported_hidden_sizes(arch)"
         )
-
-
-def _alert_nondeterministic(entry: str) -> None:
-    """PyTorch's alert for an operation without a deterministic implementation, raised by ``entry`` before it
-    launches the unordered reduction while PyTorch's deterministic algorithms are enabled: a ``RuntimeError``, or a
-    ``UserWarning`` under ``torch.use_deterministic_algorithms(True, warn_only=True)`` (the alert of PyTorch's own
-    operators; PyTorch exposes no public Python entry for it).  Fixed-order launches do not alert."""
-
-    if not torch.are_deterministic_algorithms_enabled():
-        return
-    if torch.is_deterministic_algorithms_warn_only_enabled():
-        warnings.warn(
-            f"{entry} does not have a deterministic implementation, but you set "
-            "'torch.use_deterministic_algorithms(True, warn_only=True)'; "
-            "flashinfer.cake_mhc_det_train is the deterministic package",
-            stacklevel=3,
-        )
-        return
-    raise RuntimeError(
-        f"{entry} does not have a deterministic implementation, but you set "
-        "'torch.use_deterministic_algorithms(True)'; flashinfer.cake_mhc_det_train is "
-        "the deterministic package, or use the 'warn_only=True' option if that is acceptable for your "
-        "application"
-    )
 
 
 def _device_index(device: torch.device) -> int:
@@ -463,15 +436,19 @@ def cake_mhc_nondet_train_backward_workspace_bytes(
     """Bytes of the caller-owned backward workspace for up to ``T`` tokens of hidden
     size ``hidden`` on ``device``.
 
-    The ``backward_finish`` route holds one 256-byte ticket region (first, at
-    the same offset for every token count), the transposed BF16 pieces of
-    ``fn``, the per-token records of the token-owner pass (``dz'`` pieces and the
-    per-token scalars, padded to a multiple of 128 rows) and the per-CTA
-    parameter partials: the deterministic package's backward regions at the same
-    offsets without its per-chunk FP32 ``dfn`` partials (``P x 24 x 4H x 4``
-    bytes, ``P <= 32``), so a deterministic backward workspace of the same ``H``
-    also serves this package.  The size is the maximum over every token count up
-    to ``T``; ``hidden`` is the hidden size of the calls the buffer serves, as in
+    The ``backward_finish`` route holds one 256-byte ticket region and the
+    column slab's 512-byte arrival counts (first, at the same offsets for every
+    token count: the first 768 bytes must be zero on first use -- allocate
+    with ``torch.zeros`` or :func:`cake_mhc_nondet_train_backward_workspace`
+    -- and the kernels leave them zero), the transposed BF16 pieces of ``fn``,
+    the per-token records of the token-owner pass (``dz'`` pieces and the
+    per-token scalars, padded to a multiple of 128 rows), the parameter rows
+    of the token-owner pass (per-CTA partials, or 8-token group rows in the
+    group-row band) and the column slab's per-chunk FP32 ``dfn`` slots
+    (``min(32, ceil(T / 64)) x 24 x 4H x 4`` bytes).  The layout is this
+    package's own: a deterministic backward workspace does not serve it.  The
+    size is the maximum over every token count up to ``T``; ``hidden`` is the
+    hidden size of the calls the buffer serves, as in
     :func:`cake_mhc_nondet_train_forward_workspace_bytes` (a buffer sized for one ``H``
     is refused by a call of a larger ``H`` it is too small for).
     """
@@ -511,10 +488,11 @@ def cake_mhc_nondet_train_backward_workspace(
 def cake_mhc_nondet_train_reset_workspace(workspace: torch.Tensor) -> None:
     """Return a workspace to its first-use state after an interrupted launch.
 
-    The kernels' unit tickets self-reset at the end of every launch; a launch
-    that did not complete (an asynchronous error, a cancelled stream capture)
-    can leave them non-zero.  Zeroing the whole buffer restores the contract for
-    every token count the buffer serves; no other region needs a value.
+    The kernels' unit tickets and the column slab's arrival counts self-reset at
+    the end of every launch; a launch that did not complete (an asynchronous
+    error, a cancelled stream capture) can leave them non-zero.  Zeroing the
+    whole buffer restores the contract for every token count the buffer serves;
+    no other region needs a value.
     """
 
     if (
@@ -943,8 +921,9 @@ _CALL_VALUES: dict[str, tuple[str, ...]] = {
 # Logical workspace values -> region names.  The forward fn split writes the
 # forward operand layout only; its transposed-layout pointer is bound to the
 # same region, exactly like the source launcher binds an unused parameter.  The
-# backward's atomic fn split takes the transposed layout only, and the column
-# slab adds into ``dfn`` itself (no per-chunk partial region).
+# backward's atomic fn split takes the transposed layout only; the column slab
+# stores its per-chunk ``dfn`` sums in ``dfn_slot`` and counts the grid's
+# finished units and CTAs in ``slab_cnt``.
 _FWD_WORKSPACE_VALUES = (
     ("fnp", "fnp"),
     ("fnTp", "fnp"),
@@ -964,8 +943,12 @@ _WORKSPACE_VALUES: dict[str, tuple[tuple[str, str], ...]] = {
         ("param_partial", "param_partial"),
         ("dzp_rows", "dzp_rows"),
         ("ticket", "ticket"),
+        ("dfn_slot", "dfn_slot"),
+        ("slab_cnt", "slab_cnt"),
     ),
 }
+# The fast path runs the Sinkhorn count of record only, so the host plan's ``prow`` / ``param_rows`` (the token
+# owner's group rows inside ``BWD_ROW_BANDS``) hold for every fast launch.
 _HOST_VALUES: dict[str, tuple[str, ...]] = {
     "fwd_prepare": ("m_tiles", "log2_pk", "p_k", "t_pad"),
     "fwd_recompute": ("m_tiles", "log2_pk", "p_k", "t_pad"),
@@ -981,6 +964,8 @@ _HOST_VALUES: dict[str, tuple[str, ...]] = {
         "lpt_rows_per_chunk",
         "lpt_big_parts",
         "lpt_small_rows_per_chunk",
+        "param_rows",
+        "prow",
     ),
 }
 
@@ -1696,18 +1681,14 @@ def cake_mhc_nondet_train_backward_finish(
         As in :func:`cake_mhc_nondet_train_forward_prepare` (the epsilons are launch
         arguments; the iteration count is ``1 .. SINKHORN_ITERS_MAX``, default ``20``).
     accumulate : bool
-        ``False`` (default): ``dfn``, ``dscale`` and ``dbase`` are written (the
-        fn split zeroes ``dfn`` before the column slab adds into it).
-        ``True``: the caller passes all three; the column slab adds the ``dfn``
-        sums onto its current values with the same FP32 reductions, and
-        ``dscale`` / ``dbase`` add their current value last in the FP64 fold,
-        rounded once (the order of the deterministic package's per-CTA
-        reduction).
+        ``False`` (default): ``dfn``, ``dscale`` and ``dbase`` are written.
+        ``True``: the caller passes all three; each fold adds the current value
+        last and rounds once (``dfn``: after its compensated sum of the chunk
+        slots; ``dscale`` / ``dbase``: in the deterministic package's order).
     workspace : torch.Tensor, optional
         Caller-owned ``uint8`` buffer from :func:`cake_mhc_nondet_train_backward_workspace`
-        (sized for this ``H``: ``hidden=X.shape[2]``; or a deterministic
-        backward workspace of that ``H``: the regions sit at the same offsets);
-        a per-device default buffer is used when omitted.
+        (sized for this ``H``: ``hidden=X.shape[2]``); a per-device default
+        buffer is used when omitted.
     dX : torch.Tensor, optional
         Preallocated BF16 ``[T, 4, H]`` contiguous output.
     dfn, dscale, dbase : torch.Tensor, optional
@@ -1716,27 +1697,28 @@ def cake_mhc_nondet_train_backward_finish(
 
     Returns
     -------
-    ``(dX, dfn, dscale, dbase)``: the BF16 ``dX`` sums the mapping, collapse and
-    residual-mixing contributions in FP32 and rounds once, bitwise the
-    deterministic package's ``dX``.  ``dscale`` / ``dbase`` are fixed-order FP64
-    folds rounded once, bitwise the deterministic package's per-CTA reduction;
-    where that package sums them over 8-token group rows instead (hidden 4096
-    above 14927 tokens on sm_100a and sm_103a; see :mod:`.cake_jit`), their
-    low-order bits can differ from its results.  ``dfn`` adds the per-unit FP32
-    sums of at most ``P <= 32`` token chunks (the host rule's chunk sizes per
-    token count and device) per element onto its starting value (zero, or the
-    caller's ``dfn`` under ``accumulate=True``) in an order that varies from run
-    to run (at most ``P`` FP32 additions per element, so two runs differ by at
-    most about ``2 P u (|start| + sum |partial|)``, ``u = 2^-24``; the FP32
-    reduction flushes subnormal addends and results to zero).  With ``T == 0``
-    nothing is launched: ``dX`` is empty and the
-    parameter gradients are zeroed (``accumulate=False``) or left untouched
+    ``(dX, dfn, dscale, dbase)``, each the same bits on every run on one
+    device: the BF16 ``dX`` sums the mapping, collapse and residual-mixing
+    contributions in FP32 and rounds once, bitwise the deterministic package's
+    ``dX``.  ``dscale`` / ``dbase`` fold the token-owner pass's parameter rows
+    in the deterministic package's fixed order (per-CTA rows as an FP64 chain,
+    or 8-token group rows as compensated FP32 columns where that package runs
+    them: hidden 4096 above 14927 tokens on sm_100a and sm_103a; see
+    :mod:`.cake_jit`), rounded once, bitwise the deterministic package's.
+    ``dfn`` folds the per-chunk FP32 partials ``x_p`` (bitwise the
+    deterministic package's) of at most ``P <= 32`` token chunks (the
+    deterministic package's chunks per token count and device) per element in
+    ascending chunk order as a compensated FP32 sum, the caller's ``dfn`` last
+    under ``accumulate=True``, rounded once: within one FP32 rounding of the
+    exact sum plus ``O(P^2 u^2) (|start| + sum |x_p|)`` (``u = 2^-24``).
+    It is the deterministic package's ``dfn`` (an FP64 sum of the same
+    partials, rounded once) except where the exact sum lies within that last
+    term of an FP32 rounding boundary.
+    With ``T == 0`` nothing is launched: ``dX`` is empty and the parameter
+    gradients are zeroed (``accumulate=False``) or left untouched
     (``accumulate=True``).
 
-    With ``torch.use_deterministic_algorithms(True)`` the call raises PyTorch's
-    alert for an operation without a deterministic implementation
-    (``RuntimeError``; under ``warn_only=True`` a ``UserWarning``, and the call
-    runs).  The launches run on the current torch stream of the tensors' device.
+    The launches run on the current torch stream of the tensors' device.
     """
 
     return _backward_finish(
@@ -1759,7 +1741,6 @@ def cake_mhc_nondet_train_backward_finish(
         dscale=dscale,
         dbase=dbase,
         path=_PATH_BACKWARD,
-        alert="cake_mhc_nondet_train_backward_finish",
     )
 
 
@@ -1784,15 +1765,11 @@ def _backward_finish(
     dscale: Optional[torch.Tensor],
     dbase: Optional[torch.Tensor],
     path: str,
-    alert: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """:func:`cake_mhc_nondet_train_backward_finish` along ``path`` (``_PATH_BACKWARD`` from
     saved statistics, ``_PATH_CHECKPOINT`` after the forward prefix was replayed: the
     autograd nodes know which): the path fixes the per-call PDL argument of the
-    column-slab record (:func:`cake_jit.enable_pdl`).  ``alert`` names the entry
-    point in PyTorch's deterministic-algorithms alert, raised right before the
-    launches (validated arguments, ``T > 0``): only the column-slab pass's
-    unordered ``dfn`` reduction is non-deterministic."""
+    column-slab record (:func:`cake_jit.enable_pdl`)."""
 
     fast = _fast_forward(
         X, fn, scale, base, rms_eps, hc_eps, sinkhorn_iters, "bwd_finish"
@@ -1822,7 +1799,6 @@ def _backward_finish(
                 dbase = _empty(_BASE_SHAPE, _F32, X)
             route = _fast_route(arch, "bwd_finish", rows, hidden, index, path)
             views = _fast_workspace(workspace, "bwd", rows, hidden, index, X)
-            _alert_nondeterministic(alert)
             _launch_route(
                 route,
                 (
@@ -1883,18 +1859,23 @@ def _backward_finish(
             dbase.zero_()
         return dX, dfn, dscale, dbase
     ws = _workspace_for(workspace, "bwd", rows, hidden, device)
-    _alert_nondeterministic(alert)
     sm = _loader.sm_count(_device_index(device))
     plan = _loader.host_plan(rows, sm, arch, hidden=hidden)
     slab = _loader.slab_plan(rows, sm, arch, hidden=hidden)
+    # The token owner writes the group rows inside BWD_ROW_BANDS at the count of
+    # record; at a run-time Sinkhorn count its run-time-count record writes the
+    # per-CTA rows, which the column slab then folds (prow 0, G6 rows).
+    rows_mode = plan["group_rows"] and int(sinkhorn_iters) == SINKHORN_ITERS
     # The atomic fn split writes the transposed operand layout and, without
     # accumulate, zeroes dfn.  The column-slab pass (the dynr record over the
-    # one-size chunks or the lpt record over the host rule's two-size chunks,
-    # or their slab-fastest _os copies where bwd_slab_order names "slab")
+    # one-size chunks, or its slab-fastest _os copy where bwd_slab_order names
+    # "slab"; no two-size lpt record ships)
     # describes the ``[T, 4, H]`` tensors as ``[T, 4H]``, reads the first
     # ``T`` rows of the padded ``dz'`` record, draws its work units from the
-    # workspace's self-resetting ticket word, adds into dfn and folds dscale /
-    # dbase.
+    # workspace's self-resetting ticket word, stores each unit's compensated
+    # dfn sums in its chunk's slots, folds the slots into dfn across the grid once
+    # every unit is done (the self-resetting slab_cnt words count the units and
+    # the CTAs) and folds dscale / dbase from the token owner's rows.
     values: dict[str, Any] = {
         "fn": fn,
         "fnTp": ws["fnTp"],
@@ -1927,6 +1908,10 @@ def _backward_finish(
         "dscale": dscale,
         "dbase": dbase,
         "chunks": plan["chunks"],
+        "dfn_slot": ws["dfn_slot"],
+        "slab_cnt": ws["slab_cnt"],
+        "prow": 1 if rows_mode else 0,
+        "param_rows": plan["groups"] if rows_mode else plan["chunks"],
         "accumulate": 1 if accumulate else 0,
     }
     _run_route(
@@ -2087,18 +2072,15 @@ def _as_bf16(
 class CakeMHCNondetPrepareFunction(torch.autograd.Function):
     """Autograd node of ``forward_prepare``: ``forward(X, fn, scale, base, state) -> (U, *edges)``.
 
-    Its backward is the non-deterministic ``backward_finish``: it receives
+    Its backward is ``backward_finish``: it receives
     ``dU`` from the external branch and, as the gradients of the edges (outputs
     the finish node takes as inputs), ``dY`` and the gradient statistics from the
     finish node's backward; it returns the single-cast ``dX`` (mapping, collapse
     and residual-mixing contributions summed in FP32) and the FP32 parameter
-    gradients (``dfn`` summed with FP32 reductions in a run-to-run varying
-    order); the finish node returns no gradient for ``X``.  ``state`` is the
-    private state :func:`cake_mhc_nondet_train_prepare` builds.  With
-    ``torch.use_deterministic_algorithms(True)`` when the backward runs, it
-    raises PyTorch's alert named
-    ``CakeMHCNondetPrepareFunction.backward`` (``RuntimeError``; under
-    ``warn_only=True`` a ``UserWarning``, and the backward runs).
+    gradients (``dfn`` folded from its per-chunk slots in a fixed order), each
+    the same bits on every run on one device; the finish node returns no
+    gradient for ``X``.  ``state`` is the private state
+    :func:`cake_mhc_nondet_train_prepare` builds.
     """
 
     @staticmethod
@@ -2164,9 +2146,6 @@ class CakeMHCNondetPrepareFunction(torch.autograd.Function):
             dscale=None,
             dbase=None,
             path=_PATH_BACKWARD if saved else _PATH_CHECKPOINT,
-            # PyTorch's alert when its deterministic algorithms are enabled now
-            # (also when they were enabled after the forward).
-            alert="CakeMHCNondetPrepareFunction.backward",
         )
         return dX, dfn, dscale, dbase, None
 
@@ -2270,9 +2249,7 @@ def cake_mhc_nondet_train_prepare(
     -------
     ``(U, handle)``: BF16 ``U`` and the handle of this prepare node for one
     :func:`cake_mhc_nondet_train_finish`.  The forward runs the deterministic programs'
-    copies and does not alert; the prepare node's backward runs the
-    non-deterministic ``backward_finish`` and raises PyTorch's alert when its
-    deterministic algorithms are enabled at that time (see
+    copies; the prepare node's backward runs ``backward_finish`` (see
     :class:`CakeMHCNondetPrepareFunction`).
     """
 

@@ -47,34 +47,13 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACCUM_OFFSET 0
-#define NUM_TMA_PIPE_STAGES 4
-#define NUM_MAINLOOP_PIPE_STAGES 1
-#define NUM_WORK_PIPE_STAGES 4
-#define SMEM_SMEM_A_OFF 1024
-#define SMEM_SMEM_A_STAGE_BYTES 16384
-#define SMEM_SMEM_A_STRIDE 49152
-#define SMEM_SMEM_B_OFF 17408
-#define SMEM_SMEM_B_STAGE_BYTES 16384
-#define SMEM_SMEM_B_STRIDE 49152
-#define SMEM_SMEM_B1_OFF 33792
-#define SMEM_SMEM_B1_STAGE_BYTES 16384
-#define SMEM_SMEM_B1_STRIDE 49152
-#define SMEM_WORK_RING_OFF 197632
-#define SMEM_WORK_RING_STAGE_BYTES 16
-#define SMEM_WORK_RING_STRIDE 16
-#define SMEM_PROBE_CELL_OFF 197696
-#define SMEM_PROBE_CELL_STAGE_BYTES 16
-#define SMEM_PROBE_CELL_STRIDE 16
-#define SMEM_TOTAL 197760
 #define BLOCK_M 128
 #define BLOCK_N 256
 #define BLOCK_K 64
 #define MMA_K 16
 #define CTA_GROUP 2
 #define NUM_STAGES 4
+#define TMEM_NCOLS 512
 #define NUM_EPILOGUE_WARPS 8
 #define CLUSTER_M 256
 #define EPI_CHUNK 16
@@ -214,7 +193,7 @@ kernel_cake_moe_grouped_det_gemm_6bd667b99e236d0c69df(const __grid_constant__ CU
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_a = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_a_addr = smem + 1024;
     __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -226,8 +205,7 @@ kernel_cake_moe_grouped_det_gemm_6bd667b99e236d0c69df(const __grid_constant__ CU
     unsigned int* probe_cell = reinterpret_cast<unsigned int*>(smem_raw + 197696);
     const int probe_cell_addr = smem + 197696;
 
-    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 20 barriers)
-    // Mbarriers at smem_raw[0..160)
+    // Mbarrier init (20 barriers at smem_raw[0..160))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -283,10 +261,8 @@ kernel_cake_moe_grouped_det_gemm_6bd667b99e236d0c69df(const __grid_constant__ CU
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
 
     // ---- Role: load ----
     if (warp == 0) {
@@ -316,10 +292,10 @@ kernel_cake_moe_grouped_det_gemm_6bd667b99e236d0c69df(const __grid_constant__ CU
             unsigned int near = 0;
             if (cta_rank == 0) {
                 unsigned long long base = (unsigned long long)sched;
-                unsigned int chunk_a = (unsigned int)((base + 8319 & 18446744073709543424) - base) >> 2;
+                unsigned int chunk_a = (unsigned int)((base + 8319ull & 18446744073709543424ull) - base) >> 2;
                 unsigned int word_a = chunk_a + (unsigned int)cluster_id % 32 * 32;
-                unsigned long long lat_a = 4294967295;
-                unsigned long long lat_b = 4294967295;
+                unsigned long long lat_a = 4294967295ll;
+                unsigned long long lat_b = 4294967295ll;
                 #pragma unroll
                 for (int _rnd = 0; _rnd < 2; _rnd++) {
                     unsigned long long t0_0;
@@ -485,7 +461,7 @@ kernel_cake_moe_grouped_det_gemm_6bd667b99e236d0c69df(const __grid_constant__ CU
                     if (retired == (unsigned int)num_clusters - 1) {
                         __threadfence();
                         sched[0] = 0;
-                        sched[1] = 2147483648;
+                        sched[1] = 2147483648ll;
                         sched[2] = 0;
                     }
                 }

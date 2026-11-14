@@ -1230,6 +1230,27 @@ def _with_pdl_spec(
     return PrimsTsConfigSpec(kwargs=kwargs)
 
 
+def _with_spec_overrides_pair(
+    pair: PrimsTsGemmPair, **overrides: int
+) -> PrimsTsGemmPair:
+    """Return ``pair`` with ``overrides`` applied to both FC1 and FC2 specs."""
+
+    def _apply(gemm: PrimsTsMoeGemmConfig) -> PrimsTsMoeGemmConfig:
+        kwargs = dict(gemm.cfg.kwargs)
+        kwargs.update(overrides)
+        return PrimsTsMoeGemmConfig(
+            cfg=PrimsTsConfigSpec(kwargs=kwargs),
+            prims_ts_gemm_config_index=gemm.prims_ts_gemm_config_index,
+        )
+
+    return PrimsTsGemmPair(
+        tile_n=pair.tile_n,
+        moe_config_index=pair.moe_config_index,
+        fc1=_apply(pair.fc1),
+        fc2=_apply(pair.fc2),
+    )
+
+
 def _with_pdl_pair(pair: PrimsTsGemmPair, *, enable_pdl: bool) -> PrimsTsGemmPair:
     return PrimsTsGemmPair(
         tile_n=pair.tile_n,
@@ -1277,6 +1298,7 @@ def _make_json_moe_config_pair(
     has_gemm1_beta: bool = False,
     has_gemm1_clamp_limit: bool = False,
     enable_pdl: bool = False,
+    deepseek_fp8_block_size: int = 128,
 ) -> PrimsTsGemmPair | None:
     json_pair = _resolve_moe_json_config_pair(
         tile_n,
@@ -1300,7 +1322,7 @@ def _make_json_moe_config_pair(
         return None
 
     fc1_json, fc2_json = json_pair
-    return _with_pdl_pair(
+    pair = _with_pdl_pair(
         PrimsTsGemmPair(
             tile_n=tile_n,
             moe_config_index=moe_config_index,
@@ -1348,6 +1370,13 @@ def _make_json_moe_config_pair(
         ),
         enable_pdl=enable_pdl,
     )
+    if use_deepseek_fp8:
+        # The tactic rows are block-agnostic; the scale block comes from the
+        # call's scale shapes.
+        pair = _with_spec_overrides_pair(
+            pair, deepseek_fp8_block_size=deepseek_fp8_block_size
+        )
+    return pair
 
 
 def _task_manager_smem_bytes(manager: object) -> int | None:
@@ -1504,6 +1533,7 @@ def _make_default_json_moe_config_pair(
     num_tokens: int | None = None,
     top_k: int | None = None,
     num_experts: int | None = None,
+    deepseek_fp8_block_size: int = 128,
     prefer_persistent_scheduler: bool = False,
 ) -> PrimsTsGemmPair | None:
     fc1_indices = _moe_json_passing_indices(
@@ -1577,6 +1607,7 @@ def _make_default_json_moe_config_pair(
         has_gemm1_beta=has_gemm1_beta,
         has_gemm1_clamp_limit=has_gemm1_clamp_limit,
         enable_pdl=enable_pdl,
+        deepseek_fp8_block_size=deepseek_fp8_block_size,
     )
 
 
@@ -2380,8 +2411,14 @@ def map_trtllm_deepseek_fp8_moe_tactic(
     num_experts: int | None = None,
     enable_pdl: bool = False,
     weight_layout: int = int(WeightLayout.MajorK),
+    deepseek_fp8_block_size: int = 128,
 ) -> PrimsTsGemmPair:
-    """Return Prims-TS FC1/FC2 configs for Prims-TS DeepSeek FP8 MoE."""
+    """Return Prims-TS FC1/FC2 configs for Prims-TS DeepSeek FP8 MoE.
+
+    ``deepseek_fp8_block_size`` is the side of the square FP32 scale block,
+    ``128`` (the DeepSeek checkpoint layout) or ``32`` (vLLM's re-blocked
+    TP shards).
+    """
 
     tile_n, moe_config_index = _parse_tactic(
         tactic,
@@ -2413,4 +2450,5 @@ def map_trtllm_deepseek_fp8_moe_tactic(
         use_deepseek_fp8=True,
         enable_pdl=enable_pdl,
         weight_layout=weight_layout,
+        deepseek_fp8_block_size=deepseek_fp8_block_size,
     )

@@ -98,7 +98,7 @@ kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl_trows(float* __restrict__ d
     int b = bid;
     int tid_0 = tid;
     if (b >= 27) {
-        long long e0 = (long long)((b - 27) * 256 + tid_0) * 4;
+        long long e0 = (long long)((b - 27) * 256 + tid_0) * 4ll;
         float out[4];
         double a[4];
         #pragma unroll
@@ -126,7 +126,7 @@ kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl_trows(float* __restrict__ d
                 unsigned _v4_1_2;
                 unsigned _v4_1_3;
                 asm volatile("ld.global.nc.L2::cache_hint.v4.b32 {%0, %1, %2, %3}, [%4], %5;"
-                    : "=r"(_v4_1_0), "=r"(_v4_1_1), "=r"(_v4_1_2), "=r"(_v4_1_3) : "l"((const void*)(dfn_part + ((long long)p * 393216 + e0) + (0))), "l"(0x12F0000000000000ULL));
+                    : "=r"(_v4_1_0), "=r"(_v4_1_1), "=r"(_v4_1_2), "=r"(_v4_1_3) : "l"((const void*)(dfn_part + ((long long)p * 393216ll + e0) + (0))), "l"(0x12F0000000000000ULL));
                 vec_load[0 + 0] = __uint_as_float(_v4_1_0);
                 vec_load[0 + 1] = __uint_as_float(_v4_1_1);
                 vec_load[0 + 2] = __uint_as_float(_v4_1_2);
@@ -536,7 +536,7 @@ kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl_trows(float* __restrict__ d
                     fl[0] = _add_65;
                     fh[0] = add_7;
                 } else {
-                    float csv = dscale[col64 - 24];
+                    float csv = dscale[col64 - 24ll];
                     float add_8;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(add_8) : "f"(fh[0]), "f"(csv));
                     float sub_8;
@@ -562,7 +562,7 @@ kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl_trows(float* __restrict__ d
             if (b < 24) {
                 *(reinterpret_cast<float*>(dbase + col64) + (0)) = res;
             } else {
-                *(reinterpret_cast<float*>(dscale + (col64 - 24)) + (0)) = res;
+                *(reinterpret_cast<float*>(dscale + (col64 - 24ll)) + (0)) = res;
             }
         }
     }

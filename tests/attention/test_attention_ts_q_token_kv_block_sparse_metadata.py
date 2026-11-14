@@ -388,7 +388,10 @@ def test_q_token_kv_block_sparse_wrapper_matches_plan_run_grammar() -> None:
         "sm_scale",
         "v_scale",
         "out",
+        "validate",
     )
+    assert run_parameters["validate"].default is True
+    assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["token_to_request"].default is None
     assert run_parameters["query_positions"].default is None
 
@@ -959,11 +962,36 @@ def _reference(
 def _assert_metadata_matches(
     actual: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     expected: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    query_major_memberships: bool = False,
 ) -> None:
     """Compare the observable live route prefix of compact QToken-KvBlock-Sparse-Attention metadata."""
 
     actual_indices, actual_memberships, actual_seq_lens = actual
     expected_indices, expected_memberships, expected_seq_lens = expected
+    if query_major_memberships:
+        # Normalize private query bitplanes to the public per-page bytes.
+        planes = actual_memberships.reshape(actual_memberships.shape[0], -1, 8).to(
+            torch.int64
+        )
+        bits = torch.arange(32, device=actual_memberships.device)
+        queries = torch.arange(8, device=actual_memberships.device)
+        page_bytes = (
+            (((planes[..., None] >> bits) & 1) << queries[None, None, :, None])
+            .sum(2)
+            .to(torch.uint8)
+            .reshape(actual_memberships.shape[0], -1)
+        )
+        for row, length in enumerate(actual_seq_lens.cpu().tolist()):
+            pages = (length + 3) // 4
+            assert torch.all(page_bytes[row, pages : (pages + 31) // 32 * 32] == 0)
+        actual_indices = actual_indices[:, : expected_indices.shape[1]]
+        # Public membership words include padding when capacity is not /4.
+        actual_memberships = (
+            page_bytes[:, : expected_memberships.shape[1] * 4]
+            .contiguous()
+            .view(torch.int32)
+        )
     assert actual_indices.shape == expected_indices.shape
     assert actual_memberships.shape == expected_memberships.shape
     torch.testing.assert_close(actual_seq_lens, expected_seq_lens)
@@ -2282,6 +2310,7 @@ def test_q_token_kv_block_sparse_attention_hides_workspace_metadata(
             views.seq_lens,
         ),
         expected,
+        query_major_memberships=workspace_layout.query_major_memberships,
     )
     assert scratch.data_ptr() > q_token_kv_block_sparse_page_indices.data_ptr()
 
@@ -2914,27 +2943,15 @@ def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scra
         storage_page_size,
         group_size,
     )
-    actual_indices = views.q_token_kv_block_sparse_page_indices
-    actual_members = views.q_token_kv_block_sparse_page_memberships
-    if layout.query_major_memberships:
-        # Normalize the private representation for the independent semantic
-        # reference; do not reinterpret public metadata outputs as query words.
-        planes = actual_members.reshape(actual_members.shape[0], -1, 8).to(torch.int64)
-        bits = torch.arange(32, device="cuda")
-        queries = torch.arange(8, device="cuda")
-        page_bytes = (
-            (((planes[..., None] >> bits) & 1) << queries[None, None, :, None])
-            .sum(2)
-            .to(torch.uint8)
-            .reshape(actual_members.shape[0], -1)
-        )
-        for row, length in enumerate(views.seq_lens.cpu().tolist()):
-            pages = (length + 3) // 4
-            assert torch.all(page_bytes[row, pages : (pages + 31) // 32 * 32] == 0)
-        columns = expected[0].shape[1]
-        actual_indices = actual_indices[:, :columns]
-        actual_members = page_bytes[:, :columns].contiguous().view(torch.int32)
-    _assert_metadata_matches((actual_indices, actual_members, views.seq_lens), expected)
+    _assert_metadata_matches(
+        (
+            views.q_token_kv_block_sparse_page_indices,
+            views.q_token_kv_block_sparse_page_memberships,
+            views.seq_lens,
+        ),
+        expected,
+        query_major_memberships=layout.query_major_memberships,
+    )
 
     replacement_query = query.clone()
     replacement_blocks = blocks.clone()
@@ -3863,6 +3880,7 @@ def test_q_token_kv_block_sparse_attention_unified_workspace_matches_two_step_cu
             ],
             raw_metadata[2],
         ),
+        query_major_memberships=unified_layout.query_major_memberships,
     )
     torch.testing.assert_close(
         _as_lower_level_decode_view(unified_output),
@@ -3889,6 +3907,17 @@ def test_q_token_kv_block_sparse_attention_unified_workspace_matches_two_step_cu
         kv_dtype=k_cache.dtype,
         out_dtype=graph_output.dtype,
     )
+    with pytest.raises(RuntimeError, match="validate=True"):
+        graph_wrapper.run(
+            query,
+            (k_cache, v_cache),
+            table,
+            blocks,
+            requests,
+            positions,
+            out=graph_output,
+            validate=False,
+        )
     graph_wrapper.run(
         query,
         (k_cache, v_cache),
@@ -3908,6 +3937,7 @@ def test_q_token_kv_block_sparse_attention_unified_workspace_matches_two_step_cu
             requests,
             positions,
             out=graph_output,
+            validate=False,
         )
     graph.replay()
     torch.cuda.synchronize()
@@ -5142,7 +5172,7 @@ def test_qtoken_global_scales_graph_replay():
 @_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize("updated_scale", (0, 1), ids=("qk", "v"))
 def test_qtoken_persistent_direct_q1_pdl_scales(updated_scale):
-    from tests.test_helpers.pdl import late_store
+    from tests.utils.test_helpers.pdl import late_store
 
     values = (0.125, 0.75)
     scales = tuple(torch.tensor(value, device="cuda") for value in values)
@@ -5168,7 +5198,7 @@ def test_qtoken_persistent_direct_q1_pdl_scales(updated_scale):
 
 @_REQUIRES_PRIMS_TS_ATTENTION
 def test_qtoken_direct_q1_pdl_query_offsets():
-    from tests.test_helpers.pdl import late_store
+    from tests.utils.test_helpers.pdl import late_store
 
     wrapper, run, check, offsets, out = _global_scale_qtoken_case(
         (0.125, 0.75),

@@ -50,9 +50,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define THREADS 256
-
 #include <math_constants.h>
 
 
@@ -94,13 +91,15 @@ kernel_cake_mhc_det_train_head_fwd(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
 
     // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    unsigned int vectors = (unsigned int)T * ((uint32_t)(hv.divisor));
-    unsigned int v = (unsigned int)bid * 256 + (unsigned int)tid;
-    if (v < vectors) {
-        uint32_t token = (hv.divisor != 1) ? (__umulhi((uint32_t)(v), hv.multiplier) >> hv.shift_right) : (uint32_t)(v);
-        uint32_t col = (uint32_t)(v) - token * (uint32_t)(hv.divisor);
-        long long row = (long long)((uint32_t)(hv.divisor)) * 8;
-        long long xbase = (long long)token * (row * 4) + (long long)col * 8;
+    uint32_t cta_q = (hv.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)bid), hv.multiplier) >> hv.shift_right) : (uint32_t)((unsigned int)bid);
+    uint32_t cta_r = (uint32_t)((unsigned int)bid) - cta_q * (uint32_t)(hv.divisor);
+    unsigned int within = cta_r * 256 + (unsigned int)tid;
+    uint32_t sub = (hv.divisor != 1) ? (__umulhi((uint32_t)(within), hv.multiplier) >> hv.shift_right) : (uint32_t)(within);
+    uint32_t col = (uint32_t)(within) - sub * (uint32_t)(hv.divisor);
+    unsigned int token = cta_q * 256 + sub;
+    if (token < (unsigned int)T) {
+        long long row = (long long)((uint32_t)(hv.divisor)) * 8ll;
+        long long xbase = (long long)token * (row * 4ll) + (long long)col * 8ll;
         unsigned int words[16];
         {
             uint32_t _uv4_0_0;
@@ -132,7 +131,7 @@ kernel_cake_mhc_det_train_head_fwd(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
             uint32_t _uv4_2_2;
             uint32_t _uv4_2_3;
             asm volatile("ld.global.L1::no_allocate.v4.b32 {%0, %1, %2, %3}, [%4];"
-                : "=r"(_uv4_2_0), "=r"(_uv4_2_1), "=r"(_uv4_2_2), "=r"(_uv4_2_3) : "l"((const void*)(reinterpret_cast<unsigned int*>(x + (xbase + row * 2)) + (0))) : "memory");
+                : "=r"(_uv4_2_0), "=r"(_uv4_2_1), "=r"(_uv4_2_2), "=r"(_uv4_2_3) : "l"((const void*)(reinterpret_cast<unsigned int*>(x + (xbase + row * 2ll)) + (0))) : "memory");
             words[8 + 0] = _uv4_2_0;
             words[8 + 1] = _uv4_2_1;
             words[8 + 2] = _uv4_2_2;
@@ -144,7 +143,7 @@ kernel_cake_mhc_det_train_head_fwd(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
             uint32_t _uv4_3_2;
             uint32_t _uv4_3_3;
             asm volatile("ld.global.L1::no_allocate.v4.b32 {%0, %1, %2, %3}, [%4];"
-                : "=r"(_uv4_3_0), "=r"(_uv4_3_1), "=r"(_uv4_3_2), "=r"(_uv4_3_3) : "l"((const void*)(reinterpret_cast<unsigned int*>(x + (xbase + row * 3)) + (0))) : "memory");
+                : "=r"(_uv4_3_0), "=r"(_uv4_3_1), "=r"(_uv4_3_2), "=r"(_uv4_3_3) : "l"((const void*)(reinterpret_cast<unsigned int*>(x + (xbase + row * 3ll)) + (0))) : "memory");
             words[12 + 0] = _uv4_3_0;
             words[12 + 1] = _uv4_3_1;
             words[12 + 2] = _uv4_3_2;
@@ -303,7 +302,7 @@ kernel_cake_mhc_det_train_head_fwd(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
             : "=&f"(acc3_3[0]), "=&f"(acc3_3[1]) : "r"(words[15]), "f"(acc2_3[0]), "f"(acc2_3[1]));
         unsigned int mean_3 = __as_u32(__float22bfloat162_rn(make_float2(mul_f32_rn_noftz(acc3_3[0], 0.25f), mul_f32_rn_noftz(acc3_3[1], 0.25f))));
         out[3] = mean_3;
-        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(y + ((long long)v * 8)))[0] = reinterpret_cast<int4*>(out)[0];
+        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(y + ((long long)token * row + (long long)col * 8ll)))[0] = reinterpret_cast<int4*>(out)[0];
     }
 }
 

@@ -65,7 +65,7 @@ import statistics
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_nondet_train")
 loader = cake_package("cake_rmsnorm_nondet_train", "cake_jit")
@@ -605,7 +605,11 @@ def _instances() -> list[tuple[str, int, bool, str, int, int | None, int, str]]:
                 if at_most is None
                 else (above + 1 + int(at_most)) // 2
             )
-            form = "single" if rule["kind"] == "claim_sum_f64" else "pair"
+            form = (
+                "single"
+                if rule["kind"] in ("claim_sum_f64", "claim_part_f32")
+                else "pair"
+            )
             out.append((route, hidden, residual, token, above, at_most, rows, form))
     return sorted(set(out), key=lambda item: (item[0], item[4]))
 

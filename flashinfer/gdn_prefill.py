@@ -281,6 +281,29 @@ def _cake_gdn_prefill_launch_metadata(
     return values if metadata_i64 else _cake_gdn_prefill_i32(values)
 
 
+_CAKE_GDN_STATE_VEC_BYTES = 16
+
+
+def _cake_gdn_state_vec_aligned(
+    slot_states: tuple[tuple[torch.Tensor, int], ...], checkpoints: torch.Tensor
+) -> bool:
+    """Whether every state vector access of one launch is 16-byte aligned.
+
+    A tile's state address is ``data_ptr + (slot * slot_stride + head * 16384) *
+    esize`` plus a 16-byte multiple; ``head * 16384 * esize`` is a 16-byte
+    multiple for every state dtype, so all slots are aligned iff the pointer and
+    ``slot_stride * esize`` are.  Checkpoint rows are dense (``H * 16384``
+    elements apart): their pointer decides.  Host values only: no device read or
+    allocation; capture and replay see the same pointers.
+    """
+
+    mask = _CAKE_GDN_STATE_VEC_BYTES - 1
+    for tensor, slot_stride in slot_states:
+        if (tensor.data_ptr() | (slot_stride * tensor.element_size())) & mask:
+            return False
+    return (checkpoints.data_ptr() & mask) == 0
+
+
 # Per-call device-side slot validation, same default as ``gdn_decode.py``: the
 # ``torch._assert_async`` chain expands to four elementwise kernels plus the
 # ``_assert_async_cuda_kernel`` and exposes ~40 us of launch gaps around a
@@ -676,7 +699,6 @@ def _run_cake_gdn_prefill(
         # twin without its initial-state prefetch where that grid gives each CTA one tile.
         sm_count=_cake_gdn_sm_count(device_index),
     )
-    entry = _cake_gdn.load_cake_gdn_kernel(route.variant_name, arch)
     dvsplit = route.route_id.endswith(".dvsplit")
     total_tiles = num_seqs * num_o_heads * (2 if dvsplit else 1)
     # The device's SM count and, with ``cu_seqlens_cpu``, the host sequence
@@ -726,6 +748,31 @@ def _run_cake_gdn_prefill(
             checkpoint_cu_starts, metadata_i64=metadata_i64
         )
     )
+    initial_slot_stride = (
+        int(initial_state.stride(0))
+        if initial_state is not None
+        else num_o_heads * 16384
+    )
+    output_slot_stride = (
+        int(output_state.stride(0))
+        if output_final_state and output_state is not None
+        else num_o_heads * 16384
+    )
+    # A 16-byte-aligned launch runs the unguarded body; an element-aligned one the
+    # guarded flavor (bit-identical, ``CAKE_GDN_STATE_VEC_ALIGNED=0``).  The aligned
+    # call omits the keyword (one loader cache entry per flavor).
+    if _cake_gdn_state_vec_aligned(
+        (
+            (launch_initial_state, initial_slot_stride),
+            (launch_output_state, output_slot_stride),
+        ),
+        launch_checkpoints,
+    ):
+        entry = _cake_gdn.load_cake_gdn_kernel(route.variant_name, arch)
+    else:
+        entry = _cake_gdn.load_cake_gdn_kernel(
+            route.variant_name, arch, state_vec_aligned=False
+        )
     tensormap_workspace = _cake_gdn_tensormap_workspace(
         device_index, torch.cuda.current_stream(device_index).cuda_stream, grid_x
     )
@@ -743,12 +790,8 @@ def _run_cake_gdn_prefill(
         launch_checkpoints,
         cu_checkpoints_i32,
         tensormap_workspace,
-        int(initial_state.stride(0))
-        if initial_state is not None
-        else num_o_heads * 16384,
-        int(output_state.stride(0))
-        if output_final_state and output_state is not None
-        else num_o_heads * 16384,
+        initial_slot_stride,
+        output_slot_stride,
         checkpoint_every_n_tokens,
         scale,
         num_seqs,
@@ -1434,7 +1477,14 @@ def chunk_gated_delta_rule(
         optional; ``state_indices`` pools need both. Checkpoints are limited
         to the frozen FP16-I/O FP32-state packed contract without an initial
         state and to the SGLang TP4 (H=4, HV=8) BF16-I/O BF16-state indexed
-        DV-split contract at 64-token intervals. The frozen
+        DV-split contract at 64-token intervals. State rows must be dense
+        ``[H, 128, 128]`` (strides ``(stride(0), 16384, 128, 1)``); the data
+        pointers of ``initial_state``, ``output_state`` and
+        ``state_checkpoints`` and the slot stride ``stride(0)`` of
+        ``initial_state`` and ``output_state`` need only be element-aligned,
+        not 16-byte aligned (sliced, offset or padded state pools give the
+        same bits as 16-byte-aligned buffers): 16-byte-aligned state runs the
+        unguarded body, element-aligned state a bit-identical guarded twin. The frozen
         ``(HEAD_GROUP_LOG2, IS_GQA, NUM_O_HEADS_LOG2)`` geometry set of each
         contract is enumerated by
         :func:`flashinfer.jit.cake_gdn.cake_gdn_prefill_geometries` from
@@ -1577,7 +1627,7 @@ def chunk_gated_delta_rule(
     - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
       (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
-    - Requires SM8x (Ampere), SM90 (Hopper), SM100 (Blackwell) or SM120. The
+    - Requires SM8x (Ampere), SM90 (Hopper), SM100/SM103 (Blackwell), SM107 or SM120. The
       SM100 path requires ``head_size == 128``. On SM100/SM103, ``gdn_cp``
       supports structurally legal equal-head, GQA, and GVA shapes on
       CUDA 12.8, CUDA 12.9, and CUDA 13; SM107 supports the same shapes with

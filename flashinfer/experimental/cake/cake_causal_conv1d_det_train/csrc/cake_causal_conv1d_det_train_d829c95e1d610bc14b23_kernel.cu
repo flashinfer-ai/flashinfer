@@ -219,7 +219,7 @@ kernel_cake_causal_conv1d_det_train_d829c95e1d610bc14b23(__nv_bfloat16* __restri
             for (int j = 0; j < 8; j++) {
                 {
                     uint2 _vld_0;
-                    _vld_0 = *reinterpret_cast<const uint2*>(reinterpret_cast<const __nv_bfloat16*>(w) + ((long long)c0 + (long long)j) * 4);
+                    _vld_0 = *reinterpret_cast<const uint2*>(reinterpret_cast<const __nv_bfloat16*>(w) + ((long long)c0 + (long long)j) * 4ll);
                     uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0);
                     #pragma unroll
                     for (int _pair = 0; _pair < 2; _pair++) {
@@ -232,7 +232,7 @@ kernel_cake_causal_conv1d_det_train_d829c95e1d610bc14b23(__nv_bfloat16* __restri
             #pragma unroll
             for (int j_1 = 0; j_1 < 8; j_1++) {
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<const float*>(w) + ((long long)c0 + (long long)j_1) * 4);
+                    float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<const float*>(w) + ((long long)c0 + (long long)j_1) * 4ll);
                     wr[j_1 * 4 + 0] = _v4.x;
                     wr[j_1 * 4 + 1] = _v4.y;
                     wr[j_1 * 4 + 2] = _v4.z;

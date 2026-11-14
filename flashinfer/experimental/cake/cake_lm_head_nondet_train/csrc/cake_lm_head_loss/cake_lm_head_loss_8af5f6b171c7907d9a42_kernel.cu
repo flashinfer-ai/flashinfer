@@ -72,13 +72,13 @@ kernel_cake_lm_head_loss_8af5f6b171c7907d9a42(float* __restrict__ stats, __nv_bf
     int t = row0 + r_safe;
     long long lbl = labels[t];
     long long v64 = (long long)V;
-    unsigned long long stat_row = (unsigned long long)r_safe * (unsigned long long)num_tiles * 2;
+    unsigned long long stat_row = (unsigned long long)r_safe * (unsigned long long)num_tiles * 2ull;
     float m = -3.4028235e+38f;
     #pragma unroll 4
     for (int i = lane_0; i < num_tiles; i += 32) {
         float _vec_load_0[2];
         {
-            float2 _v2_0 = *reinterpret_cast<const float2*>(stats + (stat_row + (unsigned long long)i * 2) + 0);
+            float2 _v2_0 = *reinterpret_cast<const float2*>(stats + (stat_row + (unsigned long long)i * 2ull) + 0);
             _vec_load_0[0] = _v2_0.x;
             _vec_load_0[0 + 1] = _v2_0.y;
         }
@@ -93,7 +93,7 @@ kernel_cake_lm_head_loss_8af5f6b171c7907d9a42(float* __restrict__ stats, __nv_bf
     for (int i_1 = lane_0; i_1 < num_tiles; i_1 += 32) {
         float _vec_load_1[2];
         {
-            float2 _v2_1 = *reinterpret_cast<const float2*>(stats + (stat_row + (unsigned long long)i_1 * 2) + 0);
+            float2 _v2_1 = *reinterpret_cast<const float2*>(stats + (stat_row + (unsigned long long)i_1 * 2ull) + 0);
             _vec_load_1[0] = _v2_1.x;
             _vec_load_1[0 + 1] = _v2_1.y;
         }
@@ -108,7 +108,7 @@ kernel_cake_lm_head_loss_8af5f6b171c7907d9a42(float* __restrict__ stats, __nv_bf
     float lse_v = row_max + _log_3;
     long long zero64 = (long long)0;
     long long last64 = v64 - (long long)1;
-    long long lbl_lo = ((lbl >= 0) ? lbl : zero64);
+    long long lbl_lo = ((lbl >= 0ll) ? lbl : zero64);
     long long lbl_idx = ((lbl_lo < v64) ? lbl_lo : last64);
     unsigned long long z_off = (unsigned long long)r_safe * (unsigned long long)V + (unsigned long long)lbl_idx;
     float _vec_load_2[1];
@@ -117,24 +117,24 @@ kernel_cake_lm_head_loss_8af5f6b171c7907d9a42(float* __restrict__ stats, __nv_bf
         _vec_load_2[0] = __bfloat162float(_bf16_4);
     }
     float zy = _vec_load_2[0];
-    float logp_v = ((lbl >= 0) ? zy - lse_v : 0.0f);
+    float logp_v = ((lbl >= 0ll) ? zy - lse_v : 0.0f);
     float term_v = 0.0f;
     float d_v = 0.0f;
     if (mode == 0) {
         term_v = logp_v;
-        d_v = ((lbl >= 0) ? -1.0f / loss_div : 0.0f);
+        d_v = ((lbl >= 0ll) ? -1.0f / loss_div : 0.0f);
     }
     if (mode == 1) {
         float w = loss_weights[t];
         float ratio = expf(logp_v - infer_logp[t]);
         float clipped = ((ratio < 2.0f) ? ratio : 2.0f);
-        term_v = ((lbl >= 0) ? w * clipped : 0.0f);
+        term_v = ((lbl >= 0ll) ? w * clipped : 0.0f);
         float d_grad = ((ratio <= 2.0f) ? (-w) * ratio : 0.0f);
-        d_v = ((lbl >= 0) ? d_grad : 0.0f);
+        d_v = ((lbl >= 0ll) ? d_grad : 0.0f);
     }
     if (mode == 2) {
         float d_ext = d_in[t];
-        d_v = ((lbl >= 0) ? d_ext : 0.0f);
+        d_v = ((lbl >= 0ll) ? d_ext : 0.0f);
     }
     if (active == 1) {
         if (lane_0 == 0) {

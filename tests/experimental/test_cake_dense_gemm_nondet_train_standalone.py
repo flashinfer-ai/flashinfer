@@ -24,8 +24,10 @@ package under its own name, and its ``cake_backend``, ``cake_jit`` and
 ``cake_build`` import without any ``flashinfer`` module.  With the deterministic
 directory loaded as a top-level package beside it, the first use resolves that
 sibling; without it, importing still succeeds and the first use raises an
-``ImportError`` that names the missing directory.  CPU only: no GPU, no
-generated program and no JIT build.
+``ImportError`` that names the missing directory.  With both directories, the
+planners of both packages run under the blocker, and loading a program that is
+not prebuilt raises the error that names the missing FlashInfer JIT.  CPU only:
+no GPU, no generated program and no JIT build.
 """
 
 import json
@@ -38,7 +40,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 tvm_ffi = pytest.importorskip("tvm_ffi")  # cake_backend imports it at module level
 
@@ -55,7 +57,8 @@ def _dependency_paths() -> list[str]:
     return list(dict.fromkeys(paths))
 
 
-_STANDALONE = r"""
+# The child's preamble: ``flashinfer`` blocked, the two directories loadable as top-level packages.
+_BLOCKED = r"""
 import importlib
 import importlib.abc
 import importlib.util
@@ -95,8 +98,11 @@ def flashinfer_modules():
     return sorted(
         n for n, m in sys.modules.items() if (n == "flashinfer" or n.startswith("flashinfer.")) and m is not None
     )
+"""
 
-
+_STANDALONE = (
+    _BLOCKED
+    + r"""
 nd = load_top_level(ND_DIR)
 det = load_top_level(DET_DIR) if DET_DIR else None
 backend, jit, build = (importlib.import_module(f"{nd.__name__}.{sub}") for sub in ("cake_backend", "cake_jit", "cake_build"))
@@ -123,15 +129,76 @@ else:
 facts["flashinfer_after_use"] = flashinfer_modules()
 print(json.dumps(facts))
 """
+)
 
 
-def _standalone(det_dir: str) -> dict:
+# Under the blocker, with the deterministic directory beside it: the planners of both packages on CPU views (no
+# device: the architecture and SM count given), then the load of each plan's program -- no library is prebuilt in the
+# checkout, and the fallback to FlashInfer's JIT is blocked.
+_PLANS = (
+    _BLOCKED
+    + r"""
+import torch
+
+nd, det = load_top_level(ND_DIR), load_top_level(DET_DIR)
+backend, jit, build = (importlib.import_module(f"{nd.__name__}.{sub}") for sub in ("cake_backend", "cake_jit", "cake_build"))
+det_jit = importlib.import_module(f"{det.__name__}.cake_jit")
+det_build = importlib.import_module(f"{det.__name__}.cake_build")
+arch, sm_count, l2_bytes = "sm_103a", 152, 126 << 20
+bf16, T, K, N, E = torch.bfloat16, 1000, 4096, 128, 256
+X, W, G = torch.empty(T, K, dtype=bf16), torch.empty(N, K, dtype=bf16), torch.empty(T, N, dtype=bf16)
+facts = {}
+
+
+def load(name, record):
+    # the program's load: the prebuilt library when present, else FlashInfer's JIT (blocked)
+    library = record[0].library_name(name, arch)
+    if record[1].prebuilt_path(library).is_file():
+        return ["prebuilt", library]
+    try:
+        record[2](name, arch)
+    except Exception as exc:
+        return [type(exc).__name__, str(exc), isinstance(exc.__cause__, ImportError), library]
+    return ["loaded", library]
+
+
+# this package's weight-gradient program at an explicit split count: the transposed-store GEMM X.T @ G
+plan = backend.cake_dense_gemm_nondet_train_projection_plan(
+    X.t(), G, torch.empty(N, K), transposed_out=True, splits=2, arch=arch, sm_count=sm_count
+)
+facts["wgrad_plan"] = [type(plan).__name__, plan.template, plan.splits, plan.reproducible]
+facts["wgrad_load"] = load(jit.select_module(arch, plan.template), (jit, build, jit.load_cake_dense_projection_gemm_module))
+# a forward: the deterministic package's plan (its planner, resolved as the sibling)
+dplan = backend.cake_dense_gemm_nondet_train_projection_plan(
+    X, W.t(), torch.empty(T, N, dtype=bf16), arch=arch, sm_count=sm_count, l2_bytes=l2_bytes
+)
+dplan = dplan[0] if isinstance(dplan, tuple) else dplan
+facts["fwd_plan"] = [type(dplan).__name__, dplan.template]
+facts["fwd_load"] = load(
+    det_jit.select_module(arch, dplan.template), (det_jit, det_build, det_jit.load_cake_dense_projection_det_gemm_module)
+)
+# the router's weight gradient at an explicit split count (the FP32 GEMM G.T @ X)
+rplan, reason = backend.plan_atomic_router(
+    torch.empty(T, E).t(), torch.empty(T, 5120), torch.empty(E, 5120), arch=arch, sm_count=sm_count, splits=2
+)
+facts["router_plan"] = [type(rplan).__name__, getattr(rplan, "template", None), getattr(rplan, "units", None), reason]
+try:
+    build.jit_specs(arch)
+except Exception as exc:
+    facts["jit_specs_error"] = [type(exc).__name__, str(exc)]
+facts["flashinfer_after_use"] = flashinfer_modules()
+print(json.dumps(facts))
+"""
+)
+
+
+def _standalone(det_dir: str, script: str = _STANDALONE) -> dict:
     result = subprocess.run(
         [
             sys.executable,
             "-I",
             "-c",
-            _STANDALONE,
+            script,
             str(ND_DIR),
             det_dir,
             *_dependency_paths(),
@@ -185,4 +252,37 @@ def test_without_the_deterministic_directory_import_succeeds_and_first_use_names
         assert kind == "ImportError", facts[key]
         assert "cake_dense_gemm_det_train" in message
         assert "use_deterministic_backend" in message
+    assert facts["flashinfer_after_use"] == []
+
+
+def test_the_backend_plans_under_the_blocker_and_names_the_missing_jit():
+    """With ``flashinfer`` blocked the planners of both packages run on CPU views: this package's weight-gradient
+    plan at two splits (bitwise reproducible: one add of two values), the deterministic package's forward plan through
+    the sibling, the router planner.  Loading a planned program whose library is not prebuilt under ``aot/`` takes the
+    fallback to FlashInfer's JIT, which the blocker refuses: a ``RuntimeError`` that names the library and the missing
+    JIT, raised from the ``ImportError`` -- in both packages -- and no ``flashinfer`` module is loaded."""
+    facts = _standalone(str(DET_DIR), _PLANS)
+    kind, template, splits, reproducible = facts["wgrad_plan"]
+    assert kind == "CakeDenseGemmNondetProjectionPlan"
+    assert template.startswith("dense_proj_gemm_atomic_nn_n")
+    assert template.endswith("_f32_t")
+    assert (splits, reproducible) == (2, True)
+    kind, template = facts["fwd_plan"]
+    assert kind == "CakeDenseGemmDetProjectionPlan" and template
+    kind, template, units, reason = facts["router_plan"]
+    assert kind == "CakeDenseGemmNondetRouterPlan", reason
+    assert template.startswith("router_fp32_gemm_") and units
+    for key in ("wgrad_load", "fwd_load"):
+        load = facts[key]
+        # a tree with prebuilt libraries: nothing to check here
+        if load[0] == "prebuilt":
+            continue
+        kind, message, from_import_error, library = load
+        assert kind == "RuntimeError", load
+        assert library in message and "is not prebuilt" in message, load
+        assert "flashinfer's JIT is not available" in message, load
+        assert from_import_error is True, load
+    if "jit_specs_error" in facts:  # some library of the architecture is not prebuilt
+        kind, message = facts["jit_specs_error"]
+        assert kind == "RuntimeError" and "flashinfer's JIT is not available" in message
     assert facts["flashinfer_after_use"] == []

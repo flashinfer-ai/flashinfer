@@ -15,7 +15,7 @@ limitations under the License.
 
 Backend of :mod:`flashinfer.cake_mhc_det_train`: Cake four-stream mHC training
 forward / backward (hidden sizes 4096, 5120 and 7168 per call, from ``X``;
-4 streams; SM100 / SM103, and hidden 4096 on SM107) as one
+4 streams; SM100 / SM103 / SM107) as one
 self-contained package (host API bodies, the ``cake_jit`` loader and the
 generated CUDA sources under ``csrc/``).  The stable, ``@flashinfer_api``-decorated
 entry points and the full user-facing documentation live in
@@ -1174,7 +1174,7 @@ def cake_mhc_det_train_forward_prepare(
         BF16 ``[T, 4, H]`` contiguous residual streams (``T`` is a runtime
         scalar; ``T == 0`` returns empty outputs without launching).  The
         hidden size ``H`` of the call is ``X.shape[2]``: 4096, 5120 or 7168
-        on SM100 / SM103, 4096 on SM107.
+        on SM100 / SM103 / SM107.
     fn : torch.Tensor
         FP32 ``[24, 4H]`` contiguous mapping matrix.
     scale : torch.Tensor

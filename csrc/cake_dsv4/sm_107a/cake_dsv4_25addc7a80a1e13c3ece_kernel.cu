@@ -540,6 +540,14 @@ kernel_cake_dsv4_25addc7a80a1e13c3ece(const __grid_constant__ CUtensorMap tmap_q
                 int num_index_passes = sparse_extent / 128;
                 if (work_idx_1 == (unsigned int)bid && load_warp_rank < num_index_passes) {
                     int k1_pre_index_offset = load_warp_rank * 128 + lane * 4;
+                    if (load_warp_rank == 0) {
+                        #pragma unroll
+                        for (int k1_pre_row_i_3 = 0; k1_pre_row_i_3 < 4; k1_pre_row_i_3++) {
+                            if (k1_pre_rows[k1_pre_row_i_3] < 0) {
+                                k1_pre_rows[k1_pre_row_i_3] = -2 - (bid & 127);
+                            }
+                        }
+                    }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_sparse_indices_addr + (unsigned int)(k1_pre_index_offset * 4)), "r"(k1_pre_rows[0]), "r"(k1_pre_rows[1]), "r"(k1_pre_rows[2]), "r"(k1_pre_rows[3]) : "memory");
                 }
                 #pragma unroll 1
@@ -575,6 +583,14 @@ kernel_cake_dsv4_25addc7a80a1e13c3ece(const __grid_constant__ CUtensorMap tmap_q
                         for (int row_i_2 = 0; row_i_2 < 4; row_i_2++) {
                             if (lane_col + row_i_2 < sparse_topk) {
                                 sparse_rows[row_i_2] = row_tile_ptr[lane * 4 + row_i_2];
+                            }
+                        }
+                    }
+                    if (tile_col_base < 128) {
+                        #pragma unroll
+                        for (int row_i_3 = 0; row_i_3 < 4; row_i_3++) {
+                            if (sparse_rows[row_i_3] < 0) {
+                                sparse_rows[row_i_3] = -2 - (bid & 127);
                             }
                         }
                     }

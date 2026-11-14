@@ -15,7 +15,7 @@ limitations under the License.
 
 The CP = 1 local path of the NON-DETERMINISTIC Cake packed GDN training package
 ``flashinfer.experimental.cake.cake_gdn_nondet_train_kcp`` (its public entries with a one-rank context) against the
-exact FP64 reference of ``tests/test_helpers/cake_gdn_det_train_kcp_reference.py`` (imported read-only).  The package
+exact FP64 reference of ``tests/experimental/test_helpers/cake_gdn_det_train_kcp_reference.py`` (imported read-only).  The package
 keeps the deterministic route's contract and accuracy budgets, not its bitwise reproducibility: two arms that the
 deterministic tests compare bitwise (strided / contiguous, explicit / autograd, saved / replay, kept / replayed tapes,
 two caller streams) are each judged against the FP64 reference and against each other with the deterministic route's
@@ -41,7 +41,7 @@ forward and backward under ``torch.use_deterministic_algorithms(True)`` (strict 
 the same bits as with it off; every launch is fixed-order).  The multi-rank rows and the
 runtime contracts live in ``test_cake_gdn_nondet_train_kcp_dist.py``; the CPU plan, table, byte-query and fake-backend tests in
 ``test_cake_gdn_nondet_train_kcp.py``.  Every test needs a CUDA device the package supports and the rendered ``build.json``
-(skipped otherwise).  The suite imports the package through ``tests/test_helpers/cake_package.py`` unconditionally (a
+(skipped otherwise).  The suite imports the package through ``tests/cake/test_helpers/cake_package.py`` unconditionally (a
 broken import fails, never skips) and nothing else from flashinfer; the tests of the facade
 ``flashinfer.cake_gdn_nondet_train_kcp`` live in ``test_cake_gdn_nondet_train_kcp_api.py``.
 """
@@ -55,7 +55,7 @@ import warnings
 import pytest
 import torch
 
-from tests.test_helpers.cake_gdn_det_train_kcp_reference import (
+from tests.experimental.test_helpers.cake_gdn_det_train_kcp_reference import (
     BLOCK,
     D,
     GRAD_NAMES,
@@ -71,7 +71,7 @@ from tests.test_helpers.cake_gdn_det_train_kcp_reference import (
 
 def _pkg(sub: str | None = None):
     """The package (or one of its modules) through the test-helper registry: a stale path fails here, never skips."""
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     return cake_package("cake_gdn_nondet_train_kcp", sub)
 
@@ -1639,7 +1639,7 @@ def test_light_akk_is_within_budget_of_light_on_poisoned_memory(
         res.update({n: lf.grad[0] for n, lf in zip(GRAD_NAMES, leaves, strict=True)})
         return res
 
-    light = saved_pass()
+    light = saved_pass(save_mode="light")  # the default with the norm is "light_akk"
     if "segments" in opts:
         assert light["fwd"]["P"] == opts["segments"]
     for n in TENSORS:
@@ -1690,7 +1690,7 @@ def test_light_akk_is_within_budget_of_light_on_poisoned_memory(
         record_property(f"akk_tape_{tag}_nonfinite_pad_rows", int(bad[~real].sum()))
     record_property("akk_tape_bitwise", bool(torch.equal(_bits(akk), _bits(full_akk))))
     del full_saved, full_akk, akk, real, bad
-    a_light = autograd(False)
+    a_light = autograd(False, save_mode="light")
     a_akk = autograd(False, save_mode="light_akk")
     assert kcp.LAST_CALL["bwd"]["akk_source"] == "saved"
     a_ckpt = autograd(True, save_mode="light_akk")

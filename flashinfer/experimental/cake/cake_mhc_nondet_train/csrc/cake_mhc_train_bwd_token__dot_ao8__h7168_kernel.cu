@@ -197,7 +197,7 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
     int lane_hi = lane_1 >> 3;
     int lc4 = ((lane_1 < 4) ? lane_1 : 3);
     int gcol = ((lane_1 >= 4) ? lane_1 - 4 : 0);
-    long long col_off = (long long)tid_2 * 16;
+    long long col_off = (long long)tid_2 * 16ll;
     float acc[2];
     float comp[2];
     #pragma unroll
@@ -205,7 +205,7 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
         acc[e] = 0.0f;
         comp[e] = 0.0f;
     }
-    long long wcol = (long long)warp_0 * 896;
+    long long wcol = (long long)warp_0 * 896ll;
     unsigned int lane32 = (unsigned int)(lane_1 * 56);
     int st__1_0 = warp_0 * 2;
     unsigned int sa__1_0 = (unsigned int)(ring_addr + (unsigned int)(st__1_0 * 8960));
@@ -250,27 +250,27 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0), "l"(dU + (tp2_0 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0), "l"(dU + (tp2_0 * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 1792), "l"(X + (tp2_0 * 4 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 1792), "l"(X + (tp2_0 * 4ll * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 3584), "l"(X + ((tp2_0 * 4 + 1) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 3584), "l"(X + ((tp2_0 * 4ll + 1ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 5376), "l"(X + ((tp2_0 * 4 + 2) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 5376), "l"(X + ((tp2_0 * 4ll + 2ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 7168), "l"(X + ((tp2_0 * 4 + 3) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 7168), "l"(X + ((tp2_0 * 4ll + 3ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
         }
         __syncwarp();
@@ -280,27 +280,27 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1), "l"(dU + (tp2_1 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1), "l"(dU + (tp2_1 * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 1792), "l"(X + (tp2_1 * 4 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 1792), "l"(X + (tp2_1 * 4ll * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 3584), "l"(X + ((tp2_1 * 4 + 1) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 3584), "l"(X + ((tp2_1 * 4ll + 1ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 5376), "l"(X + ((tp2_1 * 4 + 2) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 5376), "l"(X + ((tp2_1 * 4ll + 2ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 7168), "l"(X + ((tp2_1 * 4 + 3) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 7168), "l"(X + ((tp2_1 * 4ll + 3ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
         }
     }
@@ -376,10 +376,10 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
         int tokc = ((tok < t1) ? tok : t_last);
         long long tok64 = (long long)tokc;
         float dp[1];
-        long long srow = tok64 * 64;
+        long long srow = tok64 * 64ll;
         float r = stats[srow];
-        float z_load = stats[srow + 1 + n64];
-        float gval = gstats[tok64 * 32 + (long long)gcol];
+        float z_load = stats[srow + 1ll + n64];
+        float gval = gstats[tok64 * 32ll + (long long)gcol];
         float z = ((lane_1 < 24) ? z_load : 0.0f);
         float a_map;
         asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(a_map) : "f"(z), "f"(sc), "f"(bs));
@@ -1287,27 +1287,27 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0), "l"(dU + (th2_2 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0), "l"(dU + (th2_2 * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 1792), "l"(X + (th2_2 * 4 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 1792), "l"(X + (th2_2 * 4ll * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 3584), "l"(X + ((th2_2 * 4 + 1) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 3584), "l"(X + ((th2_2 * 4ll + 1ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 5376), "l"(X + ((th2_2 * 4 + 2) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 5376), "l"(X + ((th2_2 * 4ll + 2ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 7168), "l"(X + ((th2_2 * 4 + 3) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 7168), "l"(X + ((th2_2 * 4ll + 3ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
         }
         float _shfl_xor_sync_115 = __shfl_xor_sync(0xFFFFFFFF, c_11, 1);
@@ -2167,27 +2167,27 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1), "l"(dU + (th2_3 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1), "l"(dU + (th2_3 * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 1792), "l"(X + (th2_3 * 4 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 1792), "l"(X + (th2_3 * 4ll * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 3584), "l"(X + ((th2_3 * 4 + 1) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 3584), "l"(X + ((th2_3 * 4ll + 1ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 5376), "l"(X + ((th2_3 * 4 + 2) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 5376), "l"(X + ((th2_3 * 4ll + 2ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 7168), "l"(X + ((th2_3 * 4 + 3) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 7168), "l"(X + ((th2_3 * 4ll + 3ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
         }
         float _shfl_xor_sync_214 = __shfl_xor_sync(0xFFFFFFFF, c_20, 4);
@@ -3047,27 +3047,27 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0), "l"(dU + (th2_4 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0), "l"(dU + (th2_4 * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 1792), "l"(X + (th2_4 * 4 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 1792), "l"(X + (th2_4 * 4ll * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 3584), "l"(X + ((th2_4 * 4 + 1) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 3584), "l"(X + ((th2_4 * 4ll + 1ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 5376), "l"(X + ((th2_4 * 4 + 2) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 5376), "l"(X + ((th2_4 * 4ll + 2ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 7168), "l"(X + ((th2_4 * 4 + 3) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 7168), "l"(X + ((th2_4 * 4ll + 3ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
         }
         float _shfl_xor_sync_313 = __shfl_xor_sync(0xFFFFFFFF, c_29, 1);
@@ -3939,27 +3939,27 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1), "l"(dU + (th2_5 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1), "l"(dU + (th2_5 * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 1792), "l"(X + (th2_5 * 4 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 1792), "l"(X + (th2_5 * 4ll * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 3584), "l"(X + ((th2_5 * 4 + 1) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 3584), "l"(X + ((th2_5 * 4ll + 1ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 5376), "l"(X + ((th2_5 * 4 + 2) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 5376), "l"(X + ((th2_5 * 4ll + 2ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 7168), "l"(X + ((th2_5 * 4 + 3) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 7168), "l"(X + ((th2_5 * 4ll + 3ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
         }
         float _shfl_xor_sync_415 = __shfl_xor_sync(0xFFFFFFFF, hist[37], 1);
@@ -4900,27 +4900,27 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0), "l"(dU + (th2_6 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0), "l"(dU + (th2_6 * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 1792), "l"(X + (th2_6 * 4 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 1792), "l"(X + (th2_6 * 4ll * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 3584), "l"(X + ((th2_6 * 4 + 1) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 3584), "l"(X + ((th2_6 * 4ll + 1ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 5376), "l"(X + ((th2_6 * 4 + 2) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 5376), "l"(X + ((th2_6 * 4ll + 2ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 7168), "l"(X + ((th2_6 * 4 + 3) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 7168), "l"(X + ((th2_6 * 4ll + 3ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
         }
         float _shfl_xor_sync_541 = __shfl_xor_sync(0xFFFFFFFF, hist[28], 4);
@@ -5861,27 +5861,27 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1), "l"(dU + (th2_7 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1), "l"(dU + (th2_7 * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 1792), "l"(X + (th2_7 * 4 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 1792), "l"(X + (th2_7 * 4ll * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 3584), "l"(X + ((th2_7 * 4 + 1) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 3584), "l"(X + ((th2_7 * 4ll + 1ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 5376), "l"(X + ((th2_7 * 4 + 2) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 5376), "l"(X + ((th2_7 * 4ll + 2ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 7168), "l"(X + ((th2_7 * 4 + 3) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 7168), "l"(X + ((th2_7 * 4ll + 3ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
         }
         float _shfl_xor_sync_667 = __shfl_xor_sync(0xFFFFFFFF, hist[19], 1);
@@ -6822,27 +6822,27 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0), "l"(dU + (th2_8 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0), "l"(dU + (th2_8 * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 1792), "l"(X + (th2_8 * 4 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 1792), "l"(X + (th2_8 * 4ll * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 3584), "l"(X + ((th2_8 * 4 + 1) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 3584), "l"(X + ((th2_8 * 4ll + 1ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 5376), "l"(X + ((th2_8 * 4 + 2) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 5376), "l"(X + ((th2_8 * 4ll + 2ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_0 + 7168), "l"(X + ((th2_8 * 4 + 3) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
+                :: "r"(sa__1_0 + 7168), "l"(X + ((th2_8 * 4ll + 3ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_0) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
         }
         float _shfl_xor_sync_793 = __shfl_xor_sync(0xFFFFFFFF, hist[10], 4);
@@ -7783,27 +7783,27 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1), "l"(dU + (th2_9 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1), "l"(dU + (th2_9 * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 1792), "l"(X + (th2_9 * 4 * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 1792), "l"(X + (th2_9 * 4ll * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 3584), "l"(X + ((th2_9 * 4 + 1) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 3584), "l"(X + ((th2_9 * 4ll + 1ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 5376), "l"(X + ((th2_9 * 4 + 2) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 5376), "l"(X + ((th2_9 * 4ll + 2ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1], %2, [%3], %4;"
-                :: "r"(sa__1_1 + 7168), "l"(X + ((th2_9 * 4 + 3) * 7168 + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
+                :: "r"(sa__1_1 + 7168), "l"(X + ((th2_9 * 4ll + 3ll) * 7168ll + wcol)), "r"((unsigned)(1792)), "r"(ring_bar_addr + (st__1_1) * 8),
                    "l"(0x12F0000000000000ULL) : "memory");
         }
         float _shfl_xor_sync_919 = __shfl_xor_sync(0xFFFFFFFF, hist[1], 1);
@@ -7946,16 +7946,16 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
         float p1 = ((lane_1 < 24) ? cvt_f32 : 0.0f);
         float p2 = ((lane_1 < 24) ? cvt_f32_1 : 0.0f);
         float p3 = ((lane_1 < 24) ? cvt_f32_2 : 0.0f);
-        long long drow = tok64 * 96 + lane64;
+        long long drow = tok64 * 96ll + lane64;
         asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.b16 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&dzp[drow])), "h"(__bfloat16_as_ushort((__nv_bfloat16)p1)), "r"((unsigned int)(tok < t1)) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.b16 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&dzp[drow + 32])), "h"(__bfloat16_as_ushort((__nv_bfloat16)p2)), "r"((unsigned int)(tok < t1)) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.b16 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&dzp[drow + 64])), "h"(__bfloat16_as_ushort((__nv_bfloat16)p3)), "r"((unsigned int)(tok < t1)) : "memory");
-        long long trow = tok64 * 24;
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.b16 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&dzp[drow + 32ll])), "h"(__bfloat16_as_ushort((__nv_bfloat16)p2)), "r"((unsigned int)(tok < t1)) : "memory");
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.b16 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&dzp[drow + 64ll])), "h"(__bfloat16_as_ushort((__nv_bfloat16)p3)), "r"((unsigned int)(tok < t1)) : "memory");
+        long long trow = tok64 * 24ll;
         asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow])), "f"(r), "r"((unsigned int)(tok < t1 && lane_1 == 0)) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + 1])), "f"(c_t), "r"((unsigned int)(tok < t1 && lane_1 == 0)) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + 2 + lane64])), "f"(_add_1), "r"((unsigned int)(tok < t1 && lane_1 < 4)) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + lane64 - 2])), "f"(c_37), "r"((unsigned int)(tok < t1 && (lane_1 >= 8 && lane_1 < 24))) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + lane64 - 2])), "f"(0.0f), "r"((unsigned int)(tok < t1 && (lane_1 >= 24 && lane_1 < 26))) : "memory");
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + 1ll])), "f"(c_t), "r"((unsigned int)(tok < t1 && lane_1 == 0)) : "memory");
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + 2ll + lane64])), "f"(_add_1), "r"((unsigned int)(tok < t1 && lane_1 < 4)) : "memory");
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + lane64 - 2ll])), "f"(c_37), "r"((unsigned int)(tok < t1 && (lane_1 >= 8 && lane_1 < 24))) : "memory");
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + lane64 - 2ll])), "f"(0.0f), "r"((unsigned int)(tok < t1 && (lane_1 >= 24 && lane_1 < 26))) : "memory");
         float _sub_0_1;
         asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_0_1) : "f"(da_0), "f"(comp[0]));
         float _add_2;
@@ -7990,7 +7990,7 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
     fold[fbase + 3] = comp[1];
     __syncthreads();
     if (warp_0 == 0) {
-        long long prow = (long long)bid * 32;
+        long long prow = (long long)bid * 32ll;
         float o[2];
         float oc[2];
         #pragma unroll
@@ -8077,7 +8077,7 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
             }
             float _sub_973;
             asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_973) : "f"(ga[0]), "f"(gc[0]));
-            *(reinterpret_cast<float*>(param_partial + (prow + 24 + lane64)) + (0)) = _sub_973;
+            *(reinterpret_cast<float*>(param_partial + (prow + 24ll + lane64)) + (0)) = _sub_973;
         }
         if (lane_1 >= 27) {
             *(reinterpret_cast<float*>(param_partial + (prow + lane64)) + (0)) = 0.0f;
@@ -8093,7 +8093,7 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
         for (int k = 0; k < trips_z; k++) {
             int ez = k * 256 + tid_2;
             if (ez < nz) {
-                *(reinterpret_cast<__nv_bfloat16*>(dzp + (t64 * 96 + (long long)ez)) + (0)) = (__nv_bfloat16)zero;
+                *(reinterpret_cast<__nv_bfloat16*>(dzp + (t64 * 96ll + (long long)ez)) + (0)) = (__nv_bfloat16)zero;
             }
         }
         int nt = npad * 24;
@@ -8102,7 +8102,7 @@ kernel_cake_mhc_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ X, _
         for (int k_1 = 0; k_1 < trips_t; k_1++) {
             int et = k_1 * 256 + tid_2;
             if (et < nt) {
-                *(reinterpret_cast<float*>(tokp + (t64 * 24 + (long long)et)) + (0)) = zero;
+                *(reinterpret_cast<float*>(tokp + (t64 * 24ll + (long long)et)) + (0)) = zero;
             }
         }
     }

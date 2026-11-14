@@ -43,7 +43,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 KEY = "cake_causal_conv1d_nondet_train"
 pkg = cake_package(KEY)
@@ -88,14 +88,15 @@ CHANNELS = (
 TOKENS = (1, 1000, 65536, 98304, 147456, 250340, 262143, 262144)
 # The deterministic package's programs this package does not have: the row-group backward program of route ``bwd``
 # on sm_107a (264 <= C < 512) and the SM-wide row-group programs of route ``bwd`` on sm_100a, sm_103a and sm_107a
-# (channel bands of 264 <= C < 512, from a token floor).  Every other record pairs with this package's at the same route
-# position.
+# (channel bands of 264 <= C < 512, from a token floor), and the copy of route ``bwd``'s fallback program on sm_107a
+# (the channel band of 520 <= C < 1024).  Every other record pairs with this package's at the same route position.
 DET_ONLY = frozenset(
     {
         "cake_causal_conv1d_det_train_50aa818e2b2338fb34a4",
         "cake_causal_conv1d_det_train_e057357c655024d4ff1d",
         "cake_causal_conv1d_det_train_baca4c969c783d07d81f",
         "cake_causal_conv1d_det_train_5ca7515dd2118dd96241",
+        "cake_causal_conv1d_det_train_0d99ef0e0ed10b11dfd5",
     }
 )
 

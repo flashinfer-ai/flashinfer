@@ -31,37 +31,107 @@ Host design (every control is a keyword; no environment variable):
   is not a multiple of 16 elements) is materialized once as a contiguous copy.
 - ``weight`` is BF16 ``[128]``, shared by every token and head.
 - The forward saves nothing beyond its inputs; the backward recomputes the
-  statistics and the gate from ``x`` and ``z``.  Its only device temporary is
-  the FP32 weight-gradient partial buffer (``[chunks, 128]``,
-  :func:`cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes`), allocated on
-  the call's stream or passed in as ``workspace``.
-- The weight gradient is summed over every token and head in a fixed order
-  that depends on the row count alone (FP32 per thread and per CTA chunk, then
-  FP64 over the chunks), rounded once to the output dtype: repeated calls
-  return the same bits.
-- No call synchronizes the host or the device; every kernel runs on the
-  current torch stream, and no launch is cooperative or uses programmatic
-  dependent launch.  The forward runs one of several fixed-order modules,
-  chosen from the row count and the device's SM count
-  (``cake_jit.module_for_rows``): a short forward up to a few rows per SM,
-  the plain forward, and from many rows per SM persistent forwards whose CTAs
-  each walk a few row blocks.  Each computes every row with the same FP32
-  operations in the same order, so ``y`` is the same bits whichever module
-  runs it; the backward reads only the upstream gradient, ``x``, ``z`` and
-  ``weight``, so its results do not depend on the forward module.
+  statistics and the gate from ``x`` and ``z``.
+- Forward: 128-thread CTAs of 16-row blocks (``cake_jit.launch_grid``): one
+  CTA per block below 8192 rows per SM, and from there the fewest whole waves
+  of 6 CTAs per SM that give no CTA more than 2 blocks, a CTA loading its next
+  block while it computes the current one.  One module per architecture, and
+  on SM107 a second one for packed rows (``x`` and ``z`` both read as
+  contiguous ``[T, H, 128]``; ``cake_jit.forward_module``) that computes a row
+  with the same FP32 operations in the same order, so the layout changes no
+  bits.  The sum of squares runs in one fixed order per architecture (on
+  SM107 as four interleaved chains).  ``rstd`` comes from the approximate FP32
+  reciprocal square root, and ``silu(z) = z * (1 / (1 + 2^(-z * log2(e))))`` from the
+  approximate FP32 base-2 exponential and reciprocal (each a few FP32 units in
+  the last place from the exact value), then one rounding to BF16.  So ``y``
+  can differ from the correctly rounded FP32 formula by one BF16 unit in the
+  last place where that value lies within a few FP32 units in the last place
+  of a BF16 rounding boundary.  For finite ``z`` below about ``-87.3`` the
+  reciprocal flushes to zero and the gate is ``-0`` (the exact gate is below
+  ``2^-119`` in magnitude there).
+- Backward: one kernel, BF16 or FP32 weight gradient.  It launches ``G =
+  min(row blocks, 4 * SMs)`` 256-thread CTAs over blocks of 16 rows
+  (``cake_jit.launch_grid``): CTA ``c`` takes block ``c`` when ``G`` covers
+  every block; otherwise every CTA claims chunks of blocks (interleaved within
+  each halving round) from a counter in the workspace, following a table of
+  halving rounds that every CTA computes from the block count and ``G``, so a
+  CTA that starts late takes fewer blocks.  From 2560 rows per SM on SM100 and
+  SM103 and 1536 on SM107, a call whose ``grad_out``, ``x`` and ``z`` the
+  kernel reads as packed rows (head stride 128, token stride ``H * 128``;
+  ``cake_jit.backward_module``) runs the same backward in a loop that loads a
+  block's rows while the previous block's row math runs: the same grid, FP32
+  operations in the same order and workspace, so the same bits; other calls run
+  the default module of their weight-gradient dtype (``cake_jit.ROUTES``).
+  ``dx`` and ``dz`` are FP32 formulas rounded once each, with ``rstd`` from the
+  approximate FP32 reciprocal square root and the sigmoid factor ``s`` from the
+  approximate FP32 base-2 exponential of the exact FP32 product of ``-z`` and
+  the 15-bit head of ``log2(e)`` (the remaining bits applied to first order)
+  and the approximate reciprocal, on every element alike: each lies within one
+  BF16 unit in the last place of the same formula in correctly rounded FP32
+  plus 1/64 of a unit of its row's scale (for ``dz`` the row's largest
+  ``|dy * x * rstd * w|``, for ``dx`` the sum of the largest magnitudes of its
+  two terms; rows whose sums reach ``2^127`` aside).  Like the FP32 sigmoid,
+  ``s`` is subnormal for ``z`` from about ``-87.34`` to ``-88.72`` and 0 below
+  that (the gate ``z * s`` is then ``-0``).  For the weight gradient each thread
+  sums its rows' terms ``a * n`` of a chunk in FP32 runs of at most 16 rows
+  and folds each run into an FP32 two-sum pair (a sum and its exact error
+  term); each CTA adds its pairs exactly into 64-bit fixed-point digit
+  counters and adds those to the workspace with integer atomics, which are
+  exact in any order.  The CTA that arrives last adds ``grad_weight``'s value
+  exactly as digits when accumulating, rounds each column's exact sum once to
+  FP32 (round to nearest even, in integer arithmetic), stores it (a BF16
+  ``grad_weight`` takes that FP32 value rounded to BF16, as an FP32 sum cast
+  to BF16) and zeroes the workspace.  A chunk's runs follow from the row count
+  and ``G`` alone, whichever CTA takes it, so the weight gradient is the same
+  bits at every call with the same row count on a device with the same SM
+  count; each run errs by at most about ``2^-20`` of its terms' magnitude (the
+  approximate gate and ``rstd`` put each term within a few FP32 units in the
+  last place of the FP32 formula's term) and the digits sum exactly.
+- Workspace: ``cake_jit.workspace_elements`` FP32 elements (18952 bytes): the
+  digit counters (``2 * 9 * 128`` 64-bit words, read as ``uint64``), one
+  32-bit flag word a column (infinite and ``NaN`` sums), and two 32-bit words,
+  the arrival ticket and the claim counter.  Every launch uses it, also one
+  with ``compute_grad_weight=False`` (its CTAs still take tickets and claim
+  blocks), and leaves all of it zero, so a workspace zeroed once serves every
+  later call on its stream, of any shape and either weight-gradient dtype, and
+  every CUDA Graph replay, with no host write.  A caller workspace must come
+  from :func:`cake_rmsnorm_silu_gate_det_train_backward_workspace`
+  (zero-filled), or be zeroed with
+  :func:`cake_rmsnorm_silu_gate_det_train_reset_workspace` after anything else
+  wrote into it (a launch that did not complete, another use of the buffer).
+- Retained state: the autograd function saves only ``x``, ``z`` and ``weight``
+  through ``save_for_backward``, so a non-reentrant checkpointed forward keeps
+  nothing but its output.  A backward without a caller workspace uses the
+  zero-filled workspace of its (device, stream), allocated on first use and
+  kept in ``_STREAM_WORKSPACES`` for later calls (18952 bytes for every stream
+  that ran a backward).  Such eager calls also keep a reserve of zero-filled
+  workspaces per device, filled outside any capture in allocations of 64
+  (about 1.2 MiB each) whenever fewer than 32 are ready, up to 1024 per
+  process (about 18.75 MiB), from which a call during CUDA Graph capture takes
+  the workspace of its capture and capture stream for good, so a replay
+  launches no fill kernel (see ``_RESERVES``; with none ready, the graph
+  zero-fills one of its own).
+- No call synchronizes the host or the device, and every kernel runs on the
+  current torch stream.  No launch is cooperative or uses programmatic
+  dependent launch, and no CTA waits for another CTA: beside a kernel resident
+  on another stream, a backward CTA that is not resident yet starts as any of
+  the backward's CTAs exits and claims only the blocks left.
 - Mode: the mode is part of the name (``det``).  Every entry point is
   deterministic and takes no ``deterministic`` keyword (passing one is a
-  ``TypeError``); every launch sums in a fixed order, so
-  ``torch.use_deterministic_algorithms`` does not affect any call.  The
-  backward refuses the FP64 workspace of the non-deterministic package
-  (``flashinfer.cake_rmsnorm_silu_gate_nondet_train``) with a ``ValueError``,
-  also in a call with no rows.
+  ``TypeError``); every launch gives the same bits for the same inputs on
+  the same device (the backward's sum across CTAs is exact integer addition,
+  whose order does not change it), so ``torch.use_deterministic_algorithms``
+  does not affect any call.  The
+  backward refuses a workspace of the non-deterministic package
+  (``flashinfer.cake_rmsnorm_silu_gate_nondet_train``; an FP64 or ``uint8``
+  tensor) with a ``ValueError``, also in a call with no rows.
 """
 
 from __future__ import annotations
 
 import functools
-from typing import Optional
+import threading
+from typing import Any, Optional
 
 import torch
 
@@ -72,9 +142,13 @@ from .cake_jit import (
     ARCHES,
     HEAD_DIM,
     INT32_MAX,
+    LONG_ROLES,
+    ROLES,
+    ROUTES,
     arch_for_capability,
-    backward_chunks,
-    route_module,
+    backward_module,
+    device_sm_count,
+    workspace_elements,
 )
 
 SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
@@ -83,7 +157,7 @@ SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
 _ALIGNMENT_BYTES = ALIGNMENT_ELEMENTS * 2
 
 # The workspace factories the backward's refusal of the other mode's workspace
-# names: this package's FP32 partial buffer and the FP64 workspace of the
+# names: this package's FP32 workspace and the workspace of the
 # non-deterministic package (named only; nothing is imported from it).
 _DETERMINISTIC_WORKSPACE = (
     "flashinfer.cake_rmsnorm_silu_gate_det_train."
@@ -263,12 +337,11 @@ def cake_rmsnorm_silu_gate_det_train_forward(
 ) -> torch.Tensor:
     r"""SiLU-gated RMSNorm forward: ``y = BF16(((x * rstd) * weight) * silu(z))``.
 
-    ``rstd = 1 / sqrt(mean(x^2) + eps)`` over the last dimension (128), in FP32;
-    ``silu(z) = z / (1 + exp(-z))`` in FP32; one rounding to BF16 at the end.
-    The module that runs it follows the row count and the device's SM count
-    (``cake_jit.module_for_rows``); every forward module computes a row with
-    the same FP32 operations in the same order, so ``y`` is the same bits on
-    every route.
+    ``rstd = 1 / sqrt(mean(x^2) + eps)`` over the last dimension (128) and
+    ``silu(z) = z / (1 + exp(-z))``, in FP32 with the approximate reciprocal
+    square root, base-2 exponential and reciprocal (see the module); one
+    rounding to BF16 at the end.  The same inputs give the same bits at every
+    call.
 
     Parameters
     ----------
@@ -314,7 +387,9 @@ def cake_rmsnorm_silu_gate_det_train_forward(
         "eps": float(eps),
     }
     index = _device_index(device)
-    name = _loader.module_for_rows(arch, "fwd", rows, _loader.device_sm_count(index))
+    name = _loader.forward_module(
+        arch, rows, heads, device_sm_count(index), x_tok, x_head, z_tok, z_head
+    )
     _loader.run_module(name, values, rows=rows, device_index=index)
     if y_user is not None:
         y_user.copy_(y)
@@ -322,26 +397,284 @@ def cake_rmsnorm_silu_gate_det_train_forward(
     return y
 
 
+def _workspace_elements(arch: str) -> int:
+    """FP32 elements of a workspace that serves every backward module of
+    ``arch`` (both weight-gradient dtypes and their long modules, any row
+    count)."""
+
+    routes = ROUTES[arch]
+    return max(
+        workspace_elements(routes[role])
+        for role in ROLES + LONG_ROLES
+        if role.startswith("bwd") and role in routes
+    )
+
+
 def cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes(
     rows: int, device: torch.device
 ) -> int:
-    """Bytes of the backward's FP32 weight-gradient partial buffer for ``rows``
-    rows (``T * H``) on ``device``: ``chunks * 128 * 4``."""
+    """Bytes of the caller-owned backward workspace for ``rows`` rows
+    (``T * H``) on ``device``: the weight gradient's fixed-point digit
+    counters, one flag word a column, the arrival ticket and the claim counter,
+    18952 bytes whatever ``rows``."""
 
-    arch = _device_arch(torch.device(device))
-    chunks, _ = backward_chunks(route_module(arch, "bwd"), int(rows))
-    return chunks * HEAD_DIM * 4
+    if int(rows) < 0:
+        raise ValueError(f"rows must be non-negative, got {rows}")
+    return _workspace_elements(_device_arch(torch.device(device))) * 4
 
 
 def cake_rmsnorm_silu_gate_det_train_backward_workspace(
     rows: int, device: torch.device
 ) -> torch.Tensor:
-    """A caller-owned backward workspace for ``rows`` rows: an uninitialized
-    FP32 tensor of :func:`cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes`
-    bytes (the backward writes every element it reads)."""
+    """A caller-owned backward workspace for ``rows`` rows (``T * H``): a
+    zero-filled FP32 tensor of
+    :func:`cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes` bytes.
 
-    nbytes = cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes(rows, device)
-    return torch.empty(nbytes // 4, dtype=torch.float32, device=device)
+    The backward leaves it zero after every call, so it serves every later call
+    on its stream (any ``T`` and ``H``, BF16 or FP32 weight gradient) and every
+    CUDA Graph replay without a reset.  A backward that may run at the same time
+    on another stream needs its own workspace.  The non-deterministic package's
+    workspace is not a workspace of this package (and this one not of that
+    package's backward).
+    """
+
+    device = torch.device(device)
+    if int(rows) < 0:
+        raise ValueError(f"rows must be non-negative, got {rows}")
+    return torch.zeros(
+        _workspace_elements(_device_arch(device)), dtype=torch.float32, device=device
+    )
+
+
+def cake_rmsnorm_silu_gate_det_train_reset_workspace(
+    workspace: torch.Tensor,
+) -> None:
+    """Return a caller-owned backward workspace to its first-use state: zero all
+    of it (the digit counters, the flag words, the arrival ticket and the claim
+    counter).
+
+    Every backward leaves its workspace zero, so reuse across calls, shapes,
+    weight-gradient dtypes and CUDA Graph replays needs no reset.  A workspace
+    that did not come from
+    :func:`cake_rmsnorm_silu_gate_det_train_backward_workspace`, or that
+    something else wrote into (a launch that did not complete, another use of
+    the buffer), must be reset before its next backward.  The fill runs on the
+    current stream of the workspace's device, without a host synchronization
+    (it can be captured in a CUDA Graph).  The workspace must be a contiguous,
+    16-byte aligned FP32 CUDA tensor of at least
+    :func:`cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes` bytes; a
+    workspace of the non-deterministic package is refused with a
+    ``ValueError``.
+    """
+
+    if not isinstance(workspace, torch.Tensor):
+        raise TypeError("workspace must be a torch.Tensor")
+    device = workspace.device
+    _check_workspace(workspace, device, _workspace_elements(_device_arch(device)))
+    workspace.zero_()
+
+
+# The workspaces of calls without a caller workspace: one per (device, stream),
+# zero-filled once and kept for the process (18952 bytes for every stream that
+# ran a backward).  Every backward leaves its workspace zero and the calls of
+# one stream run in order, so they share it (no allocation and no fill per
+# call); every backward module (both weight-gradient dtypes and their long
+# modules) reads the same layout.  A call during CUDA Graph capture uses a
+# workspace of its capture instead (``_capture_workspace``), so a graph
+# replayed on another stream never shares a buffer with eager calls or other
+# graphs.
+_STREAM_WORKSPACES: dict[
+    tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+] = {}
+
+# The workspaces of captured calls without a caller workspace.  A replay must
+# find its workspace zero when the backward kernel starts and no other launch
+# may use it, yet a fill inside the graph adds a kernel to every replay.  So
+# eager calls without a caller workspace keep a reserve of zero-filled
+# workspaces per device, filled outside any capture: ``_RESERVE_SIZE`` at a
+# time from one allocation, each ready once a later eager call has seen its
+# fill complete (``Event.query``).  The first such call of a capture on a
+# capture stream takes a ready one for good and adds no node to the graph: the
+# first replay finds it zero, every launch leaves it zero, launches of one
+# graph never overlap, and no other launch gets it.  Later calls of the same
+# capture on the same capture stream run after it in the graph and reuse it
+# (capture ids from cuda-python; without it, each captured call takes its
+# own).  No graph can tell this package when it is destroyed, so the reserve's
+# memory is kept for the process: at most ``_GRAPH_WORKSPACE_LIMIT``
+# workspaces per device.  With none ready (the reserve still filling or used
+# up), a captured call zero-fills a workspace from the graph's pool inside the
+# graph (one fill kernel per call and replay).  ``_RESERVE_LOCK`` serializes
+# the reserve's bookkeeping between threads, so a workspace moves to ready
+# once, after its fill was seen complete.
+_RESERVE_SIZE = 64
+_GRAPH_WORKSPACE_LIMIT = 1024
+# device index -> {"ready": [workspace, ...], "pending": [(event recorded after
+# the fill, [workspace, ...]), ...], "blocks": [allocation, ...], "carved": int}
+_RESERVES: dict[int, dict[str, Any]] = {}
+# (device index, capture stream) -> (capture id, the workspace of that capture)
+_CAPTURE_WORKSPACES: dict[tuple[int, int], tuple[int, torch.Tensor]] = {}
+_RESERVE_LOCK = threading.Lock()
+
+
+def _refill_reserve(arch: str, device: torch.device) -> None:
+    """Eager calls: move filled reserve workspaces to ready and, below half the
+    reserve and under the limit, zero-fill ``_RESERVE_SIZE`` more on the
+    current stream (no host synchronization)."""
+
+    index = _device_index(device)
+    with _RESERVE_LOCK:
+        reserve = _RESERVES.get(index)
+        if reserve is None:
+            reserve = _RESERVES[index] = {
+                "ready": [],
+                "pending": [],
+                "blocks": [],
+                "carved": 0,
+            }
+        pending = reserve["pending"]
+        while pending and pending[0][0].query():
+            reserve["ready"].extend(pending.pop(0)[1])
+        waiting = sum(len(workspaces) for _, workspaces in pending)
+        count = min(_RESERVE_SIZE, _GRAPH_WORKSPACE_LIMIT - reserve["carved"])
+        if 2 * (len(reserve["ready"]) + waiting) >= _RESERVE_SIZE or count <= 0:
+            return
+        elements = _workspace_elements(arch)
+        stride = -(-elements // 64) * 64  # 256-byte aligned workspaces
+        block = torch.zeros(count * stride, dtype=torch.float32, device=device)
+        filled = torch.cuda.Event()
+        filled.record(torch.cuda.current_stream(device))
+        reserve["blocks"].append(block)
+        reserve["carved"] += count
+        pending.append(
+            (filled, [block[i * stride : i * stride + elements] for i in range(count)])
+        )
+
+
+@functools.cache
+def _cudart() -> Any:
+    """cuda-python's runtime module, or None when it is not installed."""
+
+    try:
+        from cuda.bindings import runtime
+    except ImportError:
+        return None
+    return runtime
+
+
+def _capture_id(cudart: Any, stream: Any) -> Optional[int]:
+    """The id of the capture in progress on ``stream``, or None."""
+
+    result = cudart.cudaStreamGetCaptureInfo(cudart.cudaStream_t(stream.cuda_stream))
+    if (
+        result[0] != cudart.cudaError_t.cudaSuccess
+        or result[1] != cudart.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive
+    ):
+        return None
+    return int(result[2])
+
+
+def _capture_workspace(arch: str, device: torch.device) -> torch.Tensor:
+    """The FP32 workspace of a call without a caller workspace during CUDA
+    Graph capture on the current stream of ``device``."""
+
+    index = _device_index(device)
+    stream = torch.cuda.current_stream(device)
+    cudart = _cudart()
+    capture = None if cudart is None else _capture_id(cudart, stream)
+    key = (index, stream.cuda_stream)
+    if capture is not None:
+        held = _CAPTURE_WORKSPACES.get(key)
+        if held is not None and held[0] == capture:
+            return held[1]
+    with _RESERVE_LOCK:
+        reserve = _RESERVES.get(index)
+        workspace = reserve["ready"].pop() if reserve and reserve["ready"] else None
+    if workspace is None:
+        # Inside the graph: from its pool, zero-filled at every replay.
+        return torch.zeros(
+            _workspace_elements(arch), dtype=torch.float32, device=device
+        )
+    if capture is not None:
+        _CAPTURE_WORKSPACES[key] = (capture, workspace)
+    return workspace
+
+
+def _stream_workspace_views(
+    name: str, arch: str, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(digit counters, flag words, ticket and claim words)`` of backward
+    module ``name`` for a call without a caller workspace."""
+
+    if torch.cuda.is_current_stream_capturing():
+        return _workspace_views(_capture_workspace(arch, device), name, device)
+    _refill_reserve(arch, device)
+    key = (_device_index(device), torch.cuda.current_stream(device).cuda_stream)
+    views = _STREAM_WORKSPACES.get(key)
+    if views is None:
+        views = _workspace_views(
+            torch.zeros(_workspace_elements(arch), dtype=torch.float32, device=device),
+            name,
+            device,
+        )
+        _STREAM_WORKSPACES[key] = views
+    return views
+
+
+def _refuse_nondeterministic_workspace(workspace: Optional[torch.Tensor]) -> None:
+    """Refuse a workspace of the non-deterministic package (an FP64 or uint8
+    tensor), naming both modes' workspaces."""
+
+    names = {torch.float64: "FP64", torch.uint8: "uint8"}
+    if isinstance(workspace, torch.Tensor) and workspace.dtype in names:
+        raise ValueError(
+            f"workspace is {names[workspace.dtype]}, a workspace of the "
+            "non-deterministic "
+            f"mode ({_NONDETERMINISTIC_WORKSPACE}); the deterministic backward "
+            "needs its own zero-filled FP32 workspace "
+            f"({_DETERMINISTIC_WORKSPACE})"
+        )
+
+
+def _check_workspace(
+    workspace: torch.Tensor, device: torch.device, elements: int
+) -> torch.Tensor:
+    """The flat view of a caller's workspace of at least ``elements`` FP32
+    elements on ``device``; a workspace of the non-deterministic package is
+    refused naming both modes' workspaces."""
+
+    _refuse_nondeterministic_workspace(workspace)
+    if (
+        not isinstance(workspace, torch.Tensor)
+        or workspace.device != device
+        or workspace.dtype != torch.float32
+        or not workspace.is_contiguous()
+        or workspace.numel() < elements
+        or workspace.data_ptr() % 16 != 0
+    ):
+        raise ValueError(
+            f"workspace must be a contiguous, 16-byte aligned FP32 tensor on {device} "
+            f"with at least {elements} elements, zero before its first use "
+            "(cake_rmsnorm_silu_gate_det_train_backward_workspace(rows, device), "
+            "or cake_rmsnorm_silu_gate_det_train_reset_workspace(workspace))"
+        )
+    return workspace.view(-1)
+
+
+def _workspace_views(
+    workspace: torch.Tensor, name: str, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(acc, flags, done)`` of backward module ``name`` on a workspace: the
+    ``uint64`` digit counters, the ``uint32`` flag word of each column, and the
+    two ``uint32`` words ``[0]`` the arrival ticket and ``[1]`` the claim
+    counter."""
+
+    elements = workspace_elements(name)
+    flat = _check_workspace(workspace, device, elements)
+    digits = elements - HEAD_DIM - 2
+    acc = flat[:digits].view(torch.uint64)
+    flags = flat[digits : digits + HEAD_DIM].view(torch.uint32)
+    done = flat[digits + HEAD_DIM : elements].view(torch.uint32)
+    return acc, flags, done
 
 
 def cake_rmsnorm_silu_gate_det_train_backward(
@@ -366,9 +699,15 @@ def cake_rmsnorm_silu_gate_det_train_backward(
         dx = BF16(rstd * a * weight - x * rstd^3 * mean(a * weight * x))
         dw = sum over every token and head of a * n
 
-    in FP32, the statistics and the gate recomputed from ``x`` and ``z``.  ``dw``
-    is accumulated in FP32 per CTA chunk and in FP64 over the chunks, in an
-    order fixed by the row count, and rounded once.
+    in FP32, the statistics and the gate recomputed from ``x`` and ``z`` with
+    the approximate reciprocal square root, base-2 exponential and reciprocal
+    (see the module): ``dx`` and ``dz`` lie within one BF16 unit in the last
+    place of these formulas in correctly rounded FP32 plus 1/64 of a unit of
+    the row's largest term, the same bits at every call.  ``dw`` is summed in
+    FP32 runs of at most 16 rows, added exactly in fixed point in an
+    order-independent way, and rounded once to FP32 (then to BF16 for a BF16
+    gradient; see the module): the same row count on a device with the same SM
+    count gives the same bits.
 
     Parameters
     ----------
@@ -382,18 +721,19 @@ def cake_rmsnorm_silu_gate_det_train_backward(
         Preallocated BF16 outputs of ``x``'s shape.
     grad_weight : torch.Tensor, optional
         A BF16 or FP32 ``[128]`` tensor that receives the weight gradient
-        (rounded once into its dtype).  Without it a new BF16 tensor is returned.
+        (the exact sum rounded once to FP32, then to BF16 for a BF16 tensor).
+        Without it a new BF16 tensor is returned.
     accumulate_grad_weight : bool
-        Add the gradient to ``grad_weight``'s current value before the one
-        rounding (needs ``grad_weight``).
+        Add the gradient to ``grad_weight``'s current value exactly, before
+        the rounding (needs ``grad_weight``).
     compute_grad_weight : bool
-        ``False`` skips the weight-gradient reduction and returns ``None`` for it.
+        ``False`` skips the weight-gradient result and returns ``None`` for it.
     workspace : torch.Tensor, optional
-        FP32 tensor of at least
+        Zero-filled FP32 workspace of at least
         :func:`cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes` bytes,
-        contiguous; allocated on the current stream when omitted.  The FP64
-        workspace of the non-deterministic package is refused
-        (``ValueError``), also in a call with no rows.
+        contiguous and 16-byte aligned, left zero by the call; the stream's
+        own workspace when omitted.  A workspace of the non-deterministic
+        package is refused (``ValueError``), also in a call with no rows.
 
     Returns
     -------
@@ -427,14 +767,10 @@ def cake_rmsnorm_silu_gate_det_train_backward(
             dw = grad_weight
     dx, dx_user = _output(grad_x, "grad_x", shape=shape, device=device)
     dz, dz_user = _output(grad_z, "grad_z", shape=shape, device=device)
-    # The other mode's workspace is refused for any row count, so before the
-    # return of a call with no rows; the size check below needs the row count.
-    if isinstance(workspace, torch.Tensor) and workspace.dtype == torch.float64:
-        raise ValueError(
-            "workspace is FP64, a workspace of the non-deterministic mode "
-            f"({_NONDETERMINISTIC_WORKSPACE}); the deterministic backward needs "
-            f"an FP32 workspace ({_DETERMINISTIC_WORKSPACE})"
-        )
+    # A caller's workspace is checked for any row count (its size does not
+    # depend on the rows), so before the return of a call with no rows.
+    if workspace is not None:
+        _check_workspace(workspace, device, _workspace_elements(arch))
     if rows == 0:
         if dw is not None and not accumulate_grad_weight:
             dw.zero_()
@@ -446,24 +782,25 @@ def cake_rmsnorm_silu_gate_det_train_backward(
     gv, dy_tok, dy_head = _kernel_view(grad_out, "grad_out", shape=shape, device=device)
     xv, x_tok, x_head = _kernel_view(x, "x", shape=shape, device=device)
     zv, z_tok, z_head = _kernel_view(z, "z", shape=shape, device=device)
-    main = route_module(arch, "bwd")
-    chunks, blocks_per_cta = backward_chunks(main, rows)
+    index = _device_index(device)
+    role = "bwd_f32" if dw is not None and dw.dtype == torch.float32 else "bwd_bf16"
+    name = backward_module(
+        arch,
+        role,
+        rows,
+        heads,
+        device_sm_count(index),
+        dy_tok,
+        dy_head,
+        x_tok,
+        x_head,
+        z_tok,
+        z_head,
+    )
     if workspace is None:
-        partial = torch.empty((chunks, HEAD_DIM), dtype=torch.float32, device=device)
+        acc, flags, done = _stream_workspace_views(name, arch, device)
     else:
-        if (
-            not isinstance(workspace, torch.Tensor)
-            or workspace.device != device
-            or workspace.dtype != torch.float32
-            or not workspace.is_contiguous()
-            or workspace.numel() < chunks * HEAD_DIM
-        ):
-            raise ValueError(
-                f"workspace must be a contiguous FP32 tensor on {device} with at least "
-                f"{chunks * HEAD_DIM} elements"
-            )
-        partial = workspace.view(-1)[: chunks * HEAD_DIM].view(chunks, HEAD_DIM)
-    device_index = _device_index(device)
+        acc, flags, done = _workspace_views(workspace, name, device)
     values = {
         "dy": gv,
         "x": xv,
@@ -471,7 +808,10 @@ def cake_rmsnorm_silu_gate_det_train_backward(
         "w": w,
         "dx": dx,
         "dz": dz,
-        "partial": partial,
+        "acc": acc,
+        "flags": flags,
+        "done": done,
+        "dw": dw if dw is not None else torch.empty((0,), dtype=w.dtype, device=device),
         "rows": rows,
         "heads": heads,
         "dy_tok": dy_tok,
@@ -481,17 +821,10 @@ def cake_rmsnorm_silu_gate_det_train_backward(
         "z_tok": z_tok,
         "z_head": z_head,
         "eps": float(eps),
-        "blocks_per_cta": blocks_per_cta,
-        "chunks": chunks,
-        "dw": dw,
         "accumulate": 1 if accumulate_grad_weight else 0,
+        "weight_grad": 1 if dw is not None else 0,
     }
-    _loader.run_module(main, values, rows=rows, device_index=device_index)
-    if dw is not None:
-        role = "dw_f32" if dw.dtype == torch.float32 else "dw_bf16"
-        _loader.run_module(
-            route_module(arch, role), values, rows=rows, device_index=device_index
-        )
+    _loader.run_module(name, values, rows=rows, device_index=index)
     for kernel_buffer, user_buffer in ((dx, dx_user), (dz, dz_user)):
         if user_buffer is not None:
             user_buffer.copy_(kernel_buffer)
@@ -552,5 +885,6 @@ __all__ = [
     "cake_rmsnorm_silu_gate_det_train_backward_workspace",
     "cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes",
     "cake_rmsnorm_silu_gate_det_train_forward",
+    "cake_rmsnorm_silu_gate_det_train_reset_workspace",
     "is_cake_rmsnorm_silu_gate_det_train_supported",
 ]

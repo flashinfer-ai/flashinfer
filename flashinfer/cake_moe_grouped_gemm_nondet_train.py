@@ -19,9 +19,11 @@ training module.
 The functions of this module are stable FlashInfer APIs (``@flashinfer_api``;
 no experimental marking) and hand off to the backend package
 :mod:`flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train` with the
-same arguments: the weight gradient with the 512-wide k tile adds its split
-tail (the tiles of its last partial wave, cut into k-step units over the
-clusters) in place with unordered fp32 reductions, in one launch.
+same arguments: the weight gradient with the 512-wide k tile finishes its
+split tail (the tiles of its last partial wave, cut into k-step units over the
+clusters) in the same launch, where the deterministic package adds a second
+tail-reduce launch: each unit stores its fp32 partial to a slot and the tile's
+last unit sums the slots in slot order.
 
 The module is the mode.  No entry takes a ``deterministic`` argument (passing
 one raises ``TypeError``); every call runs the non-deterministic package, and
@@ -38,34 +40,32 @@ shapes::
     cake_moe_grouped_gemm_nondet                     cake_moe_grouped_gemm_det
     CakeMoEGroupedGemmNondetFunction                 CakeMoEGroupedGemmDetFunction
 
-Under ``torch.use_deterministic_algorithms(True)`` an order-varying launch
-raises PyTorch's non-determinism alert immediately before it runs
-(``RuntimeError``, nothing launches; with ``warn_only=True`` a ``UserWarning``,
-then the non-deterministic launch runs); there is never a deterministic
-fallback.  An order-varying launch is the weight gradient whose 512-wide k
-tile splits its tail (``plan["unordered_tail"]`` and
-``plan["tail_splits"] > 1``), in overwrite or accumulate mode:
-:func:`cake_moe_grouped_gemm_nondet_train_wgrad`, ``launch()`` of such a
-prepared weight gradient, and the backward of
-:func:`cake_moe_grouped_gemm_nondet` when it computes ``dW``.  The forward
-pass, the data gradient, the 256-wide k tile's weight gradient, an unsplit
-tail and every preparation run in a fixed order and never alert.
+Every launch runs in a fixed order, so no launch alerts under
+``torch.use_deterministic_algorithms(True)``.  The alert stays for an
+order-varying launch (a weight gradient planned with ``plan["unordered_tail"]``
+and a split tail), which only an architecture listed in the package's
+``unordered_tail_archs`` (empty) plans: it would raise PyTorch's
+non-determinism alert immediately before it runs (``RuntimeError``, nothing
+launches; with ``warn_only=True`` a ``UserWarning``, then the launch runs);
+there is never a deterministic fallback.
 
-Numerical contract: only the run-to-run bitwise reproducibility of the weight
-gradient ``dW`` is relaxed.  ``Y`` and ``dX`` are bitwise the deterministic
-package's (copies of the same programs; on sm_100a the data gradient's L2
-evict-first twin is the package's own build of the deterministic wide program,
-whose cache policy changes no arithmetic), and so is ``dW`` wherever the
-256-wide k tile runs or the 512-wide k tile does not split its tail.  Every
-whole tile of ``dW`` is reduced by one CTA pair over the group's rows in a
-fixed order; only the units of a split tail tile are added in an order the
-launch does not fix.  The operands (bf16), the accumulation (fp32), the one
-round-to-nearest rounding to bf16 (or the fp32 store), the layouts, the
-device-resident ``offs`` contract (no host synchronisation, no padding), the
-exact zeros of empty groups, the error budgets and the fixes the deterministic
-package carries are unchanged.  The split tail's fp32 sums and tickets are
-workspaces kept per (device, CUDA stream) at rest at zero (every launch leaves
-them zero); a CUDA-graph capture takes zeroed buffers of its own.
+Numerical contract: every output (``Y``, ``dX``, ``dW`` in bf16 or fp32, and
+the accumulated ``out`` / ``main_grad``) repeats bit for bit for the same
+inputs, shapes, device SM count and configuration.  ``Y`` and ``dX`` are
+bitwise the deterministic package's (copies of the same programs), and so
+is ``dW`` wherever the 256-wide k tile runs or the 512-wide k tile does not
+split its tail.  Every whole tile of ``dW`` is reduced by one CTA pair over the
+group's rows in a fixed order, and the units of a split tail tile are summed
+in slot order; the tail plan and group order differ from the deterministic
+package's, so such a tile can differ from its bits, within its error budgets.
+The operands (bf16), the accumulation (fp32), the one round-to-nearest
+rounding to bf16 (or the fp32 store), the layouts, the device-resident
+``offs`` contract (no host synchronisation, no padding), the exact zeros of
+empty groups, the error budgets and the fixes the deterministic package
+carries are unchanged.  The split tail's fp32 slots and tickets are workspaces
+kept per (device, CUDA stream); only the tickets rest at zero (every launch
+leaves them zero), and the slots, ``tail_splits`` per tail tile, need no value
+between launches.  A CUDA-graph capture takes buffers of its own.
 
 Weight-gradient accumulation
 (``cake_moe_grouped_gemm_nondet_train_wgrad(..., out=out, accumulate=True)``,
@@ -74,7 +74,7 @@ Weight-gradient accumulation
 into ``w.main_grad`` in the backward; Megatron's
 ``gradient_accumulation_fusion``) is the package's accumulate mode (fused into
 the 512-wide k tile's epilogue where served, else the overwrite into a scratch
-and ``out.add_``), with the same alert rule.
+and ``out.add_``), with the same numerical contract.
 
 This is a local operator: on a context-parallel rank it runs on that rank's
 local rows; it adds no collective, and the reduction of a parameter gradient
@@ -87,7 +87,7 @@ Usage::
         cake_moe_grouped_gemm_nondet_train_wgrad,
     )
 
-    y = cake_moe_grouped_gemm_nondet(x, w, offs)  # unordered dW split tail
+    y = cake_moe_grouped_gemm_nondet(x, w, offs)  # dW split tail in one launch
     dw = cake_moe_grouped_gemm_nondet_train_wgrad(g, x, offs, out_dtype=torch.float32)
 
 The kernels, the host planning, the autograd wrapper and the JIT registration
@@ -139,6 +139,9 @@ def cake_moe_grouped_gemm_nondet_train_forward(
 ) -> torch.Tensor:
     """``Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T`` for every group ``e``.
 
+    The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+    For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
+
     Parameters
     ----------
     x : torch.Tensor
@@ -181,14 +184,26 @@ def cake_moe_grouped_gemm_nondet_train_dgrad(
 ) -> torch.Tensor:
     """``dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]`` for every group ``e``.
 
+    The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+    For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
+
     ``g`` is ``[sum_m, N]`` bfloat16, ``w`` is ``[E, N, K]`` bfloat16 and is
     read in place (no transpose copy), ``offs`` is ``[E]`` int32 device end
     offsets (or ``m_indptr`` ``[E + 1]``) and ``out`` is ``[sum_m, K]`` bfloat16.  ``K % 256 == 0`` and
     ``N % 64 == 0`` are required.  The programs are copies of the deterministic
-    package's, but for the sm_100a evict-first twin, this package's own build of
-    the deterministic wide tile, and all give its bits (no alert under torch's
-    deterministic mode).  See
+    package's and give its bits (no alert under torch's deterministic mode).  See
     ``cake_moe_grouped_gemm_nondet_train_forward`` for the prepared form.
+
+    Parameters
+    ----------
+    g : torch.Tensor
+        BF16 ``[sum_m, N]`` packed output-gradient rows.
+    w : torch.Tensor
+        BF16 ``[E, N, K]`` expert weights, read in place.
+    offs : torch.Tensor
+        int32 device cumulative end offsets ``[E]``, or leading-zero ``m_indptr [E + 1]``.
+    out : torch.Tensor, optional
+        Caller-owned BF16 ``[sum_m, K]`` output; allocated when omitted.
     """
     from .experimental.cake.cake_moe_grouped_gemm_nondet_train import (
         cake_moe_grouped_gemm_nondet_train_dgrad as _impl,
@@ -210,17 +225,19 @@ def cake_moe_grouped_gemm_nondet_train_wgrad(
 ) -> torch.Tensor:
     """``dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]`` for every group ``e``.
 
+    The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+    For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
+
     ``g`` is ``[sum_m, N]`` bfloat16, ``x`` is ``[sum_m, K]`` bfloat16,
     ``offs`` is ``[E]`` int32 device end offsets (``E = offs.numel()``; pass
     ``num_groups=E`` to hand in ``m_indptr`` ``[E + 1]`` instead) and ``out``
     is ``[E, N, K]`` in ``out_dtype`` (bfloat16 or float32; defaults to the
     dtype of ``out``, else bfloat16).  fp32 accumulation, one rounding at the
     store, exact zeros for empty groups.  With the 512-wide k tile a split tail
-    is added with unordered fp32 reductions, so ``dW`` is not bitwise
-    reproducible run to run, and under
-    ``torch.use_deterministic_algorithms(True)`` such a launch raises the
-    non-determinism alert immediately before it runs (a fixed-order launch does
-    not).  ``N % 256 == 0`` and ``K`` a
+    is summed in slot order in the same launch, so ``dW`` repeats bit for bit
+    for the same inputs, shapes, device SM count and configuration, and no
+    launch alerts under ``torch.use_deterministic_algorithms(True)``.
+    ``N % 256 == 0`` and ``K`` a
     multiple of the selected k tile (256, or 512 when chosen) are required.
     See ``cake_moe_grouped_gemm_nondet_train_forward`` for the prepared form.
 
@@ -231,6 +248,23 @@ def cake_moe_grouped_gemm_nondet_train_wgrad(
     build, else the overwrite into a scratch followed by ``out.add_``
     (``cake_moe_grouped_gemm_nondet_train_prepare_wgrad`` and the package README give the routes and
     the numerical contract).
+
+    Parameters
+    ----------
+    g : torch.Tensor
+        BF16 ``[sum_m, N]`` packed output-gradient rows.
+    x : torch.Tensor
+        BF16 ``[sum_m, K]`` packed activation rows.
+    offs : torch.Tensor
+        int32 device cumulative end offsets ``[E]``, or leading-zero ``m_indptr [E + 1]``.
+    out : torch.Tensor, optional
+        Caller-owned ``[E, N, K]`` output; required when accumulating.
+    out_dtype : torch.dtype, optional
+        ``torch.bfloat16`` or ``torch.float32``; defaults to ``out.dtype`` or bfloat16 without ``out``.
+    num_groups : int, optional
+        Expert count ``E``; must be supplied for ``m_indptr`` input.
+    accumulate : bool, default=False
+        Add the weight gradient into ``out`` instead of overwriting it.
     """
     from .experimental.cake.cake_moe_grouped_gemm_nondet_train import (
         cake_moe_grouped_gemm_nondet_train_wgrad as _impl,
@@ -259,10 +293,23 @@ def cake_moe_grouped_gemm_nondet_train_prepare_forward(
     ``x``: ``[sum_m, K]`` bf16; ``w``: ``[E, N, K]`` bf16; ``offs``: int32
     ``[E]`` device end offsets; ``N % 256 == 0``, ``K % 64 == 0`` (the
     512-column tile when ``N % 512 == 0`` on the architectures of
-    ``wide_fwd_archs``, its 3 / 3 head / tail twin where ``fwd_wide_ts33`` holds).
+    ``wide_fwd_archs``, its L2 evict-first twin where ``fwd_lwh_ef`` or
+    ``fwd_evict_first`` holds for ``K``, its 3 / 3 head / tail twin where
+    ``fwd_wide_ts33`` holds).
     ``out`` may be row-padded (any row stride, unit column
     stride).  The programs are copies of the deterministic package's and give
     its bits.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        BF16 ``[sum_m, K]`` packed activation rows.
+    w : torch.Tensor
+        BF16 ``[E, N, K]`` expert weights.
+    offs : torch.Tensor
+        int32 device cumulative end offsets ``[E]``, or leading-zero ``m_indptr [E + 1]``.
+    out : torch.Tensor, optional
+        Caller-owned BF16 ``[sum_m, N]`` output; allocated when omitted.
     """
     from .experimental.cake.cake_moe_grouped_gemm_nondet_train.cake_backend import (
         cake_moe_grouped_gemm_nondet_train_prepare_forward as _impl,
@@ -286,8 +333,18 @@ def cake_moe_grouped_gemm_nondet_train_prepare_dgrad(
     ``wide_dgrad_archs``, its L2 evict-first twin where ``dgrad_evict_first``
     holds for ``K``, ``sum_m`` and ``E``, its 3 / 3 head / tail twin where
     ``dgrad_wide_ts33`` holds).  The programs are copies of the deterministic
-    package's, but for the sm_100a evict-first twin, this package's own build of
-    the deterministic wide tile, and all give the deterministic package's bits.
+    package's and give its bits.
+
+    Parameters
+    ----------
+    g : torch.Tensor
+        BF16 ``[sum_m, N]`` packed output-gradient rows.
+    w : torch.Tensor
+        BF16 ``[E, N, K]`` expert weights, read in place.
+    offs : torch.Tensor
+        int32 device cumulative end offsets ``[E]``, or leading-zero ``m_indptr [E + 1]``.
+    out : torch.Tensor, optional
+        Caller-owned BF16 ``[sum_m, K]`` output; allocated when omitted.
     """
     from .experimental.cake.cake_moe_grouped_gemm_nondet_train.cake_backend import (
         cake_moe_grouped_gemm_nondet_train_prepare_dgrad as _impl,
@@ -307,7 +364,7 @@ def cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
     *,
     accumulate: bool = False,
 ) -> CakeMoEGroupedGemmNondetLaunch:
-    """Prepare ``dW[E, N, K] = grouped G[e].T @ X[e]`` (bf16 in; bf16 or fp32 out), non-deterministic.
+    """Prepare ``dW[E, N, K] = grouped G[e].T @ X[e]`` (bf16 in; bf16 or fp32 out) with this package's programs.
 
     ``g``: ``[sum_m, N]`` bf16; ``x``: ``[sum_m, K]`` bf16; ``offs``: int32
     ``[E]`` device end offsets (``E = offs.numel()`` unless ``num_groups`` is
@@ -316,14 +373,15 @@ def cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
     when it is chosen).  Empty groups produce exact zeros.  ``out_dtype``
     defaults to the dtype of ``out`` (bf16 when neither is given).
 
-    With the 512-wide k tile a split tail is added in place with unordered fp32
-    reductions
-    (``plan["unordered_tail"]`` and ``plan["tail_splits"] > 1``, the launch's
-    ``order_varying``), so ``dW`` is not bitwise reproducible run to run; with
+    With the 512-wide k tile a split tail is finished in the same launch by the
+    ordered one-launch tail (``plan["ordered_tail"]`` and
+    ``plan["tail_splits"] > 1``: each unit stores its fp32 partial to a slot of
+    ``tail_sums`` and the tile's last unit sums the slots in slot order); with
     the 256-wide k tile the deterministic program and its ordered tail reduce
-    run.  The preparation never alerts; under
-    ``torch.use_deterministic_algorithms(True)`` an order-varying launch raises
-    the non-determinism alert at each ``launch()`` (module docstring).
+    run.  Either way ``dW`` repeats bit for bit for the same inputs, shapes,
+    device SM count and configuration, and no launch alerts under
+    ``torch.use_deterministic_algorithms(True)`` (the alert serves only an
+    architecture listed in ``unordered_tail_archs``: module docstring).
 
     ``accumulate=True`` adds instead: every launch computes
     ``out[e] <- out[e] + G[e].T @ X[e]`` into the caller's ``out`` (required, bf16
@@ -338,6 +396,23 @@ def cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
     that captured it may replay); every other plan key is the overwrite's
     (module docstring, accumulate mode).  Each ``launch()`` and each replay of a
     graph that captured it adds again.
+
+    Parameters
+    ----------
+    g : torch.Tensor
+        BF16 ``[sum_m, N]`` packed output-gradient rows.
+    x : torch.Tensor
+        BF16 ``[sum_m, K]`` packed activation rows.
+    offs : torch.Tensor
+        int32 device cumulative end offsets ``[E]``, or leading-zero ``m_indptr [E + 1]``.
+    out : torch.Tensor, optional
+        Caller-owned ``[E, N, K]`` output; required when accumulating.
+    out_dtype : torch.dtype, optional
+        ``torch.bfloat16`` or ``torch.float32``; defaults to ``out.dtype`` or bfloat16 without ``out``.
+    num_groups : int, optional
+        Expert count ``E``; must be supplied for ``m_indptr`` input.
+    accumulate : bool, default=False
+        Add the weight gradient into ``out`` instead of overwriting it.
     """
     from .experimental.cake.cake_moe_grouped_gemm_nondet_train.cake_backend import (
         cake_moe_grouped_gemm_nondet_train_prepare_wgrad as _impl,
@@ -363,6 +438,9 @@ def cake_moe_grouped_gemm_nondet(
     fuse_wgrad_accumulation: bool = False,
 ) -> torch.Tensor:
     """Differentiable ragged grouped GEMM ``Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T``.
+
+    The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+    For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
 
     Parameters
     ----------
@@ -402,14 +480,16 @@ def cake_moe_grouped_gemm_nondet(
     torch.Tensor
         ``[sum_m, N]`` bfloat16, the deterministic forward's bits.  ``backward``
         produces ``x.grad`` ``[sum_m, K]`` bfloat16 (the deterministic bits) and
-        ``w.grad`` ``[E, N, K]`` in ``w``'s dtype (bfloat16), not bitwise
-        reproducible run to run where the 512-wide k tile splits its tail; use
-        :func:`cake_moe_grouped_gemm_nondet_train_wgrad` directly for an fp32 weight gradient.  Under
-        ``torch.use_deterministic_algorithms(True)`` the backward raises the
-        non-determinism alert immediately before a weight-gradient launch that
-        adds a split tail with unordered reductions (``RuntimeError``; under
-        ``warn_only=True`` a ``UserWarning``, then it runs; no fallback); the
-        forward, ``dX`` and a fixed-order ``dW`` do not alert.  The forward GEMM runs after
+        ``w.grad`` ``[E, N, K]`` in ``w``'s dtype (bfloat16), which repeats bit
+        for bit for the same inputs, shapes, device SM count and configuration
+        (a split tail of the 512-wide k tile is summed in slot order); use
+        :func:`cake_moe_grouped_gemm_nondet_train_wgrad` directly for an fp32 weight gradient.  No
+        launch of the forward or the backward alerts under
+        ``torch.use_deterministic_algorithms(True)``; an order-varying weight-gradient
+        launch, which only an architecture listed in ``unordered_tail_archs`` plans,
+        would raise the non-determinism alert immediately before it runs
+        (``RuntimeError``; under ``warn_only=True`` a ``UserWarning``, then it
+        runs; no fallback).  The forward GEMM runs after
         autograd saved ``x``, ``w`` and ``offs``: under a non-reentrant
         checkpoint with early stop on, the recomputation skips it when these
         are the last saves of the innermost checkpointed region, as for a
@@ -441,6 +521,11 @@ def is_cake_moe_grouped_gemm_nondet_train_supported(
     dtype).  False without CUDA, for a device that is not CUDA or not visible, and
     for an architecture without the programs.  The query loads no program and
     launches nothing.
+
+    Parameters
+    ----------
+    device : torch.device, optional
+        Device to query; ``None`` selects the current CUDA device.
     """
     if not torch.cuda.is_available():
         return False

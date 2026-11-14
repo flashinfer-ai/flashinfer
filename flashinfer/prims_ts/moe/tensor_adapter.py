@@ -60,13 +60,13 @@ def _validate_swap_ab_cluster_span(cfg, out_hidden: int) -> None:
     validated by the launch-capacity path.
     """
 
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+        _validate_swap_ab_out_hidden,
+    )
+
     if not cfg.is_swap_ab:
         return
-    if out_hidden % cfg.tile_m:
-        raise ValueError(
-            f"swapAB requires out_hidden to be a multiple of tile_m={cfg.tile_m}, "
-            f"got {out_hidden}"
-        )
+    _validate_swap_ab_out_hidden(cfg, out_hidden)
     cluster_dim_x = int(cfg.preferred_cluster_shape[0])
     if cluster_dim_x <= int(cfg.umma_cta_count):
         return
@@ -621,6 +621,10 @@ def build_bf16_launch_io(
         ("num_non_exiting_ctas", num_non_exiting_ctas),
         ("total_num_padded_tokens", total_num_padded_tokens),
     ):
+        # A strided C view (partitioned column slice) is checked against
+        # c_row_stride by _validate_c_output_layout instead.
+        if c_row_stride and tensor is output_buf:
+            continue
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
     if num_non_exiting_ctas.numel() < 1:

@@ -23,7 +23,7 @@ limitations under the License.
 # registered FP8 programs and skip otherwise.
 #
 # Like ``test_cake_dsa_indexer_det_train.py`` this suite names the package once, through
-# ``tests.test_helpers.cake_package``, and imports nothing else from flashinfer.
+# ``tests.cake.test_helpers.cake_package``, and imports nothing else from flashinfer.
 
 import copy
 import importlib.util
@@ -32,8 +32,8 @@ import itertools
 import pytest
 import torch
 
-from tests.test_helpers import cake_dsa_indexer_reference as ref
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers import cake_dsa_indexer_reference as ref
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake.cake_dsa_indexer_det_train", "cake_backend")
 cake_jit = cake_package("cake.cake_dsa_indexer_det_train", "cake_jit")
@@ -233,7 +233,9 @@ def test_fp8_record_replaces_only_its_fields_and_leaves_the_bf16_record():
     }
     # the FP8 records' own rules: every split field pinned (no split-resident rule); sm_107a keeps no split-fit
     # rule (no FP8 split program is measured under one), and no FP8 call walks its key tiles in descending order
-    # (the descending-walk programs are BF16 programs)
+    # (the descending-walk programs are BF16 programs); the sm_107a FP8 record sets neither BF16 sampling rule (the
+    # #7549 rules are measured on the BF16 programs) and runs no longest-first copy (its static programs draw no
+    # tickets to order; the BF16 record runs the copies of its l6 ticket programs)
     split_fields = (
         "split_max",
         "split_min_range_tiles",
@@ -281,6 +283,9 @@ def test_fp8_record_replaces_only_its_fields_and_leaves_the_bf16_record():
             "snake_l6_fallback_waves": None,
         },
         "sm_107a": {
+            "sample_class_rule": None,
+            "sample_long_rule": None,
+            "lsf_programs": False,
             "snake_cap_rule": [1, 40],
             "desc_walk_kinds": None,
             "snake_packed_rule": None,

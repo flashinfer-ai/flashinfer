@@ -24,6 +24,10 @@ any size that is not a tile multiple.  All operands are bfloat16 with fp32 tenso
 accumulation; the reductions are bitwise deterministic (no atomics) and empty groups
 produce exactly zero weight gradients.
 
+The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
+Standalone ``wgrad`` calls with ``m_indptr`` must also pass ``num_groups=E``.
+
 ============ ==================================================================== ============================
 operation    computation                                                           output
 ============ ==================================================================== ============================
@@ -101,10 +105,14 @@ Weight-gradient accumulation
 gradient into the caller's bf16 or fp32 ``out`` (``out[e] += G[e].T @ X[e]``, Megatron's
 gradient-accumulation fusion) and ``cake_moe_grouped_gemm_det(..., fuse_wgrad_accumulation=True)``
 adds it into ``w.main_grad`` in its backward.  Both are keyword-only and off by default;
-with the defaults nothing changes.  The launch composes (``plan["accumulate"] ==
-"composed"``): the overwrite of the same plan (route, k tile, stage, tail split and its
-ordered tail reduce) into a contiguous scratch of ``out``'s dtype, then ``out.add_`` on the
-same stream, outside autograd.
+with the defaults nothing changes.  The host plans the launch as the overwrite of the
+same call (route, k tile, stage, tail split and its ordered tail reduce) and adds on one of
+two routes (``plan["accumulate"]``).  ``"fused"``: for an fp32 ``out`` on the 512-wide k
+tile's half-release forms, where the accumulate builds of the stage and, for a split tail,
+of the tail reduce ship and can load, and ``out`` is 32-byte aligned, the kernels add into
+``out`` in place (no scratch).  ``"composed"`` otherwise (``plan["accumulate_reason"]``):
+the overwrite into a contiguous scratch of ``out``'s dtype, then ``out.add_`` on the same
+stream, outside autograd.  Both routes give the same bits.
 
 - Numerics: ``out`` gets AccumulateGrad's bits of the deterministic weight gradient in its
   dtype (fp32: one fp32 add of the fp32 ``dW``; bf16: the bf16 ``dW`` added in bf16),
@@ -115,9 +123,9 @@ same stream, outside autograd.
 - Checks (``ValueError``, before anything is allocated or bound): ``out`` given,
   ``out_dtype`` None or its dtype, bf16 or fp32, no overlap of ``out`` with itself, ``g``,
   ``x`` or ``offs``.  Row and expert padding is never read or written.
-- Prepared launches: every ``launch()`` and every CUDA graph replay adds again (the add
-  bumps ``out._version`` at ``launch()`` and at capture, not at a replay).  The scratch is
-  owned by the prepared launch and allocated on the stream current at the preparation:
+- Prepared launches: every ``launch()`` and every CUDA graph replay adds again (a launch
+  bumps ``out._version`` at ``launch()`` and at capture, not at a replay).  The composed
+  scratch is owned by the prepared launch and allocated on the stream current at the preparation:
   keep the launch alive while a graph that captured it may replay and, after a launch on
   another stream, until that launch completes; do not run one prepared accumulate launch
   on two streams at once.
@@ -131,7 +139,8 @@ same stream, outside autograd.
   ``NotImplementedError`` under ``torch.jit.trace``, ``torch.compile`` and a
   ``create_graph`` backward; a reentrant checkpoint passes ``w`` without ``main_grad``
   (``ValueError``).
-- Cost (``S = E * N * K``): the scratch takes ``4 * S`` bytes for fp32 (gate/up ``N`` 4096,
+- Cost (``S = E * N * K``): the fused route takes no scratch.  The composed route's
+  scratch takes ``4 * S`` bytes for fp32 (gate/up ``N`` 4096,
   ``K`` 6144: 384 MiB at ``E`` 4 to 3 GiB at ``E`` 32; down ``N`` 6144, ``K`` 2048: 192 MiB
   to 1.5 GiB) and ``8 * S`` bytes of traffic (written, then read back by the add); with an
   fp32 ``main_grad`` the backward's peak is ``2 * S`` bytes above the default flag's bf16
@@ -139,8 +148,7 @@ same stream, outside autograd.
   equal).  Under
   ``torch.use_deterministic_algorithms(True)`` with
   ``torch.utils.deterministic.fill_uninitialized_memory`` on, torch also fills the scratch
-  and the placeholder with NaN when it allocates them.  The non-deterministic module adds
-  in the kernel epilogue instead (:ref:`apicake_moe_grouped_gemm_nondet_train`).
+  and the placeholder with NaN when it allocates them.
 
 Prepared launches
 -----------------

@@ -13,31 +13,34 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Backend suite of the Cake four-stream mHC training package with the opt-in
-non-deterministic backward
-(``flashinfer.experimental.cake.cake_mhc_nondet_train``; hidden 4096, 5120
-and 7168 on SM100 / SM103, 4096 on SM107; 4 streams; FlashInfer issue #8068).
+Backend suite of the Cake four-stream mHC training package
+``flashinfer.experimental.cake.cake_mhc_nondet_train`` (hidden 4096, 5120 and
+7168 on SM100 / SM103, 4096 on SM107; 4 streams; FlashInfer issue #8068).
 
 The package is standalone: its forward, statistics replay, residual mixing and
 backward prepare run its own copies of the deterministic programs, and
-``cake_mhc_nondet_train_backward_finish(...)`` launches its copy
-of the deterministic token-owner pass, its atomic fn split (beside the
-token-owner pass as its programmatic dependent; it also clears ``dfn`` without
-``accumulate``) and its atomic column-slab pass, which adds
-the ``dfn`` partial of every (column slab, token chunk) unit into ``dfn`` with
-FP32 reductions and folds ``dscale`` / ``dbase`` in fixed order; there is no
-reduction kernel.  ``dX`` is the deterministic package's bits, ``dscale`` and
-``dbase`` the bits of its per-CTA reduction (inside its group-row bands,
-``BWD_ROW_BANDS``, the deterministic package sums them in another fixed order,
-which this package does not copy: the reference there is its backward with
-those forms off, :func:`_det_backward`); each ``dfn`` element sums ``P``
-per-chunk FP32 partials (``P`` the column slab's chunk count:
-``cake_jit.k7_chunks``, or the two-size geometry where ``cake_jit.lpt_chunks``
-fires; at most 32) in an order that may change from run to run.  The mode is
-part of the names: no entry point takes a ``deterministic`` keyword (passing one
-is a ``TypeError``) and nothing falls back to the deterministic package (checked
-without a device by ``test_cake_mhc_nondet_train_rules.py``).  The deterministic
-package
+``cake_mhc_nondet_train_backward_finish(...)`` launches its copy of the
+deterministic token-owner pass (its group-row form inside ``BWD_ROW_BANDS``, as
+the deterministic package does), its atomic fn split (beside the token-owner
+pass as its programmatic dependent; it also clears ``dfn`` without
+``accumulate``) and its column-slab pass, which stores the compensated ``dfn``
+sum of every (column slab, token chunk) unit (the deterministic partial of that
+unit) in its chunk's slots of the workspace, folds the slots of each element in
+chunk order into ``dfn`` once every unit is done (a compensated FP32 sum, the
+carried value last under ``accumulate``, one rounding) and folds
+``dscale`` / ``dbase`` in the deterministic reduction's order; there is no
+reduction kernel.  Every output repeats bit for bit from launch to launch on
+one device.  ``dX``, ``dscale`` and ``dbase`` are the deterministic package's
+bits; each ``dfn`` element folds ``P`` per-chunk FP32 partials (``P`` the
+column slab's chunk count: ``cake_jit.k7_chunks``, or the two-size geometry
+where ``cake_jit.lpt_chunks`` fires; at most 32; on the one-size chunks the
+deterministic package's partials) in a compensated FP32 sum, where the
+deterministic package sums its ``P`` partials in FP64, so its low-order bits
+may differ from the deterministic ``dfn`` near an FP32 rounding boundary.
+The mode is part of the names: no entry point takes a ``deterministic``
+keyword (passing one is a ``TypeError``) and nothing falls back to the
+deterministic package (checked without a device by
+``test_cake_mhc_nondet_train_rules.py``).  The deterministic package
 (``flashinfer.experimental.cake.cake_mhc_det_train``) is the same-input reference
 throughout, never a source of tolerances.  This module checks:
 
@@ -49,20 +52,19 @@ throughout, never a source of tolerances.  This module checks:
   the saturated-sigmoid tail clause and the single-cast cancellation band in
   the deterministic suite's form;
 * against the deterministic backward on the same inputs: ``dX``, ``dscale``,
-  ``dbase`` bitwise (``dscale`` / ``dbase``: its per-CTA reduction's, as
-  above); ``|dfn - dfn_det| <= F u (|carried| + 1.02 sum_t |dz'_t|
+  ``dbase`` bitwise; ``|dfn - dfn_det| <= F u (|carried| + 1.02 sum_t |dz'_t|
   |x_t|)`` per element (``u = 2^-24``; the FP64 absolute-value contraction of
-  the reference bounds the magnitude of every partial sum either order forms):
+  the reference bounds the magnitude of every partial sum either fold forms):
   ``F = 2 P`` where the column slab runs ``dynr`` or its slab-fastest copy
-  ``dynr_os`` (both sides sum the same per-chunk partials, ``P`` roundings
-  each) and ``F = 2 max(P, P_k7) + 10`` where it runs ``lpt`` or ``lpt_os``
-  (the partials are another partition's; see :func:`_dfn_factor`), the largest
-  ratio printed, also with the unit order forced to each of ``"chunk"`` and
-  ``"slab"`` where the device's route holds that order's records (the board
-  cells of ``BWD_SLAB_ORDER_OVERRIDES`` / ``BWD_SLAB_LPT_OVERRIDES`` emptied,
-  so the forced order holds on every board, the 212-SM sm_107a and 152-SM
-  sm_103a ones too); run to run, ``dX`` / ``dscale`` / ``dbase`` identical
-  and the ``dfn`` bits that differ counted and printed (never asserted);
+  ``dynr_os`` (both sides fold the same per-chunk partials) and ``F = 2 max(P,
+  P_k7) + 10`` where it runs ``lpt`` or ``lpt_os`` (the partials are another
+  partition's; see :func:`_dfn_factor`), the largest ratio printed, also with
+  the unit order forced to each of ``"chunk"`` and ``"slab"`` where the
+  device's route holds that order's records (the board cells of
+  ``BWD_SLAB_ORDER_OVERRIDES`` / ``BWD_SLAB_LPT_OVERRIDES`` emptied, so the
+  forced order holds on every board, the 212-SM sm_107a and 152-SM sm_103a ones
+  too); run to run, and between the default workspace and a poisoned caller
+  workspace, every output (``dfn`` included) identical;
 * the two-size schedule at forced geometries (``cake_jit.lpt_chunks`` replaced
   for one token count: one size, one small chunk, several, small chunks past
   ``T``, empty small chunks, 32 chunks, one round of units, a short odd row,
@@ -75,19 +77,18 @@ throughout, never a source of tolerances.  This module checks:
   (``lpt_os`` with the slab-fastest order forced) launches over
   ``min(SMs, H / 64 x P)`` CTAs, ``dX`` / ``dscale`` / ``dbase`` bitwise the
   deterministic package's on two launches (fresh outputs, then a poisoned
-  caller workspace), ``dfn`` within the bound, the ticket word back to 0;
+  caller workspace), ``dfn`` within the bound and the same bits on both, the
+  ticket word and the column slab's arrival counts back to 0;
 * the forward entry points (forward prepare, statistics replay, residual
   mixing, backward prepare) bitwise the deterministic package's, and every
   launch one of this package's records (the deterministic package launches
   nothing; the backward loads exactly the token-owner record, the atomic fn
   split and the column slab's form of the call, in that order);
-* PyTorch's deterministic algorithms: ``backward_finish`` raises PyTorch's
-  alert (``RuntimeError`` before any launch; under ``warn_only`` one
-  ``UserWarning`` per call, then the non-deterministic backward runs, never a
-  fallback), and so does the backward of the ``cake_mhc_nondet_train_prepare`` node,
-  also when the mode is enabled between the forward and the backward; the
-  forward entry points, the workspaces and the prepare node's forward never
-  alert;
+* PyTorch's deterministic algorithms (strict and ``warn_only``): every entry
+  point, ``backward_finish`` and the backward of the
+  ``cake_mhc_nondet_train_prepare`` node included (also when the mode is
+  enabled between the forward and the backward), runs without an alert or a
+  warning and gives the bits it gives with the mode off;
 * four ``accumulate=True`` passes; the autograd functions plain and under a
   non-reentrant checkpoint, against the deterministic gradients;
 * ``test_cake_mhc_det_train.py``'s checkpoint and lifetime cases with this
@@ -96,9 +97,11 @@ throughout, never a source of tolerances.  This module checks:
   checkpoint around the connection or after the prepare keeping nothing alive,
   nothing alive once a backward has run, repeated backward passes with
   ``retain_graph``, reentrant checkpoints, a backward without the prepare node,
-  interleaved connections; a zero row of ``X``, ``fn x 1e3`` logits, a changed
+  interleaved connections, each pair of this package's runs the same gradient
+  bits (``fn`` included); a zero row of ``X``, ``fn x 1e3`` logits, a changed
   token count without a rebuild and the argument validation;
-* concurrent launches on several streams; ``T == 0``; the build manifest;
+* concurrent launches on several streams (each its serial result's bits);
+  ``T == 0``; the build manifest;
 * the hidden sizes: the contract cases above that take ``hidden`` run at
   every size the device's architecture routes (5120 and 7168 on a
   representative subset of their token counts: small, a middle one and large
@@ -119,7 +122,7 @@ device) and ``test_cake_mhc_nondet_train_api.py`` (the
 
 The largest cases hold the FP64 reference in row blocks of 8192 tokens.  Like
 ``test_cake_mhc_det_train.py`` this suite exercises the backend packages alone
-(both named through ``tests.test_helpers.cake_package``) and imports nothing
+(both named through ``tests.cake.test_helpers.cake_package``) and imports nothing
 else from flashinfer.
 """
 
@@ -136,7 +139,7 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 KEY = "cake.cake_mhc_nondet_train"
 pkg = cake_package(KEY)
@@ -171,16 +174,16 @@ BLOCK_TOKENS = 8192
 SEED = 2032
 PARAM_CLAUSE_DRAWS = 25
 CANCEL_CLAUSE_DRAWS = 64
-# Launches of the non-deterministic backward per draw: every gate holds on each (the worst is reported).
+# Launches of this package's backward per draw: every gate holds on each (the worst is reported).
 REPEATS = 5
 RUN_TO_RUN_REPEATS = 8
 # The FP32 unit roundoff and the slack of the FP64 absolute-value contraction (the kernel's dz' is its own FP32
 # value split into three BF16 pieces, within 1e-5 relative of the FP64 dz'; the pieces add at most 2^-8 relative).
 FP32_UNIT_ROUNDOFF = 2.0**-24
 ABS_SLACK = 1.02
-TICKET_BYTES = (
-    256  # the ticket region: first in the backward workspace for every token count
-)
+# The backward workspace's zero prefix: the ticket region (256 bytes) and the column slab's arrival counts (512 bytes),
+# first for every token count and hidden size; every call finds it zero and leaves it zero.
+ZERO_PREFIX_BYTES = 768
 T_ACCURACY = (1, 7, 64, 257, 1024, 2049, 4096, 16263, 32768)
 T_DISTRIBUTION = (1, 2, 3, 7, 63, 129, 255, 1000, 2049)
 T_COMPARE = (1, 7, 64, 65, 257, 1000, 1024, 2049, 4096, 5000, 8192, 14928, 16263, 32768)
@@ -195,14 +198,15 @@ T_BENCH = (1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096, 8192, 14928, 15288, 1
 BF16, F32, F64 = torch.bfloat16, torch.float32, torch.float64
 _PARAMETER = ("dfn", "dscale", "dbase")
 _OUTPUTS = ("dX", "dfn", "dscale", "dbase")
-# Bitwise the deterministic package's (dscale / dbase: its per-CTA reduction's, _det_backward).
+# Bitwise the deterministic package's.
 _EXACT = ("dX", "dscale", "dbase")
+# PyTorch's wording of the alert of a non-deterministic operation (no call of this package raises it).
 _ALERT = "does not have a deterministic implementation"
-SLAB = "cake_mhc_train_bwd_slab_atomic__dynr"
-LPT = "cake_mhc_train_bwd_slab_atomic__lpt"
+SLAB = "cake_mhc_train_bwd_slab_fold__dynr"
+LPT = "cake_mhc_train_bwd_slab_fold__lpt"
 # The slab-fastest copies of the column slab's two forms (program keys ``dynr_os`` / ``lpt_os``).
-SLAB_OS = "cake_mhc_train_bwd_slab_atomic__dynr_os"
-LPT_OS = "cake_mhc_train_bwd_slab_atomic__lpt_os"
+SLAB_OS = "cake_mhc_train_bwd_slab_fold__dynr_os"
+LPT_OS = "cake_mhc_train_bwd_slab_fold__lpt_os"
 # The column-slab record of each program key (the size suffix appended at 5120 and 7168).
 SLAB_RECORDS = {"dynr": SLAB, "lpt": LPT, "dynr_os": SLAB_OS, "lpt_os": LPT_OS}
 # The lpt record's chunk scalars (cake_jit.slab_plan), in kernel-parameter order (P, rpc, p_big, rpc_small).
@@ -351,8 +355,8 @@ def _hidden_of(i: dict) -> int:
 
 
 def _parts(T: int, hidden: int = HIDDEN) -> int:
-    """``P``: the chunk count of the column-slab pass, the number of partials each ``dfn`` element sums (the
-    deterministic backward's chunk count too: both sum the partials of the same chunks)."""
+    """``P``: the chunk count of the column-slab pass, the number of partials each ``dfn`` element folds (the
+    deterministic backward's chunk count too: both fold the partials of the same chunks)."""
     parts = loader.host_plan(T, _sm_count(), _arch(), hidden)["parts"]
     assert parts == loader.k7_chunks(T, _sm_count(), hidden=hidden)[0], (T, hidden)
     assert parts == det_loader.host_plan(T, _sm_count(), _arch(), hidden)["parts"]
@@ -380,15 +384,16 @@ def _slab_parts(T: int, hidden: int = HIDDEN) -> int:
 
 def _dfn_factor(T: int, hidden: int = HIDDEN) -> float:
     """F of the dfn bound F u (|carried| + ABS_SLACK sum_t |dz'_t| |x_t|) at T.  F = 2 P where the column slab runs
-    dynr or dynr_os: both sides sum the same per-chunk partials, at most P roundings each (the unit order changes
-    only the order of the additions).  Under lpt or lpt_os the partials are another partition's.  Every chunk starts
-    on a 64-token tile and each tile's leading-piece product starts a fresh accumulator, so those products are
-    bitwise the same on both sides.  Each side then differs from the exact sum of those products and the trailing
-    terms by its own compensated summation of its tiles (2u), the rounding of acc - comp (u) and the FP32
-    accumulation of the trailing dz' pieces (at most 2^-8 of each term) over 16-tile groups (at most 128 accumulate
-    steps of at most 2u each: about 1.1u).  That is about 4.1u per side.  The cross-chunk roundings are P on this
-    side and at most P_k7 on the deterministic side.  So F = 2 max(P, P_k7) + 10 >= P + P_k7 + 8.2, which also
-    covers two launches of the same lpt partition (2 P)."""
+    dynr or dynr_os: both sides fold the same per-chunk partials (the unit order changes only which CTA forms each
+    partial), this package with a compensated FP32 sum and the deterministic package in FP64, each rounding once, well
+    inside the P roundings per side of any FP32 sum of the partials.  Under lpt or lpt_os the partials are another
+    partition's.  Every chunk starts on a 64-token tile and each tile's leading-piece product starts a fresh
+    accumulator, so those products are bitwise the same on both sides.  Each side then differs from the exact sum of
+    those products and the trailing terms by its own compensated summation of its tiles (2u), the rounding of acc -
+    comp (u) and the FP32 accumulation of the trailing dz' pieces (at most 2^-8 of each term) over 16-tile groups (at
+    most 128 accumulate steps of at most 2u each: about 1.1u).  That is about 4.1u per side.  The cross-chunk fold
+    rounds at most P times on this side and at most P_k7 times on the deterministic side.  So F = 2 max(P, P_k7) + 10
+    >= P + P_k7 + 8.2."""
     if not _lpt_runs(T, hidden):
         return 2.0 * _parts(T, hidden)
     return 2.0 * max(_slab_parts(T, hidden), _parts(T, hidden)) + 10.0
@@ -608,15 +613,16 @@ def _abs_contraction(i: dict) -> torch.Tensor:
 def _dfn_bound(
     i: dict, factor: float, *, carried: torch.Tensor | None = None
 ) -> torch.Tensor:
-    """Per-element bound of ``|dfn_a - dfn_b|`` for two sums of per-chunk partials in two orders:
+    """Per-element bound of ``|dfn_a - dfn_b|`` for two folds of per-chunk partials:
     ``factor u (|carried| + sum_t |dz'_t| |x_t|)`` (``factor`` = :func:`_dfn_factor` of the token count).
 
     Each side adds ``P`` partials (onto the carried-in value with ``accumulate``) with at most ``P`` FP32 roundings,
     each at most ``u`` times the running sum, whose magnitude never exceeds ``|carried| + sum_j |partial_j| <=
     |carried| + sum_t |terms_t|``: two sums of the same partials differ by at most ``2 P u (|carried| + sum_t |dz'_t|
-    |x_t|)``.  The bound holds for any partition of the tokens into the ``P`` chunks (``sum_j |partial_j| <= sum_t
-    |terms_t|`` up to the within-chunk rounding, which ``ABS_SLACK`` absorbs); where the two sides form the partials
-    of two partitions, ``factor`` adds both partitions' roundings and the within-chunk differences."""
+    |x_t|)`` (this package's compensated fold and the deterministic FP64 fold each round once).  The bound holds for
+    any partition of the tokens into the ``P`` chunks (``sum_j |partial_j| <= sum_t |terms_t|`` up to the
+    within-chunk rounding, which ``ABS_SLACK`` absorbs); where the two sides form the partials of two partitions,
+    ``factor`` adds both partitions' roundings and the within-chunk differences."""
     total = ABS_SLACK * _abs_contraction(i)
     if carried is not None:
         total = total + carried.double().abs()
@@ -706,51 +712,9 @@ def _nd_backward(i: dict, prep: dict, **kwargs) -> dict:
     return _backward(backward_finish, i, prep, **kwargs)
 
 
-def _clear_det_caches() -> None:
-    """Drop the deterministic package's cached host plans, workspace envelopes, layouts and route plans (each binds
-    the token-owner and reduction forms and the parameter region of its token count)."""
-    det_loader.host_plan.cache_clear()
-    det_loader.workspace_bytes_upto.cache_clear()
-    det._LAYOUTS.clear()
-    det._PLANS.clear()
-    det._FAST_ROUTES.clear()
-
-
-@contextlib.contextmanager
-def _det_per_cta():
-    """The deterministic package with its group-row forms off (``cake_jit.bwd_group_rows`` False at every call): the
-    per-CTA token owner and reduction whose ``dscale`` / ``dbase`` this package's column slab reproduces.  Its caches
-    are dropped on entry and on exit, also when the body fails (:func:`_clear_det_caches`)."""
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(det_loader, "bwd_group_rows", lambda *_args, **_kwargs: False)
-        _clear_det_caches()
-        try:
-            yield
-        finally:
-            patch.undo()
-            _clear_det_caches()
-
-
 def _det_backward(i: dict, prep: dict, **kwargs) -> dict:
-    """The deterministic backward of a case.  Where it runs its group-row forms (``cake_jit.bwd_group_rows`` of the
-    case's token count and hidden size on this device: ``BWD_ROW_BANDS``, which this package does not copy), its
-    ``dscale`` and ``dbase`` are overwritten in place with those of its per-CTA run (:func:`_det_per_cta`) on copies
-    of the call's arguments and a workspace of the per-CTA sizing; ``dX`` and ``dfn`` stay the shipped backward's."""
-    T, hidden = i["X"].shape[0], _hidden_of(i)
-    if not det_loader.bwd_group_rows(T, _sm_count(), _arch(), hidden):
-        return _backward(det_backward_finish, i, prep, **kwargs)
-    copies = {
-        k: v.clone() if isinstance(v, torch.Tensor) else v
-        for k, v in kwargs.items()
-        if k != "workspace"
-    }
-    out = _backward(det_backward_finish, i, prep, **kwargs)
-    with _det_per_cta():
-        ws = det.cake_mhc_det_train_backward_workspace(T, _device(), hidden=hidden)
-        per_cta = _backward(det_backward_finish, i, prep, workspace=ws, **copies)
-    for k in ("dscale", "dbase"):
-        out[k].copy_(per_cta[k])
-    return out
+    """The deterministic backward of a case (its group-row forms inside ``BWD_ROW_BANDS``, as this package's)."""
+    return _backward(det_backward_finish, i, prep, **kwargs)
 
 
 def _snapshot(out: dict) -> dict:
@@ -758,7 +722,7 @@ def _snapshot(out: dict) -> dict:
 
 
 def _nd_repeats(i: dict, prep: dict, n: int = REPEATS, **kwargs) -> list[dict]:
-    """``n`` launches of the non-deterministic backward, each output finite."""
+    """``n`` launches of this package's backward, each output finite."""
     outs = []
     for repeat in range(n):
         out = _snapshot(_nd_backward(i, prep, **kwargs))
@@ -782,7 +746,7 @@ def _poisoned_outputs(T: int, hidden: int = HIDDEN) -> dict:
 
 
 def _nd_workspace_exact(T: int, hidden: int = HIDDEN) -> torch.Tensor:
-    """A fresh zeroed non-deterministic backward workspace of exactly ``T`` tokens' layout at ``hidden``."""
+    """A fresh zeroed backward workspace of this package of exactly ``T`` tokens' layout at ``hidden``."""
     return torch.zeros(
         loader.workspace_bytes("bwd", T, _sm_count(), _arch(), hidden),
         dtype=torch.uint8,
@@ -791,14 +755,17 @@ def _nd_workspace_exact(T: int, hidden: int = HIDDEN) -> torch.Tensor:
 
 
 def _poison_workspace(ws: torch.Tensor) -> None:
-    """Every byte but the ticket region (first for every token count) set to 0xFF."""
-    ws[TICKET_BYTES:].fill_(0xFF)
+    """Every byte past the zero prefix (the ticket region and the arrival counts, first for every token count) set
+    to 0xFF."""
+    ws[ZERO_PREFIX_BYTES:].fill_(0xFF)
 
 
-def _assert_ticket_zero(ws: torch.Tensor, what: str) -> None:
+def _assert_zero_prefix(ws: torch.Tensor, what: str) -> None:
     torch.cuda.synchronize()
-    nonzero = int(torch.count_nonzero(ws[:TICKET_BYTES]))
-    assert nonzero == 0, f"{what}: {nonzero} non-zero bytes in the ticket region"
+    nonzero = int(torch.count_nonzero(ws[:ZERO_PREFIX_BYTES]))
+    assert nonzero == 0, (
+        f"{what}: {nonzero} non-zero bytes in the ticket region and the arrival counts"
+    )
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -815,12 +782,6 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
 def _differing(a: torch.Tensor, b: torch.Tensor) -> int:
     """Elements whose bits differ."""
     return int((_bits(a) != _bits(b)).sum())
-
-
-def _differing_bits(a: torch.Tensor, b: torch.Tensor) -> int:
-    """Bits that differ over all elements (FP32)."""
-    x = (_bits(a) ^ _bits(b)).to(torch.int64) & 0xFFFFFFFF
-    return int(sum(int(((x >> s) & 1).sum()) for s in range(32)))
 
 
 def _ulp_distance(a: torch.Tensor, b: torch.Tensor) -> int:
@@ -1105,7 +1066,7 @@ def _cancellation_band_report(
 
 @pytest.mark.parametrize(("hidden", "T"), _hidden_cases(T_ACCURACY, T_ACCURACY_NEW))
 def test_nondeterministic_backward_matches_fp64(hidden: int, T: int) -> None:
-    """The non-deterministic backward against the FP64 reference on the worst of REPEATS launches: BF16 ``dX`` with no
+    """This package's backward against the FP64 reference on the worst of REPEATS launches: BF16 ``dX`` with no
     mismatch at atol = rtol = 1e-2 (the launches' ``dX`` bitwise equal); ``dfn`` / ``dscale`` / ``dbase`` rel-L2
     <= 1e-5, ``dscale`` / ``dbase`` per element <= 1e-4."""
     _require_hidden(hidden)
@@ -1215,6 +1176,7 @@ def _matches_the_deterministic_backward(hidden: int, T: int) -> None:
     bound = _dfn_bound(i, _dfn_factor(T, hidden))
     ws = pkg.cake_mhc_nondet_train_backward_workspace(T, _device(), hidden=hidden)
     figures = []
+    first = None
     for repeat in range(REPEATS):
         label = f"T={T} H={hidden} {program} P={parts} launch {repeat}"
         kwargs = {}
@@ -1223,13 +1185,16 @@ def _matches_the_deterministic_backward(hidden: int, T: int) -> None:
             kwargs = {"workspace": ws, **_poisoned_outputs(T, hidden)}
         got = _snapshot(_nd_backward(i, prep, **kwargs))
         if repeat % 2:
-            _assert_ticket_zero(ws, label)
+            _assert_zero_prefix(ws, label)
         _assert_exact_outputs(got, want, f"{label} vs deterministic")
         figures.append(
             _assert_dfn_within(
                 got["dfn"], want["dfn"], bound, f"dfn {label} vs deterministic"
             )
         )
+        if first is None:
+            first = got
+        _assert_same_bits(got["dfn"], first["dfn"], f"dfn {label} vs launch 0")
     print(
         f"dfn T={T} H={hidden} {program} P={parts}: vs the deterministic backward over {REPEATS} launches: largest "
         f"|nd - det| / bound {max(f['max_ratio'] for f in figures):.3e}, elements differing up to "
@@ -1246,12 +1211,13 @@ def _matches_the_deterministic_backward(hidden: int, T: int) -> None:
 
 @pytest.mark.parametrize(("hidden", "T"), _hidden_cases(T_COMPARE, T_COMPARE_NEW))
 def test_matches_the_deterministic_backward(hidden: int, T: int) -> None:
-    """On the same inputs as the deterministic backward: ``dX``, ``dscale``, ``dbase`` bitwise (``dscale`` / ``dbase``
-    against its per-CTA reduction where it runs its group-row forms, :func:`_det_backward`); every ``dfn`` element
-    within ``F u sum_t |dz'_t| |x_t|`` (``F`` = :func:`_dfn_factor`: ``2 P`` under ``dynr`` / ``dynr_os``,
-    ``2 max(P, P_k7) + 10`` where the column slab runs ``lpt`` / ``lpt_os`` at ``T`` on this device).  The launches
-    alternate between the default workspace with fresh outputs and one caller workspace (non-ticket bytes 0xFF before
-    each launch) with NaN-filled outputs; the largest ratio to the bound and the differing bits are printed."""
+    """On the same inputs as the deterministic backward: ``dX``, ``dscale``, ``dbase`` bitwise (inside
+    ``BWD_ROW_BANDS`` both packages fold the token owner's group rows); every ``dfn`` element within ``F u sum_t
+    |dz'_t| |x_t|`` (``F`` = :func:`_dfn_factor`: ``2 P`` under ``dynr`` / ``dynr_os``, ``2 max(P, P_k7) + 10``
+    where the column slab runs ``lpt`` / ``lpt_os`` at ``T`` on this device), and every launch's ``dfn`` the first
+    launch's bits.  The launches alternate between the default workspace with fresh outputs and one caller workspace
+    (bytes past the zero prefix 0xFF before each launch) with NaN-filled outputs; the largest ratio to the bound and
+    the elements that differ from the deterministic ``dfn`` are printed."""
     _require_hidden(hidden)
     _matches_the_deterministic_backward(hidden, T)
 
@@ -1304,30 +1270,18 @@ def test_matches_the_deterministic_backward_in_each_unit_order(
 
 @pytest.mark.parametrize(("hidden", "T"), _hidden_cases((2049, 16263), (2049, 16263)))
 def test_run_to_run(hidden: int, T: int) -> None:
-    """Repeated launches on the same inputs: ``dX``, ``dscale``, ``dbase`` identical bits; the ``dfn`` elements and
-    bits that differ from the first launch are counted and printed (the summation order of the atomic reductions may
-    change; never asserted either way)."""
+    """Repeated launches on the same inputs: every output, ``dfn`` included, the first launch's bits (the column slab
+    folds each ``dfn`` element's per-chunk slots in chunk order, whatever the schedule of its units)."""
     _require_hidden(hidden)
     i = _make_inputs(T, hidden=hidden, seed=SEED + 2)
     prep = _forward(i)
     outs = _nd_repeats(i, prep, n=RUN_TO_RUN_REPEATS)
-    tallies = []
     for repeat, out in enumerate(outs[1:], start=1):
-        _assert_exact_outputs(
-            out, outs[0], f"T={T} H={hidden} launch {repeat} vs launch 0"
+        label = (
+            f"T={T} H={hidden} P={_slab_parts(T, hidden)} launch {repeat} vs launch 0"
         )
-        tallies.append(
-            (
-                _differing(out["dfn"], outs[0]["dfn"]),
-                _differing_bits(out["dfn"], outs[0]["dfn"]),
-                _ulp_distance(out["dfn"], outs[0]["dfn"]),
-            )
-        )
-    print(
-        f"dfn T={T} H={hidden} P={_slab_parts(T, hidden)} run to run (launches 1..{RUN_TO_RUN_REPEATS - 1} vs launch "
-        f"0; elements, bits, largest ulp distance): {tallies}",
-        flush=True,
-    )
+        for k in _OUTPUTS:
+            _assert_same_bits(out[k], outs[0][k], f"{k} {label}")
 
 
 @pytest.fixture
@@ -1406,10 +1360,10 @@ def test_two_size_schedule_at_forced_geometries(
     ``T`` on this device, ``_lpt_plan`` at ``o_tiles = 1``, also where the table of record is ``None``): the
     selection's column slab is that record, the only column slab ``backward_finish`` loads, launched over
     ``min(SMs, H / 64 x P)`` CTAs with ``slab_plan`` = the geometry.  On two launches -- fresh outputs on the default
-    workspace, then NaN outputs (the carried-in values under ``accumulate``) on a caller workspace whose non-ticket
-    bytes are 0xFF -- ``dX``, ``dscale``, ``dbase`` are bitwise the deterministic backward's (:func:`_det_backward`),
-    every ``dfn`` element lies within ``_dfn_factor(T, hidden) u (|carried| + sum_t |dz'_t| |x_t|)`` and the ticket
-    region is zero; the largest ratio to the bound is printed."""
+    workspace, then NaN outputs (the carried-in values under ``accumulate``) on a caller workspace whose bytes past
+    the zero prefix are 0xFF -- ``dX``, ``dscale``, ``dbase`` are bitwise the deterministic backward's, every ``dfn``
+    element lies within ``_dfn_factor(T, hidden) u (|carried| + sum_t |dz'_t| |x_t|)``, the two launches' ``dfn``
+    are the same bits and the zero prefix is zero; the largest ratio to the bound is printed."""
     _require_lpt(hidden, order)
     arch, sm, index = _arch(), _sm_count(), _device().index
     forced_order(hidden, order)
@@ -1461,7 +1415,7 @@ def test_two_size_schedule_at_forced_geometries(
         return load(name, record_arch)
 
     monkeypatch.setattr(loader, "load", recording_load)
-    figures = []
+    figures, dfns = [], []
     for launch in range(2):
         label = f"T={T} H={hidden} {order} order lpt {geometry} accumulate={accumulate} launch {launch}"
         kwargs = {"accumulate": accumulate, **outputs(launch == 1)}
@@ -1470,13 +1424,19 @@ def test_two_size_schedule_at_forced_geometries(
             kwargs["workspace"] = ws
         got = _snapshot(_nd_backward(i, prep, **kwargs))
         if launch:
-            _assert_ticket_zero(ws, label)
+            _assert_zero_prefix(ws, label)
         _assert_exact_outputs(got, want, f"{label} vs deterministic")
         figures.append(
             _assert_dfn_within(
                 got["dfn"], want["dfn"], bound, f"dfn {label} vs deterministic"
             )
         )
+        dfns.append(got["dfn"])
+    _assert_same_bits(
+        dfns[1],
+        dfns[0],
+        f"dfn T={T} H={hidden} {order} order lpt {geometry} launch 1 vs 0",
+    )
     assert loaded == list(selection), loaded
     print(
         f"dfn T={T} H={hidden} {order} order lpt {geometry} (P_k7 {_parts(T, hidden)}, F {factor:g}) "
@@ -1574,7 +1534,7 @@ def test_benchmark_token_counts_at_the_new_hidden_sizes(hidden: int, T: int) -> 
     15590 / 16263 and H 7168 15288, and at those the screen picks that no pair has measured yet, 1024 at both sizes
     and 2048 / 3072 at 7168; else ``dynr``; each as its ``_os`` copy where the size's ``BWD_SLAB_ORDER`` band is
     ``"slab"``) gives its ``dX`` / ``dscale`` / ``dbase`` bits and a ``dfn`` within the bound of
-    :func:`test_matches_the_deterministic_backward`, the ticket region of a caller workspace back to zero."""
+    :func:`test_matches_the_deterministic_backward`, the zero prefix of a caller workspace back to zero."""
     _require_hidden(hidden)
     i = _make_inputs(T, hidden=hidden, seed=SEED + 14)
     want = _snapshot(_reference_forward_outputs(i))
@@ -1586,7 +1546,7 @@ def test_benchmark_token_counts_at_the_new_hidden_sizes(hidden: int, T: int) -> 
     want = _snapshot(_det_backward(i, prep))
     ws = pkg.cake_mhc_nondet_train_backward_workspace(T, _device(), hidden=hidden)
     got = _snapshot(_nd_backward(i, prep, workspace=ws))
-    _assert_ticket_zero(ws, label)
+    _assert_zero_prefix(ws, label)
     _assert_exact_outputs(got, want, f"{label} vs deterministic")
     figures = _assert_dfn_within(
         got["dfn"],
@@ -1637,8 +1597,9 @@ def test_launches_are_this_packages_records(monkeypatch, hidden: int) -> None:
     selection = loader.selected_modules(arch, hidden, "bwd_finish", rows=T, sm_count=sm)
     assert [name for name, _ in loaded[start:]] == list(selection), loaded[start:]
     assert loader.MODULES[selection[0]]["role"] == "bwd_token", selection
+    chain = "dep1" if (arch, hidden) == ("sm_107a", 4096) else "dep"
     assert selection[1] == (
-        f"cake_mhc_train_fn_split_atomic__{loader.fn_split_program(arch, 1, hidden)}_dep"
+        f"cake_mhc_train_fn_split_atomic__{loader.fn_split_program(arch, 1, hidden)}_{chain}"
         + _suffix(hidden)
     )
     program = loader.bwd_slab_atomic_program(T, sm, arch, hidden)
@@ -1666,35 +1627,29 @@ def test_launches_are_this_packages_records(monkeypatch, hidden: int) -> None:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# PyTorch's deterministic algorithms (the alert of the unordered reduction; the facade, which forwards to this
-# package, is test_cake_mhc_nondet_train_api.py's)
+# PyTorch's deterministic algorithms (every output repeats bit for bit, so nothing alerts; the facade, which forwards
+# to this package, is test_cake_mhc_nondet_train_api.py's)
 
 
-def _our_alerts(caught) -> list[str]:
-    """The entry names of this package's alerts among the recorded warnings, in order (each a ``UserWarning``)."""
-    names = []
-    for w in caught:
-        message = str(w.message)
-        if _ALERT not in message:
-            continue
-        name = message.split(f" {_ALERT}")[0]
-        if name.startswith(("cake_mhc_nondet_train", "CakeMHCNondet")):
-            assert w.category is UserWarning, (name, w.category)
-            names.append(name)
-    return names
+def _determinism_alerts(caught) -> list[str]:
+    """The recorded warnings that carry PyTorch's alert of a non-deterministic operation (from this package or from
+    any operation it runs)."""
+    return [str(w.message) for w in caught if _ALERT in str(w.message)]
 
 
-def test_policy_strict_alerts_the_direct_backward_only(
-    deterministic_algorithms,
-) -> None:
-    """Under ``torch.use_deterministic_algorithms(True)``: the forward prepare, the statistics replay, the residual
-    mixing, the backward prepare and the workspace entry points run without an alert (warnings are errors) and give
-    the bits they give with the mode off; ``backward_finish`` raises PyTorch's alert before any launch (the caller's
-    outputs and workspace keep their bytes) and, once the mode is off, the same call runs."""
+def test_policy_strict_runs_every_entry_point(deterministic_algorithms) -> None:
+    """Under ``torch.use_deterministic_algorithms(True)`` (warnings are errors): the forward prepare, the statistics
+    replay, the residual mixing, the backward prepare, the workspace entry points and ``backward_finish`` (on the
+    default workspace with fresh outputs and on a caller workspace whose bytes past the zero prefix are 0xFF, with
+    NaN-filled outputs) run without an alert or a warning and give the bits they give with the mode off (every
+    backward output, ``dfn`` included); ``dX`` / ``dscale`` / ``dbase`` are the deterministic bits, ``dfn`` within
+    the bound, and the zero prefix is zero after the call."""
     T = 257
     i = _make_inputs(T, seed=SEED + 6)
     want_prep = _snapshot(_forward(i))
     want_replay = forward_stats(i["X"], i["fn"], i["scale"], i["base"]).clone()
+    want_Y = forward_finish(i["X"], i["B"], want_prep["stats"]).clone()
+    want_off = _snapshot(_nd_backward(i, want_prep))
     want = _snapshot(_det_backward(i, want_prep))
     bound = _dfn_bound(i, _dfn_factor(T))
     ws = pkg.cake_mhc_nondet_train_backward_workspace(T, _device())
@@ -1703,85 +1658,76 @@ def test_policy_strict_alerts_the_direct_backward_only(
         warnings.simplefilter("error")
         prep = _snapshot(_forward(i))
         replay = forward_stats(i["X"], i["fn"], i["scale"], i["base"]).clone()
-        forward_finish(i["X"], i["B"], prep["stats"])
+        Y = forward_finish(i["X"], i["B"], prep["stats"]).clone()
         assert pkg.cake_mhc_nondet_train_backward_workspace_bytes(
             T, _device()
         ) == loader.workspace_bytes_upto("bwd", T, _sm_count(), _arch())
         pkg.cake_mhc_nondet_train_forward_workspace(T, _device())
+        got = {"default": _snapshot(_nd_backward(i, prep))}
+        _poison_workspace(ws)
+        got["caller"] = _snapshot(
+            _nd_backward(i, prep, workspace=ws, **_poisoned_outputs(T))
+        )
+    deterministic_algorithms(False)
+    _assert_zero_prefix(ws, "the call under the strict mode")
     for k in ("stats", "gstats"):
         _assert_same_bits(prep[k], want_prep[k], f"{k} under the strict mode")
     _assert_same_bits(replay, want_replay, "statistics replay under the strict mode")
-    outputs = {k: v.fill_(3.0) for k, v in _poisoned_outputs(T).items()}
-    _poison_workspace(ws)
-    before = ws.clone()
-    with pytest.raises(RuntimeError) as info:
-        _nd_backward(i, prep, workspace=ws, **outputs)
-    assert str(info.value).startswith(
-        f"cake_mhc_nondet_train_backward_finish {_ALERT}, but you set "
-        "'torch.use_deterministic_algorithms(True)'"
-    ), str(info.value)
-    torch.cuda.synchronize()
-    for k, v in outputs.items():
-        assert bool((v == 3.0).all()), f"{k}: a refused call wrote its output"
-    assert torch.equal(ws, before), "a refused call wrote its workspace"
-    deterministic_algorithms(False)
-    got = _snapshot(_nd_backward(i, prep, workspace=ws, **outputs))
-    _assert_ticket_zero(ws, "the call after the strict-mode refusal")
-    _assert_exact_outputs(got, want, "the call after the strict-mode refusal")
-    _assert_dfn_within(
-        got["dfn"], want["dfn"], bound, "dfn of the call after the strict-mode refusal"
-    )
+    _assert_same_bits(Y, want_Y, "residual mixing under the strict mode")
+    for name, out in got.items():
+        label = f"backward_finish under the strict mode, {name} workspace"
+        for k in _OUTPUTS:
+            _assert_same_bits(out[k], want_off[k], f"{k} {label} vs the mode off")
+        _assert_exact_outputs(out, want, f"{label} vs deterministic")
+        _assert_dfn_within(
+            out["dfn"], want["dfn"], bound, f"dfn {label} vs deterministic"
+        )
 
 
-def test_policy_warn_only_warns_once_and_runs_the_nondeterministic_backward(
+def test_policy_warn_only_runs_the_backward_without_a_warning(
     deterministic_algorithms,
 ) -> None:
-    """Under ``torch.use_deterministic_algorithms(True, warn_only=True)`` every ``backward_finish`` call warns once
-    (PyTorch's alert as a ``UserWarning``) and runs the non-deterministic backward -- the package never falls back:
-    on the default workspace, on a workspace of the deterministic package's sizing and on one of this package's
-    sizing (which the deterministic backward refuses), ``dX`` / ``dscale`` / ``dbase`` are the deterministic bits,
-    ``dfn`` is within the bound and the ticket region is zero."""
+    """Under ``torch.use_deterministic_algorithms(True, warn_only=True)`` no ``backward_finish`` call warns (no
+    recorded warning carries PyTorch's alert) and each runs this package's backward -- the package never falls
+    back: on the default workspace and on one of this package's sizing every output is the bits of the call with the
+    mode off, ``dX`` / ``dscale`` / ``dbase`` are the deterministic bits, ``dfn`` is within the bound and the zero
+    prefix is zero."""
     T = 2049
     i = _make_inputs(T, seed=SEED + 7)
     prep = _forward(i)
+    want_off = _snapshot(_nd_backward(i, prep))
     want = _snapshot(_det_backward(i, prep))
     bound = _dfn_bound(i, _dfn_factor(T))
-    det_sized = det.cake_mhc_det_train_backward_workspace(T, _device())
     nd_sized = _nd_workspace_exact(T)
-    with pytest.raises(ValueError, match="workspace holds"):
-        _det_backward(i, prep, workspace=nd_sized)
     deterministic_algorithms(True, warn_only=True)
-    for name, workspace in (
-        ("default", None),
-        ("deterministic-sized", det_sized),
-        ("nd-sized", nd_sized),
-    ):
+    for name, workspace in (("default", None), ("nd-sized", nd_sized)):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             got = _snapshot(_nd_backward(i, prep, workspace=workspace))
-        assert _our_alerts(caught) == ["cake_mhc_nondet_train_backward_finish"], (
+        assert _determinism_alerts(caught) == [], (
             name,
             [str(w.message) for w in caught],
         )
-        _assert_exact_outputs(got, want, f"warn_only workspace={name}")
-        _assert_dfn_within(
-            got["dfn"], want["dfn"], bound, f"dfn warn_only workspace={name}"
-        )
+        label = f"warn_only workspace={name}"
+        for k in _OUTPUTS:
+            _assert_same_bits(got[k], want_off[k], f"{k} {label} vs the mode off")
+        _assert_exact_outputs(got, want, f"{label} vs deterministic")
+        _assert_dfn_within(got["dfn"], want["dfn"], bound, f"dfn {label}")
         if workspace is not None:
-            _assert_ticket_zero(workspace, f"warn_only workspace={name}")
+            _assert_zero_prefix(workspace, label)
 
 
 @pytest.mark.parametrize("save_stats", (True, False))
-def test_policy_prepare_node_alerts_its_backward(
+def test_policy_prepare_node_runs_its_backward(
     deterministic_algorithms, save_stats: bool
 ) -> None:
-    """The prepare node's forward, the finish node and (``save_stats=False``) the statistics replay never alert; the
-    prepare node's backward raises PyTorch's alert named ``CakeMHCNondetPrepareFunction.backward`` whenever the
-    deterministic algorithms are on when it runs -- recorded under the strict mode, or recorded with the mode off and
-    the mode enabled before ``backward()``.  Under ``warn_only`` that backward warns once (``backward_finish`` adds
-    no second alert) and runs the non-deterministic backward: ``Y`` and the ``X`` / ``scale`` / ``base`` gradients
-    bitwise the deterministic autograd's, the ``fn`` gradient within the bound, also on a caller backward workspace
-    of this package's sizing."""
+    """The prepare node's forward, the finish node, (``save_stats=False``) the statistics replay and the prepare
+    node's backward run without an alert or a warning whenever the deterministic algorithms are on -- recorded under
+    the strict mode (warnings are errors), recorded with the mode off and the strict mode enabled before
+    ``backward()``, and under ``warn_only`` (no recorded warning carries PyTorch's alert), also on a caller backward
+    workspace of this package's sizing: ``Y`` and every gradient are the bits of the same graph with the mode off,
+    ``Y`` and the ``X`` / ``scale`` / ``base`` gradients bitwise the deterministic autograd's, the ``fn`` gradient
+    within the bound."""
     T = 257
     i = _make_inputs(T, seed=SEED + 8)
     bound = _connection_bound(i, T)
@@ -1795,22 +1741,38 @@ def test_policy_prepare_node_alerts_its_backward(
 
     leaves_det, Y_det, loss = graph(DET_API)
     loss.backward()
-    refusal = f"CakeMHCNondetPrepareFunction.backward {_ALERT}"
-    # recorded under the strict mode: the forward runs without an alert, the backward refuses
+    leaves_off, Y_off, loss = graph(ND_API)
+    loss.backward()
+    _assert_same_bits(Y_off.detach(), Y_det.detach(), "Y with the mode off")
+    _assert_grads(_grads(leaves_off), _grads(leaves_det), bound, "the mode off")
+
+    def check(leaves, Y, what: str) -> None:
+        _assert_same_bits(Y.detach(), Y_off.detach(), f"Y {what} vs the mode off")
+        for name, got, want in zip(
+            ("X", "fn", "scale", "base"),
+            _grads(leaves),
+            _grads(leaves_off),
+            strict=True,
+        ):
+            _assert_same_bits(got, want, f"grad {name} {what} vs the mode off")
+        _assert_grads(_grads(leaves), _grads(leaves_det), bound, what)
+
+    # recorded under the strict mode: the forward and the backward run without an alert
     deterministic_algorithms(True)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        _leaves_strict, Y, loss = graph(ND_API)
-    _assert_same_bits(Y.detach(), Y_det.detach(), "Y recorded under the strict mode")
-    with pytest.raises(RuntimeError, match=refusal):
+        leaves, Y, loss = graph(ND_API)
         loss.backward()
     deterministic_algorithms(False)
+    check(leaves, Y, f"recorded under the strict mode, save_stats={save_stats}")
     # recorded with the mode off, the strict mode enabled before backward()
-    _leaves_off, _Y, loss = graph(ND_API)
+    leaves, Y, loss = graph(ND_API)
     deterministic_algorithms(True)
-    with pytest.raises(RuntimeError, match=refusal):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         loss.backward()
     deterministic_algorithms(False)
+    check(leaves, Y, f"strict mode at backward, save_stats={save_stats}")
     for workspace in (None, _nd_workspace_exact(T)):
         leaves, Y, loss = graph(ND_API, backward_workspace=workspace)
         deterministic_algorithms(True, warn_only=True)
@@ -1819,12 +1781,11 @@ def test_policy_prepare_node_alerts_its_backward(
             loss.backward()
         deterministic_algorithms(False)
         what = f"warn_only at backward, save_stats={save_stats}, workspace={workspace is not None}"
-        assert _our_alerts(caught) == ["CakeMHCNondetPrepareFunction.backward"], (
+        assert _determinism_alerts(caught) == [], (
             what,
             [str(w.message) for w in caught],
         )
-        _assert_same_bits(Y.detach(), Y_det.detach(), f"Y {what}")
-        _assert_grads(_grads(leaves), _grads(leaves_det), bound, what)
+        check(leaves, Y, what)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -2011,6 +1972,18 @@ def _assert_grads(got, want, bound: torch.Tensor, label: str) -> dict:
     return _assert_dfn_within(got[1], want[1], bound, f"grad fn {label}")
 
 
+def _assert_same_grads(got, want, label: str) -> None:
+    """The leaf gradients ``[X, *(fn, scale, base) per connection]`` of two runs of this package: every one bitwise,
+    ``fn`` included."""
+    assert len(got) == len(want) and len(got) % 3 == 1, (label, len(got), len(want))
+    chain = len(got) > 4
+    for index, (g, w) in enumerate(zip(got, want, strict=True)):
+        name = "X" if index == 0 else ("fn", "scale", "base")[(index - 1) % 3]
+        if chain and index:
+            name += f"[{(index - 1) // 3}]"
+        _assert_same_bits(g, w, f"grad {name} {label}")
+
+
 def _plain_grads(i: dict, api, *, save_stats: bool = True) -> list:
     """The leaf gradients of one plain connection of ``api`` (branch ``B = U + B_0``, loss ``sum(Y * dY)``)."""
     prepare, finish = api
@@ -2051,9 +2024,10 @@ def _assert_kept(
 
 @pytest.mark.parametrize(("hidden", "T"), _hidden_cases((129, 2049), (129, 2049)))
 def test_checkpoint_replay(hidden: int, T: int) -> None:
-    """``forward_stats`` is bitwise the ``forward_prepare`` record, and the non-deterministic gradients with the
-    statistics saved (``save_stats=True``) and replayed in the backward (``False``, the checkpoint path) agree with
-    each other and with the deterministic gradients: ``X`` / ``scale`` / ``base`` bitwise, ``fn`` within the bound."""
+    """``forward_stats`` is bitwise the ``forward_prepare`` record, and this package's gradients with the
+    statistics saved (``save_stats=True``) and replayed in the backward (``False``, the checkpoint path) are the same
+    bits (``fn`` included) and agree with the deterministic gradients: ``X`` / ``scale`` / ``base`` bitwise, ``fn``
+    within the bound."""
     _require_hidden(hidden)
     i = _make_inputs(T, hidden=hidden, seed=SEED + 11)
     _U, stats = forward_prepare(i["X"], i["fn"], i["scale"], i["base"])
@@ -2074,20 +2048,17 @@ def test_checkpoint_replay(hidden: int, T: int) -> None:
             bound,
             f"T={T} H={hidden} save_stats={save_stats} vs deterministic",
         )
-    _assert_grads(
-        grads[False],
-        grads[True],
-        bound,
-        f"T={T} H={hidden} replayed vs saved statistics",
+    _assert_same_grads(
+        grads[False], grads[True], f"T={T} H={hidden} replayed vs saved statistics"
     )
 
 
 @pytest.mark.parametrize("T", (129, 2049))
 @pytest.mark.parametrize("save_stats", (True, False))
 def test_checkpoint_keeps_nothing_alive(T: int, save_stats: bool) -> None:
-    """A non-reentrant ``torch.utils.checkpoint`` around a non-deterministic prepare / finish keeps no tensor of
-    the layer alive after the forward, and the checkpointed backward equals the plain one and the deterministic one
-    (``X`` / ``scale`` / ``base`` bitwise, ``fn`` within the bound)."""
+    """A non-reentrant ``torch.utils.checkpoint`` around this package's prepare / finish keeps no tensor of
+    the layer alive after the forward, and the checkpointed backward is the plain one's bits (``fn`` included) and
+    equals the deterministic one (``X`` / ``scale`` / ``base`` bitwise, ``fn`` within the bound)."""
     i = _make_inputs(T, seed=SEED + 41)
 
     def connection(X, fn, scale, base):
@@ -2106,24 +2077,22 @@ def test_checkpoint_keeps_nothing_alive(T: int, save_stats: bool) -> None:
     _assert_nothing_kept(before, Y, "forward")
     (Y.float() * i["dY"].float()).sum().backward()
     label = f"T={T} save_stats={save_stats} checkpointed"
-    _assert_grads(_grads(checkpointed), _grads(plain), bound, f"{label} vs plain")
+    _assert_same_grads(_grads(checkpointed), _grads(plain), f"{label} vs plain")
     _assert_grads(_grads(checkpointed), want, bound, f"{label} vs deterministic")
 
 
 @pytest.mark.parametrize("T", (129, 2049))
 @pytest.mark.parametrize("save_stats", (True, False))
 def test_checkpoint_after_prepare_replays_statistics(T: int, save_stats: bool) -> None:
-    """A non-reentrant checkpoint region that starts after a non-deterministic prepare (the branch and the finish
+    """A non-reentrant checkpoint region that starts after this package's prepare (the branch and the finish
     inside it) keeps nothing beyond its output after the forward, the finish forward takes the edges off the handle
-    and its rerun replays the released statistics; the gradients equal the plain run's (``X`` / ``scale`` / ``base``
-    bitwise, ``fn`` within the bound)."""
+    and its rerun replays the released statistics; the gradients are the plain run's bits (``fn`` included)."""
     i = _make_inputs(T, seed=SEED + 42)
 
     def finish(X, U, handle):
         B = (U.float() + i["B"].float()).to(BF16)
         return _nd_finish(X, B, handle)
 
-    bound = _connection_bound(i, T)
     plain = _leaves(i)
     U, handle = _nd_prepare(*plain, save_stats=save_stats)
     (finish(plain[0], U, handle).float() * i["dY"].float()).sum().backward()
@@ -2140,10 +2109,9 @@ def test_checkpoint_after_prepare_replays_statistics(T: int, save_stats: bool) -
     )
     del stats
     (Y.float() * i["dY"].float()).sum().backward()
-    _assert_grads(
+    _assert_same_grads(
         _grads(checkpointed),
         _grads(plain),
-        bound,
         f"T={T} save_stats={save_stats} checkpointed finish",
     )
 
@@ -2171,7 +2139,7 @@ def _two_layers(
 
 def _chain_bounds(X: torch.Tensor, params: list, dY: torch.Tensor, T: int) -> list:
     """The ``dfn`` bound of each connection of :func:`_two_layers`, from the deterministic direct entry points: the
-    input, branch output ``U`` and loss gradient of every connection (the non-deterministic chain hands each
+    input, branch output ``U`` and loss gradient of every connection (this package's chain hands each
     connection bitwise the same ``dX`` as its upstream gradient)."""
     xs, us, records = [], [], []
     x = X.detach()
@@ -2219,10 +2187,10 @@ def _assert_chain_grads(got, want, bounds: list, label: str) -> None:
 def test_backward_keeps_nothing_alive(
     T: int, save_stats: bool, checkpointed: bool
 ) -> None:
-    """Once a non-deterministic connection's backward has run, nothing of it stays alive: after
+    """Once a connection's backward has run, nothing of it stays alive: after
     ``torch.autograd.grad`` over two layers of two connections the only live tensor of the step is its output ``Y``.
-    A second step equals the first and the deterministic step (``X`` / ``scale`` / ``base`` bitwise, each ``fn``
-    within its connection's bound)."""
+    A second step is the first step's bits (each ``fn`` included) and equals the deterministic step (``X`` / ``scale``
+    / ``base`` bitwise, each ``fn`` within its connection's bound)."""
     i = _make_inputs(T, seed=SEED + 51)
     params = [
         [p.clone().requires_grad_(True) for p in (q["fn"], q["scale"], q["base"])]
@@ -2243,7 +2211,7 @@ def test_backward_keeps_nothing_alive(
     before = _live_bytes()
     Y, grads = step(ND_API)
     label = f"T={T} save_stats={save_stats} checkpointed={checkpointed}"
-    _assert_chain_grads(grads, reference, bounds, f"second step {label}")
+    _assert_same_grads(grads, reference, f"second step {label}")
     _assert_chain_grads(grads, det_grads, bounds, f"vs deterministic {label}")
     del grads
     _assert_kept(before, "the backward", Y)
@@ -2252,10 +2220,10 @@ def test_backward_keeps_nothing_alive(
 @pytest.mark.parametrize("T", (129, 2049))
 @pytest.mark.parametrize("save_stats", (True, False))
 def test_repeated_backward_with_retain_graph(T: int, save_stats: bool) -> None:
-    """Backward passes over one retained non-deterministic graph are independent: two full passes equal a fresh
+    """Backward passes over one retained graph of this package are independent: two full passes equal a fresh
     graph's, and a pass in between that reaches the prepare node but not the finish node (the loss is ``U``) takes
-    no ``dY`` of the earlier pass: it equals the same pass on a fresh graph (``X`` / ``scale`` / ``base`` bitwise,
-    ``fn`` within the bound of its pass)."""
+    no ``dY`` of the earlier pass: it equals the same pass on a fresh graph (every gradient bitwise, ``fn``
+    included)."""
     i = _make_inputs(T, seed=SEED + 56)
 
     def graph(leaves: list) -> tuple:
@@ -2263,9 +2231,6 @@ def test_repeated_backward_with_retain_graph(T: int, save_stats: bool) -> None:
         B = (U.float() + i["B"].float()).to(BF16)
         return U, _nd_finish(leaves[0], B, handle)
 
-    bound = _connection_bound(i, T)
-    # The U-only pass: dY and the gradient statistics are zero, dU is the loss gradient.
-    bound_u = _dfn_bound({**i, "dY": torch.zeros_like(i["dY"])}, _dfn_factor(T))
     leaves = _leaves(i)
     U, Y = graph(leaves)
     first = torch.autograd.grad(Y, leaves, i["dY"], retain_graph=True)
@@ -2277,18 +2242,18 @@ def test_repeated_backward_with_retain_graph(T: int, save_stats: bool) -> None:
     fresh = _leaves(i)
     u_fresh = torch.autograd.grad(graph(fresh)[0], fresh, i["dU"])
     label = f"T={T} save_stats={save_stats} retain_graph"
-    _assert_grads(first, full, bound, f"{label} first pass")
-    _assert_grads(second, full, bound, f"{label} second pass")
-    _assert_grads(u_only, u_fresh, bound_u, f"{label} U-only pass")
+    _assert_same_grads(first, full, f"{label} first pass")
+    _assert_same_grads(second, full, f"{label} second pass")
+    _assert_same_grads(u_only, u_fresh, f"{label} U-only pass")
 
 
 @pytest.mark.parametrize("T", (129, 2049))
 @pytest.mark.parametrize("save_stats", (True, False))
 @pytest.mark.parametrize("region", ("connection", "after_prepare"))
 def test_reentrant_checkpoint(T: int, save_stats: bool, region: str) -> None:
-    """A reentrant ``torch.utils.checkpoint`` around a non-deterministic connection, or around the branch and the
-    finish with the prepare outside, equals the plain gradients (``X`` / ``scale`` / ``base`` bitwise, ``fn`` within
-    the bound) and keeps nothing alive after the backward beyond ``Y`` and the leaves' gradients."""
+    """A reentrant ``torch.utils.checkpoint`` around a connection of this package, or around the branch and the
+    finish with the prepare outside, gives the plain gradients' bits (``fn`` included) and keeps nothing alive after
+    the backward beyond ``Y`` and the leaves' gradients."""
     i = _make_inputs(T, seed=SEED + 57)
 
     def finish(X, U, handle):
@@ -2299,7 +2264,6 @@ def test_reentrant_checkpoint(T: int, save_stats: bool, region: str) -> None:
         U, handle = _nd_prepare(X, fn, scale, base, save_stats=save_stats)
         return finish(X, U, handle)
 
-    bound = _connection_bound(i, T)
     plain = _leaves(i)
     connection(*plain).backward(i["dY"])
 
@@ -2312,10 +2276,9 @@ def test_reentrant_checkpoint(T: int, save_stats: bool, region: str) -> None:
         Y = checkpoint(finish, checkpointed[0], U, handle, use_reentrant=True)
         del U
     Y.backward(i["dY"])
-    _assert_grads(
+    _assert_same_grads(
         _grads(checkpointed),
         _grads(plain),
-        bound,
         f"T={T} save_stats={save_stats} reentrant checkpoint ({region})",
     )
     if region == "after_prepare":
@@ -2328,7 +2291,7 @@ def test_reentrant_checkpoint(T: int, save_stats: bool, region: str) -> None:
 @pytest.mark.parametrize("T", (129, 2049))
 @pytest.mark.parametrize("prepare", ("skipped", "not_recorded"))
 def test_backward_without_the_prepare_node(T: int, prepare: str) -> None:
-    """A backward that runs the finish node but not the non-deterministic prepare node leaves the finish node's
+    """A backward that runs the finish node but not this package's prepare node leaves the finish node's
     ``dY`` and gradient statistics on no handle; what stays alive is the prepare node's own saved statistics while
     its backward has not run."""
     i = _make_inputs(T, seed=SEED + 58)
@@ -2360,8 +2323,8 @@ def test_backward_without_the_prepare_node(T: int, prepare: str) -> None:
 
 @pytest.mark.parametrize("save_stats", (True, False))
 def test_interleaved_connections(save_stats: bool) -> None:
-    """Two non-deterministic connections of one shape whose prepares both run before either finish equal the two
-    connections run one after the other (``X`` / ``scale`` / ``base`` bitwise, each ``fn`` within its bound)."""
+    """Two connections of this package of one shape whose prepares both run before either finish give the bits of
+    the two connections run one after the other (every gradient, ``fn`` included)."""
     T = 129
     a, b = _make_inputs(T, seed=SEED + 61), _make_inputs(T, seed=SEED + 62)
 
@@ -2382,11 +2345,10 @@ def test_interleaved_connections(save_stats: bool) -> None:
         torch.autograd.backward([Ya, Yb], [a["dY"], b["dY"]])
         return _grads(la), _grads(lb)
 
-    bounds = (_connection_bound(a, T), _connection_bound(b, T))
     serial, interleaved = run(False), run(True)
-    for n, bound in enumerate(bounds):
-        _assert_grads(
-            interleaved[n], serial[n], bound, f"connection {n} save_stats={save_stats}"
+    for n in range(2):
+        _assert_same_grads(
+            interleaved[n], serial[n], f"connection {n} save_stats={save_stats}"
         )
 
 
@@ -2470,14 +2432,14 @@ def test_changing_rows_in_one_process_does_not_rebuild() -> None:
 
 
 def test_argument_validation() -> None:
-    """The non-deterministic backward validates like the deterministic backward (``test_cake_mhc_det_train.py``'s checks,
+    """This package's backward validates like the deterministic backward (``test_cake_mhc_det_train.py``'s checks,
     on ``backward_finish`` and the autograd prepare / finish): a wrong shape, dtype, device or layout of an operand or
     an output is a ``ValueError``, as are out-of-range epsilons and Sinkhorn counts (a count above
     ``SINKHORN_ITERS_MAX`` a ``NotImplementedError``) and ``accumulate=True`` without its buffers; the workspace must
-    be a 1-D, 256-byte aligned ``uint8`` CUDA tensor of the non-deterministic size (a non-tensor a ``TypeError``).
+    be a 1-D, 256-byte aligned ``uint8`` CUDA tensor of this package's size (a non-tensor a ``TypeError``).
     An operand or output of another hidden size than ``X``, and a call whose hidden size the package does not list
     (6144) or the architecture does not route (5120 and 7168 on sm_107a), is a ``ValueError``.  ``B`` is optional:
-    ``None`` gives the same ``dX`` / ``dscale`` / ``dbase`` bits and a ``dfn`` within the bound.  ``finish`` takes
+    ``None`` gives the same bits of every output, ``dfn`` included.  ``finish`` takes
     only this package's handles (any other object, a deterministic package's handle included, is a ``TypeError``
     naming the deterministic finish); a ``deterministic`` keyword is a ``TypeError`` too."""
     T = 8
@@ -2560,10 +2522,8 @@ def test_argument_validation() -> None:
     # B is optional in the backward finish (its contribution is in grad_stats).
     with_b = _snapshot(dict(zip(_OUTPUTS, call(), strict=True)))
     without_b = _snapshot(dict(zip(_OUTPUTS, call(B=None), strict=True)))
-    _assert_exact_outputs(without_b, with_b, "B=None")
-    _assert_dfn_within(
-        without_b["dfn"], with_b["dfn"], _dfn_bound(i, _dfn_factor(T)), "dfn B=None"
-    )
+    for k in _OUTPUTS:
+        _assert_same_bits(without_b[k], with_b[k], f"{k} B=None")
     with pytest.raises(ValueError):
         _nd_prepare(X.float(), fn, scale, base)
     with pytest.raises(ValueError):
@@ -2587,9 +2547,10 @@ def test_argument_validation() -> None:
 
 @pytest.mark.parametrize("Ts", ((2049, 2049), (4096, 1024, 257)))
 def test_concurrent_streams(Ts: tuple) -> None:
-    """Launches on several ``torch.cuda.Stream`` objects at once, each with its own workspace and outputs (non-ticket
-    workspace bytes 0xFF and NaN outputs before every round): each equals its serial result (``dX``, ``dscale``,
-    ``dbase`` bitwise, ``dfn`` within the bound) and the deterministic backward's, and leaves its ticket region zero."""
+    """Launches on several ``torch.cuda.Stream`` objects at once, each with its own workspace and outputs (workspace
+    bytes past the zero prefix 0xFF and NaN outputs before every round): each is its serial result's bits (every
+    output, ``dfn`` included), equals the deterministic backward's (``dX``, ``dscale``, ``dbase`` bitwise, ``dfn``
+    within the bound) and leaves its zero prefix zero."""
     cases = []
     for n, T in enumerate(Ts):
         i = _make_inputs(T, seed=SEED + 500 + n)
@@ -2627,15 +2588,10 @@ def test_concurrent_streams(Ts: tuple) -> None:
         torch.cuda.synchronize()
         for n, c in enumerate(cases):
             what = f"round {rnd} stream {n} (T={c['T']}) of {Ts}"
-            _assert_ticket_zero(c["ws"], what)
-            _assert_exact_outputs(c["outs"], c["serial"], what + " vs serial")
+            _assert_zero_prefix(c["ws"], what)
+            for k in _OUTPUTS:
+                _assert_same_bits(c["outs"][k], c["serial"][k], f"{k} {what} vs serial")
             _assert_exact_outputs(c["outs"], c["want"], what + " vs deterministic")
-            _assert_dfn_within(
-                c["outs"]["dfn"],
-                c["serial"]["dfn"],
-                c["bound"],
-                f"dfn {what} vs serial",
-            )
             _assert_dfn_within(
                 c["outs"]["dfn"],
                 c["want"]["dfn"],
@@ -2743,9 +2699,10 @@ def _assert_mixed_case(got: dict, want: dict, bound: torch.Tensor, what: str) ->
 def test_mixed_hidden_sizes_same_token_count(T: int, workspaces: str) -> None:
     """Calls of every routed hidden size at the same token count, interleaved stage by stage through the direct
     entry points (default workspaces, one caller workspace per size, one caller workspace shared by the sizes), in
-    two rounds of opposite size order: ``forward_stats`` is bitwise the ``forward_prepare`` record, every output but
-    ``dfn`` is bitwise the sizes run one after the other and the deterministic package's on the same inputs, ``dfn``
-    within the bound of both, and a caller backward workspace keeps its ticket region zero."""
+    two rounds of opposite size order: ``forward_stats`` is bitwise the ``forward_prepare`` record, every output
+    (``dfn`` included) is bitwise the sizes run one after the other, every output but ``dfn`` is bitwise the
+    deterministic package's on the same inputs and ``dfn`` within the bound of it, and a caller backward workspace
+    keeps its zero prefix zero."""
     sizes = _mixed_hidden_sizes()
     cases = {H: _make_inputs(T, hidden=H, seed=SEED + 71 + H) for H in sizes}
     ws = _mixed_workspaces(sizes, T, workspaces)
@@ -2768,12 +2725,13 @@ def test_mixed_hidden_sizes_same_token_count(T: int, workspaces: str) -> None:
             assert torch.equal(got[H]["replay"], got[H]["stats"]), (
                 f"{what}: forward_stats is not bitwise the forward_prepare record"
             )
-            _assert_mixed_case(got[H], alone[H], bounds[H], f"{what} vs alone")
+            for k, v in alone[H].items():
+                _assert_same_bits(got[H][k], v, f"{k} {what} vs alone")
             _assert_mixed_case(
                 got[H], reference[H], bounds[H], f"{what} vs deterministic"
             )
             if ws[H][1] is not None:
-                _assert_ticket_zero(ws[H][1], what)
+                _assert_zero_prefix(ws[H][1], what)
         del got
 
 
@@ -2781,10 +2739,11 @@ def test_mixed_hidden_sizes_same_token_count(T: int, workspaces: str) -> None:
 @pytest.mark.parametrize("save_stats", (True, False))
 @pytest.mark.parametrize("workspaces", _WORKSPACE_MODES)
 def test_mixed_hidden_sizes_autograd(T: int, save_stats: bool, workspaces: str) -> None:
-    """The non-deterministic autograd connections with every routed hidden size at the same token count: the
+    """This package's autograd connections with every routed hidden size at the same token count: the
     prepares of every size, then the finishes in the reverse order, then one backward over the sum of the losses.
-    Each size's ``U`` and ``Y`` are bitwise those of the sizes run one after the other, its gradients equal theirs
-    and the deterministic connection's (``X`` / ``scale`` / ``base`` bitwise, ``fn`` within the bound)."""
+    Each size's ``U``, ``Y`` and gradients (``fn`` included) are bitwise those of the sizes run one after the other,
+    and its gradients equal the deterministic connection's (``X`` / ``scale`` / ``base`` bitwise, ``fn`` within the
+    bound)."""
     sizes = _mixed_hidden_sizes()
     cases = {H: _make_inputs(T, hidden=H, seed=SEED + 81 + H) for H in sizes}
     ws = _mixed_workspaces(sizes, T, workspaces)
@@ -2832,7 +2791,7 @@ def test_mixed_hidden_sizes_autograd(T: int, save_stats: bool, workspaces: str) 
         _assert_same_bits(connections[H][1].detach(), U_alone, f"U {what}")
         _assert_same_bits(Ys[H].detach(), Y_alone, f"Y {what}")
         grads = _grads(connections[H][0])
-        _assert_grads(grads, grads_alone, bounds[H], f"{what} vs alone")
+        _assert_same_grads(grads, grads_alone, f"{what} vs alone")
         _assert_grads(grads, reference[H], bounds[H], f"{what} vs deterministic")
 
 
@@ -2844,7 +2803,7 @@ def test_mixed_hidden_sizes_autograd(T: int, save_stats: bool, workspaces: str) 
 def test_zero_tokens_launch_nothing(hidden: int) -> None:
     """``T == 0`` behaves as the deterministic package: ``dX`` is empty; the parameter gradients are zeroed without
     ``accumulate`` (also caller buffers holding other values) and left untouched with it; the workspace needs no
-    bytes and an empty one is accepted; PyTorch's deterministic mode raises no alert (nothing is reduced)."""
+    bytes and an empty one is accepted; PyTorch's deterministic mode raises no alert."""
     _require_hidden(hidden)
     i = _make_inputs(0, hidden=hidden)
     prep = _forward(i)
@@ -2873,7 +2832,7 @@ def test_zero_tokens_launch_nothing(hidden: int) -> None:
             assert got[k] is buffers[k], (k, accumulate)
             expected = value if accumulate else 0.0
             assert bool((got[k] == expected).all()), (k, accumulate)
-    # Nothing is reduced at ``T == 0``, so PyTorch's deterministic mode raises no alert there.
+    # PyTorch's deterministic mode raises no alert at ``T == 0`` either.
     prev = (
         torch.are_deterministic_algorithms_enabled(),
         torch.is_deterministic_algorithms_warn_only_enabled(),

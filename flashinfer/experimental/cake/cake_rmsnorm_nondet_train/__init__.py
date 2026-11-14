@@ -538,7 +538,9 @@ def cake_rmsnorm_nondet_train_backward_workspace_bytes(
     (``cake_jit.SUMS_BYTES`` at ``cake_jit.SUMS_OFFSET``, the largest
     ``workspace_bytes`` of the package's single kernels) and, when a window up
     to ``rows`` of the width runs the deterministic pair, that pair's FP32
-    partial rows at ``cake_jit.PAIR_ROWS_OFFSET``, which grow with ``rows``.
+    partial rows at ``cake_jit.PAIR_ROWS_OFFSET``, which grow with ``rows`` (a
+    pair-row single kernel's FP32 scratch, one row of FP32 pairs per CTA, takes
+    the same place).
     The size returned is the largest layout of the records the width's
     backward routes (``hidden``, ``residual``, both weight dtypes) run for up
     to ``rows`` tokens.  The buffer must be zero on first use (allocate with
@@ -589,7 +591,10 @@ def _workspace_views(
     """``(the region bound to ``partial``, the counters, the layout)`` of the
     launched workspace owner ``record``: the FP64 column sums of a single
     kernel (its workspace rule's ``sum_bytes``, the kernel's
-    ``workspace_bytes``), the FP32 ``[n_chunks, hidden]`` partial rows of a pair
+    ``workspace_bytes``), the FP32 scratch of a pair-row single kernel (its
+    workspace rule's ``part_row_bytes``, one row of FP32 pairs, per CTA of the
+    launch grid; the kernel's ``workspace_bytes`` is 0), the FP32
+    ``[n_chunks, hidden]`` partial rows of a pair
     main kernel (``capacity``: the routes' pair record of the largest
     capacity; ``layout``: its ``cake_jit.workspace_layout``).  The region is
     checked against the kernel's requirement before the launch."""
@@ -615,9 +620,17 @@ def _workspace_views(
         )
     begin = layout["partial_offset"]
     hidden = int(record["hidden"])
-    if record["workspace_rule"]["kind"] == "claim_sum_f64":
+    kind = record["workspace_rule"]["kind"]
+    if kind == "claim_sum_f64":
         partial = workspace[begin : begin + layout["partial_bytes"]].view(torch.float64)
         required = int(record["workspace_rule"]["sum_bytes"]) // 8
+    elif kind == "claim_part_f32":
+        # one row of FP32 (hi, lo) pairs per CTA of the launch grid (the layout's
+        # ``grid``; the chunk table's ``slots`` may differ from it)
+        partial = workspace[begin : begin + layout["partial_bytes"]].view(torch.float32)
+        required = (
+            int(record["workspace_rule"]["part_row_bytes"]) * int(layout["grid"]) // 4
+        )
     else:
         partial = workspace[begin : begin + 4 * layout["n_chunks"] * hidden].view(
             torch.float32
@@ -826,10 +839,16 @@ def cake_rmsnorm_nondet_train_forward(
     residual : torch.Tensor, optional
         BF16 update of ``x``'s shape added to ``x`` before normalization (same
         layout rules as ``x``).  Enables the fused residual-add route.
-    out, rstd, residual_out : torch.Tensor, optional
-        Preallocated outputs: BF16 ``y`` of ``x``'s shape, FP32 reciprocal RMS of
-        its leading shape (``[T]``) and (residual only) BF16 ``h_new`` of ``x``'s
-        shape.  Contiguous aligned buffers are written directly; any other layout
+    out : torch.Tensor, optional
+        Preallocated BF16 ``y`` of ``x``'s shape. Contiguous aligned buffers
+        are written directly; any other layout receives a copy after the launch.
+    rstd : torch.Tensor, optional
+        Preallocated FP32 reciprocal RMS of ``x``'s leading shape (``[...]``
+        for ``x`` of shape ``[..., H]``). Contiguous aligned buffers are written
+        directly; any other layout receives a copy after the launch.
+    residual_out : torch.Tensor, optional
+        Preallocated BF16 ``h_new`` of ``x``'s shape, used only with ``residual``.
+        Contiguous aligned buffers are written directly; any other layout
         receives a copy after the launch.
 
     Returns
@@ -942,8 +961,9 @@ def _backward(
     )
     # The plain kernels keep the residual-gradient parameters in their signature
     # and never read them: bind them to ``g`` exactly like the source launcher.
-    # The single kernel's last CTA, or the pair's dw reduce, stores all of ``dw``,
-    # so a caller's ``dw`` buffer may hold anything.
+    # The single kernel's last CTA (a pair-row single kernel's helper CTAs), or
+    # the pair's dw reduce, stores all of ``dw``, so a caller's ``dw`` buffer may
+    # hold anything.
     g_h = g_residual if has_residual else g
     values: dict[str, object] = {
         "g": g,
@@ -1034,10 +1054,14 @@ def cake_rmsnorm_nondet_train_backward(
         allocates and zero-fills one: a caching-allocator call, one fill kernel
         (about 3 us on B200) and about 35 us of host time per call.  One buffer
         per backward that may run concurrently (on another stream).
-    dx, dw : torch.Tensor, optional
-        Preallocated outputs: BF16 ``dx`` of ``x``'s shape and FP32 ``[H]``.
-        Contiguous aligned buffers are written directly; any other layout
-        receives a copy after the launch.  Their previous contents are ignored.
+    dx : torch.Tensor, optional
+        Preallocated BF16 ``dx`` of ``x``'s shape. Contiguous aligned buffers
+        are written directly; any other layout receives a copy after the launch.
+        Its previous contents are ignored.
+    dw : torch.Tensor, optional
+        Preallocated FP32 ``[H]`` weight gradient. Contiguous aligned buffers
+        are written directly; any other layout receives a copy after the launch.
+        Its previous contents are ignored.
 
     Returns
     -------

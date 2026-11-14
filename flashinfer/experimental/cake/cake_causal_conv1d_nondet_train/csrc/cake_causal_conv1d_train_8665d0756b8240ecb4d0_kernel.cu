@@ -217,7 +217,7 @@ kernel_cake_causal_conv1d_train_8665d0756b8240ecb4d0(__nv_bfloat16* __restrict__
         #pragma unroll
         for (int j = 0; j < 8; j++) {
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(w + ((long long)c0 + (long long)j) * 4);
+                float4 _v4 = *reinterpret_cast<const float4*>(w + ((long long)c0 + (long long)j) * 4ll);
                 wr[j * 4 + 0] = _v4.x;
                 wr[j * 4 + 1] = _v4.y;
                 wr[j * 4 + 2] = _v4.z;

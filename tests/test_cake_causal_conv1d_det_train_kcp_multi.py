@@ -47,6 +47,11 @@ MROWS = [(name, lens, cuts, (C, C, C)) for name, lens, cuts, C in ROWS] + [
     ("short-mixed", (1, 2, 3, 57), (3, 30, 30), (384, 128, 8)),
     ("one-tensor", (5000, 1003), (1, 2, 4997, 1003), (512,)),
 ]
+# The multi entry's production layer (FlashInfer issue #8365): one rank's 16384 tokens and three convolutions of
+# C = 8192; kept out of ``MROWS`` (other suites import it).
+MROWS_8365 = [
+    ("8365-c8192x3", (9000, 5000, 2384), (4095, 4097, 4099, 4093), (8192, 8192, 8192)),
+]
 
 
 def _bits(t):
@@ -86,7 +91,9 @@ def _singles_explicit(conv_kcp, ctx, xs, ws, dys):
     return out
 
 
-@pytest.mark.parametrize("name,lens,cuts,Cs", MROWS, ids=[r[0] for r in MROWS])
+@pytest.mark.parametrize(
+    "name,lens,cuts,Cs", MROWS + MROWS_8365, ids=[r[0] for r in MROWS + MROWS_8365]
+)
 def test_multi_forward_backward_bitwise_single_calls(name, lens, cuts, Cs) -> None:
     conv_kcp = _kcp()
     device = torch.device("cuda")

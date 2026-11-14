@@ -17,8 +17,8 @@ Deterministic Cake DSA indexer top-k for training (SM100 / SM103 / SM107).
 
 Every public name carries the mode word ``det``; no entry point takes a
 ``deterministic=`` keyword (flashinfer-ai/flashinfer#8928).  The
-non-deterministic counterpart ``flashinfer.cake_dsa_indexer_nondet_train`` is a
-reserved name for a planned package.
+non-deterministic counterpart is ``flashinfer.cake_dsa_indexer_nondet_train``,
+which leaves the slot order of each row unspecified.
 
 Thin entry points: validation of the backend contract, the host dispatch and
 workspace policy, the launch binding, JIT registration and the generated
@@ -129,8 +129,11 @@ def cake_dsa_indexer_det_train_topk(
         The caller's bound on every key segment (``max(cu_seqlens_k[1:] -
         cu_seqlens_k[:-1])``); the results are bitwise identical with and
         without it.  It sizes the rank finalize's bitmap pool and so selects
-        the finalize program variant; a value above ``Tkv`` or below
-        ``ceil(Tkv / S)`` is rejected.
+        the finalize program variant.  On ``sm_100a`` and ``sm_103a`` it also
+        shows the host whether every key segment of a packed call has the same
+        length (``Tkv == S * max_seqlen_k``): such a call runs its scan program
+        without the longest-segment-first unit order (the ``:lsf`` copy).  A
+        value above ``Tkv`` or below ``ceil(Tkv / S)`` is rejected.
     workspace_buffer : Optional[torch.Tensor]
         Scratch of at least :func:`cake_dsa_indexer_det_train_topk_workspace_size`
         bytes for the call's geometry (uint8, 8-byte aligned); allocated through
@@ -138,9 +141,10 @@ def cake_dsa_indexer_det_train_topk(
         with other calls and kernels between runs: on the ticket architectures
         the backend then zeroes the buffer's ticket word before every run,
         while its own workspace is zeroed once at prepare.
-    indices, scores : Optional[torch.Tensor]
-        Caller-owned ``[T, top_k]`` int32 / float32 outputs; allocated when
-        omitted.
+    indices : Optional[torch.Tensor]
+        Caller-owned ``[T, top_k]`` int32 output; allocated when omitted.
+    scores : Optional[torch.Tensor]
+        Caller-owned ``[T, top_k]`` float32 output; allocated when omitted.
     return_scores : bool
         ``False``: indices only; ``scores`` must be omitted and ``None`` is
         returned in its place (the scores are still computed internally).
@@ -210,8 +214,9 @@ def cake_dsa_indexer_det_train_topk_workspace_size(
     num_segments``, ``ratio`` and ``top_k`` together with the SM count of
     ``device``, and the bound follows that choice: ``grid x queries_per_unit
     x candidate_capacity(top_k) x 8`` bytes of persistent candidate buffers
-    (for example about 37 MiB at ``top_k = 2048`` with four queries per unit
-    on a 148-SM device, 74 MiB with eight) plus ``T x n_split x top_k x 8``
+    (for example 74 MiB at ``top_k = 2048`` with four queries per unit on a
+    148-SM ``sm_100a`` device, whose capacity floor is 16384 slots at that
+    ``top_k``, and 148 MiB with eight) plus ``T x n_split x top_k x 8``
     bytes of staging when the dispatch splits the key ranges.  Size a reused
     buffer for the largest bound over the geometries it serves.  ``dtype`` is
     the q / k dtype: ``torch.float8_e4m3fn`` bounds the FP8 form, whose

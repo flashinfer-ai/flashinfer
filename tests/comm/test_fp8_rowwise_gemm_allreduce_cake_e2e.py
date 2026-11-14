@@ -50,6 +50,16 @@ FP8 = torch.float8_e4m3fn
 # w_r[n, k]) ** 2): the elementwise bound adds SM90_FLOOR_C1 * Q there. SM100 /
 # SM103 accumulate in fp32 and keep the bound without it.
 SM90_FLOOR_C1 = 2**-10
+# (M, N, K_l) calls that select the lever programs a route may deliver, one call
+# per program (``_lever_cases``). The two calls above 32768 rows reach the
+# programs that the drainer lever leaves to larger calls at 4 and 8 ranks.
+LEVER_SHAPES = (
+    (1, 1024, 128),
+    (1, 1024, 384),
+    (16384, 12288, 4096),
+    (32769, 1024, 128),
+    (49152, 4096, 4096),
+)
 
 
 def _visible_arch():
@@ -156,6 +166,48 @@ def _replayed_launcher(launcher, static, device, group, generator, eager):
         _check(launcher(*eager), _expected(*eager, group))
         del expected
     del graph, captured_first, captured_second
+
+
+def _lever_cases(world_size, arch, sm_count):
+    """``(capacity, route key, program, call)`` of every lever program a route of
+    ``world_size`` delivers on ``arch``. The call is the first ``LEVER_SHAPES``
+    call that the loader dispatches to that program, or ``None``: as in
+    ``call_program``, the capacity class gives the route and the program variant,
+    and the lever of the call is taken in that variant.
+    """
+
+    capacities = [None] + [
+        int(capacity)
+        for variant_world_size, capacity, _suffix in loader.CAPACITY_VARIANTS.get(
+            arch, []
+        )
+        if int(variant_world_size) == world_size
+    ]
+    cases = []
+    for capacity in capacities:
+        base = loader.route_key(world_size, arch, capacity or 1024)
+        for lever in loader.lever_suffixes(arch)[1:]:
+            program = loader.ROUTES[arch].get(base + lever)
+            if program is None or program == loader.ROUTES[arch][base]:
+                continue
+            shapes = [
+                (m, n, k_l)
+                for m, n, k_l in LEVER_SHAPES
+                if (capacity is None or m <= capacity)
+                and loader.route_key(world_size, arch, capacity or m) == base
+                and loader.lever_variant(
+                    world_size,
+                    m,
+                    n,
+                    k_l,
+                    arch,
+                    sm_count=sm_count,
+                    variant=loader.program_variant(world_size, capacity or m, arch),
+                )
+                == lever
+            ]
+            cases.append((capacity, base + lever, program, (shapes or [None])[0]))
+    return cases
 
 
 def _run_cake_group(rank: int, world_size: int, port: int, symm_backend: str):
@@ -300,6 +352,10 @@ def _run_cake_group(rank: int, world_size: int, port: int, symm_backend: str):
         _replayed_launcher(launcher, static, device, group, generator, sample)
         del static
 
+    # Launchers prepared from here on stay alive until the lever programs ran:
+    # torch's NVSHMEM backend (before pytorch#192579) may return the cached,
+    # smaller handle of a freed symmetric buffer at the same address.
+    held = []
     # A capacity that selects a per-capacity program variant (when the
     # architecture delivers one for this world size) is served by that program.
     for variant_world_size, capacity, suffix in loader.CAPACITY_VARIANTS.get(arch, []):
@@ -318,7 +374,31 @@ def _run_cake_group(rank: int, world_size: int, port: int, symm_backend: str):
             served = _inputs(served_rows, N, K_L, device, generator)
             _check(variant_launcher(*served), _expected(*served, group))
             del served
+        held.append(variant_launcher)
         del variant_launcher, variant_sample
+
+    # Every lever program a route delivers (the loader's LEVER_DISPATCH) computes
+    # the route's result: one prepared launcher per delivered lever key, called
+    # with a shape that selects that program.
+    sm_count = loader.device_facts(device.index).sm_count
+    for capacity, key, program, shape in _lever_cases(world_size, arch, sm_count):
+        assert shape is not None, f"no e2e shape selects {key} on {arch}"
+        m, n, k_l = shape
+        lever_sample = _inputs(m, n, k_l, device, generator)
+        lever_launcher = prepare_fp8_rowwise_gemm_allreduce(
+            *lever_sample, group, max_rows=capacity or m
+        )
+        assert program in lever_launcher.programs
+        assert (
+            loader.call_program(
+                world_size, arch, capacity or m, m, n, k_l, sm_count=sm_count
+            )
+            == program
+        )
+        _check(lever_launcher(*lever_sample), _expected(*lever_sample, group))
+        held.append(lever_launcher)
+        del lever_launcher, lever_sample
+    del held
 
     # Growth after capture is refused: a graph captured from a one-shot call
     # bakes the addresses of the current workspace generation on every rank, so

@@ -15,7 +15,7 @@ limitations under the License.
 
 Cake four-stream mHC training forward / backward (4 streams; hidden size
 ``H`` in {4096, 5120, 7168}, taken per call from ``X.shape[2]``; SM100 / SM103
-at all three sizes, SM107 at 4096).
+/ SM107 at all three sizes).
 
 The function (FP32 arithmetic, BF16 activation boundaries)::
 
@@ -51,12 +51,13 @@ recomputes them in the backward; with
 recomputed from ``X`` in the backward with bitwise the same gradients
 (checkpoint replay).  The finish node's backward hands ``dY`` and the gradient
 statistics to the prepare node's backward on autograd edges, so nothing of a
-connection stays alive once its backward has run; on SM100 / SM103 at hidden
-4096 and up to 1024 tokens the replay also writes the transposed split of
-``fn`` (3 MiB), handed on one more edge, so the backward does not split ``fn``
-again.  Workspaces are caller-held
-(``*_workspace_bytes`` / ``*_workspace``) and the submit path allocates
-nothing; a workspace serves the calls of the hidden size it was sized for
+connection stays alive once its backward has run; at hidden 4096, up to 4096
+tokens on SM100 / SM107 and up to 2048 tokens on SM103, the replay also writes
+the transposed split of ``fn`` (3 MiB), handed on one more edge, so the
+backward does not split ``fn`` again.  Workspaces are caller-held
+(``*_workspace_bytes`` / ``*_workspace``) and, with preallocated outputs,
+the submit path allocates nothing; a workspace serves the calls of the
+hidden size it was sized for
 (``hidden=``, default 4096) up to ``T`` tokens.  All tensors are contiguous:
 ``X``, ``Y``, ``dY``, ``dX`` BF16 ``[T, 4, H]``; ``U``, ``B``, ``dU``, ``dB``
 BF16 ``[T, H]``; ``fn`` FP32 ``[24, 4H]``; ``scale`` FP32 ``[3]``; ``base``
@@ -153,7 +154,7 @@ def cake_mhc_det_train_forward_workspace_bytes(
     hidden : int
         Hidden size ``H`` of the calls the buffer serves (``X.shape[2]``;
         default ``4096``): a hidden size the device's architecture exports
-        (4096, 5120 or 7168 on SM100 / SM103, 4096 on SM107), else
+        (4096, 5120 or 7168 on SM100 / SM103 / SM107), else
         ``ValueError``.  The ``fn`` pieces and the partials scale with ``4 H``;
         every call checks the buffer against its own ``H`` and ``T``, so a
         buffer sized for one ``H`` is refused (``ValueError``) by a call of a
@@ -224,7 +225,7 @@ def cake_mhc_det_train_forward_prepare(
         BF16 ``[T, 4, H]`` contiguous residual streams (``T`` is a runtime
         scalar; ``T == 0`` returns empty outputs without launching).  The
         hidden size ``H = X.shape[2]`` is 4096, 5120 or 7168 on SM100 / SM103
-        and 4096 on SM107.
+        / SM107.
     fn : torch.Tensor
         FP32 ``[24, 4H]`` contiguous mapping matrix.
     scale : torch.Tensor
@@ -388,9 +389,10 @@ def cake_mhc_det_train_backward_prepare(
 
     Returns
     -------
-    ``(dB, grad_stats)``: ``dB[t, d] = BF16(sum_j post[t, j] dY[t, j, d])`` (one
-    rounding of the full FP32 sum) and the FP32 ``[T, 32]`` record
-    ``dpost[4] | dC[16] | zeros[12]`` that :func:`cake_mhc_det_train_backward_finish` consumes.
+    tuple of torch.Tensor
+        ``(dB, grad_stats)``: ``dB[t, d] = BF16(sum_j post[t, j] dY[t, j, d])`` (one
+        rounding of the full FP32 sum) and the FP32 ``[T, 32]`` record
+        ``dpost[4] | dC[16] | zeros[12]`` that :func:`cake_mhc_det_train_backward_finish` consumes.
     """
 
     return _pkg().cake_mhc_det_train_backward_prepare(

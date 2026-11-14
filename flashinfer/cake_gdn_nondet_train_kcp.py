@@ -38,7 +38,9 @@ Mode
   budgets; its results are not bitwise equal to that package's.  It also takes
   ``save_mode="light_akk"``: the light saved set plus the forward's BF16
   ``Akk`` tape, which the backward's prep replay reads instead of solving the
-  block inverse; it needs ``use_qk_l2norm_in_kernel=True``.
+  block inverse; it needs ``use_qk_l2norm_in_kernel=True`` and is the default
+  there (a call that leaves ``save_mode`` unset), while calls without the norm
+  default to ``"light"``.
 
 A stable FlashInfer API: thin ``@flashinfer_api`` entry points that import the
 package on first use.  The partition / context plan, the host orchestration,
@@ -235,6 +237,23 @@ def cake_gdn_nondet_train_kcp_build_context(
     device tables built once; no tensor contents are read.  The context holds no mode; its head plan is this
     package's own.  ``graph_replay=True`` builds the context for calls with ``graph="replay"``: the package then drops the
     one-chain (``P = 1``) rows of its faster plan, which save launches that graph replay removes.
+
+    Parameters
+    ----------
+    part
+        Partition returned by :func:`cake_gdn_nondet_train_kcp_partition`.
+    group
+        Caller-owned ``torch.distributed`` process group for all collectives.
+    rank : int
+        This rank's index within ``group``.
+    device
+        CUDA device on which to build this rank's tables.
+    conv_kernel_size : int, default=4
+        Convolution width used to plan the history-row halo exchange.
+    sm_count : int, optional
+        SM count to use when building the segment plan.
+    graph_replay : bool, default=False
+        Build the context for calls with ``graph="replay"``.
     """
     if not isinstance(graph_replay, bool):
         raise TypeError(
@@ -287,14 +306,17 @@ def cake_gdn_nondet_train_kcp_forward(
         Keep the saved set (``boundary_mode="saved"``); ``False`` or ``boundary_mode="replay"`` returns ``None``.
     workspace : CakeGDNNondetKcpWorkspace, optional
         A reused caller-held workspace (``cake_gdn_nondet_train_kcp_workspace_bytes``); without one the call allocates its own.
-    options, **knobs
-        Keyword-only options (``save_mode`` ``"light"`` | ``"full"`` | ``"light_akk"`` (see the module docstring),
+    options
+        Keyword-only options (``save_mode`` ``"light"`` | ``"full"`` | ``"light_akk"`` (see the module docstring;
+        unset: ``"light_akk"`` with ``use_qk_l2norm_in_kernel=True``, else ``"light"``),
         ``boundary_mode`` ``"saved"`` | ``"replay"``,
         ``exchange`` ``"a2a"`` | ``"ring"``, ``save_transfer``, ``offset_class`` ``"fla"`` | ``"fp32"``, ``layout`` ``"tma"`` |
         ``"copy"``, ``group_reduce`` ``"fused"`` | ``"host"``, ``graph`` ``"off"`` | ``"replay"``,
         ``reuse_recompute_tapes`` ``"auto"`` (default) | ``True`` | ``False`` (see :func:`cake_gdn_nondet_kcp`),
         ``recompute_output`` ``"auto"`` | ``"always"`` (an autograd-node switch; this forward-only entry never skips a
         launch), ...).
+    **knobs
+        Keyword overrides for the backend options described above.
 
     Returns
     -------
@@ -344,8 +366,10 @@ def cake_gdn_nondet_train_kcp_backward(
     saved : optional
         The forward's saved set; ``None`` recomputes it from the inputs (checkpoint replay: the summaries and the
         exchange are re-run).  A saved set of the deterministic package is refused (``ValueError``).
-    scale, workspace, options, **knobs
+    scale, workspace, options
         As in :func:`cake_gdn_nondet_train_kcp_forward` (the same options as the forward's).
+    **knobs
+        Additional backend options, as in :func:`cake_gdn_nondet_train_kcp_forward`.
 
     Returns
     -------
@@ -380,7 +404,7 @@ def cake_gdn_nondet_kcp(
     ctx: Any,
     *,
     scale: Optional[float] = None,
-    save_mode: str = "light",
+    save_mode: Optional[str] = None,
     boundary_mode: str = "saved",
     workspace: Optional[Any] = None,
     graph: str = "off",
@@ -501,6 +525,15 @@ def cake_gdn_nondet_train_kcp_packed_qkv_views(
 
         q, k, v = cake_gdn_nondet_train_kcp_packed_qkv_views(conv_out, H_qk=16, HV=48)   # conv_out: [T, 10240]
         out = cake_gdn_nondet_kcp(q, k, v, g, beta, ctx)
+
+    Parameters
+    ----------
+    qkv : torch.Tensor
+        Packed projection rows ``[..., T, (2 * H_qk + HV) * 128]`` with unit channel stride.
+    H_qk : int
+        Number of query and key heads, each with 128 channels.
+    HV : int
+        Number of value heads, each with 128 channels.
     """
     return _pkg().cake_gdn_nondet_train_kcp_packed_qkv_views(qkv, H_qk=H_qk, HV=HV)
 
@@ -515,7 +548,19 @@ def cake_gdn_nondet_train_kcp_workspace_bytes(
     the per-phase terms are ``cake_bytes.cake_gdn_nondet_train_kcp_workspace_layout`` of the package).
     ``save_mode="light_akk"`` gives the figure of a call outside a checkpoint: under
     ``torch.utils.checkpoint(use_reentrant=False)`` that call runs as ``"light"`` and binds the ``save_mode="light"``
-    figure, so a checkpointed ``"light_akk"`` layer is sized with ``save_mode="light"``."""
+    figure, so a checkpointed ``"light_akk"`` layer is sized with ``save_mode="light"``.
+
+    Parameters
+    ----------
+    ctx
+        This rank's context from :func:`cake_gdn_nondet_train_kcp_build_context`.
+    H_qk : int
+        Number of query and key heads.
+    HV : int
+        Number of value heads.
+    **kw
+        Backend options for this query, including the call's save and boundary settings.
+    """
     return _pkg().cake_gdn_nondet_train_kcp_workspace_bytes(ctx, H_qk=H_qk, HV=HV, **kw)
 
 
@@ -525,7 +570,19 @@ def cake_gdn_nondet_train_kcp_saved_bytes(
     ctx: Any, *, H_qk: int, HV: int, **kw: Any
 ) -> int:
     r"""Saved-set bytes of one layer on this rank (``save_mode``, ``save_transfer`` as keywords), counted per
-    crossing fragment."""
+    crossing fragment.
+
+    Parameters
+    ----------
+    ctx
+        This rank's context from :func:`cake_gdn_nondet_train_kcp_build_context`.
+    H_qk : int
+        Number of query and key heads.
+    HV : int
+        Number of value heads.
+    **kw
+        Backend options for this query, including the call's save and boundary settings.
+    """
     return _pkg().cake_gdn_nondet_train_kcp_saved_bytes(ctx, H_qk=H_qk, HV=HV, **kw)
 
 
@@ -540,7 +597,21 @@ def cake_gdn_nondet_train_kcp_comm_bytes(
     **kw: Any,
 ) -> dict:
     r"""Bytes this rank moves per collective (``c1``, ``c2``, ``b1``, ``b2``, ``halo_fwd``, ``halo_bwd``) and per
-    boundary, counted per crossing fragment; ``C`` is the convolution channel count of the halo rows."""
+    boundary, counted per crossing fragment; ``C`` is the convolution channel count of the halo rows.
+
+    Parameters
+    ----------
+    ctx
+        This rank's context from :func:`cake_gdn_nondet_train_kcp_build_context`.
+    H_qk : int
+        Number of query and key heads.
+    HV : int
+        Number of value heads.
+    C : int, default=10240
+        Convolution channel count used to size halo traffic.
+    **kw
+        Backend options for this query: ``save_transfer`` and ``boundary_mode``.
+    """
     return _pkg().cake_gdn_nondet_train_kcp_comm_bytes(ctx, H_qk=H_qk, HV=HV, C=C, **kw)
 
 
@@ -550,7 +621,13 @@ def is_cake_gdn_nondet_train_kcp_supported(
 ) -> bool:
     r"""``True`` when ``device`` (default: the current CUDA device) is an exported target of the package
     (``sm_100a``, ``sm_103a``, ``sm_107a``).  ``False`` without CUDA, for a device that is not a CUDA device and for
-    a device that cannot be queried.  A package that fails to import raises: it is not reported as unsupported."""
+    a device that cannot be queried.  A package that fails to import raises: it is not reported as unsupported.
+
+    Parameters
+    ----------
+    device : torch.device, str, int, optional
+        Device to query; ``None`` selects the current CUDA device.
+    """
     from .experimental.cake.cake_gdn_nondet_train_kcp import cake_backend  # noqa: PLC0415 - imported on first use
 
     if not torch.cuda.is_available():

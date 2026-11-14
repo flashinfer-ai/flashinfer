@@ -293,7 +293,7 @@ kernel_cake_gdn_det_train_2eade16c7f51796727a5_kcp(const __grid_constant__ CUten
             int h0_slot = h0_index[seg];
             if (h0_slot >= 0) {
                 int h0_tile = (head / h0_hg * h0_n + h0_slot) * h0_hg + head % h0_hg;
-                long long h0_base = (long long)h0_tile * (long long)tile_stride * 16384 + (long long)(k_row * 128 + vbase);
+                long long h0_base = (long long)h0_tile * (long long)tile_stride * 16384ll + (long long)(k_row * 128 + vbase);
                 #pragma unroll
                 for (int blk = 0; blk < 4; blk++) {
                     #pragma unroll
@@ -345,7 +345,7 @@ kernel_cake_gdn_det_train_2eade16c7f51796727a5_kcp(const __grid_constant__ CUten
             unsigned int _phase_h_ready_0 = 0;
             #pragma unroll 1
             for (int c = 0; c < nc; c++) {
-                if (nc > c + 1) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(u + ((rs_next + (long long)num_heads * 64) * 128 + (long long)(vbase + lane_half * 32))))); }
+                if (nc > c + 1) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(u + ((rs_next + (long long)num_heads * 64ll) * 128ll + (long long)(vbase + lane_half * 32))))); }
                 mbarrier_wait(hs_free_addr, _phase_hs_free_0);
                 _phase_hs_free_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -428,7 +428,7 @@ kernel_cake_gdn_det_train_2eade16c7f51796727a5_kcp(const __grid_constant__ CUten
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(hs_ready_addr);
-                long long u_base = ((long long)(row0 + c * 64 + t_row) * (long long)num_heads + (long long)head) * 128 + (long long)vbase;
+                long long u_base = ((long long)(row0 + c * 64 + t_row) * (long long)num_heads + (long long)head) * 128ll + (long long)vbase;
                 int col = lane_half * 16;
                 float uv[16];
                 {

@@ -110,6 +110,26 @@ class RubinVariantBackend(MegaKernelBackend):
             dataclasses.replace(config, kernel_variant="inference")
         )
 
+    def ep_weight_pack(self, weights):
+        return self._fallback.ep_weight_pack(weights)
+
+    def ep_selected_config(self, workspace):
+        return workspace.kernel.ep_selected_config(workspace.workspace)
+
+    def ep_tuning_fallback(self):
+        return self._fallback.ep_tuning_fallback()
+
+    def ep_force_tune(self, workspace, tensors, weights, output):
+        self.stage_inputs(tensors, workspace, quantize_input=True)
+        AutoTuner.get().choose_with_protocol(
+            NAMESPACE,
+            _VariantProtocol(self, workspace, weights, output),
+            force_tune=True,
+        )
+
+    def ep_tuning_contract(self, fleet_params):
+        return self._fallback.ep_tuning_contract(fleet_params)
+
     @classmethod
     def kernel_name(cls):
         return NAMESPACE

@@ -236,60 +236,60 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
     int taddr_1 = tmem_acc_cols + (warp_1 * 32 << 16);
     int r0 = tid / 16;
     int c0 = tid % 16 * 8;
-    long long row_stride = (long long)num_heads * 128;
-    long long src_row = (long long)(tok0 + r0) * row_stride + (long long)hq * 128 + (long long)c0;
+    long long row_stride = (long long)num_heads * 128ll;
+    long long src_row = (long long)(tok0 + r0) * row_stride + (long long)hq * 128ll + (long long)c0;
     unsigned int dst0 = s_kn_addr + (unsigned int)(c0 / 64 * 8192 + (r0 * 128 + c0 % 64 * 2 ^ (r0 * 128 + c0 % 64 * 2 >> 7 & 7) << 4));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
         :: "r"(dst0), "l"(kn + src_row), "r"((n_valid > r0) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0 + 1024), "l"(kn + (src_row + 8 * row_stride)), "r"((n_valid > r0 + 8) ? 16 : 0));
+        :: "r"(dst0 + 1024), "l"(kn + (src_row + 8ll * row_stride)), "r"((n_valid > r0 + 8) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0 + 2048), "l"(kn + (src_row + 16 * row_stride)), "r"((n_valid > r0 + 16) ? 16 : 0));
+        :: "r"(dst0 + 2048), "l"(kn + (src_row + 16ll * row_stride)), "r"((n_valid > r0 + 16) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0 + 3072), "l"(kn + (src_row + 24 * row_stride)), "r"((n_valid > r0 + 24) ? 16 : 0));
+        :: "r"(dst0 + 3072), "l"(kn + (src_row + 24ll * row_stride)), "r"((n_valid > r0 + 24) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0 + 4096), "l"(kn + (src_row + 32 * row_stride)), "r"((n_valid > r0 + 32) ? 16 : 0));
+        :: "r"(dst0 + 4096), "l"(kn + (src_row + 32ll * row_stride)), "r"((n_valid > r0 + 32) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0 + 5120), "l"(kn + (src_row + 40 * row_stride)), "r"((n_valid > r0 + 40) ? 16 : 0));
+        :: "r"(dst0 + 5120), "l"(kn + (src_row + 40ll * row_stride)), "r"((n_valid > r0 + 40) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0 + 6144), "l"(kn + (src_row + 48 * row_stride)), "r"((n_valid > r0 + 48) ? 16 : 0));
+        :: "r"(dst0 + 6144), "l"(kn + (src_row + 48ll * row_stride)), "r"((n_valid > r0 + 48) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0 + 7168), "l"(kn + (src_row + 56 * row_stride)), "r"((n_valid > r0 + 56) ? 16 : 0));
+        :: "r"(dst0 + 7168), "l"(kn + (src_row + 56ll * row_stride)), "r"((n_valid > r0 + 56) ? 16 : 0));
     if (recompute != 0) {
         int ra = tid / 8;
         int ca = tid % 8 * 8;
-        long long a_stride = (long long)num_v_heads * 64;
-        long long a_src = (long long)(tok0 + ra) * a_stride + (long long)hv * 64 + (long long)ca;
+        long long a_stride = (long long)num_v_heads * 64ll;
+        long long a_src = (long long)(tok0 + ra) * a_stride + (long long)hv * 64ll + (long long)ca;
         unsigned int a_dst = s_a_addr + (unsigned int)(ca / 64 * 8192 + (ra * 128 + ca % 64 * 2 ^ (ra * 128 + ca % 64 * 2 >> 7 & 7) << 4));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
             :: "r"(a_dst), "l"(A_out + a_src), "r"((n_valid > ra) ? 16 : 0));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(a_dst + 2048), "l"(A_out + (a_src + 16 * a_stride)), "r"((n_valid > ra + 16) ? 16 : 0));
+            :: "r"(a_dst + 2048), "l"(A_out + (a_src + 16ll * a_stride)), "r"((n_valid > ra + 16) ? 16 : 0));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(a_dst + 4096), "l"(A_out + (a_src + 32 * a_stride)), "r"((n_valid > ra + 32) ? 16 : 0));
+            :: "r"(a_dst + 4096), "l"(A_out + (a_src + 32ll * a_stride)), "r"((n_valid > ra + 32) ? 16 : 0));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(a_dst + 6144), "l"(A_out + (a_src + 48 * a_stride)), "r"((n_valid > ra + 48) ? 16 : 0));
+            :: "r"(a_dst + 6144), "l"(A_out + (a_src + 48ll * a_stride)), "r"((n_valid > ra + 48) ? 16 : 0));
         int r0_0 = tid / 16;
         int c0_0 = tid % 16 * 8;
-        long long row_stride_0 = (long long)num_v_heads * 128;
-        long long src_row_0 = (long long)(tok0 + r0_0) * row_stride_0 + (long long)hv * 128 + (long long)c0_0;
+        long long row_stride_0 = (long long)num_v_heads * 128ll;
+        long long src_row_0 = (long long)(tok0 + r0_0) * row_stride_0 + (long long)hv * 128ll + (long long)c0_0;
         unsigned int dst0_0 = s_v_addr + (unsigned int)(c0_0 / 64 * 8192 + (r0_0 * 128 + c0_0 % 64 * 2 ^ (r0_0 * 128 + c0_0 % 64 * 2 >> 7 & 7) << 4));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
             :: "r"(dst0_0), "l"(v + src_row_0), "r"((n_valid > r0_0) ? 16 : 0));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(dst0_0 + 1024), "l"(v + (src_row_0 + 8 * row_stride_0)), "r"((n_valid > r0_0 + 8) ? 16 : 0));
+            :: "r"(dst0_0 + 1024), "l"(v + (src_row_0 + 8ll * row_stride_0)), "r"((n_valid > r0_0 + 8) ? 16 : 0));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(dst0_0 + 2048), "l"(v + (src_row_0 + 16 * row_stride_0)), "r"((n_valid > r0_0 + 16) ? 16 : 0));
+            :: "r"(dst0_0 + 2048), "l"(v + (src_row_0 + 16ll * row_stride_0)), "r"((n_valid > r0_0 + 16) ? 16 : 0));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(dst0_0 + 3072), "l"(v + (src_row_0 + 24 * row_stride_0)), "r"((n_valid > r0_0 + 24) ? 16 : 0));
+            :: "r"(dst0_0 + 3072), "l"(v + (src_row_0 + 24ll * row_stride_0)), "r"((n_valid > r0_0 + 24) ? 16 : 0));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(dst0_0 + 4096), "l"(v + (src_row_0 + 32 * row_stride_0)), "r"((n_valid > r0_0 + 32) ? 16 : 0));
+            :: "r"(dst0_0 + 4096), "l"(v + (src_row_0 + 32ll * row_stride_0)), "r"((n_valid > r0_0 + 32) ? 16 : 0));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(dst0_0 + 5120), "l"(v + (src_row_0 + 40 * row_stride_0)), "r"((n_valid > r0_0 + 40) ? 16 : 0));
+            :: "r"(dst0_0 + 5120), "l"(v + (src_row_0 + 40ll * row_stride_0)), "r"((n_valid > r0_0 + 40) ? 16 : 0));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(dst0_0 + 6144), "l"(v + (src_row_0 + 48 * row_stride_0)), "r"((n_valid > r0_0 + 48) ? 16 : 0));
+            :: "r"(dst0_0 + 6144), "l"(v + (src_row_0 + 48ll * row_stride_0)), "r"((n_valid > r0_0 + 48) ? 16 : 0));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(dst0_0 + 7168), "l"(v + (src_row_0 + 56 * row_stride_0)), "r"((n_valid > r0_0 + 56) ? 16 : 0));
+            :: "r"(dst0_0 + 7168), "l"(v + (src_row_0 + 56ll * row_stride_0)), "r"((n_valid > r0_0 + 56) ? 16 : 0));
     }
     asm volatile("cp.async.commit_group;");
     if (tid_2 < 64) {
@@ -3189,8 +3189,8 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
         int p_col = tid_2 % 16 * 4;
         unsigned int x_pub = s_x_addr + (unsigned int)((p_row * 64 + (p_col ^ (p_row >> 2 & 1) << 4)) * 4);
         int a_pub = p_row * 128 + (p_col * 2 ^ p_row << 4);
-        long long a_idx0 = ((long long)(tok0 + p_row) * (long long)num_v_heads + (long long)hv) * 64 + (long long)p_col;
-        long long a_rows8 = (long long)num_v_heads * 512;
+        long long a_idx0 = ((long long)(tok0 + p_row) * (long long)num_v_heads + (long long)hv) * 64ll + (long long)p_col;
+        long long a_rows8 = (long long)num_v_heads * 512ll;
         #pragma unroll
         for (int t = 0; t < 8; t++) {
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -3389,25 +3389,25 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
     if (recompute == 0) {
         int r0_1 = tid / 16;
         int c0_1 = tid % 16 * 8;
-        long long row_stride_1 = (long long)num_v_heads * 128;
-        long long src_row_1 = (long long)(tok0 + r0_1) * row_stride_1 + (long long)hv * 128 + (long long)c0_1;
+        long long row_stride_1 = (long long)num_v_heads * 128ll;
+        long long src_row_1 = (long long)(tok0 + r0_1) * row_stride_1 + (long long)hv * 128ll + (long long)c0_1;
         unsigned int dst0_1 = s_v_addr + (unsigned int)(c0_1 / 64 * 8192 + (r0_1 * 128 + c0_1 % 64 * 2 ^ (r0_1 * 128 + c0_1 % 64 * 2 >> 7 & 7) << 4));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
             :: "r"(dst0_1), "l"(v + src_row_1), "r"((n_valid > r0_1) ? 16 : 0));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(dst0_1 + 1024), "l"(v + (src_row_1 + 8 * row_stride_1)), "r"((n_valid > r0_1 + 8) ? 16 : 0));
+            :: "r"(dst0_1 + 1024), "l"(v + (src_row_1 + 8ll * row_stride_1)), "r"((n_valid > r0_1 + 8) ? 16 : 0));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(dst0_1 + 2048), "l"(v + (src_row_1 + 16 * row_stride_1)), "r"((n_valid > r0_1 + 16) ? 16 : 0));
+            :: "r"(dst0_1 + 2048), "l"(v + (src_row_1 + 16ll * row_stride_1)), "r"((n_valid > r0_1 + 16) ? 16 : 0));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(dst0_1 + 3072), "l"(v + (src_row_1 + 24 * row_stride_1)), "r"((n_valid > r0_1 + 24) ? 16 : 0));
+            :: "r"(dst0_1 + 3072), "l"(v + (src_row_1 + 24ll * row_stride_1)), "r"((n_valid > r0_1 + 24) ? 16 : 0));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(dst0_1 + 4096), "l"(v + (src_row_1 + 32 * row_stride_1)), "r"((n_valid > r0_1 + 32) ? 16 : 0));
+            :: "r"(dst0_1 + 4096), "l"(v + (src_row_1 + 32ll * row_stride_1)), "r"((n_valid > r0_1 + 32) ? 16 : 0));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(dst0_1 + 5120), "l"(v + (src_row_1 + 40 * row_stride_1)), "r"((n_valid > r0_1 + 40) ? 16 : 0));
+            :: "r"(dst0_1 + 5120), "l"(v + (src_row_1 + 40ll * row_stride_1)), "r"((n_valid > r0_1 + 40) ? 16 : 0));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(dst0_1 + 6144), "l"(v + (src_row_1 + 48 * row_stride_1)), "r"((n_valid > r0_1 + 48) ? 16 : 0));
+            :: "r"(dst0_1 + 6144), "l"(v + (src_row_1 + 48ll * row_stride_1)), "r"((n_valid > r0_1 + 48) ? 16 : 0));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(dst0_1 + 7168), "l"(v + (src_row_1 + 56 * row_stride_1)), "r"((n_valid > r0_1 + 56) ? 16 : 0));
+            :: "r"(dst0_1 + 7168), "l"(v + (src_row_1 + 56ll * row_stride_1)), "r"((n_valid > r0_1 + 56) ? 16 : 0));
         asm volatile("cp.async.commit_group;");
     }
     if (warp == 1) {
@@ -3515,10 +3515,10 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
         : "r"(slot + (unsigned int)(row_o_0 * 128 + ((ld_ch ^ row_o_0 & 7) << 4))));
     int orow_0 = row0 + row_o_0;
     if (orow_0 < n_valid) {
-        long long out_i_0 = ((long long)(tok0 + orow_0) * (long long)num_v_heads + (long long)hv) * 128 + 0 + (long long)(ld_ch * 8);
+        long long out_i_0 = ((long long)(tok0 + orow_0) * (long long)num_v_heads + (long long)hv) * 128ll + 0ll + (long long)(ld_ch * 8);
         {
             int4 _iv4 = make_int4(words_o[0 + 0], words_o[0 + 1], words_o[0 + 2], words_o[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(w_out) + out_i_0 / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(w_out) + out_i_0 / 2ll) = _iv4;
         }
     }
     int row_o_1 = ld_row + 4;
@@ -3527,10 +3527,10 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
         : "r"(slot + (unsigned int)(row_o_1 * 128 + ((ld_ch ^ row_o_1 & 7) << 4))));
     int orow_1 = row0 + row_o_1;
     if (orow_1 < n_valid) {
-        long long out_i_1 = ((long long)(tok0 + orow_1) * (long long)num_v_heads + (long long)hv) * 128 + 0 + (long long)(ld_ch * 8);
+        long long out_i_1 = ((long long)(tok0 + orow_1) * (long long)num_v_heads + (long long)hv) * 128ll + 0ll + (long long)(ld_ch * 8);
         {
             int4 _iv4 = make_int4(words_o[0 + 0], words_o[0 + 1], words_o[0 + 2], words_o[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(w_out) + out_i_1 / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(w_out) + out_i_1 / 2ll) = _iv4;
         }
     }
     int row_o_2 = ld_row + 8;
@@ -3539,10 +3539,10 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
         : "r"(slot + (unsigned int)(row_o_2 * 128 + ((ld_ch ^ row_o_2 & 7) << 4))));
     int orow_2 = row0 + row_o_2;
     if (orow_2 < n_valid) {
-        long long out_i_2 = ((long long)(tok0 + orow_2) * (long long)num_v_heads + (long long)hv) * 128 + 0 + (long long)(ld_ch * 8);
+        long long out_i_2 = ((long long)(tok0 + orow_2) * (long long)num_v_heads + (long long)hv) * 128ll + 0ll + (long long)(ld_ch * 8);
         {
             int4 _iv4 = make_int4(words_o[0 + 0], words_o[0 + 1], words_o[0 + 2], words_o[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(w_out) + out_i_2 / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(w_out) + out_i_2 / 2ll) = _iv4;
         }
     }
     int row_o_3 = ld_row + 12;
@@ -3551,10 +3551,10 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
         : "r"(slot + (unsigned int)(row_o_3 * 128 + ((ld_ch ^ row_o_3 & 7) << 4))));
     int orow_3 = row0 + row_o_3;
     if (orow_3 < n_valid) {
-        long long out_i_3 = ((long long)(tok0 + orow_3) * (long long)num_v_heads + (long long)hv) * 128 + 0 + (long long)(ld_ch * 8);
+        long long out_i_3 = ((long long)(tok0 + orow_3) * (long long)num_v_heads + (long long)hv) * 128ll + 0ll + (long long)(ld_ch * 8);
         {
             int4 _iv4 = make_int4(words_o[0 + 0], words_o[0 + 1], words_o[0 + 2], words_o[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(w_out) + out_i_3 / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(w_out) + out_i_3 / 2ll) = _iv4;
         }
     }
     __syncwarp();
@@ -3607,10 +3607,10 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
         : "r"(slot + (unsigned int)(row_o_4 * 128 + ((ld_ch ^ row_o_4 & 7) << 4))));
     int orow_4 = row0 + row_o_4;
     if (orow_4 < n_valid) {
-        long long out_i_4 = ((long long)(tok0 + orow_4) * (long long)num_v_heads + (long long)hv) * 128 + 64 + (long long)(ld_ch * 8);
+        long long out_i_4 = ((long long)(tok0 + orow_4) * (long long)num_v_heads + (long long)hv) * 128ll + 64ll + (long long)(ld_ch * 8);
         {
             int4 _iv4 = make_int4(words_o[0 + 0], words_o[0 + 1], words_o[0 + 2], words_o[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(w_out) + out_i_4 / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(w_out) + out_i_4 / 2ll) = _iv4;
         }
     }
     int row_o_5 = ld_row + 4;
@@ -3619,10 +3619,10 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
         : "r"(slot + (unsigned int)(row_o_5 * 128 + ((ld_ch ^ row_o_5 & 7) << 4))));
     int orow_5 = row0 + row_o_5;
     if (orow_5 < n_valid) {
-        long long out_i_5 = ((long long)(tok0 + orow_5) * (long long)num_v_heads + (long long)hv) * 128 + 64 + (long long)(ld_ch * 8);
+        long long out_i_5 = ((long long)(tok0 + orow_5) * (long long)num_v_heads + (long long)hv) * 128ll + 64ll + (long long)(ld_ch * 8);
         {
             int4 _iv4 = make_int4(words_o[0 + 0], words_o[0 + 1], words_o[0 + 2], words_o[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(w_out) + out_i_5 / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(w_out) + out_i_5 / 2ll) = _iv4;
         }
     }
     int row_o_6 = ld_row + 8;
@@ -3631,10 +3631,10 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
         : "r"(slot + (unsigned int)(row_o_6 * 128 + ((ld_ch ^ row_o_6 & 7) << 4))));
     int orow_6 = row0 + row_o_6;
     if (orow_6 < n_valid) {
-        long long out_i_6 = ((long long)(tok0 + orow_6) * (long long)num_v_heads + (long long)hv) * 128 + 64 + (long long)(ld_ch * 8);
+        long long out_i_6 = ((long long)(tok0 + orow_6) * (long long)num_v_heads + (long long)hv) * 128ll + 64ll + (long long)(ld_ch * 8);
         {
             int4 _iv4 = make_int4(words_o[0 + 0], words_o[0 + 1], words_o[0 + 2], words_o[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(w_out) + out_i_6 / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(w_out) + out_i_6 / 2ll) = _iv4;
         }
     }
     int row_o_7 = ld_row + 12;
@@ -3643,10 +3643,10 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
         : "r"(slot + (unsigned int)(row_o_7 * 128 + ((ld_ch ^ row_o_7 & 7) << 4))));
     int orow_7 = row0 + row_o_7;
     if (orow_7 < n_valid) {
-        long long out_i_7 = ((long long)(tok0 + orow_7) * (long long)num_v_heads + (long long)hv) * 128 + 64 + (long long)(ld_ch * 8);
+        long long out_i_7 = ((long long)(tok0 + orow_7) * (long long)num_v_heads + (long long)hv) * 128ll + 64ll + (long long)(ld_ch * 8);
         {
             int4 _iv4 = make_int4(words_o[0 + 0], words_o[0 + 1], words_o[0 + 2], words_o[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(w_out) + out_i_7 / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(w_out) + out_i_7 / 2ll) = _iv4;
         }
     }
     __syncwarp();
@@ -3910,10 +3910,10 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
         : "r"(slot + (unsigned int)(row_o_8 * 128 + ((ld_ch ^ row_o_8 & 7) << 4))));
     int orow_8 = row0 + row_o_8;
     if (orow_8 < n_valid) {
-        long long out_i_8 = ((long long)(tok0 + orow_8) * (long long)num_v_heads + (long long)hv) * 128 + 0 + (long long)(ld_ch * 8);
+        long long out_i_8 = ((long long)(tok0 + orow_8) * (long long)num_v_heads + (long long)hv) * 128ll + 0ll + (long long)(ld_ch * 8);
         {
             int4 _iv4 = make_int4(words_o[0 + 0], words_o[0 + 1], words_o[0 + 2], words_o[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(u_out) + out_i_8 / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(u_out) + out_i_8 / 2ll) = _iv4;
         }
     }
     int row_o_9 = ld_row + 4;
@@ -3922,10 +3922,10 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
         : "r"(slot + (unsigned int)(row_o_9 * 128 + ((ld_ch ^ row_o_9 & 7) << 4))));
     int orow_9 = row0 + row_o_9;
     if (orow_9 < n_valid) {
-        long long out_i_9 = ((long long)(tok0 + orow_9) * (long long)num_v_heads + (long long)hv) * 128 + 0 + (long long)(ld_ch * 8);
+        long long out_i_9 = ((long long)(tok0 + orow_9) * (long long)num_v_heads + (long long)hv) * 128ll + 0ll + (long long)(ld_ch * 8);
         {
             int4 _iv4 = make_int4(words_o[0 + 0], words_o[0 + 1], words_o[0 + 2], words_o[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(u_out) + out_i_9 / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(u_out) + out_i_9 / 2ll) = _iv4;
         }
     }
     int row_o_10 = ld_row + 8;
@@ -3934,10 +3934,10 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
         : "r"(slot + (unsigned int)(row_o_10 * 128 + ((ld_ch ^ row_o_10 & 7) << 4))));
     int orow_10 = row0 + row_o_10;
     if (orow_10 < n_valid) {
-        long long out_i_10 = ((long long)(tok0 + orow_10) * (long long)num_v_heads + (long long)hv) * 128 + 0 + (long long)(ld_ch * 8);
+        long long out_i_10 = ((long long)(tok0 + orow_10) * (long long)num_v_heads + (long long)hv) * 128ll + 0ll + (long long)(ld_ch * 8);
         {
             int4 _iv4 = make_int4(words_o[0 + 0], words_o[0 + 1], words_o[0 + 2], words_o[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(u_out) + out_i_10 / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(u_out) + out_i_10 / 2ll) = _iv4;
         }
     }
     int row_o_11 = ld_row + 12;
@@ -3946,10 +3946,10 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
         : "r"(slot + (unsigned int)(row_o_11 * 128 + ((ld_ch ^ row_o_11 & 7) << 4))));
     int orow_11 = row0 + row_o_11;
     if (orow_11 < n_valid) {
-        long long out_i_11 = ((long long)(tok0 + orow_11) * (long long)num_v_heads + (long long)hv) * 128 + 0 + (long long)(ld_ch * 8);
+        long long out_i_11 = ((long long)(tok0 + orow_11) * (long long)num_v_heads + (long long)hv) * 128ll + 0ll + (long long)(ld_ch * 8);
         {
             int4 _iv4 = make_int4(words_o[0 + 0], words_o[0 + 1], words_o[0 + 2], words_o[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(u_out) + out_i_11 / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(u_out) + out_i_11 / 2ll) = _iv4;
         }
     }
     __syncwarp();
@@ -4002,10 +4002,10 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
         : "r"(slot + (unsigned int)(row_o_12 * 128 + ((ld_ch ^ row_o_12 & 7) << 4))));
     int orow_12 = row0 + row_o_12;
     if (orow_12 < n_valid) {
-        long long out_i_12 = ((long long)(tok0 + orow_12) * (long long)num_v_heads + (long long)hv) * 128 + 64 + (long long)(ld_ch * 8);
+        long long out_i_12 = ((long long)(tok0 + orow_12) * (long long)num_v_heads + (long long)hv) * 128ll + 64ll + (long long)(ld_ch * 8);
         {
             int4 _iv4 = make_int4(words_o[0 + 0], words_o[0 + 1], words_o[0 + 2], words_o[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(u_out) + out_i_12 / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(u_out) + out_i_12 / 2ll) = _iv4;
         }
     }
     int row_o_13 = ld_row + 4;
@@ -4014,10 +4014,10 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
         : "r"(slot + (unsigned int)(row_o_13 * 128 + ((ld_ch ^ row_o_13 & 7) << 4))));
     int orow_13 = row0 + row_o_13;
     if (orow_13 < n_valid) {
-        long long out_i_13 = ((long long)(tok0 + orow_13) * (long long)num_v_heads + (long long)hv) * 128 + 64 + (long long)(ld_ch * 8);
+        long long out_i_13 = ((long long)(tok0 + orow_13) * (long long)num_v_heads + (long long)hv) * 128ll + 64ll + (long long)(ld_ch * 8);
         {
             int4 _iv4 = make_int4(words_o[0 + 0], words_o[0 + 1], words_o[0 + 2], words_o[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(u_out) + out_i_13 / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(u_out) + out_i_13 / 2ll) = _iv4;
         }
     }
     int row_o_14 = ld_row + 8;
@@ -4026,10 +4026,10 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
         : "r"(slot + (unsigned int)(row_o_14 * 128 + ((ld_ch ^ row_o_14 & 7) << 4))));
     int orow_14 = row0 + row_o_14;
     if (orow_14 < n_valid) {
-        long long out_i_14 = ((long long)(tok0 + orow_14) * (long long)num_v_heads + (long long)hv) * 128 + 64 + (long long)(ld_ch * 8);
+        long long out_i_14 = ((long long)(tok0 + orow_14) * (long long)num_v_heads + (long long)hv) * 128ll + 64ll + (long long)(ld_ch * 8);
         {
             int4 _iv4 = make_int4(words_o[0 + 0], words_o[0 + 1], words_o[0 + 2], words_o[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(u_out) + out_i_14 / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(u_out) + out_i_14 / 2ll) = _iv4;
         }
     }
     int row_o_15 = ld_row + 12;
@@ -4038,10 +4038,10 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
         : "r"(slot + (unsigned int)(row_o_15 * 128 + ((ld_ch ^ row_o_15 & 7) << 4))));
     int orow_15 = row0 + row_o_15;
     if (orow_15 < n_valid) {
-        long long out_i_15 = ((long long)(tok0 + orow_15) * (long long)num_v_heads + (long long)hv) * 128 + 64 + (long long)(ld_ch * 8);
+        long long out_i_15 = ((long long)(tok0 + orow_15) * (long long)num_v_heads + (long long)hv) * 128ll + 64ll + (long long)(ld_ch * 8);
         {
             int4 _iv4 = make_int4(words_o[0 + 0], words_o[0 + 1], words_o[0 + 2], words_o[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(u_out) + out_i_15 / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(u_out) + out_i_15 / 2ll) = _iv4;
         }
     }
     __syncwarp();

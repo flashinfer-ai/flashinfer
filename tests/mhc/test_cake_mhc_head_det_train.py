@@ -18,7 +18,10 @@ mean ``Y = X.mean(dim=1)`` of BF16 ``X`` ``[T, 4, H]`` and its gradient, bit
 for bit against torch (signed zeros and NaN encodings included) at hidden
 4096, 5120 and 7168, through the forward / backward entry points, the
 accumulating backward, the autograd node, activation checkpointing and CUDA
-graph capture.
+graph capture; the backward against its formula ``BF16(dY * 0.25)`` on each
+stream (and ``BF16(dX + BF16(dY * 0.25))`` when accumulating); every output
+repeating bit for bit run to run; and the checkpoint replay giving the bits of
+the run without the checkpoint.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ from flashinfer.utils import get_compute_capability
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 HIDDEN = (4096, 5120, 7168)
-TOKENS = (1, 2, 3, 7, 65, 129, 257, 1000, 2049, 4096)
+TOKENS = (1, 2, 3, 7, 65, 129, 257, 1000, 2049, 4096, 7169)
 BF16 = torch.bfloat16
 SUBNORMAL = 2.0**-133
 SPECIAL = (
@@ -58,6 +61,9 @@ SPECIAL = (
     3.0,
 )
 SEED = 7046
+# Run to run: the launches of each entry point on identical inputs, and the token counts (with two long calls).
+REPEATS = 5
+REPEAT_TOKENS = (1, 257, 14928, 16263)
 
 
 @pytest.fixture(autouse=True)
@@ -117,10 +123,16 @@ def _bits(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.contiguous().view(torch.int16)
 
 
-def _assert_bitwise(got: torch.Tensor, want: torch.Tensor) -> None:
+def _assert_bitwise(got: torch.Tensor, want: torch.Tensor, what: str = "torch") -> None:
     assert got.shape == want.shape and got.dtype == want.dtype == BF16
     mismatch = int((_bits(got) != _bits(want)).sum())
-    assert mismatch == 0, f"{mismatch} of {got.numel()} elements differ from torch"
+    assert mismatch == 0, f"{mismatch} of {got.numel()} elements differ from {what}"
+
+
+def _complement(tensor: torch.Tensor) -> torch.Tensor:
+    """A new BF16 tensor whose every element has the inverted bits of ``tensor``'s: an output buffer in which an
+    element the kernel does not write differs from ``tensor``."""
+    return (~_bits(tensor)).view(BF16).view(tensor.shape)
 
 
 def _torch_grad(X: torch.Tensor, dY: torch.Tensor) -> torch.Tensor:
@@ -307,3 +319,94 @@ def test_cuda_graph_capture() -> None:
         _assert_bitwise(Y, X.mean(dim=1))
         _assert_bitwise(dX, _torch_grad(X, dY))
         _assert_bitwise(dXa, _torch_accumulated(X, dY, before))
+
+
+@pytest.mark.parametrize("hidden", HIDDEN)
+@pytest.mark.parametrize("T", (1, 7, 129, 1000, 2048, 2049, 14928, 16263))
+@pytest.mark.parametrize("kind", ["randn", "spread", "special"])
+def test_backward_matches_the_quarter_formula(hidden: int, T: int, kind: str) -> None:
+    """The backward against its formula, independent of autograd: every stream of ``dX`` is ``q = (dY.float() *
+    0.25).bfloat16()``, and the accumulating backward writes ``(dX0.float() + q.float()).bfloat16()``."""
+    if not _supported(hidden):
+        pytest.skip(f"hidden {hidden} is not exported on this device")
+    g = torch.Generator(device=_device()).manual_seed(SEED + 4 + T * 31 + hidden)
+    dY = _draw((T, hidden), kind, g)
+    dX0 = _draw((T, 4, hidden), kind, g)
+    q = (dY.float() * 0.25).bfloat16().unsqueeze(1).expand(T, 4, hidden)
+
+    dX = facade.cake_mhc_head_det_train_backward(dY)
+    _assert_bitwise(dX, q, "(dY * 0.25) on each stream")
+    acc = dX0.clone()
+    facade.cake_mhc_head_det_train_backward(dY, dX=acc, accumulate=True)
+    _assert_bitwise(acc, (dX0.float() + q.float()).bfloat16(), "dX0 + (dY * 0.25)")
+
+
+@pytest.mark.parametrize("hidden", HIDDEN)
+@pytest.mark.parametrize("T", REPEAT_TOKENS)
+def test_run_to_run_bitwise(hidden: int, T: int) -> None:
+    """The forward, the backward and the accumulating backward each run ``REPEATS`` times on identical inputs, and
+    every repeat equals the first run bit for bit.  A repeat writes into a buffer holding the first run's inverted
+    bits, so an element the forward or the writing backward leaves unwritten fails too; the accumulating backward
+    reads its buffer, so each repeat adds into a fresh copy of the same ``dX0``."""
+    if not _supported(hidden):
+        pytest.skip(f"hidden {hidden} is not exported on this device")
+    g = torch.Generator(device=_device()).manual_seed(SEED + 5 + T * 31 + hidden)
+    X = _draw((T, 4, hidden), "special", g)
+    dY = _draw((T, hidden), "special", g)
+    dX0 = _draw((T, 4, hidden), "special", g)
+
+    Y = facade.cake_mhc_head_det_train_forward(X)
+    dX = facade.cake_mhc_head_det_train_backward(dY)
+    acc = dX0.clone()
+    facade.cake_mhc_head_det_train_backward(dY, dX=acc, accumulate=True)
+    for repeat in range(1, REPEATS):
+        out = _complement(Y)
+        assert facade.cake_mhc_head_det_train_forward(X, out=out) is out
+        _assert_bitwise(out, Y, f"the first forward (repeat {repeat})")
+        out = _complement(dX)
+        assert facade.cake_mhc_head_det_train_backward(dY, dX=out) is out
+        _assert_bitwise(out, dX, f"the first backward (repeat {repeat})")
+        out = dX0.clone()
+        facade.cake_mhc_head_det_train_backward(dY, dX=out, accumulate=True)
+        _assert_bitwise(out, acc, f"the first accumulating backward (repeat {repeat})")
+
+
+@pytest.mark.parametrize("hidden", HIDDEN)
+@pytest.mark.parametrize("T", (257, 16263))
+def test_checkpoint_replay_bitwise(hidden: int, T: int) -> None:
+    """Under ``torch.utils.checkpoint(..., use_reentrant=False)`` around a small graph (``head(X * 2) * W``), the
+    checkpoint's forward and its recompute in the backward, the output and the gradients of ``X`` and ``W`` equal
+    the same graph's run without the checkpoint bit for bit (``W``'s gradient reads the recomputed head output)."""
+    if not _supported(hidden):
+        pytest.skip(f"hidden {hidden} is not exported on this device")
+    g = torch.Generator(device=_device()).manual_seed(SEED + 6 + T * 31 + hidden)
+    X = _draw((T, 4, hidden), "spread", g)
+    W = _draw((hidden,), "randn", g)
+    dOut = _draw((T, hidden), "randn", g)
+    heads: list[torch.Tensor] = []
+
+    def block(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        y = facade.cake_mhc_head_det(x * 2)
+        heads.append(y.detach().clone())
+        return y * w
+
+    def run(checkpointed: bool):
+        heads.clear()
+        x = X.detach().requires_grad_(True)
+        w = W.detach().requires_grad_(True)
+        if checkpointed:
+            out = torch.utils.checkpoint.checkpoint(block, x, w, use_reentrant=False)
+        else:
+            out = block(x, w)
+        out.backward(dOut)
+        return out.detach(), x.grad, w.grad, list(heads)
+
+    plain = run(checkpointed=False)
+    replay = run(checkpointed=True)
+    assert len(plain[3]) == 1 and len(replay[3]) == 2, (len(plain[3]), len(replay[3]))
+    for y in replay[3]:
+        _assert_bitwise(y, plain[3][0], "the head output without the checkpoint")
+    for name, got, want in zip(
+        ("output", "dX", "dW"), replay[:3], plain[:3], strict=True
+    ):
+        _assert_bitwise(got, want, f"the {name} without the checkpoint")

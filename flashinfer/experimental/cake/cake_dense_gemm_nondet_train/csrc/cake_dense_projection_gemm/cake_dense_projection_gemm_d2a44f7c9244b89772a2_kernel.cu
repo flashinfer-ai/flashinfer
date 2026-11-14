@@ -217,7 +217,7 @@ kernel_cake_dense_projection_gemm_d2a44f7c9244b89772a2(const __grid_constant__ C
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     float* a32 = reinterpret_cast<float*>(smem_raw + 1024);
     const int a32_addr = smem + 1024;
     __nv_bfloat16* a1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -236,10 +236,11 @@ kernel_cake_dense_projection_gemm_d2a44f7c9244b89772a2(const __grid_constant__ C
     const int box_addr = smem + 214016;
     unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 230400);
     const int work_response_addr = smem + 230400;
+
+    // Kernel setup ops
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
-    // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 32 barriers)
-    // Mbarriers at smem_raw[0..256)
+    // Mbarrier init (32 barriers at smem_raw[0..256))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -310,11 +311,9 @@ kernel_cake_dense_projection_gemm_d2a44f7c9244b89772a2(const __grid_constant__ C
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_chunk_acc = taddr;
-    const int tmem_small_acc = taddr + 256;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_chunk_acc = taddr;
+    const unsigned int tmem_small_acc = taddr + 256;
 
     // ---- Role: load ----
     if (warp == 0) {

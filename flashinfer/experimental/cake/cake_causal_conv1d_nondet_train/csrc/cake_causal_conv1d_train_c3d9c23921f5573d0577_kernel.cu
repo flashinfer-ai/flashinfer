@@ -242,7 +242,7 @@ kernel_cake_causal_conv1d_train_c3d9c23921f5573d0577(__nv_bfloat16* __restrict__
     int _max_0 = ((1) > (g_ct / 16) ? (1) : (g_ct / 16));
     int ks = ((4) < (_max_0) ? (4) : (_max_0));
     int soff = rank % ks * C * 4;
-    long long cstride = C64 * 4;
+    long long cstride = C64 * 4ll;
     int sub = tid / ct_vec;
     int v = tid - sub * ct_vec;
     int c0 = (ct * ct_vec + v) * 8;
@@ -321,7 +321,7 @@ kernel_cake_causal_conv1d_train_c3d9c23921f5573d0577(__nv_bfloat16* __restrict__
                 for (int j = 0; j < 8; j++) {
                     {
                         uint2 _vld_3;
-                        _vld_3 = *reinterpret_cast<const uint2*>(reinterpret_cast<__nv_bfloat16*>(w) + (c64 + (long long)j) * 4);
+                        _vld_3 = *reinterpret_cast<const uint2*>(reinterpret_cast<__nv_bfloat16*>(w) + (c64 + (long long)j) * 4ll);
                         uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -334,7 +334,7 @@ kernel_cake_causal_conv1d_train_c3d9c23921f5573d0577(__nv_bfloat16* __restrict__
                 #pragma unroll
                 for (int j_1 = 0; j_1 < 8; j_1++) {
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(w) + (c64 + (long long)j_1) * 4);
+                        float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(w) + (c64 + (long long)j_1) * 4ll);
                         wr[j_1 * 4 + 0] = _v4.x;
                         wr[j_1 * 4 + 1] = _v4.y;
                         wr[j_1 * 4 + 2] = _v4.z;
@@ -895,7 +895,7 @@ kernel_cake_causal_conv1d_train_c3d9c23921f5573d0577(__nv_bfloat16* __restrict__
                 for (int j_3 = 0; j_3 < 8; j_3++) {
                     {
                         uint2 _vld_50;
-                        _vld_50 = *reinterpret_cast<const uint2*>(reinterpret_cast<__nv_bfloat16*>(w) + (c64_1 + (long long)j_3) * 4);
+                        _vld_50 = *reinterpret_cast<const uint2*>(reinterpret_cast<__nv_bfloat16*>(w) + (c64_1 + (long long)j_3) * 4ll);
                         uint32_t* _vpairs_50 = reinterpret_cast<uint32_t*>(&_vld_50);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -908,7 +908,7 @@ kernel_cake_causal_conv1d_train_c3d9c23921f5573d0577(__nv_bfloat16* __restrict__
                 #pragma unroll
                 for (int j_4 = 0; j_4 < 8; j_4++) {
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(w) + (c64_1 + (long long)j_4) * 4);
+                        float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(w) + (c64_1 + (long long)j_4) * 4ll);
                         wr_1[j_4 * 4 + 0] = _v4.x;
                         wr_1[j_4 * 4 + 1] = _v4.y;
                         wr_1[j_4 * 4 + 2] = _v4.z;
@@ -1504,9 +1504,9 @@ kernel_cake_causal_conv1d_train_c3d9c23921f5573d0577(__nv_bfloat16* __restrict__
                         for (int e_1 = 0; e_1 < 4; e_1++) {
                             {
 #if __CUDA_ARCH__ == 1030
-                                d[(j_7 * 4 + s_5) * 4 + e_1] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_5 + cl64 * 4 + (long long)e_1));
+                                d[(j_7 * 4 + s_5) * 4 + e_1] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_5 + cl64 * 4ll + (long long)e_1));
 #else
-                                d[(j_6 * 4 + s_5) * 4 + e_1] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_5 + cl64 * 4 + (long long)e_1));
+                                d[(j_6 * 4 + s_5) * 4 + e_1] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_5 + cl64 * 4ll + (long long)e_1));
 #endif
                             }
                         }
@@ -1523,11 +1523,11 @@ kernel_cake_causal_conv1d_train_c3d9c23921f5573d0577(__nv_bfloat16* __restrict__
 #endif
                 if (c < lim) {
                     long long c64_2 = (long long)c;
-                    long long bi = (long long)C * 4 + c64_2;
+                    long long bi = (long long)C * 4ll + c64_2;
                     #pragma unroll
                     for (int s_6 = 0; s_6 < 4; s_6++) {
-                        reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_6 + c64_2 * 4))[0] = reinterpret_cast<int4*>(zd)[0];
-                        reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_6 + c64_2 * 4 + 2))[0] = reinterpret_cast<int4*>(zd)[0];
+                        reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_6 + c64_2 * 4ll))[0] = reinterpret_cast<int4*>(zd)[0];
+                        reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_6 + c64_2 * 4ll + 2ll))[0] = reinterpret_cast<int4*>(zd)[0];
                     }
                     #pragma unroll
                     for (int s_7 = 1; s_7 < 4; s_7++) {
@@ -1552,9 +1552,9 @@ kernel_cake_causal_conv1d_train_c3d9c23921f5573d0577(__nv_bfloat16* __restrict__
                         #pragma unroll
                         for (int e_4 = 0; e_4 < 4; e_4++) {
 #if __CUDA_ARCH__ == 1030
-                            *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4 + (long long)e_4)) = (__nv_bfloat16)a[4 * j_8 + e_4];
+                            *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4ll + (long long)e_4)) = (__nv_bfloat16)a[4 * j_8 + e_4];
 #else
-                            *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4 + (long long)e_4)) = (__nv_bfloat16)a[4 * j_7 + e_4];
+                            *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4ll + (long long)e_4)) = (__nv_bfloat16)a[4 * j_7 + e_4];
 #endif
                         }
                     } else {
@@ -1564,7 +1564,7 @@ kernel_cake_causal_conv1d_train_c3d9c23921f5573d0577(__nv_bfloat16* __restrict__
 #else
                             float4 _v4 = make_float4(a[4 * j_7 + 0], a[4 * j_7 + 1], a[4 * j_7 + 2], a[4 * j_7 + 3]);
 #endif
-                            *reinterpret_cast<float4*>(reinterpret_cast<float*>(dw) + c64_2 * 4) = _v4;
+                            *reinterpret_cast<float4*>(reinterpret_cast<float*>(dw) + c64_2 * 4ll) = _v4;
                         }
                     }
                 }

@@ -102,9 +102,9 @@ kernel_cake_mhc_train_fwd_finish__w2__h7168(__nv_bfloat16* __restrict__ x, __nv_
             int part = sub - row * 7;
             long long row64 = (long long)row;
             long long colb = (long long)(part * 1024) + col0;
-            long long xbase = row64 * 28672 + colb;
-            long long bbase = row64 * 7168 + colb;
-            long long sbase = row64 * 64 + 28;
+            long long xbase = row64 * 28672ll + colb;
+            long long bbase = row64 * 7168ll + colb;
+            long long sbase = row64 * 64ll + 28ll;
             float coef[24];
             #pragma unroll
             for (int q = 0; q < 6; q++) {

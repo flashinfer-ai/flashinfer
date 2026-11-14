@@ -21,8 +21,9 @@ before each continuing fragment, received from the ranks that hold them by one
 derivative back to the predecessor fragments, which fold it into their last
 rows' ``dx`` before the one BF16 rounding.  ``cake_causal_conv1d_det_kcp(x_local,
 weight, ctx)`` is the autograd entry; the stable, ``@flashinfer_api``-decorated
-facade is :mod:`flashinfer.cake_causal_conv1d_det_train`.  This module imports
-only ``os``, torch, torch.distributed, tvm_ffi and its own package.
+facade is :mod:`flashinfer.cake_causal_conv1d_det_train_kcp`.  This module imports
+only torch, torch.distributed, tvm_ffi and its own package, and reads no environment variable: every switch is a
+keyword argument of a call.
 
 Registry contract (``kcp_jit``, the KCP records beside the zero-history
 registry ``cake_jit``, whose tables stay untouched): kinds ``kcp_fwd`` (one
@@ -31,7 +32,9 @@ record per arch: co-resident grid, 4 CTAs per SM, 128 threads x 8 channels),
 record selected by ``channels_at_least`` = the zero-history rule;
 ``workspace_rule`` ``partial_rows`` with 4 taps) and ``kcp_bwd_head`` (one record; its grid is
 ``max(1, n_frag x ceil(C / (threads x vec)))`` computed here and launched
-through the record's ``arg_plan`` / ``logical`` / ``ffi_entry`` and ``load``);
+through the record's ``arg_plan`` / ``logical`` / ``ffi_entry`` and ``load``), ``kcp_bwd_halo`` (one record: the
+overlapped backward's tail-row program, launched on the head program's grid) and ``kcp_fwd_halo`` (one record: the
+two-launch forward's history-row program, launched on the head program's grid);
 logical tensor names are ``cake_jit.LOGICAL_TENSORS`` plus ``hist``,
 ``hist_row_off``, ``dpre_tail``, ``tail_row_off``, ``dpre_head``,
 ``head_row_off`` (``x_map`` / ``dy_map`` map to ``x`` / ``dy``); the scalars are
@@ -73,34 +76,83 @@ context and the shapes of the call, never a tensor's contents; it holds at most
 device index.  The operand checks, the gather, the exchange, its wait and the
 kernel launches run as before with the same arguments on the same stream, so
 no bit changes; a replayed graph (``graph="replay"``) contains no host work.
-``_set_test_knobs({"host_trim": 0})`` (with ``CAKE_KCP_TEST_KNOBS=1``) selects
-the previous host path for the A/B record.
+The private test hook ``_set_test_knobs({"host_trim": 0})`` selects the previous
+host path for the A/B record.
 
 Two launch forms of the main backward program (FlashInfer issue #8365), one per
 call through the ``cooperative`` argument of the backward and autograd entries
-(``None`` = :data:`COOPERATIVE_DEFAULT`).  ``cooperative=True`` runs the
-``kcp_bwd`` record: one cooperative launch whose grid barrier precedes the
-fixed-order ``dweight`` reduction; a cooperative grid starts only when all its
-CTAs fit at once, so it waits for every kernel of another stream that occupies
-an SM.  ``cooperative=False`` runs the ``kcp_bwd_split`` record: the same token
-loop as an ordinary launch ``ctas_per_sm x (SM count - reserve_sms)`` CTAs wide
+(``None`` = :data:`COOPERATIVE_DEFAULT`, ``False``: the ordinary launch).
+``cooperative=False`` runs the ``kcp_bwd_split`` record: the token loop as an
+ordinary launch ``ctas_per_sm x (SM count - reserve_sms)`` CTAs wide
 (:func:`_launch_grid`), writing per-CTA partial rows, then the record's ``reduce``
 program (the zero-history package's fixed-order reduction, programmatically
 dependent on the main program) on the same stream.  It starts beside one
 small-carveout kernel of another stream per reserved SM; more such kernels
-delay some CTAs, never the whole launch.  ``y`` and ``dx`` are bitwise equal
-in both forms.  ``dweight`` is reproducible in each form (a pure function of
-the device type and the call's shapes) and within the same FP64-oracle bound,
-but the two forms sum different partial rows, so their ``dweight`` bits differ.
-The form is fixed per call: every rank of a group may choose it on its own
-(it changes no collective).
+delay some CTAs, never the whole launch.  ``cooperative=True`` runs the
+``kcp_bwd`` record: one cooperative launch whose grid barrier precedes the
+fixed-order ``dweight`` reduction; a cooperative grid starts only when all its
+CTAs fit at once, so it waits for every kernel of another stream that occupies
+an SM.  ``y`` and ``dx`` are bitwise equal in both forms.  ``dweight`` is
+reproducible in each form (a pure function of the device type and the call's
+shapes) and within the same FP64-oracle bound, but the two forms sum different
+partial rows, so their ``dweight`` bits differ.  The form is fixed per call and
+changes no collective; every rank of a group passes the same ``cooperative``
+value (one launch form per layer of the group, so that the ranks' ``dweight``
+partials come from one reduction order).
+
+Overlapped backward (``cooperative=False`` with an exchange in flight, i.e. at more than one rank): the
+``kcp_bwd_split`` program does not wait for the backward halo exchange.  The host issues the exchange of the head
+rows, launches the ``kcp_bwd_split`` program and its reduce program with every ``tail_row_off`` entry ``-1`` (no
+received row is read; a fragment's last rows are written as at a document end), then waits for the exchange and
+launches the ``kcp_bwd_halo`` program, which writes ``dx`` of the last ``min(3, len)`` rows of every fragment with a
+tail row again: it recomputes their ``dpre`` from ``x``, the history rows and ``dy`` with the main program's
+instructions and folds the received rows with the main program's FMAs in its order, before the one BF16 rounding.  So
+``dx`` is bitwise the waiting launch's, and ``dweight`` keeps its bits: the received rows enter ``dx`` only, and the
+partial rows and their reduction are the same.  The exchange, its wait and the collectives are unchanged; the call
+launches one more program when the rank receives tail rows.  On sm_103a and sm_107a the multi entry overlaps its
+first tensor this way and launches the other tensors' programs after the wait, so it too adds one program, not one
+per tensor; on sm_100a it waits first (``MULTI_BWD_OVERLAP_ARCHS``).
+``cooperative=True`` waits before its launch as before
+(a cooperative grid waits for the communication kernel anyway).  The private test knob ``bwd_overlap`` (``1``
+shipped, ``0`` = wait before the main program) selects the previous order for the A/B record.
+
+Two-launch forward: the forward can run as a main program that reads no received row and the ``kcp_fwd_halo``
+history-row program.  The main program writes every row, a continuing fragment's first rows as at a document start:
+either the zero-history registry's single-rank ``fwd`` route program (``cake_jit.selected_modules(arch, "fwd", C=C,
+S=S)``, the program the single-rank forward runs) on the rank's fragments, each a document of its own (``cu =
+ctx.cu_seqlens_local``, ``num_docs = n_frag``; the record's full co-resident grid and token-chunk counters as in the
+single-rank forward), or, in the overlapped form only, the ``kcp_fwd`` program with every ``hist_row_off`` entry
+``-1``.  The history-row program then writes ``y`` of the first ``min(3, len)`` rows of every fragment with a history
+row again from the received pool, with the ``kcp_fwd`` program's instructions, so ``y`` is bitwise the one-launch
+forward's; it runs only when the rank receives history rows.  With an exchange in flight (more than one rank) the
+overlapped form launches the main program before the exchange's wait and the history-row program after it.  The
+waiting form launches after the wait: the single-rank main program and the history-row program, or, with the
+``kcp_fwd`` program as main, the one-launch forward (the ``kcp_fwd`` program with the context's table, no history-row
+program).  ``FWD_MAIN_ARCHS`` names the architectures whose forward runs the single-rank main program (else the
+``kcp_fwd`` program), ``FWD_OVERLAP_ARCHS`` those whose forward overlaps; ``MULTI_FWD_MAIN_ARCHS`` and
+``MULTI_FWD_OVERLAP_ARCHS`` are the multi entry's, which overlaps its first tensor only (the other tensors take the
+waiting form after the wait).  The sets come from measurements against the one-launch forward (their comment): every
+architecture's single call runs the single-rank main program after the wait, and so does the multi entry on sm_100a
+and sm_103a; on sm_107a the multi entry overlaps.  The exchange, its wait and the collectives are the same in every
+form.  The private test knobs ``fwd_main`` and
+``fwd_overlap`` (``None`` shipped = the architecture sets, ``0`` = off, ``1`` = on) select the forms for the A/B
+record, and ``LAST_CALL["fwd"]`` / ``LAST_CALL["fwd_multi"]`` record the form a call took (:func:`_fwd_record`).
+
+The ``kcp_fwd`` program launches ``ctas_per_sm x (SM count - FWD_RESERVE_SMS)``
+CTAs when they hold every channel tile of ``C``, else the full co-resident grid
+(:func:`_forward_grid`).  Beside one small-carveout kernel of another stream
+that occupies a single SM, every CTA of the shorter grid can then start at
+once; kernels on more SMs still make some CTAs wait for a later wave.  The
+single-rank main program launches its record's full co-resident grid.  ``y``
+does not depend on the grid.
 
 Checkpoint recompute without the halo exchange (FlashInfer issues #7815 /
 #7818): with ``recompute_handle=`` (:class:`CakeCausalConv1dDetKcpRecomputeHandle`, or any object
 with an ``entries`` dict) the original forward exchanges as always and stores
 its history pool ``hist`` (the saved set's own tensor, key ``"conv"``) in the
 handle; torch's recompute of that forward inside the backward binds it and
-launches the same forward kernel on it -- no gather, no collective, no wait --
+launches the same forward programs on it (the two-launch forward in its waiting form) -- no gather, no collective,
+no wait --
 so ``y`` and the saved set ``(x_local, weight, hist)`` are bitwise those of the
 exchanging recompute.  The backward is unchanged (it still exchanges the head
 rows).  The forward exchange is a collective: every rank of ``ctx.group`` passes
@@ -111,14 +163,16 @@ Several convolutions of one layer (FlashInfer issue #7815): ``cake_causal_conv1d
 the convolutions of ``n`` tensors that share the context (a layer's q, k and v) with one halo exchange per direction
 instead of ``n``: the tensors' send rows travel side by side in one ``all_to_all_single`` and are copied out into
 each tensor's own contiguous pool after the wait, and each tensor then runs the single call's kernels with the
-single call's arguments, so outputs and gradients (``dweight`` included) are bitwise one single call per tensor.
+single call's arguments.  In the overlapped backward (sm_103a and sm_107a, ``MULTI_BWD_OVERLAP_ARCHS``) only the
+first tensor takes the overlapped form (its main programs before the wait, its tail-row program after it); the other
+tensors run the waiting form's main programs after the wait, whose ``dx`` and ``dweight`` are bitwise the overlapped
+form's.  So outputs and gradients (``dweight`` included) are bitwise one single call per tensor.
 One recompute handle serves the whole call (its ``"conv"`` entry holds the ``n`` pools).  The multi path always
 uses the trimmed host path's per-context cache (the ``host_trim`` test knob selects the single call's path only).
 """
 
 from __future__ import annotations
 
-import os
 from typing import Any, Optional
 
 import torch
@@ -129,6 +183,7 @@ from . import (
     _cu_seqlens,
     _device_arch,
     _device_index,
+    _forward_work,
     _output,
     _require_tensor,
     _scalars,
@@ -147,10 +202,24 @@ KCP_FWD = "kcp_fwd"
 KCP_BWD = "kcp_bwd"
 KCP_BWD_SPLIT = "kcp_bwd_split"
 KCP_BWD_HEAD = "kcp_bwd_head"
-# The main backward's launch form when a call passes ``cooperative=None``: ``True`` = the cooperative ``kcp_bwd``
-# record, ``False`` = the ``kcp_bwd_split`` record and its reduce program (FlashInfer issue #8365).
-COOPERATIVE_DEFAULT = True
-TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"  # the KCP route's private test-hook gate (the variable the KDA host module reads too)
+KCP_BWD_HALO = "kcp_bwd_halo"
+KCP_FWD_HALO = "kcp_fwd_halo"
+# The zero-history registry's forward route of FP32 taps and no bias (the KCP contract): the single-rank main program
+# of the two-launch forward (the module docstring).
+FWD_MAIN_ROUTE = "fwd"
+# The main backward's launch form when a call passes ``cooperative=None``: ``False`` = the ``kcp_bwd_split`` record and
+# its reduce program, which starts beside kernels resident on other streams; ``True`` = the cooperative ``kcp_bwd``
+# record, which waits for them (FlashInfer issue #8365).
+COOPERATIVE_DEFAULT = False
+# SMs of co-resident CTAs the forward (``kcp_fwd``) leaves free.  The forward record carries no ``reserve_sms`` (the
+# non-deterministic package's KCP forward runs the same record), so the rule is this host's (:func:`_launch_grid`): with
+# the shorter grid, no forward CTA waits for a second wave beside one small-carveout kernel of another stream resident
+# on an SM (a communication kernel).  A ``C`` whose channel tiles need the reserved SM launches the full grid
+# (:func:`_forward_grid`) and gives up that property.  ``y`` is formed per token in a fixed FMA order, so it does not
+# depend on the grid.  The single-rank main program of the two-launch forward (``FWD_MAIN_ARCHS``) is the
+# zero-history registry's record and launches its full co-resident grid, as the single-rank forward does; the
+# history-row program launches the head program's grid.
+FWD_RESERVE_SMS = 1
 GRAPH_MODES = (
     "off",
     "replay",
@@ -167,9 +236,10 @@ def _launch_grid(
     C: int | None = None,
     S: int | None = None,
 ) -> tuple[int, int, int]:
-    """The record's launch grid (:func:`cake_jit.launch_grid`) less its ``grid_rule.reserve_sms`` SMs of co-resident CTAs.
+    """The record's launch grid (:func:`cake_jit.launch_grid`) less its reserved SMs of co-resident CTAs: the record's
+    ``grid_rule.reserve_sms``, else :data:`FWD_RESERVE_SMS` for the forward record, else none.
 
-    A backward record with ``reserve_sms = 1`` launches ``ctas_per_sm x (SM count - 1)`` CTAs: one small-carveout kernel of
+    A record with ``reserve_sms = 1`` launches ``ctas_per_sm x (SM count - 1)`` CTAs: one small-carveout kernel of
     another stream resident on an SM keeps the whole SM from hosting a CTA of this program (its shared memory needs the
     SM's large carveout), so a grid one SM short of the co-resident count still starts every CTA at once beside it
     (FlashInfer issue #8365).  The grid is a pure function of the device and the record, so the partial rows and the
@@ -179,7 +249,11 @@ def _launch_grid(
     """
 
     grid = _record_launch_grid(record, device_index=device_index, C=C, S=S)
-    reserve = int(record["grid_rule"].get("reserve_sms", 0))
+    reserve = int(
+        record["grid_rule"].get(
+            "reserve_sms", FWD_RESERVE_SMS if record.get("role") == KCP_FWD else 0
+        )
+    )
     if reserve:
         reserved = reserve * int(record["grid_rule"]["ctas_per_sm"])
         if grid[0] <= reserved:
@@ -188,6 +262,25 @@ def _launch_grid(
             )
         grid = (grid[0] - reserved, grid[1], grid[2])
     return grid
+
+
+def _forward_grid(
+    record: dict[str, Any], *, device_index: int, C: int, n_ch_tiles: int
+) -> tuple[int, int, int]:
+    """The forward's launch grid: :func:`_launch_grid` (one SM short, :data:`FWD_RESERVE_SMS`) when that grid holds
+    all ``n_ch_tiles`` channel tiles, else the record's full co-resident grid, which every ``C`` it holds launched with
+    before the reservation (also on a device too small to give up an SM); a ``ValueError`` when not even the full grid
+    holds them.  ``y`` does not depend on the grid."""
+
+    full = _record_launch_grid(record, device_index=device_index)
+    if n_ch_tiles > full[0]:
+        raise ValueError(
+            f"C={C} spans more channel tiles than the forward's grid on this device holds"
+        )
+    reserved = FWD_RESERVE_SMS * int(record["grid_rule"]["ctas_per_sm"])
+    if full[0] - reserved >= max(n_ch_tiles, 1):
+        return _launch_grid(record, device_index=device_index)
+    return full
 
 
 def _cooperative(cooperative: Optional[bool]) -> bool:
@@ -207,6 +300,45 @@ def _bwd_kind(cooperative: bool) -> str:
     """The backward route of a launch form: ``kcp_bwd`` (cooperative) or ``kcp_bwd_split``."""
 
     return KCP_BWD if cooperative else KCP_BWD_SPLIT
+
+
+def _overlapped(cooperative: bool, work: Optional[Any]) -> bool:
+    """Whether a backward call with tokens runs the overlapped backward (the module docstring): the ``kcp_bwd_split``
+    form with an exchange in flight (``work``, more than one rank) and the shipped ``bwd_overlap`` knob."""
+
+    return not cooperative and work is not None and _TEST_KNOBS["bwd_overlap"] == 1
+
+
+def _bwd_variant(cooperative: bool) -> Any:
+    """The backward's graph-key variant: the launch form, with the ``bwd_overlap`` knob when it is not shipped."""
+
+    knob = _TEST_KNOBS["bwd_overlap"]
+    if knob == BWD_OVERLAP_DEFAULT:
+        return cooperative
+    return (cooperative, ("bwd_overlap", knob))
+
+
+def _fwd_form(arch: str, *, multi: bool = False) -> tuple[bool, bool]:
+    """``(sr, overlap)`` of the forward on ``arch`` (the module docstring's "Two-launch forward"): whether its main
+    program is the single-rank ``fwd`` route program (else the ``kcp_fwd`` program), and whether it launches the main
+    program before the exchange's wait when an exchange is in flight.  Each is its test knob (``fwd_main`` /
+    ``fwd_overlap``) when the knob is ``0`` or ``1``, else (``None``, shipped) whether ``arch`` is in the entry's set:
+    ``FWD_MAIN_ARCHS`` / ``FWD_OVERLAP_ARCHS``, or ``MULTI_FWD_MAIN_ARCHS`` / ``MULTI_FWD_OVERLAP_ARCHS`` for the multi
+    entry (``multi``)."""
+
+    main, overlap = _TEST_KNOBS["fwd_main"], _TEST_KNOBS["fwd_overlap"]
+    if main is None:
+        main = arch in (MULTI_FWD_MAIN_ARCHS if multi else FWD_MAIN_ARCHS)
+    if overlap is None:
+        overlap = arch in (MULTI_FWD_OVERLAP_ARCHS if multi else FWD_OVERLAP_ARCHS)
+    return bool(main), bool(overlap)
+
+
+def _fwd_variant(x: Any, *, multi: bool = False) -> tuple[bool, bool]:
+    """The forward's graph-key variant: :func:`_fwd_form` on the device of ``x`` (the effective forms, so a changed
+    knob or architecture set is another key)."""
+
+    return _fwd_form(_device_arch(_require_tensor(x, "x_local").device), multi=multi)
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
@@ -494,8 +626,8 @@ def _handle_hist(
 # CUDA-graph replay of a call and the test knobs.
 #
 # The public keyword ``graph="replay"`` of :func:`cake_causal_conv1d_det_kcp` and of the forward / backward below (shipped
-# ``GRAPH_DEFAULT = "off"``) -- or, for the A/B record, the private ``_set_test_knobs({"graph": "replay"})`` (accepted
-# only with ``CAKE_KCP_TEST_KNOBS=1``; a keyword contradicting an active knob is a ``ValueError``) -- makes
+# ``GRAPH_DEFAULT = "off"``) -- or, for the A/B record, the private test hook ``_set_test_knobs({"graph": "replay"})``
+# (a keyword contradicting an active knob is a ``ValueError``) -- makes
 # :func:`cake_causal_conv1d_det_train_kcp_forward` / :func:`cake_causal_conv1d_det_train_kcp_backward` run their first call of a
 # validity key (kind, the context object, its world size, and the shape / stride / dtype / data pointer of every
 # operand and caller-owned output) eagerly, capture the second call into a ``torch.cuda.CUDAGraph`` (replayed once)
@@ -516,13 +648,54 @@ HOST_TRIMS = (0, 1)
 HOST_TRIM_DEFAULT = (
     1  # shipped; 0 = the previous path, via _set_test_knobs({"host_trim": 0}) only
 )
-_TEST_KNOBS: dict[str, Any] = {"graph": "off", "host_trim": HOST_TRIM_DEFAULT}
+# The overlapped backward (the module docstring's "Overlapped backward"): 1 = shipped, the split program before the
+# exchange's wait and the tail-row program after it; 0 = the wait before the main program, via _set_test_knobs only.
+BWD_OVERLAPS = (0, 1)
+BWD_OVERLAP_DEFAULT = 1
+# The architectures whose multi entry takes the overlapped backward (its first tensor's main programs before the
+# exchange's wait).  On sm_100a the overlapped multi backward measured no robust gain over the waiting one (B200,
+# 3 x C = 8192 at CP4 and CP8: -0.9% to +0.8% per shape; CP4 zigzag 0.5% slower with only the knob changed), so its
+# multi entry waits first.  The single call overlaps on every architecture.
+MULTI_BWD_OVERLAP_ARCHS = frozenset(("sm_103a", "sm_107a"))
+# The two-launch forward (the module docstring's "Two-launch forward"): the knob values of ``fwd_main`` (the main
+# program: 1 = the single-rank ``fwd`` route program, 0 = the ``kcp_fwd`` program) and ``fwd_overlap`` (1 = the main
+# program before the exchange's wait, 0 = after it); ``None``, shipped, = the architecture sets below.
+FWD_MAINS = (None, 0, 1)
+FWD_MAIN_DEFAULT = None
+FWD_OVERLAPS = (None, 0, 1)
+FWD_OVERLAP_DEFAULT = None
+# The architectures whose single call runs the single-rank main program (``FWD_MAIN_ARCHS``) and launches its main
+# program before the exchange's wait (``FWD_OVERLAP_ARCHS``), and the multi entry's (``MULTI_*``).  Each entry takes,
+# per architecture, the form faster than the one-launch forward on every forward, forward + backward and checkpointed
+# step row, the simpler form of a tie (launch-to-launch time with the split backward; CP4, and CP8 on B200; contiguous,
+# zigzag and per-document zigzag layouts; one tensor of C = 10240, three of C = 8192; % = speedup - 1):
+# - the single call waits and runs the single-rank main program on every architecture: forward 11.6-15.3% /
+#   6.6-8.1% / 8.0-9.4%, forward + backward 4.6-6.4% / 2.5-2.8% / 3.3-3.7%, checkpointed step 6.7-8.5% / 3.5-3.8% /
+#   3.7-4.7% (B200 / GB300 / R200).  Overlapped, its forward gains more, but beside the overlapped backward the
+#   contiguous row loses (forward + backward 0.881x / 0.887x on B200 / GB300, checkpointed step 0.943x-0.957x on all
+#   three);
+# - the multi entry waits on sm_100a and sm_103a (forward 7.5-10.0% / 3.5-4.5%, forward + backward 3.0-4.3% /
+#   1.6-2.0%, checkpointed step 4.1-5.7% / 2.3-2.8%; overlapped, within -0.2% to +1.2% of that on every row, a tie that
+#   goes to the waiting form) and overlaps on sm_107a (forward 2.8-3.0%, forward + backward 1.1-1.6%, checkpointed
+#   step 1.6-1.8%; waiting reads -0.9% to +0.5% there).
+FWD_MAIN_ARCHS = frozenset(("sm_100a", "sm_103a", "sm_107a"))
+FWD_OVERLAP_ARCHS: frozenset[str] = frozenset()
+MULTI_FWD_MAIN_ARCHS = frozenset(("sm_100a", "sm_103a", "sm_107a"))
+MULTI_FWD_OVERLAP_ARCHS = frozenset(("sm_107a",))
+_TEST_KNOBS: dict[str, Any] = {
+    "graph": "off",
+    "host_trim": HOST_TRIM_DEFAULT,
+    "bwd_overlap": BWD_OVERLAP_DEFAULT,
+    "fwd_main": FWD_MAIN_DEFAULT,
+    "fwd_overlap": FWD_OVERLAP_DEFAULT,
+}
 GRAPH_STATS: dict[str, int] = {"eager": 0, "capture": 0, "replay": 0, "fallback": 0}
 GRAPH_CACHE_MAX = 64
 LAST_CALL: dict[str, dict[str, Any]] = {}
 
 # -- the trimmed host path (host_trim=1): the per-context host state of the eager halo calls.  ``_HOST_CACHE[id(ctx)]`` holds the
-# context (pinned, so its id cannot be reused) and one entry per ``(kind, S, C, device, cu_seqlens_local_cpu)``: the
+# context (pinned, so its id cannot be reused) and one entry per ``(kind, S, C, device, cu_seqlens_local_cpu)`` and
+# launch form (the backward's ``cooperative``, the forward's effective ``(sr, overlap)`` of :func:`_fwd_form`): the
 # validated context tables and tensors (``cu``, ``hist_row_off``, ...), the plan scalars, the record names, the loaded
 # modules with their positional argument plans and grids.  Everything in an entry derives from host integers of the
 # context and the shapes of the call; no tensor content is read.  At most HOST_CACHE_MAX contexts (the oldest dropped).
@@ -605,20 +778,29 @@ def _reduce_plan(
         return None
     reduce_record = _zero_history.MODULES[name]
     grid = _zero_history.launch_grid(reduce_record, device_index=device_index, C=C)
-    logical = reduce_record["logical"]
+    return _zero_history_plan(name, grid, device_index)
+
+
+def _zero_history_plan(
+    name: str, grid: tuple[int, int, int], device_index: int
+) -> tuple[Any, str, tuple[tuple[str | None, int], ...]]:
+    """:func:`_launch_plan` of record ``name`` of the zero-history registry (``cake_jit``: the backward's reduce
+    programs and the two-launch forward's single-rank main program), loaded through that registry."""
+    record = _zero_history.MODULES[name]
+    logical = record["logical"]
     grid_values = {
         "grid_x": int(grid[0]),
         "grid_y": int(grid[1]),
         "grid_z": int(grid[2]),
     }
     plan_: list[tuple[str | None, int]] = []
-    for kind, key in reduce_record["arg_plan"]:
+    for kind, key in record["arg_plan"]:
         if kind == "grid":
             plan_.append((None, grid_values[key]))
         else:
             plan_.append((logical[key], 0))
     module = _zero_history.load(name, _loader.device_arch(device_index))
-    return module, reduce_record["ffi_entry"], tuple(plan_)
+    return module, record["ffi_entry"], tuple(plan_)
 
 
 def _launch_trim(
@@ -646,23 +828,27 @@ def _launch_trim(
 
 def _set_test_knobs(knobs: Optional[dict]) -> dict:
     """Set the module's private test knobs (``graph``: ``"off"`` shipped | ``"replay"``; ``host_trim``: ``1`` shipped =
-    the trimmed host path of the eager call | ``0`` the previous host path); a knob
-    the dict does not name keeps its shipped default; ``None`` restores the defaults.  Refused without
-    ``CAKE_KCP_TEST_KNOBS=1`` in the environment.  Returns the active knobs."""
+    the trimmed host path of the eager call | ``0`` the previous host path; ``bwd_overlap``: ``1`` shipped = the
+    overlapped backward | ``0`` the wait before the main program; ``fwd_main`` / ``fwd_overlap``: ``None`` shipped =
+    the architecture sets of the two-launch forward | ``0`` off | ``1`` on, :func:`_fwd_form`); a knob
+    the dict does not name keeps its shipped default; ``None`` restores the defaults.  A private test hook, called by
+    the tests only (no environment variable opens or selects it).  Returns the active knobs."""
     if knobs is None:
         _TEST_KNOBS["graph"] = "off"
         _TEST_KNOBS["host_trim"] = HOST_TRIM_DEFAULT
+        _TEST_KNOBS["bwd_overlap"] = BWD_OVERLAP_DEFAULT
+        _TEST_KNOBS["fwd_main"] = FWD_MAIN_DEFAULT
+        _TEST_KNOBS["fwd_overlap"] = FWD_OVERLAP_DEFAULT
         return dict(_TEST_KNOBS)
-    if os.environ.get(TEST_KNOBS_ENV) != "1":
-        raise ValueError(
-            f"_set_test_knobs is a private test hook: it is accepted only with {TEST_KNOBS_ENV}=1 in the environment"
-        )
     if not isinstance(knobs, dict):
         raise TypeError(f"_set_test_knobs expects a dict, got {type(knobs).__name__}")
-    unknown = sorted(set(knobs) - {"graph", "host_trim"})
+    unknown = sorted(
+        set(knobs) - {"graph", "host_trim", "bwd_overlap", "fwd_main", "fwd_overlap"}
+    )
     if unknown:
         raise ValueError(
-            f"_set_test_knobs: unknown knob(s) {unknown}; known: ['graph', 'host_trim']"
+            f"_set_test_knobs: unknown knob(s) {unknown}; known: ['bwd_overlap', 'fwd_main', 'fwd_overlap', 'graph', "
+            "'host_trim']"
         )
     graph = str(knobs.get("graph", "off"))
     if graph not in GRAPH_MODES:
@@ -674,8 +860,26 @@ def _set_test_knobs(knobs: Optional[dict]) -> dict:
         raise ValueError(
             f"_set_test_knobs: host_trim must be one of {HOST_TRIMS}, got {host_trim!r}"
         )
+    bwd_overlap = knobs.get("bwd_overlap", BWD_OVERLAP_DEFAULT)
+    if isinstance(bwd_overlap, bool) or bwd_overlap not in BWD_OVERLAPS:
+        raise ValueError(
+            f"_set_test_knobs: bwd_overlap must be one of {BWD_OVERLAPS}, got {bwd_overlap!r}"
+        )
+    fwd_main = knobs.get("fwd_main", FWD_MAIN_DEFAULT)
+    if isinstance(fwd_main, bool) or fwd_main not in FWD_MAINS:
+        raise ValueError(
+            f"_set_test_knobs: fwd_main must be one of {FWD_MAINS}, got {fwd_main!r}"
+        )
+    fwd_overlap = knobs.get("fwd_overlap", FWD_OVERLAP_DEFAULT)
+    if isinstance(fwd_overlap, bool) or fwd_overlap not in FWD_OVERLAPS:
+        raise ValueError(
+            f"_set_test_knobs: fwd_overlap must be one of {FWD_OVERLAPS}, got {fwd_overlap!r}"
+        )
     _TEST_KNOBS["graph"] = graph
     _TEST_KNOBS["host_trim"] = int(host_trim)
+    _TEST_KNOBS["bwd_overlap"] = int(bwd_overlap)
+    _TEST_KNOBS["fwd_main"] = None if fwd_main is None else int(fwd_main)
+    _TEST_KNOBS["fwd_overlap"] = None if fwd_overlap is None else int(fwd_overlap)
     return dict(_TEST_KNOBS)
 
 
@@ -698,7 +902,16 @@ def _graph_mode(graph: Optional[str]) -> str:
 class _GraphEntry:
     """One validity key: its graph (after the capture) and the static results."""
 
-    __slots__ = ("key", "pins", "seen", "graph", "result", "disabled", "digest")
+    __slots__ = (
+        "key",
+        "pins",
+        "seen",
+        "graph",
+        "result",
+        "record",
+        "disabled",
+        "digest",
+    )
 
     def __init__(self, key: tuple, pins: tuple) -> None:
         self.key, self.pins = (
@@ -708,6 +921,8 @@ class _GraphEntry:
         self.seen = 0
         self.graph: Optional[torch.cuda.CUDAGraph] = None
         self.result: Optional[tuple] = None
+        # what the captured call recorded in LAST_CALL[kind] (the forward's launch form), repeated by every replay
+        self.record: dict[str, Any] = {}
         self.disabled: Optional[str] = None
         self.digest = f"{key[0]}:{hash(key) & 0xFFFFFFFFFFFF:012x}"
 
@@ -732,7 +947,8 @@ def _graph_entry(
 ) -> Optional[_GraphEntry]:
     """The cache entry of this call's validity key, or ``None`` when the call is never captured (mode off, no tokens);
     ``mode`` = the effective graph mode (:func:`_graph_mode`), ``None`` = the knob; ``variant`` = a host value of the
-    call that changes the captured work (the backward's launch form), part of the key."""
+    call that changes the captured work (the backward's launch form, the forward's :func:`_fwd_form`), part of the
+    key."""
     if (
         (_TEST_KNOBS["graph"] if mode is None else mode) == "off"
         or int(getattr(ctx, "T_r", 0)) == 0
@@ -770,17 +986,21 @@ def _graph_run(
     kind: str, entry: Optional[_GraphEntry], body: Any, mode: Optional[str] = None
 ) -> tuple:
     """Run ``body()`` under the graph mode (keyword or knob): replay the key's graph, or capture this call (the key's second), or run eagerly
-    (the key's first call, a key whose capture failed, or a call that is never captured).  Returns the results."""
+    (the key's first call, a key whose capture failed, or a call that is never captured).  Returns the results.
+    ``LAST_CALL[kind]`` holds what the body recorded (the forward's launch form; a replay repeats the captured call's)
+    and the graph event."""
     if entry is not None and entry.graph is not None:
         entry.graph.replay()
         GRAPH_STATS["replay"] += 1
         LAST_CALL[kind] = {
+            **entry.record,
             "graph": "replay",
             "graph_event": "replay",
             "graph_key": entry.digest,
             "graph_fallback": None,
         }
         return entry.result
+    LAST_CALL.pop(kind, None)  # the body records afresh
     if entry is not None and entry.seen > 0 and entry.disabled is None:
         g = torch.cuda.CUDAGraph()
         try:
@@ -792,9 +1012,11 @@ def _graph_run(
         else:
             g.replay()
             entry.graph, entry.result = g, result
+            entry.record = LAST_CALL.pop(kind, {})
             entry.seen += 1
             GRAPH_STATS["capture"] += 1
             LAST_CALL[kind] = {
+                **entry.record,
                 "graph": "replay",
                 "graph_event": "capture",
                 "graph_key": entry.digest,
@@ -806,6 +1028,7 @@ def _graph_run(
     if entry is not None:
         entry.seen += 1
     LAST_CALL[kind] = {
+        **LAST_CALL.get(kind, {}),
         "graph": _TEST_KNOBS["graph"] if mode is None else mode,
         "graph_event": "eager",
         "graph_key": None if entry is None else entry.digest,
@@ -829,7 +1052,8 @@ def cake_causal_conv1d_det_train_kcp_forward(
     device tables ``ctx.halo_tables`` and the process group ``ctx.group``).  Every rank of the group calls this
     function once per layer, in the same order: the forward halo exchange is a collective (a rank without tokens
     joins it with empty splits and returns empty outputs).  ``hist`` is a fresh ``[n_hist_rows, C]`` BF16 tensor
-    (``[1, C]`` when the rank receives no row).  ``graph`` (``None`` = the shipped ``GRAPH_DEFAULT`` ``"off"`` |
+    (``[0, C]`` when the rank receives no row; the program then reads a private one-row placeholder that is not
+    returned).  ``graph`` (``None`` = the shipped ``GRAPH_DEFAULT`` ``"off"`` |
     ``"replay"``): keyed CUDA-graph capture / replay of this call (the graph-replay option; see the section comment
     above: pointer-stable operands, private pools, eager fallback, :func:`cake_causal_conv1d_det_train_kcp_graph_cache_clear`).
     """
@@ -837,7 +1061,9 @@ def cake_causal_conv1d_det_train_kcp_forward(
     mode = _graph_mode(graph)
     if mode == "off":
         return _kcp_forward(x_local, weight, ctx, out=out)
-    entry = _graph_entry("fwd", ctx, (x_local, weight, out), mode)
+    entry = _graph_entry(
+        "fwd", ctx, (x_local, weight, out), mode, variant=_fwd_variant(x_local)
+    )
     y, hist = _graph_run(
         "fwd", entry, lambda: _kcp_forward(x_local, weight, ctx, out=out), mode
     )
@@ -854,7 +1080,7 @@ def _kcp_forward(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The forward's host flow (eagerly or inside a capture): see :func:`cake_causal_conv1d_det_train_kcp_forward`.  ``_hist``:
     the history pool a recompute handle stored (checked by :func:`_handle_hist`): no gather, no exchange, no wait;
-    the kernel launch is the same."""
+    the programs are the same, launched in the waiting form."""
 
     x = _require_tensor(x_local, "x_local")
     device = x.device
@@ -890,32 +1116,95 @@ def _kcp_forward(
     if S == 0:
         if work is not None:
             work.wait()
+        _fwd_record("fwd", None, False, False)
         return y, hist
     hist_row_off = _table(
         ctx, "hist_row_off", shape=(n_frag, HALO), dtype=torch.int32, device=device
     )
-    (name,) = route_modules(arch, KCP_FWD)
     device_index = _device_index(device)
-    record = _loader.MODULES[name]
-    scalars = plan(S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True)
-    if scalars["n_ch_tiles"] > _launch_grid(record, device_index=device_index)[0]:
-        raise ValueError(
-            f"C={C} spans more channel tiles than the forward's grid on this device holds"
+    sr, overlap = _fwd_form(arch)
+    overlap = overlap and work is not None
+    values: dict[str, Any] = {"x": x_flat, "w": w, "cu": cu, "y": y.view(S, C)}
+    if sr:
+        # the single-rank fwd route program on the fragments (each a document of its own): the single-rank forward's
+        # plan, full co-resident grid and token-chunk counters
+        (name,) = _zero_history.selected_modules(arch, FWD_MAIN_ROUTE, C=C, S=S)
+        record = _zero_history.MODULES[name]
+        scalars = plan(
+            S,
+            C,
+            n_frag,
+            geometry=record["grid_rule"]["geometry"],
+            role=record["role"],
+            route=_zero_history.record_route(record, arch),
+            arch=arch,
         )
-    values: dict[str, Any] = {
-        "x": x_flat,
-        "w": w,
-        "cu": cu,
-        "y": y.view(S, C),
-        "hist": hist
-        if hist.shape[0]
-        else _pool(0, C, dtype=torch.bfloat16, device=device),
-        "hist_row_off": hist_row_off,
-        **_scalars(scalars),
-    }
-    if work is not None:
+        grid = _record_launch_grid(record, device_index=device_index, C=C, S=S)
+        if scalars["n_ch_tiles"] > grid[0]:
+            raise ValueError(
+                f"C={C} spans more channel tiles than the forward's grid on this device holds"
+            )
+        counters = _forward_work(
+            None,
+            _zero_history.counter_words(record, scalars["n_ch_tiles"]),
+            device=device,
+            device_index=device_index,
+        )
+        if counters is not None:
+            values["work"] = counters
+    else:
+        (name,) = route_modules(arch, KCP_FWD)
+        record = _loader.MODULES[name]
+        scalars = plan(
+            S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True
+        )
+        grid = _forward_grid(
+            record, device_index=device_index, C=C, n_ch_tiles=scalars["n_ch_tiles"]
+        )
+        if overlap:
+            # the overlapped forward: the main program reads no received row while the exchange is in flight
+            # (``x`` stands for the pool: a valid pointer no -1 entry names)
+            values["hist"] = x_flat
+            values["hist_row_off"] = torch.full(
+                (n_frag, HALO), -1, dtype=torch.int32, device=device
+            )
+        else:
+            values["hist"] = (
+                hist
+                if hist.shape[0]
+                else _pool(0, C, dtype=torch.bfloat16, device=device)
+            )
+            values["hist_row_off"] = hist_row_off
+    values.update(_scalars(scalars))
+    if work is not None and not overlap:
         work.wait()
-    run_module(name, values, device_index=device_index)
+    # the grid of :func:`_forward_grid` (the kcp_fwd program) or the record's (the single-rank program), as on the
+    # trimmed host path
+    if sr:
+        _launch_trim(_zero_history_plan(name, grid, device_index), values, device_index)
+    else:
+        run_module(name, values, device_index=device_index, grid=grid)
+    if overlap:
+        work.wait()
+    repair = (sr or overlap) and int(halo.n_hist_rows) > 0
+    if repair:
+        (halo_name,) = route_modules(arch, KCP_FWD_HALO)
+        _launch_with_grid(
+            halo_name,
+            {
+                "x": x_flat,
+                "w": w,
+                "cu": cu,
+                "y": y.view(S, C),
+                "hist": hist,
+                "hist_row_off": hist_row_off,
+                "C": C,
+                "num_docs": n_frag,
+            },
+            grid=_loader.head_grid(_loader.MODULES[halo_name], n_frag=n_frag, C=C),
+            device_index=device_index,
+        )
+    _fwd_record("fwd", sr, overlap, repair)
     return y, hist
 
 
@@ -926,23 +1215,28 @@ def _fwd_host(
     *,
     out: Optional[torch.Tensor],
     device: torch.device,
+    multi: bool = False,
 ) -> tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
     """The trimmed forward's operand checks, output and host-cache entry: ``(S, C, x_flat, w, y, entry)``.  The entry
-    is cached per ``(ctx, S, C, device, cu_seqlens_local_cpu)``: the validated ``cu`` / ``hist_index`` /
-    ``hist_row_off`` tables, the halo splits, the record, its plan scalars and grid, the loaded module with its
-    argument plan."""
+    is cached per ``(ctx, S, C, device, cu_seqlens_local_cpu, sr, overlap)`` (:func:`_fwd_form` of the device's
+    architecture, of the multi entry's sets with ``multi``; both kept in the entry): the validated ``cu`` /
+    ``hist_index`` / ``hist_row_off`` tables, the halo splits, the main program's record, its plan scalars, grid and
+    counter words, the loaded module with its argument plan."""
 
     S, C, x_flat = _tokens(x, "x_local", device=device)
     w = _weight(weight, C, device=device)
     y = _output(out, "out", shape=tuple(x.shape), dtype=torch.bfloat16, device=device)
+    arch = _device_arch(device)
+    sr, overlap = _fwd_form(arch, multi=multi)
     e = _host_cache_entry(
-        ctx, ("fwd", S, C, str(device), tuple(ctx.cu_seqlens_local_cpu))
+        ctx,
+        ("fwd", S, C, str(device), tuple(ctx.cu_seqlens_local_cpu), sr, overlap),
     )
     if not e:
-        arch = _device_arch(device)
         cu, n_frag = _context(ctx, device=device, T_r=S)
         halo = ctx.halo
-        e.update(
+        # filled into the entry at the end, so a call that raises below (C too wide for the grid) leaves it empty
+        fresh: dict[str, Any] = dict(
             cu=cu,
             n_frag=n_frag,
             hist_index=_require_tensor(
@@ -951,29 +1245,57 @@ def _fwd_host(
             recv_rows=int(halo.n_hist_rows),
             send_splits=tuple(halo.fwd_send_rows),
             recv_splits=tuple(halo.fwd_recv_rows),
+            sr=sr,
+            overlap=overlap,
         )
         if S != 0:
-            e["hist_row_off"] = _table(
+            fresh["hist_row_off"] = _table(
                 ctx,
                 "hist_row_off",
                 shape=(n_frag, HALO),
                 dtype=torch.int32,
                 device=device,
             )
-            (name,) = route_modules(arch, KCP_FWD)
             device_index = _device_index(device)
-            record = _loader.MODULES[name]
-            scalars = plan(
-                S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True
-            )
-            grid = _launch_grid(record, device_index=device_index)
-            if scalars["n_ch_tiles"] > grid[0]:
-                raise ValueError(
-                    f"C={C} spans more channel tiles than the forward's grid on this device holds"
+            if sr:
+                # the single-rank fwd route program: the single-rank forward's plan, full co-resident grid and counters
+                (name,) = _zero_history.selected_modules(arch, FWD_MAIN_ROUTE, C=C, S=S)
+                record = _zero_history.MODULES[name]
+                scalars = plan(
+                    S,
+                    C,
+                    n_frag,
+                    geometry=record["grid_rule"]["geometry"],
+                    role=record["role"],
+                    route=_zero_history.record_route(record, arch),
+                    arch=arch,
                 )
-            e["scalars"] = _scalars(scalars)
-            e["device_index"] = device_index
-            e["launch"] = _launch_plan(name, grid, device_index)
+                grid = _record_launch_grid(record, device_index=device_index, C=C, S=S)
+                if scalars["n_ch_tiles"] > grid[0]:
+                    raise ValueError(
+                        f"C={C} spans more channel tiles than the forward's grid on this device holds"
+                    )
+                fresh["words"] = _zero_history.counter_words(
+                    record, scalars["n_ch_tiles"]
+                )
+                fresh["launch"] = _zero_history_plan(name, grid, device_index)
+            else:
+                (name,) = route_modules(arch, KCP_FWD)
+                record = _loader.MODULES[name]
+                scalars = plan(
+                    S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True
+                )
+                grid = _forward_grid(
+                    record,
+                    device_index=device_index,
+                    C=C,
+                    n_ch_tiles=scalars["n_ch_tiles"],
+                )
+                fresh["words"] = 0
+                fresh["launch"] = _launch_plan(name, grid, device_index)
+            fresh["scalars"] = _scalars(scalars)
+            fresh["device_index"] = device_index
+        e.update(fresh)
     return S, C, x_flat, w, y, e
 
 
@@ -987,6 +1309,85 @@ def _fwd_gather(x_flat: torch.Tensor, C: int, e: dict[str, Any]) -> torch.Tensor
     )
 
 
+def _fwd_main(
+    e: dict[str, Any],
+    x_flat: torch.Tensor,
+    w: torch.Tensor,
+    y: torch.Tensor,
+    hist: Optional[torch.Tensor],
+    counters: Optional[torch.Tensor],
+    *,
+    S: int,
+    C: int,
+    device: torch.device,
+    deferred: bool = False,
+) -> None:
+    """Launch the main forward program of a call with ``S > 0`` (no wait).  The single-rank ``fwd`` route program
+    (``e["sr"]``) reads no history row: it writes every fragment as a document of its own, taking its token chunks
+    from ``counters``.  The ``kcp_fwd`` program reads ``hist`` through the context's ``hist_row_off``; ``deferred``
+    (the overlapped forward's main launch, before the exchange's wait): every ``hist_row_off`` entry ``-1`` and ``x``
+    as the (unread) pool, so it reads no received row and writes a continuing fragment's first rows as at a document
+    start (:func:`_fwd_repair` writes them again after the wait); ``hist`` is then not used."""
+    values: dict[str, Any] = {
+        "x": x_flat,
+        "w": w,
+        "cu": e["cu"],
+        "y": y.view(S, C),
+        **e["scalars"],
+    }
+    if e["sr"]:
+        if counters is not None:
+            values["work"] = counters
+    elif deferred:
+        values["hist"] = x_flat
+        values["hist_row_off"] = _no_hist(e, device)
+    else:
+        values["hist"] = (
+            hist if hist.shape[0] else _pool(0, C, dtype=torch.bfloat16, device=device)
+        )
+        values["hist_row_off"] = e["hist_row_off"]
+    _launch_trim(e["launch"], values, e["device_index"])
+
+
+def _fwd_repair(
+    e: dict[str, Any],
+    x_flat: torch.Tensor,
+    w: torch.Tensor,
+    y: torch.Tensor,
+    hist: torch.Tensor,
+    *,
+    S: int,
+    C: int,
+    device: torch.device,
+) -> bool:
+    """The two-launch forward's history-row program (route ``kcp_fwd_halo``), after the main program and the
+    exchange's wait: ``y`` of the first ``min(3, len)`` rows of every fragment with a history row, written again from
+    the received ``hist`` with the ``kcp_fwd`` program's instructions (nothing when the rank receives no history
+    row).  Its launch plan is made at the entry's first such call, then reused.  Returns whether it ran."""
+    if e["recv_rows"] == 0:
+        return False
+    info = e.get("repair_launch")
+    if info is None:
+        (name,) = route_modules(_device_arch(device), KCP_FWD_HALO)
+        grid = _loader.head_grid(_loader.MODULES[name], n_frag=e["n_frag"], C=C)
+        info = e["repair_launch"] = _launch_plan(name, grid, e["device_index"])
+    _launch_trim(
+        info,
+        {
+            "x": x_flat,
+            "w": w,
+            "cu": e["cu"],
+            "y": y.view(S, C),
+            "hist": hist,
+            "hist_row_off": e["hist_row_off"],
+            "C": C,
+            "num_docs": e["n_frag"],
+        },
+        e["device_index"],
+    )
+    return True
+
+
 def _fwd_launch(
     e: dict[str, Any],
     x_flat: torch.Tensor,
@@ -998,22 +1399,27 @@ def _fwd_launch(
     S: int,
     C: int,
     device: torch.device,
-) -> None:
-    """Wait ``work`` (when given) and launch the forward kernel of a call with ``S > 0`` on ``hist``."""
-    values: dict[str, Any] = {
-        "x": x_flat,
-        "w": w,
-        "cu": e["cu"],
-        "y": y.view(S, C),
-        "hist": hist
-        if hist.shape[0]
-        else _pool(0, C, dtype=torch.bfloat16, device=device),
-        "hist_row_off": e["hist_row_off"],
-        **e["scalars"],
-    }
+    counters: Optional[torch.Tensor] = None,
+) -> bool:
+    """The waiting form: wait ``work`` (when given) and launch the forward of a call with ``S > 0`` on ``hist``: its
+    main program (:func:`_fwd_main`) and, after the single-rank main program, the history-row program
+    (:func:`_fwd_repair`).  Returns whether the history-row program ran."""
     if work is not None:
         work.wait()
-    _launch_trim(e["launch"], values, e["device_index"])
+    _fwd_main(e, x_flat, w, y, hist, counters, S=S, C=C, device=device)
+    return e["sr"] and _fwd_repair(e, x_flat, w, y, hist, S=S, C=C, device=device)
+
+
+def _fwd_record(kind: str, sr: Optional[bool], pair: bool, repair: bool) -> None:
+    """Record the launch form of the forward call ``kind`` (``"fwd"`` / ``"fwd_multi"``) in ``LAST_CALL[kind]``:
+    ``main`` -- ``"sr"`` (the single-rank ``fwd`` route program), ``"f"`` (the ``kcp_fwd`` program) or ``None`` (a rank
+    without tokens: no launch); ``form`` -- ``"pair"`` (a main program before the exchange's wait) or ``"wait"``;
+    ``repair`` -- whether a history-row program ran.  :func:`_graph_run` adds the graph event."""
+    LAST_CALL[kind] = {
+        "main": None if sr is None else ("sr" if sr else "f"),
+        "form": "pair" if pair else "wait",
+        "repair": bool(repair),
+    }
 
 
 def _kcp_forward_trim(
@@ -1026,8 +1432,8 @@ def _kcp_forward_trim(
     _hist: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Trimmed host path: :func:`_kcp_forward` with the context-derived host work cached per ``(ctx, S, C, device,
-    cu_seqlens_local_cpu)`` (:func:`_fwd_host`).  The operand checks, the gather, the exchange, the wait and the
-    kernel launch are the untrimmed call's, in the same order on the same stream."""
+    cu_seqlens_local_cpu, sr, overlap)`` (:func:`_fwd_host`).  The operand checks, the gather, the exchange, the wait
+    and the launches are the untrimmed call's, in the same order on the same stream."""
 
     S, C, x_flat, w, y, e = _fwd_host(x, weight, ctx, out=out, device=device)
     if _hist is None:
@@ -1043,8 +1449,26 @@ def _kcp_forward_trim(
     if S == 0:
         if work is not None:
             work.wait()
+        _fwd_record("fwd", None, False, False)
         return y, hist
-    _fwd_launch(e, x_flat, w, y, hist, work, S=S, C=C, device=device)
+    counters = (
+        _forward_work(None, e["words"], device=device, device_index=e["device_index"])
+        if e["words"]
+        else None
+    )
+    if work is not None and e["overlap"]:
+        # the overlapped forward: the main program reads no received row while the exchange is in flight
+        _fwd_main(
+            e, x_flat, w, y, None, counters, S=S, C=C, device=device, deferred=True
+        )
+        work.wait()
+        repair = _fwd_repair(e, x_flat, w, y, hist, S=S, C=C, device=device)
+        _fwd_record("fwd", e["sr"], True, repair)
+    else:
+        repair = _fwd_launch(
+            e, x_flat, w, y, hist, work, S=S, C=C, device=device, counters=counters
+        )
+        _fwd_record("fwd", e["sr"], False, repair)
     return y, hist
 
 
@@ -1066,11 +1490,15 @@ def cake_causal_conv1d_det_train_kcp_backward(
 
     ``hist`` is the forward's pool.  The head program writes the derivative rows of every continuing fragment's first
     tokens into the backward exchange's send layout, the exchange delivers them to the predecessors as ``dpre_tail``,
-    and the main program folds them.  Every rank calls this function once per layer, in the same order.  ``graph`` as
+    and the main program folds them (``cooperative=False`` at more than one rank: the main program runs while the
+    exchange is in flight and the tail-row program folds them after the wait, bitwise the same ``dx`` and
+    ``dweight``; the module docstring's "Overlapped backward").  Every rank calls this function once per layer, in
+    the same order.  ``graph`` as
     in the forward (the backward's key holds the forward's ``hist`` pointer, so its capture follows the forward's by
-    one call).  ``cooperative``: the main program's launch form (``None`` = :data:`COOPERATIVE_DEFAULT`; ``True`` the
-    cooperative launch, ``False`` the ordinary launch and the reduce program; see the module docstring); ``dx`` is
-    bitwise the same in both, ``dweight`` is reproducible in each but differs in its bits between them.
+    one call).  ``cooperative``: the main program's launch form (``None`` = :data:`COOPERATIVE_DEFAULT`, ``False``;
+    ``False`` the ordinary launch and the reduce program, ``True`` the cooperative launch; see the module docstring);
+    ``dx`` is bitwise the same in both, ``dweight`` is reproducible in each but differs in its bits between them.
+    Every rank of the group passes the same ``cooperative``.
     """
 
     coop = _cooperative(cooperative)
@@ -1080,7 +1508,11 @@ def cake_causal_conv1d_det_train_kcp_backward(
             x_local, weight, ctx, dy, hist, dx=dx, dweight=dweight, cooperative=coop
         )
     entry = _graph_entry(
-        "bwd", ctx, (x_local, weight, dy, hist, dx, dweight), mode, variant=coop
+        "bwd",
+        ctx,
+        (x_local, weight, dy, hist, dx, dweight),
+        mode,
+        variant=_bwd_variant(coop),
     )
     dx_out, dw_out = _graph_run(
         "bwd",
@@ -1229,7 +1661,13 @@ def _kcp_backward(
         "tail_row_off": tail_row_off,
         **_scalars(scalars),
     }
-    if work is not None:
+    overlap = _overlapped(cooperative, work)
+    if overlap:
+        # the overlapped backward: the main programs read no received row while the exchange is in flight
+        values["tail_row_off"] = torch.full(
+            (n_frag, HALO), -1, dtype=torch.int32, device=device
+        )
+    elif work is not None:
         work.wait()
     for name in names:
         # the grid of :func:`_launch_grid` (less the record's reserved SMs): the one the partial rows are sized for
@@ -1242,6 +1680,16 @@ def _kcp_backward(
     reduce = _reduce_plan(record, C, grid_x, device_index)
     if reduce is not None:
         _launch_trim(reduce, {**values, "main_ctas": grid_x}, device_index)
+    if overlap:
+        work.wait()
+        if int(halo.n_tail_rows) > 0:
+            (halo_name,) = route_modules(arch, KCP_BWD_HALO)
+            _launch_with_grid(
+                halo_name,
+                {**values, "tail_row_off": tail_row_off},
+                grid=_loader.head_grid(_loader.MODULES[halo_name], n_frag=n_frag, C=C),
+                device_index=device_index,
+            )
     return dx_out, dw_out
 
 
@@ -1416,9 +1864,13 @@ def _bwd_main(
     S: int,
     C: int,
     device: torch.device,
+    deferred: bool = False,
 ) -> None:
     """Wait ``work`` (when given) and launch the main backward programs of a call with ``S > 0`` (``dx`` with the
-    received ``dpre_tail`` rows folded in, and the rank's fixed-order FP32 ``dweight`` partial)."""
+    received ``dpre_tail`` rows folded in, and the rank's fixed-order FP32 ``dweight`` partial).  ``deferred``: the
+    overlapped backward's main launch (:func:`_overlapped`): no wait and every ``tail_row_off`` entry ``-1``, so the
+    programs read no received row and write a fragment's last rows as at a document end (:func:`_bwd_tail` writes
+    them again after the wait); ``dpre_tail`` is then only a valid pointer."""
     partial = torch.empty((e["rows"], C, WIDTH), dtype=torch.float32, device=device)
     values: dict[str, Any] = {
         "x": x_flat,
@@ -1433,15 +1885,106 @@ def _bwd_main(
         "dpre_tail": dpre_tail
         if dpre_tail.shape[0]
         else _pool(0, C, dtype=torch.float32, device=device),
-        "tail_row_off": e["tail_row_off"],
+        "tail_row_off": _no_tail(e, device) if deferred else e["tail_row_off"],
         **e["scalars"],
     }
-    if work is not None:
+    if work is not None and not deferred:
         work.wait()
     for info in e["launches"]:
         _launch_trim(info, values, e["device_index"])
     if e["reduce"] is not None:
         _launch_trim(e["reduce"], values, e["device_index"])
+
+
+# The all ``-1`` ``tail_row_off`` rows of the overlapped backward and ``hist_row_off`` rows of the overlapped forward's
+# ``kcp_fwd`` main program on the trimmed host path, per device index: grow-only buffers, none ever freed, shared by
+# both (each host-cache entry names its rows under its own key).  A captured graph keeps the pointer of the rows it
+# read, and the host cache may drop the entry that named them (:func:`cake_causal_conv1d_det_train_kcp_host_cache_clear`,
+# ``HOST_CACHE_MAX``); unlike the context's tables, nothing else holds them.  Every context and stream of the device
+# reads them (the host cache is not per stream either), so a new buffer is filled on the device's private
+# ``_NO_TAIL_STREAMS`` stream and the host waits for that fill before any call names the buffer: no program on any
+# stream reads it unfilled.
+_NO_TAIL: dict[int, list[torch.Tensor]] = {}
+_NO_TAIL_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def _no_rows(e: dict[str, Any], device: torch.device, key: str) -> torch.Tensor:
+    """An all ``-1`` int32 ``[n_frag, 3]`` row-offset table of the host-cache entry, named by ``e[key]``: the first
+    ``n_frag`` rows of the device's largest ``_NO_TAIL`` buffer (a new one, at least twice the last, when that is too
+    small, filled before this returns), named by the entry at its first overlapped call, then reused.  During a graph
+    capture that finds no buffer large enough (the eager first call of a graph key made one) the call's own table,
+    filled on the capturing stream as in the untrimmed path."""
+    table = e.get(key)
+    if table is None:
+        n = e["n_frag"]
+        idx = e["device_index"]
+        bufs = _NO_TAIL.setdefault(idx, [])
+        if not bufs or bufs[-1].shape[0] < n:
+            if torch.cuda.is_current_stream_capturing():
+                return torch.full((n, HALO), -1, dtype=torch.int32, device=device)
+            rows = max(n, 2 * bufs[-1].shape[0] if bufs else 64)
+            side = _NO_TAIL_STREAMS.get(idx)
+            if side is None:
+                side = _NO_TAIL_STREAMS[idx] = torch.cuda.Stream(device=device)
+            with torch.cuda.stream(side):
+                buf = torch.full((rows, HALO), -1, dtype=torch.int32, device=device)
+            side.synchronize()
+            bufs.append(buf)
+        table = e[key] = bufs[-1][:n]
+    return table
+
+
+def _no_tail(e: dict[str, Any], device: torch.device) -> torch.Tensor:
+    """The overlapped backward's ``tail_row_off`` of the host-cache entry (:func:`_no_rows`, key ``"no_tail"``)."""
+    return _no_rows(e, device, "no_tail")
+
+
+def _no_hist(e: dict[str, Any], device: torch.device) -> torch.Tensor:
+    """The overlapped forward's ``hist_row_off`` of the ``kcp_fwd`` main program (:func:`_no_rows`, key
+    ``"no_hist"``)."""
+    return _no_rows(e, device, "no_hist")
+
+
+def _bwd_tail(
+    e: dict[str, Any],
+    x_flat: torch.Tensor,
+    w: torch.Tensor,
+    dy_flat: torch.Tensor,
+    hist_t: torch.Tensor,
+    dx_out: torch.Tensor,
+    dpre_tail: torch.Tensor,
+    *,
+    S: int,
+    C: int,
+    device: torch.device,
+) -> None:
+    """The overlapped backward's tail-row program, after the exchange's wait: ``dx`` of the last ``min(3, len)`` rows
+    of every fragment with a tail row, written again with the received ``dpre_tail`` rows folded in (nothing when the
+    rank receives no tail row).  Its launch plan is made at the entry's first overlapped call, then reused."""
+    if e["tail_rows"] == 0:
+        return
+    info = e.get("tail_launch")
+    if info is None:
+        (name,) = route_modules(_device_arch(device), KCP_BWD_HALO)
+        grid = _loader.head_grid(_loader.MODULES[name], n_frag=e["n_frag"], C=C)
+        info = e["tail_launch"] = _launch_plan(name, grid, e["device_index"])
+    _launch_trim(
+        info,
+        {
+            "x": x_flat,
+            "w": w,
+            "cu": e["cu"],
+            "dy": dy_flat,
+            "dx": dx_out.view(S, C),
+            "hist": hist_t,
+            "hist_row_off": e["hist_row_off"],
+            "dpre_tail": dpre_tail,
+            "tail_row_off": e["tail_row_off"],
+            "C": C,
+            "num_docs": e["n_frag"],
+        },
+        e["device_index"],
+    )
 
 
 def _kcp_backward_trim(
@@ -1483,6 +2026,7 @@ def _kcp_backward_trim(
             work.wait()
         dw_out.zero_()
         return dx_out, dw_out
+    overlap = _overlapped(cooperative, work)
     _bwd_main(
         e,
         x_flat,
@@ -1496,7 +2040,13 @@ def _kcp_backward_trim(
         S=S,
         C=C,
         device=device,
+        deferred=overlap,
     )
+    if overlap:
+        work.wait()
+        _bwd_tail(
+            e, x_flat, w, dy_flat, hist_t, dx_out, dpre_tail, S=S, C=C, device=device
+        )
     return dx_out, dw_out
 
 
@@ -1602,12 +2152,15 @@ def cake_causal_conv1d_det_kcp(
         backward that needs it is pending.
     cooperative : bool, optional
         The launch form of the backward's main program (the forward is the same either way).  ``None`` (default):
-        :data:`COOPERATIVE_DEFAULT`.  ``True``: one cooperative launch; it starts only when every CTA fits at once,
-        so it waits for any kernel of another stream that occupies an SM.  ``False``: an ordinary launch one SM
-        short of co-resident plus a fixed-order reduce program on the same stream; it starts beside a small kernel
-        of another stream.  ``dx`` is bitwise the same in both forms.  ``dweight`` is reproducible and within the
-        same FP64-oracle bound in each form, but its bits differ between the forms (each form sums its own partial
-        rows), so keep one form for runs whose ``dweight`` bits must match.
+        :data:`COOPERATIVE_DEFAULT`, ``False``.  ``False``: an ordinary launch one SM short of co-resident plus a
+        fixed-order reduce program on the same stream; it starts beside a small kernel of another stream.
+        ``True``: one cooperative launch; it starts only when every CTA fits at once, so it waits for any kernel of
+        another stream that occupies an SM.  ``dx`` is bitwise the same in both forms.  ``dweight`` is reproducible
+        and within the same FP64-oracle bound in each form, but its bits differ between the forms (each form sums
+        its own partial rows), so keep one form for runs whose ``dweight`` bits must match.  Every rank of
+        ``ctx.group`` passes the same value (one launch form per layer of the group; the form changes no
+        collective, so a mismatch does not hang, but the ranks' ``dweight`` partials then mix two reduction
+        orders).
 
     Returns
     -------
@@ -1701,7 +2254,13 @@ def cake_causal_conv1d_det_train_kcp_multi_forward(
     mode = _graph_mode(graph)
     if mode == "off":
         return _kcp_forward_multi(xs, weights, ctx, outs=outs)
-    entry = _graph_entry("fwd_multi", ctx, (*xs, *weights, *outs), mode)
+    entry = _graph_entry(
+        "fwd_multi",
+        ctx,
+        (*xs, *weights, *outs),
+        mode,
+        variant=_fwd_variant(xs[0], multi=True),
+    )
     ys, hists = _graph_run(
         "fwd_multi",
         entry,
@@ -1723,18 +2282,32 @@ def _kcp_forward_multi(
     _hists: Optional[tuple[torch.Tensor, ...]] = None,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
     """The multi forward's host flow (eagerly or inside a capture): per-tensor operand checks, the packed gather, one
-    exchange, one wait, the per-tensor unpack copies and the single call's forward kernel per tensor.  ``_hists``:
-    the pools a recompute handle stored (checked by :func:`_handle_hists`): no gather, no exchange, no wait."""
+    exchange, one wait, the per-tensor unpack copies and the single call's forward programs per tensor in the waiting
+    form; in the overlapped forward (``MULTI_FWD_OVERLAP_ARCHS`` or the ``fwd_overlap`` knob, an exchange in flight)
+    the first tensor's main program runs before the wait and its history-row program after it.  ``_hists``: the pools
+    a recompute handle stored (checked by :func:`_handle_hists`): no gather, no exchange, no wait."""
 
     device = _require_tensor(xs[0], "xs[0]").device
     _wait_ready(ctx)
     calls = [
-        _fwd_host(x, w, ctx, out=o, device=device)
+        _fwd_host(x, w, ctx, out=o, device=device, multi=True)
         for x, w, o in zip(xs, weights, outs, strict=True)
     ]
     S = calls[0][0]
     widths = [c[1] for c in calls]
+    # one counter buffer for every tensor's single-rank main program (launched in stream order), sized once
+    counters = (
+        _forward_work(
+            None,
+            max(c[5]["words"] for c in calls),
+            device=device,
+            device_index=calls[0][5]["device_index"],
+        )
+        if S > 0
+        else None
+    )
     work = None
+    overlap = False
     if _hists is not None:
         hists = list(_hists)
     elif int(ctx.world_size) == 1:
@@ -1751,14 +2324,42 @@ def _kcp_forward_multi(
             recv_splits=e0["recv_splits"],
             ctx=ctx,
         )
+        overlap = S > 0 and work is not None and e0["overlap"]
+        if overlap:
+            # the first tensor's main program while the exchange is in flight; the others wait, so that the call adds
+            # the history-row program of one tensor, not of every tensor
+            S0, C0, x0, w0, y0, _ = calls[0]
+            _fwd_main(
+                e0, x0, w0, y0, None, counters, S=S0, C=C0, device=device, deferred=True
+            )
         if work is not None:
             work.wait()
         hists = _unpack(recv, widths) if len(calls) > 1 else [recv]
     ys = tuple(c[4] for c in calls)
     if S == 0:
+        _fwd_record("fwd_multi", None, False, False)
         return ys, tuple(hists)
-    for (S_i, C, x_flat, w, y, e), hist in zip(calls, hists, strict=True):
-        _fwd_launch(e, x_flat, w, y, hist, None, S=S_i, C=C, device=device)
+    repair = False
+    for i, ((S_i, C, x_flat, w, y, e), hist) in enumerate(
+        zip(calls, hists, strict=True)
+    ):
+        if overlap and i == 0:
+            ran = _fwd_repair(e, x_flat, w, y, hist, S=S_i, C=C, device=device)
+        else:
+            ran = _fwd_launch(
+                e,
+                x_flat,
+                w,
+                y,
+                hist,
+                None,
+                S=S_i,
+                C=C,
+                device=device,
+                counters=counters,
+            )
+        repair = repair or ran
+    _fwd_record("fwd_multi", calls[0][5]["sr"], overlap, repair)
     return ys, tuple(hists)
 
 
@@ -1779,7 +2380,10 @@ def cake_causal_conv1d_det_train_kcp_multi_backward(
 
     The head programs of every tensor run first, their send rows travel packed in one exchange, and after the wait
     each tensor's received rows are copied out and folded by that tensor's main backward programs (own partial
-    workspace, fixed order).  ``hists`` are the forward's pools.  Every rank calls this function once per layer, in
+    workspace, fixed order); in the overlapped backward (``cooperative=False`` at more than one rank) the first
+    tensor's main programs run while the exchange is in flight and its tail-row program folds its copied-out rows
+    after the wait, before the other tensors' main programs (one tail-row program per call, as in the single
+    entry).  ``hists`` are the forward's pools.  Every rank calls this function once per layer, in
     the same order.  ``graph`` and ``cooperative`` (one launch form for every tensor) as in
     :func:`cake_causal_conv1d_det_train_kcp_backward`.
     """
@@ -1804,7 +2408,7 @@ def cake_causal_conv1d_det_train_kcp_multi_backward(
         ctx,
         (*xs, *weights, *dys, *hists, *dxs, *dweights),
         mode,
-        variant=coop,
+        variant=_bwd_variant(coop),
     )
     dx_out, dw_out = _graph_run(
         "bwd_multi",
@@ -1855,6 +2459,7 @@ def _kcp_backward_multi(
     e0 = calls[0][8]
     n_head = e0["n_head"]
     work = None
+    recv = None
     if int(ctx.world_size) == 1:
         tails = [h[:n_head] for h in heads]
     else:
@@ -1870,21 +2475,61 @@ def _kcp_backward_multi(
             recv_splits=e0["recv_splits"],
             ctx=ctx,
         )
-        if work is not None:
-            work.wait()
-        tails = _unpack(recv, [c[1] for c in calls]) if len(calls) > 1 else [recv]
     dx_out = tuple(c[6] for c in calls)
     dw_out = tuple(c[7] for c in calls)
     if calls[0][0] == 0:
+        if work is not None:
+            work.wait()
         for dw in dw_out:
             dw.zero_()
         return dx_out, dw_out
-    for (S, C, x_flat, w, dy_flat, hist_t, dx, dw, e), tail in zip(
-        calls, tails, strict=True
-    ):
+    overlap = (
+        _overlapped(cooperative, work)
+        and _device_arch(device) in MULTI_BWD_OVERLAP_ARCHS
+    )
+    if overlap:
+        # the first tensor's main programs while the exchange is in flight (its head pool: a valid, unread
+        # dpre_tail); the others wait, so that the call adds one tail-row program, not one per tensor
+        S, C, x_flat, w, dy_flat, hist_t, dx, dw, e = calls[0]
         _bwd_main(
-            e, x_flat, w, dy_flat, hist_t, dx, dw, tail, None, S=S, C=C, device=device
+            e,
+            x_flat,
+            w,
+            dy_flat,
+            hist_t,
+            dx,
+            dw,
+            heads[0],
+            None,
+            S=S,
+            C=C,
+            device=device,
+            deferred=True,
         )
+    if work is not None:
+        work.wait()
+    if recv is not None:
+        tails = _unpack(recv, [c[1] for c in calls]) if len(calls) > 1 else [recv]
+    for i, ((S, C, x_flat, w, dy_flat, hist_t, dx, dw, e), tail) in enumerate(
+        zip(calls, tails, strict=True)
+    ):
+        if overlap and i == 0:
+            _bwd_tail(e, x_flat, w, dy_flat, hist_t, dx, tail, S=S, C=C, device=device)
+        else:
+            _bwd_main(
+                e,
+                x_flat,
+                w,
+                dy_flat,
+                hist_t,
+                dx,
+                dw,
+                tail,
+                None,
+                S=S,
+                C=C,
+                device=device,
+            )
     return dx_out, dw_out
 
 
@@ -2029,8 +2674,8 @@ def cake_causal_conv1d_det_kcp_multi(
         capture; every rank passes one or none).  The handle may also carry the ``"kda"`` entry of the layer's
         recurrence; a handle's ``"conv"`` entry serves either one multi call or one single call, never both.
     cooperative : bool, optional
-        As in :func:`cake_causal_conv1d_det_kcp`; one launch form for every tensor of the call.  The result is bitwise
-        the single calls with the same ``cooperative``.
+        As in :func:`cake_causal_conv1d_det_kcp` (default ``False``, the same value on every rank); one launch form
+        for every tensor of the call.  The result is bitwise the single calls with the same ``cooperative``.
 
     Returns
     -------

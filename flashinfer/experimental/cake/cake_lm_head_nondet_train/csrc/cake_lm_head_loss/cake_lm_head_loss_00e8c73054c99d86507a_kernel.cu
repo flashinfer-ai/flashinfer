@@ -1022,15 +1022,15 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         if (epi_store_stage == 2) { epi_store_stage = 0; }
                     }
                     if (global_row < m_lim) {
-                        unsigned long long st_off_t = ((unsigned long long)global_row * (unsigned long long)(ldc / 256) + (unsigned long long)bid_n_1) * 2;
+                        unsigned long long st_off_t = ((unsigned long long)global_row * (unsigned long long)(ldc / 256) + (unsigned long long)bid_n_1) * 2ull;
                         STATS_OUT[st_off_t] = pmax;
-                        STATS_OUT[st_off_t + 1] = psum;
+                        STATS_OUT[st_off_t + 1ull] = psum;
 #elif CAKE_LOGITS_MCNT && !CAKE_LOGITS_NOSTATS && !CAKE_LOGITS_NOSTATS_MCNT && !CAKE_LOGITS_SM103
                     }
                     if (global_row < m_lim) {
-                        unsigned long long st_off = ((unsigned long long)global_row * (unsigned long long)(ldc / 256) + (unsigned long long)bid_n_1) * 2;
+                        unsigned long long st_off = ((unsigned long long)global_row * (unsigned long long)(ldc / 256) + (unsigned long long)bid_n_1) * 2ull;
                         STATS_OUT[st_off] = pmax;
-                        STATS_OUT[st_off + 1] = psum;
+                        STATS_OUT[st_off + 1ull] = psum;
 #elif (!CAKE_LOGITS_MCNT && !CAKE_LOGITS_NOSTATS && CAKE_LOGITS_NOSTATS_MCNT && CAKE_LOGITS_SM103) || (!CAKE_LOGITS_MCNT && CAKE_LOGITS_NOSTATS && !CAKE_LOGITS_NOSTATS_MCNT && CAKE_LOGITS_SM103)
                         asm volatile("barrier.sync 8, 128;" ::: "memory");
                         asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1114,15 +1114,15 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         if (epi_store_stage == 2) { epi_store_stage = 0; }
                     }
                     if (global_row < M) {
-                        unsigned long long st_off_t = ((unsigned long long)global_row * (unsigned long long)(ldc / 256) + (unsigned long long)bid_n_1) * 2;
+                        unsigned long long st_off_t = ((unsigned long long)global_row * (unsigned long long)(ldc / 256) + (unsigned long long)bid_n_1) * 2ull;
                         STATS_OUT[st_off_t] = pmax;
-                        STATS_OUT[st_off_t + 1] = psum;
+                        STATS_OUT[st_off_t + 1ull] = psum;
 #elif !CAKE_LOGITS_MCNT && !CAKE_LOGITS_NOSTATS && !CAKE_LOGITS_NOSTATS_MCNT && !CAKE_LOGITS_SM103
                     }
                     if (global_row < M) {
-                        unsigned long long st_off = ((unsigned long long)global_row * (unsigned long long)(ldc / 256) + (unsigned long long)bid_n_1) * 2;
+                        unsigned long long st_off = ((unsigned long long)global_row * (unsigned long long)(ldc / 256) + (unsigned long long)bid_n_1) * 2ull;
                         STATS_OUT[st_off] = pmax;
-                        STATS_OUT[st_off + 1] = psum;
+                        STATS_OUT[st_off + 1ull] = psum;
 #endif  // CAKE_LOGITS_MCNT, CAKE_LOGITS_NOSTATS, CAKE_LOGITS_NOSTATS_MCNT, CAKE_LOGITS_SM103
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");

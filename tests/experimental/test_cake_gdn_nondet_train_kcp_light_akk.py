@@ -13,10 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-CPU tests of the opt-in ``save_mode="light_akk"`` of the non-deterministic KCP GDN package
+CPU tests of ``save_mode="light_akk"`` of the non-deterministic KCP GDN package
 (``flashinfer.experimental.cake.cake_gdn_nondet_train_kcp``, ``use_qk_l2norm_in_kernel=True``): the forward keeps #1's BF16
 ``Akk`` tape and the light replay runs ``fwd_prep_replay_l2n`` (#1_l2n reading that tape instead of forming it).
 
+* the default: a call with the in-kernel norm that leaves ``save_mode`` unset runs ``"light_akk"`` (the options, the
+  entries, autograd, the checkpoint form and the byte queries); without the norm it runs ``"light"``; explicit values
+  keep their meaning;
 * the fake program: every output but ``akk`` bitwise #1_l2n's, ``akk`` read and never written, and a changed tape
   changes ``w`` / ``u`` (it is read);
 * the host on the fake backend: ``"light_akk"`` is bitwise ``"light"`` in every form (saved pass, ``save_transfer``
@@ -46,7 +49,7 @@ import torch
 
 def _mod(sub: str | None = None):
     """The package (or one of its modules) through the test-helper registry: a stale entry fails here, never skips."""
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     return cake_package("cake_gdn_nondet_train_kcp", sub)
 
@@ -213,6 +216,7 @@ def test_the_tier_and_the_program_are_registered() -> None:
     assert (
         opt.SAVE_MODES == ("light", "light_akk", "full")
         and opt.SAVE_MODE_DEFAULT == "light"
+        and opt.SAVE_MODE_DEFAULT_L2N == "light_akk"
     )
     assert (
         opt.SAVE_MODES_AKK == ("light_akk",)
@@ -282,6 +286,76 @@ def test_light_akk_needs_the_norm() -> None:
         query(ctx, H_qk=2, HV=6, save_mode="light_akk", **L2N)
 
 
+def test_light_akk_is_the_default_with_the_norm() -> None:
+    """A call with the in-kernel norm that leaves ``save_mode`` unset runs ``"light_akk"``, a call without the norm runs
+    ``"light"`` (``None`` is the unset value of the options, of the entries' ``save_mode`` keyword and of the byte
+    queries); an explicit value keeps its meaning; an options instance that left the mode unset resolves it again
+    when a call merges ``use_qk_l2norm_in_kernel`` into it."""
+    mo = kcp.make_options
+    assert opt.default_save_mode(True) == "light_akk"
+    assert opt.default_save_mode(False) == "light"
+    assert mo(**L2N).save_mode == "light_akk" and mo().save_mode == "light"
+    assert mo(save_mode=None, **L2N).save_mode == "light_akk"
+    assert mo(save_mode=None).save_mode == "light"
+    assert opt.CakeGDNNondetKcpOptions(**L2N).save_mode == "light_akk"
+    assert opt.CakeGDNNondetKcpOptions().save_mode == "light"
+    for mode in opt.SAVE_MODES:
+        assert mo(save_mode=mode, **L2N).save_mode == mode
+    assert mo(save_mode="light").save_mode == "light"
+    assert mo(save_mode="full").save_mode == "full"
+    assert mo(**L2N).key() == mo(save_mode="light_akk", **L2N).key()
+    assert mo(**L2N).key() != mo(save_mode="light", **L2N).key()
+    unset = opt.CakeGDNNondetKcpOptions(backend="fake")
+    assert mo(unset, **L2N).save_mode == "light_akk"
+    assert mo(mo(unset, **L2N), use_qk_l2norm_in_kernel=False).save_mode == "light"
+    explicit = opt.CakeGDNNondetKcpOptions(backend="fake", save_mode="light")
+    assert mo(explicit, **L2N).save_mode == "light"
+    # the entries
+    ctx, ops = _setup()
+    out, saved = _fwd(ctx, ops)
+    assert saved.save_mode == "light_akk" and len(saved.tapes) == 1
+    _bwd(ctx, ops, saved)
+    bwd = kcp.LAST_CALL["bwd"]
+    assert bwd["save_mode"] == "light_akk" and bwd["akk_source"] == "saved"
+    assert REPLAY in bwd["sequence"]
+    _o, light = _fwd(ctx, ops, save_mode="light")
+    assert saved.bytes - light.bytes == int(ctx.R) * ops["v"].shape[1] * 128
+    _o, off = kcp.cake_gdn_nondet_train_kcp_forward(*_ops(ops), ctx, backend="fake")
+    assert off.save_mode == "light"
+    # autograd: the direct node runs the mode, a non-reentrant checkpoint saves as "light"; the same bits
+    direct = _autograd(ctx, ops, ckpt=False)
+    assert kcp.LAST_CALL["bwd"]["save_mode"] == "light_akk"
+    assert kcp.LAST_CALL["bwd"]["akk_source"] == "saved"
+    a_light = _autograd(ctx, ops, ckpt=False, save_mode="light")
+    _same(direct, a_light, "default vs light")
+    ckpt = _autograd(ctx, ops, ckpt=True)
+    assert kcp.LAST_CALL["bwd"]["save_mode"] == "light"
+    assert kcp.LAST_CALL["bwd"]["akk_source"] is None
+    _same(direct, ckpt, "checkpointed default")
+    # the byte queries: unset is the call's default
+    H_qk, HV = ops["q"].shape[1], ops["v"].shape[1]
+    for query in (
+        gbytes.cake_gdn_nondet_train_kcp_saved_layout,
+        gbytes.cake_gdn_nondet_train_kcp_workspace_layout,
+        gbytes.cake_gdn_nondet_train_kcp_saved_bytes,
+        gbytes.cake_gdn_nondet_train_kcp_workspace_bytes,
+    ):
+        want = query(ctx, H_qk=H_qk, HV=HV, save_mode="light_akk", **L2N)
+        assert query(ctx, H_qk=H_qk, HV=HV, **L2N) == want, query.__name__
+        assert query(ctx, H_qk=H_qk, HV=HV, save_mode=None, **L2N) == want
+        assert query(ctx, H_qk=H_qk, HV=HV) == query(
+            ctx, H_qk=H_qk, HV=HV, save_mode="light"
+        ), query.__name__
+    for query in (
+        kcp.cake_gdn_nondet_kcp,
+        kcp.cake_gdn_nondet_train_kcp_forward,
+        kcp.cake_gdn_nondet_train_kcp_backward,
+        gbytes.cake_gdn_nondet_train_kcp_saved_bytes,
+        gbytes.cake_gdn_nondet_train_kcp_workspace_bytes,
+    ):
+        assert inspect.signature(query).parameters["save_mode"].default is None
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # the fake program
 
@@ -347,7 +421,7 @@ def test_light_akk_is_bitwise_light(segments, save_transfer, monkeypatch) -> Non
     )
     ctx, ops = _setup()
     o = dict(segments=segments, save_transfer=save_transfer)
-    ref = _saved_pass(ctx, ops, **o)
+    ref = _saved_pass(ctx, ops, save_mode="light", **o)
     got = _saved_pass(ctx, ops, save_mode="light_akk", **o)
     _same(ref, got, f"light_akk segments={segments} save_transfer={save_transfer}")
     assert got["bwd"]["akk_source"] == "saved" and ref["bwd"]["akk_source"] is None
@@ -375,7 +449,7 @@ def test_light_akk_autograd_checkpoint_and_replay_boundary() -> None:
     """Autograd: the replay runs; under a non-reentrant checkpoint the mode saves as "light" (the recompute's set,
     the kept hand-off of ``reuse_recompute_tapes=True`` applies); ``boundary_mode="replay"`` keeps nothing."""
     ctx, ops = _setup()
-    direct = _autograd(ctx, ops, ckpt=False)
+    direct = _autograd(ctx, ops, ckpt=False, save_mode="light")
     got = _autograd(ctx, ops, ckpt=False, save_mode="light_akk")
     _same(direct, got, "autograd")
     assert (
@@ -462,7 +536,7 @@ def test_saved_tape_reaches_the_gradients() -> None:
 def test_saved_set_round_trip_and_refusals() -> None:
     ctx, ops = _setup()
     _o, saved = _fwd(ctx, ops, save_mode="light_akk")
-    _o, light = _fwd(ctx, ops)
+    _o, light = _fwd(ctx, ops, save_mode="light")
     assert saved.flags() == light.flags() == (True, False, True)
     assert len(saved.tensors()) == len(light.tensors()) + 1
     back = kcp.CakeGDNNondetKcpSaved.from_tensors(
@@ -473,9 +547,12 @@ def test_saved_set_round_trip_and_refusals() -> None:
         light.tape("akk")
     # a set of the other mode, a missing tape and a tape of another shape are refused
     with pytest.raises(ValueError, match="save_mode"):
-        _bwd(ctx, ops, saved)
+        _bwd(ctx, ops, saved, save_mode="light")
     with pytest.raises(ValueError, match="save_mode"):
         _bwd(ctx, ops, light, save_mode="light_akk")
+    # the default with the norm is "light_akk"
+    with pytest.raises(ValueError, match="save_mode"):
+        _bwd(ctx, ops, light)
     with pytest.raises(ValueError, match="saved tapes"):
         _bwd(ctx, ops, dataclasses.replace(saved, tapes=()), save_mode="light_akk")
     with pytest.raises(ValueError, match="akk"):
@@ -504,7 +581,7 @@ def test_saved_bytes_gain_the_akk_tape() -> None:
     akk = int(ctx.R) * HV * 64 * 2
     for o in ({}, {"save_transfer": False}, {"segments": 2}):
         _x, saved = _fwd(ctx, ops, save_mode="light_akk", **o)
-        _x, light = _fwd(ctx, ops, **o)
+        _x, light = _fwd(ctx, ops, save_mode="light", **o)
         assert saved.bytes - light.bytes == akk == saved.tape("akk").numel() * 2
         kw = {k: v for k, v in o.items() if k != "segments"}
         if "segments" in o:
@@ -513,7 +590,7 @@ def test_saved_bytes_gain_the_akk_tape() -> None:
             ctx, H_qk=H_qk, HV=HV, save_mode="light_akk", with_conv=False, **L2N, **kw
         )
         base = gbytes.cake_gdn_nondet_train_kcp_saved_layout(
-            ctx, H_qk=H_qk, HV=HV, with_conv=False, **L2N, **kw
+            ctx, H_qk=H_qk, HV=HV, save_mode="light", with_conv=False, **L2N, **kw
         )
         assert lay["akk"] == akk and {k: v for k, v in lay.items() if k != "akk"} == {
             k: v for k, v in base.items() if k != "akk"
@@ -527,7 +604,7 @@ def test_saved_bytes_gain_the_akk_tape() -> None:
     assert gbytes.cake_gdn_nondet_train_kcp_saved_bytes(
         ctx, H_qk=H_qk, HV=HV, save_mode="light_akk", boundary_mode="replay", **L2N
     ) == gbytes.cake_gdn_nondet_train_kcp_saved_bytes(
-        ctx, H_qk=H_qk, HV=HV, boundary_mode="replay", **L2N
+        ctx, H_qk=H_qk, HV=HV, save_mode="light", boundary_mode="replay", **L2N
     )
 
 
@@ -542,7 +619,7 @@ def test_workspace_layout_loses_the_akk_arena_tape() -> None:
         {"reuse_recompute_tapes": False},
     ):
         light = gbytes.cake_gdn_nondet_train_kcp_workspace_layout(
-            ctx, H_qk=H_qk, HV=HV, **L2N, **kw
+            ctx, H_qk=H_qk, HV=HV, save_mode="light", **L2N, **kw
         )
         got = gbytes.cake_gdn_nondet_train_kcp_workspace_layout(
             ctx, H_qk=H_qk, HV=HV, save_mode="light_akk", **L2N, **kw
@@ -560,7 +637,7 @@ def test_workspace_layout_loses_the_akk_arena_tape() -> None:
         assert light["backward"] - got["backward"] == akk, kw
     # without a saved set the mode is the light form
     a = gbytes.cake_gdn_nondet_train_kcp_workspace_layout(
-        ctx, H_qk=H_qk, HV=HV, save_for_backward=False, **L2N
+        ctx, H_qk=H_qk, HV=HV, save_for_backward=False, save_mode="light", **L2N
     )
     b = gbytes.cake_gdn_nondet_train_kcp_workspace_layout(
         ctx, H_qk=H_qk, HV=HV, save_for_backward=False, save_mode="light_akk", **L2N
@@ -668,7 +745,9 @@ def test_checkpointed_light_akk_binds_the_light_figure(reuse) -> None:
         assert REPLAY not in kcp.LAST_CALL["bwd"]["sequence"], mode
         peaks[mode] = (fwd_peak, ws.peak)
     q = dict(H_qk=H_qk, HV=HV, reuse_recompute_tapes=reuse, with_conv=False, **L2N)
-    light = gbytes.cake_gdn_nondet_train_kcp_workspace_layout(ctx, **q)
+    light = gbytes.cake_gdn_nondet_train_kcp_workspace_layout(
+        ctx, save_mode="light", **q
+    )
     akk = gbytes.cake_gdn_nondet_train_kcp_workspace_layout(
         ctx, save_mode="light_akk", **q
     )
@@ -676,5 +755,6 @@ def test_checkpointed_light_akk_binds_the_light_figure(reuse) -> None:
     assert peaks["light_akk"] == (light["forward"], light["backward"]), (peaks, light)
     assert peaks["light_akk"] != (akk["forward"], akk["backward"]), (peaks, akk)
     assert (
-        gbytes.cake_gdn_nondet_train_kcp_workspace_bytes(ctx, **q) == light["workspace"]
+        gbytes.cake_gdn_nondet_train_kcp_workspace_bytes(ctx, save_mode="light", **q)
+        == light["workspace"]
     )

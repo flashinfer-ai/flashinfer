@@ -111,10 +111,10 @@ kernel_cake_gdn_det_train_fe2b7d6be2d3f66c37f6(__nv_bfloat16* __restrict__ qn, _
             }
             long long tok_a = (long long)(tok0 + row_a);
             long long tok_b = (long long)(tok0 + row_b_src);
-            long long qbase_a = (tok_a * (long long)num_heads + (long long)hq) * 128 + (long long)(lane_0 * 4);
-            long long qbase_b = (tok_b * (long long)num_heads + (long long)hq) * 128 + (long long)(lane_0 * 4);
-            long long vbase_a = (tok_a * (long long)num_v_heads + (long long)hv0) * 128 + (long long)(lane_0 * 4);
-            long long vbase_b = (tok_b * (long long)num_v_heads + (long long)hv0) * 128 + (long long)(lane_0 * 4);
+            long long qbase_a = (tok_a * (long long)num_heads + (long long)hq) * 128ll + (long long)(lane_0 * 4);
+            long long qbase_b = (tok_b * (long long)num_heads + (long long)hq) * 128ll + (long long)(lane_0 * 4);
+            long long vbase_a = (tok_a * (long long)num_v_heads + (long long)hv0) * 128ll + (long long)(lane_0 * 4);
+            long long vbase_b = (tok_b * (long long)num_v_heads + (long long)hv0) * 128ll + (long long)(lane_0 * 4);
             {
                 uint2 _vld_0;
                 _vld_0 = *reinterpret_cast<const uint2*>(qn + qbase_a);
@@ -221,7 +221,7 @@ kernel_cake_gdn_det_train_fe2b7d6be2d3f66c37f6(__nv_bfloat16* __restrict__ qn, _
             }
             {
                 uint2 _vld_10;
-                _vld_10 = *reinterpret_cast<const uint2*>(dq_hv + vbase_a + 128);
+                _vld_10 = *reinterpret_cast<const uint2*>(dq_hv + vbase_a + 128ll);
                 uint32_t* _vpairs_10 = reinterpret_cast<uint32_t*>(&_vld_10);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -231,7 +231,7 @@ kernel_cake_gdn_det_train_fe2b7d6be2d3f66c37f6(__nv_bfloat16* __restrict__ qn, _
             }
             {
                 uint2 _vld_11;
-                _vld_11 = *reinterpret_cast<const uint2*>(dk_hv + vbase_a + 128);
+                _vld_11 = *reinterpret_cast<const uint2*>(dk_hv + vbase_a + 128ll);
                 uint32_t* _vpairs_11 = reinterpret_cast<uint32_t*>(&_vld_11);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -241,7 +241,7 @@ kernel_cake_gdn_det_train_fe2b7d6be2d3f66c37f6(__nv_bfloat16* __restrict__ qn, _
             }
             {
                 uint2 _vld_12;
-                _vld_12 = *reinterpret_cast<const uint2*>(dk2 + vbase_a + 128);
+                _vld_12 = *reinterpret_cast<const uint2*>(dk2 + vbase_a + 128ll);
                 uint32_t* _vpairs_12 = reinterpret_cast<uint32_t*>(&_vld_12);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -251,7 +251,7 @@ kernel_cake_gdn_det_train_fe2b7d6be2d3f66c37f6(__nv_bfloat16* __restrict__ qn, _
             }
             {
                 uint2 _vld_13;
-                _vld_13 = *reinterpret_cast<const uint2*>(dq_hv + vbase_b + 128);
+                _vld_13 = *reinterpret_cast<const uint2*>(dq_hv + vbase_b + 128ll);
                 uint32_t* _vpairs_13 = reinterpret_cast<uint32_t*>(&_vld_13);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -261,7 +261,7 @@ kernel_cake_gdn_det_train_fe2b7d6be2d3f66c37f6(__nv_bfloat16* __restrict__ qn, _
             }
             {
                 uint2 _vld_14;
-                _vld_14 = *reinterpret_cast<const uint2*>(dk_hv + vbase_b + 128);
+                _vld_14 = *reinterpret_cast<const uint2*>(dk_hv + vbase_b + 128ll);
                 uint32_t* _vpairs_14 = reinterpret_cast<uint32_t*>(&_vld_14);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -271,7 +271,7 @@ kernel_cake_gdn_det_train_fe2b7d6be2d3f66c37f6(__nv_bfloat16* __restrict__ qn, _
             }
             {
                 uint2 _vld_15;
-                _vld_15 = *reinterpret_cast<const uint2*>(dk2 + vbase_b + 128);
+                _vld_15 = *reinterpret_cast<const uint2*>(dk2 + vbase_b + 128ll);
                 uint32_t* _vpairs_15 = reinterpret_cast<uint32_t*>(&_vld_15);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -281,7 +281,7 @@ kernel_cake_gdn_det_train_fe2b7d6be2d3f66c37f6(__nv_bfloat16* __restrict__ qn, _
             }
             {
                 uint2 _vld_16;
-                _vld_16 = *reinterpret_cast<const uint2*>(dq_hv + vbase_a + 256);
+                _vld_16 = *reinterpret_cast<const uint2*>(dq_hv + vbase_a + 256ll);
                 uint32_t* _vpairs_16 = reinterpret_cast<uint32_t*>(&_vld_16);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -291,7 +291,7 @@ kernel_cake_gdn_det_train_fe2b7d6be2d3f66c37f6(__nv_bfloat16* __restrict__ qn, _
             }
             {
                 uint2 _vld_17;
-                _vld_17 = *reinterpret_cast<const uint2*>(dk_hv + vbase_a + 256);
+                _vld_17 = *reinterpret_cast<const uint2*>(dk_hv + vbase_a + 256ll);
                 uint32_t* _vpairs_17 = reinterpret_cast<uint32_t*>(&_vld_17);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -301,7 +301,7 @@ kernel_cake_gdn_det_train_fe2b7d6be2d3f66c37f6(__nv_bfloat16* __restrict__ qn, _
             }
             {
                 uint2 _vld_18;
-                _vld_18 = *reinterpret_cast<const uint2*>(dk2 + vbase_a + 256);
+                _vld_18 = *reinterpret_cast<const uint2*>(dk2 + vbase_a + 256ll);
                 uint32_t* _vpairs_18 = reinterpret_cast<uint32_t*>(&_vld_18);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -311,7 +311,7 @@ kernel_cake_gdn_det_train_fe2b7d6be2d3f66c37f6(__nv_bfloat16* __restrict__ qn, _
             }
             {
                 uint2 _vld_19;
-                _vld_19 = *reinterpret_cast<const uint2*>(dq_hv + vbase_b + 256);
+                _vld_19 = *reinterpret_cast<const uint2*>(dq_hv + vbase_b + 256ll);
                 uint32_t* _vpairs_19 = reinterpret_cast<uint32_t*>(&_vld_19);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -321,7 +321,7 @@ kernel_cake_gdn_det_train_fe2b7d6be2d3f66c37f6(__nv_bfloat16* __restrict__ qn, _
             }
             {
                 uint2 _vld_20;
-                _vld_20 = *reinterpret_cast<const uint2*>(dk_hv + vbase_b + 256);
+                _vld_20 = *reinterpret_cast<const uint2*>(dk_hv + vbase_b + 256ll);
                 uint32_t* _vpairs_20 = reinterpret_cast<uint32_t*>(&_vld_20);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -331,7 +331,7 @@ kernel_cake_gdn_det_train_fe2b7d6be2d3f66c37f6(__nv_bfloat16* __restrict__ qn, _
             }
             {
                 uint2 _vld_21;
-                _vld_21 = *reinterpret_cast<const uint2*>(dk2 + vbase_b + 256);
+                _vld_21 = *reinterpret_cast<const uint2*>(dk2 + vbase_b + 256ll);
                 uint32_t* _vpairs_21 = reinterpret_cast<uint32_t*>(&_vld_21);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {

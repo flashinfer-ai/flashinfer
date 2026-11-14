@@ -130,7 +130,7 @@ kernel_cake_gdn_det_train_59386fc8f5c0cf38d589(__nv_bfloat16* __restrict__ kn, _
     int vloc_a = vwarp * 16 + lane_0 / 4;
     int vrow_a = v0 + vloc_a;
     int vrow_b = vrow_a + 8;
-    long long tok_stride = (long long)num_v_heads * 128;
+    long long tok_stride = (long long)num_v_heads * 128ll;
     int stage_base = s_stage_addr + (unsigned int)(warp_1 * 2048);
     int stage_u32_base = warp_1 * 512;
     unsigned int vw[16];
@@ -143,9 +143,9 @@ kernel_cake_gdn_det_train_59386fc8f5c0cf38d589(__nv_bfloat16* __restrict__ kn, _
     unsigned int b_frag_mn[4];
     float g_next[1];
     float g_far[1];
-    long long in_base = ((long long)seg * (long long)num_v_heads + (long long)hv) * 16384;
+    long long in_base = ((long long)seg * (long long)num_v_heads + (long long)hv) * 16384ll;
     int _max_0 = ((seq) > (0) ? (seq) : (0));
-    long long out_base = ((long long)_max_0 * (long long)num_v_heads + (long long)hv) * 16384;
+    long long out_base = ((long long)_max_0 * (long long)num_v_heads + (long long)hv) * 16384ll;
     acc_h[0] = 0.0f;
     acc_h[1] = 0.0f;
     acc_h[2] = 0.0f;
@@ -182,10 +182,10 @@ kernel_cake_gdn_det_train_59386fc8f5c0cf38d589(__nv_bfloat16* __restrict__ kn, _
         #pragma unroll
         for (int nb = 0; nb < 8; nb++) {
             int kcol = kbase + nb * 8 + quad * 2;
-            acc_h[nb * 4] = h0[in_base + (long long)kcol * 128 + (long long)vrow_a];
-            acc_h[nb * 4 + 1] = h0[in_base + (long long)(kcol + 1) * 128 + (long long)vrow_a];
-            acc_h[nb * 4 + 2] = h0[in_base + (long long)kcol * 128 + (long long)vrow_b];
-            acc_h[nb * 4 + 3] = h0[in_base + (long long)(kcol + 1) * 128 + (long long)vrow_b];
+            acc_h[nb * 4] = h0[in_base + (long long)kcol * 128ll + (long long)vrow_a];
+            acc_h[nb * 4 + 1] = h0[in_base + (long long)(kcol + 1) * 128ll + (long long)vrow_a];
+            acc_h[nb * 4 + 2] = h0[in_base + (long long)kcol * 128ll + (long long)vrow_b];
+            acc_h[nb * 4 + 3] = h0[in_base + (long long)(kcol + 1) * 128ll + (long long)vrow_b];
         }
     }
     int num_chunks = c_end - c_begin;
@@ -200,55 +200,55 @@ kernel_cake_gdn_det_train_59386fc8f5c0cf38d589(__nv_bfloat16* __restrict__ kn, _
     int _min_0 = ((seq_len) < (64) ? (seq_len) : (64));
     int r0 = tid / 16;
     int c0 = tid % 16 * 8;
-    long long row_stride = (long long)num_v_heads * 128;
-    long long src_row = (long long)(seq_tok0 + r0) * row_stride + (long long)hv * 128 + (long long)c0;
+    long long row_stride = (long long)num_v_heads * 128ll;
+    long long src_row = (long long)(seq_tok0 + r0) * row_stride + (long long)hv * 128ll + (long long)c0;
     int dst0_0 = s_w_addr + (unsigned int)stage_off + (unsigned int)(c0 / 64 * 8192 + (r0 * 128 + c0 % 64 * 2 ^ (r0 * 128 + c0 % 64 * 2 >> 7 & 7) << 4));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
         :: "r"(dst0_0), "l"(w + src_row), "r"((_min_0 > r0) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0_0 + 1024), "l"(w + (src_row + 8 * row_stride)), "r"((_min_0 > r0 + 8) ? 16 : 0));
+        :: "r"(dst0_0 + 1024), "l"(w + (src_row + 8ll * row_stride)), "r"((_min_0 > r0 + 8) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0_0 + 2048), "l"(w + (src_row + 16 * row_stride)), "r"((_min_0 > r0 + 16) ? 16 : 0));
+        :: "r"(dst0_0 + 2048), "l"(w + (src_row + 16ll * row_stride)), "r"((_min_0 > r0 + 16) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0_0 + 3072), "l"(w + (src_row + 24 * row_stride)), "r"((_min_0 > r0 + 24) ? 16 : 0));
+        :: "r"(dst0_0 + 3072), "l"(w + (src_row + 24ll * row_stride)), "r"((_min_0 > r0 + 24) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0_0 + 4096), "l"(w + (src_row + 32 * row_stride)), "r"((_min_0 > r0 + 32) ? 16 : 0));
+        :: "r"(dst0_0 + 4096), "l"(w + (src_row + 32ll * row_stride)), "r"((_min_0 > r0 + 32) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0_0 + 5120), "l"(w + (src_row + 40 * row_stride)), "r"((_min_0 > r0 + 40) ? 16 : 0));
+        :: "r"(dst0_0 + 5120), "l"(w + (src_row + 40ll * row_stride)), "r"((_min_0 > r0 + 40) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0_0 + 6144), "l"(w + (src_row + 48 * row_stride)), "r"((_min_0 > r0 + 48) ? 16 : 0));
+        :: "r"(dst0_0 + 6144), "l"(w + (src_row + 48ll * row_stride)), "r"((_min_0 > r0 + 48) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0_0 + 7168), "l"(w + (src_row + 56 * row_stride)), "r"((_min_0 > r0 + 56) ? 16 : 0));
+        :: "r"(dst0_0 + 7168), "l"(w + (src_row + 56ll * row_stride)), "r"((_min_0 > r0 + 56) ? 16 : 0));
     int r0_0 = tid / 16;
     int c0_0 = tid % 16 * 8;
-    long long row_stride_0 = (long long)num_heads * 128;
-    long long src_row_0 = (long long)(seq_tok0 + r0_0) * row_stride_0 + (long long)hq * 128 + (long long)c0_0;
+    long long row_stride_0 = (long long)num_heads * 128ll;
+    long long src_row_0 = (long long)(seq_tok0 + r0_0) * row_stride_0 + (long long)hq * 128ll + (long long)c0_0;
     int dst0_1 = s_kn_addr + (unsigned int)stage_off + (unsigned int)(c0_0 / 64 * 8192 + (r0_0 * 128 + c0_0 % 64 * 2 ^ (r0_0 * 128 + c0_0 % 64 * 2 >> 7 & 7) << 4));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
         :: "r"(dst0_1), "l"(kn + src_row_0), "r"((_min_0 > r0_0) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0_1 + 1024), "l"(kn + (src_row_0 + 8 * row_stride_0)), "r"((_min_0 > r0_0 + 8) ? 16 : 0));
+        :: "r"(dst0_1 + 1024), "l"(kn + (src_row_0 + 8ll * row_stride_0)), "r"((_min_0 > r0_0 + 8) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0_1 + 2048), "l"(kn + (src_row_0 + 16 * row_stride_0)), "r"((_min_0 > r0_0 + 16) ? 16 : 0));
+        :: "r"(dst0_1 + 2048), "l"(kn + (src_row_0 + 16ll * row_stride_0)), "r"((_min_0 > r0_0 + 16) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0_1 + 3072), "l"(kn + (src_row_0 + 24 * row_stride_0)), "r"((_min_0 > r0_0 + 24) ? 16 : 0));
+        :: "r"(dst0_1 + 3072), "l"(kn + (src_row_0 + 24ll * row_stride_0)), "r"((_min_0 > r0_0 + 24) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0_1 + 4096), "l"(kn + (src_row_0 + 32 * row_stride_0)), "r"((_min_0 > r0_0 + 32) ? 16 : 0));
+        :: "r"(dst0_1 + 4096), "l"(kn + (src_row_0 + 32ll * row_stride_0)), "r"((_min_0 > r0_0 + 32) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0_1 + 5120), "l"(kn + (src_row_0 + 40 * row_stride_0)), "r"((_min_0 > r0_0 + 40) ? 16 : 0));
+        :: "r"(dst0_1 + 5120), "l"(kn + (src_row_0 + 40ll * row_stride_0)), "r"((_min_0 > r0_0 + 40) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0_1 + 6144), "l"(kn + (src_row_0 + 48 * row_stride_0)), "r"((_min_0 > r0_0 + 48) ? 16 : 0));
+        :: "r"(dst0_1 + 6144), "l"(kn + (src_row_0 + 48ll * row_stride_0)), "r"((_min_0 > r0_0 + 48) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0_1 + 7168), "l"(kn + (src_row_0 + 56 * row_stride_0)), "r"((_min_0 > r0_0 + 56) ? 16 : 0));
+        :: "r"(dst0_1 + 7168), "l"(kn + (src_row_0 + 56ll * row_stride_0)), "r"((_min_0 > r0_0 + 56) ? 16 : 0));
     int r0_1 = tid / 4;
     int c0_1 = tid % 4 * 8;
-    long long row_stride_1 = (long long)num_v_heads * 128;
-    long long src_row_1 = (long long)(seq_tok0 + r0_1) * row_stride_1 + (long long)hv * 128 + (long long)v0 + (long long)c0_1;
+    long long row_stride_1 = (long long)num_v_heads * 128ll;
+    long long src_row_1 = (long long)(seq_tok0 + r0_1) * row_stride_1 + (long long)hv * 128ll + (long long)v0 + (long long)c0_1;
     int dst0_2 = s_u_addr + (unsigned int)stage_off + (unsigned int)(c0_1 / 64 * 8192 + (r0_1 * 128 + c0_1 % 64 * 2 ^ (r0_1 * 128 + c0_1 % 64 * 2 >> 7 & 7) << 4));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
         :: "r"(dst0_2), "l"(u + src_row_1), "r"((_min_0 > r0_1) ? 16 : 0));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-        :: "r"(dst0_2 + 4096), "l"(u + (src_row_1 + 32 * row_stride_1)), "r"((_min_0 > r0_1 + 32) ? 16 : 0));
+        :: "r"(dst0_2 + 4096), "l"(u + (src_row_1 + 32ll * row_stride_1)), "r"((_min_0 > r0_1 + 32) ? 16 : 0));
     asm volatile("cp.async.commit_group;");
     int _min_1 = ((seq_len) < (64) ? (seq_len) : (64));
     int tok = tid;
@@ -291,55 +291,55 @@ kernel_cake_gdn_det_train_59386fc8f5c0cf38d589(__nv_bfloat16* __restrict__ kn, _
             int next_len = ((seq_len - (it_chunk + 1) * 64) < (64) ? (seq_len - (it_chunk + 1) * 64) : (64));
             int r0_2 = tid / 16;
             int c0_2 = tid % 16 * 8;
-            long long row_stride_2 = (long long)num_v_heads * 128;
-            long long src_row_2 = (long long)(next_tok0 + r0_2) * row_stride_2 + (long long)hv * 128 + (long long)c0_2;
+            long long row_stride_2 = (long long)num_v_heads * 128ll;
+            long long src_row_2 = (long long)(next_tok0 + r0_2) * row_stride_2 + (long long)hv * 128ll + (long long)c0_2;
             int dst0_3 = s_w_addr + (unsigned int)next_off + (unsigned int)(c0_2 / 64 * 8192 + (r0_2 * 128 + c0_2 % 64 * 2 ^ (r0_2 * 128 + c0_2 % 64 * 2 >> 7 & 7) << 4));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
                 :: "r"(dst0_3), "l"(w + src_row_2), "r"((next_len > r0_2) ? 16 : 0));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(dst0_3 + 1024), "l"(w + (src_row_2 + 8 * row_stride_2)), "r"((next_len > r0_2 + 8) ? 16 : 0));
+                :: "r"(dst0_3 + 1024), "l"(w + (src_row_2 + 8ll * row_stride_2)), "r"((next_len > r0_2 + 8) ? 16 : 0));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(dst0_3 + 2048), "l"(w + (src_row_2 + 16 * row_stride_2)), "r"((next_len > r0_2 + 16) ? 16 : 0));
+                :: "r"(dst0_3 + 2048), "l"(w + (src_row_2 + 16ll * row_stride_2)), "r"((next_len > r0_2 + 16) ? 16 : 0));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(dst0_3 + 3072), "l"(w + (src_row_2 + 24 * row_stride_2)), "r"((next_len > r0_2 + 24) ? 16 : 0));
+                :: "r"(dst0_3 + 3072), "l"(w + (src_row_2 + 24ll * row_stride_2)), "r"((next_len > r0_2 + 24) ? 16 : 0));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(dst0_3 + 4096), "l"(w + (src_row_2 + 32 * row_stride_2)), "r"((next_len > r0_2 + 32) ? 16 : 0));
+                :: "r"(dst0_3 + 4096), "l"(w + (src_row_2 + 32ll * row_stride_2)), "r"((next_len > r0_2 + 32) ? 16 : 0));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(dst0_3 + 5120), "l"(w + (src_row_2 + 40 * row_stride_2)), "r"((next_len > r0_2 + 40) ? 16 : 0));
+                :: "r"(dst0_3 + 5120), "l"(w + (src_row_2 + 40ll * row_stride_2)), "r"((next_len > r0_2 + 40) ? 16 : 0));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(dst0_3 + 6144), "l"(w + (src_row_2 + 48 * row_stride_2)), "r"((next_len > r0_2 + 48) ? 16 : 0));
+                :: "r"(dst0_3 + 6144), "l"(w + (src_row_2 + 48ll * row_stride_2)), "r"((next_len > r0_2 + 48) ? 16 : 0));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(dst0_3 + 7168), "l"(w + (src_row_2 + 56 * row_stride_2)), "r"((next_len > r0_2 + 56) ? 16 : 0));
+                :: "r"(dst0_3 + 7168), "l"(w + (src_row_2 + 56ll * row_stride_2)), "r"((next_len > r0_2 + 56) ? 16 : 0));
             int r0_3 = tid / 16;
             int c0_3 = tid % 16 * 8;
-            long long row_stride_3 = (long long)num_heads * 128;
-            long long src_row_3 = (long long)(next_tok0 + r0_3) * row_stride_3 + (long long)hq * 128 + (long long)c0_3;
+            long long row_stride_3 = (long long)num_heads * 128ll;
+            long long src_row_3 = (long long)(next_tok0 + r0_3) * row_stride_3 + (long long)hq * 128ll + (long long)c0_3;
             int dst0_4 = s_kn_addr + (unsigned int)next_off + (unsigned int)(c0_3 / 64 * 8192 + (r0_3 * 128 + c0_3 % 64 * 2 ^ (r0_3 * 128 + c0_3 % 64 * 2 >> 7 & 7) << 4));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
                 :: "r"(dst0_4), "l"(kn + src_row_3), "r"((next_len > r0_3) ? 16 : 0));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(dst0_4 + 1024), "l"(kn + (src_row_3 + 8 * row_stride_3)), "r"((next_len > r0_3 + 8) ? 16 : 0));
+                :: "r"(dst0_4 + 1024), "l"(kn + (src_row_3 + 8ll * row_stride_3)), "r"((next_len > r0_3 + 8) ? 16 : 0));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(dst0_4 + 2048), "l"(kn + (src_row_3 + 16 * row_stride_3)), "r"((next_len > r0_3 + 16) ? 16 : 0));
+                :: "r"(dst0_4 + 2048), "l"(kn + (src_row_3 + 16ll * row_stride_3)), "r"((next_len > r0_3 + 16) ? 16 : 0));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(dst0_4 + 3072), "l"(kn + (src_row_3 + 24 * row_stride_3)), "r"((next_len > r0_3 + 24) ? 16 : 0));
+                :: "r"(dst0_4 + 3072), "l"(kn + (src_row_3 + 24ll * row_stride_3)), "r"((next_len > r0_3 + 24) ? 16 : 0));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(dst0_4 + 4096), "l"(kn + (src_row_3 + 32 * row_stride_3)), "r"((next_len > r0_3 + 32) ? 16 : 0));
+                :: "r"(dst0_4 + 4096), "l"(kn + (src_row_3 + 32ll * row_stride_3)), "r"((next_len > r0_3 + 32) ? 16 : 0));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(dst0_4 + 5120), "l"(kn + (src_row_3 + 40 * row_stride_3)), "r"((next_len > r0_3 + 40) ? 16 : 0));
+                :: "r"(dst0_4 + 5120), "l"(kn + (src_row_3 + 40ll * row_stride_3)), "r"((next_len > r0_3 + 40) ? 16 : 0));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(dst0_4 + 6144), "l"(kn + (src_row_3 + 48 * row_stride_3)), "r"((next_len > r0_3 + 48) ? 16 : 0));
+                :: "r"(dst0_4 + 6144), "l"(kn + (src_row_3 + 48ll * row_stride_3)), "r"((next_len > r0_3 + 48) ? 16 : 0));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(dst0_4 + 7168), "l"(kn + (src_row_3 + 56 * row_stride_3)), "r"((next_len > r0_3 + 56) ? 16 : 0));
+                :: "r"(dst0_4 + 7168), "l"(kn + (src_row_3 + 56ll * row_stride_3)), "r"((next_len > r0_3 + 56) ? 16 : 0));
             int r0_4 = tid / 4;
             int c0_4 = tid % 4 * 8;
-            long long row_stride_4 = (long long)num_v_heads * 128;
-            long long src_row_4 = (long long)(next_tok0 + r0_4) * row_stride_4 + (long long)hv * 128 + (long long)v0 + (long long)c0_4;
+            long long row_stride_4 = (long long)num_v_heads * 128ll;
+            long long src_row_4 = (long long)(next_tok0 + r0_4) * row_stride_4 + (long long)hv * 128ll + (long long)v0 + (long long)c0_4;
             int dst0_5 = s_u_addr + (unsigned int)next_off + (unsigned int)(c0_4 / 64 * 8192 + (r0_4 * 128 + c0_4 % 64 * 2 ^ (r0_4 * 128 + c0_4 % 64 * 2 >> 7 & 7) << 4));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
                 :: "r"(dst0_5), "l"(u + src_row_4), "r"((next_len > r0_4) ? 16 : 0));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(dst0_5 + 4096), "l"(u + (src_row_4 + 32 * row_stride_4)), "r"((next_len > r0_4 + 32) ? 16 : 0));
+                :: "r"(dst0_5 + 4096), "l"(u + (src_row_4 + 32ll * row_stride_4)), "r"((next_len > r0_4 + 32) ? 16 : 0));
             asm volatile("cp.async.commit_group;");
         }
         int _max_1 = ((n_valid) > (1) ? (n_valid) : (1));
@@ -365,7 +365,7 @@ kernel_cake_gdn_det_train_59386fc8f5c0cf38d589(__nv_bfloat16* __restrict__ kn, _
                     : "r"((hpk + ks * 4)[0]), "r"((hpk + ks * 4)[1]), "r"((hpk + ks * 4)[2]), "r"((hpk + ks * 4)[3]), "r"(b_frag_k[2]), "r"(b_frag_k[(2) + 1]), "f"(((ks == 0) ? 0.0f : (acc_v + (nb3 * 8 + 4))[0])), "f"(((ks == 0) ? 0.0f : (acc_v + (nb3 * 8 + 4))[1])), "f"(((ks == 0) ? 0.0f : (acc_v + (nb3 * 8 + 4))[2])), "f"(((ks == 0) ? 0.0f : (acc_v + (nb3 * 8 + 4))[3])));
             }
         }
-        long long tape_base = ((long long)chunk * (long long)num_v_heads + (long long)hv) * 16384 + (long long)(v0 + vwarp * 16) * 128 + (long long)kbase;
+        long long tape_base = ((long long)chunk * (long long)num_v_heads + (long long)hv) * 16384ll + (long long)(v0 + vwarp * 16) * 128ll + (long long)kbase;
         int m_idx = lane_0 / 8;
         int r_idx = lane_0 % 8;
         int st_row = m_idx % 2 * 8 + r_idx;
@@ -405,7 +405,7 @@ kernel_cake_gdn_det_train_59386fc8f5c0cf38d589(__nv_bfloat16* __restrict__ kn, _
         }
         {
             int4 _iv4 = make_int4(words_1_0[0 + 0], words_1_0[0 + 1], words_1_0[0 + 2], words_1_0[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(h_out) + (tape_base + (long long)(ld_row_1_0 * 128) + (long long)(ld_ch * 8)) / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(h_out) + (tape_base + (long long)(ld_row_1_0 * 128) + (long long)(ld_ch * 8)) / 2ll) = _iv4;
         }
         int ld_row_1_1 = 4 + ld_row_lo;
         int words_1_1[4];
@@ -420,7 +420,7 @@ kernel_cake_gdn_det_train_59386fc8f5c0cf38d589(__nv_bfloat16* __restrict__ kn, _
         }
         {
             int4 _iv4 = make_int4(words_1_1[0 + 0], words_1_1[0 + 1], words_1_1[0 + 2], words_1_1[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(h_out) + (tape_base + (long long)(ld_row_1_1 * 128) + (long long)(ld_ch * 8)) / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(h_out) + (tape_base + (long long)(ld_row_1_1 * 128) + (long long)(ld_ch * 8)) / 2ll) = _iv4;
         }
         int ld_row_1_2 = 8 + ld_row_lo;
         int words_1_2[4];
@@ -435,7 +435,7 @@ kernel_cake_gdn_det_train_59386fc8f5c0cf38d589(__nv_bfloat16* __restrict__ kn, _
         }
         {
             int4 _iv4 = make_int4(words_1_2[0 + 0], words_1_2[0 + 1], words_1_2[0 + 2], words_1_2[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(h_out) + (tape_base + (long long)(ld_row_1_2 * 128) + (long long)(ld_ch * 8)) / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(h_out) + (tape_base + (long long)(ld_row_1_2 * 128) + (long long)(ld_ch * 8)) / 2ll) = _iv4;
         }
         int ld_row_1_3 = 12 + ld_row_lo;
         int words_1_3[4];
@@ -450,7 +450,7 @@ kernel_cake_gdn_det_train_59386fc8f5c0cf38d589(__nv_bfloat16* __restrict__ kn, _
         }
         {
             int4 _iv4 = make_int4(words_1_3[0 + 0], words_1_3[0 + 1], words_1_3[0 + 2], words_1_3[0 + 3]);
-            *reinterpret_cast<int4*>(reinterpret_cast<int*>(h_out) + (tape_base + (long long)(ld_row_1_3 * 128) + (long long)(ld_ch * 8)) / 2) = _iv4;
+            *reinterpret_cast<int4*>(reinterpret_cast<int*>(h_out) + (tape_base + (long long)(ld_row_1_3 * 128) + (long long)(ld_ch * 8)) / 2ll) = _iv4;
         }
         __syncwarp();
         int own_byte = warp_1 * 4096 + lane_0 * 16;
@@ -581,7 +581,7 @@ kernel_cake_gdn_det_train_59386fc8f5c0cf38d589(__nv_bfloat16* __restrict__ kn, _
             }
         }
         if (khalf == 0) {
-            long long row_base = ((long long)tok0 * (long long)num_v_heads + (long long)hv) * 128 + (long long)v0 + (long long)(vwarp * 16);
+            long long row_base = ((long long)tok0 * (long long)num_v_heads + (long long)hv) * 128ll + (long long)v0 + (long long)(vwarp * 16);
             int m_idx_0 = lane_0 / 8;
             int r_idx_1 = lane_0 % 8;
             int st_half = m_idx_0 % 2;
@@ -621,7 +621,7 @@ kernel_cake_gdn_det_train_59386fc8f5c0cf38d589(__nv_bfloat16* __restrict__ kn, _
             if (ld_tok_1_0 < n_valid) {
                 {
                     int4 _iv4 = make_int4(words_0[0 + 0], words_0[0 + 1], words_0[0 + 2], words_0[0 + 3]);
-                    *reinterpret_cast<int4*>(reinterpret_cast<int*>(v_new) + (row_base + (long long)ld_tok_1_0 * tok_stride + (long long)(ld_half * 8)) / 2) = _iv4;
+                    *reinterpret_cast<int4*>(reinterpret_cast<int*>(v_new) + (row_base + (long long)ld_tok_1_0 * tok_stride + (long long)(ld_half * 8)) / 2ll) = _iv4;
                 }
             }
             int ld_tok_1_1 = 16 + lane_0 / 2;
@@ -638,7 +638,7 @@ kernel_cake_gdn_det_train_59386fc8f5c0cf38d589(__nv_bfloat16* __restrict__ kn, _
             if (ld_tok_1_1 < n_valid) {
                 {
                     int4 _iv4 = make_int4(words_1[0 + 0], words_1[0 + 1], words_1[0 + 2], words_1[0 + 3]);
-                    *reinterpret_cast<int4*>(reinterpret_cast<int*>(v_new) + (row_base + (long long)ld_tok_1_1 * tok_stride + (long long)(ld_half * 8)) / 2) = _iv4;
+                    *reinterpret_cast<int4*>(reinterpret_cast<int*>(v_new) + (row_base + (long long)ld_tok_1_1 * tok_stride + (long long)(ld_half * 8)) / 2ll) = _iv4;
                 }
             }
             int ld_tok_1_2 = 32 + lane_0 / 2;
@@ -655,7 +655,7 @@ kernel_cake_gdn_det_train_59386fc8f5c0cf38d589(__nv_bfloat16* __restrict__ kn, _
             if (ld_tok_1_2 < n_valid) {
                 {
                     int4 _iv4 = make_int4(words_2[0 + 0], words_2[0 + 1], words_2[0 + 2], words_2[0 + 3]);
-                    *reinterpret_cast<int4*>(reinterpret_cast<int*>(v_new) + (row_base + (long long)ld_tok_1_2 * tok_stride + (long long)(ld_half * 8)) / 2) = _iv4;
+                    *reinterpret_cast<int4*>(reinterpret_cast<int*>(v_new) + (row_base + (long long)ld_tok_1_2 * tok_stride + (long long)(ld_half * 8)) / 2ll) = _iv4;
                 }
             }
             int ld_tok_1_3 = 48 + lane_0 / 2;
@@ -672,7 +672,7 @@ kernel_cake_gdn_det_train_59386fc8f5c0cf38d589(__nv_bfloat16* __restrict__ kn, _
             if (ld_tok_1_3 < n_valid) {
                 {
                     int4 _iv4 = make_int4(words_3[0 + 0], words_3[0 + 1], words_3[0 + 2], words_3[0 + 3]);
-                    *reinterpret_cast<int4*>(reinterpret_cast<int*>(v_new) + (row_base + (long long)ld_tok_1_3 * tok_stride + (long long)(ld_half * 8)) / 2) = _iv4;
+                    *reinterpret_cast<int4*>(reinterpret_cast<int*>(v_new) + (row_base + (long long)ld_tok_1_3 * tok_stride + (long long)(ld_half * 8)) / 2ll) = _iv4;
                 }
             }
             __syncwarp();
@@ -698,10 +698,10 @@ kernel_cake_gdn_det_train_59386fc8f5c0cf38d589(__nv_bfloat16* __restrict__ kn, _
             #pragma unroll
             for (int nb6 = 0; nb6 < 8; nb6++) {
                 int kcol2 = kbase + nb6 * 8 + quad * 2;
-                final_state[out_base + (long long)kcol2 * 128 + (long long)vrow_a] = acc_h[nb6 * 4];
-                final_state[out_base + (long long)(kcol2 + 1) * 128 + (long long)vrow_a] = acc_h[nb6 * 4 + 1];
-                final_state[out_base + (long long)kcol2 * 128 + (long long)vrow_b] = acc_h[nb6 * 4 + 2];
-                final_state[out_base + (long long)(kcol2 + 1) * 128 + (long long)vrow_b] = acc_h[nb6 * 4 + 3];
+                final_state[out_base + (long long)kcol2 * 128ll + (long long)vrow_a] = acc_h[nb6 * 4];
+                final_state[out_base + (long long)(kcol2 + 1) * 128ll + (long long)vrow_a] = acc_h[nb6 * 4 + 1];
+                final_state[out_base + (long long)kcol2 * 128ll + (long long)vrow_b] = acc_h[nb6 * 4 + 2];
+                final_state[out_base + (long long)(kcol2 + 1) * 128ll + (long long)vrow_b] = acc_h[nb6 * 4 + 3];
             }
         }
     }

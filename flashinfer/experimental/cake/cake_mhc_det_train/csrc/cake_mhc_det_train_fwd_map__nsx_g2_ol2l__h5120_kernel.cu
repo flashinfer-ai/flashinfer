@@ -332,8 +332,13 @@ kernel_cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h5120(const __grid_constant__ CU
                         int small_init = ((st_1 == 0) ? 1 : 0);
                         int cc = (int)c_stage;
                         if (kc_pos == 0) {
+#if __CUDA_ARCH__ == 1070
+                            int _smem_desc_lo_0 = (((a_s_addr) >> 4) & 0x7FFF) + (m_stage) * 1792;
+                            int _smem_desc_lo_1 = (((b2_s_addr) >> 4) & 0x7FFF) + (m_stage) * 1792;
+#else
                             int _smem_desc_lo_0 = (((a_s_addr) >> 4) & 0x3FFF) + (m_stage) * 1792;
                             int _smem_desc_lo_1 = (((b2_s_addr) >> 4) & 0x3FFF) + (m_stage) * 1792;
+#endif
                             asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -368,8 +373,13 @@ kernel_cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h5120(const __grid_constant__ CU
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"((tmem_acc_big + (32))), "r"(((small_init) ? 0 : 1)) : "memory");
+#if __CUDA_ARCH__ == 1070
+                            int _smem_desc_lo_2 = (((a_s_addr) >> 4) & 0x7FFF) + (m_stage) * 1792;
+                            int _smem_desc_lo_3 = (((b1_s_addr) >> 4) & 0x7FFF) + (m_stage) * 1792;
+#else
                             int _smem_desc_lo_2 = (((a_s_addr) >> 4) & 0x3FFF) + (m_stage) * 1792;
                             int _smem_desc_lo_3 = (((b1_s_addr) >> 4) & 0x3FFF) + (m_stage) * 1792;
+#endif
                             asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -404,8 +414,13 @@ kernel_cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h5120(const __grid_constant__ CU
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"((tmem_acc_big + (cc * 64))), "r"(0) : "memory");
+#if __CUDA_ARCH__ == 1070
+                            int _smem_desc_lo_4 = (((a_s_addr) >> 4) & 0x7FFF) + (m_stage) * 1792;
+                            int _smem_desc_lo_5 = (((b3_s_addr) >> 4) & 0x7FFF) + (m_stage) * 1792;
+#else
                             int _smem_desc_lo_4 = (((a_s_addr) >> 4) & 0x3FFF) + (m_stage) * 1792;
                             int _smem_desc_lo_5 = (((b3_s_addr) >> 4) & 0x3FFF) + (m_stage) * 1792;
+#endif
                             asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -442,8 +457,13 @@ kernel_cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h5120(const __grid_constant__ CU
                     :: "r"(_smem_desc_lo_4), "r"(_smem_desc_lo_5), "r"((tmem_acc_big + (32))), "r"(1) : "memory");
                         }
                         if (kc_pos != 0) {
+#if __CUDA_ARCH__ == 1070
+                            int _smem_desc_lo_6 = (((a_s_addr) >> 4) & 0x7FFF) + (m_stage) * 1792;
+                            int _smem_desc_lo_7 = (((b01_s_addr) >> 4) & 0x7FFF) + (m_stage) * 1792;
+#else
                             int _smem_desc_lo_6 = (((a_s_addr) >> 4) & 0x3FFF) + (m_stage) * 1792;
                             int _smem_desc_lo_7 = (((b01_s_addr) >> 4) & 0x3FFF) + (m_stage) * 1792;
+#endif
                             asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -478,8 +498,13 @@ kernel_cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h5120(const __grid_constant__ CU
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_6), "r"(_smem_desc_lo_7), "r"((tmem_acc_big + (cc * 32))), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
+                            int _smem_desc_lo_8 = (((a_s_addr) >> 4) & 0x7FFF) + (m_stage) * 1792;
+                            int _smem_desc_lo_9 = (((b3_s_addr) >> 4) & 0x7FFF) + (m_stage) * 1792;
+#else
                             int _smem_desc_lo_8 = (((a_s_addr) >> 4) & 0x3FFF) + (m_stage) * 1792;
                             int _smem_desc_lo_9 = (((b3_s_addr) >> 4) & 0x3FFF) + (m_stage) * 1792;
+#endif
                             asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -539,7 +564,7 @@ kernel_cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h5120(const __grid_constant__ CU
             const int quarter = warp % 4;
             const int row = quarter * 32 + lane;
             unsigned int row_base = (unsigned int)(quarter * 32 << 16);
-            long long T_pad = (long long)m_tiles * 128;
+            long long T_pad = (long long)m_tiles * 128ll;
             int units_2 = m_tiles << log2_pk;
             int all_stages_2 = 320;
             int unit_stages_2 = all_stages_2 >> log2_pk;
@@ -563,7 +588,7 @@ kernel_cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h5120(const __grid_constant__ CU
                 qsum[0] = 0.0f;
                 qcomp[0] = 0.0f;
                 long long t_row = (long long)kappa_1 * T_pad + (long long)(m_1 * 128 + row);
-                long long s_off = t_row * 24;
+                long long s_off = t_row * 24ll;
                 #pragma unroll 1
                 for (int st_2 = 0; st_2 < unit_stages_2; st_2++) {
                     mbarrier_wait_plain_nonuniform(a_full_addr + (r_stage) * 8, _phase_a_full_1);

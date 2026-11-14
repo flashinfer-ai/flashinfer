@@ -185,15 +185,16 @@ kernel_cake_dense_projection_gemm_e717e449f20f5a8edfc3(const __grid_constant__ C
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_a = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_a_addr = smem + 1024;
     __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
     const int smem_b_addr = smem + 17408;
+
+    // Kernel setup ops
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
-    // Mbarrier init (5 pipeline groups, 0 ordered-sequence groups, 19 barriers)
-    // Mbarriers at smem_raw[0..152)
+    // Mbarrier init (19 barriers at smem_raw[0..152))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -245,10 +246,8 @@ kernel_cake_dense_projection_gemm_e717e449f20f5a8edfc3(const __grid_constant__ C
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
     asm volatile("griddepcontrol.wait;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
 
     // ---- Role: load ----
     if (warp == 0) {
@@ -609,40 +608,40 @@ kernel_cake_dense_projection_gemm_e717e449f20f5a8edfc3(const __grid_constant__ C
                         asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.b16 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(out + (base_t_2 + (long long)(col_base + 96 + 31) * (long long)ldo))), "h"(__bfloat16_as_ushort((__nv_bfloat16)vals[127])), "r"((unsigned int)(col_base + 96 + 31 < N)) : "memory");
                     }
                 } else {
-                    long long slot_floats = 65536;
+                    long long slot_floats = 65536ll;
                     long long slice_base = (long long)tile_2 * (long long)num_splits * slot_floats + (long long)(slice_id * 4096 + lane * 4);
                     asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats)), "f"(vals[(0) + 0]), "f"(vals[(0) + 1]), "f"(vals[(0) + 2]), "f"(vals[(0) + 3]), "r"((unsigned int)(col_base < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 128)), "f"(vals[(4) + 0]), "f"(vals[(4) + 1]), "f"(vals[(4) + 2]), "f"(vals[(4) + 3]), "r"((unsigned int)(col_base + 4 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 256)), "f"(vals[(8) + 0]), "f"(vals[(8) + 1]), "f"(vals[(8) + 2]), "f"(vals[(8) + 3]), "r"((unsigned int)(col_base + 8 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 384)), "f"(vals[(12) + 0]), "f"(vals[(12) + 1]), "f"(vals[(12) + 2]), "f"(vals[(12) + 3]), "r"((unsigned int)(col_base + 12 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 512)), "f"(vals[(16) + 0]), "f"(vals[(16) + 1]), "f"(vals[(16) + 2]), "f"(vals[(16) + 3]), "r"((unsigned int)(col_base + 16 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 640)), "f"(vals[(20) + 0]), "f"(vals[(20) + 1]), "f"(vals[(20) + 2]), "f"(vals[(20) + 3]), "r"((unsigned int)(col_base + 20 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 768)), "f"(vals[(24) + 0]), "f"(vals[(24) + 1]), "f"(vals[(24) + 2]), "f"(vals[(24) + 3]), "r"((unsigned int)(col_base + 24 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 896)), "f"(vals[(28) + 0]), "f"(vals[(28) + 1]), "f"(vals[(28) + 2]), "f"(vals[(28) + 3]), "r"((unsigned int)(col_base + 28 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 1024)), "f"(vals[(32) + 0]), "f"(vals[(32) + 1]), "f"(vals[(32) + 2]), "f"(vals[(32) + 3]), "r"((unsigned int)(col_base + 32 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 1152)), "f"(vals[(36) + 0]), "f"(vals[(36) + 1]), "f"(vals[(36) + 2]), "f"(vals[(36) + 3]), "r"((unsigned int)(col_base + 32 + 4 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 1280)), "f"(vals[(40) + 0]), "f"(vals[(40) + 1]), "f"(vals[(40) + 2]), "f"(vals[(40) + 3]), "r"((unsigned int)(col_base + 32 + 8 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 1408)), "f"(vals[(44) + 0]), "f"(vals[(44) + 1]), "f"(vals[(44) + 2]), "f"(vals[(44) + 3]), "r"((unsigned int)(col_base + 32 + 12 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 1536)), "f"(vals[(48) + 0]), "f"(vals[(48) + 1]), "f"(vals[(48) + 2]), "f"(vals[(48) + 3]), "r"((unsigned int)(col_base + 32 + 16 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 1664)), "f"(vals[(52) + 0]), "f"(vals[(52) + 1]), "f"(vals[(52) + 2]), "f"(vals[(52) + 3]), "r"((unsigned int)(col_base + 32 + 20 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 1792)), "f"(vals[(56) + 0]), "f"(vals[(56) + 1]), "f"(vals[(56) + 2]), "f"(vals[(56) + 3]), "r"((unsigned int)(col_base + 32 + 24 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 1920)), "f"(vals[(60) + 0]), "f"(vals[(60) + 1]), "f"(vals[(60) + 2]), "f"(vals[(60) + 3]), "r"((unsigned int)(col_base + 32 + 28 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 2048)), "f"(vals[(64) + 0]), "f"(vals[(64) + 1]), "f"(vals[(64) + 2]), "f"(vals[(64) + 3]), "r"((unsigned int)(col_base + 64 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 2176)), "f"(vals[(68) + 0]), "f"(vals[(68) + 1]), "f"(vals[(68) + 2]), "f"(vals[(68) + 3]), "r"((unsigned int)(col_base + 64 + 4 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 2304)), "f"(vals[(72) + 0]), "f"(vals[(72) + 1]), "f"(vals[(72) + 2]), "f"(vals[(72) + 3]), "r"((unsigned int)(col_base + 64 + 8 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 2432)), "f"(vals[(76) + 0]), "f"(vals[(76) + 1]), "f"(vals[(76) + 2]), "f"(vals[(76) + 3]), "r"((unsigned int)(col_base + 64 + 12 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 2560)), "f"(vals[(80) + 0]), "f"(vals[(80) + 1]), "f"(vals[(80) + 2]), "f"(vals[(80) + 3]), "r"((unsigned int)(col_base + 64 + 16 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 2688)), "f"(vals[(84) + 0]), "f"(vals[(84) + 1]), "f"(vals[(84) + 2]), "f"(vals[(84) + 3]), "r"((unsigned int)(col_base + 64 + 20 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 2816)), "f"(vals[(88) + 0]), "f"(vals[(88) + 1]), "f"(vals[(88) + 2]), "f"(vals[(88) + 3]), "r"((unsigned int)(col_base + 64 + 24 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 2944)), "f"(vals[(92) + 0]), "f"(vals[(92) + 1]), "f"(vals[(92) + 2]), "f"(vals[(92) + 3]), "r"((unsigned int)(col_base + 64 + 28 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 3072)), "f"(vals[(96) + 0]), "f"(vals[(96) + 1]), "f"(vals[(96) + 2]), "f"(vals[(96) + 3]), "r"((unsigned int)(col_base + 96 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 3200)), "f"(vals[(100) + 0]), "f"(vals[(100) + 1]), "f"(vals[(100) + 2]), "f"(vals[(100) + 3]), "r"((unsigned int)(col_base + 96 + 4 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 3328)), "f"(vals[(104) + 0]), "f"(vals[(104) + 1]), "f"(vals[(104) + 2]), "f"(vals[(104) + 3]), "r"((unsigned int)(col_base + 96 + 8 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 3456)), "f"(vals[(108) + 0]), "f"(vals[(108) + 1]), "f"(vals[(108) + 2]), "f"(vals[(108) + 3]), "r"((unsigned int)(col_base + 96 + 12 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 3584)), "f"(vals[(112) + 0]), "f"(vals[(112) + 1]), "f"(vals[(112) + 2]), "f"(vals[(112) + 3]), "r"((unsigned int)(col_base + 96 + 16 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 3712)), "f"(vals[(116) + 0]), "f"(vals[(116) + 1]), "f"(vals[(116) + 2]), "f"(vals[(116) + 3]), "r"((unsigned int)(col_base + 96 + 20 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 3840)), "f"(vals[(120) + 0]), "f"(vals[(120) + 1]), "f"(vals[(120) + 2]), "f"(vals[(120) + 3]), "r"((unsigned int)(col_base + 96 + 24 < N)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 3968)), "f"(vals[(124) + 0]), "f"(vals[(124) + 1]), "f"(vals[(124) + 2]), "f"(vals[(124) + 3]), "r"((unsigned int)(col_base + 96 + 28 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 128ll)), "f"(vals[(4) + 0]), "f"(vals[(4) + 1]), "f"(vals[(4) + 2]), "f"(vals[(4) + 3]), "r"((unsigned int)(col_base + 4 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 256ll)), "f"(vals[(8) + 0]), "f"(vals[(8) + 1]), "f"(vals[(8) + 2]), "f"(vals[(8) + 3]), "r"((unsigned int)(col_base + 8 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 384ll)), "f"(vals[(12) + 0]), "f"(vals[(12) + 1]), "f"(vals[(12) + 2]), "f"(vals[(12) + 3]), "r"((unsigned int)(col_base + 12 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 512ll)), "f"(vals[(16) + 0]), "f"(vals[(16) + 1]), "f"(vals[(16) + 2]), "f"(vals[(16) + 3]), "r"((unsigned int)(col_base + 16 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 640ll)), "f"(vals[(20) + 0]), "f"(vals[(20) + 1]), "f"(vals[(20) + 2]), "f"(vals[(20) + 3]), "r"((unsigned int)(col_base + 20 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 768ll)), "f"(vals[(24) + 0]), "f"(vals[(24) + 1]), "f"(vals[(24) + 2]), "f"(vals[(24) + 3]), "r"((unsigned int)(col_base + 24 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 896ll)), "f"(vals[(28) + 0]), "f"(vals[(28) + 1]), "f"(vals[(28) + 2]), "f"(vals[(28) + 3]), "r"((unsigned int)(col_base + 28 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 1024ll)), "f"(vals[(32) + 0]), "f"(vals[(32) + 1]), "f"(vals[(32) + 2]), "f"(vals[(32) + 3]), "r"((unsigned int)(col_base + 32 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 1152ll)), "f"(vals[(36) + 0]), "f"(vals[(36) + 1]), "f"(vals[(36) + 2]), "f"(vals[(36) + 3]), "r"((unsigned int)(col_base + 32 + 4 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 1280ll)), "f"(vals[(40) + 0]), "f"(vals[(40) + 1]), "f"(vals[(40) + 2]), "f"(vals[(40) + 3]), "r"((unsigned int)(col_base + 32 + 8 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 1408ll)), "f"(vals[(44) + 0]), "f"(vals[(44) + 1]), "f"(vals[(44) + 2]), "f"(vals[(44) + 3]), "r"((unsigned int)(col_base + 32 + 12 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 1536ll)), "f"(vals[(48) + 0]), "f"(vals[(48) + 1]), "f"(vals[(48) + 2]), "f"(vals[(48) + 3]), "r"((unsigned int)(col_base + 32 + 16 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 1664ll)), "f"(vals[(52) + 0]), "f"(vals[(52) + 1]), "f"(vals[(52) + 2]), "f"(vals[(52) + 3]), "r"((unsigned int)(col_base + 32 + 20 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 1792ll)), "f"(vals[(56) + 0]), "f"(vals[(56) + 1]), "f"(vals[(56) + 2]), "f"(vals[(56) + 3]), "r"((unsigned int)(col_base + 32 + 24 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 1920ll)), "f"(vals[(60) + 0]), "f"(vals[(60) + 1]), "f"(vals[(60) + 2]), "f"(vals[(60) + 3]), "r"((unsigned int)(col_base + 32 + 28 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 2048ll)), "f"(vals[(64) + 0]), "f"(vals[(64) + 1]), "f"(vals[(64) + 2]), "f"(vals[(64) + 3]), "r"((unsigned int)(col_base + 64 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 2176ll)), "f"(vals[(68) + 0]), "f"(vals[(68) + 1]), "f"(vals[(68) + 2]), "f"(vals[(68) + 3]), "r"((unsigned int)(col_base + 64 + 4 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 2304ll)), "f"(vals[(72) + 0]), "f"(vals[(72) + 1]), "f"(vals[(72) + 2]), "f"(vals[(72) + 3]), "r"((unsigned int)(col_base + 64 + 8 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 2432ll)), "f"(vals[(76) + 0]), "f"(vals[(76) + 1]), "f"(vals[(76) + 2]), "f"(vals[(76) + 3]), "r"((unsigned int)(col_base + 64 + 12 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 2560ll)), "f"(vals[(80) + 0]), "f"(vals[(80) + 1]), "f"(vals[(80) + 2]), "f"(vals[(80) + 3]), "r"((unsigned int)(col_base + 64 + 16 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 2688ll)), "f"(vals[(84) + 0]), "f"(vals[(84) + 1]), "f"(vals[(84) + 2]), "f"(vals[(84) + 3]), "r"((unsigned int)(col_base + 64 + 20 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 2816ll)), "f"(vals[(88) + 0]), "f"(vals[(88) + 1]), "f"(vals[(88) + 2]), "f"(vals[(88) + 3]), "r"((unsigned int)(col_base + 64 + 24 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 2944ll)), "f"(vals[(92) + 0]), "f"(vals[(92) + 1]), "f"(vals[(92) + 2]), "f"(vals[(92) + 3]), "r"((unsigned int)(col_base + 64 + 28 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 3072ll)), "f"(vals[(96) + 0]), "f"(vals[(96) + 1]), "f"(vals[(96) + 2]), "f"(vals[(96) + 3]), "r"((unsigned int)(col_base + 96 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 3200ll)), "f"(vals[(100) + 0]), "f"(vals[(100) + 1]), "f"(vals[(100) + 2]), "f"(vals[(100) + 3]), "r"((unsigned int)(col_base + 96 + 4 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 3328ll)), "f"(vals[(104) + 0]), "f"(vals[(104) + 1]), "f"(vals[(104) + 2]), "f"(vals[(104) + 3]), "r"((unsigned int)(col_base + 96 + 8 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 3456ll)), "f"(vals[(108) + 0]), "f"(vals[(108) + 1]), "f"(vals[(108) + 2]), "f"(vals[(108) + 3]), "r"((unsigned int)(col_base + 96 + 12 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 3584ll)), "f"(vals[(112) + 0]), "f"(vals[(112) + 1]), "f"(vals[(112) + 2]), "f"(vals[(112) + 3]), "r"((unsigned int)(col_base + 96 + 16 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 3712ll)), "f"(vals[(116) + 0]), "f"(vals[(116) + 1]), "f"(vals[(116) + 2]), "f"(vals[(116) + 3]), "r"((unsigned int)(col_base + 96 + 20 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 3840ll)), "f"(vals[(120) + 0]), "f"(vals[(120) + 1]), "f"(vals[(120) + 2]), "f"(vals[(120) + 3]), "r"((unsigned int)(col_base + 96 + 24 < N)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.f32 [%0], {%1, %2, %3, %4}; }" :: "l"(ws + (slice_base + (long long)split_2 * slot_floats + 3968ll)), "f"(vals[(124) + 0]), "f"(vals[(124) + 1]), "f"(vals[(124) + 2]), "f"(vals[(124) + 3]), "r"((unsigned int)(col_base + 96 + 28 < N)) : "memory");
                     uint32_t arrival;
                     asm volatile("atom.acq_rel.gpu.global.inc.u32 %0, [%1], %2;"
                         : "=r"(arrival) : "l"(&counters[(tile_2 * 16 + slice_id) * 32 + lane]), "r"(static_cast<uint32_t>(last_ticket)) : "memory");
@@ -660,49 +659,49 @@ kernel_cake_dense_projection_gemm_e717e449f20f5a8edfc3(const __grid_constant__ C
                                     part[0 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_0 * slot_floats + 128) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_0 * slot_floats + 128ll) + 0);
                                     part[4 + 0] = _v4.x;
                                     part[4 + 1] = _v4.y;
                                     part[4 + 2] = _v4.z;
                                     part[4 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_0 * slot_floats + 256) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_0 * slot_floats + 256ll) + 0);
                                     part[8 + 0] = _v4.x;
                                     part[8 + 1] = _v4.y;
                                     part[8 + 2] = _v4.z;
                                     part[8 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_0 * slot_floats + 384) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_0 * slot_floats + 384ll) + 0);
                                     part[12 + 0] = _v4.x;
                                     part[12 + 1] = _v4.y;
                                     part[12 + 2] = _v4.z;
                                     part[12 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_0 * slot_floats + 512) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_0 * slot_floats + 512ll) + 0);
                                     part[16 + 0] = _v4.x;
                                     part[16 + 1] = _v4.y;
                                     part[16 + 2] = _v4.z;
                                     part[16 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_0 * slot_floats + 640) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_0 * slot_floats + 640ll) + 0);
                                     part[20 + 0] = _v4.x;
                                     part[20 + 1] = _v4.y;
                                     part[20 + 2] = _v4.z;
                                     part[20 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_0 * slot_floats + 768) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_0 * slot_floats + 768ll) + 0);
                                     part[24 + 0] = _v4.x;
                                     part[24 + 1] = _v4.y;
                                     part[24 + 2] = _v4.z;
                                     part[24 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_0 * slot_floats + 896) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_0 * slot_floats + 896ll) + 0);
                                     part[28 + 0] = _v4.x;
                                     part[28 + 1] = _v4.y;
                                     part[28 + 2] = _v4.z;
@@ -748,56 +747,56 @@ kernel_cake_dense_projection_gemm_e717e449f20f5a8edfc3(const __grid_constant__ C
                                 int ahead_1 = split_2 + step_1;
                                 int other_1 = ((ahead_1 < num_splits) ? ahead_1 : ahead_1 - num_splits);
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_1 * slot_floats + 1024) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_1 * slot_floats + 1024ll) + 0);
                                     part[0 + 0] = _v4.x;
                                     part[0 + 1] = _v4.y;
                                     part[0 + 2] = _v4.z;
                                     part[0 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_1 * slot_floats + 1152) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_1 * slot_floats + 1152ll) + 0);
                                     part[4 + 0] = _v4.x;
                                     part[4 + 1] = _v4.y;
                                     part[4 + 2] = _v4.z;
                                     part[4 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_1 * slot_floats + 1280) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_1 * slot_floats + 1280ll) + 0);
                                     part[8 + 0] = _v4.x;
                                     part[8 + 1] = _v4.y;
                                     part[8 + 2] = _v4.z;
                                     part[8 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_1 * slot_floats + 1408) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_1 * slot_floats + 1408ll) + 0);
                                     part[12 + 0] = _v4.x;
                                     part[12 + 1] = _v4.y;
                                     part[12 + 2] = _v4.z;
                                     part[12 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_1 * slot_floats + 1536) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_1 * slot_floats + 1536ll) + 0);
                                     part[16 + 0] = _v4.x;
                                     part[16 + 1] = _v4.y;
                                     part[16 + 2] = _v4.z;
                                     part[16 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_1 * slot_floats + 1664) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_1 * slot_floats + 1664ll) + 0);
                                     part[20 + 0] = _v4.x;
                                     part[20 + 1] = _v4.y;
                                     part[20 + 2] = _v4.z;
                                     part[20 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_1 * slot_floats + 1792) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_1 * slot_floats + 1792ll) + 0);
                                     part[24 + 0] = _v4.x;
                                     part[24 + 1] = _v4.y;
                                     part[24 + 2] = _v4.z;
                                     part[24 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_1 * slot_floats + 1920) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_1 * slot_floats + 1920ll) + 0);
                                     part[28 + 0] = _v4.x;
                                     part[28 + 1] = _v4.y;
                                     part[28 + 2] = _v4.z;
@@ -843,56 +842,56 @@ kernel_cake_dense_projection_gemm_e717e449f20f5a8edfc3(const __grid_constant__ C
                                 int ahead_2 = split_2 + step_2;
                                 int other_2 = ((ahead_2 < num_splits) ? ahead_2 : ahead_2 - num_splits);
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_2 * slot_floats + 2048) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_2 * slot_floats + 2048ll) + 0);
                                     part[0 + 0] = _v4.x;
                                     part[0 + 1] = _v4.y;
                                     part[0 + 2] = _v4.z;
                                     part[0 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_2 * slot_floats + 2176) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_2 * slot_floats + 2176ll) + 0);
                                     part[4 + 0] = _v4.x;
                                     part[4 + 1] = _v4.y;
                                     part[4 + 2] = _v4.z;
                                     part[4 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_2 * slot_floats + 2304) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_2 * slot_floats + 2304ll) + 0);
                                     part[8 + 0] = _v4.x;
                                     part[8 + 1] = _v4.y;
                                     part[8 + 2] = _v4.z;
                                     part[8 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_2 * slot_floats + 2432) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_2 * slot_floats + 2432ll) + 0);
                                     part[12 + 0] = _v4.x;
                                     part[12 + 1] = _v4.y;
                                     part[12 + 2] = _v4.z;
                                     part[12 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_2 * slot_floats + 2560) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_2 * slot_floats + 2560ll) + 0);
                                     part[16 + 0] = _v4.x;
                                     part[16 + 1] = _v4.y;
                                     part[16 + 2] = _v4.z;
                                     part[16 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_2 * slot_floats + 2688) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_2 * slot_floats + 2688ll) + 0);
                                     part[20 + 0] = _v4.x;
                                     part[20 + 1] = _v4.y;
                                     part[20 + 2] = _v4.z;
                                     part[20 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_2 * slot_floats + 2816) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_2 * slot_floats + 2816ll) + 0);
                                     part[24 + 0] = _v4.x;
                                     part[24 + 1] = _v4.y;
                                     part[24 + 2] = _v4.z;
                                     part[24 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_2 * slot_floats + 2944) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_2 * slot_floats + 2944ll) + 0);
                                     part[28 + 0] = _v4.x;
                                     part[28 + 1] = _v4.y;
                                     part[28 + 2] = _v4.z;
@@ -938,56 +937,56 @@ kernel_cake_dense_projection_gemm_e717e449f20f5a8edfc3(const __grid_constant__ C
                                 int ahead_3 = split_2 + step_3;
                                 int other_3 = ((ahead_3 < num_splits) ? ahead_3 : ahead_3 - num_splits);
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_3 * slot_floats + 3072) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_3 * slot_floats + 3072ll) + 0);
                                     part[0 + 0] = _v4.x;
                                     part[0 + 1] = _v4.y;
                                     part[0 + 2] = _v4.z;
                                     part[0 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_3 * slot_floats + 3200) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_3 * slot_floats + 3200ll) + 0);
                                     part[4 + 0] = _v4.x;
                                     part[4 + 1] = _v4.y;
                                     part[4 + 2] = _v4.z;
                                     part[4 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_3 * slot_floats + 3328) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_3 * slot_floats + 3328ll) + 0);
                                     part[8 + 0] = _v4.x;
                                     part[8 + 1] = _v4.y;
                                     part[8 + 2] = _v4.z;
                                     part[8 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_3 * slot_floats + 3456) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_3 * slot_floats + 3456ll) + 0);
                                     part[12 + 0] = _v4.x;
                                     part[12 + 1] = _v4.y;
                                     part[12 + 2] = _v4.z;
                                     part[12 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_3 * slot_floats + 3584) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_3 * slot_floats + 3584ll) + 0);
                                     part[16 + 0] = _v4.x;
                                     part[16 + 1] = _v4.y;
                                     part[16 + 2] = _v4.z;
                                     part[16 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_3 * slot_floats + 3712) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_3 * slot_floats + 3712ll) + 0);
                                     part[20 + 0] = _v4.x;
                                     part[20 + 1] = _v4.y;
                                     part[20 + 2] = _v4.z;
                                     part[20 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_3 * slot_floats + 3840) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_3 * slot_floats + 3840ll) + 0);
                                     part[24 + 0] = _v4.x;
                                     part[24 + 1] = _v4.y;
                                     part[24 + 2] = _v4.z;
                                     part[24 + 3] = _v4.w;
                                 }
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_3 * slot_floats + 3968) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (slice_base + (long long)other_3 * slot_floats + 3968ll) + 0);
                                     part[28 + 0] = _v4.x;
                                     part[28 + 1] = _v4.y;
                                     part[28 + 2] = _v4.z;

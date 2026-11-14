@@ -264,6 +264,13 @@ kernel. Nonpositive KV lengths mark inactive requests; positive lengths must
 cover all query tokens. Packed Q and arbitrary mappings continue to accept
 explicit per-token metadata.
 
+After a successful validated `run()`, `run(..., validate=False)` skips repeated
+host tensor-metadata checks. Preserve shapes, strides, dtypes, devices and
+alignment; K/V and `qo_indptr` must retain their prepared storage. Other input
+and output tensors may use replacement storage with the same ABI, and device
+contents remain live during graph replay. Scale overrides are still validated.
+Run with the default `validate=True` after `plan()` or any binding change.
+
 Packed Q uses a bounded `[D, Hq, total_q_tokens]` TensorMap. Per-route masks
 handle tiles crossing a request boundary, and the physical token extent
 bounds the final tile. FP8 queries need no extra tail allocation or staging copy.
@@ -285,7 +292,7 @@ no caller-owned workspace. Shared patterns prepare one row per
 group; independent patterns prepare one per group and KV head. G1 resolves
 selected blocks and the causal tail inside attention, without a metadata launch.
 
-Eligible prepared FP8 G2–G8/page-4 Keeps routes store query-oriented membership
+Eligible prepared G2–G8/page-4 Keeps routes store query-oriented membership
 words internally, with eight query slots and complete tail tiles reserved in
 the workspace. Unused slots and tail bits are zero. Standalone metadata outputs
 retain four membership bytes per Int32 word; the public plan/run API is unchanged.

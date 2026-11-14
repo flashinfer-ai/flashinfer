@@ -121,23 +121,37 @@ existing layout contract.
 Static PTX prefill on B300
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``flashinfer.recurrent_kda(..., backend="ptx")`` explicitly selects four
-retained PTX programs from `NVlabs/kda (260927-kda-for-kda)
+``flashinfer.recurrent_kda(..., backend="ptx")`` explicitly selects retained PTX
+programs originally imported from `NVlabs/kda (260927-kda-for-kda)
 <https://github.com/NVlabs/kda/tree/ea37ebaff74c88a2545751dcb8ea8ef6c6251b67/ptx>`_.
 The programs target SM103a (B300) and use persistent recurrence scheduling
 with exact FP32 state handoff between pieces. The default backend selection
 is unchanged.
 
-Install ``nvidia-cuda-nvcc>=13.2`` and ``apache-tvm-ffi>=0.1.12`` in addition
-to FlashInfer's regular dependencies. The retained PTX uses ISA 9.2. It is
-assembled once with ptxas >= 13.2 and embedded as a cubin, allowing execution
-with a CUDA 13 driver that cannot JIT PTX 9.2 directly. A C++17 host compiler
-and CUDA driver headers (provided by Triton) are needed for the FFI shims.
+Install ``apache-tvm-ffi>=0.1.12`` in addition to FlashInfer's regular
+dependencies. The retained PTX uses ISA 9.2. Drivers supporting CUDA 13.2 or
+newer JIT the PTX directly. Older CUDA 13 drivers use a cubin assembled with
+ptxas >= 13.2; install ``nvidia-cuda-nvcc>=13.2`` for this fallback. A C++17
+host compiler and CUDA driver headers (provided by Triton) are needed for
+the FFI shims.
 ``FLASHINFER_KDA_PTXAS`` selects the assembler;
 ``FLASHINFER_KDA_PTX_CACHE_DIR`` overrides the default FlashInfer JIT cubin
 cache directory. No build output is written into the installed package. This backend is
 JIT-only and is unavailable with ``FLASHINFER_DISABLE_JIT=1`` in a fresh
 process.
+
+The optimized schedules currently require a 148-SM B300, 8192 total tokens,
+64 or 96 heads, and exactly one of these sequence-length layouts:
+``[8192]``, ``[1300, 547, 2048, 963, 271, 3063]``, or ``[1024] * 8``.
+Other supported layouts use the original scheduler, including nearby layouts
+that differ by only one token or an additional sequence.
+
+The fixed-sequence split retains the full recurrence through affine state
+composition. State handoff buffers and final-state storage are FP32. The
+correction uses TF32 products with FP32 accumulation for state composition,
+and BF16 state operands with FP32 accumulation for tail-output correction.
+Its numerical contract is the validated reference tolerance; FP32 storage does
+not imply bitwise FP32 arithmetic throughout the composition.
 
 Supported inputs are contiguous CUDA BF16 ``q/k/v/g [1, T, H, 128]`` with
 ``T >= 32`` and ``H`` equal to 64 or 96, BF16 beta logits ``[1, T, H]``, FP32
@@ -209,6 +223,11 @@ Key-Driven Attention (KDA) decode API. The CuTe-DSL kernel lives under
 The public ``recurrent_kda`` API supports standard decode with one token per
 sequence (``T=1``) and packed speculative decode with two or more tokens per
 sequence (``T>=2``).
+
+The CuTe DSL decode kernels accept a BF16 or FP32 ``initial_state`` pool and read and
+write it in its own dtype. Any other dtype raises ``TypeError``. ``backend="cake"``
+and ``packed_kda_decode`` still require a BF16 state; the fused decode ops already
+accept BF16 or FP32.
 
 ``fused_kda_decode`` combines width-four causal convolution, one KDA update,
 and gated RMSNorm for ``T=1``. ``packed_fused_kda_decode`` extends the same

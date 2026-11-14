@@ -1367,24 +1367,26 @@ def copy_built_kernels(
         shutil.copy2(src, dst)
 
 
-def compile_and_package_modules(
-    out_dir: Optional[Path],
-    build_dir: Path,
+def generate_jit_specs(
     project_root: Path,
+    build_dir: Path,
     config: dict = None,
     verbose: bool = False,
-    skip_prebuilt: bool = True,
-) -> None:
+) -> List[JitSpec]:
     """
-    Compile and package modules based on the provided configuration.
+    Generate the AOT JIT specs without compiling them.
+
+    Points the JIT environment at ``project_root`` and ``build_dir`` (generated
+    sources are written below ``build_dir``) and returns every spec the build
+    would compile for ``FLASHINFER_CUDA_ARCH_LIST``. That variable must be set
+    before ``flashinfer`` is first imported, since the compilation context reads
+    it at import.
 
     Args:
-        out_dir: Output directory for packaged modules
-        build_dir: Build directory for compilation
         project_root: Project root directory
+        build_dir: Build directory for generated sources
         config: Configuration dictionary to override defaults (optional)
-        verbose: Whether to print verbose build output
-        skip_prebuilt: Whether to skip pre-built modules
+        verbose: Whether to print a build summary
     """
     # Start with default config and override with user config
     final_config = get_default_config()
@@ -1416,8 +1418,6 @@ def compile_and_package_modules(
     # Print summary
     if verbose:
         print("AOT build summary:")
-        if out_dir is not None:
-            print("  out_dir:", out_dir)
         print("  build_dir:", build_dir)
         print("  fa2_head_dim:", config["fa2_head_dim"])
         print("  fa3_head_dim:", config["fa3_head_dim"])
@@ -1462,6 +1462,33 @@ def compile_and_package_modules(
     )
     if verbose:
         print("Total ops:", len(jit_specs))
+    return jit_specs
+
+
+def compile_and_package_modules(
+    out_dir: Optional[Path],
+    build_dir: Path,
+    project_root: Path,
+    config: dict = None,
+    verbose: bool = False,
+    skip_prebuilt: bool = True,
+) -> None:
+    """
+    Compile and package modules based on the provided configuration.
+
+    Args:
+        out_dir: Output directory for packaged modules
+        build_dir: Build directory for compilation
+        project_root: Project root directory
+        config: Configuration dictionary to override defaults (optional)
+        verbose: Whether to print verbose build output
+        skip_prebuilt: Whether to skip pre-built modules
+    """
+    if verbose and out_dir is not None:
+        print("AOT output directory:", out_dir)
+    jit_specs = generate_jit_specs(
+        project_root, build_dir, config=config, verbose=verbose
+    )
 
     # Build
     build_jit_specs(jit_specs, verbose=verbose, skip_prebuilt=skip_prebuilt)

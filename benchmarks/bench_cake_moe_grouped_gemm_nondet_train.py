@@ -29,7 +29,10 @@ block with early stop off / on -- gate_up, ``silu(a) * b`` on its two halves,
 down, with the gradients of ``x``, ``w1`` and ``w2`` -- in which only the
 recompute of the down GEMM can be skipped.  The rate of these rows counts the
 useful work only (forward, data and weight gradient of each GEMM); the ``step``
-rows keep their earlier count, which includes the recomputed forward.
+rows keep their earlier count, which includes the recomputed forward.  After every
+other row: E=1 and E=32 at the two E=4 token counts (112,576 and 136,064 rows; E=32
+in 32-row aligned groups, the last taking the remainder, as in the balanced E=4
+rows), each projection, with fwd, dgrad, the bf16 wgrad and the step.
 
 Arms: ``cake_det`` (the deterministic package,
 ``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train``), ``cake_nondet``
@@ -40,14 +43,16 @@ Arms: ``cake_det`` (the deterministic package,
 ``CakeMoEGroupedGemmNondetFunction.apply(x, w, offs)``, whose forward GEMM launches
 inside ``forward`` so that a checkpoint always recomputes it (autograd rows only; when
 it runs with ``cake_nondet``, the JSON records the elements in which their outputs and
-gradients differ -- none in the output and ``x.grad``).  ``--census`` adds the
+gradients differ -- none is expected: every output repeats bit for bit for the same
+inputs, shapes, device SM count and configuration).  ``--census`` adds the
 CUDA kernel count of one call per arm (``torch.profiler``).  Each row reports
 the median time with a cold L2 between
 iterations (and the 10th / 90th percentiles), the peak device memory one
 preparation and launch takes beyond its inputs and output (the Cake arms'
 kept stream workspaces included: they are dropped before the measurement) and
-the memory it retains, the Cake plans (stages, tail split, whether the split
-tail is unordered), the error of the ``cake_nondet`` output against ``cake_det``, and
+the memory it retains, the Cake plans (stages, tail split, the form of a split
+tail: ``ordered_tail`` / ``unordered_tail``), the error of the ``cake_nondet`` output
+against ``cake_det``, and
 the ``cake_nondet`` / ``cake_det`` time ratio.  Consecutive rows run the arms in
 alternating order (the JSON records it as ``arm_order``); an arm with no
 program for the device is dropped.
@@ -164,6 +169,8 @@ EXPERT_COUNT_SUM_M = 131072
 # E=32 over EXPERT_COUNT_SUM_M rows, 16 short groups beside 16 long ones: an average of 4096 rows keeps the
 # 512-wide k tile, whose accumulate epilogue then runs tiles of short mainloops.
 ACC_SHORT_E32 = [64 + 28 * i for i in range(16)] + [7918] * 16
+# The expert counts of the rows after every other row, at the token counts of E4_GROUPS.
+RANGE_EXPERT_COUNTS = (1, 32)
 ARMS = (
     "cake_det",
     "cake_nondet",
@@ -214,6 +221,13 @@ REQUIRE_FUSED = True
 
 class AccumulatePlanError(AssertionError):
     """A fused arm's row took the composed route on a device that serves the accumulate build."""
+
+
+def aligned_balanced(sum_m, e, align=32):
+    """``e`` groups of ``align``-row aligned size, the last taking the remainder (the
+    rule of the balanced E=4 rows)."""
+    size = (sum_m // e) // align * align
+    return [size] * (e - 1) + [sum_m - size * (e - 1)]
 
 
 def build_rows():
@@ -277,6 +291,16 @@ def build_rows():
         for proj in PROJECTIONS:
             for sizes, dist in step_dists + [(ACC_SHORT_E32, "short16")]:
                 add(op, proj, sizes, torch.bfloat16, dist)
+    # E=1 and E=32 at both ends of the token range (the E=4 token counts): fwd, dgrad,
+    # the bf16 weight gradient and the step per projection.  They come after every other
+    # row, so the earlier rows keep their order and their arm order.
+    for e in RANGE_EXPERT_COUNTS:
+        for sum_m in E4_GROUPS:
+            sizes = aligned_balanced(sum_m, e)
+            for proj in PROJECTIONS:
+                for op in OPS[:3] + ("step",):
+                    add(op, proj, sizes, torch.bfloat16, "balanced")
+    assert len(rows) == 204
     return rows
 
 
@@ -359,6 +383,7 @@ def _plan_note(launch):
         "tile_k",
         "num_tail",
         "tail_splits",
+        "ordered_tail",
         "unordered_tail",
         "wave_mode",
     )
@@ -876,8 +901,10 @@ def _autograd_outputs(fn):
 
 def _cake_nondet_vs_inforward(row, grads):
     """The count of elements in which the ``cake_nondet`` and ``cake_nondet_inforward``
-    output and gradients differ (the output and ``x.grad`` must be equal; a weight
-    gradient may differ where its split tail is unordered)."""
+    output and gradients differ (all must be equal: the 512-wide k tile's weight
+    gradient sums its split tail in slot order, so it repeats bit for bit too; only a
+    split tail planned through ``unordered_tail_archs``, empty in this release, could
+    differ)."""
     if len(grads) < 2:
         return None
     names = ("out", "x.grad", "w1.grad", "w2.grad")
@@ -1046,7 +1073,7 @@ def main():
             shown = " ".join(f"{k} {v:.4f}" for k, v in record["acc_ratios"].items())
             print(f"# {row['label']}: {shown}")
         differing = record.get("cake_nondet_vs_inforward") or {}
-        if any(differing.get(name) for name in ("y", "out", "x.grad")):
+        if any(differing.values()):
             print(
                 f"# {row['label']}: cake_nondet differs from cake_nondet_inforward {differing}"
             )

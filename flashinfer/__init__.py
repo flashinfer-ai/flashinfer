@@ -29,12 +29,6 @@ from .activation import silu_and_mul as silu_and_mul
 from .activation import (
     silu_and_mul_scaled_nvfp4_experts_quantize as silu_and_mul_scaled_nvfp4_experts_quantize,
 )
-from .gated_act_mxfp8 import (
-    silu_and_mul_mxfp8_quantize as silu_and_mul_mxfp8_quantize,
-)
-from .gated_act_mxfp8 import (
-    silu_and_mul_mxfp8_quantize_backward as silu_and_mul_mxfp8_quantize_backward,
-)
 from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
@@ -214,6 +208,17 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "CakeMHCDetFinishFunction": (".cake_mhc_det_train", "CakeMHCDetFinishFunction"),
     "CakeMHCDetPrepareFunction": (".cake_mhc_det_train", "CakeMHCDetPrepareFunction"),
     "CakeMHCHeadDetFunction": (".cake_mhc_head_det_train", "CakeMHCHeadDetFunction"),
+    # The deterministic Cake fused SwiGLU + MXFP8 quantization: its module and
+    # the names of its module (the backend package loads on first use).
+    "cake_gated_act_mxfp8_det_train": (".cake_gated_act_mxfp8_det_train", None),
+    **{
+        name: (".cake_gated_act_mxfp8_det_train", name)
+        for name in (
+            "cake_gated_act_mxfp8_det_train_backward",
+            "cake_gated_act_mxfp8_det_train_forward",
+            "is_cake_gated_act_mxfp8_det_train_supported",
+        )
+    },
     "cake_lm_head_det_train": (".cake_lm_head_det_train", None),
     "cake_lm_head_nondet_train": (".cake_lm_head_nondet_train", None),
     # The deterministic Cake MoE grouped GEMM: the names of its module.
@@ -362,6 +367,10 @@ from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import StaleAdapterError as StaleAdapterError
 from .gemm import svdquant_linear as svdquant_linear
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
+from .gemm import mm_bf16_fp8 as mm_bf16_fp8
+from .gemm import mm_bf16_fp8_workspace_bytes as mm_bf16_fp8_workspace_bytes
+from .gemm import mm_fp16_fp8 as mm_fp16_fp8
+from .gemm import mm_fp16_fp8_workspace_bytes as mm_fp16_fp8_workspace_bytes
 from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
 from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
 from .grouped_mm import grouped_mm_mxfp8 as grouped_mm_mxfp8
@@ -482,6 +491,9 @@ from .page import (
 )
 from .page import (
     nvfp4_quantize_append_paged_kv_cache_with_slot_mapping as nvfp4_quantize_append_paged_kv_cache_with_slot_mapping,
+)
+from .page import (
+    fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping as fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping,
 )
 from .page import (
     nvfp4_quantize_append_paged_mla_kv_cache as nvfp4_quantize_append_paged_mla_kv_cache,

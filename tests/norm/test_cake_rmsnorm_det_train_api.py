@@ -146,10 +146,10 @@ def test_facade_entry_points_match_the_backend(hidden: int) -> None:
 
 # "Beside kernels resident on other streams" in the facade docstring lists, per
 # architecture, the calls whose kernels need a whole SM.  A list item names an
-# architecture set ("SM100 / SM103:") and the calls: "the residual-fused H <h>
-# backward" (every token count; "... above <t> tokens": every program window
-# above ``t``) or "the forward / backward of H <h> above <t> tokens" (every
-# program window above ``t``).
+# architecture set ("SM100 / SM103:") and the calls ("none": no call): "the
+# residual-fused H <h> backward" (every token count; "... above <t> tokens":
+# every program window above ``t``) or "the forward / backward of H <h> above
+# <t> tokens" (every program window above ``t``).
 _WHOLE_SM_ITEM = re.compile(
     r"the residual-fused H (\d+) backward(?: above (\d+) tokens)?"
     r"|the (forward|backward) of H (\d+) above (\d+) tokens"
@@ -201,7 +201,6 @@ def test_documented_whole_sm_calls_match_the_program_table() -> None:
 
     documented = _documented_whole_sm()
     assert set(documented) == set(loader.ARCHES)
-    assert all(documented.values())
     for arch, entries in documented.items():
         assert entries == set(WHOLE_SM[arch]), arch
         for kind, hidden, residual, above in entries:

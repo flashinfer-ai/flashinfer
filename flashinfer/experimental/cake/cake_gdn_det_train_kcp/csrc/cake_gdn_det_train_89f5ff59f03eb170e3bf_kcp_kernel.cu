@@ -87,7 +87,7 @@ kernel_cake_gdn_det_train_89f5ff59f03eb170e3bf_kcp(float* __restrict__ m, float*
     int col_tile = col0 / 128;
     int v0 = col0 % 128;
     int k = tid;
-    long long row_off = (long long)col_tile * 16384 + (long long)(k * 128 + v0);
+    long long row_off = (long long)col_tile * 16384ll + (long long)(k * 128 + v0);
     int e_begin = chain_start[chain];
     int e_end = chain_start[chain + 1];
     unsigned int x_addr = x_block_addr + (unsigned int)(k * 64);
@@ -99,7 +99,7 @@ kernel_cake_gdn_det_train_89f5ff59f03eb170e3bf_kcp(float* __restrict__ m, float*
     float ring[64];
     float pf[32];
     long long x0_off = x0_index[chain];
-    if (x0_off >= 0) {
+    if (x0_off >= 0ll) {
         {
             float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + row_off);
             vals[0 + 0] = _v4.x;
@@ -108,21 +108,21 @@ kernel_cake_gdn_det_train_89f5ff59f03eb170e3bf_kcp(float* __restrict__ m, float*
             vals[0 + 3] = _v4.w;
         }
         {
-            float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + row_off + 4);
+            float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + row_off + 4ll);
             vals[4 + 0] = _v4.x;
             vals[4 + 1] = _v4.y;
             vals[4 + 2] = _v4.z;
             vals[4 + 3] = _v4.w;
         }
         {
-            float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + row_off + 8);
+            float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + row_off + 8ll);
             vals[8 + 0] = _v4.x;
             vals[8 + 1] = _v4.y;
             vals[8 + 2] = _v4.z;
             vals[8 + 3] = _v4.w;
         }
         {
-            float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + row_off + 12);
+            float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + row_off + 12ll);
             vals[12 + 0] = _v4.x;
             vals[12 + 1] = _v4.y;
             vals[12 + 2] = _v4.z;
@@ -145,43 +145,43 @@ kernel_cake_gdn_det_train_89f5ff59f03eb170e3bf_kcp(float* __restrict__ m, float*
     if (e_begin < e_end) {
         if (write_states != 0) {
             long long y_first = elem_y[e_begin];
-            if (y_first >= 0) {
+            if (y_first >= 0ll) {
                 {
                     float4 _v4 = make_float4(vals[0 + 0], vals[0 + 1], vals[0 + 2], vals[0 + 3]);
                     *reinterpret_cast<float4*>(y + y_first + row_off) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(vals[4 + 0], vals[4 + 1], vals[4 + 2], vals[4 + 3]);
-                    *reinterpret_cast<float4*>(y + y_first + row_off + 4) = _v4;
+                    *reinterpret_cast<float4*>(y + y_first + row_off + 4ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(vals[8 + 0], vals[8 + 1], vals[8 + 2], vals[8 + 3]);
-                    *reinterpret_cast<float4*>(y + y_first + row_off + 8) = _v4;
+                    *reinterpret_cast<float4*>(y + y_first + row_off + 8ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(vals[12 + 0], vals[12 + 1], vals[12 + 2], vals[12 + 3]);
-                    *reinterpret_cast<float4*>(y + y_first + row_off + 12) = _v4;
+                    *reinterpret_cast<float4*>(y + y_first + row_off + 12ll) = _v4;
                 }
             }
         }
     } else {
         long long y_last = y_final[chain];
-        if (y_last >= 0) {
+        if (y_last >= 0ll) {
             {
                 float4 _v4 = make_float4(vals[0 + 0], vals[0 + 1], vals[0 + 2], vals[0 + 3]);
                 *reinterpret_cast<float4*>(y + y_last + row_off) = _v4;
             }
             {
                 float4 _v4 = make_float4(vals[4 + 0], vals[4 + 1], vals[4 + 2], vals[4 + 3]);
-                *reinterpret_cast<float4*>(y + y_last + row_off + 4) = _v4;
+                *reinterpret_cast<float4*>(y + y_last + row_off + 4ll) = _v4;
             }
             {
                 float4 _v4 = make_float4(vals[8 + 0], vals[8 + 1], vals[8 + 2], vals[8 + 3]);
-                *reinterpret_cast<float4*>(y + y_last + row_off + 8) = _v4;
+                *reinterpret_cast<float4*>(y + y_last + row_off + 8ll) = _v4;
             }
             {
                 float4 _v4 = make_float4(vals[12 + 0], vals[12 + 1], vals[12 + 2], vals[12 + 3]);
-                *reinterpret_cast<float4*>(y + y_last + row_off + 12) = _v4;
+                *reinterpret_cast<float4*>(y + y_last + row_off + 12ll) = _v4;
             }
         }
     }
@@ -215,7 +215,7 @@ kernel_cake_gdn_det_train_89f5ff59f03eb170e3bf_kcp(float* __restrict__ m, float*
             if (col_tile != 0) {
                 c_off = -1;
             }
-            if (c_off >= 0) {
+            if (c_off >= 0ll) {
                 {
                     float4 _v4 = *reinterpret_cast<const float4*>(c + c_off + row_off);
                     acc[0 + 0] = _v4.x;
@@ -224,21 +224,21 @@ kernel_cake_gdn_det_train_89f5ff59f03eb170e3bf_kcp(float* __restrict__ m, float*
                     acc[0 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_off + row_off + 4);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_off + row_off + 4ll);
                     acc[4 + 0] = _v4.x;
                     acc[4 + 1] = _v4.y;
                     acc[4 + 2] = _v4.z;
                     acc[4 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_off + row_off + 8);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_off + row_off + 8ll);
                     acc[8 + 0] = _v4.x;
                     acc[8 + 1] = _v4.y;
                     acc[8 + 2] = _v4.z;
                     acc[8 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_off + row_off + 12);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_off + row_off + 12ll);
                     acc[12 + 0] = _v4.x;
                     acc[12 + 1] = _v4.y;
                     acc[12 + 2] = _v4.z;
@@ -564,43 +564,43 @@ kernel_cake_gdn_det_train_89f5ff59f03eb170e3bf_kcp(float* __restrict__ m, float*
             if (has_next != 0) {
                 if (write_states != 0) {
                     long long y_next = elem_y[e + 1];
-                    if (y_next >= 0) {
+                    if (y_next >= 0ll) {
                         {
                             float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
                             *reinterpret_cast<float4*>(y + y_next + row_off) = _v4;
                         }
                         {
                             float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                            *reinterpret_cast<float4*>(y + y_next + row_off + 4) = _v4;
+                            *reinterpret_cast<float4*>(y + y_next + row_off + 4ll) = _v4;
                         }
                         {
                             float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
-                            *reinterpret_cast<float4*>(y + y_next + row_off + 8) = _v4;
+                            *reinterpret_cast<float4*>(y + y_next + row_off + 8ll) = _v4;
                         }
                         {
                             float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
-                            *reinterpret_cast<float4*>(y + y_next + row_off + 12) = _v4;
+                            *reinterpret_cast<float4*>(y + y_next + row_off + 12ll) = _v4;
                         }
                     }
                 }
             } else {
                 long long y_out = y_final[chain];
-                if (y_out >= 0) {
+                if (y_out >= 0ll) {
                     {
                         float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
                         *reinterpret_cast<float4*>(y + y_out + row_off) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                        *reinterpret_cast<float4*>(y + y_out + row_off + 4) = _v4;
+                        *reinterpret_cast<float4*>(y + y_out + row_off + 4ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
-                        *reinterpret_cast<float4*>(y + y_out + row_off + 8) = _v4;
+                        *reinterpret_cast<float4*>(y + y_out + row_off + 8ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
-                        *reinterpret_cast<float4*>(y + y_out + row_off + 12) = _v4;
+                        *reinterpret_cast<float4*>(y + y_out + row_off + 12ll) = _v4;
                     }
                 }
             }
@@ -712,7 +712,7 @@ kernel_cake_gdn_det_train_89f5ff59f03eb170e3bf_kcp(float* __restrict__ m, float*
             if (col_tile != 0) {
                 c_off_1 = -1;
             }
-            if (c_off_1 >= 0) {
+            if (c_off_1 >= 0ll) {
                 {
                     float4 _v4 = *reinterpret_cast<const float4*>(c + c_off_1 + row_off);
                     acc[0 + 0] = _v4.x;
@@ -721,21 +721,21 @@ kernel_cake_gdn_det_train_89f5ff59f03eb170e3bf_kcp(float* __restrict__ m, float*
                     acc[0 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_off_1 + row_off + 4);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_off_1 + row_off + 4ll);
                     acc[4 + 0] = _v4.x;
                     acc[4 + 1] = _v4.y;
                     acc[4 + 2] = _v4.z;
                     acc[4 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_off_1 + row_off + 8);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_off_1 + row_off + 8ll);
                     acc[8 + 0] = _v4.x;
                     acc[8 + 1] = _v4.y;
                     acc[8 + 2] = _v4.z;
                     acc[8 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_off_1 + row_off + 12);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_off_1 + row_off + 12ll);
                     acc[12 + 0] = _v4.x;
                     acc[12 + 1] = _v4.y;
                     acc[12 + 2] = _v4.z;
@@ -1254,43 +1254,43 @@ kernel_cake_gdn_det_train_89f5ff59f03eb170e3bf_kcp(float* __restrict__ m, float*
             if (has_next_1 != 0) {
                 if (write_states != 0) {
                     long long y_next_1 = elem_y[e_1 + 1];
-                    if (y_next_1 >= 0) {
+                    if (y_next_1 >= 0ll) {
                         {
                             float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
                             *reinterpret_cast<float4*>(y + y_next_1 + row_off) = _v4;
                         }
                         {
                             float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                            *reinterpret_cast<float4*>(y + y_next_1 + row_off + 4) = _v4;
+                            *reinterpret_cast<float4*>(y + y_next_1 + row_off + 4ll) = _v4;
                         }
                         {
                             float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
-                            *reinterpret_cast<float4*>(y + y_next_1 + row_off + 8) = _v4;
+                            *reinterpret_cast<float4*>(y + y_next_1 + row_off + 8ll) = _v4;
                         }
                         {
                             float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
-                            *reinterpret_cast<float4*>(y + y_next_1 + row_off + 12) = _v4;
+                            *reinterpret_cast<float4*>(y + y_next_1 + row_off + 12ll) = _v4;
                         }
                     }
                 }
             } else {
                 long long y_out_1 = y_final[chain];
-                if (y_out_1 >= 0) {
+                if (y_out_1 >= 0ll) {
                     {
                         float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
                         *reinterpret_cast<float4*>(y + y_out_1 + row_off) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                        *reinterpret_cast<float4*>(y + y_out_1 + row_off + 4) = _v4;
+                        *reinterpret_cast<float4*>(y + y_out_1 + row_off + 4ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
-                        *reinterpret_cast<float4*>(y + y_out_1 + row_off + 8) = _v4;
+                        *reinterpret_cast<float4*>(y + y_out_1 + row_off + 8ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
-                        *reinterpret_cast<float4*>(y + y_out_1 + row_off + 12) = _v4;
+                        *reinterpret_cast<float4*>(y + y_out_1 + row_off + 12ll) = _v4;
                     }
                 }
             }

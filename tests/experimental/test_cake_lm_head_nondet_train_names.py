@@ -263,12 +263,24 @@ def test_no_entry_takes_a_mode_keyword():
             obj = getattr(module, name)
             fns[f"{module_name}.{name}"] = obj.forward if inspect.isclass(obj) else obj
     assert len(fns) == 23
-    classes = 0
+    classes = []
     for module_name in ("cake_backend", "cake_backend_opt_in", "cake_support"):
         for name, cls in _autograd_functions(_backend(module_name)):
             fns[f"{module_name}.{name}.forward"] = cls.forward
-            classes += 1
-    assert classes == 8
+            classes.append(f"{module_name}.{name}")
+    assert sorted(classes) == sorted(
+        [
+            "cake_backend.CakeLMHeadNondetLogprobFunction",
+            "cake_backend.CakeLMHeadNondetLogprobKeepFunction",
+            "cake_backend.CakeLMHeadNondetLogprobTemperatureFunction",
+            "cake_backend.CakeLMHeadNondetLossFunction",
+            "cake_backend._SmallCallStage",
+            "cake_backend_opt_in.CakeLMHeadNondetLogprobFunction",
+            "cake_backend_opt_in.CakeLMHeadNondetLogprobTemperatureFunction",
+            "cake_backend_opt_in.CakeLMHeadNondetLossFunction",
+            "cake_support.CakeLMHeadNondetSupportFunction",
+        ]
+    ), sorted(classes)
     for label, fn in fns.items():
         try:
             inspect.signature(fn).bind_partial(deterministic=False)

@@ -15,7 +15,7 @@ limitations under the License.
 
 The CP = 1 local path of the Cake packed GDN training package
 (``flashinfer.cake_gdn_det_train_kcp`` with a one-rank context) against the exact FP64
-reference of ``tests/test_helpers/cake_gdn_det_train_kcp_reference.py``.
+reference of ``tests/experimental/test_helpers/cake_gdn_det_train_kcp_reference.py``.
 
 Covered here: the six outputs ``out, dq, dk, dv, dbeta, dg`` on ragged packs
 of the normal gate regime (natural-log gates down to the -42 class; zero
@@ -39,7 +39,7 @@ import importlib
 import pytest
 import torch
 
-from tests.test_helpers.cake_gdn_det_train_kcp_reference import (
+from tests.experimental.test_helpers.cake_gdn_det_train_kcp_reference import (
     BLOCK,
     D,
     GRAD_NAMES,
@@ -51,7 +51,7 @@ from tests.test_helpers.cake_gdn_det_train_kcp_reference import (
     make_inputs,
     reference_pack,
 )
-from tests.test_helpers.cake_package import PACKAGES, cake_package
+from tests.cake.test_helpers.cake_package import PACKAGES, cake_package
 
 gdn_api = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
 
@@ -1030,3 +1030,204 @@ def test_full_backward_without_save_transfer_matches_light_on_poisoned_memory(
         assert kcp.LAST_CALL["bwd"]["tapes_source"] == "saved", i
         for n in light:
             assert torch.equal(full[n], light[n]), (i, n)
+
+
+# --------------------------------------------------------------------------- eager pool / ticket sizing after launch #1 (one GPU)
+
+
+@pytest.mark.parametrize(
+    "knobs",
+    [{}, {"save_mode": "full"}, {"use_qk_l2norm_in_kernel": True}, {"segments": 2}],
+    ids=("light", "full", "l2n", "P2"),
+)
+@pytest.mark.parametrize("ckpt", (False, True), ids=("direct", "checkpoint"))
+def test_eager_pools_and_tickets_are_sized_after_the_first_launch(
+    device, monkeypatch, ckpt, knobs
+) -> None:
+    """The kernels backend, one rank, an autograd forward + backward directly and under a non-reentrant checkpoint:
+    at the first launch of every eager call the call's (fresh) workspace holds no pool (and no ticket slot unless the
+    first program is persistent: #6 of a backward on saved or kept tapes) and its sizing is pending; out and the five gradients, the launch records (program, grid) and sequences of the last
+    forward and backward, their workspace bytes and the CUDA peak above the inputs are those of the package with
+    the sizing done in ``ensure`` (``defer=False``), the peak within the allocator's block rounding; every run
+    repeats bitwise."""
+    from torch.utils.checkpoint import checkpoint
+
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
+    )
+    cu = _cu((2048 + 37, 1000, 129))
+    inputs = make_inputs(cu, 16, 48)
+    ctx = _local_context(cu, device)
+    ctx.prepare(16, 48, P=knobs.get("segments"))
+    dout = inputs["dout"].to(device)
+    leaves0 = [inputs[n].to(device) for n in OPERANDS]
+    first: list = []
+    real_run = kcp.KernelBackend.run
+
+    def run(self, name, args):
+        call = args["_call"]
+        if all(c is not call for c, *_ in first):
+            ws = call.ws
+            first.append(
+                (
+                    call,
+                    name,
+                    sorted(ws._pools),
+                    ws._tickets is not None,
+                    ws._pending is not None,
+                )
+            )
+        return real_run(self, name, args)
+
+    monkeypatch.setattr(kcp.KernelBackend, "run", run)
+    real_ensure = kcp.CakeGDNDetKcpWorkspace.ensure
+
+    def step(defer: bool) -> tuple[dict, dict, int]:
+        def ensure(self, *a, defer=False, **k):  # noqa: ARG001 - the undeferred sizing
+            return real_ensure(self, *a, defer=False, **k)
+
+        if not defer:
+            monkeypatch.setattr(kcp.CakeGDNDetKcpWorkspace, "ensure", ensure)
+        try:
+            leaves = [x.detach().clone().requires_grad_(True) for x in leaves0]
+
+            def fn(*xs):
+                return gdn_api.cake_gdn_det_kcp(*xs, ctx, **knobs)
+
+            torch.cuda.synchronize(device)
+            base = torch.cuda.memory_allocated(device)
+            torch.cuda.reset_peak_memory_stats(device)
+            out = checkpoint(fn, *leaves, use_reentrant=False) if ckpt else fn(*leaves)
+            grads = torch.autograd.grad(out, leaves, dout)
+            torch.cuda.synchronize(device)
+            peak = torch.cuda.max_memory_allocated(device) - base
+        finally:
+            monkeypatch.setattr(kcp.CakeGDNDetKcpWorkspace, "ensure", real_ensure)
+        res = {"out": out.detach()}
+        res.update({n: gr.detach() for n, gr in zip(GRAD_NAMES, grads, strict=True)})
+        log = {
+            kind: {
+                key: kcp.LAST_CALL[kind][key]
+                for key in (
+                    "records",
+                    "sequence",
+                    "workspace_bytes",
+                    "pool_bytes",
+                    "tape_bytes",
+                )
+            }
+            for kind in ("fwd", "bwd")
+        }
+        return res, log, peak
+
+    ref, ref_log, ref_peak = step(False)
+    n_ref = len(first)
+    assert n_ref >= 2 and all(
+        tk and not pend and pools for _, _, pools, tk, pend in first
+    )
+    got, got_log, got_peak = step(True)
+    deferred = first[n_ref:]
+    assert len(deferred) == n_ref
+    for call, name, pools, tk, pend in deferred:
+        assert call.T_r > 0 and pend and pools == [], (call.backward, name, pools)
+        # the ticket slots exist at the first launch only when it is a persistent program (#6 on saved / kept tapes)
+        assert tk == (name in kcp.TICKET_SITES), (call.backward, name, tk)
+        assert call.ws._pending is None
+    for n in TENSORS:
+        assert torch.equal(got[n], ref[n]), n
+    assert got_log == ref_log
+    # the same tensors are live at every moment; the caching allocator may round a reused block differently when
+    # the allocation order changes (a large block keeps an unsplit remainder below 1 MiB)
+    assert abs(got_peak - ref_peak) <= 4 << 20, (got_peak, ref_peak)
+    again, again_log, _ = step(True)
+    for n in TENSORS:
+        assert torch.equal(again[n], got[n]), n
+    assert again_log == got_log
+
+
+# --------------------------------------------------------------------------- the forward form of #1_l2n (one GPU)
+# With the in-kernel L2 norm a forward whose akk / g_cum have no reader (not a replay-mode or hand-off forward, no saved
+# set that keeps them) launches the record fwd_prep_l2n_fwd (no akk / g_cum stores; test knob prep_form = 1, the shipped
+# form); prep_form = 0 runs the full fwd_prep_l2n everywhere.  Every form of the output-walk matrix with the norm on:
+# out and every gradient bitwise the full form's, two full runs bitwise equal, and every backward replays the full #1.
+
+PREP_FORMS = tuple(
+    (
+        f"l2n-{fid}",
+        layers,
+        ckpt,
+        later,
+        {**opts, "use_qk_l2norm_in_kernel": True},
+        knobs,
+    )
+    for fid, layers, ckpt, later, opts, knobs in FUSED_FORMS
+)
+
+
+@pytest.mark.parametrize("form", PREP_FORMS, ids=[f[0] for f in PREP_FORMS])
+@pytest.mark.parametrize(
+    ("lengths", "heads"),
+    [s[1:] for s in FUSED_SHAPES],
+    ids=[s[0] for s in FUSED_SHAPES],
+)
+def test_prep_forward_form_is_bitwise_the_full_prep(
+    device, monkeypatch, lengths, heads, form
+) -> None:
+    """The forward form of #1_l2n (record ``fwd_prep_l2n_fwd``) against the full ``fwd_prep_l2n`` (test knob
+    ``prep_form`` 1 / 0) on every form of the output-walk matrix with the norm on: every tensor bitwise equal; the
+    first forward of every arm with ``prep_form`` 1 runs the forward form, no backward and no ``prep_form`` 0 call does."""
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
+    )
+    backend = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_backend"
+    )
+    if not kcp.l2n_records_shipped():
+        pytest.skip("the registry ships no in-kernel L2 norm records")
+    if not kcp.prep_form_shipped(backend.device_arch(device.index)):
+        pytest.skip(
+            "the registry ships no forward form of fwd_prep_l2n for this architecture"
+        )
+    cu = _cu(lengths)
+    log: list = []
+    record = kcp._record
+
+    def recording(kind, call):
+        record(kind, call)
+        entry = kcp.LAST_CALL[kind]
+        preps = tuple(
+            r for r, _g in (entry.get("records") or ()) if str(r).startswith("fwd_prep")
+        )
+        log.append((kind, preps))
+
+    monkeypatch.setattr(kcp, "_record", recording)
+
+    def arm(prep_form: int) -> dict:
+        fid, layers, ckpt, later, opts, knobs = form
+        return _fused_arm(
+            device,
+            cu,
+            heads,
+            (fid, layers, ckpt, later, opts, {**knobs, "prep_form": prep_form}),
+            1,
+            log,
+        )
+
+    full = [arm(0) for _ in range(2)]
+    full_log = list(log)
+    fwd = arm(1)
+    fwd_log = list(log)
+    assert [k for k, _p in fwd_log] == [k for k, _p in full_log]
+    assert not any("fwd_prep_l2n_fwd" in p for _k, p in full_log), full_log
+    if fwd_log:  # a graph replay records no call
+        firsts = [p for k, p in fwd_log if k == "fwd"]
+        assert firsts and firsts[0] == ("fwd_prep_l2n_fwd",), fwd_log
+        assert all("fwd_prep_l2n_fwd" not in p for k, p in fwd_log if k == "bwd"), (
+            fwd_log
+        )
+    assert set(fwd) == set(full[0])
+    for n in fwd:
+        assert torch.equal(_bits(full[0][n]), _bits(full[1][n])), (form[0], n)
+        assert torch.equal(_bits(fwd[n]), _bits(full[0][n])), (form[0], n)
+        assert bool(torch.isfinite(fwd[n].float()).all()), n
+    assert kcp.kept_registry_size() == 0

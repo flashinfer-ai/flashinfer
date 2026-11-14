@@ -68,21 +68,21 @@ kernel_cake_dense_projection_gemm_3f431ee1064967195e90(float* __restrict__ ws, f
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     asm volatile("griddepcontrol.wait;" ::: "memory");
     unsigned long long cols64 = (unsigned long long)cols;
-    unsigned long long quads = (cols64 + 3) / 4;
+    unsigned long long quads = (cols64 + 3ull) / 4ull;
     unsigned long long q = (unsigned long long)(bid * 256 + tid);
     if (q < (unsigned long long)rows * quads) {
         unsigned long long r = q / quads;
-        unsigned long long c0 = (q - r * quads) * 4;
+        unsigned long long c0 = (q - r * quads) * 4ull;
         unsigned long long slab = (unsigned long long)rows * cols64;
-        int full = ((cols64 >= c0 + 4) ? 1 : 0);
+        int full = ((cols64 >= c0 + 4ull) ? 1 : 0);
         unsigned long long p_bits = (unsigned long long)(ws + (r * cols64 + c0));
         int vec_in = full;
-        if ((p_bits & 15 | (slab & 3) << 4) != 0) {
+        if ((p_bits & 15ull | (slab & 3ull) << 4ull) != 0ull) {
             vec_in = 0;
         }
         float w[32];
         if (splits > 0) {
-            unsigned long long p_s_0 = 0 * slab + r * cols64 + c0;
+            unsigned long long p_s_0 = 0ull * slab + r * cols64 + c0;
             if (vec_in == 1) {
                 float _vec_load_0[4];
                 {
@@ -107,7 +107,7 @@ kernel_cake_dense_projection_gemm_3f431ee1064967195e90(float* __restrict__ ws, f
             }
         }
         if (splits > 1) {
-            unsigned long long p_s_1 = 1 * slab + r * cols64 + c0;
+            unsigned long long p_s_1 = 1ull * slab + r * cols64 + c0;
             if (vec_in == 1) {
                 float _vec_load_1[4];
                 {
@@ -132,7 +132,7 @@ kernel_cake_dense_projection_gemm_3f431ee1064967195e90(float* __restrict__ ws, f
             }
         }
         if (splits > 2) {
-            unsigned long long p_s_2 = 2 * slab + r * cols64 + c0;
+            unsigned long long p_s_2 = 2ull * slab + r * cols64 + c0;
             if (vec_in == 1) {
                 float _vec_load_2[4];
                 {
@@ -157,7 +157,7 @@ kernel_cake_dense_projection_gemm_3f431ee1064967195e90(float* __restrict__ ws, f
             }
         }
         if (splits > 3) {
-            unsigned long long p_s_3 = 3 * slab + r * cols64 + c0;
+            unsigned long long p_s_3 = 3ull * slab + r * cols64 + c0;
             if (vec_in == 1) {
                 float _vec_load_3[4];
                 {
@@ -182,7 +182,7 @@ kernel_cake_dense_projection_gemm_3f431ee1064967195e90(float* __restrict__ ws, f
             }
         }
         if (splits > 4) {
-            unsigned long long p_s_4 = 4 * slab + r * cols64 + c0;
+            unsigned long long p_s_4 = 4ull * slab + r * cols64 + c0;
             if (vec_in == 1) {
                 float _vec_load_4[4];
                 {
@@ -207,7 +207,7 @@ kernel_cake_dense_projection_gemm_3f431ee1064967195e90(float* __restrict__ ws, f
             }
         }
         if (splits > 5) {
-            unsigned long long p_s_5 = 5 * slab + r * cols64 + c0;
+            unsigned long long p_s_5 = 5ull * slab + r * cols64 + c0;
             if (vec_in == 1) {
                 float _vec_load_5[4];
                 {
@@ -232,7 +232,7 @@ kernel_cake_dense_projection_gemm_3f431ee1064967195e90(float* __restrict__ ws, f
             }
         }
         if (splits > 6) {
-            unsigned long long p_s_6 = 6 * slab + r * cols64 + c0;
+            unsigned long long p_s_6 = 6ull * slab + r * cols64 + c0;
             if (vec_in == 1) {
                 float _vec_load_6[4];
                 {
@@ -257,7 +257,7 @@ kernel_cake_dense_projection_gemm_3f431ee1064967195e90(float* __restrict__ ws, f
             }
         }
         if (splits > 7) {
-            unsigned long long p_s_7 = 7 * slab + r * cols64 + c0;
+            unsigned long long p_s_7 = 7ull * slab + r * cols64 + c0;
             if (vec_in == 1) {
                 float _vec_load_7[4];
                 {
@@ -342,7 +342,7 @@ kernel_cake_dense_projection_gemm_3f431ee1064967195e90(float* __restrict__ ws, f
         unsigned long long o_off = r * (unsigned long long)ldo + c0;
         unsigned long long o_bits = (unsigned long long)(out + o_off);
         int vec_out = full;
-        if ((o_bits & 15) != 0) {
+        if ((o_bits & 15ull) != 0ull) {
             vec_out = 0;
         }
         if (vec_out == 1) {

@@ -44,7 +44,7 @@ from flashinfer.experimental.cake import cake_causal_conv1d_nondet_train as pkg
 from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
     kcp as conv_kcp,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 from tests.experimental.test_cake_causal_conv1d_nondet_train_kcp import (
     _bwd,
     _dw_within,
@@ -232,7 +232,6 @@ def test_backward_launches_the_reserved_grid(monkeypatch, reserve) -> None:
     rows = _widths(device)
     assert len(rows) == 2, rows
     seen = _record_main_grids(monkeypatch)
-    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
     try:
         for C, full, k, shipped in rows:
             p = _problem(LENS, CUTS, C, device)
@@ -244,8 +243,15 @@ def test_backward_launches_the_reserved_grid(monkeypatch, reserve) -> None:
                 p.x_local, p.w, p.ctx, p.dy_local, hist_det
             )
             _, _, dw_ref = _reference(p.x, p.w, p.cu, p.dy)
-            for host_trim in (1, 0):
-                conv_kcp._set_test_knobs({"host_trim": host_trim})
+            # The single program's shipped grid at reserve 0 (the ``bwd_route`` knob "single"); the shipped route
+            # runs the overlapped pair at reserve 0 (no ``kcp_bwd`` launch) and the reserved grid at reserve K.
+            for host_trim, route in (
+                (1, "single"),
+                (0, "single"),
+                (1, "overlap"),
+                (0, "overlap"),
+            ):
+                conv_kcp._set_test_knobs({"host_trim": host_trim, "bwd_route": route})
                 conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
                 for k_res, expected in ((0, shipped), (reserve, full - reserve * k)):
                     seen.clear()
@@ -253,8 +259,11 @@ def test_backward_launches_the_reserved_grid(monkeypatch, reserve) -> None:
                         p.x_local, p.w, p.ctx, p.dy_local, hist, bwd_reserve_sms=k_res
                     )
                     torch.cuda.synchronize()
-                    label = f"C={C} host_trim={host_trim} reserve={k_res}"
-                    assert seen == [(expected, 1, 1)], (label, seen)
+                    label = f"C={C} host_trim={host_trim} route={route} reserve={k_res}"
+                    want = (
+                        [] if route == "overlap" and k_res == 0 else [(expected, 1, 1)]
+                    )
+                    assert seen == want, (label, seen)
                     assert torch.equal(_bits(dx), _bits(dx_det)), label
                     _dw_within(dw, dw_ref, f"dweight vs FP64 oracle, {label}")
                     held = _stream_workspace()

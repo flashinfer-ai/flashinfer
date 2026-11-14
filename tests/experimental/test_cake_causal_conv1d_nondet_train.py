@@ -49,7 +49,7 @@ after the call.  The 32-vector tiles of ``NARROW_TILES`` the same way at every k
 (``NARROW_CASES``: the key's channel ends and an inner channel count, at token counts inside the key's range), and
 the side-stream one-SM trim of a three-tile narrow row's grid.
 
-This suite names its package once, through ``tests.test_helpers.cake_package`` (key
+This suite names its package once, through ``tests.cake.test_helpers.cake_package`` (key
 ``cake_causal_conv1d_nondet_train``), and the deterministic package for the parity checks through the same table;
 a vendored build without the deterministic package skips those checks.  Every test skips until the exporter has
 rendered the package (``build.json`` and ``csrc/``).
@@ -64,7 +64,7 @@ import weakref
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 KEY = "cake_causal_conv1d_nondet_train"
 pkg = cake_package(KEY)
