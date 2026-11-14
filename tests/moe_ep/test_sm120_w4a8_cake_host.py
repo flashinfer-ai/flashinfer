@@ -1459,3 +1459,32 @@ def test_sm120_tuner_rejects_non_swiglu_activation(capsys) -> None:
         argv += ["2048", "--num-experts", "256", "--topk", "6", "--max-tokens", "1024"]
         assert tune.main([*argv, *extra]) == 2
         assert "not supported with sm120_mxfp4_mxfp8" in capsys.readouterr().err
+
+
+def test_row_schedule_follows_the_mean_rows_with_a_rows_hint() -> None:
+    """``set_rows_by_rank``: with a bound, the m64 / m128 choice reads the mean rows per rank of the
+    rank-uniform hint (a 1-source-rank P/D prefill step at 1024 rows -> m64); without a hint or
+    without a bound it keeps the largest count; a hint never raises the bound."""
+    from types import SimpleNamespace
+
+    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_backend import (
+        Sm120Mxfp4Mxfp8CakeMegaKernelBackend as B,
+    )
+
+    def rows(hint, bound, by_rank):
+        ws = SimpleNamespace(
+            rows_hint=hint, staged_bound=bound, world_size=len(by_rank)
+        )
+        return B._schedule_rows(ws, by_rank)
+
+    bound = [1024] * 4
+    # no hint: the bound (m128 at m64_max_rows 512)
+    assert rows(None, 1024, bound) == 1024
+    assert rows((1024, 0, 0, 0), 1024, bound) == 256  # one source rank: m64
+    assert rows((1024, 1024, 0, 0), 1024, bound) == 512
+    assert rows((1024, 1024, 1024, 0), 1024, bound) == 768
+    assert rows((1024,) * 4, 1024, bound) == 1024  # uniform: unchanged
+    assert rows((513, 512, 512, 512), 1024, bound) == 513  # ceil
+    assert rows((2048,) * 4, 1024, bound) == 1024  # never above the bound
+    # gather path: exact counts, max rule
+    assert rows((1024, 0, 0, 0), None, [1024, 0, 0, 0]) == 1024

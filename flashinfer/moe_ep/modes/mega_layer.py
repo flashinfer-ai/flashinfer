@@ -6,7 +6,7 @@ import dataclasses
 import warnings
 import weakref
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -706,6 +706,10 @@ class MoEEpMegaLayer(nn.Module):
             backend_workspace,
             compile_tokens_per_rank,
         )
+        set_rows = getattr(kernel, "set_rows_by_rank", None)
+        if set_rows is not None:
+            # a schedule hint lives for one invocation only
+            set_rows(backend_workspace, None)
         return (
             fleet_params,
             backend_workspace,
@@ -720,12 +724,16 @@ class MoEEpMegaLayer(nn.Module):
         *,
         workspace: MoEEpMegaWorkspace | None = None,
         compile_tokens_per_rank: int | None = None,
+        rows_by_rank: Sequence[int] | None = None,
     ) -> None:
         """Validate and stage one invocation without launching the kernel.
 
         ``compile_tokens_per_rank`` selects a collective graph/kernel bucket
         without changing the selected workspace capacity. Every EP rank must
-        use the same bucket for an invocation.
+        use the same bucket for an invocation.  ``rows_by_rank`` optionally
+        passes the invocation's per-rank token counts (rank-uniform, e.g. the
+        DP metadata) to backends that use them as a schedule hint
+        (``set_rows_by_rank``); others ignore it.
         """
 
         (
@@ -739,6 +747,8 @@ class MoEEpMegaLayer(nn.Module):
             workspace=workspace,
             compile_tokens_per_rank=compile_tokens_per_rank,
         )
+        if rows_by_rank is not None and hasattr(kernel, "set_rows_by_rank"):
+            kernel.set_rows_by_rank(backend_workspace, rows_by_rank)
         kernel.stage_inputs(
             t,
             backend_workspace,
