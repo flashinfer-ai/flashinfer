@@ -1040,14 +1040,17 @@ def test_paged_query_lengths_are_independent_of_storage_offsets(
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 @pytest.mark.parametrize("metadata_device", ["cpu", "cuda"])
-def test_paged_auto_device_lengths_do_not_add_readback(metadata_device):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_paged_auto_device_lengths_do_not_add_readback(dtype, metadata_device):
+    if dtype == torch.float16 and not prefill._cudnn_supports_paged_fp16_auto():
+        pytest.skip("FP16 auto requires stable FE 1.33")
     if (
         torch.cuda.get_device_capability() != (10, 0)
         or not prefill._cudnn_supports_paged_auto()
     ):
         pytest.skip("requires the qualified SM100 paged-auto runtime")
     device = torch.device("cuda")
-    q = torch.randn(128, 16, 128, device=device, dtype=torch.bfloat16)
+    q = torch.randn(128, 16, 128, device=device, dtype=dtype)
     k = torch.randn(512, 4, 16, 128, device=device, dtype=q.dtype)
     v = torch.randn_like(k)
     table = torch.arange(512, device=device, dtype=torch.int32).reshape(1, -1)
@@ -1398,7 +1401,12 @@ def test_prefill_scales_capture_replay(paged, scale_type, dtype):
         "large_full",
     ],
 )
-def test_paged_auto_preserves_runtime_scales(q_lengths, kv_lengths, expected_backend):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_paged_auto_preserves_runtime_scales(
+    dtype, q_lengths, kv_lengths, expected_backend
+):
+    if dtype == torch.float16 and not prefill._cudnn_supports_paged_fp16_auto():
+        pytest.skip("FP16 auto requires stable FE 1.33")
     if (
         torch.cuda.get_device_capability() != (10, 0)
         or not prefill._cudnn_supports_paged_auto()
@@ -1406,7 +1414,7 @@ def test_paged_auto_preserves_runtime_scales(q_lengths, kv_lengths, expected_bac
         pytest.skip("requires the qualified SM100 paged-auto runtime")
     torch.manual_seed(19)
     counts = [length // 16 for length in kv_lengths]
-    q = torch.randn(sum(q_lengths), 16, 128, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(sum(q_lengths), 16, 128, device="cuda", dtype=dtype)
     k = torch.randn(sum(counts), 16, 4, 128, device=q.device, dtype=q.dtype)
     v = torch.randn_like(k)
     qo = torch.tensor([0, *q_lengths], dtype=torch.int32).cumsum(0).int()
