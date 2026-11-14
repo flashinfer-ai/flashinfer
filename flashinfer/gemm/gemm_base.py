@@ -74,6 +74,7 @@ from .gemm_mm_fp4_cute_dsl import (
     precompile_mm_fp4_tactics,
 )
 from .gemm_mm_mxfp8_precompile import precompile_mm_mxfp8_tactics
+from ._cudnn_plan_build import Bf16OverrideGraphSpec, build_bf16_override_graph
 from .gemm_mm_mxfp8_cute_dsl import (
     _b12x_gemm_mxfp8_requirement,
     _b12x_gemm_mxfp8_runner,
@@ -5783,6 +5784,25 @@ def execute_cudnn_gemm_bf16_graph(graph, a, b, bias, c_final, workspace, tactic=
 # ---------------------------------------------------------------------------
 
 
+def _bf16_override_graph_spec(
+    batch, n, k, o_type, bias_is_not_none, cache_m, is_a_k_major, is_b_k_major
+) -> Bf16OverrideGraphSpec:
+    return Bf16OverrideGraphSpec(
+        batch=batch,
+        n=n,
+        k=k,
+        o_type=int(o_type),
+        bias=bool(bias_is_not_none),
+        cache_m=cache_m,
+        is_a_k_major=is_a_k_major,
+        is_b_k_major=is_b_k_major,
+        uid_a=UIDs.A_UID.value,
+        uid_b=UIDs.B_UID.value,
+        uid_bias=UIDs.BIAS_UID.value,
+        uid_o=UIDs.O_UID.value,
+    )
+
+
 @functools.lru_cache(maxsize=2048)
 def build_cudnn_gemm_bf16_graph_override_shape(
     batch,
@@ -5811,63 +5831,13 @@ def build_cudnn_gemm_bf16_graph_override_shape(
     """
     _check_cudnn_override_shape_availability()
 
-    a_shape = (batch, cache_m, k)
-    a_stride = (cache_m * k, k, 1) if is_a_k_major else (cache_m * k, 1, cache_m)
-    b_shape = (batch, k, n)
-    b_stride = (k * n, 1, k) if is_b_k_major else (k * n, n, 1)
-    bias_shape = (1, 1, n)
-    bias_stride = (n, n, 1)
-
     stream = torch.cuda.current_stream(device)
-    graph = cudnn.pygraph(
-        io_data_type=cudnn.data_type.BFLOAT16,
-        intermediate_data_type=cudnn.data_type.FLOAT,
-        compute_data_type=cudnn.data_type.FLOAT,
-        handle=_get_cudnn_handle(device, stream),
-        is_override_shape_enabled=True,
+    graph = build_bf16_override_graph(
+        _bf16_override_graph_spec(
+            batch, n, k, o_type, bias_is_not_none, cache_m, is_a_k_major, is_b_k_major
+        ),
+        _get_cudnn_handle(device, stream),
     )
-
-    a_cudnn_tensor = graph.tensor(
-        name="a",
-        dim=list(a_shape),
-        stride=list(a_stride),
-        data_type=cudnn.data_type.BFLOAT16,
-    )
-    b_cudnn_tensor = graph.tensor(
-        name="b",
-        dim=list(b_shape),
-        stride=list(b_stride),
-        data_type=cudnn.data_type.BFLOAT16,
-    )
-    c_cudnn_tensor = graph.matmul(
-        name="matmul",
-        A=a_cudnn_tensor,
-        B=b_cudnn_tensor,
-        compute_data_type=cudnn.data_type.FLOAT,
-    )
-    c_cudnn_tensor.set_data_type(cudnn.data_type.FLOAT)
-
-    if bias_is_not_none:
-        bias_cudnn_tensor = graph.tensor(
-            name="bias",
-            dim=bias_shape,
-            stride=bias_stride,
-            data_type=cudnn.data_type.BFLOAT16,
-        )
-        c_final_cudnn_tensor = graph.add(
-            name="bias_add",
-            a=c_cudnn_tensor,
-            b=bias_cudnn_tensor,
-        )
-        bias_cudnn_tensor.set_uid(UIDs.BIAS_UID.value)
-    else:
-        c_final_cudnn_tensor = c_cudnn_tensor
-
-    c_final_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(o_type)
-
-    a_cudnn_tensor.set_uid(UIDs.A_UID.value)
-    b_cudnn_tensor.set_uid(UIDs.B_UID.value)
-    c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
 
     _finalize_cudnn_graph_for_tactic(
         graph, tactic, [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
