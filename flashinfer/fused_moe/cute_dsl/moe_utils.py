@@ -218,19 +218,21 @@ def validate_pre_fc2_routing(
     per_token_scale: bool = False,
     localized_weights: bool = False,
 ) -> None:
-    """Reject modes that cannot preserve the pre-FC2 NVFP4 weighting contract."""
+    """Keep the legacy block-scaled pre-FC2 weighting restrictions."""
+    legacy = enabled and not swap_ab and quant_mode != "w4a16"
     validate_pre_fc2_options(
-        enabled, per_token_scale=per_token_scale, localized_weights=localized_weights
+        legacy,
+        per_token_scale=per_token_scale,
+        localized_weights=localized_weights,
     )
-    if enabled and (
+    if legacy and (
         quant_mode != "w4a4"
         or activation != ActivationType.ClampedRelu2
         or output_dtype != torch.bfloat16
-        or swap_ab
     ):
         raise ValueError(
-            "routing_weights_before_fc2 requires W4A4, ClampedRelu2, "
-            "BF16 output, and swap_ab=False"
+            "Non-swap routing_weights_before_fc2 requires W4A4, ClampedRelu2, "
+            "and BF16 output"
         )
 
 

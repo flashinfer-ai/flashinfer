@@ -621,6 +621,11 @@ def with_knobs(config: Any, knobs: Optional[Dict[str, Any]]) -> Any:
     for key, value in knobs.items():
         if key == "token_back_mode" and "token_back_by_dispatch" in fields:
             overrides["token_back_by_dispatch"] = value != "epi_warps"
+        elif (
+            key == "apply_routing_weights_before_fc2"
+            and "routing_weights_before_fc2" in fields
+        ):
+            overrides["routing_weights_before_fc2"] = value
         elif key in fields:
             overrides[key] = value
         # silently drop knobs this dtype's config does not expose
@@ -649,6 +654,7 @@ _EXPLICIT_CONFIG_FIELDS = frozenset(
         "activation",
         "situ_beta",
         "situ_linear_beta",
+        "routing_weights_before_fc2",
         "apply_routing_weights_before_fc2",
         "apply_topk_in_fc1",  # Deprecated name
         "enable_in_kernel_fc2_reduce",

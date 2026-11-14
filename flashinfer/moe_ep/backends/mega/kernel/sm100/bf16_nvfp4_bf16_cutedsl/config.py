@@ -14,14 +14,17 @@ if TYPE_CHECKING:
 
 
 @legacy_finalize
-@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
+@deprecated_aliases(
+    apply_routing_weights_before_fc2="routing_weights_before_fc2",
+    apply_topk_in_fc1="routing_weights_before_fc2",
+)
 @dataclass
 class Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     """BF16 activations and NVFP4 expert weights with online dequantization.
 
     Input, FC1 activation handoff, dispatch/combine and output remain BF16.
     Routing scores are applied after FC2 by default.
-    ``apply_routing_weights_before_fc2`` instead multiplies the completed FP32
+    ``routing_weights_before_fc2`` instead multiplies the completed FP32
     SwiGLU activation before its BF16 handoff, changing the rounding contract.
     ``MoEWeightPack`` supplies packed weight data and E4M3 block scales;
     ``fc1_alpha`` and ``fc2_alpha`` supply optional per-expert FP32 epilogue
@@ -48,7 +51,7 @@ class Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # both. "auto" tunes collectively on the first forward, before capture.
     knobs: dict | Literal["auto"] | None = None
 
-    apply_routing_weights_before_fc2: bool = False
+    routing_weights_before_fc2: bool = False
     # Append new fields to preserve existing positional construction.
     fc1_norm_const: torch.Tensor | None = None
     swiglu_alpha: float | None = None

@@ -215,7 +215,7 @@ def test_weighting_precedes_quantization_with_bf16_rounding(
 
 @pytest.mark.parametrize(
     "invalid",
-    ["activation", "clamp", "output", "w4a8", "w4a16", "swap_ab", "tile_size"],
+    ["activation", "clamp", "output", "w4a8", "w4a16", "tile_size"],
 )
 def test_invalid_pre_fc2_configuration_rejected_without_cuda(invalid):
     kwargs = dict(
@@ -236,8 +236,6 @@ def test_invalid_pre_fc2_configuration_rejected_without_cuda(invalid):
         kwargs["clamped_relu2_limit"] = None
     elif invalid == "output":
         kwargs["output_dtype"] = torch.float16
-    elif invalid == "swap_ab":
-        kwargs["swap_ab"] = True
     elif invalid == "tile_size":
         kwargs["tile_size"] = 256
     else:

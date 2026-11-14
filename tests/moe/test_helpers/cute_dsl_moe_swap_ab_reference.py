@@ -814,6 +814,7 @@ def cute_dsl_moe_reference(
     sf_vec_size=16,
     swap_ab=True,
     mma_k_plans=(None, None),
+    routing_weights_before_fc2=False,
 ):
     """Evaluate unfused swap-AB MoE from the exact prepared kernel operands.
 
@@ -833,8 +834,8 @@ def cute_dsl_moe_reference(
     }
     if (a_dtype, b_dtype, sf_vec_size) not in formats:
         raise ValueError("Unsupported block-scaled MoE operand combination")
-    if output_dtype != torch.bfloat16:
-        raise ValueError("The standalone SM100 MoE finalizer requires BF16 output")
+    if output_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("The MoE reference requires BF16 or FP16 output")
     if per_token_scale is not None and sf_vec_size != 16:
         raise ValueError("Per-token scaling is an NVFP4 contract")
     if activation_type in (ActivationType.Relu2, ActivationType.ClampedRelu2):
@@ -898,9 +899,17 @@ def cute_dsl_moe_reference(
             situ_linear_beta,
             clamped_relu2_limit,
         )
+        scale = fc2_input_scale
+        if routing_weights_before_fc2:
+            activated = (
+                activated * token_final_scales[token_ids, slots].float()[:, None]
+            )
+            if scale is not None:
+                scale = scale.reshape(-1)
+                scale = scale[expert : expert + 1] if scale.numel() > 1 else scale
         if sf_vec_size == 16:
             if per_token_scale is None:
-                q, sf = ref_fp4_quant(activated, fc2_input_scale, 16)
+                q, sf = ref_fp4_quant(activated, scale, 16)
                 sf = sf.to(torch.float8_e4m3fn)
                 route_scale = None
             else:
@@ -939,11 +948,16 @@ def cute_dsl_moe_reference(
         routes[token_ids, slots] = scale_fc2(
             acc2,
             w2_alpha[expert],
-            token_final_scales.dtype,
+            torch.float32 if routing_weights_before_fc2 else token_final_scales.dtype,
             route_scale,
             output_dtype,
         )
-    return combine_routes(routes, token_final_scales, local)
+    final_weights = (
+        torch.ones_like(token_final_scales, dtype=torch.float32)
+        if routing_weights_before_fc2
+        else token_final_scales
+    )
+    return combine_routes(routes, final_weights, local)
 
 
 def assert_cute_dsl_moe_bits(actual, expected):

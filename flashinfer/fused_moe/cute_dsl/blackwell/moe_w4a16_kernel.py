@@ -276,6 +276,7 @@ class Sm100W4A16GroupedGemmKernel:
         gather_input: bool = False,
         gather_top_k: int = 1,
         enable_iket: bool = False,
+        pre_fc2_routing: bool = False,
     ):
         """Initialize the W4A16 grouped GEMM configuration."""
         self.enable_iket = enable_iket
@@ -289,6 +290,7 @@ class Sm100W4A16GroupedGemmKernel:
         self.group_count = group_count
         self.gather_input = gather_input
         self.gather_top_k = gather_top_k
+        self.pre_fc2_routing = pre_fc2_routing
         self.acc_dtype = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
@@ -838,6 +840,18 @@ class Sm100W4A16GroupedGemmKernel:
         return a_load2trans_consumer_state, trans2mma_producer_state
 
     @cute.jit
+    def pre_fc2_route_weight(
+        self, route_in_tile, route_start, valid_tokens, token_mapping, routing_weights
+    ):
+        weight = cutlass.Float32(0.0)
+        if route_in_tile < valid_tokens:
+            expanded = token_mapping[route_start + route_in_tile]
+            weight = routing_weights[
+                expanded // self.gather_top_k, expanded % self.gather_top_k
+            ]
+        return weight
+
+    @cute.jit
     def wrapper(
         self,
         weight_ptr: cute.Pointer,
@@ -907,7 +921,7 @@ class Sm100W4A16GroupedGemmKernel:
                 token_final_scales_ptr,
                 cute.make_ordered_layout((num_tokens, top_k), order=(1, 0)),
             )
-            if cutlass.const_expr(self.use_fused_finalize)
+            if cutlass.const_expr(self.use_fused_finalize or self.pre_fc2_routing)
             else None
         )
         return self(
@@ -2495,6 +2509,26 @@ class Sm100W4A16GroupedGemmKernel:
 
                             coord_0 = up_coords[i]
                             coord_1 = up_coords[i + 1]
+                            if cutlass.const_expr(self.pre_fc2_routing):
+                                result = cute.arch.mul_packed_f32x2(
+                                    result,
+                                    (
+                                        self.pre_fc2_route_weight(
+                                            coord_0[1],
+                                            work_tile.coord_n,
+                                            valid_tokens,
+                                            permuted_idx_to_expanded_idx,
+                                            token_final_scales,
+                                        ),
+                                        self.pre_fc2_route_weight(
+                                            coord_1[1],
+                                            work_tile.coord_n,
+                                            valid_tokens,
+                                            permuted_idx_to_expanded_idx,
+                                            token_final_scales,
+                                        ),
+                                    ),
+                                )
                             # Fold paired TMEM rows back into the reduced-M
                             # output tile and keep the staged N coordinate local.
                             output_m_0 = coord_0[0] // 32 * 16 + coord_0[0] % 16
@@ -2563,6 +2597,16 @@ class Sm100W4A16GroupedGemmKernel:
                             tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.mul_packed_f32x2(
                                 relu, relu
                             )
+                        if cutlass.const_expr(self.pre_fc2_routing):
+                            route_coords = m_thr_offset[(None, None, None, subtile_idx)]
+                            for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                                tTR_rAcc[i] = tTR_rAcc[i] * self.pre_fc2_route_weight(
+                                    route_coords[i][1],
+                                    work_tile.coord_n,
+                                    valid_tokens,
+                                    permuted_idx_to_expanded_idx,
+                                    token_final_scales,
+                                )
                     elif cutlass.const_expr(not self.use_fused_finalize):
                         alpha_f32 = cutlass.Float32(alpha_val)
                         for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
