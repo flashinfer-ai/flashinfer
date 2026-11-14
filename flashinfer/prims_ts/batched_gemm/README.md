@@ -290,6 +290,14 @@ timing:
 python -m batched_gemm.batched_gemm_run --benchmark --skip-ref-check
 ```
 
+To launch the kernel exactly once for an external profiler, with no correctness
+check, timing, or stream capture. Combine with `--host-input-gen` to keep input
+generation off the device:
+
+```bash
+python -m batched_gemm.batched_gemm_run --profile --host-input-gen
+```
+
 > Run as a **module** — the runner uses package-relative imports, e.g.
 > `python -m flashinfer.prims_ts.batched_gemm.batched_gemm_run` (the command
 > blocks above use the short form, which requires `flashinfer/prims_ts/` as the
