@@ -2582,6 +2582,7 @@ class CuteDslConfig:
     """
 
     swap_ab: bool = False
+    routing_weights_before_fc2: bool = False
 
     @classmethod
     def supported(cls, arch: int) -> bool:
@@ -2648,9 +2649,12 @@ class CuteDslConfig:
         return prepare_trtllm_fp8_block_activations(hidden_states_bf16, quant=quant)
 
     def __repr__(self) -> str:
+        options = []
         if self.swap_ab:
-            return "CuteDslConfig(swap_ab=True)"
-        return "CuteDslConfig()"
+            options.append("swap_ab=True")
+        if self.routing_weights_before_fc2:
+            options.append("routing_weights_before_fc2=True")
+        return f"CuteDslConfig({', '.join(options)})"
 
 
 @dataclass(frozen=True)
@@ -3609,6 +3613,18 @@ class MoEConfig:
             raise ValueError(
                 "Mixed CuteDslConfig swap_ab modes need separate gated weight "
                 "views; use a separate MoELayer for each mode."
+            )
+
+        if any(
+            isinstance(c, CuteDslConfig) and c.routing_weights_before_fc2
+            for c in self.backend
+        ) and any(
+            not isinstance(c, CuteDslConfig) or not c.routing_weights_before_fc2
+            for c in self.backend
+        ):
+            raise ValueError(
+                "Pre-FC2 routing weighting must match across all backend candidates; "
+                "use a separate MoELayer for each weighting mode."
             )
 
     def _validate_fused_shared_experts(self) -> None:

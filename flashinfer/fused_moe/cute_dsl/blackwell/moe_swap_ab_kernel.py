@@ -533,6 +533,8 @@ def _blockscaled_atomic_add_pair(values, output, loc=None, ip=None):
 class Sm100BlockScaledMoeEpilogue:
     """Process each CTA's 128-channel slice of a one/two-CTA GEMM."""
 
+    routing_weights: cute.Tensor
+
     def __init__(
         self,
         mma_tiler_mnk,
@@ -552,6 +554,7 @@ class Sm100BlockScaledMoeEpilogue:
         sf_vec_size,
         sf_dtype,
         generate_sfc,
+        pre_fc2_routing=False,
     ):
         if mma_tiler_mnk[0] != 128:
             raise ValueError(
@@ -620,6 +623,7 @@ class Sm100BlockScaledMoeEpilogue:
         self.sf_vec_size = sf_vec_size
         self.sf_dtype = sf_dtype
         self.generate_sfc = generate_sfc
+        self.pre_fc2_routing = pre_fc2_routing
         self.is_mxfp8_output = (
             generate_sfc
             and output_dtype is cutlass.Float8E4M3FN
@@ -711,6 +715,12 @@ class Sm100BlockScaledMoeEpilogue:
                     )
                 result[i], result[i + 1] = cute.arch.mul_packed_f32x2(u, g)
         return result
+
+    @cute.jit
+    def _weight_activation(self, values, route_weight):
+        for i in cutlass.range_constexpr(16):
+            values[i] = values[i] * route_weight
+        return values
 
     @cute.jit
     def _absmax(self, values):
@@ -874,6 +884,13 @@ class Sm100BlockScaledMoeEpilogue:
         lane = tidx % 32
         ptr = acc_tensor.iterator + cute.assume(token_start, divby=32)
         scratch = ptr + cute.assume(warp * (32 << 16), divby=32)
+        route_weight = cutlass.Float32(0.0)
+        if cutlass.const_expr(self.pre_fc2_routing):
+            if token_start + lane < valid_tokens:
+                expanded = token_mapping[route_start + token_start + lane]
+                route_weight = self.routing_weights[
+                    expanded // self.top_k, expanded % self.top_k
+                ]
         if cutlass.const_expr(self.gated):
             # The prepared up16/gate16 groups both belong to this
             # warp's 32-row TMEM datapath. Load both before reusing
@@ -906,6 +923,8 @@ class Sm100BlockScaledMoeEpilogue:
                 # completed before either CTA allows the next MMA to overwrite.
                 cute.arch.fence_view_async_tmem_load()
                 acc_pipeline.consumer_release(acc_state)
+            if cutlass.const_expr(self.pre_fc2_routing):
+                values = self._weight_activation(values, route_weight)
             absmax = cutlass.Float32(0.0)
             if cutlass.const_expr(self.generate_sfc):
                 if cutlass.const_expr(self.sf_vec_size == 32):
@@ -985,6 +1004,9 @@ class Sm100BlockScaledMoeEpilogue:
             if cutlass.const_expr(self.nongated):
                 top = self._activate(top, None, scale)
                 bottom = self._activate(bottom, None, scale)
+                if cutlass.const_expr(self.pre_fc2_routing):
+                    top = self._weight_activation(top, route_weight)
+                    bottom = self._weight_activation(bottom, route_weight)
             elif cutlass.const_expr(self.activation_type is None):
                 for i in cutlass.range_constexpr(0, 16, 2):
                     top[i], top[i + 1] = cute.arch.mul_packed_f32x2(
@@ -1482,6 +1504,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         publish_routing_before_signal=False,
         activation_cache_policy=0,
         enable_iket=False,
+        pre_fc2_routing=False,
     ):
         if not self.is_valid_dtypes(
             activation_dtype, weight_dtype, sf_dtype, sf_vec_size
@@ -1665,6 +1688,7 @@ class Sm100BlockScaledGroupedGemmKernel:
             sf_vec_size=sf_vec_size,
             sf_dtype=sf_dtype,
             generate_sfc=generate_sfc,
+            pre_fc2_routing=pre_fc2_routing,
         )
 
     @staticmethod
@@ -2165,7 +2189,12 @@ class Sm100BlockScaledGroupedGemmKernel:
         alpha = cute.make_tensor(alpha_ptr, cute.make_layout((num_experts,)))
         norm_const = None
         if cutlass.const_expr(norm_const_ptr is not None):
-            norm_const = cute.make_tensor(norm_const_ptr, cute.make_layout((1,)))
+            norm_const = cute.make_tensor(
+                norm_const_ptr,
+                cute.make_layout(
+                    (num_experts if self.epilogue.pre_fc2_routing else 1,)
+                ),
+            )
         token_mapping = cute.make_tensor(
             token_mapping_ptr, cute.make_layout((num_routes,))
         )
@@ -3325,12 +3354,16 @@ class Sm100BlockScaledGroupedGemmKernel:
         elif warp < 8:
             if cutlass.const_expr(self.gather_input):
                 cute.arch.setmaxregister_increase(248)
-            # Normalization is invariant across experts and scheduled tiles.
+            # Ordinary normalization is invariant across experts and tiles.
             norm = cutlass.Float32(1.0)
-            if cutlass.const_expr(norm_const is not None):
+            if cutlass.const_expr(
+                norm_const is not None and not self.epilogue.pre_fc2_routing
+            ):
                 norm = norm_const[0]
             # Keep runtime activation state local to this kernel compilation.
             epilogue = copy(self.epilogue)
+            if cutlass.const_expr(epilogue.pre_fc2_routing):
+                epilogue.routing_weights = token_final_scales
             if cutlass.const_expr(
                 epilogue.activation_type == ActivationType.ClampedRelu2.value
             ):
@@ -3364,6 +3397,10 @@ class Sm100BlockScaledGroupedGemmKernel:
                     if cutlass.const_expr(self.use_clc_scheduler)
                     else cutlass.min(self.route_tile, mn_limit[route_idx] - route_start)
                 )
+                if cutlass.const_expr(
+                    epilogue.pre_fc2_routing and norm_const is not None
+                ):
+                    norm = norm_const[expert]
                 if cutlass.const_expr(self.enable_iket):
                     _iket.range_push("epi_acc_wait")
                 acc_pipe.consumer_wait(consumer)

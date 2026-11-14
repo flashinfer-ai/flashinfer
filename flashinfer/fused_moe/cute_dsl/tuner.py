@@ -788,7 +788,7 @@ class CuteDslFusedMoERunner(TunableRunner):
         can_implement methods using the actual problem dimensions from inputs.
         Supports both Blackwell and Rubin architectures.
         """
-        if self.routing_weights_before_fc2:
+        if self.routing_weights_before_fc2 and not self.swap_ab:
             return [DEFAULT_BLACKWELL_MOE_TACTIC]
         if self.swap_ab:
             from .blackwell.moe_swap_ab_tuner import get_valid_swap_ab_tactics
@@ -1029,7 +1029,7 @@ class CuteDslFusedMoERunner(TunableRunner):
         Returns:
             Output tensor from the MoE computation.
         """
-        if self.routing_weights_before_fc2:
+        if self.routing_weights_before_fc2 and not self.swap_ab:
             if tactic is None or tactic == -1:
                 tactic = DEFAULT_BLACKWELL_MOE_TACTIC
             if tactic != DEFAULT_BLACKWELL_MOE_TACTIC:
@@ -1220,6 +1220,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
         swap_ab: bool = False,
+        routing_weights_before_fc2: bool = False,
     ):
         activation_type, _ = normalize_cute_dsl_moe_activation_type(
             activation_type, W4A16_CUTE_DSL_MOE_ACTIVATION_TYPES, backend="W4A16"
@@ -1241,6 +1242,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
         self.swap_ab = swap_ab
+        self.routing_weights_before_fc2 = routing_weights_before_fc2
         # Match production EP routing density while retaining seeded load
         # variance around route-tile boundaries.
         self.tuning_config = TuningConfig(
@@ -1312,10 +1314,15 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                 self.situ_linear_beta,
             )
             + (("swap_ab",) if self.swap_ab else ())
+            + (
+                ("routing_weights_before_fc2",)
+                if self.routing_weights_before_fc2
+                else ()
+            )
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-        return (
+        extras = (
             self.num_experts,
             self.top_k,
             self.num_local_experts,
@@ -1329,6 +1336,9 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             self.situ_beta,
             self.situ_linear_beta,
         ) + (("swap_ab",) if self.swap_ab else ())
+        if self.routing_weights_before_fc2:
+            extras += ("routing_weights_before_fc2",)
+        return extras
 
     def get_valid_tactics(  # type: ignore[override]
         self,
@@ -1443,6 +1453,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             situ_linear_beta=self.situ_linear_beta,
             tactic=None if tactic is None or tactic == -1 else tactic,
             swap_ab=self.swap_ab,
+            routing_weights_before_fc2=self.routing_weights_before_fc2,
         )
 
 

@@ -267,7 +267,7 @@ def autotune_bf16_nvfp4_mega_moe(
                 max_tokens=current.num_tokens_per_rank,
                 live_tokens=live_tokens,
                 combine_dtype="bf16",
-                apply_routing_weights_before_fc2=current.apply_routing_weights_before_fc2,
+                apply_routing_weights_before_fc2=current.routing_weights_before_fc2,
                 use_custom_finalize=current.use_custom_finalize,
                 gate_up_clamp=current.gate_up_clamp,
                 batch_invariant=current.batch_invariant,

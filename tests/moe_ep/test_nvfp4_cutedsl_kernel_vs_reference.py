@@ -1211,7 +1211,7 @@ def _check_nvfp4_kernel_matches_torch_reference(
         fc2_alpha=alpha2,
         knobs=knobs,
         **(
-            {"apply_routing_weights_before_fc2": (apply_routing_weights_before_fc2)}
+            {"routing_weights_before_fc2": apply_routing_weights_before_fc2}
             if mode == "w4a16"
             else dict(
                 swiglu_alpha=activation_pairs[0][0],

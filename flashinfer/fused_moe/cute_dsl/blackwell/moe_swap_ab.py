@@ -99,6 +99,7 @@ def _run_blockscaled_gemm(
     sm_count=None,
     publish_routing_before_signal=False,
     activation_cache_policy: str = "normal",
+    pre_fc2_routing: bool = False,
 ):
     cache_policies = {
         "normal": 0,
@@ -189,6 +190,7 @@ def _run_blockscaled_gemm(
         sf_vec_size,
         output_sf is not None,
         norm_const is not None,
+        pre_fc2_routing,
         scale_dtype,
         channels,
         reduction,
@@ -251,6 +253,7 @@ def _run_blockscaled_gemm(
             publish_routing_before_signal=publish_routing_before_signal,
             activation_cache_policy=activation_cache_hint,
             generate_sfc=output_sf is not None,
+            pre_fc2_routing=pre_fc2_routing,
             output_dtype=output_dtype,
             final_scale_dtype=scale_dtype,
             top_k=top_k,
@@ -335,8 +338,14 @@ def launch_gather_gemm(
     gated: bool = True,
     k_steps: Optional[int] = None,
     use_clc_scheduler: bool = True,
+    routing_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Gather input inside FC1 with the swap-AB weight layout."""
+    """Gather input inside FC1 with the swap-AB weight layout.
+
+    Optional routing weights are contiguous FP32 values in token/top-k order;
+    they scale the FP32 activation before conversion. With them, global_scale
+    may be a scalar or one value per local expert.
+    """
     _check_gemm_inputs(a, b, a_dtype, b_dtype, a_per_token_scale, k_steps)
     if a.dtype == torch.uint8:
         reduction = a.shape[1] * 2
@@ -406,6 +415,33 @@ def launch_gather_gemm(
     permuted_m = token_id_mapping.shape[0]
     if n % 128 != 0:
         raise ValueError(f"GEMM1 output dim n={n} must be a multiple of 128.")
+
+    pre_fc2_routing = routing_weights is not None
+    if pre_fc2_routing:
+        if (
+            routing_weights.dtype != torch.float32
+            or not routing_weights.is_contiguous()
+            or routing_weights.device != a.device
+            or routing_weights.numel() != a.shape[0] * topk
+        ):
+            raise ValueError(
+                f"routing_weights must be {a.shape[0] * topk} contiguous float32 "
+                "values on the input device"
+            )
+        if global_scale is not None:
+            if (
+                global_scale.dtype != torch.float32
+                or global_scale.numel() not in (1, b.shape[0])
+                or not global_scale.is_contiguous()
+                or global_scale.device != a.device
+            ):
+                raise ValueError(
+                    "routing_weights requires a float32 global_scale scalar or "
+                    "one value per expert on the input device"
+                )
+            global_scale = global_scale.reshape(-1)
+            if global_scale.numel() == 1:
+                global_scale = global_scale.expand(b.shape[0]).contiguous()
 
     # Output quantization is explicit because Float8E4M3FN can also be used as
     # an ordinary (non-block-scaled) output by other internal configurations.
@@ -483,11 +519,12 @@ def launch_gather_gemm(
         output_sf=out_scale,
         alpha=alpha,
         norm_const=global_scale,
+        pre_fc2_routing=pre_fc2_routing,
         token_mapping=token_id_mapping,
         expert_idx=tile_idx_to_expert_idx,
         mn_limit=tile_idx_to_mn_limit,
         num_tiles=num_non_exiting_tiles,
-        token_final_scales=None,
+        token_final_scales=routing_weights,
         per_token_scale=a_per_token_scale,
         num_tokens=a.shape[0],
         top_k=topk,

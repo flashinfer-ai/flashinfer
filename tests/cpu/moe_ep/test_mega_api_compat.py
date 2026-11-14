@@ -20,32 +20,31 @@ def _config(arch, dtype):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "arch,dtype",
+    "arch,dtype,routing_name",
     [
-        ("sm100", "bf16_nvfp4_bf16"),
-        ("sm100", "nvfp4_nvfp4_bf16"),
-        ("sm107", "mxfp8_mxfp4_bf16"),
-        ("sm107", "mxfp8_mxfp8_bf16"),
-        ("sm107", "nvfp4_nvfp4_bf16"),
+        ("sm100", "bf16_nvfp4_bf16", "routing_weights_before_fc2"),
+        ("sm100", "nvfp4_nvfp4_bf16", "apply_routing_weights_before_fc2"),
+        ("sm107", "mxfp8_mxfp4_bf16", "apply_routing_weights_before_fc2"),
+        ("sm107", "mxfp8_mxfp8_bf16", "apply_routing_weights_before_fc2"),
+        ("sm107", "nvfp4_nvfp4_bf16", "apply_routing_weights_before_fc2"),
     ],
 )
-def test_routing_aliases_remain_live(arch, dtype):
+def test_routing_aliases_remain_live(arch, dtype, routing_name):
     cls = _config(arch, dtype)
     with pytest.warns(DeprecationWarning, match="apply_topk_in_fc1"):
         config = cls(1024, 8, apply_topk_in_fc1=False)
     assert config.apply_topk_in_fc1 is False
-    assert config.apply_routing_weights_before_fc2 is False
+    assert getattr(config, routing_name) is False
     config.apply_topk_in_fc1 = True
     assert config.apply_routing_weights_before_fc2 is True
     config.apply_routing_weights_before_fc2 = False
     assert config.apply_topk_in_fc1 is False
-    assert dataclasses.replace(
-        config, apply_routing_weights_before_fc2=True
-    ).apply_topk_in_fc1
+    assert dataclasses.replace(config, **{routing_name: True}).apply_topk_in_fc1
     with pytest.warns(DeprecationWarning):
         assert dataclasses.replace(
             config, apply_topk_in_fc1=True
         ).apply_routing_weights_before_fc2
+    assert routing_name in dataclasses.asdict(config)
     assert "apply_topk_in_fc1" not in dataclasses.asdict(config)
 
 
