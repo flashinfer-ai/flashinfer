@@ -769,7 +769,7 @@ def test_bounded_ragged_prewarm_classes_before_capture(
 @requires_override
 @pytest.mark.parametrize("head_dim_qk", [192, 128])
 def test_bounded_ragged_older_frontend_keeps_broad_graph(head_dim_qk, monkeypatch):
-    """Old FE keeps its existing graph signature, including SDPA kwargs."""
+    """Without native packed-capacity support the broad graph and SDPA kwargs stay."""
     cudnn = cudnn_prefill.cudnn
     original = cudnn.pygraph.sdpa
     observed = []
@@ -779,19 +779,13 @@ def test_bounded_ragged_older_frontend_keeps_broad_graph(head_dim_qk, monkeypatc
         observed.append(True)
         return original(self, *args, **kwargs)
 
-    with monkeypatch.context() as m:
-        m.setattr(cudnn, "__version__", "1.30.0")
-        m.setattr(cudnn.pygraph, "sdpa", old_sdpa)
-        cudnn_prefill._cudnn_supports_bounded_ragged.cache_clear()
-        try:
-            assert not cudnn_prefill._cudnn_supports_bounded_ragged(
-                d128=head_dim_qk == 128
-            )
-            # A distinct head count avoids a prior test's graph-cache entry.
-            _run("cudnn", [129], 5, 5, head_dim_qk, dvo=128, kv_lens=[2049])
-            assert observed
-        finally:
-            cudnn_prefill._cudnn_supports_bounded_ragged.cache_clear()
+    monkeypatch.setattr(
+        cudnn_prefill, "_cudnn_supports_bounded_ragged", lambda *, d128=False: False
+    )
+    monkeypatch.setattr(cudnn.pygraph, "sdpa", old_sdpa)
+    # A distinct head count avoids a prior test's graph-cache entry.
+    _run("cudnn", [129], 5, 5, head_dim_qk, dvo=128, kv_lens=[2049])
+    assert observed
 
 
 @requires_override
