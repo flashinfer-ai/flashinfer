@@ -4,17 +4,14 @@ import torch
 import flashinfer
 
 
-# Every case builds its own cuDNN graph: the graph cache key includes the batch
-# size, max query/KV lengths, head counts and mask, so the case count sets the
-# file's run time. List valid combinations explicitly instead of collecting
-# a full cross product and skipping s_qo > s_kv or num_qo_heads < num_kv_heads.
+# Each case builds its own cuDNN graph; list valid pairs instead of skipping a cross product.
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize(
     "s_qo,s_kv",
     [
         # Maximum lengths; per-sequence lengths are drawn below them.
         (32, 512),  # short queries, long KV
-        (64, 87),  # odd maximum KV length
+        (32, 87),  # KV lengths from 32 to an odd 87
         (87, 87),  # equal odd maxima: every KV length is exactly 87
         (256, 512),  # long queries
     ],
