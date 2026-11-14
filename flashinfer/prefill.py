@@ -3241,7 +3241,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             its captured scheduling metadata is refreshed. Use a separate wrapper
             to select cuDNN for a new graph after planning FA2.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
-            ``cute-dsl-prims`` backend is a SM120-only FP8 attention backend implemented using
+            ``cute-dsl-prims`` backend is an SM120/SM121-only FP8 attention backend implemented using
             CUTLASS primitives.
 
         batch_invariant : bool
@@ -5993,7 +5993,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
             ``cute-dsl-rubin`` is an explicit SM107-only E4M3 prefill backend
             with ``head_dim_qk=192``, ``head_dim_vo=128`` and BF16 output.
-            ``cute-dsl-prims`` is an explicit SM120-only packed FP8 prefill backend.
+            ``cute-dsl-prims`` is an explicit SM120/SM121-only packed FP8 prefill backend.
             The ``cutile`` backend uses the pure cuda.tile Python prefill kernel (Blackwell,
             opt-in); it requires ``qo_indptr == kv_indptr`` (equal-length prefill).
 

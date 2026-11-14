@@ -525,7 +525,7 @@ routine_cc_to_supported_backends = {
             "trtllm-fmha-v2",
             "cute-dsl-prims",
         ],
-        "12.1": ["fa2", "auto", "cudnn", "cudnn-native"],
+        "12.1": ["fa2", "auto", "cudnn", "cudnn-native", "cute-dsl-prims"],
     },
     "BatchPrefillWithRaggedKVCacheWrapper": {
         # NOTE: trtllm-native calls trtllm_ragged_attention_deepseek
@@ -570,7 +570,7 @@ routine_cc_to_supported_backends = {
             "trtllm-fmha-v2",
             "cute-dsl-prims",
         ],
-        "12.1": ["fa2", "cudnn", "cudnn-native"],
+        "12.1": ["fa2", "cudnn", "cudnn-native", "cute-dsl-prims"],
     },
     "BatchMLAPagedAttentionWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache_mla(backend="trtllm-gen")
