@@ -70,6 +70,7 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.utils.blackwell_helpers import get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
+from ....batch_invariant.fp_interface.cute import ex2_approx_ftz, rcp_approx_ftz
 from ....batch_invariant.fp_interface.exact import f32_bits
 from ....batch_invariant.quantization.cute_ext import CuteF32, bitcast_i32_to_f32
 from ....batch_invariant.quantization.cvt_fp8 import (
@@ -80,7 +81,15 @@ from ....batch_invariant.quantization.cvt_fp8 import (
 from ....gemm.batch_invariant.blocks.operands import ACC_DTYPE
 from ....gemm.batch_invariant.spec import MXFP4_FMTS, NVFP4_FMTS
 from .. import spec_nvfp4 as Q
-from ..spec import ACT_PARAMS, ACTS, UNGATED_ACTS, act_elem, glu_elem
+from ..spec import (
+    ACT_PARAMS,
+    ACTS,
+    ARITHS,
+    UNGATED_ACTS,
+    act_elem,
+    glu_elem,
+    hw_arith_applies,
+)
 from ..spec_fp8 import act_quant_pre, glu_quant_pre, scaled_out_elem, w8a8_alpha
 
 GROUP = 8  # gate/up interleave granularity (columns): u x8, g x8, u x8, ...
@@ -241,10 +250,15 @@ class GroupedChain(GroupedEpilogueBlock):
     act: str = "silu"
     out_fmt: str = "bf16"
     params: Tuple[Optional[float], ...] = ()
+    #: the arithmetic of the chain's transcendental steps (``spec.ARITHS``): ``exact`` (the declared sequences) or ``hw``
+    #: (the hardware-arithmetic class: the part's ``ex2`` / ``rcp``; a class of its own for the chains that have them);
+    #: keyword-only, so the subclasses' positional fields keep their places
+    arith: str = dataclasses.field(default="exact", kw_only=True)
 
     def __post_init__(self):
         assert self.kind in KINDS and self.out_fmt in OUT_FMTS, self
         assert self.act in (UNGATED_ACTS if self.kind == "act" else ACTS), self
+        assert self.arith in ARITHS, self
         if self.kind == "glu" and self.out_fmt != "bf16":
             raise AssertionError("the gated chain converts to bf16 once")
         expected = len(ACT_PARAMS.get(self.act, ())) if self.kind == "glu" else 0
@@ -254,24 +268,34 @@ class GroupedChain(GroupedEpilogueBlock):
     def in_fmt(self) -> str:
         return "bf16"
 
+    @property
+    def hw(self) -> bool:
+        """Whether this chain computes in the hardware arithmetic: requested, and the chain has an exponential or a
+        division (the other chains are the exact class under either request)."""
+        return self.arith == "hw" and hw_arith_applies(self.act, self.kind == "glu")
+
     def elem(self, fp, acc, acc_gate, s=None, inv=None):
         """One output element, converted: the gated term of the (gate, up) accumulator pair, the ungated activation of
         one accumulator, or the plain conversion; every op in fp32 through ``fp`` (the chain's parameters are
         compile-time constants of the kernel)."""
         if self.pair:
-            return glu_elem(fp, acc_gate, acc, self.act, self.out_fmt, self.params)
+            return glu_elem(
+                fp, acc_gate, acc, self.act, self.out_fmt, self.params, self.hw
+            )
         if self.kind == "act":
-            return act_elem(fp, acc, self.act, self.out_fmt, self.params)
+            return act_elem(fp, acc, self.act, self.out_fmt, self.params, self.hw)
         return fp.cvt_out(acc, self.out_fmt)
 
     def describe(self) -> str:
         suffix = "".join(
             "_pn" if v is None else f"_p{f32_bits(v):08x}" for v in self.params
-        )
+        ) + ("_hw" if self.hw else "")
         if self.kind == "act":
-            return f"{self.act}_{self.out_fmt}"  # the ungated chains: `relu2_bf16`
+            return (
+                f"{self.act}_{self.out_fmt}{suffix}"  # the ungated chains: `relu2_bf16`
+            )
         if self.act == "silu":  # the bf16 class's names
-            return ("swiglu" if self.pair else "plain") + f"_{self.out_fmt}"
+            return ("swiglu" if self.pair else "plain") + f"_{self.out_fmt}{suffix}"
         return f"{self.kind}_{self.act}_{self.out_fmt}{suffix}"
 
     @staticmethod
@@ -444,14 +468,18 @@ class W4A4Chain(GroupedChain):
             return GroupedChain.elem(self, fp, acc, acc_gate)
         if self.out_fmt == "nvfp4":
             if self.pair:
-                return Q.glu_scaled_pre(fp, acc_gate, acc, s, self.act, self.params)
-            return Q.act_scaled_pre(fp, acc, s, self.act, self.params)
+                return Q.glu_scaled_pre(
+                    fp, acc_gate, acc, s, self.act, self.params, self.hw
+                )
+            return Q.act_scaled_pre(fp, acc, s, self.act, self.params, self.hw)
         if self.pair:
             return Q.glu_scaled_elem(
-                fp, acc_gate, acc, s, self.act, self.out_fmt, self.params
+                fp, acc_gate, acc, s, self.act, self.out_fmt, self.params, self.hw
             )
         if self.kind == "act":
-            return Q.act_scaled_elem(fp, acc, s, self.act, self.out_fmt, self.params)
+            return Q.act_scaled_elem(
+                fp, acc, s, self.act, self.out_fmt, self.params, self.hw
+            )
         return Q.scaled_out_elem(fp, acc, s, self.out_fmt)
 
     def describe(self) -> str:
@@ -615,7 +643,16 @@ def bitcast_f32_to_i32(a):
 
 class MoeF32(CuteF32):
     """``CuteF32`` with the MoE chains' exact mantissa / exponent split of the declared log (``spec.log_term``): bit
-    operations on the binary32 pattern, no floating-point rounding."""
+    operations on the binary32 pattern, no floating-point rounding; and the two SFU primitives of the hardware-arithmetic
+    classes (``ex2.approx.ftz`` / ``rcp.approx.ftz``, pinned as inline asm)."""
+
+    @staticmethod
+    def ex2(a):
+        return ex2_approx_ftz(a)
+
+    @staticmethod
+    def rcp(a):
+        return rcp_approx_ftz(a)
 
     @staticmethod
     def frexpm(a):

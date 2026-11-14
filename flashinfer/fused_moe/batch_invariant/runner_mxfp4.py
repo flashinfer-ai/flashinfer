@@ -183,6 +183,12 @@ class BatchInvariantMoeMxfp4Runner(_Fp4PairRunner):
                 f"{type(cfg.activation).__name__} with weights prepared for the chain {w.act!r} ({'gated' if w.gated else 'ungated'})",
                 "weights prepared with the layer's activation",
             )
+        if w.arith != self._arith:
+            raise unsupported(
+                CLASS,
+                f"activation_arith={self._arith_label()!r} with weights prepared for {w.arith!r}",
+                "weights prepared with the backend config's activation arithmetic",
+            )
         check_shape_mxfp4(H, w.intermediate_size, E, k, w.gated)
         if x.dtype == torch.bfloat16:
             if act.hidden_states_scale is not None or act.per_token_scale is not None:
@@ -272,7 +278,9 @@ class BatchInvariantMoeMxfp4Runner(_Fp4PairRunner):
         a = self._activation()
         sm_count, family = self._part if self._part is not None else (None, None)
         in1, in2 = expert_classes_mx(family)
-        chain1 = Mxfp4Chain("glu" if a.gated else "act", a.act, "bf16", a.params)
+        chain1 = Mxfp4Chain(
+            "glu" if a.gated else "act", a.act, "bf16", a.params, arith=self._arith
+        )
         n1 = 2 * I if a.gated else I
         r1 = list(
             rank_grouped_mxfp4(
@@ -296,7 +304,7 @@ class BatchInvariantMoeMxfp4Runner(_Fp4PairRunner):
         return r1, list(r2)
 
     def _cache_key_extras(self) -> tuple:
-        return super()._cache_key_extras() + ("moe.mxfp4-v2",)
+        return super()._cache_key_extras() + ("moe.mxfp4-v3", self._arith)
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def forward(
@@ -330,6 +338,7 @@ class BatchInvariantMoeMxfp4Runner(_Fp4PairRunner):
             a.gated,
             a.act,
             a.params,
+            self._arith,
         )
         # a pre-quantized pack: the 2-D scale tensor is the linear layout (the op's own placement: no re-tiling launch)
         xin = x if x.dtype == torch.bfloat16 else (x, sf)

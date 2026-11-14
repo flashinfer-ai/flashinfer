@@ -70,10 +70,14 @@ class MoEMxfp4Spec(S.MoESpec):
         gated: Optional[bool] = None,
         mx_class: Tuple[str, str] = ("mxfp4", "mxfp4"),
         alg: Optional[TermAlgebra] = None,
+        arith: str = "exact",
     ):
         super().__init__(H, I, k, E, method, "bf16", alg, act, params, gated)
         assert all(c in MXFP4_FMTS for c in mx_class), mx_class
+        assert arith in S.ARITHS, arith
         self.mx_class = mx_class
+        # the hardware-arithmetic class (as the NVFP4 pair's): the chain's exponential and divisions on the part's SFU
+        self.hw = arith == "hw" and S.hw_arith_applies(self.act, self.gated)
 
     def gemm2(self, r: int = 0, h: int = 0) -> Term:
         """GEMM2's epilogue term: the conversion of the raw accumulator."""
@@ -81,7 +85,7 @@ class MoEMxfp4Spec(S.MoESpec):
 
     @property
     def name(self) -> str:
-        return f"{CLASS}.{self.act}"
+        return f"{CLASS}.{self.act}" + (".hw" if self.hw else "")
 
 
 def spec_fingerprint_mxfp4(
@@ -94,12 +98,13 @@ def spec_fingerprint_mxfp4(
     params: Sequence[Optional[float]] = (),
     gated: Optional[bool] = None,
     mx_class: Tuple[str, str] = ("mxfp4", "mxfp4"),
+    arith: str = "exact",
 ) -> str:
     """Identifier of the class: the routing weights of slots 0 and k-1, the GEMM1 chain, the dense MXFP4 GEMM classes of both
     expert weights (the instruction class is a dimension), the ``mxfp4.quant`` class (the input and the intermediate are both its
     outputs; its identifier is independent of the row length), GEMM2's conversion and the combine. The activation and its
     binary32 parameters name the class."""
-    s = MoEMxfp4Spec(H, I, k, E, method, act, params, gated, mx_class)
+    s = MoEMxfp4Spec(H, I, k, E, method, act, params, gated, mx_class, arith=arith)
     parts = [
         s.name,
         f"H={H}",

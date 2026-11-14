@@ -36,6 +36,32 @@ def actScaledT (a : UAct) (acc s : MTerm) : MTerm := actElemT a (.mul acc s)
 /-- GEMM2 of the W4A4 classes: `cvt_bf16(mul(acc, s))` (`spec_nvfp4.scaled_out_elem`). -/
 def scaledOutT (acc s : MTerm) : MTerm := .cvt "bf16" (.mul acc s)
 
+/-! ### The hardware-arithmetic classes `moe.nvfp4.<act>.hw` (`spec_nvfp4` with `hw=True`): the same scaled accumulators
+through the chains of `MoE.gluHwT` / `MoE.actElemHwT` (the part's `ex2` / `rcp` in place of the declared exponential and
+divisions); GEMM2 and the row scale are the exact class's. -/
+
+/-- GEMM1 of the gated hardware classes: `cvt_bf16(glu_pre_hw(mul(g, s), mul(u, s)))`. -/
+def gluScaledHwT (a : GAct) (g u s : MTerm) : MTerm := gluHwT a (.mul g s) (.mul u s)
+
+/-- GEMM1 of the ungated hardware classes: `cvt_bf16(act_hw(mul(acc, s)))`. -/
+def actScaledHwT (a : UAct) (acc s : MTerm) : MTerm := actElemHwT a (.mul acc s)
+
+/-- The fp32 gated value of the hardware class before the static class's block quantization (`spec_nvfp4.glu_scaled_pre`
+with `hw=True`). -/
+def gluScaledHwPreT (a : GAct) (g u s : MTerm) : MTerm := gluPreHwT a (.mul g s) (.mul u s)
+
+/-- The fp32 ungated value of the hardware class before the block quantization. -/
+def actScaledHwPreT (a : UAct) (acc s : MTerm) : MTerm := ungatedHwT a (.mul acc s)
+
+theorem gluScaledHwT_is_gluHwT_of_scaled (a : GAct) (g u s : MTerm) :
+    gluScaledHwT a g u s = gluHwT a (.mul g s) (.mul u s) := rfl
+
+theorem actScaledHwT_is_actElemHwT_of_scaled (a : UAct) (acc s : MTerm) :
+    actScaledHwT a acc s = actElemHwT a (.mul acc s) := rfl
+
+/-- The chains without an exponential or a division are the exact class's under either arithmetic (the ReLU family). -/
+theorem actScaledHwT_relu2 (acc s : MTerm) : actScaledHwT .relu2 acc s = actScaledT .relu2 acc s := rfl
+
 /-- **The W4A4 GEMM1 chain is the bf16 class's chain on the scaled accumulators**: the scale enters once per accumulator,
 before any activation arithmetic; nothing of the bf16 chain is re-ordered. -/
 theorem gluScaledT_is_gluT_of_scaled (a : GAct) (g u s : MTerm) : gluScaledT a g u s = gluT a (.mul g s) (.mul u s) := rfl

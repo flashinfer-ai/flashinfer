@@ -62,6 +62,11 @@ class TermAlgebra(_Base):
         """``max.f32`` (exact, order-preserving like ``fmin``)."""
         return self._mk("fmax", a, b)
 
+    def rcp(self, a: Term) -> Term:
+        """``rcp.approx.ftz.f32``: an opaque hardware primitive, deterministic per architecture (the hardware-arithmetic
+        classes' reciprocal; ``ex2`` is the base algebra's)."""
+        return self._mk("rcp", a)
+
     def exp2i(self, k: Term) -> Term:
         """The binary32 ``2^k`` for an integer-valued ``k`` in ``[-126, 127]`` (exact; built from the exponent bits on
         the device, ``ldexp`` on the CPU)."""
@@ -101,6 +106,38 @@ class TermAlgebra(_Base):
         """The routing's NaN rule (``a`` where the logit ``x`` is NaN, else ``b``): a row rule outside the term algebra,
         so the symbolic term is ``b`` (the terms and the Lean statements are over non-NaN inputs)."""
         return b
+
+
+_SFU_TABLES = None
+
+
+def bind_sfu_tables(tables) -> None:
+    """Bind the part's SFU tables (:class:`flashinfer.batch_invariant.fp_interface.sfu.SfuTables`) for the evaluation of the
+    hardware-arithmetic classes' ``ex2`` / ``rcp`` nodes (``None`` unbinds)."""
+    global _SFU_TABLES
+    _SFU_TABLES = tables
+
+
+def sfu_tables():
+    """The bound tables, or a clear error."""
+    if _SFU_TABLES is None:
+        raise RuntimeError(
+            "no SFU tables bound: the hardware-arithmetic classes evaluate on the part's tables "
+            "(mterm.bind_sfu_tables(sfu.tables_for(device)))"
+        )
+    return _SFU_TABLES
+
+
+def sfu_eval(op: str, x: float) -> float:
+    """The bound part's ``ex2`` or ``rcp`` of one binary32 value."""
+    import torch
+
+    from ...batch_invariant.fp_interface import sfu
+
+    t = torch.tensor([x], dtype=torch.float32)
+    tables = sfu_tables()
+    y = sfu.ex2_hw(t, tables) if op == "ex2" else sfu.rcp_hw(t, tables)
+    return float(y[0].item())
 
 
 def rowmax_f32(*vals: float) -> float:
@@ -170,6 +207,8 @@ def evaluate(
             v = fp32.fmaxc(memo[A[0].uid], memo[A[1].uid])
         elif op == "exp2i":
             v = fp32.exp2i(memo[A[0].uid])
+        elif op in ("ex2", "rcp"):
+            v = sfu_eval(op, memo[A[0].uid])
         elif op == "fabs":
             v = fp32.fabs(memo[A[0].uid])
         elif op == "sqrt":
@@ -251,7 +290,7 @@ def sexpr(t: Term) -> str:
         elif op in ("add", "mul", "fmaxc"):
             a, b = sorted(A[:2])
             out = f"({op} {a} {b})"
-        elif op in ("neg", "exp2i", "fabs", "sqrt", "frexpm", "frexpe"):
+        elif op in ("neg", "exp2i", "fabs", "sqrt", "frexpm", "frexpe", "ex2", "rcp"):
             out = f"({op} {A[0]})"
         elif op in ("div", "fmin", "fmax"):
             out = f"({op} {A[0]} {A[1]})"
