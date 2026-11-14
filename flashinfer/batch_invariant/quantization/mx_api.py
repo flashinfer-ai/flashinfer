@@ -152,30 +152,17 @@ def mx_quantize(
     return codes.view(*x.shape[:-1], kbytes), sf
 
 
-def mxfp8_quantize_batch_invariant(
-    input: torch.Tensor,
-    sf_swizzle_layout=None,
-    alignment: int = 32,
-    enable_pdl: Optional[bool] = None,
-    *,
-    config: Optional[MXQuantConfig] = None,
-    sm_count: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``flashinfer.mxfp8_quantize(input, ..., backend="auto", batch_invariant=True)``: the class ``mxfp8.quant``.
-
-    FlashInfer's contract is reproduced exactly: ``x_q`` is a ``float8_e4m3fn`` tensor of shape
-    ``(*input.shape[:-1], padded_K)`` with ``padded_K = ceil(K / alignment) * alignment`` (the padding columns are zero
-    e4m3 bytes under a zero scale byte, as FlashInfer's backends produce them), ``sf`` the flat ``uint8`` UE8M0 scales
-    of ``sf_swizzle_layout`` (``SfLayout.layout_128x4``: rows padded to 128 and scale columns to 4; ``layout_8x4``: rows
-    to 8, columns to 4; ``layout_linear``: ``M x padded_K / 32``). ``enable_pdl=None`` follows the device (PDL on
-    SM >= 9.0). ``config`` / ``sm_count`` force a configuration / another SKU's dispatcher pick (members of the enumerated
-    space: the bits never depend on them).
-
-    Raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for any input outside the class (dtype,
-    K not a multiple of 32, layout, device, architecture); it never falls back."""
-    from ...utils import device_support_pdl
-
+def _check_mxfp8_quantize_batch_invariant_inputs(
+    input: torch.Tensor, sf_swizzle_layout, alignment: int
+) -> Tuple[int, int, str]:
+    """Validate the batch-invariant contract without preparing or quantizing input."""
     check_device(input.device, CLASS_MXFP8, MXFP8_QUANT_ARCHS)
+    if input.layout != torch.strided:
+        raise unsupported(
+            CLASS_MXFP8,
+            f"a {input.layout} input",
+            "strided inputs of shape (..., K)",
+        )
     if input.dtype not in _DTYPE_STR:
         raise unsupported(
             CLASS_MXFP8, f"input dtype {input.dtype}", "bf16, f16 or fp32 inputs"
@@ -206,6 +193,35 @@ def mxfp8_quantize_batch_invariant(
             f"the scale-factor layout {sf_swizzle_layout!r}",
             "SfLayout.layout_128x4, SfLayout.layout_8x4 or SfLayout.layout_linear",
         ) from None
+    return K, padded_k, layout
+
+
+def mxfp8_quantize_batch_invariant(
+    input: torch.Tensor,
+    sf_swizzle_layout=None,
+    alignment: int = 32,
+    enable_pdl: Optional[bool] = None,
+    *,
+    config: Optional[MXQuantConfig] = None,
+    sm_count: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``flashinfer.mxfp8_quantize(input, ..., backend="auto", batch_invariant=True)``: the class ``mxfp8.quant``.
+
+    FlashInfer's contract is reproduced exactly: ``x_q`` is a ``float8_e4m3fn`` tensor of shape
+    ``(*input.shape[:-1], padded_K)`` with ``padded_K = ceil(K / alignment) * alignment`` (the padding columns are zero
+    e4m3 bytes under a zero scale byte, as FlashInfer's backends produce them), ``sf`` the flat ``uint8`` UE8M0 scales
+    of ``sf_swizzle_layout`` (``SfLayout.layout_128x4``: rows padded to 128 and scale columns to 4; ``layout_8x4``: rows
+    to 8, columns to 4; ``layout_linear``: ``M x padded_K / 32``). ``enable_pdl=None`` follows the device (PDL on
+    SM >= 9.0). ``config`` / ``sm_count`` force a configuration / another SKU's dispatcher pick (members of the enumerated
+    space: the bits never depend on them).
+
+    Raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for any input outside the class (dtype,
+    K not a multiple of 32, layout, device, architecture); it never falls back."""
+    from ...utils import device_support_pdl
+
+    K, padded_k, layout = _check_mxfp8_quantize_batch_invariant_inputs(
+        input, sf_swizzle_layout, alignment
+    )
     if padded_k == K:
         try:
             x2 = _rows(input, K, "input")

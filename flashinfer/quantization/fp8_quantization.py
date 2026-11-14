@@ -34,6 +34,7 @@ from ..jit.cake_program import CakeProgram
 from ..jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from ..jit.quantization import gen_quantization_module
 from ..utils import (
+    backend_requirement,
     device_support_pdl,
     get_compute_capability,
     register_custom_op,
@@ -375,6 +376,151 @@ def get_mxfp8_quantization_sm100_module():
     )
 
 
+def _mxfp8_scale_layout(is_sf_swizzled_layout, sf_swizzle_layout):
+    """Resolve the public layout alias without changing an explicit layout."""
+    if sf_swizzle_layout is not None:
+        return sf_swizzle_layout
+    return SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
+
+
+def _check_mxfp8_scale_layout(sf_swizzle_layout):
+    """Require supported SfLayout members before mapping to backend flags."""
+    if not isinstance(sf_swizzle_layout, SfLayout) or sf_swizzle_layout not in (
+        SfLayout.layout_linear,
+        SfLayout.layout_128x4,
+        SfLayout.layout_8x4,
+    ):
+        raise ValueError(
+            f"Invalid sf_swizzle_layout value: {sf_swizzle_layout}; "
+            "expected an SfLayout member"
+        )
+
+
+def _check_mxfp8_backend(input, backend, batch_invariant):
+    """Apply the public backend selection constraints in their original order."""
+    if batch_invariant:
+        if backend != "auto":
+            raise ValueError(
+                "mxfp8_quantize: batch_invariant=True requires backend='auto' "
+                f"(got backend={backend!r})"
+            )
+        return
+    assert input.shape[-1] % 32 == 0
+    assert backend in ("auto", "cuda", "cute-dsl"), (
+        f"backend must be 'auto', 'cuda' or 'cute-dsl', got '{backend}'"
+    )
+
+
+def _mxfp8_input_dtypes(device_type: str, backend: str) -> Tuple[torch.dtype, ...]:
+    """Share dtype admission with callers that have not allocated input yet."""
+    if backend == "cute-dsl":
+        return (torch.float16, torch.bfloat16, torch.float32)
+    if device_type == "cpu":
+        return (torch.float32,)
+    return (torch.float16, torch.bfloat16)
+
+
+def _check_mxfp8_native_inputs(input, sf_swizzle_layout, alignment):
+    """Check the native binding's tensor contract before loading its module."""
+    if input.layout != torch.strided or not input.is_contiguous():
+        raise ValueError("mxfp8_quantize with backend='cuda' requires contiguous input")
+    if input.device.type == "cpu":
+        if input.dtype not in _mxfp8_input_dtypes("cpu", "cuda") or input.dim() != 2:
+            raise ValueError("mxfp8_quantize on CPU requires a 2-D float32 input")
+        if sf_swizzle_layout == SfLayout.layout_8x4:
+            raise ValueError(
+                f"{sf_swizzle_layout} is not supported for mxfp8 quantization on CPU."
+            )
+    elif input.device.type == "cuda":
+        if input.dtype not in _mxfp8_input_dtypes("cuda", "cuda") or input.dim() < 2:
+            raise ValueError(
+                "mxfp8_quantize with backend='cuda' requires float16 or bfloat16 "
+                "input with at least two dimensions"
+            )
+        if input.shape[-1] == 0:
+            raise ValueError(
+                "mxfp8_quantize on CUDA requires a nonempty last dimension"
+            )
+        if alignment <= 0 or alignment % 32:
+            raise ValueError("alignment must be a positive multiple of 32")
+    else:
+        raise ValueError(
+            "mxfp8_quantize with backend='cuda' requires CPU or CUDA input"
+        )
+    _check_mxfp8_scale_layout(sf_swizzle_layout)
+
+
+def _check_mxfp8_cute_dsl_inputs(input, alignment):
+    """Check CuTe inputs without importing its kernels or preparing tensors."""
+    assert input.dtype in _mxfp8_input_dtypes("cuda", "cute-dsl"), (
+        f"Input dtype must be float16, bfloat16, or float32, got {input.dtype}"
+    )
+    assert input.is_cuda, "Input must be on CUDA device"
+    assert alignment > 0 and alignment % 32 == 0, (
+        "alignment must be a positive multiple of SF_VEC_SIZE=32"
+    )
+    if input.dim() < 2:
+        raise ValueError("CuTe-DSL MXFP8 input must have at least two dimensions")
+    if input.layout != torch.strided:
+        raise ValueError("CuTe-DSL MXFP8 input must use strided layout")
+    k = input.shape[-1]
+    if k == 0:
+        raise ValueError("CuTe-DSL MXFP8 input must have a nonempty last dimension")
+    assert k % 32 == 0, f"K ({k}) must be divisible by SF_VEC_SIZE=32"
+
+
+def _validate_mxfp8_quantize_call(
+    input: torch.Tensor,
+    is_sf_swizzled_layout: bool = True,
+    alignment: int = 32,
+    enable_pdl: Optional[bool] = None,
+    backend: Literal["auto", "cuda", "cute-dsl"] = "auto",
+    sf_swizzle_layout: Optional[SfLayout] = None,
+    *,
+    batch_invariant: bool = False,
+) -> None:
+    """Preflight an MXFP8 call without quantizing, allocating outputs or compiling.
+
+    Accepts the same arguments as :func:`mxfp8_quantize`. Raises on known
+    input, layout or device violations; returns ``None`` when those checks
+    pass. ``auto`` retains the operation's CUDA route, rather than searching
+    for a fallback. CPU host inputs and CuTe-DSL inputs have different dtype
+    and layout contracts.
+
+    This checks metadata, not tensor values or storage addresses. A return
+    does not certify dependency availability, compilation, native launch or
+    numerical correctness. ``enable_pdl`` is accepted for call compatibility;
+    no PDL detection runs. CuTe's input copies/alignment repair are left to
+    execution, and its supported architectures are not narrowed here.
+    """
+    sf_swizzle_layout = _mxfp8_scale_layout(is_sf_swizzled_layout, sf_swizzle_layout)
+    _check_mxfp8_backend(input, backend, batch_invariant)
+    if batch_invariant:
+        from ..batch_invariant.quantization.mx_api import (
+            _check_mxfp8_quantize_batch_invariant_inputs,
+        )
+
+        _check_mxfp8_quantize_batch_invariant_inputs(
+            input, sf_swizzle_layout, alignment
+        )
+    elif backend == "cute-dsl":
+        _check_mxfp8_cute_dsl_inputs(input, alignment)
+        _check_mxfp8_scale_layout(sf_swizzle_layout)
+    else:
+        _check_mxfp8_native_inputs(input, sf_swizzle_layout, alignment)
+        _check_mxfp8_cuda_capability(input.device)
+
+
+# Keep the native policy open to newer architectures, rather than enumerating
+# today's GPUs. CPU host calls are validated by the complete call checker.
+_check_mxfp8_native_inputs.is_compute_capability_supported = lambda cc: cc >= 100  # type: ignore[attr-defined]
+
+
+@backend_requirement(
+    {"cuda": _check_mxfp8_native_inputs, "cute-dsl": _check_mxfp8_cute_dsl_inputs},
+    call_check=_validate_mxfp8_quantize_call,
+    validate_on_call=False,
+)
 @flashinfer_api(trace=mxfp8_quantize_trace)
 def mxfp8_quantize(
     input: torch.Tensor,
@@ -395,10 +541,11 @@ def mxfp8_quantize(
     Parameters
     ----------
     input : torch.Tensor
-        Input tensor of shape ``[M, K]``. CUDA inputs support fp16/bf16.
-        The ``"cute-dsl"`` backend additionally supports fp32 CUDA inputs;
-        the ``"cuda"`` backend does not. CPU inputs with ``backend="cuda"``
-        require ``torch.float32``.
+        Contiguous CUDA input of shape ``[..., M, K]`` with dtype fp16/bf16
+        for ``"cuda"``. Its CPU host path takes a 2-D fp32 input.
+        The ``"cute-dsl"`` backend additionally supports fp32 CUDA input and
+        prepares non-contiguous strided inputs when necessary. It requires
+        a nonempty last dimension divisible by 32.
     is_sf_swizzled_layout : bool
         Whether to use the swizzled layout for scale factors.  Defaults to
         ``True``.
@@ -418,7 +565,8 @@ def mxfp8_quantize(
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
     sf_swizzle_layout : SfLayout, optional
         Swizzle layout for scale factors; when supplied this overrides
-        ``is_sf_swizzled_layout``.
+        ``is_sf_swizzled_layout``. Native and CuTe backends require explicit
+        values to be ``SfLayout`` members, rather than bare integers.
     batch_invariant : bool
         ``True`` runs the batch-invariant MXFP8 quantization class in place
         of the backends (requires ``backend="auto"``): a row's bits depend on
@@ -449,19 +597,31 @@ def mxfp8_quantize(
     The ``"cute-dsl"`` backend is **experimental** and not part of the
     stable API.  It may change or be removed in future versions without
     notice.
-    """
-    sf_vec_size = 32
 
-    if sf_swizzle_layout is None:
-        sf_swizzle_layout = (
-            SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
-        )
+    Notes
+    -----
+    ``mxfp8_quantize.validate_call(...)`` accepts the same call arguments and
+    checks known input requirements without loading a quantization module,
+    preparing tensors, allocating outputs or detecting PDL support. This is
+    useful when filtering benchmark cases or choosing a caller's fallback
+    before attempting quantization. It raises on an invalid call and returns
+    ``None`` otherwise; it does not choose a different backend for ``auto``.
+
+    The preflight does not inspect storage addresses, certify native build or
+    launch support, or check numerical results. In particular, CuTe's copies
+    for strides/alignment happen during execution. Batch-invariant mode uses
+    its existing device/dependency checks and never falls back.
+
+    Examples
+    --------
+    Check the CPU host contract without compiling or quantizing:
+
+    >>> x = torch.empty((2, 32), dtype=torch.float32)
+    >>> mxfp8_quantize.validate_call(x, backend="cuda")
+    """
+    sf_swizzle_layout = _mxfp8_scale_layout(is_sf_swizzled_layout, sf_swizzle_layout)
+    _check_mxfp8_backend(input, backend, batch_invariant)
     if batch_invariant:
-        if backend != "auto":
-            raise ValueError(
-                "mxfp8_quantize: batch_invariant=True requires backend='auto' "
-                f"(got backend={backend!r})"
-            )
         from ..batch_invariant.quantization.mx_api import (
             mxfp8_quantize_batch_invariant,
         )
@@ -470,14 +630,11 @@ def mxfp8_quantize(
             input, sf_swizzle_layout, alignment, enable_pdl
         )
 
-    assert input.shape[-1] % sf_vec_size == 0
-    assert backend in ("auto", "cuda", "cute-dsl"), (
-        f"backend must be 'auto', 'cuda' or 'cute-dsl', got '{backend}'"
-    )
     if backend == "auto":
         backend = "cuda"
 
     if backend == "cute-dsl":
+        _check_mxfp8_scale_layout(sf_swizzle_layout)
         from ..cute_dsl import is_cute_dsl_available
 
         if not is_cute_dsl_available():
@@ -499,6 +656,26 @@ def mxfp8_quantize(
         )
     else:
         # backend == "cuda"
+        # The FFI checks CUDA contiguity, rank, dtype and alignment multiples.
+        # Retain what must be checked before its Python preparation or what
+        # the host binding cannot catch; full admission belongs to validate_call.
+        _check_mxfp8_scale_layout(sf_swizzle_layout)
+        if input.device.type == "cpu":
+            if input.layout != torch.strided or not input.is_contiguous():
+                raise ValueError(
+                    "mxfp8_quantize on CPU requires contiguous strided input"
+                )
+            if sf_swizzle_layout == SfLayout.layout_8x4:
+                raise ValueError(
+                    f"{sf_swizzle_layout} is not supported for mxfp8 quantization on CPU."
+                )
+        elif input.device.type == "cuda":
+            if alignment <= 0:
+                raise ValueError("alignment must be positive")
+            if input.shape[-1] == 0:
+                raise ValueError(
+                    "mxfp8_quantize on CUDA requires a nonempty last dimension"
+                )
         _check_mxfp8_cuda_capability(input.device)
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
