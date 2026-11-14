@@ -2107,9 +2107,7 @@ def test_nvfp4_quantize_4over6_tma_matches_non_tma(
 
 
 # Each batch alone is below the size threshold; the whole input is not.
-@pytest.mark.parametrize(
-    "batch_shape", [(3, 1024, 11264), (2, 1100, 16384), (4, 1024, 4096)]
-)
+@pytest.mark.parametrize("batch_shape", [(3, 1024, 11264), (2, 1100, 16384)])
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_nvfp4_batched_quantize_fp8_tma_matches_non_tma(

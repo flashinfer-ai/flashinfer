@@ -526,7 +526,7 @@ int64_t tmaWorkTiles(int b, int m, QuantizationSFLayout layout) {
 
 // Filling and draining the TMA pipeline costs ~2 us more than the vectorized kernel's launch, which
 // its higher bandwidth repays only on large inputs: ~32 MiB on B200 and RTX 5080 (cold L2). Its
-// grid spans the work tiles, which must also give every SM one. SM107 breaks even by row count.
+// grid spans the work tiles, which must also give every SM one. SM107 breaks even by total rows.
 template <typename T>
 bool useTmaQuantization(int b, int m, int n, QuantizationSFLayout layout, int multiProcessorCount) {
   if (m < 1024 || n % TmaKernelTraits<T>::TMA_COL_CHUNK != 0) {
@@ -534,7 +534,7 @@ bool useTmaQuantization(int b, int m, int n, QuantizationSFLayout layout, int mu
   }
   thread_local int const smVersion = tensorrt_llm::common::getSMVersion();
   if (smVersion == 107) {
-    return static_cast<int64_t>(std::max(b, 1)) * m >=
+    return static_cast<int64_t>(b) * m >=
            (layout == QuantizationSFLayout::SWIZZLED_128x4 ? 2048 : 3072);
   }
   constexpr int64_t kMinTmaInputBytes = 32ll << 20;
