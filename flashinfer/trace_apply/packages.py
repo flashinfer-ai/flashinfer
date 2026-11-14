@@ -908,7 +908,7 @@ def _solution_hash(value: Any) -> str | None:
     return hash_of() if callable(hash_of) else None
 
 
-def release_packages() -> None:
+def release_packages(*, allow_frozen: bool = False) -> None:
     """Release this process's sealed packages: their routes first, then their bindings.
 
     The routes are disarmed before any teardown runs, in an order that is safe
@@ -930,7 +930,10 @@ def release_packages() -> None:
     kept, states, route and preloaded entry included, and stays in
     ``setup_stats()``: captured graphs replay against the state addresses, so
     the state lives for the rest of the process (the reason nothing runs at
-    process exit either, where CUDA frees during interpreter teardown).
+    process exit either, where CUDA frees during interpreter teardown). With
+    ``allow_frozen`` even those bindings release: the caller — an inference
+    engine swapping kernels at runtime — guarantees the graphs were destroyed
+    first.
     Callers quiesce their calls first: a call in flight holds the state object
     it was handed, and a teardown that empties it in place is the Solution's
     own choice.
@@ -940,9 +943,15 @@ def release_packages() -> None:
 
     _own_bound()
     with _bound_lock:
-        released = [bound for bound in _bound.values() if not bound.frozen]
-        kept = {bound.name for bound in _bound.values() if bound.frozen}
-        for key in [key for key, bound in _bound.items() if not bound.frozen]:
+        released = [
+            bound for bound in _bound.values() if allow_frozen or not bound.frozen
+        ]
+        kept = {
+            bound.name for bound in _bound.values() if bound.frozen and not allow_frozen
+        }
+        for key in [
+            key for key, bound in _bound.items() if allow_frozen or not bound.frozen
+        ]:
             del _bound[key]
     releasing = {
         identity for identity in _preloaded_solutions if identity[0] not in kept
@@ -966,7 +975,7 @@ def release_packages() -> None:
     failures: list[SetupStateError] = []
     for bound in released:
         try:
-            bound.release()
+            bound.release(allow_frozen=allow_frozen)
         except SetupStateError as error:
             failures.append(error)
     if failures:
