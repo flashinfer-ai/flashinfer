@@ -1,5 +1,7 @@
+import hashlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from copy import deepcopy
@@ -259,6 +261,107 @@ def test_wheel_index_recognizes_provider_distributions(
     }
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("nightly", [False, True])
+@pytest.mark.parametrize("untested", [False, True])
+@pytest.mark.parametrize(
+    ("filename", "index_path"),
+    [
+        ("flashinfer_python-0.7.2-py3-none-any.whl", "flashinfer-python"),
+        ("flashinfer_cubin-0.7.2-py3-none-any.whl", "flashinfer-cubin"),
+        (
+            "flashinfer_jit_cache-0.7.2+cu130-py3-none-any.whl",
+            "cu130/flashinfer-jit-cache",
+        ),
+        (
+            "flashinfer_jit_cache_sm120f-0.7.2+cu130-py3-none-any.whl",
+            "cu130/flashinfer-jit-cache-sm120f",
+        ),
+    ],
+)
+def test_wheel_index_adds_upload_times_without_duplicate_links(
+    tmp_path, wheel_index_module, nightly, untested, filename, index_path
+):
+    """Add upload timestamps idempotently while keeping existing wheel rows."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / filename).write_bytes(b"wheel")
+    assets = tmp_path / "release-assets.json"
+    timestamp = "2026-10-01T12:34:56Z"
+    assets.write_text(json.dumps([{"name": filename, "created_at": timestamp}]))
+    output = tmp_path / "whl"
+    index = output / ("nightly" if nightly else "") / index_path / "index.html"
+    index.parent.mkdir(parents=True)
+    digest = hashlib.sha256(b"wheel").hexdigest()
+    url = f"https://example.com/v0.7.2/{filename}#sha256={digest}"
+    existing_link = '<a href="https://example.com/old.whl">old.whl</a><br>\n'
+    dated_link = (
+        '<a href="https://example.com/dated.whl" data-upload-time="2026-09-01T00:00:00Z">'
+        "dated.whl</a><br>\n"
+    )
+    index.write_text(
+        existing_link + dated_link + f'<a href="{url}">{filename}</a><br>\n'
+    )
+
+    kwargs = dict(
+        release_assets=str(assets),
+        dist_dir=str(dist),
+        output_dir=str(output),
+        base_url="https://example.com",
+        release_tag="v0.7.2",
+        nightly=nightly,
+        untested=untested,
+    )
+    wheel_index_module.update_index(**kwargs)
+
+    content = index.read_text()
+    assert existing_link in content
+    assert dated_link in content
+    marker = ' data-untested="true"' if untested else ""
+    assert (
+        f'<a href="{url}" data-upload-time="{timestamp}"{marker}>{filename}</a>'
+        in content
+    )
+    assert content.count(f'href="{url}"') == 1
+
+    wheel_index_module.update_index(**kwargs)
+    assert index.read_text() == content
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "assets",
+    [
+        [],
+        {"message": "Not Found"},
+        [{"name": "flashinfer_python-0.7.2-py3-none-any.whl", "created_at": "invalid"}],
+        [
+            {
+                "name": "flashinfer_python-0.7.2-py3-none-any.whl",
+                "created_at": "2026-10-01T12:34:56",
+            }
+        ],
+    ],
+)
+def test_wheel_index_rejects_missing_or_invalid_upload_times(
+    tmp_path, wheel_index_module, assets
+):
+    """Fail before touching the output directory when asset timestamps are invalid."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "flashinfer_python-0.7.2-py3-none-any.whl").touch()
+    metadata = tmp_path / "release-assets.json"
+    metadata.write_text(json.dumps(assets))
+    output = tmp_path / "whl"
+
+    with pytest.raises(ValueError):
+        wheel_index_module.update_index(
+            release_assets=str(metadata), dist_dir=str(dist), output_dir=str(output)
+        )
+
+    assert not output.exists()
+
+
 def _workflow(name: str) -> dict:
     yaml = pytest.importorskip("yaml")
     return yaml.safe_load(
@@ -317,3 +420,124 @@ def test_release_pr_dry_run_watches_shared_workflow():
     paths = release.get("on", release.get(True))["pull_request"]["paths"]
 
     assert ".github/workflows/release-build.yml" in paths
+
+
+@pytest.mark.cpu_only
+@requires_posix_bash
+@pytest.mark.parametrize(
+    ("workflow_name", "tests_passed"),
+    [
+        ("release.yml", True),
+        ("nightly-release.yml", True),
+        ("nightly-release.yml", False),
+    ],
+)
+def test_release_workflows_index_paginated_assets(
+    tmp_path, workflow_name, tests_passed
+):
+    """Run the workflow wheel-index step across two mocked asset pages and error exit."""
+    workflow = _workflow(workflow_name)
+    steps = workflow["jobs"]["update-wheel-index"]["steps"]
+    if workflow_name == "release.yml":
+        checkout = next(
+            step for step in steps if step.get("name") == "Checkout flashinfer repo"
+        )
+        assert checkout["with"]["ref"] == "${{ github.sha }}"
+
+    step = next(step for step in steps if step.get("name") == "Update wheel index")
+    work_dir = tmp_path / "work"
+    dist = work_dir / "dist"
+    dist.mkdir(parents=True)
+    (work_dir / "scripts").symlink_to(REPO_ROOT / "scripts")
+    page_one_wheel = "flashinfer_python-0.7.2-py3-none-any.whl"
+    page_two_wheel = "flashinfer_cubin-0.7.2-py3-none-any.whl"
+    page_one_time = "2026-10-01T12:00:00Z"
+    page_two_time = "2026-10-01T12:05:00Z"
+    (dist / page_one_wheel).write_bytes(b"python-wheel")
+    (dist / page_two_wheel).write_bytes(b"cubin-wheel")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "python3").symlink_to(sys.executable)
+    pages_file = tmp_path / "pages.json"
+    pages_file.write_text(
+        json.dumps(
+            [
+                [{"name": page_one_wheel, "created_at": page_one_time}],
+                [{"name": page_two_wheel, "created_at": page_two_time}],
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_gh = fake_bin / "gh"
+    fake_gh.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "args = sys.argv[1:]\n"
+        "repo = os.environ['EXPECTED_REPO']\n"
+        "tag = os.environ['RELEASE_TAG']\n"
+        "if args == ['api', f'repos/{repo}/releases/tags/{tag}', '--jq', '.id']:\n"
+        "    print('42')\n"
+        "elif args == ['api', '--paginate', f'repos/{repo}/releases/42/assets?per_page=100']:\n"
+        "    assert not sys.stdout.isatty()\n"
+        "    if os.environ.get('FAIL_PAGE_TWO') == '1':\n"
+        "        sys.exit(1)\n"
+        f"    pages = json.loads(open({str(pages_file)!r}, encoding='utf-8').read())\n"
+        "    assert len(pages) == 2\n"
+        "    print(json.dumps([asset for page in pages for asset in page]))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected gh invocation: {args}')\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+
+    repo = workflow.get("env", {}).get(
+        "NIGHTLY_RELEASE_REPOSITORY", "flashinfer-ai/flashinfer"
+    )
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "GH_TOKEN": "test-token",
+        "GITHUB_REPOSITORY": "flashinfer-ai/flashinfer",
+        "NIGHTLY_RELEASE_REPOSITORY": repo,
+        "EXPECTED_REPO": repo,
+        "RELEASE_TAG": "v0.7.2" if workflow_name == "release.yml" else "nightly",
+        "TESTS_PASSED": "true" if tests_passed else "false",
+    }
+
+    failing_env = {**env, "FAIL_PAGE_TWO": "1"}
+    failed = subprocess.run(
+        ["bash", "-eo", "pipefail", "-c", step["run"]],
+        cwd=work_dir,
+        env=failing_env,
+        capture_output=True,
+        text=True,
+    )
+    assert failed.returncode != 0
+    assert not (work_dir / "flashinfer-whl").exists()
+
+    subprocess.run(
+        ["bash", "-eo", "pipefail", "-c", step["run"]],
+        cwd=work_dir,
+        env=env,
+        check=True,
+    )
+
+    index_root = work_dir / "flashinfer-whl"
+    if workflow_name == "nightly-release.yml":
+        index_root = index_root / "nightly"
+    python_index = (index_root / "flashinfer-python" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    cubin_index = (index_root / "flashinfer-cubin" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    marker = "" if tests_passed else ' data-untested="true"'
+    assert (
+        f'data-upload-time="{page_one_time}"{marker}>{page_one_wheel}</a>'
+        in python_index
+    )
+    assert (
+        f'data-upload-time="{page_two_time}"{marker}>{page_two_wheel}</a>'
+        in cubin_index
+    )
