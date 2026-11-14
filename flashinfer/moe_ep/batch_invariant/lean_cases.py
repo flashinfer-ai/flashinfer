@@ -217,7 +217,7 @@ def mma_strings() -> dict[tuple[int, str], str]:
 
 
 def main() -> None:
-    with open(CASES_PATH, "w") as output:
+    with open(CASES_PATH, "w", encoding="utf-8") as output:
         output.write(render())
     print(
         f"MegaMoE Lean cases: {len(conformance_cases())} cases × 6 plans × 5 components"

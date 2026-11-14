@@ -579,7 +579,7 @@ def summary() -> str:
 
 def main(out_path: str = CASES_PATH) -> str:
     content = render()
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(content)
     s = summary()
     print(s)

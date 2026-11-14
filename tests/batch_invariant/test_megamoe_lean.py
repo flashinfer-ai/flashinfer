@@ -25,7 +25,7 @@ needs_lake = pytest.mark.skipif(
 
 
 def test_generated_megamoe_cases_are_current():
-    with open(lean_cases.CASES_PATH) as source:
+    with open(lean_cases.CASES_PATH, encoding="utf-8") as source:
         committed = source.read()
     assert committed == lean_cases.render(), (
         "regenerate with: python -m flashinfer.moe_ep.batch_invariant.lean_cases"
