@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <numeric>
 
@@ -34,6 +35,16 @@ namespace flashinfer {
 namespace norm {
 
 using namespace tensorrt_llm::common;
+
+inline uint32_t GetNormVecSize(uint32_t max_vec_size, uint32_t d,
+                               std::initializer_list<uintptr_t> alignments) {
+  uint32_t vec_size = std::gcd(max_vec_size, d);
+  // A vector must be aligned at every row's address, not only divide its width.
+  for (uintptr_t alignment : alignments) {
+    vec_size = std::gcd(vec_size, uint32_t(alignment % max_vec_size));
+  }
+  return vec_size;
+}
 
 template <typename T>
 struct QuantTypeStaticVals;
@@ -146,7 +157,11 @@ template <typename T>
 cudaError_t RMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_t d,
                     uint32_t stride_input, uint32_t stride_output, float eps = 1e-5,
                     bool enable_pdl = false, cudaStream_t stream = 0) {
-  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  const uint32_t vec_size = GetNormVecSize(
+      16 / sizeof(T), d,
+      {reinterpret_cast<uintptr_t>(input) / sizeof(T),
+       reinterpret_cast<uintptr_t>(weight) / sizeof(T),
+       reinterpret_cast<uintptr_t>(output) / sizeof(T), stride_input, stride_output});
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
   const uint32_t num_warps = ceil_div(block_size, 32);
@@ -269,7 +284,11 @@ template <typename T, typename O>
 cudaError_t RMSNormQuant(T* input, T* weight, O* output, uint32_t batch_size, uint32_t d,
                          uint32_t stride_input, uint32_t stride_output, float* scale,
                          float eps = 1e-5, bool enable_pdl = false, cudaStream_t stream = 0) {
-  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  const uint32_t vec_size = GetNormVecSize(
+      16 / sizeof(T), d,
+      {reinterpret_cast<uintptr_t>(input) / sizeof(T),
+       reinterpret_cast<uintptr_t>(weight) / sizeof(T),
+       reinterpret_cast<uintptr_t>(output) / sizeof(O), stride_input, stride_output});
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
   const uint32_t num_warps = ceil_div(block_size, 32);
@@ -383,7 +402,12 @@ cudaError_t QKRMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint3
                       uint32_t d, uint32_t stride_input_n, uint32_t stride_input_h,
                       uint32_t stride_output_n, uint32_t stride_output_h, float eps = 1e-5,
                       bool enable_pdl = false, cudaStream_t stream = 0) {
-  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  const uint32_t vec_size =
+      GetNormVecSize(16 / sizeof(T), d,
+                     {reinterpret_cast<uintptr_t>(input) / sizeof(T),
+                      reinterpret_cast<uintptr_t>(weight) / sizeof(T),
+                      reinterpret_cast<uintptr_t>(output) / sizeof(T), stride_input_n,
+                      stride_input_h, stride_output_n, stride_output_h});
   const uint32_t num_warps = 4;
   const uint32_t smem_size = 0;
 
@@ -523,7 +547,11 @@ template <typename T>
 cudaError_t FusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batch_size, uint32_t d,
                             uint32_t stride_input, uint32_t stride_residual, float eps = 1e-5,
                             bool enable_pdl = false, cudaStream_t stream = 0) {
-  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  const uint32_t vec_size = GetNormVecSize(
+      16 / sizeof(T), d,
+      {reinterpret_cast<uintptr_t>(input) / sizeof(T),
+       reinterpret_cast<uintptr_t>(residual) / sizeof(T),
+       reinterpret_cast<uintptr_t>(weight) / sizeof(T), stride_input, stride_residual});
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
   const uint32_t num_warps = ceil_div(block_size, 32);
@@ -665,7 +693,12 @@ cudaError_t FusedAddRMSNormQuant(T* input, T* residual, T* weight, O* output, ui
                                  uint32_t d, uint32_t stride_input, uint32_t stride_residual,
                                  uint32_t stride_output, float* scale, float eps = 1e-5,
                                  bool enable_pdl = false, cudaStream_t stream = 0) {
-  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  const uint32_t vec_size = GetNormVecSize(16 / sizeof(T), d,
+                                           {reinterpret_cast<uintptr_t>(input) / sizeof(T),
+                                            reinterpret_cast<uintptr_t>(residual) / sizeof(T),
+                                            reinterpret_cast<uintptr_t>(weight) / sizeof(T),
+                                            reinterpret_cast<uintptr_t>(output) / sizeof(O),
+                                            stride_input, stride_residual, stride_output});
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
   const uint32_t num_warps = ceil_div(block_size, 32);
@@ -842,7 +875,11 @@ template <typename T>
 cudaError_t GemmaRMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_t d,
                          uint32_t stride_input, uint32_t stride_output, float eps = 1e-5,
                          bool enable_pdl = false, cudaStream_t stream = 0) {
-  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  const uint32_t vec_size = GetNormVecSize(
+      16 / sizeof(T), d,
+      {reinterpret_cast<uintptr_t>(input) / sizeof(T),
+       reinterpret_cast<uintptr_t>(weight) / sizeof(T),
+       reinterpret_cast<uintptr_t>(output) / sizeof(T), stride_input, stride_output});
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
   const uint32_t num_warps = ceil_div(block_size, 32);
@@ -877,7 +914,11 @@ template <typename T>
 cudaError_t GemmaFusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batch_size, uint32_t d,
                                  uint32_t stride_input, uint32_t stride_residual, float eps = 1e-5,
                                  bool enable_pdl = false, cudaStream_t stream = 0) {
-  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  const uint32_t vec_size = GetNormVecSize(
+      16 / sizeof(T), d,
+      {reinterpret_cast<uintptr_t>(input) / sizeof(T),
+       reinterpret_cast<uintptr_t>(residual) / sizeof(T),
+       reinterpret_cast<uintptr_t>(weight) / sizeof(T), stride_input, stride_residual});
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
   const uint32_t num_warps = ceil_div(block_size, 32);

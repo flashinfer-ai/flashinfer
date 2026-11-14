@@ -1754,6 +1754,109 @@ def test_norm_quant_pdl_waits_for_scale(norm_quant):
     )
 
 
+_CUDA_NORM_ALIGNMENT_CASES = [
+    (operation, layout)
+    for operation in (
+        "rmsnorm",
+        "qk_rmsnorm",
+        "gemma_rmsnorm",
+        "rmsnorm_quant",
+        "fused_add_rmsnorm",
+        "gemma_fused_add_rmsnorm",
+        "fused_add_rmsnorm_quant",
+    )
+    for layout in (
+        "input_offset",
+        "input_stride",
+        "weight_offset",
+        *(("residual_offset", "residual_stride") if "fused_add" in operation else ()),
+        *(
+            ("output_offset", "output_stride")
+            if "fused_add" not in operation or "quant" in operation
+            else ()
+        ),
+    )
+]
+
+
+@pytest.mark.parametrize("operation,layout", _CUDA_NORM_ALIGNMENT_CASES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_cuda_norm_vector_alignment(operation, layout, dtype, enable_pdl):
+    """Vector loads and stores must honor pointer and row alignment independently."""
+    if enable_pdl and not device_support_pdl(torch.device("cuda")):
+        pytest.skip("PDL requires SM90+")
+    shape = (3, 5, 128) if operation == "qk_rmsnorm" else (19, 500)
+    hidden = shape[-1]
+    columns = torch.arange(hidden, device="cuda")
+    sentinel = -16
+    guards = []
+
+    def tensor_with_layout(name, tensor_shape, tensor_dtype):
+        offset = int(layout == name + "_offset")
+        padding = 1 if layout == name + "_stride" else 8
+        storage = torch.full(
+            (*tensor_shape[:-1], tensor_shape[-1] + padding),
+            sentinel,
+            device="cuda",
+            dtype=tensor_dtype,
+        )
+        view = storage[..., offset : offset + tensor_shape[-1]]
+        guards.append((storage, offset, tensor_shape[-1]))
+        return view
+
+    x = tensor_with_layout("input", shape, dtype)
+    x.copy_(((columns % 17 - 8).float() / 8).to(dtype))
+    weight = tensor_with_layout("weight", (hidden,), dtype)
+    weight.copy_(((columns % 9 - 4).float() / 4).to(dtype))
+    quantized = "quant" in operation
+    fused = "fused_add" in operation
+    out_dtype = torch.float8_e4m3fn if quantized else dtype
+    out = tensor_with_layout("output", shape, out_dtype)
+    weight_before = weight.clone()
+    x_before = x.clone()
+    gemma = operation.startswith("gemma")
+    source = x.float()
+    if fused:
+        residual = tensor_with_layout("residual", shape, dtype)
+        residual.copy_(((columns % 11 - 5).float() / 16).to(dtype))
+        source = source + residual.float()
+        residual_expected = source.to(dtype)
+    expected = source * torch.rsqrt(source.square().mean(-1, keepdim=True) + 1e-6)
+    expected = (expected * (weight.float() + float(gemma))).to(out_dtype)
+    module = flashinfer.norm.get_norm_module()
+    args = (x, weight, 1e-6, enable_pdl)
+    if operation in ("rmsnorm", "qk_rmsnorm"):
+        module.rmsnorm(out, *args)
+    elif operation == "gemma_rmsnorm":
+        module.gemma_rmsnorm(out, *args)
+    elif operation == "rmsnorm_quant":
+        module.rmsnorm_quant(
+            out, x, weight, torch.ones(1, device="cuda"), 1e-6, enable_pdl
+        )
+    elif operation == "fused_add_rmsnorm_quant":
+        module.fused_add_rmsnorm_quant(
+            out, x, residual, weight, torch.ones(1, device="cuda"), 1e-6, enable_pdl
+        )
+    else:
+        getattr(module, operation)(x, residual, weight, 1e-6, enable_pdl)
+        out = x
+    torch.cuda.synchronize()
+    tolerance = 1e-3 if dtype == torch.float16 else 1e-2
+    if quantized:
+        torch.testing.assert_close(out.float(), expected.float(), rtol=0, atol=0)
+    else:
+        torch.testing.assert_close(out, expected, rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(weight, weight_before, rtol=0, atol=0)
+    if fused:
+        torch.testing.assert_close(residual, residual_expected, rtol=0, atol=0)
+    if not fused or quantized:
+        torch.testing.assert_close(x, x_before, rtol=0, atol=0)
+    for storage, offset, width in guards:
+        assert (storage[..., :offset].float() == sentinel).all()
+        assert (storage[..., offset + width :].float() == sentinel).all()
+
+
 if __name__ == "__main__":
     # test_norm(1, 1024, torch.float16, False, True, True)
     test_norm(19, 1024, torch.float16, False, True, False)
