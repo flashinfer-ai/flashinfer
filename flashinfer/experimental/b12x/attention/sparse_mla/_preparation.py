@@ -286,7 +286,7 @@ class _SparseMlaState:
             )
         from b12x.attention._shared.mla.prefill import run_unified_prefill
 
-        return run_unified_prefill(
+        output, lse = run_unified_prefill(
             q=binding.q,
             kv_cache=kv_cache,
             topk_indices=binding.selected_indices,
@@ -312,6 +312,9 @@ class _SparseMlaState:
             prepared=self.prepared,
             mg_enabled=self.query.prefill_mg_enabled,
         )
+        if not self.caps.return_lse:
+            return output
+        return output, lse
 
 
 def plan(
