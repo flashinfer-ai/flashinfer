@@ -402,6 +402,12 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
   auto write_tile = [&](int b, int c, float(*v)[G][4]) {
     const float a = p.alpha[p.block_expert[b]] * 128.f;  // products carry 2^-7
     const int Nout = p.Nout;
+#if !(defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+    // R 8 GEMM1 with SiLU or relu2 on SM8x: rows at or past the block's row
+    // count are padding that GEMM2 zero-fills on load, so they are not stored.
+    [[maybe_unused]] int prows = R;
+    if constexpr (R == 8 && (ACT == 1 || ACT == 2)) prows = p.block_rows[b];
+#endif
     if constexpr (ACT == 0 && (SC == 4 || (G1E && R == 96 && STAGES == 2 && !KT))) {
       // v[s][gi][2 hh + h] is column ws 16 + 8 hh + g8, row gi 8 + 2 tq + h:
       // per (s, gi, hh) an 8 x 8 piece, columns x rows, one bf16 pair (rows 2
@@ -465,6 +471,10 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
           if (i < Nout) {
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
+#if !(defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+              if constexpr (R == 8)
+                if (r0 + h >= prows) continue;  // padding row
+#endif
               const float gt = v[s][gi][h] * a, up = v[s][gi][2 + h] * a;
               float y;
               if constexpr (SC == 4 || (G1E && R == 96 && STAGES == 2 && !KT))
@@ -479,6 +489,10 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
 #pragma unroll
           for (int q = 0; q < 4; ++q) {
             const int nn = n + (q >> 1) * 8;
+#if !(defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+            if constexpr (R == 8)
+              if (r0 + (q & 1) >= prows) continue;  // padding row
+#endif
             if (nn < Nout) {
               const float x = fmaxf(v[s][gi][q] * a, 0.f);
               p.out[(static_cast<long>(b) * R + r0 + (q & 1)) * Nout + nn] =
