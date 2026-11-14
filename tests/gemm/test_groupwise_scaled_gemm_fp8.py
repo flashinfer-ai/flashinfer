@@ -358,17 +358,105 @@ def test_fp8_groupwise_gemm_sm120_tile_selection(m, n, scale_major_mode):
     ref_c = einsum(a_dequant, b_dequant, "m k, n k -> m n").to(out_dtype)
 
     c = gemm_fp8_nt_groupwise(
-        a_fp8, b_fp8, a_scale, b_scale, scale_major_mode, out_dtype=out_dtype
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        scale_major_mode,
+        out_dtype=out_dtype,
+        backend="cutlass",
     )
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
 
     num_mismatched_repeats = torch.zeros((), dtype=torch.int64, device="cuda")
     for _ in range(num_repeats):
         c_repeat = gemm_fp8_nt_groupwise(
-            a_fp8, b_fp8, a_scale, b_scale, scale_major_mode, out_dtype=out_dtype
+            a_fp8,
+            b_fp8,
+            a_scale,
+            b_scale,
+            scale_major_mode,
+            out_dtype=out_dtype,
+            backend="cutlass",
         )
         num_mismatched_repeats += (c_repeat != c).any()
     assert num_mismatched_repeats.item() == 0
+
+
+@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
+def test_fp8_groupwise_gemm_sm120_tile_selection_cuda_graph(scale_major_mode):
+    """m = 96 queries the device's SM count on every launch, so that query has to be legal inside
+    CUDA graph capture: a decode graph is how an inference engine reaches this kernel."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 12:
+        pytest.skip("The swap-AB tile selection is SM120/121 only.")
+    torch.random.manual_seed(0)
+    m, n, k = 96, 4096, 1024
+    tile_size = 128
+    out_dtype = torch.bfloat16
+
+    a_val = torch.randn((m, k), dtype=torch.float, device="cuda")
+    b_val = torch.randn((n, k), dtype=torch.float, device="cuda") / math.sqrt(k)
+
+    if scale_major_mode == "K":
+        a_scale_shape = (m, k // tile_size)
+        b_scale_shape = (n // tile_size, k // tile_size)
+    else:
+        a_scale_shape = (k // tile_size, m)
+        b_scale_shape = (k // tile_size, n // tile_size)
+    a_tile_shape = (1, tile_size)
+    b_tile_shape = (tile_size, tile_size)
+
+    a_fp8, a_scale = quantize_fp8(a_val, a_scale_shape, a_tile_shape, scale_major_mode)
+    b_fp8, b_scale = quantize_fp8(b_val, b_scale_shape, b_tile_shape, scale_major_mode)
+
+    a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
+    b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
+    ref_c = einsum(a_dequant, b_dequant, "m k, n k -> m n").to(out_dtype)
+
+    c = gemm_fp8_nt_groupwise(
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        scale_major_mode,
+        out_dtype=out_dtype,
+        backend="cutlass",
+    )
+    torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
+
+    c_graph = torch.empty((m, n), dtype=out_dtype, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # The warm-up keeps the module build and the workspace allocation off the capture.
+        gemm_fp8_nt_groupwise(
+            a_fp8,
+            b_fp8,
+            a_scale,
+            b_scale,
+            scale_major_mode,
+            out=c_graph,
+            backend="cutlass",
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            gemm_fp8_nt_groupwise(
+                a_fp8,
+                b_fp8,
+                a_scale,
+                b_scale,
+                scale_major_mode,
+                out=c_graph,
+                backend="cutlass",
+            )
+    torch.cuda.current_stream().wait_stream(stream)
+
+    for _ in range(2):
+        c_graph.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(c_graph, ref_c, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("backend", ["trtllm", "cutile"])
