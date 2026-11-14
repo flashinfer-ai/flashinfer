@@ -167,6 +167,8 @@ def test_env_parsing(monkeypatch, caplog, value, workers, warns):
     monkeypatch.setenv("FLASHINFER_CUDNN_PLAN_BUILD_WORKERS", value)
     monkeypatch.setattr(pool_mod, "_pool", None)
     monkeypatch.setattr(pool_mod, "_pool_resolved", False)
+    # The CPU cap has its own test; keep it out of parsing on small runners.
+    monkeypatch.setattr(pool_mod.os, "cpu_count", lambda: 8)
     with caplog.at_level("WARNING"):
         pool = pool_mod.get_cudnn_plan_build_pool()
     try:

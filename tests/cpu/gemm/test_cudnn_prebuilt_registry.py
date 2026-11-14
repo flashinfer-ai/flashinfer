@@ -19,7 +19,11 @@ class FakeGraph:
 
 @pytest.fixture(autouse=True)
 def fake_cudnn(monkeypatch):
-    monkeypatch.setattr(gb, "cudnn", types.SimpleNamespace(pygraph=FakeGraph))
+    # gemm_base binds ``cudnn`` only when the package imports; the CPU lane
+    # may not have it.
+    monkeypatch.setattr(
+        gb, "cudnn", types.SimpleNamespace(pygraph=FakeGraph), raising=False
+    )
     gb._cudnn_override_prebuilt.clear()
     gb._cudnn_single_plan_graphs.clear()
     yield
