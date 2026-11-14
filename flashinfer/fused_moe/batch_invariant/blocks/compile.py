@@ -372,6 +372,12 @@ def get_compiled_grouped(
 # ----------------------------------------------------------------------------- the swapped body (the swapped records)
 
 
+def _swap_epi_wgs(token_tile: int) -> int:
+    from .swap import epi_warpgroups
+
+    return epi_warpgroups(token_tile)
+
+
 def swapped_kernel_name(
     cfg: Knobs,
     chain: ChainLike,
@@ -385,6 +391,11 @@ def swapped_kernel_name(
     return jit.sanitize_symbol_name(
         f"swapped_{fmt_tag(chain.in_fmt)}_{chain.describe()}_{knobs.describe()}"
         + ("_gather" if gather else "")
+        + (
+            f"_e{_swap_epi_wgs(knobs.tile_n)}"
+            if _swap_epi_wgs(knobs.tile_n) > 1
+            else ""
+        )
     )
 
 

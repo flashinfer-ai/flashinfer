@@ -106,6 +106,23 @@ EPILOGUE_WARPS = (
 MMA_WARP = 4
 TMA_WARP = 5
 THREADS = 32 * (TMA_WARP + 1)
+#: Token columns of one epilogue subtile: the TMEM load's width per warpgroup.
+EPI_SUBTILE_N = 8
+#: Epilogue warpgroups at most (each takes one subtile of the token tile).
+EPI_WARPGROUPS_MAX = 4
+
+
+def epi_warpgroups(token_tile: int) -> int:
+    """The swapped epilogue's warpgroups at a token tile: one per ``EPI_SUBTILE_N`` columns, at most ``EPI_WARPGROUPS_MAX``
+    (a placement: every output element's chain is computed by one thread from the same accumulator value, in the same fp32
+    sequence, whichever warpgroup owns its subtile)."""
+    return max(1, min(EPI_WARPGROUPS_MAX, token_tile // EPI_SUBTILE_N))
+
+
+def epilogue_warps(token_tile: int):
+    return tuple(range(4 * epi_warpgroups(token_tile)))
+
+
 WEIGHT_TILE = (
     128  # weight rows per tile (the MMA's M: the 1-CTA instruction's 128 rows)
 )
@@ -220,8 +237,10 @@ class SwappedGroupedGemm:
         self.token_tile, self.weight_tile = knobs.tile_n, knobs.tile_m
         # the warp roles: the epilogue warpgroup, (the block-scaled formats' scale-factor warp,) the MMA warp, the TMA warp
         bs = self.operands.block_scaled
-        self.sf_warp = len(EPILOGUE_WARPS) if bs else None
-        self.mma_warp = len(EPILOGUE_WARPS) + (1 if bs else 0)
+        self.epi_wgs = epi_warpgroups(self.token_tile)
+        self.epilogue_warps = epilogue_warps(self.token_tile)
+        self.sf_warp = len(self.epilogue_warps) if bs else None
+        self.mma_warp = len(self.epilogue_warps) + (1 if bs else 0)
         self.tma_warp = self.mma_warp + 1
         self.threads = 32 * (self.tma_warp + 1)
         # the box form reads the group counts before its wait (the kernel body): a placement that triggers before its wait
@@ -709,21 +728,21 @@ class SwappedGroupedGemm:
             num_stages=st.num_acc_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, len(EPILOGUE_WARPS)
+                pipeline.Agent.Thread, len(self.epilogue_warps)
             ),
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
         tmem_alloc_barrier = pipeline.NamedBarrier(
-            barrier_id=BAR_TMEM_ALLOC, num_threads=32 * (len(EPILOGUE_WARPS) + 1)
+            barrier_id=BAR_TMEM_ALLOC, num_threads=32 * (len(self.epilogue_warps) + 1)
         )
         epi_join = pipeline.NamedBarrier(
-            barrier_id=BAR_EPI_JOIN, num_threads=32 * len(EPILOGUE_WARPS)
+            barrier_id=BAR_EPI_JOIN, num_threads=32 * len(self.epilogue_warps)
         )
         tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
-            allocator_warp_id=EPILOGUE_WARPS[0],
+            allocator_warp_id=self.epilogue_warps[0],
             is_two_cta=False,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
             **ops.tmem_alloc_kwargs(st),
@@ -741,10 +760,10 @@ class SwappedGroupedGemm:
                 build_group_tables_dual(
                     counts, E, tn, s_off, s_pre, s_off_pad, ops.group_align
                 )
-            if warp_idx < len(EPILOGUE_WARPS):
+            if warp_idx < len(self.epilogue_warps):
                 tmem.allocate(st.num_tmem_alloc_cols)
         else:
-            if warp_idx == EPILOGUE_WARPS[0]:
+            if warp_idx == self.epilogue_warps[0]:
                 build_group_tables(
                     counts, E, tn, s_off, s_pre
                 )  # dense offsets; the "m-block" is the token tile
@@ -947,7 +966,7 @@ class SwappedGroupedGemm:
                     tCrTok,
                     tCtAcc_base,
                 )
-        if warp_idx < len(EPILOGUE_WARPS):
+        if warp_idx < len(self.epilogue_warps):
             if cutlass.const_expr(not bs):
                 tmem.allocate(st.num_tmem_alloc_cols)
             tmem.wait_for_alloc()
@@ -960,15 +979,18 @@ class SwappedGroupedGemm:
             swapped_epilogue_loop(
                 st,
                 self.chain,
-                tidx,
+                tidx % 128,
                 tile_sched,
                 tCtAcc_base,
                 thr_mma,
                 mOut,
                 Tk,
                 N,
-                epi_tile,
+                (wt, tn // self.epi_wgs)
+                if cutlass.const_expr(self.epi_wgs > 1)
+                else epi_tile,
                 acc_pipeline,
+                subtile=tidx // 128 if cutlass.const_expr(self.epi_wgs > 1) else None,
                 mAlpha=mAlpha,
                 mSa=mSa,
                 mSi=mSi,
@@ -1354,8 +1376,11 @@ def swapped_epilogue_loop(
     mOutSf: cute.Tensor = None,
     s_off: cute.Tensor = None,
     s_off_pad: cute.Tensor = None,
+    subtile=None,
 ):
-    """The transposed group-masked epilogue: the accumulator tile is (weight rows, tokens); the 128-row TMEM layout gives
+    """The transposed group-masked epilogue (``subtile``: this warpgroup's one token subtile of the tile when several
+    warpgroups split the tile's columns, the accumulator released once every warp has arrived; None: one warpgroup takes
+    every subtile): the accumulator tile is (weight rows, tokens); the 128-row TMEM layout gives
     thread ``t`` weight row ``t`` of the tile and its token columns (the record's N tile). Gated chain: the gate accumulators
     come from lane ``+8`` (``shfl.sync.down``); the up lanes (row % 16 < 8) compute the chain and store output column
     ``(n // 16) * 8 + n % 8``; plain and ungated chains: every lane stores column ``n``. Token ``j`` of the tile is dense row
@@ -1458,7 +1483,12 @@ def swapped_epilogue_loop(
         acc_pipeline.consumer_wait(acc_state)
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
         subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-        for s in cutlass.range_constexpr(subtile_cnt):
+        subtiles = (
+            [subtile]
+            if cutlass.const_expr(subtile is not None)
+            else list(range(subtile_cnt))
+        )
+        for s in subtiles:
             cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
             crd0 = tTR_cF[(None, None, None, s)][(0, 0, 0)]
             wrow = crd0[0]  # this thread's (first) weight row in the tile
