@@ -26,6 +26,8 @@ import torch
 # ATen's at::cuda::sleep kernel, launched by torch.cuda._sleep; its CUDA activity record is the
 # namespace-qualified symbol ``at::cuda::(anonymous namespace)::spin_kernel(long)``
 SENTINEL_KERNEL = "::spin_kernel("
+# the same symbol where the profiler reports the mangled name (Windows)
+SENTINEL_KERNEL_MANGLED = "11spin_kernelE"
 ATTEMPTS = 4
 LOST_RECORDS = "CUPTI-LOST-RECORDS"
 _COPY_PREFIXES = ("Memcpy", "Memset")
@@ -38,7 +40,7 @@ def launch_sentinel() -> None:
 
 def is_sentinel(name: str) -> bool:
     """Whether a CUDA activity record is the sentinel kernel (its namespace-qualified ATen symbol)."""
-    return SENTINEL_KERNEL in name
+    return SENTINEL_KERNEL in name or SENTINEL_KERNEL_MANGLED in name
 
 
 def cuda_event_names(profile: torch.profiler.profile) -> list[str]:
