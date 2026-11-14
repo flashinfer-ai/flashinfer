@@ -22,12 +22,13 @@ import re
 import shutil
 import sys
 import sysconfig
-import time
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
+from filelock import FileLock
+
 from . import env as jit_env
-from .core import JitSpec, _record_jit_build, get_tmpdir, logger
+from .core import JitSpec, get_tmpdir, logger
 from ._cute_dsl_source import (
     _hash_source_files,
     cute_dsl_strict_cache_key as cute_dsl_strict_cache_key,
@@ -147,14 +148,19 @@ class JitSpecCuteDsl(JitSpec):
         if not enable_tvm_ffi:
             # The two export formats must never share a module directory.
             self.expected_meta["tvm_ffi"] = False
-        # Set by build(): the freshly compiled in-process kernel, returned by
-        # load() so a build is never followed by a redundant JITLink reload.
+        # Retained by build() as a fallback when the artifact cannot be loaded
+        # from the disk cache because persistence failed or it was invalidated.
         self._compiled_kernel: Optional[Any] = None
 
     @property
     def lock_path(self) -> Path:
-        # Module-level lock: kernels of one op family serialize their builds
-        # (meta.json wipes/writes must not race sibling kernel exports).
+        # Keep locks outside module_dir: it can be replaced on invalidation,
+        # and creating it before meta.json would make it appear stale.
+        return get_tmpdir() / f"{self.module_dir_name}.{self.kernel_name}.lock"
+
+    @property
+    def module_lock_path(self) -> Path:
+        # Module metadata and exports are shared by kernels of one op family.
         return get_tmpdir() / f"{self.module_dir_name}.lock"
 
     @property
@@ -173,61 +179,32 @@ class JitSpecCuteDsl(JitSpec):
 
     def try_load(self) -> Optional[Any]:
         """The cached kernel iff its ``.o`` exists and meta.json matches."""
-        if not self.object_path.exists():
-            return None
-        if _read_meta(self.meta_path) != self.expected_meta:
-            return None
-        try:
-            kernel = self._load_from_disk()
-            logger.debug(f"Loaded cached CuTe-DSL kernel from {self.object_path}")
-            return kernel
-        except Exception as e:
-            logger.warning(
-                f"Failed to load cached CuTe-DSL kernel from {self.object_path}: "
-                f"{e}. Recompiling."
-            )
-            return None
+        with FileLock(self.module_lock_path, thread_local=False):
+            if not self.is_compiled:
+                return None
+            try:
+                kernel = self._load_from_disk()
+                logger.debug(f"Loaded cached CuTe-DSL kernel from {self.object_path}")
+                return kernel
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load cached CuTe-DSL kernel from {self.object_path}: "
+                    f"{e}. Recompiling."
+                )
+                return None
 
     def build(self) -> None:
         """Compile via ``cute.compile`` and export the ``.o`` artifact.
 
-        Runs under ``lock_path`` when invoked via ``build_and_load()``.
+        The caller holds the kernel lock. Compilation does not take the module
+        lock; only invalidation and export serialize with sibling kernels.
         Persistence failures degrade gracefully: the in-process kernel is
         kept for load(); only the disk write is lost.
         Stale modules (dsl version / source change) are wiped like a ninja rebuild.
         """
-        if (
-            self.module_dir.exists()
-            and _read_meta(self.meta_path) != self.expected_meta
-        ):
-            logger.info(f"Invalidating stale CuTe-DSL module {self.module_dir_name}")
-            shutil.rmtree(self.module_dir, ignore_errors=True)
-
         logger.info(f"Compiling CuTe-DSL kernel {self.name}")
         self._compiled_kernel = self.compile_fn()
-        try:
-            self._export()
-        except Exception as e:
-            logger.warning(
-                f"Failed to persist CuTe-DSL kernel {self.name} to "
-                f"{self.object_path}: {e}. The kernel will be recompiled next run."
-            )
-
-    def compile_and_persist(self) -> None:
-        """Compile outside the module lock; commit the artifact under it.
-
-        ``build_and_load()`` holds the module lock for the whole build.
-        This variant runs ``compile_fn`` unlocked and takes the lock only
-        for the stale-module wipe and the artifact export (~ms).
-
-        Meant for parallel precompilation workers.
-        """
-        from filelock import FileLock
-
-        started = time.perf_counter()
-        self._compiled_kernel = self.compile_fn()
-        _record_jit_build(self.toolchain, self.name, time.perf_counter() - started)
-        with FileLock(self.lock_path, thread_local=False):
+        with FileLock(self.module_lock_path, thread_local=False):
             if (
                 self.module_dir.exists()
                 and _read_meta(self.meta_path) != self.expected_meta
@@ -241,9 +218,18 @@ class JitSpecCuteDsl(JitSpec):
             except Exception as e:  # noqa: BLE001 -- persistence is best-effort
                 logger.warning(
                     f"Failed to persist CuTe-DSL kernel {self.name} to "
-                    f"{self.object_path}: {e}. The kernel will be recompiled "
-                    f"next run."
+                    f"{self.object_path}: {e}. The kernel will be recompiled next run."
                 )
+
+    def compile_and_persist(self) -> None:
+        """Compile unconditionally, then commit under the module lock.
+
+        Meant for parallel precompilation workers.
+        Persistence is best-effort; on-demand callers can retain the compiled
+        kernel in memory when exporting fails.
+        """
+        with FileLock(self.lock_path, thread_local=False):
+            self._timed_build()
 
     def load(self) -> Any:
         """The kernel to hand back: the exported artifact whenever one exists.
@@ -261,15 +247,16 @@ class JitSpecCuteDsl(JitSpec):
         reloaded artifact, so every second run was exercising that form
         anyway.  Miss and hit now hand back the same thing.
 
-        Falls back to the in-process object when no artifact exists -- export
+        Falls back to the in-process object when no valid artifact exists -- export
         is best-effort (``build()`` logs and continues on failure) and the
         on-disk cache can be disabled outright.
         """
-        if self.object_path.exists():
-            return self._load_from_disk()
-        if self._compiled_kernel is not None:
-            return self._compiled_kernel
-        return self._load_from_disk()
+        with FileLock(self.module_lock_path, thread_local=False):
+            if self.is_compiled:
+                return self._load_from_disk()
+            if self._compiled_kernel is not None:
+                return self._compiled_kernel
+            raise RuntimeError(f"No valid cached CuTe-DSL kernel for {self.name}")
 
     def _load_from_disk(self) -> Any:
         import cutlass.cute as cute
