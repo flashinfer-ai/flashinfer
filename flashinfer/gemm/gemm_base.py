@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import collections
 import functools
 from collections import Counter, OrderedDict
 import logging
@@ -4245,44 +4244,64 @@ _cudnn_override_all_plans: weakref.WeakValueDictionary[tuple, Any] = (
 
 
 # Single-plan graphs deserialized from plan-build workers
-# (FLASHINFER_CUDNN_PLAN_BUILD_WORKERS), keyed (override key, tactic), plus each
-# key's tactic list in candidate order. Bounded like the builders' LRUs; the
-# id set lets the plan lookup recognise these graphs, which hold exactly the
-# plan for their tactic but expose no engine/knob query by index.
-_CUDNN_PREBUILT_MAX_GRAPHS = 4096
-_cudnn_override_prebuilt: "collections.OrderedDict[tuple, Any]" = (
-    collections.OrderedDict()
-)
-_cudnn_override_prebuilt_tactics: dict[tuple, list] = {}
-_cudnn_single_plan_graph_ids: set[int] = set()
+# (FLASHINFER_CUDNN_PLAN_BUILD_WORKERS): override key -> {tactic: graph} in
+# candidate order. Whole keys are stored and evicted, bounded like the
+# builders' LRUs. ``_cudnn_single_plan_graphs`` maps id -> graph (a strong
+# reference, so an id cannot be reused while registered) and lets the plan
+# lookup recognise these graphs, which hold exactly their tactic's plan but
+# expose no engine/knob query by index. Mutated only under the GIL.
+_CUDNN_PREBUILT_MAX_KEYS = 2048
+_cudnn_override_prebuilt: "OrderedDict[tuple, dict]" = OrderedDict()
+_cudnn_single_plan_graphs: dict[int, Any] = {}
 
 
 def _cudnn_override_key(builder, kwargs) -> tuple:
     return (builder, tuple(sorted(kwargs.items())))
 
 
+def _is_cudnn_single_plan_graph(graph) -> bool:
+    return _cudnn_single_plan_graphs.get(id(graph)) is graph
+
+
 def _cudnn_prebuilt_tactics(key):
-    tactics = _cudnn_override_prebuilt_tactics.get(key)
-    if tactics is None or any(
-        (key, tactic) not in _cudnn_override_prebuilt for tactic in tactics
-    ):
-        return None
-    return list(tactics)
+    graphs = _cudnn_override_prebuilt.get(key)
+    return None if graphs is None else list(graphs)
+
+
+def _discard_cudnn_prebuilt(key) -> None:
+    for graph in (_cudnn_override_prebuilt.pop(key, None) or {}).values():
+        _cudnn_single_plan_graphs.pop(id(graph), None)
 
 
 def _store_cudnn_prebuilt(key, built, handle) -> list:
-    tactics = []
+    graphs = {}
     for tactic, blob in built:
         graph = cudnn.pygraph(handle=handle)
         graph.deserialize(blob)
-        _cudnn_override_prebuilt[(key, tactic)] = graph
-        _cudnn_single_plan_graph_ids.add(id(graph))
-        tactics.append(tactic)
-    while len(_cudnn_override_prebuilt) > _CUDNN_PREBUILT_MAX_GRAPHS:
-        _, evicted = _cudnn_override_prebuilt.popitem(last=False)
-        _cudnn_single_plan_graph_ids.discard(id(evicted))
-    _cudnn_override_prebuilt_tactics[key] = tactics
-    return list(tactics)
+        graphs[tactic] = graph
+    _discard_cudnn_prebuilt(key)
+    _cudnn_override_prebuilt[key] = graphs
+    _cudnn_single_plan_graphs.update((id(g), g) for g in graphs.values())
+    while len(_cudnn_override_prebuilt) > _CUDNN_PREBUILT_MAX_KEYS:
+        _discard_cudnn_prebuilt(next(iter(_cudnn_override_prebuilt)))
+    return list(graphs)
+
+
+def _pool_plan_tactics(pool, key, spec, device_index, heur_modes, handle):
+    """Tactics for ``key`` built by ``pool``, or ``None`` to build in-process.
+
+    Any failure, including one loading the workers' plans here, disables the
+    pool: tuning must never fail because of it.
+    """
+    try:
+        built = pool.build(spec, device_index, heur_modes)
+        if built is None:
+            return None
+        return _store_cudnn_prebuilt(key, built, handle)
+    except Exception as exc:  # noqa: BLE001 - fall back to the in-process build
+        _discard_cudnn_prebuilt(key)
+        pool.disable(f"{type(exc).__name__}: {exc}")
+        return None
 
 
 def _get_cudnn_override_graph(builder, tactic, **kwargs):
@@ -4295,9 +4314,9 @@ def _get_cudnn_override_graph(builder, tactic, **kwargs):
     """
     key = _cudnn_override_key(builder, kwargs)
     if _is_cudnn_engine_knob_tactic(tactic):
-        prebuilt = _cudnn_override_prebuilt.get((key, tactic))
+        prebuilt = (_cudnn_override_prebuilt.get(key) or {}).get(tactic)
         if prebuilt is not None:
-            _cudnn_override_prebuilt.move_to_end((key, tactic))
+            _cudnn_override_prebuilt.move_to_end(key)
             return prebuilt
         graph = _cudnn_override_all_plans.get(key)
         if graph is not None:
@@ -4316,7 +4335,7 @@ def _cudnn_knob_items_to_dict(knob_items) -> dict:
 
 
 def _get_cudnn_plan_index_for_tactic(graph, tactic) -> int:
-    if id(graph) in _cudnn_single_plan_graph_ids:
+    if _is_cudnn_single_plan_graph(graph):
         # Built for exactly this tactic; execute() runs its only plan.
         return -1
     if _is_cudnn_engine_knob_tactic(tactic):
@@ -4507,8 +4526,7 @@ def clear_cudnn_graph_cache() -> None:
 
     _cudnn_override_all_plans.clear()
     _cudnn_override_prebuilt.clear()
-    _cudnn_override_prebuilt_tactics.clear()
-    _cudnn_single_plan_graph_ids.clear()
+    _cudnn_single_plan_graphs.clear()
     cached_builders = (
         build_cudnn_bf16_fp4_graph,
         build_cudnn_bf16_fp4_graph_override_shape,
@@ -6123,7 +6141,9 @@ def _cudnn_gemm_bf16_runner(
             cached = _cudnn_prebuilt_tactics(key)
             if cached is not None:
                 return cached
-            built = pool.build(
+            return _pool_plan_tactics(
+                pool,
+                key,
                 _bf16_override_graph_spec(
                     kwargs["batch"],
                     kwargs["n"],
@@ -6136,11 +6156,8 @@ def _cudnn_gemm_bf16_runner(
                 ),
                 a.device.index,
                 [int(cudnn.heur_mode.A), int(cudnn.heur_mode.FALLBACK)],
+                _get_cudnn_handle(a.device, torch.cuda.current_stream(a.device)),
             )
-            if built is None:
-                return None
-            handle = _get_cudnn_handle(a.device, torch.cuda.current_stream(a.device))
-            return _store_cudnn_prebuilt(key, built, handle)
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             # inputs layout: a, b, bias, pdl, out, workspace_buffer

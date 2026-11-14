@@ -1,5 +1,6 @@
 """BF16 cuDNN tuning with plans built by FLASHINFER_CUDNN_PLAN_BUILD_WORKERS."""
 
+import json
 import warnings
 
 import pytest
@@ -117,3 +118,83 @@ def test_mm_bf16_autotune_with_pool_matches_reference(pool_on):
     assert pool.last_responses, "the pool was not used"
     assert not pool.broken
     torch.testing.assert_close(out, a @ b, rtol=2e-2, atol=5e-2)
+
+
+def _spec_and_handle(m):
+    import cudnn
+
+    from flashinfer.gemm import _cudnn_plan_build as pb
+
+    runner = _runner()
+    inputs = _inputs(m)
+    a, b, bias, _, out, _ = inputs
+    kwargs = runner._override_graph_kwargs(a, b, bias, out)
+    spec = gb._bf16_override_graph_spec(
+        kwargs["batch"],
+        kwargs["n"],
+        kwargs["k"],
+        kwargs["o_type"],
+        kwargs["bias_is_not_none"],
+        kwargs["cache_m"],
+        kwargs["is_a_k_major"],
+        kwargs["is_b_k_major"],
+    )
+    handle = gb._get_cudnn_handle(a.device, torch.cuda.current_stream(a.device))
+    heur = [int(cudnn.heur_mode.A), int(cudnn.heur_mode.FALLBACK)]
+    return pb, spec, handle, heur
+
+
+def _engine_config(blob: bytes) -> dict:
+    # Serialized plans embed host addresses and a graph id, so equal plans
+    # differ in a few bytes; the embedded engine JSON (engine id plus every
+    # knob choice) identifies the plan.
+    text = blob.decode("latin-1")
+    start = text.index('"engine":{"engineId"') + len('"engine":')
+    config, _ = json.JSONDecoder().raw_decode(text, start)
+    kernels = (config.get("payload") or {}).get("kernels") or []
+    return {
+        "engineId": config["engineId"],
+        "knobChoices": config.get("knobChoices"),
+        "kernels": [kernel.get("kernelName") for kernel in kernels],
+    }
+
+
+@pytest.mark.parametrize("shards", [1, 2])
+def test_shard_exports_each_tactics_own_plan(pool_off, shards):
+    # Bitwise outputs can coincide across plans; compare the exported plans.
+    pb, spec, handle, heur = _spec_and_handle(64)
+    exported = {}
+    for shard in range(shards):
+        candidates, plans = pb.build_shard(spec, handle, heur, (shard, shards))
+        exported.update({tactic: blob for _, tactic, blob in plans})
+    assert sorted(exported) == sorted(candidates)
+    configs = set()
+    for tactic in candidates:
+        graph = pb.build_bf16_override_graph(spec, handle)
+        pb.build_single_plan(graph, tactic)
+        expected = _engine_config(bytes(graph.serialize(as_bytes=True)))
+        assert _engine_config(exported[tactic]) == expected, tactic
+        configs.add(json.dumps(expected, sort_keys=True))
+    assert len(configs) > 1, "every candidate has the same engine config"
+
+
+def test_pool_returning_none_builds_in_process(pool_off, pool_on, monkeypatch):
+    inputs = _inputs(64)
+    expected = _runner().get_valid_tactics(inputs, None)
+    pool = pool_on()
+    monkeypatch.setattr(pool, "build", lambda *a, **k: None)
+    assert _runner().get_valid_tactics(inputs, None) == expected
+    assert not gb._cudnn_override_prebuilt
+
+
+def test_second_call_reuses_pool_plans(pool_on, monkeypatch):
+    pool = pool_on()
+    calls = []
+    real_build = pool.build
+    monkeypatch.setattr(
+        pool, "build", lambda *a, **k: calls.append(1) or real_build(*a, **k)
+    )
+    inputs = _inputs(64)
+    first = _runner().get_valid_tactics(inputs, None)
+    second = _runner().get_valid_tactics(inputs, None)
+    assert first == second and len(calls) == 1

@@ -48,6 +48,10 @@ FAKE_WORKER = textwrap.dedent(
             sys.exit(3)
         if mode == "sleep":
             time.sleep(30)
+        if mode == "garbage":
+            sys.stdout.buffer.write(b"\\x05" + b"\\x00" * 7 + b"junk!")
+            sys.stdout.buffer.flush()
+            continue
         i, w = req["shard"]
         mine = list(candidates)
         if mode == "mismatch" and i == 1:
@@ -57,6 +61,10 @@ FAKE_WORKER = textwrap.dedent(
             for idx, tac in enumerate(mine)
             if idx % w == i
         ]
+        if mode == "partial" and i == 0:
+            plans = plans[1:]
+        if mode == "badindex":
+            plans = [(99, mine[0], b"x")]
         b.write_frame(sys.stdout.buffer, {{
             "device_index": req["device_index"],
             "candidates": mine,
@@ -167,3 +175,58 @@ def test_env_parsing(monkeypatch, caplog, value, workers, warns):
     finally:
         if pool:
             pool.shutdown()
+
+
+@pytest.mark.parametrize("mode", ["garbage", "badindex", "partial"])
+def test_malformed_or_incomplete_results_fall_back(fake_cmd, mode):
+    pool = _pool(fake_cmd, mode)
+    try:
+        assert pool.build(SPEC, device_index=0, heur_modes=[0]) is None
+        assert pool.broken
+    finally:
+        pool.shutdown()
+
+
+def test_disable_turns_the_pool_off(fake_cmd):
+    pool = _pool(fake_cmd, "ok")
+    try:
+        assert pool.build(SPEC, device_index=0, heur_modes=[0]) is not None
+        procs = pool._all_processes()
+        pool.disable("deserialize failed")
+        assert pool.broken
+        assert all(p.poll() is not None for p in procs)
+        assert pool.build(SPEC, device_index=0, heur_modes=[0]) is None
+    finally:
+        pool.shutdown()
+
+
+def test_idle_workers_exit_and_respawn(fake_cmd):
+    pool = pool_mod.CudnnPlanBuildPool(
+        2, timeout_s=10.0, worker_cmd=fake_cmd("ok"), idle_s=0.3
+    )
+    try:
+        assert pool.build(SPEC, device_index=0, heur_modes=[0]) is not None
+        first = pool._all_processes()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and any(p.poll() is None for p in first):
+            time.sleep(0.05)
+        assert all(p.poll() is not None for p in first)
+        assert not pool.broken
+        assert pool.build(SPEC, device_index=0, heur_modes=[0]) is not None
+        assert {p.pid for p in pool._all_processes()}.isdisjoint(p.pid for p in first)
+    finally:
+        pool.shutdown()
+
+
+def test_worker_count_is_capped_at_cpu_count(monkeypatch, caplog):
+    monkeypatch.setenv("FLASHINFER_CUDNN_PLAN_BUILD_WORKERS", "100000")
+    monkeypatch.setattr(pool_mod, "_pool", None)
+    monkeypatch.setattr(pool_mod, "_pool_resolved", False)
+    monkeypatch.setattr(pool_mod.os, "cpu_count", lambda: 6)
+    with caplog.at_level("WARNING"):
+        pool = pool_mod.get_cudnn_plan_build_pool()
+    try:
+        assert pool.num_workers == 6
+        assert "FLASHINFER_CUDNN_PLAN_BUILD_WORKERS" in caplog.text
+    finally:
+        pool.shutdown()

@@ -101,7 +101,13 @@ def _read_frame(proc: subprocess.Popen, deadline: float):
 class CudnnPlanBuildPool:
     """A fixed number of plan-build workers per CUDA device, started lazily."""
 
-    def __init__(self, num_workers: int, timeout_s: float = 120.0, worker_cmd=None):
+    def __init__(
+        self,
+        num_workers: int,
+        timeout_s: float = 120.0,
+        worker_cmd=None,
+        idle_s: float = 30.0,
+    ):
         self.num_workers = num_workers
         self.timeout_s = timeout_s
         self._worker_cmd = worker_cmd or [sys.executable, "-I", str(_WORKER_SCRIPT)]
@@ -109,6 +115,11 @@ class CudnnPlanBuildPool:
         self._lock = threading.Lock()
         self._broken = False
         self.last_responses: list = []
+        # Each worker holds ~800 MB and a CUDA context; tuning comes in bursts,
+        # so release them once idle and respawn on the next build.
+        self.idle_s = idle_s
+        self._idle_timer: threading.Timer | None = None
+        self._last_use = 0.0
 
     @property
     def broken(self) -> bool:
@@ -142,10 +153,33 @@ class CudnnPlanBuildPool:
             if self._broken:
                 return None
             try:
-                return self._build(spec, device_index, list(heur_modes))
-            except (_WorkerFailure, OSError, EOFError, ValueError) as exc:
+                result = self._build(spec, device_index, list(heur_modes))
+            except Exception as exc:  # noqa: BLE001 - never fail a tuning run
                 self._fail(exc)
                 return None
+            self._last_use = time.monotonic()
+            self._schedule_idle_stop()
+            return result
+
+    def disable(self, reason) -> None:
+        """Stop the workers and build in-process from now on (e.g. a result failed to load)."""
+        with self._lock:
+            if not self._broken:
+                self._fail(reason)
+
+    def _schedule_idle_stop(self) -> None:
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+        self._idle_timer = threading.Timer(self.idle_s, self._idle_stop)
+        self._idle_timer.daemon = True
+        self._idle_timer.start()
+
+    def _idle_stop(self) -> None:
+        with self._lock:
+            if self._broken or time.monotonic() - self._last_use < self.idle_s:
+                return
+            self._stop(kill=False)
+            self._workers.clear()
 
     def _build(self, spec, device_index, heur_modes):
         procs = self._workers.get(device_index)
@@ -176,13 +210,21 @@ class CudnnPlanBuildPool:
             if response["candidates"] != candidates:
                 raise _WorkerFailure("workers disagree on the candidate plans")
             for index, tactic, blob in response["plans"]:
-                if candidates[index] != tactic:
+                if not 0 <= index < len(candidates) or candidates[index] != tactic:
                     raise _WorkerFailure("plan does not match its candidate")
                 by_index[index] = (tactic, blob)
+        # A missing plan would silently narrow the tuned tactic set; the
+        # in-process build is the reference, so fall back to it instead.
+        if len(by_index) != len(candidates):
+            raise _WorkerFailure(
+                f"built {len(by_index)} of {len(candidates)} candidate plans"
+            )
         return [by_index[index] for index in sorted(by_index)]
 
     def _fail(self, exc) -> None:
         self._broken = True
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
         logger.warning(
             "[cuDNN plan workers]: %s; building cuDNN plans in-process for the "
             "rest of this process",
@@ -211,6 +253,8 @@ class CudnnPlanBuildPool:
 
     def shutdown(self) -> None:
         with self._lock:
+            if self._idle_timer is not None:
+                self._idle_timer.cancel()
             self._stop(kill=False)
             self._workers.clear()
 
@@ -237,6 +281,12 @@ def get_cudnn_plan_build_pool():
         return None
     if workers == 0:
         return None
+    cpus = os.cpu_count()
+    if cpus and workers > cpus:
+        # Workers are per tuned device and ~800 MB each; more than the CPUs
+        # cannot build faster.
+        logger.warning("Capping %s=%d at %d (CPU count)", ENV_VAR, workers, cpus)
+        workers = cpus
     _pool = CudnnPlanBuildPool(workers)
     atexit.register(_pool.shutdown)
     return _pool
