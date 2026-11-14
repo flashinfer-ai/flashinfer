@@ -13,8 +13,8 @@ from flashinfer.gemm.gemm_bf16_fp4 import (
     _unswizzle_sf_128x4,
 )
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.pdl import late_store
-from tests.test_helpers.w4a16_reference import (
+from tests.utils.test_helpers.pdl import late_store
+from tests.moe_ep.test_helpers.w4a16_reference import (
     assert_w4a16_bits,
     dense_w4a16_reference,
 )

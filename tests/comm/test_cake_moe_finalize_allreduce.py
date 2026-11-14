@@ -30,7 +30,9 @@ PROCESS_CLEANUP_TIMEOUT_S = 30.0
 # profile 110), and otherwise in its early form up to TWO_SHOT_EARLY_MAX_TOKENS
 # tokens. A rank with a shared expert runs the deferred form that also prefetches the
 # shared-expert row to L2 at world size 4, and at world size 8 for top_k 8 except in
-# float16 with output profile 110. Other batches of up to SMALL_TOKEN_MAX
+# float16 with output profile 110; below the deferred range, a rank with a shared expert
+# at top_k 4 runs the two-shot form (and, at world size 4, the two-shot early form) that
+# also prefetches the shared-expert row. Other batches of up to SMALL_TOKEN_MAX
 # tokens run the small-token program, which still runs up to SMALL_TOKEN_EXTENDED_MAX
 # tokens at world size 4, and at world size 2 except for top_k 4 without a shared
 # expert (while the device holds that many small-token clusters). Above that, the
@@ -44,7 +46,7 @@ TWO_SHOT_MIN_TOKENS = {4: 72, 8: 56}
 TWO_SHOT_DEFER_MIN_TOKENS = {4: 1536, 8: 768}
 TWO_SHOT_EARLY_MAX_TOKENS = {4: 128, 8: 128}
 LARGE_TOKEN_MIN_TOKENS = 512
-LARGE_TOKEN_MIN_TOKENS_SHARED = 1280
+LARGE_TOKEN_MIN_TOKENS_SHARED = 895
 W2_QUAD_MAX_TOKENS = 142
 # SM count at which the small-token program holds SMALL_TOKEN_EXTENDED_MAX clusters (B200, B300).
 SMALL_TOKEN_EXTENDED_MIN_SMS = 148
@@ -54,6 +56,8 @@ _PROGRAM_SUFFIX = {
     "two_shot_defer": "_tsd",
     "two_shot_defer_shared": "_tsds",
     "two_shot_early": "_tse",
+    "two_shot_shared": "_tss",
+    "two_shot_early_shared": "_tses",
     "large_token": "_lt",
     "large_token_shared": "_lts",
     "quad": "_quad",
@@ -242,6 +246,15 @@ def _expected_program(
         )
         else "two_shot_defer"
     )
+    # Not deferred: a rank with a shared expert at top_k 4 runs the shared form.
+    now = (
+        "two_shot_early"
+        if world_size in TWO_SHOT_EARLY_MAX_TOKENS
+        and tokens <= TWO_SHOT_EARLY_MAX_TOKENS[world_size]
+        else "two_shot"
+    )
+    if use_shared and top_k == 4 and not (world_size == 8 and now == "two_shot_early"):
+        now += "_shared"
     two_shot = (
         deferred
         if world_size in TWO_SHOT_DEFER_MIN_TOKENS
@@ -252,10 +265,7 @@ def _expected_program(
             and not use_shared
             and output_profile == "110"
         )
-        else "two_shot_early"
-        if world_size in TWO_SHOT_EARLY_MAX_TOKENS
-        and tokens <= TWO_SHOT_EARLY_MAX_TOKENS[world_size]
-        else "two_shot"
+        else now
     )
     if world_size in TWO_SHOT_MIN_TOKENS and tokens >= TWO_SHOT_MIN_TOKENS[world_size]:
         return two_shot

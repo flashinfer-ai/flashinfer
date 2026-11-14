@@ -540,6 +540,8 @@ def compute_megamoe_reference_sm107_block_scaled(
     fc1_alpha: Optional[torch.Tensor] = None,
     fc2_alpha: Optional[torch.Tensor] = None,
     fc1_norm_const: Optional[torch.Tensor] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
 ) -> torch.Tensor:
     """Pure-torch single-rank oracle for the SM107 block-scaled inference kernel.
 
@@ -554,8 +556,10 @@ def compute_megamoe_reference_sm107_block_scaled(
     ``(E, 2I, hidden/vec)``; ``fc2_weight_k_major (E, hidden, I[packed])`` with
     raw SF ``(E, hidden, I/vec)``.
     """
-    if (situ_beta is None) != (situ_linear_beta is None):
-        raise ValueError("SiTU requires both beta parameters.")
+    if situ_beta is None and situ_linear_beta is not None:
+        raise ValueError("situ_linear_beta requires situ_beta.")
+    if (swiglu_alpha is None) != (swiglu_beta is None):
+        raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
     device = topk_idx.device
     tokens = x_data.shape[0] if num_tokens is None else num_tokens
     num_local_experts, fc1_out, _ = fc1_weight_k_major.shape
@@ -588,8 +592,13 @@ def compute_megamoe_reference_sm107_block_scaled(
             up = up.clamp(min=-gate_up_clamp, max=gate_up_clamp)
         if situ_beta is not None:
             gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
-            up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+            if situ_linear_beta is not None:
+                up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
             act = (up * gate).reshape(-1, intermediate)
+        elif swiglu_alpha is not None:
+            act = (
+                (up + swiglu_beta) * gate * torch.sigmoid(swiglu_alpha * gate)
+            ).reshape(-1, intermediate)
         else:
             act = (up * (gate * torch.sigmoid(gate))).reshape(-1, intermediate)
         if apply_routing_weights_before_fc2:

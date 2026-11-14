@@ -12,7 +12,7 @@ limitations under the License.
 
 Multi-GPU rows of the context-parallel (KCP) KDA training route (``cake_kda_det_train_kcp.cake_kcp``): ``W`` ranks over
 NCCL, each holding the fragments of one partition of a packed batch, compared with the exact FP64 per-document
-recurrence of the same operands (``tests/test_helpers/cake_kda_det_train_reference``) and with one another (saved ==
+recurrence of the same operands (``tests/experimental/test_helpers/cake_kda_det_train_reference``) and with one another (saved ==
 replay, repeat, autograd == explicit, checkpoint == direct, document-alone == slice, graph replay == eager with
 every rank capturing the same calls).
 
@@ -36,22 +36,22 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tests.test_helpers.cake_kda_train_kcp_saved import (
+from tests.experimental.test_helpers.cake_kda_train_kcp_saved import (
     carry_slots,
     poison_unwritten_carry,
     written_tensors,
 )
-from tests.test_helpers.cake_kda_det_train_reference import (
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (
     GRAD_NAMES,
     kda_exact_with_grads,
     make_inputs,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
-cake_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
-cake_kcp_plan = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
-cake_jit = cake_package("cake_kda_det_train", "cake_jit")
-cake_kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
+cake_kcp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp")
+cake_kcp_plan = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_plan")
+cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
+cake_kcp_jit = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_jit")
 
 PACKAGE_DIR = Path(cake_kcp_jit.__file__).resolve().parent
 TENSORS = ("out",) + GRAD_NAMES
@@ -127,8 +127,10 @@ def _partition(lengths, W: int, layout: str):
                 p = e
                 d += 1
             pos = end
-        return cake_kcp_plan.partition_det_kcp(cu, W, fragments=nested), cu
-    return cake_kcp_plan.partition_det_kcp(cu, W, layout=layout), cu
+        return cake_kcp_plan.cake_kda_det_train_kcp_partition(
+            cu, W, fragments=nested
+        ), cu
+    return cake_kcp_plan.cake_kda_det_train_kcp_partition(cu, W, layout=layout), cu
 
 
 def _local_slices(part, rank: int, cu: list[int], tensors: dict) -> dict:
@@ -170,22 +172,22 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD if W > 1 else None
     part, cu = _partition(lengths, W, layout)
-    ctx = cake_kcp_plan.build_context_det_kcp(part, group, rank, device)
+    ctx = cake_kcp_plan.cake_kda_det_train_kcp_build_context(part, group, rank, device)
     total = cu[-1]
     glob = make_inputs(
         lengths, H, device
     )  # the same seeded operands on every rank; each takes its slices
     ops = _local_slices(part, rank, cu, glob)
     q, k, v, g, beta, dout = (ops[n] for n in ("q", "k", "v", "g", "beta", "dout"))
-    ws = cake_kcp.WorkspaceDetKcp()
+    ws = cake_kcp.CakeKDADetKcpWorkspace()
 
     def saved_pass(**opts):
-        out, saved = cake_kcp.chunk_kda_det_fwd_kcp(
+        out, saved = cake_kcp.cake_kda_det_train_kcp_forward(
             q, k, v, g, beta, ctx, workspace=ws, **opts
         )
         # ``boundary_mode`` is a forward keyword: the backward replays the forward whenever ``saved`` is None
         bwd_opts = {key: val for key, val in opts.items() if key != "boundary_mode"}
-        dq, dk, dv, dbeta, dg = cake_kcp.chunk_kda_det_bwd_kcp(
+        dq, dk, dv, dbeta, dg = cake_kcp.cake_kda_det_train_kcp_backward(
             q, k, v, g, beta, ctx, dout, saved=saved, workspace=ws, **bwd_opts
         )
         return {"out": out, "dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta}
@@ -194,7 +196,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
 
         def fn(*a):
-            return cake_kcp.chunk_kda_det_kcp(*a, ctx, None, "light", "saved", ws)
+            return cake_kcp.cake_kda_det_kcp(*a, ctx, None, "light", "saved", ws)
 
         if ckpt:
             from torch.utils.checkpoint import checkpoint
@@ -232,15 +234,19 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
     # set adds their predicted bytes, both give this workspace's out (and the written bytes of its saved set)
     # bitwise, and the backward that upgrades the forward-only workspace gives the same gradients; workspace=None (a
     # forward-only arena per call) through autograd too
-    out_b, saved_b = cake_kcp.chunk_kda_det_fwd_kcp(q, k, v, g, beta, ctx, workspace=ws)
-    ws_f, ws_n = cake_kcp.WorkspaceDetKcp(), cake_kcp.WorkspaceDetKcp()
-    out_f, saved_f = cake_kcp.chunk_kda_det_fwd_kcp(
+    out_b, saved_b = cake_kcp.cake_kda_det_train_kcp_forward(
+        q, k, v, g, beta, ctx, workspace=ws
+    )
+    ws_f, ws_n = cake_kcp.CakeKDADetKcpWorkspace(), cake_kcp.CakeKDADetKcpWorkspace()
+    out_f, saved_f = cake_kcp.cake_kda_det_train_kcp_forward(
         q, k, v, g, beta, ctx, workspace=ws_f
     )
-    out_n, _ = cake_kcp.chunk_kda_det_fwd_kcp(
+    out_n, _ = cake_kcp.cake_kda_det_train_kcp_forward(
         q, k, v, g, beta, ctx, workspace=ws_n, save_for_backward=False
     )
-    pred_f = cake_kcp_plan.kda_det_workspace_bytes_kcp(ctx, H=H, backward=False)
+    pred_f = cake_kcp_plan.cake_kda_det_train_kcp_workspace_bytes(
+        ctx, H=H, backward=False
+    )
     lazy_f = cake_kcp_plan.kcp_arena_layout(ctx, H=H, backward=False)["lazy"]
     fwd_only_bytes = (
         ws_f.bytes == pred_f
@@ -251,18 +257,18 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
     # without save_transfer a forward with a saved set reads the c1 receive and transfer staging pools (that option's
     # first state) and a forward without a saved set then adds the carry plane; the ring exchange (checked below)
     # never allocates the c1 receive pool
-    ws_t = cake_kcp.WorkspaceDetKcp()
-    out_t, _ = cake_kcp.chunk_kda_det_fwd_kcp(
+    ws_t = cake_kcp.CakeKDADetKcpWorkspace()
+    out_t, _ = cake_kcp.cake_kda_det_train_kcp_forward(
         q, k, v, g, beta, ctx, workspace=ws_t, save_transfer=False
     )
-    pred_t = cake_kcp_plan.kda_det_workspace_bytes_kcp(
+    pred_t = cake_kcp_plan.cake_kda_det_train_kcp_workspace_bytes(
         ctx, H=H, backward=False, save_transfer=False
     )
     lay_t = cake_kcp_plan.kcp_arena_layout(
         ctx, H=H, backward=False, save_transfer=False
     )
     fwd_only_bytes = fwd_only_bytes and ws_t.bytes == pred_t and not ws_t.has("carry")
-    cake_kcp.chunk_kda_det_fwd_kcp(
+    cake_kcp.cake_kda_det_train_kcp_forward(
         q, k, v, g, beta, ctx, workspace=ws_t, save_for_backward=False
     )
     fwd_only_bytes = (
@@ -278,7 +284,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         carry_poisoned = poison_unwritten_carry(saved_f)
     except AssertionError as exc:
         carry_poisoned = f"carry_slots: {exc!r}"
-    dq, dk, dv, dbeta, dg = cake_kcp.chunk_kda_det_bwd_kcp(
+    dq, dk, dv, dbeta, dg = cake_kcp.cake_kda_det_train_kcp_backward(
         q, k, v, g, beta, ctx, dout, saved=saved_f, workspace=ws_f
     )
     res_fwd_only = {
@@ -305,7 +311,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
     )
     del ws_f, ws_n, ws_t, out_b, saved_b, out_f, saved_f, out_n, out_t, res_fwd_only
     leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
-    out_0 = cake_kcp.chunk_kda_det_kcp(*leaves, ctx)
+    out_0 = cake_kcp.cake_kda_det_kcp(*leaves, ctx)
     out_0.backward(dout)
     ws_none_eq = torch.equal(out_0.detach(), res["out"]) and all(
         torch.equal(lf.grad, res[f"d{n}"])
@@ -319,8 +325,8 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         res_ring = saved_pass(exchange="ring", save_transfer=False)
         ring_ok = all(torch.equal(res_recompute[n], res_ring[n]) for n in TENSORS)
         # a forward-only ring workspace: no c1 receive pool, the hop pools on first use
-        ws_r = cake_kcp.WorkspaceDetKcp()
-        out_r, _ = cake_kcp.chunk_kda_det_fwd_kcp(
+        ws_r = cake_kcp.CakeKDADetKcpWorkspace()
+        out_r, _ = cake_kcp.cake_kda_det_train_kcp_forward(
             q, k, v, g, beta, ctx, workspace=ws_r, exchange="ring"
         )
         ring_ok = ring_ok and torch.equal(out_r, res["out"])
@@ -554,7 +560,7 @@ DIST_SLEEP_MS = 2000.0  # the queue probe of the dist census windows (the host m
 def _run_upload_rank(
     rank: int, W: int, row, rdzv: str | None, result_dir: str | None
 ) -> dict:
-    """Host synchronization on every rank of a CP row, each window a census of ``tests/test_helpers/cake_host_sync.py``
+    """Host synchronization on every rank of a CP row, each window a census of ``tests/experimental/test_helpers/cake_host_sync.py``
     (upload counter, profiler copies where traced, sync-debug warnings, an event-based queue probe and a host-time
     bound): the new path is bitwise the previous one (KDA saved / replay / checkpointed passes with and without a
     workspace, conv halo forward / backward); the first call of a fresh context (with the reused workspace and with
@@ -563,8 +569,8 @@ def _run_upload_rank(
     pack prepared behind queued work (``heads=H``) issues one pinned copy, does not wait and runs bitwise; a pack
     prepared from another thread on a held-back side stream does the same; repeated ``exchange="ring"`` calls record
     no further upload on the context (ring rows); the plan's ``P`` of each rank is reported."""
-    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv
-    from tests.test_helpers.cake_host_sync import (
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import kcp as conv
+    from tests.experimental.test_helpers.cake_host_sync import (
         census,
         counts_agree,
         nonblocking,
@@ -590,12 +596,12 @@ def _run_upload_rank(
     x, dy = loc["x"].contiguous(), loc["dy"].contiguous()
 
     def run(c, ws, **opts) -> list:
-        out, saved = cake_kcp.chunk_kda_det_fwd_kcp(
+        out, saved = cake_kcp.cake_kda_det_train_kcp_forward(
             q, k, v, g, beta, c, workspace=ws, **opts
         )
         # ``boundary_mode`` is a forward keyword
         bwd_opts = {key: val for key, val in opts.items() if key != "boundary_mode"}
-        grads = cake_kcp.chunk_kda_det_bwd_kcp(
+        grads = cake_kcp.cake_kda_det_train_kcp_backward(
             q, k, v, g, beta, c, dout, saved=saved, workspace=ws, **bwd_opts
         )
         return [out, *grads]
@@ -605,7 +611,7 @@ def _run_upload_rank(
 
         leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)]
         out = checkpoint(
-            lambda *a: cake_kcp.chunk_kda_det_kcp(*a, c, None, "light", "saved", ws),
+            lambda *a: cake_kcp.cake_kda_det_kcp(*a, c, None, "light", "saved", ws),
             *leaves,
             use_reentrant=False,
         )
@@ -613,8 +619,8 @@ def _run_upload_rank(
         return [out.detach()] + [lf.grad for lf in leaves]
 
     def halo(c) -> list:
-        y, hist = conv.cake_causal_conv1d_det_forward_kcp(x, w, c)
-        return [y, *conv.cake_causal_conv1d_det_backward_kcp(x, w, c, dy, hist)]
+        y, hist = conv.cake_causal_conv1d_det_train_kcp_forward(x, w, c)
+        return [y, *conv.cake_causal_conv1d_det_train_kcp_backward(x, w, c, dy, hist)]
 
     def eq(a, b) -> bool:
         return len(a) == len(b) and all(
@@ -622,7 +628,9 @@ def _run_upload_rank(
         )
 
     def build(**kw):
-        return cake_kcp_plan.build_context_det_kcp(part, group, rank, device, **kw)
+        return cake_kcp_plan.cake_kda_det_train_kcp_build_context(
+            part, group, rank, device, **kw
+        )
 
     def window(fn, **kw) -> dict:
         return census(fn, device, sleep_ms=DIST_SLEEP_MS, **kw)
@@ -643,8 +651,11 @@ def _run_upload_rank(
         sleep_cycles(device, DIST_SLEEP_MS)  # calibrated before any window
         old = build(_kcp_test_knobs=dict(OLD_PATH))
         ctx = build(heads=H)
-        ws, ws_old = cake_kcp.WorkspaceDetKcp(), cake_kcp.WorkspaceDetKcp()
-        P = cake_kcp.WorkspaceDetKcp(local=False).tables(ctx, H).P
+        ws, ws_old = (
+            cake_kcp.CakeKDADetKcpWorkspace(),
+            cake_kcp.CakeKDADetKcpWorkspace(),
+        )
+        P = cake_kcp.CakeKDADetKcpWorkspace(local=False).tables(ctx, H).P
         ref = (
             run(old, None)
             + run(old, ws_old)
@@ -690,7 +701,7 @@ def _run_upload_rank(
         # the ring exchange: its hop chains are uploaded once per table set, not per call
         ring_uploads, ring_chains = None, None
         if W > 1 and int(ctx.n_d_max) - 1 <= cake_kcp.RING_MAX_HOPS:
-            ws_r = cake_kcp.WorkspaceDetKcp()
+            ws_r = cake_kcp.CakeKDADetKcpWorkspace()
             run(ctx, ws_r, exchange="ring", save_transfer=False)
             n1 = len(ctx._uploads)
             for _ in range(3):
@@ -698,7 +709,7 @@ def _run_upload_rank(
             ring_uploads = (n1, len(ctx._uploads))
             ring_chains = sorted(
                 cake_kcp._ring_tables(
-                    cake_kcp.WorkspaceDetKcp(local=False).tables(ctx, H)
+                    cake_kcp.CakeKDADetKcpWorkspace(local=False).tables(ctx, H)
                 ).chains
             )
         torch.cuda.synchronize(device)
@@ -914,11 +925,12 @@ def test_module_imports_only_torch_and_its_package() -> None:
     path's begin_call template cache, owned by the local arena and weakly keyed by the table set -- stdlib, no new
     module; ``operator.itemgetter`` for the trimmed local launch plan's argument fetch -- stdlib, no new module;
     ``sys.modules`` for the backward's mode check, which recognizes the non-deterministic package's workspace type
-    without importing that package -- stdlib, no new module)."""
+    without importing that package -- stdlib, no new module; ``threading.Lock`` guarding the module-level pool of
+    ``workspace=None`` default workspaces against concurrent Python threads -- stdlib, no new module); ``importlib`` in
+    ``_single_rank``, through which it imports its single-rank sibling by name (README "Vendoring")."""
     import ast
 
-    src = Path(cake_kcp.__file__).read_text()
-    tree = ast.parse(src)
+    package = Path(cake_kcp.__file__).parent
     allowed = {
         "__future__",
         "dataclasses",
@@ -934,20 +946,24 @@ def test_module_imports_only_torch_and_its_package() -> None:
         "ctypes",
         "warnings",
         "functools",
+        "inspect",  # inspect.signature: the entry points' signatures state their keyword options (stdlib)
         "weakref",
         "operator",
         "sys",  # sys.modules: the non-deterministic package's types are found without importing that package
-    }  # operator: itemgetter of the trimmed local launch plan's arguments; weakref: the arena-owned template cache of the trimmed host path; functools: cached_property of the trimmed host path; ctypes: the cache-config bracket of the walk-launch geometry and the capture-graph entry points of the replay cap; warnings: the one RuntimeWarning without a loadable CUDA runtime or for a degraded node cap; no other use
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for a in node.names:
-                assert a.name in allowed, a.name
-        elif isinstance(node, ast.ImportFrom) and node.level == 0:
-            assert node.module in allowed, node.module
+        "importlib",
+        "threading",  # threading.Lock: the workspace=None default-workspace pool's lock (stdlib)
+    }  # importlib: _single_rank resolves the single-rank sibling package by name (README "Vendoring"); operator: itemgetter of the trimmed local launch plan's arguments; weakref: the arena-owned template cache of the trimmed host path; functools: cached_property of the trimmed host path; ctypes: the cache-config bracket of the walk-launch geometry and the capture-graph entry points of the replay cap; warnings: the one RuntimeWarning without a loadable CUDA runtime or for a degraded node cap; no other use
+    for name in ("cake_kcp.py", "_single_rank.py"):
+        for node in ast.walk(ast.parse((package / name).read_text())):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    assert a.name in allowed, (name, a.name)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                assert node.module in allowed, (name, node.module)
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# Checkpoint recompute (issue #7815): ``chunk_kda_det_kcp`` under ``torch.utils.checkpoint``.  Rows: ``ROWS`` plus one
+# Checkpoint recompute (issue #7815): ``cake_kda_det_kcp`` under ``torch.utils.checkpoint``.  Rows: ``ROWS`` plus one
 # H = 64 row (``P = 1`` ranks) and one row where no document crosses a rank; under a Slurm step of 8 or 16 tasks also the rows of that width (``CKPT_WIDE``; a
 # one-node run has no such rows, so they never show up as skips there).
 
@@ -1129,9 +1145,9 @@ def _run_rank_ckpt(
       changes the recompute's ``out`` and ``dw`` (positive control);
     - collectives, waits and all-to-all bytes per phase (``orig`` / ``recompute`` / ``bwd``): the plain checkpoint
       exchanges in every phase (positive control), the handle's recompute issues none, its original forward and
-      backward match the byte queries of the tier (``kda_det_comm_bytes_kcp(checkpoint_keep=...)``);
+      backward match the byte queries of the tier (``cake_kda_det_train_kcp_comm_bytes(checkpoint_keep=...)``);
     - retained bytes after a checkpointed forward with a handle == ``handle.nbytes()`` ==
-      ``kda_det_saved_bytes_kcp(checkpoint_keep=..., with_conv=False)``;
+      ``cake_kda_det_train_kcp_saved_bytes(checkpoint_keep=..., with_conv=False)``;
     - a symmetric fingerprint mismatch raises on every rank (no collective is issued -- counted --, no hang);
     - the layer core: three KCP convolutions (with ``"conv"`` handles, one of them shared with KDA) + q / k
       normalization + KDA under one checkpoint: the recompute issues no collective; every gradient bitwise."""
@@ -1147,11 +1163,11 @@ def _run_rank_ckpt(
         _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD
     part, cu = _partition(lengths, W, layout)
-    ctx = cake_kcp_plan.build_context_det_kcp(part, group, rank, device)
+    ctx = cake_kcp_plan.cake_kda_det_train_kcp_build_context(part, group, rank, device)
     glob = make_inputs(lengths, H, device)
     ops = _local_slices(part, rank, cu, glob)
     q, k, v, g, beta, dout = (ops[n] for n in ("q", "k", "v", "g", "beta", "dout"))
-    ws = cake_kcp.WorkspaceDetKcp()
+    ws = cake_kcp.CakeKDADetKcpWorkspace()
     flags: dict[str, bool] = {}
     info: dict[str, object] = {
         "T_r": int(q.shape[0]),
@@ -1184,7 +1200,7 @@ def _run_rank_ckpt(
     for form, wsp in (("per_call", None), ("caller_ws", ws)):
 
         def fn0(*a, _w=wsp):
-            return cake_kcp.chunk_kda_det_kcp(*a, ctx, None, "light", "saved", _w)
+            return cake_kcp.cake_kda_det_kcp(*a, ctx, None, "light", "saved", _w)
 
         for step in ("warm", "measure"):
             lv = leaves()
@@ -1231,7 +1247,7 @@ def _run_rank_ckpt(
         outs = []
 
         def fn(q_, k_, v_, g_, b_, h_):
-            y = cake_kcp.chunk_kda_det_kcp(
+            y = cake_kcp.cake_kda_det_kcp(
                 q_, k_, v_, g_, b_, ctx, workspace=ws, recompute_handle=h_, **kw
             )
             outs.append(y.detach().clone())
@@ -1256,7 +1272,11 @@ def _run_rank_ckpt(
 
                 def outer(q_, k_, v_, g_, b_, h_, w_):
                     # the product saves the outer region's yi (the outer recompute runs and its yi is read)
-                    hh = cake_kcp.RecomputeHandleDetKcp() if mode == "nested_in" else h_
+                    hh = (
+                        cake_kcp.CakeKDADetKcpRecomputeHandle()
+                        if mode == "nested_in"
+                        else h_
+                    )
                     yi = checkpoint(fn, q_, k_, v_, g_, b_, hh, use_reentrant=False)
                     return yi * w_
 
@@ -1332,7 +1352,7 @@ def _run_rank_ckpt(
     for keep in ("states", "transfer"):
         for reentrant in (False, True):
             tag = f"handle_{keep}" + ("_reentrant" if reentrant else "")
-            hd = cake_kcp.RecomputeHandleDetKcp()
+            hd = cake_kcp.CakeKDADetKcpRecomputeHandle()
             res, rec, aux = run("ckpt", hd, keep=keep, reentrant=reentrant)
             counts[tag] = rec
             handles[tag] = hd
@@ -1358,7 +1378,9 @@ def _run_rank_ckpt(
             flags[f"{tag}_modes"] = rec["modes"] == ["capture", "replay"]
             # bytes the collectives moved == the byte query of the tier (KDA alone: c1 + c2, b1 + b2; none in the
             # recompute)
-            cb = cake_kcp_plan.kda_det_comm_bytes_kcp(ctx, H=H, checkpoint_keep=keep)
+            cb = cake_kcp_plan.cake_kda_det_train_kcp_comm_bytes(
+                ctx, H=H, checkpoint_keep=keep
+            )
             want_b = {
                 "send": {
                     "orig": cb["c1"]["send"] + cb["c2"]["send"],
@@ -1375,7 +1397,7 @@ def _run_rank_ckpt(
                 flags[f"{tag}_bytes_eq_query"] = (
                     rec["send"] == want_b["send"] and rec["recv"] == want_b["recv"]
                 )
-            query = cake_kcp_plan.kda_det_saved_bytes_kcp(
+            query = cake_kcp_plan.cake_kda_det_train_kcp_saved_bytes(
                 ctx, H=H, checkpoint_keep=keep, with_conv=False
             )
             flags[f"{tag}_nbytes_eq_query"] = hd.nbytes() == query
@@ -1392,7 +1414,9 @@ def _run_rank_ckpt(
         e = h.entries["kda"]
         e["S_in"] = e["S_in"] + 1.0
 
-    pert, _, pert_aux = run("ckpt", cake_kcp.RecomputeHandleDetKcp(), tamper=perturb)
+    pert, _, pert_aux = run(
+        "ckpt", cake_kcp.CakeKDADetKcpRecomputeHandle(), tamper=perturb
+    )
     flags["binding_control"] = n_in == 0 or (
         not pert_aux["outs_ok"] and not same(pert["dw"], plain["dw"])
     )
@@ -1403,7 +1427,7 @@ def _run_rank_ckpt(
     if ring_ok:
         plain_ring, counts["plain_ring"], aux_p = run("ckpt", exchange="ring")
         hd_ring, counts["handle_ring"], aux_h = run(
-            "ckpt", cake_kcp.RecomputeHandleDetKcp(), exchange="ring"
+            "ckpt", cake_kcp.CakeKDADetKcpRecomputeHandle(), exchange="ring"
         )
         pr, hr = counts["plain_ring"], counts["handle_ring"]
         flags["ring_bitwise"] = eq(plain_ring, direct) and eq(hd_ring, plain_ring)
@@ -1431,7 +1455,11 @@ def _run_rank_ckpt(
         for keep in ("states", "transfer"):
             tag = f"handle_overlap_{keep}"
             res, rec, aux = run(
-                "ckpt", cake_kcp.RecomputeHandleDetKcp(), keep=keep, poison=True, **ov
+                "ckpt",
+                cake_kcp.CakeKDADetKcpRecomputeHandle(),
+                keep=keep,
+                poison=True,
+                **ov,
             )
             counts[tag] = rec
             flags[f"{tag}_bitwise"] = eq(res, plain_ov) and eq(res, direct)
@@ -1448,7 +1476,7 @@ def _run_rank_ckpt(
             )
             res, counts["handle_ring_overlap"], aux_h = run(
                 "ckpt",
-                cake_kcp.RecomputeHandleDetKcp(),
+                cake_kcp.CakeKDADetKcpRecomputeHandle(),
                 poison=True,
                 exchange="ring",
                 **ov,
@@ -1468,7 +1496,7 @@ def _run_rank_ckpt(
         cake_kcp_plan.enable_test_knobs(previous_knobs)
     # retain_graph: each backward's recompute binds the entry (no collective); exactly twice the gradients
     twice, counts["handle_twice"], aux = run(
-        "ckpt", cake_kcp.RecomputeHandleDetKcp(), twice=True
+        "ckpt", cake_kcp.CakeKDADetKcpRecomputeHandle(), twice=True
     )
     tw = counts["handle_twice"]
     flags["twice_accumulates"] = (
@@ -1486,7 +1514,7 @@ def _run_rank_ckpt(
     )
     # early stop off
     late, counts["handle_no_early_stop"], aux = run(
-        "ckpt", cake_kcp.RecomputeHandleDetKcp(), early_stop=False
+        "ckpt", cake_kcp.CakeKDADetKcpRecomputeHandle(), early_stop=False
     )
     flags["no_early_stop"] = (
         eq(late, direct)
@@ -1495,10 +1523,10 @@ def _run_rank_ckpt(
     )
     # nested checkpoints
     nest_out, counts["nested_out"], aux_o = run(
-        "nested_out", cake_kcp.RecomputeHandleDetKcp()
+        "nested_out", cake_kcp.CakeKDADetKcpRecomputeHandle()
     )
     nest_in, counts["nested_in"], aux_i = run(
-        "nested_in", cake_kcp.RecomputeHandleDetKcp()
+        "nested_in", cake_kcp.CakeKDADetKcpRecomputeHandle()
     )
     flags["nested_out_bitwise"] = eq(nest_out, direct) and aux_o["outs_ok"]
     flags["nested_in_bitwise"] = eq(nest_in, direct) and aux_i["outs_ok"]
@@ -1512,13 +1540,13 @@ def _run_rank_ckpt(
     # handle made inside the outer region: the outer recompute's inner forward is an original forward (exchanges)
     flags["nested_in_counts"] = counts["nested_in"]["calls"] == pc["calls"]
     # retained bytes after a checkpointed forward with a handle (after a warm-up of the same form): the handle's
-    # entry, i.e. kda_det_saved_bytes_kcp(checkpoint_keep=..., with_conv=False)
+    # entry, i.e. cake_kda_det_train_kcp_saved_bytes(checkpoint_keep=..., with_conv=False)
     retained_h = {}
     for keep in ("states", "transfer"):
         for form, wsp in (("per_call", None), ("caller_ws", ws)):
 
             def fn1(q_, k_, v_, g_, b_, h_, _w=wsp, _k=keep):
-                return cake_kcp.chunk_kda_det_kcp(
+                return cake_kcp.cake_kda_det_kcp(
                     q_,
                     k_,
                     v_,
@@ -1532,7 +1560,7 @@ def _run_rank_ckpt(
 
             for step in ("warm", "measure"):
                 lv = leaves()
-                hd = cake_kcp.RecomputeHandleDetKcp()
+                hd = cake_kcp.CakeKDADetKcpRecomputeHandle()
                 torch.cuda.synchronize(device)
                 gc.collect()
                 before = _requested(device)
@@ -1542,7 +1570,7 @@ def _run_rank_ckpt(
                     retained_h[f"{keep}/{form}"] = (
                         _requested(device) - before - out.numel() * out.element_size()
                     )
-                    query = cake_kcp_plan.kda_det_saved_bytes_kcp(
+                    query = cake_kcp_plan.cake_kda_det_train_kcp_saved_bytes(
                         ctx, H=H, checkpoint_keep=keep, with_conv=False
                     )
                     flags[f"retained_{keep}_{form}"] = (
@@ -1552,17 +1580,17 @@ def _run_rank_ckpt(
                 del out, lv, hd
     info["retained_bytes_handle"] = retained_h
     info["saved_bytes_query"] = {
-        keep: cake_kcp_plan.kda_det_saved_bytes_kcp(
+        keep: cake_kcp_plan.cake_kda_det_train_kcp_saved_bytes(
             ctx, H=H, checkpoint_keep=keep, with_conv=False
         )
         for keep in ("states", "transfer")
     }
     # a symmetric mismatch (every rank's entry describes another mode) raises on every rank before any collective
     # (counted: none in the failing backward)
-    hd = cake_kcp.RecomputeHandleDetKcp()
+    hd = cake_kcp.CakeKDADetKcpRecomputeHandle()
     lv = leaves()
     out = checkpoint(
-        lambda *a: cake_kcp.chunk_kda_det_kcp(*a[:5], ctx, recompute_handle=a[5]),
+        lambda *a: cake_kcp.cake_kda_det_kcp(*a[:5], ctx, recompute_handle=a[5]),
         *lv,
         hd,
         use_reentrant=False,
@@ -1608,7 +1636,7 @@ def _run_rank_ckpt(
         qq = conv_kcp.cake_causal_conv1d_det_kcp(xq, wq, ctx, recompute_handle=hq)
         kk = conv_kcp.cake_causal_conv1d_det_kcp(xk, wk, ctx, recompute_handle=hk)
         vv = conv_kcp.cake_causal_conv1d_det_kcp(xv, wv, ctx, recompute_handle=hv)
-        y = cake_kcp.chunk_kda_det_kcp(
+        y = cake_kcp.cake_kda_det_kcp(
             l2(qq.view(T, H, 128)),
             l2(kk.view(T, H, 128)),
             vv.view(T, H, 128),
@@ -1629,9 +1657,9 @@ def _run_rank_ckpt(
         ]
         hs = (
             (
-                cake_kcp.RecomputeHandleDetKcp(),  # shared by the q convolution and KDA
-                conv_kcp.RecomputeHandleDetKcp(),
-                conv_kcp.RecomputeHandleDetKcp(),
+                cake_kcp.CakeKDADetKcpRecomputeHandle(),  # shared by the q convolution and KDA
+                conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle(),
+                conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle(),
             )
             if mode == "handle"
             else (None, None, None)
@@ -1678,19 +1706,21 @@ def _run_rank_ckpt(
     )
     # the shared handle holds "conv" + "kda"; the three handles together = KDA states + three hist pools
     flags["layer_nbytes"] = sorted(l_hs[0].entries) == ["conv", "kda"] and l_nbytes == (
-        cake_kcp_plan.kda_det_saved_bytes_kcp(ctx, H=H, checkpoint_keep="states", C=C)
+        cake_kcp_plan.cake_kda_det_train_kcp_saved_bytes(
+            ctx, H=H, checkpoint_keep="states", C=C
+        )
         + 2 * int(ctx.halo.n_hist_rows) * C * 2
     )
 
-    # the same layer with cake_causal_conv1d_det_multi_kcp (the q / k / v convolutions in one call, one halo exchange
+    # the same layer with cake_causal_conv1d_det_kcp_multi (the q / k / v convolutions in one call, one halo exchange
     # per direction) and ONE handle for the convolutions and KDA: bitwise the three single calls, two halo
     # collectives (and waits) fewer in every phase that exchanges halos, the same retained bytes
     def layer_multi(xq, xk, xv, wq, wk, wv, g_, b_, w_, h):
         T = xq.shape[0]
-        qq, kk, vv = conv_kcp.cake_causal_conv1d_det_multi_kcp(
+        qq, kk, vv = conv_kcp.cake_causal_conv1d_det_kcp_multi(
             (xq, xk, xv), (wq, wk, wv), ctx, recompute_handle=h
         )
-        y = cake_kcp.chunk_kda_det_kcp(
+        y = cake_kcp.cake_kda_det_kcp(
             l2(qq.view(T, H, 128)),
             l2(kk.view(T, H, 128)),
             vv.view(T, H, 128),
@@ -1709,7 +1739,7 @@ def _run_rank_ckpt(
             x.detach().clone().requires_grad_(True)
             for x in (*xs, *wts, g, beta, torch.ones_like(dout))
         ]
-        h = cake_kcp.RecomputeHandleDetKcp() if mode == "handle" else None
+        h = cake_kcp.CakeKDADetKcpRecomputeHandle() if mode == "handle" else None
         with _Counter() as cc:
             if mode == "direct":
                 out = layer_multi(*lv, h)

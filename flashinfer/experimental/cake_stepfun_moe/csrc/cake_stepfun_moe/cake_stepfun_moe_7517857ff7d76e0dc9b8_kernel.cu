@@ -19,10 +19,6 @@
 #define CAKE_NEED_INT_WARP_UNIFORM
 #include "cake_stepfun_moe_device_common.cuh"
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 256
-
 extern "C" {
 
 __global__ __launch_bounds__(256) void
@@ -74,11 +70,11 @@ kernel_cake_stepfun_moe_7517857ff7d76e0dc9b8(const __nv_bfloat16* in_ptr, const 
             scale[7] = 0.0f;
             value[7] = 0.0f;
             if (permuted[0] != -1) {
-                float _vec_load_0[1];
+                float _vec_load[1];
                 {
-                    _vec_load_0[0] = *reinterpret_cast<const float*>(expert_weights + (token_idx * top_k));
+                    _vec_load[0] = *reinterpret_cast<const float*>(expert_weights + (token_idx * top_k));
                 }
-                scale[0] = _vec_load_0[0];
+                scale[0] = _vec_load[0];
             }
             if (permuted[1] != -1) {
                 float _vec_load_1[1];
@@ -241,7 +237,7 @@ kernel_cake_stepfun_moe_7517857ff7d76e0dc9b8(const __nv_bfloat16* in_ptr, const 
                 asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_15) : "f"(scale[7]), "f"(value[7]), "f"(data));
                 data = _fma_15;
             }
-            *(reinterpret_cast<__nv_bfloat16*>(out_ptr + (token_idx * hidden_dim + hidden_idx)) + (0)) = __float2bfloat16_rn(data);
+            *(reinterpret_cast<__nv_bfloat16*>(out_ptr + (token_idx * hidden_dim + hidden_idx)) + (0)) = (__nv_bfloat16)data;
         }
     }
 }

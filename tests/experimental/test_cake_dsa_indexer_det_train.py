@@ -23,25 +23,27 @@ limitations under the License.
 # through the FP64 reference (minutes on B200).
 #
 # This suite exercises the package alone: it names the package once, through
-# ``tests.test_helpers.cake_package``, and imports nothing else from flashinfer,
+# ``tests.cake.test_helpers.cake_package``, and imports nothing else from flashinfer,
 # so a build that vendors the package under another import path runs it
 # unchanged after pointing that table entry at its package.  The flashinfer
 # public entry points (``flashinfer.cake_dsa_indexer_det_train``) are covered by
 # ``test_cake_dsa_indexer_det_train_api.py`` and their #8928 naming rules by
 # ``test_cake_dsa_indexer_det_train_names.py``.
 
+import dataclasses
 import itertools
 import json
 import os
 import re
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
 
-from tests.test_helpers import cake_dsa_indexer_reference as ref
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers import cake_dsa_indexer_reference as ref
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake.cake_dsa_indexer_det_train", "cake_backend")
 cake_build = cake_package("cake.cake_dsa_indexer_det_train", "cake_build")
@@ -110,15 +112,21 @@ _COMMON = dict(
     cand_cap_ceiling=None,
     cand_cap_ceiling_unsampled=None,
     wide_first_rule=None,
+    wide_wave_rule=None,
+    desc_walk_kinds=None,
     split_max=32,
     split_min_range_tiles=64,
     split_units=["l6", "narrow", "wide"],
     split_wave_scope=None,
     split_fit_rule=None,
+    split_resident_rule=None,
     l6_solo_rule=None,
     l6_solo_unsampled_max_queries=None,
     wide_pair_snake_only=False,
     snake_default=False,
+    snake_cap_rule=None,
+    snake_packed_rule=None,
+    snake_l6_fallback_waves=None,
     tile_unroll_default=1,
     tile_unroll_factor=2,
     sample_fit_max_mean_tiles=512,
@@ -131,7 +139,9 @@ _COMMON = dict(
     sample_shift_permille=250,
     sample_shift_rule=None,
     sample_class_rule=None,
+    sample_long_rule=None,
     lsf_programs=False,
+    lsf_single_rule=None,
     static_scan_kinds=[],
     far_sample=0,
     check_period_max=32,
@@ -160,6 +170,8 @@ _COMMON = dict(
     rank_t16_slots=[4096],
     rank_persist_max_k=0,
     rank_persist_ctas_per_sm=4,
+    rank_persist_spare_sms=0,
+    merge_rank=False,
 )
 NARROW_PAIR_POLICY = DispatchPolicy.from_record(
     dict(
@@ -343,19 +355,32 @@ def test_registry_records_are_well_formed():
         scan_keys = sorted(k for k in keys if k.startswith("scan:"))
         finalize_keys = sorted(k for k in keys if k.startswith("finalize:"))
         rank_keys = sorted(k for k in keys if k.startswith("finalize_rank:"))
+        merge_rank_keys = sorted(k for k in keys if k.startswith("merge:rank:"))
         assert scan_keys and finalize_keys and MERGE_KEY in keys, arch
-        assert set(keys) == set(scan_keys) | set(finalize_keys) | set(rank_keys) | {
-            MERGE_KEY
-        }, arch
-        # every scan key follows the key grammar; an FP8 key (``:fp8`` before ``:lsf``) runs in the plain unit order
-        # and the sampled-fit form, and the BF16 record's rules below are the BF16 programs' (the FP8 form has a
-        # record of its own, ``policy_for(arch, "fp8")``)
+        assert set(keys) == set(scan_keys) | set(finalize_keys) | set(rank_keys) | set(
+            merge_rank_keys
+        ) | {MERGE_KEY}, arch
+        # the fused merge + rank finalize programs: one merge program per slab rank window, registered exactly where
+        # the record turns merge_rank on
+        assert bool(merge_rank_keys) == bool(policy.merge_rank), arch
+        for key in merge_rank_keys:
+            window = int(key[len("merge:rank:w") :])
+            assert window in policy.rank_window_variants, (arch, key)
+            assert window <= policy.rank_slab_window_max, (arch, key)
+            assert cake_jit.PROGRAMS[keys[key]]["role"] == "merge", (arch, key)
+        # every scan key follows the key grammar; an FP8 key (``:fp8`` before ``:lsf``) runs the sampled-fit form, in
+        # the plain unit order or as the snake copy of a registered plain FP8 program, and the BF16 record's rules
+        # below are the BF16 programs' (the FP8 form has a record of its own, ``policy_for(arch, "fp8")``)
         for key in scan_keys:
             fields = scan_key_fields(key)
             assert fields is not None, (arch, key)
             assert (key.split(":")[-1] == "lsf") == fields.lsf, (arch, key)
             if fields.form == cake_policy.FP8:
-                assert not fields.snake and fields.sample_fit, (arch, key)
+                assert fields.sample_fit, (arch, key)
+                assert not fields.snake or key.replace(":s1:", ":s0:", 1) in keys, (
+                    arch,
+                    key,
+                )
         scan_keys = [k for k in scan_keys if scan_key_form(k) == cake_policy.BF16]
         # the rank finalize programs are registered exactly where the architecture's rule admits a call
         assert bool(rank_keys) == (
@@ -717,6 +742,8 @@ def test_policy_record_round_trip_and_validation():
         dict(rank_persist_max_k=-1),  # round 39: lever FRP-K fields
         dict(rank_persist_max_k=2048.5),
         dict(rank_persist_ctas_per_sm=0),
+        dict(rank_persist_spare_sms=-1),  # the spare SMs of the persistent grid (#7548)
+        dict(rank_persist_spare_sms=0.5),
         dict(far_sample=2),  # the far-sample first threshold switch: 0 or 1
         dict(far_sample=-1),
         dict(far_sample=True),
@@ -739,11 +766,534 @@ def test_policy_record_round_trip_and_validation():
         dict(wide_first_rule=[512.0, 1]),
         dict(wide_first_rule=[-1.0]),
         dict(wide_first_rule=[True]),
+        # the wave rule: [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles], or that with
+        # [top_k (an int >= 1), exponent, packed minimum (>= the one-segment one), rise per wave, waves (an int >= 1),
+        # low wave ratio (>= element 1), its tile coefficient, its packed coefficient, the one-document cap
+        # coefficient, the cap's lower bound from two wide waves, the wide waves (an int >= 1) from which the next
+        # element is that lower bound, that lower bound], each >= 0, or None
+        dict(wide_wave_rule=1.6),
+        dict(wide_wave_rule=[]),
+        dict(wide_wave_rule=[1.6, 1.3]),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048]),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1]),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14]),
+        dict(
+            wide_wave_rule=[1.7, 1.15, 64.0, 2048, 1.1, 112.0, 3.5, 14, 1.26, 40.0, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                1.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                0,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048.0,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                True,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                -1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                64.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                -3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                0,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14.0,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.2,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                -40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                True,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                -9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                True,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                -8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                True,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                -55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                True,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8.0,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                0,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                True,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                -60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                True,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+                1.0,
+            ]
+        ),
+        dict(wide_wave_rule=[-1.0, 1.3, 80.0]),
+        dict(wide_wave_rule=[1.6, 1.3, True]),
+        # the descending-walk kinds: [unsampled kinds, sampled kinds], ascending lists of physical scan kinds, or None
+        dict(desc_walk_kinds="wide"),
+        dict(desc_walk_kinds=[]),
+        dict(desc_walk_kinds=[["wide"]]),
+        dict(desc_walk_kinds=[["wide"], [], []]),
+        dict(desc_walk_kinds=[["wide_desc"], []]),
+        dict(desc_walk_kinds=[["wide", "wide"], []]),
+        dict(desc_walk_kinds=[["wide", "l6"], []]),
+        dict(desc_walk_kinds=[[1], []]),
         # the units that split: an ascending list of unit geometries (may be empty)
         dict(split_units="l6"),
         dict(split_units=["split_l6"]),
         dict(split_units=["wide", "l6"]),
         dict(split_units=["l6", "l6"]),
+        # the split-resident rule: [chunk, fit, resident, max splits, min splits], positive integers, 2 <= min <= max
+        dict(split_resident_rule=4096),
+        dict(split_resident_rule=[4096, 32768, 49152, 32]),
+        dict(split_resident_rule=[4096, 32768, 49152, 32, 8, 1]),
+        dict(split_resident_rule=[0, 32768, 49152, 32, 8]),
+        dict(split_resident_rule=[4096, 32768, 49152.0, 32, 8]),
+        dict(split_resident_rule=[4096, 32768, 49152, 32, True]),
+        dict(split_resident_rule=[4096, 32768, 49152, 32, 1]),
+        dict(split_resident_rule=[4096, 32768, 49152, 8, 32]),
         # the unpaired three-warpgroup preference: [max mean unit tiles >= 0, min segments >= 1] or None
         dict(l6_solo_rule=128),
         dict(l6_solo_rule=[]),
@@ -758,6 +1308,46 @@ def test_policy_record_round_trip_and_validation():
         dict(l6_solo_unsampled_max_queries=16384.0),
         dict(l6_solo_unsampled_max_queries=True),
         dict(l6_solo_unsampled_max_queries=[16384]),
+        # the FP8 snake cap: [max segments >= 1, max waves >= 1] or None
+        dict(snake_cap_rule=40),
+        dict(snake_cap_rule=[]),
+        dict(snake_cap_rule=[1]),
+        dict(snake_cap_rule=[1, 40, 1]),
+        dict(snake_cap_rule=[0, 40]),
+        dict(snake_cap_rule=[1, 0]),
+        dict(snake_cap_rule=[1.0, 40]),
+        dict(snake_cap_rule=[True, 40]),
+        # the FP8 one-segment longest-first rule: [min mean unit tiles >= 0] or None
+        dict(lsf_single_rule=64.0),
+        dict(lsf_single_rule=[]),
+        dict(lsf_single_rule=[64.0, 1]),
+        dict(lsf_single_rule=[-1.0]),
+        dict(lsf_single_rule=[True]),
+        dict(lsf_single_rule=["64"]),
+        # the snake order of packed calls: [ascending program kinds but split, min mean tiles sampled, min mean tiles
+        # unsampled or None, max waves >= 1 or None]
+        dict(snake_packed_rule=48.0),
+        dict(snake_packed_rule=[]),
+        dict(snake_packed_rule=[["l6"], 48.0, None]),
+        dict(snake_packed_rule=[["l6"], 48.0, None, 7, 1]),
+        dict(snake_packed_rule=["l6", 48.0, None, 7]),
+        dict(snake_packed_rule=[[], 48.0, None, 7]),
+        dict(snake_packed_rule=[["split_l6"], 48.0, None, 7]),
+        dict(snake_packed_rule=[["split"], 48.0, None, 7]),
+        dict(snake_packed_rule=[["pair_l6", "l6"], 48.0, None, 7]),
+        dict(snake_packed_rule=[["l6"], -1.0, None, 7]),
+        dict(snake_packed_rule=[["l6"], None, None, 7]),
+        dict(snake_packed_rule=[["l6"], True, None, 7]),
+        dict(snake_packed_rule=[["l6"], 48.0, -1.0, 7]),
+        dict(snake_packed_rule=[["l6"], 48.0, False, 7]),
+        dict(snake_packed_rule=[["l6"], 48.0, None, 0]),
+        dict(snake_packed_rule=[["l6"], 48.0, None, 7.0]),
+        dict(snake_packed_rule=[["l6"], 48.0, None, True]),
+        # the waves of the plain-order l6 fallback with sampling off: an integer >= 1 or None
+        dict(snake_l6_fallback_waves=0),
+        dict(snake_l6_fallback_waves=310.0),
+        dict(snake_l6_fallback_waves=True),
+        dict(snake_l6_fallback_waves=[310]),
         # the scope of the two-way wave split: [ascending unit geometries, max segments >= 1, sampled only] or None
         dict(split_wave_scope="narrow"),
         dict(split_wave_scope=[]),
@@ -828,6 +1418,90 @@ def test_policy_record_round_trip_and_validation():
     assert first.wide_first_rule == [192.0]
     assert first.record()["wide_first_rule"] == [192.0]
     assert DispatchPolicy.from_record(first.record()) == first
+    waved = DispatchPolicy.from_record(dict(record, wide_wave_rule=[1.6, 1.3, 80.0]))
+    assert waved.wide_wave_rule == [1.6, 1.3, 80.0]
+    assert waved.record()["wide_wave_rule"] == [1.6, 1.3, 80.0]
+    assert DispatchPolicy.from_record(waved.record()) == waved
+    capped = DispatchPolicy.from_record(dict(record, snake_cap_rule=(1, 40)))
+    assert capped.record()["snake_cap_rule"] == [1, 40]
+    assert DispatchPolicy.from_record(capped.record()) == capped
+    # waves of 6-query units on 212 CTAs: 32768 queries take 26, 65536 take 52
+    assert capped.snake_copy_fits(32768, 1, 6, 212)
+    assert not capped.snake_copy_fits(65536, 1, 6, 212)
+    assert not capped.snake_copy_fits(32768, 2, 6, 212)
+    assert DispatchPolicy.from_record(record).snake_copy_fits(1 << 20, 64, 6, 212)
+    single = DispatchPolicy.from_record(dict(record, lsf_single_rule=(64,)))
+    assert single.record()["lsf_single_rule"] == [64]
+    assert DispatchPolicy.from_record(single.record()) == single
+    # mean unit tiles (Tkv - T / (2 ratio)) / S / 128: 16384 x 16384 take 64, 16384 x 15360 take 56
+    assert single.lsf_single_fits(16384, 16384, 1, 1)
+    assert not single.lsf_single_fits(16384, 15360, 1, 1)
+    assert not single.lsf_single_fits(32768, 32768, 2, 1)
+    assert not DispatchPolicy.from_record(record).lsf_single_fits(1024, 1 << 20, 1, 1)
+    walked = DispatchPolicy.from_record(dict(record, desc_walk_kinds=[["wide"], []]))
+    assert walked.desc_walk_kinds == [["wide"], []]
+    assert walked.record()["desc_walk_kinds"] == [["wide"], []]
+    assert DispatchPolicy.from_record(walked.record()) == walked
+    assert walked.desc_walk_for("wide", sampled=False)
+    assert not walked.desc_walk_for("wide", sampled=True)
+    assert not walked.desc_walk_for("l6", sampled=False)
+    packed = DispatchPolicy.from_record(
+        dict(record, snake_packed_rule=(("l6", "pair_l6"), 48, None, 7))
+    )
+    assert packed.record()["snake_packed_rule"] == [["l6", "pair_l6"], 48, None, 7]
+    assert DispatchPolicy.from_record(packed.record()) == packed
+    fallback = DispatchPolicy.from_record(dict(record, snake_l6_fallback_waves=310))
+    assert fallback.record()["snake_l6_fallback_waves"] == 310
+    assert DispatchPolicy.from_record(fallback.record()) == fallback
+    # waves of the planned program: 8-query CTA pairs on 212 CTAs (106 slots) take 310 waves for 262144 queries and 619
+    # for 524288; the unpaired 6-query unit takes 207 for 262144; only with the sampled first threshold off
+    assert fallback.snake_l6_fallback_for(262144, 8, True, 212, sampled=False)
+    assert not fallback.snake_l6_fallback_for(524288, 8, True, 212, sampled=False)
+    assert fallback.snake_l6_fallback_for(262144, 6, False, 212, sampled=False)
+    assert not fallback.snake_l6_fallback_for(262144, 8, True, 212, sampled=True)
+    assert not DispatchPolicy.from_record(record).snake_l6_fallback_for(
+        4096, 8, True, 212, sampled=False
+    )
+    scaled = DispatchPolicy.from_record(
+        dict(
+            record,
+            wide_wave_rule=(
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ),
+        )
+    )
+    assert scaled.record()["wide_wave_rule"] == [
+        1.6,
+        1.3,
+        80.0,
+        2048,
+        1.1,
+        112.0,
+        3.5,
+        14,
+        1.3,
+        40.0,
+        9.0,
+        8.0,
+        55.0,
+        8,
+        60.0,
+    ]
+    assert DispatchPolicy.from_record(scaled.record()) == scaled
     scoped = DispatchPolicy.from_record(
         dict(record, split_wave_scope=(("narrow", "wide"), 2, False))
     )
@@ -1157,6 +1831,17 @@ def _select(policy, T, Tkv, S=1, K=2048, ratio=1, grid=148, **knobs):
     )
 
 
+# lever LSF on sm_107a: the longest-first copies its registry carries, those of the two l6 ticket programs (the plain
+# l6 programs drawing from their TicketWord, which serve its packed calls)
+_SM107_LSF_COPIES = frozenset({"scan:l6:u1:s0:f0:lsf", "scan:l6:u1:s0:f1:lsf"})
+
+
+def _lsf_key(keys, key: str) -> str:
+    """The key a packed call whose key segments the host cannot tell equal runs for the decided program ``key`` on an
+    ``lsf_programs`` architecture: its longest-first copy where ``keys`` registers one, else ``key`` itself."""
+    return key + ":lsf" if key + ":lsf" in keys else key
+
+
 def test_round38_rank_forms_policy_and_select():
     """Levers FRT (16-item thread form) and FRB (bulk row I/O) of the staged rank finalize: the record switches, the rules, the
     key tags and the dispatch -- the production slot count keeps the 16-item form to the 512-thread (top_k > 2048) staged form;
@@ -1478,6 +2163,148 @@ def test_wide_first_precedence_and_pair_units_guard():
     assert _select(hostile_open, 131072, 131072).kind == "pair_wide"
 
 
+def test_wide_wave_rule_compares_waves_of_the_persistent_grid():
+    """``wide_wave_rule`` replaces ``wide_rule`` and ``wide_first_rule``: the wide unit takes a call when the unit the
+    other rules leave needs at least the record's ratio of the wide unit's waves of the grid (``ceil(units / grid)``),
+    against the three-warpgroup unit also from a mean unit tile count on.  The fixture takes ``NARROW_PAIR_POLICY``
+    (``l6_rule`` to 256 tiles at top_k >= 512) with the rule [1.7, 1.3, 84] on a 148-CTA grid."""
+    waved = DispatchPolicy.from_record(
+        dict(NARROW_PAIR_POLICY.record(), wide_wave_rule=[1.7, 1.3, 84.0])
+    )
+
+    def unit(T, Tkv, K=2048):
+        return waved.unit_block_q_for(T, Tkv, 1, 1, 148, K)
+
+    # 4096 queries over 65536 keys (496 mean tiles): narrow 1024 units = 7 waves, wide 512 = 4 waves, 7 >= 6.8 -> wide
+    assert unit(4096, 65536) == 8
+    # 2560 queries over 49152 keys: narrow 640 units = 5 waves, wide 320 = 3 waves, 5 < 5.1 -> narrow
+    assert unit(2560, 49152) == 4
+    # 16384 queries over 20480 keys (96 mean tiles, three-warpgroup): l6 2731 units = 19 waves, wide 2048 = 14
+    # waves, 19 >= 18.2 from the 84-tile floor on -> wide; at 18432 keys (80 mean tiles) below the floor -> l6
+    assert unit(16384, 20480) == 8
+    assert unit(16384, 18432) == 6
+    # 8k causal document (32 mean tiles): l6 10 waves against wide 7, 10 >= 9.1 but below the floor -> l6
+    assert unit(8192, 8192) == 6
+    # top_k 256 has no three-warpgroup unit: 712 queries over 4096 keys compare narrow 2 waves with wide 1 -> wide
+    assert unit(712, 4096, K=256) == 8
+    # the record without the field keeps the rounds-and-work rule: 512 / 148 = 3.5 rounds < 6 -> narrow
+    assert NARROW_PAIR_POLICY.unit_block_q_for(4096, 65536, 1, 1, 148, 2048) == 4
+    # a fifteen-element rule [.., 84, 2048, 1.1, 112, 3.5, 14, 1.3, 40, 9, 1e6, 1e6, 8, 1e6] (no low wave-ratio
+    # minimum: its ratio is the second element's; no one-document cap: 1e6 is above every minimum): the same
+    # decisions on one document of at least 14 wide waves at top_k <= 2048 (16384 queries: 14 wide waves, 19 l6
+    # waves)
+    scaled = DispatchPolicy.from_record(
+        dict(
+            NARROW_PAIR_POLICY.record(),
+            wide_wave_rule=[
+                1.7,
+                1.3,
+                84.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                1e6,
+                1e6,
+                8,
+                1e6,
+            ],
+        )
+    )
+
+    def scaled_unit(T, Tkv, K=2048, S=1):
+        return scaled.unit_block_q_for(T, Tkv, S, 1, 148, K)
+
+    for T, Tkv in ((16384, 20480), (16384, 18432), (8192, 8192), (4096, 65536)):
+        assert scaled_unit(T, Tkv) == unit(T, Tkv)
+    assert scaled_unit(16384, 18432, K=1024) == unit(16384, 18432, K=1024) == 6
+    # 8192 queries take 7 wide waves (10 l6 waves): the floor rises by 3.5 x 7 to 108.5, so 96 mean tiles keep l6
+    # where the three-element rule takes the wide unit, and 128 take it
+    assert unit(8192, 16384) == 8
+    assert scaled_unit(8192, 16384) == 6
+    assert scaled_unit(8192, 20480) == 8
+    # two packed documents of 16384 queries in all need 112 mean tiles: 104 keep l6, 112 take the wide unit
+    assert scaled_unit(16384, 34816, S=2) == 6
+    assert scaled_unit(16384, 36864, S=2) == 8
+    # above top_k 2048 the floor grows as (top_k / 2048) ** 1.1: 131.2 at 3072, 180.1 at 4096
+    assert scaled_unit(16384, 24576, K=3072) == 6
+    assert scaled_unit(16384, 26624, K=3072) == 8
+    assert unit(16384, 20480, K=4096) == 8
+    assert scaled_unit(16384, 20480, K=4096) == 6
+    assert scaled_unit(16384, 32768, K=4096) == 8
+    # [1.7, 1.15, 64, 2048, 1.1, 112, 3.5, 14, 1.26, 40, 9, 8, 55, 8, 60]: below a wave ratio W = 1.26 the minimum is at
+    # least 40 / (W - 1) mean tiles, on a packed call also 9 / (W - 1) ** 2.  4096 queries take 4 wide waves against 5
+    # l6 waves (W = 1.25), so they need 160 mean tiles (packed too: 9 x 16 = 144) where 4096 x 16384 (112 tiles) clear
+    # the 99-tile minimum of 4 wide waves; 8520 queries take 8 wide waves against 10 l6 waves (W = 1.25) and need 160
+    # too; 6144 queries take 6 wide waves against 7 l6 waves (W = 7 / 6) and need 240, on two documents 324.  From
+    # W = 1.26 on, one document of fewer than 14 wide waves needs at most 8 / (W - 1) ** 2, from two wide waves on at
+    # most the larger of that and 55, from 8 wide waves on of that and 60: 8192 queries (7 wide waves, 10 l6 waves,
+    # W = 10 / 7: 43.6) need 55 instead of 88.5, 2048 queries (2 wide waves, 3 l6 waves: 32) 55 instead of 106 but
+    # 112 on two documents, 11776 queries (10 wide waves, 14 l6 waves, W = 1.4: 50) 60 instead of 78, 9216 queries
+    # (8 wide waves, 11 l6 waves, W = 1.375: 56.9) 60 instead of 85, and 1024 queries (1 wide wave, 2 l6 waves) 8
+    # instead of 109.5; 16384 queries (14 wide waves, 19 l6 waves) keep the 64-tile minimum
+    low = DispatchPolicy.from_record(
+        dict(
+            NARROW_PAIR_POLICY.record(),
+            l6_rule=[1024, 512],
+            wide_wave_rule=[
+                1.7,
+                1.15,
+                64.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.26,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ],
+        )
+    )
+
+    def low_unit(T, Tkv, K=2048, S=1):
+        return low.unit_block_q_for(T, Tkv, S, 1, 148, K)
+
+    assert low_unit(4096, 16384) == 6
+    assert low_unit(4096, 2048 + 159 * 128) == 6
+    assert low_unit(4096, 2048 + 160 * 128) == 8
+    assert low_unit(4096, 2048 + 159 * 256, S=2) == 6
+    assert low_unit(4096, 2048 + 160 * 256, S=2) == 8
+    assert low_unit(8520, 4260 + 159 * 128) == 6
+    assert low_unit(8520, 4260 + 160 * 128) == 8
+    assert low_unit(6144, 3072 + 239 * 128) == 6
+    assert low_unit(6144, 3072 + 240 * 128) == 8
+    assert low_unit(6144, 3072 + 323 * 256, S=2) == 6
+    assert low_unit(6144, 3072 + 324 * 256, S=2) == 8
+    assert low_unit(8192, 4096 + 54 * 128) == 6
+    assert low_unit(8192, 4096 + 55 * 128) == 8
+    assert low_unit(2048, 1024 + 54 * 128) == 6
+    assert low_unit(2048, 1024 + 55 * 128) == 8
+    assert low_unit(11776, 5888 + 55 * 128) == 6
+    assert low_unit(11776, 5888 + 59 * 128) == 6
+    assert low_unit(11776, 5888 + 60 * 128) == 8
+    # the top_k factor applies after the cap: 60 x 2 ** 1.1 = 128.6 at top_k 4096 (78 x 2 ** 1.1 = 167.2 without it)
+    assert low_unit(11776, 5888 + 128 * 128, K=4096) == 6
+    assert low_unit(11776, 5888 + 129 * 128, K=4096) == 8
+    assert low_unit(9216, 4608 + 59 * 128) == 6
+    assert low_unit(9216, 4608 + 60 * 128) == 8
+    assert low_unit(2048, 1024 + 111 * 256, S=2) == 6
+    assert low_unit(2048, 1024 + 112 * 256, S=2) == 8
+    assert low_unit(1024, 512 + 7 * 128) == 6
+    assert low_unit(1024, 512 + 8 * 128) == 8
+    assert low_unit(16384, 8192 + 63 * 128) == 6
+    assert low_unit(16384, 8192 + 64 * 128) == 8
+
+
 def test_sample_shift_rule_precedence():
     """``sample_shift_rule`` replaces the sampled rank shift from its ``top_k`` floor on; below the floor, and on a
     record without a rule, ``sample_shift_permille`` stands; an explicit ``sample_shift_permille`` knob overrides both.
@@ -1566,7 +2393,8 @@ def test_policy_selects_registered_programs_on_a_dense_geometry_grid():
     fails closed by name on an unregistered program, so a selectable but unregistered program is a production failure
     (round 2 review: ``scan:narrow:u1:s1:f1`` on sm_107a at 6018 queries x 11754 keys was selectable but unregistered).
     Both sample modes: the unsampled plan family (``sample_tiles_max=0``, the ``*_unsampled`` capacity values) is
-    otherwise unseen by the grid.  With and without the registry: ``l6_solo_rule`` is on only with it."""
+    otherwise unseen by the grid.  With and without the registry: ``l6_solo_rule`` is on only with it, and without it a
+    packed call names the :lsf copy of its program, which the backend runs only where the registry has it."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     for arch, keys in cake_jit.PROGRAM_KEYS.items():
@@ -1597,6 +2425,14 @@ def test_policy_selects_registered_programs_on_a_dense_geometry_grid():
                         selected = [choice.scan_key, choice.finalize_key] + (
                             [MERGE_KEY] if choice.n_split > 1 else []
                         )
+                        # without a registry the plan names the :lsf copy wherever the record asks for it; the backend
+                        # passes the registry, which runs the program itself where its copy is not registered (sm_107a)
+                        if (
+                            scan_keys is None
+                            and arch == "sm_107a"
+                            and choice.scan_key not in keys
+                        ):
+                            selected[0] = choice.scan_key.removesuffix(":lsf")
                         for key in selected:
                             assert key in keys, (
                                 arch,
@@ -1722,18 +2558,20 @@ def test_l6_solo_rule_prefers_the_unpaired_l6_unit_where_registered_and_unsplit(
     assert (
         solo(rule) and rule.scan_key == "scan:l6:u1:s1:f1" and base.kind == "pair_wide"
     )
-    # eight causal 8k documents (32 mean tiles, >= 2 segments): the pair l6 program becomes unpaired in both modes
+    # eight causal 8k documents (32 mean tiles, >= 2 segments): the pair l6 program becomes unpaired in both modes (in the
+    # plain unit order: snake_packed_rule), in its longest-first copy (the snake pair l6 program has none)
     for sample in (None, 0):
         rule, base = plans(65536, 65536, 8, sample)
-        assert solo(rule) and rule.scan_key == "scan:l6:u1:s1:f1", sample
+        assert solo(rule), sample
+        assert rule.scan_key == _lsf_key(keys, "scan:l6:u1:s0:f1"), sample
         assert base.scan_key == "scan:pair_l6:u1:s1:f1", sample
     # one sampled document of 100 mean tiles (<= 128): unpaired l6
     rule, base = plans(16384, 16384 // 2 + 100 * 128, 1, None)
     assert solo(rule) and base.kind != "l6"
-    # one causal 256k document (1024 mean tiles, no sampled fit): the unpaired l6 key would be scan:l6:u1:s1:f0, which is not
-    # registered, so the unsampled call keeps the pair wide program
+    # one causal 512k document (2048 mean tiles, no sampled fit): the unpaired l6 key would be scan:l6:u1:s1:f0, which is not
+    # registered, so the unsampled call keeps the pair wide program (619 waves, beyond snake_l6_fallback_waves)
     assert "scan:l6:u1:s1:f0" not in keys
-    rule, base = plans(262144, 262144, 1, 0)
+    rule, base = plans(524288, 524288, 1, 0)
     assert rule == base and base.scan_key == "scan:pair_wide:u1:s1:f0"
     # a split call keeps its split (4 queries over 22018 keys: 12 narrow splits, split_fit_rule)
     rule, base = plans(4, 22018, 1, 0)
@@ -1786,6 +2624,71 @@ def test_l6_solo_rule_prefers_the_unpaired_l6_unit_where_registered_and_unsplit(
             65536, 65536, 1, top_k=2048, arch=arch, num_sms=148, sample_tiles_max=0
         )
         assert (a.kind, a.block_q, a.pair) == (b.kind, b.block_q, b.pair), arch
+
+
+def test_desc_walk_kinds_runs_the_descending_wide_twin_with_sampling_off():
+    """sm_103a ``desc_walk_kinds`` ``[["wide"], []]``: a call with the sampled first threshold off whose plan is the
+    single-CTA wide program runs its descending-walk twin (key kind ``wide_desc``: the same unit, split, tile unroll, fit
+    and longest-first form; the same ids and score bits); sampled calls, every other kind and sm_100a / sm_107a (field
+    None) keep their program.  On a grid of shapes in both modes and on every frozen SM count, each plan equals the plan
+    of the record without the field except for exactly that key; the sampled list ``[["wide"], ["wide"]]`` moves sampled
+    wide calls the same way; without a registry the field is inert."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    for arch in ("sm_100a", "sm_107a"):
+        assert policy_for(arch).desc_walk_kinds is None
+        assert not any(":wide_desc:" in k for k in cake_jit.PROGRAM_KEYS[arch])
+    p, keys = policy_for("sm_103a"), cake_jit.PROGRAM_KEYS["sm_103a"]
+    assert p.desc_walk_kinds == [["wide"], []]
+    desc = sorted(k for k in keys if k.startswith("scan:wide_desc:"))
+    assert len(desc) == 8
+    assert all(k.replace("scan:wide_desc:", "scan:wide:") in keys for k in desc)
+    plain = DispatchPolicy.from_record(dict(p.record(), desc_walk_kinds=None))
+    both = DispatchPolicy.from_record(
+        dict(p.record(), desc_walk_kinds=[["wide"], ["wide"]])
+    )
+
+    def plan(policy, T, Tkv, S, sample, grid, top_k=2048, scan_keys=keys):
+        return select_program(
+            policy,
+            num_queries=T,
+            num_keys=Tkv,
+            num_segments=S,
+            ratio=1,
+            top_k=top_k,
+            grid=grid,
+            sample_tiles_max=sample,
+            scan_keys=scan_keys,
+        )
+
+    def twin(choice):
+        key = choice.scan_key.replace("scan:wide:", "scan:wide_desc:", 1)
+        if choice.physical_kind != "wide" or key not in keys:
+            return choice
+        return dataclasses.replace(choice, scan_key=key)
+
+    moved = {False: 0, True: 0}
+    for q, k, S, top_k, sample, grid in itertools.product(
+        (1024, 4096, 8192, 16384),
+        (32768, 131072, 262144),
+        (1, 2, 8),
+        (512, 2048),
+        (None, 0),
+        _FROZEN_GRIDS["sm_103a"],
+    ):
+        T, Tkv = q * S, k * S
+        if q > k or T > 131072:
+            continue
+        base = plan(plain, T, Tkv, S, sample, grid, top_k)
+        sampled = base.sample_tiles_max > 0
+        want = base if sampled else twin(base)
+        assert plan(p, T, Tkv, S, sample, grid, top_k) == want, (T, Tkv, S, sample)
+        assert plan(both, T, Tkv, S, sample, grid, top_k) == twin(base)
+        assert plan(p, T, Tkv, S, sample, grid, top_k, scan_keys=None) == plan(
+            plain, T, Tkv, S, sample, grid, top_k, scan_keys=None
+        )
+        moved[sampled] += twin(base) != base
+    assert moved[False] > 0 and moved[True] > 0, moved
 
 
 def test_l6_solo_unsampled_max_queries_on_sm_100a_and_sm_103a():
@@ -1866,12 +2769,14 @@ def test_l6_solo_unsampled_max_queries_on_sm_100a_and_sm_103a():
 
 
 def test_split_fit_rule_takes_fitting_splits_in_whole_merge_chunks():
-    """``split_fit_rule`` [4096] on every architecture: a split call whose mean unit keys fit ceil(keys / top_k) <=
-    split_max splits takes that count rounded up to whole 4096-entry merge chunks; a call that needs more keeps the
-    floor rule, and so does a call the floor rule does not split."""
+    """``split_fit_rule`` [4096] on every architecture (sm_100a and sm_103a with their ``split_resident_rule`` off): a
+    split call whose mean unit keys fit ceil(keys / top_k) <= split_max splits takes that count rounded up to whole
+    4096-entry merge chunks; a call that needs more keeps the floor rule, and so does a call the floor rule does not
+    split."""
     for arch, grid in (("sm_100a", 152), ("sm_103a", 152), ("sm_107a", 212)):
         p = policy_for(arch)
         assert p.split_fit_rule == [4096], arch
+        p = DispatchPolicy.from_record(dict(p.record(), split_resident_rule=None))
         # 4 queries x 22018 keys: floor rule 5, fit ceil(22016 / 2048) = 11 -> 12 (two splits per chunk)
         assert p.split_rule_for(4, 22018, 1, 1, grid, p.block_q_l6, True) == 5
         assert p.split_rule_for(4, 22018, 1, 1, grid, p.block_q_l6, True, 2048) == 12
@@ -1882,6 +2787,39 @@ def test_split_fit_rule_takes_fitting_splits_in_whole_merge_chunks():
         assert p.split_rule_for(4, 22018, 1, 1, grid, p.block_q_l6, True, 4096) == 6
         # the floor rule does not split 8192 keys: no fit split either
         assert p.split_rule_for(1, 8192, 1, 1, grid, p.block_q_l6, True, 2048) == 1
+
+
+def test_split_resident_rule_keeps_the_merge_resident():
+    """``split_resident_rule`` [4096, 32768, 49152, 32, 8] on sm_100a and sm_103a (sm_107a: None, ``split_fit_rule``): a
+    call the floor rule splits takes ``min(grid // units, 49152 // top_k, 32, max(8, n_fit if n_fit x top_k <= 32768
+    else 32))`` splits, at least 2; ``n_fit`` = ceil(mean unit keys / top_k) in whole 4096-entry merge chunks.  A call
+    the floor rule does not split, or one without ``top_k``, keeps the floor rule."""
+    assert policy_for("sm_107a").split_resident_rule is None
+    for arch in ("sm_100a", "sm_103a"):
+        p = policy_for(arch)
+        assert p.split_resident_rule == [4096, 32768, 49152, 32, 8], arch
+        for grid in (148, 152):
+
+            def n(T, Tkv, block_q=p.block_q_l6, top_k=None, sampled=True):
+                return p.split_rule_for(T, Tkv, 1, 1, grid, block_q, sampled, top_k)
+
+            # 4 queries x 22018 keys (one l6 unit): n_fit 11 -> 12 at top_k 2048 (24576 entries)
+            assert n(4, 22018) == 5 and n(4, 22018, top_k=2048) == 12
+            assert n(4, 30466, top_k=2048, sampled=False) == 16
+            # 41986 keys: n_fit 22 x 2048 > 32768 entries, so 32, capped at the 24 splits the merge keeps resident
+            assert n(4, 41986, top_k=2048) == 24
+            # top_k 4096: 6 fitting splits lifted to 8; 65536 keys: 16 fitting splits, 12 resident
+            assert n(4, 22018, top_k=4096) == 8 and n(4, 65536, top_k=4096) == 12
+            # top_k 256 / 512: n_fit 64 / 32 (16384 entries) capped at 32 splits
+            assert n(1, 16384, p.block_q_narrow, 256) == 32
+            assert n(1, 16384, p.block_q_narrow, 512) == 32
+            # 64 queries (16 narrow units): the grid caps the count
+            assert n(64, 16384, p.block_q_narrow, 256) == grid // 16
+            # the floor rule does not split 8192 keys: no split either
+            assert n(1, 8192, top_k=2048) == 1
+        # the FP8 record keeps every split field of the measured FP8 plans (no split-resident rule)
+        fp8 = cake_policy.fp8_policy_record(p.record(), cake_jit.POLICY_FP8[arch])
+        assert fp8["split_resident_rule"] is None and fp8["split_fit_rule"] == [4096]
 
 
 def test_split_wave_scope_and_wide_pair_snake_only_on_sm_107a():
@@ -1938,11 +2876,13 @@ def test_split_wave_scope_and_wide_pair_snake_only_on_sm_107a():
     assert (rule.kind, rule.unit, rule.n_split) == ("split", "narrow", 2)
     assert plan(plain, 1024, 131072, 1, 0).n_split == 2
     assert plan(p, 1024, 131072, 1, 0).scan_key == "scan:l6:u1:s0:f0"
-    # two such documents: the narrow wave split goes in both modes (the l6 solo preference then applies)
+    # two such documents: the narrow wave split goes in both modes (the l6 solo preference then applies; the
+    # longest-first copy of its program)
     assert plan(plain, 2048, 262144, 2, None).n_split == 2
     for sample in (None, 0):
         rule = plan(p, 2048, 262144, 2, sample)
-        assert (rule.scan_key, rule.n_split) == ("scan:l6:u1:s0:f0", 1), sample
+        assert rule.n_split == 1, sample
+        assert rule.scan_key == _lsf_key(keys, "scan:l6:u1:s0:f0"), sample
     # a 4096-query document over 128k keys: the wide wave split goes; sampled the call then runs the unpaired wide
     # program (its CTA pair does not walk the snake order), unsampled the l6 unit
     base = plan(plain, 4096, 131072, 1, None)
@@ -1988,6 +2928,116 @@ def test_split_wave_scope_and_wide_pair_snake_only_on_sm_107a():
         elif base.kind == "pair_wide" and got.kind == "wide":
             counts["unpaired"] += 1
     assert counts["kept"] and counts["dropped"] and counts["unpaired"], counts
+
+
+def test_snake_packed_rule_and_snake_l6_fallback_waves_on_sm_107a():
+    """sm_107a's ``snake_packed_rule`` [["l6"], 48.0, None, 7]: an l6 call of two or more segments walks the snake order
+    only sampled and from 48 mean unit tiles on, or within 7 waves of the l6 persistent grid (one document keeps
+    ``snake_rule`` alone); ``snake_l6_fallback_waves`` 310: a
+    sampling-off call the l6 preference moves runs ``scan:l6:u1:s0:f0`` where ``scan:l6:u1:s1:f0`` is not registered and
+    the planned program needs at most 310 waves of its persistent grid.  On a grid of shapes in both modes every plan is
+    the plan of the record with both fields off but for the unit order of an l6 program and, with sampling off, the
+    unpaired plain-order l6 unit of the fallback.  The other architectures and every FP8 record leave both fields off."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    p, keys = policy_for("sm_107a"), cake_jit.PROGRAM_KEYS["sm_107a"]
+    assert p.snake_packed_rule == [["l6"], 48.0, None, 7]
+    assert p.snake_l6_fallback_waves == 310
+    for arch in ("sm_100a", "sm_103a"):
+        other = policy_for(arch)
+        assert other.snake_packed_rule is None, arch
+        assert other.snake_l6_fallback_waves is None, arch
+    for arch, fields in cake_jit.POLICY_FP8.items():
+        assert fields["snake_packed_rule"] is None, arch
+        assert fields["snake_l6_fallback_waves"] is None, arch
+    off = DispatchPolicy.from_record(
+        dict(p.record(), snake_packed_rule=None, snake_l6_fallback_waves=None)
+    )
+    assert "scan:l6:u1:s1:f0" not in keys
+
+    def plan(policy, T, Tkv, S, sample, top_k=2048, grid=212):
+        return select_program(
+            policy,
+            num_queries=T,
+            num_keys=Tkv,
+            num_segments=S,
+            ratio=1,
+            top_k=top_k,
+            grid=grid,
+            sample_tiles_max=sample,
+            scan_keys=keys,
+        )
+
+    # packed equal documents: eight 8k documents (32 mean tiles, 52 waves) leave the snake order in both modes; two 16k
+    # documents (64 mean tiles, 26 waves) keep it sampled only; two 4k-query documents over 8k keys each (48 mean tiles)
+    # and two 4k documents over 6k keys each (32 mean tiles) need 7 waves of 6-query units on 212 CTAs: both keep it
+    # (packed calls without max_seqlen_k: the plain-order l6 programs run their longest-first copies, the snake-order
+    # ones have none)
+    for sample in (None, 0):
+        assert plan(off, 65536, 65536, 8, sample).scan_key == "scan:l6:u1:s1:f1"
+        assert plan(p, 65536, 65536, 8, sample).scan_key == _lsf_key(
+            keys, "scan:l6:u1:s0:f1"
+        )
+        assert plan(p, 8192, 16384, 2, sample).scan_key == "scan:l6:u1:s1:f1"
+        assert plan(p, 8192, 12288, 2, sample).scan_key == "scan:l6:u1:s1:f1"
+    assert plan(p, 32768, 32768, 2, None).scan_key == "scan:l6:u1:s1:f1"
+    assert plan(p, 32768, 32768, 2, 0).scan_key == _lsf_key(keys, "scan:l6:u1:s0:f1")
+    assert p.snake_for("l6", 8192, 16384, 2, 1, sampled=False, grid=212)
+    assert not p.snake_for(
+        "l6", 8192, 16384, 2, 1, sampled=False
+    )  # no grid: no waves clause
+    assert not p.snake_for(
+        "l6", 16384, 32768, 2, 1, sampled=False, grid=212
+    )  # 13 waves
+    # one document keeps the snake order in both modes
+    for sample in (None, 0):
+        assert plan(p, 8192, 8192, 1, sample).scan_key == "scan:l6:u1:s1:f1"
+    # sampling off, one causal document: 16k queries over 32k keys (20 waves of the pair wide plan) and 256k queries
+    # (310 waves) take the plain-order l6 program; 512k queries (619 waves) keep the snake pair wide program
+    for T, Tkv in ((16384, 32768), (262144, 262144)):
+        assert plan(off, T, Tkv, 1, 0).scan_key == "scan:pair_wide:u1:s1:f0", T
+        got = plan(p, T, Tkv, 1, 0)
+        assert (got.scan_key, got.kind, got.pair, got.snake) == (
+            "scan:l6:u1:s0:f0",
+            "l6",
+            False,
+            False,
+        ), T
+        assert plan(p, T, Tkv, 1, None) == plan(off, T, Tkv, 1, None), T
+    assert plan(p, 524288, 524288, 1, 0) == plan(off, 524288, 524288, 1, 0)
+    # four 16k-query documents over 32k keys each: sampling off the packed rule already takes the plain-order l6 key
+    assert plan(p, 65536, 131072, 4, 0).scan_key == _lsf_key(keys, "scan:l6:u1:s0:f0")
+    counts = dict(same=0, order=0, fallback=0)
+    for q, k, S, top_k, sample in itertools.product(
+        (4, 64, 256, 1024, 2048, 4096, 8192, 16384),
+        (8192, 16384, 32768, 65536, 131072, 262144),
+        (1, 2, 4, 8),
+        (512, 2048),
+        (None, 0),
+    ):
+        if q > k:
+            continue
+        args = (q * S, k * S, S, sample)
+        base = plan(off, *args, top_k=top_k)
+        got = plan(p, *args, top_k=top_k)
+        assert got.scan_key in keys, (args, top_k, got.scan_key)
+        if got == base:
+            counts["same"] += 1
+        elif base.kind == "l6" and got.kind == "l6":
+            # the unit order alone: a packed l6 call below the rule's floor (in the longest-first copy of the
+            # plain-order program where the registry has it; the snake-order program has none)
+            assert S >= 2 and base.snake and not got.snake, (args, top_k)
+            key = _lsf_key(keys, base.scan_key.replace(":s1:", ":s0:"))
+            assert got == replace(
+                base, snake=False, scan_key=key, lsf=key.endswith(":lsf")
+            ), (args, top_k)
+            counts["order"] += 1
+        else:
+            # the plain-order l6 fallback (sampling off) or the packed rule's l6 key now registered for the l6 preference
+            assert sample == 0 and base.snake and not got.snake, (args, top_k)
+            assert (got.kind, got.pair, got.n_split) == ("l6", False, 1), (args, top_k)
+            counts["fallback"] += 1
+    assert counts["same"] and counts["order"] and counts["fallback"], counts
 
 
 def test_ticket_units_bound_covers_every_segment_split_and_static_path_matches_the_grid():
@@ -2071,7 +3121,8 @@ def test_ticket_units_bound_covers_every_segment_split_and_static_path_matches_t
 def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
     """``sample_fit_kinds`` is the registry's own list: every scan kind with a registered ``:f1`` program and no other, so
     the dispatch never composes a sampled-fit key the architecture does not ship (round 3: a 32768-slot capacity made
-    split units of 22k-42k keys fit the buffer and selected ``scan:split_l6:u1:s0:f1``, which has no program)."""
+    split units of 22k-42k keys fit the buffer and selected ``scan:split_l6:u1:s0:f1``, which has no program).  A
+    descending-walk twin (key kind ``<kind>_desc``) is not a decided kind: its ascending program carries the form."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     for arch, keys in cake_jit.PROGRAM_KEYS.items():
@@ -2079,7 +3130,9 @@ def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
             {
                 key.split(":")[1]
                 for key in keys
-                if key.startswith("scan:") and key.endswith(":f1")
+                if key.startswith("scan:")
+                and key.endswith(":f1")
+                and not key.split(":")[1].endswith("_desc")
             }
         )
         assert policy_for(arch).sample_fit_kinds == registered, arch
@@ -2297,8 +3350,9 @@ def test_shipped_unit_rules_by_architecture():
 def test_shipped_sample_shift_rule_by_architecture():
     """sm_103a (``sample_shift_rule [4096, 375]``): a ``top_k = 4096`` call shifts its sampled rank by 375 permille, a
     ``top_k = 2048`` call keeps the 250 default, in both sample modes, and an explicit ``sample_shift_permille`` knob wins
-    on both; sm_100a and sm_107a carry no rule (``None``) and keep 250 at every ``top_k``.  The backend's plan carries the
-    same scalar (host-only: ``arch`` and the SM count given)."""
+    on both; sm_100a and sm_107a carry no rule (``None``) and keep 250 at every ``top_k``, except where their class rules
+    shift a sampled two-segment call (sm_107a also by its long-unit rule).  The backend's plan carries the same scalar
+    (host-only: ``arch`` and the SM count given)."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     p103, p100, p107 = (
@@ -2315,7 +3369,8 @@ def test_shipped_sample_shift_rule_by_architecture():
         for knobs in ({}, {"sample_tiles_max": 0}):
             for T, Tkv, S in rows:
                 # sample_class_rule [8, 500] (sm_103a / sm_100a): a sampled call of two or more segments on a wide-unit
-                # program shifts 500 permille, ahead of sample_shift_rule; sm_107a carries no class rule
+                # program shifts 500 permille, ahead of sample_shift_rule; on sm_107a the two-segment call shifts 500
+                # permille too (sample_long_rule on a long-unit l6 program, sample_class_rule [32, 500] on a wide one)
                 cls = 500 if S >= 2 and not knobs else None
                 for K, shift in ((2048, 250), (4096, 375)):
                     where = (grid, knobs, T, Tkv, S, K)
@@ -2323,9 +3378,7 @@ def test_shipped_sample_shift_rule_by_architecture():
                     assert c.sample_shift_permille == (cls or shift), where
                     for p in (p100, p107):
                         c = _select(p, T, Tkv, S=S, K=K, grid=grid, **knobs)
-                        assert c.sample_shift_permille == (
-                            cls if cls and p is p100 else 250
-                        ), where
+                        assert c.sample_shift_permille == (cls or 250), where
                     forced = dict(knobs, sample_shift_permille=-500)
                     c = _select(p103, T, Tkv, S=S, K=K, grid=grid, **forced)
                     assert c.sample_shift_permille == -500, where
@@ -3027,11 +4080,12 @@ def test_dispatch_rows_are_exact_and_plan_matches_runner(seg_q, seg_k, top_k):
     )
     assert runner.choice == plan and plan.max_seqlen_k == bound
     assert _plan(inputs).max_seqlen_k is None
-    assert runner.stages == (
-        ("scan", "merge", plan.finalize_role)
-        if plan.split
-        else ("scan", plan.finalize_role)
-    )
+    if plan.split and plan.merge_rank:
+        assert runner.stages == ("scan", "merge")
+    elif plan.split:
+        assert runner.stages == ("scan", "merge", plan.finalize_role)
+    else:
+        assert runner.stages == ("scan", plan.finalize_role)
     assert set(runner.programs) == set(runner.stages)
     assert runner.workspace_bytes == plan.workspace_bytes
     out = runner()
@@ -3098,6 +4152,60 @@ def test_repeatability_bitwise():
     )
     a, b, c = _run(inputs), _run(inputs), _run(inputs)
     assert ref.same_bits(a, b) and ref.same_bits(a, c)
+
+
+def test_sm107a_sampling_rules_cover_the_7549_rank_geometries():
+    """#7549 on sm_107a: the packed calls of short query segments and few mean unit tiles (the 22-segment packed rank
+    inputs) sample ``sample_class_rule[0]`` tiles at its shift -- not a call whose units average no more tiles than that
+    (the ratio-4 pooled packed rows keep the tiny defaults) -- and the long-unit l6 calls (the two-segment 262144-key
+    document ranks) take ``sample_long_rule``'s shift at the long-unit tile count, for every ``top_k``.  A long-unit call
+    of another kind keeps the long-unit defaults, explicit knobs stay, and sampling off stays off.  The other
+    architectures set no long-unit rule, and the sm_107a FP8 record sets neither rule."""
+    assert policy_for("sm_100a").sample_long_rule is None
+    assert policy_for("sm_103a").sample_long_rule is None
+    assert policy_for("sm_107a", "fp8").sample_class_rule is None
+    assert policy_for("sm_107a", "fp8").sample_long_rule is None
+    arch, grid = "sm_107a", _FROZEN_GRIDS["sm_107a"][0]
+    policy = policy_for(arch)
+    class_rule, long_rule = policy.sample_class_rule, policy.sample_long_rule
+    assert class_rule is not None and long_rule is not None
+
+    def plan(T, Tkv, S, top_k=2048, **knobs):
+        return plan_dsa_indexer_det_topk(
+            T, Tkv, S, top_k=top_k, arch=arch, num_sms=grid, **knobs
+        )
+
+    def sampling(choice):
+        return choice.sample_tiles_max, choice.sample_shift_permille
+
+    assert sampling(plan(17536, 289344, 22)) == tuple(class_rule)
+    # the ratio-4 pooled packed call (top-512 pools, about 21 mean unit tiles) keeps the tiny defaults: the class
+    # rule's larger sample would cover its whole units; sm_100a / sm_103a sample the tiny default count under theirs
+    pooled = plan(10624, 43824, 16, top_k=512, ratio=4)
+    assert policy.mean_unit_tiles(10624, 43824, 16, 4) <= class_rule[0]
+    assert sampling(pooled) == (
+        policy.sample_tiles_tiny_units,
+        policy.sample_shift_for(512),
+    )
+    for other in ("sm_100a", "sm_103a"):
+        assert (
+            policy_for(other).sample_class_rule[0]
+            == policy_for(other).sample_tiles_tiny_units
+        )
+    for top_k in (256, 2048, 4096):
+        doc = plan(16384, 270336, 2, top_k=top_k)
+        assert doc.physical_kind in long_rule[0], top_k
+        assert sampling(doc) == (policy.sample_tiles_max, long_rule[1]), top_k
+    wide = plan(4096, 131072, 1)
+    assert wide.physical_kind not in long_rule[0]
+    assert sampling(wide) == (policy.sample_tiles_max, policy.sample_shift_for(2048))
+    assert sampling(plan(16384, 270336, 2, sample_tiles_max=16)) == (16, long_rule[1])
+    assert sampling(plan(16384, 270336, 2, sample_shift_permille=100)) == (
+        policy.sample_tiles_max,
+        100,
+    )
+    assert plan(16384, 270336, 2, sample_tiles_max=0).sample_tiles_max == 0
+    assert plan(17536, 289344, 22, sample_tiles_max=0).sample_tiles_max == 0
 
 
 def test_far_sample_knob_is_validated_on_the_host():
@@ -3374,7 +4482,8 @@ def test_prepared_runner_graph_capture_and_replay():
 
 
 # the first 16 int64 of the ticket tail: the ticket word and its padding; the rest of the tail holds the
-# longest-first segment order, which every :lsf scan launch writes at its prologue before reading it
+# longest-first segment order, which every :lsf scan launch writes at its prologue before reading it (also the :lsf
+# copy of a program that draws from its TicketWord, whose runner has no tail of its own)
 _TICKET_WORD_BYTES = 8 * 16
 
 
@@ -3384,7 +4493,8 @@ def _assert_ticket_tail_zero(runner) -> None:
     for a program without a tail (``static_scan_kinds``).  The segment order behind it is not checked: an :lsf launch
     leaves it written.  A static call (``runner._tail_static``, ``cake_policy.ticket_static_path``) never touches the word,
     which then holds whatever the buffer held: nothing to check.  A runner whose scan program reads its ``TicketWord``
-    argument has no tail: its ticket block's word reads 0 instead."""
+    argument has no tail (its :lsf copy writes the segment order behind the workspace's ticket word before it reads
+    it): its ticket block's word reads 0 instead."""
     if runner.ticket_tail is not None and not runner._tail_static:
         words = runner.ticket_tail[:_TICKET_WORD_BYTES]
         assert not words.any(), words[:8].tolist()
@@ -3418,7 +4528,9 @@ def test_prepared_runner_ticket_tail_is_zero_at_prepare_after_runs_and_after_a_f
     )
     runner = _prepare(inputs)
     if runner.ticket_tail is None:
-        pytest.skip("no ticket tail for this program (static_scan_kinds)")
+        pytest.skip(
+            "no ticket tail for this program (a static_scan_kinds program, or one drawing from its TicketWord block)"
+        )
     assert not runner._tail_shared  # backend-owned: nothing else writes the tail
     assert not runner._tail_static  # the call draws tickets
     # the scan binding zeroes nothing: the device's one empty region, no per-call view
@@ -3472,7 +4584,9 @@ def _caller_owned_runner(inputs: ref.IndexerInputs, workspace: torch.Tensor):
     """A runner on the caller-owned ``workspace`` (skips where its program has no ticket tail)."""
     runner = _prepare(inputs, workspace_buffer=workspace)
     if runner.ticket_tail is None:
-        pytest.skip("no ticket tail for this program (static_scan_kinds)")
+        pytest.skip(
+            "no ticket tail for this program (a static_scan_kinds program, or one drawing from its TicketWord block)"
+        )
     assert runner._tail_shared
     # the scan binding zeroes the tail right before every scan launch; nothing on a static call
     zero_region = _scan_zero_region(runner)
@@ -3615,7 +4729,9 @@ def test_eager_entry_zeroes_a_caller_owned_tail_once_per_call(monkeypatch):
         assert not host_memsets and runner._ticket_restore is None
         return
     if runners[-1].ticket_tail is None:
-        pytest.skip("no ticket tail for this program (static_scan_kinds)")
+        pytest.skip(
+            "no ticket tail for this program (a static_scan_kinds program, or one drawing from its TicketWord block)"
+        )
     assert runners[-1]._tail_shared and not host_memsets  # the scan binding zeroes it
     assert not runners[-1]._tail_static  # the call draws tickets
     runner = runners[-1]
@@ -3672,10 +4788,11 @@ def test_caller_owned_workspace_graph_replay_restores_the_tail():
 
 
 def test_static_scan_kind_runner_has_no_ticket_tail_and_stays_exact_on_a_poisoned_workspace():
-    """A program of the record's ``static_scan_kinds`` (sm_107a: the l6 and CTA-pair l6 programs) keeps the static
-    enumeration on every call, also where the call's units exceed the grid: its runner gets no ticket tail (no memset
-    at prepare or run) and its rows stay bit-exact on a caller-owned buffer poisoned everywhere.  A drawing program on
-    the same architecture keeps its tail."""
+    """A program of the record's ``static_scan_kinds`` keeps the static enumeration on every call, also where the
+    call's units exceed the grid: its runner gets no ticket tail (no memset at prepare or run) and its rows stay
+    bit-exact on a caller-owned buffer poisoned everywhere.  A drawing program on the same architecture keeps its tail.
+    No BF16 record names a static kind now, so this skips; the FP8 form's static programs (sm_107a) are covered by
+    ``test_fp8_ticket_decision_is_per_form_and_exact_on_a_poisoned_workspace``."""
     _require_program()
     device = torch.device("cuda", torch.cuda.current_device())
     arch = arch_for(device)
@@ -3848,8 +4965,9 @@ def _ticket_word_inputs(seed: int):
 def test_ticket_word_runner_owns_its_block_and_ignores_a_poisoned_caller_workspace():
     """A prepared runner whose scan program reads its TicketWord gets a 16-byte block of its own, zeroed once at
     prepare, never the shared placeholder and never the workspace's tail: poisoning the whole caller-owned workspace
-    (the tail's ticket word included) between runs leaves every run bit-equal to a backend-owned runner, no run issues
-    a memset, and the block's word reads 0 after every run."""
+    (the tail's ticket word included, and the segment order an :lsf copy writes there before it reads it) between runs
+    leaves every run bit-equal to a backend-owned runner, no run issues a memset, and the block's word reads 0 after
+    every run."""
     inputs = _ticket_word_inputs(80)
     device = torch.device("cuda", torch.cuda.current_device())
     own = _prepare(inputs)
@@ -3899,6 +5017,67 @@ def test_ticket_word_runner_owns_its_block_and_ignores_a_poisoned_caller_workspa
         )
         workspace[tail_at : tail_at + 4] = torch.tensor(
             [1 + step, 2, 3, 4], dtype=torch.uint8, device=device
+        )
+
+
+# the packed calls of the sm_107a longest-first copies (``_SM107_LSF_COPIES``): unequal key segments on each copy, and
+# near-equal ones (the longest at most 5/4 of the shortest), on which the copy keeps the argument order
+_SM107_LSF_GEOMETRIES = (
+    ([1500, 1000], [1500, 12000], 1024, "scan:l6:u1:s0:f1:lsf"),
+    ([1024, 1024], [8192, 24576], 1024, "scan:l6:u1:s0:f0:lsf"),
+    ([1024, 1024], [16384, 18432], 1024, None),
+)
+
+
+@pytest.mark.parametrize("geometry", range(len(_SM107_LSF_GEOMETRIES)))
+def test_sm107_longest_first_copy_runs_on_a_poisoned_caller_workspace(geometry):
+    """On sm_107a a packed call of the two l6 ticket programs runs their longest-first copy, which draws from its
+    TicketWord block and writes the segment order into the caller-owned workspace's ticket tail before any role reads
+    it: with the whole workspace poisoned before the first run and refilled with random bytes between runs, every run
+    is bit-equal to a backend-owned runner's, which passes the reference judge."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    arch = arch_for(device)
+    if arch != "sm_107a":
+        pytest.skip(
+            f"the longest-first copies of the TicketWord programs ship on sm_107a, not {arch}"
+        )
+    assert set(cake_jit.PROGRAM_KEYS[arch]) >= _SM107_LSF_COPIES
+    seg_q, seg_k, top_k, key = _SM107_LSF_GEOMETRIES[geometry]
+    inputs = ref.make_random_inputs(
+        seg_q, seg_k, top_k=top_k, seed=88 + geometry, device="cuda"
+    )
+    own = _prepare(inputs)
+    assert own.choice.scan_key in (_SM107_LSF_COPIES if key is None else {key}), (
+        own.choice.scan_key
+    )
+    expected = _cloned(own())
+    torch.cuda.synchronize()
+    _judge_ok(expected, ref.select_reference(inputs))
+    workspace = torch.empty(
+        _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
+    )
+    workspace.fill_(0xFF)
+    runner = _prepare(inputs, workspace_buffer=workspace)
+    assert (
+        runner.choice.scan_key == own.choice.scan_key
+        and runner.ticket_block is not None
+    )
+    assert cake_backend.reads_ticket_word(runner.programs["scan"], runner.arch)
+    generator = torch.Generator(device=device).manual_seed(89)
+    for step in range(4):
+        out = runner()
+        torch.cuda.synchronize()
+        assert ref.same_bits(out, expected), step
+        workspace.copy_(
+            torch.randint(
+                0,
+                256,
+                workspace.shape,
+                generator=generator,
+                device=device,
+                dtype=torch.uint8,
+            )
         )
 
 
@@ -4199,7 +5378,8 @@ def test_empty_rows_and_no_keys_are_all_padding():
 
 def test_persistent_rank_finalize_follows_the_architecture_cap():
     """Lever FRP-K (round 39): the persistent two-row pipelined rank finalize serves the staged bulk slab calls up to the
-    architecture's ``rank_persist_max_k`` (sm_107a: 2048) and launches ``min(rows, rank_persist_ctas_per_sm x SMs)`` CTAs; every
+    architecture's ``rank_persist_max_k`` (sm_107a: 2048) and launches ``min(rows, rank_persist_ctas_per_sm x (SMs -
+    rank_persist_spare_sms))`` CTAs; every
     other architecture and every larger top_k keeps the one-row program (one CTA per row)."""
     for arch in cake_jit.ARCHES:
         policy = policy_for(arch)
@@ -4227,13 +5407,18 @@ def test_persistent_rank_finalize_follows_the_architecture_cap():
             )
             if expected:
                 assert choice.rank_persist_ctas == policy.rank_persist_ctas_per_sm
+                assert choice.rank_persist_spare == policy.rank_persist_spare_sms
                 assert finalize_grid(choice, 148) == min(
-                    8192, policy.rank_persist_ctas_per_sm * 148
+                    8192,
+                    policy.rank_persist_ctas_per_sm
+                    * (148 - policy.rank_persist_spare_sms),
                 )
                 assert finalize_grid(choice, 10_000) == 8192
             else:
                 assert (
-                    choice.rank_persist_ctas == 0 and finalize_grid(choice, 148) == 8192
+                    choice.rank_persist_ctas == 0
+                    and choice.rank_persist_spare == 0
+                    and finalize_grid(choice, 148) == 8192
                 )
             assert choice.finalize_key in cake_jit.PROGRAM_KEYS[arch], (
                 arch,
@@ -4280,6 +5465,157 @@ def test_persistent_rank_finalize_follows_the_architecture_cap():
             2048, True, False, False, False
         )  # a form of the bulk program
         assert not on.finalize_rank_persistent_for(2048, False, False, False, False)
+
+
+_MERGE_RANK_CALLS = (
+    # (num_queries, num_keys, num_segments): split calls whose finalize is the slab rank form (windows 16384 and 65536)
+    (4, 22018, 1),
+    (1, 16384, 1),
+    (64, 16384, 1),
+    (128, 32768, 2),
+)
+
+
+def test_persistent_rank_grid_spares_sms_for_another_stream():
+    """#7548: where the record spares SMs (sm_107a: one), the persistent rank grid of a call with enough rows is
+    ``rank_persist_ctas_per_sm x (SMs - spare)``, a multiple of the SMs that remain.  The :persist programs run 256 threads
+    per CTA, so a 1024-thread SM107 SM holds 4 of them at a time; with ``rank_persist_ctas_per_sm`` a multiple of 4, a block
+    of another stream on the spare SM leaves the static row walk whole waves of the other SMs instead of a short extra
+    wave."""
+    assert policy_for("sm_107a").rank_persist_spare_sms == 1
+    for arch in cake_jit.ARCHES:
+        policy = policy_for(arch)
+        if policy.rank_persist_max_k <= 0:
+            assert policy.rank_persist_spare_sms == 0, arch
+            continue
+        for sms in (148, 212):
+            choice = select_program(
+                policy,
+                num_queries=8192,
+                num_keys=8192,
+                num_segments=1,
+                ratio=1,
+                top_k=2048,
+                grid=sms,
+            )
+            assert choice.rank_persistent, (arch, sms)
+            spare = policy.rank_persist_spare_sms
+            grid = finalize_grid(choice, sms)
+            assert grid == policy.rank_persist_ctas_per_sm * (sms - spare), (arch, sms)
+            assert grid < policy.rank_persist_ctas_per_sm * sms, (arch, sms)
+            # CTAs one 1024-thread SM107 SM holds at a time divide the CTAs per SM: whole waves
+            assert choice.rank_threads == 256, (arch, choice.finalize_key)
+            assert (
+                policy.rank_persist_ctas_per_sm % (1024 // choice.rank_threads) == 0
+            ), arch
+        # a device of no more SMs than the spare count keeps one SM's grid
+        assert (
+            finalize_grid(choice, policy.rank_persist_spare_sms)
+            == policy.rank_persist_ctas_per_sm
+        )
+
+
+def test_merge_rank_fuses_the_slab_rank_finalize_into_split_merges():
+    """A split call whose finalize is the slab rank form runs the merge of key ``merge:rank:w<window>`` and no finalize
+    program where the architecture's record turns ``merge_rank`` on; the finalize key it replaces is unchanged, a record
+    with ``merge_rank`` off keeps the merge + finalize programs, and the FP8 form never fuses."""
+    for arch in cake_jit.ARCHES:
+        policy = policy_for(arch)
+        off = DispatchPolicy.from_record(dict(policy.record(), merge_rank=False))
+        keys = cake_jit.PROGRAM_KEYS[arch]
+        grid = 212 if arch == "sm_107a" else 148
+        for T, Tkv, S in _MERGE_RANK_CALLS:
+            call = dict(
+                num_queries=T,
+                num_keys=Tkv,
+                num_segments=S,
+                ratio=1,
+                top_k=2048,
+                grid=grid,
+                scan_keys=keys,
+            )
+            fused, plain = select_program(policy, **call), select_program(off, **call)
+            assert plain.split and not plain.merge_rank, (arch, T, Tkv, S)
+            assert plain.keys == (plain.scan_key, MERGE_KEY, plain.finalize_key)
+            assert fused.merge_rank is bool(policy.merge_rank), (arch, T, Tkv, S)
+            if not fused.merge_rank:
+                assert fused == plain
+                continue
+            window = fused.rank_window
+            assert window is not None and window <= policy.rank_slab_window_max
+            assert (
+                fused.merge_key == f"merge:rank:w{window}" and fused.merge_key in keys
+            )
+            assert fused.keys == (fused.scan_key, fused.merge_key)
+            assert fused.finalize_key == plain.finalize_key
+            assert (
+                dataclasses.replace(fused, merge_key=MERGE_KEY, merge_rank=False)
+                == plain
+            )
+            fp8 = plan_dsa_indexer_det_topk(
+                T,
+                Tkv,
+                S,
+                top_k=2048,
+                arch=arch,
+                num_sms=grid,
+                dtype=torch.float8_e4m3fn,
+            )
+            assert not fp8.merge_rank and fp8.merge_key in (None, MERGE_KEY), arch
+        # a call above the fused programs' top_k bound, an unsplit call and a two-level window keep the finalize program
+        for call in (
+            dict(num_queries=4, num_keys=22018, num_segments=1, top_k=4096),
+            dict(num_queries=8192, num_keys=8192, num_segments=1, top_k=2048),
+            dict(num_queries=4, num_keys=300000, num_segments=1, top_k=2048),
+        ):
+            c = select_program(policy, ratio=1, grid=grid, scan_keys=keys, **call)
+            assert not c.merge_rank and c.keys[-1] == c.finalize_key, (arch, call)
+
+
+def test_merge_rank_runs_are_bitwise_the_merge_plus_finalize_runs(monkeypatch):
+    """The fused merge writes the bits of the merge + slab rank finalize pair: every output of a split call is bitwise the
+    same with the architecture's record and with ``merge_rank`` off, and the fused call launches no finalize program."""
+    _require_program()
+    arch = arch_for(torch.device("cuda"))
+    if not policy_for(arch).merge_rank:
+        pytest.skip(f"merge_rank is off on {arch}")
+    rows = (
+        ([4], [22018]),
+        ([64], [16384]),
+        ([64, 64], [16384, 16384]),
+        ([3, 5], [7000, 30000]),
+    )
+    for seed, (seg_q, seg_k) in enumerate(rows):
+        inputs = ref.make_random_inputs(
+            seg_q, seg_k, top_k=2048, seed=700 + seed, device="cuda"
+        )
+        runner = _prepare(inputs)
+        if not runner.choice.split or not runner.choice.merge_rank:
+            continue
+        assert runner.stages == ("scan", "merge"), (seg_q, seg_k, runner.stages)
+        fused = _cloned(runner())
+        with monkeypatch.context() as m:
+            original = cake_backend.policy_for
+
+            def merge_rank_off(arch, form=cake_policy.BF16):
+                return DispatchPolicy.from_record(
+                    dict(original(arch, form).record(), merge_rank=False)
+                )
+
+            m.setattr(cake_backend, "policy_for", merge_rank_off)
+            plain_runner = _prepare(inputs)
+            assert plain_runner.stages == (
+                "scan",
+                "merge",
+                plain_runner.choice.finalize_role,
+            )
+            plain = _cloned(plain_runner())
+        assert torch.equal(fused[0], plain[0]), (seg_q, seg_k)
+        assert torch.equal(fused[1].view(torch.int32), plain[1].view(torch.int32)), (
+            seg_q,
+            seg_k,
+        )
+        _judge_ok(fused, ref.select_reference(inputs))
 
 
 def test_device_facts_are_queried_once_per_device(monkeypatch):
@@ -4362,17 +5698,21 @@ def test_policy_is_validated_once_per_architecture(monkeypatch):
 
 
 def test_lsf_copy_runs_on_packed_calls_of_unequal_key_segments():
-    """Lever LSF (#7549): an architecture whose policy sets ``lsf_programs`` (a ticket architecture) ships the
-    longest-first segment order copy of every scan program (key suffix ``:lsf``, a program of its own); the host runs it
-    on packed calls whose key segments are not all equal and the program without it on one-segment calls and on packed
-    calls of equal key segments (``num_keys == S x max_seqlen_k``)."""
+    """Lever LSF (#7549): an architecture whose policy sets ``lsf_programs`` (a ticket architecture) ships
+    longest-first segment order copies of its scan programs (key suffix ``:lsf``, each a program of its own): sm_100a
+    and sm_103a of every scan program, sm_107a of its two l6 ticket programs (``_SM107_LSF_COPIES``); the host runs the
+    copy on packed calls whose key segments are not all equal and the program without it on one-segment calls and on
+    packed calls of equal key segments (``num_keys == S x max_seqlen_k``)."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     for arch, keys in cake_jit.PROGRAM_KEYS.items():
         scan = {k for k in keys if k.startswith("scan:")}
         copies = {k for k in scan if k.endswith(":lsf")}
         lsf = policy_for(arch).lsf_programs
-        assert copies == ({k + ":lsf" for k in scan - copies} if lsf else set()), arch
+        every = {k + ":lsf" for k in scan - copies}
+        shipped = _SM107_LSF_COPIES if arch == "sm_107a" else every
+        assert copies == (shipped if lsf else set()), arch
+        assert copies <= every, arch  # every copy has its program
         assert all(keys[k] != keys[k[: -len(":lsf")]] for k in copies), arch
         # the copy reorders the ticket draws, so only a ticket architecture can ship it
         assert not lsf or arch in cake_jit.TICKET_TAIL_ARCHES, arch
@@ -4397,12 +5737,99 @@ def test_lsf_copy_runs_on_packed_calls_of_unequal_key_segments():
     assert not _select(off, 8 * 32768, 8 * 32768, S=8, max_seqlen_k=65536).lsf
 
 
+def test_lsf_copy_runs_where_the_registry_has_it_and_never_changes_the_plan():
+    """Lever LSF where the registry carries the copies of some programs only (sm_107a: its two l6 ticket programs): a
+    packed call whose key segments the host cannot tell equal runs the longest-first copy of its decided program where
+    the registry has it and the program itself elsewhere; either way the plan is the plan of the record with
+    ``lsf_programs`` off, because the rules that ask the registry for a program look up its key without the suffix.
+    Shown on the sm_107a registry with and without the two copies, and on sm_100a / sm_103a, whose registries carry
+    every copy, so a call there never falls back.  The backend plan (the registry's own keys): four 16k-query documents
+    over 32k keys run ``scan:l6:u1:s0:f0:lsf`` where that copy is registered, two 4k-query documents over 8k keys run
+    ``scan:l6:u1:s1:f1``, which has no copy."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    # (T, Tkv, S, sample_tiles_max): the packed sm_107a calls whose programs the tests above pin -- eight causal 8k
+    # documents (the unpaired l6 program, sampled fit), four 16k-query documents over 32k keys and two 1024-query
+    # documents over 128k keys (the unpaired l6 program, plain fit), two 4k-query documents over 8k keys (the snake l6
+    # program) -- and a grid of packed calls
+    packed = [
+        (q * S, k * S, S, sample)
+        for q, k, S, sample in itertools.product(
+            (4, 64, 1024, 4096), (8192, 32768, 131072), (2, 4), (None, 0)
+        )
+        if q <= k
+    ]
+    geometries = [
+        (65536, 65536, 8, None),
+        (65536, 65536, 8, 0),
+        (65536, 131072, 4, 0),
+        (2048, 262144, 2, None),
+        (8192, 16384, 2, None),
+        *packed,
+    ]
+    for arch, grid in (("sm_100a", 148), ("sm_103a", 152), ("sm_107a", 212)):
+        p, registry = policy_for(arch), set(cake_jit.PROGRAM_KEYS[arch])
+        off = DispatchPolicy.from_record(dict(p.record(), lsf_programs=False))
+        assert p.lsf_programs, arch
+        plain = {k for k in registry if not k.endswith(":lsf")}
+        key_sets = (
+            [plain, plain | _SM107_LSF_COPIES] if arch == "sm_107a" else [registry]
+        )
+        for keys in key_sets:
+            reached, kept = set(), 0
+            for (T, Tkv, S, sample), top_k in itertools.product(
+                geometries, (512, 2048)
+            ):
+                call = dict(
+                    num_queries=T,
+                    num_keys=Tkv,
+                    num_segments=S,
+                    ratio=1,
+                    top_k=top_k,
+                    grid=grid,
+                    sample_tiles_max=sample,
+                    scan_keys=keys,
+                )
+                where = (arch, len(keys), T, Tkv, S, top_k, sample)
+                base, got = select_program(off, **call), select_program(p, **call)
+                assert base.scan_key in keys, where
+                copy = base.scan_key + ":lsf"
+                if copy in keys:
+                    assert got == replace(base, lsf=True, scan_key=copy), where
+                    reached.add(copy)
+                else:
+                    assert got == base, where
+                    kept += 1
+                # equal key segments (num_keys == S x max_seqlen_k): the program itself
+                bounded = dict(call, max_seqlen_k=Tkv // S)
+                assert select_program(p, **bounded) == select_program(off, **bounded), (
+                    where
+                )
+            if arch == "sm_107a":
+                assert reached == keys & _SM107_LSF_COPIES and kept, arch
+            else:
+                assert reached and not kept, arch
+    keys = cake_jit.PROGRAM_KEYS["sm_107a"]
+    common = dict(top_k=2048, arch="sm_107a", num_sms=212)
+    four = plan_dsa_indexer_det_topk(65536, 131072, 4, sample_tiles_max=0, **common)
+    assert four.scan_key == _lsf_key(keys, "scan:l6:u1:s0:f0")
+    assert four.lsf == four.scan_key.endswith(":lsf")
+    equal = plan_dsa_indexer_det_topk(
+        65536, 131072, 4, sample_tiles_max=0, max_seqlen_k=32768, **common
+    )
+    assert (equal.scan_key, equal.lsf) == ("scan:l6:u1:s0:f0", False)
+    snake = plan_dsa_indexer_det_topk(8192, 16384, 2, **common)
+    assert (snake.scan_key, snake.lsf) == ("scan:l6:u1:s1:f1", False)
+
+
 def test_ticket_arg_arches_name_exactly_the_drawing_programs_of_their_architectures():
     """``ticket_arg_arches`` (written by the exporter from each program's source build) lists, per scan program, the
     architectures on which it draws from its TicketWord: on sm_107a every drawing scan program, on sm_100a / sm_103a
-    none (they draw from the workspace's tail).  Both ways: no program of a ``static_scan_kinds`` kind or an ``:lsf``
-    copy reads it, and every other scan program of an architecture that has a reader reads it -- so the host, which
-    decides by the record alone (``reads_ticket_word``), never hands a drawing program the placeholder."""
+    none (they draw from the workspace's tail).  Both ways: no program of a ``static_scan_kinds`` kind reads it, an
+    ``:lsf`` copy reads it only as the copy of a program that does (sm_107a's l6 ticket programs, whose copies keep the
+    segment order in the workspace's tail), and every other scan program of an architecture that has a reader reads
+    it -- so the host, which decides by the record alone (``reads_ticket_word``), never hands a drawing program the
+    placeholder."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     for name, record in cake_jit.PROGRAMS.items():
@@ -4423,7 +5850,10 @@ def test_ticket_arg_arches_name_exactly_the_drawing_programs_of_their_architectu
                 arch in cake_jit.PROGRAMS[name].get("ticket_arg_arches", ())
             ), (arch, key)
             if reads:
-                assert parts[1] not in static and parts[-1] != "lsf", (arch, key)
+                assert parts[1] not in static, (arch, key)
+            if parts[-1] == "lsf":
+                plain = keys[key[: -len(":lsf")]]
+                assert reads == cake_backend.reads_ticket_word(plain, arch), (arch, key)
             readers.setdefault(arch, []).append((reads, parts[1] in static))
     assert {arch: any(r for r, _ in rows) for arch, rows in readers.items()} == {
         "sm_100a": False,
@@ -4446,13 +5876,13 @@ def test_ticket_arg_arches_name_exactly_the_drawing_programs_of_their_architectu
 
 def test_static_scan_kinds_are_registered_ticket_architecture_kinds():
     """Every architecture is a ticket architecture; a record's ``static_scan_kinds`` names the physical scan kinds whose
-    programs keep the static enumeration there (sm_107a: the l6 and CTA-pair l6 programs), each a kind the
+    programs keep the static enumeration there (no BF16 record names one; sm_107a's FP8 record does), each a kind the
     architecture registers, and a kind with an ``:lsf`` copy is never static (the copy reorders ticket draws)."""
     assert tuple(cake_jit.POLICY) == cake_jit.TICKET_TAIL_ARCHES
     assert {arch: policy_for(arch).static_scan_kinds for arch in cake_jit.POLICY} == {
         "sm_100a": [],
         "sm_103a": [],
-        "sm_107a": ["l6", "pair_l6"],
+        "sm_107a": [],
     }
     # prepare decides a call's tail from this per-architecture set (made once per process)
     for arch in cake_jit.POLICY:

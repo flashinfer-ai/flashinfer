@@ -17,7 +17,7 @@ Context-parallel (KCP) packed width-4 depthwise causal convolution + SiLU traini
 non-deterministic package: thin stable entry points over the experimental backend module
 ``flashinfer.experimental.cake.cake_causal_conv1d_nondet_train.kcp`` (imported on first use).  The deterministic
 KCP package is :mod:`flashinfer.cake_causal_conv1d_det_train_kcp` (``cake_causal_conv1d_det_kcp``,
-``cake_causal_conv1d_det_multi_kcp``, ``RecomputeHandleDetKcp``); this module never runs it.
+``cake_causal_conv1d_det_kcp_multi``, ``CakeCausalConv1dDetKcpRecomputeHandle``); this module never runs it.
 
 Numerical mode (the same rule as every non-deterministic training package): the module name chooses the package,
 and no entry point takes a mode keyword.  "torch deterministic mode" is ``torch.use_deterministic_algorithms(True)``,
@@ -35,19 +35,22 @@ with or without ``warn_only=True``::
 The backward reads torch's deterministic setting when it runs (the autograd backward included).  Every rank of
 ``ctx.group`` runs the same entry points (and the same torch deterministic setting) for a call.
 
-Contract: the context of the KDA step (``ContextDetKcp`` from
-``flashinfer.cake_kda_det_train_kcp.build_context_det_kcp``), FP32 taps and no bias, the halo exchanges (one
+Contract: the context of the KDA step (``CakeKDADetKcpContext`` from
+``flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_build_context``), FP32 taps and no bias, the halo exchanges (one
 ``all_to_all_single`` per direction, with recompute handles for communication-free checkpoint recomputes, #7818),
-the recompute-handle rules and the multi-tensor calls are the deterministic KCP package's.  The main backward is ONE
-ordinary launch (no cooperative attribute, no grid barrier) whose CTAs add their FP32 ``dweight`` rows into zeroed
-accumulators with unordered global reductions.  ``y`` and ``dx`` are bitwise the deterministic KCP entry point's;
+the recompute-handle rules and the multi-tensor calls are the deterministic KCP package's.  The backward overlaps
+the halo exchange: its main program runs before the exchange is waited (no cooperative attribute, no grid barrier;
+its CTAs claim their tokens at run time, so a kernel resident on another stream slows it about in proportion to the
+SMs it holds) and adds the FP32 ``dweight`` runs into zeroed accumulators with unordered global reductions; a tail-row
+program then writes ``dx`` of the fragments' last rows from the received rows.  ``y`` and ``dx`` are bitwise the
+deterministic KCP entry point's;
 the rank-local FP32 ``dweight`` partial stays within the deterministic error budget but is not bitwise reproducible
 run to run (its cross-rank reduction remains the framework's).  The package is chosen by name, so a checkpoint
 recompute (``torch.utils.checkpoint``, reentrant or not) runs the same package.
 
 Name map (the deterministic package -> this module): ``cake_causal_conv1d_det_kcp`` ->
-:func:`cake_causal_conv1d_nondet_kcp`, ``cake_causal_conv1d_det_multi_kcp`` ->
-:func:`cake_causal_conv1d_nondet_kcp_multi`, ``RecomputeHandleDetKcp`` -> ``CakeCausalConv1dNondetKcpRecomputeHandle``
+:func:`cake_causal_conv1d_nondet_kcp`, ``cake_causal_conv1d_det_kcp_multi`` ->
+:func:`cake_causal_conv1d_nondet_kcp_multi`, ``CakeCausalConv1dDetKcpRecomputeHandle`` -> ``CakeCausalConv1dNondetKcpRecomputeHandle``
 (any object with an ``entries`` dict serves either package)::
 
     from flashinfer.cake_causal_conv1d_nondet_train_kcp import (
@@ -55,11 +58,12 @@ Name map (the deterministic package -> this module): ``cake_causal_conv1d_det_kc
         cake_causal_conv1d_nondet_kcp_multi,
     )
 
-    y_local = cake_causal_conv1d_nondet_kcp(x_local, weight, ctx)  # one-launch backward
+    y_local = cake_causal_conv1d_nondet_kcp(x_local, weight, ctx)  # overlapped backward
     q, k, v = cake_causal_conv1d_nondet_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx)
 
-The backward beside a kernel of another stream (FlashInfer issue #8365): ``bwd_reserve_sms=K`` (SM100 / SM103;
-``ValueError`` on SM107) launches the main backward ``K`` SMs short of its single wave::
+The backward beside a kernel of another stream (FlashInfer issue #8365): the overlapped backward needs no setting
+(its CTAs claim their tokens at run time); ``bwd_reserve_sms=K`` (SM100 / SM103; ``ValueError`` on SM107) runs the
+one-program backward after the halo exchange instead, ``K`` SMs short of its single wave::
 
     y_local = cake_causal_conv1d_nondet_kcp(x_local, weight, ctx, bwd_reserve_sms=1)
 """
@@ -94,8 +98,8 @@ def cake_causal_conv1d_nondet_kcp(
     non-deterministic backward.
 
     The first tokens of a fragment that continues a document read the history rows of the preceding fragment
-    (exchanged through the context's halo collective) instead of zeros.  FP32 taps, no bias.  The backward is one
-    launch with an unordered ``dweight`` partial (``y`` / ``dx`` bitwise the deterministic ones).  When torch's
+    (exchanged through the context's halo collective) instead of zeros.  FP32 taps, no bias.  The backward overlaps
+    the halo exchange and returns an unordered ``dweight`` partial (``y`` / ``dx`` bitwise the deterministic ones).  When torch's
     deterministic mode is on as the backward runs, the backward raises a ``RuntimeError`` before any exchange (a
     ``UserWarning``, then it runs, with ``warn_only=True``).
 
@@ -106,8 +110,8 @@ def cake_causal_conv1d_nondet_kcp(
         partition's order; ``C`` is a multiple of 8.
     weight : torch.Tensor
         FP32 ``[C, 4]`` contiguous taps.
-    ctx : ContextDetKcp
-        From ``flashinfer.cake_kda_det_train_kcp.build_context_det_kcp`` (the same context the KDA step of the rank
+    ctx : CakeKDADetKcpContext
+        From ``flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_build_context`` (the same context the KDA step of the rank
         uses).
     recompute_handle : CakeCausalConv1dNondetKcpRecomputeHandle, optional
         Keyword-only, default ``None``.  A handle (any object with an ``entries`` dict) makes the checkpoint
@@ -115,13 +119,13 @@ def cake_causal_conv1d_nondet_kcp(
         :func:`flashinfer.cake_causal_conv1d_det_train_kcp.cake_causal_conv1d_det_kcp` (one handle per call and
         micro-step, created outside the outermost checkpoint region; every rank passes one or none).
     cooperative : bool, optional
-        Keyword-only, default ``None``.  The main backward is always one ordinary launch: ``None`` and ``False``
+        Keyword-only, default ``None``.  The backward launches no cooperative grid: ``None`` and ``False``
         mean the same and ``True`` raises ``ValueError`` (the cooperative form belongs to the deterministic KCP
         package: ``cake_causal_conv1d_det_kcp(..., cooperative=True)``).
     bwd_reserve_sms : int, optional
-        Keyword-only, default ``None`` (the package's ``RESERVE_DEFAULT``, 0).  The SMs the main backward leaves to
-        kernels of other streams (issue #8365): ``K >= 1`` launches its single-wave grid ``K x ctas_per_sm`` CTAs
-        short, so a kernel of another stream that holds up to ``K`` SMs (for example a communication kernel) does
+        Keyword-only, default ``None`` (the package's ``RESERVE_DEFAULT``, 0).  The SMs the one-program backward
+        leaves to kernels of other streams (issue #8365): ``K >= 1`` runs that backward after the halo exchange
+        instead of the overlapped one and launches its single-wave grid ``K x ctas_per_sm`` CTAs short, so a kernel of another stream that holds up to ``K`` SMs (for example a communication kernel) does
         not push the top CTAs into a second wave; the unloaded backward gives up the work of those ``K`` SMs.
         ``y``, ``dx`` and the exchanges are unchanged and ``dweight`` stays within the same budget.  With ``K = 0``
         (or ``None``) the backward already launches one SM's CTAs short wherever the last channel-tile rank of the
@@ -178,7 +182,7 @@ def cake_causal_conv1d_nondet_kcp_multi(
         fragments; each ``C_i`` is a multiple of 8 (they may differ).
     weights : sequence of torch.Tensor
         FP32 ``[C_i, 4]`` contiguous taps, one per tensor.
-    ctx : ContextDetKcp
+    ctx : CakeKDADetKcpContext
         As in :func:`cake_causal_conv1d_nondet_kcp`.  Every rank of the group calls this function once per layer, in
         the same order, with the same tensor count and channel counts.
     recompute_handle : CakeCausalConv1dNondetKcpRecomputeHandle, optional

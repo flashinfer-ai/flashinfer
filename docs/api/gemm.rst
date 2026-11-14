@@ -86,6 +86,17 @@ FP8 GEMM
     batch_deepgemm_fp8_nt_groupwise
     fp8_blockscale_gemm_sm90
 
+16-bit x FP8 GEMM (FP8 weight, bf16 / fp16 activation)
+-------------------------------------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    mm_bf16_fp8
+    mm_bf16_fp8_workspace_bytes
+    mm_fp16_fp8
+    mm_fp16_fp8_workspace_bytes
+
 Low-latency TRT-LLM FP8 GEMM weight prep (also exported from ``flashinfer``):
 
 .. currentmodule:: flashinfer.trtllm_low_latency_gemm

@@ -24,13 +24,15 @@ csrc/xqa/                      @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv 
 flashinfer/attention/          @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 include/flashinfer/attention/  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
+tests/cpu/attention/           @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 
 # ── MSA ──
 flashinfer/msa_ops/            @rmhaskarnvidia @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 tests/msa_ops/                 @rmhaskarnvidia @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
+tests/cpu/msa_ops/             @rmhaskarnvidia @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 
 # ── SDSA ──
-docs/design_docs/sdsa_indexer.md    @netanel-haber @amirkl94 @saltyminty @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @bkryu @Anerudhan
+docs/design_docs/sdsa.md            @netanel-haber @amirkl94 @saltyminty @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @bkryu @Anerudhan
 flashinfer/sdsa/                    @netanel-haber @amirkl94 @saltyminty @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @bkryu @Anerudhan
 flashinfer/trace/templates/sdsa.py  @netanel-haber @amirkl94 @saltyminty @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @bkryu @Anerudhan
 tests/sdsa/                         @netanel-haber @amirkl94 @saltyminty @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @bkryu @Anerudhan
@@ -40,6 +42,7 @@ tests/trace/fi_trace_out/sdsa_*     @netanel-haber @amirkl94 @saltyminty @aleozl
 flashinfer/gemm/               @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao @Jingfan-Sun @YangXu1990uiuc @jimmyzho @yyihuang @yanqinz2 @Anerudhan
 include/flashinfer/gemm/       @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao @Jingfan-Sun @YangXu1990uiuc @jimmyzho @yyihuang @yanqinz2 @Anerudhan
 tests/gemm/                    @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao @Jingfan-Sun @YangXu1990uiuc @jimmyzho @yyihuang @yanqinz2 @Anerudhan
+tests/cpu/gemm/                @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao @Jingfan-Sun @YangXu1990uiuc @jimmyzho @yyihuang @yanqinz2 @Anerudhan
 csrc/tinygemm2*                @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao @Jingfan-Sun @YangXu1990uiuc @jimmyzho @yyihuang @yanqinz2 @Anerudhan
 csrc/cake_tinygemm2_*/         @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao @Jingfan-Sun @YangXu1990uiuc @jimmyzho @yyihuang @yanqinz2 @Anerudhan
 flashinfer/jit/*tinygemm2*     @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao @Jingfan-Sun @YangXu1990uiuc @jimmyzho @yyihuang @yanqinz2 @Anerudhan
@@ -55,15 +58,18 @@ csrc/fused_moe/                       @aleozlx @yzh119 @jiahanc @IwakuraRein @nv
 flashinfer/fused_moe/                 @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao @Jingfan-Sun @YangXu1990uiuc @bkryu @yyihuang @yanqinz2 @Anerudhan
 include/flashinfer/trtllm/fused_moe/  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao @Jingfan-Sun @YangXu1990uiuc @bkryu @yyihuang @yanqinz2 @Anerudhan
 tests/moe/                            @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao @Jingfan-Sun @YangXu1990uiuc @bkryu @yyihuang @yanqinz2 @Anerudhan
+tests/cpu/moe/                        @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao @Jingfan-Sun @YangXu1990uiuc @bkryu @yyihuang @yanqinz2 @Anerudhan
 
 # ── MOE_EP ──
 flashinfer/moe_ep/             @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @feih-nv @Aneureka @Jingfan-Sun @YangXu1990uiuc @bkryu @yyihuang @yanqinz2
 tests/moe_ep/                  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @feih-nv @Aneureka @Jingfan-Sun @YangXu1990uiuc @bkryu @yyihuang @yanqinz2
+tests/cpu/moe_ep/              @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @feih-nv @Aneureka @Jingfan-Sun @YangXu1990uiuc @bkryu @yyihuang @yanqinz2
 
 # ── Communication ──
 flashinfer/comm/               @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan @feih-nv @Aneureka @Jingfan-Sun @YangXu1990uiuc @yyihuang
 include/flashinfer/comm/       @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan @feih-nv @Aneureka @Jingfan-Sun @YangXu1990uiuc @yyihuang
 tests/comm/                    @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan @feih-nv @Aneureka @Jingfan-Sun @YangXu1990uiuc @yyihuang
+tests/cpu/comm/                @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan @feih-nv @Aneureka @Jingfan-Sun @YangXu1990uiuc @yyihuang
 
 # ── Norm ──
 csrc/*norm*                   @kahyunnam @yzh119 @bkryu @yongwww @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
@@ -90,6 +96,7 @@ include/flashinfer/sampling.cuh      @kahyunnam @yzh119 @bkryu @yongwww @aleozlx
 tests/topk_varlen/                   @kahyunnam @yzh119 @bkryu @yongwww @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 tests/utils/test_logits_processor.py @kahyunnam @yzh119 @bkryu @yongwww @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 tests/utils/test_sampling*.py        @kahyunnam @yzh119 @bkryu @yongwww @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
+tests/utils/test_helpers/sampling.py @kahyunnam @yzh119 @bkryu @yongwww @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 tests/utils/test_topk.py             @kahyunnam @yzh119 @bkryu @yongwww @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 
 # ── RoPE ──
@@ -110,6 +117,7 @@ csrc/gdn/            @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @jhjpark @aleoz
 flashinfer/gdn*      @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan @jimmyzho
 flashinfer/jit/*gdn* @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan @jimmyzho
 tests/gdn*/          @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan @jimmyzho
+tests/cpu/gdn/       @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan @jimmyzho
 
 # ── MAMBA ──
 csrc/checkpointing_ssu*      @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
@@ -119,6 +127,7 @@ flashinfer/jit/mamba/        @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun @jhjp
 flashinfer/mamba/            @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 include/flashinfer/mamba/    @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 tests/mamba/                 @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
+tests/cpu/mamba/             @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 
 # ── KDA ──
 csrc/kda/            @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
@@ -126,10 +135,12 @@ flashinfer/*kda*     @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jing
 flashinfer/jit/*kda* @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 tests/jit/test_*kda* @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 tests/kda/           @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
+tests/cpu/kda/       @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 
 # ── Autotuner ──
 flashinfer/autotuner/    @qiching @yzh119 @bkryu @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 tests/autotuner/         @qiching @yzh119 @bkryu @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
+tests/cpu/autotuner/     @qiching @yzh119 @bkryu @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 
 # -- Test runner --
 scripts/test_sharding/      @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
@@ -141,9 +152,9 @@ docker/                                          @righthandabacus @dierksen @bkr
 .devcontainer/                                   @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 build_backend.py                                 @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 pytest.ini                                       @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
-tests/test_helpers/                              @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
+tests/infra/                                     @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
+tests/cpu/infra/                                 @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 flashinfer-jit-cache-provider/                   @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 flashinfer-cubin/                                @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
-tests/cpu/                                       @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 tests/test_artifacts.py                          @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 docs/installation.rst                            @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan

@@ -22,12 +22,12 @@ from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.tuner import (
 
 
 @pytest.mark.cpu_only
-def test_bf16_knobs_only_expose_valid_fixed_geometry():
+def test_bf16_ordinary_autotuning_preserves_its_baseline_geometry():
     knobs = default_knobs(256, dtype="bf16")
     assert knobs["mma_tiler_mnk"] == (256, 256, 64)
     assert knobs["cluster_shape_mnk"] == (2, 1, 1)
     assert is_valid_bf16(knobs)
-    assert not is_valid_bf16({**knobs, "mma_tiler_mnk": (256, 256, 256)})
+    assert not is_valid_bf16({**knobs, "mma_tiler_mnk": (256, 256, 32)})
     assert not is_valid_bf16(
         {**knobs, "in_kernel_fc2_reduce": True, "token_back_mode": "epi_warps"}
     )
@@ -203,7 +203,9 @@ def test_bf16_autotune_filters_unpermitted_ikr_candidates(monkeypatch):
     monkeypatch.setattr(
         autotune,
         "autotune_knobs",
-        lambda _frontend, _launch, candidates, **_kwargs: candidates,
+        lambda _frontend, _launch, candidates, **kwargs: kwargs["candidate_filter"](
+            candidates
+        ),
     )
     buffer = SimpleNamespace(_frontend=frontend)
     with pytest.warns(
@@ -240,7 +242,9 @@ def test_bf16_autotune_sweeps_the_ikr_axis_when_permitted(monkeypatch):
     monkeypatch.setattr(
         autotune,
         "autotune_knobs",
-        lambda _frontend, _launch, candidates, **_kwargs: candidates,
+        lambda _frontend, _launch, candidates, **kwargs: kwargs["candidate_filter"](
+            candidates
+        ),
     )
     candidates = autotune.autotune_bf16_mega_moe(
         None, None, None, SimpleNamespace(_frontend=frontend)

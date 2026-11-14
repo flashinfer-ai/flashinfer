@@ -162,6 +162,17 @@ def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
     return padded_row * padded_column
 
 
+def _check_mxfp8_cuda_capability(device: torch.device) -> None:
+    """Reject pre-SM100 CUDA devices while allowing the CPU host path."""
+    if device.type == "cuda":
+        major, minor = get_compute_capability(device)
+        if major < 10:
+            raise RuntimeError(
+                "mxfp8_quantize with backend='cuda' requires SM100 or newer, "
+                f"got SM{major}{minor}"
+            )
+
+
 @functools.cache
 def get_mxfp8_quantization_sm100_module():
     module = gen_mxfp8_quantization_sm100_module().build_and_load()
@@ -214,6 +225,7 @@ def get_mxfp8_quantization_sm100_module():
             )
             return out_val, out_sf
         else:
+            _check_mxfp8_cuda_capability(input.device)
             if enable_pdl is None:
                 enable_pdl = device_support_pdl(input.device)
             m = input.numel() // input.shape[-1]
@@ -235,6 +247,13 @@ def get_mxfp8_quantization_sm100_module():
                     f"Invalid sf_swizzle_layout value: {sf_swizzle_layout}"
                 )
             out_sf = torch.empty((out_sf_size,), dtype=torch.uint8, device=input.device)
+            if input.dtype not in (torch.float16, torch.bfloat16):
+                raise NotImplementedError(
+                    "mxfp8_quantize only supports input tensor with dtypes fp16/bf16."
+                )
+            # A zero-row input would launch a zero-sized CUDA grid.
+            if m == 0:
+                return out_val, out_sf
             module.mxfp8_quantize(
                 input,
                 out_val,
@@ -376,9 +395,10 @@ def mxfp8_quantize(
     Parameters
     ----------
     input : torch.Tensor
-        Input tensor of shape ``[M, K]`` with dtype fp16/bf16/fp8_quantized.
-        The ``"cute-dsl"`` backend additionally supports fp32 input; the
-        ``"cuda"`` backend does not.
+        Input tensor of shape ``[M, K]``. CUDA inputs support fp16/bf16.
+        The ``"cute-dsl"`` backend additionally supports fp32 CUDA inputs;
+        the ``"cuda"`` backend does not. CPU inputs with ``backend="cuda"``
+        require ``torch.float32``.
     is_sf_swizzled_layout : bool
         Whether to use the swizzled layout for scale factors.  Defaults to
         ``True``.
@@ -392,7 +412,9 @@ def mxfp8_quantize(
 
         - ``"auto"`` (default): ``"cuda"``, or the batch-invariant kernel
           under ``batch_invariant=True`` (which requires ``"auto"``).
-        - ``"cuda"``: stable JIT-compiled CUDA kernel.
+        - ``"cuda"``: stable JIT-compiled kernel. CUDA inputs require
+          SM100 or newer. CPU inputs use the host implementation and
+          require ``torch.float32``.
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
     sf_swizzle_layout : SfLayout, optional
         Swizzle layout for scale factors; when supplied this overrides
@@ -415,6 +437,12 @@ def mxfp8_quantize(
         ``FLOAT8_E4M3`` and ``sf`` is the scale-factor tensor whose
         shape depends on the chosen layout and ``sf_vec_size`` (fixed at
         ``32`` here).
+
+    Raises
+    ------
+    RuntimeError
+        If ``backend="cuda"`` receives a CUDA tensor on a device older
+        than SM100.
 
     Warnings
     --------
@@ -471,6 +499,7 @@ def mxfp8_quantize(
         )
     else:
         # backend == "cuda"
+        _check_mxfp8_cuda_capability(input.device)
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
         x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100(
@@ -981,7 +1010,10 @@ def mxfp8_grouped_quantize(
         aligned. A failed launch is not retried on another backend.
 
         Outputs match across backends for finite inputs, including bfloat16
-        subnormals. A zero UE8M0 scale byte produces signed-zero payloads.
+        subnormals, except in blocks whose UE8M0 scale byte is 0 (a bfloat16
+        block amax of at most ``448 * 2**-127``): ``"cake"`` quantizes those
+        with the reciprocal ``2**127``, while ``"cutile"`` and ``"cuda"``
+        write signed-zero payloads.
         ``"cuda"`` quantizes NaN and infinities to 448, as
         :func:`mxfp8_quantize` does; blocks that hold them can differ.
 

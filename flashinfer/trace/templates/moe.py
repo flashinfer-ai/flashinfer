@@ -20,12 +20,6 @@ from typing import Any, cast
 
 import torch
 
-from ...tllm_enums import (
-    ActivationType,
-    DEFAULT_SWIGLU_ALPHA,
-    DEFAULT_SWIGLU_BETA,
-    DEFAULT_SWIGLU_LIMIT,
-)
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 from ._init_helpers import fp8_block_quant_1d, fp8_block_quant_2d
 from .gemm import _unswizzle_batched_sf_128x4
@@ -2668,12 +2662,27 @@ def _moe_bf16_run_experts(
     # Keep enum values local so the serialized reference needs only PyTorch.
     swiglu, swiglu_step, geglu_tanh, relu2, clamped_relu2 = 3, 7, 8, 6, 12
     activation_type = int(activation_type)
-    if situ_beta is not None or situ_linear_beta is not None:
-        from ...fused_moe.cute_dsl.moe_utils import (
-            validate_cute_dsl_moe_situ_config,
-        )
+    if situ_beta is None:
+        if situ_linear_beta is not None:
+            raise ValueError("situ_linear_beta requires situ_beta")
+    else:
+        if activation_type != swiglu:
+            raise ValueError("SiTU parameters require ActivationType.Swiglu")
 
-        validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
+        # Scalar checks must also reject values that overflow or underflow in FP32.
+        def positive_finite_fp32(value):
+            """Match the runtime validator after FP32 conversion."""
+            if not math.isfinite(value) or value <= 0:
+                return False
+            rounded = torch.tensor(value, dtype=torch.float32, device="cpu")
+            return bool(torch.isfinite(rounded) & (rounded > 0))
+
+        if not positive_finite_fp32(situ_beta):
+            raise ValueError("situ_beta must be positive and finite in fp32")
+        if situ_linear_beta is not None and not positive_finite_fp32(situ_linear_beta):
+            raise ValueError(
+                "situ_linear_beta must be positive and finite in fp32 when set"
+            )
     if activation_type not in (swiglu, swiglu_step, geglu_tanh, relu2, clamped_relu2):
         raise ValueError(
             f"Unsupported activation_type {activation_type!r}; "
@@ -4131,6 +4140,9 @@ cute_dsl_fused_moe_trace = TraceTemplate(
     ),
     axes={
         "num_tokens": Var(description="Total tokens across the batch."),
+        "num_fc2_input_scales": Var(
+            description="One shared FC2 input scale or one per local expert."
+        ),
         "num_experts": Const(abbrev="", description="Total number of experts."),
         "top_k": Const(abbrev="topk"),
         "num_local_experts": Const(abbrev="e"),
@@ -4219,7 +4231,7 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             description="Per-expert FC1 global scale.",
         ),
         "fc2_input_scale": Tensor(
-            ["one"],
+            ["num_fc2_input_scales"],
             dtype="float32",
             optional=True,
             description=(
@@ -4308,6 +4320,16 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             optional=True,
             description="Optional SiTU up-branch tanh-clamp beta.",
         ),
+        "use_fused_finalize": Scalar(
+            "bool",
+            optional=True,
+            description="Use BF16 atomic reduction; otherwise reduce expanded rows in FP32.",
+        ),
+        "routing_weights_before_fc2": Scalar(
+            "bool",
+            optional=True,
+            description="Apply routing weights before GEMM2-input NVFP4 quantization.",
+        ),
         "clamped_relu2_limit": Tensor(
             ["one"],
             dtype="float32",
@@ -4380,6 +4402,16 @@ _cute_dsl_wrapper_inputs["situ_beta"] = Scalar(
 )
 _cute_dsl_wrapper_inputs["situ_linear_beta"] = Scalar(
     "float32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["use_fused_finalize"] = Scalar(
+    "bool",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["routing_weights_before_fc2"] = Scalar(
+    "bool",
     optional=True,
     description="Set at wrapper __init__, not passed to run().",
 )
@@ -5014,6 +5046,37 @@ _b12x_wrapper_axes["top_k"] = Var(description="Experts per token.")
 
 
 @torch.no_grad()
+def _pre_fc2_nvfp4_qdq(hidden, global_scale):
+    """Apply standard block-16 NVFP4 QDQ with saturating round-to-nearest-even."""
+    nvfp4_block_size = 16
+    fp4_max = 6.0
+    fp8_scale_max = torch.finfo(torch.float8_e4m3fn).max
+    fp4_code_count = 8
+    blocks = hidden.float().reshape(hidden.shape[0], -1, nvfp4_block_size)
+    raw_scale = blocks.abs().amax(dim=-1) * (global_scale.reshape(()) / fp4_max)
+    scale = raw_scale.clamp(max=fp8_scale_max).to(torch.float8_e4m3fn).float()
+    normalized = blocks * torch.where(
+        scale > 0, global_scale.reshape(()) / scale, 0
+    ).unsqueeze(-1)
+    levels = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=torch.float32, device=hidden.device
+    )
+    differences = (normalized.abs().clamp(max=fp4_max).unsqueeze(-1) - levels).abs()
+    nearest = differences.argmin(dim=-1)
+    # cvt.rn.satfinite.e2m1x2 resolves exact halfway cases to the even code.
+    codes = torch.arange(fp4_code_count, device=hidden.device)
+    even_ties = (differences == differences.amin(dim=-1, keepdim=True)) & (
+        codes % 2 == 0
+    )
+    even_code = torch.where(even_ties, codes, fp4_code_count).amin(dim=-1)
+    nearest = torch.where(even_code < fp4_code_count, even_code, nearest)
+    values = levels[nearest] * torch.where(normalized < 0, -1, 1)
+    return (values * scale.unsqueeze(-1)).reshape(hidden.shape)
+
+
+# Literal defaults mirror ActivationType.Swiglu and DEFAULT_SWIGLU_ALPHA/BETA
+# so exported source needs no FlashInfer globals; None leaves clamping disabled.
+@torch.no_grad()
 def _cute_dsl_fused_moe_reference(
     x,
     x_sf,
@@ -5028,20 +5091,127 @@ def _cute_dsl_fused_moe_reference(
     w2_alpha,
     num_experts,
     top_k,
-    activation_type=ActivationType.Swiglu.value,
-    swiglu_alpha=DEFAULT_SWIGLU_ALPHA,
-    swiglu_beta=DEFAULT_SWIGLU_BETA,
-    swiglu_limit=DEFAULT_SWIGLU_LIMIT,
+    activation_type=3,
+    swiglu_alpha=1.0,
+    swiglu_beta=0.0,
+    swiglu_limit=None,
     quant_mode="w4a4",
     situ_beta=None,
     situ_linear_beta=None,
     clamped_relu2_limit=None,
+    routing_weights_before_fc2=False,
+    use_fused_finalize=True,
     per_token_scale=None,
     local_expert_offset=0,
     swap_ab=False,
     **_unused,
 ):
-    """Reference for CuteDSL block-scaled MoE with alpha folded into weights."""
+    """Reference for block-scaled MoE, including pre-FC2 weighted quantization."""
+    # Keep enum values local so the serialized reference has no enum dependency.
+    swiglu, swiglu_step, geglu_tanh, clamped_relu2 = 3, 7, 8, 12
+    fp4_values_per_byte = 2
+    nvfp4_block_size = 16
+    if routing_weights_before_fc2:
+        clamp = clamped_relu2_limit
+        if (
+            quant_mode.lower() not in ("w4a4", "nvfp4")
+            or int(activation_type) != clamped_relu2
+            or clamp is None
+            or per_token_scale is not None
+            or swap_ab
+        ):
+            raise ValueError("Pre-FC2 weighting reference requires soft-clamped W4A4")
+        if x.shape[0] == 0:
+            return torch.empty(
+                (0, w2_weight.shape[1]), dtype=torch.bfloat16, device=x.device
+            )
+
+        def logical_scales(sf, weight):
+            """Recover expert-major block scales from the grouped GEMM's MMA view."""
+            if sf.ndim == 6:
+                return (
+                    sf.permute(5, 2, 1, 0, 4, 3)
+                    .contiguous()
+                    .reshape(weight.shape[0], -1, sf.shape[4] * 4)[
+                        :,
+                        : weight.shape[1],
+                        : weight.shape[2] * fp4_values_per_byte // nvfp4_block_size,
+                    ]
+                )
+            return sf
+
+        activations = _dequantize_fp4_tensor(
+            x, x_sf.reshape(x.shape[0], -1).view(torch.float8_e4m3fn), False
+        )
+        W1 = _dequantize_fp4_tensor(
+            w1_weight,
+            logical_scales(w1_weight_sf, w1_weight).view(torch.float8_e4m3fn),
+            False,
+        )
+        W2 = _dequantize_fp4_tensor(
+            w2_weight,
+            logical_scales(w2_weight_sf, w2_weight).view(torch.float8_e4m3fn),
+            False,
+        )
+        output = torch.zeros_like(
+            activations, dtype=torch.float64 if use_fused_finalize else torch.float32
+        )
+        absolute_sum = torch.zeros_like(output) if use_fused_finalize else None
+        local_routes = (
+            torch.zeros((x.shape[0], 1), dtype=torch.float32, device=x.device)
+            if use_fused_finalize
+            else None
+        )
+        expanded = (
+            None
+            if use_fused_finalize
+            else torch.zeros(
+                (x.shape[0], top_k, w2_weight.shape[1]),
+                dtype=torch.bfloat16,
+                device=x.device,
+            )
+        )
+        offset = int(local_expert_offset)
+        for expert in range(w1_weight.shape[0]):
+            token, slot = (token_selected_experts == expert + offset).nonzero(
+                as_tuple=True
+            )
+            if token.numel() == 0:
+                continue
+            raw = (activations[token] @ W1[expert].T * w1_alpha[expert]).bfloat16()
+            intermediate = (clamp * torch.tanh(raw.float() / clamp)).bfloat16()
+            intermediate = intermediate.float().relu().square().bfloat16()
+            intermediate = (
+                intermediate.float() * token_final_scales[token, slot, None]
+            ).bfloat16()
+            scale = fc2_input_scale.reshape(-1)
+            scale = scale[expert : expert + 1] if scale.numel() > 1 else scale
+            quantized = _pre_fc2_nvfp4_qdq(intermediate, scale)
+            contribution = (quantized @ W2[expert].T * w2_alpha[expert]).bfloat16()
+            if use_fused_finalize:
+                output.index_add_(0, token, contribution.double())
+                absolute_sum.index_add_(0, token, contribution.double().abs())
+                local_routes.index_add_(
+                    0, token, torch.ones_like(token[:, None], dtype=torch.float32)
+                )
+            else:
+                expanded[token, slot] = contribution
+        if not use_fused_finalize:
+            # moe_unpermute accumulates in FP32 in top-k slot order, not expert order.
+            for slot in range(top_k):
+                output.add_(expanded[:, slot].float())
+        result = output.bfloat16()
+        if use_fused_finalize:
+            # BF16 atomic additions may arrive in any expert order. Carry a
+            # pointwise forward-error budget to the check without changing the
+            # reference's tensor shape or the serving API.
+            unit_roundoff = torch.finfo(torch.bfloat16).eps / 2
+            steps = (local_routes.double() - 1).clamp_min(0)
+            relative_bound = torch.pow(1 + unit_roundoff, steps) - 1
+            bound = relative_bound * absolute_sum.double()
+            bound += (result.double() - output).abs()
+            result._cute_dsl_bf16_reduction_bound = bound
+        return result
     E_local = w1_weight.shape[0]
     # Dequantize input and weights with alpha factors.
     quant_mode = quant_mode.lower()
@@ -5089,13 +5259,11 @@ def _cute_dsl_fused_moe_reference(
     else:
         W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=is_mxfp)
         W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=is_mxfp)
-    if ActivationType(int(activation_type)).is_gated:
-        from ...fused_moe.prepare import _cute_dsl_gated_weight_group_size
-
-        # Undo the weight-preparation interleave for the shared reference.
-        group_size = _cute_dsl_gated_weight_group_size(
-            w1_weight.device, swap_ab=swap_ab
-        )
+    # Literal enum values and layout sizes keep the exported reference standalone.
+    if int(activation_type) in (swiglu, swiglu_step, geglu_tanh):
+        swap_ab_gated_row_group_size = 16
+        gated_row_group_size = 64
+        group_size = swap_ab_gated_row_group_size if swap_ab else gated_row_group_size
         W1 = (
             W1.reshape(E_local, -1, 2, group_size, W1.shape[-1])
             .transpose(1, 2)
@@ -5121,6 +5289,75 @@ def _cute_dsl_fused_moe_reference(
         situ_linear_beta=situ_linear_beta,
         clamped_relu2_limit=clamped_relu2_limit,
     )
+
+
+cast(Any, _cute_dsl_fused_moe_reference)._trace_reference_dependencies = (
+    _unpack_fp4_e2m1,
+    _ue8m0_to_float32,
+    _decode_block_scales,
+    _dequantize_fp4_tensor,
+    _dequantize_fp4_hidden_states,
+    _moe_expert_param,
+    _moe_bf16_run_experts,
+    _pre_fc2_nvfp4_qdq,
+)
+
+
+def _cute_dsl_moe_check(reference_outputs, actual_outputs, **thresholds):
+    """Allow the pointwise BF16 reduction budget only on the weighted fused path."""
+    import torch
+    from flashinfer.trace import default_check
+    from flashinfer.trace.template import default_tolerances
+
+    def single_output(outputs):
+        """Unwrap one output while retaining its reference-only reduction metadata."""
+        if isinstance(outputs, dict):
+            return next(iter(outputs.values())) if len(outputs) == 1 else None
+        if isinstance(outputs, (list, tuple)):
+            return outputs[0] if len(outputs) == 1 else None
+        return outputs
+
+    if isinstance(reference_outputs, dict) or isinstance(actual_outputs, dict):
+        if not isinstance(reference_outputs, dict) or not isinstance(
+            actual_outputs, dict
+        ):
+            return False
+        if reference_outputs.keys() != actual_outputs.keys():
+            return False
+    ref, actual = single_output(reference_outputs), single_output(actual_outputs)
+    bound = getattr(ref, "_cute_dsl_bf16_reduction_bound", None)
+    if bound is None:
+        return default_check(reference_outputs, actual_outputs, **thresholds)
+    if not isinstance(actual, torch.Tensor) or ref.shape != actual.shape:
+        return False
+    if not (torch.isfinite(ref).all() and torch.isfinite(actual).all()):
+        return default_check(reference_outputs, actual_outputs, **thresholds)
+    if ref.numel() == 0:
+        return True
+    default_rtol, default_atol = default_tolerances(actual.dtype)
+    rtol = thresholds.get("rtol")
+    atol = thresholds.get("atol")
+    rtol = default_rtol if rtol is None else rtol
+    atol = default_atol if atol is None else atol
+    # A relative tolerance alone cannot handle cancellation of large routes.
+    close = (actual.double() - ref.double()).abs() <= (
+        bound + atol + rtol * ref.double().abs()
+    )
+    mismatch_pct = 100 * (1 - close.double().mean().item())
+    if mismatch_pct > thresholds.get("max_mismatch_pct", 0.0):
+        return False
+    # No default cosine threshold here: cancellation can make the ideal sum
+    # zero while a valid BF16 reduction is nonzero. Honor explicit requests.
+    min_cos_sim = thresholds.get("min_cos_sim")
+    if min_cos_sim is not None:
+        a, b = actual.double().flatten(), ref.double().flatten()
+        denominator = torch.linalg.vector_norm(a) * torch.linalg.vector_norm(b)
+        cosine = (
+            (a @ b / denominator).item() if denominator else float(torch.equal(a, b))
+        )
+        if cosine < min_cos_sim:
+            return False
+    return True
 
 
 @torch.no_grad()
@@ -5306,6 +5543,8 @@ def _b12x_fused_moe_reference(
 
 cute_dsl_fused_moe_trace.reference = _cute_dsl_fused_moe_reference
 cute_dsl_moe_wrapper_run_trace.reference = _cute_dsl_fused_moe_reference
+cute_dsl_fused_moe_trace.check = _cute_dsl_moe_check
+cute_dsl_moe_wrapper_run_trace.check = _cute_dsl_moe_check
 b12x_fused_moe_trace.reference = _b12x_fused_moe_reference
 
 

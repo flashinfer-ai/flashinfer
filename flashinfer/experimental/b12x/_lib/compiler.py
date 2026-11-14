@@ -2535,20 +2535,20 @@ def _ensure_cute_compile_manifest(
 
 @contextmanager
 def _disk_cache_key_lock(cache_key: str):
-    try:
-        import fcntl
-    except ImportError:
-        yield
-        return
+    import _flashinfer_filelock as filelock
 
     lock_path = _cache_lock_path(cache_key)
-    _mkdir_durable(lock_path.parent)
-    with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    if os.name == "nt":
+        # The durable-directory helper requires Unix directory fsync support.
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        _mkdir_durable(lock_path.parent)
+    with open(lock_path, "a" if os.name == "nt" else "w") as lock_file:
+        filelock.lock(lock_file.fileno())
         try:
             yield
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            filelock.unlock(lock_file.fileno())
 
 
 def _load_cute_compile_from_disk(cache_key: str):

@@ -1,3 +1,4 @@
+# Copyright 2026 Co-developed by KDA (Kernel Design Agents)
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -167,7 +168,9 @@ def _launch_ptx_kda(
     output,
     prefill_workspace,
 ):
+    """Bind or reuse a stream-owned plan and apply the public output/state contract."""
     from .kda_kernels.ptx.kda_fwd_fused import prepare_kda_forward
+    from .kda_kernels.ptx.optimized_launch import OptimizedLaunch, supports
 
     capturing = torch.cuda.is_current_stream_capturing()
     explicit = prefill_workspace is not None
@@ -283,7 +286,10 @@ def _launch_ptx_kda(
                     if initial_state is None
                     else initial_state
                 )
-                plan = prepare_kda_forward(
+                prepare = (
+                    OptimizedLaunch if supports(q, offsets) else prepare_kda_forward
+                )
+                plan = prepare(
                     q,
                     k,
                     v,

@@ -256,6 +256,9 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
   float constexpr E4m3MaxVal{448.f};
 
   int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
+  // Scale block is 128 or 32 output elements; both are powers of two.
+  bool const sfBlockIsCta = params.deepSeekSfBlockSize == DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA;
+  int const sfBlockLog2 = sfBlockIsCta ? 7 : 5;
   // Loop over tokens
   float scale1Arr[NumTokensPerCta];
   float scale2Arr[NumTokensPerCta];
@@ -303,10 +306,11 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
           int64_t const baseIdx = (int64_t)permutedIdx * params.innerDim + hiddenIdx;
 
           int64_t const scale1Idx =
-              (int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
+              (int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * (hiddenIdx >> sfBlockLog2);
           int64_t const scale2Idx =
               (int64_t)permutedIdx +
-              (int64_t)totalNumPaddedTokens * ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
+              (int64_t)totalNumPaddedTokens *
+                  ((hiddenIdx >> sfBlockLog2) + ((params.innerDim / 2) >> sfBlockLog2));
 
           scale1Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale1Idx];
           scale2Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale2Idx];
@@ -327,13 +331,38 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
           absOutArr[tokenInCtaIdx] = fabsf(out);
         }
 
-        auto absOutPacked = packedTypeFromArray<PackedType, NumTokensPerCta>(absOutArr);
-        auto aMaxPacked = BlockReduce(tempStorage).Reduce(absOutPacked, MaxOp{});
-        auto aMaxArr = arrayFromPackedType<PackedType, NumTokensPerCta>(aMaxPacked);
+        if (sfBlockIsCta) {
+          // One 128-wide scale block per CTA. innerDim / 2 is a multiple of 128, so every
+          // thread reaches the CTA-wide reduction and barrier below.
+          auto absOutPacked = packedTypeFromArray<PackedType, NumTokensPerCta>(absOutArr);
+          auto aMaxPacked = BlockReduce(tempStorage).Reduce(absOutPacked, MaxOp{});
+          auto aMaxArr = arrayFromPackedType<PackedType, NumTokensPerCta>(aMaxPacked);
 
 #pragma unroll
-        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
-          if (threadIdx.x == 0) {
+          for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+            if (threadIdx.x == 0) {
+              auto const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
+              if (tokenIdx >= params.numTokens) {
+                break;
+              }
+              int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
+              if (permutedIdx == -1) {
+                continue;
+              }
+              // Make sure the scale is strictly positive to avoid division by zero in case the
+              // maximum is zero.
+              float scaleOut =
+                  fmaxf(aMaxArr[tokenInCtaIdx] / E4m3MaxVal, std::numeric_limits<float>::min());
+              s_scaleOutArr[tokenInCtaIdx] = scaleOut;
+              int64_t const scaleOut_idx = (int64_t)permutedIdxArr[tokenInCtaIdx] +
+                                           (int64_t)totalNumPaddedTokens * (hiddenIdx >> 7);
+              params.outDqSfsPtr[scaleOut_idx] = scaleOut;
+            }
+          }
+          __syncthreads();
+
+#pragma unroll
+          for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
             auto const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
             if (tokenIdx >= params.numTokens) {
               break;
@@ -342,31 +371,45 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
             if (permutedIdx == -1) {
               continue;
             }
-            // Make sure the scale is strictly positive to avoid division by zero in case the
-            // maximum is zero.
-            float scaleOut =
-                fmaxf(aMaxArr[tokenInCtaIdx] / E4m3MaxVal, std::numeric_limits<float>::min());
-            s_scaleOutArr[tokenInCtaIdx] = scaleOut;
-            int64_t const scaleOut_idx = (int64_t)permutedIdxArr[tokenInCtaIdx] +
-                                         (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
-            params.outDqSfsPtr[scaleOut_idx] = scaleOut;
+            float const scaleOut = s_scaleOutArr[tokenInCtaIdx];
+            int64_t const outIdx = (int64_t)permutedIdx * (params.innerDim / 2) + hiddenIdx;
+            params.outPtr[outIdx] = static_cast<Type>(outArr[tokenInCtaIdx] / scaleOut);
           }
-        }
-        __syncthreads();
-
+        } else {
+          // One 32-wide scale block per warp. innerDim / 2 is a multiple of 32 but not
+          // necessarily of 128, so a CTA may have idle warps: reduce with warp shuffles
+          // and never touch a CTA-wide barrier.
+          float scaleOutArr[NumTokensPerCta];
 #pragma unroll
-        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
-          auto const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
-          if (tokenIdx >= params.numTokens) {
-            break;
+          for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+            float aMax = absOutArr[tokenInCtaIdx];
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+              aMax = fmaxf(aMax, __shfl_xor_sync(0xffffffffu, aMax, offset));
+            }
+            scaleOutArr[tokenInCtaIdx] =
+                fmaxf(aMax / E4m3MaxVal, std::numeric_limits<float>::min());
           }
-          int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
-          if (permutedIdx == -1) {
-            continue;
+          int const laneIdx = threadIdx.x % 32;
+#pragma unroll
+          for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+            auto const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
+            if (tokenIdx >= params.numTokens) {
+              break;
+            }
+            int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
+            if (permutedIdx == -1) {
+              continue;
+            }
+            float const scaleOut = scaleOutArr[tokenInCtaIdx];
+            if (laneIdx == 0) {
+              int64_t const scaleOut_idx =
+                  (int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * (hiddenIdx >> 5);
+              params.outDqSfsPtr[scaleOut_idx] = scaleOut;
+            }
+            int64_t const outIdx = (int64_t)permutedIdx * (params.innerDim / 2) + hiddenIdx;
+            params.outPtr[outIdx] = static_cast<Type>(outArr[tokenInCtaIdx] / scaleOut);
           }
-          float const scaleOut = s_scaleOutArr[tokenInCtaIdx];
-          int64_t const outIdx = (int64_t)permutedIdx * (params.innerDim / 2) + hiddenIdx;
-          params.outPtr[outIdx] = static_cast<Type>(outArr[tokenInCtaIdx] / scaleOut);
         }
       }
     }
@@ -385,17 +428,20 @@ void run(Data const& data, void* stream) {
 
   if (data.mUseDeepSeekFp8) {
     constexpr int NUM_ELTS_PER_LOAD = 1;
-    constexpr int NUM_ELTS_PER_SF = 128;
+    constexpr int NUM_ELTS_PER_CTA = DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA;
+    FLASHINFER_CHECK(data.mDeepSeekSfBlockSize == 128 || data.mDeepSeekSfBlockSize == 32,
+                     "DeepSeek FP8 activation: scale block must be 128 or 32.");
 
     int device{-1};
     cudaGetDevice(&device);
     int numSms = 0;
     cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount, device);
 
-    // Output dimension is innerDim / 2, and each scale block is 128 elements
+    // Output dimension is innerDim / 2; each CTA covers 128 elements, i.e. one scale block
+    // at block 128 or four warp-owned blocks at block 32.
     int const outputDim = data.innerDim / 2;
-    int const numScaleBlocks = (outputDim + NUM_ELTS_PER_SF - 1) / NUM_ELTS_PER_SF;
-    int const gridSizeX = (numScaleBlocks + NUM_ELTS_PER_LOAD - 1) / NUM_ELTS_PER_LOAD;
+    int const numCtaBlocks = (outputDim + NUM_ELTS_PER_CTA - 1) / NUM_ELTS_PER_CTA;
+    int const gridSizeX = (numCtaBlocks + NUM_ELTS_PER_LOAD - 1) / NUM_ELTS_PER_LOAD;
 
     auto numCtas = gridSizeX * data.numTokens * data.topK;
     // FIXME: This is heruistic based on very short benchmark.
@@ -885,6 +931,15 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
   __shared__ ScalePackedType scaleArrSmem[MaxTopK / TopKUnrollFactor];
   __shared__ IdxPackedType permutedIdxArrSmem[MaxTopK / TopKUnrollFactor];
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // Wait on the primary kernel before reading anything another kernel wrote, including the
+  // routing outputs below. Under PDL this kernel can start before routing has finished: only
+  // this wait guarantees that their writes are visible.
+  if constexpr (KernelParams::UsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+
   for (int kChunkIdx = threadIdx.x; kChunkIdx < params.topK / TopKUnrollFactor;
        kChunkIdx += blockDim.x) {
     int const expandedIdx = tokenIdx * params.topK + kChunkIdx * TopKUnrollFactor;
@@ -903,12 +958,6 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
   auto* outElemPtr = reinterpret_cast<OutputElem*>(outputPtr);
   auto const* inElemPtr = reinterpret_cast<InputElem const*>(params.inPtr);
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  // wait on primary kernel when using PDL
-  if constexpr (KernelParams::UsePdl) {
-    cudaGridDependencySynchronize();
-  }
-#endif
   __syncthreads();
 
   auto const* inElemPtr2 = reinterpret_cast<InputElem const*>(params.inPtr2);
@@ -998,9 +1047,16 @@ __global__ void __launch_bounds__(SMALL_BATCH_FINALIZE_THREADS)
   }
 #endif
 
-  // The permutation and the expert weights come from routing, which completed before the GEMMs
-  // this kernel depends on could start, so they are read before waiting on the primary kernel
-  // (as in finalizeKernelVecLoad). Only the GEMM output is read after the wait.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // Wait on the primary kernel before reading anything another kernel wrote, including the
+  // permutation and expert weights from routing. Under PDL, the kernels before this one trigger
+  // early, so routing may still be running (or its writes not yet visible) when this kernel
+  // starts. Only this wait guarantees that their writes are visible.
+  if constexpr (KernelParams::UsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+
   int permutedIdx[SMALL_BATCH_FINALIZE_MAX_LOADS];
   float scale[SMALL_BATCH_FINALIZE_MAX_LOADS];
 #pragma unroll
@@ -1016,13 +1072,6 @@ __global__ void __launch_bounds__(SMALL_BATCH_FINALIZE_THREADS)
                      : 1.f;
     }
   }
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  // wait on primary kernel when using PDL
-  if constexpr (KernelParams::UsePdl) {
-    cudaGridDependencySynchronize();
-  }
-#endif
 
   ComputeElem acc;
   acc.fill(0.f);

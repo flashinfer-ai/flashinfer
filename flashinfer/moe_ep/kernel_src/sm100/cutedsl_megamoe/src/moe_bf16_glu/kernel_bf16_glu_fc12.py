@@ -26,10 +26,6 @@ from moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
     MoEFusedFc12SchedulerParams,
 )
 from moe_bf16_glu.custom_ext_bf16 import GluBf16Fc12SchedExtension
-from common.megamoe_constants import (
-    SupportedMmaTileM,
-    SupportedMmaTileN,
-)
 from common.host_utils import get_cutedsl_target_arch
 from moe_nvfp4_swapab.moe_utils import spin_wait
 
@@ -106,13 +102,12 @@ class Sm100SwigluBf16Fc12Kernel:
                 f"got {load_balance_mode!r}."
             )
 
-        # Only (M=256, N=256) with 2-CTA instructions is validated now.
-        m, n, _k = mma_tiler_mnk
-        if (m, n) != (256, 256) or not use_2cta_instrs:
+        if (use_stg_fc1 or generate_c) and (
+            mma_tiler_mnk[:2] != (256, 256) or not use_2cta_instrs
+        ):
             raise ValueError(
-                "Sm100SwigluBf16Fc12Kernel only supports mma_tiler (M, N) = "
-                "(256, 256) with use_2cta_instrs=True; "
-                f"got mma_tiler_mnk={mma_tiler_mnk}, use_2cta_instrs={use_2cta_instrs}."
+                "use_stg_fc1 and generate_c require mma_tiler (M, N) = "
+                "(256, 256) with use_2cta_instrs=True."
             )
 
         # Problem-shape store granularity: the fc1 STG path (use_stg_fc1)
@@ -220,25 +215,27 @@ class Sm100SwigluBf16Fc12Kernel:
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.arch)
 
     def _validate_mma_tiler_and_cluster_shape(self) -> None:
-        """Validate user-provided geometry against v1 fused-fc12 constraints.
+        """Validate the one- or two-CTA fused-fc12 geometry.
 
-        ``mma_tiler_n`` is restricted to {128, 256}.  Short-N is handled by
-        the fused-fc12 scheduler via subtile-level early-exit.
+        Each CTA owns 128 token rows: M=128 uses a one-CTA cluster and M=256
+        uses a two-CTA cluster. N is 128 or 256, with short-N handled by
+        subtile-level early-exit; K stages contain 64, 128 or 256 elements.
         """
         m, n, k = self.mma_tiler_mnk
         cm, cn = self.cluster_shape_mn
 
-        # Only cluster (2, 1) is validated: the epilogue / counter / dispatch
-        # math is derived for one 2-CTA instruction pair per cluster.
-        if (cm, cn) != (2, 1):
+        # The epilogue and ready counters share one MMA instruction group per
+        # cluster. Each CTA owns 128 token rows in either instruction mode.
+        expected_cluster = (2 if self.use_2cta_instrs else 1, 1)
+        if (cm, cn) != expected_cluster:
             raise ValueError(
-                f"Sm100SwigluBf16Fc12Kernel only supports cluster_shape "
-                f"(M, N) = (2, 1); got ({cm}, {cn})."
+                f"Sm100SwigluBf16Fc12Kernel requires cluster_shape "
+                f"(M, N) = {expected_cluster}; got ({cm}, {cn})."
             )
 
-        if m not in SupportedMmaTileM:
+        if m not in (128, 256):
             raise ValueError(
-                f"mma_tiler M ({m}) must be one of {SupportedMmaTileM}"
+                f"mma_tiler M ({m}) must be 128 or 256."
             )
 
         per_cta_m = m // (2 if self.use_2cta_instrs else 1)
@@ -248,13 +245,15 @@ class Sm100SwigluBf16Fc12Kernel:
                 f"(mma_tiler_m={m}, use_2cta_instrs={self.use_2cta_instrs})"
             )
 
-        if n not in SupportedMmaTileN:
+        if n not in (128, 256):
             raise ValueError(
-                f"mma_tiler N ({n}) must be one of {SupportedMmaTileN} in fused fc12 "
+                f"mma_tiler N ({n}) must be 128 or 256 in fused fc12 "
                 f"(short-N is handled via subtile-level early-exit)."
             )
 
-        # K is validated against the MMA instruction K in _setup_attributes.
+        if k not in (64, 128, 256):
+            raise ValueError(f"mma_tiler K ({k}) must be 64, 128 or 256.")
+        # _setup_attributes also checks the hardware MMA instruction K.
 
         if cm % (2 if self.use_2cta_instrs else 1) != 0:
             raise ValueError(
@@ -363,6 +362,9 @@ class Sm100SwigluBf16Fc12Kernel:
             use_stg_fc1=self.use_stg_fc1,
         )
         self.epilogue = GluBf16Epilogue(**_epi_common)
+        if getattr(self, "batch_invariant_chain", False):
+            self.epilogue.bind_batch_invariant_chain()
+            self.epilogue.batch_invariant_activation = getattr(self, "batch_invariant_activation", None)
 
         if self.num_sched_stages is None:
             self.num_sched_stages = 2
@@ -371,9 +373,9 @@ class Sm100SwigluBf16Fc12Kernel:
         # path writes each BF16 vector from registers to GMEM and has no sD
         # consumer, so do not reserve that SMEM; the freed bytes can become an
         # additional A+B mainloop stage.
-        self.num_d_stage = (
-            0 if self.use_stg_fc1 else self.epilogue.subtile_cnt
-        )
+        # Every epilogue warp owns one 32-token SMEM stage. The number of
+        # feature subtiles varies with N and does not count these stages.
+        self.num_d_stage = 0 if self.use_stg_fc1 else len(self.epilogue_warp_id)
         d_bytes_total = self.epilogue.bytes_per_stage * self.num_d_stage
         # Raw gate+up SMEM (ping-pong) — only when generate_c=True.
         c_bytes_total = 0
@@ -487,6 +489,13 @@ class Sm100SwigluBf16Fc12Kernel:
         num_ab_stage = (
             smem_capacity // occupancy - fixed_overhead
         ) // ab_bytes_per_stage
+        if num_ab_stage < 1:
+            raise ValueError(
+                f"BF16 MegaMoE tile {mma_tiler_mnk} requires at least one "
+                f"A/B pipeline stage ({ab_bytes_per_stage} bytes) after "
+                f"{fixed_overhead} bytes of fixed shared memory; "
+                f"only {smem_capacity // occupancy} bytes are available."
+            )
         num_a_stage = num_ab_stage
         num_b_stage = num_ab_stage
 
@@ -1237,7 +1246,7 @@ class Sm100SwigluBf16Fc12Kernel:
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
 
         # acc_fake layout: (MMA, MMA_M, MMA_N, STAGE).  The two acc stages
-        # tile TMEM back-to-back (2 x 256 cols = the full 512-col budget).
+        # tile TMEM back-to-back (2 x N cols, at most the 512-col budget).
         acc_fake = tiled_mma.make_fragment_C(
             cute.append(acc_shape, self.num_acc_stage)
         )

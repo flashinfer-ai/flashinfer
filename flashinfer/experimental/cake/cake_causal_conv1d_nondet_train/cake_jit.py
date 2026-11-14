@@ -923,8 +923,9 @@ MODULES: dict[str, dict[str, Any]] = {
     # Route ``fwd``: this package's copy of the det forward program
     # ``cake_causal_conv1d_det_train_8665d0756b8240ecb4d0`` (built with ``fast=True, sched="dynamic",
     # chunk_stages=2, pair_math=True``; the same kernel under this package's prefix, so ``y`` is bitwise the det
-    # program's); selected from C = 256 on sm_107a.  ``work`` holds the int32 token-chunk counters (two per
-    # channel tile), zero before the first launch and left zero by every launch.
+    # program's); selected from C = 256 and S = 65536 on sm_107a, and its channel band's copy from C = 2048 at every
+    # S (round 35).  ``work`` holds the int32 token-chunk counters (two per channel tile), zero before the first
+    # launch and left zero by every launch.
     "cake_causal_conv1d_train_8665d0756b8240ecb4d0": {
         "arches": [
             "sm_107a",
@@ -985,7 +986,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "channels": {
                 "sm_107a": 256,
             },
-            "kind": "channels_at_least",
+            "kind": "channels_tokens_at_least",
+            "tokens": {
+                "sm_107a": 65536,
+            },
         },
         "workspace_rule": {
             "kind": "tile_counters",
@@ -994,9 +998,10 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     # Route ``fwd_dt``: this package's copy of the det forward program
     # ``cake_causal_conv1d_det_train_176ebb3e14f7ad9c94dc`` (built with ``dtype_flags=True, fast=True,
-    # sched="dynamic", chunk_stages=2, pair_math=True``; the same kernel under this package's prefix, so ``y``
-    # is bitwise the det program's); selected from C = 512 on sm_107a.  ``work`` holds the int32 token-chunk
-    # counters (two per channel tile), zero before the first launch and left zero by every launch.
+    # sched="dynamic", chunk_stages=2, pair_math=True``; the same kernel under this package's prefix, so ``y`` is
+    # bitwise the det program's); selected from C = 512 and S = 65536 on sm_107a, and its channel band's copy from C
+    # = 2048 at every S (round 35).  ``work`` holds the int32 token-chunk counters (two per channel tile), zero
+    # before the first launch and left zero by every launch.
     "cake_causal_conv1d_train_176ebb3e14f7ad9c94dc": {
         "arches": [
             "sm_107a",
@@ -1059,7 +1064,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "channels": {
                 "sm_107a": 512,
             },
-            "kind": "channels_at_least",
+            "kind": "channels_tokens_at_least",
+            "tokens": {
+                "sm_107a": 65536,
+            },
         },
         "workspace_rule": {
             "kind": "tile_counters",
@@ -1067,10 +1075,11 @@ MODULES: dict[str, dict[str, Any]] = {
         },
     },
     # Route ``fwd_bias``: this package's copy of the det forward program
-    # ``cake_causal_conv1d_det_train_d829c95e1d610bc14b23`` (built with ``bias=True, dtype_flags=True,
-    # fast=True, sched="dynamic", chunk_stages=2, pair_math=True``; the same kernel under this package's prefix,
-    # so ``y`` is bitwise the det program's); selected from C = 1024 on sm_107a.  ``work`` holds the int32
-    # token-chunk counters (two per channel tile), zero before the first launch and left zero by every launch.
+    # ``cake_causal_conv1d_det_train_d829c95e1d610bc14b23`` (built with ``bias=True, dtype_flags=True, fast=True,
+    # sched="dynamic", chunk_stages=2, pair_math=True``; the same kernel under this package's prefix, so ``y`` is
+    # bitwise the det program's); selected from C = 1024 and S = 65536 on sm_107a, and its channel band's copy from
+    # C = 2048 at every S (round 35).  ``work`` holds the int32 token-chunk counters (two per channel tile), zero
+    # before the first launch and left zero by every launch.
     "cake_causal_conv1d_train_d829c95e1d610bc14b23": {
         "arches": [
             "sm_107a",
@@ -1134,6 +1143,233 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "channels": {
                 "sm_107a": 1024,
+            },
+            "kind": "channels_tokens_at_least",
+            "tokens": {
+                "sm_107a": 65536,
+            },
+        },
+        "workspace_rule": {
+            "kind": "tile_counters",
+            "words_per_tile": 2,
+        },
+    },
+    # This package's copy of the det forward channel-band program (round 35): the forward
+    # with fast, sched dynamic, chunk_stages 2, pair_math, c_band 2048
+    # (4 CTAs per SM); it runs when C >= select_rule.channels[arch] and no
+    # routed record of a higher threshold admits C; below every threshold the
+    # fallback record (no select_rule) runs.
+    "cake_causal_conv1d_train_d00a2892aa363564c673": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "y"],
+            ["buffer", "work"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 4,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_train_d00a2892aa363564c673",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_d00a2892aa363564c673",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 33920,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_d00a2892aa363564c673",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "search_steps": "search_steps",
+            "w": "w",
+            "work": "work",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "fwd",
+        "select_rule": {
+            "channels": {
+                "sm_107a": 2048,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "kind": "tile_counters",
+            "words_per_tile": 2,
+        },
+    },
+    # This package's copy of the det forward channel-band program (round 35): the forward
+    # with dtype_flags, fast, sched dynamic, chunk_stages 2, pair_math, c_band
+    # 2048
+    # (4 CTAs per SM); it runs when C >= select_rule.channels[arch] and no
+    # routed record of a higher threshold admits C; below every threshold the
+    # fallback record (no select_rule) runs.
+    "cake_causal_conv1d_train_6211cda590057b12f1a2": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "y"],
+            ["buffer", "work"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 4,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_train_6211cda590057b12f1a2",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_6211cda590057b12f1a2",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 33920,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_6211cda590057b12f1a2",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "search_steps": "search_steps",
+            "w": "w",
+            "work": "work",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "fwd",
+        "select_rule": {
+            "channels": {
+                "sm_107a": 2048,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "kind": "tile_counters",
+            "words_per_tile": 2,
+        },
+    },
+    # This package's copy of the det forward channel-band program (round 35): the forward
+    # with bias, dtype_flags, fast, sched dynamic, chunk_stages 2, pair_math,
+    # c_band 2048
+    # (4 CTAs per SM); it runs when C >= select_rule.channels[arch] and no
+    # routed record of a higher threshold admits C; below every threshold the
+    # fallback record (no select_rule) runs.
+    "cake_causal_conv1d_train_77af6383ff00b1cd047c": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "y"],
+            ["buffer", "b"],
+            ["buffer", "work"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 4,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_train_77af6383ff00b1cd047c",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_77af6383ff00b1cd047c",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 33920,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_77af6383ff00b1cd047c",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "b": "b",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "search_steps": "search_steps",
+            "w": "w",
+            "work": "work",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "fwd",
+        "select_rule": {
+            "channels": {
+                "sm_107a": 2048,
             },
             "kind": "channels_at_least",
         },
@@ -2620,14 +2856,17 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "fwd": [
             "cake_causal_conv1d_train_f5497330bfd286211643",
             "cake_causal_conv1d_train_8665d0756b8240ecb4d0",
+            "cake_causal_conv1d_train_d00a2892aa363564c673",
         ],
         "fwd_bias": [
             "cake_causal_conv1d_train_08880ca12e4064bc8cdb",
             "cake_causal_conv1d_train_d829c95e1d610bc14b23",
+            "cake_causal_conv1d_train_77af6383ff00b1cd047c",
         ],
         "fwd_dt": [
             "cake_causal_conv1d_train_9c1e7ee9f37e3102660e",
             "cake_causal_conv1d_train_176ebb3e14f7ad9c94dc",
+            "cake_causal_conv1d_train_6211cda590057b12f1a2",
         ],
     },
 }
@@ -3178,7 +3417,8 @@ def _lane_use(channel_vectors: int, width: int, threads: int) -> float:
 # workspace takes one ticket per tile (:func:`backward_workspace_bytes` covers
 # the largest tile count of every row, whatever ``S``).  Written by the exporter
 # from the backward kernel generator's table; every other channel count, route,
-# ``S`` and architecture keeps :func:`channel_split`.
+# ``S`` and architecture keeps :func:`channel_split` (or the tiles of a
+# :data:`NARROW_TILES` row).
 TILE_OVERRIDES: dict[str, dict[tuple[str, int], tuple[int, int, int]]] = {
     "sm_100a": {
         ("bwd_bias", 768): (32, 62585, 500680),
@@ -3277,6 +3517,87 @@ def override_tiles(arch: str, route: str, C: int, geometry: dict[str, int]) -> i
     return _override_split(int(entry[0]), C, geometry)[2]
 
 
+# The 32-vector channel tiles of the narrow single-tile backward rows, ``{arch:
+# {(route, C_lo, C_hi): (S_min, S_max)}}``: a backward call of ``route`` on
+# ``arch`` with ``C_lo <= C <= C_hi`` channels (a multiple of 8 without a
+# :data:`TILE_OVERRIDES` row) and ``S_min <= S <= S_max`` tokens runs
+# ``(32, 4, ceil(C / 8 / 32))`` tiles at 128 threads where
+# :func:`channel_split` plans one tile of every channel vector
+# (:func:`narrow_tile_row`).  As at the rows of :data:`TILE_OVERRIDES`, each
+# tile's accumulator words take the adds of fewer CTAs; ``dx`` does not depend
+# on the tiling.  The workspace takes one ticket per tile
+# (:func:`backward_workspace_bytes` covers the row's tiles, whatever ``S``).
+# Written by the exporter from the backward kernel generator's table; every
+# other channel count, route, ``S``, thread count and architecture keeps
+# :func:`tile_override`'s or :func:`channel_split`'s plan.
+NARROW_TILES: dict[str, dict[tuple[str, int, int], tuple[int, int]]] = {
+    "sm_100a": {
+        ("bwd", 224, 224): (31292, 500680),
+        ("bwd", 520, 624): (31292, 500680),
+        ("bwd", 632, 760): (31292, 500680),
+    },
+    "sm_103a": {
+        ("bwd", 224, 224): (31292, 500680),
+        ("bwd", 520, 624): (31292, 500680),
+        ("bwd", 632, 760): (31292, 500680),
+    },
+}
+
+# The narrow rows' tile: ``NARROW_CT_VEC`` channel vectors of a CTA of
+# ``NARROW_THREADS`` threads (other geometries keep their plan).
+NARROW_CT_VEC = 32
+NARROW_THREADS = 128
+
+
+def narrow_tile_range(arch: str, route: str, C: int) -> tuple[int, int] | None:
+    """The ``(S_min, S_max)`` of the :data:`NARROW_TILES` key of ``arch`` on
+    ``route`` covering ``C`` (``C_lo <= C <= C_hi``, ``C`` a multiple of 8,
+    the first such key), ``None`` without one or at a ``(route, C)`` of the
+    architecture's :data:`TILE_OVERRIDES` (whose rows :func:`tile_override`
+    plans)."""
+
+    C = int(C)
+    if C % CHANNEL_MULTIPLE or (route, C) in TILE_OVERRIDES.get(arch, {}):
+        return None
+    for (name, c_lo, c_hi), (s_min, s_max) in NARROW_TILES.get(arch, {}).items():
+        if name == route and int(c_lo) <= C <= int(c_hi):
+            return int(s_min), int(s_max)
+    return None
+
+
+def narrow_tile_row(arch: str, route: str, C: int, S: int) -> bool:
+    """Whether a backward call of ``route`` on ``arch`` with ``C`` channels and
+    ``S`` tokens is a row of :data:`NARROW_TILES` (:func:`narrow_tile_range`
+    holds ``S``, both bounds included)."""
+
+    bounds = narrow_tile_range(arch, route, C)
+    return bounds is not None and bounds[0] <= int(S) <= bounds[1]
+
+
+def _narrow_split(
+    arch: str, route: str, C: int, geometry: dict[str, int]
+) -> tuple[int, int, int] | None:
+    """The ``(ct_vec, n_sub, n_ch_tiles)`` of the :data:`NARROW_TILES` key
+    covering ``(arch, route, C)`` under ``geometry`` (``NARROW_CT_VEC``-vector
+    tiles at ``NARROW_THREADS`` threads), ``None`` without a key or at another
+    thread count."""
+
+    if int(geometry["threads"]) != NARROW_THREADS:
+        return None
+    if narrow_tile_range(arch, route, C) is None:
+        return None
+    return _override_split(NARROW_CT_VEC, C, geometry)
+
+
+def narrow_tiles(arch: str, route: str, C: int, geometry: dict[str, int]) -> int:
+    """The channel tiles of the :data:`NARROW_TILES` key covering ``(arch,
+    route, C)`` under ``geometry`` (0 without one), whatever ``S``: the
+    workspace bound of the row's launches."""
+
+    split = _narrow_split(arch, route, C, geometry)
+    return 0 if split is None else split[2]
+
+
 def plan(
     S: int,
     C: int,
@@ -3303,19 +3624,45 @@ def plan(
     the tensors of the call.  Given the backward record's ``arch`` and
     ``route`` (:func:`record_route`), a row of :data:`TILE_OVERRIDES`
     (:func:`tile_override`) replaces the split by ``(ct_vec, threads //
-    ct_vec, ceil(C / vec / ct_vec))``; without them, for the forward role and
-    under ``legacy`` the split is :func:`channel_split`'s.
+    ct_vec, ceil(C / vec / ct_vec))``, else a row of :data:`NARROW_TILES`
+    (:func:`narrow_tile_row`, at 128 threads) by ``(32, threads // 32, ceil(C
+    / vec / 32))``; without them, for the forward role and under ``legacy``
+    the split is :func:`channel_split`'s.
     """
 
     S, C, num_docs = int(S), int(C), int(num_docs)
     if S < 0 or num_docs < 0:
         raise ValueError(f"S and num_docs must be non-negative, got {(S, num_docs)}")
-    split = channel_split(C, geometry=geometry, role=role, legacy=legacy)
+    split = _plan_split(
+        S, C, geometry=geometry, role=role, legacy=legacy, arch=arch, route=route
+    )
+    return _plan_scalars(S, C, num_docs, split)
+
+
+def _plan_split(
+    S: int,
+    C: int,
+    *,
+    geometry: dict[str, int],
+    role: str | None = None,
+    legacy: bool = False,
+    arch: str | None = None,
+    route: str | None = None,
+) -> tuple[int, int, int]:
+    """:func:`plan`'s ``(ct_vec, n_sub, n_ch_tiles)`` of one call: for a
+    backward call given ``arch`` and ``route`` (not ``legacy``), the
+    :data:`TILE_OVERRIDES` row's split, else the :data:`NARROW_TILES` row's,
+    else :func:`channel_split`'s."""
+
     if role == "bwd" and not legacy and arch is not None and route is not None:
         override = tile_override(arch, route, C, S)
         if override is not None:
-            split = _override_split(override, C, geometry)
-    return _plan_scalars(S, C, num_docs, split)
+            return _override_split(override, C, geometry)
+        if narrow_tile_row(arch, route, C, S):
+            narrow = _narrow_split(arch, route, C, geometry)
+            if narrow is not None:
+                return narrow
+    return channel_split(C, geometry=geometry, role=role, legacy=legacy)
 
 
 def search_steps(num_docs: int) -> int:
@@ -3537,7 +3884,9 @@ def launch_grid(
     ``grid_mult`` times finer token streams, so a CTA that finds no free slot
     beside another stream's kernel trails by a short stream in a later wave.
     Given the call's ``C`` and ``S``, a single-wave launch of the rows
-    :func:`main_grid` names (its route, the record's plan) drops CTAs to whole
+    :func:`main_grid` names (its route, the call's plan: :func:`plan` with the
+    architecture and the record's route, so a row of :data:`TILE_OVERRIDES`
+    or :data:`NARROW_TILES` trims by its own tiles) drops CTAs to whole
     channel-tile ranks (the row is planned only where :func:`row_may_trim`
     holds).  Either grid is a pure function of ``(S, C, device)`` and the
     route; ``dx`` does not depend on it, and the accumulator workspace does
@@ -3553,8 +3902,14 @@ def launch_grid(
             co_resident = int(rule["ctas_per_sm"]) * sm_count(device_index)
             factor = grid_mult(record, arch)
             if row_may_trim(record, arch, co_resident, factor, int(C), int(S)):
-                ct_vec, _, n_ch_tiles = channel_split(
-                    C, geometry=rule["geometry"], role=record["role"]
+                route = record_route(record, arch)
+                ct_vec, _, n_ch_tiles = _plan_split(
+                    int(S),
+                    int(C),
+                    geometry=rule["geometry"],
+                    role=record["role"],
+                    arch=arch,
+                    route=route,
                 )
                 grid_x = main_grid(
                     co_resident,
@@ -3564,7 +3919,7 @@ def launch_grid(
                     n_ch_tiles=n_ch_tiles,
                     S=int(S),
                     ct_vec=ct_vec,
-                    route=record_route(record, arch),
+                    route=route,
                 )
     else:
         raise ValueError(
@@ -3583,7 +3938,8 @@ class RowPlan(NamedTuple):
     C: int
     # :func:`plan`'s ``(ct_vec, n_sub, n_ch_tiles)`` outside the override's token range.
     split: tuple[int, int, int]
-    # ``(S_min, S_max, split)`` of the record's :data:`TILE_OVERRIDES` row, ``None`` without one.
+    # ``(S_min, S_max, split)`` of the record's :data:`TILE_OVERRIDES` row, else of its :data:`NARROW_TILES` row (the
+    # two tables share no ``(route, C)``), ``None`` without one.
     override: tuple[int, int, tuple[int, int, int]] | None
     # The launch grid, ``None`` where :func:`launch_grid` may trim it by ``S`` (planned per call).
     grid: tuple[int, int, int] | None
@@ -3598,7 +3954,8 @@ def plan_row(
 
     ``S`` enters a call's host plan only through a token floor of the
     route's selection rules, the ``[S_min, S_max]`` range of the record's
-    :data:`TILE_OVERRIDES` row and the trim of :func:`launch_grid` (an
+    :data:`TILE_OVERRIDES` row or :data:`NARROW_TILES` row and the trim of
+    :func:`launch_grid` (an
     ``occupancy`` record at ``C % 32`` on the default grid), and ``num_docs``
     only through :func:`search_steps`; so with this row :func:`row_launch`
     returns what :func:`plan` and :func:`launch_grid` return for the call
@@ -3617,10 +3974,16 @@ def plan_row(
     split = channel_split(C, geometry=geometry, role=role)
     override = None
     if role == "bwd":
-        entry = TILE_OVERRIDES.get(arch, {}).get((record_route(record, arch), C))
+        route = record_route(record, arch)
+        entry = TILE_OVERRIDES.get(arch, {}).get((route, C))
         if entry is not None:
             ct_vec, s_min, s_max = (int(value) for value in entry)
             override = (s_min, s_max, _override_split(ct_vec, C, geometry))
+        else:
+            narrow = _narrow_split(arch, route, C, geometry)
+            if narrow is not None:
+                s_min, s_max = narrow_tile_range(arch, route, C)
+                override = (s_min, s_max, narrow)
     if bwd_grid_mult != 1:
         grid = (launch_grid(record, device_index=device_index)[0] * bwd_grid_mult, 1, 1)
     elif rule["kind"] == "occupancy" and C % 32:
@@ -3730,18 +4093,21 @@ def backward_workspace_bytes(arch: str, C: int) -> int:
 
     The largest :func:`accumulator_layout` over every backward program of every
     backward route of the architecture (each planned with its own geometry and
-    role, at the larger of :func:`channel_split`'s tile count and its route's
-    :func:`override_tiles`), so one zeroed buffer serves whichever program and
-    plan a call selects.  It depends on ``C`` and the architecture only (not on
-    ``S``, the SM count or the grid).
+    role, at the largest of :func:`channel_split`'s tile count, its route's
+    :func:`override_tiles` and its route's :func:`narrow_tiles`), so one zeroed
+    buffer serves whichever program and plan a call selects.  It depends on
+    ``C`` and the architecture only (not on ``S``, the SM count or the grid).
     """
 
     nbytes = 0
     for owner in workspace_owners(arch):
         geometry = owner["grid_rule"]["geometry"]
+        route = record_route(owner, arch)
         _, _, n_ch_tiles = channel_split(C, geometry=geometry, role=owner["role"])
         n_ch_tiles = max(
-            n_ch_tiles, override_tiles(arch, record_route(owner, arch), C, geometry)
+            n_ch_tiles,
+            override_tiles(arch, route, C, geometry),
+            narrow_tiles(arch, route, C, geometry),
         )
         nbytes = max(
             nbytes, int(accumulator_layout(owner, C, n_ch_tiles)["total_bytes"])

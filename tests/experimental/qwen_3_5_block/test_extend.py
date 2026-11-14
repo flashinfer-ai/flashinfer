@@ -7,7 +7,7 @@ cached step under ``set_sync_debug_mode("error")``."""
 import pytest
 import torch
 
-from tests.test_helpers.qwen_3_5_block_cases import PagedCase
+from tests.experimental.test_helpers.qwen_3_5_block_cases import PagedCase
 
 pytestmark = [pytest.mark.arch_rubin, pytest.mark.usefixtures("rubin")]
 
@@ -163,7 +163,9 @@ def test_extend_two_chunks_match_the_single_oracle():
         slots = torch.full((cap,), -1, dtype=torch.int32, device="cuda")
         h[:n] = full.h_full[0][0, lo:hi]
         pos = torch.arange(lo, hi, device="cuda")
-        from tests.test_helpers.qwen_3_5_block_reference import build_rope_tables
+        from tests.experimental.test_helpers.qwen_3_5_block_reference import (
+            build_rope_tables,
+        )
 
         c, s = build_rope_tables(
             n,
@@ -192,7 +194,7 @@ def test_extend_two_chunks_match_the_single_oracle():
         )
         torch.cuda.synchronize()
         outs.append(out[:n].clone())
-    from tests.test_helpers.qwen_3_5_block_reference import cosine
+    from tests.experimental.test_helpers.qwen_3_5_block_reference import cosine
 
     got = torch.cat(outs)
     c = cosine(got, ref.out[0])

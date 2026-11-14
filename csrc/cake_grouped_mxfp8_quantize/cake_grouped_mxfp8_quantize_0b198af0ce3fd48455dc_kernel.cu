@@ -61,10 +61,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 128
-
 #include <math_constants.h>
 
 __device__ __forceinline__ void mul_f32x2_noftz_inplace(float2* a, float2 b) {
@@ -130,7 +126,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                 }
                 unsigned int ahead = group + 3;
                 if (ahead < (unsigned int)gridDim.z) {
-                    unsigned int sparse_rows = (unsigned int)((unsigned long long)M * 3 / 12);
+                    unsigned int sparse_rows = (unsigned int)((unsigned long long)M * 3ull / 12ull);
                     int _vec_load_2[1];
                     {
                         _vec_load_2[0] = *reinterpret_cast<const int*>(mask + ahead);
@@ -154,7 +150,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                 unsigned int row = first_row;
                 unsigned long long global_row = (unsigned long long)group * (unsigned long long)M + (unsigned long long)row;
                 unsigned long long x_row = global_row * (unsigned long long)K;
-                unsigned long long q_row = global_row * (unsigned long long)((uint32_t)(BLOCKS_PER_ROW.divisor)) * 32;
+                unsigned long long q_row = global_row * (unsigned long long)((uint32_t)(BLOCKS_PER_ROW.divisor)) * 32ull;
                 #pragma unroll 1
                 for (unsigned int i = 0; i < ROWS; i++) {
                     if (row < valid_rows) {
@@ -191,7 +187,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                 uint32_t _iv_1_5;
                                 uint32_t _iv_1_6;
                                 uint32_t _iv_1_7;
-                                asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_iv_1_0), "=r"(_iv_1_1), "=r"(_iv_1_2), "=r"(_iv_1_3), "=r"(_iv_1_4), "=r"(_iv_1_5), "=r"(_iv_1_6), "=r"(_iv_1_7) : "l"((const void*)(x + (x_offset + 16) + (0))) : "memory");
+                                asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_iv_1_0), "=r"(_iv_1_1), "=r"(_iv_1_2), "=r"(_iv_1_3), "=r"(_iv_1_4), "=r"(_iv_1_5), "=r"(_iv_1_6), "=r"(_iv_1_7) : "l"((const void*)(x + (x_offset + 16ull) + (0))) : "memory");
                                 words[8 + 0] = (uint32_t)_iv_1_0;
                                 words[8 + 1] = (uint32_t)_iv_1_1;
                                 words[8 + 2] = (uint32_t)_iv_1_2;
@@ -207,186 +203,232 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                 words[word] = 0;
                             }
                         }
+                        uint32_t _abs_0;
 #if CAKE_PROGRAM_VARIANT == 1
-                        uint32_t _f16x2_abs_0;
-                        asm("abs.f16x2 %0, %1;" : "=r"(_f16x2_abs_0) : "r"(words[0]));
-                        uint32_t _f16x2_abs_16_0;
-                        asm("abs.f16x2 %0, %1;" : "=r"(_f16x2_abs_16_0) : "r"(words[1]));
-                        uint32_t _f16x2_max_0;
-                        asm("max.f16x2 %0, %1, %2;" : "=r"(_f16x2_max_0) : "r"(_f16x2_abs_0), "r"(_f16x2_abs_16_0));
-                        tree[0] = _f16x2_max_0;
-                        uint32_t _f16x2_abs_1;
-                        asm("abs.f16x2 %0, %1;" : "=r"(_f16x2_abs_1) : "r"(words[2]));
-                        uint32_t _f16x2_abs_16_1;
-                        asm("abs.f16x2 %0, %1;" : "=r"(_f16x2_abs_16_1) : "r"(words[3]));
-                        uint32_t _f16x2_max_1;
-                        asm("max.f16x2 %0, %1, %2;" : "=r"(_f16x2_max_1) : "r"(_f16x2_abs_1), "r"(_f16x2_abs_16_1));
-                        tree[1] = _f16x2_max_1;
-                        uint32_t _f16x2_abs_2;
-                        asm("abs.f16x2 %0, %1;" : "=r"(_f16x2_abs_2) : "r"(words[4]));
-                        uint32_t _f16x2_abs_16_2;
-                        asm("abs.f16x2 %0, %1;" : "=r"(_f16x2_abs_16_2) : "r"(words[5]));
-                        uint32_t _f16x2_max_2;
-                        asm("max.f16x2 %0, %1, %2;" : "=r"(_f16x2_max_2) : "r"(_f16x2_abs_2), "r"(_f16x2_abs_16_2));
-                        tree[2] = _f16x2_max_2;
-                        uint32_t _f16x2_abs_3;
-                        asm("abs.f16x2 %0, %1;" : "=r"(_f16x2_abs_3) : "r"(words[6]));
-                        uint32_t _f16x2_abs_16_3;
-                        asm("abs.f16x2 %0, %1;" : "=r"(_f16x2_abs_16_3) : "r"(words[7]));
-                        uint32_t _f16x2_max_3;
-                        asm("max.f16x2 %0, %1, %2;" : "=r"(_f16x2_max_3) : "r"(_f16x2_abs_3), "r"(_f16x2_abs_16_3));
-                        tree[3] = _f16x2_max_3;
-                        uint32_t _f16x2_abs_4;
-                        asm("abs.f16x2 %0, %1;" : "=r"(_f16x2_abs_4) : "r"(words[8]));
-                        uint32_t _f16x2_abs_16_4;
-                        asm("abs.f16x2 %0, %1;" : "=r"(_f16x2_abs_16_4) : "r"(words[9]));
-                        uint32_t _f16x2_max_4;
-                        asm("max.f16x2 %0, %1, %2;" : "=r"(_f16x2_max_4) : "r"(_f16x2_abs_4), "r"(_f16x2_abs_16_4));
-                        tree[4] = _f16x2_max_4;
-                        uint32_t _f16x2_abs_5;
-                        asm("abs.f16x2 %0, %1;" : "=r"(_f16x2_abs_5) : "r"(words[10]));
-                        uint32_t _f16x2_abs_16_5;
-                        asm("abs.f16x2 %0, %1;" : "=r"(_f16x2_abs_16_5) : "r"(words[11]));
-                        uint32_t _f16x2_max_5;
-                        asm("max.f16x2 %0, %1, %2;" : "=r"(_f16x2_max_5) : "r"(_f16x2_abs_5), "r"(_f16x2_abs_16_5));
-                        tree[5] = _f16x2_max_5;
-                        uint32_t _f16x2_abs_6;
-                        asm("abs.f16x2 %0, %1;" : "=r"(_f16x2_abs_6) : "r"(words[12]));
-                        uint32_t _f16x2_abs_16_6;
-                        asm("abs.f16x2 %0, %1;" : "=r"(_f16x2_abs_16_6) : "r"(words[13]));
-                        uint32_t _f16x2_max_6;
-                        asm("max.f16x2 %0, %1, %2;" : "=r"(_f16x2_max_6) : "r"(_f16x2_abs_6), "r"(_f16x2_abs_16_6));
-                        tree[6] = _f16x2_max_6;
-                        uint32_t _f16x2_abs_7;
-                        asm("abs.f16x2 %0, %1;" : "=r"(_f16x2_abs_7) : "r"(words[14]));
-                        uint32_t _f16x2_abs_16_7;
-                        asm("abs.f16x2 %0, %1;" : "=r"(_f16x2_abs_16_7) : "r"(words[15]));
-                        uint32_t _f16x2_max_7;
-                        asm("max.f16x2 %0, %1, %2;" : "=r"(_f16x2_max_7) : "r"(_f16x2_abs_7), "r"(_f16x2_abs_16_7));
-                        tree[7] = _f16x2_max_7;
-                        uint32_t _f16x2_max_8;
-                        asm("max.f16x2 %0, %1, %2;" : "=r"(_f16x2_max_8) : "r"(tree[0]), "r"(tree[1]));
-                        tree[0] = _f16x2_max_8;
-                        uint32_t _f16x2_max_9;
-                        asm("max.f16x2 %0, %1, %2;" : "=r"(_f16x2_max_9) : "r"(tree[2]), "r"(tree[3]));
-                        tree[1] = _f16x2_max_9;
-                        uint32_t _f16x2_max_10;
-                        asm("max.f16x2 %0, %1, %2;" : "=r"(_f16x2_max_10) : "r"(tree[4]), "r"(tree[5]));
-                        tree[2] = _f16x2_max_10;
-                        uint32_t _f16x2_max_11;
-                        asm("max.f16x2 %0, %1, %2;" : "=r"(_f16x2_max_11) : "r"(tree[6]), "r"(tree[7]));
-                        tree[3] = _f16x2_max_11;
-                        uint32_t _f16x2_max_12;
-                        asm("max.f16x2 %0, %1, %2;" : "=r"(_f16x2_max_12) : "r"(tree[0]), "r"(tree[1]));
-                        tree[0] = _f16x2_max_12;
-                        uint32_t _f16x2_max_13;
-                        asm("max.f16x2 %0, %1, %2;" : "=r"(_f16x2_max_13) : "r"(tree[2]), "r"(tree[3]));
-                        tree[1] = _f16x2_max_13;
-                        uint32_t _f16x2_max_14;
-                        asm("max.f16x2 %0, %1, %2;" : "=r"(_f16x2_max_14) : "r"(tree[0]), "r"(tree[1]));
-                        tree[0] = _f16x2_max_14;
-                        uint32_t _f16x2_max_15;
-                        asm("max.f16x2 %0, %1, %2;" : "=r"(_f16x2_max_15) : "r"(tree[0]), "r"(tree[0] >> 16));
-                        tree[0] = _f16x2_max_15;
+                        asm("abs.f16x2 %0, %1;" : "=r"(_abs_0) : "r"(words[0]));
+#else
+                        asm("abs.bf16x2 %0, %1;" : "=r"(_abs_0) : "r"(words[0]));
+#endif
+                        uint32_t _abs_16_0;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("abs.f16x2 %0, %1;" : "=r"(_abs_16_0) : "r"(words[1]));
+#else
+                        asm("abs.bf16x2 %0, %1;" : "=r"(_abs_16_0) : "r"(words[1]));
+#endif
+                        uint32_t _max_0;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("max.f16x2 %0, %1, %2;" : "=r"(_max_0) : "r"(_abs_0), "r"(_abs_16_0));
+#else
+                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_max_0) : "r"(_abs_0), "r"(_abs_16_0));
+#endif
+                        tree[0] = _max_0;
+                        uint32_t _abs_1;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("abs.f16x2 %0, %1;" : "=r"(_abs_1) : "r"(words[2]));
+#else
+                        asm("abs.bf16x2 %0, %1;" : "=r"(_abs_1) : "r"(words[2]));
+#endif
+                        uint32_t _abs_16_1;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("abs.f16x2 %0, %1;" : "=r"(_abs_16_1) : "r"(words[3]));
+#else
+                        asm("abs.bf16x2 %0, %1;" : "=r"(_abs_16_1) : "r"(words[3]));
+#endif
+                        uint32_t _max_1;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("max.f16x2 %0, %1, %2;" : "=r"(_max_1) : "r"(_abs_1), "r"(_abs_16_1));
+#else
+                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_max_1) : "r"(_abs_1), "r"(_abs_16_1));
+#endif
+                        tree[1] = _max_1;
+                        uint32_t _abs_2;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("abs.f16x2 %0, %1;" : "=r"(_abs_2) : "r"(words[4]));
+#else
+                        asm("abs.bf16x2 %0, %1;" : "=r"(_abs_2) : "r"(words[4]));
+#endif
+                        uint32_t _abs_16_2;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("abs.f16x2 %0, %1;" : "=r"(_abs_16_2) : "r"(words[5]));
+#else
+                        asm("abs.bf16x2 %0, %1;" : "=r"(_abs_16_2) : "r"(words[5]));
+#endif
+                        uint32_t _max_2;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("max.f16x2 %0, %1, %2;" : "=r"(_max_2) : "r"(_abs_2), "r"(_abs_16_2));
+#else
+                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_max_2) : "r"(_abs_2), "r"(_abs_16_2));
+#endif
+                        tree[2] = _max_2;
+                        uint32_t _abs_3;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("abs.f16x2 %0, %1;" : "=r"(_abs_3) : "r"(words[6]));
+#else
+                        asm("abs.bf16x2 %0, %1;" : "=r"(_abs_3) : "r"(words[6]));
+#endif
+                        uint32_t _abs_16_3;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("abs.f16x2 %0, %1;" : "=r"(_abs_16_3) : "r"(words[7]));
+#else
+                        asm("abs.bf16x2 %0, %1;" : "=r"(_abs_16_3) : "r"(words[7]));
+#endif
+                        uint32_t _max_3;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("max.f16x2 %0, %1, %2;" : "=r"(_max_3) : "r"(_abs_3), "r"(_abs_16_3));
+#else
+                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_max_3) : "r"(_abs_3), "r"(_abs_16_3));
+#endif
+                        tree[3] = _max_3;
+                        uint32_t _abs_4;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("abs.f16x2 %0, %1;" : "=r"(_abs_4) : "r"(words[8]));
+#else
+                        asm("abs.bf16x2 %0, %1;" : "=r"(_abs_4) : "r"(words[8]));
+#endif
+                        uint32_t _abs_16_4;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("abs.f16x2 %0, %1;" : "=r"(_abs_16_4) : "r"(words[9]));
+#else
+                        asm("abs.bf16x2 %0, %1;" : "=r"(_abs_16_4) : "r"(words[9]));
+#endif
+                        uint32_t _max_4;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("max.f16x2 %0, %1, %2;" : "=r"(_max_4) : "r"(_abs_4), "r"(_abs_16_4));
+#else
+                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_max_4) : "r"(_abs_4), "r"(_abs_16_4));
+#endif
+                        tree[4] = _max_4;
+                        uint32_t _abs_5;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("abs.f16x2 %0, %1;" : "=r"(_abs_5) : "r"(words[10]));
+#else
+                        asm("abs.bf16x2 %0, %1;" : "=r"(_abs_5) : "r"(words[10]));
+#endif
+                        uint32_t _abs_16_5;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("abs.f16x2 %0, %1;" : "=r"(_abs_16_5) : "r"(words[11]));
+#else
+                        asm("abs.bf16x2 %0, %1;" : "=r"(_abs_16_5) : "r"(words[11]));
+#endif
+                        uint32_t _max_5;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("max.f16x2 %0, %1, %2;" : "=r"(_max_5) : "r"(_abs_5), "r"(_abs_16_5));
+#else
+                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_max_5) : "r"(_abs_5), "r"(_abs_16_5));
+#endif
+                        tree[5] = _max_5;
+                        uint32_t _abs_6;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("abs.f16x2 %0, %1;" : "=r"(_abs_6) : "r"(words[12]));
+#else
+                        asm("abs.bf16x2 %0, %1;" : "=r"(_abs_6) : "r"(words[12]));
+#endif
+                        uint32_t _abs_16_6;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("abs.f16x2 %0, %1;" : "=r"(_abs_16_6) : "r"(words[13]));
+#else
+                        asm("abs.bf16x2 %0, %1;" : "=r"(_abs_16_6) : "r"(words[13]));
+#endif
+                        uint32_t _max_6;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("max.f16x2 %0, %1, %2;" : "=r"(_max_6) : "r"(_abs_6), "r"(_abs_16_6));
+#else
+                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_max_6) : "r"(_abs_6), "r"(_abs_16_6));
+#endif
+                        tree[6] = _max_6;
+                        uint32_t _abs_7;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("abs.f16x2 %0, %1;" : "=r"(_abs_7) : "r"(words[14]));
+#else
+                        asm("abs.bf16x2 %0, %1;" : "=r"(_abs_7) : "r"(words[14]));
+#endif
+                        uint32_t _abs_16_7;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("abs.f16x2 %0, %1;" : "=r"(_abs_16_7) : "r"(words[15]));
+#else
+                        asm("abs.bf16x2 %0, %1;" : "=r"(_abs_16_7) : "r"(words[15]));
+#endif
+                        uint32_t _max_7;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("max.f16x2 %0, %1, %2;" : "=r"(_max_7) : "r"(_abs_7), "r"(_abs_16_7));
+#else
+                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_max_7) : "r"(_abs_7), "r"(_abs_16_7));
+#endif
+                        tree[7] = _max_7;
+                        uint32_t _max_8;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("max.f16x2 %0, %1, %2;" : "=r"(_max_8) : "r"(tree[0]), "r"(tree[1]));
+#else
+                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_max_8) : "r"(tree[0]), "r"(tree[1]));
+#endif
+                        tree[0] = _max_8;
+                        uint32_t _max_9;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("max.f16x2 %0, %1, %2;" : "=r"(_max_9) : "r"(tree[2]), "r"(tree[3]));
+#else
+                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_max_9) : "r"(tree[2]), "r"(tree[3]));
+#endif
+                        tree[1] = _max_9;
+                        uint32_t _max_10;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("max.f16x2 %0, %1, %2;" : "=r"(_max_10) : "r"(tree[4]), "r"(tree[5]));
+#else
+                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_max_10) : "r"(tree[4]), "r"(tree[5]));
+#endif
+                        tree[2] = _max_10;
+                        uint32_t _max_11;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("max.f16x2 %0, %1, %2;" : "=r"(_max_11) : "r"(tree[6]), "r"(tree[7]));
+#else
+                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_max_11) : "r"(tree[6]), "r"(tree[7]));
+#endif
+                        tree[3] = _max_11;
+                        uint32_t _max_12;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("max.f16x2 %0, %1, %2;" : "=r"(_max_12) : "r"(tree[0]), "r"(tree[1]));
+#else
+                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_max_12) : "r"(tree[0]), "r"(tree[1]));
+#endif
+                        tree[0] = _max_12;
+                        uint32_t _max_13;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("max.f16x2 %0, %1, %2;" : "=r"(_max_13) : "r"(tree[2]), "r"(tree[3]));
+#else
+                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_max_13) : "r"(tree[2]), "r"(tree[3]));
+#endif
+                        tree[1] = _max_13;
+                        uint32_t _max_14;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("max.f16x2 %0, %1, %2;" : "=r"(_max_14) : "r"(tree[0]), "r"(tree[1]));
+#else
+                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_max_14) : "r"(tree[0]), "r"(tree[1]));
+#endif
+                        tree[0] = _max_14;
+                        uint32_t _max_15;
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm("max.f16x2 %0, %1, %2;" : "=r"(_max_15) : "r"(tree[0]), "r"(tree[0] >> 16));
+#else
+                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_max_15) : "r"(tree[0]), "r"(tree[0] >> 16));
+#endif
+                        tree[0] = _max_15;
+#if CAKE_PROGRAM_VARIANT == 1
                         float _cvt_f32_f16_2;
                         asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_2) : "h"((uint16_t)(tree[0] & 65535)));
                         unsigned int magnitude = __as_u32(_cvt_f32_f16_2) & 2147483647;
 #else
-                        uint32_t _bf16x2_abs_0;
-                        asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_0) : "r"(words[0]));
-                        uint32_t _bf16x2_abs_16_0;
-                        asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_16_0) : "r"(words[1]));
-                        uint32_t _bf16x2_max_0;
-                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_0) : "r"(_bf16x2_abs_0), "r"(_bf16x2_abs_16_0));
-                        tree[0] = _bf16x2_max_0;
-                        uint32_t _bf16x2_abs_1;
-                        asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_1) : "r"(words[2]));
-                        uint32_t _bf16x2_abs_16_1;
-                        asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_16_1) : "r"(words[3]));
-                        uint32_t _bf16x2_max_1;
-                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_1) : "r"(_bf16x2_abs_1), "r"(_bf16x2_abs_16_1));
-                        tree[1] = _bf16x2_max_1;
-                        uint32_t _bf16x2_abs_2;
-                        asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_2) : "r"(words[4]));
-                        uint32_t _bf16x2_abs_16_2;
-                        asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_16_2) : "r"(words[5]));
-                        uint32_t _bf16x2_max_2;
-                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_2) : "r"(_bf16x2_abs_2), "r"(_bf16x2_abs_16_2));
-                        tree[2] = _bf16x2_max_2;
-                        uint32_t _bf16x2_abs_3;
-                        asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_3) : "r"(words[6]));
-                        uint32_t _bf16x2_abs_16_3;
-                        asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_16_3) : "r"(words[7]));
-                        uint32_t _bf16x2_max_3;
-                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_3) : "r"(_bf16x2_abs_3), "r"(_bf16x2_abs_16_3));
-                        tree[3] = _bf16x2_max_3;
-                        uint32_t _bf16x2_abs_4;
-                        asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_4) : "r"(words[8]));
-                        uint32_t _bf16x2_abs_16_4;
-                        asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_16_4) : "r"(words[9]));
-                        uint32_t _bf16x2_max_4;
-                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_4) : "r"(_bf16x2_abs_4), "r"(_bf16x2_abs_16_4));
-                        tree[4] = _bf16x2_max_4;
-                        uint32_t _bf16x2_abs_5;
-                        asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_5) : "r"(words[10]));
-                        uint32_t _bf16x2_abs_16_5;
-                        asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_16_5) : "r"(words[11]));
-                        uint32_t _bf16x2_max_5;
-                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_5) : "r"(_bf16x2_abs_5), "r"(_bf16x2_abs_16_5));
-                        tree[5] = _bf16x2_max_5;
-                        uint32_t _bf16x2_abs_6;
-                        asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_6) : "r"(words[12]));
-                        uint32_t _bf16x2_abs_16_6;
-                        asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_16_6) : "r"(words[13]));
-                        uint32_t _bf16x2_max_6;
-                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_6) : "r"(_bf16x2_abs_6), "r"(_bf16x2_abs_16_6));
-                        tree[6] = _bf16x2_max_6;
-                        uint32_t _bf16x2_abs_7;
-                        asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_7) : "r"(words[14]));
-                        uint32_t _bf16x2_abs_16_7;
-                        asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_16_7) : "r"(words[15]));
-                        uint32_t _bf16x2_max_7;
-                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_7) : "r"(_bf16x2_abs_7), "r"(_bf16x2_abs_16_7));
-                        tree[7] = _bf16x2_max_7;
-                        uint32_t _bf16x2_max_8;
-                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_8) : "r"(tree[0]), "r"(tree[1]));
-                        tree[0] = _bf16x2_max_8;
-                        uint32_t _bf16x2_max_9;
-                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_9) : "r"(tree[2]), "r"(tree[3]));
-                        tree[1] = _bf16x2_max_9;
-                        uint32_t _bf16x2_max_10;
-                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_10) : "r"(tree[4]), "r"(tree[5]));
-                        tree[2] = _bf16x2_max_10;
-                        uint32_t _bf16x2_max_11;
-                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_11) : "r"(tree[6]), "r"(tree[7]));
-                        tree[3] = _bf16x2_max_11;
-                        uint32_t _bf16x2_max_12;
-                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_12) : "r"(tree[0]), "r"(tree[1]));
-                        tree[0] = _bf16x2_max_12;
-                        uint32_t _bf16x2_max_13;
-                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_13) : "r"(tree[2]), "r"(tree[3]));
-                        tree[1] = _bf16x2_max_13;
-                        uint32_t _bf16x2_max_14;
-                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_14) : "r"(tree[0]), "r"(tree[1]));
-                        tree[0] = _bf16x2_max_14;
-                        uint32_t _bf16x2_max_15;
-                        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_15) : "r"(tree[0]), "r"(tree[0] >> 16));
-                        tree[0] = _bf16x2_max_15;
                         unsigned int magnitude = tree[0] << 16 & 2147483647;
 #endif
                         int shifted = (int)(magnitude - 65011713) >> 23;
 #if CAKE_PROGRAM_VARIANT == 1
-                        int _max_3 = ((shifted) > (0) ? (shifted) : (0));
-                        unsigned int finite_byte = (unsigned int)_max_3;
+                        int _max_3_1 = ((shifted) > (0) ? (shifted) : (0));
+                        unsigned int finite_byte = (unsigned int)_max_3_1;
 #else
-                        int _max_2 = ((shifted) > (0) ? (shifted) : (0));
-                        unsigned int finite_byte = (unsigned int)_max_2;
+                        int _max_2_1 = ((shifted) > (0) ? (shifted) : (0));
+                        unsigned int finite_byte = (unsigned int)_max_2_1;
 #endif
                         unsigned int saturated_byte = 254;
                         unsigned int scale_byte = ((magnitude > 2139095039) ? saturated_byte : finite_byte);
-                        unsigned int inverse_nonzero_bits = 254 - scale_byte << 23;
-                        unsigned int zero_bits = 0;
-                        unsigned int inverse_bits = ((scale_byte == 0) ? zero_bits : inverse_nonzero_bits);
+                        unsigned int inverse_bits = 254 - scale_byte << 23;
                         float inverse = 0.0f;
                         inverse = reinterpret_cast<float*>(&inverse_bits)[0];
                         #pragma unroll
@@ -830,12 +872,12 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                         unsigned int k_tile = _fast_div_r_0 / 4;
                         unsigned int scale_col = _fast_div_r_0 - k_tile * 4;
                         unsigned long long tile_linear = ((unsigned long long)group * (unsigned long long)PM_TILES + (unsigned long long)m_tile) * (unsigned long long)PK_TILES + (unsigned long long)k_tile;
-                        unsigned long long scale_offset = tile_linear * 512 + (unsigned long long)(row_in_tile & 31) * 16 + (unsigned long long)(row_in_tile >> 5) * 4 + (unsigned long long)scale_col;
+                        unsigned long long scale_offset = tile_linear * 512ull + (unsigned long long)(row_in_tile & 31) * 16ull + (unsigned long long)(row_in_tile >> 5) * 4ull + (unsigned long long)scale_col;
                         *(reinterpret_cast<unsigned char*>(scales + scale_offset) + (0)) = (unsigned char)(scale_byte);
                     }
                     row = row + SUBROWS;
                     x_row = x_row + (unsigned long long)SUBROWS * (unsigned long long)K;
-                    q_row = q_row + (unsigned long long)SUBROWS * (unsigned long long)((uint32_t)(BLOCKS_PER_ROW.divisor)) * 32;
+                    q_row = q_row + (unsigned long long)SUBROWS * (unsigned long long)((uint32_t)(BLOCKS_PER_ROW.divisor)) * 32ull;
                 }
             }
         }

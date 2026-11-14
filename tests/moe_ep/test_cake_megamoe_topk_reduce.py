@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from flashinfer.jit import cake_megamoe_topk_reduce as reducer
-from tests.test_helpers.cake_profiler import cuda_kernel_names
+from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
 _ARCHS = ("sm_100a", "sm_103a", "sm_107a")
 _CAPABILITIES = {"sm_100a": (10, 0), "sm_103a": (10, 3), "sm_107a": (10, 7)}
@@ -75,6 +75,83 @@ _TIER_EDGES = (
     *(48, 49, 64, 65, 96, 97, 192, 193),
     *(212, 213, 256, 257, 1024, 1025, 2048, 2049),
 )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("id_dtype", (torch.int32, torch.int64))
+@pytest.mark.parametrize("top_k", (1, 6, 32))
+def test_batch_invariant_ordered_masked_fold(id_dtype, top_k):
+    if (
+        not torch.cuda.is_available()
+        or torch.cuda.get_device_capability() not in _CAPABILITIES.values()
+    ):
+        pytest.skip("requires SM100/SM103/SM107")
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+
+    import flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe  # noqa: F401
+    from moe_nvfp4_swapab.topk_reduce import TopkReduce
+    from src.token_comm import CombineFormat
+
+    # Every BF16 code appears, including +/-0, subnormals, infinities and all
+    # NaN encodings. Other slots expose cancellation and stale masked cells.
+    codes = (
+        torch.arange(65536, dtype=torch.int32, device="cuda")
+        .to(torch.int16)
+        .view(torch.bfloat16)
+        .view(16, 4096)
+    )
+    partials = codes[:, None, :].repeat(1, top_k, 1)
+    ids = torch.zeros(16, top_k, device="cuda", dtype=id_dtype)
+    if top_k > 1:
+        partials[:, 1] = -partials[:, 1]
+    if top_k > 2:
+        ids[::2, 2] = -1
+        ids[1::2, 2] = 8
+        partials[:, 2] = float("nan")
+    expected = torch.empty_like(codes)
+    output = torch.empty_like(codes)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    args = tuple(from_dlpack(t) for t in (partials, expected, ids))
+    reference = TopkReduce(
+        4096, top_k, CombineFormat.parse("bf16"), num_experts=8, batch_invariant=True
+    )
+    compiled = cute.compile(
+        reference, args[0], None, args[1], None, stream, topk_indices=args[2]
+    )
+    compiled(args[0], None, args[1], None, stream, topk_indices=args[2])
+    reducer.run_cake_megamoe_topk_reduce(
+        partials, output, 16, batch_invariant=True, topk_ids=ids, num_experts=8
+    )
+    assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
+    # Independently reproduce the ordered finite fold with one FP32 add per
+    # slot; torch.sum is deliberately avoided because it may reassociate.
+    acc = torch.zeros_like(codes, dtype=torch.float32)
+    for slot in range(top_k):
+        valid = (ids[:, slot] >= 0) & (ids[:, slot] < 8)
+        value = torch.where(valid[:, None], partials[:, slot], 0).float()
+        acc = acc + value
+    finite = torch.isfinite(acc)
+    assert torch.equal(
+        output[finite].view(torch.int16),
+        acc.to(torch.bfloat16)[finite].view(torch.int16),
+    )
+    # A graph replay reads changed payloads/IDs; masked NaNs cannot leak.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        reducer.run_cake_megamoe_topk_reduce(
+            partials, output, 16, batch_invariant=True, topk_ids=ids, num_experts=8
+        )
+    ids.fill_(-1)
+    partials.fill_(float("nan"))
+    graph.replay()
+    assert torch.count_nonzero(output.view(torch.int16)) == 0
+    output.fill_(1)
+    reducer.run_cake_megamoe_topk_reduce(
+        partials, output, 0, batch_invariant=True, topk_ids=ids, num_experts=8
+    )
+    assert torch.all(output == 1)
 
 
 def _expected_kernel(arch: str, num_tokens: int) -> str:
@@ -161,9 +238,9 @@ def test_unknown_arch_is_rejected():
 def test_module_uri_is_arch_specific():
     uris = {arch: reducer.get_cake_megamoe_topk_reduce_uri(arch) for arch in _ARCHS}
     assert uris == {
-        "sm_100a": "cake_megamoe_topk_reduce_sm100a",
-        "sm_103a": "cake_megamoe_topk_reduce_sm103a",
-        "sm_107a": "cake_megamoe_topk_reduce_sm107a",
+        "sm_100a": "cake_megamoe_topk_reduce_v2_sm100a",
+        "sm_103a": "cake_megamoe_topk_reduce_v2_sm103a",
+        "sm_107a": "cake_megamoe_topk_reduce_v2_sm107a",
     }
 
 

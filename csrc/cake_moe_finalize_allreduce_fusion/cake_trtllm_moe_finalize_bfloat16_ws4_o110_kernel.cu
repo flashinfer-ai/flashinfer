@@ -112,7 +112,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110(__nv_bfloat16* __restrict__ al
     long long control_address = workspace_tensor[12];
     int* control_0 = reinterpret_cast<int*>(control_address);
     int control_bytes_per_buffer_word = control_0[3];
-    long long comm_stride_elems = (long long)control_bytes_per_buffer_word / 2;
+    long long comm_stride_elems = (long long)control_bytes_per_buffer_word / 2ll;
     long long workspace_address = workspace_tensor[8 + rank];
     __nv_bfloat16* workspace_local = reinterpret_cast<__nv_bfloat16*>(workspace_address);
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -220,7 +220,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110(__nv_bfloat16* __restrict__ al
                 next_index_qd = _vec_load_7[0];
             }
             if (route_index_qa >= 0) {
-                long long expert_elem = (long long)route_index_qa * 7168 + (long long)(cluster_thread * 8);
+                long long expert_elem = (long long)route_index_qa * 7168ll + (long long)(cluster_thread * 8);
                 unsigned int _vec_load_8[4];
                 {
                     uint4 _uv4_0 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem + 0);
@@ -241,7 +241,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110(__nv_bfloat16* __restrict__ al
                 route_scales[0] = _vec_load_9[0];
             }
             if (route_index_qb >= 0) {
-                long long expert_elem_1 = (long long)route_index_qb * 7168 + (long long)(cluster_thread * 8);
+                long long expert_elem_1 = (long long)route_index_qb * 7168ll + (long long)(cluster_thread * 8);
                 unsigned int _vec_load_10[4];
                 {
                     uint4 _uv4_2 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_1 + 0);
@@ -262,7 +262,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110(__nv_bfloat16* __restrict__ al
                 route_scales[1] = _vec_load_11[0];
             }
             if (route_index_qc >= 0) {
-                long long expert_elem_2 = (long long)route_index_qc * 7168 + (long long)(cluster_thread * 8);
+                long long expert_elem_2 = (long long)route_index_qc * 7168ll + (long long)(cluster_thread * 8);
                 unsigned int _vec_load_12[4];
                 {
                     uint4 _uv4_4 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_2 + 0);
@@ -283,7 +283,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110(__nv_bfloat16* __restrict__ al
                 route_scales[2] = _vec_load_13[0];
             }
             if (route_index_qd >= 0) {
-                long long expert_elem_3 = (long long)route_index_qd * 7168 + (long long)(cluster_thread * 8);
+                long long expert_elem_3 = (long long)route_index_qd * 7168ll + (long long)(cluster_thread * 8);
                 unsigned int _vec_load_14[4];
                 {
                     uint4 _uv4_6 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_3 + 0);
@@ -604,7 +604,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110(__nv_bfloat16* __restrict__ al
             scaled_f16_6[_lp] = *(uint32_t*)&_bf2;
         }
         int access = token * 896 + cluster_thread;
-        long long slot = (long long)rank * (long long)total_access * 8 + (long long)access * 8;
+        long long slot = (long long)rank * (long long)total_access * 8ll + (long long)access * 8ll;
         asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer0 + slot), "r"((scaled_f16_6)[0]), "r"((scaled_f16_6)[1]), "r"((scaled_f16_6)[2]), "r"((scaled_f16_6)[3]) : "memory");
         asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer1 + slot), "r"((scaled_f16_6)[0]), "r"((scaled_f16_6)[1]), "r"((scaled_f16_6)[2]), "r"((scaled_f16_6)[3]) : "memory");
         asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer2 + slot), "r"((scaled_f16_6)[0]), "r"((scaled_f16_6)[1]), "r"((scaled_f16_6)[2]), "r"((scaled_f16_6)[3]) : "memory");
@@ -613,13 +613,13 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110(__nv_bfloat16* __restrict__ al
     unsigned int clear_words[4];
     #pragma unroll
     for (int word = 0; word < 4; word++) {
-        clear_words[word] = 2147516416;
+        clear_words[word] = 2147516416ll;
     }
     long long clear_base = (long long)control_dirty * comm_stride_elems;
     #pragma unroll 4
     for (int clear_access = first_access; clear_access < control_clear_word / 8; clear_access += access_stride) {
         {
-            auto _gst_9 = workspace_local + (clear_base + (long long)clear_access * 8);
+            auto _gst_9 = workspace_local + (clear_base + (long long)clear_access * 8ll);
             __builtin_assume(__isGlobal(_gst_9));
             reinterpret_cast<int4*>(_gst_9)[0] = reinterpret_cast<int4*>(clear_words)[0];
         }

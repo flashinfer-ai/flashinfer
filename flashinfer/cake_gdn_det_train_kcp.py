@@ -17,20 +17,21 @@ Deterministic context-parallel (KCP) packed GDN (Gated DeltaNet) chunked
 training with precise cross-rank state passing (SM100 / SM103 / SM107), the
 Cake backend.
 
-Mode and dispatch rules: every entry point here is deterministic and carries
-``det`` in its name; none takes a ``deterministic`` keyword (passing one is a
-``TypeError``).  ``torch.use_deterministic_algorithms`` changes nothing here:
-every launch has a fixed order, so the results are bitwise reproducible run to
-run at the same topology.  ``chunk_gdn_det_bwd_kcp`` refuses a saved set or a
-workspace of the non-deterministic mode with ``ValueError``.  The
-non-deterministic mode is the separate package
-``flashinfer.experimental.cake_gdn_train_kcp``, whose entries take
-``deterministic=False`` explicitly.  The pre-rename names
-(``flashinfer.gdn_train``, ``chunk_gdn_kcp``, ``KcpContext``, ...) were removed.
+Mode and dispatch rules: every name here carries the mode word ``det``
+(FlashInfer #8928: ``cake_gdn_det_kcp``, ``CakeGDNDetKcp<Noun>``,
+``cake_gdn_det_train_kcp_<verb>``); none takes a ``deterministic`` keyword
+(passing one is a ``TypeError``).  ``torch.use_deterministic_algorithms``
+changes nothing here: every launch has a fixed order, so no alert is raised
+and the results are bitwise reproducible run to run at the same topology.
+``cake_gdn_det_train_kcp_backward`` refuses a saved set or a workspace of the
+non-deterministic mode with ``ValueError``.  The non-deterministic mode is a
+separate package with its own partition, context and plan rules (the ``b1``
+layout differs; the head plan and the ``P`` rule are each package's own);
+nothing here routes to it.
 
-Thin experimental entry points.  The partition / context plan, the host
+Thin entry points (a stable API: no ``ExperimentalWarning``).  The partition / context plan, the host
 orchestration, the saved set, the autograd Function and the generated kernels
-live in ``flashinfer.experimental.cake_gdn_det_train_kcp``; this module validates
+live in ``flashinfer.experimental.cake.cake_gdn_det_train_kcp``; this module validates
 nothing itself and forwards every keyword.  Every switch is a keyword
 argument; no environment variable is read.
 
@@ -47,16 +48,23 @@ FP32.  ``scale = 128 ** -0.5`` by default; ``T_r`` may be 0.
 
 Usage::
 
-    from flashinfer.cake_gdn_det_train_kcp import partition_det_kcp, build_context_det_kcp, chunk_gdn_det_kcp
+    from flashinfer.cake_gdn_det_train_kcp import (
+        cake_gdn_det_kcp,
+        cake_gdn_det_train_kcp_backward,
+        cake_gdn_det_train_kcp_build_context,
+        cake_gdn_det_train_kcp_comm_bytes,
+        cake_gdn_det_train_kcp_forward,
+        cake_gdn_det_train_kcp_partition,
+    )
 
-    part = partition_det_kcp(cu_seqlens_global_cpu, world_size, layout="zigzag_per_document")   # once per batch layout
-    ctx = build_context_det_kcp(part, group, rank, device, conv_kernel_size=4)                 # tables of this rank
-    out = chunk_gdn_det_kcp(q, k, v, g, beta, ctx, save_mode="light", boundary_mode="saved")   # autograd
-    out = chunk_gdn_det_kcp(q, k, v, g, beta, ctx, boundary_mode="replay")                      # keep nothing; re-run the forward in backward
-    out, saved = chunk_gdn_det_fwd_kcp(q, k, v, g, beta, ctx)
-    dq, dk, dv, dbeta, dg = chunk_gdn_det_bwd_kcp(q, k, v, g, beta, ctx, dout, saved=saved)
-    dq, dk, dv, dbeta, dg = chunk_gdn_det_bwd_kcp(q, k, v, g, beta, ctx, dout)                 # checkpoint replay
-    gdn_det_comm_bytes_kcp(ctx, H_qk=16, HV=48, C=10240)                                       # bytes per collective
+    part = cake_gdn_det_train_kcp_partition(cu_seqlens_global_cpu, world_size, layout="zigzag_per_document")   # once per batch layout
+    ctx = cake_gdn_det_train_kcp_build_context(part, group, rank, device, conv_kernel_size=4)                 # tables of this rank
+    out = cake_gdn_det_kcp(q, k, v, g, beta, ctx, save_mode="light", boundary_mode="saved")   # autograd
+    out = cake_gdn_det_kcp(q, k, v, g, beta, ctx, boundary_mode="replay")                      # keep nothing; re-run the forward in backward
+    out, saved = cake_gdn_det_train_kcp_forward(q, k, v, g, beta, ctx)
+    dq, dk, dv, dbeta, dg = cake_gdn_det_train_kcp_backward(q, k, v, g, beta, ctx, dout, saved=saved)
+    dq, dk, dv, dbeta, dg = cake_gdn_det_train_kcp_backward(q, k, v, g, beta, ctx, dout)                 # checkpoint replay
+    cake_gdn_det_train_kcp_comm_bytes(ctx, H_qk=16, HV=48, C=10240)                                       # bytes per collective
 
 ``use_qk_l2norm_in_kernel=True`` (keyword-only, default ``False``; the FLA
 ``chunk_gated_delta_rule`` keyword) normalizes ``q`` and ``k`` inside the
@@ -70,7 +78,7 @@ saved ``r``, rounded once to BF16.  The saved set grows by ``8 T_r H_qk`` bytes
 (the FP32 ``r`` of q and k; 4 MiB at ``T_r = 32768``, ``H_qk = 16``); the
 normalized rows (``2 x 256 T_r H_qk`` bytes) are transient workspace in the
 forward and the backward and never retained.  Pass the same value to
-``chunk_gdn_det_bwd_kcp`` as to ``chunk_gdn_det_fwd_kcp``; every mode (saved / replay,
+``cake_gdn_det_train_kcp_backward`` as to ``cake_gdn_det_train_kcp_forward``; every mode (saved / replay,
 light / full, checkpoint, recompute handle, CUDA-graph replay, ring) supports it.
 
 The width-4 causal convolution with halo of the same partition is
@@ -80,26 +88,89 @@ with this module's ``ctx``.
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Callable
 from typing import Any, Optional
 
 import torch
 
-from .api_logging import flashinfer_experimental_api
-
-_FEATURE = "Cake context-parallel packed GDN chunked training (SM100/SM103/SM107)"
+from .api_logging import flashinfer_api
 
 # The default scale of the contract: ``head_dim ** -0.5`` with head dimension 128.
 DEFAULT_SCALE = 128**-0.5
 
 
+_PACKAGE: Any = None  # the backend package once imported (every facade call reads it)
+
+
 def _pkg():
-    from .experimental import cake_gdn_det_train_kcp  # noqa: PLC0415 - the backend package, imported on first use
+    global _PACKAGE
+    if _PACKAGE is None:
+        from .experimental.cake import cake_gdn_det_train_kcp  # noqa: PLC0415 - the backend package, imported on first use
 
-    return cake_gdn_det_train_kcp
+        _PACKAGE = cake_gdn_det_train_kcp
+    return _PACKAGE
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def partition_det_kcp(
+class _PackageKeywordsSignature(inspect.Signature):
+    """``__signature__`` of a facade function that hands its ``**`` keywords to the package function of its name: the
+    facade function's own parameters without ``**``, then each keyword-only parameter of the package function that the
+    facade function does not name (every option field, keyword-only).  The package parameters are read on first use of
+    the signature, which imports the package, so importing this module still imports nothing; the facade function
+    stays a plain function (its source and type hints are its own)."""
+
+    __slots__ = ("_own", "_name", "_full")
+
+    def __init__(
+        self, fn: Callable[..., Any]
+    ) -> None:  # no Signature.__init__: the parameters are read on first use
+        self._own = inspect.signature(fn)
+        self._name = fn.__name__
+        self._full: Optional[inspect.Signature] = None
+
+    def _resolved(self) -> inspect.Signature:
+        if self._full is None:
+            params = [
+                p for p in self._own.parameters.values() if p.kind is not p.VAR_KEYWORD
+            ]
+            named = {p.name for p in params}
+            theirs = inspect.signature(getattr(_pkg(), self._name)).parameters
+            params += [
+                p
+                for p in theirs.values()
+                if p.kind is p.KEYWORD_ONLY and p.name not in named
+            ]
+            self._full = self._own.replace(parameters=params)
+        return self._full
+
+    # every Signature method (parameters, bind, str, ==, hash) reads these two slots of the base class
+    @property  # type: ignore[override]
+    def _parameters(self) -> Any:
+        return self._resolved().parameters
+
+    @property  # type: ignore[override]
+    def _return_annotation(self) -> Any:
+        return self._own.return_annotation
+
+    def replace(self, **changes: Any) -> inspect.Signature:  # type: ignore[override]
+        return self._resolved().replace(**changes)
+
+    def __reduce__(self) -> Any:
+        return self._resolved().__reduce__()
+
+    def __repr__(self) -> str:
+        return repr(self._resolved())
+
+
+def _forwards_keywords(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Mark ``fn`` as handing its ``**`` keywords to the package function of its name: its ``__signature__`` is a
+    :class:`_PackageKeywordsSignature`."""
+    fn.__signature__ = _PackageKeywordsSignature(fn)  # type: ignore[attr-defined]
+    return fn
+
+
+@flashinfer_api
+def cake_gdn_det_train_kcp_partition(
     cu_seqlens_global_cpu: Any,
     world_size: int,
     layout: str = "contiguous",
@@ -128,16 +199,16 @@ def partition_det_kcp(
 
     Returns
     -------
-    ``PartitionDetKcp``: per rank the fragment table ``(doc, off, length, prev, next)`` in document order; reused across
+    ``CakeGDNDetKcpPartition``: per rank the fragment table ``(doc, off, length, prev, next)`` in document order; reused across
     layers (metadata only).
     """
-    return _pkg().partition_det_kcp(
+    return _pkg().cake_gdn_det_train_kcp_partition(
         cu_seqlens_global_cpu, world_size, layout, fragments, cut_points=cut_points
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def build_context_det_kcp(
+@flashinfer_api
+def cake_gdn_det_train_kcp_build_context(
     part: Any,
     group: Any,
     rank: int,
@@ -151,14 +222,30 @@ def build_context_det_kcp(
     ``conv_kernel_size - 1`` history rows per continuing fragment) and the segment plan.  ``group`` is the caller's
     ``torch.distributed`` process group (every collective of the route runs on it); CPU metadata plus small int32
     device tables built once; no tensor contents are read.
+
+    Parameters
+    ----------
+    part
+        Partition returned by :func:`cake_gdn_det_train_kcp_partition`.
+    group
+        Caller-owned ``torch.distributed`` process group for all collectives.
+    rank : int
+        This rank's index within ``group``.
+    device
+        CUDA device on which to build this rank's tables.
+    conv_kernel_size : int, default=4
+        Convolution width used to plan the history-row halo exchange.
+    sm_count : int, optional
+        SM count to use when building the segment plan.
     """
-    return _pkg().build_context_det_kcp(
+    return _pkg().cake_gdn_det_train_kcp_build_context(
         part, group, rank, device, conv_kernel_size, sm_count=sm_count
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def chunk_gdn_det_fwd_kcp(
+@flashinfer_api
+@_forwards_keywords
+def cake_gdn_det_train_kcp_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -185,22 +272,24 @@ def chunk_gdn_det_fwd_kcp(
         FP32 ``[1, T_r, HV]`` natural-log decay gate (preactivation form, no clamp).
     beta : torch.Tensor
         FP32 ``[1, T_r, HV]`` delta-rule gate after the sigmoid.
-    ctx : ContextDetKcp
-        This rank's context from :func:`build_context_det_kcp`.
+    ctx : CakeGDNDetKcpContext
+        This rank's context from :func:`cake_gdn_det_train_kcp_build_context`.
     scale : float, optional
         Output scale; ``128 ** -0.5`` when ``None``.
     save_for_backward : bool
         Keep the saved set (``boundary_mode="saved"``); ``False`` or ``boundary_mode="replay"`` returns ``None``.
-    workspace : WorkspaceDetKcp, optional
-        A reused caller-held workspace (``gdn_det_workspace_bytes_kcp``); without one the call allocates its own.
-    options, **knobs
+    workspace : CakeGDNDetKcpWorkspace, optional
+        A reused caller-held workspace (``cake_gdn_det_train_kcp_workspace_bytes``); without one the call allocates its own.
+    options
         Keyword-only options (``save_mode`` ``"light"`` | ``"full"``, ``boundary_mode`` ``"saved"`` | ``"replay"``,
         ``exchange`` ``"a2a"`` | ``"ring"``, ``save_transfer``, ``offset_class`` ``"fla"`` | ``"fp32"``, ``layout`` ``"tma"`` |
         ``"copy"``, ``group_reduce`` ``"fused"`` | ``"host"``, ``graph`` ``"off"`` | ``"replay"``,
         ``reuse_recompute_tapes`` ``"auto"`` (default) | ``True`` | ``False`` (``False`` with ``graph="replay"``; see
-        :func:`chunk_gdn_det_kcp`),
+        :func:`cake_gdn_det_kcp`),
         ``recompute_output`` ``"auto"`` | ``"always"`` (an autograd-node switch; this forward-only entry never skips a
         launch), ...).
+    **knobs
+        Keyword overrides for the backend options described above.
     use_qk_l2norm_in_kernel : bool
         Normalize ``q`` / ``k`` per token and head inside the programs (module docstring); the saved set then
         carries the FP32 ``r`` of q and k.  With an ``options`` instance it overrides only when ``True``.
@@ -209,7 +298,7 @@ def chunk_gdn_det_fwd_kcp(
     -------
     ``(out, saved)``: ``out`` BF16 like ``v`` (fresh); ``saved`` the saved set or ``None``.
     """
-    return _pkg().chunk_gdn_det_fwd_kcp(
+    return _pkg().cake_gdn_det_train_kcp_forward(
         q,
         k,
         v,
@@ -225,8 +314,9 @@ def chunk_gdn_det_fwd_kcp(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def chunk_gdn_det_bwd_kcp(
+@flashinfer_api
+@_forwards_keywords
+def cake_gdn_det_train_kcp_backward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -253,9 +343,11 @@ def chunk_gdn_det_bwd_kcp(
     saved : optional
         The forward's saved set; ``None`` recomputes it from the inputs (checkpoint replay: the summaries and the
         exchange are re-run).
-    scale, workspace, options, use_qk_l2norm_in_kernel, **knobs
-        As in :func:`chunk_gdn_det_fwd_kcp` (the same options as the forward's; a saved set of the other
+    scale, workspace, options, use_qk_l2norm_in_kernel
+        As in :func:`cake_gdn_det_train_kcp_forward` (the same options as the forward's; a saved set of the other
         ``use_qk_l2norm_in_kernel`` value is refused).
+    **knobs
+        Additional backend options, as in :func:`cake_gdn_det_train_kcp_forward`.
 
     Returns
     -------
@@ -263,7 +355,7 @@ def chunk_gdn_det_bwd_kcp(
     ``dq`` / ``dk`` reduced in FP32 and rounded once), FP32 gradients of ``beta`` and ``g``; fresh tensors, ranked
     like the inputs.  Bitwise reproducible at the same topology; saved and replay modes agree bitwise.
     """
-    return _pkg().chunk_gdn_det_bwd_kcp(
+    return _pkg().cake_gdn_det_train_kcp_backward(
         q,
         k,
         v,
@@ -280,8 +372,9 @@ def chunk_gdn_det_bwd_kcp(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def chunk_gdn_det_kcp(
+@flashinfer_api
+@_forwards_keywords
+def cake_gdn_det_kcp(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -302,8 +395,8 @@ def chunk_gdn_det_kcp(
     r"""Context-parallel packed GDN training as an autograd node (``torch.utils.checkpoint`` compatible).
 
     Returns ``out`` BF16 like ``v`` with gradients to ``q, k, v, g, beta``; every saved tensor travels through
-    ``save_for_backward`` only, so a checkpointed forward retains nothing.  See :func:`chunk_gdn_det_fwd_kcp` for the
-    operands and options and :func:`chunk_gdn_det_bwd_kcp` for the gradients.
+    ``save_for_backward`` only, so a checkpointed forward retains nothing.  See :func:`cake_gdn_det_train_kcp_forward` for the
+    operands and options and :func:`cake_gdn_det_train_kcp_backward` for the gradients.
 
     ``reuse_recompute_tapes`` (keyword-only, default ``"auto"``; ``True`` | ``False``): under
     ``torch.utils.checkpoint(use_reentrant=False)`` the ``save_mode="light"`` backward binds the forward tapes that
@@ -332,23 +425,23 @@ def chunk_gdn_det_kcp(
     decision and its reason).  The gradients and the retained bytes are unchanged either way; ``"always"`` is the
     unconditional launch.
 
-    ``recompute_handle`` (keyword-only, default ``None``; a :class:`RecomputeHandleDetKcp`): the checkpoint recompute
+    ``recompute_handle`` (keyword-only, default ``None``; a :class:`CakeGDNDetKcpRecomputeHandle`): the checkpoint recompute
     of this forward runs without cross-rank communication.  The original forward exchanges as always and stores
     this rank's incoming states ``S_in`` (the saved set's own tensor) in the handle; torch's recompute of the forward
     inside ``.backward()`` reads them back and runs no exchange, no transfer-summary walk and no merge -- only the
     prep program, at ``P > 1`` the local segment walks and carry merges, and the state walk from ``S_in``, the
     launches of the light backward's replay -- so
     the gradients are bitwise those of the same checkpoint without a handle.  The backward still exchanges.  The
-    handle retains ``S_in`` (``gdn_det_saved_bytes_kcp(ctx, ..., save_mode="light", save_transfer=False)``) from the
+    handle retains ``S_in`` (``cake_gdn_det_train_kcp_saved_bytes(ctx, ..., save_mode="light", save_transfer=False)``) from the
     original forward until the checkpoint frame holding it is freed, instead of retaining nothing (``with_conv=False``
     in that query: the convolution keeps its own rows).  Create one handle per layer and micro-step, outside the
     outermost checkpoint region, and pass it as an argument of the checkpointed function::
 
         def layer(x, handle):
             ...
-            return chunk_gdn_det_kcp(q, k, v, g, beta, ctx, recompute_handle=handle)
+            return cake_gdn_det_kcp(q, k, v, g, beta, ctx, recompute_handle=handle)
 
-        y = torch.utils.checkpoint.checkpoint(layer, x, RecomputeHandleDetKcp(), use_reentrant=False)
+        y = torch.utils.checkpoint.checkpoint(layer, x, CakeGDNDetKcpRecomputeHandle(), use_reentrant=False)
 
     A handle holds one entry per key: it serves this call and at most one context-parallel convolution call (whose
     halo rows go under the key ``"conv"``); a layer with separate Q / K / V convolutions uses one handle per
@@ -360,12 +453,12 @@ def chunk_gdn_det_kcp(
     and a CUDA-graph replay see it like any other option.
 
     ``q`` / ``k`` / ``v`` that are head views of one packed ``[..., T, (2 H_qk + HV) * 128]`` row (the convolution's
-    output) get the full backward speed only as :func:`packed_qkv_views_det_kcp` views.  Plain ``split`` / ``view``
+    output) get the full backward speed only as :func:`cake_gdn_det_train_kcp_packed_qkv_views` views.  Plain ``split`` / ``view``
     views of the row give bitwise the same results, but torch's split backward concatenates ``dq`` / ``dk`` /
     ``dv`` into a new row: about 1.1 ms (33-36 %) more backward per call at ``(16, 48)`` and 32,768 tokens on GB200
     and GB300, with the in-kernel norm off or on (package README, "Packed Q/K/V").
     """
-    return _pkg().chunk_gdn_det_kcp(
+    return _pkg().cake_gdn_det_kcp(
         q,
         k,
         v,
@@ -384,15 +477,15 @@ def chunk_gdn_det_kcp(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def packed_qkv_views_det_kcp(
+@flashinfer_api
+def cake_gdn_det_train_kcp_packed_qkv_views(
     qkv: torch.Tensor, *, H_qk: int, HV: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""``q`` / ``k`` / ``v`` as head views ``[..., T, H_qk | H_qk | HV, 128]`` of a packed
-    ``[..., T, (2 H_qk + HV) * 128]`` row, with no copy.  :func:`chunk_gdn_det_kcp` takes the views as they are and its
+    ``[..., T, (2 H_qk + HV) * 128]`` row, with no copy.  :func:`cake_gdn_det_kcp` takes the views as they are and its
     backward writes ``dq`` / ``dk`` / ``dv`` into one packed row, which this split's backward returns as the gradient
     of ``qkv`` without a concatenation.  Plain ``split`` views of ``qkv`` give the same gradients through torch's
-    split backward, which concatenates them (:func:`chunk_gdn_det_kcp`).
+    split backward, which concatenates them (:func:`cake_gdn_det_kcp`).
 
     Needs a dense channel axis (``qkv.stride(-1) == 1``).  The views are the outputs of one custom autograd node:
     hooks and ``retain_grad`` on them fire as on any autograd output; its backward concatenates instead when the
@@ -401,48 +494,109 @@ def packed_qkv_views_det_kcp(
 
     Example::
 
-        q, k, v = packed_qkv_views_det_kcp(conv_out, H_qk=16, HV=48)        # conv_out: [T, 10240]
-        out = chunk_gdn_det_kcp(q, k, v, g, beta, ctx)
+        q, k, v = cake_gdn_det_train_kcp_packed_qkv_views(conv_out, H_qk=16, HV=48)        # conv_out: [T, 10240]
+        out = cake_gdn_det_kcp(q, k, v, g, beta, ctx)
+
+    Parameters
+    ----------
+    qkv : torch.Tensor
+        Packed projection rows ``[..., T, (2 * H_qk + HV) * 128]`` with unit channel stride.
+    H_qk : int
+        Number of query and key heads, each with 128 channels.
+    HV : int
+        Number of value heads, each with 128 channels.
     """
-    return _pkg().packed_qkv_views_det_kcp(qkv, H_qk=H_qk, HV=HV)
+    return _pkg().cake_gdn_det_train_kcp_packed_qkv_views(qkv, H_qk=H_qk, HV=HV)
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def gdn_det_workspace_bytes_kcp(ctx: Any, *, H_qk: int, HV: int, **kw: Any) -> int:
+@flashinfer_api
+@_forwards_keywords
+def cake_gdn_det_train_kcp_workspace_bytes(
+    ctx: Any, *, H_qk: int, HV: int, **kw: Any
+) -> int:
     r"""Caller-held workspace bytes of one rank for ``(ctx, H_qk, HV)`` (exchange pools, staging, tapes): the most
     the workspace binds in the forward or the backward of the given options (``reuse_recompute_tapes`` as a keyword;
-    the per-phase terms are ``gdn_det_workspace_layout_kcp`` of the package).  ``use_qk_l2norm_in_kernel=True`` adds the
+    the per-phase terms are ``cake_gdn_det_train_kcp_workspace_layout`` of the package).  ``use_qk_l2norm_in_kernel=True`` adds the
     transient normalized rows ``qn`` / ``kn`` (``2 x 256 T_r H_qk`` bytes) to the forward and every backward phase,
-    and the ``8 T_r H_qk``-byte FP32 ``r`` where the backward re-runs the prep program."""
-    return _pkg().gdn_det_workspace_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
+    and the ``8 T_r H_qk``-byte FP32 ``r`` where the backward re-runs the prep program.
+
+    Parameters
+    ----------
+    ctx
+        This rank's context from :func:`cake_gdn_det_train_kcp_build_context`.
+    H_qk : int
+        Number of query and key heads.
+    HV : int
+        Number of value heads.
+    **kw
+        Backend options for this query, including the call's save and boundary settings.
+    """
+    return _pkg().cake_gdn_det_train_kcp_workspace_bytes(ctx, H_qk=H_qk, HV=HV, **kw)
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def gdn_det_saved_bytes_kcp(ctx: Any, *, H_qk: int, HV: int, **kw: Any) -> int:
+@flashinfer_api
+@_forwards_keywords
+def cake_gdn_det_train_kcp_saved_bytes(
+    ctx: Any, *, H_qk: int, HV: int, **kw: Any
+) -> int:
     r"""Saved-set bytes of one layer on this rank (``save_mode``, ``save_transfer`` as keywords), counted per
     crossing fragment; ``use_qk_l2norm_in_kernel=True`` adds the FP32 ``r`` of q and k, ``8 T_r H_qk`` bytes
-    (``boundary_mode="saved"``)."""
-    return _pkg().gdn_det_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
+    (``boundary_mode="saved"``).
+
+    Parameters
+    ----------
+    ctx
+        This rank's context from :func:`cake_gdn_det_train_kcp_build_context`.
+    H_qk : int
+        Number of query and key heads.
+    HV : int
+        Number of value heads.
+    **kw
+        Backend options for this query, including the call's save and boundary settings.
+    """
+    return _pkg().cake_gdn_det_train_kcp_saved_bytes(ctx, H_qk=H_qk, HV=HV, **kw)
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def gdn_det_comm_bytes_kcp(
+@flashinfer_api
+@_forwards_keywords
+def cake_gdn_det_train_kcp_comm_bytes(
     ctx: Any, *, H_qk: int, HV: int, C: int = 10240, **kw: Any
 ) -> dict:
     r"""Bytes this rank moves per collective (``c1``, ``c2``, ``b1``, ``b2``, ``halo_fwd``, ``halo_bwd``) and per
-    boundary, counted per crossing fragment; ``C`` is the convolution channel count of the halo rows."""
-    return _pkg().gdn_det_comm_bytes_kcp(ctx, H_qk=H_qk, HV=HV, C=C, **kw)
+    boundary, counted per crossing fragment; ``C`` is the convolution channel count of the halo rows.
+
+    Parameters
+    ----------
+    ctx
+        This rank's context from :func:`cake_gdn_det_train_kcp_build_context`.
+    H_qk : int
+        Number of query and key heads.
+    HV : int
+        Number of value heads.
+    C : int, default=10240
+        Convolution channel count used to size halo traffic.
+    **kw
+        Backend options for this query: ``save_transfer`` and ``boundary_mode``.
+    """
+    return _pkg().cake_gdn_det_train_kcp_comm_bytes(ctx, H_qk=H_qk, HV=HV, C=C, **kw)
 
 
-def is_gdn_det_train_kcp_supported(
+@flashinfer_api
+def is_cake_gdn_det_train_kcp_supported(
     device: torch.device | str | int | None = None,
 ) -> bool:
-    r"""``True`` when ``device`` (default: the current CUDA device) is an exported target of the package."""
+    r"""``True`` when ``device`` (default: the current CUDA device) is an exported target of the package.
+
+    Parameters
+    ----------
+    device : torch.device, str, int, optional
+        Device to query; ``None`` selects the current CUDA device.
+    """
     if not torch.cuda.is_available():
         return False
     try:
         pkg = _pkg()
-        from .experimental.cake_gdn_det_train_kcp import cake_jit  # noqa: PLC0415
+        from .experimental.cake.cake_gdn_det_train_kcp import cake_jit  # noqa: PLC0415
 
         if device is None:
             index = torch.cuda.current_device()
@@ -460,7 +614,7 @@ def _device_arch(cake_jit: Any, index: int) -> str | None:
     """The exported ``sm_`` arch name of CUDA device ``index``: the loader's ``cake_backend.device_arch`` when the
     package ships it, else the registry's ``ARCH_BY_CAPABILITY`` map of ``torch.cuda.get_device_capability``."""
     try:
-        from .experimental.cake_gdn_det_train_kcp import cake_backend  # noqa: PLC0415
+        from .experimental.cake.cake_gdn_det_train_kcp import cake_backend  # noqa: PLC0415
 
         return cake_backend.device_arch(index)
     except ImportError:
@@ -469,16 +623,17 @@ def _device_arch(cake_jit: Any, index: int) -> str | None:
     return by_cap.get(tuple(torch.cuda.get_device_capability(index)))
 
 
-# The public types of the package (the contract's exported names), resolved on first access so that importing the
-# facade imports the package lazily: ``OptionsDetKcp``, ``ContextDetKcp``, ``PartitionDetKcp``.  ``SavedDetKcp`` (returned by
-# ``chunk_gdn_det_fwd_kcp``) and ``WorkspaceDetKcp`` resolve the same way but are not public names of the contract.
+# The public types of the package, resolved on first access so that importing the facade imports the package
+# lazily: the options, partition, context and recompute-handle types the caller builds, the saved set and workspace
+# types the forward returns and the backward reads, and the autograd Function of ``cake_gdn_det_kcp``.
 _LAZY_TYPES = (
-    "OptionsDetKcp",
-    "ContextDetKcp",
-    "PartitionDetKcp",
-    "RecomputeHandleDetKcp",
-    "SavedDetKcp",
-    "WorkspaceDetKcp",
+    "CakeGDNDetKcpContext",
+    "CakeGDNDetKcpFunction",
+    "CakeGDNDetKcpOptions",
+    "CakeGDNDetKcpPartition",
+    "CakeGDNDetKcpRecomputeHandle",
+    "CakeGDNDetKcpSaved",
+    "CakeGDNDetKcpWorkspace",
 )
 
 
@@ -493,18 +648,21 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
-    "ContextDetKcp",  # noqa: F822 - resolved by __getattr__
-    "OptionsDetKcp",  # noqa: F822
-    "PartitionDetKcp",  # noqa: F822
-    "RecomputeHandleDetKcp",  # noqa: F822
-    "build_context_det_kcp",
-    "chunk_gdn_det_kcp",
-    "chunk_gdn_det_bwd_kcp",
-    "chunk_gdn_det_fwd_kcp",
-    "gdn_det_comm_bytes_kcp",
-    "gdn_det_saved_bytes_kcp",
-    "gdn_det_workspace_bytes_kcp",
-    "is_gdn_det_train_kcp_supported",
-    "partition_det_kcp",
-    "packed_qkv_views_det_kcp",
+    "CakeGDNDetKcpContext",  # noqa: F822 - resolved by __getattr__
+    "CakeGDNDetKcpFunction",  # noqa: F822
+    "CakeGDNDetKcpOptions",  # noqa: F822
+    "CakeGDNDetKcpPartition",  # noqa: F822
+    "CakeGDNDetKcpRecomputeHandle",  # noqa: F822
+    "CakeGDNDetKcpSaved",  # noqa: F822
+    "CakeGDNDetKcpWorkspace",  # noqa: F822
+    "cake_gdn_det_kcp",
+    "cake_gdn_det_train_kcp_backward",
+    "cake_gdn_det_train_kcp_build_context",
+    "cake_gdn_det_train_kcp_comm_bytes",
+    "cake_gdn_det_train_kcp_forward",
+    "cake_gdn_det_train_kcp_packed_qkv_views",
+    "cake_gdn_det_train_kcp_partition",
+    "cake_gdn_det_train_kcp_saved_bytes",
+    "cake_gdn_det_train_kcp_workspace_bytes",
+    "is_cake_gdn_det_train_kcp_supported",
 ]

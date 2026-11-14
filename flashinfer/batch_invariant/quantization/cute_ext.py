@@ -101,7 +101,7 @@ class CuteF32:
     @staticmethod
     def cvt_out(a, fmt_name: str):
         """``cvt.rn.<fmt>.f32`` (``arith.truncf``, RNE); the identity for ``f32``."""
-        from .dtypes import get_cutlass_dtype
+        from ..fp_interface.cute import get_cutlass_dtype
 
         return a if fmt_name == "f32" else a.to(get_cutlass_dtype(fmt_name))
 

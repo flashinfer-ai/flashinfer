@@ -507,6 +507,9 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
         output_activation=None,
         topk_idx=torch.empty(capacity, top_k, dtype=torch.int32),
         topk_weights=torch.randn(capacity, top_k, dtype=torch.float32),
+        fc1_alpha=torch.ones(2, dtype=torch.float32),
+        fc2_alpha=torch.ones(2, dtype=torch.float32),
+        fc1_norm_const=torch.ones(2, dtype=torch.float32),
         _frontend=mock.Mock(),
         _staging_inputs=None,
     )

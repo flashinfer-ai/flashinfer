@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     git \
     jq \
+    rsync \
     wget \
     && rm -rf /var/lib/apt/lists/*
 

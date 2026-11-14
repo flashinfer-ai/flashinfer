@@ -148,24 +148,7 @@ main() {
         # shellcheck disable=SC1091
         source "${SCRIPT_DIR}/setup_test_env.sh"
 
-        # tests/moe_ep needs its additional runtime stack only on CUDA 13 images.
-        local cuda_major
-        cuda_major=$(python -c \
-            'import torch; v=torch.version.cuda; print(v.split(".")[0] if v else "0")' \
-            2>/dev/null || echo 0)
-        # Match tests/moe_ep as whole path components: file names such as
-        # tests/experimental/test_cake_mxfp8_megamoe_ep16.py contain "moe_ep"
-        # but do not use this stack.
-        if [[ " ${TEST_PATH:-} " == *[[:space:]/]tests/moe_ep[[:space:]/]* ]] \
-            && [ "${cuda_major}" -ge 13 ]; then
-            FI_SRC="$(pwd)" bash docker/install/build_flashinfer_ep_pytorch.sh
-            # The installer's exports do not reach this shell. Non-root jobs
-            # need the wheel's NCCL library ahead of the image's system copy.
-            local nccl_wheel_lib
-            nccl_wheel_lib=$(python -c \
-                'import nvidia.nccl, os; print(os.path.join(list(nvidia.nccl.__path__)[0], "lib"))')
-            export LD_LIBRARY_PATH="${nccl_wheel_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-        fi
+        setup_moe_ep_test_env
 
         echo "=========================================="
         echo "INSTALLED PYTHON PACKAGES"

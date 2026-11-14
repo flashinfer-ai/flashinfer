@@ -275,6 +275,12 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             barrier_id=4,
             num_threads=self.threads_per_warp * len(self.compute_group_1_warp_ids),
         )
+        # All CG1 warps must have drained their tcgen05.ld before warp 4
+        # deallocates TMEM.
+        self.tmem_dealloc_barrier = pipeline.NamedBarrier(
+            barrier_id=3,
+            num_threads=self.threads_per_warp * len(self.compute_group_1_warp_ids),
+        )
         self.manual_cache_key(
             "io_dtype",
             "cu_seqlens_dtype",
@@ -1442,6 +1448,10 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
                 else:
                     kv_acc_handle = kv_acc_consumer.wait_and_advance()
                     kv_acc_handle.release()
+            # Drain this warp's TMEM loads, then wait for all CG1 warps before
+            # warp 4 deallocates the TMEM they were reading from.
+            cute.arch.fence_view_async_tmem_load()
+            self.tmem_dealloc_barrier.arrive_and_wait()
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
             o_store_producer.tail()

@@ -29,7 +29,7 @@ limitations under the License.
 # behind FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1. Importing this module
 # is always allowed (so tooling and docs can introspect it).
 #
-# See README.md in this directory for the full policy, and CLAUDE.md for
+# See README.md in this directory for the full policy, and AGENTS.md for
 # agent-facing contribution rules.
 
 from ..api_logging import (

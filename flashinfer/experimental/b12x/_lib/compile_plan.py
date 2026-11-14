@@ -505,8 +505,9 @@ def serialized_compilations():
 def _locked_triton_compile(
     compile_fn, source, target=None, options=None, _env_vars=None
 ):
-    import fcntl
     from pathlib import Path
+
+    import _flashinfer_filelock as filelock
     from triton.compiler.compiler import get_cache_manager
 
     program = _triton_program(source, target, options, _env_vars)
@@ -518,13 +519,13 @@ def _locked_triton_compile(
         )
     Path(directory).mkdir(parents=True, exist_ok=True)
     with (Path(directory) / ".b12x-compile.lock").open("a") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        filelock.lock(lock.fileno())
         try:
             result = compile_fn(
                 source, target=target, options=options, _env_vars=_env_vars
             )
         finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            filelock.unlock(lock.fileno())
     record_program(program)
     return result
 

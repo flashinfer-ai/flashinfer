@@ -66,7 +66,8 @@ class TermAlgebra:
         return self._mk("const", value, math.copysign(1.0, value))
 
     def sym(self, name: str) -> Term:
-        """A runtime scalar the kernel reads as given (the fp8 classes' ``alpha``): a leaf, not a computation."""
+        """A runtime scalar the kernel reads as given (the fp8 classes' ``alpha``, the attention class's ``c = sm_scale * log2(e)``
+        and ``nc = -c``): a leaf, not a computation."""
         return self._mk("sym", name)
 
     # -- primitives --------------------------------------------------------------
@@ -79,6 +80,27 @@ class TermAlgebra:
         """``mul.rn.f32``, commutativity-normalised (IEEE multiplication is bitwise commutative)."""
         a, b = self._sorted2(a, b)
         return self._mk("mul", a, b)
+
+    def fma(self, a: Term, b: Term, c: Term) -> Term:
+        """``fma.rn.f32``; the product's operands commutativity-normalised."""
+        a, b = self._sorted2(a, b)
+        return self._mk("fma", a, b, c)
+
+    def div(self, a: Term, b: Term) -> Term:
+        """``div.rn.f32``."""
+        return self._mk("div", a, b)
+
+    def fmaxc(self, a: Term, b: Term) -> Term:
+        """``max.f32`` (NVVM ``fmax``, maximumNumber) as a *commutative join*: it returns ``+0`` for both ``max(+0, -0)`` and
+        ``max(-0, +0)`` on SM100 / SM103 / SM107, so it is bitwise commutative on every non-NaN pair and the operand order is
+        normalised like ``add``. Printed as ``(fmax a b)`` with the operands sorted."""
+        a, b = self._sorted2(a, b)
+        return self._mk("fmaxc", a, b)
+
+    def ex2(self, a: Term) -> Term:
+        """``ex2.approx.ftz.f32``: an opaque hardware primitive, deterministic per architecture (``ex2(+0) = ex2(-0) = 1``,
+        ``ex2(-inf) = 0``)."""
+        return self._mk("ex2", a)
 
     def cvt_out(self, a: Term, fmt_name: str) -> Term:
         """``cvt.rn.<fmt>.f32``: the one conversion of the epilogue."""
@@ -113,8 +135,8 @@ def size(t: Term) -> int:
 
 
 def sexpr(t: Term) -> str:
-    """Canonical S-expression of a term, with the operands of commutative nodes sorted by their own
-    S-expression. Identical on the Lean side (``GTerm.sexpr``), so the two implementations can be compared
+    """Canonical S-expression of a term, with the operands of commutative nodes (``add``, ``mul``, ``fmax``, ``fma``'s
+    product) sorted by their own S-expression. Identical on the Lean side (``GTerm.sexpr``), so the two implementations can be compared
     textually."""
     memo: Dict[int, str] = {}
     stack = [t]
@@ -136,14 +158,21 @@ def sexpr(t: Term) -> str:
                 if isinstance(A[0], str)
                 else f"(const {float(A[0])!r})"
             )
-        elif op == "add":
-            a, b = sorted(A[:2])
-            out = f"(add {a} {b})"
-        elif op == "mul":
-            a, b = sorted(A[:2])
-            out = f"(mul {a} {b})"
         elif op == "sym":
             out = f"(sym {A[0]})"
+        elif op in ("add", "mul"):
+            a, b = sorted(A[:2])
+            out = f"({op} {a} {b})"
+        elif op == "fma":
+            a, b = sorted(A[:2])
+            out = f"(fma {a} {b} {A[2]})"
+        elif op == "div":
+            out = f"(div {A[0]} {A[1]})"
+        elif op == "fmaxc":
+            a, b = sorted(A[:2])
+            out = f"(fmax {a} {b})"
+        elif op == "ex2":
+            out = f"(ex2 {A[0]})"
         elif op == "cvt_out":
             out = f"(cvt {A[1]} {A[0]})"
         elif op == "op:mma_bf16_k16":
@@ -176,6 +205,10 @@ def sexpr(t: Term) -> str:
             out = f"(sfa {A[0]} {A[1]})"  # A's block scales of row m at step t
         elif op == "op:sfb_cols":
             out = f"(sfb {A[0]} {A[1]})"  # B's block scales of column n at step t
+        elif op == "op:sfa_blk":
+            out = f"(sfa_blk {A[0]} {A[1]})"  # the fp32 scale of A's row m for K block kb (the block-scale class)
+        elif op == "op:sfb_blk":
+            out = f"(sfb_blk {A[0]} {A[1]})"  # the fp32 scale of B's column block n // 128 for K block kb
         else:
             out = "(" + op + " " + " ".join(map(str, A)) + ")"
         memo[cur.uid] = out

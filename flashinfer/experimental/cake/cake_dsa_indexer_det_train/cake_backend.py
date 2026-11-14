@@ -30,8 +30,10 @@ Contract (the issue text is authoritative)
   >= 1``; ``max_seqlen_q`` is an accepted host mirror that no launch decision
   reads; ``max_seqlen_k`` (the caller's bound on every key segment, optional)
   sizes the rank finalize's bitmap pool and so selects its program variant
-  (``rank_seg_window``) -- never a result; a value above ``Tkv`` or below
-  ``ceil(Tkv / S)`` is rejected.
+  (``rank_seg_window``), and where the record ships ``lsf_programs`` it runs a
+  packed call whose key segments all have that length (``Tkv == S *
+  max_seqlen_k``) without the ``:lsf`` copy -- never a result; a value above
+  ``Tkv`` or below ``ceil(Tkv / S)`` is rejected.
 * Outputs ``indices [T, top_k]`` int32 segment-local key ids and ``scores [T,
   top_k]`` FP32, both in ascending id order with the tail padded by ``-1`` /
   ``-inf``; an entirely empty row holds only padding.
@@ -973,7 +975,9 @@ class DSAIndexerDetRunner:
     # call whose ``zero_region`` is the block's ticket word (8 bytes), on the run's stream.  The eager entry draws from
     # the first 16 bytes of the workspace's tail instead, which its scan binding zeroes (8 bytes) right before the
     # launch.  Any other scan launch (static, or a program drawing from the tail) gets the device's zeroed
-    # placeholder, which it never reads.
+    # placeholder, which it never reads.  The :lsf copy of a TicketWord-reading program (sm_107a's l6 ticket
+    # programs) still keeps its longest-first segment order in the tail's bytes behind the ticket word, which every
+    # launch writes before it reads them, so stale bytes there never matter and nothing zeroes them.
     # byte offset of the tail in the workspace; -1: no tail
     _tail_at: int = field(default=-1, repr=False)
     _tail_view: Optional[torch.Tensor] = field(default=None, repr=False)
@@ -1164,11 +1168,11 @@ def _prepare_runner(
         dtype=q.dtype,
     )
     # every program of the call must be registered before anything is allocated (fail closed by name)
+    # a merge that finalizes its rows itself (``choice.merge_rank``, key merge:rank:w*) leaves no finalize program to bind
     fin_role = choice.finalize_role
-    programs = {
-        "scan": program_for(arch, choice.scan_key),
-        fin_role: program_for(arch, choice.finalize_key),
-    }
+    programs = {"scan": program_for(arch, choice.scan_key)}
+    if not choice.merge_rank:
+        programs[fin_role] = program_for(arch, choice.finalize_key)
     if choice.merge_key is not None:
         programs["merge"] = program_for(arch, choice.merge_key)
     workspace_bytes = int(choice.workspace_bytes)
@@ -1306,12 +1310,13 @@ def _prepare_runner(
                 bind_program(programs["merge"], arch, "merge", values, row_grid)
             )
             stages.append("merge")
-        # lever FRP-K: the persistent rank finalize launches min(rows, CTAs per SM x SMs) CTAs, each walking rows bid, bid + grid, ...
+        # lever FRP-K: the persistent rank finalize launches min(rows, CTAs per SM x (SMs - spare SMs)) CTAs, each walking rows bid, bid + grid, ...
         fin_grid = (finalize_grid(choice, _num_sms(device)), 1, 1)
-        launches.append(
-            bind_program(programs[fin_role], arch, fin_role, values, fin_grid)
-        )
-        stages.append(fin_role)
+        if fin_role in programs:
+            launches.append(
+                bind_program(programs[fin_role], arch, fin_role, values, fin_grid)
+            )
+            stages.append(fin_role)
     elif num_queries > 0:
         _padded_outputs(num_queries, int(top_k), device, t["Indices"], t["Scores"])
     # on the ticket architectures the scan program draws every work unit from the workspace's
@@ -1326,7 +1331,8 @@ def _prepare_runner(
     # zeroed neither here nor per run.  A program of the ``static_scan_kinds`` of its form's record
     # (``policy_for(arch, form)``) keeps the static enumeration on every call: no tail view, nothing zeroed.
     # A program that reads its TicketWord argument (``reads_ticket_word``) has no tail here: it draws from its
-    # ticket block (above), so neither a caller-owned nor a backend-owned workspace is zeroed for it.
+    # ticket block (above), so neither a caller-owned nor a backend-owned workspace is zeroed for it (its :lsf copy
+    # writes the segment order behind the tail's ticket word before it reads it).
     # (``tail_at`` / ``tail_static`` were decided above, before the first device operation; a call launches
     # iff it has queries and keys.)
     tail_view = scan_ticket["zero_region"] if shared_tail else None

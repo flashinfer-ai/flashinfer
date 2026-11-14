@@ -214,6 +214,44 @@ _STAGE_BINDINGS = {
         "ll_reuse",
     ),
 }
+# Stage fields one architecture replaces (the kernel symbol and bindings; the
+# launch contract otherwise holds): on sm_107a, stage_inputs also builds every
+# owner's route codes, so input_arrive only sends them; local_unpermute pushes
+# each partial row into its source's local_partials (combine then reads them locally).
+_ARCH_STAGE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
+    "sm_107a": {
+        "stage_inputs": {
+            "symbol": "kernel_rank_major_stage_inputs_v2",
+            "bindings": (*_STAGE_BINDINGS["stage_inputs"], "route_codes_out"),
+        },
+        "input_arrive": {
+            "symbol": "kernel_rank_major_input_arrive_v3",
+            "bindings": (
+                "active_tokens_per_rank",
+                "pg_world",
+                "pg_rank",
+                "pg_flags",
+                "route_codes_out",
+                "route_codes_peers",
+            ),
+        },
+        "local_unpermute": {
+            "symbol": "kernel_rank_major_exact_unpermute_v11",
+            "bindings": (
+                "expert_output",
+                "topk_weights",
+                "token_to_permuted",
+                "local_partials_peers",
+                "hidden_size",
+                "active_tokens_per_rank",
+                "pg_rank",
+            ),
+        },
+    },
+}
+# sm_100a runs the same overridden stages as sm_107a: route codes built in
+# stage_inputs, push unpermute above 32 tokens per rank.
+_ARCH_STAGE_OVERRIDES["sm_100a"] = _ARCH_STAGE_OVERRIDES["sm_107a"]
 _STAGE_LAUNCH_CONTRACTS = {
     "stage_inputs": (
         (128, 1, 1),
@@ -513,7 +551,29 @@ def _load_manifest() -> tuple[dict[str, Any], Path]:
             raise RuntimeError(
                 f"Blackwell BF16 rank-major stage {stage_name} launch contract drifted"
             )
+    expected_overrides = {
+        arch: {
+            stage_name: {
+                field: list(value) if field == "bindings" else value
+                for field, value in fields.items()
+            }
+            for stage_name, fields in overrides.items()
+        }
+        for arch, overrides in _ARCH_STAGE_OVERRIDES.items()
+    }
+    if manifest.get("arch_stage_overrides") != expected_overrides:
+        raise RuntimeError(
+            "Blackwell BF16 rank-major per-architecture stage overrides drifted"
+        )
     return manifest, source_path
+
+
+def _stages_for_arch(manifest: dict[str, Any], arch: str) -> list[dict[str, Any]]:
+    """The manifest stages with the kernel symbol and bindings ``arch`` replaces."""
+    overrides = manifest["arch_stage_overrides"].get(arch, {})
+    return [
+        {**stage, **overrides.get(stage["name"], {})} for stage in manifest["stages"]
+    ]
 
 
 def _nvcc() -> Path:
@@ -946,6 +1006,16 @@ class BlackwellBf16RankMajorSession:
             group_name=name,
         )
         self._route_codes.local.zero_()
+        # sm_107a: route codes [owner][token][8] that stage_inputs builds and
+        # input_arrive sends into every owner's route codes; the routed owner
+        # masks stay unused there (dispatch reads the route codes instead).
+        self._route_codes_out: torch.Tensor | None = None
+        if self._arch in ("sm_100a", "sm_107a"):
+            self._route_codes_out = torch.zeros(
+                (_WORLD_SIZE * _TOKENS_PER_RANK * 2,),
+                dtype=torch.int32,
+                device=self._device,
+            )
         # LL (flag-in-data) buffers of the small-T path: [bank][source][token][header + row] dispatch words and
         # [bank][owner][token][row] combine words; zero words never match an epoch (epochs start at 1).
         self._ll_dispatch = _alloc_symmetric(
@@ -1036,14 +1106,11 @@ class BlackwellBf16RankMajorSession:
         )
 
         self._manifest, source_path = _load_manifest()
-        self._stage_by_name = {
-            stage["name"]: stage for stage in self._manifest["stages"]
-        }
+        stages = _stages_for_arch(self._manifest, self._arch)
+        self._stage_by_name = {stage["name"]: stage for stage in stages}
         cubin_path = _compile_cubin(source_path, self._manifest, self._arch)
         torch.distributed.barrier(group=process_group)
-        self._library = _KernelLibrary(
-            cubin_path, self._manifest["stages"], self._device_index
-        )
+        self._library = _KernelLibrary(cubin_path, stages, self._device_index)
         self._weight_descriptor_sets: dict[tuple[int, int], _WeightDescriptorSet] = {}
         self._active_weight_key: tuple[int, int] | None = None
         self._descriptors: dict[str, int] = {}
@@ -1235,20 +1302,30 @@ class BlackwellBf16RankMajorSession:
             self._inputs_staged = True
             self._staged_capture_id = capture_id
             return
+        values: tuple[Any, ...] = (
+            p(hidden_states),
+            p(topk_ids),
+            p(topk_weights),
+            p(self._hidden_states.local),
+            p(self._topk_ids.local),
+            p(self._topk_weights.local),
+            1 if topk_ids.dtype is torch.int64 else 0,
+            hidden_copy,
+            active_tokens_per_rank,
+        )
+        types: tuple[Any, ...] = (
+            *self._pointer_types(6),
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+        )
+        if self._route_codes_out is not None:
+            values = (*values, p(self._route_codes_out))
+            types = (*types, ctypes.c_void_p)
         self._library.launch(
             self._stage_by_name["stage_inputs"],
-            (
-                p(hidden_states),
-                p(topk_ids),
-                p(topk_weights),
-                p(self._hidden_states.local),
-                p(self._topk_ids.local),
-                p(self._topk_weights.local),
-                1 if topk_ids.dtype is torch.int64 else 0,
-                hidden_copy,
-                active_tokens_per_rank,
-            ),
-            (*self._pointer_types(6), ctypes.c_int32, ctypes.c_int32, ctypes.c_int32),
+            values,
+            types,
             torch.cuda.current_stream(self._device).cuda_stream,
             grid=(active_tokens_per_rank, 1, 1),
         )
@@ -1440,6 +1517,17 @@ class BlackwellBf16RankMajorSession:
             )
         active_tokens_per_rank = self._active_tokens_per_rank
         world_rank = (_WORLD_SIZE, self._rank)
+        if name == "input_arrive" and self._route_codes_out is not None:
+            return (
+                (
+                    active_tokens_per_rank,
+                    *world_rank,
+                    p(self._flags.peers),
+                    p(self._route_codes_out),
+                    p(self._route_codes.peers),
+                ),
+                (*(ctypes.c_int32,) * 3, *self._pointer_types(3)),
+            )
         if name in ("input_barrier", "input_arrive"):
             return (
                 (
@@ -1601,6 +1689,17 @@ class BlackwellBf16RankMajorSession:
                 _INTERMEDIATE_SIZE,
             )
             return values, (*self._pointer_types(6), ctypes.c_int32)
+        if name == "local_unpermute" and self._arch in ("sm_100a", "sm_107a"):
+            values = (
+                p(self._gemm2_output),
+                p(self._recv_weights),
+                p(self._token_to_permuted),
+                p(self._local_partials.peers),
+                _HIDDEN_SIZE,
+                active_tokens_per_rank,
+                self._rank,
+            )
+            return values, (*self._pointer_types(4), *(ctypes.c_int32,) * 3)
         if name == "local_unpermute":
             values = (
                 p(self._gemm2_output),

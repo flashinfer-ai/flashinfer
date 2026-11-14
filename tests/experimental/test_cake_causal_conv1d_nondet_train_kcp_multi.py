@@ -31,7 +31,7 @@ from flashinfer.experimental.cake import cake_causal_conv1d_nondet_train as pkg
 from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
     kcp as conv_kcp,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 from tests.test_cake_causal_conv1d_det_train_kcp import (
     DW_ATOL,
     DW_RTOL,
@@ -71,8 +71,8 @@ def _singles(ctx, xs, ws, dys, *, det=False):
     out = []
     if det:
         forward, backward = (
-            det_kcp.cake_causal_conv1d_det_forward_kcp,
-            det_kcp.cake_causal_conv1d_det_backward_kcp,
+            det_kcp.cake_causal_conv1d_det_train_kcp_forward,
+            det_kcp.cake_causal_conv1d_det_train_kcp_backward,
         )
     else:
         forward, backward = (

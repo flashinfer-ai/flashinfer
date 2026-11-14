@@ -1603,13 +1603,13 @@ def _encode(
 
 
 def _activation_map(t: torch.Tensor, total_tokens: int, heads: int, segment_elems: int):
-    """Key-major ``(DK, T_total, H)`` view of contiguous ``[1, T, H, DK]``."""
+    """Key-major ``(DK, T_total, H)`` view of token-strided ``[1, T, H, DK]``."""
     esz = t.element_size()
     return _encode(
         t.dtype,
         t.data_ptr(),
         global_dim=(DK, total_tokens, heads),
-        strides_bytes=(heads * DK * esz, DK * esz),
+        strides_bytes=(t.stride(1) * esz, t.stride(2) * esz),
         box_dim=(segment_elems, BT, 1),
     )
 
@@ -1678,7 +1678,9 @@ def build_tensor_maps(
     )
     key = (
         q.data_ptr(),
+        q.stride(),
         k.data_ptr(),
+        k.stride(),
         g.data_ptr(),
         g.dtype,
         ws_kd.data_ptr(),
@@ -1763,6 +1765,7 @@ def recurrence_tensor_map_specs(
     aq_ptr: int,
     gt_ptr: int,
     v_ptr: int,
+    v_stride: tuple[int, ...],
     out_ptr: int,
     heads: int,
     total_tokens: int,
@@ -1803,17 +1806,23 @@ def recurrence_tensor_map_specs(
             swizzle="NONE",
         ),
     }
-    # V and out are the same geometry over [1, T, H, 128]; when they are also
-    # the same storage they collapse to one descriptor by equality.
+    # V can have gaps between token rows; output remains contiguous.
     activation = dict(
         dtype=torch.bfloat16,
         global_dim=(DV, total_tokens, heads),
-        global_stride_bytes=(heads * DV * 2, DV * 2),
         box_dim=(DV_HALF, BT, 1),
         swizzle="128B",
     )
-    specs["v"] = TensorMapSpec(base_ptr=v_ptr, **activation)
-    specs["out"] = TensorMapSpec(base_ptr=out_ptr, **activation)
+    specs["v"] = TensorMapSpec(
+        base_ptr=v_ptr,
+        global_stride_bytes=(v_stride[1] * 2, v_stride[2] * 2),
+        **activation,
+    )
+    specs["out"] = TensorMapSpec(
+        base_ptr=out_ptr,
+        global_stride_bytes=(heads * DV * 2, DV * 2),
+        **activation,
+    )
 
     if state_in_ptr is not None or state_out_ptr is not None:
         if state_dtype is None:
@@ -2330,6 +2339,7 @@ def launch_recurrence(
         aq_ptr=workspace.aq.data_ptr(),
         gt_ptr=workspace.g_total.data_ptr(),
         v_ptr=v.data_ptr(),
+        v_stride=v.stride(),
         out_ptr=out.data_ptr(),
         heads=heads,
         total_tokens=total_tokens,
@@ -3240,8 +3250,6 @@ def store_vec8_bf16(ptr, idx, frag):
 
 @cute.kernel
 def prepare_kernel(
-    gq: cute.Tensor,
-    gk: cute.Tensor,
     gg: cute.Tensor,
     gbeta: cute.Tensor,
     ga_log_exp: cute.Tensor,
@@ -3907,8 +3915,6 @@ def prepare_kernel(
 
 @cute.jit
 def _prepare_entry(
-    gq: cute.Tensor,
-    gk: cute.Tensor,
     gg: cute.Tensor,
     gbeta: cute.Tensor,
     ga_log_exp: cute.Tensor,
@@ -3936,8 +3942,6 @@ def _prepare_entry(
     G_FP32: cutlass.Constexpr,
 ):
     prepare_kernel(
-        gq,
-        gk,
         gg,
         gbeta,
         ga_log_exp,
@@ -4016,8 +4020,6 @@ def launch_prepare_device(
     )
 
     args = (
-        _flat(q),
-        _flat(k),
         _flat(g),
         _flat(beta),
         _flat(a_log_exp),
@@ -4700,8 +4702,6 @@ def launch_recurrence_device(
 @cute.jit
 def _fwd_entry(
     # --- prepare inputs ---
-    gq: cute.Tensor,
-    gk: cute.Tensor,
     gg: cute.Tensor,
     gbeta: cute.Tensor,
     ga_log_exp: cute.Tensor,
@@ -4754,8 +4754,6 @@ def _fwd_entry(
     second stream measured slower because co-resident overlap needs a flag ring.
     """
     prepare_kernel(
-        gq,
-        gk,
         gg,
         gbeta,
         ga_log_exp,
@@ -4948,8 +4946,6 @@ def launch_fwd(
     stream = cuda_driver.CUstream(torch.cuda.current_stream(out.device).cuda_stream)
 
     args = (
-        flat_view(q),
-        flat_view(k),
         flat_view(g),
         flat_view(beta),
         flat_view(a_log_exp),

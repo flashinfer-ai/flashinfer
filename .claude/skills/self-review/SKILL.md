@@ -61,7 +61,7 @@ From [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) (Pull Request Guidelines):
   (`benchmarks/flashinfer_benchmark.py` or a named script), with the GPU and problem sizes.
   A speedup ratio without absolute numbers, or numbers without a GPU, is not enough. Use the
   `benchmark-kernel` skill to produce them.
-- Documentation referenced by the change (`CLAUDE.md`, `.claude/skills/`, `docs/`) is
+- Documentation referenced by the change (`AGENTS.md`, `.claude/skills/`, `docs/`) is
   updated in the same PR.
 - **Backwards compatibility.** If the change removes or renames a public API, or changes a
   signature, default, or semantics, say so explicitly in the PR description.

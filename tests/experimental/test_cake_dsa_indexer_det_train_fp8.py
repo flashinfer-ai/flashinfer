@@ -23,7 +23,7 @@ limitations under the License.
 # registered FP8 programs and skip otherwise.
 #
 # Like ``test_cake_dsa_indexer_det_train.py`` this suite names the package once, through
-# ``tests.test_helpers.cake_package``, and imports nothing else from flashinfer.
+# ``tests.cake.test_helpers.cake_package``, and imports nothing else from flashinfer.
 
 import copy
 import importlib.util
@@ -32,8 +32,8 @@ import itertools
 import pytest
 import torch
 
-from tests.test_helpers import cake_dsa_indexer_reference as ref
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers import cake_dsa_indexer_reference as ref
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake.cake_dsa_indexer_det_train", "cake_backend")
 cake_jit = cake_package("cake.cake_dsa_indexer_det_train", "cake_jit")
@@ -78,9 +78,9 @@ _FP8_WIDE_ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 
 def _spec_fp8_keys(arch: str) -> set[str]:
     """The FP8 scan keys the export registers per architecture: narrow, l6, split_narrow, split_l6 and wide, each
-    with its :lsf copy, on sm_100a / sm_103a; narrow, l6, split_narrow and wide, without :lsf copies, on sm_107a.  A
-    stand-in registry for the host tests while a checkout registers none; the dispatch reads the tile unroll from the
-    keys, so two unrolls appear."""
+    with its :lsf copy, on sm_100a / sm_103a; narrow, l6 and its snake copy, split_narrow and wide, without :lsf
+    copies, on sm_107a.  A stand-in registry for the host tests while a checkout registers none; the dispatch reads
+    the tile unroll from the keys, so two unrolls appear."""
     if arch == "sm_107a":
         kinds, lsf = (("narrow", 2), ("l6", 1), ("split_narrow", 1)), (False,)
     else:
@@ -88,10 +88,13 @@ def _spec_fp8_keys(arch: str) -> set[str]:
         lsf = (False, True)
     if arch in _FP8_WIDE_ARCHES:
         kinds += (("wide", 2),)
-    return {
+    keys = {
         scan_key(kind, unroll, False, True, copy, form=FP8)
         for (kind, unroll), copy in itertools.product(kinds, lsf)
     }
+    if arch == "sm_107a":
+        keys.add(scan_key("l6", 1, True, True, False, form=FP8))
+    return keys
 
 
 def _registries():
@@ -183,7 +186,7 @@ def test_fp8_scan_programs_index_the_fp8_keys_only():
         "scan:narrow:u1:s0:f1:fp8",
         "scan:narrow:u2:s0:f1:fp8",
         "scan:narrow:u1:s0:f1:fp8:lsf",
-        "scan:l6:u1:s1:f1:fp8",  # snake order: not an FP8 build
+        "scan:l6:u1:s1:f1:fp8",  # a snake copy: not indexed, select_fp8_program swaps it in
         "scan:l6:u1:s0:f0:fp8",  # plain fit form: not an FP8 build
         MERGE_KEY,
     }
@@ -228,11 +231,99 @@ def test_fp8_record_replaces_only_its_fields_and_leaves_the_bf16_record():
         "sm_103a": [],
         "sm_107a": ["l6", "narrow", "split_narrow", "wide"],
     }
-    # the FP8 records' own rules: sm_107a keeps no split-fit rule (no FP8 split program is measured under one)
+    # the FP8 records' own rules: every split field pinned (no split-resident rule); sm_107a keeps no split-fit
+    # rule (no FP8 split program is measured under one), and no FP8 call walks its key tiles in descending order
+    # (the descending-walk programs are BF16 programs); the sm_107a FP8 record sets neither BF16 sampling rule (the
+    # #7549 rules are measured on the BF16 programs) and runs no longest-first copy (its static programs draw no
+    # tickets to order; the BF16 record runs the copies of its l6 ticket programs)
+    split_fields = (
+        "split_max",
+        "split_min_range_tiles",
+        "split_wave_rule",
+        "split_wave_scope",
+        "split_fit_rule",
+        "split_resident_rule",
+        "split_units",
+    )
     assert {
-        arch: {f: v for f, v in fields.items() if f != "static_scan_kinds"}
+        arch: {
+            f: v
+            for f, v in fields.items()
+            if f != "static_scan_kinds" and f not in split_fields
+        }
         for arch, fields in cake_jit.POLICY_FP8.items()
-    } == {"sm_100a": {}, "sm_103a": {}, "sm_107a": {"split_fit_rule": None}}
+    } == {
+        "sm_100a": {
+            "wide_wave_rule": [1.7, 1.3, 84.0],
+            "desc_walk_kinds": None,
+            "snake_packed_rule": None,
+            "snake_l6_fallback_waves": None,
+        },
+        "sm_103a": {
+            "wide_wave_rule": [
+                1.7,
+                1.15,
+                64.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.26,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ],
+            "lsf_single_rule": [64.0],
+            "desc_walk_kinds": None,
+            "snake_packed_rule": None,
+            "snake_l6_fallback_waves": None,
+        },
+        "sm_107a": {
+            "sample_class_rule": None,
+            "sample_long_rule": None,
+            "lsf_programs": False,
+            "snake_cap_rule": [1, 40],
+            "desc_walk_kinds": None,
+            "snake_packed_rule": None,
+            "snake_l6_fallback_waves": None,
+        },
+    }
+    assert {
+        arch: {f: fields[f] for f in split_fields}
+        for arch, fields in cake_jit.POLICY_FP8.items()
+    } == {
+        "sm_100a": dict(
+            split_max=16,
+            split_min_range_tiles=32,
+            split_wave_rule=None,
+            split_wave_scope=None,
+            split_fit_rule=[4096],
+            split_resident_rule=None,
+            split_units=["l6", "narrow"],
+        ),
+        "sm_103a": dict(
+            split_max=16,
+            split_min_range_tiles=32,
+            split_wave_rule=None,
+            split_wave_scope=None,
+            split_fit_rule=[4096],
+            split_resident_rule=None,
+            split_units=["l6", "narrow"],
+        ),
+        "sm_107a": dict(
+            split_max=16,
+            split_min_range_tiles=32,
+            split_wave_rule=[1000, 0.12],
+            split_wave_scope=[["narrow"], 1, True],
+            split_fit_rule=None,
+            split_resident_rule=None,
+            split_units=["narrow", "wide"],
+        ),
+    }
     # the FP8 record never inherits the BF16 programs' static kinds, and takes only record fields
     with pytest.raises(ValueError, match="static_scan_kinds"):
         fp8_policy_record(cake_jit.POLICY["sm_107a"], {})
@@ -349,9 +440,10 @@ def test_fp8_dispatch_maps_the_decision_under_the_fp8_record_and_reaches_every_f
 ):
     """The FP8 dispatch runs the BF16 decision procedure under the FP8 record and maps its kind to a registered FP8
     kind (``FP8_KIND_FALLBACK``); on a geometry grid every program it selects is an FP8 key of the registry, never a
-    CTA pair, a snake order or the plain fit form, the split, unroll and :lsf choices follow that decision where an
-    FP8 program carries them, the sampled first threshold and the check period are those of the kind that runs, and
-    every FP8 key is selected by some call."""
+    CTA pair or the plain fit form, the split, unroll, snake and :lsf choices follow that decision where an FP8 program
+    carries them (the :lsf copy also on a one-segment wide call within the record's lsf_single_rule), the sampled first
+    threshold and the check period are those of the kind that runs, and every FP8 key
+    is selected by some call."""
     if not fp8_keys:
         pytest.skip(f"this checkout registers no FP8 scan program for {arch}")
     policy = _fp8_policy(arch)
@@ -377,14 +469,25 @@ def test_fp8_dispatch_maps_the_decision_under_the_fp8_record_and_reaches_every_f
                 c = select_fp8_program(policy, fp8_programs=programs, **call)
                 where = (arch, grid, T, Tkv, S, ratio, top_k, bound, sample)
                 assert c.scan_key in fp8_keys, (*where, c.scan_key)
-                assert not c.pair and not c.snake and c.sample_fit, where
+                assert not c.pair and c.sample_fit, where
+                # the snake order where the decision takes it, the registry has the snake copy of the program and
+                # the call stays within the record's snake_cap_rule
+                plain = c.scan_key.replace(":s1:", ":s0:", 1)
+                assert c.snake == (
+                    decided.snake
+                    and plain.replace(":s0:", ":s1:", 1) in keys
+                    and policy.snake_copy_fits(T, S, c.block_q, grid)
+                ), (*where, c.scan_key)
                 assert c.grid_ctas == grid and c.finalize_key in keys, where
                 physical = decided.physical_kind
                 if physical not in fp8_kinds:
                     physical = FP8_KIND_FALLBACK[physical]
                 assert c.physical_kind == physical, (*where, decided.scan_key)
                 assert (c.split, c.n_split) == (decided.split, decided.n_split), where
-                assert c.lsf == (decided.lsf and (physical, True) in programs), where
+                lsf = decided.lsf or (
+                    physical == "wide" and policy.lsf_single_fits(T, Tkv, S, ratio)
+                )
+                assert c.lsf == (lsf and (physical, True) in programs), where
                 unrolls = programs[(physical, c.lsf)]
                 assert c.tile_unroll == (
                     decided.tile_unroll
@@ -430,14 +533,96 @@ def test_fp8_dispatch_maps_the_decision_under_the_fp8_record_and_reaches_every_f
     assert reached == fp8_keys, sorted(fp8_keys - reached)
 
 
+def test_fp8_snake_marked_sm107_call_runs_the_registered_snake_copy():
+    """On sm_107a a call the snake rule marks (half a query per key or more, 32 mean unit tiles or more) runs the snake
+    copy of the FP8 l6 program where the registry has it and the call is one document within the FP8 record's
+    snake_cap_rule waves, and the plain program without the copy, over packed documents or beyond the waves; a call
+    the rule leaves runs the plain program."""
+    arch, twin = "sm_107a", "scan:l6:u1:s1:f1:fp8"
+    keys = set(cake_jit.PROGRAM_KEYS.get(arch, {}))
+    if twin not in keys:
+        pytest.skip(f"this checkout registers no FP8 snake program for {arch}")
+    policy = _fp8_policy(arch)
+    marked = dict(
+        num_queries=16384, num_keys=16384, num_segments=1, ratio=1, top_k=2048, grid=212
+    )
+    left = dict(marked, num_queries=1024, num_keys=8192)
+    assert select_program(policy, scan_keys=keys, **marked).snake
+    assert not select_program(policy, scan_keys=keys, **left).snake
+    c = select_fp8_program(policy, scan_keys=keys, **marked)
+    assert c.scan_key == twin and c.snake, c.scan_key
+    c = select_fp8_program(policy, scan_keys=keys - {twin}, **marked)
+    assert c.scan_key == "scan:l6:u1:s0:f1:fp8" and not c.snake, c.scan_key
+    c = select_fp8_program(policy, scan_keys=keys, **left)
+    assert ":s1:" not in c.scan_key and not c.snake, c.scan_key
+    # marked calls beyond the cap keep the plain order: 131072 queries (103 waves of 6-query units on 212 CTAs) and
+    # two packed 16384-query documents
+    long = dict(marked, num_queries=131072, num_keys=131072)
+    packed = dict(marked, num_queries=32768, num_keys=32768, num_segments=2)
+    for call in (long, packed):
+        assert select_program(policy, scan_keys=keys, **call).snake, call
+        assert not policy.snake_copy_fits(
+            call["num_queries"], call["num_segments"], 6, 212
+        ), call
+        c = select_fp8_program(policy, scan_keys=keys, **call)
+        assert c.scan_key == "scan:l6:u1:s0:f1:fp8" and not c.snake, (call, c.scan_key)
+
+
+def test_fp8_one_document_sm103_wide_call_runs_the_lsf_copy_within_the_rule():
+    """On sm_103a a one-document FP8 call of the wide unit runs the :lsf copy of the FP8 wide program from the FP8
+    record's lsf_single_rule mean unit tiles on (the plan leaves the segment order plain on one segment), and the plain
+    program below them or where the registry has no copy; packed calls keep the plan's segment order, and the BF16
+    dispatch keeps the plain order on one segment."""
+    arch, plain, copy = (
+        "sm_103a",
+        "scan:wide:u2:s0:f1:fp8",
+        "scan:wide:u2:s0:f1:fp8:lsf",
+    )
+    keys = set(cake_jit.PROGRAM_KEYS.get(arch, {}))
+    if not {plain, copy} <= keys:
+        pytest.skip(
+            f"this checkout registers no FP8 wide program with its :lsf copy for {arch}"
+        )
+    policy = _fp8_policy(arch)
+    assert policy.lsf_single_rule == [64.0]
+    # mean unit tiles (Tkv - T / 2) / 128: 544 and 56; on 152 CTAs the wide unit needs 7 waves (wide_wave_rule): long
+    # (an l6 call) needs 9 of the l6 unit (>= 1.15 x 7) over the 88.5-tile minimum (64 + 3.5 x (14 - 7)), short (top_k
+    # 256, a narrow call) 14 of the narrow unit (>= 1.7 x 7)
+    long = dict(
+        num_queries=8192, num_keys=73728, num_segments=1, ratio=1, top_k=2048, grid=152
+    )
+    short = dict(long, num_keys=11264, top_k=256)
+    for call in (long, short):
+        decided = select_program(policy, scan_keys=keys, **call)
+        assert decided.physical_kind == "wide" and not decided.lsf, (
+            call,
+            decided.scan_key,
+        )
+        assert not select_program(policy_for(arch), scan_keys=keys, **call).lsf, call
+    c = select_fp8_program(policy, scan_keys=keys, **long)
+    assert c.scan_key == copy and c.lsf, c.scan_key
+    c = select_fp8_program(policy, scan_keys=keys - {copy}, **long)
+    assert c.scan_key == plain and not c.lsf, c.scan_key
+    c = select_fp8_program(policy, scan_keys=keys, **short)
+    assert c.scan_key == plain and not c.lsf, c.scan_key
+    # four equal packed documents of 120 mean unit tiles (top_k 256): the plan keeps the plain order, and so does the
+    # FP8 dispatch
+    packed = dict(long, num_keys=65536, num_segments=4, max_seqlen_k=16384, top_k=256)
+    decided = select_program(policy, scan_keys=keys, **packed)
+    assert decided.physical_kind == "wide" and not decided.lsf, decided.scan_key
+    c = select_fp8_program(policy, scan_keys=keys, **packed)
+    assert c.scan_key == plain and not c.lsf, c.scan_key
+
+
 @pytest.mark.parametrize(
     "arch, grid", [("sm_100a", 148), ("sm_103a", 152), ("sm_107a", 212)]
 )
 def test_fp8_wide_call_runs_the_wide_or_l6_program(arch, grid):
     """s1_8k_on_64k (8192 queries over 73728 keys, one segment, top_k 2048): the BF16 record plans a wide unit (on
     sm_107a the sampled call drops its CTA pair, ``wide_pair_snake_only``), and the FP8 form runs its wide program (8
-    queries per unit) where the architecture registers one (``_FP8_WIDE_ARCHES``: sm_100a, sm_103a and sm_107a), else
-    its l6 program (``FP8_KIND_FALLBACK``), unpaired and unsplit, rather than the narrow one."""
+    queries per unit) where the architecture registers one (``_FP8_WIDE_ARCHES``: sm_100a, sm_103a and sm_107a; on
+    sm_103a its :lsf copy, ``lsf_single_rule``), else its l6 program (``FP8_KIND_FALLBACK``), unpaired and unsplit,
+    rather than the narrow one."""
     keys = set((cake_jit.PROGRAM_KEYS or {}).get(arch) or ())
     if not any(scan_key_form(k) == FP8 for k in keys):
         pytest.skip(f"this checkout registers no FP8 scan program for {arch}")
@@ -458,6 +643,10 @@ def test_fp8_wide_call_runs_the_wide_or_l6_program(arch, grid):
         if arch in _FP8_WIDE_ARCHES
         else ("scan:l6:u1:s0:f1:fp8", 6)
     )
+    if (
+        arch == "sm_103a"
+    ):  # one document of 544 mean unit tiles: the :lsf copy (lsf_single_rule)
+        key += ":lsf"
     assert fp8.scan_key == key, fp8.scan_key
     assert (fp8.block_q, fp8.pair, fp8.n_split, fp8.grid_ctas) == (
         block_q,
@@ -918,9 +1107,7 @@ def test_fp8_dispatch_invariance_over_every_registered_program(monkeypatch, shap
     arch = arch_for(torch.device("cuda"))
     policy = policy_for(arch, FP8)
     keys = sorted(
-        key
-        for unrolls in cake_backend.fp8_programs_for(arch).values()
-        for key in unrolls.values()
+        key for key in cake_jit.PROGRAM_KEYS.get(arch, {}) if scan_key_form(key) == FP8
     )
     inputs = ref.make_fp8_inputs(seed=41, device="cuda", **shape)
     rows, reference = None, None

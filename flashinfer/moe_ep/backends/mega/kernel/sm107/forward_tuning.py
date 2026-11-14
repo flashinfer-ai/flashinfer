@@ -26,15 +26,28 @@ class ForwardExecution:
         self.quantize_input, self.output = quantize_input, output
 
     def contract(self):
-        def layout(value):
+        from .....batch_invariant.spec import f32_bits
+
+        def layout(value, *, batched=False):
             if value is None:
                 return None
-            return [str(value.dtype), list(value.shape[1:]), list(value.stride())]
+            if isinstance(value, (int, float)):
+                return {"scalar_f32": f32_bits(value)}
+            return [
+                str(value.dtype),
+                list(value.shape[1:] if batched else value.shape),
+                list(value.stride()),
+                value.device.type,
+            ]
 
-        inputs = {
-            name: getattr(self.tensors, name)
-            for name in ("hidden_states", "topk_ids", "topk_weights", "scales")
-        }
+        batched = (
+            "hidden_states",
+            "topk_ids",
+            "topk_weights",
+            "scales",
+            "fc1_activation_per_token_scale",
+        )
+        inputs = {name: getattr(self.tensors, name) for name in batched}
         for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
             value = getattr(self.tensors, name)
             inputs[name] = (
@@ -47,8 +60,14 @@ class ForwardExecution:
             "input_norm_const": getattr(
                 self.backend._kernel_config, "input_norm_const", 1.0
             ),
-            "inputs": {name: layout(value) for name, value in inputs.items()},
-            "output": layout(self.output),
+            "inputs": {
+                name: layout(value, batched=name in batched)
+                for name, value in inputs.items()
+            },
+            "num_valid_tokens": layout(
+                getattr(self.backend._kernel_config, "num_valid_tokens_tensor", None)
+            ),
+            "output": layout(self.output, batched=True),
             "staging": {
                 name: os.environ.get(name, default)
                 for name, default in (

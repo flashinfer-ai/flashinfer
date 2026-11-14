@@ -11,7 +11,7 @@ from flashinfer.mla import (
     batch_decode_sparse_mla_dsv4,
     trtllm_batch_decode_sparse_mla_dsv4,
 )
-from tests.test_helpers.hca_dsv4 import (
+from tests.attention.test_helpers.hca_dsv4 import (
     _cpu_hca_inputs,
     _cpu_compressed_page_aligned_sparse_hca_inputs,
     _cpu_compressed_page_aligned_conversion_inputs,

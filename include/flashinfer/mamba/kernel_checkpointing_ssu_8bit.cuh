@@ -509,7 +509,13 @@ __device__ __forceinline__ void replay_state_mma_8bit_chain(
 #pragma unroll
   for (int i = 0; i < D_ROWS_PER_THREAD; ++i) {
     float const a = per_thread_amax[i];
-    encode_scale_per_row[i] = (a == 0.f) ? 1.f : (QUANT_MAX / a);
+    float denominator = a;
+    if constexpr (std::is_same_v<state_t, __nv_fp8_e4m3>) {
+      // Keep nonzero FP8 values normal after decoding into FP32.
+      constexpr float MINIMUM_AMAX = QUANT_MAX * 0x1p-117f;
+      denominator = (a < MINIMUM_AMAX) ? MINIMUM_AMAX : a;
+    }
+    encode_scale_per_row[i] = (a == 0.f) ? 1.f : (QUANT_MAX / denominator);
   }
 
   // ── STG decode_scale (one writer per (cache, head, d_row)).

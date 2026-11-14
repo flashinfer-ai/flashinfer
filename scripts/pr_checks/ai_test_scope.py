@@ -23,6 +23,7 @@ from typing import List
 from urllib.parse import quote, urlsplit
 
 from merged_source import MergedSource
+from scope_evidence import EvidenceContext
 
 
 DEFAULT_BASE_URL = "https://inference-api.nvidia.com/v1"
@@ -58,7 +59,9 @@ Avoid overlapping targets. Leave experimental-tests unchanged.
 
 EVIDENCE_PROMPT = """Choose additional files needed to connect changed behavior to test assertions
 and an applicable CI launcher. Return JSON with only "read_paths": an array of
-at most 20 distinct paths from inventory_at_merged_tree or candidate_test_files.
+at most 20 distinct paths from inventory_at_merged_tree, candidate_test_files,
+or configuration_files. Configuration files may be retried when their eager
+inspection was omitted from source_files to reserve space for this request.
 Prioritize implementation, test bodies, conftest/configuration, and runner scripts.
 Do not request contents already in source_files or ci_files. Return [] if sufficient.
 This is your only file-request opportunity; do not select final targets yet.
@@ -80,6 +83,9 @@ Use "needs_maintainer" for uncertain relevance/routing or missing/truncated evid
 Use "full_suite" only for a demonstrated broad impact requiring the full CI suite;
 the reason must cite the changed behavior and supporting CI/source evidence.
 These three outcomes require targets: []. Files in unavailable_evidence were not inspected.
+omitted_evidence reports missing PR metadata, patches, and inventory entries. Missing
+evidence must never justify full_suite; request relevant available files or return
+needs_maintainer. A null patch is not proof of a content-free rename.
 Only "full_suite" automatically launches CI. Focused and uncertain recommendations
 are posted for developer review and an explicit run command.
 Never infer coverage from filenames alone.
@@ -477,7 +483,6 @@ class PytestTargetSelector:
 
     def _select(self, pr):
         snapshot = resolve_merge_snapshot(self.github, pr)
-        sha = snapshot["head_sha"]
         repo = pr["base"]["repo"]["full_name"]
         tree = self.github.get_repository_tree(repo, snapshot["tree_sha"])
         if tree.get("truncated"):
@@ -488,6 +493,10 @@ class PytestTargetSelector:
             if item["type"] == "blob" and item.get("mode") in ("100644", "100755")
         }
         changed = self.github.get_pr_files(pr["number"])
+        expected_files = pr.get("changed_files")
+        file_count_mismatch = (
+            isinstance(expected_files, int) and len(changed) != expected_files
+        )
         # The files endpoint is live. Recheck before combining it with a pinned tree.
         latest = self.github.get_pr_details(pr["number"])
         if not snapshot_matches(
@@ -510,30 +519,6 @@ class PytestTargetSelector:
             and path.count("/") <= 2
             or path in ("pytest.ini", "pyproject.toml")
         )
-        files = {}
-
-        def read(path, required=False):
-            if path not in blobs:
-                if required:
-                    raise TargetSelectionError(
-                        "Requested evidence file does not exist in the merged tree"
-                    )
-                return
-            if blobs[path].get("size", 0) > MAX_FILE_BYTES:
-                raise TargetSelectionError(
-                    "Evidence file exceeds the automatic selection size limit"
-                )
-            files[path] = self.github.get_repository_blob(
-                repo, blobs[path]["sha"], MAX_FILE_BYTES
-            )
-
-        for path in (
-            "pytest.ini",
-            "pyproject.toml",
-            "tests/conftest.py",
-            "scripts/task_run_unit_tests.sh",
-        ):
-            read(path)
         ci_files = {}
         for path in (
             ".github/workflows/pr-test.yml",
@@ -545,28 +530,25 @@ class PytestTargetSelector:
             ci_files[path] = text
         candidates = [path for path in inventory if _TEST_FILE.fullmatch(path)]
         candidate_set = set(candidates)
-        context = {
-            "pr": {
-                "title": pr.get("title", ""),
-                "body": pr.get("body", ""),
-                "head_sha": sha,
-                "merged_snapshot": snapshot,
-            },
-            "changed_files": [
-                {
-                    key: item.get(key)
-                    for key in ("filename", "status", "previous_filename", "patch")
-                }
-                for item in changed
-            ],
-            # Do not repeat a potentially large test inventory in the model input.
-            "inventory_at_merged_tree": [
-                path for path in inventory if path not in candidate_set
-            ],
-            "candidate_test_files": candidates,
-            "source_files": files,
-            "ci_files": ci_files,
-        }
+        try:
+            budget = EvidenceContext(
+                pr,
+                snapshot,
+                changed,
+                inventory,
+                candidates,
+                ci_files,
+                MAX_CONTEXT_CHARS,
+            )
+        except ValueError as error:
+            raise TargetSelectionError(str(error)) from error
+        context = budget.context
+        files = context["source_files"]
+        visible_paths = set(
+            context["inventory_at_merged_tree"]
+            + context["candidate_test_files"]
+            + context["configuration_files"]
+        )
 
         secrets = (
             os.getenv("GH_TOKEN"),
@@ -576,12 +558,6 @@ class PytestTargetSelector:
         )
 
         def infer(task):
-            encoded = json.dumps(context)
-            if len(encoded) > MAX_CONTEXT_CHARS:
-                raise TargetSelectionError(
-                    "PR evidence exceeds the automatic selection context limit"
-                )
-
             # Include repository evidence only, never client configuration or auth headers.
             def scrub(value):
                 if isinstance(value, str):
@@ -593,25 +569,39 @@ class PytestTargetSelector:
                 return value
 
             safe_context = scrub(context)
+            stage = "evidence" if task == EVIDENCE_PROMPT else "selection"
+            sent_chars = len(json.dumps(safe_context))
+            diagnostics = {**budget.diagnostics(), "sent_chars": sent_chars}
+            print(
+                f"AI scope context ({stage}): {json.dumps(diagnostics)}",
+                file=sys.stderr,
+            )
+            if sent_chars > MAX_CONTEXT_CHARS:
+                raise TargetSelectionError(
+                    f"Sanitized {stage} evidence exceeds the context budget"
+                )
             return self.inference.complete(safe_context, task)
 
-        unavailable = {}
-        context["unavailable_evidence"] = unavailable
-
-        def inspect(path):
+        def inspect(path, reserve=0):
             if path in files:
                 return
             if blobs[path].get("size", 0) > MAX_FILE_BYTES:
-                unavailable[path] = "file size limit"
+                budget.unavailable(path, "file size limit")
                 return
-            read(path, required=True)
-            if len(json.dumps(context)) > MAX_CONTEXT_CHARS - 2000:
-                del files[path]
-                unavailable[path] = "context budget"
+            budget.add_source(
+                path,
+                self.github.get_repository_blob(
+                    repo, blobs[path]["sha"], MAX_FILE_BYTES
+                ),
+                reserve,
+            )
+
+        for path in context["configuration_files"]:
+            inspect(path, reserve=min(50_000, MAX_CONTEXT_CHARS // 4))
 
         # Include changed test bodies before asking the model for more evidence.
-        for path in sorted(changed_paths & candidate_set):
-            inspect(path)
+        for path in sorted(changed_paths & set(context["candidate_test_files"])):
+            inspect(path, reserve=min(50_000, MAX_CONTEXT_CHARS // 4))
 
         evidence = infer(EVIDENCE_PROMPT)
         requested = evidence.get("read_paths")
@@ -622,7 +612,7 @@ class PytestTargetSelector:
             key=lambda path: not isinstance(path, str) or path not in candidate_set,
         ):
             if not isinstance(path, str) or (
-                path not in inventory and path not in ci_files
+                path not in visible_paths and path not in ci_files
             ):
                 raise TargetSelectionError(
                     "AI requested a file outside the supplied repository inventory"
@@ -647,6 +637,17 @@ class PytestTargetSelector:
             if not isinstance(reason, str) or not reason.strip():
                 raise TargetSelectionError("AI decision is missing its explanation")
             reason = _public_prose(reason, secrets)
+            if outcome == "full_suite" and (
+                file_count_mismatch
+                or context["omitted_evidence"]["changed_files"]
+                or context["omitted_evidence"]["pr_metadata"]
+            ):
+                return TargetSelection(
+                    [],
+                    "needs_maintainer",
+                    snapshot,
+                    "The complete PR change description could not be verified; review the scope manually.",
+                )
             return TargetSelection([], outcome, snapshot, reason)
         if not 1 <= len(raw) <= MAX_TARGETS:
             raise TargetSelectionError("AI must select between one and ten targets")

@@ -27,7 +27,7 @@ so an implementation that reads ``state[row]`` instead of ``state[idx[row]]``
 fails, and slots outside the indices must come through untouched. All three
 forms must produce bit-identical outputs and final states, and each call must
 be exactly one device launch. The full-census assertion (every kernel and
-memcpy per call, via ``tests.test_helpers.cake_profiler``, not a
+memcpy per call, via ``tests.cake.test_helpers.cake_profiler``, not a
 name-filtered count) is intentional: the batched + ``ssm_state_indices`` form
 currently wraps the same decode kernel in a gather and scatter of the B
 selected state rows (5 launches per call: two int32->int64 index casts, the
@@ -38,16 +38,14 @@ part where the profiler raises or returns no device records, the census
 helper skips, so the census tests (the strict xfail included) report skipped
 there rather than a false pass or XPASS.
 
-The state-dtype contract is pinned as well: the serving frameworks hold
-float32 state pools, and the CuTe decode path must refuse them with a
-``TypeError`` (#6893) rather than crash.
+Float32 state pools are covered by ``test_recurrent_kda_fp32_state.py``.
 """
 
 import pytest
 import torch
 
 from flashinfer.utils import is_sm100a_supported
-from tests.test_helpers.cake_profiler import cuda_kernel_names
+from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
 try:
     from flashinfer import recurrent_kda
@@ -252,16 +250,3 @@ def test_batched_indexed_decode_is_one_launch(B):
     removes the xfail mark. Where the profiler cannot read launches, the
     census helper skips, so this never XPASSes for lack of records."""
     _assert_single_launch(B, "batched", indexed=True)
-
-
-@pytest.mark.parametrize("layout", ("packed", "batched"))
-def test_fp32_state_pool_raises_type_error(layout):
-    """The serving frameworks hold float32 state pools; the CuTe decode path
-    requires bfloat16 state and must refuse fp32 with a TypeError naming the
-    state-dtype contract (#6893). A future fp32-state decode variant replaces
-    this test (with dtype-parametrized equivalence cases) rather than
-    flipping it."""
-    p = _inputs(8, layout, torch.float32)
-    with pytest.raises(TypeError, match="bfloat16 state"):
-        _call(p)
-        torch.cuda.synchronize()

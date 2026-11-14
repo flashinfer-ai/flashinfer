@@ -44,18 +44,20 @@ waves. The map is sized by model context, never global cache capacity. Plain
 Int32 locators and packed membership words remain separate outputs; membership
 bits are never fused into a locator.
 
-Compatible FP8 G2–G8/page-4 Keeps plans instead use eight query words per
+Compatible G2–G8/page-4 Keeps plans instead use eight query words per
 32-fragment tile, emitted directly into the same workspace with unused slots
 and tail bits zero. The public
 standalone metadata format remains page-byte masks. Sparse FP8 D256 Keeps
 loads a full head stage as two SW128 planes and uses compact single-head
 TensorMaps when cache strides permit; other cache layouts retain their descriptors.
 
-Attention caches a grouped membership row in SMEM only when the complete
-resource layout, including barriers, fits the compilation budget. Larger rows
-stay in the existing immutable metadata buffer; Softmax reads packed words for
-the current KV tile directly from GMEM. This does not change query grouping or
-the caller's split-KV permission.
+Attention caches grouped memberships in SMEM only when the complete resource
+layout, including barriers, fits the compilation budget. Runtime query-oriented
+routes stage a bounded prefix with aligned asynchronous copies: 1 KiB for split
+CTAs and 4 KiB for nonsplit CTAs. Inactive tiles are zero-filled; longer routes
+read the remaining words from the immutable GMEM table. Fixed-length plans can
+retain the complete row. The cache does not specialize runtime lengths or change
+query grouping and the caller's split-KV permission.
 
 Packed QToken-KvBlock-Sparse-Attention uses an ordinary rank-3 Q TensorMap
 over `[D, Hq, total_q_tokens]`. A grouped box loads the configured query group,
@@ -215,8 +217,15 @@ current key and at most `window_left` preceding keys. Pages wholly before the
 earliest visible key in a query group are not loaded, so recycled storage outside
 the window cannot introduce NaNs into PV. The first partially visible page is
 retained. `softmax_scale` defaults to
-`1 / sqrt(D)` and `output_scale` defaults to 1; supplied scales must be finite,
-positive Python scalars representable as positive `float32` values.
+`1 / sqrt(D)` and `output_scale` defaults to 1. Each independently accepts a
+positive finite Python number or a contiguous CUDA FP32 tensor of shape `()` or `(1,)`.
+Plan defaults select the operand types; `run()` inherits omitted values and
+requires same-type overrides. This applies to the reusable wrapper, prepared
+plan, and one-shot APIs. QToken-KV-block sparse uses the equivalent names
+`sm_scale` and `v_scale`. Device scales are loaded before the existing arithmetic;
+reducers merge already-scaled partials without reapplying the multipliers.
+See [global scale operands](../../README.md#global-scale-operands) for value
+validation, cache identity, and graph-replay lifetimes.
 
 D64 NVFP4 K/V with page size 16 remains unsupported because its native staging
 produces a misaligned access. Other transformed profiles use the normal

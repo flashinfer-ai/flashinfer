@@ -47,6 +47,10 @@ def execute(inputs, config, tile_k):
         QuantFormat.MXFP4,
         QuantFormat.MXINT4,
     ):
+        if isinstance(tile_k, tuple) and tile_k and tile_k[0] == "warp_mma":
+            from .tc.nvfp4 import execute as execute_grouped_nvfp4
+
+            return execute_grouped_nvfp4(inputs, config, tile_k)
         from .fp4_weight_only import execute as execute_w4a16
 
         return execute_w4a16(inputs, config, tile_k)

@@ -21,7 +21,7 @@ from flashinfer.utils import (
     LibraryError,
 )
 from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
-from tests.test_helpers.pdl import late_store
+from tests.utils.test_helpers.pdl import late_store
 
 
 def _test_mm_fp4(

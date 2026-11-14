@@ -44,7 +44,7 @@ import torch.nn.functional as F
 
 from flashinfer.cudnn import cudnn_chunk_gated_delta_rule
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
-from tests.test_helpers.cudnn_linear_attention import (
+from tests.gdn.test_helpers.cudnn_linear_attention import (
     HEAD_DIM,
     assert_rel_close,
     assert_state_orientation,

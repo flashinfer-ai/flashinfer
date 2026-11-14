@@ -25,21 +25,31 @@ from .kda_prefill import (
     _check_output_does_not_overlap_inputs,
     _get_stream_workspace,
     _storage_ranges_overlap,
+    _supports_strided_qkv,
 )
 from .utils import get_compute_capability
 
 
-def _validate_tensor(name, tensor, shape, dtype, device, alignment=16):
+def _validate_tensor(
+    name, tensor, shape, dtype, device, alignment=16, *, token_strided: bool
+):
     if (
         not isinstance(tensor, torch.Tensor)
         or tuple(tensor.shape) != tuple(shape)
         or tensor.dtype != dtype
         or tensor.device != device
-        or not tensor.is_contiguous()
+        or not (
+            _supports_strided_qkv(tensor) if token_strided else tensor.is_contiguous()
+        )
         or tensor.data_ptr() % alignment
     ):
+        layout = (
+            "dense head/features with aligned token rows and a flattenable batch"
+            if token_strided
+            else "contiguous storage"
+        )
         raise ValueError(
-            f"{name} must be contiguous {dtype} on {device}, shape {tuple(shape)}, "
+            f"{name} must be {dtype} on {device}, shape {tuple(shape)}, {layout}, "
             f"with {alignment}-byte alignment for backend='cute-dsl-persistent'"
         )
 
@@ -97,12 +107,18 @@ def _run_persistent_kda(
     if lower_bound is None or not -5.0 <= float(lower_bound) < 0.0:
         raise ValueError("persistent KDA requires lower_bound in [-5, 0)")
     for name, tensor in (("q", q), ("k", k), ("v", v), ("g", g)):
-        _validate_tensor(name, tensor, q.shape, torch.bfloat16, q.device)
-    _validate_tensor("beta", beta, (B, T, H), torch.bfloat16, q.device)
-    _validate_tensor("A_log", A_log, (H,), torch.float32, q.device)
+        _validate_tensor(
+            name, tensor, q.shape, torch.bfloat16, q.device, token_strided=name != "g"
+        )
+    _validate_tensor(
+        "beta", beta, (B, T, H), torch.bfloat16, q.device, token_strided=False
+    )
+    _validate_tensor("A_log", A_log, (H,), torch.float32, q.device, token_strided=False)
     if dt_bias is None or dt_bias.shape not in ((H * D,), (H, D)):
         raise ValueError("dt_bias must have shape [H*128] or [H, 128]")
-    _validate_tensor("dt_bias", dt_bias, dt_bias.shape, torch.float32, q.device)
+    _validate_tensor(
+        "dt_bias", dt_bias, dt_bias.shape, torch.float32, q.device, token_strided=False
+    )
     if cu_seqlens is not None:
         if (
             B != 1
@@ -118,16 +134,25 @@ def _run_persistent_kda(
             cu_seqlens.dtype,
             q.device,
             cu_seqlens.element_size(),
+            token_strided=False,
         )
     N = B if cu_seqlens is None else cu_seqlens.numel() - 1
     if N * H * D * D >= 2**31:
         raise ValueError("persistent KDA requires N*H*128*128 < 2**31")
     if initial_state is not None:
         _validate_tensor(
-            "initial_state", initial_state, (N, H, D, D), torch.float32, q.device, 32
+            "initial_state",
+            initial_state,
+            (N, H, D, D),
+            torch.float32,
+            q.device,
+            32,
+            token_strided=False,
         )
     if output is not None:
-        _validate_tensor("output", output, q.shape, q.dtype, q.device)
+        _validate_tensor(
+            "output", output, q.shape, q.dtype, q.device, token_strided=False
+        )
     scale_value = D**-0.5 if scale is None else float(scale)
     if not math.isfinite(scale_value):
         raise ValueError("scale must be finite")

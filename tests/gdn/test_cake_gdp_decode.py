@@ -31,7 +31,7 @@ the rejected arguments, batch-row independence, bitwise reproducibility and
 one launch of every exported program.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 ``flashinfer.cake_gdp`` facade and the ``flashinfer`` top-level exposure are
@@ -49,7 +49,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_gdp")
 cake_build = cake_package("cake_gdp", "cake_build")

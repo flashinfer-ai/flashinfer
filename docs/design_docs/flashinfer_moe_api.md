@@ -663,7 +663,7 @@ rationale above this section), so neither mechanism can see inside them.
 | --- | --- | --- |
 | [x] | Add `@flashinfer_api` to the public unified MoE execution entry points **at release time**, not before. | Done on `MoELayer.__init__` and `MoELayer.__call__`. `__init__` is decorated so the config is logged crash-safely *before* backend discovery and `runner.build()` (JIT compile) run — the two places construction actually fails. The runners' `pack_inputs` / `forward` are deliberately **not** decorated: they are `TunableRunner` plumbing driven by the autotuner in a tight per-tactic loop, and `MoELayer.__call__` already logs the same tensors one level up. The frozen `*Config` dataclasses and their `supported()` / `prepare_weights()` / `prepare_activations()` classmethods are **not** decorated either — see the per-entry-point rationale in the PR description. |
 | [ ] | Make level-10 (`FLASHINFER_LOGLEVEL=10`) dumps of `MoELayer.__call__` contain the actual input tensors. | **Partial today.** `_extract_value_for_dump` walks `list` / `tuple` / `dict` but falls through to `_serialize_value` for any other object, so a pack is recorded as `{"type": "MoEActivationPack", "repr": ...}` metadata and its tensors never reach `inputs.pt`. Levels 1/3/5 are unaffected (shape/dtype/device/stats all come from the pack repr and the output tensor). Fixing this means teaching `_extract_value_for_dump` to recurse into dataclasses — a change to the shared walker that alters dump contents for *every* decorated API, so it is out of scope for an rc cut. |
-| [ ] | Add a `TraceTemplate` for `MoELayer.__call__` per the `CLAUDE.md` "Trace Template Checklist". | **Blocked on trace infrastructure, not on MoE.** No attribute traversal exists in `_get_tensor` / `Tensor(param=...)`, and the routing/quant shape axes live on `self.config` rather than in the signature, so no template can reach a single tensor or axis today (`flashinfer/trace/` contains zero references to `MoELayer` / the packs). Closing this gate requires either dotted-path parameter support or a pack-flattening adapter; both are trace-framework changes and belong in their own PR. Until then `MoELayer` gets the logging half of `@flashinfer_api` but no `fi_trace`. Bare `@flashinfer_api` with no `trace=` is established house style for exactly this case (e.g. `flashinfer/norm/__init__.py:392`, `flashinfer/fused_moe/core.py:5409`). |
+| [ ] | Add a `TraceTemplate` for `MoELayer.__call__` per the `AGENTS.md` "Trace Template Checklist". | **Blocked on trace infrastructure, not on MoE.** No attribute traversal exists in `_get_tensor` / `Tensor(param=...)`, and the routing/quant shape axes live on `self.config` rather than in the signature, so no template can reach a single tensor or axis today (`flashinfer/trace/` contains zero references to `MoELayer` / the packs). Closing this gate requires either dotted-path parameter support or a pack-flattening adapter; both are trace-framework changes and belong in their own PR. Until then `MoELayer` gets the logging half of `@flashinfer_api` but no `fi_trace`. Bare `@flashinfer_api` with no `trace=` is established house style for exactly this case (e.g. `flashinfer/norm/__init__.py:392`, `flashinfer/fused_moe/core.py:5409`). |
 
 To keep the decorator from being actively harmful while those gates are open,
 `MoEActivationPack` and `MoEWeightPack` now define metadata-only `__repr__`s
@@ -887,6 +887,7 @@ python scripts/generate_moe_activation_matrix.py --write
 | --- | --- | --- | --- |
 | `b12x_nvfp4` | `B12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
 | `b12x_w4a16` | `B12xW4A16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
+| `batch_invariant_bf16` | `BatchInvariantBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cake` | `CakeWarpDecodeConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiLU`, `SiTU` |
 | `cake_stepfun` | `CakeStepFunConfig` | `BF16×BF16` | `SwiGLUStep` |
 | `cake_stepfun` | `CakeStepFunConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLUStep` |
@@ -947,7 +948,7 @@ python scripts/generate_moe_activation_matrix.py --write
 | `prims_ts` | `PrimsTsConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2`, `SiLU` |
 | `sm12x_fp8` | `SM12xFp8Config` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `sm12x_mxfp8_mxfp4` | `SM12xMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU` |
-| `sm12x_nvfp4` | `SM12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `ReLU2` |
+| `sm12x_nvfp4` | `SM12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SiTU`, `ReLU2` |
 | `sm12x_nvfp4_bf16` | `SM12xNvfp4Bf16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
 | `trtllm_bf16_routed` | `TrtllmBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `ReLU2` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×BF16` | `SwiGLU` |
@@ -1162,7 +1163,7 @@ local + `local_expert_offset` — the real deployment shape, in scope for the
 single-GPU harness; the EP *collective* is not), all under a weight-memory
 budget so one config never hogs the GPU.
 
-**Known-failure ledger** (shared `tests/test_helpers/fuzz_ledger.py`):
+**Known-failure ledger** (shared `tests/infra/test_helpers/fuzz_ledger.py`):
 wrong-answer findings still run and report `xfail` after healthy backends;
 crash-class findings are quarantined before launch. Unexpected passes fail
 strictly so stale waivers are removed.

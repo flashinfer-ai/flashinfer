@@ -102,7 +102,18 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     # Size the dispatch pull buffer by the active dispatch warps only (the
     # idle warps' slots otherwise cost 3 x hidden bytes of AB-stage SMEM per
     # CTA).  Output-invariant; False restores the 4-slot buffer for A/B.
+    # knobs="auto" ignores this field and tunes the pull buffer.
     compact_pull_buffer: bool = True
+    # Dispatch-pull rows in flight per active dispatch warp and the per-pass
+    # rotation of the warp -> row assignment (output-invariant tactic fields).
+    # None follows the resolved tactic (knob cache / heuristic / dict), else
+    # the serial, unrotated pull; an explicit value wins.  A batch > 1 uses
+    # the 4-slot pull buffer (overriding compact_pull_buffer) and needs
+    # epi_warps token-back without dedup_dispatch / grouped_token_back and
+    # dispatch_pull_batch * active_dispatch_warps <= 4; rotation needs
+    # epi_warps token-back.  Explicit values are incompatible with knobs="auto".
+    dispatch_pull_batch: int | None = None
+    dispatch_pull_rotate: bool | None = None
     # Empty-warp FC1 store offload (self-gating to non-swap non-ping-pong
     # with register headroom; falls back to early fc1_done publication).
     fc1_store_offload: bool = True

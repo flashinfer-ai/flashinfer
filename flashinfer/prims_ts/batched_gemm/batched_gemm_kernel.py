@@ -3456,7 +3456,8 @@ def gemm(
         sf_c_layout = cute.make_layout((sf_c_elems,), stride=(1,))
     elif cutlass.const_expr(cfg.has_deepseek_fp8_c_scale):
         if cutlass.const_expr(cfg.is_swap_ab):
-            sf_c_elems = ((output_m_for_sf + Int32(127)) // Int32(128)) * n
+            sf_c_block = Int32(cfg.deepseek_fp8_block_size)
+            sf_c_elems = ((output_m_for_sf + sf_c_block - Int32(1)) // sf_c_block) * n
         else:
             sf_c_elems = ((n + Int32(127)) // Int32(128)) * output_m_for_sf
         sf_c_layout = cute.make_layout((sf_c_elems,), stride=(1,))

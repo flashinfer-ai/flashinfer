@@ -133,6 +133,8 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         self.cluster_shape_mn = tuple(impl_desc.get("cluster_shape_mn", (4, 1)))
 
         self.quant_kind = QuantKind(problem_desc["quant_kind"])
+        # Pin instruction N together with its matching two-CTA input split.
+        self.batch_invariant = bool(problem_desc.get("batch_invariant", False))
         self.a_dtype = self.quant_kind.weight_dtype
         self.b_dtype = self.quant_kind.activation_dtype
         self.sf_dtype = self.quant_kind.sf_dtype
@@ -1108,7 +1110,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                 if cutlass.const_expr(self.use_2cta_instrs):
                     if not self.is_leader_cta:
                         load_shift = dynamic_mainloop.compute_non_leader_cta_load_shift(
-                            valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile, mma_tiler_n=self.mma_tiler_mnk[1]
+                            valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile), mma_tiler_n=self.mma_tiler_mnk[1]
                         )
                         real_b = cute.domain_offset((load_shift, 0, 0), real_b)
 
@@ -1222,7 +1224,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                 # `compute_non_leader_cta_load_shift` does for the tiled TMA legs.
                 # Rounding to sixteen keeps that midpoint a multiple of eight, so
                 # every run stays aligned to its 256-bit index load.
-                cta_row_base = self.mma_cta_index * (round_up(work_tile.valid_tokens_in_cta_tile, 16) // Int32(2))
+                if cutlass.const_expr(self.batch_invariant):
+                    cta_row_base = self.mma_cta_index * Int32(self.cta_tile_n // self.mma_cta_count)
+                else:
+                    cta_row_base = self.mma_cta_index * (round_up(work_tile.valid_tokens_in_cta_tile, 16) // Int32(2))
                 index_runs = cute.zipped_divide(
                     cute.domain_offset((tile_pool_base + cta_row_base,), gather_index), (self.gather_index_load_rows,)
                 )
@@ -1403,7 +1408,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                             b_window_frag=b_stage_frag,
                             sfa_window_tensor=tmem_sfa,
                             sfb_window_tensor=mma_tmem_sfb,
-                            valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile,
+                            valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile),
                             mma_instruction_mnk=self.mma_instruction_mnk,
                             window_instruction_offset=0,
                             window_instruction_count=self.num_mma_instructions_per_ab_stage,
@@ -1437,7 +1442,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                             b_window_frag=b_stage_frag,
                             sfa_window_tensor=tmem_sfa,
                             sfb_window_tensor=mma_tmem_sfb,
-                            valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile,
+                            valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile),
                             mma_instruction_mnk=self.mma_instruction_mnk,
                             window_instruction_offset=0,
                             window_instruction_count=self.num_mma_instructions_per_ab_stage,
@@ -1597,7 +1602,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                         b_window_frag=b_stage_frag,
                         sfa_window_tensor=tmem_sfa,
                         sfb_window_tensor=mma_tmem_sfb,
-                        valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile,
+                        valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile),
                         mma_instruction_mnk=self.mma_instruction_mnk,
                         window_instruction_offset=0,
                         window_instruction_count=self.num_mma_instructions_per_ab_stage,

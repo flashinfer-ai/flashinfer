@@ -17,7 +17,7 @@ Tests of the flashinfer public surface of the Cake packed width-4 depthwise
 causal convolution + SiLU training kernels (SM100 / SM103 / SM107): the
 ``flashinfer.cake_causal_conv1d_det_train`` facade and its re-export from the
 ``flashinfer`` top-level package.  The facade's three entry points are
-pass-throughs to ``flashinfer.cake_causal_conv1d_det_train_backend``; this module
+pass-throughs to ``flashinfer.experimental.cake.cake_causal_conv1d_det_train``; this module
 checks that identity (same objects at the top level, the backend's exact
 signatures, same bits as the backend) and leaves the numerical contract to
 ``test_cake_causal_conv1d_det_train.py``, which imports only the backend package.
@@ -32,7 +32,7 @@ import torch
 
 import flashinfer
 import flashinfer.cake_causal_conv1d_det_train
-import flashinfer.cake_causal_conv1d_det_train_backend as backend
+import flashinfer.experimental.cake.cake_causal_conv1d_det_train as backend
 from flashinfer.cake_causal_conv1d_det_train import (
     CakeCausalConv1dDetFunction,
     cake_causal_conv1d_det,
@@ -43,7 +43,7 @@ from flashinfer.cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_forward_workspace_bytes,
     is_cake_causal_conv1d_det_train_supported,
 )
-from flashinfer.cake_causal_conv1d_det_train_backend import cake_jit as loader
+from flashinfer.experimental.cake.cake_causal_conv1d_det_train import cake_jit as loader
 from flashinfer.jit.env import has_flashinfer_jit_cache
 from flashinfer.utils import get_compute_capability
 

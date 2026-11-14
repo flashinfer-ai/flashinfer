@@ -22,8 +22,12 @@ module checks that identity (same objects at the top level, same bits as the
 backend) and the mode rules of the deterministic package: no entry point takes a
 ``deterministic`` keyword (``TypeError``, checked without a device),
 ``torch.use_deterministic_algorithms(True)`` (strict or ``warn_only``) neither
-raises nor warns in any call, and the backward refuses the non-deterministic
-package's FP64 workspace.  The numerical contract is
+raises nor warns in any call, the backward's workspace is a zero-filled FP32
+tensor of one size for every row count that
+``cake_rmsnorm_silu_gate_det_train_reset_workspace`` zeroes again, and the
+backward and the reset refuse the non-deterministic package's workspaces (FP64
+or ``uint8``), the backward also in a call with no rows.  The reset is not a
+``flashinfer`` top-level name.  The numerical contract is
 ``test_cake_rmsnorm_silu_gate_det_train.py``'s.
 """
 
@@ -46,6 +50,7 @@ from flashinfer.cake_rmsnorm_silu_gate_det_train import (
     cake_rmsnorm_silu_gate_det_train_backward_workspace,
     cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes,
     cake_rmsnorm_silu_gate_det_train_forward,
+    cake_rmsnorm_silu_gate_det_train_reset_workspace,
     is_cake_rmsnorm_silu_gate_det_train_supported,
 )
 
@@ -63,9 +68,26 @@ ENTRY_NAMES = (
     "cake_rmsnorm_silu_gate_det_train_backward_workspace",
     "cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes",
     "cake_rmsnorm_silu_gate_det_train_forward",
+    "cake_rmsnorm_silu_gate_det_train_reset_workspace",
     "is_cake_rmsnorm_silu_gate_det_train_supported",
 )
 NAMESPACES = {"facade": facade, "backend": backend}
+# Elements and bytes of the backward's workspace, whatever the rows.
+WORKSPACE_ELEMENTS = 4738
+WORKSPACE_BYTES = 18952
+
+
+def _refusal(dtype: torch.dtype) -> str:
+    """The refusal of a workspace of the non-deterministic package."""
+    name = {torch.float64: "FP64", torch.uint8: "uint8"}[dtype]
+    return (
+        f"workspace is {name}, a workspace of the non-deterministic mode "
+        "(flashinfer.cake_rmsnorm_silu_gate_nondet_train."
+        "cake_rmsnorm_silu_gate_nondet_train_backward_workspace); the "
+        "deterministic backward needs its own zero-filled FP32 workspace "
+        "(flashinfer.cake_rmsnorm_silu_gate_det_train."
+        "cake_rmsnorm_silu_gate_det_train_backward_workspace)"
+    )
 
 
 @pytest.fixture
@@ -121,6 +143,11 @@ def test_a_mode_keyword_is_a_type_error(mode) -> None:
                     8, "cpu", deterministic=mode
                 )
             ),
+            "cake_rmsnorm_silu_gate_det_train_reset_workspace": lambda m=module: (
+                m.cake_rmsnorm_silu_gate_det_train_reset_workspace(
+                    torch.zeros(8), deterministic=mode
+                )
+            ),
             "is_cake_rmsnorm_silu_gate_det_train_supported": lambda m=module: (
                 m.is_cake_rmsnorm_silu_gate_det_train_supported(
                     "cpu", deterministic=mode
@@ -133,6 +160,40 @@ def test_a_mode_keyword_is_a_type_error(mode) -> None:
                 run()
         with pytest.raises(TypeError):
             module.CakeRMSNormSiLUGateDetFunction.apply(x, x, w, EPS, mode)
+
+
+def test_workspace_entries_refuse_negative_rows() -> None:
+    """Both namespaces' workspace and workspace size refuse a negative row
+    count with a ``ValueError`` before they look at the device (no device
+    needed)."""
+    for module in NAMESPACES.values():
+        for entry in (
+            module.cake_rmsnorm_silu_gate_det_train_backward_workspace,
+            module.cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes,
+        ):
+            with pytest.raises(ValueError, match="non-negative"):
+                entry(-1, "cpu")
+
+
+def test_reset_workspace_passes_through(
+    monkeypatch: pytest.MonkeyPatch, determinism_setting
+) -> None:
+    """The facade's reset resets through the backend whatever
+    ``torch.use_deterministic_algorithms`` says, with no warning (no device
+    needed)."""
+    resets: list = []
+    monkeypatch.setattr(
+        backend,
+        "cake_rmsnorm_silu_gate_det_train_reset_workspace",
+        lambda workspace, **k: resets.append((workspace, k)),
+    )
+    ws = torch.zeros(8, dtype=torch.float32)
+    for enabled, warn_only in ((False, False), (True, False), (True, True)):
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            cake_rmsnorm_silu_gate_det_train_reset_workspace(ws)
+    assert resets == [(ws, {})] * 3
 
 
 # --------------------------------------------------------------------------- on the device
@@ -153,6 +214,8 @@ def test_top_level_exports_are_the_facade():
         flashinfer.cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes
         is cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes
     )
+    # the reset is the facade's and the backend's, not a top-level name
+    assert not hasattr(flashinfer, "cake_rmsnorm_silu_gate_det_train_reset_workspace")
     # the autograd class is the backend package's, reached through the facade
     # and the top level
     assert facade.CakeRMSNormSiLUGateDetFunction is CakeRMSNormSiLUGateDetFunction
@@ -195,8 +258,9 @@ def test_deterministic_algorithms_neither_raise_nor_warn(
     """Under ``torch.use_deterministic_algorithms(True)`` (strict and
     ``warn_only``) with every warning an error, the forward, the backward
     (both weight-gradient dtypes, accumulation, ``compute_grad_weight=False``,
-    no rows), the workspace entry points, the support query, autograd and a
-    non-reentrant checkpoint run as with the mode off: the same bits."""
+    no rows), the workspace entry points and the reset, the support query,
+    autograd and a non-reentrant checkpoint run as with the mode off: the same
+    bits."""
     g = torch.Generator(device="cuda").manual_seed(13)
     x, z, dy = (
         torch.randn(257, 48, D, device="cuda", generator=g).bfloat16() for _ in range(3)
@@ -211,6 +275,7 @@ def test_deterministic_algorithms_neither_raise_nor_warn(
         ws = cake_rmsnorm_silu_gate_det_train_backward_workspace(
             x.numel() // D, x.device
         )
+        cake_rmsnorm_silu_gate_det_train_reset_workspace(ws)
         out += cake_rmsnorm_silu_gate_det_train_backward(
             dy,
             x,
@@ -256,29 +321,69 @@ def test_deterministic_algorithms_neither_raise_nor_warn(
 
 
 @requires_device
-def test_backward_refuses_the_nondeterministic_workspace() -> None:
-    """The backward refuses an FP64 tensor (the non-deterministic package's
-    workspace) naming both modes' workspaces; another unfit FP32 buffer keeps
-    its own message."""
+def test_workspace_is_zero_filled_and_reset_zeroes_it() -> None:
+    """Both namespaces' workspace is a zero-filled, contiguous FP32 CUDA tensor
+    of ``backward_workspace_bytes`` bytes, 18952 for every row count.  The
+    facade's reset zeroes a workspace something else wrote into, and a
+    backward on it then gives the bits of a fresh workspace and leaves it
+    zero."""
+    device = torch.device("cuda")
+    for module in NAMESPACES.values():
+        for rows in (0, 1, 129 * 48, 10**7):
+            ws = module.cake_rmsnorm_silu_gate_det_train_backward_workspace(
+                rows, device
+            )
+            assert ws.dtype == torch.float32 and ws.is_contiguous(), rows
+            assert ws.device.type == "cuda" and ws.numel() == WORKSPACE_ELEMENTS
+            assert not bool(ws.view(torch.int32).any()), rows
+            nbytes = module.cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes(
+                rows, device
+            )
+            assert nbytes == ws.numel() * 4 == WORKSPACE_BYTES, rows
+    g = torch.Generator(device="cuda").manual_seed(17)
+    x, z, dy = (
+        torch.randn(129, 48, D, device="cuda", generator=g).bfloat16() for _ in range(3)
+    )
+    w = (1.0 + 0.5 * torch.randn(D, device="cuda", generator=g)).bfloat16()
+    ws = cake_rmsnorm_silu_gate_det_train_backward_workspace(129 * 48, device)
+    ws.view(torch.int32).fill_(7)
+    cake_rmsnorm_silu_gate_det_train_reset_workspace(ws)
+    torch.cuda.synchronize()
+    assert not bool(ws.view(torch.int32).any())
+    got = cake_rmsnorm_silu_gate_det_train_backward(dy, x, z, w, EPS, workspace=ws)
+    want = cake_rmsnorm_silu_gate_det_train_backward(
+        dy,
+        x,
+        z,
+        w,
+        EPS,
+        workspace=cake_rmsnorm_silu_gate_det_train_backward_workspace(129 * 48, device),
+    )
+    for a, b in zip(got, want, strict=True):
+        assert torch.equal(a, b)
+    torch.cuda.synchronize()
+    assert not bool(ws.view(torch.int32).any())
+
+
+@requires_device
+@pytest.mark.parametrize("dtype", [torch.float64, torch.uint8], ids=["fp64", "uint8"])
+def test_backward_refuses_the_nondeterministic_workspace(dtype: torch.dtype) -> None:
+    """The backward and the reset refuse an FP64 or ``uint8`` tensor (the
+    non-deterministic package's workspace) naming both modes' workspaces and
+    leave it as it is; another unfit FP32 buffer keeps its own message."""
     x = torch.randn(129, 48, D, device="cuda").bfloat16()
     w = torch.ones(D, dtype=torch.bfloat16, device="cuda")
-    fp64 = torch.zeros(4 * D + 1, dtype=torch.float64, device="cuda")
+    other = torch.zeros(4 * D + 1, dtype=dtype, device="cuda")
     for module in NAMESPACES.values():
         with pytest.raises(ValueError) as info:
             module.cake_rmsnorm_silu_gate_det_train_backward(
-                x, x, x, w, EPS, workspace=fp64
+                x, x, x, w, EPS, workspace=other
             )
-        message = str(info.value)
-        assert message == (
-            "workspace is FP64, a workspace of the non-deterministic mode "
-            "(flashinfer.cake_rmsnorm_silu_gate_nondet_train."
-            "cake_rmsnorm_silu_gate_nondet_train_backward_workspace); the "
-            "deterministic "
-            "backward needs an FP32 workspace "
-            "(flashinfer.cake_rmsnorm_silu_gate_det_train."
-            "cake_rmsnorm_silu_gate_det_train_backward_workspace)"
-        ), message
-        with pytest.raises(ValueError, match="contiguous FP32 tensor"):
+        assert str(info.value) == _refusal(dtype), str(info.value)
+        with pytest.raises(ValueError) as info:
+            module.cake_rmsnorm_silu_gate_det_train_reset_workspace(other)
+        assert str(info.value) == _refusal(dtype), str(info.value)
+        with pytest.raises(ValueError, match="contiguous, 16-byte aligned FP32 tensor"):
             module.cake_rmsnorm_silu_gate_det_train_backward(
                 x,
                 x,
@@ -287,3 +392,50 @@ def test_backward_refuses_the_nondeterministic_workspace() -> None:
                 EPS,
                 workspace=torch.zeros(1, dtype=torch.float32, device="cuda"),
             )
+    torch.cuda.synchronize()
+    assert not bool(other.any())
+
+
+@requires_device
+@pytest.mark.parametrize("dtype", [torch.float64, torch.uint8], ids=["fp64", "uint8"])
+@pytest.mark.parametrize("shape", [(0, D), (0, 48, D)], ids=["0x128", "0x48x128"])
+def test_backward_with_no_rows_refuses_the_nondeterministic_workspace(
+    shape: tuple, dtype: torch.dtype
+) -> None:
+    """A call with no rows refuses the non-deterministic package's FP64 or
+    ``uint8`` workspace with the ``ValueError`` of a call with rows, before it
+    returns (``grad_weight`` keeps its value).  With this package's FP32
+    workspace it returns zero-sized ``dx`` and ``dz`` and a zero ``dw``, or
+    keeps ``grad_weight`` when accumulating."""
+    empty = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(129, 48, D, device="cuda").bfloat16()
+    w = torch.ones(D, dtype=torch.bfloat16, device="cuda")
+    other = torch.zeros(4 * D + 1, dtype=dtype, device="cuda")
+    ws = cake_rmsnorm_silu_gate_det_train_backward_workspace(0, empty.device)
+    assert ws.dtype == torch.float32
+    for module in NAMESPACES.values():
+        backward = module.cake_rmsnorm_silu_gate_det_train_backward
+        with pytest.raises(ValueError) as with_rows:
+            backward(x, x, x, w, EPS, workspace=other)
+        main = torch.full((D,), 1.5, dtype=torch.float32, device="cuda")
+        with pytest.raises(ValueError) as no_rows:
+            backward(empty, empty, empty, w, EPS, grad_weight=main, workspace=other)
+        assert str(no_rows.value) == str(with_rows.value), str(no_rows.value)
+        assert str(no_rows.value) == _refusal(dtype), str(no_rows.value)
+        assert torch.equal(main, torch.full_like(main, 1.5))
+        dx, dz, dw = backward(empty, empty, empty, w, EPS, workspace=ws)
+        assert dx.shape == dz.shape == empty.shape and dx.numel() == dz.numel() == 0
+        assert dw.dtype == torch.bfloat16 and torch.equal(dw, torch.zeros_like(dw))
+        _, _, dw = backward(
+            empty,
+            empty,
+            empty,
+            w,
+            EPS,
+            grad_weight=main,
+            accumulate_grad_weight=True,
+            workspace=ws,
+        )
+        assert dw is main and torch.equal(main, torch.full_like(main, 1.5))
+        _, _, dw = backward(empty, empty, empty, w, EPS, grad_weight=main, workspace=ws)
+        assert dw is main and torch.equal(main, torch.zeros_like(main))

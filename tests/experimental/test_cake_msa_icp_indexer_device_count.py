@@ -36,7 +36,7 @@ import torch
 
 from flashinfer.experimental.cake_msa_icp_indexer import cake_backend as cb
 from tests.experimental import test_cake_msa_icp_indexer as base
-from tests.test_helpers import cake_msa_icp_inputs as ref
+from tests.experimental.test_helpers import cake_msa_icp_inputs as ref
 
 H = ref.NUM_HEADS
 TOPK = ref.TOPK

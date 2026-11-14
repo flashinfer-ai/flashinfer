@@ -28,6 +28,7 @@ from .kda_prefill import (
     _bind_workspace,
     _check_output_does_not_overlap_inputs,
     _identity_seq_order,
+    _supports_strided_qkv,
 )
 from .utils import get_compute_capability
 
@@ -128,12 +129,13 @@ def _is_cute_dsl_kda_prefill_eligible(
         not q.is_cuda
         or get_compute_capability(q.device) not in _SUPPORTED_COMPUTE_CAPABILITIES
         or q.dtype != torch.bfloat16
-        or not q.is_contiguous()
     ):
         return False
 
     batch_size, token_count, num_heads, head_dim = q.shape
     if batch_size <= 0 or token_count <= 1 or num_heads <= 0 or head_dim != _HEAD_DIM:
+        return False
+    if not _supports_strided_qkv(q):
         return False
     for tensor in (k, v):
         if (
@@ -141,7 +143,7 @@ def _is_cute_dsl_kda_prefill_eligible(
             or tensor.device != q.device
             or tensor.dtype != torch.bfloat16
             or tensor.shape != q.shape
-            or not tensor.is_contiguous()
+            or not _supports_strided_qkv(tensor)
         ):
             return False
     if (

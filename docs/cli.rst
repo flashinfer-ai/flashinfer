@@ -171,6 +171,9 @@ environment. This combines ``install-cubin-wheel`` and
    # Override CUDA version detection for the jit-cache wheel
    flashinfer download-kernels --cuda-version 12.9
 
+   # Install only the jit-cache providers for the visible GPUs
+   flashinfer download-kernels --mode minimal
+
    # Install only the jit-cache provider compatible with SM90a
    flashinfer download-kernels --sm sm90a
 
@@ -182,10 +185,21 @@ environment. This combines ``install-cubin-wheel`` and
 
 ``flashinfer-cubin`` is installed from the flat FlashInfer wheel index, while
 ``flashinfer-jit-cache`` is installed from the CUDA-specific wheel index.
-Passing ``--sm`` installs the shim and only the best compatible jit-cache
-provider for that architecture; it may be repeated for heterogeneous targets.
+As with ``install-jit-cache-wheel``, the default installs every jit-cache
+provider; ``--mode minimal`` installs only the best compatible provider for
+each visible GPU, and ``--sm`` selects the architectures explicitly (implying
+``--mode minimal``; it may be repeated for heterogeneous targets).
 The ``flashinfer-cubin`` wheel is a shared multi-architecture package and is
-still installed unchanged.
+still installed unchanged. Invalid ``--mode``/``--sm`` combinations, malformed
+``--sm`` values and an unsupported explicit ``--cuda-version`` are rejected
+before either wheel is installed.
+
+``install-cubin-wheel``, ``install-jit-cache-wheel`` and ``download-kernels``
+share the same options: ``--flashinfer-version``, ``--nightly`` and
+``--dry-run`` on all three, and ``--cuda-version``, ``--mode`` and ``--sm`` on the
+two that install jit-cache providers. Custom indexes are set with
+``--cubin-index-url`` and ``--jit-cache-index-url``; the single-wheel commands
+also accept ``--index-url`` for compatibility.
 If one wheel install fails, the command still attempts the other install and
 reports any failures at the end.
 

@@ -17,10 +17,13 @@ from flashinfer.gemm.cake_batch_deepgemm_fp8 import (
     supported_nk,
 )
 from flashinfer.jit.gemm.cake_batch_deepgemm_fp8 import (
+    _SM100A_SM103A_MMSETUP_TWINS,
     _SM107A_CELLS,
+    _SM107A_MMSETUP_TWINS,
     _TABLE,
     _cell_tag,
     _em4,
+    _matches,
     PROGRAMS,
     SUPPORTED_COMPUTE_CAPABILITIES,
     device_arch,
@@ -314,19 +317,28 @@ def test_packed_serving_expected_m_one_with_multi_block_groups(nk, groups):
     )
 
 
+_N512_CELL_BN32 = "seed_masked_bn__n512_k128_cell_bn32_k128"
+
+
 @pytest.mark.parametrize(
-    "groups,m,full,route",
+    "groups,m,full,route,route_sm107",
     [
-        (1, 1024, (0,), "seed_n512_k128__b1_bn32"),
-        (1, 2048, (0,), "seed_n512_k128__b1_mbn32"),
-        (4, 1024, (0, 3), "seed_n512_k128__b2_8_bn32"),
-        (4, 2048, (0, 3), "seed_n512_k128__b2_8_mbn32"),
-        (16, 1024, (2, 15), "seed_n512_k128__b9_bn128"),
-        (16, 2048, (2, 15), "seed_n512_k128__b9_mbn128"),
-        (40, 2048, (2, 39), "seed_n512_k128__b9_mbn192"),
+        (1, 1024, (0,), "seed_n512_k128__b1_bn32", _N512_CELL_BN32),
+        (1, 2048, (0,), "seed_n512_k128__b1_mbn32", _N512_CELL_BN32),
+        (4, 1024, (0, 3), "seed_n512_k128__b2_8_bn32", _N512_CELL_BN32),
+        (4, 2048, (0, 3), "seed_n512_k128__b2_8_mbn32", _N512_CELL_BN32),
+        (16, 1024, (2, 15), "seed_n512_k128__b9_bn128", _N512_CELL_BN32),
+        (16, 2048, (2, 15), "seed_n512_k128__b9_mbn128", _N512_CELL_BN32),
+        (
+            40,
+            2048,
+            (2, 39),
+            "seed_n512_k128__b9_mbn192",
+            "seed_masked_bn__n512_k128_cell_bn192_once",
+        ),
     ],
 )
-def test_n512_k128_groups_far_above_expected_m(groups, m, full, route):
+def test_n512_k128_groups_far_above_expected_m(groups, m, full, route, route_sm107):
     """``expected_m`` is only a hint: groups that fill all M rows at ``expected_m=1``
     on the N=512, K=128 routes still have every valid row written."""
     device = torch.device("cuda")
@@ -339,8 +351,11 @@ def test_n512_k128_groups_far_above_expected_m(groups, m, full, route):
     prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
         a, b, a_scale, b_scale, masked_m, 1
     )
-    if _arch() in PACKED_ARCHS:
+    if _arch() in ("sm_100a", "sm_103a"):  # the N=512, K=128 routes' architectures
         assert prepared.route == route
+    elif _arch() == "sm_107a":  # the masked BLOCK_N cells of the same geometry
+        assert prepared.parent == "seed_masked_bn"
+        assert prepared.route == route_sm107
     else:
         assert prepared.parent == "seed_masked_bn"
     out = prepared.launch()
@@ -386,7 +401,7 @@ def test_out_of_band_problems_raise():
         2, 128, 7168, 2048, seed=932, device=device
     )
     assert 2 not in PACKED_GROUPS and (7168, 2048) in PACKED_NK
-    assert "sm_107a" not in PACKED_ARCHS
+    assert "sm_107a" in PACKED_ARCHS
     with pytest.raises(ValueError, match="packed UE8M0"):
         prepare_batch_deepgemm_fp8_nt_groupwise(
             a,
@@ -593,7 +608,8 @@ def _band_points(row):
 )
 def test_sm107a_band_boundaries_match_reference(row):
     """Every end of every SM107a BLOCK_N band selects that band's program, or the
-    (B, em4) cell that takes the problem first, and matches the reference."""
+    (B, em4) cell or the one-wave (B, CTA, M) row that takes the problem first, and
+    matches the reference."""
     if _arch() != "sm_107a":
         pytest.skip("the SM107a bands run on SM107a")
     device = torch.device("cuda")
@@ -609,9 +625,21 @@ def test_sm107a_band_boundaries_match_reference(row):
             a, b, a_scale, b_scale, masked_m, rows
         )
         tag = _cell_tag(n, k, 1, rows)
-        if tag is None:
+        earlier = _TABLE["sm_107a"][: _TABLE["sm_107a"].index(row)]
+        wave = next(
+            (
+                other
+                for other in earlier
+                if other.form == "bcta" and _matches(other, "sm_107a", 1, m, n, k, rows)
+            ),
+            None,
+        )
+        if tag is None and wave is None:
             assert prepared.route == row.route, (cta, prepared.route)
             assert prepared.programs == (row.stages[0][0],)
+        elif tag is None:
+            assert prepared.route == wave.route, (cta, prepared.route)
+            assert prepared.programs == (wave.stages[0][0],)
         else:
             assert prepared.route == f"seed_masked_bn__n{n}_k{k}_cell_{tag}", (
                 cta,
@@ -684,3 +712,180 @@ def test_sm107a_cell_keys_and_nearest_fallback():
     assert _cell_tag(7168, 2048, 1000, 1) is None
     assert _cell_tag(4096, 7168, 1, 128) is None
     assert _cell_tag(4096, 7168, 1000, 1) is None
+
+
+_BN144 = "cake_batch_deepgemm_fp8_fa7c913fa26439d68c52"
+_BN192_L2 = "cake_batch_deepgemm_fp8_e73ad8a03db49514daf6"
+_BN240_K128 = "cake_batch_deepgemm_fp8_55bb778b259bbabdf1d9"
+_CELL240 = "seed_masked_bn__n7168_k2048_cell_bn240_k128"
+
+
+def test_sm107a_mmsetup_twins_take_n7168_k2048_keys_of_at_least_64_groups():
+    """On SM107a an N=7168 K=2048 key with at least 64 groups (at most 128 for the
+    BLOCK_N 240 program) whose route picks a program of ``_SM107A_MMSETUP_TWINS``
+    runs that program's masked_m setup twin under the route's name with
+    ``_mmsetup`` appended; other group counts and the N=4096 K=7168 keys of the
+    same programs keep the parent."""
+    for groups, n, k, expected_m, route, program, twinned in (
+        (64, 7168, 2048, 2, "seed_masked_bn__n7168_k2048_cell_bn144", _BN144, True),
+        (64, 7168, 2048, 100, "seed_masked_bn__n7168_k2048_bn192", _BN192_L2, True),
+        (32, 7168, 2048, 1, "seed_masked_bn__n7168_k2048_cell_bn144", _BN144, False),
+        (32, 7168, 2048, 100, "seed_masked_bn__n7168_k2048_bn192", _BN192_L2, False),
+        (64, 4096, 7168, 2, "seed_masked_bn__n4096_k7168_cell_bn144", _BN144, False),
+        (64, 4096, 7168, 100, "seed_masked_bn__n4096_k7168_bn192", _BN192_L2, False),
+        (64, 7168, 2048, 54, _CELL240, _BN240_K128, True),
+        (128, 7168, 2048, 108, _CELL240, _BN240_K128, True),
+        (144, 7168, 2048, 108, _CELL240, _BN240_K128, False),
+    ):
+        plan = select_route("sm_107a", 216, groups, 128, n, k, expected_m)
+        twin = _SM107A_MMSETUP_TWINS[program][0]
+        want = (f"{route}_mmsetup", twin) if twinned else (route, program)
+        assert (plan.route, plan.stages[0].program) == want, (groups, n, expected_m)
+        assert len(plan.stages) == 1 and "sm_107a" in PROGRAMS[want[1]]["arches"]
+    for program, (twin, b_min, b_max) in _SM107A_MMSETUP_TWINS.items():
+        assert b_min == 64 and twin != program
+        assert b_max == (128 if program == _BN240_K128 else None)
+        assert PROGRAMS[twin]["arches"] == ["sm_107a"]
+
+
+@pytest.mark.parametrize(
+    "expected_m,route",
+    [
+        (2, "seed_masked_bn__n7168_k2048_cell_bn144_mmsetup"),
+        (100, "seed_masked_bn__n7168_k2048_bn192_mmsetup"),
+        (54, "seed_masked_bn__n7168_k2048_cell_bn240_k128_mmsetup"),
+    ],
+)
+def test_sm107a_mmsetup_twins_match_reference(expected_m, route):
+    """Each SM107a masked_m setup twin, with an empty group and a full one, matches
+    the reference."""
+    if _arch() != "sm_107a":
+        pytest.skip("the SM107a masked_m setup twins run on SM107a")
+    device = torch.device("cuda")
+    groups, m, n, k = 64, 128, 7168, 2048
+    masked = [expected_m] * (groups - 2) + [0, m]
+    a, b, a_scale, b_scale, masked_m, _ = _make_inputs(
+        groups, m, n, k, seed=970 + expected_m, device=device, masked=masked
+    )
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_scale, b_scale, masked_m, expected_m
+    )
+    assert prepared.route == route, prepared.route
+    out = prepared.launch()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(
+        out, _reference(a, b, a_scale, b_scale, masked_m), masked_m
+    )
+    del a, b, out
+    torch.cuda.empty_cache()
+
+
+_BN192 = "cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9"
+_N512_BN192 = "seed_n512_k128__b9_mbn192"
+_N512_BN128 = "seed_n512_k128__b9_bn128"
+_N512_PROGRAM = "cake_batch_deepgemm_fp8_c9415f6c743e6bb72fc7"
+
+
+def test_sm100a_sm103a_mmsetup_twin_takes_n512_k128_keys_of_at_least_64_groups():
+    """On SM100a and SM103a an N=512 K=128 key with at least 64 groups whose
+    route picks the BLOCK_N 192 program runs its masked_m setup twin under the
+    route's name with ``_mmsetup`` appended; fewer groups and the keys of other
+    programs keep their route."""
+    assert list(_SM100A_SM103A_MMSETUP_TWINS) == [_BN192]
+    twin, b_min, b_max = _SM100A_SM103A_MMSETUP_TWINS[_BN192]
+    assert (b_min, b_max) == (64, None) and twin != _BN192
+    assert PROGRAMS[twin]["arches"] == ["sm_100a", "sm_103a"]
+    for arch, sm_count in (("sm_100a", 148), ("sm_103a", 152)):
+        for groups, m, expected_m, route, program, twinned in (
+            (64, 2048, 1000, _N512_BN192, _BN192, True),
+            (256, 4096, 3067, _N512_BN192, _BN192, True),
+            (48, 2048, 1000, _N512_BN192, _BN192, False),
+            (64, 1024, 1000, _N512_BN128, _N512_PROGRAM, False),
+        ):
+            plan = select_route(arch, sm_count, groups, m, 512, 128, expected_m)
+            want = (f"{route}_mmsetup", twin) if twinned else (route, program)
+            assert (plan.route, plan.stages[0].program) == want, (arch, groups, m)
+            assert len(plan.stages) == 1 and arch in PROGRAMS[want[1]]["arches"]
+
+
+def test_sm100a_sm103a_mmsetup_twin_matches_reference():
+    """The SM100a / SM103a masked_m setup twin, with an empty group and a full one,
+    matches the reference."""
+    if _arch() not in ("sm_100a", "sm_103a"):
+        pytest.skip("the masked_m setup twin runs on SM100a and SM103a")
+    device = torch.device("cuda")
+    groups, m, n, k, expected_m = 64, 2048, 512, 128, 1000
+    masked = [expected_m] * (groups - 2) + [0, m]
+    a, b, a_scale, b_scale, masked_m, _ = _make_inputs(
+        groups, m, n, k, seed=1356, device=device, masked=masked
+    )
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_scale, b_scale, masked_m, expected_m
+    )
+    assert prepared.route == f"{_N512_BN192}_mmsetup", prepared.route
+    out = prepared.launch()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(
+        out, _reference(a, b, a_scale, b_scale, masked_m), masked_m
+    )
+    del a, b, out
+    torch.cuda.empty_cache()
+
+
+_BN32_S8 = "cake_batch_deepgemm_fp8_929a5561abc99caa7f4f"
+_EARLY_BN32_S8 = "cake_batch_deepgemm_fp8_927fea695cd92359d999"
+
+
+def test_sm100a_sm103a_n512_k128_mbn32_routes_take_the_masked_m_once_build():
+    """On SM100a and SM103a the N=512 K=128 keys with M > 1024, at most eight
+    groups and at most eight CTAs (seven for one group) run the masked_m-once form
+    of the BLOCK_N 32 eight-stage build; the neighbouring keys keep their programs
+    and the parent stays shipped for the N=4096 K=7168 one-CTA band."""
+    assert PROGRAMS[_EARLY_BN32_S8]["arches"] == ["sm_100a", "sm_103a"]
+    assert PROGRAMS[_BN32_S8]["arches"] == ["sm_100a", "sm_103a"]
+    b1, b2_8 = "seed_n512_k128__b1_mbn32", "seed_n512_k128__b2_8_mbn32"
+    for arch, sm_count in (("sm_100a", 148), ("sm_103a", 152)):
+        for groups, m, expected_m, route, program in (
+            (1, 1152, 1, b1, _EARLY_BN32_S8),
+            (1, 16384, 896, b1, _EARLY_BN32_S8),
+            (2, 2048, 512, b2_8, _EARLY_BN32_S8),
+            (8, 8192, 128, b2_8, _EARLY_BN32_S8),
+            (1, 1024, 896, "seed_n512_k128__b1_bn32", None),
+            (1, 2048, 897, "seed_n512_k128__b1_bn192", None),
+            (8, 2048, 129, "seed_n512_k128__b2_8_bn128", None),
+        ):
+            plan = select_route(arch, sm_count, groups, m, 512, 128, expected_m)
+            assert plan.route == route, (arch, groups, m, expected_m, plan.route)
+            assert len(plan.stages) == 1
+            got = plan.stages[0].program
+            if program is None:
+                assert got not in (_EARLY_BN32_S8, _BN32_S8), (arch, route, got)
+            else:
+                assert got == program, (arch, route, got)
+
+
+@pytest.mark.parametrize("groups,m,expected_m", [(1, 2048, 700), (8, 4096, 100)])
+def test_sm100a_sm103a_masked_m_once_bn32_matches_reference(groups, m, expected_m):
+    """The SM100a / SM103a masked_m-once BLOCK_N 32 eight-stage build, with an
+    empty group and a full one where there are two or more, matches the
+    reference."""
+    if _arch() not in ("sm_100a", "sm_103a"):
+        pytest.skip("the masked_m-once BLOCK_N 32 build runs on SM100a and SM103a")
+    device = torch.device("cuda")
+    masked = [expected_m] * groups
+    if groups > 1:
+        masked[-2:] = [0, m]
+    a, b, a_scale, b_scale, masked_m, _ = _make_inputs(
+        groups, m, 512, 128, seed=1356, device=device, masked=masked
+    )
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_scale, b_scale, masked_m, expected_m
+    )
+    assert prepared.route.endswith("_mbn32"), prepared.route
+    out = prepared.launch()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(
+        out, _reference(a, b, a_scale, b_scale, masked_m), masked_m
+    )
+    del a, b, out
+    torch.cuda.empty_cache()

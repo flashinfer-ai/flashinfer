@@ -580,6 +580,7 @@ def test_fixed_prepared_eager_execution_skips_collective_lookup(
     with monkeypatch.context() as patch:
         patch.setattr(torch.distributed, "all_gather_object", unexpected)
         patch.setattr(automatic, "needs_selection", unexpected)
+        patch.setattr(native, "_unique_candidates", unexpected)
         state.tuner.clear_cache()
         with unrelated_autotune_contexts():
             for _ in range(3):

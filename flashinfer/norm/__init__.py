@@ -1696,7 +1696,10 @@ def layernorm(
     ----------
     input: torch.Tensor
         Input tensor, shape (batch_size, hidden_size). Need to be bfloat16.
-        The last dimension must be contiguous; row strides are supported.
+        The last dimension must be contiguous. The default CuTe DSL backend
+        requires a row stride that is a multiple of its vector width and a
+        16-byte-aligned data pointer; the CUDA backend (``FLASHINFER_USE_CUDA_NORM=1``,
+        or when the CuTe DSL is unavailable) accepts any row stride.
     gemma: torch.Tensor
         Gemma tensor, shape (hidden_size,). Need to be float32.
     beta: torch.Tensor

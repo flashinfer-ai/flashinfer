@@ -199,6 +199,36 @@ def _check_kv_layout(kv_layout: str) -> None:
         raise KeyError("Invalid kv_layout {}".format(kv_layout))
 
 
+def _check_head_dim(head_dim_qk: int, head_dim_vo: int, backend: str) -> None:
+    """Validate the FA2 prefill head-dimension safety requirements."""
+    if head_dim_qk <= 0 or head_dim_vo <= 0:
+        raise ValueError(
+            "head_dim_qk and head_dim_vo must be positive, got "
+            "head_dim_qk={}, head_dim_vo={}.".format(head_dim_qk, head_dim_vo)
+        )
+    if backend != "fa2":  # only FA2 silently corrupts for non-64-multiple head dims
+        return
+    if head_dim_qk % 64 != 0 or head_dim_vo % 64 != 0:
+        raise ValueError(
+            "head_dim_qk and head_dim_vo must be positive multiples of 64, got "
+            "head_dim_qk={}, head_dim_vo={}. The FA2 prefill kernels only "
+            "safely handle head dims divisible by 64; other dims lead to "
+            "out-of-bounds accesses or silently wrong results.".format(
+                head_dim_qk, head_dim_vo
+            )
+        )
+    # KernelTraits tiles the output in chunks of at most 256 dims, and a chunk
+    # must divide head_dim_vo; other sizes fail to compile.
+    if head_dim_vo > 256 and head_dim_vo % 256 != 0:
+        raise ValueError(
+            "head_dim_vo above 256 must be a multiple of 256, got "
+            "head_dim_vo={}. The FA2 prefill kernels split the output into "
+            "tiles of at most 256 dims, which must divide head_dim_vo.".format(
+                head_dim_vo
+            )
+        )
+
+
 def is_float8(x: torch.Tensor) -> bool:
     return x.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
 
@@ -269,6 +299,22 @@ def _get_cache_buf(
             buf = torch.empty(num_bytes, dtype=torch.uint8, device=device)
         _cache_buf[key] = buf
     return buf
+
+
+def make_l2_flush(num_bytes: int, device) -> Callable[[], None]:
+    """Return a callable that evicts L2 by reading a ``num_bytes`` scratch buffer.
+
+    The buffer is only read, so L2 is left holding clean lines. A write-based
+    flush (``zero_()``) leaves L2 full of dirty lines, and the next kernel pays
+    for writing them back to DRAM (about 8 us for a memory-bound GEMM on B200).
+    """
+    buffer = torch.empty(num_bytes // 8, dtype=torch.int64, device=device)
+    out = torch.empty((), dtype=torch.int64, device=device)
+
+    def flush() -> None:
+        torch.sum(buffer, dim=0, out=out)
+
+    return flush
 
 
 _stream_cache_buf: Dict[Tuple[str, torch.device, int], torch.Tensor] = {}
@@ -1365,6 +1411,7 @@ def backend_requirement(
     backend_checks: Dict[str, Callable],
     common_check: Optional[Callable] = None,
     heuristic_func: Optional[Callable] = None,
+    bypass: Optional[Callable[..., bool]] = None,
 ) -> Callable:
     """
     Decorator to enforce backend and problem size requirements for kernel functions.
@@ -1395,6 +1442,15 @@ def backend_requirement(
         Should return an ordered list of runnable backends with the most preferred backend first.
         When decorated function is not autotuned, the first backend in the heuristic list will be run.
         When decorated function is autotuned, the backends in the heuristic list will be autotuned over to find the best backend.
+    bypass : callable, optional
+        A predicate over the call's arguments (``bypass(*args, **kwargs) -> bool``). When it returns True the
+        wrapper performs no backend selection or validation and calls the function directly, which then owns
+        the validation of that call. For a mode that replaces the backends altogether, e.g.
+        ``mm_bf16(..., batch_invariant=True)``, which never runs a backend and raises its own typed errors:
+        evaluating every backend's requirement checks and the auto heuristic for it is pure host overhead.
+        The predicate runs on every call, so keep it a cheap keyword lookup. It gets the call's arguments as passed
+        (no defaults applied, positional arguments not bound to names), so key it on a keyword-only parameter: a
+        positional-or-keyword flag passed by position would silently never bypass.
 
     Returns
     -------
@@ -1634,6 +1690,10 @@ def backend_requirement(
             # skip_check is an optional argument that the decorator adds to any API function.
             # It prevents the performance overhead of checking.
             skip_check = kwargs.pop("skip_check", False)
+
+            if bypass is not None and bypass(*args, **kwargs):
+                # A mode the function validates and dispatches itself: no backend selection here.
+                return func(*args, **kwargs)
 
             if not skip_check:
                 # Apply defaults from the function signature for validation

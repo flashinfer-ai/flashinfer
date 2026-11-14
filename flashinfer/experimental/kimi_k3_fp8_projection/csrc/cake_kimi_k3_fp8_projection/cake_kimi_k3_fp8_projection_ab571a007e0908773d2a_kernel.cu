@@ -800,7 +800,7 @@ kernel_cake_kimi_k3_fp8_projection_ab571a007e0908773d2a(const __grid_constant__ 
                                     for (int v = 0; v < 12; v++) {
                                         int skf_vi = skf_vi0 + (h * 12 + v) * 32;
                                         {
-                                            float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skf_vi * 4 + 0);
+                                            float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skf_vi * 4ull + 0);
                                             parts[4 * v + 0] = _v4.x;
                                             parts[4 * v + 1] = _v4.y;
                                             parts[4 * v + 2] = _v4.z;
@@ -891,7 +891,7 @@ kernel_cake_kimi_k3_fp8_projection_ab571a007e0908773d2a(const __grid_constant__ 
                         int skf_cvi = skf_cvi0 + v_1 * 32;
                         {
                             float4 _v4 = make_float4(quad_c[0 + 0], quad_c[0 + 1], quad_c[0 + 2], quad_c[0 + 3]);
-                            *reinterpret_cast<float4*>((sk_partials + (unsigned long long)skf_cvi * 4) + 0) = _v4;
+                            *reinterpret_cast<float4*>((sk_partials + (unsigned long long)skf_cvi * 4ull) + 0) = _v4;
                         }
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");

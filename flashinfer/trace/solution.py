@@ -24,6 +24,7 @@ and ``flashinfer.trace_apply``.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -96,8 +97,25 @@ class BuildSpec:
     """If True, the solution writes into output buffers passed as trailing args
     and returns None; otherwise it returns the output value(s)."""
     binding: Optional[SupportedBindings] = None
+    setup_entry_point: Optional[str] = None
+    """``"<file_path>::<function_name>"`` of an optional untimed setup step,
+    ``setup(context) -> state``, run once per weight set before the entry point
+    is called (see :mod:`flashinfer.trace_apply.setup`). Python-family
+    solutions only."""
+    teardown_entry_point: Optional[str] = None
+    """``"<file_path>::<function_name>"`` of ``teardown(state)``; requires
+    ``setup_entry_point``."""
+    setup_inputs: Sequence[str] = field(default_factory=tuple)
+    """Definition inputs whose live tensors setup receives and whose identity
+    keys the retained state. Empty with a setup means one state per process."""
+    setup_state_param: str = "state"
+    """The keyword parameter the entry point takes the setup state under. A
+    field rather than a fixed name because trace_apply calls Python-family
+    solutions by keyword, so the wrapper must know the name; an existing kernel
+    keeps whatever parameter name it already uses and records it here."""
 
     def __post_init__(self) -> None:
+        """Validate language, entry point, hardware, binding and the setup fields."""
         try:
             language = SupportedLanguages(self.language)
         except ValueError as exc:
@@ -122,6 +140,50 @@ class BuildSpec:
                     f"Unsupported solution binding: {self.binding!r}"
                 ) from exc
 
+        for name, entry in (
+            ("setup_entry_point", self.setup_entry_point),
+            ("teardown_entry_point", self.teardown_entry_point),
+        ):
+            if entry is not None and (
+                entry.count("::") != 1 or not all(entry.split("::"))
+            ):
+                raise ValueError(
+                    f"Invalid {name}: {entry!r}. "
+                    'Expected "<file_path>::<function_name>".'
+                )
+        if (
+            isinstance(self.setup_inputs, str)
+            or not isinstance(self.setup_inputs, Sequence)
+            or not all(
+                isinstance(item, str) and item.isidentifier()
+                for item in self.setup_inputs
+            )
+            or len(set(self.setup_inputs)) != len(self.setup_inputs)
+        ):
+            raise ValueError(
+                f"setup_inputs must be distinct identifiers: {self.setup_inputs!r}"
+            )
+        setup_inputs = tuple(self.setup_inputs)
+        if self.setup_entry_point is None:
+            if self.teardown_entry_point is not None:
+                raise ValueError("teardown_entry_point requires setup_entry_point")
+            if setup_inputs:
+                raise ValueError("setup_inputs requires setup_entry_point")
+        elif language not in _PYTHON_FAMILY:
+            raise ValueError(
+                f"setup_entry_point requires a Python-family language, "
+                f"not {language.value!r}"
+            )
+        if (
+            not isinstance(self.setup_state_param, str)
+            or not self.setup_state_param.isidentifier()
+        ):
+            raise ValueError(f"Invalid setup_state_param: {self.setup_state_param!r}")
+        if self.setup_state_param in setup_inputs:
+            raise ValueError(
+                f"setup_state_param {self.setup_state_param!r} is also a setup input"
+            )
+
         object.__setattr__(self, "language", language)
         object.__setattr__(self, "target_hardware", tuple(self.target_hardware))
         object.__setattr__(self, "dependencies", tuple(self.dependencies))
@@ -129,6 +191,7 @@ class BuildSpec:
             self, "destination_passing_style", bool(self.destination_passing_style)
         )
         object.__setattr__(self, "binding", binding)
+        object.__setattr__(self, "setup_inputs", setup_inputs)
 
     @property
     def is_python_family(self) -> bool:
@@ -141,6 +204,17 @@ class BuildSpec:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "BuildSpec":
+        """Build a BuildSpec from JSON, refusing an implicit DPS with a setup."""
+        if data.get("setup_entry_point") is not None and not isinstance(
+            data.get("destination_passing_style"), bool
+        ):
+            # The state-bearing run ABI never inherits a default
+            # (FlashInfer defaults to False, flashinfer-bench to True), and a
+            # null would silently read as False.
+            raise ValueError(
+                "destination_passing_style must be declared explicitly, as a "
+                "boolean, when setup_entry_point is present"
+            )
         return cls(
             language=data["language"],
             target_hardware=data.get("target_hardware", ()),
@@ -148,9 +222,14 @@ class BuildSpec:
             dependencies=data.get("dependencies", ()),
             destination_passing_style=data.get("destination_passing_style", False),
             binding=data.get("binding"),
+            setup_entry_point=data.get("setup_entry_point"),
+            teardown_entry_point=data.get("teardown_entry_point"),
+            setup_inputs=data.get("setup_inputs", ()),
+            setup_state_param=data.get("setup_state_param", "state"),
         )
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize to JSON, emitting setup fields only when a setup is declared."""
         out: dict[str, Any] = {
             "language": self.language.value,
             "target_hardware": list(self.target_hardware),
@@ -160,7 +239,18 @@ class BuildSpec:
         }
         if self.binding is not None:
             out["binding"] = self.binding.value
+        if self.setup_entry_point is not None:
+            out["setup_entry_point"] = self.setup_entry_point
+            if self.teardown_entry_point is not None:
+                out["teardown_entry_point"] = self.teardown_entry_point
+            out["setup_inputs"] = list(self.setup_inputs)
+            out["setup_state_param"] = self.setup_state_param
         return out
+
+
+def _entry_part(entry: Optional[str], index: int) -> Optional[str]:
+    """File (0) or symbol (1) half of an optional ``"<file_path>::<symbol>"``."""
+    return None if entry is None else entry.split("::", 1)[index]
 
 
 @dataclass(frozen=True, eq=False)
@@ -177,6 +267,7 @@ class Solution:
     _hash_cache: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        """Check the spec type, source uniqueness and that entry files are sources."""
         if not isinstance(self.spec, BuildSpec):
             raise TypeError("Solution.spec must be a BuildSpec")
         if not self.sources:
@@ -194,6 +285,12 @@ class Solution:
         entry_file = self.spec.entry_point.split("::", 1)[0]
         if entry_file not in seen:
             raise ValueError(f"Entry source file {entry_file!r} not found in sources")
+        for role, path in (
+            ("Setup", self.setup_file()),
+            ("Teardown", self.teardown_file()),
+        ):
+            if path is not None and path not in seen:
+                raise ValueError(f"{role} source file {path!r} not found in sources")
 
         object.__setattr__(self, "sources", sources)
         object.__setattr__(self, "_hash_cache", self._compute_hash())
@@ -203,6 +300,18 @@ class Solution:
 
     def entry_file(self) -> str:
         return self.spec.entry_point.split("::", 1)[0]
+
+    def setup_symbol(self) -> Optional[str]:
+        return _entry_part(self.spec.setup_entry_point, 1)
+
+    def setup_file(self) -> Optional[str]:
+        return _entry_part(self.spec.setup_entry_point, 0)
+
+    def teardown_symbol(self) -> Optional[str]:
+        return _entry_part(self.spec.teardown_entry_point, 1)
+
+    def teardown_file(self) -> Optional[str]:
+        return _entry_part(self.spec.teardown_entry_point, 0)
 
     def entry_source(self) -> Optional[SourceFile]:
         entry = self.entry_file()
@@ -244,10 +353,11 @@ class Solution:
         return out
 
     def _compute_hash(self) -> str:
+        """Hash the definition, build-affecting spec fields and sorted sources."""
         h = hashlib.sha256()
         # Sort sources by path so the hash is independent of source ordering.
         sorted_sources = sorted(self.sources, key=lambda s: s.path)
-        for part in (
+        parts = (
             self.definition,
             self.spec.language.value,
             self.spec.entry_point,
@@ -258,7 +368,24 @@ class Solution:
             str(int(self.spec.destination_passing_style)),
             *self.spec.dependencies,
             *(item for s in sorted_sources for item in (s.path, s.content)),
-        ):
+        )
+        if self.spec.setup_entry_point is not None:
+            # Appended only when declared, so every Solution without a setup
+            # keeps the hash (and build-cache key) it had before the fields
+            # existed; framed as one JSON document so the fields cannot run
+            # into each other (("a", ["bc"]) and ("ab", ["c"]) differ).
+            parts += (
+                json.dumps(
+                    [
+                        "setup",
+                        self.spec.setup_entry_point,
+                        self.spec.teardown_entry_point,
+                        self.spec.setup_state_param,
+                        list(self.spec.setup_inputs),
+                    ]
+                ),
+            )
+        for part in parts:
             h.update(part.encode())
         return h.hexdigest()
 

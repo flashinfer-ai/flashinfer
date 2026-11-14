@@ -335,22 +335,29 @@ def test_invalid_routing_indices_rejected(tensor_index, value, message):
         prepare_bgmv_moe(*inputs, backend="cake")
 
 
-def test_blackwell_backend_rejected():
-    x = torch.empty((1, 2688), dtype=torch.bfloat16)
-    empty_i64 = torch.empty((1,), dtype=torch.int64)
-    empty_f32 = torch.empty((1,), dtype=torch.float32)
-    with pytest.raises(ValueError, match="backend"):
-        prepare_bgmv_moe(
-            x,
-            [],
-            [],
-            empty_i64,
-            empty_i64,
-            empty_i64,
-            empty_f32,
-            1,
-            backend="blackwell",
-        )
+def test_blackwell_plan_is_a_deprecated_alias():
+    import sys
+
+    import flashinfer.fused_moe as fused_moe
+
+    # flashinfer.fused_moe.bgmv_moe is shadowed by the bgmv_moe function.
+    bgmv_moe_module = sys.modules["flashinfer.fused_moe.bgmv_moe"]
+    assert "BGMVMoEBlackwellPlan" in fused_moe.__all__
+    for module in (fused_moe, bgmv_moe_module):
+        with pytest.warns(DeprecationWarning, match="BGMVMoECakePlan"):
+            assert module.BGMVMoEBlackwellPlan is BGMVMoECakePlan
+
+
+def test_blackwell_backend_is_a_deprecated_alias_of_cake():
+    _require_cake_arch()
+    inputs = _make_inputs(2688, 4, torch.bfloat16)
+    expected = _reference(inputs)
+    with pytest.warns(DeprecationWarning, match="blackwell"):
+        plan = prepare_bgmv_moe(*inputs, backend="blackwell")
+    assert isinstance(plan, BGMVMoECakePlan)
+    assert plan.backend_used == "cake"
+    torch.testing.assert_close(plan.run(), expected, atol=1e-2, rtol=1e-2)
+    plan.close()
 
 
 @pytest.mark.parametrize(("hidden_size", "rank"), [(2688, 32), (1024, 16)])
@@ -994,6 +1001,35 @@ def test_strict_mode_raises_for_unsupported_inputs(name, case, message):
     inputs = _fallback_inputs(case)
     with pytest.raises(ValueError, match=message):
         prepare_bgmv_moe(*inputs, backend="cake", fallback=False)
+
+
+@pytest.mark.parametrize(
+    ("name", "case", "message"),
+    _UNSUPPORTED_CASES,
+    ids=[c[0] for c in _UNSUPPORTED_CASES],
+)
+def test_blackwell_backend_raises_for_unsupported_inputs(name, case, message):
+    # "blackwell" keeps the contract of the original backend: no portable plan.
+    _require_cake_arch()
+    inputs = _fallback_inputs(case)
+    with (
+        pytest.warns(DeprecationWarning, match="blackwell"),
+        pytest.raises(ValueError, match=message),
+    ):
+        prepare_bgmv_moe(*inputs, backend="blackwell")
+
+
+def test_blackwell_backend_raises_on_unsupported_capability(monkeypatch):
+    _require_cuda()
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda *args, **kwargs: (8, 0)
+    )
+    inputs = _make_inputs(3072, 4, torch.bfloat16)
+    with (
+        pytest.warns(DeprecationWarning, match="blackwell"),
+        pytest.raises(ValueError, match="exact SM90, SM100, SM103 or SM107"),
+    ):
+        prepare_bgmv_moe(*inputs, backend="blackwell")
 
 
 def test_fallback_on_unsupported_capability(monkeypatch):

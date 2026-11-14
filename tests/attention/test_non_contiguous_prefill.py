@@ -16,7 +16,7 @@ limitations under the License.
 
 import pytest
 import torch
-from tests.test_helpers.jit_utils import gen_prefill_attention_modules
+from tests.jit.test_helpers.jit_utils import gen_prefill_attention_modules
 
 import flashinfer
 from flashinfer.utils import has_flashinfer_jit_cache

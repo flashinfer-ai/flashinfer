@@ -32,6 +32,10 @@ most eight ranks).  Per row and rank:
   and the per-phase collective counts of the deterministic suite (one halo exchange per direction, one more in a
   plain recompute, none in a recompute with a handle);
 - the handle retains exactly the history pool;
+- the two-launch forward (knobs ``fwd_main`` x ``fwd_overlap``, the same on every rank): ``LAST_CALL["fwd"]`` names
+  the form the rank ran (the overlapped form on a rank with tokens, the history-row program when the rank receives
+  history rows) and ``y`` / ``hist`` are bitwise the one-launch forward's (``fwd_main`` 0, ``fwd_overlap`` 0: the
+  previous forward) and the deterministic KCP forward's;
 - a 1-thread kernel resident on another stream does not stall the backward (FlashInfer issues #7038 / #7548: the
   main backward is an ordinary launch; ``busy <= 2 x alone``).
 
@@ -85,8 +89,10 @@ def _run_rank(
     from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
         kcp as conv_kcp,
     )
-    from flashinfer.experimental.cake_kda_det_train_kcp import cake_kcp_plan as plan
-    from tests.test_helpers.cake_package import cake_package
+    from flashinfer.experimental.cake.cake_kda_det_train_kcp import (
+        cake_kcp_plan as plan,
+    )
+    from tests.cake.test_helpers.cake_package import cake_package
 
     det_kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
 
@@ -98,8 +104,10 @@ def _run_rank(
         os.environ.setdefault("MASTER_PORT", str(port))
         dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
     group = dist.group.WORLD
-    part, cu = _partition(plan, lengths, W, layout)
-    ctx = plan.build_context_det_kcp(part, group, rank, device, conv_kernel_size=WIDTH)
+    part, cu = _partition(plan.cake_kda_det_train_kcp_partition, lengths, W, layout)
+    ctx = plan.cake_kda_det_train_kcp_build_context(
+        part, group, rank, device, conv_kernel_size=WIDTH
+    )
     T = cu[-1]
     g = torch.Generator(device="cpu").manual_seed(7815)
     x_all = torch.randn(T, C, generator=g).to(torch.bfloat16)
@@ -208,6 +216,14 @@ def _run_rank(
     yd = det_kcp.cake_causal_conv1d_det_kcp(xd, wd, ctx)
     yd.backward(dy)
     det = {"y": yd.detach(), "dx": xd.grad, "dw": wd.grad}
+    # The first nondet call of the context runs the rank-agreement check of #8946 (one all_gather_into_tensor per
+    # phase, before that phase's exchange); every later call issues only the halo exchanges.
+    _, c_first = run("direct")
+    flags["agreement_check_once_per_phase"] = c_first["calls"] == {
+        "orig": 2,
+        "recompute": 0,
+        "bwd": 2,
+    }
     direct, c_direct = run("direct")
     plain, c_plain = run("ckpt")
     hd = conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle()
@@ -225,6 +241,48 @@ def _run_rank(
         direct["dx"], det["dx"]
     )
     flags["dw_within_budget_of_deterministic"] = ratio(direct["dw"], det["dw"]) <= 1.0
+    # The two-launch forward: every (fwd_main, fwd_overlap) form, the same on every rank, records its form in
+    # LAST_CALL["fwd"] (the overlapped form with the exchange in flight on a rank with tokens; the history-row program
+    # when the rank receives history rows and the form has two launches) and gives y / hist bitwise the one-launch
+    # forward's (fwd_main 0, fwd_overlap 0) and the deterministic KCP forward's.
+    y_det_f, hist_det_f = det_kcp.cake_causal_conv1d_det_train_kcp_forward(x, w, ctx)
+    torch.cuda.synchronize(device)
+    one = None
+    fwd_bitwise, fwd_recorded = True, True
+    for fwd_main in (0, 1):
+        for fwd_overlap in (0, 1):
+            conv_kcp._set_test_knobs({"fwd_main": fwd_main, "fwd_overlap": fwd_overlap})
+            try:
+                for _ in range(2):
+                    y_f, hist_f = conv_kcp.cake_causal_conv1d_nondet_train_kcp_forward(
+                        x, w, ctx
+                    )
+                    torch.cuda.synchronize(device)
+                    if one is None:
+                        one = (y_f.clone(), hist_f.clone())
+                    want = (
+                        {
+                            "main": "sr" if fwd_main else "f",
+                            "form": "pair" if fwd_overlap else "wait",
+                            "repair": bool(fwd_main or fwd_overlap) and n_hist > 0,
+                        }
+                        if x.shape[0]
+                        else {"main": None, "form": "wait", "repair": False}
+                    )
+                    fwd_recorded = fwd_recorded and conv_kcp.LAST_CALL["fwd"] == want
+                    fwd_bitwise = (
+                        fwd_bitwise
+                        and same(y_f, one[0])
+                        and same(hist_f, one[1])
+                        and same(y_f, y_det_f)
+                        and same(hist_f, hist_det_f)
+                        and same(y_f, det["y"])
+                    )
+            finally:
+                conv_kcp._set_test_knobs(None)
+                conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
+    flags["fwd_forms_bitwise"] = fwd_bitwise
+    flags["fwd_forms_recorded"] = fwd_recorded
     # The independent reference: the global FP64 oracle of the whole pack, the rank's tokens gathered from it.
     y_ref, dx_ref, dw_ref = _reference(x_all.to(device), w, cu_dev, dy_all.to(device))
     info["y_ratio_to_one_bf16_ulp_vs_fp64"] = ulp_ratio(
@@ -363,6 +421,25 @@ def _run_rank(
     # These rows are tiny: one more wave of CTAs beside the SM that the side kernel
     # holds can exceed 2x alone (about 0.1 ms) without a stall.
     flags["side_kernel_no_stall"] = busy <= max(2.0 * alone, 0.5 * sleep)
+    # Rank agreement (#8946): on a fresh context of the same partition, rank 0 calls with C channels and every other
+    # rank with C + 8.  The first forward's check raises the same ValueError on every rank, before any exchange; a
+    # matching call on that context then runs (the failed check recorded nothing).
+    ctx2 = plan.cake_kda_det_train_kcp_build_context(
+        part, group, rank, device, conv_kernel_size=WIDTH
+    )
+    C2 = C if rank == 0 else C + 8
+    x2 = torch.zeros(x.shape[0], C2, dtype=torch.bfloat16, device=device)
+    w2 = torch.zeros(C2, WIDTH, dtype=torch.float32, device=device)
+    try:
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_forward(x2, w2, ctx2)
+        flags["agreement_mismatch_raises"] = False
+    except ValueError as exc:
+        flags["agreement_mismatch_raises"] = "rank agreement" in str(exc)
+        info["agreement_error"] = str(exc)[:300]
+    y2, _ = conv_kcp.cake_causal_conv1d_nondet_train_kcp_forward(
+        x2[:, :C].contiguous(), w2[:C].contiguous(), ctx2
+    )
+    flags["agreement_matching_call_runs"] = bool(torch.all(y2 == 0))
     flag_list = [None] * W
     info_list = [None] * W
     dist.all_gather_object(flag_list, flags)

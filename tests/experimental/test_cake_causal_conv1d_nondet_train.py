@@ -45,9 +45,11 @@ CUDA Graph capture / replay and through the autograd entry (plain and checkpoint
 The narrower channel tiles of ``TILE_OVERRIDES``: one row per architecture (``OVERRIDE_CASES``) launches the row's
 tiles, on a caller-owned workspace of the public size and on the package's, with ``dx`` bitwise the deterministic
 package's, the gradients within budget of the reference and of the deterministic package, and the workspace zero
-after the call.
+after the call.  The 32-vector tiles of ``NARROW_TILES`` the same way at every key of the architecture's table
+(``NARROW_CASES``: the key's channel ends and an inner channel count, at token counts inside the key's range), and
+the side-stream one-SM trim of a three-tile narrow row's grid.
 
-This suite names its package once, through ``tests.test_helpers.cake_package`` (key
+This suite names its package once, through ``tests.cake.test_helpers.cake_package`` (key
 ``cake_causal_conv1d_nondet_train``), and the deterministic package for the parity checks through the same table;
 a vendored build without the deterministic package skips those checks.  Every test skips until the exporter has
 rendered the package (``build.json`` and ``csrc/``).
@@ -62,7 +64,7 @@ import weakref
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 KEY = "cake_causal_conv1d_nondet_train"
 pkg = cake_package(KEY)
@@ -127,6 +129,18 @@ OVERRIDE_CASES = {
     "sm_100a": ("bwd_bias_fp32g", 62585, 2048),
     "sm_103a": ("bwd", 62585, 1536),
     "sm_107a": ("bwd_dt", 62585, 768),
+}
+# The rows of ``NARROW_TILES`` (rendered with the table; empty for an architecture without rows) the narrow-tile
+# test launches, per architecture (route, S, C): each key's lowest, an inner and its highest channel count at the
+# key's smallest token count and one token above it (inside the delivered range; ``CASES`` stop at S = 4097).
+NARROW_CASES = {
+    arch: tuple(
+        (route, S, C)
+        for (route, c_lo, c_hi), (s_min, s_max) in sorted(rows.items())
+        for C in sorted({int(c_lo), (int(c_lo) + int(c_hi)) // 16 * 8, int(c_hi)})
+        for S in sorted({int(s_min), min(int(s_min) + 1, int(s_max))})
+    )
+    for arch, rows in loader.NARROW_TILES.items()
 }
 # Wide channel counts on every route: C = 4096 (four documents, one empty) and C = 10240 (a packed q / k / v
 # projection width), at small S.
@@ -961,6 +975,180 @@ def test_tile_override_row(own_workspace, monkeypatch, record_property) -> None:
         )
 
 
+@pytest.mark.parametrize("own_workspace", (True, False), ids=("own-ws", "pkg-ws"))
+def test_narrow_tile_row(own_workspace, monkeypatch, record_property) -> None:
+    """Every ``NARROW_CASES`` row of the architecture's ``NARROW_TILES`` launches 32-vector channel tiles (``32``,
+    ``threads // 32`` sub-tiles, ``ceil(C / vec / 32)`` tiles) instead of :func:`channel_split`'s single tile, on
+    the grid the host plans for the call (``_call_plan``: ``launch_grid`` with the side-stream trim), on a
+    caller-owned workspace of the public size or the package's: ``dx`` within budget of the reference and bitwise
+    the deterministic package's (when importable), ``dweight`` / ``dbias`` within the route's budget of the
+    reference and of the deterministic package, the workspace zero after the call."""
+
+    arch, device = _arch(), _device()
+    cases = NARROW_CASES.get(arch, ())
+    if not cases:
+        pytest.skip(f"{arch} has no NARROW_TILES row")
+    seen = []
+    launch = pkg.run_module
+
+    def record_launch(name, values, *, device_index, grid=None):
+        seen.append(
+            (
+                name,
+                {key: int(values[key]) for key in ("ct_vec", "n_sub", "n_ch_tiles")},
+                grid,
+            )
+        )
+        return launch(name, values, device_index=device_index, grid=grid)
+
+    monkeypatch.setattr(pkg, "run_module", record_launch)
+    det = _det_or_none()
+    worst = [0.0, 0.0]
+    for kind, S, C in cases:
+        _require_route(kind)
+        label = f"{arch} {kind} S={S} C={C}"
+        assert loader.narrow_tile_row(arch, kind, C, S), label
+        (name,) = loader.selected_modules(arch, kind, C=C, S=S)
+        geometry = loader.MODULES[name]["grid_rule"]["geometry"]
+        wanted = {
+            "ct_vec": 32,
+            "n_sub": geometry["threads"] // 32,
+            "n_ch_tiles": -(-(C // geometry["vec"]) // 32),
+        }
+        assert wanted != dict(
+            zip(
+                ("ct_vec", "n_sub", "n_ch_tiles"),
+                loader.channel_split(C, geometry=geometry, role="bwd"),
+                strict=True,
+            )
+        ), f"{label}: the row must differ from the default split"
+        x, w, cu, dy, b, policy = _route_inputs(S, C, "perf", kind, key=11)
+        _, _, _, grid, _ = pkg._call_plan(
+            arch,
+            kind,
+            S,
+            C,
+            len(doc_lengths(S, "perf")),
+            device_index=device.index,
+            policy=policy,
+        )
+        workspace = (
+            pkg.cake_causal_conv1d_nondet_train_backward_workspace(S, C, device)
+            if own_workspace
+            else None
+        )
+        seen.clear()
+        dx, dw, db = _backward(x, w, cu, dy, b, policy, workspace=workspace)
+        torch.cuda.synchronize(device)
+        assert seen == [(name, wanted, grid)], f"{label}: launched {seen}"
+        worst_dw, worst_db = _check_grads(
+            dx, dw, db, reference_backward(x, w, cu, dy, b=b, policy=policy),
+            policy=policy, label=label,
+        )  # fmt: skip
+        worst = [max(worst[0], worst_dw), max(worst[1], worst_db)]
+        held = workspace if own_workspace else _stream_workspace(device)
+        assert held is not None and int(torch.count_nonzero(held)) == 0, label
+        if det is None:
+            continue
+        dx_d, dw_d, db_d = _det_backward(det, x, w, cu, dy, b, policy)
+        assert torch.equal(dx, dx_d), (
+            f"dx differs from the deterministic package ({label})"
+        )
+        for got, ref, what in ((dw, dw_d, "dweight"), (db, db_d, "dbias")):
+            if got is None:
+                continue
+            atol, rtol = _grad_tolerance(policy, got.dtype)
+            _assert_within(
+                got.float(),
+                ref.float(),
+                atol=atol,
+                rtol=rtol,
+                label=f"{what} vs det {label}",
+            )
+    record_property("narrow_rows", len(cases))
+    record_property("worst_dweight_ratio_to_budget", worst[0])
+    record_property("worst_dbias_ratio_to_budget", worst[1])
+
+
+def test_narrow_tile_row_gives_up_one_sm_at_three_tiles(monkeypatch) -> None:
+    """FlashInfer issue #8365 on a three-tile ``NARROW_TILES`` row: on the ``bwd`` and ``bwd_fp32g`` routes a
+    single-wave launch of ``ctas_per_sm x SM count`` CTAs whose last channel-tile rank holds at least
+    ``ctas_per_sm`` CTAs (``full % 3 >= ctas_per_sm``; B200: 296 % 3 = 2) launches ``ctas_per_sm`` fewer, as at a
+    route-free plan of three tiles; a grid ``launch_grid`` already trimmed to whole ranks is kept.  The trimmed
+    launch's ``dx`` is bitwise the whole grid's, both gradients are within budget of the reference and the workspace
+    reads back zero."""
+
+    arch, device = _arch(), _device()
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    rows = [
+        (kind, S, C)
+        for kind, S, C in NARROW_CASES.get(arch, ())
+        if kind in ("bwd", "bwd_fp32g")
+    ]
+    if not rows:
+        pytest.skip(f"{arch} has no NARROW_TILES row on the bwd / bwd_fp32g routes")
+    launched = []
+    run_module = pkg.run_module
+
+    def record_launch(name, values, *, device_index, grid=None):
+        launched.append((int(values["n_ch_tiles"]), grid))
+        return run_module(name, values, device_index=device_index, grid=grid)
+
+    monkeypatch.setattr(pkg, "run_module", record_launch)
+    checked = 0
+    for kind, S, C in rows:
+        _require_route(kind)
+        (name,) = loader.selected_modules(arch, kind, C=C, S=S)
+        record = loader.MODULES[name]
+        rule = record["grid_rule"]
+        geometry = rule["geometry"]
+        tiles = -(-(C // geometry["vec"]) // 32)
+        if (
+            tiles != 3
+            or rule["kind"] != "occupancy"
+            or loader.grid_mult(record, arch) != 1
+        ):
+            continue
+        k = int(rule["ctas_per_sm"])
+        full = k * sms
+        untrimmed = loader.launch_grid(record, device_index=device.index, C=C, S=S)
+        cut = untrimmed[0] == full and full % tiles >= k
+        expected = (full - k, 1, 1) if cut else tuple(untrimmed)
+        label = f"{arch} {kind} S={S} C={C} full={full} k={k}"
+        x, w, cu, dy, b, policy = _route_inputs(S, C, "perf", kind, key=43)
+        refs = reference_backward(x, w, cu, dy, b=b, policy=policy)
+        pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
+        launched.clear()
+        dx, dw, db = _backward(x, w, cu, dy, b, policy)
+        torch.cuda.synchronize(device)
+        assert launched == [(tiles, expected)], f"{label}: launched {launched}"
+        _check_grads(dx, dw, db, refs, policy=policy, label=label)
+        held = _stream_workspace(device)
+        assert held is None or int(torch.count_nonzero(held)) == 0, label
+        if cut:
+            with monkeypatch.context() as m:
+                m.setattr(pkg, "_one_sm_trim", lambda record, n, grid, **kw: grid)
+                pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
+                launched.clear()
+                dx_full, dw_full, db_full = _backward(x, w, cu, dy, b, policy)
+                torch.cuda.synchronize(device)
+            pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
+            assert launched == [(tiles, tuple(untrimmed))], f"{label}: {launched}"
+            assert torch.equal(dx, dx_full), label
+            _check_grads(
+                dx_full,
+                dw_full,
+                db_full,
+                refs,
+                policy=policy,
+                label=f"{label} whole grid",
+            )
+        checked += 1
+    assert checked, (
+        f"{arch}: no three-tile NARROW_TILES row on an occupancy single-wave record"
+    )
+
+
 @pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
 @pytest.mark.parametrize("case", GRID_MULT_CASES, ids=_case_id)
 def test_bwd_grid_mult_keeps_dx_and_the_budgets(case, kind, record_property) -> None:
@@ -1651,11 +1839,11 @@ def test_backward_grid_gives_up_one_sm_when_the_last_rank_is_partial(
         if cut:
             with monkeypatch.context() as m:
                 m.setattr(pkg, "_one_sm_trim", lambda record, n, grid, **kw: grid)
-                pkg.plan_cache_clear()
+                pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
                 launched.clear()
                 dx_full, dw_full, db_full = _backward(x, w, cu, dy, b, policy)
                 torch.cuda.synchronize(device)
-            pkg.plan_cache_clear()
+            pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
             assert launched == [(full, 1, 1)], (kind, C, launched)
             assert torch.equal(dx, dx_full), (kind, C)
             _check_grads(

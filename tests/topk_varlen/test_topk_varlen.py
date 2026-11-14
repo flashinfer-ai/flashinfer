@@ -58,7 +58,10 @@ test_input_validation         — 1-D logits / non-int32 seq_lens rejected
 
 import pytest
 import torch
-from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
+from tests.infra.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
 
 try:
     import flashinfer

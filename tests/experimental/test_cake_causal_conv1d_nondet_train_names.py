@@ -18,10 +18,10 @@ Public names of the Cake non-deterministic causal conv1d + SiLU training package
 The module names the mode: the entry-point modules (stable APIs) ``flashinfer.cake_causal_conv1d_nondet_train`` and
 ``flashinfer.cake_causal_conv1d_nondet_train_kcp`` and the package
 ``flashinfer.experimental.cake.cake_causal_conv1d_nondet_train`` (with its ``kcp`` module).  Every public name of the
-two entry-point modules (their ``__all__``) has the mode word ``nondet`` as one of its words (the name split at ``_``
-and at CamelCase boundaries), except the module constants (ALL_CAPS); the package carries the mode in its path, and
-its public entry points and types have the entry-point modules' names (its internal helper ``plan_cache_clear`` keeps
-its name).  No public callable of the four modules, no package object an entry point forwards to and no ``forward`` /
+four modules (their ``__all__``) has the mode word ``nondet`` as one of its words (the name split at ``_`` and at
+CamelCase boundaries), except the module constants (ALL_CAPS); the package's entry points and types have the
+entry-point modules' names, and its helpers carry the module name too
+(``cake_causal_conv1d_nondet_train_plan_cache_clear``).  No public callable of the four modules, no package object an entry point forwards to and no ``forward`` /
 ``backward`` of the package's autograd Functions takes a ``deterministic`` keyword (binding one is a ``TypeError``);
 the modules of the names before the rename do not import, and no module binds an old name.  CPU-only: nothing here
 launches, builds or needs a device.
@@ -121,10 +121,15 @@ KCP_PACKAGE_NAMES = (
     ),
     ("graph_cache_clear", "cake_causal_conv1d_nondet_train_kcp_graph_cache_clear"),
 )
+# The package also renames its host-plan cache helper.
+PACKAGE_NAMES = (
+    *SINGLE_RANK,
+    ("plan_cache_clear", "cake_causal_conv1d_nondet_train_plan_cache_clear"),
+)
 RENAMED = {
     FACADE: SINGLE_RANK,
     KCP_FACADE: KCP_FACADE_NAMES,
-    PACKAGE: SINGLE_RANK,
+    PACKAGE: PACKAGE_NAMES,
     KCP_PACKAGE: KCP_PACKAGE_NAMES,
 }
 # Renamed names that no module lists in ``__all__`` (the KCP backend's host-plan cache helper, now
@@ -195,15 +200,16 @@ def test_words_split_at_underscores_and_camel_case() -> None:
         "cake_causal_conv1d_nondeterministic",
         "CakeCausalConv1dNondeterministicFunction",
         "cake_causal_conv1d_det",
-        "RecomputeHandleDetKcp",
+        "CakeCausalConv1dDetKcpRecomputeHandle",
     ):
         assert MODE_WORD not in _words(name), name
 
 
-@pytest.mark.parametrize("module_name", FACADES)
+@pytest.mark.parametrize("module_name", MODULES)
 def test_public_names_carry_the_mode_word(module_name: str) -> None:
-    """Every name of an entry-point module's ``__all__`` resolves, and every one but the module constants has
-    ``nondet`` (any case) as one of its words (split at ``_`` and at CamelCase boundaries)."""
+    """Every name of the ``__all__`` of an entry-point module, of the package and of its ``kcp`` module resolves,
+    and every one but the module constants has ``nondet`` (any case) as one of its words (split at ``_`` and at
+    CamelCase boundaries): no helper keeps a name without the mode."""
 
     module = importlib.import_module(module_name)
     for name, _ in _public(module):

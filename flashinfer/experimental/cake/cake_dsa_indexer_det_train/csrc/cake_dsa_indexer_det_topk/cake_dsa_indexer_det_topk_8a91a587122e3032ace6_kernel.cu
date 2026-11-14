@@ -210,7 +210,7 @@ CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int* 
     for (int i = 0; i < 8; i++) {
         int pos = i * 256 + tid;
         kids[i] = -1;
-        bits[i] = 4286578688;
+        bits[i] = 4286578688ll;
         unsigned int is_pad = 0;
         if (pos < top_k) {
             int kid = s_out_id[pos];

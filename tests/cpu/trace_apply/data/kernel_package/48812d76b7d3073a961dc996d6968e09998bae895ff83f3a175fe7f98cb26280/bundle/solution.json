@@ -1,0 +1,33 @@
+{
+  "author": "sealed package tests",
+  "definition": "rmsnorm_h16",
+  "description": "Example of a setup-bearing sealed package: prepare.py converts the weight once per weight set into the layout kernel.py consumes, and run() receives it under state. The stock rmsnorm layout stays in place.",
+  "name": "rmsnorm_h16_prepared_weight",
+  "sources": [
+    {
+      "content": "\"\"\"The sealed kernel: ``run`` receives the Definition inputs by keyword, the\nprepared weight under ``state`` and the destination buffer ``output``.\n\nIt converts nothing per call: ``prepare.py`` ran once for this weight set and\nleft the layout the kernel consumes in ``state``. ``weight`` still arrives (it\nis a Definition input and the tensor the state is keyed on) but is not read.\n\"\"\"\n\nimport torch\n\n\ndef run(hidden_states, weight, state, output):\n    x = hidden_states.to(torch.float32)\n    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)\n    output.copy_((x * inv_rms * state[\"weight_f32\"]).to(output.dtype))\n",
+      "path": "kernel.py"
+    },
+    {
+      "content": "\"\"\"Weight preparation for the sealed rmsnorm kernel.\n\n``setup(context)`` runs once per weight set, at the first eager call and never\ninside CUDA-graph capture, with the live tensors named by ``setup_inputs``\nunder ``context[\"setup_inputs\"]``. It returns the state ``run`` receives by\nkeyword: here the weight converted once into the layout the kernel consumes\n(contiguous float32), so no call converts it again. ``teardown(state)`` runs\nonly on an explicit release, never at process exit.\n\"\"\"\n\nimport torch\n\n\ndef setup(context):\n    weight = context[\"setup_inputs\"][\"weight\"]\n    return {\"weight_f32\": weight.to(torch.float32).contiguous()}\n\n\ndef teardown(state):\n    state.clear()\n",
+      "path": "prepare.py"
+    }
+  ],
+  "spec": {
+    "dependencies": [
+      "torch"
+    ],
+    "destination_passing_style": true,
+    "entry_point": "kernel.py::run",
+    "language": "python",
+    "setup_entry_point": "prepare.py::setup",
+    "setup_inputs": [
+      "weight"
+    ],
+    "setup_state_param": "state",
+    "target_hardware": [
+      "sm100"
+    ],
+    "teardown_entry_point": "prepare.py::teardown"
+  }
+}

@@ -38,7 +38,7 @@ peaked variant):
   pooled, ``V6`` one 262144-token document pooled, and ``V7`` one 65536-token
   document at top-k 512 without pooling; ``--rows pool`` names the group;
 * the attention-sink + local-band rows of flashinfer-ai/flashinfer#7042
-  (``tests/test_helpers/cake_dsa_indexer_reference.make_sink_inputs``, the
+  (``tests/experimental/test_helpers/cake_dsa_indexer_reference.make_sink_inputs``, the
   issue's generator): ``Z1`` one 262144-token document, context-parallel
   zigzag rank 0 of 16 (queries ``[0, 8192)`` and ``[253952, 262144)``, the
   issue's call), ``Z1k4096`` / ``Z1k256`` its top-k variants, ``Z2`` eight 32k
@@ -102,7 +102,7 @@ Every row is measured in three paired phases -- the arms in the given order
 together with the wrapper-inclusive wall time, the peak extra device memory
 beyond inputs / outputs / workspace, and the explicit workspace bytes of the
 ``cake`` arm.  ``--verify`` judges every arm against the FP64 / FP32
-reference of ``tests/test_helpers/cake_dsa_indexer_reference.py`` (small rows
+reference of ``tests/experimental/test_helpers/cake_dsa_indexer_reference.py`` (small rows
 only; the reference scores every visible pair).
 
 FP8 mode (``--form fp8``): the inputs are float8_e4m3fn ``q`` / ``k`` with
@@ -180,7 +180,7 @@ from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
 from flashinfer.experimental.cake.cake_dsa_indexer_det_train import cake_backend  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 from flashinfer.topk import TopKTieBreak  # noqa: E402
-from tests.test_helpers import cake_dsa_indexer_reference as ref  # noqa: E402
+from tests.experimental.test_helpers import cake_dsa_indexer_reference as ref  # noqa: E402
 
 P1_CU_SEQLENS_Q = (0, 1777, 3532, 5655, 7765, 9888, 11998, 14121, 16231)
 P1_CU_SEQLENS_K = (0, 1777, 58619, 60742, 128665, 130788, 198711, 200834, 268757)
@@ -1194,17 +1194,30 @@ FAR = {"far_sample": 1}
 # record that drops ``l6_rule`` cannot compose the unregistered ``pair_wide`` on sm_100a / sm_103a; ``WIDE`` keeps dropping
 # ``pair_rule`` so the arm is the single-CTA wide program on sm_107a (which registers ``pair_wide``) as well.  The plain-l6
 # and reverse pair arms pin ``wide_first_rule`` to None: without the pin they would inherit an architecture's wide-first
-# precedence and run the wide program on every eligible row at or above its floor.
-WIDE = {"l6_rule": None, "pair_rule": None}
-L6 = {"pair_rule": None, "wide_first_rule": None}
+# precedence and run the wide program on every eligible row at or above its floor.  Every forced unit arm pins
+# ``wide_wave_rule`` to None: a record that sets it (the sm_100a and sm_103a FP8 records) decides narrow / l6 against
+# wide by waves of the persistent grid instead of the rules these arms replace.
+WIDE = {"l6_rule": None, "pair_rule": None, "wide_wave_rule": None}
+L6 = {"pair_rule": None, "wide_first_rule": None, "wide_wave_rule": None}
 PAIR_L6 = {
     "l6_rule": [1024.0, 512],
     "pair_rule": [128.0, 1024.0, 512],
     "wide_first_rule": None,
+    "wide_wave_rule": None,
 }
-WIDE_C1 = {"l6_rule": None, "pair_rule": None, "wide_rule": [1.0, 0.0]}
+WIDE_C1 = {
+    "l6_rule": None,
+    "pair_rule": None,
+    "wide_rule": [1.0, 0.0],
+    "wide_wave_rule": None,
+}
 # forced narrow: no l6, no pair, and a wide rule no call can meet (the single-warpgroup narrow program on every row)
-NARROW = {"l6_rule": None, "pair_rule": None, "wide_rule": [1e18, 1e18]}
+NARROW = {
+    "l6_rule": None,
+    "pair_rule": None,
+    "wide_rule": [1e18, 1e18],
+    "wide_wave_rule": None,
+}
 # the 16384-slot capacity floor on every top_k (no top_k-keyed floor rule): the plan of the package before the rule, so on
 # sm_100a a top_k <= 512 row runs the same programs with twice the candidate buffers (the same bits) in this build; the
 # sm_103a record carries this floor already (there the arm is a second A/A twin)
@@ -1218,6 +1231,7 @@ L6_ALL = {
     "pair_rule": None,
     "wide_first_rule": None,
     "wide_rule": [1e18, 1e18],
+    "wide_wave_rule": None,
 }
 FP8_NARROW = {**NARROW, "l6_solo_rule": None, "l6_solo_unsampled_max_queries": None}
 # the FP8 kind fallback before a wide decision ran the FP8 l6 program: the narrow program

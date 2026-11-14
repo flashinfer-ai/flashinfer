@@ -103,12 +103,12 @@ Host design (the knobs are keywords; no environment variable):
   package's rules.
 - Host plan: the first call of a row (architecture, route, ``C``, device,
   ``bwd_grid_mult``) selects its program, splits ``C`` into channel tiles,
-  reads the row's ``TILE_OVERRIDES`` entry and sizes the grid
-  (``cake_jit.plan_row``); later calls of the row only compare ``S`` with the
-  override's token range (and size the grid where ``launch_grid`` trims it
+  reads the row's ``TILE_OVERRIDES`` or ``NARROW_TILES`` entry and sizes the
+  grid (``cake_jit.plan_row``); later calls of the row only compare ``S`` with
+  the entry's token range (and size the grid where ``launch_grid`` trims it
   by ``S``), so they launch the values a per-call plan gives.  A row whose
-  program selection reads ``S`` plans every call.  :func:`plan_cache_clear`
-  drops the rows.
+  program selection reads ``S`` plans every call.
+  :func:`cake_causal_conv1d_nondet_train_plan_cache_clear` drops the rows.
 """
 
 from __future__ import annotations
@@ -191,12 +191,12 @@ _LAYOUTS: dict[tuple, dict] = {}
 _ACCUMULATOR_VIEWS: dict[int, tuple[weakref.ref, dict]] = {}
 # The host plan of each call row, planned by the row's first call: ``(arch, route kind, C, device index,
 # bwd_grid_mult) -> (cake_jit.RowPlan or None, {n_ch_tiles: the forward's counter words or the backward's accumulator
-# layout})``.  Selecting the route's program, splitting C into channel tiles, looking up the TILE_OVERRIDES row and
-# sizing the grid cost several us of host time in front of every launch; with the row's plan a call only compares
-# ``S`` with the override's token range (``cake_jit.row_launch``).  A row whose program selection reads ``S``
-# (``cake_jit.tokens_select``) holds ``None`` and plans every call.  At most ``_ROW_PLANS_MAX`` rows (then emptied);
-# :func:`plan_cache_clear` empties it (needed after a change of the registry tables, the SM count or the
-# architecture a device reports, which the rows were planned from).
+# layout})``.  Selecting the route's program, splitting C into channel tiles, looking up the TILE_OVERRIDES /
+# NARROW_TILES row and sizing the grid cost several us of host time in front of every launch; with the row's plan a
+# call only compares ``S`` with the row's token range (``cake_jit.row_launch``).  A row whose program selection reads
+# ``S`` (``cake_jit.tokens_select``) holds ``None`` and plans every call.  At most ``_ROW_PLANS_MAX`` rows (then
+# emptied); :func:`cake_causal_conv1d_nondet_train_plan_cache_clear` empties it (needed after a change of the registry
+# tables, the SM count or the architecture a device reports, which the rows were planned from).
 _ROW_PLANS: dict[tuple, tuple[Optional[_loader.RowPlan], dict]] = {}
 _ROW_PLANS_MAX = 1024
 # The torch dtype of each accumulator / counter dtype name of a workspace rule.
@@ -524,9 +524,9 @@ def _launch(
     untrimmed grid (``launch_grid`` without the row), never trimmed to whole
     channel-tile ranks; the scalars do not depend on the grid.  A backward
     record's plan takes the device's architecture ``arch`` and the record's
-    route, so a row of ``cake_jit.TILE_OVERRIDES`` runs its narrower channel
-    tiles.  At ``bwd_grid_mult`` 1 the grid is :func:`_one_sm_trim` of the
-    row's ``launch_grid``.
+    route, so a row of ``cake_jit.TILE_OVERRIDES`` or ``cake_jit.NARROW_TILES``
+    runs its narrower channel tiles.  At ``bwd_grid_mult`` 1 the grid is
+    :func:`_one_sm_trim` of the row's ``launch_grid``.
     """
 
     scalars = plan(
@@ -662,10 +662,10 @@ def _call_plan(
     return row.names, row.record, scalars, grid, per_tiles
 
 
-def plan_cache_clear() -> int:
+def cake_causal_conv1d_nondet_train_plan_cache_clear() -> int:
     """Drop the host plans of the single-rank calls (``_ROW_PLANS``), planned again by the next call of each row;
     returns the number of rows dropped.  Call it after changing what the rows were planned from: the registry
-    tables of ``cake_jit`` (``MODULES``, ``ROUTES``, ``TILE_OVERRIDES``, the grid-trim tables), its
+    tables of ``cake_jit`` (``MODULES``, ``ROUTES``, ``TILE_OVERRIDES``, ``NARROW_TILES``, the grid-trim tables), its
     ``sm_count`` or ``device_arch``."""
 
     n = len(_ROW_PLANS)
@@ -1368,6 +1368,6 @@ __all__ = [
     "cake_causal_conv1d_nondet_train_forward",
     "cake_causal_conv1d_nondet_train_forward_workspace",
     "cake_causal_conv1d_nondet_train_forward_workspace_bytes",
+    "cake_causal_conv1d_nondet_train_plan_cache_clear",
     "is_cake_causal_conv1d_nondet_train_supported",
-    "plan_cache_clear",
 ]

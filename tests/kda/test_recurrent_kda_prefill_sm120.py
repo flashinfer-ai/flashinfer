@@ -1145,7 +1145,8 @@ def test_recurrent_kda_prefill_sm120_packed_matches_reference(
 @torch.inference_mode()
 @pytest.mark.parametrize("variant", ["decomp", "fused"])
 @pytest.mark.parametrize("packed", [False, True])
-def test_recurrent_kda_prefill_sm120_variants_match_reference(variant, packed):
+@pytest.mark.parametrize("strided", [False, True])
+def test_recurrent_kda_prefill_sm120_variants_match_reference(variant, packed, strided):
     """Each variant on its own, so neither is left untested by ``auto``.
 
     ``auto`` picks one per shape, and which one depends on the runner's SM
@@ -1159,6 +1160,10 @@ def test_recurrent_kda_prefill_sm120_variants_match_reference(variant, packed):
     inputs = _make_inputs_sm120(
         seq_lens=seq_lens, num_heads=4, packed=packed, initial_state=True, seed=SEED
     )
+    if strided:
+        from tests.kda.test_helpers.kda_prefill import _strided_qkv
+
+        inputs.update(_strided_qkv(inputs, independent=False))
     expected_out, expected_state = _reference_kda_prefill(inputs)
 
     out = torch.empty_like(inputs["v"])
@@ -1512,8 +1517,9 @@ def _warm_and_capture(inputs, *, workspace, output, state, variant=None):
 @pytest.mark.parametrize("variant", ["decomp", "fused", None])
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("offsets_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("strided", [False, True])
 def test_recurrent_kda_prefill_sm120_graph_replay_matches_eager(
-    variant, packed, offsets_dtype
+    variant, packed, offsets_dtype, strided
 ):
     """Every published combination captures, replays and agrees with eager.
 
@@ -1536,6 +1542,10 @@ def test_recurrent_kda_prefill_sm120_graph_replay_matches_eager(
         seed=SEED,
         offsets_dtype=offsets_dtype,
     )
+    if strided:
+        from tests.kda.test_helpers.kda_prefill import _strided_qkv
+
+        inputs.update(_strided_qkv(inputs, independent=True))
     expected_out, expected_state = _reference_kda_prefill(inputs)
 
     eager_state = inputs["initial_state"].clone()

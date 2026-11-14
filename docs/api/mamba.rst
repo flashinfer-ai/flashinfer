@@ -127,7 +127,7 @@ takes a ``deterministic`` keyword; passing one raises ``TypeError``.
      - no effect
    * - deterministic, context-parallel (KCP)
      - ``flashinfer.cake_causal_conv1d_det_train_kcp``:
-       ``cake_causal_conv1d_det_kcp``, ``cake_causal_conv1d_det_multi_kcp``
+       ``cake_causal_conv1d_det_kcp``, ``cake_causal_conv1d_det_kcp_multi``
      - ``y``, ``dx`` and the rank-local FP32 ``dweight`` partial bitwise
        reproducible
      - no effect
@@ -196,8 +196,10 @@ the halo collective of the KDA step's context.
     :toctree: ../generated
 
     cake_causal_conv1d_det_kcp
-    cake_causal_conv1d_det_multi_kcp
-    RecomputeHandleDetKcp
+    cake_causal_conv1d_det_kcp_multi
+    CakeCausalConv1dDetKcpFunction
+    CakeCausalConv1dDetKcpMultiFunction
+    CakeCausalConv1dDetKcpRecomputeHandle
 
 Training causal conv1d, non-deterministic (Cake)
 -------------------------------------------------
@@ -223,9 +225,10 @@ here runs the deterministic package.
   and ``CakeCausalConv1dNondetKcpRecomputeHandle``, with the deterministic KCP
   entry points' parameters and the keyword-only ``bwd_reserve_sms`` (SMs the
   main backward leaves free; ``bwd_reserve_sms >= 1`` raises ``ValueError`` on
-  SM107).  ``cooperative=True`` raises ``ValueError``: it applies to the
-  deterministic KCP package only, and the non-deterministic main backward is
-  one ordinary launch.
+  SM107 and, elsewhere, runs the one-program backward after the halo exchange
+  instead of the overlapped backward).  ``cooperative=True`` raises
+  ``ValueError``: it applies to the deterministic KCP package only, and the
+  non-deterministic backward launches no cooperative grid.
 
 .. currentmodule:: flashinfer.cake_causal_conv1d_nondet_train
 
@@ -261,9 +264,10 @@ Each name of the two modules maps to the deterministic name with ``det`` in
 place of ``nondet`` (``cake_causal_conv1d_nondet`` ->
 ``cake_causal_conv1d_det``, ``CakeCausalConv1dNondetFunction`` ->
 ``CakeCausalConv1dDetFunction``,
-``cake_causal_conv1d_nondet_kcp`` -> ``cake_causal_conv1d_det_kcp``), except
-``cake_causal_conv1d_nondet_kcp_multi`` -> ``cake_causal_conv1d_det_multi_kcp``
-and ``CakeCausalConv1dNondetKcpRecomputeHandle`` -> ``RecomputeHandleDetKcp``.
+``cake_causal_conv1d_nondet_kcp`` -> ``cake_causal_conv1d_det_kcp``,
+``cake_causal_conv1d_nondet_kcp_multi`` -> ``cake_causal_conv1d_det_kcp_multi``,
+``CakeCausalConv1dNondetKcpRecomputeHandle`` ->
+``CakeCausalConv1dDetKcpRecomputeHandle``).
 Example::
 
     from flashinfer.cake_causal_conv1d_nondet_train import (
@@ -283,8 +287,15 @@ deterministic backward's, and the CTAs add their ``dweight`` / ``dbias`` rows
 into zeroed accumulators with unordered global reductions (FP32, or FP64 under
 ``silu_grad_preactivation="fp32"``), rounded once into the requested dtype.
 ``dweight`` / ``dbias`` stay within the deterministic error budget but are not
-bitwise reproducible from run to run.  The KCP backward returns the rank-local
-FP32 ``dweight`` partial with the same property.
+bitwise reproducible from run to run.  The KCP backward overlaps the halo
+exchange: its main program runs before the exchange is waited, as if no
+fragment had tail rows, with CTAs that claim their tokens at run time (Cluster
+Launch Control), so a kernel resident on another stream slows it about in
+proportion to the SMs it holds; a tail-row program then writes ``dx`` of the
+last three rows of each fragment that receives tail rows.  ``dx`` is bitwise
+the deterministic KCP backward's; the rank-local FP32 ``dweight`` partial is
+summed into four FP32 accumulator copies in the order the CTAs end their runs,
+so it is not bitwise reproducible from run to run.
 
 Under ``torch.use_deterministic_algorithms(True)`` the forward and the
 checkpoint recompute run (they are fixed-order).  The entry points that launch
@@ -315,7 +326,7 @@ were removed without aliases: importing an old module raises
 the module selects the mode.  The old names ran the deterministic package by
 default: a call that relied on that default moves to the deterministic
 package's names (``flashinfer.cake_causal_conv1d_det_train[_kcp]``), not to
-the names below.  The backend's ``plan_cache_clear`` keeps its name.
+the names below.
 
 .. list-table:: Old and new non-deterministic names
    :header-rows: 1
@@ -372,6 +383,8 @@ the names below.  The backend's ``plan_cache_clear`` keeps its name.
      - ``cake_causal_conv1d_nondet_train_kcp_graph_cache_clear``
    * - ``host_cache_clear`` (of the backend's ``kcp`` module)
      - ``cake_causal_conv1d_nondet_train_kcp_host_cache_clear``
+   * - ``plan_cache_clear`` (of the backend)
+     - ``cake_causal_conv1d_nondet_train_plan_cache_clear``
 
 The deterministic package's names before its ``det`` rename (the modules
 ``flashinfer.cake_causal_conv1d_train`` and

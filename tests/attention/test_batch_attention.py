@@ -19,12 +19,12 @@ import pytest
 import torch
 
 import flashinfer
-from tests.test_helpers.jit_utils import (
+from tests.jit.test_helpers.jit_utils import (
     gen_persistent_batch_attention_modules,
     gen_prefill_attention_modules,
 )
-from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
-from tests.test_helpers.parametrize import (
+from tests.quantization.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
+from tests.infra.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )

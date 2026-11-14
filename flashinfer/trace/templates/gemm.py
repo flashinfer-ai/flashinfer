@@ -1303,6 +1303,18 @@ bmm_mxfp8_trace = TraceTemplate(
 )
 
 
+def bmm_mxfp8_trace_dispatch(**kwargs):
+    """Return the TraceTemplate for a ``bmm_mxfp8`` call. MXFP8 output (``out_scale``) has
+    no template yet, so it resolves to None: tracing records nothing and Trace Apply keeps
+    the original call, since a registered solution cannot fill ``out_scale``."""
+    if kwargs.get("out_scale") is not None:
+        return None
+    return bmm_mxfp8_trace
+
+
+bmm_mxfp8_trace_dispatch.templates = [bmm_mxfp8_trace]  # type: ignore[attr-defined]
+
+
 # ── tinygemm_bf16 (small bf16 GEMM with bias) ────────────────────────────────
 
 
@@ -2843,3 +2855,177 @@ svdquant_linear_trace = TraceTemplate(
     tags=["quantization:fp4"],
     init=_svdquant_linear_init,
 )
+
+
+# ── mm_bf16_fp8 / mm_fp16_fp8 (16-bit activation, FP8 e4m3 weight, per-tensor scale) ─
+
+
+@torch.no_grad()
+def _mm_16bit_fp8_reference(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    alpha: torch.Tensor,
+    bias=None,
+    **_unused,
+) -> torch.Tensor:
+    """``a @ (b.float() * alpha).T + bias`` with the e4m3 weight dequantized
+    exactly in fp32 and one rounding into ``a``'s dtype.  ``a`` is ``(..., K)``;
+    its leading dimensions are kept."""
+    a32 = a.to(torch.float32)
+    w = b.to(torch.float32) * alpha.to(torch.float32).reshape(())
+    res = a32 @ w.T
+    if bias is not None:
+        res = res + bias.to(torch.float32)
+    return res.to(a.dtype)
+
+
+def _mm_bf16_fp8_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    scalar: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gemm.mm_bf16_fp8`` (2-D activation).
+
+    Sourced from ``tests/gemm/test_mm_bf16_fp8.py``: a ``randn`` bf16
+    activation and a ``randn`` weight quantized per tensor to e4m3 (mirrored
+    as ``per_tensor_fp8_quantize``); ``alpha`` is the dequant multiplier.
+    """
+    del scalar
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    b_16 = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    b, inv_scale = per_tensor_fp8_quantize(b_16)
+    return {"a": a, "b": b, "alpha": inv_scale.reshape(1)}
+
+
+def _mm_fp16_fp8_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    scalar: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gemm.mm_fp16_fp8`` (2-D activation): as
+    ``_mm_bf16_fp8_init`` with a float16 activation."""
+    del scalar
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.float16, device=device)
+    b_16 = torch.randn(N, K, dtype=torch.float16, device=device)
+    b, inv_scale = per_tensor_fp8_quantize(b_16)
+    return {"a": a, "b": b, "alpha": inv_scale.reshape(1)}
+
+
+_MM_16BIT_FP8_INITS = {
+    torch.bfloat16: _mm_bf16_fp8_init,
+    torch.float16: _mm_fp16_fp8_init,
+}
+
+
+def _mm_16bit_fp8_a_dims(a_ndim: int):
+    """Leading dimension names of an ``(..., K)`` activation of ``a_ndim``
+    dimensions: none for a vector, ``M`` for a matrix, ``batch`` / ``seq_len``
+    for the usual 3-D hidden state, ``lead<i>`` beyond that."""
+    if a_ndim <= 1:
+        return []
+    if a_ndim == 2:
+        return ["M"]
+    if a_ndim == 3:
+        return ["batch", "seq_len"]
+    return [f"lead{i}" for i in range(a_ndim - 1)]
+
+
+_MM_16BIT_FP8_NAMES = {torch.bfloat16: "mm_bf16_fp8", torch.float16: "mm_fp16_fp8"}
+
+
+@functools.lru_cache(maxsize=None)
+def _mm_16bit_fp8_trace(
+    a_dtype: torch.dtype, a_ndim: int, scale_ndim: int
+) -> TraceTemplate:
+    """The template of ``mm_bf16_fp8`` / ``mm_fp16_fp8`` (by ``a_dtype``) for an
+    ``a`` of ``a_ndim`` dimensions and an ``alpha`` of ``scale_ndim`` (0 or 1)
+    dimensions: the API accepts any leading shape on ``a`` and a ``()`` or
+    ``(1,)`` scale, and the trace names the ranks it actually saw.  ``K`` is
+    read off ``a``'s last dimension."""
+    name = _MM_16BIT_FP8_NAMES[a_dtype]
+    dtype_name = str(a_dtype).removeprefix("torch.")
+    short = name.split("_")[1]  # bf16 / fp16
+    lead = _mm_16bit_fp8_a_dims(a_ndim)
+    axes: "dict[str, Var | Const]" = {dim: Var() for dim in lead}
+    axes["N"] = Const()
+    axes["K"] = Const(extract=lambda kw: int(kw["a"].shape[-1]))
+    scale_dims = []
+    scale_desc = "Per-tensor dequant scale of b, a 0-d fp32 tensor."
+    if scale_ndim == 1:
+        axes["scalar"] = Var(description="alpha tensor length (1).")
+        scale_dims = ["scalar"]
+        scale_desc = "Per-tensor dequant scale of b, shape (1,)."
+    common = a_ndim == 2 and scale_ndim == 1
+    name_prefix = name
+    if not common:
+        name_prefix += f"_a{a_ndim}d" + ("_alpha0d" if scale_ndim == 0 else "")
+    return TraceTemplate(
+        op_type=f"gemm_{short}_fp8",
+        name_prefix=name_prefix,
+        description=(
+            f"W8A16 GEMM: out = a @ (b * alpha).T + bias. a is {dtype_name} "
+            "(..., K); b is float8_e4m3fn [N, K] with one per-tensor fp32 "
+            "scale alpha, dequantized inside the kernel."
+        ),
+        axes=axes,
+        inputs={
+            "a": Tensor(lead + ["K"], dtype=dtype_name),
+            "b": Tensor(
+                ["N", "K"],
+                dtype="float8_e4m3fn",
+                description="FP8 e4m3 weight in torch.nn.Linear layout [N, K].",
+            ),
+            "alpha": Tensor(scale_dims, dtype="float32", description=scale_desc),
+            "bias": Tensor(
+                ["N"], dtype=dtype_name, optional=True, description="Bias in a's dtype."
+            ),
+        },
+        outputs={
+            "out": Tensor(lead + ["N"], dtype=dtype_name),
+        },
+        tags=["status:verified", "quantization:float8_e4m3fn"],
+        reference=_mm_16bit_fp8_reference,
+        check=_gemm_check,
+        init=_MM_16BIT_FP8_INITS[a_dtype] if common else None,
+    )
+
+
+mm_bf16_fp8_trace = _mm_16bit_fp8_trace(torch.bfloat16, 2, 1)
+mm_fp16_fp8_trace = _mm_16bit_fp8_trace(torch.float16, 2, 1)
+
+
+def _mm_16bit_fp8_dispatch(a_dtype: torch.dtype):
+    def dispatch(**kwargs):
+        a = kwargs.get("a")
+        alpha = kwargs.get("alpha")
+        a_ndim = a.ndim if a is not None else 2
+        scale_ndim = min(alpha.ndim, 1) if alpha is not None else 1
+        return _mm_16bit_fp8_trace(a_dtype, a_ndim, scale_ndim)
+
+    dispatch.__doc__ = (
+        f"Return the ``{_MM_16BIT_FP8_NAMES[a_dtype]}`` TraceTemplate matching the "
+        "call's ranks.  Passed as ``trace=`` to ``@flashinfer_api``."
+    )
+    # Registered for the consistency tests (the generic sample builder cannot
+    # form a 0-d input, so the alpha0d variants are covered by
+    # tests/trace/test_mm_bf16_fp8_trace.py).
+    dispatch.templates = [  # type: ignore[attr-defined]
+        _mm_16bit_fp8_trace(a_dtype, 2, 1),
+        _mm_16bit_fp8_trace(a_dtype, 1, 1),
+        _mm_16bit_fp8_trace(a_dtype, 3, 1),
+    ]
+    return dispatch
+
+
+mm_bf16_fp8_trace_dispatch = _mm_16bit_fp8_dispatch(torch.bfloat16)
+mm_fp16_fp8_trace_dispatch = _mm_16bit_fp8_dispatch(torch.float16)

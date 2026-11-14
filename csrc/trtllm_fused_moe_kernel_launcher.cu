@@ -2721,6 +2721,17 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
         routing_logits_dtype == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
   }
 
+  // DeepSeek FP8 scale block implied by hidden_states_scale [hidden_size / block, num_tokens]:
+  // 128 (checkpoint layout) or 32 (vLLM's re-blocked TP shards). check_moe() rejects anything
+  // else; MxFp8 keeps the 128-element divisibility rule.
+  int64_t deepseek_sf_block_size() const {
+    if (quantization_type != Fp8QuantizationType::DeepSeekFp8 || hidden_states_scale.ndim() != 2 ||
+        hidden_states_scale.size(0) == 0 || args->hidden_size % hidden_states_scale.size(0) != 0) {
+      return 128;
+    }
+    return args->hidden_size / hidden_states_scale.size(0);
+  }
+
   void check_moe() const override {
     FusedMoeLauncher::check_moe_common();
     TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_float8_e4m3fn)
@@ -2737,10 +2748,12 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
     TVM_FFI_ICHECK(weight_layout == batchedGemm::gemm::MatrixLayout::MajorK ||
                    weight_layout == batchedGemm::gemm::MatrixLayout::BlockMajorK)
         << "Staged FP8 block-scale MoE: weight_layout must be MajorK or BlockMajorK.";
-    TVM_FFI_ICHECK_EQ(args->hidden_size % 128, 0)
-        << "Staged FP8 block-scale MoE: hidden_size must be a multiple of 128.";
-    TVM_FFI_ICHECK_EQ(args->intermediate_size % 128, 0)
-        << "Staged FP8 block-scale MoE: intermediate_size must be a multiple of 128.";
+    int64_t const sf_block = deepseek_sf_block_size();
+    TVM_FFI_ICHECK_EQ(args->hidden_size % sf_block, 0)
+        << "Staged FP8 block-scale MoE: hidden_size must be a multiple of " << sf_block << ".";
+    TVM_FFI_ICHECK_EQ(args->intermediate_size % sf_block, 0)
+        << "Staged FP8 block-scale MoE: intermediate_size must be a multiple of " << sf_block
+        << ".";
     if (gemm1_weights.has_value() && gemm2_weights.has_value()) {
       TensorView const gemm1 = gemm1_weights.value();
       TensorView const gemm2 = gemm2_weights.value();
@@ -2789,8 +2802,11 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
           << "Staged DeepSeek FP8 MoE: hidden_states_scale must be float32.";
       TVM_FFI_ICHECK_EQ(hidden_states_scale.ndim(), 2)
           << "Staged DeepSeek FP8 MoE: hidden_states_scale must be 2D.";
-      TVM_FFI_ICHECK_EQ(hidden_states_scale.size(0), args->hidden_size / 128)
-          << "Staged DeepSeek FP8 MoE: hidden_states_scale dim0 must be hidden_size / 128.";
+      TVM_FFI_ICHECK((sf_block == 128 || sf_block == 32) &&
+                     hidden_states_scale.size(0) * sf_block == args->hidden_size)
+          << "Staged DeepSeek FP8 MoE: hidden_states_scale dim0 must be hidden_size / 128 or "
+             "hidden_size / 32, got "
+          << hidden_states_scale.size(0) << " for hidden_size " << args->hidden_size << ".";
       TVM_FFI_ICHECK_EQ(hidden_states_scale.size(1), args->num_tokens)
           << "Staged DeepSeek FP8 MoE: hidden_states_scale dim1 must be num_tokens.";
       if (gemm1_weights_scale.has_value() && gemm2_weights_scale.has_value()) {
@@ -2809,13 +2825,13 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
         TVM_FFI_ICHECK_EQ(gemm2_scale.size(0), totalLocalExperts)
             << "Staged DeepSeek FP8 MoE: gemm2_weights_scale dim0 is incorrect.";
         TVM_FFI_ICHECK_EQ(gemm1_scale.size(1),
-                          intermediate_size_factor * args->intermediate_size / 128)
+                          intermediate_size_factor * args->intermediate_size / sf_block)
             << "Staged DeepSeek FP8 MoE: gemm1_weights_scale dim1 is incorrect.";
-        TVM_FFI_ICHECK_EQ(gemm1_scale.size(2), args->hidden_size / 128)
+        TVM_FFI_ICHECK_EQ(gemm1_scale.size(2), args->hidden_size / sf_block)
             << "Staged DeepSeek FP8 MoE: gemm1_weights_scale dim2 is incorrect.";
-        TVM_FFI_ICHECK_EQ(gemm2_scale.size(1), args->hidden_size / 128)
+        TVM_FFI_ICHECK_EQ(gemm2_scale.size(1), args->hidden_size / sf_block)
             << "Staged DeepSeek FP8 MoE: gemm2_weights_scale dim1 is incorrect.";
-        TVM_FFI_ICHECK_EQ(gemm2_scale.size(2), args->intermediate_size / 128)
+        TVM_FFI_ICHECK_EQ(gemm2_scale.size(2), args->intermediate_size / sf_block)
             << "Staged DeepSeek FP8 MoE: gemm2_weights_scale dim2 is incorrect.";
       }
     } else if (quantization_type == Fp8QuantizationType::MxFp8) {
@@ -2854,14 +2870,16 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
       // inherit the wider FC1 minimum and write past gemm2_output.
       auto const staged_padded_tokens =
           std::max(max_num_padded_tokens_gemm1, max_num_padded_tokens_gemm2);
+      int64_t const sf_block = deepseek_sf_block_size();
       gemm1_output = alloc_tensor({staged_padded_tokens, gemm1_output_hidden}, dl_uint8,
                                   hidden_states.device());
-      gemm1_output_scale = alloc_tensor({gemm1_output_hidden / 128, staged_padded_tokens},
+      gemm1_output_scale = alloc_tensor({gemm1_output_hidden / sf_block, staged_padded_tokens},
                                         dl_float32, hidden_states.device());
       activation_output = alloc_tensor({staged_padded_tokens, args->intermediate_size}, dl_uint8,
                                        hidden_states.device());
-      activation_output_scale = alloc_tensor({args->intermediate_size / 128, staged_padded_tokens},
-                                             dl_float32, hidden_states.device());
+      activation_output_scale =
+          alloc_tensor({args->intermediate_size / sf_block, staged_padded_tokens}, dl_float32,
+                       hidden_states.device());
       gemm2_output = alloc_tensor({staged_padded_tokens, args->hidden_size}, dl_bfloat16,
                                   hidden_states.device());
     } else {
@@ -3395,13 +3413,15 @@ void trtllm_moe_run_finalize(TensorView gemm2_output, TensorView output,
                           gemm2_output2);
 }
 
-void trtllm_moe_run_deepseek_fp8_activation(TensorView gemm1_output, TensorView gemm1_output_scale,
-                                            TensorView activation_output,
-                                            TensorView activation_output_scale,
-                                            TensorView expanded_idx_to_permuted_idx,
-                                            TensorView total_num_padded_tokens, int64_t num_tokens,
-                                            int64_t top_k, int64_t intermediate_size,
-                                            int64_t activation_type, bool enable_pdl) {
+void trtllm_moe_run_deepseek_fp8_activation(
+    TensorView gemm1_output, TensorView gemm1_output_scale, TensorView activation_output,
+    TensorView activation_output_scale, TensorView expanded_idx_to_permuted_idx,
+    TensorView total_num_padded_tokens, int64_t num_tokens, int64_t top_k,
+    int64_t intermediate_size, int64_t activation_type, bool enable_pdl, int64_t sf_block_size) {
+  TVM_FFI_ICHECK(sf_block_size == 128 || sf_block_size == 32)
+      << "DeepSeek FP8 activation: sf_block_size must be 128 or 32.";
+  TVM_FFI_ICHECK_EQ(intermediate_size % sf_block_size, 0)
+      << "DeepSeek FP8 activation: intermediate_size must be a multiple of sf_block_size.";
   TVM_FFI_ICHECK_EQ(gemm1_output.dtype(), dl_uint8)
       << "DeepSeek FP8 activation: gemm1_output must be uint8 FP8 storage.";
   TVM_FFI_ICHECK_EQ(gemm1_output_scale.dtype(), dl_float32)
@@ -3416,10 +3436,23 @@ void trtllm_moe_run_deepseek_fp8_activation(TensorView gemm1_output, TensorView 
       << "DeepSeek FP8 activation: total_num_padded_tokens must be int32.";
 
   auto const activation = validateAndCastActivationType(activation_type);
+  // Both scale buffers are [row_blocks, padded_tokens] and the kernel indexes them by
+  // sf_block_size, so their leading dims must match the block the caller named.
+  int64_t const gemm1_cols = intermediate_size * (isGatedActivation(activation) ? 2 : 1);
+  TVM_FFI_ICHECK(gemm1_output_scale.ndim() == 2 &&
+                 gemm1_output_scale.size(0) == gemm1_cols / sf_block_size)
+      << "DeepSeek FP8 activation: gemm1_output_scale must be [" << gemm1_cols / sf_block_size
+      << ", padded_tokens] for sf_block_size " << sf_block_size << ".";
+  TVM_FFI_ICHECK(activation_output_scale.ndim() == 2 &&
+                 activation_output_scale.size(0) == intermediate_size / sf_block_size &&
+                 activation_output_scale.size(1) == gemm1_output_scale.size(1))
+      << "DeepSeek FP8 activation: activation_output_scale must be ["
+      << intermediate_size / sf_block_size << ", " << gemm1_output_scale.size(1) << "].";
   moe::dev::activation::Data activationData;
   activationData.mDtypeElt = btg::Dtype::E4m3;
   activationData.mUsePdl = enable_pdl;
   activationData.mUseDeepSeekFp8 = true;
+  activationData.mDeepSeekSfBlockSize = static_cast<int32_t>(sf_block_size);
   activationData.inPtr = const_cast<void*>(gemm1_output.data_ptr());
   activationData.outPtr = activation_output.data_ptr();
   activationData.inDqSfsPtr = static_cast<float*>(const_cast<void*>(gemm1_output_scale.data_ptr()));
@@ -5137,11 +5170,14 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
  public:
   static constexpr std::array<int32_t, 4> mBaseSupportedTileNums = {8, 16, 32, 64};
 
-  static std::vector<int32_t> getSupportedTileNums(btg::Dtype dtype_act, btg::Dtype dtype_weights) {
+  static std::vector<int32_t> getSupportedTileNums(btg::Dtype dtype_act, btg::Dtype dtype_weights,
+                                                   batchedGemm::gemm::BiasType gemm1_bias_type) {
     std::vector<int32_t> tiles(mBaseSupportedTileNums.begin(), mBaseSupportedTileNums.end());
     if (dtype_act != btg::Dtype::Bfloat16) {
       tiles.push_back(128);
-      if ((dtype_weights == btg::Dtype::E2m1 && dtype_act == btg::Dtype::E2m1) ||
+      // NVFP4 tile-192 kernels do not support the MN-bias LoRA epilogue.
+      if ((dtype_weights == btg::Dtype::E2m1 && dtype_act == btg::Dtype::E2m1 &&
+           gemm1_bias_type != batchedGemm::gemm::BiasType::Mn) ||
           (dtype_weights == btg::Dtype::MxE2m1 && dtype_act == btg::Dtype::MxE4m3)) {
         tiles.push_back(192);
       }
@@ -5555,7 +5591,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     Array<Array<int64_t>> valid_configs;
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
-    std::vector<int32_t> tile_sizes = getSupportedTileNums(dtype_act, dtype_weights);
+    std::vector<int32_t> tile_sizes =
+        getSupportedTileNums(dtype_act, dtype_weights, gemm1_bias_type);
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts, num_experts);
 
@@ -6352,7 +6389,7 @@ Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
 
   // Determine supported tile sizes
   std::vector<int32_t> mSupportedTileN =
-      FP4BlockScaleLauncher::getSupportedTileNums(mDtypeAct, mDtypeWeights);
+      FP4BlockScaleLauncher::getSupportedTileNums(mDtypeAct, mDtypeWeights, gemm1_bias_type_enum);
   // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size

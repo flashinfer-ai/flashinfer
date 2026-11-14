@@ -26,7 +26,7 @@ and with the native trtllm-gen pipeline on the StepFun serving geometry
 (H=4096, I=1536, E=64, top-k 8; T in 8 / 64 / 512 / 2048; limit modes 7 / 16
 / mixed / 0.5 / inf; routing regimes uniform / ragged / randperm / empty), for
 every plan the facade enumerates: the final bf16 output at the per-family
-tolerances of ``tests/test_helpers/cake_stepfun_moe_reference.py`` (every
+tolerances of ``tests/experimental/test_helpers/cake_stepfun_moe_reference.py`` (every
 element, with the e4m3 / e2m1 one-ulp block rules; against the native default
 tactic, or the native tactic that the plan reproduces bitwise, see
 ``_native_target``), the routing tables
@@ -110,7 +110,7 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
     moe_args,
     routing_reference_renormalize,
 )
-from tests.test_helpers import cake_stepfun_moe_reference as ref
+from tests.experimental.test_helpers import cake_stepfun_moe_reference as ref
 
 H, I, E, K = ref.HIDDEN_SIZE, ref.INTERMEDIATE_SIZE, ref.NUM_EXPERTS, ref.TOP_K
 PADDING = 8
@@ -1532,6 +1532,7 @@ def test_full_path_finalize_matches_native_kernel(num_tokens, cache_permute_indi
         H,
         True,
         False,
+        None,
     )
     _sync()
     assert not torch.isnan(theirs).any()

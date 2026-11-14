@@ -38,3 +38,11 @@ The SM120 DSA indexer's single-CTA decode selection
 adapted from SGLang's DeepSeek-V4 top-k (TopKRegister and
 coarse_bin_lower_bound), Copyright 2023-2024 SGLang Team, under Apache-2.0.
 Source: https://github.com/sgl-project/sglang (python/sglang/kernels/jit/include/sgl_kernel/deepseek_v4/topk_impl.cuh)
+
+The experimental SM100/SM103 HC sum-state backend includes code derived from
+SGLang's original HC implementation, Copyright 2023-2024 SGLang Team,
+under Apache-2.0. The low-M GEMM retains its original NVIDIA 2026 copyright
+and FlashInfer PR #4266 provenance. The fixed-order batched GEMM retains
+code derived from batch_invariant_ops, Copyright 2025 Thinking Machines Lab,
+under the MIT License (licenses/LICENSE.batch-invariant-ops.txt).
+Pinned sources and modifications: flashinfer/experimental/hc_sum_sm100/SOURCES.md.

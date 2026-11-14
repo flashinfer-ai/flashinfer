@@ -1,5 +1,5 @@
 """CPU tests for the decode wrapper's ``backend="auto"`` -> cudnn rule and its
-cudnn-frontend version gate. No GPU, no real cudnn import needed."""
+runtime availability checks. No GPU, no real cudnn import needed."""
 
 import re
 import sys
@@ -46,8 +46,7 @@ def _fake_cudnn(
     dsl_installed=True,
     frost_helpers=True,
 ):
-    """A stand-in ``cudnn`` package: ``__version__`` plus, as 1.30+ ships them,
-    the ``cudnn.frost.buffers`` CuTe-DSL availability helpers reporting ``dsl``."""
+    """An importable FE with runtime availability helpers reporting ``dsl``."""
     mod = types.ModuleType("cudnn")
     if version is not None:
         mod.__version__ = version
@@ -64,74 +63,20 @@ def _fake_cudnn(
     return mod
 
 
-# -------------------------------------------------------------- version gate
+# -------------------------------------------------------------- runtime availability
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "raw,expected",
-    [
-        ("1.30.0", (1, 30, 0)),
-        ("1.31.0.dev123", (1, 31, 0)),
-        ("1.29.1+cu13", (1, 29, 1)),
-        ("1.30", (1, 30)),
-        ("", None),
-        (None, None),
-        ("nightly", None),
-    ],
-)
-def test_cudnn_frontend_version_parsing(clean_env, raw, expected):
-    _fake_cudnn(clean_env, raw)
-    assert cudnn_utils.cudnn_frontend_version() == expected
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "version,expected",
-    [
-        ("1.30.0", False),
-        ("1.31.0", True),
-        ("1.31.0.dev7", True),
-        ("1.31", True),
-        ("2.0.0", True),
-        (None, False),
-    ],
-)
-def test_cudnn_frontend_leads_short_caches(clean_env, version, expected):
-    if version is None:
-        clean_env.setitem(sys.modules, "cudnn", None)
+@pytest.mark.parametrize("available", [False, True])
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (9, 0), (10, 7), (12, 0)])
+def test_cudnn_frontend_serves_frost_decode(clean_env, available, cc):
+    if available:
+        _fake_cudnn(clean_env, "1.32.0")
     else:
-        _fake_cudnn(clean_env, version)
-    assert cudnn_utils.cudnn_frontend_leads_short_caches() is expected
-
-
-@pytest.mark.cpu_only
-def test_cudnn_frontend_version_without_package(clean_env):
-    clean_env.setitem(sys.modules, "cudnn", None)  # makes `import cudnn` fail
-    assert cudnn_utils.cudnn_frontend_version() is None
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "version,cc,expected",
-    [
-        ("1.30.0", (10, 0), True),
-        ("1.30.0", (10, 3), True),
-        ("1.31.0.dev5", (10, 0), True),
-        ("1.30.0", (9, 0), False),  # Hopper has no FROST decode row
-        ("1.30.0", (10, 7), False),  # Rubin's row has no decode tile yet
-        ("1.30.0", (12, 0), False),
-        ("1.29.0", (10, 0), False),  # FROST declines paged KV before 1.30
-        ("1.30", (10, 0), True),
-        (None, (10, 0), False),  # cudnn-frontend not installed
-    ],
-)
-def test_cudnn_frontend_serves_frost_decode(clean_env, version, cc, expected):
-    if version is None:
         clean_env.setitem(sys.modules, "cudnn", None)
-    else:
-        _fake_cudnn(clean_env, version)
-    assert cudnn_utils.cudnn_frontend_serves_frost_decode(cc) is expected
+    assert cudnn_utils.cudnn_frontend_serves_frost_decode(cc) is (
+        available and cc in ((10, 0), (10, 3))
+    )
 
 
 # -------------------------------------------------------------- FROST runtime
@@ -147,7 +92,7 @@ def test_cudnn_frontend_serves_frost_decode(clean_env, version, cc, expected):
             True,
             ("nvidia-cutlass-dsl", "4.6.2"),
             False,
-        ),  # the dependency floor, below FROST's
+        ),  # a broken environment below FROST's floor
         (True, ("nvidia-cutlass-dsl", "4.6"), False),
         (True, ("nvidia-cutlass-dsl-internal", "0.3.0+2026"), True),  # not judged
         (
@@ -160,16 +105,15 @@ def test_cudnn_frontend_serves_frost_decode(clean_env, version, cc, expected):
 )
 def test_cudnn_frontend_frost_runtime_available(clean_env, installed, dsl, expected):
     """The probe is the frontend's own CuTe-DSL check (presence and floor),
-    so an install whose DSL satisfies the packages' dependency metadata but
-    not the FROST floor reads as 'FROST cannot run'."""
-    _fake_cudnn(clean_env, "1.31.0", dsl=dsl, dsl_installed=installed)
+    so missing or too-old runtime dependencies keep the fallback available."""
+    _fake_cudnn(clean_env, "1.32.0", dsl=dsl, dsl_installed=installed)
     assert cudnn_utils.cudnn_frontend_frost_runtime_available() is expected
 
 
 @pytest.mark.cpu_only
 def test_cudnn_frontend_frost_runtime_needs_the_helpers(clean_env):
-    # 1.29 and older have no cudnn.frost.buffers (and no FROST decode rows).
-    _fake_cudnn(clean_env, "1.29.1", frost_helpers=False)
+    # Preserve fallback if the runtime helpers cannot be imported.
+    _fake_cudnn(clean_env, "1.32.0", frost_helpers=False)
     assert cudnn_utils.cudnn_frontend_frost_runtime_available() is False
     cudnn_utils.cudnn_frontend_frost_runtime_available.cache_clear()
     clean_env.setitem(sys.modules, "cudnn", None)  # makes `import cudnn` fail
@@ -198,8 +142,6 @@ def _base():
         logits_soft_cap=0.0,
         q_len_per_req=2,
         fa2_available=True,
-        declared_kv_len=None,
-        frontend_leads_short_caches=False,
         override="",
     )
 
@@ -231,9 +173,6 @@ def _base():
         {"page_size": 128},
         {"page_size": 256},
         {"logits_soft_cap": None},
-        {"declared_kv_len": 2048},  # a caller-owned table as wide as the bucket
-        {"declared_kv_len": 65536},
-        {"declared_kv_len": 512, "frontend_leads_short_caches": True},  # 1.31+
         {"frontend_serves_frost_decode": False, "override": "1"},  # forced
         {"override": "true"},
         {"frost_runtime_available": False, "override": "1"},  # forced: benchmarking
@@ -461,8 +400,6 @@ def test_auto_prefers_cudnn_inside_the_envelope(changes):
         {"num_qo_heads": 48, "num_kv_heads": 8},  # group 6
         {"num_qo_heads": 30, "num_kv_heads": 8},  # not a multiple
         {"num_kv_heads": 0},
-        {"declared_kv_len": 512},  # 1.30 ranks the backend's prefill engine first
-        {"declared_kv_len": 2047},
         {"page_size": 24},
         {"page_size": 4},
         {"page_size": 96},
@@ -476,7 +413,6 @@ def test_auto_prefers_cudnn_inside_the_envelope(changes):
         {"override": "0", "frontend_serves_frost_decode": False},
         # the frontend is new enough but its FROST engines cannot run here
         {"frost_runtime_available": False},
-        {"frost_runtime_available": False, "declared_kv_len": 65536},
         # fa2's explicit split controls: the batch-invariance contract
         {"fixed_split_size": 128},
         {"fixed_split_size": 1},
@@ -503,7 +439,6 @@ def test_auto_keeps_fa2_outside_the_envelope(changes):
         {"head_dim": 256, "num_qo_heads": 32, "num_kv_heads": 2},
         {"window_left": 128},
         {"page_size": 24},
-        {"declared_kv_len": 512},  # slow cudnn still beats no kernel
         {"frost_runtime_available": False},  # the backend engine still serves them
         {"fixed_split_size": 128},  # nothing to keep fa2 for
         {"disable_split_kv": True},
@@ -546,62 +481,3 @@ def test_auto_reads_the_override_from_the_environment(clean_env):
     assert _auto_decode_prefers_cudnn(**old) is True
     clean_env.delenv(_DECODE_AUTO_CUDNN_ENV)
     assert _auto_decode_prefers_cudnn(**old) is False
-
-
-# -------------------------------------------------------------- replay hint probe
-
-
-class _PygraphWithHint:
-    def __init__(
-        self, io_data_type=None, *, is_cuda_graph_replay_expected=False, **kwargs
-    ):
-        pass
-
-
-class _PygraphWithoutHint:
-    def __init__(self, io_data_type=None, **kwargs):
-        pass
-
-
-def _graph_forwarding(handle, name="g", **graph_kwargs):
-    pass
-
-
-def _graph_fixed(handle, name="g"):
-    pass
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "pygraph,graph,expected",
-    [
-        (_PygraphWithHint, _graph_forwarding, True),
-        (_PygraphWithoutHint, _graph_forwarding, False),  # 1.30: no such keyword
-        (_PygraphWithHint, _graph_fixed, False),  # the helper would reject the keyword
-        (None, _graph_forwarding, False),  # no pygraph class at all
-    ],
-)
-def test_cudnn_frontend_accepts_cuda_graph_replay_hint(
-    clean_env, pygraph, graph, expected
-):
-    """The probe reads the signatures: the pygraph constructor must take the
-    keyword and the cudnn.graph helper must forward graph keywords."""
-    mod = _fake_cudnn(clean_env, "1.31.0")
-    if pygraph is not None:
-        mod.pygraph = pygraph
-    mod.graph = graph
-    cudnn_utils.cudnn_frontend_accepts_cuda_graph_replay_hint.cache_clear()
-    try:
-        assert cudnn_utils.cudnn_frontend_accepts_cuda_graph_replay_hint() is expected
-    finally:
-        cudnn_utils.cudnn_frontend_accepts_cuda_graph_replay_hint.cache_clear()
-
-
-@pytest.mark.cpu_only
-def test_cudnn_frontend_accepts_cuda_graph_replay_hint_without_package(clean_env):
-    clean_env.setitem(sys.modules, "cudnn", None)  # makes `import cudnn` fail
-    cudnn_utils.cudnn_frontend_accepts_cuda_graph_replay_hint.cache_clear()
-    try:
-        assert cudnn_utils.cudnn_frontend_accepts_cuda_graph_replay_hint() is False
-    finally:
-        cudnn_utils.cudnn_frontend_accepts_cuda_graph_replay_hint.cache_clear()

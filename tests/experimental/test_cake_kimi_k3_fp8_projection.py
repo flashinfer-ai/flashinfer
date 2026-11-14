@@ -2766,7 +2766,8 @@ def test_route_twins_are_registered_hint_instances(arch):
     # four-slot four-tile-prefetch TMA-store GEMM program or both, ``_ts3_tde_prg``, of the 192-wide 128-K
     # grid-stride program, or (round 12 F) both, ``_tde_prg``, of the two-stage four-slot 128-K TMA-store GEMM
     # program, or the early-first-stage form ``_pre`` of the 16-token four-stage fused and the resident 64-token
-    # TMA-store decode programs -- on the architecture
+    # TMA-store decode programs, or (round 14) the raster-group two-accumulator form ``_rg4_a2`` of the 192-wide 128-K
+    # TMA-store GEMM program -- on the architecture
     # the twin was measured on; the twin is a required key, its program is registered for that architecture once
     # generated, and a quantization twin compiles at its plain key's width.
     required = set(required_kernel_keys(arch, SM_COUNT))
@@ -2794,6 +2795,7 @@ def test_route_twins_are_registered_hint_instances(arch):
                 or (suffix == "_ts3_tde_prg" and key == "gemm_tstore_n192_k128_gs")
                 or (suffix == "_tde_prg" and key == "gemm_tstore_k128_s2_ts4")
                 or (suffix == "_pre" and key in _PRE_CELLS)
+                or (suffix == "_rg4_a2" and key == "gemm_tstore_n192_k128")
             ), (cell, key, twin)
             if sko:
                 assert int(cell.split(",")[2]) <= int(sko.group(1)), (cell, twin)

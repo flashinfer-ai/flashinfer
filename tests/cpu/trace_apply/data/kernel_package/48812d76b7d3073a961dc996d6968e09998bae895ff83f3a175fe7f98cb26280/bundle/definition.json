@@ -1,0 +1,37 @@
+{
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 16
+    }
+  },
+  "inputs": {
+    "hidden_states": {
+      "dtype": "float32",
+      "shape": [
+        "batch_size",
+        "hidden_size"
+      ]
+    },
+    "weight": {
+      "dtype": "float32",
+      "shape": [
+        "hidden_size"
+      ]
+    }
+  },
+  "name": "rmsnorm_h16",
+  "op_type": "rmsnorm",
+  "outputs": {
+    "output": {
+      "dtype": "float32",
+      "shape": [
+        "batch_size",
+        "hidden_size"
+      ]
+    }
+  }
+}

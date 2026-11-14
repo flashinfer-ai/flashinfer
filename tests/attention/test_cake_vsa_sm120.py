@@ -160,6 +160,52 @@ def test_packing_fills_the_last_wave(rows_per_head):
         assert torch.equal(plan["work"], expected["work"])
 
 
+def test_split_cost_past_the_kv_limit():
+    """Equal rows of 40 blocks, 0.68 rows per virtual CTA on 188 SMs: while the
+    K and V of the 8 KV heads span at most _SPLIT_KV_BLOCKS blocks, the plan
+    splits every row in two; past that, a split part costs _FAR_SPLIT_COST and
+    the plan keeps the rows whole."""
+    counts = torch.full((8, 32), 40, dtype=torch.int64)
+    first = (torch.cumsum(counts.reshape(-1), 0) - counts.reshape(-1)).view_as(counts)
+    limit = cake_vsa_sm120._SPLIT_KV_BLOCKS // 8
+    near, far = (
+        cake_vsa_sm120.build_work(counts, first, 1, 188, num_kv_blocks=n)
+        for n in (limit, limit + 1)
+    )
+    assert near["total_work"] == 2 * counts.numel()
+    assert far["total_work"] == counts.numel()
+
+
+def test_split_cost_of_a_packed_plan_past_its_kv_limit():
+    """Equal rows of 32 blocks, 1.02 rows per virtual CTA on 188 SMs, a plan
+    that may be packed: while the K and V of the 8 KV heads span at most
+    _PACK_SPLIT_KV_BLOCKS blocks, the packing starts from every row split in
+    two; past that, a split part costs _FAR_SPLIT_COST and the packing starts
+    from the whole rows, so it cuts only the rows past the first wave.  A plan
+    that is not packed keeps the _SPLIT_KV_BLOCKS limit."""
+    counts = torch.full((8, 48), 32, dtype=torch.int64)
+    first = (torch.cumsum(counts.reshape(-1), 0) - counts.reshape(-1)).view_as(counts)
+    limit = cake_vsa_sm120._PACK_SPLIT_KV_BLOCKS // 8
+    assert limit < cake_vsa_sm120._SPLIT_KV_BLOCKS // 8
+
+    def split_rows(plan):
+        group = plan["work"][:, 4]
+        return int(torch.unique(group[group >= 0]).numel())
+
+    near, far = (
+        cake_vsa_sm120.build_work(counts, first, 1, 188, num_kv_blocks=n)
+        for n in (limit, limit + 1)
+    )
+    assert split_rows(near) == counts.numel()
+    assert 0 < split_rows(far) <= counts.numel() - 376
+    uniform = [
+        cake_vsa_sm120.build_work(counts, first, 1, 188, pack=False, num_kv_blocks=n)
+        for n in (limit, limit + 1)
+    ]
+    assert torch.equal(uniform[0]["work"], uniform[1]["work"])
+    assert uniform[0]["total_work"] == 2 * counts.numel()
+
+
 def _bsr(mb, nb, generator):
     counts = torch.randint(0, nb + 1, (mb,), generator=generator)
     indptr = torch.cat((torch.zeros(1, dtype=torch.int64), torch.cumsum(counts, 0)))

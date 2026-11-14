@@ -580,10 +580,15 @@ def compute_megamoe_reference_block_scaled(
             sf2 = from_blocked(sf2, hidden, intermediate // vec)
         w1 = _dequant_weight_k_major(quant_kind, fc1_weight_k_major[local_e], sf1)
         fc1 = x[src_t] @ w1.transpose(0, 1)  # (v, 2I): (pair, {gate,up}, 16)
-        if fc1_alpha is not None:
-            fc1 = fc1 * fc1_alpha[local_e]
         if fc1_activation_per_token_scale is not None:
-            fc1 *= fc1_activation_per_token_scale[src_t, None]
+            dequant_scale = fc1_activation_per_token_scale[src_t, None]
+            if fc1_alpha is not None:
+                # The kernel folds these FP32 scales before multiplying the
+                # accumulator, avoiding overflow in acc * alpha alone.
+                dequant_scale = dequant_scale * fc1_alpha[local_e]
+            fc1 = fc1 * dequant_scale
+        elif fc1_alpha is not None:
+            fc1 = fc1 * fc1_alpha[local_e]
         pairs = fc1.view(-1, intermediate // GateUpInterleave, 2, GateUpInterleave)
         gate, up = pairs[:, :, 0, :], pairs[:, :, 1, :]
         if gate_up_clamp is not None:

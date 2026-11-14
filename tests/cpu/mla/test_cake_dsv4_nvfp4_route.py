@@ -326,9 +326,13 @@ def test_nvfp4_variant_names():
         assert cake._nvfp4_variant_name(member) == f"nvfp4_decode_{member}"
     with pytest.raises(ValueError, match="unknown NVFP4 family member"):
         cake._nvfp4_variant_name("merge")
-    assert len(set(_NVFP4_VARIANTS)) == len(_NVFP4_VARIANTS) == 8
-    for arch in ("sm_100a", "sm_103a"):
-        assert set(_NVFP4_VARIANTS) <= set(_ARCH_REGISTRATIONS[arch]["variants"])
+    assert len(set(_NVFP4_VARIANTS)) == len(_NVFP4_VARIANTS) == 19
+    sm103_only = {"nvfp4_h128_v_unit_pairs_prefill"}
+    assert set(_NVFP4_VARIANTS) <= set(_ARCH_REGISTRATIONS["sm_103a"]["variants"])
+    assert set(_NVFP4_VARIANTS) - sm103_only <= set(
+        _ARCH_REGISTRATIONS["sm_100a"]["variants"]
+    )
+    assert not sm103_only & set(_ARCH_REGISTRATIONS["sm_100a"]["variants"])
 
 
 @pytest.mark.cpu_only
@@ -357,7 +361,9 @@ def test_nvfp4_plan_head_tiles_and_caps():
             sm_count=148,
         )
     # 13 candidate tiles exceed the split cap (12) of every member.
-    with pytest.raises(ValueError, match="exceeds the NVFP4 route cap"):
+    with pytest.raises(
+        ValueError, match="exceeds the NVFP4 route cap.*cake_dsv4_nvfp4_pack_query"
+    ):
         _nvfp4_plan(
             num_query_tokens=1,
             num_heads=128,
@@ -388,6 +394,94 @@ def test_workspace_layout_lse_region_is_opt_in():
     assert with_lse.lse[1] == -(-(32 * 128 * 4) // 128) * 128
     assert with_lse.total_bytes == base.total_bytes + with_lse.lse[1]
     assert with_lse.lse[0] % 128 == 0
+    assert with_lse.prefill_lens == (with_lse.total_bytes, 0)
+
+
+@pytest.mark.parametrize(
+    "heads, tokens, main_width, extra_width, stride, expected",
+    [
+        # 16 heads, window-only: per-token at most #SMs tokens, breaks to 1024, then the block body.
+        (16, 128, 128, 0, 128, ("nvfp4_h64_tmem_v_early_gather_prefill", 128)),
+        (16, 148, 128, 0, 128, ("nvfp4_h64_tmem_v_early_gather_prefill", 148)),
+        (16, 512, 128, 0, 128, ("nvfp4_qb_h16_breaks_prefill", 128 + 16)),
+        (16, 1024, 128, 0, 128, ("nvfp4_qb_h16_breaks_prefill", 256 + 16)),
+        (16, 200, 128, 0, 128, ("nvfp4_qb_h16_breaks_prefill", 50 + 7)),
+        (16, 1025, 128, 0, 128, ("nvfp4_qb_h16_prefill", 257)),
+        (16, 8192, 128, 0, 128, ("nvfp4_qb_h16_prefill", 2048)),
+        # 32 heads, window-only: late_claim from 11 / 8 blocks per SM to 512 tokens, else the block body.
+        (32, 128, 128, 0, 128, ("nvfp4_h64_tmem_v_early_gather_prefill", 128)),
+        (32, 384, 128, 0, 128, ("nvfp4_qb_h32_prefill", 192)),
+        (32, 406, 128, 0, 128, ("nvfp4_qb_h32_prefill", 203)),
+        (32, 408, 128, 0, 128, ("nvfp4_qb_h32_late_claim_prefill", 204)),
+        (32, 512, 128, 0, 128, ("nvfp4_qb_h32_late_claim_prefill", 256)),
+        (32, 513, 128, 0, 128, ("nvfp4_qb_h32_prefill", 257)),
+        (32, 2048, 128, 0, 128, ("nvfp4_qb_h32_prefill", 1024)),
+        # Rows the block bodies do not take: tmem_v, with early_gather at most #SMs tokens.
+        (16, 2048, 512, 0, 512, ("nvfp4_h64_tmem_v_prefill", 2048)),
+        (16, 2048, 128, 128, 128, ("nvfp4_h64_tmem_v_prefill", 2048)),
+        (32, 128, 512, 512, 512, ("nvfp4_h64_tmem_v_early_gather_prefill", 128)),
+        (16, 2048, 64, 0, 64, ("nvfp4_h64_tmem_v_prefill", 2048)),
+        (8, 2048, 128, 0, 128, ("nvfp4_h64_tmem_v_prefill", 2048)),
+        # 64 heads.
+        (64, 128, 512, 512, 512, ("nvfp4_h64_early_gather_prefill", 128)),
+        (64, 2048, 128, 0, 128, ("nvfp4_h64_q_prefetch_prefill", 2048)),
+        (64, 2048, 512, 0, 512, ("nvfp4_h64_o_boxes_prefill", 2048)),
+        (64, 2048, 128, 128, 128, ("nvfp4_h64_o_boxes_prefill", 2048)),
+        # 128 heads: one two-CTA cluster per token; v_unit_pairs past 256 selected keys (sm_103a).
+        (128, 512, 128, 0, 128, ("nvfp4_h128_prefill", 1024)),
+        (128, 512, 128, 128, 128, ("nvfp4_h128_prefill", 1024)),  # C128-16K
+        (128, 512, 128, 129, 128, ("nvfp4_h128_v_unit_pairs_prefill", 1024)),
+        (128, 2048, 128, 512, 128, ("nvfp4_h128_v_unit_pairs_prefill", 4096)),
+        (128, 2048, 128, 1024, 128, ("nvfp4_h128_v_unit_pairs_prefill", 4096)),
+        (128, 2048, 128, 2048, 128, ("nvfp4_h128_v_unit_pairs_prefill", 4096)),
+        (128, 2048, 512, 0, 512, ("nvfp4_h128_v_unit_pairs_prefill", 4096)),
+    ],
+)
+def test_nvfp4_prefill_route(heads, tokens, main_width, extra_width, stride, expected):
+    assert (
+        cake._nvfp4_prefill_route(
+            num_heads=heads,
+            num_query_tokens=tokens,
+            main_width=main_width,
+            extra_width=extra_width,
+            main_index_stride=stride,
+            sm_count=148,
+        )
+        == expected
+    )
+    assert expected[0] in _NVFP4_VARIANTS
+
+
+def test_nvfp4_prefill_route_keeps_sm100a_on_the_persistent_h128_build():
+    route = cake._nvfp4_prefill_route(
+        num_heads=128,
+        num_query_tokens=2048,
+        main_width=128,
+        extra_width=1024,
+        main_index_stride=128,
+        sm_count=148,
+        arch="sm_100a",
+    )
+    assert route == ("nvfp4_h128_prefill", 4096)
+
+
+def test_nvfp4_prefill_flat_index_rows_keep_the_storage():
+    table = torch.arange(6 * 160, dtype=torch.int32).reshape(6, 160)[:, :128]
+    flat = cake._flat_index_rows(table)
+    assert flat.data_ptr() == table.data_ptr()
+    assert flat.shape == (5 * 160 + 128,) and flat.is_contiguous()
+    dense = torch.zeros((6, 128), dtype=torch.int32)
+    assert cake._flat_index_rows(dense) is dense
+
+
+def test_workspace_layout_prefill_regions_are_opt_in():
+    base = cake_dsv4_workspace_layout(256, 64, 1, with_lse=True)
+    prefill = cake_dsv4_workspace_layout(256, 64, 1, with_lse=True, with_prefill=True)
+    assert (base.partial_lse, base.lse) == (prefill.partial_lse, prefill.lse)
+    # The call takes the query packed: the prefill regions are the two length vectors alone.
+    assert prefill.prefill_lens == (base.total_bytes, 2 * (-(-(256 * 4) // 128) * 128))
+    assert prefill.total_bytes == prefill.prefill_lens[0] + prefill.prefill_lens[1]
+    assert prefill.prefill_lens[0] % 128 == 0
 
 
 @pytest.mark.cpu_only
@@ -398,17 +492,30 @@ def test_workspace_bytes_nvfp4_bound():
         32, 128, 512, torch.bfloat16, kv_cache_format="nvfp4", extra_topk=512
     )
     assert (
-        nvfp4_bytes == cake_dsv4_workspace_layout(32, 128, 8, with_lse=True).total_bytes
+        nvfp4_bytes
+        == cake_dsv4_workspace_layout(
+            32, 128, 8, with_lse=True, with_prefill=True
+        ).total_bytes
     )
     capped = get_cake_dsv4_workspace_bytes(
         1, 128, 2048, torch.bfloat16, kv_cache_format="nvfp4", extra_topk=2048
     )
-    assert capped == cake_dsv4_workspace_layout(1, 128, 12, with_lse=True).total_bytes
+    assert (
+        capped
+        == cake_dsv4_workspace_layout(
+            1, 128, 12, with_lse=True, with_prefill=True
+        ).total_bytes
+    )
     pinned = get_cake_dsv4_workspace_bytes(
         32, 128, 512, torch.bfloat16, kv_cache_format="nvfp4", num_splits=2
     )
-    assert pinned == cake_dsv4_workspace_layout(32, 128, 2, with_lse=True).total_bytes
-    with pytest.raises(ValueError, match="BF16 query"):
+    assert (
+        pinned
+        == cake_dsv4_workspace_layout(
+            32, 128, 2, with_lse=True, with_prefill=True
+        ).total_bytes
+    )
+    with pytest.raises(ValueError, match="torch.bfloat16"):
         get_cake_dsv4_workspace_bytes(
             32, 128, 512, torch.float8_e4m3fn, kv_cache_format="nvfp4"
         )
@@ -441,6 +548,30 @@ def test_nvfp4_argument_vocabulary():
         assert cake.canonical_arg_name("tma_buffer", name) == canonical
         assert cake.is_bindable_arg("tma_buffer", name)
     assert cake.is_bindable_arg("parameter", "heads_per_cta")
+    # NVFP4 prefill bodies.
+    for name, canonical in (
+        ("tmap_q_sf", "Q"),
+        ("tmap_swa_sf", "SWA_sf"),
+        ("tmap_compressed_sf", "compressed_KV_sf"),
+        ("tmap_o", "O"),
+    ):
+        assert cake.canonical_arg_name("tma_buffer", name) == canonical
+        assert cake.is_bindable_arg("tma_buffer", name)
+    for name in ("LSE", "extra_topk_lens", "swa_indices", "sparse_topk_lens"):
+        assert cake.is_bindable_arg("buffer", name)
+    for name in (
+        "swa_page_log2",
+        "swa_pitch_units",
+        "swa_footer_units",
+        "compressed_page_log2",
+        "compressed_pitch_units",
+        "compressed_footer_units",
+        "swa_width",
+        "compressed_width",
+        "total_work_items",
+        "max_q_len",
+    ):
+        assert cake.is_bindable_arg("parameter", name)
     for name in (
         "tiles_per_split",
         "total_tiles",

@@ -68,7 +68,7 @@ ARCH_SUPPORTED_NK = {
 # The zero-copy packed-scale serving programs are specialised on (N, K, B), on these
 # architectures.
 PACKED_NK = frozenset({(4096, 7168), (7168, 2048)})
-PACKED_ARCHS = frozenset({"sm_100a", "sm_103a"})
+PACKED_ARCHS = frozenset({"sm_100a", "sm_103a", "sm_107a"})
 PACKED_GROUPS = frozenset({32, 64})
 PACKED_K_GRANULE = 512
 SERVING_ROUTE = "seed_serving_m32_packed"

@@ -26,6 +26,8 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from flashinfer.moe_ep.batch_invariant.nvfp4_device import PackedF32
+
 from cutlass.cutlass_dsl import Float32, Int32, T
 from cutlass._mlir.dialects import llvm
 
@@ -164,7 +166,8 @@ class TopkReduce:
     # topk loop (small enough to not bloat registers; a CTA-broadcast read).
     _prefetch_limit: ClassVar[int] = 16
 
-    def __init__(self, hidden: int, num_topk: int, combine_format: CombineFormat, num_experts: Optional[int] = None) -> None:
+    def __init__(self, hidden: int, num_topk: int, combine_format: CombineFormat, num_experts: Optional[int] = None, *, batch_invariant: bool = False) -> None:
+        self.batch_invariant = bool(batch_invariant)
         self.hidden = int(hidden)
         self.num_topk = int(num_topk)
         self.num_experts = None if num_experts is None else int(num_experts)
@@ -240,7 +243,11 @@ class TopkReduce:
                 ),
             )
 
-        if cutlass.const_expr(self.combine_format.act_dtype is cutlass.Float8E4M3FN):
+        if cutlass.const_expr(self.batch_invariant):
+            self._reduce_quantized_bi(combine_quant, sf, topk_score, reduced_output, topk_indices).launch(
+                grid=grid, block=block, stream=stream
+            )
+        elif cutlass.const_expr(self.combine_format.act_dtype is cutlass.Float8E4M3FN):
             self._reduce_mxfp8(combine_quant, sf, topk_score, reduced_output, topk_indices).launch(
                 grid=grid, block=block, stream=stream
             )
@@ -250,6 +257,34 @@ class TopkReduce:
             )
 
     # -- kernels --------------------------------------------------------------
+
+    @cute.kernel
+    def _reduce_quantized_bi(self, combine_quant: cute.Tensor, combine_sf: cute.Tensor, topk_score: Optional[cute.Tensor], reduced_output: cute.Tensor, topk_indices: Optional[cute.Tensor] = None):
+        from flashinfer.moe_ep.batch_invariant.quantized_combine_device import ordered_quantized_slot_fold
+
+        worker_idx = cute.arch.block_idx()[0] * Int32(self._threads) + cute.arch.thread_idx()[0]
+        token_idx = worker_idx // self.hidden_tiles
+        hidden_tile_idx = worker_idx % self.hidden_tiles
+        if (not self.require_predicate) or token_idx < reduced_output.shape[0]:
+            codes = cute.zipped_divide(combine_quant[token_idx, None, None], (self.num_topk, self.hidden_per_thread))[
+                (None, None), (0, hidden_tile_idx)
+            ]
+            sf = cute.zipped_divide(combine_sf[token_idx, None, None], (self.num_topk, self.hidden_per_thread))[
+                (None, None), (0, hidden_tile_idx)
+            ]
+            acc = ordered_quantized_slot_fold(
+                codes, sf, topk_score, topk_indices, token_idx,
+                num_experts=self.num_experts, hidden_per_thread=self.hidden_per_thread,
+                num_topk=self.num_topk, act_dtype=self.combine_format.act_dtype,
+                decode_fp4=cvt_e2m1_to_fp32_cvt_ptx,
+            )
+            out = cute.make_rmem_tensor((self.hidden_per_thread,), reduced_output.element_type)
+            out.store(acc.load().to(reduced_output.element_type))
+            dst = cute.zipped_divide(reduced_output[token_idx, None], (self.hidden_per_thread,))[(None,), (hidden_tile_idx,)]
+            cute.copy(
+                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), reduced_output.element_type, num_bits_per_copy=128),
+                out, mark_alignment(dst, self.hidden_per_thread * reduced_output.element_type.width // 8),
+            )
 
     @cute.kernel
     def _reduce_bf16(self, combine_output: cute.Tensor, topk_score: Optional[cute.Tensor], reduced_output: cute.Tensor, topk_indices: Optional[cute.Tensor] = None):
@@ -285,6 +320,8 @@ class TopkReduce:
 
             load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
             acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+            if cutlass.const_expr(self.batch_invariant):
+                acc.fill(0)
 
             for k in cutlass.range_constexpr(0, num_topk, 1):
                 term = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
@@ -312,7 +349,12 @@ class TopkReduce:
 
                 for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
                     value_pair = (Float32(term[i]), Float32(term[i + 1]))
-                    if cutlass.const_expr(k != 0):
+                    if cutlass.const_expr(self.batch_invariant):
+                        if cutlass.const_expr(topk_score is None):
+                            acc[i], acc[i + 1] = PackedF32.add((acc[i], acc[i + 1]), value_pair)
+                        else:
+                            acc[i], acc[i + 1] = PackedF32.fma(value_pair, score_pair, (acc[i], acc[i + 1]))
+                    elif cutlass.const_expr(k != 0):
                         acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(value_pair, score_pair, (acc[i], acc[i + 1]))
                     else:
                         if cutlass.const_expr(topk_score is not None):

@@ -30,6 +30,76 @@ replace its own device snapshot.
 
 ## Pending local diffs vs upstream
 
+- **Opt-in quantized combine arithmetic:** the NVFP4 FC2 epilogue forwards
+  its BI flag to the shared canonical BF16-to-quantized wire encoder for
+  both register and across-lane layouts. Legacy MXFP8 instead preserves its
+  FP32-to-MXFP8 legacy quantizer through an explicit ordered helper. The
+  shared top-k reducer uses a zero-seeded ordered slot fold in BI mode,
+  masking payload, scale and score loads for invalid routes. Legacy launchers
+  pass route indices for this quantized BI branch. Ordinary quantization and
+  reduction retain their existing paths. Reapply until upstream absorbs this
+  integration patch.
+
+- **Opt-in activation variants:** the BF16, NVFP4 and MXFP8 FC12 setup forwards
+  an optional `batch_invariant_activation` recipe to its epilogue. Only the
+  enabled BI path interprets that recipe through the shared ordered activation
+  helper; a missing recipe keeps each provider's existing default helper.
+  The NVFP4 BI path also follows the existing per-token scale shuffle mapping,
+  folding token scale times expert alpha with an explicit RN multiply before
+  accumulator dequantization. Ordinary activation branches are unchanged.
+  Reapply until upstream absorbs these integration hooks.
+
+- **Shared FC2 epilogue compatibility:**
+  `src/moe_nvfp4_swapab/epilogue_refactor.py` defaults the optional
+  `batch_invariant_chain` flag to false when forwarding FC2 conversion. The
+  mixed MXFP8-weight/BF16-activation epilogue also uses this adapter and has no
+  NVFP4 arithmetic flag; its ordinary conversion must remain available.
+  An explicitly enabled NVFP4 batch-invariant flag is preserved. Reapply until
+  upstream absorbs the fix.
+
+- **MXFP8 batch-invariant arithmetic:** the MXFP8 frontend binds a fixed
+  M256/N256/K128 paired-CTA geometry and native K32 MMA fold, with routing
+  weights applied before FC2. `src/moe_mxfp8_glu/kernel_mxfp8_glu_fc12.py`
+  passes the opt-in arithmetic flag to `epilogue_mxfp8.py`, which interprets
+  the separate legacy MXFP8 activation and block32 UE8M0 requantization
+  chains, including explicit scale conversion and the existing packed
+  E4M3/E5M2 data conversion. Its FC2 BF16 conversion and launcher use the
+  pinned ordered masked top-k fold shared with NVFP4. The legacy multiplication
+  association and quantizer remain distinct from the next-generation providers.
+  Ordinary execution and the inherited BF16 epilogue retain their old branches.
+  Reapply these necessary local changes until upstream absorbs them.
+
+- **NVFP4 batch-invariant arithmetic:** the NVFP4 frontend binds a fixed
+  M256/N128/K256 paired-CTA geometry, K64 MMA fold and full-N descriptor.
+  `src/moe_nvfp4_swapab/kernel_fc12.py` omits dynamic short-N input shifts
+  in this mode; `epilogue_refactor.py` uses the shared ordered activation,
+  block16 requantization and FC2 conversion. `topk_reduce.py` uses an explicit
+  +0 slot fold with early add or late FMA and masked operands.
+  `src/src/inputs_process.py` binds the same pinned offline input quantizer.
+  The branches are opt-in and preserve the ordinary implementations.
+  Reapply these necessary local changes until upstream absorbs them.
+
+- **Single-CTA dynamic scheduling:**
+  `src/moe_nvfp4_swapab/fc1_fc2_fuse_sched.py` publishes atomic-counter work
+  through a warp shuffle for one-CTA clusters, followed by the existing local
+  scheduler-to-consumer pipeline. Only multi-CTA clusters use the DSMEM
+  asynchronous-store publication protocol, whose PTX instruction requires at
+  least two CTAs. This fixes newly admitted M128 BF16 plans; paired-CTA
+  scheduling and the arithmetic trace are unchanged. Reapply until upstream
+  absorbs the fix.
+
+- **BF16 batch-invariant tile variants:**
+  `src/moe_bf16_glu/kernel_bf16_glu_fc12.py` admits M128 single-CTA and M256
+  paired-CTA tiles, N128/N256 and K64/K128/K256, with one instruction group
+  per cluster and a guard against zero A/B pipeline stages. Its FC1 output
+  SMEM has one stage per epilogue warp, independent of the N subtile count.
+  `src/moe_bf16_glu/epilogue_bf16.py` uses N/2 post-SwiGLU output columns.
+  The shared `src/moe_mxfp8_glu/epilogue_mxfp8.py` FC1 TMA-store view uses
+  the epilogue's tile width; the MXFP8 default stays at 128 columns. Keep
+  these changes together: allowing N128 alone misaddresses FC1 stores.
+  Shape-dependent arithmetic-padding and SMEM admission live in the shim
+  and FlashInfer policy, outside the vendored device source.
+
 - **Sparse decode (FlashInfer PR #6447 / #6565, 2026-10-14):** re-ported onto
   this drop in four device files. `src/src/token_comm.py` gives CTA0 ownership
   of small shared reset prefixes (EP1, prefixes above 16 KiB and NCU keep the
@@ -114,6 +184,26 @@ replace its own device snapshot.
   Upstream `main` has since moved this feature to the `next/` path (see the
   kernel repo's `docs/FC1_PER_TOKEN_SCALE_NEXT_DESIGN.md`); re-derive on the
   next re-sync.
+
+- **Opt-in W8A16 BI:** `src/moe_mxfp8_bf16_glu/epilogue_mxfp8_bf16.py`,
+  `kernel_mxfp8_bf16_glu_fc12.py` and `megamoe_kernel_mxfp8_bf16.py` carry the
+  BF16 handoff activation adapter and masked ordered finalizer. The BI path
+  fixes the dense M256/N128 two-CTA atom and rejects accumulator overlap and
+  floating atomics. Its weight-decode/BF16-MMA receipt is separate from native
+  block-scaled W8A8. The ordinary branch retains its original activation.
+- **Legacy W8A8 BI quantized combine:** the shim can select the existing
+  internal MXFP8 payload/SF planes. The wire always stores E4M3, including
+  E5M2 input sessions, and quantizes FC2 FP32 values directly. This has a
+  separate receipt from providers that first round FC2 to BF16. Public outputs
+  remain BF16; wire payloads and SFs stay inside the symmetric workspace.
+
+## Batch-invariant compiled identity patch
+
+The NVFP4 FC12/MegaMoE and W8A16 FC12 `name()` methods append the BI mode and,
+when present, a hash of the ordered activation signature's effective FP32
+coefficient bits. Their ordinary names remain byte-for-byte unchanged. Retain
+this host metadata exception alongside the BI lowering hooks until upstream
+absorbs it.
 
 ## Related trees
 

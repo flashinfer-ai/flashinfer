@@ -27,7 +27,7 @@ import numpy as np
 import torch
 from einops import rearrange, reduce, repeat
 
-from flashinfer.utils import round_up
+from flashinfer.utils import make_l2_flush, round_up
 
 
 # =============================================================================
@@ -895,10 +895,10 @@ def bench_gpu_time_with_cuda_event(
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
-    buffer = None
+    _l2_flush_fn = None
     if _do_l2_flush:
         l2_flush_size = int(_l2_flush_size_mb) * 1024 * 1024
-        buffer = torch.empty(l2_flush_size, device=_l2_flush_device, dtype=torch.int8)
+        _l2_flush_fn = make_l2_flush(l2_flush_size, _l2_flush_device)
 
     ## Estimate kernel execution time by running the kernel 5 times
     measurement_iters = 5
@@ -907,8 +907,8 @@ def bench_gpu_time_with_cuda_event(
     torch.cuda.synchronize()
     start_event.record()
     for _ in range(measurement_iters):
-        if _do_l2_flush:
-            buffer.zero_()
+        if _l2_flush_fn is not None:
+            _l2_flush_fn()
         call_fn()
     end_event.record()
     torch.cuda.synchronize()
@@ -926,8 +926,8 @@ def bench_gpu_time_with_cuda_event(
     # Dry runs
     torch.cuda.synchronize()
     for _ in range(dry_run_iters):
-        if _do_l2_flush:
-            buffer.zero_()
+        if _l2_flush_fn is not None:
+            _l2_flush_fn()
         call_fn()
     torch.cuda.synchronize()
 
@@ -936,8 +936,8 @@ def bench_gpu_time_with_cuda_event(
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
     torch.cuda.synchronize()
     for iter_idx in range(repeat_iters):
-        if _do_l2_flush:
-            buffer.zero_()
+        if _l2_flush_fn is not None:
+            _l2_flush_fn()
         start_events[iter_idx].record()
         call_fn()
         end_events[iter_idx].record()
@@ -1190,10 +1190,10 @@ def bench_gpu_time_with_cupti(
         else:
             fn()
 
-    buffer = None
+    _l2_flush_fn = None
     if _do_l2_flush:
         l2_flush_size = int(_l2_flush_size_mb) * 1024 * 1024
-        buffer = torch.empty(l2_flush_size, device=_l2_flush_device, dtype=torch.int8)
+        _l2_flush_fn = make_l2_flush(l2_flush_size, _l2_flush_device)
 
     # Prepare runner (either direct fn or CUDA graph replay)
     runner = call_fn
@@ -1223,8 +1223,8 @@ def bench_gpu_time_with_cupti(
     end_event = torch.cuda.Event(enable_timing=True)
     start_event.record()
     for _ in range(measurement_iters):
-        if _do_l2_flush:
-            buffer.zero_()
+        if _l2_flush_fn is not None:
+            _l2_flush_fn()
         runner()
     end_event.record()
     torch.cuda.synchronize()
@@ -1242,8 +1242,8 @@ def bench_gpu_time_with_cupti(
     # Dry runs
     torch.cuda.synchronize()
     for _ in range(dry_run_iters):
-        if _do_l2_flush:
-            buffer.zero_()
+        if _l2_flush_fn is not None:
+            _l2_flush_fn()
         runner()
     torch.cuda.synchronize()
 
@@ -1260,8 +1260,8 @@ def bench_gpu_time_with_cupti(
         func_buffer_requested, partial(func_buffer_completed, launches, kernels)
     )
     for _ in range(repeat_iters):
-        if _do_l2_flush:
-            buffer.zero_()
+        if _l2_flush_fn is not None:
+            _l2_flush_fn()
         torch.cuda.synchronize()
         start_cpu = cupti.get_timestamp()
         runner()

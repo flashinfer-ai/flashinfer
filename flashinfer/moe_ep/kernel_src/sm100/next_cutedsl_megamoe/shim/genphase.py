@@ -80,7 +80,7 @@ class Sm100GenphaseMoeConfig(BlockScaledMoeConfig):
             or geometry not in self.admitted_geometries
             or self.schedule_policy[0] != "grouped"
             or self.reduce_topk_in_kernel
-            or self.activation != "swiglu"
+            or (not self.batch_invariant and self.activation != "swiglu")
         ):
             raise ValueError(
                 "Blackwell GenPhase requires SwiGLU, N128/CGA4 or an admitted "
@@ -120,10 +120,10 @@ class Sm100GenphaseSymmBuffer(BlockScaledSymmBuffer):
                 f"Restart Python with CUTE_DSL_ARCH={target} before importing CuTe DSL."
             )
 
-    def __init__(self, config: Sm100GenphaseMoeConfig) -> None:
+    def __init__(self, config: Sm100GenphaseMoeConfig, *, process_group=None) -> None:
         if not isinstance(config, Sm100GenphaseMoeConfig):
             raise TypeError("Blackwell GenPhase requires Sm100GenphaseMoeConfig.")
-        super().__init__(config)
+        super().__init__(config, process_group=process_group)
 
     def retune(self, knobs) -> None:
         """Collectively replace kernel storage before capture, preserving I/O views.
@@ -134,23 +134,36 @@ class Sm100GenphaseSymmBuffer(BlockScaledSymmBuffer):
         from . import comm
         from .tuning import is_valid_sm100_genphase_knobs
 
-        comm.ensure_not_capturing("Blackwell GenPhase retune")
-        if self._destroyed:
-            raise RuntimeError("cannot retune a destroyed workspace")
-        if not is_valid_sm100_genphase_knobs(knobs, self.config):
-            raise ValueError("invalid Blackwell GenPhase tuning knobs")
-        config = dataclasses.replace(self.config, **knobs)
-        if config == self.config:
+        def prepare_replacement():
+            comm.ensure_not_capturing("Blackwell GenPhase retune")
+            if self._destroyed or self._tuning_state.graph_captured:
+                raise RuntimeError("cannot retune a destroyed or captured workspace")
+            if not is_valid_sm100_genphase_knobs(knobs, self.config):
+                raise ValueError("invalid Blackwell GenPhase tuning knobs")
+            config = dataclasses.replace(self.config, **knobs)
+            if config == self.config:
+                return None
+            kernel = self._build_kernel(config)
+            local = self._prepare_kernel_workspace_local(kernel)
+            torch.cuda.synchronize()
+            return config, kernel, local
+
+        prepared = comm.prepare_local(
+            prepare_replacement,
+            self.config.world_size,
+            self._process_group,
+            phase="retune local allocation",
+        )
+        if prepared is None:
             return
-        kernel = self._build_kernel(config)
-        torch.cuda.synchronize()
+        config, kernel, local = prepared
         self._compiled = self._launch_key = self._launch_kwargs = None
         self._launch_weights = None
         self._pre_reduced_activation = self._pre_reduced_activation_sf = None
         comm.free_sym_tensor(self.shared_workspace)
         self.shared_workspace = self.local_workspace = None
         self.config, self.kernel = config, kernel
-        self._allocate_kernel_workspace(kernel)
+        self._allocate_kernel_workspace(kernel, local_workspace=local)
 
 
 def validate_genphase_weights(transformed, config, device: torch.device) -> None:
