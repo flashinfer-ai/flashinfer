@@ -21,6 +21,7 @@ a cache invalidation for every kernel in CI's persistent compile cache.
 """
 
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -341,6 +342,66 @@ def test_reading_all_through_star_import_keys_it(fake_package):
         "__init__.py",
         "from .api_a import api_a\nfrom .api_b import api_b\n__all__ = ['api_a']\n",
     )
+
+
+@pytest.mark.parametrize("strict", ["0", "1"])
+@pytest.mark.parametrize("with_external", [False, True])
+def test_package_relocation_preserves_key(
+    fake_package, tmp_path, monkeypatch, strict, with_external
+):
+    """A shared cache must not depend on the installation prefix or sort order."""
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", strict)
+    external = tmp_path / "middle.py"
+    _write(external, "EXTRA = 1\n")
+    relocated = tmp_path / "relocated" / "flashinfer"
+    shutil.copytree(fake_package, relocated)
+    keys = []
+    for pkg in (fake_package, relocated):
+        monkeypatch.setattr(source_analysis, "_PACKAGE_DIR", pkg.resolve())
+        _clear_closure_caches()
+        paths = (str(pkg / "kernels/uses_env.py"),)
+        if with_external:
+            paths += (str(external),)
+        keys.append(source_analysis._hash_source_files(paths))
+    assert keys[0] == keys[1]
+
+
+@pytest.mark.parametrize(
+    "edited_rel, new_text",
+    [
+        ("jit/env.py", "JIT_DIR = 'changed'\n"),
+        ("jit/__init__.py", "from . import env as env\nIMPORT_SETTING = 2\n"),
+    ],
+)
+def test_relocated_package_still_keys_dependencies(
+    fake_package, tmp_path, monkeypatch, edited_rel, new_text
+):
+    relocated = tmp_path / "relocated" / "flashinfer"
+    shutil.copytree(fake_package, relocated)
+    monkeypatch.setattr(source_analysis, "_PACKAGE_DIR", relocated.resolve())
+    assert _edit_changes_key(relocated, "kernels/uses_env.py", edited_rel, new_text)
+
+
+@pytest.mark.parametrize("strict", ["0", "1"])
+def test_distinct_package_and_external_files_keep_distinct_keys(
+    fake_package, tmp_path, monkeypatch, strict
+):
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", strict)
+    original = fake_package / "kernels/standalone.py"
+    duplicate = fake_package / "kernels/duplicate.py"
+    shutil.copyfile(original, duplicate)
+    external = tmp_path / "external"
+    # This relative external name would collide with an untagged package path.
+    alias = external / "flashinfer/kernels/standalone.py"
+    alias.parent.mkdir(parents=True)
+    shutil.copyfile(original, alias)
+    monkeypatch.chdir(external)
+    keys = {
+        source_analysis._hash_source_files((str(original),)),
+        source_analysis._hash_source_files((str(duplicate),)),
+        source_analysis._hash_source_files(("flashinfer/kernels/standalone.py",)),
+    }
+    assert len(keys) == 3
 
 
 # Real-tree guards. Plain-module closure sizes on main before this rework:
