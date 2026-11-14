@@ -2574,7 +2574,9 @@ def _hopper_paged_auto_cudnn(
 ):
     """H100 D256 admission after the native planner has selected FA3."""
     if not (
-        layout == "HND"
+        layout in ("HND", "NHD")
+        # The extra storage layouts were qualified only for causal attention.
+        and (causal or (layout == "HND" and page_size == 16))
         and q_dtype == kv_dtype == o_dtype
         and q_dtype in (torch.float16, torch.bfloat16)
         and head_dim_qk == head_dim_vo == 256
@@ -2583,7 +2585,7 @@ def _hopper_paged_auto_cudnn(
         and hk > 0
         and hq % hk == 0
         and hq // hk in (1, 2, 4, 8, 16)
-        and page_size == 16
+        and page_size in (16, 32, 64, 128)
         and 65 <= max_q <= 16384
         and max_q <= max_kv <= 32768
         and qo_indptr_host.device.type == "cpu"

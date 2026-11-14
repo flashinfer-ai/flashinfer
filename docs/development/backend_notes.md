@@ -223,8 +223,13 @@ specific wrapper.
 
 ### H100 D256 paged admission
 
-On H100 80GB HBM3 with 132 SMs, BF16 or FP16 HND/page16 D256 auto may select cuDNN
-when the native planner selects FA3. The existing short-query FA2 domain is
+The expanded NHD layout and page sizes 32/64/128 apply only to causal
+attention. Noncausal admission retains HND with page size 16; combining these
+two independently qualified extensions does not qualify their cross-product.
+
+On H100 80GB HBM3 with 132 SMs, BF16 or FP16 D256 auto may select cuDNN
+with HND or NHD KV storage and page sizes 16/32/64/128 when the native planner
+selects FA3. The existing short-query FA2 domain is
 retained. The domain covers batches 1–32, query heads 16–48, GQA groups 1/2/4/8/16,
 maximum Q 65–16384 and maximum KV at most 32768. Actual positive Q/KV lengths
 must already be on CPU, satisfy Q≤KV per request, match the declared maxima,
@@ -245,4 +250,6 @@ A graph-mode wrapper already planned for FA2 or FA3 keeps that native provider
 and its schedule. A cuDNN-first wrapper may fall back while refreshing the
 metadata retained by its old cuDNN captures. Validate both starting orders and
 Q64/Q65 partition changes and transitions across the actual-work floor,
-including numerical output and LSE after replay.
+including numerical output and LSE after replay. Test physical NHD strides and
+nonaligned KV lengths: page counts round up, and the final-page length must
+reflect the remaining tokens when a captured plan grows within its reservation.

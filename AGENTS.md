@@ -77,6 +77,11 @@ captured buffers remain valid. Read the
 [backend lifetime notes](docs/development/backend_notes.md) before changing
 attention planning or provider selection.
 
+When combining independently qualified dispatch extensions, test the union of
+their qualified domains and reject unqualified cross-products. For example,
+causal NHD/page32 support plus noncausal HND/page16 support does not qualify
+noncausal NHD/page32. Include a mask/layout/page routing matrix in the merge.
+
 Performance results need a reproducible benchmark, named GPU, problem sizes,
 and absolute before/after times. State cache conditions and timing boundaries;
 keep compilation/startup, host time, and GPU kernel time distinct. Use
