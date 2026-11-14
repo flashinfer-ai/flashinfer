@@ -1,0 +1,156 @@
+{
+  "name": "qsa_sparse_paged_attention_h12_kv1_d256_ps16",
+  "description": "Gated sparse paged GQA attention over an NVFP4, FP8 or BF16 KV cache with logical token selections (vLLM Qwen QSA contract).",
+  "op_type": "qsa_sparse_paged_attention",
+  "tags": [
+    "fi_api:flashinfer.sparse.qsa_sparse_paged_attention"
+  ],
+  "axes": {
+    "num_rows": {
+      "type": "var"
+    },
+    "num_blocks": {
+      "type": "var"
+    },
+    "num_requests": {
+      "type": "var"
+    },
+    "max_blocks": {
+      "type": "var"
+    },
+    "num_qo_heads": {
+      "type": "const",
+      "value": 12
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 1
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 256
+    },
+    "page_size": {
+      "type": "const",
+      "value": 16
+    },
+    "cache_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "index_cols": {
+      "type": "const",
+      "value": 65
+    },
+    "num_scales": {
+      "type": "const",
+      "value": 16
+    }
+  },
+  "inputs": {
+    "q": {
+      "shape": [
+        "num_rows",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k_cache": {
+      "shape": [
+        "num_blocks",
+        "page_size",
+        "num_kv_heads",
+        "cache_dim"
+      ],
+      "dtype": "uint8"
+    },
+    "v_cache": {
+      "shape": [
+        "num_blocks",
+        "page_size",
+        "num_kv_heads",
+        "cache_dim"
+      ],
+      "dtype": "uint8"
+    },
+    "logical_indices": {
+      "shape": [
+        "num_rows",
+        "index_cols"
+      ],
+      "dtype": "int32"
+    },
+    "block_table": {
+      "shape": [
+        "num_requests",
+        "max_blocks"
+      ],
+      "dtype": "int32"
+    },
+    "token_to_req": {
+      "shape": [
+        "num_rows"
+      ],
+      "dtype": "int32"
+    },
+    "use_prefill_config": {
+      "shape": null,
+      "dtype": "bool"
+    },
+    "k_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "v_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "output_gate": {
+      "shape": [
+        "num_rows",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k_sf": {
+      "shape": [
+        "num_blocks",
+        "page_size",
+        "num_kv_heads",
+        "num_scales"
+      ],
+      "dtype": "float8_e4m3fn",
+      "optional": true
+    },
+    "v_sf": {
+      "shape": [
+        "num_blocks",
+        "page_size",
+        "num_kv_heads",
+        "num_scales"
+      ],
+      "dtype": "float8_e4m3fn",
+      "optional": true
+    },
+    "backend": {
+      "shape": null,
+      "dtype": "string",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "out": {
+      "shape": [
+        "num_rows",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

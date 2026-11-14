@@ -31,6 +31,7 @@ Results:
 - We would get these example json files under fi_trace_out directory:
 qsa_forward_h12_kv1_d256.json
 qsa_indexed_forward_h12_kv1_d256.json
+qsa_sparse_paged_attention_h12_kv1_d256_ps16.json
 alphamoe_fused_router_e512_k8_bm16_shared0.json
 alphamoe_nvfp4_aligned_moe_topk2_e4_h256_n256_bm8.json
 bmm_mxfp8_N128_K128.json
@@ -207,6 +208,7 @@ are only generated on SM120/SM121 GPUs.
 trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
 trtllm_batch_decode_token_sparse_h16_kv1_d256_ps1_topk512.json requires SM100/SM103 GPUs.
 trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
+qsa_sparse_paged_attention_h12_kv1_d256_ps16.json requires SM80 through SM90 GPUs.
 top_k_varlen_n4096_k512.json (windowed prefill mode, gvr_2) requires SM100/SM103/SM107 GPUs.
 """
 
@@ -555,6 +557,52 @@ def example_qsa():
 
 
 example_qsa()
+
+
+def example_qsa_sparse_paged_attention():
+    if torch.cuda.get_device_capability(device)[0] not in (8, 9):
+        print("Skipping QSA sparse paged attention example: requires SM80 through SM90")
+        return
+    rows, num_blocks, page_size, width = 4, 8, 16, 64
+    q = torch.randn(rows, 12, 256, dtype=torch.bfloat16, device=device)
+    # NVFP4 cache: packed E2M1 bytes and one E4M3 block scale per 16 dims.
+    k_cache = torch.randint(
+        0, 256, (num_blocks, page_size, 1, 128), dtype=torch.uint8, device=device
+    )
+    v_cache = torch.randint_like(k_cache, 0, 256)
+    k_sf, v_sf = (
+        torch.rand(num_blocks, page_size, 1, 16, device=device).to(torch.float8_e4m3fn)
+        for _ in range(2)
+    )
+    tokens = torch.arange(width, dtype=torch.int32, device=device)
+    logical_indices = torch.cat(
+        [
+            tokens.expand(rows, width),
+            torch.full((rows, 1), width, dtype=torch.int32, device=device),
+        ],
+        dim=1,
+    ).contiguous()
+    block_table = torch.arange(num_blocks, dtype=torch.int32, device=device).unsqueeze(
+        0
+    )
+    token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
+    flashinfer.qsa_sparse_paged_attention(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        False,
+        k_scale=1.0,
+        v_scale=1.0,
+        output_gate=torch.randn_like(q),
+        k_sf=k_sf,
+        v_sf=v_sf,
+    )
+
+
+example_qsa_sparse_paged_attention()
 
 
 def example_dsv41_fp4_cache():
