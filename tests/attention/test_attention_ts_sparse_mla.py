@@ -7,6 +7,8 @@ The test-only preparer adapts vLLM's page-stride mapping and stable compaction
 (0aee727ff6131a1b647941186ceef8f4777bdac2); native Q/KV are never repacked.
 """
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -466,7 +468,7 @@ def _plan_with_deferred_compilation(wrapper, *args, **kwargs):
     assert wrapper._state["compiled"] is None
     assert mla_decode_module._get_compiled_mla_decode.cache_info() == cache_info
     with pytest.raises(RuntimeError, match=r"plan\(compile=True\)"):
-        wrapper.run(None, None, None, None)
+        wrapper.run(None, None, None, None, validate=False)
     wrapper.plan(*args, **kwargs)
     compiled = wrapper._state["compiled"]
     assert compiled is not None and wrapper._state["compile_spec"] == spec
@@ -801,14 +803,14 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
     out = torch.empty_like(q, dtype=torch.bfloat16)
     lse = torch.empty(q.shape[:-1], device=q.device)
 
-    def run(checked=False, target_lse=lse):
+    def run(checked=False, target_lse=lse, target_offsets=offsets):
         """Launch into caller-owned outputs using the current host-composed scales."""
         return w.run(
             q,
             primary,
             **meta,
             extra_kv_cache=secondary if extra else None,
-            qo_indptr=offsets,
+            qo_indptr=target_offsets,
             out=out,
             lse=target_lse,
             validate=checked,
@@ -889,9 +891,11 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
     assert torch.count_nonzero(out.reshape(rows, heads, 512)[-1]) == 0
     assert torch.isneginf(lse.reshape(rows, heads)[-1]).all()
     if packed:
+        with pytest.raises(TypeError, match="qo_indptr must be a torch.Tensor"):
+            run(target_offsets=None)
         unaligned = torch.empty(lse.numel() + 1, device=q.device)[1:].view_as(lse)
         with pytest.raises(ValueError, match="16-byte-aligned"):
-            run(target_lse=unaligned)
+            run(checked=True, target_lse=unaligned)
     if packed and heads == 6 and dtype == torch.bfloat16:
         empty_meta = prepare_sparse_mla_indices(
             w,
@@ -935,7 +939,19 @@ def test_caller_workspace_single_source_and_eager_api():
     wrapper = BatchSparseMLADecodePagedTSWrapper(workspace)
     _plan_with_deferred_compilation(wrapper, **args)
     metadata = prepare_sparse_mla_indices(wrapper, q, kv, indices)
-    result, lse = wrapper.run(q, kv, **metadata)
+    with (
+        patch.object(
+            mla_decode_module,
+            "_validate_query",
+            side_effect=AssertionError("query validation"),
+        ),
+        patch.object(
+            mla_decode_module,
+            "_validate_out",
+            side_effect=AssertionError("output validation"),
+        ),
+    ):
+        result, lse = wrapper.run(q, kv, **metadata, validate=False)
     torch.testing.assert_close(result, torch.full_like(q, 1.5))
     eager, eager_lse = batch_sparse_mla_decode_with_paged_kv_cache(
         q, kv, **metadata, return_lse=True
