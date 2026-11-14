@@ -173,8 +173,8 @@ def cake_gated_delta_product_mtp(
     -----
     - Requires an SM90, SM100 or SM103 device (``sm_90a`` / ``sm_100a`` /
       ``sm_103a`` programs).
-    - ``T`` is a runtime value up to the exported maximum (16); ``T`` of 1 to 8
-      and 16 with ``num_householder == 3`` run programs compiled for that token
+    - ``T`` is a runtime value up to the exported maximum (16); ``T`` of 1, 4
+      and 8 with ``num_householder == 3`` run programs compiled for that token
       count, selected by ``B x HV``.
     - The call reads no tensor contents on the host and synchronizes nothing.
       With bfloat16 activations, float32 ``A_log`` / ``dt_bias``, int32

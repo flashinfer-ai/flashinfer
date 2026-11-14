@@ -345,7 +345,6 @@ TensorRT-LLM Fused MoE
     trtllm_bf16_routed_moe
     trtllm_fp4_block_scale_moe
     trtllm_fp4_block_scale_routed_moe
-    split_fp4_moe_weights_by_locality_domain
     trtllm_fp8_block_scale_moe
     trtllm_fp8_block_scale_routed_moe
     trtllm_fp8_per_channel_scale_moe

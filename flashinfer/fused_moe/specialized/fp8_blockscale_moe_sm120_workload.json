@@ -1,0 +1,39 @@
+{
+  "op": "fused_moe_fp8_block_scale",
+  "backends": [
+    "specialized"
+  ],
+  "min_compute_capability": [
+    12,
+    0
+  ],
+  "max_compute_capability": [
+    12,
+    0
+  ],
+  "contract": {
+    "num_experts": 256,
+    "top_k": 8,
+    "hidden_size": 2048,
+    "intermediate_size": 512,
+    "activation": "swiglu",
+    "input_dtype": "bfloat16",
+    "weight_dtype": "float8_e4m3fn",
+    "weight_scale_block": [
+      128,
+      128
+    ],
+    "output_dtype": "bfloat16"
+  },
+  "num_tokens_allowlist": [
+    1,
+    4,
+    16,
+    64,
+    256,
+    1024,
+    4096,
+    16384
+  ],
+  "provenance": "agent-generated kernel benchmarked on RTX PRO 6000 (SM120) against the Qwen3.6-35B-A3B-FP8 serving workload (captured routing, measured per-step dispatch weights); every admitted num_tokens wins vs the serving engine's dispatched Triton fused-MoE in two independent interleaved CUPTI runs"
+}

@@ -42,9 +42,9 @@ def qk_tile(
     kv_cons,
     s_prod,
 ):
-    """``S = Q K^T`` of one tile: one ``D/16``-step fold per ring slot of K (one slot = the whole tile; with half-tile slots each would be
-    written to its own S columns by a 128 x 64 instruction -- the same per-element fold, ``ACCUMULATE`` off on its first step); the
-    slot is released as soon as its MMAs are issued (the release is the MMAs' completion)."""
+    """``S = Q K^T`` of one tile: one ``D/16``-step fold per ring slot of K (one slot = the whole tile at D <= 128; two 64-key slots at
+    D = 256, each written to its own S columns by a 128 x 64 instruction -- the same per-element fold, ``ACCUMULATE`` off on its
+    first step); the slot is released as soon as its MMAs are issued (the release is the MMAs' completion)."""
     sh = None
     for sl in cutlass.range_constexpr(st.slots_per_tile):
         kh = kv_cons.wait_and_advance()

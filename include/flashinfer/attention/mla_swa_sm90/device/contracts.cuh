@@ -1,10 +1,6 @@
 
 template <class C>
 struct PVRoleOps;
-struct SoftmaxRowState {
-  float maximum;
-  float sum;
-};
 template <class T>
 struct SplitOutputTraits : T {
   using InputT = std::conditional_t<T::Config::Backend == mla_swa::Reduce::GlobalFP32, float,

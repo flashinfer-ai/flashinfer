@@ -58,8 +58,7 @@ from moe_nvfp4_swapab.runner_common import (
 
 from flashinfer.moe_ep._compat import deprecated_aliases
 
-from .comm import (  # noqa: F401 (_multicast_base is POC-gated)
-    _multicast_base,
+from .comm import (
     _CompiledMega,
     _compute_peer_offsets,
     bootstrap_dist,
@@ -842,8 +841,6 @@ class MegaMoENvfp4Frontend:
         self._mega.symmetric_base, self._mega.peer_offsets_list = _compute_peer_offsets(
             shared_workspace, self.config.world_size
         )
-        # POC (multimem barrier): 0 unless MEGA_MULTIMEM_BARRIER=1 and NVLS maps.
-        self._mega.mc_base = _multicast_base(shared_workspace)
 
     def _compile_prepared(self, inputs: MegaMoENvfp4Inputs) -> _CompiledMega:
         import cutlass.cute as cute
@@ -1172,19 +1169,11 @@ class MegaMoENvfp4Frontend:
             )
 
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        # POC (multimem barrier): absolute multicast VA of nvlink_barrier_signal
-        # = workspace multicast base + its shared-region offset (0 when gate off).
-        mc_signal_base = (
-            mega.mc_base + int(mega.kernel._shared_offsets["nvlink_barrier_signal"])
-            if mega.mc_base
-            else 0
-        )
         peer_rank_ptr_mapper_host = SymBufferHost(
             base_addr=mega.symmetric_base,
             offsets=tuple(mega.peer_offsets_list),
             rank_idx=c.rank,
             num_max_ranks=c.world_size,
-            mc_base=mc_signal_base,
         )
         dynamic_weight_modes = (0,) if c.num_experts_per_rank == 1 else ()
 

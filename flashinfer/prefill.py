@@ -4365,13 +4365,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     paged_kv_indptr, paged_kv_last_page_len, seq_lens, page_size
                 )
             )
-        # fa2 derives kv lengths from the page table and never reads this
-        # buffer, so skip the copy, which syncs when the host lengths are
-        # pageable. A cuDNN graph retained from an earlier plan still reads it.
-        if kv_lens_arr_host is not None and (
-            self._backend != "fa2"
-            or (self.is_cuda_graph_enabled and self._cudnn_q_lens_buffer is not None)
-        ):
+        if kv_lens_arr_host is not None:
             required_size = len(kv_lens_arr_host)
             if required_size > self._kv_lens_buffer.shape[0]:
                 self._kv_lens_buffer = torch.empty(
@@ -5101,7 +5095,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         lse : Optional[torch.Tensor]
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
-            Whether to return the logsumexp of attention logits
+            Whether to return the logsumexp of attention output
         lse_base : str
             Base of the returned ``lse`` when :attr:`return_lse` is ``True``:
             ``"log2"`` (default, FlashInfer's convention, ``max + log2(sum(exp2(...)))``)
@@ -5183,7 +5177,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             * The attention output, shape:
               ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
-            * The logsumexp of attention logits, shape: ``[qo_indptr[-1], num_qo_heads]``
+            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``
               (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
               (``"HN"``), in the base selected by :attr:`lse_base`.
         """
@@ -6300,9 +6294,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             and after scaling. The mask tensor should be in the same device as the input tensors.
         causal : bool
             Whether to apply causal mask to the attention matrix.
-            This argument is ignored if ``custom_mask`` or ``packed_custom_mask`` is provided in :meth:`plan`
-            for backends that apply custom masks. The ``cutlass`` backend ignores custom masks,
-            so ``causal`` still applies there.
+            This argument is ignored if ``mask`` is provided in :meth:`plan`.
         pos_encoding_mode : str
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
@@ -7474,7 +7466,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse : Optional[torch.Tensor]
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
-            Whether to return the logsumexp of attention logits
+            Whether to return the logsumexp of attention output
         lse_base : str
             Base of the returned ``lse`` when :attr:`return_lse` is ``True``:
             ``"log2"`` (default, FlashInfer's convention, ``max + log2(sum(exp2(...)))``)
@@ -7512,7 +7504,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
-            * The logsumexp of attention logits, shape: ``[qo_indptr[-1], num_qo_heads]``
+            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``
               (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
               (``"HN"``), in the base selected by :attr:`lse_base`.
         """
@@ -8457,10 +8449,8 @@ def trtllm_sage_attention_quantize(
 
     Returns
     -------
-    tuple of torch.Tensor
-        (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale) or
-        (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, k_mean)
-
+    (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale) or
+    (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, k_mean)
         Quantized Q/K/V followed by their FP32 dequantization scales.
         When ``smooth_k=True``, the FP32 K mean is appended. The first six
         outputs can be passed directly to `trtllm_ragged_attention_deepseek`.
@@ -10300,10 +10290,8 @@ def trtllm_fmha_v2_prefill(
         Defaults to ``0`` (disabled).
     Returns
     -------
-    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         If :attr:`save_softmax_stats` is ``False``, the attention output tensor.
         If :attr:`save_softmax_stats` is ``True``, a tuple of two tensors:
-
         * The attention output tensor.
         * The softmax statistics tensor (LSE).
     """

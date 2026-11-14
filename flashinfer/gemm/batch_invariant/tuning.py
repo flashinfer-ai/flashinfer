@@ -97,7 +97,7 @@ __all__ = [
 def knobs_to_tactic(k: Knobs) -> tuple:
     """A configuration as an autotuner tactic: a flat tuple of scalars (JSON round-trips through the tuner's cache
     files turn lists into tuples and keep ints, bools and strings); the block-scaled knobs (the in-cluster split factor,
-    the swapped decode record, the record's k-block) last."""
+    the swapped decode record) last."""
     return (
         k.tile_m,
         k.tile_n,
@@ -111,15 +111,14 @@ def knobs_to_tactic(k: Knobs) -> tuple:
         k.cta_chunks,
         k.cluster_k,
         k.swap_ab,
-        k.k_block,
     )
 
 
 def knobs_from_tactic(t: Any) -> Knobs:
-    """A tactic back to its configuration; a tactic without the block-scaled knobs (a cache file written before they
-    existed) is a dense record, one without the k-block a record at the format's default stage."""
+    """A tactic back to its configuration; a tactic without the two block-scaled knobs (a cache file written before they
+    existed) is a dense record."""
     tm, tn, cm, cn, two, tma, raster, sw, grid, cc, *bs = t
-    ck, swap, kb = (list(bs) + [1, False, 0][len(bs) :])[:3]
+    ck, swap = bs if bs else (1, False)
     return Knobs(
         (int(tm), int(tn)),
         (int(cm), int(cn)),
@@ -131,7 +130,6 @@ def knobs_from_tactic(t: Any) -> Knobs:
         bool(cc),
         int(ck),
         bool(swap),
-        int(kb),
     )
 
 

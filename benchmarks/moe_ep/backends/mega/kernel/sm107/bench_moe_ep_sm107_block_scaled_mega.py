@@ -356,50 +356,6 @@ def _selected_knobs(
     )
 
 
-def _make_backend_config(args, selection, quant_kind):
-    from flashinfer.moe_ep import (
-        Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
-        Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
-        Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
-        Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
-    )
-
-    common = dict(
-        intermediate_size=INTERMEDIATE,
-        top_k=TOP_K,
-        knobs=selection,
-        in_kernel_fc2_reduce=args.variant == "ikr",
-        kernel_variant=args.kernel_variant,
-        activation=args.activation,
-        situ_beta=args.situ_beta,
-        situ_linear_beta=args.situ_linear_beta,
-        gate_up_clamp=(
-            args.gate_up_clamp
-            if args.gate_up_clamp is not None
-            else 10.0
-            if args.input_profile == "blackwell" and args.activation == "swiglu"
-            else None
-        ),
-        apply_routing_weights_before_fc2=args.routing_weight_position == "early",
-    )
-    if args.kernel_variant == "genphase":
-        common.update(cluster_shape_mn=(4, 1), fc2_use_bulk=True)
-    # Omit new options at their defaults so this script can also measure older drops.
-    if args.use_tanh_sigmoid:
-        common["use_tanh_sigmoid"] = True
-    if args.epilogue_warpgroups != 1:
-        common["epilogue_warpgroups"] = args.epilogue_warpgroups
-    return (
-        Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
-        if quant_kind == "nvfp4"
-        else Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
-        if quant_kind == "mxfp4"
-        else Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
-        if quant_kind == "mxfp4_mxfp8"
-        else Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(kind=quant_kind, **common)
-    )
-
-
 def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_kind):
     import dataclasses
 
@@ -410,6 +366,10 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
         MegaConfig,
         MoEEpLayer,
         MoEEpTensors,
+        Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+        Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
 
     selection = _selected_knobs(
@@ -424,7 +384,23 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
     )
     if args.variant is not None and isinstance(selection, dict):
         selection = dict(selection, reduce_topk_in_kernel=args.variant == "ikr")
-    cfg = _make_backend_config(args, selection, quant_kind)
+    common = dict(
+        intermediate_size=INTERMEDIATE,
+        top_k=TOP_K,
+        knobs=selection,
+        kernel_variant=args.kernel_variant,
+        in_kernel_fc2_reduce=args.variant == "ikr",
+        gate_up_clamp=10.0 if args.input_profile == "blackwell" else None,
+    )
+    cfg = (
+        Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
+        if quant_kind == "nvfp4"
+        else Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
+        if quant_kind == "mxfp4"
+        else Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
+        if quant_kind == "mxfp4_mxfp8"
+        else Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(kind=quant_kind, **common)
+    )
     torch.cuda.reset_peak_memory_stats()
     layer = MoEEpLayer(
         bootstrap=BootstrapConfig(world_size=world, rank=rank, auto_bootstrap=False),
@@ -599,9 +575,7 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
                     "output_activation",
                     "local_workspace",
                     "shared_workspace",
-                    "tmp_workspace",
                 )
-                if isinstance(getattr(workspace, name, None), torch.Tensor)
             },
         )
         if args.execution == "graph":
@@ -748,7 +722,9 @@ def _testlist(args, world):
     return cases
 
 
-def _parse_args(argv=None):
+def main():
+    global HIDDEN, INTERMEDIATE, NUM_EXPERTS, TOP_K, SEED
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--testlist", help="JSON testlist; select rows matching WORLD_SIZE"
@@ -763,16 +739,7 @@ def _parse_args(argv=None):
         action="store_true",
         help="time eager host dispatch through device completion for each call",
     )
-    parser.add_argument("--activation", choices=["swiglu", "situ"], default="swiglu")
-    parser.add_argument("--situ-beta", type=float)
-    parser.add_argument("--situ-linear-beta", type=float)
-    parser.add_argument("--gate-up-clamp", type=float)
-    parser.add_argument(
-        "--routing-weight-position", choices=["early", "late"], default="early"
-    )
-    parser.add_argument("--use-tanh-sigmoid", action="store_true")
-    parser.add_argument("--epilogue-warpgroups", type=int, choices=[1, 2], default=1)
-    parser.add_argument("--tokens")
+    parser.add_argument("--tokens", default="8,64,512,1024,2048,4096,8192")
     parser.add_argument(
         "--capacity",
         type=int,
@@ -830,13 +797,7 @@ def _parse_args(argv=None):
         "--repetition", type=int, default=1, help="label an independent fixed-seed run"
     )
     parser.add_argument("--output", default="bench_sm107_mega_results.jsonl")
-    args = parser.parse_args(argv)
-    if args.tokens is None:
-        args.tokens = (
-            "8,64,512,1024"
-            if args.kernel_variant == "genphase"
-            else "8,64,512,1024,2048,4096,8192"
-        )
+    args = parser.parse_args()
     if args.eager_completed_wall and args.execution != "eager":
         parser.error("--eager-completed-wall requires --execution eager")
     if args.kernel_variant == "genphase" and (
@@ -847,6 +808,13 @@ def _parse_args(argv=None):
         parser.error(
             "reported profiles use separate reduction; do not label an IKR override reported"
         )
+    HIDDEN, INTERMEDIATE, NUM_EXPERTS, TOP_K, SEED = (
+        args.hidden,
+        args.intermediate,
+        args.num_experts,
+        args.topk,
+        args.seed,
+    )
     token_list = [int(t) for t in args.tokens.split(",")]
     if min(token_list) < 1 or min(args.warmup, args.iters, args.repetition) < 1:
         parser.error("tokens, warmup, iters, and repetition must be positive")
@@ -866,24 +834,10 @@ def _parse_args(argv=None):
     )
     if world < 2:
         parser.error("run under torchrun with at least two EP ranks")
-    if args.num_experts % world or not 1 <= args.topk <= args.num_experts:
+    if NUM_EXPERTS % world or not 1 <= TOP_K <= NUM_EXPERTS:
         parser.error(
             "num-experts must divide across ranks and topk must be in [1, num-experts]"
         )
-    return args, token_list, rank, world
-
-
-def main():
-    global HIDDEN, INTERMEDIATE, NUM_EXPERTS, TOP_K, SEED
-
-    args, token_list, rank, world = _parse_args()
-    HIDDEN, INTERMEDIATE, NUM_EXPERTS, TOP_K, SEED = (
-        args.hidden,
-        args.intermediate,
-        args.num_experts,
-        args.topk,
-        args.seed,
-    )
     cases = _testlist(args, world)
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -899,7 +853,7 @@ def main():
     bootstrap = BootstrapConfig(world_size=world, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
     if torch.cuda.get_device_capability() != (10, 7):
-        raise RuntimeError("this benchmark requires native SM107 GPUs")
+        parser.error("this benchmark requires native SM107 GPUs")
     require_sm107_dsl()
     runtime = bootstrap_moe_ep_runtime(
         bootstrap, sm107_block_scaled_runtime_requirements(bootstrap)

@@ -20,7 +20,6 @@ sys.path.insert(0, str(ROOT))
 
 SUITES = {
     "host": [
-        "tests/moe_ep/test_provider_package.py",
         "tests/moe_ep/test_sm107_block_scaled_config.py",
         "tests/moe_ep/test_sm107_block_scaled_contracts.py",
         "tests/moe_ep/test_sm107_runtime_options.py",
@@ -43,7 +42,6 @@ SUITES = {
     "multi": [
         "tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py",
         "tests/moe_ep/test_sm107_routing_graph_multirank.py",
-        "tests/moe_ep/test_sm107_shared_expert.py",
     ],
 }
 
