@@ -238,6 +238,9 @@ from .core.validation import (
 )
 from .layer import MoEEpLayer
 from .modes import (
+    AutoConfig,
+    MoEEpAutoLayer,
+    MoEEpAutoWorkspace,
     CakeAlltoAllConfig,
     FusedMoeKernelConfig,
     IdentityConfig,
@@ -265,6 +268,9 @@ from .weights import (
 )
 
 __all__ = [
+    "AutoConfig",
+    "MoEEpAutoLayer",
+    "MoEEpAutoWorkspace",
     "AlgoKnob",
     "BootstrapConfig",
     "CakeAlltoAll",

@@ -97,12 +97,14 @@ In-kernel Q / K L2 norm (``use_qk_l2norm_in_kernel=True``, default ``False``): `
 (``qk_rstd`` ``[2, T_r, H_qk]``) before its own body; every other q / k reader (#2, #3, #5, #7, #8) is the unchanged
 program bound to ``qn`` / ``kn``; #8 runs as ``bwd_dqkg_l2n``, which applies the norm's pullback (from the raw rows
 and the saved ``r``) before the one BF16 rounding of ``dq`` / ``dk`` (``group_reduce="host"``: the unchanged #8 and the
-pullback of :mod:`.cake_l2n` on the host, chunked by token blocks).  The saved set gains ``qk_rstd`` only
-(``KCP_SAVED_VERSION`` 2); ``qn`` / ``kn`` never outlive a call: the forward drops ``kn`` before its output and
-``qn`` after #5 (a hand-off forward hands both over with its tapes instead); the backward gets them from #1_l2n
-again (light replay, replay mode), from the recompute forward's #1_l2n through the kept hand-off (the kept recompute
-tapes) or from ``qk_apply`` (``qn = bf16(q * r)`` from the saved ``r``: ``save_mode="full"`` only) and drops them
-after #8.
+pullback of :mod:`.cake_l2n` on the host, chunked by token blocks).  The saved set gains ``qk_rstd``
+(``KCP_SAVED_VERSION`` 2) and, with ``save_mode="full"``, the rows ``qn`` / ``kn`` (fresh tensors #1_l2n writes:
+the full backward binds them, so it launches no ``qk_apply``); otherwise ``qn`` / ``kn`` never outlive a call: the
+forward drops ``kn`` before its output and ``qn`` after #5 (a hand-off forward hands both over with its tapes
+instead); the backward gets them from #1_l2n again (light replay, replay mode), from the recompute forward's #1_l2n
+through the kept hand-off (the kept recompute tapes), from the full saved set, or -- a full saved set without them
+(test knob ``full_qk="apply"``) -- from ``qk_apply`` (``qn = bf16(q * r)`` from the saved ``r``, #1_l2n's row rule)
+and drops them after #8.
 The numeric orders are :mod:`.cake_l2n`'s (FTZ off), bitwise the device programs'.
 
 This module reads tensor contents nowhere (no ``.item()``, no ``.tolist()``
@@ -170,10 +172,11 @@ PROGRAMS = (
     "gate_epilogue",  # #9: dg from the partials (reverse cumsum + chunk term), dbeta pass-through
     "fwd_prep_l2n",  # #1 with the in-kernel Q / K L2 norm: qn / kn / rstd first, then #1's body on qn / kn
     "bwd_dqkg_l2n",  # #8 on qn / kn with the norm's pullback before the BF16 rounding of dq / dk (group_reduce = 1)
-    "qk_apply",  # qn = bf16(q * r), kn likewise, from the saved rstd (backward of save_mode="full")
+    "qk_apply",  # qn = bf16(q * r), kn likewise, from the saved rstd (full backward without saved rows)
 )
 # The in-kernel Q / K L2 norm programs (``use_qk_l2norm_in_kernel``): #1 and #8 run as their ``_l2n`` siblings, and
-# ``qk_apply`` rebuilds ``qn`` / ``kn`` where the backward has no #1 replay and no kept hand-off (save_mode="full").
+# ``qk_apply`` rebuilds ``qn`` / ``kn`` where the backward has no #1 replay, no kept hand-off and no saved rows (a
+# save_mode="full" set of the test knob full_qk="apply").
 L2N_PROGRAMS = ("fwd_prep_l2n", "bwd_dqkg_l2n", "qk_apply")
 LOCAL_PROGRAMS = (
     "fwd_prep",
@@ -195,8 +198,8 @@ TART_MODULE_OF = {
     "fwd_prep": "gdn_chunk_det_train_fwd_prep_v1",
     "kcp_fwdh_offset": "gdn_chunk_det_fwdh_v1_kcp",
     "kcp_fwdh_tape": "gdn_chunk_det_fwdh_v1_kcp",
-    "kcp_fwdh_out": "gdn_chunk_fwdh_out_v1_kcp",  # det-neutral: the non-det package ships the same module
-    "kcp_transfer_walk": "gdn_chunk_det_transfer_walk_v1_kcp",
+    "kcp_fwdh_out": "gdn_chunk_fwdh_out_v2_kcp",  # the v2 output walk (o bitwise v1), the module the non-det package ships
+    "kcp_transfer_walk": "gdn_chunk_det_transfer_walk_ez_v1_kcp",
     "kcp_affine_merge": "kda_chunk_kcp_affine_merge_fp32_v1",
     "fwd_o": "gdn_chunk_det_train_fwd_o_v1",
     "bwd_prep": "gdn_chunk_det_train_bwd_prep_v1",
@@ -205,6 +208,8 @@ TART_MODULE_OF = {
     "bwd_dqkg": "gdn_chunk_det_train_bwd_dqkg_v1",
     "gate_epilogue": "gdn_chunk_det_train_gate_epilogue_v1",
     "fwd_prep_l2n": "gdn_chunk_det_train_fwd_prep_l2n_v1",
+    # the forward form of #1_l2n (record fwd_prep_l2n_fwd): v1 without the backward-only akk / g_cum stores
+    "fwd_prep_l2n_fwd": "gdn_chunk_det_train_fwd_prep_l2n_v2",
     "bwd_dqkg_l2n": "gdn_chunk_det_train_bwd_dqkg_l2n_v1",
     "qk_apply": "gdn_chunk_det_train_qk_apply_v1",
 }
@@ -594,11 +599,13 @@ FWD_TAPES = (
 )
 BWD_TAPES = ("do_g", "dv_intra", "dh_tape", "dv_new", "dg_part", "gamma_dot")
 # In-kernel Q / K L2 norm: the normalized rows (BF16 ``[T_r, H_qk, 128]``, contiguous) and the FP32 ``r`` of q and k
-# (``[2, T_r, H_qk]``: plane 0 = q, plane 1 = k).  Arena tapes of the call that writes them (never saved): the forward
+# (``[2, T_r, H_qk]``: plane 0 = q, plane 1 = k).  Arena tapes of the call that writes them: the forward
 # drops ``kn`` before its output (the tape walks were its last readers) and ``qn`` after #5 -- a hand-off forward
 # (``reuse_recompute_tapes``) unbinds both instead and hands them to the backward with its tapes (``_KeptTapes.qk``);
 # the backward drops both with the arena ``qk_rstd`` after #8 (or the host reduction).  A forward that keeps a saved set writes a fresh
 # ``qk_rstd`` (the saved set's tensor, bound in ``CakeGDNDetKcpCall.bufs``); the light replay's #1_l2n writes the arena one.
+# A forward that keeps a ``save_mode="full"`` set writes the rows into fresh tensors too and saves them
+# (:func:`_saves_qk`; :attr:`CakeGDNDetKcpSaved.qk`): its backward binds them instead of launching ``qk_apply``.
 QK_TAPES: tuple[str, ...] = ("qn", "kn")
 QK_RSTD = "qk_rstd"
 # group_reduce="host" with the norm: the FP32 group sum and the pullback run per block of this many tokens (the same
@@ -715,6 +722,19 @@ LIGHT_TAPES: tuple[str, ...] = ()
 def saved_tapes(save_mode: str) -> tuple[str, ...]:
     """The tape names a saved set of ``save_mode`` carries (in :data:`FWD_TAPES` order)."""
     return FWD_TAPES if save_mode == "full" else LIGHT_TAPES
+
+
+def _saves_qk(opts: CakeGDNDetKcpOptions) -> bool:
+    """Whether a forward that keeps a saved set saves the normalized rows ``qn`` / ``kn`` (:data:`QK_TAPES`):
+    ``save_mode="full"`` with ``use_qk_l2norm_in_kernel`` (#1_l2n writes them into fresh tensors and the backward
+    binds them -- the full backward then launches nothing before #6); the test knob ``full_qk="apply"`` keeps the
+    form without them (the backward rebuilds them with ``qk_apply``, the same bits).  A rank without tokens saves
+    none, as it saves no tape."""
+    return (
+        bool(opts.use_qk_l2norm_in_kernel)
+        and opts.save_mode == "full"
+        and opts.knob("full_qk") == "saved"
+    )
 
 
 # Forward tapes an eager forward leaves bound in the workspace arena (#5 reads them; the others go at
@@ -1390,13 +1410,23 @@ def _public_args(args: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in args.items() if k[:1] != "_"}
 
 
+# the imported registry module (_registry), read on every call and launch
+_REGISTRY_MODULE: Any = None
+
+
 def _registry() -> Any | None:
-    """The package registry (:mod:`.cake_jit`: records, ``select_record``, ``launch_grid``), ``None`` without it."""
-    try:
-        from . import cake_jit  # noqa: PLC0415 - the registry; optional at import time
-    except ImportError:
-        return None
-    return cake_jit
+    """The package registry (:mod:`.cake_jit`: records, ``select_record``, ``launch_grid``), ``None`` without it.
+
+    Imported once: later reads return the module object without the import machinery (a failed import is retried
+    on the next read)."""
+    global _REGISTRY_MODULE
+    if _REGISTRY_MODULE is None:
+        try:
+            from . import cake_jit  # noqa: PLC0415 - the registry; optional at import time
+        except ImportError:
+            return None
+        _REGISTRY_MODULE = cake_jit
+    return _REGISTRY_MODULE
 
 
 # The registry answers of l2n_records_shipped / fused_o_shipped, derived once per registry identity: they are read on
@@ -1434,6 +1464,33 @@ def l2n_records_shipped() -> bool:
             return False
 
     return _registry_answer(("l2n",), jit, derive)
+
+
+def prep_form_shipped(arch: str | None = None) -> bool:
+    """Whether the registry ships the forward form of #1_l2n for ``arch`` (``None``: any architecture): a record of
+    ``fwd_prep_l2n`` selected by ``prep_form`` with ``backward_tapes`` False (``fwd_prep_l2n_fwd``: no ``akk`` /
+    ``g_cum`` output).  A forward launches it only then (:func:`_prep_backward_tapes`)."""
+    jit = _registry()
+    if jit is None:
+        return False
+
+    def derive() -> bool:
+        try:
+            names = jit.records_of_program("fwd_prep_l2n")
+        except ValueError:  # a registry that does not know the program
+            return False
+        for n in names:
+            rec = jit.MODULES[n]
+            rule = rec.get("select_rule", {})
+            if (
+                rule.get("kind") == "prep_form"
+                and rule.get("backward_tapes") is False
+                and (arch is None or arch in rec.get("arches", ()))
+            ):
+                return True
+        return False
+
+    return _registry_answer(("prep_form", arch), jit, derive)
 
 
 def fused_o_shipped(arch: str | None = None) -> bool:
@@ -1513,6 +1570,9 @@ def resolve_launch(
     if jit is not None and not explicit:
         per_head = 2 if vh == 64 else 1
         select = dict(ncols=values.get("ncols"), precision_mode=pm, transfer_walk=tw)
+        if args.get("_backward_tapes") is False:
+            # the forward form of #1_l2n (no akk / g_cum): requested only where prep_form_shipped()
+            select["backward_tapes"] = False
         try:
             record = str(jit.select_record(name, ctas_per_head=per_head, **select))
         except TypeError:  # a registry without the ctas_per_head select rule: the suffixed record, if any
@@ -1565,6 +1625,70 @@ def resolve_launch(
     if call is not None:
         call.records.append((str(record), grid))
     return str(record), values, grid, is_test
+
+
+def _launch_key(name: str, args: dict[str, Any], cols_per_cta: int, jit: Any) -> tuple:
+    """Every input :func:`resolve_launch` reads besides the launch's tensors: the registry's identity (module, record
+    table and its size), the program, the static knobs, the grid rule's arguments (in the call site's order), the
+    walk-form inputs (``_sm_count``, ``_fwdh_vh``, ``_vh64_fits``, ``_dhu_vh``, ``_arch``, ``_dhu_long_chain``), the
+    form of #1_l2n (``_backward_tapes``: the forward form ``fwd_prep_l2n_fwd`` or the full record), the merge's
+    columns and the caller's grid x.
+
+    The launch cache is valid only because :func:`resolve_launch` derives the record, the grid, the test flag and the
+    merge's ``cols_per_cta`` from these values and the registry alone and reads nothing from the launch's tensors: an
+    input added to :func:`resolve_launch` (a new grid-rule argument, for example) must be added to this key as well."""
+    grid_args = args.get("_grid_args")
+    modules = getattr(jit, "MODULES", None)
+    return (
+        name,
+        id(jit),
+        id(modules),
+        len(modules) if isinstance(modules, dict) else None,
+        args.get("_precision_mode"),
+        args.get("_transfer_walk"),
+        tuple(grid_args.items()) if grid_args else None,
+        args.get("_sm_count"),
+        args.get("_fwdh_vh"),
+        args.get("_vh64_fits"),
+        args.get("_dhu_vh"),
+        args.get("_arch"),
+        args.get("_dhu_long_chain"),
+        args.get("_backward_tapes"),
+        args.get("ncols"),
+        args.get("cols_per_cta"),
+        args.get("_grid"),
+        int(cols_per_cta),
+    )
+
+
+def _resolve_cached(
+    name: str, args: dict[str, Any], *, cols_per_cta: int = 8
+) -> tuple[str, dict[str, Any], tuple[int, int, int], bool]:
+    """:func:`resolve_launch` through the launch cache of the call's tables (``_Tables.launches``, one per context
+    plan): the record, the grid, the test flag and the merge's ``cols_per_cta`` of a launch key are resolved once;
+    every launch rebuilds its public values and appends ``(record, grid)`` to the call's records as
+    :func:`resolve_launch` does.  A key with an unhashable value resolves per launch."""
+    call = args.get("_call")
+    cache = getattr(getattr(call, "tb", None), "launches", None)
+    if cache is None:
+        return resolve_launch(name, args, cols_per_cta=cols_per_cta)
+    try:
+        key = _launch_key(name, args, cols_per_cta, _registry())
+        hit = cache.get(key)
+    except TypeError:  # an unhashable grid argument or knob
+        return resolve_launch(name, args, cols_per_cta=cols_per_cta)
+    if hit is None:
+        record, values, grid, is_test = resolve_launch(
+            name, args, cols_per_cta=cols_per_cta
+        )
+        cache[key] = (record, grid, is_test, values.get("cols_per_cta"))
+        return record, values, grid, is_test
+    record, grid, is_test, cols = hit
+    values = _public_args(args)
+    if cols is not None:
+        values["cols_per_cta"] = cols
+    call.records.append((record, grid))
+    return record, values, grid, is_test
 
 
 _L2N_NOT_SHIPPED = (
@@ -1633,7 +1757,7 @@ class KernelBackend(Backend):
         elif name in DHU_PROGRAMS:
             # the #7 width rule reads the architecture (dhu_vh)
             args = {**args, "_arch": be.device_arch(device_index)}
-        record, values, grid, is_test = resolve_launch(
+        record, values, grid, is_test = _resolve_cached(
             name, args, cols_per_cta=self.cols_per_cta
         )
         module = None
@@ -1673,7 +1797,7 @@ class FakeBackend(Backend):
     def run(self, name: str, args: dict[str, Any]) -> None:
         mod = self.module()
         call: CakeGDNDetKcpCall = args["_call"]
-        record, values, grid, _is_test = resolve_launch(name, args)
+        record, values, grid, _is_test = _resolve_cached(name, args)
         run_module = getattr(mod, "run_module", None)
         if (
             run_module is not None
@@ -1861,6 +1985,39 @@ def _prefix(values) -> list[int]:
 MEMO_MAX = 4096  # entries of a plan's walk-form memo (_Tables.memo) before it is cleared and rebuilt on use
 
 
+class _IndexedSpec:
+    """The static part of the :class:`Indexed` views a plan builds from one pair of its tables: the normalised
+    ``index`` / ``tiles`` tuples (the views' fields), the kernels' addressing of the tiles (derived at the first
+    :meth:`CakeGDNDetKcpCall.block`, by :meth:`Indexed.addressing`) and the device index table per device.  ``src``
+    holds the keyed source tuples, so their ids cannot be reused while the entry lives."""
+
+    __slots__ = ("src", "index", "tiles", "addr", "dev")
+
+    def __init__(self, index: tuple, tiles: tuple) -> None:
+        self.src = (index, tiles)
+        self.index = tuple(int(i) for i in index)
+        self.tiles = tuple(tuple(int(t) for t in row) for row in tiles)
+        self.addr: tuple[int, int, int, int] | None = None
+        self.dev: dict[torch.device, torch.Tensor] = {}
+
+
+def _chain_device_tables(
+    tb: Any, ch: Any, device: torch.device
+) -> tuple[torch.Tensor, ...]:
+    """The device tables of the merge chains ``ch`` (``chain_start`` int32; ``elem_m``, ``elem_c``, ``elem_y``,
+    ``x0_index``, ``y_final`` int64), cached by content on the head plan (:meth:`_Tables.dev`)."""
+    tag = ("chain", ch.content())
+    i64 = torch.int64
+    return (
+        tb.dev(tag + ("start",), ch.chain_start, device),
+        tb.dev(tag + ("m",), ch.elem_m, device, i64),
+        tb.dev(tag + ("c",), ch.elem_c, device, i64),
+        tb.dev(tag + ("y",), ch.elem_y, device, i64),
+        tb.dev(tag + ("x0",), ch.x0_index, device, i64),
+        tb.dev(tag + ("yf",), ch.y_final, device, i64),
+    )
+
+
 class _Tables:
     """Everything the launch sequences read for one ``(ctx, HV)``: the segment plan, walk lists, the compact tile
     tables of every pool, the collective splits and the merge chains, derived once from ``cake_kcp_plan.CakeGDNDetKcpContext``
@@ -1887,7 +2044,15 @@ class _Tables:
     ) -> None:
         self.ctx = ctx
         # host decisions of this plan derived at their first use (the walk lists' vh = 64 chain clause, walk_fits)
+        # and the launches' static pieces (host data, never a kernel argument value of its own): the normalised pool
+        # tables of CakeGDNDetKcpCall.indexed with their kernel addressing and device index tables
+        # (_IndexedSpec), the walk lists' and the merge chains' device tables, the zero block's index table and the
+        # collectives' split lists.  Every device table is the one ``dev`` returns (cached by content on the head
+        # plan), so a launch receives the very tensors it received before.
         self.memo: dict[tuple, Any] = {}
+        # launch key -> (record, grid, is_test, merge cols_per_cta): the launch cache of _resolve_cached (host data of
+        # this plan, filled at the first launch of each key)
+        self.launches: dict[tuple, tuple] = {}
         self.H = H = int(HV)  # every pool, split and chain is per VALUE head
         self.fused_walks = int(
             fused_walks
@@ -2462,6 +2627,64 @@ class _Tables:
         self.memo[key] = value
         return value
 
+    def indexed_spec(self, index: Any, tiles: Any) -> _IndexedSpec | None:
+        """The memo entry of an :class:`Indexed` view over the tables ``index`` / ``tiles`` -- keyed by the identity
+        of the two tuples (immutable; the entry holds them, so their ids stay theirs); ``None`` for any other type
+        (a list may change after its first use: such a view is derived per call as before)."""
+        if type(index) is not tuple or type(tiles) is not tuple:
+            return None
+        spec = self.memo.get(("ix", id(index), id(tiles)))
+        if spec is None:
+            spec = _IndexedSpec(index, tiles)
+            self._memo_put(("ix", id(index), id(tiles)), spec)
+            self._memo_put(("ixn", id(spec.index), id(spec.tiles)), spec)
+        return spec
+
+    def walk_table(self, walk: Sequence[int], device: torch.device) -> torch.Tensor:
+        """The int32 device table of the walk list ``walk`` (keyed by its content: the lists are short)."""
+        key = ("walk", tuple(walk), device)
+        hit = self.memo.get(key)
+        if hit is None:
+            hit = self._memo_put(key, self.dev("walk", [int(s) for s in walk], device))
+        return hit
+
+    def neg_index(self, device: torch.device) -> torch.Tensor:
+        """The zero block's ``[NSEG]`` index table (every entry ``-1``) on the device."""
+        key = ("neg", device)
+        t = self.memo.get(key)
+        if t is None:
+            t = self._memo_put(key, self.dev("neg", [-1] * int(self.NSEG), device))
+        return t
+
+    def chain_tables(
+        self, family: str, device: torch.device
+    ) -> tuple[torch.Tensor, ...]:
+        """The six device tables of the plan's merge chain family ``family`` (``chain_start`` int32; ``elem_m``,
+        ``elem_c``, ``elem_y``, ``x0_index``, ``y_final`` int64), uploaded in this order at first use."""
+        key = ("chain", family, device)
+        hit = self.memo.get(key)
+        if hit is None:
+            hit = self._memo_put(
+                key, _chain_device_tables(self, self.chains[family], device)
+            )
+        return hit
+
+    def split_lists(self, coll: str) -> tuple[list[int], list[int]]:
+        """:meth:`split_elems` of ``coll``, derived once (the caller must not mutate the lists)."""
+        key = ("split", coll)
+        hit = self.memo.get(key)
+        if hit is None:
+            hit = self._memo_put(key, self.split_elems(coll))
+        return hit
+
+    def pool_size_items(self, backward: bool) -> tuple[tuple[str, int], ...]:
+        """:meth:`pool_sizes` of ``backward`` as ``(name, elements)`` pairs, derived once."""
+        key = ("pool_sizes", bool(backward))
+        hit = self.memo.get(key)
+        if hit is None:
+            hit = self._memo_put(key, tuple(self.pool_sizes(backward).items()))
+        return hit
+
     def walk_fits(self, walk: Sequence[int], sm_count: int) -> bool:
         """:func:`walk_vh64_fits` of the walk list ``walk`` (its segments' chunk counts; keyed by its content like
         :meth:`walk_table`)."""
@@ -2585,6 +2808,43 @@ def _identity_tile(
     return t
 
 
+def _new_ticket_slots(device: torch.device) -> torch.Tensor:
+    """Zeroed u32 ticket slots of every persistent launch site (:data:`TICKET_SITES`), one 128-byte-aligned slot each."""
+    # one slot of slack, then the 128-byte-aligned view: the CUDA caching allocator hands out 512-byte-aligned
+    # blocks (offset 0), the CPU allocator only 64-byte-aligned ones (offset 0 or 16 words)
+    words = len(TICKET_SITES) * TICKET_SLOT_WORDS
+    base = torch.zeros((words + TICKET_SLOT_WORDS,), dtype=torch.uint32, device=device)
+    skew = (-base.data_ptr() % TICKET_SLOT_BYTES) // base.element_size()
+    return base[skew : skew + words]
+
+
+# The ticket slots the per-call workspaces of eager calls share, one buffer per (device index, raw CUDA stream).  A
+# persistent program leaves its word at zero (the self-resetting ticket), and every launch that reads a slot runs on
+# the stream the slots are keyed by, after the zeroing and after every earlier launch on that stream: the calls of one
+# stream use the slots one launch at a time, as the calls of one caller-held workspace do.  The first eager call on a
+# stream zeroes them (the launch order of that call is unchanged); later calls skip the per-call zeroing.
+_STREAM_TICKETS: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _stream_ticket_slots(device: torch.device) -> torch.Tensor | None:
+    """The shared ticket slots of the current stream of CUDA ``device``; ``None`` while that stream is capturing a
+    graph (a captured call keeps its own slots, as before)."""
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    raw = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    stream = (
+        int(raw(index))
+        if raw is not None
+        else int(torch.cuda.current_stream(index).cuda_stream)
+    )
+    key = (int(index), stream)
+    t = _STREAM_TICKETS.get(key)
+    if t is None:
+        t = _STREAM_TICKETS[key] = _new_ticket_slots(device)
+    return t
+
+
 def _chunk_tokens(ctx: Any, chunk_len: Sequence[int]) -> int:
     """The tokens the context's chunk table ``chunk_len`` covers (its sum; the in-kernel L2 norm's coverage check).
     A context's table is an immutable tuple: its sum is derived once and kept in the context's cache with the table
@@ -2650,7 +2910,14 @@ class CakeGDNDetKcpWorkspace:
         self._tickets: torch.Tensor | None = (
             None  # u32 [len(TICKET_SITES) * 32]: one 128-byte slot per site
         )
+        # the per-call workspace of an eager call (_prepare): its ticket slots are its stream's shared ones
+        # (_stream_ticket_slots); a caller's workspace keeps its own
+        self._shared_tickets = False
         self.geometry: tuple[int, int, int, int] | None = None  # (R, NC_pad, HV, T)
+        # an eager call's pool and ticket sizing, deferred by ensure(defer=True) until the call's first launch has been
+        # issued (CakeGDNDetKcpCall.kernel) or a pool is first read (a ticket read sizes the ticket slots alone):
+        # (tables, backward, skip, device)
+        self._pending: tuple | None = None
         # the Q / K head count of the in-kernel L2 norm tapes (QK_TAPES / QK_RSTD: [T, H_qk, ...]); the last ensure()'s
         self.qk_heads: int | None = None
         if ctx is not None:
@@ -2681,9 +2948,13 @@ class CakeGDNDetKcpWorkspace:
         fused_walks: int = 1,
         P: int | None = None,
         skip: Sequence[str] = (),
+        defer: bool = False,
     ) -> _Tables:
         """Size the pools for ``(ctx, HV)`` and bind the tape geometry; returns the tables (``P``: the segments
-        override of the plan).  ``skip``: pool names this call never touches (:func:`_prepare` passes the ring
+        override of the plan).  ``defer`` (eager calls): the pools and the ticket slots are sized by :meth:`settle`,
+        which runs after the call's first launch is issued (or at the first read of a pool, a ticket or the byte
+        counts, and at the end of the call), so their host work overlaps that launch's device time; the sizes, names
+        and contents are the same.  ``skip``: pool names this call never touches (:func:`_prepare` passes the ring
         pools under ``exchange="a2a"`` and the pools the call replaces with fresh / saved tensors, ``c1_recv`` under
         ``save_transfer`` and ``stage_m`` when the saved set carries ``M_seg``); a skipped pool is not allocated, a
         held one is left as it is, and a later ``ensure()`` without the name sizes it.  A workspace built from
@@ -2698,28 +2969,12 @@ class CakeGDNDetKcpWorkspace:
                 f"CakeGDNDetKcpWorkspace: lives on {self.device}, the call is on {device}"
             )
         validate_heads(H_qk, HV)
+        self.settle()  # an earlier call's deferred sizing first (same order as an undeferred ensure)
         tb = self.tables(ctx, HV, fused_walks=fused_walks, P=P)
-        for name, n in tb.pool_sizes(backward).items():
-            if name in skip:
-                continue
-            cur = self._pools.get(name)
-            if cur is None or cur.numel() < n:
-                self._pools[name] = (
-                    _identity_tile(ctx, n, self.state_dtype, device)
-                    if name == "eye"
-                    else _alloc((n,), self.state_dtype, device)
-                )
-        if (
-            self._tickets is None
-        ):  # once per workspace: the kernels keep every word at zero afterwards
-            # one slot of slack, then the 128-byte-aligned view: the CUDA caching allocator hands out 512-byte-aligned
-            # blocks (offset 0), the CPU allocator only 64-byte-aligned ones (offset 0 or 16 words)
-            words = len(TICKET_SITES) * TICKET_SLOT_WORDS
-            base = torch.zeros(
-                (words + TICKET_SLOT_WORDS,), dtype=torch.uint32, device=device
-            )
-            skew = (-base.data_ptr() % TICKET_SLOT_BYTES) // base.element_size()
-            self._tickets = base[skew : skew + words]
+        if defer:
+            self._pending = (tb, bool(backward), tuple(skip), device)
+        else:
+            self._size_pools(tb, backward, skip, device)
         geometry = (int(ctx.R), int(ctx.NC_pad), int(HV), int(ctx.T_r))
         if self.geometry != geometry:
             self._tapes.clear()  # another padded geometry: the tapes are reallocated on first use
@@ -2730,6 +2985,37 @@ class CakeGDNDetKcpWorkspace:
             self.qk_heads = int(H_qk)
         return tb
 
+    def _size_pools(
+        self, tb: _Tables, backward: bool, skip: Sequence[str], device: torch.device
+    ) -> None:
+        for name, n in tb.pool_size_items(backward):
+            if name in skip:
+                continue
+            cur = self._pools.get(name)
+            if cur is None or cur.numel() < n:
+                self._pools[name] = (
+                    _identity_tile(tb.ctx, n, self.state_dtype, device)
+                    if name == "eye"
+                    else _alloc((n,), self.state_dtype, device)
+                )
+        self._size_tickets(device)
+
+    def _size_tickets(self, device: torch.device) -> None:
+        if (
+            self._tickets is None
+        ):  # once per workspace: the kernels keep every word at zero afterwards
+            if self._shared_tickets and device.type == "cuda":
+                self._tickets = _stream_ticket_slots(device)
+            if self._tickets is None:
+                self._tickets = _new_ticket_slots(device)
+
+    def settle(self) -> None:
+        """Size the pools and ticket slots an ``ensure(defer=True)`` left pending (no-op otherwise)."""
+        pending = self._pending
+        if pending is not None:
+            self._pending = None
+            self._size_pools(*pending)
+
     def ticket(self, site: str) -> torch.Tensor:
         """The 128-byte u32 ticket slot of persistent launch site ``site`` (one of :data:`TICKET_SITES`): the
         kernel's ``ticket`` argument, zero before and after every launch, never read on the host."""
@@ -2737,6 +3023,10 @@ class CakeGDNDetKcpWorkspace:
             raise KeyError(
                 f"CakeGDNDetKcpWorkspace: {site!r} is not a persistent launch site {TICKET_SITES}"
             )
+        if self._tickets is None and self._pending is not None:
+            # a persistent program's slot before the deferred pools: a call whose first launch is persistent (the
+            # backward's #6 on saved or kept tapes) sizes the slots alone and still issues that launch before the pools
+            self._size_tickets(self._pending[3])
         if self._tickets is None:
             raise KeyError(
                 "CakeGDNDetKcpWorkspace: no ticket slots yet (ensure() first)"
@@ -2745,6 +3035,8 @@ class CakeGDNDetKcpWorkspace:
         return self._tickets[i : i + TICKET_SLOT_WORDS]
 
     def pool(self, name: str, n: int | None = None) -> torch.Tensor:
+        if self._pending is not None:
+            self.settle()
         t = self._pools.get(name)
         if t is None:
             if n not in (None, 0) or self.device is None:
@@ -2752,13 +3044,18 @@ class CakeGDNDetKcpWorkspace:
                     f"CakeGDNDetKcpWorkspace: pool {name!r} was not sized for this call (ensure() first)"
                 )
             t = self._pools[name] = _alloc((0,), self.state_dtype, self.device)
-        return t if n is None else t[:n]
+        # a pool of exactly ``n`` elements is its own first-``n`` view (same storage, offset, shape and stride)
+        return t if n is None or t.numel() == n else t[:n]
 
     def has(self, name: str) -> bool:
+        if self._pending is not None:
+            self.settle()
         return name in self._pools
 
     def release_pool(self, name: str) -> bool:
         """Drop pool ``name`` (sized again by the next ``ensure``); ``True`` when it was held."""
+        if self._pending is not None:
+            self.settle()
         return self._pools.pop(name, None) is not None
 
     def tape(self, name: str) -> torch.Tensor:
@@ -2804,6 +3101,7 @@ class CakeGDNDetKcpWorkspace:
 
     @property
     def bytes(self) -> int:
+        self.settle()
         return (
             sum(t.numel() * t.element_size() for t in self._pools.values())
             + self.tape_bytes
@@ -2812,6 +3110,7 @@ class CakeGDNDetKcpWorkspace:
 
     @property
     def ticket_bytes(self) -> int:
+        self.settle()
         t = self._tickets
         return 0 if t is None else t.numel() * t.element_size()
 
@@ -2821,6 +3120,7 @@ class CakeGDNDetKcpWorkspace:
 
     @property
     def pool_bytes(self) -> dict[str, int]:
+        self.settle()
         return {k: t.numel() * t.element_size() for k, t in self._pools.items()}
 
 
@@ -2835,7 +3135,9 @@ class CakeGDNDetKcpSaved:
     tapes of the ``save_mode`` (:func:`saved_tapes`: none in ``"light"``, every forward tape in ``"full"``) and the
     scalars of the call.  With ``use_qk_l2norm_in_kernel`` (``qk_l2norm``) it also carries ``qk_rstd``, the FP32
     ``r`` of q and k ``[2, T_r, H_qk]`` (after the tapes in :meth:`tensors`; its presence follows
-    ``meta()["qk_l2norm"]``, so :meth:`flags` keeps its three entries).  Every
+    ``meta()["qk_l2norm"]``, so :meth:`flags` keeps its three entries), and in ``save_mode="full"`` (:func:`_saves_qk`)
+    ``qk``, the normalized rows ``(qn, kn)`` (BF16 ``[T_r, H_qk, 128]`` each; between the tapes and ``qk_rstd`` in
+    :meth:`tensors`; presence ``meta()["qk_saved"]``).  Every
     tensor is fresh per call and travels through ``save_for_backward`` only (#7039).  ``kept`` (never saved, never
     compared: not in ``tensors()`` / ``flags()`` / ``meta()``) is the recompute forward's tape hand-off of
     ``reuse_recompute_tapes`` on its way through the autograd Function's backward; ``None`` everywhere else."""
@@ -2861,6 +3163,9 @@ class CakeGDNDetKcpSaved:
     ctx: Any
     qk_rstd: torch.Tensor | None = None
     qk_l2norm: bool = False
+    # save_mode="full" with the norm (_saves_qk): the forward's qn / kn (QK_TAPES order); qk_saved = their presence
+    qk: tuple[torch.Tensor, ...] | None = None
+    qk_saved: bool = False
     kept: Any = dataclasses.field(default=None, compare=False, repr=False)
     # The backward may forget ``S_in`` / ``c1_recv`` / ``M_seg`` at their last reader (:meth:`forget`): set by the
     # autograd Function on the set it rebuilds from ``save_for_backward`` (nothing else references those tensors
@@ -2877,6 +3182,8 @@ class CakeGDNDetKcpSaved:
             out.append(self.M_seg)
         if self.tapes is not None:
             out.extend(self.tapes)
+        if self.qk_saved:
+            out.extend(self.qk)
         if self.qk_l2norm:
             out.append(self.qk_rstd)
         return tuple(out)
@@ -2905,6 +3212,7 @@ class CakeGDNDetKcpSaved:
             "precision_mode": self.precision_mode,
             "transfer_walk": self.transfer_walk,
             "qk_l2norm": self.qk_l2norm,
+            "qk_saved": self.qk_saved,
         }
 
     @classmethod
@@ -2925,6 +3233,7 @@ class CakeGDNDetKcpSaved:
             if has_tapes
             else None
         )
+        qk = tuple(next(it) for _ in QK_TAPES) if meta.get("qk_saved") else None
         qk_rstd = next(it) if meta.get("qk_l2norm") else None
         return cls(
             S_in=S_in,
@@ -2933,10 +3242,13 @@ class CakeGDNDetKcpSaved:
             tapes=tapes,
             ctx=ctx,
             qk_rstd=qk_rstd,
+            qk=qk,
             **meta,
         )
 
     def tape(self, name: str) -> torch.Tensor:
+        if name in QK_TAPES and self.qk is not None:
+            return self.qk[QK_TAPES.index(name)]
         names = saved_tapes(self.save_mode)
         if self.tapes is None or name not in names:
             raise KeyError(
@@ -3083,6 +3395,9 @@ class CakeGDNDetKcpCall:
     def indexed(
         self, pool: str, index: Sequence[int], tiles: Sequence[Sequence[int]]
     ) -> Indexed:
+        spec = self.tb.indexed_spec(index, tiles)
+        if spec is not None:  # the plan's own tables: normalised once
+            return Indexed(self.buf(pool), spec.index, spec.tiles)
         return Indexed(
             self.buf(pool),
             tuple(int(i) for i in index),
@@ -3163,16 +3478,33 @@ class CakeGDNDetKcpCall:
     def block(self, ix: Indexed | None) -> _Block:
         """The kernel's view of an :class:`Indexed` pool; ``None`` (or no slot) = the zero state: every index ``-1``
         and a never-read base pointer."""
-        nseg = int(self.tb.NSEG)
+        tb = self.tb
+        nseg = int(tb.NSEG)
         if ix is None or ix.n_slots == 0:
-            return _Block(self.buf("eye"), self.dev("neg", [-1] * nseg), self.H, 1, 1)
-        base_tile, hg, n, stride = ix.addressing(self.H)
+            return _Block(self.buf("eye"), tb.neg_index(self.device), self.H, 1, 1)
+        # a view from indexed() over the plan's own tables: its addressing and index table are derived once
+        spec = tb.memo.get(("ixn", id(ix.index), id(ix.tiles)))
+        if spec is None:
+            base_tile, hg, n, stride = ix.addressing(self.H)
+        else:
+            if spec.addr is None:
+                spec.addr = ix.addressing(self.H)
+            base_tile, hg, n, stride = spec.addr
         if len(ix.index) != nseg:
             raise ValueError(
                 f"Indexed: {len(ix.index)} segment entries, the plan has NSEG = {nseg}"
             )
-        ptr = ix.pool.view(-1)[base_tile * TILE :] if base_tile else ix.pool.view(-1)
-        return _Block(ptr, self.dev("index", ix.index), int(hg), int(n), int(stride))
+        # a flat pool (every workspace pool and per-call stand-in is 1-D) is its own flat view: same storage, offset,
+        # shape and stride, without building another tensor per block
+        pool = ix.pool if ix.pool.dim() == 1 else ix.pool.view(-1)
+        ptr = pool[base_tile * TILE :] if base_tile else pool
+        if spec is None:
+            index_t = self.dev("index", ix.index)
+        else:
+            index_t = spec.dev.get(self.device)
+            if index_t is None:
+                index_t = spec.dev[self.device] = self.dev("index", ix.index)
+        return _Block(ptr, index_t, int(hg), int(n), int(stride))
 
     # -- launches
     def kernel(self, name: str, grid: int, **args: Any) -> None:
@@ -3186,6 +3518,12 @@ class CakeGDNDetKcpCall:
             self._deferred.append((name, args))
             return
         self.backend.run(name, args)
+        ws = getattr(
+            self, "ws", None
+        )  # (a test's stand-in call may carry no workspace)
+        if ws is not None and ws._pending is not None:
+            # S4: the pools and ticket slots of this eager call are sized now, under the first launch's device time
+            ws.settle()
 
     def _walk_common(self, walk: Sequence[int]) -> dict[str, Any]:
         tb = self.tb
@@ -3194,7 +3532,9 @@ class CakeGDNDetKcpCall:
             "num_qk_heads": self.H_qk,
             "seg_chunk_start": tb.seg_table(self.device),
             "num_seqs": int(tb.NSEG),
-            "walk_seg": self.dev("walk", walk),
+            "walk_seg": tb.walk_table(
+                walk, self.device
+            ),  # the plan's memo (content-keyed device table)
             "chunk_bos": self.ctx.tables["chunk_bos"],
             "chunk_len": self.ctx.tables["chunk_len"],
         }
@@ -3352,8 +3692,12 @@ class CakeGDNDetKcpCall:
         x0 = (
             self.buf(spec["x0"]) if spec["x0"] else y
         )  # never read when every x0_index is -1
-        tag = ("chain", ch.content())
-        i64 = torch.int64
+        # the plan's own family: its tables from the plan's memo; explicit chains (the ring's): derived per call
+        start, elem_m, elem_c, elem_y, x0_index, y_final = (
+            self.tb.chain_tables(family, self.device)
+            if chains is None
+            else _chain_device_tables(self.tb, ch, self.device)
+        )
         self.kernel(
             "kcp_affine_merge",
             ch.n_chains * (ch.ncols // cols_eff),
@@ -3363,12 +3707,12 @@ class CakeGDNDetKcpCall:
             c=c,
             x0=x0,
             y=y,
-            chain_start=self.dev(tag + ("start",), ch.chain_start),
-            elem_m=self.dev(tag + ("m",), ch.elem_m, i64),
-            elem_c=self.dev(tag + ("c",), ch.elem_c, i64),
-            elem_y=self.dev(tag + ("y",), ch.elem_y, i64),
-            x0_index=self.dev(tag + ("x0",), ch.x0_index, i64),
-            y_final=self.dev(tag + ("yf",), ch.y_final, i64),
+            chain_start=start,
+            elem_m=elem_m,
+            elem_c=elem_c,
+            elem_y=elem_y,
+            x0_index=x0_index,
+            y_final=y_final,
             ncols=int(ch.ncols),
             transpose_m=int(spec["tm"]),
             write_states=int(spec["ws"]),
@@ -3412,11 +3756,13 @@ class CakeGDNDetKcpCall:
             ),  # K4: seq_chunk_start[num_seqs] = the real chunk count on the device
         }
 
-    def local(self, name: str) -> None:
+    def local(self, name: str, *, backward_tapes: bool = True) -> None:
         """A chunk-local program (#1, #5, #6, #8, #9, ``qk_apply``) over this rank's tokens (skipped without
         tokens).  With ``use_qk_l2norm_in_kernel`` ``fwd_prep`` launches ``fwd_prep_l2n`` and the fused
         ``bwd_dqkg`` launches ``bwd_dqkg_l2n`` (:data:`L2N_SIBLING_OF`); ``group_reduce="host"`` keeps #8 itself
-        (on ``qn`` / ``kn``) and applies the pullback in :meth:`host_group_reduce`."""
+        (on ``qn`` / ``kn``) and applies the pullback in :meth:`host_group_reduce`.  ``backward_tapes`` False
+        (``fwd_prep_l2n`` only, from :func:`_prep_backward_tapes`): the forward form ``fwd_prep_l2n_fwd``, which
+        writes no ``akk`` / ``g_cum`` (neither tape is bound)."""
         if self.T_r == 0:
             return
         if name not in LOCAL_PROGRAMS or name in L2N_SIBLING_OF.values():
@@ -3431,6 +3777,7 @@ class CakeGDNDetKcpCall:
         o, NC = self.ops, int(self.ctx.NC)
         args = self._local_common()
         if name == "fwd_prep":
+            fwd_form = program == "fwd_prep_l2n" and not backward_tapes
             args.update(
                 q=o["q"],  # #1 / #1_l2n read the raw rows
                 k=o["k"],
@@ -3441,12 +3788,15 @@ class CakeGDNDetKcpCall:
                 w=self.tape("w"),
                 u=self.tape("u"),
                 aqk=self.tape("aqk"),
-                akk=self.tape("akk"),
-                g_cum=self.tape("g_cum"),
                 rowscale=self.tape("rowscale"),
                 qscale=self.tape("qscale"),
                 gamma=self.tape("gamma"),
             )
+            if fwd_form:
+                # the forward form: no akk / g_cum output, so neither arena tape is bound by this call
+                args["_backward_tapes"] = False
+            else:
+                args.update(akk=self.tape("akk"), g_cum=self.tape("g_cum"))
             if program == "fwd_prep_l2n":
                 rstd = self.rstd_out()
                 args.update(
@@ -3630,8 +3980,13 @@ class CakeGDNDetKcpCall:
             raise ValueError(
                 f"{tag}: split lists must have one entry per rank ({self.world})"
             )
-        send = self.buf(send_name)[: sum(send_splits)]
-        recv = self.buf(recv_name)[: sum(recv_splits)]
+        send, recv = self.buf(send_name), self.buf(recv_name)
+        n_send, n_recv = sum(send_splits), sum(recv_splits)
+        # a buffer of exactly the exchanged size is its own leading view (same storage, offset, shape, stride)
+        if send.numel() != n_send:
+            send = send[:n_send]
+        if recv.numel() != n_recv:
+            recv = recv[:n_recv]
         self.counters["collectives"] += 1
         self._sequence(tag)
         if self.world == 1 or not (dist.is_available() and dist.is_initialized()):
@@ -3697,6 +4052,11 @@ def saved_states(saved: CakeGDNDetKcpSaved) -> torch.Tensor:
 
 def _record(kind: str, call: CakeGDNDetKcpCall) -> None:
     """The launch inventory of the last forward / backward (evidence)."""
+    ws = call.ws
+    # the byte counts once each: workspace_bytes is the pools' sum + the tapes + the ticket slots (CakeGDNDetKcpWorkspace.bytes)
+    pool_bytes = ws.pool_bytes
+    tape_bytes = ws.tape_bytes
+    workspace_bytes = sum(pool_bytes.values()) + tape_bytes + ws.ticket_bytes
     LAST_CALL[kind] = {
         **{f"n_{k}": v for k, v in call.counters.items()},
         "sequence": list(call.sequence),
@@ -3712,9 +4072,9 @@ def _record(kind: str, call: CakeGDNDetKcpCall) -> None:
         "H_qk": call.H_qk,
         "HV": call.HV,
         "T_r": call.T_r,
-        "workspace_bytes": call.ws.bytes,
-        "pool_bytes": call.ws.pool_bytes,
-        "tape_bytes": call.ws.tape_bytes,
+        "workspace_bytes": workspace_bytes,
+        "pool_bytes": pool_bytes,
+        "tape_bytes": tape_bytes,
         "fresh_bytes": {k: t.numel() * t.element_size() for k, t in call.bufs.items()},
         "precision_mode": call.precision_mode,
         "transfer_walk": call.transfer_walk,
@@ -3757,9 +4117,9 @@ def _record(kind: str, call: CakeGDNDetKcpCall) -> None:
             "recompute_handle"
         ),  # forward: None | "capture" (stored S_in in the handle) | "replay" (S_in from the handle, no exchange)
         "qk_l2norm": call.l2n,  # use_qk_l2norm_in_kernel
-        # where qn / kn came from: forward "fwd_prep" (#1_l2n); backward "recompute" (the replay mode's forward),
+        # where qn / kn came from: forward "fwd_prep" (#1_l2n); backward "saved" (a full saved set's rows), "recompute" (the replay mode's forward),
         # "replay" (the light replay's #1_l2n), "kept" (the recompute forward's #1_l2n, handed over with the kept
-        # tapes) or "qk_apply" (save_mode="full"); None without the norm
+        # tapes) or "qk_apply" (a save_mode="full" set without rows: test knob full_qk="apply"); None without the norm
         "qk_source": call.scratch.get("qk_source"),
         # the r #1_l2n wrote (forward: "fresh" = the saved set's tensor, "arena") / the pullback read (backward:
         # "saved", "arena" in the replay mode); None without the norm
@@ -4171,6 +4531,36 @@ def _fuse_o_enabled(call: CakeGDNDetKcpCall) -> bool:
     return fused_o_shipped(arch)
 
 
+def _prep_backward_tapes(
+    call: CakeGDNDetKcpCall, *, replay: bool, hand_off: bool, keep: bool
+) -> bool:
+    """Whether this forward's #1 writes the backward-only ``akk`` / ``g_cum`` (the full ``fwd_prep_l2n`` record):
+    ``True`` unless every reader of those tapes takes them from elsewhere -- a replay-mode backward's forward
+    (``replay``) and a hand-off forward (``reuse_recompute_tapes``) give them to #6 / #8, and a saved set that keeps
+    them (``save_mode="full"``) carries this launch's planes; every other forward (no grad, the light save's forward,
+    whose backward re-runs #1, the checkpoint's first forward and a non-hand-off recompute) runs the forward form
+    ``fwd_prep_l2n_fwd`` when test knob ``prep_form`` = 1 (shipped), the call runs the in-kernel L2 norm and the
+    registry ships that record for the device's architecture (:func:`prep_form_shipped`)."""
+    if replay or hand_off:
+        return True
+    if keep and (
+        "akk" in saved_tapes(call.opts.save_mode)
+        or "g_cum" in saved_tapes(call.opts.save_mode)
+    ):
+        return True
+    if not call.l2n or call.T_r == 0 or int(call.opts.knob("prep_form")) != 1:
+        return True
+    arch = None
+    if isinstance(call.backend, KernelBackend) and call.device.type == "cuda":
+        index = (
+            call.device.index
+            if call.device.index is not None
+            else torch.cuda.current_device()
+        )
+        arch = call.backend.launcher().device_arch(index)
+    return not prep_form_shipped(arch)
+
+
 def _fuse_o(call: CakeGDNDetKcpCall, *, launch: bool, hand_off: bool) -> bool:
     """Whether this forward runs the output walk ``kcp_fwdh_out`` on every tape-walk launch list in place of the tape
     walk and #5: #5 launches, the tapes go to no backward (not a hand-off forward), the rank holds tokens and
@@ -4357,10 +4747,13 @@ def _forward(
     replay: bool,
     hand_off: bool = False,
     s_in: torch.Tensor | None = None,
-    fuse_o: bool = False,
-) -> None:
+    fuse_o: bool | Callable[[], bool] = False,
+) -> bool:
     """The forward sequence.  ``fuse_o``: every tape-walk launch runs the output walk ``kcp_fwdh_out`` on its launch
-    list instead (``o`` written in the walk, no ``h`` / ``v_new`` tape; :func:`_fuse_o`).  ``save``: the saved set is
+    list instead (``o`` written in the walk, no ``h`` / ``v_new`` tape; :func:`_fuse_o`); a callable is the decision
+    itself, taken right after #1 is issued (its host work runs under #1's device time; no launch before the first
+    walk reads it) -- or before #1 when a captured call or a held ``h`` / ``v_new`` tape needs it there.  Returns the
+    decision.  ``save``: the saved set is
     kept (fresh ``S_in``; with ``save_transfer`` also the c1 receive tensor; ``M_seg`` at ``P > 1`` with
     ``save_transfer`` or ``save_mode="full"``; with ``save_mode="full"`` fresh forward tapes); ``replay``: the forward
     of a replay-mode backward (no ``fwd_o``, nothing kept); ``hand_off``: the forward tapes go to the backward of this
@@ -4373,16 +4766,14 @@ def _forward(
     read only ``c1_recv`` / the staging planes and the tapes read no collective buffer, so every published bit is the
     same under either schedule."""
     tb, opts = call.tb, call.opts
-    if fuse_o and (hand_off or replay):
-        raise ValueError(
-            "fuse_o: a hand-off or replay forward writes the tapes its backward reads"
-        )
-    # the walk every tape-walk launch site of this forward runs
-    walk_program = "kcp_fwdh_out" if fuse_o else "kcp_fwdh_tape"
-    if fuse_o and opts.graph == "off":
-        # a caller-held arena may still bind the h / v_new tapes a split forward or a kept backward left
-        # (FWD_TAPES_ARENA_AFTER_FWD): this forward writes neither, so they go before #1
-        call.release_tapes(("h_tape", "v_new"))
+    held = getattr(call.ws, "_tapes", None)
+    if callable(fuse_o) and (
+        opts.graph != "off" or held is None or "h_tape" in held or "v_new" in held
+    ):
+        # decided before #1: a captured call, or a held h / v_new tape this forward may have to drop first
+        fuse_o = bool(fuse_o())
+    if not callable(fuse_o):
+        _forward_fuse_o(call, fuse_o, hand_off=hand_off, replay=replay)
     # before the first launch: the backend record reads it
     call.scratch["hand_off"] = bool(hand_off)
     wait_first = call.schedule == "wait_first"
@@ -4400,6 +4791,9 @@ def _forward(
         keep
     ):  # the saved tapes are fresh per call (light: none; full: every forward tape)
         call.fresh_tapes(saved_tapes(opts.save_mode))
+        if _saves_qk(opts):
+            # full with the norm: #1_l2n writes qn / kn into fresh tensors, saved for the backward (no qk_apply)
+            call.fresh_tapes(QK_TAPES)
     if call.l2n:
         # the saved set's r: fresh, written by #1_l2n directly (the arena r of a forward without a saved set and of
         # the replay-mode forward is dropped after #1 / kept for the pullback)
@@ -4412,7 +4806,16 @@ def _forward(
             call.scratch["rstd_source"] = "arena"
         else:
             call.scratch["rstd_source"] = "fresh" if keep else "arena"
-    call.local("fwd_prep")
+    backward_tapes = _prep_backward_tapes(
+        call, replay=replay, hand_off=hand_off, keep=keep
+    )
+    call.scratch["prep_form"] = "full" if backward_tapes else "fwd"
+    call.local("fwd_prep", backward_tapes=backward_tapes)
+    if callable(fuse_o):
+        fuse_o = bool(fuse_o())
+        _forward_fuse_o(call, fuse_o, hand_off=hand_off, replay=replay)
+    # the walk every tape-walk launch site of this forward runs
+    walk_program = "kcp_fwdh_out" if fuse_o else "kcp_fwdh_tape"
     if call.l2n and call.opts.knob("record_qk") and not call.backward:
         _record_qk(call)
     if call.l2n and not replay and opts.graph == "off":
@@ -4429,7 +4832,7 @@ def _forward(
         _replay_from_states(call, have_m=False, program=walk_program)
         if call.opts.knob("record_states"):
             call.scratch["states"] = {"S_in": gather_states(s_in, tb.s_in_tiles)}
-        return
+        return fuse_o
     _summaries(call)
     # the c1 receive tensor and S_in (the c2 receive buffer) are first written by their collectives: allocated after
     # the summaries' walks (the forward's peak moment), not at the top of the sequence where they would sit unwritten
@@ -4453,7 +4856,7 @@ def _forward(
         started_early = not wait_first and not hand_off
         _ring_forward(call, walk_starts=started_early, program=walk_program)
     else:
-        w1 = call.a2a("c1", "c1_send", "c1_recv", *tb.split_elems("c1"))
+        w1 = call.a2a("c1", "c1_send", "c1_recv", *tb.split_lists("c1"))
         if not wait_first:
             if tb.P > 1:
                 call.merge(
@@ -4480,7 +4883,7 @@ def _forward(
             # plane exists from here to wait(c2) only, not across the whole forward
             call.fresh("c2_send")
         call.merge("fwd")  # the owner's chains: S_in slices into the c2 send layout
-        w2 = call.a2a("c2", "c2_send", "S_in", *tb.split_elems("c2"))
+        w2 = call.a2a("c2", "c2_send", "S_in", *tb.split_lists("c2"))
         call.wait(w2)
         w2 = None
         # sent: a fresh plane goes now (a workspace pool stays until FWD_DEAD_POOLS)
@@ -4507,6 +4910,23 @@ def _forward(
         }
     # #5 is launched by _fwd_body (never in a replay; not by a recompute whose output is provably dead) once this
     # frame and its views of the pools are gone
+    return fuse_o
+
+
+def _forward_fuse_o(
+    call: CakeGDNDetKcpCall, fuse_o: bool, *, hand_off: bool, replay: bool
+) -> None:
+    """The checks and the arena step of a forward's ``fuse_o`` decision (:func:`_forward`, before #1 or right after
+    it is issued)."""
+    if fuse_o and (hand_off or replay):
+        raise ValueError(
+            "fuse_o: a hand-off or replay forward writes the tapes its backward reads"
+        )
+    if fuse_o and call.opts.graph == "off":
+        # a caller-held arena may still bind the h / v_new tapes a split forward or a kept backward left
+        # (FWD_TAPES_ARENA_AFTER_FWD): this forward writes neither, so they go before #1 (a deferred decision is
+        # taken after #1 only when neither is bound)
+        call.release_tapes(("h_tape", "v_new"))
 
 
 def _record_qk(call: CakeGDNDetKcpCall, regen: bool = False) -> None:
@@ -4662,6 +5082,12 @@ def _backward(call: CakeGDNDetKcpCall, saved: CakeGDNDetKcpSaved | None) -> None
                 for name, t in zip(FWD_TAPES, saved.tapes, strict=True):
                     call.tapes[name] = t
             call.scratch["tapes_source"] = "saved"
+            if call.l2n and saved.qk is not None:
+                # the forward's qn / kn (its #1_l2n wrote them into the saved set): bound as they are, so the
+                # backward launches no qk_apply (no program re-reads the raw Q / K rows to normalize them)
+                for name, t in zip(QK_TAPES, saved.qk, strict=True):
+                    call.tapes[name] = t
+                call.scratch["qk_source"] = "saved"
         elif kept is not None:
             # the recompute forward's tapes of this graph task (reuse_recompute_tapes): the full-mode form on them;
             # the handed-over stage_m plane stands in for the saved M_seg^T when the saved set carries none
@@ -4682,9 +5108,13 @@ def _backward(call: CakeGDNDetKcpCall, saved: CakeGDNDetKcpSaved | None) -> None
             if call.l2n:
                 call.scratch["qk_source"] = "replay"
     call.local("bwd_prep")
-    if call.l2n and call.scratch.get("tapes_source") == "saved":
-        # save_mode="full": no #1 replay and no hand-off: qn / kn from the raw rows and the saved r (bitwise
-        # #1_l2n's), before the first q / k reader
+    if (
+        call.l2n
+        and call.scratch.get("tapes_source") == "saved"
+        and call.scratch.get("qk_source") != "saved"
+    ):
+        # save_mode="full" without saved rows (test knob full_qk="apply"): no #1 replay and no hand-off: qn / kn from
+        # the raw rows and the saved r (bitwise #1_l2n's), before the first q / k reader
         call.local("qk_apply")
         call.scratch["qk_source"] = "qk_apply"
     if call.l2n and call.opts.knob("record_qk"):
@@ -4741,7 +5171,7 @@ def _backward(call: CakeGDNDetKcpCall, saved: CakeGDNDetKcpSaved | None) -> None
         merged_end = ended_early and tb.P > 1
         _ring_backward(call, walk_ends=ended_early)
     else:
-        wb1 = call.a2a("b1", "b1_send", "b1_recv", *tb.split_elems(f"b1_{form}"))
+        wb1 = call.a2a("b1", "b1_send", "b1_recv", *tb.split_lists(f"b1_{form}"))
         call.wait(wb1)
         wb1 = None
         call.merge(
@@ -4751,7 +5181,7 @@ def _backward(call: CakeGDNDetKcpCall, saved: CakeGDNDetKcpSaved | None) -> None
             call.release_pools(BWD_DEAD_AFTER_ADJ_MERGE)
             # the saved c1 receive tensor: the adjoint merge was its last reader
             call.drop_bound("c1_recv", saved)
-        wb2 = call.a2a("b2", "b2_send", "b2_recv", *tb.split_elems("b2"))
+        wb2 = call.a2a("b2", "b2_send", "b2_recv", *tb.split_lists("b2"))
         if not wait_first:
             if tb.P > 1:
                 call.merge("dcarry_end")  # reads the staging planes only
@@ -4893,6 +5323,9 @@ def _sig(t: Any) -> tuple:
 def _arena_sig(ws: Any) -> tuple:
     """(name, pointer, size) of every pool and tape buffer of the workspace arena, in name order, and of the ticket
     slots (one buffer; a capture bakes their addresses like the pools')."""
+    settle = getattr(ws, "settle", None)
+    if settle is not None:
+        settle()
     tickets = getattr(ws, "_tickets", None)
     return (
         tuple(sorted((n, t.data_ptr(), t.numel()) for n, t in ws._pools.items())),
@@ -5038,6 +5471,9 @@ def _prepare(
         _check(dout, "dout", (T, HV, D), backend.dtypes["dout"], device)
     if workspace is None:
         workspace = CakeGDNDetKcpWorkspace(state_dtype=backend.dtypes["state"])
+        # an eager call's own workspace: its stream's shared ticket slots (_stream_ticket_slots), not a zeroed buffer
+        # per call; a captured call (graph="replay", or a stream capture) zeroes its own
+        workspace._shared_tickets = opts.graph == "off"
     elif not isinstance(workspace, CakeGDNDetKcpWorkspace):
         raise TypeError("workspace must be a CakeGDNDetKcpWorkspace")
     if workspace.state_dtype != backend.dtypes["state"]:
@@ -5049,7 +5485,13 @@ def _prepare(
         ctx, "prepare", None
     )  # the plan's device tables per (HV, sm_count, P) key, uploaded at first use
     if callable(prepare):
-        prepare(H_qk, HV, P=P)
+        caches = getattr(ctx, "_caches", None)
+        # the bundle is built once per key: later calls skip the lookup
+        done = ("kcp_prepared", H_qk, HV, P)
+        if not isinstance(caches, dict) or done not in caches:
+            prepare(H_qk, HV, P=P)
+            if isinstance(caches, dict):
+                caches[done] = True
     # Dead pools are not allocated (R2-L1 1a): the ring pools under the a2a exchange and the pools the call binds
     # fresh / saved tensors for (``c1_recv`` under ``save_transfer``, ``stage_m`` when the saved set carries
     # ``M_seg``) never hold a byte of this call.
@@ -5069,6 +5511,8 @@ def _prepare(
         fused_walks=int(opts.knob("fused_walks")),
         P=P,
         skip=skip,
+        # eager: pools and ticket slots are sized after the first launch (a capture bakes their addresses first)
+        defer=opts.graph == "off",
     )
     ops = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
     if dout is not None:
@@ -5294,6 +5738,8 @@ def _fwd_entry(
         executable=executable,
         s_in=s_in,
     )
+    # a rank without tokens may issue no launch: the deferred pool / ticket sizing completes here at the latest
+    call.ws.settle()
     _record("fwd", call)
     if opts.graph != "off":
         _graph_eager("fwd", entry)
@@ -5317,6 +5763,8 @@ def _saved_count(call: CakeGDNDetKcpCall, save: bool) -> int:
     )
     if call.T_r > 0:
         n += len(saved_tapes(opts.save_mode))
+        if _saves_qk(opts):  # qn / kn (save_mode="full" with the norm)
+            n += len(QK_TAPES)
     if call.l2n:  # qk_rstd, at T_r = 0 too (an empty [2, 0, H_qk] tensor: the flags agree across ranks)
         n += 1
     return _SAVED_OPERANDS + n
@@ -5363,27 +5811,40 @@ def _fwd_body(
     call.scratch["hand_off_reason"] = hand_off_reason
     if hand_off:
         _kept_evict_all()  # one live entry: the previous set is freed before this forward materialises its own
-    # #5's decision comes before the forward, which folds #5 into its tape walks when it launches (``fuse_o``): the
+    # #5's decision: the forward folds #5 into its tape walks when it launches (``fuse_o``), so _forward takes it
+    # before its first walk -- right after #1 is issued (it reads only host state that #1 does not change).  The
     # frame proof reads the count the Function saves after this forward (memoised per count; this forward packs
     # nothing), asserted against the saved set below
-    n_saved = _saved_count(call, save)
-    launch, reason = True, "always"
-    if (
-        autograd_node
-        and call.opts.recompute_output == "auto"
-        and call.opts.graph == "off"
-    ):
-        if not executable:
-            # autograd creates no node and packs nothing: the holders still waiting are a later op's
-            reason = "not_executable"
-        else:
-            # the Function saves the five operands and saved.tensors() right after this forward returns
-            dead, reason = frame_proof(n_saved)
-            launch = not dead
-            if reason in _RECOMPUTE_FRAME_REASONS:
-                RECOMPUTE_OUTPUT_STATS["skipped" if dead else "launched"] += 1
-    fuse_o = _fuse_o(call, launch=launch, hand_off=hand_off)
-    _forward(call, save=save, replay=False, hand_off=hand_off, s_in=s_in, fuse_o=fuse_o)
+    decision: dict[str, Any] = {}
+
+    def decide() -> bool:
+        n_saved = decision["n_saved"] = _saved_count(call, save)
+        launch, reason = True, "always"
+        if (
+            autograd_node
+            and call.opts.recompute_output == "auto"
+            and call.opts.graph == "off"
+        ):
+            if not executable:
+                # autograd creates no node and packs nothing: the holders still waiting are a later op's
+                reason = "not_executable"
+            else:
+                # the Function saves the five operands and saved.tensors() right after this forward returns
+                dead, reason = frame_proof(n_saved)
+                launch = not dead
+                if reason in _RECOMPUTE_FRAME_REASONS:
+                    RECOMPUTE_OUTPUT_STATS["skipped" if dead else "launched"] += 1
+        decision["launch"], decision["reason"] = launch, reason
+        return _fuse_o(call, launch=launch, hand_off=hand_off)
+
+    fuse_o = _forward(
+        call, save=save, replay=False, hand_off=hand_off, s_in=s_in, fuse_o=decide
+    )
+    n_saved, launch, reason = (
+        decision["n_saved"],
+        decision["launch"],
+        decision["reason"],
+    )
     stage_m = None
     if hand_off and call.tb.P > 1 and not call.opts.save_transfer:
         # the transfer walk's M_seg^T plane: the backward's merges read it and no saved M_seg replaces it; the view
@@ -5398,8 +5859,11 @@ def _fwd_body(
                 FWD_DEAD_BEFORE_O, keep=saved_tapes(call.opts.save_mode) if save else ()
             )
         if call.l2n and not hand_off:
-            # the tape walks were kn's last readers (a hand-off forward hands kn over with its tapes)
-            call.release_tapes(("kn",))
+            # the tape walks were kn's last readers (a hand-off forward hands kn over with its tapes; a full saved
+            # set keeps its fresh kn)
+            call.release_tapes(
+                ("kn",), keep=QK_TAPES if save and _saves_qk(call.opts) else ()
+            )
         call.release_pools(FWD_DEAD_POOLS)
     call.output()  # a fused forward's output walks wrote it; else allocated here, after the releases, for #5
     saved = _saved_set(call) if save else None
@@ -5413,7 +5877,10 @@ def _fwd_body(
     if launch and not fuse_o:
         call.local("fwd_o")
     if call.l2n and call.opts.graph == "off" and not hand_off:
-        call.release_tapes(("qn",))  # #5 was qn's last reader (or #5 is left out)
+        # #5 was qn's last reader (or #5 is left out); a full saved set keeps its fresh qn
+        call.release_tapes(
+            ("qn",), keep=QK_TAPES if save and _saves_qk(call.opts) else ()
+        )
     kept = None
     if hand_off:
         # with the norm the rows #1_l2n wrote go along: the backward binds them instead of running qk_apply
@@ -5439,6 +5906,7 @@ def _saved_set(call: CakeGDNDetKcpCall) -> CakeGDNDetKcpSaved:
     of the ``save_mode`` (none in ``"light"``), the scalars of the call.  Built before #5 so the forward knows what
     the Function saves."""
     tb, opts = call.tb, call.opts
+    qk_saved = call.T_r > 0 and _saves_qk(opts)
     return CakeGDNDetKcpSaved(
         version=KCP_SAVED_VERSION,
         S_in=call.bufs["S_in"],
@@ -5465,6 +5933,8 @@ def _saved_set(call: CakeGDNDetKcpCall) -> CakeGDNDetKcpSaved:
         ctx=call.ctx,
         qk_rstd=call.bufs.get(QK_RSTD) if call.l2n else None,
         qk_l2norm=call.l2n,
+        qk=tuple(call.tapes[n] for n in QK_TAPES) if qk_saved else None,
+        qk_saved=qk_saved,
         kept=None,
     )
 
@@ -5553,6 +6023,27 @@ def _check_saved(saved: CakeGDNDetKcpSaved, call: CakeGDNDetKcpCall) -> None:
         R, NC_pad = int(call.ctx.R), int(call.ctx.NC_pad)
         for name, t in zip(names, saved.tapes, strict=True):
             shape, dtype = tape_spec(name, R=R, NC_pad=NC_pad, HV=call.HV, T=call.T_r)
+            _check(t, f"saved.{name}", shape, dtype, call.device)
+    # the normalized rows ride in a full saved set of a call with the norm and tokens only (either full form is
+    # accepted: without them the backward rebuilds them with qk_apply)
+    if saved.qk_saved != (saved.qk is not None):
+        raise ValueError("saved: qk_saved disagrees with the saved qn / kn")
+    if saved.qk is not None:
+        if not (call.l2n and saved.save_mode == "full" and call.T_r > 0):
+            raise ValueError(
+                'saved: qn / kn are saved with save_mode="full", use_qk_l2norm_in_kernel and tokens only'
+            )
+        if len(saved.qk) != len(QK_TAPES):
+            raise ValueError(f"saved: the saved rows are {QK_TAPES}")
+        for name, t in zip(QK_TAPES, saved.qk, strict=True):
+            shape, dtype = tape_spec(
+                name,
+                R=int(call.ctx.R),
+                NC_pad=int(call.ctx.NC_pad),
+                HV=call.HV,
+                T=call.T_r,
+                H_qk=call.H_qk,
+            )
             _check(t, f"saved.{name}", shape, dtype, call.device)
     kept: _KeptTapes | None = saved.kept
     # the recompute forward's ten tapes of this geometry (+ the stage_m plane without a saved M_seg)
@@ -5740,10 +6231,15 @@ def _alloc_grads(call: CakeGDNDetKcpCall) -> None:
         # layer below (the convolution's backward) reads one contiguous [T, (2 H_qk + HV) * 128] gradient with no
         # concatenation (:func:`cake_gdn_det_train_kcp_packed_qkv_views`)
         qkv = _alloc((T, (2 * H_qk + HV) * D), dt["dq"], call.device)
-        a, b = H_qk * D, 2 * H_qk * D
-        dq = qkv[:, :a].view(T, H_qk, D)
-        dk = qkv[:, a:b].view(T, H_qk, D)
-        dv = qkv[:, b:].view(T, HV, D)
+        if T:
+            # the views of qkv[:, :a] / [:, a:b] / [:, b:] (same storage offset, shape and strides) in two view ops
+            # instead of three slices and three views
+            dq, dk, dv = _qkv_views(qkv, H_qk, HV)
+        else:
+            a, b = H_qk * D, 2 * H_qk * D
+            dq = qkv[:, :a].view(T, H_qk, D)
+            dk = qkv[:, a:b].view(T, H_qk, D)
+            dv = qkv[:, b:].view(T, HV, D)
     else:
         dq = _alloc((T, H_qk, D), dt["dq"], call.device)
         dk = _alloc((T, H_qk, D), dt["dk"], call.device)
@@ -5763,6 +6259,8 @@ def _bwd_body(
 ) -> tuple[torch.Tensor, ...]:
     """The backward's allocations and launches (eagerly or inside a capture): ``(dq, dk, dv, dbeta, dg)``."""
     _backward(call, saved)
+    # a rank without tokens may issue no launch: the deferred pool / ticket sizing completes here at the latest
+    call.ws.settle()
     return tuple(call.grads[n] for n in ("dq", "dk", "dv", "dbeta", "dg"))
 
 
@@ -5851,12 +6349,12 @@ class CakeGDNDetKcpFunction(torch.autograd.Function):
         saved = (
             None
             if meta is None
-            else dataclasses.replace(
-                CakeGDNDetKcpSaved.from_tensors(tensors, meta[0], meta[1], ctx),
-                # this node's own set: forgotten tensor by tensor at the last reader
-                release_in_backward=True,
-            )
+            else CakeGDNDetKcpSaved.from_tensors(tensors, meta[0], meta[1], ctx)
         )
+        if saved is not None:
+            # this node's own set (built just above, referenced nowhere else): forgotten tensor by tensor at the
+            # last reader -- set in place rather than through a second construction (frozen dataclass)
+            object.__setattr__(saved, "release_in_backward", True)
         # the set above holds the only Python references to the saved tensors
         del tensors
         if (
@@ -5906,13 +6404,12 @@ PACKED_SPLIT_STATS: dict[str, int] = {
 def _qkv_views(
     qkv: torch.Tensor, H_qk: int, HV: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    lead = tuple(qkv.shape[:-1])
-    a, b = H_qk * D, 2 * H_qk * D
-    return (
-        qkv[..., :a].view(*lead, H_qk, D),
-        qkv[..., a:b].view(*lead, H_qk, D),
-        qkv[..., b:].view(*lead, HV, D),
+    # the channel axis as [heads, 128], split by heads: the views of ``qkv[..., :a]`` / ``[a:2a]`` / ``[2a:]``
+    # (a = H_qk * 128; same storage offset, shape and strides) in two view ops
+    q, k, v = qkv.unflatten(-1, (2 * H_qk + HV, D)).split_with_sizes(
+        (H_qk, H_qk, HV), dim=-2
     )
+    return q, k, v
 
 
 class CakeGDNDetKcpPackedQKVSplitFunction(torch.autograd.Function):
@@ -5970,6 +6467,32 @@ def cake_gdn_det_train_kcp_packed_qkv_views(
     return CakeGDNDetKcpPackedQKVSplitFunction.apply(qkv, H_qk, HV)
 
 
+# cake_gdn_det_kcp's validated options per keyword set (no ``options`` object): a CakeGDNDetKcpOptions built and checked
+# once per distinct keyword values (with their types, so ``1`` never stands in for ``True``) and shared by the calls --
+# never handed to the caller, never mutated by the package (a recompute handle's form is a dataclasses.replace copy).
+_KEYWORD_OPTIONS: dict[tuple, CakeGDNDetKcpOptions] = {}
+KEYWORD_OPTIONS_MAX = 64
+
+
+def _keyword_options(
+    over: dict[str, Any], knobs: dict[str, Any]
+) -> CakeGDNDetKcpOptions:
+    try:
+        key = tuple((k, type(v), v) for k, v in sorted(over.items())) + (
+            None,
+            *((k, type(v), v) for k, v in sorted(knobs.items())),
+        )
+        opts = _KEYWORD_OPTIONS.get(key)
+    except TypeError:  # an unhashable value (a test_knobs dict): validated per call
+        return make_options(None, **over, **knobs)
+    if opts is None:
+        opts = make_options(None, **over, **knobs)
+        if len(_KEYWORD_OPTIONS) >= KEYWORD_OPTIONS_MAX:
+            _KEYWORD_OPTIONS.clear()
+        _KEYWORD_OPTIONS[key] = opts
+    return opts
+
+
 @_option_keywords
 def cake_gdn_det_kcp(
     q: torch.Tensor,
@@ -6022,7 +6545,11 @@ def cake_gdn_det_kcp(
         raise ValueError(
             "recompute_handle keeps the incoming states only: it needs save_transfer=False"
         )
-    opts = make_options(options, **over, **knobs)
+    opts = (
+        make_options(options, **over, **knobs)
+        if options is not None
+        else _keyword_options(over, knobs)
+    )
     if recompute_handle is not None:
         if opts.boundary_mode != "saved" or opts.graph != "off":
             raise ValueError(
@@ -6037,8 +6564,12 @@ def cake_gdn_det_kcp(
             opts = dataclasses.replace(opts, save_transfer=False)
     # autograd's own executability test for the node (grad mode and an operand requiring grad, flags only): read
     # here because inside Function.forward grad mode is always off
-    executable = torch.is_grad_enabled() and any(
-        t.requires_grad for t in (q, k, v, g, beta)
+    executable = torch.is_grad_enabled() and (
+        q.requires_grad
+        or k.requires_grad
+        or v.requires_grad
+        or g.requires_grad
+        or beta.requires_grad
     )
     return CakeGDNDetKcpFunction.apply(
         q, k, v, g, beta, ctx, scale, workspace, opts, executable, recompute_handle
@@ -6140,6 +6671,7 @@ __all__ = [
     "get_backend",
     "graph_cache_clear",
     "fused_o_shipped",
+    "prep_form_shipped",
     "kept_registry_size",
     "l2n_records_shipped",
     "make_options",

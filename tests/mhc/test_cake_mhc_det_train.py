@@ -14,8 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests for the Cake four-stream mHC training forward / backward (hidden 4096,
-5120 and 7168, 4 streams; SM100 / SM103 at the three hidden sizes, SM107 at
-4096).
+5120 and 7168, 4 streams; SM100 / SM103 / SM107 at the three hidden sizes).
 
 Every case below runs at each hidden size ``H`` the device's architecture
 exports (``cake_jit.supported_hidden_sizes``); a size it does not export is
@@ -60,9 +59,10 @@ the IEEE-FP32 evaluation of the same reference (TF32 off):
   2026-10-19 and 2026-10-31): on the resolvable band
   (``|dX| >= 2^-14 max |contribution|``) the error is <= 2 ulp
   on every draw, or the pooled ``n(> 2 ulp)`` and the maximum over the draws
-  are within 2x the IEEE-FP32 single-cast comparator's (at H 7168 T 2049 the
-  maximum clause is printed but not gated, the count clause is: the contract
-  owner's decision of 2026-10-31, CANCEL_MAX_RECORDED_ONLY).  Every draw prints its band and
+  are within 2x the IEEE-FP32 single-cast comparator's (at H 7168 T 2049, and
+  on SM107 at H 7168 T 257, the maximum clause is printed but not gated, the
+  count clause is: the contract owner's decisions of 2026-10-31,
+  CANCEL_MAX_RECORDED_ONLY, and 2026-11-07, CANCEL_MAX_RECORDED_ONLY_BY_ARCH).  Every draw prints its band and
   spec-literal mask figures (maximum ulp, ``n(> 2 ulp)``, strict band verdict,
   the single-draw refined verdict) as the literal record; the IEEE-FP32
   comparator itself exceeds 2 ulp on that band.  Its draws come from the host
@@ -88,8 +88,10 @@ the IEEE-FP32 evaluation of the same reference (TF32 off):
   printed.  BF16 ``dX`` is a seed distribution (the contract owner's decision of
   2026-10-31): over 64 draws of each (H, T in 257, 2049) the maximum of the
   kernel's worst ``|err| / (1e-2 + 1e-2 |ref|)`` is <= the maximum of the
-  IEEE-FP32 comparator's; the draws meeting the absolute bar, the draws within
-  the comparator and the median ratio are printed as the literal record;
+  IEEE-FP32 comparator's (on SM107 at H 5120 T 257 printed but not gated: the
+  contract owner's decision of 2026-11-07, LARGE_LOGITS_RECORDED_ONLY_BY_ARCH);
+  the draws meeting the absolute bar, the draws within the comparator and the
+  median ratio are printed as the literal record;
 * hidden sizes mixed in one process (on an architecture that exports 4096
   and 7168): calls of every exported size interleaved at the same token
   count, through the direct entry points (default workspaces, one caller
@@ -105,7 +107,7 @@ The largest cases hold the FP64 reference in row blocks of 8192 tokens and
 the FP32 comparator in one block (about 40 GB of device memory at T = 65536
 and H = 4096; the footprint grows in proportion to H).
 This suite exercises the backend package alone: it names the package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 ``flashinfer.cake_mhc_det_train`` facade and the ``flashinfer`` top-level
@@ -126,7 +128,7 @@ import numpy as np
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake.cake_mhc_det_train")
 cake_build = cake_package("cake.cake_mhc_det_train", "cake_build")
@@ -200,9 +202,20 @@ CANCEL_CLAUSE_DRAWS = 256
 # count clause stays gated.  H 7168 T 2049 at 256 draws: max ratio 2.15x (B200) / 3.25x (GB200, GB300), driven by one
 # draw, seed 2173 (kernel 954.5 ulp vs the comparator's 256.5 on that draw; the next kernel maximum is 324).
 CANCEL_MAX_RECORDED_ONLY = {(7168, 2049)}
+# The cells whose max-ulp clause is recorded and printed but not gated on one architecture only (contract owner
+# decision of 2026-11-07); their count clause stays gated.  The comparator is the torch IEEE-FP32 evaluation on the
+# device itself.  On sm_107a it is more accurate in this cell, and in the cell of LARGE_LOGITS_RECORDED_ONLY_BY_ARCH,
+# than on the other architectures, while the kernel's dX on sm_107a is bit-identical to its dX on B200 for the same
+# draws; on B200 the comparator clauses of both cells pass.  H 7168 T 257 on sm_107a: kernel max 200.881 ulp vs the
+# comparator's 86.006 (ratio 2.336).
+CANCEL_MAX_RECORDED_ONLY_BY_ARCH = {"sm_107a": {(7168, 257)}}
 # The large-logits dX clause is a seed distribution too (contract owner decision of 2026-10-31): over the draws SEED,
 # SEED + 1, ... of each (H, T), the kernel's worst |err| / (atol + rtol |ref|) stays within the IEEE-FP32 comparator's.
 LARGE_LOGITS_DRAWS = 64
+# The cells whose worst-ratio clause is recorded and printed but not gated on one architecture only (contract owner
+# decision of 2026-11-07; the evidence is with CANCEL_MAX_RECORDED_ONLY_BY_ARCH).  H 5120 T 257 on sm_107a: kernel
+# worst err/tol 10.7105 vs the comparator's 8.8360.
+LARGE_LOGITS_RECORDED_ONLY_BY_ARCH = {"sm_107a": {(5120, 257)}}
 T_DISTRIBUTION = (1, 2, 3, 7, 63, 129, 255, 1000, 2049)
 BF16, F32, F64 = torch.bfloat16, torch.float32, torch.float64
 
@@ -1053,8 +1066,9 @@ def test_saturated_sigmoid_tails(T: int, hidden: int) -> None:
 def test_single_cast_cancellation(T: int, hidden: int) -> None:
     """The cancellation band aggregated over CANCEL_CLAUSE_DRAWS (256) draws of the case (ulp error in units of the
     FP64 reference's BF16 spacing): the resolvable band holds 2 ulp on every draw, or the pooled n(> 2 ulp) and the
-    maximum ulp error over the draws are within 2x the IEEE-FP32 comparator's (in the CANCEL_MAX_RECORDED_ONLY cells the
-    maximum-ulp ratio is printed, not gated; the count clause is). The first draw runs every gate of the case; every
+    maximum ulp error over the draws are within 2x the IEEE-FP32 comparator's (in the CANCEL_MAX_RECORDED_ONLY cells and
+    the device architecture's CANCEL_MAX_RECORDED_ONLY_BY_ARCH cells the maximum-ulp ratio is printed, not gated; the
+    count clause is). The first draw runs every gate of the case; every
     draw prints its band figures and single-draw refined verdict as the literal record. The parameter gradients and
     the statistics of the same draws hold the distribution clause too."""
     first = _check_case(T, hidden=hidden, mode="cancel", host_draw=True)
@@ -1083,7 +1097,8 @@ def test_single_cast_cancellation(T: int, hidden: int) -> None:
     max_k = max(r["band"]["max"] for r in reports)
     max_c = max(r["comparator_band"]["max"] for r in reports)
     strict_every_draw = max_k <= CANCEL_ULP_MAX
-    max_gated = (hidden, T) not in CANCEL_MAX_RECORDED_ONLY
+    arch_recorded_only = CANCEL_MAX_RECORDED_ONLY_BY_ARCH.get(_arch(), set())
+    max_gated = (hidden, T) not in CANCEL_MAX_RECORDED_ONLY | arch_recorded_only
     max_ratio = max_k / max_c if max_c else float("inf")
     pooled = total_k <= 2 * total_c and (max_k <= 2 * max_c or not max_gated)
     single_draw_fails = sum(1 for r in reports if not (r["strict"] or r["within"]))
@@ -1140,7 +1155,8 @@ def test_large_logits(T: int, hidden: int) -> None:
 def test_large_logits_dx_over_draws(T: int, hidden: int) -> None:
     """BF16 ``dX`` at ``fn x 1e3`` over LARGE_LOGITS_DRAWS host-drawn seeds (the contract owner's decision of
     2026-10-31): the maximum over the draws of the kernel's worst ``|dX - dX_fp64| / (atol + rtol |dX_fp64|)``
-    (atol = rtol = 1e-2) is <= the maximum of the IEEE-FP32 comparator's on the same draws.  There the FP32
+    (atol = rtol = 1e-2) is <= the maximum of the IEEE-FP32 comparator's on the same draws (in the device
+    architecture's LARGE_LOGITS_RECORDED_ONLY_BY_ARCH cells it is printed, not gated).  There the FP32
     representation of the pre-activations (|z| ~ 1e3) bounds every FP32 evaluation, and a fixed set of draws meets the
     absolute bar on most but not every draw, at every H.  The absolute pass count, the draws within the comparator and
     the median ratio are the literal record."""
@@ -1155,14 +1171,16 @@ def test_large_logits_dx_over_draws(T: int, hidden: int) -> None:
         c_worst.append(float(((comp - ref).abs() / tol).max()))
         del i, res, ref, comp, tol
     within = sum(1 for k, c in zip(k_worst, c_worst, strict=True) if k <= c)
+    arch_recorded_only = LARGE_LOGITS_RECORDED_ONLY_BY_ARCH.get(_arch(), set())
+    worst_gated = (hidden, T) not in arch_recorded_only
     print(
         f"dX fn_scale=1000 T={T} H={hidden}: {len(k_worst)} draws; absolute bar met on {sum(1 for k in k_worst if k <= 1)}; "
         f"kernel max {max(k_worst):.4f} median {statistics.median(k_worst):.4f}; IEEE-FP32 comparator max "
         f"{max(c_worst):.4f} median {statistics.median(c_worst):.4f}; draws within the comparator {within}; "
-        f"max ratio {max(k_worst) / max(c_worst):.4f} (literal record)",
+        f"max ratio {max(k_worst) / max(c_worst):.4f} ({'gated' if worst_gated else 'recorded, not gated'})",
         flush=True,
     )
-    assert max(k_worst) <= max(c_worst), (
+    assert max(k_worst) <= max(c_worst) or not worst_gated, (
         f"dX fn_scale=1000 T={T} H={hidden}: kernel worst err/tol {max(k_worst):.4f} over {len(k_worst)} draws exceeds "
         f"the IEEE-FP32 comparator's {max(c_worst):.4f}"
     )

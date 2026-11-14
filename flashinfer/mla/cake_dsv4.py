@@ -19,7 +19,10 @@ Host contract (flashinfer#4671 hardening)
   ``extra_sparse_indices [T, topk_c]``; ``extra_sparse_topk_lens`` counts
   compressed slots only and implies ``sparse_topk_lens_offset += 128``).
   Resolution never copies: a non-unit column stride or a non-int32 table is an
-  error.
+  error. The kernels load index rows 16 bytes (four int32) at a time, so every
+  bound table must start at a 16-byte aligned address and, with more than one
+  row, have a row stride that is a multiple of 4 elements. Other tables (for
+  example ``parent[:, 1:]`` of a ``[T, W + 1]`` parent) are an error as well.
 * **Padded rows.** ``num_query_tokens`` is the metadata row count ``T``.
   ``query`` and ``out`` may carry more rows; rows ``>= T`` are neither read nor
   written. Grids and workspace views derive from ``T``, never from query rows.
@@ -97,7 +100,12 @@ Host contract (flashinfer#4671 hardening)
 * **Split-KV pieces (SM107).** A split launch of the FP8/H128 uniform-gather
   route (:func:`_k64_split_plan`) runs its ``W`` whole rows first and each
   later row ``t`` as ``s`` pieces of its sparse tiles, then merges the
-  pieces into ``O`` (one ``run_sequence`` call). It carves
+  pieces into ``O`` (one ``run_sequence`` call) with the merge their rule's
+  ``merge_by_splits`` names for ``s`` and their rows
+  (:func:`_k64_split_merge`): on SM107, for 128 heads, a merge built for
+  ``s`` pieces alone, one CTA per row and head (nine and five pieces) or one
+  warp per row and head and two heads per CTA (three pieces at 16-20 rows),
+  else the merge of any ``s``, one CTA per row and head. It carves
   ``cake_dsv4_workspace_layout(R, H, s)`` for its ``R = T - W`` split rows
   and stores the pieces in token-major order: piece ``j`` of row ``t`` is
   ``p = (t - W) * s + j``, its BF16 partial O the rows ``[p, :, :]`` of
@@ -158,6 +166,32 @@ an unexported variant raises ``NotImplementedError``. Splits write
 ``partial_O [T, H, S, 512]`` BF16 and ``partial_lse [T, H, S]`` FP32 into the
 workspace; the final base-2 LSE lives in an extra ``lse`` region appended
 after ``partial_lse`` (:func:`cake_dsv4_workspace_layout` ``with_lse=True``).
+
+A query packed to the NVFP4 row format (``uint8 [rows, H, 384]``: per row the
+352 bytes of E2M1 NoPE codes and BF16 RoPE dims, then its 28 E4M3 scale factors
+and 4 pad bytes, the cache's token record; :func:`cake_dsv4_nvfp4_pack_query`
+packs a BF16 query) runs the NVFP4 prefill bodies instead, at any row count
+(Cake ``cake_dsv4_nvfp4_query_block_prefill`` and
+``flashinfer_blackwell_trtllm_sparse_mla_dsv4_nvfp4_{h64,h128}_prefill``,
+chosen by :func:`_nvfp4_prefill_route`): the query-block bodies
+``nvfp4_qb_h{16,32}*`` (16 / 32 heads on window-only rows with more query
+tokens than SMs: one item per block of ``64 / H`` consecutive tokens, whose
+shifted windows are gathered and transformed once), the per-token builds
+``nvfp4_h64_*`` (``H <= 64``, one item per query token, the heads duplicated on
+the two 64-row halves of a block-scaled M128 QK) and ``nvfp4_h128_prefill``
+(``H128``, one two-CTA cluster per token, 64 heads per CTA). As the FP8
+route takes an E4M3 query, they take the query packed by the caller: the call
+packs nothing. A BF16 query runs the decode family at any row count, as it
+did before the prefill bodies. On the DSv4 prefill shapes (128 to 8192 rows)
+the prefill bodies with a packed query run 1.04-6.5x faster than the decode
+family on B200 and GB300; below 64 rows the decode family is often the
+faster one. The decode family caps a row at 12 candidate tiles, so wider
+tables (C128 layers past 1408 compressed entries) run only with a packed
+query. The prefill bodies read the
+pools through 32-byte-pitch data-row and scale-row tensor maps, and write the
+final BF16 output and base-2 LSE directly (no split, no merge), so their
+workspace carve has one split (no ``partial_O`` region); the LSE lands in the
+same ``lse`` region as the decode family's.
 """
 
 from __future__ import annotations
@@ -179,6 +213,8 @@ _HEAD_DIM = 512
 _TILE_KV = 128
 _SWA_WIDTH = 128
 _ALIGN = 128
+# The BF16 / FP8 programs load index rows this many bytes (four int32) at a time.
+_INDEX_ROW_ALIGN = 16
 
 # Deterministic workspace layout (byte offsets inside workspace_buffer).
 _DESCRIPTOR_SLAB_OFFSET = 0
@@ -209,14 +245,13 @@ _BF16_TOPK128X_MAX_WIDTH = 388
 # One FP8 low-head producer partition owns up to three sparse tiles; mirrors
 # the producer's FP8_ONE_PARTITION_MAX_TILES = 3.
 _FP8_ONE_PARTITION_MAX_WIDTH = 384
-# The M64 bindings take items of at most 1152 sparse slots (SWA 128 + 1024);
-# mirrors their ``sparse_topk <= 1152`` check.
-_FP8_M64_MAX_WIDTH = 1152
-# The FP8 low-head prefill producer stages an item's sparse indices in a
-# shared-memory buffer of 1152 slots (nine tiles of 128).  A wider item
-# writes past that buffer and past the dynamic shared memory, and its
-# binding does not check the width.
-_FP8_LOWHEAD_PREFILL_MAX_WIDTH = 1152
+# Every FP8 body takes items of at most 1152 sparse slots (SWA 128 + 1024):
+# the persistent and M64 bindings check ``sparse_topk <= 1152``, and the
+# low-head producers stage an item's sparse indices in a shared-memory buffer
+# of 1152 slots (nine tiles of 128) without a check of their own.  A C128
+# layer's item holds 128 + context / 128 slots, so it passes the limit past
+# 128K context (2176 at 256K).
+_FP8_MAX_WIDTH = 1152
 _BF16_H64_COMPRESSED_PREFILL_TOKENS = 24
 _BF16_H64_PREFILL_MAX_SPARSE_WIDTH = 640
 # Workspaces whose split-merge counter region is known to be zero:
@@ -274,6 +309,73 @@ _NVFP4_PV_PLAN_MERGE_US = 1.5
 # Split merge (Cake MERGE_HEADS_PER_CTA / merge_heads_per_cta): 16 warps per CTA, one (token, head) per warp;
 # heads_per_cta is the smallest power of two whose grid T x ceil(H / hpc) stays within one CTA per SM (round 45).
 _NVFP4_MERGE_HEADS_PER_CTA = 16
+# NVFP4 prefill bodies: a caller-packed NVFP4 query runs them (see the module docstring);
+# a BF16 query runs the decode family at any row count.
+# The per-token body takes up to 64 heads, the two-CTA body 128. Its builds (``_nvfp4_prefill_route``):
+# ``tmem_v`` keeps V^T in TMEM (at most 32 heads); ``early_gather`` gathers a CTA's first item before
+# the index hand-off (one item per CTA: at most as many query tokens as SMs); ``o_boxes`` stores O
+# through TMA boxes; ``q_prefetch`` is ``o_boxes`` with the next item's query loaded ahead (window-only
+# rows).
+_NVFP4_VARIANT_H64_TMEM_V_PREFILL = "nvfp4_h64_tmem_v_prefill"
+_NVFP4_VARIANT_H64_TMEM_V_EARLY_GATHER_PREFILL = "nvfp4_h64_tmem_v_early_gather_prefill"
+_NVFP4_VARIANT_H64_EARLY_GATHER_PREFILL = "nvfp4_h64_early_gather_prefill"
+_NVFP4_VARIANT_H64_O_BOXES_PREFILL = "nvfp4_h64_o_boxes_prefill"
+_NVFP4_VARIANT_H64_Q_PREFETCH_PREFILL = "nvfp4_h64_q_prefetch_prefill"
+_NVFP4_VARIANT_H128_PREFILL = "nvfp4_h128_prefill"
+# The two-CTA body's build for items of more than two 128-key tiles (sparse_topk above 256, e.g. C4 and
+# C128 past 16K context): its loaders transform two NoPE units per trip from one shared scale word.
+# It is built for sm_103a; sm_100a keeps the persistent build.
+_NVFP4_VARIANT_H128_V_UNIT_PAIRS_PREFILL = "nvfp4_h128_v_unit_pairs_prefill"
+_NVFP4_H128_V_UNIT_PAIRS_MIN_TOPK = 257
+_NVFP4_H128_V_UNIT_PAIRS_ARCHES = ("sm_103a",)
+# Query-block bodies (16 / 32 heads, window-only rows: no extra table, a main table of at most 128
+# keys on a row stride of at least 128): one CTA item per block of 64 / H consecutive query tokens,
+# whose shifted windows are gathered and transformed once (window tables oldest or newest key first,
+# as SGLang builds them). ``breaks`` (16 heads) splits a block at a sequence boundary through extra
+# group items, up to the token count below. ``late_claim`` (32 heads) holds back the next claim of a
+# CTA whose first block cannot share; it pays only while most CTAs take a second block, so it serves
+# the rows of at most the token count below whose blocks exceed 11 / 8 of the SMs (on GB300's 152
+# SMs: 420 to 512 tokens; the default build is 1-3 % faster on either side).
+_NVFP4_VARIANT_QB_H16_PREFILL = "nvfp4_qb_h16_prefill"
+_NVFP4_VARIANT_QB_H16_BREAKS_PREFILL = "nvfp4_qb_h16_breaks_prefill"
+_NVFP4_VARIANT_QB_H32_PREFILL = "nvfp4_qb_h32_prefill"
+_NVFP4_VARIANT_QB_H32_LATE_CLAIM_PREFILL = "nvfp4_qb_h32_late_claim_prefill"
+_NVFP4_QB_BREAKS_MAX_TOKENS = 1024
+_NVFP4_QB_LATE_CLAIM_MAX_TOKENS = 512
+_NVFP4_QB_LATE_CLAIM_MIN_BLOCKS_PER_SM = (11, 8)
+_NVFP4_QB_WINDOW = 128
+_NVFP4_PREFILL_VARIANTS = (
+    _NVFP4_VARIANT_QB_H16_PREFILL,
+    _NVFP4_VARIANT_QB_H16_BREAKS_PREFILL,
+    _NVFP4_VARIANT_QB_H32_PREFILL,
+    _NVFP4_VARIANT_QB_H32_LATE_CLAIM_PREFILL,
+    _NVFP4_VARIANT_H64_TMEM_V_PREFILL,
+    _NVFP4_VARIANT_H64_TMEM_V_EARLY_GATHER_PREFILL,
+    _NVFP4_VARIANT_H64_EARLY_GATHER_PREFILL,
+    _NVFP4_VARIANT_H64_O_BOXES_PREFILL,
+    _NVFP4_VARIANT_H64_Q_PREFETCH_PREFILL,
+    _NVFP4_VARIANT_H128_PREFILL,
+    _NVFP4_VARIANT_H128_V_UNIT_PAIRS_PREFILL,
+)
+# Prefill bodies that load index rows 16 bytes (four int32) at a time with cp.async or vector loads: the
+# two-CTA H128 builds and the query-block builds. Their tables must start 16-byte aligned and keep a row
+# stride that is a multiple of 4 elements (:func:`_check_index_row_alignment`); the per-token H <= 64
+# builds read one index at a time.
+_NVFP4_PREFILL_VECTOR_INDEX_VARIANTS = frozenset(
+    {
+        _NVFP4_VARIANT_QB_H16_PREFILL,
+        _NVFP4_VARIANT_QB_H16_BREAKS_PREFILL,
+        _NVFP4_VARIANT_QB_H32_PREFILL,
+        _NVFP4_VARIANT_QB_H32_LATE_CLAIM_PREFILL,
+        _NVFP4_VARIANT_H128_PREFILL,
+        _NVFP4_VARIANT_H128_V_UNIT_PAIRS_PREFILL,
+    }
+)
+_NVFP4_H64_PREFILL_MAX_HEADS = 64
+_NVFP4_TMEM_V_MAX_HEADS = 32
+_NVFP4_DATA_BYTES = 352  # E2M1 NoPE codes and BF16 RoPE dims of one NVFP4 row
+_NVFP4_SF_BYTES = 32  # the row's 28 E4M3 scales and 4 pad bytes
+_NVFP4_ROW_PITCH = 32  # pitch of the pool row views the prefill tensor maps read
 
 
 # Work feed of the BF16/H128 persistent prefill body (mirrors the Cake seed's
@@ -435,6 +537,33 @@ def _int32_table(tensor: torch.Tensor, name: str, *, rows: Optional[int] = None)
     return tensor
 
 
+def _check_index_row_alignment(table: torch.Tensor, name: str) -> None:
+    """Reject an index table the 16-byte index-row loads cannot read.
+
+    The BF16 / FP8 programs load four int32 indices at a time from
+    ``data_ptr + 4 * (t * row_stride + c)`` with ``c`` a multiple of 4, so the
+    table must start 16-byte aligned and, past one row, have a row stride that
+    is a multiple of 4 elements. Row-tiled launches slice the table by row,
+    which keeps both properties. The NVFP4 decode family and the per-token
+    H <= 64 prefill builds read their tables one index at a time; the NVFP4
+    H128 and query-block prefill builds load 16-byte rows and call this
+    (``_NVFP4_PREFILL_VECTOR_INDEX_VARIANTS``).
+    """
+    misaligned = table.data_ptr() % _INDEX_ROW_ALIGN
+    if misaligned:
+        raise ValueError(
+            f"{name} must start at a {_INDEX_ROW_ALIGN}-byte aligned address, got "
+            f"data_ptr() % {_INDEX_ROW_ALIGN} == {misaligned}: the kernels load "
+            f"index rows {_INDEX_ROW_ALIGN} bytes at a time"
+        )
+    if table.shape[0] > 1 and table.stride(0) % 4:
+        raise ValueError(
+            f"{name} must have a row stride that is a multiple of 4 elements, got "
+            f"{table.stride(0)}: the kernels load index rows {_INDEX_ROW_ALIGN} "
+            "bytes at a time"
+        )
+
+
 def _int32_lens(tensor: torch.Tensor, name: str, *, rows: int) -> torch.Tensor:
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
@@ -475,6 +604,11 @@ def resolve_cake_dsv4_sparse_metadata(
 
     ``query_rows`` is the number of rows the query tensor provides; the metadata
     may describe fewer tokens (padded batch) but never more.
+
+    Every bound table must start at a 16-byte aligned address and, with more
+    than one row, have a row stride that is a multiple of 4 elements (the
+    BF16 / FP8 kernels load index rows 16 bytes at a time); other tables raise
+    ``ValueError``.
     """
     if isinstance(sparse_topk_lens_offset, bool) or not isinstance(
         sparse_topk_lens_offset, int
@@ -540,6 +674,11 @@ def resolve_cake_dsv4_sparse_metadata(
         raise ValueError(
             f"sparse_topk (128 + compressed columns) must be a multiple of 4, got {sparse_topk}"
         )
+    _check_index_row_alignment(swa, "sparse_indices")
+    if compressed is not swa:
+        _check_index_row_alignment(
+            compressed, "extra_sparse_indices" if separate else "sparse_indices"
+        )
     lens = _int32_lens(lens, lens_name, rows=rows)
     return SparseMetadata(
         swa_indices=swa,
@@ -587,6 +726,10 @@ class WorkspaceLayout:
     # Final base-2 LSE f32 [T * H]; only carved for the NVFP4 route
     # (``with_lse=True``), otherwise an empty region at the layout end.
     lse: tuple[int, int] = (0, 0)
+    # NVFP4 prefill bodies (``with_prefill=True``): two int32 [T] length
+    # vectors the host fills when the caller passes none; otherwise an empty
+    # region at the layout end.
+    prefill_lens: tuple[int, int] = (0, 0)
 
 
 def cake_dsv4_workspace_layout(
@@ -596,6 +739,7 @@ def cake_dsv4_workspace_layout(
     *,
     num_query_offsets: int = 0,
     with_lse: bool = False,
+    with_prefill: bool = False,
 ) -> WorkspaceLayout:
     """Deterministic carve of ``workspace_buffer`` for one launch shape.
 
@@ -604,8 +748,8 @@ def cake_dsv4_workspace_layout(
     counters immediately. ``num_query_offsets`` (``batch_size + 1`` for a
     row-tiled chunk after the first, else 0) sizes the int32 region after
     ``partial_lse`` that holds the chunk's shifted ``cum_seq_lens_q``.
-    ``with_lse`` appends the NVFP4 route's final-LSE region after that; the
-    default layout is unchanged.
+    ``with_lse`` appends the NVFP4 route's final-LSE region after that, and
+    ``with_prefill`` the NVFP4 prefill bodies' length regions after the LSE; the default layout is unchanged.
     """
     tokens = _positive_int(num_query_tokens, "num_query_tokens")
     heads = _positive_int(num_heads, "num_heads")
@@ -633,14 +777,17 @@ def cake_dsv4_workspace_layout(
     final_lse_bytes = (
         _align_up(tokens * heads * torch.float32.itemsize) if with_lse else 0
     )
+    lens_offset = final_lse_offset + final_lse_bytes
+    lens_bytes = 2 * _align_up(tokens * torch.int32.itemsize) if with_prefill else 0
     return WorkspaceLayout(
         descriptor_slab=(_DESCRIPTOR_SLAB_OFFSET, _DESCRIPTOR_SLAB_BYTES),
         counters=(_COUNTER_OFFSET, _COUNTER_REGION_BYTES),
         partial_o=(o_offset, o_bytes),
         partial_lse=(lse_offset, lse_bytes),
         query_offsets=(offsets_offset, offsets_bytes),
-        total_bytes=final_lse_offset + final_lse_bytes,
+        total_bytes=lens_offset + lens_bytes,
         lse=(final_lse_offset, final_lse_bytes),
+        prefill_lens=(lens_offset, lens_bytes),
     )
 
 
@@ -682,14 +829,23 @@ def get_cake_dsv4_workspace_bytes(
     ``num_splits`` if given, else ``min(ceil(sparse_topk / 128) +
     ceil(extra_topk / 128), 12)`` (the plan never exceeds the candidate tile
     count or the kernel's 12-split cap), and a final-LSE region
-    ``align128(num_query_tokens * num_heads * 4)`` is appended.
+    ``align128(num_query_tokens * num_heads * 4)`` is appended, then the
+    prefill bodies' two ``align128(num_query_tokens * 4)`` length regions (the
+    bound covers the decode family and the prefill bodies alike). A call with a
+    packed NVFP4 query runs the prefill bodies, which write the final output and
+    LSE directly and need only the one-split carve
+    ``cake_dsv4_workspace_layout(num_query_tokens, num_heads, 1, with_lse=True,
+    with_prefill=True).total_bytes``.
     """
     if dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError(f"unsupported CAKE DSv4 dtype: {dtype}")
     topk = _positive_int(sparse_topk, "sparse_topk")
     if kv_cache_format == "nvfp4":
         if dtype != torch.bfloat16:
-            raise ValueError("the CAKE DSv4 NVFP4 route takes a BF16 query")
+            raise ValueError(
+                "the CAKE DSv4 NVFP4 route sizes its workspace with dtype "
+                "torch.bfloat16 (a BF16 or a packed NVFP4 query)"
+            )
         if (
             isinstance(extra_topk, bool)
             or not isinstance(extra_topk, int)
@@ -707,7 +863,7 @@ def get_cake_dsv4_workspace_bytes(
             else _positive_int(num_splits, "num_splits")
         )
         return cake_dsv4_workspace_layout(
-            num_query_tokens, num_heads, splits, with_lse=True
+            num_query_tokens, num_heads, splits, with_lse=True, with_prefill=True
         ).total_bytes
     if kv_cache_format != "fp8":
         raise ValueError(f"unsupported CAKE DSv4 kv_cache_format: {kv_cache_format!r}")
@@ -841,6 +997,12 @@ def _ensure_counters_zeroed(
 
 _TMA_SOURCE_ALIASES: Mapping[str, str] = {
     "tmap_q": "Q",
+    # The NVFP4 prefill bodies read the packed query [tokens, heads, 384] through
+    # a data map and a scale map over the same rows, and each pool through a
+    # data-row map and a scale-row map (``_nvfp4_pool_row_views``).
+    "tmap_q_sf": "Q",
+    "tmap_swa_sf": "SWA_sf",
+    "tmap_compressed_sf": "compressed_KV_sf",
     "tmap_swa_k": "SWA_cache",
     "tmap_swa_v": "SWA_cache",
     "tmap_swa_kv": "SWA_cache",
@@ -905,6 +1067,11 @@ _TENSOR_VALUE_NAMES = frozenset(
         "main_cache_g4f",
         "extra_cache_g4d",
         "extra_cache_g4f",
+        # NVFP4 prefill bodies (pool scale-row views, the final LSE, the extra table's lengths).
+        "SWA_sf",
+        "compressed_KV_sf",
+        "LSE",
+        "extra_topk_lens",
     }
 )
 # Kernel parameters bound as Python floats (the NVFP4 members take the LSE
@@ -927,6 +1094,10 @@ _SCALAR_VALUE_NAMES = frozenset(
         "batch_size",
         "max_q_len",
         "ragged_query",
+        # Rows of the flat compressed-KV pool: SM107's last-tile L2 prefetch
+        # sibling of the four-stage M64 program bounds the pool rows it
+        # prefetches by it (_kv4_l2pf_variant).
+        "compressed_KV_rows",
         # NVFP4 cache route.
         "num_main_tiles",
         "tiles_per_split",
@@ -945,6 +1116,15 @@ _SCALAR_VALUE_NAMES = frozenset(
         # Retrace knobs of the templated NVFP4 members (runtime instantiation switch).
         "tile_n",
         "o_chunks",
+        # NVFP4 prefill bodies: pool geometry in 32-byte units and the two table widths.
+        "swa_page_log2",
+        "swa_pitch_units",
+        "swa_footer_units",
+        "compressed_page_log2",
+        "compressed_pitch_units",
+        "compressed_footer_units",
+        "swa_width",
+        "compressed_width",
         *_FLOAT_SCALAR_VALUE_NAMES,
     }
 )
@@ -982,14 +1162,32 @@ _FP8_PERSISTENT_SHORT_QUERY_UNIFORM = {
 }
 
 
+# Architectures whose SWA-only decode launches keep the uniform-gather route at
+# every row count, with the longest request (``max_q_len``) they apply to.
+# GB300 (152 SMs), 128 heads, newest-first windows: q_len 1 at 128-4096 rows,
+# lane-issued route (its PDL-free twin from 384 rows) 11.58-160.90 us ->
+# uniform 11.17-160.38 us (1.002-1.044x); q_len 2 at 512-4096 rows 0.993-1.016x
+# (noise); q_len 4 and 8 lose from 1024 rows (0.939-0.989x), so they keep the
+# lane-issued route.
+_FP8_PERSISTENT_SWA_DECODE_UNIFORM = {"sm_103a": 2}
+
+
 def _fp8_persistent_program(
     num_query_tokens: int,
     *,
     max_q_len: Optional[int] = None,
     topk4x: bool = False,
     arch: Optional[str] = None,
+    swa: bool = False,
 ) -> str:
     if num_query_tokens < _FP8_PERSISTENT_LANE_GATHER_MIN_TOKENS:
+        return "fp8_h128_prefill_source_persistent_uniform"
+    if (
+        swa
+        and arch in _FP8_PERSISTENT_SWA_DECODE_UNIFORM
+        and max_q_len is not None
+        and max_q_len <= _FP8_PERSISTENT_SWA_DECODE_UNIFORM[arch]
+    ):
         return "fp8_h128_prefill_source_persistent_uniform"
     entries = _FP8_PERSISTENT_SHORT_QUERY_UNIFORM.get(arch, ()) if arch else ()
     if max_q_len is not None and any(
@@ -1016,6 +1214,11 @@ _FP8_H64_PERSISTENT_ONE_TILE_MIN_WIDTH = {"sm_107a": (192, 176)}
 # so widths 353-383 keep the persistent body.
 _FP8_H64_PERSISTENT_SHORT_MIN_WIDTH_KV4 = {"sm_107a": {1: 177, 2: 353}}
 
+# Architectures whose FP8/H64 rows of two complete sparse tiles and a partial
+# third (widths 257-383) run the persistent body up to 12 tokens as well, in
+# place of the H64 cluster body (:func:`_fp8_h64_uses_cluster_body`).
+_FP8_H64_PERSISTENT_PARTIAL_THIRD_ARCHES = frozenset({"sm_103a"})
+
 
 def _fp8_h64_uses_persistent_body(
     sparse_topk: int,
@@ -1037,9 +1240,19 @@ def _fp8_h64_uses_persistent_body(
     Launches whose multi-tile M64 route runs its four-stage sibling (``kv4``)
     take the minimum widths up to 16 tokens from
     ``_FP8_H64_PERSISTENT_SHORT_MIN_WIDTH_KV4`` where it has an entry.
+
+    On SM103 the rows of two complete tiles and a partial third (widths
+    257-383) run it up to 12 tokens too
+    (``_FP8_H64_PERSISTENT_PARTIAL_THIRD_ARCHES``).  GB300 (152 SMs), q_len 1,
+    1-12 tokens: widths 260-380 with every slot live, H64 cluster body
+    9.38-10.19 -> persistent body 8.22-9.17 us
+    (1.08-1.20x); width 320 with 256 live (a C128 table padded to the
+    server's context) 8.90-9.31 -> 7.52-7.62 us (1.18-1.23x).
     """
     full_tiles = sparse_topk // 128
     if num_query_tokens <= 12:
+        if arch in _FP8_H64_PERSISTENT_PARTIAL_THIRD_ARCHES and full_tiles == 2:
+            return sparse_topk > 2 * _TILE_KV
         return full_tiles >= 3
     if kv4 and num_query_tokens <= 16:
         short_min_width = _FP8_H64_PERSISTENT_SHORT_MIN_WIDTH_KV4.get(arch, {}).get(
@@ -1222,9 +1435,10 @@ def _fp8_h64_m64_program(sparse_topk: int) -> str:
 _FP8_H64_SOURCE_EXACT_M64_ARCHES = frozenset({"sm_107a"})
 
 
-# Architectures that build the H64 cluster body (``fp8_lowhead_h64``); SM107
-# registers no program for it.
-_FP8_LOWHEAD_H64_ARCHES = frozenset({"sm_100a", "sm_103a"})
+# Architectures that build the H64 cluster body (``fp8_lowhead_h64``) and route
+# rows to it; SM107 registers no program for it, and SM103 runs its rows on the
+# persistent body (``_FP8_H64_PERSISTENT_PARTIAL_THIRD_ARCHES``).
+_FP8_LOWHEAD_H64_ARCHES = frozenset({"sm_100a"})
 
 
 def _fp8_h64_uses_cluster_body(
@@ -1237,7 +1451,8 @@ def _fp8_h64_uses_cluster_body(
     260-380, both cache layouts: B200 9.5-10.3 us vs 10.0-11.1 us, GB300
     9.1-10.0 us vs 9.4-10.7 us).  Width 256 (no partial tile: B200 8.8-9.4 us
     vs 7.6-8.9 us, GB300 8.5-9.2 us vs 7.2-8.3 us) and rows with one complete
-    tile keep the M64 body; so does ``arch=None`` (unknown device)."""
+    tile keep the M64 body; so does ``arch=None`` (unknown device).  On SM103
+    the persistent body leads both (:func:`_fp8_h64_uses_persistent_body`)."""
     return (
         arch in _FP8_LOWHEAD_H64_ARCHES
         and num_query_tokens <= 12
@@ -1245,12 +1460,62 @@ def _fp8_h64_uses_cluster_body(
     )
 
 
-# Architectures where two more kinds of FP8 rows leave the low-head prefill
-# producer for the single-CTA M64 body: the 8-head prefill rows (``_route``)
-# and the 8/16/32-head SWA-only decode rows past one wave
-# (``_fp8_lowhead_swa_uses_m64_body``).  Measured on SM107 only; SM100, SM103
-# and ``arch=None`` keep the producer on those rows.
-_FP8_LOWHEAD_M64_ARCHES = frozenset({"sm_107a"})
+# Architectures where the 8/16/32-head SWA-only decode rows past one wave
+# leave the low-head prefill producer for the single-CTA M64 body
+# (``_fp8_lowhead_swa_uses_m64_body``); ``arch=None`` keeps the producer.
+_FP8_LOWHEAD_M64_ARCHES = frozenset({"sm_100a", "sm_103a", "sm_107a"})
+
+# Architectures where the 32-head decode rows wider than one producer
+# partition (``_FP8_ONE_PARTITION_MAX_WIDTH``) run the FP8/H128 persistent body
+# while it fits one wave (``_fp8_lowhead_wide_uses_persistent_body``); the
+# others run the M64 body at every token count.
+_FP8_LOWHEAD_PERSISTENT_ARCHES = frozenset({"sm_100a", "sm_103a"})
+
+
+def _fp8_lowhead_wide_uses_persistent_body(
+    num_heads: int, num_query_tokens: int, sm_count: int, arch: Optional[str]
+) -> bool:
+    """FP8 decode rows (``max_q_len < 257``) of 8, 16 or 32 heads wider than
+    one producer partition that run the FP8/H128 persistent body; the rest run
+    the M64 body (one CTA per token, heads past ``num_heads`` predicated).
+
+    32 heads only: the persistent epilogue stores O in 32-row boxes from row
+    ``token * num_heads``, so at 8 or 16 heads a box would cover the next
+    tokens' rows.  The persistent body launches two CTAs per token and leads
+    while they fit one wave; past it the M64 body runs the rows, as on the
+    64-head rows (:func:`_fp8_h64_uses_m64_body`).  GB300 (152 SMs), q_len 1
+    and 4, width 640 / 1152: 1-64 tokens 10.3-11.7 / 13.2-15.1 us vs M64
+    13.3-14.4 / 19.7-21.2 us; 128-256 tokens M64 15.8-25.6 / 22.7-40.5 us vs
+    16.8-26.6 / 22.7-38.8 us (M64 1.04-1.08x at 640, 0.96-1.00x at 1152).
+    At 8 and 16 heads the M64 body runs within one wave at 0.97-1.01x of the
+    low-head prefill producer at width 640 and 1.05-1.09x at 1152, and
+    1.69-2.22x past it.
+    """
+    return (
+        num_heads == 32
+        and arch in _FP8_LOWHEAD_PERSISTENT_ARCHES
+        and not _fp8_h64_uses_m64_body(num_query_tokens, sm_count)
+    )
+
+
+def _fp8_lowhead_narrow_uses_one_partition(
+    num_query_tokens: int, sm_count: int, arch: Optional[str]
+) -> bool:
+    """FP8 decode rows (``max_q_len < 257``) of 8, 16 or 32 heads with a
+    compressed cache and at most ``_FP8_ONE_PARTITION_MAX_WIDTH`` sparse slots
+    that run the one-partition producer; the rest run the M64 body.
+
+    The producer launches two CTAs per token and runs these rows while they
+    fit one wave.  Past it the M64 body (one CTA per token) leads at every
+    width and fill: GB300 (152 SMs), q_len 1, newest-first windows, widths
+    192-384 with every slot live and width 320 with 256 live (a C128 table
+    padded to the server's context), 128 and 256 tokens: 15.2-36.5 us ->
+    9.2-18.3 us (1.49-2.42x) at 8, 16 and 32 heads.  Within the wave neither
+    body leads everywhere (M64 0.81-1.33x of the producer, behind on the
+    rows whose slots are all live).  SM107 builds no one-partition program
+    and runs the M64 body at every token count.
+    """
+    return arch != "sm_107a" and 2 * num_query_tokens <= sm_count
 
 
 def _fp8_lowhead_swa_uses_m64_body(
@@ -1264,9 +1529,12 @@ def _fp8_lowhead_swa_uses_m64_body(
     single-CTA M64 body (one CTA per token) saves.  R200 (sm_107a, 216 SMs),
     q_len 4, CUDA graph + PDL, per call: 112-256 tokens 6.71-10.45 us ->
     4.06-5.69 us (1.56-1.85x) at 8, 16 and 32 heads; 96 and 108 tokens (one
-    wave) 0.98-1.01x, which keep the producer.  A rule of its own, kept apart
-    from the 64-head one (``_fp8_h64_uses_m64_body``), and on the
-    architectures of ``_FP8_LOWHEAD_M64_ARCHES`` only.
+    wave) 0.98-1.01x, which keep the producer.  GB300 (152 SMs), q_len 1,
+    newest-first windows: 77-256 tokens 10.7-21.5 us -> 7.3-10.9 us
+    (1.43-1.99x) at 8, 16 and 32 heads; 64 and 76 tokens 0.92-0.97x, which
+    keep the producer.  A rule of its own, kept apart from the 64-head one
+    (``_fp8_h64_uses_m64_body``), and on the architectures of
+    ``_FP8_LOWHEAD_M64_ARCHES`` only.
     """
     return arch in _FP8_LOWHEAD_M64_ARCHES and 2 * num_query_tokens > sm_count
 
@@ -1430,8 +1698,9 @@ def _route(
     kv4: bool = False,
 ) -> str:
     """The variant one call runs; ``sm_count`` is the device's SM count (the
-    FP8/H64 decode rows, and on SM107 the FP8 8/16/32-head SWA-only decode
-    rows, pick their body by the waves of its grid) and ``arch`` its
+    FP8/H64 decode rows, the FP8 32-head decode rows wider than 384 on SM100
+    and SM103, and on SM107 the FP8 8/16/32-head SWA-only decode rows, pick
+    their body by the waves of its grid) and ``arch`` its
     ``sm_XYa`` target (``None``: the architecture-independent choice, which
     may name a program SM107 does not build: it has no BF16 programs, no FP8
     source-exact program and no FP8 low-head cluster or one-partition
@@ -1444,13 +1713,42 @@ def _route(
     is_topk4x = not is_swa and compressed_page_size == 64
     is_topk128x = not is_swa and compressed_page_size == 2
     if dtype == torch.float8_e4m3fn:
+        if sparse_topk > _FP8_MAX_WIDTH:
+            # The backend='cake' NVFP4 route takes up to _NVFP4_MAX_SPLITS
+            # tiles of 128 slots per token; only rows within it are sent there,
+            # and only on the architectures that register NVFP4 programs
+            # (``arch=None``: the architecture-independent choice).
+            from ..jit.cake_dsv4 import _NVFP4_IDENTITIES
+
+            nvfp4_max_width = _NVFP4_MAX_SPLITS * _TILE_KV
+            if sparse_topk <= nvfp4_max_width and (
+                arch is None or arch in _NVFP4_IDENTITIES
+            ):
+                elsewhere = (
+                    "Run these rows with backend='trtllm-gen' on this cache, or on "
+                    "an NVFP4 KV cache (kv_cache_format='nvfp4'), whose "
+                    f"backend='cake' route takes up to {nvfp4_max_width} slots per "
+                    "token."
+                )
+            else:
+                elsewhere = "Run these rows with backend='trtllm-gen'."
+            raise ValueError(
+                f"backend='cake' has no FP8 kernel for sparse_topk {sparse_topk}: "
+                f"the FP8 DSv4 kernels take at most {_FP8_MAX_WIDTH} sparse slots "
+                "per token (128 SWA + 1024 compressed). A C128 layer is wider past "
+                "128K context (128 + context / 128 slots, 2176 at 256K). " + elsewhere
+            )
         if num_heads == 128:
             # One producer for every FP8/H128 row: the persistent body (one
             # work feed over T x 2 CTAs, runtime q_lens) matched or beat the
             # former per-(token, split) cluster producer on the 12-token
             # decode rows and beat trtllm-gen 1.12-1.75x on the MTP rows.
             return _fp8_persistent_program(
-                num_query_tokens, max_q_len=max_q_len, topk4x=is_topk4x, arch=arch
+                num_query_tokens,
+                max_q_len=max_q_len,
+                topk4x=is_topk4x,
+                arch=arch,
+                swa=is_swa,
             )
         if num_heads not in (8, 16, 32, 64):
             raise ValueError(f"unsupported CAKE FP8 DSv4 head count: {num_heads}")
@@ -1467,31 +1765,17 @@ def _route(
             # the M64 body below (_FP8_H64_SOURCE_EXACT_M64_ARCHES).
             return "fp8_h64_source_exact"
         if max_q_len >= 257:
-            if num_heads in (16, 32, 64):
-                # The single-CTA M64 persistent body (num_heads runtime, heads
-                # past num_heads predicated) beats the low-head prefill
-                # producer on every 16/32/64-head prefill row of the DSv4
-                # contract on GB300: 2.1-5.2x on the 512-8192-token rows
-                # (widths 128-1024, single and dual caches), with the same
-                # oracle.  Two programs, selected by the item width.
-                return _fp8_h64_m64_program(sparse_topk)
-            if arch in _FP8_LOWHEAD_M64_ARCHES and sparse_topk <= _FP8_M64_MAX_WIDTH:
-                # 8-head prefill rows take the same M64 body on SM107: R200
-                # (sm_107a, 216 SMs), CUDA graph + PDL, per call, measured at
-                # (tokens x width) 257 x 128, 386 x 640, 1024 x 128 / 640 /
-                # 1152 and 2048 x 128 / 640 / 1152: 1.87-4.66x (one
-                # 257-token request at width 128: 10.50 -> 5.61 us; two
-                # 1024-token requests at width 1152: 318.4 -> 68.4 us), with
-                # the same oracle.  Other architectures (unmeasured there)
-                # keep the low-head prefill producer for 8-head prefill rows.
-                return _fp8_h64_m64_program(sparse_topk)
-            if sparse_topk > _FP8_LOWHEAD_PREFILL_MAX_WIDTH:
-                raise ValueError(
-                    f"backend='cake' has no FP8 kernel for {num_heads} heads "
-                    f"with sparse_topk {sparse_topk} > "
-                    f"{_FP8_LOWHEAD_PREFILL_MAX_WIDTH} at max_q_len >= 257"
-                )
-            return "fp8_lowhead_prefill"
+            # The single-CTA M64 persistent body (num_heads runtime, heads
+            # past num_heads predicated) beats the low-head prefill producer
+            # on every prefill row of the DSv4 contract.  GB300: 2.1-5.2x on
+            # the 16/32/64-head rows of 512-8192 tokens (widths 128-1024,
+            # single and dual caches), 2.1-4.7x on the 8-head rows of
+            # 512-8192 tokens (widths 128, 640 and 1152; two requests at
+            # 8192 tokens, width 1152: 2240 -> 909 us).  R200
+            # (sm_107a, 216 SMs), CUDA graph + PDL, 8 heads at (tokens x
+            # width) 257 x 128 to 2048 x 1152: 1.87-4.66x.  Same oracle.  Two
+            # programs, selected by the item width.
+            return _fp8_h64_m64_program(sparse_topk)
         if (
             num_heads in (8, 16)
             and batch_size == 3
@@ -1545,15 +1829,18 @@ def _route(
             return "fp8_lowhead_prefill"
         # One producer partition owns up to three sparse tiles (widths up to
         # 384) and writes final O directly (one partition measured 1.18-1.26x
-        # on the width-260 rows).  No two-partition producer is exported for
-        # wider low-head rows.
-        if sparse_topk > _FP8_ONE_PARTITION_MAX_WIDTH:
-            raise ValueError(
-                f"backend='cake' has no FP8 kernel for {num_heads} heads with "
-                f"sparse_topk {sparse_topk} > {_FP8_ONE_PARTITION_MAX_WIDTH} "
-                f"below max_q_len 257"
-            )
-        return "fp8_lowhead_one_partition"
+        # on the width-260 rows); past one wave the M64 body runs them.
+        if sparse_topk <= _FP8_ONE_PARTITION_MAX_WIDTH:
+            if _fp8_lowhead_narrow_uses_one_partition(num_query_tokens, sm_count, arch):
+                return "fp8_lowhead_one_partition"
+            return _fp8_h64_m64_program(sparse_topk)
+        # Wider rows (C4 at 640 or 1152, C128 past 32K context) run the
+        # persistent or the M64 body.
+        if _fp8_lowhead_wide_uses_persistent_body(
+            num_heads, num_query_tokens, sm_count, arch
+        ):
+            return _fp8_persistent_program(num_query_tokens)
+        return _fp8_h64_m64_program(sparse_topk)
     if dtype != torch.bfloat16:
         raise ValueError(f"unsupported CAKE DSv4 dtype: {dtype}")
     if (
@@ -2187,6 +2474,85 @@ _KV4_SIBLING_ROUTES = frozenset({"fp8_h64_prefill_source_persistent_m64_multi_ti
 # (:func:`_kv4_sibling_launchable`, :func:`_kv4_variant`).
 _KV4_SIBLING_OVERSIZED_SMEM_BYTES = {"sm_107a": 322688}
 
+# The TMEM-batch sibling ``<route>_kv4_bcl`` of the four-stage sibling on
+# SM107: the four-stage program whose correction warps rescale each output
+# stage in two 64-column TMEM load / multiply / store passes in place of eight
+# 16-column steps and whose softmax waits once for its two max-reduction loads,
+# with the four-stage program's arguments, grid, launch and shared memory and
+# the same output bits.  It takes the four-stage launches of one window and
+# every other launch keeps the four-stage program (:func:`_kv4_bcl_variant`):
+# 64-head MTP decode launches of calls whose longest request has 2-4 query
+# tokens, of at least 108 rows and at most two rows per SM of the device (432
+# at 216 SMs, 424 at 212, 416 at 208), over items of at most six tiles.  R200
+# (216 SMs) and VR200 (212 SMs), eight calls per CUDA graph over distinct
+# inputs behind an L2 flush / over one input, four-stage program -> TMEM-batch
+# program: q_len 2-4, widths 384-768, 108 rows to two per SM 0.996-1.011x /
+# 1.000-1.012x, no row slower beyond the spread of two runs of the same
+# program.  The window leaves out the launches on which the TMEM-batch program
+# trailed: one-token requests, 96-row launches over items 768 wide, items 1152
+# wide and 257- to 1024-token prefill.  The decode windows
+# (``_KV4_BCL_DECODE_WINDOWS``) take back one-token launches of one layer,
+# width and row range where the TMEM-batch program measured faster.
+_KV4_BCL_HEADS = 64  # query heads
+_KV4_BCL_MIN_Q = 2  # query tokens of the call's longest request
+_KV4_BCL_MAX_Q = 4
+_KV4_BCL_MIN_TOKENS = 108  # query rows of the launch
+_KV4_BCL_MAX_TOKENS_PER_SM = 2  # query rows of the launch per SM of the device
+_KV4_BCL_MAX_TOPK = 768  # item width (sparse_topk), six tiles
+
+# The TMEM-batch sibling's decode windows: 64-head launches of calls whose
+# ``(max_q_len, sparse_topk, compressed_page_size)`` names a window, of its
+# rows and at most one row per SM, on a device of an SM count in
+# ``_KV4_BCL_DECODE_SM_COUNTS`` (:func:`_kv4_bcl_variant`).  One window: the
+# one-token decode of the c4 layer (compressed pages of 64 rows) over items
+# 1152 wide, 176-208 rows.  R200 (216 SMs) and VR200 (212 SMs), two
+# processes each, eight calls per CUDA graph over distinct inputs behind an
+# L2 flush, four-stage program -> TMEM-batch program at every row count from
+# 176 to 208: 0.007-0.133 us faster per call in every run, 19 of the 33 row
+# counts beyond the spread of two runs of the same program in all four
+# runs, no row slower.  The window leaves out the c128 layer (compressed
+# pages of 2 rows), 144- and 160-row and 256- to 416-row launches (slower
+# there) and devices of other SM counts (not measured; on 208 SMs a 208-row
+# launch fills the device).
+_KV4_BCL_DECODE_WINDOWS: dict[tuple[int, int, int], tuple[int, int]] = {
+    (1, 1152, 64): (176, 208),
+}
+_KV4_BCL_DECODE_SM_COUNTS = frozenset({212, 216})
+
+# The last-tile L2 prefetch sibling ``<route>_kv4_l2pf`` of the four-stage
+# sibling on SM107: the four-stage program whose index warp, in a launch of at
+# most one row per SM, prefetches into L2 the compressed-KV pool rows of each
+# item's last tile (items of at least four tiles) after the item's last index
+# pass, with the four-stage program's grid, launch and shared memory, the
+# compressed-KV pool and its row count as two more arguments, and the same
+# output bits.  It takes the four-stage launches of 64-head calls over
+# compressed pages of 64 rows (the c4 layer) whose ``(sparse_topk,
+# max_q_len)`` names a row ceiling in ``_KV4_L2PF_MAX_TOKENS``, of at most
+# that many rows and at most one row per SM, on a device of an SM count in
+# ``_KV4_L2PF_SM_COUNTS``; a launch of 4-token requests also has to be
+# uniform (``num_query_tokens == batch_size * max_q_len``).  Every other
+# launch keeps the four-stage program (:func:`_kv4_l2pf_variant`).  R200
+# (216 SMs) and VR200 (212 SMs), two processes each, eight calls per CUDA
+# graph over distinct inputs behind an L2 flush, four-stage program -> L2
+# prefetch program, per row and call: items 640 wide, one-token requests,
+# 32-47 rows 0.160-0.330 us faster; four-token requests, 32-44 and 60-64
+# rows 0.060-0.328 us; items 512 wide, one-token requests at 40-41 rows
+# 0.090-0.176 us, four-token requests at 40-56 rows 0.028-0.250 us.  The
+# ceilings stop below the first measured row count that was not faster.
+# The rows of these widths and request lengths that the host does not send
+# to the four-stage program (48-57 rows over items 640 wide, for example)
+# never reach it.
+_KV4_L2PF_HEADS = 64  # query heads
+_KV4_L2PF_PAGE = 64  # compressed page rows (the c4 layer)
+_KV4_L2PF_MAX_TOKENS: dict[tuple[int, int], int] = {
+    # (sparse_topk, max_q_len): most query rows of the launch
+    (640, 1): 47,
+    (640, 4): 64,
+    (512, 1): 41,
+    (512, 4): 56,
+}
+_KV4_L2PF_SM_COUNTS = frozenset({212, 216})
+
 # The routes with an early-PV sibling ``<route>_overlap`` on SM107: the route's
 # program whose P x V MMAs start once the softmax has written the low half of
 # P and whose epilogues drain the output of the first V block while the MMA of
@@ -2202,6 +2568,25 @@ _OVERLAP_SIBLING_ROUTES = frozenset({"fp8_lowhead_prefill"})
 # the measured ceiling (:func:`_overlap_variant`).
 _OVERLAP_SIBLING_MAX_TOKENS = {"sm_107a": 64}
 _OVERLAP_SIBLING_MEASURED_SMS = {"sm_107a": 216}
+
+# The routes with a V-block sibling ``<route>_vblock`` on SM107: the early-PV
+# sibling's program run with four work items per row instead of two, one
+# 128-column V block of the output each on its own CTA, with the route's
+# arguments and the same output bits.  Each CTA drains one V block instead of
+# two, and the launch takes four CTAs per row.  It takes the launches of at
+# most the row ceiling below; the larger launches keep the early-PV sibling or
+# the route's program (:func:`_vblock_variant`).
+_VBLOCK_SIBLING_ROUTES = frozenset({"fp8_lowhead_prefill"})
+
+# The most query rows a launch may have to take the V-block sibling, per
+# architecture, and the SM count of the part the ceiling is set for: at most
+# half of its SMs busy at four CTAs per row.  A part with fewer SMs scales the
+# ceiling down with its SM count; a part with more SMs keeps the ceiling.
+_VBLOCK_SIBLING_MAX_TOKENS = {"sm_107a": 27}
+_VBLOCK_SIBLING_MEASURED_SMS = {"sm_107a": 216}
+
+# The work items, and CTAs, per query row of a V-block sibling launch.
+_VBLOCK_ITEMS_PER_TOKEN = 4
 
 # The CUDA toolkit and runtime (``cudaRuntimeGetVersion``) version that added
 # the oversized shared-memory mode, and the driver's device attribute for its
@@ -2362,6 +2747,122 @@ def _fp8_h64_kv4_edges(
     )
 
 
+def _kv4_bcl_variant(
+    variant: str,
+    *,
+    arch: str,
+    num_heads: int,
+    max_q_len: int,
+    num_query_tokens: int,
+    sparse_topk: int,
+    device: torch.device,
+    compressed_page_size: Optional[int] = None,
+) -> str:
+    """The variant a launch over ``num_query_tokens`` rows of a call whose
+    longest request has ``max_q_len`` tokens runs once :func:`_kv4_variant`
+    chose ``variant``: its TMEM-batch sibling ``<variant>_bcl`` when
+    ``variant`` is the four-stage sibling of a route in
+    ``_KV4_SIBLING_ROUTES``, the call has ``_KV4_BCL_HEADS`` heads, ``arch``
+    routes the TMEM-batch sibling to a program other than the four-stage one
+    and the launch is in one of the sibling's windows, else ``variant``.  The
+    MTP window: ``max_q_len`` is from ``_KV4_BCL_MIN_Q`` to
+    ``_KV4_BCL_MAX_Q``, the items are at most ``_KV4_BCL_MAX_TOPK`` wide and
+    the launch has from ``_KV4_BCL_MIN_TOKENS`` rows to
+    ``_KV4_BCL_MAX_TOKENS_PER_SM`` rows per SM of ``device``.  A decode
+    window: ``_KV4_BCL_DECODE_WINDOWS`` names the call's ``(max_q_len,
+    sparse_topk, compressed_page_size)``, the launch has the window's rows and
+    at most one row per SM of ``device``, and ``device`` has an SM count in
+    ``_KV4_BCL_DECODE_SM_COUNTS``; a launch of an unknown
+    ``compressed_page_size`` (``None``) takes no decode window.  The
+    four-stage launch check :func:`_kv4_variant` applied covers the
+    TMEM-batch sibling, which takes the same shared memory."""
+    route = variant.removesuffix("_kv4")
+    if route == variant or route not in _KV4_SIBLING_ROUTES:
+        return variant
+    if num_heads != _KV4_BCL_HEADS:
+        return variant
+    decode: Optional[tuple[int, int]] = None
+    if compressed_page_size is not None:
+        decode = _KV4_BCL_DECODE_WINDOWS.get(
+            (max_q_len, sparse_topk, compressed_page_size)
+        )
+    if decode is None:
+        if not _KV4_BCL_MIN_Q <= max_q_len <= _KV4_BCL_MAX_Q:
+            return variant
+        if sparse_topk > _KV4_BCL_MAX_TOPK or num_query_tokens < _KV4_BCL_MIN_TOKENS:
+            return variant
+    elif not decode[0] <= num_query_tokens <= decode[1]:
+        return variant
+    from ..jit.cake_dsv4 import VARIANTS
+
+    programs = VARIANTS.get(arch, {})
+    sibling = f"{variant}_bcl"
+    if programs.get(sibling, programs.get(variant)) == programs.get(variant):
+        return variant
+    sm_count = _device_sm_count(device)
+    if decode is None:
+        ceiling = _KV4_BCL_MAX_TOKENS_PER_SM * sm_count
+    elif sm_count in _KV4_BCL_DECODE_SM_COUNTS:
+        ceiling = sm_count
+    else:
+        return variant
+    if num_query_tokens > ceiling:
+        return variant
+    return sibling
+
+
+def _kv4_l2pf_variant(
+    variant: str,
+    *,
+    arch: str,
+    num_heads: int,
+    max_q_len: int,
+    num_query_tokens: int,
+    sparse_topk: int,
+    device: torch.device,
+    batch_size: Optional[int] = None,
+    compressed_page_size: Optional[int] = None,
+) -> str:
+    """The variant a launch over ``num_query_tokens`` rows of a call of
+    ``batch_size`` requests whose longest has ``max_q_len`` tokens runs once
+    :func:`_kv4_bcl_variant` chose ``variant``: its last-tile L2 prefetch
+    sibling ``<variant>_l2pf`` when ``variant`` is the four-stage sibling of a
+    route in ``_KV4_SIBLING_ROUTES`` (not its TMEM-batch sibling), the call
+    has ``_KV4_L2PF_HEADS`` heads and compressed pages of ``_KV4_L2PF_PAGE``
+    rows, ``_KV4_L2PF_MAX_TOKENS`` gives ``(sparse_topk, max_q_len)`` a row
+    ceiling the launch does not pass, a launch of requests of more than one
+    token is uniform (``num_query_tokens == batch_size * max_q_len``),
+    ``arch`` routes the sibling to a program other than the four-stage one,
+    and ``device`` has an SM count in ``_KV4_L2PF_SM_COUNTS`` and at least
+    one SM per row, else ``variant``.  A launch of an unknown
+    ``compressed_page_size`` or, past one-token requests, ``batch_size``
+    (``None``) keeps ``variant``.  The four-stage launch check
+    :func:`_kv4_variant` applied covers the sibling, which takes the same
+    shared memory."""
+    route = variant.removesuffix("_kv4")
+    if route == variant or route not in _KV4_SIBLING_ROUTES:
+        return variant
+    if num_heads != _KV4_L2PF_HEADS or compressed_page_size != _KV4_L2PF_PAGE:
+        return variant
+    ceiling = _KV4_L2PF_MAX_TOKENS.get((sparse_topk, max_q_len))
+    if ceiling is None or num_query_tokens > ceiling:
+        return variant
+    if max_q_len > 1 and (
+        batch_size is None or num_query_tokens != batch_size * max_q_len
+    ):
+        return variant
+    from ..jit.cake_dsv4 import VARIANTS
+
+    programs = VARIANTS.get(arch, {})
+    sibling = f"{variant}_l2pf"
+    if programs.get(sibling, programs.get(variant)) == programs.get(variant):
+        return variant
+    sm_count = _device_sm_count(device)
+    if sm_count not in _KV4_L2PF_SM_COUNTS or num_query_tokens > sm_count:
+        return variant
+    return sibling
+
+
 def _overlap_variant(
     route: str, *, arch: str, num_query_tokens: int, device: torch.device
 ) -> str:
@@ -2388,6 +2889,39 @@ def _overlap_variant(
     if programs.get(sibling, programs.get(route)) == programs.get(route):
         return route
     return sibling
+
+
+def _vblock_variant(
+    route: str, *, arch: str, num_query_tokens: int, device: torch.device
+) -> str:
+    """The variant a launch of ``route`` over ``num_query_tokens`` rows on
+    ``device`` runs before the early-PV sibling is considered: its V-block
+    sibling when ``route`` is in ``_VBLOCK_SIBLING_ROUTES``, ``arch`` has a
+    ceiling in ``_VBLOCK_SIBLING_MAX_TOKENS``, the launch has at most that many
+    rows scaled by the device's SM count up to ``_VBLOCK_SIBLING_MEASURED_SMS``
+    (27 rows at 216 SMs, 26 at 212 and at 208) and ``arch`` routes the sibling
+    to a program other than the route's and the early-PV sibling's, else
+    ``route``.  The V-block sibling launches ``_VBLOCK_ITEMS_PER_TOKEN`` work
+    items, and CTAs, per row."""
+    if route not in _VBLOCK_SIBLING_ROUTES:
+        return route
+    max_tokens = _VBLOCK_SIBLING_MAX_TOKENS.get(arch)
+    if max_tokens is None:
+        return route
+    measured_sms = _VBLOCK_SIBLING_MEASURED_SMS[arch]
+    sm_count = min(_device_sm_count(device), measured_sms)
+    if num_query_tokens > max_tokens * sm_count // measured_sms:
+        return route
+    from ..jit.cake_dsv4 import VARIANTS
+
+    programs = VARIANTS.get(arch, {})
+    program = programs.get(f"{route}_vblock")
+    if program is None or program in (
+        programs.get(route),
+        programs.get(f"{route}_overlap"),
+    ):
+        return route
+    return f"{route}_vblock"
 
 
 def _pdl_variant(
@@ -2426,14 +2960,29 @@ def _pdl_variant(
 # per row; the split form of the K=64 program (``_K64_SPLIT_VARIANT``) runs
 # each row as ``s`` pieces of its sparse tiles, two CTAs per piece, and writes
 # partial O and LSE (module docstring, "Split-KV pieces"); the merge program
-# (``_K64_SPLIT_MERGE``, one CTA per row and head) writes O from them.  Both
-# launch back to back in one FFI call with the call's PDL setting.
+# (``_K64_SPLIT_MERGE``, one CTA per row and head, any ``s``) writes O from
+# them, or, for the 128-head launches whose rule's ``merge_by_splits`` names
+# a merge built for their ``s`` pieces alone at their rows, that merge
+# (``_K64_SPLIT_COUNT_MERGES``, :func:`_k64_split_merge`).  Both launch back
+# to back in one FFI call with the call's PDL setting.
 _K64_SPLIT_ROUTE = "fp8_h128_prefill_source_persistent_uniform"
 _K64_SPLIT_VARIANT = "fp8_h128_prefill_source_persistent_uniform_k64_split"
 # A launch splits only where the registry routes both keys to programs of
 # their own (:func:`_k64_split`).
 _K64_SPLIT_MERGE = "fp8_h128_prefill_source_persistent_uniform_k64_split_reduce"
 _K64_SPLIT_HEADS = 128
+# The merges built for one piece count s, each with the heads one of its CTAs
+# serves: ``_c{s}`` is the copy of ``_K64_SPLIT_MERGE`` for s pieces alone
+# (one CTA per row and head, the same per-element operations; the merge of
+# any count holds the copies for 1-9 pieces and picks one at run time) and
+# ``_s3`` the three-piece merge with one warp per row and head (two heads per
+# CTA).  A 128-head launch of s pieces takes the one its rule's
+# ``merge_by_splits`` names for s at its rows (:func:`_k64_split_merge`).
+_K64_SPLIT_COUNT_MERGES: Mapping[str, int] = {
+    f"{_K64_SPLIT_MERGE}_c9": 1,
+    f"{_K64_SPLIT_MERGE}_c5": 1,
+    f"{_K64_SPLIT_MERGE}_s3": 2,
+}
 
 
 @dataclass(frozen=True)
@@ -2449,27 +2998,66 @@ class _K64SplitRule:
     # ``s`` pieces per row with ``s`` at most ``num_tiles`` and rows x ``s``
     # at most that count's ``most pieces``.
     splits: tuple[tuple[int, int], ...]
+    # ``(s, fewest rows, merge)``: a launch of ``s`` pieces per row merges
+    # with the ``merge`` (``_K64_SPLIT_MERGE`` or a key of
+    # ``_K64_SPLIT_COUNT_MERGES``) of the entry for ``s`` with the most
+    # ``fewest rows`` at most its rows, and with ``_K64_SPLIT_MERGE`` where no
+    # entry is (128 heads only).
+    merge_by_splits: tuple[tuple[int, int, str], ...] = ()
 
 
 # Per architecture.  R200 (sm_107a, 208 SMs), eight back-to-back calls per
 # CUDA graph with PDL, items 1152 wide (nine tiles) whose rows use all of
-# them, split launch vs the K=32 program: 1.50-1.51x at 1-2 rows (nine
-# pieces), 1.43x at 4, 1.34x at 8 (five), 1.23x at 12 (three), 1.18x at 14
-# and 1.11-1.12x at 15 (three) and 1.05-1.07x at 16-17 (two).  Three pieces
-# run up to 45 pieces: at 14-15 rows they measured 1.06-1.11x of two, and at
-# 16 rows (48 pieces) 0.91-0.92x.  Nine pieces at 5 rows (45 pieces) measured
-# 0.97x of five, so the other counts stay at 40.  A launch whose every row
-# fits in one piece (at most ceil(9 / s) tiles: short requests, piece 0
-# writes O itself) still runs the merge kernel and measured 0.81-0.86x (0.97x
-# of two pieces at 15 rows of at most three tiles); the host does not read
-# row lengths, so those launches split as well.  Without PDL the 17-row
-# launch measured 0.98x: no launch without PDL splits.
+# them, split launch vs the K=32 program: 1.50-1.51x at 1-2 rows and 1.43x
+# at 4 (nine pieces), 1.34x at 8 (five).  Nine pieces at 5 rows (45 pieces)
+# measured 0.97x of five, so nine and five stay at 40 pieces.  Three pieces
+# run every launch of 9-20 rows (at most 20 x 3 = 60 pieces, so no launch
+# takes two).  With the merge of any count, three pieces measured 1.23x of
+# the K=32 program at 12 rows and 1.11-1.12x at 15, but 0.91-0.92x of two
+# pieces at 16 rows (48 pieces).  The launches of 16-20 rows merge with
+# the three-piece merge (``merge_by_splits``: one warp per row and head, two
+# heads per CTA, the per-element operations of the merge of any count): in a
+# test harness on a 216-SM R200, three pieces with a merge of the three-piece
+# merge's geometry ran a median 0.80-0.93 us per call faster than two pieces
+# with the merge of any count at 16 and 17 rows, and at least 0.3 us faster
+# in each of 8 rounds.  At 18-20 rows, three pieces with the three-piece
+# merge ran 0.84-1.07 us per call faster than the K=32 program (1.09-1.11x)
+# in a test harness on a 216-SM R200 (CUDA graph of 8 calls, PDL, rows that
+# use all nine tiles), 1.08-1.13x on a 208-SM R200 and 1.05-1.11x on a
+# 212-SM VR200, faster beyond the A/A difference in every round on each.
+# The launches of 9-15 rows do not take the three-piece
+# merge: in a test harness on a 212-SM VR200, a 15-row batch of mixed row
+# lengths ran slower with it in every round.  The launches of nine and five
+# pieces merge with the merge built for their count alone
+# (``merge_by_splits``: ``_c9``, ``_c5``), the merge of any count's code for
+# that count, so the output bits do not change: in a test harness on a
+# 216-SM R200 (CUDA graph of 8 calls, PDL) the launches of 4, 7 and 8 rows
+# ran 0.12-0.37 us per call faster with it (1.01-1.05x), faster beyond the
+# A/A difference in each of 8 rounds, and the launches of 1-3, 5 and 6 rows
+# differed by at most 0.06 us; on a 208-SM R200 and a 212-SM VR200 no launch
+# of 1-8 rows ran slower beyond the A/A difference.  The three-piece launches
+# of 9-15 rows keep the merge of any count: the merge built for three pieces
+# alone ran slower than it on a 208-SM R200 and on a 212-SM VR200.  With the
+# merge of any count, a launch whose every row fits in one piece (at most
+# ceil(9 / s) tiles: short requests, piece 0 writes O itself) still runs the
+# merge kernel and measured 0.81-0.86x (0.97x of two pieces at 15 rows of at
+# most three tiles); the host does not read row lengths, so those launches
+# split as well.  At 18-20 rows, with the three-piece merge, such a launch
+# measured 0.78-0.81x (1.57-1.83 us per call slower) and one whose every row
+# uses at most five tiles 0.86-0.89x (0.97-1.33 us slower) on those three
+# boards.  Without PDL the 17-row launch measured 0.98x with two pieces:
+# no launch without PDL splits.
 _K64_SPLIT_RULES: Mapping[str, _K64SplitRule] = {
     "sm_107a": _K64SplitRule(
         num_tiles=9,
-        max_tokens_pdl=17,
+        max_tokens_pdl=20,
         max_tokens_no_pdl=0,
-        splits=((9, 40), (5, 40), (3, 45), (2, 40)),
+        splits=((9, 40), (5, 40), (3, 60)),
+        merge_by_splits=(
+            (9, 1, f"{_K64_SPLIT_MERGE}_c9"),
+            (5, 5, f"{_K64_SPLIT_MERGE}_c5"),
+            (3, 16, f"{_K64_SPLIT_MERGE}_s3"),
+        ),
     ),
 }
 
@@ -2539,6 +3127,37 @@ def _k64_split_plan(
         if splits <= rule.num_tiles and num_query_tokens * splits <= max_pieces:
             return (0, num_query_tokens, splits)
     return None
+
+
+def _k64_split_merge(
+    *, arch: str, num_heads: int, rows: int, num_splits: int
+) -> tuple[str, int]:
+    """The merge variant of a split launch and its heads per CTA: the
+    per-count merge the 128-head rule of ``arch`` names for ``num_splits``
+    pieces and ``rows`` rows (``merge_by_splits``) where the registry routes
+    it to a program of its own (not the route's, not ``_K64_SPLIT_MERGE``'s),
+    else ``_K64_SPLIT_MERGE`` (one CTA per row and head).  A per-count merge
+    runs its own count of pieces only, and the three-piece merge serves two
+    heads per CTA with no head bound: each must launch with its count and
+    over ``H`` divided by its heads per CTA, which a registry entry pointing
+    its key at either of those programs (a retired key) never does."""
+    key, fewest = _K64_SPLIT_MERGE, 0
+    if num_heads == _K64_SPLIT_HEADS and arch in _K64_SPLIT_RULES:
+        for s, at_least, merge in _K64_SPLIT_RULES[arch].merge_by_splits:
+            if s == num_splits and fewest < at_least <= rows:
+                key, fewest = merge, at_least
+    heads_per_cta = _K64_SPLIT_COUNT_MERGES.get(key)
+    if heads_per_cta is not None:
+        from ..jit.cake_dsv4 import VARIANTS
+
+        programs = VARIANTS.get(arch, {})
+        own = programs.get(key)
+        if own is not None and own not in (
+            programs.get(_K64_SPLIT_ROUTE),
+            programs.get(_K64_SPLIT_MERGE),
+        ):
+            return key, heads_per_cta
+    return _K64_SPLIT_MERGE, 1
 
 
 def _k64_split_workspace_bytes(
@@ -2734,16 +3353,33 @@ def run_cake_dsv4(
     rows per launch and on SM100 when the longest request has at least 257
     query tokens (``_pdl_variant``).  On SM107, PDL launches of few metadata
     rows run a split-KV producer and a merge when the workspace holds their
-    carve: FP8/H128 over items 1025-1152 wide (``_K64_SPLIT_RULES``) and
-    FP8/H64 over items of four to nine tiles (``_K64_SPLIT_RULES_H64``)
-    (:func:`_k64_split`; :func:`cake_dsv4_workspace_requirement` includes
-    it).
+    carve: FP8/H128 over items 1025-1152 wide (``_K64_SPLIT_RULES``; their
+    launches of nine and five pieces and of three pieces at 16-20 rows
+    merge with a merge built for their piece count where the registry has
+    it, :func:`_k64_split_merge`) and FP8/H64 over items of four to nine
+    tiles (``_K64_SPLIT_RULES_H64``) (:func:`_k64_split`;
+    :func:`cake_dsv4_workspace_requirement` includes it).
 
-    On SM107 the FP8 low-head prefill route runs launches of at most 64 query
-    rows (fewer on a part with fewer than 216 SMs) on its early-PV sibling and
-    the larger ones on its own program (``_overlap_variant``).  Each program
-    builds and loads its module on its first launch: warm up launches on both
-    sides of that ceiling eagerly before a capture.
+    On SM107 the FP8 low-head prefill route runs launches of at most 27 query
+    rows on its V-block sibling (``_vblock_variant``), launches of at most 64
+    query rows on its early-PV sibling (``_overlap_variant``) and the larger
+    ones on its own program; a part with fewer than 216 SMs lowers both
+    ceilings.  Each program builds and loads its module on its first launch:
+    warm up launches on both sides of each ceiling eagerly before a capture.
+
+    On SM107 the four-stage multi-tile M64 program runs the 64-head launches of
+    108 query rows up to two per SM over items at most 768 wide, of calls whose
+    longest request has 2-4 query tokens, on its TMEM-batch sibling, and so
+    the 64-head launches of 176-208 query rows of one-token requests over
+    items 1152 wide with compressed pages of 64 rows on a device of 212 or 216
+    SMs (``_KV4_BCL_DECODE_WINDOWS``), and every other launch on its own
+    program (``_kv4_bcl_variant``).  Its 64-head launches of few query rows
+    (at most 41 to 64 by item width and request length,
+    ``_KV4_L2PF_MAX_TOKENS``) over items 512 or 640 wide with compressed pages
+    of 64 rows, of one-token requests or of uniform 4-token requests, on
+    a device of 212 or 216 SMs run its L2 prefetch sibling
+    (``_kv4_l2pf_variant``).  Warm up launches on both sides of those windows
+    eagerly before a capture as well.
 
     ``out=None`` allocates the output here, after the route is known, so the
     routes in ``_OUT_PHASE_BY_ROUTE`` get their measured-fast base phase;
@@ -2905,6 +3541,7 @@ def run_cake_dsv4(
         "Q": query_rows.view(torch.uint8) if is_fp8 else query_rows,
         "SWA_cache": swa.view(torch.uint8) if is_fp8 else swa,
         "compressed_KV_cache": compressed.view(torch.uint8) if is_fp8 else compressed,
+        "compressed_KV_rows": int(compressed.shape[0]),
         "O": out_rows,
         "seq_lens": seq_lens,
         "cum_seq_lens_q": cum_seq_lens_q_value,
@@ -2918,6 +3555,10 @@ def run_cake_dsv4(
         "batch_size": batch_size,
         "max_q_len": max_q_len,
         "ragged_query": int(ragged),
+        # Host-only: the TMEM-batch sibling's decode windows and the L2
+        # prefetch sibling key on it (_kv4_bcl_variant, _kv4_l2pf_variant);
+        # no argument plan names it.
+        "compressed_page_size": int(compressed_kv_cache.shape[-2]),
         "num_splits": 1,
         "total_work_items": num_query_tokens,
         "enable_pdl": bool(enable_pdl),
@@ -3188,7 +3829,8 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         if L.split is not None:
             # SM107 split-KV launch (_k64_split): W whole rows, then R rows of
             # s pieces each (two CTAs per item); the merge writes the split
-            # rows' O, one CTA per (row, head).  One run_sequence call.
+            # rows' O, one CTA per (row, head) or, for the three-piece merge,
+            # per (row, two heads) (_k64_split_merge).  One run_sequence call.
             num_whole, rows, num_splits = L.split
             items = num_whole + rows * num_splits
             pieces = L.pieces(rows, num_splits)
@@ -3199,9 +3841,12 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
                 num_whole_items=num_whole,
                 **pieces,
             )
+            merge, heads_per_cta = _k64_split_merge(
+                arch=L.arch, num_heads=H, rows=rows, num_splits=num_splits
+            )
             merge_launch = L.variant(
-                _K64_SPLIT_MERGE,
-                grid=(rows, H, 1),
+                merge,
+                grid=(rows, H // heads_per_cta, 1),
                 O=v["O"][num_whole:],
                 **pieces,
             )
@@ -3229,9 +3874,38 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         # runs the multi-tile program's launches on its four-stage sibling
         # where this process can launch it (_kv4_variant); run_cake_dsv4
         # routed the FP8/H64 decode rows by the same check (_fp8_h64_kv4_edges).
+        # The four-stage launches of the TMEM-batch windows (64-head MTP decode
+        # and the decode windows of _KV4_BCL_DECODE_WINDOWS) run its TMEM-batch
+        # sibling (_kv4_bcl_variant); those of the L2 prefetch window (64-head
+        # decode of few rows over items 512 or 640 wide, _KV4_L2PF_MAX_TOKENS)
+        # run its L2 prefetch sibling (_kv4_l2pf_variant).  The windows do not
+        # overlap: the TMEM-batch windows start at 108 rows.
         parts = L.partials(1)
+        device = v["Q"].device
+        page = v.get("compressed_page_size")
+        program = _kv4_bcl_variant(
+            _kv4_variant(route, arch=L.arch, device=device),
+            arch=L.arch,
+            num_heads=H,
+            max_q_len=v["max_q_len"],
+            num_query_tokens=T,
+            sparse_topk=topk,
+            device=device,
+            compressed_page_size=page,
+        )
+        program = _kv4_l2pf_variant(
+            program,
+            arch=L.arch,
+            num_heads=H,
+            max_q_len=v["max_q_len"],
+            num_query_tokens=T,
+            sparse_topk=topk,
+            device=device,
+            batch_size=v.get("batch_size"),
+            compressed_page_size=page,
+        )
         program = _pdl_variant(
-            _kv4_variant(route, arch=L.arch, device=v["Q"].device),
+            program,
             arch=L.arch,
             enable_pdl=v["enable_pdl"],
             num_query_tokens=T,
@@ -3249,15 +3923,23 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         # prefill producer runs one CTA per work item over two items per
         # token; the decode producers run one two-CTA cluster per token.  SM107
         # runs the prefill producer's launches up to a row ceiling on its
-        # early-PV sibling (_overlap_variant).
+        # early-PV sibling (_overlap_variant), and the smallest ones on its
+        # V-block sibling over four items per token (_vblock_variant).
         work_items = 2 * T if route == "fp8_lowhead_prefill" else T
-        program = _overlap_variant(
+        ctas = 2 * T
+        program = _vblock_variant(
             route, arch=L.arch, num_query_tokens=T, device=v["Q"].device
         )
+        if program != route:
+            ctas = work_items = _VBLOCK_ITEMS_PER_TOKEN * T
+        else:
+            program = _overlap_variant(
+                route, arch=L.arch, num_query_tokens=T, device=v["Q"].device
+            )
         L.run(
             L.variant(
                 program,
-                grid=(2 * T, 1, 1),
+                grid=(ctas, 1, 1),
                 total_work_items=work_items,
                 **L.partials(1),
             )
@@ -3354,7 +4036,11 @@ def _nvfp4_variant_name(member: str) -> str:
 # Every decode variant a plan can select (the host names them statically so the export can check that each
 # generated program is bindable).
 _NVFP4_DECODE_VARIANTS = tuple(_NVFP4_MEMBER_VARIANTS.values())
-_NVFP4_VARIANTS = (*_NVFP4_DECODE_VARIANTS, _NVFP4_VARIANT_MERGE)
+_NVFP4_VARIANTS = (
+    *_NVFP4_DECODE_VARIANTS,
+    _NVFP4_VARIANT_MERGE,
+    *_NVFP4_PREFILL_VARIANTS,
+)
 
 
 def _nvfp4_split_shape(total_tiles: int, num_splits: int) -> tuple[int, int]:
@@ -3545,7 +4231,9 @@ def _nvfp4_plan(
         raise ValueError("at least one candidate tile is required")
     if total_tiles > _NVFP4_MAX_SPLITS:
         raise ValueError(
-            f"total candidate tiles {total_tiles} exceeds the NVFP4 route cap {_NVFP4_MAX_SPLITS}"
+            f"total candidate tiles {total_tiles} exceeds the NVFP4 route cap {_NVFP4_MAX_SPLITS}; "
+            "a query packed with cake_dsv4_nvfp4_pack_query runs the prefill bodies, "
+            "which take any table width"
         )
     num_head_tiles = _ceil_div(heads, _NVFP4_TILE_Q)
     common = dict(
@@ -3778,7 +4466,10 @@ def run_cake_dsv4_nvfp4(
     compressed_page_size: Optional[int] = None,
     lse_scale: float = 1.0,
 ) -> torch.Tensor:
-    """Launch the CAKE DSv4 NVFP4 decode for ``query [rows, num_heads, 512]`` BF16.
+    """Launch the CAKE DSv4 NVFP4 route for ``query``: BF16 ``[rows, num_heads, 512]``
+    (the decode family) or packed NVFP4 ``uint8
+    [rows, num_heads, 384]`` (the prefill bodies; see the module docstring and
+    :func:`cake_dsv4_nvfp4_pack_query`).
 
     ``sparse_indices [T, topk]`` (int32, unit inner stride) indexes
     ``swa_kv_cache``; ``sparse_topk_lens`` (optional, int32 ``>= T``) clamps its
@@ -3788,9 +4479,12 @@ def run_cake_dsv4_nvfp4(
     the module docstring); ``swa_page_size`` / ``compressed_page_size`` are
     required for 2-D ``[pages, bytes]`` pools and otherwise checked against the
     geometry. ``query`` / ``out`` may carry more rows than ``T``; rows ``>= T``
-    are untouched. ``max_q_len``, ``cum_seq_lens_q`` and ``seq_lens`` are
-    accepted for surface parity with :func:`run_cake_dsv4` but unused: the
-    kernels consume flat token coordinates. The base-2 LSE is written to the
+    are untouched. ``cum_seq_lens_q`` and ``seq_lens`` are accepted for surface
+    parity with :func:`run_cake_dsv4` but unused, and ``max_q_len`` is only a
+    work-mapping constant of the prefill bodies: the kernels consume flat token
+    coordinates. A packed query runs the NVFP4 prefill bodies
+    (:func:`_nvfp4_prefill`); a BF16 query runs the decode family. The base-2
+    LSE is written to the
     workspace (not returned). No device memory is allocated.
     """
     if backend != "cake":
@@ -3800,12 +4494,19 @@ def run_cake_dsv4_nvfp4(
             f"query must be [num_tokens, num_heads, {_HEAD_DIM}], got shape {tuple(query.shape)}"
         )
     query_capacity, num_heads, head_dim = (int(d) for d in query.shape)
-    if head_dim != _HEAD_DIM:
-        raise ValueError(f"CAKE DSv4 requires head dim {_HEAD_DIM}, got {head_dim}")
-    if query.dtype != torch.bfloat16:
+    packed_query = query.dtype == torch.uint8
+    if packed_query:
+        if head_dim != _NVFP4_TOKEN_BYTES:
+            raise ValueError(
+                f"a packed NVFP4 query has {_NVFP4_TOKEN_BYTES}-byte rows, got {head_dim}"
+            )
+    elif query.dtype != torch.bfloat16:
         raise ValueError(
-            f"the CAKE DSv4 NVFP4 route takes a BF16 query, got {query.dtype}"
+            "the CAKE DSv4 NVFP4 route takes a BF16 query or a packed NVFP4 "
+            f"query (uint8, cake_dsv4_nvfp4_pack_query), got {query.dtype}"
         )
+    elif head_dim != _HEAD_DIM:
+        raise ValueError(f"CAKE DSv4 requires head dim {_HEAD_DIM}, got {head_dim}")
     if not query.is_contiguous():
         raise ValueError("query must be contiguous; backend='cake' makes no host copy")
     if num_heads not in _NVFP4_HEAD_COUNTS:
@@ -3908,31 +4609,68 @@ def run_cake_dsv4_nvfp4(
     sink_tensor = sinks if sinks is not None else scale1
     lse_scale = float(lse_scale)
 
-    plan = _nvfp4_plan(
-        num_query_tokens=num_query_tokens,
-        num_heads=num_heads,
-        sparse_topk=main_width,
-        extra_topk=extra_width,
-        sm_count=_nvfp4_sm_count(device),
+    # The decode family's split plan (its candidate tiles are capped); the
+    # prefill bodies take any table width and run one split.
+    plan = (
+        None
+        if packed_query
+        else _nvfp4_plan(
+            num_query_tokens=num_query_tokens,
+            num_heads=num_heads,
+            sparse_topk=main_width,
+            extra_topk=extra_width,
+            sm_count=_nvfp4_sm_count(device),
+        )
     )
-    num_splits = plan.num_splits
+    num_splits = 1 if plan is None else plan.num_splits
 
     if workspace_buffer.device != device:
         raise ValueError(
             f"workspace_buffer must be on {device}, got {workspace_buffer.device}"
         )
     raw = _workspace_bytes(workspace_buffer)
+    prefill = packed_query
+    # The prefill bodies write the final O and LSE directly, so their carve has one
+    # split (no partial_O) whatever the decode plan would split into.
     layout = cake_dsv4_workspace_layout(
-        num_query_tokens, num_heads, num_splits, with_lse=True
+        num_query_tokens,
+        num_heads,
+        num_splits,
+        with_lse=True,
+        with_prefill=prefill,
     )
     _require_workspace_bytes(raw, layout.total_bytes)
-    partial_o, partial_lse = _partial_views(
-        raw, out_rows, num_query_tokens, num_heads, num_splits
-    )
     lse_offset, lse_bytes = layout.lse
     lse_out = raw[
         lse_offset : lse_offset + num_query_tokens * num_heads * torch.float32.itemsize
     ].view(torch.float32)
+    if prefill:
+        _nvfp4_prefill(
+            arch=arch,
+            workspace=workspace_buffer,
+            raw=raw,
+            layout=layout,
+            query_rows=query_rows,
+            out_rows=out_rows,
+            lse_out=lse_out,
+            main=(main_flat, main_page_size, main_page_stride),
+            extra=(extra_flat, extra_page_size, extra_page_stride),
+            main_indices=main_indices,
+            extra_indices=extra_indices,
+            main_lengths=main_lengths,
+            extra_lengths=extra_lengths,
+            main_width=main_width,
+            extra_width=extra_width,
+            sinks=sinks,
+            sink_tensor=sink_tensor,
+            scale1=scale1,
+            scale2=scale2,
+            max_q_len=max_q_len,
+        )
+        return out
+    partial_o, partial_lse = _partial_views(
+        raw, out_rows, num_query_tokens, num_heads, num_splits
+    )
     if num_splits == 1:
         # The decode member writes the final output and base-2 LSE directly.
         partial_lse = lse_out
@@ -3944,6 +4682,7 @@ def run_cake_dsv4_nvfp4(
             num_query_tokens, num_heads, num_splits, _HEAD_DIM
         )
 
+    assert plan is not None  # a BF16 query runs the decode family
     _require_nvfp4_variant(plan.variant, arch=arch)
     if num_splits > 1:
         _require_nvfp4_variant(_NVFP4_VARIANT_MERGE, arch=arch)
@@ -4009,6 +4748,300 @@ def run_cake_dsv4_nvfp4(
         launches.append(launcher.variant(_NVFP4_VARIANT_MERGE, grid=plan.merge_grid))
     launcher.run(*launches)
     return out
+
+
+def _nvfp4_pool_row_views(flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Row views of a flat NVFP4 pool (``[pages, page_stride]`` uint8) for the prefill bodies' tensor maps: the
+    352-byte data rows and the 32-byte scale rows, both on a 32-byte pitch (token ``t`` of page ``p`` is data row
+    ``p * page_stride / 32 + 11 t`` and scale row ``p * page_stride / 32 + 11 * page_size + t``).  The data rows
+    overlap and must stay inside the storage."""
+    raw = flat.reshape(-1)
+    n = raw.numel()
+    data = raw.as_strided(
+        ((n - _NVFP4_DATA_BYTES) // _NVFP4_ROW_PITCH + 1, _NVFP4_DATA_BYTES),
+        (_NVFP4_ROW_PITCH, 1),
+    )
+    scales = raw.as_strided(
+        (n // _NVFP4_ROW_PITCH, _NVFP4_SF_BYTES), (_NVFP4_ROW_PITCH, 1)
+    )
+    return data, scales
+
+
+def _nvfp4_pool_geometry(
+    page_size: int, page_stride: int, *, name: str
+) -> tuple[int, int, int]:
+    """``(page_log2, pitch_units, footer_units)`` of a pool for the prefill bodies: the page size as a shift, the
+    page stride and the offset of the page's scale rows in 32-byte units."""
+    if page_stride % _NVFP4_ROW_PITCH:
+        raise ValueError(
+            f"{name}: page stride {page_stride} B must be a multiple of {_NVFP4_ROW_PITCH}"
+        )
+    return (
+        _log2_page_size(page_size, name=name),
+        page_stride // _NVFP4_ROW_PITCH,
+        (_NVFP4_DATA_BYTES // _NVFP4_ROW_PITCH) * page_size,
+    )
+
+
+def cake_dsv4_nvfp4_pack_query(
+    query: torch.Tensor, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Pack a BF16 query ``[..., num_heads, 512]`` to the NVFP4 row format the
+    NVFP4 prefill bodies take: ``uint8 [..., num_heads, 384]``, each (token,
+    head) row the cache's token record (224 bytes of E2M1 NoPE codes, 128 bytes
+    of BF16 RoPE dims, then the 28 E4M3 scale factors of the 16-dim NoPE groups,
+    ``e4m3(amax / 6)``, and 4 pad bytes), the same quantizer as
+    :func:`nvfp4_quantize_pack_sparse_mla_cache`. ``out`` (contiguous uint8 of
+    that shape on the query's device) receives the rows; without it a tensor is
+    allocated. One kernel launch, capturable in a CUDA graph with ``out``.
+    """
+    from ._sparse_mla_sm120._execution import (
+        get_sparse_mla_dsv4_nvfp4_cache_ops_module,
+    )
+
+    if query.dtype != torch.bfloat16 or query.ndim < 2:
+        raise ValueError(
+            f"query must be BF16 [..., num_heads, {_HEAD_DIM}], got {query.dtype} "
+            f"{tuple(query.shape)}"
+        )
+    if int(query.shape[-1]) != _HEAD_DIM or not query.is_contiguous():
+        raise ValueError(
+            f"query must be contiguous [..., num_heads, {_HEAD_DIM}], got shape "
+            f"{tuple(query.shape)}"
+        )
+    shape = (*query.shape[:-1], _NVFP4_TOKEN_BYTES)
+    if out is None:
+        out = torch.empty(shape, dtype=torch.uint8, device=query.device)
+    elif (
+        out.dtype != torch.uint8
+        or tuple(out.shape) != shape
+        or not out.is_contiguous()
+        or out.device != query.device
+    ):
+        raise ValueError(
+            f"out must be a contiguous uint8 {shape} tensor on {query.device}, "
+            f"got {out.dtype} {tuple(out.shape)} on {out.device}"
+        )
+    rows = query.numel() // _HEAD_DIM
+    if rows:
+        get_sparse_mla_dsv4_nvfp4_cache_ops_module().sparse_mla_sm120_nvfp4_quantize_pack(
+            query.reshape(rows, 1, _HEAD_DIM), out.view(rows, 1, 1, _NVFP4_TOKEN_BYTES)
+        )
+    return out
+
+
+def _nvfp4_prefill(
+    *,
+    arch: str,
+    workspace: torch.Tensor,
+    raw: torch.Tensor,
+    layout: WorkspaceLayout,
+    query_rows: torch.Tensor,
+    out_rows: torch.Tensor,
+    lse_out: torch.Tensor,
+    main: tuple[torch.Tensor, int, int],
+    extra: tuple[torch.Tensor, int, int],
+    main_indices: torch.Tensor,
+    extra_indices: torch.Tensor,
+    main_lengths: Optional[torch.Tensor],
+    extra_lengths: Optional[torch.Tensor],
+    main_width: int,
+    extra_width: int,
+    sinks: Optional[torch.Tensor],
+    sink_tensor: torch.Tensor,
+    scale1: torch.Tensor,
+    scale2: torch.Tensor,
+    max_q_len: Optional[int],
+) -> None:
+    """Launch one of the NVFP4 prefill bodies on ``num_query_tokens`` rows.
+
+    :func:`_nvfp4_prefill_route` picks the body and its build. Every body
+    reads the caller's packed NVFP4 query ``query_rows`` (uint8 ``[T, H,
+    384]``) through a data map and a scale-factor map, the pools through 32-byte-pitch data and scale
+    row views, and writes the final BF16 output and base-2 LSE directly. A
+    table without a caller length vector gets one filled in the workspace
+    (every entry the table width).
+    """
+    num_query_tokens, num_heads = int(query_rows.shape[0]), int(query_rows.shape[1])
+    variant, grid_x = _nvfp4_prefill_route(
+        num_heads=num_heads,
+        num_query_tokens=num_query_tokens,
+        main_width=main_width,
+        extra_width=extra_width,
+        main_index_stride=int(main_indices.stride(0)),
+        sm_count=_device_sm_count(query_rows.device),
+        arch=arch,
+    )
+    _require_nvfp4_variant(variant, arch=arch)
+    if variant in _NVFP4_PREFILL_VECTOR_INDEX_VARIANTS:
+        # Refused before any launch (and before the length fill below), as the
+        # BF16 / FP8 route refuses such tables in resolve_cake_dsv4_sparse_metadata.
+        _check_index_row_alignment(main_indices, "sparse_indices")
+        if extra_width:
+            _check_index_row_alignment(extra_indices, "extra_sparse_indices")
+
+    q_packed = query_rows
+
+    lens_offset, lens_bytes = layout.prefill_lens
+    half = lens_bytes // 2
+
+    def lengths(given: Optional[torch.Tensor], width: int, slot: int) -> torch.Tensor:
+        if given is not None:
+            return given
+        start = lens_offset + slot * half
+        view = raw[start : start + num_query_tokens * torch.int32.itemsize].view(
+            torch.int32
+        )
+        view.fill_(width)
+        return view
+
+    main_lens = lengths(main_lengths, main_width, 0)
+    extra_lens = lengths(extra_lengths, extra_width, 1) if extra_width else main_lens
+
+    main_flat, main_page_size, main_page_stride = main
+    main_data, main_sf = _nvfp4_pool_row_views(main_flat)
+    main_page_log2, main_pitch_units, main_footer_units = _nvfp4_pool_geometry(
+        main_page_size, main_page_stride, name="swa_kv_cache"
+    )
+    if extra_width:
+        extra_flat, extra_page_size, extra_page_stride = extra
+        extra_data, extra_sf = _nvfp4_pool_row_views(extra_flat)
+        extra_page_log2, extra_pitch_units, extra_footer_units = _nvfp4_pool_geometry(
+            extra_page_size, extra_page_stride, name="compressed_kv_cache"
+        )
+    else:
+        extra_data, extra_sf = main_data, main_sf
+        extra_page_log2, extra_pitch_units, extra_footer_units = (
+            main_page_log2,
+            main_pitch_units,
+            main_footer_units,
+        )
+
+    values: dict[str, Any] = {
+        "Q": q_packed,
+        "SWA_cache": main_data,
+        "SWA_sf": main_sf,
+        "compressed_KV_cache": extra_data,
+        "compressed_KV_sf": extra_sf,
+        "O": out_rows,
+        "LSE": lse_out,
+        "swa_indices": _flat_index_rows(main_indices),
+        "compressed_indices": _flat_index_rows(extra_indices),
+        "sparse_topk_lens": main_lens,
+        "extra_topk_lens": extra_lens,
+        "sinks": sink_tensor,
+        "bmm1_scale": scale1,
+        "bmm2_scale": scale2,
+        "num_heads": num_heads,
+        "swa_index_stride": int(main_indices.stride(0)),
+        "compressed_index_stride": int(extra_indices.stride(0)),
+        "sparse_topk_lens_offset": 0,
+        "num_query_tokens": num_query_tokens,
+        "sparse_topk": main_width + extra_width,
+        "has_sinks": int(sinks is not None),
+        # Work items are query tokens; the body maps item (x, z) to token z * max_q_len + x
+        # and the launch keeps every item in x, so max_q_len only has to be positive.
+        "total_work_items": num_query_tokens,
+        "max_q_len": int(max_q_len) if max_q_len is not None else num_query_tokens,
+        "swa_page_log2": main_page_log2,
+        "swa_pitch_units": main_pitch_units,
+        "swa_footer_units": main_footer_units,
+        "compressed_page_log2": extra_page_log2,
+        "compressed_pitch_units": extra_pitch_units,
+        "compressed_footer_units": extra_footer_units,
+        "swa_width": main_width,
+        "compressed_width": extra_width,
+    }
+    launcher = _Launcher(arch=arch, workspace=workspace, raw=raw, values=values)
+    launcher.run(launcher.variant(variant, grid=(grid_x, 1, 1)))
+
+
+def _nvfp4_qb_group_ids(blocks: int) -> int:
+    """The group items the ``breaks`` build launches ahead of its ``blocks`` block items: one per 8
+    blocks, at most 16 (Cake ``group_ids``)."""
+    return min(_ceil_div(blocks, 8), 16)
+
+
+def _nvfp4_prefill_route(
+    *,
+    num_heads: int,
+    num_query_tokens: int,
+    main_width: int,
+    extra_width: int,
+    main_index_stride: int,
+    sm_count: int,
+    arch: str = "sm_103a",
+) -> tuple[str, int]:
+    """The NVFP4 prefill variant of one call and its grid (CTAs along x).
+
+    * 128 heads: the two-CTA body, one cluster per query token; on sm_103a its
+      ``v_unit_pairs`` build once the row selects more than 256 keys (items of
+      more than two tiles: C4 and long-context C128 layers), the persistent
+      build otherwise (SWA and C128 up to 16K context, within 2 % of each other
+      there).
+    * 16 / 32 heads on window-only rows (no extra table, a main table of at
+      most 128 keys on a row stride of at least 128) with more query tokens
+      than SMs: the query-block bodies, one item per block of 64 / H tokens.
+      16 heads take the ``breaks`` build up to 1024 tokens (plus its group
+      items), the default build above. 32 heads take the ``late_claim`` build
+      up to 512 tokens once their blocks exceed 11 / 8 of the SMs, the default
+      build otherwise. With at most as many tokens as SMs the blocks would leave
+      most SMs idle, and the per-token body is faster.
+    * Every other row of at most 32 heads: the per-token body's ``tmem_v``
+      build, with ``early_gather`` at most as many tokens as SMs.
+    * 33 to 64 heads: ``early_gather`` at most as many tokens as SMs, else
+      ``q_prefetch`` on window-only rows and ``o_boxes`` on rows with a
+      compressed selection or an extra table.
+    """
+    tokens = num_query_tokens
+    if num_heads > _NVFP4_H64_PREFILL_MAX_HEADS:
+        if (
+            main_width + extra_width >= _NVFP4_H128_V_UNIT_PAIRS_MIN_TOPK
+            and arch in _NVFP4_H128_V_UNIT_PAIRS_ARCHES
+        ):
+            return _NVFP4_VARIANT_H128_V_UNIT_PAIRS_PREFILL, 2 * tokens
+        return _NVFP4_VARIANT_H128_PREFILL, 2 * tokens
+    window_only = extra_width == 0 and main_width <= _NVFP4_QB_WINDOW
+    one_item_per_cta = tokens <= sm_count
+    if num_heads <= _NVFP4_TMEM_V_MAX_HEADS:
+        if (
+            num_heads in (16, 32)
+            and window_only
+            and main_index_stride >= _NVFP4_QB_WINDOW
+            and not one_item_per_cta
+        ):
+            blocks = _ceil_div(tokens, 64 // num_heads)
+            if num_heads == 16:
+                if tokens <= _NVFP4_QB_BREAKS_MAX_TOKENS:
+                    return (
+                        _NVFP4_VARIANT_QB_H16_BREAKS_PREFILL,
+                        blocks + _nvfp4_qb_group_ids(blocks),
+                    )
+                return _NVFP4_VARIANT_QB_H16_PREFILL, blocks
+            num, den = _NVFP4_QB_LATE_CLAIM_MIN_BLOCKS_PER_SM
+            if (
+                den * blocks > num * sm_count
+                and tokens <= _NVFP4_QB_LATE_CLAIM_MAX_TOKENS
+            ):
+                return _NVFP4_VARIANT_QB_H32_LATE_CLAIM_PREFILL, blocks
+            return _NVFP4_VARIANT_QB_H32_PREFILL, blocks
+        if one_item_per_cta:
+            return _NVFP4_VARIANT_H64_TMEM_V_EARLY_GATHER_PREFILL, tokens
+        return _NVFP4_VARIANT_H64_TMEM_V_PREFILL, tokens
+    if one_item_per_cta:
+        return _NVFP4_VARIANT_H64_EARLY_GATHER_PREFILL, tokens
+    if window_only:
+        return _NVFP4_VARIANT_H64_Q_PREFETCH_PREFILL, tokens
+    return _NVFP4_VARIANT_H64_O_BOXES_PREFILL, tokens
+
+
+def _flat_index_rows(table: torch.Tensor) -> torch.Tensor:
+    """A ``[rows, width]`` int32 table (unit column stride, any row stride) as the 1-D run of storage its
+    rows span: the prefill bodies read row ``t`` at ``t * index_stride`` themselves."""
+    rows, width = int(table.shape[0]), int(table.shape[1])
+    if table.is_contiguous():
+        return table
+    return table.as_strided(((rows - 1) * int(table.stride(0)) + width,), (1,))
 
 
 def _nvfp4_gather4_views(flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

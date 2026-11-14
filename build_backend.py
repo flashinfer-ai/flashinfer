@@ -1215,20 +1215,28 @@ def build_sdist(sdist_directory, config_settings=None):
 #
 # With FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1 (set by the release
 # workflow for the wheel published to PyPI, not by nightlies or source
-# installs) the experimental packages' generated kernel sources are dropped as
-# well: flashinfer/experimental/<pkg>/csrc/** and flashinfer/data/csrc/experimental/**.
+# installs) generated sources under flashinfer/experimental/<pkg>/csrc/** and
+# flashinfer/data/csrc/experimental/** are dropped, except the exact paths in
+# _EXPERIMENTAL_SOURCES_KEEP.
 # Experimental features are JIT-only and intended for main-branch users
 # (flashinfer/experimental/README.md), and PyPI caps flashinfer-python files at
 # 100 MB. The Cake training backends one level deeper,
 # flashinfer/experimental/cake/<pkg>/csrc/**, are not matched and ship in every
 # wheel: they back the stable flashinfer.cake_<op>_<det|nondet>_train[_kcp]
-# facades (#8928). The Python modules, build.json manifests and route catalogs stay, so
-# `import flashinfer` is unchanged and an experimental kernel load fails on
-# first use; the marker file below says why and where the sources are.
+# facades (#8928). Python modules, build.json manifests and route catalogs stay,
+# so `import flashinfer` is unchanged. Loads requiring omitted sources fail on
+# first use; the marker file below explains how to obtain those sources.
 _EXPERIMENTAL_SOURCES_FLAG = "FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES"
 _EXPERIMENTAL_SOURCES_MARKER = "flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt"
 _EXPERIMENTAL_SOURCES_RE = re.compile(
     r"^(flashinfer/experimental/[^/]+/csrc/|flashinfer/data/csrc/experimental/)"
+)
+# HC needs these small sources for JIT even in release installs (#8944).
+_EXPERIMENTAL_SOURCES_KEEP = frozenset(
+    {
+        "flashinfer/experimental/hc_sum_sm100/csrc/binding.cu",
+        "flashinfer/experimental/hc_sum_sm100/csrc/kernels.cuh",
+    }
 )
 _THIRD_PARTY_ROOTS = (
     "flashinfer/data/cutlass/",
@@ -1245,11 +1253,12 @@ _THIRD_PARTY_KEEP = (
     "flashinfer/data/cccl/thrust/thrust/",
 )
 _EXPERIMENTAL_SOURCES_MARKER_TEXT = """\
-This wheel was built with FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1: the
-generated kernel sources of the experimental packages (flashinfer/experimental/*/csrc
-and csrc/experimental) are not included, so that the release wheel stays under
-PyPI's per-file size limit. Experimental APIs import normally but raise when they
-first try to compile a kernel. To use them, install a nightly wheel from
+This wheel was built with FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1: most
+generated kernel sources under flashinfer/experimental/*/csrc and csrc/experimental
+are omitted so that the release wheel stays under PyPI's per-file size limit.
+The HC sum-state JIT sources are exempt from this filter. APIs whose required
+sources are omitted raise when they first try to compile a kernel. To use those
+backends, install a nightly wheel from
 https://flashinfer.ai/whl or install from source:
     pip install git+https://github.com/flashinfer-ai/flashinfer.git@<tag>
 See flashinfer/experimental/README.md and flashinfer-ai/flashinfer#7977.
@@ -1260,7 +1269,7 @@ def _wheel_entry_dropped(name: str, exclude_experimental: bool) -> bool:
     if name.startswith(_THIRD_PARTY_ROOTS):
         return not name.startswith(_THIRD_PARTY_KEEP)
     if exclude_experimental and _EXPERIMENTAL_SOURCES_RE.match(name):
-        return True
+        return name not in _EXPERIMENTAL_SOURCES_KEEP
     return False
 
 

@@ -23,7 +23,9 @@ what stays exact is structural (zero gradients, collective counts, byte counts, 
   dbeta`` FP32; the correctness rows (regime ``normal``) by the elementwise clause ``|cand - ref| <= 1e-2 + 1e-2 |ref|``
   with zero mismatches; the accuracy rows (regimes A1-A4) by the per-(row, CP, tensor) budgets of the deterministic
   package's ``cake_gdn_det_train_kcp_g1_budgets.json`` (rel-RMS <= budget and max-abs <= budget + one storage ulp of
-  |ref| at the worst element).  No budget is derived from this package's output.
+  |ref| at the worst element); the arms at the forced ``P = 2`` (below) by the cells of
+  ``cake_gdn_nondet_train_kcp_p2_budgets.json`` instead (the same rule and storage; 1.10 x the deterministic package's
+  measured error at the forced ``P = 2``, never below the G1 cell).  No budget is derived from this package's output.
 * every arm (repeat, saved / replay, light / full, the full form's split twin (test knob ``fused_o_tape=0``; each full
   forward's launch log names the walk it ran), autograd / explicit, checkpoint / direct with its kept-tape and
   recompute-handle forms, ``save_transfer``, ring / a2a, strided / contiguous, CUDA-graph replay, and the
@@ -35,8 +37,8 @@ what stays exact is structural (zero gradients, collective counts, byte counts, 
   ``M_seg`` exactly at ``P > 1`` (the full backward's merges read that plane; it runs no transfer walk); a row whose
   ranks all plan ``P = 1`` reads no ``M_seg`` at its plan, so the same forms run again at the forced ``P = 2``
   (``segments=2``, where every rank's fragments take it) against the light form at ``P = 2``, all under NaN-filled
-  allocations (a row that plans ``P > 1`` reads the plane at its plan and runs no forced form: the G1 cells are
-  budgets of the planned schedule);
+  allocations and judged by the forced ``P = 2`` cells (the G1 cells are budgets of the planned schedule); a row that
+  plans ``P > 1`` reads the plane at its plan and runs no forced form;
 * worst case: ``N_REPEAT`` forward + backward runs per row, all recorded, the worst run per tensor gated;
 * semantics (G4): the zero-gradient leak stays exact (``dout`` zero outside one document -> exactly zero gradients on
   the others); independence (the other documents' operands replaced) within the budget constants;
@@ -53,7 +55,8 @@ what stays exact is structural (zero gradients, collective counts, byte counts, 
 ``test_poisoned_workspace_pairs``: one ``CakeGDNNondetKcpWorkspace`` reused across two rows of different token layouts on one group,
 every pool and tape of the workspace filled with NaN in between; both rows within the FP64 budgets, each also in the
 ``save_mode="full"`` / ``save_transfer=False`` form (and its ring form where eligible), at the plan's ``P`` and at the forced
-``P = 2`` where every rank plans ``P = 1`` and its fragments take it, under NaN-filled allocations.  The convolution
+``P = 2`` where every rank plans ``P = 1`` and its fragments take it (judged by the forced ``P = 2`` cells), under
+NaN-filled allocations.  The convolution
 halo row C7 (``cake_causal_conv1d_det_kcp`` through this package's context) and the whole-layer checkpoint rows
 (``CakeGDNNondetKcpRecomputeHandle``: the recompute exchanges nothing; out / dx / dweight / dg / dbeta within the budget constants of
 the plain checkpoint and the direct pass and within the correctness clause of the FP64 layer oracle; the backward's
@@ -75,7 +78,7 @@ sub-group of its ``W`` lowest ranks; the other ranks skip the row).  Environment
 ``KCP_TEST_RESULT_DIR`` (one JSON per row), ``KCP_TEST_MODE`` (``full`` | ``forward``), ``KCP_TEST_REPEATS`` (raises
 ``N_REPEAT`` above 3), ``KCP_TEST_PORT_DIR`` (the Slurm rendezvous port file), ``KCP_TEST_DEBUG_RETAINED``.
 Operands come from the seeded CPU generator (bitwise identical on every rank and host).  The suite imports this package,
-the deterministic package and the causal-convolution package through ``tests/test_helpers/cake_package.py`` and
+the deterministic package and the causal-convolution package through ``tests/cake/test_helpers/cake_package.py`` and
 nothing else from flashinfer (the facade's tests live in ``test_cake_gdn_nondet_train_kcp_api.py``).
 """
 
@@ -104,7 +107,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
+from tests.experimental.test_helpers.kcp_collective_shims import (
+    CollectiveCounter,
+    RecomputePhase,
+)
 
 PACKAGE = "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp"  # the in-tree path (report metadata)
 
@@ -127,7 +133,7 @@ def _few_cpu_threads():
 
 def _mod(sub: str | None = None):
     """The package (or one of its modules) through the test-helper registry: a stale entry fails here, never skips."""
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     return cake_package("cake_gdn_nondet_train_kcp", sub)
 
@@ -135,7 +141,7 @@ def _mod(sub: str | None = None):
 def _det_mod(sub: str | None = None):
     """A module of the deterministic package through the test-helper registry (its entries and its ``LAST_CALL`` for
     the collective comparison)."""
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     return cake_package("cake_gdn_det_train_kcp", sub)
 
@@ -144,7 +150,7 @@ def _conv_mod(sub: str | None = None):
     """The deterministic causal-convolution package (or its ``kcp`` module) through the test-helper registry: the
     entries ``cake_causal_conv1d_det`` / ``is_cake_causal_conv1d_det_train_supported`` and
     ``kcp.cake_causal_conv1d_det_kcp`` that its facades forward to."""
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     return cake_package("cake_causal_conv1d_det_train", sub)
 
@@ -193,7 +199,9 @@ STAGES = ("int1", "int3", "int4")
 def _reference():
     """The FP64 reference: the FlashInfer test helper (read only), else the session harness on PYTHONPATH."""
     try:
-        from tests.test_helpers import cake_gdn_det_train_kcp_reference as ref  # type: ignore[attr-defined]
+        from tests.experimental.test_helpers import (
+            cake_gdn_det_train_kcp_reference as ref,
+        )  # type: ignore[attr-defined]
 
         return ref
     except ImportError:
@@ -204,8 +212,8 @@ def _inputs():
     """The seeded operand generator (``make_inputs(cu, H_qk, HV, *, regime, seed, token_range)``): the inputs helper,
     else the reference helper (the same generator, bitwise), else the session harness on PYTHONPATH."""
     for name in (
-        "tests.test_helpers.cake_gdn_det_train_kcp_inputs",
-        "tests.test_helpers.cake_gdn_det_train_kcp_reference",
+        "tests.experimental.test_helpers.cake_gdn_det_train_kcp_inputs",
+        "tests.experimental.test_helpers.cake_gdn_det_train_kcp_reference",
     ):
         try:
             mod = importlib.import_module(name)
@@ -219,6 +227,12 @@ def _inputs():
 # the deterministic package's budget table, read only: the same budgets judge this package
 BUDGETS_FILE = (
     Path(__file__).resolve().parent / "cake_gdn_det_train_kcp_g1_budgets.json"
+)
+# the forced P = 2 cells: the arms that run a row which plans P = 1 at the forced P = 2 (segments=2) leave the planned
+# schedule the G1 cells were calibrated on; per (row, CP, tensor) max(G1 cell, 1.10 x the deterministic package's
+# measured error at the forced P = 2, max over sm_100a / sm_103a / sm_107a), the G1 table's storage and max-abs slack
+P2_BUDGETS_FILE = (
+    Path(__file__).resolve().parent / "cake_gdn_nondet_train_kcp_p2_budgets.json"
 )
 STORAGE = {
     "out": "bf16",
@@ -238,11 +252,19 @@ def _budgets() -> dict:
         return json.load(fh)
 
 
-def _budget_cell(row: Row) -> tuple[dict, int] | None:
+def _p2_budgets() -> dict:
+    """The forced ``P = 2`` cells (``P2_BUDGETS_FILE``): the budgets of the arms at the forced ``P = 2`` (see
+    :func:`_p2_budget_cell`), in the G1 table's layout."""
+    with open(P2_BUDGETS_FILE) as fh:
+        return json.load(fh)
+
+
+def _budget_cell(row: Row, table: dict | None = None) -> tuple[dict, int] | None:
     """The budget cell of a row: the row's base name (``A1-cp16`` -> ``A1``) at CP = ``row.W``.  When the table has no
     cell at that CP the row is judged at its nearest CP of record (closest log2 distance, ties -> the lower CP; the CP
-    used is recorded in the report): ``A1-cp16`` -> the A1 CP8 cell.  ``None`` when the table has no such row."""
-    cells = _budgets()["rows"].get(row.name.split("-")[0])
+    used is recorded in the report): ``A1-cp16`` -> the A1 CP8 cell.  ``None`` when the table has no such row.
+    ``table``: the table to read (default: the G1 table)."""
+    cells = (table or _budgets())["rows"].get(row.name.split("-")[0])
     if not cells:
         return None
     cps = sorted(int(c) for c in cells)
@@ -250,6 +272,14 @@ def _budget_cell(row: Row) -> tuple[dict, int] | None:
         return cells[str(row.W)], row.W
     cp = min(cps, key=lambda c: (abs(math.log2(c / row.W)), c))
     return cells[str(cp)], cp
+
+
+def _p2_budget_cell(row: Row) -> tuple[dict, int] | None:
+    """The forced ``P = 2`` cell of a row (the row / nearest-CP rule of :func:`_budget_cell` on ``P2_BUDGETS_FILE``):
+    the budgets of the comparisons :class:`_Judge` receives with ``forced=True`` (``_p2_full_arms``, the forced
+    ``light_akk`` forms of the l2n rows, the poison pairs' forced forms).  ``None`` when the table has no such row: a
+    forced arm of it cannot pass."""
+    return _budget_cell(row, _p2_budgets())
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -375,59 +405,89 @@ def _severity(v: dict) -> tuple:
 class _Judge:
     """FP64 and cross-arm comparisons of one row: each ``fp64`` / ``cross`` call adds this rank's partials at once
     (the arm's tensors can go), ``finish`` gathers them once over the group and every rank derives the same verdicts.
-    Keys: ``fp64:<arm>:<tensor>`` and ``cross:<arm>:<tensor>``."""
+    Keys: ``fp64:<arm>:<tensor>`` and ``cross:<arm>:<tensor>``.  A comparison added with ``forced=True`` (an arm at
+    the forced ``P = 2``) is judged by ``p2_budget`` (:func:`_p2_budget_cell`), every other one by ``budget``; each
+    verdict names its cell (``"cell"``: ``"p2"`` or ``"g1"``)."""
 
-    def __init__(self, row: Row, ref_mod, budget, fp64_rel_rms=None) -> None:
+    def __init__(
+        self, row: Row, ref_mod, budget, fp64_rel_rms=None, p2_budget=None
+    ) -> None:
         """``fp64_rel_rms``: ``{tensor: max}``, the ``fp64`` comparisons of these tensors judged by finiteness and
-        rel-RMS alone (the elementwise count and the worst element recorded)."""
+        rel-RMS alone (the elementwise count and the worst element recorded).  ``p2_budget``: the cell of the
+        ``forced`` comparisons."""
         self.row, self.ref_mod, self.budget = row, ref_mod, budget
+        self.p2_budget = p2_budget
         self.fp64_rel_rms = dict(fp64_rel_rms or {})
         self.parts: dict[str, dict] = {}
         self.gated: dict[str, bool] = {}
+        self.forced: dict[str, bool] = {}
 
-    def _add(self, key: str, cand: torch.Tensor, ref: torch.Tensor, gate: bool):
+    def _add(
+        self,
+        key: str,
+        cand: torch.Tensor,
+        ref: torch.Tensor,
+        gate: bool,
+        forced: bool,
+    ):
         self.parts[key] = _partial(self.ref_mod, cand, ref)
         self.gated[key] = bool(gate)
+        self.forced[key] = bool(forced)
 
     def fp64(
-        self, arm: str, res: dict, refs: dict, names=TENSORS, *, half=False, gate=True
+        self,
+        arm: str,
+        res: dict,
+        refs: dict,
+        names=TENSORS,
+        *,
+        half=False,
+        gate=True,
+        forced=False,
     ):
         """``res`` against the FP64 reference; ``half``: half of an accumulated (two-backward) gradient, exact in
-        every float format, against the FP64 gradient."""
+        every float format, against the FP64 gradient; ``forced``: an arm at the forced ``P = 2``."""
         for n in names:
             cand = res[n].detach().to(F64) * 0.5 if half else res[n]
-            self._add(f"fp64:{arm}:{n}", cand, refs[n], gate)
+            self._add(f"fp64:{arm}:{n}", cand, refs[n], gate, forced)
 
-    def cross(self, arm: str, a: dict, b: dict, names=TENSORS, *, gate=True):
-        """Arm ``a`` against its partner ``b`` within the same budget constants (``b`` in the reference's place)."""
+    def cross(
+        self, arm: str, a: dict, b: dict, names=TENSORS, *, gate=True, forced=False
+    ):
+        """Arm ``a`` against its partner ``b`` within the same budget constants (``b`` in the reference's place;
+        ``forced``: both arms at the forced ``P = 2``)."""
         for n in names:
-            self._add(f"cross:{arm}:{n}", a[n], b[n], gate)
+            self._add(f"cross:{arm}:{n}", a[n], b[n], gate, forced)
 
     def finish(self, group, W: int) -> dict[str, dict]:
         mine = dict(self.parts)
         if W > 1:
             every: list = [None] * W
-            dist.all_gather_object(every, (mine, self.gated), group=group)
+            dist.all_gather_object(every, (mine, self.gated, self.forced), group=group)
         else:
-            every = [(mine, self.gated)]
+            every = [(mine, self.gated, self.forced)]
         keys: list[str] = []
         gated: dict[str, bool] = {}
-        for p, gt in every:
+        forced: dict[str, bool] = {}
+        for p, gt, fc in every:
             for key in p:
                 if key not in gated:
                     keys.append(key)
                 gated[key] = gated.get(key, True) and gt[key]
+                forced[key] = forced.get(key, False) or fc[key]
         out: dict[str, dict] = {}
         for key in keys:
-            met = _combine([p.get(key) for p, _ in every])
+            met = _combine([p.get(key) for p, _, _ in every])
             name = key.rsplit(":", 1)[1]
+            budget = self.p2_budget if forced[key] else self.budget
             if key.startswith("fp64:") and name in self.fp64_rel_rms:
                 v = _rel_rms_verdict(met, self.fp64_rel_rms[name])
             else:
-                v = _verdict(self.row, name, met, self.budget, self.ref_mod)
+                v = _verdict(self.row, name, met, budget, self.ref_mod)
+            v["cell"] = "p2" if forced[key] else "g1"
             v["gated"] = gated[key]
             # a key missing on a rank: that rank skipped the comparison (fails the verdict)
-            v["ranks"] = sum(1 for p, _ in every if key in p)
+            v["ranks"] = sum(1 for p, _, _ in every if key in p)
             if v["ranks"] != len(every):
                 v["ok"] = False
             out[key] = v
@@ -1537,7 +1597,7 @@ def _run_rank(
     t_start = time.time()
     ref_mod = _reference()
     refs = _local_reference(row, part, cu, rank, device)
-    judge = _Judge(row, ref_mod, _budget_cell(row))
+    judge = _Judge(row, ref_mod, _budget_cell(row), p2_budget=_p2_budget_cell(row))
     kernels = backend == "kernels"
 
     def saved_pass(qq=q, kk=k, vv=v, gg=g, bb=beta, dd=dout, **opts) -> dict:
@@ -1588,11 +1648,16 @@ def _run_rank(
             **{n: lf.grad for n, lf in zip(GRADS, leaves, strict=True)},
         }
 
-    def arm(name: str, r_: dict, partner=None, partner_name=None, *, gate=True):
-        """One arm within the FP64 budgets and, against its partner, within the same budget constants."""
-        judge.fp64(name, r_, refs, gate=gate)
+    def arm(
+        name: str, r_: dict, partner=None, partner_name=None, *, gate=True, forced=False
+    ):
+        """One arm within the FP64 budgets and, against its partner, within the same budget constants (``forced``:
+        an arm at the forced ``P = 2``, judged by the forced ``P = 2`` cell)."""
+        judge.fp64(name, r_, refs, gate=gate, forced=forced)
         if partner is not None:
-            judge.cross(f"{name}_vs_{partner_name}", r_, partner, gate=gate)
+            judge.cross(
+                f"{name}_vs_{partner_name}", r_, partner, gate=gate, forced=forced
+            )
 
     flags: dict[str, bool] = {}
     info: dict[str, object] = {}
@@ -2114,7 +2179,7 @@ def _run_rank(
     info["retained_bytes"] = retained
     info["retained_block_bytes"] = retained_block
     # INT3 save_mode decision inputs (G8, M1): this rank's saved-set bytes per save_mode -- the public byte query and
-    # the measured bytes of the saved objects (recorded, not gated: the default stays "light")
+    # the measured bytes of the saved objects (recorded, not gated: the default without the norm stays "light")
     try:
         sb: dict[str, int] = {"T_r": int(q.shape[0])}
         for mode in ("light", "full"):
@@ -2663,10 +2728,10 @@ def _bitwise(a: dict, b: dict, names=TENSORS) -> dict[str, bool]:
 def _p2_group_ok(ctx, HV: int, group, W: int, device: torch.device) -> bool:
     """Every rank plans ``P = 1`` and its fragments take the segments override ``P = 2`` (the longest fragment of
     each rank has at least two chunks).  Such a row reads no saved ``M_seg^T`` plane at its plan; the forced
-    ``P = 2`` arms put the full form's read of that plane on it.  A row that plans ``P > 1`` on some rank already
-    reads the plane in its planned forms, and forcing ``P = 2`` there lowers its plan (A4 int3 plans ``P = 24``):
-    a schedule its G1 cells (budgets of the planned schedule) do not cover, so it runs no forced form.  A group
-    decision (MIN over the ranks): every rank runs the same calls."""
+    ``P = 2`` arms put the full form's read of that plane on it, judged by the row's forced ``P = 2`` cell
+    (:func:`_p2_budget_cell`; the G1 cells are budgets of the planned schedule).  A row that plans ``P > 1`` on some
+    rank already reads the plane in its planned forms, and forcing ``P = 2`` there lowers its plan (A4 int3 plans
+    ``P = 24``), so it runs no forced form.  A group decision (MIN over the ranks): every rank runs the same calls."""
     try:
         ok = int(ctx.heads(HV).P) == 1 and int(ctx.heads(HV, P=2).P) == 2
     except ValueError:
@@ -2680,16 +2745,19 @@ def _p2_group_ok(ctx, HV: int, group, W: int, device: torch.device) -> bool:
 def _p2_full_arms(saved_pass, arm, info, flags, *, ring: bool, **extra) -> None:
     """The forced ``P = 2`` forms without ``save_transfer`` under NaN-filled allocations: ``save_mode="full"``
     first (its backward reads the saved ``M_seg^T`` plane), then the light form it is judged against, and the same
-    pair over the ring when the partition allows it.  Every arm within the FP64 budgets; ``M_seg`` held."""
+    pair over the ring when the partition allows it.  Every arm within the forced ``P = 2`` cell
+    (``arm(..., forced=True)``); ``M_seg`` held."""
     pairs = [("p2_full_no_save_transfer", "p2_no_save_transfer", {})]
     if ring:
         pairs.append(("p2_ring_full", "p2_ring", {"exchange": "ring"}))
     for full_name, light_name, opts in pairs:
         o = {"segments": 2, "save_transfer": False, **opts, **extra}
         res_full = _nan_allocations_pass(lambda o=o: saved_pass(save_mode="full", **o))
-        res_light = _nan_allocations_pass(lambda o=o: saved_pass(**o))
-        arm(light_name, res_light)
-        arm(full_name, res_full, res_light, light_name)
+        res_light = _nan_allocations_pass(
+            lambda o=o: saved_pass(save_mode="light", **o)
+        )
+        arm(light_name, res_light, forced=True)
+        arm(full_name, res_full, res_light, light_name, forced=True)
         info[full_name] = {
             **_m_seg_rule(res_full["saved"]),
             "bitwise_vs_light": _bitwise(res_full, res_light),
@@ -2777,7 +2845,7 @@ def _run_rank_poison(
             }
 
         tag = f"{'second' if i else 'first'}_{row.name}"
-        judge = _Judge(row, ref_mod, _budget_cell(row))
+        judge = _Judge(row, ref_mod, _budget_cell(row), p2_budget=_p2_budget_cell(row))
         res = one_pass()
         judge.fp64(tag, res, refs)
         del res
@@ -2800,7 +2868,7 @@ def _run_rank_poison(
                     save_mode="full", save_transfer=False, **extra
                 )
             )
-            judge.fp64(f"{tag}_{form}", res, refs)
+            judge.fp64(f"{tag}_{form}", res, refs, forced="segments" in extra)
             rule = _m_seg_rule(res["saved"])
             info[f"{tag}_{form}"] = rule
             forced = "segments" not in extra or rule["P"] == int(extra["segments"])
@@ -3204,6 +3272,40 @@ def test_accuracy_budget_cells_cover_the_accuracy_rows() -> None:
             assert 0.0 < b["budget_rel_rms"] < 1.0, (row.name, n)
             assert 0.0 < b["budget_max_abs"] < 1.0, (row.name, n)
     assert _budget_cell(Row("Zz", (1,), (2, 6), 2, "contiguous")) is None
+
+
+def test_forced_p2_budget_cells_cover_the_forced_rows() -> None:
+    """Every accuracy row that runs the forced ``P = 2`` forms on an architecture of record (the table's
+    ``forced_rows``: its ranks all plan ``P = 1`` there) maps to a forced ``P = 2`` cell at the CP of its G1 cell
+    (``A1-cp16``: the A1 CP8 cell) with all six tensors in the G1 storage, every budget finite, below 1 and at least
+    its G1 cell; every other accuracy row is named in ``no_forced_form``.  CPU-only."""
+    table = _p2_budgets()
+    assert table["status"] == "FINAL" and table["factor"] == 1.1
+    rows = [r for r in ROWS if r.regime != "normal"]
+    bases = {r.name.split("-")[0] for r in rows}
+    forced, declined = set(table["forced_rows"]), set(table["no_forced_form"])
+    assert forced | declined == bases and not forced & declined, (forced, declined)
+    assert table["cells"] == sum(len(c) for c in table["rows"].values())
+    for base, cps in table["forced_rows"].items():
+        assert {str(cp) for cp in cps} <= set(table["rows"][base]), base
+    for row in rows:
+        if row.name.split("-")[0] in declined:
+            continue
+        got, g1 = _p2_budget_cell(row), _budget_cell(row)
+        assert got is not None and g1 is not None, row.name
+        cell, cp = got
+        assert cp == g1[1], (row.name, cp, g1[1])
+        assert set(cell["tensors"]) == set(TENSORS), row.name
+        for n, b in cell["tensors"].items():
+            g = g1[0]["tensors"][n]
+            assert b["storage"] == STORAGE[n] == g["storage"], (row.name, n)
+            for key in ("budget_rel_rms", "budget_max_abs"):
+                assert math.isfinite(b[key]) and g[key] <= b[key] < 1.0, (
+                    row.name,
+                    n,
+                    key,
+                )
+    assert _p2_budget_cell(Row("Zz", (1,), (2, 6), 2, "contiguous")) is None
 
 
 def test_public_api_cannot_select_test_programs() -> None:
@@ -3814,16 +3916,18 @@ def test_layer_checkpoint_rows(row: Row, slurm) -> None:
 #   its eight #1 tapes == v1 #1 on the materialized rows; ``qk_apply`` on its ``r`` == its rows; the backward's rows
 #   and regenerated ``r`` == the forward's (``record_qk``);
 # * norm off unchanged: the v1 records keep their library names and the norm-off route launches only them (the sha256
-#   of their 36 sources is reported; the render's SASS identity against the previous package decides the bits);
+#   of their 32 sources is reported; the render's SASS identity against the previous package decides the bits);
 # * packed QKV views with the norm: within the budgets of the contiguous call; the backward writes one packed dQKV
 #   row and ``cake_gdn_nondet_train_kcp_packed_qkv_views`` hands it to the packed leaf without a concatenation;
 # * memory: no ``qn`` / ``kn`` / ``qk_rstd`` in the arena after a forward or a backward; the bytes a forward retains
-#   with the norm == without + ``8 T_r H_qk`` (the saved r); saved bytes on - off == the query's ``qk_rstd`` term;
-# * ``save_mode="light_akk"`` (the light set plus #1_l2n's ``Akk`` tape; the light replay runs ``fwd_prep_replay_l2n``,
+#   with the norm (``save_mode="light"``) == without + ``8 T_r H_qk`` (the saved r); saved bytes on - off == the
+#   query's ``qk_rstd`` term; the default with the norm (``"light_akk"``) recorded with its ``Akk`` tape (not gated);
+# * ``save_mode="light_akk"`` (the default with the norm: the light set plus #1_l2n's ``Akk`` tape; the light replay runs ``fwd_prep_replay_l2n``,
 #   #1_l2n reading that tape): within the FP64 budgets and against the light form in every form (a2a / ring,
-#   ``save_transfer`` on / off, the plan's ``P`` and the forced ``P = 2``, autograd, checkpoint, CUDA-graph replay
-#   steps on the light steps' workspace); exact: the launch census (the backward's ``fwd_prep_l2n`` becomes the
-#   replay, once per light replay; the forward is light's), the saved ``Akk`` bytes (``128 R HV``, the byte query's
+#   ``save_transfer`` on / off, the plan's ``P`` and the forced ``P = 2`` (judged by the forced ``P = 2`` cells),
+#   autograd, checkpoint, CUDA-graph replay steps on the light steps' workspace); exact: the launch census (the
+#   backward's ``fwd_prep_l2n`` becomes the replay, once per light replay; the forward is light's), the saved ``Akk``
+#   bytes (``128 R HV``, the byte query's
 #   difference), the checkpoint saving as ``"light"``, and on the kernel backend every form under NaN-filled
 #   allocations within the budgets of the light form of the same options, with the replay run; whether the two
 #   forms' bits agree (and whether the light form repeats its own) is recorded as data, not gated (the package
@@ -3840,8 +3944,6 @@ V1_LIBRARIES = {
     "gate_epilogue": "cake_gdn_train_b902b0b0bef82d9f7c53",
     "kcp_affine_merge_c16": "cake_gdn_train_89f5ff59f03eb170e3bf_kcp",
     "kcp_affine_merge_c8": "cake_gdn_train_c6958a0a4ed5cb55a9a1_kcp",
-    "kcp_dhu_offset": "cake_gdn_train_665649ff924fda17ec3f_kcp",
-    "kcp_dhu_offset_vh64": "cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp",
     "kcp_dhu_tape": "cake_gdn_train_8b193b1101cc03b7d704_kcp",
     "kcp_dhu_tape_vh64": "cake_gdn_train_a44997811b71d9d83fb4_kcp",
     "kcp_fwdh_offset": "cake_gdn_train_eb58759a50e781620aed_kcp",
@@ -3852,8 +3954,15 @@ V1_LIBRARIES = {
     "kcp_transfer_walk_three_mma": "cake_gdn_train_2f42874614b85ffc14fe_kcp",
     "kcp_transfer_walk_plain_tf32": "cake_gdn_train_efbba796414578cbd8b5_kcp",
 }
-# The output walk (#2 with #5 folded in): no v1 record, launched by the norm-off and the norm-on forward alike.
-NORM_OFF_EXTRA_RECORDS = ("kcp_fwdh_out", "kcp_fwdh_out_vh64")
+# The output walk (#2 with #5 folded in) and the cut adjoint offset walk with its table program: no v1 record,
+# launched by the norm-off and the norm-on routes alike.
+NORM_OFF_EXTRA_RECORDS = (
+    "kcp_fwdh_out",
+    "kcp_fwdh_out_vh64",
+    "kcp_dhu_offset",
+    "kcp_dhu_offset_vh64",
+    "kcp_dhu_cut_start",
+)
 L2N_SKIP = (
     "the in-kernel Q/K L2 norm records (fwd_prep_l2n, bwd_dqkg_l2n, qk_apply) are not in the shipped registry "
     "yet: use_qk_l2norm_in_kernel cannot run on the kernel backend"
@@ -3873,7 +3982,7 @@ def _skip_unless_l2n(backend: str) -> None:
 
 
 def _v1_csrc_digest() -> str:
-    """sha256 over the sorted lines ``"<file> <sha256>\\n"`` of the 36 csrc files of the 18 v1 records (reported)."""
+    """sha256 over the sorted lines ``"<file> <sha256>\\n"`` of the 32 csrc files of the 16 v1 records (reported)."""
     import hashlib
 
     lines = []
@@ -4050,6 +4159,7 @@ def _run_rank_l2n(
         ref_mod,
         _budget_cell(row),
         fp64_rel_rms={n: L2N_DQK_FP64_REL_RMS_MAX for n in ("dq", "dk")},
+        p2_budget=_p2_budget_cell(row),
     )
     flags: dict[str, bool] = {}
     info: dict[str, object] = {"T_r": T_r}
@@ -4116,11 +4226,16 @@ def _run_rank_l2n(
             **{n: lf.grad for n, lf in zip(GRADS, leaves, strict=True)},
         }
 
-    def arm(name: str, r_: dict, partner=None, partner_name=None, *, gate=True):
-        """One arm within the FP64 budgets and, against its partner, within the same budget constants."""
-        judge.fp64(name, r_, refs, gate=gate)
+    def arm(
+        name: str, r_: dict, partner=None, partner_name=None, *, gate=True, forced=False
+    ):
+        """One arm within the FP64 budgets and, against its partner, within the same budget constants (``forced``:
+        an arm at the forced ``P = 2``, judged by the forced ``P = 2`` cell)."""
+        judge.fp64(name, r_, refs, gate=gate, forced=forced)
         if partner is not None:
-            judge.cross(f"{name}_vs_{partner_name}", r_, partner, gate=gate)
+            judge.cross(
+                f"{name}_vs_{partner_name}", r_, partner, gate=gate, forced=forced
+            )
 
     # norm off unchanged: the v1 records keep their names; the norm-off route launches only them and the output
     # walk (a program of both routes, new beside the v1 records; NORM_OFF_EXTRA_RECORDS)
@@ -4143,8 +4258,9 @@ def _run_rank_l2n(
     )
     del res_off
 
-    # (a) the norm on: the worst of N_REPEAT runs against FP64; every form against FP64 and its partner
-    res = saved_pass(**L2N, test_knobs={"record_qk": True})
+    # (a) the norm on: the worst of N_REPEAT runs against FP64; every form against FP64 and its partner.  The light
+    # arms name save_mode="light" (the default with the norm is "light_akk"; the arms without a save mode run it)
+    res = saved_pass(save_mode="light", **L2N, test_knobs={"record_qk": True})
     rec_fwd_qk, rec_bwd_qk = res["fwd"].get("qk"), res["bwd"].get("qk")
     info["fwd_record"] = {
         k_: v_
@@ -4169,14 +4285,14 @@ def _run_rank_l2n(
     )
     arm("run0", res)
     for i in range(1, N_REPEAT):
-        arm(f"run{i}", saved_pass(**L2N), res, "run0")
+        arm(f"run{i}", saved_pass(save_mode="light", **L2N), res, "run0")
     full = saved_pass(save_mode="full", **L2N, test_knobs={"record_qk": True})
     arm("full", full, res, "run0")
     flags["l2n_full_rebuilds_with_qk_apply"] = (
         T_r == 0 or full["bwd"]["qk_source"] == "qk_apply"
     )
     arm("replay", saved_pass(boundary_mode="replay", **L2N), res, "run0")
-    res_nt = saved_pass(save_transfer=False, **L2N)
+    res_nt = saved_pass(save_mode="light", save_transfer=False, **L2N)
     arm("no_save_transfer", res_nt, res, "run0")
     # save_mode="full" without save_transfer under NaN-filled allocations (the M_seg^T plane at P > 1, see _run_rank)
     res_full_nt = _nan_allocations_pass(
@@ -4189,7 +4305,7 @@ def _run_rank_l2n(
     }
     flags["full_no_save_transfer_saves_m_seg"] = info["full_no_save_transfer"]["ok"]
     del res_full_nt, res_nt
-    res_auto = autograd_pass(False, **L2N)
+    res_auto = autograd_pass(False, save_mode="light", **L2N)
     arm("autograd", res_auto, res, "run0")
     for name, opts in (
         ("ckpt_replay_form", {"reuse_recompute_tapes": False}),
@@ -4212,7 +4328,9 @@ def _run_rank_l2n(
     judge.fp64("backward_twice_half", twice, refs, GRADS, half=True)
     del twice
     if W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS:
-        res_ring = saved_pass(exchange="ring", save_transfer=False, **L2N)
+        res_ring = saved_pass(
+            exchange="ring", save_mode="light", save_transfer=False, **L2N
+        )
         arm("ring", res_ring, res, "run0")
         res_ring_full = _nan_allocations_pass(
             lambda: saved_pass(
@@ -4269,7 +4387,7 @@ def _run_rank_l2n(
         tape = int(ctx.R) * HV * 128
         q_light = int(
             gb.cake_gdn_nondet_train_kcp_saved_bytes(
-                ctx, H_qk=H_qk, HV=HV, with_conv=False, **L2N
+                ctx, H_qk=H_qk, HV=HV, save_mode="light", with_conv=False, **L2N
             )
         )
         q_akk = int(
@@ -4308,13 +4426,18 @@ def _run_rank_l2n(
                 forms.append(("ring_akk", {"exchange": "ring", "save_transfer": False}))
             for name, opts in forms:
                 o = {**opts, **L2N}
-                lt = _nan_allocations_pass(lambda o=o: saved_pass(**o))
-                lt2 = _nan_allocations_pass(lambda o=o: saved_pass(**o))
+                lt = _nan_allocations_pass(
+                    lambda o=o: saved_pass(save_mode="light", **o)
+                )
+                lt2 = _nan_allocations_pass(
+                    lambda o=o: saved_pass(save_mode="light", **o)
+                )
                 ak = _nan_allocations_pass(
                     lambda o=o: saved_pass(save_mode="light_akk", **o)
                 )
-                arm(f"{name}_light", lt)
-                arm(f"{name}_light_akk", ak, lt, f"{name}_light")
+                forced = "segments" in opts  # the forced P = 2 forms: their own cell
+                arm(f"{name}_light", lt, forced=forced)
+                arm(f"{name}_light_akk", ak, lt, f"{name}_light", forced=forced)
                 repeat, bits = _bitwise(lt2, lt), _bitwise(ak, lt)
                 akk_info[name] = {
                     "P": None if ak["saved"] is None else int(ak["saved"].P),
@@ -4536,6 +4659,7 @@ def _run_rank_l2n(
                 ctx,
                 workspace=ws,
                 graph="replay",
+                save_mode="light",
                 **base,
                 **L2N,
             )
@@ -4550,6 +4674,7 @@ def _run_rank_l2n(
                 saved=saved_g,
                 workspace=ws,
                 graph="replay",
+                save_mode="light",
                 **base,
                 **L2N,
             )
@@ -4710,7 +4835,9 @@ def _run_rank_l2n(
         return kept, nbytes, peak
 
     kept_off, saved_off_b, peak_off = retained()
-    kept_on, saved_on_b, peak_on = retained(**L2N)
+    kept_on, saved_on_b, peak_on = retained(save_mode="light", **L2N)
+    # the default with the norm ("light_akk"): recorded, not gated (+ the Akk tape, 128 R HV bytes, against "light")
+    kept_def, saved_def_b, peak_def = retained(**L2N)
     rstd_bytes = 8 * T_r * H_qk
     info["memory"] = {
         "retained_off": kept_off,
@@ -4720,11 +4847,15 @@ def _run_rank_l2n(
         "fwd_peak_off": peak_off,
         "fwd_peak_on": peak_on,
         "qn_kn_bytes": 2 * T_r * H_qk * 256,
+        "retained_on_default": kept_def,
+        "saved_on_default": saved_def_b,
+        "fwd_peak_on_default": peak_def,
+        "akk_tape_bytes": int(ctx.R) * HV * 128,
     }
     flags["l2n_post_forward_eq_off_plus_rstd"] = kept_on - kept_off == rstd_bytes
     q_on = int(
         gb.cake_gdn_nondet_train_kcp_saved_bytes(
-            ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True
+            ctx, H_qk=H_qk, HV=HV, save_mode="light", use_qk_l2norm_in_kernel=True
         )
     )
     q_off = int(gb.cake_gdn_nondet_train_kcp_saved_bytes(ctx, H_qk=H_qk, HV=HV))

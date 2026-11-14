@@ -23,7 +23,7 @@ limitations under the License.
 # through the FP64 reference (minutes on B200).
 #
 # This suite exercises the package alone: it names the package once, through
-# ``tests.test_helpers.cake_package``, and imports nothing else from flashinfer,
+# ``tests.cake.test_helpers.cake_package``, and imports nothing else from flashinfer,
 # so a build that vendors the package under another import path runs it
 # unchanged after pointing that table entry at its package.  The flashinfer
 # public entry points (``flashinfer.cake_dsa_indexer_det_train``) are covered by
@@ -42,8 +42,8 @@ from unittest import mock
 import pytest
 import torch
 
-from tests.test_helpers import cake_dsa_indexer_reference as ref
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers import cake_dsa_indexer_reference as ref
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake.cake_dsa_indexer_det_train", "cake_backend")
 cake_build = cake_package("cake.cake_dsa_indexer_det_train", "cake_build")
@@ -139,6 +139,7 @@ _COMMON = dict(
     sample_shift_permille=250,
     sample_shift_rule=None,
     sample_class_rule=None,
+    sample_long_rule=None,
     lsf_programs=False,
     lsf_single_rule=None,
     static_scan_kinds=[],
@@ -169,6 +170,7 @@ _COMMON = dict(
     rank_t16_slots=[4096],
     rank_persist_max_k=0,
     rank_persist_ctas_per_sm=4,
+    rank_persist_spare_sms=0,
     merge_rank=False,
 )
 NARROW_PAIR_POLICY = DispatchPolicy.from_record(
@@ -740,6 +742,8 @@ def test_policy_record_round_trip_and_validation():
         dict(rank_persist_max_k=-1),  # round 39: lever FRP-K fields
         dict(rank_persist_max_k=2048.5),
         dict(rank_persist_ctas_per_sm=0),
+        dict(rank_persist_spare_sms=-1),  # the spare SMs of the persistent grid (#7548)
+        dict(rank_persist_spare_sms=0.5),
         dict(far_sample=2),  # the far-sample first threshold switch: 0 or 1
         dict(far_sample=-1),
         dict(far_sample=True),
@@ -1827,6 +1831,17 @@ def _select(policy, T, Tkv, S=1, K=2048, ratio=1, grid=148, **knobs):
     )
 
 
+# lever LSF on sm_107a: the longest-first copies its registry carries, those of the two l6 ticket programs (the plain
+# l6 programs drawing from their TicketWord, which serve its packed calls)
+_SM107_LSF_COPIES = frozenset({"scan:l6:u1:s0:f0:lsf", "scan:l6:u1:s0:f1:lsf"})
+
+
+def _lsf_key(keys, key: str) -> str:
+    """The key a packed call whose key segments the host cannot tell equal runs for the decided program ``key`` on an
+    ``lsf_programs`` architecture: its longest-first copy where ``keys`` registers one, else ``key`` itself."""
+    return key + ":lsf" if key + ":lsf" in keys else key
+
+
 def test_round38_rank_forms_policy_and_select():
     """Levers FRT (16-item thread form) and FRB (bulk row I/O) of the staged rank finalize: the record switches, the rules, the
     key tags and the dispatch -- the production slot count keeps the 16-item form to the 512-thread (top_k > 2048) staged form;
@@ -2378,7 +2393,8 @@ def test_policy_selects_registered_programs_on_a_dense_geometry_grid():
     fails closed by name on an unregistered program, so a selectable but unregistered program is a production failure
     (round 2 review: ``scan:narrow:u1:s1:f1`` on sm_107a at 6018 queries x 11754 keys was selectable but unregistered).
     Both sample modes: the unsampled plan family (``sample_tiles_max=0``, the ``*_unsampled`` capacity values) is
-    otherwise unseen by the grid.  With and without the registry: ``l6_solo_rule`` is on only with it."""
+    otherwise unseen by the grid.  With and without the registry: ``l6_solo_rule`` is on only with it, and without it a
+    packed call names the :lsf copy of its program, which the backend runs only where the registry has it."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     for arch, keys in cake_jit.PROGRAM_KEYS.items():
@@ -2409,6 +2425,14 @@ def test_policy_selects_registered_programs_on_a_dense_geometry_grid():
                         selected = [choice.scan_key, choice.finalize_key] + (
                             [MERGE_KEY] if choice.n_split > 1 else []
                         )
+                        # without a registry the plan names the :lsf copy wherever the record asks for it; the backend
+                        # passes the registry, which runs the program itself where its copy is not registered (sm_107a)
+                        if (
+                            scan_keys is None
+                            and arch == "sm_107a"
+                            and choice.scan_key not in keys
+                        ):
+                            selected[0] = choice.scan_key.removesuffix(":lsf")
                         for key in selected:
                             assert key in keys, (
                                 arch,
@@ -2535,10 +2559,11 @@ def test_l6_solo_rule_prefers_the_unpaired_l6_unit_where_registered_and_unsplit(
         solo(rule) and rule.scan_key == "scan:l6:u1:s1:f1" and base.kind == "pair_wide"
     )
     # eight causal 8k documents (32 mean tiles, >= 2 segments): the pair l6 program becomes unpaired in both modes (in the
-    # plain unit order: snake_packed_rule)
+    # plain unit order: snake_packed_rule), in its longest-first copy (the snake pair l6 program has none)
     for sample in (None, 0):
         rule, base = plans(65536, 65536, 8, sample)
-        assert solo(rule) and rule.scan_key == "scan:l6:u1:s0:f1", sample
+        assert solo(rule), sample
+        assert rule.scan_key == _lsf_key(keys, "scan:l6:u1:s0:f1"), sample
         assert base.scan_key == "scan:pair_l6:u1:s1:f1", sample
     # one sampled document of 100 mean tiles (<= 128): unpaired l6
     rule, base = plans(16384, 16384 // 2 + 100 * 128, 1, None)
@@ -2851,11 +2876,13 @@ def test_split_wave_scope_and_wide_pair_snake_only_on_sm_107a():
     assert (rule.kind, rule.unit, rule.n_split) == ("split", "narrow", 2)
     assert plan(plain, 1024, 131072, 1, 0).n_split == 2
     assert plan(p, 1024, 131072, 1, 0).scan_key == "scan:l6:u1:s0:f0"
-    # two such documents: the narrow wave split goes in both modes (the l6 solo preference then applies)
+    # two such documents: the narrow wave split goes in both modes (the l6 solo preference then applies; the
+    # longest-first copy of its program)
     assert plan(plain, 2048, 262144, 2, None).n_split == 2
     for sample in (None, 0):
         rule = plan(p, 2048, 262144, 2, sample)
-        assert (rule.scan_key, rule.n_split) == ("scan:l6:u1:s0:f0", 1), sample
+        assert rule.n_split == 1, sample
+        assert rule.scan_key == _lsf_key(keys, "scan:l6:u1:s0:f0"), sample
     # a 4096-query document over 128k keys: the wide wave split goes; sampled the call then runs the unpaired wide
     # program (its CTA pair does not walk the snake order), unsampled the l6 unit
     base = plan(plain, 4096, 131072, 1, None)
@@ -2944,13 +2971,17 @@ def test_snake_packed_rule_and_snake_l6_fallback_waves_on_sm_107a():
     # packed equal documents: eight 8k documents (32 mean tiles, 52 waves) leave the snake order in both modes; two 16k
     # documents (64 mean tiles, 26 waves) keep it sampled only; two 4k-query documents over 8k keys each (48 mean tiles)
     # and two 4k documents over 6k keys each (32 mean tiles) need 7 waves of 6-query units on 212 CTAs: both keep it
+    # (packed calls without max_seqlen_k: the plain-order l6 programs run their longest-first copies, the snake-order
+    # ones have none)
     for sample in (None, 0):
         assert plan(off, 65536, 65536, 8, sample).scan_key == "scan:l6:u1:s1:f1"
-        assert plan(p, 65536, 65536, 8, sample).scan_key == "scan:l6:u1:s0:f1"
+        assert plan(p, 65536, 65536, 8, sample).scan_key == _lsf_key(
+            keys, "scan:l6:u1:s0:f1"
+        )
         assert plan(p, 8192, 16384, 2, sample).scan_key == "scan:l6:u1:s1:f1"
         assert plan(p, 8192, 12288, 2, sample).scan_key == "scan:l6:u1:s1:f1"
     assert plan(p, 32768, 32768, 2, None).scan_key == "scan:l6:u1:s1:f1"
-    assert plan(p, 32768, 32768, 2, 0).scan_key == "scan:l6:u1:s0:f1"
+    assert plan(p, 32768, 32768, 2, 0).scan_key == _lsf_key(keys, "scan:l6:u1:s0:f1")
     assert p.snake_for("l6", 8192, 16384, 2, 1, sampled=False, grid=212)
     assert not p.snake_for(
         "l6", 8192, 16384, 2, 1, sampled=False
@@ -2975,7 +3006,7 @@ def test_snake_packed_rule_and_snake_l6_fallback_waves_on_sm_107a():
         assert plan(p, T, Tkv, 1, None) == plan(off, T, Tkv, 1, None), T
     assert plan(p, 524288, 524288, 1, 0) == plan(off, 524288, 524288, 1, 0)
     # four 16k-query documents over 32k keys each: sampling off the packed rule already takes the plain-order l6 key
-    assert plan(p, 65536, 131072, 4, 0).scan_key == "scan:l6:u1:s0:f0"
+    assert plan(p, 65536, 131072, 4, 0).scan_key == _lsf_key(keys, "scan:l6:u1:s0:f0")
     counts = dict(same=0, order=0, fallback=0)
     for q, k, S, top_k, sample in itertools.product(
         (4, 64, 256, 1024, 2048, 4096, 8192, 16384),
@@ -2993,10 +3024,12 @@ def test_snake_packed_rule_and_snake_l6_fallback_waves_on_sm_107a():
         if got == base:
             counts["same"] += 1
         elif base.kind == "l6" and got.kind == "l6":
-            # the unit order alone: a packed l6 call below the rule's floor
+            # the unit order alone: a packed l6 call below the rule's floor (in the longest-first copy of the
+            # plain-order program where the registry has it; the snake-order program has none)
             assert S >= 2 and base.snake and not got.snake, (args, top_k)
+            key = _lsf_key(keys, base.scan_key.replace(":s1:", ":s0:"))
             assert got == replace(
-                base, snake=False, scan_key=base.scan_key.replace(":s1:", ":s0:")
+                base, snake=False, scan_key=key, lsf=key.endswith(":lsf")
             ), (args, top_k)
             counts["order"] += 1
         else:
@@ -3317,8 +3350,9 @@ def test_shipped_unit_rules_by_architecture():
 def test_shipped_sample_shift_rule_by_architecture():
     """sm_103a (``sample_shift_rule [4096, 375]``): a ``top_k = 4096`` call shifts its sampled rank by 375 permille, a
     ``top_k = 2048`` call keeps the 250 default, in both sample modes, and an explicit ``sample_shift_permille`` knob wins
-    on both; sm_100a and sm_107a carry no rule (``None``) and keep 250 at every ``top_k``.  The backend's plan carries the
-    same scalar (host-only: ``arch`` and the SM count given)."""
+    on both; sm_100a and sm_107a carry no rule (``None``) and keep 250 at every ``top_k``, except where their class rules
+    shift a sampled two-segment call (sm_107a also by its long-unit rule).  The backend's plan carries the same scalar
+    (host-only: ``arch`` and the SM count given)."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     p103, p100, p107 = (
@@ -3335,7 +3369,8 @@ def test_shipped_sample_shift_rule_by_architecture():
         for knobs in ({}, {"sample_tiles_max": 0}):
             for T, Tkv, S in rows:
                 # sample_class_rule [8, 500] (sm_103a / sm_100a): a sampled call of two or more segments on a wide-unit
-                # program shifts 500 permille, ahead of sample_shift_rule; sm_107a carries no class rule
+                # program shifts 500 permille, ahead of sample_shift_rule; on sm_107a the two-segment call shifts 500
+                # permille too (sample_long_rule on a long-unit l6 program, sample_class_rule [32, 500] on a wide one)
                 cls = 500 if S >= 2 and not knobs else None
                 for K, shift in ((2048, 250), (4096, 375)):
                     where = (grid, knobs, T, Tkv, S, K)
@@ -3343,9 +3378,7 @@ def test_shipped_sample_shift_rule_by_architecture():
                     assert c.sample_shift_permille == (cls or shift), where
                     for p in (p100, p107):
                         c = _select(p, T, Tkv, S=S, K=K, grid=grid, **knobs)
-                        assert c.sample_shift_permille == (
-                            cls if cls and p is p100 else 250
-                        ), where
+                        assert c.sample_shift_permille == (cls or 250), where
                     forced = dict(knobs, sample_shift_permille=-500)
                     c = _select(p103, T, Tkv, S=S, K=K, grid=grid, **forced)
                     assert c.sample_shift_permille == -500, where
@@ -4121,6 +4154,60 @@ def test_repeatability_bitwise():
     assert ref.same_bits(a, b) and ref.same_bits(a, c)
 
 
+def test_sm107a_sampling_rules_cover_the_7549_rank_geometries():
+    """#7549 on sm_107a: the packed calls of short query segments and few mean unit tiles (the 22-segment packed rank
+    inputs) sample ``sample_class_rule[0]`` tiles at its shift -- not a call whose units average no more tiles than that
+    (the ratio-4 pooled packed rows keep the tiny defaults) -- and the long-unit l6 calls (the two-segment 262144-key
+    document ranks) take ``sample_long_rule``'s shift at the long-unit tile count, for every ``top_k``.  A long-unit call
+    of another kind keeps the long-unit defaults, explicit knobs stay, and sampling off stays off.  The other
+    architectures set no long-unit rule, and the sm_107a FP8 record sets neither rule."""
+    assert policy_for("sm_100a").sample_long_rule is None
+    assert policy_for("sm_103a").sample_long_rule is None
+    assert policy_for("sm_107a", "fp8").sample_class_rule is None
+    assert policy_for("sm_107a", "fp8").sample_long_rule is None
+    arch, grid = "sm_107a", _FROZEN_GRIDS["sm_107a"][0]
+    policy = policy_for(arch)
+    class_rule, long_rule = policy.sample_class_rule, policy.sample_long_rule
+    assert class_rule is not None and long_rule is not None
+
+    def plan(T, Tkv, S, top_k=2048, **knobs):
+        return plan_dsa_indexer_det_topk(
+            T, Tkv, S, top_k=top_k, arch=arch, num_sms=grid, **knobs
+        )
+
+    def sampling(choice):
+        return choice.sample_tiles_max, choice.sample_shift_permille
+
+    assert sampling(plan(17536, 289344, 22)) == tuple(class_rule)
+    # the ratio-4 pooled packed call (top-512 pools, about 21 mean unit tiles) keeps the tiny defaults: the class
+    # rule's larger sample would cover its whole units; sm_100a / sm_103a sample the tiny default count under theirs
+    pooled = plan(10624, 43824, 16, top_k=512, ratio=4)
+    assert policy.mean_unit_tiles(10624, 43824, 16, 4) <= class_rule[0]
+    assert sampling(pooled) == (
+        policy.sample_tiles_tiny_units,
+        policy.sample_shift_for(512),
+    )
+    for other in ("sm_100a", "sm_103a"):
+        assert (
+            policy_for(other).sample_class_rule[0]
+            == policy_for(other).sample_tiles_tiny_units
+        )
+    for top_k in (256, 2048, 4096):
+        doc = plan(16384, 270336, 2, top_k=top_k)
+        assert doc.physical_kind in long_rule[0], top_k
+        assert sampling(doc) == (policy.sample_tiles_max, long_rule[1]), top_k
+    wide = plan(4096, 131072, 1)
+    assert wide.physical_kind not in long_rule[0]
+    assert sampling(wide) == (policy.sample_tiles_max, policy.sample_shift_for(2048))
+    assert sampling(plan(16384, 270336, 2, sample_tiles_max=16)) == (16, long_rule[1])
+    assert sampling(plan(16384, 270336, 2, sample_shift_permille=100)) == (
+        policy.sample_tiles_max,
+        100,
+    )
+    assert plan(16384, 270336, 2, sample_tiles_max=0).sample_tiles_max == 0
+    assert plan(17536, 289344, 22, sample_tiles_max=0).sample_tiles_max == 0
+
+
 def test_far_sample_knob_is_validated_on_the_host():
     """``far_sample`` is ``0`` or ``1`` and defaults to the architecture's record; the check reads no device."""
     if not cake_jit.PROGRAM_KEYS:
@@ -4395,7 +4482,8 @@ def test_prepared_runner_graph_capture_and_replay():
 
 
 # the first 16 int64 of the ticket tail: the ticket word and its padding; the rest of the tail holds the
-# longest-first segment order, which every :lsf scan launch writes at its prologue before reading it
+# longest-first segment order, which every :lsf scan launch writes at its prologue before reading it (also the :lsf
+# copy of a program that draws from its TicketWord, whose runner has no tail of its own)
 _TICKET_WORD_BYTES = 8 * 16
 
 
@@ -4405,7 +4493,8 @@ def _assert_ticket_tail_zero(runner) -> None:
     for a program without a tail (``static_scan_kinds``).  The segment order behind it is not checked: an :lsf launch
     leaves it written.  A static call (``runner._tail_static``, ``cake_policy.ticket_static_path``) never touches the word,
     which then holds whatever the buffer held: nothing to check.  A runner whose scan program reads its ``TicketWord``
-    argument has no tail: its ticket block's word reads 0 instead."""
+    argument has no tail (its :lsf copy writes the segment order behind the workspace's ticket word before it reads
+    it): its ticket block's word reads 0 instead."""
     if runner.ticket_tail is not None and not runner._tail_static:
         words = runner.ticket_tail[:_TICKET_WORD_BYTES]
         assert not words.any(), words[:8].tolist()
@@ -4439,7 +4528,9 @@ def test_prepared_runner_ticket_tail_is_zero_at_prepare_after_runs_and_after_a_f
     )
     runner = _prepare(inputs)
     if runner.ticket_tail is None:
-        pytest.skip("no ticket tail for this program (static_scan_kinds)")
+        pytest.skip(
+            "no ticket tail for this program (a static_scan_kinds program, or one drawing from its TicketWord block)"
+        )
     assert not runner._tail_shared  # backend-owned: nothing else writes the tail
     assert not runner._tail_static  # the call draws tickets
     # the scan binding zeroes nothing: the device's one empty region, no per-call view
@@ -4493,7 +4584,9 @@ def _caller_owned_runner(inputs: ref.IndexerInputs, workspace: torch.Tensor):
     """A runner on the caller-owned ``workspace`` (skips where its program has no ticket tail)."""
     runner = _prepare(inputs, workspace_buffer=workspace)
     if runner.ticket_tail is None:
-        pytest.skip("no ticket tail for this program (static_scan_kinds)")
+        pytest.skip(
+            "no ticket tail for this program (a static_scan_kinds program, or one drawing from its TicketWord block)"
+        )
     assert runner._tail_shared
     # the scan binding zeroes the tail right before every scan launch; nothing on a static call
     zero_region = _scan_zero_region(runner)
@@ -4636,7 +4729,9 @@ def test_eager_entry_zeroes_a_caller_owned_tail_once_per_call(monkeypatch):
         assert not host_memsets and runner._ticket_restore is None
         return
     if runners[-1].ticket_tail is None:
-        pytest.skip("no ticket tail for this program (static_scan_kinds)")
+        pytest.skip(
+            "no ticket tail for this program (a static_scan_kinds program, or one drawing from its TicketWord block)"
+        )
     assert runners[-1]._tail_shared and not host_memsets  # the scan binding zeroes it
     assert not runners[-1]._tail_static  # the call draws tickets
     runner = runners[-1]
@@ -4693,10 +4788,11 @@ def test_caller_owned_workspace_graph_replay_restores_the_tail():
 
 
 def test_static_scan_kind_runner_has_no_ticket_tail_and_stays_exact_on_a_poisoned_workspace():
-    """A program of the record's ``static_scan_kinds`` (sm_107a: the l6 and CTA-pair l6 programs) keeps the static
-    enumeration on every call, also where the call's units exceed the grid: its runner gets no ticket tail (no memset
-    at prepare or run) and its rows stay bit-exact on a caller-owned buffer poisoned everywhere.  A drawing program on
-    the same architecture keeps its tail."""
+    """A program of the record's ``static_scan_kinds`` keeps the static enumeration on every call, also where the
+    call's units exceed the grid: its runner gets no ticket tail (no memset at prepare or run) and its rows stay
+    bit-exact on a caller-owned buffer poisoned everywhere.  A drawing program on the same architecture keeps its tail.
+    No BF16 record names a static kind now, so this skips; the FP8 form's static programs (sm_107a) are covered by
+    ``test_fp8_ticket_decision_is_per_form_and_exact_on_a_poisoned_workspace``."""
     _require_program()
     device = torch.device("cuda", torch.cuda.current_device())
     arch = arch_for(device)
@@ -4869,8 +4965,9 @@ def _ticket_word_inputs(seed: int):
 def test_ticket_word_runner_owns_its_block_and_ignores_a_poisoned_caller_workspace():
     """A prepared runner whose scan program reads its TicketWord gets a 16-byte block of its own, zeroed once at
     prepare, never the shared placeholder and never the workspace's tail: poisoning the whole caller-owned workspace
-    (the tail's ticket word included) between runs leaves every run bit-equal to a backend-owned runner, no run issues
-    a memset, and the block's word reads 0 after every run."""
+    (the tail's ticket word included, and the segment order an :lsf copy writes there before it reads it) between runs
+    leaves every run bit-equal to a backend-owned runner, no run issues a memset, and the block's word reads 0 after
+    every run."""
     inputs = _ticket_word_inputs(80)
     device = torch.device("cuda", torch.cuda.current_device())
     own = _prepare(inputs)
@@ -4920,6 +5017,67 @@ def test_ticket_word_runner_owns_its_block_and_ignores_a_poisoned_caller_workspa
         )
         workspace[tail_at : tail_at + 4] = torch.tensor(
             [1 + step, 2, 3, 4], dtype=torch.uint8, device=device
+        )
+
+
+# the packed calls of the sm_107a longest-first copies (``_SM107_LSF_COPIES``): unequal key segments on each copy, and
+# near-equal ones (the longest at most 5/4 of the shortest), on which the copy keeps the argument order
+_SM107_LSF_GEOMETRIES = (
+    ([1500, 1000], [1500, 12000], 1024, "scan:l6:u1:s0:f1:lsf"),
+    ([1024, 1024], [8192, 24576], 1024, "scan:l6:u1:s0:f0:lsf"),
+    ([1024, 1024], [16384, 18432], 1024, None),
+)
+
+
+@pytest.mark.parametrize("geometry", range(len(_SM107_LSF_GEOMETRIES)))
+def test_sm107_longest_first_copy_runs_on_a_poisoned_caller_workspace(geometry):
+    """On sm_107a a packed call of the two l6 ticket programs runs their longest-first copy, which draws from its
+    TicketWord block and writes the segment order into the caller-owned workspace's ticket tail before any role reads
+    it: with the whole workspace poisoned before the first run and refilled with random bytes between runs, every run
+    is bit-equal to a backend-owned runner's, which passes the reference judge."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    arch = arch_for(device)
+    if arch != "sm_107a":
+        pytest.skip(
+            f"the longest-first copies of the TicketWord programs ship on sm_107a, not {arch}"
+        )
+    assert set(cake_jit.PROGRAM_KEYS[arch]) >= _SM107_LSF_COPIES
+    seg_q, seg_k, top_k, key = _SM107_LSF_GEOMETRIES[geometry]
+    inputs = ref.make_random_inputs(
+        seg_q, seg_k, top_k=top_k, seed=88 + geometry, device="cuda"
+    )
+    own = _prepare(inputs)
+    assert own.choice.scan_key in (_SM107_LSF_COPIES if key is None else {key}), (
+        own.choice.scan_key
+    )
+    expected = _cloned(own())
+    torch.cuda.synchronize()
+    _judge_ok(expected, ref.select_reference(inputs))
+    workspace = torch.empty(
+        _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
+    )
+    workspace.fill_(0xFF)
+    runner = _prepare(inputs, workspace_buffer=workspace)
+    assert (
+        runner.choice.scan_key == own.choice.scan_key
+        and runner.ticket_block is not None
+    )
+    assert cake_backend.reads_ticket_word(runner.programs["scan"], runner.arch)
+    generator = torch.Generator(device=device).manual_seed(89)
+    for step in range(4):
+        out = runner()
+        torch.cuda.synchronize()
+        assert ref.same_bits(out, expected), step
+        workspace.copy_(
+            torch.randint(
+                0,
+                256,
+                workspace.shape,
+                generator=generator,
+                device=device,
+                dtype=torch.uint8,
+            )
         )
 
 
@@ -5220,7 +5378,8 @@ def test_empty_rows_and_no_keys_are_all_padding():
 
 def test_persistent_rank_finalize_follows_the_architecture_cap():
     """Lever FRP-K (round 39): the persistent two-row pipelined rank finalize serves the staged bulk slab calls up to the
-    architecture's ``rank_persist_max_k`` (sm_107a: 2048) and launches ``min(rows, rank_persist_ctas_per_sm x SMs)`` CTAs; every
+    architecture's ``rank_persist_max_k`` (sm_107a: 2048) and launches ``min(rows, rank_persist_ctas_per_sm x (SMs -
+    rank_persist_spare_sms))`` CTAs; every
     other architecture and every larger top_k keeps the one-row program (one CTA per row)."""
     for arch in cake_jit.ARCHES:
         policy = policy_for(arch)
@@ -5248,13 +5407,18 @@ def test_persistent_rank_finalize_follows_the_architecture_cap():
             )
             if expected:
                 assert choice.rank_persist_ctas == policy.rank_persist_ctas_per_sm
+                assert choice.rank_persist_spare == policy.rank_persist_spare_sms
                 assert finalize_grid(choice, 148) == min(
-                    8192, policy.rank_persist_ctas_per_sm * 148
+                    8192,
+                    policy.rank_persist_ctas_per_sm
+                    * (148 - policy.rank_persist_spare_sms),
                 )
                 assert finalize_grid(choice, 10_000) == 8192
             else:
                 assert (
-                    choice.rank_persist_ctas == 0 and finalize_grid(choice, 148) == 8192
+                    choice.rank_persist_ctas == 0
+                    and choice.rank_persist_spare == 0
+                    and finalize_grid(choice, 148) == 8192
                 )
             assert choice.finalize_key in cake_jit.PROGRAM_KEYS[arch], (
                 arch,
@@ -5310,6 +5474,45 @@ _MERGE_RANK_CALLS = (
     (64, 16384, 1),
     (128, 32768, 2),
 )
+
+
+def test_persistent_rank_grid_spares_sms_for_another_stream():
+    """#7548: where the record spares SMs (sm_107a: one), the persistent rank grid of a call with enough rows is
+    ``rank_persist_ctas_per_sm x (SMs - spare)``, a multiple of the SMs that remain.  The :persist programs run 256 threads
+    per CTA, so a 1024-thread SM107 SM holds 4 of them at a time; with ``rank_persist_ctas_per_sm`` a multiple of 4, a block
+    of another stream on the spare SM leaves the static row walk whole waves of the other SMs instead of a short extra
+    wave."""
+    assert policy_for("sm_107a").rank_persist_spare_sms == 1
+    for arch in cake_jit.ARCHES:
+        policy = policy_for(arch)
+        if policy.rank_persist_max_k <= 0:
+            assert policy.rank_persist_spare_sms == 0, arch
+            continue
+        for sms in (148, 212):
+            choice = select_program(
+                policy,
+                num_queries=8192,
+                num_keys=8192,
+                num_segments=1,
+                ratio=1,
+                top_k=2048,
+                grid=sms,
+            )
+            assert choice.rank_persistent, (arch, sms)
+            spare = policy.rank_persist_spare_sms
+            grid = finalize_grid(choice, sms)
+            assert grid == policy.rank_persist_ctas_per_sm * (sms - spare), (arch, sms)
+            assert grid < policy.rank_persist_ctas_per_sm * sms, (arch, sms)
+            # CTAs one 1024-thread SM107 SM holds at a time divide the CTAs per SM: whole waves
+            assert choice.rank_threads == 256, (arch, choice.finalize_key)
+            assert (
+                policy.rank_persist_ctas_per_sm % (1024 // choice.rank_threads) == 0
+            ), arch
+        # a device of no more SMs than the spare count keeps one SM's grid
+        assert (
+            finalize_grid(choice, policy.rank_persist_spare_sms)
+            == policy.rank_persist_ctas_per_sm
+        )
 
 
 def test_merge_rank_fuses_the_slab_rank_finalize_into_split_merges():
@@ -5495,17 +5698,21 @@ def test_policy_is_validated_once_per_architecture(monkeypatch):
 
 
 def test_lsf_copy_runs_on_packed_calls_of_unequal_key_segments():
-    """Lever LSF (#7549): an architecture whose policy sets ``lsf_programs`` (a ticket architecture) ships the
-    longest-first segment order copy of every scan program (key suffix ``:lsf``, a program of its own); the host runs it
-    on packed calls whose key segments are not all equal and the program without it on one-segment calls and on packed
-    calls of equal key segments (``num_keys == S x max_seqlen_k``)."""
+    """Lever LSF (#7549): an architecture whose policy sets ``lsf_programs`` (a ticket architecture) ships
+    longest-first segment order copies of its scan programs (key suffix ``:lsf``, each a program of its own): sm_100a
+    and sm_103a of every scan program, sm_107a of its two l6 ticket programs (``_SM107_LSF_COPIES``); the host runs the
+    copy on packed calls whose key segments are not all equal and the program without it on one-segment calls and on
+    packed calls of equal key segments (``num_keys == S x max_seqlen_k``)."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     for arch, keys in cake_jit.PROGRAM_KEYS.items():
         scan = {k for k in keys if k.startswith("scan:")}
         copies = {k for k in scan if k.endswith(":lsf")}
         lsf = policy_for(arch).lsf_programs
-        assert copies == ({k + ":lsf" for k in scan - copies} if lsf else set()), arch
+        every = {k + ":lsf" for k in scan - copies}
+        shipped = _SM107_LSF_COPIES if arch == "sm_107a" else every
+        assert copies == (shipped if lsf else set()), arch
+        assert copies <= every, arch  # every copy has its program
         assert all(keys[k] != keys[k[: -len(":lsf")]] for k in copies), arch
         # the copy reorders the ticket draws, so only a ticket architecture can ship it
         assert not lsf or arch in cake_jit.TICKET_TAIL_ARCHES, arch
@@ -5530,12 +5737,99 @@ def test_lsf_copy_runs_on_packed_calls_of_unequal_key_segments():
     assert not _select(off, 8 * 32768, 8 * 32768, S=8, max_seqlen_k=65536).lsf
 
 
+def test_lsf_copy_runs_where_the_registry_has_it_and_never_changes_the_plan():
+    """Lever LSF where the registry carries the copies of some programs only (sm_107a: its two l6 ticket programs): a
+    packed call whose key segments the host cannot tell equal runs the longest-first copy of its decided program where
+    the registry has it and the program itself elsewhere; either way the plan is the plan of the record with
+    ``lsf_programs`` off, because the rules that ask the registry for a program look up its key without the suffix.
+    Shown on the sm_107a registry with and without the two copies, and on sm_100a / sm_103a, whose registries carry
+    every copy, so a call there never falls back.  The backend plan (the registry's own keys): four 16k-query documents
+    over 32k keys run ``scan:l6:u1:s0:f0:lsf`` where that copy is registered, two 4k-query documents over 8k keys run
+    ``scan:l6:u1:s1:f1``, which has no copy."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    # (T, Tkv, S, sample_tiles_max): the packed sm_107a calls whose programs the tests above pin -- eight causal 8k
+    # documents (the unpaired l6 program, sampled fit), four 16k-query documents over 32k keys and two 1024-query
+    # documents over 128k keys (the unpaired l6 program, plain fit), two 4k-query documents over 8k keys (the snake l6
+    # program) -- and a grid of packed calls
+    packed = [
+        (q * S, k * S, S, sample)
+        for q, k, S, sample in itertools.product(
+            (4, 64, 1024, 4096), (8192, 32768, 131072), (2, 4), (None, 0)
+        )
+        if q <= k
+    ]
+    geometries = [
+        (65536, 65536, 8, None),
+        (65536, 65536, 8, 0),
+        (65536, 131072, 4, 0),
+        (2048, 262144, 2, None),
+        (8192, 16384, 2, None),
+        *packed,
+    ]
+    for arch, grid in (("sm_100a", 148), ("sm_103a", 152), ("sm_107a", 212)):
+        p, registry = policy_for(arch), set(cake_jit.PROGRAM_KEYS[arch])
+        off = DispatchPolicy.from_record(dict(p.record(), lsf_programs=False))
+        assert p.lsf_programs, arch
+        plain = {k for k in registry if not k.endswith(":lsf")}
+        key_sets = (
+            [plain, plain | _SM107_LSF_COPIES] if arch == "sm_107a" else [registry]
+        )
+        for keys in key_sets:
+            reached, kept = set(), 0
+            for (T, Tkv, S, sample), top_k in itertools.product(
+                geometries, (512, 2048)
+            ):
+                call = dict(
+                    num_queries=T,
+                    num_keys=Tkv,
+                    num_segments=S,
+                    ratio=1,
+                    top_k=top_k,
+                    grid=grid,
+                    sample_tiles_max=sample,
+                    scan_keys=keys,
+                )
+                where = (arch, len(keys), T, Tkv, S, top_k, sample)
+                base, got = select_program(off, **call), select_program(p, **call)
+                assert base.scan_key in keys, where
+                copy = base.scan_key + ":lsf"
+                if copy in keys:
+                    assert got == replace(base, lsf=True, scan_key=copy), where
+                    reached.add(copy)
+                else:
+                    assert got == base, where
+                    kept += 1
+                # equal key segments (num_keys == S x max_seqlen_k): the program itself
+                bounded = dict(call, max_seqlen_k=Tkv // S)
+                assert select_program(p, **bounded) == select_program(off, **bounded), (
+                    where
+                )
+            if arch == "sm_107a":
+                assert reached == keys & _SM107_LSF_COPIES and kept, arch
+            else:
+                assert reached and not kept, arch
+    keys = cake_jit.PROGRAM_KEYS["sm_107a"]
+    common = dict(top_k=2048, arch="sm_107a", num_sms=212)
+    four = plan_dsa_indexer_det_topk(65536, 131072, 4, sample_tiles_max=0, **common)
+    assert four.scan_key == _lsf_key(keys, "scan:l6:u1:s0:f0")
+    assert four.lsf == four.scan_key.endswith(":lsf")
+    equal = plan_dsa_indexer_det_topk(
+        65536, 131072, 4, sample_tiles_max=0, max_seqlen_k=32768, **common
+    )
+    assert (equal.scan_key, equal.lsf) == ("scan:l6:u1:s0:f0", False)
+    snake = plan_dsa_indexer_det_topk(8192, 16384, 2, **common)
+    assert (snake.scan_key, snake.lsf) == ("scan:l6:u1:s1:f1", False)
+
+
 def test_ticket_arg_arches_name_exactly_the_drawing_programs_of_their_architectures():
     """``ticket_arg_arches`` (written by the exporter from each program's source build) lists, per scan program, the
     architectures on which it draws from its TicketWord: on sm_107a every drawing scan program, on sm_100a / sm_103a
-    none (they draw from the workspace's tail).  Both ways: no program of a ``static_scan_kinds`` kind or an ``:lsf``
-    copy reads it, and every other scan program of an architecture that has a reader reads it -- so the host, which
-    decides by the record alone (``reads_ticket_word``), never hands a drawing program the placeholder."""
+    none (they draw from the workspace's tail).  Both ways: no program of a ``static_scan_kinds`` kind reads it, an
+    ``:lsf`` copy reads it only as the copy of a program that does (sm_107a's l6 ticket programs, whose copies keep the
+    segment order in the workspace's tail), and every other scan program of an architecture that has a reader reads
+    it -- so the host, which decides by the record alone (``reads_ticket_word``), never hands a drawing program the
+    placeholder."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     for name, record in cake_jit.PROGRAMS.items():
@@ -5556,7 +5850,10 @@ def test_ticket_arg_arches_name_exactly_the_drawing_programs_of_their_architectu
                 arch in cake_jit.PROGRAMS[name].get("ticket_arg_arches", ())
             ), (arch, key)
             if reads:
-                assert parts[1] not in static and parts[-1] != "lsf", (arch, key)
+                assert parts[1] not in static, (arch, key)
+            if parts[-1] == "lsf":
+                plain = keys[key[: -len(":lsf")]]
+                assert reads == cake_backend.reads_ticket_word(plain, arch), (arch, key)
             readers.setdefault(arch, []).append((reads, parts[1] in static))
     assert {arch: any(r for r, _ in rows) for arch, rows in readers.items()} == {
         "sm_100a": False,
@@ -5579,13 +5876,13 @@ def test_ticket_arg_arches_name_exactly_the_drawing_programs_of_their_architectu
 
 def test_static_scan_kinds_are_registered_ticket_architecture_kinds():
     """Every architecture is a ticket architecture; a record's ``static_scan_kinds`` names the physical scan kinds whose
-    programs keep the static enumeration there (sm_107a: the l6 and CTA-pair l6 programs), each a kind the
+    programs keep the static enumeration there (no BF16 record names one; sm_107a's FP8 record does), each a kind the
     architecture registers, and a kind with an ``:lsf`` copy is never static (the copy reorders ticket draws)."""
     assert tuple(cake_jit.POLICY) == cake_jit.TICKET_TAIL_ARCHES
     assert {arch: policy_for(arch).static_scan_kinds for arch in cake_jit.POLICY} == {
         "sm_100a": [],
         "sm_103a": [],
-        "sm_107a": ["l6", "pair_l6"],
+        "sm_107a": [],
     }
     # prepare decides a call's tail from this per-architecture set (made once per process)
     for arch in cake_jit.POLICY:

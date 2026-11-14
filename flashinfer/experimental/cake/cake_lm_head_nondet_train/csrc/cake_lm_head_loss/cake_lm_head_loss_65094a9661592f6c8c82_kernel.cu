@@ -541,7 +541,7 @@ kernel_cake_lm_head_loss_65094a9661592f6c8c82(const __grid_constant__ CUtensorMa
                 int rin_r = ((global_row < M) ? global_row : M - 1);
                 int rin_t = row0 + rin_r;
                 long long rin_lbl = labels[rin_t];
-                long long lb_lo = ((rin_lbl >= 0) ? rin_lbl : 0);
+                long long lb_lo = ((rin_lbl >= 0ll) ? rin_lbl : 0ll);
                 int lb_idx = ((lb_lo < (long long)ldc) ? (int)lb_lo : ldc - 1);
                 int lb_col = lb_idx - ep_off_n;
                 #pragma unroll 1
@@ -589,9 +589,9 @@ kernel_cake_lm_head_loss_65094a9661592f6c8c82(const __grid_constant__ CUtensorMa
                         }
                     }
                     if (global_row < M) {
-                        unsigned long long st_off = ((unsigned long long)global_row * (unsigned long long)(ldc / 256) + (unsigned long long)bid_n_1) * 2;
+                        unsigned long long st_off = ((unsigned long long)global_row * (unsigned long long)(ldc / 256) + (unsigned long long)bid_n_1) * 2ull;
                         STATS_OUT[st_off] = pmax;
-                        STATS_OUT[st_off + 1] = psum;
+                        STATS_OUT[st_off + 1ull] = psum;
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     if (elect_sync()) {

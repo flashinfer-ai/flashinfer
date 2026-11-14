@@ -104,7 +104,7 @@ kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl(float* __restrict__ dfn_par
     int b = bid;
     int tid_0 = tid;
     if (b < 384) {
-        long long e0 = (long long)(b * 256 + tid_0) * 4;
+        long long e0 = (long long)(b * 256 + tid_0) * 4ll;
         float out[4];
         double a[4];
         #pragma unroll
@@ -132,7 +132,7 @@ kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl(float* __restrict__ dfn_par
                 unsigned _v4_1_2;
                 unsigned _v4_1_3;
                 asm volatile("ld.global.nc.L2::cache_hint.v4.b32 {%0, %1, %2, %3}, [%4], %5;"
-                    : "=r"(_v4_1_0), "=r"(_v4_1_1), "=r"(_v4_1_2), "=r"(_v4_1_3) : "l"((const void*)(dfn_part + ((long long)p * 393216 + e0) + (0))), "l"(0x12F0000000000000ULL));
+                    : "=r"(_v4_1_0), "=r"(_v4_1_1), "=r"(_v4_1_2), "=r"(_v4_1_3) : "l"((const void*)(dfn_part + ((long long)p * 393216ll + e0) + (0))), "l"(0x12F0000000000000ULL));
                 vec_load[0 + 0] = __uint_as_float(_v4_1_0);
                 vec_load[0 + 1] = __uint_as_float(_v4_1_1);
                 vec_load[0 + 2] = __uint_as_float(_v4_1_2);
@@ -168,7 +168,7 @@ kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl(float* __restrict__ dfn_par
     } else {
         int col = b - 384;
         long long col64 = (long long)col;
-        long long scol64 = col64 - 24;
+        long long scol64 = col64 - 24ll;
         double tot[1];
         float res[1];
         tot[0] = 0.0;
@@ -193,7 +193,7 @@ kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl(float* __restrict__ dfn_par
                 unsigned int cbr[1];
                 cbr[0] = 0;
                 if (inb != 0) {
-                    long long srcp = (c064 + (long long)row) * 32 + col64;
+                    long long srcp = (c064 + (long long)row) * 32ll + col64;
                     float xp = param_partial[srcp];
                     cbr[0] = __as_u32(xp);
                     sstage_u[row] = cbr[0];

@@ -242,6 +242,7 @@ def _get_compiled_gather_kernel(
     norm_const_ptr,
     a_per_token_scale_ptr,
     clamped_relu2_limit_ptr,
+    routing_weights_ptr,
     max_active_clusters: int,
     stream,
     # Dtype parameters (compile-time - IN cache key)
@@ -275,6 +276,7 @@ def _get_compiled_gather_kernel(
     use_a_per_token_scale: bool = False,
     # locality-domain half-GEMM (Rubin only, compile-time - IN cache key)
     localized_half_gemm: bool = False,
+    pre_fc2_routing: bool = False,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -327,6 +329,7 @@ def _get_compiled_gather_kernel(
         situ_linear_beta,
         gated,
         use_a_per_token_scale,
+        pre_fc2_routing,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -408,20 +411,22 @@ def _get_compiled_gather_kernel(
                 situ_linear_beta=situ_linear_beta,
                 gated=gated,
                 use_a_per_token_scale=use_a_per_token_scale,
+                pre_fc2_routing=pre_fc2_routing,
             )
         wrapper_fn = gemm.wrapper
 
         # Compile with runtime parameters - they can vary across calls.
         # Order must match the wrapper signature, and the two wrappers have
-        # DIFFERENT arities: the Blackwell wrapper takes a_per_token_scale_ptr
-        # and clamped_relu2_limit_ptr (14 pointers), the Rubin SM107 wrapper
-        # takes neither (12 pointers).
-        # Passing 13 pointers to the SM107 wrapper shifts every argument one
-        # slot and dies with "multiple values for argument 'tile_size'".
+        # DIFFERENT arities: the Blackwell wrapper takes a_per_token_scale_ptr,
+        # clamped_relu2_limit_ptr and routing_weights_ptr (15 pointers), the
+        # Rubin SM107 wrapper takes none of them (12 pointers).
+        # Passing extra pointers to the SM107 wrapper shifts every argument
+        # and dies with "multiple values for argument 'tile_size'".
         # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr, token_id_mapping_ptr,
         #  num_non_exiting_tiles_ptr, global_sf_ptr, [a_per_token_scale_ptr,
-        #  clamped_relu2_limit_ptr], orig_m, m, n, k, l, tile_size, scaling_vector_size,
+        #  clamped_relu2_limit_ptr, routing_weights_ptr], orig_m, m, n, k, l,
+        #  tile_size, scaling_vector_size,
         #  max_active_clusters, stream)
         compiled_gemm = cute.compile(
             wrapper_fn,
@@ -437,7 +442,15 @@ def _get_compiled_gather_kernel(
             token_id_ptr,
             num_tiles_ptr,
             norm_const_ptr,
-            *([] if is_rubin else [a_per_token_scale_ptr, clamped_relu2_limit_ptr]),
+            *(
+                []
+                if is_rubin
+                else [
+                    a_per_token_scale_ptr,
+                    clamped_relu2_limit_ptr,
+                    routing_weights_ptr,
+                ]
+            ),
             orig_m,
             permuted_m,
             n,
@@ -503,6 +516,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     situ_linear_beta: Optional[float] = None,
     gated: bool = True,
     clamped_relu2_limit: Optional[torch.Tensor] = None,
+    routing_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled contiguous gather grouped GEMM with fused FC1 activation.
 
@@ -541,7 +555,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             M = permuted_m, their full-width shapes are (M, I) and
             (32, 4, M//128, 4, ceil(2*I/64), 1), respectively.
         global_scale: Global scale factor for FP4 output quantization, shape
-            (1,), float32.
+            (1,), float32. With ``routing_weights``, one value per expert,
+            shape (num_experts,).
         a_per_token_scale: Optional per-token row scale for operand A,
             shape (seq_len,), float32. Indexed by the original token ID and
             applied before the fused activation.
@@ -582,6 +597,13 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             ``relu(L * tanh(x / L)) ** 2`` on the alpha-scaled FC1 output
             ``x``. Required with ClampedRelu2 and rejected for every other
             activation. Not supported on SM107.
+        routing_weights: Optional float32 weight per route, shape
+            (seq_len * topk,), indexed like ``token_id_mapping``. When given,
+            the epilogue rounds the FC1 output, the ClampedRelu2 result, its
+            square and the weighted value to BF16, then quantizes to NVFP4
+            with ``global_scale`` of the row's expert. Requires non-gated
+            ClampedRelu2 with NVFP4 output, ``mma_tiler_mn=(128, 128)`` and
+            ``cluster_shape_mn=(1, 1)``; SM100/SM103 only.
 
     Returns:
         Tuple of:
@@ -674,6 +696,49 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
 
     if n % 128 != 0:
         raise ValueError(f"GEMM1 output dim n={n} must be a multiple of 128.")
+
+    # Pre-FC2 routing: BF16-rounded ClampedRelu2 output weighted per route
+    # before NVFP4 quantization with one FC2 input scale per local expert.
+    pre_fc2_routing = routing_weights is not None
+    if pre_fc2_routing:
+        if (
+            gated
+            or normalized_activation_type != ActivationType.ClampedRelu2
+            or not quantize_output
+            or c_dtype != "float4_e2m1fn"
+            or sf_vec_size != 16
+            or use_a_per_token_scale
+            or mma_tiler is not None
+            or domain_id >= 0
+            or tuple(mma_tiler_mn) != (128, 128)
+            or tuple(cluster_shape_mn) != (1, 1)
+        ):
+            # Bit-exactness against the separate BF16-FC1 quantizer is
+            # validated for this single-CTA 128x128 tactic only.
+            raise ValueError(
+                "routing_weights requires Blackwell non-gated ClampedRelu2 with "
+                "NVFP4 output, no per-token A scale, mma_tiler_mn=(128, 128) "
+                "and cluster_shape_mn=(1, 1)"
+            )
+        if (
+            routing_weights.dtype != torch.float32
+            or not routing_weights.is_contiguous()
+            or routing_weights.device != a.device
+            or routing_weights.numel() != seq_len * topk
+        ):
+            raise ValueError(
+                f"routing_weights must be {seq_len * topk} contiguous float32 values "
+                "on the input device"
+            )
+        if (
+            global_scale is None
+            or global_scale.dtype != torch.float32
+            or global_scale.numel() != num_experts
+            or not global_scale.is_contiguous()
+        ):
+            raise ValueError(
+                "routing_weights requires one float32 global_scale per expert"
+            )
 
     # Output quantization is explicit because Float8E4M3FN can also be used as
     # an ordinary (non-block-scaled) output by other internal configurations.
@@ -934,6 +999,11 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         if clamped_relu2_limit is not None
         else None
     )
+    routing_weights_ptr = (
+        make_ptr(cutlass.Float32, routing_weights.data_ptr(), cute.AddressSpace.gmem)
+        if pre_fc2_routing
+        else None
+    )
     tile_idx_ptr = make_ptr(
         cutlass.Int32, tile_idx_to_expert_idx.data_ptr(), cute.AddressSpace.gmem
     )
@@ -971,6 +1041,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         norm_const_ptr=norm_const_ptr,
         a_per_token_scale_ptr=a_per_token_scale_ptr,
         clamped_relu2_limit_ptr=clamped_relu2_limit_ptr,
+        routing_weights_ptr=routing_weights_ptr,
         max_active_clusters=max_active_clusters,
         stream=stream,
         # Dtype parameters (compile-time, in cache key)
@@ -999,17 +1070,18 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         gated=gated,
         use_a_per_token_scale=use_a_per_token_scale,
         localized_half_gemm=localized_half_gemm,
+        pre_fc2_routing=pre_fc2_routing,
     )
 
     # Execute kernel with runtime parameters.
-    # Order must match the wrapper signature; the Rubin SM107 wrapper has no
-    # a_per_token_scale_ptr parameter (see the arity note at the compile site),
-    # so on Rubin the extra pointer must be omitted here too or every argument
-    # shifts one slot ("multiple values for argument 'stream'").
+    # Order must match the wrapper signature; the Rubin SM107 wrapper has none
+    # of the three optional Blackwell pointers (see the arity note at the
+    # compile site), so on Rubin they must be omitted here too or every
+    # argument shifts ("multiple values for argument 'stream'").
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
     #  tile_idx_ptr, mn_limit_ptr, token_id_ptr, num_tiles_ptr, global_sf_ptr,
-    #  [a_per_token_scale_ptr, clamped_relu2_limit_ptr], orig_m, m, n, k, l,
-    #  stream)
+    #  [a_per_token_scale_ptr, clamped_relu2_limit_ptr, routing_weights_ptr],
+    #  orig_m, m, n, k, l, stream)
     compiled_gemm(
         a_ptr,
         b_ptr,
@@ -1023,7 +1095,11 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         token_id_ptr,
         num_tiles_ptr,
         norm_const_ptr,
-        *([] if is_rubin else [a_per_token_scale_ptr, clamped_relu2_limit_ptr]),
+        *(
+            []
+            if is_rubin
+            else [a_per_token_scale_ptr, clamped_relu2_limit_ptr, routing_weights_ptr]
+        ),
         seq_len,  # orig_m
         permuted_m,
         n,

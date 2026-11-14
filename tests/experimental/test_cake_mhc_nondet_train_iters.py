@@ -14,23 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests of the run-time Sinkhorn iteration count and the epsilons of the Cake
-four-stream mHC training package with the non-deterministic backward
-(``flashinfer.experimental.cake.cake_mhc_nondet_train``; SM100 / SM103 /
+four-stream mHC training package
+``flashinfer.experimental.cake.cake_mhc_nondet_train`` (SM100 / SM103 /
 SM107; FlashInfer issue #8068), in
 the form of ``test_cake_mhc_det_train_iters.py``.
 
 ``sinkhorn_iters`` is an integer from 1 to ``SINKHORN_ITERS_MAX`` (64).  The
-non-deterministic backward launches the package's copy of the deterministic
-token-owner pass, whose run-time-count record takes every count but the
-compiled 20; the atomic fn split and column-slab pass do not depend on the
-count.  The forward and the backward prepare are the package's copies of the
+package's backward launches its copy of the deterministic token-owner pass,
+whose run-time-count record takes every count but the compiled 20 (the per-CTA
+form: at another count the column slab folds the per-CTA parameter rows, also
+inside ``BWD_ROW_BANDS``, as the deterministic reduction does); the atomic fn
+split and column-slab pass do not depend on the count.  The forward and the backward prepare are the package's copies of the
 deterministic programs (the same bits at every count, checked here against the
 deterministic package).  This module checks:
 
 * the numerics at counts 1, 2, 5, 10, 19, 21, 30, 50 and 64 on T = 1, 7, 1024
-  and 16263, on every one of 5 launches: ``dX``, ``dscale``, ``dbase`` bitwise
-  the deterministic backward's at the same count and ``dfn`` within ``2 P u
-  sum_t |dz'_t| |x_t|``; against an FP64 reference at the same count the BF16
+  and 16263, on every one of 5 launches (each every output of the first launch
+  bitwise): ``dX``, ``dscale``, ``dbase`` bitwise the deterministic backward's
+  at the same count and ``dfn`` within ``F u sum_t |dz'_t| |x_t|`` (``F =
+  2 P`` under ``dynr``); against an FP64 reference at the same count the BF16
   ``dX`` gate (atol = rtol = 1e-2, no mismatch) and rel-L2 <= 1e-5
   (``dscale`` / ``dbase`` per element <= 1e-4); where the FP64 ``dfn`` of the
   count and of 20 lie apart, the kernel's ``dfn`` is nearer the count's; the
@@ -40,9 +42,9 @@ deterministic package).  This module checks:
   residual mixing and backward prepare are bitwise the deterministic
   package's, the checkpoint replay is bitwise the forward record, and the
   autograd functions (statistics saved: the backward path;
-  replayed: the checkpoint path) agree with the direct entry point and with
-  each other (``dX`` / ``dscale`` / ``dbase`` bitwise, ``dfn`` within the
-  bound);
+  replayed: the checkpoint path) give the direct entry point's bits (every
+  gradient, ``fn`` included) and agree with the deterministic backward
+  (``dX`` / ``dscale`` / ``dbase`` bitwise, ``dfn`` within the bound);
 * that changing the count in one process loads no module after the first
   run-time-count call, the count checks, and non-default epsilons with a
   run-time count.
@@ -62,7 +64,7 @@ import statistics
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 KEY = "cake.cake_mhc_nondet_train"
 pkg = cake_package(KEY)
@@ -92,7 +94,7 @@ FP32_COMPARATOR_FACTOR = 2.0
 PARAM_CLAUSE_DRAWS = 25
 BLOCK_TOKENS = 8192
 SEED = 2032
-# Launches of the non-deterministic backward per draw: every gate holds on each (the worst is reported).
+# Launches of this package's backward per draw: every gate holds on each (the worst is reported).
 REPEATS = 5
 FP32_UNIT_ROUNDOFF = 2.0**-24
 ABS_SLACK = 1.02
@@ -158,7 +160,7 @@ def _require_hidden(hidden: int) -> int:
 
 
 def _parts(T: int, hidden: int = HIDDEN) -> int:
-    """``P``: the chunk count of the column-slab pass, the number of partials each ``dfn`` element sums."""
+    """``P``: the chunk count of the column-slab pass, the number of partials each ``dfn`` element folds."""
     parts = loader.host_plan(T, _sm_count(), _arch(), hidden)["parts"]
     assert 1 <= parts <= 32, (T, hidden, parts)
     return parts
@@ -183,7 +185,7 @@ def _slab_parts(T: int, hidden: int = HIDDEN) -> int:
 
 def _dfn_factor(T: int, hidden: int = HIDDEN) -> float:
     """F of the dfn bound F u (|carried| + ABS_SLACK sum_t |dz'_t| |x_t|) at T (``test_cake_mhc_nondet_train.py``'s
-    ``_dfn_factor``, which derives it): 2 P where the column slab runs dynr or dynr_os (both sides sum the same
+    ``_dfn_factor``, which derives it): 2 P where the column slab runs dynr or dynr_os (both sides fold the same
     per-chunk partials), 2 max(P, P_k7) + 10 where it runs lpt or lpt_os (the partials are another partition's)."""
     if not _lpt_runs(T, hidden):
         return 2.0 * _parts(T, hidden)
@@ -311,7 +313,7 @@ def _dzp(i: dict) -> torch.Tensor:
 
 
 def _dfn_bound(i: dict) -> torch.Tensor:
-    """Per-element bound of ``|dfn_a - dfn_b|`` for two sums of per-chunk partials in two orders:
+    """Per-element bound of ``|dfn_a - dfn_b|`` for two folds of per-chunk partials:
     ``F u * 1.02 sum_t |dz'_t| |x_t|`` with ``F`` = :func:`_dfn_factor` (``test_cake_mhc_nondet_train.py``'s
     ``_dfn_bound``)."""
     T, hidden = i["X"].shape[0], i["X"].shape[2]
@@ -368,7 +370,7 @@ def _snapshot(out: dict) -> dict:
 
 
 def _nd_repeats(i: dict, prep: dict, n: int = REPEATS) -> list[dict]:
-    """``n`` launches of the non-deterministic backward, each output finite."""
+    """``n`` launches of this package's backward, each output finite."""
     outs = []
     for repeat in range(n):
         out = _snapshot(_nd_backward(i, prep))
@@ -435,6 +437,14 @@ def _assert_exact(got, want, label: str) -> None:
             assert _same_bits(a, b), f"{k} {label}: bits differ"
 
 
+def _assert_same_call(got, want, label: str) -> None:
+    """``(dX, dfn, dscale, dbase)`` sequences or dicts of two calls of this package: every output bitwise."""
+    for n, k in enumerate(_OUTPUTS):
+        a = got[k] if isinstance(got, dict) else got[n]
+        b = want[k] if isinstance(want, dict) else want[n]
+        assert _same_bits(a, b), f"{k} {label}: bits differ"
+
+
 def _assert_dfn_within(
     got: torch.Tensor, want: torch.Tensor, bound: torch.Tensor, label: str
 ) -> None:
@@ -452,7 +462,8 @@ def _assert_dfn_within(
 
 
 def _check(T: int, iters: int, *, seed: int = SEED, hidden: int = HIDDEN) -> dict:
-    """One draw at the count: every launch against the deterministic backward and the FP64 reference."""
+    """One draw at the count: every launch against the first launch (every output bitwise), the deterministic
+    backward and the FP64 reference."""
     i = _make_inputs(T, seed=seed, hidden=hidden)
     i["sinkhorn_iters"] = iters
     prep = _forward(i)
@@ -463,6 +474,7 @@ def _check(T: int, iters: int, *, seed: int = SEED, hidden: int = HIDDEN) -> dic
     label = f"T={T} sinkhorn_iters={iters} H={hidden}"
     for repeat, out in enumerate(outs):
         what = f"{label} launch {repeat}"
+        _assert_same_call(out, outs[0], f"{what} vs launch 0")
         _assert_exact(out, want, f"{what} vs deterministic")
         _assert_dfn_within(
             out["dfn"], want["dfn"], bound, f"dfn {what} vs deterministic"
@@ -499,7 +511,7 @@ def _check_counts(T: int, iters: int, hidden: int) -> None:
     out = _check(T, iters, hidden=hidden)
     # The count reaches the kernels: where the FP64 dfn of this count and of 20 lie apart at the test's tolerance,
     # every launch's dfn is nearer this count's (test_cake_mhc_det_train_iters.py's check of the record's C, on the
-    # output of the non-deterministic route). A chain at its fixed point leaves the two FP64 gradients closer than
+    # output of this package's route). A chain at its fixed point leaves the two FP64 gradients closer than
     # that and nothing to tell apart; the values alone are checked there.
     ref_n = out["ref"]["dfn"]
     ref_20 = _oracle({**out["inputs"], "sinkhorn_iters": SINKHORN_ITERS})["dfn"]
@@ -552,9 +564,10 @@ def test_parameter_gradients_within_2x_comparator_over_draws(
 def test_paths_agree(T: int, iters: int) -> None:
     """At each count: the package's forward prepare, statistics replay, residual mixing and backward prepare are
     bitwise the deterministic package's; the checkpoint replay is bitwise the forward record; the direct entry
-    point, the autograd functions with the statistics saved (the backward path) and replayed (the checkpoint path)
-    and the deterministic backward on the same branch give ``dX`` / ``dscale`` / ``dbase`` bitwise and ``dfn`` within
-    the bound of one another; the autograd ``U`` / ``Y`` / ``dU`` are bitwise the direct entry points'."""
+    point and the autograd functions with the statistics saved (the backward path) and replayed (the checkpoint
+    path) give the same bits (every gradient, ``fn`` included), and the deterministic backward on the same branch
+    ``dX`` / ``dscale`` / ``dbase`` bitwise and ``dfn`` within the bound; the autograd ``U`` / ``Y`` / ``dU`` are
+    bitwise the direct entry points'."""
     _check_paths(T, iters, HIDDEN)
 
 
@@ -622,16 +635,14 @@ def _check_paths(T: int, iters: int, hidden: int) -> None:
         assert torch.equal(Ua.detach(), U) and torch.equal(Ya.detach(), Y), what
         assert torch.equal(Ua.grad, dB), what
         got = (X.grad, fn.grad, scale.grad, base.grad)
-        for want, name in ((direct, "direct"), (direct_det, "deterministic")):
-            _assert_exact(got, want, f"autograd {what} vs {name}")
-            _assert_dfn_within(got[1], want[1], bound, f"dfn autograd {what} vs {name}")
+        _assert_same_call(got, direct, f"autograd {what} vs direct")
+        _assert_exact(got, direct_det, f"autograd {what} vs deterministic")
+        _assert_dfn_within(
+            got[1], direct_det[1], bound, f"dfn autograd {what} vs deterministic"
+        )
         paths[save_stats] = got
-    _assert_exact(paths[False], paths[True], f"{label}: checkpoint vs backward path")
-    _assert_dfn_within(
-        paths[False][1],
-        paths[True][1],
-        bound,
-        f"dfn {label}: checkpoint vs backward path",
+    _assert_same_call(
+        paths[False], paths[True], f"{label}: checkpoint vs backward path"
     )
 
 
@@ -705,9 +716,10 @@ def test_run_time_count_and_epsilons(
     T: int, iters: int, rms_eps: float, hc_eps: float
 ) -> None:
     """A run-time Sinkhorn count (the deterministic token-owner pass's run-time-count record) and non-default
-    epsilons of the non-deterministic backward: ``dX``, ``dscale``, ``dbase`` bitwise the deterministic backward's at the
-    same constants on every launch, ``dfn`` within the bound; against the FP64 reference at the same constants the
-    BF16 ``dX`` gate and rel-L2 <= 1e-5 (``dscale`` / ``dbase`` per element <= 1e-4) on the worst launch."""
+    epsilons of this package's backward: every output of every launch the first launch's bits; ``dX``, ``dscale``,
+    ``dbase`` bitwise the deterministic backward's at the same constants on every launch, ``dfn`` within the bound;
+    against the FP64 reference at the same constants the BF16 ``dX`` gate and rel-L2 <= 1e-5 (``dscale`` / ``dbase``
+    per element <= 1e-4) on the worst launch."""
     i = _make_inputs(T, seed=SEED + 41)
     i.update(sinkhorn_iters=iters, rms_eps=rms_eps, hc_eps=hc_eps)
     prep = _forward(i)
@@ -716,6 +728,7 @@ def test_run_time_count_and_epsilons(
     outs = _nd_repeats(i, prep)
     label = f"T={T} sinkhorn_iters={iters} rms_eps={rms_eps:g} hc_eps={hc_eps:g}"
     for repeat, out in enumerate(outs):
+        _assert_same_call(out, outs[0], f"{label} launch {repeat} vs launch 0")
         _assert_exact(out, want, f"{label} launch {repeat}")
         _assert_dfn_within(
             out["dfn"], want["dfn"], bound, f"dfn {label} launch {repeat}"

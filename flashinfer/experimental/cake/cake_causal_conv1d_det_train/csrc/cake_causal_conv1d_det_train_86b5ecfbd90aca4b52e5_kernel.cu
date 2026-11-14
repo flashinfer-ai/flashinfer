@@ -103,7 +103,7 @@ kernel_cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5(float* __restrict__ par
                 int r = lane_1 + (k0 + u << 5);
                 if (r < G) {
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(partial + ((long long)r * C64 + ch64) * 4);
+                        float4 _v4 = *reinterpret_cast<const float4*>(partial + ((long long)r * C64 + ch64) * 4ll);
                         pv[u * 4 + 0] = _v4.x;
                         pv[u * 4 + 1] = _v4.y;
                         pv[u * 4 + 2] = _v4.z;
@@ -172,7 +172,7 @@ kernel_cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5(float* __restrict__ par
             v[0] = v[0] + v[1];
             float total = v[0];
             long long ch64b = (long long)ch2;
-            *(reinterpret_cast<float*>(dw) + (ch64b * 4 + (long long)chain)) = total;
+            *(reinterpret_cast<float*>(dw) + (ch64b * 4ll + (long long)chain)) = total;
         }
     }
 }

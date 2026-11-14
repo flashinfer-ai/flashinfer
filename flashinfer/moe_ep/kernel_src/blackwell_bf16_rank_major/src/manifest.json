@@ -1,5 +1,45 @@
 {
   "arch_stage_overrides": {
+    "sm_100a": {
+      "input_arrive": {
+        "bindings": [
+          "active_tokens_per_rank",
+          "pg_world",
+          "pg_rank",
+          "pg_flags",
+          "route_codes_out",
+          "route_codes_peers"
+        ],
+        "symbol": "kernel_rank_major_input_arrive_v3"
+      },
+      "local_unpermute": {
+        "bindings": [
+          "expert_output",
+          "topk_weights",
+          "token_to_permuted",
+          "local_partials_peers",
+          "hidden_size",
+          "active_tokens_per_rank",
+          "pg_rank"
+        ],
+        "symbol": "kernel_rank_major_exact_unpermute_v11"
+      },
+      "stage_inputs": {
+        "bindings": [
+          "hidden_in",
+          "ids_in",
+          "weights_in",
+          "hidden_states",
+          "topk_ids",
+          "topk_weights",
+          "ids_is_int64",
+          "hidden_copy",
+          "active_tokens_per_rank",
+          "route_codes_out"
+        ],
+        "symbol": "kernel_rank_major_stage_inputs_v2"
+      }
+    },
     "sm_107a": {
       "input_arrive": {
         "bindings": [
@@ -77,7 +117,7 @@
     "kernel_rank_major_combine_v6"
   ],
   "schema_version": 1,
-  "source_sha256": "976a3379646ddcd3197a3306f35fb374ea8438e8d59824cd05f585ee5e219e34",
+  "source_sha256": "5b0193f16557a479d63c8350d490202bb82e2c21e594ee6d07daef82ac6eb887",
   "stages": [
     {
       "bindings": [

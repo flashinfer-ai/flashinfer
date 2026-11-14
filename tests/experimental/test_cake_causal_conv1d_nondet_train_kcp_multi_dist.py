@@ -27,8 +27,19 @@ per-document one).  Per row and rank, for every tensor:
   partial sum within the package budget of the global FP64 ``dweight``;
 - the collective counts per phase of the deterministic suite: multi 1/0/1 direct, 1/1/1 plain checkpoint, 1/0/1
   with a handle; single calls n/0/n;
+- the two-launch forward (knobs ``fwd_main`` x ``fwd_overlap``, the same on every rank): ``LAST_CALL["fwd_multi"]``
+  names the form the rank ran and every tensor's ``y`` / ``hist`` are bitwise the one-launch single call's
+  (``fwd_main`` 0, ``fwd_overlap`` 0: the previous forward) and the deterministic multi forward's;
 - ``graph="replay"`` of the multi forward / backward: ``y`` / ``hist`` / ``dx`` bitwise the eager single calls on
-  every call, ``dweight`` within budget, the deterministic suite's event sequence.
+  every call, ``dweight`` within budget, the deterministic suite's event sequence; and of the single backward of the
+  first tensor (its head program and exchange issue on the side stream inside the capture): ``dx`` bitwise the eager
+  call, ``dweight`` within budget, events eager, capture, replay, replay;
+- a main-program launch that raises after the fork (single and multi backward) still joins the side stream: the
+  error is the injected one and the current stream waits for work queued on the side stream before the call;
+- the overlapped backward's tail rows (single and multi backward, eager): every main-program launch passes the
+  context's ``tail_row_off`` as its ``skip_row_off`` when the rank receives tail rows (else the all ``-1`` table),
+  every tail-row launch runs off the caller's stream (the side stream, or a stream forked from it), and ``dx`` is
+  bitwise the autograd calls'.
 
 Launch forms as the deterministic suite.  Skipped until the exporter renders the non-deterministic package.
 """
@@ -59,7 +70,10 @@ from tests.test_cake_causal_conv1d_det_train_kcp_multi_dist import (
     _same,
     _setup,
 )
-from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
+from tests.experimental.test_helpers.kcp_collective_shims import (
+    CollectiveCounter,
+    RecomputePhase,
+)
 
 DW_ATOL, DW_RTOL = 5e-2, 1e-4
 # W = 16 (16-way context parallelism) on the deterministic rows' packs, for the layouts any world size partitions;
@@ -293,8 +307,35 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
     }
     flags["y_dx_within_one_bf16_ulp_of_fp64"] = worst_y <= 1.0 and worst_dx <= 1.0
     flags["dw_sum_within_budget_of_fp64"] = worst_dw <= 1.0
+    # The first nondet call of the context (the single calls) also runs the rank-agreement check of #8946: one
+    # all_gather_into_tensor per phase; every later call issues only the halo exchanges.
+    # The overlapped backward's tail rows: the main programs leave them to the tail-row programs on the side stream.
+    y0, hist0 = conv_kcp.cake_causal_conv1d_nondet_train_kcp_forward(xs[0], ws[0], ctx)
+    dx0 = []
+    flags["skip_path_single"] = _skip_path(
+        conv_kcp,
+        ctx,
+        device,
+        lambda: dx0.append(
+            conv_kcp.cake_causal_conv1d_nondet_train_kcp_backward(
+                xs[0], ws[0], ctx, dys[0], hist0
+            )[0]
+        ),
+    ) and _same(dx0[0], s_direct[0]["dx"])
+    _, hists = conv_kcp.cake_causal_conv1d_nondet_train_kcp_multi_forward(xs, ws, ctx)
+    dxs = []
+    flags["skip_path_multi"] = _skip_path(
+        conv_kcp,
+        ctx,
+        device,
+        lambda: dxs.append(
+            conv_kcp.cake_causal_conv1d_nondet_train_kcp_multi_backward(
+                xs, ws, ctx, dys, hists
+            )[0]
+        ),
+    ) and all(_same(dxs[0][i], m_direct[i]["dx"]) for i in range(n))
     flags["counts"] = (
-        cs_direct["calls"] == table(n, 0, n)
+        cs_direct["calls"] == table(n + 1, 0, n + 1)
         and cm_direct["calls"] == table(1, 0, 1)
         and cm_plain["calls"] == table(1, 1, 1)
         and cm_handle["calls"] == table(1, 0, 1)
@@ -303,7 +344,150 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
         and cm_nest_out["calls"] == table(1, 0, 1)
         and cm_nest_in["calls"] == table(1, 1, 1)
     )
+    # The two-launch forward: every (fwd_main, fwd_overlap) form, the same on every rank, records its form in
+    # LAST_CALL["fwd_multi"] (the first tensor's main program before the exchange's wait on a rank with tokens; the
+    # history-row program when the rank receives history rows and the form has two launches) and gives every
+    # tensor's y / hist bitwise the one-launch single call's and the deterministic multi forward's.
+    from tests.cake.test_helpers.cake_package import cake_package
+
+    det_kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
+    n_hist = int(ctx.halo.n_hist_rows)
+    det_ys, det_hists = det_kcp.cake_causal_conv1d_det_train_kcp_multi_forward(
+        xs, ws, ctx
+    )
+    conv_kcp._set_test_knobs({"fwd_main": 0, "fwd_overlap": 0})
+    try:
+        refs = [
+            conv_kcp.cake_causal_conv1d_nondet_train_kcp_forward(x, w, ctx)
+            for x, w in zip(xs, ws, strict=True)
+        ]
+        torch.cuda.synchronize(device)
+    finally:
+        conv_kcp._set_test_knobs(None)
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
+    fwd_bitwise = all(
+        _same(y, det_ys[i]) and _same(hist, det_hists[i])
+        for i, (y, hist) in enumerate(refs)
+    )
+    fwd_recorded = True
+    for fwd_main in (0, 1):
+        for fwd_overlap in (0, 1):
+            conv_kcp._set_test_knobs({"fwd_main": fwd_main, "fwd_overlap": fwd_overlap})
+            try:
+                for _ in range(2):
+                    ys, hists = (
+                        conv_kcp.cake_causal_conv1d_nondet_train_kcp_multi_forward(
+                            xs, ws, ctx
+                        )
+                    )
+                    torch.cuda.synchronize(device)
+                    want = (
+                        {
+                            "main": "sr" if fwd_main else "f",
+                            "form": "pair" if fwd_overlap else "wait",
+                            "repair": bool(fwd_main or fwd_overlap) and n_hist > 0,
+                        }
+                        if xs[0].shape[0]
+                        else {"main": None, "form": "wait", "repair": False}
+                    )
+                    fwd_recorded = (
+                        fwd_recorded and conv_kcp.LAST_CALL["fwd_multi"] == want
+                    )
+                    fwd_bitwise = fwd_bitwise and all(
+                        _same(ys[i], y) and _same(hists[i], hist)
+                        for i, (y, hist) in enumerate(refs)
+                    )
+            finally:
+                conv_kcp._set_test_knobs(None)
+                conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
+    flags["fwd_forms_bitwise"] = fwd_bitwise
+    flags["fwd_forms_recorded"] = fwd_recorded
     return _report(W, row, flags, info, result_dir, rank, "nondet-multi")
+
+
+def _skip_path(conv_kcp, ctx, device, call) -> bool:
+    """``call`` (a backward) with its main-program and tail-row launches recorded: True when every main-program launch
+    passed the context's ``tail_row_off`` as ``skip_row_off`` if the rank receives tail rows (else the all ``-1``
+    table) and the tail-row launches, one per tensor when it receives them and none otherwise, ran off the caller's
+    stream; or, for a call that takes no side stream (one rank) or a rank without tokens, when it launched neither."""
+    tokens = int(ctx.T_r) > 0
+    if conv_kcp._side_stream(ctx, device, True) is None or not tokens:
+        real = conv_kcp._launch_dyn
+        hits: list[int] = []
+
+        def counted(d, **kwargs):
+            hits.append(1)
+            return real(d, **kwargs)
+
+        conv_kcp._launch_dyn = counted
+        try:
+            call()
+            torch.cuda.synchronize(device)
+        finally:
+            conv_kcp._launch_dyn = real
+        return tokens or not hits
+    caller = torch.cuda.current_stream(device).cuda_stream
+    tail = ctx.halo_tables["tail_row_off"]
+    receives = int(ctx.halo.n_tail_rows) > 0
+    skips: list[bool] = []
+    streams: list[int] = []
+    real_dyn, real_halo = conv_kcp._launch_dyn, conv_kcp._launch_halo
+
+    def dyn(d, **kwargs):
+        skip = kwargs["skip"]
+        skips.append(skip is tail if receives else bool((skip < 0).all()))
+        return real_dyn(d, **kwargs)
+
+    def halo(d, **kwargs):
+        if d["halo"] is not None:
+            streams.append(torch.cuda.current_stream(device).cuda_stream)
+        return real_halo(d, **kwargs)
+
+    conv_kcp._launch_dyn, conv_kcp._launch_halo = dyn, halo
+    try:
+        call()
+        torch.cuda.synchronize(device)
+    finally:
+        conv_kcp._launch_dyn, conv_kcp._launch_halo = real_dyn, real_halo
+    if not skips or not all(skips):
+        return False
+    if not receives:
+        return not streams
+    return len(streams) == len(skips) and caller not in streams
+
+
+def _join_after_failed_launch(conv_kcp, ctx, device, call) -> bool:
+    """``call`` with the main-program launch raising, while the side stream sleeps from before the call: True when
+    the call raised the injected error and an event recorded on the current stream right after it is still pending
+    (the current stream waits for the side stream), or when the call launched no main program (no error)."""
+    if conv_kcp._side_stream(ctx, device, True) is None:
+        return True
+    side = conv_kcp._device_stream(device, 0)
+    torch.cuda.synchronize(device)
+    hits = []
+
+    def boom(*args, **kwargs):
+        hits.append(1)
+        raise RuntimeError("injected main-launch failure")
+
+    real = conv_kcp._launch_dyn
+    conv_kcp._launch_dyn = boom
+    err = None
+    try:
+        with torch.cuda.stream(side):
+            torch.cuda._sleep(1 << 30)
+        call()
+    except RuntimeError as exc:
+        err = exc
+    finally:
+        conv_kcp._launch_dyn = real
+    done = torch.cuda.Event()
+    done.record(torch.cuda.current_stream(device))
+    pending = not done.query()
+    torch.cuda.synchronize(device)
+    if not hits:
+        return err is None
+    return err is not None and "injected main-launch failure" in str(err) and pending
 
 
 def _run_rank_graph(
@@ -322,6 +506,7 @@ def _run_rank_graph(
         )
         ref.append((y, hist, dx, dw))
     events, ok, worst = [], True, 0.0
+    single_events, single_ok = [], True
     try:
         for _ in range(4):
             ys, hists = conv_kcp.cake_causal_conv1d_nondet_train_kcp_multi_forward(
@@ -341,9 +526,38 @@ def _run_rank_graph(
                     and _same(dxs[i], dx)
                 )
                 worst = max(worst, _ratio(dws[i], dw))
+        _, hist0, dx0, dw0 = ref[0]
+        for _ in range(4):
+            dx, dw = conv_kcp.cake_causal_conv1d_nondet_train_kcp_backward(
+                xs[0], ws[0], ctx, dys[0], hist0, graph="replay"
+            )
+            single_events.append(conv_kcp.LAST_CALL["bwd"]["graph_event"])
+            torch.cuda.synchronize(device)
+            single_ok = single_ok and _same(dx, dx0)
+            worst = max(worst, _ratio(dw, dw0))
+        join_single = _join_after_failed_launch(
+            conv_kcp,
+            ctx,
+            device,
+            lambda: conv_kcp.cake_causal_conv1d_nondet_train_kcp_backward(
+                xs[0], ws[0], ctx, dys[0], hist0
+            ),
+        )
+        join_multi = _join_after_failed_launch(
+            conv_kcp,
+            ctx,
+            device,
+            lambda: conv_kcp.cake_causal_conv1d_nondet_train_kcp_multi_backward(
+                xs, ws, ctx, dys, hists
+            ),
+        )
     finally:
         torch.cuda.synchronize(device)
         conv_kcp.cake_causal_conv1d_nondet_train_kcp_graph_cache_clear()
+    if int(xs[0].shape[0]) == 0:
+        single_expected = ["eager"] * 4
+    else:
+        single_expected = ["eager", "capture", "replay", "replay"]
     if int(xs[0].shape[0]) == 0:
         expected = ["eager"] * 8
     elif int(ctx.halo.n_hist_rows) == 0:
@@ -363,8 +577,17 @@ def _run_rank_graph(
         "graph_y_hist_dx_bitwise": ok,
         "graph_dw_within_budget": worst <= 1.0,
         "graph_events": events == expected,
+        "graph_single_dx_bitwise": single_ok,
+        "graph_single_events": single_events == single_expected,
+        "launch_error_joins_side_single": join_single,
+        "launch_error_joins_side_multi": join_multi,
     }
-    info = {"events": events, "worst_dw_ratio": worst, "T_r": int(xs[0].shape[0])}
+    info = {
+        "events": events,
+        "single_events": single_events,
+        "worst_dw_ratio": worst,
+        "T_r": int(xs[0].shape[0]),
+    }
     return _report(W, row, flags, info, result_dir, rank, "nondet-graph")
 
 

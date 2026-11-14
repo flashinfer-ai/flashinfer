@@ -69,7 +69,7 @@ own orchestration (:mod:`.cake_kcp`) runs the same programs on NCCL.
 Segment plans with ``P > 1`` are not emulated here (build the contexts with
 ``sm_count=1`` for ``P = 1``); the programs themselves take any segment list.
 
-The dictionary collective is adapted from ``tests/test_helpers/cake_kcp_fake_backend.py`` at FlashInfer
+The dictionary collective is adapted from ``tests/experimental/test_helpers/cake_kcp_fake_backend.py`` at FlashInfer
 13d7fcf4041635f5b7f573bb0dbab23570ae1034 (sha256 eb733b4e8e15556f023379332939454c4fa5b15a2d258168e3c9daa510a4b006).
 """
 
@@ -174,10 +174,10 @@ def fwd_prep(values: Mapping[str, Any]) -> None:
     q, k, v, g, beta = (values[n] for n in ("q", "k", "v", "g", "beta"))
     HV, _H_qk, r = _group(values)
     scale = float(values["scale"])
-    w, u, aqk, akk = (values[n] for n in ("w", "u", "aqk", "akk"))
-    g_cum, rowscale, qscale, gamma = (
-        values[n] for n in ("g_cum", "rowscale", "qscale", "gamma")
-    )
+    w, u, aqk = (values[n] for n in ("w", "u", "aqk"))
+    rowscale, qscale, gamma = (values[n] for n in ("rowscale", "qscale", "gamma"))
+    # the forward form of #1_l2n (record fwd_prep_l2n_fwd) names no akk / g_cum: those rows are not written
+    akk, g_cum = values.get("akk"), values.get("g_cum")
     eye = torch.eye(CHUNK, dtype=F32, device=g.device)
     n_real = 0
     for c, bos, L in _chunks(values):
@@ -185,7 +185,8 @@ def fwd_prep(values: Mapping[str, Any]) -> None:
         tok = slice(bos, bos + L)
         rows = slice(c * CHUNK, c * CHUNK + L)
         G = torch.cumsum(f32(g[tok]), 0)  # [L, HV] FP32 chunk-local cumsum
-        g_cum[rows] = G
+        if g_cum is not None:
+            g_cum[rows] = G
         gamma[c] = G[L - 1].exp()
         rowscale[rows] = (G[L - 1][None, :] - G).exp()
         qscale[rows] = scale * G.exp()
@@ -202,7 +203,8 @@ def fwd_prep(values: Mapping[str, Any]) -> None:
                 eye[:L, :L] + A_pre, eye[:L, :L], upper=False, unitriangular=True
             )  # FP32 block inverse
             A_b = bf16(Ainv)  # ROUND #1: Akk tape
-            akk[rows, hv, :L] = A_b
+            if akk is not None:
+                akk[rows, hv, :L] = A_b
             kb = bf16(
                 kk * (bet[:, hv] * G[:, hv].exp())[:, None]
             )  # ROUND: MMA operand beta e^G k (FLA b_kb)

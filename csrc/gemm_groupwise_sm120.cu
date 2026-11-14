@@ -129,7 +129,10 @@ void CutlassGemmGroupwiseScaledSM120(TensorView float_workspace_buffer, TensorVi
                 static_cast<float*>(SFA.data_ptr()), static_cast<float*>(SFB.data_ptr()),
                 static_cast<cutlass_t_out*>(C.data_ptr()), m, n, k, l,
                 stream);  // C is the output (D)
-            return status == cudaSuccess;
+            TVM_FFI_ICHECK_EQ(status, cudaSuccess)
+                << "Failed to run cutlass gemm groupwise scaled sm120: "
+                << cudaGetErrorString(status);
+            return true;
           });
     });
   });

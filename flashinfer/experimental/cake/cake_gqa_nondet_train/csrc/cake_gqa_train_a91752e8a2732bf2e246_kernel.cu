@@ -47,10 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 256
-
 #include <math_constants.h>
 
 
@@ -63,7 +59,7 @@ __device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_gqa_train_a91752e8a2732bf2e246(__nv_bfloat16* __restrict__ O, __nv_bfloat16* __restrict__ dO, float* __restrict__ LSE, int* __restrict__ cu_seqlens_q, float* __restrict__ LSE_log2, float* __restrict__ dPsum, float* __restrict__ dQ_accum, int T_q, int H_q, int num_segments, int rows_pad)
+kernel_cake_gqa_train_a91752e8a2732bf2e246(__nv_bfloat16* __restrict__ O, __nv_bfloat16* __restrict__ dO, float* __restrict__ LSE, int* __restrict__ cu_seqlens_q, float* __restrict__ LSE_log2, float* __restrict__ dPsum, int T_q, int H_q, int num_segments, int rows_pad)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -103,7 +99,7 @@ kernel_cake_gqa_train_a91752e8a2732bf2e246(__nv_bfloat16* __restrict__ O, __nv_b
     for (int i = 0; i < 2; i++) {
         int local = local0 + i * 16 + half;
         int load_token = ((seg_start + (local >> 1)) < (T_q - 1) ? (seg_start + (local >> 1)) : (T_q - 1));
-        unsigned long long row_offset = ((unsigned long long)load_token * (unsigned long long)H_q + (unsigned long long)(2 * pair + (local & 1))) * 256 + (unsigned long long)col;
+        unsigned long long row_offset = ((unsigned long long)load_token * (unsigned long long)H_q + (unsigned long long)(2 * pair + (local & 1))) * 256ull + (unsigned long long)col;
         {
             asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                 : "=r"(o_words[i * 8 + 0]), "=r"(o_words[i * 8 + 1]), "=r"(o_words[i * 8 + 2]), "=r"(o_words[i * 8 + 3]), "=r"(o_words[i * 8 + 4]), "=r"(o_words[i * 8 + 5]), "=r"(o_words[i * 8 + 6]), "=r"(o_words[i * 8 + 7]) : "l"((const void*)((const char*)(O + row_offset + 0) + 0)) : "memory");
@@ -117,52 +113,30 @@ kernel_cake_gqa_train_a91752e8a2732bf2e246(__nv_bfloat16* __restrict__ O, __nv_b
     int lse_token = ((seg_start + (lse_local >> 1)) < (T_q - 1) ? (seg_start + (lse_local >> 1)) : (T_q - 1));
     float lse = LSE[(unsigned long long)(2 * pair + (lse_local & 1)) * (unsigned long long)T_q + (unsigned long long)lse_token];
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    unsigned int zeros[8];
-    #pragma unroll
-    for (int j = 0; j < 8; j++) {
-        zeros[j] = 0;
-    }
-    unsigned long long chunk_base = stats_base * 256 + (unsigned long long)(tid * 8);
     #pragma unroll
     for (int i_1 = 0; i_1 < 2; i_1++) {
-        unsigned long long elem = chunk_base + (unsigned long long)(i_1 * 4096);
-        {
-            const unsigned* _raw_stv8_3 = reinterpret_cast<const unsigned*>(zeros);
-            asm volatile(
-                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                :: "l"((void*)(reinterpret_cast<unsigned int*>(dQ_accum + elem))), "r"(_raw_stv8_3[0]), "r"(_raw_stv8_3[1]), "r"(_raw_stv8_3[2]), "r"(_raw_stv8_3[3]), "r"(_raw_stv8_3[4]), "r"(_raw_stv8_3[5]), "r"(_raw_stv8_3[6]), "r"(_raw_stv8_3[7]) : "memory");
-        }
-        {
-            const unsigned* _raw_stv8_4 = reinterpret_cast<const unsigned*>(zeros);
-            asm volatile(
-                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                :: "l"((void*)(reinterpret_cast<unsigned int*>(dQ_accum + (elem + 2048)))), "r"(_raw_stv8_4[0]), "r"(_raw_stv8_4[1]), "r"(_raw_stv8_4[2]), "r"(_raw_stv8_4[3]), "r"(_raw_stv8_4[4]), "r"(_raw_stv8_4[5]), "r"(_raw_stv8_4[6]), "r"(_raw_stv8_4[7]) : "memory");
-        }
-    }
-    #pragma unroll
-    for (int i_2 = 0; i_2 < 2; i_2++) {
-        int local_1 = local0 + i_2 * 16 + half;
+        int local_1 = local0 + i_1 * 16 + half;
         float even = 0.0f;
         float odd = 0.0f;
         #pragma unroll
-        for (int j_1 = 0; j_1 < 8; j_1++) {
+        for (int j = 0; j < 8; j++) {
             float sums[2] = {even, odd};
-            asm("fma.rn.f32.bf16 %0, %1, %2, %0;" : "+f"(sums[0]) : "h"(static_cast<uint16_t>((o_words[i_2 * 8 + j_1]))), "h"(static_cast<uint16_t>((do_words[i_2 * 8 + j_1]))));
-            asm("fma.rn.f32.bf16 %0, %1, %2, %0;" : "+f"(sums[1]) : "h"(static_cast<uint16_t>((o_words[i_2 * 8 + j_1]) >> 16)), "h"(static_cast<uint16_t>((do_words[i_2 * 8 + j_1]) >> 16)));
+            asm("fma.rn.f32.bf16 %0, %1, %2, %0;" : "+f"(sums[0]) : "h"(static_cast<uint16_t>((o_words[i_1 * 8 + j]))), "h"(static_cast<uint16_t>((do_words[i_1 * 8 + j]))));
+            asm("fma.rn.f32.bf16 %0, %1, %2, %0;" : "+f"(sums[1]) : "h"(static_cast<uint16_t>((o_words[i_1 * 8 + j]) >> 16)), "h"(static_cast<uint16_t>((do_words[i_1 * 8 + j]) >> 16)));
             even = sums[0];
             odd = sums[1];
         }
         float row_sum = even + odd;
-        float _shfl_xor_sync_5 = __shfl_xor_sync(0xFFFFFFFF, row_sum, 8);
+        float _shfl_xor_sync_3 = __shfl_xor_sync(0xFFFFFFFF, row_sum, 8);
+        row_sum = row_sum + _shfl_xor_sync_3;
+        float _shfl_xor_sync_4 = __shfl_xor_sync(0xFFFFFFFF, row_sum, 4);
+        row_sum = row_sum + _shfl_xor_sync_4;
+        float _shfl_xor_sync_5 = __shfl_xor_sync(0xFFFFFFFF, row_sum, 2);
         row_sum = row_sum + _shfl_xor_sync_5;
-        float _shfl_xor_sync_6 = __shfl_xor_sync(0xFFFFFFFF, row_sum, 4);
+        float _shfl_xor_sync_6 = __shfl_xor_sync(0xFFFFFFFF, row_sum, 1);
         row_sum = row_sum + _shfl_xor_sync_6;
-        float _shfl_xor_sync_7 = __shfl_xor_sync(0xFFFFFFFF, row_sum, 2);
-        row_sum = row_sum + _shfl_xor_sync_7;
-        float _shfl_xor_sync_8 = __shfl_xor_sync(0xFFFFFFFF, row_sum, 1);
-        row_sum = row_sum + _shfl_xor_sync_8;
         if (lane % 16 == 0 && in_window != 0) {
-            *(reinterpret_cast<float*>(dPsum + (stats_base + (unsigned long long)(i_2 * 16 + half))) + (0)) = ((local_1 >> 1 < seg_len) ? row_sum : 0.0f);
+            *(reinterpret_cast<float*>(dPsum + (stats_base + (unsigned long long)(i_1 * 16 + half))) + (0)) = ((local_1 >> 1 < seg_len) ? row_sum : 0.0f);
         }
     }
     if (tid < 32 && in_window != 0) {

@@ -444,6 +444,7 @@ def test_recompute_handle_keywords_are_forwarded(
         "boundary_mode": "saved",
         "workspace": None,
         "checkpoint_handoff": "auto",
+        "saved_rows": "auto",  # forwarded explicitly
         "use_qk_l2norm_in_kernel": False,  # issue #7817: forwarded explicitly
     }
     assert (
@@ -477,6 +478,7 @@ def test_recompute_handle_keywords_are_forwarded(
                     "use_qk_l2norm_in_kernel": False,
                     "use_gate_in_kernel": False,
                     "checkpoint_handoff": False,
+                    "saved_rows": "auto",  # forwarded explicitly
                 },
             ),
             (
@@ -826,8 +828,9 @@ def test_package_entries_take_the_in_kernel_qk_norm(entry) -> None:
     """The in-kernel q / k L2 norm runs on this package: every compute entry takes ``use_qk_l2norm_in_kernel`` as a
     keyword-only parameter with the deterministic entry's default (``False``), so it never reaches the options (whose
     validator refuses it, as the deterministic package's does).  A flag-on call with stand-in operands (also with the
-    raw gate requested) fails on the operand checks or the capability check, never with a refusal of the mode or an
-    unknown keyword; a non-bool value is a ``ValueError`` raised before any work."""
+    raw gate requested) passes the capability check (the records serve the mode on every architecture they list) and
+    fails on the operand checks (``ValueError`` of the 1-D ``v``), never with a refusal of the mode or an unknown
+    keyword; a non-bool value is a ``ValueError`` raised before any work."""
     kcp, det_kcp = _mod("cake_kcp"), _det("cake_kcp")
     p = inspect.signature(getattr(kcp, entry)).parameters["use_qk_l2norm_in_kernel"]
     dp = inspect.signature(getattr(det_kcp, DET_COMPUTE_NAMES[entry])).parameters[
@@ -836,7 +839,7 @@ def test_package_entries_take_the_in_kernel_qk_norm(entry) -> None:
     assert p.kind is dp.kind is inspect.Parameter.KEYWORD_ONLY, entry
     assert p.default is dp.default is False, entry
     for kw in ({}, _raw_gate_keywords()):
-        with pytest.raises(Exception) as info:  # noqa: B017 - the stand-in operands' error, never the mode's
+        with pytest.raises(ValueError, match=r"^v: expected 3-D") as info:
             _package_call(entry, use_qk_l2norm_in_kernel=True, **kw)
         message = str(info.value)
         for refusal in ("unexpected keyword", RAW_GATE_REFUSAL, QK_NORM):

@@ -32,7 +32,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_build = cake_package("cake.cake_kda_nondet_train_kcp", "cake_build")
 det_kcp_jit = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_jit")
@@ -53,7 +53,7 @@ FWDH_PLAN = [
     ["buffer", "v_new"], *GRID,
 ]  # fmt: skip
 DHU_PLAN = [
-    ["buffer", "kg_tma"], ["buffer", "qg_tma"], ["buffer", "w_tma"], ["buffer", "do_tma"], ["buffer", "dv1"],
+    ["buffer", "kg_tma"], ["buffer", "qg_tma"], ["buffer", "w_tma"], ["buffer", "do_tma"], ["buffer", "aqk_tma"],
     ["buffer", "gk"], ["parameter", "num_heads"], ["buffer", "seq_chunk_start"], ["parameter", "num_seqs"],
     ["parameter", "scale"], ["buffer", "walk_seg"], ["buffer", "dht"], ["buffer", "dht_index"], ["parameter", "dht_hg"],
     ["parameter", "dht_n"], ["buffer", "out"], ["buffer", "out_index"], ["parameter", "out_hg"], ["parameter", "out_n"],
@@ -184,19 +184,19 @@ IDENTITIES = {
     ),
     "kcp_dhu_offset": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
-        {"program": "offset"},
+        {"program": "offset", "fuse_dv1": 1},
     ),
     "kcp_dhu_offset_overlap": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_det_dhu_v2_kcp",
-        {"program": "offset", "tile_prefetch": 0},
+        {"program": "offset", "tile_prefetch": 0, "fuse_dv1": 1},
     ),
     "kcp_dhu_offset_vh64": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
-        {"program": "offset", "vh": 64},
+        {"program": "offset", "vh": 64, "fuse_dv1": 1},
     ),
     "kcp_dhu_tape": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
-        {"program": "tape", "vh": 64, "tape_store": "tma"},
+        {"program": "tape", "vh": 64, "tape_store": "tma", "fuse_dv1": 1},
     ),
     "kcp_transfer_walk": (
         f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_det_transfer_walk_bf16x3_v2_kcp",
@@ -235,7 +235,7 @@ IDENTITIES = {
     ),
     "kcp_dhu_tape_full": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
-        {"program": "tape"},
+        {"program": "tape", "fuse_dv1": 1},
     ),
 }
 

@@ -50,9 +50,16 @@ their fallback tactics; ``--autotune_cache`` reuses the profiles across runs).
 Launch on one node, for example:
 
     # DeepSeek-V4-Pro experts (MXFP4 weights, MXFP8 activations) behind the
-    # one-sided all-to-all on its fence transport, local batches 1..1024.
+    # one-sided all-to-all on its fence protocol for every batch, local
+    # batches 1..1024.
     torchrun --standalone --nproc-per-node=8 benchmarks/moe_ep/bench_moe_ep.py \\
-        --comm nvlink_one_sided --cft off --compute trtllm \\
+        --comm nvlink_one_sided --sync_protocol fence --compute trtllm \\
+        --profile deepseek_v4_pro --perfect_router -b 1 -e 1024 -f 2 \\
+        --kernel_breakdown --output_file out.json
+
+    # The same on the sentinel protocol for every batch.
+    torchrun --standalone --nproc-per-node=8 benchmarks/moe_ep/bench_moe_ep.py \\
+        --comm nvlink_one_sided --sync_protocol sentinel --compute trtllm \\
         --profile deepseek_v4_pro --perfect_router -b 1 -e 1024 -f 2 \\
         --kernel_breakdown --output_file out.json
 """
@@ -102,8 +109,8 @@ QUANT_FORMATS = {
 ACTIVATION_FORMATS = ("bf16", "fp8_block_scale", "mxfp8", "nvfp4")
 COMM_BACKENDS = ("nvlink_one_sided", "cake", "nvlink_two_sided")
 COMPUTE_BACKENDS = ("trtllm", "cutedsl", "prims_ts")
-# NVLinkOneSidedConfig.cft for each --cft choice.
-_CFT_MODES = {"auto": None, "on": True, "off": False}
+# NVLinkOneSidedConfig.sync_protocol choices.
+SYNC_PROTOCOLS = ("auto", "fence", "sentinel")
 TIMING_SCOPES = ("dispatch_compute_combine", "forward")
 # The stage a fused dispatch-experts-combine kernel starts at.
 _DISPATCH_STAGE = "dispatch"
@@ -119,7 +126,8 @@ def _comm_config(args: argparse.Namespace):
     low_precision = bool(args.use_low_precision_combine)
     if args.comm == "nvlink_one_sided":
         return NVLinkOneSidedConfig(
-            use_low_precision_combine=low_precision, cft=_CFT_MODES[args.cft]
+            use_low_precision_combine=low_precision,
+            sync_protocol=args.sync_protocol,
         )
     if args.comm == "cake":
         return CakeAlltoAllConfig(use_low_precision_combine=low_precision)
@@ -594,11 +602,14 @@ def parse_args() -> argparse.Namespace:
         help="Send combine payloads as FP8 (nvlink_one_sided and cake).",
     )
     parser.add_argument(
-        "--cft",
-        choices=sorted(_CFT_MODES),
+        "--sync_protocol",
+        "--sync-protocol",
+        choices=SYNC_PROTOCOLS,
         default="auto",
-        help="CFT counted writes of nvlink_one_sided: auto (where supported, up "
-        "to its token-count limits), on (every supported step) or off.",
+        help="Sync protocol of nvlink_one_sided: fence or sentinel for every "
+        "step, or auto (default): the sentinel protocol for steps of at most 256 "
+        "tokens per rank where every rank supports it, the fence protocol for "
+        "the others.",
     )
     parser.add_argument(
         "--no_cuda_graph",
@@ -629,8 +640,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Report the stages inside the timing scope instead of its span.",
     )
-    args = parser.parse_args()
-    return args
+    return parser.parse_args()
 
 
 def main() -> None:
@@ -683,7 +693,10 @@ def main() -> None:
         "max_num_tokens_per_rank": max_num_tokens_per_rank,
         "perfect_router": bool(args.perfect_router),
         "use_low_precision_combine": bool(args.use_low_precision_combine),
-        "cft": args.cft,
+        "sync_protocol": args.sync_protocol,
+        # nvlink_one_sided's largest step on the sentinel protocol, set once
+        # the transport is up.
+        "sentinel_max_tokens": None,
         "random_seed": int(args.random_seed),
         "device": torch.cuda.get_device_name(device),
         "cuda_graph": not args.no_cuda_graph,
@@ -780,6 +793,10 @@ def main() -> None:
             print_rank0(f"[{_TAG}] Stopping at {label}: {error}")
             break
         times, span_times, stats = timings
+        if metadata["sentinel_max_tokens"] is None:
+            metadata["sentinel_max_tokens"] = getattr(
+                layer._communication, "sentinel_max_tokens", None
+            )
 
         cupti_errors = first_error(stats.get("cupti_error"))
         if cupti_errors is not None:

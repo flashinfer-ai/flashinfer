@@ -1096,7 +1096,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynr_dpl(const __grid_constant__ CUtensorMap
                                     "setp.ne.b32 p, %0, 0;\n\t"
                                     "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
                                     "}"
-                                    :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq * 24));
+                                    :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq * 24ull));
                                 #pragma unroll
                                 for (int kq_2 = 0; kq_2 < 2; kq_2++) {
                                     int rowa = t0_1 + tokbase + wq_r4[kq_2];
@@ -1104,7 +1104,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynr_dpl(const __grid_constant__ CUtensorMap
                                         rowa = T - 1;
                                     }
                                     asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
-                                        :: "r"(wtab + (unsigned int)(wq_r4[kq_2] * 48 + 16 + 8 * wq_b4[kq_2])), "l"(tokp + ((unsigned long long)rowa * 24 + (unsigned long long)(6 + 2 * wq_b4[kq_2]))));
+                                        :: "r"(wtab + (unsigned int)(wq_r4[kq_2] * 48 + 16 + 8 * wq_b4[kq_2])), "l"(tokp + ((unsigned long long)rowa * 24ull + (unsigned long long)(6 + 2 * wq_b4[kq_2]))));
                                 }
                             } else {
                                 asm volatile(
@@ -1113,7 +1113,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynr_dpl(const __grid_constant__ CUtensorMap
                                     "setp.ne.b32 p, %0, 0;\n\t"
                                     "@p cp.async.ca.shared::cta.global [%1], [%2], 4;\n\t"
                                     "}"
-                                    :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48 + 4)), "l"(tokp + ((unsigned long long)rowq * 24 + 1)));
+                                    :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48 + 4)), "l"(tokp + ((unsigned long long)rowq * 24ull + 1ull)));
                                 #pragma unroll
                                 for (int kq_3 = 0; kq_3 < 3; kq_3++) {
                                     int rowa_1 = t0_1 + tokbase + wq_r5[kq_3];
@@ -1127,10 +1127,10 @@ kernel_cake_mhc_det_train_bwd_slab__dynr_dpl(const __grid_constant__ CUtensorMap
                                             "setp.ne.b32 p, %0, 0;\n\t"
                                             "@p cp.async.ca.shared::cta.global [%1], [%2], 8;\n\t"
                                             "}"
-                                            :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_3] * 48 + 8 + 8 * wq_b5[kq_3])), "l"(tokp + ((unsigned long long)rowa_1 * 24 + (unsigned long long)wq_w5[kq_3])));
+                                            :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_3] * 48 + 8 + 8 * wq_b5[kq_3])), "l"(tokp + ((unsigned long long)rowa_1 * 24ull + (unsigned long long)wq_w5[kq_3])));
                                     } else {
                                         asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
-                                            :: "r"(wtab + (unsigned int)(wq_r5[kq_3] * 48 + 8 + 8 * wq_b5[kq_3])), "l"(tokp + ((unsigned long long)rowa_1 * 24 + (unsigned long long)wq_w5[kq_3])));
+                                            :: "r"(wtab + (unsigned int)(wq_r5[kq_3] * 48 + 8 + 8 * wq_b5[kq_3])), "l"(tokp + ((unsigned long long)rowa_1 * 24ull + (unsigned long long)wq_w5[kq_3])));
                                     }
                                 }
                             }
@@ -2572,7 +2572,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynr_dpl(const __grid_constant__ CUtensorMap
                                 "setp.ne.b32 p, %0, 0;\n\t"
                                 "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
                                 "}"
-                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq_1 * 24));
+                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq_1 * 24ull));
                             #pragma unroll
                             for (int kq_4 = 0; kq_4 < 2; kq_4++) {
                                 int rowa_2 = t0_1 + 64 + tokbase + wq_r4[kq_4];
@@ -2580,7 +2580,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynr_dpl(const __grid_constant__ CUtensorMap
                                     rowa_2 = T - 1;
                                 }
                                 asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
-                                    :: "r"(wtab + (unsigned int)(wq_r4[kq_4] * 48 + 16 + 8 * wq_b4[kq_4])), "l"(tokp + ((unsigned long long)rowa_2 * 24 + (unsigned long long)(6 + 2 * wq_b4[kq_4]))));
+                                    :: "r"(wtab + (unsigned int)(wq_r4[kq_4] * 48 + 16 + 8 * wq_b4[kq_4])), "l"(tokp + ((unsigned long long)rowa_2 * 24ull + (unsigned long long)(6 + 2 * wq_b4[kq_4]))));
                             }
                         } else {
                             asm volatile(
@@ -2589,7 +2589,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynr_dpl(const __grid_constant__ CUtensorMap
                                 "setp.ne.b32 p, %0, 0;\n\t"
                                 "@p cp.async.ca.shared::cta.global [%1], [%2], 4;\n\t"
                                 "}"
-                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48 + 4)), "l"(tokp + ((unsigned long long)rowq_1 * 24 + 1)));
+                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48 + 4)), "l"(tokp + ((unsigned long long)rowq_1 * 24ull + 1ull)));
                             #pragma unroll
                             for (int kq_5 = 0; kq_5 < 3; kq_5++) {
                                 int rowa_3 = t0_1 + 64 + tokbase + wq_r5[kq_5];
@@ -2603,10 +2603,10 @@ kernel_cake_mhc_det_train_bwd_slab__dynr_dpl(const __grid_constant__ CUtensorMap
                                         "setp.ne.b32 p, %0, 0;\n\t"
                                         "@p cp.async.ca.shared::cta.global [%1], [%2], 8;\n\t"
                                         "}"
-                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_5] * 48 + 8 + 8 * wq_b5[kq_5])), "l"(tokp + ((unsigned long long)rowa_3 * 24 + (unsigned long long)wq_w5[kq_5])));
+                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_5] * 48 + 8 + 8 * wq_b5[kq_5])), "l"(tokp + ((unsigned long long)rowa_3 * 24ull + (unsigned long long)wq_w5[kq_5])));
                                 } else {
                                     asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
-                                        :: "r"(wtab + (unsigned int)(wq_r5[kq_5] * 48 + 8 + 8 * wq_b5[kq_5])), "l"(tokp + ((unsigned long long)rowa_3 * 24 + (unsigned long long)wq_w5[kq_5])));
+                                        :: "r"(wtab + (unsigned int)(wq_r5[kq_5] * 48 + 8 + 8 * wq_b5[kq_5])), "l"(tokp + ((unsigned long long)rowa_3 * 24ull + (unsigned long long)wq_w5[kq_5])));
                                 }
                             }
                         }
@@ -2644,7 +2644,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynr_dpl(const __grid_constant__ CUtensorMap
                                         "setp.ne.b32 p, %0, 0;\n\t"
                                         "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
                                         "}"
-                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq_2 * 24));
+                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq_2 * 24ull));
                                     #pragma unroll
                                     for (int kq_6 = 0; kq_6 < 2; kq_6++) {
                                         int rowa_4 = row0_1_1 + tokbase + wq_r4[kq_6];
@@ -2652,7 +2652,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynr_dpl(const __grid_constant__ CUtensorMap
                                             rowa_4 = T - 1;
                                         }
                                         asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
-                                            :: "r"(wtab + (unsigned int)(wq_r4[kq_6] * 48 + 16 + 8 * wq_b4[kq_6])), "l"(tokp + ((unsigned long long)rowa_4 * 24 + (unsigned long long)(6 + 2 * wq_b4[kq_6]))));
+                                            :: "r"(wtab + (unsigned int)(wq_r4[kq_6] * 48 + 16 + 8 * wq_b4[kq_6])), "l"(tokp + ((unsigned long long)rowa_4 * 24ull + (unsigned long long)(6 + 2 * wq_b4[kq_6]))));
                                     }
                                 } else {
                                     asm volatile(
@@ -2661,7 +2661,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynr_dpl(const __grid_constant__ CUtensorMap
                                         "setp.ne.b32 p, %0, 0;\n\t"
                                         "@p cp.async.ca.shared::cta.global [%1], [%2], 4;\n\t"
                                         "}"
-                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48 + 4)), "l"(tokp + ((unsigned long long)rowq_2 * 24 + 1)));
+                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48 + 4)), "l"(tokp + ((unsigned long long)rowq_2 * 24ull + 1ull)));
                                     #pragma unroll
                                     for (int kq_7 = 0; kq_7 < 3; kq_7++) {
                                         int rowa_5 = row0_1_1 + tokbase + wq_r5[kq_7];
@@ -2675,10 +2675,10 @@ kernel_cake_mhc_det_train_bwd_slab__dynr_dpl(const __grid_constant__ CUtensorMap
                                                 "setp.ne.b32 p, %0, 0;\n\t"
                                                 "@p cp.async.ca.shared::cta.global [%1], [%2], 8;\n\t"
                                                 "}"
-                                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_7] * 48 + 8 + 8 * wq_b5[kq_7])), "l"(tokp + ((unsigned long long)rowa_5 * 24 + (unsigned long long)wq_w5[kq_7])));
+                                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_7] * 48 + 8 + 8 * wq_b5[kq_7])), "l"(tokp + ((unsigned long long)rowa_5 * 24ull + (unsigned long long)wq_w5[kq_7])));
                                         } else {
                                             asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
-                                                :: "r"(wtab + (unsigned int)(wq_r5[kq_7] * 48 + 8 + 8 * wq_b5[kq_7])), "l"(tokp + ((unsigned long long)rowa_5 * 24 + (unsigned long long)wq_w5[kq_7])));
+                                                :: "r"(wtab + (unsigned int)(wq_r5[kq_7] * 48 + 8 + 8 * wq_b5[kq_7])), "l"(tokp + ((unsigned long long)rowa_5 * 24ull + (unsigned long long)wq_w5[kq_7])));
                                         }
                                     }
                                 }
@@ -2766,7 +2766,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynr_dpl(const __grid_constant__ CUtensorMap
                     if (ep_stage == 2) { ep_stage = 0; _phase_stage_full_x ^= 1; }
                 }
                 unsigned long long kcol = (unsigned long long)(i_str * 4096 + s_2 * 64 + dl);
-                unsigned long long pbase = (unsigned long long)p_2 * 393216;
+                unsigned long long pbase = (unsigned long long)p_2 * 393216ull;
                 #pragma unroll
                 for (int n_3 = 0; n_3 < 24; n_3++) {
                     float dpv;

@@ -155,12 +155,11 @@ kernel_cake_causal_conv1d_train_675940a7a4fc0dba4b53_kcp(__nv_bfloat16* __restri
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* stage_buf = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int stage_buf_addr = smem + 1024;
 
-    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 2 barriers)
-    // Mbarriers at smem_raw[0..16)
+    // Mbarrier init (2 barriers at smem_raw[0..16))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -250,7 +249,7 @@ kernel_cake_causal_conv1d_train_675940a7a4fc0dba4b53_kcp(__nv_bfloat16* __restri
         #pragma unroll
         for (int j = 0; j < 8; j++) {
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(w + (c64 + (long long)j) * 4);
+                float4 _v4 = *reinterpret_cast<const float4*>(w + (c64 + (long long)j) * 4ll);
                 wr[j * 4 + 0] = _v4.x;
                 wr[j * 4 + 1] = _v4.y;
                 wr[j * 4 + 2] = _v4.z;
@@ -497,7 +496,7 @@ kernel_cake_causal_conv1d_train_675940a7a4fc0dba4b53_kcp(__nv_bfloat16* __restri
                         asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_19) : "f"(w4[2]), "f"(win[(u % 4 + 3) % 4 * 8 + j_2]), "f"(_fma_20));
                         float _fma_0;
                         asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_0) : "f"(w4[3]), "f"(win[u % 4 * 8 + j_2]), "f"(_fma_19));
-                        float e = (-_fma_0) * 1.442695f;
+                        float e = -_fma_0 * 1.442695f;
                         float _exp2_21 = approx_exp2(e);
                         float den = 1.0f + _exp2_21;
                         float _rcp_22 = approx_rcp(den);

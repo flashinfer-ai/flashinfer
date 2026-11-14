@@ -8,18 +8,20 @@ from typing import Union
 
 import pytest
 import torch
-from tests.test_helpers.parametrize import (
+from tests.infra.test_helpers.parametrize import (
     pairwise_product_cases,
     parametrize_product,
 )
-from tests.test_helpers.utils_fp4 import (
+from tests.quantization.test_helpers.utils_fp4 import (
     cast_from_fp4,
     recover_swizzled_scales,
     ref_fp4_quant,
 )
-from tests.test_helpers.test_helpers import assert_close_with_mismatch_tolerance
+from tests.attention.test_helpers.test_helpers import (
+    assert_close_with_mismatch_tolerance,
+)
 import einops
-from tests.test_helpers.sink_attention_reference import sink_attention_unified
+from tests.attention.test_helpers.sink_attention_reference import sink_attention_unified
 from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 
 import flashinfer
@@ -2145,7 +2147,8 @@ def test_trtllm_batch_decode_spec(
 
 
 # Multi-wave KV split (opt-in): with FLASHINFER_TRTLLM_GEN_MULTI_WAVE_KV_SPLIT=1, when one wave
-# of CTAs gives at most 2 KV splits, trtllm-gen uses up to 4 waves (fmhaKernels.cuh); =2 is
+# of CTAs gives at most 2 KV splits, trtllm-gen uses up to 4 waves when each raised split has
+# enough mainloop work (fmhaKernels.cuh); =2 is
 # tested further below. Unset keeps the stock one-wave split. The 32/2-head cases have base
 # CTAs = 2 x batch (one Q CTA per request), so one-wave splits are SMs // (2 x batch).
 MULTI_WAVE_KV_SPLIT_ENV = "FLASHINFER_TRTLLM_GEN_MULTI_WAVE_KV_SPLIT"
@@ -2287,12 +2290,14 @@ def _multi_wave_cases(m: int) -> dict:
 
     engaged: more CTAs than SMs. unchanged: the same launch as default (bitwise).
     cga_gmem: engaged, and the CGA candidate falls back to Gmem on occupancy.
+    capped: engaged, but the mainloop guard admits fewer splits than the four-wave budget.
     """
     cases = {}
 
     def add(name, expect, batch_size, q_len=1, **kw):
         cfg = dict(batch_size=batch_size, q_len=q_len, head_grp_size=16, head_dim=128)
-        cfg.update(q_dtype="fp8", kv_dtype="fp8", max_kv_len=8192, window_left=-1)
+        # Keep capacity and reselection fixtures long enough to use the full split budget.
+        cfg.update(q_dtype="fp8", kv_dtype="fp8", max_kv_len=65536, window_left=-1)
         cfg.update(
             page_size=16, workspace_bytes=None, misalign=0, lse=False, expect=expect
         )
@@ -2307,14 +2312,46 @@ def _multi_wave_cases(m: int) -> dict:
                 batch_size = m // 4 + (1 if k0 == 1 else 0)
                 name = f"one_wave_{k0}-q{q_len}-{q_dtype}q"
                 add(name, "engaged", batch_size, q_len, q_dtype=q_dtype)
-    add("tuned_max_3", "engaged", m // 4 + 1, max_kv_len=768)
-    add("window_1023", "engaged", m // 4 + 1, window_left=1023)
+    add("tuned_max_3", "unchanged", m // 4 + 1, max_kv_len=768)
+    add("window_1023", "unchanged", m // 4 + 1, window_left=1023)
+    add("mainloop_capped", "capped", m // 4 + 1, max_kv_len=18432)
+    add("window_2047_bf16q", "unchanged", m // 4 + 1, q_dtype="bf16", window_left=2047)
+    add(
+        "window_2047_native_bf16",
+        "unchanged",
+        max(1, m // 3),
+        num_kv_heads=4,
+        head_grp_size=8,
+        head_dim=64,
+        page_size=64,
+        q_dtype="bf16",
+        kv_dtype="bf16",
+        window_left=2047,
+    )
+    # Mainloop-limited partial increases must improve CTA-wave utilization: reject a sparse
+    # final wave and a grid with exactly the stock fill, even though the mainloops are long.
+    for suffix, batch_size, max_kv_len in (
+        ("wave_tail", max(1, m // 9), 32768),
+        ("equal_fill", max(1, m // 5), 16384),
+    ):
+        add(
+            f"mainloop_capped_{suffix}",
+            "unchanged",
+            batch_size,
+            num_kv_heads=4,
+            head_grp_size=8,
+            head_dim=64,
+            page_size=64,
+            q_dtype="bf16",
+            kv_dtype="bf16",
+            max_kv_len=max_kv_len,
+        )
     head512 = dict(
-        q_len=6, head_grp_size=8, head_dim=512, max_kv_len=4096, page_size=64
+        q_len=6, head_grp_size=8, head_dim=512, max_kv_len=16384, page_size=64
     )
     add("head512-one_wave_1", "engaged", m // 8 + 1, **head512)
     add("head512-base_2x_sms", "engaged", m // 2, **head512)
-    add("base_2x_sms", "engaged", m, max_kv_len=2048)
+    add("base_2x_sms", "unchanged", m, max_kv_len=2048)
     add("base_over_2x_sms", "unchanged", m + 1, max_kv_len=2048)  # 4 waves give 1 split
     # One wave gives 4 splits; and short KV that binds tunedMax with tile-search probes.
     add("parity", "unchanged", m // 8)
@@ -2368,7 +2405,7 @@ def _multi_wave_case_inputs(cfg: dict):
     return _multi_wave_inputs(
         cfg["batch_size"],
         cfg["q_len"],
-        2,
+        cfg.get("num_kv_heads", 2),
         cfg["head_grp_size"],
         cfg["head_dim"],
         cfg["q_dtype"],
@@ -2500,6 +2537,9 @@ def test_trtllm_batch_decode_multi_wave_kv_split(case: str, multi_wave_runs) -> 
         # More CTAs than SMs and than the stock launch, with multi-CTA KV on.
         assert num_ctas > max(sm_count, stock_num_ctas), (num_ctas, stock_num_ctas)
         assert mode != _MULTI_CTAS_KV_DISABLED
+        if cfg["expect"] == "capped":
+            base_ctas = 2 * cfg["batch_size"]
+            assert num_ctas < (4 * sm_count // base_ctas) * base_ctas
         if "scratch_start" in cfg:
             assert not checks["scratch"], (
                 "multi-wave split did not run at exact capacity"
@@ -2603,11 +2643,10 @@ def _wave_fill_cases(m: int) -> dict:
     add("base_over_sms", "as_flag_1", m // 2 + 1)
     add("base_2x_sms", "as_flag_1", m, max_kv_len=2048)
     add("base_over_2x_sms", "as_flag_1", m + 1, max_kv_len=2048)
-    # =2 raises a one-wave split of 1 to 8 waves where =1 uses 4; with KV too short for a
-    # 4096-token split, =2 keeps the stock split where =1 still uses 4 waves.
+    # =2 raises a one-wave split of 1 to 8 waves where =1 uses 4. Both modes keep the stock
+    # split when the effective window is too short to amortize multi-wave reduction.
     cases["one_wave_1"]["differs_from_flag_1"] = True
     add("one_wave_1-kv_2048", "unchanged", one_wave[1], max_kv_len=2048)
-    cases["one_wave_1-kv_2048"]["differs_from_flag_1"] = True
     # The window per split, ceil(window / split), must be >= 4096: 4095 x split + 1 is the
     # shortest window that allows a split. The fill branch then stops at that split.
     b4, b9 = one_wave[4], one_wave[9]

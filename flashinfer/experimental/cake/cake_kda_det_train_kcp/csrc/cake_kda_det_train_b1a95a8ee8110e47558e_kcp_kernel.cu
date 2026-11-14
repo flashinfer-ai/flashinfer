@@ -412,7 +412,7 @@ kernel_cake_kda_det_train_b1a95a8ee8110e47558e_kcp(const __grid_constant__ CUten
             unsigned int _phase_h_ready_0 = 0;
             #pragma unroll 1
             for (int c = 0; c < nc; c++) {
-                long long gn_index = ((long long)(row0 + c * 64 + 64 - 1) * (long long)num_heads + (long long)head) * 128 + (long long)k_row;
+                long long gn_index = ((long long)(row0 + c * 64 + 64 - 1) * (long long)num_heads + (long long)head) * 128ll + (long long)k_row;
                 float decay = approx_exp2(gk[gn_index]);
                 float _tmem_load_0_0[16];
                 tmem_ld_x16(&_tmem_load_0_0[0], taddr + (unsigned int)h_row_base);
@@ -1006,7 +1006,7 @@ kernel_cake_kda_det_train_b1a95a8ee8110e47558e_kcp(const __grid_constant__ CUten
                 _phase_vp_ready_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int trow = row0 + c * 64 + t_row;
-                long long u_base = ((long long)trow * (long long)num_heads + (long long)head) * 128 + (long long)v0;
+                long long u_base = ((long long)trow * (long long)num_heads + (long long)head) * 128ll + (long long)v0;
                 float _tmem_load_2[16];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
@@ -1432,7 +1432,7 @@ kernel_cake_kda_det_train_b1a95a8ee8110e47558e_kcp(const __grid_constant__ CUten
             }
             int slot = out_index[seg];
             if (slot >= 0) {
-                long long tile = (long long)((head / out_hg * out_n + slot) * out_hg + head % out_hg) * (long long)tile_stride * 16384;
+                long long tile = (long long)((head / out_hg * out_n + slot) * out_hg + head % out_hg) * (long long)tile_stride * 16384ll;
                 float _tmem_load_6[16];
                 tmem_ld_x16(&_tmem_load_6[0], taddr + (unsigned int)h_row_base);
                 float _tmem_load_36_0[16];
@@ -1450,15 +1450,15 @@ kernel_cake_kda_det_train_b1a95a8ee8110e47558e_kcp(const __grid_constant__ CUten
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_6[4 + 0], _tmem_load_6[4 + 1], _tmem_load_6[4 + 2], _tmem_load_6[4 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_0 + 4) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_0 + 4ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_6[8 + 0], _tmem_load_6[8 + 1], _tmem_load_6[8 + 2], _tmem_load_6[8 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_0 + 8) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_0 + 8ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_6[12 + 0], _tmem_load_6[12 + 1], _tmem_load_6[12 + 2], _tmem_load_6[12 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_0 + 12) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_0 + 12ll) = _v4;
                     }
                 } else {
                     #pragma unroll
@@ -1483,15 +1483,15 @@ kernel_cake_kda_det_train_b1a95a8ee8110e47558e_kcp(const __grid_constant__ CUten
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_7[4 + 0], _tmem_load_7[4 + 1], _tmem_load_7[4 + 2], _tmem_load_7[4 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_1 + 4) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_1 + 4ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_7[8 + 0], _tmem_load_7[8 + 1], _tmem_load_7[8 + 2], _tmem_load_7[8 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_1 + 8) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_1 + 8ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_7[12 + 0], _tmem_load_7[12 + 1], _tmem_load_7[12 + 2], _tmem_load_7[12 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_1 + 12) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_1 + 12ll) = _v4;
                     }
                 } else {
                     #pragma unroll
@@ -1516,15 +1516,15 @@ kernel_cake_kda_det_train_b1a95a8ee8110e47558e_kcp(const __grid_constant__ CUten
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_8[4 + 0], _tmem_load_8[4 + 1], _tmem_load_8[4 + 2], _tmem_load_8[4 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_2 + 4) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_2 + 4ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_8[8 + 0], _tmem_load_8[8 + 1], _tmem_load_8[8 + 2], _tmem_load_8[8 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_2 + 8) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_2 + 8ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_8[12 + 0], _tmem_load_8[12 + 1], _tmem_load_8[12 + 2], _tmem_load_8[12 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_2 + 12) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_2 + 12ll) = _v4;
                     }
                 } else {
                     #pragma unroll
@@ -1549,15 +1549,15 @@ kernel_cake_kda_det_train_b1a95a8ee8110e47558e_kcp(const __grid_constant__ CUten
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_9[4 + 0], _tmem_load_9[4 + 1], _tmem_load_9[4 + 2], _tmem_load_9[4 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_3 + 4) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_3 + 4ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_9[8 + 0], _tmem_load_9[8 + 1], _tmem_load_9[8 + 2], _tmem_load_9[8 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_3 + 8) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_3 + 8ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_9[12 + 0], _tmem_load_9[12 + 1], _tmem_load_9[12 + 2], _tmem_load_9[12 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_3 + 12) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_3 + 12ll) = _v4;
                     }
                 } else {
                     #pragma unroll
@@ -1582,15 +1582,15 @@ kernel_cake_kda_det_train_b1a95a8ee8110e47558e_kcp(const __grid_constant__ CUten
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_10[4 + 0], _tmem_load_10[4 + 1], _tmem_load_10[4 + 2], _tmem_load_10[4 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_4 + 4) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_4 + 4ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_10[8 + 0], _tmem_load_10[8 + 1], _tmem_load_10[8 + 2], _tmem_load_10[8 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_4 + 8) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_4 + 8ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_10[12 + 0], _tmem_load_10[12 + 1], _tmem_load_10[12 + 2], _tmem_load_10[12 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_4 + 12) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_4 + 12ll) = _v4;
                     }
                 } else {
                     #pragma unroll
@@ -1615,15 +1615,15 @@ kernel_cake_kda_det_train_b1a95a8ee8110e47558e_kcp(const __grid_constant__ CUten
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_11[4 + 0], _tmem_load_11[4 + 1], _tmem_load_11[4 + 2], _tmem_load_11[4 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_5 + 4) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_5 + 4ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_11[8 + 0], _tmem_load_11[8 + 1], _tmem_load_11[8 + 2], _tmem_load_11[8 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_5 + 8) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_5 + 8ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_11[12 + 0], _tmem_load_11[12 + 1], _tmem_load_11[12 + 2], _tmem_load_11[12 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_5 + 12) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_5 + 12ll) = _v4;
                     }
                 } else {
                     #pragma unroll
@@ -1648,15 +1648,15 @@ kernel_cake_kda_det_train_b1a95a8ee8110e47558e_kcp(const __grid_constant__ CUten
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_12[4 + 0], _tmem_load_12[4 + 1], _tmem_load_12[4 + 2], _tmem_load_12[4 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_6 + 4) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_6 + 4ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_12[8 + 0], _tmem_load_12[8 + 1], _tmem_load_12[8 + 2], _tmem_load_12[8 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_6 + 8) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_6 + 8ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_12[12 + 0], _tmem_load_12[12 + 1], _tmem_load_12[12 + 2], _tmem_load_12[12 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_6 + 12) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_6 + 12ll) = _v4;
                     }
                 } else {
                     #pragma unroll
@@ -1681,15 +1681,15 @@ kernel_cake_kda_det_train_b1a95a8ee8110e47558e_kcp(const __grid_constant__ CUten
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_13[4 + 0], _tmem_load_13[4 + 1], _tmem_load_13[4 + 2], _tmem_load_13[4 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_7 + 4) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_7 + 4ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_13[8 + 0], _tmem_load_13[8 + 1], _tmem_load_13[8 + 2], _tmem_load_13[8 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_7 + 8) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_7 + 8ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(_tmem_load_13[12 + 0], _tmem_load_13[12 + 1], _tmem_load_13[12 + 2], _tmem_load_13[12 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1_7 + 12) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1_7 + 12ll) = _v4;
                     }
                 } else {
                     #pragma unroll

@@ -32,7 +32,7 @@ from flashinfer.grouped_mm.cute_sm120_fp8_groupwise.core import (
 )
 from flashinfer.testing.utils import per_block_cast_to_fp8, per_token_cast_to_fp8
 from flashinfer.utils import is_sm120a_supported
-from tests.test_helpers.pdl import late_store
+from tests.utils.test_helpers.pdl import late_store
 
 CALC_DIFF_THRESHOLD = 1e-3
 # Gated (fused SwiGLU) uses a looser tolerance: the fp8 GEMM output is 2N (gate+up),

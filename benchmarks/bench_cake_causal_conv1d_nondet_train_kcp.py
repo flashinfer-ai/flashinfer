@@ -15,8 +15,9 @@ limitations under the License.
 
 Benchmark of the context-parallel (KCP) Cake packed width-4 depthwise causal convolution + SiLU training step in its
 two numerical modes: the deterministic KCP package (``flashinfer.cake_causal_conv1d_det_train_kcp``:
-``cake_causal_conv1d_det_kcp`` / ``cake_causal_conv1d_det_kcp_multi``; a cooperative backward launch whose grid
-reduces the ``dweight`` partial in a fixed order) against the non-deterministic KCP package
+``cake_causal_conv1d_det_kcp`` / ``cake_causal_conv1d_det_kcp_multi`` in the package's default backward launch form,
+``COOPERATIVE_DEFAULT`` of its ``kcp`` module, recorded in the JSON as ``det_cooperative_default``; either form reduces
+the ``dweight`` partial in a fixed order) against the non-deterministic KCP package
 (``flashinfer.cake_causal_conv1d_nondet_train_kcp``: ``cake_causal_conv1d_nondet_kcp`` /
 ``cake_causal_conv1d_nondet_kcp_multi``; one ordinary backward launch with unordered ``dweight`` accumulators), each
 called by its own entry-point names; the multi entry runs ``--tensors`` convolutions of one layer (one halo exchange
@@ -891,6 +892,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "layout": args.layout,
                     "tensors": args.tensors,
                     "sota_arms": args.sota_arms,
+                    "det_cooperative_default": getattr(
+                        importlib.import_module(
+                            "flashinfer.experimental.cake.cake_causal_conv1d_det_train.kcp"
+                        ),
+                        "COOPERATIVE_DEFAULT",
+                        None,
+                    ),
                     "gpu_timer": "cuda_event",
                     "complete": complete,
                     "rows": results,

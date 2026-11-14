@@ -20,7 +20,9 @@ import pytest
 import torch
 
 from flashinfer.cudnn import cudnn_recurrent_kda, linear_attention
-from tests.test_helpers.cudnn_linear_attention import requires_cudnn_linear_attention
+from tests.gdn.test_helpers.cudnn_linear_attention import (
+    requires_cudnn_linear_attention,
+)
 
 
 def test_workspace_is_owned_by_stream_or_capture(monkeypatch):

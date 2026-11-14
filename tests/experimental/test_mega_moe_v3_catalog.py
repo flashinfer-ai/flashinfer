@@ -64,6 +64,23 @@ SETMAXNREG = "setmaxnreg."
 SHAPE_BLOCK_M = {(48, 2304, 128): 32, (48, 2304, 512): 32}
 
 
+# The TP/EP routes whose sm_103a programs run a persistent grid smaller than
+# the 152-SM device (route metadata ``num_ctas`` and grid ``[num_ctas, 1, 1]``):
+# the 384-expert I640, 96-expert and 48-expert rank shapes at one token run
+# 148 CTAs, the device less their 4 combine CTAs, so a stream's next call is
+# admitted while they finish. Every other route, the 384-expert I384 one-token
+# route included, runs one CTA per SM.
+PERSISTENT_GRID = {
+    (384, 640, 1): 148,
+    (96, 2304, 1): 148,
+    (48, 2304, 1): 148,
+}
+T1_PROGRAMS = {
+    f"deepgemm_mega_moe_v3_pipeline_fp4_e{e}_i{i}_t1_sm103a"
+    for e, i, _ in PERSISTENT_GRID
+}
+
+
 def expected_block_m(num_experts, intermediate, num_tokens):
     """Source tile height of a TP/EP row: 16 rows up to 512 tokens, 32 at 1024,
     128 at 4096, unless ``SHAPE_BLOCK_M`` names the row's own."""
@@ -180,7 +197,10 @@ def test_tp_ep_routes_ship_with_the_local_expert_filter_and_their_source_form():
                 metadata["slot_list"],
             ) == expected_source_form(num_experts, num_tokens), shape
             assert runtime.route_admitted_num_sms(route, "sm_103a") == (152,), shape
-            assert runtime.route_grid(route, "sm_103a", 152) == (152, 1, 1), shape
+            num_ctas = PERSISTENT_GRID.get(shape, 152)
+            assert runtime.route_grid(route, "sm_103a", 152) == (num_ctas, 1, 1), shape
+            assert runtime.route_num_ctas(route, "sm_103a", 152) == num_ctas, shape
+            assert metadata.get("num_ctas") == PERSISTENT_GRID.get(shape), shape
             (stage,) = route["stages"]
             assert stage["name"] == "pipeline", shape
             assert runtime.stage_program(stage, "sm_103a") == (
@@ -333,9 +353,14 @@ def test_every_route_resolves_its_programs_grid_and_sm_count(arch):
         for num_sms in admitted:
             grid = runtime.route_grid(route, arch, num_sms)
             assert len(grid) == 3
+            num_ctas = runtime.route_num_ctas(route, arch, num_sms)
+            assert 0 < num_ctas <= num_sms, (key, arch, num_sms)
             if surface != "grouped_l1":
-                # Persistent schedules fill the device: one CTA per physical SM.
-                assert grid == (num_sms, 1, 1), (key, arch, num_sms)
+                # Persistent schedules run one CTA per physical SM, or the
+                # smaller persistent grid the route states.
+                assert grid == (num_ctas, 1, 1), (key, arch, num_sms)
+            if "num_ctas" not in route["metadata"]:
+                assert num_ctas == num_sms, (key, arch, num_sms)
         for stage in route["stages"]:
             name = runtime.stage_program(stage, arch)
             assert name in programs, (key, stage["name"], arch)
@@ -420,3 +445,97 @@ def test_load_program_supplies_the_route_sm_count_as_num_ctas():
                     assert not any(f.startswith("-DNUM_CTAS") for f in flags)
                 for flag in catalog.compile_flags(record, arch):
                     assert flag in flags
+
+
+def test_only_the_one_token_rank_routes_state_a_persistent_grid():
+    """Only sm_103a one-token rank routes state ``num_ctas``: exactly those of
+    ``PERSISTENT_GRID``, each at 148 CTAs with the grid ``[148, 1, 1]`` and the
+    152-SM device it admits. Their programs take ``NUM_CTAS`` from the compile
+    line, so the shipped texts run at the stated count."""
+    catalog = _catalog()
+    stated = [
+        (arch, key)
+        for arch in catalog.arches
+        for key, route in catalog.routes(arch).items()
+        if "num_ctas" in route["metadata"]
+    ]
+    keys = [tp_ep_route_key(*shape) for shape in PERSISTENT_GRID]
+    assert sorted(stated) == sorted(("sm_103a", key) for key in keys)
+    for key in keys:
+        route = catalog.routes("sm_103a")[key]
+        assert route["metadata"]["num_ctas"] == 148, key
+        assert route["grid"] == {"sm_103a": [148, 1, 1]}, key
+        assert runtime.route_admitted_num_sms(route, "sm_103a") == (152,), key
+        assert runtime.route_num_ctas(route, "sm_103a", 152) == 148, key
+        (stage,) = route["stages"]
+        name = runtime.stage_program(stage, "sm_103a")
+        assert name in T1_PROGRAMS, key
+        assert catalog.programs("sm_103a")[name]["definitions"] == ["NUM_CTAS"]
+
+
+def _route(grid=None, num_ctas=None, arch="sm_103a"):
+    """A pipeline route at 152 SMs with the given stated grid and ``num_ctas``."""
+    route = {"num_sms": {arch: 152}, "metadata": {"surface": "pipeline"}}
+    if grid is not None:
+        route["grid"] = {arch: list(grid)}
+    if num_ctas is not None:
+        route["metadata"]["num_ctas"] = num_ctas
+    return route
+
+
+def test_route_grid_and_num_ctas_with_and_without_a_stated_grid():
+    """A route without a stated grid or ``num_ctas`` runs one CTA per SM; a
+    stated grid is the route's launch grid; a stated ``num_ctas`` is the
+    persistent grid and must be the stated grid and fit the device."""
+    bare = _route()
+    assert runtime.route_grid(bare, "sm_103a", 152) == (152, 1, 1)
+    assert runtime.route_num_ctas(bare, "sm_103a", 152) == 152
+    full = _route(grid=(152, 1, 1))
+    assert runtime.route_grid(full, "sm_103a", 152) == (152, 1, 1)
+    assert runtime.route_num_ctas(full, "sm_103a", 152) == 152
+    smaller = _route(grid=(136, 1, 1), num_ctas=136)
+    assert runtime.route_grid(smaller, "sm_103a", 152) == (136, 1, 1)
+    assert runtime.route_num_ctas(smaller, "sm_103a", 152) == 136
+    for bad in (
+        _route(num_ctas=136),
+        _route(grid=(152, 1, 1), num_ctas=136),
+        _route(grid=(160, 1, 1), num_ctas=160),
+        _route(grid=(0, 1, 1), num_ctas=0),
+        _route(grid=(136, 2, 1), num_ctas=136),
+    ):
+        with pytest.raises(ValueError, match="must be the route's grid and fit"):
+            runtime.route_num_ctas(bad, "sm_103a", 152)
+
+
+def test_load_program_defines_num_ctas_as_the_routes_persistent_grid(monkeypatch):
+    """``load_program`` passes the route's persistent grid as ``NUM_CTAS``:
+    148 for the one-token rank routes of ``PERSISTENT_GRID``, the SM count for
+    every other sm_103a pipeline route; the JIT spec of that program names the
+    count."""
+    pytest.importorskip("torch")
+    catalog = _catalog()
+    loaded = []
+
+    def load(self, arch, name, definitions):
+        loaded.append((arch, name, definitions))
+        return None, None
+
+    monkeypatch.setattr(type(catalog), "load_program", load)
+    seen = set()
+    for key, route in catalog.routes("sm_103a").items():
+        if route["metadata"]["surface"] != "pipeline":
+            continue
+        num_ctas = runtime.route_num_ctas(route, "sm_103a", 152)
+        (stage,) = route["stages"]
+        name = runtime.stage_program(stage, "sm_103a")
+        runtime.load_program("sm_103a", name, num_ctas)
+        definitions = catalog.definitions("sm_103a", name, {"NUM_CTAS": num_ctas})
+        assert loaded[-1] == ("sm_103a", name, definitions), key
+        expected = 148 if name in T1_PROGRAMS else 152
+        assert num_ctas == expected, key
+        spec = catalog.jit_spec("sm_103a", name, definitions)
+        if catalog.programs("sm_103a")[name].get("definitions"):
+            assert f"-DNUM_CTAS={expected}" in spec.extra_cuda_cflags, key
+            assert spec.name == f"{jit_spec_name(name, 'sm_103a')}_num_ctas{expected}"
+        seen.add(name)
+    assert seen >= T1_PROGRAMS

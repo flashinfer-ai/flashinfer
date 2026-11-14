@@ -18,14 +18,14 @@ import math
 
 import pytest
 import torch
-from tests.test_helpers.jit_utils import (
+from tests.jit.test_helpers.jit_utils import (
     gen_decode_attention_modules,
     gen_prefill_attention_modules,
 )
 
 import flashinfer
 from flashinfer.utils import has_flashinfer_jit_cache
-from tests.test_helpers.parametrize import (
+from tests.infra.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )

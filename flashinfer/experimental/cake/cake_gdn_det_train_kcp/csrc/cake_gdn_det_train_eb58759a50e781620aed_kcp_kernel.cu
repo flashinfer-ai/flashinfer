@@ -273,7 +273,7 @@ kernel_cake_gdn_det_train_eb58759a50e781620aed_kcp(const __grid_constant__ CUten
             int h0_slot = h0_index[seg];
             if (h0_slot >= 0) {
                 int h0_tile = (head / h0_hg * h0_n + h0_slot) * h0_hg + head % h0_hg;
-                long long h0_base = (long long)h0_tile * (long long)tile_stride * 16384 + (long long)(k_row * 128 + vbase);
+                long long h0_base = (long long)h0_tile * (long long)tile_stride * 16384ll + (long long)(k_row * 128 + vbase);
                 #pragma unroll
                 for (int blk = 0; blk < 8; blk++) {
                     #pragma unroll
@@ -474,7 +474,7 @@ kernel_cake_gdn_det_train_eb58759a50e781620aed_kcp(const __grid_constant__ CUten
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(hs_ready_addr);
-                long long u_base = ((long long)(row0 + c * 64 + t_row) * (long long)num_heads + (long long)head) * 128 + (long long)vbase;
+                long long u_base = ((long long)(row0 + c * 64 + t_row) * (long long)num_heads + (long long)head) * 128ll + (long long)vbase;
                 int col = lane_half * 16;
                 float uv[16];
                 {
@@ -667,7 +667,7 @@ kernel_cake_gdn_det_train_eb58759a50e781620aed_kcp(const __grid_constant__ CUten
             int out_slot = out_index[seg];
             if (out_slot >= 0) {
                 int out_tile = (head / out_hg * out_n + out_slot) * out_hg + head % out_hg;
-                long long out_base = (long long)out_tile * (long long)tile_stride * 16384 + (long long)(k_row * 128 + vbase);
+                long long out_base = (long long)out_tile * (long long)tile_stride * 16384ll + (long long)(k_row * 128 + vbase);
                 #pragma unroll
                 for (int blk_2 = 0; blk_2 < 8; blk_2++) {
                     float hf[16];

@@ -735,7 +735,7 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
                 }
                 __syncthreads();
                 if (peer_2 >= 0) {
-                    cp_async_bulk_gmem2smem(smem_v39_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_2])) + (unsigned long long)((unsigned long long)(peer_token_1 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block * 512) + 256) * (unsigned long long)2), hi_cols * 2, dispatch_arrived_hi_addr);
+                    cp_async_bulk_gmem2smem(smem_v39_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_2])) + (unsigned long long)((unsigned long long)(peer_token_1 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block * 512) + 256ull) * (unsigned long long)2), hi_cols * 2, dispatch_arrived_hi_addr);
                 } else if (tid < 128) {
                     #pragma unroll
                     for (int vec_1 = 0; vec_1 < 32; vec_1++) {
@@ -1715,7 +1715,7 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
                         }
                         __syncthreads();
                         if (peer_5 >= 0) {
-                            cp_async_bulk_gmem2smem(smem_v39_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer_5])) + (unsigned long long)((unsigned long long)(peer_token_4 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block_1 * 512) + 256) * (unsigned long long)2), hi_cols_1 * 2, dispatch_arrived_hi_addr);
+                            cp_async_bulk_gmem2smem(smem_v39_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer_5])) + (unsigned long long)((unsigned long long)(peer_token_4 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block_1 * 512) + 256ull) * (unsigned long long)2), hi_cols_1 * 2, dispatch_arrived_hi_addr);
                         } else if (tid < 128) {
                             #pragma unroll
                             for (int vec_4 = 0; vec_4 < 32; vec_4++) {
@@ -2407,7 +2407,7 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
                         }
                         __syncthreads();
                         if (peer_9 >= 0) {
-                            cp_async_bulk_gmem2smem(smem_v39_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_9])) + (unsigned long long)((unsigned long long)(peer_token_7 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block_2 * 512) + 256) * (unsigned long long)2), hi_cols_2 * 2, dispatch_arrived_hi_addr);
+                            cp_async_bulk_gmem2smem(smem_v39_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_9])) + (unsigned long long)((unsigned long long)(peer_token_7 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block_2 * 512) + 256ull) * (unsigned long long)2), hi_cols_2 * 2, dispatch_arrived_hi_addr);
                         } else if (tid < 128) {
                             #pragma unroll
                             for (int vec_7 = 0; vec_7 < 32; vec_7++) {

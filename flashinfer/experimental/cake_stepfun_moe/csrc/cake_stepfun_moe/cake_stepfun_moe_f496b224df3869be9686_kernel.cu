@@ -19,43 +19,6 @@
 #define CAKE_NEED_INT_WARP_UNIFORM
 #include "cake_stepfun_moe_device_common.cuh"
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 496
-#define TMEM_ACCUM_OFFSET 0
-#define TMEM_SFA_OFFSET 448
-#define TMEM_SFB_OFFSET 464
-#define NUM_K_PIPE_STAGES 5
-#define NUM_MMA_PIPE_STAGES 1
-#define NUM_WORK_PIPE_STAGES 3
-#define NUM_THROTTLE_PIPE_STAGES 3
-#define NUM_FAST_PIPE_STAGES 1
-#define NUM_EXIT_PIPE_STAGES 1
-#define SMEM_SMEM_A_OFF 1024
-#define SMEM_SMEM_A_STAGE_BYTES 16384
-#define SMEM_SMEM_A_STRIDE 16384
-#define SMEM_SMEM_B_OFF 82944
-#define SMEM_SMEM_B_STAGE_BYTES 16384
-#define SMEM_SMEM_B_STRIDE 16384
-#define SMEM_EPI_STAGING_OFF 164864
-#define SMEM_EPI_STAGING_STAGE_BYTES 16384
-#define SMEM_EPI_STAGING_STRIDE 16384
-#define SMEM_EPI_STAGING_U64_OFF 164864
-#define SMEM_EPI_STAGING_U64_STAGE_BYTES 16384
-#define SMEM_EPI_STAGING_U64_STRIDE 16384
-#define SMEM_SMEM_SFA_OFF 188416
-#define SMEM_SMEM_SFA_STAGE_BYTES 2048
-#define SMEM_SMEM_SFA_STRIDE 2048
-#define SMEM_SMEM_SFB_OFF 198656
-#define SMEM_SMEM_SFB_STAGE_BYTES 4096
-#define SMEM_SMEM_SFB_STRIDE 4096
-#define SMEM_WORK_RESPONSE_OFF 220160
-#define SMEM_WORK_RESPONSE_STAGE_BYTES 16
-#define SMEM_WORK_RESPONSE_STRIDE 16
-#define SMEM_FAST_RESPONSE_OFF 220208
-#define SMEM_FAST_RESPONSE_STAGE_BYTES 64
-#define SMEM_FAST_RESPONSE_STRIDE 64
-#define SMEM_TOTAL 220288
-#define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
 
@@ -110,7 +73,7 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_a_addr = smem + 1024;
     uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 82944);
@@ -128,8 +91,7 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
     unsigned int* fast_response = reinterpret_cast<unsigned int*>(smem_raw + 220208);
     const int fast_response_addr = smem + 220208;
 
-    // Mbarrier init (16 pipeline groups, 0 ordered-sequence groups, 56 barriers)
-    // Mbarriers at smem_raw[0..448)
+    // Mbarrier init (56 barriers at smem_raw[0..448))
 
     if (warp == 0) {
         // --- pipeline 'k_pipe' ---
@@ -184,12 +146,12 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
     if (warp == 0 || warp == 1 || warp == 2 || warp == 3 || warp == 8 || warp == 9 || warp == 10 || warp == 11) {
         asm volatile("barrier.sync.aligned %0, %1;" :: "r"(9), "r"(256) : "memory");
     }
-    const int taddr = (warp == 0 || warp == 1 || warp == 2 || warp == 3 || warp == 8 || warp == 9 || warp == 10 || warp == 11) ? tmem_addr_storage[0] : 0;
+    const unsigned int taddr = (warp == 0 || warp == 1 || warp == 2 || warp == 3 || warp == 8 || warp == 9 || warp == 10 || warp == 11) ? tmem_addr_storage[0] : 0;
+    const unsigned int tmem_accum = taddr;
+    const unsigned int tmem_sfa = taddr + 448;
+    const unsigned int tmem_sfb = taddr + 464;
 
     // Kernel post-init ops
-    const int tmem_accum = taddr;
-    const int tmem_sfa = taddr + 448;
-    const int tmem_sfb = taddr + 464;
     if (warp >= 4 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
     }
@@ -213,1268 +175,1269 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
             unsigned int packed[2];
             unsigned long long packed_word = 0;
             float frag[64];
-            unsigned int _phase_mma_full_0 = 0;
+            unsigned int _phase_mma_full = 0;
             unsigned int _phase_work_full = 0;
             #pragma unroll 1
             for (unsigned int _tile_iter = 0; _tile_iter < grid_m / 2 * grid_n; _tile_iter++) {
                 int valid_rows = tile_mn_limit[n_tile] - (int)n_tile * 256;
-                if (tile_count > (int)n_tile) {
-                    if (valid_rows > 0) {
-                        int expert_e = tile_expert[n_tile];
-                        float sc = scale_c[expert_e];
-                        mbarrier_wait(mma_full_addr, _phase_mma_full_0);
-                        _phase_mma_full_0 ^= 1;
-                        asm volatile("tcgen05.fence::after_thread_sync;");
-                        int token_block = 0;
-                        if (epilogue_local_idx == 0) {
-                            token_block = 3;
-                        }
-                        unsigned int acc_col = epilogue_local_idx * 192 + (unsigned int)(token_block * 64);
-                        float _tmem_load_0[32];
-                        asm volatile(
-                            "tcgen05.ld.sync.aligned.16x256b.x8.b32"
-                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[31]))
-                            : "r"(taddr + row_addr + acc_col));
-                        asm volatile("tcgen05.wait::ld.sync.aligned;");
-                        float _tmem_load_1[32];
-                        asm volatile(
-                            "tcgen05.ld.sync.aligned.16x256b.x8.b32"
-                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[31]))
-                            : "r"(taddr + row_addr + 1048576 + acc_col));
-                        asm volatile("tcgen05.wait::ld.sync.aligned;");
-                        for (int i = 0; i < 32; i++) {
-                            frag[i] = _tmem_load_0[i];
-                            frag[32 + i] = _tmem_load_1[i];
-                        }
-                        asm volatile("tcgen05.fence::before_thread_sync;");
-                        asm volatile(
-                            "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
-                            :: "r"((mma_free_addr) & 0xFEFFFFFF) : "memory");
-                        asm volatile("cp.async.bulk.wait_group.read 0;");
-                        asm volatile("barrier.sync 7, 128;" ::: "memory");
-                        int token = base_token;
-                        converted[0] = mul_f32_rn_noftz(frag[0], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[2], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[32], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[34], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature = token % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token * 64 + (base_feature ^ swizzle_feature)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token * 64 + (base_feature - 64 ^ swizzle_feature)) / 4] = packed_word;
-                        }
-                        int token_0 = base_token + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[1], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[3], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[33], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[35], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_1 = token_0 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_0 * 64 + (base_feature ^ swizzle_feature_1)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_0 * 64 + (base_feature - 64 ^ swizzle_feature_1)) / 4] = packed_word;
-                        }
-                        int token_2 = base_token + 8;
-                        converted[0] = mul_f32_rn_noftz(frag[4], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[6], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[36], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[38], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_3 = token_2 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_2 * 64 + (base_feature ^ swizzle_feature_3)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_2 * 64 + (base_feature - 64 ^ swizzle_feature_3)) / 4] = packed_word;
-                        }
-                        int token_4 = base_token + 8 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[5], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[7], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[37], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[39], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_5 = token_4 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_4 * 64 + (base_feature ^ swizzle_feature_5)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_4 * 64 + (base_feature - 64 ^ swizzle_feature_5)) / 4] = packed_word;
-                        }
-                        int token_6 = base_token + 16;
-                        converted[0] = mul_f32_rn_noftz(frag[8], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[10], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[40], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[42], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_7 = token_6 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_6 * 64 + (base_feature ^ swizzle_feature_7)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_6 * 64 + (base_feature - 64 ^ swizzle_feature_7)) / 4] = packed_word;
-                        }
-                        int token_8 = base_token + 16 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[9], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[11], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[41], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[43], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_9 = token_8 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_8 * 64 + (base_feature ^ swizzle_feature_9)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_8 * 64 + (base_feature - 64 ^ swizzle_feature_9)) / 4] = packed_word;
-                        }
-                        int token_10 = base_token + 24;
-                        converted[0] = mul_f32_rn_noftz(frag[12], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[14], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[44], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[46], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_11 = token_10 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_10 * 64 + (base_feature ^ swizzle_feature_11)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_10 * 64 + (base_feature - 64 ^ swizzle_feature_11)) / 4] = packed_word;
-                        }
-                        int token_12 = base_token + 24 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[13], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[15], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[45], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[47], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_13 = token_12 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_12 * 64 + (base_feature ^ swizzle_feature_13)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_12 * 64 + (base_feature - 64 ^ swizzle_feature_13)) / 4] = packed_word;
-                        }
-                        int token_14 = base_token + 32;
-                        converted[0] = mul_f32_rn_noftz(frag[16], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[18], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[48], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[50], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_15 = token_14 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_14 * 64 + (base_feature ^ swizzle_feature_15)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_14 * 64 + (base_feature - 64 ^ swizzle_feature_15)) / 4] = packed_word;
-                        }
-                        int token_16 = base_token + 32 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[17], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[19], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[49], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[51], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_17 = token_16 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_16 * 64 + (base_feature ^ swizzle_feature_17)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_16 * 64 + (base_feature - 64 ^ swizzle_feature_17)) / 4] = packed_word;
-                        }
-                        int token_18 = base_token + 40;
-                        converted[0] = mul_f32_rn_noftz(frag[20], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[22], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[52], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[54], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_19 = token_18 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_18 * 64 + (base_feature ^ swizzle_feature_19)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_18 * 64 + (base_feature - 64 ^ swizzle_feature_19)) / 4] = packed_word;
-                        }
-                        int token_20 = base_token + 40 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[21], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[23], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[53], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[55], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_21 = token_20 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_20 * 64 + (base_feature ^ swizzle_feature_21)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_20 * 64 + (base_feature - 64 ^ swizzle_feature_21)) / 4] = packed_word;
-                        }
-                        int token_22 = base_token + 48;
-                        converted[0] = mul_f32_rn_noftz(frag[24], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[26], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[56], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[58], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_23 = token_22 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_22 * 64 + (base_feature ^ swizzle_feature_23)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_22 * 64 + (base_feature - 64 ^ swizzle_feature_23)) / 4] = packed_word;
-                        }
-                        int token_24 = base_token + 48 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[25], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[27], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[57], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[59], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_25 = token_24 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_24 * 64 + (base_feature ^ swizzle_feature_25)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_24 * 64 + (base_feature - 64 ^ swizzle_feature_25)) / 4] = packed_word;
-                        }
-                        int token_26 = base_token + 56;
-                        converted[0] = mul_f32_rn_noftz(frag[28], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[30], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[60], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[62], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_27 = token_26 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_26 * 64 + (base_feature ^ swizzle_feature_27)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_26 * 64 + (base_feature - 64 ^ swizzle_feature_27)) / 4] = packed_word;
-                        }
-                        int token_28 = base_token + 56 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[29], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[31], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[61], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[63], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_29 = token_28 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_28 * 64 + (base_feature ^ swizzle_feature_29)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_28 * 64 + (base_feature - 64 ^ swizzle_feature_29)) / 4] = packed_word;
-                        }
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        asm volatile("barrier.sync 7, 128;" ::: "memory");
-                        if (warp == 0) {
-                            if (elect_sync()) {
-                                int padding_rows = (256 - valid_rows % 256) % 256;
-                                tma_store_4d((&C), m_tile * 128, padding_rows + token_block * 64, 1073741824, n_tile * 256 - (unsigned int)padding_rows + 1073741824, epi_staging_addr);
-                                tma_store_4d((&C), m_tile * 128 + 64, padding_rows + token_block * 64, 1073741824, n_tile * 256 - (unsigned int)padding_rows + 1073741824, epi_staging_addr + 8192);
-                            }
-                        }
-                        asm volatile("cp.async.bulk.commit_group;");
-                        asm volatile("barrier.sync 7, 128;" ::: "memory");
-                        asm volatile("tcgen05.fence::after_thread_sync;");
-                        int token_block_30 = 1;
-                        if (epilogue_local_idx == 0) {
-                            token_block_30 = 0;
-                        }
-                        unsigned int acc_col_31 = epilogue_local_idx * 192 + (unsigned int)(token_block_30 * 64);
-                        float _tmem_load_2[32];
-                        asm volatile(
-                            "tcgen05.ld.sync.aligned.16x256b.x8.b32"
-                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[31]))
-                            : "r"(taddr + row_addr + acc_col_31));
-                        asm volatile("tcgen05.wait::ld.sync.aligned;");
-                        float _tmem_load_3[32];
-                        asm volatile(
-                            "tcgen05.ld.sync.aligned.16x256b.x8.b32"
-                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[31]))
-                            : "r"(taddr + row_addr + 1048576 + acc_col_31));
-                        asm volatile("tcgen05.wait::ld.sync.aligned;");
-                        for (int i_1 = 0; i_1 < 32; i_1++) {
-                            frag[i_1] = _tmem_load_2[i_1];
-                            frag[32 + i_1] = _tmem_load_3[i_1];
-                        }
-                        asm volatile("cp.async.bulk.wait_group.read 0;");
-                        asm volatile("tcgen05.fence::before_thread_sync;");
-                        asm volatile("barrier.sync 7, 128;" ::: "memory");
-                        int token_32 = base_token;
-                        converted[0] = mul_f32_rn_noftz(frag[0], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[2], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[32], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[34], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_33 = token_32 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_32 * 64 + (base_feature ^ swizzle_feature_33)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_32 * 64 + (base_feature - 64 ^ swizzle_feature_33)) / 4] = packed_word;
-                        }
-                        int token_34 = base_token + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[1], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[3], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[33], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[35], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_35 = token_34 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_34 * 64 + (base_feature ^ swizzle_feature_35)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_34 * 64 + (base_feature - 64 ^ swizzle_feature_35)) / 4] = packed_word;
-                        }
-                        int token_36 = base_token + 8;
-                        converted[0] = mul_f32_rn_noftz(frag[4], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[6], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[36], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[38], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_37 = token_36 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_36 * 64 + (base_feature ^ swizzle_feature_37)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_36 * 64 + (base_feature - 64 ^ swizzle_feature_37)) / 4] = packed_word;
-                        }
-                        int token_38 = base_token + 8 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[5], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[7], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[37], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[39], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_39 = token_38 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_38 * 64 + (base_feature ^ swizzle_feature_39)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_38 * 64 + (base_feature - 64 ^ swizzle_feature_39)) / 4] = packed_word;
-                        }
-                        int token_40 = base_token + 16;
-                        converted[0] = mul_f32_rn_noftz(frag[8], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[10], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[40], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[42], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_41 = token_40 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_40 * 64 + (base_feature ^ swizzle_feature_41)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_40 * 64 + (base_feature - 64 ^ swizzle_feature_41)) / 4] = packed_word;
-                        }
-                        int token_42 = base_token + 16 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[9], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[11], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[41], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[43], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_43 = token_42 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_42 * 64 + (base_feature ^ swizzle_feature_43)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_42 * 64 + (base_feature - 64 ^ swizzle_feature_43)) / 4] = packed_word;
-                        }
-                        int token_44 = base_token + 24;
-                        converted[0] = mul_f32_rn_noftz(frag[12], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[14], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[44], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[46], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_45 = token_44 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_44 * 64 + (base_feature ^ swizzle_feature_45)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_44 * 64 + (base_feature - 64 ^ swizzle_feature_45)) / 4] = packed_word;
-                        }
-                        int token_46 = base_token + 24 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[13], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[15], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[45], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[47], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_47 = token_46 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_46 * 64 + (base_feature ^ swizzle_feature_47)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_46 * 64 + (base_feature - 64 ^ swizzle_feature_47)) / 4] = packed_word;
-                        }
-                        int token_48 = base_token + 32;
-                        converted[0] = mul_f32_rn_noftz(frag[16], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[18], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[48], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[50], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_49 = token_48 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_48 * 64 + (base_feature ^ swizzle_feature_49)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_48 * 64 + (base_feature - 64 ^ swizzle_feature_49)) / 4] = packed_word;
-                        }
-                        int token_50 = base_token + 32 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[17], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[19], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[49], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[51], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_51 = token_50 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_50 * 64 + (base_feature ^ swizzle_feature_51)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_50 * 64 + (base_feature - 64 ^ swizzle_feature_51)) / 4] = packed_word;
-                        }
-                        int token_52 = base_token + 40;
-                        converted[0] = mul_f32_rn_noftz(frag[20], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[22], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[52], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[54], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_53 = token_52 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_52 * 64 + (base_feature ^ swizzle_feature_53)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_52 * 64 + (base_feature - 64 ^ swizzle_feature_53)) / 4] = packed_word;
-                        }
-                        int token_54 = base_token + 40 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[21], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[23], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[53], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[55], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_55 = token_54 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_54 * 64 + (base_feature ^ swizzle_feature_55)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_54 * 64 + (base_feature - 64 ^ swizzle_feature_55)) / 4] = packed_word;
-                        }
-                        int token_56 = base_token + 48;
-                        converted[0] = mul_f32_rn_noftz(frag[24], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[26], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[56], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[58], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_57 = token_56 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_56 * 64 + (base_feature ^ swizzle_feature_57)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_56 * 64 + (base_feature - 64 ^ swizzle_feature_57)) / 4] = packed_word;
-                        }
-                        int token_58 = base_token + 48 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[25], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[27], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[57], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[59], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_59 = token_58 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_58 * 64 + (base_feature ^ swizzle_feature_59)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_58 * 64 + (base_feature - 64 ^ swizzle_feature_59)) / 4] = packed_word;
-                        }
-                        int token_60 = base_token + 56;
-                        converted[0] = mul_f32_rn_noftz(frag[28], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[30], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[60], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[62], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_61 = token_60 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_60 * 64 + (base_feature ^ swizzle_feature_61)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_60 * 64 + (base_feature - 64 ^ swizzle_feature_61)) / 4] = packed_word;
-                        }
-                        int token_62 = base_token + 56 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[29], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[31], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[61], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[63], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_63 = token_62 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_62 * 64 + (base_feature ^ swizzle_feature_63)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_62 * 64 + (base_feature - 64 ^ swizzle_feature_63)) / 4] = packed_word;
-                        }
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        asm volatile("barrier.sync 7, 128;" ::: "memory");
-                        if (warp == 0) {
-                            if (elect_sync()) {
-                                int padding_rows_1 = (256 - valid_rows % 256) % 256;
-                                tma_store_4d((&C), m_tile * 128, padding_rows_1 + token_block_30 * 64, 1073741824, n_tile * 256 - (unsigned int)padding_rows_1 + 1073741824, epi_staging_addr);
-                                tma_store_4d((&C), m_tile * 128 + 64, padding_rows_1 + token_block_30 * 64, 1073741824, n_tile * 256 - (unsigned int)padding_rows_1 + 1073741824, epi_staging_addr + 8192);
-                            }
-                        }
-                        asm volatile("cp.async.bulk.commit_group;");
-                        asm volatile("barrier.sync 7, 128;" ::: "memory");
-                        asm volatile("tcgen05.fence::after_thread_sync;");
-                        int token_block_64 = 2;
-                        if (epilogue_local_idx == 0) {
-                            token_block_64 = 1;
-                        }
-                        unsigned int acc_col_65 = epilogue_local_idx * 192 + (unsigned int)(token_block_64 * 64);
-                        float _tmem_load_4[32];
-                        asm volatile(
-                            "tcgen05.ld.sync.aligned.16x256b.x8.b32"
-                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[31]))
-                            : "r"(taddr + row_addr + acc_col_65));
-                        asm volatile("tcgen05.wait::ld.sync.aligned;");
-                        float _tmem_load_5[32];
-                        asm volatile(
-                            "tcgen05.ld.sync.aligned.16x256b.x8.b32"
-                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_5[31]))
-                            : "r"(taddr + row_addr + 1048576 + acc_col_65));
-                        asm volatile("tcgen05.wait::ld.sync.aligned;");
-                        for (int i_2 = 0; i_2 < 32; i_2++) {
-                            frag[i_2] = _tmem_load_4[i_2];
-                            frag[32 + i_2] = _tmem_load_5[i_2];
-                        }
-                        asm volatile("cp.async.bulk.wait_group.read 0;");
-                        asm volatile("tcgen05.fence::before_thread_sync;");
-                        asm volatile("barrier.sync 7, 128;" ::: "memory");
-                        int token_66 = base_token;
-                        converted[0] = mul_f32_rn_noftz(frag[0], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[2], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[32], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[34], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_67 = token_66 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_66 * 64 + (base_feature ^ swizzle_feature_67)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_66 * 64 + (base_feature - 64 ^ swizzle_feature_67)) / 4] = packed_word;
-                        }
-                        int token_68 = base_token + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[1], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[3], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[33], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[35], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_69 = token_68 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_68 * 64 + (base_feature ^ swizzle_feature_69)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_68 * 64 + (base_feature - 64 ^ swizzle_feature_69)) / 4] = packed_word;
-                        }
-                        int token_70 = base_token + 8;
-                        converted[0] = mul_f32_rn_noftz(frag[4], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[6], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[36], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[38], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_71 = token_70 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_70 * 64 + (base_feature ^ swizzle_feature_71)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_70 * 64 + (base_feature - 64 ^ swizzle_feature_71)) / 4] = packed_word;
-                        }
-                        int token_72 = base_token + 8 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[5], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[7], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[37], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[39], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_73 = token_72 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_72 * 64 + (base_feature ^ swizzle_feature_73)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_72 * 64 + (base_feature - 64 ^ swizzle_feature_73)) / 4] = packed_word;
-                        }
-                        int token_74 = base_token + 16;
-                        converted[0] = mul_f32_rn_noftz(frag[8], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[10], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[40], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[42], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_75 = token_74 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_74 * 64 + (base_feature ^ swizzle_feature_75)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_74 * 64 + (base_feature - 64 ^ swizzle_feature_75)) / 4] = packed_word;
-                        }
-                        int token_76 = base_token + 16 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[9], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[11], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[41], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[43], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_77 = token_76 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_76 * 64 + (base_feature ^ swizzle_feature_77)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_76 * 64 + (base_feature - 64 ^ swizzle_feature_77)) / 4] = packed_word;
-                        }
-                        int token_78 = base_token + 24;
-                        converted[0] = mul_f32_rn_noftz(frag[12], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[14], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[44], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[46], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_79 = token_78 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_78 * 64 + (base_feature ^ swizzle_feature_79)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_78 * 64 + (base_feature - 64 ^ swizzle_feature_79)) / 4] = packed_word;
-                        }
-                        int token_80 = base_token + 24 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[13], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[15], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[45], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[47], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_81 = token_80 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_80 * 64 + (base_feature ^ swizzle_feature_81)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_80 * 64 + (base_feature - 64 ^ swizzle_feature_81)) / 4] = packed_word;
-                        }
-                        int token_82 = base_token + 32;
-                        converted[0] = mul_f32_rn_noftz(frag[16], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[18], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[48], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[50], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_83 = token_82 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_82 * 64 + (base_feature ^ swizzle_feature_83)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_82 * 64 + (base_feature - 64 ^ swizzle_feature_83)) / 4] = packed_word;
-                        }
-                        int token_84 = base_token + 32 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[17], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[19], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[49], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[51], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_85 = token_84 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_84 * 64 + (base_feature ^ swizzle_feature_85)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_84 * 64 + (base_feature - 64 ^ swizzle_feature_85)) / 4] = packed_word;
-                        }
-                        int token_86 = base_token + 40;
-                        converted[0] = mul_f32_rn_noftz(frag[20], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[22], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[52], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[54], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_87 = token_86 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_86 * 64 + (base_feature ^ swizzle_feature_87)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_86 * 64 + (base_feature - 64 ^ swizzle_feature_87)) / 4] = packed_word;
-                        }
-                        int token_88 = base_token + 40 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[21], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[23], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[53], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[55], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_89 = token_88 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_88 * 64 + (base_feature ^ swizzle_feature_89)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_88 * 64 + (base_feature - 64 ^ swizzle_feature_89)) / 4] = packed_word;
-                        }
-                        int token_90 = base_token + 48;
-                        converted[0] = mul_f32_rn_noftz(frag[24], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[26], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[56], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[58], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_91 = token_90 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_90 * 64 + (base_feature ^ swizzle_feature_91)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_90 * 64 + (base_feature - 64 ^ swizzle_feature_91)) / 4] = packed_word;
-                        }
-                        int token_92 = base_token + 48 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[25], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[27], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[57], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[59], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_93 = token_92 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_92 * 64 + (base_feature ^ swizzle_feature_93)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_92 * 64 + (base_feature - 64 ^ swizzle_feature_93)) / 4] = packed_word;
-                        }
-                        int token_94 = base_token + 56;
-                        converted[0] = mul_f32_rn_noftz(frag[28], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[30], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[60], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[62], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_95 = token_94 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_94 * 64 + (base_feature ^ swizzle_feature_95)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_94 * 64 + (base_feature - 64 ^ swizzle_feature_95)) / 4] = packed_word;
-                        }
-                        int token_96 = base_token + 56 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[29], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[31], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[61], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[63], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_97 = token_96 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_96 * 64 + (base_feature ^ swizzle_feature_97)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_96 * 64 + (base_feature - 64 ^ swizzle_feature_97)) / 4] = packed_word;
-                        }
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        asm volatile("barrier.sync 7, 128;" ::: "memory");
-                        if (warp == 0) {
-                            if (elect_sync()) {
-                                int padding_rows_2 = (256 - valid_rows % 256) % 256;
-                                tma_store_4d((&C), m_tile * 128, padding_rows_2 + token_block_64 * 64, 1073741824, n_tile * 256 - (unsigned int)padding_rows_2 + 1073741824, epi_staging_addr);
-                                tma_store_4d((&C), m_tile * 128 + 64, padding_rows_2 + token_block_64 * 64, 1073741824, n_tile * 256 - (unsigned int)padding_rows_2 + 1073741824, epi_staging_addr + 8192);
-                            }
-                        }
-                        asm volatile("cp.async.bulk.commit_group;");
-                        asm volatile("barrier.sync 7, 128;" ::: "memory");
-                        asm volatile("tcgen05.fence::after_thread_sync;");
-                        int token_block_98 = 3;
-                        if (epilogue_local_idx == 0) {
-                            token_block_98 = 2;
-                        }
-                        unsigned int acc_col_99 = epilogue_local_idx * 192 + (unsigned int)(token_block_98 * 64);
-                        float _tmem_load_6[32];
-                        asm volatile(
-                            "tcgen05.ld.sync.aligned.16x256b.x8.b32"
-                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[31]))
-                            : "r"(taddr + row_addr + acc_col_99));
-                        asm volatile("tcgen05.wait::ld.sync.aligned;");
-                        float _tmem_load_7[32];
-                        asm volatile(
-                            "tcgen05.ld.sync.aligned.16x256b.x8.b32"
-                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[31]))
-                            : "r"(taddr + row_addr + 1048576 + acc_col_99));
-                        asm volatile("tcgen05.wait::ld.sync.aligned;");
-                        for (int i_3 = 0; i_3 < 32; i_3++) {
-                            frag[i_3] = _tmem_load_6[i_3];
-                            frag[32 + i_3] = _tmem_load_7[i_3];
-                        }
-                        asm volatile("cp.async.bulk.wait_group.read 0;");
-                        asm volatile("tcgen05.fence::before_thread_sync;");
-                        asm volatile("barrier.sync 7, 128;" ::: "memory");
-                        int token_100 = base_token;
-                        converted[0] = mul_f32_rn_noftz(frag[0], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[2], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[32], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[34], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_101 = token_100 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_100 * 64 + (base_feature ^ swizzle_feature_101)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_100 * 64 + (base_feature - 64 ^ swizzle_feature_101)) / 4] = packed_word;
-                        }
-                        int token_102 = base_token + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[1], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[3], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[33], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[35], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_103 = token_102 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_102 * 64 + (base_feature ^ swizzle_feature_103)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_102 * 64 + (base_feature - 64 ^ swizzle_feature_103)) / 4] = packed_word;
-                        }
-                        int token_104 = base_token + 8;
-                        converted[0] = mul_f32_rn_noftz(frag[4], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[6], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[36], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[38], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_105 = token_104 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_104 * 64 + (base_feature ^ swizzle_feature_105)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_104 * 64 + (base_feature - 64 ^ swizzle_feature_105)) / 4] = packed_word;
-                        }
-                        int token_106 = base_token + 8 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[5], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[7], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[37], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[39], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_107 = token_106 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_106 * 64 + (base_feature ^ swizzle_feature_107)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_106 * 64 + (base_feature - 64 ^ swizzle_feature_107)) / 4] = packed_word;
-                        }
-                        int token_108 = base_token + 16;
-                        converted[0] = mul_f32_rn_noftz(frag[8], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[10], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[40], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[42], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_109 = token_108 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_108 * 64 + (base_feature ^ swizzle_feature_109)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_108 * 64 + (base_feature - 64 ^ swizzle_feature_109)) / 4] = packed_word;
-                        }
-                        int token_110 = base_token + 16 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[9], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[11], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[41], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[43], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_111 = token_110 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_110 * 64 + (base_feature ^ swizzle_feature_111)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_110 * 64 + (base_feature - 64 ^ swizzle_feature_111)) / 4] = packed_word;
-                        }
-                        int token_112 = base_token + 24;
-                        converted[0] = mul_f32_rn_noftz(frag[12], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[14], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[44], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[46], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_113 = token_112 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_112 * 64 + (base_feature ^ swizzle_feature_113)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_112 * 64 + (base_feature - 64 ^ swizzle_feature_113)) / 4] = packed_word;
-                        }
-                        int token_114 = base_token + 24 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[13], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[15], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[45], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[47], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_115 = token_114 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_114 * 64 + (base_feature ^ swizzle_feature_115)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_114 * 64 + (base_feature - 64 ^ swizzle_feature_115)) / 4] = packed_word;
-                        }
-                        int token_116 = base_token + 32;
-                        converted[0] = mul_f32_rn_noftz(frag[16], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[18], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[48], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[50], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_117 = token_116 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_116 * 64 + (base_feature ^ swizzle_feature_117)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_116 * 64 + (base_feature - 64 ^ swizzle_feature_117)) / 4] = packed_word;
-                        }
-                        int token_118 = base_token + 32 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[17], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[19], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[49], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[51], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_119 = token_118 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_118 * 64 + (base_feature ^ swizzle_feature_119)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_118 * 64 + (base_feature - 64 ^ swizzle_feature_119)) / 4] = packed_word;
-                        }
-                        int token_120 = base_token + 40;
-                        converted[0] = mul_f32_rn_noftz(frag[20], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[22], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[52], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[54], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_121 = token_120 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_120 * 64 + (base_feature ^ swizzle_feature_121)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_120 * 64 + (base_feature - 64 ^ swizzle_feature_121)) / 4] = packed_word;
-                        }
-                        int token_122 = base_token + 40 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[21], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[23], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[53], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[55], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_123 = token_122 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_122 * 64 + (base_feature ^ swizzle_feature_123)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_122 * 64 + (base_feature - 64 ^ swizzle_feature_123)) / 4] = packed_word;
-                        }
-                        int token_124 = base_token + 48;
-                        converted[0] = mul_f32_rn_noftz(frag[24], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[26], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[56], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[58], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_125 = token_124 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_124 * 64 + (base_feature ^ swizzle_feature_125)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_124 * 64 + (base_feature - 64 ^ swizzle_feature_125)) / 4] = packed_word;
-                        }
-                        int token_126 = base_token + 48 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[25], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[27], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[57], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[59], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_127 = token_126 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_126 * 64 + (base_feature ^ swizzle_feature_127)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_126 * 64 + (base_feature - 64 ^ swizzle_feature_127)) / 4] = packed_word;
-                        }
-                        int token_128 = base_token + 56;
-                        converted[0] = mul_f32_rn_noftz(frag[28], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[30], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[60], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[62], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_129 = token_128 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_128 * 64 + (base_feature ^ swizzle_feature_129)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_128 * 64 + (base_feature - 64 ^ swizzle_feature_129)) / 4] = packed_word;
-                        }
-                        int token_130 = base_token + 56 + 1;
-                        converted[0] = mul_f32_rn_noftz(frag[29], sc);
-                        converted[1] = mul_f32_rn_noftz(frag[31], sc);
-                        converted[2] = mul_f32_rn_noftz(frag[61], sc);
-                        converted[3] = mul_f32_rn_noftz(frag[63], sc);
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 2; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
-                            packed[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                        int swizzle_feature_131 = token_130 % 8 * 8;
-                        if (base_feature < 64) {
-                            epi_staging_u64[(token_130 * 64 + (base_feature ^ swizzle_feature_131)) / 4] = packed_word;
-                        } else {
-                            epi_staging_u64[(4096 + token_130 * 64 + (base_feature - 64 ^ swizzle_feature_131)) / 4] = packed_word;
-                        }
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        asm volatile("barrier.sync 7, 128;" ::: "memory");
-                        if (warp == 0) {
-                            if (elect_sync()) {
-                                int padding_rows_3 = (256 - valid_rows % 256) % 256;
-                                tma_store_4d((&C), m_tile * 128, padding_rows_3 + token_block_98 * 64, 1073741824, n_tile * 256 - (unsigned int)padding_rows_3 + 1073741824, epi_staging_addr);
-                                tma_store_4d((&C), m_tile * 128 + 64, padding_rows_3 + token_block_98 * 64, 1073741824, n_tile * 256 - (unsigned int)padding_rows_3 + 1073741824, epi_staging_addr + 8192);
-                            }
-                        }
-                        asm volatile("cp.async.bulk.commit_group;");
-                        asm volatile("barrier.sync 7, 128;" ::: "memory");
-                        epilogue_local_idx = epilogue_local_idx ^ 1;
+                if (tile_count <= (int)n_tile) {
+                    break;
+                }
+                if (valid_rows > 0) {
+                    int expert_e = tile_expert[n_tile];
+                    float sc = scale_c[expert_e];
+                    mbarrier_wait(mma_full_addr, _phase_mma_full);
+                    asm volatile("tcgen05.fence::after_thread_sync;");
+                    int token_block_0 = 0;
+                    if (epilogue_local_idx == 0) {
+                        token_block_0 = 3;
                     }
+                    unsigned int acc_col_0 = epilogue_local_idx * 192 + (unsigned int)(token_block_0 * 64);
+                    float _tmem_load_0_0[32];
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_0[31]))
+                        : "r"(taddr + row_addr + acc_col_0));
+                    asm volatile("tcgen05.wait::ld.sync.aligned;");
+                    float _tmem_load_1_0[32];
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_0[31]))
+                        : "r"(taddr + row_addr + 1048576 + acc_col_0));
+                    asm volatile("tcgen05.wait::ld.sync.aligned;");
+                    for (int i_0 = 0; i_0 < 32; i_0++) {
+                        frag[i_0] = _tmem_load_0_0[i_0];
+                        frag[32 + i_0] = _tmem_load_1_0[i_0];
+                    }
+                    asm volatile("tcgen05.fence::before_thread_sync;");
+                    asm volatile(
+                        "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
+                        :: "r"((mma_free_addr) & 0xFEFFFFFF) : "memory");
+                    asm volatile("cp.async.bulk.wait_group.read 0;");
+                    asm volatile("barrier.sync 7, 128;" ::: "memory");
+                    int token_1_0 = base_token;
+                    converted[0] = mul_f32_rn_noftz(frag[0], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[2], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[32], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[34], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_0 = token_1_0 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_0 * 64 + (base_feature ^ swizzle_feature_1_0)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_0 * 64 + (base_feature - 64 ^ swizzle_feature_1_0)) / 4] = packed_word;
+                    }
+                    int token_1_1 = base_token + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[1], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[3], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[33], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[35], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_1 = token_1_1 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_1 * 64 + (base_feature ^ swizzle_feature_1_1)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_1 * 64 + (base_feature - 64 ^ swizzle_feature_1_1)) / 4] = packed_word;
+                    }
+                    int token_1_2 = base_token + 8;
+                    converted[0] = mul_f32_rn_noftz(frag[4], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[6], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[36], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[38], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_2 = token_1_2 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_2 * 64 + (base_feature ^ swizzle_feature_1_2)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_2 * 64 + (base_feature - 64 ^ swizzle_feature_1_2)) / 4] = packed_word;
+                    }
+                    int token_1_3 = base_token + 8 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[5], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[7], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[37], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[39], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_3 = token_1_3 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_3 * 64 + (base_feature ^ swizzle_feature_1_3)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_3 * 64 + (base_feature - 64 ^ swizzle_feature_1_3)) / 4] = packed_word;
+                    }
+                    int token_1_4 = base_token + 16;
+                    converted[0] = mul_f32_rn_noftz(frag[8], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[10], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[40], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[42], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_4 = token_1_4 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_4 * 64 + (base_feature ^ swizzle_feature_1_4)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_4 * 64 + (base_feature - 64 ^ swizzle_feature_1_4)) / 4] = packed_word;
+                    }
+                    int token_1_5 = base_token + 16 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[9], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[11], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[41], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[43], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_5 = token_1_5 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_5 * 64 + (base_feature ^ swizzle_feature_1_5)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_5 * 64 + (base_feature - 64 ^ swizzle_feature_1_5)) / 4] = packed_word;
+                    }
+                    int token_1_6 = base_token + 24;
+                    converted[0] = mul_f32_rn_noftz(frag[12], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[14], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[44], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[46], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_6 = token_1_6 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_6 * 64 + (base_feature ^ swizzle_feature_1_6)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_6 * 64 + (base_feature - 64 ^ swizzle_feature_1_6)) / 4] = packed_word;
+                    }
+                    int token_1_7 = base_token + 24 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[13], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[15], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[45], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[47], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_7 = token_1_7 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_7 * 64 + (base_feature ^ swizzle_feature_1_7)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_7 * 64 + (base_feature - 64 ^ swizzle_feature_1_7)) / 4] = packed_word;
+                    }
+                    int token_1_8 = base_token + 32;
+                    converted[0] = mul_f32_rn_noftz(frag[16], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[18], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[48], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[50], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_8 = token_1_8 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_8 * 64 + (base_feature ^ swizzle_feature_1_8)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_8 * 64 + (base_feature - 64 ^ swizzle_feature_1_8)) / 4] = packed_word;
+                    }
+                    int token_1_9 = base_token + 32 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[17], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[19], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[49], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[51], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_9 = token_1_9 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_9 * 64 + (base_feature ^ swizzle_feature_1_9)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_9 * 64 + (base_feature - 64 ^ swizzle_feature_1_9)) / 4] = packed_word;
+                    }
+                    int token_1_10 = base_token + 40;
+                    converted[0] = mul_f32_rn_noftz(frag[20], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[22], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[52], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[54], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_10 = token_1_10 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_10 * 64 + (base_feature ^ swizzle_feature_1_10)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_10 * 64 + (base_feature - 64 ^ swizzle_feature_1_10)) / 4] = packed_word;
+                    }
+                    int token_1_11 = base_token + 40 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[21], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[23], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[53], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[55], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_11 = token_1_11 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_11 * 64 + (base_feature ^ swizzle_feature_1_11)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_11 * 64 + (base_feature - 64 ^ swizzle_feature_1_11)) / 4] = packed_word;
+                    }
+                    int token_1_12 = base_token + 48;
+                    converted[0] = mul_f32_rn_noftz(frag[24], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[26], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[56], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[58], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_12 = token_1_12 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_12 * 64 + (base_feature ^ swizzle_feature_1_12)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_12 * 64 + (base_feature - 64 ^ swizzle_feature_1_12)) / 4] = packed_word;
+                    }
+                    int token_1_13 = base_token + 48 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[25], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[27], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[57], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[59], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_13 = token_1_13 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_13 * 64 + (base_feature ^ swizzle_feature_1_13)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_13 * 64 + (base_feature - 64 ^ swizzle_feature_1_13)) / 4] = packed_word;
+                    }
+                    int token_1_14 = base_token + 56;
+                    converted[0] = mul_f32_rn_noftz(frag[28], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[30], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[60], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[62], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_14 = token_1_14 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_14 * 64 + (base_feature ^ swizzle_feature_1_14)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_14 * 64 + (base_feature - 64 ^ swizzle_feature_1_14)) / 4] = packed_word;
+                    }
+                    int token_1_15 = base_token + 56 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[29], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[31], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[61], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[63], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_15 = token_1_15 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_15 * 64 + (base_feature ^ swizzle_feature_1_15)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_15 * 64 + (base_feature - 64 ^ swizzle_feature_1_15)) / 4] = packed_word;
+                    }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    asm volatile("barrier.sync 7, 128;" ::: "memory");
+                    if (warp == 0) {
+                        if (elect_sync()) {
+                            int padding_rows_0 = (256 - valid_rows % 256) % 256;
+                            tma_store_4d((&C), m_tile * 128, padding_rows_0 + token_block_0 * 64, 1073741824, n_tile * 256 - (unsigned int)padding_rows_0 + 1073741824, epi_staging_addr);
+                            tma_store_4d((&C), m_tile * 128 + 64, padding_rows_0 + token_block_0 * 64, 1073741824, n_tile * 256 - (unsigned int)padding_rows_0 + 1073741824, epi_staging_addr + 8192);
+                        }
+                    }
+                    asm volatile("cp.async.bulk.commit_group;");
+                    asm volatile("barrier.sync 7, 128;" ::: "memory");
+                    asm volatile("tcgen05.fence::after_thread_sync;");
+                    int token_block_1 = 1;
+                    if (epilogue_local_idx == 0) {
+                        token_block_1 = 0;
+                    }
+                    unsigned int acc_col_1 = epilogue_local_idx * 192 + (unsigned int)(token_block_1 * 64);
+                    float _tmem_load_0_1[32];
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_1[31]))
+                        : "r"(taddr + row_addr + acc_col_1));
+                    asm volatile("tcgen05.wait::ld.sync.aligned;");
+                    float _tmem_load_1_1[32];
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_1[31]))
+                        : "r"(taddr + row_addr + 1048576 + acc_col_1));
+                    asm volatile("tcgen05.wait::ld.sync.aligned;");
+                    for (int i_1 = 0; i_1 < 32; i_1++) {
+                        frag[i_1] = _tmem_load_0_1[i_1];
+                        frag[32 + i_1] = _tmem_load_1_1[i_1];
+                    }
+                    asm volatile("cp.async.bulk.wait_group.read 0;");
+                    asm volatile("tcgen05.fence::before_thread_sync;");
+                    asm volatile("barrier.sync 7, 128;" ::: "memory");
+                    int token_1_16 = base_token;
+                    converted[0] = mul_f32_rn_noftz(frag[0], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[2], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[32], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[34], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_16 = token_1_16 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_16 * 64 + (base_feature ^ swizzle_feature_1_16)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_16 * 64 + (base_feature - 64 ^ swizzle_feature_1_16)) / 4] = packed_word;
+                    }
+                    int token_1_17 = base_token + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[1], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[3], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[33], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[35], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_17 = token_1_17 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_17 * 64 + (base_feature ^ swizzle_feature_1_17)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_17 * 64 + (base_feature - 64 ^ swizzle_feature_1_17)) / 4] = packed_word;
+                    }
+                    int token_1_18 = base_token + 8;
+                    converted[0] = mul_f32_rn_noftz(frag[4], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[6], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[36], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[38], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_18 = token_1_18 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_18 * 64 + (base_feature ^ swizzle_feature_1_18)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_18 * 64 + (base_feature - 64 ^ swizzle_feature_1_18)) / 4] = packed_word;
+                    }
+                    int token_1_19 = base_token + 8 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[5], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[7], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[37], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[39], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_19 = token_1_19 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_19 * 64 + (base_feature ^ swizzle_feature_1_19)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_19 * 64 + (base_feature - 64 ^ swizzle_feature_1_19)) / 4] = packed_word;
+                    }
+                    int token_1_20 = base_token + 16;
+                    converted[0] = mul_f32_rn_noftz(frag[8], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[10], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[40], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[42], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_20 = token_1_20 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_20 * 64 + (base_feature ^ swizzle_feature_1_20)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_20 * 64 + (base_feature - 64 ^ swizzle_feature_1_20)) / 4] = packed_word;
+                    }
+                    int token_1_21 = base_token + 16 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[9], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[11], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[41], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[43], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_21 = token_1_21 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_21 * 64 + (base_feature ^ swizzle_feature_1_21)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_21 * 64 + (base_feature - 64 ^ swizzle_feature_1_21)) / 4] = packed_word;
+                    }
+                    int token_1_22 = base_token + 24;
+                    converted[0] = mul_f32_rn_noftz(frag[12], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[14], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[44], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[46], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_22 = token_1_22 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_22 * 64 + (base_feature ^ swizzle_feature_1_22)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_22 * 64 + (base_feature - 64 ^ swizzle_feature_1_22)) / 4] = packed_word;
+                    }
+                    int token_1_23 = base_token + 24 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[13], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[15], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[45], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[47], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_23 = token_1_23 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_23 * 64 + (base_feature ^ swizzle_feature_1_23)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_23 * 64 + (base_feature - 64 ^ swizzle_feature_1_23)) / 4] = packed_word;
+                    }
+                    int token_1_24 = base_token + 32;
+                    converted[0] = mul_f32_rn_noftz(frag[16], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[18], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[48], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[50], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_24 = token_1_24 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_24 * 64 + (base_feature ^ swizzle_feature_1_24)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_24 * 64 + (base_feature - 64 ^ swizzle_feature_1_24)) / 4] = packed_word;
+                    }
+                    int token_1_25 = base_token + 32 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[17], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[19], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[49], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[51], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_25 = token_1_25 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_25 * 64 + (base_feature ^ swizzle_feature_1_25)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_25 * 64 + (base_feature - 64 ^ swizzle_feature_1_25)) / 4] = packed_word;
+                    }
+                    int token_1_26 = base_token + 40;
+                    converted[0] = mul_f32_rn_noftz(frag[20], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[22], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[52], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[54], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_26 = token_1_26 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_26 * 64 + (base_feature ^ swizzle_feature_1_26)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_26 * 64 + (base_feature - 64 ^ swizzle_feature_1_26)) / 4] = packed_word;
+                    }
+                    int token_1_27 = base_token + 40 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[21], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[23], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[53], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[55], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_27 = token_1_27 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_27 * 64 + (base_feature ^ swizzle_feature_1_27)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_27 * 64 + (base_feature - 64 ^ swizzle_feature_1_27)) / 4] = packed_word;
+                    }
+                    int token_1_28 = base_token + 48;
+                    converted[0] = mul_f32_rn_noftz(frag[24], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[26], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[56], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[58], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_28 = token_1_28 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_28 * 64 + (base_feature ^ swizzle_feature_1_28)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_28 * 64 + (base_feature - 64 ^ swizzle_feature_1_28)) / 4] = packed_word;
+                    }
+                    int token_1_29 = base_token + 48 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[25], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[27], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[57], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[59], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_29 = token_1_29 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_29 * 64 + (base_feature ^ swizzle_feature_1_29)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_29 * 64 + (base_feature - 64 ^ swizzle_feature_1_29)) / 4] = packed_word;
+                    }
+                    int token_1_30 = base_token + 56;
+                    converted[0] = mul_f32_rn_noftz(frag[28], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[30], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[60], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[62], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_30 = token_1_30 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_30 * 64 + (base_feature ^ swizzle_feature_1_30)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_30 * 64 + (base_feature - 64 ^ swizzle_feature_1_30)) / 4] = packed_word;
+                    }
+                    int token_1_31 = base_token + 56 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[29], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[31], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[61], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[63], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_31 = token_1_31 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_31 * 64 + (base_feature ^ swizzle_feature_1_31)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_31 * 64 + (base_feature - 64 ^ swizzle_feature_1_31)) / 4] = packed_word;
+                    }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    asm volatile("barrier.sync 7, 128;" ::: "memory");
+                    if (warp == 0) {
+                        if (elect_sync()) {
+                            int padding_rows_1 = (256 - valid_rows % 256) % 256;
+                            tma_store_4d((&C), m_tile * 128, padding_rows_1 + token_block_1 * 64, 1073741824, n_tile * 256 - (unsigned int)padding_rows_1 + 1073741824, epi_staging_addr);
+                            tma_store_4d((&C), m_tile * 128 + 64, padding_rows_1 + token_block_1 * 64, 1073741824, n_tile * 256 - (unsigned int)padding_rows_1 + 1073741824, epi_staging_addr + 8192);
+                        }
+                    }
+                    asm volatile("cp.async.bulk.commit_group;");
+                    asm volatile("barrier.sync 7, 128;" ::: "memory");
+                    asm volatile("tcgen05.fence::after_thread_sync;");
+                    int token_block_2 = 2;
+                    if (epilogue_local_idx == 0) {
+                        token_block_2 = 1;
+                    }
+                    unsigned int acc_col_2 = epilogue_local_idx * 192 + (unsigned int)(token_block_2 * 64);
+                    float _tmem_load_0_2[32];
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_2[31]))
+                        : "r"(taddr + row_addr + acc_col_2));
+                    asm volatile("tcgen05.wait::ld.sync.aligned;");
+                    float _tmem_load_1_2[32];
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_2[31]))
+                        : "r"(taddr + row_addr + 1048576 + acc_col_2));
+                    asm volatile("tcgen05.wait::ld.sync.aligned;");
+                    for (int i_2 = 0; i_2 < 32; i_2++) {
+                        frag[i_2] = _tmem_load_0_2[i_2];
+                        frag[32 + i_2] = _tmem_load_1_2[i_2];
+                    }
+                    asm volatile("cp.async.bulk.wait_group.read 0;");
+                    asm volatile("tcgen05.fence::before_thread_sync;");
+                    asm volatile("barrier.sync 7, 128;" ::: "memory");
+                    int token_1_32 = base_token;
+                    converted[0] = mul_f32_rn_noftz(frag[0], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[2], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[32], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[34], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_32 = token_1_32 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_32 * 64 + (base_feature ^ swizzle_feature_1_32)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_32 * 64 + (base_feature - 64 ^ swizzle_feature_1_32)) / 4] = packed_word;
+                    }
+                    int token_1_33 = base_token + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[1], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[3], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[33], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[35], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_33 = token_1_33 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_33 * 64 + (base_feature ^ swizzle_feature_1_33)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_33 * 64 + (base_feature - 64 ^ swizzle_feature_1_33)) / 4] = packed_word;
+                    }
+                    int token_1_34 = base_token + 8;
+                    converted[0] = mul_f32_rn_noftz(frag[4], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[6], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[36], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[38], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_34 = token_1_34 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_34 * 64 + (base_feature ^ swizzle_feature_1_34)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_34 * 64 + (base_feature - 64 ^ swizzle_feature_1_34)) / 4] = packed_word;
+                    }
+                    int token_1_35 = base_token + 8 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[5], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[7], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[37], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[39], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_35 = token_1_35 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_35 * 64 + (base_feature ^ swizzle_feature_1_35)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_35 * 64 + (base_feature - 64 ^ swizzle_feature_1_35)) / 4] = packed_word;
+                    }
+                    int token_1_36 = base_token + 16;
+                    converted[0] = mul_f32_rn_noftz(frag[8], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[10], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[40], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[42], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_36 = token_1_36 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_36 * 64 + (base_feature ^ swizzle_feature_1_36)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_36 * 64 + (base_feature - 64 ^ swizzle_feature_1_36)) / 4] = packed_word;
+                    }
+                    int token_1_37 = base_token + 16 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[9], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[11], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[41], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[43], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_37 = token_1_37 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_37 * 64 + (base_feature ^ swizzle_feature_1_37)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_37 * 64 + (base_feature - 64 ^ swizzle_feature_1_37)) / 4] = packed_word;
+                    }
+                    int token_1_38 = base_token + 24;
+                    converted[0] = mul_f32_rn_noftz(frag[12], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[14], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[44], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[46], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_38 = token_1_38 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_38 * 64 + (base_feature ^ swizzle_feature_1_38)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_38 * 64 + (base_feature - 64 ^ swizzle_feature_1_38)) / 4] = packed_word;
+                    }
+                    int token_1_39 = base_token + 24 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[13], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[15], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[45], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[47], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_39 = token_1_39 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_39 * 64 + (base_feature ^ swizzle_feature_1_39)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_39 * 64 + (base_feature - 64 ^ swizzle_feature_1_39)) / 4] = packed_word;
+                    }
+                    int token_1_40 = base_token + 32;
+                    converted[0] = mul_f32_rn_noftz(frag[16], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[18], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[48], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[50], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_40 = token_1_40 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_40 * 64 + (base_feature ^ swizzle_feature_1_40)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_40 * 64 + (base_feature - 64 ^ swizzle_feature_1_40)) / 4] = packed_word;
+                    }
+                    int token_1_41 = base_token + 32 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[17], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[19], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[49], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[51], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_41 = token_1_41 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_41 * 64 + (base_feature ^ swizzle_feature_1_41)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_41 * 64 + (base_feature - 64 ^ swizzle_feature_1_41)) / 4] = packed_word;
+                    }
+                    int token_1_42 = base_token + 40;
+                    converted[0] = mul_f32_rn_noftz(frag[20], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[22], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[52], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[54], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_42 = token_1_42 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_42 * 64 + (base_feature ^ swizzle_feature_1_42)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_42 * 64 + (base_feature - 64 ^ swizzle_feature_1_42)) / 4] = packed_word;
+                    }
+                    int token_1_43 = base_token + 40 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[21], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[23], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[53], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[55], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_43 = token_1_43 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_43 * 64 + (base_feature ^ swizzle_feature_1_43)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_43 * 64 + (base_feature - 64 ^ swizzle_feature_1_43)) / 4] = packed_word;
+                    }
+                    int token_1_44 = base_token + 48;
+                    converted[0] = mul_f32_rn_noftz(frag[24], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[26], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[56], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[58], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_44 = token_1_44 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_44 * 64 + (base_feature ^ swizzle_feature_1_44)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_44 * 64 + (base_feature - 64 ^ swizzle_feature_1_44)) / 4] = packed_word;
+                    }
+                    int token_1_45 = base_token + 48 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[25], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[27], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[57], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[59], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_45 = token_1_45 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_45 * 64 + (base_feature ^ swizzle_feature_1_45)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_45 * 64 + (base_feature - 64 ^ swizzle_feature_1_45)) / 4] = packed_word;
+                    }
+                    int token_1_46 = base_token + 56;
+                    converted[0] = mul_f32_rn_noftz(frag[28], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[30], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[60], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[62], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_46 = token_1_46 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_46 * 64 + (base_feature ^ swizzle_feature_1_46)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_46 * 64 + (base_feature - 64 ^ swizzle_feature_1_46)) / 4] = packed_word;
+                    }
+                    int token_1_47 = base_token + 56 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[29], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[31], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[61], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[63], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_47 = token_1_47 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_47 * 64 + (base_feature ^ swizzle_feature_1_47)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_47 * 64 + (base_feature - 64 ^ swizzle_feature_1_47)) / 4] = packed_word;
+                    }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    asm volatile("barrier.sync 7, 128;" ::: "memory");
+                    if (warp == 0) {
+                        if (elect_sync()) {
+                            int padding_rows_2 = (256 - valid_rows % 256) % 256;
+                            tma_store_4d((&C), m_tile * 128, padding_rows_2 + token_block_2 * 64, 1073741824, n_tile * 256 - (unsigned int)padding_rows_2 + 1073741824, epi_staging_addr);
+                            tma_store_4d((&C), m_tile * 128 + 64, padding_rows_2 + token_block_2 * 64, 1073741824, n_tile * 256 - (unsigned int)padding_rows_2 + 1073741824, epi_staging_addr + 8192);
+                        }
+                    }
+                    asm volatile("cp.async.bulk.commit_group;");
+                    asm volatile("barrier.sync 7, 128;" ::: "memory");
+                    asm volatile("tcgen05.fence::after_thread_sync;");
+                    int token_block_3 = 3;
+                    if (epilogue_local_idx == 0) {
+                        token_block_3 = 2;
+                    }
+                    unsigned int acc_col_3 = epilogue_local_idx * 192 + (unsigned int)(token_block_3 * 64);
+                    float _tmem_load_0_3[32];
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0_3[31]))
+                        : "r"(taddr + row_addr + acc_col_3));
+                    asm volatile("tcgen05.wait::ld.sync.aligned;");
+                    float _tmem_load_1_3[32];
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1_3[31]))
+                        : "r"(taddr + row_addr + 1048576 + acc_col_3));
+                    asm volatile("tcgen05.wait::ld.sync.aligned;");
+                    for (int i_3 = 0; i_3 < 32; i_3++) {
+                        frag[i_3] = _tmem_load_0_3[i_3];
+                        frag[32 + i_3] = _tmem_load_1_3[i_3];
+                    }
+                    asm volatile("cp.async.bulk.wait_group.read 0;");
+                    asm volatile("tcgen05.fence::before_thread_sync;");
+                    asm volatile("barrier.sync 7, 128;" ::: "memory");
+                    int token_1_48 = base_token;
+                    converted[0] = mul_f32_rn_noftz(frag[0], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[2], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[32], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[34], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_48 = token_1_48 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_48 * 64 + (base_feature ^ swizzle_feature_1_48)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_48 * 64 + (base_feature - 64 ^ swizzle_feature_1_48)) / 4] = packed_word;
+                    }
+                    int token_1_49 = base_token + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[1], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[3], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[33], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[35], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_49 = token_1_49 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_49 * 64 + (base_feature ^ swizzle_feature_1_49)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_49 * 64 + (base_feature - 64 ^ swizzle_feature_1_49)) / 4] = packed_word;
+                    }
+                    int token_1_50 = base_token + 8;
+                    converted[0] = mul_f32_rn_noftz(frag[4], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[6], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[36], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[38], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_50 = token_1_50 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_50 * 64 + (base_feature ^ swizzle_feature_1_50)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_50 * 64 + (base_feature - 64 ^ swizzle_feature_1_50)) / 4] = packed_word;
+                    }
+                    int token_1_51 = base_token + 8 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[5], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[7], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[37], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[39], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_51 = token_1_51 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_51 * 64 + (base_feature ^ swizzle_feature_1_51)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_51 * 64 + (base_feature - 64 ^ swizzle_feature_1_51)) / 4] = packed_word;
+                    }
+                    int token_1_52 = base_token + 16;
+                    converted[0] = mul_f32_rn_noftz(frag[8], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[10], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[40], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[42], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_52 = token_1_52 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_52 * 64 + (base_feature ^ swizzle_feature_1_52)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_52 * 64 + (base_feature - 64 ^ swizzle_feature_1_52)) / 4] = packed_word;
+                    }
+                    int token_1_53 = base_token + 16 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[9], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[11], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[41], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[43], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_53 = token_1_53 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_53 * 64 + (base_feature ^ swizzle_feature_1_53)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_53 * 64 + (base_feature - 64 ^ swizzle_feature_1_53)) / 4] = packed_word;
+                    }
+                    int token_1_54 = base_token + 24;
+                    converted[0] = mul_f32_rn_noftz(frag[12], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[14], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[44], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[46], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_54 = token_1_54 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_54 * 64 + (base_feature ^ swizzle_feature_1_54)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_54 * 64 + (base_feature - 64 ^ swizzle_feature_1_54)) / 4] = packed_word;
+                    }
+                    int token_1_55 = base_token + 24 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[13], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[15], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[45], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[47], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_55 = token_1_55 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_55 * 64 + (base_feature ^ swizzle_feature_1_55)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_55 * 64 + (base_feature - 64 ^ swizzle_feature_1_55)) / 4] = packed_word;
+                    }
+                    int token_1_56 = base_token + 32;
+                    converted[0] = mul_f32_rn_noftz(frag[16], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[18], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[48], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[50], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_56 = token_1_56 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_56 * 64 + (base_feature ^ swizzle_feature_1_56)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_56 * 64 + (base_feature - 64 ^ swizzle_feature_1_56)) / 4] = packed_word;
+                    }
+                    int token_1_57 = base_token + 32 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[17], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[19], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[49], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[51], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_57 = token_1_57 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_57 * 64 + (base_feature ^ swizzle_feature_1_57)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_57 * 64 + (base_feature - 64 ^ swizzle_feature_1_57)) / 4] = packed_word;
+                    }
+                    int token_1_58 = base_token + 40;
+                    converted[0] = mul_f32_rn_noftz(frag[20], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[22], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[52], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[54], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_58 = token_1_58 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_58 * 64 + (base_feature ^ swizzle_feature_1_58)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_58 * 64 + (base_feature - 64 ^ swizzle_feature_1_58)) / 4] = packed_word;
+                    }
+                    int token_1_59 = base_token + 40 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[21], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[23], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[53], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[55], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_59 = token_1_59 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_59 * 64 + (base_feature ^ swizzle_feature_1_59)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_59 * 64 + (base_feature - 64 ^ swizzle_feature_1_59)) / 4] = packed_word;
+                    }
+                    int token_1_60 = base_token + 48;
+                    converted[0] = mul_f32_rn_noftz(frag[24], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[26], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[56], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[58], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_60 = token_1_60 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_60 * 64 + (base_feature ^ swizzle_feature_1_60)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_60 * 64 + (base_feature - 64 ^ swizzle_feature_1_60)) / 4] = packed_word;
+                    }
+                    int token_1_61 = base_token + 48 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[25], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[27], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[57], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[59], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_61 = token_1_61 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_61 * 64 + (base_feature ^ swizzle_feature_1_61)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_61 * 64 + (base_feature - 64 ^ swizzle_feature_1_61)) / 4] = packed_word;
+                    }
+                    int token_1_62 = base_token + 56;
+                    converted[0] = mul_f32_rn_noftz(frag[28], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[30], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[60], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[62], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_62 = token_1_62 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_62 * 64 + (base_feature ^ swizzle_feature_1_62)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_62 * 64 + (base_feature - 64 ^ swizzle_feature_1_62)) / 4] = packed_word;
+                    }
+                    int token_1_63 = base_token + 56 + 1;
+                    converted[0] = mul_f32_rn_noftz(frag[29], sc);
+                    converted[1] = mul_f32_rn_noftz(frag[31], sc);
+                    converted[2] = mul_f32_rn_noftz(frag[61], sc);
+                    converted[3] = mul_f32_rn_noftz(frag[63], sc);
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 2; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
+                        packed[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32ull;
+                    int swizzle_feature_1_63 = token_1_63 % 8 * 8;
+                    if (base_feature < 64) {
+                        epi_staging_u64[(token_1_63 * 64 + (base_feature ^ swizzle_feature_1_63)) / 4] = packed_word;
+                    } else {
+                        epi_staging_u64[(4096 + token_1_63 * 64 + (base_feature - 64 ^ swizzle_feature_1_63)) / 4] = packed_word;
+                    }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    asm volatile("barrier.sync 7, 128;" ::: "memory");
+                    if (warp == 0) {
+                        if (elect_sync()) {
+                            int padding_rows_3 = (256 - valid_rows % 256) % 256;
+                            tma_store_4d((&C), m_tile * 128, padding_rows_3 + token_block_3 * 64, 1073741824, n_tile * 256 - (unsigned int)padding_rows_3 + 1073741824, epi_staging_addr);
+                            tma_store_4d((&C), m_tile * 128 + 64, padding_rows_3 + token_block_3 * 64, 1073741824, n_tile * 256 - (unsigned int)padding_rows_3 + 1073741824, epi_staging_addr + 8192);
+                        }
+                    }
+                    asm volatile("cp.async.bulk.commit_group;");
+                    asm volatile("barrier.sync 7, 128;" ::: "memory");
+                    _phase_mma_full ^= 1;
+                    epilogue_local_idx = epilogue_local_idx ^ 1;
                 }
                 mbarrier_wait(work_full_addr + (work_stage) * 8, _phase_work_full);
                 unsigned int valid = 0;
                 unsigned int next_x = 0;
                 unsigned int next_y = 0;
-                uint32_t _clc_valid_5 = 0;
+                uint32_t clc_valid = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -1483,11 +1446,11 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "selp.u32 %0, 1, 0, p1;\n\t"
                     "}\n"
-                    : "=r"(_clc_valid_5)
+                    : "=r"(clc_valid)
                     : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                     : "memory");
-                valid = _clc_valid_5;
-                uint32_t _clc_ctaid_10 = 0;
+                valid = clc_valid;
+                uint32_t clc_ctaid = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -1496,11 +1459,11 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                     "}\n"
-                    : "+r"(_clc_ctaid_10)
+                    : "+r"(clc_ctaid)
                     : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                     : "memory");
-                next_x = _clc_ctaid_10;
-                uint32_t _clc_ctaid_11 = 0;
+                next_x = clc_ctaid;
+                uint32_t clc_ctaid_1 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -1509,10 +1472,10 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
                     "}\n"
-                    : "+r"(_clc_ctaid_11)
+                    : "+r"(clc_ctaid_1)
                     : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                     : "memory");
-                next_y = _clc_ctaid_11;
+                next_y = clc_ctaid_1;
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile(
                     "{\n\t"
@@ -1520,15 +1483,14 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(work_empty_addr + work_stage * 8), "r"(0) : "memory");
+                    :: "r"(work_empty_addr + (work_stage) * 8), "r"(0) : "memory");
                 work_stage += 1;
                 if (work_stage == 3) { work_stage = 0; _phase_work_full ^= 1; }
-                unsigned int valid_0 = valid;
-                m_tile = next_x + (unsigned int)cta_rank;
-                n_tile = next_y;
-                if (valid_0 == 0) {
+                if (valid == 0) {
                     break;
                 }
+                m_tile = next_x + (unsigned int)cta_rank;
+                n_tile = next_y;
             }
             asm volatile("barrier.sync 10, 128;" ::: "memory");
             if (warp_0 == 0) {
@@ -1570,35 +1532,36 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
             #pragma unroll 1
             for (unsigned int _tile_iter_1 = 0; _tile_iter_1 < grid_m / 2 * grid_n; _tile_iter_1++) {
                 int valid_rows_1 = tile_mn_limit[n_tile_1] - (int)n_tile_1 * 256;
-                if (tile_count_1 > (int)n_tile_1) {
-                    if (valid_rows_1 > 0) {
-                        int padding_rows_4 = (256 - valid_rows_1 % 256) % 256;
-                        int box_row0 = (int)cta_rank * 128 + padding_rows_4;
-                        #pragma unroll 1
-                        for (int iter_k = 0; iter_k < K_tiles; iter_k++) {
-                            mbarrier_wait(b_empty_addr + (stage) * 8, _phase_b_empty);
-                            if (elect_sync()) {
-                                if (cta_rank == 0) {
-                                    asm volatile(
-                                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
-                                        :: "r"((b_full_addr + (stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
-                                }
+                if (tile_count_1 <= (int)n_tile_1) {
+                    break;
+                }
+                if (valid_rows_1 > 0) {
+                    int padding_rows = (256 - valid_rows_1 % 256) % 256;
+                    int box_row0 = (int)cta_rank * 128 + padding_rows;
+                    #pragma unroll 1
+                    for (int iter_k = 0; iter_k < K_tiles; iter_k++) {
+                        mbarrier_wait(b_empty_addr + (stage) * 8, _phase_b_empty);
+                        if (elect_sync()) {
+                            if (cta_rank == 0) {
                                 asm volatile(
-                                    "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
-                                    " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                                    :: "r"(smem_b_addr + stage * 16384), "l"((&B)), "r"(iter_k * 128), "r"(box_row0), "r"(1073741824), "r"(n_tile_1 * 256 - (unsigned int)padding_rows_4 + 1073741824),
-                                       "r"(((b_full_addr + (stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(cta_mask)) : "memory");
+                                    "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
+                                    :: "r"((b_full_addr + (stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
                             }
-                            stage += 1;
-                            if (stage == 5) { stage = 0; _phase_b_empty ^= 1; }
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(smem_b_addr + stage * 16384), "l"((&B)), "r"(iter_k * 128), "r"(box_row0), "r"(1073741824), "r"(n_tile_1 * 256 - (unsigned int)padding_rows + 1073741824),
+                                   "r"(((b_full_addr + (stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(cta_mask)) : "memory");
                         }
+                        stage += 1;
+                        if (stage == 5) { stage = 0; _phase_b_empty ^= 1; }
                     }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_1) * 8, _phase_work_full_1);
                 unsigned int valid_1 = 0;
                 unsigned int next_x_1 = 0;
                 unsigned int next_y_1 = 0;
-                uint32_t _clc_valid_1 = 0;
+                uint32_t clc_valid_1 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -1607,11 +1570,11 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "selp.u32 %0, 1, 0, p1;\n\t"
                     "}\n"
-                    : "=r"(_clc_valid_1)
+                    : "=r"(clc_valid_1)
                     : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                     : "memory");
-                valid_1 = _clc_valid_1;
-                uint32_t _clc_ctaid_2 = 0;
+                valid_1 = clc_valid_1;
+                uint32_t clc_ctaid_2 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -1620,11 +1583,11 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                     "}\n"
-                    : "+r"(_clc_ctaid_2)
+                    : "+r"(clc_ctaid_2)
                     : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                     : "memory");
-                next_x_1 = _clc_ctaid_2;
-                uint32_t _clc_ctaid_3 = 0;
+                next_x_1 = clc_ctaid_2;
+                uint32_t clc_ctaid_1_1 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -1633,10 +1596,10 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
                     "}\n"
-                    : "+r"(_clc_ctaid_3)
+                    : "+r"(clc_ctaid_1_1)
                     : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                     : "memory");
-                next_y_1 = _clc_ctaid_3;
+                next_y_1 = clc_ctaid_1_1;
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile(
                     "{\n\t"
@@ -1644,17 +1607,22 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(work_empty_addr + work_stage_1 * 8), "r"(0) : "memory");
+                    :: "r"(work_empty_addr + (work_stage_1) * 8), "r"(0) : "memory");
                 work_stage_1 += 1;
                 if (work_stage_1 == 3) { work_stage_1 = 0; _phase_work_full_1 ^= 1; }
-                unsigned int valid_0_1 = valid_1;
-                m_tile_1 = next_x_1 + (unsigned int)cta_rank;
-                n_tile_1 = next_y_1;
-                if (valid_0_1 == 0) {
+                if (valid_1 == 0) {
                     break;
                 }
+                m_tile_1 = next_x_1 + (unsigned int)cta_rank;
+                n_tile_1 = next_y_1;
             }
             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            #pragma unroll 1
+            for (unsigned int _tail_iter = 0; _tail_iter < 5; _tail_iter++) {
+                mbarrier_wait(b_empty_addr + (stage) * 8, _phase_b_empty);
+                stage += 1;
+                if (stage == 5) { stage = 0; _phase_b_empty ^= 1; }
+            }
         }
     }
     // ---- Role: load_sfb ----
@@ -1671,32 +1639,33 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                 unsigned int n_tile_2 = blockIdx.y;
                 #pragma unroll 1
                 for (unsigned int _tile_iter_2 = 0; _tile_iter_2 < grid_m / 2 * grid_n; _tile_iter_2++) {
-                    if (tile_count_2 > (int)n_tile_2) {
-                        int valid_rows_sfb = tile_mn_limit[n_tile_2] - (int)n_tile_2 * 256;
-                        if (valid_rows_sfb > 0) {
-                            #pragma unroll 1
-                            for (int iter_k_1 = 0; iter_k_1 < K_tiles; iter_k_1++) {
-                                mbarrier_wait(sfb_empty_addr + (stage_1) * 8, _phase_sfb_empty);
-                                if (elect_sync()) {
-                                    asm volatile(
-                                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
-                                        :: "r"((sfb_full_addr + (stage_1) * 8) & 0xFEFFFFFF), "r"((uint32_t)(8192)) : "memory");
-                                    asm volatile(
-                                        "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
-                                        " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                                        :: "r"(smem_sfb_addr + stage_1 * 4096), "l"((&SFB)), "r"(0), "r"(0), "r"(iter_k_1 * 4), "r"(n_tile_2 * 2),
-                                           "r"(((sfb_full_addr + (stage_1) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)) : "memory");
-                                }
-                                stage_1 += 1;
-                                if (stage_1 == 5) { stage_1 = 0; _phase_sfb_empty ^= 1; }
+                    if (tile_count_2 <= (int)n_tile_2) {
+                        break;
+                    }
+                    int valid_rows_sfb = tile_mn_limit[n_tile_2] - (int)n_tile_2 * 256;
+                    if (valid_rows_sfb > 0) {
+                        #pragma unroll 1
+                        for (int iter_k_1 = 0; iter_k_1 < K_tiles; iter_k_1++) {
+                            mbarrier_wait(sfb_empty_addr + (stage_1) * 8, _phase_sfb_empty);
+                            if (elect_sync()) {
+                                asm volatile(
+                                    "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
+                                    :: "r"((sfb_full_addr + (stage_1) * 8) & 0xFEFFFFFF), "r"((uint32_t)(8192)) : "memory");
+                                asm volatile(
+                                    "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
+                                    " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                    :: "r"(smem_sfb_addr + stage_1 * 4096), "l"((&SFB)), "r"(0), "r"(0), "r"(iter_k_1 * 4), "r"(n_tile_2 * 2),
+                                       "r"(((sfb_full_addr + (stage_1) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)) : "memory");
                             }
+                            stage_1 += 1;
+                            if (stage_1 == 5) { stage_1 = 0; _phase_sfb_empty ^= 1; }
                         }
                     }
                     mbarrier_wait(work_full_addr + (work_stage_2) * 8, _phase_work_full_2);
                     unsigned int valid_2 = 0;
                     unsigned int next_x_2 = 0;
                     unsigned int next_y_2 = 0;
-                    uint32_t _clc_valid_2 = 0;
+                    uint32_t clc_valid_2 = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -1705,11 +1674,11 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "selp.u32 %0, 1, 0, p1;\n\t"
                         "}\n"
-                        : "=r"(_clc_valid_2)
+                        : "=r"(clc_valid_2)
                         : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                         : "memory");
-                    valid_2 = _clc_valid_2;
-                    uint32_t _clc_ctaid_4 = 0;
+                    valid_2 = clc_valid_2;
+                    uint32_t clc_ctaid_3 = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -1718,11 +1687,11 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                         "}\n"
-                        : "+r"(_clc_ctaid_4)
+                        : "+r"(clc_ctaid_3)
                         : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                         : "memory");
-                    next_x_2 = _clc_ctaid_4;
-                    uint32_t _clc_ctaid_5 = 0;
+                    next_x_2 = clc_ctaid_3;
+                    uint32_t clc_ctaid_1_2 = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -1731,10 +1700,10 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
                         "}\n"
-                        : "+r"(_clc_ctaid_5)
+                        : "+r"(clc_ctaid_1_2)
                         : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                         : "memory");
-                    next_y_2 = _clc_ctaid_5;
+                    next_y_2 = clc_ctaid_1_2;
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile(
                         "{\n\t"
@@ -1742,15 +1711,14 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(work_empty_addr + work_stage_2 * 8), "r"(0) : "memory");
+                        :: "r"(work_empty_addr + (work_stage_2) * 8), "r"(0) : "memory");
                     work_stage_2 += 1;
                     if (work_stage_2 == 3) { work_stage_2 = 0; _phase_work_full_2 ^= 1; }
-                    unsigned int valid_0_2 = valid_2;
-                    m_tile_2 = next_x_2 + (unsigned int)cta_rank;
-                    n_tile_2 = next_y_2;
-                    if (valid_0_2 == 0) {
+                    if (valid_2 == 0) {
                         break;
                     }
+                    m_tile_2 = next_x_2 + (unsigned int)cta_rank;
+                    n_tile_2 = next_y_2;
                 }
                 asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             }
@@ -1771,41 +1739,42 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
             unsigned int _phase_work_full_3 = 0;
             #pragma unroll 1
             for (unsigned int _tile_iter_3 = 0; _tile_iter_3 < grid_m / 2 * grid_n; _tile_iter_3++) {
-                if (tile_count_3 > (int)n_tile_3) {
-                    int valid_rows_a = tile_mn_limit[n_tile_3] - (int)n_tile_3 * 256;
-                    if (valid_rows_a > 0) {
-                        int expert = tile_expert[n_tile_3];
-                        if (cta_rank == 0) {
-                            mbarrier_wait(throttle_empty_addr + (throttle_stage) * 8, _phase_throttle_empty);
-                            mbarrier_arrive(throttle_full_addr + (throttle_stage) * 8);
-                            throttle_stage += 1;
-                            if (throttle_stage == 3) { throttle_stage = 0; _phase_throttle_empty ^= 1; }
-                        }
-                        #pragma unroll 1
-                        for (int iter_k_2 = 0; iter_k_2 < K_tiles; iter_k_2++) {
-                            mbarrier_wait(a_empty_addr + (stage_2) * 8, _phase_a_empty);
-                            if (elect_sync()) {
-                                if (cta_rank == 0) {
-                                    asm volatile(
-                                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
-                                        :: "r"((a_full_addr + (stage_2) * 8) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
-                                }
+                if (tile_count_3 <= (int)n_tile_3) {
+                    break;
+                }
+                if (cta_rank == 0) {
+                    mbarrier_wait(throttle_empty_addr + (throttle_stage) * 8, _phase_throttle_empty);
+                    mbarrier_arrive(throttle_full_addr + (throttle_stage) * 8);
+                    throttle_stage += 1;
+                    if (throttle_stage == 3) { throttle_stage = 0; _phase_throttle_empty ^= 1; }
+                }
+                int valid_rows_a = tile_mn_limit[n_tile_3] - (int)n_tile_3 * 256;
+                if (valid_rows_a > 0) {
+                    int expert = tile_expert[n_tile_3];
+                    #pragma unroll 1
+                    for (int iter_k_2 = 0; iter_k_2 < K_tiles; iter_k_2++) {
+                        mbarrier_wait(a_empty_addr + (stage_2) * 8, _phase_a_empty);
+                        if (elect_sync()) {
+                            if (cta_rank == 0) {
                                 asm volatile(
-                                    "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
-                                    " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                                    :: "r"(smem_a_addr + stage_2 * 16384), "l"((&A)), "r"(0), "r"(m_tile_3 * 128), "r"(iter_k_2), "r"(expert),
-                                       "r"(((a_full_addr + (stage_2) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(cta_mask_1)) : "memory");
+                                    "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
+                                    :: "r"((a_full_addr + (stage_2) * 8) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
                             }
-                            stage_2 += 1;
-                            if (stage_2 == 5) { stage_2 = 0; _phase_a_empty ^= 1; }
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(smem_a_addr + stage_2 * 16384), "l"((&A)), "r"(0), "r"(m_tile_3 * 128), "r"(iter_k_2), "r"(expert),
+                                   "r"(((a_full_addr + (stage_2) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(cta_mask_1)) : "memory");
                         }
+                        stage_2 += 1;
+                        if (stage_2 == 5) { stage_2 = 0; _phase_a_empty ^= 1; }
                     }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_3) * 8, _phase_work_full_3);
                 unsigned int valid_3 = 0;
                 unsigned int next_x_3 = 0;
                 unsigned int next_y_3 = 0;
-                uint32_t _clc_valid_0 = 0;
+                uint32_t clc_valid_3 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -1814,11 +1783,11 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "selp.u32 %0, 1, 0, p1;\n\t"
                     "}\n"
-                    : "=r"(_clc_valid_0)
+                    : "=r"(clc_valid_3)
                     : "r"(work_response_addr + work_stage_3 * 16 + 0 * 16)
                     : "memory");
-                valid_3 = _clc_valid_0;
-                uint32_t _clc_ctaid_0 = 0;
+                valid_3 = clc_valid_3;
+                uint32_t clc_ctaid_4 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -1827,11 +1796,11 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                     "}\n"
-                    : "+r"(_clc_ctaid_0)
+                    : "+r"(clc_ctaid_4)
                     : "r"(work_response_addr + work_stage_3 * 16 + 0 * 16)
                     : "memory");
-                next_x_3 = _clc_ctaid_0;
-                uint32_t _clc_ctaid_1 = 0;
+                next_x_3 = clc_ctaid_4;
+                uint32_t clc_ctaid_1_3 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -1840,10 +1809,10 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
                     "}\n"
-                    : "+r"(_clc_ctaid_1)
+                    : "+r"(clc_ctaid_1_3)
                     : "r"(work_response_addr + work_stage_3 * 16 + 0 * 16)
                     : "memory");
-                next_y_3 = _clc_ctaid_1;
+                next_y_3 = clc_ctaid_1_3;
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile(
                     "{\n\t"
@@ -1851,15 +1820,20 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(work_empty_addr + work_stage_3 * 8), "r"(0) : "memory");
+                    :: "r"(work_empty_addr + (work_stage_3) * 8), "r"(0) : "memory");
                 work_stage_3 += 1;
                 if (work_stage_3 == 3) { work_stage_3 = 0; _phase_work_full_3 ^= 1; }
-                unsigned int valid_0_3 = valid_3;
-                m_tile_3 = next_x_3 + (unsigned int)cta_rank;
-                n_tile_3 = next_y_3;
-                if (valid_0_3 == 0) {
+                if (valid_3 == 0) {
                     break;
                 }
+                m_tile_3 = next_x_3 + (unsigned int)cta_rank;
+                n_tile_3 = next_y_3;
+            }
+            #pragma unroll 1
+            for (unsigned int _tail_iter_1 = 0; _tail_iter_1 < 5; _tail_iter_1++) {
+                mbarrier_wait(a_empty_addr + (stage_2) * 8, _phase_a_empty);
+                stage_2 += 1;
+                if (stage_2 == 5) { stage_2 = 0; _phase_a_empty ^= 1; }
             }
         }
     }
@@ -1876,35 +1850,36 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
             unsigned int _phase_work_full_4 = 0;
             #pragma unroll 1
             for (unsigned int _tile_iter_4 = 0; _tile_iter_4 < grid_m / 2 * grid_n; _tile_iter_4++) {
-                if (tile_count_4 > (int)n_tile_4) {
-                    int valid_rows_sfa = tile_mn_limit[n_tile_4] - (int)n_tile_4 * 256;
-                    if (valid_rows_sfa > 0) {
-                        int expert_sfa = tile_expert[n_tile_4];
-                        #pragma unroll 1
-                        for (int iter_k_3 = 0; iter_k_3 < K_tiles; iter_k_3++) {
-                            mbarrier_wait(sfa_empty_addr + (stage_3) * 8, _phase_sfa_empty);
-                            if (elect_sync()) {
-                                if (cta_rank == 0) {
-                                    asm volatile(
-                                        "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
-                                        :: "r"((sfa_full_addr + (stage_3) * 8) & 0xFEFFFFFF), "r"((uint32_t)(4096)) : "memory");
-                                }
+                if (tile_count_4 <= (int)n_tile_4) {
+                    break;
+                }
+                int valid_rows_sfa = tile_mn_limit[n_tile_4] - (int)n_tile_4 * 256;
+                if (valid_rows_sfa > 0) {
+                    int expert_sfa = tile_expert[n_tile_4];
+                    #pragma unroll 1
+                    for (int iter_k_3 = 0; iter_k_3 < K_tiles; iter_k_3++) {
+                        mbarrier_wait(sfa_empty_addr + (stage_3) * 8, _phase_sfa_empty);
+                        if (elect_sync()) {
+                            if (cta_rank == 0) {
                                 asm volatile(
-                                    "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
-                                    " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                                    :: "r"(smem_sfa_addr + stage_3 * 2048), "l"((&SFA)), "r"(0), "r"(0), "r"(iter_k_3 * 4), "r"((unsigned int)(expert_sfa * grid_m) + m_tile_4),
-                                       "r"(((sfa_full_addr + (stage_3) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(cta_mask_2)) : "memory");
+                                    "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
+                                    :: "r"((sfa_full_addr + (stage_3) * 8) & 0xFEFFFFFF), "r"((uint32_t)(4096)) : "memory");
                             }
-                            stage_3 += 1;
-                            if (stage_3 == 5) { stage_3 = 0; _phase_sfa_empty ^= 1; }
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(smem_sfa_addr + stage_3 * 2048), "l"((&SFA)), "r"(0), "r"(0), "r"(iter_k_3 * 4), "r"((unsigned int)(expert_sfa * grid_m) + m_tile_4),
+                                   "r"(((sfa_full_addr + (stage_3) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(cta_mask_2)) : "memory");
                         }
+                        stage_3 += 1;
+                        if (stage_3 == 5) { stage_3 = 0; _phase_sfa_empty ^= 1; }
                     }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_4) * 8, _phase_work_full_4);
                 unsigned int valid_4 = 0;
                 unsigned int next_x_4 = 0;
                 unsigned int next_y_4 = 0;
-                uint32_t _clc_valid_3 = 0;
+                uint32_t clc_valid_4 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -1913,11 +1888,11 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "selp.u32 %0, 1, 0, p1;\n\t"
                     "}\n"
-                    : "=r"(_clc_valid_3)
+                    : "=r"(clc_valid_4)
                     : "r"(work_response_addr + work_stage_4 * 16 + 0 * 16)
                     : "memory");
-                valid_4 = _clc_valid_3;
-                uint32_t _clc_ctaid_6 = 0;
+                valid_4 = clc_valid_4;
+                uint32_t clc_ctaid_5 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -1926,11 +1901,11 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                     "}\n"
-                    : "+r"(_clc_ctaid_6)
+                    : "+r"(clc_ctaid_5)
                     : "r"(work_response_addr + work_stage_4 * 16 + 0 * 16)
                     : "memory");
-                next_x_4 = _clc_ctaid_6;
-                uint32_t _clc_ctaid_7 = 0;
+                next_x_4 = clc_ctaid_5;
+                uint32_t clc_ctaid_1_4 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -1939,10 +1914,10 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
                     "}\n"
-                    : "+r"(_clc_ctaid_7)
+                    : "+r"(clc_ctaid_1_4)
                     : "r"(work_response_addr + work_stage_4 * 16 + 0 * 16)
                     : "memory");
-                next_y_4 = _clc_ctaid_7;
+                next_y_4 = clc_ctaid_1_4;
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile(
                     "{\n\t"
@@ -1950,15 +1925,20 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(work_empty_addr + work_stage_4 * 8), "r"(0) : "memory");
+                    :: "r"(work_empty_addr + (work_stage_4) * 8), "r"(0) : "memory");
                 work_stage_4 += 1;
                 if (work_stage_4 == 3) { work_stage_4 = 0; _phase_work_full_4 ^= 1; }
-                unsigned int valid_0_4 = valid_4;
-                m_tile_4 = next_x_4 + (unsigned int)cta_rank;
-                n_tile_4 = next_y_4;
-                if (valid_0_4 == 0) {
+                if (valid_4 == 0) {
                     break;
                 }
+                m_tile_4 = next_x_4 + (unsigned int)cta_rank;
+                n_tile_4 = next_y_4;
+            }
+            #pragma unroll 1
+            for (unsigned int _tail_iter_2 = 0; _tail_iter_2 < 5; _tail_iter_2++) {
+                mbarrier_wait(sfa_empty_addr + (stage_3) * 8, _phase_sfa_empty);
+                stage_3 += 1;
+                if (stage_3 == 5) { stage_3 = 0; _phase_sfa_empty ^= 1; }
             }
         }
     }
@@ -1966,11 +1946,8 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
     if (warp == 8) {
         { // copy_sfab_mma_main
             int tile_count_5 = num_non_exiting_ctas[0];
-            unsigned int _phase_mma_free_0 = 1;
+            unsigned int _phase_mma_free = 1;
             unsigned int _phase_a_full = 0;
-            unsigned int _phase_b_full = 0;
-            unsigned int _phase_sfa_full = 0;
-            unsigned int _phase_sfb_full = 0;
             unsigned int _phase_work_full_5 = 0;
             if (cta_rank == 0) {
                 unsigned int stage_4 = 0;
@@ -1980,205 +1957,206 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                 unsigned int n_tile_5 = blockIdx.y;
                 #pragma unroll 1
                 for (unsigned int _tile_iter_5 = 0; _tile_iter_5 < grid_m / 2 * grid_n; _tile_iter_5++) {
-                    if (tile_count_5 > (int)n_tile_5) {
-                        int valid_rows_m = tile_mn_limit[n_tile_5] - (int)n_tile_5 * 256;
-                        if (valid_rows_m > 0) {
-                            mbarrier_wait(mma_free_addr, _phase_mma_free_0);
-                            _phase_mma_free_0 ^= 1;
-                            #pragma unroll 1
-                            for (int iter_k_4 = 0; iter_k_4 < K_tiles; iter_k_4++) {
-                                mbarrier_wait(a_full_addr + (stage_4) * 8, _phase_a_full);
-                                mbarrier_wait(b_full_addr + (stage_4) * 8, _phase_b_full);
-                                mbarrier_wait(sfa_full_addr + (stage_4) * 8, _phase_sfa_full);
-                                mbarrier_wait(sfb_full_addr + (stage_4) * 8, _phase_sfb_full);
-                                asm volatile("tcgen05.fence::after_thread_sync;");
-                                uint32_t _elected_0 = elect_sync();
-                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                #endif
-                                {
-                                    uint64_t _tcgen05_cp_desc_1 = ((((uint64_t)(smem_sfa_addr + stage_4 * 2048)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                    asm volatile(
-                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
-                                        :: "r"((uint32_t)(tmem_sfa)), "l"(_tcgen05_cp_desc_1), "r"(_elected_0)
-                                        : "memory");
-                                }
-                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                #endif
-                                {
-                                    uint64_t _tcgen05_cp_desc_2 = ((((uint64_t)(smem_sfa_addr + stage_4 * 2048 + 512)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                    asm volatile(
-                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
-                                        :: "r"((uint32_t)(tmem_sfa + 4)), "l"(_tcgen05_cp_desc_2), "r"(_elected_0)
-                                        : "memory");
-                                }
-                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                #endif
-                                {
-                                    uint64_t _tcgen05_cp_desc_3 = ((((uint64_t)(smem_sfa_addr + stage_4 * 2048 + 1024)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                    asm volatile(
-                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
-                                        :: "r"((uint32_t)(tmem_sfa + 8)), "l"(_tcgen05_cp_desc_3), "r"(_elected_0)
-                                        : "memory");
-                                }
-                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                #endif
-                                {
-                                    uint64_t _tcgen05_cp_desc_4 = ((((uint64_t)(smem_sfa_addr + stage_4 * 2048 + 1536)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                    asm volatile(
-                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
-                                        :: "r"((uint32_t)(tmem_sfa + 12)), "l"(_tcgen05_cp_desc_4), "r"(_elected_0)
-                                        : "memory");
-                                }
-                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                #endif
-                                {
-                                    uint64_t _tcgen05_cp_desc_5 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                    asm volatile(
-                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
-                                        :: "r"((uint32_t)(tmem_sfb)), "l"(_tcgen05_cp_desc_5), "r"(_elected_0)
-                                        : "memory");
-                                }
-                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                #endif
-                                {
-                                    uint64_t _tcgen05_cp_desc_6 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 512)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                    asm volatile(
-                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
-                                        :: "r"((uint32_t)(tmem_sfb + 8)), "l"(_tcgen05_cp_desc_6), "r"(_elected_0)
-                                        : "memory");
-                                }
-                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                #endif
-                                {
-                                    uint64_t _tcgen05_cp_desc_7 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 1024)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                    asm volatile(
-                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
-                                        :: "r"((uint32_t)(tmem_sfb + 16)), "l"(_tcgen05_cp_desc_7), "r"(_elected_0)
-                                        : "memory");
-                                }
-                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                #endif
-                                {
-                                    uint64_t _tcgen05_cp_desc_8 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 1536)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                    asm volatile(
-                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
-                                        :: "r"((uint32_t)(tmem_sfb + 24)), "l"(_tcgen05_cp_desc_8), "r"(_elected_0)
-                                        : "memory");
-                                }
-                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                #endif
-                                {
-                                    uint64_t _tcgen05_cp_desc_9 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 2048)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                    asm volatile(
-                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
-                                        :: "r"((uint32_t)(tmem_sfb + 4)), "l"(_tcgen05_cp_desc_9), "r"(_elected_0)
-                                        : "memory");
-                                }
-                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                #endif
-                                {
-                                    uint64_t _tcgen05_cp_desc_10 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 2560)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                    asm volatile(
-                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
-                                        :: "r"((uint32_t)(tmem_sfb + 12)), "l"(_tcgen05_cp_desc_10), "r"(_elected_0)
-                                        : "memory");
-                                }
-                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                #endif
-                                {
-                                    uint64_t _tcgen05_cp_desc_11 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 3072)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                    asm volatile(
-                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
-                                        :: "r"((uint32_t)(tmem_sfb + 20)), "l"(_tcgen05_cp_desc_11), "r"(_elected_0)
-                                        : "memory");
-                                }
-                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                #endif
-                                {
-                                    uint64_t _tcgen05_cp_desc_12 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 3584)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                    asm volatile(
-                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
-                                        :: "r"((uint32_t)(tmem_sfb + 28)), "l"(_tcgen05_cp_desc_12), "r"(_elected_0)
-                                        : "memory");
-                                }
-                                int _mma_a_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (stage_4) * 1024;
-                                int _mma_b_lo_0 = (((smem_b_addr) >> 4) & 0x3FFF) + (stage_4) * 1024;
-                                if (elect_sync()) {
-                                    {
-                                        uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_0) | ((uint64_t)0x40004040 << 32);
-                                        uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_0) | ((uint64_t)0x40004040 << 32);
-
-                                        tcgen05_mma_mxf4nvf4_bs_cta2((tmem_accum + (mma_local_idx * 192)), a_desc + 0, b_desc + 0,
-                                            0x10400480U, tmem_sfa + 0, tmem_sfb + 0, ((((iter_k_4 == 0) ? 1 : 0)) ? 0 : 1));
-                                    }
-                                }
-                                int _mma_a_lo_1 = (((smem_a_addr + 32) >> 4) & 0x3FFF) + (stage_4) * 1024;
-                                int _mma_b_lo_1 = (((smem_b_addr + 32) >> 4) & 0x3FFF) + (stage_4) * 1024;
-                                if (elect_sync()) {
-                                    {
-                                        uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_1) | ((uint64_t)0x40004040 << 32);
-                                        uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_1) | ((uint64_t)0x40004040 << 32);
-
-                                        tcgen05_mma_mxf4nvf4_bs_cta2((tmem_accum + (mma_local_idx * 192)), a_desc + 0, b_desc + 0,
-                                            0x10400480U, tmem_sfa + 4 + 0, tmem_sfb + 8 + 0, 1);
-                                    }
-                                }
-                                int _mma_a_lo_2 = (((smem_a_addr + 64) >> 4) & 0x3FFF) + (stage_4) * 1024;
-                                int _mma_b_lo_2 = (((smem_b_addr + 64) >> 4) & 0x3FFF) + (stage_4) * 1024;
-                                if (elect_sync()) {
-                                    {
-                                        uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_2) | ((uint64_t)0x40004040 << 32);
-                                        uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_2) | ((uint64_t)0x40004040 << 32);
-
-                                        tcgen05_mma_mxf4nvf4_bs_cta2((tmem_accum + (mma_local_idx * 192)), a_desc + 0, b_desc + 0,
-                                            0x10400480U, tmem_sfa + 8 + 0, tmem_sfb + 16 + 0, 1);
-                                    }
-                                }
-                                int _mma_a_lo_3 = (((smem_a_addr + 96) >> 4) & 0x3FFF) + (stage_4) * 1024;
-                                int _mma_b_lo_3 = (((smem_b_addr + 96) >> 4) & 0x3FFF) + (stage_4) * 1024;
-                                if (elect_sync()) {
-                                    {
-                                        uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_3) | ((uint64_t)0x40004040 << 32);
-                                        uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_3) | ((uint64_t)0x40004040 << 32);
-
-                                        tcgen05_mma_mxf4nvf4_bs_cta2((tmem_accum + (mma_local_idx * 192)), a_desc + 0, b_desc + 0,
-                                            0x10400480U, tmem_sfa + 12 + 0, tmem_sfb + 24 + 0, 1);
-                                    }
-                                }
-                                elect_commit_cg2_multicast(a_empty_addr + (stage_4) * 8, (uint16_t)(3));
-                                elect_commit_cg2_multicast(b_empty_addr + (stage_4) * 8, (uint16_t)(3));
-                                elect_commit_cg2_multicast(sfa_empty_addr + (stage_4) * 8, (uint16_t)(3));
-                                elect_commit_cg2_multicast(sfb_empty_addr + (stage_4) * 8, (uint16_t)(1));
-                                stage_4 += 1;
-                                if (stage_4 == 5) { stage_4 = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; _phase_sfa_full ^= 1; _phase_sfb_full ^= 1; }
+                    if (tile_count_5 <= (int)n_tile_5) {
+                        break;
+                    }
+                    int valid_rows_m = tile_mn_limit[n_tile_5] - (int)n_tile_5 * 256;
+                    if (valid_rows_m > 0) {
+                        mbarrier_wait(mma_free_addr, _phase_mma_free);
+                        #pragma unroll 1
+                        for (int iter_k_4 = 0; iter_k_4 < K_tiles; iter_k_4++) {
+                            mbarrier_wait(a_full_addr + (stage_4) * 8, _phase_a_full);
+                            mbarrier_wait(b_full_addr + (stage_4) * 8, _phase_a_full);
+                            mbarrier_wait(sfa_full_addr + (stage_4) * 8, _phase_a_full);
+                            mbarrier_wait(sfb_full_addr + (stage_4) * 8, _phase_a_full);
+                            asm volatile("tcgen05.fence::after_thread_sync;");
+                            uint32_t _elected_0 = elect_sync();
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                            #endif
+                            {
+                                uint64_t _tcgen05_cp_desc_1 = ((((uint64_t)(smem_sfa_addr + stage_4 * 2048)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                asm volatile(
+                                    "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                    "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                    :: "r"((uint32_t)(tmem_sfa + 0)), "l"(_tcgen05_cp_desc_1), "r"(_elected_0)
+                                    : "memory");
                             }
-                            elect_commit_cg2_multicast(mma_full_addr, (uint16_t)(3));
-                            mma_local_idx = mma_local_idx ^ 1;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                            #endif
+                            {
+                                uint64_t _tcgen05_cp_desc_2 = ((((uint64_t)(smem_sfa_addr + stage_4 * 2048 + 512)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                asm volatile(
+                                    "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                    "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                    :: "r"((uint32_t)(tmem_sfa + 4)), "l"(_tcgen05_cp_desc_2), "r"(_elected_0)
+                                    : "memory");
+                            }
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                            #endif
+                            {
+                                uint64_t _tcgen05_cp_desc_3 = ((((uint64_t)(smem_sfa_addr + stage_4 * 2048 + 1024)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                asm volatile(
+                                    "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                    "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                    :: "r"((uint32_t)(tmem_sfa + 8)), "l"(_tcgen05_cp_desc_3), "r"(_elected_0)
+                                    : "memory");
+                            }
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                            #endif
+                            {
+                                uint64_t _tcgen05_cp_desc_4 = ((((uint64_t)(smem_sfa_addr + stage_4 * 2048 + 1536)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                asm volatile(
+                                    "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                    "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                    :: "r"((uint32_t)(tmem_sfa + 12)), "l"(_tcgen05_cp_desc_4), "r"(_elected_0)
+                                    : "memory");
+                            }
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                            #endif
+                            {
+                                uint64_t _tcgen05_cp_desc_5 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                asm volatile(
+                                    "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                    "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                    :: "r"((uint32_t)(tmem_sfb + 0)), "l"(_tcgen05_cp_desc_5), "r"(_elected_0)
+                                    : "memory");
+                            }
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                            #endif
+                            {
+                                uint64_t _tcgen05_cp_desc_6 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 512)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                asm volatile(
+                                    "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                    "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                    :: "r"((uint32_t)(tmem_sfb + 8)), "l"(_tcgen05_cp_desc_6), "r"(_elected_0)
+                                    : "memory");
+                            }
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                            #endif
+                            {
+                                uint64_t _tcgen05_cp_desc_7 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 1024)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                asm volatile(
+                                    "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                    "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                    :: "r"((uint32_t)(tmem_sfb + 16)), "l"(_tcgen05_cp_desc_7), "r"(_elected_0)
+                                    : "memory");
+                            }
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                            #endif
+                            {
+                                uint64_t _tcgen05_cp_desc_8 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 1536)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                asm volatile(
+                                    "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                    "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                    :: "r"((uint32_t)(tmem_sfb + 24)), "l"(_tcgen05_cp_desc_8), "r"(_elected_0)
+                                    : "memory");
+                            }
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                            #endif
+                            {
+                                uint64_t _tcgen05_cp_desc_9 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 2048)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                asm volatile(
+                                    "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                    "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                    :: "r"((uint32_t)(tmem_sfb + 4)), "l"(_tcgen05_cp_desc_9), "r"(_elected_0)
+                                    : "memory");
+                            }
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                            #endif
+                            {
+                                uint64_t _tcgen05_cp_desc_10 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 2560)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                asm volatile(
+                                    "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                    "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                    :: "r"((uint32_t)(tmem_sfb + 12)), "l"(_tcgen05_cp_desc_10), "r"(_elected_0)
+                                    : "memory");
+                            }
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                            #endif
+                            {
+                                uint64_t _tcgen05_cp_desc_11 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 3072)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                asm volatile(
+                                    "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                    "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                    :: "r"((uint32_t)(tmem_sfb + 20)), "l"(_tcgen05_cp_desc_11), "r"(_elected_0)
+                                    : "memory");
+                            }
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                            #endif
+                            {
+                                uint64_t _tcgen05_cp_desc_12 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 3584)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                asm volatile(
+                                    "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                    "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                    :: "r"((uint32_t)(tmem_sfb + 28)), "l"(_tcgen05_cp_desc_12), "r"(_elected_0)
+                                    : "memory");
+                            }
+                            int _mma_a_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (stage_4) * 1024;
+                            int _mma_b_lo_0 = (((smem_b_addr) >> 4) & 0x3FFF) + (stage_4) * 1024;
+                            if (elect_sync()) {
+                                {
+                                    uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_0) | ((uint64_t)0x40004040 << 32);
+                                    uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_0) | ((uint64_t)0x40004040 << 32);
+
+                                    tcgen05_mma_mxf4nvf4_bs_cta2((tmem_accum + (mma_local_idx * 192)), a_desc + 0, b_desc + 0,
+                                        0x10400480U, tmem_sfa + 0 + 0, tmem_sfb + 0 + 0, ((((iter_k_4 == 0) ? 1 : 0)) ? 0 : 1));
+                                }
+                            }
+                            int mma_a_lo_0 = (((smem_a_addr + 32) >> 4) & 0x3FFF) + (stage_4) * 1024;
+                            int mma_b_lo_0 = (((smem_b_addr + 32) >> 4) & 0x3FFF) + (stage_4) * 1024;
+                            if (elect_sync()) {
+                                {
+                                    uint64_t a_desc = ((uint64_t)(uint32_t)mma_a_lo_0) | ((uint64_t)0x40004040 << 32);
+                                    uint64_t b_desc = ((uint64_t)(uint32_t)mma_b_lo_0) | ((uint64_t)0x40004040 << 32);
+
+                                    tcgen05_mma_mxf4nvf4_bs_cta2((tmem_accum + (mma_local_idx * 192)), a_desc + 0, b_desc + 0,
+                                        0x10400480U, tmem_sfa + 4 + 0, tmem_sfb + 8 + 0, 1);
+                                }
+                            }
+                            int mma_a_lo_1 = (((smem_a_addr + 64) >> 4) & 0x3FFF) + (stage_4) * 1024;
+                            int mma_b_lo_1 = (((smem_b_addr + 64) >> 4) & 0x3FFF) + (stage_4) * 1024;
+                            if (elect_sync()) {
+                                {
+                                    uint64_t a_desc = ((uint64_t)(uint32_t)mma_a_lo_1) | ((uint64_t)0x40004040 << 32);
+                                    uint64_t b_desc = ((uint64_t)(uint32_t)mma_b_lo_1) | ((uint64_t)0x40004040 << 32);
+
+                                    tcgen05_mma_mxf4nvf4_bs_cta2((tmem_accum + (mma_local_idx * 192)), a_desc + 0, b_desc + 0,
+                                        0x10400480U, tmem_sfa + 8 + 0, tmem_sfb + 16 + 0, 1);
+                                }
+                            }
+                            int mma_a_lo_2 = (((smem_a_addr + 96) >> 4) & 0x3FFF) + (stage_4) * 1024;
+                            int mma_b_lo_2 = (((smem_b_addr + 96) >> 4) & 0x3FFF) + (stage_4) * 1024;
+                            if (elect_sync()) {
+                                {
+                                    uint64_t a_desc = ((uint64_t)(uint32_t)mma_a_lo_2) | ((uint64_t)0x40004040 << 32);
+                                    uint64_t b_desc = ((uint64_t)(uint32_t)mma_b_lo_2) | ((uint64_t)0x40004040 << 32);
+
+                                    tcgen05_mma_mxf4nvf4_bs_cta2((tmem_accum + (mma_local_idx * 192)), a_desc + 0, b_desc + 0,
+                                        0x10400480U, tmem_sfa + 12 + 0, tmem_sfb + 24 + 0, 1);
+                                }
+                            }
+                            elect_commit_cg2_multicast(a_empty_addr + (stage_4) * 8, (uint16_t)(3));
+                            elect_commit_cg2_multicast(b_empty_addr + (stage_4) * 8, (uint16_t)(3));
+                            elect_commit_cg2_multicast(sfa_empty_addr + (stage_4) * 8, (uint16_t)(3));
+                            elect_commit_cg2_multicast(sfb_empty_addr + (stage_4) * 8, (uint16_t)(1));
+                            stage_4 += 1;
+                            if (stage_4 == 5) { stage_4 = 0; _phase_a_full ^= 1; }
                         }
+                        elect_commit_cg2_multicast(mma_full_addr, (uint16_t)(3));
+                        _phase_mma_free ^= 1;
+                        mma_local_idx = mma_local_idx ^ 1;
                     }
                     mbarrier_wait(work_full_addr + (work_stage_5) * 8, _phase_work_full_5);
                     unsigned int valid_5 = 0;
@@ -2231,15 +2209,14 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(work_empty_addr + work_stage_5 * 8), "r"(0) : "memory");
+                        :: "r"(work_empty_addr + (work_stage_5) * 8), "r"(0) : "memory");
                     work_stage_5 += 1;
                     if (work_stage_5 == 3) { work_stage_5 = 0; _phase_work_full_5 ^= 1; }
-                    unsigned int valid_0_5 = valid_5;
-                    m_tile_5 = next_x_5 + (unsigned int)cta_rank;
-                    n_tile_5 = next_y_5;
-                    if (valid_0_5 == 0) {
+                    if (valid_5 == 0) {
                         break;
                     }
+                    m_tile_5 = next_x_5 + (unsigned int)cta_rank;
+                    n_tile_5 = next_y_5;
                 }
             }
         }
@@ -2251,116 +2228,24 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
             int tile_count_6 = num_non_exiting_ctas[0];
             unsigned int work_stage_6 = 0;
             unsigned int throttle_stage_1 = 0;
-            unsigned int fast_stage = 0;
             unsigned int m_tile_6 = blockIdx.x;
             unsigned int n_tile_6 = blockIdx.y;
             unsigned int _phase_throttle_full = 0;
-            unsigned int _phase_fast_ready = 0;
             unsigned int _phase_work_empty = 1;
             unsigned int _phase_work_full_6 = 0;
+            unsigned int _phase_fast_ready = 0;
             if (cta_rank == 0) {
+                int drain = 0;
                 #pragma unroll 1
                 for (unsigned int _tile_iter_6 = 0; _tile_iter_6 < grid_m / 2 * grid_n; _tile_iter_6++) {
-                    if (tile_count_6 > (int)n_tile_6) {
-                        mbarrier_wait(throttle_full_addr + (throttle_stage_1) * 8, _phase_throttle_full);
-                        mbarrier_arrive(throttle_empty_addr + (throttle_stage_1) * 8);
-                        throttle_stage_1 += 1;
-                        if (throttle_stage_1 == 3) { throttle_stage_1 = 0; _phase_throttle_full ^= 1; }
-                    } else {
-                        #pragma unroll 1
-                        for (unsigned int _drain_iter = 0; _drain_iter < grid_m / 2 * grid_n; _drain_iter++) {
-                            if (elect_sync()) {
-                                mbarrier_arrive_expect_tx(fast_ready_addr + (fast_stage) * 8, 64);
-                                asm volatile(
-                                    "fence.proxy.async.shared::cta;\n\t"
-                                    "clusterlaunchcontrol.try_cancel.async.shared::cta"
-                                        ".mbarrier::complete_tx::bytes.b128"
-                                        " [%0], [%1];"
-                                    :: "r"(fast_response_addr + fast_stage * 64 + 0 * 16), "r"(fast_ready_addr + fast_stage * 8)
-                                    : "memory");
-                                asm volatile(
-                                    "fence.proxy.async.shared::cta;\n\t"
-                                    "clusterlaunchcontrol.try_cancel.async.shared::cta"
-                                        ".mbarrier::complete_tx::bytes.b128"
-                                        " [%0], [%1];"
-                                    :: "r"(fast_response_addr + fast_stage * 64 + 1 * 16), "r"(fast_ready_addr + fast_stage * 8)
-                                    : "memory");
-                                asm volatile(
-                                    "fence.proxy.async.shared::cta;\n\t"
-                                    "clusterlaunchcontrol.try_cancel.async.shared::cta"
-                                        ".mbarrier::complete_tx::bytes.b128"
-                                        " [%0], [%1];"
-                                    :: "r"(fast_response_addr + fast_stage * 64 + 2 * 16), "r"(fast_ready_addr + fast_stage * 8)
-                                    : "memory");
-                                asm volatile(
-                                    "fence.proxy.async.shared::cta;\n\t"
-                                    "clusterlaunchcontrol.try_cancel.async.shared::cta"
-                                        ".mbarrier::complete_tx::bytes.b128"
-                                        " [%0], [%1];"
-                                    :: "r"(fast_response_addr + fast_stage * 64 + 3 * 16), "r"(fast_ready_addr + fast_stage * 8)
-                                    : "memory");
-                            }
-                            mbarrier_wait(fast_ready_addr + (fast_stage) * 8, _phase_fast_ready);
-                            unsigned int canceled = 0;
-                            uint32_t _clc_valid_6 = 0;
-                            asm volatile(
-                                "{\n\t"
-                                ".reg .pred p1;\n\t"
-                                ".reg .b128 clc_r;\n\t"
-                                "ld.shared.b128 clc_r, [%1];\n\t"
-                                "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
-                                "selp.u32 %0, 1, 0, p1;\n\t"
-                                "}\n"
-                                : "=r"(_clc_valid_6)
-                                : "r"(fast_response_addr + fast_stage * 64 + 0 * 16)
-                                : "memory");
-                            canceled = canceled + _clc_valid_6;
-                            uint32_t _clc_valid_7 = 0;
-                            asm volatile(
-                                "{\n\t"
-                                ".reg .pred p1;\n\t"
-                                ".reg .b128 clc_r;\n\t"
-                                "ld.shared.b128 clc_r, [%1];\n\t"
-                                "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
-                                "selp.u32 %0, 1, 0, p1;\n\t"
-                                "}\n"
-                                : "=r"(_clc_valid_7)
-                                : "r"(fast_response_addr + fast_stage * 64 + 1 * 16)
-                                : "memory");
-                            canceled = canceled + _clc_valid_7;
-                            uint32_t _clc_valid_8 = 0;
-                            asm volatile(
-                                "{\n\t"
-                                ".reg .pred p1;\n\t"
-                                ".reg .b128 clc_r;\n\t"
-                                "ld.shared.b128 clc_r, [%1];\n\t"
-                                "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
-                                "selp.u32 %0, 1, 0, p1;\n\t"
-                                "}\n"
-                                : "=r"(_clc_valid_8)
-                                : "r"(fast_response_addr + fast_stage * 64 + 2 * 16)
-                                : "memory");
-                            canceled = canceled + _clc_valid_8;
-                            uint32_t _clc_valid_9 = 0;
-                            asm volatile(
-                                "{\n\t"
-                                ".reg .pred p1;\n\t"
-                                ".reg .b128 clc_r;\n\t"
-                                "ld.shared.b128 clc_r, [%1];\n\t"
-                                "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
-                                "selp.u32 %0, 1, 0, p1;\n\t"
-                                "}\n"
-                                : "=r"(_clc_valid_9)
-                                : "r"(fast_response_addr + fast_stage * 64 + 3 * 16)
-                                : "memory");
-                            canceled = canceled + _clc_valid_9;
-                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                            _phase_fast_ready ^= 1;
-                            if (canceled == 0) {
-                                break;
-                            }
-                        }
+                    if (tile_count_6 <= (int)n_tile_6) {
+                        drain = 1;
+                        break;
                     }
+                    mbarrier_wait(throttle_full_addr + (throttle_stage_1) * 8, _phase_throttle_full);
+                    mbarrier_arrive(throttle_empty_addr + (throttle_stage_1) * 8);
+                    throttle_stage_1 += 1;
+                    if (throttle_stage_1 == 3) { throttle_stage_1 = 0; _phase_throttle_full ^= 1; }
                     mbarrier_wait(work_empty_addr + (work_stage_6) * 8, _phase_work_empty);
                     if (lane < 2) {
                         asm volatile(
@@ -2369,7 +2254,7 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                             "}"
-                            :: "r"(work_full_addr + work_stage_6 * 8), "r"(lane), "r"((uint32_t)(16)) : "memory");
+                            :: "r"(work_full_addr + (work_stage_6) * 8), "r"(lane), "r"((uint32_t)(16)) : "memory");
                     }
                     if (elect_sync()) {
                         asm volatile(
@@ -2384,7 +2269,7 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     unsigned int valid_6 = 0;
                     unsigned int next_x_6 = 0;
                     unsigned int next_y_6 = 0;
-                    uint32_t _clc_valid_10 = 0;
+                    uint32_t clc_valid_5 = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -2393,11 +2278,11 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "selp.u32 %0, 1, 0, p1;\n\t"
                         "}\n"
-                        : "=r"(_clc_valid_10)
+                        : "=r"(clc_valid_5)
                         : "r"(work_response_addr + work_stage_6 * 16 + 0 * 16)
                         : "memory");
-                    valid_6 = _clc_valid_10;
-                    uint32_t _clc_ctaid_12 = 0;
+                    valid_6 = clc_valid_5;
+                    uint32_t clc_ctaid_6 = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -2406,11 +2291,11 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                         "}\n"
-                        : "+r"(_clc_ctaid_12)
+                        : "+r"(clc_ctaid_6)
                         : "r"(work_response_addr + work_stage_6 * 16 + 0 * 16)
                         : "memory");
-                    next_x_6 = _clc_ctaid_12;
-                    uint32_t _clc_ctaid_13 = 0;
+                    next_x_6 = clc_ctaid_6;
+                    uint32_t clc_ctaid_1_5 = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -2419,10 +2304,10 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
                         "}\n"
-                        : "+r"(_clc_ctaid_13)
+                        : "+r"(clc_ctaid_1_5)
                         : "r"(work_response_addr + work_stage_6 * 16 + 0 * 16)
                         : "memory");
-                    next_y_6 = _clc_ctaid_13;
+                    next_y_6 = clc_ctaid_1_5;
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile(
                         "{\n\t"
@@ -2430,18 +2315,113 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(work_empty_addr + work_stage_6 * 8), "r"(0) : "memory");
+                        :: "r"(work_empty_addr + (work_stage_6) * 8), "r"(0) : "memory");
                     work_stage_6 += 1;
                     if (work_stage_6 == 3) { work_stage_6 = 0; _phase_work_empty ^= 1; _phase_work_full_6 ^= 1; }
-                    unsigned int valid_0_6 = valid_6;
+                    if (valid_6 == 0) {
+                        break;
+                    }
                     m_tile_6 = next_x_6 + (unsigned int)cta_rank;
                     n_tile_6 = next_y_6;
-                    if (valid_0_6 == 0) {
-                        break;
+                }
+                if (drain != 0) {
+                    #pragma unroll 1
+                    for (unsigned int _drain_iter = 0; _drain_iter < grid_m / 2 * grid_n; _drain_iter++) {
+                        __syncwarp();
+                        if (elect_sync()) {
+                            mbarrier_arrive_expect_tx(fast_ready_addr, 64);
+                            asm volatile(
+                                "fence.proxy.async.shared::cta;\n\t"
+                                "clusterlaunchcontrol.try_cancel.async.shared::cta"
+                                    ".mbarrier::complete_tx::bytes.b128"
+                                    " [%0], [%1];"
+                                :: "r"(fast_response_addr + 0 * 64 + 0 * 16), "r"(fast_ready_addr + 0 * 8)
+                                : "memory");
+                            asm volatile(
+                                "fence.proxy.async.shared::cta;\n\t"
+                                "clusterlaunchcontrol.try_cancel.async.shared::cta"
+                                    ".mbarrier::complete_tx::bytes.b128"
+                                    " [%0], [%1];"
+                                :: "r"(fast_response_addr + 0 * 64 + 1 * 16), "r"(fast_ready_addr + 0 * 8)
+                                : "memory");
+                            asm volatile(
+                                "fence.proxy.async.shared::cta;\n\t"
+                                "clusterlaunchcontrol.try_cancel.async.shared::cta"
+                                    ".mbarrier::complete_tx::bytes.b128"
+                                    " [%0], [%1];"
+                                :: "r"(fast_response_addr + 0 * 64 + 2 * 16), "r"(fast_ready_addr + 0 * 8)
+                                : "memory");
+                            asm volatile(
+                                "fence.proxy.async.shared::cta;\n\t"
+                                "clusterlaunchcontrol.try_cancel.async.shared::cta"
+                                    ".mbarrier::complete_tx::bytes.b128"
+                                    " [%0], [%1];"
+                                :: "r"(fast_response_addr + 0 * 64 + 3 * 16), "r"(fast_ready_addr + 0 * 8)
+                                : "memory");
+                        }
+                        mbarrier_wait(fast_ready_addr, _phase_fast_ready);
+                        unsigned int canceled = 0;
+                        uint32_t _clc_valid_6 = 0;
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .pred p1;\n\t"
+                            ".reg .b128 clc_r;\n\t"
+                            "ld.shared.b128 clc_r, [%1];\n\t"
+                            "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                            "selp.u32 %0, 1, 0, p1;\n\t"
+                            "}\n"
+                            : "=r"(_clc_valid_6)
+                            : "r"(fast_response_addr + 0 * 64 + 0 * 16)
+                            : "memory");
+                        canceled = canceled + _clc_valid_6;
+                        uint32_t _clc_valid_7 = 0;
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .pred p1;\n\t"
+                            ".reg .b128 clc_r;\n\t"
+                            "ld.shared.b128 clc_r, [%1];\n\t"
+                            "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                            "selp.u32 %0, 1, 0, p1;\n\t"
+                            "}\n"
+                            : "=r"(_clc_valid_7)
+                            : "r"(fast_response_addr + 0 * 64 + 1 * 16)
+                            : "memory");
+                        canceled = canceled + _clc_valid_7;
+                        uint32_t _clc_valid_8 = 0;
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .pred p1;\n\t"
+                            ".reg .b128 clc_r;\n\t"
+                            "ld.shared.b128 clc_r, [%1];\n\t"
+                            "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                            "selp.u32 %0, 1, 0, p1;\n\t"
+                            "}\n"
+                            : "=r"(_clc_valid_8)
+                            : "r"(fast_response_addr + 0 * 64 + 2 * 16)
+                            : "memory");
+                        canceled = canceled + _clc_valid_8;
+                        uint32_t _clc_valid_9 = 0;
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .pred p1;\n\t"
+                            ".reg .b128 clc_r;\n\t"
+                            "ld.shared.b128 clc_r, [%1];\n\t"
+                            "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                            "selp.u32 %0, 1, 0, p1;\n\t"
+                            "}\n"
+                            : "=r"(_clc_valid_9)
+                            : "r"(fast_response_addr + 0 * 64 + 3 * 16)
+                            : "memory");
+                        canceled = canceled + _clc_valid_9;
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                        _phase_fast_ready ^= 1;
+                        if (canceled == 0) {
+                            break;
+                        }
                     }
                 }
                 #pragma unroll 1
-                for (unsigned int _tail_iter = 0; _tail_iter < 3; _tail_iter++) {
+                for (unsigned int _tail_iter_3 = 0; _tail_iter_3 < 3; _tail_iter_3++) {
                     mbarrier_wait(work_empty_addr + (work_stage_6) * 8, _phase_work_empty);
                     work_stage_6 += 1;
                     if (work_stage_6 == 3) { work_stage_6 = 0; _phase_work_empty ^= 1; _phase_work_full_6 ^= 1; }
@@ -2452,12 +2432,16 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
     // ---- Role: padding ----
     if (warp >= 10 && warp <= 11) {
         { // padding_main
+            int tile_count_7 = num_non_exiting_ctas[0];
             unsigned int work_stage_7 = 0;
             unsigned int m_tile_7 = blockIdx.x;
             unsigned int n_tile_7 = blockIdx.y;
             unsigned int _phase_work_full_7 = 0;
             #pragma unroll 1
             for (unsigned int _tile_iter_7 = 0; _tile_iter_7 < grid_m / 2 * grid_n; _tile_iter_7++) {
+                if (tile_count_7 <= (int)n_tile_7) {
+                    break;
+                }
                 mbarrier_wait(work_full_addr + (work_stage_7) * 8, _phase_work_full_7);
                 unsigned int valid_7 = 0;
                 unsigned int next_x_7 = 0;
@@ -2508,15 +2492,14 @@ kernel_cake_stepfun_moe_f496b224df3869be9686(const __grid_constant__ CUtensorMap
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(work_empty_addr + work_stage_7 * 8), "r"(0) : "memory");
+                    :: "r"(work_empty_addr + (work_stage_7) * 8), "r"(0) : "memory");
                 work_stage_7 += 1;
                 if (work_stage_7 == 3) { work_stage_7 = 0; _phase_work_full_7 ^= 1; }
-                unsigned int valid_0_7 = valid_7;
-                m_tile_7 = next_x_7 + (unsigned int)cta_rank;
-                n_tile_7 = next_y_7;
-                if (valid_0_7 == 0) {
+                if (valid_7 == 0) {
                     break;
                 }
+                m_tile_7 = next_x_7 + (unsigned int)cta_rank;
+                n_tile_7 = next_y_7;
             }
         }
     }

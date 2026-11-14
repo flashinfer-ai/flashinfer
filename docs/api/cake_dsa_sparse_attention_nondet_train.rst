@@ -16,8 +16,9 @@ not bitwise reproducible run to run.  Under
 ``torch.use_deterministic_algorithms(True)`` the backward raises PyTorch's
 alert before its first backward kernel launch; with ``warn_only=True`` it
 warns and runs.  It never falls back to a deterministic implementation.  The
-deterministic package ``flashinfer.cake_dsa_sparse_attention_det_train`` is
-planned.
+deterministic package ``flashinfer.cake_dsa_sparse_attention_det_train`` has
+the same entry points (``det`` in place of ``nondet``); its outputs repeat bit
+for bit run to run.
 
 Each entry is an autograd call.  The rope entries score the latent and rope
 parts; the NoPE entries score the latent part only.  The varlen entries take

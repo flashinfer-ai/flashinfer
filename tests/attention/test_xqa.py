@@ -6,8 +6,8 @@ import torch
 
 from flashinfer import xqa, xqa_mla
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.pdl import late_store
-from tests.test_helpers.parametrize import (
+from tests.utils.test_helpers.pdl import late_store
+from tests.infra.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )

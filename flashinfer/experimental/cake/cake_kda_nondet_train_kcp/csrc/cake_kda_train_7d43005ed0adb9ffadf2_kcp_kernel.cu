@@ -281,7 +281,7 @@ kernel_cake_kda_train_7d43005ed0adb9ffadf2_kcp(const __grid_constant__ CUtensorM
             int h0_slot = h0_index[seg];
             if (h0_slot >= 0) {
                 int h0_tile = (head / h0_hg * h0_n + h0_slot) * h0_hg + head % h0_hg;
-                long long h0_base = (long long)h0_tile * (long long)tile_stride * 16384 + (long long)(k_row * 128);
+                long long h0_base = (long long)h0_tile * (long long)tile_stride * 16384ll + (long long)(k_row * 128);
                 #pragma unroll
                 for (int blk = 0; blk < 8; blk++) {
                     #pragma unroll
@@ -354,56 +354,56 @@ kernel_cake_kda_train_7d43005ed0adb9ffadf2_kcp(const __grid_constant__ CUtensorM
             u_pk[31] = 0;
             if (nc > 0) {
                 {
-                    uint4 _uv4_1 = *reinterpret_cast<const uint4*>(u + ((long long)(row0 + t_row) * (long long)num_heads + (long long)head) * 128 + (long long)(lane_half * 16));
+                    uint4 _uv4_1 = *reinterpret_cast<const uint4*>(u + ((long long)(row0 + t_row) * (long long)num_heads + (long long)head) * 128ll + (long long)(lane_half * 16));
                     u_pk[0 + 0] = _uv4_1.x;
                     u_pk[0 + 1] = _uv4_1.y;
                     u_pk[0 + 2] = _uv4_1.z;
                     u_pk[0 + 3] = _uv4_1.w;
                 }
                 {
-                    uint4 _uv4_2 = *reinterpret_cast<const uint4*>(u + ((long long)(row0 + t_row) * (long long)num_heads + (long long)head) * 128 + (long long)(lane_half * 16 + 8));
+                    uint4 _uv4_2 = *reinterpret_cast<const uint4*>(u + ((long long)(row0 + t_row) * (long long)num_heads + (long long)head) * 128ll + (long long)(lane_half * 16 + 8));
                     u_pk[4 + 0] = _uv4_2.x;
                     u_pk[4 + 1] = _uv4_2.y;
                     u_pk[4 + 2] = _uv4_2.z;
                     u_pk[4 + 3] = _uv4_2.w;
                 }
                 {
-                    uint4 _uv4_3 = *reinterpret_cast<const uint4*>(u + ((long long)(row0 + t_row) * (long long)num_heads + (long long)head) * 128 + (long long)(32 + lane_half * 16));
+                    uint4 _uv4_3 = *reinterpret_cast<const uint4*>(u + ((long long)(row0 + t_row) * (long long)num_heads + (long long)head) * 128ll + (long long)(32 + lane_half * 16));
                     u_pk[8 + 0] = _uv4_3.x;
                     u_pk[8 + 1] = _uv4_3.y;
                     u_pk[8 + 2] = _uv4_3.z;
                     u_pk[8 + 3] = _uv4_3.w;
                 }
                 {
-                    uint4 _uv4_4 = *reinterpret_cast<const uint4*>(u + ((long long)(row0 + t_row) * (long long)num_heads + (long long)head) * 128 + (long long)(32 + lane_half * 16 + 8));
+                    uint4 _uv4_4 = *reinterpret_cast<const uint4*>(u + ((long long)(row0 + t_row) * (long long)num_heads + (long long)head) * 128ll + (long long)(32 + lane_half * 16 + 8));
                     u_pk[12 + 0] = _uv4_4.x;
                     u_pk[12 + 1] = _uv4_4.y;
                     u_pk[12 + 2] = _uv4_4.z;
                     u_pk[12 + 3] = _uv4_4.w;
                 }
                 {
-                    uint4 _uv4_5 = *reinterpret_cast<const uint4*>(u + ((long long)(row0 + t_row) * (long long)num_heads + (long long)head) * 128 + (long long)(64 + lane_half * 16));
+                    uint4 _uv4_5 = *reinterpret_cast<const uint4*>(u + ((long long)(row0 + t_row) * (long long)num_heads + (long long)head) * 128ll + (long long)(64 + lane_half * 16));
                     u_pk[16 + 0] = _uv4_5.x;
                     u_pk[16 + 1] = _uv4_5.y;
                     u_pk[16 + 2] = _uv4_5.z;
                     u_pk[16 + 3] = _uv4_5.w;
                 }
                 {
-                    uint4 _uv4_6 = *reinterpret_cast<const uint4*>(u + ((long long)(row0 + t_row) * (long long)num_heads + (long long)head) * 128 + (long long)(64 + lane_half * 16 + 8));
+                    uint4 _uv4_6 = *reinterpret_cast<const uint4*>(u + ((long long)(row0 + t_row) * (long long)num_heads + (long long)head) * 128ll + (long long)(64 + lane_half * 16 + 8));
                     u_pk[20 + 0] = _uv4_6.x;
                     u_pk[20 + 1] = _uv4_6.y;
                     u_pk[20 + 2] = _uv4_6.z;
                     u_pk[20 + 3] = _uv4_6.w;
                 }
                 {
-                    uint4 _uv4_7 = *reinterpret_cast<const uint4*>(u + ((long long)(row0 + t_row) * (long long)num_heads + (long long)head) * 128 + (long long)(96 + lane_half * 16));
+                    uint4 _uv4_7 = *reinterpret_cast<const uint4*>(u + ((long long)(row0 + t_row) * (long long)num_heads + (long long)head) * 128ll + (long long)(96 + lane_half * 16));
                     u_pk[24 + 0] = _uv4_7.x;
                     u_pk[24 + 1] = _uv4_7.y;
                     u_pk[24 + 2] = _uv4_7.z;
                     u_pk[24 + 3] = _uv4_7.w;
                 }
                 {
-                    uint4 _uv4_8 = *reinterpret_cast<const uint4*>(u + ((long long)(row0 + t_row) * (long long)num_heads + (long long)head) * 128 + (long long)(96 + lane_half * 16 + 8));
+                    uint4 _uv4_8 = *reinterpret_cast<const uint4*>(u + ((long long)(row0 + t_row) * (long long)num_heads + (long long)head) * 128ll + (long long)(96 + lane_half * 16 + 8));
                     u_pk[28 + 0] = _uv4_8.x;
                     u_pk[28 + 1] = _uv4_8.y;
                     u_pk[28 + 2] = _uv4_8.z;
@@ -436,7 +436,7 @@ kernel_cake_kda_train_7d43005ed0adb9ffadf2_kcp(const __grid_constant__ CUtensorM
                 mbarrier_wait(vp_ready_addr, _phase_vp_ready_0);
                 _phase_vp_ready_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
-                long long u_base = ((long long)(row0 + c * 64 + t_row) * (long long)num_heads + (long long)head) * 128;
+                long long u_base = ((long long)(row0 + c * 64 + t_row) * (long long)num_heads + (long long)head) * 128ll;
                 float vp_blk_0[16];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
@@ -622,7 +622,7 @@ kernel_cake_kda_train_7d43005ed0adb9ffadf2_kcp(const __grid_constant__ CUtensorM
             int out_slot = out_index[seg];
             if (out_slot >= 0) {
                 int out_tile = (head / out_hg * out_n + out_slot) * out_hg + head % out_hg;
-                long long out_base = (long long)out_tile * (long long)tile_stride * 16384 + (long long)(k_row * 128);
+                long long out_base = (long long)out_tile * (long long)tile_stride * 16384ll + (long long)(k_row * 128);
                 #pragma unroll
                 for (int blk_3 = 0; blk_3 < 8; blk_3++) {
                     float h_out[16];
@@ -658,7 +658,7 @@ kernel_cake_kda_train_7d43005ed0adb9ffadf2_kcp(const __grid_constant__ CUtensorM
             int h_row_base_1 = warp_in_wg_1 * 32 << 16;
             float gk_pre = 0.0f;
             if (nc_1 > 0) {
-                long long gn_first = ((long long)(row0_1 + 64 - 1) * (long long)num_heads + (long long)head_1) * 128 + (long long)k_row_1;
+                long long gn_first = ((long long)(row0_1 + 64 - 1) * (long long)num_heads + (long long)head_1) * 128ll + (long long)k_row_1;
                 gk_pre = gk[gn_first];
             }
             unsigned int _phase_hs_ready_0 = 0;
@@ -741,7 +741,7 @@ kernel_cake_kda_train_7d43005ed0adb9ffadf2_kcp(const __grid_constant__ CUtensorM
                 }
                 tmem_st_x16_f32(taddr + (unsigned int)h_row_base_1 + 112, hd_7);
                 if (nc_1 > c_1 + 1) {
-                    long long gn_next = ((long long)(row0_1 + c_1 * 64 + 128 - 1) * (long long)num_heads + (long long)head_1) * 128 + (long long)k_row_1;
+                    long long gn_next = ((long long)(row0_1 + c_1 * 64 + 128 - 1) * (long long)num_heads + (long long)head_1) * 128ll + (long long)k_row_1;
                     gk_pre = gk[gn_next];
                 }
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");

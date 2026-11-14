@@ -113,7 +113,9 @@ from __future__ import annotations
 import bisect
 import dataclasses
 import functools
+import hashlib
 import inspect
+import json
 import operator
 import weakref
 from collections.abc import Mapping, Sequence
@@ -2451,6 +2453,94 @@ def cake_kda_nondet_train_kcp_build_context(
 
 
 # ----------------------------------------------------------------------------------------------------------------
+# Rank agreement (``cake_kcp._rank_check``): the digest the ranks of ``ctx.group`` compare once per call key.
+#
+# The inputs that set the count, order or split sizes of a call's collectives, or the form of its recurrence, must be
+# the same on every rank: the partition (every rank's fragments, hence the chains, the crossing counts and the c1 / c2
+# / b1 / b2 splits and ring hops), the context's ``conv_kernel_size`` (the halo plan), and the call's
+# :data:`RANK_CHECK_FIELDS`.  The rank-local inputs stay out of the digest: the rank (the partition holds every rank's
+# fragments), the SM count and the plan rule (the segment count ``P``: the splits use the crossing counts and the head
+# plan of ``(H, W)`` only), the walk geometry and form, the cache-config bracket, the checkpoint hand-off decision, the
+# graph mode, the workspace and the schedule knobs: they change rank-local launches only.
+
+# the digest's format: a change makes every rank's digest change alike
+RANK_CHECK_VERSION = 1
+# the call's inputs in the digest, in this order: the value-head count, the resolved exchange ("a2a" / "ring"), the
+# resolved save_transfer, the boundary mode ("saved": the forward keeps a saved set and the backward reads it,
+# "replay": the backward replays the forward), debug_sequence, whether the call carries a recompute handle (its
+# recompute exchanges nothing), the gate mode ("g" / "raw") and use_qk_l2norm_in_kernel
+RANK_CHECK_FIELDS = (
+    "H",
+    "exchange",
+    "save_transfer",
+    "boundary",
+    "debug_sequence",
+    "recompute_handle",
+    "gate",
+    "qk_l2norm",
+)
+_RANK_CHECK_TYPES = {
+    "H": int,
+    "exchange": str,
+    "save_transfer": bool,
+    "boundary": str,
+    "debug_sequence": bool,
+    "recompute_handle": bool,
+    "gate": str,
+    "qk_l2norm": bool,
+}
+
+
+def _canonical(obj: Any) -> bytes:
+    """``obj`` as compact JSON with sorted keys (the same bytes on every rank for equal host values)."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+
+
+def kcp_partition_digest(part: CakeKDANondetKcpPartition) -> bytes:
+    """BLAKE2b-128 of the partition's canonical dict (:meth:`CakeKDANondetKcpPartition.to_dict`: the world size,
+    the layout, the global ``cu_seqlens`` and every rank's fragment records ``(doc, offset, length, prev, next)``):
+    16 bytes, equal for equal partitions whatever object holds them."""
+    if not isinstance(part, CakeKDANondetKcpPartition):
+        raise TypeError(
+            "kcp_partition_digest: part must be a CakeKDANondetKcpPartition"
+        )
+    return hashlib.blake2b(_canonical(part.to_dict()), digest_size=16).digest()
+
+
+def kcp_rank_digest(
+    partition_digest: bytes, conv_kernel_size: int, fields: Mapping[str, Any]
+) -> bytes:
+    """The 16-byte digest one call key's ranks compare (BLAKE2b-128 of the canonical JSON of
+    :data:`RANK_CHECK_VERSION`, the partition's :func:`kcp_partition_digest`, ``conv_kernel_size`` and ``fields``,
+    which holds exactly the :data:`RANK_CHECK_FIELDS` with their host types).  Host data only; no rank-local input
+    enters it."""
+    if (
+        not isinstance(partition_digest, (bytes, bytearray))
+        or len(partition_digest) != 16
+    ):
+        raise ValueError(
+            "kcp_rank_digest: partition_digest is the 16 bytes of kcp_partition_digest"
+        )
+    if set(fields) != set(RANK_CHECK_FIELDS):
+        raise ValueError(
+            f"kcp_rank_digest: fields must be exactly {RANK_CHECK_FIELDS}, got {sorted(fields)}"
+        )
+    for name, kind in _RANK_CHECK_TYPES.items():
+        value = fields[name]
+        if type(value) is not kind:  # bool is not an int here, nor an int a bool
+            raise TypeError(
+                f"kcp_rank_digest: {name} must be a {kind.__name__}, got {type(value).__name__}"
+            )
+    payload = {
+        "version": RANK_CHECK_VERSION,
+        "partition": bytes(partition_digest).hex(),
+        "conv_kernel_size": int(conv_kernel_size),
+        **{name: fields[name] for name in RANK_CHECK_FIELDS},
+    }
+    return hashlib.blake2b(_canonical(payload), digest_size=16).digest()
+
+
+# ----------------------------------------------------------------------------------------------------------------
 # Byte queries (the design note §9; keyword-only beyond ``ctx``: the context carries no H)
 
 
@@ -2471,8 +2561,10 @@ CHECKPOINT_KEEPS = ("states", "transfer")
 # default) where :func:`kcp_handoff_auto_refusal` admits the call:
 #
 #     (architecture, SM count, Cake build toolkit "major.minor") of the device in KCP_HANDOFF_VERIFIED
+#         (raw gate mode / in-kernel Q / K L2 norm: in KCP_HANDOFF_VERIFIED_MODES[(gate mode, l2n)])
 #     and H in KCP_HANDOFF_HEADS
 #     and H * (total packed tokens // world size) >= KCP_HANDOFF_MIN_HEAD_TOKENS
+#         (and >= KCP_HANDOFF_MIN_HEAD_TOKENS_BY_KEY[key] for a key with its own bound)
 #
 # Measured on the four keys below (B200, B300, GB300, R200; T = 261392 packed tokens in 4 documents, BF16, head dim
 # 128), ckpt step time with the hand-off off / on.  On the rows "auto" admits, measured with "auto" at this version on
@@ -2488,8 +2580,10 @@ CHECKPOINT_KEEPS = ("states", "transfer")
 # the 1.1-4.3 % H4 CP4 gains of B200, B300 and R200 with it).  Every key measured the output and every gradient bitwise
 # equal with the hand-off on and off.  The hand-off raises the checkpoint peak by at most :func:`cake_kda_nondet_train_kcp_handoff_bytes`
 # per rank (measured with "on" on the first version: +152 MiB at CP8 H4 to +10196 MiB at CP2 H64; with "auto" at this
-# version: +625.5 MiB at CP8 H16 to +10196 MiB at CP2 H64).  A new device, toolkit or head count needs those rows again
-# before it enters KCP_HANDOFF_VERIFIED or KCP_HANDOFF_HEADS.
+# version: +625.5 MiB at CP8 H16 to +10196 MiB at CP2 H64).  GB200 (sm_100a, 152, 13.4) entered later on the rule's
+# rows at H 4 / 8 / 16 / 64 at CP2 and CP4, every output and gradient bitwise those of "off", with its own, higher
+# work bound (KCP_HANDOFF_MIN_HEAD_TOKENS_BY_KEY).  A new device, toolkit or head count needs those rows again before
+# it enters KCP_HANDOFF_VERIFIED or KCP_HANDOFF_HEADS.
 #
 # H, the total and the world size are the same on every rank (the layer's head count and the partition every rank
 # builds its context from), so every rank of a group of one device kind decides alike.  A rank may still differ (a
@@ -2504,19 +2598,113 @@ KCP_HANDOFF_VERIFIED: frozenset[tuple[str, int, str]] = frozenset(
         ("sm_103a", 148, "13.4"),  # B300
         ("sm_103a", 152, "13.4"),  # GB300
         ("sm_107a", 212, "13.4"),  # R200
+        # GB200, with its own work bound (KCP_HANDOFF_MIN_HEAD_TOKENS_BY_KEY)
+        ("sm_100a", 152, "13.4"),
     }
 )
+# The raw gate mode and the in-kernel Q / K L2 norm (by ``(gate mode, use_qk_l2norm_in_kernel)``): the keys whose
+# hand-off rows (tests/experimental/test_cake_kda_nondet_train_kcp_handoff.py, the rows of the mode) measured the output
+# and every gradient bitwise those of "off" in that mode.  "auto" admits a call of such a mode on these keys only (the
+# head and work bounds are the activated gate's); the activated gate without the norm reads KCP_HANDOFF_VERIFIED.  The
+# local programs of these modes differ per architecture (the forward's and the replay's intra records, the
+# saved-rstd prep twin), so a key of KCP_HANDOFF_VERIFIED is no evidence for them.  The shared bounds hold in each
+# mode on GB300: the rule's rows (T = 261392 in 4 documents, zigzag per document, H 4 / 8 / 16 / 32 / 64 at CP2 and
+# CP4, the hand-off forced on, every output and gradient bitwise those of "off") gain 3.4-8.6 % on every row the
+# bounds admit, and the only losses are H4 at CP4 (0.957-0.961), which the work bound refuses.  On R200 the same
+# rows (H 4 / 8 / 16 / 64 at CP2 and CP4) gain 4.2-8.9 % on every row the bounds admit, each in a run with every A/A
+# ratio within 0.985-1.011 and drift below 2 % (raw gate + L2 norm 1.042-1.069, L2 norm 1.047-1.067, raw gate
+# 1.066-1.089), and the H4 CP4 rows the work bound refuses measure 0.984-1.044.  GB200 holds them with its own work
+# bound (KCP_HANDOFF_MIN_HEAD_TOKENS_BY_KEY, below).  A device enters a mode's set with the mode's hand-off rows and
+# these rows on it.
+KCP_HANDOFF_VERIFIED_MODES: dict[tuple[str, bool], frozenset[tuple[str, int, str]]] = {
+    ("raw", False): frozenset(
+        {("sm_103a", 152, "13.4"), ("sm_107a", 212, "13.4"), ("sm_100a", 152, "13.4")}
+    ),  # GB300, R200, GB200
+    ("g", True): frozenset(
+        {("sm_103a", 152, "13.4"), ("sm_107a", 212, "13.4"), ("sm_100a", 152, "13.4")}
+    ),  # GB300, R200, GB200
+    ("raw", True): frozenset(
+        {("sm_103a", 152, "13.4"), ("sm_107a", 212, "13.4"), ("sm_100a", 152, "13.4")}
+    ),  # GB300, R200, GB200
+}
 KCP_HANDOFF_HEADS: frozenset[int] = frozenset({4, 8, 16, 32, 64})
 KCP_HANDOFF_MIN_HEAD_TOKENS = 393216
+# A key's own work bound, above the shared one, where the rule's rows at the shared bound do not gain on that device
+# (checked with the key, after the shared bounds, in every gate / L2 norm mode; refused as "work").  GB200 (sm_100a,
+# 152, 13.4): the rule's rows (T = 261392 in 4 documents, zigzag per document, H 4 / 8 / 16 / 64 at CP2 and CP4, the
+# hand-off forced on; activated gate, raw gate, L2 norm and both) measured every output and gradient bitwise those of
+# "off" with the hand-off engaged on every rank.  H * T / W = 522784 does not gain reliably there: H8 at CP4 measures
+# 1.004-1.064 in runs within the A/A and drift limits (1.004 on the raw gate, no such run with the L2 norm alone) and
+# down to 0.988 in runs over the drift limit, while H4 at CP2 (the same work) gains 1.020-1.065.  The bound 786432
+# lies between 522784 and 1045568: every row it admits (H8 at CP2, H16 and H64 at CP2 and CP4) gains 1.060-1.081 in
+# runs within both limits (the activated gate's H16 CP4 row: 1.059, one run, drift 2.5 %), and it refuses H4 at CP4
+# (0.958-0.978), H8 at CP4 and H4 at CP2.  The H64 step at 16384 tokens per rank (1048576) is admitted.
+KCP_HANDOFF_MIN_HEAD_TOKENS_BY_KEY: dict[tuple[object, ...], int] = {
+    ("sm_100a", 152, "13.4"): 786432,  # GB200
+}
 # the tape set, in saved-set order: the h tape BF16 [NC_pad, H, 128, 128], v_new and w BF16 [R, H, 128], the internal
 # Aqk / Akk rows BF16 [R, H, 64]
 KCP_HANDOFF_BUFFERS = ("h", "v_new", "w", "aqk_int", "akk_int")
 
+# The forward's rows a saved set keeps beside the light set (``saved_rows`` of ``cake_kcp.cake_kda_nondet_kcp`` and
+# ``cake_kcp.cake_kda_nondet_train_kcp_forward``), by set name, in saved-set order.  ``"intra"``: the internal Aqk / Akk
+# rows BF16 [R, H, 64] the forward's intra program writes (the backward then runs no intra program).  ``"wy"``: also
+# ``w`` and ``u`` BF16 [R, H, 128] of the forward's WY program (no WY program either).  Neither holds the h tape: the
+# forward keeps its fused walk and its carry plane, and the backward still replays the K1 tape from ``S_in`` (or the
+# carry plane).  ``"tape"`` is the checkpoint hand-off's tape set; ``"none"`` keeps nothing.  The choice is rank-local
+# and moves no collective, like the hand-off's.
+KCP_SAVED_ROWS: dict[str, tuple[str, ...]] = {
+    "none": (),
+    "intra": ("aqk_int", "akk_int"),
+    "wy": ("aqk_int", "akk_int", "w", "u"),
+    "tape": KCP_HANDOFF_BUFFERS,
+}
+# bytes per internal token-head of the two rows sets (the tape set: cake_kda_nondet_train_kcp_handoff_bytes)
+KCP_SAVED_ROWS_BYTES = {"intra": 256, "wy": 768}
+# the values of the entries' ``saved_rows`` keyword: "auto" (the default) is the package rule -- no rows outside a
+# checkpoint pass, the hand-off's rows form KCP_HANDOFF_AUTO_ROWS where the checkpoint hand-off engages; "tape" keeps
+# the hand-off's tape set where it engages and no rows elsewhere (the earlier "auto"); "none" keeps no rows in any
+# pass (the hand-off included); "intra" / "wy" keep that set where the call builds an autograd node outside a
+# checkpoint pass and outside a backward, with no saved-tensor hooks of the caller, and, inside a checkpoint pass,
+# where the checkpoint hand-off engages (its form then); never with boundary_mode="replay" or on a rank without tokens
+KCP_SAVED_ROWS_MODES = ("auto", "none", "intra", "wy", "tape")
+KCP_SAVED_ROWS_DEFAULT = "auto"
+# the form "auto" keeps where the checkpoint hand-off engages (the same admission as the tape set): the wy rows
+# beside the light set (and the carry plane).  GB300 CP4 H64, 16384 tokens per rank: checkpointed step 0.21-0.33 ms
+# (2.4-4.3 %) faster than the tape set and 528 MiB less per layer and rank (+792 vs +1320 MiB over the light set);
+# the backward still replays the K1 tape
+KCP_HANDOFF_AUTO_ROWS = "wy"
+
+
+def check_saved_rows(saved_rows: Any) -> str:
+    """``saved_rows`` itself; ``ValueError`` for a value outside :data:`KCP_SAVED_ROWS_MODES`."""
+    if not isinstance(saved_rows, str) or saved_rows not in KCP_SAVED_ROWS_MODES:
+        raise ValueError(
+            f"saved_rows must be one of {KCP_SAVED_ROWS_MODES}, got {saved_rows!r}"
+        )
+    return saved_rows
+
+
+def kcp_saved_rows_form(saved_rows: str, checkpoint_handoff: bool) -> str:
+    """The set a saved set keeps beside the light set for a call with ``saved_rows`` and the checkpoint hand-off's
+    decision ``checkpoint_handoff`` (a ``bool``): ``"none"``, ``"intra"``, ``"wy"`` or ``"tape"``.  ``"auto"`` keeps
+    :data:`KCP_HANDOFF_AUTO_ROWS` where the hand-off engaged and nothing elsewhere; ``"tape"`` the tape set where the
+    hand-off engaged and nothing elsewhere; ``"intra"`` / ``"wy"`` keep that set in both cases (the hand-off's form
+    when it engaged); ``"none"`` keeps nothing (the hand-off never engages with it)."""
+    rows = check_saved_rows(saved_rows)
+    if rows == "auto":
+        return KCP_HANDOFF_AUTO_ROWS if checkpoint_handoff else "none"
+    if rows == "tape":
+        return "tape" if checkpoint_handoff else "none"
+    return rows
+
 
 def cake_kda_nondet_train_kcp_handoff_bytes(
-    ctx: CakeKDANondetKcpContext, *, H: int = 64
+    ctx: CakeKDANondetKcpContext, *, H: int = 64, saved_rows: str = "auto"
 ) -> int:
-    """Bytes of the checkpoint hand-off's tape set on this rank (:data:`KCP_HANDOFF_BUFFERS`)::
+    """Bytes of the checkpoint hand-off's set on this rank for a call with ``saved_rows``: under ``"auto"`` (the
+    default) its rows form :data:`KCP_HANDOFF_AUTO_ROWS` (``R * H * 768``, below); under ``"tape"`` the tape set
+    :data:`KCP_HANDOFF_BUFFERS`::
 
     NC_pad * H * 32768                                         # the h tape
     + R * H * (256 + 256 + 128 + 128)                          # v_new, w, aqk_int, akk_int
@@ -2527,24 +2715,47 @@ def cake_kda_nondet_train_kcp_handoff_bytes(
     checkpoint, inside the original forward call too, freed at its return): the checkpoint peak of a call the hand-off
     engages on is at most this many bytes higher than with ``checkpoint_handoff="off"`` (the saved set grows by
     ``cake_kda_nondet_train_kcp_saved_bytes(..., checkpoint_handoff=True) - cake_kda_nondet_train_kcp_saved_bytes(...)``, this less the carry plane at
-    ``P > 1``)."""
+    ``P > 1``).  ``saved_rows="intra"`` / ``"wy"`` (the hand-off kept in that rows form, :data:`KCP_SAVED_ROWS`;
+    ``"auto"`` keeps ``"wy"``): ``R * H * 256`` / ``R * H * 768``, with the carry plane kept (the K1 tape replay
+    still reads it); ``"none"``: 0 (the hand-off keeps nothing)."""
     H = int(H)
-    return ctx.NC_pad * H * 32768 + ctx.R * H * 768
+    form = kcp_saved_rows_form(saved_rows, True)
+    if form == "none":
+        return 0
+    if form == "tape":
+        return ctx.NC_pad * H * 32768 + ctx.R * H * 768
+    return ctx.R * H * KCP_SAVED_ROWS_BYTES[form]
 
 
 def kcp_handoff_auto_refusal(
-    key: tuple[str, int, str | None], H: int, total_tokens: int, world_size: int
+    key: tuple[str, int, str | None],
+    H: int,
+    total_tokens: int,
+    world_size: int,
+    *,
+    gate: str = "g",
+    l2n: bool = False,
 ) -> str | None:
     """Why ``checkpoint_handoff="auto"`` keeps the light set for a call (``None``: it keeps the tape set; see the rule
     above :data:`KCP_HANDOFF_VERIFIED`): ``"heads"`` (``H`` not in :data:`KCP_HANDOFF_HEADS`), ``"work"``
-    (``H * (total_tokens // world_size)`` below :data:`KCP_HANDOFF_MIN_HEAD_TOKENS`) or ``"unverified"`` (``key``, the
-    device's (architecture, SM count, toolkit), not in :data:`KCP_HANDOFF_VERIFIED`).  ``total_tokens`` is the packed
-    batch's token count (``ctx.partition.total``) and ``world_size`` the group's (``ctx.world_size``), not this
-    rank's share."""
+    (``H * (total_tokens // world_size)`` below :data:`KCP_HANDOFF_MIN_HEAD_TOKENS`, or below the key's own bound in
+    :data:`KCP_HANDOFF_MIN_HEAD_TOKENS_BY_KEY`) or ``"unverified"`` (``key``, the
+    device's (architecture, SM count, toolkit), not verified in the call's mode: :data:`KCP_HANDOFF_VERIFIED` for the
+    activated gate without the in-kernel Q / K L2 norm, else the entry ``(gate, l2n)`` of
+    :data:`KCP_HANDOFF_VERIFIED_MODES`).  ``total_tokens`` is the packed batch's token count (``ctx.partition.total``)
+    and ``world_size`` the group's (``ctx.world_size``), not this rank's share; ``gate`` (``"g"`` / ``"raw"``) and
+    ``l2n`` are the call's gate mode and ``use_qk_l2norm_in_kernel``."""
     reason = kcp_handoff_shape_refusal(H, total_tokens, world_size)
     if reason is not None:
         return reason
-    if tuple(key) not in KCP_HANDOFF_VERIFIED:
+    key_bound = KCP_HANDOFF_MIN_HEAD_TOKENS_BY_KEY.get(tuple(key), 0)
+    if int(H) * (int(total_tokens) // int(world_size)) < key_bound:
+        return "work"
+    if (gate, bool(l2n)) == ("g", False):
+        verified = KCP_HANDOFF_VERIFIED
+    else:
+        verified = KCP_HANDOFF_VERIFIED_MODES.get((gate, bool(l2n)), frozenset())
+    if tuple(key) not in verified:
         return "unverified"
     return None
 
@@ -2596,6 +2807,7 @@ def cake_kda_nondet_train_kcp_saved_bytes(
     use_gate_in_kernel: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     checkpoint_handoff: bool = False,
+    saved_rows: str = KCP_SAVED_ROWS_DEFAULT,
 ) -> int:
     """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``cake_kda_nondet_train_kcp_saved_bytes(ctx, ...)``)::
 
@@ -2615,7 +2827,8 @@ def cake_kda_nondet_train_kcp_saved_bytes(
     per crossing fragment); ``False`` = the re-walk form of the test knob ``saved_carry=0``.
 
     The set carries no token-row ``Aqk`` / ``Akk`` (the ``256 * T_r * H`` term of its earlier version): the backward
-    recomputes the internal rows in both modes.
+    recomputes the internal rows in both modes, unless the call keeps them (``saved_rows`` or the checkpoint
+    hand-off, below).
 
     The retained ``S_in`` and c1 tensors are the padded receive buffers (``s`` -> ``n_owners Hg`` tiles,
     ``Hg_r`` -> ``Hg_pad_r``); identical to the formula for ``H = 64``, and the padding is reported by
@@ -2644,13 +2857,26 @@ def cake_kda_nondet_train_kcp_saved_bytes(
     it) and the device model of ``ctx.device``.
 
     ``checkpoint_handoff`` (without ``checkpoint_keep``): ``False`` (the default) is the light set above, the saved
-    set of every call the checkpoint hand-off does not engage on; ``True`` is the saved set of a forward that keeps
-    the hand-off's tape set -- plus :func:`cake_kda_nondet_train_kcp_handoff_bytes`, without the carry plane term -- that is, of a
-    checkpointed call with ``checkpoint_handoff="on"``, or ``"auto"`` where :func:`kcp_handoff_auto_refusal` admits
-    it.  A rank without tokens keeps no tape set, nor does a call in the raw gate mode or with the in-kernel Q / K
-    L2 norm (the hand-off engages with neither): query them with ``False`` (``True`` with
-    ``use_gate_in_kernel=True`` or ``use_qk_l2norm_in_kernel=True`` raises ``ValueError``).  The flag is that
-    decision, not the entry's mode: a value that is not a ``bool`` raises ``TypeError``."""
+    set of every call the checkpoint hand-off does not engage on; ``True`` is the saved set of a forward the hand-off
+    engages on -- a checkpointed call with ``checkpoint_handoff="on"``, or ``"auto"`` where
+    :func:`kcp_handoff_auto_refusal` admits it -- in the form ``saved_rows`` names (below; with ``"tape"`` the
+    light set plus :func:`cake_kda_nondet_train_kcp_handoff_bytes`, without the carry plane term).  A rank without
+    tokens keeps no tape set: query it with ``False``.  The tape set is the same in the raw gate
+    mode and with the in-kernel Q / K L2 norm (whose rstd term stays): ``True`` adds the same bytes there.  The flag
+    is that decision, not the entry's mode: a value that is not a ``bool`` raises ``TypeError``.
+
+    ``saved_rows`` (without ``checkpoint_keep``): the call's ``saved_rows`` keyword (:data:`KCP_SAVED_ROWS_MODES`;
+    another value raises ``ValueError``), read with the hand-off decision (:func:`kcp_saved_rows_form`).
+    ``"auto"`` (the default) is the light set with ``False`` and the ``"wy"`` set (:data:`KCP_HANDOFF_AUTO_ROWS`)
+    with ``True``; ``"tape"`` the light set with ``False`` and the tape set's saved set with ``True``; ``"none"`` the
+    light set for either flag; ``"intra"`` / ``"wy"`` the saved set of a forward that keeps that rows set (the
+    hand-off's form with ``checkpoint_handoff=True``) -- the light set (the carry plane term stays at ``P > 1``: the
+    backward's K1 tape replay still reads it) plus::
+
+    "intra": R * H * 256                                       # aqk_int, akk_int
+    "wy":    R * H * 768                                       # aqk_int, akk_int, w, u
+
+    A rank without tokens keeps no rows: query it with ``"none"``."""
     l2n = check_qk_l2norm(use_qk_l2norm_in_kernel)
     if not isinstance(use_gate_in_kernel, bool):
         raise ValueError(
@@ -2661,16 +2887,7 @@ def cake_kda_nondet_train_kcp_saved_bytes(
             "checkpoint_handoff of the byte query is the hand-off decision (a bool), not cake_kda_nondet_kcp's mode; "
             f"got {checkpoint_handoff!r}"
         )
-    if checkpoint_handoff and l2n:
-        raise ValueError(
-            "checkpoint_handoff=True: the checkpoint hand-off does not engage with use_qk_l2norm_in_kernel=True "
-            "(no tape set is kept); query the saved set with checkpoint_handoff=False"
-        )
-    if checkpoint_handoff and use_gate_in_kernel:
-        raise ValueError(
-            "checkpoint_handoff=True: the checkpoint hand-off does not engage with use_gate_in_kernel=True "
-            "(no tape set is kept); query the saved set with checkpoint_handoff=False"
-        )
+    form = kcp_saved_rows_form(saved_rows, checkpoint_handoff)
     _check_save_mode(save_mode)
     if l2n:  # the refusal of every rank alike, as the workspace bytes
         gate = "raw" if use_gate_in_kernel else "g"
@@ -2695,14 +2912,16 @@ def cake_kda_nondet_train_kcp_saved_bytes(
         total += ctx.N_out * 2 * hp.Hg_pad_by_rank[ctx.rank] * STATE_TILE_BYTES
         if hp.P > 1:
             total += hp.NSEG * s
-    if saved_carry and hp.P > 1 and not checkpoint_handoff:
+    if saved_carry and hp.P > 1 and form != "tape":
         total += (ctx.n_frag * (hp.P - 1) + max(ctx.n_in, ctx.n_out)) * s
     if with_conv:
         total += ctx.halo.n_hist_rows * C * 2
     if save_mode == "tape":
         total += ctx.NC_pad * H * 32768 + ctx.R * H * 256
-    if checkpoint_handoff:
-        total += cake_kda_nondet_train_kcp_handoff_bytes(ctx, H=H)
+    if form == "tape":
+        total += cake_kda_nondet_train_kcp_handoff_bytes(ctx, H=H, saved_rows="tape")
+    elif form != "none":
+        total += ctx.R * H * KCP_SAVED_ROWS_BYTES[form]
     if l2n:
         total += 2 * ctx.T_r * H * 4
     return total
@@ -2985,7 +3204,7 @@ def local_scratch_table_bytes(plan) -> int:
 # The local arena of a backward workspace (``cake_kcp.CakeKDANondetKcpWorkspace`` ``local_arena``): ``"replay"`` (the default)
 # is the existing backend's replay layout (4488 B per internal token-head) with its forward layout; ``"lean"`` (opt-in)
 # runs the backward on this route's lean layout (:data:`LOCAL_LAYOUT_BWD_LEAN`, registered on the existing backend:
-# 3460 B per internal token-head plus the per-pass set where it does not fit; the fused gradient, GLM intra and the
+# 3332 B per internal token-head plus the per-pass set where it does not fit; the fused gradient, GLM intra and the
 # gate epilogue once per range of ``ceil(NC_pad / passes)`` chunks) and the forward on :data:`LOCAL_LAYOUT_FWD_ONLY`.
 # The same kernels on the same bytes: the gradients are bitwise those of ``"replay"``.  Under ``"lean"`` a row whose
 # replay fused-gradient record does not store ``dAqk`` itself (H 9-15: ``dqkg_int``, whose ``dAqk`` comes from
@@ -2993,18 +3212,17 @@ def local_scratch_table_bytes(plan) -> int:
 LOCAL_ARENAS = ("replay", "lean")
 LOCAL_ARENA_DEFAULT = "replay"
 # The lean backward layout (a mode of the existing backend's arenas that this module registers there, never one of its
-# own).  The KCP backward (the replay prep and intra / WY programs, its K1 / K2 walks, its ``kcp_dav``, then the fused
-# gradient, GLM intra and the gate epilogue) with the tail split into ``passes`` chunk ranges as in the existing
-# backend's lean layouts.  The fused-gradient records of the rows it serves (:data:`LEAN_DQKG_RECORDS`) store ``dAqk``
-# themselves, every row ``kcp_dav`` writes, so ``kcp_dav``'s ``dAqk`` goes to a dead sink over ``u`` (lifetime
-# [4, 4]) and the whole-sequence ``dAqk`` leaves the layout; ``aqk_int`` (read last by ``kcp_dav`` at 4) rides beside
-# the sink under the ``dh`` tape, and ``dv1`` (written by ``kcp_dav`` at 4, read by the adjoint walks at 5) takes
-# ``kb``'s bytes.  The walks keep no segment state in the arena, so the layout has no state blocks.  Whole-sequence
-# buffers: 3460 B per internal token-head (the live set at the adjoint tape walk, step 5).  The per-pass set (the
-# existing backend's ``_PASS_OCCUPANTS`` without the gate buffers where GLM intra fuses the epilogue) is packed
-# first-fit into the bytes of the three whole-sequence slots dead before the tail (qg / kg 512, w 256, kb / dv1 256);
-# what does not fit goes to an overflow slot.  The rows ``kcp_dav`` reads and writes in one slot (``aqk_int`` and
-# the sink) are disjoint bytes.
+# own).  The KCP backward (the replay prep and intra / WY programs, its K1 / K2 walks, then the fused gradient, GLM
+# intra and the gate epilogue) with the tail split into ``passes`` chunk ranges as in the existing backend's lean
+# layouts.  The fused-gradient records of the rows it serves (:data:`LEAN_DQKG_RECORDS`) store ``dAqk`` themselves,
+# so the backward launches no ``kcp_dav`` there (:func:`kcp_dav_needed`) and the layout holds no whole-sequence
+# ``dAqk`` and no ``dv1`` (the adjoint walks form it from ``aqk_int``).  ``kb`` (read by the WY program at 2) rides
+# beside ``u`` at +256 under the ``dh`` tape (5, 6), and ``aqk_int`` (read by the adjoint walks at 5) has a slot of its
+# own.  The walks keep no segment state in the arena, so the layout has no state blocks.  Whole-sequence buffers:
+# 3332 B per internal token-head (the live set at the adjoint tape walk, step 5).  The per-pass set (the existing
+# backend's ``_PASS_OCCUPANTS`` without the gate buffers where GLM intra fuses the epilogue) is packed first-fit into
+# the bytes of the three whole-sequence slots dead before the tail (qg / kg 512, w 256, aqk_int 128); what does not
+# fit goes to an overflow slot.
 LOCAL_LAYOUT_BWD_LEAN = "replay_kcp_lean"
 _LEAN_WHOLE = (
     (("gk", "F32", 0, (1, 7)),),
@@ -3015,20 +3233,39 @@ _LEAN_WHOLE = (
     (("h", "TAPE", 0, (3, 6)),),
     (
         ("u", "B16", 0, (2, 3)),
-        ("dAqk_sink", "A32", 0, (4, 4)),
-        ("aqk_int", "A16", 256, (1, 4)),
+        ("kb", "B16", 256, (1, 2)),
         ("dh", "TAPE", 0, (5, 6)),
     ),
     (("qg", "B16", 0, (1, 5)), ("kg", "B16", 256, (1, 5))),
     (("w", "B16", 0, (2, 5)),),
-    (("kb", "B16", 0, (1, 2)), ("dv1", "B16", 0, (4, 5))),
+    (("aqk_int", "A16", 0, (1, 5)),),
     (("beta_int", "V32", 0, (1, 7)),),
 )
 # the per-pass hosts of the lean layout: (first occupant of the slot, its bytes per internal token-head)
-_LEAN_HOSTS = (("qg", 512), ("w", 256), ("kb", 256))
-# the replay fused-gradient records that store the whole dAqk (the rows kcp_dav writes) themselves: this package's
+_LEAN_HOSTS = (("qg", 512), ("w", 256), ("aqk_int", 128))
+# the replay fused-gradient records that store the whole dAqk (the rows kcp_dav would write) themselves: this package's
 # records of the deterministic package's two (its forms in ``cake_jit.S1_RECORDS`` read the same buffers but ``q``)
 LEAN_DQKG_RECORDS = ("dqkg_int_davq", "dqkg_int_davq_v24", "dqkg_int_davq_nohint_v24")
+# The replay fused-gradient records that store every dAqk row the GLM intra program reads (all 64 internal rows of
+# every real chunk) before it reads them, by record and the architectures each is admitted for here: the record-level
+# statement behind :func:`kcp_dav_needed` at ``H >= DAV_DAQK_MIN_HEADS`` (where the existing backend's plan
+# dispatches no ``dav`` stage, its fused gradient is one of these, so ``kcp_dav``'s dAqk is dead and the backward
+# skips it).  Evidence: the records are specified so that for H >= 16 every dqkg davq form writes
+# all 64 internal rows of every real chunk (kernels f6a70fb0, 1f9c46f9, 1a0df5d5, 3b9b3f9a; the raw / L2N records
+# bind the same libraries); below 16 heads the serial route's ``dqkg_int*`` (``davq = 0``) takes its dAqk from
+# ``kcp_dav``, and no statement covers a davq record there.  The architectures are those of each record's select
+# rule on the replay path at H >= 16.  The two S1 forms (``_v24``: 94dcf92d, dc809e51) are davq forms by that
+# statement's wording, not by kernel hash; the lean layout above relies on the same property of them.
+DAV_DAQK_COVERED: dict[str, frozenset[str]] = {
+    "dqkg_int_davq": frozenset({"sm_103a"}),  # 1f9c46f9
+    "dqkg_int_davq_l2n": frozenset({"sm_100a", "sm_103a"}),  # 1f9c46f9
+    "dqkg_int_davq_raw": frozenset({"sm_100a", "sm_103a"}),  # 1f9c46f9
+    "dqkg_int_davq_nohint_l2n": frozenset({"sm_107a"}),  # 3b9b3f9a
+    "dqkg_int_davq_nohint_raw": frozenset({"sm_107a"}),  # 3b9b3f9a
+    "dqkg_int_davq_v24": frozenset({"sm_100a"}),  # 94dcf92d (S1 form)
+    "dqkg_int_davq_nohint_v24": frozenset({"sm_107a"}),  # dc809e51 (S1 form)
+}
+DAV_DAQK_MIN_HEADS = 16
 LEAN_MAX_PASSES = 8  # the tail passes a lean arena may be sized for (from four on the per-pass set fits on sm_100a)
 # the tail passes of a lean arena without ``lean_passes``: two keep about three quarters of the four-pass saving for
 # one more launch per tail stage instead of three
@@ -3105,6 +3342,31 @@ def local_lean_serves(plan) -> bool:
     """Whether the lean layout serves ``plan`` (a ``cake_backend.Plan``): its replay fused-gradient record stores
     the whole ``dAqk`` itself (:data:`LEAN_DQKG_RECORDS`)."""
     return plan.record("dqkg", LOCAL_PATH_BWD) in LEAN_DQKG_RECORDS
+
+
+def dav_daqk_refusal(record: str | None, arch: str | None, H: int) -> str | None:
+    """Why ``kcp_dav``'s dAqk is live on a plan whose replay fused-gradient record is ``record`` on architecture
+    ``arch`` at ``H`` heads (``None``: it is dead, :data:`DAV_DAQK_COVERED`): ``"heads"`` (``H`` below
+    :data:`DAV_DAQK_MIN_HEADS`), ``"record"`` (``record`` not listed) or ``"arch"`` (listed, not for ``arch``)."""
+    if int(H) < DAV_DAQK_MIN_HEADS:
+        return "heads"
+    arches = DAV_DAQK_COVERED.get(str(record))
+    if arches is None:
+        return "record"
+    if arch not in arches:
+        return "arch"
+    return None
+
+
+def kcp_dav_needed(plan) -> bool:
+    """Whether the KCP backward launches ``kcp_dav`` on ``plan`` (a ``cake_backend.Plan`` of the rank's problem):
+    exactly where the existing backend's plan dispatches its ``dav`` stage on :data:`LOCAL_PATH_BWD`
+    (``dav_serial_replay``: the serial route below 16 heads, H 9-15 on every architecture).  Its fused gradient there
+    (``dqkg_int`` and its raw / L2N forms) stores no ``dAqk``, so GLM intra reads ``kcp_dav``'s.  Everywhere else the
+    plan's fused gradient stores every ``dAqk`` row GLM intra reads, pad rows included (the plan's own correctness
+    rests on it: it launches no dav stage there), and the adjoint walks form ``dv1`` from ``aqk_int`` themselves (their
+    ``fuse_dv1`` builds), so no kernel reads ``kcp_dav``'s outputs and the backward skips it."""
+    return bool(plan.dispatched("dav", LOCAL_PATH_BWD))
 
 
 def local_lean_bytes(plan, passes: int) -> int:
@@ -3476,16 +3738,23 @@ def _qk_l2norm_problem(
 # workspace (``workspace=None``) host-bound.  A replaced input (a test's monkeypatch) is another object, so the
 # check runs again; a refusal is never kept.
 _QK_L2NORM_SERVED: dict[tuple[str, str, str | None], tuple[Any, ...]] = {}
+# The existing backend's modules the check reads, imported on its first call (their attributes are read per call)
+_QK_L2NORM_MODULES: tuple[Any, ...] = ()
 
 
 def _qk_l2norm_inputs() -> tuple[Any, ...]:
     """The objects :func:`qk_l2norm_missing` reads: the existing backend's entry point, plan, layout table, registry
     and libraries query, and this module's stages, grid, SM counts, layouts, slots and helpers."""
-    from . import _single_rank
+    global _QK_L2NORM_MODULES
+    if not _QK_L2NORM_MODULES:
+        from . import _single_rank
 
-    cake_backend = _single_rank.module("cake_backend")
-    cake_build = _single_rank.module("cake_build")
-    cake_jit = _single_rank.module("cake_jit")
+        _QK_L2NORM_MODULES = (
+            _single_rank.module("cake_backend"),
+            _single_rank.module("cake_build"),
+            _single_rank.module("cake_jit"),
+        )
+    cake_backend, cake_build, cake_jit = _QK_L2NORM_MODULES
     return (
         cake_backend.cake_kda_nondet_train_forward,
         cake_backend.plan,
@@ -3526,7 +3795,11 @@ def qk_l2norm_missing(
     key = (mode, gate, arch)
     inputs = _qk_l2norm_inputs()
     kept = _QK_L2NORM_SERVED.get(key)
-    if kept is not None and all(a is b for a, b in zip(kept, inputs, strict=True)):
+    if (
+        kept is not None
+        and len(kept) == len(inputs)
+        and all(map(operator.is_, kept, inputs))
+    ):
         return None
     why = _qk_l2norm_missing(mode, gate, arch)
     if why is None:
@@ -3839,13 +4112,17 @@ __all__ = [
     "CakeKDANondetKcpPartition",
     "KcpSegmentPlan",
     "KcpSequence",
+    "RANK_CHECK_FIELDS",
+    "RANK_CHECK_VERSION",
     "cake_kda_nondet_train_kcp_build_context",
     "chunk_geometry",
     "chunk_tables",
     "head_groups",
     "kcp_arena_layout",
     "cake_kda_nondet_train_kcp_comm_bytes",
+    "kcp_partition_digest",
     "kcp_pool_numel",
+    "kcp_rank_digest",
     "cake_kda_nondet_train_kcp_partition",
     "kcp_plan",
     "cake_kda_nondet_train_kcp_saved_bytes",
@@ -3854,8 +4131,16 @@ __all__ = [
     "KCP_HANDOFF_DEFAULT",
     "KCP_HANDOFF_HEADS",
     "KCP_HANDOFF_MIN_HEAD_TOKENS",
+    "KCP_HANDOFF_MIN_HEAD_TOKENS_BY_KEY",
     "KCP_HANDOFF_MODES",
     "KCP_HANDOFF_VERIFIED",
+    "KCP_HANDOFF_VERIFIED_MODES",
+    "KCP_SAVED_ROWS",
+    "KCP_SAVED_ROWS_BYTES",
+    "KCP_SAVED_ROWS_DEFAULT",
+    "KCP_SAVED_ROWS_MODES",
+    "check_saved_rows",
+    "kcp_saved_rows_form",
     "kcp_handoff_auto_refusal",
     "kcp_handoff_shape_refusal",
     "cake_kda_nondet_train_kcp_workspace_bytes",

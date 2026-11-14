@@ -37,8 +37,9 @@ Beside the all-SM kernel a call starts when it costs at most
 is reported as "not measured (det-inherited)" -- a pytest skip -- only when its
 window is in the package's whole-SM list (``cake_windows.WHOLE_SM``, the list
 the facade documents) and the call runs the deterministic package's program (a
-forward or a deterministic-pair backward window whose program id equals the one
-the deterministic package selects at the same token count; an FP32-weight twin
+forward or a deterministic-pair backward window whose program id is one of the
+deterministic package's programs for the same shape, at any token count, or one
+it selected before it moved the route, ``DET_PROGRAMS_BEFORE``; an FP32-weight twin
 through its BF16 owner route, same form, or -- in a deterministic-pair twin
 window where the owner runs a single kernel -- through the owner's pair program
 that the twin's program twins); the deterministic package's own call
@@ -59,8 +60,8 @@ from typing import Optional
 import pytest
 import torch
 
-from tests.test_helpers import cake_rmsnorm_train_reference as ref
-from tests.test_helpers.cake_package import cake_package
+from tests.norm.test_helpers import cake_rmsnorm_train_reference as ref
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_nondet_train")
 loader = cake_package("cake_rmsnorm_nondet_train", "cake_jit")
@@ -178,6 +179,28 @@ def _whole_sm_ranges() -> dict[tuple[str, str], tuple[tuple[int, Optional[int]],
 
 
 WHOLE_SM = _whole_sm_ranges()
+
+# Temporary bridge for #9134: removed when the nondet package stops running
+# 0dcdc563 on sm_107a bwd_residual_h6144.
+# Per architecture and deterministic route: the ``(above, at_most, program)``
+# windows of the deterministic package's earlier programs on a route it has
+# since moved to programs that start beside an all-SM kernel.  This package's
+# det-pair windows there still run the earlier program and stay det-inherited,
+# as before the move, until this package selects the new program.
+DET_PROGRAMS_BEFORE = {
+    ("sm_107a", "bwd_residual_h6144"): (
+        (0, 960, "c15868b87bfb2c21645e"),
+        (960, None, "0dcdc563be377247044e"),
+    ),
+}
+
+
+def _det_program_before(arch: str, key: str, rows: int) -> Optional[str]:
+    """The ``DET_PROGRAMS_BEFORE`` program of ``key`` at ``rows``, else ``None``."""
+    for above, at_most, program in DET_PROGRAMS_BEFORE.get((arch, key), ()):
+        if rows > above and (at_most is None or rows <= at_most):
+            return program
+    return None
 
 
 def _listed_whole_sm(kind: str, key: str, rows: int) -> Optional[int]:
@@ -529,27 +552,37 @@ def _owner_pair_program(hidden: int, residual: bool, w: str, twin_main: str):
 
 
 def _runs_det_program(kind: str, hidden: int, residual: bool, w: str, rows: int):
-    """``(True / False, note)``: the call runs the program the deterministic
-    package selects for the same shape and token count (program id equality of
-    the main kernels); an FP32-weight twin through its BF16 owner route (the
-    det package serves BF16 weights only), whose form it must share -- or, in a
+    """``(True / False, note)``: the call runs a program the deterministic
+    package ships for the same shape (program id of the main kernel among the
+    det route's main programs, at any token count: the det package may move a
+    window to a newer program while this package keeps the older one); an
+    FP32-weight twin through its BF16 owner route (the det package serves BF16
+    weights only), whose form it must share -- or, in a
     pair twin window where the owner runs a single kernel, through the owner's
     pair program that the twin's program twins (:func:`_owner_pair_program`)."""
     if det is None:
         return False, "no det package"
     arch = det.cake_jit.arch_for_capability(_capability())
-    if det.cake_jit.route_key(hidden, kind, residual) not in det.cake_jit.ROUTES.get(
-        arch, {}
-    ):
+    det_key = det.cake_jit.route_key(hidden, kind, residual)
+    if det_key not in det.cake_jit.ROUTES.get(arch, {}):
         return False, "the det package does not serve this shape"
     det_main = _main_module(
         list(det.cake_jit.selected_modules(arch, hidden, kind, residual, rows=rows)),
         det.cake_jit.MODULES,
     )
+    det_program_before = _det_program_before(arch, det_key, rows)
+    det_program = det_program_before or _program_id(det_main)
     owner = ref.window_records(loader, _arch(), hidden, kind, residual, "bf16", rows)
     main = _main_module(owner, loader.MODULES)
-    same = _program_id(main) == _program_id(det_main)
-    note = f"program={_program_id(main)[:8]} det_program={_program_id(det_main)[:8]}"
+    det_programs = {
+        _program_id(n)
+        for n in det.cake_jit.route_modules(arch, hidden, kind, residual)
+        if det.cake_jit.MODULES[n]["role"] != "bwd_reduce"
+    }
+    if det_program_before:
+        det_programs.add(det_program_before)
+    same = _program_id(main) in det_programs
+    note = f"program={_program_id(main)[:8]} det_program={det_program[:8]}"
     if w != "bf16" and kind == "bwd":
         twin = ref.window_records(loader, _arch(), hidden, kind, residual, w, rows)
         twin_form, owner_form = ref.form(loader, twin), ref.form(loader, owner)
@@ -557,7 +590,7 @@ def _runs_det_program(kind: str, hidden: int, residual: bool, w: str, rows: int)
             program = _owner_pair_program(
                 hidden, residual, w, _main_module(twin, loader.MODULES)
             )
-            same = program is not None and program == _program_id(det_main)
+            same = program is not None and program in det_programs
             note += (
                 f" (the twin's program twins the owner's pair program "
                 f"{(program or 'none')[:8]}; owner form single)"

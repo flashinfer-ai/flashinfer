@@ -19,7 +19,7 @@ import torch
 from flashinfer import gdn_prefill as prefill_mod
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from flashinfer.jit import cake_gdn as cake_gdn
-from tests.test_helpers import cake_profiler
+from tests.cake.test_helpers import cake_profiler
 
 
 @pytest.fixture(autouse=True)
@@ -288,7 +288,20 @@ def _launch_raw_indexed_prefill(case):
     major, minor = torch.cuda.get_device_capability(case["q"].device)
     arch = cake_gdn.arch_for_compute_capability(major, minor)
     route = _public_route(case)
-    entry = cake_gdn.load_cake_gdn_kernel(route.variant_name, arch)
+    empty_state = torch.empty(1, dtype=case["state_dtype"], device=case["q"].device)
+    checkpoints = case["state_checkpoints"] if case["checkpoint_every"] else empty_state
+    # The flavor the public launch would pick for these buffers: a padded pool whose
+    # slot stride is not a 16-byte multiple runs the guarded flavor.
+    aligned = prefill_mod._cake_gdn_state_vec_aligned(
+        (
+            (case["initial_state"], int(case["initial_state"].stride(0))),
+            (case["output_state"], int(case["output_state"].stride(0))),
+        ),
+        checkpoints,
+    )
+    entry = cake_gdn.load_cake_gdn_kernel(
+        route.variant_name, arch, **({} if aligned else {"state_vec_aligned": False})
+    )
     num_o_heads = max(case["num_q_heads"], case["num_v_heads"])
     dvsplit = route.route_id.endswith(".dvsplit")
     total_tiles = len(case["seq_lens"]) * num_o_heads * (2 if dvsplit else 1)
@@ -300,7 +313,6 @@ def _launch_raw_indexed_prefill(case):
         total_tiles, active_clusters, dvsplit, max(case["seq_lens"])
     )
     empty_i32 = torch.empty(1, dtype=torch.int32, device=case["q"].device)
-    empty_state = torch.empty(1, dtype=case["state_dtype"], device=case["q"].device)
     workspace = torch.empty(grid_x * 512, dtype=torch.uint8, device=case["q"].device)
     entry(
         case["q"],
@@ -313,7 +325,7 @@ def _launch_raw_indexed_prefill(case):
         case["state_indices"],
         case["initial_state"],
         case["output_state"],
-        case["state_checkpoints"] if case["checkpoint_every"] else empty_state,
+        checkpoints,
         case["checkpoint_cu_starts"] if case["checkpoint_every"] else empty_i32,
         workspace,
         int(case["initial_state"].stride(0)),
@@ -1097,6 +1109,92 @@ def test_public_cake_gdn_prefill_sm107a_ragged_dvsplit_route_of_each_contract_ma
         assert grids == [expected_grid, expected_grid]
 
 
+@pytest.mark.parametrize(
+    ("io_dtype", "state_dtype", "initial", "heads"),
+    (
+        (torch.bfloat16, torch.bfloat16, True, (8, 32)),
+        (torch.bfloat16, torch.float32, False, (16, 32)),
+        (torch.float16, torch.float32, False, (16, 64)),
+    ),
+    ids=("bf16_state", "no_initial_state", "f16_io_no_initial_state"),
+)
+@pytest.mark.parametrize("seq_len", (2048, 2049), ids=("max2048", "max2049"))
+def test_public_cake_gdn_prefill_sm107a_vec2full_twin_equals_the_shared_record(
+    monkeypatch, io_dtype, state_dtype, initial, heads, seq_len
+):
+    # A full-DV batch of the BF16-state contract (without gate streaming) or of the FP32-state
+    # contracts without an initial state runs the key's vec2-full twin record when its longest
+    # sequence is at most 2048 tokens and the shared record above that.  The twin only moves
+    # the state differently: with the rule's bound moved to the other side, the other record
+    # of the same key gives the same output and final state bit for bit, and both match the
+    # reference recurrence.
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) != "sm_107a":
+        pytest.skip("the vec2-full twin records are sm_107a only")
+    num_q_heads, num_v_heads = heads
+    seq_lens = (seq_len,) * 4
+    case = _make_case(
+        seq_lens=seq_lens,
+        io_dtype=io_dtype,
+        state_dtype=state_dtype,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+    )
+    if not initial:
+        case["initial_state"] = None
+    initial_state = (
+        None if case["initial_state"] is None else case["initial_state"].clone()
+    )
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    loaded = []
+    load = cake_gdn.load_cake_gdn_kernel
+
+    def loading(name, arch):
+        loaded.append(name)
+        return load(name, arch)
+
+    monkeypatch.setattr(cake_gdn, "load_cake_gdn_kernel", loading)
+    results = []
+
+    def run():
+        case["output"].fill_(float("nan"))
+        if initial_state is None:
+            case["output_state"].fill_(float("nan"))
+        else:
+            case["output_state"].copy_(initial_state)
+        out, state = _launch(case, cu_seqlens_cpu=_host_cu_seqlens(seq_lens))
+        torch.cuda.synchronize()
+        results.append((out.clone(), state.clone()))
+
+    run()
+    twin_first = seq_len <= 2048
+    limit = cake_gdn._VEC2FULL_MAX_TILE_CHUNKS
+    cake_gdn._VEC2FULL_MAX_TILE_CHUNKS = -1 if twin_first else 1 << 20
+    cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+    try:
+        run()
+    finally:
+        cake_gdn._VEC2FULL_MAX_TILE_CHUNKS = limit
+        cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+    assert len(loaded) == 2, loaded
+    twin, shared = loaded if twin_first else loaded[::-1]
+    assert "_sm107a_vec2full_i64meta_" in twin, loaded
+    assert shared == twin.replace("_sm107a_vec2full_i64meta_", "_sm107a_i64meta_")
+    twin_record = cake_gdn._kernel_record(twin)
+    shared_record = cake_gdn._kernel_record(shared)
+    assert twin_record["specializations"] == shared_record["specializations"]
+    assert twin_record["outputs"] != shared_record["outputs"]
+    (out, state), (other_out, other_state) = results
+    assert torch.isfinite(out.float()).all() and torch.isfinite(state.float()).all()
+    assert torch.equal(out, other_out)
+    assert torch.equal(state, other_state)
+    torch.testing.assert_close(out.float(), expected_out.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
 def _carry_segment(case, start, stop, initial_state):
     """``case`` cut to tokens ``[start, stop)`` of its one sequence, started from ``initial_state``."""
 
@@ -1205,6 +1303,106 @@ def test_public_cake_gdn_prefill_raw_ffi_bf16_indexed_checkpoint_b7_t421_noncomp
             atol=0,
             rtol=0,
         )
+
+
+@pytest.mark.parametrize("layout", ("unused_output_off_by_one", "padded_pool"))
+def test_public_cake_gdn_prefill_state_flavor_is_decided_on_the_launched_buffers(
+    monkeypatch, layout
+):
+    """The prefill state flavor is decided on the buffers and slot strides the entry gets.
+
+    A stateless call (no initial state, ``output_final_state=False``) ignores its
+    ``output_state`` and launches the sentinel, so a misaligned ``output_state`` keeps
+    the aligned flavor and the same output bits as a call without it; an indexed pool
+    whose slot stride is not a 16-byte multiple takes the guarded flavor.
+    """
+
+    if layout == "padded_pool":
+        case = _make_case(
+            seq_lens=(64, 37),
+            indexed=True,
+            state_dtype=torch.bfloat16,
+            state_pool_padding=257,
+        )
+        stateful, expect_aligned = True, False
+        initial_state = case["initial_state"].clone()
+        expected_out, _, _ = _reference(case, initial_state)
+    else:
+        # The shipped stateless single-chunk key (see the absent-gates test).
+        case = _make_case(
+            seq_lens=(64,) * 4, num_q_heads=4, num_k_heads=4, num_v_heads=8
+        )
+        case["initial_state"] = None
+        dense = case["output_state"]
+        backing = torch.empty(dense.numel() + 4, dtype=dense.dtype, device="cuda")
+        case["output_state"] = backing[1 : 1 + dense.numel()].view(dense.shape)
+        assert case["output_state"].data_ptr() % 16 != 0
+        stateful, expect_aligned = False, True
+
+    def launch(output_state):
+        return chunk_gated_delta_rule(
+            q=case["q"],
+            k=case["k"],
+            v=case["v"],
+            g=case["g"],
+            beta=case["beta"],
+            scale=case["scale"],
+            initial_state=case["initial_state"],
+            output_final_state=stateful,
+            cu_seqlens=case["cu_seqlens"],
+            cu_seqlens_cpu=_host_cu_seqlens(case["seq_lens"]),
+            use_qk_l2norm_in_kernel=False,
+            output=case["output"],
+            output_state=output_state,
+            use_cp=False,
+            state_indices=case["state_indices"],
+            backend="cake_gdn",
+        )
+
+    if not stateful:
+        launch(None)
+        torch.cuda.synchronize()
+        expected_out = case["output"].clone()
+        case["output"].fill_(float("nan"))
+    decisions, launches = [], []
+    rule = prefill_mod._cake_gdn_state_vec_aligned
+    load = cake_gdn.load_cake_gdn_kernel
+
+    def deciding(slot_states, checkpoints):
+        aligned = rule(slot_states, checkpoints)
+        decisions.append((slot_states, checkpoints, aligned))
+        return aligned
+
+    def loading(name, arch, **kwargs):
+        entry = load(name, arch, **kwargs)
+
+        def launching(*args):
+            launches.append((kwargs.get("state_vec_aligned", True), args))
+            return entry(*args)
+
+        return launching
+
+    monkeypatch.setattr(prefill_mod, "_cake_gdn_state_vec_aligned", deciding)
+    monkeypatch.setattr(cake_gdn, "load_cake_gdn_kernel", loading)
+    launch(case["output_state"])
+    torch.cuda.synchronize()
+    ((slot_states, checkpoints, aligned),) = decisions
+    ((flavor, args),) = launches
+    assert aligned is expect_aligned and flavor is expect_aligned, (aligned, flavor)
+    (initial, initial_stride), (output, output_stride) = slot_states
+    # Entry ABI: initial state, output state, checkpoints at 8..10, slot strides at 13, 14.
+    assert args[8] is initial and args[9] is output and args[10] is checkpoints
+    assert (args[13], args[14]) == (initial_stride, output_stride)
+    if stateful:
+        assert initial is case["initial_state"] and output is case["output_state"]
+        torch.testing.assert_close(
+            case["output"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+        )
+    else:
+        # Both state buffers are the one-element sentinel.
+        assert output is not case["output_state"] and output.numel() == 1
+        assert initial.numel() == 1
+        assert torch.equal(case["output"], expected_out)
 
 
 def test_public_cake_gdn_prefill_api_bf16_indexed_checkpoint_b5_t4296_live_matches_independent_recurrence():
@@ -1374,7 +1572,7 @@ def _forbidden_sync_names(names):
 def _profile_window(fn, attempts=cake_profiler.ATTEMPTS):
     """Names of the CUDA runtime/device events of ``fn`` (CPU events inside its window).
 
-    Sentinel kernels open and close the window (``tests.test_helpers.cake_profiler``): a
+    Sentinel kernels open and close the window (``tests.cake.test_helpers.cake_profiler``): a
     session whose device records miss a leading or the trailing one lost CUDA activity
     (some torch / CUPTI builds of the nightly images do), so the window is profiled again;
     after ``attempts`` such sessions the test is skipped.  The sentinels' own records are
@@ -1950,7 +2148,7 @@ def _live_arch(case):
 def _device_kernel_names(fn):
     """Names of the device kernels ``fn`` launches (profiler CUDA activities; copies excluded).
 
-    ``tests.test_helpers.cake_profiler`` brackets the call with sentinel kernels and retries a
+    ``tests.cake.test_helpers.cake_profiler`` brackets the call with sentinel kernels and retries a
     session that lost its CUDA records; ``fn`` runs once more as the profiler's warm-up call.
     """
 

@@ -204,9 +204,8 @@ toolkit) devices of :data:`HANDOFF_VERIFIED`, on a problem of ``S`` tokens in
 :data:`HANDOFF_MIN_HEAD_TOKENS` and ``S / N`` at least
 :data:`HANDOFF_MIN_DOC_TOKENS` (a smaller step is host-bound: the record's host
 work costs more than the GPU work it saves), ``"on"`` on every call it
-supports, ``"off"`` never; ``CAKE_KDA_CKPT_HANDOFF`` (``off`` / ``on``, read
-by :func:`cake_kda_nondet` at each call) turns every call off or ``"auto"`` into
-``"on"``.  A per-device byte budget (two
+supports, ``"off"`` never.  The package reads no environment variable: the
+keyword is the only switch.  A per-device byte budget (two
 records of the call's shape) admits a record before its writes; untaken
 records are dropped at the end of the graph task (or by the next forward
 outside any backward), and repeated misses turn the hand-off off on the
@@ -6152,9 +6151,6 @@ def _param_finalize(
 # context with the recomputed saved tensors), so nothing else can carry them.
 
 HANDOFF_MODES = ("auto", "on", "off")
-# the benchmarking override of the cake_kda_nondet keyword, read at each call: "off" turns every call off, "on" turns
-# "auto" into "on" (an explicit "off" stays off); unset, empty or "auto": no override
-HANDOFF_ENV = "CAKE_KDA_CKPT_HANDOFF"
 # "auto" engages on these (plan architecture, SM count, Cake build toolkit "major.minor") devices, where the hand-off
 # suite measured the gradients bitwise equal to "off" on every plan family its packs reach, both checkpoint modes, ...
 HANDOFF_VERIFIED = frozenset(
@@ -6286,21 +6282,13 @@ _handoff_lock = threading.Lock()
 
 
 def _handoff_mode(checkpoint_handoff: str) -> str:
-    """The call's mode: ``checkpoint_handoff`` under :data:`HANDOFF_ENV`; ``ValueError`` for another value of
-    either."""
+    """The call's mode: ``checkpoint_handoff`` itself (the package reads no environment variable); ``ValueError`` for
+    another value."""
     if checkpoint_handoff not in HANDOFF_MODES:
         raise ValueError(
             f"checkpoint_handoff must be one of {HANDOFF_MODES}, got {checkpoint_handoff!r}"
         )
-    raw = os.environ.get(HANDOFF_ENV, "")
-    env = raw.strip().lower()
-    if env and env not in HANDOFF_MODES:
-        raise ValueError(
-            f"{HANDOFF_ENV}={raw!r}: expected one of {HANDOFF_MODES} (or unset)"
-        )
-    if env == "off" or checkpoint_handoff == "off":
-        return "off"
-    return "on" if env == "on" else checkpoint_handoff
+    return checkpoint_handoff
 
 
 def _handoff_task() -> int | None:
@@ -7060,7 +7048,7 @@ class CakeKDANondetFunction(torch.autograd.Function):
     own (:func:`cake_kda_nondet_train_backward` without ``workspace``).  The node takes no mode argument: its forward
     and its backward run this package.  ``checkpoint_handoff`` is the positional argument after ``doc_lengths``
     (``None``: ``"auto"``; a ``bool`` there raises ``TypeError``: an ``apply`` written with the deterministic Function's
-    raw gate arguments after ``doc_lengths``); :func:`cake_kda_nondet` applies the environment override and passes
+    raw gate arguments after ``doc_lengths``); :func:`cake_kda_nondet` passes the keyword, and
     ``"off"`` under ``no_grad``.  The raw gate mode's arguments follow ``checkpoint_handoff`` (``use_gate_in_kernel``,
     ``A_log``, ``dt_bias``, ``lower_bound``): the node then saves the raw gate (the caller's view) and ``A_log`` /
     ``dt_bias`` in place of an FP32 gate, records the mode and ``lower_bound``, returns the gradients of the raw gate,
@@ -7282,8 +7270,8 @@ def cake_kda_nondet(
     ``None``: the workspace's option, off without one) is the lower-memory arena option; the node records it, so
     the backward's own workspace (a per-call or checkpointed forward) takes the same option.  ``doc_lengths``
     (the documents' token counts, host integers) is required under a batched option and recorded by the node.
-    ``checkpoint_handoff`` (``"auto"``, ``"on"`` or ``"off"``) and ``CAKE_KDA_CKPT_HANDOFF``: the checkpoint
-    hand-off (the module docstring).  The node's backward is this package's.  A workspace or an arena option of the
+    ``checkpoint_handoff`` (``"auto"``, ``"on"`` or ``"off"``): the checkpoint hand-off (the module docstring); the
+    keyword is its only switch.  The node's backward is this package's.  A workspace or an arena option of the
     deterministic package is refused with ``ValueError`` (:func:`_check_nondet_package`).
     """
     _check_nondet_package(workspace=workspace, arena=arena)

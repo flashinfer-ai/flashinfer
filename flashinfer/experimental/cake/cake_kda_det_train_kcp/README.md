@@ -10,7 +10,7 @@ The entry points of `flashinfer.cake_kda_det_train_kcp` are a stable top-level
 API; the modules of this package are their backend.
 
 The path is deterministic: the same inputs, hardware, plan and process group
-give bitwise the same outputs and gradients.
+give bitwise the same outputs and gradients (see Determinism below).
 
 ## Usage
 
@@ -142,6 +142,16 @@ run its queued work.  Calls on one stream do neither.
 and sizes that call for the backward, so a first forward does not build a
 forward-only arena that the first backward replaces.
 
+A call without a workspace (`workspace=None`) runs on a default workspace of
+its context, device, stream, head count, direction and modes, kept in a bounded
+pool between calls (at most 64 keys, 2 workspaces per key). The call allocates
+its pools and local arena at its start and frees them at its end, as before,
+so between calls the pool holds host objects only: the plan, the layout views
+and the launch templates, which the next call reuses instead of building them
+again. The results are bitwise unchanged. The default workspaces of a
+collected context leave the pool at the next call; a call under CUDA-graph
+capture builds a workspace of its own.
+
 Saved set of a rank (`CakeKDADetKcpSaved`, `boundary_mode="saved"`): the fresh `S_in`
 (the initial states of its fragments), with `save_transfer` the owner's c1
 receive tensor and `M_seg`, on a rank whose fragments are split into `P > 1`
@@ -153,7 +163,24 @@ scalars; the int32 tables are rebuilt from the context.  The token-row `Aqk` /
 the internal rows in both modes (saved set and checkpoint replay run the same
 local programs), so `cake_kda_det_train_kcp_saved_bytes` counts the tables, `S_in`, the
 `save_transfer` tensors and the carry plane (and the convolution's history
-rows with `with_conv`).
+rows with `with_conv`).  The one exception is a checkpoint recompute on a
+caller's workspace (a saving forward that runs inside the autograd backward
+pass, with or without a recompute handle): its intra program writes the
+internal `Aqk` / `Akk` rows (BF16 `[2, R, H, 64]`) into a tensor its backward
+takes, and that backward uses them instead of launching the intra program
+again.  The rows are not part of the saved set (its type, tensors and meta are
+unchanged; the package hands them over under the set's `S_in`), and they add
+nothing to the backward's peak: they lie in the first bytes of the backward's
+`dq` / `dk` outputs (one tensor, allocated by the recompute).  With the
+in-kernel Q/K L2 norm off the backward reads them there (written only after the
+rows' last reader); otherwise it first copies them into its arena.  A call with
+`workspace=None` keeps none: its default workspace frees its storage at the end
+of every call, and a tensor kept from the recompute to the backward made the
+caching allocator reserve another arena.  The rows are the intra program's on the same
+operands, so every output is unchanged; with the fused in-kernel Q/K L2 norm
+the forward and backward intra records differ, and that form keeps the rows
+only on `cake_kcp.INTRA_ROWS_L2N_ARCHS` (sm_100a, sm_103a, sm_107a), where the
+two were measured to write bitwise equal rows.
 
 Walk-launch geometry: the walk kernels' CTA lists are issued
 longest-segment-first and the two tape programs (`fwdh_tape`, `dhu_tape`) run
@@ -438,6 +465,19 @@ previous rules stay selectable through the private test knob `p_rule`, as
 does the fused form of the carry merges (`merge_fuse="carry"`: the two carry
 families of a phase in one launch; off by default).
 
+The saved-set backward replays the forward tapes (`kcp_fwdh_tape`, which
+writes `h` / `v_new`) on a per-device side stream: an event recorded after
+the adjoint offset walk forks it, and the call's stream waits for it before
+the adjoint tape walk, whose `dh` shares bytes with `u` in both backward
+layouts.  In between, the b1 / b2 exchange and the merges read no tape and
+write only the call's pools, so the replay runs beside them.  The first
+replay of a table set, a backward that launches `kcp_dav` (it reads
+`v_new`), the ring exchange and the `overlap` schedule keep the call's
+stream.  Placement changes no bit.  The private test knob
+`bwd_tape_stream` keeps the one-stream form (`"one"`) and the other fork,
+issue and priority forms selectable for the A/B record;
+`LAST_CALL["bwd"]["bwd_tape_stream"]` records the form a backward ran.
+
 The files of this package:
 
 * `cake_kcp_jit.py` -- the `MODULES` registry of the sixteen shipped programs (the
@@ -446,7 +486,9 @@ The files of this package:
   and head, each over one 64-column half of the state), the affine
   merge in one record per register-blocked build, and the two chunk stages of the
   context-parallel route, `kcp_fwd_o` (the output from the K1 tapes) and
-  `kcp_dav` (`dA_qk` and the `dv1` K2 reads), and the fused forward walk
+  `kcp_dav` (`dA_qk`, launched only where the single-rank plan dispatches
+  its `dav` stage; the K2 adjoint walks form `dv1 = Aqk^T dO` themselves from
+  the internal `Aqk` rows), and the fused forward walk
   `kcp_fwdh_o` (the forward state walk with the chunk output inside it: the
   same bits as the tape walk followed by `kcp_fwd_o`, no tape written; in its
   full-width and two-CTA records), which the forward that keeps no tape
@@ -484,6 +526,27 @@ The files of this package:
   context-parallel-only programs and `csrc/cake_kda_det_train_<digest>_{kernel,binding}.cu`
   of the two chunk stages (`kcp_fwd_o`, `kcp_dav`), rendered like the
   single-rank ones (digests in `build.json` and `build.test.json`).
+
+## Determinism
+
+Every output repeats bit for bit for identical inputs, device (the same SM
+count), configuration (`cake_kda_det_train_kcp_partition` layout, options,
+workspace or `workspace=None`) and process group:
+
+- the forward output `out`;
+- the input gradients `dq`, `dk`, `dv`, `dbeta`;
+- the gate gradient `dg` (gate mode `g`), or with `use_gate_in_kernel=True`
+  the per-rank partials of `dA_log` and `dt_bias`, which repeat bit for bit on
+  each rank and are equal on every rank after
+  `cake_kda_det_train_kcp_reduce_gate_param_grads` (a fixed rank-order sum, no
+  all-reduce);
+- the saved set of `cake_kda_det_train_kcp_forward`.
+
+A checkpoint recompute (plain `torch.utils.checkpoint` or the recompute
+handle) gives the same bits as the saved-set path, and the recompute with the
+handle issues no collective.  Cross-rank state merges run in a fixed rank
+order.  Bits are not promised across SM counts, batch compositions, CP layouts
+or package versions.
 
 ## Vendoring
 

@@ -6,7 +6,7 @@ every position, the padding past the cache's rows, the typed refusals; the per-t
 import pytest
 import torch
 
-from tests.test_helpers.qwen_3_5_block_reference import build_rope_tables
+from tests.experimental.test_helpers.qwen_3_5_block_reference import build_rope_tables
 
 
 def _cos_sin_cache(max_pos, rope_dim, base=1_000_000.0, dtype=torch.float32):

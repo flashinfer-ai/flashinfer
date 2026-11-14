@@ -16,7 +16,7 @@ limitations under the License.
 Host tests of the candidate-support entry points (flashinfer-ai/flashinfer#7636) of the Cake LM-head package:
 the argument contract, the validation stage's error word, the canonical FP32 sequence of the row stages and the
 reference backend against the masked FP64 oracle (gate: 1.05x the masked PyTorch baseline's error plus a floor).
-The package is reached through ``tests.test_helpers.cake_package`` only.
+The package is reached through ``tests.cake.test_helpers.cake_package`` only.
 """
 
 import math
@@ -31,9 +31,11 @@ from fractions import Fraction
 import pytest
 import torch
 
-from tests.test_helpers.cake_lm_head_loss_reference import Inputs as LossInputs
-from tests.test_helpers.cake_lm_head_loss_reference import reference_fp64
-from tests.test_helpers.cake_lm_head_support_reference import (
+from tests.experimental.test_helpers.cake_lm_head_loss_reference import (
+    Inputs as LossInputs,
+)
+from tests.experimental.test_helpers.cake_lm_head_loss_reference import reference_fp64
+from tests.experimental.test_helpers.cake_lm_head_support_reference import (
     IGNORE_INDEX,
     gate_failures,
     label_positions,
@@ -44,7 +46,7 @@ from tests.test_helpers.cake_lm_head_support_reference import (
     support_error_report,
     topp_support,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_support = cake_package("cake.cake_lm_head_det_train", "cake_support")
 cake_backend = cake_package("cake.cake_lm_head_det_train", "cake_backend")
@@ -1266,7 +1268,7 @@ def test_device_assert_ends_the_context(what):
     script = textwrap.dedent(
         f"""
         import torch
-        from tests.test_helpers.cake_package import cake_package
+        from tests.cake.test_helpers.cake_package import cake_package
         cs = cake_package("cake.cake_lm_head_det_train", "cake_support")
         X = torch.zeros(4, 256, dtype=torch.bfloat16, device="cuda")
         W = torch.zeros(512, 256, dtype=torch.bfloat16, device="cuda")
@@ -1757,7 +1759,7 @@ def test_cake_device_assert_ends_the_context(what):
     script = textwrap.dedent(
         f"""
         import torch
-        from tests.test_helpers.cake_package import cake_package
+        from tests.cake.test_helpers.cake_package import cake_package
         cs = cake_package("cake.cake_lm_head_det_train", "cake_support")
         T = 0 if "{what}" == "first offset" else 4
         X = torch.zeros(T, 256, dtype=torch.bfloat16, device="cuda")

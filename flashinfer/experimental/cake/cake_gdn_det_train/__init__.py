@@ -20,8 +20,9 @@ limitations under the License.
 # public entry point is ``cake_gdn_det``; the package exports
 # the names that carry ``det`` only.  The chunk and segment tables, the scan
 # planner, the launch order and the autograd chain live in ``cake_chain``
-# (which also exports the planner and table helpers), the registry in
-# ``cake_jit`` and the loader in ``cake_backend``.  Every plan pin is an
+# (which also exports the planner and table helpers), the split forward's
+# host piece table and the forward tape levels in ``cake_plan``, the registry
+# in ``cake_jit`` and the loader in ``cake_backend``.  Every plan pin is an
 # explicit keyword argument; the package reads no environment variable.
 
 from .cake_chain import (

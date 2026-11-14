@@ -651,7 +651,7 @@ kernel_cake_rmsnorm_train_b0299f6e0881fb35f27b(__nv_bfloat16* __restrict__ x, __
             packed_0[_lp + 3] = *(uint32_t*)&_bf2;
         }
         if (row0 < T) {
-            reinterpret_cast<int4*>(y + ((long long)row0 * 256 + (long long)col))[0] = reinterpret_cast<int4*>(packed_0)[0];
+            reinterpret_cast<int4*>(y + ((long long)row0 * 256ll + (long long)col))[0] = reinterpret_cast<int4*>(packed_0)[0];
         }
         float rk_1 = __shfl_sync(0xFFFFFFFF, rstd, 4);
         float out_1[8];
@@ -706,7 +706,7 @@ kernel_cake_rmsnorm_train_b0299f6e0881fb35f27b(__nv_bfloat16* __restrict__ x, __
             packed_1[_lp + 3] = *(uint32_t*)&_bf2;
         }
         if (row0 + 1 < T) {
-            reinterpret_cast<int4*>(y + ((long long)(row0 + 1) * 256 + (long long)col))[0] = reinterpret_cast<int4*>(packed_1)[0];
+            reinterpret_cast<int4*>(y + ((long long)(row0 + 1) * 256ll + (long long)col))[0] = reinterpret_cast<int4*>(packed_1)[0];
         }
         float rk_2 = __shfl_sync(0xFFFFFFFF, rstd, 8);
         float out_2[8];
@@ -761,7 +761,7 @@ kernel_cake_rmsnorm_train_b0299f6e0881fb35f27b(__nv_bfloat16* __restrict__ x, __
             packed_2[_lp + 3] = *(uint32_t*)&_bf2;
         }
         if (row0 + 2 < T) {
-            reinterpret_cast<int4*>(y + ((long long)(row0 + 2) * 256 + (long long)col))[0] = reinterpret_cast<int4*>(packed_2)[0];
+            reinterpret_cast<int4*>(y + ((long long)(row0 + 2) * 256ll + (long long)col))[0] = reinterpret_cast<int4*>(packed_2)[0];
         }
         float rk_3 = __shfl_sync(0xFFFFFFFF, rstd, 12);
         float out_3[8];
@@ -816,7 +816,7 @@ kernel_cake_rmsnorm_train_b0299f6e0881fb35f27b(__nv_bfloat16* __restrict__ x, __
             packed_3[_lp + 3] = *(uint32_t*)&_bf2;
         }
         if (row0 + 3 < T) {
-            reinterpret_cast<int4*>(y + ((long long)(row0 + 3) * 256 + (long long)col))[0] = reinterpret_cast<int4*>(packed_3)[0];
+            reinterpret_cast<int4*>(y + ((long long)(row0 + 3) * 256ll + (long long)col))[0] = reinterpret_cast<int4*>(packed_3)[0];
         }
         float rk_4 = __shfl_sync(0xFFFFFFFF, rstd, 16);
         float out_4[8];
@@ -871,7 +871,7 @@ kernel_cake_rmsnorm_train_b0299f6e0881fb35f27b(__nv_bfloat16* __restrict__ x, __
             packed_4[_lp + 3] = *(uint32_t*)&_bf2;
         }
         if (row0 + 4 < T) {
-            reinterpret_cast<int4*>(y + ((long long)(row0 + 4) * 256 + (long long)col))[0] = reinterpret_cast<int4*>(packed_4)[0];
+            reinterpret_cast<int4*>(y + ((long long)(row0 + 4) * 256ll + (long long)col))[0] = reinterpret_cast<int4*>(packed_4)[0];
         }
         float rk_5 = __shfl_sync(0xFFFFFFFF, rstd, 20);
         float out_5[8];
@@ -926,7 +926,7 @@ kernel_cake_rmsnorm_train_b0299f6e0881fb35f27b(__nv_bfloat16* __restrict__ x, __
             packed_5[_lp + 3] = *(uint32_t*)&_bf2;
         }
         if (row0 + 5 < T) {
-            reinterpret_cast<int4*>(y + ((long long)(row0 + 5) * 256 + (long long)col))[0] = reinterpret_cast<int4*>(packed_5)[0];
+            reinterpret_cast<int4*>(y + ((long long)(row0 + 5) * 256ll + (long long)col))[0] = reinterpret_cast<int4*>(packed_5)[0];
         }
         float rk_6 = __shfl_sync(0xFFFFFFFF, rstd, 24);
         float out_6[8];
@@ -981,7 +981,7 @@ kernel_cake_rmsnorm_train_b0299f6e0881fb35f27b(__nv_bfloat16* __restrict__ x, __
             packed_6[_lp + 3] = *(uint32_t*)&_bf2;
         }
         if (row0 + 6 < T) {
-            reinterpret_cast<int4*>(y + ((long long)(row0 + 6) * 256 + (long long)col))[0] = reinterpret_cast<int4*>(packed_6)[0];
+            reinterpret_cast<int4*>(y + ((long long)(row0 + 6) * 256ll + (long long)col))[0] = reinterpret_cast<int4*>(packed_6)[0];
         }
         float rk_7 = __shfl_sync(0xFFFFFFFF, rstd, 28);
         float out_7[8];
@@ -1036,7 +1036,7 @@ kernel_cake_rmsnorm_train_b0299f6e0881fb35f27b(__nv_bfloat16* __restrict__ x, __
             packed_7[_lp + 3] = *(uint32_t*)&_bf2;
         }
         if (row0 + 7 < T) {
-            reinterpret_cast<int4*>(y + ((long long)(row0 + 7) * 256 + (long long)col))[0] = reinterpret_cast<int4*>(packed_7)[0];
+            reinterpret_cast<int4*>(y + ((long long)(row0 + 7) * 256ll + (long long)col))[0] = reinterpret_cast<int4*>(packed_7)[0];
         }
         if ((lane & 3) == 0) {
             if (lane >> 2 < 8) {

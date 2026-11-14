@@ -49,6 +49,7 @@ from ._utils import (
     MLAHeadDimensions as MLAHeadDimensions,
     deepseek_mla_dimensions as deepseek_mla_dimensions,
     smaller_mla_dimensions as smaller_mla_dimensions,
+    compact_query_mla_dimensions as compact_query_mla_dimensions,
     nope_mla_dimensions as nope_mla_dimensions,
     supported_mla_head_dimensions as supported_mla_head_dimensions,
     _check_mla_query_kv_shape,
@@ -1948,8 +1949,10 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     in the combined convention or as ``extra_sparse_topk_lens`` counting
     compressed slots only, which implies a length offset of 128). The kernels
     use ``clamp(len + sparse_topk_lens_offset, 0, sparse_topk)`` entries of
-    each row. No copies are made: tables must be int32 with unit column stride
-    (row strides are free), and ``query``/``out``/KV pools must be densely
+    each row. No copies are made: tables must be int32 with unit column stride,
+    start at a 16-byte aligned address and, with more than one row, have a row
+    stride that is a multiple of 4 (the kernels load index rows 16 bytes at a
+    time), and ``query``/``out``/KV pools must be densely
     packed. ``workspace_buffer`` is carved deterministically and exactly per
     route (:func:`flashinfer.mla.cake_dsv4_workspace_requirement`); any
     buffer from the one-row minimum up works: when one launch over all
@@ -1976,7 +1979,14 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         Dense query input ``[batch_size, q_len_per_request, num_heads, 512]``
         or varlen query input ``[sum_q, num_heads, 512]`` when
         ``cum_seq_lens_q`` is provided. SM100/SM103/SM107 accept BF16 or FP8
-        E4M3; SM120/SM121 accepts BF16.
+        E4M3; SM120/SM121 accepts BF16. With ``backend="cake"`` and
+        ``kv_cache_format="nvfp4"`` on SM100/SM103 the query is either BF16
+        (the NVFP4 decode family) or packed
+        NVFP4, uint8 with last dimension 384 (the cache's row format: codes,
+        then the 28 E4M3 scale factors), which runs the NVFP4 prefill bodies
+        at any row count; the call packs nothing.
+        :func:`flashinfer.mla.cake_dsv4_nvfp4_pack_query`
+        packs a BF16 query. The output is BF16 with last dimension 512.
     swa_kv_cache : torch.Tensor
         SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses an opaque
         packed uint8 record with last dimension 584 (FP8), 528 (DSV4.1 FP8) or
@@ -2071,8 +2081,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     extra_sparse_indices : Optional[torch.Tensor]
         Optional SM120/SM121 compressed segment indices into
         ``compressed_kv_cache``. With ``backend="cake"``, the separate
-        compressed table ``[T, topk_c]`` INT32 (unit column stride; row stride
-        free) that pairs with a ``[T, 128]`` SWA ``sparse_indices``.
+        compressed table ``[T, topk_c]`` INT32 (unit column stride, 16-byte
+        aligned start and, with more than one row, a row stride that is a
+        multiple of 4) that pairs with a ``[T, 128]`` SWA ``sparse_indices``.
     extra_sparse_topk_lens : Optional[torch.Tensor]
         Active compressed segment lengths for SM120/SM121, shape ``[sum_q]``
         INT32. With ``backend="cake"``, compressed-only lengths ``[T]`` that
@@ -2478,7 +2489,10 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         else:
             raise ValueError(f"Expected query.ndim == 3 or 4, got {query.ndim}")
         if out is None:
-            out = torch.empty(query.shape, dtype=torch.bfloat16, device=query.device)
+            # A packed NVFP4 query has 384-byte rows; the output rows are 512 BF16.
+            out = torch.empty(
+                (*query.shape[:-1], 512), dtype=torch.bfloat16, device=query.device
+            )
         return run_cake_dsv4_nvfp4(
             query=query_flat,
             swa_kv_cache=swa_kv_cache,
@@ -3585,8 +3599,9 @@ def _mla_with_kv_cache_impl(
         Pre-allocated workspace buffer. Must be zero-initialized on first use
         by kernels that use semaphore state.
     qk_nope_head_dim : int
-        Non-RoPE query dimension. Dense MLA paths commonly use ``128`` or
-        ``64`` depending on model. The SM120/SM121 sparse v32/GLM backend
+        Non-RoPE query dimension before absorption. SM100/SM103 TRTLLM-GEN
+        sparse MLA supports ``64`` with ``kv_lora_rank=512`` and
+        ``qk_rope_head_dim=64``. The SM120/SM121 sparse v32/GLM backend
         validates it together with ``query.shape[-1]``. GLM-5.3 uses the
         native ``qk_rope_head_dim=0`` / ``query.shape[-1]=512`` geometry.
     kv_lora_rank : int

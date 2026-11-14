@@ -18,12 +18,12 @@ limitations under the License.
 # the forward projection ``Y = X @ W[e].T`` with the activation gradient
 # ``dX = G @ W[e]`` and the weight gradient ``dW[e] = G[e].T @ X[e]`` in
 # ``backward``.  The forward and the activation gradient run this package's
-# copies of the deterministic programs, but for the sm_100a activation
-# gradient's L2 evict-first twin, this package's own build of the
-# deterministic wide tile (the deterministic bits; a
+# copies of the deterministic programs (the deterministic bits; a
 # non-reentrant activation-checkpoint replay of the forward gives the same
-# ``Y``); the weight gradient may add its split tail with unordered fp32
-# reductions (``cake_backend``, numerical mode).  ``CakeMoEGroupedGemmNondetFunction`` calls the
+# ``Y``); the weight gradient finishes a split tail in the same launch, in
+# slot order, so it also repeats bit for bit for the same inputs, shapes,
+# device SM count and configuration (``cake_backend``, numerical mode).
+# ``CakeMoEGroupedGemmNondetFunction`` calls the
 # three generated programs as plain functions; no torch custom op is
 # registered.  ``cake_moe_grouped_gemm_nondet`` launches the forward after
 # ``CakeMoEGroupedGemmNondetFunction.apply`` returns, so autograd saves ``x``, ``w`` and ``offs``
@@ -81,7 +81,8 @@ def _wgrad_op(
     out: torch.Tensor,
     num_groups: int,
 ) -> None:
-    # An order-varying launch raises the deterministic-mode alert right before it runs.
+    # An order-varying launch (none under the shipped constants) raises the deterministic-mode alert
+    # right before it runs.
     _prepare_wgrad(g, x, offs, out, None, num_groups)._run(
         "CakeMoEGroupedGemmNondetFunction.backward"
     )
@@ -94,8 +95,9 @@ def _wgrad_acc_op(
     main_grad: torch.Tensor,
     num_groups: int,
 ) -> None:
-    # ``main_grad[e] += G[e].T @ X[e]``; an order-varying launch raises the deterministic-mode alert
-    # right before it runs (``main_grad`` is then untouched under the strict mode).
+    # ``main_grad[e] += G[e].T @ X[e]``; an order-varying launch (none under the shipped constants)
+    # raises the deterministic-mode alert right before it runs (``main_grad`` is then untouched under
+    # the strict mode).
     _prepare_wgrad(g, x, offs, main_grad, None, num_groups, accumulate=True)._run(
         "CakeMoEGroupedGemmNondetFunction.backward"
     )
@@ -154,18 +156,18 @@ def _fill_fwd(
 
 
 class CakeMoEGroupedGemmNondetFunction(torch.autograd.Function):
-    """``Y = grouped X @ W[e].T`` with ``dX`` and ``dW`` from the Cake programs, ``dW`` non-deterministic.
+    """``Y = grouped X @ W[e].T`` with ``dX`` and ``dW`` from the non-deterministic package's Cake programs.
 
     ``x`` ``[sum_m, K]`` bf16, ``w`` ``[E, N, K]`` bf16, ``offs`` int32 device
     end offsets ``[E]`` (or ``m_indptr`` ``[E + 1]``).  ``forward`` saves ``x``,
     ``w`` and ``offs`` only.  ``backward`` returns ``dX`` ``[sum_m, K]`` bf16 (the
     deterministic bits) and ``dW`` ``[E, N, K]`` in the dtype of ``w``, whose
-    split tail (512-wide k tile) is added in an order the launch does not fix;
-    empty groups give exact zeros.  Under
-    ``torch.use_deterministic_algorithms(True)`` a backward whose ``dW``
-    launch adds such a split tail raises the non-determinism alert immediately
-    before that launch (the forward, ``dX`` and a fixed-order ``dW`` never
-    alert).  Through
+    split tail (512-wide k tile) is summed in slot order in the same launch;
+    empty groups give exact zeros.  Every output repeats bit for bit for the
+    same inputs, shapes, device SM count and configuration, and no launch
+    alerts under ``torch.use_deterministic_algorithms(True)`` (the alert serves
+    only an architecture listed in ``unordered_tail_archs``: ``cake_backend``).
+    Through
     :func:`cake_moe_grouped_gemm_nondet` the forward GEMM runs after autograd saved ``x``,
     ``w`` and ``offs``, so a checkpoint's early stop can skip it; a direct
     ``CakeMoEGroupedGemmNondetFunction.apply(x, w, offs)`` launches inside ``forward``
@@ -279,6 +281,9 @@ def cake_moe_grouped_gemm_nondet(
 ) -> torch.Tensor:
     """Differentiable ragged grouped GEMM ``Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T``.
 
+    The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+    For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
+
     Parameters
     ----------
     x : torch.Tensor
@@ -317,14 +322,16 @@ def cake_moe_grouped_gemm_nondet(
     torch.Tensor
         ``[sum_m, N]`` bfloat16, the deterministic forward's bits.  ``backward``
         produces ``x.grad`` ``[sum_m, K]`` bfloat16 (the deterministic bits) and
-        ``w.grad`` ``[E, N, K]`` in ``w``'s dtype (bfloat16), not bitwise
-        reproducible run to run where the 512-wide k tile splits its tail; use
-        :func:`cake_moe_grouped_gemm_nondet_train_wgrad` directly for an fp32 weight gradient.  Under
-        ``torch.use_deterministic_algorithms(True)`` the backward raises the
-        non-determinism alert immediately before a weight-gradient launch that
-        adds a split tail with unordered reductions (``RuntimeError``; under
-        ``warn_only=True`` a ``UserWarning``, then it runs; no fallback); the
-        forward, ``dX`` and a fixed-order ``dW`` do not alert.  The forward GEMM runs after
+        ``w.grad`` ``[E, N, K]`` in ``w``'s dtype (bfloat16), which repeats bit
+        for bit for the same inputs, shapes, device SM count and configuration
+        (a split tail of the 512-wide k tile is summed in slot order); use
+        :func:`cake_moe_grouped_gemm_nondet_train_wgrad` directly for an fp32 weight gradient.  No
+        launch of the forward or the backward alerts under
+        ``torch.use_deterministic_algorithms(True)``; an order-varying weight-gradient
+        launch, which only an architecture listed in ``unordered_tail_archs`` plans,
+        would raise the non-determinism alert immediately before it runs
+        (``RuntimeError``; under ``warn_only=True`` a ``UserWarning``, then it
+        runs; no fallback).  The forward GEMM runs after
         autograd saved ``x``, ``w`` and ``offs``: under a non-reentrant
         checkpoint with early stop on, the recomputation skips it when these
         are the last saves of the innermost checkpointed region, as for a

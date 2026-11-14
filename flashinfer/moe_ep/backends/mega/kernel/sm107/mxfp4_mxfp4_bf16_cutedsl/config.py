@@ -19,6 +19,7 @@ class Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig:
     top_k: int
     kernel_name: str = field(default="sm107_mxfp4_mxfp4_bf16_cutedsl", init=False)
     kind: Literal["mxfp4"] = field(default="mxfp4", init=False)
+    batch_invariant: bool = field(default=False, kw_only=True)
     gate_up_clamp: Optional[float] = None
     activation_clamp: Optional[float] = None  # deprecated alias of gate_up_clamp
     fast_math: bool = True  # accepted for mega API parity; no kernel toggle
@@ -46,7 +47,20 @@ class Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig:
     activation: Literal["swiglu", "situ"] = "swiglu"
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
+    swiglu_alpha: Optional[float] = field(default=None, kw_only=True)
+    swiglu_beta: Optional[float] = field(default=None, kw_only=True)
     # GenPhase requires cluster (4, 1), fc2_use_bulk=True, and <=1024 tokens/rank.
     kernel_variant: Literal["inference", "genphase"] = "inference"
     # Quantizes the FC2 return payload; the operator still returns BF16.
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
+
+    def __post_init__(self):
+        if not self.batch_invariant and (
+            self.swiglu_alpha is not None or self.swiglu_beta is not None
+        ):
+            raise ValueError(
+                "custom Rubin activation constants require batch_invariant=True"
+            )
+        from ...sm100.common.mxfp4_batch_invariant import validate_mxfp4_batch_invariant
+
+        validate_mxfp4_batch_invariant(self, arch="sm_107")

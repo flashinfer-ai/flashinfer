@@ -23,7 +23,7 @@ import pytest
 import torch
 import torch.utils.checkpoint
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 # Backend suite: the package is named once, through ``cake_package``; nothing else
 # of flashinfer is imported here.  The tests of the stable flashinfer entry point
@@ -95,6 +95,14 @@ def _wide_ts33(op, k, arch, sum_m, groups, c):
     """The 3 / 3 head / tail rule of ``op``: ``dgrad_wide_ts33`` / ``fwd_wide_ts33``."""
     rule = cb.dgrad_wide_ts33 if op == "dgrad" else cb.fwd_wide_ts33
     return rule(k, arch, sum_m, groups, c)
+
+
+def _evict_first(op, k, arch, sum_m, groups, c):
+    """The evict-first rule of ``op``: ``dgrad_evict_first``; ``fwd_lwh_ef`` or
+    ``fwd_evict_first``."""
+    if op == "dgrad":
+        return cb.dgrad_evict_first(k, arch, sum_m, groups, c)
+    return cb.fwd_lwh_ef(k, arch, c) or cb.fwd_evict_first(k, arch, c)
 
 
 def _require_program(op, out_dtype=None):
@@ -357,7 +365,9 @@ def test_program_choice_follows_the_host_plan_constants():
     """``wide_fwd_archs`` / ``wide_dgrad_archs`` select the 512-column tile of
     ``fwd`` / ``dgrad`` when the output columns are a multiple of
     ``wide_block_n``; ``dgrad_evict_first_archs`` the evict-first twin of the
-    ``dgrad`` wide tile (``main_wide_ef``) where ``dgrad_evict_first`` holds;
+    ``dgrad`` wide tile (``main_wide_ef``) where ``dgrad_evict_first`` holds, and
+    ``fwd_lwh_ef_archs`` / ``fwd_evict_first_archs`` that of the ``fwd`` wide tile
+    where ``fwd_lwh_ef`` / ``fwd_evict_first`` holds;
     ``dgrad_wide_ts33_archs`` / ``fwd_wide_ts33_archs`` the 3 / 3 head / tail twin of
     the ``dgrad`` / ``fwd`` wide tile (``main_wide_ts33``) where ``dgrad_wide_ts33`` /
     ``fwd_wide_ts33`` holds and the evict-first twin does not; ``wave_sync_archs``
@@ -373,7 +383,8 @@ def test_program_choice_follows_the_host_plan_constants():
     for key in ("wide_fwd_archs", "wide_dgrad_archs", "k512_archs"):
         assert set(c[key]) <= set(cake_jit.ARCHES), key
     assert set(c["dgrad_evict_first_archs"]) <= set(c["wide_dgrad_archs"])
-    assert int(c["dgrad_evict_first_min_rows"]) > 0
+    assert set(c["dgrad_evict_first_archs"]) <= set(c["dgrad_evict_first_min_rows"])
+    assert all(int(v) > 0 for v in c["dgrad_evict_first_min_rows"].values())
     assert int(c["dgrad_evict_first_min_k"]) % wide_n == 0
     assert set(c["dgrad_wide_ts33_archs"]) <= set(c["wide_dgrad_archs"])
     assert set(c["dgrad_wide_ts33_min_rows"]) == set(c["dgrad_wide_ts33_archs"])
@@ -384,6 +395,8 @@ def test_program_choice_follows_the_host_plan_constants():
     assert int(c["fwd_wide_ts33_max_rows"]) > 0
     assert set(c["fwd_lwh_ef_archs"]) <= set(c["wide_fwd_archs"])
     assert int(c["fwd_lwh_ef_max_k"]) > 0
+    assert set(c["fwd_evict_first_archs"]) <= set(c["wide_fwd_archs"])
+    assert int(c["fwd_evict_first_min_k"]) > 0
     # The probed queue split serves the domain-scheduled programs only (sm_107a's are
     # static and ignore c0 / c1), and the data gradient only.
     assert set(c["domain_split_archs"]) <= {"sm_100a", "sm_103a"}
@@ -407,14 +420,24 @@ def test_program_choice_follows_the_host_plan_constants():
             if arch in wide_archs:
                 assert served, (name, arch)
             served_ef = cake_jit.stage_served(name, "main_wide_ef", arch)
-            ef_key = "dgrad_evict_first_archs" if op == "dgrad" else "fwd_lwh_ef_archs"
-            if arch in c[ef_key]:
+            ef_keys = (
+                ("dgrad_evict_first_archs",)
+                if op == "dgrad"
+                else ("fwd_lwh_ef_archs", "fwd_evict_first_archs")
+            )
+            if any(arch in c[key] for key in ef_keys):
                 assert served_ef, (name, arch)
             served_ts33 = cake_jit.stage_served(name, "main_wide_ts33", arch)
             if arch in c[f"{op}_wide_ts33_archs"]:
                 assert served_ts33, (name, arch)
-            for cols in (4096, 4096 - block_n, block_n):
-                n, k = (cols, 512) if op == "fwd" else (512, cols)
+            for cols, red in (
+                (4096, 512),
+                (4096 - block_n, 512),
+                (block_n, 512),
+                (4096, 2048),
+                (4096, 6144),
+            ):
+                n, k = (cols, red) if op == "fwd" else (red, cols)
                 for sum_m, groups in ((4096, 4), (EXPERT_ROWS, 4)):
                     stage, tile_n = cb.select_row_stage(
                         name, op, n, k, arch, c, sum_m=sum_m, num_groups=groups
@@ -423,11 +446,7 @@ def test_program_choice_follows_the_host_plan_constants():
                     ef = (
                         wide
                         and served_ef
-                        and (
-                            cb.dgrad_evict_first(k, arch, sum_m, groups, c)
-                            if op == "dgrad"
-                            else cb.fwd_lwh_ef(k, arch, c)
-                        )
+                        and _evict_first(op, k, arch, sum_m, groups, c)
                     )
                     ts33 = (
                         wide
@@ -502,16 +521,21 @@ def test_program_choice_follows_the_host_plan_constants():
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_expert_rows_take_the_measured_dgrad_stage_and_k_tile(arch):
     """Over ``EXPERT_ROWS`` routed rows: the data gradient of the gate/up projection
-    (``K`` 6144) takes the evict-first wide tile on sm_107a and the 3 / 3 head / tail
-    wide tile on sm_103a at 4, 8 and 16 groups, else the plain wide tile; the down
-    projection (``K`` 2048) takes the plain wide tile.
-    The weight gradient's 512-wide k tile starts at 4096 rows per group (32 groups) on
-    every architecture."""
+    (``K`` 6144) takes the evict-first wide tile on sm_100a at 4 to 32 groups and on
+    sm_107a at 4 and 8 groups, and the 3 / 3 head / tail wide tile on sm_103a at 4, 8
+    and 16 groups, else the plain wide tile; the down projection (``K`` 2048) takes
+    the plain wide tile.
+    The weight gradient's 512-wide k tile starts at the architecture's
+    ``k512_min_rows_per_group`` (3072 rows per group on sm_100a and sm_103a, 4096 on
+    sm_107a): at 32 groups on every architecture, and at the measured E32 row of
+    112576 rows (3518 per group) on sm_100a and sm_103a only."""
     c = HOST_PLAN_CONSTANTS
     name = cake_jit.record_name("dgrad")
     for groups in EXPERT_GROUPS:
         for n, k in ((4096, 6144), (6144, 2048)):
-            ef = arch == "sm_107a" and k == 6144 and groups in (4, 8)
+            ef = k == 6144 and (
+                arch == "sm_100a" or (arch == "sm_107a" and groups in (4, 8))
+            )
             ts33 = k == 6144 and arch == "sm_103a" and groups in (4, 8, 16)
             assert cb.dgrad_evict_first(k, arch, EXPERT_ROWS, groups, c) == ef
             assert cb.dgrad_wide_ts33(k, arch, EXPERT_ROWS, groups, c) == ts33
@@ -523,10 +547,13 @@ def test_expert_rows_take_the_measured_dgrad_stage_and_k_tile(arch):
                 "main_wide_ef" if ef else "main_wide_ts33" if ts33 else "main_wide"
             )
             assert stage == expected, (arch, groups, k)
-        k512 = EXPERT_ROWS // groups >= 4096
+        k512 = EXPERT_ROWS // groups >= c["k512_min_rows_per_group"][arch]
         for k in (2048, 6144):
             tile_k = cb.select_wgrad_tile(k, arch, EXPERT_ROWS, groups, c)
             assert tile_k == (512 if k512 else 256), (arch, groups, k)
+    for k in (2048, 6144):
+        tile_k = cb.select_wgrad_tile(k, arch, 112576, 32, c)
+        assert tile_k == (256 if arch == "sm_107a" else 512), (arch, k)
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
@@ -564,6 +591,46 @@ def test_bench_rows_take_the_measured_wide_ts33_stage(arch):
     variants = {label: v for label, _sum_m, _groups, v in BENCH_ROWS}
     rows = sum(variants[label] for _op, _proj, label in taken)
     assert rows == {"sm_100a": 0, "sm_103a": 9, "sm_107a": 0}[arch]
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_bench_rows_take_the_measured_evict_first_stage(arch):
+    """Over the MoE benchmark rows (``BENCH_ROWS`` x ``BENCH_PROJ``, both ops): the
+    wide tile's L2 evict-first twin (``main_wide_ef``) serves the gate/up forward pass
+    (``K`` 6144) on sm_100a and sm_103a at every group count, the gate/up data
+    gradient on sm_100a at every group count (``sum_m // E >= 4096``) and on sm_107a
+    at E4 and E8 (``sum_m // E >= 16384``), and the down forward pass (``K`` 2048) on
+    sm_107a; no down data gradient, and no sm_103a data gradient (the 3 / 3 head /
+    tail rule keeps its rows).  Every row takes the stage its rules select."""
+    c = HOST_PLAN_CONSTANTS
+    taken = set()
+    for op in ("fwd", "dgrad"):
+        name = cake_jit.record_name(op)
+        for proj, n, k in BENCH_PROJ:
+            for label, sum_m, groups, _variants in BENCH_ROWS:
+                stage, tile_n = cb.select_row_stage(
+                    name, op, n, k, arch, c, sum_m=sum_m, num_groups=groups
+                )
+                assert tile_n == int(c["wide_block_n"]), (op, proj, label)
+                ef = _evict_first(op, k, arch, sum_m, groups, c)
+                ts33 = not ef and _wide_ts33(op, k, arch, sum_m, groups, c)
+                assert stage == (
+                    "main_wide_ef" if ef else "main_wide_ts33" if ts33 else "main_wide"
+                ), (op, proj, label)
+                if ef:
+                    taken.add((op, proj, label))
+    labels = [label for label, _sum_m, _groups, _variants in BENCH_ROWS]
+    expected = {
+        "sm_100a": {("fwd", "gate_up", label) for label in labels}
+        | {("dgrad", "gate_up", label) for label in labels},
+        "sm_103a": {("fwd", "gate_up", label) for label in labels},
+        "sm_107a": {("fwd", "down", label) for label in labels}
+        | {("dgrad", "gate_up", label) for label in ("E4_m112576", "E4_m136064", "E8")},
+    }[arch]
+    assert taken == expected, (arch, sorted(taken ^ expected))
+    variants = {label: v for label, _sum_m, _groups, v in BENCH_ROWS}
+    rows = sum(variants[label] for _op, _proj, label in taken)
+    assert rows == {"sm_100a": 18, "sm_103a": 9, "sm_107a": 16}[arch]
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
@@ -657,6 +724,165 @@ def test_workspace_arguments_of_the_argument_plans():
     assert len(rest) == 3 and all(0 <= int(v) < 2**32 for v in rest)
     assert int(HOST_PLAN_CONSTANTS["sched_words"]) >= len(rest)
     assert int(HOST_PLAN_CONSTANTS["wave_sync_words"]) >= 1
+
+
+# The keywords the host binds a stage's argument plan from, by the stage it binds: the
+# forward and data-gradient stages, the weight-gradient main stages and the tail reduce.
+ROW_ARGUMENTS = {
+    "A",
+    "B",
+    "C",
+    "offs",
+    "num_groups",
+    "sum_m",
+    "N",
+    "K",
+    "ldc",
+    "c0",
+    "c1",
+}
+WGRAD_MAIN_ARGUMENTS = {
+    "A",
+    "B",
+    "C",
+    "offs",
+    "tensormap_workspace",
+    "partials",
+    "tail_splits",
+    "raster_rows",
+    "num_groups",
+    "sum_m",
+    "N",
+    "K",
+    "ldc",
+    "stride_e",
+    "wave_mode",
+}
+TAIL_ARGUMENTS = {
+    "partials",
+    "C",
+    "offs",
+    "num_groups",
+    "N",
+    "K",
+    "ldc",
+    "stride_e",
+    "num_clusters",
+    "tail_splits",
+    "raster_rows",
+}
+GRID_ARGUMENTS = {"grid_x", "grid_y", "grid_z"}
+
+
+def test_argument_plans_name_only_bound_arguments():
+    """Every argument the program of a route stage names, on every architecture, is one
+    the host binds for that stage: a grid dimension, a stream workspace, a keyword of the
+    stage's preparation, or an operand alias (``OPERAND_ALIASES``: a row-addressed base
+    of ``A`` / ``B`` that a build takes beside its TMA descriptors)."""
+    for name, route in ROUTES.items():
+        for stage in route["stages"]:
+            if route["op"] != "wgrad":
+                bound = ROW_ARGUMENTS
+            elif stage["name"].startswith(cb.TAIL_REDUCE):
+                bound = TAIL_ARGUMENTS
+            else:
+                bound = WGRAD_MAIN_ARGUMENTS
+            for kind, arg in PROGRAMS[stage["program"]]["arg_plan"]:
+                if kind == "grid":
+                    assert arg in GRID_ARGUMENTS, (name, stage["name"], arg)
+                elif kind == "buffer" and arg in cb.STREAM_WORKSPACES:
+                    continue
+                else:
+                    assert arg in bound or cb.OPERAND_ALIASES.get(arg) in bound, (
+                        name,
+                        stage["name"],
+                        stage["program"],
+                        arg,
+                    )
+
+
+def test_bind_passes_each_operand_alias_its_operand(monkeypatch):
+    """A program whose argument plan names ``A_rows`` / ``B_rows`` gets the row bases of
+    the tensors the host binds as ``A`` / ``B``, in the plan's order: on an architecture
+    of ``ROW_BASE_READ_ARCHS`` the tensor itself, refused unless its rows are dense;
+    elsewhere a one-element view at its first element, whatever its row stride (the
+    build does not read it).  An argument the host does not bind is refused with a
+    ``KeyError`` naming it."""
+    program = "cake_moe_grouped_det_gemm_alias_probe"
+    arg_plan = [
+        ["buffer", "A"],
+        ["buffer", "A_rows"],
+        ["buffer", "B_rows"],
+        ["buffer", "B"],
+        ["parameter", "K"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ]
+    monkeypatch.setitem(
+        PROGRAMS,
+        program,
+        {"arg_plan": arg_plan, "ffi_entry": "run", "arches": ["sm_100a", "sm_107a"]},
+    )
+    monkeypatch.setattr(
+        cb,
+        "stage_binding",
+        lambda name, stage, arch: {"program": program, "specializations": {}},
+    )
+    entry = object()
+    monkeypatch.setattr(
+        cb, "load_module", lambda *args: type("Module", (), {"run": entry})
+    )
+    assert cb.ROW_BASE_READ_ARCHS == ("sm_107a",)
+    a, b = torch.zeros(4, 8), torch.zeros(2, 6)
+    padded = torch.zeros(4, 16)[:, :8]
+    kwargs = dict(A=a, B=b, K=7, grid=(4, 2, 1))
+    for arch in ("sm_100a", "sm_107a"):
+        launch = cb._bind("alias_probe", "main", kwargs, arch)
+        assert launch.entry is entry
+        args = launch.arguments
+        assert args[0] is a and args[3] is b and args[4:] == (7, 4, 2, 1)
+        assert launch.workspace_slots == ()
+        for row_base, t in ((args[1], a), (args[2], b)):
+            if arch in cb.ROW_BASE_READ_ARCHS:
+                assert row_base is t
+            else:
+                assert row_base.shape == (1,) and row_base.data_ptr() == t.data_ptr()
+    launch = cb._bind("alias_probe", "main", dict(kwargs, A=padded), "sm_100a")
+    assert launch.arguments[0] is padded
+    assert launch.arguments[1].shape == (1,)
+    assert launch.arguments[1].data_ptr() == padded.data_ptr()
+    with pytest.raises(ValueError, match="dense rows"):
+        cb._bind("alias_probe", "main", dict(kwargs, A=padded), "sm_107a")
+    arg_plan.insert(1, ["buffer", "C_rows"])
+    with pytest.raises(KeyError, match="C_rows"):
+        cb._bind("alias_probe", "main", kwargs, "sm_100a")
+
+
+def test_k256_wave_build_launches_only_on_its_wave_archs():
+    """The 256-wide k tile's wave-synchronised build (``main_wave``) launches only on
+    the architectures ``wave_sync_archs[256]`` lists, never on sm_107a, whatever ``K``
+    and whether or not the route also builds it there; every architecture of the route
+    keeps its weight gradient (the ``main`` stage, ``program_registered``)."""
+    c = HOST_PLAN_CONSTANTS
+    assert "sm_107a" not in c["wave_sync_archs"][256]
+    min_k = int(c["wave_sync_min_k"])
+    for out_dtype in ("bfloat16", "float32"):
+        name = cake_jit.record_name("wgrad", out_dtype=out_dtype, tile_k=256)
+        for arch in ROUTES[name]["arches"]:
+            assert cake_jit.stage_served(name, "main", arch), (name, arch)
+            assert cake_jit.program_registered(
+                "wgrad", arch, out_dtype=out_dtype, tile_k=256
+            )
+            launched = arch in c["wave_sync_archs"][256]
+            if launched:
+                assert cake_jit.stage_served(name, "main_wave", arch), (name, arch)
+            for k in (min_k, 4 * min_k):
+                stage, wave = cb.select_wgrad_stage(
+                    name, k, 256, arch, c, sum_m=EXPERT_ROWS, num_groups=4
+                )
+                assert wave == launched, (name, arch, k)
+                assert stage == ("main_wave" if launched else "main"), (name, arch, k)
 
 
 # ---------------------------------------------------------------------------
@@ -880,6 +1106,47 @@ def test_wgrad_wave_sync_route_and_rest_state(out_dtype, monkeypatch):
     assert torch.equal(plain.launch(), out)
 
 
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_wgrad_wave_sync_takes_row_padded_operands(out_dtype):
+    """The 256-wide k tile's weight gradient takes ``g`` and ``x`` with padded rows (the
+    leading columns of wider NaN-filled tensors) and gives the bits of contiguous
+    copies.  Its ``main_wave`` build on sm_100a / sm_103a names the operands' row bases
+    and never reads them; the host binds a one-element view there
+    (``cake_backend.ROW_BASE_READ_ARCHS``)."""
+    device = _require_program("wgrad", out_dtype)
+    c = HOST_PLAN_CONSTANTS
+    arch = SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability(device)]
+    sizes, n, k = [2048] * 8, 4096, 4096
+    x, _w, g, offs = _inputs(sizes, n, k, device, seed=11)
+
+    def padded(t):
+        wide = torch.full(
+            (t.size(0), t.size(1) + 256), float("nan"), dtype=t.dtype, device=t.device
+        )
+        wide[:, : t.size(1)] = t
+        return wide[:, : t.size(1)]
+
+    gp, xp = padded(g), padded(x)
+    assert not gp.is_contiguous() and not xp.is_contiguous()
+    dense = cake_moe_grouped_gemm_det_train_prepare_wgrad(
+        g, x, offs, out_dtype=out_dtype
+    )
+    launch = cake_moe_grouped_gemm_det_train_prepare_wgrad(
+        gp, xp, offs, out_dtype=out_dtype
+    )
+    wave = arch in c["wave_sync_archs"][256] and cake_jit.stage_served(
+        launch.record_name, "main_wave", arch
+    )
+    assert launch.plan["tile_k"] == 256, launch.plan
+    assert launch.stages[0] == ("main_wave" if wave else "main"), launch.stages
+    assert launch.stages == dense.stages
+    ref = dense.launch().clone()
+    launch.out.fill_(float("nan"))
+    out = launch.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+
+
 @pytest.mark.parametrize("op", ["fwd", "dgrad"])
 def test_wide_tile_gives_the_256_column_tile_bits(op, monkeypatch):
     """On an architecture of ``wide_fwd_archs`` / ``wide_dgrad_archs`` an output
@@ -894,11 +1161,10 @@ def test_wide_tile_gives_the_256_column_tile_bits(op, monkeypatch):
     wide = arch in c[f"wide_{op}_archs"] and cake_jit.stage_served(
         launch.record_name, "main_wide", arch
     )
-    # The forward pass's short reductions take the wide tile's last-wave-halves twin.
+    # Where an evict-first rule holds the wide tile is its twin (``main_wide_ef``).
     ef = (
         wide
-        and op == "fwd"
-        and cb.fwd_lwh_ef(k, arch, c)
+        and _evict_first(op, k, arch, sum(RAGGED_E6), len(RAGGED_E6), c)
         and cake_jit.stage_served(launch.record_name, "main_wide_ef", arch)
     )
     ts33 = (
@@ -944,7 +1210,9 @@ def test_dgrad_evict_first_gives_the_wide_tile_bits(monkeypatch):
     arch = SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability(device)]
     n, k = 64, int(c["dgrad_evict_first_min_k"])
     sizes = EVICT_FIRST_E2
-    assert sum(sizes) // len(sizes) >= int(c["dgrad_evict_first_min_rows"])
+    assert sum(sizes) // len(sizes) >= max(
+        int(v) for v in c["dgrad_evict_first_min_rows"].values()
+    )
     launch, ref = _prepare_row_op("dgrad", sizes, n, k, device)
     name = launch.record_name
     ef = arch in c["dgrad_evict_first_archs"] and cake_jit.stage_served(
@@ -974,7 +1242,11 @@ def test_dgrad_evict_first_gives_the_wide_tile_bits(monkeypatch):
     torch.cuda.synchronize()
     if not ef:
         pytest.skip(f"no evict-first data-gradient tile on {arch}")
-    monkeypatch.setitem(HOST_PLAN_CONSTANTS, "dgrad_evict_first_min_rows", 1 << 30)
+    monkeypatch.setitem(
+        HOST_PLAN_CONSTANTS,
+        "dgrad_evict_first_min_rows",
+        dict.fromkeys(c["dgrad_evict_first_min_rows"], 1 << 30),
+    )
     plain, _ = _prepare_row_op("dgrad", sizes, n, k, device)
     assert plain.stages[0] == "main_wide"
     assert plain.plan["tile_n"] == launch.plan["tile_n"]
@@ -1005,16 +1277,8 @@ def test_wide_ts33_gives_the_wide_tile_bits(op, monkeypatch):
         sizes = RAGGED_E6
     launch, ref = _prepare_row_op(op, sizes, n, k, device)
     name = launch.record_name
-    ef_key = "dgrad_evict_first_archs" if op == "dgrad" else "fwd_lwh_ef_archs"
-    ef_rule = (
-        cb.dgrad_evict_first(k, arch, sum(sizes), len(sizes), c)
-        if op == "dgrad"
-        else cb.fwd_lwh_ef(k, arch, c)
-    )
-    ef = (
-        arch in c[ef_key]
-        and ef_rule
-        and cake_jit.stage_served(name, "main_wide_ef", arch)
+    ef = _evict_first(op, k, arch, sum(sizes), len(sizes), c) and cake_jit.stage_served(
+        name, "main_wide_ef", arch
     )
     wide = arch in c[f"wide_{op}_archs"] and cake_jit.stage_served(
         name, "main_wide", arch
@@ -1203,6 +1467,76 @@ def test_fwd_lwh_ef_gives_the_wide_tile_bits(monkeypatch):
     assert narrow.stages[0] == "main"
     torch.cuda.synchronize()
     assert torch.equal(narrow.launch(), launch.out)
+
+
+@pytest.mark.parametrize("sizes", [RAGGED_E6, EVICT_FIRST_E2], ids=["ragged", "long"])
+def test_fwd_evict_first_gives_the_wide_tile_bits(sizes, monkeypatch):
+    """Where ``fwd_evict_first`` holds (a long reduction, the gate/up projection), the
+    forward pass launches the twin of its wide tile that loads X and stores Y with the
+    L2 evict-first policy (``main_wide_ef``), whatever the group sizes (an empty group
+    and a one-row group among them).  The cache policy changes no arithmetic: five
+    launches and a CUDA-graph replay give one set of output bits, those of the wide
+    tile and of the 256-column tile."""
+    device = _require_program("fwd")
+    c = HOST_PLAN_CONSTANTS
+    arch = SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability(device)]
+    n, k = 2 * int(c["wide_block_n"]), int(c["fwd_evict_first_min_k"])
+    launch, ref = _prepare_row_op("fwd", sizes, n, k, device)
+    name = launch.record_name
+    wide = arch in c["wide_fwd_archs"] and cake_jit.stage_served(
+        name, "main_wide", arch
+    )
+    ef = (
+        wide
+        and _evict_first("fwd", k, arch, sum(sizes), len(sizes), c)
+        and cake_jit.stage_served(name, "main_wide_ef", arch)
+    )
+    if arch in c["fwd_evict_first_archs"]:
+        assert ef, (name, arch)
+    ts33 = (
+        wide
+        and not ef
+        and cb.fwd_wide_ts33(k, arch, sum(sizes), len(sizes), c)
+        and cake_jit.stage_served(name, "main_wide_ts33", arch)
+    )
+    assert launch.stages[0] == (
+        "main_wide_ef"
+        if ef
+        else "main_wide_ts33"
+        if ts33
+        else "main_wide"
+        if wide
+        else "main"
+    )
+    first = None
+    for _ in range(5):
+        launch.out.fill_(float("nan"))
+        _assert_bf16_close(launch.launch(), ref)
+        bits = launch.out.view(torch.int16).clone()
+        if first is None:
+            first = bits
+        assert torch.equal(bits, first)
+    torch.cuda.synchronize()
+    if not ef:
+        pytest.skip(f"no X / Y evict-first forward tile on {arch}")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch.launch()
+    launch.out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(launch.out.view(torch.int16), first)
+    monkeypatch.setitem(HOST_PLAN_CONSTANTS, "fwd_evict_first_archs", [])
+    plain, _ = _prepare_row_op("fwd", sizes, n, k, device)
+    assert plain.stages[0] == "main_wide"
+    assert plain.plan["tile_n"] == launch.plan["tile_n"]
+    torch.cuda.synchronize()
+    assert torch.equal(plain.launch().view(torch.int16), first)
+    monkeypatch.setitem(HOST_PLAN_CONSTANTS, "wide_fwd_archs", [])
+    narrow, _ = _prepare_row_op("fwd", sizes, n, k, device)
+    assert narrow.stages[0] == "main"
+    torch.cuda.synchronize()
+    assert torch.equal(narrow.launch().view(torch.int16), first)
 
 
 @pytest.mark.parametrize("wave", [False, True])

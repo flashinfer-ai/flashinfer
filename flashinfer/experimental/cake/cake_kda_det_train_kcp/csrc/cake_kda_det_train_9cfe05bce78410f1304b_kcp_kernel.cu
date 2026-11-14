@@ -278,7 +278,7 @@ kernel_cake_kda_det_train_9cfe05bce78410f1304b_kcp(const __grid_constant__ CUten
             int h0_slot = h0_index[seg];
             if (h0_slot >= 0) {
                 int h0_tile = (head / h0_hg * h0_n + h0_slot) * h0_hg + head % h0_hg;
-                long long h0_base = (long long)h0_tile * (long long)tile_stride * 16384 + (long long)(k_row * 128);
+                long long h0_base = (long long)h0_tile * (long long)tile_stride * 16384ll + (long long)(k_row * 128);
                 #pragma unroll
                 for (int blk = 0; blk < 8; blk++) {
                     #pragma unroll
@@ -320,7 +320,7 @@ kernel_cake_kda_det_train_9cfe05bce78410f1304b_kcp(const __grid_constant__ CUten
             unsigned int _phase_h_ready_0 = 0;
             #pragma unroll 1
             for (int c = 0; c < nc; c++) {
-                long long h_base = ((long long)(c0 + c) * (long long)num_heads + (long long)head) * 16384 + (long long)(k_row * 128);
+                long long h_base = ((long long)(c0 + c) * (long long)num_heads + (long long)head) * 16384ll + (long long)(k_row * 128);
                 #pragma unroll
                 for (int blk_2 = 0; blk_2 < 8; blk_2++) {
                     float _tmem_load_0[16];
@@ -391,7 +391,7 @@ kernel_cake_kda_det_train_9cfe05bce78410f1304b_kcp(const __grid_constant__ CUten
                 _phase_vp_ready_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int trow = row0 + c * 64 + t_row;
-                long long u_base = ((long long)trow * (long long)num_heads + (long long)head) * 128;
+                long long u_base = ((long long)trow * (long long)num_heads + (long long)head) * 128ll;
                 #pragma unroll
                 for (int blk_3 = 0; blk_3 < 4; blk_3++) {
                     float _tmem_load_1[16];
@@ -480,7 +480,7 @@ kernel_cake_kda_det_train_9cfe05bce78410f1304b_kcp(const __grid_constant__ CUten
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((bv_addr + (unsigned int)((col + q_2 * 8) / 64 * 8192 + t_row * 128 + (col + q_2 * 8) % 64 * 2 ^ ((col + q_2 * 8) / 64 * 8192 + t_row * 128 + (col + q_2 * 8) % 64 * 2 >> 7 & 7) << 4))), "r"(bvv_bf16[q_2 * 4]), "r"(bvv_bf16[q_2 * 4 + 1]), "r"(bvv_bf16[q_2 * 4 + 2]), "r"(bvv_bf16[q_2 * 4 + 3]) : "memory");
                     }
                 }
-                long long gn_index = ((long long)(row0 + c * 64 + 64 - 1) * (long long)num_heads + (long long)head) * 128 + (long long)k_row;
+                long long gn_index = ((long long)(row0 + c * 64 + 64 - 1) * (long long)num_heads + (long long)head) * 128ll + (long long)k_row;
                 float decay = approx_exp2(gk[gn_index]);
                 #pragma unroll
                 for (int blk_4 = 0; blk_4 < 8; blk_4++) {

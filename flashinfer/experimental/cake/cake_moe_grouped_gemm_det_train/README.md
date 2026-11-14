@@ -19,6 +19,9 @@ equivalently, an `m_indptr[E + 1]` with a leading 0 (`torch._grouped_mm` /
 two forms apart). The kernels read the offsets on the device; the host never
 synchronises on them.
 
+The slice lower bound is `0` for `e == 0` and `offs[e-1]` for `e > 0`.
+For `m_indptr` input, `offs` in these formulas means `m_indptr[1:]`.
+
 | helper | computation | inputs | output |
 | --- | --- | --- | --- |
 | `cake_moe_grouped_gemm_det_train_forward(x, w, offs, out=None)` | `Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T` | `x [sum_m, K]`, `w [E, N, K]` bf16 | `Y [sum_m, N]` bf16 |
@@ -35,6 +38,41 @@ Numerics: fp32 tensor-core accumulation with one bf16 rounding at the store
 (the fp32 weight-gradient variant stores the accumulator); bitwise
 deterministic (no atomics; the split-K tail sums fp32 partials in a fixed
 order); `dW[e] == 0` exactly for empty groups.
+
+## Reproducibility and accuracy
+
+Every output repeats bit for bit run to run: the same inputs on the same
+device give the same bits at every launch, with other streams running, after
+new group boundaries are written into `offs`, in CUDA graph replays and in a
+fresh process. No output depends on which cluster computed which tile.
+
+| output | dtype | what is fixed | bit for bit run to run |
+| --- | --- | --- | --- |
+| `Y` (`fwd`) | bf16 | the k steps of every element, in order | yes |
+| `dX` (`dgrad`) | bf16 | the k steps of every element, in order | yes |
+| `dW` (`wgrad`) | bf16, fp32 | the k steps in order; a split tail's partials summed by the tail reduce in a fixed order | yes |
+| `out += dW`, fused (`accumulate=True`, fp32 `out`) | fp32 | the fp32 `dW` above, then one fp32 add per element of `out` | yes; the same bits as the composed route |
+| `out += dW`, composed (`accumulate=True`) | bf16, fp32 | the `dW` above in `out`'s dtype, then `out.add_` | yes |
+
+Error against an fp64 reference, measured by
+`test_cake_moe_grouped_gemm_det_train_acceptance.py::test_error_vs_fp64_per_output`
+over a sample of every group (the first and last 16 rows by 512 columns of `Y`
+and `dX`, a 64 x 256 block of each `dW[e]`) of the E4 (112576 balanced and
+136064 skewed rows), E8, E32 and E32-with-hot-groups rows (131072 rows), on both
+projections (gate/up `N` 4096, `K` 6144; down `N` 6144, `K` 2048). The budgets
+are the package's test budgets: bf16 every element within `1e-2 + 1e-2 |ref|`,
+fp32 relative L2 at most `1e-4`. The table gives the range over those rows.
+The R200 column comes from a 212-SM board, except the fused row (216 SMs).
+On each board the fused route gives the composed route's bits.
+
+| output | budget | GB300 (`sm_103a`): relative L2; max abs | B200 (`sm_100a`): relative L2; max abs | R200 (`sm_107a`): relative L2; max abs |
+| --- | --- | --- | --- | --- |
+| `Y` bf16 | `1e-2 + 1e-2 \|ref\|` | 1.651e-3 to 1.664e-3; 2.441e-4 | 1.649e-3 to 1.665e-3; 2.443e-4 | 1.649e-3 to 1.665e-3; 2.439e-4 |
+| `dX` bf16 | `1e-2 + 1e-2 \|ref\|` | 1.650e-3 to 1.666e-3; 2.543e-2 | 1.643e-3 to 1.659e-3; 2.830e-2 | 1.645e-3 to 1.668e-3; 1.566e-2 |
+| `dW` bf16 | `1e-2 + 1e-2 \|ref\|` | 1.639e-3 to 1.665e-3; 6.233e-2 | 1.653e-3 to 1.666e-3; 6.330e-2 | 1.649e-3 to 1.670e-3; 6.322e-2 |
+| `dW` fp32 | rel L2 `1e-4` | 4.406e-6 to 7.548e-5; 1.898e-3 | 4.396e-6 to 7.553e-5; 1.829e-3 | 4.404e-6 to 7.568e-5; 1.801e-3 |
+| `out += dW` fp32, composed | rel L2 `1e-4` | 2.782e-6 to 6.716e-5; 2.191e-3 | 2.783e-6 to 6.720e-5; 2.254e-3 | 2.790e-6 to 6.712e-5; 1.883e-3 |
+| `out += dW` fp32, fused | rel L2 `1e-4` | 2.782e-6 to 6.716e-5; 2.191e-3 | 2.783e-6 to 6.720e-5; 2.254e-3 | 2.782e-6 to 6.707e-5; 2.135e-3 (216 SMs) |
 
 ## Mode rules
 
@@ -182,19 +220,33 @@ backward into `w.main_grad` (below). Both switches are keyword-only and off by
 default; with the defaults the routes, programs, plans and bits are unchanged,
 and `plan["accumulate"]` is `"off"`.
 
-The launch composes (`plan["accumulate"] == "composed"`). The host plans it
-exactly as the overwrite of `out.dtype` (route, k tile, stage, grid, tail split
-and its ordered tail reduce, raster, wave mode). The bound programs write that
-overwrite into a contiguous scratch of `out.dtype`, and the launch adds the
-scratch with `out.add_` on the same stream, outside autograd. No new device
-program runs.
+The host plans the launch exactly as the overwrite of `out.dtype` (route, k
+tile, stage, grid, tail split, raster, wave mode); `plan["accumulate"]` records
+how it adds, and every other plan key is the overwrite's:
+
+| `plan["accumulate"]` | when | what runs |
+| --- | --- | --- |
+| `"fused"` | the 512-wide k tile; the route serves the accumulate build of the selected stage (`stage + "_acc"`) on the architecture; when the tail splits (`plan["tail_splits"] > 1`), the route of that tail (the 256-wide k tile's for `main_halves_k256t`) serves `tail_reduce_acc`; every such build's library can load (below); `out` is 32-byte aligned (base, row pitch, expert pitch) | the overwrite's stages with `_acc` (`stages == (stage + "_acc",)`, or `(stage + "_acc", "tail_reduce_acc")` for a split tail), bound to `out`: the main kernel adds each whole tile into `out` once and writes a split tile's partials as the overwrite does; the tail reduce sums those partials in the overwrite's fixed order and adds the sum into `out` once; no scratch |
+| `"composed"` | otherwise; `plan["accumulate_reason"]` is the first condition that fails: `"tile_k"` (the 256-wide k tile), `"stage"` (no accumulate build of the stage for the dtype and architecture: every bf16 `out`, and the `main` / `main_wave` forms), `"tail"` (a split tail whose route serves no `tail_reduce_acc`), `"min_cuda"` (a build cannot load) or `"alignment"`; the last two warn once per process | the overwrite's stages into a contiguous scratch of `out.dtype`, then `out.add_(scratch)` on the same stream, outside autograd |
+
+A build can load when its prebuilt library is under `aot/` or FlashInfer's
+JIT toolkit reaches its `build.json` `min_cuda` (13.4 for the main stages'
+accumulate builds, which use the PTX ISA 9.4 `red.global.add.noftz.f32`), with
+`nvcc` under the CUDA path and `FLASHINFER_DISABLE_JIT` unset;
+`cake_backend.acc_library_loadable` applies that rule without building or
+loading anything, and
+`generated_program_available(device, "wgrad", out_dtype, accumulate=True)` tells
+whether some call into an `out` of that dtype can take the fused route.
 
 Numerical contract:
 
 - `out` gets AccumulateGrad's bits of the deterministic weight gradient in its
-  dtype. fp32 `out`: `RN_fp32(out + dW32)`, one fp32 add of the fp32 overwrite
-  of the same call. bf16 `out`: `RN_bf16(out + dW_bf16)` with the bf16
-  overwrite, the bits autograd gives when it accumulates `w.grad`.
+  dtype. fp32 `out`: `RN_fp32(out + dW32)`, one fp32 add (round to nearest,
+  subnormals kept) of the fp32 overwrite of the same call. bf16 `out`:
+  `RN_bf16(out + dW_bf16)` with the bf16 overwrite, the bits autograd gives
+  when it accumulates `w.grad`.
+- The fused and the composed route give the same bits: the fused kernels add
+  the bits of the fp32 overwrite, each element of `out` exactly once.
 - Bitwise reproducible run to run, as the overwrite: every element is reduced
   in a fixed order (the split tail by the ordered tail reduce) and added once.
   `torch.use_deterministic_algorithms(True)` changes nothing (no alert, no
@@ -213,15 +265,17 @@ memory shared with `g`, `x` or `offs`, and `accumulate` a bool. Row and expert
 padding is allowed and never read or written.
 
 Prepared launches and CUDA graphs: `launch()` and every replay of a graph that
-captured it add again (a prepared accumulate launch is not idempotent); the add
-bumps `out._version` at `launch()` and at capture, not at a graph replay. The
-scratch is owned by the prepared launch, as its descriptor slots are, and is
-allocated on the stream current at the preparation: keep the launch alive while
-a graph that captured it may replay (the graph does not keep the scratch
-alive) and, after a launch on another stream, until that launch completes; do
-not have one prepared accumulate launch in flight on two streams at once. A
-launch prepared inside a captured backward allocates the scratch from, and
-returns it to, the graph's pool within that backward. As for any in-place
+captured it add again (a prepared accumulate launch is not idempotent); a
+launch bumps `out._version` once at `launch()` and at capture, not at a graph
+replay (the composed route through `out.add_`, the fused route through
+`torch.autograd.graph.increment_version`; an inference tensor gets no bump).
+The composed scratch is owned by the prepared launch, as its descriptor slots
+are, and is allocated on the stream current at the preparation: keep the
+launch alive while a graph that captured it may replay (the graph does not keep
+the scratch alive) and, after a launch on another stream, until that launch
+completes; do not have one prepared accumulate launch in flight on two streams
+at once. A launch prepared inside a captured backward allocates the scratch
+from, and returns it to, the graph's pool within that backward. As for any in-place
 operation, two launches into the same `out` on different streams must be
 ordered by the caller.
 
@@ -252,9 +306,13 @@ and checks `main_grad` at the backward only.
 
 Cost (`S = E * N * K` elements):
 
-- Memory: the scratch takes `4 * S` bytes for an fp32 `out` (`2 * S` for
-  bf16) for the life of the prepared launch (in the autograd wrapper, the
-  weight-gradient launch of one backward). Gate/up projection (`N` 4096, `K`
+- Fused route: no scratch and no extra launch; the kernels read and write each
+  element of `out` once (`8 * S` bytes for fp32) in place of the overwrite's
+  store (`4 * S` bytes), and the backward allocates no buffer of the weight
+  gradient's size but the `grad_added_to_main_grad` placeholder.
+- Composed route, memory: the scratch takes `4 * S` bytes for an fp32 `out`
+  (`2 * S` for bf16) for the life of the prepared launch (in the autograd
+  wrapper, the weight-gradient launch of one backward). Gate/up projection (`N` 4096, `K`
   6144): 384 MiB at `E` 4, 768 MiB at 8, 1.5 GiB at 16, 3 GiB at 32. Down
   projection (`N` 6144, `K` 2048): 192 MiB, 384 MiB, 768 MiB, 1.5 GiB. With an
   fp32 `main_grad` the backward's peak is `2 * S` bytes above the default
@@ -262,11 +320,9 @@ Cost (`S = E * N * K` elements):
   `main_grad`); with a bf16 `main_grad` the scratch is `2 * S` bytes and the
   peak equals the default flag's. The `grad_added_to_main_grad` placeholder
   (`2 * S` bytes) is allocated after the scratch is released.
-- Traffic: the programs write the scratch and the add reads it back, `8 * S`
-  bytes beyond the add's read and write of `out`; the time is that of the fp32
-  weight gradient followed by `main_grad.add_`. The non-deterministic package
-  adds in the 512-wide k tile's epilogue instead (no scratch); this package
-  composes.
+- Composed route, traffic: the programs write the scratch and the add reads it
+  back, `8 * S` bytes beyond the add's read and write of `out`; the time is
+  that of the weight gradient followed by `main_grad.add_`.
 - Under `torch.use_deterministic_algorithms(True)` with
   `torch.utils.deterministic.fill_uninitialized_memory` on (the default),
   torch fills the scratch and the `torch.empty` placeholder with NaN when it
@@ -291,7 +347,7 @@ for x, g in micro_batches:
 # Low level: add into any fp32 / bf16 buffer
 cake_moe_grouped_gemm_det_train_wgrad(g, x, offs, out=main_grad, accumulate=True)
 launch = cake_moe_grouped_gemm_det_train_prepare_wgrad(g, x, offs, out=main_grad, accumulate=True)
-launch.launch()  # main_grad += dW; launch.plan["accumulate"] == "composed"
+launch.launch()  # main_grad += dW; launch.plan["accumulate"]: "fused" or "composed"
 ```
 
 ## Host plan
@@ -313,16 +369,18 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   same bits. The `sm_107a` `dgrad` program of that stage keeps each G tile in
   the tensor core's A collector for both 256-column halves of the tile.
 - `dgrad` L2 evict-first twin (`dgrad_evict_first`): on the architectures
-  listed in `dgrad_evict_first_archs`, when the groups average at least
-  `dgrad_evict_first_min_rows` rows (`sum_m // E`) and `dX` has at least
-  `dgrad_evict_first_min_k` columns (`K`), the wide tile is the route's
-  `main_wide_ef` stage: the same program with G loaded and `dX` stored under
-  the L2 evict-first policy, so a group's weights stay resident in L2 while
-  its row blocks stream past them, and with two head and two tail k steps of
-  an item split around the release of the accumulator's two halves instead of
-  four and three, so fewer of an item's k steps pay the split. Every element
-  still accumulates its k steps in order, so its output is bitwise that of
-  `main_wide`.
+  listed in `dgrad_evict_first_archs`, when the groups average at least the
+  architecture's `dgrad_evict_first_min_rows` rows (`sum_m // E`; 4096 on
+  `sm_100a`, 16384 on `sm_107a`) and `dX` has at least
+  `dgrad_evict_first_min_k` columns (`K`, the gate/up projection), the wide
+  tile is the route's `main_wide_ef` stage: the same program with G loaded and
+  `dX` stored under the L2 evict-first policy, so a group's weights stay
+  resident in L2 while its row blocks stream past them (the domain-scheduled
+  program on `sm_100a`; on `sm_107a` the A-collector program, which also
+  splits two head and two tail k steps of an item around the release of the
+  accumulator's two halves instead of four and three, so fewer of an item's k
+  steps pay the split). Every element still accumulates its k steps in order,
+  so its output is bitwise that of `main_wide`.
 - `fwd` / `dgrad` 3 / 3 head / tail twin (`fwd_wide_ts33` /
   `dgrad_wide_ts33`): where the evict-first twin does not apply, the wide tile
   is the route's `main_wide_ts33` stage, the same program with three head and
@@ -345,6 +403,14 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   splits two head and two tail k steps of an item around the release of the
   accumulator's two halves instead of four and three. Its output is bitwise
   that of `main_wide`.
+- `fwd` X / Y evict-first twin (`fwd_evict_first`): on the architectures
+  listed in `fwd_evict_first_archs`, when the reduction `K` is at least
+  `fwd_evict_first_min_k`, as in the gate/up projection, the wide tile is the
+  route's `main_wide_ef` stage: the domain-scheduled program with X loaded and
+  Y stored under the L2 evict-first policy, so the group's weights stay
+  resident in L2 while its rows stream past them. A shorter reduction (the
+  down projection) keeps `main_wide`. The cache policy changes no arithmetic:
+  its output is bitwise that of `main_wide`.
 - `fwd` / `dgrad` tile order on `sm_100a` / `sm_103a`: the column tiles of
   every 256-row block are split between two claim queues, one per locality
   domain of the device, in proportion to the clusters that claim each queue
@@ -441,32 +507,45 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
 `CakeMoEGroupedGemmDetLaunch.plan` exposes `grid`, `tile_k`, `tail_splits`,
 `raster_rows`, `launches` and, for `fwd` / `dgrad`, `tile_n`, `clusters`, `c0`,
 `c1` (the even split) and `queue_split`, for `wgrad` `tail_tile_k` (the k width of the split tail tiles),
-`wave_mode` and `accumulate` (`"off"` or `"composed"`), for inspection and tests; `CakeMoEGroupedGemmDetLaunch.stages`
-names the bound stages in launch order, and `CakeMoEGroupedGemmDetLaunch.add_from` is the
-scratch of an accumulate launch (else `None`).
+`wave_mode`, `accumulate` (`"off"`, `"fused"` or `"composed"`) and, on the
+composed route, `accumulate_reason`, for inspection and tests;
+`CakeMoEGroupedGemmDetLaunch.stages` names the bound stages in launch order,
+`CakeMoEGroupedGemmDetLaunch.add_from` is the scratch of a composed accumulate
+launch (else `None`) and `CakeMoEGroupedGemmDetLaunch.bump_version` is set on a
+fused one.
 
 ## Build targets and layout
 
+| feature | sm_100a | sm_103a | sm_107a |
+| --- | --- | --- | --- |
+| `wgrad` k512 half-release stages | `main_halves` (planned walk), `main_wave_halves` (wave period 8) | `main_halves` (planned walk), `main_wave_halves` (wave period 8) | `main_halves`, `main_halves_k256t` |
+| `fwd` / `dgrad` L2 evict-first twin launched (`main_wide_ef`) | `fwd` (`K >= 6144`); `dgrad` (`K >= 4096`, `sum_m // E >= 4096`) | `fwd` (`K >= 6144`) | `fwd` (`K <= 2048`); `dgrad` (`K >= 4096`, `sum_m // E >= 16384`) |
+| `wgrad` accumulate, fused (`_acc` builds, fp32 `out` only) | `main_halves`, `main_wave_halves`, `tail_reduce` | `main_halves`, `main_wave_halves`, `tail_reduce` | `main_halves`, `main_halves_k256t`, `tail_reduce` |
+| `wgrad` accumulate, composed | bf16 `out`; k256 tile; `main` / `main_wave`; misaligned `out`; `_acc` library not loadable | bf16 `out`; k256 tile; `main` / `main_wave`; misaligned `out`; `_acc` library not loadable | bf16 `out`; k256 tile; `main`; misaligned `out`; `_acc` library not loadable |
+| CUDA toolkit floor of the fused main stages (`min_cuda`) | 13.4 | 13.4 | 13.4 |
+
 The programs are exact-architecture tcgen05 payloads built for the exact
 targets `sm_100a`, `sm_103a` and `sm_107a` (`build.json` `arch_flags`).
-`cake_jit.PROGRAMS` lists twenty-two libraries, one per kernel and build,
+`cake_jit.PROGRAMS` lists twenty-nine libraries, one per kernel and build,
 each a kernel and a host-binding translation unit under
 `csrc/cake_moe_grouped_det_gemm/` shared by the architectures it is built for (an
 architecture-dependent line is folded under `__CUDA_ARCH__`):
 
-- `fwd` and `dgrad` in five builds each: the domain-scheduled build for
+- `fwd` and `dgrad` in six builds each: the domain-scheduled build for
   `sm_100a` and `sm_103a` and the static-schedule build for `sm_107a`, each
   with the 256-column output tile (the routes' `main` stage) and with the
-  512-column one (`main_wide`), and the `sm_107a` evict-first twin of the
-  512-column build (`main_wide_ef`); plus the 3 / 3 head / tail twin of the
+  512-column one (`main_wide`), and the evict-first twin of each 512-column
+  build (`main_wide_ef`; the domain-scheduled `fwd` twin, which loads X and
+  stores Y evict-first, for `sm_100a` and `sm_103a`, the domain-scheduled
+  `dgrad` twin for `sm_100a`); plus the 3 / 3 head / tail twin of the
   domain-scheduled A-collector 512-column build for `fwd` and `dgrad` on
   `sm_103a` (`main_wide_ts33`). A route spells the two builds of a stage as
   two stages of one name on disjoint architectures, and
   `cake_jit.stage_binding(name, stage, arch)` returns the one built for the
   architecture.
 - the wave-synchronized weight-gradient main kernel with a 256- or 512-wide
-  k tile, for `sm_100a`, `sm_103a` and `sm_107a` (the routes' `main_wave`
-  stage).
+  k tile, for `sm_100a` and `sm_103a` (the routes' `main_wave` stage; the
+  host launches it on no other architecture).
 - the 512-wide k tile's A-collector main kernel that releases the
   accumulator in two halves (`main_halves`): with the planned tile walk for
   `sm_100a` and `sm_103a`, without it for `sm_107a`; for `sm_107a` its twin
@@ -475,6 +554,14 @@ architecture-dependent line is folded under `__CUDA_ARCH__`):
   releases it in two halves (`main_wave_halves`), for `sm_100a` and `sm_103a`.
 - the 512-wide k tile's main kernel for `sm_107a`, a second `main` stage
   beside the one built for `sm_100a` and `sm_103a`.
+- the fp32 accumulate builds (`_acc`): the twins of `main_halves` (one for
+  `sm_100a` and `sm_103a`, one for `sm_107a`), `main_wave_halves` (`sm_100a`,
+  `sm_103a`) and `main_halves_k256t` (`sm_107a`) on the fp32 512-wide k tile
+  route, which add the weight gradient into `C` with one fp32 add per element
+  (their `build.json` entries need CUDA 13.4, `min_cuda`), and the twin of the
+  tail-reduce that adds the ordered sum of a split tail's partials into `C`
+  (`tail_reduce_acc`, on the fp32 512- and 256-wide k tile routes, for all
+  three architectures).
 - the weight-gradient main kernel with a 256- or 512-wide k tile and the
   weight-gradient tail-reduce, as the previous delivery shipped them.
 
@@ -540,7 +627,7 @@ python benchmarks/bench_cake_moe_grouped_gemm_det_train.py --help
 ```
 
 `test_cake_moe_grouped_gemm_det_train.py` (the backend suite, which imports the package
-through `tests.test_helpers.cake_package`) compares against a per-group fp64
+through `tests.cake.test_helpers.cake_package`) compares against a per-group fp64
 reference (including an empty group, a one-row group, padded outputs,
 determinism and the fp32 output) and skips when no supported device or no
 registered program is present. `test_cake_moe_grouped_gemm_det_train_api.py` covers the
@@ -561,12 +648,21 @@ reduce, the probed split of the data gradient) on fixed inputs and zeroed
 accumulators and requires bitwise-identical outputs, also across fresh
 processes.
 `test_cake_moe_grouped_gemm_det_train_acc.py` covers the weight-gradient accumulation:
-on the CPU the plans (equal to the overwrite's, bound to the scratch), the
-checks, the launch's add and the autograd flag's Megatron contract with CPU
-stand-ins for the preparations; on a GPU every weight-gradient form with and
-without a split tail, fp32 and bf16, bitwise against `out0.add_(dW)` and run to
-run, CUDA graph replays, streams, layouts, and the autograd flag with the
-generated programs. The accumulation is timed by the accumulation rows of
+on the CPU the shipped accumulate builds (registry, README feature matrix,
+`build.json`, the loader's `min_cuda` rule), the plans (equal to the
+overwrite's, bound to `out` on the fused route and to the scratch on the
+composed one), every reason of the route choice, the checks on both routes,
+the launch's add or version bump, the facade's handoff and the autograd flag's
+Megatron contract with CPU stand-ins for the preparations; on a GPU every
+weight-gradient form with and without a split tail, fp32 and bf16, bitwise
+against `out0.add_(dW)` and run to run, the fused route bitwise against the
+composed one (split tails, the planned walk with empty groups last, the wave
+halves, the k256 tail, `-0.0` and subnormals, 32 groups), CUDA graph replays,
+streams, layouts, and the autograd flag with the generated programs.
+`test_cake_moe_grouped_gemm_det_train_acceptance.py` repeats every output of
+the reproducibility table five times into a zeroed and five times into a
+filled output under concurrent copy streams, over changing offsets, and
+measures the errors of the accuracy table. The accumulation is timed by the accumulation rows of
 `benchmarks/bench_cake_moe_grouped_gemm_nondet_train.py` (arm `det_mgX`, beside the
 deterministic baselines `det_acc` and `det_mgB` and the non-deterministic arms).
 The benchmark `benchmarks/bench_cake_moe_grouped_gemm_det_train.py` times the prepared
@@ -579,8 +675,9 @@ gradients).
 
 - bf16 inputs only; `E`, `sum_m`, `N`, `K` and the output span must fit
   32-bit element addressing.
-- The weight-gradient accumulation composes: a scratch of the weight
-  gradient's size (above), no add in the kernel epilogue.
+- The weight-gradient accumulation is fused for an fp32 `out` on the
+  half-release forms of the 512-wide k tile only; every other call composes,
+  with a scratch of the weight gradient's size (above).
 - The alignment rules above; no transposed operand layouts other than the
   documented in-place `W` read of `dgrad`.
 - Compute capability 10.0, 10.3 or 10.7 only; other devices raise.

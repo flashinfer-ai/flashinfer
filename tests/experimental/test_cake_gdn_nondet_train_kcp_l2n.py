@@ -31,7 +31,7 @@ CPU tests of the in-kernel Q / K L2 norm of the non-deterministic KCP GDN packag
 
 The fake backend is not bitwise the device programs in #1 / #8's bodies (different accumulation orders): these tests
 prove the plumbing and the oracle, not GPU numerics (``test_cake_gdn_nondet_train_kcp_dist.py`` holds the GPU rows).
-The suite imports the package and the deterministic package through ``tests/test_helpers/cake_package.py`` and nothing
+The suite imports the package and the deterministic package through ``tests/cake/test_helpers/cake_package.py`` and nothing
 else from flashinfer; the facade's hand-off of the option is tested in ``test_cake_gdn_nondet_train_kcp_api.py``.
 """
 
@@ -50,14 +50,14 @@ import torch
 
 def _mod(sub: str | None = None):
     """The package (or one of its modules) through the test-helper registry: a stale entry fails here, never skips."""
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     return cake_package("cake_gdn_nondet_train_kcp", sub)
 
 
 def _det_mod(sub: str | None = None):
     """A module of the deterministic package through the test-helper registry (a stale entry fails, never skips)."""
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     return cake_package("cake_gdn_det_train_kcp", sub)
 
@@ -905,7 +905,8 @@ def test_norm_tapes_are_not_retained() -> None:
     H_qk, HV = ops["q"].shape[1], ops["v"].shape[1]
     T = ops["q"].shape[0]
     for opts in (
-        {},
+        # the default with the norm is "light_akk" (its Akk tape: test_..._light_akk.py)
+        {"save_mode": "light"},
         {"save_mode": "full"},
         {"boundary_mode": "replay"},
         {"save_for_backward": False},
@@ -1341,8 +1342,9 @@ def test_kept_backward_binds_the_recompute_rows() -> None:
     H_qk, HV = ops["q"].shape[1], ops["v"].shape[1]
     o = dict(use_qk_l2norm_in_kernel=True)
     direct = _autograd(ctx, ops, ckpt=False, **o)
+    # a checkpointed call saves as "light" (the default "light_akk" too): it is sized with save_mode="light"
     layout = gbytes.cake_gdn_nondet_train_kcp_workspace_layout(
-        ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes=True, **o
+        ctx, H_qk=H_qk, HV=HV, save_mode="light", reuse_recompute_tapes=True, **o
     )
     ws = _PeakWorkspace()
     leaves = [
@@ -1397,7 +1399,14 @@ def test_kept_rows_are_checked() -> None:
     a kept set without them (or with them while the call runs without the norm) is refused by the backward."""
     ctx, ops = _setup()
     for on in (True, False):
-        o = dict(backend="fake", use_qk_l2norm_in_kernel=on, reuse_recompute_tapes=True)
+        # the hand-off is the checkpointed form, which saves as "light" (with the norm
+        # too, where an unset save_mode is "light_akk")
+        o = dict(
+            backend="fake",
+            use_qk_l2norm_in_kernel=on,
+            save_mode="light",
+            reuse_recompute_tapes=True,
+        )
         ws = kcp.CakeGDNNondetKcpWorkspace()
         call, _ = kcp._prepare(
             *_ops(ops),
@@ -1447,7 +1456,12 @@ def test_workspace_layout_counts_the_norm_rows() -> None:
             ctx, H_qk=H_qk, HV=HV, **kw
         )
         on = gbytes.cake_gdn_nondet_train_kcp_workspace_layout(
-            ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True, **kw
+            ctx,
+            H_qk=H_qk,
+            HV=HV,
+            use_qk_l2norm_in_kernel=True,
+            # the norm's terms against the same save mode (the default with the norm is "light_akk")
+            **{"save_mode": "light", **kw},
         )
         kept = bool(kw.get("reuse_recompute_tapes"))
         assert on["fwd.qn"] == on["fwd.kn"] == row

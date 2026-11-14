@@ -8,7 +8,7 @@ Modified: standalone host-only dependency closure and device admission.
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -115,6 +115,17 @@ class MoKWorkspace:
     barrier_buffer_ptrs: list[int]  # (ep_size,) uintptr64
     barrier_buffer_multicast_ptr: int  # () uintptr64
     barrier_target: torch.Tensor  # (1,) int32
+    # Launch plans of the adapters that use this workspace
+    # (``MoKFunctional._plan``): validated, prebuilt launch arguments and the
+    # persistent counter slabs, keyed by launcher, geometry, split and SwiGLU
+    # variant. Owned here so they live and die with the buffers they name;
+    # weights and per-call tensors are never part of a plan. A plan's counter
+    # slab is reset on the stream of every launch that uses it, so all MoK
+    # operations on one workspace must run in one stream order (as the shared
+    # x/combine buffers already require).
+    launch_plans: dict = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
 
 def validate_workspace_args(

@@ -44,15 +44,15 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers import cake_kda_det_train_reference_l2n as ref_l2n
-from tests.test_helpers.cake_kda_det_train_reference import (
+from tests.experimental.test_helpers import cake_kda_det_train_reference_l2n as ref_l2n
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (
     LOWER_BOUND,
     elementwise_gate,
     error_metrics,
     make_inputs,
     make_raw_inputs,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake.cake_kda_nondet_train", "cake_backend")
 cake_jit = cake_package("cake.cake_kda_nondet_train", "cake_jit")
@@ -1808,9 +1808,9 @@ def test_l2n_autograd_and_checkpoint_are_bitwise_the_deterministic_l2n_and_take_
     count = _Count()
     for env in (None, "on", "off"):
         if env is None:
-            monkeypatch.delenv(cake_backend.HANDOFF_ENV, raising=False)
+            monkeypatch.delenv("CAKE_KDA_CKPT_HANDOFF", raising=False)
         else:
-            monkeypatch.setenv(cake_backend.HANDOFF_ENV, env)
+            monkeypatch.setenv("CAKE_KDA_CKPT_HANDOFF", env)
         for mode in ("auto", "on", "off"):
             tag = (env, mode)
             leaves = _leaves(inputs, gate)
@@ -1831,7 +1831,7 @@ def test_l2n_autograd_and_checkpoint_are_bitwise_the_deterministic_l2n_and_take_
                 o.backward(dout)
                 for i, (x, r) in enumerate(zip(leaves, ref, strict=True)):
                     count.same(x.grad, r, (*tag, "checkpoint", reentrant, i))
-    monkeypatch.delenv(cake_backend.HANDOFF_ENV, raising=False)
+    monkeypatch.delenv("CAKE_KDA_CKPT_HANDOFF", raising=False)
     stats = cake_backend._handoff_stats(device.index)
     assert all(stats[name] == 0 for name in cake_backend._HANDOFF_COUNTERS), stats
     assert stats["live_records"] == 0, stats

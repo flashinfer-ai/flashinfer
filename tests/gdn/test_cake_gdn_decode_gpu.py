@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 import torch
 
+import flashinfer.gdn_decode as gdn_decode
 from flashinfer.jit import cake_gdn as cake_gdn
 from flashinfer.gdn_decode import (
     gated_delta_rule_decode as public_nontranspose_decode,
@@ -966,10 +967,10 @@ def _launch_bf16_serving(
     )
 
 
-# B 1 / 20: small band (mid4 on sm_107a); 21 / 31: the upper small band (the TMA-state
-# hqsplit_tma3 body on sm_107a, the small body elsewhere); 32 .. 64: the large band (the
-# TMA-state hqsplit_tma3 body on sm_107a, the large body elsewhere).
-@pytest.mark.parametrize("batch_size", [1, 20, 21, 31, 32, 34, 35, 37, 64])
+# B 1 / 9: small band (mid4 on sm_107a); 10 / 20 / 21 / 31: the upper small band (the
+# TMA-state hqsplit_tma3 body on sm_107a, the small body elsewhere); 32 .. 64: the large
+# band (the TMA-state hqsplit_tma3 body on sm_107a, the large body elsewhere).
+@pytest.mark.parametrize("batch_size", [1, 9, 10, 20, 21, 31, 32, 34, 35, 37, 64])
 def test_exported_decode_matches_torch_on_caller_stream(batch_size: int) -> None:
     tensors = _make_inputs(batch_size)
     initial_state = tensors["state"].clone()
@@ -1028,7 +1029,7 @@ def _require_tma_state_route(batch_size: int):
 
 
 def test_tma_state_decode_graph_replays_the_state_each_capture_saw() -> None:
-    # The TMA-state body takes the state as a by-value tensor map encoded per call: a graph
+    # The TMA-state body takes the state as a by-value tensor map of each call's state: a graph
     # captured on one state tensor replays on that tensor, a second capture on another state
     # tensor replays on its own, and neither replay touches the other tensor.
     batch_size = 64
@@ -1066,6 +1067,76 @@ def test_tma_state_decode_graph_replays_the_state_each_capture_saw() -> None:
     assert torch.equal(tensors["state"], after_first)
 
 
+@pytest.mark.parametrize("batch_size", [12, 64])
+def test_tma_state_decode_tensor_map_follows_the_state_of_each_call(
+    batch_size: int,
+) -> None:
+    # The TMA-state host shim reuses the tensor map it encoded for the same (device,
+    # address, B, HV) and encodes a new one otherwise: calls alternating between state
+    # tensors, pool slices at other offsets, a state at a freed and reallocated address
+    # and a state of one batch less at the same address each update exactly their own
+    # state, bit for bit as the same call on a fresh copy, and leave the rest of the pool
+    # untouched.
+    _require_tma_state_route(batch_size)
+    _require_tma_state_route(batch_size - 1)
+    _, entry = _load(batch_size)
+    _, entry_less = _load(batch_size - 1)
+    tensors = _make_inputs(batch_size)
+    tensors_less = _make_inputs(batch_size - 1)
+    first = tensors["state"]
+    initial = first.clone()
+    second = (torch.randn_like(first) * 0.01).contiguous()
+    pool = (
+        torch.randn(
+            batch_size + 3, *first.shape[1:], device=first.device, dtype=first.dtype
+        )
+        * 0.01
+    ).contiguous()
+    slot_bytes = pool[0].numel() * pool.element_size()
+
+    def check(state: torch.Tensor, inputs: dict[str, torch.Tensor], kernel) -> None:
+        rows = state.shape[0]
+        pool_before = pool.clone()
+        copy = state.clone()
+        copy_out = torch.zeros_like(inputs["out"])
+        _launch(kernel, {**inputs, "out": copy_out}, rows, state=copy)
+        inputs["out"].zero_()
+        _launch(kernel, inputs, rows, state=state)
+        torch.cuda.synchronize()
+        assert torch.equal(state, copy)
+        assert torch.equal(inputs["out"], copy_out)
+        offset = state.data_ptr() - pool.data_ptr()
+        if 0 <= offset < pool.numel() * pool.element_size():
+            start = offset // slot_bytes
+            assert torch.equal(pool[:start], pool_before[:start])
+            assert torch.equal(pool[start + rows :], pool_before[start + rows :])
+        else:
+            assert torch.equal(pool, pool_before)
+
+    check(first, tensors, entry)
+    expected_out, expected_state = _reference(tensors, initial)
+    torch.testing.assert_close(
+        tensors["out"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(first, expected_state, atol=1e-3, rtol=1e-3)
+    for state in (
+        second,
+        first,
+        pool[1 : 1 + batch_size],
+        pool[2 : 2 + batch_size],
+        second,
+        pool[1 : 1 + batch_size],
+    ):
+        check(state, tensors, entry)
+    check(pool[1:batch_size], tensors_less, entry_less)
+    check(pool[1 : 1 + batch_size], tensors, entry)
+    freed = second.clone()
+    check(freed, tensors, entry)
+    del freed
+    reallocated = (torch.randn_like(second) * 0.01).contiguous()
+    check(reallocated, tensors, entry)
+
+
 def test_tma_state_decode_refuses_a_misaligned_state_before_launch() -> None:
     # The tensor map needs a 16-byte aligned base address: a contiguous state view at a
     # 4-byte offset is refused by the host shim, the state is left untouched and the
@@ -1091,20 +1162,26 @@ def test_tma_state_decode_refuses_a_misaligned_state_before_launch() -> None:
     torch.testing.assert_close(tensors["state"], expected_state, atol=1e-3, rtol=1e-3)
 
 
-# B 21: formerly the mid4_rc_kq128 twin; B 32: formerly the tilev32_x2 twin; B 64:
+# B 10 / 21: formerly the mid4_rc_kq128 twin; B 32: formerly the tilev32_x2 twin; B 64:
 # formerly the hqsplit twin.
 @pytest.mark.parametrize("backend", ["cake_gdn", "auto"])
-@pytest.mark.parametrize("batch_size", [21, 32, 64])
+@pytest.mark.parametrize("batch_size", [10, 21, 32, 64])
 def test_public_decode_refuses_a_misaligned_state_and_runs_an_aligned_one_on_tma(
     batch_size: int, backend: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # No sm_107a record from 21 rows on runs a state whose base is not 16-byte aligned: the
+    # No sm_107a record from 10 rows on runs a state whose base is not 16-byte aligned: the
     # pointer twins it replaces move the state with 16-byte vector loads and stores (a
     # misaligned-address fault), and the TMA-state record needs an aligned tensor-map
     # base.  Through the public API the misaligned call is refused before launch with
     # the state untouched; the same call on an aligned state runs the TMA-state record
-    # and matches a direct launch of that record bit for bit.
+    # and matches a direct launch of that record bit for bit.  The row resolves its
+    # launch once (an empty launch table here) and every later call reuses it.
     route, entry = _require_tma_state_route(batch_size)
+    tensors = _make_inputs(batch_size)
+    initial = tensors["state"].clone()
+    numel = initial.numel()
+    direct = {"out": tensors["out"].clone(), "state": initial.clone()}
+    _launch(entry, {**tensors, "out": direct["out"]}, batch_size, state=direct["state"])
     selected: list[str] = []
     select = cake_gdn.select_cake_gdn_decode_variant
 
@@ -1114,9 +1191,7 @@ def test_public_decode_refuses_a_misaligned_state_and_runs_an_aligned_one_on_tma
         return chosen
 
     monkeypatch.setattr(cake_gdn, "select_cake_gdn_decode_variant", spy)
-    tensors = _make_inputs(batch_size)
-    initial = tensors["state"].clone()
-    numel = initial.numel()
+    monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_LAUNCHES", {})
 
     def call(state: torch.Tensor) -> None:
         public_nontranspose_decode(
@@ -1141,18 +1216,168 @@ def test_public_decode_refuses_a_misaligned_state_and_runs_an_aligned_one_on_tma
             call(misaligned)
         torch.cuda.synchronize()
         assert torch.equal(misaligned, initial)
-    assert selected == [route.variant_name] * 3
+    assert selected == [route.variant_name]
 
-    direct = {"out": tensors["out"].clone(), "state": initial.clone()}
-    _launch(entry, {**tensors, "out": direct["out"]}, batch_size, state=direct["state"])
     tensors["out"].zero_()
     call(tensors["state"])
     torch.cuda.synchronize()
-    assert selected[-1] == route.variant_name
+    assert selected == [route.variant_name]
+    assert list(gdn_decode._CAKE_GDN_NONTRANSPOSE_LAUNCHES.values()) == [
+        (entry, batch_size * 32)
+    ]
     assert cake_gdn._kernel_record(route.variant_name)["tma_abi"] == "grid_constant"
     assert torch.equal(tensors["out"], direct["out"])
     assert torch.equal(tensors["state"], direct["state"])
     expected_out, expected_state = _reference(tensors, initial)
+    torch.testing.assert_close(
+        tensors["out"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(tensors["state"], expected_state, atol=1e-3, rtol=1e-3)
+
+
+_NONTRANSPOSE_ARGS = ("q", "k", "v", "state", "A_log", "a", "dt_bias", "b", "out")
+
+
+def _run_nontranspose(tensors: dict[str, torch.Tensor], scale: float = _SCALE):
+    return gdn_decode._run_cake_gdn_decode_nontranspose(
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        state=tensors["state"],
+        A_log=tensors["A_log"],
+        a=tensors["a"],
+        dt_bias=tensors["dt_bias"],
+        b=tensors["b"],
+        scale=scale,
+        output=tensors["out"],
+        use_qk_l2norm=True,
+    )
+
+
+# B 9: small band; 10 / 20: the upper small band from 10 rows (hqsplit_tma3 on sm_107a);
+# 21 / 32: the upper small / large band of every architecture.
+@pytest.mark.parametrize("batch_size", [9, 10, 20, 21, 32])
+def test_public_nontranspose_decode_resolves_each_row_launch_once(
+    batch_size: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The public nontranspose decode resolves the route, loads the entry and derives the
+    # grid on the first call of a row (device, B, H, HK, HV, scale, l2norm) and reuses
+    # them on every later call: each call runs the resolved record bit for bit as a
+    # direct launch of it; another scale or batch is another row; a row the resolver
+    # refuses is never stored and is refused again.
+    route, entry = _load(batch_size)
+    calls: list[tuple[str, int, float]] = []
+    select = cake_gdn.select_cake_gdn_decode_variant
+
+    def spy(**kwargs):
+        chosen = select(**kwargs)
+        calls.append(
+            (chosen.variant_name, kwargs["batch_size"], float(kwargs["scale"]))
+        )
+        return chosen
+
+    def refusing_spy(**kwargs):
+        calls.append(("refused", kwargs["batch_size"], float(kwargs["scale"])))
+        return select(**kwargs)
+
+    tensors = _make_inputs(batch_size)
+    initial = tensors["state"].clone()
+    direct = {"out": tensors["out"].clone(), "state": initial.clone()}
+    _launch(entry, {**tensors, "out": direct["out"]}, batch_size, state=direct["state"])
+    blocks_per_state = cake_gdn.cake_gdn_nontranspose_fp32_t1_ctas_per_state(
+        route.variant_name
+    )
+    launches: dict = {}
+    monkeypatch.setattr(cake_gdn, "select_cake_gdn_decode_variant", spy)
+    monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_LAUNCHES", launches)
+    for _ in range(3):
+        tensors["state"].copy_(initial)
+        tensors["out"].zero_()
+        assert _run_nontranspose(tensors) is tensors["out"]
+        torch.cuda.synchronize()
+        assert torch.equal(tensors["out"], direct["out"])
+        assert torch.equal(tensors["state"], direct["state"])
+    assert calls == [(route.variant_name, batch_size, _SCALE)]
+    device_index = tensors["q"].get_device()
+    assert launches == {
+        (device_index, batch_size, 16, 16, 32, _SCALE, True): (
+            entry,
+            batch_size * 32 * blocks_per_state,
+        )
+    }
+    _run_nontranspose(tensors, scale=1.0)
+    _run_nontranspose(tensors, scale=1.0)
+    smaller = _make_inputs(batch_size - 1)
+    _run_nontranspose(smaller)
+    _run_nontranspose(smaller)
+    torch.cuda.synchronize()
+    assert [call[1:] for call in calls] == [
+        (batch_size, _SCALE),
+        (batch_size, 1.0),
+        (batch_size - 1, _SCALE),
+    ]
+    assert len(launches) == 3
+    monkeypatch.setattr(cake_gdn, "select_cake_gdn_decode_variant", refusing_spy)
+    for _ in range(2):
+        with pytest.raises(cake_gdn.CakeGDNUnsupportedError):
+            _run_nontranspose(tensors, scale=0.5)
+    assert calls[3:] == [("refused", batch_size, 0.5)] * 2
+    assert len(launches) == 3
+
+
+def _non_contiguous_copy(tensor: torch.Tensor) -> torch.Tensor:
+    wide = torch.zeros(
+        *tensor.shape[:-1],
+        2 * tensor.shape[-1],
+        device=tensor.device,
+        dtype=tensor.dtype,
+    )
+    view = wide[..., ::2]
+    view.copy_(tensor)
+    assert view.shape == tensor.shape and not view.is_contiguous()
+    return view
+
+
+@pytest.mark.parametrize("name", _NONTRANSPOSE_ARGS)
+def test_nontranspose_decode_refuses_each_malformed_tensor_before_launch(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Each tensor of an exact row, on the CPU, of another dtype, twice as wide or
+    # non-contiguous, is refused before any launch with the error and message of its
+    # check (device, then dtype, then exact contiguous shape); no launch is stored and
+    # the state and output are untouched.  The exact row then runs.
+    batch_size = 10
+    launches: dict = {}
+    monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_LAUNCHES", launches)
+    tensors = _make_inputs(batch_size)
+    tensors["out"].fill_(3.0)
+    state_before = tensors["state"].clone()
+    out_before = tensors["out"].clone()
+    original = tensors[name]
+    other_dtype = {torch.bfloat16: torch.float16, torch.float32: torch.float64}[
+        original.dtype
+    ]
+    cases = (
+        (original.cpu(), "requires one CUDA device"),
+        (original.to(other_dtype), "requires BF16 I/O/gates and FP32 state/decay"),
+        (
+            torch.cat([original, original], dim=-1),
+            "requires exact contiguous T=1 tensors",
+        ),
+        (_non_contiguous_copy(original), "requires exact contiguous T=1 tensors"),
+    )
+    for bad, message in cases:
+        with pytest.raises(cake_gdn.CakeGDNUnsupportedError) as error:
+            _run_nontranspose({**tensors, name: bad})
+        assert str(error.value) == "GDN non-CP nontranspose decode " + message
+        torch.cuda.synchronize()
+        assert launches == {}
+        assert torch.equal(tensors["state"], state_before)
+        assert torch.equal(tensors["out"], out_before)
+    _run_nontranspose(tensors)
+    torch.cuda.synchronize()
+    assert len(launches) == 1
+    expected_out, expected_state = _reference(tensors, state_before)
     torch.testing.assert_close(
         tensors["out"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
     )

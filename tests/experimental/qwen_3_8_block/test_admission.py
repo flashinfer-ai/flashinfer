@@ -822,7 +822,7 @@ def test_declined_geometry_is_typed_before_any_vendored_code(monkeypatch):
         prepare_qwen_3_8_block_bf16,
         qwen_3_8_block_support,
     )
-    from tests.test_helpers.qwen_3_8_block_cases import Qsa38PagedCase
+    from tests.experimental.test_helpers.qwen_3_8_block_cases import Qsa38PagedCase
 
     def reached():
         raise AssertionError(

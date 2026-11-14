@@ -30,7 +30,7 @@ from flashinfer.grouped_mm.cute_sm120_mxfp8_groupwise.core import (
     _MXFP8_MOE_PLAIN_TACTICS,
 )
 from flashinfer.utils import is_sm120a_supported
-from tests.test_helpers.pdl import late_store
+from tests.utils.test_helpers.pdl import late_store
 
 COS_SIM_THRESHOLD = 0.99
 

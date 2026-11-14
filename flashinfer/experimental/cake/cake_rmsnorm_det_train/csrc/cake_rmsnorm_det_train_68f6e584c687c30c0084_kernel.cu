@@ -140,12 +140,7 @@ kernel_cake_rmsnorm_det_train_68f6e584c687c30c0084(__nv_bfloat16* __restrict__ g
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-#if __CUDA_ARCH__ == 1000
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
-#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-#endif
 
     const int mbar_base = smem;
     #define full_addr (mbar_base + 0)
@@ -1641,7 +1636,7 @@ kernel_cake_rmsnorm_det_train_68f6e584c687c30c0084(__nv_bfloat16* __restrict__ g
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_0[_lp*2 + 0], out_0[_lp*2+1 + 0]));
                 packed_0[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<int4*>(dx + ((unsigned long long)(row0 + rg) * 5120 + (unsigned long long)(tir * 8)))[0] = reinterpret_cast<int4*>(packed_0)[0];
+            reinterpret_cast<int4*>(dx + ((unsigned long long)(row0 + rg) * 5120ull + (unsigned long long)(tir * 8)))[0] = reinterpret_cast<int4*>(packed_0)[0];
             float out_1[8];
             float g0_4 = __uint_as_float(gw[4] << 16);
             float g1_4 = __uint_as_float(gw[4] & 4294901760u);
@@ -1681,7 +1676,7 @@ kernel_cake_rmsnorm_det_train_68f6e584c687c30c0084(__nv_bfloat16* __restrict__ g
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_1[_lp*2 + 0], out_1[_lp*2+1 + 0]));
                 packed_1[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<int4*>(dx + ((unsigned long long)(row0 + rg) * 5120 + (unsigned long long)((320 + tir) * 8)))[0] = reinterpret_cast<int4*>(packed_1)[0];
+            reinterpret_cast<int4*>(dx + ((unsigned long long)(row0 + rg) * 5120ull + (unsigned long long)((320 + tir) * 8)))[0] = reinterpret_cast<int4*>(packed_1)[0];
         }
         row0 = row0_n;
         nval_2 = nval_n;

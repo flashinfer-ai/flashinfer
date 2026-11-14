@@ -305,10 +305,10 @@ kernel_cake_moe_grouped_gemm_7e39db00fc7c99693f3e(const __grid_constant__ CUtens
             unsigned int near = 0;
             if (cta_rank == 0) {
                 unsigned long long base = (unsigned long long)sched;
-                unsigned int chunk_a = (unsigned int)((base + 8319 & 18446744073709543424) - base) >> 2;
+                unsigned int chunk_a = (unsigned int)((base + 8319ull & 18446744073709543424ull) - base) >> 2;
                 unsigned int word_a = chunk_a + (unsigned int)cluster_id % 32 * 32;
-                unsigned long long lat_a = 4294967295;
-                unsigned long long lat_b = 4294967295;
+                unsigned long long lat_a = 4294967295ll;
+                unsigned long long lat_b = 4294967295ll;
                 #pragma unroll
                 for (int _rnd = 0; _rnd < 2; _rnd++) {
                     unsigned long long t0_0;
@@ -472,7 +472,7 @@ kernel_cake_moe_grouped_gemm_7e39db00fc7c99693f3e(const __grid_constant__ CUtens
                     if (retired == (unsigned int)num_clusters - 1) {
                         __threadfence();
                         sched[0] = 0;
-                        sched[1] = 2147483648;
+                        sched[1] = 2147483648ll;
                         sched[2] = 0;
                     }
                 }

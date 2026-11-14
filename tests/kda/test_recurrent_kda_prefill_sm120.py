@@ -1161,7 +1161,7 @@ def test_recurrent_kda_prefill_sm120_variants_match_reference(variant, packed, s
         seq_lens=seq_lens, num_heads=4, packed=packed, initial_state=True, seed=SEED
     )
     if strided:
-        from tests.test_helpers.kda_prefill import _strided_qkv
+        from tests.kda.test_helpers.kda_prefill import _strided_qkv
 
         inputs.update(_strided_qkv(inputs, independent=False))
     expected_out, expected_state = _reference_kda_prefill(inputs)
@@ -1543,7 +1543,7 @@ def test_recurrent_kda_prefill_sm120_graph_replay_matches_eager(
         offsets_dtype=offsets_dtype,
     )
     if strided:
-        from tests.test_helpers.kda_prefill import _strided_qkv
+        from tests.kda.test_helpers.kda_prefill import _strided_qkv
 
         inputs.update(_strided_qkv(inputs, independent=True))
     expected_out, expected_state = _reference_kda_prefill(inputs)

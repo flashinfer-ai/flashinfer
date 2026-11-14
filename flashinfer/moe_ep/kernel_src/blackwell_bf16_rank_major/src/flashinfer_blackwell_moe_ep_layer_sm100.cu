@@ -504,7 +504,7 @@ kernel_rank_major_stage_inputs_v1(const __nv_bfloat16* __restrict__ hidden_in, c
         topk_weights[route] = weights_in[route];
     }
 }
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
 
 // sm_107a: stage_inputs_v1 that also builds the route codes input_arrive_v2 builds (one warp per token instead
 // of one warp for all tokens), so the input barrier only sends them.
@@ -699,7 +699,7 @@ kernel_rank_major_input_arrive_v2(int* __restrict__ topk_ids, int active_tokens_
         }
     }
 }
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
 
 __global__ __launch_bounds__(32) void
 kernel_rank_major_input_arrive_v3(int active_tokens_per_rank, int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags, const unsigned* __restrict__ route_codes_out, unsigned* const* __restrict__ route_codes_peers)
@@ -820,7 +820,7 @@ __device__ __noinline__ void rank_major_route_cta_ids(int active_tokens_per_rank
     for (int elem = tid; elem < 7168; elem += 256) {
         zero_sentinel[elem] = 0.0f;
     }
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
     for (int e = tid; e < 256; e += 256) {
         // sm_107a: zero the FC1 -> FC2 per-group completion counters (the unused tail of cta_to_mn_limit; at most
         // T + 31 < 256 groups are active) before this forward's FC1 starts.
@@ -993,7 +993,7 @@ kernel_rank_major_dispatch_v4(__nv_bfloat16* __restrict__ recv_hidden, int* __re
     }
     __syncthreads();
     {
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
         // sm_107a (input_arrive_v3 sends no routed bits): the source's route codes of this token for this owner (stored
         // before the release acquired above); all eight bytes 0xff = no route of the token lands here
         unsigned int code_lo, code_hi;
@@ -1121,7 +1121,7 @@ kernel_rank_major_route_fused_v1(int* __restrict__ recv_local_ids, int* __restri
     for (int elem = tid; elem < 7168; elem += 1024) {
         zero_sentinel[elem] = 0.0f;
     }
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
     for (int e = tid; e < 256; e += 1024) {
         // sm_107a: zero the FC1 -> FC2 per-group completion counters (the unused tail of cta_to_mn_limit; at most
         // T + 31 < 256 groups are active) before this forward's FC1 starts.
@@ -1347,7 +1347,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
             mbarrier_init(smem + 56, 1);
             mbarrier_init(smem + 64, 1);
             mbarrier_init(smem + 72, 1);
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
             // b_full: 5 barriers, init_count=8 (sm_107a: every load_b warp of both CTAs arrives, see load_b)
             mbarrier_init(smem + 80, 8);
             mbarrier_init(smem + 88, 8);
@@ -1436,6 +1436,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
             const int lane_1 = lane;
             int base_feature = warp_0 * 16 + lane_1 / 4 * 2;
             int base_token = lane_1 % 4 * 2;
+            unsigned int lane_base = (unsigned int)((tid & 96) << 16);
             float output_pair[2];
             unsigned int packed_pair[1];
             unsigned int _phase_mma_full = 0;
@@ -1452,13 +1453,13 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                         "tcgen05.ld.sync.aligned.16x256b.x8.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[31]))
-                        : "r"(taddr + acc_stage * 64));
+                        : "r"(taddr + lane_base + acc_stage * 64));
                     float _tmem_load_1[32];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.16x256b.x8.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[31]))
-                        : "r"(taddr + 1048576 + acc_stage * 64));
+                        : "r"(taddr + lane_base + 1048576 + acc_stage * 64));
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     asm volatile("cp.async.bulk.wait_group.read 0;");
                     asm volatile("barrier.sync 4, 128;" ::: "memory");
@@ -1736,7 +1737,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                     asm volatile("st.shared.b32 [%0], %1;" :: "r"(epi_staging_addr + (unsigned int)(smem_element_104 * 2)), "r"((packed_pair[0])));
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("barrier.sync 4, 128;" ::: "memory");
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
                     if (warp == 0) {
                         if (elect_sync()) {
                             tma_store_4d(compact_intermediate, m_tile * 64, padding_rows, 1073741824, n_tile * 64 - (unsigned int)padding_rows + 1073741824, epi_staging_addr);
@@ -2139,7 +2140,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
         { // load_b_main
             asm volatile("setmaxnreg.dec.sync.aligned.u32 96;");
             asm volatile("griddepcontrol.wait;" ::: "memory");
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
             // sm_107a: let FC2 launch as soon as every FC1 CTA has passed griddepcontrol.wait (FC2 waits per group on
             // the epilogue's completion counters instead of on the whole FC1 grid).
             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
@@ -2156,7 +2157,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
             #pragma unroll 1
             for (unsigned int _tile_iter_3 = 0; _tile_iter_3 < gridDim.x / 2 * gridDim.y; _tile_iter_3++) {
                 if (n_tile_3 < (unsigned int)num_non_exiting_ctas[0]) {
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
                     // sm_107a: the tile's padding rows (its last (64 - mn_limit % 64) % 64 rows, route_map entry 0) only
                     // feed output columns that the epilogue's store clips, and an MMA output column depends only on its own
                     // B row. Gathering them would make every CTA read recv_hidden row 0 at the same k-step (an L2 hot
@@ -2771,7 +2772,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
         { // epilogue_main
             asm volatile("barrier.sync 6, 192;" ::: "memory");
             asm volatile("setmaxnreg.dec.sync.aligned.u32 168;");
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
 #else
             asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
@@ -2784,6 +2785,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
             const int lane_1 = lane;
             int base_feature = warp_0 * 32 + lane_1 / 4 * 4;
             int base_token = lane_1 % 4 * 2;
+            unsigned int lane_base = (unsigned int)((tid & 96) << 16);
             float converted[4];
             unsigned int packed[2];
             unsigned long long packed_word = 0;
@@ -2801,13 +2803,13 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                         "tcgen05.ld.sync.aligned.16x256b.x8.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[31]))
-                        : "r"(taddr + acc_stage * 64));
+                        : "r"(taddr + lane_base + acc_stage * 64));
                     float _tmem_load_1[32];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.16x256b.x8.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[31]))
-                        : "r"(taddr + 1048576 + acc_stage * 64));
+                        : "r"(taddr + lane_base + 1048576 + acc_stage * 64));
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     asm volatile("cp.async.bulk.wait_group.read 0;");
                     asm volatile("barrier.sync 4, 128;" ::: "memory");
@@ -3525,7 +3527,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
     if (warp == 6) {
         { // load_b_main
             asm volatile("setmaxnreg.dec.sync.aligned.u32 96;");
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
 #else
             asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
@@ -3543,7 +3545,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                 if (n_tile_3 < (unsigned int)num_non_exiting_ctas[0]) {
                     int mn_limit_1 = cta_idx_y_to_mn_limit[n_tile_3];
                     int padding_rows_1 = (64 - mn_limit_1 % 64) % 64;
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
                     // sm_107a: wait until FC1 has stored every K / 64 slice of this group (see the FC1 epilogue).
                     if (elect_sync()) {
                         const int* g3_flag = cta_idx_y_to_mn_limit + 256 + n_tile_3;
@@ -3652,7 +3654,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
         { // work_id_main
             asm volatile("barrier.sync 6, 192;" ::: "memory");
             asm volatile("setmaxnreg.dec.sync.aligned.u32 96;");
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
 #else
             asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
@@ -4035,7 +4037,7 @@ kernel_rank_major_exact_unpermute_v8(__nv_bfloat16* __restrict__ expert_output, 
         }
     }
 }
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
 
 __global__ __launch_bounds__(128) void
 kernel_rank_major_exact_unpermute_v11(__nv_bfloat16* __restrict__ expert_output, float* __restrict__ topk_weights, int* __restrict__ token_to_permuted, __nv_bfloat16* const* __restrict__ local_partials_peers, unsigned int hidden_size, int active_tokens_per_rank, int32_t pg_rank)
@@ -4248,7 +4250,7 @@ kernel_rank_major_combine_v3(__nv_bfloat16* __restrict__ output, int32_t pg_worl
     const int tid = threadIdx.x;
     extern __shared__ __align__(1024) char smem_raw[];
     const int smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
     // sm_107a: before the wait only an L2 prefetch hint of this token's topk_ids line (no memory-model effect; the
     // ids are loaded after the wait)
     if (tid == 0) {
@@ -4268,7 +4270,7 @@ kernel_rank_major_combine_v3(__nv_bfloat16* __restrict__ output, int32_t pg_worl
             owners |= 1u << (expert >> 5);
         }
     }
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
     // sm_107a: every routed owner pushed its partial row of this token into local_partials[owner * 128 + token]
     // (exact_unpermute_v11) before its partial_arrive release: acquire every owner's mailbox (the forward does not
     // complete before all owners arrived), then sum the local rows in owner order (+0.0 for owners without a route).
@@ -4622,7 +4624,7 @@ __device__ __noinline__ void rank_major_route_cta_ll(int active_tokens_per_rank,
     for (int elem = tid; elem < 7168; elem += 256) {
         zero_sentinel[elem] = 0.0f;
     }
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
     for (int e = tid; e < 256; e += 256) {
         // sm_107a: zero the FC1 -> FC2 per-group completion counters (the unused tail of cta_to_mn_limit; at most
         // T + 31 < 256 groups are active) before this forward's FC1 starts.
@@ -4715,7 +4717,7 @@ __global__ __launch_bounds__(256) void
 kernel_rank_major_ll_recv_v2(__nv_bfloat16* __restrict__ recv_hidden, int* __restrict__ recv_local_ids, float* __restrict__ recv_weights, int active_tokens_per_rank, int32_t pg_world, int32_t pg_rank, const unsigned long long* __restrict__ ll_dispatch, unsigned* __restrict__ ll_control, int* __restrict__ expert_scatter_offsets, int* __restrict__ token_to_permuted, int* __restrict__ cta_to_expert, int* __restrict__ cta_to_mn_limit, int* __restrict__ expert_padded_row_offsets, int* __restrict__ num_non_exiting_ctas, int* __restrict__ total_padded_rows, int* __restrict__ route_map, __nv_bfloat16* __restrict__ zero_sentinel, int row_splits)
 {
     const int tid = threadIdx.x;
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
     // sm_107a: polls while ll_push (the primary grid) still runs: nothing read here before the final
     // griddepcontrol.wait is written by ll_push. The LL words carry their epoch; ll_control[0] (the last LL forward's
     // epoch, stored by that forward's combine_v6) was written by a grid that completed before ll_push, which is
@@ -4738,7 +4740,7 @@ kernel_rank_major_ll_recv_v2(__nv_bfloat16* __restrict__ recv_hidden, int* __res
     const unsigned long long* bank_words = ll_dispatch + (unsigned long long)(((int)(epoch & 1u)) * 8 * LL_MAX_T) * LL_SLOT_WORDS;
     const int bid = blockIdx.x;
     if (bid == 0) {
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
         rank_major_route_cta_ll(active_tokens_per_rank, pg_rank, bank_words, epoch, expert_scatter_offsets, token_to_permuted, cta_to_expert, cta_to_mn_limit, expert_padded_row_offsets, num_non_exiting_ctas, total_padded_rows, route_map, zero_sentinel);
         asm volatile("griddepcontrol.wait;" ::: "memory");
 #else
@@ -4781,7 +4783,7 @@ kernel_rank_major_ll_recv_v2(__nv_bfloat16* __restrict__ recv_hidden, int* __res
         }
     }
     if (!__any_sync(0xffffffff, hit)) {
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
         asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
         return;
@@ -4817,7 +4819,7 @@ kernel_rank_major_ll_recv_v2(__nv_bfloat16* __restrict__ recv_hidden, int* __res
     }
     // recv_hidden is read by FC1 through TMA (async proxy) in a later grid
     asm volatile("fence.proxy.async.global;" ::: "memory");
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
     asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
 }
@@ -4849,7 +4851,7 @@ kernel_rank_major_exact_unpermute_v6(__nv_bfloat16* __restrict__ expert_output, 
     unsigned int token = (unsigned int)(src_rank * 128 + src_token);
     unsigned int route_base = token * 8;
     // recv_weights / token_to_permuted come from ll_recv (an earlier grid): read them after griddepcontrol.wait
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
     // sm_107a: before the wait only L2 prefetch hints of their two 32-byte lines and of ll_control are issued (no
     // memory-model effect; the values are loaded after the wait).
     if (tid == 0) {
@@ -4973,7 +4975,7 @@ kernel_rank_major_combine_v6(__nv_bfloat16* __restrict__ output, int32_t pg_rank
     // One CTA per (token, 1024-column chunk): poll every routed owner's LL partial words, then the FP32 sum in owner
     // order of kernel_rank_major_combine_v3 (+0.0 for owners without a route of this token).
     const int tid = threadIdx.x;
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
     // sm_107a: before the wait only L2 prefetch hints of this token's topk_ids line and of ll_control (no memory-model
     // effect; the values are loaded after the wait)
     if (tid == 0) {
@@ -4987,7 +4989,7 @@ kernel_rank_major_combine_v6(__nv_bfloat16* __restrict__ output, int32_t pg_rank
     const int chunk = blockIdx.y;
     unsigned epoch;
     asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(epoch) : "l"(ll_control + 1) : "memory");
-#if __CUDA_ARCH__ == 1070
+#if __CUDA_ARCH__ == 1070 || __CUDA_ARCH__ == 1000
     if (tid == 128 && token == 0 && chunk == 0) {
         // sm_107a: last LL epoch for the next LL forward's ll_push and ll_recv: every reader of ll_control[0] in this
         // forward (ll_push, ll_recv) completed before the wait above returned

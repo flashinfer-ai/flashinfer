@@ -74,7 +74,11 @@ thread's ``dw`` column sums exact (error-free FP32 products, TwoSum
 compensation) before the FP64 additions, so its ``dw`` error does not grow
 with ``T``; a kblock single kernel adds the ``dw`` products of each block of 8
 rows in FP32 and keeps the block sums as FP32 TwoSum pairs before the FP64
-additions, so its ``dw`` error grows slowly with ``T``.  Every other window
+additions, so its ``dw`` error grows slowly with ``T``; a pair-row single
+kernel keeps the twosum sums as FP32 pairs, writes one row of pairs per CTA
+into scratch in the workspace and folds the rows in helper CTAs once every row
+is in, with no FP64 additions (the order of its rows depends on scheduling, so
+its ``dw`` is not guaranteed bitwise reproducible either).  Every other window
 runs the deterministic package's backward pair (main kernel and fixed-order
 reduce), rendered into this package.  The package also accepts ``[..., H]``
 inputs whose leading dimensions collapse into rows (for example a
@@ -82,7 +86,8 @@ inputs whose leading dimensions collapse into rows (for example a
 on the routes that ship the FP32-weight programs.
 
 All kernels use FP32 statistics and accumulation (the non-deterministic
-single kernel's ``dw`` sums across CTAs in FP64) with IEEE division and square root (no
+single kernel's ``dw`` sums across CTAs in FP64, the pair-row single kernel's
+in FP32 pairs) with IEEE division and square root (no
 fast-math).  Inputs and outputs are BF16; ``rstd`` and ``dw``
 are FP32.  Row-strided inputs (``x``, ``residual``, ``g``, ``g_residual``)
 are accepted when ``stride(1) == 1``, ``stride(0)`` is a multiple of eight
@@ -96,7 +101,9 @@ H, device)`` bytes) has one layout, with offsets fixed by the
 package, for every call: the deterministic pair's counters, the single kernel's
 counters and FP64 column sums (``cake_jit.SUMS_BYTES``, the largest of the
 package's single kernels) and, when a window up to ``T`` runs the deterministic
-pair, its FP32 partial rows.  Zero the buffer once: after every launch the
+pair or a pair-row single kernel, its FP32 partial rows or the pair-row
+scratch (one region after the sums; it needs no rest state).  Zero the buffer
+once: after every launch the
 kernels leave the counters at rest and the sums at zero, so with no host write
 one buffer serves any sequence of backward calls it is large enough for --
 hidden sizes, residual flags, weight dtypes, token counts, windows and CUDA
@@ -231,10 +238,16 @@ def cake_rmsnorm_nondet_train_forward(
     residual : torch.Tensor, optional
         BF16 update of ``x``'s shape added to ``x`` before normalization (same
         layout rules as ``x``).  Enables the fused residual-add route.
-    out, rstd, residual_out : torch.Tensor, optional
-        Preallocated outputs: BF16 ``y`` of ``x``'s shape, FP32 reciprocal RMS of
-        its leading shape (``[T]``) and (residual only) BF16 ``h_new`` of ``x``'s
-        shape.  Contiguous aligned buffers are written directly; any other layout
+    out : torch.Tensor, optional
+        Preallocated BF16 ``y`` of ``x``'s shape. Contiguous aligned buffers
+        are written directly; any other layout receives a copy after the launch.
+    rstd : torch.Tensor, optional
+        Preallocated FP32 reciprocal RMS of ``x``'s leading shape (``[...]``
+        for ``x`` of shape ``[..., H]``). Contiguous aligned buffers are written
+        directly; any other layout receives a copy after the launch.
+    residual_out : torch.Tensor, optional
+        Preallocated BF16 ``h_new`` of ``x``'s shape, used only with ``residual``.
+        Contiguous aligned buffers are written directly; any other layout
         receives a copy after the launch.
 
     Returns
@@ -328,10 +341,14 @@ def cake_rmsnorm_nondet_train_backward(
         allocates and zero-fills one: a caching-allocator call, one fill kernel
         (about 3 us on B200) and about 35 us of host time per call.  One buffer
         per backward that may run concurrently (on another stream).
-    dx, dw : torch.Tensor, optional
-        Preallocated outputs: BF16 ``dx`` of ``x``'s shape and FP32 ``[H]``.
-        Contiguous aligned buffers are written directly; any other layout
-        receives a copy after the launch.  Their previous contents are ignored.
+    dx : torch.Tensor, optional
+        Preallocated BF16 ``dx`` of ``x``'s shape. Contiguous aligned buffers
+        are written directly; any other layout receives a copy after the launch.
+        Its previous contents are ignored.
+    dw : torch.Tensor, optional
+        Preallocated FP32 ``[H]`` weight gradient. Contiguous aligned buffers
+        are written directly; any other layout receives a copy after the launch.
+        Its previous contents are ignored.
 
     Returns
     -------

@@ -184,7 +184,7 @@ def test_entry_points_return_the_backend_results() -> None:
             softmax_scale=SCALE,
             dkv_dtype=torch.float32,
         )
-        _rdq, rdk, rdv = cake_backend.cake_gqa_nondet_train_backward(
+        rdq, rdk, rdv = cake_backend.cake_gqa_nondet_train_backward(
             q,
             k,
             v,
@@ -200,12 +200,25 @@ def test_entry_points_return_the_backend_results() -> None:
             dk.dtype == torch.float32 and torch.equal(dk, rdk) and torch.equal(dv, rdv)
         )
         assert dq.dtype == torch.bfloat16 and dq.shape == q.shape
+        assert torch.equal(dq, rdq)
         ws = api.cake_gqa_nondet_train_workspace(device)
         assert isinstance(ws, api.CakeGQANondetWorkspace) and ws.nbytes == 0
         api.cake_gqa_nondet(q, k, v, cu_q, cu_k, workspace=ws)
         assert api.cake_gqa_nondet_train_workspace_bytes(
             377, 24, 2
         ) == cake_backend.cake_gqa_nondet_train_workspace_bytes(377, 24, 2)
+        small = api.cake_gqa_nondet_train_workspace(device, budget_bytes=1 << 26)
+        assert small.budget_bytes == 1 << 26 and small.nbytes == 0
+        sizes = dict(
+            total_k=1077,
+            num_heads_kv=4,
+            max_seqlen_k=1000,
+            row_map=True,
+            budget_bytes=1 << 26,
+        )
+        assert api.cake_gqa_nondet_train_workspace_bytes(
+            377, 24, 2, **sizes
+        ) == cake_backend.cake_gqa_nondet_train_workspace_bytes(377, 24, 2, **sizes)
 
 
 @pytest.mark.parametrize("form", ("none", "window", "rowmap"))

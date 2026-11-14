@@ -92,7 +92,7 @@ kernel_cake_lm_head_loss_c4e7e9ccc838c461277a(long long* __restrict__ labels, fl
     for (int i = tid_1; i < T; i += 1024) {
         long long a_lab = labels[i];
         float a_d = dlogp[i];
-        int a_valid = ((a_lab >= 0) ? 1 : 0);
+        int a_valid = ((a_lab >= 0ll) ? 1 : 0);
         int a_live = ((a_d != 0.0f) ? a_valid : 0);
         n_live += a_live;
         if (i < tile0) {
@@ -184,7 +184,7 @@ kernel_cake_lm_head_loss_c4e7e9ccc838c461277a(long long* __restrict__ labels, fl
         if (r0 + j < T) {
             long long b_lab = labels[r0 + j];
             float b_d = dlogp[r0 + j];
-            valid_j[j] = ((b_lab >= 0) ? 1 : 0);
+            valid_j[j] = ((b_lab >= 0ll) ? 1 : 0);
             live_j[j] = ((b_d != 0.0f) ? valid_j[j] : 0);
         }
         t_live += live_j[j];

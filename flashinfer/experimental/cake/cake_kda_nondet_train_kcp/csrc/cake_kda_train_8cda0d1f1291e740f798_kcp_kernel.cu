@@ -111,7 +111,7 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
     float xv[4];
     if (transpose_m == 0) {
         int row0 = warp_1 * 16 + g * 4;
-        long long g_off = (long long)col_tile * 16384 + (long long)(row0 * 128 + v0 + cg * 4);
+        long long g_off = (long long)col_tile * 16384ll + (long long)(row0 * 128 + v0 + cg * 4);
         unsigned int x_thr = xs_addr + (unsigned int)((row0 * 68 + cg * 4) * 4);
         unsigned int x_rd = xs_addr + (unsigned int)(cg * 16);
         unsigned int m_rd = ring_w + (unsigned int)(g * 16);
@@ -127,39 +127,39 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
                 :: "r"(dst0), "l"(m + src0));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0 + 512), "l"(m + (src0 + 1024)));
+                :: "r"(dst0 + 512), "l"(m + (src0 + 1024ll)));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0 + 1024), "l"(m + (src0 + 2048)));
+                :: "r"(dst0 + 1024), "l"(m + (src0 + 2048ll)));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0 + 1536), "l"(m + (src0 + 3072)));
+                :: "r"(dst0 + 1536), "l"(m + (src0 + 3072ll)));
             asm volatile("cp.async.commit_group;");
             long long src0_0 = m_cur + (long long)(cp_src + 4096);
             unsigned int dst0_0 = cp_dst + 2304;
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
                 :: "r"(dst0_0), "l"(m + src0_0));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0_0 + 512), "l"(m + (src0_0 + 1024)));
+                :: "r"(dst0_0 + 512), "l"(m + (src0_0 + 1024ll)));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0_0 + 1024), "l"(m + (src0_0 + 2048)));
+                :: "r"(dst0_0 + 1024), "l"(m + (src0_0 + 2048ll)));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0_0 + 1536), "l"(m + (src0_0 + 3072)));
+                :: "r"(dst0_0 + 1536), "l"(m + (src0_0 + 3072ll)));
             asm volatile("cp.async.commit_group;");
             long long src0_1 = m_cur + (long long)(cp_src + 8192);
             unsigned int dst0_1 = cp_dst + 4608;
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
                 :: "r"(dst0_1), "l"(m + src0_1));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0_1 + 512), "l"(m + (src0_1 + 1024)));
+                :: "r"(dst0_1 + 512), "l"(m + (src0_1 + 1024ll)));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0_1 + 1024), "l"(m + (src0_1 + 2048)));
+                :: "r"(dst0_1 + 1024), "l"(m + (src0_1 + 2048ll)));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0_1 + 1536), "l"(m + (src0_1 + 3072)));
+                :: "r"(dst0_1 + 1536), "l"(m + (src0_1 + 3072ll)));
             asm volatile("cp.async.commit_group;");
             long long c_first = -1;
             if (col_tile == 0) {
                 c_first = elem_c[e_begin];
             }
-            if (c_first >= 0) {
+            if (c_first >= 0ll) {
                 {
                     float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off);
                     cn[0 + 0] = _v4.x;
@@ -168,49 +168,49 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
                     cn[0 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 128);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 128ll);
                     cn[4 + 0] = _v4.x;
                     cn[4 + 1] = _v4.y;
                     cn[4 + 2] = _v4.z;
                     cn[4 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 256);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 256ll);
                     cn[8 + 0] = _v4.x;
                     cn[8 + 1] = _v4.y;
                     cn[8 + 2] = _v4.z;
                     cn[8 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 384);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 384ll);
                     cn[12 + 0] = _v4.x;
                     cn[12 + 1] = _v4.y;
                     cn[12 + 2] = _v4.z;
                     cn[12 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 1024);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 1024ll);
                     cn[16 + 0] = _v4.x;
                     cn[16 + 1] = _v4.y;
                     cn[16 + 2] = _v4.z;
                     cn[16 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 1152);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 1152ll);
                     cn[20 + 0] = _v4.x;
                     cn[20 + 1] = _v4.y;
                     cn[20 + 2] = _v4.z;
                     cn[20 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 1280);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 1280ll);
                     cn[24 + 0] = _v4.x;
                     cn[24 + 1] = _v4.y;
                     cn[24 + 2] = _v4.z;
                     cn[24 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 1408);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 1408ll);
                     cn[28 + 0] = _v4.x;
                     cn[28 + 1] = _v4.y;
                     cn[28 + 2] = _v4.z;
@@ -252,7 +252,7 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
             }
         }
         long long x0_off = x0_index[chain];
-        if (x0_off >= 0) {
+        if (x0_off >= 0ll) {
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off);
                 acc[0 + 0] = _v4.x;
@@ -261,49 +261,49 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
                 acc[0 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 128);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 128ll);
                 acc[4 + 0] = _v4.x;
                 acc[4 + 1] = _v4.y;
                 acc[4 + 2] = _v4.z;
                 acc[4 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 256);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 256ll);
                 acc[8 + 0] = _v4.x;
                 acc[8 + 1] = _v4.y;
                 acc[8 + 2] = _v4.z;
                 acc[8 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 384);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 384ll);
                 acc[12 + 0] = _v4.x;
                 acc[12 + 1] = _v4.y;
                 acc[12 + 2] = _v4.z;
                 acc[12 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 1024);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 1024ll);
                 acc[16 + 0] = _v4.x;
                 acc[16 + 1] = _v4.y;
                 acc[16 + 2] = _v4.z;
                 acc[16 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 1152);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 1152ll);
                 acc[20 + 0] = _v4.x;
                 acc[20 + 1] = _v4.y;
                 acc[20 + 2] = _v4.z;
                 acc[20 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 1280);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 1280ll);
                 acc[24 + 0] = _v4.x;
                 acc[24 + 1] = _v4.y;
                 acc[24 + 2] = _v4.z;
                 acc[24 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 1408);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 1408ll);
                 acc[28 + 0] = _v4.x;
                 acc[28 + 1] = _v4.y;
                 acc[28 + 2] = _v4.z;
@@ -358,75 +358,75 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
         if (e_begin < e_end) {
             if (write_states != 0) {
                 long long y_first = elem_y[e_begin];
-                if (y_first >= 0) {
+                if (y_first >= 0ll) {
                     {
                         float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
                         *reinterpret_cast<float4*>(y + y_first + g_off) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first + g_off + 128) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first + g_off + 128ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first + g_off + 256) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first + g_off + 256ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first + g_off + 384) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first + g_off + 384ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[16 + 0], acc[16 + 1], acc[16 + 2], acc[16 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first + g_off + 1024) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first + g_off + 1024ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[20 + 0], acc[20 + 1], acc[20 + 2], acc[20 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first + g_off + 1152) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first + g_off + 1152ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[24 + 0], acc[24 + 1], acc[24 + 2], acc[24 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first + g_off + 1280) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first + g_off + 1280ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[28 + 0], acc[28 + 1], acc[28 + 2], acc[28 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first + g_off + 1408) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first + g_off + 1408ll) = _v4;
                     }
                 }
             }
         } else {
             long long y_last = y_final[chain];
-            if (y_last >= 0) {
+            if (y_last >= 0ll) {
                 {
                     float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
                     *reinterpret_cast<float4*>(y + y_last + g_off) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last + g_off + 128) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last + g_off + 128ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last + g_off + 256) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last + g_off + 256ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last + g_off + 384) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last + g_off + 384ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[16 + 0], acc[16 + 1], acc[16 + 2], acc[16 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last + g_off + 1024) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last + g_off + 1024ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[20 + 0], acc[20 + 1], acc[20 + 2], acc[20 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last + g_off + 1152) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last + g_off + 1152ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[24 + 0], acc[24 + 1], acc[24 + 2], acc[24 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last + g_off + 1280) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last + g_off + 1280ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[28 + 0], acc[28 + 1], acc[28 + 2], acc[28 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last + g_off + 1408) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last + g_off + 1408ll) = _v4;
                 }
             }
         }
@@ -494,26 +494,26 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
                         :: "r"(dst0_2), "l"(m + src0_2));
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                        :: "r"(dst0_2 + 512), "l"(m + (src0_2 + 1024)));
+                        :: "r"(dst0_2 + 512), "l"(m + (src0_2 + 1024ll)));
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                        :: "r"(dst0_2 + 1024), "l"(m + (src0_2 + 2048)));
+                        :: "r"(dst0_2 + 1024), "l"(m + (src0_2 + 2048ll)));
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                        :: "r"(dst0_2 + 1536), "l"(m + (src0_2 + 3072)));
+                        :: "r"(dst0_2 + 1536), "l"(m + (src0_2 + 3072ll)));
                 } else if (has_next != 0) {
                     long long src0_3 = m_next + (long long)(cp_src + (nc - 4) * 4096);
                     unsigned int dst0_3 = cp_dst + (unsigned int)(nc % 4 * 2304);
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
                         :: "r"(dst0_3), "l"(m + src0_3));
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                        :: "r"(dst0_3 + 512), "l"(m + (src0_3 + 1024)));
+                        :: "r"(dst0_3 + 512), "l"(m + (src0_3 + 1024ll)));
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                        :: "r"(dst0_3 + 1024), "l"(m + (src0_3 + 2048)));
+                        :: "r"(dst0_3 + 1024), "l"(m + (src0_3 + 2048ll)));
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                        :: "r"(dst0_3 + 1536), "l"(m + (src0_3 + 3072)));
+                        :: "r"(dst0_3 + 1536), "l"(m + (src0_3 + 3072ll)));
                 }
                 asm volatile("cp.async.commit_group;");
                 if (ch == 1) {
-                    if (c_next >= 0) {
+                    if (c_next >= 0ll) {
                         {
                             float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off);
                             cn[0 + 0] = _v4.x;
@@ -522,49 +522,49 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
                             cn[0 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 128);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 128ll);
                             cn[4 + 0] = _v4.x;
                             cn[4 + 1] = _v4.y;
                             cn[4 + 2] = _v4.z;
                             cn[4 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 256);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 256ll);
                             cn[8 + 0] = _v4.x;
                             cn[8 + 1] = _v4.y;
                             cn[8 + 2] = _v4.z;
                             cn[8 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 384);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 384ll);
                             cn[12 + 0] = _v4.x;
                             cn[12 + 1] = _v4.y;
                             cn[12 + 2] = _v4.z;
                             cn[12 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 1024);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 1024ll);
                             cn[16 + 0] = _v4.x;
                             cn[16 + 1] = _v4.y;
                             cn[16 + 2] = _v4.z;
                             cn[16 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 1152);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 1152ll);
                             cn[20 + 0] = _v4.x;
                             cn[20 + 1] = _v4.y;
                             cn[20 + 2] = _v4.z;
                             cn[20 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 1280);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 1280ll);
                             cn[24 + 0] = _v4.x;
                             cn[24 + 1] = _v4.y;
                             cn[24 + 2] = _v4.z;
                             cn[24 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 1408);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 1408ll);
                             cn[28 + 0] = _v4.x;
                             cn[28 + 1] = _v4.y;
                             cn[28 + 2] = _v4.z;
@@ -698,38 +698,38 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (34816 - buf * 34816) + 2448), "r"(__float_as_uint(acc[20])), "r"(__float_as_uint(acc[21])), "r"(__float_as_uint(acc[22])), "r"(__float_as_uint(acc[23])) : "memory");
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (34816 - buf * 34816) + 2720), "r"(__float_as_uint(acc[24])), "r"(__float_as_uint(acc[25])), "r"(__float_as_uint(acc[26])), "r"(__float_as_uint(acc[27])) : "memory");
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (34816 - buf * 34816) + 2992), "r"(__float_as_uint(acc[28])), "r"(__float_as_uint(acc[29])), "r"(__float_as_uint(acc[30])), "r"(__float_as_uint(acc[31])) : "memory");
-            if (y_pub >= 0) {
+            if (y_pub >= 0ll) {
                 {
                     float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
                     *reinterpret_cast<float4*>(y + y_pub + g_off) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub + g_off + 128) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub + g_off + 128ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub + g_off + 256) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub + g_off + 256ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub + g_off + 384) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub + g_off + 384ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[16 + 0], acc[16 + 1], acc[16 + 2], acc[16 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub + g_off + 1024) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub + g_off + 1024ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[20 + 0], acc[20 + 1], acc[20 + 2], acc[20 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub + g_off + 1152) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub + g_off + 1152ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[24 + 0], acc[24 + 1], acc[24 + 2], acc[24 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub + g_off + 1280) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub + g_off + 1280ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[28 + 0], acc[28 + 1], acc[28 + 2], acc[28 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub + g_off + 1408) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub + g_off + 1408ll) = _v4;
                 }
             }
             __syncthreads();
@@ -740,7 +740,7 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
         asm volatile("cp.async.wait_group 0;");
     } else {
         int row0_1 = warp_1 * 16 + g;
-        long long g_off_1 = (long long)col_tile * 16384 + (long long)(row0_1 * 128 + v0 + cg * 4);
+        long long g_off_1 = (long long)col_tile * 16384ll + (long long)(row0_1 * 128 + v0 + cg * 4);
         unsigned int x_thr_1 = xs_addr + (unsigned int)((row0_1 * 68 + cg * 4) * 4);
         unsigned int x_rd_1 = xs_addr + (unsigned int)(cg * 16);
         unsigned int m_rd_1 = ring_w + (unsigned int)(g * 144);
@@ -756,39 +756,39 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
                 :: "r"(dst0_4), "l"(m + src0_4));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0_4 + 576), "l"(m + (src0_4 + 512)));
+                :: "r"(dst0_4 + 576), "l"(m + (src0_4 + 512ll)));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0_4 + 1152), "l"(m + (src0_4 + 1024)));
+                :: "r"(dst0_4 + 1152), "l"(m + (src0_4 + 1024ll)));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0_4 + 1728), "l"(m + (src0_4 + 1536)));
+                :: "r"(dst0_4 + 1728), "l"(m + (src0_4 + 1536ll)));
             asm volatile("cp.async.commit_group;");
             long long src0_2_1 = m_cur_1 + (long long)(cp_src_1 + 32);
             unsigned int dst0_2_1 = cp_dst_1 + 2304;
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
                 :: "r"(dst0_2_1), "l"(m + src0_2_1));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0_2_1 + 576), "l"(m + (src0_2_1 + 512)));
+                :: "r"(dst0_2_1 + 576), "l"(m + (src0_2_1 + 512ll)));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0_2_1 + 1152), "l"(m + (src0_2_1 + 1024)));
+                :: "r"(dst0_2_1 + 1152), "l"(m + (src0_2_1 + 1024ll)));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0_2_1 + 1728), "l"(m + (src0_2_1 + 1536)));
+                :: "r"(dst0_2_1 + 1728), "l"(m + (src0_2_1 + 1536ll)));
             asm volatile("cp.async.commit_group;");
             long long src0_3_1 = m_cur_1 + (long long)(cp_src_1 + 64);
             unsigned int dst0_3_1 = cp_dst_1 + 4608;
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
                 :: "r"(dst0_3_1), "l"(m + src0_3_1));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0_3_1 + 576), "l"(m + (src0_3_1 + 512)));
+                :: "r"(dst0_3_1 + 576), "l"(m + (src0_3_1 + 512ll)));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0_3_1 + 1152), "l"(m + (src0_3_1 + 1024)));
+                :: "r"(dst0_3_1 + 1152), "l"(m + (src0_3_1 + 1024ll)));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                :: "r"(dst0_3_1 + 1728), "l"(m + (src0_3_1 + 1536)));
+                :: "r"(dst0_3_1 + 1728), "l"(m + (src0_3_1 + 1536ll)));
             asm volatile("cp.async.commit_group;");
             long long c_first_1 = -1;
             if (col_tile == 0) {
                 c_first_1 = elem_c[e_begin];
             }
-            if (c_first_1 >= 0) {
+            if (c_first_1 >= 0ll) {
                 {
                     float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1);
                     cn[0 + 0] = _v4.x;
@@ -797,49 +797,49 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
                     cn[0 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 256);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 256ll);
                     cn[4 + 0] = _v4.x;
                     cn[4 + 1] = _v4.y;
                     cn[4 + 2] = _v4.z;
                     cn[4 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 512);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 512ll);
                     cn[8 + 0] = _v4.x;
                     cn[8 + 1] = _v4.y;
                     cn[8 + 2] = _v4.z;
                     cn[8 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 768);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 768ll);
                     cn[12 + 0] = _v4.x;
                     cn[12 + 1] = _v4.y;
                     cn[12 + 2] = _v4.z;
                     cn[12 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 1024);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 1024ll);
                     cn[16 + 0] = _v4.x;
                     cn[16 + 1] = _v4.y;
                     cn[16 + 2] = _v4.z;
                     cn[16 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 1280);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 1280ll);
                     cn[20 + 0] = _v4.x;
                     cn[20 + 1] = _v4.y;
                     cn[20 + 2] = _v4.z;
                     cn[20 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 1536);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 1536ll);
                     cn[24 + 0] = _v4.x;
                     cn[24 + 1] = _v4.y;
                     cn[24 + 2] = _v4.z;
                     cn[24 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 1792);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 1792ll);
                     cn[28 + 0] = _v4.x;
                     cn[28 + 1] = _v4.y;
                     cn[28 + 2] = _v4.z;
@@ -881,7 +881,7 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
             }
         }
         long long x0_off_1 = x0_index[chain];
-        if (x0_off_1 >= 0) {
+        if (x0_off_1 >= 0ll) {
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1);
                 acc[0 + 0] = _v4.x;
@@ -890,49 +890,49 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
                 acc[0 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 256);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 256ll);
                 acc[4 + 0] = _v4.x;
                 acc[4 + 1] = _v4.y;
                 acc[4 + 2] = _v4.z;
                 acc[4 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 512);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 512ll);
                 acc[8 + 0] = _v4.x;
                 acc[8 + 1] = _v4.y;
                 acc[8 + 2] = _v4.z;
                 acc[8 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 768);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 768ll);
                 acc[12 + 0] = _v4.x;
                 acc[12 + 1] = _v4.y;
                 acc[12 + 2] = _v4.z;
                 acc[12 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 1024);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 1024ll);
                 acc[16 + 0] = _v4.x;
                 acc[16 + 1] = _v4.y;
                 acc[16 + 2] = _v4.z;
                 acc[16 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 1280);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 1280ll);
                 acc[20 + 0] = _v4.x;
                 acc[20 + 1] = _v4.y;
                 acc[20 + 2] = _v4.z;
                 acc[20 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 1536);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 1536ll);
                 acc[24 + 0] = _v4.x;
                 acc[24 + 1] = _v4.y;
                 acc[24 + 2] = _v4.z;
                 acc[24 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 1792);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 1792ll);
                 acc[28 + 0] = _v4.x;
                 acc[28 + 1] = _v4.y;
                 acc[28 + 2] = _v4.z;
@@ -987,75 +987,75 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
         if (e_begin < e_end) {
             if (write_states != 0) {
                 long long y_first_1 = elem_y[e_begin];
-                if (y_first_1 >= 0) {
+                if (y_first_1 >= 0ll) {
                     {
                         float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
                         *reinterpret_cast<float4*>(y + y_first_1 + g_off_1) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 256) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 256ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 512) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 512ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 768) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 768ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[16 + 0], acc[16 + 1], acc[16 + 2], acc[16 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 1024) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 1024ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[20 + 0], acc[20 + 1], acc[20 + 2], acc[20 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 1280) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 1280ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[24 + 0], acc[24 + 1], acc[24 + 2], acc[24 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 1536) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 1536ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[28 + 0], acc[28 + 1], acc[28 + 2], acc[28 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 1792) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 1792ll) = _v4;
                     }
                 }
             }
         } else {
             long long y_last_1 = y_final[chain];
-            if (y_last_1 >= 0) {
+            if (y_last_1 >= 0ll) {
                 {
                     float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
                     *reinterpret_cast<float4*>(y + y_last_1 + g_off_1) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 256) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 256ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 512) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 512ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 768) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 768ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[16 + 0], acc[16 + 1], acc[16 + 2], acc[16 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 1024) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 1024ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[20 + 0], acc[20 + 1], acc[20 + 2], acc[20 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 1280) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 1280ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[24 + 0], acc[24 + 1], acc[24 + 2], acc[24 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 1536) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 1536ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[28 + 0], acc[28 + 1], acc[28 + 2], acc[28 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 1792) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 1792ll) = _v4;
                 }
             }
         }
@@ -1123,26 +1123,26 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
                         :: "r"(dst0_5), "l"(m + src0_5));
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                        :: "r"(dst0_5 + 576), "l"(m + (src0_5 + 512)));
+                        :: "r"(dst0_5 + 576), "l"(m + (src0_5 + 512ll)));
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                        :: "r"(dst0_5 + 1152), "l"(m + (src0_5 + 1024)));
+                        :: "r"(dst0_5 + 1152), "l"(m + (src0_5 + 1024ll)));
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                        :: "r"(dst0_5 + 1728), "l"(m + (src0_5 + 1536)));
+                        :: "r"(dst0_5 + 1728), "l"(m + (src0_5 + 1536ll)));
                 } else if (has_next_1 != 0) {
                     long long src0_6 = m_next_1 + (long long)(cp_src_1 + (nc_1 - 4) * 32);
                     unsigned int dst0_6 = cp_dst_1 + (unsigned int)(nc_1 % 4 * 2304);
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
                         :: "r"(dst0_6), "l"(m + src0_6));
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                        :: "r"(dst0_6 + 576), "l"(m + (src0_6 + 512)));
+                        :: "r"(dst0_6 + 576), "l"(m + (src0_6 + 512ll)));
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                        :: "r"(dst0_6 + 1152), "l"(m + (src0_6 + 1024)));
+                        :: "r"(dst0_6 + 1152), "l"(m + (src0_6 + 1024ll)));
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                        :: "r"(dst0_6 + 1728), "l"(m + (src0_6 + 1536)));
+                        :: "r"(dst0_6 + 1728), "l"(m + (src0_6 + 1536ll)));
                 }
                 asm volatile("cp.async.commit_group;");
                 if (ch_1 == 1) {
-                    if (c_next_1 >= 0) {
+                    if (c_next_1 >= 0ll) {
                         {
                             float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1);
                             cn[0 + 0] = _v4.x;
@@ -1151,49 +1151,49 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
                             cn[0 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 256);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 256ll);
                             cn[4 + 0] = _v4.x;
                             cn[4 + 1] = _v4.y;
                             cn[4 + 2] = _v4.z;
                             cn[4 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 512);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 512ll);
                             cn[8 + 0] = _v4.x;
                             cn[8 + 1] = _v4.y;
                             cn[8 + 2] = _v4.z;
                             cn[8 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 768);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 768ll);
                             cn[12 + 0] = _v4.x;
                             cn[12 + 1] = _v4.y;
                             cn[12 + 2] = _v4.z;
                             cn[12 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 1024);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 1024ll);
                             cn[16 + 0] = _v4.x;
                             cn[16 + 1] = _v4.y;
                             cn[16 + 2] = _v4.z;
                             cn[16 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 1280);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 1280ll);
                             cn[20 + 0] = _v4.x;
                             cn[20 + 1] = _v4.y;
                             cn[20 + 2] = _v4.z;
                             cn[20 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 1536);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 1536ll);
                             cn[24 + 0] = _v4.x;
                             cn[24 + 1] = _v4.y;
                             cn[24 + 2] = _v4.z;
                             cn[24 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 1792);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 1792ll);
                             cn[28 + 0] = _v4.x;
                             cn[28 + 1] = _v4.y;
                             cn[28 + 2] = _v4.z;
@@ -1570,38 +1570,38 @@ kernel_cake_kda_train_8cda0d1f1291e740f798_kcp(float* __restrict__ m, float* __r
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + (34816 - buf_1 * 34816) + 2720), "r"(__float_as_uint(acc[20])), "r"(__float_as_uint(acc[21])), "r"(__float_as_uint(acc[22])), "r"(__float_as_uint(acc[23])) : "memory");
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + (34816 - buf_1 * 34816) + 3264), "r"(__float_as_uint(acc[24])), "r"(__float_as_uint(acc[25])), "r"(__float_as_uint(acc[26])), "r"(__float_as_uint(acc[27])) : "memory");
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + (34816 - buf_1 * 34816) + 3808), "r"(__float_as_uint(acc[28])), "r"(__float_as_uint(acc[29])), "r"(__float_as_uint(acc[30])), "r"(__float_as_uint(acc[31])) : "memory");
-            if (y_pub_1 >= 0) {
+            if (y_pub_1 >= 0ll) {
                 {
                     float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
                     *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 256) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 256ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 512) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 512ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 768) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 768ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[16 + 0], acc[16 + 1], acc[16 + 2], acc[16 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 1024) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 1024ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[20 + 0], acc[20 + 1], acc[20 + 2], acc[20 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 1280) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 1280ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[24 + 0], acc[24 + 1], acc[24 + 2], acc[24 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 1536) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 1536ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[28 + 0], acc[28 + 1], acc[28 + 2], acc[28 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 1792) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 1792ll) = _v4;
                 }
             }
             __syncthreads();

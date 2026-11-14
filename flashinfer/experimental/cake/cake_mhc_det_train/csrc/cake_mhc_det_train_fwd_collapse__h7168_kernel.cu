@@ -102,8 +102,8 @@ kernel_cake_mhc_det_train_fwd_collapse__h7168(__nv_bfloat16* __restrict__ x, flo
             int part = sub - row * 7;
             long long row64 = (long long)row;
             long long colb = (long long)(part * 1024) + col0;
-            long long xbase = row64 * 28672 + colb;
-            long long ubase = row64 * 7168 + colb;
+            long long xbase = row64 * 28672ll + colb;
+            long long ubase = row64 * 7168ll + colb;
             float cache[32];
             #pragma unroll
             for (int s = 0; s < 4; s++) {
@@ -126,10 +126,10 @@ kernel_cake_mhc_det_train_fwd_collapse__h7168(__nv_bfloat16* __restrict__ x, flo
                     }
                 }
             }
-            long long sbase = row64 * 64;
+            long long sbase = row64 * 64ll;
             float _vec_load_0[4];
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(stats + (sbase + 24) + 0);
+                float4 _v4 = *reinterpret_cast<const float4*>(stats + (sbase + 24ll) + 0);
                 _vec_load_0[0 + 0] = _v4.x;
                 _vec_load_0[0 + 1] = _v4.y;
                 _vec_load_0[0 + 2] = _v4.z;
@@ -137,7 +137,7 @@ kernel_cake_mhc_det_train_fwd_collapse__h7168(__nv_bfloat16* __restrict__ x, flo
             }
             float _vec_load_1[4];
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(stats + (sbase + 28) + 0);
+                float4 _v4 = *reinterpret_cast<const float4*>(stats + (sbase + 28ll) + 0);
                 _vec_load_1[0 + 0] = _v4.x;
                 _vec_load_1[0 + 1] = _v4.y;
                 _vec_load_1[0 + 2] = _v4.z;

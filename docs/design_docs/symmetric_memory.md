@@ -1,8 +1,7 @@
 # Symmetric Memory over NVLink
 
 **Scope**: `MnnvlMemory` and `SymmDeviceMemory` in `flashinfer/comm/mnnvl.py`:
-how they allocate and share memory, their lifecycle and checkpoint/restore, and
-how the NVLink one-sided all-to-all gates CFT on the handle type.
+how they allocate and share memory, and their lifecycle and checkpoint/restore.
 
 FlashInfer's NVLink collectives work on symmetric memory: every rank of a group
 allocates a buffer of the same size, and every rank maps every peer's buffer
@@ -182,15 +181,6 @@ The restore runs `allocate_mnnvl_handles` again, so it can settle on a
 different handle type than the original allocation. The workspaces expose
 these steps as `checkpoint_prepare` and `checkpoint_restore` (see
 [`docs/api/comm.rst`](../api/comm.rst)).
-
-## Interaction with CFT counted writes
-
-The NVLink one-sided all-to-all can bind its workspace to CUDA logical
-endpoints (CFT counted writes), which only accept memory shared through
-FABRIC handles. The workspace layout depends on whether CFT is used, so the
-backend decides before allocating, from `MnnvlMemory.uses_fabric_handles` (the
-precheck above). If the allocation then falls back to POSIX file
-descriptors, binding is skipped and the backend uses its fence path.
 
 ## Comparison
 

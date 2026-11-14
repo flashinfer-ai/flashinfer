@@ -112,7 +112,7 @@ kernel_cake_gdn_det_train_dd20d92fd03ad2cf563d(__nv_bfloat16* __restrict__ q_raw
             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv[_lp*2 + 0], yv[_lp*2+1 + 0]));
             yb[_lp] = *(uint32_t*)&_bf2;
         }
-        reinterpret_cast<int4*>(qn + (((long long)(bos + s) * (long long)num_qk_heads + (long long)h) * 128 + (long long)(c * 8)))[0] = reinterpret_cast<int4*>(yb)[0];
+        reinterpret_cast<int4*>(qn + (((long long)(bos + s) * (long long)num_qk_heads + (long long)h) * 128ll + (long long)(c * 8)))[0] = reinterpret_cast<int4*>(yb)[0];
         float xv_0[8];
         {
             const uint4* _vptr_1 = reinterpret_cast<const uint4*>(k_raw + ((long long)(bos + s) * (long long)k_raw_tstride + (long long)(h * 128 + c * 8)) + 0);
@@ -147,7 +147,7 @@ kernel_cake_gdn_det_train_dd20d92fd03ad2cf563d(__nv_bfloat16* __restrict__ q_raw
             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_0[_lp*2 + 0], yv_0[_lp*2+1 + 0]));
             yb_0[_lp] = *(uint32_t*)&_bf2;
         }
-        reinterpret_cast<int4*>(kn + (((long long)(bos + s) * (long long)num_qk_heads + (long long)h) * 128 + (long long)(c * 8)))[0] = reinterpret_cast<int4*>(yb_0)[0];
+        reinterpret_cast<int4*>(kn + (((long long)(bos + s) * (long long)num_qk_heads + (long long)h) * 128ll + (long long)(c * 8)))[0] = reinterpret_cast<int4*>(yb_0)[0];
     }
     if (s + 16 < clen) {
         float xv_1[8];
@@ -184,7 +184,7 @@ kernel_cake_gdn_det_train_dd20d92fd03ad2cf563d(__nv_bfloat16* __restrict__ q_raw
             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_1[_lp*2 + 0], yv_1[_lp*2+1 + 0]));
             yb_1[_lp] = *(uint32_t*)&_bf2;
         }
-        reinterpret_cast<int4*>(qn + (((long long)(bos + s + 16) * (long long)num_qk_heads + (long long)h) * 128 + (long long)(c * 8)))[0] = reinterpret_cast<int4*>(yb_1)[0];
+        reinterpret_cast<int4*>(qn + (((long long)(bos + s + 16) * (long long)num_qk_heads + (long long)h) * 128ll + (long long)(c * 8)))[0] = reinterpret_cast<int4*>(yb_1)[0];
         float xv_1_1[8];
         {
             const uint4* _vptr_3 = reinterpret_cast<const uint4*>(k_raw + ((long long)(bos + s + 16) * (long long)k_raw_tstride + (long long)(h * 128 + c * 8)) + 0);
@@ -219,7 +219,7 @@ kernel_cake_gdn_det_train_dd20d92fd03ad2cf563d(__nv_bfloat16* __restrict__ q_raw
             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_1_1[_lp*2 + 0], yv_1_1[_lp*2+1 + 0]));
             yb_1_1[_lp] = *(uint32_t*)&_bf2;
         }
-        reinterpret_cast<int4*>(kn + (((long long)(bos + s + 16) * (long long)num_qk_heads + (long long)h) * 128 + (long long)(c * 8)))[0] = reinterpret_cast<int4*>(yb_1_1)[0];
+        reinterpret_cast<int4*>(kn + (((long long)(bos + s + 16) * (long long)num_qk_heads + (long long)h) * 128ll + (long long)(c * 8)))[0] = reinterpret_cast<int4*>(yb_1_1)[0];
     }
     if (s + 32 < clen) {
         float xv_2[8];
@@ -256,7 +256,7 @@ kernel_cake_gdn_det_train_dd20d92fd03ad2cf563d(__nv_bfloat16* __restrict__ q_raw
             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_2[_lp*2 + 0], yv_2[_lp*2+1 + 0]));
             yb_2[_lp] = *(uint32_t*)&_bf2;
         }
-        reinterpret_cast<int4*>(qn + (((long long)(bos + s + 32) * (long long)num_qk_heads + (long long)h) * 128 + (long long)(c * 8)))[0] = reinterpret_cast<int4*>(yb_2)[0];
+        reinterpret_cast<int4*>(qn + (((long long)(bos + s + 32) * (long long)num_qk_heads + (long long)h) * 128ll + (long long)(c * 8)))[0] = reinterpret_cast<int4*>(yb_2)[0];
         float xv_2_1[8];
         {
             const uint4* _vptr_5 = reinterpret_cast<const uint4*>(k_raw + ((long long)(bos + s + 32) * (long long)k_raw_tstride + (long long)(h * 128 + c * 8)) + 0);
@@ -291,7 +291,7 @@ kernel_cake_gdn_det_train_dd20d92fd03ad2cf563d(__nv_bfloat16* __restrict__ q_raw
             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_2_1[_lp*2 + 0], yv_2_1[_lp*2+1 + 0]));
             yb_2_1[_lp] = *(uint32_t*)&_bf2;
         }
-        reinterpret_cast<int4*>(kn + (((long long)(bos + s + 32) * (long long)num_qk_heads + (long long)h) * 128 + (long long)(c * 8)))[0] = reinterpret_cast<int4*>(yb_2_1)[0];
+        reinterpret_cast<int4*>(kn + (((long long)(bos + s + 32) * (long long)num_qk_heads + (long long)h) * 128ll + (long long)(c * 8)))[0] = reinterpret_cast<int4*>(yb_2_1)[0];
     }
     if (s + 48 < clen) {
         float xv_3[8];
@@ -328,7 +328,7 @@ kernel_cake_gdn_det_train_dd20d92fd03ad2cf563d(__nv_bfloat16* __restrict__ q_raw
             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_3[_lp*2 + 0], yv_3[_lp*2+1 + 0]));
             yb_3[_lp] = *(uint32_t*)&_bf2;
         }
-        reinterpret_cast<int4*>(qn + (((long long)(bos + s + 48) * (long long)num_qk_heads + (long long)h) * 128 + (long long)(c * 8)))[0] = reinterpret_cast<int4*>(yb_3)[0];
+        reinterpret_cast<int4*>(qn + (((long long)(bos + s + 48) * (long long)num_qk_heads + (long long)h) * 128ll + (long long)(c * 8)))[0] = reinterpret_cast<int4*>(yb_3)[0];
         float xv_3_1[8];
         {
             const uint4* _vptr_7 = reinterpret_cast<const uint4*>(k_raw + ((long long)(bos + s + 48) * (long long)k_raw_tstride + (long long)(h * 128 + c * 8)) + 0);
@@ -363,7 +363,7 @@ kernel_cake_gdn_det_train_dd20d92fd03ad2cf563d(__nv_bfloat16* __restrict__ q_raw
             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_3_1[_lp*2 + 0], yv_3_1[_lp*2+1 + 0]));
             yb_3_1[_lp] = *(uint32_t*)&_bf2;
         }
-        reinterpret_cast<int4*>(kn + (((long long)(bos + s + 48) * (long long)num_qk_heads + (long long)h) * 128 + (long long)(c * 8)))[0] = reinterpret_cast<int4*>(yb_3_1)[0];
+        reinterpret_cast<int4*>(kn + (((long long)(bos + s + 48) * (long long)num_qk_heads + (long long)h) * 128ll + (long long)(c * 8)))[0] = reinterpret_cast<int4*>(yb_3_1)[0];
     }
 }
 

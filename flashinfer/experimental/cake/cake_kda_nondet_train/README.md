@@ -216,10 +216,7 @@ saved set do not change.
 - Elsewhere `"auto"` runs as `"off"`, also when the toolkit cannot be read.
   A new device, toolkit or registry needs the suite on that device before it
   enters `HANDOFF_VERIFIED`.
-- The environment variable `CAKE_KDA_CKPT_HANDOFF` (`off` / `on`) is read by
-  `cake_kda_nondet` at each call, not by `CakeKDANondetFunction.apply`.  `off` turns
-  every call off; `on` turns `"auto"` into `"on"`.  An explicit `"off"` stays
-  off.
+- The keyword is the only switch: the package reads no environment variable.
 - Row records: the registry maps each forward intra record to a twin
   (`cake_jit.HANDOFF_TWINS`: `fwd_intra_v19` for `fwd_intra_v14`,
   `fwd_intra_v20` for `fwd_intra`).  The twin is the same program and also
@@ -370,7 +367,7 @@ requires this package as a sibling directory.
 Tests:
 
 * `tests/experimental/test_cake_kda_nondet_train.py`: the backend suite against the
-  FP64 reference of `tests/test_helpers/cake_kda_det_train_reference.py`,
+  FP64 reference of `tests/experimental/test_helpers/cake_kda_det_train_reference.py`,
   the comparison with the deterministic package, the hand-off twins'
   records and rows, and the tape WY twin's record, rule and tape backward.
 * `tests/experimental/test_cake_kda_nondet_train_l2n.py`: the in-kernel q / k

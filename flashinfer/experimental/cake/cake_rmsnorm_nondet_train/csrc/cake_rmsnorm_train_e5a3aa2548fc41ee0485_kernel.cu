@@ -115,7 +115,7 @@ kernel_cake_rmsnorm_train_e5a3aa2548fc41ee0485(__nv_bfloat16* __restrict__ x, __
         int row = row0 + group;
         long long row64 = (long long)row;
         long long xbase = row64 * x_stride_p0;
-        long long obase = row64 * 6144;
+        long long obase = row64 * 6144ll;
         unsigned int x_words[24];
         unsigned int u_words[24];
         float sum_sq = 0.0f;

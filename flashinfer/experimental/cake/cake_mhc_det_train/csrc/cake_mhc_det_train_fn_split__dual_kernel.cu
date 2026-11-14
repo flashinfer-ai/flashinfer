@@ -111,7 +111,7 @@ kernel_cake_mhc_det_train_fn_split__dual(float* __restrict__ fn, __nv_bfloat16* 
     float p2[8];
     float p3[8];
     if (n < 24) {
-        long long src = (long long)n * 16384 + (long long)k0;
+        long long src = (long long)n * 16384ll + (long long)k0;
         if (want_t == 0) {
             #pragma unroll
             for (int q = 0; q < 2; q++) {
@@ -164,7 +164,7 @@ kernel_cake_mhc_det_train_fn_split__dual(float* __restrict__ fn, __nv_bfloat16* 
         }
     }
     if (want_t == 0) {
-        long long dst_2_0 = (long long)n * 16384 + (long long)k0;
+        long long dst_2_0 = (long long)n * 16384ll + (long long)k0;
         unsigned int _packed_0[4];
         #pragma unroll
         for (int _lp = 0; _lp < 1; _lp++) {
@@ -187,7 +187,7 @@ kernel_cake_mhc_det_train_fn_split__dual(float* __restrict__ fn, __nv_bfloat16* 
             _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
         }
         reinterpret_cast<int4*>(fnp + dst_2_0)[0] = reinterpret_cast<int4*>(_packed_0)[0];
-        long long dst_2_1 = (long long)(32 + n) * 16384 + (long long)k0;
+        long long dst_2_1 = (long long)(32 + n) * 16384ll + (long long)k0;
         unsigned int _packed_1[4];
         #pragma unroll
         for (int _lp = 0; _lp < 1; _lp++) {
@@ -210,7 +210,7 @@ kernel_cake_mhc_det_train_fn_split__dual(float* __restrict__ fn, __nv_bfloat16* 
             _packed_1[_lp + 3] = *(uint32_t*)&_bf2;
         }
         reinterpret_cast<int4*>(fnp + dst_2_1)[0] = reinterpret_cast<int4*>(_packed_1)[0];
-        long long dst_2_2 = (long long)(64 + n) * 16384 + (long long)k0;
+        long long dst_2_2 = (long long)(64 + n) * 16384ll + (long long)k0;
         unsigned int _packed_2[4];
         #pragma unroll
         for (int _lp = 0; _lp < 1; _lp++) {
@@ -234,7 +234,7 @@ kernel_cake_mhc_det_train_fn_split__dual(float* __restrict__ fn, __nv_bfloat16* 
         }
         reinterpret_cast<int4*>(fnp + dst_2_2)[0] = reinterpret_cast<int4*>(_packed_2)[0];
     } else {
-        long long dst_t_2_0 = (long long)k0 * 32 + (long long)n;
+        long long dst_t_2_0 = (long long)k0 * 32ll + (long long)n;
         unsigned int _packed_3[4];
         #pragma unroll
         for (int _lp = 0; _lp < 1; _lp++) {
@@ -257,7 +257,7 @@ kernel_cake_mhc_det_train_fn_split__dual(float* __restrict__ fn, __nv_bfloat16* 
             _packed_3[_lp + 3] = *(uint32_t*)&_bf2;
         }
         reinterpret_cast<int4*>(fnTp + dst_t_2_0)[0] = reinterpret_cast<int4*>(_packed_3)[0];
-        long long dst_t_2_1 = (16384 + (long long)k0) * 32 + (long long)n;
+        long long dst_t_2_1 = (16384ll + (long long)k0) * 32ll + (long long)n;
         unsigned int _packed_4[4];
         #pragma unroll
         for (int _lp = 0; _lp < 1; _lp++) {
@@ -280,7 +280,7 @@ kernel_cake_mhc_det_train_fn_split__dual(float* __restrict__ fn, __nv_bfloat16* 
             _packed_4[_lp + 3] = *(uint32_t*)&_bf2;
         }
         reinterpret_cast<int4*>(fnTp + dst_t_2_1)[0] = reinterpret_cast<int4*>(_packed_4)[0];
-        long long dst_t_2_2 = (32768 + (long long)k0) * 32 + (long long)n;
+        long long dst_t_2_2 = (32768ll + (long long)k0) * 32ll + (long long)n;
         unsigned int _packed_5[4];
         #pragma unroll
         for (int _lp = 0; _lp < 1; _lp++) {
@@ -341,21 +341,21 @@ kernel_cake_mhc_det_train_fn_split__dual(float* __restrict__ fn, __nv_bfloat16* 
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&_tile_words_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tile_words_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&_tile_words_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&_tile_words_0[(0) + 3]))
             : "r"(tile_addr + (unsigned int)soff_3_0));
-        long long dst_p_2_0 = (long long)row * 16384 + (long long)(bid * 64 + chunk * 8);
+        long long dst_p_2_0 = (long long)row * 16384ll + (long long)(bid * 64 + chunk * 8);
         reinterpret_cast<int4*>(fnp + dst_p_2_0)[0] = reinterpret_cast<int4*>(_tile_words_0)[0];
         unsigned int _tile_words_1[4];
         int soff_3_1 = 4096 + row * 128 + (chunk ^ row / 8) * 16;
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&_tile_words_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tile_words_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&_tile_words_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&_tile_words_1[(0) + 3]))
             : "r"(tile_addr + (unsigned int)soff_3_1));
-        long long dst_p_2_1 = (long long)(32 + row) * 16384 + (long long)(bid * 64 + chunk * 8);
+        long long dst_p_2_1 = (long long)(32 + row) * 16384ll + (long long)(bid * 64 + chunk * 8);
         reinterpret_cast<int4*>(fnp + dst_p_2_1)[0] = reinterpret_cast<int4*>(_tile_words_1)[0];
         unsigned int _tile_words_2[4];
         int soff_3_2 = 8192 + row * 128 + (chunk ^ row / 8) * 16;
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&_tile_words_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tile_words_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&_tile_words_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&_tile_words_2[(0) + 3]))
             : "r"(tile_addr + (unsigned int)soff_3_2));
-        long long dst_p_2_2 = (long long)(64 + row) * 16384 + (long long)(bid * 64 + chunk * 8);
+        long long dst_p_2_2 = (long long)(64 + row) * 16384ll + (long long)(bid * 64 + chunk * 8);
         reinterpret_cast<int4*>(fnp + dst_p_2_2)[0] = reinterpret_cast<int4*>(_tile_words_2)[0];
     }
 }

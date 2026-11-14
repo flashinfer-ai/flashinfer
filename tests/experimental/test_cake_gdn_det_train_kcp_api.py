@@ -35,10 +35,27 @@ import torch
 PACKAGE = "flashinfer.experimental.cake.cake_gdn_det_train_kcp"
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _few_cpu_threads():
+    """The CPU tests run many small matmuls and elementwise ops.  On a host with hundreds of CPUs, torch's default
+    intra-op pool and the oneDNN matmul path (its own pool, which torch.set_num_threads does not resize) spend far more
+    time synchronizing threads than computing (the forward-form suite took about two hours on a shared CI host, against
+    11 s on a GPU node), so this module runs with at most 8 threads and oneDNN off, as the non-deterministic KCP suite
+    does."""
+    threads, onednn = torch.get_num_threads(), torch.backends.mkldnn.enabled
+    torch.set_num_threads(min(threads, 8))
+    torch.backends.mkldnn.enabled = False
+    try:
+        yield
+    finally:
+        torch.backends.mkldnn.enabled = onednn
+        torch.set_num_threads(threads)
+
+
 def _mod(sub: str | None = None):
     """The package (or one of its modules) through the test-helper registry when it lists the package, else directly."""
     try:
-        from tests.test_helpers.cake_package import cake_package
+        from tests.cake.test_helpers.cake_package import cake_package
 
         return cake_package("cake_gdn_det_train_kcp", sub)
     except (ImportError, KeyError):
@@ -894,7 +911,7 @@ def test_legacy_names_are_removed() -> None:
 def test_package_exports_the_det_names_only() -> None:
     """The package's ``__all__`` holds the names that carry ``det`` only, each bound; the constants and backend
     controls without ``det`` are neither exported nor bound by the package, and are read from their modules."""
-    from tests.test_helpers.cake_mode_names import assert_mode_names  # noqa: PLC0415
+    from tests.cake.test_helpers.cake_mode_names import assert_mode_names  # noqa: PLC0415
 
     pkg = _mod()
     assert pkg.__all__
@@ -1099,7 +1116,7 @@ def test_program_vocabulary_is_the_design_list() -> None:
         kcp.TART_MODULE_OF["kcp_affine_merge"] == "kda_chunk_kcp_affine_merge_fp32_v1"
     )  # reused verbatim
     # the output walk: a det-neutral module (the non-deterministic package ships the same program)
-    assert kcp.TART_MODULE_OF["kcp_fwdh_out"] == "gdn_chunk_fwdh_out_v1_kcp"
+    assert kcp.TART_MODULE_OF["kcp_fwdh_out"] == "gdn_chunk_fwdh_out_v2_kcp"
     for name, module in kcp.TART_MODULE_OF.items():
         if name not in ("kcp_affine_merge", "kcp_fwdh_out"):
             # the deterministic family's stems

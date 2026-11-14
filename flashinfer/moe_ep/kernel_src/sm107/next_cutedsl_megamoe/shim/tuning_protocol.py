@@ -100,7 +100,9 @@ class RubinTuningProtocol:
         )
         self.candidates = (
             sm107_candidates(
-                self.cfg.quant_kind, kernel_variant=self.cfg.kernel_variant
+                self.cfg.quant_kind,
+                kernel_variant=self.cfg.kernel_variant,
+                batch_invariant=getattr(self.cfg, "batch_invariant", False),
             )
             if candidates is None
             else candidates
@@ -144,7 +146,11 @@ class RubinTuningProtocol:
             activation=cfg.activation,
             situ_beta=cfg.situ_beta,
             situ_linear_beta=cfg.situ_linear_beta,
+            swiglu_alpha=getattr(cfg, "swiglu_alpha", None),
+            swiglu_beta=getattr(cfg, "swiglu_beta", None),
             gate_up_clamp=cfg.gate_up_clamp,
+            batch_invariant=getattr(cfg, "batch_invariant", False),
+            input_norm_const=getattr(cfg, "input_norm_const", 1.0),
         )
 
     def _contract(self):
@@ -154,6 +160,18 @@ class RubinTuningProtocol:
         config = dataclasses.asdict(self.cfg)
         for key in (*KNOB_KEYS, "rank", "max_tokens_per_rank"):
             config.pop(key, None)
+        if getattr(self.cfg, "batch_invariant", False):
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+                block_scaled_batch_invariant_version,
+                block_scaled_batch_invariant_fingerprint,
+            )
+
+            config["batch_invariant_version"] = block_scaled_batch_invariant_version(
+                self.cfg
+            )
+            config["batch_invariant_fingerprint"] = (
+                block_scaled_batch_invariant_fingerprint(self.cfg, arch="sm_107")
+            )
         device = None
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(torch.cuda.current_device())

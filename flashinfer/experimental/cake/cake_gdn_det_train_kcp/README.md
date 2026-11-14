@@ -155,7 +155,15 @@ context-parallel-only programs (`kcp_*`); the kernel symbol of a library is
   (the stream `tvm_ffi.use_torch_stream()` binds, without building a
   `torch.cuda.Stream` per launch).  The registry's answers (in-kernel L2 norm
   and fused-output records) and the chunk table's token count are derived once
-  and reused.
+  and reused.  An eager call sizes its workspace pools and ticket slots after
+  its first launch is issued, so that host work overlaps the launch (a
+  backward whose first program is persistent, #6 on saved or kept tapes, sizes
+  the ticket slots alone before it); a captured call sizes them first.  Each
+  launch key's record, grid and test flag are resolved once per context plan,
+  and the plan's pool tables with their kernel addressing, its walk, merge-chain
+  and zero-block device tables, split lists and pool sizes are derived at first
+  use; `cake_gdn_det_kcp` validates its keyword options once per keyword set.
+  Launches, arguments and bits are unchanged.
 * On `sm_100a` and `sm_103a`, with a zigzag or zigzag-per-document partition
   of at most 8 ranks, the summaries' offset walk runs on a side stream beside
   the transfer walk (fork / join with CUDA events; the same launches,
@@ -207,7 +215,7 @@ context serves every call of the same batch layout and head pair.
 
 | option | values | meaning |
 |---|---|---|
-| `save_mode` | **`"light"`**, `"full"` | `"light"` keeps the boundary states (with `save_transfer=True` also the received summary pairs and `M_seg`) and no tape: the backward re-runs the chunk preparation and replays the intra-rank tapes; `"full"` also keeps `M_seg` and every forward tape (the ten tapes `h`, `v_new`, `w`, `u`, `Aqk`, `Akk`, `gamma`, `gcum`, `rowscale`, `qscale`: 74,307 B per padded token row at `HV = 48`) |
+| `save_mode` | **`"light"`**, `"full"` | `"light"` keeps the boundary states (with `save_transfer=True` also the received summary pairs and `M_seg`) and no tape: the backward re-runs the chunk preparation and replays the intra-rank tapes; `"full"` also keeps `M_seg` and every forward tape (the ten tapes `h`, `v_new`, `w`, `u`, `Aqk`, `Akk`, `gamma`, `gcum`, `rowscale`, `qscale`: 74,307 B per padded token row at `HV = 48`; with `use_qk_l2norm_in_kernel` also the normalized rows `qn` / `kn`, 8,192 B per token at `H_qk = 16`, so its backward launches no `qk_apply`) |
 | `boundary_mode` | **`"saved"`**, `"replay"` | whether the cross-rank boundary states (`S_in`, the owner's received summaries) are kept in the saved set or recomputed (exchange included) in the backward; `"replay"` keeps no tape and no `qk_rstd` either: `save_mode="full"` there runs the same backward as `"light"` (the whole-forward replay) |
 | `exchange` | **`"a2a"`**, `"ring"` | the collective schedule; `"ring"` only when every document crosses at most 3 ranks (`n_d_max - 1 <= 2`) and `save_transfer=False` |
 | `save_transfer` | **`True`**, `False` | keep the received summary pairs for the backward (`False` re-sends the transposed transfers) |
@@ -248,6 +256,7 @@ bytes per padded token row, `R = 64 * NC_pad` rows per rank, at `HV = 48`):
 | `rowscale`, `qscale` (chunk-preparation FP32 row factors) | yes | **no** (the chunk preparation re-runs in the backward) | 384 B per token |
 | `h` tape, `v_new`, `w`, `u`, `Aqk` | yes | **no** (replayed in the backward) | 67,584 B per token |
 | `qk_rstd` (`use_qk_l2norm_in_kernel=True`; `boundary_mode="saved"` only) FP32 | yes | yes | `8 * T_r * H_qk` |
+| `qn`, `kn` (`use_qk_l2norm_in_kernel=True`: the normalized rows `fwd_prep_l2n` wrote) BF16 | yes | **no** (the replay's `fwd_prep_l2n` writes them again) | `2 * 256 * T_r * H_qk` (8,192 B per token at `H_qk = 16`) |
 
 With `boundary_mode="replay"` the saved set keeps no boundary state, no
 `M_seg`, no tape and no `qk_rstd` in either `save_mode`: the backward replays
@@ -402,8 +411,9 @@ cake_gdn_det_train_kcp_workspace_bytes(ctx, *, H_qk, HV, save_mode="light", boun
     `backward_transient`, which that plane can put above the replay form's).  graph="replay": nothing is released,
     so the forward is every forward pool and tape it writes (no tape with save_mode="full" and a saved set) and the
     backward every backward pool, the ten light tapes (none with save_mode="full" and a saved set) and every
-    backward tape; with use_qk_l2norm_in_kernel both add qn / kn and the arena qk_rstd where #1 writes it (a
-    forward without a saved set, a backward that re-runs #1).
+    backward tape; with use_qk_l2norm_in_kernel both add qn / kn (none with save_mode="full" and a saved set, whose
+    rows are saved-set tensors) and the arena qk_rstd where #1 writes it (a forward without a saved set, a backward
+    that re-runs #1).
     At P > 1 the c1 send pool also holds the M_f^T tiles (`c1_send_mf` = s * n_out(r)) and, with the fused walks, the
     carry plane max(n_in(r), n_out(r)) more slots (`fused_walks=0` is the test knob's split form); the b1 pools
     take the larger split form (the d_f plane, or the d_f plane + the n_io(r) re-sent maps); a backward on a caller-held workspace also sizes the forward exchange pools
@@ -432,7 +442,9 @@ dq    = cvt.rn.bf16(mul.rn(r, sub.rn(dq_hat, mul.rn(y, dot))))           dq_hat 
 FTZ off everywhere; `cake_l2n.py` is the pure-torch reference of these
 orders (bitwise the device programs; the `fma.rn` of `ss` is emulated
 exactly in FP64).  Programs: `fwd_prep_l2n` (#1 that first writes `qn` /
-`kn` and `r`, then runs #1's body on them), `bwd_dqkg_l2n` (#8 on `qn` /
+`kn` and `r`, then runs #1's body on them; its forward form, record
+`fwd_prep_l2n_fwd`, stores no `akk` / `g_cum` and runs for every forward
+whose `akk` / `g_cum` reach no backward), `bwd_dqkg_l2n` (#8 on `qn` /
 `kn` with the pullback before the one BF16 rounding; `group_reduce="host"`
 runs the unchanged #8 and the reference pullback on the host, per block of
 2048 tokens) and `qk_apply` (`qn = bf16(q * r)` from the saved `r`).  Every
@@ -443,16 +455,19 @@ other reader (#2, #3, #5, #2+5, #7) is the unchanged program bound to `qn` / `kn
 | forward | `fwd_prep_l2n` | -- | `kn` before `out`, `qn` after #5 (a fused forward: both after its output walks; a hand-off forward hands both over with its tapes); the arena `r` after #1 (the saved `r` is a fresh tensor) |
 | light backward | the replay's `fwd_prep_l2n` | saved | after #8 |
 | kept recompute tapes | the recompute forward's `fwd_prep_l2n` (handed over with the tapes; no `qk_apply`) | saved | after #8 |
-| `save_mode="full"` | `qk_apply` after #6 | saved | after #8 |
+| `save_mode="full"` | the saved set (the forward's `fwd_prep_l2n` rows; no `qk_apply`) | saved | after #8 (unbound; the saved set holds them) |
+| `save_mode="full"`, test knob `full_qk="apply"` | `qk_apply` after #6 | saved | after #8 |
 | `boundary_mode="replay"` | the replayed forward's `fwd_prep_l2n` | arena | after #8 |
 | recompute handle | `fwd_prep_l2n` (the recompute is a forward) | -- | as the forward |
 | `graph="replay"` | as eager | as eager | never (the graph bakes the arena) |
 
 The saved set gains `qk_rstd` (FP32 `[2, T_r, H_qk]`, `8 T_r H_qk` bytes;
-`KCP_SAVED_VERSION` 2); the normalized rows are never saved
-(`2 x 256 T_r H_qk` bytes: workspace in the forward's tape walk and every
-backward phase; in the kept-tape backward they are hand-off tensors,
-`bwd.kept_tapes`).  The byte queries take `use_qk_l2norm_in_kernel=`;
+`KCP_SAVED_VERSION` 2); with `save_mode="full"` it also keeps the normalized
+rows (`2 x 256 T_r H_qk` bytes, fresh tensors `fwd_prep_l2n` writes; the
+same bits `qk_apply` rebuilds from the saved `r`), so the full backward
+launches nothing before #6.  Otherwise the rows are never saved: workspace in
+the forward's tape walk and every backward phase of the replay forms; in the
+kept-tape backward they are hand-off tensors, `bwd.kept_tapes`.  The byte queries take `use_qk_l2norm_in_kernel=`;
 `LAST_CALL[...]` records `qk_l2norm`, `qk_source`, `rstd_source` and
 `arena_tapes`.  The recompute handle's entry key includes the flag.  Until
 the registry renders the three programs the kernel backend refuses the
@@ -507,7 +522,7 @@ with the `_kcp` suffix; its 20-hex digests equal that package's):
 |---|---|---|
 | 1 | `fwd_prep` | per chunk: cumulative gate, `gamma`, the WY representation (`w`, `u`), `Aqk`, `Akk` |
 | 2 | `kcp_fwdh` (`offset` / `tape` forms, each at value width `vh` 128 or 64) | the forward state walk over the rank's segments: from zero for the summary offset `B_f`, from `S_in` for the `h` / `v_new` tapes; the `vh` 64 form (two CTAs per segment and head, the `_vh64` records) runs when `n_walk × HV ≤ SM count` or when its two-CTA grid finishes within the longest walked segment (LPT over two CTAs per SM) and writes bitwise-identical results |
-| 3 | `kcp_transfer_walk` | the transfer `M_f` of a segment, TF32 hi/lo on the tensor cores (`precision_mode` 0) on eight compute warps (a column half each); its `precision_mode` 1 / 2 forms are four-warp test-only programs of `build.test.json` with bitwise the same results |
+| 3 | `kcp_transfer_walk` | the transfer `M_f` of a segment, TF32 hi/lo on the tensor cores (`precision_mode` 0) on eight compute warps (a column half each); a CTA whose first 32 chunk decays multiply to at most 2^-64 stops once its carried transition is exactly zero (every later step keeps it zero; bitwise the full walk); its `precision_mode` 1 / 2 forms are four-warp test-only programs of `build.test.json` with bitwise the same results |
 | 4 | `kcp_affine_merge` (`c8` / `c16`) | FP32 affine chains over state (`S = M S + B`) and map (compose) tiles; transposed for the adjoint |
 | 5 | `fwd_o` | the output from the `h` tape, `v_new` and `Aqk`; persistent, the tiles beyond the grid drawn in units from a ticket word |
 | 2+5 | `kcp_fwdh_out` (value width `vh` 128 or 64) | the output walk: #2's tape walk from `S_in` that writes each chunk's output from its `h` snapshot, its `v_new` operand, `q`, `Aqk` and `qscale` instead of the `h` / `v_new` tapes; the forward of a light, saved-boundary call that launches #5 runs it in place of the tape walk and #5 (see "Contract"); the `vh` 64 form (two CTAs per segment and head, the `_vh64` record) runs under #2's rule (`n_walk × HV ≤ SM count`, or its two-CTA grid finishes within the longest walked segment); bitwise the split form's output |
@@ -525,8 +540,9 @@ The persistent programs (#5, #6, #8) launch no cooperative grid: a CTA that
 finishes its static tile draws the remaining work through an `atom.inc` on a
 32-bit ticket word (the `ticket` argument), which every launch leaves at zero
 again.  The host keeps one such word per launch site in the caller's
-workspace, 128-byte aligned, zeroed once when the workspace is allocated and
-never read back; a kernel resident on a side stream therefore delays one CTA,
+workspace, 128-byte aligned, zeroed once when the workspace is first sized
+(an eager call: after its first launch, or before a persistent first program)
+and never read back; a kernel resident on a side stream therefore delays one CTA,
 not the whole grid.
 
 ## Layout of this package

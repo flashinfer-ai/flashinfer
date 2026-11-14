@@ -12,7 +12,7 @@ compiled-plan cache's reload path."""
 import pytest
 import torch
 
-from tests.test_helpers.qwen_3_5_block_cases import PagedCase
+from tests.experimental.test_helpers.qwen_3_5_block_cases import PagedCase
 
 pytestmark = [pytest.mark.arch_rubin, pytest.mark.usefixtures("rubin")]
 
@@ -350,7 +350,7 @@ def test_decode_lowered_chain_against_the_fused_fork_control_arm():
     epilogue -- the control arm.  Both hold the oracle, the two chains agree (two roundings of stage (1): not bitwise), and the
     stage lists are the two chains'."""
     from flashinfer.experimental.qwen_3_5_block import api as _api
-    from tests.test_helpers.qwen_3_5_block_reference import cosine
+    from tests.experimental.test_helpers.qwen_3_5_block_reference import cosine
 
     g = _geometry("24_2")
     case = PagedCase(g, (300, 77), (2, 2), page_size=16, layout="NHD", seed=43)
@@ -479,7 +479,7 @@ def test_decode_unsplit_tile_runs_the_gate_as_its_own_launch():
     case.check_written_rows(label="decode split 1 (gate launch)")
     split = _plan_decode(case, g, decode_split_kv=2)
     assert split.declaration["gate_fused"] is True
-    from tests.test_helpers.qwen_3_5_block_reference import cosine
+    from tests.experimental.test_helpers.qwen_3_5_block_reference import cosine
 
     assert cosine(out, _run(split, case)) > 0.9999, (
         "the unsplit and the split plans compute the same function"

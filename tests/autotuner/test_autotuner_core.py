@@ -1494,6 +1494,101 @@ def test_autotune_context_custom_buckets(monkeypatch):
     assert unique_shapes == [100, 200, 500]
 
 
+def test_tuning_buckets_off_grid_top_bucket_matches_inference_key(monkeypatch):
+    """A top tuning bucket off the op's grid must be found at inference.
+
+    Tuning with an override whose largest bucket (24) is not a value the op's
+    mapper produces (it rounds 24 up to 32) must store the result under the key
+    inference looks up, instead of leaving the op's top bucket untuned.
+    """
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(8, 16, 32),
+                map_to_tuning_buckets=next_positive_power_of_2,
+            ),
+        ),
+    )
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw):
+        n = prof_inputs[0].shape[0]
+        if n == 24:
+            return {0: 5.0, 1: 1.0}[tactic]
+        return {0: 1.0, 1: 5.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    buckets = (8, 16, 24)
+    tune_inputs = [torch.empty((24, 16), dtype=torch.float32)]
+    with autotune(tune_mode=True, tuning_buckets=buckets, round_up=True):
+        tuner.choose_one("off_grid_top_bucket_test", [runner], config, tune_inputs)
+
+    keys = {
+        k.nearest_profile[0][0]
+        for k in tuner.profiling_cache
+        if k.custom_op == "off_grid_top_bucket_test"
+    }
+    assert keys == {8, 16, 32}, f"Expected the op's keys {{8, 16, 32}}, got {keys}"
+
+    infer_inputs = [torch.empty((24, 16), dtype=torch.float32)]
+    _, tactic = tuner.choose_one(
+        "off_grid_top_bucket_test", [runner], config, infer_inputs
+    )
+
+    assert tactic == 1, f"Expected the tactic tuned at 24 (key 32), got {tactic}"
+
+
+def test_tuning_buckets_profile_one_size_per_op_bucket(monkeypatch):
+    """Listed sizes that share an op bucket are profiled once, at the size
+    equal to the bucket, or else at the largest of them, not at the smallest.
+    """
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+
+    def coarse_ceil(m):  # op grid (8, 16), coarser than the listed sizes
+        return 8 if m <= 8 else 16
+
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(8, 16),
+                map_to_tuning_buckets=coarse_ceil,
+            ),
+        ),
+    )
+    profiled_shapes = []
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw):
+        n = prof_inputs[0].shape[0]
+        profiled_shapes.append(n)
+        best = 1 if n >= 6 else 0
+        return 1.0 if tactic == best else 5.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    # 1, 2, 4, 8 -> key 8 (8 is listed); 10, 12 -> key 16 (16 is not listed).
+    buckets = (1, 2, 4, 8, 10, 12)
+    tune_inputs = [torch.empty((12, 16), dtype=torch.float32)]
+    with autotune(tune_mode=True, tuning_buckets=buckets):
+        tuner.choose_one("op_bucket_size_test", [runner], config, tune_inputs)
+
+    assert set(profiled_shapes) == {8, 12}, sorted(set(profiled_shapes))
+
+    for m in (3, 8, 15):
+        infer_inputs = [torch.empty((m, 16), dtype=torch.float32)]
+        _, tactic = tuner.choose_one(
+            "op_bucket_size_test", [runner], config, infer_inputs
+        )
+        assert tactic == 1, f"m={m}: got {tactic}"
+
+
 def test_tuning_overrides_preserve_tensor_initializers():
     """Bucket overrides must retain the per-input initializer mapping."""
 
@@ -1718,17 +1813,15 @@ def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
         use_cold_l2_cache=True,
         cuda_graph_profile_replays=2,
     )
-    allocations = []
-    original_empty = torch.empty
+    flushes = []
+    original_make_l2_flush = autotuner_module.make_l2_flush
 
-    def tracked_empty(*args, **kwargs):
-        result = original_empty(*args, **kwargs)
-        if kwargs.get("dtype") == torch.int8:
-            allocations.append((result.numel(), result.device))
-        return result
+    def tracked_make_l2_flush(num_bytes, device):
+        flushes.append((num_bytes, device))
+        return original_make_l2_flush(num_bytes, device)
 
     monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda device_id: 4096)
-    monkeypatch.setattr(torch, "empty", tracked_empty)
+    monkeypatch.setattr(autotuner_module, "make_l2_flush", tracked_make_l2_flush)
     monkeypatch.setattr(
         "flashinfer.autotuner.autotuner.delay_kernel", lambda delay_us: None
     )
@@ -1736,7 +1829,7 @@ def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
     latency = tuner._profile_single_kernel(runner, inputs, 0, config)
 
     assert latency >= 0
-    assert allocations == [(8192, inputs[0].device)]
+    assert flushes == [(8192, inputs[0].device)]
 
 
 class _CudaAddRunner(DummyRunner):
@@ -2007,7 +2100,11 @@ def test_autotune_context_round_up(monkeypatch):
 
 
 def test_autotune_context_both_overrides(monkeypatch):
-    """autotune with both custom buckets and round_up=True."""
+    """With tuning_buckets set, keys come from the op's own mapper.
+
+    ``round_up`` is accepted but does not change the mapping while
+    ``tuning_buckets`` is given.
+    """
     tuner = reset_autotuner()
     runner = DummyRunner(valid_tactics=(0, 1))
 
@@ -2024,24 +2121,26 @@ def test_autotune_context_both_overrides(monkeypatch):
 
     def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw):
         n = prof_inputs[0].shape[0]
-        if n == 300:
+        if n == 256:
             return {0: 1.0, 1: 5.0}[tactic]
         return {0: 5.0, 1: 1.0}[tactic]
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
 
     tune_inputs = [torch.empty((300, 16), dtype=torch.float32)]
-    with autotune(tune_mode=True, tuning_buckets=(100, 300, 600), round_up=True):
+    with autotune(tune_mode=True, tuning_buckets=(256, 512, 1024), round_up=True):
         tuner.choose_one("both_overrides_test", [runner], config, tune_inputs)
 
-    # 250 rounds UP to 300 with custom buckets
-    infer_inputs = [torch.empty((250, 16), dtype=torch.float32)]
-    with autotune(tune_mode=False, tuning_buckets=(100, 300, 600), round_up=True):
+    # 300 maps to bucket 256 through the op's own (floor) mapper.
+    infer_inputs = [torch.empty((300, 16), dtype=torch.float32)]
+    with autotune(tune_mode=False, tuning_buckets=(256, 512, 1024), round_up=True):
+        mapper = tuner.get_effective_map_to_tuning_buckets(config)
+        assert mapper(250) == last_positive_power_of_2(250)
         _, tactic = tuner.choose_one(
             "both_overrides_test", [runner], config, infer_inputs
         )
 
-    assert tactic == 0, f"Expected tactic 0 (bucket 300 via round_up), got {tactic}"
+    assert tactic == 0, f"Expected tactic 0 (bucket 256 via op mapper), got {tactic}"
 
 
 def test_autotune_context_restores_overrides():
@@ -2085,25 +2184,25 @@ def test_choose_one_with_custom_buckets_selects_best_tactic(monkeypatch):
 
     def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw):
         n = prof_inputs[0].shape[0]
-        if n <= 200:
+        if n <= 128:
             return {0: 3.0, 1: 1.0, 2: 5.0}[tactic]  # tactic 1 best for small
-        elif n <= 400:
+        elif n <= 256:
             return {0: 1.0, 1: 5.0, 2: 3.0}[tactic]  # tactic 0 best for medium
         else:
             return {0: 5.0, 1: 3.0, 2: 1.0}[tactic]  # tactic 2 best for large
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
 
-    custom_buckets = (100, 300, 500)
-    tune_inputs = [torch.empty((500, 64), dtype=torch.float32)]
+    custom_buckets = (128, 256, 512)
+    tune_inputs = [torch.empty((512, 64), dtype=torch.float32)]
     with autotune(tune_mode=True, tuning_buckets=custom_buckets):
         tuner.choose_one("custom_select_test", [runner], config, tune_inputs)
 
-    # Inference with custom buckets (floor rounding):
-    # 150 -> bucket 100 -> tactic 1
-    # 350 -> bucket 300 -> tactic 0
-    # 450 -> bucket 300 -> tactic 0
-    # 600 -> bucket 500 -> tactic 2
+    # Inference maps sizes with the op's own (floor) mapper:
+    # 150 -> bucket 128 -> tactic 1
+    # 350 -> bucket 256 -> tactic 0
+    # 450 -> bucket 256 -> tactic 0
+    # 600 -> bucket 512 -> tactic 2
     test_cases = [
         (150, 1),
         (350, 0),
@@ -2143,9 +2242,9 @@ def test_choose_one_above_overridden_top_bucket_uses_largest_tuned_profile(
     monkeypatch,
 ):
     """Tuning under autotune(tuning_buckets=hybrid(N), round_up=True) stores
-    the top bucket N under N, while the op's own mapper sends runtime sizes
-    above the previous bucket to the next power of two.  Those lookups (and
-    sizes above N) must use the profile tuned at N, not the fallback."""
+    the top bucket N under the op's own key for N (8192 here), so 5000 and 6144
+    hit it directly.  Larger sizes (20000 -> 32768) must still use the profile
+    tuned at N, not the default tactic."""
     tuner = reset_autotuner()
     runner = DummyRunner(valid_tactics=(0, 1, 2))
     config = TuningConfig(
@@ -2176,15 +2275,15 @@ def test_choose_one_above_overridden_top_bucket_uses_largest_tuned_profile(
     monkeypatch.setattr(
         autotuner_module.logger, "info", lambda msg, *a, **k: messages.append(msg)
     )
-    # 3000 -> 3072 (tuned); 5000 and 6144 -> 8192 and 20000 -> 32768, all
-    # above the top tuned bucket 6144.
+    # 3000 -> 3072 and 5000, 6144 -> 8192 are tuned; 20000 -> 32768 is above
+    # the top tuned key 8192.
     for num_tokens, expected_tactic in ((3000, 1), (5000, 2), (6144, 2), (20000, 2)):
         _, tactic = tuner.choose_one(
             "top_bucket_test", [runner], config, [torch.empty((num_tokens, 16))]
         )
         assert tactic == expected_tactic, f"num_tokens={num_tokens}: got {tactic}"
-    # Logged once per requested profile: 8192 and 32768.
-    assert len([m for m in messages if "above the largest tuned bucket" in m]) == 2
+    # Logged once, for 32768; 8192 is now a direct hit.
+    assert len([m for m in messages if "above the largest tuned bucket" in m]) == 1
 
 
 def test_search_cache_top_bucket_fallback_only_above_tuned_range():

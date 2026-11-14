@@ -51,6 +51,21 @@ static constexpr int kDefaultReservedSMsForOverlapping = 8;
 static constexpr char kReservedSMsForOverlappingEnv[] =
     "FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS";
 
+// PDL trigger for a routing kernel whose global writes are read by the kernels after it. Every
+// thread of the CTA must call it after its last global write.
+// - The trigger counts for the whole CTA as soon as one thread runs it, so without the barrier
+//   a thread that finishes early lets the next kernel start while other threads still write.
+// - A trigger is not a memory fence. Writes are guaranteed visible at the start of the dependent
+//   grid only if a GPU-scope release fence comes before the trigger in the triggering thread
+//   (PTX ISA, griddepcontrol). The fence after the barrier covers the writes of the whole CTA.
+__device__ __forceinline__ void triggerDependentLaunchAfterWrites() {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  __syncthreads();
+  __threadfence();
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 // Parsed reserved-SM value and whether it came from the environment.
 struct ReservedSMsForOverlappingConfig {
   // Number of SMs to reserve for overlapping kernels.
@@ -552,11 +567,11 @@ __device__ void routingPermutation(KernelParams params,
   // mPtrCtaIdxXyToMnLimit, mPtrNumNonExitingCtas, mPtrPermutedIdxSize, AND
   // mPtrExpandedIdxToPermutedIdx / mPtrPermutedIdxToTokenIdx.
   // Triggering before the permutation writes causes the consumer to read stale data → NaN.
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  // The trigger takes effect for the whole CTA when its first thread reaches it, so trigger only
+  // after every thread of the CTA has written its part (see triggerDependentLaunchAfterWrites).
   if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
+    triggerDependentLaunchAfterWrites();
   }
-#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -938,12 +953,11 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     }
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  // Trigger secondary kernel.
+  // Trigger the secondary kernel only after every thread of the CTA wrote its permutation
+  // indices (see routingPermutation).
   if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
+    triggerDependentLaunchAfterWrites();
   }
-#endif  // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1226,9 +1240,10 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
     }
   }
 
-  // Trigger the secondary kernel AFTER all global memory writes (including permutation indices).
+  // Trigger the secondary kernel AFTER all global memory writes (including permutation indices)
+  // of every thread in the CTA (see routingPermutation).
   if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
+    triggerDependentLaunchAfterWrites();
   }
 }
 #else

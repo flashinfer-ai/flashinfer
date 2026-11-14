@@ -35,7 +35,9 @@ Every name this module exports carries the mode word ``det``
 ``CakeMHCDetTrainHeadFunction`` and ``is_cake_mhc_det_train_head_supported``,
 and FlashInfer 0.7.3's ``cake_mhc_train_head*`` fail at import).  The entry
 points take no ``deterministic`` keyword, give the same results under
-``torch.use_deterministic_algorithms(True)`` and raise no alert.
+``torch.use_deterministic_algorithms(True)`` and raise no alert.  Every output
+(``Y``, the written ``dX`` and the accumulated ``dX``) repeats bit for bit for
+identical inputs, also in the recompute of an activation checkpoint.
 """
 
 from __future__ import annotations

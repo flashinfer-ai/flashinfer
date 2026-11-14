@@ -115,7 +115,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
     int lane_hi = lane_1 >> 3;
     int lc4 = ((lane_1 < 4) ? lane_1 : 3);
     int gcol = ((lane_1 >= 4) ? lane_1 - 4 : 0);
-    long long col_off = (long long)tid_2 * 28;
+    long long col_off = (long long)tid_2 * 28ll;
     float acc[2];
     float comp[2];
     #pragma unroll
@@ -141,7 +141,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_0;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_0.x), "=r"(_vld_0.y) : "l"((const void*)(dU + (ta64_0 * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_0.x), "=r"(_vld_0.y) : "l"((const void*)(dU + (ta64_0 * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -152,7 +152,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1.x), "=r"(_vld_1.y) : "l"((const void*)(dU + (ta64_0 * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1.x), "=r"(_vld_1.y) : "l"((const void*)(dU + (ta64_0 * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -163,7 +163,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_2;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_2.x), "=r"(_vld_2.y) : "l"((const void*)(dU + (ta64_0 * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_2.x), "=r"(_vld_2.y) : "l"((const void*)(dU + (ta64_0 * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -174,7 +174,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_3;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_3.x), "=r"(_vld_3.y) : "l"((const void*)(dU + (ta64_0 * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_3.x), "=r"(_vld_3.y) : "l"((const void*)(dU + (ta64_0 * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -185,7 +185,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_4;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_4.x), "=r"(_vld_4.y) : "l"((const void*)(dU + (ta64_0 * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_4.x), "=r"(_vld_4.y) : "l"((const void*)(dU + (ta64_0 * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_4 = reinterpret_cast<uint32_t*>(&_vld_4);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -196,7 +196,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_5;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_5.x), "=r"(_vld_5.y) : "l"((const void*)(dU + (ta64_0 * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_5.x), "=r"(_vld_5.y) : "l"((const void*)(dU + (ta64_0 * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_5 = reinterpret_cast<uint32_t*>(&_vld_5);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -207,7 +207,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_6;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_6.x), "=r"(_vld_6.y) : "l"((const void*)(dU + (ta64_0 * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_6.x), "=r"(_vld_6.y) : "l"((const void*)(dU + (ta64_0 * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_6 = reinterpret_cast<uint32_t*>(&_vld_6);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -220,7 +220,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_7;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_7.x), "=r"(_vld_7.y) : "l"((const void*)(X + (ta64_0 * 4 * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_7.x), "=r"(_vld_7.y) : "l"((const void*)(X + (ta64_0 * 4ll * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_7 = reinterpret_cast<uint32_t*>(&_vld_7);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -231,7 +231,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_8;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_8.x), "=r"(_vld_8.y) : "l"((const void*)(X + (ta64_0 * 4 * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_8.x), "=r"(_vld_8.y) : "l"((const void*)(X + (ta64_0 * 4ll * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_8 = reinterpret_cast<uint32_t*>(&_vld_8);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -242,7 +242,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_9;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_9.x), "=r"(_vld_9.y) : "l"((const void*)(X + (ta64_0 * 4 * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_9.x), "=r"(_vld_9.y) : "l"((const void*)(X + (ta64_0 * 4ll * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_9 = reinterpret_cast<uint32_t*>(&_vld_9);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -253,7 +253,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_10;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_10.x), "=r"(_vld_10.y) : "l"((const void*)(X + (ta64_0 * 4 * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_10.x), "=r"(_vld_10.y) : "l"((const void*)(X + (ta64_0 * 4ll * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_10 = reinterpret_cast<uint32_t*>(&_vld_10);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -264,7 +264,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_11;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_11.x), "=r"(_vld_11.y) : "l"((const void*)(X + (ta64_0 * 4 * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_11.x), "=r"(_vld_11.y) : "l"((const void*)(X + (ta64_0 * 4ll * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_11 = reinterpret_cast<uint32_t*>(&_vld_11);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -275,7 +275,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_12;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_12.x), "=r"(_vld_12.y) : "l"((const void*)(X + (ta64_0 * 4 * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_12.x), "=r"(_vld_12.y) : "l"((const void*)(X + (ta64_0 * 4ll * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_12 = reinterpret_cast<uint32_t*>(&_vld_12);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -286,7 +286,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_13;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_13.x), "=r"(_vld_13.y) : "l"((const void*)(X + (ta64_0 * 4 * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_13.x), "=r"(_vld_13.y) : "l"((const void*)(X + (ta64_0 * 4ll * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_13 = reinterpret_cast<uint32_t*>(&_vld_13);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -379,7 +379,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_41;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_41.x), "=r"(_vld_41.y) : "l"((const void*)(X + ((ta64_0 * 4 + 1) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_41.x), "=r"(_vld_41.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 1ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_41 = reinterpret_cast<uint32_t*>(&_vld_41);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -390,7 +390,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_42;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_42.x), "=r"(_vld_42.y) : "l"((const void*)(X + ((ta64_0 * 4 + 1) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_42.x), "=r"(_vld_42.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 1ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_42 = reinterpret_cast<uint32_t*>(&_vld_42);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -401,7 +401,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_43;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_43.x), "=r"(_vld_43.y) : "l"((const void*)(X + ((ta64_0 * 4 + 1) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_43.x), "=r"(_vld_43.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 1ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_43 = reinterpret_cast<uint32_t*>(&_vld_43);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -412,7 +412,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_44;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_44.x), "=r"(_vld_44.y) : "l"((const void*)(X + ((ta64_0 * 4 + 1) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_44.x), "=r"(_vld_44.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 1ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_44 = reinterpret_cast<uint32_t*>(&_vld_44);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -423,7 +423,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_45;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_45.x), "=r"(_vld_45.y) : "l"((const void*)(X + ((ta64_0 * 4 + 1) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_45.x), "=r"(_vld_45.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 1ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_45 = reinterpret_cast<uint32_t*>(&_vld_45);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -434,7 +434,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_46;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_46.x), "=r"(_vld_46.y) : "l"((const void*)(X + ((ta64_0 * 4 + 1) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_46.x), "=r"(_vld_46.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 1ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_46 = reinterpret_cast<uint32_t*>(&_vld_46);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -445,7 +445,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_47;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_47.x), "=r"(_vld_47.y) : "l"((const void*)(X + ((ta64_0 * 4 + 1) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_47.x), "=r"(_vld_47.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 1ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_47 = reinterpret_cast<uint32_t*>(&_vld_47);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -538,7 +538,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_75;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_75.x), "=r"(_vld_75.y) : "l"((const void*)(X + ((ta64_0 * 4 + 2) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_75.x), "=r"(_vld_75.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 2ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_75 = reinterpret_cast<uint32_t*>(&_vld_75);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -549,7 +549,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_76;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_76.x), "=r"(_vld_76.y) : "l"((const void*)(X + ((ta64_0 * 4 + 2) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_76.x), "=r"(_vld_76.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 2ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_76 = reinterpret_cast<uint32_t*>(&_vld_76);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -560,7 +560,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_77;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_77.x), "=r"(_vld_77.y) : "l"((const void*)(X + ((ta64_0 * 4 + 2) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_77.x), "=r"(_vld_77.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 2ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_77 = reinterpret_cast<uint32_t*>(&_vld_77);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -571,7 +571,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_78;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_78.x), "=r"(_vld_78.y) : "l"((const void*)(X + ((ta64_0 * 4 + 2) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_78.x), "=r"(_vld_78.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 2ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_78 = reinterpret_cast<uint32_t*>(&_vld_78);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -582,7 +582,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_79;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_79.x), "=r"(_vld_79.y) : "l"((const void*)(X + ((ta64_0 * 4 + 2) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_79.x), "=r"(_vld_79.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 2ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_79 = reinterpret_cast<uint32_t*>(&_vld_79);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -593,7 +593,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_80;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_80.x), "=r"(_vld_80.y) : "l"((const void*)(X + ((ta64_0 * 4 + 2) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_80.x), "=r"(_vld_80.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 2ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_80 = reinterpret_cast<uint32_t*>(&_vld_80);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -604,7 +604,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_81;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_81.x), "=r"(_vld_81.y) : "l"((const void*)(X + ((ta64_0 * 4 + 2) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_81.x), "=r"(_vld_81.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 2ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_81 = reinterpret_cast<uint32_t*>(&_vld_81);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -697,7 +697,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_109;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_109.x), "=r"(_vld_109.y) : "l"((const void*)(X + ((ta64_0 * 4 + 3) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_109.x), "=r"(_vld_109.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 3ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_109 = reinterpret_cast<uint32_t*>(&_vld_109);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -708,7 +708,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_110;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_110.x), "=r"(_vld_110.y) : "l"((const void*)(X + ((ta64_0 * 4 + 3) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_110.x), "=r"(_vld_110.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 3ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_110 = reinterpret_cast<uint32_t*>(&_vld_110);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -719,7 +719,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_111;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_111.x), "=r"(_vld_111.y) : "l"((const void*)(X + ((ta64_0 * 4 + 3) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_111.x), "=r"(_vld_111.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 3ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_111 = reinterpret_cast<uint32_t*>(&_vld_111);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -730,7 +730,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_112;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_112.x), "=r"(_vld_112.y) : "l"((const void*)(X + ((ta64_0 * 4 + 3) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_112.x), "=r"(_vld_112.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 3ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_112 = reinterpret_cast<uint32_t*>(&_vld_112);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -741,7 +741,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_113;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_113.x), "=r"(_vld_113.y) : "l"((const void*)(X + ((ta64_0 * 4 + 3) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_113.x), "=r"(_vld_113.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 3ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_113 = reinterpret_cast<uint32_t*>(&_vld_113);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -752,7 +752,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_114;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_114.x), "=r"(_vld_114.y) : "l"((const void*)(X + ((ta64_0 * 4 + 3) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_114.x), "=r"(_vld_114.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 3ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_114 = reinterpret_cast<uint32_t*>(&_vld_114);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -763,7 +763,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_115;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_115.x), "=r"(_vld_115.y) : "l"((const void*)(X + ((ta64_0 * 4 + 3) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_115.x), "=r"(_vld_115.y) : "l"((const void*)(X + ((ta64_0 * 4ll + 3ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_115 = reinterpret_cast<uint32_t*>(&_vld_115);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -890,7 +890,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_149;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_149.x), "=r"(_vld_149.y) : "l"((const void*)(dU + (ta64_1 * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_149.x), "=r"(_vld_149.y) : "l"((const void*)(dU + (ta64_1 * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_149 = reinterpret_cast<uint32_t*>(&_vld_149);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -901,7 +901,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_150;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_150.x), "=r"(_vld_150.y) : "l"((const void*)(dU + (ta64_1 * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_150.x), "=r"(_vld_150.y) : "l"((const void*)(dU + (ta64_1 * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_150 = reinterpret_cast<uint32_t*>(&_vld_150);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -912,7 +912,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_151;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_151.x), "=r"(_vld_151.y) : "l"((const void*)(dU + (ta64_1 * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_151.x), "=r"(_vld_151.y) : "l"((const void*)(dU + (ta64_1 * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_151 = reinterpret_cast<uint32_t*>(&_vld_151);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -923,7 +923,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_152;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_152.x), "=r"(_vld_152.y) : "l"((const void*)(dU + (ta64_1 * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_152.x), "=r"(_vld_152.y) : "l"((const void*)(dU + (ta64_1 * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_152 = reinterpret_cast<uint32_t*>(&_vld_152);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -934,7 +934,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_153;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_153.x), "=r"(_vld_153.y) : "l"((const void*)(dU + (ta64_1 * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_153.x), "=r"(_vld_153.y) : "l"((const void*)(dU + (ta64_1 * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_153 = reinterpret_cast<uint32_t*>(&_vld_153);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -945,7 +945,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_154;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_154.x), "=r"(_vld_154.y) : "l"((const void*)(dU + (ta64_1 * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_154.x), "=r"(_vld_154.y) : "l"((const void*)(dU + (ta64_1 * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_154 = reinterpret_cast<uint32_t*>(&_vld_154);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -956,7 +956,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_155;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_155.x), "=r"(_vld_155.y) : "l"((const void*)(dU + (ta64_1 * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_155.x), "=r"(_vld_155.y) : "l"((const void*)(dU + (ta64_1 * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_155 = reinterpret_cast<uint32_t*>(&_vld_155);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -969,7 +969,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_156;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_156.x), "=r"(_vld_156.y) : "l"((const void*)(X + (ta64_1 * 4 * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_156.x), "=r"(_vld_156.y) : "l"((const void*)(X + (ta64_1 * 4ll * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_156 = reinterpret_cast<uint32_t*>(&_vld_156);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -980,7 +980,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_157;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_157.x), "=r"(_vld_157.y) : "l"((const void*)(X + (ta64_1 * 4 * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_157.x), "=r"(_vld_157.y) : "l"((const void*)(X + (ta64_1 * 4ll * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_157 = reinterpret_cast<uint32_t*>(&_vld_157);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -991,7 +991,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_158;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_158.x), "=r"(_vld_158.y) : "l"((const void*)(X + (ta64_1 * 4 * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_158.x), "=r"(_vld_158.y) : "l"((const void*)(X + (ta64_1 * 4ll * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_158 = reinterpret_cast<uint32_t*>(&_vld_158);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1002,7 +1002,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_159;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_159.x), "=r"(_vld_159.y) : "l"((const void*)(X + (ta64_1 * 4 * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_159.x), "=r"(_vld_159.y) : "l"((const void*)(X + (ta64_1 * 4ll * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_159 = reinterpret_cast<uint32_t*>(&_vld_159);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1013,7 +1013,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_160;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_160.x), "=r"(_vld_160.y) : "l"((const void*)(X + (ta64_1 * 4 * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_160.x), "=r"(_vld_160.y) : "l"((const void*)(X + (ta64_1 * 4ll * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_160 = reinterpret_cast<uint32_t*>(&_vld_160);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1024,7 +1024,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_161;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_161.x), "=r"(_vld_161.y) : "l"((const void*)(X + (ta64_1 * 4 * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_161.x), "=r"(_vld_161.y) : "l"((const void*)(X + (ta64_1 * 4ll * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_161 = reinterpret_cast<uint32_t*>(&_vld_161);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1035,7 +1035,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_162;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_162.x), "=r"(_vld_162.y) : "l"((const void*)(X + (ta64_1 * 4 * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_162.x), "=r"(_vld_162.y) : "l"((const void*)(X + (ta64_1 * 4ll * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_162 = reinterpret_cast<uint32_t*>(&_vld_162);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1128,7 +1128,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_190;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_190.x), "=r"(_vld_190.y) : "l"((const void*)(X + ((ta64_1 * 4 + 1) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_190.x), "=r"(_vld_190.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 1ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_190 = reinterpret_cast<uint32_t*>(&_vld_190);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1139,7 +1139,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_191;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_191.x), "=r"(_vld_191.y) : "l"((const void*)(X + ((ta64_1 * 4 + 1) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_191.x), "=r"(_vld_191.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 1ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_191 = reinterpret_cast<uint32_t*>(&_vld_191);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1150,7 +1150,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_192;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_192.x), "=r"(_vld_192.y) : "l"((const void*)(X + ((ta64_1 * 4 + 1) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_192.x), "=r"(_vld_192.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 1ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_192 = reinterpret_cast<uint32_t*>(&_vld_192);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1161,7 +1161,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_193;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_193.x), "=r"(_vld_193.y) : "l"((const void*)(X + ((ta64_1 * 4 + 1) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_193.x), "=r"(_vld_193.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 1ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_193 = reinterpret_cast<uint32_t*>(&_vld_193);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1172,7 +1172,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_194;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_194.x), "=r"(_vld_194.y) : "l"((const void*)(X + ((ta64_1 * 4 + 1) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_194.x), "=r"(_vld_194.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 1ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_194 = reinterpret_cast<uint32_t*>(&_vld_194);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1183,7 +1183,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_195;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_195.x), "=r"(_vld_195.y) : "l"((const void*)(X + ((ta64_1 * 4 + 1) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_195.x), "=r"(_vld_195.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 1ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_195 = reinterpret_cast<uint32_t*>(&_vld_195);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1194,7 +1194,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_196;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_196.x), "=r"(_vld_196.y) : "l"((const void*)(X + ((ta64_1 * 4 + 1) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_196.x), "=r"(_vld_196.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 1ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_196 = reinterpret_cast<uint32_t*>(&_vld_196);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1287,7 +1287,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_224;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_224.x), "=r"(_vld_224.y) : "l"((const void*)(X + ((ta64_1 * 4 + 2) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_224.x), "=r"(_vld_224.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 2ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_224 = reinterpret_cast<uint32_t*>(&_vld_224);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1298,7 +1298,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_225;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_225.x), "=r"(_vld_225.y) : "l"((const void*)(X + ((ta64_1 * 4 + 2) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_225.x), "=r"(_vld_225.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 2ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_225 = reinterpret_cast<uint32_t*>(&_vld_225);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1309,7 +1309,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_226;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_226.x), "=r"(_vld_226.y) : "l"((const void*)(X + ((ta64_1 * 4 + 2) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_226.x), "=r"(_vld_226.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 2ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_226 = reinterpret_cast<uint32_t*>(&_vld_226);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1320,7 +1320,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_227;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_227.x), "=r"(_vld_227.y) : "l"((const void*)(X + ((ta64_1 * 4 + 2) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_227.x), "=r"(_vld_227.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 2ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_227 = reinterpret_cast<uint32_t*>(&_vld_227);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1331,7 +1331,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_228;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_228.x), "=r"(_vld_228.y) : "l"((const void*)(X + ((ta64_1 * 4 + 2) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_228.x), "=r"(_vld_228.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 2ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_228 = reinterpret_cast<uint32_t*>(&_vld_228);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1342,7 +1342,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_229;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_229.x), "=r"(_vld_229.y) : "l"((const void*)(X + ((ta64_1 * 4 + 2) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_229.x), "=r"(_vld_229.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 2ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_229 = reinterpret_cast<uint32_t*>(&_vld_229);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1353,7 +1353,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_230;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_230.x), "=r"(_vld_230.y) : "l"((const void*)(X + ((ta64_1 * 4 + 2) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_230.x), "=r"(_vld_230.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 2ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_230 = reinterpret_cast<uint32_t*>(&_vld_230);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1446,7 +1446,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_258;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_258.x), "=r"(_vld_258.y) : "l"((const void*)(X + ((ta64_1 * 4 + 3) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_258.x), "=r"(_vld_258.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 3ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_258 = reinterpret_cast<uint32_t*>(&_vld_258);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1457,7 +1457,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_259;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_259.x), "=r"(_vld_259.y) : "l"((const void*)(X + ((ta64_1 * 4 + 3) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_259.x), "=r"(_vld_259.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 3ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_259 = reinterpret_cast<uint32_t*>(&_vld_259);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1468,7 +1468,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_260;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_260.x), "=r"(_vld_260.y) : "l"((const void*)(X + ((ta64_1 * 4 + 3) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_260.x), "=r"(_vld_260.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 3ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_260 = reinterpret_cast<uint32_t*>(&_vld_260);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1479,7 +1479,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_261;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_261.x), "=r"(_vld_261.y) : "l"((const void*)(X + ((ta64_1 * 4 + 3) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_261.x), "=r"(_vld_261.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 3ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_261 = reinterpret_cast<uint32_t*>(&_vld_261);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1490,7 +1490,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_262;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_262.x), "=r"(_vld_262.y) : "l"((const void*)(X + ((ta64_1 * 4 + 3) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_262.x), "=r"(_vld_262.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 3ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_262 = reinterpret_cast<uint32_t*>(&_vld_262);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1501,7 +1501,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_263;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_263.x), "=r"(_vld_263.y) : "l"((const void*)(X + ((ta64_1 * 4 + 3) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_263.x), "=r"(_vld_263.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 3ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_263 = reinterpret_cast<uint32_t*>(&_vld_263);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1512,7 +1512,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_264;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_264.x), "=r"(_vld_264.y) : "l"((const void*)(X + ((ta64_1 * 4 + 3) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_264.x), "=r"(_vld_264.y) : "l"((const void*)(X + ((ta64_1 * 4ll + 3ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_264 = reinterpret_cast<uint32_t*>(&_vld_264);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1639,7 +1639,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_298;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_298.x), "=r"(_vld_298.y) : "l"((const void*)(dU + (ta64_2 * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_298.x), "=r"(_vld_298.y) : "l"((const void*)(dU + (ta64_2 * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_298 = reinterpret_cast<uint32_t*>(&_vld_298);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1650,7 +1650,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_299;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_299.x), "=r"(_vld_299.y) : "l"((const void*)(dU + (ta64_2 * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_299.x), "=r"(_vld_299.y) : "l"((const void*)(dU + (ta64_2 * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_299 = reinterpret_cast<uint32_t*>(&_vld_299);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1661,7 +1661,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_300;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_300.x), "=r"(_vld_300.y) : "l"((const void*)(dU + (ta64_2 * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_300.x), "=r"(_vld_300.y) : "l"((const void*)(dU + (ta64_2 * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_300 = reinterpret_cast<uint32_t*>(&_vld_300);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1672,7 +1672,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_301;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_301.x), "=r"(_vld_301.y) : "l"((const void*)(dU + (ta64_2 * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_301.x), "=r"(_vld_301.y) : "l"((const void*)(dU + (ta64_2 * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_301 = reinterpret_cast<uint32_t*>(&_vld_301);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1683,7 +1683,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_302;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_302.x), "=r"(_vld_302.y) : "l"((const void*)(dU + (ta64_2 * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_302.x), "=r"(_vld_302.y) : "l"((const void*)(dU + (ta64_2 * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_302 = reinterpret_cast<uint32_t*>(&_vld_302);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1694,7 +1694,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_303;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_303.x), "=r"(_vld_303.y) : "l"((const void*)(dU + (ta64_2 * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_303.x), "=r"(_vld_303.y) : "l"((const void*)(dU + (ta64_2 * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_303 = reinterpret_cast<uint32_t*>(&_vld_303);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1705,7 +1705,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_304;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_304.x), "=r"(_vld_304.y) : "l"((const void*)(dU + (ta64_2 * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_304.x), "=r"(_vld_304.y) : "l"((const void*)(dU + (ta64_2 * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_304 = reinterpret_cast<uint32_t*>(&_vld_304);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1718,7 +1718,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_305;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_305.x), "=r"(_vld_305.y) : "l"((const void*)(X + (ta64_2 * 4 * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_305.x), "=r"(_vld_305.y) : "l"((const void*)(X + (ta64_2 * 4ll * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_305 = reinterpret_cast<uint32_t*>(&_vld_305);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1729,7 +1729,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_306;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_306.x), "=r"(_vld_306.y) : "l"((const void*)(X + (ta64_2 * 4 * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_306.x), "=r"(_vld_306.y) : "l"((const void*)(X + (ta64_2 * 4ll * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_306 = reinterpret_cast<uint32_t*>(&_vld_306);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1740,7 +1740,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_307;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_307.x), "=r"(_vld_307.y) : "l"((const void*)(X + (ta64_2 * 4 * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_307.x), "=r"(_vld_307.y) : "l"((const void*)(X + (ta64_2 * 4ll * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_307 = reinterpret_cast<uint32_t*>(&_vld_307);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1751,7 +1751,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_308;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_308.x), "=r"(_vld_308.y) : "l"((const void*)(X + (ta64_2 * 4 * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_308.x), "=r"(_vld_308.y) : "l"((const void*)(X + (ta64_2 * 4ll * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_308 = reinterpret_cast<uint32_t*>(&_vld_308);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1762,7 +1762,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_309;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_309.x), "=r"(_vld_309.y) : "l"((const void*)(X + (ta64_2 * 4 * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_309.x), "=r"(_vld_309.y) : "l"((const void*)(X + (ta64_2 * 4ll * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_309 = reinterpret_cast<uint32_t*>(&_vld_309);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1773,7 +1773,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_310;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_310.x), "=r"(_vld_310.y) : "l"((const void*)(X + (ta64_2 * 4 * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_310.x), "=r"(_vld_310.y) : "l"((const void*)(X + (ta64_2 * 4ll * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_310 = reinterpret_cast<uint32_t*>(&_vld_310);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1784,7 +1784,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_311;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_311.x), "=r"(_vld_311.y) : "l"((const void*)(X + (ta64_2 * 4 * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_311.x), "=r"(_vld_311.y) : "l"((const void*)(X + (ta64_2 * 4ll * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_311 = reinterpret_cast<uint32_t*>(&_vld_311);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1877,7 +1877,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_339;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_339.x), "=r"(_vld_339.y) : "l"((const void*)(X + ((ta64_2 * 4 + 1) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_339.x), "=r"(_vld_339.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 1ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_339 = reinterpret_cast<uint32_t*>(&_vld_339);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1888,7 +1888,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_340;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_340.x), "=r"(_vld_340.y) : "l"((const void*)(X + ((ta64_2 * 4 + 1) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_340.x), "=r"(_vld_340.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 1ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_340 = reinterpret_cast<uint32_t*>(&_vld_340);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1899,7 +1899,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_341;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_341.x), "=r"(_vld_341.y) : "l"((const void*)(X + ((ta64_2 * 4 + 1) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_341.x), "=r"(_vld_341.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 1ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_341 = reinterpret_cast<uint32_t*>(&_vld_341);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1910,7 +1910,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_342;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_342.x), "=r"(_vld_342.y) : "l"((const void*)(X + ((ta64_2 * 4 + 1) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_342.x), "=r"(_vld_342.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 1ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_342 = reinterpret_cast<uint32_t*>(&_vld_342);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1921,7 +1921,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_343;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_343.x), "=r"(_vld_343.y) : "l"((const void*)(X + ((ta64_2 * 4 + 1) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_343.x), "=r"(_vld_343.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 1ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_343 = reinterpret_cast<uint32_t*>(&_vld_343);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1932,7 +1932,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_344;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_344.x), "=r"(_vld_344.y) : "l"((const void*)(X + ((ta64_2 * 4 + 1) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_344.x), "=r"(_vld_344.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 1ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_344 = reinterpret_cast<uint32_t*>(&_vld_344);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1943,7 +1943,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_345;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_345.x), "=r"(_vld_345.y) : "l"((const void*)(X + ((ta64_2 * 4 + 1) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_345.x), "=r"(_vld_345.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 1ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_345 = reinterpret_cast<uint32_t*>(&_vld_345);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2036,7 +2036,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_373;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_373.x), "=r"(_vld_373.y) : "l"((const void*)(X + ((ta64_2 * 4 + 2) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_373.x), "=r"(_vld_373.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 2ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_373 = reinterpret_cast<uint32_t*>(&_vld_373);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2047,7 +2047,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_374;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_374.x), "=r"(_vld_374.y) : "l"((const void*)(X + ((ta64_2 * 4 + 2) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_374.x), "=r"(_vld_374.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 2ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_374 = reinterpret_cast<uint32_t*>(&_vld_374);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2058,7 +2058,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_375;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_375.x), "=r"(_vld_375.y) : "l"((const void*)(X + ((ta64_2 * 4 + 2) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_375.x), "=r"(_vld_375.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 2ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_375 = reinterpret_cast<uint32_t*>(&_vld_375);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2069,7 +2069,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_376;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_376.x), "=r"(_vld_376.y) : "l"((const void*)(X + ((ta64_2 * 4 + 2) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_376.x), "=r"(_vld_376.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 2ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_376 = reinterpret_cast<uint32_t*>(&_vld_376);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2080,7 +2080,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_377;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_377.x), "=r"(_vld_377.y) : "l"((const void*)(X + ((ta64_2 * 4 + 2) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_377.x), "=r"(_vld_377.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 2ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_377 = reinterpret_cast<uint32_t*>(&_vld_377);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2091,7 +2091,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_378;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_378.x), "=r"(_vld_378.y) : "l"((const void*)(X + ((ta64_2 * 4 + 2) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_378.x), "=r"(_vld_378.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 2ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_378 = reinterpret_cast<uint32_t*>(&_vld_378);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2102,7 +2102,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_379;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_379.x), "=r"(_vld_379.y) : "l"((const void*)(X + ((ta64_2 * 4 + 2) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_379.x), "=r"(_vld_379.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 2ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_379 = reinterpret_cast<uint32_t*>(&_vld_379);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2195,7 +2195,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_407;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_407.x), "=r"(_vld_407.y) : "l"((const void*)(X + ((ta64_2 * 4 + 3) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_407.x), "=r"(_vld_407.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 3ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_407 = reinterpret_cast<uint32_t*>(&_vld_407);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2206,7 +2206,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_408;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_408.x), "=r"(_vld_408.y) : "l"((const void*)(X + ((ta64_2 * 4 + 3) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_408.x), "=r"(_vld_408.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 3ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_408 = reinterpret_cast<uint32_t*>(&_vld_408);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2217,7 +2217,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_409;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_409.x), "=r"(_vld_409.y) : "l"((const void*)(X + ((ta64_2 * 4 + 3) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_409.x), "=r"(_vld_409.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 3ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_409 = reinterpret_cast<uint32_t*>(&_vld_409);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2228,7 +2228,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_410;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_410.x), "=r"(_vld_410.y) : "l"((const void*)(X + ((ta64_2 * 4 + 3) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_410.x), "=r"(_vld_410.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 3ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_410 = reinterpret_cast<uint32_t*>(&_vld_410);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2239,7 +2239,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_411;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_411.x), "=r"(_vld_411.y) : "l"((const void*)(X + ((ta64_2 * 4 + 3) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_411.x), "=r"(_vld_411.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 3ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_411 = reinterpret_cast<uint32_t*>(&_vld_411);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2250,7 +2250,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_412;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_412.x), "=r"(_vld_412.y) : "l"((const void*)(X + ((ta64_2 * 4 + 3) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_412.x), "=r"(_vld_412.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 3ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_412 = reinterpret_cast<uint32_t*>(&_vld_412);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2261,7 +2261,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_413;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_413.x), "=r"(_vld_413.y) : "l"((const void*)(X + ((ta64_2 * 4 + 3) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_413.x), "=r"(_vld_413.y) : "l"((const void*)(X + ((ta64_2 * 4ll + 3ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_413 = reinterpret_cast<uint32_t*>(&_vld_413);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2388,7 +2388,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_447;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_447.x), "=r"(_vld_447.y) : "l"((const void*)(dU + (ta64_3 * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_447.x), "=r"(_vld_447.y) : "l"((const void*)(dU + (ta64_3 * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_447 = reinterpret_cast<uint32_t*>(&_vld_447);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2399,7 +2399,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_448;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_448.x), "=r"(_vld_448.y) : "l"((const void*)(dU + (ta64_3 * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_448.x), "=r"(_vld_448.y) : "l"((const void*)(dU + (ta64_3 * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_448 = reinterpret_cast<uint32_t*>(&_vld_448);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2410,7 +2410,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_449;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_449.x), "=r"(_vld_449.y) : "l"((const void*)(dU + (ta64_3 * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_449.x), "=r"(_vld_449.y) : "l"((const void*)(dU + (ta64_3 * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_449 = reinterpret_cast<uint32_t*>(&_vld_449);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2421,7 +2421,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_450;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_450.x), "=r"(_vld_450.y) : "l"((const void*)(dU + (ta64_3 * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_450.x), "=r"(_vld_450.y) : "l"((const void*)(dU + (ta64_3 * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_450 = reinterpret_cast<uint32_t*>(&_vld_450);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2432,7 +2432,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_451;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_451.x), "=r"(_vld_451.y) : "l"((const void*)(dU + (ta64_3 * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_451.x), "=r"(_vld_451.y) : "l"((const void*)(dU + (ta64_3 * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_451 = reinterpret_cast<uint32_t*>(&_vld_451);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2443,7 +2443,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_452;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_452.x), "=r"(_vld_452.y) : "l"((const void*)(dU + (ta64_3 * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_452.x), "=r"(_vld_452.y) : "l"((const void*)(dU + (ta64_3 * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_452 = reinterpret_cast<uint32_t*>(&_vld_452);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2454,7 +2454,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_453;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_453.x), "=r"(_vld_453.y) : "l"((const void*)(dU + (ta64_3 * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_453.x), "=r"(_vld_453.y) : "l"((const void*)(dU + (ta64_3 * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_453 = reinterpret_cast<uint32_t*>(&_vld_453);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2467,7 +2467,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_454;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_454.x), "=r"(_vld_454.y) : "l"((const void*)(X + (ta64_3 * 4 * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_454.x), "=r"(_vld_454.y) : "l"((const void*)(X + (ta64_3 * 4ll * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_454 = reinterpret_cast<uint32_t*>(&_vld_454);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2478,7 +2478,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_455;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_455.x), "=r"(_vld_455.y) : "l"((const void*)(X + (ta64_3 * 4 * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_455.x), "=r"(_vld_455.y) : "l"((const void*)(X + (ta64_3 * 4ll * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_455 = reinterpret_cast<uint32_t*>(&_vld_455);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2489,7 +2489,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_456;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_456.x), "=r"(_vld_456.y) : "l"((const void*)(X + (ta64_3 * 4 * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_456.x), "=r"(_vld_456.y) : "l"((const void*)(X + (ta64_3 * 4ll * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_456 = reinterpret_cast<uint32_t*>(&_vld_456);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2500,7 +2500,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_457;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_457.x), "=r"(_vld_457.y) : "l"((const void*)(X + (ta64_3 * 4 * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_457.x), "=r"(_vld_457.y) : "l"((const void*)(X + (ta64_3 * 4ll * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_457 = reinterpret_cast<uint32_t*>(&_vld_457);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2511,7 +2511,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_458;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_458.x), "=r"(_vld_458.y) : "l"((const void*)(X + (ta64_3 * 4 * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_458.x), "=r"(_vld_458.y) : "l"((const void*)(X + (ta64_3 * 4ll * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_458 = reinterpret_cast<uint32_t*>(&_vld_458);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2522,7 +2522,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_459;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_459.x), "=r"(_vld_459.y) : "l"((const void*)(X + (ta64_3 * 4 * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_459.x), "=r"(_vld_459.y) : "l"((const void*)(X + (ta64_3 * 4ll * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_459 = reinterpret_cast<uint32_t*>(&_vld_459);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2533,7 +2533,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_460;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_460.x), "=r"(_vld_460.y) : "l"((const void*)(X + (ta64_3 * 4 * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_460.x), "=r"(_vld_460.y) : "l"((const void*)(X + (ta64_3 * 4ll * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_460 = reinterpret_cast<uint32_t*>(&_vld_460);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2626,7 +2626,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_488;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_488.x), "=r"(_vld_488.y) : "l"((const void*)(X + ((ta64_3 * 4 + 1) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_488.x), "=r"(_vld_488.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 1ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_488 = reinterpret_cast<uint32_t*>(&_vld_488);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2637,7 +2637,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_489;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_489.x), "=r"(_vld_489.y) : "l"((const void*)(X + ((ta64_3 * 4 + 1) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_489.x), "=r"(_vld_489.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 1ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_489 = reinterpret_cast<uint32_t*>(&_vld_489);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2648,7 +2648,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_490;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_490.x), "=r"(_vld_490.y) : "l"((const void*)(X + ((ta64_3 * 4 + 1) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_490.x), "=r"(_vld_490.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 1ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_490 = reinterpret_cast<uint32_t*>(&_vld_490);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2659,7 +2659,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_491;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_491.x), "=r"(_vld_491.y) : "l"((const void*)(X + ((ta64_3 * 4 + 1) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_491.x), "=r"(_vld_491.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 1ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_491 = reinterpret_cast<uint32_t*>(&_vld_491);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2670,7 +2670,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_492;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_492.x), "=r"(_vld_492.y) : "l"((const void*)(X + ((ta64_3 * 4 + 1) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_492.x), "=r"(_vld_492.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 1ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_492 = reinterpret_cast<uint32_t*>(&_vld_492);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2681,7 +2681,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_493;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_493.x), "=r"(_vld_493.y) : "l"((const void*)(X + ((ta64_3 * 4 + 1) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_493.x), "=r"(_vld_493.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 1ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_493 = reinterpret_cast<uint32_t*>(&_vld_493);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2692,7 +2692,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_494;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_494.x), "=r"(_vld_494.y) : "l"((const void*)(X + ((ta64_3 * 4 + 1) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_494.x), "=r"(_vld_494.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 1ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_494 = reinterpret_cast<uint32_t*>(&_vld_494);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2785,7 +2785,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_522;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_522.x), "=r"(_vld_522.y) : "l"((const void*)(X + ((ta64_3 * 4 + 2) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_522.x), "=r"(_vld_522.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 2ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_522 = reinterpret_cast<uint32_t*>(&_vld_522);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2796,7 +2796,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_523;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_523.x), "=r"(_vld_523.y) : "l"((const void*)(X + ((ta64_3 * 4 + 2) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_523.x), "=r"(_vld_523.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 2ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_523 = reinterpret_cast<uint32_t*>(&_vld_523);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2807,7 +2807,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_524;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_524.x), "=r"(_vld_524.y) : "l"((const void*)(X + ((ta64_3 * 4 + 2) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_524.x), "=r"(_vld_524.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 2ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_524 = reinterpret_cast<uint32_t*>(&_vld_524);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2818,7 +2818,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_525;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_525.x), "=r"(_vld_525.y) : "l"((const void*)(X + ((ta64_3 * 4 + 2) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_525.x), "=r"(_vld_525.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 2ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_525 = reinterpret_cast<uint32_t*>(&_vld_525);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2829,7 +2829,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_526;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_526.x), "=r"(_vld_526.y) : "l"((const void*)(X + ((ta64_3 * 4 + 2) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_526.x), "=r"(_vld_526.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 2ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_526 = reinterpret_cast<uint32_t*>(&_vld_526);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2840,7 +2840,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_527;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_527.x), "=r"(_vld_527.y) : "l"((const void*)(X + ((ta64_3 * 4 + 2) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_527.x), "=r"(_vld_527.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 2ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_527 = reinterpret_cast<uint32_t*>(&_vld_527);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2851,7 +2851,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_528;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_528.x), "=r"(_vld_528.y) : "l"((const void*)(X + ((ta64_3 * 4 + 2) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_528.x), "=r"(_vld_528.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 2ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_528 = reinterpret_cast<uint32_t*>(&_vld_528);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2944,7 +2944,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_556;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_556.x), "=r"(_vld_556.y) : "l"((const void*)(X + ((ta64_3 * 4 + 3) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_556.x), "=r"(_vld_556.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 3ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_556 = reinterpret_cast<uint32_t*>(&_vld_556);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2955,7 +2955,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_557;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_557.x), "=r"(_vld_557.y) : "l"((const void*)(X + ((ta64_3 * 4 + 3) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_557.x), "=r"(_vld_557.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 3ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_557 = reinterpret_cast<uint32_t*>(&_vld_557);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2966,7 +2966,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_558;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_558.x), "=r"(_vld_558.y) : "l"((const void*)(X + ((ta64_3 * 4 + 3) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_558.x), "=r"(_vld_558.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 3ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_558 = reinterpret_cast<uint32_t*>(&_vld_558);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2977,7 +2977,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_559;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_559.x), "=r"(_vld_559.y) : "l"((const void*)(X + ((ta64_3 * 4 + 3) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_559.x), "=r"(_vld_559.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 3ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_559 = reinterpret_cast<uint32_t*>(&_vld_559);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2988,7 +2988,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_560;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_560.x), "=r"(_vld_560.y) : "l"((const void*)(X + ((ta64_3 * 4 + 3) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_560.x), "=r"(_vld_560.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 3ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_560 = reinterpret_cast<uint32_t*>(&_vld_560);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2999,7 +2999,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_561;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_561.x), "=r"(_vld_561.y) : "l"((const void*)(X + ((ta64_3 * 4 + 3) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_561.x), "=r"(_vld_561.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 3ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_561 = reinterpret_cast<uint32_t*>(&_vld_561);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3010,7 +3010,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_562;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_562.x), "=r"(_vld_562.y) : "l"((const void*)(X + ((ta64_3 * 4 + 3) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_562.x), "=r"(_vld_562.y) : "l"((const void*)(X + ((ta64_3 * 4ll + 3ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_562 = reinterpret_cast<uint32_t*>(&_vld_562);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3137,7 +3137,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_596;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_596.x), "=r"(_vld_596.y) : "l"((const void*)(dU + (ta64_4 * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_596.x), "=r"(_vld_596.y) : "l"((const void*)(dU + (ta64_4 * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_596 = reinterpret_cast<uint32_t*>(&_vld_596);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3148,7 +3148,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_597;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_597.x), "=r"(_vld_597.y) : "l"((const void*)(dU + (ta64_4 * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_597.x), "=r"(_vld_597.y) : "l"((const void*)(dU + (ta64_4 * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_597 = reinterpret_cast<uint32_t*>(&_vld_597);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3159,7 +3159,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_598;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_598.x), "=r"(_vld_598.y) : "l"((const void*)(dU + (ta64_4 * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_598.x), "=r"(_vld_598.y) : "l"((const void*)(dU + (ta64_4 * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_598 = reinterpret_cast<uint32_t*>(&_vld_598);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3170,7 +3170,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_599;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_599.x), "=r"(_vld_599.y) : "l"((const void*)(dU + (ta64_4 * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_599.x), "=r"(_vld_599.y) : "l"((const void*)(dU + (ta64_4 * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_599 = reinterpret_cast<uint32_t*>(&_vld_599);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3181,7 +3181,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_600;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_600.x), "=r"(_vld_600.y) : "l"((const void*)(dU + (ta64_4 * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_600.x), "=r"(_vld_600.y) : "l"((const void*)(dU + (ta64_4 * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_600 = reinterpret_cast<uint32_t*>(&_vld_600);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3192,7 +3192,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_601;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_601.x), "=r"(_vld_601.y) : "l"((const void*)(dU + (ta64_4 * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_601.x), "=r"(_vld_601.y) : "l"((const void*)(dU + (ta64_4 * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_601 = reinterpret_cast<uint32_t*>(&_vld_601);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3203,7 +3203,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_602;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_602.x), "=r"(_vld_602.y) : "l"((const void*)(dU + (ta64_4 * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_602.x), "=r"(_vld_602.y) : "l"((const void*)(dU + (ta64_4 * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_602 = reinterpret_cast<uint32_t*>(&_vld_602);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3216,7 +3216,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_603;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_603.x), "=r"(_vld_603.y) : "l"((const void*)(X + (ta64_4 * 4 * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_603.x), "=r"(_vld_603.y) : "l"((const void*)(X + (ta64_4 * 4ll * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_603 = reinterpret_cast<uint32_t*>(&_vld_603);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3227,7 +3227,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_604;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_604.x), "=r"(_vld_604.y) : "l"((const void*)(X + (ta64_4 * 4 * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_604.x), "=r"(_vld_604.y) : "l"((const void*)(X + (ta64_4 * 4ll * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_604 = reinterpret_cast<uint32_t*>(&_vld_604);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3238,7 +3238,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_605;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_605.x), "=r"(_vld_605.y) : "l"((const void*)(X + (ta64_4 * 4 * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_605.x), "=r"(_vld_605.y) : "l"((const void*)(X + (ta64_4 * 4ll * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_605 = reinterpret_cast<uint32_t*>(&_vld_605);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3249,7 +3249,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_606;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_606.x), "=r"(_vld_606.y) : "l"((const void*)(X + (ta64_4 * 4 * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_606.x), "=r"(_vld_606.y) : "l"((const void*)(X + (ta64_4 * 4ll * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_606 = reinterpret_cast<uint32_t*>(&_vld_606);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3260,7 +3260,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_607;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_607.x), "=r"(_vld_607.y) : "l"((const void*)(X + (ta64_4 * 4 * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_607.x), "=r"(_vld_607.y) : "l"((const void*)(X + (ta64_4 * 4ll * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_607 = reinterpret_cast<uint32_t*>(&_vld_607);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3271,7 +3271,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_608;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_608.x), "=r"(_vld_608.y) : "l"((const void*)(X + (ta64_4 * 4 * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_608.x), "=r"(_vld_608.y) : "l"((const void*)(X + (ta64_4 * 4ll * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_608 = reinterpret_cast<uint32_t*>(&_vld_608);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3282,7 +3282,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_609;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_609.x), "=r"(_vld_609.y) : "l"((const void*)(X + (ta64_4 * 4 * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_609.x), "=r"(_vld_609.y) : "l"((const void*)(X + (ta64_4 * 4ll * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_609 = reinterpret_cast<uint32_t*>(&_vld_609);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3375,7 +3375,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_637;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_637.x), "=r"(_vld_637.y) : "l"((const void*)(X + ((ta64_4 * 4 + 1) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_637.x), "=r"(_vld_637.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 1ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_637 = reinterpret_cast<uint32_t*>(&_vld_637);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3386,7 +3386,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_638;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_638.x), "=r"(_vld_638.y) : "l"((const void*)(X + ((ta64_4 * 4 + 1) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_638.x), "=r"(_vld_638.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 1ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_638 = reinterpret_cast<uint32_t*>(&_vld_638);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3397,7 +3397,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_639;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_639.x), "=r"(_vld_639.y) : "l"((const void*)(X + ((ta64_4 * 4 + 1) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_639.x), "=r"(_vld_639.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 1ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_639 = reinterpret_cast<uint32_t*>(&_vld_639);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3408,7 +3408,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_640;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_640.x), "=r"(_vld_640.y) : "l"((const void*)(X + ((ta64_4 * 4 + 1) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_640.x), "=r"(_vld_640.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 1ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_640 = reinterpret_cast<uint32_t*>(&_vld_640);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3419,7 +3419,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_641;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_641.x), "=r"(_vld_641.y) : "l"((const void*)(X + ((ta64_4 * 4 + 1) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_641.x), "=r"(_vld_641.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 1ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_641 = reinterpret_cast<uint32_t*>(&_vld_641);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3430,7 +3430,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_642;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_642.x), "=r"(_vld_642.y) : "l"((const void*)(X + ((ta64_4 * 4 + 1) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_642.x), "=r"(_vld_642.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 1ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_642 = reinterpret_cast<uint32_t*>(&_vld_642);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3441,7 +3441,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_643;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_643.x), "=r"(_vld_643.y) : "l"((const void*)(X + ((ta64_4 * 4 + 1) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_643.x), "=r"(_vld_643.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 1ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_643 = reinterpret_cast<uint32_t*>(&_vld_643);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3534,7 +3534,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_671;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_671.x), "=r"(_vld_671.y) : "l"((const void*)(X + ((ta64_4 * 4 + 2) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_671.x), "=r"(_vld_671.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 2ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_671 = reinterpret_cast<uint32_t*>(&_vld_671);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3545,7 +3545,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_672;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_672.x), "=r"(_vld_672.y) : "l"((const void*)(X + ((ta64_4 * 4 + 2) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_672.x), "=r"(_vld_672.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 2ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_672 = reinterpret_cast<uint32_t*>(&_vld_672);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3556,7 +3556,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_673;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_673.x), "=r"(_vld_673.y) : "l"((const void*)(X + ((ta64_4 * 4 + 2) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_673.x), "=r"(_vld_673.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 2ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_673 = reinterpret_cast<uint32_t*>(&_vld_673);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3567,7 +3567,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_674;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_674.x), "=r"(_vld_674.y) : "l"((const void*)(X + ((ta64_4 * 4 + 2) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_674.x), "=r"(_vld_674.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 2ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_674 = reinterpret_cast<uint32_t*>(&_vld_674);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3578,7 +3578,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_675;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_675.x), "=r"(_vld_675.y) : "l"((const void*)(X + ((ta64_4 * 4 + 2) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_675.x), "=r"(_vld_675.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 2ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_675 = reinterpret_cast<uint32_t*>(&_vld_675);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3589,7 +3589,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_676;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_676.x), "=r"(_vld_676.y) : "l"((const void*)(X + ((ta64_4 * 4 + 2) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_676.x), "=r"(_vld_676.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 2ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_676 = reinterpret_cast<uint32_t*>(&_vld_676);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3600,7 +3600,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_677;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_677.x), "=r"(_vld_677.y) : "l"((const void*)(X + ((ta64_4 * 4 + 2) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_677.x), "=r"(_vld_677.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 2ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_677 = reinterpret_cast<uint32_t*>(&_vld_677);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3693,7 +3693,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_705;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_705.x), "=r"(_vld_705.y) : "l"((const void*)(X + ((ta64_4 * 4 + 3) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_705.x), "=r"(_vld_705.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 3ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_705 = reinterpret_cast<uint32_t*>(&_vld_705);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3704,7 +3704,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_706;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_706.x), "=r"(_vld_706.y) : "l"((const void*)(X + ((ta64_4 * 4 + 3) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_706.x), "=r"(_vld_706.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 3ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_706 = reinterpret_cast<uint32_t*>(&_vld_706);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3715,7 +3715,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_707;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_707.x), "=r"(_vld_707.y) : "l"((const void*)(X + ((ta64_4 * 4 + 3) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_707.x), "=r"(_vld_707.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 3ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_707 = reinterpret_cast<uint32_t*>(&_vld_707);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3726,7 +3726,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_708;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_708.x), "=r"(_vld_708.y) : "l"((const void*)(X + ((ta64_4 * 4 + 3) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_708.x), "=r"(_vld_708.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 3ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_708 = reinterpret_cast<uint32_t*>(&_vld_708);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3737,7 +3737,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_709;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_709.x), "=r"(_vld_709.y) : "l"((const void*)(X + ((ta64_4 * 4 + 3) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_709.x), "=r"(_vld_709.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 3ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_709 = reinterpret_cast<uint32_t*>(&_vld_709);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3748,7 +3748,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_710;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_710.x), "=r"(_vld_710.y) : "l"((const void*)(X + ((ta64_4 * 4 + 3) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_710.x), "=r"(_vld_710.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 3ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_710 = reinterpret_cast<uint32_t*>(&_vld_710);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3759,7 +3759,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_711;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_711.x), "=r"(_vld_711.y) : "l"((const void*)(X + ((ta64_4 * 4 + 3) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_711.x), "=r"(_vld_711.y) : "l"((const void*)(X + ((ta64_4 * 4ll + 3ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_711 = reinterpret_cast<uint32_t*>(&_vld_711);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3886,7 +3886,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_745;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_745.x), "=r"(_vld_745.y) : "l"((const void*)(dU + (ta64_5 * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_745.x), "=r"(_vld_745.y) : "l"((const void*)(dU + (ta64_5 * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_745 = reinterpret_cast<uint32_t*>(&_vld_745);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3897,7 +3897,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_746;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_746.x), "=r"(_vld_746.y) : "l"((const void*)(dU + (ta64_5 * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_746.x), "=r"(_vld_746.y) : "l"((const void*)(dU + (ta64_5 * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_746 = reinterpret_cast<uint32_t*>(&_vld_746);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3908,7 +3908,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_747;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_747.x), "=r"(_vld_747.y) : "l"((const void*)(dU + (ta64_5 * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_747.x), "=r"(_vld_747.y) : "l"((const void*)(dU + (ta64_5 * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_747 = reinterpret_cast<uint32_t*>(&_vld_747);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3919,7 +3919,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_748;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_748.x), "=r"(_vld_748.y) : "l"((const void*)(dU + (ta64_5 * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_748.x), "=r"(_vld_748.y) : "l"((const void*)(dU + (ta64_5 * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_748 = reinterpret_cast<uint32_t*>(&_vld_748);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3930,7 +3930,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_749;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_749.x), "=r"(_vld_749.y) : "l"((const void*)(dU + (ta64_5 * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_749.x), "=r"(_vld_749.y) : "l"((const void*)(dU + (ta64_5 * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_749 = reinterpret_cast<uint32_t*>(&_vld_749);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3941,7 +3941,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_750;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_750.x), "=r"(_vld_750.y) : "l"((const void*)(dU + (ta64_5 * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_750.x), "=r"(_vld_750.y) : "l"((const void*)(dU + (ta64_5 * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_750 = reinterpret_cast<uint32_t*>(&_vld_750);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3952,7 +3952,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_751;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_751.x), "=r"(_vld_751.y) : "l"((const void*)(dU + (ta64_5 * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_751.x), "=r"(_vld_751.y) : "l"((const void*)(dU + (ta64_5 * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_751 = reinterpret_cast<uint32_t*>(&_vld_751);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3965,7 +3965,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_752;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_752.x), "=r"(_vld_752.y) : "l"((const void*)(X + (ta64_5 * 4 * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_752.x), "=r"(_vld_752.y) : "l"((const void*)(X + (ta64_5 * 4ll * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_752 = reinterpret_cast<uint32_t*>(&_vld_752);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3976,7 +3976,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_753;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_753.x), "=r"(_vld_753.y) : "l"((const void*)(X + (ta64_5 * 4 * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_753.x), "=r"(_vld_753.y) : "l"((const void*)(X + (ta64_5 * 4ll * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_753 = reinterpret_cast<uint32_t*>(&_vld_753);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3987,7 +3987,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_754;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_754.x), "=r"(_vld_754.y) : "l"((const void*)(X + (ta64_5 * 4 * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_754.x), "=r"(_vld_754.y) : "l"((const void*)(X + (ta64_5 * 4ll * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_754 = reinterpret_cast<uint32_t*>(&_vld_754);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3998,7 +3998,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_755;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_755.x), "=r"(_vld_755.y) : "l"((const void*)(X + (ta64_5 * 4 * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_755.x), "=r"(_vld_755.y) : "l"((const void*)(X + (ta64_5 * 4ll * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_755 = reinterpret_cast<uint32_t*>(&_vld_755);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4009,7 +4009,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_756;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_756.x), "=r"(_vld_756.y) : "l"((const void*)(X + (ta64_5 * 4 * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_756.x), "=r"(_vld_756.y) : "l"((const void*)(X + (ta64_5 * 4ll * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_756 = reinterpret_cast<uint32_t*>(&_vld_756);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4020,7 +4020,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_757;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_757.x), "=r"(_vld_757.y) : "l"((const void*)(X + (ta64_5 * 4 * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_757.x), "=r"(_vld_757.y) : "l"((const void*)(X + (ta64_5 * 4ll * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_757 = reinterpret_cast<uint32_t*>(&_vld_757);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4031,7 +4031,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_758;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_758.x), "=r"(_vld_758.y) : "l"((const void*)(X + (ta64_5 * 4 * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_758.x), "=r"(_vld_758.y) : "l"((const void*)(X + (ta64_5 * 4ll * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_758 = reinterpret_cast<uint32_t*>(&_vld_758);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4124,7 +4124,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_786;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_786.x), "=r"(_vld_786.y) : "l"((const void*)(X + ((ta64_5 * 4 + 1) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_786.x), "=r"(_vld_786.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 1ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_786 = reinterpret_cast<uint32_t*>(&_vld_786);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4135,7 +4135,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_787;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_787.x), "=r"(_vld_787.y) : "l"((const void*)(X + ((ta64_5 * 4 + 1) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_787.x), "=r"(_vld_787.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 1ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_787 = reinterpret_cast<uint32_t*>(&_vld_787);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4146,7 +4146,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_788;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_788.x), "=r"(_vld_788.y) : "l"((const void*)(X + ((ta64_5 * 4 + 1) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_788.x), "=r"(_vld_788.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 1ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_788 = reinterpret_cast<uint32_t*>(&_vld_788);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4157,7 +4157,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_789;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_789.x), "=r"(_vld_789.y) : "l"((const void*)(X + ((ta64_5 * 4 + 1) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_789.x), "=r"(_vld_789.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 1ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_789 = reinterpret_cast<uint32_t*>(&_vld_789);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4168,7 +4168,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_790;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_790.x), "=r"(_vld_790.y) : "l"((const void*)(X + ((ta64_5 * 4 + 1) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_790.x), "=r"(_vld_790.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 1ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_790 = reinterpret_cast<uint32_t*>(&_vld_790);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4179,7 +4179,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_791;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_791.x), "=r"(_vld_791.y) : "l"((const void*)(X + ((ta64_5 * 4 + 1) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_791.x), "=r"(_vld_791.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 1ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_791 = reinterpret_cast<uint32_t*>(&_vld_791);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4190,7 +4190,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_792;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_792.x), "=r"(_vld_792.y) : "l"((const void*)(X + ((ta64_5 * 4 + 1) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_792.x), "=r"(_vld_792.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 1ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_792 = reinterpret_cast<uint32_t*>(&_vld_792);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4283,7 +4283,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_820;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_820.x), "=r"(_vld_820.y) : "l"((const void*)(X + ((ta64_5 * 4 + 2) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_820.x), "=r"(_vld_820.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 2ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_820 = reinterpret_cast<uint32_t*>(&_vld_820);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4294,7 +4294,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_821;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_821.x), "=r"(_vld_821.y) : "l"((const void*)(X + ((ta64_5 * 4 + 2) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_821.x), "=r"(_vld_821.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 2ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_821 = reinterpret_cast<uint32_t*>(&_vld_821);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4305,7 +4305,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_822;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_822.x), "=r"(_vld_822.y) : "l"((const void*)(X + ((ta64_5 * 4 + 2) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_822.x), "=r"(_vld_822.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 2ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_822 = reinterpret_cast<uint32_t*>(&_vld_822);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4316,7 +4316,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_823;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_823.x), "=r"(_vld_823.y) : "l"((const void*)(X + ((ta64_5 * 4 + 2) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_823.x), "=r"(_vld_823.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 2ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_823 = reinterpret_cast<uint32_t*>(&_vld_823);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4327,7 +4327,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_824;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_824.x), "=r"(_vld_824.y) : "l"((const void*)(X + ((ta64_5 * 4 + 2) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_824.x), "=r"(_vld_824.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 2ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_824 = reinterpret_cast<uint32_t*>(&_vld_824);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4338,7 +4338,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_825;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_825.x), "=r"(_vld_825.y) : "l"((const void*)(X + ((ta64_5 * 4 + 2) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_825.x), "=r"(_vld_825.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 2ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_825 = reinterpret_cast<uint32_t*>(&_vld_825);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4349,7 +4349,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_826;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_826.x), "=r"(_vld_826.y) : "l"((const void*)(X + ((ta64_5 * 4 + 2) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_826.x), "=r"(_vld_826.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 2ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_826 = reinterpret_cast<uint32_t*>(&_vld_826);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4442,7 +4442,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_854;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_854.x), "=r"(_vld_854.y) : "l"((const void*)(X + ((ta64_5 * 4 + 3) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_854.x), "=r"(_vld_854.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 3ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_854 = reinterpret_cast<uint32_t*>(&_vld_854);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4453,7 +4453,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_855;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_855.x), "=r"(_vld_855.y) : "l"((const void*)(X + ((ta64_5 * 4 + 3) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_855.x), "=r"(_vld_855.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 3ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_855 = reinterpret_cast<uint32_t*>(&_vld_855);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4464,7 +4464,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_856;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_856.x), "=r"(_vld_856.y) : "l"((const void*)(X + ((ta64_5 * 4 + 3) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_856.x), "=r"(_vld_856.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 3ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_856 = reinterpret_cast<uint32_t*>(&_vld_856);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4475,7 +4475,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_857;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_857.x), "=r"(_vld_857.y) : "l"((const void*)(X + ((ta64_5 * 4 + 3) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_857.x), "=r"(_vld_857.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 3ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_857 = reinterpret_cast<uint32_t*>(&_vld_857);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4486,7 +4486,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_858;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_858.x), "=r"(_vld_858.y) : "l"((const void*)(X + ((ta64_5 * 4 + 3) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_858.x), "=r"(_vld_858.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 3ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_858 = reinterpret_cast<uint32_t*>(&_vld_858);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4497,7 +4497,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_859;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_859.x), "=r"(_vld_859.y) : "l"((const void*)(X + ((ta64_5 * 4 + 3) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_859.x), "=r"(_vld_859.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 3ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_859 = reinterpret_cast<uint32_t*>(&_vld_859);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4508,7 +4508,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_860;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_860.x), "=r"(_vld_860.y) : "l"((const void*)(X + ((ta64_5 * 4 + 3) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_860.x), "=r"(_vld_860.y) : "l"((const void*)(X + ((ta64_5 * 4ll + 3ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_860 = reinterpret_cast<uint32_t*>(&_vld_860);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4635,7 +4635,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_894;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_894.x), "=r"(_vld_894.y) : "l"((const void*)(dU + (ta64_6 * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_894.x), "=r"(_vld_894.y) : "l"((const void*)(dU + (ta64_6 * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_894 = reinterpret_cast<uint32_t*>(&_vld_894);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4646,7 +4646,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_895;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_895.x), "=r"(_vld_895.y) : "l"((const void*)(dU + (ta64_6 * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_895.x), "=r"(_vld_895.y) : "l"((const void*)(dU + (ta64_6 * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_895 = reinterpret_cast<uint32_t*>(&_vld_895);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4657,7 +4657,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_896;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_896.x), "=r"(_vld_896.y) : "l"((const void*)(dU + (ta64_6 * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_896.x), "=r"(_vld_896.y) : "l"((const void*)(dU + (ta64_6 * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_896 = reinterpret_cast<uint32_t*>(&_vld_896);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4668,7 +4668,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_897;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_897.x), "=r"(_vld_897.y) : "l"((const void*)(dU + (ta64_6 * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_897.x), "=r"(_vld_897.y) : "l"((const void*)(dU + (ta64_6 * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_897 = reinterpret_cast<uint32_t*>(&_vld_897);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4679,7 +4679,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_898;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_898.x), "=r"(_vld_898.y) : "l"((const void*)(dU + (ta64_6 * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_898.x), "=r"(_vld_898.y) : "l"((const void*)(dU + (ta64_6 * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_898 = reinterpret_cast<uint32_t*>(&_vld_898);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4690,7 +4690,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_899;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_899.x), "=r"(_vld_899.y) : "l"((const void*)(dU + (ta64_6 * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_899.x), "=r"(_vld_899.y) : "l"((const void*)(dU + (ta64_6 * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_899 = reinterpret_cast<uint32_t*>(&_vld_899);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4701,7 +4701,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_900;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_900.x), "=r"(_vld_900.y) : "l"((const void*)(dU + (ta64_6 * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_900.x), "=r"(_vld_900.y) : "l"((const void*)(dU + (ta64_6 * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_900 = reinterpret_cast<uint32_t*>(&_vld_900);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4714,7 +4714,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_901;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_901.x), "=r"(_vld_901.y) : "l"((const void*)(X + (ta64_6 * 4 * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_901.x), "=r"(_vld_901.y) : "l"((const void*)(X + (ta64_6 * 4ll * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_901 = reinterpret_cast<uint32_t*>(&_vld_901);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4725,7 +4725,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_902;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_902.x), "=r"(_vld_902.y) : "l"((const void*)(X + (ta64_6 * 4 * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_902.x), "=r"(_vld_902.y) : "l"((const void*)(X + (ta64_6 * 4ll * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_902 = reinterpret_cast<uint32_t*>(&_vld_902);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4736,7 +4736,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_903;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_903.x), "=r"(_vld_903.y) : "l"((const void*)(X + (ta64_6 * 4 * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_903.x), "=r"(_vld_903.y) : "l"((const void*)(X + (ta64_6 * 4ll * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_903 = reinterpret_cast<uint32_t*>(&_vld_903);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4747,7 +4747,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_904;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_904.x), "=r"(_vld_904.y) : "l"((const void*)(X + (ta64_6 * 4 * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_904.x), "=r"(_vld_904.y) : "l"((const void*)(X + (ta64_6 * 4ll * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_904 = reinterpret_cast<uint32_t*>(&_vld_904);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4758,7 +4758,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_905;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_905.x), "=r"(_vld_905.y) : "l"((const void*)(X + (ta64_6 * 4 * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_905.x), "=r"(_vld_905.y) : "l"((const void*)(X + (ta64_6 * 4ll * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_905 = reinterpret_cast<uint32_t*>(&_vld_905);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4769,7 +4769,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_906;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_906.x), "=r"(_vld_906.y) : "l"((const void*)(X + (ta64_6 * 4 * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_906.x), "=r"(_vld_906.y) : "l"((const void*)(X + (ta64_6 * 4ll * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_906 = reinterpret_cast<uint32_t*>(&_vld_906);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4780,7 +4780,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_907;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_907.x), "=r"(_vld_907.y) : "l"((const void*)(X + (ta64_6 * 4 * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_907.x), "=r"(_vld_907.y) : "l"((const void*)(X + (ta64_6 * 4ll * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_907 = reinterpret_cast<uint32_t*>(&_vld_907);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4873,7 +4873,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_935;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_935.x), "=r"(_vld_935.y) : "l"((const void*)(X + ((ta64_6 * 4 + 1) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_935.x), "=r"(_vld_935.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 1ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_935 = reinterpret_cast<uint32_t*>(&_vld_935);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4884,7 +4884,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_936;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_936.x), "=r"(_vld_936.y) : "l"((const void*)(X + ((ta64_6 * 4 + 1) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_936.x), "=r"(_vld_936.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 1ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_936 = reinterpret_cast<uint32_t*>(&_vld_936);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4895,7 +4895,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_937;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_937.x), "=r"(_vld_937.y) : "l"((const void*)(X + ((ta64_6 * 4 + 1) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_937.x), "=r"(_vld_937.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 1ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_937 = reinterpret_cast<uint32_t*>(&_vld_937);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4906,7 +4906,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_938;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_938.x), "=r"(_vld_938.y) : "l"((const void*)(X + ((ta64_6 * 4 + 1) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_938.x), "=r"(_vld_938.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 1ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_938 = reinterpret_cast<uint32_t*>(&_vld_938);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4917,7 +4917,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_939;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_939.x), "=r"(_vld_939.y) : "l"((const void*)(X + ((ta64_6 * 4 + 1) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_939.x), "=r"(_vld_939.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 1ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_939 = reinterpret_cast<uint32_t*>(&_vld_939);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4928,7 +4928,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_940;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_940.x), "=r"(_vld_940.y) : "l"((const void*)(X + ((ta64_6 * 4 + 1) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_940.x), "=r"(_vld_940.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 1ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_940 = reinterpret_cast<uint32_t*>(&_vld_940);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -4939,7 +4939,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_941;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_941.x), "=r"(_vld_941.y) : "l"((const void*)(X + ((ta64_6 * 4 + 1) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_941.x), "=r"(_vld_941.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 1ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_941 = reinterpret_cast<uint32_t*>(&_vld_941);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5032,7 +5032,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_969;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_969.x), "=r"(_vld_969.y) : "l"((const void*)(X + ((ta64_6 * 4 + 2) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_969.x), "=r"(_vld_969.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 2ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_969 = reinterpret_cast<uint32_t*>(&_vld_969);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5043,7 +5043,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_970;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_970.x), "=r"(_vld_970.y) : "l"((const void*)(X + ((ta64_6 * 4 + 2) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_970.x), "=r"(_vld_970.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 2ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_970 = reinterpret_cast<uint32_t*>(&_vld_970);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5054,7 +5054,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_971;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_971.x), "=r"(_vld_971.y) : "l"((const void*)(X + ((ta64_6 * 4 + 2) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_971.x), "=r"(_vld_971.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 2ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_971 = reinterpret_cast<uint32_t*>(&_vld_971);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5065,7 +5065,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_972;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_972.x), "=r"(_vld_972.y) : "l"((const void*)(X + ((ta64_6 * 4 + 2) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_972.x), "=r"(_vld_972.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 2ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_972 = reinterpret_cast<uint32_t*>(&_vld_972);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5076,7 +5076,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_973;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_973.x), "=r"(_vld_973.y) : "l"((const void*)(X + ((ta64_6 * 4 + 2) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_973.x), "=r"(_vld_973.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 2ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_973 = reinterpret_cast<uint32_t*>(&_vld_973);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5087,7 +5087,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_974;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_974.x), "=r"(_vld_974.y) : "l"((const void*)(X + ((ta64_6 * 4 + 2) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_974.x), "=r"(_vld_974.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 2ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_974 = reinterpret_cast<uint32_t*>(&_vld_974);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5098,7 +5098,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_975;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_975.x), "=r"(_vld_975.y) : "l"((const void*)(X + ((ta64_6 * 4 + 2) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_975.x), "=r"(_vld_975.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 2ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_975 = reinterpret_cast<uint32_t*>(&_vld_975);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5191,7 +5191,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1003;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1003.x), "=r"(_vld_1003.y) : "l"((const void*)(X + ((ta64_6 * 4 + 3) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1003.x), "=r"(_vld_1003.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 3ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1003 = reinterpret_cast<uint32_t*>(&_vld_1003);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5202,7 +5202,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1004;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1004.x), "=r"(_vld_1004.y) : "l"((const void*)(X + ((ta64_6 * 4 + 3) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1004.x), "=r"(_vld_1004.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 3ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1004 = reinterpret_cast<uint32_t*>(&_vld_1004);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5213,7 +5213,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1005;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1005.x), "=r"(_vld_1005.y) : "l"((const void*)(X + ((ta64_6 * 4 + 3) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1005.x), "=r"(_vld_1005.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 3ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1005 = reinterpret_cast<uint32_t*>(&_vld_1005);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5224,7 +5224,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1006;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1006.x), "=r"(_vld_1006.y) : "l"((const void*)(X + ((ta64_6 * 4 + 3) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1006.x), "=r"(_vld_1006.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 3ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1006 = reinterpret_cast<uint32_t*>(&_vld_1006);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5235,7 +5235,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1007;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1007.x), "=r"(_vld_1007.y) : "l"((const void*)(X + ((ta64_6 * 4 + 3) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1007.x), "=r"(_vld_1007.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 3ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1007 = reinterpret_cast<uint32_t*>(&_vld_1007);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5246,7 +5246,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1008;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1008.x), "=r"(_vld_1008.y) : "l"((const void*)(X + ((ta64_6 * 4 + 3) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1008.x), "=r"(_vld_1008.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 3ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1008 = reinterpret_cast<uint32_t*>(&_vld_1008);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5257,7 +5257,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1009;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1009.x), "=r"(_vld_1009.y) : "l"((const void*)(X + ((ta64_6 * 4 + 3) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1009.x), "=r"(_vld_1009.y) : "l"((const void*)(X + ((ta64_6 * 4ll + 3ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1009 = reinterpret_cast<uint32_t*>(&_vld_1009);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5384,7 +5384,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1043;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1043.x), "=r"(_vld_1043.y) : "l"((const void*)(dU + (ta64_7 * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1043.x), "=r"(_vld_1043.y) : "l"((const void*)(dU + (ta64_7 * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1043 = reinterpret_cast<uint32_t*>(&_vld_1043);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5395,7 +5395,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1044;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1044.x), "=r"(_vld_1044.y) : "l"((const void*)(dU + (ta64_7 * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1044.x), "=r"(_vld_1044.y) : "l"((const void*)(dU + (ta64_7 * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1044 = reinterpret_cast<uint32_t*>(&_vld_1044);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5406,7 +5406,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1045;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1045.x), "=r"(_vld_1045.y) : "l"((const void*)(dU + (ta64_7 * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1045.x), "=r"(_vld_1045.y) : "l"((const void*)(dU + (ta64_7 * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1045 = reinterpret_cast<uint32_t*>(&_vld_1045);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5417,7 +5417,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1046;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1046.x), "=r"(_vld_1046.y) : "l"((const void*)(dU + (ta64_7 * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1046.x), "=r"(_vld_1046.y) : "l"((const void*)(dU + (ta64_7 * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1046 = reinterpret_cast<uint32_t*>(&_vld_1046);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5428,7 +5428,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1047;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1047.x), "=r"(_vld_1047.y) : "l"((const void*)(dU + (ta64_7 * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1047.x), "=r"(_vld_1047.y) : "l"((const void*)(dU + (ta64_7 * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1047 = reinterpret_cast<uint32_t*>(&_vld_1047);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5439,7 +5439,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1048;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1048.x), "=r"(_vld_1048.y) : "l"((const void*)(dU + (ta64_7 * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1048.x), "=r"(_vld_1048.y) : "l"((const void*)(dU + (ta64_7 * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1048 = reinterpret_cast<uint32_t*>(&_vld_1048);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5450,7 +5450,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1049;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1049.x), "=r"(_vld_1049.y) : "l"((const void*)(dU + (ta64_7 * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1049.x), "=r"(_vld_1049.y) : "l"((const void*)(dU + (ta64_7 * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1049 = reinterpret_cast<uint32_t*>(&_vld_1049);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5463,7 +5463,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1050;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1050.x), "=r"(_vld_1050.y) : "l"((const void*)(X + (ta64_7 * 4 * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1050.x), "=r"(_vld_1050.y) : "l"((const void*)(X + (ta64_7 * 4ll * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1050 = reinterpret_cast<uint32_t*>(&_vld_1050);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5474,7 +5474,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1051;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1051.x), "=r"(_vld_1051.y) : "l"((const void*)(X + (ta64_7 * 4 * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1051.x), "=r"(_vld_1051.y) : "l"((const void*)(X + (ta64_7 * 4ll * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1051 = reinterpret_cast<uint32_t*>(&_vld_1051);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5485,7 +5485,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1052;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1052.x), "=r"(_vld_1052.y) : "l"((const void*)(X + (ta64_7 * 4 * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1052.x), "=r"(_vld_1052.y) : "l"((const void*)(X + (ta64_7 * 4ll * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1052 = reinterpret_cast<uint32_t*>(&_vld_1052);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5496,7 +5496,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1053;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1053.x), "=r"(_vld_1053.y) : "l"((const void*)(X + (ta64_7 * 4 * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1053.x), "=r"(_vld_1053.y) : "l"((const void*)(X + (ta64_7 * 4ll * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1053 = reinterpret_cast<uint32_t*>(&_vld_1053);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5507,7 +5507,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1054;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1054.x), "=r"(_vld_1054.y) : "l"((const void*)(X + (ta64_7 * 4 * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1054.x), "=r"(_vld_1054.y) : "l"((const void*)(X + (ta64_7 * 4ll * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1054 = reinterpret_cast<uint32_t*>(&_vld_1054);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5518,7 +5518,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1055;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1055.x), "=r"(_vld_1055.y) : "l"((const void*)(X + (ta64_7 * 4 * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1055.x), "=r"(_vld_1055.y) : "l"((const void*)(X + (ta64_7 * 4ll * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1055 = reinterpret_cast<uint32_t*>(&_vld_1055);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5529,7 +5529,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1056;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1056.x), "=r"(_vld_1056.y) : "l"((const void*)(X + (ta64_7 * 4 * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1056.x), "=r"(_vld_1056.y) : "l"((const void*)(X + (ta64_7 * 4ll * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1056 = reinterpret_cast<uint32_t*>(&_vld_1056);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5622,7 +5622,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1084;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1084.x), "=r"(_vld_1084.y) : "l"((const void*)(X + ((ta64_7 * 4 + 1) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1084.x), "=r"(_vld_1084.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 1ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1084 = reinterpret_cast<uint32_t*>(&_vld_1084);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5633,7 +5633,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1085;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1085.x), "=r"(_vld_1085.y) : "l"((const void*)(X + ((ta64_7 * 4 + 1) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1085.x), "=r"(_vld_1085.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 1ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1085 = reinterpret_cast<uint32_t*>(&_vld_1085);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5644,7 +5644,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1086;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1086.x), "=r"(_vld_1086.y) : "l"((const void*)(X + ((ta64_7 * 4 + 1) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1086.x), "=r"(_vld_1086.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 1ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1086 = reinterpret_cast<uint32_t*>(&_vld_1086);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5655,7 +5655,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1087;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1087.x), "=r"(_vld_1087.y) : "l"((const void*)(X + ((ta64_7 * 4 + 1) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1087.x), "=r"(_vld_1087.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 1ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1087 = reinterpret_cast<uint32_t*>(&_vld_1087);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5666,7 +5666,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1088;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1088.x), "=r"(_vld_1088.y) : "l"((const void*)(X + ((ta64_7 * 4 + 1) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1088.x), "=r"(_vld_1088.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 1ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1088 = reinterpret_cast<uint32_t*>(&_vld_1088);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5677,7 +5677,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1089;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1089.x), "=r"(_vld_1089.y) : "l"((const void*)(X + ((ta64_7 * 4 + 1) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1089.x), "=r"(_vld_1089.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 1ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1089 = reinterpret_cast<uint32_t*>(&_vld_1089);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5688,7 +5688,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1090;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1090.x), "=r"(_vld_1090.y) : "l"((const void*)(X + ((ta64_7 * 4 + 1) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1090.x), "=r"(_vld_1090.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 1ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1090 = reinterpret_cast<uint32_t*>(&_vld_1090);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5781,7 +5781,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1118;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1118.x), "=r"(_vld_1118.y) : "l"((const void*)(X + ((ta64_7 * 4 + 2) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1118.x), "=r"(_vld_1118.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 2ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1118 = reinterpret_cast<uint32_t*>(&_vld_1118);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5792,7 +5792,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1119;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1119.x), "=r"(_vld_1119.y) : "l"((const void*)(X + ((ta64_7 * 4 + 2) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1119.x), "=r"(_vld_1119.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 2ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1119 = reinterpret_cast<uint32_t*>(&_vld_1119);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5803,7 +5803,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1120;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1120.x), "=r"(_vld_1120.y) : "l"((const void*)(X + ((ta64_7 * 4 + 2) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1120.x), "=r"(_vld_1120.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 2ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1120 = reinterpret_cast<uint32_t*>(&_vld_1120);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5814,7 +5814,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1121;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1121.x), "=r"(_vld_1121.y) : "l"((const void*)(X + ((ta64_7 * 4 + 2) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1121.x), "=r"(_vld_1121.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 2ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1121 = reinterpret_cast<uint32_t*>(&_vld_1121);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5825,7 +5825,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1122;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1122.x), "=r"(_vld_1122.y) : "l"((const void*)(X + ((ta64_7 * 4 + 2) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1122.x), "=r"(_vld_1122.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 2ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1122 = reinterpret_cast<uint32_t*>(&_vld_1122);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5836,7 +5836,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1123;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1123.x), "=r"(_vld_1123.y) : "l"((const void*)(X + ((ta64_7 * 4 + 2) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1123.x), "=r"(_vld_1123.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 2ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1123 = reinterpret_cast<uint32_t*>(&_vld_1123);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5847,7 +5847,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1124;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1124.x), "=r"(_vld_1124.y) : "l"((const void*)(X + ((ta64_7 * 4 + 2) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1124.x), "=r"(_vld_1124.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 2ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1124 = reinterpret_cast<uint32_t*>(&_vld_1124);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5940,7 +5940,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1152;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1152.x), "=r"(_vld_1152.y) : "l"((const void*)(X + ((ta64_7 * 4 + 3) * 7168 + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1152.x), "=r"(_vld_1152.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 3ll) * 7168ll + col_off) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1152 = reinterpret_cast<uint32_t*>(&_vld_1152);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5951,7 +5951,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1153;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1153.x), "=r"(_vld_1153.y) : "l"((const void*)(X + ((ta64_7 * 4 + 3) * 7168 + col_off + 4) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1153.x), "=r"(_vld_1153.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 3ll) * 7168ll + col_off + 4ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1153 = reinterpret_cast<uint32_t*>(&_vld_1153);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5962,7 +5962,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1154;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1154.x), "=r"(_vld_1154.y) : "l"((const void*)(X + ((ta64_7 * 4 + 3) * 7168 + col_off + 8) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1154.x), "=r"(_vld_1154.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 3ll) * 7168ll + col_off + 8ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1154 = reinterpret_cast<uint32_t*>(&_vld_1154);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5973,7 +5973,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1155;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1155.x), "=r"(_vld_1155.y) : "l"((const void*)(X + ((ta64_7 * 4 + 3) * 7168 + col_off + 12) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1155.x), "=r"(_vld_1155.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 3ll) * 7168ll + col_off + 12ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1155 = reinterpret_cast<uint32_t*>(&_vld_1155);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5984,7 +5984,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1156;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1156.x), "=r"(_vld_1156.y) : "l"((const void*)(X + ((ta64_7 * 4 + 3) * 7168 + col_off + 16) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1156.x), "=r"(_vld_1156.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 3ll) * 7168ll + col_off + 16ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1156 = reinterpret_cast<uint32_t*>(&_vld_1156);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -5995,7 +5995,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1157;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1157.x), "=r"(_vld_1157.y) : "l"((const void*)(X + ((ta64_7 * 4 + 3) * 7168 + col_off + 20) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1157.x), "=r"(_vld_1157.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 3ll) * 7168ll + col_off + 20ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1157 = reinterpret_cast<uint32_t*>(&_vld_1157);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -6006,7 +6006,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             {
                 uint2 _vld_1158;
                 asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
-                    : "=r"(_vld_1158.x), "=r"(_vld_1158.y) : "l"((const void*)(X + ((ta64_7 * 4 + 3) * 7168 + col_off + 24) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(_vld_1158.x), "=r"(_vld_1158.y) : "l"((const void*)(X + ((ta64_7 * 4ll + 3ll) * 7168ll + col_off + 24ll) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 uint32_t* _vpairs_1158 = reinterpret_cast<uint32_t*>(&_vld_1158);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -6131,10 +6131,10 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
         int tokc = ((tok < t1) ? tok : t_last);
         long long tok64 = (long long)tokc;
         float dp[1];
-        long long srow = tok64 * 64;
+        long long srow = tok64 * 64ll;
         float r = stats[srow];
-        float z_load = stats[srow + 1 + n64];
-        float gval = gstats[tok64 * 32 + (long long)gcol];
+        float z_load = stats[srow + 1ll + n64];
+        float gval = gstats[tok64 * 32ll + (long long)gcol];
         float z = ((lane_1 < 24) ? z_load : 0.0f);
         float a_map;
         asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(a_map) : "f"(z), "f"(sc), "f"(bs));
@@ -6353,16 +6353,16 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
         float p1 = ((lane_1 < 24) ? cvt_f32 : 0.0f);
         float p2 = ((lane_1 < 24) ? cvt_f32_1 : 0.0f);
         float p3 = ((lane_1 < 24) ? cvt_f32_2 : 0.0f);
-        long long drow = tok64 * 96 + lane64;
+        long long drow = tok64 * 96ll + lane64;
         asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.b16 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&dzp[drow])), "h"(__bfloat16_as_ushort((__nv_bfloat16)p1)), "r"((unsigned int)(tok < t1)) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.b16 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&dzp[drow + 32])), "h"(__bfloat16_as_ushort((__nv_bfloat16)p2)), "r"((unsigned int)(tok < t1)) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.b16 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&dzp[drow + 64])), "h"(__bfloat16_as_ushort((__nv_bfloat16)p3)), "r"((unsigned int)(tok < t1)) : "memory");
-        long long trow = tok64 * 24;
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.b16 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&dzp[drow + 32ll])), "h"(__bfloat16_as_ushort((__nv_bfloat16)p2)), "r"((unsigned int)(tok < t1)) : "memory");
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.b16 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&dzp[drow + 64ll])), "h"(__bfloat16_as_ushort((__nv_bfloat16)p3)), "r"((unsigned int)(tok < t1)) : "memory");
+        long long trow = tok64 * 24ll;
         asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow])), "f"(r), "r"((unsigned int)(tok < t1 && lane_1 == 0)) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + 1])), "f"(c_t), "r"((unsigned int)(tok < t1 && lane_1 == 0)) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + 2 + lane64])), "f"(_add_1), "r"((unsigned int)(tok < t1 && lane_1 < 4)) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + lane64 - 2])), "f"(c), "r"((unsigned int)(tok < t1 && is_logit)) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + lane64 - 2])), "f"(0.0f), "r"((unsigned int)(tok < t1 && (lane_1 >= 24 && lane_1 < 26))) : "memory");
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + 1ll])), "f"(c_t), "r"((unsigned int)(tok < t1 && lane_1 == 0)) : "memory");
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + 2ll + lane64])), "f"(_add_1), "r"((unsigned int)(tok < t1 && lane_1 < 4)) : "memory");
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + lane64 - 2ll])), "f"(c), "r"((unsigned int)(tok < t1 && is_logit)) : "memory");
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + lane64 - 2ll])), "f"(0.0f), "r"((unsigned int)(tok < t1 && (lane_1 >= 24 && lane_1 < 26))) : "memory");
         float _sub_0;
         asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_0) : "f"(da_0), "f"(comp[0]));
         float _add_2;
@@ -6392,7 +6392,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
     fold[fbase + 3] = comp[1];
     __syncthreads();
     if (warp_0 == 0) {
-        long long prow = (long long)bid * 32;
+        long long prow = (long long)bid * 32ll;
         float o[2];
         float oc[2];
         #pragma unroll
@@ -6479,7 +6479,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
             }
             float _sub_1269;
             asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_1269) : "f"(ga[0]), "f"(gc[0]));
-            *(reinterpret_cast<float*>(param_partial + (prow + 24 + lane64)) + (0)) = _sub_1269;
+            *(reinterpret_cast<float*>(param_partial + (prow + 24ll + lane64)) + (0)) = _sub_1269;
         }
         if (lane_1 >= 27) {
             *(reinterpret_cast<float*>(param_partial + (prow + lane64)) + (0)) = 0.0f;
@@ -6495,7 +6495,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
         for (int k = 0; k < trips_z; k++) {
             int ez = k * 256 + tid_2;
             if (ez < nz) {
-                *(reinterpret_cast<__nv_bfloat16*>(dzp + (t64 * 96 + (long long)ez)) + (0)) = (__nv_bfloat16)zero;
+                *(reinterpret_cast<__nv_bfloat16*>(dzp + (t64 * 96ll + (long long)ez)) + (0)) = (__nv_bfloat16)zero;
             }
         }
         int nt = npad * 24;
@@ -6504,7 +6504,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
         for (int k_1 = 0; k_1 < trips_t; k_1++) {
             int et = k_1 * 256 + tid_2;
             if (et < nt) {
-                *(reinterpret_cast<float*>(tokp + (t64 * 24 + (long long)et)) + (0)) = zero;
+                *(reinterpret_cast<float*>(tokp + (t64 * 24ll + (long long)et)) + (0)) = zero;
             }
         }
     }

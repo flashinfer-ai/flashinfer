@@ -1,5 +1,6 @@
 {
  "captured": {
+  "arch_keyword": "plan_calls: arch=None added to every recorded plan / workspace_bytes call after the capture; the workspace query passes the architecture of each context's device (None for these CPU contexts) since #9058",
   "base": "9cdebfc5c7f654d1e87b9bbe1d94b381689fc294",
   "device": "cpu (no CUDA device)",
   "first_exported_arch": "sm_100a",
@@ -58,6 +59,10 @@
    ],
    [
     [
+     "arch",
+     null
+    ],
+    [
      "gate",
      "g"
     ]
@@ -71,6 +76,10 @@
     4
    ],
    [
+    [
+     "arch",
+     null
+    ],
     [
      "backward",
      true
@@ -103,6 +112,10 @@
    ],
    [
     [
+     "arch",
+     null
+    ],
+    [
      "gate",
      "g"
     ]
@@ -116,6 +129,10 @@
     4
    ],
    [
+    [
+     "arch",
+     null
+    ],
     [
      "backward",
      false
@@ -148,6 +165,10 @@
    ],
    [
     [
+     "arch",
+     null
+    ],
+    [
      "gate",
      "g"
     ]
@@ -161,6 +182,10 @@
     64
    ],
    [
+    [
+     "arch",
+     null
+    ],
     [
      "backward",
      true
@@ -193,6 +218,10 @@
    ],
    [
     [
+     "arch",
+     null
+    ],
+    [
      "gate",
      "g"
     ]
@@ -207,185 +236,9 @@
    ],
    [
     [
-     "backward",
-     false
+     "arch",
+     null
     ],
-    [
-     "fwd_layout",
-     "fwd_kcp"
-    ],
-    [
-     "gate",
-     "g"
-    ],
-    [
-     "save_mode",
-     "light"
-    ],
-    [
-     "sm_count",
-     148
-    ]
-   ]
-  ],
-  [
-   "plan",
-   [
-    1500,
-    8,
-    4,
-    148
-   ],
-   [
-    [
-     "gate",
-     "g"
-    ]
-   ]
-  ],
-  [
-   "workspace_bytes",
-   [
-    1500,
-    8,
-    4
-   ],
-   [
-    [
-     "backward",
-     true
-    ],
-    [
-     "fwd_layout",
-     "fwd"
-    ],
-    [
-     "gate",
-     "g"
-    ],
-    [
-     "save_mode",
-     "light"
-    ],
-    [
-     "sm_count",
-     148
-    ]
-   ]
-  ],
-  [
-   "plan",
-   [
-    1500,
-    8,
-    4,
-    148
-   ],
-   [
-    [
-     "gate",
-     "g"
-    ]
-   ]
-  ],
-  [
-   "workspace_bytes",
-   [
-    1500,
-    8,
-    4
-   ],
-   [
-    [
-     "backward",
-     true
-    ],
-    [
-     "fwd_layout",
-     "fwd"
-    ],
-    [
-     "gate",
-     "g"
-    ],
-    [
-     "save_mode",
-     "light"
-    ],
-    [
-     "sm_count",
-     148
-    ]
-   ]
-  ],
-  [
-   "plan",
-   [
-    900,
-    1,
-    4,
-    148
-   ],
-   [
-    [
-     "gate",
-     "g"
-    ]
-   ]
-  ],
-  [
-   "workspace_bytes",
-   [
-    900,
-    1,
-    4
-   ],
-   [
-    [
-     "backward",
-     true
-    ],
-    [
-     "fwd_layout",
-     "fwd"
-    ],
-    [
-     "gate",
-     "g"
-    ],
-    [
-     "save_mode",
-     "light"
-    ],
-    [
-     "sm_count",
-     148
-    ]
-   ]
-  ],
-  [
-   "plan",
-   [
-    1500,
-    8,
-    4,
-    148
-   ],
-   [
-    [
-     "gate",
-     "g"
-    ]
-   ]
-  ],
-  [
-   "workspace_bytes",
-   [
-    1500,
-    8,
-    4
-   ],
-   [
     [
      "backward",
      false
@@ -418,6 +271,10 @@
    ],
    [
     [
+     "arch",
+     null
+    ],
+    [
      "gate",
      "g"
     ]
@@ -431,6 +288,222 @@
     4
    ],
    [
+    [
+     "arch",
+     null
+    ],
+    [
+     "backward",
+     true
+    ],
+    [
+     "fwd_layout",
+     "fwd"
+    ],
+    [
+     "gate",
+     "g"
+    ],
+    [
+     "save_mode",
+     "light"
+    ],
+    [
+     "sm_count",
+     148
+    ]
+   ]
+  ],
+  [
+   "plan",
+   [
+    1500,
+    8,
+    4,
+    148
+   ],
+   [
+    [
+     "arch",
+     null
+    ],
+    [
+     "gate",
+     "g"
+    ]
+   ]
+  ],
+  [
+   "workspace_bytes",
+   [
+    1500,
+    8,
+    4
+   ],
+   [
+    [
+     "arch",
+     null
+    ],
+    [
+     "backward",
+     true
+    ],
+    [
+     "fwd_layout",
+     "fwd"
+    ],
+    [
+     "gate",
+     "g"
+    ],
+    [
+     "save_mode",
+     "light"
+    ],
+    [
+     "sm_count",
+     148
+    ]
+   ]
+  ],
+  [
+   "plan",
+   [
+    900,
+    1,
+    4,
+    148
+   ],
+   [
+    [
+     "arch",
+     null
+    ],
+    [
+     "gate",
+     "g"
+    ]
+   ]
+  ],
+  [
+   "workspace_bytes",
+   [
+    900,
+    1,
+    4
+   ],
+   [
+    [
+     "arch",
+     null
+    ],
+    [
+     "backward",
+     true
+    ],
+    [
+     "fwd_layout",
+     "fwd"
+    ],
+    [
+     "gate",
+     "g"
+    ],
+    [
+     "save_mode",
+     "light"
+    ],
+    [
+     "sm_count",
+     148
+    ]
+   ]
+  ],
+  [
+   "plan",
+   [
+    1500,
+    8,
+    4,
+    148
+   ],
+   [
+    [
+     "arch",
+     null
+    ],
+    [
+     "gate",
+     "g"
+    ]
+   ]
+  ],
+  [
+   "workspace_bytes",
+   [
+    1500,
+    8,
+    4
+   ],
+   [
+    [
+     "arch",
+     null
+    ],
+    [
+     "backward",
+     false
+    ],
+    [
+     "fwd_layout",
+     "fwd_kcp"
+    ],
+    [
+     "gate",
+     "g"
+    ],
+    [
+     "save_mode",
+     "light"
+    ],
+    [
+     "sm_count",
+     148
+    ]
+   ]
+  ],
+  [
+   "plan",
+   [
+    1500,
+    8,
+    4,
+    148
+   ],
+   [
+    [
+     "arch",
+     null
+    ],
+    [
+     "gate",
+     "g"
+    ]
+   ]
+  ],
+  [
+   "workspace_bytes",
+   [
+    1500,
+    8,
+    4
+   ],
+   [
+    [
+     "arch",
+     null
+    ],
     [
      "backward",
      false
@@ -463,6 +536,10 @@
    ],
    [
     [
+     "arch",
+     null
+    ],
+    [
      "gate",
      "g"
     ]
@@ -477,185 +554,9 @@
    ],
    [
     [
-     "backward",
-     false
+     "arch",
+     null
     ],
-    [
-     "fwd_layout",
-     "fwd_kcp"
-    ],
-    [
-     "gate",
-     "g"
-    ],
-    [
-     "save_mode",
-     "light"
-    ],
-    [
-     "sm_count",
-     148
-    ]
-   ]
-  ],
-  [
-   "plan",
-   [
-    1500,
-    8,
-    64,
-    148
-   ],
-   [
-    [
-     "gate",
-     "g"
-    ]
-   ]
-  ],
-  [
-   "workspace_bytes",
-   [
-    1500,
-    8,
-    64
-   ],
-   [
-    [
-     "backward",
-     true
-    ],
-    [
-     "fwd_layout",
-     "fwd"
-    ],
-    [
-     "gate",
-     "g"
-    ],
-    [
-     "save_mode",
-     "light"
-    ],
-    [
-     "sm_count",
-     148
-    ]
-   ]
-  ],
-  [
-   "plan",
-   [
-    1500,
-    8,
-    64,
-    148
-   ],
-   [
-    [
-     "gate",
-     "g"
-    ]
-   ]
-  ],
-  [
-   "workspace_bytes",
-   [
-    1500,
-    8,
-    64
-   ],
-   [
-    [
-     "backward",
-     true
-    ],
-    [
-     "fwd_layout",
-     "fwd"
-    ],
-    [
-     "gate",
-     "g"
-    ],
-    [
-     "save_mode",
-     "light"
-    ],
-    [
-     "sm_count",
-     148
-    ]
-   ]
-  ],
-  [
-   "plan",
-   [
-    900,
-    1,
-    64,
-    148
-   ],
-   [
-    [
-     "gate",
-     "g"
-    ]
-   ]
-  ],
-  [
-   "workspace_bytes",
-   [
-    900,
-    1,
-    64
-   ],
-   [
-    [
-     "backward",
-     true
-    ],
-    [
-     "fwd_layout",
-     "fwd"
-    ],
-    [
-     "gate",
-     "g"
-    ],
-    [
-     "save_mode",
-     "light"
-    ],
-    [
-     "sm_count",
-     148
-    ]
-   ]
-  ],
-  [
-   "plan",
-   [
-    1500,
-    8,
-    64,
-    148
-   ],
-   [
-    [
-     "gate",
-     "g"
-    ]
-   ]
-  ],
-  [
-   "workspace_bytes",
-   [
-    1500,
-    8,
-    64
-   ],
-   [
     [
      "backward",
      false
@@ -688,6 +589,10 @@
    ],
    [
     [
+     "arch",
+     null
+    ],
+    [
      "gate",
      "g"
     ]
@@ -701,6 +606,222 @@
     64
    ],
    [
+    [
+     "arch",
+     null
+    ],
+    [
+     "backward",
+     true
+    ],
+    [
+     "fwd_layout",
+     "fwd"
+    ],
+    [
+     "gate",
+     "g"
+    ],
+    [
+     "save_mode",
+     "light"
+    ],
+    [
+     "sm_count",
+     148
+    ]
+   ]
+  ],
+  [
+   "plan",
+   [
+    1500,
+    8,
+    64,
+    148
+   ],
+   [
+    [
+     "arch",
+     null
+    ],
+    [
+     "gate",
+     "g"
+    ]
+   ]
+  ],
+  [
+   "workspace_bytes",
+   [
+    1500,
+    8,
+    64
+   ],
+   [
+    [
+     "arch",
+     null
+    ],
+    [
+     "backward",
+     true
+    ],
+    [
+     "fwd_layout",
+     "fwd"
+    ],
+    [
+     "gate",
+     "g"
+    ],
+    [
+     "save_mode",
+     "light"
+    ],
+    [
+     "sm_count",
+     148
+    ]
+   ]
+  ],
+  [
+   "plan",
+   [
+    900,
+    1,
+    64,
+    148
+   ],
+   [
+    [
+     "arch",
+     null
+    ],
+    [
+     "gate",
+     "g"
+    ]
+   ]
+  ],
+  [
+   "workspace_bytes",
+   [
+    900,
+    1,
+    64
+   ],
+   [
+    [
+     "arch",
+     null
+    ],
+    [
+     "backward",
+     true
+    ],
+    [
+     "fwd_layout",
+     "fwd"
+    ],
+    [
+     "gate",
+     "g"
+    ],
+    [
+     "save_mode",
+     "light"
+    ],
+    [
+     "sm_count",
+     148
+    ]
+   ]
+  ],
+  [
+   "plan",
+   [
+    1500,
+    8,
+    64,
+    148
+   ],
+   [
+    [
+     "arch",
+     null
+    ],
+    [
+     "gate",
+     "g"
+    ]
+   ]
+  ],
+  [
+   "workspace_bytes",
+   [
+    1500,
+    8,
+    64
+   ],
+   [
+    [
+     "arch",
+     null
+    ],
+    [
+     "backward",
+     false
+    ],
+    [
+     "fwd_layout",
+     "fwd_kcp"
+    ],
+    [
+     "gate",
+     "g"
+    ],
+    [
+     "save_mode",
+     "light"
+    ],
+    [
+     "sm_count",
+     148
+    ]
+   ]
+  ],
+  [
+   "plan",
+   [
+    1500,
+    8,
+    64,
+    148
+   ],
+   [
+    [
+     "arch",
+     null
+    ],
+    [
+     "gate",
+     "g"
+    ]
+   ]
+  ],
+  [
+   "workspace_bytes",
+   [
+    1500,
+    8,
+    64
+   ],
+   [
+    [
+     "arch",
+     null
+    ],
     [
      "backward",
      false
@@ -733,6 +854,10 @@
    ],
    [
     [
+     "arch",
+     null
+    ],
+    [
      "gate",
      "g"
     ]
@@ -746,6 +871,10 @@
     64
    ],
    [
+    [
+     "arch",
+     null
+    ],
     [
      "backward",
      false

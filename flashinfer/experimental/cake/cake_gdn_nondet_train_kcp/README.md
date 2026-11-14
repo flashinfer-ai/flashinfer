@@ -14,7 +14,8 @@ entry takes a `deterministic` keyword.  Its deterministic counterpart is
 This package keeps that package's entry points and accuracy budgets; its
 results are not bitwise equal to that package's.  It also takes the
 `save_mode` value `"light_akk"`, which the deterministic package does not
-take (see "Options").
+take, and runs it by default with `use_qk_l2norm_in_kernel=True` (see
+"Options").
 
 The facade `flashinfer.cake_gdn_nondet_train_kcp` is a stable FlashInfer API:
 its entry points are `@flashinfer_api` functions.  This package, under
@@ -290,7 +291,7 @@ eager calls too.
 
 | option | values | meaning |
 |---|---|---|
-| `save_mode` | **`"light"`**, `"light_akk"`, `"full"` | `"light"` keeps the boundary states (with `save_transfer=True` also the received summary pairs and `M_seg`) and no tape: the backward re-runs the chunk preparation and replays the intra-rank tapes; `"light_akk"` (opt-in, `use_qk_l2norm_in_kernel=True` only) is `"light"` plus the chunk preparation's BF16 `Akk` tape (6,144 B per padded token row at `HV = 48`): the light replay then runs `fwd_prep_replay_l2n`, the chunk preparation reading that tape instead of forming it (no `K K^T` Gram, no block inverse; every other output bitwise the same), and under `torch.utils.checkpoint(use_reentrant=False)` it saves as `"light"`; `"full"` also keeps `M_seg` and every forward tape (the ten tapes `h`, `v_new`, `w`, `u`, `Aqk`, `Akk`, `gamma`, `gcum`, `rowscale`, `qscale`: 74,307 B per padded token row at `HV = 48`) |
+| `save_mode` | **unset** (`None`: **`"light_akk"`** with `use_qk_l2norm_in_kernel=True`, **`"light"`** without it), `"light"`, `"light_akk"`, `"full"` | `"light"` keeps the boundary states (with `save_transfer=True` also the received summary pairs and `M_seg`) and no tape: the backward re-runs the chunk preparation and replays the intra-rank tapes; `"light_akk"` (`use_qk_l2norm_in_kernel=True` only, and the default there) is `"light"` plus the chunk preparation's BF16 `Akk` tape (6,144 B per padded token row at `HV = 48`: `R * HV * 128` B more retained per rank, about 192 MiB per rank at 32,768 tokens per rank): the light replay then runs `fwd_prep_replay_l2n`, the chunk preparation reading that tape instead of forming it (no `K K^T` Gram, no block inverse; every other output bitwise the same), and under `torch.utils.checkpoint(use_reentrant=False)` it saves as `"light"`; pass `save_mode="light"` to keep the smaller saved set with the norm; `"full"` (opt-in) also keeps `M_seg` and every forward tape (the ten tapes `h`, `v_new`, `w`, `u`, `Aqk`, `Akk`, `gamma`, `gcum`, `rowscale`, `qscale`: 74,307 B per padded token row at `HV = 48`) |
 | `boundary_mode` | **`"saved"`**, `"replay"` | whether the cross-rank boundary states (`S_in`, the owner's received summaries) are kept in the saved set or recomputed (exchange included) in the backward; `"replay"` keeps no tape and no `qk_rstd` either: `save_mode="full"` there runs the same backward as `"light"` (the whole-forward replay) |
 | `exchange` | **`"a2a"`**, `"ring"` | the collective schedule; `"ring"` only when every document crosses at most 3 ranks (`n_d_max - 1 <= 2`) and `save_transfer=False` |
 | `save_transfer` | **`True`**, `False` | keep the received summary pairs for the backward (`False` re-sends the transposed transfers) |
@@ -333,7 +334,14 @@ bytes per padded token row, `R = 64 * NC_pad` rows per rank, at `HV = 48`):
 | `qk_rstd` (`use_qk_l2norm_in_kernel=True`; `boundary_mode="saved"` only) FP32 | yes | yes | `8 * T_r * H_qk` |
 
 `save_mode="light_akk"` is the `"light"` column plus `Akk` (BF16
-`[R, HV, 64]`, 6,144 B per padded token row at `HV = 48`).
+`[R, HV, 64]`, 6,144 B per padded token row at `HV = 48`).  It is the
+default of a call with `use_qk_l2norm_in_kernel=True` that leaves
+`save_mode` unset, so such a call retains `R * HV * 128` B per rank more
+than `"light"`: about 192 MiB per rank at 32,768 tokens per rank and
+`HV = 48` (`cake_gdn_nondet_train_kcp_saved_bytes` with the norm counts it by
+default).  A call without the norm defaults to `"light"`.  Under
+`torch.utils.checkpoint(use_reentrant=False)` the mode saves as `"light"`,
+so a checkpointed forward still retains nothing.
 
 With `boundary_mode="replay"` the saved set keeps no boundary state, no
 `M_seg`, no tape and no `qk_rstd` in any `save_mode`: the backward replays
@@ -465,9 +473,10 @@ cake_gdn_nondet_train_kcp_comm_bytes(ctx, *, H_qk, HV, C=None, save_transfer=Tru
     b1 send = s_pad * n_in(r), twice that with the re-sent maps (boundary_mode="saved", save_transfer=False)
     on an owner: c1 recv = 2 * s_owner * N_out      c2 send = s_owner * N_in      b2 send = s_owner * N_out
     b1 recv = s_owner * N_in (twice that with the re-sent maps)      halo = rows(r) * C * 2 forward, * 4 backward
-cake_gdn_nondet_train_kcp_saved_bytes(ctx, *, H_qk, HV, save_mode="light", boundary_mode="saved", save_transfer=True, with_conv=True,
-    C=None, P=None, use_qk_l2norm_in_kernel=False) -> per rank (the table above)
-cake_gdn_nondet_train_kcp_workspace_bytes(ctx, *, H_qk, HV, save_mode="light", boundary_mode="saved", save_transfer=True, backward=True,
+cake_gdn_nondet_train_kcp_saved_bytes(ctx, *, H_qk, HV, save_mode=None, boundary_mode="saved", save_transfer=True, with_conv=True,
+    C=None, P=None, use_qk_l2norm_in_kernel=False) -> per rank (the table above; save_mode=None is the call's default:
+    "light_akk" with use_qk_l2norm_in_kernel=True, "light" without it)
+cake_gdn_nondet_train_kcp_workspace_bytes(ctx, *, H_qk, HV, save_mode=None, boundary_mode="saved", save_transfer=True, backward=True,
     with_conv=True, C=None, P=None, group_reduce="fused", reuse_recompute_tapes=None, use_qk_l2norm_in_kernel=False,
     fused_walks=1, graph="off", save_for_backward=True)
     -> per rank: the most the caller-held workspace binds in the forward or the backward.  Covered: exchange="a2a"
@@ -525,6 +534,7 @@ cake_gdn_nondet_train_kcp_workspace_bytes(ctx, *, H_qk, HV, save_mode="light", b
     gives the light figures without Akk in the arena (the forward writes it into the saved set, the backward binds
     it from there) for a call outside a checkpoint; under torch.utils.checkpoint(use_reentrant=False) the call runs
     as save_mode="light" and binds the light figure: size a checkpointed light_akk layer with save_mode="light"
+    (the default save_mode=None is "light_akk" with use_qk_l2norm_in_kernel=True, "light" without it)
 ```
 
 `H_qk` enters the halo and strided-view terms; the exchange terms depend on

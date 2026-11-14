@@ -16,7 +16,7 @@ limitations under the License.
 Host synchronization of the non-deterministic KCP route (``cake_kda_nondet_train_kcp.cake_kcp`` / ``cake_kcp_plan``):
 pack preparation and the KDA / conv halo calls never copy a table from pageable memory and never wait for queued device
 work, with or without a caller-owned workspace.  The signals of a window are those of
-``tests/test_helpers/cake_host_sync.py``: an upload counter that needs no device tracing (equal to the profiler's
+``tests/experimental/test_helpers/cake_host_sync.py``: an upload counter that needs no device tracing (equal to the profiler's
 host-to-device copies by kind where the profiler traces the device), the caching allocator's device allocations, the
 synchronizing operations ``torch.cuda.set_sync_debug_mode("warn")`` reports, and a queue probe (``torch.cuda._sleep``
 enqueued before the window must still run after it, and the host must return well before it ends).  The negative control
@@ -31,7 +31,7 @@ import weakref
 import pytest
 import torch
 
-from tests.test_helpers.cake_host_sync import (
+from tests.experimental.test_helpers.cake_host_sync import (
     SLEEP_MS,
     allocator_counts,
     census,
@@ -40,7 +40,7 @@ from tests.test_helpers.cake_host_sync import (
     sleep_cycles,
     summary,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 kp = cake_package("cake.cake_kda_nondet_train_kcp", "cake_kcp_plan")
 cake_kcp = cake_package("cake.cake_kda_nondet_train_kcp", "cake_kcp")
@@ -712,7 +712,8 @@ def test_gpu_fresh_context_with_conv_halo_releases_everything(device) -> None:
     """A T7 / critique #3: a loop that builds a new context per step and runs the conv halo and the KDA step with
     ``workspace=None`` keeps nothing once the conv module's host cache is cleared: the context, its table sets and
     its blobs are freed by reference counting alone (the cycle collector disabled; the table set holds its context
-    through a weak proxy) and ``memory_allocated`` returns to its level after the first step."""
+    through a weak proxy; the workspaces the package keeps for the ``workspace=None`` calls hold neither) and
+    ``memory_allocated`` returns to its level after the first step."""
     from flashinfer.experimental.cake.cake_causal_conv1d_det_train import kcp as conv
 
     H = 2
@@ -773,6 +774,8 @@ def test_gpu_fresh_context_with_conv_halo_releases_everything(device) -> None:
             conv.cake_causal_conv1d_det_train_kcp_host_cache_clear()
             torch.cuda.synchronize(device)
             assert all(r() is None for r in refs), (i, _holders(refs))
+            # the workspace=None calls ran on workspaces the package keeps, which hold neither a context nor a table set
+            assert cake_kcp._DEFAULT_WS, i
     finally:
         if enabled:
             gc.enable()

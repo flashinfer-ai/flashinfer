@@ -22,7 +22,7 @@ import torch
 from flashinfer import RecurrentKDAPrefillWorkspace, recurrent_kda
 from flashinfer.cute_dsl.availability import is_cute_dsl_experimental_available
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.kda_prefill import _make_inputs
+from tests.kda.test_helpers.kda_prefill import _make_inputs
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()

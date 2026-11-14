@@ -310,7 +310,7 @@ kernel_cake_causal_conv1d_det_train_843c010db78c79107fd3(__nv_bfloat16* __restri
                 for (int j_1 = 0; j_1 < 8; j_1++) {
                     {
                         uint2 _vld_2;
-                        _vld_2 = *reinterpret_cast<const uint2*>(reinterpret_cast<__nv_bfloat16*>(w) + (c64 + (long long)j_1) * 4);
+                        _vld_2 = *reinterpret_cast<const uint2*>(reinterpret_cast<__nv_bfloat16*>(w) + (c64 + (long long)j_1) * 4ll);
                         uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -323,7 +323,7 @@ kernel_cake_causal_conv1d_det_train_843c010db78c79107fd3(__nv_bfloat16* __restri
                 #pragma unroll
                 for (int j_2 = 0; j_2 < 8; j_2++) {
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(w) + (c64 + (long long)j_2) * 4);
+                        float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(w) + (c64 + (long long)j_2) * 4ll);
                         wr[j_2 * 4 + 0] = _v4.x;
                         wr[j_2 * 4 + 1] = _v4.y;
                         wr[j_2 * 4 + 2] = _v4.z;
@@ -355,7 +355,7 @@ kernel_cake_causal_conv1d_det_train_843c010db78c79107fd3(__nv_bfloat16* __restri
                     br[0 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(b) + c64 + 4);
+                    float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(b) + c64 + 4ll);
                     br[4 + 0] = _v4.x;
                     br[4 + 1] = _v4.y;
                     br[4 + 2] = _v4.z;
@@ -935,7 +935,7 @@ kernel_cake_causal_conv1d_det_train_843c010db78c79107fd3(__nv_bfloat16* __restri
                 for (int j_5 = 0; j_5 < 8; j_5++) {
                     {
                         uint2 _vld_54;
-                        _vld_54 = *reinterpret_cast<const uint2*>(reinterpret_cast<__nv_bfloat16*>(w) + (c64_1 + (long long)j_5) * 4);
+                        _vld_54 = *reinterpret_cast<const uint2*>(reinterpret_cast<__nv_bfloat16*>(w) + (c64_1 + (long long)j_5) * 4ll);
                         uint32_t* _vpairs_54 = reinterpret_cast<uint32_t*>(&_vld_54);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -948,7 +948,7 @@ kernel_cake_causal_conv1d_det_train_843c010db78c79107fd3(__nv_bfloat16* __restri
                 #pragma unroll
                 for (int j_6 = 0; j_6 < 8; j_6++) {
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(w) + (c64_1 + (long long)j_6) * 4);
+                        float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(w) + (c64_1 + (long long)j_6) * 4ll);
                         wr_1[j_6 * 4 + 0] = _v4.x;
                         wr_1[j_6 * 4 + 1] = _v4.y;
                         wr_1[j_6 * 4 + 2] = _v4.z;
@@ -980,7 +980,7 @@ kernel_cake_causal_conv1d_det_train_843c010db78c79107fd3(__nv_bfloat16* __restri
                     br_1[0 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(b) + c64_1 + 4);
+                    float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(b) + c64_1 + 4ll);
                     br_1[4 + 0] = _v4.x;
                     br_1[4 + 1] = _v4.y;
                     br_1[4 + 2] = _v4.z;
@@ -1526,7 +1526,7 @@ kernel_cake_causal_conv1d_det_train_843c010db78c79107fd3(__nv_bfloat16* __restri
         }
         #pragma unroll
         for (int j_10 = 0; j_10 < 8; j_10++) {
-            long long pidx = ((long long)rank * C64 + (long long)c0_0 + (long long)j_10) * 4;
+            long long pidx = ((long long)rank * C64 + (long long)c0_0 + (long long)j_10) * 4ll;
             {
                 float4 _v4 = make_float4(tot[j_10 * 4 + 0], tot[j_10 * 4 + 1], tot[j_10 * 4 + 2], tot[j_10 * 4 + 3]);
                 *reinterpret_cast<float4*>(partial + pidx) = _v4;
@@ -1544,14 +1544,14 @@ kernel_cake_causal_conv1d_det_train_843c010db78c79107fd3(__nv_bfloat16* __restri
                 totb[j_12] = totb[j_12] + red[(s_8 * ct_vec + v) * 40 + (32 + j_12)];
             }
         }
-        long long bidx = (long long)((num_bids + n_ch_tiles - 1) / n_ch_tiles) * C64 * 4 + (long long)rank * C64 + (long long)c0_0;
+        long long bidx = (long long)((num_bids + n_ch_tiles - 1) / n_ch_tiles) * C64 * 4ll + (long long)rank * C64 + (long long)c0_0;
         {
             float4 _v4 = make_float4(totb[0 + 0], totb[0 + 1], totb[0 + 2], totb[0 + 3]);
             *reinterpret_cast<float4*>(partial + bidx) = _v4;
         }
         {
             float4 _v4 = make_float4(totb[4 + 0], totb[4 + 1], totb[4 + 2], totb[4 + 3]);
-            *reinterpret_cast<float4*>(partial + bidx + 4) = _v4;
+            *reinterpret_cast<float4*>(partial + bidx + 4ll) = _v4;
         }
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");

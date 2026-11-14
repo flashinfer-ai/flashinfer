@@ -18,7 +18,7 @@ attention package: the Sage-FP8 block-sparse attention forward against an
 exact-P dequantized reference, the fused quantizer against the torch recipe,
 the one-launch and CUDA-Graph contract of the host path, and the package's
 ``build.json`` contract.  It imports the package only through
-``tests.test_helpers.cake_package`` and nothing else from flashinfer; the
+``tests.cake.test_helpers.cake_package`` and nothing else from flashinfer; the
 flashinfer public routes are covered by
 ``test_cake_sage_block_sparse_attention_sm100_api.py``.
 """
@@ -31,8 +31,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
-from tests.test_helpers.cake_profiler import cuda_kernel_names
+from tests.cake.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
 pkg = cake_package("cake_sage_block_sparse_attention")
 cake_build = cake_package("cake_sage_block_sparse_attention", "cake_build")
@@ -407,7 +407,7 @@ def test_cake_sage_sm100_launches_one_kernel_per_call():
     quantizer is its two kernels behind the zero-fill of its V amax scratch
     (``torch.zeros``: a torch fill kernel, or a memset on torch builds that zero
     a fresh tensor that way).  The launch records come from
-    ``tests.test_helpers.cake_profiler``, which retries a profiler session that
+    ``tests.cake.test_helpers.cake_profiler``, which retries a profiler session that
     lost its CUDA records."""
     device = torch.device("cuda")
     c = _make_case(

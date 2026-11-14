@@ -87,7 +87,7 @@ kernel_cake_rmsnorm_det_train_a4d3f82b3e776f4fc49b(__nv_bfloat16* __restrict__ x
         int row = row0 + group;
         long long row64 = (long long)row;
         long long xbase = row64 * x_stride_p0;
-        long long obase = row64 * 2048;
+        long long obase = row64 * 2048ll;
         float x_cache[32];
         float sum_sq = 0.0f;
         if (row < T) {

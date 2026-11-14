@@ -94,7 +94,7 @@ kernel_cake_rmsnorm_det_train_271082c56c222bf10d77(float* __restrict__ partial, 
         if (cc < n_chunks) {
             float _vec_load_0[4];
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(partial + (unsigned long long)cc * 2048 + (unsigned long long)col);
+                float4 _v4 = *reinterpret_cast<const float4*>(partial + (unsigned long long)cc * 2048ull + (unsigned long long)col);
                 _vec_load_0[0 + 0] = _v4.x;
                 _vec_load_0[0 + 1] = _v4.y;
                 _vec_load_0[0 + 2] = _v4.z;

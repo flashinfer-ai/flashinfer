@@ -174,7 +174,7 @@ kernel_cake_rmsnorm_train_a4da85136fba4588239f(__nv_bfloat16* __restrict__ x, __
             int rowc = row0 + group * 2 + rr_5;
             if (rowc < T) {
                 long long row64c = (long long)rowc;
-                long long obasec = row64c * 2048;
+                long long obasec = row64c * 2048ll;
                 if (gtid == 0) {
                     r[rowc] = rstd_r;
                 }

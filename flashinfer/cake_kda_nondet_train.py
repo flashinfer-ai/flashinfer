@@ -39,10 +39,9 @@ Checkpoint hand-off: under ``torch.utils.checkpoint`` (reentrant or not),
 hand its state tapes to the node's backward, which then skips its recurrence
 recompute; the gradients do not change.  ``checkpoint_handoff="auto"`` (the
 default) engages on the verified devices and problem sizes the package README
-lists, ``"on"`` on every call it supports, ``"off"`` never.  The environment
-variable ``CAKE_KDA_CKPT_HANDOFF`` (``off`` / ``on``), read by the backend at
-each :func:`cake_kda_nondet` call, turns every call off or ``"auto"`` into
-``"on"``.  The raw gate mode and the in-kernel Q/K L2 norm never engage it.
+lists, ``"on"`` on every call it supports, ``"off"`` never; the keyword is the
+only switch (the package reads no environment variable).  The raw gate mode and
+the in-kernel Q/K L2 norm never engage it.
 
 Thin entry points.  The contract, the host plan, the workspace,
 the launch sequences, the autograd Function and the generated kernels live in
@@ -258,12 +257,13 @@ def cake_kda_nondet_train_backward(
 
     Returns
     -------
-    ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v, beta`` and the FP32 gradient of ``g``, ranked
-    like the inputs.  With ``use_gate_in_kernel=True``: ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg``
-    the BF16 gradient of the raw gate (contiguous, ranked like ``g``), ``dA_log`` FP32 ``[H]`` and ``ddt_bias``
-    FP32 shaped like ``dt_bias``.  Bitwise reproducible for the same inputs and path.  ``dq``, ``dk``, ``dv`` and
-    ``dbeta`` are bitwise the deterministic package's and ``dg`` differs from it by FP32 rounding; in raw gate mode
-    and with the in-kernel Q/K L2 norm every gradient is bitwise the deterministic package's.
+    tuple of torch.Tensor
+        ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v, beta`` and the FP32 gradient of ``g``, ranked
+        like the inputs.  With ``use_gate_in_kernel=True``: ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg``
+        the BF16 gradient of the raw gate (contiguous, ranked like ``g``), ``dA_log`` FP32 ``[H]`` and ``ddt_bias``
+        FP32 shaped like ``dt_bias``.  Bitwise reproducible for the same inputs and path.  ``dq``, ``dk``, ``dv`` and
+        ``dbeta`` are bitwise the deterministic package's and ``dg`` differs from it by FP32 rounding; in raw gate mode
+        and with the in-kernel Q/K L2 norm every gradient is bitwise the deterministic package's.
     """
     from .experimental.cake.cake_kda_nondet_train import cake_backend
 
@@ -319,7 +319,42 @@ def cake_kda_nondet(
     ``k`` in, their gradients out) and :func:`cake_kda_nondet_train_backward` for the gradients.  The node's
     backward is this package's.  ``checkpoint_handoff`` (``"auto"``, ``"on"`` or ``"off"``; another value raises
     ``ValueError``) is the checkpoint hand-off under ``torch.utils.checkpoint`` (the module docstring; the raw gate
-    mode and the in-kernel Q/K L2 norm never engage it), overridden by ``CAKE_KDA_CKPT_HANDOFF``.
+    mode and the in-kernel Q/K L2 norm never engage it).
+
+    Parameters
+    ----------
+    q, k, v : torch.Tensor
+        BF16 packed rows ``[1, S, H, 128]`` (or ``[S, H, 128]``), as in
+        :func:`cake_kda_nondet_train_forward`.
+    g : torch.Tensor
+        FP32 activated decay gate; raw BF16 gate when ``use_gate_in_kernel=True``.
+    beta : torch.Tensor
+        BF16 ``[1, S, H]`` delta-rule gate after the sigmoid.
+    cu_seqlens : torch.Tensor
+        int32 device document offsets, first 0 and last ``S``.
+    scale : float, optional
+        Output scale; ``128 ** -0.5`` when ``None``.
+    workspace : optional
+        Caller-owned workspace from :func:`cake_kda_nondet_train_workspace`.
+    save_mode : str, optional
+        ``"light"`` or ``"tape"``; ``None`` uses the workspace's default (``"light"`` without one).
+    arena : optional
+        Lower-memory arena option from :func:`cake_kda_nondet_train_arena`.
+    doc_lengths : sequence of int, optional
+        Host document lengths in offset order; required by a batched arena.
+    use_gate_in_kernel : bool, default=False
+        Activate the raw BF16 gate inside the kernels.
+    A_log : torch.Tensor, optional
+        Contiguous FP32 ``[H]`` raw-gate parameter.
+    dt_bias : torch.Tensor, optional
+        Contiguous FP32 ``[H * 128]`` or ``[H, 128]`` raw-gate bias.
+    lower_bound : float, optional
+        Required in raw-gate mode, with ``-5 <= lower_bound < 0``.
+    use_qk_l2norm_in_kernel : bool, default=False
+        Normalize raw query and key rows inside the kernels; input layout rules are
+        those of :func:`cake_kda_nondet_train_forward`.
+    checkpoint_handoff : str, default="auto"
+        Checkpoint hand-off mode: ``"auto"``, ``"on"`` or ``"off"``.
     """
     from .experimental.cake.cake_kda_nondet_train import cake_backend
 

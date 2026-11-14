@@ -88,7 +88,7 @@ kernel_cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7(long long* __restrict__ St
     long long base = (long long)bid * (long long)n;
     long long row_base = (long long)bid * (long long)top_k;
     unsigned int zero_u = 0;
-    unsigned int sign_mask = 2147483648;
+    unsigned int sign_mask = 2147483648ll;
     unsigned int nan_floor = 2139095040;
     unsigned int key_pad = 1;
     int hist_base = warp_1 * 256;
@@ -119,28 +119,28 @@ kernel_cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7(long long* __restrict__ St
                 #pragma unroll
                 for (int u = 0; u < 8; u++) {
                     int idx_l = e0 + tid + 512 * u;
-                    ent[u] = 4294967295;
+                    ent[u] = 4294967295ll;
                     if (idx_l < n) {
                         ent[u] = (unsigned long long)Staging[base + (long long)idx_l];
                     }
                 }
                 #pragma unroll
                 for (int u_1 = 0; u_1 < 8; u_1++) {
-                    int kid = (int)(unsigned int)(ent[u_1] & 4294967295);
+                    int kid = (int)(unsigned int)(ent[u_1] & 4294967295ull);
                     int kid_h = kid;
                     int valid_h = ((kid_h != -1) ? 1 : 0);
-                    unsigned int bits = (unsigned int)(ent[u_1] >> 32);
+                    unsigned int bits = (unsigned int)(ent[u_1] >> 32ull);
                     unsigned int magnitude = bits & 2147483647;
                     unsigned int m = ((magnitude != 0) ? bits : zero_u);
                     unsigned int key32 = (((m & sign_mask) != 0) ? ~m : m | sign_mask);
                     if (magnitude > nan_floor) {
                         key32 = zero_u;
                     }
-                    unsigned long long key64 = (unsigned long long)key32 << 32 | (unsigned long long)(unsigned int)kid_h;
+                    unsigned long long key64 = (unsigned long long)key32 << 32ull | (unsigned long long)(unsigned int)kid_h;
                     unsigned long long key_h = key64;
                     unsigned long long ks_h = key_h >> (unsigned long long)shift;
-                    int digit_h = (int)(ks_h & 255);
-                    int pm_h = ((ks_h >> 8 == prefix) ? 1 : 0);
+                    int digit_h = (int)(ks_h & 255ull);
+                    int pm_h = ((ks_h >> 8ull == prefix) ? 1 : 0);
                     int bin_h = (((valid_h & pm_h) != 0) ? hist_base + digit_h : sink_idx);
                     atomicAdd(&s_m[bin_h], 1);
                 }
@@ -152,7 +152,7 @@ kernel_cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7(long long* __restrict__ St
                 #pragma unroll
                 for (int u_2 = 0; u_2 < 32; u_2++) {
                     int idx_0 = e0_1 + tid + 512 * u_2;
-                    ld[u_2] = 4294967295;
+                    ld[u_2] = 4294967295ll;
                     if (idx_0 < n) {
                         ld[u_2] = (unsigned long long)Staging[base + (long long)idx_0];
                     }
@@ -160,9 +160,9 @@ kernel_cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7(long long* __restrict__ St
                 #pragma unroll
                 for (int u_3 = 0; u_3 < 32; u_3++) {
                     int idx_s = e0_1 + tid + 512 * u_3;
-                    int kid_1 = (int)(unsigned int)(ld[u_3] & 4294967295);
+                    int kid_1 = (int)(unsigned int)(ld[u_3] & 4294967295ull);
                     int kid_0 = kid_1;
-                    unsigned int bits_1 = (unsigned int)(ld[u_3] >> 32);
+                    unsigned int bits_1 = (unsigned int)(ld[u_3] >> 32ull);
                     unsigned int magnitude_1 = bits_1 & 2147483647;
                     unsigned int m_1 = ((magnitude_1 != 0) ? bits_1 : zero_u);
                     unsigned int key32_1 = (((m_1 & sign_mask) != 0) ? ~m_1 : m_1 | sign_mask);
@@ -207,27 +207,27 @@ kernel_cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7(long long* __restrict__ St
                     #pragma unroll
                     for (int u_4 = 0; u_4 < 8; u_4++) {
                         int idx_t = e0_2 + tid + 512 * u_4;
-                        ent_t[u_4] = 4294967295;
+                        ent_t[u_4] = 4294967295ll;
                         if (s_k[idx_t] == t32) {
                             ent_t[u_4] = (unsigned long long)Staging[base + (long long)idx_t];
                         }
                     }
                     #pragma unroll
                     for (int u_5 = 0; u_5 < 8; u_5++) {
-                        int kid_2 = (int)(unsigned int)(ent_t[u_5] & 4294967295);
+                        int kid_2 = (int)(unsigned int)(ent_t[u_5] & 4294967295ull);
                         int kid_t = kid_2;
                         if (kid_t != -1) {
-                            unsigned long long key_t = (unsigned long long)t32 << 32 | (unsigned long long)(unsigned int)kid_t;
+                            unsigned long long key_t = (unsigned long long)t32 << 32ull | (unsigned long long)(unsigned int)kid_t;
                             unsigned long long ks_t = key_t >> (unsigned long long)shift;
-                            if (ks_t >> 8 == prefix) {
-                                atomicAdd(&s_m[hist_base + (int)(ks_t & 255)], 1);
+                            if (ks_t >> 8ull == prefix) {
+                                atomicAdd(&s_m[hist_base + (int)(ks_t & 255ull)], 1);
                             }
                         }
                     }
                 }
             }
         }
-        int pad_fix = ((res != 0 && p >= 1 && p < 4 && prefix == 0) ? 1 : 0);
+        int pad_fix = ((res != 0 && p >= 1 && p < 4 && prefix == 0ull) ? 1 : 0);
         int pad_bin = ((p == 3) ? 1 : 0);
         __syncthreads();
         if (tid < 256) {
@@ -419,7 +419,7 @@ kernel_cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7(long long* __restrict__ St
         int bucket_cnt = __shfl_sync(0xFFFFFFFF, count_sel, target_lane);
         k_rem = k_rem - above_cnt;
         kept_above += above_cnt;
-        prefix = prefix << 8 | (unsigned long long)(unsigned int)(target_lane * 8 + digit_sel);
+        prefix = prefix << 8ull | (unsigned long long)(unsigned int)(target_lane * 8 + digit_sel);
         edge = prefix << (unsigned long long)shift;
         int sel_bin = target_lane * 8 + digit_sel;
         int last = ((kept_above + bucket_cnt <= top_k) ? 1 : 0);
@@ -516,25 +516,25 @@ kernel_cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7(long long* __restrict__ St
             #pragma unroll
             for (int u_6 = 0; u_6 < 8; u_6++) {
                 int idx_l_1 = e0_3 + tid + 512 * u_6;
-                ent_w[u_6] = 4294967295;
+                ent_w[u_6] = 4294967295ll;
                 if (idx_l_1 < n) {
                     ent_w[u_6] = (unsigned long long)Staging[base + (long long)idx_l_1];
                 }
             }
             #pragma unroll
             for (int u_7 = 0; u_7 < 8; u_7++) {
-                int kid_3 = (int)(unsigned int)(ent_w[u_7] & 4294967295);
+                int kid_3 = (int)(unsigned int)(ent_w[u_7] & 4294967295ull);
                 int kid_w = kid_3;
                 int keep_w = 0;
                 if (kid_w != -1) {
-                    unsigned int bits_2 = (unsigned int)(ent_w[u_7] >> 32);
+                    unsigned int bits_2 = (unsigned int)(ent_w[u_7] >> 32ull);
                     unsigned int magnitude_2 = bits_2 & 2147483647;
                     unsigned int m_2 = ((magnitude_2 != 0) ? bits_2 : zero_u);
                     unsigned int key32_2 = (((m_2 & sign_mask) != 0) ? ~m_2 : m_2 | sign_mask);
                     if (magnitude_2 > nan_floor) {
                         key32_2 = zero_u;
                     }
-                    unsigned long long key64_1 = (unsigned long long)key32_2 << 32 | (unsigned long long)(unsigned int)kid_w;
+                    unsigned long long key64_1 = (unsigned long long)key32_2 << 32ull | (unsigned long long)(unsigned int)kid_w;
                     keep_w = ((key64_1 >= edge) ? 1 : 0);
                 }
                 unsigned int ballot_w = __ballot_sync(0xFFFFFFFF, keep_w != 0);
@@ -542,7 +542,7 @@ kernel_cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7(long long* __restrict__ St
                     int _rank_in_mask_4 = (int)__popc(ballot_w & ((1u << (unsigned int)lane) - 1u));
                     long long slot_w = row_base + (long long)(write_pos + _rank_in_mask_4);
                     float sc_w = 0.0f;
-                    unsigned int bits_3 = (unsigned int)(ent_w[u_7] >> 32);
+                    unsigned int bits_3 = (unsigned int)(ent_w[u_7] >> 32ull);
                     sc_w = reinterpret_cast<float*>(&bits_3)[0];
                     Indices[slot_w] = kid_w;
                     Scores[slot_w] = sc_w;
@@ -551,8 +551,8 @@ kernel_cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7(long long* __restrict__ St
             }
         }
     } else {
-        unsigned int e_hi = (unsigned int)(edge >> 32);
-        unsigned int e_lo = (unsigned int)(edge & 4294967295);
+        unsigned int e_hi = (unsigned int)(edge >> 32ull);
+        unsigned int e_lo = (unsigned int)(edge & 4294967295ull);
         #pragma unroll 1
         for (int e0_4 = 0; e0_4 < n_r; e0_4 += 8192) {
             unsigned long long ent_r[16];
@@ -561,14 +561,14 @@ kernel_cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7(long long* __restrict__ St
             for (int u_8 = 0; u_8 < 16; u_8++) {
                 int idx_w = e0_4 + tid + 512 * u_8;
                 kw[u_8] = s_k[idx_w];
-                ent_r[u_8] = 4294967295;
+                ent_r[u_8] = 4294967295ll;
                 if (kw[u_8] != key_pad && kw[u_8] >= e_hi) {
                     ent_r[u_8] = (unsigned long long)Staging[base + (long long)idx_w];
                 }
             }
             #pragma unroll
             for (int u_9 = 0; u_9 < 16; u_9++) {
-                int kid_4 = (int)(unsigned int)(ent_r[u_9] & 4294967295);
+                int kid_4 = (int)(unsigned int)(ent_r[u_9] & 4294967295ull);
                 int kid_r = kid_4;
                 int keep_r = 0;
                 if (kid_r != -1) {
@@ -579,7 +579,7 @@ kernel_cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7(long long* __restrict__ St
                     int _rank_in_mask_5 = (int)__popc(ballot_r & ((1u << (unsigned int)lane) - 1u));
                     long long slot_r = row_base + (long long)(write_pos + _rank_in_mask_5);
                     float sc_r = 0.0f;
-                    unsigned int bits_4 = (unsigned int)(ent_r[u_9] >> 32);
+                    unsigned int bits_4 = (unsigned int)(ent_r[u_9] >> 32ull);
                     sc_r = reinterpret_cast<float*>(&bits_4)[0];
                     Indices[slot_r] = kid_r;
                     Scores[slot_r] = sc_r;
@@ -588,7 +588,7 @@ kernel_cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7(long long* __restrict__ St
             }
         }
     }
-    unsigned int pad_bits = 4286578688;
+    unsigned int pad_bits = 4286578688ll;
     float pad_score = 0.0f;
     pad_score = reinterpret_cast<float*>(&pad_bits)[0];
     #pragma unroll 1

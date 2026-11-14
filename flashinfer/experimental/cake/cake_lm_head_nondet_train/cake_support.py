@@ -64,28 +64,33 @@ allocation-free).
 * the forward row stage (one warp per row) and the backward row stage, which writes ``dz [M]`` (BF16);
 * ``dX``: sparse = one CTA per token and 1024 columns adding its pairs' ``W`` rows in pair order (rows
   of fewer than two candidates write +0 without reading ``W``), dense = a scatter of ``dz`` into the
-  chunk's ``[chunk, vb]`` block and per block the dX GEMM that adds its product into the chunk's FP32
-  sum from its epilogue (:func:`support_dx_form`: one K slice -- blocks added in ascending order -- or
-  K slices added in the order they finish), one cast per chunk;
+  chunk's ``[chunk, vb]`` block and per block the dX GEMM (:func:`support_dx_form`): at one K slice it
+  adds its product into the chunk's FP32 sum from its epilogue (blocks in ascending order), above one it
+  stores its K slices into a slab and the slab sum launched after it adds them, summed in slice order;
+  one cast per chunk;
 * ``dW``: sparse = the unique keys ``(v << 32) | p`` of the pairs (a pair of a row no upstream reaches
   takes a sentinel row), sorted, then one CTA per key range adding the ``X`` rows of each id's pairs in
   pair order (a long segment, an id most tokens share, is cut into parts summed in part order); the
   BF16 ``dW`` is written directly (ids in no support stay +0) up to
   :data:`SUPPORT_DW_GLOBAL_MAX_PAIRS` pairs, above that pair ranges of ``chunk_size * ceil(M / T)``
   pairs accumulate into an FP32 ``[V, H]`` sum cast once; dense = the shipped weight-gradient GEMM per
-  block, accumulated in chunk order.
+  block, accumulated in chunk order.  The dense backward loops chunk-outer or block-outer, whichever
+  needs the smaller FP32 sums (:func:`_dense_order`); both add every element in the same order.
 
 The pass form of each pass is a host rule on host-known sizes (:data:`SUPPORT_DENSE_MIN_MEAN_K`):
 deterministic, no synchronization.  The programs of these entries are the deterministic package's
 (every sum has one owner and one order; the bits depend on the pass form, ``chunk_size``, the dense
 vocabulary block and the sparse split) except the dense dX: its blocks add into the chunk sum through
-the reduction form of the dX GEMM, bitwise the deterministic dX at one K slice and an unordered FP32
-sum of the slices above one.  As part of the non-deterministic package the entries take no
-``deterministic`` keyword and make no run-to-run bitwise promise for the gradients.  Under torch's deterministic algorithms the
+the reduction form of the dX GEMM, bitwise the deterministic dX at one K slice and the same vocabulary
+block (this package's default block, :data:`DENSE_VOCAB_BLOCK_TARGET`, is wider than the deterministic
+package's) and, above one, a slab sum of the slices in slice order (fixed order: the same bits every run).  As
+part of the non-deterministic package the entries take no ``deterministic`` keyword and make no run-to-run
+bitwise promise for the gradients, and they keep PyTorch's alert as part of that contract.  Under torch's
+deterministic algorithms the
 backward raises PyTorch's alert (:func:`cake_backend._alert_nondeterministic`) when its dense dX runs a block of more
 than one K slice (:func:`_dense_dx_unordered`; only inside a cell of :data:`SUPPORT_DX_SLICE_CELLS`), before its first
-launch; every other backward has one fixed order and does not alert.  The device bytes of a step by bucket: :func:`support_memory_report`.  A token
-of two or more candidates that no upstream reaches gets ``dX = +0`` for finite ``W`` (``+0`` times its
+launch; every other backward does not alert.  The device bytes of a step by bucket: :func:`support_memory_report`.
+A token of two or more candidates that no upstream reaches gets ``dX = +0`` for finite ``W`` (``+0`` times its
 rows), as the reference backend does.
 """
 
@@ -104,8 +109,9 @@ from .cake_backend import (
     _TOP_SAVED_HOOKS,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_GEOMETRY,
-    DX_FILL_VALUE,
     DX_RED_STAGE,
+    DX_SLAB_SUM_ACC_STAGE,
+    DX_SLAB_SUM_STAGE,
     DX_SPLIT_ARCHES,
     DX_TILE_WIDE,
     IGNORE_INDEX,
@@ -121,6 +127,10 @@ from .cake_backend import (
     _selective_checkpoint_modes,
     _temperature_rows,
     arch_for,
+    base_stage,
+    dx_ordered_operands,
+    dx_slab_bytes,
+    dx_slab_sum_operands,
     gemm_scalars,
     record_abi,
     record_for,
@@ -856,12 +866,16 @@ SUPPORT_STAGES = (
 )
 # The shipped GEMMs the dense pass form runs on row-block views ``W[v0:v1]`` (the call geometry is a launch scalar,
 # so one record serves every block width): the logits GEMM, the dX GEMM's plain store (a chunk's first block at one
-# slice) and reduction form (the later blocks, every block above one slice), the weight-gradient GEMMs; and on an
-# architecture in DX_SPLIT_ARCHES the split-tail forms of both dX GEMMs (:func:`support_dense_stages`).
+# slice) and reduction form (the later blocks, every block above one slice) with the reduction's slab sum after a
+# block above one slice (its storing form after a chunk's first block, its accumulating form after a later one), the
+# weight-gradient GEMMs; and on an architecture in DX_SPLIT_ARCHES the split-tail forms of
+# both dX GEMMs (:func:`support_dense_stages`).
 SUPPORT_DENSE_STAGES = (
     "gemm_logits_nostats",
     "gemm_dx",
     DX_RED_STAGE,
+    DX_SLAB_SUM_STAGE,
+    DX_SLAB_SUM_ACC_STAGE,
     "gemm_dw_acc",
     "gemm_dw_cast_bf16",
 )
@@ -911,8 +925,11 @@ SENTINEL_ROW = 2**31 - 1
 # The validation stage takes the cap as int32; K_t <= M < 2^31, so a larger cap is exactly "no cap".
 K1_K_CAP_MAX = 2**31 - 1
 # Dense form: vocabulary block of about this many columns (a multiple of 256) and token chunks of at most
-# DENSE_CHUNK_MAX rows (the shipped GEMMs' chunk bound).
-DENSE_VOCAB_BLOCK_TARGET = 16384
+# DENSE_CHUNK_MAX rows (the shipped GEMMs' chunk bound).  Three blocks at V 154880 (the deterministic package's
+# 16384 gives ten): measured on R200 (VR NVL72, 212 SMs, sm_107a) at T 16231, H 6144, chunk 4096, mean support 1032
+# (block-outer backward, :func:`_dense_order`), over the ten-block default: forward 1.246, whole step 1.144, at a
+# step peak of 4131 MiB against 3003 MiB (and 5983 MiB for the ten-block chunk-outer form).
+DENSE_VOCAB_BLOCK_TARGET = 51712
 DENSE_CHUNK_MAX = 65535
 
 
@@ -929,12 +946,14 @@ class SupportDxCell(NamedTuple):
 
 
 # Dense dX of this package (:func:`_dense_backward`, :func:`support_dx_form`): every vocabulary block's dX GEMM ADDS
-# its FP32 product into the token chunk's FP32 ``dX_c`` from its epilogue -- the reduction form of the loss path's dX
-# GEMM (``gemm_dx_red``: TMA ``.add.f32``, round to nearest, subnormals kept) -- instead of writing an FP32 product
-# block that a separate pass adds into ``dX_c``.  Per block GEMM: ``S`` K slices and ``F`` split-tail items.  With
-# ``S = 1`` the chunk's first block stores and the later ones add: one FP32 add per element per block in block order,
-# the deterministic package's bits; with ``S > 1`` ``dX_c`` is filled with ``-0.0`` first and the slices of a block add
-# in the order they finish.  ``S > 1`` runs only inside a cell of SUPPORT_DX_SLICE_CELLS: a shape class where the
+# its FP32 product into the token chunk's FP32 ``dX_c`` -- the reduction form of the loss path's dX GEMM
+# (``gemm_dx_red``) -- instead of writing an FP32 product block that a separate pass adds into ``dX_c``.  Per block
+# GEMM: ``S`` K slices and ``F`` split-tail items.  With ``S = 1`` the chunk's first block stores and the later ones add
+# from the epilogue (TMA ``.add.f32``, round to nearest, subnormals kept): one FP32 add per element per block in block
+# order, the deterministic package's bits; with ``S > 1`` the slices store into a slab and the slab sum sums them in
+# slice order and stores the sum (the chunk's first block) or adds it once (a later block): the same bits in every
+# run.
+# ``S > 1`` runs only inside a cell of SUPPORT_DX_SLICE_CELLS: a shape class where the
 # whole-step time of the call at ``S`` over ``S = 1`` (each call after a GPU delay as long as one back-to-back call)
 # has its 95 % CI below 1 at the class's smallest and largest token chunk in each of two independent runs, each
 # interleaving ``S`` and ``S = 1``.  Every other shape, SM count and architecture runs one slice.  The split tail
@@ -975,6 +994,10 @@ SUPPORT_DX_SLICE_CELLS: dict[str, tuple[SupportDxCell, ...]] = {
     #   Every 95 % CI below 1 (half-width at most 0.0017); every A/A control (S = 1 twice) within 0.0006 of 1, one
     #   of them (H = 2048, 2817 rows, second run: 1.0002 [1.00003, 1.00038]; first run 0.9998) with its CI not
     #   holding 1.
+    # The cells were measured at the ten-block default of the deterministic package (vocabulary blocks of 13824 to
+    # 15616 columns at V 152064 / 154880).  At this package's default (DENSE_VOCAB_BLOCK_TARGET) those vocabularies
+    # run blocks of about 50000 columns (around 790 K steps), outside every cell, so they run one slice; a cell applies
+    # to a vocabulary whose default block falls in its K-step range, or to a forced ``vocab_block``.
     "sm_100a": (
         SupportDxCell(148, 2048, 12, (224, 244), 3),
         SupportDxCell(148, 3072, 8, (224, 244), 3),
@@ -1397,7 +1420,7 @@ def _dense_logits(
 
 def _dense_dx_unordered(cx: _Cake, plan: SupportPlan, problem: SupportProblem) -> bool:
     """Whether the dense dX pass of a backward (:func:`_dense_backward`) runs a vocabulary block of more than one K
-    slice (:func:`support_dx_form`), whose slices add into the chunk sum in the order they finish: the host rule over
+    slice (:func:`support_dx_form`), whose slices the slab sum adds in slice order: the host rule over
     the pass's token chunks and vocabulary blocks, no launch.  ``False`` for the sparse dX pass, ``T == 0`` and a call
     without a pair (they launch no dense dX)."""
     T, H, V, M = problem.num_rows, problem.hidden, problem.vocab, problem.num_pairs
@@ -1412,6 +1435,21 @@ def _dense_dx_unordered(cx: _Cake, plan: SupportPlan, problem: SupportProblem) -
     )
 
 
+def _dense_order(
+    T: int, H: int, V: int, C: int, vb: int, dense_x: bool, dense_w: bool
+) -> str:
+    """The loop order of a dense backward (:func:`_dense_backward`): ``"block"`` (vocabulary block outer, token chunk
+    inner) when its FP32 sums -- ``dX`` ``[T, H]`` and one block's ``dW_acc`` ``[vb, H]`` -- take fewer bytes than the
+    chunk-outer order's (``"chunk"``: the chunk's ``dX_c`` ``[C, H]`` and the whole ``dW_acc`` ``[V, H]``), else
+    ``"chunk"``.  One token chunk: ``"chunk"`` (no ``dW_acc``; the orders coincide).  Both orders run the same launches
+    and add every FP32 element in the same order, so the bits do not depend on the order."""
+    if T <= C or not (dense_x or dense_w):
+        return "chunk"
+    chunk_bytes = (4 * C * H if dense_x else 0) + (4 * V * H if dense_w else 0)
+    block_bytes = (4 * T * H if dense_x else 0) + (4 * min(vb, V) * H if dense_w else 0)
+    return "block" if block_bytes < chunk_bytes else "chunk"
+
+
 def _dense_backward(
     cx: _Cake,
     plan: SupportPlan,
@@ -1424,14 +1462,19 @@ def _dense_backward(
     need_dx: bool,
     need_dw: bool,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Dense backward, chunk-outer: per token chunk and vocabulary block (ascending) the scatter builds the BF16
-    gradient block ``dzblk`` (``dz`` at the support, +0 elsewhere); each block's dX GEMM adds its FP32 product into the
-    chunk's FP32 ``dX_c`` from its epilogue at the block's :func:`support_dx_form` -- the chunk's first block stores
-    when it runs one slice, otherwise ``dX_c`` is filled with ``-0.0`` (the exact additive identity) first -- and one
-    cast per chunk writes ``dX``.  The shipped weight-gradient GEMM stores / accumulates ``dW_acc[v0:v1]`` in chunk
-    order and the last chunk's GEMM writes the BF16 ``dW`` from its epilogue (``cast(dW_acc + tile)``, or
-    ``cast(tile)`` for one chunk).  With one slice on every block the adds run in block order (the deterministic
-    package's bits); above one, the slices of a block add in the order they finish."""
+    """Dense backward: per token chunk and vocabulary block the scatter builds the BF16 gradient block ``dzblk`` (``dz``
+    at the support, +0 elsewhere); each block's dX GEMM adds its FP32 product into the chunk's FP32 ``dX_c`` at the
+    block's :func:`support_dx_form` -- the chunk's first block stores (one slice from its epilogue, more through the
+    slab sum), so nothing fills or zeroes ``dX_c`` -- and one cast per chunk, after its last block, writes ``dX``.  The
+    shipped weight-gradient GEMM stores / accumulates the block's ``dW_acc`` in chunk order and the last chunk's GEMM
+    writes the BF16 ``dW`` rows from its epilogue (``cast(dW_acc + tile)``, or ``cast(tile)`` for one chunk).  The loop
+    order is :func:`_dense_order`'s: chunk-outer (``dX_c`` of one chunk, ``dW_acc`` ``[V, H]``) or block-outer
+    (``dX_c`` of every chunk, ``dW_acc`` of one block); in both every chunk sees its blocks in ascending order and
+    every block its chunks in ascending order, so each FP32 element takes the same adds in the same order.  With one
+    slice on every block the adds run in block order (the deterministic package's bits); above one, the block's GEMM
+    stores its slices into the slab and the slab sum launched right after it sums them in slice order and stores the
+    sum (the chunk's first block, :data:`.cake_backend.DX_SLAB_SUM_STAGE`) or adds it once (a later block,
+    :data:`.cake_backend.DX_SLAB_SUM_ACC_STAGE`): the ordered reduction, the same bits in every run."""
     T, H, V, M = problem.num_rows, problem.hidden, problem.vocab, problem.num_pairs
     device = cx.device
     C, vb = min(plan.dense_chunk, T), plan.vocab_block
@@ -1440,105 +1483,154 @@ def _dense_backward(
     chunks = _blocks(T, C)
     blocks = _blocks(V, vb)
     multi = len(chunks) > 1
+    by_block = _dense_order(T, H, V, C, vb, need_dx, need_dw) == "block"
     k_block = int(cx.geometry.k_block)
     flat = torch.empty((C * vb,), dtype=torch.bfloat16, device=device)
     dX = torch.empty((T if need_dx else 0, H), dtype=torch.bfloat16, device=device)
-    dxc = torch.empty((C if need_dx else 0, H), dtype=torch.float32, device=device)
-    dW = torch.empty((V if need_dw else 0, H), dtype=torch.bfloat16, device=device)
-    dw_acc = torch.empty(
-        (V if need_dw and multi else 0, H), dtype=torch.float32, device=device
+    # FP32 chunk sums: one chunk's rows (chunk-outer) or every chunk's rows (block-outer)
+    dxc = torch.empty(
+        ((T if by_block else C) if need_dx else 0, H),
+        dtype=torch.float32,
+        device=device,
     )
-    for ci, (r0, rows_c) in enumerate(chunks):
+    dW = torch.empty((V if need_dw else 0, H), dtype=torch.bfloat16, device=device)
+    # FP32 weight-gradient sums of the chunks before the last: every block's rows (chunk-outer) or one block's
+    dw_acc = torch.empty(
+        ((min(vb, V) if by_block else V) if need_dw and multi else 0, H),
+        dtype=torch.float32,
+        device=device,
+    )
+    # the ordered K-sliced dX slab (dx_ordered_operands; read by the slab sum), allocated with the first K-sliced launch
+    slab: Optional[torch.Tensor] = None
+    forms = [
+        [
+            support_dx_form(rows_c, H, width // k_block, cx.num_sms, cx.arch)
+            for _, width in blocks
+        ]
+        if need_dx
+        else []
+        for _, rows_c in chunks
+    ]
+    steps = (
+        [(ci, bi) for bi in range(len(blocks)) for ci in range(len(chunks))]
+        if by_block
+        else [(ci, bi) for ci in range(len(chunks)) for bi in range(len(blocks))]
+    )
+    for ci, bi in steps:
+        r0, rows_c = chunks[ci]
+        v0, width = blocks[bi]
         last = ci == len(chunks) - 1
-        forms = (
-            [
-                support_dx_form(rows_c, H, width // k_block, cx.num_sms, cx.arch)
-                for _, width in blocks
-            ]
-            if need_dx
-            else []
+        x0 = r0 if by_block else 0  # the chunk's first row in dxc
+        w0 = 0 if by_block else v0  # the block's first row in dw_acc
+        store_first = need_dx and forms[ci][0][0] == 1
+        blk = flat[: rows_c * width].view(rows_c, width)
+        _run(
+            cx,
+            "support_scatter_dz_bf16",
+            dict(
+                dz=dz,
+                ids=ids_rows,
+                offsets=off32,
+                dzblk=blk,
+                t0=r0,
+                rows=rows_c,
+                v0=v0,
+                vb=width,
+                ldc=width,
+                M=M,
+                V=V,
+            ),
         )
-        store_first = need_dx and forms[0][0] == 1
-        if need_dx and not store_first:
-            dxc[:rows_c].fill_(DX_FILL_VALUE)
-        for bi, (v0, width) in enumerate(blocks):
-            blk = flat[: rows_c * width].view(rows_c, width)
+        if need_dx:
+            slices, split = forms[ci][bi]
+            stage = stage_variant(
+                "gemm_dx" if store_first and bi == 0 else DX_RED_STAGE,
+                split=bool(split),
+            )
+            scalars = gemm_scalars(
+                stage,
+                cx.geometry,
+                hidden=H,
+                vocab=width,
+                rows_c=rows_c,
+                k_slices=slices,
+            )
+            ordered = {}
+            if base_stage(stage) == DX_RED_STAGE:
+                # the ordered reduction's slab (one buffer of the call, grown to the largest K-sliced block); a
+                # block of one slice adds directly and touches no slab
+                need = dx_slab_bytes(slices, scalars["m_tiles"], H)
+                if need and (slab is None or slab.numel() * 4 < need):
+                    slab = torch.empty((need // 4,), dtype=torch.float32, device=device)
+                ordered = dx_ordered_operands(
+                    dxc[x0 : x0 + rows_c],
+                    slab,
+                    k_slices=slices,
+                    m_tiles=scalars["m_tiles"],
+                    ldc=scalars["ldc"],
+                )
             _run(
                 cx,
-                "support_scatter_dz_bf16",
+                stage,
                 dict(
-                    dz=dz,
-                    ids=ids_rows,
-                    offsets=off32,
-                    dzblk=blk,
-                    t0=r0,
-                    rows=rows_c,
-                    v0=v0,
-                    vb=width,
-                    ldc=width,
-                    M=M,
-                    V=V,
+                    A=blk,
+                    B=W[v0 : v0 + width],
+                    C=dxc[x0 : x0 + rows_c],
+                    STATS_OUT=f32,
+                    WS=f32,
+                    dx_split=split,  # the split-tail form's grid term
+                    **scalars,
+                    **ordered,
                 ),
             )
-            if need_dx:
-                slices, split = forms[bi]
-                stage = stage_variant(
-                    "gemm_dx" if store_first and bi == 0 else DX_RED_STAGE,
-                    split=bool(split),
-                )
+            if slices > 1:
+                # the slab sum of the block's K slices, right behind its GEMM on the same stream: the chunk's
+                # first block stores it, a later block adds it to the earlier blocks' sum
                 _run(
                     cx,
-                    stage,
-                    dict(
-                        A=blk,
-                        B=W[v0 : v0 + width],
-                        C=dxc[:rows_c],
-                        STATS_OUT=f32,
-                        WS=f32,
-                        dx_split=split,  # the split-tail form's grid term
-                        **gemm_scalars(
-                            stage,
-                            cx.geometry,
-                            hidden=H,
-                            vocab=width,
-                            rows_c=rows_c,
-                            k_slices=slices,
-                        ),
+                    DX_SLAB_SUM_STAGE if bi == 0 else DX_SLAB_SUM_ACC_STAGE,
+                    dx_slab_sum_operands(
+                        dxc[x0 : x0 + rows_c],
+                        slab,
+                        k_slices=slices,
+                        m_tiles=scalars["m_tiles"],
+                        ldc=scalars["ldc"],
+                        cast_vec=cx.geometry.cast_vec,
                     ),
                 )
-            if need_dw:
-                assert Xop is not None
-                B = Xop[r0 : r0 + rows_c]
-                if not last:
-                    _gemm(
-                        cx,
-                        "gemm_dw_acc",
-                        blk,
-                        B,
-                        dw_acc[v0 : v0 + width],
-                        stats=f32,
-                        ws=f32,
-                        hidden=H,
-                        vocab=width,
-                        rows_c=rows_c,
-                        first_chunk=int(ci == 0),
-                    )
-                else:
-                    _gemm(
-                        cx,
-                        "gemm_dw_cast_bf16",
-                        blk,
-                        B,
-                        dW[v0 : v0 + width],
-                        stats=consts["unit_scale"],
-                        ws=dw_acc[v0 : v0 + width] if multi else f32,
-                        hidden=H,
-                        vocab=width,
-                        rows_c=rows_c,
-                        first_chunk=int(not multi),
-                    )
-        if need_dx:
-            dX[r0 : r0 + rows_c].copy_(dxc[:rows_c])  # one round to BF16
+        if need_dw:
+            assert Xop is not None
+            B = Xop[r0 : r0 + rows_c]
+            if not last:
+                _gemm(
+                    cx,
+                    "gemm_dw_acc",
+                    blk,
+                    B,
+                    dw_acc[w0 : w0 + width],
+                    stats=f32,
+                    ws=f32,
+                    hidden=H,
+                    vocab=width,
+                    rows_c=rows_c,
+                    first_chunk=int(ci == 0),
+                )
+            else:
+                _gemm(
+                    cx,
+                    "gemm_dw_cast_bf16",
+                    blk,
+                    B,
+                    dW[v0 : v0 + width],
+                    stats=consts["unit_scale"],
+                    ws=dw_acc[w0 : w0 + width] if multi else f32,
+                    hidden=H,
+                    vocab=width,
+                    rows_c=rows_c,
+                    first_chunk=int(not multi),
+                )
+        if need_dx and bi == len(blocks) - 1:
+            dX[r0 : r0 + rows_c].copy_(dxc[x0 : x0 + rows_c])  # one round to BF16
     return (dX if need_dx else None), (dW if need_dw else None)
 
 
@@ -1868,13 +1960,16 @@ def support_memory_report(
     * ``forward_workspace``: the dense logits block ``[C, vb]`` BF16 (dense forward only), plus ``X``'s copy when its
       rows are not 16-byte aligned (``x_copy``).
     * ``backward_workspace``: ``dz`` 2 B per pair; dense dX / dW: the gradient block ``[C, vb]`` BF16 and, for dX, the
-      FP32 ``[C, H]`` chunk sum the blocks add into; sparse dW: per pair range of ``n`` pairs the pair index (4 B), the
+      FP32 chunk sums the blocks add into (``[C, H]`` chunk-outer, ``[T, H]`` block-outer: :func:`_dense_order`) and
+      the ordered K-sliced dX's FP32 slab of ``S`` slices of the padded rows when a slice cell of
+      :data:`SUPPORT_DX_SLICE_CELLS` can hold the chunk; sparse dW: per pair range of ``n`` pairs the pair index (4 B), the
       row index (8 B), the keys (8 B), :data:`SORT_BYTES_PER_KEY` measured ``torch.sort`` bytes per key, the row
       activity (1 B per row) and ``2 ceil(n / split)`` FP32 partial rows; ``X``'s copy (``x_copy``).
-    * ``weight_gradient_storage``: the FP32 ``dW_acc [V, H]`` (sparse chunked mode, or dense with more than one token
-      chunk).
+    * ``weight_gradient_storage``: the FP32 ``dW_acc``: ``[V, H]`` in sparse chunked mode and in the chunk-outer dense
+      form with more than one token chunk, ``[vb, H]`` (one vocabulary block) in the block-outer dense form.
     * ``gradients``: BF16 ``dX`` and ``dW``.
-    * ``plan``: the pass forms, the dW mode, the pair range, the split, the vocabulary block and the dense chunk.
+    * ``plan``: the pass forms, the dW mode, the pair range, the split, the vocabulary block, the dense chunk and the
+      dense backward's loop order (``None`` without a dense dX / dW pass).
     """
     if arch not in SUPPORT_DENSE_MIN_MEAN_K:
         raise ValueError(f"arch must be one of {sorted(SUPPORT_DENSE_MIN_MEAN_K)}")
@@ -1918,10 +2013,24 @@ def support_memory_report(
     )
     forward_ws = (2 * C * vb if plan.forward == "dense" and M else 0) + x_bytes
     backward_ws = 2 * M if M and (need_dx or need_dw) else 0
-    dense_x = need_dx and plan.dx == "dense" and M
-    dense_w = need_dw and plan.dw == "dense" and M
+    dense_x = bool(need_dx and plan.dx == "dense" and M)
+    dense_w = bool(need_dw and plan.dw == "dense" and M)
+    order = _dense_order(T, H, V, C, vb, dense_x, dense_w)
     if dense_x or dense_w:
-        backward_ws += 2 * C * vb + (4 * C * H if dense_x else 0)
+        backward_ws += 2 * C * vb + (
+            4 * (T if order == "block" else C) * H if dense_x else 0
+        )
+    if dense_x:
+        # the ordered K-sliced dX slab: the largest of the arch's slice cells at this H with at most the chunk's row
+        # pairs (any SM count), S slices of its padded rows
+        backward_ws += max(
+            (
+                dx_slab_bytes(cell.slices, 2 * cell.row_pairs, H)
+                for cell in SUPPORT_DX_SLICE_CELLS.get(arch, ())
+                if cell.hidden == H and cell.row_pairs <= _row_pairs(C)
+            ),
+            default=0,
+        )
     split: Optional[int] = None
     if need_dw and M and not dense_w:
         n = min(plan.dw_pairs, M)
@@ -1932,13 +2041,12 @@ def support_memory_report(
     if need_dw and M:
         backward_ws += x_bytes
     multi_chunk = T > C
-    dw_storage = (
-        4 * V * H
-        if need_dw
-        and M
-        and ((not dense_w and plan.dw_mode == "chunked") or (dense_w and multi_chunk))
-        else 0
-    )
+    if need_dw and M and not dense_w and plan.dw_mode == "chunked":
+        dw_storage = 4 * V * H
+    elif dense_w and multi_chunk:
+        dw_storage = 4 * (min(vb, V) if order == "block" else V) * H
+    else:
+        dw_storage = 0
     grads = (2 * T * H if need_dx else 0) + (2 * V * H if need_dw else 0)
     report = dict(
         packed_state=packed_state,
@@ -1959,6 +2067,7 @@ def support_memory_report(
             dw_split=split,
             vocab_block=vb,
             dense_chunk=plan.dense_chunk,
+            dense_order=order if dense_x or dense_w else None,
         ),
     )
     report["total"] = (
@@ -2088,8 +2197,9 @@ class CakeLMHeadNondetSupportFunction(torch.autograd.Function):
             and torch.are_deterministic_algorithms_enabled()
             and _dense_dx_unordered(*ctx.cake, problem)
         ):
-            # before the backward's first launch: its dense dX adds K slices in the order they finish (torch's flag
-            # read first: outside its deterministic algorithms the slice rule is not evaluated)
+            # before the backward's first launch: its dense dX runs a block of more than one K slice (the slab sum adds
+            # them in slice order; the alert is kept by this package's contract; torch's flag read first: outside its
+            # deterministic algorithms the slice rule is not evaluated)
             _alert_nondeterministic(
                 "CakeLMHeadNondetSupportFunction.backward",
                 "support_kl" if ctx.outputs.kl else "support_logprob",

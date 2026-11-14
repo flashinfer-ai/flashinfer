@@ -115,7 +115,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
     int lane_hi = lane_1 >> 3;
     int lc4 = ((lane_1 < 4) ? lane_1 : 3);
     int gcol = ((lane_1 >= 4) ? lane_1 - 4 : 0);
-    long long col_off = (long long)tid_2 * 16;
+    long long col_off = (long long)tid_2 * 16ll;
     float acc[2];
     float comp[2];
     #pragma unroll
@@ -139,7 +139,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             long long ta64_0 = (long long)tok_a_0;
             float vec_load[16];
             {
-                const void* _v8p_0 = (const void*)(dU + (ta64_0 * 4096 + col_off) + (0));
+                const void* _v8p_0 = (const void*)(dU + (ta64_0 * 4096ll + col_off) + (0));
                 uint32_t _v8_0_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_0_0[0]), "=r"(_v8_0_0[1]), "=r"(_v8_0_0[2]), "=r"(_v8_0_0[3]), "=r"(_v8_0_0[4]), "=r"(_v8_0_0[5]), "=r"(_v8_0_0[6]), "=r"(_v8_0_0[7]) : "l"((const void*)((const char*)_v8p_0 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -162,7 +162,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_1[16];
             {
-                const void* _v8p_1 = (const void*)(X + (ta64_0 * 4 * 4096 + col_off) + (0));
+                const void* _v8p_1 = (const void*)(X + (ta64_0 * 4ll * 4096ll + col_off) + (0));
                 uint32_t _v8_1_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_1_0[0]), "=r"(_v8_1_0[1]), "=r"(_v8_1_0[2]), "=r"(_v8_1_0[3]), "=r"(_v8_1_0[4]), "=r"(_v8_1_0[5]), "=r"(_v8_1_0[6]), "=r"(_v8_1_0[7]) : "l"((const void*)((const char*)_v8p_1 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -185,7 +185,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_2[16];
             {
-                const void* _v8p_2 = (const void*)(X + ((ta64_0 * 4 + 1) * 4096 + col_off) + (0));
+                const void* _v8p_2 = (const void*)(X + ((ta64_0 * 4ll + 1ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_2_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_2_0[0]), "=r"(_v8_2_0[1]), "=r"(_v8_2_0[2]), "=r"(_v8_2_0[3]), "=r"(_v8_2_0[4]), "=r"(_v8_2_0[5]), "=r"(_v8_2_0[6]), "=r"(_v8_2_0[7]) : "l"((const void*)((const char*)_v8p_2 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -208,7 +208,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_3[16];
             {
-                const void* _v8p_3 = (const void*)(X + ((ta64_0 * 4 + 2) * 4096 + col_off) + (0));
+                const void* _v8p_3 = (const void*)(X + ((ta64_0 * 4ll + 2ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_3_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_3_0[0]), "=r"(_v8_3_0[1]), "=r"(_v8_3_0[2]), "=r"(_v8_3_0[3]), "=r"(_v8_3_0[4]), "=r"(_v8_3_0[5]), "=r"(_v8_3_0[6]), "=r"(_v8_3_0[7]) : "l"((const void*)((const char*)_v8p_3 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -231,7 +231,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_4[16];
             {
-                const void* _v8p_4 = (const void*)(X + ((ta64_0 * 4 + 3) * 4096 + col_off) + (0));
+                const void* _v8p_4 = (const void*)(X + ((ta64_0 * 4ll + 3ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_4_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_4_0[0]), "=r"(_v8_4_0[1]), "=r"(_v8_4_0[2]), "=r"(_v8_4_0[3]), "=r"(_v8_4_0[4]), "=r"(_v8_4_0[5]), "=r"(_v8_4_0[6]), "=r"(_v8_4_0[7]) : "l"((const void*)((const char*)_v8p_4 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -472,7 +472,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             long long ta64_1 = (long long)tok_a_1;
             float vec_load_5[16];
             {
-                const void* _v8p_71 = (const void*)(dU + (ta64_1 * 4096 + col_off) + (0));
+                const void* _v8p_71 = (const void*)(dU + (ta64_1 * 4096ll + col_off) + (0));
                 uint32_t _v8_71_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_71_0[0]), "=r"(_v8_71_0[1]), "=r"(_v8_71_0[2]), "=r"(_v8_71_0[3]), "=r"(_v8_71_0[4]), "=r"(_v8_71_0[5]), "=r"(_v8_71_0[6]), "=r"(_v8_71_0[7]) : "l"((const void*)((const char*)_v8p_71 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -495,7 +495,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_1_1[16];
             {
-                const void* _v8p_72 = (const void*)(X + (ta64_1 * 4 * 4096 + col_off) + (0));
+                const void* _v8p_72 = (const void*)(X + (ta64_1 * 4ll * 4096ll + col_off) + (0));
                 uint32_t _v8_72_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_72_0[0]), "=r"(_v8_72_0[1]), "=r"(_v8_72_0[2]), "=r"(_v8_72_0[3]), "=r"(_v8_72_0[4]), "=r"(_v8_72_0[5]), "=r"(_v8_72_0[6]), "=r"(_v8_72_0[7]) : "l"((const void*)((const char*)_v8p_72 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -518,7 +518,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_2_1[16];
             {
-                const void* _v8p_73 = (const void*)(X + ((ta64_1 * 4 + 1) * 4096 + col_off) + (0));
+                const void* _v8p_73 = (const void*)(X + ((ta64_1 * 4ll + 1ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_73_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_73_0[0]), "=r"(_v8_73_0[1]), "=r"(_v8_73_0[2]), "=r"(_v8_73_0[3]), "=r"(_v8_73_0[4]), "=r"(_v8_73_0[5]), "=r"(_v8_73_0[6]), "=r"(_v8_73_0[7]) : "l"((const void*)((const char*)_v8p_73 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -541,7 +541,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_3_1[16];
             {
-                const void* _v8p_74 = (const void*)(X + ((ta64_1 * 4 + 2) * 4096 + col_off) + (0));
+                const void* _v8p_74 = (const void*)(X + ((ta64_1 * 4ll + 2ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_74_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_74_0[0]), "=r"(_v8_74_0[1]), "=r"(_v8_74_0[2]), "=r"(_v8_74_0[3]), "=r"(_v8_74_0[4]), "=r"(_v8_74_0[5]), "=r"(_v8_74_0[6]), "=r"(_v8_74_0[7]) : "l"((const void*)((const char*)_v8p_74 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -564,7 +564,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_4_1[16];
             {
-                const void* _v8p_75 = (const void*)(X + ((ta64_1 * 4 + 3) * 4096 + col_off) + (0));
+                const void* _v8p_75 = (const void*)(X + ((ta64_1 * 4ll + 3ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_75_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_75_0[0]), "=r"(_v8_75_0[1]), "=r"(_v8_75_0[2]), "=r"(_v8_75_0[3]), "=r"(_v8_75_0[4]), "=r"(_v8_75_0[5]), "=r"(_v8_75_0[6]), "=r"(_v8_75_0[7]) : "l"((const void*)((const char*)_v8p_75 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -805,7 +805,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             long long ta64_2 = (long long)tok_a_2;
             float vec_load_6[16];
             {
-                const void* _v8p_142 = (const void*)(dU + (ta64_2 * 4096 + col_off) + (0));
+                const void* _v8p_142 = (const void*)(dU + (ta64_2 * 4096ll + col_off) + (0));
                 uint32_t _v8_142_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_142_0[0]), "=r"(_v8_142_0[1]), "=r"(_v8_142_0[2]), "=r"(_v8_142_0[3]), "=r"(_v8_142_0[4]), "=r"(_v8_142_0[5]), "=r"(_v8_142_0[6]), "=r"(_v8_142_0[7]) : "l"((const void*)((const char*)_v8p_142 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -828,7 +828,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_1_2[16];
             {
-                const void* _v8p_143 = (const void*)(X + (ta64_2 * 4 * 4096 + col_off) + (0));
+                const void* _v8p_143 = (const void*)(X + (ta64_2 * 4ll * 4096ll + col_off) + (0));
                 uint32_t _v8_143_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_143_0[0]), "=r"(_v8_143_0[1]), "=r"(_v8_143_0[2]), "=r"(_v8_143_0[3]), "=r"(_v8_143_0[4]), "=r"(_v8_143_0[5]), "=r"(_v8_143_0[6]), "=r"(_v8_143_0[7]) : "l"((const void*)((const char*)_v8p_143 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -851,7 +851,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_2_2[16];
             {
-                const void* _v8p_144 = (const void*)(X + ((ta64_2 * 4 + 1) * 4096 + col_off) + (0));
+                const void* _v8p_144 = (const void*)(X + ((ta64_2 * 4ll + 1ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_144_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_144_0[0]), "=r"(_v8_144_0[1]), "=r"(_v8_144_0[2]), "=r"(_v8_144_0[3]), "=r"(_v8_144_0[4]), "=r"(_v8_144_0[5]), "=r"(_v8_144_0[6]), "=r"(_v8_144_0[7]) : "l"((const void*)((const char*)_v8p_144 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -874,7 +874,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_3_2[16];
             {
-                const void* _v8p_145 = (const void*)(X + ((ta64_2 * 4 + 2) * 4096 + col_off) + (0));
+                const void* _v8p_145 = (const void*)(X + ((ta64_2 * 4ll + 2ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_145_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_145_0[0]), "=r"(_v8_145_0[1]), "=r"(_v8_145_0[2]), "=r"(_v8_145_0[3]), "=r"(_v8_145_0[4]), "=r"(_v8_145_0[5]), "=r"(_v8_145_0[6]), "=r"(_v8_145_0[7]) : "l"((const void*)((const char*)_v8p_145 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -897,7 +897,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_4_2[16];
             {
-                const void* _v8p_146 = (const void*)(X + ((ta64_2 * 4 + 3) * 4096 + col_off) + (0));
+                const void* _v8p_146 = (const void*)(X + ((ta64_2 * 4ll + 3ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_146_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_146_0[0]), "=r"(_v8_146_0[1]), "=r"(_v8_146_0[2]), "=r"(_v8_146_0[3]), "=r"(_v8_146_0[4]), "=r"(_v8_146_0[5]), "=r"(_v8_146_0[6]), "=r"(_v8_146_0[7]) : "l"((const void*)((const char*)_v8p_146 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -1138,7 +1138,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             long long ta64_3 = (long long)tok_a_3;
             float vec_load_7[16];
             {
-                const void* _v8p_213 = (const void*)(dU + (ta64_3 * 4096 + col_off) + (0));
+                const void* _v8p_213 = (const void*)(dU + (ta64_3 * 4096ll + col_off) + (0));
                 uint32_t _v8_213_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_213_0[0]), "=r"(_v8_213_0[1]), "=r"(_v8_213_0[2]), "=r"(_v8_213_0[3]), "=r"(_v8_213_0[4]), "=r"(_v8_213_0[5]), "=r"(_v8_213_0[6]), "=r"(_v8_213_0[7]) : "l"((const void*)((const char*)_v8p_213 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -1161,7 +1161,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_1_3[16];
             {
-                const void* _v8p_214 = (const void*)(X + (ta64_3 * 4 * 4096 + col_off) + (0));
+                const void* _v8p_214 = (const void*)(X + (ta64_3 * 4ll * 4096ll + col_off) + (0));
                 uint32_t _v8_214_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_214_0[0]), "=r"(_v8_214_0[1]), "=r"(_v8_214_0[2]), "=r"(_v8_214_0[3]), "=r"(_v8_214_0[4]), "=r"(_v8_214_0[5]), "=r"(_v8_214_0[6]), "=r"(_v8_214_0[7]) : "l"((const void*)((const char*)_v8p_214 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -1184,7 +1184,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_2_3[16];
             {
-                const void* _v8p_215 = (const void*)(X + ((ta64_3 * 4 + 1) * 4096 + col_off) + (0));
+                const void* _v8p_215 = (const void*)(X + ((ta64_3 * 4ll + 1ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_215_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_215_0[0]), "=r"(_v8_215_0[1]), "=r"(_v8_215_0[2]), "=r"(_v8_215_0[3]), "=r"(_v8_215_0[4]), "=r"(_v8_215_0[5]), "=r"(_v8_215_0[6]), "=r"(_v8_215_0[7]) : "l"((const void*)((const char*)_v8p_215 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -1207,7 +1207,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_3_3[16];
             {
-                const void* _v8p_216 = (const void*)(X + ((ta64_3 * 4 + 2) * 4096 + col_off) + (0));
+                const void* _v8p_216 = (const void*)(X + ((ta64_3 * 4ll + 2ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_216_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_216_0[0]), "=r"(_v8_216_0[1]), "=r"(_v8_216_0[2]), "=r"(_v8_216_0[3]), "=r"(_v8_216_0[4]), "=r"(_v8_216_0[5]), "=r"(_v8_216_0[6]), "=r"(_v8_216_0[7]) : "l"((const void*)((const char*)_v8p_216 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -1230,7 +1230,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_4_3[16];
             {
-                const void* _v8p_217 = (const void*)(X + ((ta64_3 * 4 + 3) * 4096 + col_off) + (0));
+                const void* _v8p_217 = (const void*)(X + ((ta64_3 * 4ll + 3ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_217_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_217_0[0]), "=r"(_v8_217_0[1]), "=r"(_v8_217_0[2]), "=r"(_v8_217_0[3]), "=r"(_v8_217_0[4]), "=r"(_v8_217_0[5]), "=r"(_v8_217_0[6]), "=r"(_v8_217_0[7]) : "l"((const void*)((const char*)_v8p_217 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -1471,7 +1471,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             long long ta64_4 = (long long)tok_a_4;
             float vec_load_8[16];
             {
-                const void* _v8p_284 = (const void*)(dU + (ta64_4 * 4096 + col_off) + (0));
+                const void* _v8p_284 = (const void*)(dU + (ta64_4 * 4096ll + col_off) + (0));
                 uint32_t _v8_284_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_284_0[0]), "=r"(_v8_284_0[1]), "=r"(_v8_284_0[2]), "=r"(_v8_284_0[3]), "=r"(_v8_284_0[4]), "=r"(_v8_284_0[5]), "=r"(_v8_284_0[6]), "=r"(_v8_284_0[7]) : "l"((const void*)((const char*)_v8p_284 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -1494,7 +1494,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_1_4[16];
             {
-                const void* _v8p_285 = (const void*)(X + (ta64_4 * 4 * 4096 + col_off) + (0));
+                const void* _v8p_285 = (const void*)(X + (ta64_4 * 4ll * 4096ll + col_off) + (0));
                 uint32_t _v8_285_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_285_0[0]), "=r"(_v8_285_0[1]), "=r"(_v8_285_0[2]), "=r"(_v8_285_0[3]), "=r"(_v8_285_0[4]), "=r"(_v8_285_0[5]), "=r"(_v8_285_0[6]), "=r"(_v8_285_0[7]) : "l"((const void*)((const char*)_v8p_285 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -1517,7 +1517,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_2_4[16];
             {
-                const void* _v8p_286 = (const void*)(X + ((ta64_4 * 4 + 1) * 4096 + col_off) + (0));
+                const void* _v8p_286 = (const void*)(X + ((ta64_4 * 4ll + 1ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_286_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_286_0[0]), "=r"(_v8_286_0[1]), "=r"(_v8_286_0[2]), "=r"(_v8_286_0[3]), "=r"(_v8_286_0[4]), "=r"(_v8_286_0[5]), "=r"(_v8_286_0[6]), "=r"(_v8_286_0[7]) : "l"((const void*)((const char*)_v8p_286 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -1540,7 +1540,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_3_4[16];
             {
-                const void* _v8p_287 = (const void*)(X + ((ta64_4 * 4 + 2) * 4096 + col_off) + (0));
+                const void* _v8p_287 = (const void*)(X + ((ta64_4 * 4ll + 2ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_287_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_287_0[0]), "=r"(_v8_287_0[1]), "=r"(_v8_287_0[2]), "=r"(_v8_287_0[3]), "=r"(_v8_287_0[4]), "=r"(_v8_287_0[5]), "=r"(_v8_287_0[6]), "=r"(_v8_287_0[7]) : "l"((const void*)((const char*)_v8p_287 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -1563,7 +1563,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_4_4[16];
             {
-                const void* _v8p_288 = (const void*)(X + ((ta64_4 * 4 + 3) * 4096 + col_off) + (0));
+                const void* _v8p_288 = (const void*)(X + ((ta64_4 * 4ll + 3ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_288_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_288_0[0]), "=r"(_v8_288_0[1]), "=r"(_v8_288_0[2]), "=r"(_v8_288_0[3]), "=r"(_v8_288_0[4]), "=r"(_v8_288_0[5]), "=r"(_v8_288_0[6]), "=r"(_v8_288_0[7]) : "l"((const void*)((const char*)_v8p_288 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -1804,7 +1804,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             long long ta64_5 = (long long)tok_a_5;
             float vec_load_9[16];
             {
-                const void* _v8p_355 = (const void*)(dU + (ta64_5 * 4096 + col_off) + (0));
+                const void* _v8p_355 = (const void*)(dU + (ta64_5 * 4096ll + col_off) + (0));
                 uint32_t _v8_355_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_355_0[0]), "=r"(_v8_355_0[1]), "=r"(_v8_355_0[2]), "=r"(_v8_355_0[3]), "=r"(_v8_355_0[4]), "=r"(_v8_355_0[5]), "=r"(_v8_355_0[6]), "=r"(_v8_355_0[7]) : "l"((const void*)((const char*)_v8p_355 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -1827,7 +1827,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_1_5[16];
             {
-                const void* _v8p_356 = (const void*)(X + (ta64_5 * 4 * 4096 + col_off) + (0));
+                const void* _v8p_356 = (const void*)(X + (ta64_5 * 4ll * 4096ll + col_off) + (0));
                 uint32_t _v8_356_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_356_0[0]), "=r"(_v8_356_0[1]), "=r"(_v8_356_0[2]), "=r"(_v8_356_0[3]), "=r"(_v8_356_0[4]), "=r"(_v8_356_0[5]), "=r"(_v8_356_0[6]), "=r"(_v8_356_0[7]) : "l"((const void*)((const char*)_v8p_356 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -1850,7 +1850,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_2_5[16];
             {
-                const void* _v8p_357 = (const void*)(X + ((ta64_5 * 4 + 1) * 4096 + col_off) + (0));
+                const void* _v8p_357 = (const void*)(X + ((ta64_5 * 4ll + 1ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_357_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_357_0[0]), "=r"(_v8_357_0[1]), "=r"(_v8_357_0[2]), "=r"(_v8_357_0[3]), "=r"(_v8_357_0[4]), "=r"(_v8_357_0[5]), "=r"(_v8_357_0[6]), "=r"(_v8_357_0[7]) : "l"((const void*)((const char*)_v8p_357 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -1873,7 +1873,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_3_5[16];
             {
-                const void* _v8p_358 = (const void*)(X + ((ta64_5 * 4 + 2) * 4096 + col_off) + (0));
+                const void* _v8p_358 = (const void*)(X + ((ta64_5 * 4ll + 2ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_358_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_358_0[0]), "=r"(_v8_358_0[1]), "=r"(_v8_358_0[2]), "=r"(_v8_358_0[3]), "=r"(_v8_358_0[4]), "=r"(_v8_358_0[5]), "=r"(_v8_358_0[6]), "=r"(_v8_358_0[7]) : "l"((const void*)((const char*)_v8p_358 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -1896,7 +1896,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_4_5[16];
             {
-                const void* _v8p_359 = (const void*)(X + ((ta64_5 * 4 + 3) * 4096 + col_off) + (0));
+                const void* _v8p_359 = (const void*)(X + ((ta64_5 * 4ll + 3ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_359_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_359_0[0]), "=r"(_v8_359_0[1]), "=r"(_v8_359_0[2]), "=r"(_v8_359_0[3]), "=r"(_v8_359_0[4]), "=r"(_v8_359_0[5]), "=r"(_v8_359_0[6]), "=r"(_v8_359_0[7]) : "l"((const void*)((const char*)_v8p_359 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -2137,7 +2137,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             long long ta64_6 = (long long)tok_a_6;
             float vec_load_10[16];
             {
-                const void* _v8p_426 = (const void*)(dU + (ta64_6 * 4096 + col_off) + (0));
+                const void* _v8p_426 = (const void*)(dU + (ta64_6 * 4096ll + col_off) + (0));
                 uint32_t _v8_426_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_426_0[0]), "=r"(_v8_426_0[1]), "=r"(_v8_426_0[2]), "=r"(_v8_426_0[3]), "=r"(_v8_426_0[4]), "=r"(_v8_426_0[5]), "=r"(_v8_426_0[6]), "=r"(_v8_426_0[7]) : "l"((const void*)((const char*)_v8p_426 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -2160,7 +2160,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_1_6[16];
             {
-                const void* _v8p_427 = (const void*)(X + (ta64_6 * 4 * 4096 + col_off) + (0));
+                const void* _v8p_427 = (const void*)(X + (ta64_6 * 4ll * 4096ll + col_off) + (0));
                 uint32_t _v8_427_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_427_0[0]), "=r"(_v8_427_0[1]), "=r"(_v8_427_0[2]), "=r"(_v8_427_0[3]), "=r"(_v8_427_0[4]), "=r"(_v8_427_0[5]), "=r"(_v8_427_0[6]), "=r"(_v8_427_0[7]) : "l"((const void*)((const char*)_v8p_427 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -2183,7 +2183,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_2_6[16];
             {
-                const void* _v8p_428 = (const void*)(X + ((ta64_6 * 4 + 1) * 4096 + col_off) + (0));
+                const void* _v8p_428 = (const void*)(X + ((ta64_6 * 4ll + 1ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_428_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_428_0[0]), "=r"(_v8_428_0[1]), "=r"(_v8_428_0[2]), "=r"(_v8_428_0[3]), "=r"(_v8_428_0[4]), "=r"(_v8_428_0[5]), "=r"(_v8_428_0[6]), "=r"(_v8_428_0[7]) : "l"((const void*)((const char*)_v8p_428 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -2206,7 +2206,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_3_6[16];
             {
-                const void* _v8p_429 = (const void*)(X + ((ta64_6 * 4 + 2) * 4096 + col_off) + (0));
+                const void* _v8p_429 = (const void*)(X + ((ta64_6 * 4ll + 2ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_429_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_429_0[0]), "=r"(_v8_429_0[1]), "=r"(_v8_429_0[2]), "=r"(_v8_429_0[3]), "=r"(_v8_429_0[4]), "=r"(_v8_429_0[5]), "=r"(_v8_429_0[6]), "=r"(_v8_429_0[7]) : "l"((const void*)((const char*)_v8p_429 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -2229,7 +2229,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_4_6[16];
             {
-                const void* _v8p_430 = (const void*)(X + ((ta64_6 * 4 + 3) * 4096 + col_off) + (0));
+                const void* _v8p_430 = (const void*)(X + ((ta64_6 * 4ll + 3ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_430_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_430_0[0]), "=r"(_v8_430_0[1]), "=r"(_v8_430_0[2]), "=r"(_v8_430_0[3]), "=r"(_v8_430_0[4]), "=r"(_v8_430_0[5]), "=r"(_v8_430_0[6]), "=r"(_v8_430_0[7]) : "l"((const void*)((const char*)_v8p_430 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -2470,7 +2470,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             long long ta64_7 = (long long)tok_a_7;
             float vec_load_11[16];
             {
-                const void* _v8p_497 = (const void*)(dU + (ta64_7 * 4096 + col_off) + (0));
+                const void* _v8p_497 = (const void*)(dU + (ta64_7 * 4096ll + col_off) + (0));
                 uint32_t _v8_497_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_497_0[0]), "=r"(_v8_497_0[1]), "=r"(_v8_497_0[2]), "=r"(_v8_497_0[3]), "=r"(_v8_497_0[4]), "=r"(_v8_497_0[5]), "=r"(_v8_497_0[6]), "=r"(_v8_497_0[7]) : "l"((const void*)((const char*)_v8p_497 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -2493,7 +2493,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_1_7[16];
             {
-                const void* _v8p_498 = (const void*)(X + (ta64_7 * 4 * 4096 + col_off) + (0));
+                const void* _v8p_498 = (const void*)(X + (ta64_7 * 4ll * 4096ll + col_off) + (0));
                 uint32_t _v8_498_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_498_0[0]), "=r"(_v8_498_0[1]), "=r"(_v8_498_0[2]), "=r"(_v8_498_0[3]), "=r"(_v8_498_0[4]), "=r"(_v8_498_0[5]), "=r"(_v8_498_0[6]), "=r"(_v8_498_0[7]) : "l"((const void*)((const char*)_v8p_498 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -2516,7 +2516,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_2_7[16];
             {
-                const void* _v8p_499 = (const void*)(X + ((ta64_7 * 4 + 1) * 4096 + col_off) + (0));
+                const void* _v8p_499 = (const void*)(X + ((ta64_7 * 4ll + 1ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_499_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_499_0[0]), "=r"(_v8_499_0[1]), "=r"(_v8_499_0[2]), "=r"(_v8_499_0[3]), "=r"(_v8_499_0[4]), "=r"(_v8_499_0[5]), "=r"(_v8_499_0[6]), "=r"(_v8_499_0[7]) : "l"((const void*)((const char*)_v8p_499 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -2539,7 +2539,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_3_7[16];
             {
-                const void* _v8p_500 = (const void*)(X + ((ta64_7 * 4 + 2) * 4096 + col_off) + (0));
+                const void* _v8p_500 = (const void*)(X + ((ta64_7 * 4ll + 2ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_500_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_500_0[0]), "=r"(_v8_500_0[1]), "=r"(_v8_500_0[2]), "=r"(_v8_500_0[3]), "=r"(_v8_500_0[4]), "=r"(_v8_500_0[5]), "=r"(_v8_500_0[6]), "=r"(_v8_500_0[7]) : "l"((const void*)((const char*)_v8p_500 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -2562,7 +2562,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float vec_load_4_7[16];
             {
-                const void* _v8p_501 = (const void*)(X + ((ta64_7 * 4 + 3) * 4096 + col_off) + (0));
+                const void* _v8p_501 = (const void*)(X + ((ta64_7 * 4ll + 3ll) * 4096ll + col_off) + (0));
                 uint32_t _v8_501_0[8];
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                     : "=r"(_v8_501_0[0]), "=r"(_v8_501_0[1]), "=r"(_v8_501_0[2]), "=r"(_v8_501_0[3]), "=r"(_v8_501_0[4]), "=r"(_v8_501_0[5]), "=r"(_v8_501_0[6]), "=r"(_v8_501_0[7]) : "l"((const void*)((const char*)_v8p_501 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -2803,10 +2803,10 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
         int tokc = ((tok < t1) ? tok : t_last);
         long long tok64 = (long long)tokc;
         float dp[1];
-        long long srow = tok64 * 64;
+        long long srow = tok64 * 64ll;
         float r = stats[srow];
-        float z_load = stats[srow + 1 + n64];
-        float gval = gstats[tok64 * 32 + (long long)gcol];
+        float z_load = stats[srow + 1ll + n64];
+        float gval = gstats[tok64 * 32ll + (long long)gcol];
         float z = ((lane_1 < 24) ? z_load : 0.0f);
         float a_map;
         asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(a_map) : "f"(z), "f"(sc), "f"(bs));
@@ -3026,16 +3026,16 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
         float p1 = ((lane_1 < 24) ? cvt_f32 : 0.0f);
         float p2 = ((lane_1 < 24) ? cvt_f32_1 : 0.0f);
         float p3 = ((lane_1 < 24) ? cvt_f32_2 : 0.0f);
-        long long drow = tok64 * 96 + lane64;
+        long long drow = tok64 * 96ll + lane64;
         asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.b16 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&dzp[drow])), "h"(__bfloat16_as_ushort((__nv_bfloat16)p1)), "r"((unsigned int)(tok < t1)) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.b16 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&dzp[drow + 32])), "h"(__bfloat16_as_ushort((__nv_bfloat16)p2)), "r"((unsigned int)(tok < t1)) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.b16 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&dzp[drow + 64])), "h"(__bfloat16_as_ushort((__nv_bfloat16)p3)), "r"((unsigned int)(tok < t1)) : "memory");
-        long long trow = tok64 * 24;
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.b16 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&dzp[drow + 32ll])), "h"(__bfloat16_as_ushort((__nv_bfloat16)p2)), "r"((unsigned int)(tok < t1)) : "memory");
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.b16 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&dzp[drow + 64ll])), "h"(__bfloat16_as_ushort((__nv_bfloat16)p3)), "r"((unsigned int)(tok < t1)) : "memory");
+        long long trow = tok64 * 24ll;
         asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow])), "f"(r), "r"((unsigned int)(tok < t1 && lane_1 == 0)) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + 1])), "f"(c_t), "r"((unsigned int)(tok < t1 && lane_1 == 0)) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + 2 + lane64])), "f"(_add_1), "r"((unsigned int)(tok < t1 && lane_1 < 4)) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + lane64 - 2])), "f"(c), "r"((unsigned int)(tok < t1 && is_logit)) : "memory");
-        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + lane64 - 2])), "f"(0.0f), "r"((unsigned int)(tok < t1 && (lane_1 >= 24 && lane_1 < 26))) : "memory");
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + 1ll])), "f"(c_t), "r"((unsigned int)(tok < t1 && lane_1 == 0)) : "memory");
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + 2ll + lane64])), "f"(_add_1), "r"((unsigned int)(tok < t1 && lane_1 < 4)) : "memory");
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + lane64 - 2ll])), "f"(c), "r"((unsigned int)(tok < t1 && is_logit)) : "memory");
+        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(&tokp[trow + lane64 - 2ll])), "f"(0.0f), "r"((unsigned int)(tok < t1 && (lane_1 >= 24 && lane_1 < 26))) : "memory");
         float _sub_0;
         asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_0) : "f"(da_0), "f"(comp[0]));
         float _add_2;
@@ -3065,7 +3065,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
     fold[fbase + 3] = comp[1];
     __syncthreads();
     if (warp_0 == 0) {
-        long long prow = (long long)bid * 32;
+        long long prow = (long long)bid * 32ll;
         float o[2];
         float oc[2];
         #pragma unroll
@@ -3152,7 +3152,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
             }
             float _sub_645;
             asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_645) : "f"(ga[0]), "f"(gc[0]));
-            *(reinterpret_cast<float*>(param_partial + (prow + 24 + lane64)) + (0)) = _sub_645;
+            *(reinterpret_cast<float*>(param_partial + (prow + 24ll + lane64)) + (0)) = _sub_645;
         }
         if (lane_1 >= 27) {
             *(reinterpret_cast<float*>(param_partial + (prow + lane64)) + (0)) = 0.0f;
@@ -3168,7 +3168,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
         for (int k = 0; k < trips_z; k++) {
             int ez = k * 256 + tid_2;
             if (ez < nz) {
-                *(reinterpret_cast<__nv_bfloat16*>(dzp + (t64 * 96 + (long long)ez)) + (0)) = (__nv_bfloat16)zero;
+                *(reinterpret_cast<__nv_bfloat16*>(dzp + (t64 * 96ll + (long long)ez)) + (0)) = (__nv_bfloat16)zero;
             }
         }
         int nt = npad * 24;
@@ -3177,7 +3177,7 @@ kernel_cake_mhc_train_bwd_token__rt64(__nv_bfloat16* __restrict__ X, __nv_bfloat
         for (int k_1 = 0; k_1 < trips_t; k_1++) {
             int et = k_1 * 256 + tid_2;
             if (et < nt) {
-                *(reinterpret_cast<float*>(tokp + (t64 * 24 + (long long)et)) + (0)) = zero;
+                *(reinterpret_cast<float*>(tokp + (t64 * 24ll + (long long)et)) + (0)) = zero;
             }
         }
     }

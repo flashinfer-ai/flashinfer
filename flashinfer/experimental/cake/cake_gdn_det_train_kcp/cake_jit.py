@@ -72,6 +72,10 @@ In-kernel Q / K L2 norm (option ``use_qk_l2norm_in_kernel``; three programs, rec
   #1 * ``fwd_prep_l2n``      #1 on the raw ``q`` / ``k`` that first writes ``qn`` / ``kn`` (BF16 ``[T, H_qk, 128]``)
                              and the FP32 ``q_rstd`` / ``k_rstd`` ``[T, H_qk]`` (token stride ``rstd_tstride``) and
                              runs #1's body on them; grid (NC, H_qk), two resident CTAs per SM as #1
+                             (the ``_fwd`` record: the same program without the backward-only ``akk`` / ``g_cum``
+                             outputs and parameters, every other output bitwise; select rule ``prep_form`` on
+                             ``backward_tapes``: the host picks it for a forward whose ``akk`` / ``g_cum`` have no
+                             reader)
   #8 * ``bwd_dqkg_l2n``      #8 on ``qn`` / ``kn`` with the pullback of the norm before the one BF16 rounding of
                              ``dq`` / ``dk`` (raw rows ``q_raw`` / ``k_raw`` with ``q_raw_tstride`` /
                              ``k_raw_tstride``, the rstd rows); ``group_reduce = 1`` only
@@ -696,8 +700,74 @@ MODULES: dict[str, dict[str, Any]] = {
             "w_out": "w",
         },
         "program": "fwd_prep_l2n",
-        "select_rule": {"kind": "always"},
+        "select_rule": {"backward_tapes": True, "kind": "prep_form"},
         "variant": None,
+    },
+    "fwd_prep_l2n_fwd": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "q_tma"],
+            ["buffer", "k_tma"],
+            ["buffer", "v_tma"],
+            ["buffer", "g"],
+            ["buffer", "beta"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "w_out"],
+            ["buffer", "u_out"],
+            ["buffer", "aqk_out"],
+            ["buffer", "rowscale"],
+            ["buffer", "qscale"],
+            ["buffer", "gamma"],
+            ["buffer", "qn_out"],
+            ["buffer", "kn_out"],
+            ["buffer", "q_rstd"],
+            ["buffer", "k_rstd"],
+            ["parameter", "rstd_tstride"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "chunks_by_qk_heads"},
+        "kernel_symbol": "kernel_cake_gdn_det_train_b5f5a36e92c00cae9522",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 113664,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_b5f5a36e92c00cae9522",
+        "logical": {
+            "aqk_out": "aqk",
+            "beta": "beta",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "g": "g",
+            "gamma": "gamma",
+            "k_rstd": "k_rstd",
+            "k_tma": "k",
+            "kn_out": "kn",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_qk_heads",
+            "q_rstd": "q_rstd",
+            "q_tma": "q",
+            "qn_out": "qn",
+            "qscale": "qscale",
+            "rowscale": "rowscale",
+            "rstd_tstride": "rstd_tstride",
+            "scale": "scale",
+            "u_out": "u",
+            "v_tma": "v",
+            "w_out": "w",
+        },
+        "program": "fwd_prep_l2n",
+        "select_rule": {"backward_tapes": False, "kind": "prep_form"},
+        "variant": "fwd",
     },
     "gate_epilogue": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -1303,7 +1373,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"ctas_per_head": 1, "kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_gdn_det_train_85572b8a5cfbc960fd3c_kcp",
+        "kernel_symbol": "kernel_cake_gdn_det_train_99188218c943435780ea_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -1311,7 +1381,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_85572b8a5cfbc960fd3c_kcp",
+        "library": "cake_gdn_det_train_99188218c943435780ea_kcp",
         "logical": {
             "aqk_tma": "aqk",
             "chunk_bos": "chunk_bos",
@@ -1369,7 +1439,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_gdn_det_train_68f80b7d8e094ebad01b_kcp",
+        "kernel_symbol": "kernel_cake_gdn_det_train_1dbb3715625ef542df16_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -1377,7 +1447,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_68f80b7d8e094ebad01b_kcp",
+        "library": "cake_gdn_det_train_1dbb3715625ef542df16_kcp",
         "logical": {
             "aqk_tma": "aqk",
             "chunk_bos": "chunk_bos",
@@ -1569,15 +1639,15 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_gdn_det_train_4bf560a7ea389e92d5f1_kcp",
+        "kernel_symbol": "kernel_cake_gdn_det_train_ca5488020bef49bf474b_kcp",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 199680,
+            "dynamic_smem_bytes": 199808,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_4bf560a7ea389e92d5f1_kcp",
+        "library": "cake_gdn_det_train_ca5488020bef49bf474b_kcp",
         "logical": {
             "chunk_bos": "chunk_bos",
             "gamma": "gamma",
@@ -1831,10 +1901,18 @@ def l2n_records_shipped() -> bool:
     return all(records_of_program(p) for p in L2N_PROGRAMS)
 
 
-def _admits(rule: Mapping[str, Any], *, ncols: int | None, ctas_per_head: int) -> bool:
+def _admits(
+    rule: Mapping[str, Any],
+    *,
+    ncols: int | None,
+    ctas_per_head: int,
+    backward_tapes: bool = True,
+) -> bool:
     kind = rule["kind"]
     if kind == "always":
         return True
+    if kind == "prep_form":
+        return bool(rule["backward_tapes"]) == bool(backward_tapes)
     if kind == "columns":
         return ncols is not None and int(ncols) == int(rule["ncols"])
     if kind == "ctas_per_head":
@@ -1849,8 +1927,12 @@ def select_record(
     ctas_per_head: int = 1,
     precision_mode: int = PRECISION_MODE_DEFAULT,
     transfer_walk: str = TRANSFER_WALK_DEFAULT,
+    backward_tapes: bool = True,
 ) -> str:
     """The one record of ``program`` the launch's scalars select (``always`` for a single-record program;
+    ``prep_form`` picks the #1_l2n record by ``backward_tapes``: ``True`` (the default) the program that also writes
+    the backward-only ``akk`` / ``g_cum``, ``False`` the ``_fwd`` record without them, for a forward whose ``akk`` /
+    ``g_cum`` have no reader;
     ``columns`` picks the merge variant whose column count is the chain's ``ncols``: 128 state, 256 map;
     ``ctas_per_head`` picks the form of a forward state walk: 1 the ``vh = 128`` record, 2 the ``_vh64`` record with
     two CTAs per (segment, head), chosen per launch when ``n_walk x HV <= sm_count``).  Shipped
@@ -1900,13 +1982,16 @@ def select_record(
         name
         for name in records_of_program(program)
         if _admits(
-            MODULES[name]["select_rule"], ncols=ncols, ctas_per_head=ctas_per_head
+            MODULES[name]["select_rule"],
+            ncols=ncols,
+            ctas_per_head=ctas_per_head,
+            backward_tapes=backward_tapes,
         )
     ]
     if len(admitted) != 1:
         raise ValueError(
             f"program {program!r}: {len(admitted)} records admit ncols={ncols} ctas_per_head={ctas_per_head} "
-            f"({admitted}); expected one"
+            f"backward_tapes={backward_tapes} ({admitted}); expected one"
         )
     return admitted[0]
 

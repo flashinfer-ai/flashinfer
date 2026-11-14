@@ -147,6 +147,76 @@ class MegaKernelBackend(ABC):
         """Construct a backend, including an opt-in variant selector."""
         return cls(config)
 
+    def ep_weight_pack(self, weights):
+        """Convert the selector's [up, gate] FC1 rows to the backend's input order."""
+        return weights
+
+    def batch_invariant_fingerprint(self, fleet_params: FleetParams) -> str | None:
+        """Arithmetic receipt when the backend implements a specified BI class."""
+        return None
+
+    def ep_selected_config(self, workspace):
+        return self.get_tuned_config(workspace)
+
+    def ep_prepare_fixed(self, workspace, weights):
+        """Compile a fixed EP plan locally, before any rank launches it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support fixed EP preparation"
+        )
+
+    def ep_validate_selection(self, fleet_params, selection):
+        """Validate a cached fixed configuration before collective allocation."""
+        import dataclasses
+
+        from flashinfer.autotuner.autotuner import _json_to_tactic
+        from .registry import create_mega_kernel
+
+        expected = (
+            {"kernel_variant", "knobs"}
+            if hasattr(self._config, "kernel_variant")
+            else {"knobs"}
+        )
+        if set(selection) != expected:
+            raise ValueError(
+                "cached MegaMoE selection fields do not match its configuration"
+            )
+        fields = {
+            "knobs": {k: _json_to_tactic(v) for k, v in selection["knobs"].items()}
+        }
+        if "kernel_variant" in selection:
+            if not hasattr(self._config, "kernel_variant"):
+                raise ValueError("this MegaMoE configuration has no kernel_variant")
+            fields["kernel_variant"] = selection["kernel_variant"]
+        config = dataclasses.replace(self._config, **fields)
+        kernel = create_mega_kernel(config)
+        kernel.bind_ep_bootstrap(self._ep_bootstrap)
+        kernel.validate_init(self._ep_bootstrap, fleet_params)
+        if getattr(self._config, "batch_invariant", False):
+            self.validate_init(self._ep_bootstrap, fleet_params)
+            if kernel.batch_invariant_fingerprint(
+                fleet_params
+            ) != self.batch_invariant_fingerprint(fleet_params):
+                raise ValueError(
+                    "cached MegaMoE selection changes the arithmetic fingerprint"
+                )
+
+    def ep_force_tune(self, workspace, tensors, weights, output):
+        """Run a fresh inner search for an explicitly forced outer search."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support forced EP tuning"
+        )
+
+    def ep_tuning_fallback(self):
+        import dataclasses
+
+        return dataclasses.replace(self._config, knobs=None)
+
+    def ep_tuning_contract(self, fleet_params):
+        """Describe complete-forward tuning support for an outer EP selector."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support complete-EP selection"
+        )
+
     def get_tuned_config(self, workspace: Any = None) -> Any:
         """Return a fixed kernel config for the selected automatic result."""
         import dataclasses
@@ -402,6 +472,20 @@ class MegaKernelBackend(ABC):
         """Run the fused kernel. ``output=None`` (cutedsl backends) returns a
         zero-copy view of the workspace output, valid under stream ordering
         until the next launch on this session's buffers."""
+
+    def _compute_prepared(
+        self,
+        workspace: Any,
+        transformed_weights: Any,
+        *,
+        output: "torch.Tensor | None",
+    ) -> "torch.Tensor":
+        """Execute immediately after the layer validates and stages a forward.
+
+        Backends may omit checks already covered by that path. Public staged
+        execution continues through ``compute``.
+        """
+        return self.compute(workspace, transformed_weights, output=output)
 
     def compute_unfinalized(
         self,

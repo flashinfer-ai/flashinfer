@@ -33,7 +33,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 kcp_plan = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_plan")
 

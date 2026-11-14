@@ -388,16 +388,20 @@ def _launch(
     The caller launches this grid (``run_module`` / ``run_modules`` ``grid``),
     so a call plans it once.  A backward ``bwd_grid_mult`` above 1 launches
     that many times the record's untrimmed grid (``launch_grid`` without the
-    row), never trimmed to whole channel-tile ranks.
+    row), never trimmed to whole channel-tile ranks.  The plan names the
+    device's architecture, so a forward row of ``NARROW_TILE_WIDTHS`` runs its
+    width from the architecture's token floor (``cake_jit.NARROW_WIDTH_FLOORS``).
     """
 
+    arch = _loader.device_arch(device_index)
     scalars = plan(
         S,
         C,
         num_docs,
         geometry=record["grid_rule"]["geometry"],
         role=record["role"],
-        route=_loader.record_route(record, _loader.device_arch(device_index)),
+        route=_loader.record_route(record, arch),
+        arch=arch,
     )
     if bwd_grid_mult == 1:
         grid = launch_grid(record, device_index=device_index, C=C, S=S)
@@ -448,9 +452,11 @@ def cake_causal_conv1d_det_train_backward_workspace_bytes(
     the channel count the program, every program writes the leading rows of
     its own grid inside
     this buffer, and its reduce
-    program sums exactly those.  So one buffer serves every route (the bias
-    routes' fifth slab makes it 25 % larger than the dweight partials alone,
-    for every caller) and, as it depends on ``C`` and the device only, every
+    program sums exactly those.  So one buffer serves every route (a bias
+    route's fifth slab makes it 25 % larger than the dweight partials alone,
+    and in its channel bands the SM-wide row-group program's one channel tile
+    per CTA can need more, on sm_107a from C 520) and, as it depends on ``C``
+    and the device only, every
     token count; the main program fully writes the rows the reduce program
     sums, so the buffer needs no zeroing between launches or CUDA Graph
     replays.  ``bwd_grid_mult`` (one of ``BWD_GRID_MULTS``, default 1) sizes
@@ -515,8 +521,10 @@ def cake_causal_conv1d_det_train_forward_workspace_bytes(
     The forward's programs take their token chunks from int32 counters, two
     per channel tile (the next-chunk counter and the done-CTA counter of the
     tile), sized by the most over every forward program of every forward route
-    of the architecture (``cake_jit.forward_workspace_words``), so one buffer
-    serves every route; the size depends on ``C`` only (``S`` is checked and
+    of the architecture and both channel-tile plans of a row whose tiles change
+    at a token floor (``cake_jit.forward_workspace_words``,
+    ``cake_jit.NARROW_WIDTH_FLOORS``), so one buffer serves every route and
+    token count; the size depends on ``C`` only (``S`` is checked and
     otherwise unused, as for the backward helper).  The buffer must be zero
     before its first launch; every launch leaves it zero, so one buffer serves
     every later forward call of one stream, CUDA Graph replays included,

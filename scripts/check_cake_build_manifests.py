@@ -117,7 +117,7 @@ entries the gate wrote into it):
    error, further files go through ``--pytest-args``, whose extra pytest
    arguments are split like a shell) -- a second ``<python> -I`` child with the
    same blocker, the repository root on ``sys.path`` and
-   ``tests.test_helpers.cake_package.PACKAGES[<key>]`` pointed at the copy
+   ``tests.cake.test_helpers.cake_package.PACKAGES[<key>]`` pointed at the copy
    (the key whose import path is the package's, read from that table; with
    ``requires``, also every key of a required package pointed at its copy), runs
    ``pytest TESTFILE --noconftest -p no:cacheprovider -q -rfEs --junitxml
@@ -399,8 +399,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_with_kcp,
     ),
     Package(
-        "flashinfer.cake_gated_act_mxfp8_backend",
-        "flashinfer/cake_gated_act_mxfp8_backend",
+        "flashinfer.experimental.cake.cake_gated_act_mxfp8_det_train",
+        "flashinfer/experimental/cake/cake_gated_act_mxfp8_det_train",
         "cake_jit.py",
         refs_generic,
     ),
@@ -471,8 +471,20 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
+        "flashinfer.experimental.cake.cake_dsa_sparse_attention_det_train",
+        "flashinfer/experimental/cake/cake_dsa_sparse_attention_det_train",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
         "flashinfer.experimental.cake.cake_dsa_indexer_det_train",
         "flashinfer/experimental/cake/cake_dsa_indexer_det_train",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake.cake_dsa_indexer_nondet_train",
+        "flashinfer/experimental/cake/cake_dsa_indexer_nondet_train",
         "cake_jit.py",
         refs_generic,
     ),
@@ -647,6 +659,12 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.experimental.cake.cake_gqa_nondet_train",
         "flashinfer/experimental/cake/cake_gqa_nondet_train",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake.cake_gqa_det_train",
+        "flashinfer/experimental/cake/cake_gqa_det_train",
         "cake_jit.py",
         refs_generic,
     ),
@@ -1108,7 +1126,7 @@ BUILD_INFO_SCHEMA = "cake-build-info/1"
 GATE_BUILDER = "scripts/check_cake_build_manifests.py --vendored-gate"
 GATE_CHILD_NAME = "vendored_gate_child.py"
 SITECUSTOMIZE_NAME = "sitecustomize.py"
-PACKAGE_TABLE = "tests/test_helpers/cake_package.py"
+PACKAGE_TABLE = "tests/cake/test_helpers/cake_package.py"
 CUDA_CONSTRAINT_RE = re.compile(r"(==|>=)([0-9]+)\.([0-9]+)")
 NVCC_RELEASE_RE = re.compile(r"release (\d+)\.(\d+)")
 COMPUTE_CAP_RE = re.compile(r"(\d+)\.(\d+)")
@@ -1252,7 +1270,7 @@ def suite():
     isolate()
     # interpreters a test spawns pick up <work>/sitecustomize.py from here
     os.environ["PYTHONPATH"] = os.pathsep.join(CONFIG["paths"])
-    table = importlib.import_module("tests.test_helpers.cake_package")
+    table = importlib.import_module("tests.cake.test_helpers.cake_package")
     table.PACKAGES.update(CONFIG["table"])
     import pytest
 
@@ -1288,7 +1306,7 @@ class Block(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, Block())
 sys.modules["flashinfer"] = None
-importlib.import_module("tests.test_helpers.cake_package").PACKAGES.update(TABLE)
+importlib.import_module("tests.cake.test_helpers.cake_package").PACKAGES.update(TABLE)
 """
 
 
@@ -1795,7 +1813,7 @@ def junit_summary(path: Path) -> dict[str, Any]:
 
 
 def suite_key(root: Path, package: Package) -> str | None:
-    """The ``tests.test_helpers.cake_package.PACKAGES`` key importing ``package``."""
+    """The ``tests.cake.test_helpers.cake_package.PACKAGES`` key importing ``package``."""
     table = module_literals(root / PACKAGE_TABLE).get("PACKAGES") or {}
     for key, path in table.items():
         if path == package.name:
@@ -1804,7 +1822,7 @@ def suite_key(root: Path, package: Package) -> str | None:
 
 
 def suite_keys(root: Path, names: Iterable[str]) -> dict[str, str]:
-    """Every ``tests.test_helpers.cake_package.PACKAGES`` key importing one of the
+    """Every ``tests.cake.test_helpers.cake_package.PACKAGES`` key importing one of the
     packages ``names`` -> that package's dotted import path."""
     wanted = set(names)
     table = module_literals(root / PACKAGE_TABLE).get("PACKAGES") or {}

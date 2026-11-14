@@ -25,7 +25,10 @@ The reference budget is the deterministic head test's: bit for bit torch
 the deterministic head module ``flashinfer.cake_mhc_head_det_train`` (the same
 kernels under other library names).  The head has no order-varying step, so
 under ``torch.use_deterministic_algorithms(True)`` (with and without
-``warn_only``) no entry point raises or warns.
+``warn_only``) no entry point raises or warns.  The ``nondet`` contract does not
+promise run-to-run bits; this implementation runs the deterministic head's
+kernels in a fixed order, so repeated calls and the checkpoint replay are
+checked against the deterministic head's bits within one version.
 
 The hidden sizes a case runs at come from the architecture table below, not
 from the module's support query, and a separate case checks that query: a
@@ -54,7 +57,7 @@ HIDDEN_BY_CAPABILITY = {
     (10, 7): (4096,),
 }
 HIDDEN = (4096, 5120, 7168)
-TOKENS = (1, 2, 3, 7, 65, 129, 257, 1000, 2049, 4096)
+TOKENS = (1, 2, 3, 7, 65, 129, 257, 1000, 2049, 4096, 7169)
 BF16 = torch.bfloat16
 SUBNORMAL = 2.0**-133
 SPECIAL = (
@@ -77,6 +80,9 @@ SPECIAL = (
     3.0,
 )
 SEED = 8068
+# Repeated calls: the launches of each entry point on identical inputs, and the token counts (with two long calls).
+REPEATS = 5
+REPEAT_TOKENS = (1, 257, 14928, 16263)
 
 
 @pytest.fixture(autouse=True)
@@ -143,6 +149,12 @@ def _assert_bitwise(got: torch.Tensor, want: torch.Tensor, what: str = "torch") 
     assert got.shape == want.shape and got.dtype == want.dtype == BF16
     mismatch = int((_bits(got) != _bits(want)).sum())
     assert mismatch == 0, f"{mismatch} of {got.numel()} elements differ from {what}"
+
+
+def _complement(tensor: torch.Tensor) -> torch.Tensor:
+    """A new BF16 tensor whose every element has the inverted bits of ``tensor``'s: an output buffer in which an
+    element the kernel does not write differs from ``tensor``."""
+    return (~_bits(tensor)).view(BF16).view(tensor.shape)
 
 
 def _torch_grad(X: torch.Tensor, dY: torch.Tensor) -> torch.Tensor:
@@ -424,3 +436,77 @@ def test_deterministic_algorithms_raise_and_warn_nothing(warn_only: bool) -> Non
     _assert_bitwise(acc, want_acc)
     _assert_bitwise(node.grad, want_dX)
     _assert_bitwise(checkpointed.grad, want_dX)
+
+
+@pytest.mark.parametrize("hidden", HIDDEN)
+@pytest.mark.parametrize("T", REPEAT_TOKENS)
+def test_repeats_give_the_det_head_bits(hidden: int, T: int) -> None:
+    """The forward, the backward and the accumulating backward each run ``REPEATS`` times on identical inputs, and
+    every run equals the deterministic head's result bit for bit (the kernels are the deterministic head's, in a
+    fixed order; the ``nondet`` contract itself does not promise run-to-run bits).  A run writes into a buffer holding
+    the inverted bits of that result, so an element the forward or the writing backward leaves unwritten fails too;
+    the accumulating backward reads its buffer, so each run adds into a fresh copy of the same ``dX0``."""
+    _require(hidden)
+    g = torch.Generator(device=_device()).manual_seed(SEED + 5 + T * 31 + hidden)
+    X = _draw((T, 4, hidden), "special", g)
+    dY = _draw((T, hidden), "special", g)
+    dX0 = _draw((T, 4, hidden), "special", g)
+
+    Y = det_facade.cake_mhc_head_det_train_forward(X)
+    dX = det_facade.cake_mhc_head_det_train_backward(dY)
+    acc = dX0.clone()
+    det_facade.cake_mhc_head_det_train_backward(dY, dX=acc, accumulate=True)
+    for run in range(REPEATS):
+        out = _complement(Y)
+        assert facade.cake_mhc_head_nondet_train_forward(X, out=out) is out
+        _assert_bitwise(out, Y, f"the det head's forward (run {run})")
+        out = _complement(dX)
+        assert facade.cake_mhc_head_nondet_train_backward(dY, dX=out) is out
+        _assert_bitwise(out, dX, f"the det head's backward (run {run})")
+        out = dX0.clone()
+        facade.cake_mhc_head_nondet_train_backward(dY, dX=out, accumulate=True)
+        _assert_bitwise(out, acc, f"the det head's accumulating backward (run {run})")
+
+
+@pytest.mark.parametrize("hidden", HIDDEN)
+@pytest.mark.parametrize("T", (257, 16263))
+def test_checkpoint_replay_bitwise(hidden: int, T: int) -> None:
+    """Under ``torch.utils.checkpoint(..., use_reentrant=False)`` around a small graph (``head(X * 2) * W``), the
+    checkpoint's forward and its recompute in the backward, the output and the gradients of ``X`` and ``W`` equal
+    the same graph's run without the checkpoint bit for bit (``W``'s gradient reads the recomputed head output), and
+    that run equals the deterministic head's."""
+    _require(hidden)
+    g = torch.Generator(device=_device()).manual_seed(SEED + 6 + T * 31 + hidden)
+    X = _draw((T, 4, hidden), "spread", g)
+    W = _draw((hidden,), "randn", g)
+    dOut = _draw((T, hidden), "randn", g)
+    heads: list[torch.Tensor] = []
+
+    def run(head, checkpointed: bool):
+        def block(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            y = head(x * 2)
+            heads.append(y.detach().clone())
+            return y * w
+
+        heads.clear()
+        x = X.detach().requires_grad_(True)
+        w = W.detach().requires_grad_(True)
+        if checkpointed:
+            out = torch.utils.checkpoint.checkpoint(block, x, w, use_reentrant=False)
+        else:
+            out = block(x, w)
+        out.backward(dOut)
+        return out.detach(), x.grad, w.grad, list(heads)
+
+    det = run(det_facade.cake_mhc_head_det, checkpointed=False)
+    plain = run(facade.cake_mhc_head_nondet, checkpointed=False)
+    replay = run(facade.cake_mhc_head_nondet, checkpointed=True)
+    assert len(plain[3]) == 1 and len(replay[3]) == 2, (len(plain[3]), len(replay[3]))
+    _assert_bitwise(plain[3][0], det[3][0], "the det head's output")
+    for y in replay[3]:
+        _assert_bitwise(y, plain[3][0], "the head output without the checkpoint")
+    for name, got, want, det_want in zip(
+        ("output", "dX", "dW"), replay[:3], plain[:3], det[:3], strict=True
+    ):
+        _assert_bitwise(got, want, f"the {name} without the checkpoint")
+        _assert_bitwise(want, det_want, f"the det head's {name}")

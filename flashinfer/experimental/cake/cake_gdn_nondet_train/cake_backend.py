@@ -38,10 +38,14 @@ and enters no stream context: a tvm-ffi call whose arguments include PyTorch
 CUDA tensors sets the FFI stream of the first one's device to PyTorch's
 current stream for the call (a CUDA graph's capture stream during capture),
 and the binding launches there.  :func:`run_module` enters
-``tvm_ffi.use_torch_stream()`` for any argument type.  Every launch is a
-plain stream-ordered launch: nothing cooperative, no PDL.  Nothing here
-reads an environment variable, synchronizes, reads device memory or
-allocates.
+``tvm_ffi.use_torch_stream()`` for any argument type.  Nothing is launched
+cooperative.  A record whose launch carries ``use_pdl`` (the backward chain's
+stitch, piece chain, dvl32 walk forms and FP32-partial cluster tails) is
+launched with programmatic stream serialization: its kernel waits on the
+producer grid before its first global access and triggers its dependent's
+launch at its end, so the binding needs nothing more; every other launch is
+a plain stream-ordered launch.  Nothing here reads an environment variable,
+synchronizes, reads device memory or allocates.
 """
 
 from __future__ import annotations

@@ -695,10 +695,10 @@ The registry holds the 67 records (65 programs) for `sm_100a`, `sm_103a` and
 stage), exported from the kernel snapshot named in the pull request.
 
 Tests: `tests/experimental/test_cake_kda_det_train.py` (the backend suite: imports
-only this package through `tests/test_helpers/cake_package`; the registry and
+only this package through `tests/cake/test_helpers/cake_package`; the registry and
 plan tests run everywhere, the kernel tests skip without a compute capability
 10.0 / 10.3 / 10.7 device) against the exact FP64 per-document recurrence of
-`tests/test_helpers/cake_kda_det_train_reference.py`,
+`tests/experimental/test_helpers/cake_kda_det_train_reference.py`,
 `tests/experimental/test_cake_kda_det_train_raw_gate_accuracy.py` (the raw gate
 mode's accuracy against the activated-gate paths, both measured against the
 FP64 reference) and `tests/experimental/test_cake_kda_det_train_api.py` (the

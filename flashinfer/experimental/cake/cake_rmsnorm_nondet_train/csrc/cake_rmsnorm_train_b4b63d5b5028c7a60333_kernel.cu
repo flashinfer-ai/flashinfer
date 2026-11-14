@@ -102,7 +102,7 @@ kernel_cake_rmsnorm_train_b4b63d5b5028c7a60333(float* __restrict__ partial, floa
         int cc = rsub + d * 32;
         if (cc < n_chunks) {
             {
-                cur[d] = *reinterpret_cast<const float*>(partial + ((unsigned long long)cc * 256 + (unsigned long long)col));
+                cur[d] = *reinterpret_cast<const float*>(partial + ((unsigned long long)cc * 256ull + (unsigned long long)col));
             }
         }
     }
@@ -117,7 +117,7 @@ kernel_cake_rmsnorm_train_b4b63d5b5028c7a60333(float* __restrict__ partial, floa
             int cc_1 = rsub + ((w + 1) * 24 + d_1) * 32;
             if (cc_1 < n_chunks) {
                 {
-                    nxt[d_1] = *reinterpret_cast<const float*>(partial + ((unsigned long long)cc_1 * 256 + (unsigned long long)col));
+                    nxt[d_1] = *reinterpret_cast<const float*>(partial + ((unsigned long long)cc_1 * 256ull + (unsigned long long)col));
                 }
             }
         }

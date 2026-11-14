@@ -16,7 +16,7 @@ limitations under the License.
 flashinfer public-API tests of the Cake deterministic context-parallel (KCP) packed KDA training package
 (``flashinfer.experimental.cake.cake_kda_det_train_kcp``), device-free: the keywords the entry points of
 ``flashinfer.cake_kda_det_train_kcp`` forward, and the #8928 names.  The shared check of #8928
-(``tests.test_helpers.cake_mode_names.assert_cake_mode_module``) covers the facade: the mode word right after the
+(``tests.cake.test_helpers.cake_mode_names.assert_cake_mode_module``) covers the facade: the mode word right after the
 op, no ``deterministic`` keyword, each object bound under one name only (the facade, the ``flashinfer`` top level,
 the package and its modules) and the earlier names and package path failing at import; the package states the
 mode and takes no ``deterministic`` keyword either.  The three entries that take ``**options`` state the options
@@ -38,7 +38,7 @@ import pytest
 
 import flashinfer
 import flashinfer.cake_kda_det_train_kcp as kcp_api
-from tests.test_helpers.cake_mode_names import (
+from tests.cake.test_helpers.cake_mode_names import (
     assert_cake_mode_module,
     assert_mode_names,
     assert_no_deterministic_keyword,

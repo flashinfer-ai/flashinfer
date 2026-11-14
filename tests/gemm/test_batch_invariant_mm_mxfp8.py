@@ -818,13 +818,27 @@ def test_autotuning_profiles_every_candidate_and_keeps_the_bits(N, K):
 
 
 @needs_device
+def test_public_api_skips_backend_selection(monkeypatch):
+    """batch_invariant=True never runs a backend, so the @backend_requirement wrapper must not run the auto selection
+    for it (host cost only): a selecting call rewrites `mm_mxfp8.suitable_auto_backends`, a bypassed one leaves it."""
+    a, sfa = adv_mx(16, 4096, 131)
+    b, sfb = weight(4096, 4096, 132)
+    sentinel = ["sentinel"]
+    # the wrapper creates the attribute at its first auto selection, so it may not exist yet
+    monkeypatch.setattr(
+        flashinfer.mm_mxfp8, "suitable_auto_backends", sentinel, raising=False
+    )
+    bi_mm(a, b, sfa, sfb)
+    assert flashinfer.mm_mxfp8.suitable_auto_backends is sentinel
+
+
+@needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     a, sfa = adv_mx(16, 4096, 121)
     b, sfb = weight(4096, 4096, 122)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match='backend="auto"'):
         flashinfer.mm_mxfp8(a, b, sfa, sfb, backend="cutlass", batch_invariant=True)
-    # the operator's own checks run first on the API path (scale lengths, dtypes, the output dtype): the class's checks
-    # of the same inputs are reached through its entries
+    # the class's checks, reached through the API (which runs no backend checks for the flag) and through its entries
     auto = tuning.mm_mxfp8_batch_invariant_auto
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="8x4"):
         auto(a, b, sfa, sfb, None, torch.bfloat16, True, "auto")
@@ -842,9 +856,9 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         mm_mxfp8_batch_invariant(a[:, :4080], b[:4080], sfa, sfb)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="2-D operands"):
         mm_mxfp8_batch_invariant(a.unsqueeze(0), b, sfa, sfb)
-    with pytest.raises(
-        ValueError
-    ):  # FlashInfer's own output-dtype contract, checked before the flag path
+    # the public API hands batch-invariant calls to the class without running the backend checks: the class's typed
+    # error (a ValueError, as before)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 or fp16 output"):
         bi_mm(a, b, sfa, sfb, out_dtype=torch.float32)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 or fp16"):
         auto(a, b, sfa, sfb, None, torch.float32, False, "auto")

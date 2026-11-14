@@ -2104,7 +2104,7 @@ kernel_cake_rmsnorm_det_train_2b4c0f5b0e9c312fa43e(__nv_bfloat16* __restrict__ g
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_0[_lp*2 + 0], out_0[_lp*2+1 + 0]));
                 packed_0[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<int4*>(dx + ((unsigned long long)(row0 + rg) * 2048 + (unsigned long long)(tir * 8)))[0] = reinterpret_cast<int4*>(packed_0)[0];
+            reinterpret_cast<int4*>(dx + ((unsigned long long)(row0 + rg) * 2048ull + (unsigned long long)(tir * 8)))[0] = reinterpret_cast<int4*>(packed_0)[0];
             float out_1[8];
             float g0_4 = __uint_as_float(gw[4] << 16);
             float g1_4 = __uint_as_float(gw[4] & 4294901760u);
@@ -2144,7 +2144,7 @@ kernel_cake_rmsnorm_det_train_2b4c0f5b0e9c312fa43e(__nv_bfloat16* __restrict__ g
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_1[_lp*2 + 0], out_1[_lp*2+1 + 0]));
                 packed_1[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<int4*>(dx + ((unsigned long long)(row0 + rg) * 2048 + (unsigned long long)((128 + tir) * 8)))[0] = reinterpret_cast<int4*>(packed_1)[0];
+            reinterpret_cast<int4*>(dx + ((unsigned long long)(row0 + rg) * 2048ull + (unsigned long long)((128 + tir) * 8)))[0] = reinterpret_cast<int4*>(packed_1)[0];
         }
         row0 = meta[2 * ((k_5 + 1) % 4)];
         nval_3 = meta[2 * ((k_5 + 1) % 4) + 1];

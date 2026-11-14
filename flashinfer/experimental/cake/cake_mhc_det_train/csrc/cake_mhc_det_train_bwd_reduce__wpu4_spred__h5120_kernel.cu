@@ -104,7 +104,7 @@ kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred__h5120(float* __restrict__ dfn_
     int b = bid;
     int tid_0 = tid;
     if (b < 480) {
-        long long e0 = (long long)(b * 256 + tid_0) * 4;
+        long long e0 = (long long)(b * 256 + tid_0) * 4ll;
         float out[4];
         double a[4];
         #pragma unroll
@@ -127,7 +127,7 @@ kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred__h5120(float* __restrict__ dfn_
         for (int p = 1; p < n_parts; p++) {
             float vec_load[4];
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(dfn_part + ((long long)p * 491520 + e0) + 0);
+                float4 _v4 = *reinterpret_cast<const float4*>(dfn_part + ((long long)p * 491520ll + e0) + 0);
                 vec_load[0 + 0] = _v4.x;
                 vec_load[0 + 1] = _v4.y;
                 vec_load[0 + 2] = _v4.z;
@@ -163,7 +163,7 @@ kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred__h5120(float* __restrict__ dfn_
     } else {
         int col = b - 480;
         long long col64 = (long long)col;
-        long long scol64 = col64 - 24;
+        long long scol64 = col64 - 24ll;
         double tot[1];
         float res[1];
         tot[0] = 0.0;
@@ -188,7 +188,7 @@ kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred__h5120(float* __restrict__ dfn_
                 unsigned int cbr[1];
                 cbr[0] = 0;
                 if (inb != 0) {
-                    long long srcp = (c064 + (long long)row) * 32 + col64;
+                    long long srcp = (c064 + (long long)row) * 32ll + col64;
                     float xp = param_partial[srcp];
                     cbr[0] = __as_u32(xp);
                     sstage_u[row] = cbr[0];

@@ -8,7 +8,7 @@ from mpi4py import MPI
 
 import flashinfer.comm as comm
 from flashinfer.comm.mnnvl import TorchDistBackend
-from tests.test_helpers.comm import init_torch_distributed_from_mpi
+from tests.comm.test_helpers.comm import init_torch_distributed_from_mpi
 
 
 FP8_MAX = float(torch.finfo(torch.float8_e4m3fn).max)

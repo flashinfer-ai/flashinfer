@@ -11,7 +11,7 @@ from flashinfer.testing.utils import bench_gpu_time, bench_gpu_time_with_cudagra
 
 # Add the project root to Python path to import test helpers
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from tests.test_helpers.rope_reference import RotaryEmbedding
+from tests.attention.test_helpers.rope_reference import RotaryEmbedding
 
 mode_ncu = bool(int(os.environ.get("FLASHINFER_MODE_NCU", "0")))
 

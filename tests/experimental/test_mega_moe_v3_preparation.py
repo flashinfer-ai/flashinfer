@@ -340,6 +340,37 @@ def test_pipeline_bindings_take_the_a_map_from_the_stated_source(a_source):
         assert A.data_ptr() == pool.data_ptr()
 
 
+def test_pipeline_bindings_launch_the_routes_persistent_grid():
+    """The bindings launch one CTA per SM, or the persistent grid a route's
+    metadata states (``num_ctas``); nothing else the preparation binds depends
+    on it. A count of no CTA or past the device's SMs is refused."""
+    torch = cuda_torch()
+
+    def bind(**metadata):
+        inputs = small_pipeline_inputs(torch)
+        return preparation.prepare_pipeline_bindings(
+            inputs, 4, route_metadata=dict(SHORT_ROW_METADATA, **metadata)
+        )
+
+    def form(bindings):
+        out = {}
+        for name, v in bindings.items():
+            if isinstance(v, torch.Tensor):
+                v = (tuple(v.shape), v.dtype, tuple(v.stride()))
+            out[name] = v
+        out.pop("grid")
+        return out
+
+    full, smaller = bind(), bind(num_ctas=2)
+    assert full["grid"] == full["bindings"]["grid"] == (4, 1, 1)
+    assert smaller["grid"] == smaller["bindings"]["grid"] == (2, 1, 1)
+    assert form(full["bindings"]) == form(smaller["bindings"])
+    assert bind(num_ctas=4)["grid"] == (4, 1, 1)
+    for bad in (0, 6):
+        with pytest.raises(ValueError, match="'num_ctas' must be a persistent grid"):
+            bind(num_ctas=bad)
+
+
 def test_pipeline_bindings_refuse_an_unknown_a_source():
     """The metadata is refused before any input is touched, so the inputs
     may live on the host here."""

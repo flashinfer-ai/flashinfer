@@ -2,26 +2,24 @@
 
 The dispatch kernel writes each token directly into the receive buffers of the
 ranks that own its experts; the combine kernel reads the expert outputs back
-from those ranks and reduces them locally. Where the platform supports it,
-either direction can instead use CFT counted writes: the sender pushes over the
-NVLink fabric with ``fabric.try_put.counted`` and the receiver waits on
-hardware byte counters instead of per-round completion flags. Small steps can
-use the Lamport transport (``include/flashinfer/comm/moe_alltoall_lamport.cuh``):
-every pushed vector carries its own arrival, so neither direction waits for
-flags.
+from those ranks and reduces them locally. A step synchronizes by one of two
+protocols (``NVLinkOneSidedConfig.sync_protocol``): the fence protocol publishes
+per-peer completion flags behind a system-scope fence; under the sentinel
+protocol (``include/flashinfer/comm/moe_alltoall_sentinel.cuh``) every pushed
+vector carries its own arrival, so neither direction waits for flags.
 
 One symmetric workspace, laid out by ``moe_a2a_get_workspace_layout``, holds
 the round state, the dispatch receive buffers and the combine buffers of a
-rank. Its size grows with ``ep_size * max_tokens_per_rank``; the Lamport
-regions, appended by ``moe_a2a_lamport_extend_workspace_layout``, grow with
-``ep_size * lamport_max_tokens``. Instances with the same layout share one
+rank. Its size grows with ``ep_size * max_tokens_per_rank``; the sentinel
+regions, appended by ``moe_a2a_sentinel_extend_workspace_layout``, grow with
+``ep_size * sentinel_max_tokens``. Instances with the same layout share one
 workspace.
 """
 
 from __future__ import annotations
 
 import logging
-import re
+import warnings
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Optional, Sequence
 
 from .....core.comm.communication import (
@@ -37,6 +35,7 @@ from ..nvlink_common import (
     remap_mnnvl_memory,
     unmap_mnnvl_memory,
 )
+from . import config as config_module
 from .config import NVLinkOneSidedConfig
 from .kernels import get_nvlink_one_sided_alltoall_module, layout_constants
 
@@ -49,109 +48,36 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MAX_TIMEOUT_SEC = 24 * 60 * 60
-_CFT_MIN_DRIVER_BRANCH = 615
-# fabric.try_put.counted moves 16-byte chunks.
-_CFT_ALIGNMENT_BYTES = 16
 # Top-k values the kernels are specialized for.
 _SUPPORTED_TOP_K = (1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 18, 22)
-# Lamport transport: its payload format (layout constant suffix) per dispatch format.
-_LAMPORT_FORMATS = {
+# Sentinel protocol: its payload format (layout constant suffix) per dispatch format.
+_SENTINEL_FORMATS = {
     None: "BF16",
     "BF16": "BF16",
     "MXFP8": "MXFP8",
     "DeepSeekFp8": "FP8_BLOCK128",
     "NVFP4": "NVFP4",
 }
-# Default token limit of the Lamport transport (_default_lamport_max_tokens). Up to 159 tokens
-# per rank the transport was faster than the fence transport in every configuration measured
-# (GB300, EP 4 to 64, hidden 3584 to 7168, every payload format), so the default never goes below.
-_LAMPORT_MIN_DEFAULT_MAX_TOKENS = 159
-# Above it the default keeps the ep_size * limit rows a Lamport step polls, copies out and re-arms
-# within this: a speed bound, not a memory budget; the largest that kept every GB300 case faster.
-_LAMPORT_MAX_DEFAULT_REGION_BYTES = 64 << 20
 
 
-def _driver_branch() -> Optional[int]:
-    """Major version of the installed NVIDIA driver, or ``None`` if NVML fails."""
-    import pynvml
-
-    try:
-        pynvml.nvmlInit()
-        try:
-            version = pynvml.nvmlSystemGetDriverVersion()
-        finally:
-            pynvml.nvmlShutdown()
-    except pynvml.NVMLError:
-        return None
-    if isinstance(version, bytes):
-        version = version.decode(errors="replace")
-    match = re.match(r"\s*(\d+)", str(version))
-    return int(match.group(1)) if match else None
-
-
-def _cft_unsupported_reason(device_index: int, fabric_handles: bool) -> Optional[str]:
-    """Why this rank cannot use CFT counted writes, or ``None`` if it can.
-
-    ``fabric_handles`` tells whether the workspace will be shared through
-    FABRIC handles; logical endpoints can only bind such memory. Never raises:
-    every rank must reach the collective CFT agreement, and a rank whose probe
-    fails falls back to the fence path with the others.
-    """
-    if not fabric_handles:
-        return "the workspace is not shared through FABRIC handles"
-    try:
-        return _probe_cft_support(device_index)
-    except Exception as exc:  # NVML, CUDA driver or cuda-python errors alike
-        return f"the CFT support probe failed: {type(exc).__name__}: {exc}"
-
-
-def _probe_cft_support(device_index: int) -> Optional[str]:
-    import torch
-
-    from ......comm.mnnvl import cuda
-
-    major, minor = torch.cuda.get_device_capability(device_index)
-    if major < 10:
-        return f"compute capability {major}.{minor} is below 10.0"
-    branch = _driver_branch()
-    if branch is None:
-        return "the NVIDIA driver version could not be queried"
-    if branch < _CFT_MIN_DRIVER_BRANCH:
-        return f"driver branch {branch} is older than {_CFT_MIN_DRIVER_BRANCH}"
-    try:
-        attributes = (
-            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_UNICAST_SUPPORTED,
-            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_COUNTED_OPS_SUPPORTED,
-        )
-    except AttributeError:
-        return "the installed cuda-python does not expose logical endpoints"
-    for attribute in attributes:
-        status, supported = cuda.cuDeviceGetAttribute(attribute, device_index)
-        if status != cuda.CUresult.CUDA_SUCCESS:
-            return f"querying {attribute.name} failed with {status.name}"
-        if not supported:
-            return f"the device does not support {attribute.name}"
-    return None
-
-
-class _LamportRow(NamedTuple):
-    """Row geometry of a Lamport payload format, from the kernel module."""
+class _SentinelRow(NamedTuple):
+    """Row geometry of a sentinel payload format, from the kernel module."""
 
     hidden_bytes: int  # one token's hidden states
     scale_bytes: int  # one token's scales (0 for BF16)
     blocks_per_token: int  # dispatch blocks per token slot
-    bytes_per_row: int  # Lamport workspace bytes per (source rank, token) row
+    bytes_per_row: int  # sentinel workspace bytes per (source rank, token) row
 
 
-def _lamport_row(
-    module: Any, index: Any, lamport_format: str, params: MoEEpCommParams
-) -> _LamportRow:
+def _sentinel_row(
+    module: Any, index: Any, sentinel_format: str, params: MoEEpCommParams
+) -> _SentinelRow:
     """Raises if the kernels do not take rows of ``params.hidden_size``."""
-    return _LamportRow(
+    return _SentinelRow(
         *map(
             int,
-            module.moe_a2a_lamport_row_bytes(
-                getattr(index, f"LAMPORT_FORMAT_{lamport_format}"),
+            module.moe_a2a_sentinel_row_bytes(
+                getattr(index, f"SENTINEL_FORMAT_{sentinel_format}"),
                 params.hidden_size,
                 params.top_k,
             ),
@@ -159,7 +85,7 @@ def _lamport_row(
     )
 
 
-def _probe_lamport_support(
+def _probe_sentinel_support(
     module: Any,
     params: MoEEpCommParams,
     config: NVLinkOneSidedConfig,
@@ -168,87 +94,41 @@ def _probe_lamport_support(
 ) -> Optional[str]:
     import torch
 
-    if not module.moe_a2a_lamport_available():
-        return "the kernel module has no Lamport kernels for this GPU"
-    if ep_size > index.LAMPORT_MAX_RANKS:
-        return f"it supports at most {index.LAMPORT_MAX_RANKS} EP ranks"
-    if params.top_k > index.LAMPORT_MAX_TOP_K:
-        return f"it supports top_k <= {index.LAMPORT_MAX_TOP_K}"
+    if not module.moe_a2a_sentinel_available():
+        return "the kernel module has no sentinel kernels for this GPU"
+    if ep_size > index.SENTINEL_MAX_RANKS:
+        return f"it supports at most {index.SENTINEL_MAX_RANKS} EP ranks"
+    if params.top_k > index.SENTINEL_MAX_TOP_K:
+        return f"it supports top_k <= {index.SENTINEL_MAX_TOP_K}"
     if params.token_dtype != torch.bfloat16:
         return "it combines BF16 expert outputs only"
     if config.use_low_precision_combine:
         return "it has no FP8 combine"
-    if ((params.invalid_expert_id - index.LAMPORT_IDS_SENTINEL) & 0xFFFFFFFF) == 0:
+    if ((params.invalid_expert_id - index.SENTINEL_IDS_SENTINEL) & 0xFFFFFFFF) == 0:
         return "invalid_expert_id equals its expert-id sentinel as an int32"
     name = getattr(params.dispatch_format, "name", None)
-    if name not in _LAMPORT_FORMATS:
+    if name not in _SENTINEL_FORMATS:
         return f"it does not carry the dispatch format {name}"
-    _lamport_row(module, index, _LAMPORT_FORMATS[name], params)
+    _sentinel_row(module, index, _SENTINEL_FORMATS[name], params)
     return None
 
 
-def _lamport_unsupported_reason(
+def _sentinel_unsupported_reason(
     module: Any,
     params: MoEEpCommParams,
     config: NVLinkOneSidedConfig,
     ep_size: int,
     index: Any,
 ) -> Optional[str]:
-    """Why this rank cannot use the Lamport transport, or ``None`` if it can.
+    """Why this rank cannot use the sentinel protocol, or ``None`` if it can.
 
-    Never raises: every rank must reach the collective Lamport agreement, and a
-    rank whose probe fails falls back to the other transports with the others.
+    Never raises: every rank must reach the collective protocol agreement, and
+    a rank whose probe fails falls back to the fence protocol with the others.
     """
     try:
-        return _probe_lamport_support(module, params, config, ep_size, index)
+        return _probe_sentinel_support(module, params, config, ep_size, index)
     except Exception as exc:  # CUDA queries and the kernels' row checks alike
-        return f"the Lamport support probe failed: {type(exc).__name__}: {exc}"
-
-
-def _default_lamport_max_tokens(
-    ep_size: int, num_sms: int, row: _LamportRow, index: Any
-) -> int:
-    """Default token limit of the Lamport transport, in this order of precedence:
-
-    1. at least ``_LAMPORT_MIN_DEFAULT_MAX_TOKENS`` (159);
-    2. else the largest step whose dispatch grid stays below one full wave of
-       resident blocks (from a full wave on, the fence transport catches up),
-       at most the kernels' 512;
-    3. lowered while the Lamport regions (landing, combine and receive rows,
-       ``ep_size * limit`` of them) would exceed
-       ``_LAMPORT_MAX_DEFAULT_REGION_BYTES`` per rank.
-
-    The caller caps it by ``max_tokens_per_rank``.
-    """
-    below_one_wave = (
-        index.LAMPORT_DISPATCH_BLOCKS_PER_SM * num_sms - 1
-    ) // row.blocks_per_token
-    by_region_bytes = _LAMPORT_MAX_DEFAULT_REGION_BYTES // (ep_size * row.bytes_per_row)
-    return max(
-        min(below_one_wave, index.LAMPORT_MAX_TOKENS_PER_RANK, by_region_bytes),
-        _LAMPORT_MIN_DEFAULT_MAX_TOKENS,
-    )
-
-
-def _lamport_request(config: NVLinkOneSidedConfig) -> Optional[bool]:
-    """``config.lamport``, with auto (``None``) off under ``cft=True``: an explicit
-    CFT request keeps every step for CFT counted writes. (``lamport=True`` with
-    ``cft=True`` is refused at construction.)"""
-    if config.lamport is None and config.cft is True:
-        return False
-    return config.lamport
-
-
-def _log_unavailable(
-    transport: str, requested: Optional[bool], available: bool, reason: Optional[str]
-) -> None:
-    """Log why a transport asked for (warning) or left to auto (info) is off."""
-    if requested is not False and not available:
-        (logger.warning if requested else logger.info)(
-            "NVLink one-sided %s disabled: %s",
-            transport,
-            reason or "another EP rank does not support it or turned it off",
-        )
+        return f"the sentinel support probe failed: {type(exc).__name__}: {exc}"
 
 
 @register_communication("nvlink_one_sided")
@@ -258,17 +138,14 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
     ``hidden_states``, its optional scale factors, ``topk_ids`` and
     ``topk_weights`` travel as payloads of a single dispatch. Received rows
     beyond each source rank's token count get ``invalid_expert_id`` routing;
-    after a Lamport step, row ``source_rank * tokens_per_rank + token`` holds
+    after a sentinel step, row ``source_rank * tokens_per_rank + token`` holds
     that token and rows of tokens not routed here get ``invalid_expert_id``.
-    See :class:`NVLinkOneSidedConfig` for CFT counted writes, the Lamport
-    transport and timeouts.
+    See :class:`NVLinkOneSidedConfig` for the sync protocols and timeouts.
     """
 
     # Workspaces shared by instances with the same layout, keyed by
     # (ep_rank, ep_size, layout).
     _WORKSPACES: ClassVar[dict[tuple, dict[str, Any]]] = {}
-    # Key of the workspace bound to the process's CFT logical endpoints.
-    _CFT_WORKSPACE_KEY: ClassVar[Optional[tuple]] = None
 
     def __init__(
         self,
@@ -282,12 +159,6 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         from ......utils import device_support_pdl
 
         self.config = config = NVLinkOneSidedConfig() if config is None else config
-        # Before any collective, so that every rank fails alike.
-        if config.lamport is True and config.cft is True:
-            raise ValueError(
-                "lamport=True and cft=True both ask for every eligible step; "
-                "set one of them to None or False"
-            )
         # Collective platform check across the EP group; it runs before the
         # base class's local check so that no rank fails alone.
         mapping, mnnvl_config = mnnvl_mapping_and_config(bootstrap, config.comm_backend)
@@ -303,11 +174,6 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             raise TypeError("timeout_sec must be an integer number of seconds")
         if not 0 < config.timeout_sec <= _MAX_TIMEOUT_SEC:
             raise ValueError(f"timeout_sec must be in 1..{_MAX_TIMEOUT_SEC}")
-        if (
-            config.cft_max_tokens_for_dispatch < 0
-            or config.cft_max_tokens_for_combine < 0
-        ):
-            raise ValueError("CFT token-count limits must be non-negative")
         if config.lamport_max_tokens is not None and (
             isinstance(config.lamport_max_tokens, bool)
             or not isinstance(config.lamport_max_tokens, int)
@@ -338,46 +204,36 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             else config.enable_pdl
         )
 
-        # Every rank must agree on CFT and on the Lamport transport (each changes
-        # the workspace layout; the CFT endpoint exchange is collective), on an
-        # explicit Lamport limit and, for the default one, on one SM count: one
-        # collective for all. Each rank votes its own decision, so a rank that
-        # turns a transport off turns it off on every rank. The CFT handle type
-        # is the one the workspace allocation will start with; _bind_cft checks
-        # the one it ends with. Its precheck is collective, so every rank runs it.
-        fabric_handles = MnnvlMemory.uses_fabric_handles(comm, device.index)
-        cft_reason = lamport_reason = num_sms = None
-        lamport = _lamport_request(config)
-        if lamport is False and config.lamport is None:
-            logger.info(
-                "NVLink one-sided Lamport transport off: cft=True keeps every step "
-                "for CFT counted writes"
-            )
-        if config.cft is not False:
-            cft_reason = _cft_unsupported_reason(device.index, fabric_handles)
-        if lamport is not False:
-            lamport_reason = _lamport_unsupported_reason(
+        # Every rank must agree on the protocol and, under "auto", on an explicit
+        # sentinel limit (they decide each step's protocol and the workspace
+        # layout) and on whether all of them support the sentinel protocol: one
+        # collective for all.
+        protocol = config._effective_sync_protocol()
+        sentinel_reason = None
+        if protocol != "fence":
+            sentinel_reason = _sentinel_unsupported_reason(
                 self._module, params, config, self.ep_size, index
             )
-            if lamport_reason is None:
-                num_sms = torch.cuda.get_device_properties(device).multi_processor_count
         votes = comm.allgather(
             (
-                config.cft is not False and cft_reason is None,
-                lamport is not False and lamport_reason is None,
-                num_sms,
-                config.lamport_max_tokens,
+                protocol,
+                config.lamport_max_tokens if protocol == "auto" else None,
+                protocol != "fence" and sentinel_reason is None,
             )
         )
-        if len({v[3] for v in votes}) > 1:
-            raise ValueError(
-                "lamport_max_tokens must be the same on every EP rank, got "
-                + ", ".join(sorted({repr(v[3]) for v in votes}))
+        for i, name in enumerate(("sync_protocol", "lamport_max_tokens")):
+            if len({v[i] for v in votes}) > 1:
+                raise ValueError(
+                    f"{name} must be the same on every EP rank, got "
+                    + ", ".join(sorted({repr(v[i]) for v in votes}))
+                )
+        sentinel_capable = all(v[2] for v in votes)
+        if protocol != "fence" and not sentinel_capable:
+            (logger.warning if protocol == "sentinel" else logger.info)(
+                "NVLink one-sided sentinel protocol disabled, every step takes the "
+                "fence protocol: %s",
+                sentinel_reason or "another EP rank does not support it",
             )
-        cft_capable = all(v[0] for v in votes)
-        lamport_capable = all(v[1] for v in votes)
-        _log_unavailable("CFT counted writes", config.cft, cft_capable, cft_reason)
-        _log_unavailable("Lamport transport", lamport, lamport_capable, lamport_reason)
 
         tokens = self.ep_size * params.max_tokens_per_rank
         alignment = index.WORKSPACE_ALIGNMENT
@@ -392,62 +248,53 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             )
             + index.MAX_PAYLOADS * alignment
         )
-        # Expert outputs come back unquantized, at least 16 bits wide; the FP8
-        # wire format only applies to the CFT receive inbox.
+        # Expert outputs come back unquantized, at least 16 bits wide.
         combine_element_size = max(params.token_dtype.itemsize, 2)
         combine_input_bytes = tokens * params.hidden_size * combine_element_size
-        combine_recv_bytes = (
-            tokens
-            * params.hidden_size
-            * (1 if config.use_low_precision_combine else combine_element_size)
-            if cft_capable
-            else 0
-        )
         metainfo = torch.empty(index.NUM_METAINFO_FIELDS, dtype=torch.int64)
+        # The module's CFT counted-write path stays unused: no CFT receive inbox
+        # or counters.
         self._module.moe_a2a_get_workspace_layout(
             self.ep_size,
             params.max_tokens_per_rank,
             params.top_k,
             dispatch_bytes,
             combine_input_bytes,
-            combine_recv_bytes,
+            0,
             config.eplb_stats_num_experts,
-            cft_capable,
+            False,
             metainfo,
         )
-        # Largest step of the Lamport transport; 0 when the instance does not use it.
-        self.lamport_max_tokens = 0
-        self._lamport_format: Optional[str] = None
-        self._lamport_row: Optional[_LamportRow] = None
-        self._lamport_workspace_bytes = 0
-        if lamport_capable:
-            lamport_format = _LAMPORT_FORMATS[
+        self._sentinel_max_tokens = 0
+        self._sentinel_format: Optional[str] = None
+        self._sentinel_row: Optional[_SentinelRow] = None
+        self._sentinel_workspace_bytes = 0
+        if protocol == "sentinel":
+            max_tokens = params.max_tokens_per_rank
+        elif config.lamport_max_tokens is not None:
+            max_tokens = config.lamport_max_tokens
+        else:
+            max_tokens = config_module.AUTO_SENTINEL_MAX_TOKENS
+        max_tokens = min(max_tokens, params.max_tokens_per_rank)
+        if sentinel_capable and max_tokens > 0:
+            sentinel_format = _SENTINEL_FORMATS[
                 getattr(params.dispatch_format, "name", None)
             ]
-            row = _lamport_row(self._module, index, lamport_format, params)
-            if config.lamport_max_tokens is None:  # every rank voted its SM count
-                max_tokens = _default_lamport_max_tokens(
-                    self.ep_size, min(v[2] for v in votes), row, index
-                )
-            else:
-                max_tokens = min(
-                    config.lamport_max_tokens, index.LAMPORT_MAX_TOKENS_PER_RANK
-                )
-            max_tokens = min(max_tokens, params.max_tokens_per_rank)
+            row = _sentinel_row(self._module, index, sentinel_format, params)
             size_before = int(metainfo[index.WORKSPACE_SIZE_INDEX])
-            self._module.moe_a2a_lamport_extend_workspace_layout(
+            self._module.moe_a2a_sentinel_extend_workspace_layout(
                 metainfo,
                 max_tokens,
-                getattr(index, f"LAMPORT_FORMAT_{lamport_format}"),
+                getattr(index, f"SENTINEL_FORMAT_{sentinel_format}"),
                 params.hidden_size,
             )
-            self.lamport_max_tokens = max_tokens
-            self._lamport_format = lamport_format
-            self._lamport_row = row
-            self._lamport_workspace_bytes = (
+            self._sentinel_max_tokens = max_tokens
+            self._sentinel_format = sentinel_format
+            self._sentinel_row = row
+            self._sentinel_workspace_bytes = (
                 int(metainfo[index.WORKSPACE_SIZE_INDEX]) - size_before
             )
-        self._state = self._acquire_workspace(mapping, comm, metainfo, cft_capable)
+        self._state = self._acquire_workspace(mapping, comm, metainfo)
         self.workspace: "torch.Tensor" = self._state["workspace"]
         self.metainfo: "torch.Tensor" = self._state["metainfo"]
         # Contiguous bytes of this rank's slice of the workspace.
@@ -459,7 +306,6 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         mapping: Any,
         comm: "CommBackend",
         metainfo: "torch.Tensor",
-        cft_capable: bool,
     ) -> dict[str, Any]:
         import torch
 
@@ -477,12 +323,12 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             # No peer may publish into this workspace until every rank has
             # cleared its own slice.
             comm.barrier()
-            if self.lamport_max_tokens and self.ep_rank == 0:
+            if self.sentinel_max_tokens and self.ep_rank == 0:
                 logger.info(
-                    "NVLink one-sided Lamport transport: steps of up to %d tokens per "
+                    "NVLink one-sided sentinel protocol: steps of up to %d tokens per "
                     "rank, %.1f MiB of workspace per rank",
-                    self.lamport_max_tokens,
-                    self._lamport_workspace_bytes / (1 << 20),
+                    self.sentinel_max_tokens,
+                    self._sentinel_workspace_bytes / (1 << 20),
                 )
             state = {
                 "key": key,
@@ -490,111 +336,19 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
                 "workspace": workspace,
                 "metainfo": metainfo,
                 "views": {},
+                # Instances sharing the workspace, and CFT endpoints bound to it
+                # (cft.CftEndpoints); the last one to drop its reference frees it.
                 "refcount": 0,
                 # Instance whose dispatch awaits its combine on this workspace.
                 "round_owner": None,
-                "cft_ready": cft_capable
-                and self._bind_cft(key, comm, mnnvl_mem, workspace, size),
             }
             self._WORKSPACES[key] = state
         state["refcount"] += 1
         return state
 
-    def _bind_cft(
-        self,
-        key: tuple,
-        comm: "CommBackend",
-        mnnvl_mem: Any,
-        workspace: "torch.Tensor",
-        size: int,
-    ) -> bool:
-        """Bind this workspace to the process's CFT logical endpoints.
-
-        Collective over the EP group; every rank returns the same result.
-        """
-        cls = type(self)
-        if not mnnvl_mem.fabric_handles:
-            logger.warning(
-                "NVLink one-sided CFT counted writes disabled: the workspace fell "
-                "back to POSIX file descriptors"
-            )
-            return False
-        if cls._CFT_WORKSPACE_KEY is not None:
-            logger.info(
-                "NVLink one-sided CFT counted writes are bound to another workspace "
-                "of this process; this one uses the fence path"
-            )
-            return False
-        if not self._create_cft_endpoints(comm, mnnvl_mem, workspace, size):
-            logger.warning(
-                "NVLink one-sided CFT counted writes disabled: creating the logical "
-                "endpoints failed on at least one EP rank"
-            )
-            return False
-        cls._CFT_WORKSPACE_KEY = key
-        return True
-
-    def _create_cft_endpoints(
-        self,
-        comm: "CommBackend",
-        mnnvl_mem: Any,
-        workspace: "torch.Tensor",
-        size: int,
-    ) -> bool:
-        """Create this rank's logical endpoint on its workspace slice and
-        import every peer's.
-
-        Collective over the EP group; every rank returns the same result and
-        a failure leaves no endpoint behind.
-        """
-        import torch
-
-        from ......comm.mnnvl import all_ranks_agree
-
-        module = self._module
-        handle = torch.empty(module.moe_a2a_cft_handle_bytes(), dtype=torch.uint8)
-        created = module.moe_a2a_cft_create_endpoint(
-            workspace,
-            mnnvl_mem.local_mem_handle,
-            size,
-            self.ep_rank,
-            self.ep_size,
-            handle,
-        )
-        bound = all_ranks_agree(comm, created)
-        if bound:
-            handles = comm.allgather(handle.numpy().tobytes())
-            all_handles = torch.frombuffer(
-                bytearray(b"".join(handles)), dtype=torch.uint8
-            )
-            bound = all_ranks_agree(
-                comm,
-                module.moe_a2a_cft_import_endpoints(
-                    workspace, self.ep_rank, all_handles
-                ),
-            )
-        if not bound:
-            module.moe_a2a_cft_destroy(workspace, self.ep_rank)
-            return False
-        comm.barrier()
-        return True
-
-    def _cft_endpoint_ids(self) -> "torch.Tensor":
-        """Logical-endpoint ID per peer rank that CFT launches bake in."""
-        import torch
-
-        ids = torch.empty(self.ep_size, dtype=torch.int64)
-        self._module.moe_a2a_cft_endpoint_ids(self.workspace, self.ep_rank, ids)
-        return ids
-
     @classmethod
     def is_platform_supported(cls) -> bool:
         return nvlink_platform_supported()
-
-    @property
-    def _cft_enabled(self) -> bool:
-        """Whether CFT counted writes are available to this instance's steps."""
-        return self._state is not None and self._state["cft_ready"]
 
     def active_rank_mask(self, active_ranks: Sequence[int]) -> "torch.Tensor":
         """CPU ``uint64`` bitmask of ``active_ranks`` for ``active_rank_mask``."""
@@ -629,11 +383,39 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         return view
 
     @property
-    def lamport_enabled(self) -> bool:
-        """Whether the Lamport transport is available to this instance's steps."""
-        return self._state is not None and self.lamport_max_tokens > 0
+    def sentinel_max_tokens(self) -> int:
+        """Largest step, in tokens per rank, that the sentinel protocol takes; 0
+        when this instance does not use it. Fixed at construction: the
+        workspace's sentinel regions are sized for it."""
+        return self._sentinel_max_tokens
 
-    def _lamport_carries(
+    @property
+    def sentinel_enabled(self) -> bool:
+        """Whether the sentinel protocol is available to this instance's steps."""
+        return self._state is not None and self.sentinel_max_tokens > 0
+
+    @property
+    def lamport_enabled(self) -> bool:
+        """Deprecated alias of :attr:`sentinel_enabled`."""
+        warnings.warn(
+            "NVLinkOneSidedAlltoAll.lamport_enabled is deprecated; use sentinel_enabled.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.sentinel_enabled
+
+    @property
+    def lamport_max_tokens(self) -> int:
+        """Deprecated alias of :attr:`sentinel_max_tokens`."""
+        warnings.warn(
+            "NVLinkOneSidedAlltoAll.lamport_max_tokens is deprecated; use "
+            "sentinel_max_tokens.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.sentinel_max_tokens
+
+    def _sentinel_carries(
         self,
         tokens_per_rank: int,
         hidden_states: "torch.Tensor",
@@ -641,15 +423,16 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         topk_weights: "torch.Tensor | None",
         eplb_local_stats: "torch.Tensor | None",
     ) -> bool:
-        """Whether the Lamport transport can carry this step: few enough tokens,
-        no EPLB statistics and payloads in the instance's format.
+        """Whether this step takes the sentinel protocol: few enough tokens, no
+        EPLB statistics and payloads in the instance's format. The fence
+        protocol takes the other steps.
 
         Depends only on values every rank passes alike, so all ranks take the
-        same transport.
+        same protocol.
         """
-        if tokens_per_rank > self.lamport_max_tokens or eplb_local_stats is not None:
+        if tokens_per_rank > self.sentinel_max_tokens or eplb_local_stats is not None:
             return False
-        row = self._lamport_row
+        row = self._sentinel_row
 
         def row_bytes(tensor: "torch.Tensor | None") -> int:
             if tensor is None:
@@ -663,7 +446,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             return False
         # Senders rewrite payload words equal to a sentinel the way the format
         # keeps its values (NaN stays NaN), so the dtype must be the format's.
-        if self._lamport_format == "BF16":
+        if self._sentinel_format == "BF16":
             import torch
 
             if hidden_states.dtype != torch.bfloat16:
@@ -674,56 +457,6 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             topk_weights.dim() == 2
             and (topk_weights.shape[1], topk_weights.element_size())
             == (self.params.top_k, 4)
-        )
-
-    def _dispatch_transports(
-        self,
-        tokens_per_rank: int,
-        payloads: "Sequence[torch.Tensor]",
-        hidden_states: "torch.Tensor",
-        hidden_states_scale: "torch.Tensor | None",
-        topk_weights: "torch.Tensor | None",
-        eplb_local_stats: "torch.Tensor | None",
-    ) -> tuple[bool, bool]:
-        """``(use_lamport, use_cft)`` of a dispatch.
-
-        The Lamport transport takes every step it can carry, ahead of CFT: its
-        combine receives and reduces each token in the same kernel as it lands.
-        CFT counted writes take the other steps within their token limit when
-        every payload row meets their alignment; the fence path the rest.
-        """
-        use_lamport = self._lamport_carries(
-            tokens_per_rank,
-            hidden_states,
-            hidden_states_scale,
-            topk_weights,
-            eplb_local_stats,
-        )
-        use_cft = (
-            not use_lamport
-            and self._use_cft(tokens_per_rank, self.config.cft_max_tokens_for_dispatch)
-            and all(
-                p.shape[1] * p.element_size() % _CFT_ALIGNMENT_BYTES == 0
-                for p in payloads
-            )
-        )
-        return use_lamport, use_cft
-
-    def _use_cft(self, tokens_per_rank: int, max_tokens: int) -> bool:
-        if not self._cft_enabled:
-            return False
-        return self.config.cft is True or tokens_per_rank <= max_tokens
-
-    def _combine_uses_cft(
-        self, tokens_per_rank: int, hidden: int, element_size: int
-    ) -> bool:
-        """Whether a non-Lamport combine of this step uses CFT counted writes."""
-        wire_bytes = hidden * (
-            1 if self.config.use_low_precision_combine else element_size
-        )
-        return (
-            self._use_cft(tokens_per_rank, self.config.cft_max_tokens_for_combine)
-            and wire_bytes % _CFT_ALIGNMENT_BYTES == 0
         )
 
     def _check_rank_mask(self, active_rank_mask: "torch.Tensor | None") -> None:
@@ -757,9 +490,9 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         :meth:`active_rank_mask`; tokens routed to a masked-off rank are
         dropped. Requires ``enable_rank_mask=True``.
 
-        A step takes the Lamport transport only if its
+        A step takes the sentinel protocol only if its
         ``runtime_max_tokens_per_rank`` (the capacity when ``None``) is at most
-        ``lamport_max_tokens``; :class:`NVLinkOneSidedConfig` lists the other
+        ``sentinel_max_tokens``; :class:`NVLinkOneSidedConfig` lists the other
         conditions.
 
         Every rank passes ``topk_weights`` in a step or none does (a rank
@@ -767,7 +500,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         as every rank passes the same ``runtime_max_tokens_per_rank``. A
         mismatch is not detected: on the fence path a rank that passes weights
         reads, for a peer that passed none, whatever an earlier step left in
-        its weight rows; a Lamport step can also leave a stale weight row for a
+        its weight rows; a sentinel step can also leave a stale weight row for a
         later step, or time out (``timeout_sec``).
         """
         import torch
@@ -791,9 +524,8 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         if topk_weights is not None:
             payloads.append(topk_weights)
 
-        use_lamport, use_cft = self._dispatch_transports(
+        use_sentinel = self._sentinel_carries(
             tokens_per_rank,
-            payloads,
             hidden_states,
             hidden_states_scale,
             topk_weights,
@@ -810,10 +542,10 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             params.top_k,
             params.num_experts,
             eplb_local_stats,
-            use_cft,
-            expert_id_index if use_cft or use_lamport else -1,
+            False,
+            expert_id_index if use_sentinel else -1,
             params.invalid_expert_id,
-            use_lamport,
+            use_sentinel,
             self.config.enable_rank_mask,
             active_rank_mask,
             self.config.timeout_sec,
@@ -828,8 +560,8 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             )
             for offset, payload in zip(recv_offsets, payloads, strict=True)
         ]
-        if not (use_cft or use_lamport):
-            # CFT and Lamport dispatches fill the padding rows' expert ids themselves.
+        if not use_sentinel:
+            # Sentinel dispatches fill the padding rows' expert ids themselves.
             self._module.moe_a2a_sanitize_expert_ids(
                 recv[expert_id_index],
                 self.workspace,
@@ -849,7 +581,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             "tokens_per_rank": tokens_per_rank,
             "local_num_tokens": topk_ids.shape[0],
             "combine_offset": int(combine_offset),
-            "lamport": use_lamport,
+            "sentinel": use_sentinel,
         }
         self._state["round_owner"] = self
         recv = [t.flatten(0, 1) for t in recv]
@@ -915,11 +647,8 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
                 dtype=payload.dtype,
                 device=payload.device,
             )
-        # A Lamport dispatch is followed by a Lamport combine.
-        use_lamport = state["lamport"]
-        use_cft = not use_lamport and self._combine_uses_cft(
-            tokens_per_rank, hidden, payload.element_size()
-        )
+        # A sentinel dispatch is followed by a sentinel combine.
+        use_sentinel = state["sentinel"]
         self._module.moe_a2a_combine(
             payload,
             state["local_num_tokens"],
@@ -932,27 +661,26 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             state["combine_offset"],
             False,
             self.config.use_low_precision_combine,
-            use_cft,
+            False,
             self.config.enable_rank_mask,
             active_rank_mask,
             output,
             self.config.timeout_sec,
             self._enable_pdl,
-            use_lamport,
+            use_sentinel,
         )
         self._round = None
         self._state["round_owner"] = None
         return output
 
     def checkpoint_prepare(self) -> None:
-        """Release the workspace's physical memory and CFT endpoints before a
-        process checkpoint.
+        """Release the workspace's physical memory before a process checkpoint.
 
         A CUDA process checkpoint cannot save the workspace's MNNVL physical
-        memory, which peer processes import, nor its CFT logical endpoints.
-        This method releases both but keeps the workspace's virtual addresses
-        reserved, so CUDA graphs captured on the workspace replay correctly
-        once :meth:`checkpoint_restore` has backed it with new memory:
+        memory, which peer processes import. This method releases it but keeps
+        the workspace's virtual addresses reserved, so CUDA graphs captured on
+        the workspace replay correctly once :meth:`checkpoint_restore` has
+        backed it with new memory:
 
         .. code-block:: python
 
@@ -971,29 +699,18 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             raise RuntimeError("NVLinkOneSidedAlltoAll has been destroyed")
         if state["round_owner"] is not None:
             raise RuntimeError("checkpoint_prepare called between dispatch and combine")
-
-        def release_cft() -> None:
-            # Keep the endpoint IDs reserved: captured launches use them.
-            if state["cft_ready"]:
-                state["cft_endpoint_ids"] = self._cft_endpoint_ids()
-                self._module.moe_a2a_cft_release_endpoints(self.workspace, self.ep_rank)
-
-        unmap_mnnvl_memory(state["mnnvl_mem"], release_cft)
+        unmap_mnnvl_memory(state["mnnvl_mem"])
 
     def checkpoint_restore(self, comm_backend: "CommBackend") -> None:
-        """Back the workspace with new memory after :meth:`checkpoint_prepare`,
-        re-arm its Lamport regions and recreate its CFT endpoints.
+        """Back the workspace with new memory after :meth:`checkpoint_prepare`
+        and re-arm its sentinel regions.
 
         Collective over ``comm_backend``, a fresh backend that must span the
         EP group with the original ranks and world size. Every rank calls it
-        in the same order. Does nothing when the workspace is mapped. The CFT
-        endpoints are recreated under the IDs they had, which CUDA graphs
-        captured before the checkpoint use; raises if that is not possible.
-        If it raises once remapping has begun, the workspace cannot be reused:
+        in the same order. Does nothing when the workspace is mapped. If it
+        raises once remapping has begun, the workspace cannot be reused:
         restart the rank rather than retry.
         """
-        from ......comm.mnnvl import all_ranks_agree
-
         state = self._state
         if state is None:
             raise RuntimeError("NVLinkOneSidedAlltoAll has been destroyed")
@@ -1006,38 +723,17 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         # cleared its own slice.
         comm_backend.barrier()
         self._round = None
-        if not state["cft_ready"]:
-            return
-        previous_ids = state.pop("cft_endpoint_ids")
-        size = int(self.metainfo[self._index.WORKSPACE_SIZE_INDEX])
-        if not self._create_cft_endpoints(
-            comm_backend, state["mnnvl_mem"], self.workspace, size
-        ):
-            state["cft_ready"] = False
-            type(self)._CFT_WORKSPACE_KEY = None
-            raise RuntimeError(
-                "Could not recreate the NVLink one-sided CFT logical endpoints after "
-                "the checkpoint; CUDA graphs that use CFT are not safe to replay"
-            )
-        if not all_ranks_agree(
-            comm_backend, bool((self._cft_endpoint_ids() == previous_ids).all())
-        ):
-            raise RuntimeError(
-                "NVLink one-sided CFT logical-endpoint IDs changed across the "
-                "checkpoint; CUDA graphs captured before it are not safe to replay"
-            )
 
     def destroy(self) -> None:
         """Release this instance's share of the workspace.
 
-        The last instance on a workspace frees it, together with its CFT
-        endpoints; every rank must have finished its last combine on it.
+        The last instance on a workspace frees it, unless CFT endpoints are
+        still bound to it; every rank must have finished its last combine on
+        it.
         """
         state = self._state
         if state is None:
             return
-        import torch
-
         if state["round_owner"] is self:
             state["round_owner"] = None
         self._state = None
@@ -1045,13 +741,16 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         self.workspace = None
         self.metainfo = None
         self._rank_bytes = None
+        self._release_workspace(state)
+
+    @classmethod
+    def _release_workspace(cls, state: dict[str, Any]) -> None:
+        """Drop one reference to a workspace; the last one frees it."""
+        import torch
+
         state["refcount"] -= 1
         if state["refcount"] > 0:
             return
         torch.cuda.synchronize()
-        cls = type(self)
-        if state["cft_ready"]:
-            self._module.moe_a2a_cft_destroy(state["workspace"], self.ep_rank)
-            cls._CFT_WORKSPACE_KEY = None
         cls._WORKSPACES.pop(state["key"], None)
         state.clear()

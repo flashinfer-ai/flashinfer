@@ -24,6 +24,13 @@ after the fold (the fixup applies it for the workspace split; the in-CTA fold af
 
 Each class has a biased variant (``BIAS_NOTE``): the bias of the output column, widened from bf16 to binary32 exactly, is
 added once with ``add.rn`` to the fully reduced accumulator before the single ``cvt.rn``; the fold is untouched.
+
+The block-scale fp8 class ``gemm.e4m3.kblock128`` (format key ``e4m3_bs``; :func:`flashinfer.gemm_fp8_nt_groupwise` with
+``scale_granularity_mnk = (1, 128, 128)``): the same e4m3 ``mma32`` step, but K is folded in blocks of ``BLOCK_K`` elements
+(one fp8 smem stage: 4 steps), each block an ``mma32`` fold from +0, and the block partials are folded in block order from +0
+with ``fma.rn(mul.rn(s_a[m, kb], s_b[n // SCALE_BLOCK_N, kb]), P_kb, acc)``: A's fp32 scale of the row's 1x128 block and B's
+fp32 scale of the 128x128 weight block, leaves of the fold (:func:`reduction_blockscale`). No chain scalar (the conversion
+alone), no split variant. A different term from the per-tensor fp8 fold at every K (Lean ``kblock128_ne_kfold32``).
 """
 
 from __future__ import annotations
@@ -47,8 +54,14 @@ IN_FMTS = (
     "nvfp4_k128",
     "mxfp4",
     "mxfp4_k128",
+    "e4m3_bs",
 )
 FP8_FMTS = ("e4m3", "e5m2")
+#: The block-scale fp8 class (module docstring): e4m3 elements, fp32 scales per 1x128 block of A and per 128x128 block of B,
+#: the scales applied by the kernel's promotion pass once per K block (no instruction operand).
+FP8_BLOCKSCALE_FMTS = ("e4m3_bs",)
+BLOCK_K = 128  # elements of K per scale block: the class constant (scale_granularity_mnk = (1, 128, 128))
+SCALE_BLOCK_N = 128  # output columns per weight scale block
 #: The MX format: e4m3 elements with one UE8M0 (power-of-two) block scale per 32 elements in the 128x4 swizzled layout, the
 #: scale consumed by the block-scaled instruction itself (no software step touches it). Two classes, one per instruction:
 #: ``mxfp8`` on ``kind::mxf8f6f4`` with 32 elements per step (one scale per row per step; the sm_100 / sm_103 parts) and
@@ -80,6 +93,7 @@ MMA_K_OF = {
     "nvfp4_k128": 128,
     "mxfp4": 64,
     "mxfp4_k128": 128,
+    "e4m3_bs": 32,
 }
 MMA_OP_OF = {
     "bf16": "mma_bf16_k16",
@@ -91,6 +105,7 @@ MMA_OP_OF = {
     "nvfp4_k128": "mma_nvfp4_k128",
     "mxfp4": "mma_mxfp4_k64",
     "mxfp4_k128": "mma_mxfp4_k128",
+    "e4m3_bs": "mma_fp8_k32",
 }
 ELEM_BITS_OF = {
     "bf16": 16,
@@ -102,6 +117,7 @@ ELEM_BITS_OF = {
     "nvfp4_k128": 4,
     "mxfp4": 4,
     "mxfp4_k128": 4,
+    "e4m3_bs": 8,
 }
 #: Dense MMA throughput relative to bf16 (what the dispatcher's estimate uses): the 8-bit kinds run at twice the bf16 rate,
 #: the 4-bit ones at four times; a block-scaled step at the rate of the dense step of its width.
@@ -115,6 +131,7 @@ MMA_RATE_OF = {
     "nvfp4_k128": 4.0,
     "mxfp4": 4.0,
     "mxfp4_k128": 4.0,
+    "e4m3_bs": 2.0,
 }
 SF_VEC = {
     "mxfp8": 32,
@@ -151,6 +168,10 @@ CLASS_TAG = {
     "mxfp8_k64": ("mxfp8.kfold64", "mxfp8.kchunk64"),
     "nvfp4_k128": ("nvfp4.kfold128", "nvfp4.kchunk128"),
     "mxfp4_k128": ("mxfp4.kfold128", "mxfp4.kchunk128"),
+    "e4m3_bs": (
+        "e4m3.kblock128",
+        "e4m3.kblock128",
+    ),  # the block-scale class has no split variant
 }  # class names where the format key is not the class name
 MMA_K = MMA_K_OF["bf16"]  # the bf16 K step (the bf16 class's constant)
 MMA_OP = MMA_OP_OF["bf16"]
@@ -313,6 +334,48 @@ def reduction_chunked(
     return Reduction(f"{class_name(in_fmt, True)}[K={K},C={C}]", (kstep, chunk), leaf)
 
 
+def block_scale_term(fp, m: int, n: int, kb: int):
+    """The scale of block ``kb`` for output element (m, n): ``mul.rn(s_a[m, kb], s_b[n // SCALE_BLOCK_N, kb])``, the two fp32
+    block scales (leaves: inputs, like the operand slices) multiplied once with one correctly rounded multiply on the device."""
+    return fp.mul(fp.op("sfa_blk", m, kb), fp.op("sfb_blk", n // SCALE_BLOCK_N, kb))
+
+
+def reduction_blockscale(K: int, m: int, n: int, in_fmt: str = "e4m3_bs") -> Reduction:
+    """The block-scale class ``gemm.e4m3.kblock128``: K is cut into ``K / BLOCK_K`` blocks of ``BLOCK_K`` elements (``BLOCK_K / 32``
+    opaque ``mma32`` steps each; K a whole number of blocks); each block is an ``mma32`` fold from +0 (its partial ``P_kb``), and
+    the partials are folded in block order from +0 with ``acc = fma.rn(block_scale_term(kb), P_kb, acc)`` (one correctly rounded
+    fused multiply-add per block; the first block's ``fma(s, P_0, +0)`` is the same, so an exact ``-0`` product gives ``+0``). The
+    block fold is an indexed ``fold`` digit (the scale is a per-block coefficient); the kernel's promotion pass performs exactly it."""
+    assert in_fmt in FP8_BLOCKSCALE_FMTS and K % BLOCK_K == 0, (in_fmt, K)
+    op, mk = MMA_OP_OF[in_fmt], MMA_K_OF[in_fmt]
+    spb = BLOCK_K // mk
+    kstep = Digit(
+        "kstep",
+        spb,
+        "fold",
+        init=lambda fp: fp.const(0.0),
+        step=lambda fp, acc, tile: fp.op(op, acc, tile),
+        identity_note="K is a whole number of blocks: no padded step",
+    )
+    block = Digit(
+        "block",
+        K // BLOCK_K,
+        "fold",
+        init=lambda fp: fp.const(0.0),
+        step=lambda fp, acc, partial, kb: fp.fma(
+            block_scale_term(fp, m, n, kb), partial, acc
+        ),
+        identity_note="fma(s, +0, acc) == acc for finite s: a block of zero operands adds nothing (the scales are finite inputs)",
+        indexed=True,
+    )
+    slice_leaf = kslice_leaf(m, n, in_fmt)
+
+    def leaf(fp, idx):
+        return slice_leaf(fp, {"kstep": idx["block"] * spb + idx["kstep"]})
+
+    return Reduction(f"{class_name(in_fmt, False)}[K={K}]", (kstep, block), leaf)
+
+
 def scale_term(fp, in_fmt: str = "e4m3"):
     """``alpha = mul.rn(a_scale, b_scale)``: the two per-tensor fp8 scales are runtime scalars (``sym``) and their product
     is formed on the device with one correctly rounded multiply (never on the host, whose double product would round
@@ -409,9 +472,15 @@ class GemmSpec:
                 f"the biased chain exists for the bf16 class only (mm_bf16's bias); no kernel implements it for {in_fmt!r}"
             )
         self.bias = bias
+        if in_fmt in FP8_BLOCKSCALE_FMTS and chunks != 1:
+            raise ValueError(
+                f"the block-scale class {class_name(in_fmt, False)} has no split variant (chunks = {chunks})"
+            )
         self.alg = alg or TermAlgebra()
 
     def acc(self, m: int, n: int) -> Term:
+        if self.in_fmt in FP8_BLOCKSCALE_FMTS:
+            return reduction_blockscale(self.K, m, n, self.in_fmt).canonical(self.alg)
         if self.chunks == 1:
             return reduction(self.K, m, n, self.in_fmt).canonical(self.alg)
         return reduction_chunked(self.K, self.chunks, m, n, self.in_fmt).canonical(
@@ -438,14 +507,21 @@ def spec_fingerprint(
     unbiased class's, unchanged). The biased variant exists for the bf16 class only; ``bias=True`` with another format
     raises."""
     s = GemmSpec(K, out_fmt, chunks=chunks, in_fmt=in_fmt, bias=bias)
-    tag = f"gemm-{in_fmt.replace('_', '-')}-" + (
-        "kfold" if chunks == 1 else f"kchunk{chunks}"
-    )  # the sm_107 MX class tags as gemm-mxfp8-k64-...
-    tag += ("-scaled" if s.scaled else "") + ("-bias" if bias else "") + "-"
+    if in_fmt in FP8_BLOCKSCALE_FMTS:
+        tag = f"gemm-{in_fmt.split('_')[0]}-kblock{BLOCK_K}-"  # gemm-e4m3-kblock128-<hash>
+    else:
+        tag = f"gemm-{in_fmt.replace('_', '-')}-" + (
+            "kfold" if chunks == 1 else f"kchunk{chunks}"
+        )  # the sm_107 MX class tags as gemm-mxfp8-k64-...
+        tag += ("-scaled" if s.scaled else "") + ("-bias" if bias else "") + "-"
     parts = [f"K={K}", f"chunks={chunks}", f"out={out_fmt}"]
     if in_fmt != "bf16":
         parts += [f"in={in_fmt}", f"scaled={int(s.scaled)}"]
     parts += [fingerprint(s.out(0, 0)), fingerprint(s.out(1, 1))]
+    if in_fmt in FP8_BLOCKSCALE_FMTS:
+        parts.append(
+            fingerprint(s.out(1, SCALE_BLOCK_N))
+        )  # a column of the second weight scale block
     if bias:
         parts.append("bias=1")
     return tag + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]

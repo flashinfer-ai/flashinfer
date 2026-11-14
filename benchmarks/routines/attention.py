@@ -26,6 +26,7 @@ from flashinfer import autotune
 from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 from flashinfer.prefill import trtllm_fmha_v2_prefill
 from flashinfer.utils import (
+    get_compute_capability,
     get_device_sm_count,
     get_trtllm_gen_multi_ctas_kv_counter_bytes,
     is_sm12x_supported,
@@ -899,16 +900,25 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         elif args.enable_pdl:
             print("[WARNING] prims-ts does not expose PDL; ignoring --enable_pdl.")
 
+    if speculative_decode and spec_dec_mask_mode == "full":
+        while "trtllm-gen" in backends:
+            _drop_backend(
+                backends,
+                "trtllm-gen",
+                "uses implicit causal masking and does not support full-mask speculative decode",
+            )
+        if "trtllm-native" in backends and get_compute_capability(device)[0] == 10:
+            while "trtllm-native" in backends:
+                _drop_backend(
+                    backends,
+                    "trtllm-native",
+                    "with backend=auto resolves to causal trtllm-gen on SM10x and "
+                    "does not support full-mask speculative decode",
+                )
+
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
-
-    if speculative_decode and spec_dec_mask_mode == "full" and "trtllm-gen" in backends:
-        print(
-            "[WARNING] trtllm-gen wrapper backend applies implicit causal masking to "
-            "the draft block and ignores the non-causal (DFlash) mask; refcheck "
-            "against trtllm-native may mismatch."
-        )
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}

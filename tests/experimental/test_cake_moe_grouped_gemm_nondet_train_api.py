@@ -18,19 +18,25 @@ flashinfer public-API tests of the non-deterministic Cake MoE grouped GEMM.
 The module ``flashinfer.cake_moe_grouped_gemm_nondet_train`` and the package
 ``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train`` it hands off to
 are the non-deterministic mode: no entry takes a ``deterministic`` argument (one
-raises ``TypeError`` before anything runs), nothing routes to the deterministic
-module, and under ``torch.use_deterministic_algorithms(True)`` PyTorch's
-non-determinism alert is raised immediately before an order-varying launch only (the
-weight gradient whose 512-wide k tile splits its tail).  This suite covers on CPU the
-stable-API status (no experimental marking, no warning) and signatures of the module,
-the support query, its handoff (with the package
-functions replaced by recorders and the deterministic ones by tripwires), the refusal
-of a stale mode argument, its deferred imports, and the alert contract of prepared
-launches (with recorded launches standing in for the programs: an order-varying one
-alerts, a fixed-order one never does; the alert names the caller's frame under
-``warn_only``); on a GPU, the alert of prepared launches and of the autograd backward
-on an order-varying and on a fixed-order shape.  The names of the module, the removed
-ones included, are covered by ``test_cake_moe_grouped_gemm_nondet_train_names.py``.
+raises ``TypeError`` before anything runs) and nothing routes to the deterministic
+module.  Every output of the shipped registry and constants repeats bit for bit (the
+512-wide k tile's weight gradient finishes a split tail with the ordered one-launch
+tail), so no launch alerts under ``torch.use_deterministic_algorithms(True)``.  The
+non-determinism alert is dormant: it is raised immediately before an order-varying
+launch only (a weight gradient planned with an unordered split tail, which only an
+architecture listed in ``unordered_tail_archs`` -- empty in the shipped constants --
+can produce).  This suite covers on CPU the stable-API status (no experimental
+marking, no warning) and signatures of the module, the support query, its handoff
+(with the package functions replaced by recorders and the deterministic ones by
+tripwires), the refusal of a stale mode argument, its deferred imports, and the alert
+contract of prepared launches (with recorded launches standing in for the programs:
+an order-varying one alerts, a fixed-order one -- the ordered one-launch split tail
+included -- never does; the alert names the caller's frame under ``warn_only``); on a
+GPU, that a prepared weight gradient with a split ordered tail, the weight-gradient
+entry and the autograd backward on that shape (and on a 256-wide k tile shape) never
+alert under the strict and the ``warn_only`` mode and give the bits of a run with the
+mode off.  The names of the module, the removed ones included, are covered by
+``test_cake_moe_grouped_gemm_nondet_train_names.py``.
 """
 
 import contextlib
@@ -548,12 +554,19 @@ def _recorded_launch(monkeypatch, *, op="wgrad", plan=None, programs=1):
     return launch, log
 
 
+# The plan of a weight gradient with an unordered split tail: order-varying.  Only an
+# architecture listed in ``unordered_tail_archs`` (empty in the shipped constants)
+# plans one.
 SPLIT_TAIL = {"unordered_tail": True, "tail_splits": 3}
+# The plan of a 512-wide k tile weight gradient whose split tail the ordered one-launch
+# tail finishes (the shipped constants): a fixed order.
+ORDERED_SPLIT_TAIL = {"unordered_tail": False, "ordered_tail": True, "tail_splits": 4}
 
 
 def test_order_varying_launch_alerts_immediately_before_it_runs(monkeypatch):
-    """An order-varying launch (the weight gradient with an unordered split tail) checks
-    torch's deterministic mode at every ``launch()``: strict, a ``RuntimeError`` naming
+    """An order-varying launch (a weight gradient with an unordered split tail, which no
+    plan of the shipped constants is: the alert is dormant) checks torch's
+    deterministic mode at every ``launch()``: strict, a ``RuntimeError`` naming
     ``CakeMoEGroupedGemmNondetLaunch.launch`` and the deterministic entry
     (``CakeMoEGroupedGemmDetLaunch.launch``), and nothing launches; ``warn_only``, one
     ``UserWarning`` naming both and the caller's line, then it launches; mode off, it
@@ -595,17 +608,19 @@ def test_order_varying_launch_alerts_immediately_before_it_runs(monkeypatch):
     "op,plan,programs",
     [
         ("wgrad", {"unordered_tail": True, "tail_splits": 1}, 1),  # unsplit tail
-        ("wgrad", {"unordered_tail": False, "tail_splits": 4}, 2),  # ordered reduce
+        ("wgrad", {"unordered_tail": False, "tail_splits": 4}, 2),  # tail reduce
+        ("wgrad", ORDERED_SPLIT_TAIL, 1),  # ordered one-launch split tail
         ("wgrad", SPLIT_TAIL, 0),  # sum_m == 0: nothing to launch
         ("fwd", SPLIT_TAIL, 1),
         ("dgrad", {}, 1),
     ],
-    ids=["unsplit", "ordered_tail", "no_rows", "fwd", "dgrad"],
+    ids=["unsplit", "tail_reduce", "ordered_tail", "no_rows", "fwd", "dgrad"],
 )
 def test_fixed_order_launches_never_alert(op, plan, programs, monkeypatch):
     """A launch with a fixed order (the forward, the data gradient, the 256-wide k
-    tile's ordered tail reduce, an unsplit tail, no rows) is not ``order_varying`` and
-    runs under torch's strict deterministic mode without an alert."""
+    tile's two-launch ordered tail reduce, the 512-wide k tile's ordered one-launch
+    split tail, an unsplit tail, no rows) is not ``order_varying`` and runs under
+    torch's strict deterministic mode without an alert."""
     launch, log = _recorded_launch(monkeypatch, op=op, plan=plan, programs=programs)
     assert not launch.order_varying
     with (
@@ -625,7 +640,9 @@ def test_weight_gradient_alerts_with_the_entry_name(via, accumulate, monkeypatch
     handoff to it) raises the alert with its own name immediately before an
     order-varying launch (overwrite or accumulate): strict, a ``RuntimeError`` and
     nothing launches; ``warn_only``, a ``UserWarning`` naming the caller's line, then
-    it launches; the deterministic module is never called."""
+    it launches; the deterministic module is never called.  A launch whose split tail
+    the ordered one-launch tail finishes runs under the strict mode with no alert and
+    no warning."""
     _tripwires(monkeypatch)
     launch, log = _recorded_launch(monkeypatch, plan=SPLIT_TAIL)
     monkeypatch.setattr(cb, "_prepare_wgrad", lambda *args, **kwargs: launch)
@@ -658,6 +675,17 @@ def test_weight_gradient_alerts_with_the_entry_name(via, accumulate, monkeypatch
     )
     assert os.path.samefile(alerts[0].filename, __file__), alerts[0].filename
     assert log == ["launch"]
+    ordered, log = _recorded_launch(monkeypatch, plan=ORDERED_SPLIT_TAIL)
+    assert not ordered.order_varying
+    monkeypatch.setattr(cb, "_prepare_wgrad", lambda *args, **kwargs: ordered)
+    with (
+        _TorchDeterministic(warn_only=False),
+        warnings.catch_warnings(record=True) as rec,
+    ):
+        warnings.simplefilter("always")
+        call()
+    assert _user_warnings(rec) == [], [str(w.message) for w in rec]
+    assert log == ["launch"]
 
 
 def test_package_has_no_stable_api_handoff():
@@ -674,7 +702,8 @@ def test_package_has_no_stable_api_handoff():
 
 
 # ---------------------------------------------------------------------------
-# The alert of prepared launches and of the autograd backward (GPU)
+# No alert from prepared launches, the weight-gradient entry and the autograd
+# backward (GPU)
 # ---------------------------------------------------------------------------
 
 
@@ -685,120 +714,135 @@ def _base():
     return base
 
 
-def test_prepared_wgrad_launch_alerts_only_when_order_varying():
-    """A weight gradient prepared with torch's deterministic mode off alerts at its
-    launch once the mode is on when the launch is order-varying (the 512-wide k tile
-    with a split tail): strict, a ``RuntimeError`` and nothing launched (``out`` keeps
-    its NaN fill); ``warn_only``, one ``UserWarning`` naming the caller's line, then the
-    launch, within the budget of the fp64 reference.  The 256-wide k tile (ordered tail
-    reduce) and a forward launch never alert, and give the bits of a launch with the
-    mode off."""
+def _assert_split_ordered_tail(launch):
+    """``launch`` is a 512-wide k tile weight gradient whose tail is split and finished
+    in the same launch by the ordered one-launch tail, so it is not
+    ``order_varying``."""
+    plan = launch.plan
+    assert launch.op == "wgrad" and plan["tile_k"] == 512, plan
+    assert plan["ordered_tail"] and not plan["unordered_tail"], plan
+    assert plan["tail_splits"] > 1 and plan["launches"] == 1, plan
+    assert not launch.order_varying, plan
+
+
+def test_prepared_split_tail_wgrad_never_alerts():
+    """A 512-wide k tile weight gradient whose tail is split (the ordered one-launch
+    tail: ``plan["ordered_tail"]`` and ``plan["tail_splits"] > 1``, not
+    ``order_varying``), prepared with torch's deterministic mode off, launches under the
+    strict and the ``warn_only`` mode with no alert (no ``RuntimeError``, no
+    ``UserWarning``) and gives the bits of its launch with the mode off (within the
+    budget of the fp64 reference), ``out`` NaN-filled and the stream's tail slots
+    garbage-filled before every launch; so does
+    ``cake_moe_grouped_gemm_nondet_train_wgrad`` (the package's and the module's) on
+    that shape.  The 256-wide k tile (two-launch ordered tail reduce) and a forward
+    launch never alert either, and give the bits of a launch with the mode off."""
     base = _base()
     device = base._require_autograd_programs()
     sizes, (n, k) = base._tile_case(device, "k512")
     x, _w, g, offs = base._inputs(sizes, n, k, device, seed=60)
     launch = cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(g, x, offs)
-    assert launch.order_varying, launch.plan
-    launch.out.fill_(float("nan"))
-    with (
-        _TorchDeterministic(warn_only=False),
-        pytest.raises(RuntimeError, match="CakeMoEGroupedGemmNondetLaunch.launch"),
-    ):
-        launch.launch()
+    _assert_split_ordered_tail(launch)
+    ref = launch.launch().clone()
     torch.cuda.synchronize()
-    assert torch.isnan(launch.out.float()).all()  # the alert came before the launch
-    with (
-        _TorchDeterministic(warn_only=True),
-        warnings.catch_warnings(record=True) as rec,
-    ):
-        warnings.simplefilter("always")
-        out = launch.launch()
-    torch.cuda.synchronize()
-    alerts = [
-        w for w in rec if "CakeMoEGroupedGemmNondetLaunch.launch" in str(w.message)
-    ]
-    assert len(alerts) == 1 and alerts[0].category is UserWarning, [
-        str(w.message) for w in rec
-    ]
-    assert os.path.samefile(alerts[0].filename, __file__), alerts[0].filename
-    base._assert_wgrad_close(out, base._reference("wgrad", g, x, sizes))
+    base._assert_wgrad_close(ref, base._reference("wgrad", g, x, sizes))
+    calls = {
+        "launch": launch.launch,
+        "package": lambda: pkg.cake_moe_grouped_gemm_nondet_train_wgrad(g, x, offs),
+        "facade": lambda: facade.cake_moe_grouped_gemm_nondet_train_wgrad(g, x, offs),
+    }
+    for warn_only in (False, True):
+        for label, call in calls.items():
+            launch.out.fill_(float("nan"))
+            assert base._poison_tail_sums(device), "no kept tail slots on this stream"
+            with (
+                _TorchDeterministic(warn_only),
+                warnings.catch_warnings(record=True) as rec,
+            ):
+                warnings.simplefilter("always")
+                out = call()
+            torch.cuda.synchronize()
+            what = f"{label} warn_only={warn_only}"
+            assert _user_warnings(rec) == [], (what, [str(r.message) for r in rec])
+            base._assert_same_bits(out, ref, what)
+    base._assert_tail_at_rest(device)
 
     sizes = base.RAGGED_E4
     x, w, g, offs = base._inputs(sizes, 512, 256, device, seed=61)
-    ordered = cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(g, x, offs)
-    assert not ordered.order_varying, ordered.plan
+    k256 = cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(g, x, offs)
+    assert k256.plan["tile_k"] == 256 and not k256.order_varying, k256.plan
     fwd = cb.cake_moe_grouped_gemm_nondet_train_prepare_forward(x, w, offs)
-    ref = ordered.launch().clone()
+    ref = k256.launch().clone()
     y_ref = fwd.launch().clone()
-    ordered.out.fill_(float("nan"))
-    with (
-        _TorchDeterministic(warn_only=False),
-        warnings.catch_warnings(record=True) as rec,
-    ):
-        warnings.simplefilter("always")
-        out = ordered.launch()
-        y = fwd.launch()
-    torch.cuda.synchronize()
-    assert _user_warnings(rec) == []
-    assert torch.equal(out, ref) and torch.equal(y, y_ref)
+    for warn_only in (False, True):
+        k256.out.fill_(float("nan"))
+        fwd.out.fill_(float("nan"))
+        with (
+            _TorchDeterministic(warn_only),
+            warnings.catch_warnings(record=True) as rec,
+        ):
+            warnings.simplefilter("always")
+            out = k256.launch()
+            y = fwd.launch()
+        torch.cuda.synchronize()
+        assert _user_warnings(rec) == [], (warn_only, [str(r.message) for r in rec])
+        base._assert_same_bits(out, ref, f"k256 dW warn_only={warn_only}")
+        base._assert_same_bits(y, y_ref, f"Y warn_only={warn_only}")
 
 
-def test_autograd_backward_alerts_only_before_an_order_varying_weight_gradient():
-    """Under torch's deterministic mode the backward of the package's
-    ``CakeMoEGroupedGemmNondetFunction`` (through the package and through the module;
-    no fallback) alerts immediately before an order-varying ``dW`` launch
-    (``RuntimeError``; a ``UserWarning`` with ``warn_only``), not when only ``dX`` is
-    needed, and never on a fixed-order shape, whose gradients have the bits of a run
-    with the mode off."""
+def test_autograd_backward_never_alerts():
+    """Under torch's deterministic mode (strict and ``warn_only``) the backward of the
+    package's ``CakeMoEGroupedGemmNondetFunction`` (through the package and through the
+    module; no fallback) never alerts or warns, on a 512-wide k tile shape whose weight
+    gradient splits its ordered one-launch tail and on a 256-wide k tile shape, with
+    ``dW`` needed or not, and its gradients have the bits of a run with the mode off
+    (the stream's tail slots garbage-filled before every run; ``dW`` within the budget
+    of the fp64 reference)."""
     base = _base()
     device = base._require_autograd_programs()
+    entries = {
+        "package": pkg.cake_moe_grouped_gemm_nondet,
+        "facade": facade.cake_moe_grouped_gemm_nondet,
+    }
 
-    def run(fn, x0, w0, g, needs_w=True):
+    def run(entry, x0, w0, g, offs, needs_w=True):
+        base._poison_tail_sums(device)
         x = x0.clone().requires_grad_(True)
         w = w0.clone().requires_grad_(needs_w)
-        fn(x, w).backward(g)
+        entry(x, w, offs).backward(g)
         torch.cuda.synchronize()
         return x.grad, w.grad
 
-    sizes, (n, k) = base._tile_case(device, "k512")
-    x0, w0, g, offs = base._inputs(sizes, n, k, device, seed=62)
-    package = lambda x, w: pkg.cake_moe_grouped_gemm_nondet(x, w, offs)  # noqa: E731
-    through_facade = lambda x, w: facade.cake_moe_grouped_gemm_nondet(  # noqa: E731
-        x, w, offs
+    k512_sizes, k512_shape = base._tile_case(device, "k512")
+    cases = (
+        ("k512", k512_sizes, k512_shape, 62),
+        ("k256", base.RAGGED_E4, (512, 256), 63),
     )
-    with _TorchDeterministic(warn_only=False):
-        for fn in (package, through_facade):
-            with pytest.raises(
-                RuntimeError, match="CakeMoEGroupedGemmNondetFunction.backward"
-            ):
-                run(fn, x0, w0, g)
-        dx, dw = run(package, x0, w0, g, needs_w=False)
-        assert dx is not None and dw is None
-    with (
-        _TorchDeterministic(warn_only=True),
-        warnings.catch_warnings(record=True) as rec,
-    ):
-        warnings.simplefilter("always")
-        dx, dw = run(package, x0, w0, g)
-    alerts = [
-        w for w in rec if "CakeMoEGroupedGemmNondetFunction.backward" in str(w.message)
-    ]
-    assert alerts and all(w.category is UserWarning for w in alerts), [
-        str(w.message) for w in rec
-    ]
-    base._assert_wgrad_close(dw, base._reference("wgrad", g, x0, sizes))
-
-    sizes = base.RAGGED_E4
-    x0, w0, g, offs = base._inputs(sizes, 512, 256, device, seed=63)
-    want = run(package, x0, w0, g)
-    with (
-        _TorchDeterministic(warn_only=False),
-        warnings.catch_warnings(record=True) as rec,
-    ):
-        warnings.simplefilter("always")
-        got = run(package, x0, w0, g)
-    assert _user_warnings(rec) == []
-    assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
+    for tile, sizes, (n, k), seed in cases:
+        x0, w0, g, offs = base._inputs(sizes, n, k, device, seed=seed)
+        # The backward prepares this weight gradient (same operands, same plan).
+        planned = cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(g, x0, offs)
+        if tile == "k512":
+            _assert_split_ordered_tail(planned)
+        else:
+            assert planned.plan["tile_k"] == 256, planned.plan
+            assert not planned.order_varying, planned.plan
+        want = run(entries["package"], x0, w0, g, offs)
+        base._assert_wgrad_close(want[1], base._reference("wgrad", g, x0, sizes))
+        for warn_only in (False, True):
+            for via, entry in entries.items():
+                with (
+                    _TorchDeterministic(warn_only),
+                    warnings.catch_warnings(record=True) as rec,
+                ):
+                    warnings.simplefilter("always")
+                    dx, dw = run(entry, x0, w0, g, offs)
+                    dx_only, no_dw = run(entry, x0, w0, g, offs, needs_w=False)
+                what = f"{tile} {via} warn_only={warn_only}"
+                assert _user_warnings(rec) == [], (what, [str(r.message) for r in rec])
+                base._assert_same_bits(dx, want[0], f"dX {what}")
+                base._assert_same_bits(dw, want[1], f"dW {what}")
+                assert no_dw is None, what
+                base._assert_same_bits(dx_only, want[0], f"dX alone {what}")
 
 
 @pytest.mark.parametrize(

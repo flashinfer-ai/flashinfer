@@ -666,12 +666,18 @@ def test_workspace_pool_shares_session_and_refcounts_destroy(monkeypatch):
 
 
 @pytest.mark.cpu_only
-def test_sm100a_stages_are_the_manifest_stages():
+def test_sm100a_stages_are_the_sm107a_stage_overrides():
     module = _session_module()
     manifest, _ = module._load_manifest()
 
-    assert module._stages_for_arch(manifest, "sm_100a") == manifest["stages"]
-    assert "sm_100a" not in manifest["arch_stage_overrides"]
+    # sm_100a runs the same overridden stages as sm_107a
+    assert (
+        manifest["arch_stage_overrides"]["sm_100a"]
+        == manifest["arch_stage_overrides"]["sm_107a"]
+    )
+    assert module._stages_for_arch(manifest, "sm_100a") == module._stages_for_arch(
+        manifest, "sm_107a"
+    )
 
 
 @pytest.mark.cpu_only

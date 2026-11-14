@@ -107,7 +107,9 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
 
 extern "C" {
 
-__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
+// At most 120 registers: one CTA of 512 threads then leaves room on every SM
+// sub-partition for a warp of a kernel resident on another stream.
+__global__ __maxnreg__(120) void
 kernel_cake_rmsnorm_det_train_ca8ca4674a3dbd89ad16(__nv_bfloat16* __restrict__ g, __nv_bfloat16* __restrict__ x, float* __restrict__ w, float* __restrict__ r, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* __restrict__ partial, unsigned int* __restrict__ counters, __nv_bfloat16* __restrict__ g_h, int T, int n_chunks, int rows_per_chunk, long long g_stride_p0, long long x_stride_p0, long long g_h_stride_p0)
 {
     const int tid = threadIdx.x;
@@ -454,7 +456,7 @@ kernel_cake_rmsnorm_det_train_ca8ca4674a3dbd89ad16(__nv_bfloat16* __restrict__ g
     float out[16];
     if (cb >= ce) {
         if (c0 < n_chunks) {
-            unsigned long long pbase0 = (unsigned long long)c0 * 2048;
+            unsigned long long pbase0 = (unsigned long long)c0 * 2048ull;
             float fold0[4];
             #pragma unroll
             for (int e0 = 0; e0 < 4; e0++) {
@@ -649,7 +651,7 @@ kernel_cake_rmsnorm_det_train_ca8ca4674a3dbd89ad16(__nv_bfloat16* __restrict__ g
             float kx = rq * rq * rq * cq;
             float nkx = -kx;
             if (row < ce) {
-                unsigned long long dx_base = (unsigned long long)row * 2048;
+                unsigned long long dx_base = (unsigned long long)row * 2048ull;
                 #pragma unroll
                 for (int v_3 = 0; v_3 < 2; v_3++) {
                     #pragma unroll
@@ -736,7 +738,7 @@ kernel_cake_rmsnorm_det_train_ca8ca4674a3dbd89ad16(__nv_bfloat16* __restrict__ g
         asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_26) : "r"(w2_1));
         nd[2] = _warp_redux_26;
         int cid_f = nd[0];
-        unsigned long long pbase = (unsigned long long)cid_f * 2048;
+        unsigned long long pbase = (unsigned long long)cid_f * 2048ull;
         #pragma unroll
         for (int v_4 = 0; v_4 < 2; v_4++) {
             int fcol = (v_4 * 128 + tir) * 8;

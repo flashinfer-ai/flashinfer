@@ -8,7 +8,7 @@ the LRU evicted its plan (the plan retained, ``clear_plan_cache()`` the release)
 import pytest
 import torch
 
-from tests.test_helpers.qwen_3_5_block_cases import PagedCase
+from tests.experimental.test_helpers.qwen_3_5_block_cases import PagedCase
 
 pytestmark = [pytest.mark.arch_rubin, pytest.mark.usefixtures("rubin")]
 
@@ -294,12 +294,12 @@ def test_prefill_first_run_captured_replays_bitwise_eager():
         Qwen35BlockGeometry,
         prepare_qwen_3_5_block_bf16,
     )
-    from tests.test_helpers.qwen_3_5_block_cases import (
+    from tests.experimental.test_helpers.qwen_3_5_block_cases import (
         new_kv_cache,
         random_weights,
         ref_geometry,
     )
-    from tests.test_helpers.qwen_3_5_block_reference import (
+    from tests.experimental.test_helpers.qwen_3_5_block_reference import (
         build_rope_tables,
         cosine,
         gated_attention_block_reference,

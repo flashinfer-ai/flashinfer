@@ -197,10 +197,13 @@ def test_unsupported_inputs_raise_before_any_kernel():
         softmax_batch_invariant(x)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="lse.row"):
         log_probs_batch_invariant(x, torch.zeros(4, dtype=torch.int64))
-    with pytest.raises(ValueError, match="batch_invariant"):
+    # batch_invariant=False routes to the same entry today (no ValueError on the flag): the device check comes next
+    with pytest.raises(ValueError, match="CUDA tensor"):
         flashinfer.sampling.log_probs(
             x, torch.zeros(4, dtype=torch.int64), batch_invariant=False
         )
+    with pytest.raises(ValueError, match="CUDA tensor"):
+        flashinfer.sampling.log_softmax(x, batch_invariant=False)
 
 
 # ----------------------------------------------------------------------------------------------- on the device
@@ -404,8 +407,12 @@ def test_shared_dataflow_of_the_entries():
     assert same(flashinfer.sampling.log_probs(x, ids.to(torch.int32), temps), lp)
     # the log-softmax entry is the class's row; K ids per row are the row gathered K times (one launch), NaN per id
     assert same(flashinfer.sampling.log_softmax(x, temps), lp_row)
-    with pytest.raises(ValueError):
-        flashinfer.sampling.log_softmax(x, temps, batch_invariant=False)
+    # batch_invariant=False (the default) is the operator's regular kernel for these entries, today the same class
+    assert same(
+        flashinfer.sampling.log_softmax(x, temps, batch_invariant=False), lp_row
+    )
+    assert same(flashinfer.sampling.log_probs(x, ids, temps, batch_invariant=False), lp)
+    assert same(flashinfer.sampling.log_softmax(x, temps), lp_row)
     ar = torch.arange(16, device="cuda")
     ids3 = torch.stack([ids, bad, ids.flip(0)], dim=1)
     lp3, lse3 = flashinfer.sampling.log_probs(x, ids3, temps, return_lse=True)

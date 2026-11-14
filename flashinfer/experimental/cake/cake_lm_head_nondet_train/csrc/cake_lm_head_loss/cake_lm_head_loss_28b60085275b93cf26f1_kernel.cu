@@ -85,12 +85,12 @@ kernel_cake_lm_head_loss_28b60085275b93cf26f1(long long* __restrict__ ids, int* 
     __syncwarp();
     long long m64 = (long long)M;
     int num_windows = (V + 32767) / 32768;
-    long long run = 9223372036854775807;
+    long long run = 9223372036854775807ll;
     int row_stride = gridDim.x * 8;
     if (bid == 0) {
         if (tid == 0) {
             long long o_end = (long long)offsets[T];
-            long long e_lo = ((o_end > 0) ? o_end : 0);
+            long long e_lo = ((o_end > 0ll) ? o_end : 0ll);
             offsets32[T] = (int)((e_lo < m64) ? e_lo : m64);
         }
     }
@@ -98,13 +98,13 @@ kernel_cake_lm_head_loss_28b60085275b93cf26f1(long long* __restrict__ ids, int* 
         long long o_lo = (long long)offsets[t];
         long long o_hi = (long long)offsets[t + 1];
         long long t64 = (long long)t;
-        long long cand = 9223372036854775807;
-        cand = ((t == 0 && o_lo != 0) ? 1 : cand);
-        long long w_dec = t64 << 8 | 2;
+        long long cand = 9223372036854775807ll;
+        cand = ((t == 0 && o_lo != 0ll) ? 1ll : cand);
+        long long w_dec = t64 << 8ll | 2ll;
         cand = ((o_hi < o_lo && w_dec < cand) ? w_dec : cand);
-        long long w_last = (long long)T << 8 | 3;
+        long long w_last = (long long)T << 8ll | 3ll;
         cand = ((t == T - 1 && o_hi != m64 && w_last < cand) ? w_last : cand);
-        long long c_lo = ((o_lo > 0) ? o_lo : 0);
+        long long c_lo = ((o_lo > 0ll) ? o_lo : 0ll);
         c_lo = ((c_lo < m64) ? c_lo : m64);
         long long c_hi = ((o_hi > c_lo) ? o_hi : c_lo);
         c_hi = ((c_hi < m64) ? c_hi : m64);
@@ -114,26 +114,26 @@ kernel_cake_lm_head_loss_28b60085275b93cf26f1(long long* __restrict__ ids, int* 
         if (lane_1 == 0) {
             offsets32[t] = lo;
         }
-        long long lab = -100;
+        long long lab = -100ll;
         if (has_labels != 0) {
             lab = labels[t];
         }
-        bool need = lab != -100;
+        bool need = lab != -100ll;
         int bad = 0;
         int dup = 0;
         int first = 2147483647;
-        long long idv = 0;
+        long long idv = 0ll;
         int hit = 0;
         if (k <= 32) {
             int key = -1 - lane_1;
             if (lane_1 < k) {
                 idv = (long long)ids[lo + lane_1];
                 long long v64 = (long long)V;
-                bad = ((idv < 0 || idv >= v64) ? 1 : bad);
+                bad = ((idv < 0ll || idv >= v64) ? 1 : bad);
                 hit = ((idv == lab) ? 1 : 0);
-                long long lo_id = ((idv > 0) ? idv : 0);
-                ids32[lo + lane_1] = (int)((lo_id < v64) ? lo_id : v64 - 1);
-                key = ((idv >= 0 && idv < (long long)V) ? (int)idv : key);
+                long long lo_id = ((idv > 0ll) ? idv : 0ll);
+                ids32[lo + lane_1] = (int)((lo_id < v64) ? lo_id : v64 - 1ll);
+                key = ((idv >= 0ll && idv < (long long)V) ? (int)idv : key);
                 first = ((hit != 0) ? lane_1 : first);
             }
             if (k >= 2) {
@@ -204,18 +204,18 @@ kernel_cake_lm_head_loss_28b60085275b93cf26f1(long long* __restrict__ ids, int* 
             for (int i = lane_1; i < k; i += 32) {
                 idv = (long long)ids[lo + i];
                 long long v64_1 = (long long)V;
-                bad = ((idv < 0 || idv >= v64_1) ? 1 : bad);
+                bad = ((idv < 0ll || idv >= v64_1) ? 1 : bad);
                 hit = ((idv == lab) ? 1 : 0);
-                long long lo_id_1 = ((idv > 0) ? idv : 0);
-                ids32[lo + i] = (int)((lo_id_1 < v64_1) ? lo_id_1 : v64_1 - 1);
+                long long lo_id_1 = ((idv > 0ll) ? idv : 0ll);
+                ids32[lo + i] = (int)((lo_id_1 < v64_1) ? lo_id_1 : v64_1 - 1ll);
                 first = ((hit != 0 && i < first) ? i : first);
             }
             for (int win = 0; win < num_windows; win++) {
-                long long base = (long long)win * 32768;
+                long long base = (long long)win * 32768ll;
                 for (int im = lane_1; im < k; im += 32) {
                     long long id_m = (long long)ids[lo + im];
                     long long rel_m = id_m - base;
-                    if (rel_m >= 0 && rel_m < 32768 && id_m < (long long)V) {
+                    if (rel_m >= 0ll && rel_m < 32768ll && id_m < (long long)V) {
                         int r_m = (int)rel_m;
                         unsigned int bit = 1 << (unsigned int)(r_m & 31);
                         unsigned int old = atomicAdd(&bitmap[wbase + (r_m >> 5)], bit);
@@ -226,7 +226,7 @@ kernel_cake_lm_head_loss_28b60085275b93cf26f1(long long* __restrict__ ids, int* 
                 for (int ic = lane_1; ic < k; ic += 32) {
                     long long id_c = (long long)ids[lo + ic];
                     long long rel_c = id_c - base;
-                    if (rel_c >= 0 && rel_c < 32768 && id_c < (long long)V) {
+                    if (rel_c >= 0ll && rel_c < 32768ll && id_c < (long long)V) {
                         atomicAnd(&bitmap[wbase + ((int)rel_c >> 5)], 0);
                     }
                 }
@@ -246,7 +246,7 @@ kernel_cake_lm_head_loss_28b60085275b93cf26f1(long long* __restrict__ ids, int* 
         code = ((any_dup) ? 18 : code);
         code = ((any_bad) ? 17 : code);
         code = ((over) ? 16 : code);
-        long long w_row = 2305843009213693952 | t64 << 8 | (long long)code;
+        long long w_row = 2305843009213693952ll | t64 << 8ll | (long long)code;
         cand = ((code != 0 && w_row < cand) ? w_row : cand);
         run = ((cand < run) ? cand : run);
         if (has_labels != 0) {
@@ -255,7 +255,7 @@ kernel_cake_lm_head_loss_28b60085275b93cf26f1(long long* __restrict__ ids, int* 
             }
         }
     }
-    if (run != 9223372036854775807) {
+    if (run != 9223372036854775807ll) {
         if (lane_1 == 0) {
             atomicMin(&word[0], run);
         }

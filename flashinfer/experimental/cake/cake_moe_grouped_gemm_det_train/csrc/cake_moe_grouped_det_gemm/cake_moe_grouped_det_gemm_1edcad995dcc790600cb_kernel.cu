@@ -47,24 +47,13 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACCUM_OFFSET 0
-#define NUM_TMA_PIPE_STAGES 7
-#define NUM_MAINLOOP_PIPE_STAGES 2
-#define SMEM_SMEM_A_OFF 1024
-#define SMEM_SMEM_A_STAGE_BYTES 16384
-#define SMEM_SMEM_A_STRIDE 32768
-#define SMEM_SMEM_B_OFF 17408
-#define SMEM_SMEM_B_STAGE_BYTES 16384
-#define SMEM_SMEM_B_STRIDE 32768
-#define SMEM_TOTAL 230400
 #define BLOCK_M 128
 #define BLOCK_N 256
 #define BLOCK_K 64
 #define MMA_K 16
 #define CTA_GROUP 2
 #define NUM_STAGES 7
+#define TMEM_NCOLS 512
 #define NUM_EPILOGUE_WARPS 4
 #define CLUSTER_M 256
 #define EPI_CHUNK 16
@@ -192,14 +181,13 @@ kernel_cake_moe_grouped_det_gemm_1edcad995dcc790600cb(const __grid_constant__ CU
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_a = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_a_addr = smem + 1024;
     __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
     const int smem_b_addr = smem + 17408;
 
-    // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 18 barriers)
-    // Mbarriers at smem_raw[0..144)
+    // Mbarrier init (18 barriers at smem_raw[0..144))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -248,10 +236,8 @@ kernel_cake_moe_grouped_det_gemm_1edcad995dcc790600cb(const __grid_constant__ CU
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
 
     // ---- Role: load ----
     if (warp == 0) {

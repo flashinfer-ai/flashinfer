@@ -16,7 +16,9 @@ limitations under the License.
 The host plan of the non-deterministic RMSNorm training package without a
 device: every route tiles the positive token counts; a backward window launches
 either one single kernel (workspace rule ``claim_sum_f64``: counters and the
-kernel's ``workspace_bytes`` of FP64 column sums) or the deterministic
+kernel's ``workspace_bytes`` of FP64 column sums; or ``claim_part_f32``, a
+pair-row single kernel: counters and one row of FP32 pairs of scratch per CTA)
+or the deterministic
 package's pair (a ``chunk_partials`` main kernel, then its dw reduce), and the
 launch count of every window is the registry's; every backward route ships the
 single kernel in at least one window or is listed with its reason in
@@ -35,7 +37,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pytestmark = pytest.mark.cpu_only
 
@@ -123,7 +125,7 @@ def test_launch_count_of_every_window_is_the_registry_s() -> None:
             if kind == "fwd":
                 form = "fwd"
                 assert rule is None and len(names) == 1, (arch, route, names)
-            elif rule["kind"] == "claim_sum_f64":
+            elif rule["kind"] in ("claim_sum_f64", "claim_part_f32"):
                 form = "single"
                 assert len(names) == 1, (arch, route, names)
             else:
@@ -172,8 +174,24 @@ def test_backward_records_are_chunk_claiming_kernels_or_their_reduce() -> None:
                 assert record["launch"]["use_pdl"] is True
                 assert record["logical"]["partial"] == "partial"
                 continue
+            if record["grid_rule"]["kind"] == "fixed":
+                # the one-cluster kernel of a route's smallest token counts: one
+                # launch of a fixed grid (one thread-block cluster), no claim
+                # ticket, no completion count and no FP64 sums
+                assert record["role"].startswith("bwd_tiny"), (arch, route, name)
+                assert record["workspace_rule"] == {
+                    "counters": 0,
+                    "kind": "claim_sum_f64",
+                    "sum_bytes": 0,
+                }
+                assert record["grid_rule"]["ctas"] in (1, 2, 4, 8), (arch, name)
+                assert record["launch"]["cooperative"] is False
+                continue
             assert record["workspace_rule"]["kind"] in loader.WORKSPACE_KINDS
-            single = record["workspace_rule"]["kind"] == "claim_sum_f64"
+            single = record["workspace_rule"]["kind"] in (
+                "claim_sum_f64",
+                "claim_part_f32",
+            )
             # the claim ticket, then the completion counts (none for a single
             # kernel that keeps no sums, the column form: one word)
             assert (
@@ -182,13 +200,21 @@ def test_backward_records_are_chunk_claiming_kernels_or_their_reduce() -> None:
                 <= (loader.SINGLE_COUNTERS_BYTES if single else loader.COUNTERS_BYTES)
                 // 4
             )
-            if single:
+            if record["workspace_rule"]["kind"] == "claim_sum_f64":
                 sum_bytes = record["workspace_rule"]["sum_bytes"]
                 assert 0 <= sum_bytes <= loader.SUMS_BYTES and sum_bytes % 8 == 0
                 assert set(record["workspace_rule"]) == {
                     "counters",
                     "kind",
                     "sum_bytes",
+                }
+            elif single:
+                # one row of FP32 (hi, lo) pairs per CTA; no FP64 sums
+                assert record["workspace_rule"]["part_row_bytes"] == 8 * hidden
+                assert set(record["workspace_rule"]) == {
+                    "counters",
+                    "kind",
+                    "part_row_bytes",
                 }
             rule = record["grid_rule"]
             assert rule["kind"] == "claimed_chunks"
@@ -235,14 +261,22 @@ def _check_family_layout(arch: str, hidden: int, residual: bool, sms: int) -> in
     for w_dtype in loader.weight_dtypes(arch, hidden, "bwd", residual):
         for name in loader.route_modules(arch, hidden, "bwd", residual, w_dtype):
             record = loader.MODULES[name]
-            if record["workspace_rule"] is None:
+            # the one-cluster kernel (a fixed grid) has no chunk table, claim
+            # ticket or sums; its record is checked above
+            if (
+                record["workspace_rule"] is None
+                or record["grid_rule"]["kind"] == "fixed"
+            ):
                 continue
             rule = record["grid_rule"]
             single = record["workspace_rule"]["kind"] == "claim_sum_f64"
+            part = record["workspace_rule"]["kind"] == "claim_part_f32"
             singles += single
             for rows in (1, 2, 7, 64, 257, 1000, 4096, 16385, 65536):
                 layout = loader.workspace_layout(record, rows, device_index=0)
-                slots = rule["ctas_per_sm"] * sms
+                # the chunk table's slots: ``table_slots_per_sm`` per SM where the
+                # record spells it (a table cut finer than the grid), else the grid's
+                slots = rule.get("table_slots_per_sm", rule["ctas_per_sm"]) * sms
                 assert layout["slots"] == slots
                 table = loader.chunk_table(
                     rows, slots, rule["rows_per_issue"], *loader.chunk_taper(rule)
@@ -264,6 +298,21 @@ def _check_family_layout(arch: str, hidden: int, residual: bool, sms: int) -> in
                         -(-sum_bytes // 256) * 256
                     )
                     assert layout["total_bytes"] <= loader.PAIR_ROWS_OFFSET
+                elif part:
+                    # the single counters, then one row of FP32 pairs per CTA of
+                    # the launch grid at the pair rows' offset; the size covers a
+                    # row per CTA of every launch up to ``rows`` (the grid's bound)
+                    row_bytes = record["workspace_rule"]["part_row_bytes"]
+                    grid = loader.launch_grid(record, rows, device_index=0)[0]
+                    ctas = rule["ctas_per_sm"] * sms
+                    assert layout["grid"] == grid
+                    assert layout["counters_offset"] == loader.SINGLE_COUNTERS_OFFSET
+                    assert 4 * layout["counters"] <= loader.SINGLE_COUNTERS_BYTES
+                    assert layout["partial_offset"] == loader.PAIR_ROWS_OFFSET
+                    assert layout["partial_bytes"] == row_bytes * grid
+                    assert layout["total_bytes"] == loader.PAIR_ROWS_OFFSET + (
+                        -(-row_bytes * min(rows, ctas) // 256) * 256
+                    )
                 else:
                     # the pair counters first, the partial rows after the sums: a
                     # pair call never touches the single kernel's counters or sums
@@ -283,11 +332,19 @@ def _check_family_layout(arch: str, hidden: int, residual: bool, sms: int) -> in
                 # beside the chunks; no other record spells them
                 tasks = rule.get("col_tasks", 0)
                 column = single and record["workspace_rule"]["sum_bytes"] == 0
+                assert not (part and "col_tasks" in rule), (name, rule)
                 assert column == ("col_tasks" in rule), (name, rule)
                 if column:
                     assert tasks > 0 and hidden % tasks == 0, (name, tasks)
+                # at most the grid's CTAs, whatever the table's slots; a column-task
+                # record keeps the grid's own table
+                assert not ("table_slots_per_sm" in rule and "col_tasks" in rule), name
                 grid = loader.launch_grid(record, rows, device_index=0)
-                assert grid == (min(slots, len(table) + tasks), 1, 1)
+                assert grid == (
+                    min(rule["ctas_per_sm"] * sms, len(table) + tasks),
+                    1,
+                    1,
+                )
     return singles
 
 
@@ -401,11 +458,63 @@ def _pair_led_route() -> tuple[str, int, int]:
                     if loader.MODULES[name]["workspace_rule"] is not None
                     and loader.MODULES[name]["workspace_rule"]["kind"]
                     == "claim_sum_f64"
+                    # the one-cluster records (a fixed grid) are not counted:
+                    # the layout check skips them
+                    and loader.MODULES[name]["grid_rule"]["kind"] != "fixed"
                     and _window(loader.MODULES[name])[1] is not None
                     and _window(loader.MODULES[name])[1] <= 256
                 )
                 return arch, hidden, replaced
     raise AssertionError("no BF16 backward route runs the det pair at 257 tokens")
+
+
+@pytest.mark.parametrize("sms", SM_COUNTS)
+def test_a_pair_row_single_binds_fp32_scratch_after_the_sums(
+    sms: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pair-row single kernel (``claim_part_f32``; its kernel's
+    ``workspace_bytes`` is 0) binds the single counters and, at
+    ``PAIR_ROWS_OFFSET``, ``8 * grid * hidden`` bytes of FP32 scratch, ``grid``
+    its launch grid: the backend's ``partial`` view is that FP32 region and its
+    ``counters`` view the single counters; the layout's ``grid`` is the launch
+    grid, and a buffer one byte short is refused."""
+    import torch
+
+    monkeypatch.setattr(loader, "sm_count", lambda device_index: sms)
+    parts = [
+        (name, record)
+        for name, record in loader.MODULES.items()
+        if record["workspace_rule"] is not None
+        and record["workspace_rule"]["kind"] == "claim_part_f32"
+    ]
+    if not parts:
+        pytest.skip("the registry ships no pair-row single kernel")
+    cpu = torch.device("cpu")
+    for name, record in parts:
+        rule = record["workspace_rule"]
+        hidden = int(record["hidden"])
+        assert set(rule) == {"counters", "kind", "part_row_bytes"}, name
+        assert rule["part_row_bytes"] == 8 * hidden, name
+        low, high = _window(record)
+        top = 2 * low + 2 if high is None else high
+        for rows in sorted({low + 1, (low + 1 + top) // 2, top}):
+            layout = loader.workspace_layout(record, rows, device_index=0)
+            grid = loader.launch_grid(record, rows, device_index=0)[0]
+            assert layout["grid"] == grid, (name, rows)
+            buf = torch.zeros(layout["total_bytes"] + 256, dtype=torch.uint8)
+            skip = -buf.data_ptr() % 256
+            ws = buf[skip : skip + layout["total_bytes"]]
+            partial, counters = pkg._workspace_views(
+                ws, record, layout=layout, device=cpu
+            )
+            assert partial.dtype == torch.float32 and partial.ndim == 1, name
+            assert partial.numel() * 4 == 8 * grid * hidden, (name, rows, grid)
+            assert partial.data_ptr() == ws.data_ptr() + loader.PAIR_ROWS_OFFSET
+            assert counters.dtype == torch.uint32
+            assert counters.numel() == rule["counters"]
+            assert counters.data_ptr() == ws.data_ptr() + loader.SINGLE_COUNTERS_OFFSET
+            with pytest.raises(ValueError, match="needs"):
+                pkg._workspace_views(ws[:-1], record, layout=layout, device=cpu)
 
 
 @pytest.mark.parametrize("sizes", [(1,), (4,), (4, 4), (4, 2)])
@@ -453,7 +562,8 @@ def test_every_backward_route_ships_the_single_kernel_or_is_listed() -> None:
         if not route.startswith("bwd"):
             continue
         ships = any(
-            loader.MODULES[names[0]]["workspace_rule"]["kind"] == "claim_sum_f64"
+            loader.MODULES[names[0]]["workspace_rule"]["kind"]
+            in ("claim_sum_f64", "claim_part_f32")
             for _above, _at_most, names in _launches(arch, route)
         )
         listed = route in windows.DET_PAIR_ROUTES.get(arch, {})

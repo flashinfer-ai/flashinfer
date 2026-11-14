@@ -93,8 +93,9 @@ def _wgrad_acc_op(
     main_grad: torch.Tensor,
     num_groups: int,
 ) -> None:
-    # ``main_grad[e] += G[e].T @ X[e]``: the deterministic weight gradient in main_grad's dtype into the
-    # launch's scratch, then ``main_grad.add_`` on the same stream (the package's accumulate mode).
+    # ``main_grad[e] += G[e].T @ X[e]`` with the package's accumulate mode: fused into the weight-gradient
+    # programs where the route serves their accumulate builds, else the deterministic weight gradient in
+    # main_grad's dtype into the launch's scratch, then ``main_grad.add_`` on the same stream (same bits).
     cake_moe_grouped_gemm_det_train_prepare_wgrad(
         g, x, offs, out=main_grad, num_groups=num_groups, accumulate=True
     ).launch()
@@ -281,6 +282,9 @@ def cake_moe_grouped_gemm_det(
 ) -> torch.Tensor:
     """Differentiable ragged grouped GEMM ``Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T``.
 
+    The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+    For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
+
     Parameters
     ----------
     x : torch.Tensor
@@ -302,10 +306,12 @@ def cake_moe_grouped_gemm_det(
         and also refuses one that shares memory with the operands).  Under
         ``torch.no_grad()`` or inference mode the forward needs no
         ``main_grad``.  The backward adds the deterministic ``dW`` into it in
-        place (``main_grad[e] += G[e].T @ X[e]``: ``dW`` in ``main_grad``'s
-        dtype into a scratch, then ``main_grad.add_`` on the same stream, the
-        package's accumulate mode), which gives AccumulateGrad's bits of that
-        ``dW``, bitwise reproducible run to run, and returns for ``w`` a fresh
+        place (``main_grad[e] += G[e].T @ X[e]``, the package's accumulate
+        mode: fused into the weight-gradient programs where the route serves
+        their accumulate builds for ``main_grad``'s dtype, else ``dW`` in
+        ``main_grad``'s dtype into a scratch, then ``main_grad.add_`` on the
+        same stream), which gives AccumulateGrad's bits of that ``dW`` on
+        either route, bitwise reproducible run to run, and returns for ``w`` a fresh
         ``torch.empty`` of ``w``'s shape and dtype when ``w`` has the attribute
         ``grad_added_to_main_grad`` (set to ``True``; ``torch.zeros`` when
         ``w.zero_out_wgrad`` is true), else ``None``: ``w.grad`` is then
@@ -316,11 +322,12 @@ def cake_moe_grouped_gemm_det(
         supported (``NotImplementedError``) under ``torch.jit.trace``,
         ``torch.compile`` and a ``create_graph`` backward; under a reentrant
         checkpoint ``w`` arrives detached, without ``main_grad``
-        (``ValueError``).  Cost: the weight-gradient launch holds a scratch of
-        ``E * N * K`` elements of ``main_grad``'s dtype (``4 * E * N * K``
-        bytes for fp32, freed after the add), which the programs write and the
-        add reads back besides its read and write of ``main_grad``; the
-        placeholder takes ``2 * E * N * K`` bytes.  Under
+        (``ValueError``).  Cost: on the composed route the weight-gradient
+        launch holds a scratch of ``E * N * K`` elements of ``main_grad``'s
+        dtype (``4 * E * N * K`` bytes for fp32, freed after the add), which
+        the programs write and the add reads back besides its read and write
+        of ``main_grad``; the fused route holds none.  The placeholder takes
+        ``2 * E * N * K`` bytes.  Under
         ``torch.use_deterministic_algorithms(True)`` with
         ``torch.utils.deterministic.fill_uninitialized_memory`` on (the
         default) torch also fills the scratch and the ``torch.empty``

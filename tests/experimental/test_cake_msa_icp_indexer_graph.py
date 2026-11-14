@@ -52,7 +52,7 @@ import torch
 
 import flashinfer.msa_ops as msa_ops
 from tests.experimental import test_cake_msa_icp_indexer as base
-from tests.test_helpers import cake_msa_icp_inputs as ref
+from tests.experimental.test_helpers import cake_msa_icp_inputs as ref
 
 FP8 = torch.float8_e4m3fn
 H = ref.NUM_HEADS

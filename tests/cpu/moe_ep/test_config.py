@@ -204,3 +204,54 @@ def test_moe_ep_imports_without_deep_gemm():
     assert SplitConfig().kernel.kernel_name == "identity"
     assert SplitKernelContext.__name__ == "SplitKernelContext"
     assert MoEEpSplitLayer.__name__ == "MoEEpSplitLayer"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("alias", (False, True))
+@pytest.mark.parametrize("left,right", ((2.0, -2.0), (0.0, -0.0), (2.0, 2.0 + 2**-25)))
+def test_batch_invariant_auto_config_accepts_equivalent_clamps(left, right, alias):
+    from flashinfer.batch_invariant import fingerprint
+    from flashinfer.moe_ep import (
+        AutoConfig,
+        MegaConfig,
+        Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
+    )
+
+    base = Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=256, top_k=2, batch_invariant=True, gate_up_clamp=left
+    )
+    changes = (
+        {"gate_up_clamp": None, "activation_clamp": right}
+        if alias
+        else {"gate_up_clamp": right}
+    )
+    candidates = (
+        MegaConfig(megakernel=base),
+        MegaConfig(megakernel=replace(base, **changes)),
+    )
+    assert AutoConfig(candidates=candidates).candidates == candidates
+    dims = dict(hidden=256, intermediate=256, top_k=2, num_experts=4, arch="sm_100")
+    assert fingerprint("megamoe_bf16", **dims, gate_up_clamp=left) == fingerprint(
+        "megamoe_bf16", **dims, gate_up_clamp=right
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("left,right", ((2.0, -3.0), (None, 0.0), (None, -0.0)))
+def test_batch_invariant_auto_config_rejects_distinct_clamps(left, right):
+    from flashinfer.moe_ep import (
+        AutoConfig,
+        MegaConfig,
+        Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
+    )
+
+    base = Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=256, top_k=2, batch_invariant=True, gate_up_clamp=left
+    )
+    with pytest.raises(ValueError, match="same calculation"):
+        AutoConfig(
+            candidates=(
+                MegaConfig(megakernel=base),
+                MegaConfig(megakernel=replace(base, gate_up_clamp=right)),
+            )
+        )

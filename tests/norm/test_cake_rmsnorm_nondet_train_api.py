@@ -432,7 +432,7 @@ def test_nondet_calls_select_this_package(
         if loader.MODULES[name]["workspace_rule"] is not None
     ]
     assert len(owners) == 1 and len(launched) == (
-        2 if owners[0] == "claim_sum_f64" else 3
+        2 if owners[0] in ("claim_sum_f64", "claim_part_f32") else 3
     ), launched
     y_det, rstd_det = det.cake_rmsnorm_det_train_forward(x, w, eps)
     torch.testing.assert_close(y.float(), y_det.float(), atol=1e-2, rtol=1e-2)
@@ -636,7 +636,7 @@ def test_a_single_kernel_window_launches_exactly_one_kernel(no_determinism) -> N
     from flashinfer.experimental.cake.cake_rmsnorm_nondet_train import (
         cake_windows as windows,
     )
-    from tests.test_helpers.cake_profiler import cuda_kernel_names
+    from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
     arch = loader.device_arch(_device().index or 0)
     found = _single_window(arch)
@@ -675,7 +675,7 @@ def test_a_single_kernel_window_launches_exactly_one_kernel(no_determinism) -> N
     torch.cuda.synchronize()
     # Every CUDA activity of the call, memsets and copies included, read
     # between sentinel kernels that prove the session kept the whole window (a
-    # session can lose its device records; see tests.test_helpers.cake_profiler).
+    # session can lose its device records; see tests.cake.test_helpers.cake_profiler).
     # When every session lost them, the workspace is still checked before the
     # launch count is skipped.
     lost = None

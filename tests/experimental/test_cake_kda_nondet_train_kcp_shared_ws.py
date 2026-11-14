@@ -42,15 +42,15 @@ from tests.experimental.test_cake_kda_nondet_train_kcp_dist import (
     _init_group,
     _rendezvous,
 )
-from tests.test_helpers.cake_host_sync import (
+from tests.experimental.test_helpers.cake_host_sync import (
     allocator_counts,
     census,
     nonblocking,
     sleep_cycles,
     summary,
 )
-from tests.test_helpers.cake_kda_train_kcp_saved import written_tensors
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers.cake_kda_train_kcp_saved import written_tensors
+from tests.cake.test_helpers.cake_package import cake_package
 
 kp = cake_package("cake.cake_kda_nondet_train_kcp", "cake_kcp_plan")
 cake_kcp = cake_package("cake.cake_kda_nondet_train_kcp", "cake_kcp")
@@ -657,7 +657,7 @@ def test_gpu_four_pack_step_peak_drops_by_sum_minus_max(device) -> None:
 
 
 def test_gpu_shared_workspace_steady_calls_do_not_block_or_allocate(device) -> None:
-    """Census (``tests/test_helpers/cake_host_sync.py``) of a steady interleaved round of the four packs (saving
+    """Census (``tests/experimental/test_helpers/cake_host_sync.py``) of a steady interleaved round of the four packs (saving
     forwards, then saved-mode backwards in reverse order) on one reserved workspace: no pageable or pinned copy, no
     synchronizing operation, the queued probe still runs when the host returns, and no device allocation or free;
     bitwise the first round."""

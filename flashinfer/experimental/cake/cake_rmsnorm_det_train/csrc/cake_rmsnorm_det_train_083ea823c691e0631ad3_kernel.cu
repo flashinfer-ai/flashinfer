@@ -409,7 +409,7 @@ kernel_cake_rmsnorm_det_train_083ea823c691e0631ad3(__nv_bfloat16* __restrict__ g
                     float cq = dots[0] * 0.00390625f;
                     float kx = rq * rq * rq * cq;
                     float nkx = -kx;
-                    unsigned long long dx_base = (unsigned long long)rowc * 256;
+                    unsigned long long dx_base = (unsigned long long)rowc * 256ull;
                     float2 rr = make_float2(rq, rq);
                     float2 rrn = make_float2(-rq, -rq);
                     float2 nn = make_float2(nkx, nkx);
@@ -505,7 +505,7 @@ kernel_cake_rmsnorm_det_train_083ea823c691e0631ad3(__nv_bfloat16* __restrict__ g
                     float cq_0 = dots_0[0] * 0.00390625f;
                     float kx_0 = rq_0 * rq_0 * rq_0 * cq_0;
                     float nkx_0 = -kx_0;
-                    unsigned long long dx_base_0 = (unsigned long long)(rowc + rstep) * 256;
+                    unsigned long long dx_base_0 = (unsigned long long)(rowc + rstep) * 256ull;
                     float2 rr_0 = make_float2(rq_0, rq_0);
                     float2 rrn_0 = make_float2(-rq_0, -rq_0);
                     float2 nn_0 = make_float2(nkx_0, nkx_0);
@@ -602,7 +602,7 @@ kernel_cake_rmsnorm_det_train_083ea823c691e0631ad3(__nv_bfloat16* __restrict__ g
                     float cq_1 = dots_1[0] * 0.00390625f;
                     float kx_1 = rq_1 * rq_1 * rq_1 * cq_1;
                     float nkx_1 = -kx_1;
-                    unsigned long long dx_base_1 = (unsigned long long)rowc * 256;
+                    unsigned long long dx_base_1 = (unsigned long long)rowc * 256ull;
                     float2 rr_1 = make_float2(rq_1, rq_1);
                     float2 rrn_1 = make_float2(-rq_1, -rq_1);
                     float2 nn_1 = make_float2(nkx_1, nkx_1);
@@ -670,7 +670,7 @@ kernel_cake_rmsnorm_det_train_083ea823c691e0631ad3(__nv_bfloat16* __restrict__ g
             }
             asm volatile("cp.async.wait_group 0;");
         }
-        unsigned long long pbase = (unsigned long long)c * 256;
+        unsigned long long pbase = (unsigned long long)c * 256ull;
         #pragma unroll
         for (int v_7 = 0; v_7 < 1; v_7++) {
             int fcol = (v_7 * 32 + tir) * 8;

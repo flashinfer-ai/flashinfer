@@ -273,7 +273,7 @@ class GmemCResource(MemoryResource):
         ):
             self._alloc_dsfp8_absmax = SmemAllocation(
                 f"{self.name}_dsfp8_absmax",
-                size_bytes=self.cfg.epi_tile_n * 4,
+                size_bytes=self.cfg.epi_tile_n * self.cfg.dsfp8_row_groups_per_tile * 4,
                 alignment=16,
             )
         if self._alloc_bias is None and self.cfg.has_bias_m:
@@ -447,7 +447,7 @@ class GmemCResource(MemoryResource):
         """Clear the dedicated DeepSeek output-scale reduction scratch."""
         if cutlass.const_expr(self._alloc_dsfp8_absmax is not None):
             tidx, _, _ = cute.arch.thread_idx()
-            if tidx < Int32(self.cfg.epi_tile_n):
+            if tidx < Int32(self.cfg.epi_tile_n * self.cfg.dsfp8_row_groups_per_tile):
                 self.sDsFp8Absmax.subview(tidx).store(Float32(0.0))
             prims.barrier_cta_sync(
                 barrier_id=_EPILOGUE_BARRIER_ID,
@@ -2543,11 +2543,15 @@ class GmemCResource(MemoryResource):
             )
 
     @cute.jit
-    def _atomic_dsfp8_absmax_scratch_pair(self, val0, val1, lane_id, scale_pair):
+    def _atomic_dsfp8_absmax_scratch_pair(
+        self, val0, val1, lane_id, scale_pair, row_group
+    ):
         warp_absmax0 = self._reduce_fp4_absmax_m16(val0)
         warp_absmax1 = self._reduce_fp4_absmax_m16(val1)
         lane_col = (lane_id % Int32(4)) * Int32(2)
-        scratch_idx = scale_pair * Int32(8) + lane_col
+        scratch_idx = (
+            row_group * Int32(self.cfg.epi_tile_n) + scale_pair * Int32(8) + lane_col
+        )
         if (lane_id // Int32(4)) == Int32(0):
             cute.arch.atomic_fmax(
                 ptr=self.sDsFp8Absmax.data_ptr(scratch_idx),
@@ -2647,14 +2651,29 @@ class GmemCResource(MemoryResource):
         return q0, dq0, q1, dq1
 
     @cute.jit
-    def _dsfp8_c_scale_pair_two_epilogues(self, lane_id, scale_pair):
+    def _dsfp8_c_scale_pair_two_epilogues(
+        self, warpgroup_idx, warp_in_epi4, lane_id, scale_pair, row_group
+    ):
+        """Block absmax of one column pair over this warp's scale row group.
+
+        At block 128 the group is the whole 128-row tile (all eight warps).
+        At block 32 it is this warp and its partner ``warp_in_epi4 ^ 1``.
+        """
         if cutlass.const_expr(self.cfg.uses_deepseek_fp8_atomic_absmax):
             lane_col = (lane_id % Int32(4)) * Int32(2)
-            scratch_idx = scale_pair * Int32(8) + lane_col
+            scratch_idx = (
+                row_group * Int32(self.cfg.epi_tile_n)
+                + scale_pair * Int32(8)
+                + lane_col
+            )
             block_abs0, block_abs1 = self.sDsFp8Absmax.load(
                 scratch_idx,
                 vector_size=2,
                 alignment=8,
+            )
+        elif cutlass.const_expr(self.cfg.dsfp8_row_groups_per_tile > 1):
+            block_abs0, block_abs1 = self._read_absmax_scratch_pair(
+                warpgroup_idx, warp_in_epi4, lane_id, scale_pair
             )
         else:
             group0_abs0, group0_abs1 = self._read_absmax_scratch_pair_all_warps(
@@ -2680,7 +2699,9 @@ class GmemCResource(MemoryResource):
     @cute.jit
     def _dsfp8_c_scale_idx(self, m_row, n_col, output_m):
         if cutlass.const_expr(self.cfg.is_swap_ab):
-            return (m_row // Int32(128)) * self.dsfp8_c_scale_stride + n_col
+            return (
+                m_row // Int32(self.cfg.deepseek_fp8_block_size)
+            ) * self.dsfp8_c_scale_stride + n_col
         return (n_col // Int32(128)) * output_m + m_row
 
     @cute.jit
@@ -2696,9 +2717,22 @@ class GmemCResource(MemoryResource):
         warp_in_epi4,
         warpgroup_idx,
     ):
-        should_store = (warp_in_epi4 == Int32(0)) & ((lane_id // Int32(4)) == Int32(0))
+        lane_stores = (lane_id // Int32(4)) == Int32(0)
         if cutlass.const_expr(self.cfg.has_deepseek_fp8_two_epilogue):
-            should_store = should_store & (warpgroup_idx == Int32(0))
+            # The warpgroups split the tile rows: the first warp of each scale
+            # row group stores that group's scale.
+            warps_per_group = (
+                self.cfg.warp_layout.num_epilogue_warps
+                // self.cfg.dsfp8_row_groups_per_tile
+            )
+            warp_in_epi = warpgroup_idx * Int32(4) + warp_in_epi4
+            should_store = (
+                (warp_in_epi % Int32(warps_per_group)) == Int32(0)
+            ) & lane_stores
+        else:
+            # The warpgroups split the tile columns: warp 0 of each stores the
+            # scale of its own columns.
+            should_store = (warp_in_epi4 == Int32(0)) & lane_stores
         if should_store:
             if output_in_bounds:
                 if cutlass.const_expr(self.cfg.use_tma_oob_opt):
@@ -4861,6 +4895,17 @@ class GmemCResource(MemoryResource):
                                         )
         elif cutlass.const_expr(self.cfg.has_deepseek_fp8_c_scale):
             if cutlass.const_expr(self.cfg.has_deepseek_fp8_two_epilogue):
+                # Scale row group of this warp's rows (warp-uniform). Each
+                # epilogue warp owns tile_m / num_epilogue_warps consecutive
+                # rows, so a warp never straddles two groups.
+                dsfp8_row_group = Int32(0)
+                if cutlass.const_expr(self.cfg.dsfp8_row_groups_per_tile > 1):
+                    rows_per_warp = (
+                        self.cfg.tile_m // self.cfg.warp_layout.num_epilogue_warps
+                    )
+                    dsfp8_row_group = (
+                        (warpgroup_idx * Int32(4) + warp_in_epi4) * Int32(rows_per_warp)
+                    ) // Int32(self.cfg.deepseek_fp8_block_size)
                 val0_vals = []
                 val1_vals = []
                 for group in cutlass.range_constexpr(self.cfg.epi_tile_n // 8):
@@ -4901,6 +4946,7 @@ class GmemCResource(MemoryResource):
                             local_abs1,
                             lane_id,
                             Int32(group),
+                            dsfp8_row_group,
                         )
                     else:
                         self._write_absmax_scratch_pair(
@@ -4918,8 +4964,11 @@ class GmemCResource(MemoryResource):
                 )
                 for group in cutlass.range_constexpr(self.cfg.epi_tile_n // 8):
                     q0, dq0, q1, dq1 = self._dsfp8_c_scale_pair_two_epilogues(
+                        warpgroup_idx,
+                        warp_in_epi4,
                         lane_id,
                         Int32(group),
+                        dsfp8_row_group,
                     )
                     col_off = Int32(group * 8)
                     for col_sub in cutlass.range_constexpr(2):

@@ -22,10 +22,10 @@ public callable takes a ``deterministic`` keyword (the ``forward`` /
 ``backward`` of the autograd ``Function`` class included), the former mHC
 modules and names are gone, the top level of ``flashinfer`` has no mHC
 ``nondet`` name, the module imports its backend on first use only, the backend
-never imports the deterministic head package, its registry is the
-deterministic head's under the library stem ``cake_mhc_train_head_*``, and the
-package is wired at its path (test-helper key, package data, ignored ``aot/``,
-pre-commit exclude, manifest checker row).
+never imports the deterministic head package, its registry (records and
+routes) is the deterministic head's under the library stem
+``cake_mhc_train_head_*``, and the package is wired at its path (test-helper
+key, package data, pre-commit exclude, manifest checker row).
 """
 
 import ast
@@ -276,33 +276,53 @@ def _renamed(value):
 
 @pytest.mark.cpu_only
 def test_the_registry_is_the_det_head_registry_renamed() -> None:
-    """Every record of the registry (launch, grid rule, argument plan, logical map, architectures) and every host
-    constant is the deterministic head's, with the library stem ``cake_mhc_det_train_head_`` replaced by
-    ``cake_mhc_train_head_``: the same programs under this package's own library names."""
+    """Every record of the registry (launch, grid rule, argument plan, logical map, architectures, hidden size), the
+    route of every (architecture, role, hidden size), the small-problem routes and every host constant are the
+    deterministic head's, with the library stem ``cake_mhc_det_train_head_`` replaced by ``cake_mhc_train_head_``:
+    the same programs, launched on the same architectures, under this package's own library names."""
     ours = importlib.import_module(f"{BACKEND}.cake_jit")
     det = importlib.import_module(f"{DET_BACKEND}.cake_jit")
-    modules, roles = ours.MODULES, ours.ROLES
+    modules, routes, small_routes = ours.MODULES, ours.ROUTES, ours.SMALL_ROUTES
     assert modules == _renamed(det.MODULES)
-    assert roles == _renamed(det.ROLES)
+    assert routes == _renamed(det.ROUTES)
+    assert small_routes == _renamed(det.SMALL_ROUTES)
     assert all(record["library"].startswith(STEM) for record in modules.values()), (
         modules
     )
+    for arch, roles in routes.items():
+        for role, by_hidden in roles.items():
+            for hidden, name in by_hidden.items():
+                for rows in (
+                    1,
+                    ours.small_elements(arch, role) // hidden,
+                    ours.small_elements(arch, role) // hidden + 1,
+                ):
+                    assert ours.route_module(arch, role, hidden, rows) == _renamed(
+                        det.route_module(arch, role, hidden, rows)
+                    )
+                assert ours.route_module(arch, role, hidden, 1 << 20) == name
+                record = modules[name]
+                assert record["role"] == role and arch in record["arches"]
+                assert record["hidden"] in (0, hidden)
     for name in (
         "ARCHES",
         "ARCH_BY_CAPABILITY",
         "STREAMS",
         "HIDDEN_SIZES",
         "MAX_TOKENS",
+        "MAX_VECTORS",
+        "SMALL_ELEMENTS",
+        "SMALL_ELEMENTS_BY_ROUTE",
     ):
         assert getattr(ours, name) == getattr(det, name), name
 
 
 @pytest.mark.cpu_only
 def test_package_wiring() -> None:
-    """The test-helper key, the build manifest's package and libraries, the package data, the ignored ``aot/``
-    directory, the pre-commit exclude of the generated sources and the manifest checker's row name the package
+    """The test-helper key, the build manifest's package and libraries, the package data,
+    the pre-commit exclude of the generated sources and the manifest checker's row name the package
     at its path."""
-    from tests.test_helpers.cake_package import PACKAGES
+    from tests.cake.test_helpers.cake_package import PACKAGES
 
     directory = _backend_dir()
     assert PACKAGES[KEY] == BACKEND
@@ -323,7 +343,6 @@ def test_package_wiring() -> None:
     data = tomllib.loads((REPO / "pyproject.toml").read_text())
     package_data = data["tool"]["setuptools"]["package-data"]
     assert package_data[BACKEND] == ["csrc/**", "build.json"]
-    assert "aot/" in (directory / ".gitignore").read_text().split()
     pre_commit = (REPO / ".pre-commit-config.yaml").read_text()
     # pre-commit skips every generated source of the package (the generic #8928 rule), still checks its Python
     # modules

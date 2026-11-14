@@ -550,7 +550,7 @@ kernel_cake_lm_head_loss_f9bdd4cff5189fe26c30(const __grid_constant__ CUtensorMa
                 float tau_t = temperature[rin_t];
                 float _fdiv_0 = __fdiv_rn(dz_d, tau_t);
                 dz_d = _fdiv_0;
-                int dz_skip = ((rin_lbl < 0) ? 1 : 0);
+                int dz_skip = ((rin_lbl < 0ll) ? 1 : 0);
                 int dz_col = (int)rin_lbl - ep_off_n;
                 int live_rows_2 = CNT[0];
                 int live_2 = (((bid_m_2 >> 1) * 256 < live_rows_2) ? k_iters : 0);

@@ -44,6 +44,10 @@ CakeGDNArch = Literal["sm_100a", "sm_103a", "sm_107a"]
 
 _EXPORT_SCHEMA = "flashinfer-cake-gdn-decode-standalone-export-v1"
 _DEFINE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Prefill bodies compile in two flavors: =1 assumes every state vector access is
+# 16-byte aligned (no address predicate: the main body); =0 guards each vector
+# block with a warp-uniform address predicate and a bit-identical scalar cold arm.
+_STATE_VEC_ALIGNED_DEFINE = "CAKE_GDN_STATE_VEC_ALIGNED"
 _RECORD_NAME = re.compile(r"^(decode|prefill)_(.+)_[0-9a-f]{12}$")
 _RECORD_TMA_ABI = {"decode": "pointer", "prefill": "grid_constant"}
 # A decode record whose kernel takes its state as a ``const __grid_constant__ CUtensorMap``
@@ -295,8 +299,14 @@ def _define_flags(record: dict[str, Any]) -> tuple[str, ...]:
     return tuple(flags)
 
 
-def _compile_options(record: dict[str, Any]) -> tuple[str, ...]:
-    """``nvcc`` options of the variant: ``--use_fast_math`` and its ``-D`` flags."""
+def _compile_options(
+    record: dict[str, Any], *, state_vec_aligned: bool = True
+) -> tuple[str, ...]:
+    """``nvcc`` options of the variant: ``--use_fast_math`` and its ``-D`` flags.
+
+    Every prefill record also gets ``-DCAKE_GDN_STATE_VEC_ALIGNED=1|0`` (the
+    16-byte-aligned or the guarded flavor); decode records have one flavor.
+    """
 
     options = tuple(record.get("compile_options", ("--use_fast_math",)))
     unsupported_options = set(options) - {"--use_fast_math"}
@@ -304,12 +314,25 @@ def _compile_options(record: dict[str, Any]) -> tuple[str, ...]:
         raise RuntimeError(
             f"unsupported Cake GDN compile options: {sorted(unsupported_options)!r}"
         )
-    return options + _define_flags(record)
+    options += _define_flags(record)
+    if record["name"].startswith("prefill_"):
+        options += (f"-D{_STATE_VEC_ALIGNED_DEFINE}={int(state_vec_aligned)}",)
+    elif not state_vec_aligned:
+        raise ValueError(
+            f"Cake GDN record {record['name']!r} has no state-alignment flavor"
+        )
+    return options
 
 
 @functools.cache
-def compile_cake_gdn_cubin(name: str, arch: CakeGDNArch) -> Path:
-    """Compile one Cake GDN kernel variant for ``arch`` and return its cubin path."""
+def compile_cake_gdn_cubin(
+    name: str, arch: CakeGDNArch, *, state_vec_aligned: bool = True
+) -> Path:
+    """Compile one Cake GDN kernel variant for ``arch`` and return its cubin path.
+
+    ``state_vec_aligned=False`` selects the guarded prefill flavor (element-aligned
+    state); the flavor enters the compile options and so the cubin digest.
+    """
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
         raise CakeGDNUnsupportedError(f"unsupported Cake GDN architecture: {arch!r}")
@@ -318,7 +341,7 @@ def compile_cake_gdn_cubin(name: str, arch: CakeGDNArch) -> Path:
     root = _source_dir()
     cuda_path = root / cuda["path"]
     headers = _manifest().get("cuda_headers", [])
-    compile_options = _compile_options(record)
+    compile_options = _compile_options(record, state_vec_aligned=state_vec_aligned)
     nvcc, nvcc_version = _nvcc_identity()
     compile_digest = _compile_cache_digest(
         arch=arch,
@@ -407,10 +430,17 @@ def render_cake_gdn_host_shim(record: dict[str, Any]) -> str:
 
 
 @functools.cache
-def load_cake_gdn_kernel(name: str, arch: CakeGDNArch):
-    """Compile and load one Cake GDN host entrypoint."""
+def load_cake_gdn_kernel(
+    name: str, arch: CakeGDNArch, *, state_vec_aligned: bool = True
+):
+    """Compile and load one Cake GDN host entrypoint.
 
-    cubin = compile_cake_gdn_cubin(name, arch)
+    ``state_vec_aligned=False`` loads the guarded prefill flavor; its module name
+    differs through the cubin stem.  Callers of the aligned flavor omit the keyword
+    (one cache entry per flavor).
+    """
+
+    cubin = compile_cake_gdn_cubin(name, arch, state_vec_aligned=state_vec_aligned)
     record = _kernel_record(name)
     host = record["host_binding"]
     root = _source_dir()
@@ -685,6 +715,34 @@ _GATE_STREAM_FULL_BASES = frozenset(
 # ``select_cake_gdn_prefill_variant``); every stored value equals the twin's without it.
 _GATE_STREAM_PF_ARCHES = frozenset({"sm_107a"})
 
+# The sm_107a vec2-full twins of the three shared full-DV bodies that store a final state without
+# state indices: BF16 I/O with BF16 state and an initial state (without the gate-stream twin), and
+# BF16 or FP16 I/O with FP32 state and no initial state.  Each twin is a record of its own beside the
+# shared record of the same key (schedule ``..._sm107a_vec2full_i64meta``) and moves the final (and
+# initial) state as sector-complete 16x256b rows; every other operation, and every stored value, is
+# the shared body's.  It is faster where every sequence of the batch is short, and lost up to 0.8% on
+# an R200 (216 SMs) on ragged batches where one sequence of 8192 tokens (128 chunks) bounds the
+# launch (BF16 state Hq8/Hv32 0.997x, FP32 state Hq16/Hv32 0.992-0.996x).  Batches bounded by 4096
+# tokens still ran 1.011-1.020x with BF16 state, but as low as 0.999x on a ragged FP32-state batch
+# without an initial state (Hq16/Hv32), while every measured batch bounded by 2048 tokens ran 1.011x
+# or faster.  So the resolver takes the twin only when the longest sequence spans at most
+# ``_VEC2FULL_MAX_TILE_CHUNKS`` 64-token chunks (2048 tokens).  ``max_seq_len`` is an upper bound: a
+# loose bound only raises it, so the batch keeps the shared record.
+_VEC2FULL_MAX_TILE_CHUNKS = 32
+_VEC2FULL_SHARED_SCHEDULES = frozenset(
+    {
+        "flashinfer_blackwell_gdn_prefill_initial_bf16state_sm107a_i64meta",
+        "flashinfer_blackwell_gdn_prefill_sm107a_i64meta",
+        "flashinfer_blackwell_gdn_prefill_f16io_sm107a_i64meta",
+    }
+)
+
+
+def _vec2full_twin_schedule(shared_schedule: str) -> str:
+    """The schedule of the vec2-full twin of a ``_VEC2FULL_SHARED_SCHEDULES`` schedule."""
+
+    return shared_schedule.replace("_sm107a_i64meta", "_sm107a_vec2full_i64meta")
+
 
 def _cake_gdn_prefill_gate_stream_full(
     *, num_seqs: int, total_seq_len: int, total_tiles: int, grid_x: int
@@ -787,8 +845,13 @@ _SM107A_SEQ_TWINS: dict[str, tuple[str, ...]] = {
         "dvsplit_initial_f16io_gatepipe4",
     ),
     # bf16 / f16-state dvsplit schedules with shipped records (the bf16 one indexed or
-    # not): the same width lever on the low-precision state loads and stores,
-    # alignment-guarded on the indexed plans
+    # not): the same width lever on the low-precision state loads and stores.  As in
+    # every non-CP prefill body, the aligned flavor (`CAKE_GDN_STATE_VEC_ALIGNED=1`,
+    # picked when every state pointer and slot stride is 16-byte aligned) runs the
+    # vector blocks unguarded; the guarded flavor (`=0`) runs a vector state access
+    # block only when the tile's absolute state address (data pointer plus slot and
+    # head offset) is aligned to the block's widest vector access, and a bit-identical
+    # scalar block otherwise, on indexed and packed plans alike.
     "l7b_vec2lp": (
         "dvsplit_initial_bf16state",
         "dvsplit_initial_bf16state_indexed",
@@ -1104,6 +1167,14 @@ def select_cake_gdn_prefill_variant(
     twin itself, as the prefetch twin issues no prefetch when each CTA owns
     one tile.  The launch evaluates the same grid rule with the same count,
     so the two agree.
+
+    On sm_107a a batch that resolves the shared full-DV record of the BF16-state
+    contract without gate streaming or of the FP32-state contracts without an
+    initial state runs that key's vec2-full twin record when ``max_seq_len``
+    spans at most ``_VEC2FULL_MAX_TILE_CHUNKS`` chunks (2048 tokens), else the
+    shared record; outputs and final states are bitwise equal either way.  A
+    loose bound keeps the shared record, and the ragged DV-split route keeps
+    precedence.
     """
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
@@ -1438,6 +1509,31 @@ def select_cake_gdn_prefill_variant(
             ragged = _ragged_dvsplit_routes().get(record["name"])
             if ragged is not None:
                 return ragged
+    # The vec2-full twin of a shared full-DV record (``_VEC2FULL_SHARED_SCHEDULES``): when the
+    # longest sequence spans at most ``_VEC2FULL_MAX_TILE_CHUNKS`` chunks and the key ships the
+    # twin record, the batch runs the twin; the ragged DV-split route above keeps precedence and
+    # every other record (gate-stream twins, indexed state, checkpoints) stays as resolved.
+    if (
+        arch == "sm_107a"
+        and not dvsplit
+        and not use_state_indices
+        and _prefill_tile_chunks(max_seq_len) <= _VEC2FULL_MAX_TILE_CHUNKS
+    ):
+        shared_schedule = record.get("source_schedule", "").rsplit(":", 1)[-1]
+        if shared_schedule in _VEC2FULL_SHARED_SCHEDULES:
+            twin_schedule = _vec2full_twin_schedule(shared_schedule)
+            if _has_variant(
+                arch=arch,
+                domain="prefill",
+                schedule_attr=twin_schedule,
+                specializations=specializations,
+            ):
+                record = _variant_for(
+                    arch=arch,
+                    domain="prefill",
+                    schedule_attr=twin_schedule,
+                    specializations=specializations,
+                )
     if single_chunk:
         route = "flashinfer.gdn_prefill.noncp.single_chunk"
     elif enable_checkpoints:
@@ -1811,9 +1907,9 @@ def cake_gdn_fp32_t1_ctas_per_state(variant_name: str) -> int:
 # The fp32-state T=1 K-major (nontranspose) bodies (`direct_fp32_t1_nontranspose_*`) are
 # routed per (architecture, rule band): the shipped `_small` body (eight CTAs per state
 # head) below 32 batch rows and the shipped large body (one CTA per state head) from 32
-# on, except on Rubin (sm_107a), which runs the `mid4` twin below 21 rows -- four CTAs
+# on, except on Rubin (sm_107a), which runs the `mid4` twin below 10 rows -- four CTAs
 # per state head, each owning one Kx32 value panel over 128-byte state segments -- and the
-# `hqsplit_tma3` twin from 21 rows on (the upper small band 21 <= B < 32 and the whole
+# `hqsplit_tma3` twin from 10 rows on (the upper small band 10 <= B < 32 and the whole
 # large band B >= 32): the large body's update loop split in two (`hqsplit`), with each
 # 32-wide V panel of the state loaded and stored by TMA through a three-stage ring of
 # 128-byte-swizzled shared-memory panels instead of cp.async loads and per-thread
@@ -1837,8 +1933,8 @@ def cake_gdn_fp32_t1_ctas_per_state(variant_name: str) -> int:
 # `NONTRANSPOSE_FP32_T1_CTAS_PER_STATE` / `select_nontranspose_fp32_t1_body` of the
 # Cake decode kernel program; they are kept in step by hand (no test compares them).
 CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD = 32
-# First batch size of the upper small band (21 <= B < 32).
-CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_UPPER_BATCH_START = 21
+# First batch size of the upper small band (10 <= B < 32; 21 before 2026-11-08).
+CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_UPPER_BATCH_START = 10
 CAKE_GDN_NONTRANSPOSE_FP32_T1_LARGE_WAVEFIT_BATCH_LIMIT = (
     37  # 35 -> 37; see the Cake launcher
 )
@@ -1858,8 +1954,11 @@ CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_BODIES: dict[tuple[str, str], str] = {
     # Adopted 2026-11-02: the `_rc_kq128` twin of `mid4` (q/k fetched from shared memory
     # as 128-bit loads into registers; bitwise-identical output).
     ("sm_107a", "small"): "gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128",
-    # Adopted 2026-11-03: the upper small band 21 <= B < 32 (formerly `mid4_rc_kq128`)
-    # runs the TMA-state `hqsplit_tma3` twin on sm_107a where it ships a record.
+    # Adopted 2026-11-03: the upper small band (formerly `mid4_rc_kq128`) runs the
+    # TMA-state `hqsplit_tma3` twin on sm_107a where it ships a record; the band starts at
+    # B = 10 since 2026-11-08 (21 before), when the TMA-state host shim began to reuse the
+    # tensor map it encoded for the same state and the public nontranspose decode began to
+    # reuse its launch per row (``gdn_decode._CAKE_GDN_NONTRANSPOSE_LAUNCHES``).
     ("sm_107a", "small_upper"): "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3",
     # Adopted 2026-11-03: the whole large band (B >= 32; formerly `tilev32_x2` for
     # 32 <= B < 37 and the ``hqsplit`` recurrence twin from 37) runs the TMA-state
@@ -1901,7 +2000,7 @@ CAKE_GDN_DECODE_TMA_STATE_SCHEDULES = frozenset(
 
 
 def cake_gdn_nontranspose_fp32_t1_rule_band(batch_size: int) -> str:
-    """Rule band of ``batch_size`` rows: ``small`` (B < 21), ``small_upper`` (21 <= B < 32), ``large_wavefit`` (32 <= B < 37) or ``large``."""
+    """Rule band of ``batch_size`` rows: ``small`` (B < 10), ``small_upper`` (10 <= B < 32), ``large_wavefit`` (32 <= B < 37) or ``large``."""
 
     if int(batch_size) < CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_UPPER_BATCH_START:
         return "small"
@@ -2302,7 +2401,7 @@ def select_cake_gdn_decode_variant(
         )
     elif layout == "nontranspose":
         # The body follows the batch band per architecture (sm_107a runs the `mid4`
-        # twin below 21 rows); the route id names a twin and the host reads the
+        # twin below 10 rows); the route id names a twin and the host reads the
         # record's CTAs per state head for the grid.  A band whose twin ships no
         # record for the row's specializations keeps its fallback band's body; a row
         # listed in the per-row table runs the body of the band it names.

@@ -302,7 +302,7 @@ kernel_cake_rmsnorm_det_train_40210950f2e7ee48bc3e(__nv_bfloat16* __restrict__ x
                     if (g0 == 0) {
                         r[row] = rstd;
                     }
-                    long long obase = (long long)row * 2048;
+                    long long obase = (long long)row * 2048ll;
                     #pragma unroll
                     for (int c_2 = 0; c_2 < 2; c_2++) {
                         #pragma unroll

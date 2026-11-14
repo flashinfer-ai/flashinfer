@@ -561,10 +561,16 @@ def cake_rmsnorm_det_train_forward(
     residual : torch.Tensor, optional
         BF16 update of ``x``'s shape added to ``x`` before normalization (same
         layout rules as ``x``).  Enables the fused residual-add route.
-    out, rstd, residual_out : torch.Tensor, optional
-        Preallocated outputs: BF16 ``y`` of ``x``'s shape, FP32 reciprocal RMS of
-        its leading shape (``[T]``) and (residual only) BF16 ``h_new`` of ``x``'s
-        shape.  Contiguous aligned buffers are written directly; any other layout
+    out : torch.Tensor, optional
+        Preallocated BF16 ``y`` of ``x``'s shape. Contiguous aligned buffers
+        are written directly; any other layout receives a copy after the launch.
+    rstd : torch.Tensor, optional
+        Preallocated FP32 reciprocal RMS of ``x``'s leading shape (``[...]``
+        for ``x`` of shape ``[..., H]``). Contiguous aligned buffers are written
+        directly; any other layout receives a copy after the launch.
+    residual_out : torch.Tensor, optional
+        Preallocated BF16 ``h_new`` of ``x``'s shape, used only with ``residual``.
+        Contiguous aligned buffers are written directly; any other layout
         receives a copy after the launch.
 
     Returns
@@ -709,10 +715,12 @@ def cake_rmsnorm_det_train_backward(
         Caller-owned ``uint8`` buffer from
         :func:`cake_rmsnorm_det_train_backward_workspace` sized for at least this
         many rows; allocated when omitted.
-    dx, dw : torch.Tensor, optional
-        Preallocated outputs: BF16 ``dx`` of ``x``'s shape and FP32 ``[H]``.
-        Contiguous aligned buffers are written directly; any other layout
-        receives a copy after the launch.
+    dx : torch.Tensor, optional
+        Preallocated BF16 gradient of ``x``'s shape. Contiguous aligned buffers
+        are written directly; any other layout receives a copy after the launch.
+    dw : torch.Tensor, optional
+        Preallocated FP32 ``[H]`` weight gradient. Contiguous aligned buffers
+        are written directly; any other layout receives a copy after the launch.
 
     Returns
     -------

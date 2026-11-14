@@ -18,13 +18,13 @@ package ``flashinfer.experimental.cake.cake_lm_head_nondet_train``:
 ``cake_lm_head_nondet_train_support_logprob`` / ``cake_lm_head_nondet_train_support_kl`` take no ``deterministic``, raise
 PyTorch's deterministic-algorithms alert in their backward before a dense dX of more than one K slice (every other
 backward has one fixed order), and are held to the deterministic suite's gate
-(``tests/test_helpers/cake_lm_head_support_reference.py``: 1.05x the masked PyTorch baseline's error against the
+(``tests/experimental/test_helpers/cake_lm_head_support_reference.py``: 1.05x the masked PyTorch baseline's error against the
 FP64 oracle plus a floor).  Their programs are the deterministic package's, so the outputs, the sparse dX and the
 weight gradient equal the deterministic entries' bits on the same inputs; the dense dX adds its vocabulary blocks into
 the chunk sum through the K-sliced reduction (``cake_support.support_dx_form``: one slice keeps the deterministic
 bits, more slices -- only inside the rule's measured cells, or forced by a test -- add in the order they finish).  The
 gradients carry no run-to-run promise in this package and are checked over repeated runs against the gate.  The
-package is reached through ``tests.test_helpers.cake_package``.
+package is reached through ``tests.cake.test_helpers.cake_package``.
 """
 
 import contextlib
@@ -35,14 +35,14 @@ import warnings
 import pytest
 import torch
 
-from tests.test_helpers.cake_lm_head_support_reference import (
+from tests.experimental.test_helpers.cake_lm_head_support_reference import (
     gate_failures,
     make_support_inputs,
     reference_support_b0,
     reference_support_fp64,
     support_error_report,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_support = cake_package("cake.cake_lm_head_nondet_train", "cake_support")
 cake_backend = cake_package("cake.cake_lm_head_nondet_train", "cake_backend")
@@ -145,13 +145,13 @@ def _bf16_ulp(t):
 
 
 def _within_rounding_of_det(nd, det, zero_rows=None):
-    """A K-sliced (unordered) dX against the deterministic (ordered) one, element by element:
+    """A K-sliced dX (its own summation order) against the deterministic one, element by element:
     ``|nd - det| <= ulp(det) + 2^-14 rowmax |det|``.  Two FP32 sums less than one BF16 ulp apart round to BF16 values
     at most one ulp apart; the two FP32 sums differ by a few FP32 roundings of partial sums of about the size of the
     row's elements, far below 2^-14 of the row's largest one.  A lost or doubled slice moves an element by that
     slice's whole share.  A row with no nonzero product (an ignored label, a single candidate; ``zero_rows``, by
     default the rows of the deterministic dX that are all 0) is 0 here too, compared by value (``-0.0`` and ``+0.0``
-    are equal): the ``-0.0`` fill plus zero products, so a value a missing fill leaves in such a row fails.  A single 0
+    are equal): the chunk's first block stores the row's zero products, so a value a missing store leaves fails.  A 0
     in another row keeps the bound (``ulp(0) = 2^-133``): a sum that cancels to exactly 0 in one order, or rounds to 0
     at the BF16 underflow, may end one rounding away in the other.  Returns the largest ``|nd - det| / bound``."""
     d, ref = nd.float(), det.float()
@@ -594,8 +594,16 @@ def test_dense_stages_follow_the_rule():
     # an architecture outside DX_SPLIT_ARCHES requires no split-tail program
     assert not split & set(stages("sm_90a"))
     assert set(cake_support.SUPPORT_DENSE_STAGES) <= set(stages("sm_90a"))
-    # the later blocks of a chunk add through the reduction form at one slice too
-    assert "gemm_dx_red" in cake_support.SUPPORT_DENSE_STAGES
+    # the later blocks of a chunk add through the reduction form at one slice too; a block above one slice is followed
+    # by the reduction's slab sum: the storing form after a chunk's first block, the accumulating form after a later one
+    dense = cake_support.SUPPORT_DENSE_STAGES
+    assert "gemm_dx_red" in dense
+    assert cake_backend.DX_SLAB_SUM_STAGE in dense
+    assert cake_backend.DX_SLAB_SUM_ACC_STAGE in dense
+    assert dense.index(cake_backend.DX_SLAB_SUM_ACC_STAGE) == (
+        dense.index(cake_backend.DX_SLAB_SUM_STAGE) + 1
+    )
+    assert cake_backend.DX_SLAB_SUM_ACC_STAGE not in cake_backend.DX_SLAB_SUM_STAGES
     for name, record in cake_support.MODULES.items():
         need = cake_support.SUPPORT_STAGES + stages(record["arch"])
         assert [s for s in need if s not in record] == [], name
@@ -628,8 +636,52 @@ def _force_dx_form(monkeypatch, form):
     monkeypatch.setattr(cake_support, "support_dx_form", forced)
 
 
-# (slices, split-tail items): S = 1 keeps the deterministic bits (with or without the split tail); S > 1 adds the
-# slices in the order they finish
+def _record_dense_launches(monkeypatch) -> list:
+    """The support programs' launches of the calls that follow, in order: ``(stage, v0, k_slices)`` from the launch's
+    values (``None`` where it has none; ``v0`` is read from the gradient scatter that opens each dense backward
+    vocabulary block, ``k_slices`` from each dX GEMM)."""
+    launch, launched = cake_support._run, []
+
+    def recording(cx, stage, values):
+        launched.append((stage, values.get("v0"), values.get("k_slices")))
+        return launch(cx, stage, values)
+
+    monkeypatch.setattr(cake_support, "_run", recording)
+    return launched
+
+
+def _assert_slab_sums_follow_their_blocks(launched: list) -> tuple[int, int]:
+    """Every dense dX block GEMM of ``launched`` (:func:`_record_dense_launches`) above one K slice is a reduction form
+    followed right away by its slab sum: :data:`.cake_backend.DX_SLAB_SUM_STAGE` (stores the sum) after a token
+    chunk's first vocabulary block (``v0 == 0``), :data:`.cake_backend.DX_SLAB_SUM_ACC_STAGE` (adds it once) after a
+    later block; no slab sum follows a GEMM of one slice.  Returns the numbers of storing and accumulating slab
+    sums."""
+    sums = (cake_backend.DX_SLAB_SUM_STAGE, cake_backend.DX_SLAB_SUM_ACC_STAGE)
+    first, gemms, counts = None, 0, [0, 0]
+    for pos, (stage, v0, slices) in enumerate(launched):
+        if stage == "support_scatter_dz_bf16":
+            first = v0 == 0
+            continue
+        if not stage.startswith("gemm_dx"):
+            continue
+        gemms += 1
+        after = launched[pos + 1][0] if pos + 1 < len(launched) else None
+        if int(slices) == 1:
+            assert after not in sums, (pos, launched)
+            continue
+        assert first is not None and stage.startswith(cake_backend.DX_RED_STAGE), (
+            pos,
+            launched,
+        )
+        want = 0 if first else 1
+        assert after == sums[want], (pos, launched)
+        counts[want] += 1
+    assert gemms, launched
+    return counts[0], counts[1]
+
+
+# (slices, split-tail items): S = 1 keeps the deterministic bits (with or without the split tail); S > 1 stores the
+# slices into a slab and sums them in slice order
 DX_FORMS = [(1, 0), (1, 1), (2, 0), (2, 1), (4, 0), (4, 2)]
 DX_CASES = ["kl two chunks", "selected chunked", "packed shr hetero"]
 
@@ -640,20 +692,200 @@ DX_CASES = ["kl two chunks", "selected chunked", "packed shr hetero"]
 def test_cake_dense_dx_reduction_forms(case, form, vocab_block, monkeypatch):
     """The dense dX pass at every slice / split-tail form passes the gate; one slice equals the deterministic
     package's bits (outputs, dX and dW); above one slice the outputs and dW stay bitwise and dX differs from the
-    deterministic one by rounding only."""
+    deterministic one by rounding only.  Above one slice each block's reduction GEMM is followed right away by its
+    slab sum (:func:`_assert_slab_sums_follow_their_blocks`): the storing form after a chunk's first vocabulary block,
+    the accumulating form after each later one (``vocab_block`` 256: two blocks per chunk)."""
     _require_cake()
     outputs, mk, kw = SUPPORT_CASES[case]
     mk = dict(mk)
     inp = cuda_inputs(mk.pop("T"), **mk)
     kw = dict(kw, backend="cake", path={"X": "dense"}, vocab_block=vocab_block)
     _force_dx_form(monkeypatch, form)
+    launched = _record_dense_launches(monkeypatch)
     res, err, _ = check_gates(inp, outputs, **kw)
+    storing, accumulating = _assert_slab_sums_follow_their_blocks(launched)
+    if form[0] == 1:
+        assert storing == accumulating == 0, launched
+    else:
+        assert storing, launched
+        if vocab_block is not None:
+            assert accumulating, launched
     det = run_support(inp, outputs, package="det", **kw)
     if form[0] == 1:
         assert_same(res, det)
         return
     assert_same(dict(res, dX=None), dict(det, dX=None))
     _within_rounding_of_det(res["dX"], det["dX"])
+
+
+def _force_dense_order(monkeypatch, order):
+    """Run every dense backward in ``order`` (``"chunk"`` / ``"block"``, :func:`cake_support._dense_order`); returns
+    the list of the orders the calls that follow ran."""
+    seen = []
+
+    def forced(*args):
+        seen.append(order)
+        return order
+
+    monkeypatch.setattr(cake_support, "_dense_order", forced)
+    return seen
+
+
+# name: (outputs, make_support_inputs kwargs, entry kwargs, rows whose upstream is zeroed: every third row and the
+# first quarter, or none).  More than one token chunk each; "selected chunked" has ignored labels and empty rows.
+DENSE_ORDER_CASES = {
+    "selected chunked": SUPPORT_CASES["selected chunked"] + (False,),
+    "kl two chunks": SUPPORT_CASES["kl two chunks"] + (False,),
+    "kl+packed heavy constant": SUPPORT_CASES["kl+packed heavy constant"] + (False,),
+    "packed heavy zero upstream rows": (
+        ("packed",),
+        dict(T=1100, k_cap=32, kind="heavy", tau_form="hetero"),
+        dict(chunk_size=256),
+        True,
+    ),
+}
+
+
+def _zero_upstream_rows(inp):
+    """``inp.g`` with every third row's and the first quarter's pairs set to 0 (rows no upstream reaches)."""
+    T = inp.T
+    counts = (inp.support_offsets[1:] - inp.support_offsets[:-1]).long()
+    rows = torch.arange(T, device=counts.device)
+    row_of_pair = torch.repeat_interleave(rows, counts)
+    zero = (rows % 3 == 0) | (rows < T // 4)
+    g = inp.g.clone()
+    g[zero[row_of_pair]] = 0
+    return dict(packed=g)
+
+
+@pytest.mark.parametrize(
+    "need, form",
+    [
+        ((True, True), None),
+        ((True, False), None),
+        ((False, True), None),
+        ((True, True), (2, 0)),
+        ((True, False), (2, 0)),
+    ],
+    ids=["dXdW", "dX", "dW", "dXdW-s2", "dX-s2"],
+)
+@pytest.mark.parametrize("vocab_block", [None, 256])
+@pytest.mark.parametrize("case", sorted(DENSE_ORDER_CASES))
+def test_cake_dense_backward_orders_have_the_same_bits(
+    case, vocab_block, need, form, monkeypatch
+):
+    """The dense backward forced chunk-outer and forced block-outer (:func:`cake_support._dense_order`) gives the same
+    bits on the outputs, dX and dW: both orders run the same launches and add every FP32 element in the same order.
+    With ignored labels, empty rows and rows no upstream reaches; the rule's own order passes the gate and equals both.
+    Every shape here is outside the dense dX rule's cells (one K slice per block).  ``form`` ``(2, 0)`` forces two K
+    slices on every block (blocks of 4 or 8 K steps): the ordered slab sums -- storing at a chunk's first block,
+    accumulating at a later one (``vocab_block`` 256: two blocks) -- give the same bits in both orders too."""
+    _require_cake()
+    outputs, mk, kw, zero_rows = DENSE_ORDER_CASES[case]
+    mk = dict(mk)
+    inp = cuda_inputs(mk.pop("T"), **mk)
+    kw = dict(kw, backend="cake", path="dense", vocab_block=vocab_block)
+    need_dx, need_dw = need
+    up = _zero_upstream_rows(inp) if zero_rows else None
+    rule = cake_support._dense_order
+    if form is not None:
+        _force_dx_form(monkeypatch, form)
+    forms = _record_dx_forms(monkeypatch)
+    runs = {}
+    for order in ("chunk", "block"):
+        seen = _force_dense_order(monkeypatch, order)
+        runs[order] = run_support(
+            inp, outputs, upstream=up, need_dx=need_dx, need_dw=need_dw, **kw
+        )
+        assert seen == [order], seen
+    if form is None:
+        assert all(s == 1 for s, _ in forms), forms
+    else:
+        assert forms and all(s == form[0] for s, _ in forms), forms
+    assert_same(runs["chunk"], runs["block"])
+    monkeypatch.setattr(cake_support, "_dense_order", rule)
+    if up is None and need_dx and need_dw:
+        res, _, _ = check_gates(inp, outputs, **kw)
+    else:
+        res = run_support(
+            inp, outputs, upstream=up, need_dx=need_dx, need_dw=need_dw, **kw
+        )
+    assert_same(res, runs["chunk"])
+    if up is not None:
+        # the rows no upstream reaches: dX exactly 0 in both orders
+        counts = inp.support_offsets[1:] - inp.support_offsets[:-1]
+        rows = torch.arange(inp.T, device=counts.device)
+        zero = (rows % 3 == 0) | (rows < inp.T // 4)
+        if need_dx:
+            for order in ("chunk", "block"):
+                assert int((runs[order]["dX"][zero] != 0).sum()) == 0, order
+
+
+def test_dense_vocab_block_default():
+    """The default dense vocabulary block (host rule, no device): blocks of at most about
+    ``DENSE_VOCAB_BLOCK_TARGET`` columns, equal widths rounded up to 256 -- three blocks at V 154880 / 152064, one
+    block (the whole vocabulary, rounded) at or below the target."""
+    rule = cake_support._dense_vocab_block
+    assert cake_support.DENSE_VOCAB_BLOCK_TARGET == 51712
+    assert rule(154880) == 51712
+    assert rule(152064) == 50688
+    assert rule(51712) == 51712
+    assert rule(51713) == 26112
+    assert rule(4096) == 4096
+    assert rule(1000) == 1000
+
+
+def test_cake_dense_order_rule_and_memory_report():
+    """The order rule picks the smaller FP32 sums and the memory report counts them: block-outer at a V18-like shape
+    (T 16231, H 6144, V 154880, chunk 4096: ``dX`` ``[T, H]`` + one block's ``dW_acc`` instead of ``dX_c`` ``[C, H]`` +
+    ``dW_acc`` ``[V, H]``), chunk-outer at a very long call (T 262144) and at one token chunk, chunk-outer for a dX-only
+    dense backward."""
+    _require_cake()
+    arch = cake_support._cake_context(CUDA).arch
+    H, V, M, C = 6144, 154880, 16_800_000, 4096
+    rule = cake_support._dense_order
+    for T, vb, dx, dw, want in [
+        (16231, 15616, True, True, "block"),
+        (16231, 51712, True, True, "block"),
+        (16231, 15616, False, True, "block"),
+        (16231, 15616, True, False, "chunk"),
+        (262144, 15616, True, True, "chunk"),
+        (4096, 15616, True, True, "chunk"),
+    ]:
+        assert rule(T, H, V, C, vb, dx, dw) == want, (T, vb, dx, dw)
+    # the ordered K-sliced dX slab the report adds for a dense dX: the largest of the arch's slice cells at this H with
+    # at most the chunk's row pairs (sm_100a: the H 6144 cell, 3 slices of 8 tiles; sm_103a / sm_107a: no cell, 0)
+    slab = max(
+        (
+            cake_backend.dx_slab_bytes(cell.slices, 2 * cell.row_pairs, H)
+            for cell in cake_support.SUPPORT_DX_SLICE_CELLS.get(arch, ())
+            if cell.hidden == H and cell.row_pairs <= cake_support._row_pairs(C)
+        ),
+        default=0,
+    )
+    for T, vb in [(16231, None), (16231, 51712), (262144, None)]:
+        rep = cake_support.support_memory_report(
+            T,
+            H,
+            V,
+            M,
+            outputs=("kl",),
+            chunk_size=C,
+            arch=arch,
+            path="dense",
+            vocab_block=vb,
+        )
+        plan = rep["plan"]
+        width = plan["vocab_block"]
+        order = rule(T, H, V, C, width, True, True)
+        assert plan["dense_order"] == order
+        assert (
+            rep["weight_gradient_storage"] == 4 * (width if order == "block" else V) * H
+        )
+        assert (
+            rep["backward_workspace"]
+            == 2 * M + 2 * C * width + 4 * (T if order == "block" else C) * H + slab
+        )
 
 
 def test_cake_backward_alerts_only_before_a_k_sliced_dense_dx(monkeypatch):
@@ -697,6 +929,9 @@ def test_cake_backward_alerts_only_before_a_k_sliced_dense_dx(monkeypatch):
     assert stages and "support_row_grad" not in stages, stages
     again = run_support(inp, outputs, **kw)
     assert "support_row_grad" in stages
+    # the two-slice blocks' slab sums, each right behind its block's reduction GEMM
+    sums = [i for i, s in enumerate(stages) if s == cake_backend.DX_SLAB_SUM_STAGE]
+    assert sums and all(stages[i - 1] == "gemm_dx_red" for i in sums), stages
     assert_same(dict(again, dX=None), dict(det, dX=None))
     _within_rounding_of_det(again["dX"], det["dX"])
     stages.clear()

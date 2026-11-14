@@ -99,7 +99,7 @@ kernel_cake_mhc_det_train_fn_split__tv128__h7168(float* __restrict__ fn, __nv_bf
     float p2[8];
     float p3[8];
     if (n < 24) {
-        long long src = (long long)n * 28672 + (long long)k0;
+        long long src = (long long)n * 28672ll + (long long)k0;
         if (want_t == 0) {
             #pragma unroll
             for (int q = 0; q < 2; q++) {
@@ -152,7 +152,7 @@ kernel_cake_mhc_det_train_fn_split__tv128__h7168(float* __restrict__ fn, __nv_bf
         }
     }
     if (want_t == 0) {
-        long long dst_2_0 = (long long)n * 28672 + (long long)k0;
+        long long dst_2_0 = (long long)n * 28672ll + (long long)k0;
         unsigned int _packed_0[4];
         #pragma unroll
         for (int _lp = 0; _lp < 1; _lp++) {
@@ -175,7 +175,7 @@ kernel_cake_mhc_det_train_fn_split__tv128__h7168(float* __restrict__ fn, __nv_bf
             _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
         }
         reinterpret_cast<int4*>(fnp + dst_2_0)[0] = reinterpret_cast<int4*>(_packed_0)[0];
-        long long dst_2_1 = (long long)(32 + n) * 28672 + (long long)k0;
+        long long dst_2_1 = (long long)(32 + n) * 28672ll + (long long)k0;
         unsigned int _packed_1[4];
         #pragma unroll
         for (int _lp = 0; _lp < 1; _lp++) {
@@ -198,7 +198,7 @@ kernel_cake_mhc_det_train_fn_split__tv128__h7168(float* __restrict__ fn, __nv_bf
             _packed_1[_lp + 3] = *(uint32_t*)&_bf2;
         }
         reinterpret_cast<int4*>(fnp + dst_2_1)[0] = reinterpret_cast<int4*>(_packed_1)[0];
-        long long dst_2_2 = (long long)(64 + n) * 28672 + (long long)k0;
+        long long dst_2_2 = (long long)(64 + n) * 28672ll + (long long)k0;
         unsigned int _packed_2[4];
         #pragma unroll
         for (int _lp = 0; _lp < 1; _lp++) {
@@ -222,7 +222,7 @@ kernel_cake_mhc_det_train_fn_split__tv128__h7168(float* __restrict__ fn, __nv_bf
         }
         reinterpret_cast<int4*>(fnp + dst_2_2)[0] = reinterpret_cast<int4*>(_packed_2)[0];
     } else {
-        long long dst_t_2_0 = (long long)k0 * 32 + (long long)n;
+        long long dst_t_2_0 = (long long)k0 * 32ll + (long long)n;
         unsigned int _packed_3[4];
         #pragma unroll
         for (int _lp = 0; _lp < 1; _lp++) {
@@ -245,7 +245,7 @@ kernel_cake_mhc_det_train_fn_split__tv128__h7168(float* __restrict__ fn, __nv_bf
             _packed_3[_lp + 3] = *(uint32_t*)&_bf2;
         }
         reinterpret_cast<int4*>(fnTp + dst_t_2_0)[0] = reinterpret_cast<int4*>(_packed_3)[0];
-        long long dst_t_2_1 = (28672 + (long long)k0) * 32 + (long long)n;
+        long long dst_t_2_1 = (28672ll + (long long)k0) * 32ll + (long long)n;
         unsigned int _packed_4[4];
         #pragma unroll
         for (int _lp = 0; _lp < 1; _lp++) {
@@ -268,7 +268,7 @@ kernel_cake_mhc_det_train_fn_split__tv128__h7168(float* __restrict__ fn, __nv_bf
             _packed_4[_lp + 3] = *(uint32_t*)&_bf2;
         }
         reinterpret_cast<int4*>(fnTp + dst_t_2_1)[0] = reinterpret_cast<int4*>(_packed_4)[0];
-        long long dst_t_2_2 = (57344 + (long long)k0) * 32 + (long long)n;
+        long long dst_t_2_2 = (57344ll + (long long)k0) * 32ll + (long long)n;
         unsigned int _packed_5[4];
         #pragma unroll
         for (int _lp = 0; _lp < 1; _lp++) {

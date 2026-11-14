@@ -15717,7 +15717,7 @@ kernel_alpha_moe_nvfp4_accumulator_drain(float* __restrict__ accumulator, __nv_b
         asm("add.rn.f32 %0, %1, %2;" : "=f"(high_3) : "f"(sums[7]), "f"(prior[7]));
         packed[3] = __as_u32(__float22bfloat162_rn(make_float2(low_3, high_3)));
         reinterpret_cast<int4*>(output + vector * 8)[0] = reinterpret_cast<int4*>(packed)[0];
-        float zeros[4] = {0};
+        float zeros[4] = {-0.0, -0.0, -0.0, -0.0};
         {
             float4 _v4 = make_float4(zeros[0 + 0], zeros[0 + 1], zeros[0 + 2], zeros[0 + 3]);
             *reinterpret_cast<float4*>((accumulator + vector * 8) + 0) = _v4;
@@ -27238,11 +27238,13 @@ void SeedAccumulator(TensorView out, TensorView accumulator) {
   CheckCuda(cudaGetLastError(), "seed accumulator launch");
 }
 
-// The aligned entry's copy back from its zero-at-rest FP32 accumulator (block nvfp4_batch_drain):
+// The aligned entry's copy back from its FP32 accumulator, -0 at rest (block nvfp4_batch_drain):
 // out = bf16_rn(accumulator + float32(out)), the FP32 sum rounded to nearest with no flush of a subnormal sum, then
-// accumulator = +0, so the next call on the stream starts from zero without a fill; eight values per thread. The
+// accumulator = -0, the additive identity, so the next call on the stream starts from it without a fill and an
+// element no route reaches keeps its value, including -0 (a NaN stays a NaN, but the add may change its payload);
+// eight values per thread. The
 // kernel reads and writes 16-byte vectors: out contiguous with a multiple of eight elements, both tensors 16-byte
-// aligned.
+// aligned and disjoint.
 void DrainAccumulator(TensorView accumulator, TensorView out) {
   TVM_FFI_ICHECK(out.device().device_type == kDLCUDA) << "out must be a CUDA tensor";
   ffi::CUDADeviceGuard device_guard(out.device().device_id);
@@ -27259,6 +27261,7 @@ void DrainAccumulator(TensorView accumulator, TensorView out) {
   if (vectors == 0) {
     return;
   }
+  CheckNoOverlap(accumulator, out, "out", "accumulator");
   static_assert(nvfp4_batch_drain::kGeneratedThreads == 256, "one CTA drains 256 vectors of eight values");
   const cudaStream_t stream = get_stream(out.device());
   const dim3 drain_grid(static_cast<unsigned>((vectors + 255) / 256), 1, 1);

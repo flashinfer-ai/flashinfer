@@ -98,7 +98,7 @@ kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred_trows(float* __restrict__ dfn_p
     int b = bid;
     int tid_0 = tid;
     if (b >= 27) {
-        long long e0 = (long long)((b - 27) * 256 + tid_0) * 4;
+        long long e0 = (long long)((b - 27) * 256 + tid_0) * 4ll;
         float out[4];
         double a[4];
         #pragma unroll
@@ -121,7 +121,7 @@ kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred_trows(float* __restrict__ dfn_p
         for (int p = 1; p < n_parts; p++) {
             float vec_load[4];
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(dfn_part + ((long long)p * 393216 + e0) + 0);
+                float4 _v4 = *reinterpret_cast<const float4*>(dfn_part + ((long long)p * 393216ll + e0) + 0);
                 vec_load[0 + 0] = _v4.x;
                 vec_load[0 + 1] = _v4.y;
                 vec_load[0 + 2] = _v4.z;
@@ -531,7 +531,7 @@ kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred_trows(float* __restrict__ dfn_p
                     fl[0] = _add_65;
                     fh[0] = add_7;
                 } else {
-                    float csv = dscale[col64 - 24];
+                    float csv = dscale[col64 - 24ll];
                     float add_8;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(add_8) : "f"(fh[0]), "f"(csv));
                     float sub_8;
@@ -557,7 +557,7 @@ kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred_trows(float* __restrict__ dfn_p
             if (b < 24) {
                 *(reinterpret_cast<float*>(dbase + col64) + (0)) = res;
             } else {
-                *(reinterpret_cast<float*>(dscale + (col64 - 24)) + (0)) = res;
+                *(reinterpret_cast<float*>(dscale + (col64 - 24ll)) + (0)) = res;
             }
         }
     }

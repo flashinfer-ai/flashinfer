@@ -16,8 +16,8 @@ limitations under the License.
 
 # Backend of ``flashinfer.cake_gqa_nondet_train``: packed-varlen causal GQA
 # attention training with head dimension 256 on SM100 / SM103 / SM107, the
-# non-deterministic (``nondet``) package of the family: the backward adds the
-# dQ partials with atomic FP32 reductions.  Q ``[T_q, H_q, 256]``, K / V
+# ``nondet`` package of the family (every output nonetheless repeats bit for
+# bit run to run: no sum adds with atomics).  Q ``[T_q, H_q, 256]``, K / V
 # ``[T_k, H_kv, 256]`` (BF16, ``H_q / H_kv`` even), segments packed by
 # ``cu_seqlens_q`` / ``cu_seqlens_k`` (int32 on the device), causal with the
 # bottom-right alignment per segment.  The entry point with autograd is

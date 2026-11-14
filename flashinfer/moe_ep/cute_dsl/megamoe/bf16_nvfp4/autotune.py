@@ -15,7 +15,7 @@ class _CollectiveGraphTimingError(RuntimeError):
 
 
 def bf16_nvfp4_candidates(
-    *, enable_in_kernel_fc2_reduce: bool = False
+    *, enable_in_kernel_fc2_reduce: bool = False, batch_invariant: bool = False
 ) -> List[Dict[str, Any]]:
     """W4A16 tactics across geometry, return mode and FC1 group size.
 
@@ -24,6 +24,17 @@ def bf16_nvfp4_candidates(
     trade phase-transition overhead against earlier FC2 work and token return.
     Opting into in-kernel reduction adds dispatch-return tactics.
     """
+    if batch_invariant:
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.a16_batch_invariant import (
+            a16_batch_invariant_default_knobs,
+        )
+
+        base = a16_batch_invariant_default_knobs()
+        return [
+            {**base, "load_balance_mode": schedule, "token_back_mode": carrier}
+            for schedule in ("static", "atomic_counter")
+            for carrier in ("epi_warps", "reuse_dispatch_warps")
+        ]
     return [
         dict(
             cluster_shape_mnk=(2, 1, 1),
@@ -157,96 +168,138 @@ def autotune_bf16_nvfp4_mega_moe(
             sync=sync,
         )
 
-    frontend = symm_buffer._frontend
-    if swiglu_alpha is not None or swiglu_beta is not None:
-        frontend.set_swiglu_params(swiglu_alpha, swiglu_beta)
-    cfg = frontend.config
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         _session_candidates,
+        autotune_knobs,
+        resolve_gate_up_clamp,
         tuner,
     )
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+        batch_invariant_variant_kwargs,
+    )
+    from .frontend import MegaMoEBf16Nvfp4Inputs
 
+    frontend = symm_buffer._frontend
+    cfg = frontend.config
+    overrides: Dict[str, Any] = {}
+    if swiglu_alpha is not None or swiglu_beta is not None:
+        overrides.update(swiglu_alpha=swiglu_alpha, swiglu_beta=swiglu_beta)
+    clamp = resolve_gate_up_clamp(
+        gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
+    )
+    if clamp is not None:
+        overrides["gate_up_clamp"] = clamp
     if candidates is None:
         candidates = bf16_nvfp4_candidates(
-            enable_in_kernel_fc2_reduce=cfg.enable_in_kernel_fc2_reduce
+            enable_in_kernel_fc2_reduce=cfg.enable_in_kernel_fc2_reduce,
+            batch_invariant=cfg.batch_invariant,
         )
-    candidates = _session_candidates(
-        candidates,
-        cfg,
-        tuner.is_valid_bf16_nvfp4_for_config,
-        what="BF16/NVFP4 MegaMoE",
-    )
-    warmup_iters = max(1, warmup_iters)
-    label = "bf16_nvfp4_mega"
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import ensure_not_capturing
 
-    # The sweep owns host-side compile, allocation, timing and collectives;
-    # it must finish before the caller captures its serving graph.
-    ensure_not_capturing("knobs='auto' collective autotune sweep")
+    def prepare_launch():
+        n = cfg.num_tokens_per_rank if num_tokens is None else num_tokens
+        if type(n) is not int or not 0 <= n <= cfg.num_tokens_per_rank:
+            raise ValueError("num_tokens must be within the workspace capacity")
+        current = frontend.config
+        if current.use_custom_finalize:
+            if y is not None:
+                raise ValueError("use_custom_finalize=True requires y=None")
+        elif (
+            y is None
+            or y.dtype != torch.bfloat16
+            or tuple(y.shape) != (n, cfg.hidden)
+            or not y.is_cuda
+            or not y.is_contiguous()
+        ):
+            raise ValueError(
+                f"y must be contiguous CUDA bfloat16 with shape ({n}, {cfg.hidden})"
+            )
+        inputs = MegaMoEBf16Nvfp4Inputs(
+            symm_buffer.x,
+            symm_buffer.topk_idx,
+            symm_buffer.topk_weights,
+            transformed_l1[0],
+            transformed_l1[1],
+            symm_buffer.fc1_alpha,
+            transformed_l2[0],
+            transformed_l2[1],
+            symm_buffer.fc2_alpha,
+            symm_buffer.kernel_combine_output,
+            None if current.in_kernel_fc2_reduce else y,
+            symm_buffer._staging_inputs,
+            symm_buffer.fc1_norm_const if symm_buffer._use_fc1_norm_const else None,
+        )
+        # Compilation and argument conversion are local. Every EP rank agrees
+        # on their success before the first eager communication-kernel launch.
+        frontend._validate(inputs, n)
+        mega = frontend._ensure_compiled(inputs)
+        frontend._runtime_kwargs(inputs, mega)
+        return launch
 
-    import torch.distributed as dist
+    def measure(candidate_launch):
+        import torch.distributed as dist
 
-    collective = dist.is_available() and dist.is_initialized()
-    rank = dist.get_rank(group=process_group) if collective else 0
-
-    def _barrier() -> None:
-        if collective:
-            dist.barrier(group=process_group)
-
-    scores: List[float] = []
-    for knobs in candidates:
-        # Rank-local allocation/compile errors need not be deterministic.
-        # Abort the sweep; continuing could enter a different collective from
-        # a peer still preparing or launching this candidate.
-        frontend.apply_knobs(knobs)
-        _barrier()
-        for _ in range(warmup_iters):  # first launch compiles
+        # Keep the full-wrapper graph-event timing used by ordinary W4A16.
+        for _ in range(max(1, warmup_iters)):
             launch(sync=True)
-        _barrier()
-        scores.append(
-            statistics.median(_sample_graph_seconds(launch, timed_iters, process_group))
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier(group=process_group)
+        return statistics.median(
+            _sample_graph_seconds(candidate_launch, timed_iters, process_group)
         )
-        _barrier()
 
-    t = torch.tensor(scores, dtype=torch.float64, device="cuda")
-    if collective:
-        dist.all_reduce(t, op=dist.ReduceOp.MAX, group=process_group)
-    best = int(torch.argmin(t).item())
-    winner = candidates[best]
-    frontend.apply_knobs(winner)
-    p50_s = float(t[best])
-    from flashinfer.moe_ep.core.tuning import tuning_live_tokens
-
-    live_tokens = tuning_live_tokens(num_tokens, cfg.num_tokens_per_rank, process_group)
-    if cfg.rank == 0:
+    def record(winner, p50_s):
+        from flashinfer.moe_ep.core.tuning import tuning_live_tokens
         from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import record_knobs
 
-        record_knobs(
-            winner,
-            dtype="bf16_nvfp4",
-            world_size=cfg.world_size,
-            hidden=cfg.hidden,
-            intermediate=cfg.intermediate,
-            num_experts=cfg.num_total_experts,
-            topk=cfg.num_topk,
-            max_tokens=cfg.num_tokens_per_rank,
-            live_tokens=live_tokens,
-            combine_dtype="bf16",
-            apply_routing_weights_before_fc2=(cfg.apply_routing_weights_before_fc2),
-            use_custom_finalize=cfg.use_custom_finalize,
-            p50_us=p50_s * 1e6,
-            source="autotune_graph_events",
+        current = frontend.config
+        live_tokens = tuning_live_tokens(
+            num_tokens, current.num_tokens_per_rank, process_group
         )
-    if rank == 0:
-        ranked = sorted(zip(t.tolist(), candidates, strict=False), key=lambda kv: kv[0])
-        summary = "\n".join(f"    {us * 1e6:10.1f} us  {knobs}" for us, knobs in ranked)
-        print(
-            f"[cutedsl-autotune] {label}: winner {winner} "
-            f"({float(t[best]) * 1e6:.1f} us median, max across ranks) "
-            f"out of {len(candidates)} candidates:\n{summary}",
-            flush=True,
-        )
-    return winner
+        if current.rank == 0:
+            record_knobs(
+                winner,
+                dtype="bf16_nvfp4",
+                world_size=current.world_size,
+                hidden=current.hidden,
+                intermediate=current.intermediate,
+                num_experts=current.num_total_experts,
+                topk=current.num_topk,
+                max_tokens=current.num_tokens_per_rank,
+                live_tokens=live_tokens,
+                combine_dtype="bf16",
+                apply_routing_weights_before_fc2=current.apply_routing_weights_before_fc2,
+                use_custom_finalize=current.use_custom_finalize,
+                gate_up_clamp=current.gate_up_clamp,
+                batch_invariant=current.batch_invariant,
+                handoff_norm=current.has_fc1_norm_const,
+                **(
+                    batch_invariant_variant_kwargs(current)
+                    if current.batch_invariant
+                    else {}
+                ),
+                p50_us=p50_s * 1e6,
+                source="autotune_graph_events",
+            )
+
+    return autotune_knobs(
+        frontend,
+        launch,
+        candidates,
+        label="bf16_nvfp4_mega",
+        warmup_iters=warmup_iters,
+        timed_iters=timed_iters,
+        on_winner=record,
+        prepare_launch=prepare_launch,
+        config_overrides=overrides,
+        candidate_filter=lambda proposed: _session_candidates(
+            proposed,
+            cfg,
+            tuner.is_valid_bf16_nvfp4_for_config,
+            what="BF16/NVFP4 MegaMoE",
+        ),
+        process_group=process_group,
+        measure_launch=measure,
+    )
 
 
 __all__ = ["autotune_bf16_nvfp4_mega_moe", "bf16_nvfp4_candidates"]

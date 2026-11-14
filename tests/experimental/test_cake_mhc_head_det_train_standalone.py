@@ -1,0 +1,296 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Standalone-import tests of the Cake mHC training head package.
+
+A copy of ``flashinfer/experimental/cake/cake_mhc_head_det_train`` must import
+and reach its host-side checks on its own: under another top-level name, in a
+``python -I`` subprocess with ``flashinfer`` blocked (the form of a vendoring
+gate, ``scripts/check_cake_build_manifests.py --vendored-gate``).  The package
+imports only itself, ``torch`` and ``tvm_ffi``; the public entry points
+``flashinfer.cake_mhc_head_det_train.*`` add only FlashInfer's API logging, so
+a direct call of the package emits no warning, and the only ``flashinfer``
+import is the JIT fallback of ``cake_build.py``.  The copy keeps ``csrc/``, so
+the subprocess also checks what a vendoring builder compiles: every
+``build.json`` library is the build of one registry record for one of the
+record's architectures, routed on that architecture (``ROUTES[arch][role][hidden]``
+or ``SMALL_ROUTES[arch][role]``),
+with every source present in the copy at its manifest digest and the prebuilt
+path ``aot/<library>.so`` inside the copy.  Two tests, CPU-only: no GPU, no
+generated program and no JIT build is needed, so both run on every lane.  The
+non-deterministic package ``cake_mhc_head_nondet_train`` has no standalone
+test of its own.
+"""
+
+from __future__ import annotations
+
+import ast
+import os
+import shutil
+import site
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+
+tvm_ffi = pytest.importorskip("tvm_ffi")  # the package's load path imports it
+
+import flashinfer.experimental.cake.cake_mhc_head_det_train as pkg
+
+PACKAGE_DIR = Path(pkg.__file__).resolve().parent
+VENDORED_NAME = (
+    "vendored_cake_mhc_head_det_train"  # the copy's top-level name in the subprocess
+)
+
+
+# ---------------------------------------------------------------------------
+# A vendored copy, flashinfer blocked
+# ---------------------------------------------------------------------------
+
+
+def _dependency_paths():
+    """Where ``torch`` and ``tvm_ffi`` live, plus the interpreter's site-packages.
+
+    ``python -I`` drops ``PYTHONPATH`` and the user site, so the subprocess is
+    told explicitly where the package's two dependencies are.
+    """
+    paths = list(site.getsitepackages())
+    for module in (torch, tvm_ffi):
+        paths.append(os.path.dirname(os.path.dirname(os.path.abspath(module.__file__))))
+    return list(dict.fromkeys(paths))
+
+
+_ISOLATED = """
+import hashlib
+import importlib
+import importlib.abc
+import os
+import sys
+import warnings
+
+PKG_ROOT, PKG_NAME = sys.argv[1], sys.argv[2]
+for p in sys.argv[3:]:
+    if p not in sys.path:
+        sys.path.append(p)
+
+
+class _Block(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == "flashinfer" or name.startswith("flashinfer."):
+            raise ImportError(f"flashinfer is blocked in this test: {name}")
+        return None
+
+
+sys.meta_path.insert(0, _Block())
+sys.modules["flashinfer"] = None
+sys.path.insert(0, PKG_ROOT)
+
+import torch
+
+assert not torch.cuda.is_available()
+
+pkg = importlib.import_module(PKG_NAME)
+copy_dir = os.path.realpath(os.path.join(PKG_ROOT, PKG_NAME))
+assert os.path.realpath(pkg.__file__).startswith(copy_dir + os.sep), pkg.__file__
+cake_jit = importlib.import_module(PKG_NAME + ".cake_jit")
+cake_build = importlib.import_module(PKG_NAME + ".cake_build")
+for name in cake_build.__all__:
+    getattr(cake_build, name)
+for name in pkg.__all__:
+    getattr(pkg, name)
+assert {
+    "cake_mhc_head_det_train_forward",
+    "cake_mhc_head_det_train_backward",
+    "cake_mhc_head_det",
+    "CakeMHCHeadDetFunction",
+    "is_cake_mhc_head_det_train_supported",
+}.issubset(pkg.__all__), sorted(pkg.__all__)
+
+# Every build.json library: the build of one record for one of its architectures, routed on that architecture, its
+# sources in the copy at their manifest digests, its prebuilt path inside the copy.
+manifest = cake_build.manifest()
+libraries = cake_build.libraries_by_name()
+records = {
+    cake_jit.library_name(name, arch): (name, arch)
+    for name, record in cake_jit.MODULES.items()
+    for arch in record["arches"]
+}
+assert set(libraries) == set(records), (sorted(libraries), sorted(records))
+routes = {}
+for arch in cake_jit.ARCHES:
+    for role, by_hidden in cake_jit.ROUTES[arch].items():
+        routes[arch, role] = set(by_hidden.values())
+        small = cake_jit.SMALL_ROUTES.get(arch, {}).get(role)
+        if small is not None:
+            routes[arch, role].add(small)
+routed = {
+    cake_jit.library_name(cake_jit.route_module(arch, role, hidden, rows), arch)
+    for arch in cake_jit.ARCHES
+    for role in cake_jit.ROUTES[arch]
+    for hidden in cake_jit.ROUTES[arch][role]
+    for rows in (1, cake_jit.small_elements(arch, role) // hidden + 1)
+}
+assert routed == set(libraries), (sorted(routed), sorted(libraries))
+for library, entry in sorted(libraries.items()):
+    name, arch = records[library]
+    assert entry["arch"] == arch and arch in manifest["arch_flags"], (library, entry["arch"])
+    assert name in routes[arch, cake_jit.MODULES[name]["role"]], library
+    assert os.path.realpath(cake_build.prebuilt_path(library)) == os.path.join(
+        copy_dir, "aot", library + ".so"
+    ), library
+    for relative in entry["sources"]:
+        path = os.path.join(copy_dir, relative)
+        with open(path, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        assert digest == entry["sha256"][relative], (library, relative)
+
+
+def bf16(*shape):
+    return torch.zeros(*shape, dtype=torch.bfloat16)
+
+
+T, H = 4, 4096  # a served hidden size: only the device is wrong
+record = cake_jit.MODULES[cake_jit.route_module("sm_100a", "head_fwd", H, T)]
+# Host-side rejections, each raised before any device query, program load or launch:
+calls = [
+    # the forward: X is [T, 4, hidden]
+    lambda: pkg.cake_mhc_head_det_train_forward(bf16(T, 3, H)),
+    # the forward: CUDA tensors only
+    lambda: pkg.cake_mhc_head_det_train_forward(bf16(T, 4, H)),
+    # the backward: dY is [T, hidden]
+    lambda: pkg.cake_mhc_head_det_train_backward(bf16(T, 4, H)),
+    # the accumulating backward: CUDA tensors only
+    lambda: pkg.cake_mhc_head_det_train_backward(bf16(T, H), dX=bf16(T, 4, H), accumulate=True),
+    # the autograd entry: CUDA tensors only
+    lambda: pkg.cake_mhc_head_det(bf16(T, 4, H)),
+    # the routes: no module outside the exported architectures and hidden sizes
+    lambda: cake_jit.route_module("sm_90a", "head_fwd", H, T),
+    lambda: cake_jit.route_module("sm_107a", "head_fwd", 5120, T),
+    # the record: built for one hidden size only
+    lambda: cake_jit.vectors_per_token(record, 5120),
+    # the grid rule: the hidden size is a whole number of vectors
+    lambda: cake_jit.vectors_per_token(cake_jit.MODULES[cake_jit.route_module("sm_107a", "head_fwd", H, T)], H + 2),
+    # the grid rule: zero rows launch nothing
+    lambda: cake_jit.launch_grid(record, 0, H),
+]
+
+with warnings.catch_warnings(record=True) as rec:
+    warnings.simplefilter("always")
+    for _ in range(2):  # a second round: nothing here warns, not even once
+        assert not pkg.is_cake_mhc_head_det_train_supported(torch.device("cpu"))
+        for call in calls:
+            try:
+                call()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("the host-side check must reject the call")
+assert not rec, [f"{w.category.__name__}: {w.message}" for w in rec]
+
+leaked = sorted(
+    k
+    for k in sys.modules
+    if (k == "flashinfer" and sys.modules[k] is not None)
+    or k.startswith("flashinfer.")
+)
+assert not leaked, leaked
+print("OK")
+"""
+
+
+def test_vendored_copy_imports_with_flashinfer_blocked(tmp_path):
+    """A copy of the package under another top-level name imports in a ``python -I``
+    subprocess with ``flashinfer`` blocked (meta-path finder plus
+    ``sys.modules["flashinfer"] = None``), resolves the package's public names and
+    the loader's ``__all__``, finds every ``build.json`` library (each the routed
+    build of one registry record on one of its architectures, its sources in the
+    copy at their digests), raises the host-side ``ValueError`` of each of ten
+    rejected calls (five public calls on CPU operands, five loader calls) without
+    emitting a warning of any kind, and loads no ``flashinfer`` module."""
+    root = tmp_path / "site"
+    shutil.copytree(
+        PACKAGE_DIR,
+        root / VENDORED_NAME,
+        ignore=shutil.ignore_patterns("__pycache__", "aot"),
+    )
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": ""}
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c", _ISOLATED, str(root), VENDORED_NAME]
+        + _dependency_paths(),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=600,
+    )
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    assert proc.stdout.strip() == "OK", proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# The package's import surface (source only)
+# ---------------------------------------------------------------------------
+
+
+def _exception_names(expr):
+    """Exception class names of an ``except`` clause: a Name or a tuple of Names."""
+    if isinstance(expr, ast.Tuple):
+        return [e.id for e in expr.elts if isinstance(e, ast.Name)]
+    return [expr.id] if isinstance(expr, ast.Name) else []
+
+
+def _imports_flashinfer(node):
+    if isinstance(node, ast.Import):
+        return any(
+            a.name == "flashinfer" or a.name.startswith("flashinfer.")
+            for a in node.names
+        )
+    if isinstance(node, ast.ImportFrom) and not node.level and node.module:
+        return node.module == "flashinfer" or node.module.startswith("flashinfer.")
+    return False
+
+
+def test_package_names_flashinfer_only_in_the_jit_fallback():
+    """The package imports nothing from the rest of FlashInfer: no relative import
+    climbs above the package (``from .. import``), every ``flashinfer`` import sits
+    in the body of a ``try`` with an ``except ImportError`` handler, and exactly
+    one such guarded block exists -- the JIT fallback in ``cake_build.py``."""
+    guards = {}
+    for path in sorted(PACKAGE_DIR.glob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        guarded = {}  # import node -> line of the enclosing guarded try
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Try) and any(
+                "ImportError" in _exception_names(h.type) for h in node.handlers
+            ):
+                for stmt in node.body:
+                    for sub in ast.walk(stmt):
+                        guarded[sub] = node.lineno
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                assert node.level < 2, (
+                    f"{path.name}:{node.lineno}: import from outside the package"
+                )
+            if _imports_flashinfer(node):
+                assert node in guarded, (
+                    f"{path.name}:{node.lineno}: flashinfer import outside a "
+                    "try/except ImportError"
+                )
+                guards.setdefault(path.name, set()).add(guarded[node])
+    assert {name: len(lines) for name, lines in guards.items()} == {
+        "cake_build.py": 1
+    }, guards

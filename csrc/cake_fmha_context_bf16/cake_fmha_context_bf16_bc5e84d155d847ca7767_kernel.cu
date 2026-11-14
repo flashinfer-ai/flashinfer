@@ -1888,7 +1888,7 @@ kernel_cake_fmha_context_bf16_bc5e84d155d847ca7767(const __grid_constant__ CUten
                 float final_max_1 = sScale[warp % 4 * 32 + lane + BLOCK_M + 4 * BLOCK_M];
                 mbarrier_arrive(corr_done_addr);
                 mbarrier_arrive(corr_done_addr + 8);
-                bool o_wide = ((unsigned long long)O_ptr & 31) == 0;
+                bool o_wide = ((unsigned long long)O_ptr & 31ull) == 0ull;
                 #pragma unroll
                 for (int stage_1 = 0; stage_1 < 2; stage_1++) {
                     if (stage_1 == 0) {
@@ -2012,7 +2012,7 @@ kernel_cake_fmha_context_bf16_bc5e84d155d847ca7767(const __grid_constant__ CUten
                                         o_bf16[_lp + 15] = *(uint32_t*)&_bf2;
                                     }
                                     asm volatile("st.global.L1::no_allocate.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(O_ptr + o_elem), "r"(o_bf16[(0) + 0]), "r"(o_bf16[(0) + 1]), "r"(o_bf16[(0) + 2]), "r"(o_bf16[(0) + 3]), "r"(o_bf16[(0) + 4]), "r"(o_bf16[(0) + 5]), "r"(o_bf16[(0) + 6]), "r"(o_bf16[(0) + 7]) : "memory");
-                                    asm volatile("st.global.L1::no_allocate.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(O_ptr + (o_elem + 16)), "r"(o_bf16[(8) + 0]), "r"(o_bf16[(8) + 1]), "r"(o_bf16[(8) + 2]), "r"(o_bf16[(8) + 3]), "r"(o_bf16[(8) + 4]), "r"(o_bf16[(8) + 5]), "r"(o_bf16[(8) + 6]), "r"(o_bf16[(8) + 7]) : "memory");
+                                    asm volatile("st.global.L1::no_allocate.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(O_ptr + (o_elem + 16ll)), "r"(o_bf16[(8) + 0]), "r"(o_bf16[(8) + 1]), "r"(o_bf16[(8) + 2]), "r"(o_bf16[(8) + 3]), "r"(o_bf16[(8) + 4]), "r"(o_bf16[(8) + 5]), "r"(o_bf16[(8) + 6]), "r"(o_bf16[(8) + 7]) : "memory");
                                 } else {
                                     unsigned int o_bf16_1[16];
                                     #pragma unroll
@@ -2096,9 +2096,9 @@ kernel_cake_fmha_context_bf16_bc5e84d155d847ca7767(const __grid_constant__ CUten
                                         o_bf16_1[_lp + 15] = *(uint32_t*)&_bf2;
                                     }
                                     reinterpret_cast<int4*>(O_ptr + o_elem)[0] = reinterpret_cast<int4*>(o_bf16_1)[0];
-                                    reinterpret_cast<int4*>(O_ptr + (o_elem + 8))[0] = reinterpret_cast<int4*>(o_bf16_1 + (4))[0];
-                                    reinterpret_cast<int4*>(O_ptr + (o_elem + 16))[0] = reinterpret_cast<int4*>(o_bf16_1 + (8))[0];
-                                    reinterpret_cast<int4*>(O_ptr + (o_elem + 24))[0] = reinterpret_cast<int4*>(o_bf16_1 + (12))[0];
+                                    reinterpret_cast<int4*>(O_ptr + (o_elem + 8ll))[0] = reinterpret_cast<int4*>(o_bf16_1 + (4))[0];
+                                    reinterpret_cast<int4*>(O_ptr + (o_elem + 16ll))[0] = reinterpret_cast<int4*>(o_bf16_1 + (8))[0];
+                                    reinterpret_cast<int4*>(O_ptr + (o_elem + 24ll))[0] = reinterpret_cast<int4*>(o_bf16_1 + (12))[0];
                                 }
                             }
                         }
@@ -2161,6 +2161,7 @@ kernel_cake_fmha_context_bf16_bc5e84d155d847ca7767(const __grid_constant__ CUten
                 unsigned int num_n_blocks_2 = (seqlen_kv_bh_2 + BLOCK_N - 1) / BLOCK_N;
                 unsigned int _max_0_2 = ((num_n_blocks_2) > (1) ? (num_n_blocks_2) : (1));
                 num_n_blocks_2 = _max_0_2;
+                int v_valid = seqlen_kv_bh_2 - (int)(num_n_blocks_2 - 1) * BLOCK_N;
                 mbarrier_wait(q_full_addr, _phase_q_full_0);
                 _phase_q_full_0 ^= 1;
                 mbarrier_wait(q_full_addr + 8, _phase_q_full_1);
@@ -2260,6 +2261,20 @@ kernel_cake_fmha_context_bf16_bc5e84d155d847ca7767(const __grid_constant__ CUten
                 elect_commit(kv_empty_addr + (mma_kv_stage) * 8);
                 mma_kv_stage += 1;
                 if (mma_kv_stage == 4) { mma_kv_stage = 0; _phase_kv_full ^= 1; }
+                if (v_valid < BLOCK_N) {
+                    mbarrier_wait(kv_full_addr + (mma_kv_stage) * 8, _phase_kv_full);
+                    unsigned int vz_stage = mma_kv_stage;
+                    uint32_t vz_lane;
+                    asm volatile("mov.u32 %0, %%laneid;" : "=r"(vz_lane));
+                    unsigned int vz_base = smem_kv_addr + vz_stage * 32768;
+                    #pragma unroll 1
+                    for (unsigned int vz_addr = vz_base + ((unsigned int)v_valid * 8 + vz_lane) * 16; vz_addr < vz_base + 16384; vz_addr += 512) {
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(vz_addr), "r"(0), "r"(0), "r"(0), "r"(0) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(vz_addr + 16384), "r"(0), "r"(0), "r"(0), "r"(0) : "memory");
+                    }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    __syncwarp();
+                }
                 unsigned int first_pv = 1;
                 #pragma unroll 1
                 for (unsigned int n_iter_3 = 0; n_iter_3 < num_n_blocks_2 - 1; n_iter_3++) {

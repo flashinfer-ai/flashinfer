@@ -52,15 +52,35 @@ def test_genphase_rejects_unsupported_geometry(overrides):
         _config(**overrides)
 
 
-@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
-def test_genphase_candidates_respect_fixed_geometry(kind):
+@pytest.mark.parametrize(
+    "kind", ["nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
+)
+def test_genphase_grid_order_and_fixed_geometry(kind):
     cfg = _config(quant_kind=kind)
     assert cfg.padded_tokens_per_rank == 4
     assert _config(max_tokens_per_rank=1024).padded_tokens_per_rank == 1024
     candidates = pkg.sm107_candidates(
         kind, kernel_variant="genphase", allow_in_kernel_fc2_reduce=True
     )
-    assert candidates
+    defaults = pkg.sm107_candidates(kind, kernel_variant="genphase")
+    has_n64 = kind in ("mxfp8_e4m3", "mxfp4_mxfp8")
+    assert len(defaults) == (11 if has_n64 else 8)
+    assert len({tuple(sorted(c.items())) for c in defaults}) == len(defaults)
+    assert len(candidates) == (19 if has_n64 else 16)
+    assert [c for c in candidates if not c["reduce_topk_in_kernel"]] == defaults
+    assert [
+        dict(c, reduce_topk_in_kernel=False)
+        for c in candidates
+        if c["reduce_topk_in_kernel"]
+    ] == [c for c in defaults if c["mma_tiler_mnk"][1] != 64]
+    if has_n64:
+        assert defaults[0]["mma_tiler_mnk"] == (256, 64, 128)
+        assert defaults[0]["schedule_policy"] == ("grouped", None)
+        assert defaults[0]["work_id_mode"] == "grid_stride"
+    phase = defaults[1 if has_n64 else 0]
+    assert phase["mma_tiler_mnk"][1] == 128
+    assert phase["schedule_policy"] == ("phase_interleave", None)
+    assert phase["epi_flag_batches"] == (2, 4)
     assert all(pkg.is_valid_sm107(candidate, cfg) for candidate in candidates)
     assert all(candidate["fc2_use_bulk"] for candidate in candidates)
     assert all(
