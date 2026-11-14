@@ -234,9 +234,9 @@ def _canonical_relative(name: str, where: Path) -> None:
     """Refuse a listed path that is not a plain, canonical, bundle-relative name."""
     relative = Path(name)
     if (
-        relative.is_absolute()
+        relative.anchor != ""
         or ".." in relative.parts
-        or str(relative) != name
+        or relative.as_posix() != name
         or "\0" in name
     ):
         raise SealedPackageError(f"{where} lists a non-canonical path {name!r}")
@@ -268,7 +268,7 @@ def _bundle_files(bundle: Path) -> set[str]:
                 raise SealedPackageError(
                     f"{path} is not a regular file; a sealed package holds files only"
                 )
-            present.add(str(path.relative_to(bundle)))
+            present.add(path.relative_to(bundle).as_posix())
     return present
 
 
@@ -342,7 +342,7 @@ def _entry_point(
     if "::" in entry:
         filename, symbol = entry.split("::", 1)
         path = Path(filename)
-        if path.suffix != ".py" or path.is_absolute() or str(path) != filename:
+        if path.suffix != ".py" or path.is_absolute() or path.as_posix() != filename:
             raise SealedPackageError(f"invalid Python {key} {entry!r}")
         parts = path.with_suffix("").parts
         module_parts = parts[:-1] if parts[-1:] == ("__init__",) else parts
