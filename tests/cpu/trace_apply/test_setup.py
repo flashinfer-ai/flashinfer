@@ -726,6 +726,35 @@ def test_an_inference_tensor_is_served_with_identity_keying_only():
     assert life.setups == 1 and wrapper.stats()["weight_sets"] == 1
 
 
+def test_a_frozen_binding_releases_when_the_engine_allows_it(tmp_path, monkeypatch):
+    """allow_frozen releases a capture-observed binding; a reload binds and serves."""
+    monkeypatch.setattr(su, "_is_capturing", lambda device: False)
+    monkeypatch.setattr(
+        pk, "_bound", {}
+    )  # the frozen binding must not outlive the test
+    bound = pk.import_entry(setup_package(tmp_path))
+    a, out = torch.ones(2), torch.empty(2)
+    bound(x=a, out=out)
+    monkeypatch.setattr(su, "_is_capturing", lambda device: True)
+    bound(x=a, out=out)  # a captured hit freezes the binding
+    assert bound.frozen
+    monkeypatch.setattr(su, "_is_capturing", lambda device: False)
+
+    with pytest.raises(SetupStateError, match="kept for the life of the process"):
+        bound.release()
+    pk.release_packages()
+    assert pk._bound  # kept whole
+    pk.release_packages(allow_frozen=True)
+    assert not pk._bound  # released on the engine's authority
+    module = sys.modules[bound.__module__]
+    assert module.CALLS == {"setup": 1, "run": 2, "teardown": 1}
+
+    # a fresh package for the same Definition binds and serves afterwards
+    bound = pk.import_entry(setup_package(tmp_path))
+    bound(x=a, out=out)
+    assert module.CALLS["run"] == 3 and module.CALLS["setup"] == 2
+
+
 def test_a_wrapper_kept_across_release_routes_nowhere(sm_gate_off, monkeypatch):
     """A wrapped API kept across release routes to stock, never to the loader."""
     import flashinfer.trace_apply.apply as apply_module

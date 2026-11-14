@@ -606,12 +606,15 @@ class SetupBoundCallable:
         frozen and its states are kept for the life of the process."""
         return self._frozen
 
-    def release(self) -> None:
+    def release(self, *, allow_frozen: bool = False) -> None:
         """Tear down every retained state (when a teardown is declared), then forget them.
 
         Refused once a CUDA-graph capture has observed the binding: captured
         graphs replay against the state addresses, so freeing them would serve
-        recycled memory as weights. A shutdown-time operation: the caller
+        recycled memory as weights. With ``allow_frozen`` a frozen binding
+        releases like any other; the caller — an inference engine — guarantees
+        every graph that captured a call through this binding has been
+        destroyed. A shutdown-time operation: the caller
         quiesces calls first, since a call in flight already holds the state
         it was handed and a teardown may empty it. The binding refuses every
         call from here on, before the first teardown runs, so a teardown that
@@ -619,7 +622,7 @@ class SetupBoundCallable:
         attempted; the first failure is raised afterwards, naming how many of
         them failed."""
         with self._lock:
-            if self._frozen:
+            if self._frozen and not allow_frozen:
                 raise SetupStateError(
                     f"{self.name}: a CUDA-graph capture observed the retained state; "
                     "captured graphs replay against its addresses, so it is kept for "
