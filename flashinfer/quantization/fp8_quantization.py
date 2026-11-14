@@ -34,7 +34,6 @@ from ..jit.cake_program import CakeProgram
 from ..jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from ..jit.quantization import gen_quantization_module
 from ..utils import (
-    _check_block_scale_quantization_support,
     backend_requirement,
     device_support_pdl,
     get_compute_capability,
@@ -509,7 +508,7 @@ def _validate_mxfp8_quantize_call(
         _check_mxfp8_scale_layout(sf_swizzle_layout)
     else:
         _check_mxfp8_native_inputs(input, sf_swizzle_layout, alignment)
-        _check_block_scale_quantization_support(input.device, "mxfp8_quantize")
+        _check_mxfp8_cuda_capability(input.device)
 
 
 # Keep the native policy open to newer architectures, rather than enumerating
@@ -677,7 +676,7 @@ def mxfp8_quantize(
                 raise ValueError(
                     "mxfp8_quantize on CUDA requires a nonempty last dimension"
                 )
-        _check_block_scale_quantization_support(input.device, "mxfp8_quantize")
+        _check_mxfp8_cuda_capability(input.device)
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
         x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100(
