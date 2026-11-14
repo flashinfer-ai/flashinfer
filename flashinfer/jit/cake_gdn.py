@@ -90,7 +90,8 @@ def _sha256(path: Path) -> str:
 
 
 def _nvcc_identity() -> tuple[Path, str]:
-    nvcc = (Path(get_cuda_path()) / "bin" / "nvcc").resolve()
+    nvcc_name = "nvcc.exe" if os.name == "nt" else "nvcc"
+    nvcc = (Path(get_cuda_path()) / "bin" / nvcc_name).resolve()
     if not nvcc.is_file():
         raise RuntimeError(f"nvcc was not found at {nvcc}")
     result = subprocess.run(
