@@ -148,7 +148,7 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120Default(void* float_buffer,
   size_t workspace_size = Gemm::get_workspace_size(arguments);
 
   if (workspace_size > float_buffer_size_in_bytes) {
-    return cudaErrorInsufficientDriver;
+    return cudaErrorInvalidValue;
   }
 
   // Pass workspace pointer only if needed
@@ -271,7 +271,7 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120SwapAB(void* float_buffer,
   size_t workspace_size = Gemm::get_workspace_size(arguments);
 
   if (workspace_size > float_buffer_size_in_bytes) {
-    return cudaErrorInsufficientDriver;
+    return cudaErrorInvalidValue;
   }
 
   void* kernel_workspace = nullptr;
