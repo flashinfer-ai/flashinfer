@@ -6,7 +6,7 @@ the fingerprint behind ``fingerprint("softmax", N=, dtype=, temperature=[, out_d
 ``fingerprint("sampling_from_logits", N=, dtype=)``, and the truncated samplers' ``fingerprint("top_k_sampling_from_probs",
 N=, dtype=)``, ``fingerprint("top_p_sampling_from_probs", ...)``, ``fingerprint("min_p_sampling_from_probs", ...)``,
 ``fingerprint("top_k_top_p_sampling_from_probs", N=, dtype=[, filter_apply_order=])`` and
-``fingerprint("top_k_top_p_sampling_from_logits", ...)``.
+``fingerprint("top_k_top_p_sampling_from_logits", N=, dtype=[, filter_apply_order=, temperature=])``.
 
 The first three APIs run one class, ``lse.row``, whose specification is a function of the vocabulary ``N`` (the two row
 trees), the input dtype (the output conversion of the probabilities; the leaves of a 16-bit input are its exact
@@ -61,28 +61,38 @@ def _lse_row_fingerprint(N: int, dtype, temperature, out_dtype=None) -> str:
     return spec_fingerprint(int(N), in_fmt, bool(temperature))
 
 
-def _draw_fingerprint(N: int, dtype, from_logits: bool = False) -> str:
+def _draw_fingerprint(
+    N: int, dtype, from_logits: bool = False, temperature: bool = False
+) -> str:
     from .draw_spec import spec_fingerprint
 
     in_fmt = _in_fmt(dtype)
-    return spec_fingerprint(int(N), bool(from_logits), in_fmt)
+    return spec_fingerprint(int(N), bool(from_logits), in_fmt, bool(temperature))
 
 
-def _support_fingerprint(N: int, dtype, filters, from_logits: bool) -> str:
+def _support_fingerprint(
+    N: int, dtype, filters, from_logits: bool, temperature: bool = False
+) -> str:
     """The support class's fingerprint (``support_api.py``): the filter set, the selection rules, the vocabulary
-    (the sum tree the kept mass is read from), the weight form and the output format. The class has no registry
-    entry of its own: its renormalisation entries are internal in this release (the operators' flag is deferred)."""
+    (the sum tree the kept mass is read from), the weight form (with or without a temperature in the scale) and the
+    output format. The class has no registry entry of its own: its renormalisation entries are internal in this release
+    (the operators' flag is deferred)."""
     from .support_spec import spec_fingerprint
 
-    return spec_fingerprint(filters, int(N), bool(from_logits), _in_fmt(dtype))
+    return spec_fingerprint(
+        filters, int(N), bool(from_logits), _in_fmt(dtype), bool(temperature)
+    )
 
 
-def _draw_support_fingerprint(N: int, dtype, filters, from_logits: bool) -> str:
+def _draw_support_fingerprint(
+    N: int, dtype, filters, from_logits: bool, temperature: bool = False
+) -> str:
     """The truncated samplers' receipt: the draw class's fingerprint (the tree the kept mass and the prefixes are read
-    from) joined with the support class's (the kept set); no class of its own."""
+    from) joined with the support class's (the kept set); no class of its own. For logits both halves embed the scale
+    ``c``, so a temperature in the scale is another receipt."""
     return (
-        f"{_draw_fingerprint(N, dtype, from_logits)}+"
-        f"{_support_fingerprint(N, dtype, filters, from_logits)}"
+        f"{_draw_fingerprint(N, dtype, from_logits, temperature)}+"
+        f"{_support_fingerprint(N, dtype, filters, from_logits, temperature)}"
     )
 
 
@@ -115,12 +125,16 @@ def _top_k_top_p_sampling_probs_fingerprint(
 
 
 def _top_k_top_p_sampling_logits_fingerprint(
-    N: int, dtype, filter_apply_order: str = "top_k_first"
+    N: int, dtype, filter_apply_order: str = "top_k_first", temperature: bool = False
 ) -> str:
     from .support_spec import Filters
 
     return _draw_support_fingerprint(
-        N, dtype, Filters(top_k=1, top_p=1.0, order=filter_apply_order), True
+        N,
+        dtype,
+        Filters(top_k=1, top_p=1.0, order=filter_apply_order),
+        True,
+        bool(temperature),
     )
 
 
@@ -137,7 +151,8 @@ def register(classes: Dict[str, Any], class_info: Any) -> None:
     ``log_softmax`` and ``log_probs`` take the vocabulary ``N``, the input ``dtype`` and whether a ``temperature`` is
     given; ``softmax`` optionally ``out_dtype`` (f32: the probabilities before the output conversion);
     ``sampling_from_probs`` and ``sampling_from_logits`` (the draw class) take ``N`` and the input ``dtype``; the five
-    truncated samplers take ``N`` and ``dtype``, the two top-k + top-p ones optionally ``filter_apply_order``."""
+    truncated samplers take ``N`` and ``dtype``, the two top-k + top-p ones optionally ``filter_apply_order``, the logits
+    one optionally whether a ``temperature`` enters the scale."""
     dims = ("N", "dtype", "temperature")
     classes["softmax"] = class_info(
         "lse.row", dims, _lse_row_fingerprint, ("out_dtype",)
@@ -175,5 +190,5 @@ def register(classes: Dict[str, Any], class_info: Any) -> None:
         joined,
         ("N", "dtype"),
         _top_k_top_p_sampling_logits_fingerprint,
-        ("filter_apply_order",),
+        ("filter_apply_order", "temperature"),
     )

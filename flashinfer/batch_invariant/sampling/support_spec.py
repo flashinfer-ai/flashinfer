@@ -145,16 +145,25 @@ def renorm_term(N: int, keep: Sequence[bool], j: int, alg=None) -> Term:
 
 
 def spec_fingerprint(
-    filters: Filters, N: int, from_logits: bool = False, in_fmt: str = "f32"
+    filters: Filters,
+    N: int,
+    from_logits: bool = False,
+    in_fmt: str = "f32",
+    temperature: bool = False,
 ) -> str:
     """The class identifier: the filter set and order, the fixed-point resolution, the selection rules, the vocabulary,
-    the weight form (the given probabilities, or ``lse.row``'s weights of the logits) and the structural hash of the sum
-    tree the kept mass is read from (``draw_spec.DrawSpec.total``: the same tree for the draw, the row class and this
-    class), with the input format (the renormalised probabilities convert to it)."""
+    the weight form (the given probabilities, or ``lse.row``'s weights of the logits, with or without a temperature in
+    the scale) and the structural hash of the sum tree the kept mass is read from (``draw_spec.DrawSpec.total``: the same
+    tree for the draw, the row class and this class), with the input format (the renormalised probabilities convert to
+    it)."""
     from .draw_spec import DrawSpec
     from .sterm import fingerprint_dag
 
-    tree = fingerprint_dag(DrawSpec(int(N), bool(from_logits), in_fmt).total(0))
+    tree = fingerprint_dag(
+        DrawSpec(
+            int(N), bool(from_logits), in_fmt, temperature=bool(temperature)
+        ).total(0)
+    )
     parts = [
         CLASS,
         filters.name,

@@ -246,6 +246,21 @@ def test_fingerprints_are_pinned():
     assert bi.fingerprint(
         "top_k_top_p_sampling_from_logits", N=1000, dtype="bf16"
     ).startswith(bi.fingerprint("sampling_from_logits", N=1000, dtype="bf16") + "+")
+    # a temperature in the scale: both halves embed `c`, so another receipt (the entry's `temperature=` keyword)
+    fl_t = bi.fingerprint(
+        "top_k_top_p_sampling_from_logits", N=1000, dtype="bf16", temperature=True
+    )
+    assert fl_t == "sample-icdf-ce7d921bf6afce4b+support-row-2039ae06e93b6c1e"
+    assert fl_t != pins["top_k_top_p_sampling_from_logits"]
+    assert fl_t.endswith(
+        "+" + SS.spec_fingerprint(Filters(top_k=1, top_p=1.0), 1000, True, "bf16", True)
+    )
+    assert (
+        bi.fingerprint(
+            "top_k_top_p_sampling_from_logits", N=1000, dtype="bf16", temperature=False
+        )
+        == pins["top_k_top_p_sampling_from_logits"]
+    )
     k_bf16 = bi.fingerprint("top_k_sampling_from_probs", N=1000, dtype="bf16")
     assert k_bf16 != bi.fingerprint("top_k_sampling_from_probs", N=1000, dtype="f32")
     assert k_bf16 != bi.fingerprint("top_k_sampling_from_probs", N=1001, dtype="bf16")
