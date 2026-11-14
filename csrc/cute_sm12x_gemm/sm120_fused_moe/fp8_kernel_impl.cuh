@@ -934,6 +934,7 @@ struct SM120BlockScalingFusedMoeGemmKernel : SM120BlockScalingGemmKernel<KT> {
       cutlass::arch::fence_barrier_init();
     }
     __syncthreads();
+    asm volatile("griddepcontrol.wait;" ::: "memory");
 
     int32_t k_tile_count = sm120_common::math::ceil_div(params.K, int(KT::kTileK));
 
