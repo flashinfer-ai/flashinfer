@@ -16,6 +16,7 @@ limitations under the License.
 
 import os
 import platform
+import shutil
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -29,7 +30,7 @@ from .core import (
     sm90a_nvcc_flags,
     sm89_nvcc_flags,
 )
-from .cpp_ext import host_compiler_is_gcc, is_cuda_version_at_least
+from .cpp_ext import get_cuda_path, host_compiler_is_gcc, is_cuda_version_at_least
 from .cubin_loader import (
     get_artifact,
     get_meta_hash,
@@ -55,6 +56,41 @@ def _should_enable_sm90_moe_prebuilt_d_descriptor() -> bool:
         properties = torch.cuda.get_device_properties(torch.cuda.current_device())
         # H20 and H20-3e expose 78 SMs, unlike H100 and H200.
         return properties.multi_processor_count == 78
+    except Exception:  # noqa: BLE001 - an unknown device must use the generic path
+        return False
+
+
+_SM90_MOE_H100_PREBUILT_D_MODULE = "fused_moe_90_h100_prebuilt_d"
+
+
+def _should_enable_sm90_moe_h100_prebuilt_d_descriptor() -> bool:
+    """Return whether to use the H100-specific prebuilt-D JIT variant.
+
+    Only the measured H100 SXM 80GB (HBM3, 132 SMs) qualifies; other H100
+    variants keep the generic module. The variant is selected only when it can
+    be loaded, from an installed AOT artifact or by compiling it with nvcc and
+    ninja, so generic AOT-only deployments keep working.
+    """
+    if os.environ.get("FLASHINFER_DISABLE_JIT"):
+        return False
+
+    try:
+        import torch
+
+        properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+        if not (
+            properties.major == 9
+            and properties.name == "NVIDIA H100 80GB HBM3"
+            and properties.multi_processor_count == 132
+        ):
+            return False
+        if jit_env.get_aot_artifacts(_SM90_MOE_H100_PREBUILT_D_MODULE):
+            return True
+        # Ninja also needs the CUDA toolkit root for headers and libraries,
+        # even when the compiler executable is overridden separately.
+        cuda_path = get_cuda_path()
+        nvcc = os.environ.get("FLASHINFER_NVCC") or str(Path(cuda_path) / "bin/nvcc")
+        return shutil.which(nvcc) is not None and shutil.which("ninja") is not None
     except Exception:  # noqa: BLE001 - an unknown device must use the generic path
         return False
 
@@ -161,7 +197,16 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
 
 
-def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
+def gen_cutlass_fused_moe_sm90_module(
+    use_fast_build: bool = False, *, enable_prebuilt_d: bool = True
+) -> JitSpec:
+    """Generate the SM90 cutlass fused MoE JitSpec.
+
+    With ``enable_prebuilt_d`` (the default), an H20 (which takes precedence)
+    or a measured H100 SXM selects its prebuilt-D module variant; every other
+    device gets the generic module. ``False`` always returns the generic module,
+    so AOT builds do not depend on the build host's GPU.
+    """
     nvcc_flags = sm90a_nvcc_flags + [
         "-DCOMPILE_HOPPER_TMA_GEMMS",
         "-DCOMPILE_HOPPER_TMA_GROUPED_GEMMS",
@@ -174,9 +219,13 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
         "-DCUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1",
     ]
     module_name = None
-    if _should_enable_sm90_moe_prebuilt_d_descriptor():
-        nvcc_flags.append("-DFLASHINFER_SM90_MOE_PREBUILT_D_DESCRIPTOR=1")
-        module_name = "fused_moe_90_h20_prebuilt_d"
+    if enable_prebuilt_d:
+        if _should_enable_sm90_moe_prebuilt_d_descriptor():
+            nvcc_flags.append("-DFLASHINFER_SM90_MOE_PREBUILT_D_DESCRIPTOR=1")
+            module_name = "fused_moe_90_h20_prebuilt_d"
+        elif _should_enable_sm90_moe_h100_prebuilt_d_descriptor():
+            nvcc_flags.append("-DFLASHINFER_SM90_MOE_H100_PREBUILT_D_DESCRIPTOR=1")
+            module_name = _SM90_MOE_H100_PREBUILT_D_MODULE
     return gen_cutlass_fused_moe_module(
         nvcc_flags, "90", use_fast_build, module_name=module_name
     )

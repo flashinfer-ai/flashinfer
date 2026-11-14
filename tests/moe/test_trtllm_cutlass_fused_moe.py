@@ -3924,6 +3924,20 @@ def test_moe_bf16_mxfp4_hopper_correctness(
 
 @pytest.mark.skipif(
     not is_sm90a_supported(torch.device("cuda")),
+    reason="Mixed-input MoE epilogue policies require SM90",
+)
+@pytest.mark.parametrize("intermediate_size", [3072, 3200])
+def test_moe_bf16_mxfp4_hopper_epilogue_k_boundary(intermediate_size):
+    # FC1 stays above the H20 threshold while FC2 exercises the threshold and
+    # an aligned K above it. Both share the maximum-workspace allocation.
+    # Use the same numerical coverage criterion as the other large W4A16
+    # cases: BF16 cancellation near zero can exceed the strict per-element
+    # reference tolerance even in the unmodified generic implementation.
+    _run_w4a16_moe_hopper(16, 4096, 4, 2, intermediate_size, strict_correctness=False)
+
+
+@pytest.mark.skipif(
+    not is_sm90a_supported(torch.device("cuda")),
     reason="W4A16 MoE (Hopper mixed-input) requires SM90",
 )
 @pytest.mark.parametrize(
