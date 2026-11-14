@@ -639,7 +639,7 @@ def _key_sources(paths: tuple) -> tuple:
     """
     initializers: dict = {}
     if not cute_dsl_strict_cache_key():
-        # As given, duplicates included: default keys must not change.
+        # Keep the caller-supplied files, including duplicates.
         return [str(p) for p in paths], initializers
     files = {str(p) for p in paths}
     for p in paths:
@@ -660,14 +660,29 @@ def _expand_key_files(paths: tuple) -> tuple:
     return tuple(set(files) | set(initializers))
 
 
+def _source_key_path(path: str) -> str:
+    """Use a stable package identity while keeping external paths distinct."""
+    try:
+        relative = Path(path).resolve().relative_to(_PACKAGE_DIR)
+    except RuntimeError as e:
+        # Python < 3.13 reports symlink loops as RuntimeError. Preserve the
+        # unreadable-source contract used by the kernel builder's cache bypass.
+        raise OSError(f"Cannot resolve source path: {path}") from e
+    except ValueError:
+        return path
+    # NUL cannot occur in a filesystem path, so an external relative path
+    # cannot alias this package-relative identity.
+    return f"\0flashinfer/{relative.as_posix()}"
+
+
 def _hash_source_files(paths: tuple) -> str:
     files, initializers = _key_sources(paths)
     sha = hashlib.sha256()
-    for path in sorted(files):
-        sha.update(path.encode())
+    for path in sorted(files, key=_source_key_path):
+        sha.update(_source_key_path(path).encode())
         with open(path, "rb") as f:
             sha.update(f.read())
-    for path in sorted(initializers):
-        sha.update(f"{path} (initializer)".encode())
+    for path in sorted(initializers, key=_source_key_path):
+        sha.update(f"{_source_key_path(path)} (initializer)".encode())
         sha.update(_initializer_digest(Path(path), initializers[path]).encode())
     return sha.hexdigest()
