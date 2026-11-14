@@ -171,6 +171,7 @@ def can_implement_grouped(
         or knobs.cluster_k > 1
         or knobs.swap_ab
         or knobs.cta_chunks
+        or knobs.gather_a
     ):
         return False
     if _is_block_scaled(chain):
@@ -268,6 +269,15 @@ def _fakes(chain: GroupedEpilogueBlock, packing: str = "dense"):
         f["out_sf"] = flat(SF_BUFFER_DIVISIBILITY)
         f["aux"] = cute.runtime.make_fake_tensor(
             Float32, (sym_e,), (1,), assumed_align=4
+        )
+        # the gather form: the token rows' scale buffer (the linear bytes: whole 4-byte groups), their per-token scales (any
+        # count: one entry is the unit scale), the plan's map
+        f["sfa_lin"] = flat(4)
+        f["pts_any"] = cute.runtime.make_fake_tensor(
+            Float32, (cute.sym_int(32),), (1,), assumed_align=4
+        )
+        f["src"] = cute.runtime.make_fake_tensor(
+            Int32, (cute.sym_int(32),), (1,), assumed_align=16
         )
         return f
     sym_r, sym_m, sym_n, sym_k = (
@@ -431,22 +441,37 @@ def get_compiled_grouped(
 # ----------------------------------------------------------------------------- the swapped body (the swapped records)
 
 
+def _swap_epi_wgs(chain: GroupedEpilogueBlock, token_tile: int) -> int:
+    from .swap import epi_warpgroups_of
+
+    return epi_warpgroups_of(chain, token_tile)
+
+
 def swapped_kernel_name(
     cfg: Knobs,
     chain: ChainLike,
     out_fmt: str = "bf16",
     gather: bool = False,
     k_block: int = 0,
+    sf_src: str = "128x4",
 ) -> str:
-    """``swapped_<format>_<chain>_<record>[_gather][_kb<K>]``: the swapped record (its weight and token tiles) names the
-    object beside the chain; the gather form (the token box gathered from the unpermuted rows) appends ``_gather``; a
-    block-scaled body's stage of ``k_block`` elements of K (the MXFP8 classes' two-atom stage) appends ``_kb<k_block>``."""
+    """``swapped_<format>_<chain>_<record>[_gather][_kb<K>][_sflin][_e<W>]``: the swapped record (its weight and token
+    tiles) names the object beside the chain; the bf16 gather form (the token box gathered from the unpermuted rows)
+    appends ``_gather`` (the block-scaled gather record carries its own suffix); a block-scaled body's stage of ``k_block``
+    elements of K (the MXFP8 classes' two-atom stage) appends ``_kb<k_block>``; the linear scale source ``_sflin``; the
+    epilogue over several warpgroups ``_e<W>``."""
     chain = as_chain(chain, out_fmt)
     knobs = dataclasses.replace(cfg, grid_clusters=0)
     return jit.sanitize_symbol_name(
         f"swapped_{fmt_tag(chain.in_fmt)}_{chain.describe()}_{knobs.describe()}"
         + ("_gather" if gather else "")
         + (f"_kb{k_block}" if k_block else "")
+        + ("_sflin" if (gather or cfg.gather_a) and sf_src == "linear" else "")
+        + (
+            f"_e{_swap_epi_wgs(chain, knobs.tile_n)}"
+            if _swap_epi_wgs(chain, knobs.tile_n) > 1
+            else ""
+        )
     )
 
 
@@ -468,6 +493,8 @@ def can_implement_swapped(
         return False
     if _is_block_scaled(chain) and not knobs.well_formed(chain.in_fmt):
         return False
+    if knobs.gather_a and not _is_block_scaled(chain):
+        return False  # the gather record is the block-scaled classes' (the bf16 gather form is the API's choice)
     return _operands_ok(chain, N, K, E)
 
 
@@ -487,7 +514,11 @@ def can_implement(
 
 
 def compile_swapped_fn(
-    cfg: Knobs, chain: GroupedEpilogueBlock, gather: bool = False, k_block: int = 0
+    cfg: Knobs,
+    chain: GroupedEpilogueBlock,
+    gather: bool = False,
+    k_block: int = 0,
+    sf_src: str = "128x4",
 ) -> Callable[[], Any]:
     """The zero-argument compile closure of one swapped specialisation: ``kernel(rows3, w3, out2, counts, [alpha, sa, si,]
     grid)`` -- ``rows (R, K, 1)`` the dense permuted rows (``R >= Tk``), ``w (N, K, E)``, ``out (Tk, Nout)``; the gather form
@@ -501,7 +532,59 @@ def compile_swapped_fn(
         f = _fakes(chain)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
-        body = SwappedGroupedGemm(cfg, chain, gather=gather, k_block=k_block)
+        body = SwappedGroupedGemm(cfg, chain, gather=gather, k_block=k_block, sf_src=sf_src)
+        if _is_block_scaled(chain) and cfg.gather_a:
+            sfx = f["sfa_lin"] if sf_src == "linear" else f["sfa"]
+            if isinstance(chain, Mxfp4Chain):
+                return cute.compile(
+                    body.block_scaled_plain_gathered,
+                    f["rows"],
+                    sfx,
+                    f["src"],
+                    Int32(1),
+                    f["b"],
+                    f["sfb"],
+                    f["out"],
+                    f["counts"],
+                    grid,
+                    stream_fake,
+                    options="--enable-tvm-ffi",
+                )
+            if chain.needs_aux:
+                return cute.compile(
+                    body.block_scaled_static_gathered,
+                    f["rows"],
+                    sfx,
+                    f["src"],
+                    Int32(1),
+                    f["b"],
+                    f["sfb"],
+                    f["out"],
+                    f["out_sf"],
+                    f["counts"],
+                    f["alpha"],
+                    f["pts_any"],
+                    f["aux"],
+                    grid,
+                    stream_fake,
+                    options="--enable-tvm-ffi",
+                )
+            return cute.compile(
+                body.block_scaled_gathered,
+                f["rows"],
+                sfx,
+                f["src"],
+                Int32(1),
+                f["b"],
+                f["sfb"],
+                f["out"],
+                f["counts"],
+                f["alpha"],
+                f["pts_any"],
+                grid,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
         if _is_block_scaled(chain):
             if isinstance(chain, (MxChain, Mxfp4Chain)):
                 # the MX chains' entries; the W4A4 unscaled oracle keeps ``block_scaled`` (alpha / pts unread)
@@ -598,20 +681,24 @@ def get_compiled_swapped(
     out_fmt: str = "bf16",
     gather: bool = False,
     k_block: int = 0,
+    sf_src: str = "128x4",
 ) -> Any:
     """``kernel(rows3, w3, out2, counts, grid)`` (``kernel(rows3, w3, out2, counts, alpha, sa, si, grid)`` for a chain with
     scale operands; ``kernel(rows3, sfa, w3, sfw, out2, [out_sf,] counts, alpha, pts, [aux,] grid)`` for the block-scaled
     chains with the W4A4 scales; ``kernel(rows3, sfa, w3, sfw, out2, [out_sf,] counts, grid)`` for the MX chains): the
     swapped body for a swapped record of the chain's format (module ``batch_invariant_moe``): rows ``(R, K, 1)`` K-major
-    (``R >= Tk``), w ``(N, K, E)`` K-major, out ``(Tk, Nout)``, counts ``(E,)``, ``grid`` the persistent grid in CTAs; the
-    gather form ``kernel(x2, src, k_div, w3, out2, counts, grid)`` (the bf16 classes). ``k_block``: a block-scaled body's K
-    elements per stage (0: the format's atom), one object per value."""
+    (``R >= Tk``), w ``(N, K, E)`` K-major, out ``(Tk, Nout)``, counts ``(E,)``, ``grid`` the persistent grid in CTAs;
+    the gather form ``kernel(x2, src, k_div, w3, out2, counts, grid)`` (the bf16 classes); the block-scaled gather record
+    (``cfg.gather_a``): ``kernel(x3, sfx, src, k_div, w3, sfw, out2, [out_sf,] counts, [alpha, pts, [aux,]] grid)`` -- ``x (T,
+    K/2, 1)`` the unpermuted packed token rows, ``sfx`` their flat scale buffer (``sf_src``), ``pts (T,)`` or ``(1,)``.
+    ``k_block``: a block-scaled body's K elements per stage (0: the format's atom), one object per value."""
     chain = as_chain(chain, out_fmt)
     assert is_swapped_record(cfg, chain.in_fmt), (cfg, chain.in_fmt)
+    assert sf_src in ("128x4", "linear"), sf_src
     return jit.build_and_load(
         MODULE,
-        swapped_kernel_name(cfg, chain, gather=gather, k_block=k_block),
-        compile_swapped_fn(cfg, chain, gather, k_block),
+        swapped_kernel_name(cfg, chain, gather=gather, k_block=k_block, sf_src=sf_src),
+        compile_swapped_fn(cfg, chain, gather, k_block, sf_src),
     )
 
 

@@ -73,7 +73,7 @@ def _no_scales(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
 
 def _tactic_nvfp4(c1, c2) -> tuple:
     """A pair of records as a flat tuple of scalars (JSON round-trip safe for the autotuner's cache): the bf16 runner's six
-    per record plus the swapped-record flag (the dispatcher's two record spaces)."""
+    per record plus the swapped-record and the gather-form flags (the dispatcher's record spaces and forms)."""
     return tuple(
         int(v) if isinstance(v, bool) else v
         for cfg in (c1, c2)
@@ -85,8 +85,12 @@ def _tactic_nvfp4(c1, c2) -> tuple:
             cfg.use_2cta_instrs,
             cfg.raster_along,
             cfg.swap_ab,
+            cfg.gather_a,
         )
     )
+
+
+TACTIC_FIELDS = 8  # scalars per record in the tactic tuple
 
 
 def _configs_from_tactic_nvfp4(t: tuple):
@@ -101,9 +105,10 @@ def _configs_from_tactic_nvfp4(t: tuple):
             str(v[5]),
             1,
             swap_ab=bool(v[6]),
+            gather_a=bool(v[7]),
         )
 
-    return one(t[:7]), one(t[7:14])
+    return one(t[:TACTIC_FIELDS]), one(t[TACTIC_FIELDS : 2 * TACTIC_FIELDS])
 
 
 class _Fp4PairRunner(MoERunner):
@@ -214,14 +219,25 @@ class _Fp4PairRunner(MoERunner):
     def _hidden_of(x: torch.Tensor) -> int:
         return int(x.shape[1]) if x.dtype == torch.bfloat16 else 2 * int(x.shape[1])
 
-    def _ranked(self, T: int, H: int) -> Tuple[list, list]:
-        """The dispatcher's ranked records of the two GEMMs at ``T`` tokens (the pair's)."""
+    def _ranked(
+        self, T: int, H: int, scatter_launch: bool = False
+    ) -> Tuple[list, list]:
+        """The dispatcher's ranked records of the two GEMMs at ``T`` tokens (the pair's); with ``scatter_launch`` GEMM1's
+        list carries the structural rule's gather twin (:func:`~.schedule_nvfp4.gather_form_rule`)."""
         raise NotImplementedError
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile) -> List[Any]:
         self._require_built()
-        r1, r2 = self._ranked(int(inputs[_X].shape[0]), self._hidden_of(inputs[_X]))
+        x = inputs[_X]
+        r1, r2 = self._ranked(
+            int(x.shape[0]), self._hidden_of(x), self._scatter_launch(x)
+        )
         return [_tactic_nvfp4(c1, c2) for c1 in r1 for c2 in r2]
+
+    def _scatter_launch(self, x: torch.Tensor) -> bool:
+        """Whether the box form scatters the quantized rows in a launch of its own: a pre-quantized input (the bf16 input's
+        quantizer scatters in its own pass)."""
+        return x.dtype != torch.bfloat16
 
 
 class BatchInvariantMoeNvfp4Runner(_Fp4PairRunner):
@@ -470,12 +486,17 @@ class BatchInvariantMoeNvfp4Runner(_Fp4PairRunner):
         ] + plan
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
-    def _ranked(self, T: int, H: int) -> Tuple[list, list]:
+    def _ranked(
+        self, T: int, H: int, scatter_launch: bool = False
+    ) -> Tuple[list, list]:
+        """The ranked records of both GEMMs (the tactic space's head); with ``scatter_launch`` GEMM1's list carries the
+        gather-form twin the structural rule places (:func:`~.schedule_nvfp4.gather_form_rule`)."""
         from .api_nvfp4 import GEMM2_CHAIN, GEMM2_STATIC_CHAIN
         from .blocks.epilogue import W4A4Chain
         from .schedule_nvfp4 import (
-            TOP_K,
+            TOP_K_FP4,
             active_experts,
+            gather_form_rule,
             rank_grouped_nvfp4,
             rows_per_expert,
         )
@@ -501,17 +522,20 @@ class BatchInvariantMoeNvfp4Runner(_Fp4PairRunner):
         )
         chain2 = GEMM2_STATIC_CHAIN if static else GEMM2_CHAIN
         n1 = 2 * I if a.gated else I
-        return (
+        r1 = list(
             rank_grouped_nvfp4(
-                rows, n1, H, E, chain1, in1, sm_count, family, TOP_K, n_active=n_act
-            ),
-            rank_grouped_nvfp4(
-                rows, H, I, E, chain2, in2, sm_count, family, TOP_K, n_active=n_act
-            ),
+                rows, n1, H, E, chain1, in1, sm_count, family, TOP_K_FP4, n_active=n_act
+            )
         )
+        twins = [gather_form_rule(c, scatter_launch) for c in r1]
+        r1 += [t for t in twins if t.gather_a and t not in r1]
+        r2 = rank_grouped_nvfp4(
+            rows, H, I, E, chain2, in2, sm_count, family, TOP_K_FP4, n_active=n_act
+        )
+        return r1, list(r2)
 
     def _cache_key_extras(self) -> tuple:
-        return super()._cache_key_extras() + ("moe.nvfp4-v3", self._intermediate)
+        return super()._cache_key_extras() + ("moe.nvfp4-v4", self._intermediate)
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def forward(
@@ -528,8 +552,10 @@ class BatchInvariantMoeNvfp4Runner(_Fp4PairRunner):
         plan = tuple(inputs[14:19]) if len(inputs) >= 19 else None
         H = self._hidden_of(x)
         if tactic == -1 or tactic is None:
-            r1, r2 = self._ranked(int(x.shape[0]), H)
-            c1, c2 = r1[0], r2[0]
+            from .schedule_nvfp4 import gather_form_rule
+
+            r1, r2 = self._ranked(int(x.shape[0]), H, self._scatter_launch(x))
+            c1, c2 = gather_form_rule(r1[0], self._scatter_launch(x)), r2[0]
         else:
             c1, c2 = _configs_from_tactic_nvfp4(tuple(tactic))
         a = self._activation()
