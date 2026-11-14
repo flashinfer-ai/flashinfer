@@ -128,5 +128,48 @@ def test_act_and_mul_cuda_graph():
     torch.testing.assert_close(y2, y2_ref, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("op", ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul"])
+@pytest.mark.parametrize("strided_arg", ["input", "out"])
+def test_act_and_mul_rejects_noncontiguous(op, strided_arg):
+    fn = getattr(flashinfer.activation, op)
+    x = torch.randn((4, 2048), device="cuda", dtype=torch.bfloat16)
+
+    if strided_arg == "input":
+        storage = torch.randn((4, 2112), device="cuda", dtype=torch.bfloat16)
+        x = storage[:, :2048]
+        assert not x.is_contiguous()
+
+        with pytest.raises(ValueError, match="Input tensor must be contiguous"):
+            fn(x)
+    else:
+        storage = torch.empty((4, 1040), device="cuda", dtype=torch.bfloat16)
+        out = storage[:, :1024]
+        assert not out.is_contiguous()
+
+        with pytest.raises(ValueError, match="Output tensor must be contiguous"):
+            fn(x, out=out)
+
+
+@pytest.mark.parametrize("op", ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul"])
+@pytest.mark.parametrize("strided_arg", ["input", "out"])
+def test_act_and_mul_ffi_rejects_noncontiguous(op, strided_arg):
+    act = op.removesuffix("_and_mul")
+    module = flashinfer.activation.get_act_and_mul_module(act)
+    fn = getattr(module, op)
+
+    x = torch.randn((4, 2048), device="cuda", dtype=torch.bfloat16)
+    out = torch.empty((4, 1024), device="cuda", dtype=torch.bfloat16)
+
+    if strided_arg == "input":
+        storage = torch.randn((4, 2112), device="cuda", dtype=torch.bfloat16)
+        x = storage[:, :2048]
+    else:
+        storage = torch.empty((4, 1040), device="cuda", dtype=torch.bfloat16)
+        out = storage[:, :1024]
+
+    with pytest.raises(RuntimeError, match=f"{strided_arg} must be contiguous"):
+        fn(out, x, False)
+
+
 if __name__ == "__main__":
     test_fused_silu_mul(128, 1, 1, True)
