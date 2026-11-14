@@ -273,7 +273,7 @@ def prepare_bf16_fp4_weights(
     },
     common_check=_check_mm_bf16_fp4_problem_size,
 )
-@flashinfer_api(trace=mm_bf16_fp4_trace_dispatch)
+@flashinfer_api(trace=mm_bf16_fp4_trace_dispatch, pdl_static=("b", "b_descale"))
 def mm_bf16_fp4(
     a: torch.Tensor,
     b: torch.Tensor,

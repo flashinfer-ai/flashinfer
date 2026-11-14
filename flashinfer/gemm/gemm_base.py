@@ -862,7 +862,7 @@ def _batch_invariant_requested(*args, **kwargs) -> bool:
     heuristic_func=_heuristic_func_mm_bf16,
     bypass=_batch_invariant_requested,
 )
-@flashinfer_api(trace=mm_bf16_trace)
+@flashinfer_api(trace=mm_bf16_trace, pdl_static=("b",))
 def mm_bf16(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -907,10 +907,12 @@ def mm_bf16(
         PDL, while cuDNN, cuBLASLt, and CUTLASS compete without it. Tuning
         entries for ``pdl=True`` use the op name ``"bf16_gemm_pdl"``, while
         ``skip_ops={"bf16_gemm"}`` still skips such calls. PDL kernels may read
-        ``b`` and ``bias`` before waiting for the preceding kernel, so pass
-        ``pdl=False`` if a kernel that may still be running writes them.
-        Defaults to ``False``. ``None`` is accepted as ``False`` for backward
-        compatibility with 0.7.4rc1.
+        ``b`` before waiting for the preceding kernel, so pass ``pdl=False`` if
+        a kernel that may still be running writes it. The TinyGEMM backend and
+        the CuTeDSL warp split-K kernel currently read ``bias`` before the wait
+        too, so the same applies to ``bias`` there. Defaults to ``False``.
+        ``None`` is accepted as ``False`` for backward compatibility with
+        0.7.4rc1.
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16, fp16, or fp32. FP16 and FP32 output are enabled
@@ -3457,7 +3459,7 @@ def _cutedsl_low_latency_blockscaled_tgv_requirement(
     return True
 
 
-@flashinfer_api(trace=tgv_gemm_sm100_trace)
+@flashinfer_api(trace=tgv_gemm_sm100_trace, pdl_static=("b", "b_descale"))
 def tgv_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -10431,7 +10433,7 @@ _BMM_MXFP8_CUTE_DSL_TUNING_CONFIG = TuningConfig(
     heuristic_func=_heuristic_func_mm_fp4,  # result stored in mm_fp4.suitable_auto_backends
     bypass=_batch_invariant_requested,
 )
-@flashinfer_api(trace=mm_fp4_trace)
+@flashinfer_api(trace=mm_fp4_trace, pdl_static=("b", "b_descale"))
 def mm_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
