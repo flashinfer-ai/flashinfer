@@ -17,9 +17,9 @@ Packed KDA (Kimi Delta Attention) chunked training forward and backward
 (SM100 / SM103 / SM107), the Cake backend.  Deterministic: the same inputs, hardware and
 plan give bitwise the same outputs and gradients.
 
-Thin experimental entry points.  The contract, the host plan, the workspace,
+Thin entry points.  The contract, the host plan, the workspace,
 the launch sequences, the autograd Function and the generated kernels live in
-``flashinfer.experimental.cake_kda_det_train``; this module validates nothing
+``flashinfer.experimental.cake.cake_kda_det_train``; this module validates nothing
 itself and forwards every keyword.  Every switch is a keyword argument; no
 environment variable is read.
 
@@ -34,23 +34,23 @@ final state, ``scale = 128 ** -0.5`` by default, ``H`` in ``1..64``.
 
 Usage::
 
-    from flashinfer.cake_kda_det_train import chunk_kda_det, chunk_kda_det_fwd, chunk_kda_det_bwd
+    from flashinfer.cake_kda_det_train import cake_kda_det, cake_kda_det_train_forward, cake_kda_det_train_backward
 
-    out = chunk_kda_det(q, k, v, g, beta, cu_seqlens)                  # autograd
-    out, saved = chunk_kda_det_fwd(q, k, v, g, beta, cu_seqlens, save_for_backward=True)
-    dq, dk, dv, dbeta, dg = chunk_kda_det_bwd(q, k, v, g, beta, cu_seqlens, dout, saved=saved)
-    dq, dk, dv, dbeta, dg = chunk_kda_det_bwd(q, k, v, g, beta, cu_seqlens, dout)  # checkpoint replay
+    out = cake_kda_det(q, k, v, g, beta, cu_seqlens)                  # autograd
+    out, saved = cake_kda_det_train_forward(q, k, v, g, beta, cu_seqlens, save_for_backward=True)
+    dq, dk, dv, dbeta, dg = cake_kda_det_train_backward(q, k, v, g, beta, cu_seqlens, dout, saved=saved)
+    dq, dk, dv, dbeta, dg = cake_kda_det_train_backward(q, k, v, g, beta, cu_seqlens, dout)  # checkpoint replay
 
-    ws = kda_det_train_workspace(S, num_docs, H, device)               # caller-owned, reused
-    out, saved = chunk_kda_det_fwd(q, k, v, g, beta, cu_seqlens, workspace=ws)
-    ws = kda_det_train_workspace(S, num_docs, H, device, save_mode="tape")   # saved set v2: the backward
-    out, saved = chunk_kda_det_fwd(q, k, v, g, beta, cu_seqlens, workspace=ws)  # skips its recurrence recompute
-    arena = kda_det_train_arena(lean=True, tail_passes=4)                    # the lower-memory arena option
-    ws = kda_det_train_workspace(S, num_docs, H, device, arena=arena)        # (off by default): a smaller backward
-    out = chunk_kda_det(q, k, v, g, beta, cu_seqlens, workspace=ws)          # arena, the same gradients bitwise
-    arena = kda_det_train_arena(lean=True, tail_passes=4, batch_tokens=B)    # and over groups of whole documents of
-    ws = kda_det_train_workspace(S, num_docs, H, device, arena=arena, doc_lengths=lengths)   # at most B tokens: the
-    out = chunk_kda_det(q, k, v, g, beta, cu_seqlens, workspace=ws, doc_lengths=lengths)     # arena of the largest group
+    ws = cake_kda_det_train_workspace(S, num_docs, H, device)               # caller-owned, reused
+    out, saved = cake_kda_det_train_forward(q, k, v, g, beta, cu_seqlens, workspace=ws)
+    ws = cake_kda_det_train_workspace(S, num_docs, H, device, save_mode="tape")   # saved set v2: the backward
+    out, saved = cake_kda_det_train_forward(q, k, v, g, beta, cu_seqlens, workspace=ws)  # skips its recurrence recompute
+    arena = cake_kda_det_train_arena(lean=True, tail_passes=4)                    # the lower-memory arena option
+    ws = cake_kda_det_train_workspace(S, num_docs, H, device, arena=arena)        # (off by default): a smaller backward
+    out = cake_kda_det(q, k, v, g, beta, cu_seqlens, workspace=ws)          # arena, the same gradients bitwise
+    arena = cake_kda_det_train_arena(lean=True, tail_passes=4, batch_tokens=B)    # and over groups of whole documents of
+    ws = cake_kda_det_train_workspace(S, num_docs, H, device, arena=arena, doc_lengths=lengths)   # at most B tokens: the
+    out = cake_kda_det(q, k, v, g, beta, cu_seqlens, workspace=ws, doc_lengths=lengths)     # arena of the largest group
 """
 
 from __future__ import annotations
@@ -60,16 +60,15 @@ from typing import Any, Optional
 
 import torch
 
-from .api_logging import flashinfer_experimental_api
+from .api_logging import flashinfer_api
 
-_FEATURE = "Cake packed KDA chunked training (SM100/SM103/SM107)"
 
 # The default scale of the GLM contract: ``head_dim ** -0.5`` with head dimension 128.
 DEFAULT_SCALE = 128**-0.5
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def chunk_kda_det_fwd(
+@flashinfer_api
+def cake_kda_det_train_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -107,8 +106,8 @@ def chunk_kda_det_fwd(
         Output scale; ``128 ** -0.5`` when ``None``.
     save_for_backward : bool
         Write the saved set (``Aqk`` / ``Akk`` on the token rows plus the device chunk tables).
-    workspace : KdaDetWorkspace, optional
-        A reused workspace from :func:`kda_det_train_workspace`; without one this call allocates its own.
+    workspace : CakeKDADetWorkspace, optional
+        A reused workspace from :func:`cake_kda_det_train_workspace`; without one this call allocates its own.
     save_mode : str, optional
         ``"light"`` (saved set version 4: ``Aqk`` / ``Akk`` and the tables, 256 B per token-head, the forward's
         gated queries ``qg``, 256 B per internal token-head, plus the segment-boundary states on the segmented
@@ -116,8 +115,8 @@ def chunk_kda_det_fwd(
         the WY representation on the rows whose backward reads it from the set) or ``"tape"`` (version 2: also
         the forward's state tape and ``v_new``, 768 B more per token-head, so the backward skips the whole
         recompute); ``None`` takes the workspace's default (``"light"`` without one).
-    arena : KdaDetArena, optional
-        The lower-memory arena option (:func:`kda_det_train_arena`; off by default): the forward's layout is the
+    arena : CakeKDADetArena, optional
+        The lower-memory arena option (:func:`cake_kda_det_train_arena`; off by default): the forward's layout is the
         same under every option, and a batched option (``batch_tokens``) runs the forward once per document
         group; ``None`` takes the workspace's option, a differing option on a given workspace is refused.
     doc_lengths : sequence of int, optional
@@ -144,11 +143,11 @@ def chunk_kda_det_fwd(
 
     Returns
     -------
-    ``(out, saved)``: ``out`` BF16 like ``v``; ``saved`` a ``KdaDetChunkSaved`` (versioned) or ``None``.
+    ``(out, saved)``: ``out`` BF16 like ``v``; ``saved`` a ``CakeKDADetChunkSaved`` (versioned) or ``None``.
     """
-    from .experimental.cake_kda_det_train import cake_backend
+    from .experimental.cake.cake_kda_det_train import cake_backend
 
-    return cake_backend.chunk_kda_det_fwd(
+    return cake_backend.cake_kda_det_train_forward(
         q,
         k,
         v,
@@ -169,8 +168,8 @@ def chunk_kda_det_fwd(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def chunk_kda_det_bwd(
+@flashinfer_api
+def cake_kda_det_train_backward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -198,14 +197,14 @@ def chunk_kda_det_bwd(
         The forward's operands.
     dout : torch.Tensor
         BF16 gradient of ``out``, laid out like ``v``.
-    saved : KdaDetChunkSaved, optional
+    saved : CakeKDADetChunkSaved, optional
         The forward's saved set (version 4 or 2); ``None`` recomputes it from the inputs (checkpoint replay).
     scale : float, optional
         The forward's scale; ``128 ** -0.5`` when ``None``.
-    workspace : KdaDetWorkspace, optional
+    workspace : CakeKDADetWorkspace, optional
         A reused workspace with backward buffers; without one this call allocates its own.
-    arena : KdaDetArena, optional
-        The lower-memory arena option (:func:`kda_det_train_arena`; off by default) of that per-call workspace:
+    arena : CakeKDADetArena, optional
+        The lower-memory arena option (:func:`cake_kda_det_train_arena`; off by default) of that per-call workspace:
         the lean backward layouts and the tail split (``tail_passes``), the same gradients bitwise; ``None``
         takes a given workspace's option, a differing one is refused.  A lean arena serves no checkpoint replay
         (``saved=None``); a batched option (``batch_tokens``) runs the backward once per document group.
@@ -213,7 +212,7 @@ def chunk_kda_det_bwd(
         The documents' token counts in ``cu_seqlens`` order (host integers), required under a batched option and
         checked against ``cu_seqlens`` on the device.
     use_gate_in_kernel, A_log, dt_bias, lower_bound
-        The forward's gate mode and raw gate parameters (see :func:`chunk_kda_det_fwd`); a saved set of the other mode,
+        The forward's gate mode and raw gate parameters (see :func:`cake_kda_det_train_forward`); a saved set of the other mode,
         or with another ``lower_bound``, is refused.
     use_qk_l2norm_in_kernel : bool
         The forward's in-kernel Q/K L2 norm mode (``q`` / ``k`` then the raw rows; ``dq`` / ``dk`` their
@@ -221,14 +220,15 @@ def chunk_kda_det_bwd(
 
     Returns
     -------
-    ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v, beta`` and the FP32 gradient of ``g``, ranked
-    like the inputs.  With ``use_gate_in_kernel=True``: ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg``
-    the BF16 gradient of the raw gate (contiguous, ranked like ``g``), ``dA_log`` FP32 ``[H]`` and ``ddt_bias``
-    FP32 shaped like ``dt_bias``.  Bitwise reproducible for the same inputs.
+    tuple of torch.Tensor
+        ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v, beta`` and the FP32 gradient of ``g``, ranked
+        like the inputs.  With ``use_gate_in_kernel=True``: ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg``
+        the BF16 gradient of the raw gate (contiguous, ranked like ``g``), ``dA_log`` FP32 ``[H]`` and ``ddt_bias``
+        FP32 shaped like ``dt_bias``.  Bitwise reproducible for the same inputs.
     """
-    from .experimental.cake_kda_det_train import cake_backend
+    from .experimental.cake.cake_kda_det_train import cake_backend
 
-    return cake_backend.chunk_kda_det_bwd(
+    return cake_backend.cake_kda_det_train_backward(
         q,
         k,
         v,
@@ -249,8 +249,8 @@ def chunk_kda_det_bwd(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def chunk_kda_det(
+@flashinfer_api
+def cake_kda_det(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -271,16 +271,49 @@ def chunk_kda_det(
 ) -> torch.Tensor:
     r"""Packed KDA chunked training as an autograd node (``torch.utils.checkpoint`` compatible).
 
-    Returns ``out`` BF16 like ``v`` with gradients to ``q, k, v, g, beta``; see :func:`chunk_kda_det_fwd` for the
+    Returns ``out`` BF16 like ``v`` with gradients to ``q, k, v, g, beta``; see :func:`cake_kda_det_train_forward` for the
     operands, ``save_mode``, ``arena``, ``doc_lengths`` (the node records the option and the document lengths,
     so a backward that allocates its own workspace takes them too) and the raw gate mode
     (``use_gate_in_kernel=True``, ``A_log``, ``dt_bias``, ``lower_bound``: gradients to the raw gate ``g``, BF16,
     and to ``A_log`` / ``dt_bias``, FP32), the in-kernel Q/K L2 norm (``use_qk_l2norm_in_kernel=True``: raw ``q`` /
-    ``k`` in, their gradients out) and :func:`chunk_kda_det_bwd` for the gradients.
-    """
-    from .experimental.cake_kda_det_train import cake_backend
+    ``k`` in, their gradients out) and :func:`cake_kda_det_train_backward` for the gradients.
 
-    return cake_backend.chunk_kda_det(
+    Parameters
+    ----------
+    q, k, v : torch.Tensor
+        BF16 packed rows ``[1, S, H, 128]`` (or ``[S, H, 128]``), as in
+        :func:`cake_kda_det_train_forward`.
+    g : torch.Tensor
+        FP32 activated decay gate; raw BF16 gate when ``use_gate_in_kernel=True``.
+    beta : torch.Tensor
+        BF16 ``[1, S, H]`` delta-rule gate after the sigmoid.
+    cu_seqlens : torch.Tensor
+        int32 device document offsets, first 0 and last ``S``.
+    scale : float, optional
+        Output scale; ``128 ** -0.5`` when ``None``.
+    workspace : optional
+        Caller-owned workspace from :func:`cake_kda_det_train_workspace`.
+    save_mode : str, optional
+        ``"light"`` or ``"tape"``; ``None`` uses the workspace's default (``"light"`` without one).
+    arena : optional
+        Lower-memory arena option from :func:`cake_kda_det_train_arena`.
+    doc_lengths : sequence of int, optional
+        Host document lengths in offset order; required by a batched arena.
+    use_gate_in_kernel : bool, default=False
+        Activate the raw BF16 gate inside the kernels.
+    A_log : torch.Tensor, optional
+        Contiguous FP32 ``[H]`` raw-gate parameter.
+    dt_bias : torch.Tensor, optional
+        Contiguous FP32 ``[H * 128]`` or ``[H, 128]`` raw-gate bias.
+    lower_bound : float, optional
+        Required in raw-gate mode, with ``-5 <= lower_bound < 0``.
+    use_qk_l2norm_in_kernel : bool, default=False
+        Normalize raw query and key rows inside the kernels; input layout rules are
+        those of :func:`cake_kda_det_train_forward`.
+    """
+    from .experimental.cake.cake_kda_det_train import cake_backend
+
+    return cake_backend.cake_kda_det(
         q,
         k,
         v,
@@ -300,14 +333,14 @@ def chunk_kda_det(
     )
 
 
-def kda_det_train_arena(
+def cake_kda_det_train_arena(
     *,
     lean: bool = False,
     tail_passes: int = 1,
     batch_tokens: Optional[int] = None,
     max_docs_per_batch: Optional[int] = None,
 ) -> Any:
-    """The lower-memory arena option (a ``KdaDetArena``; the default, ``lean=False, tail_passes=1``, no batching, is
+    """The lower-memory arena option (a ``CakeKDADetArena``; the default, ``lean=False, tail_passes=1``, no batching, is
     the full layout).  ``lean=True`` selects the lean backward layouts (4108 B per internal token-head with one
     tail pass instead of the default's 4488, tape 3720; no checkpoint replay on such a workspace); ``tail_passes
     >= 2`` (implies ``lean``) runs the backward's tail, the fused gradient / GLM intra / gate epilogue, once per
@@ -319,9 +352,9 @@ def kda_det_train_arena(
     arena); the calls then take ``doc_lengths``.  Bitwise the same results, except that an exactly-zero
     ``u`` / ``w`` entry of a chunk whose pair partner changed may change sign; refused on the rows with at most four
     (document, head) chains on the segmented route."""
-    from .experimental.cake_kda_det_train import cake_backend
+    from .experimental.cake.cake_kda_det_train import cake_backend
 
-    return cake_backend.KdaDetArena(
+    return cake_backend.CakeKDADetArena(
         lean=lean,
         tail_passes=tail_passes,
         batch_tokens=batch_tokens,
@@ -329,7 +362,7 @@ def kda_det_train_arena(
     )
 
 
-def kda_det_train_workspace(
+def cake_kda_det_train_workspace(
     S: int,
     num_docs: int,
     H: int,
@@ -342,16 +375,16 @@ def kda_det_train_workspace(
     use_gate_in_kernel: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> Any:
-    """A caller-owned ``KdaDetWorkspace`` (one arena of internal intermediates) for ``S`` tokens in ``num_docs``
+    """A caller-owned ``CakeKDADetWorkspace`` (one arena of internal intermediates) for ``S`` tokens in ``num_docs``
     documents with ``H`` heads on ``device``, reused by every call that receives it: the forward layout only with
     ``backward=False``; ``save_mode`` is the default of the calls on it and sizes the arena for that mode;
-    ``arena`` (:func:`kda_det_train_arena`) is the lower-memory arena option, off when ``None``; under a batched
+    ``arena`` (:func:`cake_kda_det_train_arena`) is the lower-memory arena option, off when ``None``; under a batched
     option ``doc_lengths`` (the documents' token counts) sizes the arena for the exact document groups instead of
     the bound of every group; ``use_gate_in_kernel`` / ``use_qk_l2norm_in_kernel`` are the gate and Q/K L2 norm
     modes of the calls it serves (a call in another mode is refused)."""
-    from .experimental.cake_kda_det_train import cake_backend
+    from .experimental.cake.cake_kda_det_train import cake_backend
 
-    return cake_backend.KdaDetWorkspace.for_problem(
+    return cake_backend.CakeKDADetWorkspace.for_problem(
         S,
         num_docs,
         H,
@@ -365,7 +398,7 @@ def kda_det_train_workspace(
     )
 
 
-def kda_det_train_workspace_bytes(
+def cake_kda_det_train_workspace_bytes(
     S: int,
     num_docs: int,
     H: int,
@@ -378,12 +411,12 @@ def kda_det_train_workspace_bytes(
     use_gate_in_kernel: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> int:
-    """Bytes :func:`kda_det_train_workspace` allocates for the problem (``sm_count``: the device's SM count, the
+    """Bytes :func:`cake_kda_det_train_workspace` allocates for the problem (``sm_count``: the device's SM count, the
     current CUDA device's when ``None``; it sets the segment count of the segmented recurrences; ``arena``: the
     lower-memory arena option, off when ``None``; ``doc_lengths``: the exact document groups of a batched option,
     else their bound; ``use_gate_in_kernel``: the gate mode, whose backward layouts carry no gate epilogue
     buffers in raw mode; ``use_qk_l2norm_in_kernel``: the Q/K L2 norm mode, likewise without those buffers)."""
-    from .experimental.cake_kda_det_train import cake_backend
+    from .experimental.cake.cake_kda_det_train import cake_backend
 
     return cake_backend.workspace_bytes(
         S,
@@ -417,7 +450,7 @@ def _l2n(use_qk_l2norm_in_kernel: bool) -> str:
     return "fused" if use_qk_l2norm_in_kernel else "off"
 
 
-def kda_det_train_saved_bytes(
+def cake_kda_det_train_saved_bytes(
     S: int,
     H: int,
     num_docs: Optional[int] = None,
@@ -431,7 +464,7 @@ def kda_det_train_saved_bytes(
     reads it from the set, the WY representation ``w`` / ``u``) and the segment-boundary states under the size rule
     with ``save_mode="light"``; the state tape, ``v_new`` and the segment transfers with ``save_mode="tape"``;
     with ``use_qk_l2norm_in_kernel=True`` the FP32 reciprocal norms ``[2, S, H]`` (``8 * S * H``) in either."""
-    from .experimental.cake_kda_det_train import cake_backend
+    from .experimental.cake.cake_kda_det_train import cake_backend
 
     return cake_backend.saved_bytes(
         S,
@@ -443,22 +476,24 @@ def kda_det_train_saved_bytes(
     )
 
 
-def is_kda_det_train_supported(device: torch.device | str | int | None = None) -> bool:
+def is_cake_kda_det_train_supported(
+    device: torch.device | str | int | None = None,
+) -> bool:
     """Whether ``device`` (the current CUDA device by default) is a target of the Cake kernels
     (compute capability 10.0, 10.3 or 10.7)."""
-    from .experimental.cake_kda_det_train import cake_backend
+    from .experimental.cake.cake_kda_det_train import cake_backend
 
     return cake_backend.is_supported(device)
 
 
 __all__ = [
     "DEFAULT_SCALE",
-    "chunk_kda_det",
-    "chunk_kda_det_bwd",
-    "chunk_kda_det_fwd",
-    "is_kda_det_train_supported",
-    "kda_det_train_arena",
-    "kda_det_train_saved_bytes",
-    "kda_det_train_workspace",
-    "kda_det_train_workspace_bytes",
+    "cake_kda_det",
+    "cake_kda_det_train_arena",
+    "cake_kda_det_train_backward",
+    "cake_kda_det_train_forward",
+    "cake_kda_det_train_saved_bytes",
+    "cake_kda_det_train_workspace",
+    "cake_kda_det_train_workspace_bytes",
+    "is_cake_kda_det_train_supported",
 ]

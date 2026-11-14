@@ -432,6 +432,7 @@ class _DummyResource(MemoryResource):
         desc_b_mma_base,
         smem_b_stage_ptr,
         first_k_tile: cutlass.Constexpr[Optional[bool]] = None,
+        k_subblock: cutlass.Constexpr[Optional[int]] = None,
     ):
         pass
 

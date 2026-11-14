@@ -14,6 +14,7 @@
 #   bash tests/moe_ep/run_tests.sh mega_sm120_cake # 4/8-GPU Blackwell-consumer sm120_mxfp4_mxfp8_bf16_cake (NCCL LSA + GIN)
 #   bash tests/moe_ep/run_tests.sh mega_sm107    # Rubin EP2/4/8 (NPROC_MULTIRANK, default 4), all three formats
 #   bash tests/moe_ep/run_tests.sh qualify_sm107 # strict Rubin host/single/multirank suite; rejects skips
+#   bash tests/moe_ep/run_tests.sh qualify_bi    # strict MegaMoE BI + Lean + EP2/4/8; rejects skips
 #   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper sm90_fp8_fp8_bf16_push_cuda kernel + backend
 #   bash tests/moe_ep/run_tests.sh sm90_bf16_push_cake # 2-GPU Hopper sm90_bf16_bf16_bf16_push_cake (native BF16) backend
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_bf16   # 4-GPU bf16 split-path numerics
@@ -196,10 +197,10 @@ run_comm() {
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_communication_multirank.py -v || return 1
-  # NVLink one-sided's Lamport transport against its fence transport.
+  # NVLink one-sided's sentinel protocol against its fence protocol.
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
-    tests/moe_ep/test_nvlink_one_sided_lamport.py -v || return 1
+    tests/moe_ep/test_nvlink_one_sided_sentinel.py -v || return 1
   # Spawns one process per EP rank itself; cases needing more GPUs skip.
   "${PY}" -m pytest "${MOE_EP_PYTEST_FLAGS[@]}" tests/moe_ep/test_nvlink_one_sided.py -v
 }
@@ -618,6 +619,7 @@ run_all() {
 # Single-target runs must still propagate failure (print_summary returns
 # non-zero if any section failed) so CI callers see a real exit code.
 case "${1:-all}" in
+  qualify_bi) "${PY}" tests/moe_ep/qualify_batch_invariant.py --suite all --world-size "${NPROC_MULTIRANK}" --output-dir "${BI_QUALIFICATION_OUTPUT:-${TMPDIR:-/tmp}/flashinfer-bi-$$}" ;;
   qualify_sm107) "${PY}" tests/moe_ep/qualify_sm107.py --suite all --world-size "${NPROC_MULTIRANK}" --output-dir "${SM107_RESULTS_DIR:-/tmp/flashinfer-sm107-qualification}" ;;
   unit) run_section "unit + mock (no multirank)" run_unit; print_summary ;;
   oracle) run_section "torch-oracle correctness (1 GPU)" run_oracle; print_summary ;;
@@ -643,7 +645,7 @@ case "${1:-all}" in
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm90_mxfp4|oracle_sm107|qualify_sm107|multirank|comm|sm90_push|sm90_bf16_push_cake|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm90_mxfp4|mega_sm90_nvfp4|mega_sm120|mega_sm120_cake|mega_sm107|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm90_mxfp4|oracle_sm107|qualify_sm107|qualify_bi|multirank|comm|sm90_push|sm90_bf16_push_cake|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm90_mxfp4|mega_sm90_nvfp4|mega_sm120|mega_sm120_cake|mega_sm107|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

@@ -160,9 +160,16 @@ class Sm107BlockScaledMoeConfig:
     activation: Literal["swiglu", "situ"] = "swiglu"
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
+    swiglu_alpha: Optional[float] = dataclasses.field(default=None, kw_only=True)
+    swiglu_beta: Optional[float] = dataclasses.field(default=None, kw_only=True)
 
     kernel_variant: Literal["inference", "genphase"] = "inference"
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
+    batch_invariant: bool = dataclasses.field(default=False, kw_only=True)
+    input_norm_const: float = dataclasses.field(default=1.0, kw_only=True)
+    has_fc1_alpha: bool = dataclasses.field(default=True, kw_only=True)
+    has_fc2_alpha: bool = dataclasses.field(default=True, kw_only=True)
+    has_fc1_norm_const: bool = dataclasses.field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
         if self.quant_kind not in _KIND_TABLE:
@@ -183,16 +190,24 @@ class Sm107BlockScaledMoeConfig:
             raise ValueError(
                 "NVFP4 combine bulk stores require a token-back data path."
             )
+        if (
+            not self.batch_invariant
+            and type(self).__name__ != "Sm100BlockScaledMoeConfig"
+            and (self.swiglu_alpha is not None or self.swiglu_beta is not None)
+        ):
+            raise ValueError("custom activation constants require batch_invariant=True")
         if self.activation not in ("swiglu", "situ"):
             raise ValueError("activation must be 'swiglu' or 'situ'.")
-        if self.activation == "situ":
+        if self.activation == "situ" and not self.batch_invariant:
             for name in ("situ_beta", "situ_linear_beta"):
                 value = getattr(self, name)
                 if value is None or not math.isfinite(value) or value <= 0:
                     raise ValueError(f"SiTU requires positive, finite {name}.")
             if self.gate_up_clamp is not None:
                 raise ValueError("SiTU does not support gate_up_clamp.")
-        elif self.situ_beta is not None or self.situ_linear_beta is not None:
+        elif self.activation != "situ" and (
+            self.situ_beta is not None or self.situ_linear_beta is not None
+        ):
             raise ValueError("SiTU beta parameters require activation='situ'.")
         for name in (
             "num_total_experts",
@@ -359,8 +374,10 @@ class Sm107BlockScaledMoeConfig:
             type(self.max_sm_count) is not int or self.max_sm_count < cm
         ):
             raise ValueError("max_sm_count must accommodate at least one cluster.")
-        if self.gate_up_clamp is not None and (
-            not math.isfinite(self.gate_up_clamp) or self.gate_up_clamp < 0
+        if (
+            not self.batch_invariant
+            and self.gate_up_clamp is not None
+            and (not math.isfinite(self.gate_up_clamp) or self.gate_up_clamp < 0)
         ):
             raise ValueError("gate_up_clamp must be finite and nonnegative.")
         if self.fc2_tma_stages is not None and not (
@@ -427,6 +444,22 @@ class Sm107BlockScaledMoeConfig:
                     "GenPhase does not use token-back or token-in flag knobs."
                 )
 
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+            validate_block_scaled_batch_invariant,
+        )
+
+        if type(self.batch_invariant) is not bool:
+            raise ValueError("batch_invariant must be a bool.")
+        if self.batch_invariant:
+            # NVFP4 binds three expert scalars; MX modes have no such operands.
+            expected_scalars = self.quant_kind == "nvfp4"
+            for name in ("has_fc1_alpha", "has_fc2_alpha", "has_fc1_norm_const"):
+                if getattr(self, name) is not expected_scalars:
+                    raise ValueError(
+                        f"batch_invariant workspace requires {name}={expected_scalars}."
+                    )
+        validate_block_scaled_batch_invariant(self, arch="sm_107")
+
     @property
     def experts_per_rank(self) -> int:
         return self.num_total_experts // self.world_size
@@ -475,18 +508,25 @@ class Sm107BlockScaledSymmBuffer:
     Create via :func:`get_symm_buffer_for_sm107_block_scaled_mega_moe`.
     """
 
-    def __init__(self, config: Sm107BlockScaledMoeConfig) -> None:
+    def __init__(
+        self, config: Sm107BlockScaledMoeConfig, *, process_group=None
+    ) -> None:
         """Allocate session buffers, including independent NVFP4 default scalars."""
-        comm.ensure_not_capturing("SM107 mega workspace allocation")
-        _require_sm107()
-        _configure_dsl_arch()
         self.config = config
-        self.device = torch.device("cuda", torch.cuda.current_device())
+        self._process_group = process_group
+        prepared = comm.prepare_local(
+            self._prepare_session_local,
+            config.world_size,
+            process_group,
+            phase="session local allocation",
+        )
+        execution = prepared.pop("execution")
+        self.device = prepared.pop("device")
+        self.kernel = prepared.pop("kernel")
+        self.sf_cols = prepared.pop("sf_cols")
+        self.topk_idx = prepared.pop("topk_idx")
+        self.__dict__.update(prepared)
         cfg = config
-
-        kernel = self._build_kernel(cfg)
-        self.kernel = kernel
-
         tokens = cfg.padded_tokens_per_rank
 
         # Staging tensors. Activation / SF / scores are pulled by peer dispatch
@@ -496,39 +536,10 @@ class Sm107BlockScaledSymmBuffer:
             self.x = comm.sym_zeros((tokens, cfg.hidden // 2), cfg.torch_act_data_dtype)
         else:
             self.x = comm.sym_zeros((tokens, cfg.hidden), cfg.torch_act_data_dtype)
-        self.sf_cols = int(
-            kernel.token_comm.plain_activation_sf_row_elements
-            if cfg.kernel_variant == "genphase"
-            else kernel.token_comm.activation_sf_hidden_padded
-        )
         self.x_sf = comm.sym_zeros((tokens, self.sf_cols), cfg.torch_act_sf_dtype)
         self.topk_weights = comm.sym_zeros((tokens, cfg.num_topk), torch.float32)
-        self.topk_idx = torch.full(
-            (tokens, cfg.num_topk), -1, dtype=torch.int32, device="cuda"
-        )
-        # Stable local-expert pointers allow per-call scaling updates in graphs.
-        # Mutable tensors serve explicit low-level calls and layout fallbacks.
-        # Backend defaults bind a separate read-only ones tensor, which cannot
-        # be overwritten by another layer or graph using these mutable tensors.
-        for name in _SCALAR_NAMES:
-            setattr(
-                self,
-                name,
-                torch.ones(
-                    cfg.experts_per_rank, dtype=torch.float32, device=self.device
-                )
-                if cfg.quant_kind == "nvfp4"
-                else None,
-            )
-        self._default_scalar = (
-            torch.ones(cfg.experts_per_rank, dtype=torch.float32, device=self.device)
-            if cfg.quant_kind == "nvfp4"
-            else None
-        )
-        if self.topk_idx.data_ptr() % 16 != 0:
-            raise RuntimeError("routing index tensor must be 16-byte aligned.")
 
-        self._allocate_execution_state()
+        self._allocate_execution_state(prepared=execution)
         self._staged_tokens: Optional[int] = None
         self._destroyed = False
         self._tuning_state = AutoTuningState()
@@ -537,7 +548,92 @@ class Sm107BlockScaledSymmBuffer:
         # Missing scalar bindings use the workspace's own tensors.
         self._bound_scalars: dict = {}
 
-    def _allocate_execution_state(self) -> None:
+        self._validate_batch_invariant_scalars()
+
+    def _prepare_session_local(self) -> dict:
+        """Finish every local allocation before entering the symmetric heap."""
+        comm.ensure_not_capturing("SM107 mega workspace allocation")
+        _require_sm107()
+        _configure_dsl_arch()
+        cfg = self.config
+        device = torch.device("cuda", torch.cuda.current_device())
+        kernel = self._build_kernel(cfg)
+        prepared = dict(
+            device=device,
+            kernel=kernel,
+            sf_cols=int(
+                kernel.token_comm.plain_activation_sf_row_elements
+                if cfg.kernel_variant == "genphase"
+                else kernel.token_comm.activation_sf_hidden_padded
+            ),
+            topk_idx=torch.full(
+                (cfg.padded_tokens_per_rank, cfg.num_topk),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            ),
+            execution=self._prepare_execution_local(cfg, kernel),
+        )
+        for name in (*_SCALAR_NAMES, "_default_scalar"):
+            prepared[name] = (
+                torch.ones(cfg.experts_per_rank, dtype=torch.float32, device=device)
+                if cfg.quant_kind == "nvfp4"
+                else None
+            )
+            if (
+                name in _SCALAR_NAMES
+                and cfg.batch_invariant
+                and getattr(cfg, f"has_{name}") is not (prepared[name] is not None)
+            ):
+                raise ValueError(
+                    f"batch_invariant scale presence does not match {name}."
+                )
+        if prepared["topk_idx"].data_ptr() % 16:
+            raise RuntimeError("routing index tensor must be 16-byte aligned.")
+        return prepared
+
+    def _validate_batch_invariant_scalars(self) -> None:
+        if not self.config.batch_invariant:
+            return
+        for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+            if getattr(self.config, f"has_{name}") is not (
+                getattr(self, name) is not None
+            ):
+                raise ValueError(
+                    f"batch_invariant scale presence does not match {name}."
+                )
+
+    @property
+    def batch_invariant_fingerprint(self) -> Optional[str]:
+        if not self.config.batch_invariant:
+            return None
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_fingerprint,
+        )
+
+        self._validate_batch_invariant_scalars()
+        return block_scaled_batch_invariant_fingerprint(self.config, arch="sm_107")
+
+    def _prepare_execution_local(self, cfg, kernel) -> dict:
+        workspace = kernel._device_workspace
+        local_bytes = int(workspace.total_bytes("local"))
+        local = torch.zeros((max(local_bytes, 1),), dtype=torch.uint8, device="cuda")
+        if local.data_ptr() % 128:
+            raise RuntimeError("SM107 mega workspaces must be 128-byte aligned.")
+        return dict(
+            local_workspace=local,
+            output_activation=(
+                None
+                if cfg.reduce_topk_in_kernel
+                else torch.zeros(
+                    (cfg.padded_tokens_per_rank, cfg.hidden),
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+            ),
+        )
+
+    def _allocate_execution_state(self, *, prepared=None) -> None:
         """Allocate reduction buffers and scratch, then reset cached bindings.
 
         Peer-written buffers use symmetric allocations; separate-reduce output
@@ -545,6 +641,13 @@ class Sm107BlockScaledSymmBuffer:
         """
         cfg, kernel = self.config, self.kernel
         tokens = cfg.padded_tokens_per_rank
+        if prepared is None:
+            prepared = comm.prepare_local(
+                lambda: self._prepare_execution_local(cfg, kernel),
+                cfg.world_size,
+                getattr(self, "_process_group", None),
+                phase="kernel local allocation",
+            )
         # In-kernel reduce: the combine peer-writes (red.add) each topk term
         # straight into the output, so it must live on the SYMMETRIC heap and
         # start zeroed; the separate-reduce path only sees local stores.
@@ -553,18 +656,24 @@ class Sm107BlockScaledSymmBuffer:
                 (tokens, cfg.hidden), torch.bfloat16
             )
         else:
-            self.output_activation = torch.zeros(
-                (tokens, cfg.hidden), dtype=torch.bfloat16, device="cuda"
-            )
+            self.output_activation = prepared["output_activation"]
 
         workspace = kernel._device_workspace
-        local_bytes = int(workspace.total_bytes("local"))
         shared_bytes = int(workspace.total_bytes("shared"))
         # Allocated fully zeroed, which covers require_zero_workspace_leading_bytes.
-        self.local_workspace = torch.zeros(
-            (max(local_bytes, 1),), dtype=torch.uint8, device="cuda"
-        )
+        self.local_workspace = prepared["local_workspace"]
         self.shared_workspace = comm.sym_zeros((max(shared_bytes, 1),), torch.uint8)
+        comm.prepare_local(
+            self._bind_execution_state,
+            cfg.world_size,
+            getattr(self, "_process_group", None),
+            phase="symmetric workspace binding",
+        )
+
+    def _bind_execution_state(self) -> None:
+        cfg, kernel = self.config, self.kernel
+        tokens = cfg.padded_tokens_per_rank
+        workspace = kernel._device_workspace
         self._pre_reduced_activation = None
         self._pre_reduced_activation_sf = None
         if not cfg.reduce_topk_in_kernel:
@@ -615,6 +724,11 @@ class Sm107BlockScaledSymmBuffer:
         from sources.api import ImplDesc, ProblemDesc
         from sources.quant_def import CombineFormat
 
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+            validate_block_scaled_batch_invariant,
+        )
+
+        validate_block_scaled_batch_invariant(cfg, arch="sm_107")
         tiler = cfg.resolved_mma_tiler_mnk
         cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
         preferred_count: Optional[int] = None
@@ -655,9 +769,24 @@ class Sm107BlockScaledSymmBuffer:
             fallback_count = remaining // split_factor * split_factor
             launch_clusters = preferred_count + fallback_count // split_factor
 
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+            batch_invariant_activation,
+        )
+
+        activation_variant = (
+            batch_invariant_activation(cfg, family="next107", nondefault_only=True)
+            if cfg.batch_invariant
+            else None
+        )
         problem_desc = ProblemDesc(
             {
                 "expert_count": cfg.num_total_experts,
+                "batch_invariant": cfg.batch_invariant,
+                **(
+                    {"batch_invariant_activation": activation_variant}
+                    if activation_variant is not None
+                    else {}
+                ),
                 "intermediate_gateup_size": 2 * cfg.intermediate,
                 "hidden_size": cfg.hidden,
                 "quant_kind": cfg.quant_kind,
@@ -670,9 +799,13 @@ class Sm107BlockScaledSymmBuffer:
                         "mxfp8": "32e4m3xe8m0",
                     }[cfg.combine_dtype]
                 ),
-                "gate_up_clamp": cfg.gate_up_clamp,
-                "situ_beta": cfg.situ_beta,
-                "situ_linear_beta": cfg.situ_linear_beta,
+                "gate_up_clamp": None
+                if activation_variant is not None
+                else cfg.gate_up_clamp,
+                "situ_beta": None if activation_variant is not None else cfg.situ_beta,
+                "situ_linear_beta": None
+                if activation_variant is not None
+                else cfg.situ_linear_beta,
                 "world_size": cfg.world_size,
                 "topk": cfg.num_topk,
                 "topk_index_dtype": cutlass.Int32,
@@ -821,7 +954,9 @@ class Sm107BlockScaledSymmBuffer:
             raise RuntimeError(
                 "SM107 workspace must launch on the CUDA device that owns it."
             )
+        self._validate_batch_invariant_scalars()
         key = (
+            self.batch_invariant_fingerprint,
             transformed_l1[0].data_ptr(),
             transformed_l1[1].data_ptr(),
             transformed_l2[0].data_ptr(),
@@ -910,11 +1045,15 @@ class Sm107BlockScaledSymmBuffer:
         """Replace output and scratch before capture, retaining staged inputs."""
         import dataclasses
 
-        comm.ensure_not_capturing("SM107 tuning winner installation")
-        if self._destroyed or self._tuning_state.graph_captured:
-            raise RuntimeError("cannot tune a destroyed or captured SM107 workspace")
-        config = dataclasses.replace(self.config, **knobs)
-        if config != self.config:
+        def prepare_replacement():
+            comm.ensure_not_capturing("SM107 tuning winner installation")
+            if self._destroyed or self._tuning_state.graph_captured:
+                raise RuntimeError(
+                    "cannot tune a destroyed or captured SM107 workspace"
+                )
+            config = dataclasses.replace(self.config, **knobs)
+            if config == self.config:
+                return None
             kernel = self._build_kernel(config)
             sf_cols = int(
                 kernel.token_comm.plain_activation_sf_row_elements
@@ -923,11 +1062,27 @@ class Sm107BlockScaledSymmBuffer:
             )
             if sf_cols != self.sf_cols:
                 raise ValueError("tuning cannot change the staged scale layout")
+            local = self._prepare_execution_local(config, kernel)
             torch.cuda.synchronize()
+            return config, kernel, local
+
+        prepared = comm.prepare_local(
+            prepare_replacement,
+            self.config.world_size,
+            self._process_group,
+            phase="winner local allocation",
+        )
+        if prepared is not None:
+            config, kernel, local = prepared
             self._release_execution_state()
             self.config, self.kernel = config, kernel
-            self._allocate_execution_state()
-        self.prepare(transformed_l1, transformed_l2)
+            self._allocate_execution_state(prepared=local)
+        comm.prepare_local(
+            lambda: self.prepare(transformed_l1, transformed_l2),
+            self.config.world_size,
+            self._process_group,
+            phase="winner compilation",
+        )
 
     def destroy(self) -> None:
         """Drain outstanding work and collectively release the session buffers."""
@@ -985,6 +1140,14 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     activation: Literal["swiglu", "situ"] = "swiglu",
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    batch_invariant: bool = False,
+    input_norm_const: float = 1.0,
+    has_fc1_alpha: bool = True,
+    has_fc2_alpha: bool = True,
+    has_fc1_norm_const: bool = True,
+    process_group=None,
 ) -> Sm107BlockScaledSymmBuffer:
     """Allocate the SM107 block-scaled mega session workspace.
 
@@ -1003,6 +1166,11 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
         quant_kind=quant_kind,
         kernel_variant=kernel_variant,
         combine_dtype=combine_dtype,
+        batch_invariant=batch_invariant,
+        input_norm_const=input_norm_const,
+        has_fc1_alpha=has_fc1_alpha,
+        has_fc2_alpha=has_fc2_alpha,
+        has_fc1_norm_const=has_fc1_norm_const,
         mma_tiler_mnk=mma_tiler_mnk,
         cluster_shape_mn=cluster_shape_mn,
         fallback_cluster_shape_mn=fallback_cluster_shape_mn,
@@ -1022,8 +1190,10 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
         activation=activation,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
-    return Sm107BlockScaledSymmBuffer(config)
+    return Sm107BlockScaledSymmBuffer(config, process_group=process_group)
 
 
 def _expected_weight_shapes(

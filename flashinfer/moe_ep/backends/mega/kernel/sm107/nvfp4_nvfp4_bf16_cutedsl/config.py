@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Optional, Tuple
 
 from flashinfer.moe_ep._compat import deprecated_aliases
@@ -27,6 +27,7 @@ class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     intermediate_size: int  # width after activation; FC1 N is 2*intermediate_size
     top_k: int
     kernel_name: str = "sm107_nvfp4_nvfp4_bf16_cutedsl"
+    batch_invariant: bool = field(default=False, kw_only=True)
     gate_up_clamp: Optional[float] = None
     fast_math: bool = True  # accepted for mega API parity; no kernel toggle
     in_kernel_fc2_reduce: bool = False
@@ -53,6 +54,8 @@ class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     activation: Literal["swiglu", "situ"] = "swiglu"
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
+    swiglu_alpha: Optional[float] = field(default=None, kw_only=True)
+    swiglu_beta: Optional[float] = field(default=None, kw_only=True)
     input_norm_const: float = 1.0
     fc1_alpha: Optional["torch.Tensor"] = None
     fc2_alpha: Optional["torch.Tensor"] = None
@@ -62,3 +65,23 @@ class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     kernel_variant: Literal["inference", "genphase", "auto"] = "inference"
     # Quantizes the FC2 return payload; the operator still returns BF16.
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
+
+    def __post_init__(self) -> None:
+        if not self.batch_invariant and (
+            self.swiglu_alpha is not None or self.swiglu_beta is not None
+        ):
+            raise ValueError(
+                "custom Rubin activation constants require batch_invariant=True"
+            )
+        if type(self.batch_invariant) is not bool:
+            raise ValueError("batch_invariant must be a bool.")
+        if self.batch_invariant:
+            from ...sm100.common.nvfp4_batch_invariant import (
+                validate_nvfp4_batch_invariant,
+            )
+
+            if self.kernel_name != "sm107_nvfp4_nvfp4_bf16_cutedsl":
+                raise ValueError(
+                    "batch_invariant requires the specified SM107 NVFP4 backend"
+                )
+            validate_nvfp4_batch_invariant(self, arch="sm_107")

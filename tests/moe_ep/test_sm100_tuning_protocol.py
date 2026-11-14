@@ -21,6 +21,7 @@ from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe import (
 )
 from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
     autotune as native,
+    correctness,
     knob_cache,
     tuning,
     tuning_protocol,
@@ -30,6 +31,70 @@ from flashinfer.moe_ep.backends.mega.kernel.sm100 import automatic
 
 class Workspace(SimpleNamespace):
     _build_kernel = staticmethod(lambda cfg: None)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_tokens", [0, 1, 512, 8192])
+@pytest.mark.parametrize("sample_size", [1, 64])
+def test_reference_row_sampling_under_model_default_dtype(
+    monkeypatch, dtype, num_tokens, sample_size
+):
+    def on_cpu(factory):
+        def call(*args, **kwargs):
+            kwargs["device"] = "cpu"
+            return factory(*args, **kwargs)
+
+        return call
+
+    monkeypatch.setattr(torch, "arange", on_cpu(torch.arange))
+    monkeypatch.setattr(torch, "linspace", on_cpu(torch.linspace))
+    config = SimpleNamespace(
+        rank=0,
+        world_size=1,
+        experts_per_rank=1,
+        quant_kind="nvfp4",
+        combine_dtype="bf16",
+        batch_invariant=False,
+        gate_up_clamp=None,
+        apply_routing_weights_before_fc2=False,
+        situ_beta=None,
+        situ_linear_beta=None,
+    )
+    row_ids = torch.arange(num_tokens, dtype=torch.int64)
+    x = torch.stack((row_ids % 256, row_ids // 256), dim=1).to(torch.uint8)
+    workspace = SimpleNamespace(
+        config=config,
+        x=x,
+        x_sf=torch.zeros((num_tokens, 1), dtype=torch.uint8),
+        topk_idx=torch.zeros((num_tokens, 1), dtype=torch.int32),
+        topk_weights=torch.ones((num_tokens, 1), dtype=torch.float32),
+    )
+    weights = (torch.zeros((1, 1, 1)), torch.zeros((1, 1, 1)))
+    monkeypatch.setattr(
+        correctness,
+        "compute_megamoe_reference_block_scaled",
+        lambda inputs, *args, **kwargs: inputs.float(),
+    )
+    original = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(dtype)
+        indices, expected = correctness.sampled_reference(
+            workspace, weights, weights, num_tokens, sample_size=sample_size
+        )
+    finally:
+        torch.set_default_dtype(original)
+    assert indices.dtype == torch.int64
+    assert len(indices) == min(num_tokens, sample_size)
+    if num_tokens:
+        assert int(indices[0]) == 0
+        assert int(indices[-1]) == (num_tokens - 1 if len(indices) > 1 else 0)
+        assert bool((indices[1:] > indices[:-1]).all())
+        if len(indices) > 1:
+            # Each index rounds its ideal position down by less than one row.
+            steps = len(indices) - 1
+            for sample, row in enumerate(indices.tolist()):
+                assert row * steps <= sample * (num_tokens - 1) < (row + 1) * steps
+    torch.testing.assert_close(expected, x[indices].bfloat16())
 
 
 @pytest.fixture(params=["standard", "genphase"])
@@ -252,7 +317,9 @@ def test_standard_grid_is_complete_unique_and_fixed_numerics(kind):
         cfg = dataclasses.replace(cfg, mma_tiler_mnk=(256, 128, 256))
     candidates = tuning.sm100_standard_candidates(cfg, allow_nondeterministic=True)
     assert len({json.dumps(c, sort_keys=True) for c in candidates}) == len(candidates)
-    assert {c["mma_tiler_mnk"][1] for c in candidates} == {128, 256}
+    assert {c["mma_tiler_mnk"][1] for c in candidates} == (
+        {64, 128, 256} if kind == "nvfp4" else {128, 256}
+    )
     assert {c["reduce_topk_in_kernel"] for c in candidates} == {False, True}
     assert {c["fc2_use_bulk"] for c in candidates} == {False, True}
     for knobs in candidates:
@@ -539,3 +606,33 @@ def test_native_cold_policy_has_one_call_per_flush(state):
         settings = measurement_settings(automatic.tuning_context())
         assert settings["calls_per_sample"] == 1
         assert settings["cold_l2"] and settings["cuda_graph_profile_replays"] == 1
+
+
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
+def test_standard_n64_preserves_cache_contract(kind):
+    cfg = Sm100BlockScaledMoeConfig(
+        num_total_experts=8,
+        max_tokens_per_rank=128,
+        num_topk=2,
+        hidden=512,
+        intermediate=256,
+        rank=0,
+        world_size=1,
+        quant_kind=kind,
+    )
+    candidates = tuning.sm100_standard_candidates(cfg)
+    small = [k for k in candidates if k["mma_tiler_mnk"][1] == 64]
+    key = knob_cache._key(cfg, device="test")
+    if kind == "nvfp4":
+        assert small
+        assert key["backend_revision"] == "sm100-standard-auto-v1"
+        assert key["problem"]["token_padding_block"] == 64
+        for knobs in small:
+            assert knobs["fc2_tma_stages"] == (1 if knobs["fc2_use_bulk"] else None)
+            changed = dataclasses.replace(cfg, **knobs)
+            assert knob_cache._key(changed, device="test") == key
+    else:
+        assert not small
+        assert key["backend_revision"] == "sm100-standard-auto-v1"
+        assert key["problem"]["token_padding_block"] == 64
+        assert all("token_padding_block" not in knobs for knobs in candidates)

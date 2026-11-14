@@ -149,7 +149,7 @@ def test_gb300_table_is_the_152_sm_sm103a_part(monkeypatch):
 
 def test_rule_tables_ship_the_measured_rows():
     assert runtime.M64_OWNER_HELPER_MIN_SEQ_LEN == ((36, 1024), (48, 2048, 1))
-    assert runtime.M64_OWNER_HELPER_MIN_SEQ_LEN_GB300 == ((36, 1024),)
+    assert runtime.M64_OWNER_HELPER_MIN_SEQ_LEN_GB300 == ((36, 1024), (50, 2048, 1))
 
 
 @pytest.mark.parametrize("arch,sm_count", [("sm_100a", 148), ("sm_103a", 152)])
@@ -164,13 +164,14 @@ def test_shipped_rows_take_long_launches_up_to_36_tasks(monkeypatch, arch, sm_co
     assert count(total_tasks=8, min_seq_len=1024) == 2
     assert count(total_tasks=36, min_seq_len=16384) == 2
     assert count(total_tasks=36, min_seq_len=1023) == 0
-    # The B200 row of one helper (the hybrid build's): 37 to 48 tasks at 2048
-    # tokens or more; the GB300 table stops at 36 tasks.
-    one = 1 if arch == "sm_100a" else 0
-    assert count(total_tasks=37, min_seq_len=4096) == one
-    assert count(total_tasks=48, min_seq_len=2048) == one
+    # The row of one helper (the hybrid build's): 37 to 48 tasks on B200 and
+    # 37 to 50 on GB300, at 2048 tokens or more.
+    last = 48 if arch == "sm_100a" else 50
+    assert count(total_tasks=37, min_seq_len=4096) == 1
+    assert count(total_tasks=48, min_seq_len=2048) == 1
     assert count(total_tasks=48, min_seq_len=2047) == 0
-    assert count(total_tasks=49, min_seq_len=4096) == 0
+    assert count(total_tasks=last, min_seq_len=2048) == 1
+    assert count(total_tasks=last + 1, min_seq_len=4096) == 0
 
 
 class _Raising(contextlib.AbstractContextManager):
@@ -611,16 +612,19 @@ def test_hybrid_rule_without_the_build_keeps_the_pair_share_program(
 
 
 @pytest.mark.parametrize(("arch", "capability", "sm_count"), PARTS, ids=PART_IDS)
-def test_shipped_rules_take_the_hybrid_build_on_b200_only(
+def test_shipped_rules_take_the_hybrid_build_on_both_parts(
     planner, arch, capability, sm_count
 ):
-    planner.configure(arch, rows=SHIPPED_RULES[arch])
+    planner.configure(arch, rows=SHIPPED_RULES[arch], capacity=sm_count)
     plan = _plan([4096] * 4, 12)
-    if arch == "sm_100a":
-        assert plan.schedule == HYBRID_SCHEDULE and plan.module.name == HYBRID
+    assert plan.schedule == HYBRID_SCHEDULE and plan.module.name == HYBRID
+    assert plan.m64_owner_helpers == 1 and plan.grid == (48, 3, 1)
+    # 50 tasks: the GB300 row takes the launch, the B200 table stops at 48.
+    plan = _plan([4096] * 5, 10)
+    if arch == "sm_103a":
+        assert plan.schedule == HYBRID_SCHEDULE and plan.grid == (50, 3, 1)
     else:
-        assert plan.schedule == BASE + "_pair_share" and plan.m64_owner_helpers == 0
-        assert HYBRID not in {kernel.name for kernel in _Kernel.made}
+        assert plan.m64_owner_helpers == 0 and plan.schedule == BASE
 
 
 def test_refused_hybrid_launch_switches_the_plan_to_its_pair_share_program(

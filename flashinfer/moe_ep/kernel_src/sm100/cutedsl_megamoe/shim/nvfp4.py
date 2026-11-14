@@ -131,8 +131,21 @@ class MegaMoENvfp4Config:
     # gated activation (``real = fc1_alpha * scale_t * acc``).  Lets the caller
     # quantize ``x_t / scale_t`` to NVFP4 without losing the per-token range.
     enable_fc1_activation_per_token_scale: bool = False
+    batch_invariant: bool = dataclasses.field(default=False, kw_only=True)
+    input_norm_const: float = dataclasses.field(default=1.0, kw_only=True)
+    has_fc1_alpha: bool = dataclasses.field(default=True, kw_only=True)
+    has_fc2_alpha: bool = dataclasses.field(default=True, kw_only=True)
+    has_fc1_norm_const: bool = dataclasses.field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
+        if type(self.batch_invariant) is not bool:
+            raise ValueError("batch_invariant must be a bool")
+        if self.batch_invariant:
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+                validate_nvfp4_batch_invariant,
+            )
+
+            validate_nvfp4_batch_invariant(self, implementation="legacy")
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
             raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
         if self.world_size < 1:
@@ -192,7 +205,7 @@ class MegaMoENvfp4Config:
                 raise ValueError(
                     "situ_linear_beta must be positive and finite when set."
                 )
-            if self.gate_up_clamp is not None:
+            if not self.batch_invariant and self.gate_up_clamp is not None:
                 raise ValueError("gate_up_clamp is not supported with SiTU.")
         elif self.situ_beta is not None or self.situ_linear_beta is not None:
             raise ValueError("SiTU parameters require activation='situ'.")
@@ -319,6 +332,7 @@ class MegaMoENvfp4Frontend:
         self._gate_up_clamp = config.gate_up_clamp
         self._mega_key: Optional[tuple] = None
         self._mega: Optional[_CompiledMega] = None
+        self._compile_prepare: Optional[dict] = None
 
     @property
     def config(self) -> MegaMoENvfp4Config:
@@ -329,6 +343,14 @@ class MegaMoENvfp4Frontend:
 
     def set_gate_up_clamp(self, clamp: Optional[float]) -> None:
         """Update ``gate_up_clamp`` and invalidate compile cache when it changes."""
+        if self._config.batch_invariant:
+            from flashinfer.moe_ep.batch_invariant.spec import f32_bits
+
+            def bits(value):
+                return None if value is None else f32_bits(abs(value))
+
+            if bits(clamp) != bits(self._config.gate_up_clamp):
+                raise ValueError("batch_invariant NVFP4 clamp is fixed at construction")
         if self._gate_up_clamp == clamp:
             return
         ensure_not_capturing("set_gate_up_clamp (clamp change)")
@@ -338,6 +360,23 @@ class MegaMoENvfp4Frontend:
 
     def set_swiglu_params(self, alpha: Optional[float], beta: Optional[float]) -> None:
         """Set uniform activation constants and invalidate the compiled session."""
+        if self.config.batch_invariant:
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+                batch_invariant_activation,
+            )
+
+            changed = dataclasses.replace(
+                self.config, swiglu_alpha=alpha, swiglu_beta=beta
+            )
+            if (
+                batch_invariant_activation(changed, family="nvfp4_legacy").signature
+                != batch_invariant_activation(
+                    self.config, family="nvfp4_legacy"
+                ).signature
+            ):
+                raise ValueError(
+                    "batch_invariant NVFP4 activation is fixed at construction"
+                )
         if (alpha, beta) == (self._config.swiglu_alpha, self._config.swiglu_beta):
             return
         new_config = dataclasses.replace(
@@ -442,6 +481,8 @@ class MegaMoENvfp4Frontend:
             # full raw buffer so stale rows beyond a partial num_tokens can't
             # leak from an earlier, larger launch.
             inputs.output_activation.zero_()
+        if self.config.batch_invariant and self.config.use_custom_finalize:
+            self.custom_finalize_workspace()[0].zero_()
         mega.compiled(**mega.launch_kwargs)
 
         # Zero-break capture gate: a device synchronize would abort stream
@@ -481,11 +522,15 @@ class MegaMoENvfp4Frontend:
 
             def thunk() -> None:
                 output_activation.zero_()
+                if self.config.batch_invariant and self.config.use_custom_finalize:
+                    self.custom_finalize_workspace()[0].zero_()
                 compiled(**runtime_kwargs)
 
         else:
 
             def thunk() -> None:
+                if self.config.batch_invariant and self.config.use_custom_finalize:
+                    self.custom_finalize_workspace()[0].zero_()
                 compiled(**runtime_kwargs)
 
         return thunk
@@ -560,6 +605,16 @@ class MegaMoENvfp4Frontend:
     # Compile cache
     # ------------------------------------------------------------------
 
+    @property
+    def batch_invariant_fingerprint(self) -> Optional[str]:
+        if not self.config.batch_invariant:
+            return None
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_fingerprint,
+        )
+
+        return nvfp4_batch_invariant_fingerprint(self.config, implementation="legacy")
+
     def _mega_compile_key(self) -> tuple:
         c = self.config
         return (
@@ -595,24 +650,98 @@ class MegaMoENvfp4Frontend:
             c.swiglu_beta,
             c.enable_iket,
             c.enable_fc1_activation_per_token_scale,
+            c.batch_invariant,
+            self.batch_invariant_fingerprint,
         )
 
     def _ensure_mega_compiled(self, inputs: MegaMoENvfp4Inputs) -> _CompiledMega:
         key = self._mega_compile_key()
-        if self._mega is not None and self._mega_key == key:
+        if (
+            self._mega is not None
+            and self._mega_key == key
+            and self._mega.compiled is not None
+        ):
             return self._mega
+        if self._compile_prepare is None:
+            prepared = self._prepare_compile_local()
+            self._release_workspace()
+            self._compile_prepare = prepared
+            self._allocate_compile_local()
+            self._prepare_compile_symmetric()
+        return self._compile_prepared(inputs)
 
-        ensure_not_capturing("cute.compile + symmetric-heap allocation")
+    def prepare_tuning_local(self, knobs, *, config_overrides=None):
+        """Validate a candidate and construct its kernel without allocating storage."""
+        from .tuner import with_checked_knobs
+
+        trial = type(self)(with_checked_knobs(self.config, knobs))
+        overrides = dict(config_overrides or {})
+        if "gate_up_clamp" in overrides and hasattr(trial, "set_gate_up_clamp"):
+            trial.set_gate_up_clamp(overrides.pop("gate_up_clamp"))
+        if overrides:
+            changed = dataclasses.replace(trial.config, **overrides)
+            if trial.config.batch_invariant:
+                from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+                    batch_invariant_activation,
+                )
+
+                if (
+                    batch_invariant_activation(changed, family="nvfp4_legacy").signature
+                    != batch_invariant_activation(
+                        trial.config, family="nvfp4_legacy"
+                    ).signature
+                ):
+                    raise ValueError(
+                        "batch_invariant NVFP4 activation is fixed at construction"
+                    )
+            trial._config = changed
+        trial._compile_prepare = trial._prepare_compile_local()
+        return trial
+
+    def prepare_tuning_release(self, prepared):
+        """Release old storage collectively before allocating candidate scratch."""
+        if type(prepared) is not type(self):
+            raise TypeError("incompatible MegaMoE tuning preparation")
         self._release_workspace()
+        self.__dict__.update(prepared.__dict__)
+
+    def prepare_tuning_allocate_local(self, prepared):
+        """Allocate only local scratch; peers agree before symmetric allocation."""
+        self._allocate_compile_local()
+
+    def prepare_tuning_collective(self, prepared):
+        """Allocate symmetric storage after every rank has local scratch."""
+        self._prepare_compile_symmetric()
+
+    def _prepare_compile_local(self):
+        ensure_not_capturing("cute.compile + symmetric-heap allocation")
 
         import cutlass
-        import cutlass.cute as cute
         from common.megamoe_constants import SfPaddingBlock
         from moe_nvfp4_swapab.epilogue_refactor import SwapABSwigluFp4Epilogue
         from moe_nvfp4_swapab.megamoe_kernel import Sm100MegaMoEKernel
         from src.token_comm import CombineFormat
 
         c = self.config
+        variant = None
+        if c.batch_invariant:
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+                batch_invariant_activation,
+            )
+
+            variant = batch_invariant_activation(
+                c, family="nvfp4_legacy", nondefault_only=True
+            )
+        if c.batch_invariant:
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+                validate_bf16_batch_invariant_compile_target,
+            )
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+                validate_nvfp4_batch_invariant,
+            )
+
+            validate_nvfp4_batch_invariant(c, implementation="legacy")
+            validate_bf16_batch_invariant_compile_target()
         # The kernel now takes a CombineFormat object (was a combine_dtype string)
         # and derives local_rank from the peer mapper (was a ctor arg).
         combine_format = CombineFormat.parse(COMBINE_FORMAT_NAMES[c.combine_dtype])
@@ -653,11 +782,11 @@ class MegaMoENvfp4Frontend:
             topk_reduce_persistent=c.use_persistent_finalize_kernel,
             token_back_mode=c.token_back_mode,
             apply_topk_in_fc1=c.apply_routing_weights_before_fc2,
-            gate_up_clamp=self._gate_up_clamp,
-            swiglu_alpha=c.swiglu_alpha,
-            swiglu_beta=c.swiglu_beta,
-            situ_beta=c.situ_beta,
-            situ_linear_beta=c.situ_linear_beta,
+            gate_up_clamp=None if variant is not None else self._gate_up_clamp,
+            swiglu_alpha=None if variant is not None else c.swiglu_alpha,
+            swiglu_beta=None if variant is not None else c.swiglu_beta,
+            situ_beta=None if variant is not None else c.situ_beta,
+            situ_linear_beta=None if variant is not None else c.situ_linear_beta,
             enable_fc1_activation_per_token_scale=(
                 c.enable_fc1_activation_per_token_scale
             ),
@@ -665,36 +794,68 @@ class MegaMoENvfp4Frontend:
             epi_flag_batch=c.epi_flag_batch,
             combine_format=combine_format,
         )
+        kernel.batch_invariant_chain = c.batch_invariant
+        if c.batch_invariant:
+            kernel.batch_invariant_activation = variant
+            kernel.batch_invariant_per_token_scale = (
+                c.enable_fc1_activation_per_token_scale
+            )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
-        local_workspace = torch.zeros(
-            (local_ws_bytes,),
-            dtype=torch.uint8,
-            device="cuda",
-        )
-        shared_workspace = sym_zeros((shared_ws_bytes,), torch.uint8)
-        symmetric_base, peer_offsets_list = _compute_peer_offsets(
-            shared_workspace,
-            c.world_size,
-        )
-
-        mega = _CompiledMega(
-            compiled=None,
+        return dict(
+            key=self._mega_compile_key(),
             kernel=kernel,
-            local_workspace=local_workspace,
-            shared_workspace=shared_workspace,
-            symmetric_base=symmetric_base,
-            peer_offsets_list=peer_offsets_list,
+            local_bytes=local_ws_bytes,
+            shared_bytes=shared_ws_bytes,
+            max_active_clusters=max_active_clusters,
         )
-        compile_kwargs = self._build_mega_runtime_kwargs(inputs, mega)
-        compile_kwargs["max_active_clusters"] = max_active_clusters
-        if c.enable_iket:
-            compile_kwargs["options"] = "iket"
 
-        mega.compiled = cute.compile(kernel, **compile_kwargs)
-        self._mega_key = key
-        self._mega = mega
-        return self._mega
+    def _allocate_compile_local(self):
+        p = self._compile_prepare
+        if p is None:
+            raise RuntimeError("missing local MegaMoE preparation")
+        try:
+            p["local_workspace"] = torch.zeros(
+                p["local_bytes"], dtype=torch.uint8, device="cuda"
+            )
+        except Exception:
+            # Retry local allocation without discarding owned symmetric storage.
+            p.clear()
+            self._compile_prepare = None
+            raise
+
+    def _prepare_compile_symmetric(self):
+        p = self._compile_prepare
+        if p is None:
+            raise RuntimeError("missing local MegaMoE preparation")
+        shared_workspace = sym_zeros((p["shared_bytes"],), torch.uint8)
+        # Retain ownership even if peer mapping or compilation subsequently fails.
+        self._mega = _CompiledMega(
+            compiled=None,
+            kernel=p["kernel"],
+            local_workspace=p["local_workspace"],
+            shared_workspace=shared_workspace,
+            symmetric_base=0,
+            peer_offsets_list=(),
+        )
+        self._mega.symmetric_base, self._mega.peer_offsets_list = _compute_peer_offsets(
+            shared_workspace, self.config.world_size
+        )
+
+    def _compile_prepared(self, inputs: MegaMoENvfp4Inputs) -> _CompiledMega:
+        import cutlass.cute as cute
+
+        p, mega = self._compile_prepare, self._mega
+        if p is None or mega is None:
+            raise RuntimeError("missing symmetric MegaMoE preparation")
+        kwargs = self._build_mega_runtime_kwargs(inputs, mega)
+        kwargs["max_active_clusters"] = p["max_active_clusters"]
+        if self.config.enable_iket:
+            kwargs["options"] = "iket"
+        mega.compiled = cute.compile(mega.kernel, **kwargs)
+        self._mega_key = p["key"]
+        self._compile_prepare = None
+        return mega
 
     # ------------------------------------------------------------------
     # Launch helpers
@@ -708,6 +869,9 @@ class MegaMoENvfp4Frontend:
         if self._mega is not None:
             ensure_not_capturing("workspace release (symmetric-heap free)")
             free_sym_tensor(self._mega.shared_workspace)
+        self._mega = None
+        self._mega_key = None
+        self._compile_prepare = None
 
     @staticmethod
     def _resolve_num_tokens(
@@ -1248,6 +1412,11 @@ def get_symm_buffer_for_mega_moe(
     fc2_alpha: Optional[PerExpertEpilogue] = None,
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
     enable_fc1_activation_per_token_scale: bool = False,
+    batch_invariant: bool = False,
+    input_norm_const: float = 1.0,
+    has_fc1_alpha: bool = True,
+    has_fc2_alpha: bool = True,
+    has_fc1_norm_const: bool = True,
     knobs: Optional[dict] = None,
 ) -> MegaMoESymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MegaMoE session.
@@ -1324,7 +1493,11 @@ def get_symm_buffer_for_mega_moe(
     num_experts_per_rank = num_total_experts // world_size
 
     from .knob_cache import resolve_knobs
-    from .tuner import with_checked_knobs
+    from .tuner import reject_explicit_knobs, with_checked_knobs
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+        NVFP4_BATCH_INVARIANT_VERSION,
+        nvfp4_batch_invariant_default_knobs,
+    )
 
     # knobs=None -> pure lookup: offline-tuned cache entry for this session
     # key when present, else the built-in token-count heuristic.  An explicit
@@ -1342,10 +1515,37 @@ def get_symm_buffer_for_mega_moe(
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
             apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
             use_custom_finalize=use_custom_finalize,
+            batch_invariant=batch_invariant,
+            batch_invariant_version=(
+                NVFP4_BATCH_INVARIANT_VERSION if batch_invariant else None
+            ),
+            gate_up_clamp=clamp,
+            input_norm_const=input_norm_const,
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            per_token_scale=enable_fc1_activation_per_token_scale,
         )
     else:
         knobs = dict(knobs)
 
+    reject_explicit_knobs(knobs)
+    config_knobs = {}
+    if batch_invariant:
+        config_knobs = nvfp4_batch_invariant_default_knobs("legacy")
+        if combine_dtype != "bf16":
+            config_knobs["token_back_mode"] = "reuse_dispatch_warps"
+        config_knobs.update(knobs)
+        fields = {field.name for field in dataclasses.fields(MegaMoENvfp4Config)}
+        config_knobs = {
+            key: value for key, value in config_knobs.items() if key in fields
+        }
+    config_knobs.setdefault(
+        "token_back_mode",
+        "reuse_dispatch_warps" if combine_dtype != "bf16" else "epi_warps",
+    )
     cfg = MegaMoENvfp4Config(
         rank=rank,
         world_size=world_size,
@@ -1366,11 +1566,14 @@ def get_symm_buffer_for_mega_moe(
         use_persistent_finalize_kernel=use_persistent_finalize_kernel,
         combine_dtype=combine_dtype,
         enable_fc1_activation_per_token_scale=enable_fc1_activation_per_token_scale,
+        batch_invariant=batch_invariant,
+        input_norm_const=input_norm_const,
+        has_fc1_alpha=has_fc1_alpha,
+        has_fc2_alpha=has_fc2_alpha,
+        has_fc1_norm_const=has_fc1_norm_const,
         # Constructed valid even before knobs land: quantized combine rejects
         # the default epi_warps token-back in __post_init__.
-        token_back_mode=(
-            "reuse_dispatch_warps" if combine_dtype != "bf16" else "epi_warps"
-        ),
+        **config_knobs,
     )
     cfg = with_checked_knobs(cfg, knobs)
     # TODO(Sep 2026) Previously we explicitly overrode the knobs here with the user request,

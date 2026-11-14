@@ -617,6 +617,21 @@ def test_trace_apply_does_not_replace_the_class():
 
 
 @needs_device
+def test_public_api_skips_backend_selection(monkeypatch):
+    """batch_invariant=True never runs a backend, so the @backend_requirement wrapper must not run the auto selection
+    for it (host cost only): a selecting call rewrites `bmm_fp8.suitable_auto_backends`, a bypassed one leaves it."""
+    A, B = adv_fp8(2, 16, 4096, seed=131), weights(2, 4096, 4096, 132)
+    sa, sb = scales()
+    sentinel = ["sentinel"]
+    # the wrapper creates the attribute at its first auto selection, so it may not exist yet
+    monkeypatch.setattr(
+        flashinfer.bmm_fp8, "suitable_auto_backends", sentinel, raising=False
+    )
+    bi_bmm(A, B, sa, sb)
+    assert flashinfer.bmm_fp8.suitable_auto_backends is sentinel
+
+
+@needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     A, B = adv_fp8(2, 16, 4096, seed=121), weights(2, 4096, 4096, 122)
     sa, sb = scales()
@@ -638,9 +653,9 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         bi_bmm(A, weights(3, 4096, 4096, 126), sa, sb)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="3-D operands"):
         bmm_fp8_batch_invariant(A[0], B[0], sa, sb, torch.bfloat16)
-    with pytest.raises(
-        ValueError
-    ):  # FlashInfer's own output-dtype contract, checked before the flag path
+    # the public API hands batch-invariant calls to the class without running the backend checks: the class's typed
+    # error (a ValueError, as before)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 or fp16 output"):
         bi_bmm(A, B, sa, sb, torch.float32)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="out"):
         bi_bmm(

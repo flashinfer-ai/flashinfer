@@ -19,14 +19,17 @@ import math
 import pytest
 import torch
 import torch.nn.functional as F
-from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
-from tests.test_helpers.pdl import late_store
+from tests.infra.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
+from tests.utils.test_helpers.pdl import late_store
 
 import flashinfer
 from flashinfer.jit import env as jit_env
 from flashinfer.jit.core import gen_jit_spec
 from flashinfer.utils import device_support_pdl
-from tests.test_helpers.pdl_race import (
+from tests.trace.test_helpers.pdl_race import (
     PDL_REPEATS,
     PDL_SPIN_CYCLES,
     assert_bitwise,
@@ -1009,6 +1012,29 @@ def test_layernorm_cuda_row_stride(
 
     torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(storage, storage_before, rtol=0, atol=0)
+
+
+def test_layernorm_cuda_row_offset_beyond_int32(monkeypatch):
+    """The second row starts past INT32_MAX, so it needs the 64-bit offset path."""
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    hidden_size, eps = 128, 1e-6
+    # An odd stride selects the scalar path, where offsets count single elements.
+    row_stride = 2**31 + 1
+    numel = row_stride + hidden_size
+    if torch.cuda.mem_get_info()[0] < numel * 2 + (1 << 30):
+        pytest.skip("needs about 5 GB of free GPU memory")
+
+    torch.manual_seed(0)
+    storage = torch.empty(numel, dtype=torch.bfloat16, device="cuda")
+    x = storage.as_strided((2, hidden_size), (row_stride, 1))
+    x.copy_(torch.randn(2, hidden_size, dtype=torch.bfloat16, device="cuda"))
+    gamma = torch.randn(hidden_size, device="cuda")
+    beta = torch.randn(hidden_size, device="cuda")
+
+    out = flashinfer.layernorm(x, gamma, beta, eps)
+    out_ref = F.layer_norm(x.float(), (hidden_size,), gamma, beta, eps).to(x.dtype)
+
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])

@@ -31,7 +31,7 @@ from flashinfer.trace.templates import quantize as quantize_templates
 from flashinfer.trace.templates.page import tgv_gemm_sm100_trace
 from flashinfer.trace.templates.sampling import softmax_trace
 from flashinfer.utils import BackendSupportedError
-from tests.test_helpers.pdl_race import (
+from tests.trace.test_helpers.pdl_race import (
     PDL_REPEATS,
     PDL_SPIN_CYCLES,
     assert_bitwise,

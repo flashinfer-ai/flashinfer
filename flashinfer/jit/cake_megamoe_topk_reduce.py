@@ -163,7 +163,9 @@ def get_cake_megamoe_topk_reduce_uri(arch: str | None = None) -> str:
     if arch is None:
         arch = resolve_arch()
     _check_arch(arch)
-    return f"cake_megamoe_topk_reduce_{arch.replace('_', '')}"
+    # v2 adds the masked, ordered BI entry point. An older AOT module with
+    # the same architecture only exports run(), and must not satisfy this ABI.
+    return f"cake_megamoe_topk_reduce_v2_{arch.replace('_', '')}"
 
 
 @functools.cache
@@ -218,10 +220,21 @@ def run_cake_megamoe_topk_reduce(
     partials: torch.Tensor,
     out: torch.Tensor,
     num_tokens: int,
+    *,
+    batch_invariant: bool = False,
+    topk_ids: torch.Tensor | None = None,
+    num_experts: int | None = None,
 ) -> None:
     """Launch the reducer on ``partials``' current CUDA stream."""
 
     stream = torch.cuda.current_stream(device=partials.device).cuda_stream
+    if batch_invariant:
+        if topk_ids is None or num_experts is None:
+            raise ValueError("BI CAKE finalization requires topk_ids and num_experts")
+        get_cake_megamoe_topk_reduce_module(partials.device).run_batch_invariant(
+            partials, topk_ids, out, num_tokens, num_experts, stream
+        )
+        return
     get_cake_megamoe_topk_reduce_module(partials.device).run(
         partials,
         out,

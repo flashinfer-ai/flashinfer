@@ -24,7 +24,7 @@ compared against the *unrounded* fp32 payload with ``atol = rtol = 0.1``;
 bitwise.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 ``flashinfer.cake_fused_qk_rope_fp8_append`` facade is covered by
@@ -41,7 +41,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_fused_qk_rope_fp8_append")
 cake_build = cake_package("cake_fused_qk_rope_fp8_append", "cake_build")

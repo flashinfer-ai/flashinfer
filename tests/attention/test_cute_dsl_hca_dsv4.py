@@ -14,7 +14,9 @@ from flashinfer.mla import (
 )
 from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.hca_dsv4 import _cpu_compressed_page_aligned_conversion_inputs
+from tests.attention.test_helpers.hca_dsv4 import (
+    _cpu_compressed_page_aligned_conversion_inputs,
+)
 
 
 @pytest.mark.arch_blackwell

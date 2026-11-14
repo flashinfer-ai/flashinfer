@@ -1,4 +1,5 @@
 import copy
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -394,6 +395,118 @@ class PytestTargetSelectorTests(unittest.TestCase):
         result = self.selector.select(PR)
         self.assertLessEqual(len(result.targets[0].ci_evidence), 500)
         self.assertIn("unit-test", result.targets[0].ci_evidence)
+
+    def test_large_initial_evidence_is_bounded_before_model_requests(self):
+        changes = [
+            {
+                "filename": f"scripts/tool_{i}.py",
+                "status": "modified",
+                "patch": "@@ changed\n" + "x" * 1500,
+            }
+            for i in range(150)
+        ]
+        self.github.get_pr_files.return_value += changes
+        self.github.get_repository_tree.return_value["tree"] += [
+            {
+                "path": f"tests/generated/test_long_repository_inventory_entry_{i}.py",
+                "sha": f"unused-{i}",
+                "mode": "100644",
+                "type": "blob",
+                "size": 100,
+            }
+            for i in range(4000)
+        ]
+        result = self.selector.select(PR)
+        self.assertEqual(["tests/attention/test_rope.py"], result.paths)
+        self.assertEqual(2, len(self.inference.calls))
+        for context, _ in self.inference.calls:
+            self.assertLessEqual(len(json.dumps(context)), 300_000)
+            self.assertEqual(151, len(context["changed_files"]))
+            self.assertGreater(context["omitted_evidence"]["candidate_test_files"], 0)
+            self.assertGreater(context["omitted_evidence"]["patches"], 0)
+
+    def test_incomplete_change_metadata_cannot_start_full_suite(self):
+        self.github.get_pr_files.return_value += [
+            {
+                "filename": "scripts/" + "long_name_" * 20 + str(i) + ".py",
+                "status": "modified",
+            }
+            for i in range(300)
+        ]
+        self.inference.outputs = [
+            {"read_paths": []},
+            {"outcome": "full_suite", "targets": [], "reason": "Broad change"},
+        ]
+        with patch("ai_test_scope.MAX_CONTEXT_CHARS", 20_000):
+            result = self.selector.select(PR)
+        self.assertEqual("needs_maintainer", result.outcome)
+        self.assertGreater(
+            self.inference.calls[0][0]["omitted_evidence"]["changed_files"], 0
+        )
+
+    def test_omitted_configuration_can_be_requested_without_eager_reserve(self):
+        body = "# config\n" * 800
+        self.github.get_repository_tree.return_value["tree"] += [
+            {
+                "path": f"scripts/aaa_{i:05d}.py",
+                "sha": f"unused-{i}",
+                "mode": "100644",
+                "type": "blob",
+                "size": 100,
+            }
+            for i in range(2000)
+        ]
+        self.inference.outputs[0] = {
+            "read_paths": ["tests/conftest.py", "tests/attention/test_rope.py"]
+        }
+        with (
+            patch.dict(SOURCES, {"tests/conftest.py": body}),
+            patch("ai_test_scope.MAX_CONTEXT_CHARS", 20_000),
+        ):
+            result = self.selector.select(PR)
+        first, second = [context for context, _ in self.inference.calls]
+        self.assertNotIn("tests/conftest.py", first["inventory_at_merged_tree"])
+        self.assertNotIn("tests/conftest.py", first["source_files"])
+        self.assertIn("tests/conftest.py", first["unavailable_evidence"])
+        self.assertEqual(body, second["source_files"]["tests/conftest.py"])
+        self.assertNotIn("tests/conftest.py", second["unavailable_evidence"])
+        self.assertEqual(["tests/attention/test_rope.py"], result.paths)
+
+    def test_full_suite_requires_matching_changed_file_count(self):
+        for expected in (0, 2):
+            with self.subTest(expected=expected):
+                pr = dict(PR, changed_files=expected)
+                self.github.get_pr_details.return_value = pr
+                self.inference.outputs = [
+                    {"read_paths": []},
+                    {"outcome": "full_suite", "targets": [], "reason": "Broad change"},
+                ]
+                result = self.selector.select(pr)
+                self.assertEqual("needs_maintainer", result.outcome)
+
+    def test_truncated_description_cannot_start_full_suite(self):
+        pr = dict(PR, body="x" * 8001, changed_files=1)
+        self.github.get_pr_details.return_value = pr
+        self.inference.outputs = [
+            {"read_paths": []},
+            {"outcome": "full_suite", "targets": [], "reason": "Broad change"},
+        ]
+        result = self.selector.select(pr)
+        self.assertEqual("needs_maintainer", result.outcome)
+        context = self.inference.calls[0][0]
+        self.assertTrue(context["omitted_evidence"]["pr_metadata"])
+        self.assertEqual(0, context["omitted_evidence"]["changed_files"])
+
+    def test_context_limit_is_checked_after_redaction(self):
+        self.inference.api_key = "x"
+        large_pr = dict(PR, body="x" * 1500)
+        self.github.get_pr_details.return_value = large_pr
+        with (
+            patch("ai_test_scope.MAX_CONTEXT_CHARS", 10_000),
+            self.assertRaisesRegex(TargetSelectionError, "Sanitized evidence"),
+        ):
+            self.selector.select(large_pr)
+        self.assertFalse(self.inference.calls)
 
     def test_context_budget_stops_before_ai_request(self):
         with (

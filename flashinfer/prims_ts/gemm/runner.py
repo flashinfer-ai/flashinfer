@@ -8,8 +8,8 @@
 ``N`` and ``K`` stay fixed. Only ``M`` is bucketed, on a fixed list from
 1024 to 65536. A runtime ``M`` rounds up to the next bucket and uses that
 bucket's tactic; below 1024 uses 1024, and above 65536 uses 65536.
-``autotune(tuning_buckets=..., round_up=True)`` replaces the bucket list;
-lookup uses the same ceil rule only while that override is still active.
+``autotune(tuning_buckets=...)`` replaces the list of profiled sizes; lookup
+keeps using the same ceil rule.
 Dtype and epilogue select the cache entry; they are not tactics.
 """
 

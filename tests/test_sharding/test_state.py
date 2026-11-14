@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+import _flashinfer_filelock as filelock
 import pytest
 
 from scripts.test_sharding.models import Plan, PlanningOptions
@@ -153,6 +154,21 @@ def test_state_lock_supports_simultaneous_first_start(tmp_path: Path) -> None:
         futures = [executor.submit(acquire_lock) for _ in range(worker_count)]
         for future in futures:
             future.result()
+
+
+def test_state_lock_preserves_marker_and_releases_after_failure(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="critical section"), state_lock(tmp_path):
+        with (
+            (tmp_path / "lock").open("r+") as contender,
+            pytest.raises(BlockingIOError),
+        ):
+            filelock.lock(contender.fileno(), blocking=False)
+        raise RuntimeError("critical section")
+
+    assert (tmp_path / "lock").read_text() == "flashinfer-unit-test-runner-lock-v1\n"
+    with (tmp_path / "lock").open("r+") as contender:
+        filelock.lock(contender.fileno(), blocking=False)
+        filelock.unlock(contender.fileno())
 
 
 def test_create_attempt_rejects_empty_reserved_attempts_directory(

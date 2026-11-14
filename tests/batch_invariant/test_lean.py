@@ -1,7 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The Lean coupling of the classes ``gemm.bf16``, ``gemm.e4m3`` / ``gemm.e5m2`` and ``gemm.mxfp8`` (both instructions'
-classes) (``flashinfer/batch_invariant/lean/``).
+"""The Lean coupling of the classes ``gemm.bf16``, ``gemm.e4m3`` / ``gemm.e5m2``, ``gemm.e4m3.kblock128`` (the block-scale
+fp8 class) and ``gemm.mxfp8`` (both instructions' classes) (``flashinfer/batch_invariant/lean/``).
 
 Device-free (every CI job): the committed ``Cases.lean`` is byte for byte what the Python spec and engine emit, so a
 change to the dataflow, the lowering, a knob constraint or the chunk rule that was not propagated to the Lean cases
@@ -39,7 +39,7 @@ def test_generated_cases_are_current():
         assert f"theorem {name} " in committed
     with open(os.path.join(lean_cases.LEAN_DIR, "Axioms.lean")) as f:
         axioms = f.read()
-    for name in lean_cases.DECIDED_THEOREMS:
+    for name in lean_cases.DECIDED_THEOREMS + lean_cases.MODULE_DECIDED_THEOREMS:
         assert f"``BIK.{name}" in axioms, f"{name} is not pinned in Axioms.lean"
 
 
@@ -110,7 +110,9 @@ def test_lean_model_matches_python_engine_and_spec():
     assert r.returncode == 0, (r.stdout + r.stderr)[-4000:]
     r = _lake("exe", "conformance", timeout=600)
     assert r.returncode == 0, r.stderr[-2000:]
-    kinds = {"gemmbias": "spec", "fp4class": "fp4class"}
+    kinds = {"gemmbias": "spec", "fp4class": "fp4class", "attn": "attn"}
+    # the block-scale fp8 class: the output at (0, 0) and at (3, 129) per (blocks, format), the promotion loop per block count
+    kinds.update({"gemmfp8bs": "out", "gemmfp8bs2": "out", "gemmfp8bsloop": "loop"})
     for F in lean_cases.FORMATS:
         kinds[F.tag] = "spec"
         kinds[F.tag + "loop"] = "loop"
@@ -136,6 +138,9 @@ def test_lean_model_matches_python_engine_and_spec():
         elif kind == "fp4class":
             _, N, K, b = line.split(" ")
             lean[("fp4class", int(N), int(K))] = bool(int(b))
+        elif kind == "attn":
+            _, name, sx = line.split(" ", 2)
+            lean[("attn", name)] = sx
         else:
             raise AssertionError(f"unexpected conformance line: {line[:80]}")
     checked = 0
@@ -164,6 +169,18 @@ def test_lean_model_matches_python_engine_and_spec():
     for K, C, sx in lean_cases.bias_cases():
         assert lean[("gemmbias", K // MMA_K, C)] == sx, (K, C)
         checked += 1
+    # the block-scale fp8 class: the spec's output at (0, 0) and at (3, 129) node for node, and the kernel's promotion loop
+    # against the engine's per-block traces folded by the block digit
+    for KB, fmt, sx0, sx1 in lean_cases.fp8bs_cases():
+        assert lean[("gemmfp8bs", KB, fmt)] == sx0, ("e4m3_bs", KB, fmt)
+        assert lean[("gemmfp8bs2", KB, fmt)] == sx1, ("e4m3_bs (3, 129)", KB, fmt)
+        checked += 2
+    for KB, sx in lean_cases.fp8bs_loop_cases():
+        assert lean[("gemmfp8bsloop", KB)] == sx, ("e4m3_bs loop", KB)
+        checked += 1
+    for name, *_, sx in lean_cases.attn_cases():
+        assert lean[("attn", name)] == sx, name
+        checked += 1
     assert MMA_K_OF["bf16"] == MMA_K
     assert checked == len(lean) >= 80
 
@@ -173,6 +190,7 @@ def test_axioms_policy():
     r = _lake("exe", "axioms", timeout=600)
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-3000:]
     assert "0 with sorry, 0 violations" in r.stdout, r.stdout
-    assert f"{len(lean_cases.DECIDED_THEOREMS)} named table theorems" in r.stdout, (
-        r.stdout
+    n_decided = len(lean_cases.DECIDED_THEOREMS) + len(
+        lean_cases.MODULE_DECIDED_THEOREMS
     )
+    assert f"{n_decided} named table theorems" in r.stdout, r.stdout

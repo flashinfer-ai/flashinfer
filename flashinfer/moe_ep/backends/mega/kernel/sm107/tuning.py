@@ -124,6 +124,9 @@ def _candidates(args, rank, world_size, max_tokens, quant_kind, variant):
         sm107_candidates,
         sm107_schedule_candidates,
     )
+    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+        _unique_candidates,
+    )
 
     if args.sweep == "schedule":
         if args.base_knobs:
@@ -157,7 +160,7 @@ def _candidates(args, rank, world_size, max_tokens, quant_kind, variant):
             and args.combine_dtype == "bf16",
             kernel_variant=variant,
         )
-    return candidates
+    return _unique_candidates(candidates)
 
 
 def _collective_candidates(

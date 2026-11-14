@@ -28,7 +28,7 @@ import torch.nn.functional as F
 
 import flashinfer.kda as kda_api
 
-from tests.test_helpers.kda_prefill import _make_inputs, _strict_prefill_kwargs
+from tests.kda.test_helpers.kda_prefill import _make_inputs, _strict_prefill_kwargs
 
 _POOL_SLOTS = 257
 _HEAD_DIM = 128

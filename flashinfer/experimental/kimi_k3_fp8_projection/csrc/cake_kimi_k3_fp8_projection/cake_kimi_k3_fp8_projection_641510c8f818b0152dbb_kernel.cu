@@ -980,7 +980,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                     int skp_cvi = skp_cvi0 + v * 32;
                     {
                         float4 _v4 = make_float4(quad_p[0 + 0], quad_p[0 + 1], quad_p[0 + 2], quad_p[0 + 3]);
-                        *reinterpret_cast<float4*>((sk_partials + (unsigned long long)skp_cvi * 4) + 0) = _v4;
+                        *reinterpret_cast<float4*>((sk_partials + (unsigned long long)skp_cvi * 4ull) + 0) = _v4;
                     }
                 }
                 asm volatile("tcgen05.fence::before_thread_sync;");
@@ -1161,7 +1161,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v = 0; skp_v < 8; skp_v++) {
                             int skp_vi = skp_vi0 + skp_v * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi * 4ull + 0);
                                 parts_q[4 * skp_v + 0] = _v4.x;
                                 parts_q[4 * skp_v + 1] = _v4.y;
                                 parts_q[4 * skp_v + 2] = _v4.z;
@@ -1180,7 +1180,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_1 = 0; skp_v_1 < 8; skp_v_1++) {
                             int skp_vi_1 = skp_vi0_0 + skp_v_1 * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_1 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_1 * 4ull + 0);
                                 parts_q_0[4 * skp_v_1 + 0] = _v4.x;
                                 parts_q_0[4 * skp_v_1 + 1] = _v4.y;
                                 parts_q_0[4 * skp_v_1 + 2] = _v4.z;
@@ -1199,7 +1199,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_2 = 0; skp_v_2 < 8; skp_v_2++) {
                             int skp_vi_2 = skp_vi0_1 + skp_v_2 * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_2 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_2 * 4ull + 0);
                                 parts_q_1[4 * skp_v_2 + 0] = _v4.x;
                                 parts_q_1[4 * skp_v_2 + 1] = _v4.y;
                                 parts_q_1[4 * skp_v_2 + 2] = _v4.z;
@@ -1218,7 +1218,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_3 = 0; skp_v_3 < 8; skp_v_3++) {
                             int skp_vi_3 = skp_vi0_2 + skp_v_3 * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_3 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_3 * 4ull + 0);
                                 parts_q_2[4 * skp_v_3 + 0] = _v4.x;
                                 parts_q_2[4 * skp_v_3 + 1] = _v4.y;
                                 parts_q_2[4 * skp_v_3 + 2] = _v4.z;
@@ -1240,7 +1240,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_4 = 0; skp_v_4 < 8; skp_v_4++) {
                             int skp_vi_4 = skp_vi0_3 + (8 + skp_v_4) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_4 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_4 * 4ull + 0);
                                 parts_q_3[4 * skp_v_4 + 0] = _v4.x;
                                 parts_q_3[4 * skp_v_4 + 1] = _v4.y;
                                 parts_q_3[4 * skp_v_4 + 2] = _v4.z;
@@ -1259,7 +1259,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_5 = 0; skp_v_5 < 8; skp_v_5++) {
                             int skp_vi_5 = skp_vi0_4 + (8 + skp_v_5) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_5 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_5 * 4ull + 0);
                                 parts_q_4[4 * skp_v_5 + 0] = _v4.x;
                                 parts_q_4[4 * skp_v_5 + 1] = _v4.y;
                                 parts_q_4[4 * skp_v_5 + 2] = _v4.z;
@@ -1278,7 +1278,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_6 = 0; skp_v_6 < 8; skp_v_6++) {
                             int skp_vi_6 = skp_vi0_5 + (8 + skp_v_6) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_6 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_6 * 4ull + 0);
                                 parts_q_5[4 * skp_v_6 + 0] = _v4.x;
                                 parts_q_5[4 * skp_v_6 + 1] = _v4.y;
                                 parts_q_5[4 * skp_v_6 + 2] = _v4.z;
@@ -1297,7 +1297,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_7 = 0; skp_v_7 < 8; skp_v_7++) {
                             int skp_vi_7 = skp_vi0_6 + (8 + skp_v_7) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_7 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_7 * 4ull + 0);
                                 parts_q_6[4 * skp_v_7 + 0] = _v4.x;
                                 parts_q_6[4 * skp_v_7 + 1] = _v4.y;
                                 parts_q_6[4 * skp_v_7 + 2] = _v4.z;
@@ -1319,7 +1319,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_8 = 0; skp_v_8 < 8; skp_v_8++) {
                             int skp_vi_8 = skp_vi0_7 + (16 + skp_v_8) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_8 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_8 * 4ull + 0);
                                 parts_q_7[4 * skp_v_8 + 0] = _v4.x;
                                 parts_q_7[4 * skp_v_8 + 1] = _v4.y;
                                 parts_q_7[4 * skp_v_8 + 2] = _v4.z;
@@ -1338,7 +1338,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_9 = 0; skp_v_9 < 8; skp_v_9++) {
                             int skp_vi_9 = skp_vi0_3_1 + (16 + skp_v_9) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_9 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_9 * 4ull + 0);
                                 parts_q_3_1[4 * skp_v_9 + 0] = _v4.x;
                                 parts_q_3_1[4 * skp_v_9 + 1] = _v4.y;
                                 parts_q_3_1[4 * skp_v_9 + 2] = _v4.z;
@@ -1357,7 +1357,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_10 = 0; skp_v_10 < 8; skp_v_10++) {
                             int skp_vi_10 = skp_vi0_4_1 + (16 + skp_v_10) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_10 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_10 * 4ull + 0);
                                 parts_q_4_1[4 * skp_v_10 + 0] = _v4.x;
                                 parts_q_4_1[4 * skp_v_10 + 1] = _v4.y;
                                 parts_q_4_1[4 * skp_v_10 + 2] = _v4.z;
@@ -1376,7 +1376,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_11 = 0; skp_v_11 < 8; skp_v_11++) {
                             int skp_vi_11 = skp_vi0_5_1 + (16 + skp_v_11) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_11 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_11 * 4ull + 0);
                                 parts_q_5_1[4 * skp_v_11 + 0] = _v4.x;
                                 parts_q_5_1[4 * skp_v_11 + 1] = _v4.y;
                                 parts_q_5_1[4 * skp_v_11 + 2] = _v4.z;
@@ -1398,7 +1398,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_12 = 0; skp_v_12 < 4; skp_v_12++) {
                             int skp_vi_12 = skp_vi0_8 + (24 + skp_v_12) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_12 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_12 * 4ull + 0);
                                 parts_q_8[4 * skp_v_12 + 0] = _v4.x;
                                 parts_q_8[4 * skp_v_12 + 1] = _v4.y;
                                 parts_q_8[4 * skp_v_12 + 2] = _v4.z;
@@ -1417,7 +1417,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_13 = 0; skp_v_13 < 4; skp_v_13++) {
                             int skp_vi_13 = skp_vi0_6_1 + (24 + skp_v_13) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_13 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_13 * 4ull + 0);
                                 parts_q_6_1[4 * skp_v_13 + 0] = _v4.x;
                                 parts_q_6_1[4 * skp_v_13 + 1] = _v4.y;
                                 parts_q_6_1[4 * skp_v_13 + 2] = _v4.z;
@@ -1436,7 +1436,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_14 = 0; skp_v_14 < 4; skp_v_14++) {
                             int skp_vi_14 = skp_vi0_7_1 + (24 + skp_v_14) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_14 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_14 * 4ull + 0);
                                 parts_q_7_1[4 * skp_v_14 + 0] = _v4.x;
                                 parts_q_7_1[4 * skp_v_14 + 1] = _v4.y;
                                 parts_q_7_1[4 * skp_v_14 + 2] = _v4.z;
@@ -1455,7 +1455,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_15 = 0; skp_v_15 < 4; skp_v_15++) {
                             int skp_vi_15 = skp_vi0_8_1 + (24 + skp_v_15) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_15 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_15 * 4ull + 0);
                                 parts_q_8_1[4 * skp_v_15 + 0] = _v4.x;
                                 parts_q_8_1[4 * skp_v_15 + 1] = _v4.y;
                                 parts_q_8_1[4 * skp_v_15 + 2] = _v4.z;
@@ -1557,7 +1557,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_16 = 0; skp_v_16 < 4; skp_v_16++) {
                             int skp_vi_16 = skp_pvi0 + (28 + skp_v_16) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_16 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_16 * 4ull + 0);
                                 parts_p[4 * skp_v_16 + 0] = _v4.x;
                                 parts_p[4 * skp_v_16 + 1] = _v4.y;
                                 parts_p[4 * skp_v_16 + 2] = _v4.z;
@@ -1576,7 +1576,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_17 = 0; skp_v_17 < 4; skp_v_17++) {
                             int skp_vi_17 = skp_pvi0_0 + (28 + skp_v_17) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_17 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_17 * 4ull + 0);
                                 parts_p_0[4 * skp_v_17 + 0] = _v4.x;
                                 parts_p_0[4 * skp_v_17 + 1] = _v4.y;
                                 parts_p_0[4 * skp_v_17 + 2] = _v4.z;
@@ -1595,7 +1595,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_18 = 0; skp_v_18 < 4; skp_v_18++) {
                             int skp_vi_18 = skp_pvi0_1 + (28 + skp_v_18) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_18 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_18 * 4ull + 0);
                                 parts_p_1[4 * skp_v_18 + 0] = _v4.x;
                                 parts_p_1[4 * skp_v_18 + 1] = _v4.y;
                                 parts_p_1[4 * skp_v_18 + 2] = _v4.z;
@@ -1614,7 +1614,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_19 = 0; skp_v_19 < 4; skp_v_19++) {
                             int skp_vi_19 = skp_pvi0_2 + (28 + skp_v_19) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_19 * 4 + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_19 * 4ull + 0);
                                 parts_p_2[4 * skp_v_19 + 0] = _v4.x;
                                 parts_p_2[4 * skp_v_19 + 1] = _v4.y;
                                 parts_p_2[4 * skp_v_19 + 2] = _v4.z;

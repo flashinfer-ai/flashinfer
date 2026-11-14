@@ -8,6 +8,18 @@
 
 SCCACHE_VERSION="0.18.0"
 
+# rapidsai/sccache fork used for nvcc when FLASHINFER_SCCACHE_NVCC_IMPL=rapids
+# (see setup_sccache). Pinned by release tag and the sha256 digests GitHub
+# publishes for the release assets; the checksums are pinned here rather than
+# fetched from the same origin as the tarball.
+SCCACHE_RAPIDS_VERSION="0.18.0-rapids.8"
+SCCACHE_RAPIDS_SHA256_x86_64="6b479c4d4903c8f738f031d4a18f2937a1090827ed553b6bfd7beed0e9aeebeb"
+SCCACHE_RAPIDS_SHA256_aarch64="2994d493d18566af0d55dc4ebc678be6b6f91b6856d1c6837325c121da755b6d"
+# Installed in a directory of its own under the name "sccache": invoked under any
+# other name (e.g. sccache-rapids), sccache treats that name as a compiler to
+# wrap, and even `--version` hangs. Not overridable from the environment.
+SCCACHE_RAPIDS_BIN=/usr/local/libexec/sccache-rapids/sccache
+
 # Compute MAX_JOBS and FLASHINFER_NVCC_THREADS from system memory/CPU,
 # clamping FLASHINFER_NVCC_THREADS to a sane range and budgeting per-job
 # memory to avoid OOMs on multi-arch builds.
@@ -162,6 +174,45 @@ run_bounded_parallel() {
   return $failed
 }
 
+# Lint the AOT spec list of each provider architecture: no spec may name a CUDA
+# target its provider cannot carry (see check_jit_spec_gencodes.py). Generates
+# specs only, so it needs the CUDA image and flashinfer installed but no GPU and
+# no compiling. One process per provider: the target list is fixed when flashinfer
+# is first imported.
+#
+# Args: $1 - CONCURRENCY (>= 1), $2... - provider architectures.
+# Returns 0 when every provider passed, else 1.
+_JIT_CACHE_COMMON_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+lint_provider_specs() {
+  local provider_architecture=$1
+  python3 "${_JIT_CACHE_COMMON_DIR}/check_jit_spec_gencodes.py" \
+    --provider "${provider_architecture}" 2>&1 \
+    | sed -u "s/^/[${provider_architecture}] /"
+}
+
+run_provider_spec_lint() {
+  local concurrency=$1
+  shift
+  if ! [[ "${concurrency}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: spec lint concurrency must be a positive integer, got '${concurrency}'"
+    return 1
+  fi
+  local started_at=${SECONDS}
+  # Cold metadata downloads can outlast a peer's artifact-lock timeout. Fill
+  # the shared header cache before the fail-fast pool starts any arch workers.
+  if (( concurrency > 1 && $# > 1 )); then
+    python3 "${_JIT_CACHE_COMMON_DIR}/prefetch_jit_spec_headers.py" || {
+      echo "ERROR: Failed to prefetch provider spec headers"
+      return 1
+    }
+  fi
+  run_bounded_parallel "${concurrency}" lint_provider_specs "$@" || {
+    echo "ERROR: A provider spec lists CUDA targets the provider cannot carry"
+    return 1
+  }
+  echo "✓ Provider spec CUDA targets linted in $(( SECONDS - started_at )) s"
+}
+
 # Verify that the selected compiler matches the CUDA matrix entry.
 #
 # Args:
@@ -300,19 +351,30 @@ cleanup_jit_cache_python_build() {
   unset JIT_CACHE_RESTORE_PIP_BUILD_CONSTRAINT
 }
 
-# Download and install a released sccache binary to /usr/local/bin/sccache,
-# verifying the upstream sha256 checksum.
+# Download, verify and install a released sccache binary.
+#
+# Args:
+#   $1 - Release version (without the leading "v").
+#   $2 - Architecture (x86_64 or aarch64).
+#   $3 - GitHub repository (default mozilla/sccache).
+#   $4 - Install path (default /usr/local/bin/sccache).
+#   $5 - Expected sha256 (default: the release's published .sha256 file).
+# Exits on a checksum mismatch, before the archive is extracted, even when the
+# caller runs with errexit off.
 install_released_sccache() {
   local sccache_version=$1
   local sccache_arch=$2
+  local sccache_repo=${3:-mozilla/sccache}
+  local sccache_dest=${4:-/usr/local/bin/sccache}
+  local sccache_sha256=${5:-}
   local sccache_package="sccache-v${sccache_version}-${sccache_arch}-unknown-linux-musl"
   local sccache_archive="${sccache_package}.tar.gz"
-  local sccache_url="https://github.com/mozilla/sccache/releases/download/v${sccache_version}/${sccache_archive}"
+  local sccache_url="https://github.com/${sccache_repo}/releases/download/v${sccache_version}/${sccache_archive}"
   local sccache_tmpdir
-  local sccache_sha256
   local sccache_install_started_at=${SECONDS}
+  local suffix attempt delay http_status
 
-  echo "::group::Install sccache v${sccache_version} (${sccache_arch})"
+  echo "::group::Install ${sccache_repo} v${sccache_version} (${sccache_arch})"
 
   if ! command -v sha256sum >/dev/null 2>&1; then
     echo "ERROR: sha256sum is required to verify sccache downloads"
@@ -320,19 +382,50 @@ install_released_sccache() {
   fi
 
   sccache_tmpdir=$(mktemp -d)
-  curl -fsSL "${sccache_url}" -o "${sccache_tmpdir}/${sccache_archive}"
-  curl -fsSL "${sccache_url}.sha256" -o "${sccache_tmpdir}/${sccache_archive}.sha256"
-  sccache_sha256=$(awk '{print $1}' "${sccache_tmpdir}/${sccache_archive}.sha256")
+  # Match the Docker image pull policy: four attempts with 5/10/20s backoff.
+  # Retry each file independently so a checksum retry keeps the downloaded archive.
+  # A pinned checksum (e.g. the rapidsai fork) skips the .sha256 download.
+  local suffixes=("")
+  if [ -z "${sccache_sha256}" ]; then
+    suffixes+=(".sha256")
+  fi
+  for suffix in "${suffixes[@]}"; do
+    for attempt in 1 2 3 4; do
+      if http_status=$(curl -fsSL -w '%{http_code}' "${sccache_url}${suffix}" -o "${sccache_tmpdir}/${sccache_archive}${suffix}"); then
+        break
+      fi
+      # Missing release files will not recover with another download attempt.
+      if [ "${http_status}" = "404" ]; then
+        echo "Release file not found (HTTP 404): ${sccache_archive}${suffix}" >&2
+        return 1
+      fi
+      if (( attempt == 4 )); then
+        echo "Failed to download ${sccache_archive}${suffix} after ${attempt} attempts" >&2
+        return 1
+      fi
+      delay=$(( 5 * 2 ** (attempt - 1) ))
+      echo "sccache download failed; retrying in ${delay}s (attempt $(( attempt + 1 ))/4)" >&2
+      sleep "${delay}"
+    done
+  done
+  if [ -z "${sccache_sha256}" ]; then
+    sccache_sha256=$(awk '{print $1}' "${sccache_tmpdir}/${sccache_archive}.sha256")
+  fi
   if [ -z "${sccache_sha256}" ]; then
     echo "ERROR: Missing checksum for ${sccache_archive}"
     exit 1
   fi
 
-  printf '%s  %s\n' "${sccache_sha256}" "${sccache_tmpdir}/${sccache_archive}" | sha256sum -c -
+  if ! printf '%s  %s\n' "${sccache_sha256}" "${sccache_tmpdir}/${sccache_archive}" | sha256sum -c -; then
+    echo "ERROR: Checksum mismatch for ${sccache_archive}"
+    rm -rf "${sccache_tmpdir}"
+    exit 1
+  fi
   tar xzf "${sccache_tmpdir}/${sccache_archive}" -C "${sccache_tmpdir}"
-  mv "${sccache_tmpdir}/${sccache_package}/sccache" /usr/local/bin/
+  mkdir -p "$(dirname "${sccache_dest}")"
+  mv "${sccache_tmpdir}/${sccache_package}/sccache" "${sccache_dest}"
   rm -rf "${sccache_tmpdir}"
-  chmod +x /usr/local/bin/sccache
+  chmod +x "${sccache_dest}"
   echo "::endgroup::"
   echo "sccache install duration: $((SECONDS - sccache_install_started_at)) seconds"
 }
@@ -358,6 +451,27 @@ install_sccache() {
   export FLASHINFER_SCCACHE_REVISION="v${sccache_version}"
 }
 
+# Install the pinned rapidsai/sccache fork as SCCACHE_RAPIDS_BIN, next to (not
+# replacing) an upstream /usr/local/bin/sccache.
+install_rapids_sccache() {
+  local sccache_arch=$1
+  local sccache_sha256
+
+  case "${sccache_arch}" in
+    x86_64) sccache_sha256="${SCCACHE_RAPIDS_SHA256_x86_64}" ;;
+    aarch64) sccache_sha256="${SCCACHE_RAPIDS_SHA256_aarch64}" ;;
+    *)
+      echo "ERROR: Unsupported sccache build architecture: ${sccache_arch}"
+      exit 1
+      ;;
+  esac
+
+  install_released_sccache "${SCCACHE_RAPIDS_VERSION}" "${sccache_arch}" \
+    rapidsai/sccache "${SCCACHE_RAPIDS_BIN}" "${sccache_sha256}"
+  export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-release-rapidsai"
+  export FLASHINFER_SCCACHE_REVISION="v${SCCACHE_RAPIDS_VERSION}"
+}
+
 # Install sccache (if missing), configure environment, and start the server.
 # Caller must have exported SCCACHE_BUCKET before calling.
 #
@@ -366,7 +480,15 @@ install_sccache() {
 #   $2 - Source root directory for SCCACHE_BASEDIRS.
 #
 # Reads (optional): SCCACHE_REGION, SCCACHE_STATS_DIR,
-# AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
+# AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, FLASHINFER_SCCACHE_NVCC_IMPL.
+#
+# FLASHINFER_SCCACHE_NVCC_IMPL=rapids runs the rapidsai/sccache fork
+# (SCCACHE_RAPIDS_VERSION) instead of upstream. Its nvcc hashing lists
+# dependencies (-M) and caches that list, so a hit skips nvcc's preprocessing:
+# on the sm80 provider, about 0.3 instead of 7.4 host CPU-s per hit. Its keys
+# differ from upstream's, so it uses the key prefix "<tag>-rapids". Host C++
+# is left uncached: the fork fails fatally (no fallback) on `g++ -MMD` of files
+# that include <vector> ("Error computing digest: while reading '/'").
 # Sets/exports: SCCACHE_*, FLASHINFER_NVCC_LAUNCHER, FLASHINFER_CXX_LAUNCHER.
 # Launchers and ACTIVE are enabled only after startup and zero-stats succeed.
 # Each setup starts a new stats session, discarding inherited runtime state.
@@ -378,7 +500,22 @@ setup_sccache() {
   unset FLASHINFER_CXX_LAUNCHER FLASHINFER_NVCC_LAUNCHER
   unset FLASHINFER_SCCACHE_ACTIVE FLASHINFER_SCCACHE_STATS_COLLECTED
   sccache_arch=$(uname -m)
-  if [ "$(sccache --version 2>/dev/null)" = "sccache ${SCCACHE_VERSION}" ]; then
+  local nvcc_impl="${FLASHINFER_SCCACHE_NVCC_IMPL:-upstream}"
+  case "${nvcc_impl}" in
+    upstream|rapids) ;;
+    *)
+      echo "ERROR: Unsupported FLASHINFER_SCCACHE_NVCC_IMPL=${nvcc_impl} (upstream|rapids)"
+      return 1
+      ;;
+  esac
+  export FLASHINFER_SCCACHE_BIN=sccache
+  if [ "${nvcc_impl}" = "rapids" ]; then
+    export FLASHINFER_SCCACHE_BIN="${SCCACHE_RAPIDS_BIN}"
+    key_prefix="${key_prefix}-rapids"
+    # Always installed: nothing preinstalls the fork, unlike the upstream
+    # probe below.
+    install_rapids_sccache "${sccache_arch}"
+  elif [ "$(sccache --version 2>/dev/null)" = "sccache ${SCCACHE_VERSION}" ]; then
     # Already installed (e.g. by run_with_test_sccache.sh's fail-open probe).
     export FLASHINFER_SCCACHE_INSTALL_SOURCE="${FLASHINFER_SCCACHE_INSTALL_SOURCE:-preinstalled}"
     export FLASHINFER_SCCACHE_REVISION="${FLASHINFER_SCCACHE_REVISION:-v${SCCACHE_VERSION}}"
@@ -413,27 +550,32 @@ setup_sccache() {
 
   # Explicit returns: a caller that guards setup_sccache with `if` runs it with
   # errexit off, and must still see failed control commands.
-  sccache --start-server || {
+  "${FLASHINFER_SCCACHE_BIN}" --start-server || {
     setup_status=$?
     stop_sccache_after_setup_failure
     return "${setup_status}"
   }
-  sccache --zero-stats || {
+  "${FLASHINFER_SCCACHE_BIN}" --zero-stats || {
     setup_status=$?
     stop_sccache_after_setup_failure
     return "${setup_status}"
   }
-  export FLASHINFER_CXX_LAUNCHER="sccache"
-  export FLASHINFER_NVCC_LAUNCHER="sccache"
+  if [ "${nvcc_impl}" = "rapids" ]; then
+    # Host C++ uncached; see the FLASHINFER_SCCACHE_NVCC_IMPL note above.
+    export FLASHINFER_CXX_LAUNCHER=""
+  else
+    export FLASHINFER_CXX_LAUNCHER="sccache"
+  fi
+  export FLASHINFER_NVCC_LAUNCHER="${FLASHINFER_SCCACHE_BIN}"
   export FLASHINFER_SCCACHE_ACTIVE=true
-  echo "sccache version: $(sccache --version)"
+  echo "sccache version: $("${FLASHINFER_SCCACHE_BIN}" --version)"
   echo "sccache install source: ${FLASHINFER_SCCACHE_INSTALL_SOURCE}"
   echo "sccache revision: ${FLASHINFER_SCCACHE_REVISION}"
   echo "sccache bucket: ${SCCACHE_BUCKET}"
   echo "sccache region: ${SCCACHE_REGION}"
   echo "sccache prefix: ${SCCACHE_S3_KEY_PREFIX}"
   echo "sccache basedirs: ${SCCACHE_BASEDIRS}"
-  echo "sccache cxx launcher: ${FLASHINFER_CXX_LAUNCHER}"
+  echo "sccache cxx launcher: ${FLASHINFER_CXX_LAUNCHER:-disabled}"
   echo "sccache nvcc launcher: ${FLASHINFER_NVCC_LAUNCHER:-disabled}"
 
   if [ -n "${SCCACHE_STATS_DIR:-}" ]; then
@@ -442,7 +584,8 @@ setup_sccache() {
     git_commit=$(git -C "${source_root}" rev-parse HEAD 2>/dev/null || true)
     {
       printf 'git_commit=%s\n' "${git_commit:-unknown}"
-      printf 'sccache_version=%s\n' "$(sccache --version)"
+      printf 'sccache_version=%s\n' "$("${FLASHINFER_SCCACHE_BIN}" --version)"
+      printf 'sccache_nvcc_impl=%s\n' "${nvcc_impl}"
       printf 'sccache_install_source=%s\n' "${FLASHINFER_SCCACHE_INSTALL_SOURCE}"
       printf 'sccache_revision=%s\n' "${FLASHINFER_SCCACHE_REVISION}"
       printf 'sccache_cache_mode=%s\n' "${FLASHINFER_SCCACHE_CACHE_MODE}"
@@ -467,9 +610,9 @@ stop_sccache_after_setup_failure() {
 
 run_sccache_control_command() {
   if command -v timeout >/dev/null 2>&1; then
-    timeout --signal=TERM --kill-after=5s 30s sccache "$@"
+    timeout --signal=TERM --kill-after=5s 30s "${FLASHINFER_SCCACHE_BIN:-sccache}" "$@"
   else
-    sccache "$@"
+    "${FLASHINFER_SCCACHE_BIN:-sccache}" "$@"
   fi
 }
 
@@ -480,7 +623,7 @@ run_sccache_control_command() {
 collect_sccache_stats() {
   if [ "${FLASHINFER_SCCACHE_ACTIVE:-false}" != "true" ] || \
      [ "${FLASHINFER_SCCACHE_STATS_COLLECTED:-false}" = "true" ] || \
-     ! command -v sccache >/dev/null 2>&1; then
+     ! command -v "${FLASHINFER_SCCACHE_BIN:-sccache}" >/dev/null 2>&1; then
     return 0
   fi
   export FLASHINFER_SCCACHE_STATS_COLLECTED=true

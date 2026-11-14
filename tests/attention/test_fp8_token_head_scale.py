@@ -446,6 +446,128 @@ def test_batch_prefill_paged_token_head_scale(
 
 
 # ---------------------------------------------------------------------------
+# write -> read round-trip: the fp8 per-(token, head) quantize+append operator
+# fills an inline uint8 slot cache consumed by the FA2 read path
+# (use_token_head_sf / kv_cache_sf). Slot t holds token t, so a single arange
+# slot mapping writes the whole cache.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [128, 256])
+def test_fp8_pth_write_read_roundtrip_paged(kv_layout, dtype, q_dtype, head_dim):
+    _skip_bf16_on_sm75(q_dtype)
+    torch.manual_seed(42)
+    dev = "cuda:0"
+    sz = _sizes(head_dim)
+    batch_size, qo_len, kv_len = sz["batch_size"], sz["qo_len"], sz["kv_len"]
+    num_qo_heads, num_kv_heads = _heads(False)
+    page_size = 16
+    assert kv_len % page_size == 0
+
+    pages_per_req = kv_len // page_size
+    num_pages = batch_size * pages_per_req
+    total_kv = batch_size * kv_len
+    qo_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32).to(dev) * qo_len
+    total_qo = qo_indptr[-1].item()
+    paged_kv_indptr = (
+        torch.arange(0, batch_size + 1, dtype=torch.int32).to(dev) * pages_per_req
+    )
+    paged_kv_indices = torch.arange(num_pages, dtype=torch.int32).to(dev)
+    paged_kv_last_page_len = torch.full((batch_size,), page_size, dtype=torch.int32).to(
+        dev
+    )
+    slot_mapping = torch.arange(total_kv, dtype=torch.int32).to(dev)
+
+    if kv_layout == "NHD":
+        paged_shape = (num_pages, page_size, num_kv_heads, head_dim)
+    else:
+        paged_shape = (num_pages, num_kv_heads, page_size, head_dim)
+    k_ref = 0.05 * torch.randn(*paged_shape, dtype=q_dtype).to(dev)
+    v_ref = 0.05 * torch.randn(*paged_shape, dtype=q_dtype).to(dev)
+
+    # Flatten to a token-major append input (slot t holds token t).
+    if kv_layout == "NHD":
+        k_append = k_ref.reshape(total_kv, num_kv_heads, head_dim)
+        v_append = v_ref.reshape(total_kv, num_kv_heads, head_dim)
+    else:
+        k_append = k_ref.permute(0, 2, 1, 3).reshape(total_kv, num_kv_heads, head_dim)
+        v_append = v_ref.permute(0, 2, 1, 3).reshape(total_kv, num_kv_heads, head_dim)
+
+    # Fill the inline uint8 slot cache with the native write operator.
+    if kv_layout == "NHD":
+        slot_shape = (num_pages, page_size, num_kv_heads, head_dim + 16)
+    else:
+        slot_shape = (num_pages, num_kv_heads, page_size, head_dim + 16)
+    k_slot = torch.zeros(slot_shape, dtype=torch.uint8, device=dev)
+    v_slot = torch.zeros_like(k_slot)
+    k_sf = k_slot[..., head_dim : head_dim + 4].view(torch.float32).squeeze(-1)
+    v_sf = v_slot[..., head_dim : head_dim + 4].view(torch.float32).squeeze(-1)
+    flashinfer.fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
+        k_append,
+        v_append,
+        slot_mapping,
+        (k_slot, v_slot),
+        (k_sf, v_sf),
+        kv_layout=kv_layout,
+        kv_data_type=dtype,
+    )
+
+    # Carve the data + scale views and build the interleaved caches the read
+    # path consumes (data) plus the (k_sf, v_sf) scale tuple.
+    k_view = k_slot[..., :head_dim].view(dtype)
+    v_view = v_slot[..., :head_dim].view(dtype)
+    k_deq = (k_view.to(q_dtype).float() * k_sf.unsqueeze(-1)).to(q_dtype)
+    v_deq = (v_view.to(q_dtype).float() * v_sf.unsqueeze(-1)).to(q_dtype)
+    kv_view = torch.stack([k_view, v_view], dim=1)
+    kv_deq_cache = torch.stack([k_deq, v_deq], dim=1)
+    kv_orig_cache = torch.stack([k_ref, v_ref], dim=1)
+    kv_sf = (k_sf, v_sf)
+
+    q = torch.randn(total_qo, num_qo_heads, head_dim, dtype=q_dtype).to(dev)
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+
+    ref = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws, kv_layout=kv_layout, backend="fa2"
+    )
+    ref.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=q_dtype,
+        kv_data_type=q_dtype,
+    )
+    o_orig = ref.run(q, kv_orig_cache)
+    o_ref = ref.run(q, kv_deq_cache)
+
+    fi = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws, kv_layout=kv_layout, backend="fa2"
+    )
+    fi.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=q_dtype,
+        kv_data_type=dtype,
+        use_token_head_sf=True,
+    )
+    o_fp8 = fi.run(q, kv_view, kv_cache_sf=kv_sf)
+
+    assert o_fp8.shape == (total_qo, num_qo_heads, head_dim), o_fp8.shape
+    _check(o_fp8, o_ref, o_orig, "fp8_pth_write_read_paged")
+
+
+# ---------------------------------------------------------------------------
 # 4. batch prefill (paged) -- VO-split path (HEAD_DIM_VO >= 512)
 #
 # Exercises vosplit_compute_pv, which (unlike compute_sfm_v) reads the P

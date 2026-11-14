@@ -181,13 +181,32 @@ __device__ inline float calcFloatValue(uint32_t count, uint32_t exponent, uint64
   return reinterpret_cast<float&>(bitFloat);
 }
 
+// Deterministic bins sum 23-bit float mantissas as integers. A shared-memory
+// atomicAdd on 64-bit integers compiles to a compare-and-swap loop, while
+// 32-bit integer adds are native, so a bin can instead hold the high and low
+// mantissa parts in two 32-bit words. With fewer than MAX_SPLIT_MANTISSA_LEN
+// scanned elements neither word can overflow, and
+// (hi << MANTISSA_LO_BITS) + lo is the exact 64-bit sum.
+static constexpr int MANTISSA_LO_BITS = 12;
+static_assert(MANTISSA_LO_BITS >= 23 - MANTISSA_LO_BITS, "the low part must be the wider one");
+static constexpr IdxT MAX_SPLIT_MANTISSA_LEN = IdxT(1) << (32 - MANTISSA_LO_BITS);
+
 template <bool IsDeterministic, typename T, typename HisT_>
-__device__ constexpr void histAtomicAdd(HisT_* dst, T value) {
+__device__ __forceinline__ void histAtomicAdd(HisT_* histogramSmem, int bucket, T value,
+                                              bool splitMantissa) {
   if constexpr (IsDeterministic) {
+    static_assert(sizeof(HisT_) == sizeof(uint64_t), "split bins need 64-bit histogram storage");
     uint32_t m = calcMantissa(value);
-    atomicAdd(reinterpret_cast<unsigned long long*>(dst), static_cast<uint64_t>(m));
+    if (splitMantissa) {
+      uint32_t* parts = reinterpret_cast<uint32_t*>(histogramSmem);
+      atomicAdd(parts + bucket, m >> MANTISSA_LO_BITS);
+      atomicAdd(parts + NUM_BUCKETS + bucket, m & ((1u << MANTISSA_LO_BITS) - 1));
+    } else {
+      atomicAdd(reinterpret_cast<unsigned long long*>(histogramSmem + bucket),
+                static_cast<unsigned long long>(m));
+    }
   } else {
-    atomicAdd(dst, static_cast<float>(value));
+    atomicAdd(histogramSmem + bucket, static_cast<float>(value));
   }
 }
 
@@ -237,10 +256,12 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, T* outBuf, in
   __syncthreads();
   int const startBit = calcStartBit<T>(pass);
   uint32_t const mask = calcMask<T>(pass);
+  // A block only scans its own row, so previousLen bounds every bin's count.
+  bool const splitMantissa = previousLen < MAX_SPLIT_MANTISSA_LEN;
   if (pass == 0) {
-    auto f = [startBit, mask, histogramSmem, countHistogramSmem](T value, IdxT) {
+    auto f = [startBit, mask, histogramSmem, countHistogramSmem, splitMantissa](T value, IdxT) {
       int bucket = calcBucket<T>(value, startBit, mask);
-      histAtomicAdd<IsDeterministic, T>(histogramSmem + bucket, value);
+      histAtomicAdd<IsDeterministic, T>(histogramSmem, bucket, value, splitMantissa);
       atomicAdd(countHistogramSmem + bucket, static_cast<IdxT>(1));
     };
     vectorizedProcess<T>(static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x,
@@ -250,7 +271,7 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, T* outBuf, in
     auto const kthValueBits = counter->kthValueBits;
     int const previousStartBit = calcStartBit<T>(pass - 1);
     auto f = [outBuf, startBit, mask, previousStartBit, kthValueBits, pFilterCnt, histogramSmem,
-              countHistogramSmem](T value, IdxT) {
+              countHistogramSmem, splitMantissa](T value, IdxT) {
       auto const previousBits = (twiddleIn(value, false) >> previousStartBit) << previousStartBit;
       if (previousBits == kthValueBits) {
         if (outBuf) {
@@ -258,7 +279,7 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, T* outBuf, in
           outBuf[pos] = value;
         }
         int bucket = calcBucket<T>(value, startBit, mask);
-        histAtomicAdd<IsDeterministic, T>(histogramSmem + bucket, value);
+        histAtomicAdd<IsDeterministic, T>(histogramSmem, bucket, value, splitMantissa);
         atomicAdd(countHistogramSmem + bucket, static_cast<IdxT>(1));
       }
     };
@@ -267,12 +288,15 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, T* outBuf, in
   }
   __syncthreads();
   for (int i = threadIdx.x; i < NUM_BUCKETS; i += blockDim.x) {
-    if (histogramSmem[i] != 0) {
-      if constexpr (IsDeterministic)
-        atomicAdd(reinterpret_cast<unsigned long long*>(histogram + i),
-                  static_cast<unsigned long long>(histogramSmem[i]));
-      else
-        atomicAdd(histogram + i, histogramSmem[i]);
+    if constexpr (IsDeterministic) {
+      uint32_t const* parts = reinterpret_cast<uint32_t const*>(histogramSmem);
+      unsigned long long const sum =
+          splitMantissa ? (static_cast<unsigned long long>(parts[i]) << MANTISSA_LO_BITS) +
+                              parts[NUM_BUCKETS + i]
+                        : static_cast<unsigned long long>(histogramSmem[i]);
+      if (sum != 0) atomicAdd(reinterpret_cast<unsigned long long*>(histogram + i), sum);
+    } else {
+      if (histogramSmem[i] != 0) atomicAdd(histogram + i, histogramSmem[i]);
     }
     if (countHistogramSmem[i] != 0) atomicAdd(countHistogram + i, countHistogramSmem[i]);
   }

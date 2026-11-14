@@ -19,7 +19,7 @@ import torch
 from flashinfer import gdn_prefill as prefill_mod
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from flashinfer.jit import cake_gdn as cake_gdn
-from tests.test_helpers import cake_profiler
+from tests.cake.test_helpers import cake_profiler
 
 
 @pytest.fixture(autouse=True)
@@ -259,6 +259,8 @@ def _public_route_kwargs(case):
 
     major, minor = torch.cuda.get_device_capability(case["q"].device)
     return dict(
+        # the device's SM count, as the public launch passes it
+        sm_count=prefill_mod._cake_gdn_sm_count(case["q"].device.index),
         arch=cake_gdn.arch_for_compute_capability(major, minor),
         io_dtype={torch.bfloat16: "bfloat16", torch.float16: "float16"}[
             case["q"].dtype
@@ -286,7 +288,20 @@ def _launch_raw_indexed_prefill(case):
     major, minor = torch.cuda.get_device_capability(case["q"].device)
     arch = cake_gdn.arch_for_compute_capability(major, minor)
     route = _public_route(case)
-    entry = cake_gdn.load_cake_gdn_kernel(route.variant_name, arch)
+    empty_state = torch.empty(1, dtype=case["state_dtype"], device=case["q"].device)
+    checkpoints = case["state_checkpoints"] if case["checkpoint_every"] else empty_state
+    # The flavor the public launch would pick for these buffers: a padded pool whose
+    # slot stride is not a 16-byte multiple runs the guarded flavor.
+    aligned = prefill_mod._cake_gdn_state_vec_aligned(
+        (
+            (case["initial_state"], int(case["initial_state"].stride(0))),
+            (case["output_state"], int(case["output_state"].stride(0))),
+        ),
+        checkpoints,
+    )
+    entry = cake_gdn.load_cake_gdn_kernel(
+        route.variant_name, arch, **({} if aligned else {"state_vec_aligned": False})
+    )
     num_o_heads = max(case["num_q_heads"], case["num_v_heads"])
     dvsplit = route.route_id.endswith(".dvsplit")
     total_tiles = len(case["seq_lens"]) * num_o_heads * (2 if dvsplit else 1)
@@ -298,7 +313,6 @@ def _launch_raw_indexed_prefill(case):
         total_tiles, active_clusters, dvsplit, max(case["seq_lens"])
     )
     empty_i32 = torch.empty(1, dtype=torch.int32, device=case["q"].device)
-    empty_state = torch.empty(1, dtype=case["state_dtype"], device=case["q"].device)
     workspace = torch.empty(grid_x * 512, dtype=torch.uint8, device=case["q"].device)
     entry(
         case["q"],
@@ -311,7 +325,7 @@ def _launch_raw_indexed_prefill(case):
         case["state_indices"],
         case["initial_state"],
         case["output_state"],
-        case["state_checkpoints"] if case["checkpoint_every"] else empty_state,
+        checkpoints,
         case["checkpoint_cu_starts"] if case["checkpoint_every"] else empty_i32,
         workspace,
         int(case["initial_state"].stride(0)),
@@ -684,8 +698,10 @@ def test_public_cake_gdn_prefill_fp32_state_short_tiles_match_independent_recurr
 ):
     # The vLLM FP32-state contract with several short full-DV tiles per CTA: on
     # sm_107a these keys run the gate-stream twin (the epilogue warp streams the
-    # successor tile's gate/beta prologue); elsewhere the base body or its twin
-    # where shipped.  Output and final state match the reference recurrence.
+    # successor tile's gate/beta prologue), as its initial-state prefetch twin
+    # (the launch grid gives some CTA a second tile); elsewhere the base body or
+    # its twin where shipped.  Output and final state match the reference
+    # recurrence.
     num_q_heads, num_v_heads = heads
     case = _make_case(
         seq_lens=(128,) * num_seqs,
@@ -699,7 +715,7 @@ def test_public_cake_gdn_prefill_fp32_state_short_tiles_match_independent_recurr
     assert route.route_id == "flashinfer.gdn_prefill.noncp.full_dv", route.route_id
     major, minor = torch.cuda.get_device_capability()
     if cake_gdn.arch_for_compute_capability(major, minor) == "sm_107a":
-        assert "_initial_gatestream_full_sm107a_i64meta_" in route.variant_name, (
+        assert "_initial_gatestream_full_pf_sm107a_i64meta_" in route.variant_name, (
             route.variant_name
         )
     out, state = _launch(case)
@@ -707,6 +723,208 @@ def test_public_cake_gdn_prefill_fp32_state_short_tiles_match_independent_recurr
     torch.testing.assert_close(out.float(), expected_out.float(), atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(
         state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
+@pytest.mark.parametrize(
+    "state_dtype", (torch.float32, torch.bfloat16), ids=("fp32_state", "bf16_state")
+)
+def test_public_cake_gdn_prefill_short_tiles_initial_state_off_16_bytes_matches_aligned(
+    state_dtype,
+):
+    # On sm_107a these keys run the gate-stream prefetch twin, which asks L2 for
+    # the initial state of each tile that follows another tile on its CTA with
+    # 16-byte aligned bulk prefetches.  An initial state 8 (FP32) or 4 (BF16)
+    # bytes past a 16-byte boundary prefetches the aligned bytes inside it:
+    # output and final state equal the aligned call's bit for bit.
+    case = _make_case(
+        seq_lens=(128,) * 32,
+        state_dtype=state_dtype,
+        num_q_heads=4,
+        num_k_heads=4,
+        num_v_heads=16,
+    )
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) == "sm_107a":
+        route = _public_route(case)
+        assert "_gatestream_full_pf_sm107a_i64meta_" in route.variant_name, (
+            route.variant_name
+        )
+    initial_state = case["initial_state"]
+    aligned_out, aligned_state = _launch(case)
+    aligned_out, aligned_state = aligned_out.clone(), aligned_state.clone()
+    backing = torch.empty(
+        initial_state.numel() + 16, dtype=state_dtype, device=initial_state.device
+    )
+    shifted = backing[2 : 2 + initial_state.numel()].view(initial_state.shape)
+    shifted.copy_(initial_state)
+    assert shifted.is_contiguous() and shifted.data_ptr() % 16 != 0
+    shifted_case = dict(
+        case,
+        initial_state=shifted,
+        output=torch.full_like(case["output"], float("nan")),
+        output_state=torch.full_like(case["output_state"], float("nan")),
+    )
+    out, state = _launch(shifted_case)
+    torch.cuda.synchronize()
+    assert torch.equal(out, aligned_out)
+    assert torch.equal(state, aligned_state)
+
+
+@pytest.mark.parametrize(
+    "state_dtype", (torch.float32, torch.bfloat16), ids=("fp32_state", "bf16_state")
+)
+def test_public_cake_gdn_prefill_sm107a_gatestream_one_cta_per_tile_runs_the_twin_without_prefetch(
+    monkeypatch, state_dtype
+):
+    # The sm_107a gate-stream prefetch twin asks L2 for the initial state of each
+    # tile that follows another tile on its CTA, so the resolver takes it only
+    # when the launch grid gives some CTA a second tile.  The persistent grid
+    # loads the prefetch twin; a launch with one CTA per tile (an SM count of
+    # one SM a tile, seen by both the resolver and the launch) loads the
+    # gate-stream twin without the prefetch.  Both outputs and final states are
+    # equal bit for bit and match the reference recurrence.
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) != "sm_107a":
+        pytest.skip("the gate-stream prefetch twin is sm_107a only")
+    case = _make_case(
+        seq_lens=(128,) * 32,
+        state_dtype=state_dtype,
+        num_q_heads=4,
+        num_k_heads=4,
+        num_v_heads=16,
+    )
+    total_tiles = len(case["seq_lens"]) * case["num_v_heads"]
+    initial_state = case["initial_state"].clone()
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    # The loaded record and the launched grid (observed where the launch sizes its
+    # per-CTA workspace).
+    loaded = []
+    load = cake_gdn.load_cake_gdn_kernel
+
+    def loading(name, arch):
+        loaded.append(name)
+        return load(name, arch)
+
+    grids = []
+    workspace = prefill_mod._cake_gdn_tensormap_workspace
+
+    def recording(device_index, stream, grid_x):
+        grids.append(grid_x)
+        return workspace(device_index, stream, grid_x)
+
+    monkeypatch.setattr(cake_gdn, "load_cake_gdn_kernel", loading)
+    monkeypatch.setattr(prefill_mod, "_cake_gdn_tensormap_workspace", recording)
+    persistent_out, persistent_state = _launch(case)
+    torch.cuda.synchronize()
+    persistent_out = persistent_out.clone()
+    persistent_state = persistent_state.clone()
+    assert len(grids) == 1 and grids[0] < total_tiles, grids
+    (prefetch,) = loaded
+    assert "_gatestream_full_pf_sm107a_i64meta_" in prefetch, prefetch
+    monkeypatch.setattr(
+        prefill_mod, "_cake_gdn_sm_count", lambda _device_index: total_tiles
+    )
+    case["output"].fill_(float("nan"))
+    case["output_state"].fill_(float("nan"))
+    out, state = _launch(case)
+    torch.cuda.synchronize()
+    assert grids[1:] == [total_tiles], grids
+    assert loaded[1:] == [prefetch.replace("_gatestream_full_pf_", "_gatestream_full_")]
+    assert torch.equal(out, persistent_out)
+    assert torch.equal(state, persistent_state)
+    torch.testing.assert_close(out.float(), expected_out.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_public_cake_gdn_prefill_sm107a_f16io_gatestream_twins_equal_the_base_record(
+    monkeypatch,
+):
+    # The FP16-I/O full-DV key with several short tiles per CTA runs the gate-stream
+    # prefetch twin on the persistent grid and the gate-stream twin without the prefetch
+    # with one CTA per tile; with the twin rule off for the FP16-I/O body it runs the base
+    # record.  The twins only move data differently: all three outputs and final states
+    # are equal bit for bit and match the reference recurrence.
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) != "sm_107a":
+        pytest.skip("the FP16-I/O gate-stream twins are sm_107a only")
+    case = _make_case(
+        seq_lens=(128,) * 32,
+        io_dtype=torch.float16,
+        num_q_heads=4,
+        num_k_heads=4,
+        num_v_heads=16,
+    )
+    total_tiles = len(case["seq_lens"]) * case["num_v_heads"]
+    initial_state = case["initial_state"].clone()
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    loaded = []
+    load = cake_gdn.load_cake_gdn_kernel
+
+    def loading(name, arch):
+        loaded.append(name)
+        return load(name, arch)
+
+    grids = []
+    workspace = prefill_mod._cake_gdn_tensormap_workspace
+
+    def recording(device_index, stream, grid_x):
+        grids.append(grid_x)
+        return workspace(device_index, stream, grid_x)
+
+    monkeypatch.setattr(cake_gdn, "load_cake_gdn_kernel", loading)
+    monkeypatch.setattr(prefill_mod, "_cake_gdn_tensormap_workspace", recording)
+    results = []
+
+    def run():
+        case["output"].fill_(float("nan"))
+        case["output_state"].fill_(float("nan"))
+        out, state = _launch(case)
+        torch.cuda.synchronize()
+        results.append((out.clone(), state.clone()))
+
+    run()
+    assert len(grids) == 1 and grids[0] < total_tiles, grids
+    (prefetch,) = loaded
+    assert "_initial_f16io_gatestream_full_pf_sm107a_i64meta_" in prefetch, prefetch
+    real_sm_count = prefill_mod._cake_gdn_sm_count
+    monkeypatch.setattr(
+        prefill_mod, "_cake_gdn_sm_count", lambda _device_index: total_tiles
+    )
+    run()
+    assert grids[1:] == [total_tiles], grids
+    assert loaded[1:] == [prefetch.replace("_gatestream_full_pf_", "_gatestream_full_")]
+    monkeypatch.setattr(prefill_mod, "_cake_gdn_sm_count", real_sm_count)
+    monkeypatch.setattr(
+        cake_gdn,
+        "_GATE_STREAM_FULL_BASES",
+        cake_gdn._GATE_STREAM_FULL_BASES
+        - {"flashinfer_blackwell_gdn_prefill_initial_f16io"},
+    )
+    cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+    try:
+        run()
+    finally:
+        cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+    assert len(loaded) == 3
+    assert "_initial_f16io_sm107a_i64meta_" in loaded[2], loaded
+    record = cake_gdn._kernel_record(loaded[2])
+    for name in loaded[:2]:
+        assert (
+            cake_gdn._kernel_record(name)["specializations"]
+            == record["specializations"]
+        )
+    base_out, base_state = results[2]
+    for out, state in results[:2]:
+        assert torch.equal(out, base_out)
+        assert torch.equal(state, base_state)
+    torch.testing.assert_close(
+        base_out.float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        base_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
     )
 
 
@@ -770,6 +988,211 @@ def test_public_cake_gdn_prefill_sm107a_ragged_dvsplit_route_matches_independent
         assert torch.equal(runs[0][0], runs[1][0])
         assert torch.equal(runs[0][1], runs[1][1])
         assert grids == [expected_grid, expected_grid]
+
+
+@pytest.mark.parametrize(
+    ("io_dtype", "state_dtype", "initial", "heads", "seq_lens", "split"),
+    (
+        # BF16 I/O, BF16 state, with an initial state: Hq8/Hv16, 512 half tiles
+        (
+            torch.bfloat16,
+            torch.bfloat16,
+            True,
+            (8, 16),
+            (4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1, 1),
+            "_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_",
+        ),
+        # FP16 I/O, FP32 state, with an initial state: Hq4/Hv16, 512 half tiles
+        (
+            torch.float16,
+            torch.float32,
+            True,
+            (4, 16),
+            (4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1, 1),
+            "_dvsplit_initial_f16io_sm107a_l7_vec2_",
+        ),
+        # BF16 / FP16 I/O, FP32 state, no initial state: Hq16/Hv32, 1024 half tiles
+        (
+            torch.bfloat16,
+            torch.float32,
+            False,
+            (16, 32),
+            (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1),
+            "_dvsplit_sm107a_l7_vec2_",
+        ),
+        (
+            torch.float16,
+            torch.float32,
+            False,
+            (16, 32),
+            (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1),
+            "_dvsplit_f16io_sm107a_l7_vec2_",
+        ),
+    ),
+    ids=("bf16_state", "f16_io", "no_initial_state", "f16_io_no_initial_state"),
+)
+def test_public_cake_gdn_prefill_sm107a_ragged_dvsplit_route_of_each_contract_matches_independent_recurrence(
+    monkeypatch, io_dtype, state_dtype, initial, heads, seq_lens, split
+):
+    # The BF16-state, FP16-I/O and no-initial-state contracts of the ragged DV-split route:
+    # a ragged batch over the DV-split tile budget whose critical path is its long first
+    # sequence runs its contract's DV-split body with one CTA per half tile when
+    # ``cu_seqlens_cpu`` is passed, else the full-DV body on the grid rule's grid.  Both
+    # match the reference recurrence and repeat bitwise.
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) != "sm_107a":
+        pytest.skip("the ragged DV-split route is sm_107a only")
+    num_q_heads, num_v_heads = heads
+    case = _make_case(
+        seq_lens=seq_lens,
+        io_dtype=io_dtype,
+        state_dtype=state_dtype,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+    )
+    if not initial:
+        case["initial_state"] = None
+    initial_state = (
+        None if case["initial_state"] is None else case["initial_state"].clone()
+    )
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    unrouted = _public_route(case)
+    assert unrouted.route_id == "flashinfer.gdn_prefill.noncp.full_dv"
+    assert unrouted.one_cta_per_tile is False
+    routed = cake_gdn.select_cake_gdn_prefill_variant(
+        **_public_route_kwargs(case), host_seq_lens=seq_lens
+    )
+    assert routed.route_id == "flashinfer.gdn_prefill.noncp.dvsplit"
+    assert routed.one_cta_per_tile is True
+    assert split in routed.variant_name, routed.variant_name
+    grids = []
+    workspace = prefill_mod._cake_gdn_tensormap_workspace
+
+    def recording(device_index, stream, grid_x):
+        grids.append(grid_x)
+        return workspace(device_index, stream, grid_x)
+
+    monkeypatch.setattr(prefill_mod, "_cake_gdn_tensormap_workspace", recording)
+    sm_count = torch.cuda.get_device_properties(case["q"].device).multi_processor_count
+    full_dv_tiles = len(seq_lens) * max(heads)
+    full_dv_grid = cake_gdn._cake_gdn_prefill_grid_x(
+        full_dv_tiles, sm_count, False, sum(seq_lens)
+    )
+    assert full_dv_grid <= sm_count < 2 * full_dv_tiles
+    for host_copy, expected_grid in (
+        ({"cu_seqlens_cpu": _host_cu_seqlens(seq_lens)}, 2 * full_dv_tiles),
+        ({}, full_dv_grid),
+    ):
+        runs = []
+        grids.clear()
+        for _ in range(2):
+            case["output"].fill_(float("nan"))
+            if initial_state is None:
+                case["output_state"].fill_(float("nan"))
+            else:
+                case["output_state"].copy_(initial_state)
+            out, state = _launch(case, **host_copy)
+            torch.cuda.synchronize()
+            runs.append((out.clone(), state.clone()))
+        for out, state in runs:
+            assert torch.isfinite(out.float()).all()
+            assert torch.isfinite(state.float()).all()
+        torch.testing.assert_close(
+            runs[0][0].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            runs[0][1].float(), expected_state.float(), atol=1e-2, rtol=1e-2
+        )
+        assert torch.equal(runs[0][0], runs[1][0])
+        assert torch.equal(runs[0][1], runs[1][1])
+        assert grids == [expected_grid, expected_grid]
+
+
+@pytest.mark.parametrize(
+    ("io_dtype", "state_dtype", "initial", "heads"),
+    (
+        (torch.bfloat16, torch.bfloat16, True, (8, 32)),
+        (torch.bfloat16, torch.float32, False, (16, 32)),
+        (torch.float16, torch.float32, False, (16, 64)),
+    ),
+    ids=("bf16_state", "no_initial_state", "f16_io_no_initial_state"),
+)
+@pytest.mark.parametrize("seq_len", (2048, 2049), ids=("max2048", "max2049"))
+def test_public_cake_gdn_prefill_sm107a_vec2full_twin_equals_the_shared_record(
+    monkeypatch, io_dtype, state_dtype, initial, heads, seq_len
+):
+    # A full-DV batch of the BF16-state contract (without gate streaming) or of the FP32-state
+    # contracts without an initial state runs the key's vec2-full twin record when its longest
+    # sequence is at most 2048 tokens and the shared record above that.  The twin only moves
+    # the state differently: with the rule's bound moved to the other side, the other record
+    # of the same key gives the same output and final state bit for bit, and both match the
+    # reference recurrence.
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) != "sm_107a":
+        pytest.skip("the vec2-full twin records are sm_107a only")
+    num_q_heads, num_v_heads = heads
+    seq_lens = (seq_len,) * 4
+    case = _make_case(
+        seq_lens=seq_lens,
+        io_dtype=io_dtype,
+        state_dtype=state_dtype,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+    )
+    if not initial:
+        case["initial_state"] = None
+    initial_state = (
+        None if case["initial_state"] is None else case["initial_state"].clone()
+    )
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    loaded = []
+    load = cake_gdn.load_cake_gdn_kernel
+
+    def loading(name, arch):
+        loaded.append(name)
+        return load(name, arch)
+
+    monkeypatch.setattr(cake_gdn, "load_cake_gdn_kernel", loading)
+    results = []
+
+    def run():
+        case["output"].fill_(float("nan"))
+        if initial_state is None:
+            case["output_state"].fill_(float("nan"))
+        else:
+            case["output_state"].copy_(initial_state)
+        out, state = _launch(case, cu_seqlens_cpu=_host_cu_seqlens(seq_lens))
+        torch.cuda.synchronize()
+        results.append((out.clone(), state.clone()))
+
+    run()
+    twin_first = seq_len <= 2048
+    limit = cake_gdn._VEC2FULL_MAX_TILE_CHUNKS
+    cake_gdn._VEC2FULL_MAX_TILE_CHUNKS = -1 if twin_first else 1 << 20
+    cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+    try:
+        run()
+    finally:
+        cake_gdn._VEC2FULL_MAX_TILE_CHUNKS = limit
+        cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+    assert len(loaded) == 2, loaded
+    twin, shared = loaded if twin_first else loaded[::-1]
+    assert "_sm107a_vec2full_i64meta_" in twin, loaded
+    assert shared == twin.replace("_sm107a_vec2full_i64meta_", "_sm107a_i64meta_")
+    twin_record = cake_gdn._kernel_record(twin)
+    shared_record = cake_gdn._kernel_record(shared)
+    assert twin_record["specializations"] == shared_record["specializations"]
+    assert twin_record["outputs"] != shared_record["outputs"]
+    (out, state), (other_out, other_state) = results
+    assert torch.isfinite(out.float()).all() and torch.isfinite(state.float()).all()
+    assert torch.equal(out, other_out)
+    assert torch.equal(state, other_state)
+    torch.testing.assert_close(out.float(), expected_out.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
 
 
 def _carry_segment(case, start, stop, initial_state):
@@ -880,6 +1303,106 @@ def test_public_cake_gdn_prefill_raw_ffi_bf16_indexed_checkpoint_b7_t421_noncomp
             atol=0,
             rtol=0,
         )
+
+
+@pytest.mark.parametrize("layout", ("unused_output_off_by_one", "padded_pool"))
+def test_public_cake_gdn_prefill_state_flavor_is_decided_on_the_launched_buffers(
+    monkeypatch, layout
+):
+    """The prefill state flavor is decided on the buffers and slot strides the entry gets.
+
+    A stateless call (no initial state, ``output_final_state=False``) ignores its
+    ``output_state`` and launches the sentinel, so a misaligned ``output_state`` keeps
+    the aligned flavor and the same output bits as a call without it; an indexed pool
+    whose slot stride is not a 16-byte multiple takes the guarded flavor.
+    """
+
+    if layout == "padded_pool":
+        case = _make_case(
+            seq_lens=(64, 37),
+            indexed=True,
+            state_dtype=torch.bfloat16,
+            state_pool_padding=257,
+        )
+        stateful, expect_aligned = True, False
+        initial_state = case["initial_state"].clone()
+        expected_out, _, _ = _reference(case, initial_state)
+    else:
+        # The shipped stateless single-chunk key (see the absent-gates test).
+        case = _make_case(
+            seq_lens=(64,) * 4, num_q_heads=4, num_k_heads=4, num_v_heads=8
+        )
+        case["initial_state"] = None
+        dense = case["output_state"]
+        backing = torch.empty(dense.numel() + 4, dtype=dense.dtype, device="cuda")
+        case["output_state"] = backing[1 : 1 + dense.numel()].view(dense.shape)
+        assert case["output_state"].data_ptr() % 16 != 0
+        stateful, expect_aligned = False, True
+
+    def launch(output_state):
+        return chunk_gated_delta_rule(
+            q=case["q"],
+            k=case["k"],
+            v=case["v"],
+            g=case["g"],
+            beta=case["beta"],
+            scale=case["scale"],
+            initial_state=case["initial_state"],
+            output_final_state=stateful,
+            cu_seqlens=case["cu_seqlens"],
+            cu_seqlens_cpu=_host_cu_seqlens(case["seq_lens"]),
+            use_qk_l2norm_in_kernel=False,
+            output=case["output"],
+            output_state=output_state,
+            use_cp=False,
+            state_indices=case["state_indices"],
+            backend="cake_gdn",
+        )
+
+    if not stateful:
+        launch(None)
+        torch.cuda.synchronize()
+        expected_out = case["output"].clone()
+        case["output"].fill_(float("nan"))
+    decisions, launches = [], []
+    rule = prefill_mod._cake_gdn_state_vec_aligned
+    load = cake_gdn.load_cake_gdn_kernel
+
+    def deciding(slot_states, checkpoints):
+        aligned = rule(slot_states, checkpoints)
+        decisions.append((slot_states, checkpoints, aligned))
+        return aligned
+
+    def loading(name, arch, **kwargs):
+        entry = load(name, arch, **kwargs)
+
+        def launching(*args):
+            launches.append((kwargs.get("state_vec_aligned", True), args))
+            return entry(*args)
+
+        return launching
+
+    monkeypatch.setattr(prefill_mod, "_cake_gdn_state_vec_aligned", deciding)
+    monkeypatch.setattr(cake_gdn, "load_cake_gdn_kernel", loading)
+    launch(case["output_state"])
+    torch.cuda.synchronize()
+    ((slot_states, checkpoints, aligned),) = decisions
+    ((flavor, args),) = launches
+    assert aligned is expect_aligned and flavor is expect_aligned, (aligned, flavor)
+    (initial, initial_stride), (output, output_stride) = slot_states
+    # Entry ABI: initial state, output state, checkpoints at 8..10, slot strides at 13, 14.
+    assert args[8] is initial and args[9] is output and args[10] is checkpoints
+    assert (args[13], args[14]) == (initial_stride, output_stride)
+    if stateful:
+        assert initial is case["initial_state"] and output is case["output_state"]
+        torch.testing.assert_close(
+            case["output"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+        )
+    else:
+        # Both state buffers are the one-element sentinel.
+        assert output is not case["output_state"] and output.numel() == 1
+        assert initial.numel() == 1
+        assert torch.equal(case["output"], expected_out)
 
 
 def test_public_cake_gdn_prefill_api_bf16_indexed_checkpoint_b5_t4296_live_matches_independent_recurrence():
@@ -1049,7 +1572,7 @@ def _forbidden_sync_names(names):
 def _profile_window(fn, attempts=cake_profiler.ATTEMPTS):
     """Names of the CUDA runtime/device events of ``fn`` (CPU events inside its window).
 
-    Sentinel kernels open and close the window (``tests.test_helpers.cake_profiler``): a
+    Sentinel kernels open and close the window (``tests.cake.test_helpers.cake_profiler``): a
     session whose device records miss a leading or the trailing one lost CUDA activity
     (some torch / CUPTI builds of the nightly images do), so the window is profiled again;
     after ``attempts`` such sessions the test is skipped.  The sentinels' own records are
@@ -1625,7 +2148,7 @@ def _live_arch(case):
 def _device_kernel_names(fn):
     """Names of the device kernels ``fn`` launches (profiler CUDA activities; copies excluded).
 
-    ``tests.test_helpers.cake_profiler`` brackets the call with sentinel kernels and retries a
+    ``tests.cake.test_helpers.cake_profiler`` brackets the call with sentinel kernels and retries a
     session that lost its CUDA records; ``fn`` runs once more as the profiler's warm-up call.
     """
 

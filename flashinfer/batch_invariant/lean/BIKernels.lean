@@ -1,5 +1,8 @@
+-- Copyright (c) 2026 by FlashInfer team.
+-- SPDX-License-Identifier: Apache-2.0
 import BIKernels.GEMM
 import BIKernels.GEMMConfig
+import BIKernels.Attention
 import BIKernels.Export
 import BIKernels.Cases
 import BIKernels.Canon
@@ -9,3 +12,24 @@ import BIKernels.MXQuant
 import BIKernels.Quant
 import BIKernels.QuantExport
 import BIKernels.QuantCases
+import BIKernels.Sampling
+import BIKernels.Stream
+import BIKernels.Draw
+import BIKernels.SamplingCases
+import BIKernels.MoE
+import BIKernels.MoECases
+import BIKernels.MegaMoE
+import BIKernels.MegaMoECases
+import BIKernels.NVFP4MegaMoE
+import BIKernels.NVFP4MegaMoECases
+import BIKernels.MXFP4MegaMoE
+import BIKernels.MXFP4MegaMoECases
+import BIKernels.MXFP8MegaMoE
+import BIKernels.MXFP8MegaMoECases
+import BIKernels.NumericalVariants
+import BIKernels.NumericalVariantsCases
+import BIKernels.A16MegaMoE
+import BIKernels.A16MegaMoECases
+import BIKernels.CombineWire
+import BIKernels.CombineWireCases
+import BIKernels.QuantizedStagePartition

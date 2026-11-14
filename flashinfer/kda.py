@@ -240,9 +240,17 @@ def recurrent_kda(
             Query of shape ``[B, T, H, K]``, or
             ``[1, total_tokens, H, K]`` when using ``cu_seqlens``. Must be
             bfloat16. ``T=1`` selects decode; eligible ``T>1`` calls may select
-            the frozen prefill backend. Ordinary prefill accepts strided Q/K:
-            dense-only providers pack them internally, while cuDNN retains
-            supported strides. Other inputs keep their layout requirements.
+            the frozen prefill backend. Ordinary prefill with ``"auto"``,
+            ``"cake"`` or ``"small-bh"`` packs strided Q/K; ``"auto"`` can
+            select CuTe prefill with supported token-strided V. Explicit
+            ``"cute-dsl"`` and ``"cute-dsl-persistent"`` read Q/K/V views
+            directly when head/features are contiguous, base pointers and
+            token pitches are 16-byte aligned, and fixed batches flatten
+            without a copy. Ordinary ``"cute-dsl"`` packs unsupported Q/K
+            layouts; persistent CuTe requires the supported layout. V is never
+            packed automatically and must meet the selected backend's layout
+            requirements. cuDNN retains its supported strides. Other inputs
+            keep their layout requirements.
         k (torch.Tensor):
             Key with the same shape as ``q``. Must be bfloat16.
         v (torch.Tensor):
@@ -271,7 +279,8 @@ def recurrent_kda(
         initial_state (Optional[torch.Tensor]):
             Initial state of shape ``[N, HV, V, K]``. Eligible prefill
             backends accept bfloat16 or float32; decode, speculative decode and
-            packed calls with no more tokens than sequences require bfloat16.
+            packed calls with no more tokens than sequences accept bfloat16 or
+            float32 on the CuTe DSL kernels (Cake requires bfloat16).
             If ``None``, zero-initialized. Updated in-place. For
             batched spec decode without ``cu_seqlens``, ``N`` is the packed
             checkpoint-slot count ``B * (1 + num_spec_tokens)`` when
@@ -402,9 +411,10 @@ def recurrent_kda(
             64 or a larger cache-page-aligned multiple.
         backend (Literal["auto", "cute-dsl", "cute-dsl-persistent", "tirx", "ptx", "cake", "small-bh", "cudnn"]):
             Implementation backend. ``"cute-dsl-persistent"`` explicitly selects
-            the SM100/SM103 persistent prefill kernel with contiguous BF16
-            inputs, D128, heads divisible by eight, FP32 state, fused Q/K
-            normalization and beta sigmoid, and a gate bound in [-5, 0).
+            the SM100/SM103 persistent prefill kernel with token-strided BF16
+            Q/K/V and contiguous G/beta, D128, heads divisible by eight,
+            FP32 state, fused Q/K normalization and beta sigmoid, and a gate
+            bound in [-5, 0).
             Packed sequences must be nonempty. Graph capture requires an
             explicit workspace and output, warmed with the exact tensors;
             sequence offsets must remain fixed throughout replay.
@@ -777,7 +787,14 @@ def recurrent_kda(
                 beta=beta,
                 initial_state=initial_state,
             )
-        q, k = q.contiguous(), k.contiguous()
+        if backend != "cute-dsl" or not (
+            q.ndim == 4 and _kda_prefill._supports_strided_qkv(q)
+        ):
+            q = q.contiguous()
+        if backend != "cute-dsl" or not (
+            k.ndim == 4 and _kda_prefill._supports_strided_qkv(k)
+        ):
+            k = k.contiguous()
     if backend in ("auto", "small-bh"):
         small_bh_available = (
             is_cute_dsl_available()

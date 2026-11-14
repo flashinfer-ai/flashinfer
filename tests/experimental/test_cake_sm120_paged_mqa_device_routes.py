@@ -111,7 +111,10 @@ REMOVED = frozenset(
         "sm120:fp8:h64:p64:n4:a2:atom2_mpf_bta_ha_k2q",
         "sm120:fp8:h64:p64:n4:a2:atom2_mx_bta_ha_wr",
         "sm120:fp8:h64:p64:n4:a4:mpf_bta_ha_k2q_ef_dynv28_p3s1",
+        "sm120:fp8:h64:p64:n5:a3:par",
         "sm120:fp8:h64:p64:n6:a2:atom2_mpf_bta_ha_k2q",
+        "sm120:fp8:h64:p64:n6:a2:par",
+        "sm120:fp8:h64:p64:n6:a3:par",
     }
 )
 TABLE_KEY = re.compile(r"^h(\d+):p(\d+):n(\d+):(a\d+):(\w+)$")

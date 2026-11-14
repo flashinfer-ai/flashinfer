@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Single-GPU tests of ``cake_causal_conv1d_det_multi_kcp`` (FlashInfer issue #7815): the convolutions of several tensors of
+Single-GPU tests of ``cake_causal_conv1d_det_kcp_multi`` (FlashInfer issue #7815): the convolutions of several tensors of
 one layer (q / k / v) with one halo exchange per direction.  One process, world size 1 (the rank holds every fragment
 of a partitioned problem, so history rows, head rows and the tail fold all run; one rank issues no collective).  The
 criterion is bitwise equality with one ``cake_causal_conv1d_det_kcp`` call per tensor: ``y``, ``hist``, ``dx`` and
@@ -47,6 +47,11 @@ MROWS = [(name, lens, cuts, (C, C, C)) for name, lens, cuts, C in ROWS] + [
     ("short-mixed", (1, 2, 3, 57), (3, 30, 30), (384, 128, 8)),
     ("one-tensor", (5000, 1003), (1, 2, 4997, 1003), (512,)),
 ]
+# The multi entry's production layer (FlashInfer issue #8365): one rank's 16384 tokens and three convolutions of
+# C = 8192; kept out of ``MROWS`` (other suites import it).
+MROWS_8365 = [
+    ("8365-c8192x3", (9000, 5000, 2384), (4095, 4097, 4099, 4093), (8192, 8192, 8192)),
+]
 
 
 def _bits(t):
@@ -58,7 +63,9 @@ def _same(a, b) -> bool:
 
 
 def _kcp():
-    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import (
+        kcp as conv_kcp,
+    )
 
     return conv_kcp
 
@@ -78,20 +85,22 @@ def _problem(lens, cuts, Cs, device, seed=7815):
 def _singles_explicit(conv_kcp, ctx, xs, ws, dys):
     out = []
     for x, w, dy in zip(xs, ws, dys, strict=True):
-        y, hist = conv_kcp.cake_causal_conv1d_det_forward_kcp(x, w, ctx)
-        dx, dw = conv_kcp.cake_causal_conv1d_det_backward_kcp(x, w, ctx, dy, hist)
+        y, hist = conv_kcp.cake_causal_conv1d_det_train_kcp_forward(x, w, ctx)
+        dx, dw = conv_kcp.cake_causal_conv1d_det_train_kcp_backward(x, w, ctx, dy, hist)
         out.append({"y": y, "hist": hist, "dx": dx, "dw": dw})
     return out
 
 
-@pytest.mark.parametrize("name,lens,cuts,Cs", MROWS, ids=[r[0] for r in MROWS])
+@pytest.mark.parametrize(
+    "name,lens,cuts,Cs", MROWS + MROWS_8365, ids=[r[0] for r in MROWS + MROWS_8365]
+)
 def test_multi_forward_backward_bitwise_single_calls(name, lens, cuts, Cs) -> None:
     conv_kcp = _kcp()
     device = torch.device("cuda")
     ctx, xs, ws, dys = _problem(lens, cuts, Cs, device)
     ref = _singles_explicit(conv_kcp, ctx, xs, ws, dys)
-    ys, hists = conv_kcp.cake_causal_conv1d_det_multi_forward_kcp(xs, ws, ctx)
-    dxs, dws = conv_kcp.cake_causal_conv1d_det_multi_backward_kcp(
+    ys, hists = conv_kcp.cake_causal_conv1d_det_train_kcp_multi_forward(xs, ws, ctx)
+    dxs, dws = conv_kcp.cake_causal_conv1d_det_train_kcp_multi_backward(
         xs, ws, ctx, dys, hists
     )
     torch.cuda.synchronize()
@@ -103,10 +112,12 @@ def test_multi_forward_backward_bitwise_single_calls(name, lens, cuts, Cs) -> No
         assert _same(dws[i], r["dw"]), (name, i, "dweight")
     # caller-owned outputs are written in place, same bits
     outs = [torch.empty_like(x) for x in xs]
-    ys2, _ = conv_kcp.cake_causal_conv1d_det_multi_forward_kcp(xs, ws, ctx, outs=outs)
+    ys2, _ = conv_kcp.cake_causal_conv1d_det_train_kcp_multi_forward(
+        xs, ws, ctx, outs=outs
+    )
     dx_o = [torch.empty_like(x) for x in xs]
     dw_o = [torch.empty_like(w) for w in ws]
-    dxs2, dws2 = conv_kcp.cake_causal_conv1d_det_multi_backward_kcp(
+    dxs2, dws2 = conv_kcp.cake_causal_conv1d_det_train_kcp_multi_backward(
         xs, ws, ctx, dys, hists, dxs=dx_o, dweights=dw_o
     )
     for i, r in enumerate(ref):
@@ -133,7 +144,7 @@ def test_multi_autograd_and_facade_bitwise_single_calls(
         xl = [x.clone().requires_grad_(True) for x in xs]
         wl = [w.clone().requires_grad_(True) for w in ws]
         if multi:
-            ys = facade.cake_causal_conv1d_det_multi_kcp(xl, wl, ctx)
+            ys = facade.cake_causal_conv1d_det_kcp_multi(xl, wl, ctx)
         else:
             ys = [
                 facade.cake_causal_conv1d_det_kcp(x, w, ctx)
@@ -192,7 +203,7 @@ def test_multi_recompute_handle_bitwise_single_handles(
         def fn(*args):
             a_x, a_w, a_h = args[:n], args[n : 2 * n], args[2 * n :]
             if multi:
-                return facade.cake_causal_conv1d_det_multi_kcp(
+                return facade.cake_causal_conv1d_det_kcp_multi(
                     a_x, a_w, ctx, recompute_handle=a_h[0]
                 )
             return tuple(
@@ -209,10 +220,10 @@ def test_multi_recompute_handle_bitwise_single_handles(
         ]
 
     direct = run(False, [None] * n, ckpt=False)
-    singles_h = [conv_kcp.RecomputeHandleDetKcp() for _ in range(n)]
+    singles_h = [conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle() for _ in range(n)]
     single_handles = run(False, singles_h)
     plain_multi = run(True, [None])
-    h = conv_kcp.RecomputeHandleDetKcp()
+    h = conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
     conv_kcp.LAST_CALL.pop("recompute_handle", None)
     multi_handle = run(True, [h])
     assert conv_kcp.LAST_CALL["recompute_handle"] == {"fwd": "replay", "n": n}
@@ -246,7 +257,7 @@ def test_multi_recompute_handle_retain_graph_and_nested() -> None:
     )
 
     def fn(xq, xk, xv, wq, wk, wv, h):
-        return facade.cake_causal_conv1d_det_multi_kcp(
+        return facade.cake_causal_conv1d_det_kcp_multi(
             (xq, xk, xv), (wq, wk, wv), ctx, recompute_handle=h
         )
 
@@ -260,7 +271,7 @@ def test_multi_recompute_handle_retain_graph_and_nested() -> None:
     torch.autograd.backward(list(ys), list(dys))
     direct = [t.grad for t in a]
     a = leaves()
-    h = conv_kcp.RecomputeHandleDetKcp()
+    h = conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
     h.entries["kda"] = {"marker": torch.zeros(1, device=device)}
     ys = checkpoint(fn, *a, h, use_reentrant=False)
     torch.autograd.backward(list(ys), list(dys), retain_graph=True)
@@ -274,7 +285,7 @@ def test_multi_recompute_handle_retain_graph_and_nested() -> None:
         return tuple(y * torch.ones_like(y) for y in yi)
 
     a = leaves()
-    h = conv_kcp.RecomputeHandleDetKcp()
+    h = conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
     ys = checkpoint(outer, *a, h, use_reentrant=False)
     conv_kcp.LAST_CALL.pop("recompute_handle", None)
     torch.autograd.backward(list(ys), list(dys))
@@ -290,25 +301,25 @@ def test_multi_recompute_handle_misuse_raises() -> None:
     device = torch.device("cuda")
     ctx, xs, ws, _ = _problem((5000, 1003), (1, 2, 4997, 1003), (512, 512, 512), device)
     # a handle used outside the backward a second time (reuse across micro-steps)
-    h = conv_kcp.RecomputeHandleDetKcp()
-    facade.cake_causal_conv1d_det_multi_kcp(xs, ws, ctx, recompute_handle=h)
+    h = conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
+    facade.cake_causal_conv1d_det_kcp_multi(xs, ws, ctx, recompute_handle=h)
     with pytest.raises(RuntimeError, match="recompute_handle"):
-        facade.cake_causal_conv1d_det_multi_kcp(xs, ws, ctx, recompute_handle=h)
+        facade.cake_causal_conv1d_det_kcp_multi(xs, ws, ctx, recompute_handle=h)
     # graph replay and a non-handle are refused
     with pytest.raises(ValueError, match="recompute_handle"):
-        conv_kcp.cake_causal_conv1d_det_multi_kcp(
+        conv_kcp.cake_causal_conv1d_det_kcp_multi(
             xs,
             ws,
             ctx,
             graph="replay",
-            recompute_handle=conv_kcp.RecomputeHandleDetKcp(),
+            recompute_handle=conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle(),
         )
     with pytest.raises(TypeError, match="entries"):
-        conv_kcp.cake_causal_conv1d_det_multi_kcp(
+        conv_kcp.cake_causal_conv1d_det_kcp_multi(
             xs, ws, ctx, recompute_handle=object()
         )
     # entries of a single call / another tensor count are not a multi entry, and the reverse
-    single = conv_kcp.RecomputeHandleDetKcp()
+    single = conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
     facade.cake_causal_conv1d_det_kcp(xs[0], ws[0], ctx, recompute_handle=single)
     with pytest.raises(ValueError, match="multi-call"):
         conv_kcp._handle_hists(single.entries["conv"], xs, ctx)
@@ -316,20 +327,20 @@ def test_multi_recompute_handle_misuse_raises() -> None:
         conv_kcp._handle_hists(h.entries["conv"], xs[:2], ctx)
     with pytest.raises(ValueError, match="hist"):
         conv_kcp._handle_hist(h.entries["conv"], xs[0], ctx)
-    with pytest.raises(ValueError, match="ContextDetKcp"):
+    with pytest.raises(ValueError, match="another KCP context"):
         other, _, _, _ = _problem((5000, 1003), (1, 2, 4997, 1003), (512,), device)
         conv_kcp._handle_hists(h.entries["conv"], xs, other)
     bound = conv_kcp._handle_hists(h.entries["conv"], xs, ctx)
     assert all(a is b for a, b in zip(bound, h.entries["conv"]["hists"], strict=True))
     # operand shape errors
     with pytest.raises(TypeError, match="sequences"):
-        conv_kcp.cake_causal_conv1d_det_multi_kcp(xs[0], ws[0], ctx)
+        conv_kcp.cake_causal_conv1d_det_kcp_multi(xs[0], ws[0], ctx)
     with pytest.raises(ValueError, match="same number"):
-        conv_kcp.cake_causal_conv1d_det_multi_kcp(xs, ws[:2], ctx)
+        conv_kcp.cake_causal_conv1d_det_kcp_multi(xs, ws[:2], ctx)
     with pytest.raises(ValueError, match="same number"):
-        conv_kcp.cake_causal_conv1d_det_multi_kcp([], [], ctx)
+        conv_kcp.cake_causal_conv1d_det_kcp_multi([], [], ctx)
     with pytest.raises(ValueError):
-        conv_kcp.cake_causal_conv1d_det_multi_forward_kcp(
+        conv_kcp.cake_causal_conv1d_det_train_kcp_multi_forward(
             [xs[0], xs[1][:-1].contiguous()], ws[:2], ctx
         )
 
@@ -341,8 +352,8 @@ def test_multi_empty_rank_returns_empty_outputs() -> None:
     Cs = (512, 256, 512)
     xs = [torch.empty(0, C, dtype=torch.bfloat16, device=device) for C in Cs]
     ws = [torch.randn(C, WIDTH, device=device) for C in Cs]
-    ys, hists = conv_kcp.cake_causal_conv1d_det_multi_forward_kcp(xs, ws, ctx)
-    dxs, dws = conv_kcp.cake_causal_conv1d_det_multi_backward_kcp(
+    ys, hists = conv_kcp.cake_causal_conv1d_det_train_kcp_multi_forward(xs, ws, ctx)
+    dxs, dws = conv_kcp.cake_causal_conv1d_det_train_kcp_multi_backward(
         xs, ws, ctx, [torch.empty_like(x) for x in xs], hists
     )
     for y, dx, dw, C in zip(ys, dxs, dws, Cs, strict=True):
@@ -363,11 +374,11 @@ def test_multi_graph_replay_is_bitwise() -> None:
     try:
         events = []
         for _ in range(4):
-            ys, hists = conv_kcp.cake_causal_conv1d_det_multi_forward_kcp(
+            ys, hists = conv_kcp.cake_causal_conv1d_det_train_kcp_multi_forward(
                 xs, ws, ctx, graph="replay"
             )
             events.append(conv_kcp.LAST_CALL["fwd_multi"]["graph_event"])
-            dxs, dws = conv_kcp.cake_causal_conv1d_det_multi_backward_kcp(
+            dxs, dws = conv_kcp.cake_causal_conv1d_det_train_kcp_multi_backward(
                 xs, ws, ctx, dys, hists, graph="replay"
             )
             events.append(conv_kcp.LAST_CALL["bwd_multi"]["graph_event"])
@@ -386,7 +397,7 @@ def test_multi_graph_replay_is_bitwise() -> None:
         ], events
         # the autograd entry carries the keyword to the forward and the backward
         xl = [x.clone().requires_grad_(True) for x in xs]
-        ys = conv_kcp.cake_causal_conv1d_det_multi_kcp(xl, ws, ctx, graph="replay")
+        ys = conv_kcp.cake_causal_conv1d_det_kcp_multi(xl, ws, ctx, graph="replay")
         assert conv_kcp.LAST_CALL["fwd_multi"]["graph"] == "replay"
         torch.autograd.backward(list(ys), list(dys))
         assert conv_kcp.LAST_CALL["bwd_multi"]["graph"] == "replay"
@@ -408,13 +419,13 @@ def test_multi_one_rank_issues_no_exchange(monkeypatch) -> None:
     monkeypatch.setattr(
         conv_kcp, "_exchange", lambda *a, **kw: calls.append(1) or original(*a, **kw)
     )
-    ys, hists = conv_kcp.cake_causal_conv1d_det_multi_forward_kcp(xs, ws, ctx)
-    conv_kcp.cake_causal_conv1d_det_multi_backward_kcp(xs, ws, ctx, dys, hists)
+    ys, hists = conv_kcp.cake_causal_conv1d_det_train_kcp_multi_forward(xs, ws, ctx)
+    conv_kcp.cake_causal_conv1d_det_train_kcp_multi_backward(xs, ws, ctx, dys, hists)
     assert calls == []
 
 
 def test_facade_multi_entry_is_lazy_and_keyword_only() -> None:
-    """The KCP facade's ``cake_causal_conv1d_det_multi_kcp`` is exported, takes ``recompute_handle`` and ``cooperative``
+    """The KCP facade's ``cake_causal_conv1d_det_kcp_multi`` is exported, takes ``recompute_handle`` and ``cooperative``
     keyword-only (default ``None``), the single-rank det facade binds no ``cake_causal_conv1d_kcp_multi`` (the name before
     the det rename), and importing either facade still does not import the KCP host modules (fresh interpreter)."""
     import subprocess
@@ -424,15 +435,15 @@ def test_facade_multi_entry_is_lazy_and_keyword_only() -> None:
         "import inspect, sys\n"
         "import flashinfer.cake_causal_conv1d_det_train_kcp as f\n"
         "import flashinfer.cake_causal_conv1d_det_train as d\n"
-        "kcp = 'flashinfer.cake_causal_conv1d_det_train_backend.kcp'\n"
+        "kcp = 'flashinfer.experimental.cake.cake_causal_conv1d_det_train.kcp'\n"
         "assert kcp not in sys.modules\n"
-        "s = inspect.signature(f.cake_causal_conv1d_det_multi_kcp).parameters\n"
+        "s = inspect.signature(f.cake_causal_conv1d_det_kcp_multi).parameters\n"
         "assert list(s) == ['xs', 'weights', 'ctx', 'recompute_handle', 'cooperative'], list(s)\n"
         "for n in ('recompute_handle', 'cooperative'):\n"
         "    p = s[n]\n"
         "    assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is None, n\n"
         "assert not hasattr(d, 'cake_causal_conv1d_kcp_multi')\n"
-        "assert 'cake_causal_conv1d_det_multi_kcp' in f.__all__ and kcp not in sys.modules\n"
+        "assert 'cake_causal_conv1d_det_kcp_multi' in f.__all__ and kcp not in sys.modules\n"
         "print('FACADE_MULTI_OK')\n"
     )
     r = subprocess.run(
@@ -450,16 +461,16 @@ def test_multi_launch_form_bitwise_single_calls(cooperative) -> None:
     ctx, xs, ws, dys = _problem(
         (5000, 1003), (1, 2, 4997, 1003), (512, 256, 1024), device
     )
-    _, hists = conv_kcp.cake_causal_conv1d_det_multi_forward_kcp(xs, ws, ctx)
-    dxs, dws = conv_kcp.cake_causal_conv1d_det_multi_backward_kcp(
+    _, hists = conv_kcp.cake_causal_conv1d_det_train_kcp_multi_forward(xs, ws, ctx)
+    dxs, dws = conv_kcp.cake_causal_conv1d_det_train_kcp_multi_backward(
         xs, ws, ctx, dys, hists, cooperative=cooperative
     )
     xg = [x.clone().requires_grad_(True) for x in xs]
     wg = [w.clone().requires_grad_(True) for w in ws]
-    ys = conv_kcp.cake_causal_conv1d_det_multi_kcp(xg, wg, ctx, cooperative=cooperative)
+    ys = conv_kcp.cake_causal_conv1d_det_kcp_multi(xg, wg, ctx, cooperative=cooperative)
     torch.autograd.backward(ys, dys)
     for i, (x, w, dy, hist) in enumerate(zip(xs, ws, dys, hists, strict=True)):
-        dx1, dw1 = conv_kcp.cake_causal_conv1d_det_backward_kcp(
+        dx1, dw1 = conv_kcp.cake_causal_conv1d_det_train_kcp_backward(
             x, w, ctx, dy, hist, cooperative=cooperative
         )
         assert _same(dxs[i], dx1) and _same(dws[i], dw1), i

@@ -607,6 +607,22 @@ def test_autotuning_profiles_every_candidate_and_keeps_the_bits(N, K, layout, bi
 
 
 @needs_device
+def test_public_api_skips_backend_selection(monkeypatch):
+    """batch_invariant=True never runs a backend, so the @backend_requirement wrapper must not run the auto selection
+    for it (host cost only): a selecting call rewrites `mm_bf16.suitable_auto_backends`, a bypassed one leaves it."""
+    a, b = rnd_bf16(16, 4096, 121), rnd_bf16(4096, 4096, 122)
+    sentinel = ["sentinel"]
+    # the wrapper creates the attribute at its first auto selection, so it may not exist yet
+    monkeypatch.setattr(
+        flashinfer.mm_bf16, "suitable_auto_backends", sentinel, raising=False
+    )
+    bi_mm(a, b)
+    assert flashinfer.mm_bf16.suitable_auto_backends is sentinel
+    flashinfer.mm_bf16(a, b, backend="auto")  # the regular path still selects
+    assert flashinfer.mm_bf16.suitable_auto_backends is not sentinel
+
+
+@needs_device
 def test_misaligned_a_is_copied_and_keeps_the_bits():
     # a contiguous view whose base address is two bytes past a 16-byte boundary: a placement, so the same bits
     M, K, N = 16, 4096, 4096
@@ -738,10 +754,16 @@ def test_persistent_grid_is_the_device_co_resident_cluster_count():
         )  # compiled before the profiled launch
         torch.cuda.synchronize()
         if traced:
-            with profile(activities=[ProfilerActivity.CUDA]) as prof:
-                mm_bf16_batch_invariant(a, b, config=cfg, out=out)
-                torch.cuda.synchronize()
-            events = kernel_events(prof)
+            # CUPTI can drop a launch's record (#8967): retry; zeroing `out` makes the bits check prove each launch ran.
+            for _ in range(3):
+                out.zero_()
+                with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                    mm_bf16_batch_invariant(a, b, config=cfg, out=out)
+                    torch.cuda.synchronize()
+                assert torch.equal(bits(out), ref), cfg.describe()
+                events = kernel_events(prof)
+                if events:
+                    break
             assert events, "no kernel in the trace"
             grid = max(events, key=lambda e: e["dur"])["args"]["grid"]
             launched = grid[0] * grid[1] * grid[2]
@@ -787,15 +809,15 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         )
     out = bi_mm(a[:0], b)
     assert out.shape == (0, 4096) and out.dtype == torch.bfloat16
-    # a wrong-dtype `out` or bias through the public API is FlashInfer's own contract (its common check raises before
-    # the flag path); the class's entry raises its typed error for the same inputs
-    with pytest.raises(ValueError):
+    # the public API hands every batch-invariant call to the class without running the backend checks, so a
+    # wrong-dtype `out` or bias raises the class's typed error there too (a ValueError, as before)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="out"):
         bi_mm(a, b, out=torch.empty(16, 4096, dtype=torch.float16, device="cuda"))
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="out"):
         mm_bf16_batch_invariant(
             a, b, torch.empty(16, 4096, dtype=torch.float16, device="cuda")
         )
-    with pytest.raises(ValueError):
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 bias"):
         bi_mm(a, b, bias=torch.zeros(4096, dtype=torch.float32, device="cuda"))
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 bias"):
         mm_bf16_batch_invariant(

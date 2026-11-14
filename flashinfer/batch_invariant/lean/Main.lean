@@ -1,3 +1,5 @@
+-- Copyright (c) 2026 by FlashInfer team.
+-- SPDX-License-Identifier: Apache-2.0
 import BIKernels.Export
 import BIKernels.Cases
 /-! `lake exe conformance`: print the Lean model's terms for the generated cases. The Python test
@@ -25,6 +27,13 @@ def main : IO Unit := do
     IO.println s!"gemm32out {steps} {fmt} {(outputKfold32 fmt ⟨0⟩ ⟨0⟩ steps).sexpr}"
   for (N, K, _) in chunkTableFp8 do
     IO.println s!"chunks32 {N} {K} {chunksForFp8 N K}"
+  -- the block-scale fp8 class: the output at (0, 0) and at (3, 129) (the second weight scale block) per (blocks, format);
+  -- the kernel's promotion loop at sampled block counts
+  for (KB, fmt) in gemmFp8BsOutCases do
+    IO.println s!"gemmfp8bs {KB} {fmt} {(outputKblock fmt ⟨0⟩ ⟨0⟩ KB).sexpr}"
+    IO.println s!"gemmfp8bs2 {KB} {fmt} {(outputKblock fmt ⟨3⟩ ⟨129⟩ KB).sexpr}"
+  for KB in gemmFp8BsLoopCases do
+    IO.println s!"gemmfp8bsloop {KB} {(promoteLoop ⟨0⟩ ⟨0⟩ 3 KB).sexpr}"
   for (steps, C) in gemmBiasCases do
     let t := if C == 1 then kfold ⟨0⟩ ⟨0⟩ steps else kchunk ⟨0⟩ ⟨0⟩ C (steps / C)
     IO.println s!"gemmbias {steps} {C} {(outputElemBias "bf16" t ⟨0⟩).sexpr}"
@@ -82,3 +91,5 @@ def main : IO Unit := do
     IO.println s!"gemmmx4k128loop {nblk} {(kblockLoopMX4K128 ⟨0⟩ ⟨0⟩ gemmMainloopInnerMx4K128 3 .zero nblk).sexpr}"
   for (steps, fmt) in gemmmx4k128OutCases do
     IO.println s!"gemmmx4k128out {steps} {fmt} {(outputKfoldMX4K128 fmt ⟨0⟩ ⟨0⟩ steps).sexpr}"
+  for (name, P) in attnCases do
+    IO.println s!"attn {name} {(Attn.output P).sexpr}"

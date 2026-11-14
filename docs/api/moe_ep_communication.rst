@@ -30,3 +30,19 @@ run over NVLink (MNNVL) symmetric memory.
     :toctree: ../generated
 
     create_communication
+
+Complete EP selection
+---------------------
+
+``MoEEpLayer(..., backend=AutoConfig(...))`` compares complete Mega and split
+forwards during a v2 warmup. See the `EP architecture notes
+<https://github.com/flashinfer-ai/flashinfer/blob/main/docs/design_docs/moe_ep_architecture.md#complete-ep-selection>`_ for candidate
+configuration, cache matching and graph lifetime.
+
+.. autosummary::
+    :toctree: ../generated
+    :template: autosummary/class_with_members.rst
+
+    AutoConfig
+    MoEEpAutoLayer
+    MoEEpAutoWorkspace

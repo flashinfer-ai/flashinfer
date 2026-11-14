@@ -532,8 +532,8 @@ class TokenInPullTokenBackPush:
         # (a deep queue lengthens per-request RTT and fights the GEMM for
         # L2/issue slots).  Deeper per-warp pipelining (donating idle
         # warps' smem slots as extra in-flight stages) was measured at
-        # -0.8%..+0.1% net there; it pays for some packed-FP4 shapes instead
-        # (``pull_batch``: the H2560/I640/E512/EP2 defaults keep 2-3 rows).
+        # -0.8%..+0.1% net there; it pays for some shapes instead (``pull_batch``:
+        # on H2560/I640/E512/EP2 packed-FP4 and FP8 tactics keep 2-3 rows).
         if active_dispatch_warps not in (1, 2, self.num_dispatch_warps):
             raise ValueError(
                 "active_dispatch_warps must be 1, 2, or "

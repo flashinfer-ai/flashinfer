@@ -1241,7 +1241,7 @@ def test_prepared_operation_launches_the_routed_programs(
         pytest.skip("requires SM103a")
     pytest.importorskip("flashinfer.jit.cake_minimax_h3_nvfp4_pre_attention")
     from flashinfer.jit import cake_minimax_h3_nvfp4_pre_attention as programs
-    from tests.test_helpers.cake_profiler import cuda_kernel_names
+    from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
     operation, values = _prepare_zero_smoke(-1, M=M, P=P, out_format=out_format)
     operation.run(**values)

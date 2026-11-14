@@ -6,7 +6,7 @@ os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"
 
 import pytest
 import torch
-from tests.test_helpers.utils_fp4 import pack_fp4_values, ref_fp4_quant
+from tests.quantization.test_helpers.utils_fp4 import pack_fp4_values, ref_fp4_quant
 
 from flashinfer import fp4_quantize
 from flashinfer.utils import (

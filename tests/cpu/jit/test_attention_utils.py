@@ -396,7 +396,7 @@ def test_custom_batch_attention_preserves_caller_uri_and_dual_surface(
 
 @pytest.mark.cpu_only
 def test_persistent_warmup_contains_equal_primaries_only(generated_sources):
-    from tests.test_helpers.jit_utils import gen_persistent_batch_attention_modules
+    from tests.jit.test_helpers.jit_utils import gen_persistent_batch_attention_modules
 
     specs = gen_persistent_batch_attention_modules(
         [torch.float16, torch.bfloat16],

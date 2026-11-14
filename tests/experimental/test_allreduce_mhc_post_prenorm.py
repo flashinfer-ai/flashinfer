@@ -598,7 +598,7 @@ def mnnvl_workspace():
         pytest.skip("requires CUDA")
     from flashinfer.comm.mapping import Mapping
     from flashinfer.comm.mnnvl import TorchDistBackend
-    from tests.test_helpers.comm import init_torch_distributed_from_mpi
+    from tests.comm.test_helpers.comm import init_torch_distributed_from_mpi
 
     try:
         init_torch_distributed_from_mpi()

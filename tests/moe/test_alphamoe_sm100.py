@@ -37,7 +37,7 @@ import pytest
 import torch
 
 from flashinfer import utils
-from tests.test_helpers.cake_profiler import cuda_kernel_names
+from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
 _FP8_MAX = 448.0
 _GROUP = 128

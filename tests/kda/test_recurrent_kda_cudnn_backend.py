@@ -53,7 +53,7 @@ from flashinfer.kda_prefill_cute import (
     _SUPPORTED_COMPUTE_CAPABILITIES as _CUTE_DSL_SUPPORTED_COMPUTE_CAPABILITIES,
 )
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.cudnn_linear_attention import (
+from tests.gdn.test_helpers.cudnn_linear_attention import (
     HEAD_DIM,
     assert_rel_close,
     assert_state_orientation,

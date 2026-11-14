@@ -51,12 +51,13 @@ const __nv_bfloat16* get_bias_ptr(const ffi::Optional<TensorView>& bias, int64_t
 
 }  // namespace
 
-// Serialize all heuristic algorithms into a CPU uint8 tensor for caching.
+// Serialize the heuristic algorithms for the problem with mat1's N, K and bias, but
+// algo_m rows, into a CPU uint8 tensor.
 // algo_buffer: CPU uint8 tensor of size >= kMaxAlgorithms * kAlgoBytes.
 // Returns number of algorithms written.
 int64_t mm_bf16_cublaslt_get_algos(TensorView mat1, TensorView mat2, ffi::Optional<TensorView> bias,
                                    TensorView out, TensorView workspace_buffer,
-                                   int64_t cublas_handle, TensorView algo_buffer) {
+                                   int64_t cublas_handle, TensorView algo_buffer, int64_t algo_m) {
   CHECK_CUDA(mat1);
   CHECK_CUDA(mat2);
   CHECK_CUDA(out);
@@ -77,6 +78,7 @@ int64_t mm_bf16_cublaslt_get_algos(TensorView mat1, TensorView mat2, ffi::Option
       << "mat2 K dimension mismatch: expected " << k << ", got " << mat2.size(1);
   TVM_FFI_ICHECK_EQ(out.size(0), m) << "out M dimension mismatch";
   TVM_FFI_ICHECK_EQ(out.size(1), n) << "out N dimension mismatch";
+  TVM_FFI_ICHECK_GT(algo_m, 0) << "algo_m must be positive";
   cudaDataType_t d_type = get_d_type(out.dtype());
   const auto* bias_ptr = get_bias_ptr(bias, n);
 
@@ -85,16 +87,18 @@ int64_t mm_bf16_cublaslt_get_algos(TensorView mat1, TensorView mat2, ffi::Option
   int max_algos = static_cast<int>(algo_buffer.numel() * get_element_size(algo_buffer) /
                                    flashinfer::mm_bf16_cublaslt::kAlgoBytes);
   return static_cast<int64_t>(flashinfer::mm_bf16_cublaslt::get_algorithms(
-      static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), d_type, bias_ptr,
+      static_cast<int>(algo_m), static_cast<int>(n), static_cast<int>(k), d_type, bias_ptr,
       workspace_buffer.numel() * get_element_size(workspace_buffer), lt_handle,
       algo_buffer.data_ptr(), max_algos));
 }
 
-// Run matmul using a pre-cached algorithm — zero heuristic overhead.
-void mm_bf16_cublaslt_run_with_algo(TensorView mat1, TensorView mat2,
-                                    ffi::Optional<TensorView> bias, TensorView out,
-                                    TensorView workspace_buffer, int64_t cublas_handle,
-                                    TensorView algo_buffer, int64_t algo_idx) {
+// Run the matmul with algo_desc, a CPU uint8 tensor of kAlgoBytes holding a serialized
+// cublasLtMatmulAlgo_t, or with the heuristic default when algo_desc is None or does not
+// apply to this problem. Returns 1 if algo_desc ran, 0 if the heuristic default ran.
+int64_t mm_bf16_cublaslt_run_with_descriptor(TensorView mat1, TensorView mat2,
+                                             ffi::Optional<TensorView> bias, TensorView out,
+                                             TensorView workspace_buffer, int64_t cublas_handle,
+                                             ffi::Optional<TensorView> algo_desc) {
   CHECK_CUDA(mat1);
   CHECK_CUDA(mat2);
   CHECK_CUDA(out);
@@ -103,8 +107,6 @@ void mm_bf16_cublaslt_run_with_algo(TensorView mat1, TensorView mat2,
   CHECK_DIM(2, mat1);
   CHECK_DIM(2, mat2);
   CHECK_DIM(2, out);
-  CHECK_CPU(algo_buffer);
-  CHECK_CONTIGUOUS(algo_buffer);
   CHECK_CUDA(workspace_buffer);
 
   int64_t m = mat1.size(0);
@@ -115,10 +117,17 @@ void mm_bf16_cublaslt_run_with_algo(TensorView mat1, TensorView mat2,
       << "mat2 K dimension mismatch: expected " << k << ", got " << mat2.size(1);
   TVM_FFI_ICHECK_EQ(out.size(0), m) << "out M dimension mismatch";
   TVM_FFI_ICHECK_EQ(out.size(1), n) << "out N dimension mismatch";
-  int64_t max_algos = algo_buffer.numel() * get_element_size(algo_buffer) /
-                      flashinfer::mm_bf16_cublaslt::kAlgoBytes;
-  TVM_FFI_ICHECK(algo_idx >= 0 && algo_idx < max_algos)
-      << "algo_idx " << algo_idx << " out of range [0, " << max_algos << ")";
+
+  const void* algo_desc_ptr = nullptr;
+  if (algo_desc.has_value()) {
+    const auto& desc = algo_desc.value();
+    CHECK_CPU(desc);
+    CHECK_CONTIGUOUS(desc);
+    TVM_FFI_ICHECK_EQ(desc.numel() * get_element_size(desc),
+                      static_cast<int64_t>(flashinfer::mm_bf16_cublaslt::kAlgoBytes))
+        << "algo_desc must hold one serialized cublasLtMatmulAlgo_t";
+    algo_desc_ptr = desc.data_ptr();
+  }
 
   auto lt_handle = reinterpret_cast<cublasLtHandle_t>(cublas_handle);
   ffi::CUDADeviceGuard device_guard(mat1.device().device_id);
@@ -126,15 +135,19 @@ void mm_bf16_cublaslt_run_with_algo(TensorView mat1, TensorView mat2,
   cudaDataType_t d_type = get_d_type(out.dtype());
   const auto* bias_ptr = get_bias_ptr(bias, n);
 
-  auto status = flashinfer::mm_bf16_cublaslt::run_with_algo(
+  bool used_descriptor = false;
+  auto status = flashinfer::mm_bf16_cublaslt::run_with_descriptor(
       static_cast<__nv_bfloat16*>(mat1.data_ptr()), static_cast<__nv_bfloat16*>(mat2.data_ptr()),
       out.data_ptr(), bias_ptr, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
       d_type, workspace_buffer.data_ptr(),
       workspace_buffer.numel() * get_element_size(workspace_buffer), lt_handle, stream,
-      algo_buffer.data_ptr(), static_cast<int>(algo_idx));
+      mat1.device().device_id, algo_desc_ptr, &used_descriptor);
   TVM_FFI_ICHECK(status == CUBLAS_STATUS_SUCCESS)
-      << "mm_bf16_cublaslt_run_with_algo failed: " << cublasGetStatusString(status);
+      << "mm_bf16_cublaslt_run_with_descriptor failed for M=" << m << ", N=" << n << ", K=" << k
+      << ": " << cublasGetStatusString(status);
+  return used_descriptor ? 1 : 0;
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt_get_algos, mm_bf16_cublaslt_get_algos);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt_run_with_algo, mm_bf16_cublaslt_run_with_algo);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt_run_with_descriptor,
+                              mm_bf16_cublaslt_run_with_descriptor);

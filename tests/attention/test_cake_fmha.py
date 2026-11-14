@@ -60,7 +60,7 @@ from flashinfer.jit.cake_fmha import (
     get_cake_fmha_decode_quant_nvfp4_uri,
     get_cake_fmha_manifest,
 )
-from tests.test_helpers.cake_fmha_capability import (
+from tests.attention.test_helpers.cake_fmha_capability import (
     PINNED_FLASHINFER_REVISION,
     replay_selectors,
     select_case,
@@ -2907,6 +2907,7 @@ def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
         is_causal=True,
         return_lse=True,
         enable_sink=False,
+        program="RUNTIME_PACK2_LSE",
     )
     assert cake_api.cake_fmha_route_is_optimized(route)
     assert (

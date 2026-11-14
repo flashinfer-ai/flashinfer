@@ -14322,33 +14322,13 @@ kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ CakeTensorMap64 x, const 
                             route_weight = route_weights[token_slot_out];
                         }
                         float down = _tmem_load_2[token_slot_out] * down_scale_scalar_c;
-#if __CUDA_ARCH__ == 1030
-                        smem_out[out_buf * 2048 + token_slot_out * 128 + physical_feature] = down * route_weight * scaling_factor;
-#else
                         smem_out[(out_buf >> 1) * 4096 + token_slot_out * 256 + (out_buf & 1) * 128 + physical_feature] = down * route_weight * scaling_factor;
-#endif
                     }
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("barrier.sync 15, 128;" ::: "memory");
                     if (elect_sync()) {
                         mbarrier_arrive(down_free_addr + (down_stage_c) * 8);
                     }
-#if __CUDA_ARCH__ == 1030
-                    if (warp == 2) {
-                        if (elect_sync()) {
-                            #pragma unroll
-                            for (int token_slot_reduce = 0; token_slot_reduce < 16; token_slot_reduce++) {
-                                int pair_reduce = route_pairs[token_slot_reduce];
-                                if (pair_reduce < M * top_k) {
-                                    int token_reduce = output_tokens[token_slot_reduce];
-                                    int src = smem_out_addr + (unsigned int)(out_buf * 8192) + (unsigned int)(token_slot_reduce * 128 * 4);
-                                    {
-                                        void* _cpred_dst_15 = reinterpret_cast<void*>(out + (token_reduce * K + ob_c * 128));
-                                        asm volatile("cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32"
-                                            " [%0], [%1], %2;"
-                                            :: "l"(_cpred_dst_15), "r"(src), "r"((uint32_t)(512))
-                                            : "memory");
-#else
                     if (ob_c % 2 == 1) {
                         if (warp == 2) {
                             if (elect_sync()) {
@@ -14365,31 +14345,15 @@ kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ CakeTensorMap64 x, const 
                                                 :: "l"(_cpred_dst_15), "r"(src), "r"((uint32_t)(1024))
                                                 : "memory");
                                         }
-#endif
                                     }
                                 }
-#if __CUDA_ARCH__ == 1030
-#else
                                 asm volatile("cp.async.bulk.commit_group;");
                                 asm volatile("cp.async.bulk.wait_group.read 1;");
-#endif
                             }
-#if __CUDA_ARCH__ == 1030
-                            asm volatile("cp.async.bulk.commit_group;");
-                            asm volatile("cp.async.bulk.wait_group.read 1;");
-#endif
                         }
-#if __CUDA_ARCH__ == 1030
-#else
                         asm volatile("barrier.sync 15, 128;" ::: "memory");
-#endif
                     }
-#if __CUDA_ARCH__ == 1030
-                    asm volatile("barrier.sync 15, 128;" ::: "memory");
-                    out_buf = out_buf + 1 & 1;
-#else
                     out_buf = out_buf + 1 & 3;
-#endif
                     down_stage_c += 1;
                     if (down_stage_c == 4) { down_stage_c = 0; _phase_down_ready ^= 1; }
                 }
@@ -15635,6 +15599,142 @@ constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 0;
 #undef kernel_alpha_moe_nvfp4_seed_accumulator
 }  // namespace nvfp4_batch_seed
+
+namespace nvfp4_batch_drain {
+#define kernel_alpha_moe_nvfp4_accumulator_drain kernel_alpha_moe_nvfp4_accumulator_drain_nvfp4_batch_drain
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
+typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+typedef signed int         int32_t;
+typedef short int          int16_t;
+struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
+
+#endif
+
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
+__device__ __forceinline__ unsigned int __as_u32(float v) {
+    unsigned int u;
+    asm("mov.b32 %0, %1;" : "=r"(u) : "f"(v));
+    return u;
+}
+__device__ __forceinline__ unsigned int __as_u32(__nv_bfloat162 v) {
+    return *reinterpret_cast<const unsigned int*>(&v);
+}
+__device__ __forceinline__ unsigned int __as_u32(unsigned int v) { return v; }
+__device__ __forceinline__ unsigned int __as_u32(int v) {
+    unsigned int u;
+    asm("mov.b32 %0, %1;" : "=r"(u) : "r"(v));
+    return u;
+}
+
+extern "C" {
+
+__global__ __launch_bounds__(256) void
+kernel_alpha_moe_nvfp4_accumulator_drain(float* __restrict__ accumulator, __nv_bfloat16* __restrict__ output, long long vectors)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // === Task calls (declaration order) ===
+    long long vector = (long long)blockIdx.x * 256 + (long long)tid;
+    if (vector < vectors) {
+        float sums[8];
+        float prior[8];
+        {
+            float4 _v4 = *reinterpret_cast<const float4*>(accumulator + vector * 8 + 0);
+            sums[0 + 0] = _v4.x;
+            sums[0 + 1] = _v4.y;
+            sums[0 + 2] = _v4.z;
+            sums[0 + 3] = _v4.w;
+        }
+        {
+            float4 _v4 = *reinterpret_cast<const float4*>(accumulator + (vector * 8 + 4) + 0);
+            sums[4 + 0] = _v4.x;
+            sums[4 + 1] = _v4.y;
+            sums[4 + 2] = _v4.z;
+            sums[4 + 3] = _v4.w;
+        }
+        {
+            const uint4* _vptr_2 = reinterpret_cast<const uint4*>(output + vector * 8 + 0);
+            uint4 _vld_2[1];
+            #pragma unroll
+            for (int _blk = 0; _blk < 1; _blk++) {
+                _vld_2[_blk] = _vptr_2[_blk];
+                uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2[_blk]);
+                #pragma unroll
+                for (int _pair = 0; _pair < 4; _pair++) {
+                    (&prior[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) << 16);
+                    (&prior[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) & 0xffff0000u);
+                }
+            }
+        }
+        unsigned int packed[4];
+        float low_0;
+        asm("add.rn.f32 %0, %1, %2;" : "=f"(low_0) : "f"(sums[0]), "f"(prior[0]));
+        float high_0;
+        asm("add.rn.f32 %0, %1, %2;" : "=f"(high_0) : "f"(sums[1]), "f"(prior[1]));
+        packed[0] = __as_u32(__float22bfloat162_rn(make_float2(low_0, high_0)));
+        float low_1;
+        asm("add.rn.f32 %0, %1, %2;" : "=f"(low_1) : "f"(sums[2]), "f"(prior[2]));
+        float high_1;
+        asm("add.rn.f32 %0, %1, %2;" : "=f"(high_1) : "f"(sums[3]), "f"(prior[3]));
+        packed[1] = __as_u32(__float22bfloat162_rn(make_float2(low_1, high_1)));
+        float low_2;
+        asm("add.rn.f32 %0, %1, %2;" : "=f"(low_2) : "f"(sums[4]), "f"(prior[4]));
+        float high_2;
+        asm("add.rn.f32 %0, %1, %2;" : "=f"(high_2) : "f"(sums[5]), "f"(prior[5]));
+        packed[2] = __as_u32(__float22bfloat162_rn(make_float2(low_2, high_2)));
+        float low_3;
+        asm("add.rn.f32 %0, %1, %2;" : "=f"(low_3) : "f"(sums[6]), "f"(prior[6]));
+        float high_3;
+        asm("add.rn.f32 %0, %1, %2;" : "=f"(high_3) : "f"(sums[7]), "f"(prior[7]));
+        packed[3] = __as_u32(__float22bfloat162_rn(make_float2(low_3, high_3)));
+        reinterpret_cast<int4*>(output + vector * 8)[0] = reinterpret_cast<int4*>(packed)[0];
+        float zeros[4] = {-0.0, -0.0, -0.0, -0.0};
+        {
+            float4 _v4 = make_float4(zeros[0 + 0], zeros[0 + 1], zeros[0 + 2], zeros[0 + 3]);
+            *reinterpret_cast<float4*>((accumulator + vector * 8) + 0) = _v4;
+        }
+        {
+            float4 _v4 = make_float4(zeros[0 + 0], zeros[0 + 1], zeros[0 + 2], zeros[0 + 3]);
+            *reinterpret_cast<float4*>((accumulator + (vector * 8 + 4)) + 0) = _v4;
+        }
+    }
+}
+
+} // extern "C"
+
+constexpr int kGeneratedThreads = 256;
+constexpr int kGeneratedSmemTotal = 0;
+#undef kernel_alpha_moe_nvfp4_accumulator_drain
+}  // namespace nvfp4_batch_drain
 
 namespace {
 constexpr int kAlphaMoeNvfp4GeneratedThreads = nvfp4_scale_word::kGeneratedThreads;
@@ -27138,6 +27238,40 @@ void SeedAccumulator(TensorView out, TensorView accumulator) {
   CheckCuda(cudaGetLastError(), "seed accumulator launch");
 }
 
+// The aligned entry's copy back from its FP32 accumulator, -0 at rest (block nvfp4_batch_drain):
+// out = bf16_rn(accumulator + float32(out)), the FP32 sum rounded to nearest with no flush of a subnormal sum, then
+// accumulator = -0, the additive identity, so the next call on the stream starts from it without a fill and an
+// element no route reaches keeps its value, including -0 (a NaN stays a NaN, but the add may change its payload);
+// eight values per thread. The
+// kernel reads and writes 16-byte vectors: out contiguous with a multiple of eight elements, both tensors 16-byte
+// aligned and disjoint.
+void DrainAccumulator(TensorView accumulator, TensorView out) {
+  TVM_FFI_ICHECK(out.device().device_type == kDLCUDA) << "out must be a CUDA tensor";
+  ffi::CUDADeviceGuard device_guard(out.device().device_id);
+  CheckTensor(out, dl_bfloat16, 2, true, "out", "bfloat16");
+  CheckTensor(accumulator, dl_float32, 2, true, "accumulator", "float32");
+  CheckSameDevice(accumulator, out.device().device_id, "accumulator");
+  CheckShape2(accumulator, out.size(0), out.size(1), "accumulator");
+  const int64_t elements = out.size(0) * out.size(1);
+  TVM_FFI_ICHECK(elements % 8 == 0) << "out must hold a multiple of 8 elements, got " << elements;
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0 &&
+                 reinterpret_cast<uintptr_t>(accumulator.data_ptr()) % 16 == 0)
+      << "out and accumulator data pointers must be 16-byte aligned";
+  const int64_t vectors = elements / 8;
+  if (vectors == 0) {
+    return;
+  }
+  CheckNoOverlap(accumulator, out, "out", "accumulator");
+  static_assert(nvfp4_batch_drain::kGeneratedThreads == 256, "one CTA drains 256 vectors of eight values");
+  const cudaStream_t stream = get_stream(out.device());
+  const dim3 drain_grid(static_cast<unsigned>((vectors + 255) / 256), 1, 1);
+  nvfp4_batch_drain::kernel_alpha_moe_nvfp4_accumulator_drain_nvfp4_batch_drain<<<drain_grid, dim3(nvfp4_batch_drain::kGeneratedThreads, 1, 1),
+      nvfp4_batch_drain::kGeneratedSmemTotal, stream>>>(
+      static_cast<float*>(accumulator.data_ptr()), static_cast<__nv_bfloat16*>(out.data_ptr()),
+      static_cast<long long>(vectors));
+  CheckCuda(cudaGetLastError(), "drain accumulator launch");
+}
+
 void RunCurrent(TensorView hidden_states, TensorView hidden_states_scale, TensorView gemm1_weights,
          TensorView gemm1_weights_scale, TensorView gemm2_weights, TensorView gemm2_weights_scale,
          TensorView output1_scale_gate_scalar, TensorView output1_scale_scalar,
@@ -27229,6 +27363,8 @@ void RunRoutedSeededGeneralCurrent(
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_current_aligned_moe_op, flashinfer::alphamoe_nvfp4_sm100::RunCurrent);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_seed_accumulator_op, flashinfer::alphamoe_nvfp4_sm100::SeedAccumulator);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_drain_accumulator_op, flashinfer::alphamoe_nvfp4_sm100::DrainAccumulator);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_current_routed_seeded_moe_op, flashinfer::alphamoe_nvfp4_sm100::RunRoutedSeededCurrent);
 

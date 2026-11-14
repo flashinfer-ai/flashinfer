@@ -116,59 +116,59 @@ kernel_cake_hopper_msa_e9b601567cc3a6dd8033(unsigned int* __restrict__ S, int* _
     }
     cb[2] = 4286578688u;
     if (lim_full > t0 + 2) {
-        cb[2] = S[p + 2 * nq64];
+        cb[2] = S[p + 2ll * nq64];
     }
     cb[3] = 4286578688u;
     if (lim_full > t0 + 3) {
-        cb[3] = S[p + 3 * nq64];
+        cb[3] = S[p + 3ll * nq64];
     }
     cb[4] = 4286578688u;
     if (lim_full > t0 + 4) {
-        cb[4] = S[p + 4 * nq64];
+        cb[4] = S[p + 4ll * nq64];
     }
     cb[5] = 4286578688u;
     if (lim_full > t0 + 5) {
-        cb[5] = S[p + 5 * nq64];
+        cb[5] = S[p + 5ll * nq64];
     }
     cb[6] = 4286578688u;
     if (lim_full > t0 + 6) {
-        cb[6] = S[p + 6 * nq64];
+        cb[6] = S[p + 6ll * nq64];
     }
     cb[7] = 4286578688u;
     if (lim_full > t0 + 7) {
-        cb[7] = S[p + 7 * nq64];
+        cb[7] = S[p + 7ll * nq64];
     }
     cb[8] = 4286578688u;
     if (lim_full > t0 + 8) {
-        cb[8] = S[p + 8 * nq64];
+        cb[8] = S[p + 8ll * nq64];
     }
     cb[9] = 4286578688u;
     if (lim_full > t0 + 9) {
-        cb[9] = S[p + 9 * nq64];
+        cb[9] = S[p + 9ll * nq64];
     }
     cb[10] = 4286578688u;
     if (lim_full > t0 + 10) {
-        cb[10] = S[p + 10 * nq64];
+        cb[10] = S[p + 10ll * nq64];
     }
     cb[11] = 4286578688u;
     if (lim_full > t0 + 11) {
-        cb[11] = S[p + 11 * nq64];
+        cb[11] = S[p + 11ll * nq64];
     }
     cb[12] = 4286578688u;
     if (lim_full > t0 + 12) {
-        cb[12] = S[p + 12 * nq64];
+        cb[12] = S[p + 12ll * nq64];
     }
     cb[13] = 4286578688u;
     if (lim_full > t0 + 13) {
-        cb[13] = S[p + 13 * nq64];
+        cb[13] = S[p + 13ll * nq64];
     }
     cb[14] = 4286578688u;
     if (lim_full > t0 + 14) {
-        cb[14] = S[p + 14 * nq64];
+        cb[14] = S[p + 14ll * nq64];
     }
     cb[15] = 4286578688u;
     if (lim_full > t0 + 15) {
-        cb[15] = S[p + 15 * nq64];
+        cb[15] = S[p + 15ll * nq64];
     }
     asm volatile("" ::: "memory");
     int t0_1 = w * 16;
@@ -224,82 +224,146 @@ kernel_cake_hopper_msa_e9b601567cc3a6dd8033(unsigned int* __restrict__ S, int* _
     float sc = __uint_as_float(cb[0]);
     sc = fmaxf(sc, -1.7014118e+38f);
     sc = fminf(sc, 1.7014118e+38f);
-    unsigned int key_1_0 = __as_u32(sc) & 4294966784u | (unsigned int)t0_2;
+    unsigned int kbits = __as_u32(sc);
+    if (cb[0] == 4286578688u) {
+        kbits = 4282384384u;
+    }
+    unsigned int key_1_0 = kbits & 4294966784u | (unsigned int)t0_2;
     kb[0] = __uint_as_float(key_1_0);
     float sc_0 = __uint_as_float(cb[1]);
     sc_0 = fmaxf(sc_0, -1.7014118e+38f);
     sc_0 = fminf(sc_0, 1.7014118e+38f);
-    unsigned int key_1_1 = __as_u32(sc_0) & 4294966784u | (unsigned int)(t0_2 + 1);
+    unsigned int kbits_0 = __as_u32(sc_0);
+    if (cb[1] == 4286578688u) {
+        kbits_0 = 4282384384u;
+    }
+    unsigned int key_1_1 = kbits_0 & 4294966784u | (unsigned int)(t0_2 + 1);
     kb[1] = __uint_as_float(key_1_1);
     float sc_1 = __uint_as_float(cb[2]);
     sc_1 = fmaxf(sc_1, -1.7014118e+38f);
     sc_1 = fminf(sc_1, 1.7014118e+38f);
-    unsigned int key_1_2 = __as_u32(sc_1) & 4294966784u | (unsigned int)(t0_2 + 2);
+    unsigned int kbits_1 = __as_u32(sc_1);
+    if (cb[2] == 4286578688u) {
+        kbits_1 = 4282384384u;
+    }
+    unsigned int key_1_2 = kbits_1 & 4294966784u | (unsigned int)(t0_2 + 2);
     kb[2] = __uint_as_float(key_1_2);
     float sc_2 = __uint_as_float(cb[3]);
     sc_2 = fmaxf(sc_2, -1.7014118e+38f);
     sc_2 = fminf(sc_2, 1.7014118e+38f);
-    unsigned int key_1_3 = __as_u32(sc_2) & 4294966784u | (unsigned int)(t0_2 + 3);
+    unsigned int kbits_2 = __as_u32(sc_2);
+    if (cb[3] == 4286578688u) {
+        kbits_2 = 4282384384u;
+    }
+    unsigned int key_1_3 = kbits_2 & 4294966784u | (unsigned int)(t0_2 + 3);
     kb[3] = __uint_as_float(key_1_3);
     float sc_3 = __uint_as_float(cb[4]);
     sc_3 = fmaxf(sc_3, -1.7014118e+38f);
     sc_3 = fminf(sc_3, 1.7014118e+38f);
-    unsigned int key_1_4 = __as_u32(sc_3) & 4294966784u | (unsigned int)(t0_2 + 4);
+    unsigned int kbits_3 = __as_u32(sc_3);
+    if (cb[4] == 4286578688u) {
+        kbits_3 = 4282384384u;
+    }
+    unsigned int key_1_4 = kbits_3 & 4294966784u | (unsigned int)(t0_2 + 4);
     kb[4] = __uint_as_float(key_1_4);
     float sc_4 = __uint_as_float(cb[5]);
     sc_4 = fmaxf(sc_4, -1.7014118e+38f);
     sc_4 = fminf(sc_4, 1.7014118e+38f);
-    unsigned int key_1_5 = __as_u32(sc_4) & 4294966784u | (unsigned int)(t0_2 + 5);
+    unsigned int kbits_4 = __as_u32(sc_4);
+    if (cb[5] == 4286578688u) {
+        kbits_4 = 4282384384u;
+    }
+    unsigned int key_1_5 = kbits_4 & 4294966784u | (unsigned int)(t0_2 + 5);
     kb[5] = __uint_as_float(key_1_5);
     float sc_5 = __uint_as_float(cb[6]);
     sc_5 = fmaxf(sc_5, -1.7014118e+38f);
     sc_5 = fminf(sc_5, 1.7014118e+38f);
-    unsigned int key_1_6 = __as_u32(sc_5) & 4294966784u | (unsigned int)(t0_2 + 6);
+    unsigned int kbits_5 = __as_u32(sc_5);
+    if (cb[6] == 4286578688u) {
+        kbits_5 = 4282384384u;
+    }
+    unsigned int key_1_6 = kbits_5 & 4294966784u | (unsigned int)(t0_2 + 6);
     kb[6] = __uint_as_float(key_1_6);
     float sc_6 = __uint_as_float(cb[7]);
     sc_6 = fmaxf(sc_6, -1.7014118e+38f);
     sc_6 = fminf(sc_6, 1.7014118e+38f);
-    unsigned int key_1_7 = __as_u32(sc_6) & 4294966784u | (unsigned int)(t0_2 + 7);
+    unsigned int kbits_6 = __as_u32(sc_6);
+    if (cb[7] == 4286578688u) {
+        kbits_6 = 4282384384u;
+    }
+    unsigned int key_1_7 = kbits_6 & 4294966784u | (unsigned int)(t0_2 + 7);
     kb[7] = __uint_as_float(key_1_7);
     float sc_7 = __uint_as_float(cb[8]);
     sc_7 = fmaxf(sc_7, -1.7014118e+38f);
     sc_7 = fminf(sc_7, 1.7014118e+38f);
-    unsigned int key_1_8 = __as_u32(sc_7) & 4294966784u | (unsigned int)(t0_2 + 8);
+    unsigned int kbits_7 = __as_u32(sc_7);
+    if (cb[8] == 4286578688u) {
+        kbits_7 = 4282384384u;
+    }
+    unsigned int key_1_8 = kbits_7 & 4294966784u | (unsigned int)(t0_2 + 8);
     kb[8] = __uint_as_float(key_1_8);
     float sc_8 = __uint_as_float(cb[9]);
     sc_8 = fmaxf(sc_8, -1.7014118e+38f);
     sc_8 = fminf(sc_8, 1.7014118e+38f);
-    unsigned int key_1_9 = __as_u32(sc_8) & 4294966784u | (unsigned int)(t0_2 + 9);
+    unsigned int kbits_8 = __as_u32(sc_8);
+    if (cb[9] == 4286578688u) {
+        kbits_8 = 4282384384u;
+    }
+    unsigned int key_1_9 = kbits_8 & 4294966784u | (unsigned int)(t0_2 + 9);
     kb[9] = __uint_as_float(key_1_9);
     float sc_9 = __uint_as_float(cb[10]);
     sc_9 = fmaxf(sc_9, -1.7014118e+38f);
     sc_9 = fminf(sc_9, 1.7014118e+38f);
-    unsigned int key_1_10 = __as_u32(sc_9) & 4294966784u | (unsigned int)(t0_2 + 10);
+    unsigned int kbits_9 = __as_u32(sc_9);
+    if (cb[10] == 4286578688u) {
+        kbits_9 = 4282384384u;
+    }
+    unsigned int key_1_10 = kbits_9 & 4294966784u | (unsigned int)(t0_2 + 10);
     kb[10] = __uint_as_float(key_1_10);
     float sc_10 = __uint_as_float(cb[11]);
     sc_10 = fmaxf(sc_10, -1.7014118e+38f);
     sc_10 = fminf(sc_10, 1.7014118e+38f);
-    unsigned int key_1_11 = __as_u32(sc_10) & 4294966784u | (unsigned int)(t0_2 + 11);
+    unsigned int kbits_10 = __as_u32(sc_10);
+    if (cb[11] == 4286578688u) {
+        kbits_10 = 4282384384u;
+    }
+    unsigned int key_1_11 = kbits_10 & 4294966784u | (unsigned int)(t0_2 + 11);
     kb[11] = __uint_as_float(key_1_11);
     float sc_11 = __uint_as_float(cb[12]);
     sc_11 = fmaxf(sc_11, -1.7014118e+38f);
     sc_11 = fminf(sc_11, 1.7014118e+38f);
-    unsigned int key_1_12 = __as_u32(sc_11) & 4294966784u | (unsigned int)(t0_2 + 12);
+    unsigned int kbits_11 = __as_u32(sc_11);
+    if (cb[12] == 4286578688u) {
+        kbits_11 = 4282384384u;
+    }
+    unsigned int key_1_12 = kbits_11 & 4294966784u | (unsigned int)(t0_2 + 12);
     kb[12] = __uint_as_float(key_1_12);
     float sc_12 = __uint_as_float(cb[13]);
     sc_12 = fmaxf(sc_12, -1.7014118e+38f);
     sc_12 = fminf(sc_12, 1.7014118e+38f);
-    unsigned int key_1_13 = __as_u32(sc_12) & 4294966784u | (unsigned int)(t0_2 + 13);
+    unsigned int kbits_12 = __as_u32(sc_12);
+    if (cb[13] == 4286578688u) {
+        kbits_12 = 4282384384u;
+    }
+    unsigned int key_1_13 = kbits_12 & 4294966784u | (unsigned int)(t0_2 + 13);
     kb[13] = __uint_as_float(key_1_13);
     float sc_13 = __uint_as_float(cb[14]);
     sc_13 = fmaxf(sc_13, -1.7014118e+38f);
     sc_13 = fminf(sc_13, 1.7014118e+38f);
-    unsigned int key_1_14 = __as_u32(sc_13) & 4294966784u | (unsigned int)(t0_2 + 14);
+    unsigned int kbits_13 = __as_u32(sc_13);
+    if (cb[14] == 4286578688u) {
+        kbits_13 = 4282384384u;
+    }
+    unsigned int key_1_14 = kbits_13 & 4294966784u | (unsigned int)(t0_2 + 14);
     kb[14] = __uint_as_float(key_1_14);
     float sc_14 = __uint_as_float(cb[15]);
     sc_14 = fmaxf(sc_14, -1.7014118e+38f);
     sc_14 = fminf(sc_14, 1.7014118e+38f);
-    unsigned int key_1_15 = __as_u32(sc_14) & 4294966784u | (unsigned int)(t0_2 + 15);
+    unsigned int kbits_14 = __as_u32(sc_14);
+    if (cb[15] == 4286578688u) {
+        kbits_14 = 4282384384u;
+    }
+    unsigned int key_1_15 = kbits_14 & 4294966784u | (unsigned int)(t0_2 + 15);
     kb[15] = __uint_as_float(key_1_15);
     int f = 0;
     if ((t0_2 < fb || t0_2 + 16 > lim - fe) && t0_2 < lim) {
@@ -3075,7 +3139,7 @@ kernel_cake_hopper_msa_e9b601567cc3a6dd8033(unsigned int* __restrict__ S, int* _
     if (tid_1 < 32) {
         unsigned int kk = __as_u32(K);
         unsigned int idx = 512;
-        if (kk < 4278190080u) {
+        if (kk < 4282384384u) {
             idx = kk & 511;
         }
         if (gflag != 0) {
@@ -3152,7 +3216,7 @@ kernel_cake_hopper_msa_e9b601567cc3a6dd8033(unsigned int* __restrict__ S, int* _
             val = (int)idx;
         }
         if (commit != 0) {
-            long long obase = ((long long)ucol * (long long)num_heads + (long long)head) * 16;
+            long long obase = ((long long)ucol * (long long)num_heads + (long long)head) * 16ll;
             out[obase + (long long)rank] = val;
         }
     }

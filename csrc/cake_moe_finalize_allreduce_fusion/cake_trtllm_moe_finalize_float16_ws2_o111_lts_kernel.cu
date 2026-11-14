@@ -123,7 +123,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws2_o111_lts(__half* __restrict__ allred
     long long control_address = workspace_tensor[6];
     int* control_0 = reinterpret_cast<int*>(control_address);
     int control_bytes_per_buffer_word = control_0[3];
-    long long comm_stride_elems = (long long)control_bytes_per_buffer_word / 2;
+    long long comm_stride_elems = (long long)control_bytes_per_buffer_word / 2ll;
     long long workspace_address = workspace_tensor[4 + rank];
     __half* workspace_local = reinterpret_cast<__half*>(workspace_address);
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -156,7 +156,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws2_o111_lts(__half* __restrict__ allred
     unsigned int clear_words[4];
     #pragma unroll
     for (int word = 0; word < 4; word++) {
-        clear_words[word] = 2147516416;
+        clear_words[word] = 2147516416ll;
     }
     long long clear_base = (long long)control_dirty * comm_stride_elems;
     int access = first_access;
@@ -216,7 +216,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws2_o111_lts(__half* __restrict__ allred
                     next_index_hi = _vec_load_3[0];
                 }
                 if (route_index_lo >= 0) {
-                    long long expert_elem = (long long)route_index_lo * 7168 + (long long)(cluster_thread * 8);
+                    long long expert_elem = (long long)route_index_lo * 7168ll + (long long)(cluster_thread * 8);
                     float _vec_load_4[8];
                     {
                         const uint4* _vptr_0 = reinterpret_cast<const uint4*>(allreduce_in + expert_elem + 0);
@@ -253,7 +253,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws2_o111_lts(__half* __restrict__ allred
                     }
                 }
                 if (route_index_hi >= 0) {
-                    long long expert_elem_1 = (long long)route_index_hi * 7168 + (long long)(cluster_thread * 8);
+                    long long expert_elem_1 = (long long)route_index_hi * 7168ll + (long long)(cluster_thread * 8);
                     float _vec_load_6[8];
                     {
                         const uint4* _vptr_2 = reinterpret_cast<const uint4*>(allreduce_in + expert_elem_1 + 0);
@@ -485,7 +485,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws2_o111_lts(__half* __restrict__ allred
                 scaled_f16_4[_lp] = *(uint32_t*)&_h2;
             }
             int access_0 = published_token * 896 + cluster_thread;
-            long long slot = (long long)rank * (long long)total_access * 8 + (long long)access_0 * 8;
+            long long slot = (long long)rank * (long long)total_access * 8ll + (long long)access_0 * 8ll;
             reinterpret_cast<int4*>(own_ring + ((step & 1) * 224 + tid) * 4)[0] = reinterpret_cast<int4*>(scaled_f16_4)[0];
             if (rank == 0) {
                 asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer1 + slot), "r"((scaled_f16_4)[0]), "r"((scaled_f16_4)[1]), "r"((scaled_f16_4)[2]), "r"((scaled_f16_4)[3]) : "memory");
@@ -499,7 +499,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws2_o111_lts(__half* __restrict__ allred
                 break;
             }
             {
-                auto _gst_5 = workspace_local + (clear_base + (long long)clear_next * 8);
+                auto _gst_5 = workspace_local + (clear_base + (long long)clear_next * 8ll);
                 __builtin_assume(__isGlobal(_gst_5));
                 reinterpret_cast<int4*>(_gst_5)[0] = reinterpret_cast<int4*>(clear_words)[0];
             }
@@ -870,7 +870,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws2_o111_lts(__half* __restrict__ allred
     #pragma unroll 1
     for (int clear_access = clear_next; clear_access < clear_limit; clear_access += access_stride) {
         {
-            auto _gst_25 = workspace_local + (clear_base + (long long)clear_access * 8);
+            auto _gst_25 = workspace_local + (clear_base + (long long)clear_access * 8ll);
             __builtin_assume(__isGlobal(_gst_25));
             reinterpret_cast<int4*>(_gst_25)[0] = reinterpret_cast<int4*>(clear_words)[0];
         }

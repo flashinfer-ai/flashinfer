@@ -6,14 +6,19 @@ Each check compares two authoritative sources to detect drift between code
 and documentation. Pure static analysis: grep / AST / filesystem, no GPU,
 no imports of flashinfer.
 
+"Agent guidance" is AGENTS.md plus the reference pages it links under
+docs/development/ (AGENT_GUIDANCE_DOCS).
+
 Checks:
-  env_vars_consistency        — CLAUDE.md FLASHINFER_* env var table vs
-                                real os.environ/getenv reads in code.
-  supported_arch_consistency  — CLAUDE.md "Supported GPU Architectures"
-                                line vs `is_sm*_supported()` predicates and
+  env_vars_consistency        — FLASHINFER_* env vars named in the agent
+                                guidance vs real os.environ/getenv reads in
+                                code.
+  supported_arch_consistency  — the agent guidance "FlashInfer supports
+                                NVIDIA ..." line vs `is_sm*_supported()`
+                                predicates and
                                 `supported_major_versions=[...]` lists in
                                 the JIT layer.
-  quickref_paths_exist        — every file path mentioned in CLAUDE.md
+  quickref_paths_exist        — every file path mentioned in agent guidance
                                 code blocks / tables really exists in repo.
   skill_refs_exist            — file paths inside .claude/skills/*/SKILL.md
                                 still exist in the codebase.
@@ -39,7 +44,7 @@ from .register_checks import (
     get_check,
 )
 from .configure_checks import (
-    CLAUDE_MD,
+    AGENT_GUIDANCE_DOCS,
     CSRC_DIR,
     DOCS_DIR,
     FLASHINFER_PKG,
@@ -103,7 +108,7 @@ _ENV_VAR_EXCLUSIONS = {
 # Accessor functions whose first argument is an env var name.  The in-tree
 # wrappers have to be listed explicitly: a variable read only through
 # ``env_flag_enabled("X")`` never spells ``os.environ`` anywhere, so without
-# them the checker silently stops protecting that CLAUDE.md row.  The
+# them the checker silently stops protecting that AGENTS.md row.  The
 # alternation is deliberately unanchored, which is also what lets it match
 # aliased imports (``env_flag_enabled as _env_flag_enabled`` in
 # flashinfer/quantization/kernels/nvfp4_quantize.py) and ``std::getenv``.
@@ -187,16 +192,24 @@ def collect_env_vars_in_code() -> set[str]:
     return set(collect_env_var_reads_in_code())
 
 
-def collect_env_vars_in_claude_md() -> set[str]:
-    if not CLAUDE_MD.exists():
-        return set()
-    text = CLAUDE_MD.read_text("utf-8", "replace")
-    return set(_ENV_VAR_DOCREF_RE.findall(text)) - _ENV_VAR_EXCLUSIONS
+def _agent_guidance_texts() -> list[tuple[Path, str]]:
+    return [
+        (doc, doc.read_text("utf-8", "replace"))
+        for doc in AGENT_GUIDANCE_DOCS
+        if doc.exists()
+    ]
+
+
+def collect_env_vars_in_agents_md() -> set[str]:
+    found: set[str] = set()
+    for _, text in _agent_guidance_texts():
+        found.update(_ENV_VAR_DOCREF_RE.findall(text))
+    return found - _ENV_VAR_EXCLUSIONS
 
 
 def check_env_vars_consistency() -> list[Finding]:
     code_reads = collect_env_var_reads_in_code()
-    doc = collect_env_vars_in_claude_md()
+    doc = collect_env_vars_in_agents_md()
     out: list[Finding] = []
     missing_in_doc = sorted(set(code_reads) - doc)
     for v in missing_in_doc:
@@ -217,11 +230,11 @@ def check_env_vars_consistency() -> list[Finding]:
 # supported_arch_consistency
 # ---------------------------------------------------------------------------
 
-# Single canonical sentence in CLAUDE.md:
+# Single canonical sentence in the agent guidance (docs/development/testing.md):
 #   "FlashInfer supports NVIDIA SM75, SM80, SM86, SM89, SM90, SM103, SM110,
 #    SM120, and SM121."
-_CLAUDE_ARCH_LINE_RE = re.compile(
-    r"FlashInfer supports NVIDIA ((?:SM\d+[a-z]?(?:, and | and |, )?)+)"
+_AGENTS_ARCH_LINE_RE = re.compile(
+    r"FlashInfer supports NVIDIA ((?:SM\d+[a-z]?(?:,\s+and\s+|\s+and\s+|,\s+)?)+)"
 )
 _SM_TOKEN_RE = re.compile(r"SM(\d+)[a-z]?")
 _SUPPORTED_MAJOR_RE = re.compile(r"supported_major_versions\s*=\s*\[([^\]]*)\]")
@@ -229,14 +242,11 @@ _IS_SM_PREDICATE_RE = re.compile(r"def\s+(is_sm(\d+)([a-z])?_supported)\s*\(")
 
 
 def collect_arches_doc() -> set[int]:
-    if not CLAUDE_MD.exists():
-        return set()
-    text = CLAUDE_MD.read_text("utf-8", "replace")
-    m = _CLAUDE_ARCH_LINE_RE.search(text)
-    if not m:
-        return set()
-    fragment = m.group(1)
-    return {int(x) for x in _SM_TOKEN_RE.findall(fragment)}
+    for _, text in _agent_guidance_texts():
+        m = _AGENTS_ARCH_LINE_RE.search(text)
+        if m:
+            return {int(x) for x in _SM_TOKEN_RE.findall(m.group(1))}
+    return set()
 
 
 def collect_arches_code() -> tuple[set[int], set[int]]:
@@ -281,8 +291,9 @@ def check_supported_arch() -> list[Finding]:
         out.append(
             Finding(
                 check=SUPPORTED_ARCH,
-                location="CLAUDE.md",
-                message="Could not find 'FlashInfer supports NVIDIA ...' arch line",
+                location="AGENTS.md",
+                message="Could not find 'FlashInfer supports NVIDIA ...' arch "
+                "line in the agent guidance",
             )
         )
         return out
@@ -295,7 +306,7 @@ def check_supported_arch() -> list[Finding]:
                     check=SUPPORTED_ARCH,
                     location=f"flashinfer/utils.py (is_sm{cap}*_supported)",
                     message=f"SM{cap} has is_sm{cap}*_supported() predicate but is "
-                    f"not in CLAUDE.md supported-arch list",
+                    f"not in the agent-guidance supported-arch list",
                 )
             )
     # Every major in supported_major_versions[] should be reflected by at least
@@ -308,7 +319,7 @@ def check_supported_arch() -> list[Finding]:
                     check=SUPPORTED_ARCH,
                     location="flashinfer/jit/* (supported_major_versions)",
                     message=f"Major SM{mj}x referenced in supported_major_versions=[] "
-                    f"but no SM{mj}? appears in CLAUDE.md arch list",
+                    f"but no SM{mj}? appears in the agent-guidance arch list",
                 )
             )
     return out
@@ -377,9 +388,10 @@ _PLACEHOLDER_PATH_TOKENS = (
 )
 
 # Paths that are documented to be generated/created at build time, not present
-# in a clean checkout. CLAUDE.md explicitly calls these out as build artifacts.
+# in a clean checkout. AGENTS.md explicitly calls these out as build artifacts.
 _BUILD_ARTIFACT_PATHS = {
     "flashinfer/_build_meta.py",  # generated from version.txt
+    "flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt",  # generated in slim wheels
     "flashinfer/data/cutlass",  # editable-install symlink
     "flashinfer/data/csrc",  # editable-install symlink
     "flashinfer/data/include",  # editable-install symlink
@@ -434,9 +446,14 @@ def iter_markdown_paths(text: str) -> list[str]:
 
 
 def check_quickref_paths_exist() -> list[Finding]:
-    if not CLAUDE_MD.exists():
-        return []
-    text = CLAUDE_MD.read_text("utf-8", "replace")
+    out: list[Finding] = []
+    for doc, text in _agent_guidance_texts():
+        out.extend(_check_doc_paths_exist(doc, text))
+    return out
+
+
+def _check_doc_paths_exist(doc: Path, text: str) -> list[Finding]:
+    rel = str(doc.relative_to(FLASHINFER_ROOT))
     out: list[Finding] = []
     seen: set[str] = set()
     for path, line in iter_markdown_path_locations(text):
@@ -464,8 +481,8 @@ def check_quickref_paths_exist() -> list[Finding]:
         out.append(
             Finding(
                 check=QUICKREF_PATHS,
-                location=f"CLAUDE.md:{line}",
-                file="CLAUDE.md",
+                location=f"{rel}:{line}",
+                file=rel,
                 line=line,
                 message=f"Referenced path does not exist: `{path}`",
             )
@@ -700,7 +717,7 @@ def main(argv: list[str]) -> int:
     lines = [
         "# FlashInfer Cross-Source Consistency Check",
         "",
-        "Static comparison between code, CLAUDE.md, and `.claude/skills/` content.",
+        "Static comparison between code, AGENTS.md, and `.claude/skills/` content.",
         "",
         "## Summary",
         "",

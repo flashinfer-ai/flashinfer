@@ -19,7 +19,7 @@ manifest, the keyword-only prepare surface, and every exported stage --
 routing (Renormalize top-k), FC1 with the StepFun epilogue, the NVFP4
 per-token requantization, FC2 and finalize -- plus the whole graph, each
 against the torch-only fp32 reference of
-``tests/test_helpers/cake_stepfun_moe_reference.py`` at the per-family
+``tests/experimental/test_helpers/cake_stepfun_moe_reference.py`` at the per-family
 tolerances (bf16 1e-2 / 1e-2, fp8 and mxfp8 0.1 / 0.1 with the e4m3 one-ulp
 block rule, nvfp4 1.0 / 0.1 after dequantization with the e2m1 one-code block
 rule; routing tables bitwise, permutation maps canonically above 16 tokens).
@@ -34,7 +34,7 @@ reference module.  CUDA-graph replays and fresh-process first replays must
 equal eager bitwise, and a whole-graph forward launches only Cake kernels.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 registry and keyword tests run on CPU; every kernel test skips without an
@@ -58,8 +58,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers import cake_stepfun_moe_reference as ref
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers import cake_stepfun_moe_reference as ref
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_stepfun_moe")
 cb = cake_package("cake_stepfun_moe", "cake_backend")
@@ -73,12 +73,10 @@ PRECISIONS = tuple(ref.PRECISION_FAMILY)
 PACKAGE_DIR = Path(pkg.__file__).resolve().parent
 STAGE_TABLE_SIZES = {"routing": 50, "fc1": 27, "requant": 2, "fc2": 28, "finalize": 4}
 ROUTE_COUNT = 138
-ARG_PLAN_COUNT = 21
+ARG_PLAN_COUNT = 24
 # The export's measurement catalogue (``ROUTES``), delivered with the tests.
 ROUTES_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "test_helpers"
-    / "cake_stepfun_moe_routes.json"
+    Path(__file__).resolve().parent / "test_helpers" / "cake_stepfun_moe_routes.json"
 )
 CAKE_KERNEL_SYMBOL = re.compile(r"\bkernel_cake_stepfun_moe_[0-9a-f]+\b")
 # The retired per-arch minor macro: its name must not appear in any delivered source.
@@ -334,7 +332,7 @@ def test_stage_tables_and_routes_cover_every_program_once():
     """The five dispatcher tables hold program names only, in the production order and counts (50 /
     27 / 2 / 28 / 4); with the two histogram pre units of the cooperative rows they name every
     program exactly once.  Every program is reachable from a route of the export's measurement
-    catalogue (``tests/test_helpers/cake_stepfun_moe_routes.json``) and every route stage names a
+    catalogue (``tests/experimental/test_helpers/cake_stepfun_moe_routes.json``) and every route stage names a
     registered program delivered for the route's architectures."""
     assert tuple(loader.STAGE_TABLES) == loader.STAGE_ORDER
     named = Counter()
@@ -455,6 +453,9 @@ def test_unit_blocks_carry_the_stage_facts():
             )
             assert unit["per_token"] is families[unit["family"]]["per_token"]
             assert unit["weight_layout"] == families[unit["family"]]["weight_layout"]
+            assert unit["grid_rule"] in ("tiles", "resident"), program
+            if unit["grid_rule"] == "resident":
+                assert unit["stage"] == "fc1" or unit["split_k"] == 1, program
             if unit["stage"] == "fc1":
                 assert unit["output_rows_per_cta"] == ref.FC1_OUTPUT_ROWS_PER_CTA
             else:
@@ -611,7 +612,7 @@ def test_package_sources_carry_no_target_minor_and_no_fast_math():
 
 def test_program_rows_expand_over_the_shared_argument_plans():
     """Every ``PROGRAMS`` record is expanded from a compact row: its argument plan is one of the
-    shared ``ARG_PLANS`` (21 distinct ``[kind, name]`` sequences, each serving at least one
+    shared ``ARG_PLANS`` (24 distinct ``[kind, name]`` sequences, each serving at least one
     program), the tensor-map operands of that plan are exactly the keys of ``unit["tma_ranks"]``,
     and the derived fields hold -- ``library`` is the program name, ``ffi_entry`` is ``run``,
     ``arches`` is ``ARCHES``, ``kernel`` is ``kernel_<program>`` unless ``_KERNEL_OVERRIDES`` names
@@ -1353,7 +1354,8 @@ def test_unfinalized_outputs_follow_the_native_layout(precision, weights_cache):
 @pytest.mark.parametrize("precision", PRECISIONS)
 def test_cuda_graph_replay_equals_eager(precision, num_tokens, weights_cache):
     """A prepared launch captured in a CUDA graph (after one eager launch) replays the eager bytes,
-    on the first and on the second replay."""
+    on the first and on the second replay, and leaves every resident unit's work counter zeroed
+    (no launch resets it)."""
     family = ref.PRECISION_FAMILY[precision]
     device, _arch = _require_device(family)
     weights = _weights(weights_cache, family, 0, device)
@@ -1371,6 +1373,12 @@ def test_cuda_graph_replay_equals_eager(precision, num_tokens, weights_cache):
             assert torch.equal(tensor, expected), (
                 f"{precision} T={num_tokens}: replay {replay} differs"
             )
+        for name, counter in launch.buffers.items():
+            if name.endswith("_work_counter"):
+                assert counter.tolist() == [0, 0], (
+                    f"{precision} T={num_tokens}: {name} is {counter.tolist()} after "
+                    f"replay {replay}"
+                )
 
 
 # ---------------------------------------------------------------------------------------------

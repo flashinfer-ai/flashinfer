@@ -1,6 +1,6 @@
 import BIKernels.Canon
 import BIKernels.Export
-/-! Canonical S-expressions, textually identical to `term.sexpr` on the Python side (`quantization/qterm.py`; `sortPair` is the GEMM export's).
+/-! Canonical S-expressions, textually identical to `term.sexpr` on the Python side (`quantization/qterm.py`, `sampling/sterm.py`; `sortPair` is the GEMM export's).
 Commutative nodes (add, mul, fma's first two operands, the commutative max) print their operands sorted. -/
 namespace BIK
 
@@ -20,6 +20,9 @@ def Term.sexpr : Term → String
   | .fmin a b => s!"(fmin {a.sexpr} {b.sexpr})"
   | .fmaxc a b => let (p, q) := sortPair a.sexpr b.sexpr; s!"(fmax {p} {q})"   -- `term.sexpr` prints the commutative max as (fmax p q), sorted
   | .nzor a b => s!"(nzor {a.sexpr} {b.sexpr})"
+  | .neg a => s!"(neg {a.sexpr})"
+  | .ex2 a => s!"(ex2 {a.sexpr})"
+  | .opq name a => s!"(op:{name} {a.sexpr})"
 
 def osexpr : Option Term → String
   | none => "absent"

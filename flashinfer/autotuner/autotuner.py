@@ -36,6 +36,7 @@ from flashinfer.utils import (
     next_positive_power_of_2,
     is_confidential_compute,
     get_globaltimer_kernel,
+    make_l2_flush,
 )
 
 from flashinfer.jit.core import logger
@@ -325,7 +326,9 @@ def _collect_metadata() -> dict[str, str]:
 
         * ``flashinfer_version``  -- our own bucketing / ordering changes
         * ``cuda_version``        -- CUDA driver/runtime ABI
-        * ``cublas_version``      -- cuBLAS plan availability inside cuDNN
+        * ``cublas_version``      -- cuBLAS plan availability inside cuDNN,
+                                     and the cuBLASLt algorithm descriptors
+                                     the cuBLAS runners use as tactics
         * ``cudnn_version``       -- cuDNN **backend** version
         * ``cudnn_frontend_version`` -- cuDNN-frontend Python wrapper
                                         version (independent of backend);
@@ -935,8 +938,10 @@ def autotune(
         tuning_buckets: Optional sequence of integer measurement points.
             When provided, replaces the default power-of-2 buckets for all
             operations within this context.  For example,
-            ``tuning_buckets=(64, 128, 256, 512, 1024)`` profiles exactly
-            those batch sizes.  Duplicates are removed and values are sorted
+            ``tuning_buckets=(64, 128, 256, 512, 1024)`` profiles those batch
+            sizes.  Listed sizes that an op maps to the same bucket share one
+            tuned entry, profiled at the size equal to that bucket, or else at
+            the largest of them.  Duplicates are removed and values are sorted
             automatically.  Must contain **at least one** value when provided;
             pass ``None`` (or omit) to inherit the current buckets.
 
@@ -950,6 +955,8 @@ def autotune(
             for throughput-oriented serving, cover the larger range.
 
         round_up: Controls how runtime sizes map to profiled buckets.
+            Ignored when ``tuning_buckets`` is given (each op's own mapper
+            is used then).
 
             * ``None`` (default) -- inherit from enclosing ``autotune()``
               context, or ``False`` if there is none.
@@ -978,7 +985,7 @@ def autotune(
             ``autotune(skip_ops={"B"})`` inside an outer
             ``autotune(skip_ops={"A"})`` skips both ``"A"`` and ``"B"``.
             Common op names: ``"fp4_gemm"``, ``"bf16_gemm"``,
-            ``"bf16_gemm_pdl_auto"``, ``"fp8_gemm"``, ``"mxfp8_gemm"``.
+            ``"bf16_gemm_pdl"``, ``"fp8_gemm"``, ``"mxfp8_gemm"``.
         cuda_graph_profile_replays: Number of CUDA graph samples per profiling
             repeat. Operations configured for hot L2 use back-to-back replays;
             operations configured with ``use_cold_l2_cache=True`` flush L2
@@ -1013,19 +1020,19 @@ def autotune(
     ``map_to_tuning_buckets`` maps the runtime size to the nearest profiled
     bucket, so an unsupported raw size never reaches the kernel directly.
 
-    **Round-up beyond the largest bucket** -- When ``round_up=True`` and the
-    runtime size exceeds every bucket, the value is clamped to the largest
-    bucket (see :func:`~flashinfer.fused_moe.utils.round_to_nearest_bucket`).
+    **Round-up beyond the largest bucket** -- When ``round_up=True`` is used
+    without ``tuning_buckets`` and the runtime size exceeds every bucket, the
+    value is clamped to the largest bucket (see
+    :func:`~flashinfer.fused_moe.utils.round_to_nearest_bucket`).
 
     **Nested / sequential contexts** -- Overrides are managed on a per-thread
     stack.  A nested ``autotune()`` pushes its overrides; on exit the outer
     context's values are restored.  Sequential contexts are fully independent.
-    Different buckets produce different cache keys, so entries never collide.
 
-    **Using both parameters together** is fully supported:
-    ``autotune(tuning_buckets=(100, 300, 600), round_up=True)`` profiles
-    at 100, 300, and 600 and rounds runtime sizes *up* to the nearest of
-    those buckets at inference time.
+    **Using both parameters together** -- ``round_up`` has no effect.  Each
+    op's own mapper decides which bucket a runtime size uses, and a size whose
+    op bucket no listed size maps to finds no tuned entry inside the context
+    and uses the default tactic.
 
     Examples::
 
@@ -1041,7 +1048,7 @@ def autotune(
         with autotune(False, cache="my_configs.json", round_up=True):
             model(inputs)
 
-        # Combine custom buckets with round-up
+        # round_up has no effect together with tuning_buckets
         with autotune(True, tuning_buckets=(100, 300, 600), round_up=True):
             model(inputs)  # profiles at 100, 300, 600
 
@@ -2666,12 +2673,9 @@ class AutoTuner:
     ) -> tuple[tuple[int, ...], ...] | None:
         """Return the largest tuned profile for a lookup above the tuned range.
 
-        A lookup's bucket can lie above every bucket tuned for the op: the
-        runtime size exceeds the tuned sizes, or tuning ran under
-        ``autotune(tuning_buckets=...)`` and stored its top bucket under a
-        value the op's own ``map_to_tuning_buckets`` never produces (e.g.
-        21504 stored as 21504 but looked up as its next power of two, 32768).
-        Either way the lookup would silently use the untuned fallback.
+        A lookup's bucket can lie above every bucket tuned for the op when the
+        runtime size exceeds the tuned sizes; the lookup would then silently
+        use the untuned fallback.
 
         Candidates are the tuned profiles in the active in-memory partition,
         the user-loaded configs and the hydrated entries of the active
@@ -2802,8 +2806,22 @@ class AutoTuner:
             new_gen: tuple[int, ...] | Callable[[int], Iterable[int]]
             new_map: Callable[[int], int]
             if buckets is not None:
-                new_gen = tuple(sorted(set(buckets)))
-                new_map = make_bucket_mapper(new_gen, round_map=round_up_flag)
+                # Keep the op's own mapper so tuning and inference build the
+                # same cache key even if the largest bucket is off the op's grid
+                # (e.g. 21504 vs. 32768).
+                new_map = spec.map_to_tuning_buckets
+                # Profile one listed size per key: the size equal to the key,
+                # else the largest.  The smallest would store e.g. the tactic
+                # measured at M=1 under key 1024.
+                sizes_by_key: dict[int, list[int]] = {}
+                for size in sorted(set(buckets)):
+                    sizes_by_key.setdefault(new_map(size), []).append(size)
+                new_gen = tuple(
+                    sorted(
+                        key if key in sizes else sizes[-1]
+                        for key, sizes in sizes_by_key.items()
+                    )
+                )
             elif round_up_flag:
                 if isinstance(spec.gen_tuning_buckets, (list, tuple)):
                     sorted_gen = tuple(sorted(set(spec.gen_tuning_buckets)))
@@ -4084,10 +4102,8 @@ class AutoTuner:
             # Twice L2 matches the standalone benchmark policy and prevents
             # static operands passed through kwargs (for example MoE weights)
             # from remaining resident between samples.
-            flush_buffer = torch.empty(
-                2 * self._get_l2_cache_size_in_bytes(device.index),
-                dtype=torch.int8,
-                device=device,
+            l2_flush = make_l2_flush(
+                2 * self._get_l2_cache_size_in_bytes(device.index), device
             )
             num_samples = repeat * profile_replays
             graph = torch.cuda.CUDAGraph() if tuning_config.use_cuda_graph else None
@@ -4137,7 +4153,7 @@ class AutoTuner:
                     delay_kernel(delay_kernel_time_usec)
 
                 for sample_idx in range(num_samples):
-                    flush_buffer.zero_()
+                    l2_flush()
                     starts[sample_idx].record(stream)
                     if graph is not None:
                         graph.replay()
@@ -4464,8 +4480,8 @@ class AutoTuner:
         of a multi-kernel tactic are honestly included, queue-saturation
         effects are not (see ``MeasurementPolicy``).
 
-        Cold-L2 is achieved by zeroing an L2-sized flush buffer once per
-        iteration.  ``zero_()`` dispatches a fill KERNEL (not a memset), so
+        Cold-L2 is achieved by reading an L2-sized flush buffer once per
+        iteration.  The read is a reduction KERNEL, so
         it is handed to ``_cupti_measure_spans`` as a prologue that runs and
         is synced BEFORE the correlation window opens; running it inside the
         window would fold ~100 us of flush into the tactic's measured span
@@ -4488,10 +4504,10 @@ class AutoTuner:
 
         with _profile_measurement_scope():
             graph = None
-            flush_buffer = None
+            l2_flush = None
 
             def prepare():
-                nonlocal graph, flush_buffer
+                nonlocal graph, l2_flush
                 for _ in range(self.warmup):
                     runner(inputs, tactic=tactic, **kwargs)
 
@@ -4500,10 +4516,8 @@ class AutoTuner:
                         (t.device for t in inputs if isinstance(t, torch.Tensor)),
                         torch.device("cuda"),
                     )
-                    flush_buffer = torch.empty(
-                        self._get_l2_cache_size_in_bytes() * 3,
-                        device=device,
-                        dtype=torch.int8,
+                    l2_flush = make_l2_flush(
+                        self._get_l2_cache_size_in_bytes() * 3, device
                     )
 
                 if tuning_config.use_cuda_graph:
@@ -4519,9 +4533,9 @@ class AutoTuner:
                     graph.replay()
 
             def prologue():
-                # zero_ launches a fill kernel; exclude it from the span.
-                if flush_buffer is not None:
-                    flush_buffer.zero_()
+                # The flush launches a reduction kernel; exclude it from the span.
+                if l2_flush is not None:
+                    l2_flush()
 
             spans_ms = _cupti_measure_spans(
                 run_iteration,

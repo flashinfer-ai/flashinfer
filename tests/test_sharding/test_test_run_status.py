@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -87,6 +89,12 @@ def test_worker_missing_before_python_starts_prevents_publication(
     "route,outcome",
     [
         ("torchrun", "passed"),
+        ("mega", "passed"),
+        ("mega", "assertion"),
+        ("mega", "oom"),
+        ("mega", "missing_jit_cache"),
+        ("torchrun", "oom"),
+        ("torchrun", "missing_jit_cache"),
         ("torchrun", "assertion"),
         ("torchrun", "internal"),
         ("torchrun", "crash"),
@@ -102,6 +110,10 @@ def test_communication_wrappers_report_execution_outcomes(
     tmp_path: Path, route: str, outcome: str
 ) -> None:
     wrapper, test_path = {
+        "mega": (
+            "task_test_multi_gpu_comm_kernels.sh",
+            "tests/moe_ep/test_sm107_auto_multirank.py",
+        ),
         "torchrun": (
             "task_test_multi_gpu_comm_kernels.sh",
             "tests/attention/test_parallel_attention.py",
@@ -128,7 +140,9 @@ def test_communication_wrappers_report_execution_outcomes(
         "test_run_status.py",
     ]:
         shutil.copy(ROOT / "scripts" / name, scripts / name)
-    (scripts / "setup_test_env.sh").write_text("install_and_verify() { :; }\n")
+    (scripts / "setup_test_env.sh").write_text(
+        "install_and_verify() { :; }\nsetup_moe_ep_test_env() { :; }\n"
+    )
     test_file = tmp_path / test_path
     test_file.parent.mkdir(parents=True, exist_ok=True)
     if outcome == "collection":
@@ -141,12 +155,69 @@ def test_communication_wrappers_report_execution_outcomes(
         )
     elif outcome == "passed":
         test_file.write_text("def test_success():\n    pass\n")
+    elif outcome in ("oom", "missing_jit_cache"):
+        # Load the real exception hook without importing GPU package setup.
+        hook_names = {
+            "is_cuda_oom_error_str",
+            "_release_cuda_oom",
+            "pytest_runtest_call",
+        }
+        hook_source = "\n\n".join(
+            ast.unparse(node)
+            for node in ast.parse((ROOT / "tests/conftest.py").read_text()).body
+            if isinstance(node, ast.FunctionDef) and node.name in hook_names
+        )
+        error_class = next(
+            node
+            for node in ast.parse((ROOT / "flashinfer/jit/core.py").read_text()).body
+            if isinstance(node, ast.ClassDef) and node.name == "MissingJITCacheError"
+        )
+        (tmp_path / "conftest.py").write_text(
+            "from __future__ import annotations\n"
+            "import os, traceback, pytest, torch\n"
+            "_MISSING_JIT_CACHE_MODULES = set()\n"
+            + ast.unparse(error_class)
+            + "\n\n"
+            + hook_source
+        )
+        error = (
+            'torch.cuda.OutOfMemoryError("CUDA out of memory")'
+            if outcome == "oom"
+            else 'MissingJITCacheError("missing test kernel")'
+        )
+        test_file.write_text(
+            "from pathlib import Path\nimport torch\n"
+            "from conftest import MissingJITCacheError\n"
+            "def test_runtime_error():\n"
+            '    Path("runtime-error-reached").touch()\n'
+            f"    raise {error}\n"
+        )
     else:
         test_file.write_text("def test_failure():\n    assert False\n")
     if outcome == "internal":
         (tmp_path / "conftest.py").write_text(
             'def pytest_sessionstart(session):\n    raise RuntimeError("internal error")\n'
         )
+    if route == "mega" or outcome in ("oom", "missing_jit_cache"):
+        (tmp_path / "torch.py").write_text(
+            "from types import SimpleNamespace\n"
+            "class OutOfMemoryError(RuntimeError):\n    pass\n"
+            "version = SimpleNamespace(cuda='13.4')\n"
+            "cuda = SimpleNamespace(is_available=lambda: True, "
+            "get_device_capability=lambda: (10, 7), "
+            "OutOfMemoryError=OutOfMemoryError)\n"
+        )
+    if route == "mega":
+        with test_file.open("a") as stream:
+            stream.write(
+                '\nimport os\nassert os.environ["FAIL_ON_DISTRIBUTED_SKIP"] == "1"\n'
+                'assert os.environ["CUTE_DSL_ARCH"] == "sm_107a"\n'
+            )
+    elif route == "torchrun" and outcome == "passed":
+        with test_file.open("a") as stream:
+            stream.write(
+                '\nimport os\nassert "FAIL_ON_DISTRIBUTED_SKIP" not in os.environ\n'
+            )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     for name in ["mpirun", "torchrun"]:
@@ -158,6 +229,8 @@ def test_communication_wrappers_report_execution_outcomes(
         )
         executable.chmod(0o755)
     env = dict(os.environ)
+    env.pop("FAIL_ON_DISTRIBUTED_SKIP", None)
+    env.pop("FLASHINFER_STRICT_MOE_EP_TESTS", None)
     env.update(
         PATH=f"{fake_bin}:{env['PATH']}",
         PIP_CONSTRAINT=os.devnull,
@@ -189,6 +262,16 @@ def test_communication_wrappers_report_execution_outcomes(
     elif outcome == "skip":
         assert report["complete"] is True
         assert report["tests_executed"] == 0
+    elif outcome in ("oom", "missing_jit_cache"):
+        assert (tmp_path / "runtime-error-reached").exists()
+        assert report["complete"] is True
+        assert report["infrastructure_errors"] == []
+        strict = route == "mega"
+        assert result.returncode == int(strict), result.stdout + result.stderr
+        assert report["tests_executed"] == int(strict)
+        [junit] = (tmp_path / "junit").glob("*.xml")
+        [case] = ET.parse(junit).iter("testcase")
+        assert case.find("failure" if strict else "skipped") is not None
     else:
         assert report["infrastructure_errors"]
         assert result.returncode == 1

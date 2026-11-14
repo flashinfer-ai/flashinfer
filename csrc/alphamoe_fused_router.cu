@@ -265,8 +265,8 @@ inline RouterKernels GetRouterKernels(int minor) {
                                                         "kernel_alpha_moe_fused_router_medium");
     static auto medium_routed = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
         alphamoe_medium_routed_sm_100a, "kernel_alpha_moe_fused_router_medium");
-    static auto small = TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_small_sm_100a,
-                                                       "kernel_alpha_moe_fused_router_small");
+    static auto small_kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_small_sm_100a, "kernel_alpha_moe_fused_router_small");
     static auto small_routed = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
         alphamoe_small_routed_sm_100a, "kernel_alpha_moe_fused_router_small");
     static auto tiny = TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_tiny_sm_100a,
@@ -275,7 +275,7 @@ inline RouterKernels GetRouterKernels(int minor) {
                                                              "kernel_alpha_moe_fused_router_small");
     static auto large_tail = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
         alphamoe_large_tail_sm_100a, "kernel_alpha_moe_fused_router_large_tail");
-    return {&large,        &large_routed, &medium,      &medium_routed, &small,
+    return {&large,        &large_routed, &medium,      &medium_routed, &small_kernel,
             &small_routed, &tiny,         &tiny_routed, &large_tail};
   }
 #endif
@@ -289,8 +289,8 @@ inline RouterKernels GetRouterKernels(int minor) {
                                                         "kernel_alpha_moe_fused_router_medium");
     static auto medium_routed = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
         alphamoe_medium_routed_sm_103a, "kernel_alpha_moe_fused_router_medium");
-    static auto small = TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_small_sm_103a,
-                                                       "kernel_alpha_moe_fused_router_small");
+    static auto small_kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_small_sm_103a, "kernel_alpha_moe_fused_router_small");
     static auto small_routed = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
         alphamoe_small_routed_sm_103a, "kernel_alpha_moe_fused_router_small");
     static auto tiny = TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_tiny_sm_103a,
@@ -299,7 +299,7 @@ inline RouterKernels GetRouterKernels(int minor) {
                                                              "kernel_alpha_moe_fused_router_small");
     static auto large_tail = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
         alphamoe_large_tail_sm_103a, "kernel_alpha_moe_fused_router_large_tail");
-    return {&large,        &large_routed, &medium,      &medium_routed, &small,
+    return {&large,        &large_routed, &medium,      &medium_routed, &small_kernel,
             &small_routed, &tiny,         &tiny_routed, &large_tail};
   }
 #endif

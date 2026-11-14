@@ -15,7 +15,7 @@ limitations under the License.
 
 The CP = 1 local path of the Cake packed GDN training package
 (``flashinfer.cake_gdn_det_train_kcp`` with a one-rank context) against the exact FP64
-reference of ``tests/test_helpers/cake_gdn_det_train_kcp_reference.py``.
+reference of ``tests/experimental/test_helpers/cake_gdn_det_train_kcp_reference.py``.
 
 Covered here: the six outputs ``out, dq, dk, dv, dbeta, dg`` on ragged packs
 of the normal gate regime (natural-log gates down to the -42 class; zero
@@ -34,10 +34,12 @@ table and byte-query tests in ``test_cake_gdn_det_train_kcp.py``.
 
 from __future__ import annotations
 
+import importlib
+
 import pytest
 import torch
 
-from tests.test_helpers.cake_gdn_det_train_kcp_reference import (
+from tests.experimental.test_helpers.cake_gdn_det_train_kcp_reference import (
     BLOCK,
     D,
     GRAD_NAMES,
@@ -49,11 +51,9 @@ from tests.test_helpers.cake_gdn_det_train_kcp_reference import (
     make_inputs,
     reference_pack,
 )
+from tests.cake.test_helpers.cake_package import PACKAGES, cake_package
 
-gdn_api = pytest.importorskip(
-    "flashinfer.cake_gdn_det_train_kcp",
-    reason="the flashinfer.cake_gdn_det_train_kcp facade is not part of this tree",
-)
+gdn_api = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
 
 # Accuracy gate, declared before the first run: every output elementwise within
 # ``|cand - ref| <= ATOL + RTOL * |ref|`` of the exact FP64 reference of the same BF16 / FP32 inputs with ZERO
@@ -137,7 +137,7 @@ def _device_or_skip() -> torch.device:
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
     index = torch.cuda.current_device()
-    if not gdn_api.is_gdn_det_train_kcp_supported(index):
+    if not gdn_api.is_cake_gdn_det_train_kcp_supported(index):
         pytest.skip("the package does not support this device")
     return torch.device("cuda", index)
 
@@ -149,16 +149,16 @@ def device() -> torch.device:
 
 def _local_context(cu: list[int], device: torch.device):
     """The one-rank context of the local path (the public entry names; group None = single process)."""
-    part = gdn_api.partition_det_kcp(
+    part = gdn_api.cake_gdn_det_train_kcp_partition(
         torch.tensor(cu, dtype=torch.int64), 1, layout="contiguous"
     )
-    return gdn_api.build_context_det_kcp(part, None, 0, device)
+    return gdn_api.cake_gdn_det_train_kcp_build_context(part, None, 0, device)
 
 
 def _run_fwd_bwd(inputs: dict, ctx, device: torch.device) -> dict:
     """Autograd forward + backward of the local path; the results keyed by tensor name (no batch axis)."""
     leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
-    out = gdn_api.chunk_gdn_det_kcp(*leaves, ctx)
+    out = gdn_api.cake_gdn_det_kcp(*leaves, ctx)
     grads = torch.autograd.grad(out, leaves, inputs["dout"].to(device))
     res = {"out": out.detach()[0]}
     res.update({n: gr.detach()[0] for n, gr in zip(GRAD_NAMES, grads, strict=True)})
@@ -257,7 +257,7 @@ def test_packed_qkv_strided_view_equals_the_contiguous_input(
 
 def _split_view_pass(form, row0, g0, b0, dout, ctx, heads, *, ckpt, **o) -> dict:
     """One autograd pass with q / k / v taken from the packed ``[1, T, (2 H_qk + HV) * 128]`` row ``row0``:
-    ``"plain"`` = ``split`` + ``view`` head views, ``"packed"`` = ``packed_qkv_views_det_kcp``, ``"contiguous"`` =
+    ``"plain"`` = ``split`` + ``view`` head views, ``"packed"`` = ``cake_gdn_det_train_kcp_packed_qkv_views``, ``"contiguous"`` =
     separate contiguous leaves holding the same values.  A tensor hook (recording the gradient) and ``retain_grad``
     are set on every view (and on the split outputs) of the original forward."""
     H, HV = heads
@@ -287,7 +287,9 @@ def _split_view_pass(form, row0, g0, b0, dout, ctx, heads, *, ckpt, **o) -> dict
                 p.view(1, T, n, D) for p, n in zip(parts, (H, H, HV), strict=True)
             )
         else:
-            q, k, v = gdn_api.packed_qkv_views_det_kcp(row, H_qk=H, HV=HV)
+            q, k, v = gdn_api.cake_gdn_det_train_kcp_packed_qkv_views(
+                row, H_qk=H, HV=HV
+            )
         if not views:  # the original forward (a checkpoint recompute builds a graph no backward runs)
             views.update(q=q, k=k, v=v, **{f"part{i}": p for i, p in enumerate(parts)})
             for name, t in views.items():
@@ -295,7 +297,7 @@ def _split_view_pass(form, row0, g0, b0, dout, ctx, heads, *, ckpt, **o) -> dict
                     lambda gr, name=name: fired.setdefault(name, []).append(gr.clone())
                 )
                 t.retain_grad()
-        return gdn_api.chunk_gdn_det_kcp(q, k, v, g, beta, ctx, **o)
+        return gdn_api.cake_gdn_det_kcp(q, k, v, g, beta, ctx, **o)
 
     if ckpt:
         from torch.utils.checkpoint import checkpoint
@@ -330,11 +332,13 @@ def test_plain_split_views_keep_hooks_and_bitwise_gradients(
     device, lengths, heads, norm, ckpt
 ) -> None:
     """Issue #8367 on the device programs: plain ``split`` / ``view`` head views of one packed QKV row, the
-    ``packed_qkv_views_det_kcp`` views of it and contiguous operands give bitwise the same ``out``, row gradient
+    ``cake_gdn_det_train_kcp_packed_qkv_views`` views of it and contiguous operands give bitwise the same ``out``, row gradient
     (``dq | dk | dv``), ``dg`` and ``dbeta``, with the in-kernel norm off and on, direct and checkpointed.  Plain views
     keep torch's autograd path: their tensor hooks and ``retain_grad`` (and those on the split outputs) fire once
     with the gradient, and only the packed views' split hands the packed dQKV row on without a concatenation."""
-    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
+    )
     H, HV = heads
     cu = _cu(lengths)
     T = cu[-1]
@@ -385,8 +389,10 @@ def test_explicit_entries_match_autograd_and_keep_the_output_order(device) -> No
     ctx = _local_context(cu, device)
     ops = [inputs[n].to(device) for n in OPERANDS]
     dout = inputs["dout"].to(device)
-    out, saved = gdn_api.chunk_gdn_det_fwd_kcp(*ops, ctx, save_for_backward=True)
-    grads = gdn_api.chunk_gdn_det_bwd_kcp(*ops, ctx, dout, saved=saved)
+    out, saved = gdn_api.cake_gdn_det_train_kcp_forward(
+        *ops, ctx, save_for_backward=True
+    )
+    grads = gdn_api.cake_gdn_det_train_kcp_backward(*ops, ctx, dout, saved=saved)
     assert len(grads) == len(EXPLICIT_GRAD_ORDER)
     auto = _run_fwd_bwd(inputs, ctx, device)
     assert torch.equal(out[0], auto["out"])
@@ -395,52 +401,62 @@ def test_explicit_entries_match_autograd_and_keep_the_output_order(device) -> No
         assert torch.equal(t[0], auto[n]), (
             f"{n} differs between the explicit entry and autograd"
         )
-    replay = gdn_api.chunk_gdn_det_bwd_kcp(*ops, ctx, dout, saved=None)
+    replay = gdn_api.cake_gdn_det_train_kcp_backward(*ops, ctx, dout, saved=None)
     for n, t_saved, t_replay in zip(EXPLICIT_GRAD_ORDER, grads, replay, strict=True):
         assert torch.equal(t_saved, t_replay), (
             f"{n}: saved-context and replay backward differ"
         )
 
 
+@pytest.mark.skipif(
+    "cake_gdn_nondet_train_kcp" not in PACKAGES,
+    reason="pending integration: the non-deterministic package is not in this tree's PACKAGES table",
+)
 def test_backward_refuses_the_non_deterministic_forwards_saved_set_and_workspace(
     device,
 ) -> None:
     """A saved set and a caller-held workspace of the non-deterministic package's forward (kernels, same tokens) are
     refused by the deterministic package backward with ``ValueError`` naming the deterministic mode and the expected
     type; the deterministic forward's own saved set and workspace still run."""
-    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
-    nd = pytest.importorskip(
-        "flashinfer.experimental.cake_gdn_train_kcp",
-        reason="the non-deterministic package is not part of this tree",
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
     )
+    # the non-deterministic package under its FlashInfer #8928 path and names; it ships with this package, so a
+    # package that does not import fails here, it is not skipped
+    nd = cake_package("cake_gdn_nondet_train_kcp")
     cu = _cu((100, 640, 77))
     inputs = make_inputs(cu, 2, 6)
     ops = [inputs[n].to(device) for n in OPERANDS]
     dout = inputs["dout"].to(device)
-    nd_part = nd.partition_kcp(
+    nd_part = nd.cake_gdn_nondet_train_kcp_partition(
         torch.tensor(cu, dtype=torch.int64), 1, layout="contiguous"
     )
-    nd_ws = nd.WorkspaceKcp()
-    _, nd_saved = nd.chunk_gdn_fwd_kcp(
+    nd_ws = nd.CakeGDNNondetKcpWorkspace()
+    _, nd_saved = nd.cake_gdn_nondet_train_kcp_forward(
         *ops,
-        nd.build_context_kcp(nd_part, None, 0, device),
+        nd.cake_gdn_nondet_train_kcp_build_context(nd_part, None, 0, device),
         workspace=nd_ws,
-        deterministic=False,
     )
-    assert type(nd_saved) is nd.SavedKcp
+    assert type(nd_saved) is nd.CakeGDNNondetKcpSaved
     ctx = _local_context(cu, device)
-    ws = kcp.WorkspaceDetKcp()
-    _, saved = kcp.chunk_gdn_det_fwd_kcp(*ops, ctx, workspace=ws)
+    ws = kcp.CakeGDNDetKcpWorkspace()
+    _, saved = kcp.cake_gdn_det_train_kcp_forward(*ops, ctx, workspace=ws)
     with pytest.raises(
-        ValueError, match="saved must be a SavedDetKcp of the deterministic mode"
+        ValueError, match="saved must be a CakeGDNDetKcpSaved of the deterministic mode"
     ):
-        kcp.chunk_gdn_det_bwd_kcp(*ops, ctx, dout, saved=nd_saved, workspace=ws)
+        kcp.cake_gdn_det_train_kcp_backward(
+            *ops, ctx, dout, saved=nd_saved, workspace=ws
+        )
     with pytest.raises(
         ValueError,
-        match="workspace must be a WorkspaceDetKcp of the deterministic mode",
+        match="workspace must be a CakeGDNDetKcpWorkspace of the deterministic mode",
     ):
-        kcp.chunk_gdn_det_bwd_kcp(*ops, ctx, dout, saved=saved, workspace=nd_ws)
-    grads = kcp.chunk_gdn_det_bwd_kcp(*ops, ctx, dout, saved=saved, workspace=ws)
+        kcp.cake_gdn_det_train_kcp_backward(
+            *ops, ctx, dout, saved=saved, workspace=nd_ws
+        )
+    grads = kcp.cake_gdn_det_train_kcp_backward(
+        *ops, ctx, dout, saved=saved, workspace=ws
+    )
     assert all(bool(torch.isfinite(t).all()) for t in grads)
 
 
@@ -452,8 +468,8 @@ def test_every_launch_binds_the_caller_stream_once(device, monkeypatch, ckpt) ->
     call on the default stream."""
     from torch.utils.checkpoint import checkpoint
 
-    be = pytest.importorskip(
-        "flashinfer.experimental.cake_gdn_det_train_kcp.cake_backend"
+    be = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_backend"
     )
     cu = _cu((100, 640, 77, 1000, 129))
     inputs = make_inputs(cu, 2, 6)
@@ -464,7 +480,7 @@ def test_every_launch_binds_the_caller_stream_once(device, monkeypatch, ckpt) ->
         leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
 
         def fn(*xs):
-            return gdn_api.chunk_gdn_det_kcp(*xs, ctx)
+            return gdn_api.cake_gdn_det_kcp(*xs, ctx)
 
         out = checkpoint(fn, *leaves, use_reentrant=False) if ckpt else fn(*leaves)
         grads = torch.autograd.grad(out, leaves, dout)
@@ -514,23 +530,25 @@ ISSUE_CU = [
 
 
 def test_context_preparation_does_not_synchronize(device) -> None:
-    """``partition_det_kcp`` + ``build_context_det_kcp`` + ``prepare`` of a new layout make no synchronizing CUDA call (the
+    """``cake_gdn_det_train_kcp_partition`` + ``cake_gdn_det_train_kcp_build_context`` + ``prepare`` of a new layout make no synchronizing CUDA call (the
     tables travel in pinned, asynchronous copies), and every device table is bitwise the table built on the CPU."""
-    plan = pytest.importorskip(
-        "flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp_plan"
+    plan = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp_plan"
     )
     torch.cuda.synchronize(device)
     torch.cuda.set_sync_debug_mode("error")
     try:
-        part = gdn_api.partition_det_kcp(
+        part = gdn_api.cake_gdn_det_train_kcp_partition(
             torch.tensor(ISSUE_CU, dtype=torch.int64), 1, layout="contiguous"
         )
-        ctx = gdn_api.build_context_det_kcp(part, None, 0, device)
+        ctx = gdn_api.cake_gdn_det_train_kcp_build_context(part, None, 0, device)
         prepared = ctx.prepare(2, 6)
     finally:
         torch.cuda.set_sync_debug_mode("default")
     torch.cuda.synchronize(device)
-    ref = plan.build_context_det_kcp(part, None, 0, "cpu", sm_count=ctx.sm_count)
+    ref = plan.cake_gdn_det_train_kcp_build_context(
+        part, None, 0, "cpu", sm_count=ctx.sm_count
+    )
     ref_prepared = ref.prepare(2, 6)
     pairs = (
         [(f"tables.{k}", ctx.tables[k], ref.tables[k]) for k in ctx.tables]
@@ -562,10 +580,10 @@ def test_context_preparation_does_not_synchronize(device) -> None:
 
 
 class _PeakWorkspace:
-    """A ``WorkspaceDetKcp`` recording the most bytes it binds (every allocation / release path)."""
+    """A ``CakeGDNDetKcpWorkspace`` recording the most bytes it binds (every allocation / release path)."""
 
     def __new__(cls, kcp):
-        class Tracked(kcp.WorkspaceDetKcp):
+        class Tracked(kcp.CakeGDNDetKcpWorkspace):
             def __init__(self, *a, **k):
                 super().__init__(*a, **k)
                 self.peak = 0
@@ -602,7 +620,7 @@ class _PeakWorkspace:
     ids=["issue-2x6", "32k-16x48"],
 )
 def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> None:
-    """``gdn_det_workspace_layout_kcp`` is what a caller-held workspace binds (tolerance 0): the forward's peak (the
+    """``cake_gdn_det_train_kcp_workspace_layout`` is what a caller-held workspace binds (tolerance 0): the forward's peak (the
     fused forward's #1; with test knob ``fused_o=0`` the split forward's tape walk, ``forward_split``), and the
     backward's phase maximum of each tape form -- the kept-tape form (the ten light tapes are the recompute's hand-off
     tensors, the tapes the forward leaves re-adopted after #8) and the replay form (the ten light tapes are
@@ -611,9 +629,11 @@ def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> Non
 
     from torch.utils.checkpoint import checkpoint
 
-    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
-    gb = pytest.importorskip(
-        "flashinfer.experimental.cake_gdn_det_train_kcp.cake_bytes"
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
+    )
+    gb = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_bytes"
     )
     H, HV = heads
     inputs = make_inputs(cu, H, HV)
@@ -622,13 +642,13 @@ def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> Non
     leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
     dout = inputs["dout"].to(device)
     for form in (True, False):
-        layout = gb.gdn_det_workspace_layout_kcp(
+        layout = gb.cake_gdn_det_train_kcp_workspace_layout(
             ctx, H_qk=H, HV=HV, reuse_recompute_tapes=form
         )
         ws = _PeakWorkspace(kcp)
 
         def fn(*a, _ws=ws, _form=form):
-            return gdn_api.chunk_gdn_det_kcp(
+            return gdn_api.cake_gdn_det_kcp(
                 *a, ctx, workspace=_ws, reuse_recompute_tapes=_form
             )
 
@@ -644,7 +664,7 @@ def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> Non
             ws.bytes,
             layout["bwd.phase.end"],
         )
-        assert gdn_api.gdn_det_workspace_bytes_kcp(
+        assert gdn_api.cake_gdn_det_train_kcp_workspace_bytes(
             ctx, H_qk=H, HV=HV, reuse_recompute_tapes=form
         ) == max(layout["forward"], layout["backward"])
         for lf in leaves:
@@ -656,7 +676,7 @@ def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> Non
         ws = _PeakWorkspace(kcp)
 
         def split(*a, _ws=ws, _form=form):
-            return gdn_api.chunk_gdn_det_kcp(
+            return gdn_api.cake_gdn_det_kcp(
                 *a,
                 ctx,
                 workspace=_ws,
@@ -695,7 +715,9 @@ def test_reuse_recompute_tapes_auto_follows_the_region_shape(
     (``holders_remain``); ``True`` always hands off (``always``), ``False`` never (``off``).  Every form is bitwise the
     direct autograd result, the registry is empty afterwards, and the ``"auto"`` backward -- the recompute forward,
     the frame proof over the autograd graph, the take -- makes no synchronizing CUDA call."""
-    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
+    )
     H, HV = 2, 6
     cu = [0, 1500, 4200, 6144]
     inputs = make_inputs(cu, H, HV)
@@ -730,7 +752,7 @@ def test_reuse_recompute_tapes_auto_follows_the_region_shape(
         from torch.utils.checkpoint import checkpoint
 
         def fn(*a):
-            out = gdn_api.chunk_gdn_det_kcp(
+            out = gdn_api.cake_gdn_det_kcp(
                 *a, ctx, **({} if form is None else {"reuse_recompute_tapes": form})
             )
             return out if proj is None else proj(out)
@@ -822,21 +844,21 @@ def _fused_arm(device, cu, heads, form, fused_o: int, log: list) -> dict:
     graph = opts.get("graph") == "replay"
     H, HV = heads
     inputs = make_inputs(cu, H, HV)
-    part = gdn_api.partition_det_kcp(
+    part = gdn_api.cake_gdn_det_train_kcp_partition(
         torch.tensor(cu, dtype=torch.int64), 1, layout="contiguous"
     )
-    ctx = gdn_api.build_context_det_kcp(part, None, 0, device)
+    ctx = gdn_api.cake_gdn_det_train_kcp_build_context(part, None, 0, device)
     kw = {"test_knobs": {"fused_o": fused_o, **knobs}, **opts}
     if graph:
-        kw["workspace"] = gdn_api.WorkspaceDetKcp()
+        kw["workspace"] = gdn_api.CakeGDNDetKcpWorkspace()
     dout = inputs["dout"].to(device)
     del log[:]
     if explicit:
         q, k, v, g, beta = (inputs[n].to(device) for n in OPERANDS)
-        out, saved = gdn_api.chunk_gdn_det_fwd_kcp(
+        out, saved = gdn_api.cake_gdn_det_train_kcp_forward(
             q, k, v, g, beta, ctx, save_for_backward=True, **kw
         )
-        dq, dk, dv, dbeta, dg = gdn_api.chunk_gdn_det_bwd_kcp(
+        dq, dk, dv, dbeta, dg = gdn_api.cake_gdn_det_train_kcp_backward(
             q, k, v, g, beta, ctx, dout, saved=saved, **kw
         )
         torch.cuda.synchronize(device)
@@ -851,7 +873,7 @@ def _fused_arm(device, cu, heads, form, fused_o: int, log: list) -> dict:
         x = v
         for i in range(layers):
             hk = {"recompute_handle": handles[i]} if handles else {}
-            x = gdn_api.chunk_gdn_det_kcp(q, k, x, g, beta, ctx, **hk, **kw)
+            x = gdn_api.cake_gdn_det_kcp(q, k, x, g, beta, ctx, **hk, **kw)
         # a later saver of the region: w's gradient reads the output
         return x if w is None else x * w
 
@@ -859,7 +881,9 @@ def _fused_arm(device, cu, heads, form, fused_o: int, log: list) -> dict:
     for _rep in range(3 if graph else 1):
         leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
         handles = (
-            [gdn_api.RecomputeHandleDetKcp() for _ in range(layers)] if handle else []
+            [gdn_api.CakeGDNDetKcpRecomputeHandle() for _ in range(layers)]
+            if handle
+            else []
         )
         out = (
             checkpoint(fn, *leaves, *handles, use_reentrant=False)
@@ -888,9 +912,11 @@ def test_fused_output_walk_is_bitwise_the_split_forward(
     saver, the replay form, three layers with a later saver, a recompute handle), two segments, both value widths,
     the in-kernel L2 norm and the graph replay, each with test knob ``fused_o`` 1 and 0 (split twice): every tensor
     bitwise equal."""
-    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
-    backend = pytest.importorskip(
-        "flashinfer.experimental.cake_gdn_det_train_kcp.cake_backend"
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
+    )
+    backend = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_backend"
     )
     if not kcp.fused_o_shipped(backend.device_arch(device.index)):
         pytest.skip("the registry ships no output walk for this architecture")
@@ -943,7 +969,9 @@ def test_full_backward_without_save_transfer_matches_light_on_poisoned_memory(
     ``M_seg^T`` staging plane the backward's merges read) shows up as a non-finite gradient.  The saved set carries
     ``M_seg``; the full form gives the light form's bits (out and the five gradients) on a per-call, a fresh and a
     shared workspace (twice on the shared one) and under a non-reentrant checkpoint."""
-    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
+    )
     real_alloc = kcp._alloc
 
     def nan_alloc(shape, dtype, dev):
@@ -964,7 +992,7 @@ def test_full_backward_without_save_transfer_matches_light_on_poisoned_memory(
         leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
 
         def fn(*a):
-            return gdn_api.chunk_gdn_det_kcp(*a, ctx, workspace=workspace, **o, **kw)
+            return gdn_api.cake_gdn_det_kcp(*a, ctx, workspace=workspace, **o, **kw)
 
         if ckpt:
             from torch.utils.checkpoint import checkpoint
@@ -980,7 +1008,7 @@ def test_full_backward_without_save_transfer_matches_light_on_poisoned_memory(
         }
 
     ops = [inputs[n].to(device) for n in OPERANDS]
-    _, saved = gdn_api.chunk_gdn_det_fwd_kcp(
+    _, saved = gdn_api.cake_gdn_det_train_kcp_forward(
         *ops, ctx, save_for_backward=True, save_mode="full", **o
     )
     assert saved.P == 2 and saved.c1_recv is None and saved.M_seg is not None
@@ -989,10 +1017,10 @@ def test_full_backward_without_save_transfer_matches_light_on_poisoned_memory(
     assert kcp.LAST_CALL["fwd"]["P"] == 2
     for n, t in light.items():
         assert bool(torch.isfinite(t.float()).all()), ("light", n)
-    shared = kcp.WorkspaceDetKcp()
+    shared = kcp.CakeGDNDetKcpWorkspace()
     arms = (
         (None, False),
-        (kcp.WorkspaceDetKcp(), False),
+        (kcp.CakeGDNDetKcpWorkspace(), False),
         (shared, False),
         (shared, False),
         (None, True),
@@ -1002,3 +1030,204 @@ def test_full_backward_without_save_transfer_matches_light_on_poisoned_memory(
         assert kcp.LAST_CALL["bwd"]["tapes_source"] == "saved", i
         for n in light:
             assert torch.equal(full[n], light[n]), (i, n)
+
+
+# --------------------------------------------------------------------------- eager pool / ticket sizing after launch #1 (one GPU)
+
+
+@pytest.mark.parametrize(
+    "knobs",
+    [{}, {"save_mode": "full"}, {"use_qk_l2norm_in_kernel": True}, {"segments": 2}],
+    ids=("light", "full", "l2n", "P2"),
+)
+@pytest.mark.parametrize("ckpt", (False, True), ids=("direct", "checkpoint"))
+def test_eager_pools_and_tickets_are_sized_after_the_first_launch(
+    device, monkeypatch, ckpt, knobs
+) -> None:
+    """The kernels backend, one rank, an autograd forward + backward directly and under a non-reentrant checkpoint:
+    at the first launch of every eager call the call's (fresh) workspace holds no pool (and no ticket slot unless the
+    first program is persistent: #6 of a backward on saved or kept tapes) and its sizing is pending; out and the five gradients, the launch records (program, grid) and sequences of the last
+    forward and backward, their workspace bytes and the CUDA peak above the inputs are those of the package with
+    the sizing done in ``ensure`` (``defer=False``), the peak within the allocator's block rounding; every run
+    repeats bitwise."""
+    from torch.utils.checkpoint import checkpoint
+
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
+    )
+    cu = _cu((2048 + 37, 1000, 129))
+    inputs = make_inputs(cu, 16, 48)
+    ctx = _local_context(cu, device)
+    ctx.prepare(16, 48, P=knobs.get("segments"))
+    dout = inputs["dout"].to(device)
+    leaves0 = [inputs[n].to(device) for n in OPERANDS]
+    first: list = []
+    real_run = kcp.KernelBackend.run
+
+    def run(self, name, args):
+        call = args["_call"]
+        if all(c is not call for c, *_ in first):
+            ws = call.ws
+            first.append(
+                (
+                    call,
+                    name,
+                    sorted(ws._pools),
+                    ws._tickets is not None,
+                    ws._pending is not None,
+                )
+            )
+        return real_run(self, name, args)
+
+    monkeypatch.setattr(kcp.KernelBackend, "run", run)
+    real_ensure = kcp.CakeGDNDetKcpWorkspace.ensure
+
+    def step(defer: bool) -> tuple[dict, dict, int]:
+        def ensure(self, *a, defer=False, **k):  # noqa: ARG001 - the undeferred sizing
+            return real_ensure(self, *a, defer=False, **k)
+
+        if not defer:
+            monkeypatch.setattr(kcp.CakeGDNDetKcpWorkspace, "ensure", ensure)
+        try:
+            leaves = [x.detach().clone().requires_grad_(True) for x in leaves0]
+
+            def fn(*xs):
+                return gdn_api.cake_gdn_det_kcp(*xs, ctx, **knobs)
+
+            torch.cuda.synchronize(device)
+            base = torch.cuda.memory_allocated(device)
+            torch.cuda.reset_peak_memory_stats(device)
+            out = checkpoint(fn, *leaves, use_reentrant=False) if ckpt else fn(*leaves)
+            grads = torch.autograd.grad(out, leaves, dout)
+            torch.cuda.synchronize(device)
+            peak = torch.cuda.max_memory_allocated(device) - base
+        finally:
+            monkeypatch.setattr(kcp.CakeGDNDetKcpWorkspace, "ensure", real_ensure)
+        res = {"out": out.detach()}
+        res.update({n: gr.detach() for n, gr in zip(GRAD_NAMES, grads, strict=True)})
+        log = {
+            kind: {
+                key: kcp.LAST_CALL[kind][key]
+                for key in (
+                    "records",
+                    "sequence",
+                    "workspace_bytes",
+                    "pool_bytes",
+                    "tape_bytes",
+                )
+            }
+            for kind in ("fwd", "bwd")
+        }
+        return res, log, peak
+
+    ref, ref_log, ref_peak = step(False)
+    n_ref = len(first)
+    assert n_ref >= 2 and all(
+        tk and not pend and pools for _, _, pools, tk, pend in first
+    )
+    got, got_log, got_peak = step(True)
+    deferred = first[n_ref:]
+    assert len(deferred) == n_ref
+    for call, name, pools, tk, pend in deferred:
+        assert call.T_r > 0 and pend and pools == [], (call.backward, name, pools)
+        # the ticket slots exist at the first launch only when it is a persistent program (#6 on saved / kept tapes)
+        assert tk == (name in kcp.TICKET_SITES), (call.backward, name, tk)
+        assert call.ws._pending is None
+    for n in TENSORS:
+        assert torch.equal(got[n], ref[n]), n
+    assert got_log == ref_log
+    # the same tensors are live at every moment; the caching allocator may round a reused block differently when
+    # the allocation order changes (a large block keeps an unsplit remainder below 1 MiB)
+    assert abs(got_peak - ref_peak) <= 4 << 20, (got_peak, ref_peak)
+    again, again_log, _ = step(True)
+    for n in TENSORS:
+        assert torch.equal(again[n], got[n]), n
+    assert again_log == got_log
+
+
+# --------------------------------------------------------------------------- the forward form of #1_l2n (one GPU)
+# With the in-kernel L2 norm a forward whose akk / g_cum have no reader (not a replay-mode or hand-off forward, no saved
+# set that keeps them) launches the record fwd_prep_l2n_fwd (no akk / g_cum stores; test knob prep_form = 1, the shipped
+# form); prep_form = 0 runs the full fwd_prep_l2n everywhere.  Every form of the output-walk matrix with the norm on:
+# out and every gradient bitwise the full form's, two full runs bitwise equal, and every backward replays the full #1.
+
+PREP_FORMS = tuple(
+    (
+        f"l2n-{fid}",
+        layers,
+        ckpt,
+        later,
+        {**opts, "use_qk_l2norm_in_kernel": True},
+        knobs,
+    )
+    for fid, layers, ckpt, later, opts, knobs in FUSED_FORMS
+)
+
+
+@pytest.mark.parametrize("form", PREP_FORMS, ids=[f[0] for f in PREP_FORMS])
+@pytest.mark.parametrize(
+    ("lengths", "heads"),
+    [s[1:] for s in FUSED_SHAPES],
+    ids=[s[0] for s in FUSED_SHAPES],
+)
+def test_prep_forward_form_is_bitwise_the_full_prep(
+    device, monkeypatch, lengths, heads, form
+) -> None:
+    """The forward form of #1_l2n (record ``fwd_prep_l2n_fwd``) against the full ``fwd_prep_l2n`` (test knob
+    ``prep_form`` 1 / 0) on every form of the output-walk matrix with the norm on: every tensor bitwise equal; the
+    first forward of every arm with ``prep_form`` 1 runs the forward form, no backward and no ``prep_form`` 0 call does."""
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
+    )
+    backend = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_backend"
+    )
+    if not kcp.l2n_records_shipped():
+        pytest.skip("the registry ships no in-kernel L2 norm records")
+    if not kcp.prep_form_shipped(backend.device_arch(device.index)):
+        pytest.skip(
+            "the registry ships no forward form of fwd_prep_l2n for this architecture"
+        )
+    cu = _cu(lengths)
+    log: list = []
+    record = kcp._record
+
+    def recording(kind, call):
+        record(kind, call)
+        entry = kcp.LAST_CALL[kind]
+        preps = tuple(
+            r for r, _g in (entry.get("records") or ()) if str(r).startswith("fwd_prep")
+        )
+        log.append((kind, preps))
+
+    monkeypatch.setattr(kcp, "_record", recording)
+
+    def arm(prep_form: int) -> dict:
+        fid, layers, ckpt, later, opts, knobs = form
+        return _fused_arm(
+            device,
+            cu,
+            heads,
+            (fid, layers, ckpt, later, opts, {**knobs, "prep_form": prep_form}),
+            1,
+            log,
+        )
+
+    full = [arm(0) for _ in range(2)]
+    full_log = list(log)
+    fwd = arm(1)
+    fwd_log = list(log)
+    assert [k for k, _p in fwd_log] == [k for k, _p in full_log]
+    assert not any("fwd_prep_l2n_fwd" in p for _k, p in full_log), full_log
+    if fwd_log:  # a graph replay records no call
+        firsts = [p for k, p in fwd_log if k == "fwd"]
+        assert firsts and firsts[0] == ("fwd_prep_l2n_fwd",), fwd_log
+        assert all("fwd_prep_l2n_fwd" not in p for k, p in fwd_log if k == "bwd"), (
+            fwd_log
+        )
+    assert set(fwd) == set(full[0])
+    for n in fwd:
+        assert torch.equal(_bits(full[0][n]), _bits(full[1][n])), (form[0], n)
+        assert torch.equal(_bits(fwd[n]), _bits(full[0][n])), (form[0], n)
+        assert bool(torch.isfinite(fwd[n].float()).all()), n
+    assert kcp.kept_registry_size() == 0

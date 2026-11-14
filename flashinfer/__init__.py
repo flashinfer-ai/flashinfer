@@ -29,12 +29,6 @@ from .activation import silu_and_mul as silu_and_mul
 from .activation import (
     silu_and_mul_scaled_nvfp4_experts_quantize as silu_and_mul_scaled_nvfp4_experts_quantize,
 )
-from .gated_act_mxfp8 import (
-    silu_and_mul_mxfp8_quantize as silu_and_mul_mxfp8_quantize,
-)
-from .gated_act_mxfp8 import (
-    silu_and_mul_mxfp8_quantize_backward as silu_and_mul_mxfp8_quantize_backward,
-)
 from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
@@ -178,6 +172,127 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
 # import the experimental tree.
 _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     **{name: (".fused_moe", name) for name in sorted(_PRIMS_TS_LAZY_EXPORTS)},
+    # RMSNorm training: det names from the det facade, and both facades as modules.
+    "cake_rmsnorm_det": (".cake_rmsnorm_det_train", "cake_rmsnorm_det"),
+    "CakeRMSNormDetFunction": (".cake_rmsnorm_det_train", "CakeRMSNormDetFunction"),
+    "cake_rmsnorm_det_train_forward": (
+        ".cake_rmsnorm_det_train",
+        "cake_rmsnorm_det_train_forward",
+    ),
+    "cake_rmsnorm_det_train_backward": (
+        ".cake_rmsnorm_det_train",
+        "cake_rmsnorm_det_train_backward",
+    ),
+    "cake_rmsnorm_det_train_backward_workspace_bytes": (
+        ".cake_rmsnorm_det_train",
+        "cake_rmsnorm_det_train_backward_workspace_bytes",
+    ),
+    "cake_rmsnorm_det_train": (".cake_rmsnorm_det_train", None),
+    "cake_rmsnorm_nondet_train": (".cake_rmsnorm_nondet_train", None),
+    "CakeCausalConv1dDetFunction": (
+        ".cake_causal_conv1d_det_train",
+        "CakeCausalConv1dDetFunction",
+    ),
+    "cake_causal_conv1d_det_train_backward_workspace_bytes": (
+        ".cake_causal_conv1d_det_train",
+        "cake_causal_conv1d_det_train_backward_workspace_bytes",
+    ),
+    "cake_causal_conv1d_det_train_forward_workspace_bytes": (
+        ".cake_causal_conv1d_det_train",
+        "cake_causal_conv1d_det_train_forward_workspace_bytes",
+    ),
+    "cake_gdn_det_train": (".cake_gdn_det_train", None),
+    "cake_gdn_det_train_kcp": (".cake_gdn_det_train_kcp", None),
+    "cake_gdn_nondet_train": (".cake_gdn_nondet_train", None),
+    "cake_gdn_nondet_train_kcp": (".cake_gdn_nondet_train_kcp", None),
+    "CakeMHCDetFinishFunction": (".cake_mhc_det_train", "CakeMHCDetFinishFunction"),
+    "CakeMHCDetPrepareFunction": (".cake_mhc_det_train", "CakeMHCDetPrepareFunction"),
+    "CakeMHCHeadDetFunction": (".cake_mhc_head_det_train", "CakeMHCHeadDetFunction"),
+    # The deterministic Cake fused SwiGLU + MXFP8 quantization: its module and
+    # the names of its module (the backend package loads on first use).
+    "cake_gated_act_mxfp8_det_train": (".cake_gated_act_mxfp8_det_train", None),
+    **{
+        name: (".cake_gated_act_mxfp8_det_train", name)
+        for name in (
+            "cake_gated_act_mxfp8_det_train_backward",
+            "cake_gated_act_mxfp8_det_train_forward",
+            "is_cake_gated_act_mxfp8_det_train_supported",
+        )
+    },
+    "cake_lm_head_det_train": (".cake_lm_head_det_train", None),
+    "cake_lm_head_nondet_train": (".cake_lm_head_nondet_train", None),
+    # The deterministic Cake MoE grouped GEMM: the names of its module.
+    **{
+        name: (".cake_moe_grouped_gemm_det_train", name)
+        for name in (
+            "CakeMoEGroupedGemmDetFunction",
+            "CakeMoEGroupedGemmDetLaunch",
+            "cake_moe_grouped_gemm_det",
+            "cake_moe_grouped_gemm_det_train_dgrad",
+            "cake_moe_grouped_gemm_det_train_forward",
+            "cake_moe_grouped_gemm_det_train_prepare_dgrad",
+            "cake_moe_grouped_gemm_det_train_prepare_forward",
+            "cake_moe_grouped_gemm_det_train_prepare_wgrad",
+            "cake_moe_grouped_gemm_det_train_wgrad",
+            "is_cake_moe_grouped_gemm_det_train_supported",
+        )
+    },
+    # Its non-deterministic counterpart is reached through its module only.
+    "cake_moe_grouped_gemm_nondet_train": (".cake_moe_grouped_gemm_nondet_train", None),
+    # SiLU-gated RMSNorm training (Cake), both modes: each facade imports its
+    # backend package (under flashinfer.experimental.cake) on first use.
+    "cake_rmsnorm_silu_gate_det_train": (".cake_rmsnorm_silu_gate_det_train", None),
+    "cake_rmsnorm_silu_gate_det": (
+        ".cake_rmsnorm_silu_gate_det_train",
+        "cake_rmsnorm_silu_gate_det",
+    ),
+    "cake_rmsnorm_silu_gate_det_train_forward": (
+        ".cake_rmsnorm_silu_gate_det_train",
+        "cake_rmsnorm_silu_gate_det_train_forward",
+    ),
+    "cake_rmsnorm_silu_gate_det_train_backward": (
+        ".cake_rmsnorm_silu_gate_det_train",
+        "cake_rmsnorm_silu_gate_det_train_backward",
+    ),
+    "cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes": (
+        ".cake_rmsnorm_silu_gate_det_train",
+        "cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes",
+    ),
+    "CakeRMSNormSiLUGateDetFunction": (
+        ".cake_rmsnorm_silu_gate_det_train",
+        "CakeRMSNormSiLUGateDetFunction",
+    ),
+    "cake_rmsnorm_silu_gate_nondet_train": (
+        ".cake_rmsnorm_silu_gate_nondet_train",
+        None,
+    ),
+    "cake_rmsnorm_silu_gate_nondet": (
+        ".cake_rmsnorm_silu_gate_nondet_train",
+        "cake_rmsnorm_silu_gate_nondet",
+    ),
+    "cake_rmsnorm_silu_gate_nondet_train_forward": (
+        ".cake_rmsnorm_silu_gate_nondet_train",
+        "cake_rmsnorm_silu_gate_nondet_train_forward",
+    ),
+    "cake_rmsnorm_silu_gate_nondet_train_backward": (
+        ".cake_rmsnorm_silu_gate_nondet_train",
+        "cake_rmsnorm_silu_gate_nondet_train_backward",
+    ),
+    "cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes": (
+        ".cake_rmsnorm_silu_gate_nondet_train",
+        "cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes",
+    ),
+    "CakeRMSNormSiLUGateNondetFunction": (
+        ".cake_rmsnorm_silu_gate_nondet_train",
+        "CakeRMSNormSiLUGateNondetFunction",
+    ),
+    # KDA chunked training (Cake), both modes, single rank and KCP: the facade
+    # modules; each imports its backend package (under
+    # flashinfer.experimental.cake) on first use.
+    "cake_kda_det_train": (".cake_kda_det_train", None),
+    "cake_kda_det_train_kcp": (".cake_kda_det_train_kcp", None),
+    "cake_kda_nondet_train": (".cake_kda_nondet_train", None),
+    "cake_kda_nondet_train_kcp": (".cake_kda_nondet_train_kcp", None),
 }
 
 
@@ -252,6 +367,10 @@ from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import StaleAdapterError as StaleAdapterError
 from .gemm import svdquant_linear as svdquant_linear
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
+from .gemm import mm_bf16_fp8 as mm_bf16_fp8
+from .gemm import mm_bf16_fp8_workspace_bytes as mm_bf16_fp8_workspace_bytes
+from .gemm import mm_fp16_fp8 as mm_fp16_fp8
+from .gemm import mm_fp16_fp8_workspace_bytes as mm_fp16_fp8_workspace_bytes
 from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
 from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
 from .grouped_mm import grouped_mm_mxfp8 as grouped_mm_mxfp8
@@ -283,73 +402,9 @@ from .norm import rmsnorm as rmsnorm
 from .norm import rmsnorm_quant as rmsnorm_quant
 from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
 from .norm import fused_qk_rmsnorm_rope as fused_qk_rmsnorm_rope
-from .cake_rmsnorm_det_train import CakeRMSNormDetFunction as CakeRMSNormDetFunction
-from .cake_rmsnorm_det_train import cake_rmsnorm_det as cake_rmsnorm_det
-from .cake_rmsnorm_det_train import (
-    cake_rmsnorm_det_train_backward as cake_rmsnorm_det_train_backward,
-)
-from .cake_rmsnorm_det_train import (
-    cake_rmsnorm_det_train_backward_workspace_bytes as cake_rmsnorm_det_train_backward_workspace_bytes,
-)
-from .cake_rmsnorm_det_train import (
-    cake_rmsnorm_det_train_forward as cake_rmsnorm_det_train_forward,
-)
 
-# The names before the det rename: the package with the deterministic default and the
-# opt-in non-deterministic weight gradient (``deterministic=False``).
-from .cake_rmsnorm_train import CakeRMSNormFunction as CakeRMSNormFunction
-from .cake_rmsnorm_train import cake_rmsnorm as cake_rmsnorm
-from .cake_rmsnorm_train import (
-    cake_rmsnorm_train_backward as cake_rmsnorm_train_backward,
-)
-from .cake_rmsnorm_train import (
-    cake_rmsnorm_train_backward_workspace_bytes as cake_rmsnorm_train_backward_workspace_bytes,
-)
-from .cake_rmsnorm_train import (
-    cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
-)
-from . import cake_rmsnorm_train as cake_rmsnorm_train
-from . import cake_rmsnorm_train_backend as cake_rmsnorm_train_backend
-from .cake_rmsnorm_silu_gate_det_train import (
-    CakeRMSNormSiLUGateDetFunction as CakeRMSNormSiLUGateDetFunction,
-)
-from .cake_rmsnorm_silu_gate_det_train import (
-    cake_rmsnorm_silu_gate_det as cake_rmsnorm_silu_gate_det,
-)
-from .cake_rmsnorm_silu_gate_det_train import (
-    cake_rmsnorm_silu_gate_det_train_backward as cake_rmsnorm_silu_gate_det_train_backward,
-)
-from .cake_rmsnorm_silu_gate_det_train import (
-    cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes as cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes,
-)
-from .cake_rmsnorm_silu_gate_det_train import (
-    cake_rmsnorm_silu_gate_det_train_forward as cake_rmsnorm_silu_gate_det_train_forward,
-)
-
-# The names before the det rename: the package with the deterministic default and the
-# opt-in non-deterministic weight gradient (``deterministic=False``).
-from .cake_rmsnorm_silu_gate_train import (
-    CakeRMSNormSiLUGateFunction as CakeRMSNormSiLUGateFunction,
-)
-from .cake_rmsnorm_silu_gate_train import (
-    cake_rmsnorm_silu_gate as cake_rmsnorm_silu_gate,
-)
-from .cake_rmsnorm_silu_gate_train import (
-    cake_rmsnorm_silu_gate_train_backward as cake_rmsnorm_silu_gate_train_backward,
-)
-from .cake_rmsnorm_silu_gate_train import (
-    cake_rmsnorm_silu_gate_train_backward_workspace_bytes as cake_rmsnorm_silu_gate_train_backward_workspace_bytes,
-)
-from .cake_rmsnorm_silu_gate_train import (
-    cake_rmsnorm_silu_gate_train_forward as cake_rmsnorm_silu_gate_train_forward,
-)
-from . import cake_rmsnorm_silu_gate_train as cake_rmsnorm_silu_gate_train
-from . import (
-    cake_rmsnorm_silu_gate_train_backend as cake_rmsnorm_silu_gate_train_backend,
-)
-from .cake_causal_conv1d_det_train import (
-    CakeCausalConv1dDetFunction as CakeCausalConv1dDetFunction,
-)
+# CakeCausalConv1dDetFunction and the workspace-bytes helpers are served by
+# ``_LAZY_EXPORTS`` above: they live in the backend package under flashinfer/experimental/cake/.
 from .cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det as cake_causal_conv1d_det,
 )
@@ -357,24 +412,9 @@ from .cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_backward as cake_causal_conv1d_det_train_backward,
 )
 from .cake_causal_conv1d_det_train import (
-    cake_causal_conv1d_det_train_backward_workspace_bytes as cake_causal_conv1d_det_train_backward_workspace_bytes,
-)
-from .cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_forward as cake_causal_conv1d_det_train_forward,
 )
-from .cake_causal_conv1d_det_train import (
-    cake_causal_conv1d_det_train_forward_workspace_bytes as cake_causal_conv1d_det_train_forward_workspace_bytes,
-)
 
-from .cake_mhc_det_train import (
-    CakeMHCDetTrainFinishFunction as CakeMHCDetTrainFinishFunction,
-)
-from .cake_mhc_det_train import (
-    CakeMHCDetTrainHeadFunction as CakeMHCDetTrainHeadFunction,
-)
-from .cake_mhc_det_train import (
-    CakeMHCDetTrainPrepareFunction as CakeMHCDetTrainPrepareFunction,
-)
 from .cake_mhc_det_train import (
     cake_mhc_det_train_backward_finish as cake_mhc_det_train_backward_finish,
 )
@@ -397,14 +437,14 @@ from .cake_mhc_det_train import (
 from .cake_mhc_det_train import (
     cake_mhc_det_train_forward_workspace_bytes as cake_mhc_det_train_forward_workspace_bytes,
 )
-from .cake_mhc_det_train import cake_mhc_det_train_head as cake_mhc_det_train_head
-from .cake_mhc_det_train import (
-    cake_mhc_det_train_head_backward as cake_mhc_det_train_head_backward,
-)
-from .cake_mhc_det_train import (
-    cake_mhc_det_train_head_forward as cake_mhc_det_train_head_forward,
-)
 from .cake_mhc_det_train import cake_mhc_det_train_prepare as cake_mhc_det_train_prepare
+from .cake_mhc_head_det_train import cake_mhc_head_det as cake_mhc_head_det
+from .cake_mhc_head_det_train import (
+    cake_mhc_head_det_train_backward as cake_mhc_head_det_train_backward,
+)
+from .cake_mhc_head_det_train import (
+    cake_mhc_head_det_train_forward as cake_mhc_head_det_train_forward,
+)
 from .cake_gdp import (
     cake_gated_delta_product_mtp as cake_gated_delta_product_mtp,
 )
@@ -453,6 +493,9 @@ from .page import (
     nvfp4_quantize_append_paged_kv_cache_with_slot_mapping as nvfp4_quantize_append_paged_kv_cache_with_slot_mapping,
 )
 from .page import (
+    fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping as fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping,
+)
+from .page import (
     nvfp4_quantize_append_paged_mla_kv_cache as nvfp4_quantize_append_paged_mla_kv_cache,
 )
 from .pod import PODWithPagedKVCacheWrapper as PODWithPagedKVCacheWrapper
@@ -491,6 +534,8 @@ from .rope import (
 )
 from .sampling import chain_speculative_sampling as chain_speculative_sampling
 from .sampling import min_p_sampling_from_probs as min_p_sampling_from_probs
+from .sampling import log_probs as log_probs
+from .sampling import log_softmax as log_softmax
 from .sampling import sampling_from_logits as sampling_from_logits
 from .sampling import sampling_from_probs as sampling_from_probs
 from .sampling import softmax as softmax
@@ -531,14 +576,14 @@ from .fi_trace import fi_trace as fi_trace
 
 # ---------------------------------------------------------------------------
 # Trace Apply (opt-in): zero-code kernel substitution from the FlashInfer Trace.
-# Activated only when FLASHINFER_TRACE_APPLY=1. This is the single edit to
-# existing flashinfer code required by the Trace Apply design — the package
-# itself lives in flashinfer/trace_apply/. Failures here must never break a
-# normal import, so the install is best-effort.
+# Activated only when FLASHINFER_TRACE_APPLY=1 (exactly "1": anything else is
+# refused by _enable_apply_from_env, so the gate here must match it exactly).
+# The package itself lives in flashinfer/trace_apply/. Failures here must
+# never break a normal import, so the install is best-effort.
 # ---------------------------------------------------------------------------
 import os as _os
 
-if _os.environ.get("FLASHINFER_TRACE_APPLY", "0") not in ("0", "", "false", "False"):
+if _os.environ.get("FLASHINFER_TRACE_APPLY", "0") == "1":
     try:
         from . import trace_apply as trace_apply
 
@@ -550,6 +595,32 @@ if _os.environ.get("FLASHINFER_TRACE_APPLY", "0") not in ("0", "", "false", "Fal
             "FLASHINFER_TRACE_APPLY is set but enabling Trace Apply failed: %s "
             "(continuing without Trace Apply).",
             _trace_apply_err,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sealed kernel packages (opt-in): digest-named package directories whose
+# every byte is pinned by a sha256 chain (manifest digest == directory name,
+# exact bundle file set, per-file digests, sealed sidecars) before anything
+# is imported. Named by FLASHINFER_KERNEL_PACKAGES (comma-separated digests)
+# under FLASHINFER_KERNEL_PACKAGE_ROOT. The same best-effort rule as above: a
+# bad package warns and never breaks import flashinfer. See
+# flashinfer/trace_apply/packages.py.
+# ---------------------------------------------------------------------------
+if _os.environ.get("FLASHINFER_KERNEL_PACKAGES", "") or _os.environ.get(
+    "FLASHINFER_KERNEL_PACKAGE_ROOT", ""
+):
+    try:
+        from . import trace_apply as _trace_apply_sealed
+
+        _trace_apply_sealed._load_packages_from_env()
+    except Exception as _sealed_err:  # noqa: BLE001
+        import logging as _sealed_logging
+
+        _sealed_logging.getLogger("flashinfer.trace_apply").warning(
+            "FLASHINFER_KERNEL_PACKAGES is set but sealed package loading failed: %s "
+            "(continuing with stock kernels).",
+            _sealed_err,
         )
 
 

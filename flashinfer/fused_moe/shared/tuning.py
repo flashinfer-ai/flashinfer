@@ -305,16 +305,26 @@ def make_moe_tuning_config(
 
     def _dynamic_dim(name: str) -> int:
         if name == "hidden_states_scale":
-            # DeepSeekFp8 uses [hidden_size//128, num_tokens]; all others
+            # DeepSeekFp8 uses [hidden_size/block, num_tokens] with block 128
+            # or 32; all others
             # (MxFp8, fp4, …) use [num_tokens, ...] when 2-D.  The flat
             # 1-D layout never reaches here — it is filtered out above
             # and handled by a ConstraintSpec.
             t = moe_inputs.hidden_states_scale
             if fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
-                assert t.shape == (hidden_size // 128, num_tokens), (
+                # Block 128 is the checkpoint layout; block 32 is vLLM's
+                # re-blocked TP shard layout (Prims-TS only).
+                assert (
+                    t.dim() == 2
+                    and t.shape[1] == num_tokens
+                    and t.shape[0] > 0
+                    and hidden_size % t.shape[0] == 0
+                    and hidden_size // t.shape[0] in (128, 32)
+                ), (
                     f"hidden_states_scale shape {tuple(t.shape)} does not match "
-                    f"expected DeepSeekFp8 layout "
-                    f"(hidden_size//128={hidden_size // 128}, num_tokens={num_tokens})"
+                    f"expected DeepSeekFp8 layout (hidden_size//block, "
+                    f"num_tokens={num_tokens}) with block 128 or 32 "
+                    f"(hidden_size={hidden_size})"
                 )
                 return 1
             assert t.dim() >= 1 and t.shape[0] == num_tokens, (

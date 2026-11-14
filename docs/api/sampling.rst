@@ -5,6 +5,15 @@ flashinfer.sampling
 
 Kernels for LLM sampling.
 
+.. note::
+
+   Generator state reservations in ``flashinfer.sampling`` are serialized across
+   host threads. This does not synchronize with PyTorch RNG operations or other
+   code that mutates the same generator. When sharing a generator across these
+   APIs and other RNG operations, callers must serialize both sides with a common
+   external lock, or use separate generators. This also applies to the default
+   CUDA generator used when ``generator=None``.
+
 .. important::
 
    Batch-length ``seed`` and ``offset`` tensors now apply one value per output
@@ -30,6 +39,8 @@ Kernels for LLM sampling.
     sampling_from_probs
     sampling_from_logits
     softmax
+    log_softmax
+    log_probs
     top_p_sampling_from_probs
     top_k_sampling_from_probs
     min_p_sampling_from_probs

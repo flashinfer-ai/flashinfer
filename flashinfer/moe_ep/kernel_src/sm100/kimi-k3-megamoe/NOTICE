@@ -1,0 +1,11 @@
+kimi-k3-megamoe
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+The files under overlay/ are modified versions of, or additions to, TensorRT-LLM's MegaMoE CuteDSL backend
+(https://github.com/NVIDIA/TensorRT-LLM, tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe,
+tensorrt_llm/_torch/moe/fused_moe/mega_moe, tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py),
+Copyright (c) NVIDIA CORPORATION & AFFILIATES, licensed under the Apache License, Version 2.0.
+The baseline they modify is TensorRT-LLM 1.4.0rc3.dev202610300406; patches/ holds the exact diff.
+
+overlay/.../mega_moe/fast_topk reproduces the semantics of TensorRT-LLM's deepseek_v3_topk_kernel (noAuxTcKernels.cu)
+in Triton; tests/unit/ref/noaux_tc_replica.cu is a standalone replica of that reference kernel used for testing.

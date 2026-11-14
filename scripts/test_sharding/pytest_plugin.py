@@ -37,7 +37,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     # builds via task_test_nightly_build.sh) does not cause an unrecognized-
     # argument error in collection or execution subprocesses where
     # tests/conftest.py may not be on the conftest discovery path.
-    # When conftest discovery also loads tests/test_helpers/parametrize.py,
+    # When conftest discovery also loads tests/infra/test_helpers/parametrize.py,
     # --full is already registered — silently skip the duplicate.
     import argparse
     import contextlib
@@ -45,6 +45,9 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     with contextlib.suppress(argparse.ArgumentError):
         group.addoption(
             "--full",
+            # tests/infra/test_helpers/parametrize.py also registers --full; pytest>=9.2
+            # rejects a second option mapping to the same dest unless it is explicit.
+            dest="full",
             action="store_true",
             default=False,
             help="run full parameter matrices instead of regular subsets",

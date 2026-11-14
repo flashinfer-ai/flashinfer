@@ -66,6 +66,7 @@ from .api import (
     CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     CuteDslConfig,
+    BatchInvariantBf16Config,
     FrostLowLatencyConfig,
     MoEActivationPack,
     MoEConfig,
@@ -126,10 +127,12 @@ from .backends.cudnn_frost.mxfp8.moe import CudnnFrostMxfp8MoeRunner
 from .backends.cudnn_frost.nvfp4.moe import CudnnFrostNvfp4MoeRunner
 from .backends.cudnn_frost.mxfp8_mxfp4.moe import CudnnFrostMxfp8Mxfp4MoeRunner
 from .backends.frost_low_latency.runner import FrostLowLatencyRunner
+from .batch_invariant.runner import BatchInvariantMoeRunner
 from .utils import map_to_hybrid_bucket
 
 # Concrete host runners for configured candidates; device kernel loading stays deferred.
 _RunnerT = Union[
+    BatchInvariantMoeRunner,
     FrostLowLatencyRunner,
     CakeStepFunRunner,
     CudnnFrostBf16MoeRunner,
@@ -177,6 +180,7 @@ _RunnerT = Union[
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
+    BatchInvariantBf16Config: BatchInvariantMoeRunner,
     FrostLowLatencyConfig: FrostLowLatencyRunner,
     CakeStepFunConfig: CakeStepFunRunner,
     CudnnFrostBf16Config: CudnnFrostBf16MoeRunner,
@@ -221,6 +225,10 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     B12xNvfp4Config: B12xNvfp4Runner,
     B12xW4A16Config: B12xW4A16Runner,
 }
+
+
+class NoEligibleBackend(RuntimeError):
+    """No configured backend supports the requested MoE configuration."""
 
 
 class MoELayer:
@@ -270,10 +278,11 @@ class MoELayer:
 
         # Build one runner per compatible backend
         self.runners: List[_RunnerT] = []
+        self._tuning_runner_ids: list[int] = []
         # check_support() raises a precise reason; keep it instead of letting
         # the filter swallow it, or every rejection reads "no usable backend".
         rejected: List[str] = []
-        for backend_cfg in config.backend:
+        for backend_index, backend_cfg in enumerate(config.backend):
             if not backend_cfg.supported(arch):
                 continue
             runner_cls = _BACKEND_RUNNERS.get(type(backend_cfg))
@@ -297,6 +306,7 @@ class MoELayer:
                 continue
             runner.build()
             self.runners.append(runner)
+            self._tuning_runner_ids.append(backend_index)
 
         if not self.runners:
             mvp = ", ".join(c.__name__ for c in _BACKEND_RUNNERS)
@@ -360,7 +370,7 @@ class MoELayer:
                 reasons = " Backends rejected this configuration: " + "; ".join(
                     rejected
                 )
-            raise RuntimeError(
+            raise NoEligibleBackend(
                 f"MoELayer: none of the configured backends "
                 f"{[type(c).__name__ for c in config.backend]} are usable on "
                 f"arch sm{arch} for this configuration. Registered unified "
@@ -419,32 +429,9 @@ class MoELayer:
         NotImplementedError
             If no usable backend supports this pack's ``routing_input_mode``.
         """
+        eligible = self._eligible_runners(act_pack, weight_pack)
         ceiling = self.config.execution.tune_max_num_tokens
-        if act_pack.num_tokens > ceiling:
-            raise ValueError(
-                f"num_tokens={act_pack.num_tokens} exceeds "
-                f"tune_max_num_tokens={ceiling}. "
-                f"Reconstruct MoELayer with a larger ceiling."
-            )
-
-        # Only runners that can execute this pack's routing input mode compete.
-        # Not every backend has an in-kernel router (CuteDSL is pre-routed-only),
-        # so a FromLogits pack must never reach an incapable runner — neither
-        # here nor via a winner cached under the other mode, hence the
-        # mode-qualified cache key below.
         mode = act_pack.routing_input_mode
-        eligible = tuple(
-            index
-            for index, runner in enumerate(self.runners)
-            if mode in runner.supported_routing_modes
-            and runner.accepts(act_pack, weight_pack)
-        )
-        if not eligible:
-            raise NotImplementedError(
-                f"MoELayer: none of the usable backends "
-                f"{[r.backend_key for r in self.runners]} support "
-                f"routing_input_mode={mode!r} with these input/weight packs."
-            )
 
         bucket = map_to_hybrid_bucket(act_pack.num_tokens, ceiling)
         # Frost's bounded decode tactics can require exactly T=4 or T=8.
@@ -475,6 +462,103 @@ class MoELayer:
             tactic=tactic,
             **runner.launch_kwargs_for(inputs),
         )
+
+    def _eligible_runners(self, act_pack, weight_pack) -> tuple[int, ...]:
+        ceiling = self.config.execution.tune_max_num_tokens
+        if act_pack.num_tokens > ceiling:
+            raise ValueError(
+                f"num_tokens={act_pack.num_tokens} exceeds "
+                f"tune_max_num_tokens={ceiling}. "
+                f"Reconstruct MoELayer with a larger ceiling."
+            )
+
+        # Only runners that can execute this pack's routing input mode compete.
+        # Not every backend has an in-kernel router (CuteDSL is pre-routed-only),
+        # so a FromLogits pack must never reach an incapable runner — neither
+        # here nor via a winner cached under the other mode, hence the
+        # mode-qualified cache key below.
+        mode = act_pack.routing_input_mode
+        eligible = tuple(
+            index
+            for index, runner in enumerate(self.runners)
+            if mode in runner.supported_routing_modes
+            and runner.accepts(act_pack, weight_pack)
+        )
+        if not eligible:
+            raise NotImplementedError(
+                f"MoELayer: none of the usable backends "
+                f"{[r.backend_key for r in self.runners]} support "
+                f"routing_input_mode={mode!r} with these input/weight packs."
+            )
+
+        return eligible
+
+    def _tuning_candidates(self, act_pack, weight_pack):
+        """Enumerate tactics on the actual inputs without compute-only selection."""
+        from ..autotuner.autotuner import (
+            OptimizationProfile,
+            StaticDim,
+            _tactic_to_json_hashable,
+        )
+
+        candidates = []
+        eligible = self._eligible_runners(act_pack, weight_pack)
+        for index in eligible:
+            runner = self.runners[index]
+            inputs = runner.pack_inputs(act_pack, weight_pack)
+            profile = OptimizationProfile(
+                [
+                    [StaticDim(d) for d in t.shape]
+                    if isinstance(t, torch.Tensor)
+                    else [StaticDim(0)]
+                    for t in inputs
+                ],
+                [None] * len(inputs),
+            )
+            tactics = [
+                _tactic_to_json_hashable(tactic)
+                for tactic in self.tuner._blocklist.filter(
+                    f"moe_{runner.backend_key}",
+                    runner,
+                    runner.get_valid_tactics(inputs, profile),
+                )
+            ]
+            candidates.append(
+                {
+                    "runner": self._tuning_runner_ids[index],
+                    "backend": runner.backend_key,
+                    "implementation": type(runner).__name__,
+                    "extras": runner.get_cache_key_extras(inputs),
+                    "tactics": tactics,
+                }
+            )
+        return candidates
+
+    def _prepare_tactic(self, act_pack, weight_pack, selection):
+        from ..autotuner.autotuner import OptimizationProfile, StaticDim
+
+        backend_index, tactic = selection
+        runner = self.runners[self._tuning_runner_ids.index(backend_index)]
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        profile = OptimizationProfile(
+            [
+                [StaticDim(d) for d in t.shape]
+                if isinstance(t, torch.Tensor)
+                else [StaticDim(0)]
+                for t in inputs
+            ],
+            [None] * len(inputs),
+        )
+        kwargs = runner.launch_kwargs_for(inputs)
+        if not runner.precompile_tactics(inputs, [tactic], profile, **kwargs):
+            runner.forward(inputs, tactic=tactic, do_preparation=True, **kwargs)
+
+    def _run_tactic(self, act_pack, weight_pack, selection):
+        """Pack and execute an already selected runner/tactic."""
+        backend_index, tactic = selection
+        runner = self.runners[self._tuning_runner_ids.index(backend_index)]
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        return runner.forward(inputs, tactic=tactic, **runner.launch_kwargs_for(inputs))
 
     def _select_winner(
         self,

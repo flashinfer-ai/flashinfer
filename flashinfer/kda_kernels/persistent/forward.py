@@ -105,9 +105,15 @@ def _get_compiled(
         mk = lambda t, a=16: from_dlpack(t, assumed_align=a).mark_compact_shape_dynamic(
             mode=0
         )
-        q = torch.empty(T, H, D, dtype=bf, device=dev)
-        k = torch.empty(T, H, D, dtype=bf, device=dev)
-        v = torch.empty(T, H, D, dtype=bf, device=dev)
+
+        def qkv_fake():
+            return cute.runtime.make_fake_tensor(
+                cutlass.BFloat16,
+                shape=(cute.sym_int(), H, D),
+                stride=(cute.sym_int64(divisibility=8), D, 1),
+                assumed_align=16,
+            )
+
         g = torch.empty(T, H, D, dtype=bf, device=dev)
         beta = torch.empty(T, H, dtype=bf, device=dev)
         alog = torch.empty(H, dtype=torch.float32, device=dev)
@@ -138,9 +144,9 @@ def _get_compiled(
         def compile_kernel():
             return cute.compile(
                 _k._launch_pkd,
-                mk(q),
-                mk(k),
-                mk(v),
+                qkv_fake(),
+                qkv_fake(),
+                qkv_fake(),
                 mk(g),
                 mk(beta, 4),
                 from_dlpack(alog, assumed_align=16),

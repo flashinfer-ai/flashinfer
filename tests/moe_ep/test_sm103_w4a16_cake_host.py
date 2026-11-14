@@ -113,7 +113,8 @@ def test_config_field_names_mirror_the_cutedsl_sibling() -> None:
     theirs = {
         f.name for f in dataclasses.fields(Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig)
     }
-    assert theirs <= mine, sorted(theirs - mine)
+    # Batch invariance is supported only by the SM100 CuTe DSL sibling.
+    assert theirs - mine == {"batch_invariant"}
 
 
 @pytest.mark.parametrize(
