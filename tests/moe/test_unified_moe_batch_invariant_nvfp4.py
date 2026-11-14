@@ -1366,7 +1366,9 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits(T):
     ref = bits(layer(pack, W))
     inputs = runner.pack_inputs(pack, W)
     tactics = runner.get_valid_tactics(inputs, None)
-    assert 1 <= len(tactics) <= 9 and len(set(tactics)) == len(tactics)
+    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import TOP_K_FP4
+
+    assert 1 <= len(tactics) <= TOP_K_FP4**2 and len(set(tactics)) == len(tactics)
     r1, r2 = runner.impl._ranked(T, H)
     assert tactics == [_tactic_nvfp4(c1, c2) for c1 in r1 for c2 in r2]
     c1, c2 = _configs_from_tactic_nvfp4(tactics[0])

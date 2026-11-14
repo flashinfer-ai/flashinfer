@@ -76,6 +76,8 @@ def swapped_knobs_blockscaled() -> List[Knobs]:
     return swapped_knobs("nvfp4")
 
 
+#: Records the fp4 runners hand the autotuner per GEMM: the ranked list's head (its raster twins included).
+TOP_K_FP4 = 6
 #: The average rows per active expert fill at most three quarters of the swapped token tile (an empirical margin).
 SWAP_TILE_FILL = (3, 4)
 #: The narrowest swapped tile: the structural rule's pick (the bench's reference point; the ranking decides the dispatch).
@@ -227,8 +229,8 @@ def rank_grouped_nvfp4(
     cost (:func:`.schedule.record_cost` at this class's instruction class, with this class's chain term in nodes: the dense estimate
     under the ranking's overrides times the pair and token-tile terms, the exposed epilogue chain, the token box's exposed zero fill
     at the packed fp4 width and the body's per-launch fixed cost), rounded to three significant digits; the grouped scheduler's
-    structural raster first among twins, ties in the spaces' enumeration order (the grouped records before the swapped ones, the
-    narrower token tile first). Each of the best ceil(k/2) records is followed by its raster twin, then the rank order fills the
+    structural raster first among twins, then the wider N tile among tied grouped records (fewer tiles: fewer per-tile costs),
+    ties in the spaces' enumeration order (the grouped records before the swapped ones, the narrower token tile first). Each of the best ceil(k/2) records is followed by its raster twin, then the rank order fills the
     list: distinct records, at most ``k``, never empty for an implementable shape."""
     import dataclasses
 
@@ -284,6 +286,9 @@ def rank_grouped_nvfp4(
         return (
             float(f"{est:.3g}"),
             0 if (c.swap_ab or c.raster_along == raster_for(c, rows)) else 1,
+            0
+            if c.swap_ab
+            else -c.tile_n,  # tied grouped records: the wider N tile first (fewer tiles, fewer per-tile costs)
             i,
         )
 
@@ -307,6 +312,19 @@ def rank_grouped_nvfp4(
         if rec not in seen:
             out.append(rec)
             seen.add(rec)
+    # the autotuner's structural slot: the best-ranked 2-CTA record joins the list once the rows per expert fill at least half
+    # its cluster tile (the pair's share of the stream is then real), whatever the model's order (its pair terms are the
+    # coarsest)
+    pair = next(
+        (
+            c
+            for c in ranked
+            if c.use_2cta_instrs and not c.swap_ab and 2 * rows >= c.mma_tiler_mn[0]
+        ),
+        None,
+    )
+    if pair is not None and pair not in seen and k > 1:
+        out = out[: k - 1] + [pair] if len(out) >= k else out + [pair]
     return out[:k]
 
 

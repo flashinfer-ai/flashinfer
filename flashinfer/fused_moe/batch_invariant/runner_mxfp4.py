@@ -254,7 +254,8 @@ class BatchInvariantMoeMxfp4Runner(_Fp4PairRunner):
     # ---- tactics ---------------------------------------------------------------------------------------------------
     def _ranked(self, T: int, H: int) -> Tuple[list, list]:
         from .blocks.epilogue import MXFP4_GEMM2_CHAIN, Mxfp4Chain
-        from .schedule import TOP_K, active_experts, rows_per_expert
+        from .schedule import active_experts, rows_per_expert
+        from .schedule_nvfp4 import TOP_K_FP4
         from .schedule_mxfp4 import rank_grouped_mxfp4
         from .spec_mxfp4 import expert_classes_mx
 
@@ -272,7 +273,7 @@ class BatchInvariantMoeMxfp4Runner(_Fp4PairRunner):
         n1 = 2 * I if a.gated else I
         return (
             rank_grouped_mxfp4(
-                rows, n1, H, E, chain1, in1, sm_count, family, TOP_K, n_active=n_act
+                rows, n1, H, E, chain1, in1, sm_count, family, TOP_K_FP4, n_active=n_act
             ),
             rank_grouped_mxfp4(
                 rows,
@@ -283,7 +284,7 @@ class BatchInvariantMoeMxfp4Runner(_Fp4PairRunner):
                 in2,
                 sm_count,
                 family,
-                TOP_K,
+                TOP_K_FP4,
                 n_active=n_act,
             ),
         )

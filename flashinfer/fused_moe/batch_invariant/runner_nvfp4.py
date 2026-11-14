@@ -474,7 +474,7 @@ class BatchInvariantMoeNvfp4Runner(_Fp4PairRunner):
         from .api_nvfp4 import GEMM2_CHAIN, GEMM2_STATIC_CHAIN
         from .blocks.epilogue import W4A4Chain
         from .schedule_nvfp4 import (
-            TOP_K,
+            TOP_K_FP4,
             active_experts,
             rank_grouped_nvfp4,
             rows_per_expert,
@@ -503,10 +503,10 @@ class BatchInvariantMoeNvfp4Runner(_Fp4PairRunner):
         n1 = 2 * I if a.gated else I
         return (
             rank_grouped_nvfp4(
-                rows, n1, H, E, chain1, in1, sm_count, family, TOP_K, n_active=n_act
+                rows, n1, H, E, chain1, in1, sm_count, family, TOP_K_FP4, n_active=n_act
             ),
             rank_grouped_nvfp4(
-                rows, H, I, E, chain2, in2, sm_count, family, TOP_K, n_active=n_act
+                rows, H, I, E, chain2, in2, sm_count, family, TOP_K_FP4, n_active=n_act
             ),
         )
 
