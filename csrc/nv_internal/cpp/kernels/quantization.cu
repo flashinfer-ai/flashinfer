@@ -534,7 +534,8 @@ bool useTmaQuantization(int b, int m, int n, QuantizationSFLayout layout, int mu
   }
   thread_local int const smVersion = tensorrt_llm::common::getSMVersion();
   if (smVersion == 107) {
-    return m >= (layout == QuantizationSFLayout::SWIZZLED_128x4 ? 2048 : 3072);
+    return static_cast<int64_t>(std::max(b, 1)) * m >=
+           (layout == QuantizationSFLayout::SWIZZLED_128x4 ? 2048 : 3072);
   }
   constexpr int64_t kMinTmaInputBytes = 32ll << 20;
   return tmaWorkTiles<T>(b, m, layout) >= multiProcessorCount &&
