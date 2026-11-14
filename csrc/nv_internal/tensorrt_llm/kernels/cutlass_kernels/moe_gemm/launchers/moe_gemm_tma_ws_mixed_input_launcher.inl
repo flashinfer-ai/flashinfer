@@ -81,32 +81,42 @@ using namespace cute;
 
 namespace mixed_input_detail {
 
+// Largest K for which the H20 prebuilt-D module runs post-MMA GEMMs with the source-free,
+// producer-acquire epilogue (see sm90_generic_mixed_moe_gemm_kernelLauncher).
+static constexpr int64_t kH20PostMmaProducerAcquireMaxK = 3072;
+
 template <bool UseSingleWarpgroup, class TileShape, class ClusterShape, class ElementAccumulator,
           class ElementC, class LayoutC, int AlignmentC, class ElementD, class LayoutD,
-          int AlignmentD, class EpilogueSchedule, class FusionOperation>
+          int AlignmentD, class EpilogueSchedule, class FusionOperation, bool EnableSource,
+          bool ProducerAcquiresPrebuiltD>
 struct EpilogueSelector;
 
 template <class TileShape, class ClusterShape, class ElementAccumulator, class ElementC,
           class LayoutC, int AlignmentC, class ElementD, class LayoutD, int AlignmentD,
-          class EpilogueSchedule, class FusionOperation>
+          class EpilogueSchedule, class FusionOperation, bool EnableSource,
+          bool ProducerAcquiresPrebuiltD>
 struct EpilogueSelector<false, TileShape, ClusterShape, ElementAccumulator, ElementC, LayoutC,
                         AlignmentC, ElementD, LayoutD, AlignmentD, EpilogueSchedule,
-                        FusionOperation> {
+                        FusionOperation, EnableSource, ProducerAcquiresPrebuiltD> {
   using Type = typename tensorrt_llm::cutlass_extensions::epilogue::collective::
       MixedInputSm90TmaEpilogueBuilder<
           cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, TileShape, ClusterShape,
           cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator,
           ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type*, AlignmentC, ElementD,
           typename cutlass::layout::LayoutTranspose<LayoutD>::type*, AlignmentD, EpilogueSchedule,
-          FusionOperation, detail::kUsePrebuiltDDescriptor>::CollectiveOp;
+          FusionOperation, detail::kUsePrebuiltDDescriptor, EnableSource,
+          ProducerAcquiresPrebuiltD>::CollectiveOp;
 };
 
 template <class TileShape, class ClusterShape, class ElementAccumulator, class ElementC,
           class LayoutC, int AlignmentC, class ElementD, class LayoutD, int AlignmentD,
-          class EpilogueSchedule, class FusionOperation>
+          class EpilogueSchedule, class FusionOperation, bool EnableSource,
+          bool ProducerAcquiresPrebuiltD>
 struct EpilogueSelector<true, TileShape, ClusterShape, ElementAccumulator, ElementC, LayoutC,
                         AlignmentC, ElementD, LayoutD, AlignmentD, EpilogueSchedule,
-                        FusionOperation> {
+                        FusionOperation, EnableSource, ProducerAcquiresPrebuiltD> {
+  static_assert(EnableSource && !ProducerAcquiresPrebuiltD,
+                "The single-warpgroup epilogue has no source-disabled or producer-D variant.");
   using EpilogueLayoutC = typename cutlass::layout::LayoutTranspose<LayoutC>::type;
   using EpilogueLayoutD = typename cutlass::layout::LayoutTranspose<LayoutD>::type;
   using Epilogue = cutlass::epilogue::collective::SmemEpilogueArrayPerTokenScale<
@@ -144,7 +154,8 @@ template <typename T, typename WeightType, typename GemmOutputType, typename Epi
           typename CTAShape, typename ClusterShape, typename MainloopScheduleType,
           typename EpilogueScheduleType, cutlass::WeightOnlyQuantOp QuantOp,
           cutlass::gemm::collective::MixedInputScaleMode ScaleMode,
-          tkc::MainloopScheduleType KernelType>
+          tkc::MainloopScheduleType KernelType, bool ElideEpilogueSource,
+          bool ProducerAcquiresPrebuiltD>
 void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
     GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size) {
@@ -224,8 +235,13 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
   constexpr int SmallKCtasPerSm =
       SmallKTileN <= 16 ? 5 : (SmallKTileN == 32 ? 4 : (SmallKTileN == 40 ? 3 : 2));
 
+  static_assert(
+      !ProducerAcquiresPrebuiltD || (detail::kUsePrebuiltDDescriptor && !use_single_warpgroup),
+      "Only an immutable prebuilt D descriptor can be acquired by the producer.");
   static_assert(!use_single_warpgroup || use_fused_e8m0_scale,
                 "The single-warpgroup kernel is only valid for pre-MMA E8M0 scaling.");
+  static_assert(!use_single_warpgroup || (!ElideEpilogueSource && !ProducerAcquiresPrebuiltD),
+                "The single-warpgroup kernel has no epilogue source or producer-D policy.");
   static_assert(!use_single_warpgroup || cute::size(ClusterShape{}) == 1,
                 "The single-warpgroup kernel requires a 1x1x1 cluster.");
   static_assert(!use_single_warpgroup ||
@@ -241,9 +257,16 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
                          cutlass::epilogue::fusion::LinearCombination<
                              ElementD, ElementAccumulator, ElementC, ElementAccumulator>>;
 
+  // The post-MMA LinearCombination always runs with beta = 0 and null beta pointers (see
+  // fusion_args below), so its source operand is never read: ElideEpilogueSource builds it with
+  // EnableSource=false. The per-token-scale fusion (pre-MMA E8M0, including every
+  // single-warpgroup kernel) has no source operand and keeps its epilogue type.
+  constexpr bool enable_source = !(ElideEpilogueSource && FusionOperation::IsSourceSupported);
+
   using CollectiveEpilogue = typename mixed_input_detail::EpilogueSelector<
       use_single_warpgroup, TileShape, ClusterShape, ElementAccumulator, ElementC, LayoutC,
-      AlignmentC, ElementD, LayoutD, AlignmentD, EpilogueSchedule, FusionOperation>::Type;
+      AlignmentC, ElementD, LayoutD, AlignmentD, EpilogueSchedule, FusionOperation, enable_source,
+      ProducerAcquiresPrebuiltD>::Type;
 
   // =========================================================== MIXED INPUT WITH SCALES
   // =========================================================================== The Scale
@@ -318,7 +341,9 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
          reinterpret_cast<StrideA*>(hopper_inputs.stride_act),
          reinterpret_cast<ElementScale const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
          reinterpret_cast<StrideS*>(hopper_inputs.int4_groupwise_params.stride_s_a), group_size},
-        {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c),
+        // A source-disabled epilogue (public ElementC void) takes no C pointer.
+        {fusion_args,
+         enable_source ? reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c) : nullptr,
          reinterpret_cast<StrideC*>(hopper_inputs.stride_c),
          reinterpret_cast<ElementD**>(hopper_inputs.ptr_d),
          reinterpret_cast<StrideD*>(hopper_inputs.stride_d), nullptr},
@@ -426,10 +451,46 @@ template <typename T, typename WeightType, typename GemmOutputType, typename Epi
 void sm90_generic_mixed_moe_gemm_kernelLauncher(
     GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size) {
-  sm90_generic_mixed_moe_gemm_kernelLauncher_impl<
-      T, WeightType, GemmOutputType, EpilogueTag, CTAShape, ClusterShape, MainloopScheduleType,
-      EpilogueScheduleType, QuantOp, ScaleMode, tkc::MainloopScheduleType::AUTO>(
-      inputs, hopper_inputs, sm_count_, workspace_size);
+  // Epilogue policy of the regular kernels; each module compiles only the instances it uses:
+  //  - H100 prebuilt-D module: for every K and scale mode, the mainloop producer acquires the
+  //    immutable prebuilt D descriptor. Post-MMA GEMMs, whose beta is always 0, also elide the
+  //    epilogue source (a no-op for the source-free pre-MMA E8M0 epilogue).
+  //  - H20 prebuilt-D module: post-MMA GEMMs with K <= kH20PostMmaProducerAcquireMaxK take both;
+  //    larger K and every pre-MMA E8M0 GEMM keep the source-capable epilogue with the
+  //    consumer-late acquire of the prebuilt D descriptor.
+  //  - Generic module: the source-capable epilogue with mutable D descriptors.
+  // Neither choice changes the epilogue workspace or the D descriptor storage of a module, so the
+  // k = 0 maximum-workspace query also sizes the K > kH20PostMmaProducerAcquireMaxK instance.
+  constexpr bool use_pre_mma_e8m0 =
+      ScaleMode == cutlass::gemm::collective::MixedInputScaleMode::kPreMmaE8M0;
+  if constexpr (detail::kIsH100PrebuiltDModule) {
+    sm90_generic_mixed_moe_gemm_kernelLauncher_impl<
+        T, WeightType, GemmOutputType, EpilogueTag, CTAShape, ClusterShape, MainloopScheduleType,
+        EpilogueScheduleType, QuantOp, ScaleMode, tkc::MainloopScheduleType::AUTO,
+        /*ElideEpilogueSource=*/true, /*ProducerAcquiresPrebuiltD=*/true>(
+        inputs, hopper_inputs, sm_count_, workspace_size);
+  } else if constexpr (detail::kIsH20PrebuiltDModule && !use_pre_mma_e8m0) {
+    if (inputs.k <= mixed_input_detail::kH20PostMmaProducerAcquireMaxK) {
+      sm90_generic_mixed_moe_gemm_kernelLauncher_impl<
+          T, WeightType, GemmOutputType, EpilogueTag, CTAShape, ClusterShape, MainloopScheduleType,
+          EpilogueScheduleType, QuantOp, ScaleMode, tkc::MainloopScheduleType::AUTO,
+          /*ElideEpilogueSource=*/true, /*ProducerAcquiresPrebuiltD=*/true>(
+          inputs, hopper_inputs, sm_count_, workspace_size);
+    } else {
+      sm90_generic_mixed_moe_gemm_kernelLauncher_impl<
+          T, WeightType, GemmOutputType, EpilogueTag, CTAShape, ClusterShape, MainloopScheduleType,
+          EpilogueScheduleType, QuantOp, ScaleMode, tkc::MainloopScheduleType::AUTO,
+          /*ElideEpilogueSource=*/false, /*ProducerAcquiresPrebuiltD=*/false>(
+          inputs, hopper_inputs, sm_count_, workspace_size);
+    }
+  } else {
+    // Generic module, and H20 pre-MMA E8M0 GEMMs (which keep their prebuilt D descriptor).
+    sm90_generic_mixed_moe_gemm_kernelLauncher_impl<
+        T, WeightType, GemmOutputType, EpilogueTag, CTAShape, ClusterShape, MainloopScheduleType,
+        EpilogueScheduleType, QuantOp, ScaleMode, tkc::MainloopScheduleType::AUTO,
+        /*ElideEpilogueSource=*/false, /*ProducerAcquiresPrebuiltD=*/false>(
+        inputs, hopper_inputs, sm_count_, workspace_size);
+  }
 }
 
 template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag,
@@ -445,8 +506,8 @@ void sm90_generic_mixed_moe_small_k_kernelLauncher(
                 "Small-K launcher requires a single-warpgroup schedule.");
   sm90_generic_mixed_moe_gemm_kernelLauncher_impl<
       T, WeightType, GemmOutputType, EpilogueTag, CTAShape, ClusterShape, MainloopScheduleType,
-      EpilogueScheduleType, QuantOp, ScaleMode, KernelType>(inputs, hopper_inputs, sm_count_,
-                                                            workspace_size);
+      EpilogueScheduleType, QuantOp, ScaleMode, KernelType, /*ElideEpilogueSource=*/false,
+      /*ProducerAcquiresPrebuiltD=*/false>(inputs, hopper_inputs, sm_count_, workspace_size);
 }
 
 }  // namespace cutlass_kernels_oss
