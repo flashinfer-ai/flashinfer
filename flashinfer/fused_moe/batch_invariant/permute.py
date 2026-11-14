@@ -49,6 +49,7 @@ THREADS = 1024
 CHUNK = 4 * THREADS
 WARPS = 4
 LANES = 32
+PLAN_FINISH_UNROLL = 8  # the plan kernels' id and histogram loops keep this many loads in flight per thread
 
 
 class HistogramKernel:
@@ -258,7 +259,7 @@ class PlanKernel:
         for h in cutlass.range(tidx, MAX_E, self.threads):
             hist[h] = Int32(0)
         cute.arch.barrier()
-        for i in cutlass.range(tidx, n, self.threads):
+        for i in cutlass.range(tidx, n, self.threads, unroll=PLAN_FINISH_UNROLL):
             ei = mExp[i]
             if (ei >= Int32(0)) & (ei < E):
                 cute.arch.atomic_add(hist.iterator + ei, Int32(1))
@@ -281,7 +282,7 @@ class PlanKernel:
         lo = warp * per_warp
         hi = cutlass.min(lo + per_warp, n)
         local = Int32(0)
-        for i0 in cutlass.range(lo, hi, LANES):
+        for i0 in cutlass.range(lo, hi, LANES, unroll=PLAN_FINISH_UNROLL):
             i = i0 + lane
             match = Boolean(False)
             if i < hi:
@@ -307,7 +308,7 @@ class PlanKernel:
                 base_pad = base_pad + warp_tot[w]
         # pass 2: the positions of this warp's range in slot order
         running = Int32(0)
-        for i0 in cutlass.range(lo, hi, LANES):
+        for i0 in cutlass.range(lo, hi, LANES, unroll=PLAN_FINISH_UNROLL):
             i = i0 + lane
             match = Boolean(False)
             if i < hi:
@@ -374,19 +375,26 @@ class PlanBlocksKernel:
         wcnt = smem.allocate_tensor(
             Int32, cute.make_layout((PLAN_WARPS * MAX_E,)), byte_alignment=16
         )
-        for j in cutlass.range(tidx, PLAN_WARPS * MAX_E, PLAN_THREADS):
-            wcnt[j] = Int32(0)
-        cute.arch.barrier()
         base_w = b * PLAN_BLOCK + warp * (PLAN_IDS_PER_THREAD * LANES)
+        # the lane's ids first, every load in flight together (one memory latency per CTA instead of one per chunk)
+        ids = cute.make_rmem_tensor((PLAN_IDS_PER_THREAD,), Int32)
+        for c in cutlass.range_constexpr(PLAN_IDS_PER_THREAD):
+            i = base_w + c * LANES + lane
+            e = Int32(-1)
+            if i < n:
+                e = mExp[i]
+            ids[c] = e
+        for w in cutlass.range_constexpr(PLAN_WARPS):
+            for j in cutlass.range(tidx, E, PLAN_THREADS):
+                wcnt[w * MAX_E + j] = Int32(0)
+        cute.arch.barrier()
         es = []
         rs = []
         oks = []
         for c in cutlass.range_constexpr(PLAN_IDS_PER_THREAD):
             i = base_w + c * LANES + lane
             valid = i < n
-            e = Int32(-1)
-            if valid:
-                e = mExp[i]
+            e = ids[c]
             ok = (
                 valid & (e >= Int32(0)) & (e < E)
             )  # a dropped slot (id outside [0, E)) is ranked by nothing
@@ -493,10 +501,12 @@ class PlanFinishKernel:
             s_pre_pad = smem.allocate_tensor(
                 Int32, cute.make_layout((MAX_E + 1,)), byte_alignment=16
             )
+        # a thread per expert (coalesced across the experts), the blocks' loads unrolled so several are in flight: integer
+        # sums, the same in every order
         for e in cutlass.range(tidx, E, PLAN_THREADS):
             tot = Int32(0)
             pre = Int32(0)
-            for bb in cutlass.range(0, nb, 1):
+            for bb in cutlass.range(0, nb, 1, unroll=PLAN_FINISH_UNROLL):
                 v = mHistBlk[bb * E + e]
                 if bb < b:
                     pre = pre + v
