@@ -218,6 +218,7 @@ from .jit.rmsnorm_silu import (
 )
 from .jit.page import gen_page_module
 from .jit.quantization import gen_quantization_module
+from .jit.qsa_sparse_paged import gen_qsa_sparse_paged_module
 from .jit.rope import gen_rope_module
 from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
 from .jit.sampling import gen_sampling_module
@@ -759,6 +760,9 @@ def gen_all_modules(
         jit_specs.append(gen_mla_kv_pack_fp8_module())
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
+    # QSA sparse paged attention: one build (SM80 instructions) over the 8.x and 9.x targets.
+    if has_sm80 or has_sm90:
+        jit_specs.append(gen_qsa_sparse_paged_module())
     # Cake SM120 block-64 block-sparse attention (backend="vsa_sm120_blk64" of
     # BlockSparseAttentionWrapper): the bfloat16 and float16 programs, one
     # library each per exact target.

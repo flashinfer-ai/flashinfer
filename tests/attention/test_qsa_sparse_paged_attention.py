@@ -20,12 +20,12 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.experimental.qsa_nvfp4.backend import (
-    _FORMATS,
-    _num_splits,
-    _resident_ctas,
+from flashinfer.sparse import (
+    _QSA_FORMATS,
+    _qsa_num_splits,
+    _qsa_resident_ctas,
+    qsa_sparse_paged_attention,
 )
-from flashinfer.sparse import qsa_sparse_paged_attention
 from flashinfer.utils import get_compute_capability
 
 pytestmark = pytest.mark.skipif(
@@ -140,7 +140,7 @@ def _reference(q, cache, selection, gate, num_splits, kv_dtype, chunk=64):
     table, token_to_req, indices = selection
     num_kv_heads = k_deq.shape[2]
     log2_scale = math.log2(math.e) / math.sqrt(HEAD_DIM)
-    tile_tokens = _FORMATS[kv_dtype][1]
+    tile_tokens = _QSA_FORMATS[kv_dtype][1]
     p_dtype = torch.float16 if kv_dtype == torch.float8_e4m3fn else torch.bfloat16
     num_tiles = math.ceil(WIDTH / tile_tokens)
     parts = []
@@ -269,13 +269,13 @@ def test_matches_reference(kv_dtype, layout, rows, num_qo_heads, num_kv_heads):
         rows, num_qo_heads, num_kv_heads, layout, rows, kv_dtype
     )
     out = _run(q, cache, selection, gate).double()
-    kv_format, tile_tokens = _FORMATS[kv_dtype]
-    num_splits = _num_splits(
+    kv_format, tile_tokens = _QSA_FORMATS[kv_dtype]
+    num_splits = _qsa_num_splits(
         rows,
         num_kv_heads,
         math.ceil(WIDTH / tile_tokens),
         kv_format,
-        _resident_ctas(q.device.index, kv_format),
+        _qsa_resident_ctas(q.device.index, kv_format),
     )
     contract, tolerance, exact, bound = _reference(
         q, cache, selection, gate, num_splits, kv_dtype

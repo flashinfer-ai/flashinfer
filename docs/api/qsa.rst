@@ -46,8 +46,8 @@ cuDNN allocates outputs and scratch and uses the input device's current CUDA
 stream. Warm up each required configuration before CUDA graph capture.
 Replay reads current selection tensors; no implicit selection cache is kept.
 The cuDNN package requires CuTe DSL 4.8+; SM107 also needs a compiler build
-with Rubin support. These APIs are separate from the NVFP4 paged-cache
-``flashinfer.sparse.qsa_sparse_paged_attention`` interface.
+with Rubin support. These APIs are separate from the paged-cache
+:func:`flashinfer.sparse.qsa_sparse_paged_attention` interface.
 
 .. code-block:: python
 
