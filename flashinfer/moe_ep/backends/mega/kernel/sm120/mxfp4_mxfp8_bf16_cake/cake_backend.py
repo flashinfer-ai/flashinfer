@@ -78,7 +78,7 @@ import ctypes
 import struct
 import warnings
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 import torch
 
@@ -716,6 +716,9 @@ class _CakeWorkspace:
     # Rank-uniform per-rank row bound of the invocation (``compile_tokens_per_rank``).
     compile_tokens_per_rank: int | None = None
     staged_bound: int | None = None
+    # Optional rank-uniform per-rank row counts of the next invocation (``set_rows_by_rank``); only the
+    # row schedule (m64 / m128) reads it.  Reset by every ``set_rows_by_rank`` call.
+    rows_hint: tuple[int, ...] | None = None
     last_launch: dict[str, Any] = field(default_factory=dict)
     layers: dict[int, _LayerDescriptors] = field(default_factory=dict)
     destroyed: bool = False
@@ -1527,6 +1530,46 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             None if compile_tokens_per_rank is None else int(compile_tokens_per_rank)
         )
 
+    def set_rows_by_rank(
+        self, workspace: Any, rows_by_rank: Sequence[int] | None
+    ) -> None:
+        """Rank-uniform per-rank row counts of the next invocation (``None`` clears them).
+
+        With a ``compile_tokens_per_rank`` bound the kernel cannot see how many rows the other
+        ranks hold, so the row schedule used to follow the bound (the largest per-rank count): a
+        P/D prefill step with one rank at 1024 rows and three at 0 ran the m128 schedule, whose
+        128-row tiles are ~80 % padding at ~24 rows per local expert.  With the counts the schedule
+        follows the mean rows per rank (``ceil(sum / world)``), which equals the largest count
+        for uniform loads, so uniform calls keep their schedule.  Grid sizing still uses the
+        bound.  Every EP rank must pass the same counts (e.g. the DP metadata), else the ranks
+        could launch different schedules.
+        """
+
+        ws = self._live(workspace)
+        if rows_by_rank is None:
+            ws.rows_hint = None
+            return
+        hint = tuple(int(v) for v in rows_by_rank)
+        if len(hint) != ws.world_size or min(hint) < 0:
+            raise MoEEpConfigError(
+                f"{KERNEL_NAME}: rows_by_rank={list(hint)} must hold one non-negative count per "
+                f"EP rank (world size {ws.world_size})"
+            )
+        ws.rows_hint = hint
+
+    @staticmethod
+    def _schedule_rows(ws: _CakeWorkspace, rows_by_rank: list[int]) -> int:
+        """Rows that pick the row schedule (m64 when ``<= m64_max_rows``)."""
+
+        collective_rows = max(rows_by_rank)
+        hint = ws.rows_hint
+        if ws.staged_bound is None or hint is None:
+            return collective_rows
+        # A function of rank-uniform values only (hint, bound): every rank picks the same schedule.
+        # Advisory: both schedules serve any row count up to the workspace capacity (identical
+        # results), so a hint that misstates the rows changes speed, never correctness.
+        return min(collective_rows, -(-sum(hint) // ws.world_size))
+
     def stage_inputs(
         self, t: MoEEpTensors, workspace: Any, *, quantize_input: bool
     ) -> None:
@@ -1630,7 +1673,8 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             if output is not None:
                 return output[:0]
             return out
-        inst = ws.instances["m64" if collective_rows <= ws.m64_max_rows else "m128"]
+        schedule_rows = self._schedule_rows(ws, rows_by_rank)
+        inst = ws.instances["m64" if schedule_rows <= ws.m64_max_rows else "m128"]
         grid_args: dict[str, Any] = dict(
             task_m=inst.task_m,
             with_shared_expert=ws.variant == "fp8shared",
@@ -1686,6 +1730,7 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             "epoch": ws.epoch,
             "rows_by_rank": rows_by_rank,
             "collective_rows": collective_rows,
+            "schedule_rows": schedule_rows,
             "grid_rule": "routing" if expert_counts is not None else "bound",
         }
         ws.epoch += 1
