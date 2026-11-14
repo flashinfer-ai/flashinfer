@@ -6,9 +6,16 @@ importing the ``flashinfer`` package or torch) to build the same graph. Keep it
 free of torch and flashinfer imports so both paths describe one graph.
 """
 
-from dataclasses import dataclass
+import os
+import pickle
+import struct
+import sys
+from dataclasses import asdict, dataclass
 
 Tactic = tuple  # (engine_id, ((knob_type, value), ...))
+
+# Worker wire format: 8-byte little-endian length, then a pickle payload.
+_FRAME_HEADER = struct.Struct("<Q")
 
 
 @dataclass(frozen=True)
@@ -128,3 +135,98 @@ def build_single_plan(graph, tactic: Tactic) -> None:
     )
     graph.check_support()
     graph.build_plans()
+
+
+def write_frame(stream, obj) -> None:
+    data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    stream.write(_FRAME_HEADER.pack(len(data)) + data)
+    stream.flush()
+
+
+def _read_exact(stream, size: int):
+    buf = b""
+    while len(buf) < size:
+        chunk = stream.read(size - len(buf))
+        if not chunk:
+            if buf:
+                raise EOFError("truncated frame")
+            return None
+        buf += chunk
+    return buf
+
+
+def read_frame(stream):
+    """Read one frame; ``None`` at a clean end of stream."""
+    header = _read_exact(stream, _FRAME_HEADER.size)
+    if header is None:
+        return None
+    (size,) = _FRAME_HEADER.unpack(header)
+    payload = _read_exact(stream, size)
+    if payload is None:
+        raise EOFError("truncated frame")
+    return pickle.loads(payload)
+
+
+def spec_to_wire(spec: Bf16OverrideGraphSpec) -> dict:
+    # A plain dict: unpickling the dataclass by its package path would import
+    # flashinfer (and torch) in the worker.
+    return asdict(spec)
+
+
+def build_shard(spec: Bf16OverrideGraphSpec, handle, heur_modes, shard):
+    """Enumerate all candidates; build and serialize this shard's plans.
+
+    Returns ``(candidates, [(index, tactic, blob), ...])``. A candidate whose
+    plan fails to build is left out, as the all-plans build leaves it out.
+    """
+    shard_index, shard_count = shard
+    candidates = enumerate_tactics(build_bf16_override_graph(spec, handle), heur_modes)
+    plans = []
+    for index, tactic in enumerate(candidates):
+        if index % shard_count != shard_index:
+            continue
+        graph = build_bf16_override_graph(spec, handle)
+        try:
+            build_single_plan(graph, tactic)
+        except Exception:  # noqa: BLE001 - an unbuildable plan is skipped
+            continue
+        plans.append((index, tactic, bytes(graph.serialize())))
+    return candidates, plans
+
+
+def _worker_main() -> None:
+    # cuDNN may print to fd 1; keep the protocol on a private copy of it.
+    protocol_out = os.fdopen(os.dup(1), "wb")
+    os.dup2(2, 1)
+    import cudnn
+
+    handle = None
+    stdin = sys.stdin.buffer
+    while True:
+        request = read_frame(stdin)
+        if request is None:
+            return
+        response = {
+            "device_index": request["device_index"],
+            "candidates": [],
+            "plans": [],
+            "error": None,
+        }
+        try:
+            if handle is None:
+                handle = cudnn.create_handle()
+            candidates, plans = build_shard(
+                Bf16OverrideGraphSpec(**request["spec"]),
+                handle,
+                request["heur_modes"],
+                tuple(request["shard"]),
+            )
+            response["candidates"] = candidates
+            response["plans"] = plans
+        except Exception as exc:  # noqa: BLE001 - reported to the parent
+            response["error"] = f"{type(exc).__name__}: {exc}"
+        write_frame(protocol_out, response)
+
+
+if __name__ == "__main__":
+    _worker_main()
