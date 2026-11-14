@@ -1,6 +1,6 @@
 {
-  "name": "qsa_sparse_paged_attention_h12_kv1_d256_ps16",
-  "description": "Gated sparse paged GQA attention over an NVFP4, FP8 or BF16 KV cache with logical token selections (vLLM Qwen QSA contract).",
+  "name": "qsa_sparse_paged_attention_nvfp4_h12_kv1_d256_ps16",
+  "description": "Gated sparse paged GQA attention over an NVFP4 KV cache with logical token selections (vLLM Qwen QSA contract).",
   "op_type": "qsa_sparse_paged_attention",
   "tags": [
     "fi_api:flashinfer.sparse.qsa_sparse_paged_attention"
@@ -16,6 +16,9 @@
       "type": "var"
     },
     "max_blocks": {
+      "type": "var"
+    },
+    "index_cols": {
       "type": "var"
     },
     "num_qo_heads": {
@@ -37,10 +40,6 @@
     "cache_dim": {
       "type": "const",
       "value": 128
-    },
-    "index_cols": {
-      "type": "const",
-      "value": 65
     },
     "num_scales": {
       "type": "const",

@@ -3,6 +3,11 @@
 
 """Trace contracts for packed QSA forward and QSA sparse paged attention."""
 
+from copy import deepcopy
+from typing import Any, cast
+
+import torch
+
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 
@@ -61,23 +66,24 @@ qsa_indexed_forward_trace = TraceTemplate(
     },
 )
 
-qsa_sparse_paged_attention_trace = TraceTemplate(
+_qsa_sparse_paged_attention_nvfp4_trace = TraceTemplate(
     op_type="qsa_sparse_paged_attention",
+    name_prefix="qsa_sparse_paged_attention_nvfp4",
     description=(
-        "Gated sparse paged GQA attention over an NVFP4, FP8 or BF16 KV cache with "
-        "logical token selections (vLLM Qwen QSA contract)."
+        "Gated sparse paged GQA attention over an NVFP4 KV cache with logical token "
+        "selections (vLLM Qwen QSA contract)."
     ),
     axes={
         "num_rows": Var(),
         "num_blocks": Var(),
         "num_requests": Var(),
         "max_blocks": Var(),
+        "index_cols": Var(),
         "num_qo_heads": Const(abbrev="h"),
         "num_kv_heads": Const(abbrev="kv"),
         "head_dim": Const(abbrev="d"),
         "page_size": Const(abbrev="ps"),
         "cache_dim": Const(abbrev=""),
-        "index_cols": Const(abbrev=""),
         "num_scales": Const(
             abbrev="",
             extract=lambda kw: (
@@ -107,4 +113,38 @@ qsa_sparse_paged_attention_trace = TraceTemplate(
     outputs={
         "out": Tensor(["num_rows", "num_qo_heads", "head_dim"], dtype="bfloat16"),
     },
+)
+
+# One definition per cache format: the formats run different kernels and the FP8
+# and BF16 axes are otherwise identical.
+_qsa_sparse_paged_attention_fp8_trace = deepcopy(
+    _qsa_sparse_paged_attention_nvfp4_trace
+)
+_qsa_sparse_paged_attention_fp8_trace.name_prefix = "qsa_sparse_paged_attention_fp8"
+_qsa_sparse_paged_attention_fp8_trace.description = (
+    "Gated sparse paged GQA attention over an FP8 (e4m3) KV cache with logical token "
+    "selections (vLLM Qwen QSA contract)."
+)
+_qsa_sparse_paged_attention_bf16_trace = deepcopy(
+    _qsa_sparse_paged_attention_nvfp4_trace
+)
+_qsa_sparse_paged_attention_bf16_trace.name_prefix = "qsa_sparse_paged_attention_bf16"
+_qsa_sparse_paged_attention_bf16_trace.description = (
+    "Gated sparse paged GQA attention over a BF16 KV cache with logical token "
+    "selections (vLLM Qwen QSA contract)."
+)
+_QSA_SPARSE_PAGED_ATTENTION_TRACES = {
+    torch.uint8: _qsa_sparse_paged_attention_nvfp4_trace,
+    torch.float8_e4m3fn: _qsa_sparse_paged_attention_fp8_trace,
+    torch.bfloat16: _qsa_sparse_paged_attention_bf16_trace,
+}
+
+
+def qsa_sparse_paged_attention_trace(**kwargs):
+    k_cache = kwargs.get("k_cache")
+    return _QSA_SPARSE_PAGED_ATTENTION_TRACES.get(getattr(k_cache, "dtype", None))
+
+
+cast(Any, qsa_sparse_paged_attention_trace).templates = tuple(
+    _QSA_SPARSE_PAGED_ATTENTION_TRACES.values()
 )

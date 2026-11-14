@@ -101,7 +101,10 @@ def test_entry_point_is_stable():
 
 def test_auto_cake_route_requires_the_experimental_opt_in(monkeypatch):
     """``auto`` reaches the experimental package only with the opt-in set; without it the
-    call is refused before any implementation runs, and ``backend="cake"`` needs no opt-in."""
+    call is refused before any implementation runs, and ``backend="cake"`` needs no opt-in.
+    Both routes to the package emit the experimental-backend warning."""
+    from flashinfer import api_logging
+
     calls = _patch_both_backends(monkeypatch)
     monkeypatch.setattr(public_api, "_qsa_auto_backend", lambda device: "cake")
     t = torch.empty(0)
@@ -113,13 +116,17 @@ def test_auto_cake_route_requires_the_experimental_opt_in(monkeypatch):
             t, t, t, t, t, t, False, output_gate=t, k_sf=t, v_sf=t
         )
     assert calls == []
-    with _quiet():
+    monkeypatch.setattr(api_logging, "_WARNED_EXPERIMENTAL_BACKENDS", set())
+    with pytest.warns(ExperimentalWarning, match="'cake' selected for"):
         result = public_api.qsa_sparse_paged_attention(
             t, t, t, t, t, t, False, output_gate=t, k_sf=t, v_sf=t, backend="cake"
         )
     assert result == "cake"
     monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1")
-    with _quiet():
+    monkeypatch.setattr(api_logging, "_WARNED_EXPERIMENTAL_BACKENDS", set())
+    with pytest.warns(
+        ExperimentalWarning, match="'cake' may be selected automatically for"
+    ):
         result = public_api.qsa_sparse_paged_attention(
             t, t, t, t, t, t, False, output_gate=t, k_sf=t, v_sf=t
         )

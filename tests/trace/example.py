@@ -31,7 +31,7 @@ Results:
 - We would get these example json files under fi_trace_out directory:
 qsa_forward_h12_kv1_d256.json
 qsa_indexed_forward_h12_kv1_d256.json
-qsa_sparse_paged_attention_h12_kv1_d256_ps16.json
+qsa_sparse_paged_attention_nvfp4_h12_kv1_d256_ps16.json
 alphamoe_fused_router_e512_k8_bm16_shared0.json
 alphamoe_nvfp4_aligned_moe_topk2_e4_h256_n256_bm8.json
 bmm_mxfp8_N128_K128.json
@@ -208,7 +208,7 @@ are only generated on SM120/SM121 GPUs.
 trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
 trtllm_batch_decode_token_sparse_h16_kv1_d256_ps1_topk512.json requires SM100/SM103 GPUs.
 trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
-qsa_sparse_paged_attention_h12_kv1_d256_ps16.json requires SM80 through SM90 GPUs.
+qsa_sparse_paged_attention_nvfp4_h12_kv1_d256_ps16.json requires SM80 through SM90 GPUs.
 top_k_varlen_n4096_k512.json (windowed prefill mode, gvr_2) requires SM100/SM103/SM107 GPUs.
 """
 

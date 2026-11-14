@@ -2571,14 +2571,16 @@ def qsa_sparse_paged_attention(
     Parameters
     ----------
     q : torch.Tensor
-        BF16 queries ``[rows, num_qo_heads, 256]``.
+        BF16 queries ``[rows, num_qo_heads, 256]``; ``num_qo_heads / num_kv_heads`` is 1 to 16.
     k_cache, v_cache : torch.Tensor
         ``[num_blocks, page_size, num_kv_heads, D]`` with ``D = 128`` packed E2M1 bytes (uint8,
         NVFP4) or ``D = 256`` float8_e4m3fn or bfloat16 values. Any strides with a contiguous
         last dim and 16-byte alignment, so NHD and HND (transposed) views both work.
     logical_indices : torch.Tensor
         int32 ``[rows, selection_width + 1]``: logical token indices of each row's selection;
-        the last column holds the row's valid-entry count.
+        the last column holds the row's valid-entry count. Entries that are negative, past the
+        block table, unmapped or past the cache are skipped (never read), and a row with no
+        valid entry is zero.
     block_table : torch.Tensor
         int32 ``[num_requests, max_blocks]`` mapping logical pages to cache blocks.
     token_to_req : torch.Tensor
@@ -2592,10 +2594,12 @@ def qsa_sparse_paged_attention(
         caches and ignored for BF16.
     output_gate : torch.Tensor
         Contiguous BF16 gate with the shape of ``q``; the output is
-        ``bf16(attention) * sigmoid(output_gate)``.
+        ``bf16(attention) * sigmoid(output_gate)``, with the attention rounded to BF16 before
+        the FP32 gate.
     k_sf, v_sf : Optional[torch.Tensor]
         NVFP4 only: E4M3 block scales ``[num_blocks, page_size, num_kv_heads, 16]``, one per 16
-        dims.
+        dims. Data and scales use the layout that
+        ``nvfp4_quantize_append_paged_kv_cache_with_slot_mapping`` writes.
     backend : str
         ``"default"`` runs the default implementation (compute capability 8.x and 9.0).
         ``"cake"`` runs the experimental Cake kernels of
