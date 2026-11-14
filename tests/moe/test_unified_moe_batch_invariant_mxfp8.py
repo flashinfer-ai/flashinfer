@@ -465,7 +465,7 @@ def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch
     """The MX chains run the backend's swapped body (:mod:`blocks.swap`), which reads the plan's group counts under the
     chain's trigger rule (``pdl.BOX_FORM_TRIGGERS``: the dependents launch after the predecessor's own wait, the body's own
     wait before the tables is the margin) and whose builder asserts the shipped placement is one of them; the gather form
-    belongs to the bf16 classes; a k-block is whole instruction steps of the class."""
+    belongs to the bf16 and the 4-bit block-scaled classes; a k-block is whole instruction steps of the class."""
     from flashinfer.fused_moe.batch_invariant import pdl
     from flashinfer.fused_moe.batch_invariant.blocks.epilogue_mx import MxChain
     from flashinfer.fused_moe.batch_invariant.blocks.swap import SwappedGroupedGemm
@@ -548,7 +548,12 @@ def test_mx_classes_run_on_the_unified_bodies():
         sw = swapped_knobs_mx()[0]
         assert is_swapped_record(sw, fmt)
         s = SwappedGroupedGemm(sw, plain.at(fmt), k_block=256)
-        assert s.operands.block_scaled and s.k_block == 256 and s.sf_warp == 4
+        assert s.operands.block_scaled and s.k_block == 256
+        # the scale-factor warp follows the epilogue warpgroups: the shared epilogue's count at the token tile for the
+        # plain chains, the one warpgroup the fused requantization's own loop is written for
+        assert s.sf_warp == len(s.epilogue_warps) == 4 * s.epi_wgs
+        q = SwappedGroupedGemm(sw, quant.at(fmt))
+        assert q.epi_wgs == 1 and q.sf_warp == 4
         assert C.can_implement_grouped_blockscaled(dense, 256, 2048, 8, quant, fmt)
         assert C.can_implement_swapped_blockscaled(sw, 256, 2048, 8, quant, fmt)
         assert not C.can_implement_grouped_blockscaled(dense, 256, 2064, 8, quant, fmt)
@@ -565,7 +570,13 @@ def test_mx_classes_run_on_the_unified_bodies():
     name = C.swapped_kernel_name(
         swapped_knobs_mx()[1], plain.at("mxfp8_k64"), k_block=256
     )
-    assert name.startswith("swapped_mxfp8k64_plain_bf16_") and name.endswith("_kb256")
+    # the plain chain on the shared swapped epilogue: the k-block and the epilogue warpgroups of the 16-token tile
+    assert name.startswith("swapped_mxfp8k64_plain_bf16_") and name.endswith("_kb256_e2")
+    name = C.swapped_kernel_name(
+        swapped_knobs_mx()[1], quant.at("mxfp8_k64"), k_block=256
+    )
+    # the fused requantization's own loop: one warpgroup, no epilogue suffix
+    assert name.startswith("swapped_mxfp8k64_swiglu_mxfp8_") and name.endswith("_kb256")
     assert C.MODULE == SCATTER_MODULE == "batch_invariant_moe"
     assert "batch_invariant_moe_mxfp8" not in jit.MODULE_ROOTS
     srcs = jit.relative_sources("batch_invariant_moe")

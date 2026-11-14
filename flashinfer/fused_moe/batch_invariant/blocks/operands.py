@@ -503,18 +503,24 @@ def gather_sf_row_padded(
     sf_stage_bytes: cutlass.Constexpr,
     sf_groups: cutlass.Constexpr,
     pred1,
+    linear: cutlass.Constexpr = False,
+    row_sf_bytes: Int32 = None,
 ):
-    """The scale factors of tile row ``r`` (padded position ``tk``) for k-tile ``kt``: its ``sf_groups`` 4-byte block groups from
+    """The scale factors of tile row ``r`` (padded position ``tk``; with ``linear`` the token's row of the row-major ``[T, K /
+    sf_vec]`` bytes, ``row_sf_bytes`` per row) for k-tile ``kt``: its ``sf_groups`` 4-byte block groups from
     the 128x4 swizzled buffer into the stage's atom by 4-byte ``cp.async``; a block group past the operand's ``n_blocks`` (the tail
     of a partial k-tile) is the same ``cp.async`` with a false predicate, a zero-fill (ignore-src) tracked by the stage's cp.async
     arrive -- never a generic store, whose visibility to the MMA's async-proxy reads that arrive does not order; a row that is not
     ``ok`` copies nothing (only the owning lane may touch a row's slot). The byte positions are the layout's: row ``r`` at
     ``(r % 32) * 16 + (r // 32) * 4``, block group ``g`` at ``g * 512``, atoms at ``128 * pcols``."""
-    g_src_row = (
-        (tk // Int32(128)) * (Int32(128) * pcols)
-        + (tk % Int32(32)) * Int32(16)
-        + ((tk % Int32(128)) // Int32(32)) * Int32(4)
-    )
+    if cutlass.const_expr(linear):
+        g_src_row = tk * row_sf_bytes
+    else:
+        g_src_row = (
+            (tk // Int32(128)) * (Int32(128) * pcols)
+            + (tk % Int32(32)) * Int32(16)
+            + ((tk % Int32(128)) // Int32(32)) * Int32(4)
+        )
     g_dst_row = (
         stage * Int32(sf_stage_bytes)
         + (r % Int32(32)) * Int32(16)
@@ -522,7 +528,12 @@ def gather_sf_row_padded(
     )
     for g in cutlass.range_constexpr(sf_groups):
         blk0 = (kt * Int32(sf_groups) + Int32(g)) * Int32(SF_GROUP)
-        src_off = g_src_row + (kt * Int32(sf_groups) + Int32(g)) * Int32(SF_ATOM_BYTES)
+        if cutlass.const_expr(linear):
+            src_off = g_src_row + (kt * Int32(sf_groups) + Int32(g)) * Int32(SF_GROUP)
+        else:
+            src_off = g_src_row + (kt * Int32(sf_groups) + Int32(g)) * Int32(
+                SF_ATOM_BYTES
+            )
         src_off = cute.assume(src_off, divby=4)
         dst_off = g_dst_row + Int32(g * SF_ATOM_BYTES)
         dst_off = cute.assume(dst_off, divby=4)
@@ -555,14 +566,20 @@ def swap_sf_producer_loop(
     tn: cutlass.Constexpr,
     sf_groups: cutlass.Constexpr,
     sf_stage_bytes: cutlass.Constexpr,
+    mSrc: cute.Tensor = None,
+    k_div: Int32 = None,
+    sf_linear: cutlass.Constexpr = False,
 ):
     """The LDGSTS producer of the token tile's scale factors (one warp): lane ``j < tn`` owns tile row ``j`` = dense row
-    ``row0 + j``, whose scale factors sit at the padded position ``row0 + j + (off_pad[e] - off[e])``; rows past the group's
+    ``row0 + j``, whose scale factors sit at the padded position ``row0 + j + (off_pad[e] - off[e])`` -- or, in the gather form
+    (``mSrc`` given), in the token's own row ``src[row0 + j] // k_div`` of the token rows' buffer (the 128x4 layout, or with
+    ``sf_linear`` the row-major bytes); rows past the group's
     real end are skipped (their accumulator columns are never stored). Every lane arrives on the stage's barrier (the pipeline
     counts the warp)."""
     sf_atom = cute.make_copy_atom(cpasync.CopyG2SOp(), Uint8, num_bits_per_copy=32)
     pred1 = cute.make_rmem_tensor(cute.make_layout((1,)), Boolean)
     n_blocks = K // Int32(st.sf_vec)
+    row_sf_bytes = K // Int32(st.sf_vec)
     state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Producer, st.num_ab_stage
     )
@@ -571,10 +588,15 @@ def swap_sf_producer_loop(
         row0 = work_tile.row0
         row_end = cutlass.min(work_tile.row_end, Tk)
         e = work_tile.e
-        shift = s_off_pad[e] - s_off[e]
         p = row0 + lane
         ok = (lane < Int32(tn)) & (p < row_end)
-        tk = cutlass.max(p + shift, Int32(0))
+        if cutlass.const_expr(mSrc is not None):
+            # the gather form: the token's own scale row
+            pc = cutlass.min(cutlass.max(p, Int32(0)), mSrc.shape[0] - Int32(1))
+            tk = cutlass.max(mSrc[pc], Int32(0)) // k_div
+        else:
+            shift = s_off_pad[e] - s_off[e]
+            tk = cutlass.max(p + shift, Int32(0))
         state.reset_count()
         peek = Boolean(1)
         if state.count < k_tile_cnt:
@@ -595,6 +617,8 @@ def swap_sf_producer_loop(
                 sf_stage_bytes,
                 sf_groups,
                 pred1,
+                sf_linear,
+                row_sf_bytes,
             )
             sf_pipeline.producer_commit(state)
             state.advance()

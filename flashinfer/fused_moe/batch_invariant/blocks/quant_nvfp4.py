@@ -21,6 +21,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint8, Uint32
 
 from ....batch_invariant import canon, jit
+from .. import pdl
 from ....batch_invariant.quantization.cute_ext import CuteF32
 from ....batch_invariant.quantization.layout import sanitize_symbol_name
 from ....batch_invariant.quantization.nvfp4_kernel import (
@@ -110,6 +111,7 @@ class RowMappedNvFP4QuantKernel(NvFP4QuantKernel):
         bidx, _, _ = cute.arch.block_idx()
         if enable_pdl:
             cute.arch.griddepcontrol_wait()
+            pdl.trigger_one_wave()
         W, Lr, rows, bpt, V = self.W, self.Lr, self.rows, self.bpt, self.V
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
@@ -131,7 +133,10 @@ class RowMappedNvFP4QuantKernel(NvFP4QuantKernel):
         # the destination row of the scale factors and the per-row scale: the row's map entry (a row past M has none and
         # stores nothing: the store bound is M)
         srow = mR[cutlass.min(row, M - Int64(1))].to(Int64)
-        store_bound = M
+        # a row without a map entry (the plan marks the rows past the live ones -1: the dropped slots' share of the
+        # buffer) keeps its codes in place and stores no scale factor or row scale
+        mapped = (row < M) & (srow >= Int64(0))
+        srow = cutlass.max(srow, Int64(0))
 
         xbuf = None
         if cutlass.const_expr(self.needs_xbuf):
@@ -165,7 +170,7 @@ class RowMappedNvFP4QuantKernel(NvFP4QuantKernel):
         g = mG[0]
         ramax = canon.run(self.plan, dict(state), nxt, peers, fp)
         g, pts = row_scale_chain(fp, ramax, g)
-        if (t == 0) & (w == 0) & (row < M):
+        if (t == 0) & (w == 0) & mapped:
             mP[srow] = pts
         if cutlass.const_expr(self.cfg.stage == "reread"):
             frag = src.load()
@@ -185,16 +190,14 @@ class RowMappedNvFP4QuantKernel(NvFP4QuantKernel):
         for kk in cutlass.range_constexpr(bpt):
             sf_byte = _quantize_block(self, fp, frag, kk, amax[kk], g, fy_words)
             blk = self.plan.digit_value("blk", coords, self._key_for(kk))
-            if half0 & (blk < pcols) & (row < store_bound):
+            if half0 & (blk < pcols) & mapped:
                 mS[self._sf_off(srow, blk, pcols)] = sf_byte.to(Uint8)
         cute.copy(atom_y, fy, gY, pred=pY)
         if cutlass.const_expr(self.Kbp < SF_COL_TILE):
             # the 128x4 layout pads scale columns to 4; a bucket of 1 or 2 blocks owns none of columns Kbp..3
-            if (t == 0) & (w == 0) & (row < store_bound):
+            if (t == 0) & (w == 0) & mapped:
                 for c in cutlass.range_constexpr(self.Kbp, SF_COL_TILE):
                     mS[self._sf_off(srow, Int32(c), pcols)] = Uint8(0)
-        if enable_pdl:
-            cute.arch.griddepcontrol_launch_dependents()
 
 
 class ScatterQuantNvFP4Quantizer(NvFP4QuantKernel):
@@ -265,6 +268,7 @@ class ScatterQuantNvFP4Quantizer(NvFP4QuantKernel):
         bidx, _, _ = cute.arch.block_idx()
         if enable_pdl:
             cute.arch.griddepcontrol_wait()
+            pdl.trigger_one_wave()
         W, Lr, rows, bpt, V = self.W, self.Lr, self.rows, self.bpt, self.V
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
@@ -334,24 +338,26 @@ class ScatterQuantNvFP4Quantizer(NvFP4QuantKernel):
             i = cutlass.min(row * Int64(self.k) + Int64(j), last)
             d = mD[i].to(Int64)
             dp = mDP[i].to(Int64)
-            if (t == 0) & (w == 0) & valid:
+            # a dropped slot (an expert id outside [0, E)) has no position: the plan marks it -1 and the slot stores nothing
+            live = valid & (d >= Int64(0))
+            d = cutlass.max(d, Int64(0))
+            dp = cutlass.max(dp, Int64(0))
+            if (t == 0) & (w == 0) & live:
                 mP[dp] = pts
             for kk in cutlass.range_constexpr(bpt):
                 blk = self.plan.digit_value("blk", coords, self._key_for(kk))
-                if half0 & (blk < pcols) & valid:
+                if half0 & (blk < pcols) & live:
                     mS[self._sf_off(dp, blk, pcols)] = sf_bytes[kk]
-                if (blk < nb) & valid:
+                if (blk < nb) & live:
                     base = d * Int64(row_words) + (
                         (blk * (BLOCK // 2) + lane_off) // 4
                     ).to(Int64)
                     for q in cutlass.range_constexpr(V // 8):
                         y32[base + Int64(q)] = fy_words[kk * (V // 8) + q]
             if cutlass.const_expr(self.Kbp < SF_COL_TILE):
-                if (t == 0) & (w == 0) & valid:
+                if (t == 0) & (w == 0) & live:
                     for c in cutlass.range_constexpr(self.Kbp, SF_COL_TILE):
                         mS[self._sf_off(dp, Int32(c), pcols)] = Uint8(0)
-        if enable_pdl:
-            cute.arch.griddepcontrol_launch_dependents()
 
 
 def get_compiled_rowmap_quant(

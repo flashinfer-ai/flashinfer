@@ -40,6 +40,8 @@ TOP_K = 3
 CHAIN_NODE_CYCLES = 1.0
 #: Epilogue warpgroups of the grouped body (its subtiles are split between them): `blocks.scheduler.EPI_WARPGROUPS_DENSE`.
 _EPI_WARPGROUPS = 2
+#: ... and of the block-scaled grouped body: `blocks.operands.EPI_WARPGROUPS_BLOCKSCALED`.
+_EPI_WARPGROUPS_FP4 = 4
 #: Bytes per cycle per SM at which a CTA's TMA engine zero-fills the rows of its token box past the group's rows (empirical, per
 #: family: the sandbox cost model's fitted rates, a fifth to a tenth of the engine's load rate). The grouped body streams a whole
 #: token tile per k-tile of which only the live rows are real, the swapped body a narrow one; the dense estimate's HBM floor hides
@@ -229,6 +231,7 @@ def exposed_epilogue_cycles(
     rows: int,
     nodes: int,
     pair: bool = False,
+    scalar_store: bool = False,
     epi_warpgroups: int = _EPI_WARPGROUPS,
 ) -> float:
     """The chain work of a CTA's last tile, which no mainloop overlaps (the earlier tiles' epilogues run behind the next tile's
@@ -244,9 +247,31 @@ def exposed_epilogue_cycles(
         chains = cfg.tile_n * cfg.tile_m / 128
         if pair and cfg.tile_m < 128:
             chains /= 2
-    else:
-        chains = cfg.tile_n / epi_warpgroups
+        store = 0.0
+        if scalar_store:
+            # the swapped body's stores are scalars (a weight row's token columns are strided in the output): every
+            # element costs a sector of write traffic, drained at the empirical rate below
+            store = (
+                cfg.tile_n
+                * cfg.tile_m
+                * SWAP_STORE_SECTOR_BYTES
+                / SWAP_STORE_BYTES_PER_CLK
+            )
+        return chains * nodes * CHAIN_NODE_CYCLES + store
+    # the grouped body's epilogue works in subtiles of EPI_SUBTILE_N columns, one per warpgroup per round: a tile costs as
+    # many rounds as its subtiles need over the warpgroups (a 192-wide tile takes the rounds of a 256-wide one)
+    subtiles = -(-cfg.tile_n // EPI_SUBTILE_N)
+    rounds = -(-subtiles // epi_warpgroups)
+    chains = rounds * EPI_SUBTILE_N
     return chains * nodes * CHAIN_NODE_CYCLES
+
+
+#: Columns of one epilogue subtile of the grouped body (the TMEM load's width per warpgroup).
+EPI_SUBTILE_N = 32
+
+#: The swapped epilogue's scalar stores: the sector each one writes and the rate they drain at (an empirical constant).
+SWAP_STORE_SECTOR_BYTES = 32.0
+SWAP_STORE_BYTES_PER_CLK = 64.0
 
 
 def zero_fill_cycles(
@@ -290,9 +315,24 @@ def estimate_overrides(cfg: Knobs, rows: int, in_fmt: str, family: str) -> dict:
     the step (at one row per expert the swapped records are bytes-bound, so a 64-row weight tile is priced by its bytes
     per CTA)."""
     from ...gemm.batch_invariant.heuristic import CONSTANTS, PART_TABLE
-    from ...gemm.batch_invariant.spec import ELEM_BITS_OF, MMA_K_OF, MMA_RATE_OF
+    from ...gemm.batch_invariant.spec import (
+        ELEM_BITS_OF,
+        FP4_FMTS,
+        MMA_K_OF,
+        MMA_RATE_OF,
+    )
 
     p = dict(CONSTANTS)
+    if in_fmt in FP4_FMTS:
+        # the block-scaled grouped body: its tiles cost the longer of the mainloop and the declared chain (the accumulator
+        # stages overlap the two), `epi_tile` switching that bound on; and until the rows per expert fill two of the
+        # record's cluster tiles, its 2-CTA pair and its N-cluster synchronise every stage on the group scheduler, so
+        # neither earns the dense estimate's pair bonus or multicast credit (longer groups stream several tiles per expert
+        # and keep the dense estimate's credits)
+        p["epi_tile"] = 1.0
+        if rows < 2 * cfg.mma_tiler_mn[0]:
+            p["two_cta"] = 1.0
+            p["mcast_pow"] = 0.0
     part = PART_TABLE.get(family, PART_TABLE["sm_107"])
     group = 2 if cfg.use_2cta_instrs else 1
     cta_rows = (
@@ -301,7 +341,7 @@ def estimate_overrides(cfg: Knobs, rows: int, in_fmt: str, family: str) -> dict:
     tn = cfg.mma_tiler_mn[1]
     cm, cn = cfg.cluster_shape_mn
     live = min(max(1, rows), cta_rows)
-    if not cfg.swap_ab:
+    if not cfg.swap_ab and p["mcast_pow"] != 0.0:
         p["mcast_pow"] = CONSTANTS["mcast_pow"] * live / cta_rows
     # the record's k-step as the estimate forms it: MMA cycles against operand bytes
     eb = ELEM_BITS_OF[in_fmt] / 8.0
@@ -350,14 +390,14 @@ def record_cost(
     in_fmt: str = "bf16",
     nominal: bool = False,
     *,
-    epi_warpgroups: int = _EPI_WARPGROUPS,
+    epi_warpgroups: Optional[int] = None,
     overrides: Optional[dict] = None,
 ) -> float:
     """The shared contract's cost of one grouped record at the launch's shape ``(rows per expert, n_active x N, K)``, the key
     every class's ``rank_grouped_*`` sorts by: the dense estimate with the MoE ranking's constant overrides
     (`estimate_overrides`, with a class's own ``overrides`` layered on top: its promotion counts and the like; the dense
     dispatcher's constants untouched), times the pair term and the swapped records' tiles term, plus the exposed epilogue
-    chain (over the body's ``epi_warpgroups``) and the token box's exposed fill; in SM cycles (a launch's fixed cost is the
+    chain (over the body's ``epi_warpgroups``: the format's default when not given) and the token box's exposed fill; in SM cycles (a launch's fixed cost is the
     same for both bodies on every measured part, so it is no term). The class-specific arguments are keyword-only: a class
     that does not pass them gets the shared defaults."""
     import dataclasses
@@ -367,7 +407,20 @@ def record_cost(
     constants = estimate_overrides(cfg, rows, in_fmt, family)
     if overrides:
         constants.update(overrides)
+    from ...gemm.batch_invariant.spec import FP4_FMTS
+
     canon = dataclasses.replace(cfg, raster_along="m")
+    fp4 = in_fmt in FP4_FMTS
+    if epi_warpgroups is None:
+        epi_warpgroups = _EPI_WARPGROUPS_FP4 if fp4 else _EPI_WARPGROUPS
+    epi = exposed_epilogue_cycles(
+        cfg,
+        rows,
+        nodes,
+        pair,
+        scalar_store=fp4,
+        epi_warpgroups=epi_warpgroups,
+    )
     est = estimate_cycles(
         canon,
         rows,
@@ -380,10 +433,11 @@ def record_cost(
         sm_count,
         nominal=nominal,
         c=constants,
+        epi_tile_cycles=epi * constants.get("epi_tile", 0.0),
     )
     return (
         est * pair_term(cfg, rows) * tiles_term(cfg, rows)
-        + exposed_epilogue_cycles(cfg, rows, nodes, pair, epi_warpgroups)
+        + epi
         + zero_fill_cycles(cfg, rows, K, family, in_fmt)
     )
 

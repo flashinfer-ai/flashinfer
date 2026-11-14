@@ -252,9 +252,13 @@ class BatchInvariantMoeMxfp4Runner(_Fp4PairRunner):
         return [x, sf, ids, wts, w.w1, w.w1_sf, w.w2, w.w2_sf, out] + plan
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
-    def _ranked(self, T: int, H: int) -> Tuple[list, list]:
+    def _scatter_launch(self, x: torch.Tensor) -> bool:
+        return True  # this pair's quantizer has no scattering pass: every input's box form scatters in a launch of its own
+
+    def _ranked(self, T: int, H: int, scatter_launch: bool = True) -> Tuple[list, list]:
         from .blocks.epilogue import MXFP4_GEMM2_CHAIN, Mxfp4Chain
-        from .schedule import TOP_K, active_experts, rows_per_expert
+        from .schedule import active_experts, rows_per_expert
+        from .schedule_nvfp4 import TOP_K_FP4, gather_form_rule
         from .schedule_mxfp4 import rank_grouped_mxfp4
         from .spec_mxfp4 import expert_classes_mx
 
@@ -270,26 +274,29 @@ class BatchInvariantMoeMxfp4Runner(_Fp4PairRunner):
         in1, in2 = expert_classes_mx(family)
         chain1 = Mxfp4Chain("glu" if a.gated else "act", a.act, "bf16", a.params)
         n1 = 2 * I if a.gated else I
-        return (
+        r1 = list(
             rank_grouped_mxfp4(
-                rows, n1, H, E, chain1, in1, sm_count, family, TOP_K, n_active=n_act
-            ),
-            rank_grouped_mxfp4(
-                rows,
-                H,
-                I,
-                E,
-                MXFP4_GEMM2_CHAIN,
-                in2,
-                sm_count,
-                family,
-                TOP_K,
-                n_active=n_act,
-            ),
+                rows, n1, H, E, chain1, in1, sm_count, family, TOP_K_FP4, n_active=n_act
+            )
         )
+        twins = [gather_form_rule(c, scatter_launch) for c in r1]
+        r1 += [t for t in twins if t.gather_a and t not in r1]
+        r2 = rank_grouped_mxfp4(
+            rows,
+            H,
+            I,
+            E,
+            MXFP4_GEMM2_CHAIN,
+            in2,
+            sm_count,
+            family,
+            TOP_K_FP4,
+            n_active=n_act,
+        )
+        return r1, list(r2)
 
     def _cache_key_extras(self) -> tuple:
-        return super()._cache_key_extras() + ("moe.mxfp4-v1",)
+        return super()._cache_key_extras() + ("moe.mxfp4-v2",)
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def forward(
@@ -306,8 +313,10 @@ class BatchInvariantMoeMxfp4Runner(_Fp4PairRunner):
         plan = tuple(inputs[9:14]) if len(inputs) >= 14 else None
         H = self._hidden_of(x)
         if tactic == -1 or tactic is None:
-            r1, r2 = self._ranked(int(x.shape[0]), H)
-            c1, c2 = r1[0], r2[0]
+            from .schedule_nvfp4 import gather_form_rule
+
+            r1, r2 = self._ranked(int(x.shape[0]), H, True)
+            c1, c2 = gather_form_rule(r1[0], True), r2[0]
         else:
             c1, c2 = _configs_from_tactic_nvfp4(tuple(tactic))
         a = self._activation()

@@ -266,9 +266,12 @@ def estimate_cycles(
     out_bytes: int = 2,
     c: Optional[Dict[str, float]] = None,
     nominal: bool = False,
+    epi_tile_cycles: float = 0.0,
 ) -> float:
     """SM-cycles of the launch for record ``k`` at the shape: waves of CTA tiles over the part's co-resident cluster
-    capacity, each the slower of its MMA and its L2 -> SMEM traffic per k-step plus a floor, bounded below by the shared
+    capacity, each the slower of its MMA and its L2 -> SMEM traffic per k-step plus a floor -- and no shorter than
+    ``epi_tile_cycles``, a caller's per-tile epilogue work (the accumulator stages overlap a tile's epilogue with the next
+    tile's mainloop, so a tile costs the longer of the two; 0 for the dense bodies) -- bounded below by the shared
     L2 fabric and by the operands' HBM bytes, plus the stall of the bytes the scheduler's tile order fetches again
     (`hbm_traffic`) beyond what the body's duration streams unnoticed, the epilogue and (workspace split) the fixup;
     raster, swizzle and 2-CTA adjustments multiply. ``b_major`` does not enter the estimate (the narrow-tile cost is
@@ -351,7 +354,7 @@ def estimate_cycles(
             )
             + p["step_floor"]
         )
-    body = waves * ksteps * step
+    body = waves * max(ksteps * step, epi_tile_cycles)
     active = ctas_m * n_tiles * items
     l2_total = (
         active

@@ -35,6 +35,7 @@ from ...gemm.batch_invariant.spec import MXFP4_FMTS
 from . import spec as S
 from .api import interleave_fc1, route  # noqa: F401  (route re-exported for the class's callers)
 from .api_nvfp4 import (
+    gather_form_ok,
     DENSE_TAIL,
     GROUP_ALIGN,
     MAX_TOP_K,
@@ -265,6 +266,9 @@ def grouped_gemm_mxfp4(
     out: Optional[torch.Tensor] = None,
     dense_a: bool = False,
     rows_sf: Optional[int] = None,
+    *,
+    src: Optional[torch.Tensor] = None,
+    k_div: int = 1,
 ) -> torch.Tensor:
     """``out[p] = chain(a4[p] @ w4[e(p)].T)`` on the expert segments ``counts`` (int32 ``[E]``, group order = expert order),
     the UE8M0 block scales of both operands applied inside the instruction. Padded packing (default): ``a4 [rows, K/2]``
@@ -273,7 +277,10 @@ def grouped_gemm_mxfp4(
     padded positions of ``rows_sf`` rows (a multiple of 128, at least the live rows), ``out [rows]`` dense. ``w4 [E, N, K/2]``
     uint8, ``w_sf [E, mx_sf_numel(N, K)]``. The record selects the body as :func:`.api_nvfp4.grouped_gemm_nvfp4`: a dense
     record runs the padded body on either packing, a swapped record the swapped decode body on the dense packing (``a4``
-    carries at least the token tile's rows past the live rows: the op's ``DENSE_TAIL``)."""
+    carries at least the token tile's rows past the live rows: the op's ``DENSE_TAIL``). The gather record (``config.gather_a``,
+    a swapped record): ``a4 [T, K/2]`` the unpermuted token rows, ``a_sf`` their scale factors (the flat 128x4 buffer of the
+    ``T`` rows, or the linear ``[T, K/32]`` bytes), ``src [>= Tk]`` int32 the plan's slot of every dense row (``src[p] //
+    k_div`` its token), ``out`` given (it sizes the dense rows); the body reads the rows itself."""
     from .api import _check_grouped_chain, _check_grouped_operands, _grouped_out
     from .blocks.compile import (
         can_implement_grouped_blockscaled,
@@ -282,6 +289,14 @@ def grouped_gemm_mxfp4(
         get_compiled_swapped,
     )
 
+    if config.gather_a:
+        return _grouped_gemm_mxfp4_gather(
+            a4, a_sf, w4, w_sf, counts, config, chain, in_fmt, out, src, k_div
+        )
+    if src is not None:
+        raise ValueError(
+            "grouped_gemm_mxfp4: src belongs to the gather record (config.gather_a)"
+        )
     rows, Kh, E, N, _ = _check_grouped_operands(
         "grouped_gemm_mxfp4",
         a4,
@@ -369,6 +384,91 @@ def grouped_gemm_mxfp4(
     return out
 
 
+def _grouped_gemm_mxfp4_gather(
+    a4, a_sf, w4, w_sf, counts, config, chain, in_fmt, out, src, k_div
+) -> torch.Tensor:
+    """The gather record of :func:`grouped_gemm_mxfp4` (its operand rules, the token rows in place of the permuted rows)."""
+    from .api import _check_grouped_chain, _check_grouped_operands, _grouped_out
+    from .api_nvfp4 import gather_form_ok, gather_sf_layout
+    from .blocks.compile import can_implement_swapped_blockscaled, get_compiled_swapped
+
+    T, Kh, E, N, _ = _check_grouped_operands(
+        "grouped_gemm_mxfp4",
+        a4,
+        w4,
+        counts,
+        a4.shape[0] if a4.dim() == 2 else None,
+        None,
+        torch.uint8,
+        ALIGN_MXFP4 // 2,
+        "packed fp4 uint8",
+        n_align=8,
+    )
+    K = 2 * Kh
+    if out is None or src is None:
+        raise ValueError(
+            "grouped_gemm_mxfp4: the gather record reads the token rows through the plan's map: src and out"
+        )
+    if (
+        src.dtype != torch.int32
+        or src.dim() != 1
+        or not src.is_contiguous()
+        or k_div < 1
+    ):
+        raise ValueError(
+            "grouped_gemm_mxfp4: src must be a contiguous int32 [>= Tk] and k_div >= 1"
+        )
+    sf_src = gather_sf_layout(a_sf, T, K, MX_BLOCK)
+    if a_sf.dtype != torch.uint8 or (
+        sf_src == "128x4" and a_sf.numel() < mx_sf_numel(T, K)
+    ):
+        raise ValueError(
+            "grouped_gemm_mxfp4: a_sf must hold the 128x4 swizzled scales of the T token rows or their linear [T, K/32] bytes"
+        )
+    if not gather_form_ok(K, sf_src, MX_BLOCK):
+        raise ValueError(
+            "grouped_gemm_mxfp4: the linear scale layout's rows must be whole 4-byte groups (K a multiple of 128)"
+        )
+    if w_sf.dtype != torch.uint8 or w_sf.numel() < E * mx_sf_numel(N, K):
+        raise ValueError(
+            "grouped_gemm_mxfp4: w_sf must hold E consecutive 128x4 swizzled scale buffers of (N, K)"
+        )
+    if not isinstance(chain, Mxfp4Chain):
+        raise ValueError("grouped_gemm_mxfp4: chain must be an Mxfp4Chain")
+    if in_fmt not in MXFP4_FMTS or chunks_for(N, K, in_fmt) != 1:
+        raise ValueError(
+            "grouped_gemm_mxfp4: the grouped class takes unsplit expert weight shapes"
+        )
+    if not config.swap_ab or not can_implement_swapped_blockscaled(
+        config, N, K, E, chain, in_fmt
+    ):
+        raise ValueError(
+            f"grouped_gemm_mxfp4: gather record {config.describe()} does not implement ({N}, {K}, {E}, {chain}, {in_fmt})"
+        )
+    n_out = _check_grouped_chain("grouped_gemm_mxfp4", N, chain)
+    rows = out.shape[0]
+    out = _grouped_out(
+        "grouped_gemm_mxfp4", out, rows, n_out, _OUT[chain.out_fmt], a4.device
+    )
+    if rows == 0 or T == 0:
+        return out
+    grid = min(
+        persistent_clusters(a4.device, config), launch_tile_bound(config, rows, E, N)
+    )
+    get_compiled_swapped(config, chain.at(in_fmt), sf_src=sf_src)(
+        a4.unsqueeze(-1),
+        a_sf.reshape(-1),
+        src,
+        k_div,
+        w4.permute(1, 2, 0),
+        w_sf.reshape(-1),
+        out,
+        counts,
+        grid,
+    )
+    return out
+
+
 _UNIT: Dict[str, torch.Tensor] = {}
 
 
@@ -397,6 +497,7 @@ def fused_moe_mxfp4(
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     ] = None,
     round_scales: bool = False,
+    gather: Optional[bool] = None,
 ):
     """The MXFP4 MoE FFN for pre-routed tokens: ``x`` bf16 ``[T, H]`` (quantized here with the class) or the quantized pair
     ``(x4 [T, H/2] uint8, x_sf uint8: the 128x4 swizzled buffer of ``mxfp4_quantize(..., batch_invariant=True)`` or the linear
@@ -405,11 +506,20 @@ def fused_moe_mxfp4(
     GEMM (default: the part's); ``config1`` / ``config2`` the grouped records (any record of the space gives the same bits);
     ``path`` the packing of the expanded rows; ``swap`` the dense path's body (None: the dispatcher's ranking, True / False:
     the swapped / the padded body on both GEMMs); ``plan`` the dense packing's precomputed plan (:func:`.api_nvfp4.route_plan_dual`'s
-    outputs after the ids and weights)."""
+    outputs after the ids and weights); ``gather`` GEMM1's swapped records in their gather form (the body reads the token rows
+    through the plan's map: this pair's scatter launch gone) -- False excludes it, True forces it, None (the default) applies
+    the structural rule (:func:`~.schedule_nvfp4.gather_form_rule`: the narrow swapped tile); an explicit ``config1`` selects
+    the form itself (``gather_a``)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import warps_per_row
-    from .permute_nvfp4 import get_compiled_scatter_fp4, get_compiled_scatter_sf
+    from .permute_nvfp4 import (
+        get_compiled_scatter_fp4,
+        get_compiled_scatter_sf,
+        scatter_lanes,
+        scatter_sf_lanes,
+    )
     from .schedule_mxfp4 import default_configs_mxfp4
+    from .schedule_nvfp4 import gather_form_rule
 
     if path not in PATHS:
         raise ValueError(f"fused_moe_mxfp4: path must be one of {PATHS}, not {path!r}")
@@ -485,6 +595,7 @@ def fused_moe_mxfp4(
     in1, in2 = in_fmts if in_fmts is not None else w.classes(family)
     chain1, chain2 = w.chain1, w.chain2
     if config1 is None or config2 is None:
+        ranked1 = config1 is None
         c1, c2 = default_configs_mxfp4(
             T,
             k,
@@ -497,12 +608,27 @@ def fused_moe_mxfp4(
             sm_count,
             family,
             swap=swap if path == "dense" else False,
+            gather=(gather or False) if path == "dense" else False,
         )
         config1, config2 = config1 or c1, config2 or c2
+        if ranked1 and gather is None and path == "dense":
+            # the rule: this pair's scatter launch folded into the narrow swapped tile's gather form
+            config1 = gather_form_rule(config1, True)
     if path != "dense" and (swap or config1.swap_ab or config2.swap_ab):
         raise ValueError(
             "fused_moe_mxfp4: the swapped decode body reads the dense packing (path='dense')"
         )
+    if config2.gather_a or (path != "dense" and (gather or config1.gather_a)):
+        raise ValueError(
+            "fused_moe_mxfp4: the gather form is GEMM1's on the dense packing (path='dense')"
+        )
+    gather1 = config1.gather_a
+    if gather1 and not gather_form_ok(H, sf_src, MX_BLOCK):
+        # the linear scale layout's rows are not whole 4-byte groups: the box form through the scatter
+        import dataclasses
+
+        config1 = dataclasses.replace(config1, gather_a=False)
+        gather1 = False
     if path != "dense" and plan is not None:
         raise ValueError(
             "fused_moe_mxfp4: the precomputed plan is the dense packing's (path='dense')"
@@ -519,26 +645,43 @@ def fused_moe_mxfp4(
         # the fp4 rows back to back (a tail past Tk for the last tiles' TMA boxes); the scale factors at the padded positions
         # (one 128x4 atom per (expert, 128-row tile); a tail past Tk_pad likewise)
         Tk_a, Tk_sf = Tk + DENSE_TAIL, Tk_pad + DENSE_TAIL
-        x_perm4 = torch.empty(Tk_a, H // 2, dtype=torch.uint8, device=dev)
-        x_perm_sf = torch.empty(mx_sf_numel(Tk_sf, H), dtype=torch.uint8, device=dev)
-        if Tk:
-            get_compiled_scatter_fp4(k, wpr, sf_src, False, True, MX_BLOCK)(
-                x4,
-                x_sf,
-                unit,
-                dest.reshape(-1),
-                dest_pad.reshape(-1),
-                x_perm4,
-                x_perm_sf,
-                unit,
-                Tk,
-                H // 2,
-                pcols_h,
+        x_perm4 = x_perm_sf = None
+        if gather1:
+            # the gather form: GEMM1 reads the token rows through the plan's map (no scatter launch)
+            g_a = x4
+            g_sf = x_sf.view(T, H // MX_BLOCK) if sf_src == "linear" else x_sf
+        else:
+            x_perm4 = torch.empty(Tk_a, H // 2, dtype=torch.uint8, device=dev)
+            x_perm_sf = torch.empty(
+                mx_sf_numel(Tk_sf, H), dtype=torch.uint8, device=dev
             )
+            if Tk:
+                get_compiled_scatter_fp4(
+                    k,
+                    wpr,
+                    sf_src,
+                    False,
+                    True,
+                    MX_BLOCK,
+                    **scatter_lanes(H // 2, pcols_h, wpr),
+                )(
+                    x4,
+                    x_sf,
+                    unit,
+                    dest.reshape(-1),
+                    dest_pad.reshape(-1),
+                    x_perm4,
+                    x_perm_sf,
+                    unit,
+                    Tk,
+                    H // 2,
+                    pcols_h,
+                )
+            g_a, g_sf = x_perm4, x_perm_sf
         a = torch.empty(Tk_a, I, dtype=torch.bfloat16, device=dev)
         grouped_gemm_mxfp4(
-            x_perm4,
-            x_perm_sf,
+            g_a,
+            g_sf,
             w.w1,
             w.w1_sf,
             counts,
@@ -548,6 +691,8 @@ def fused_moe_mxfp4(
             out=a,
             dense_a=True,
             rows_sf=Tk_sf,
+            src=src if gather1 else None,
+            k_div=k,
         )
         # the class's second pass over the live rows: the codes stay dense; the scale factors are re-tiled to the padded
         # positions for GEMM2's atom-aligned scale boxes (a byte move)
@@ -556,7 +701,7 @@ def fused_moe_mxfp4(
         a_sf_pad = torch.empty(mx_sf_numel(Tk_sf, I), dtype=torch.uint8, device=dev)
         if Tk:
             quantize_rows_mx(a[:Tk], out=(a4[:Tk], a_sf))
-            get_compiled_scatter_sf(1, True)(
+            get_compiled_scatter_sf(1, True, spl=scatter_sf_lanes(pcols_i))(
                 a_sf, unit, pos_pad, a_sf_pad, unit, Tk, pcols_i
             )
         y = torch.empty(Tk_a, H, dtype=torch.bfloat16, device=dev)
@@ -586,8 +731,10 @@ def fused_moe_mxfp4(
                 pos_pad=pos_pad,
                 x4=x4,
                 x_sf=x_sf,
-                x_perm4=x_perm4[:Tk],
-                x_perm_sf=x_perm_sf[: mx_sf_numel(Tk_pad, H)],
+                x_perm4=None if x_perm4 is None else x_perm4[:Tk],
+                x_perm_sf=None
+                if x_perm_sf is None
+                else x_perm_sf[: mx_sf_numel(Tk_pad, H)],
                 a=a[:Tk],
                 a4=a4[:Tk],
                 a_sf=a_sf,
@@ -602,7 +749,12 @@ def fused_moe_mxfp4(
         return out
     # the padded packing: every group's rows start at a 128-row atom; the padding rows are zero (computed, never stored)
     from .api import PLAN_MULTI_MIN_N
-    from .permute import PLAN_BLOCK, get_compiled_plan, get_compiled_plan_multi
+    from .permute import (
+        get_compiled_plan,
+        get_compiled_plan_multi,
+        PLAN_BLOCK,
+        plan_threads,
+    )
 
     n = Tk
     dest = torch.empty(n, dtype=torch.int32, device=dev)
@@ -618,13 +770,17 @@ def fused_moe_mxfp4(
             flat, counts, dest, src, dest, dest, hist_blk, n, E, nb
         )
     else:
-        get_compiled_plan(GROUP_ALIGN, False)(flat, counts, dest, src, dest, dest, n, E)
+        get_compiled_plan(GROUP_ALIGN, False, threads=plan_threads(n))(
+            flat, counts, dest, src, dest, dest, n, E
+        )
     dest = dest.view(T, k)
     x_perm4 = torch.zeros(Tk_pad, H // 2, dtype=torch.uint8, device=dev)
     x_perm_sf = torch.zeros(mx_sf_numel(Tk_pad, H), dtype=torch.uint8, device=dev)
     if Tk:
         flat_dest = dest.reshape(-1)
-        get_compiled_scatter_fp4(k, wpr, sf_src, False, True, MX_BLOCK)(
+        get_compiled_scatter_fp4(
+            k, wpr, sf_src, False, True, MX_BLOCK, **scatter_lanes(H // 2, pcols_h, wpr)
+        )(
             x4,
             x_sf,
             unit,

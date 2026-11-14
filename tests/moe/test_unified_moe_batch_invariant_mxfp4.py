@@ -808,11 +808,23 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits(T):
     ref = bits(layer(pack, W))
     inputs = runner.pack_inputs(pack, W)
     tactics = runner.get_valid_tactics(inputs, None)
-    assert 1 <= len(tactics) <= 9 and len(set(tactics)) == len(tactics)
+    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import TOP_K_FP4
+
+    # GEMM1's list carries the structural rule's gather twin beside its box record (one more than the ranking's head)
+    assert 1 <= len(tactics) <= TOP_K_FP4 * (TOP_K_FP4 + 1) and len(
+        set(tactics)
+    ) == len(tactics)
     r1, r2 = runner.impl._ranked(T, H)
     assert tactics == [_tactic_nvfp4(c1, c2) for c1 in r1 for c2 in r2]
     c1, c2 = _configs_from_tactic_nvfp4(tactics[0])
     assert (c1, c2) == (r1[0], r2[0])
+    # this pair's tactic space: the box head plus the structural rule's gather twin of the narrow swapped tile
+    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import GATHER_TILE_N
+
+    box = [c for c in r1 if not c.gather_a]
+    assert r1[: len(box)] == box and [c.describe() for c in r1 if c.gather_a] == [
+        c.describe() + "_ga" for c in box if c.swap_ab and c.tile_n == GATHER_TILE_N
+    ]
     if token_tile_default(rows_per_expert(T, k, E)) is not None:
         assert c1.swap_ab and c2.swap_ab, (T, c1.describe(), c2.describe())
     for t in tactics:
@@ -821,6 +833,84 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits(T):
     with autotune(True):
         assert torch.equal(bits(layer(pack, W)), ref)
     assert torch.equal(bits(layer(pack, W)), ref)
+
+
+@needs_device
+def test_swapped_gather_record_gives_the_box_forms_bits_on_every_pack_form():
+    """The MXFP4 pair's swapped gather records (:func:`...api_nvfp4.fused_moe_nvfp4`'s form on this class): the box form's bits for
+    the bf16 input, the pre-quantized pair with the 128x4 and with the linear scale layout, every token tile; the padded
+    packing and GEMM2 refuse the record."""
+    from flashinfer.batch_invariant.quantization.layout import unswizzle_sf_128x4
+    from flashinfer.fused_moe.batch_invariant.api_mxfp4 import fused_moe_mxfp4
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp4 import (
+        default_configs_mxfp4,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import (
+        GATHER_TILE_N,
+        gather_twins,
+        swapped_knobs_blockscaled,
+    )
+    from flashinfer.fused_moe.batch_invariant.spec_mxfp4 import MX_BLOCK
+
+    twins = gather_twins(swapped_knobs_blockscaled())
+    H, I, E = 512, 256, 32
+    for T, k in ((5, 8), (300, 6)):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=3 + T)
+        W = _weights_of(_weights(w1, w2))
+        ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        ids, weights = ids.cuda(), weights.cuda()
+        ref = bits(fused_moe_mxfp4(x, ids, weights, W, gather=False))
+        in1, in2 = W.classes(_family())
+        _, c2 = default_configs_mxfp4(
+            T, k, H, I, E, (in1, in2), W.chain1, W.chain2, 212, _family()
+        )
+        x4, sf = _quantized(x)[:2]
+        sf_lin = (
+            unswizzle_sf_128x4(sf.cpu(), T, H, MX_BLOCK)
+            .cuda()
+            .view(torch.uint8)
+            .reshape(T, H // MX_BLOCK)
+        )
+        for rec in twins:
+            out, im = fused_moe_mxfp4(
+                x, ids, weights, W, config1=rec, config2=c2, return_intermediates=True
+            )
+            assert im["config1"].gather_a and im["x_perm4"] is None
+            assert torch.equal(bits(out), ref), rec.describe()
+            assert torch.equal(
+                bits(
+                    fused_moe_mxfp4((x4, sf), ids, weights, W, config1=rec, config2=c2)
+                ),
+                ref,
+            )
+            assert torch.equal(
+                bits(
+                    fused_moe_mxfp4(
+                        (x4, sf_lin), ids, weights, W, config1=rec, config2=c2
+                    )
+                ),
+                ref,
+            )
+        if T <= 16:
+            out_g, im = fused_moe_mxfp4(
+                x, ids, weights, W, gather=True, return_intermediates=True
+            )
+            assert im["config1"].gather_a and torch.equal(bits(out_g), ref)
+            # the default: the rule's form (this pair's scatter launch folded into the narrow swapped tile)
+            for xin in (x, (x4, sf), (x4, sf_lin)):
+                out_d, im = fused_moe_mxfp4(
+                    xin, ids, weights, W, return_intermediates=True
+                )
+                c = im["config1"]
+                assert (
+                    c.gather_a == (c.swap_ab and c.tile_n == GATHER_TILE_N)
+                    and (im["x_perm4"] is None) == c.gather_a
+                )
+                assert torch.equal(bits(out_d), ref)
+    with pytest.raises(ValueError):
+        fused_moe_mxfp4(x, ids, weights, W, path="padded", gather=True)
+    with pytest.raises(ValueError):
+        fused_moe_mxfp4(x, ids, weights, W, config1=c2, config2=twins[0])
 
 
 @needs_device
@@ -1002,3 +1092,162 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     nv = _layer(k, E, I, quant=_NVFP4)
     with pytest.raises(BatchInvariantUnsupportedError, match="another pair"):
         nv(_logits_pack(x, logits), W)
+
+
+# ----------------------------------------------------------------------------- dropped slots
+
+
+@needs_device
+def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots():
+    """A pre-routed expert id outside ``[0, E)`` (``-1``, ``E``, ``2^30``) is a dropped slot for this pair as for the others:
+    the plan marks it (``dest`` / ``dest_pad`` -1, ``pos_pad`` -1 past the live rows), the scatter of the codes and the
+    scale re-tiling write nothing for it (nothing outside the live rows or the buffers: sentinel guards), and the combine
+    folds ``+0`` in its place: the output equals the composition with those slots at a valid id and weight 0, a token whose
+    slots are all dropped gives a zero row, the other tokens keep their bits, the combine oracle over the op's intermediates
+    gives the bits; both plan forms, both packings; every slot dropped on the dense and the swapped records."""
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant.api import PLAN_MULTI_MIN_N, permute_plan
+    from flashinfer.fused_moe.batch_invariant.api_mxfp4 import (
+        _placeholder,
+        fused_moe_mxfp4,
+        mx_sf_cols,
+        mx_sf_numel,
+    )
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import (
+        DENSE_TAIL,
+        _part,
+        padded_rows_bound,
+        permute_plan_dual,
+    )
+    from flashinfer.fused_moe.batch_invariant.permute import warps_per_row
+    from flashinfer.fused_moe.batch_invariant.permute_nvfp4 import (
+        get_compiled_scatter_fp4,
+        get_compiled_scatter_sf,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp4 import (
+        default_configs_mxfp4,
+    )
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+    from flashinfer.fused_moe.batch_invariant.spec_mxfp4 import expert_classes_mx
+    from tests.moe.test_unified_moe_batch_invariant_nvfp4 import (
+        _guarded,
+        _guards_untouched,
+    )
+
+    k, H, I, E = 8, 256, 128, 64
+    bad = (-1, E, 1 << 30)
+    chain = activation_of(_SWIGLU)
+    sm_count, family = _part(torch.device("cuda"))
+    for T in (96, PLAN_MULTI_MIN_N // k + 3):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=21)
+        W_pack, layer = _weights(w1, w2), _layer(k, E, I)
+        W = _weights_of(W_pack)
+        ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        ids_bad = ids.clone()
+        rows = torch.randperm(T, generator=torch.Generator().manual_seed(T))[: T // 4]
+        for j, t in enumerate(rows.tolist()):
+            ids_bad[t, j % k] = bad[j % 3]
+            ids_bad[t, (j + 3) % k] = bad[(j + 1) % 3]
+        ids_bad[rows[0]] = torch.tensor(
+            [bad[i % 3] for i in range(k)], dtype=torch.int32
+        )
+        dropped = (ids_bad < 0) | (ids_bad >= E)
+        n_valid = int((~dropped).sum())
+        counts, dest, src = permute_plan(ids_bad.cuda(), E)
+        assert int(counts.sum()) == n_valid and torch.equal(
+            dest.cpu().view(-1) < 0, dropped.view(-1)
+        )
+        _, _, _, dest_pad, pos_pad = permute_plan_dual(ids_bad.cuda(), E)
+        assert torch.equal(dest_pad.cpu().view(-1) < 0, dropped.view(-1))
+        assert torch.all(pos_pad[n_valid:] == -1) and torch.all(pos_pad[:n_valid] >= 0)
+        x4, sf = _quantized(x)
+        Tk, Tk_pad = T * k, padded_rows_bound(T, k, E)
+        Tk_a, Tk_sf = Tk + DENSE_TAIL, Tk_pad + DENSE_TAIL
+        unit = _placeholder(x.device)
+        x_perm4, big4 = _guarded(Tk_a * (H // 2))
+        x_perm_sf, bigsf = _guarded(mx_sf_numel(Tk_sf, H))
+        x_perm4 = x_perm4.view(Tk_a, H // 2)
+        get_compiled_scatter_fp4(
+            k, warps_per_row(Tk, H // 32, sm_count), "128x4", False, True, MX_BLOCK
+        )(
+            x4,
+            sf,
+            unit,
+            dest.reshape(-1),
+            dest_pad.reshape(-1),
+            x_perm4,
+            x_perm_sf,
+            unit,
+            Tk,
+            H // 2,
+            mx_sf_cols(H),
+        )
+        torch.cuda.synchronize()
+        assert _guards_untouched(big4) and _guards_untouched(bigsf)
+        assert bool((x_perm4[n_valid:] == 0xAB).all())
+        assert torch.equal(x_perm4[:n_valid], x4[(src[:n_valid] // k).long()])
+        a_sf_q = torch.randint(
+            0, 255, (mx_sf_numel(Tk, I),), dtype=torch.uint8, device="cuda"
+        )
+        a_sf_s, big_s = _guarded(mx_sf_numel(Tk_sf, I))
+        get_compiled_scatter_sf(1, True)(
+            a_sf_q, unit, pos_pad, a_sf_s, unit, Tk, mx_sf_cols(I)
+        )
+        torch.cuda.synchronize()
+        assert _guards_untouched(big_s)
+        # the op
+        out = layer(_routed_pack(x, ids_bad.cuda(), wts.cuda()), W_pack)
+        ids_ref = torch.where(dropped, torch.zeros_like(ids), ids)
+        wts_ref = torch.where(dropped, torch.zeros_like(wts), wts)
+        ref = _reference_ffn(
+            _quantized(x, check=False),
+            ids_ref.cuda(),
+            wts_ref,
+            W,
+            chain,
+            expert_classes_mx(family),
+        )
+        assert torch.equal(bits(out.cpu()), bits(ref)), T
+        assert torch.all(out[rows[0]] == 0)
+        for path in ("dense", "padded"):
+            out_api, im = fused_moe_mxfp4(
+                x, ids_bad.cuda(), wts.cuda(), W, path=path, return_intermediates=True
+            )
+            assert torch.equal(bits(out_api), bits(out)), path
+            assert torch.equal(
+                bits(out_api.cpu()), bits(R.combine_cpu(im["y"], im["dest"], wts))
+            ), path
+        whole = (~dropped.any(dim=1)).cuda()
+        ref_whole = layer(_routed_pack(x, ids.cuda(), wts.cuda()), W_pack)
+        assert torch.equal(bits(out[whole]), bits(ref_whole[whole]))
+    T, k, E = 37, 4, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=44)
+    W = _weights_of(_weights(w1, w2))
+    ids_none = torch.full((T, k), -1, dtype=torch.int32, device="cuda")
+    wts_any = torch.rand(T, k, device="cuda")
+    out, im = fused_moe_mxfp4(x, ids_none, wts_any, W, return_intermediates=True)
+    torch.cuda.synchronize()
+    assert (
+        torch.all(out == 0)
+        and int(im["counts"].sum()) == 0
+        and torch.all(im["dest"] == -1)
+    )
+    for swap in (False, True):
+        c1, c2 = default_configs_mxfp4(
+            T,
+            k,
+            H,
+            I,
+            E,
+            expert_classes_mx(family),
+            W.chain1,
+            W.chain2,
+            sm_count,
+            family,
+            swap=swap,
+        )
+        assert c1.swap_ab == swap and c2.swap_ab == swap
+        assert torch.all(
+            fused_moe_mxfp4(x, ids_none, wts_any, W, config1=c1, config2=c2) == 0
+        ), swap
+    assert torch.all(fused_moe_mxfp4(x, ids_none, wts_any, W, path="padded") == 0)

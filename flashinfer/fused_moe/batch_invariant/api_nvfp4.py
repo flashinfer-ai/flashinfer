@@ -20,6 +20,8 @@ atom; the padding rows are zero-filled, computed and never stored).
 
 from __future__ import annotations
 
+import dataclasses
+
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple, Union
 
@@ -374,6 +376,9 @@ def grouped_gemm_nvfp4(
     dense_a: bool = False,
     out_sf: Optional[torch.Tensor] = None,
     aux: Optional[torch.Tensor] = None,
+    *,
+    src: Optional[torch.Tensor] = None,
+    k_div: int = 1,
 ) -> torch.Tensor:
     """``out[p] = chain(a4[p] @ w4[e(p)].T, alpha[e(p)], pts[p])`` on the expert segments ``counts`` (int32 ``[E]``, group
     order = expert order). Padded packing (default): ``a4 [rows, K/2]`` uint8 with every group's rows starting at a multiple
@@ -387,7 +392,11 @@ def grouped_gemm_nvfp4(
     ``DENSE_TAIL``). The persistent grid is a launch argument: the device's co-resident cluster capacity for the record. The
     static class: GEMM1 with ``chain.out_fmt == "nvfp4"`` writes the packed codes to ``out`` (uint8 ``[rows, N_out/2]``) and the
     scale bytes to ``out_sf`` (the flat 128x4 buffer of the (padded) rows) with ``aux = gs2 [E]``; GEMM2 with ``chain.scale ==
-    "w4a4s"`` takes ``aux = inv2 [E]`` (``a_pts`` unread)."""
+    "w4a4s"`` takes ``aux = inv2 [E]`` (``a_pts`` unread). The gather record (``config.gather_a``: a swapped record whose
+    body reads the token rows itself): ``a4 [T, K/2]`` the unpermuted token rows, ``a_sf`` their scale factors (the flat 128x4
+    buffer of the ``T`` rows, or the linear ``[T, K/16]`` bytes), ``a_pts [T]`` (or one entry: the unit scale), ``src [>= Tk]``
+    int32 the plan's slot of every dense row (``src[p] // k_div`` its token), ``out [rows, n_out]`` given (it sizes the dense
+    rows); no permuted tensor, the same bits."""
     from .blocks.compile import (
         can_implement_grouped_blockscaled,
         can_implement_swapped_blockscaled,
@@ -397,6 +406,28 @@ def grouped_gemm_nvfp4(
 
     from .api import _check_grouped_chain, _check_grouped_operands, _grouped_out
 
+    if config.gather_a:
+        return _grouped_gemm_nvfp4_gather(
+            a4,
+            a_sf,
+            a_pts,
+            w4,
+            w_sf,
+            alpha,
+            counts,
+            config,
+            chain,
+            in_fmt,
+            out,
+            out_sf,
+            aux,
+            src,
+            k_div,
+        )
+    if src is not None:
+        raise ValueError(
+            "grouped_gemm_nvfp4: src belongs to the gather record (config.gather_a)"
+        )
     # the shared operand rules at the packed fp4 formats' alignment (16-byte rows of codes: whole scale-factor column groups);
     # the weight rows N in whole 8-row units (the 16-bit output's rows), the expert count under the group tables' bound
     rows, Kh, E, N, _ = _check_grouped_operands(
@@ -549,6 +580,162 @@ def grouped_gemm_nvfp4(
     return out
 
 
+def gather_sf_layout(a_sf: torch.Tensor, T: int, K: int, sf_vec: int = 16) -> str:
+    """The layout of a gather record's scale operand: the row-major linear bytes ``[T, K / sf_vec]`` or the flat 128x4 buffer."""
+    return (
+        "linear"
+        if a_sf.dim() == 2 and tuple(a_sf.shape) == (T, K // sf_vec)
+        else "128x4"
+    )
+
+
+def gather_form_ok(K: int, sf_src: str, sf_vec: int = 16) -> bool:
+    """The gather form's host rule on the scale source: the linear layout's rows are whole 4-byte groups (the kernel copies a
+    row's scales in 4-byte groups), the 128x4 buffer always."""
+    return sf_src == "128x4" or (K // sf_vec) % 4 == 0
+
+
+def _grouped_gemm_nvfp4_gather(
+    a4,
+    a_sf,
+    a_pts,
+    w4,
+    w_sf,
+    alpha,
+    counts,
+    config,
+    chain,
+    in_fmt,
+    out,
+    out_sf,
+    aux,
+    src,
+    k_div,
+) -> torch.Tensor:
+    """The gather record of :func:`grouped_gemm_nvfp4` (its operand rules, the token rows in place of the permuted rows; the
+    swapped body)."""
+    from .api import _check_grouped_chain, _check_grouped_operands, _grouped_out
+    from .blocks.compile import can_implement_swapped_blockscaled, get_compiled_swapped
+
+    T, Kh, E, N, _ = _check_grouped_operands(
+        "grouped_gemm_nvfp4",
+        a4,
+        w4,
+        counts,
+        a4.shape[0] if a4.dim() == 2 else None,
+        None,
+        torch.uint8,
+        ALIGN_NVFP4 // 2,
+        "packed fp4 uint8",
+        n_align=8,
+    )
+    K = 2 * Kh
+    if out is None or src is None:
+        raise ValueError(
+            "grouped_gemm_nvfp4: the gather record reads the token rows through the plan's map: src and out"
+        )
+    if (
+        src.dtype != torch.int32
+        or src.dim() != 1
+        or not src.is_contiguous()
+        or k_div < 1
+    ):
+        raise ValueError(
+            "grouped_gemm_nvfp4: src must be a contiguous int32 [>= Tk] and k_div >= 1"
+        )
+    sf_src = gather_sf_layout(a_sf, T, K)
+    if a_sf.dtype != torch.uint8 or (
+        sf_src == "128x4" and a_sf.numel() < sf_numel(T, K)
+    ):
+        raise ValueError(
+            "grouped_gemm_nvfp4: a_sf must hold the 128x4 swizzled scales of the T token rows or their linear [T, K/16] bytes"
+        )
+    if not gather_form_ok(K, sf_src):
+        raise ValueError(
+            "grouped_gemm_nvfp4: the linear scale layout's rows must be whole 4-byte groups (K a multiple of 64)"
+        )
+    if w_sf.dtype != torch.uint8 or w_sf.numel() < E * sf_numel(N, K):
+        raise ValueError(
+            "grouped_gemm_nvfp4: w_sf must hold E consecutive 128x4 swizzled scale buffers of (N, K)"
+        )
+    if (
+        alpha.dtype != torch.float32
+        or alpha.numel() != E
+        or a_pts.dtype != torch.float32
+        or a_pts.numel() not in (1, T)
+    ):
+        raise ValueError(
+            "grouped_gemm_nvfp4: alpha [E] and pts [T] (or one unit entry) must be float32"
+        )
+    if in_fmt not in NVFP4_FMTS or chunks_for(N, K, in_fmt) != 1:
+        raise ValueError(
+            "grouped_gemm_nvfp4: the grouped class takes unsplit expert weight shapes"
+        )
+    if not config.swap_ab or not can_implement_swapped_blockscaled(
+        config, N, K, E, chain, in_fmt
+    ):
+        raise ValueError(
+            f"grouped_gemm_nvfp4: gather record {config.describe()} does not implement ({N}, {K}, {E}, {chain}, {in_fmt})"
+        )
+    n_out = _check_grouped_chain("grouped_gemm_nvfp4", N, chain)
+    static = chain.needs_aux
+    rows = out.shape[0]
+    if chain.static_quant:
+        n_out //= 2
+        out_dtype = torch.uint8
+        if out_sf is None or out_sf.dtype != torch.uint8:
+            raise ValueError(
+                "grouped_gemm_nvfp4: the static class's GEMM1 takes out_sf, the flat 128x4 scale bytes of the padded rows"
+            )
+    else:
+        out_dtype = _OUT[chain.out_fmt]
+    if static:
+        if aux is None or aux.dtype != torch.float32 or aux.numel() != E:
+            raise ValueError(
+                "grouped_gemm_nvfp4: the static class's chains take aux, the per-expert static scales [E]"
+            )
+        if out_sf is None:
+            out_sf = _dummy_sf(a4.device)
+    out = _grouped_out("grouped_gemm_nvfp4", out, rows, n_out, out_dtype, a4.device)
+    if rows == 0 or T == 0:
+        return out
+    grid = min(
+        persistent_clusters(a4.device, config), launch_tile_bound(config, rows, E, N)
+    )
+    kernel = get_compiled_swapped(config, chain.at(in_fmt), sf_src=sf_src)
+    if static:
+        kernel(
+            a4.unsqueeze(-1),
+            a_sf.reshape(-1),
+            src,
+            k_div,
+            w4.permute(1, 2, 0),
+            w_sf.reshape(-1),
+            out,
+            out_sf.reshape(-1),
+            counts,
+            alpha.reshape(-1).contiguous(),
+            a_pts.reshape(-1).contiguous(),
+            aux.reshape(-1).contiguous(),
+            grid,
+        )
+    else:
+        kernel(
+            a4.unsqueeze(-1),
+            a_sf.reshape(-1),
+            src,
+            k_div,
+            w4.permute(1, 2, 0),
+            w_sf.reshape(-1),
+            out,
+            counts,
+            alpha.reshape(-1).contiguous(),
+            a_pts.reshape(-1).contiguous(),
+            grid,
+        )
+    return out
+
+
 def padded_rows_bound(T: int, k: int, E: int, align: int = GROUP_ALIGN) -> int:
     """An upper bound of the padded expanded row count ``sum_e roundup(counts[e], align)`` that does not read the device
     (CUDA-graph safe): every active expert pads at most ``align - 1`` rows."""
@@ -563,7 +750,12 @@ def permute_plan_dual(
     plus the positions with the groups padded to ``pad_align`` rows (``dest_pad[i]``) and the padded position of every dense
     row (``pos_pad[p]``): the dense packing's row map (A rows dense, scale factors and row scales at the padded positions)."""
     from .api import PLAN_MULTI_MIN_N
-    from .permute import PLAN_BLOCK, get_compiled_plan, get_compiled_plan_multi
+    from .permute import (
+        PLAN_BLOCK,
+        get_compiled_plan,
+        get_compiled_plan_multi,
+        plan_threads,
+    )
 
     T, k = experts.shape
     n = T * k
@@ -585,7 +777,7 @@ def permute_plan_dual(
             flat, counts, dest, src, dest_pad, pos_pad, hist_blk, n, E, nb
         )
     else:
-        get_compiled_plan(1, True, pad_align)(
+        get_compiled_plan(1, True, pad_align, plan_threads(n))(
             flat, counts, dest, src, dest_pad, pos_pad, n, E
         )
     return counts, dest.view(T, k), src, dest_pad.view(T, k), pos_pad
@@ -769,6 +961,7 @@ def fused_moe_nvfp4(
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     ] = None,
     round_scales: bool = False,
+    gather: Optional[bool] = None,
 ):
     """The W4A4 MoE FFN for pre-routed tokens: ``x`` bf16 ``[T, H]`` (quantized here per token with the class and
     ``gs_inv``) or the quantized triple ``(x4 [T, H/2] uint8, x_sf (128x4 swizzled, uint8), x_pts [T] f32)``;
@@ -781,11 +974,20 @@ def fused_moe_nvfp4(
     estimate at the grouped shape), True / False: the swapped / the padded body on both GEMMs (placements: the same bits); explicit records select the
     body themselves (a swapped record needs the dense path). ``plan``: the dense packing's precomputed plan, the outputs of
     :func:`route_plan_dual` after the ids and weights (``counts, dest, src, dest_pad, pos_pad``: the same integers as
-    :func:`permute_plan_dual`'s, one launch saved)."""
+    :func:`permute_plan_dual`'s, one launch saved). ``gather``: GEMM1's swapped records in their gather form (the body reads
+    the token rows through the plan's map: no scatter launch, no permuted tensor; the dense path) -- False excludes it, True
+    forces it, None (the default) applies the structural rule (:func:`~.schedule_nvfp4.gather_form_rule`: the narrow swapped
+    tile's gather form when the box form would scatter a pre-quantized input in a launch of its own); an explicit ``config1``
+    selects the form itself (``gather_a``)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import warps_per_row
-    from .permute_nvfp4 import get_compiled_scatter_fp4, get_compiled_scatter_sf
-    from .schedule_nvfp4 import default_configs_nvfp4
+    from .permute_nvfp4 import (
+        get_compiled_scatter_fp4,
+        get_compiled_scatter_sf,
+        scatter_lanes,
+        scatter_sf_lanes,
+    )
+    from .schedule_nvfp4 import default_configs_nvfp4, gather_form_rule
 
     if path not in PATHS:
         raise ValueError(f"fused_moe_nvfp4: path must be one of {PATHS}, not {path!r}")
@@ -877,6 +1079,7 @@ def fused_moe_nvfp4(
     chain1, chain2 = w.chain1, w.chain2
     static = w.static
     if config1 is None or config2 is None:
+        ranked1 = config1 is None
         c1, c2 = default_configs_nvfp4(
             T,
             k,
@@ -889,12 +1092,25 @@ def fused_moe_nvfp4(
             sm_count,
             family,
             swap=swap if path == "dense" else False,
+            gather=(gather or False) if path == "dense" else False,
         )
         config1, config2 = config1 or c1, config2 or c2
+        if ranked1 and gather is None and path == "dense":
+            # the rule: a standalone scatter launch (a pre-quantized input) folded into the narrow swapped tile's gather form
+            config1 = gather_form_rule(config1, x4 is not None)
     if path != "dense" and (swap or config1.swap_ab or config2.swap_ab):
         raise ValueError(
             "fused_moe_nvfp4: the swapped decode body reads the dense packing (path='dense')"
         )
+    if config2.gather_a or (path != "dense" and (gather or config1.gather_a)):
+        raise ValueError(
+            "fused_moe_nvfp4: the gather form is GEMM1's on the dense packing (path='dense')"
+        )
+    gather1 = config1.gather_a
+    if gather1 and not gather_form_ok(H, "linear" if x_rows is None else "128x4"):
+        # the linear scale layout's rows are not whole 4-byte groups: the box form through the scatter
+        config1 = dataclasses.replace(config1, gather_a=False)
+        gather1 = False
     if path != "dense" and plan is not None:
         raise ValueError(
             "fused_moe_nvfp4: the precomputed plan is the dense packing's (path='dense')"
@@ -910,34 +1126,45 @@ def fused_moe_nvfp4(
         # the fp4 rows back to back (a tail past Tk for the last tiles' TMA boxes); the scale factors and the row scales at
         # the padded positions (one 128x4 atom per (expert, 128-row tile); a tail past Tk_pad likewise)
         Tk_a, Tk_sf = Tk + DENSE_TAIL, Tk_pad + DENSE_TAIL
-        x_perm4 = torch.empty(Tk_a, H // 2, dtype=torch.uint8, device=dev)
-        x_perm_sf = torch.empty(sf_numel(Tk_sf, H), dtype=torch.uint8, device=dev)
-        x_perm_pts = torch.empty(Tk_sf, dtype=torch.float32, device=dev)
-        if Tk and x4 is None:
-            quantize_scatter_rows(
-                x_rows,
-                gsi,
-                dest.reshape(-1),
-                dest_pad.reshape(-1),
-                k,
-                (x_perm4, x_perm_sf, x_perm_pts),
-            )
-        elif Tk:
-            get_compiled_scatter_fp4(
-                k, warps_per_row(Tk, H // 32, sm_count), sf_src, unit_pts
-            )(
-                x4,
-                x_sf,
-                x_pts,
-                dest.reshape(-1),
-                dest_pad.reshape(-1),
-                x_perm4,
-                x_perm_sf,
-                x_perm_pts,
-                Tk,
-                H // 2,
-                pcols_h,
-            )
+        x_perm4 = x_perm_sf = x_perm_pts = None
+        if gather1:
+            # the gather form: GEMM1 reads the token rows through the plan's map; a bf16 input is quantized over its T rows
+            if x4 is None:
+                x4, x_sf, x_pts = quantize_activations(x_rows, gsi)
+            g_a, g_pts = x4, x_pts
+            g_sf = x_sf.view(T, H // 16) if sf_src == "linear" else x_sf
+        else:
+            x_perm4 = torch.empty(Tk_a, H // 2, dtype=torch.uint8, device=dev)
+            x_perm_sf = torch.empty(sf_numel(Tk_sf, H), dtype=torch.uint8, device=dev)
+            x_perm_pts = torch.empty(Tk_sf, dtype=torch.float32, device=dev)
+            if Tk and x4 is None:
+                quantize_scatter_rows(
+                    x_rows,
+                    gsi,
+                    dest.reshape(-1),
+                    dest_pad.reshape(-1),
+                    k,
+                    (x_perm4, x_perm_sf, x_perm_pts),
+                )
+            elif Tk:
+                wpr = warps_per_row(Tk, H // 32, sm_count)
+                get_compiled_scatter_fp4(
+                    k, wpr, sf_src, unit_pts, **scatter_lanes(H // 2, pcols_h, wpr)
+                )(
+                    x4,
+                    x_sf,
+                    x_pts,
+                    dest.reshape(-1),
+                    dest_pad.reshape(-1),
+                    x_perm4,
+                    x_perm_sf,
+                    x_perm_pts,
+                    Tk,
+                    H // 2,
+                    pcols_h,
+                )
+            g_a, g_sf, g_pts = x_perm4, x_perm_sf, x_perm_pts
+        g_src = src if gather1 else None
         a4 = torch.empty(Tk_a, I // 2, dtype=torch.uint8, device=dev)
         a_sf_pad = torch.empty(sf_numel(Tk_sf, I), dtype=torch.uint8, device=dev)
         a = a_sf = a_pts = None
@@ -945,9 +1172,9 @@ def fused_moe_nvfp4(
             # the static class: GEMM1's epilogue writes the intermediate's codes (dense rows) and scale bytes (the padded
             # positions) itself -- no bf16 intermediate, no quantizer launch; GEMM2's scale is mul(alpha2[e], inv2[e])
             grouped_gemm_nvfp4(
-                x_perm4,
-                x_perm_sf,
-                x_perm_pts,
+                g_a,
+                g_sf,
+                g_pts,
                 w.w1,
                 w.w1_sf,
                 w.w1_alpha,
@@ -959,16 +1186,20 @@ def fused_moe_nvfp4(
                 dense_a=True,
                 out_sf=a_sf_pad,
                 aux=w.gs2,
+                src=g_src,
+                k_div=k,
             )
             a_pts_pad = (
                 x_perm_pts  # GEMM2's row-scale operand is unread by the static chain
+                if x_perm_pts is not None
+                else torch.empty(Tk_sf, dtype=torch.float32, device=dev)
             )
         else:
             a = torch.empty(Tk_a, I, dtype=torch.bfloat16, device=dev)
             grouped_gemm_nvfp4(
-                x_perm4,
-                x_perm_sf,
-                x_perm_pts,
+                g_a,
+                g_sf,
+                g_pts,
                 w.w1,
                 w.w1_sf,
                 w.w1_alpha,
@@ -978,6 +1209,8 @@ def fused_moe_nvfp4(
                 in1,
                 out=a,
                 dense_a=True,
+                src=g_src,
+                k_div=k,
             )
             # the class's second pass over the live rows: the codes stay dense; the scale factors and the row scales are re-tiled
             # to the padded positions for GEMM2's atom-aligned scale boxes (a byte move)
@@ -989,7 +1222,7 @@ def fused_moe_nvfp4(
             elif Tk:
                 a_sf = torch.empty(sf_numel(Tk, I), dtype=torch.uint8, device=dev)
                 _, _, a_pts = quantize_activations(a[:Tk], gsi, out=(a4[:Tk], a_sf))
-                get_compiled_scatter_sf(1)(
+                get_compiled_scatter_sf(1, spl=scatter_sf_lanes(pcols_i))(
                     a_sf, a_pts, pos_pad, a_sf_pad, a_pts_pad, Tk, pcols_i
                 )
         y = torch.empty(Tk_a, H, dtype=torch.bfloat16, device=dev)
@@ -1022,9 +1255,11 @@ def fused_moe_nvfp4(
                 x4=x4,
                 x_sf=x_sf,
                 x_pts=x_pts,
-                x_perm4=x_perm4[:Tk],
-                x_perm_sf=x_perm_sf[: sf_numel(Tk_pad, H)],
-                x_perm_pts=x_perm_pts[:Tk_pad],
+                x_perm4=None if x_perm4 is None else x_perm4[:Tk],
+                x_perm_sf=None
+                if x_perm_sf is None
+                else x_perm_sf[: sf_numel(Tk_pad, H)],
+                x_perm_pts=None if x_perm_pts is None else x_perm_pts[:Tk_pad],
                 a=None if static else a[:Tk],
                 a4=a4[:Tk],
                 a_sf=a_sf,
@@ -1040,7 +1275,12 @@ def fused_moe_nvfp4(
             )
         return out
     # the padded packing: every group's rows start at a 128-row atom; the padding rows are zero (computed, never stored)
-    from .permute import get_compiled_plan, get_compiled_plan_multi, PLAN_BLOCK
+    from .permute import (
+        PLAN_BLOCK,
+        get_compiled_plan,
+        get_compiled_plan_multi,
+        plan_threads,
+    )
     from .api import PLAN_MULTI_MIN_N
 
     n = Tk
@@ -1057,15 +1297,18 @@ def fused_moe_nvfp4(
             flat, counts, dest, src, dest, dest, hist_blk, n, E, nb
         )
     else:
-        get_compiled_plan(GROUP_ALIGN, False)(flat, counts, dest, src, dest, dest, n, E)
+        get_compiled_plan(GROUP_ALIGN, False, threads=plan_threads(n))(
+            flat, counts, dest, src, dest, dest, n, E
+        )
     dest = dest.view(T, k)
     x_perm4 = torch.zeros(Tk_pad, H // 2, dtype=torch.uint8, device=dev)
     x_perm_sf = torch.zeros(sf_numel(Tk_pad, H), dtype=torch.uint8, device=dev)
     x_perm_pts = torch.zeros(Tk_pad, dtype=torch.float32, device=dev)
     if Tk:
         flat_dest = dest.reshape(-1)
+        wpr = warps_per_row(Tk, H // 32, sm_count)
         get_compiled_scatter_fp4(
-            k, warps_per_row(Tk, H // 32, sm_count), sf_src, unit_pts
+            k, wpr, sf_src, unit_pts, **scatter_lanes(H // 2, pcols_h, wpr)
         )(
             x4,
             x_sf,

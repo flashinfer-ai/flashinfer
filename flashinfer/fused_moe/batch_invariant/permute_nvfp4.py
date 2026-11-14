@@ -20,6 +20,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint8, Uint32
 
 from ...batch_invariant import jit
+from . import pdl
 from .permute import LANES, WARPS
 
 MODULE = "batch_invariant_moe"
@@ -53,17 +54,22 @@ class ScatterFp4Kernel:
         unit_pts: bool = False,
         no_pts: bool = False,
         block: int = 16,
+        cpl: int = 1,
+        spl: int = 1,
     ):
         """``sf_src``: the source scale factors' layout -- ``"128x4"`` (the quantizer's swizzled buffer) or ``"linear"`` (row-major
         ``[T, K / block]`` bytes, the layout of the per-tensor activation pack of the TRTLLM backends: the kernel assembles each
         4-byte group of the destination atom from the row's bytes, a zero past the row's last block); ``unit_pts``: the rows'
         per-token scales are one (the per-tensor pack: nothing to read, the destination gets ``1.0``); ``no_pts``: the class
         carries no per-token scale (the MX classes: nothing is read or stored); ``block``: the elements per scale of the
-        linear source layout. Placements of the same bytes."""
+        linear source layout; ``cpl`` / ``spl``: a lane's 16-byte chunks and 4-byte scale groups per row (static bounds from
+        the row width and ``wpr``, :func:`scatter_lanes`; the tail predicated), so a row's loads are all issued before its
+        stores. Placements of the same bytes."""
         assert wpr >= 1 and wpr & (wpr - 1) == 0, wpr
         assert sf_src in ("128x4", "linear"), sf_src
+        assert cpl >= 1 and spl >= 1, (cpl, spl)
         self.k, self.wpr, self.sf_src, self.unit_pts = k, wpr, sf_src, unit_pts
-        self.no_pts, self.block = no_pts, block
+        self.no_pts, self.block, self.cpl, self.spl = no_pts, block, cpl, spl
 
     @cute.jit
     def __call__(
@@ -111,6 +117,7 @@ class ScatterFp4Kernel:
         gdim, _, _ = cute.arch.grid_dim()
         lane = cute.arch.lane_idx()
         cute.arch.griddepcontrol_wait()
+        pdl.trigger_one_wave()
         g = bidx * WARPS + tidx // LANES
         w = g // wpr  # this warp's row group
         part = g % wpr  # its slab phase within the row
@@ -122,8 +129,7 @@ class ScatterFp4Kernel:
         )
         n_vec = B // Int32(16)
         step = wpr * Int32(LANES)  # chunk j = (jj * wpr + part) * LANES + lane
-        n_mine = (n_vec - lane - part * Int32(LANES) + step - Int32(1)) // step
-        frag = cute.make_rmem_tensor((16,), Uint8)
+        frags = [cute.make_rmem_tensor((16,), Uint8) for _ in range(self.cpl)]
         src32 = cute.make_tensor(
             cute.recast_ptr(mSf.iterator, dtype=Uint32),
             cute.make_layout((cute.size(mSf) // 4,)),
@@ -133,47 +139,102 @@ class ScatterFp4Kernel:
             cute.make_layout((cute.size(mSfp) // 4,)),
         )
         n_groups = pcols // Int32(SF_COL_TILE)
-        n_sf = (n_groups - lane - part * Int32(LANES) + step - Int32(1)) // step
         nb = B // Int32(
             self.block // 2
         )  # scale blocks per row (K / block): the linear row's bytes
+        # this lane's chunks and scale groups of a row: slab c of its phase (static bounds, the tail predicated), and their
+        # dynamic counts for the chunks past the bounds
+        js = [(Int32(c) * wpr + part) * Int32(LANES) + lane for c in range(self.cpl)]
+        gs = [(Int32(c) * wpr + part) * Int32(LANES) + lane for c in range(self.spl)]
+        n_mine = (n_vec - lane - part * Int32(LANES) + step - Int32(1)) // step
+        n_sf = (n_groups - lane - part * Int32(LANES) + step - Int32(1)) // step
         if w < stride:
+            # the positions of the next row are loaded while this row moves (the index clamped: in bounds past the last row)
+            last = Tk - Int32(1)
+            p_next = mDest[cutlass.min(w, last)]
+            ps_next = mDestSf[cutlass.min(w, last)]
             for r in cutlass.range(0, n_rows, 1):
                 i = w + r * stride
                 t = i // Int32(self.k)
-                p = mDest[i]
-                ps = mDestSf[i]
-                if cutlass.const_expr(not self.no_pts):
-                    if (lane == 0) & (part == 0):
-                        if cutlass.const_expr(self.unit_pts):
-                            mPtsp[ps] = Float32(1.0)
-                        else:
-                            mPtsp[ps] = mPts[t]
-                row_x = mX[(t, None)]
-                row_p = mXp[(p, None)]
-                for jj in cutlass.range(0, n_mine, 1):
-                    j = (jj * wpr + part) * Int32(LANES) + lane
-                    cute.copy(atom, cute.local_tile(row_x, (16,), (j,)), frag)
-                    cute.copy(atom, frag, cute.local_tile(row_p, (16,), (j,)))
-                for jj in cutlass.range(0, n_sf, 1):
-                    gg = (jj * wpr + part) * Int32(LANES) + lane
-                    if cutlass.const_expr(self.sf_src == "linear"):
-                        # the row's bytes 4gg .. 4gg + 3 assembled little-endian into the atom's 4-byte group (zero past the
-                        # row's blocks)
-                        base = t.to(Int64) * nb.to(Int64) + Int64(4) * gg.to(Int64)
+                p = p_next
+                ps = ps_next
+                i_next = cutlass.min(i + stride, last)
+                p_next = mDest[i_next]
+                ps_next = mDestSf[i_next]
+                # a dropped slot (dest -1: an expert id outside [0, E)) has no row: nothing is stored for it
+                live = p >= Int32(0)
+                p = cutlass.max(p, Int32(0))
+                ps = cutlass.max(ps, Int32(0))
+                if live:
+                    if cutlass.const_expr(not self.no_pts):
+                        if (lane == 0) & (part == 0):
+                            if cutlass.const_expr(self.unit_pts):
+                                mPtsp[ps] = Float32(1.0)
+                            else:
+                                mPtsp[ps] = mPts[t]
+                    row_x = mX[(t, None)]
+                    row_p = mXp[(p, None)]
+                    for c in cutlass.range_constexpr(self.cpl):
+                        if js[c] < n_vec:
+                            cute.copy(
+                                atom, cute.local_tile(row_x, (16,), (js[c],)), frags[c]
+                            )
+                    words = []
+                    for c in cutlass.range_constexpr(self.spl):
                         word = Uint32(0)
-                        for c in cutlass.range_constexpr(4):
-                            col = Int32(4) * gg + Int32(c)
-                            if col < nb:
-                                word = word | (
-                                    mSf[base + Int64(c)].to(Uint32) << Uint32(8 * c)
+                        if gs[c] < n_groups:
+                            if cutlass.const_expr(self.sf_src == "linear"):
+                                # the row's bytes 4gg .. 4gg + 3 assembled little-endian into the atom's 4-byte group (zero past
+                                # the row's blocks)
+                                base = t.to(Int64) * nb.to(Int64) + Int64(4) * gs[c].to(
+                                    Int64
                                 )
+                                for b in cutlass.range_constexpr(4):
+                                    col = Int32(4) * gs[c] + Int32(b)
+                                    if col < nb:
+                                        word = (
+                                            word
+                                            | (
+                                                mSf[base + Int64(b)].to(Uint32)
+                                                << Uint32(8 * b)
+                                            )
+                                        ).to(Uint32)
+                            else:
+                                word = src32[_sf_group_offset(t, gs[c], pcols) // 4].to(
+                                    Uint32
+                                )
+                        words.append(word)
+                    for c in cutlass.range_constexpr(self.cpl):
+                        if js[c] < n_vec:
+                            cute.copy(
+                                atom, frags[c], cute.local_tile(row_p, (16,), (js[c],))
+                            )
+                    for c in cutlass.range_constexpr(self.spl):
+                        if gs[c] < n_groups:
+                            dst32[_sf_group_offset(ps, gs[c], pcols) // 4] = words[c]
+                    # the chunks and groups past the static bounds (a caller that did not size them): one at a time
+                    for jj in cutlass.range(Int32(self.cpl), n_mine, 1):
+                        j = (jj * wpr + part) * Int32(LANES) + lane
+                        cute.copy(atom, cute.local_tile(row_x, (16,), (j,)), frags[0])
+                        cute.copy(atom, frags[0], cute.local_tile(row_p, (16,), (j,)))
+                    for jj in cutlass.range(Int32(self.spl), n_sf, 1):
+                        gg = (jj * wpr + part) * Int32(LANES) + lane
+                        word = Uint32(0)
+                        if cutlass.const_expr(self.sf_src == "linear"):
+                            base = t.to(Int64) * nb.to(Int64) + Int64(4) * gg.to(Int64)
+                            for b in cutlass.range_constexpr(4):
+                                col = Int32(4) * gg + Int32(b)
+                                if col < nb:
+                                    word = (
+                                        word
+                                        | (
+                                            mSf[base + Int64(b)].to(Uint32)
+                                            << Uint32(8 * b)
+                                        )
+                                    ).to(Uint32)
+                        else:
+                            word = src32[_sf_group_offset(t, gg, pcols) // 4].to(Uint32)
                         dst32[_sf_group_offset(ps, gg, pcols) // 4] = word
-                    else:
-                        dst32[_sf_group_offset(ps, gg, pcols) // 4] = src32[
-                            _sf_group_offset(t, gg, pcols) // 4
-                        ]
-        cute.arch.griddepcontrol_launch_dependents()
 
 
 class ScatterSfKernel:
@@ -182,9 +243,11 @@ class ScatterSfKernel:
     factors and row scales from the dense rows to the padded positions (``k = 1``, ``dest`` the padded position of every
     dense row). One lane per 4-byte group, one warp per row, the warps of a capped grid striding over the rows."""
 
-    def __init__(self, k: int, no_pts: bool = False):
-        """``no_pts``: the class carries no per-token scale (the MX classes): the row scales are neither read nor stored."""
-        self.k, self.no_pts = k, no_pts
+    def __init__(self, k: int, no_pts: bool = False, spl: int = 1):
+        """``no_pts``: the class carries no per-token scale (the MX classes): the row scales are neither read nor stored;
+        ``spl``: a lane's 4-byte groups per row (a static bound, :func:`scatter_sf_lanes`; the tail predicated)."""
+        assert spl >= 1, spl
+        self.k, self.no_pts, self.spl = k, no_pts, spl
 
     @cute.jit
     def __call__(
@@ -221,6 +284,7 @@ class ScatterSfKernel:
         gdim, _, _ = cute.arch.grid_dim()
         lane = cute.arch.lane_idx()
         cute.arch.griddepcontrol_wait()
+        pdl.trigger_one_wave()
         w = bidx * WARPS + tidx // LANES
         stride = gdim * WARPS
         n_rows = cutlass.max((Tk - w + stride - Int32(1)) // stride, Int32(0))
@@ -233,20 +297,55 @@ class ScatterSfKernel:
             cute.make_layout((cute.size(mSfp) // 4,)),
         )
         n_groups = pcols // Int32(SF_COL_TILE)
+        gs = [Int32(c) * Int32(LANES) + lane for c in range(self.spl)]
         n_mine = (n_groups - lane + Int32(LANES - 1)) // Int32(LANES)
-        for r in cutlass.range(0, n_rows, 1):
-            i = w + r * stride
-            t = i // Int32(self.k)
-            p = mDest[i]
-            if cutlass.const_expr(not self.no_pts):
-                if lane == 0:
-                    mPtsp[p] = mPts[t]
-            for jj in cutlass.range(0, n_mine, 1):
-                g = jj * LANES + lane
-                dst32[_sf_group_offset(p, g, pcols) // 4] = src32[
-                    _sf_group_offset(t, g, pcols) // 4
-                ]
-        cute.arch.griddepcontrol_launch_dependents()
+        if w < stride:
+            last = Tk - Int32(1)
+            p_next = mDest[cutlass.min(w, last)]
+            for r in cutlass.range(0, n_rows, 1):
+                i = w + r * stride
+                t = i // Int32(self.k)
+                p = p_next
+                p_next = mDest[cutlass.min(i + stride, last)]
+                # a row without a padded position (the plan marks it -1: a dropped slot's share of the buffer) stores nothing
+                live = p >= Int32(0)
+                p = cutlass.max(p, Int32(0))
+                if live:
+                    if cutlass.const_expr(not self.no_pts):
+                        if lane == 0:
+                            mPtsp[p] = mPts[t]
+                    words = []
+                    for c in cutlass.range_constexpr(self.spl):
+                        word = Uint32(0)
+                        if gs[c] < n_groups:
+                            word = src32[_sf_group_offset(t, gs[c], pcols) // 4].to(
+                                Uint32
+                            )
+                        words.append(word)
+                    for c in cutlass.range_constexpr(self.spl):
+                        if gs[c] < n_groups:
+                            dst32[_sf_group_offset(p, gs[c], pcols) // 4] = words[c]
+                    for jj in cutlass.range(
+                        Int32(self.spl), n_mine, 1
+                    ):  # the groups past the static bound
+                        g = jj * Int32(LANES) + lane
+                        dst32[_sf_group_offset(p, g, pcols) // 4] = src32[
+                            _sf_group_offset(t, g, pcols) // 4
+                        ]
+
+
+def scatter_lanes(B: int, pcols: int, wpr: int) -> dict:
+    """The static per-lane counts of a row scatter at ``B`` bytes per row, ``pcols`` scale columns and ``wpr`` warps per row:
+    ``cpl`` 16-byte chunks and ``spl`` 4-byte scale groups per lane (the ceilings; a placement of the same bytes)."""
+    return {
+        "cpl": max(1, -(-(B // 16) // (wpr * LANES))),
+        "spl": max(1, -(-(pcols // SF_COL_TILE) // (wpr * LANES))),
+    }
+
+
+def scatter_sf_lanes(pcols: int) -> int:
+    """The static 4-byte groups per lane of the scale-factor re-tiling (one warp per row)."""
+    return max(1, -(-(pcols // SF_COL_TILE) // LANES))
 
 
 def scatter_grid(Tk: Int32) -> Int32:
@@ -263,6 +362,8 @@ def get_compiled_scatter_fp4(
     unit_pts: bool = False,
     no_pts: bool = False,
     block: int = 16,
+    cpl: int = 1,
+    spl: int = 1,
 ) -> Any:
     """``kernel(x4 [T, B] u8, sf [n_src] u8, pts [T] f32, dest [T k] i32, dest_sf [T k] i32, x_perm [rows, B] u8, sf_perm
     [n_dst] u8, pts_perm [rows_sf] f32, Tk, B, pcols)``, ``B % 16 == 0``; ``wpr`` warps per row (``warps_per_row``); ``sf_src``
@@ -317,7 +418,7 @@ def get_compiled_scatter_fp4(
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            ScatterFp4Kernel(k, wpr, sf_src, unit_pts, no_pts, block),
+            ScatterFp4Kernel(k, wpr, sf_src, unit_pts, no_pts, block, cpl, spl),
             x_fake,
             sf_fake,
             pts_fake,
@@ -338,6 +439,7 @@ def get_compiled_scatter_fp4(
         jit.sanitize_symbol_name(
             f"moe_scatter_fp4_k{k}"
             + (f"_w{wpr}" if wpr > 1 else "")
+            + f"_c{cpl}_s{spl}"
             + ("_lin" if sf_src == "linear" else "")
             + ("_unit" if unit_pts else "")
             + ("_nopts" if no_pts else "")
@@ -348,9 +450,10 @@ def get_compiled_scatter_fp4(
 
 
 @functools.cache
-def get_compiled_scatter_sf(k: int, no_pts: bool = False) -> Any:
+def get_compiled_scatter_sf(k: int, no_pts: bool = False, spl: int = 1) -> Any:
     """``kernel(sf [n_src] u8, pts [T] f32, dest [T k] i32, sf_perm [n_dst] u8, pts_perm [rows_sf] f32, Tk, pcols)``;
-    ``no_pts``: the per-token scales are neither read nor stored (1-element placeholders)."""
+    ``no_pts``: the per-token scales are neither read nor stored (1-element placeholders); ``spl``: a lane's groups per row
+    (:func:`scatter_sf_lanes`)."""
 
     def compile_fn():
         sym_s, sym_t, sym_n, sym_sp, sym_p = (
@@ -373,7 +476,7 @@ def get_compiled_scatter_sf(k: int, no_pts: bool = False) -> Any:
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            ScatterSfKernel(k, no_pts),
+            ScatterSfKernel(k, no_pts, spl),
             sf_fake,
             pts_fake,
             d_fake,
@@ -387,6 +490,8 @@ def get_compiled_scatter_sf(k: int, no_pts: bool = False) -> Any:
 
     return jit.build_and_load(
         MODULE,
-        jit.sanitize_symbol_name(f"moe_scatter_sf_k{k}" + ("_nopts" if no_pts else "")),
+        jit.sanitize_symbol_name(
+            f"moe_scatter_sf_k{k}" + ("_nopts" if no_pts else "") + f"_s{spl}"
+        ),
         compile_fn,
     )
