@@ -256,6 +256,13 @@ class SwappedGroupedGemm:
             "the gather record is the block-scaled classes'",
             knobs,
         )
+        # the block-scaled gather form reads 4-bit token rows (the fp4 pairs: the token box one swizzle atom of K); the mixed
+        # operand block's 8-bit tokens against its 4-bit weights take the box form
+        assert not gather or not self.operands.block_scaled or not self.operands.mixed, (
+            "the block-scaled gather form is the fp4 pairs'; the mixed classes read the token box",
+            knobs,
+            self.in_fmt,
+        )
         assert sf_src in ("128x4", "linear"), sf_src
         self.knobs, self.chain, self.gather, self.sf_src = knobs, chain, gather, sf_src
         self.token_tile, self.weight_tile = knobs.tile_n, knobs.tile_m

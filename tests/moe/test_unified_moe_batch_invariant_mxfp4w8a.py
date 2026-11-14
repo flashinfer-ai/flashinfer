@@ -2181,6 +2181,7 @@ def test_mixed_classes_run_on_the_unified_bodies():
     )
     from flashinfer.fused_moe.batch_invariant.blocks.swap import (
         SwappedGroupedGemm,
+        epi_warpgroups_of,
         is_swapped_record,
     )
     from flashinfer.fused_moe.batch_invariant.mx_permute import MODULE as SCATTER_MODULE
@@ -2216,7 +2217,20 @@ def test_mixed_classes_run_on_the_unified_bodies():
         for sw in swapped_knobs_mx(fmt):
             assert is_swapped_record(sw, fmt)
             s = SwappedGroupedGemm(sw, plain)
-            assert s.operands.mixed and s.sf_warp == 4 and s.k_block == 0
+            assert s.operands.mixed and s.k_block == 0
+            # the shared transposed epilogue runs over the record's warpgroups (one per eight-token subtile, at most four);
+            # the scale-factor warp, the MMA warp and the TMA warp follow them
+            assert s.epi_wgs == epi_warpgroups_of(plain, sw.tile_n) == max(
+                1, min(4, sw.tile_n // 8)
+            )
+            assert (s.sf_warp, s.mma_warp, s.tma_warp) == (
+                4 * s.epi_wgs,
+                4 * s.epi_wgs + 1,
+                4 * s.epi_wgs + 2,
+            )
+            # the fused requantization runs its own transposed epilogue on one warpgroup
+            sq = SwappedGroupedGemm(sw, quant)
+            assert (sq.epi_wgs, sq.sf_warp) == (1, 4)
         gran = 128 if fmt == "mxfp4w8a" else 32
         assert C.blockscaled_k_align(fmt) == gran
         assert C.can_implement_grouped_blockscaled(dense, 256, 2048, 8, quant, fmt)
@@ -2245,12 +2259,19 @@ def test_mixed_classes_run_on_the_unified_bodies():
     assert C.kernel_name(
         dense, MxChain("glu", "silu", "mxfp8", (), "mxfp4w8a"), packing="dense"
     ).startswith("grouped_mxfp4w8a_densea_swiglu_mxfp8_")
+    # the plain chain's 16-token record: the record's k-block, then the two-warpgroup epilogue's suffix
     name = C.swapped_kernel_name(
         swapped_knobs_mx("mxfp4w8a_k64")[1], GEMM2_CHAIN.at("mxfp4w8a_k64")
     )
     assert name.startswith("swapped_mxfp4w8ak64_plain_bf16_") and name.endswith(
-        "_swap_kb256"
+        "_swap_kb256_e2"
     )
+    # the fused requantization's one-warpgroup epilogue: no warpgroup suffix
+    name = C.swapped_kernel_name(
+        swapped_knobs_mx("mxfp4w8a_k64")[1],
+        MxChain("glu", "silu", "mxfp8", (), "mxfp4w8a_k64"),
+    )
+    assert name.endswith("_swap_kb256")
     assert C.MODULE == SCATTER_MODULE == "batch_invariant_moe"
     assert "batch_invariant_moe_mxfp4w8a" not in jit.MODULE_ROOTS
     srcs = jit.relative_sources("batch_invariant_moe")
