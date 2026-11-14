@@ -369,15 +369,14 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
         layout. ``sf_idx`` includes the logical staged head-slice offset.
         """
         cfg = self.cfg
-        sf_bytes_per_token = Int32(cfg.smem_kv_sf_bytes_per_token)
         row_idx = elem_idx // Int32(cfg.head_dim_kv_stage)
         sf_idx = Int32(head_dim_stage_idx * (cfg.head_dim_kv_stage // 16)) + (
             elem_idx % Int32(cfg.head_dim_kv_stage)
         ) // Int32(16)
-        sf_offset = row_idx * sf_bytes_per_token + sf_idx
+        sf_offset = cfg.smem_kv_sf_row_offset(row_idx) + sf_idx
         if cutlass.const_expr(is_v):
             sf_offset = (
-                (row_idx // Int32(4)) * Int32(4) * sf_bytes_per_token
+                cfg.smem_kv_sf_row_offset((row_idx // Int32(4)) * Int32(4))
                 + sf_idx * Int32(4)
                 + row_idx % Int32(4)
             )

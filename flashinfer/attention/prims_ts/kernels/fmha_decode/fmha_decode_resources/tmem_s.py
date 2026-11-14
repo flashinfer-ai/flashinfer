@@ -260,6 +260,14 @@ class TmemSResource(DecodeGenResourceBase):
             Float32(1.0),
             "Sage Q scale of the lane's row, loaded once per work tile.",
         ),
+    ) + tuple(
+        (
+            f"page_membership{i}",
+            Uint32,
+            Uint32(0),
+            f"Grouped-Q page-membership byte of the lane's token group {i}.",
+        )
+        for i in range(4)
     )
     inst_id: Constexpr[int] = 0
     cfg: Constexpr[FmhaDecodeConfig] = None
@@ -291,6 +299,10 @@ class TmemSResource(DecodeGenResourceBase):
     new_max_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     s_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     sage_q_scale: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    page_membership0: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    page_membership1: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    page_membership2: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    page_membership3: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
 
     def _init_placeholder_state(self) -> None:
         """Create placeholder register and scratch state for softmax."""
@@ -806,6 +818,9 @@ class TmemSResource(DecodeGenResourceBase):
                     scale_d = True
                     if cutlass.const_expr(ki + 1 < cfg.headdim // _mma_k_step_qk(cfg)):
                         if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+                            assert cfg.qk_dtype_bytes == 1, (
+                                "full-head TMEM K supports FP8 only"
+                            )
                             k_desc = prims.make_tmem_ptr(
                                 kv_desc + Int32((ki + 1) * _mma_k_step_qk(cfg) // 4),
                                 Int32,
@@ -849,10 +864,23 @@ class TmemSResource(DecodeGenResourceBase):
             # Keeping descriptors out of iter_args avoids staged-D256 spills.
             for ki in cutlass.range(1, mma_k_steps, 1, unroll=1):
                 if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+                    # TMEM packs 4 / qk_dtype_bytes K elements per column.
                     iter_k_desc = prims.make_tmem_ptr(
-                        kv_desc + ki * Int32(_mma_k_step_qk(cfg) // 4), Int32
+                        kv_desc
+                        + ki * Int32(_mma_k_step_qk(cfg) * cfg.qk_dtype_bytes // 4),
+                        Int32,
                     )
                     q_desc_offset = ki * Int32(2)
+                    if cutlass.const_expr(cfg.qk_dtype_bytes == 2):
+                        # A 16-bit SW128 Q row holds 64 elements; later
+                        # K slices start in the next row-major Q chunk.
+                        chunk_idx = (ki * Int32(_mma_k_step_qk(cfg))) // Int32(64)
+                        q_chunk_extra = (
+                            8 * cfg.tile_size_q - 8
+                            if cutlass.const_expr(cfg.tile_size_q >= 16)
+                            else 56
+                        )
+                        q_desc_offset += chunk_idx * Int32(q_chunk_extra)
                 elif cutlass.const_expr(cfg.qk_dtype_bytes == 1):
                     k_desc_offset = ki * Int32(2)
                     q_desc_offset = ki * Int32(2)
@@ -1097,8 +1125,13 @@ class TmemSResource(DecodeGenResourceBase):
         logical_q_group_idx: Int32,
         warp_grp_thread_idx: Int32,
         tile_row_idx: Int32,
+        page_memberships: tuple | None = None,
     ) -> Uint32:
-        """Return a lane-local 16/32-page keep word for Q64/Q128 with KV128."""
+        """Return a lane-local 16/32-page keep word for Q64/Q128 with KV128.
+
+        ``page_memberships`` carries the lane's four raw GMEM words when the
+        schedule loaded them a tile ahead.
+        """
 
         cfg = self.cfg
         assert cfg.tile_size_q in (64, 128)
@@ -1126,6 +1159,18 @@ class TmemSResource(DecodeGenResourceBase):
         keep_word = Uint32(0)
         page_span = min(cfg.num_tokens_per_page, cfg.num_s_regs_per_thread)
         pages_per_lane = cfg.num_s_regs_per_thread // page_span
+        if cutlass.const_expr(page_memberships is not None):
+            # Raw GMEM words were loaded one tile ahead by the schedule.
+            assert pages_per_lane == 16
+            return (
+                self.page_offsets_ref.q_token_kv_block_sparse_page_keep_word16_from_raw(
+                    stage_info,
+                    local_tile_idx,
+                    col_base // Int32(cfg.num_tokens_per_page),
+                    q_token_idx,
+                    page_memberships,
+                )
+            )
         if cutlass.const_expr(pages_per_lane >= 16):
             for vector_idx in cutlass.range_constexpr(pages_per_lane // 16):
                 bits = self.page_offsets_ref.q_token_kv_block_sparse_page_keep_word16(
@@ -1197,17 +1242,24 @@ class TmemSResource(DecodeGenResourceBase):
         task_cache = _decode_gen_task_cache(stage_info)
         num_s_regs = cfg.num_s_regs_per_thread
         base_addr = self._softmax_loop_score_tmem_addr(stage_info)
+        # Issue every 32-column load before one wait: the TMEM round trips
+        # overlap instead of serializing per atom.
+        loaded_atoms = []
         for load_atom_idx in cutlass.range_constexpr(num_s_regs // 32):
-            atom_col = load_atom_idx * 32
-            loaded = _keeps_tcgen05_ld(
-                cfg,
-                prims.make_tmem_ptr(base_addr + Int32(atom_col), Float32),
-                num=32,
-                offset=cfg.tile_size_kv // 2,
+            loaded_atoms.append(
+                _keeps_tcgen05_ld(
+                    cfg,
+                    prims.make_tmem_ptr(base_addr + Int32(load_atom_idx * 32), Float32),
+                    num=32,
+                    offset=cfg.tile_size_kv // 2,
+                )
             )
-            prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+        for load_atom_idx in cutlass.range_constexpr(num_s_regs // 32):
             for atom_reg_idx in cutlass.range_constexpr(32):
-                s_vals[atom_col + atom_reg_idx] = loaded[atom_reg_idx]
+                s_vals[load_atom_idx * 32 + atom_reg_idx] = loaded_atoms[load_atom_idx][
+                    atom_reg_idx
+                ]
 
         warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
         lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
@@ -1365,6 +1417,7 @@ class TmemSResource(DecodeGenResourceBase):
         is_valid_effective_tile: cutlass.Boolean,
         is_masked_final_wave: cutlass.Boolean,
         tile_is_unmasked: cutlass.Boolean,
+        page_memberships: tuple | None = None,
     ) -> None:
         """Select the masked or unmasked fragment loader before LDTM.
 
@@ -1384,6 +1437,7 @@ class TmemSResource(DecodeGenResourceBase):
                     logical_q_group_idx,
                     warp_grp_thread_idx,
                     tile_row_idx,
+                    page_memberships,
                 )
             )
         if tile_is_unmasked:
@@ -1426,6 +1480,7 @@ class TmemSResource(DecodeGenResourceBase):
         s_arr: cutlass.Array,
         sage_q_scale: Float32 | None = None,
         sage_k_stage_bytes: Int32 | None = None,
+        page_memberships: tuple | None = None,
     ) -> tuple[object, object, object, object]:
         """Load and reduce the row-major Keeps S fragment.
 
@@ -1482,6 +1537,7 @@ class TmemSResource(DecodeGenResourceBase):
             is_valid_effective_tile,
             is_masked_final_wave,
             tile_is_unmasked,
+            page_memberships,
         )
         tile_max = self._reduce_keeps_tile_max(
             stage_info, s_vals, sage_q_scale, sage_k_stage_bytes
@@ -1506,8 +1562,13 @@ class TmemSResource(DecodeGenResourceBase):
         task_cache: cutlass.Array,
         logical_q_group_idx: Int32,
         local_tile_idx: Int32,
+        page_memberships: tuple | None = None,
     ) -> None:
-        """Mask Swaps scores whose page is absent from a grouped Q row."""
+        """Mask Swaps scores whose page is absent from a grouped Q row.
+
+        ``page_memberships`` carries the lane's four token-group bytes when
+        the schedule loaded them ahead of the S wait.
+        """
 
         cfg = self.cfg
         assert not cfg.use_keeps_mma_ab
@@ -1521,9 +1582,29 @@ class TmemSResource(DecodeGenResourceBase):
         local_idx_k0 = warp_idx * Int32(32) + (lane_idx >> Int32(2))
 
         # Each held page-4 slot has a separate query-membership byte; locator
-        # values never carry membership bits. One lookup serves the pair of Q
-        # rows represented by a Swaps score register pair; causal masking still
-        # handles the zero-to-three-token tail within a member page.
+        # values never carry membership bits. One lookup per token group serves
+        # every Q row of this lane; causal masking still handles the
+        # zero-to-three-token tail within a member page.
+        memberships = []
+        for token_group_idx in cutlass.range_constexpr(4):
+            local_token_idx = local_idx_k0 + Int32(token_group_idx * 8)
+            page_frag = local_token_idx // Int32(cfg.num_tokens_per_page)
+            if cutlass.const_expr(page_memberships is None):
+                memberships.append(
+                    self.page_offsets_ref.q_token_kv_block_sparse_page_membership(
+                        stage_info, local_tile_idx, page_frag
+                    )
+                )
+            else:
+                # Raw GMEM words were loaded one tile ahead by the schedule.
+                memberships.append(
+                    self.page_offsets_ref.q_token_kv_block_sparse_page_membership_from_raw(
+                        stage_info,
+                        local_tile_idx,
+                        page_frag,
+                        page_memberships[token_group_idx],
+                    )
+                )
         for scale_idx in cutlass.range_constexpr(num_scale_groups):
             repeat_idx = scale_idx // 2
             pair_idx = scale_idx % 2
@@ -1538,15 +1619,7 @@ class TmemSResource(DecodeGenResourceBase):
             )
             membership_bit = Uint32(1) << q_token_idx
             for token_group_idx in cutlass.range_constexpr(4):
-                local_token_idx = local_idx_k0 + Int32(token_group_idx * 8)
-                page_frag = local_token_idx // Int32(cfg.num_tokens_per_page)
-                membership = (
-                    self.page_offsets_ref.q_token_kv_block_sparse_page_membership(
-                        stage_info,
-                        local_tile_idx,
-                        page_frag,
-                    )
-                )
+                membership = memberships[token_group_idx]
                 s_idx = (
                     repeat_idx * 4
                     + pair_idx
@@ -1572,6 +1645,7 @@ class TmemSResource(DecodeGenResourceBase):
         sparse_token_word: Uint32,
         sparse_route_flags: Uint32,
         use_sparse: Constexpr[bool],
+        page_memberships: tuple | None = None,
     ) -> tuple[object, object, object, object]:
         """Load SWAP S from TMEM and materialize the running softmax state.
 
@@ -1908,6 +1982,7 @@ class TmemSResource(DecodeGenResourceBase):
                 task_cache,
                 logical_q_group_idx,
                 local_tile_idx,
+                page_memberships,
             )
 
         if cutlass.const_expr(cfg.uses_per_row_causal_mask):
@@ -2203,6 +2278,132 @@ class TmemSResource(DecodeGenResourceBase):
             sparse_token_word=Uint32(0xFFFFFFFF),
             sparse_route_flags=Uint32(0),
             use_sparse=False,
+        )
+
+    @cute.jit
+    def load_raw_page_membership_words(
+        self, stage_info: StageInfo, local_tile_idx: Int32
+    ) -> tuple[Uint32, Uint32, Uint32, Uint32]:
+        """Issue this lane's four GMEM membership-word loads for one tile."""
+        cfg = self.cfg
+        task_cache = _decode_gen_task_cache(stage_info)
+        words = []
+        if cutlass.const_expr(cfg.use_keeps_mma_ab):
+            # A Keeps lane owns a contiguous 64-token column half of its row:
+            # sixteen pages in four aligned words.
+            lane_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX] & Int32(31)
+            first_page = _keeps_col_base(
+                cfg, lane_idx, cfg.softmax_score_fragment_regs
+            ) // Int32(cfg.num_tokens_per_page)
+            for word_idx in cutlass.range_constexpr(4):
+                words.append(
+                    self.page_offsets_ref.load_q_token_kv_block_sparse_page_membership_raw(
+                        stage_info, local_tile_idx, first_page + Int32(word_idx * 4)
+                    )
+                )
+            return words[0], words[1], words[2], words[3]
+        local_idx_k0 = task_cache[_TASK_CACHE_WARP_IDX] * Int32(32) + (
+            task_cache[_TASK_CACHE_LANE_IDX] >> Int32(2)
+        )
+        for token_group_idx in cutlass.range_constexpr(4):
+            local_token_idx = local_idx_k0 + Int32(token_group_idx * 8)
+            words.append(
+                self.page_offsets_ref.load_q_token_kv_block_sparse_page_membership_raw(
+                    stage_info,
+                    local_tile_idx,
+                    local_token_idx // Int32(cfg.num_tokens_per_page),
+                )
+            )
+        return words[0], words[1], words[2], words[3]
+
+    @consumer_work(
+        work_attrs=WorkAttr.AUXILIARY,
+        returns=(
+            page_membership0,
+            page_membership1,
+            page_membership2,
+            page_membership3,
+        ),
+    )
+    @cute.jit
+    def load_first_page_memberships(
+        self, stage_info: StageInfo
+    ) -> tuple[Uint32, Uint32, Uint32, Uint32]:
+        """Load the raw membership words of the work tile's first S tile."""
+        return self.load_raw_page_membership_words(stage_info, Int32(self.inst_id))
+
+    @consumer_work(
+        work_attrs=WorkAttr.AUXILIARY,
+        returns=(
+            page_membership0,
+            page_membership1,
+            page_membership2,
+            page_membership3,
+        ),
+    )
+    @cute.jit
+    def load_next_page_memberships(
+        self, stage_info: StageInfo
+    ) -> tuple[Uint32, Uint32, Uint32, Uint32]:
+        """Load the next S tile's raw membership words one tile ahead.
+
+        Called right after this tile's scores are reduced: the GMEM latency
+        then overlaps P, the stats handoff and the next score wait instead of
+        sitting between S and the row max. Past the route end the loads are
+        predicated off and the words are unused.
+        """
+        local_tile_idx = _softmax_tile_idx(self.cfg, stage_info, self.inst_id)
+        return self.load_raw_page_membership_words(
+            stage_info, local_tile_idx + Int32(self.cfg.num_insts_kv)
+        )
+
+    @consumer_work(returns=(old_max_arr, sum_arr, new_max_arr, s_arr))
+    @cute.jit
+    def compute_softmax_loop_with_memberships(
+        self,
+        stage_info: StageInfo,
+        *,
+        old_max_arr: cutlass.Array,
+        sum_arr: cutlass.Array,
+        new_max_arr: cutlass.Array,
+        s_arr: cutlass.Array,
+        page_membership0: Uint32,
+        page_membership1: Uint32,
+        page_membership2: Uint32,
+        page_membership3: Uint32,
+    ) -> tuple[object, object, object, object]:
+        """``compute_softmax_loop`` with raw GMEM membership words loaded one
+        tile ahead (``load_first_page_memberships`` / ``load_next_...``)."""
+        page_memberships = (
+            page_membership0,
+            page_membership1,
+            page_membership2,
+            page_membership3,
+        )
+        if cutlass.const_expr(self.cfg.use_keeps_mma_ab):
+            assert not self.cfg.streams_tmem_p_fragments
+            return self._compute_softmax_loop_keeps(
+                stage_info,
+                old_max_arr=old_max_arr,
+                sum_arr=sum_arr,
+                new_max_arr=new_max_arr,
+                s_arr=s_arr,
+                page_memberships=page_memberships,
+            )
+        return self._compute_softmax_loop_swaps(
+            stage_info,
+            old_max_arr=old_max_arr,
+            sum_arr=sum_arr,
+            new_max_arr=new_max_arr,
+            s_arr=s_arr,
+            sparse_origin0=Int32(-1),
+            sparse_origin1=Int32(-1),
+            sparse_origin2=Int32(-1),
+            sparse_origin3=Int32(-1),
+            sparse_token_word=Uint32(0xFFFFFFFF),
+            sparse_route_flags=Uint32(0),
+            use_sparse=False,
+            page_memberships=page_memberships,
         )
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=sage_q_scale)

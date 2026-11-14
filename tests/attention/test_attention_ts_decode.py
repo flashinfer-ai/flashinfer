@@ -4528,7 +4528,7 @@ def test_attention_ts_nvfp4_cache_contract():
         logical_head_dim=64,
     )
     assert normalized[5] == 64
-    k_sf, v_sf, k_sf_page_stride, v_sf_page_stride = (
+    k_sf, v_sf, k_sf_strides, v_sf_strides = (
         decode_module._normalize_paged_kv_scale_factors(
             (scales, scales),
             k_cache=packed,
@@ -4537,8 +4537,16 @@ def test_attention_ts_nvfp4_cache_contract():
     )
     assert k_sf is scales
     assert v_sf is scales
-    assert k_sf_page_stride == scales.stride(0)
-    assert v_sf_page_stride == scales.stride(0)
+    assert k_sf_strides == v_sf_strides == scales.stride()[:3]
+    # D64 scale rows (4 bytes) are copied several tokens per TMA box row, so
+    # they must be token-contiguous; a transposed token-major view is not.
+    token_major = torch.empty((2, 64, 2, 4), dtype=torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="token-contiguous"):
+        decode_module._normalize_paged_kv_scale_factors(
+            (token_major.transpose(1, 2),) * 2,
+            k_cache=torch.empty((2, 2, 64, 32), dtype=torch.uint8),
+            logical_head_dim=64,
+        )
     with pytest.raises(ValueError, match="requires kv_scale_factors"):
         decode_module._normalize_paged_kv_scale_factors(
             None,
