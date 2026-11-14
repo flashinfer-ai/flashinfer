@@ -184,7 +184,7 @@ def module_sources(module: str) -> Tuple[Path, ...]:
 
 
 def relative_sources(module: str) -> list:
-    return [str(p.relative_to(_FI_DIR)) for p in module_sources(module)]
+    return [p.relative_to(_FI_DIR).as_posix() for p in module_sources(module)]
 
 
 def build_and_load(module: str, kernel: str, compile_fn: Callable[[], Any]) -> Any:
