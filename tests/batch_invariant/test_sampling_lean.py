@@ -26,7 +26,7 @@ needs_lake = pytest.mark.skipif(
 
 
 def test_generated_cases_are_current():
-    with open(lean_cases.CASES_PATH) as f:
+    with open(lean_cases.CASES_PATH, encoding="utf-8") as f:
         committed = f.read()
     assert committed == lean_cases.render(), (
         "regenerate with: python -m flashinfer.batch_invariant.sampling.lean_cases"
