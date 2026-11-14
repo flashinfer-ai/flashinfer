@@ -52,6 +52,22 @@ separate: token offsets require backend 9.24 (mixed masks/FP8 require 9.25), and
 the single-token GQA Stats bug is guarded until 9.27. Keep checks that ensure
 both backend and FROST remain usable through the common graph contract.
 
+### Hopper ragged declaration cache
+
+For unscaled, direct cumulative-length BF16/FP16 D256 ragged attention on Hopper,
+cuDNN 9.24+ uses a power-of-two batch declaration bound instead of the general
+4096-batch cache. Q/KV sequence cache classes remain unchanged. This reduces
+work in the cuDNN SDPA kernel while retaining plan reuse within a batch bucket;
+crossing that bound requires a different graph. The batch bound does not imply
+a packed-Q capacity. Existing FROST packed-capacity declarations are unchanged.
+
+This applies to unwindowed attention without sinks, explicit mask lengths or
+single-token queries, for MHA/GQA ratios 1, 2, 4, 8 and 16. It does not change
+ragged `auto` admission. Graph-mode wrappers already use explicit lengths and
+exact declarations, so they keep that path. Validate batch-boundary replans and
+retained captures in both modes with changed partitions, data, scales and
+workspaces.
+
 ### Buffer ownership and graph bounds
 
 Old captures can retain a previous provider's metadata pointers after `auto`
@@ -207,6 +223,10 @@ specific wrapper.
 
 ### H100 D256 paged admission
 
+The expanded NHD layout and page sizes 32/64/128 apply only to causal
+attention. Noncausal admission retains HND with page size 16; combining these
+two independently qualified extensions does not qualify their cross-product.
+
 On H100 80GB HBM3 with 132 SMs, BF16 or FP16 D256 auto may select cuDNN
 with HND or NHD KV storage and page sizes 16/32/64/128 when the native planner
 selects FA3. The existing short-query FA2 domain is
@@ -215,11 +235,13 @@ maximum Q 65–16384 and maximum KV at most 32768. Actual positive Q/KV lengths
 must already be on CPU, satisfy Q≤KV per request, match the declared maxima,
 and use physical query offsets as the valid query lengths. Independent masks
 and device-only metadata do not extend admission. Admission also requires at
-least `2**24` actual causal query-key pairs across query heads:
-`Hq * sum(q_i * (2 * kv_i - q_i + 1) // 2)`. Small workloads retain their native
-FA2/FA3 provider. The calculation uses paired CPU lengths rather than declared
-maximum lengths and adds no device readback. Existing causal, mask, window,
-sinks, split-control and runtime guards remain in force. Q, K, V and output
+least `2**24` actual query-key pairs across query heads. For causal attention,
+work is `Hq * sum(q_i * (2 * kv_i - q_i + 1) // 2)`; for noncausal attention,
+work is `Hq * sum(q_i * kv_i)`. Small workloads retain their native FA2/FA3
+provider. Both calculations use paired CPU lengths rather than declared maximum
+lengths and add no device readback. Custom-mask, window, sinks, split-control
+and runtime guards remain in force. This noncausal extension is H100-specific;
+Blackwell auto admission keeps its causal guard. Q, K, V and output
 must have the same BF16 or FP16 dtype; mixed precision is not admitted.
 
 The cuDNN graph uses exact H100 declarations; Blackwell's cache buckets do not

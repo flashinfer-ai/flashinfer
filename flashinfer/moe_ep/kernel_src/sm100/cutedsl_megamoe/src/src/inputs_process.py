@@ -29,6 +29,8 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Float32, Int32, Int64
+from flashinfer.moe_ep.batch_invariant.nvfp4_device import ScalarF32 as BiScalarF32
+from flashinfer.moe_ep.batch_invariant.nvfp4_spec import input_quantize_block_precast
 
 from common.megamoe_constants import (
     Fp8E4M3FNMax,
@@ -394,29 +396,42 @@ class DataPreprocess:
                 vals = cute.make_rmem_tensor((sf_vec,), Float32)
                 vals.store(block_bf16.load().to(Float32))
 
-                absmax = Float32(0.0)
-                for i in cutlass.range_constexpr(sf_vec):
-                    absmax = cute.arch.fmax(absmax, cute.arch.fmax(vals[i], -vals[i]))
+                if cutlass.const_expr(getattr(self, "batch_invariant", False)):
+                    scaled_values, sfc_e4m3 = input_quantize_block_precast(
+                        BiScalarF32, tuple(vals[i] for i in range(16)), norm=nc
+                    )
+                    scaled = cute.make_rmem_tensor((sf_vec,), Float32)
+                    for i in cutlass.range_constexpr(sf_vec):
+                        scaled[i] = scaled_values[i]
+                    fp4 = cute.make_rmem_tensor((sf_vec,), cutlass.Float4E2M1FN)
+                    fp4.store(scaled.load().to(cutlass.Float4E2M1FN))
+                    cute.copy(store_atom, fp4, self._mark_alignment(q_blk[(None,), (b,)], 8))
+                    activation_sf[token_idx, (0, b)] = sfc_e4m3
 
-                # Stored per-block E4M3 scale; .to() clamps to the E4M3 range.
-                if cutlass.const_expr(scale_multiplier is not None):
-                    sfc_e4m3 = (absmax * scale_multiplier).to(cutlass.Float8E4M3FN)
                 else:
-                    sfc_e4m3 = (absmax * rcp_limit * nc).to(cutlass.Float8E4M3FN)
-                sfc_rt = Float32(sfc_e4m3)
-                # Per-element encode scale; the mask zeros the sfc==0 (all-zero
-                # block) case so its fp4 codes stay 0 instead of NaN.
-                acc_scale = cute.arch.fmin(nc * cute.arch.rcp_approx(sfc_rt), fp32_max)
-                acc_scale = acc_scale * cute.arch.fmin(sfc_rt * Float32(1.0e30), Float32(1.0))
+                    absmax = Float32(0.0)
+                    for i in cutlass.range_constexpr(sf_vec):
+                        absmax = cute.arch.fmax(absmax, cute.arch.fmax(vals[i], -vals[i]))
 
-                scaled = cute.make_rmem_tensor((sf_vec,), Float32)
-                for i in cutlass.range_constexpr(sf_vec):
-                    scaled[i] = vals[i] * acc_scale
-                fp4 = cute.make_rmem_tensor((sf_vec,), cutlass.Float4E2M1FN)
-                fp4.store(scaled.load().to(cutlass.Float4E2M1FN))
+                    # Stored per-block E4M3 scale; .to() clamps to the E4M3 range.
+                    if cutlass.const_expr(scale_multiplier is not None):
+                        sfc_e4m3 = (absmax * scale_multiplier).to(cutlass.Float8E4M3FN)
+                    else:
+                        sfc_e4m3 = (absmax * rcp_limit * nc).to(cutlass.Float8E4M3FN)
+                    sfc_rt = Float32(sfc_e4m3)
+                    # Per-element encode scale; the mask zeros the sfc==0 (all-zero
+                    # block) case so its fp4 codes stay 0 instead of NaN.
+                    acc_scale = cute.arch.fmin(nc * cute.arch.rcp_approx(sfc_rt), fp32_max)
+                    acc_scale = acc_scale * cute.arch.fmin(sfc_rt * Float32(1.0e30), Float32(1.0))
 
-                cute.copy(store_atom, fp4, self._mark_alignment(q_blk[(None,), (b,)], sf_vec // 2))
-                activation_sf[token_idx, (0, b)] = sfc_e4m3
+                    scaled = cute.make_rmem_tensor((sf_vec,), Float32)
+                    for i in cutlass.range_constexpr(sf_vec):
+                        scaled[i] = vals[i] * acc_scale
+                    fp4 = cute.make_rmem_tensor((sf_vec,), cutlass.Float4E2M1FN)
+                    fp4.store(scaled.load().to(cutlass.Float4E2M1FN))
+
+                    cute.copy(store_atom, fp4, self._mark_alignment(q_blk[(None,), (b,)], sf_vec // 2))
+                    activation_sf[token_idx, (0, b)] = sfc_e4m3
 
         self._repack_routing(
             token_idx, tid, topk_idx, topk_weights, token_padding_info, topk_idx_output, topk_weights_output

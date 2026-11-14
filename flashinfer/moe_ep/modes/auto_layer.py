@@ -87,7 +87,12 @@ def _signature(t, row_bound=None):
         t.runtime_max_tokens_per_rank,
         _aliases_input(t),
         [
-            name
+            [
+                name,
+                layout(getattr(t, name))
+                if name == "fc1_activation_per_token_scale"
+                else tensor_layout(getattr(t, name)),
+            ]
             for name in (
                 "scales",
                 "fc1_alpha",
@@ -114,7 +119,40 @@ def _common_candidate(config):
                 ),
             ),
         )
-    return plain(config)
+    return _candidate_plain(config)
+
+
+def _candidate_plain(config):
+    return plain(
+        config,
+        tensor_sources=isinstance(config, MegaConfig)
+        and bool(getattr(config.megakernel, "batch_invariant", False)),
+    )
+
+
+def _copy_config_preserving_tensors(config):
+    """Copy configuration metadata while retaining borrowed runtime buffers."""
+    memo, seen = {}, set()
+
+    def preserve(value):
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        if isinstance(value, torch.Tensor):
+            memo[id(value)] = value
+        elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+            for field in dataclasses.fields(value):
+                preserve(getattr(value, field.name))
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                preserve(key)
+                preserve(item)
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                preserve(item)
+
+    preserve(config)
+    return copy.deepcopy(config, memo)
 
 
 def _identity(context):
@@ -241,8 +279,10 @@ class MoEEpAutoLayer(nn.Module):
             )
             c.agree(plain(fleet_params), "fleet parameters")
             c.agree(c.prepare(lambda: plain(fleet_knobs)), "fleet knobs")
-            configs = c.prepare(lambda: plain(config.candidates))
-            config = copy.deepcopy(config)
+            configs = c.prepare(
+                lambda: [_candidate_plain(v) for v in config.candidates]
+            )
+            config = c.prepare(lambda: _copy_config_preserving_tensors(config))
             self._config = config
             self._config_contract = c.gather(configs)
             self._fleet_knobs = c.gather(c.prepare(lambda: plain(fleet_knobs)))
@@ -378,8 +418,30 @@ class MoEEpAutoLayer(nn.Module):
             "recv_count",
             "num_tokens_per_expert",
         ):
-            if getattr(t, name) is not None:
+            allowed = self._numerical_contract.get("batch_invariant") is not None and (
+                name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+                and self._numerical_contract["quantization"] in ("nvfp4", "bf16_nvfp4")
+                or name == "fc1_activation_per_token_scale"
+                and self._numerical_contract.get("per_token_activation", False)
+            )
+            if getattr(t, name) is not None and not allowed:
                 raise ValueError(f"EP selection does not accept {name}")
+            if allowed and getattr(t, name) is not None:
+                value = getattr(t, name)
+                count = (
+                    t.num_tokens
+                    if name == "fc1_activation_per_token_scale"
+                    else self._fleet.num_experts // self._bootstrap.world_size
+                )
+                if (
+                    value.dtype != torch.float32
+                    or value.device != t.hidden_states.device
+                    or tuple(value.shape) != (count,)
+                    or not value.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"EP selection {name} must be contiguous FP32 [{count}] on the input device"
+                    )
         if t.output is not None and (
             t.output.shape != t.hidden_states.shape
             or t.output.dtype != torch.bfloat16
@@ -726,10 +788,14 @@ class _OuterProtocol:
                 return False
             selected = record.get("selected")
             if isinstance(layer._prototypes[index], MoEEpMegaLayer):
+                has_variant = hasattr(
+                    layer._prototypes[index]._megakernel_config, "kernel_variant"
+                )
                 if not (
                     isinstance(selected, dict)
-                    and set(selected) == {"kernel_variant", "knobs"}
-                    and isinstance(selected["kernel_variant"], str)
+                    and set(selected)
+                    == ({"kernel_variant", "knobs"} if has_variant else {"knobs"})
+                    and (not has_variant or isinstance(selected["kernel_variant"], str))
                     and isinstance(selected["knobs"], dict)
                 ):
                     return False

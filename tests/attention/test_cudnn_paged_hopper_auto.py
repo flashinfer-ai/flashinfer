@@ -24,9 +24,13 @@ import flashinfer.prefill as fp
 
 
 @pytest.fixture(
-    params=[(layout, page) for layout in ("HND", "NHD") for page in (16, 32, 64, 128)]
+    params=[
+        (layout, page, True) for layout in ("HND", "NHD") for page in (16, 32, 64, 128)
+    ]
+    + [("HND", 16, False)]
 )
-def storage(request):
+def storage_mask(request):
+    # Extra layouts/pages remain causal; noncausal keeps its qualified storage.
     return request.param
 
 
@@ -49,10 +53,10 @@ def require_h100():
 @pytest.mark.parametrize("caller_table", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_hopper_paged_auto_retained_capture(
-    storage, dtype, first, return_lse, caller_table
+    storage_mask, dtype, first, return_lse, caller_table
 ):
     require_h100()
-    layout, page = storage
+    layout, page, causal = storage_mask
     shapes = [[64, 64, 64, 64], [65, 63, 64, 64]]
     start = 0 if first == "fa2" else 1
     b, hq, hk, d, nk = 4, 32, 4, 256, 4096
@@ -102,7 +106,7 @@ def test_hopper_paged_auto_retained_capture(
             hk,
             d,
             page,
-            causal=True,
+            causal=causal,
             q_data_type=q.dtype,
             seq_lens=lengths,
             block_tables=table if caller_table else None,
@@ -124,6 +128,8 @@ def test_hopper_paged_auto_retained_capture(
         counts = torch.cat(
             [
                 torch.arange(nk - nq + 1, nk + 1, device=q.device, dtype=torch.float64)
+                if causal
+                else torch.full((nq,), nk, device=q.device, dtype=torch.float64)
                 for nq in qs
             ]
         )
@@ -194,12 +200,144 @@ def test_hopper_paged_auto_retained_capture(
     graph.reset()
 
 
-@pytest.mark.parametrize("nq", [64, 65, 129])
-@pytest.mark.parametrize("nk", [512, 16384])
+@pytest.mark.parametrize("first", ["fa3", "cudnn"])
+@pytest.mark.parametrize("initial_causal", [True, False])
+@pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_hopper_paged_auto_runtime_scales(storage, dtype, nq, nk):
+def test_hopper_mask_replan_preserves_each_captured_mask(
+    dtype, first, initial_causal, return_lse
+):
     require_h100()
-    layout, page = storage
+    batch, nq, nk, hq, hk, d, page = 2, 256, 8192, 32, 4, 256, 16
+    qptr = torch.arange(batch + 1, dtype=torch.int32) * nq
+    pageptr = torch.arange(batch + 1, dtype=torch.int32) * (nk // page)
+    indices = torch.arange(batch * nk // page, device="cuda", dtype=torch.int32)
+    last = torch.full((batch,), page, dtype=torch.int32)
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(256 << 20, device="cuda", dtype=torch.uint8),
+        "HND",
+        backend="auto",
+        use_cuda_graph=True,
+        qo_indptr_buf=qptr.cuda(),
+        paged_kv_indptr_buf=pageptr.cuda(),
+        paged_kv_indices_buf=indices.clone(),
+        paged_kv_last_page_len_buf=last.cuda(),
+    )
+    q = torch.zeros(batch * nq, hq, d, dtype=dtype, device="cuda")
+    kv = torch.zeros(batch * nk // page, 2, hk, page, d, dtype=dtype, device=q.device)
+    k, v = kv[:, 0], kv[:, 1]
+    out = torch.empty_like(q)
+    lse = torch.empty(batch * nq, hq, device=q.device, dtype=torch.float32)
+    positions = torch.arange(nk, device=q.device).repeat(batch).reshape(-1, page)
+    weights = torch.arange(1, batch + 1, device=q.device).repeat_interleave(nk // page)
+    lengths = torch.full((batch,), nk, dtype=torch.int32)
+
+    def run():
+        return w.run(
+            q,
+            (k, v),
+            out=out,
+            lse=lse if return_lse else None,
+            return_lse=return_lse,
+            lse_base="ln",
+        )
+
+    def reference(causal, scale, rowmap):
+        count = (
+            torch.arange(nk - nq + 1, nk + 1, device=q.device, dtype=torch.float64)
+            if causal
+            else torch.full((nq,), nk, device=q.device, dtype=torch.float64)
+        ).repeat(batch)
+        row_weights = torch.repeat_interleave(
+            torch.tensor(rowmap, device=q.device, dtype=torch.float64) + 1, nq
+        )
+        expected = scale * row_weights * (count - (nk - 128)).clamp_min(0) / count
+        return expected.float(), count.log().float()
+
+    def check(causal, scale, rowmap):
+        expected, stats = reference(causal, scale, rowmap)
+        torch.testing.assert_close(
+            out.float(),
+            expected[:, None, None].expand_as(out),
+            atol=0.002,
+            rtol=0.002 if dtype == torch.float16 else 0.02,
+        )
+        if return_lse:
+            torch.testing.assert_close(
+                lse, stats[:, None].expand_as(lse), atol=0.002, rtol=0.002
+            )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    captures = []
+    with torch.cuda.stream(stream):
+        for phase, causal in enumerate(
+            (initial_causal, not initial_causal, initial_causal)
+        ):
+            scale = 128 * (phase + 1)
+            rowmap = torch.arange(batch).roll(phase + 1).tolist()
+            v.copy_(
+                (positions >= nk - 128)[:, None, :, None]
+                * scale
+                * weights[:, None, None, None]
+            )
+            indices.copy_(
+                torch.arange(batch * nk // page, device=q.device, dtype=torch.int32)
+                .reshape(batch, -1)
+                .roll(phase + 1, 0)
+                .flatten()
+            )
+            w.plan(
+                qptr,
+                pageptr,
+                indices,
+                last,
+                hq,
+                hk,
+                d,
+                page,
+                causal=causal,
+                q_data_type=dtype,
+                seq_lens=lengths,
+                max_token_per_sequence=2 * nq if phase == 0 and first == "fa3" else nq,
+                max_sequence_kv=nk,
+            )
+            assert w._backend == first
+            for _ in range(3):
+                run()
+            check(causal, scale, rowmap)
+            expected, _ = reference(causal, scale, rowmap)
+            other_mask, _ = reference(not causal, scale, rowmap)
+            stale_map, _ = reference(causal, scale, list(reversed(rowmap)))
+            assert bool(((expected - other_mask).abs() > 0.1).any())
+            assert bool(((expected - stale_map).abs() > 0.1).any())
+            if phase < 2:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    run()
+                captures.append((causal, graph))
+            for captured_mask, graph in captures:
+                out.fill_(float("nan"))
+                lse.fill_(float("nan"))
+                graph.replay()
+                check(captured_mask, scale, rowmap)
+        stream.synchronize()
+    for _, graph in captures:
+        graph.reset()
+
+
+# Native half-precision paged kernels accept a host float sm_scale. Exercise
+# device-resident Q/K scale replay on the admitted cuDNN routes; retain Python
+# scale checks across native and cuDNN routes.
+@pytest.mark.parametrize(
+    "nq,nk,tensor_scales",
+    [(nq, nk, False) for nq in (64, 65, 129) for nk in (512, 16384)]
+    + [(nq, 16384, True) for nq in (65, 129)],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_hopper_paged_auto_runtime_scales(storage_mask, dtype, nq, nk, tensor_scales):
+    require_h100()
+    layout, page, causal = storage_mask
     torch.manual_seed(83)
     hq, hk, d = 16, 4, 256
     q = torch.randn(nq, hq, d, device="cuda", dtype=dtype)
@@ -223,7 +361,7 @@ def test_hopper_paged_auto_runtime_scales(storage, dtype, nq, nk):
         hk,
         d,
         page,
-        causal=True,
+        causal=causal,
         q_data_type=q.dtype,
     )
     assert w._backend == ("fa2" if nq <= 64 else "cudnn" if nk == 16384 else "fa3")
@@ -245,20 +383,48 @@ def test_hopper_paged_auto_runtime_scales(storage, dtype, nq, nk):
         torch.arange(nk, device=q.device)[None, :]
         <= (nk - nq + torch.arange(nq, device=q.device))[:, None]
     )
+    graph = None
+    if tensor_scales:
+        scale_buffers = [torch.tensor(1.0, device=q.device) for _ in range(3)]
+
+        def run_scaled():
+            return w.run(
+                q,
+                (k, v),
+                return_lse=True,
+                lse_base="ln",
+                q_scale=scale_buffers[0],
+                k_scale=scale_buffers[1],
+                v_scale=scale_buffers[2],
+            )
+
+        for _ in range(3):
+            run_scaled()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out, lse = run_scaled()
     for qs, ks, vs in [(0.5, 1.0, 1.0), (1.0, 0.25, 1.0), (1.0, 1.0, 0.75)]:
         scores = torch.einsum("qhd,khd->hqk", q.double(), keys) * (d**-0.5 * qs * ks)
-        scores.masked_fill_(~allowed[None], float("-inf"))
+        if causal:
+            scores.masked_fill_(~allowed[None], float("-inf"))
         ref = torch.einsum("hqk,khd->qhd", scores.softmax(-1), values) * vs
         stats = scores.logsumexp(-1).transpose(0, 1)
-        out, lse = w.run(
-            q,
-            (k, v),
-            return_lse=True,
-            lse_base="ln",
-            q_scale=qs,
-            k_scale=ks,
-            v_scale=vs,
-        )
+        if tensor_scales:
+            for buffer, value in zip(scale_buffers, (qs, ks, vs), strict=True):
+                buffer.fill_(value)
+            out.fill_(float("nan"))
+            lse.fill_(float("nan"))
+            graph.replay()
+        else:
+            out, lse = w.run(
+                q,
+                (k, v),
+                return_lse=True,
+                lse_base="ln",
+                q_scale=qs,
+                k_scale=ks,
+                v_scale=vs,
+            )
         torch.testing.assert_close(
             out.float(),
             ref.float(),
@@ -266,14 +432,18 @@ def test_hopper_paged_auto_runtime_scales(storage, dtype, nq, nk):
             rtol=0.002 if dtype == torch.float16 else 0.015,
         )
         torch.testing.assert_close(lse, stats.float(), atol=0.003, rtol=0.003)
+    if graph is not None:
+        graph.reset()
 
 
 @pytest.mark.parametrize("first", ["fa3", "cudnn", "cudnn_grow"])
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_hopper_work_boundary_preserves_captures(storage, dtype, first, return_lse):
+def test_hopper_work_boundary_preserves_captures(
+    storage_mask, dtype, first, return_lse
+):
     require_h100()
-    layout, page = storage
+    layout, page, causal = storage_mask
     nq, hq, hk, d, capacity = 65, 32, 8, 256, 8192
     lengths = [8065, 8192]
     start = int(first != "fa3")
@@ -313,7 +483,7 @@ def test_hopper_work_boundary_preserves_captures(storage, dtype, first, return_l
             hk,
             d,
             page,
-            causal=True,
+            causal=causal,
             q_data_type=q.dtype,
             seq_lens=torch.tensor([nk], dtype=torch.int32),
             max_token_per_sequence=nq,
@@ -331,7 +501,11 @@ def test_hopper_work_boundary_preserves_captures(storage, dtype, first, return_l
         )
 
     def check(nk, scale):
-        count = torch.arange(nk - nq + 1, nk + 1, dtype=torch.float64, device=q.device)
+        count = (
+            torch.arange(nk - nq + 1, nk + 1, dtype=torch.float64, device=q.device)
+            if causal
+            else torch.full((nq,), nk, dtype=torch.float64, device=q.device)
+        )
         expected = (scale * (count - 8000).clamp_min(0) / count).float()
         torch.testing.assert_close(
             out.float(),
@@ -350,8 +524,8 @@ def test_hopper_work_boundary_preserves_captures(storage, dtype, first, return_l
     with torch.cuda.stream(stream):
         v_hnd.copy_((positions >= 8000)[:, None, :, None] * 8)
         if first == "cudnn_grow":
-            # Both plans select cuDNN. A partially filled final page must not
-            # prevent the later plan from using every reserved page and token.
+            # Both plans select cuDNN. A partial last page must not prevent
+            # the later plan from using every reserved page and token.
             plan(8112)
             assert w._backend == "cudnn" and w._cudnn_paged_bounds is None
             table_ptr = w._cudnn_block_tables.data_ptr()

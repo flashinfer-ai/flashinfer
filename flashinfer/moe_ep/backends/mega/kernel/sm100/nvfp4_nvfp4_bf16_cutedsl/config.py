@@ -39,6 +39,7 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     intermediate_size: int
     top_k: int
     kernel_name: str = "sm100_nvfp4_nvfp4_bf16_cutedsl"
+    batch_invariant: bool = field(default=False, kw_only=True)
     gate_up_clamp: float | None = None
     activation_clamp: float | None = None
     activation: Literal["swiglu", "situ"] = "swiglu"
@@ -98,6 +99,20 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     finalize_mode: FinalizeMode = FinalizeMode.AUTO
 
     def __post_init__(self) -> None:
+        if type(self.batch_invariant) is not bool:
+            raise ValueError("batch_invariant must be a bool.")
+        if self.batch_invariant:
+            from ..common.nvfp4_batch_invariant import validate_nvfp4_batch_invariant
+
+            if self.kernel_name not in (
+                "sm100_nvfp4_nvfp4_bf16_cutedsl",
+                "nvfp4_cutedsl",
+                "sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+            ):
+                raise ValueError(
+                    "batch_invariant requires a specified NVFP4 CuTeDSL backend"
+                )
+            validate_nvfp4_batch_invariant(self, arch="sm_100")
         validate_finalize_mode(
             self.finalize_mode, tuple(FinalizeMode), self.num_valid_tokens_tensor
         )
@@ -133,7 +148,9 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
                 raise ValueError(
                     "situ_linear_beta must be positive and finite when set."
                 )
-            if self.gate_up_clamp is not None or self.activation_clamp is not None:
+            if not self.batch_invariant and (
+                self.gate_up_clamp is not None or self.activation_clamp is not None
+            ):
                 raise ValueError("activation clamps are not supported with SiTU.")
         elif self.situ_beta is not None or self.situ_linear_beta is not None:
             raise ValueError("SiTU parameters require activation='situ'.")

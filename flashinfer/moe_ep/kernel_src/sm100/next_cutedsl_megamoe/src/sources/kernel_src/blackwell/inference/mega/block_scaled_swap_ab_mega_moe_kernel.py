@@ -287,6 +287,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             None if self.reduce_topk_in_kernel or self.skip_topk_reduce else TopkReduce(
                 self.hidden_size, self.topk, self.combine_format,
                 num_experts=self.expert_count, persistent=self.topk_reduce_persistent,
+                batch_invariant=bool(problem_desc.get("batch_invariant", False)),
             )
         )
         self._route_reset = ClearInvalidRoutes(
@@ -508,6 +509,14 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             else "x".join(str(dimension) for dimension in self.fallback_cluster_shape_mn)
         )
         epi_flags = "x".join(str(batch) for batch in self.epi_flag_batches)
+        bi_enabled = bool(getattr(self.epilogue, "batch_invariant", False))
+        bi_variant = getattr(self.epilogue, "batch_invariant_activation", None)
+        bi_suffix = f"_bi{int(bi_enabled)}" if bi_enabled or bi_variant is not None else ""
+        if bi_variant is not None:
+            import hashlib
+            bi_suffix += "_act" + hashlib.sha256(
+                repr(bi_variant.signature).encode()
+            ).hexdigest()[:16]
         return (
             f"sm100_block_scaled_swap_ab_mega_moe_{self.quant_kind}_"
             f"{dtype_name(self.a_dtype)}_{dtype_name(self.b_dtype)}_{dtype_name(self.acc_dtype)}_"
@@ -536,6 +545,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             # Off / SwiGLU keep the historical name so existing compiled-kernel caches stay valid.
             + ("_fc1actscale" if self.fc1_activation_per_token_scale else "")
             + (f"_act{self.gate_activation}" if self.gate_activation != "swiglu" else "")
+            + bi_suffix
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):

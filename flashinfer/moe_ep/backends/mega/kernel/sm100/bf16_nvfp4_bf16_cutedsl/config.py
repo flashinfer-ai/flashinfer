@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 from flashinfer.moe_ep._compat import deprecated_aliases, legacy_finalize
@@ -59,8 +59,14 @@ class Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     activation_clamp: float | None = None
     # NONE makes MoEEpMegaLayer.forward return per-route outputs.
     finalize_mode: FinalizeMode = FinalizeMode.AUTO
+    batch_invariant: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
+        from ..common.a16_batch_invariant import validate_a16_batch_invariant
+
+        validate_a16_batch_invariant(
+            self, self.knobs if isinstance(self.knobs, dict) else None
+        )
         validate_finalize_mode(
             self.finalize_mode,
             (FinalizeMode.AUTO, FinalizeMode.DEFAULT, FinalizeMode.NONE),

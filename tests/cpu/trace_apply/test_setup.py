@@ -40,7 +40,11 @@ from flashinfer.trace_apply import packages as pk
 from flashinfer.trace_apply import setup as su
 from flashinfer.trace_apply.apply import preloaded_entry
 from flashinfer.trace_apply.loaders import load as load_solution
-from flashinfer.trace_apply.setup import SetupBoundCallable, SetupStateError
+from flashinfer.trace_apply.setup import (
+    SetupBoundCallable,
+    SetupStateError,
+    StaleSetupError,
+)
 from tests.cpu.trace_apply.seal_helpers import (
     DEFINITION,
     GOLDEN_DIGEST,
@@ -569,6 +573,157 @@ def test_capture_refuses_first_use_freezes_and_never_releases(tmp_path, monkeypa
     assert sys.modules[bound.__module__].CALLS["teardown"] == 0
     assert pk.setup_stats() == {OPERATION: bound.stats()}
     assert bound.stats()["weight_sets"] == 1
+
+
+# ---------------------------------------------------------------------------
+# In-place rewrites of a setup input: re-prepare, or refuse once frozen
+# ---------------------------------------------------------------------------
+
+
+def test_an_inplace_rewrite_reprepares_under_the_same_key():
+    """Mutating a setup input in place re-runs setup; the old state is torn down."""
+    life = _Lifecycle()
+    wrapper = bind(life)
+    a, out = torch.ones(2), torch.empty(2)
+    wrapper(x=a, out=out)
+    a.fill_(3.0)  # an in-place op bumps the version counter; the key is unchanged
+    wrapper(x=a, out=out)
+    assert life.setups == 2
+    assert life.teardowns == [{"serial": 1}]
+    assert [state["serial"] for state in life.runs] == [1, 2]
+    assert wrapper.stats()["reprepared"] == 1 and wrapper.stats()["weight_sets"] == 1
+
+
+def test_a_rewrite_through_a_view_is_seen():
+    """Views share the version counter: mutating one is mutating the weight."""
+    life = _Lifecycle()
+    wrapper = bind(life)
+    a, out = torch.ones(2, 2), torch.empty(2, 2)
+    wrapper(x=a, out=out)
+    a[0].fill_(0.0)
+    wrapper(x=a, out=out)
+    assert life.setups == 2 and wrapper.stats()["reprepared"] == 1
+
+
+def test_a_rewrite_once_frozen_is_refused(monkeypatch):
+    """Frozen by a capture, an in-place rewrite raises StaleSetupError, naming the input."""
+    life = _Lifecycle()
+    wrapper = bind(life)
+    a, out = torch.ones(2), torch.empty(2)
+    wrapper(x=a, out=out)
+    monkeypatch.setattr(su, "_is_capturing", lambda device: True)
+    wrapper(x=a, out=out)  # a captured hit freezes the binding
+    assert wrapper.frozen
+    a.fill_(3.0)
+    monkeypatch.setattr(su, "_is_capturing", lambda device: False)
+    with pytest.raises(StaleSetupError, match="'x' changed in place"):
+        wrapper(x=a, out=out)
+    assert life.setups == 1 and life.teardowns == []  # the frozen state is kept
+    stats = wrapper.stats()
+    assert stats["refused_stale"] == 1 and stats["reprepared"] == 0
+
+
+def test_a_rewrite_during_capture_is_refused_even_unfrozen(monkeypatch):
+    """A rewrite first seen during capture cannot re-prepare: capture forbids it."""
+    life = _Lifecycle()
+    wrapper = bind(life)
+    a, out = torch.ones(2), torch.empty(2)
+    wrapper(x=a, out=out)
+    a.fill_(3.0)
+    monkeypatch.setattr(su, "_is_capturing", lambda device: True)
+    with pytest.raises(StaleSetupError, match="cannot be replaced"):
+        wrapper(x=a, out=out)
+    stats = wrapper.stats()
+    assert stats["refused_stale"] == 1 and stats["reprepared"] == 0
+
+
+def test_a_failed_teardown_during_reprepare_leaves_nothing():
+    """A teardown that raises during re-prepare leaves no state; the next call prepares afresh."""
+    life = _Lifecycle()
+
+    def stuck(state):
+        raise ValueError("stuck")
+
+    life.teardown = stuck
+    wrapper = bind(life)
+    a, out = torch.ones(2), torch.empty(2)
+    wrapper(x=a, out=out)
+    a.fill_(3.0)
+    with pytest.raises(SetupStateError, match="teardown"):
+        wrapper(x=a, out=out)
+    assert wrapper.stats()["weight_sets"] == 0
+    wrapper(x=a, out=out)  # the failed re-prepare left nothing behind
+    assert life.setups == 2 and [state["serial"] for state in life.runs] == [1, 2]
+
+
+def test_a_rewrite_reprepares_only_the_weight_set_that_changed():
+    """Two cached weight sets: mutating one's input re-prepares it alone."""
+    life = _Lifecycle()
+    wrapper = bind(life)
+    a, b, out = torch.ones(2), torch.full((2,), 2.0), torch.empty(2)
+    wrapper(x=a, out=out)
+    wrapper(x=b, out=out)
+    a.fill_(3.0)
+    wrapper(x=a, out=out)
+    wrapper(x=b, out=out)  # untouched: still its first state, never re-prepared
+    assert life.setups == 3 and life.teardowns == [{"serial": 1}]
+    assert [state["serial"] for state in life.runs] == [1, 2, 3, 2]
+    stats = wrapper.stats()
+    assert stats["weight_sets"] == 2 and stats["reprepared"] == 1
+
+
+def test_a_racing_reprepare_is_validated_against_the_call():
+    """A replacement entry that postdates a further rewrite is re-prepared again."""
+    life = _Lifecycle()
+    wrapper = bind(life)
+    a, out = torch.ones(2), torch.empty(2)
+    wrapper(x=a, out=out)  # state 1, versions recorded
+    key = next(iter(wrapper._states))
+    old = wrapper._states[key]
+    a.fill_(3.0)  # the live tensor is now ahead of both entries below
+    # A racing call re-prepared at the earlier contents; its entry is stale
+    # against this call's tensors and must not serve.
+    wrapper._states[key] = ({"serial": 99}, old[1], old[2], old[3])
+    entry = wrapper._reprepare(
+        key, "x", old, (a,), {"x": a, "out": out}, torch.device("cpu")
+    )
+    assert life.setups == 2  # the replacement was refused, setup re-ran
+    assert entry[0] == {"serial": 2} and entry is wrapper._states[key]
+    assert life.teardowns == [{"serial": 99}]
+
+
+def test_a_racing_reprepare_served_during_capture_freezes(monkeypatch):
+    """A replacement served to a capturing call freezes the binding, as a hit would."""
+    life = _Lifecycle()
+    wrapper = bind(life)
+    a, out = torch.ones(2), torch.empty(2)
+    wrapper(x=a, out=out)
+    key = next(iter(wrapper._states))
+    old = wrapper._states[key]
+    a.fill_(3.0)
+    # A racing call already re-prepared at the current contents; this call is
+    # capturing, so the state it serves must pin for the process's life.
+    fresh = tuple(su._tensor_version(tensor) for tensor in old[1])
+    wrapper._states[key] = ({"serial": 2}, old[1], fresh, old[3])
+    monkeypatch.setattr(su, "_is_capturing", lambda device: True)
+    entry = wrapper._reprepare(
+        key, "x", old, (a,), {"x": a, "out": out}, torch.device("cpu")
+    )
+    assert entry[0] == {"serial": 2} and wrapper.frozen
+    with pytest.raises(SetupStateError, match="kept for the life of the process"):
+        wrapper.release()
+
+
+def test_an_inference_tensor_is_served_with_identity_keying_only():
+    """An inference-mode tensor tracks no version: no refusal, no re-prepare."""
+    life = _Lifecycle()
+    wrapper = bind(life)
+    with torch.inference_mode():
+        a = torch.ones(2)
+    out = torch.empty(2)
+    wrapper(x=a, out=out)
+    wrapper(x=a, out=out)
+    assert life.setups == 1 and wrapper.stats()["weight_sets"] == 1
 
 
 def test_a_wrapper_kept_across_release_routes_nowhere(sm_gate_off, monkeypatch):

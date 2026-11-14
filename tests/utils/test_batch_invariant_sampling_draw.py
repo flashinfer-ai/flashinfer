@@ -526,21 +526,14 @@ def test_draw_ir_uses_only_declared_forms(
     never divides), the stream's `cvt.rn.f32.u32` and Philox multiplies, the cluster forms only in cluster members, no
     fast-math anywhere."""
     pytest.importorskip("cutlass")
-    env = dict(
-        os.environ,
-        CUDA_VISIBLE_DEVICES="",
-        CUTE_DSL_KEEP_IR="1",
-        CUTE_DSL_KEEP="ptx",
-        FLASHINFER_CUTE_DSL_DISABLE_CACHE="1",
-        CUTE_DSL_ARCH=os.environ.get("BI_TEST_ARCH", "sm_100a"),
-    )
+    env = _ir_compile_env()
     code = (
         "from flashinfer.batch_invariant.sampling.schedule import LSEConfig\n"
         "from flashinfer.batch_invariant.sampling.draw_kernel import get_compiled_kernel\n"
         f"get_compiled_kernel({dtype!r}, {N}, LSEConfig{cfg}, {from_logits}, {trow}, {idx}, {lp}, False)\n"
     )
     r = subprocess.run(
-        [sys.executable, "-c", code],
+        [sys.executable, "-c", _IR_DUMP_PRELUDE + code],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -597,6 +590,36 @@ def test_draw_ir_uses_only_declared_forms(
 
 
 # ----------------------------------------------------------------------------------------------- on the device
+
+
+# The IR / PTX dumps are requested on the DSL's option object inside this process, not through CUTE_DSL_KEEP* environment
+# variables: a CI that validates the compiler environment of every process against the one recorded at test start
+# counts those as compiler switches (the DSL resolves its options from the environment once, into plain attributes of
+# its singleton; the dumps are written before the cache is consulted, so they never affect what is compiled).
+_IR_DUMP_PRELUDE = (
+    "import os\n"
+    "from cutlass.cutlass_dsl.cutlass import CuTeDSL\n"
+    "_dsl = CuTeDSL()\n"
+    "_dsl.envar.keep_ir = True\n"  # the raw IR before any pass (what CUTE_DSL_KEEP=ir-debug requests)
+    "_dsl.envar.keep_ptx = True\n"  # the PTX (what CUTE_DSL_KEEP=ptx requests)
+    "_dsl.envar.dump_dir = os.getcwd()\n"
+)
+
+
+def _ir_compile_env():
+    """The environment of an IR pin's compile subprocess: this process's, plus FlashInfer's module cache off (so the DSL
+    compiles and the dumps exist; the dumps themselves are requested in-process, ``_IR_DUMP_PRELUDE``). With a device
+    visible the compile targets it as this process would (a CI that validates the compiler environment of every process
+    sees the same ``CUTE_DSL_ARCH`` / ``FLASHINFER_CUDA_ARCH_LIST`` and no ``CUTE_DSL_KEEP*``); without one it is
+    device-free and takes the target from ``BI_TEST_ARCH`` (default ``sm_100a``)."""
+    env = dict(os.environ, FLASHINFER_CUTE_DSL_DISABLE_CACHE="1")
+    if not torch.cuda.is_available():
+        env.update(
+            CUDA_VISIBLE_DEVICES="",
+            CUTE_DSL_ARCH=os.environ.get("BI_TEST_ARCH", "sm_100a"),
+        )
+    return env
+
 
 _WORKER_CODE = r"""
 import ast, sys
@@ -690,10 +713,19 @@ def _device_tests_selected(session) -> bool:
 
 @pytest.fixture(scope="session", autouse=True)
 def _precompile_draw_kernels(request):
-    """Precompile the device tests' kernels on device-free workers once per session: a no-op without a supported device,
-    under ``BI_DRAW_NO_PRECOMPILE=1``, and when no device test is selected."""
+    """Precompile the device tests' kernels on worker processes once per session: a no-op without a supported device,
+    with ``BI_DRAW_PRECOMPILE_WORKERS=0`` (or ``BI_DRAW_NO_PRECOMPILE=1``), and when no device test is selected. The
+    workers inherit this process's environment unchanged -- the same visible device, the same ``CUTE_DSL_ARCH`` and
+    ``FLASHINFER_CUDA_ARCH_LIST`` -- so they compile what this process would, into its module directory, and a CI that
+    validates the compiler environment of every process sees no change. ``BI_DRAW_PRECOMPILE_DEVICE_FREE=1`` (a
+    development host with many cores and no such validation) compiles with no device visible and the device's
+    architecture passed explicitly instead."""
+    workers = int(
+        os.environ.get("BI_DRAW_PRECOMPILE_WORKERS", min(8, os.cpu_count() or 1))
+    )
     if (
         not _supported
+        or workers <= 0
         or os.environ.get("BI_DRAW_NO_PRECOMPILE") == "1"
         or not _device_tests_selected(request.session)
     ):
@@ -704,25 +736,23 @@ def _precompile_draw_kernels(request):
 
     dev = torch.device("cuda")
     sm = device_sm_count(dev)
-    # the workers compile without a device: they take the device's architecture explicitly, so the module directory
-    # (FLASHINFER_CUDA_ARCH_LIST decides the workspace's architecture segment, CUTE_DSL_ARCH the kernel target) is the
-    # one this process loads from
     archs = sorted(CompilationContext().TARGET_CUDA_ARCHS)
     major, minor = archs[0]
     specs = _suite_specs(sm)
     random.Random(0).shuffle(
         specs
     )  # spread the heavy (cluster) kernels over the workers
-    workers = int(
-        os.environ.get("BI_DRAW_PRECOMPILE_WORKERS", min(32, os.cpu_count() or 8))
-    )
     workers = max(1, min(workers, len(specs)))
-    env = dict(
-        os.environ,
-        CUDA_VISIBLE_DEVICES="",
-        CUTE_DSL_ARCH=f"sm_{major}{minor}",
-        FLASHINFER_CUDA_ARCH_LIST=" ".join(f"{a}.{b}" for a, b in archs),
-    )
+    env = dict(os.environ)
+    if os.environ.get("BI_DRAW_PRECOMPILE_DEVICE_FREE") == "1":
+        # no device in the workers: the device's architecture explicitly, so the module directory
+        # (FLASHINFER_CUDA_ARCH_LIST decides the workspace's architecture segment, CUTE_DSL_ARCH the kernel target) is
+        # the one this process loads from
+        env.update(
+            CUDA_VISIBLE_DEVICES="",
+            CUTE_DSL_ARCH=f"sm_{major}{minor}",
+            FLASHINFER_CUDA_ARCH_LIST=" ".join(f"{a}.{b}" for a, b in archs),
+        )
     chunks = [specs[i::workers] for i in range(workers)]
 
     def run(chunk):

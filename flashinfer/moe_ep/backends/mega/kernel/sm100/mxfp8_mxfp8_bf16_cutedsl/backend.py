@@ -9,7 +9,7 @@ and swizzles them. Pass pre-quantized MXFP8 weights via ``w13``/``w2`` plus
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
 
@@ -39,6 +39,12 @@ from .weights import (
     validate_transformed_mega_weights,
 )
 
+from ..common.activation_batch_invariant import batch_invariant_numerical_metadata
+
+from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+    batch_invariant_variant_kwargs,
+)
+
 if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
@@ -62,18 +68,21 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
         """Validate pipeline options and initialize deferred tuning state."""
         super().__init__(config)
         if (
-            config.activation != "swiglu"
-            or config.swiglu_alpha is not None
-            or (
-                config.kernel_variant != "genphase"
-                and not config.apply_routing_weights_before_fc2
-            )
+            not config.batch_invariant
+            and (config.activation != "swiglu" or config.swiglu_alpha is not None)
+        ) or (
+            config.kernel_variant != "genphase"
+            and not config.apply_routing_weights_before_fc2
         ):
             raise MoEEpConfigError(
                 "Activation controls and late routing weights require "
                 "kernel_name='sm100_mxfp8_mxfp8_bf16_cutedsl_next'."
             )
         self._kernel_config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig = config
+        if config.batch_invariant:
+            from ..common.nvfp4_batch_invariant import nvfp4_batch_invariant_arch
+
+            self._arithmetic_arch = nvfp4_batch_invariant_arch()
         if config.kernel_variant not in ("inference", "genphase"):
             raise MoEEpConfigError(
                 f"unsupported kernel_variant {config.kernel_variant!r}"
@@ -172,6 +181,21 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
         fleet_params: FleetParams,
     ) -> None:
         validate_mega_arch()
+        if self._kernel_config.batch_invariant:
+            from ..common.block_scaled_batch_invariant import (
+                validate_block_scaled_batch_invariant,
+            )
+
+            if (
+                self._kernel_config.kind == "mxfp4_mxfp8"
+                and self._kernel_config.kernel_variant != "genphase"
+            ):
+                raise MoEEpConfigError(
+                    "MXFP4 BI inference requires the standard provider selector"
+                )
+            validate_block_scaled_batch_invariant(
+                self._kernel_config, arch=self._arithmetic_arch
+            )
         validate_mega_fleet_params(
             fleet_params,
             bootstrap.world_size,
@@ -179,7 +203,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
             top_k=self._kernel_config.top_k,
             # cutedsl tiles are tail-safe (ceil-div + predicated epilogue);
             # the binding bound is TMA row alignment, not the dg SF word.
-            alignment=64,
+            alignment=128 if self._kernel_config.batch_invariant else 64,
         )
         if self._kernel_config.kernel_variant == "genphase":
             if torch.cuda.is_available():
@@ -189,6 +213,8 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
                         f"Blackwell GenPhase requires SM100/103; got {cc}."
                     )
             self._genphase_config(fleet_params)
+        elif self._kernel_config.batch_invariant:
+            self._legacy_config(fleet_params)
 
     def preprocess_weights(
         self,
@@ -248,7 +274,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
 
     def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
         k = self._kernel_config
-        return dict(
+        key: dict[str, Any] = dict(
             dtype=k.kind,
             world_size=self.ep_world_size,
             hidden=fleet_params.token_hidden_size,
@@ -258,6 +284,51 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
             max_tokens=fleet_params.max_tokens_per_rank,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
             use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
+            combine_dtype=k.combine_dtype,
+        )
+        if k.batch_invariant:
+            from ..common.mxfp8_batch_invariant import MXFP8_BATCH_INVARIANT_VERSION
+
+            key.update(
+                batch_invariant=True,
+                batch_invariant_version=MXFP8_BATCH_INVARIANT_VERSION,
+                apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
+                gate_up_clamp=_resolve_gate_up_clamp(k),
+                input_norm_const=1.0,
+                **(batch_invariant_variant_kwargs(k) if k.batch_invariant else {}),
+            )
+        return key
+
+    def _legacy_config(self, fleet_params):
+        """Validate the resolved legacy plan before allocation or its receipt."""
+        from ......kernel_src.sm100.cutedsl_megamoe import (
+            MegaMoEMxfp8Config,
+            with_knobs,
+        )
+
+        k, fp = self._kernel_config, fleet_params
+        return with_knobs(
+            MegaMoEMxfp8Config(
+                rank=self.ep_rank,
+                world_size=self.ep_world_size,
+                num_tokens_per_rank=fp.max_tokens_per_rank,
+                num_topk=k.top_k,
+                num_total_experts=fp.num_experts,
+                hidden=fp.token_hidden_size,
+                intermediate=k.intermediate_size,
+                kind=k.kind,
+                combine_dtype=k.combine_dtype,
+                gate_up_clamp=_resolve_gate_up_clamp(k),
+                enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
+                use_persistent_finalize_kernel=k.resolved_finalize_mode
+                is FinalizeMode.PERSISTENT,
+                use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
+                batch_invariant=True,
+                input_norm_const=1.0,
+                has_3_global_scales=False,
+                **batch_invariant_numerical_metadata(k),
+            ),
+            self._workspace_knobs(fp),
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
@@ -290,6 +361,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
             self.ep_rank,
             self.ep_world_size,
             kind=kind,
+            combine_dtype=cast(Literal["bf16", "mxfp8"], k.combine_dtype),
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
@@ -298,6 +370,16 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
             use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
             num_valid_tokens_tensor=k.num_valid_tokens_tensor,
             knobs=self._workspace_knobs(fleet_params),
+            **(
+                dict(
+                    batch_invariant=True,
+                    input_norm_const=1.0,
+                    has_3_global_scales=False,
+                    **batch_invariant_numerical_metadata(k),
+                )
+                if k.batch_invariant
+                else {}
+            ),
         )
         if k.finalize_mode is FinalizeMode.NONE:
             workspace._unfinalized_route_map = torch.arange(
@@ -365,6 +447,11 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
                 workspace.topk_idx,
                 workspace.topk_weights,
                 kind=self._kernel_config.kind,
+                **(
+                    {"batch_invariant": True}
+                    if self._kernel_config.batch_invariant
+                    else {}
+                ),
             )
         else:
             # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
@@ -522,12 +609,37 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
             sync=False,
         )
         partials, _root, _region = workspace._frontend.custom_finalize_workspace()
+        if self._kernel_config.batch_invariant:
+            weights = workspace._unfinalized_weights[:num_tokens]
+            if self._kernel_config.apply_routing_weights_before_fc2:
+                weights.fill_(1.0)
+            else:
+                weights.copy_(workspace.topk_weights[:num_tokens])
+            weights.masked_fill_(
+                (workspace.topk_idx[:num_tokens] < 0)
+                | (workspace.topk_idx[:num_tokens] >= workspace.num_total_experts),
+                0,
+            )
         return (
             partials[:num_tokens].view(
                 num_tokens * self._kernel_config.top_k, workspace.hidden
             ),
             workspace._unfinalized_weights[:num_tokens],
             workspace._unfinalized_route_map[:num_tokens],
+        )
+
+    def batch_invariant_fingerprint(self, fleet_params):
+        if not self._kernel_config.batch_invariant:
+            return None
+        from ..common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_fingerprint,
+        )
+
+        return block_scaled_batch_invariant_fingerprint(
+            self._genphase_config(fleet_params)
+            if self._kernel_config.kernel_variant == "genphase"
+            else self._legacy_config(fleet_params),
+            arch=self._arithmetic_arch,
         )
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
@@ -562,11 +674,17 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
             fp.token_hidden_size,
             k.intermediate_size,
             k.kind,
+            k.combine_dtype,
             _resolve_gate_up_clamp(k),
             k.enable_in_kernel_fc2_reduce,
             k.resolved_finalize_mode,
             epilogue_pool_key(k.num_valid_tokens_tensor),
             knobs_pool_key(self._workspace_knobs(fleet_params)),
+            *(
+                (True, self.batch_invariant_fingerprint(fp))
+                if k.batch_invariant
+                else ()
+            ),
         )
 
     def _forget_workspace_state(self, workspace) -> None:

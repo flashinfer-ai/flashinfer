@@ -153,6 +153,7 @@ def prepare_auto_configuration(
         state.initial_knobs = {name: getattr(cfg, name) for name in KNOB_KEYS}
     candidates = sm107_candidates(
         cfg.quant_kind,
+        batch_invariant=getattr(cfg, "batch_invariant", False),
         kernel_variant=cfg.kernel_variant,
         allow_in_kernel_fc2_reduce=backend._kernel_config.in_kernel_fc2_reduce
         and cfg.combine_dtype == "bf16",
@@ -220,6 +221,15 @@ def ep_tuning_contract(backend, fleet_params):
         "nvfp4_4over6": None,
         "apply_routing_weights_before_fc2": cfg.apply_routing_weights_before_fc2,
         "combine_dtype": cfg.combine_dtype,
+        **(
+            {
+                "batch_invariant_fingerprint": backend.batch_invariant_fingerprint(
+                    fleet_params
+                )
+            }
+            if getattr(cfg, "batch_invariant", False)
+            else {}
+        ),
     }
 
 
@@ -257,6 +267,7 @@ def ep_force_tune(backend, workspace, tensors, weights, output):
             candidates=sm107_candidates(
                 cfg.quant_kind,
                 kernel_variant=cfg.kernel_variant,
+                batch_invariant=getattr(cfg, "batch_invariant", False),
                 allow_in_kernel_fc2_reduce=backend._kernel_config.in_kernel_fc2_reduce
                 and cfg.combine_dtype == "bf16",
             ),

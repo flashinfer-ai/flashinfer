@@ -20,13 +20,25 @@ NAMESPACE = "moe_ep.complete_forward.v1"
 BACKEND_NAMESPACE = "moe_ep.complete_forward.backends.v1"
 
 
-def plain(value):
+def plain(value, *, tensor_sources=False):
     """Encode configuration values without process-local object identities."""
     from flashinfer.quantization.nvfp4_quantization_utils import _UNSET
     from ..algo_knobs import FleetAlgoKnobAllocator, HandleAlgoKnobUserStream
 
     if value is _UNSET:
         return {"nvfp4_4over6": "environment"}
+    if tensor_sources and isinstance(value, torch.Tensor):
+        # BI candidate comparison already checks local source identity. The
+        # collective/cache descriptor records layout rather than process-local
+        # addresses or runtime input values.
+        return {
+            "tensor_source": [
+                str(value.dtype),
+                list(value.shape),
+                list(value.stride()),
+                value.device.type,
+            ]
+        }
     if isinstance(value, HandleAlgoKnobUserStream) or (
         isinstance(value, FleetAlgoKnobAllocator)
         and (value.alloc_fn or value.free_fn or value.context)
@@ -41,13 +53,16 @@ def plain(value):
         return {
             "type": type(value).__module__ + "." + type(value).__qualname__,
             "fields": {
-                f.name: plain(getattr(value, f.name)) for f in dataclasses.fields(value)
+                f.name: plain(getattr(value, f.name), tensor_sources=tensor_sources)
+                for f in dataclasses.fields(value)
             },
         }
     if isinstance(value, dict):
-        return {str(k): plain(v) for k, v in value.items()}
+        return {
+            str(k): plain(v, tensor_sources=tensor_sources) for k, v in value.items()
+        }
     if isinstance(value, (tuple, list)):
-        return [plain(v) for v in value]
+        return [plain(v, tensor_sources=tensor_sources) for v in value]
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, torch.dtype):

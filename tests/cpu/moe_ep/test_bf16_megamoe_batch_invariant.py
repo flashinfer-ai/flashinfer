@@ -10,7 +10,6 @@ import pytest
 
 from flashinfer.moe_ep import (
     BootstrapConfig,
-    FinalizeMode,
     FleetParams,
     Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
 )
@@ -258,7 +257,9 @@ def test_sm107_resource_filter_and_receipt_share_the_same_arch(monkeypatch):
     monkeypatch.setattr(
         autotune,
         "autotune_knobs",
-        lambda _frontend, _launch, candidates, **_: candidates,
+        lambda _frontend, _launch, candidates, **kwargs: kwargs["candidate_filter"](
+            candidates
+        ),
     )
     for current_arch, expected in (
         ("sm_100", False),
@@ -325,7 +326,6 @@ def test_cache_separates_sm107_math_even_with_identical_device_names(
     [
         ("enable_in_kernel_fc2_reduce", True),
         ("in_kernel_fc2_reduce", True),
-        ("use_custom_finalize", True),
         ("clc_bundle_size", 2),
         ("num_sched_stages", 2),
         ("group_hint", 123),
@@ -541,7 +541,9 @@ def test_autotune_filters_geometry_by_shape_and_keeps_k64_fallback(monkeypatch):
     monkeypatch.setattr(
         autotune,
         "autotune_knobs",
-        lambda _frontend, _launch, candidates, **_: candidates,
+        lambda _frontend, _launch, candidates, **kwargs: kwargs["candidate_filter"](
+            candidates
+        ),
     )
     for hidden, intermediate, expected_k in ((32, 64, {64}), (96, 128, {64, 128})):
         buffer = SimpleNamespace(
@@ -572,7 +574,9 @@ def test_default_plan_filter_is_quiet_but_explicit_invalid_plans_warn(
     monkeypatch.setattr(
         autotune,
         "autotune_knobs",
-        lambda _frontend, _launch, candidates, **_: candidates,
+        lambda _frontend, _launch, candidates, **kwargs: kwargs["candidate_filter"](
+            candidates
+        ),
     )
     buffer = SimpleNamespace(
         _frontend=MegaMoEBf16Frontend(_config(hidden=hidden, intermediate=intermediate))
@@ -833,38 +837,30 @@ def test_new_geometry_cache_records_invalidate_v2_and_roundtrip_tuples(
 def test_shape_incompatible_cached_geometry_fails_before_workspace_allocation(
     monkeypatch, tmp_path
 ):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16, knob_cache
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import knob_cache
 
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
     monkeypatch.setattr(knob_cache, "_current_device_name", lambda: "testgpu")
-    knob_cache.record_knobs(
-        {"mma_tiler_mnk": (128, 128, 128)},
-        dtype="bf16",
-        world_size=1,
-        hidden=32,
-        intermediate=64,
-        num_experts=2,
-        topk=2,
-        max_tokens=257,
-        device="testgpu",
-        batch_invariant=True,
-        apply_routing_weights_before_fc2=True,
-    )
-    monkeypatch.setattr(
-        bf16,
-        "sym_zeros",
-        lambda *_a, **_kw: pytest.fail("allocated incompatible geometry"),
-    )
-    with pytest.raises(ValueError, match="unsupported BF16 MegaMoE knobs"):
-        bf16.get_symm_buffer_for_bf16_mega_moe(
-            2, 257, 2, 32, 64, 0, 1, batch_invariant=True
+    with pytest.raises(ValueError, match="inadmissible"):
+        knob_cache.record_knobs(
+            {"mma_tiler_mnk": (128, 128, 128)},
+            dtype="bf16",
+            world_size=1,
+            hidden=32,
+            intermediate=64,
+            num_experts=2,
+            topk=2,
+            max_tokens=257,
+            device="testgpu",
+            batch_invariant=True,
+            apply_routing_weights_before_fc2=True,
         )
+    assert not (tmp_path / "knobs.json").exists()
 
 
 @pytest.mark.parametrize(
     "options",
     [
-        {"finalize_mode": FinalizeMode.NONE},
         {"enable_in_kernel_fc2_reduce": True},
         {"knobs": "unknown"},
         {"batch_invariant": 1},
@@ -1008,7 +1004,9 @@ def test_autotune_only_receives_admitted_candidates(monkeypatch):
     monkeypatch.setattr(
         autotune,
         "autotune_knobs",
-        lambda _frontend, _launch, candidates, **_kwargs: candidates,
+        lambda _frontend, _launch, candidates, **kwargs: kwargs["candidate_filter"](
+            candidates
+        ),
     )
     buffer = SimpleNamespace(_frontend=MegaMoEBf16Frontend(_config()))
     with pytest.warns(RuntimeWarning):
@@ -1070,32 +1068,25 @@ def test_cache_separates_legacy_policy_versions_and_weight_placement(
 
 
 def test_poisoned_cache_fails_before_allocating_or_launching(monkeypatch, tmp_path):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16, knob_cache
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import knob_cache
 
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
     monkeypatch.setattr(knob_cache, "_current_device_name", lambda: "testgpu")
-    knob_cache.record_knobs(
-        {"future_numerical_knob": True},
-        dtype="bf16",
-        world_size=1,
-        hidden=256,
-        intermediate=256,
-        num_experts=2,
-        topk=2,
-        max_tokens=257,
-        device="testgpu",
-        batch_invariant=True,
-        apply_routing_weights_before_fc2=True,
-    )
-    monkeypatch.setattr(
-        bf16,
-        "sym_zeros",
-        lambda *_a, **_kw: pytest.fail("allocated before rejecting poisoned cache"),
-    )
-    with pytest.raises(ValueError, match="future_numerical_knob"):
-        bf16.get_symm_buffer_for_bf16_mega_moe(
-            2, 257, 2, 256, 256, 0, 1, batch_invariant=True
+    with pytest.raises(ValueError, match="inadmissible"):
+        knob_cache.record_knobs(
+            {"future_numerical_knob": True},
+            dtype="bf16",
+            world_size=1,
+            hidden=256,
+            intermediate=256,
+            num_experts=2,
+            topk=2,
+            max_tokens=257,
+            device="testgpu",
+            batch_invariant=True,
+            apply_routing_weights_before_fc2=True,
         )
+    assert not (tmp_path / "knobs.json").exists()
 
 
 def test_public_backend_propagates_and_isolates_policy(monkeypatch):

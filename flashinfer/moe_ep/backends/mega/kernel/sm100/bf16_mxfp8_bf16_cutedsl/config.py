@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Optional
 
 from flashinfer.moe_ep.config import FinalizeMode, validate_finalize_mode
@@ -31,8 +31,24 @@ class Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(Sm100_Bf16_Cutedsl_MegaMoeConf
     # reads; the workspace borrows it and never writes it. Update before every
     # forward.
     num_valid_tokens_tensor: Optional["torch.Tensor"] = None
+    batch_invariant: bool = field(default=False, kw_only=True)
+    activation: Literal["swiglu", "situ"] = field(default="swiglu", kw_only=True)
+    swiglu_alpha: float | None = field(default=None, kw_only=True)
+    swiglu_beta: float | None = field(default=None, kw_only=True)
+    situ_beta: float | None = field(default=None, kw_only=True)
+    situ_linear_beta: float | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
+        from ..common.a16_batch_invariant import validate_a16_batch_invariant
+        from ..common.activation_batch_invariant import (
+            batch_invariant_activation_fields,
+        )
+
+        if not self.batch_invariant and batch_invariant_activation_fields(self):
+            raise ValueError("W8A16 activation variants require batch_invariant=True")
+        validate_a16_batch_invariant(
+            self, self.knobs if isinstance(self.knobs, dict) else None
+        )
         validate_finalize_mode(
             self.finalize_mode,
             (

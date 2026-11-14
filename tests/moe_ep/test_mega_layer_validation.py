@@ -760,9 +760,10 @@ def test_nvfp4_stage_epilogues_preserve_copy_semantics(
         x_sf=None,
         topk_idx=None,
         topk_weights=None,
+        _epilogue_default_ones=torch.ones(16, device=device),
         **{name: torch.full((16,), -1.0, device=device) for name in names},
     )
-    expected = {name: getattr(workspace, name).clone() for name in names}
+    expected = {name: torch.ones_like(getattr(workspace, name)) for name in names}
     sources = []
     for i in range(3):
         source = torch.arange(32, dtype=torch.float32, device=device) + i
@@ -796,10 +797,11 @@ def test_nvfp4_stage_epilogues_preserve_copy_semantics(
             getattr(workspace, name), expected[name], rtol=0, atol=0
         )
         setattr(t, name, None)
+    # Omitted overrides restore the configuration defaults (ones here).
     backend.stage_inputs(t, workspace, quantize_input=True)
     for name in names:
         torch.testing.assert_close(
-            getattr(workspace, name), expected[name], rtol=0, atol=0
+            getattr(workspace, name), torch.ones_like(expected[name]), rtol=0, atol=0
         )
 
 
@@ -821,6 +823,7 @@ def test_nvfp4_stage_epilogues_graph_shared_workspace(monkeypatch, layout):
         x_sf=None,
         topk_idx=None,
         topk_weights=None,
+        _epilogue_default_ones=torch.ones(16, device="cuda"),
         **{name: torch.zeros(16, device="cuda") for name in names},
     )
     layers = []
@@ -867,6 +870,8 @@ def test_nvfp4_stage_epilogues_graph_shared_workspace(monkeypatch, layout):
         for name, source in sources.items():
             if source is not None:
                 expected[name].copy_(source)
+            else:
+                expected[name].fill_(1)
             torch.testing.assert_close(
                 getattr(workspace, name), expected[name], rtol=0, atol=0
             )
@@ -897,6 +902,7 @@ def test_nvfp4_stage_epilogues_preserve_workspace_alias_order(monkeypatch, devic
         fc1_alpha=torch.ones(16, device=device),
         fc2_alpha=torch.full((16,), 2.0, device=device),
         fc1_norm_const=torch.ones(16, device=device),
+        _epilogue_default_ones=torch.ones(16, device=device),
     )
     t = MoEEpTensors(
         hidden_states=torch.empty(0, 128, device=device),

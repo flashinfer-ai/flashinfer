@@ -71,6 +71,25 @@ def _key(config, device: str | None = None) -> dict:
     spec = dataclasses.asdict(config)
     for name in ("rank", *knob_keys(config)):
         spec.pop(name)
+    if getattr(config, "batch_invariant", False):
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_version,
+            block_scaled_batch_invariant_fingerprint,
+        )
+
+        spec["batch_invariant_version"] = block_scaled_batch_invariant_version(config)
+        spec["batch_invariant_fingerprint"] = block_scaled_batch_invariant_fingerprint(
+            config
+        )
+    else:
+        for name in (
+            "batch_invariant",
+            "input_norm_const",
+            "has_fc1_alpha",
+            "has_fc2_alpha",
+            "has_fc1_norm_const",
+        ):
+            spec.pop(name, None)
     return dict(
         backend_revision=_REVISION
         if config.kernel_variant == "genphase"
@@ -236,7 +255,11 @@ def write_record(entry):
                 e
                 for e in data["entries"]
                 if not isinstance(e, dict)
-                or not all(e.get(k) == entry[k] for k in identity)
+                or not (
+                    all(e.get(k) == entry[k] for k in identity)
+                    and e.get("timing_boundary", "kernel")
+                    == entry.get("timing_boundary", "kernel")
+                )
             ]
             data["entries"].append(entry)
             with tempfile.NamedTemporaryFile(
