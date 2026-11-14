@@ -12,9 +12,9 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 from filelock import FileLock
 
+from ..jit.cpp_ext import _available_host_memory_bytes
 from ..utils import get_device_index
 from .gemm_mm_fp4_cute_dsl import (
-    _available_host_memory_bytes,
     _blockscaled_mxfp8_gemm_cache_key_files,
     _make_blockscaled_gemm_compile_fn,
     _mm_mxfp8_cache_key,
