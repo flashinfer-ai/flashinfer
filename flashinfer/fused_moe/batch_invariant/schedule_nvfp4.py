@@ -24,6 +24,7 @@ canonical (the same bits), so the dispatcher may depend on anything; the ranked 
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from typing import List, Optional, Tuple
 
@@ -90,6 +91,19 @@ TOP_K_FP4 = 6
 SWAP_TILE_FILL = (3, 4)
 #: The narrowest swapped tile: the structural rule's pick (the bench's reference point; the ranking decides the dispatch).
 SWAP_TILES_DEFAULT = (8,)
+#: The gather form's token tile: the swapped record whose one-warp scale producer keeps a stage's row copies in flight; the
+#: wider tiles serialize them (the campaign's lever record).
+GATHER_TILE_N = 8
+
+
+def gather_form_rule(config1: Knobs, scatter_launch: bool) -> Knobs:
+    """The fused ops' default form of GEMM1's record: the gather form (``gather_a``) of the swapped record at the
+    ``GATHER_TILE_N`` token tile when the box form would scatter the quantized rows in a launch of its own
+    (``scatter_launch``: a pre-quantized input, the MXFP4 pair), the record as ranked otherwise (a bf16 NVFP4 input: its
+    quantizer scatters in its own pass; the grouped records; the wider swapped tiles)."""
+    if scatter_launch and config1.swap_ab and config1.tile_n == GATHER_TILE_N:
+        return dataclasses.replace(config1, gather_a=True)
+    return config1
 
 
 def token_tile_default(rows: int) -> Optional[int]:
@@ -215,6 +229,13 @@ def padded_rows(rows: int) -> int:
     return -(-max(1, rows) // GROUP_ALIGN) * GROUP_ALIGN
 
 
+def gather_twins(swapped: List[Knobs]) -> List[Knobs]:
+    """The gather-form twins of the swapped records (:class:`.blocks.swap.SwappedGroupedGemm`'s gather record): the same tile,
+    the token rows and their scale factors read by the kernel through the plan's map instead of from the permuted rows (GEMM1
+    only: GEMM2's rows are the class's own intermediates, already dense)."""
+    return [dataclasses.replace(c, gather_a=True) for c in swapped if c.swap_ab]
+
+
 def rank_grouped_nvfp4(
     rows: int,
     N: int,
@@ -228,12 +249,27 @@ def rank_grouped_nvfp4(
     nominal: bool = False,
     n_active: Optional[int] = None,
     swap: Optional[bool] = None,
+    gather: Optional[bool] = False,
 ) -> List[Knobs]:
     """The ranked records (:func:`_rank_grouped_nvfp4`), memoised on the arguments: the ranking runs on the host at every call
-    of the op and of the layer, and enumerating and costing the space is milliseconds of Python per GEMM."""
+    of the op and of the layer, and enumerating and costing the space is milliseconds of Python per GEMM. ``gather``: the
+    swapped records' gather form (GEMM1) -- False excludes it (GEMM2, the default), True replaces the swapped records by their
+    gather twins, None ranks both forms (the twin right after its record: the same cost, the form a placement)."""
     return list(
         _rank_grouped_nvfp4(
-            rows, N, K, E, chain, in_fmt, sm_count, family, k, nominal, n_active, swap
+            rows,
+            N,
+            K,
+            E,
+            chain,
+            in_fmt,
+            sm_count,
+            family,
+            k,
+            nominal,
+            n_active,
+            swap,
+            gather,
         )
     )
 
@@ -252,6 +288,7 @@ def _rank_grouped_nvfp4(
     nominal: bool,
     n_active: Optional[int],
     swap: Optional[bool],
+    gather: Optional[bool] = False,
 ) -> Tuple[Knobs, ...]:
     """The ranked records for one GEMM over both record spaces (the bf16 dispatcher's form, :func:`.schedule.rank_grouped`): the
     grouped records the grouped body accepts for the weight shape, the chain and the instruction class (at a decode-sized ``rows``
@@ -264,8 +301,6 @@ def _rank_grouped_nvfp4(
     structural raster first among twins, then the wider N tile among tied grouped records (fewer tiles: fewer per-tile costs),
     ties in the spaces' enumeration order (the grouped records before the swapped ones, the narrower token tile first). Each of the best ceil(k/2) records is followed by its raster twin, then the rank order fills the
     list: distinct records, at most ``k``, never empty for an implementable shape."""
-    import dataclasses
-
     from ...gemm.batch_invariant.heuristic import decode_sane
     from .blocks.compile import (
         can_implement_grouped_blockscaled as can_implement_grouped_nvfp4,
@@ -296,14 +331,22 @@ def _rank_grouped_nvfp4(
             if can_implement_swapped_nvfp4(c, N, K, E, chain, in_fmt)
         ]
     )
+    if gather is not False:
+        twins = [
+            c
+            for c in gather_twins(swapped)
+            if can_implement_swapped_nvfp4(c, N, K, E, chain, in_fmt)
+        ]
+        swapped = twins if gather else swapped + twins
     space = dense + swapped
     guarded = [c for c in dense if decode_sane(c, rows, False)] or dense
     nodes = chain_nodes_nvfp4(chain)
 
     def key(i, c):
-        # the shared contract's cost (`schedule.record_cost`) at this class's instruction class and chain term
+        # the shared contract's cost (`schedule.record_cost`) at this class's instruction class and chain term (a gather twin
+        # at its record's cost: the form moves the same bytes)
         est = record_cost(
-            c,
+            dataclasses.replace(c, gather_a=False),
             rows,
             n_active or E,
             N,
@@ -373,13 +416,27 @@ def default_configs_nvfp4(
     family: Optional[str] = None,
     nominal: bool = False,
     swap: Optional[bool] = None,
+    gather: Optional[bool] = False,
 ) -> Tuple[Knobs, Knobs]:
     """``(config for GEMM1 (N = 2I or I, K = H), config for GEMM2 (N = H, K = I))``: the first record of each ranked list
-    (``swap``: the swapped decode body by the structural rule (None), forced (True) or forbidden (False))."""
+    (``swap``: the swapped decode body by the structural rule (None), forced (True) or forbidden (False); ``gather``: GEMM1's
+    swapped records in their gather form -- excluded (False), forced (True) or ranked with the box form (None))."""
     rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
     n1 = 2 * I if chain1.pair else I
     c1 = rank_grouped_nvfp4(
-        rows, n1, H, E, chain1, in_fmts[0], sm_count, family, 1, nominal, n_act, swap
+        rows,
+        n1,
+        H,
+        E,
+        chain1,
+        in_fmts[0],
+        sm_count,
+        family,
+        1,
+        nominal,
+        n_act,
+        swap,
+        gather,
     )
     c2 = rank_grouped_nvfp4(
         rows, H, I, E, chain2, in_fmts[1], sm_count, family, 1, nominal, n_act, swap

@@ -1137,6 +1137,162 @@ def test_both_packings_and_the_prequantized_pack_forms_give_the_bits():
 
 
 @needs_device
+def test_swapped_gather_record_gives_the_box_forms_bits_on_every_pack_form():
+    """The swapped records' gather form (the body reads the token rows and their scale factors through the plan's map: no scatter
+    launch, no permuted tensor) is a placement: the box form's bits for the bf16 input (quantized over the T rows), the
+    pre-quantized triple with the 128x4 and with the linear scale layout, the per-tensor pack (unit per-token scales), the static
+    class, every swapped token tile, at decode and beyond it, twice. The record is the swapped body's: a grouped record with the
+    flag is refused, so is the padded packing and GEMM2; the ranking's three forms (excluded / forced / ranked) and the tactic
+    round trip carry it."""
+    import dataclasses
+
+    from flashinfer.batch_invariant.quantization.nvfp4_reference import (
+        unswizzle_sf_128x4,
+    )
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import (
+        MoEWeightsNVFP4,
+        fused_moe_nvfp4,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.compile import (
+        can_implement_grouped_blockscaled,
+        can_implement_swapped_blockscaled,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import (
+        GATHER_TILE_N,
+        default_configs_nvfp4,
+        gather_form_rule,
+        gather_twins,
+        rank_grouped_nvfp4,
+        swapped_knobs_blockscaled,
+    )
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+
+    twins = gather_twins(swapped_knobs_blockscaled())
+    assert [t.tile_n for t in twins] == [8, 16, 32] and all(
+        t.gather_a
+        and t.swap_ab
+        and dataclasses.replace(t, gather_a=False) in swapped_knobs_blockscaled()
+        for t in twins
+    )
+    # the structural rule: the narrow swapped tile's gather form when the box form would scatter in a launch of its own
+    sw = swapped_knobs_blockscaled()
+    assert [gather_form_rule(c, True).gather_a for c in sw] == [
+        c.tile_n == GATHER_TILE_N for c in sw
+    ]
+    assert not any(gather_form_rule(c, False).gather_a for c in sw)
+    grouped = Knobs((128, 256), (1, 1), False, True, "n", 1)
+    assert gather_form_rule(grouped, True) == grouped
+    H, I, E = 512, 256, 32
+    for T, k in ((3, 4), (16, 6), (257, 6)):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=2 + T)
+        W = _weights_of(_weights(w1, w2))
+        ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        ids, weights = ids.cuda(), weights.cuda()
+        ref = bits(fused_moe_nvfp4(x, ids, weights, W, gather=False))
+        in1, in2 = W.classes(_family())
+        _, c2 = default_configs_nvfp4(
+            T, k, H, I, E, (in1, in2), W.chain1, W.chain2, 212, _family()
+        )
+        n1 = 2 * I
+        x4, sf, pts = _quantized(x)
+        sf_lin = (
+            unswizzle_sf_128x4(sf.cpu(), T, H)
+            .cuda()
+            .view(torch.uint8)
+            .reshape(T, H // 16)
+        )
+        ref_u = bits(fused_moe_nvfp4((x4, sf_lin, None), ids, weights, W, gather=False))
+        for rec in twins:
+            assert can_implement_swapped_blockscaled(rec, n1, H, E, W.chain1, in1)
+            out, im = fused_moe_nvfp4(
+                x, ids, weights, W, config1=rec, config2=c2, return_intermediates=True
+            )
+            assert (
+                im["config1"].gather_a and im["x_perm4"] is None
+            )  # no permuted tensor
+            assert torch.equal(bits(out), ref), rec.describe()
+            assert torch.equal(
+                bits(
+                    fused_moe_nvfp4(
+                        (x4, sf, pts), ids, weights, W, config1=rec, config2=c2
+                    )
+                ),
+                ref,
+            )
+            assert torch.equal(
+                bits(
+                    fused_moe_nvfp4(
+                        (x4, sf_lin, pts), ids, weights, W, config1=rec, config2=c2
+                    )
+                ),
+                ref,
+            )
+            assert torch.equal(
+                bits(
+                    fused_moe_nvfp4(
+                        (x4, sf_lin, None), ids, weights, W, config1=rec, config2=c2
+                    )
+                ),
+                ref_u,
+            )
+        assert torch.equal(
+            bits(fused_moe_nvfp4(x, ids, weights, W, config1=twins[0], config2=c2)), ref
+        )  # twice
+        Ws = MoEWeightsNVFP4.prepare(w1, w2, intermediate="static")
+        ref_s = bits(fused_moe_nvfp4(x, ids, weights, Ws, gather=False))
+        assert torch.equal(
+            bits(fused_moe_nvfp4(x, ids, weights, Ws, config1=twins[1], config2=c2)),
+            ref_s,
+        )
+        if T <= 16:
+            out_g, im = fused_moe_nvfp4(
+                x, ids, weights, W, gather=True, return_intermediates=True
+            )
+            assert (
+                im["config1"].gather_a
+                and im["config1"].swap_ab
+                and torch.equal(bits(out_g), ref)
+            )
+            # the default: the rule's form -- the pre-quantized input's narrow swapped tile gathers, the bf16 input's quantizer scatters
+            out_d, im = fused_moe_nvfp4(
+                (x4, sf, pts), ids, weights, W, return_intermediates=True
+            )
+            c = im["config1"]
+            assert (
+                c.gather_a == (c.swap_ab and c.tile_n == GATHER_TILE_N)
+                and (im["x_perm4"] is None) == c.gather_a
+            )
+            assert torch.equal(bits(out_d), ref)
+            _, im = fused_moe_nvfp4(x, ids, weights, W, return_intermediates=True)
+            assert not im["config1"].gather_a and im["x_perm4"] is not None
+    # the ranking's forms and the refusals
+    rows = 1
+    r_g = rank_grouped_nvfp4(
+        rows, n1, H, E, W.chain1, in1, 212, _family(), 6, n_active=8, gather=True
+    )
+    r_b = rank_grouped_nvfp4(
+        rows, n1, H, E, W.chain1, in1, 212, _family(), 6, n_active=8
+    )
+    r_n = rank_grouped_nvfp4(
+        rows, n1, H, E, W.chain1, in1, 212, _family(), 6, n_active=8, gather=None
+    )
+    assert r_g[0].gather_a and all(c.gather_a or not c.swap_ab for c in r_g)
+    assert not any(c.gather_a for c in r_b)
+    assert any(c.gather_a for c in r_n) and any(
+        c.swap_ab and not c.gather_a for c in r_n
+    )
+    grouped_ga = Knobs((128, 256), (1, 1), False, True, "n", 1, gather_a=True)
+    assert not can_implement_grouped_blockscaled(grouped_ga, n1, H, E, W.chain1, in1)
+    assert not can_implement_swapped_blockscaled(grouped_ga, n1, H, E, W.chain1, in1)
+    with pytest.raises(ValueError):
+        fused_moe_nvfp4(x, ids, weights, W, path="padded", gather=True)
+    with pytest.raises(ValueError):
+        fused_moe_nvfp4(x, ids, weights, W, config1=c2, config2=twins[0])
+    with pytest.raises(ValueError):
+        fused_moe_nvfp4(x, ids, weights, W, config1=grouped_ga, config2=c2)
+
+
+@needs_device
 @pytest.mark.parametrize("body", ["padded", "swapped"])
 def test_pdl_chain_alternating_inputs_give_each_call_its_own_bits(body):
     """The op's kernels run under programmatic dependent launch, each warp waiting for the predecessor grid before its first read
@@ -1368,11 +1524,29 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits(T):
     tactics = runner.get_valid_tactics(inputs, None)
     from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import TOP_K_FP4
 
-    assert 1 <= len(tactics) <= TOP_K_FP4**2 and len(set(tactics)) == len(tactics)
+    # GEMM1's list carries the structural rule's gather twin beside its box record (one more than the ranking's head)
+    assert 1 <= len(tactics) <= TOP_K_FP4 * (TOP_K_FP4 + 1) and len(
+        set(tactics)
+    ) == len(tactics)
+    import dataclasses
+
+    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import GATHER_TILE_N
+
     r1, r2 = runner.impl._ranked(T, H)
     assert tactics == [_tactic_nvfp4(c1, c2) for c1 in r1 for c2 in r2]
     c1, c2 = _configs_from_tactic_nvfp4(tactics[0])
     assert _tactic_nvfp4(c1, c2) == tactics[0] and (c1, c2) == (r1[0], r2[0])
+    # a pre-quantized input's tactic space: the box head plus the structural rule's gather twin of the narrow swapped tile
+    r1g, _ = runner.impl._ranked(T, H, True)
+    assert r1g[: len(r1)] == r1 and not any(c.gather_a for c in r1)
+    assert [c for c in r1g if c.gather_a] == [
+        dataclasses.replace(c, gather_a=True)
+        for c in r1
+        if c.swap_ab and c.tile_n == GATHER_TILE_N
+    ]
+    g1 = dataclasses.replace(r1[0], gather_a=True)
+    assert _configs_from_tactic_nvfp4(_tactic_nvfp4(g1, c2)) == (g1, c2)
+    assert len(tactics[0]) == 16
     if token_tile_default(rows_per_expert(T, k, E)) is not None:
         assert c1.swap_ab and c2.swap_ab, (T, c1.describe(), c2.describe())
     for t in tactics:
@@ -2058,8 +2232,12 @@ def test_linear_scale_unit_pack_equals_swizzled_pack_with_ones():
     sf_lin = unswizzle_sf_128x4(sf, T, H).cuda().contiguous()
     assert sf_lin.shape == (T, H // 16)
     ref = fused_moe_nvfp4((x4, sf, torch.ones(T, device="cuda")), ids, wts, W)
+    assert torch.equal(
+        bits(fused_moe_nvfp4((x4, sf_lin, None), ids, wts, W)), bits(ref)
+    )
+    # the scatter's placements: the box form (the default form of a pre-quantized input may gather instead)
     out, im = fused_moe_nvfp4(
-        (x4, sf_lin, None), ids, wts, W, return_intermediates=True
+        (x4, sf_lin, None), ids, wts, W, return_intermediates=True, gather=False
     )
     assert torch.equal(bits(out), bits(ref))
     pos = im["dest_pad"].reshape(-1).long()

@@ -217,7 +217,11 @@ class SwappedGroupedGemm:
         knobs: Knobs,
         chain: Union[str, GroupedEpilogueBlock],
         gather: bool = False,
+        sf_src: str = "128x4",
     ):
+        """``gather``: the gather form -- the bf16 classes' by the API's choice, the block-scaled classes' by the record
+        (``knobs.gather_a``); ``sf_src``: the block-scaled gather form's scale source, the class's flat 128x4 buffer of the token
+        rows or the pre-quantized packs' row-major bytes (``"linear"``)."""
         if isinstance(chain, str):
             chain = GroupedChain.legacy(chain, "bf16")
         assert isinstance(chain, GroupedEpilogueBlock), chain
@@ -229,11 +233,18 @@ class SwappedGroupedGemm:
             knobs,
             self.in_fmt,
         )
-        assert not gather or self.in_fmt == "bf16", (
-            "the gather form is the bf16 classes'",
+        gather = gather or knobs.gather_a
+        assert not gather or self.in_fmt == "bf16" or self.operands.block_scaled, (
+            "the gather form is the bf16 classes' (the API's choice) and the block-scaled classes' (the record's flag)",
+            knobs,
             self.in_fmt,
         )
-        self.knobs, self.chain, self.gather = knobs, chain, gather
+        assert not knobs.gather_a or self.operands.block_scaled, (
+            "the gather record is the block-scaled classes'",
+            knobs,
+        )
+        assert sf_src in ("128x4", "linear"), sf_src
+        self.knobs, self.chain, self.gather, self.sf_src = knobs, chain, gather, sf_src
         self.token_tile, self.weight_tile = knobs.tile_n, knobs.tile_m
         # the warp roles: the epilogue warpgroup, (the block-scaled formats' scale-factor warp,) the MMA warp, the TMA warp
         bs = self.operands.block_scaled
@@ -343,6 +354,98 @@ class SwappedGroupedGemm:
             sfa=sfa,
             sfw=sfw,
             pts=pts,
+        )
+
+    @cute.jit
+    def block_scaled_gathered(
+        self,
+        x: cute.Tensor,
+        sfx: cute.Tensor,
+        src: cute.Tensor,
+        k_div: Int32,
+        w: cute.Tensor,
+        sfw: cute.Tensor,
+        out: cute.Tensor,
+        counts: cute.Tensor,
+        alpha: cute.Tensor,
+        pts: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The gather form of :meth:`block_scaled`: ``x (T, K/2, 1)`` the unpermuted packed token rows, ``sfx`` their flat scale
+        factors, ``pts (T,)`` their per-token scales (one entry: a unit scale), ``src (>= Tk,)`` int32 the plan's slot of every
+        dense row, ``k_div`` the slots per token; ``out (Tk, Nout)`` sizes the dense rows."""
+        assert self.gather and self.operands.block_scaled and not self.chain.needs_aux
+        self._launch(
+            x,
+            w,
+            out,
+            counts,
+            max_active_clusters,
+            stream,
+            src,
+            k_div,
+            alpha=alpha,
+            sfa=sfx,
+            sfw=sfw,
+            pts=pts,
+        )
+
+    @cute.jit
+    def block_scaled_plain_gathered(
+        self,
+        x: cute.Tensor,
+        sfx: cute.Tensor,
+        src: cute.Tensor,
+        k_div: Int32,
+        w: cute.Tensor,
+        sfw: cute.Tensor,
+        out: cute.Tensor,
+        counts: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The gather form of :meth:`block_scaled_plain` (the MXFP4 classes)."""
+        assert self.gather and self.operands.block_scaled and not self.chain.operands
+        self._launch(
+            x, w, out, counts, max_active_clusters, stream, src, k_div, sfa=sfx, sfw=sfw
+        )
+
+    @cute.jit
+    def block_scaled_static_gathered(
+        self,
+        x: cute.Tensor,
+        sfx: cute.Tensor,
+        src: cute.Tensor,
+        k_div: Int32,
+        w: cute.Tensor,
+        sfw: cute.Tensor,
+        out: cute.Tensor,
+        out_sf: cute.Tensor,
+        counts: cute.Tensor,
+        alpha: cute.Tensor,
+        pts: cute.Tensor,
+        aux: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The gather form of :meth:`block_scaled_static` (the intermediate's scale bytes still go to the padded positions)."""
+        assert self.gather and self.operands.block_scaled and self.chain.needs_aux
+        self._launch(
+            x,
+            w,
+            out,
+            counts,
+            max_active_clusters,
+            stream,
+            src,
+            k_div,
+            alpha=alpha,
+            sfa=sfx,
+            sfw=sfw,
+            pts=pts,
+            out_sf=out_sf,
+            aux=aux,
         )
 
     @cute.jit
@@ -502,7 +605,17 @@ class SwappedGroupedGemm:
             self.sf_groups = ops.sf_groups(st)
         if cutlass.const_expr(self.gather):
             # the token rows gathered by the TMA's gather4 mode over the 2-D x: a (token_tile, k-tile) box whose rows come
-            # from the index tensor, written to the swizzled stage as the dense box writes it (the atom carries the swizzle)
+            # from the index tensor, written to the swizzled stage as the dense box writes it (the atom carries the swizzle);
+            # the block-scaled classes' packed rows through their element view's 2-D form
+            rows2 = rows
+            if cutlass.const_expr(ops.block_scaled):
+                rows2 = cute.make_tensor(
+                    rows.iterator,
+                    cute.make_layout(
+                        (rows.shape[0], rows.shape[1]),
+                        stride=(rows.layout.stride[0], 1),
+                    ),
+                )
             slab = cute.make_composed_layout(
                 st.b_smem_layout_staged.inner,
                 0,
@@ -510,11 +623,11 @@ class SwappedGroupedGemm:
             )
             gI = cute.make_tensor(
                 src.iterator,
-                cute.make_layout((src.shape[0], rows.shape[1]), stride=(1, 0)),
+                cute.make_layout((src.shape[0], rows2.shape[1]), stride=(1, 0)),
             )
             atom_tok, tensor_tok = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensor2DGather4G2SOp(tcgen05.CtaGroup.ONE),
-                rows,
+                rows2,
                 slab,
                 (self.token_tile, tile_k),
                 gmem_coord_tensor=gI,
@@ -873,6 +986,9 @@ class SwappedGroupedGemm:
                     Tk,
                     tn,
                     st.cta_tile_shape_mnk[2],
+                    tma_atom_sfw=tma_atom_sfw,
+                    tWgSFW=tWgSFW,
+                    tWsSFW=tWsSFW,
                 )
             else:
                 swap_tma_producer_loop(
@@ -915,6 +1031,9 @@ class SwappedGroupedGemm:
                     tn,
                     self.sf_groups,
                     self.sf_stage_bytes,
+                    mSrc if cutlass.const_expr(self.gather) else None,
+                    k_div,
+                    self.sf_src == "linear",
                 )
         if warp_idx == mma_warp:
             tmem.wait_for_alloc()
@@ -999,6 +1118,8 @@ class SwappedGroupedGemm:
                 mOutSf=mOutSf,
                 s_off=s_off,
                 s_off_pad=s_off_pad,
+                mSrc=mSrc if cutlass.const_expr(self.gather and bs) else None,
+                k_div=k_div,
             )
             tmem.relinquish_alloc_permit()
             # the allocator warp alone frees the columns: the epilogue warpgroup's warps join here after their last TMEM loads
@@ -1157,13 +1278,17 @@ def swap_gather_producer_loop(
     Tk: Int32,
     tn: cutlass.Constexpr,
     tile_k: cutlass.Constexpr,
+    tma_atom_sfw: Optional[cute.CopyAtom] = None,
+    tWgSFW: Optional[cute.Tensor] = None,
+    tWsSFW: Optional[cute.Tensor] = None,
 ):
     """The TMA producer of the gather form: per tile the expert's weight tile (128 or 64 rows; the expert as the batch
-    coordinate) and the token tile gathered by the TMA's gather4 mode from the unpermuted rows -- the tile's ``tn`` token indices (``src[p] //
+    coordinate; with the block-scaled formats its scale-factor atom too) and the token tile gathered by the TMA's gather4 mode from the unpermuted rows -- the tile's ``tn`` token indices (``src[p] //
     k_div`` for the group's rows, the group's last row past its end: a valid box whose extra rows are never stored) go into
     registers once per tile and every k-tile's gather issues from them; both copies count on the stage's transaction barrier.
     The kernel has waited for the predecessor (the plan's launch) before its tables, so the wait here returns at once; the
     loop keeps the box form's shape (the first tile's weight stages, the wait, the token gathers)."""
+    has_sf = tma_atom_sfw is not None
     stage_elems = tn * tile_k
     sTok_plain = cute.make_tensor(
         sTok.iterator,
@@ -1178,6 +1303,9 @@ def swap_gather_producer_loop(
     if not work_tile.is_valid_tile:
         n_pre = Int32(0)
     tWgW_slice = tWgW[(None, work_tile.n_tile, None, work_tile.e)]
+    tWgSFW_slice = None
+    if cutlass.const_expr(has_sf):
+        tWgSFW_slice = tWgSFW[(None, work_tile.n_tile, None, work_tile.e)]
     tma_producer.reset()
     tok_producer = tma_producer.clone()
     for _k_tile in cutlass.range(0, n_pre, 1, unroll=1):
@@ -1188,6 +1316,13 @@ def swap_gather_producer_loop(
             tWsW[(None, handle.index)],
             tma_bar_ptr=handle.barrier,
         )
+        if cutlass.const_expr(has_sf):
+            cute.copy(
+                tma_atom_sfw,
+                tWgSFW_slice[(None, handle.count)],
+                tWsSFW[(None, handle.index)],
+                tma_bar_ptr=handle.barrier,
+            )
     cute.arch.griddepcontrol_wait()  # the plan's row map is the predecessor's
     row0 = work_tile.row0
     last = cutlass.max(cutlass.min(work_tile.row_end, Tk) - Int32(1), Int32(0))
@@ -1219,6 +1354,8 @@ def swap_gather_producer_loop(
     k_start = n_pre
     while work_tile.is_valid_tile:
         tWgW_slice = tWgW[(None, work_tile.n_tile, None, work_tile.e)]
+        if cutlass.const_expr(has_sf):
+            tWgSFW_slice = tWgSFW[(None, work_tile.n_tile, None, work_tile.e)]
         row0 = work_tile.row0
         last = cutlass.max(cutlass.min(work_tile.row_end, Tk) - Int32(1), Int32(0))
         for j in cutlass.range_constexpr(tn):
@@ -1244,6 +1381,13 @@ def swap_gather_producer_loop(
                 tWsW[(None, handle.index)],
                 tma_bar_ptr=handle.barrier,
             )
+            if cutlass.const_expr(has_sf):
+                cute.copy(
+                    tma_atom_sfw,
+                    tWgSFW_slice[(None, handle.count)],
+                    tWsSFW[(None, handle.index)],
+                    tma_bar_ptr=handle.barrier,
+                )
             cute.copy(
                 tma_atom_tok,
                 [tTgX[(None, handle.count)], tTgI[(None, handle.count)]],
@@ -1345,12 +1489,18 @@ def _col_scale(
     j: Int32,
     rows_left: Int32,
     shift: Int32,
+    mSrc: cute.Tensor = None,
+    k_div: Int32 = None,
 ):
     """The row scale of token column ``j`` of the tile: ``chain.row_scale`` at the padded position of dense row ``row0 + j``
-    (``+ shift``: the group's padded offset less its dense one); columns past the valid tokens read a valid row and store
-    nothing."""
+    (``+ shift``: the group's padded offset less its dense one), or in the gather form (``mSrc`` given) at the token
+    ``src[row0 + j] // k_div``; columns past the valid tokens read a valid row and store nothing."""
     p = row0 + cutlass.min(j, cutlass.max(rows_left - Int32(1), Int32(0)))
-    p = cutlass.max(p, Int32(0)) + shift
+    if cutlass.const_expr(mSrc is not None):
+        p = cutlass.min(cutlass.max(p, Int32(0)), mSrc.shape[0] - Int32(1))
+        p = cutlass.max(mSrc[p], Int32(0)) // k_div
+    else:
+        p = cutlass.max(p, Int32(0)) + shift
     p = cutlass.min(cutlass.max(p, Int32(0)), mPts.shape[0] - Int32(1))
     return chain.row_scale(MoeF32, alpha_e, mPts, p)
 
@@ -1377,6 +1527,8 @@ def swapped_epilogue_loop(
     s_off: cute.Tensor = None,
     s_off_pad: cute.Tensor = None,
     subtile=None,
+    mSrc: cute.Tensor = None,
+    k_div: Int32 = None,
 ):
     """The transposed group-masked epilogue (``subtile``: this warpgroup's one token subtile of the tile when several
     warpgroups split the tile's columns, the accumulator released once every warp has arrived; None: one warpgroup takes
@@ -1538,7 +1690,9 @@ def swapped_epilogue_loop(
                 for v in cutlass.range_constexpr(nv):
                     j = col0 + Int32(cols[v])
                     if j < rows_left:
-                        sv = _col_scale(chain, alpha_e, mPts, row0, j, rows_left, shift)
+                        sv = _col_scale(
+                            chain, alpha_e, mPts, row0, j, rows_left, shift, mSrc, k_div
+                        )
                         val = chain.elem(
                             MoeF32,
                             tTR_rAcc[v],
@@ -1612,7 +1766,15 @@ def swapped_epilogue_loop(
                         sv = alpha_e
                         if cutlass.const_expr(per_row):
                             sv = _col_scale(
-                                chain, alpha_e, mPts, row0, j, rows_left, shift
+                                chain,
+                                alpha_e,
+                                mPts,
+                                row0,
+                                j,
+                                rows_left,
+                                shift,
+                                mSrc,
+                                k_div,
                             )
                         val = chain.elem(
                             MoeF32,

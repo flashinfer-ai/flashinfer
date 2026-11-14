@@ -810,11 +810,21 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits(T):
     tactics = runner.get_valid_tactics(inputs, None)
     from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import TOP_K_FP4
 
-    assert 1 <= len(tactics) <= TOP_K_FP4**2 and len(set(tactics)) == len(tactics)
+    # GEMM1's list carries the structural rule's gather twin beside its box record (one more than the ranking's head)
+    assert 1 <= len(tactics) <= TOP_K_FP4 * (TOP_K_FP4 + 1) and len(
+        set(tactics)
+    ) == len(tactics)
     r1, r2 = runner.impl._ranked(T, H)
     assert tactics == [_tactic_nvfp4(c1, c2) for c1 in r1 for c2 in r2]
     c1, c2 = _configs_from_tactic_nvfp4(tactics[0])
     assert (c1, c2) == (r1[0], r2[0])
+    # this pair's tactic space: the box head plus the structural rule's gather twin of the narrow swapped tile
+    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import GATHER_TILE_N
+
+    box = [c for c in r1 if not c.gather_a]
+    assert r1[: len(box)] == box and [c.describe() for c in r1 if c.gather_a] == [
+        c.describe() + "_ga" for c in box if c.swap_ab and c.tile_n == GATHER_TILE_N
+    ]
     if token_tile_default(rows_per_expert(T, k, E)) is not None:
         assert c1.swap_ab and c2.swap_ab, (T, c1.describe(), c2.describe())
     for t in tactics:
@@ -823,6 +833,84 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits(T):
     with autotune(True):
         assert torch.equal(bits(layer(pack, W)), ref)
     assert torch.equal(bits(layer(pack, W)), ref)
+
+
+@needs_device
+def test_swapped_gather_record_gives_the_box_forms_bits_on_every_pack_form():
+    """The MXFP4 pair's swapped gather records (:func:`...api_nvfp4.fused_moe_nvfp4`'s form on this class): the box form's bits for
+    the bf16 input, the pre-quantized pair with the 128x4 and with the linear scale layout, every token tile; the padded
+    packing and GEMM2 refuse the record."""
+    from flashinfer.batch_invariant.quantization.layout import unswizzle_sf_128x4
+    from flashinfer.fused_moe.batch_invariant.api_mxfp4 import fused_moe_mxfp4
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp4 import (
+        default_configs_mxfp4,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import (
+        GATHER_TILE_N,
+        gather_twins,
+        swapped_knobs_blockscaled,
+    )
+    from flashinfer.fused_moe.batch_invariant.spec_mxfp4 import MX_BLOCK
+
+    twins = gather_twins(swapped_knobs_blockscaled())
+    H, I, E = 512, 256, 32
+    for T, k in ((5, 8), (300, 6)):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=3 + T)
+        W = _weights_of(_weights(w1, w2))
+        ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        ids, weights = ids.cuda(), weights.cuda()
+        ref = bits(fused_moe_mxfp4(x, ids, weights, W, gather=False))
+        in1, in2 = W.classes(_family())
+        _, c2 = default_configs_mxfp4(
+            T, k, H, I, E, (in1, in2), W.chain1, W.chain2, 212, _family()
+        )
+        x4, sf = _quantized(x)[:2]
+        sf_lin = (
+            unswizzle_sf_128x4(sf.cpu(), T, H, MX_BLOCK)
+            .cuda()
+            .view(torch.uint8)
+            .reshape(T, H // MX_BLOCK)
+        )
+        for rec in twins:
+            out, im = fused_moe_mxfp4(
+                x, ids, weights, W, config1=rec, config2=c2, return_intermediates=True
+            )
+            assert im["config1"].gather_a and im["x_perm4"] is None
+            assert torch.equal(bits(out), ref), rec.describe()
+            assert torch.equal(
+                bits(
+                    fused_moe_mxfp4((x4, sf), ids, weights, W, config1=rec, config2=c2)
+                ),
+                ref,
+            )
+            assert torch.equal(
+                bits(
+                    fused_moe_mxfp4(
+                        (x4, sf_lin), ids, weights, W, config1=rec, config2=c2
+                    )
+                ),
+                ref,
+            )
+        if T <= 16:
+            out_g, im = fused_moe_mxfp4(
+                x, ids, weights, W, gather=True, return_intermediates=True
+            )
+            assert im["config1"].gather_a and torch.equal(bits(out_g), ref)
+            # the default: the rule's form (this pair's scatter launch folded into the narrow swapped tile)
+            for xin in (x, (x4, sf), (x4, sf_lin)):
+                out_d, im = fused_moe_mxfp4(
+                    xin, ids, weights, W, return_intermediates=True
+                )
+                c = im["config1"]
+                assert (
+                    c.gather_a == (c.swap_ab and c.tile_n == GATHER_TILE_N)
+                    and (im["x_perm4"] is None) == c.gather_a
+                )
+                assert torch.equal(bits(out_d), ref)
+    with pytest.raises(ValueError):
+        fused_moe_mxfp4(x, ids, weights, W, path="padded", gather=True)
+    with pytest.raises(ValueError):
+        fused_moe_mxfp4(x, ids, weights, W, config1=c2, config2=twins[0])
 
 
 @needs_device

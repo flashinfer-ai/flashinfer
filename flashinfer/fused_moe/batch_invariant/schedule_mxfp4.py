@@ -44,11 +44,24 @@ def rank_grouped_mxfp4(
     nominal: bool = False,
     n_active: Optional[int] = None,
     swap: Optional[bool] = None,
+    gather: Optional[bool] = False,
 ) -> List[Knobs]:
     """The ranked records for one GEMM over both record spaces (:func:`.schedule_nvfp4.rank_grouped_nvfp4` at the MXFP4
     instruction class with this class's chain term)."""
     return rank_grouped_nvfp4(
-        rows, N, K, E, chain, in_fmt, sm_count, family, k, nominal, n_active, swap
+        rows,
+        N,
+        K,
+        E,
+        chain,
+        in_fmt,
+        sm_count,
+        family,
+        k,
+        nominal,
+        n_active,
+        swap,
+        gather,
     )
 
 
@@ -65,12 +78,26 @@ def default_configs_mxfp4(
     family: Optional[str] = None,
     nominal: bool = False,
     swap: Optional[bool] = None,
+    gather: Optional[bool] = False,
 ) -> Tuple[Knobs, Knobs]:
-    """``(config for GEMM1 (N = 2I or I, K = H), config for GEMM2 (N = H, K = I))``: the first record of each ranked list."""
+    """``(config for GEMM1 (N = 2I or I, K = H), config for GEMM2 (N = H, K = I))``: the first record of each ranked list
+    (``gather`` as :func:`.schedule_nvfp4.default_configs_nvfp4`)."""
     rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
     n1 = 2 * I if chain1.pair else I
     c1 = rank_grouped_mxfp4(
-        rows, n1, H, E, chain1, in_fmts[0], sm_count, family, 1, nominal, n_act, swap
+        rows,
+        n1,
+        H,
+        E,
+        chain1,
+        in_fmts[0],
+        sm_count,
+        family,
+        1,
+        nominal,
+        n_act,
+        swap,
+        gather,
     )
     c2 = rank_grouped_mxfp4(
         rows, H, I, E, chain2, in_fmts[1], sm_count, family, 1, nominal, n_act, swap
