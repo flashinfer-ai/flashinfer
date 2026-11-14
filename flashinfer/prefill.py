@@ -2516,12 +2516,13 @@ def _build_block_tables_from_paged_kv_indices(
 
 
 def _paged_kv_host_metadata(indptr, last_page_len, seq_lens, page_size):
-    indptr_host = indptr.to("cpu")
-    last_host = last_page_len.to("cpu")
+    # Strided CPU views are misread through the planner's raw pointers (#5260).
+    indptr_host = indptr.to("cpu").contiguous()
+    last_host = last_page_len.to("cpu").contiguous()
     lengths = (
         get_seq_lens(indptr_host, last_host, page_size)
         if seq_lens is None
-        else seq_lens.cpu().flatten().to(torch.int32)
+        else seq_lens.cpu().flatten().to(torch.int32).contiguous()
     )
     return indptr_host, last_host, lengths
 
