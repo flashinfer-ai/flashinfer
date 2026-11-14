@@ -230,11 +230,13 @@ maximum Q 65–16384 and maximum KV at most 32768. Actual positive Q/KV lengths
 must already be on CPU, satisfy Q≤KV per request, match the declared maxima,
 and use physical query offsets as the valid query lengths. Independent masks
 and device-only metadata do not extend admission. Admission also requires at
-least `2**24` actual causal query-key pairs across query heads:
-`Hq * sum(q_i * (2 * kv_i - q_i + 1) // 2)`. Small workloads retain their native
-FA2/FA3 provider. The calculation uses paired CPU lengths rather than declared
-maximum lengths and adds no device readback. Existing causal, mask, window,
-sinks, split-control and runtime guards remain in force. Q, K, V and output
+least `2**24` actual query-key pairs across query heads. For causal attention,
+work is `Hq * sum(q_i * (2 * kv_i - q_i + 1) // 2)`; for noncausal attention,
+work is `Hq * sum(q_i * kv_i)`. Small workloads retain their native FA2/FA3
+provider. Both calculations use paired CPU lengths rather than declared maximum
+lengths and add no device readback. Custom-mask, window, sinks, split-control
+and runtime guards remain in force. This noncausal extension is H100-specific;
+Blackwell auto admission keeps its causal guard. Q, K, V and output
 must have the same BF16 or FP16 dtype; mixed precision is not admitted.
 
 The cuDNN graph uses exact H100 declarations; Blackwell's cache buckets do not

@@ -16,6 +16,8 @@ Both bind the same kind of GPU prefixes; only the host readback differs.
 Paged prefill uses pinned CPU prefixes and KV lengths, without caller-supplied
 block tables or length maxima, matching the ordinary vLLM paged plan call.
 Input pinning is outside the measured plan cost.
+Prefill defaults to causal attention. Use --no-causal to compare noncausal
+prefill, including its independent reference; decode remains causal.
 
 Each result includes sampled independent math checks and one-ULP CUDA
 graph replay after poisoning the output. Host enqueue excludes synchronization,
@@ -117,6 +119,12 @@ def main():
     p.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
     p.add_argument("--head-dim", type=int, default=128)
     p.add_argument("--page-size", type=int, default=16)
+    p.add_argument(
+        "--causal",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="prefill mask; --no-causal includes every KV token for each query",
+    )
     p.add_argument("--expected-backend-version", type=int)
     p.add_argument("--expect-auto-backend", choices=["fa2", "fa3", "cudnn"])
     p.add_argument(
@@ -131,6 +139,8 @@ def main():
         help="also measure run after each plan and complete plan+run",
     )
     a = p.parse_args()
+    if a.kind == "decode" and not a.causal:
+        p.error("--no-causal applies only to prefill (--kind paged or ragged)")
     if a.kind != "ragged" and a.ragged_indptr != "cpu":
         p.error("--ragged-indptr applies only to --kind ragged")
     if a.kv_heads <= 0 or a.qo_heads <= 0 or a.qo_heads % a.kv_heads:
@@ -201,7 +211,7 @@ def main():
             .reshape(-1, hk, d)
             .contiguous()
         )
-    # Independent math reference for first/last requests and causal boundary rows.
+    # Independent math reference for first/last requests and query boundary rows.
     samples = [
         (bi, qi) for bi in sorted({0, b - 1}) for qi in sorted({0, sq // 2, sq - 1})
     ]
@@ -219,7 +229,7 @@ def main():
             .float()
             .repeat_interleave(h // hk, 1)
         )
-        length = sk - sq + qi + 1
+        length = sk - sq + qi + 1 if a.causal else sk
         scores = (
             torch.einsum("hd,shd->hs", q[bi * sq + qi].float(), k[:length]) / d**0.5
         )
@@ -275,7 +285,7 @@ def main():
                     hk,
                     d,
                     page,
-                    causal=True,
+                    causal=a.causal,
                     q_data_type=q.dtype,
                     kv_data_type=q.dtype,
                     seq_lens=seq_lens_cpu,
@@ -290,7 +300,7 @@ def main():
                     h,
                     hk,
                     d,
-                    causal=True,
+                    causal=a.causal,
                     q_data_type=q.dtype,
                     kv_data_type=q.dtype,
                     **host_indptr,
