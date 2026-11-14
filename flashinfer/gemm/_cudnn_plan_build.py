@@ -180,17 +180,23 @@ def build_shard(spec: Bf16OverrideGraphSpec, handle, heur_modes, shard):
     plan fails to build is left out, as the all-plans build leaves it out.
     """
     shard_index, shard_count = shard
-    candidates = enumerate_tactics(build_bf16_override_graph(spec, handle), heur_modes)
+    # One graph per shard: building plans by index on it costs what
+    # build_plans(ALL) does, while a fresh graph per tactic repeats validation
+    # and support checks (~25% more on BF16).
+    graph = build_bf16_override_graph(spec, handle)
+    candidates = enumerate_tactics(graph, heur_modes)
     plans = []
     for index, tactic in enumerate(candidates):
         if index % shard_count != shard_index:
             continue
-        graph = build_bf16_override_graph(spec, handle)
         try:
-            build_single_plan(graph, tactic)
+            # Select, then build: serialize() exports the selected, built plan.
+            graph.select_plan(index)
+            graph.build_plan_at_index(index)
+            blob = graph.serialize(as_bytes=True)
         except Exception:  # noqa: BLE001 - an unbuildable plan is skipped
             continue
-        plans.append((index, tactic, bytes(graph.serialize())))
+        plans.append((index, tactic, bytes(blob)))
     return candidates, plans
 
 
