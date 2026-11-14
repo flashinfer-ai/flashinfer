@@ -687,6 +687,13 @@ class FmhaDecodeConfig:
     use_variable_seqlens_q: bool = False
     # Derived from the affine metadata view; lengths themselves stay runtime.
     uniform_query_offsets: bool = False
+    # Fixed-Q launches whose runtime Q length always equals ``max_seq_len_q``
+    # (one compiled kernel per query length, as ahead-of-time catalogs build
+    # them). K/V lengths may stay runtime. The Q geometry then decides at
+    # compile time whether Q tiles are full, so complete grouped tiles drop the
+    # per-tile inactive-row score mask. ``max_seq_len_q`` stays in the compile
+    # signature.
+    exact_seq_len_q: bool = False
     # Select the private sparse-block route. This explicit discriminator keeps
     # ordinary storage-subpage callers on the generic paged-KV path. Grouped
     # sparse routes consume query membership from a separate packed-word table;
@@ -2383,6 +2390,8 @@ class FmhaDecodeConfig:
         if not self.fixed_seqlen:
             policy = replace(self, fixed_seqlen=True)
             for name in LENGTH_DERIVED_FIELDS:
+                if name == "max_seq_len_q" and self.exact_seq_len_q:
+                    continue
                 del items[name]
             items.update(
                 use_variable_seqlens_q=True,
@@ -2665,7 +2674,9 @@ class FmhaDecodeConfig:
             and self.heads_q_per_kv % self.tile_size_q == 0
         ):
             return True
-        if self.use_variable_seqlens_q or not self.fixed_seqlen:
+        if self.use_variable_seqlens_q or not (
+            self.fixed_seqlen or self.exact_seq_len_q
+        ):
             return False
         if self.uses_nontrivial_grouped_q_layout:
             return (
