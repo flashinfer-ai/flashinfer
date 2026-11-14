@@ -186,6 +186,7 @@ def planned_route(
     captured=None,
     requested="auto",
     dtype=torch.bfloat16,
+    native="fa3",
     **features,
 ):
     route(monkeypatch, [q], [16384], dtype=dtype)
@@ -208,7 +209,7 @@ def planned_route(
         device=torch.device("cpu"),
         _qo_indptr_buf=torch.tensor([0, q], dtype=torch.int32),
     )
-    monkeypatch.setattr(fp, "determine_attention_backend", lambda *a, **k: "fa3")
+    monkeypatch.setattr(fp, "determine_attention_backend", lambda *a, **k: native)
     result = []
 
     def observe(backend, *args):
@@ -251,7 +252,6 @@ def test_real_planner_preserves_native_capture_schedules(
 @pytest.mark.parametrize(
     "feature",
     [
-        dict(causal=False),
         dict(window_left=127),
         dict(logits_soft_cap=1.0),
         dict(use_fp16_qk_reduction=True),
@@ -291,3 +291,34 @@ def test_actual_work_uses_paired_lengths_not_declared_maxima(dtype, monkeypatch)
 def test_mixed_precision_is_not_admitted(dtype, monkeypatch, field):
     other = torch.float16 if dtype == torch.bfloat16 else torch.bfloat16
     assert not route(monkeypatch, [65], [16384], dtype=dtype, **{field: other})
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("captured", [None, "fa2", "fa3"])
+def test_real_planner_mask_transfer_preserves_native_capture(
+    dtype, monkeypatch, causal, captured
+):
+    assert planned_route(
+        monkeypatch, causal=causal, captured=captured, dtype=dtype
+    ) == (captured or "cudnn")
+
+
+@pytest.mark.parametrize("kv,expected", [(8065, False), (8066, True)])
+def test_noncausal_actual_work_crossing(dtype, monkeypatch, kv, expected):
+    assert route(monkeypatch, [65], [kv], dtype=dtype, causal=False) is expected
+
+
+def test_noncausal_actual_work_does_not_use_triangular_estimate(dtype, monkeypatch):
+    assert route(monkeypatch, [65], [8066], dtype=dtype, causal=False)
+    assert not route(monkeypatch, [65], [8066], dtype=dtype, causal=True)
+
+
+def test_noncausal_work_uses_paired_lengths(dtype, monkeypatch):
+    assert route(monkeypatch, [129, 129], [4096, 4096], dtype=dtype, causal=False)
+    assert not route(monkeypatch, [129, 65], [129, 4096], dtype=dtype, causal=False)
+
+
+def test_noncausal_blackwell_does_not_inherit_hopper_admission(dtype, monkeypatch):
+    assert planned_route(monkeypatch, causal=False, native="fa2", dtype=dtype) == "fa2"
+    # The helper also independently rejects Blackwell.
+    assert not route(monkeypatch, [65], [16384], dtype=dtype, causal=False, cc=(10, 0))

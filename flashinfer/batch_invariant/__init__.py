@@ -98,7 +98,8 @@ def _attention_fingerprint(head_dim: int) -> str:
 
 def _mx_family(arch, op: str = "mm_mxfp8") -> str:
     """The architecture family behind ``arch``: a family name (``"sm_100"`` / ``"sm_103"`` / ``"sm_107"``), a compute
-    capability such as ``(10, 7)``, a ``torch.device``, or None for the current CUDA device."""
+    capability such as ``(10, 7)``, a ``torch.device``, or None for the current CUDA device.
+    """
     from ..gemm.batch_invariant.heuristic import PART_TABLE, family_of
 
     if arch is None:
@@ -169,7 +170,8 @@ def _moe_bf16_fingerprint(
     class as the enum form with the groups) or a ``spec.RoutingMethod``; ``act`` an ``ActivationConfig`` of the layer (its
     scalars are the class's parameters), ``"swiglu"`` / ``"relu2"`` (the default gated / ungated chains), or a chain name of
     ``spec.ACTS`` / ``spec.UNGATED_ACTS`` with ``params`` (and ``gated`` for the names in both tables). The receipt names
-    a class some layer can build: the runner's bounds and group rule apply here as ``ValueError``."""
+    a class some layer can build: the runner's bounds and group rule apply here as ``ValueError``.
+    """
     # absolute on purpose: the JIT cache keys follow relative imports, and the MoE specification is not part of the GEMM
     # modules' closures
     from flashinfer.fused_moe.batch_invariant import spec
@@ -249,6 +251,7 @@ def _megamoe_bf16_fingerprint(
     apply_routing_weights_before_fc2: bool = True,
     gate_up_clamp: float | None = None,
     arch=None,
+    **numerical_kwargs,
 ) -> str:
     from ..moe_ep.batch_invariant.spec import spec_fingerprint
 
@@ -260,7 +263,151 @@ def _megamoe_bf16_fingerprint(
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         gate_up_clamp=gate_up_clamp,
         arch=_mx_family(arch, "megamoe_bf16"),
+        **numerical_kwargs,
     )
+
+
+def _megamoe_nvfp4_fingerprint(
+    hidden: int,
+    intermediate: int,
+    top_k: int,
+    num_experts: int,
+    implementation: str = "legacy",
+    apply_routing_weights_before_fc2: bool = True,
+    gate_up_clamp: float | None = None,
+    input_norm_const: float = 1.0,
+    has_fc1_alpha: bool = True,
+    has_fc2_alpha: bool = True,
+    has_fc1_norm_const: bool = True,
+    arch=None,
+    **numerical_kwargs,
+) -> str:
+    from ..moe_ep.batch_invariant.nvfp4_spec import spec_fingerprint
+
+    return spec_fingerprint(
+        hidden,
+        intermediate,
+        top_k,
+        num_experts,
+        arch=_mx_family(arch, "megamoe_nvfp4"),
+        implementation=implementation,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        gate_up_clamp=gate_up_clamp,
+        input_norm_const=input_norm_const,
+        has_fc1_alpha=has_fc1_alpha,
+        has_fc2_alpha=has_fc2_alpha,
+        has_fc1_norm_const=has_fc1_norm_const,
+        **numerical_kwargs,
+    )
+
+
+def _megamoe_mxfp4_fingerprint(
+    hidden: int,
+    intermediate: int,
+    top_k: int,
+    num_experts: int,
+    quant_kind: str = "mxfp4_mxfp8",
+    implementation: str = "standard",
+    apply_routing_weights_before_fc2: bool = True,
+    gate_up_clamp: float | None = None,
+    arch=None,
+    **numerical_kwargs,
+) -> str:
+    from ..moe_ep.batch_invariant.mxfp4_spec import spec_fingerprint
+
+    return spec_fingerprint(
+        hidden,
+        intermediate,
+        top_k,
+        num_experts,
+        arch=_mx_family(arch, "megamoe_mxfp4"),
+        quant_kind=quant_kind,
+        implementation=implementation,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        gate_up_clamp=gate_up_clamp,
+        **numerical_kwargs,
+    )
+
+
+def _megamoe_mxfp8_fingerprint(
+    hidden,
+    intermediate,
+    top_k,
+    num_experts,
+    quant_kind="mxfp8_e4m3",
+    implementation="standard",
+    apply_routing_weights_before_fc2=True,
+    gate_up_clamp=None,
+    arch=None,
+    **numerical_kwargs,
+):
+    from ..moe_ep.batch_invariant.mxfp8_spec import spec_fingerprint
+
+    return spec_fingerprint(
+        hidden,
+        intermediate,
+        top_k,
+        num_experts,
+        arch=_mx_family(arch, "megamoe_mxfp8"),
+        quant_kind=quant_kind,
+        implementation=implementation,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        gate_up_clamp=gate_up_clamp,
+        **numerical_kwargs,
+    )
+
+
+_MEGAMOE_NUMERICAL_DIMS = (
+    "activation",
+    "swiglu_alpha",
+    "swiglu_beta",
+    "situ_beta",
+    "situ_linear_beta",
+    "per_token_scale",
+    "combine_dtype",
+    "output_mode",
+)
+
+
+def _megamoe_a16_handler(kind):
+    def compute(
+        hidden,
+        intermediate,
+        top_k,
+        num_experts,
+        *,
+        apply_routing_weights_before_fc2=kind != "w4a16",
+        gate_up_clamp=None,
+        arch=None,
+        activation="swiglu",
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        situ_beta=None,
+        situ_linear_beta=None,
+        handoff_norm=False,
+        output_mode="finalized",
+    ):
+        from ..moe_ep.batch_invariant.a16_spec import spec_fingerprint
+
+        return spec_fingerprint(
+            hidden,
+            intermediate,
+            top_k,
+            num_experts,
+            kind=kind,
+            apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+            gate_up_clamp=gate_up_clamp,
+            arch=_mx_family(arch, "megamoe_" + kind),
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            handoff_norm=handoff_norm,
+            output_mode=output_mode,
+        )
+
+    return compute
 
 
 #: The FlashInfer APIs with a batch-invariant class, by API name.
@@ -277,8 +424,71 @@ CLASSES: Dict[str, ClassInfo] = {
         "megamoe.bf16",
         ("hidden", "intermediate", "top_k", "num_experts"),
         _megamoe_bf16_fingerprint,
-        ("apply_routing_weights_before_fc2", "gate_up_clamp", "arch"),
+        ("apply_routing_weights_before_fc2", "gate_up_clamp", "arch")
+        + _MEGAMOE_NUMERICAL_DIMS,
     ),
+    "megamoe_nvfp4": ClassInfo(
+        "megamoe.nvfp4",
+        ("hidden", "intermediate", "top_k", "num_experts"),
+        _megamoe_nvfp4_fingerprint,
+        (
+            "implementation",
+            "apply_routing_weights_before_fc2",
+            "gate_up_clamp",
+            "input_norm_const",
+            "has_fc1_alpha",
+            "has_fc2_alpha",
+            "has_fc1_norm_const",
+            "arch",
+        )
+        + _MEGAMOE_NUMERICAL_DIMS,
+    ),
+    "megamoe_mxfp4": ClassInfo(
+        "megamoe.mxfp4",
+        ("hidden", "intermediate", "top_k", "num_experts"),
+        _megamoe_mxfp4_fingerprint,
+        (
+            "quant_kind",
+            "implementation",
+            "apply_routing_weights_before_fc2",
+            "gate_up_clamp",
+            "arch",
+        )
+        + _MEGAMOE_NUMERICAL_DIMS,
+    ),
+    "megamoe_mxfp8": ClassInfo(
+        "megamoe.mxfp8",
+        ("hidden", "intermediate", "top_k", "num_experts"),
+        _megamoe_mxfp8_fingerprint,
+        (
+            "quant_kind",
+            "implementation",
+            "apply_routing_weights_before_fc2",
+            "gate_up_clamp",
+            "arch",
+        )
+        + _MEGAMOE_NUMERICAL_DIMS,
+    ),
+    **{
+        "megamoe_" + kind: ClassInfo(
+            "megamoe.a16",
+            ("hidden", "intermediate", "top_k", "num_experts"),
+            _megamoe_a16_handler(kind),
+            (
+                "apply_routing_weights_before_fc2",
+                "gate_up_clamp",
+                "arch",
+                "activation",
+                "swiglu_alpha",
+                "swiglu_beta",
+                "situ_beta",
+                "situ_linear_beta",
+                "handoff_norm",
+                "output_mode",
+            ),
+        )
+        for kind in ("w4a16", "w8a16_e4m3", "w8a16_e5m2")
+    },
     "mm_bf16": ClassInfo("gemm.bf16", ("N", "K"), _mm_bf16_fingerprint, ("bias",)),
     # the fp8 input dtype is a dimension: e4m3 and e5m2 are two classes (gemm.e4m3.*, gemm.e5m2.*) of one API; the output
     # dtype (bf16 / fp16) is the chain's conversion; the batch is not a dimension (every element is one launch of the class)
@@ -334,6 +544,35 @@ def fingerprint(op: str, **dims) -> str:
     capacity, packing and scheduling are not dimensions. The environment scope additionally fixes EP
     topology, expert placement and the compiler stack. SM107 requires native ``sm_107a`` compilation
     and has its own architecture receipt. This is distinct from the regular MoE class.
+
+    ``megamoe_nvfp4`` takes the same four dimensions and isolates ``legacy``,
+    ``standard`` and ``genphase`` implementations and every architecture. Its
+    arithmetic uses E2M1 values/E4M3 block16 scales, K64 or K128 block-scaled
+    MMA, FP32 dequantization, SwiGLU, block16 intermediate requantization,
+    BF16 combine storage and ordered slot reduction. ``input_norm_const`` and
+    optional per-expert scale presence are additional dimensions. Public Mega
+    APIs materialize all three omitted scale tensors as ones, so their presence
+    defaults to True here. Scale values remain runtime inputs. The receipt's
+    main boundary is packed NVFP4 plus scales; separate components describe
+    the BF16 staging recipe. Prequantized calls supply that boundary directly.
+
+    ``megamoe_mxfp4`` uses UE8M0 block32 scales and takes ``quant_kind``
+    (``mxfp4_mxfp8`` for E2M1 weights/E4M3 activations, or Rubin-only ``mxfp4``
+    for E2M1 operands), ``implementation`` (``standard`` or ``genphase``),
+    routing-weight placement, clamp and architecture. Global scales are absent.
+    Input staging's normal-scale floor and FC1's paired amax/soft-mask recipe
+    remain separate components. UE8M0 conversion uses RP rounding and the
+    actual BF16 roundtrip; byte zero represents 2^-127. Packed/scaled operands
+    are the main boundary, as for the NVFP4 class.
+
+    ``megamoe_mxfp8`` describes E4M3 or E5M2 operands with UE8M0 block32
+    scales. ``quant_kind`` selects ``mxfp8_e4m3`` or ``mxfp8_e5m2``;
+    implementation and architecture remain separate classes. Legacy supports
+    early routing weights and preserves its sigmoid-first association,
+    NaN-propagating amax and explicit normalization-by-one operations. Next
+    implementations use paired amax and the soft-mask recipe. All BI input
+    staging uses the normal-scale floor. Packed/scaled operands are the main
+    boundary; input staging is a separate component.
 
     ``mm_bf16`` takes the weight shape ``N, K``: the K steps of the fold and the chunk count (a function of the
     weight shape alone) are the specification; M, the configuration and the weight's layout do not enter it. The

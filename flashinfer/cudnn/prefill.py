@@ -221,7 +221,12 @@ def _override_seq_class(max_seq: int, *, is_q: bool) -> int:
 
 
 def _override_cache_shape(
-    batch_size: int, max_seq_q: int, max_seq_kv: int, *, bounded_ragged: bool = False
+    batch_size: int,
+    max_seq_q: int,
+    max_seq_kv: int,
+    *,
+    bounded_ragged: bool = False,
+    bounded_batch: bool = False,
 ) -> tuple[int, int, int]:
     """Declared (batch, s_q, s_kv) of the override graph for a real (b, s_q,
     s_kv). q and kv are classed separately (a short-q / long-kv step must not
@@ -244,7 +249,8 @@ def _override_cache_shape(
         )
         return cache_b, cache_q, cache_kv
     cache_b = max(
-        _OVERRIDE_CACHE_BATCH, 1 << (max(int(batch_size), 1) - 1).bit_length()
+        1 if bounded_batch else _OVERRIDE_CACHE_BATCH,
+        1 << (max(int(batch_size), 1) - 1).bit_length(),
     )
     return (
         cache_b,
@@ -389,6 +395,7 @@ def _prefill_descriptor_key(
     token_offsets: bool = False,
     window_left: Optional[int] = None,
     sinks: Optional[torch.Tensor] = None,
+    bounded_batch: bool = False,
 ):
     if actual_seq_lens_q is not None:
         graph_b = actual_seq_lens_q.shape[0]
@@ -430,17 +437,19 @@ def _prefill_descriptor_key(
     )
     key = (core, (return_lse, layout(batch_offsets_stats) if return_lse else None))
     return (
-        _prefill_override_descriptor_key(key, override_cache)
+        _prefill_override_descriptor_key(
+            key, override_cache, bounded_batch=bounded_batch
+        )
         if override_cache is not None
         else key
     )
 
 
-def _prefill_graph_total_q(override_cache, max_total_num_rows):
+def _prefill_graph_total_q(override_cache, max_total_num_rows, *, bounded_batch=False):
     if override_cache is None:
         return max_total_num_rows
-    if override_cache[0] >= _OVERRIDE_CACHE_BATCH:
-        # Preserve the broad fallback's existing declaration and cache domain.
+    if bounded_batch or override_cache[0] >= _OVERRIDE_CACHE_BATCH:
+        # A batch-cache bound does not also declare a packed-Q capacity.
         return None
     capacity = override_cache[0] * override_cache[1]
     return (
@@ -450,7 +459,7 @@ def _prefill_graph_total_q(override_cache, max_total_num_rows):
     )
 
 
-def _prefill_override_descriptor_key(key, override_cache):
+def _prefill_override_descriptor_key(key, override_cache, *, bounded_batch=False):
     core, (return_lse, stats) = key
     (
         shape,
@@ -464,7 +473,9 @@ def _prefill_override_descriptor_key(key, override_cache):
         window_left,
         has_sinks,
     ) = core
-    total_q = _prefill_graph_total_q(override_cache, shape[3])
+    total_q = _prefill_graph_total_q(
+        override_cache, shape[3], bounded_batch=bounded_batch
+    )
 
     def indptr_layout(layout):
         if layout is None:
@@ -560,6 +571,7 @@ if CUDNN_AVAILABLE:
         token_offsets: bool = False,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        bounded_batch: bool = False,
     ):
         global _prefill_graph_builds
         _prefill_graph_builds += 1
@@ -602,7 +614,9 @@ if CUDNN_AVAILABLE:
             )
         graph_s_qo = max_token_seq_q
         graph_s_kv = max_sequence_kv
-        graph_total_q = _prefill_graph_total_q(override_cache, max_total_num_rows)
+        graph_total_q = _prefill_graph_total_q(
+            override_cache, max_total_num_rows, bounded_batch=bounded_batch
+        )
         if override_cache is not None:
             graph_b, graph_s_qo, graph_s_kv = override_cache
         if block_tables is not None:
@@ -1213,6 +1227,7 @@ class _PrefillMetadata:
     max_total_num_rows: Optional[int] = None
     _bounded_ragged: bool = False
     _bounded_paged: bool = False
+    _bounded_batch: bool = False
     _token_offsets: bool = False
 
     def resolve(self, q, k_cache, v_cache, *, batch_offsets_units="elements"):
@@ -1246,6 +1261,7 @@ class _PrefillMetadata:
         batch_offsets_units="tokens",
         token_strides=None,
     ):
+        self._bounded_batch = False
         self._bounded_ragged = (
             q_dtype in (torch.float16, torch.bfloat16)
             # The bounded-override contract is part of FE 1.31. Keep older
@@ -1296,6 +1312,25 @@ class _PrefillMetadata:
                 if paged
                 else self.batch_offsets_k is not None
             )
+        )
+        # Hopper D256 spends work inside SDPA on the declared batch, even when
+        # execution overrides it. Keep sequence-class reuse with a bounded batch.
+        self._bounded_batch = bool(
+            direct
+            and not paged
+            and q_dtype in (torch.float16, torch.bfloat16)
+            and head_dim_qk == head_dim_vo == 256
+            and num_kv_heads > 0
+            and num_qo_heads % num_kv_heads == 0
+            and num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16)
+            and self.max_token_per_sequence is not None
+            and self.max_token_per_sequence >= 2
+            and self.actual_seq_lens_q is None
+            and self.actual_seq_lens_kv is None
+            and self.window_left is None
+            and self.sinks is None
+            and self.batch_offsets_q.device.type == "cuda"
+            and get_compute_capability(self.batch_offsets_q.device) == (9, 0)
         )
         # The wrapper's initialization capacity is already fixed across
         # graph-mode replans. Preserve it without padding the packed total.
@@ -1450,6 +1485,7 @@ class _PrefillMetadata:
                 self.max_token_per_sequence,
                 self.max_sequence_kv,
                 bounded_ragged=self._bounded_ragged,
+                bounded_batch=self._bounded_batch,
             )
         return None
 
@@ -1475,6 +1511,7 @@ class _PrefillMetadata:
             token_offsets=self._token_offsets,
             window_left=self.window_left,
             sinks=self.sinks,
+            bounded_batch=self._bounded_batch,
         )
 
 
@@ -1576,6 +1613,7 @@ class _CudnnPrefillPlan:
             and previous.override_enabled == enabled
             and previous.metadata._bounded_ragged == metadata._bounded_ragged
             and previous.metadata._bounded_paged == metadata._bounded_paged
+            and previous.metadata._bounded_batch == metadata._bounded_batch
             and previous.metadata._token_offsets == metadata._token_offsets
             and previous.metadata.window_left == metadata.window_left
             and previous.exact_keys[True][0][0][1:]
@@ -1654,6 +1692,7 @@ class _CudnnPrefillPlan:
             and self.override_enabled == previous.override_enabled
             and metadata._bounded_ragged == previous.metadata._bounded_ragged
             and metadata._bounded_paged == previous.metadata._bounded_paged
+            and metadata._bounded_batch == previous.metadata._bounded_batch
         ):
             self.override = previous.override
             self.exact_keys = previous.exact_keys
@@ -1664,7 +1703,9 @@ class _CudnnPrefillPlan:
             )
             self.exact_keys = ((exact[0], (False, None)), exact)
             if self.override is not None:
-                override = _prefill_override_descriptor_key(exact, self.override)
+                override = _prefill_override_descriptor_key(
+                    exact, self.override, bounded_batch=metadata._bounded_batch
+                )
                 self.override_keys = ((override[0], (False, None)), override)
             else:
                 self.override_keys = self.exact_keys

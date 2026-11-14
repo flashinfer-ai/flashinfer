@@ -431,11 +431,20 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
     def name(self) -> str:
         weight = getattr(self, "a_dtype", "fp8")
         overlap = "_overlap2" if self.overlapping_accum else ""
+        bi_enabled = bool(getattr(self, "batch_invariant", False))
+        bi_variant = getattr(self, "batch_invariant_activation", None)
+        bi_suffix = f"_bi{int(bi_enabled)}" if bi_enabled or bi_variant is not None else ""
+        if bi_variant is not None:
+            import hashlib
+            bi_suffix += "_act" + hashlib.sha256(
+                repr(bi_variant.signature).encode()
+            ).hexdigest()[:16]
         return (
             "sm100_swapab_mxfp8_bf16_glu_fc12_"
             f"{weight}_m{self.mma_tiler[0]}n{self.mma_tiler[1]}"
             f"k{self.tma_k_tile}{overlap}_2cta_"
             f"a{self.transformed_a_storage}"
+            + bi_suffix
         )
 
     def get_workspace_size_in_bytes(
@@ -503,6 +512,8 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
             in_kernel_fc2_reduce=self.fc2_in_kernel_topk_reduce,
             token_back_by_dispatch=self.token_back_by_dispatch,
             gate_up_clamp=self.gate_up_clamp,
+            batch_invariant=getattr(self, "batch_invariant", False),
+            batch_invariant_activation=getattr(self, "batch_invariant_activation", None),
             epi_flag_batch=self.epi_flag_batch,
             accumulator_overlap=self.overlapping_accum,
         )

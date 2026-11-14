@@ -12,7 +12,11 @@ from cutlass.cutlass_dsl import Float32, Int32
 class Bf16TopkReduce:
     """Reduce eight hidden elements in FP32, optionally applying routing scores."""
 
-    def __init__(self, hidden: int, num_topk: int) -> None:
+    def __init__(
+        self, hidden: int, num_topk: int, *, batch_invariant=False, num_experts=None
+    ) -> None:
+        self.batch_invariant = batch_invariant
+        self.num_experts = num_experts
         self.hidden = int(hidden)
         self.num_topk = int(num_topk)
         self.hidden_per_thread = 8
@@ -49,6 +53,7 @@ class Bf16TopkReduce:
         token_idx: Int32,
         hidden_tile_idx: Int32,
         score_reg: Optional[cute.Tensor],
+        topk_indices: Optional[cute.Tensor] = None,
     ):
         hidden_per_thread = self.hidden_per_thread
         num_topk: cutlass.Constexpr[int] = self.num_topk
@@ -73,21 +78,41 @@ class Bf16TopkReduce:
             num_bits_per_copy=128,
         )
         acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+        if cutlass.const_expr(self.batch_invariant):
+            acc.fill(0)
 
         for k in cutlass.range_constexpr(0, num_topk, 1):
             term = cute.make_rmem_tensor(
                 (hidden_per_thread,),
                 cutlass.BFloat16,
             )
-            cute.copy(load_atom, terms[k, None], term)
+            valid = True
+            if cutlass.const_expr(topk_indices is not None):
+                expert = topk_indices[token_idx, Int32(k)]
+                valid = (expert >= 0) & (expert < self.num_experts)
+            term.fill(0)
+            if valid:
+                cute.copy(load_atom, terms[k, None], term)
             if cutlass.const_expr(topk_score is not None):
                 if cutlass.const_expr(not prefetch):
                     score_reg[k] = topk_score[token_idx, Int32(k)]
                 score = Float32(score_reg[k])
+                if not valid:
+                    score = Float32(0.0)
 
             for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
                 value_pair = (Float32(term[i]), Float32(term[i + 1]))
-                if cutlass.const_expr(topk_score is None):
+                if cutlass.const_expr(self.batch_invariant):
+                    from flashinfer.moe_ep.batch_invariant.device import PackedF32
+
+                    previous = (acc[i], acc[i + 1])
+                    if cutlass.const_expr(topk_score is None):
+                        acc[i], acc[i + 1] = PackedF32.add(previous, value_pair)
+                    else:
+                        acc[i], acc[i + 1] = PackedF32.fma(
+                            value_pair, (score, score), previous
+                        )
+                elif cutlass.const_expr(topk_score is None):
                     if cutlass.const_expr(k == 0):
                         acc[i], acc[i + 1] = value_pair
                     else:

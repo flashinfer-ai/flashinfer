@@ -100,7 +100,13 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
         generate_c: bool = False,
         use_stg_fc1: bool = False,
         combine_format: Optional[CombineFormat] = None,
+        batch_invariant: bool = False,
+        batch_invariant_activation=None,
     ) -> None:
+        self.batch_invariant = batch_invariant
+        self.batch_invariant_activation = batch_invariant_activation
+        if batch_invariant and (fc2_in_kernel_topk_reduce or mma_tiler_mnk != (256, 128, 128) or accumulator_overlap or transform_buffer != "tmem" or transform_k_tile != 128):
+            raise ValueError("W8A16 BI requires canonical TMEM M256/N128/K128 without IKR/overlap")
         if static_expert_shape is None:
             raise NotImplementedError(
                 "Sm100MegaMoEMxfp8Bf16Kernel requires "
@@ -1073,6 +1079,8 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
                 sm_arch=get_cutedsl_target_arch(),
                 persistent=self.topk_reduce_persistent,
                 num_sms=self.topk_reduce_num_sms,
+                batch_invariant=self.batch_invariant,
+                num_experts=self.world_size * self.static_expert_shape[0],
             )
             if cutlass.const_expr(self.topk_reduce_persistent):
                 reduce(
@@ -1083,6 +1091,7 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
                     stream,
                     self._view_local(local_workspace, "topk_reduce_counters"),
                     num_tokens_dev=num_valid_tokens,
+                    topk_indices=topk_idx if cutlass.const_expr(self.batch_invariant) else None,
                 )
             else:
                 reduce(
@@ -1091,6 +1100,7 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
                     output_activation,
                     None,
                     stream,
+                    topk_indices=topk_idx if cutlass.const_expr(self.batch_invariant) else None,
                 )
 
     # ------------------------------------------------------------------

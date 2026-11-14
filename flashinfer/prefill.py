@@ -2524,12 +2524,13 @@ def _build_block_tables_from_paged_kv_indices(
 
 
 def _paged_kv_host_metadata(indptr, last_page_len, seq_lens, page_size):
-    indptr_host = indptr.to("cpu")
-    last_host = last_page_len.to("cpu")
+    # CPU inputs can retain strides across .to(); the planners read raw pointers.
+    indptr_host = indptr.to("cpu").contiguous()
+    last_host = last_page_len.to("cpu").contiguous()
     lengths = (
         get_seq_lens(indptr_host, last_host, page_size)
         if seq_lens is None
-        else seq_lens.cpu().flatten().to(torch.int32)
+        else seq_lens.cpu().flatten().to(torch.int32).contiguous()
     )
     return indptr_host, last_host, lengths
 
@@ -2571,6 +2572,7 @@ def _hopper_paged_auto_cudnn(
     qo_indptr_host,
     kv_lens,
     seq_lens_q=None,
+    causal=True,
 ):
     """H100 D256 admission after the native planner has selected FA3."""
     if not (
@@ -2605,10 +2607,11 @@ def _hopper_paged_auto_cudnn(
         and (seq_lens_q is None or seq_lens_q.flatten().tolist() == queries)
     ):
         return False
-    # Amortize the cuDNN path using actual causal work, including mixed rows.
+    # Amortize the cuDNN path using actual mask-specific work, including mixed rows.
     # A product of declared maxima would admit nearly empty ragged batches.
     paired_work = hq * sum(
-        q * (2 * kv - q + 1) // 2 for q, kv in zip(queries, lengths, strict=True)
+        q * (2 * kv - q + 1) // 2 if causal else q * kv
+        for q, kv in zip(queries, lengths, strict=True)
     )
     if paired_work < 1 << 24:
         return False
@@ -4277,7 +4280,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             cudnn_admission = (
                 _blackwell_paged_auto_cudnn
                 if planned_backend == "fa2"
-                else _hopper_paged_auto_cudnn
+                else functools.partial(_hopper_paged_auto_cudnn, causal=causal)
             )
             if (
                 planned_backend in ("fa2", "fa3")
@@ -4285,7 +4288,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 # refreshed, not just the raw page and length buffers. Keep
                 # planning its provider instead of maintaining a second planner.
                 and (not self.is_cuda_graph_enabled or self._plan_info is None)
-                and causal
+                and (causal or planned_backend == "fa3")
                 and pos_encoding_mode == "NONE"
                 and not use_fp16_qk_reduction
                 and custom_mask is None
