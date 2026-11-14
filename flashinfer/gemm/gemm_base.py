@@ -6117,7 +6117,9 @@ def _cudnn_gemm_bf16_runner(
             if pool is None or torch.cuda.is_current_stream_capturing():
                 return None
             kwargs = self._override_graph_kwargs(a, b, bias, out)
-            key = _cudnn_override_key(build_cudnn_gemm_bf16_graph_override_shape, kwargs)
+            key = _cudnn_override_key(
+                build_cudnn_gemm_bf16_graph_override_shape, kwargs
+            )
             cached = _cudnn_prebuilt_tactics(key)
             if cached is not None:
                 return cached

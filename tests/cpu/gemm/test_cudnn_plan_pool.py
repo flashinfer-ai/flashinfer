@@ -147,7 +147,13 @@ def test_shutdown_terminates_workers(fake_cmd):
 
 @pytest.mark.parametrize(
     "value, workers, warns",
-    [("0", None, False), ("", None, False), ("two", None, True), ("-1", None, True), ("2", 2, False)],
+    [
+        ("0", None, False),
+        ("", None, False),
+        ("two", None, True),
+        ("-1", None, True),
+        ("2", 2, False),
+    ],
 )
 def test_env_parsing(monkeypatch, caplog, value, workers, warns):
     monkeypatch.setenv("FLASHINFER_CUDNN_PLAN_BUILD_WORKERS", value)

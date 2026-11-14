@@ -46,9 +46,7 @@ def build_bf16_override_graph(spec: Bf16OverrideGraphSpec, handle):
 
     batch, n, k, cache_m = spec.batch, spec.n, spec.k, spec.cache_m
     a_shape = (batch, cache_m, k)
-    a_stride = (
-        (cache_m * k, k, 1) if spec.is_a_k_major else (cache_m * k, 1, cache_m)
-    )
+    a_stride = (cache_m * k, k, 1) if spec.is_a_k_major else (cache_m * k, 1, cache_m)
     b_shape = (batch, k, n)
     b_stride = (k * n, 1, k) if spec.is_b_k_major else (k * n, n, 1)
 
@@ -71,9 +69,7 @@ def build_bf16_override_graph(spec: Bf16OverrideGraphSpec, handle):
         stride=list(b_stride),
         data_type=cudnn.data_type.BFLOAT16,
     )
-    c = graph.matmul(
-        name="matmul", A=a, B=b, compute_data_type=cudnn.data_type.FLOAT
-    )
+    c = graph.matmul(name="matmul", A=a, B=b, compute_data_type=cudnn.data_type.FLOAT)
     c.set_data_type(cudnn.data_type.FLOAT)
 
     if spec.bias:

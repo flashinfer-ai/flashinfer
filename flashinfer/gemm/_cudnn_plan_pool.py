@@ -13,6 +13,7 @@ turns the pool off for the rest of the process.
 """
 
 import atexit
+import contextlib
 import logging
 import os
 import pathlib
@@ -205,10 +206,8 @@ class CudnnPlanBuildPool:
                 proc.kill()
                 proc.wait()
             for stream in (proc.stdin, proc.stdout):
-                try:
+                with contextlib.suppress(OSError):
                     stream.close()
-                except OSError:
-                    pass
 
     def shutdown(self) -> None:
         with self._lock:
