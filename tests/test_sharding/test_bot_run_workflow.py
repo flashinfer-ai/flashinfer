@@ -18,7 +18,7 @@ sys.path.insert(0, str(CHECKS))
 import ai_test_scope as scope
 
 WORKFLOW_TEXT = (ROOT / ".github/workflows/ci-bot-commands.yml").read_text()
-PR_WORKFLOW_TEXT = (ROOT / ".github/workflows/pr-test.yml").read_text()
+PR_WORKFLOW_TEXT = (ROOT / ".github/workflows/pr-test.yml").read_text(encoding="utf-8")
 
 
 def step_block(name, workflow_text=WORKFLOW_TEXT):

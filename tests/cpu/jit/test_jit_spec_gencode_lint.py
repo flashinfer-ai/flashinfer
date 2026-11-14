@@ -180,7 +180,9 @@ def test_standalone_lint_script_covers_both_cpu_architectures():
 @pytest.mark.cpu_only
 def test_pr_test_runs_spec_lint_and_requires_it():
     yaml = pytest.importorskip("yaml")
-    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/pr-test.yml").read_text())
+    workflow = yaml.safe_load(
+        (REPO_ROOT / ".github/workflows/pr-test.yml").read_text(encoding="utf-8")
+    )
     jobs = workflow["jobs"]
 
     lint = jobs["spec-lint"]
