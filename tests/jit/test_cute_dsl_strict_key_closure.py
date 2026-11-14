@@ -404,6 +404,15 @@ def test_distinct_package_and_external_files_keep_distinct_keys(
     assert len(keys) == 3
 
 
+def test_non_strict_symlink_loop_raises_oserror(fake_package, tmp_path, monkeypatch):
+    """Unreadable source must reach the kernel builder's OSError fallback."""
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "0")
+    loop = tmp_path / "loop.py"
+    loop.symlink_to(loop.name)
+    with pytest.raises(OSError):
+        source_analysis._hash_source_files((str(loop),))
+
+
 # Real-tree guards. Plain-module closure sizes on main before this rework:
 # cute_dsl_core 7, gdn_decode_mtp 12, nvfp4_quantize 22. Every kernel now also
 # keys its package initializers and the Trace Apply code flashinfer/__init__.py

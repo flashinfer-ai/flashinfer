@@ -664,6 +664,10 @@ def _source_key_path(path: str) -> str:
     """Use a stable package identity while keeping external paths distinct."""
     try:
         relative = Path(path).resolve().relative_to(_PACKAGE_DIR)
+    except RuntimeError as e:
+        # Python < 3.13 reports symlink loops as RuntimeError. Preserve the
+        # unreadable-source contract used by the kernel builder's cache bypass.
+        raise OSError(f"Cannot resolve source path: {path}") from e
     except ValueError:
         return path
     # NUL cannot occur in a filesystem path, so an external relative path
